@@ -1045,7 +1045,7 @@ under the daemon's errgroup. Nothing else imports this package.
       superseded generation is #6716.
     - **A RETIRED leg never gains a credential** (round 14). `stopLegLocked` only
       closes a channel — the socket keeps accepting until the serve goroutine
-      reaches `Shutdown`, and what it accepted is served for the whole bounded
+      reaches `Shutdown`, and what it accepted is served for the whole
       drain — while `ReconcileHTTP`/`ReconcileHTTPS` return immediately, and the
       reconciler then publishes. Each leg therefore carries its own `authSlot`:
       LIVE legs FOLLOW `s.auth` (the live swap above is unchanged), and a leg is
@@ -1079,13 +1079,18 @@ under the daemon's errgroup. Nothing else imports this package.
       `TestInFlightResponseIsSeveredOnEveryLegExit_6827` across all three exits;
       deleting the `Close`, or reverting the retirement/root arm to a bare
       `Shutdown`, reds it — before round 8 both edits left the package green.
-      **What `legDrainTimeout` bounds is the `Shutdown`, not the drain.** The
-      sever that follows has no deadline of its own: `Close` takes no context and
-      closes `activeConn` SERIALLY, and on an HTTPS leg each of those is a
-      `*tls.Conn` whose `Close` sends `close_notify` under its own five-second
-      write deadline (`crypto/tls`), so a peer stalling its receive window costs
-      up to five seconds EACH, in series. The worst case therefore grows with the
-      number of such connections rather than sitting at five seconds, and the
+      **`legDrainTimeout` bounds NEITHER the drain nor the `Shutdown` in
+      wall-clock terms** — round 8 said "the Shutdown" and that was the second
+      wrong version of the sentence (#6827 round 9). It is a POLL deadline
+      consulted between quiescence checks, and serial per-connection closes sit
+      in front of it in BOTH phases: `Shutdown`'s loop calls `closeIdleConns()`
+      and only reaches its `ctx.Done()` select if that returns false, and
+      `closeIdleConns` walks `activeConn` under `s.mu` closing one at a time; then
+      `Close`, which takes no context at all, does the same again. On an HTTPS leg
+      each close is a `*tls.Conn` sending `close_notify` under its own five-second
+      write deadline (`crypto/tls`), so a stalled peer costs up to five seconds
+      EACH, in series, in either phase. The worst case grows with the number of
+      such connections and has no fixed ceiling, and the
       knock-on is worth knowing: `Server.Wait` holds `lifeMu` across the drain
       and `WarnStaleMgmtCertForHostName` holds `staleCertMu` while waiting for
       `lifeMu`, so a `set system host-name` racing daemon shutdown waits for it.
@@ -1093,17 +1098,25 @@ under the daemon's errgroup. Nothing else imports this package.
       concurrent deadlined closes — a larger change than #6827, deliberately not
       taken here, and the claim is narrowed to what is true instead of asserting
       a bound that is not.
-      **Hijacked connections are OUT OF SCOPE, by gate rather than by luck.** Go
+      **Hijacked connections are OUT OF SCOPE, and the exclusion is only partly
+      enforced.** Go
       excludes them from both calls (`Shutdown` "does not attempt to close nor
       wait for hijacked connections", `Close` "does not even know about" them),
       and a hijacked conn leaves `activeConn`, so it can outlive the drain with
       `drained` stored. Nothing in `drainLeg` can reach it — the handle is gone.
-      This package has no hijacker, and `TestNoHijackerInThisPackage_6827` (an
-      AST scan, so comments about hijacking are not false positives) fails if one
-      is added, naming what `drainLeg` would then have to grow. Absence is thus
-      enforced rather than incidental, which matters because two reviewers read
-      the absence as closing the case and the next WebSocket endpoint would
-      otherwise inherit an invariant that had silently stopped holding.
+      This package has no hijacker, and `TestNoHijackerInThisPackage_6827` is a
+      **tripwire, not a gate** — round 8 claimed enforcement and that was too
+      strong (#6827 round 9). It catches three forms: a local `http.Hijacker`
+      assertion, a local `Hijack` call, and an import of a package known to
+      hijack internally. The third exists because a purely local AST walk is
+      defeated by a dependency this module ALREADY has:
+      `golang.org/x/net/websocket`'s `Server` hijacks inside its own handler, so
+      `mux.Handle("/ws", websocket.Handler(h))` would add the case with nothing
+      in this package's syntax to match. Reverse proxies, upgrade helpers,
+      aliases and reflection escape even the import check. Read a pass as "none
+      of the three known forms is present". It is an AST scan rather than a text
+      scan so that this documentation, and `drainLeg`'s, do not trip it — a guard
+      has to be able to coexist with its own description.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —

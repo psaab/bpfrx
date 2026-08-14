@@ -492,7 +492,8 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// certificate to judge, and the name is still the one the operator set.
 	d.deliverStaleMgmtCertDiagnosis()
 	// Drain the management serve goroutines on daemon shutdown: ctx cancel
-	// triggers the api.Server bounded 5s graceful drain, and wait() joins every
+	// triggers the api.Server graceful drain (5s deadline, not a wall-clock
+	// bound — see api.legDrainTimeout), and wait() joins every
 	// live + retiring listener goroutine so none leak past Run.
 	wg.Add(1)
 	go func() {

@@ -756,7 +756,7 @@ func (m *managementReconciler) warnStaleCertForHostName(hostName string) bool {
 // Without this publish the pin captures the credential the operator DELETED, and
 // retirement is asynchronous: the socket keeps accepting until the serve
 // goroutine reaches Shutdown, and connections already accepted are served for the
-// whole bounded drain. Guarded by
+// whole drain. Guarded by
 // TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561 — the only case in
 // the package whose nil-direction rebind converges.
 //
@@ -788,7 +788,7 @@ func mgmtAddrIsLoopback(addr string) bool {
 
 // wait blocks until every serve goroutine (live + retiring legs) has drained.
 // Called on daemon shutdown after the root ctx is cancelled (which triggers each
-// leg's bounded graceful drain inside api.Server).
+// leg's graceful drain inside api.Server).
 func (m *managementReconciler) wait() {
 	m.mu.Lock()
 	srv := m.srv

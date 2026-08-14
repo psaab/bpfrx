@@ -47,7 +47,8 @@ type listenerLeg struct {
 	// round 7 stated only the first half, which is the half Shutdown alone
 	// already provides, so it understated what the flag has to promise). Modulo
 	// HIJACKED connections, which Go excludes from both Shutdown and Close and
-	// which this package has none of, by gate — see drainLeg.
+	// which this package has none of today — a tripwire, not a gate; see
+	// drainLeg.
 	// Server.pruneRetiredLocked spends it as exactly that: a drained leg stops
 	// being tightened by ReplaceAuth because there is nothing left for a
 	// revocation to reach. That reading is only true because EVERY exit path now
@@ -79,9 +80,10 @@ type listenerLeg struct {
 	//
 	// It marks INTENT, and the socket state trails it by a hair: it is stored
 	// just before the drain, which is what closes the listener, and requests
-	// already accepted keep being served until they finish or legDrainTimeout
-	// expires and they are severed. So a `stopping` leg is not instantaneously
-	// silent — but it is silent within a bound. It is still the right answer to
+	// already accepted keep being served until they finish or the drain severs
+	// them. So a `stopping` leg is not instantaneously silent — and NOT within a
+	// wall-clock bound either (legDrainTimeout is a poll deadline, not a
+	// ceiling; see its doc). It is still the right answer to
 	// "is a certificate in front of clients right now?", which is a question
 	// about whether to warn an operator: this leg is on its way out, no new
 	// client will reach it, and a staleness warning about it is noise. Callers
@@ -121,8 +123,10 @@ type listenerLeg struct {
 // further flag.
 //
 // `drained` is NOT a candidate here even though it is set on every exit
-// (#5561 round 14). It is stored from a defer as the goroutine's LAST act, which
-// makes it the right answer to "has this leg finished, so retiring can reap it?"
+// (#5561 round 14). It is stored from a defer after the exit path and the drain
+// have run — not as the goroutine's last act, since `defer s.wg.Done()` is
+// registered first and therefore runs after it — which makes it the right
+// answer to "has this leg finished draining, so retiring can reap it?"
 // and the wrong answer to this one: throughout the drain — the whole window
 // in which the socket is already closed but the goroutine has not returned — it
 // still reads false. A predicate built on it would call a closing listener live
@@ -141,15 +145,23 @@ func (l *listenerLeg) serving() bool {
 // finish GRACEFULLY once that leg is on its way out, on every exit — requested
 // retirement, root-context shutdown, and an unexpected serve-loop exit.
 //
-// It bounds the SHUTDOWN, not drainLeg, and the difference is not academic
-// (#6827 round 8). The sever that follows has no deadline of its own and is not
-// O(1): http.Server.Close takes no context and closes s.activeConn SERIALLY
-// (net/http/server.go), and on an HTTPS leg each of those is a *tls.Conn whose
-// Close sends close_notify under a five-second write deadline of its OWN
-// (crypto/tls/conn.go closeNotify). A peer that stalls its receive window
-// therefore costs up to five seconds EACH, one after another, so the worst-case
-// drain grows with the number of such connections rather than sitting at five
-// seconds. The knock-on is worth knowing before someone rediscovers it as a
+// It bounds NEITHER the drain nor even the Shutdown in wall-clock terms, and
+// round 8's "it bounds the Shutdown" was the second wrong version of this
+// sentence (#6827 round 9). It is a POLL deadline, consulted between quiescence
+// checks, and both phases put serial per-connection closes in front of it:
+//
+//   - INSIDE Shutdown: the loop calls closeIdleConns() and only reaches its
+//     `select { case <-ctx.Done() }` if that returns false. closeIdleConns walks
+//     s.activeConn under s.mu calling c.rwc.Close() one at a time, so a batch of
+//     stalled IDLE peers overruns the context before the context is ever read.
+//   - AFTER it: http.Server.Close takes no context at all and closes
+//     s.activeConn serially too.
+//
+// On an HTTPS leg each of those closes is a *tls.Conn whose Close sends
+// close_notify under a five-second write deadline of its OWN (crypto/tls
+// conn.go closeNotify), so a peer that stalls its receive window costs up to
+// five seconds EACH, one after another, in both phases. The worst case grows
+// with the number of such connections and has no fixed ceiling. The knock-on is worth knowing before someone rediscovers it as a
 // hang: Server.Wait holds lifeMu across the drain, and
 // WarnStaleMgmtCertForHostName holds staleCertMu while waiting for lifeMu, so a
 // `set system host-name` racing daemon shutdown waits for whatever the drain
@@ -185,11 +197,15 @@ var legDrainTimeout = 5 * time.Second
 //
 // Measured, not argued:
 //
-//   - FURTHER REQUESTS: Shutdown sets `inShutdown`, which makes `doKeepAlives()`
-//     false. Idle connections are closed outright, and a connection Shutdown is
-//     still waiting on finishes its current response and then closes rather than
-//     reading another request. So a surviving connection CANNOT serve a second
-//     request — Shutdown alone is sufficient for that half.
+//   - FURTHER REQUESTS, on HTTP/1: Shutdown sets `inShutdown`, which makes
+//     `doKeepAlives()` false. Idle connections are closed outright, and a
+//     connection Shutdown is still waiting on finishes its current response and
+//     then closes rather than reading another request. So a surviving HTTP/1
+//     connection cannot serve a second request — Shutdown alone is sufficient
+//     for that half. On HTTP/2 it is weaker (#6827 round 9): the shutdown
+//     callbacks are asynchronous, so an already-established h2 connection can
+//     open another stream in the window before GOAWAY reaches it. Close is what
+//     makes that answer the same on both protocols.
 //   - THE RESPONSE ALREADY IN FLIGHT: Shutdown does not terminate it. It WAITS
 //     for it, and when the deadline expires it returns ctx.Err() and leaves the
 //     response open and still streaming. This server deliberately runs with no
@@ -205,17 +221,31 @@ var legDrainTimeout = 5 * time.Second
 // in-flight half is the data story: a response authorized under the old policy
 // goes on delivering after the box believes the socket is gone.
 //
-// HIJACKED CONNECTIONS ARE OUT OF SCOPE, deliberately and enforceably (#6827
-// round 8). Go excludes them from BOTH calls — Shutdown "does not attempt to
-// close nor wait for hijacked connections", Close "does not even know about"
-// them — and a hijacked conn is removed from srv.activeConn, so it can outlive
-// this function with `drained` set. Adding the force-close does not fix that;
-// nothing here can, because the handle is gone. This package therefore has no
-// hijacker at all, and that is a GATE rather than an accident:
-// TestNoHijackerInThisPackage_6827 fails if one is introduced, and says what
-// drainLeg would then have to grow (per-connection tracking via an
-// http.Server.ConnState hook, which fires with StateHijacked and hands you the
-// net.Conn, plus closing those conns here).
+// HIJACKED CONNECTIONS ARE OUT OF SCOPE, deliberately — and the exclusion is
+// only PARTLY enforced, which is the honest version of what round 8 claimed
+// (#6827 round 9). Go excludes them from BOTH calls — Shutdown "does not
+// attempt to close nor wait for hijacked connections", Close "does not even
+// know about" them — and a hijacked conn is removed from srv.activeConn, so it
+// can outlive this function with `drained` set. Adding the force-close does not
+// fix that; nothing here can, because the handle is gone.
+//
+// This package has no hijacker today, and TestNoHijackerInThisPackage_6827 is a
+// TRIPWIRE for the two forms it can take LOCALLY — a type assertion to
+// http.Hijacker, or a call to Hijack — plus an import of a package known to
+// hijack internally. It is NOT a proof of absence and must not be read as one:
+// a dependency that hijacks inside its own handler is invisible to a local AST
+// walk. `golang.org/x/net/websocket` is a direct dependency of this module and
+// its Server does exactly that, so `mux.Handle("/ws", websocket.Handler(h))`
+// would introduce the case with nothing in this package's syntax to catch —
+// which is why the import check exists and why even together they are a
+// tripwire rather than a gate. Reverse proxies, upgrade helpers, aliases and
+// reflection escape identically.
+//
+// If a hijacking endpoint is added, drainLeg has to grow per-connection
+// tracking (an http.Server.ConnState hook fires with StateHijacked and hands
+// you the net.Conn) and close those conns itself; otherwise the invariant here,
+// at listenerLeg.drained and in pkg/api/README.md must be narrowed to exclude
+// that endpoint.
 func drainLeg(srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), legDrainTimeout)
 	defer cancel()
@@ -232,7 +262,7 @@ func drainLeg(srv *http.Server) {
 // server wait group, and returns the leg. The goroutine serves until (a) the
 // listener terminates on its own, (b) the leg is explicitly retired
 // (stopLegLocked), or (c) the daemon root context is cancelled — then it runs a
-// bounded graceful drain (drainLeg) and joins. Every one of the three ends in
+// graceful drain (drainLeg) and joins. Every one of the three ends in
 // that drain: (a) closes the listener but not the connections behind it, so it
 // needs the drain for exactly the same reason the other two do.
 // Caller holds lifeMu (so rootCtx is set and reads are consistent).
@@ -315,7 +345,7 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 // Retirement is ASYNCHRONOUS and that is the point of the auth pin (#5561 round
 // 14). Closing stopCh only WAKES the serve goroutine; the socket keeps accepting
 // until that goroutine reaches Shutdown, and connections it already accepted are
-// served for the whole bounded drain. ReconcileHTTP/ReconcileHTTPS return as soon
+// served for the whole drain. ReconcileHTTP/ReconcileHTTPS return as soon
 // as this call does, and the management reconciler then publishes the committed
 // credential set — so without the pin a credential the commit authorized for the
 // NEW address became valid on the address that same commit retired. Pinning the

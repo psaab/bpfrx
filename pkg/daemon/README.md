@@ -339,7 +339,7 @@ credential revocation is enforced even on an apply that returns early
       `m.cur` is loopback so the committed nil is what publishes, and
       `api.authSlot.tighten` drops a nil `next` by design. Without the
       pre-rebind publish the pin captures the credential the operator DELETED,
-      and it keeps authenticating on the routable address for the whole bounded
+      and it keeps authenticating on the routable address for the whole
       drain plus every keep-alive connection already accepted. Pinned by
       `TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561`, which is the
       only case in the package where this nil-direction rebind converges — every

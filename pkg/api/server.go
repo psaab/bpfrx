@@ -848,7 +848,7 @@ func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
 // The swap reaches every LIVE leg at once (they read s.auth through their slots)
 // and reaches each RETIRING leg only as a TIGHTENING (#5561 round 14). A leg
 // that a reconcile replaced is still accepting and serving for the width of its
-// bounded drain, and the address it is serving is one the committed config asked
+// drain (whose width is not a fixed bound — see legDrainTimeout), and the address it is serving is one the committed config asked
 // to leave: a revocation must still land there, a grant must not, and a nil must
 // not — the clamp that licenses a nil was evaluated against the address the
 // commit BOUND, not the one it retired.
@@ -894,7 +894,8 @@ func (s *Server) HTTPHandlerForTest() http.Handler {
 
 // HTTPSLegDrainedForTest reports whether the installed HTTPS leg has finished
 // its EXIT PATH AND ITS DRAIN — the listener is gone and every connection it
-// accepted has been finished or severed. False when no leg is installed.
+// accepted has been finished or severed, hijacked connections excepted (Go
+// excludes those from both Shutdown and Close; see drainLeg). False when no leg is installed.
 // Test-only, and specifically a CROSS-PACKAGE precondition helper (#6827 round
 // 7).
 //
@@ -985,7 +986,7 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, 
 }
 
 // serveBound serves already-bound listeners until ctx is cancelled or a listener
-// terminates with an error, then shuts BOTH down under a bounded 5s drain and
+// terminates with an error, then shuts BOTH down under a 5s-deadline drain and
 // joins both serve goroutines before returning (#5058 lifecycle, extracted for
 // the #5866 Start/Run split).
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {

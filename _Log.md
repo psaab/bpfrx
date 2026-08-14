@@ -79908,3 +79908,44 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   Validation: `gofmt` clean on every touched file, `go vet ./pkg/api ./pkg/daemon` clean,
   `go test ./pkg/api ./pkg/daemon -count=1` rc 0, `go test ./... -count=1` FULL_RC=0.
 - **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T10:40Z
+- **Action**: #6827 round 9 — a Codex leg at `047c9e38d` refuted three things I built, including
+  two the lead had praised. All verified in source before folding. **(1) "bounds the Shutdown"
+  was ALSO wrong — my second wrong version of that sentence.** `Shutdown`'s loop calls
+  `closeIdleConns()` and only reaches its `select { case <-ctx.Done() }` if that returns
+  false, and `closeIdleConns` walks `activeConn` under `s.mu` closing serially — so stalled
+  IDLE TLS peers overrun the context INSIDE Shutdown, before it is ever consulted
+  (`net/http/server.go` Shutdown + closeIdleConns, read directly). `legDrainTimeout` is a POLL
+  deadline bounding neither phase in wall-clock terms. Corrected there and swept across the
+  eight enumerated stale sites plus two more the enumeration missed
+  (`management_nilpublish_5561_test.go`, found by grepping the claim rather than the list).
+  **(2) The hijack gate is not a semantic gate, and `x/net/websocket` is a DIRECT dependency
+  of this module** (`go.mod:16`) whose `Server` hijacks internally — so
+  `mux.Handle("/ws", websocket.Handler(h))` adds the case with nothing in local syntax to
+  match. "by gate", "absence is enforced", "fails if one is added" were all false. Narrowed to
+  TRIPWIRE everywhere it is claimed, and the test now checks a third form — an import of a
+  package known to hijack (`x/net/websocket`, `net/http/httputil`) — while saying in its own
+  doc that reverse proxies, aliases and reflection still escape. **(3) `assertSevered` treated
+  ANY read error as closure, including its own 250ms read deadline**, so a stream merely
+  PAUSED would have passed. This is the second time this fixture trusted the wrong signal
+  (round 8 fixed a single-read version). It now treats a timeout as "keep waiting", requires a
+  non-timeout error for closure, and reports WHICH state it timed out in — "STILL STREAMING"
+  vs "OPEN BUT SILENT" — because those are different bugs. Re-ran F1a with the stricter
+  assertion: still RED on all three subtests, "STILL STREAMING", 3649/1426/1433 reads, so the
+  mutant's streams were genuinely alive rather than merely quiet.
+  Also: TryLock is stated as a TRADE, not a closure — it proves the mutex is held WHILE
+  sethostname runs, not that the hold is uninterrupted to the bump, so the split-hold shape
+  (B2c, GREEN) passes it; and I removed the starvation-mode sentence I had shipped on relay.
+  Codex retracted its own mechanism claim and it was right to: normal-mode waiters COMPETE
+  rather than re-queue, and `sync.Mutex` switches to starvation mode after ~1ms and hands
+  ownership to the waiter — so the window is improbable to observe, not impossible, and B2c's
+  GREEN means "did not observe", not "cannot be observed". `Shutdown` stopping further
+  requests is qualified as HTTP/1-only (h2 shutdown callbacks are async, so a stream can open
+  before GOAWAY). `listener.go:124`'s second "LAST act" corrected.
+  Validation: `go test ./pkg/api ./pkg/daemon -count=1` rc 0; `go test ./... -count=1`
+  FULL_RC=0.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/hostname_stale_cert_6827_test.go,
+  pkg/daemon/management_nilpublish_5561_test.go, pkg/daemon/README.md

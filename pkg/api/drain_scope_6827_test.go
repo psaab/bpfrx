@@ -48,17 +48,35 @@ func TestLegDrainTimeoutDefault_6827(t *testing.T) {
 // and read that as closing the case. It does not — it makes the case
 // UNREACHABLE, which is a property of the current code rather than of the
 // design, and the first person to add a WebSocket endpoint inherits an
-// invariant that silently stops holding. This test converts "absent" into
-// "refused", so that person is told at the point of the change.
+// invariant that silently stops holding. This test aims to tell that person at
+// the point of the change.
+//
+// IT IS A TRIPWIRE, NOT A PROOF OF ABSENCE, and round 8 claimed the stronger
+// thing (#6827 round 9). It catches three forms: a local type assertion to
+// http.Hijacker, a local call to Hijack, and an IMPORT of a package known to
+// hijack inside its own handler. That third check exists because the second
+// reviewer produced the counterexample that defeats a purely local walk —
+// `golang.org/x/net/websocket` is a DIRECT dependency of this module and its
+// Server calls `w.(http.Hijacker).Hijack()` internally, so
+// `mux.Handle("/ws", websocket.Handler(h))` adds a hijacked connection with
+// nothing in this package's syntax to match. Even with the import check,
+// reverse proxies, upgrade helpers, aliases, reflection and connections reached
+// through a context all escape. Read a pass as "none of the three known forms
+// is present", never as "this package cannot hijack".
 //
 // It scans the AST rather than the file text so a comment about hijacking (this
-// one, and drainLeg's) is not a false positive; it looks for the two forms that
-// can actually take a connection over — a type assertion to http.Hijacker, and
-// a call to a .Hijack() method.
+// one, and drainLeg's) is not a false positive — the guard has to be able to
+// coexist with its own documentation.
 func TestNoHijackerInThisPackage_6827(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read package dir: %v", err)
+	}
+	// Packages whose handlers hijack internally. Not exhaustive and cannot be —
+	// see the doc above — but these are the ones reachable from this module today.
+	hijackingImports := map[string]string{
+		"golang.org/x/net/websocket": "its Server calls w.(http.Hijacker).Hijack() internally",
+		"net/http/httputil":          "ReverseProxy and DumpRequest hijack for upgrades",
 	}
 	fset := token.NewFileSet()
 	var scanned int
@@ -72,6 +90,17 @@ func TestNoHijackerInThisPackage_6827(t *testing.T) {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 		scanned++
+		for _, imp := range f.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			if why, bad := hijackingImports[path]; bad {
+				t.Errorf("%s imports %s, which hijacks connections (%s). A hijacked connection "+
+					"is invisible to BOTH http.Server.Shutdown and http.Server.Close, so it "+
+					"outlives drainLeg with listenerLeg.drained stored. Either keep it off the "+
+					"management listener, or grow drainLeg per-connection tracking via an "+
+					"http.Server.ConnState hook (StateHijacked hands you the net.Conn) and close "+
+					"them there (#6827 round 9).", name, path, why)
+			}
+		}
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch v := n.(type) {
 			case *ast.TypeAssertExpr:

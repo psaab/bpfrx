@@ -465,6 +465,16 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 // goroutine, at the instant the kernel name moves, and its answer is the state
 // of the mutex — false while the fence holds, true the moment it does not.
 //
+// It is a TRADE, not a closure (#6827 round 9). What it proves is that the
+// mutex is held WHILE sethostname runs. What it cannot see is whether the hold
+// is UNINTERRUPTED from there to the bump: a shape that releases after the
+// syscall and re-takes for the ledger write passes this cell — TryLock observes
+// the first hold, and the closing read observes generation 1 — which is exactly
+// the B2c mutant recorded GREEN in _Log.md. The probabilistic gap the goroutine
+// version had is gone; this gap is deterministic and is covered structurally
+// instead, by the single deferred unlock over a body with no intermediate
+// release.
+//
 // RED on revert: take staleCertMu only for the ledger write and leave the
 // syscall outside it — the exact pre-round-7 shape, where applyHostname called
 // Sethostname and the generation moved afterwards. The observer then acquires
@@ -475,12 +485,17 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 // assumed: a shape that holds the mutex across the syscall, releases it, and
 // re-takes it for the bump stays GREEN. That shape is still defective — the gap
 // between the two holds is a window in which the name has moved and the
-// generation has not — but it is unobservable for a MECHANICAL reason, not
-// merely a narrow one: the first Unlock happens while the mutex is still in
-// NORMAL mode, so the re-acquiring goroutine wins the fast-path CAS and any
-// woken waiter simply re-queues. A waiter is not handed the mutex in that
-// window, so no probe of any kind lands in it. The guard against that shape is
-// structural instead: the fenced function holds the mutex with a
+// generation has not.
+//
+// Why no probe caught it, stated at the right strength (#6827 round 9 corrected
+// round 8, which asserted a mechanical impossibility): the first Unlock happens
+// while the mutex is in NORMAL mode, where a woken waiter COMPETES with the
+// re-acquiring goroutine rather than being handed ownership — and the
+// re-acquirer, already running, usually wins. Usually is not never: sync.Mutex
+// switches to STARVATION mode after a waiter has been blocked ~1ms and then
+// hands ownership directly to that waiter. So the window is improbable to
+// observe, not impossible, and B2c's GREEN is "did not observe it", not "cannot
+// be observed". The guard against that shape is structural instead: the fenced function holds the mutex with a
 // single `defer`ed unlock over a body with no intermediate release, which is
 // visible on inspection in a way an interleaving is not. The two ORDERINGS
 // inside the hold are bound behaviourally — ledger-after-syscall by

@@ -990,17 +990,31 @@ func newStreamFixture(t *testing.T, ctx context.Context) *streamFixture {
 	return &streamFixture{s: s, leg: leg, kln: kln, conn: conn, body: resp.Body}
 }
 
-// assertSevered drains the stream until the read errors, which is the only
-// honest form of the assertion: after the server closes a connection the client
-// keeps returning bytes that were already buffered, so a SINGLE read succeeding
-// proves nothing (measured — three reads and 19 buffered bytes before the error
-// surfaced). If bytes keep arriving past the bound, the response outlived the
-// drain and the leg's `drained` flag is a lie.
+// assertSevered drains the stream until the connection is CLOSED, and it
+// distinguishes that from "nothing arrived recently" — which is the whole
+// difficulty (#6827 round 9).
+//
+// Two ways to get this wrong, both of which this cell shipped at some point:
+//
+//   - trusting ONE read. After the server closes a connection the client still
+//     returns bytes that were already buffered — measured: three reads and 19
+//     bytes before the error surfaced — so a single successful read proves
+//     nothing about liveness, and a single failed one may just be the buffer
+//     boundary.
+//   - trusting ANY error. The round-8 version returned on the first error of
+//     any kind, including the 250ms read deadline it sets itself. A stream that
+//     is merely PAUSED — open, tracked, and free to resume — passes that. The
+//     assertion has to be "the peer closed it", not "it went quiet".
+//
+// So a timeout error is not an answer, it is a reason to keep waiting; only a
+// non-timeout error (EOF, reset, use-of-closed) proves closure. If the overall
+// bound expires the cell reports WHICH of the two states it was in, because
+// "still delivering" and "open but silent" are different bugs.
 func (f *streamFixture) assertSevered(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	buf := make([]byte, 512)
-	var total, reads int
+	var total, reads, timeouts int
 	for {
 		if err := f.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
 			t.Fatalf("set read deadline: %v", err)
@@ -1008,15 +1022,26 @@ func (f *streamFixture) assertSevered(t *testing.T) {
 		n, err := f.body.Read(buf)
 		total += n
 		reads++
-		if err != nil {
-			return // severed, as it must be
+		var ne net.Error
+		switch {
+		case err == nil:
+			// Bytes are still flowing: the response outlived its leg.
+		case errors.As(err, &ne) && ne.Timeout():
+			// OUR deadline, not the peer's close. Says nothing either way.
+			timeouts++
+		default:
+			return // the peer closed it, which is the assertion
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the response was STILL STREAMING %v after the leg finished draining "+
-				"(%d reads, %d bytes): Shutdown waits for an in-flight response and gives up on "+
-				"it at the deadline, so without the force-close a leg reports drained while it "+
-				"is still delivering to a client under a policy nothing will ever tighten "+
-				"(#6827 round 8)", 2*time.Second, reads, total)
+			state := "STILL STREAMING"
+			if timeouts > 0 && total == 0 {
+				state = "OPEN BUT SILENT (no bytes, and never closed)"
+			}
+			t.Fatalf("the response was %s %v after the leg finished draining (%d reads, %d "+
+				"bytes, %d read timeouts): Shutdown waits for an in-flight response and gives "+
+				"up on it at the deadline, so without the force-close a leg reports drained "+
+				"while a client can still be attached to it under a policy nothing will ever "+
+				"tighten (#6827 round 8)", state, 3*time.Second, reads, total, timeouts)
 		}
 	}
 }
