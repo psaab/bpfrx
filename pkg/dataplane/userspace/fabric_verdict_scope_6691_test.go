@@ -348,6 +348,82 @@ func TestFabricParentVerdictSurvivesACanonicalAlias(t *testing.T) {
 	}
 }
 
+// TestAFabricVoteCannotOverturnAnOwningRow pins the ROLE rule directly (#6691
+// round 11), on a snapshot built by hand rather than compiled from a config.
+//
+// That is deliberate, and it is what makes this test worth having. The two ways
+// production could put a disagreeing fabric vote next to an owning row — a
+// canonical alias in the member's name, a fabric refresh re-sampling the kernel
+// — are fixed at their sources, so no config reaches this state any more. The
+// mutation matrix says as much: severing the abstain-when-owned rule while those
+// two fixes are in place killed NOTHING, because the two owners now agree and
+// unanimity gives the same answer either way.
+//
+// A rule that holds only because its inputs happen to agree is the round-10
+// argument again ("production computes both from identical inputs") — true of
+// the code and false of two reachable configs. So this drives the state itself:
+// unbindable row, bindable fabric, one netdev. It also guards the snapshot as a
+// WIRE object, since the Rust plane runs the mirror of this tally over bytes it
+// did not compute; `fabric_vote_cannot_overturn_an_owning_row` drives the same
+// shape there.
+//
+// FAIL-ON-REVERT: let a fabric vote count while an interface row owns the netdev
+// (drop the netdevVoteAbstains branch in snapshotNetdevVotes) and this reds.
+func TestAFabricVoteCannotOverturnAnOwningRow(t *testing.T) {
+	const (
+		memberIfindex = 20
+		lanIfindex    = 21
+	)
+	member := InterfaceSnapshot{
+		Name:      "ge-0/0/0",
+		LinuxName: "ge-0-0-0",
+		Ifindex:   memberIfindex,
+		Zone:      "trust",
+		RXQueues:  1,
+		// The row's verdict: this device is a route-based IPsec tunnel.
+		SecureTunnel: true,
+	}
+	snap := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			member,
+			{Name: "ge-0/0/3", LinuxName: "ge-0-0-3", Ifindex: lanIfindex, Zone: "trust", RXQueues: 6},
+		},
+		Fabrics: []FabricSnapshot{{
+			Name:            "fab0",
+			ParentInterface: "ge-0/0/0",
+			ParentLinuxName: "ge-0-0-0",
+			ParentIfindex:   memberIfindex,
+			// THE DISAGREEMENT: the fabric says the same device is bindable.
+			ParentUnbindable: false,
+		}},
+	}
+
+	// PREMISES: the row must own the netdev and refuse it, or there is no
+	// verdict for the fabric vote to overturn.
+	if !userspaceOwnsItsNetdev(member) || !userspaceUnbindableNetdev(member) {
+		t.Fatalf("premise broken: the member row must own and refuse its netdev "+
+			"(owns=%v unbindable=%v)", userspaceOwnsItsNetdev(member), userspaceUnbindableNetdev(member))
+	}
+
+	refused := buildUserspaceRefusedNetdevs(snap)
+	if !refused.refusesName("ge-0-0-0") || !refused.refusesIfindex(memberIfindex) {
+		t.Errorf("refusesName=%v refusesIfindex=%v, want both true. A fabric row voting "+
+			"`bindable` was counted beside the only row that describes the device, and the "+
+			"resulting DISAGREEMENT was read as an admission. Two owners of one device "+
+			"differing is not evidence of bindability — it is evidence that one of them was "+
+			"computed from the wrong input",
+			refused.refusesName("ge-0-0-0"), refused.refusesIfindex(memberIfindex))
+	}
+	if got := buildUserspaceIngressIfindexes(snap); slices.Contains(got, uint32(memberIfindex)) {
+		t.Errorf("ingress-adjudication set = %v: the fabric loop re-admitted the refused "+
+			"netdev %d on its own vote", got, memberIfindex)
+	}
+	// NEGATIVE CONTROL: the LAN is untouched.
+	if got := buildUserspaceIngressIfindexes(snap); !slices.Contains(got, uint32(lanIfindex)) {
+		t.Errorf("ingress-adjudication set = %v: lost the LAN ifindex %d", got, lanIfindex)
+	}
+}
+
 // TestFabricRefreshCannotMoveADeviceVerdict is the #6691 round 11 guard for B2:
 // a fabric refresh carries MACs, not verdicts.
 //
