@@ -80863,3 +80863,97 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/server/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+
+- **Timestamp**: 2026-08-14T00:20Z
+- **Action**: #6691 round 11 — Codex MERGE-NEEDS-MAJOR at `8c011681c`: three runtime
+  blockers, all downstream of round 10 adding a SECOND producer of netdev verdicts
+  and teaching each consumer about it by hand. All three reproduced first at
+  `8c011681c`, then fixed.
+  **B1 (the v7 gate could not see the v7 verdict) — CONFIRMED, FIXED.**
+  `ensureSecureTunnelProtocolLocked` scoped itself with a scan of `snap.Interfaces`,
+  so a snapshot whose only unbindable verdict was a fabric parent's did not arm it:
+  measured at `8c011681c` on an ownerless live-xfrm member, `ParentUnbindable=true`,
+  no flagged row, `gate = nil`. The snapshot ships, a v6 helper refuses it on the
+  exact-equality version check, the commit reports success, and that helper stays
+  ARMED on a plan binding the refused netdev — the window the gate exists to close,
+  missed for the field the bump was made for. NOT fixed by adding a fabric loop to
+  the gate (the same hand-maintained second list, one round later):
+  `snapshotNetdevVotes` is now the ONE enumeration of who contributes a netdev, and
+  each contributor declares whether it speaks for the netdev, what its verdict is,
+  and whether that verdict rides on a field an older helper cannot read. The tally
+  and the gate both read it.
+  **B2 (a refresh re-decided the verdict) — REPRODUCED, FIXED.** `SyncFabricState`
+  rebuilds fabric rows from a FRESH xfrm sample and writes them back beside
+  interface rows only a full build re-derives. Neither plane replans there
+  (`update_fabrics` swaps `snapshot.fabrics` in place; `replan_queues` runs only
+  from the apply path), so the next partial republish ships a verdict the Go ingress
+  map never saw — an ifindex in that map with no READY binding is
+  `drop_degraded_transit`. Measured at `8c011681c`: ingress `[20 21]` before a
+  refresh, `[21]` after. `alignFabricVerdicts` keeps the verdict with the APPLIED
+  snapshot; the refresh carries MACs, ifindexes and link state as intended. Codex's
+  claim that the "SyncFabricState has no interface rows to agree with" comment was
+  wrong is CONFIRMED — both planes persist its rows beside existing interface rows —
+  and the comment is corrected with the fix.
+  **B3 (canonical aliases split one device into two owners) — REPRODUCED, FIXED.**
+  `member-interfaces gr-0/0/3` with the stanza authored `gr-0-0-3` is ONE device
+  under two legal names: the member must be slash-spelled for `InterfaceSlot` to
+  resolve its node, the stanza name is a wildcard, and
+  `validateInterfaceNameCollisionStrict` sees a single map key and cannot object.
+  The verdict's exact map lookup missed the `tunnel` stanza and voted bindable
+  against an unbindable row; measured at `8c011681c`, ingress `[20 21]` with 20 the
+  GRE device and allowlist `[ge-0-0-3 gr-0-0-3]`. Lookup now keyed on the NETDEV
+  (`interfaceConfigForNetdev`); it is the only exact-match lookup in `fabric.go`
+  that could miss (the fab interface itself is keyed by its own map key, and
+  `snapshotSecureTunnel`'s kernel half is netdev-keyed already).
+  **AND THE RULE CHANGED, because fixing both leaves the next divergence a
+  fail-open.** Round 10 counted the fabric as an owner beside any row, so one device
+  had two owners judged from different evidence — and unanimity reads a
+  disagreement as an ADMISSION. A fabric now votes only where NO interface row owns
+  the netdev: round 9 preserved exactly for row-owned netdevs, round 10 exactly for
+  ownerless ones, and never less refusing than either (suppressing a bindable fabric
+  vote can only turn "not refused" into "refused"). Mirrored in Rust's
+  `snapshot_refuses_parent_netdev`.
+  **REFUTED.** Codex's second B1 case — fabric-only `Tunnel` verdicts missed the
+  same way — does not exist. The Tunnel evidence comes from
+  `cfg.Interfaces.Interfaces`, and `buildInterfaceSnapshotsFrom` emits a base row
+  for EVERY entry in that map, so a Tunnel-class fabric verdict always has an owning
+  row and (under the new rule) is never load-bearing. A v6 helper reaches the same
+  verdict from the row's own pre-v7 `tunnel` field, so arming there would abort a
+  commit over a difference that does not exist — the gate deliberately does not.
+  **MINORS.** Bound the second `clearLastStatusLocked` in `stopLocked` (Codex's
+  deletion-survivor claim CONFIRMED: every existing stopLocked test runs with
+  `proc == nil`; deleting the post-teardown clear leaves them green while a stopped
+  helper keeps a stale `ConfigSnapshotProtocolVersion` with `helperStatusObserved`
+  still true — the exact pair the required-protocol gates read). Widened
+  `TestFabricAndBaseRowNeverDisagree` to pair a row with a fabric by NETDEV instead
+  of by authored spelling, which is why it could not see the alias, plus an alias
+  case.
+  **Validation — mutation grid, all cells on the worktree at `ee880b805` unless
+  noted.** G1 fabric verdict never needs the wire: rc=1, killed by the gate test AND
+  by the producer guard's coupling assertion. G2 fabric votes even when a row owns
+  it: rc=0 FIRST TIME — the rule was unguarded on the Go plane because the other two
+  fixes removed every config that reaches the state; added
+  `TestAFabricVoteCannotOverturnAnOwningRow`, which builds the snapshot by hand, and
+  re-ran: rc=1. G3 exact-spelling stanza lookup: rc=1, killed by
+  `TestFabricAndBaseRowNeverDisagree`. G4 refresh ships a freshly sampled verdict:
+  rc=1, `ingress [20 21] -> [21]`. G5 delete the post-teardown status clear: rc=1,
+  killed only by the new test. G6 a third producer emits a netdev with no verdict
+  (fabric loop also emits its OVERLAY ifindex): rc=1, the producer guard named the
+  section and the ifindex. G7 fabric never votes: rc=1, killed by the round-10
+  guard. R1 fabric counted beside an owning row: rc=101,
+  `fabric_vote_cannot_overturn_an_owning_row`. R2 fabric never votes: rc=101,
+  `ownerless_fabric_parent_is_refused`. Targeted Rust baseline before mutation: 103
+  passed / 0 failed.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/fabric.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  pkg/dataplane/userspace/fabric_ownerless_parent_6691_test.go,
+  pkg/dataplane/userspace/manager_ha_test.go,
+  pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go,
+  pkg/dataplane/userspace/mixed_version_matrix_6691_test.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md

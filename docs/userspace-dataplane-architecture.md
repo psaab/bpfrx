@@ -1699,17 +1699,60 @@ dump is also now taken ONCE per snapshot and shared by the row builder and the
 fabric builder, so two samples of a changing kernel cannot put one netdev's
 owners on opposite sides of the unanimity.
 
-A related invariant is worth stating because it is what keeps "a disagreement
-admits" safe: a BASE row and a fabric parent on the same netdev never disagree,
-since production computes both from identical config fields and the same kernel
-sample. The disagreements the rule tolerates are between a UNIT row and its base.
+**Round 11: one device, one verdict.** Round 10 rested on an invariant it stated
+and did not have — that a BASE row and a fabric parent on the same netdev never
+disagree, "since production computes both from identical config fields and the
+same kernel sample". Two ways to produce the disagreement were then measured, and
+because the unanimity rule reads a disagreement as an ADMISSION, each was a
+fail-open on a netdev the only row describing it had refused:
+
+- **A canonical alias.** `LinuxIfName` maps `/` to `-` and nothing else, so
+  `gr-0/0/3` and `gr-0-0-3` are one device under two authored names — and both
+  are legal, because a fabric member MUST be slot-spelled with slashes for
+  `InterfaceSlot` to resolve it to a node while the interface stanza's name is a
+  wildcard. `validateInterfaceNameCollisionStrict` cannot object: it compares
+  authored interface-map KEYS and there is only one. The verdict's exact map
+  lookup missed the stanza's `tunnel` and voted bindable against an unbindable
+  row. Fixed by keying the lookup on the NETDEV (`interfaceConfigForNetdev`).
+- **A re-sampled kernel.** `SyncFabricState` rebuilds the fabric rows from a
+  FRESH xfrm sample and writes them back beside interface rows that only a full
+  build re-derives. Neither plane replans on that path (`update_fabrics` swaps
+  `snapshot.fabrics` in place; `replan_queues` runs only from the apply path), so
+  the next partial republish shipped a verdict the Go ingress map had never seen
+  — and an ifindex in that map with no READY binding is `drop_degraded_transit`.
+  Fixed by `alignFabricVerdicts`: the refresh carries MACs, ifindexes and link
+  state, and the VERDICT stays the applied snapshot's until a new one is applied,
+  which is the only moment both planes recompute together.
+
+Fixing both would still leave the next such divergence a fail-open, so the RULE
+changed too: **a fabric parent votes only where no interface row owns the
+netdev** (`snapshotNetdevVotes`, mirrored by the `owners == 0` guard in Rust's
+`snapshot_refuses_parent_netdev`). That preserves round 9 exactly for row-owned
+netdevs and round 10 exactly for ownerless ones, and it is never less refusing
+than either — suppressing a bindable fabric vote can only turn "not refused" into
+"refused". The disagreements the rule still tolerates are between a UNIT row and
+its base, which is the case the round-9 argument was actually about.
 
 The secure-tunnel bump carries the matching gate,
 `ensureSecureTunnelProtocolLocked`, with sentinel
 `ErrSecureTunnelProtocolIncompatible` (also registered in
-`requiredProtocolGateSentinels`). It arms off `snapshotHasSecureTunnel`,
-which reads the flag off the SNAPSHOT the caller is publishing rather than
-re-deriving it. Round 8 hand-mirrored the builder's walk here and claimed the
+`requiredProtocolGateSentinels`). It arms off
+`snapshotRequiresRefusalProtocol`, which reads the SNAPSHOT the caller is
+publishing rather than re-deriving it.
+
+Its scope is derived from the SAME enumeration the verdicts are
+(`snapshotNetdevVotes`), and that is a round-11 repair with a specific cause:
+round 10 added a second producer of verdicts and taught the tally about it by
+hand, while the gate kept its own walk of `snap.Interfaces` — so the gate was
+silent for exactly the verdict the v7 bump exists for. An ownerless xfrm fabric
+parent shipped a v7 snapshot to a v6 helper, which refuses it on the
+exact-equality version check, and the commit reported success while the helper
+stayed armed on a plan that binds the refused netdev. Each contributor now
+declares for itself whether its verdict needs the wire, and
+`TestEveryNetdevProducerIsEnumerated` zeroes each snapshot section in turn to
+DISCOVER producers — a section that changes the emitted netdev set but not the
+enumeration reds under its own field name, so a third producer cannot repeat
+this. Round 8 hand-mirrored the builder's walk here and claimed the
 two "cannot diverge"; a review round measured them diverging, because the mirror
 took a SECOND RTM_GETLINK dump and an xfrm device visible to the builder and gone
 by the gate produced a flagged snapshot with a silent gate — the pre-v6 helper
