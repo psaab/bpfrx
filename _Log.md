@@ -79655,3 +79655,18 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
   pkg/api/tls_stale_cert_6827_test.go, pkg/daemon/management.go,
   pkg/daemon/README.md, pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-13T15:05Z
+- **Action**: #6827 — regenerated `docs/refactoring-audit-current.txt`. `go test ./...` at the
+  round-6 head surfaced `pkg/refactoraudit.TestHeatmapNotStale` RED: `pkg/api/server.go`
+  had entered the audit at `[WATCH]` (>=1500 LOC) without the heatmap being refreshed.
+  The gate was ALREADY red at the round-5 head `ccc2f6b09` — server.go was 1606 LOC
+  there (1307 on master), the heatmap is byte-identical between the two commits, and it
+  lists no `pkg/api/server.go` row; measured directly against a checkout at that commit.
+  Round 6 added 18 lines (comment corrections), taking it to 1624; the regenerated file
+  also picks up `pkg/daemon/daemon_system.go` 2262 -> 2297 from an earlier round of this
+  same PR. `[WATCH]` is advisory, so no split is demanded at this size. Also confirmed
+  the one other `go test ./...` failure — `pkg/ddns` "bind: address already in use" on an
+  ephemeral port — is a collision with a concurrent agent, not a regression: the package
+  passes standalone (rc 0).
+- **File(s)**: docs/refactoring-audit-current.txt
