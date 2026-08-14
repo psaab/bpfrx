@@ -422,8 +422,10 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
 /// `Clone`-shares-the-inner-`Arc<Mutex>` store, and the build's
 /// `attach_zone_counters` step OPENS with
 /// `state.zone_counter_store.reconcile(&configured)` — an in-place `retain`
-/// UNDER THE SHARED LOCK — and only THEN get-or-creates a block per configured
-/// zone in that same map. With `Some(&coord.forwarding)` a VALIDATION build
+/// UNDER THE SHARED LOCK — and only THEN get-or-creates a block per
+/// SLOT-ASSIGNED zone in that same map (`ZoneCounterSlotMap::build` skips zone
+/// id 0 and stops at `ZONE_COUNTER_ASSIGNABLE_SLOTS`, so it is a subset of the
+/// configured set, not all of it). With `Some(&coord.forwarding)` a VALIDATION build
 /// would prune the LIVE, published `coord.forwarding.zone_counter_store`,
 /// dropping cumulative per-zone traffic totals for any zone absent from the
 /// candidate snapshot — a mutation of the live observability surface

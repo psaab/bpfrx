@@ -327,7 +327,7 @@ const REUSE_RING_CAPACITY: u32 = 8;
 /// distinguishable payloads, and it says nothing whatever about the two guards
 /// whose surviving constant left the data intact. The per-batch checkpoints
 /// below are the first assertions in this file to bind the advance itself.
-const REUSE_BATCHES: [u32; 3] = [1, 3, 2];
+const REUSE_BATCHES: [u32; 3] = [1, 3, 3];
 
 /// Total slots a reuse fixture reserves / peeks: the sum of [`REUSE_BATCHES`].
 const REUSE_TOTAL: u32 = REUSE_BATCHES[0] + REUSE_BATCHES[1] + REUSE_BATCHES[2];
@@ -340,6 +340,22 @@ const REUSE_TOTAL: u32 = REUSE_BATCHES[0] + REUSE_BATCHES[1] + REUSE_BATCHES[2];
 //
 // At least two distinct batch sizes, so the runs still distinguish a
 // count-sized advance from a repeated-constant one.
+//
+// #6832 fold r5 — the NON-ZERO conjunct is not decoration, and its absence was
+// a real hole in this guard. Distinct ARRAY ELEMENTS is the wrong property:
+// what a run can distinguish is decided by its EXECUTED operation sizes, and a
+// zero batch executes no terminal operation at all. `[0, 2, 2]` satisfies the
+// distinctness disjunction below (0 != 2), yet the sizes actually driven
+// through the guard are 2 and 2 — a constant-2 advance is invisible to every
+// checkpoint. Measured: with `[0, 2, 2]` and this conjunct absent, the file
+// compiled and all 17 XSK tests passed. Requiring every element non-zero makes
+// "distinct elements" and "distinct executed sizes" the same statement again.
+const _: () = assert!(
+    REUSE_BATCHES[0] > 0 && REUSE_BATCHES[1] > 0 && REUSE_BATCHES[2] > 0,
+    "every reuse batch must be NON-ZERO: a zero batch executes no terminal op, \
+     so it cannot contribute a distinct executed size and a constant advance \
+     survives"
+);
 const _: () = assert!(
     REUSE_BATCHES[0] != REUSE_BATCHES[1]
         || REUSE_BATCHES[1] != REUSE_BATCHES[2]
@@ -351,16 +367,39 @@ const _: () = assert!(
 const _: () = assert!(REUSE_TOTAL <= REUSE_RING_CAPACITY);
 // The terminal-op-then-`Drop` fixtures leave the FINAL batch partly done, at
 // `REUSE_BATCHES[2] - 1`, so the drop has both a submit/release AND a non-zero
-// cancel to do. That needs a final batch of at least 2, and NOTHING above pins
-// it: `[1, 3, 1]` satisfies both self-checks above, and under it those fixtures
-// reach drop with nothing left to submit — they would pass VACUOUSLY, binding a
-// `Drop` that did nothing. `[_, _, 0]` is worse still: the subtraction
-// underflows. Compile-time rather than per-fixture, so it covers all three at
-// once and cannot be forgotten on a fourth.
+// cancel to do — and, at a final batch of 3 or more, has them at DIFFERENT
+// magnitudes. Both properties matter and they need different floors:
+//
+//   final batch  drop submits/releases  drop cancels
+//        1                 0                 1        <- no terminal work
+//        2                 1                 1        <- equal: a constant passes
+//        3                 2                 1        <- distinct: binds it
+//
+// The distinctness is the load-bearing one, and its absence was a live hole.
+// At a final batch of 2 the drop's two bridge arguments are both 1, so a `Drop`
+// implementation that hardcoded them — `release(1)` / `cancel(1)`, `submit(1)` /
+// `cancel(1)` — is indistinguishable from one computing the real per-item
+// values. Measured on the branch before #6832 fold r5: with the four `Drop`
+// bodies' bridge arguments replaced by the literal `1`, all 17 XSK tests
+// passed. At 3 the drop must submit 2 and cancel 1, so no single constant can
+// satisfy both.
+//
+// A correction to what this guard was previously documented to do, because the
+// claim was checked and is false. At a final batch of 1 the fixtures do NOT
+// "pass vacuously": each asserts `dropped_read > 0` (resp. `dropped_written`)
+// as a fixture precondition BEFORE reaching drop, so `[1, 3, 1]` with this
+// guard removed compiles and runs — 13 pass and exactly these four fail, at
+// that precondition, before `Drop` executes. What the guard actually buys is
+// centralising that failure at COMPILE time, once, where it cannot be forgotten
+// on a fifth fixture — not preventing a silent vacuous pass. `[_, _, 0]` would
+// underflow the subtraction, which the same floor also excludes.
 const _: () = assert!(
-    REUSE_BATCHES[2] >= 2,
-    "the drop fixtures need a final batch of at least 2 so REUSE_BATCHES[2] - 1 \
-     leaves work for Drop; at 1 they pass vacuously and at 0 they underflow"
+    REUSE_BATCHES[2] >= 3,
+    "the drop fixtures need a final batch of at least 3 so the drop's terminal \
+     count (REUSE_BATCHES[2] - 1) and its cancel count (1) are DISTINCT and \
+     both non-zero; at 2 they are both 1 and a Drop hardcoding its bridge \
+     arguments to a constant passes, at 1 the fixture preconditions fail, and \
+     at 0 the subtraction underflows"
 );
 
 /// Distinct non-zero payload for the `j`-th slot of a reuse run. Monotone in
@@ -711,6 +750,18 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
                 }
                 r.release();
                 read_so_far += n;
+                // PER-OPERATION checkpoint, not an aggregate. The two explicit
+                // releases sum to `released_explicitly`, and a constant advance
+                // can reach the same total by a different route (2+2 == 1+3), so
+                // an end-of-loop check alone admits it. Checking after EACH
+                // release rejects it at the first batch (#6832 fold r5).
+                assert_eq!(
+                    unsafe { *consumer },
+                    origin.wrapping_add(read_so_far),
+                    "origin {origin}: the consumer is not at {read_so_far} after \
+                     the explicit release of a {n}-descriptor batch — the release \
+                     advanced by something other than what it was handed"
+                );
             }
             assert_eq!(
                 unsafe { *consumer },
@@ -777,8 +828,17 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
 // The three fixtures below are the same shape as the `ReadRx` one, one per
 // remaining guard: run the first two batches to the terminal op explicitly,
 // leave the third PARTLY done, and let `Drop` finish. That gives the drop both
-// halves of its job at once — a submit/release AND a non-zero cancel — so a
-// drop that does either wrongly is observable.
+// halves of its job at once — a submit/release AND a non-zero cancel.
+//
+// "So a drop that does either wrongly is observable" is what r3 wrote here, and
+// at the batch sizes r3 chose it was FALSE. With a final batch of 2 the drop's
+// two counts were both 1, so a `Drop` hardcoding its bridge arguments to the
+// literal 1 produced byte-identical ring state — measured: all 17 XSK tests
+// passed under exactly that mutation. The claim is true at the CURRENT sizes
+// and only because of them: `REUSE_BATCHES[2] == 3` makes the drop submit 2 and
+// cancel 1, and the `>= 3` self-check above is what holds that apart. The
+// explicit batches are now checked per-operation rather than as one aggregate,
+// for the same reason — 1+3 and 2+2 reach the same total.
 //
 // Each is comparative: reverting its production line reds it while the
 // pre-existing tests in this file stay green (see `_Log.md` for the matrix).
@@ -817,6 +877,18 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
                 }
                 r.release();
                 read_so_far += n;
+                // PER-OPERATION checkpoint, not an aggregate. The two explicit
+                // releases sum to `released_explicitly`, and a constant advance
+                // can reach the same total by a different route (2+2 == 1+3), so
+                // an end-of-loop check alone admits it. Checking after EACH
+                // release rejects it at the first batch (#6832 fold r5).
+                assert_eq!(
+                    unsafe { *consumer },
+                    origin.wrapping_add(read_so_far),
+                    "origin {origin}: the consumer is not at {read_so_far} after \
+                     the explicit release of a {n}-descriptor batch — the release \
+                     advanced by something other than what it was handed"
+                );
             }
             assert_eq!(
                 unsafe { *consumer },
@@ -856,11 +928,25 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
 #[test]
 fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
     // The producer counterpart. `WriteTx::Drop` submits `written` and cancels
-    // `reserved - written`; every pre-existing fixture commits its whole
+    // `reserved - written`.
+    //
+    // What the pre-existing fixtures leave for that drop, stated exactly —
+    // an earlier round wrote "every pre-existing fixture commits its whole
     // reservation, so it drops with `written == 0` and `reserved == 0` and the
-    // body does nothing. A drop that skipped the submit would silently DISCARD
-    // descriptors the caller had already inserted — frames the caller believes
-    // it queued for TX are never handed to the kernel.
+    // body does nothing", and that is false in its second half and contradicts
+    // the block 90 lines above, which had it right. `commit()` zeroes `written`
+    // and subtracts it from `reserved`, so a fixture that commits everything it
+    // INSERTED still drops with `reserved` at whatever it over-reserved:
+    // `write_tx_two_inserts_append_not_overwrite` reserves 4 and inserts 3,
+    // `write_tx_single_insert_writes_base` reserves 4 and inserts 2. Both drop
+    // with `written == 0` — so the SUBMIT half is genuinely never exercised,
+    // which is what this fixture is for — but with `reserved` at 1 and 2, so
+    // the CANCEL half does run there. It is unobserved rather than unexecuted:
+    // neither reads `cached_prod` or `*producer` after the guard drops.
+    //
+    // A drop that skipped the submit would silently DISCARD descriptors the
+    // caller had already inserted — frames the caller believes it queued for TX
+    // are never handed to the kernel.
     for origin in CURSOR_ORIGINS {
         let mut tx = RingTx::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_prod_at(&mut tx.ring, origin);
@@ -889,6 +975,15 @@ fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
                 );
                 w.commit();
                 submitted += n;
+                // PER-OPERATION checkpoint — see the RX twin above for why an
+                // aggregate is not enough (#6832 fold r5).
+                assert_eq!(
+                    unsafe { *producer },
+                    base.wrapping_add(submitted),
+                    "origin {origin}: the producer is not at {submitted} after \
+                     the explicit commit of a {n}-descriptor batch — the commit \
+                     advanced by something other than what it was handed"
+                );
             }
             assert_eq!(
                 unsafe { *producer },
@@ -967,6 +1062,15 @@ fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
                 );
                 w.commit();
                 submitted += n;
+                // PER-OPERATION checkpoint — see the RX twin above for why an
+                // aggregate is not enough (#6832 fold r5).
+                assert_eq!(
+                    unsafe { *producer },
+                    base.wrapping_add(submitted),
+                    "origin {origin}: the producer is not at {submitted} after \
+                     the explicit commit of a {n}-descriptor batch — the commit \
+                     advanced by something other than what it was handed"
+                );
             }
             assert_eq!(
                 unsafe { *producer },

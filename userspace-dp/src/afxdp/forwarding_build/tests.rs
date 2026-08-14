@@ -5598,8 +5598,16 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
 // reconcile/refresh preflight ("keeping previous forwarding state") — but
 // the live store had already lost the removed zones' cumulative totals, so
 // an operator's `show security zones` traffic counters silently reset on a
-// commit that was never applied. The prune is now the last statement before
-// `Ok(state)`.
+// commit that was never applied.
+//
+// Where the prune lives now, corrected twice. r1's shape — "the last statement
+// before `Ok(state)`" — was replaced in r2 by the structural split, and that
+// sentence survived here describing a tree that no longer existed: after r2 the
+// prune was one of THREE statements in `attach_zone_counters`, with the
+// slot-map construction and the store assignment following it. r5 moved it out
+// of the build entirely, to `forwarding_build::commit_zone_counter_prune`,
+// which each apply path calls at its own commit point. What remains in the
+// build is additive only.
 
 /// Live state for the two tests below: zones 100 and 200 configured, with
 /// traffic folded into the shared store.
@@ -5826,7 +5834,9 @@ fn rejected_build_does_not_prune_live_zone_counters() {
 fn rejected_build_does_not_create_zone_blocks_in_the_live_store() {
     // The mirror image of the prune, and the half the sparse snapshot hides.
     // `ZoneCounterSlotMap::build` GET-OR-CREATES one atomic block per
-    // configured zone, resolved out of the store it is handed — and that is
+    // SLOT-ASSIGNED zone — a subset of the configured set, since it skips zone
+    // id 0 and stops at `ZONE_COUNTER_ASSIGNABLE_SLOTS` — resolved out of the
+    // store it is handed — and that is
     // the carried-forward, `Arc`-shared, LIVE store. So a candidate that
     // introduces a zone and is then REJECTED used to leave a zero-valued block
     // for that zone behind in the live map. `snapshot()` omits all-zero rows,
@@ -5868,10 +5878,106 @@ fn rejected_build_does_not_create_zone_blocks_in_the_live_store() {
 }
 
 #[test]
-fn accepted_build_still_prunes_zone_counters_for_removed_zones() {
-    // Anti-over-fix control: deferring the prune must not DELETE it. The
-    // same zone set, on a snapshot that builds cleanly, still drops the
-    // removed zone — and the surviving zone keeps its carried-forward
+fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
+    // #6832 fold r5. The two tests above pass a FRESH `PolicyCounterStore` and
+    // `NatCounterStore` into every row. That is not neutral: those two stores
+    // are also `Arc`-shared and are also written by the inner builder, ABOVE
+    // the last three belts, so a rejected build leaves get-or-create residue in
+    // each. Measured on this branch, with a candidate SNAT rule carrying a
+    // fresh `counter_id` and a malformed NPTv6 rule to reject the build:
+    //
+    //   nat_residue  = [4242]        <- pre-existing, tracked as #6995
+    //   zone_residue = [100, 200]    <- correct, this is what #6832 fixes
+    //
+    // Two things follow, and this test exists for the second. First, the
+    // #6995 residue is real and out of scope here — neither introduced nor
+    // fixed by this PR, and cross-referenced from `forwarding_build/mod.rs`
+    // and `docs/userspace-dataplane-gaps.md`. Second, and the reason the fresh
+    // stores are worth replacing in at least one row: a zone guarantee proved
+    // only against EMPTY sibling stores is a guarantee about a configuration
+    // that never happens in production, where all three arrive live and
+    // populated off the same coordinator. This row runs the same four
+    // rejection belts with all three stores live and asserts the zone half
+    // still holds.
+    for (label, snapshot, expected) in zone_counter_rejection_rows() {
+        let prev = zone_counter_prev_state();
+        // Live siblings, pre-populated the way a running coordinator's are.
+        let live_policy = PolicyCounterStore::default();
+        let live_nat = crate::nat::NatCounterStore::default();
+        let _ = live_nat.rule_counter(7777);
+        let mut snapshot = snapshot;
+        snapshot.source_nat_rules = vec![crate::protocol::SourceNATRuleSnapshot {
+            name: "candidate-snat".into(),
+            counter_id: 4242,
+            ..Default::default()
+        }];
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &live_policy,
+            &live_nat,
+            Some(&prev),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            expected(&err),
+            "{label}: rejected through a different belt than the row names ({err:?})"
+        );
+
+        assert_eq!(
+            prev.zone_counter_store.tracked_zone_ids_for_test(),
+            vec![100, 200],
+            "{label}: a REJECTED build mutated the live ZONE-counter store when \
+             the sibling policy/NAT stores were also live — the zone guarantee \
+             must not depend on its neighbours being empty"
+        );
+        // The scope boundary, asserted rather than only described: the NAT
+        // store IS touched, and this is #6995's residue, not a #6832
+        // regression. If a later change fixes #6995, this assertion is the one
+        // that says so out loud instead of going quietly stale.
+        //
+        // It is row-dependent, and that dependence is itself the useful part.
+        // The NAT rule parse sits in the MIDDLE of the fallible builder, so a
+        // belt ABOVE it rejects before any NAT counter is resolved and a belt
+        // BELOW it does not. #3719 duplicate-zone-id is the builder's first
+        // fallible step and is the only row above the parse; NPTv6, filter and
+        // CoS all follow it. So this pins the relative order of the dup-zone
+        // belt and the NAT parse as well as the residue itself — move the NAT
+        // parse above `reject_duplicate_zone_ids` and this reds.
+        let rejected_above_the_nat_parse = label.starts_with("#3719");
+        let mut nat_ids: Vec<u32> = live_nat.snapshots().iter().map(|s| s.counter_id).collect();
+        nat_ids.sort_unstable();
+        let expected_nat_ids: Vec<u32> = if rejected_above_the_nat_parse {
+            vec![7777]
+        } else {
+            vec![4242, 7777]
+        };
+        assert_eq!(
+            nat_ids, expected_nat_ids,
+            "{label}: the documented #6995 scope boundary moved. A belt BELOW \
+             the NAT rule parse leaves the candidate's counter_id behind in the \
+             live NAT store, and a belt ABOVE it does not — that residue is \
+             EXPECTED (see the builder's doc comment). If it is now absent for \
+             a below-the-parse row, #6995 was fixed and both that comment and \
+             the PR body's scope paragraph are stale"
+        );
+    }
+}
+
+#[test]
+fn accepted_build_defers_the_prune_to_the_commit_point() {
+    // #6832 fold r5. A clean BUILD no longer prunes, and that is the fix, not
+    // an omission: the build succeeding is not the apply committing. Worker
+    // bring-up can still reject the apply afterwards (#4952 spawn, #5143 bind),
+    // and pruning here destroyed a removed zone's cumulative totals for a
+    // configuration that never ran a worker — measured in
+    // `rejected_apply_does_not_prune_live_zone_counters_6832`.
+    //
+    // Anti-over-fix control, in the same test so the two halves cannot drift:
+    // the prune is DEFERRED, not deleted. `commit_zone_counter_prune` still
+    // drops the removed zone, and the survivor still keeps its carried-forward
     // totals rather than resetting.
     let prev = zone_counter_prev_state();
     let good_snapshot = ConfigSnapshot {
@@ -5890,11 +5996,33 @@ fn accepted_build_still_prunes_zone_counters_for_removed_zones() {
     )
     .expect("a clean snapshot must build");
 
+    // Half 1 — the build itself is now ADDITIVE ONLY. Zone 200 is absent from
+    // this snapshot and its totals are still here, because no apply has
+    // committed yet.
+    let mut after_build: Vec<u16> = next
+        .zone_counter_store
+        .snapshot()
+        .iter()
+        .map(|r| r.zone_id)
+        .collect();
+    after_build.sort_unstable();
+    assert_eq!(
+        after_build,
+        vec![100, 200],
+        "a clean BUILD must not prune: the apply it belongs to can still be \
+         rejected by worker bring-up, and the prune is unrecoverable"
+    );
+
+    // Half 2 — the commit point still prunes. This is the anti-over-fix
+    // control: reverting `commit_zone_counter_prune` to a no-op (rather than
+    // moving it) reds here, and every rejected-apply assertion stays green.
+    commit_zone_counter_prune(&next, &good_snapshot);
+
     let live = next.zone_counter_store.snapshot();
     assert_eq!(
         live.len(),
         1,
-        "an ACCEPTED build must still prune the removed zone's totals"
+        "a COMMITTED apply must still prune the removed zone's totals"
     );
     assert_eq!(live[0].zone_id, 100);
     assert!(

@@ -204,8 +204,9 @@ pub(super) fn build_forwarding_state_with_counters(
 /// `Arc`-backed, so the carry-forward `clone()` is a HANDLE ON THE LIVE STORE
 /// the running workers are folding into, not a copy — and binding a candidate
 /// to it mutates it two ways: [`ZoneCounterSlotMap::build`] GET-OR-CREATES a
-/// block per configured zone, and `reconcile` DROPS the blocks for zones the
-/// candidate no longer configures. A snapshot rejected by one of the fallible
+/// block per SLOT-ASSIGNED zone (a SUBSET of the configured set — it skips zone
+/// id 0 and stops at [`ZONE_COUNTER_ASSIGNABLE_SLOTS`]), and `reconcile` DROPS
+/// the blocks for zones the candidate no longer configures. A snapshot rejected by one of the fallible
 /// integrity belts is discarded by the reconcile/refresh preflight, which keeps
 /// the previous forwarding state — so neither mutation may have happened.
 ///
@@ -264,17 +265,28 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
 /// then build this snapshot's slot map against it.
 ///
 /// INFALLIBLE, and called only after the fallible builder has returned `Ok` —
-/// see [`build_forwarding_state_with_policy_counters_and_previous`]. Both
-/// statements below mutate the LIVE, `Arc`-shared store, so neither may run for
-/// a snapshot that is about to be rejected.
+/// see [`build_forwarding_state_with_policy_counters_and_previous`].
 ///
-/// Prune-then-resolve rather than the reverse: `reconcile` retains exactly
-/// `configured` and `build` get-or-creates a subset of `configured` (it skips
-/// zone id 0 and stops at [`ZONE_COUNTER_ASSIGNABLE_SLOTS`]), so the two orders
-/// reach the same map — but pruning first means the map never transiently holds
-/// the union. A zone present in both the old and new config keeps its SAME
-/// atomic block either way, which is what stops the #5163 lock-free per-slot
-/// fold resetting or double-counting across a slot renumber.
+/// This function is now ADDITIVE ONLY. It resolves (get-or-creates) one block
+/// per SLOT-ASSIGNED zone out of the live, `Arc`-shared store, and does not
+/// remove anything. The destructive half — dropping the blocks for zones the
+/// candidate no longer configures — moved to [`commit_zone_counter_prune`],
+/// which each apply path calls at ITS OWN commit point (#6832 fold r5). The
+/// reason is measured, not stylistic: a build can succeed and the apply STILL be
+/// rejected afterwards, by a worker-thread spawn failure (#4952) or an
+/// incomplete queue bind (#5143). Pruning here destroyed a removed zone's
+/// cumulative totals for a configuration that never brought up a single worker.
+///
+/// The residue this still leaves — a block for a candidate-only zone on a build
+/// whose apply is later rejected — is bounded (one block per rejected apply that
+/// adds or renumbers a zone), invisible to the sparse snapshot, and evicted by
+/// the next committed apply's prune. It is the same class as the pre-existing
+/// `PolicyCounterStore` / `NatCounterStore` residue tracked as #6995, and is
+/// unavoidable while the slot map caches real `Arc` handles at build time.
+///
+/// A zone present in both the old and new config keeps its SAME atomic block,
+/// which is what stops the #5163 lock-free per-slot fold resetting or
+/// double-counting across a slot renumber.
 fn attach_zone_counters(
     state: &mut ForwardingState,
     snapshot: &ConfigSnapshot,
@@ -285,10 +297,39 @@ fn attach_zone_counters(
     let store = previous
         .map(|p| p.zone_counter_store.clone())
         .unwrap_or_else(ZoneCounterStore::default);
-    let configured: rustc_hash::FxHashSet<u16> = zone_ids.iter().copied().collect();
-    store.reconcile(&configured);
     state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids, &store));
     state.zone_counter_store = store;
+}
+
+/// Drop the per-zone counter blocks for zones `snapshot` no longer configures.
+///
+/// DESTRUCTIVE, and therefore callable only once an apply is COMMITTED — the
+/// point past which no further step can reject it. There are two such points and
+/// they are not the same as "the build returned `Ok`":
+///
+/// * the full reconcile commits only after `bring_up_workers` returns `Ok`
+///   (`coordinator/reconcile/mod.rs`). A published forwarding state whose worker
+///   bring-up then failed is NOT committed: the `WorkerSpawn` arm leaves
+///   `coord.forwarding` in place, so `show security zones` keeps reporting from
+///   this store while no worker is running.
+/// * the same-plan refresh commits at its `self.forwarding = new_forwarding`
+///   swap (`coordinator/snapshot_refresh.rs`); nothing fallible follows it.
+///
+/// Deferring the prune costs nothing on the success path — it runs microseconds
+/// later, before any reader can observe the difference — and on the failure path
+/// it is exactly what preserves a removed zone's totals for the retry or the
+/// revert. The store is `Arc`-shared, so pruning through `state` prunes the map
+/// every generation's handle sees.
+///
+/// `rejected_apply_does_not_prune_live_zone_counters` (`coordinator/tests.rs`)
+/// drives the worker-spawn arm and reds when this call is hoisted back into
+/// [`attach_zone_counters`].
+pub(in crate::afxdp) fn commit_zone_counter_prune(
+    state: &ForwardingState,
+    snapshot: &ConfigSnapshot,
+) {
+    let configured: rustc_hash::FxHashSet<u16> = snapshot.zones.iter().map(|z| z.id).collect();
+    state.zone_counter_store.reconcile(&configured);
 }
 
 /// Every fallible step of the forwarding build. Returns `Err` on any snapshot

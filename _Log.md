@@ -1,3 +1,191 @@
+## 2026-08-13 — #5716 (7/7): the build succeeding is not the apply committing
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r5)
+- **Action**: One RUNTIME fix with a real operator-visible harm, one test-guard
+  fix that was a live hole in a guard this branch itself added, four Drop
+  fixtures made discriminating, and five prose corrections. Raised by the
+  hostile review at c2845c041 (MERGE-NEEDS-MAJOR). Every finding was
+  re-measured here before being acted on; the one that did not survive
+  re-measurement as framed is recorded below as a non-defect rather than
+  quietly fixed.
+
+  **B2 (BLOCKING, RUNTIME) — a rejected APPLY still destroyed a removed zone's
+  totals.** r2 moved the per-zone counter binding out of the fallible builder so
+  a snapshot rejected by an INTEGRITY belt could not touch the live store. That
+  holds. What it does not cover is the rest of the rejection surface: a build
+  can succeed and the apply still be rejected afterwards, by a worker-thread
+  spawn failure (#4952) or an incomplete queue bind (#5143). Reproduced with
+  live zones `{100,200}` carrying folded traffic, candidate `{100,300}`, and
+  `force_worker_spawn_fail = 1`:
+
+  ```
+  PROBE-B2 before rows=[100, 200] tracked=[100, 200]
+  PROBE-B2 reconcile is_err=true variant=WorkerSpawn
+  PROBE-B2 after  rows=[100]      tracked=[100, 300]
+  ```
+
+  Zone 200's cumulative totals are gone, for a configuration that never brought
+  up a single worker. The `WorkerSpawn` arm is what makes this operator-visible
+  rather than merely internal, and the two arms are NOT equivalent — documented
+  at `reconcile/bringup.rs:7-8`, `WorkerBindIncomplete` calls `stop_inner(false)`
+  (which defaults `coord.forwarding`, so the coordinator's own view goes empty)
+  while `WorkerSpawn` returns WITHOUT it, leaving the candidate state published.
+  So on the spawn arm `show security zones` keeps reporting, from a store whose
+  history for the removed zone has already been destroyed. Measured on the bind
+  arm too: `after rows=[] tracked=[]` for `coord.forwarding`, but an independent
+  handle on the original `Arc` shows the same `tracked=[100,300]`.
+
+  Fix: split the two mutations by WHEN they may run, not by where they sit.
+  `attach_zone_counters` is now ADDITIVE ONLY — it resolves the slot map's
+  per-zone `Arc`s and assigns the store. The destructive prune moved to
+  `forwarding_build::commit_zone_counter_prune`, which each apply path calls at
+  ITS OWN commit point: the reconcile only when `bring_up_workers` returned
+  `Ok`, the same-plan refresh at its `self.forwarding` swap (nothing fallible
+  follows it — the refresh keeps its live workers). Deferring costs nothing on
+  the success path and is exactly what preserves the totals for the retry or the
+  revert on the failure path. The additive get-or-create stays where it is: the
+  slot map must cache real handles at build time, so a candidate-only block for
+  a rejected apply is unavoidable — bounded at one per rejected apply, invisible
+  to the sparse snapshot, evicted by the next committed prune, and the same
+  class as the #6995 residue.
+
+  **B1 (raised BLOCKING) — REFUTED AS A DEFECT OF THIS PR, and measured.** The
+  report is that a rejected SNAT+NPTv6 apply leaves a candidate-only row in
+  `Coordinator::nat_rule_counters()`. It does, and the probe confirms it:
+
+  ```
+  PROBE-B1 err          = Nptv6UnparseableRule { rule_name: "bad-parse", ... }
+  PROBE-B1 nat_residue  = [4242]
+  PROBE-B1 zone_residue = [100, 200]
+  ```
+
+  But this is not new information at this head and it is not unscoped. It is
+  pre-existing, is already filed as **#6995** (which contains this same probe),
+  and is already documented in three places on this branch — the builder's doc
+  comment, `docs/userspace-dataplane-gaps.md:222`, and the PR body's "Scope,
+  stated exactly" paragraph, which states in as many words that the absolute
+  claim is NOT made. Folding a fix would be re-scoping #6995 into this PR.
+
+  What WAS missing is a binding. Both rejected-build tests passed a FRESH
+  `NatCounterStore` and `PolicyCounterStore` into every row, so the zone
+  guarantee was only ever proved against EMPTY siblings — a configuration that
+  never occurs in production, where all three arrive live off one coordinator.
+  Added `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`:
+  the same four belts, all three stores live and pre-populated, asserting the
+  zone half still holds AND asserting the #6995 boundary explicitly, so a later
+  fix to #6995 reds this test instead of leaving three stale documents behind.
+  The boundary assertion is row-dependent and that dependence is itself a bind:
+  the NAT parse sits mid-builder, so #3719 dup-zone (the FIRST fallible step)
+  rejects above it and leaves `[7777]` while the other three leave
+  `[4242, 7777]` — moving the NAT parse above `reject_duplicate_zone_ids` reds it.
+
+  **B3 — four Drop fixtures could not tell the intended values from a constant.**
+  r3 added three sibling Drop fixtures (plus r2's `ReadRx` one) to bind the half
+  of `Drop` that no fixture executed. With `REUSE_BATCHES = [1, 3, 2]` the final
+  batch is 2, so the drop always releases/submits exactly 1 AND cancels exactly
+  1. Neither cursor origin changes those values. Measured: with all four `Drop`
+  bodies' bridge arguments replaced by the literal `1`, **all 17 XSK tests
+  passed**. The preceding 1/3 operations were checked only as an aggregate 4,
+  which a constant 2 also satisfies.
+
+  Fixed on both axes. `REUSE_BATCHES` is now `[1, 3, 3]`, so the drop must
+  submit/release 2 and cancel 1 — distinct, so no single constant satisfies
+  both — and each explicit terminal op now has its own cursor checkpoint instead
+  of one aggregate. Comparative proof, same mutation, same crate, same
+  invocation:
+
+  | mutation | before r5 | after r5 |
+  |---|---|---|
+  | all four `Drop` bridge args := `1` | 17 pass, 0 fail | 13 pass, **4 fail** (`left: 5, right: 6`, terminal assertion) |
+  | all four `Drop` bridge args := `2` | not run | 13 pass, **4 fail** (`left: 5, right: 6`, cancel assertion) |
+
+  The two constants fail at DIFFERENT assertions, which is the point: 1 is
+  caught by the terminal count, 2 by the cancel.
+
+  **B4 — the self-check I added in r4 had a hole, and its stated reason was
+  false.** Two separate defects in one guard.
+
+  (a) `[0, 2, 2]` satisfies all three r4 self-checks — measured: it compiled and
+  all 17 tests passed — because a zero batch executes no terminal operation, so
+  the sizes actually driven are 2 and 2 and a constant-2 advance is invisible.
+  Distinct ARRAY ELEMENTS was the wrong property; the guard needs distinct
+  NON-ZERO executed sizes. Added the non-zero conjunct; `[0, 2, 2]` now fails to
+  compile.
+
+  (b) The `>= 2` guard's comment claimed `[1, 3, 1]` would make the drop
+  fixtures "pass VACUOUSLY". Checked, and false. With the guard present
+  `[1, 3, 1]` fails to compile (E0080 at `xsk_ffi_tests.rs:360`, as claimed);
+  with the guard ALSO removed it compiles and runs, and 13 pass while exactly
+  the four Drop fixtures FAIL — at their runtime `dropped_read > 0` fixture
+  precondition, before `Drop` executes. So the guard centralises that failure at
+  compile time where it cannot be forgotten on a fifth fixture; it is not what
+  prevents a silent vacuous pass. The floor is now `>= 3` (B3's distinctness
+  requirement, which is strictly stronger) with the rationale rewritten to what
+  was measured.
+
+  **Prose (five sites).** Each cite resolved against the tree before editing.
+  `xsk_ffi_tests.rs` batch-1 vacuity claim — false, rewritten (B4b).
+  "a drop that does either wrongly is observable" — was false at r3's sizes,
+  now true and annotated as true only because of the `>= 3` floor.
+  "every previous fixture commits its whole reservation … `reserved == 0` and
+  the body does nothing" — false in its second half and contradicting a correct
+  block 90 lines above: `commit()` zeroes `written` and subtracts it from
+  `reserved`, so `write_tx_two_inserts_append_not_overwrite` (reserves 4,
+  inserts 3) and `write_tx_single_insert_writes_base` (reserves 4, inserts 2)
+  drop with `written == 0` but `reserved` at 1 and 2, so the CANCEL half DOES
+  run there — unobserved, not unexecuted.
+  `forwarding_build/tests.rs` "the prune is now the last statement before
+  `Ok(state)`" — stale since r2 and now doubly so; rewritten with both moves.
+  "one block per configured zone" — imprecise at four sites
+  (`zone_counters.rs`, `forwarding_build/mod.rs`, `reconcile/snapshot.rs`,
+  `forwarding_build/tests.rs`): `ZoneCounterSlotMap::build` skips zone id 0 and
+  stops at `ZONE_COUNTER_ASSIGNABLE_SLOTS`, so it is a strict SUBSET. The one
+  site that already stated the exceptions was left alone.
+
+  `_Log.md`'s S5 sentence credited cells "M7/M8" that do not exist — the matrix
+  runs M1-M4 and the paragraph below it says the four further cells were only
+  QUEUED. Corrected in place: the indirect binding of S5 is left standing as an
+  assertion about the file's assertions, no longer credited to evidence that was
+  never produced.
+
+- **Mutation matrix.** Each cell run over the whole bin suite (minus the
+  three `wg::engine::engine_internal_tests` cells that hang under load), so
+  every RED is named against a live green denominator in the SAME invocation.
+
+  | cell | mutation | result |
+  |---|---|---|
+  | MUT-B2a | prune hoisted back into `attach_zone_counters` (pre-r5 shape) | 4264 pass, **2 fail**: `rejected_apply_does_not_prune_live_zone_counters_6832`, `accepted_build_defers_the_prune_to_the_commit_point` |
+  | MUT-B2b | reconcile commit-point call DELETED | 4265 pass, **1 fail**: `committed_reconcile_prunes_zone_counters_for_removed_zones_6832` |
+  | MUT-B2c | refresh commit-point call DELETED | 4265 pass, **1 fail**: `committed_refresh_prunes_zone_counters_for_removed_zones_6832` |
+  | MUT-B3 | four `Drop` bridge args := `1` | 13 pass, **4 fail** (was 17/17 GREEN before this round) |
+  | MUT-B3b | four `Drop` bridge args := `2` | 13 pass, **4 fail** |
+  | MUT-B4a | `REUSE_BATCHES = [0, 2, 2]` | **E0080** on the new non-zero conjunct (compiled + 17/17 green before) |
+  | MUT-B4b | `REUSE_BATCHES = [1, 3, 1]`, `>= 2` guard removed | 13 pass, **4 fail** at the fixture precondition — NOT a vacuous pass |
+
+  The three B2 cells are mutually exclusive: no cell reds another cell's test,
+  so each production line is bound by exactly one assertion and the reconcile
+  and refresh call sites are bound separately. `force_worker_healthy_stub`
+  (#6242) is what makes the committed-reconcile direction reachable at all in
+  process — without it every unit reconcile fails at `WorkerBindIncomplete`
+  (UMEM create is EPERM unprivileged) and the positive direction would be
+  untestable.
+
+- **Control**: `cargo test --bins -- --skip wg::engine::engine_internal_tests`
+  → **4266 passed; 0 failed; 2 ignored; 24 filtered out**, FULL_RC=0. No Go file
+  is touched by this round. `cargo fmt --check` reports diffs for 2510 files
+  across the crate including untouched ones — a pre-existing repo-wide
+  toolchain mismatch, and none of the diff hunks land on lines added here
+  (checked).
+
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/mod.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
+
 ## 2026-08-13 — #5716 (6/6): the round about overshooting corrections overshot one
 
 - **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r4)
@@ -224,8 +412,17 @@
   known-unbound: the sweep found exactly one asymmetric row (S6) plus one row
   (S7) that was weak in all four columns, and both are closed by the three new
   fixtures. S5 for the two consumers is bound INDIRECTLY — through the terminal
-  exhaustion check plus the post-drop `cached_cons` equality, not a named
-  assertion on `peeked` — which cells M7/M8 below confirm is sufficient.
+  exhaustion check plus the post-drop `cached_cons` equality, rather than a
+  named assertion on `peeked`.
+
+  **Correction (r5).** The sentence above previously ended "…which cells M7/M8
+  below confirm is sufficient". No such cells exist. The matrix below runs
+  M1-M4, and the paragraph after it says in as many words that the four further
+  cells — including the two `release`-side `peeked` shrinks that would have
+  been M7/M8 — were QUEUED and are not part of the entry. The indirect binding
+  of S5 is therefore ASSERTED here, not measured; it is left standing as a
+  claim about the assertions in the file, which is checkable by reading them,
+  and it is no longer credited to evidence that was never produced.
 
 - **Mutation matrix.** Eight production lines in `xsk_ffi.rs`, each reverted on
   its own, in an ISOLATED worktree copy so no mutation could reach the tree

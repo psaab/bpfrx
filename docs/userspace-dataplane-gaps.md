@@ -212,14 +212,41 @@ counters (see below).
   catches; a hoist ABOVE it, to the top of the fallible region, reds the
   dup-zone row of both zone tests (measured, #6832 fold r4).
   A single-belt fixture binds neither: it stays green when a *different* belt
-  moves. `accepted_build_still_prunes_zone_counters_for_removed_zones` is the
+  moves. `accepted_build_defers_the_prune_to_the_commit_point` is the
   anti-over-fix control. The create half is only observable through
   `ZoneCounterStore::tracked_zone_ids_for_test`, since the operator-facing
   `snapshot()` omits all-zero rows by design.
 
+  **The rejection surface is wider than the integrity belts (#6832 fold r5).**
+  Everything above concerns a snapshot the BUILDER rejects. A build can also
+  succeed and the apply still be rejected afterwards, by a worker-thread spawn
+  failure (#4952) or an incomplete queue bind (#5143) — and the destructive
+  prune used to have already run by then, so a removed zone's cumulative totals
+  were destroyed for a configuration that never brought up a worker (measured:
+  live `{100,200}`, candidate `{100,300}`, forced spawn failure → visible rows
+  `[100]`). The two bring-up failure arms are not equivalent:
+  `WorkerBindIncomplete` calls `stop_inner`, which defaults `coord.forwarding`;
+  `WorkerSpawn` does not, so the candidate state stays PUBLISHED and
+  `show security zones` keeps reporting from the store it just pruned.
+
+  The prune therefore now lives in `forwarding_build::commit_zone_counter_prune`
+  and each apply path calls it at its own commit point — the full reconcile only
+  after `bring_up_workers` returns `Ok`, the same-plan refresh at its
+  `self.forwarding` swap (nothing fallible follows it). The build keeps only the
+  ADDITIVE get-or-create, which cannot be deferred: the slot map caches real
+  per-zone `Arc`s at build time. Bound by
+  `rejected_apply_does_not_prune_live_zone_counters_6832` (negative) plus
+  `committed_reconcile_…` / `committed_refresh_…` (one per call site).
+
   Scope note: this is the ZONE-counter store only. The same rejected build
   still leaves get-or-create residue in the shared `PolicyCounterStore` and
-  `NatCounterStore` — pre-existing, untouched by #6832, tracked as **#6995**.
+  `NatCounterStore` — pre-existing, untouched by #6832, tracked as **#6995**,
+  and now asserted rather than only described, by
+  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`: it
+  drives the four belts with all three stores LIVE (the other rejection tests
+  pass fresh siblings, so they prove the zone guarantee only against empty
+  neighbours) and pins the residue, so a later fix to #6995 reds it instead of
+  leaving this note stale.
 
 - **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting (the screen module holds per-zone

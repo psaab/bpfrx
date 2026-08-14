@@ -204,7 +204,12 @@ pub(in crate::afxdp) fn publishable_zone_rows(
 }
 
 /// #5163: shared cumulative per-zone traffic totals as four `Relaxed` atomics.
-/// One block per configured zone id; the per-batch worker fold `fetch_add`s
+/// One block per SLOT-ASSIGNED zone id — not per configured zone.
+/// [`ZoneCounterSlotMap::build`] skips zone id 0 and stops once
+/// [`ZONE_COUNTER_ASSIGNABLE_SLOTS`] are taken, so a config carrying zone 0 or
+/// more than that many zones resolves a block for a strict SUBSET of what it
+/// configures; the rest get slot 0 and go uncounted (`overflow_active`). The
+/// per-batch worker fold `fetch_add`s
 /// into it lock-free (the same lock-free shared-counter shape as
 /// `PolicyRuleCounter`), and the ≤ 1 s status/clear path reads/zeroes it under
 /// the store mutex. Cache-line sharing between workers `fetch_add`ing the same
