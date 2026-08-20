@@ -1,3 +1,99 @@
+## 2026-08-14 — #5716 (8/8): a guard that quantifies over the array, not the loop
+
+- **Timestamp**: 2026-08-14 (fix/5716-afxdp-api-hardening, PR #6832 review fold r6)
+- **Action**: Two guard-completeness holes, both in the XSK fixture layer, both
+  in guards this branch itself added, and both reproduced here before being
+  acted on. The production zone-prune split from r5 was verified clean by the
+  review and is untouched.
+
+  **F1 — "no constant survives" was false for the CANCEL half.** Hardcoding
+  ONLY the `Drop` cancel argument to `1` in all four impls left the suite at
+  **4266 passed, 0 failed** — bit-identical to baseline. The r5 `>= 3` floor
+  made the submit/release count distinct from the cancel count and left the
+  cancel count INVARIANT at 1 in every fixture and at both cursor origins.
+
+  The methodological error is worth naming exactly, because the measurement was
+  sound and the generalisation was not. Showing that constants `1` and `2` fail
+  at *different* assertions proves those two JOINT substitutions fail. It says
+  nothing about either POSITION independently. To generalise to "no constant
+  survives", every substituted position must VARY across the drive set — and
+  the cancel position never varied, so the evidence certified exactly the half
+  that was already working.
+
+  **F2 — `[1, 1, 3]` satisfies every r5 guard and restores vacuity.** It
+  compiles, passes 17/17, and greens all four Drop fixtures under a constant
+  `base_idx` advance that reds 4 of 4 at `[1, 3, 3]` (measured both ways). The
+  distinctness disjunction is satisfied via `B[1] != B[2]`, while the Drop
+  fixtures' explicit loop runs only `B[0]` and `B[1]` — both 1.
+
+  Same shape as re-keying a colliding key: the constraint MOVED rather than
+  closed, and a neighbouring triple took the dead one's place. `[0, 2, 2]` was
+  closed in r5; `[1, 1, 3]` walked into the gap. A fifth conjunct would move it
+  again.
+
+  **The fix is one rule, applied to both: a self-check must quantify over the
+  same values its fixture drives.** So the consts ARE the loops' iterands:
+
+  - `EXPLICIT_BATCHES` = the two batches each Drop fixture runs to an explicit
+    terminal op. The fixtures iterate it and guard (3) asserts over it, so
+    "the guard names something the loop never executes" is unstateable rather
+    than merely currently-false. Guard (3) is `EXPLICIT_BATCHES[0] !=
+    EXPLICIT_BATCHES[1]` — which `[1, 1, 3]` fails.
+  - `DROP_PARTIALS = [1, 2]` — each entry is one drive, so `Drop` runs at
+    `(terminal, cancel) = (p, B[2] - p)`. Two distinct partials make the
+    terminal count vary AND the cancel count vary INVERSELY, so whatever value
+    a constant picks is right for at most one drive. That is what binds the
+    cancel position, which no single pinned partial could.
+
+  The `REUSE_BATCHES[2] >= 3` floor is now DERIVED rather than asserted: two
+  distinct partials both inside `1..B[2]` cannot exist below 3. A floor that
+  follows from the property it serves cannot drift away from it — which is
+  exactly how the r5 floor came to be true-but-insufficient.
+
+  **F3 — the `previous = None` safety rationale described pre-r5 behaviour.**
+  The worst of the stale sites, because a rationale that describes the old
+  behaviour is what someone cites when undoing the fix. Rewritten at
+  `reconcile/snapshot.rs`: the conclusion survives but the REASON changed. The
+  prune-the-live-store harm is gone (the prune moved to
+  `commit_zone_counter_prune`, which validation never calls); what remains is
+  the ADDITIVE half — every validation build would leave a zero-valued block
+  per candidate-only zone in the live map, the #6995 residue class. So
+  `previous = None` stays load-bearing, and the comment now says explicitly:
+  do not relax it *on the grounds that the prune moved*.
+
+- **Mutation matrix.** Every cell over the whole bin suite with
+  `--no-fail-fast`, so "exactly these four red" is a claim over the complete
+  population rather than over whatever ran before cargo stopped.
+
+  | cell | mutation | before r6 | at this tree |
+  |---|---|---|---|
+  | CONTROL | none | — | rc=0, **4266 pass, 0 fail** |
+  | CANCEL-ONLY-1 | only the 4 cancel args := `1` | **4266 pass, 0 fail (SURVIVED)** | rc=101, 4262 pass, **4 fail** |
+  | CANCEL-ONLY-2 | only the 4 cancel args := `2` | not run | rc=101, 4262 pass, **4 fail** |
+  | TERMINAL-ONLY-1 | only the 4 terminal args := `1` | not run | rc=101, 4262 pass, **4 fail** |
+  | TERMINAL-ONLY-2 | only the 4 terminal args := `2` | not run | rc=101, 4262 pass, **4 fail** |
+  | BOTH-1 | both args := `1` | 4 fail | rc=101, 4262 pass, **4 fail** |
+  | TRIPLE-1-1-3 | `REUSE_BATCHES = [1, 1, 3]` | **compiled, 17/17, 0 of 4 Drop fixtures red under constant advance** | **E0080** on guard (3) |
+  | TRIPLE-0-2-2 | `REUSE_BATCHES = [0, 2, 2]` | E0080 (r5) | **E0080** ×2 |
+  | TRIPLE-1-3-2 | `REUSE_BATCHES = [1, 3, 2]` | E0080 (r5 floor) | **E0080** on the DERIVED partial-range guard |
+
+  The two rows that matter are the ones that changed state: CANCEL-ONLY-1 went
+  from a silent survivor to a 4-way red, and TRIPLE-1-1-3 from a clean compile
+  to a build failure. Terminal and cancel are now bound INDEPENDENTLY — each
+  position reds on its own substitution, which is the property r5 claimed and
+  did not have.
+
+- **Harness note.** The first matrix run was killed mid-cell (I was still
+  editing while it ran, which would have contaminated every later cell) and it
+  stranded the CANCEL-ONLY-1 mutation in `xsk_ffi.rs`. Caught immediately by a
+  CONTENT diff against a backup copy rather than by `git status` — the same
+  failure this file recorded one round ago, now with the better primitive:
+  back up and restore by content, and assert the files MATCH THE BACKUP before
+  every cell.
+
+- **File(s)**: `userspace-dp/src/xsk_ffi_tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`, `_Log.md`
+
 ## 2026-08-13 — #5716 (7/7): the build succeeding is not the apply committing
 
 - **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r5)

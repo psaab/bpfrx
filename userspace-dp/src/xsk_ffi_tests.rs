@@ -338,70 +338,104 @@ const REUSE_TOTAL: u32 = REUSE_BATCHES[0] + REUSE_BATCHES[1] + REUSE_BATCHES[2];
 // BUILD if a later edit to the constants above quietly invalidates the
 // fixtures that consume them.
 //
-// At least two distinct batch sizes, so the runs still distinguish a
-// count-sized advance from a repeated-constant one.
+// #6832 fold r6 — these guards are now stated over the positions each loop
+// ACTUALLY EXECUTES, because twice running a guard phrased over the whole array
+// was satisfied by a triple its consuming loop could not distinguish.
 //
-// #6832 fold r5 — the NON-ZERO conjunct is not decoration, and its absence was
-// a real hole in this guard. Distinct ARRAY ELEMENTS is the wrong property:
-// what a run can distinguish is decided by its EXECUTED operation sizes, and a
-// zero batch executes no terminal operation at all. `[0, 2, 2]` satisfies the
-// distinctness disjunction below (0 != 2), yet the sizes actually driven
-// through the guard are 2 and 2 — a constant-2 advance is invisible to every
-// checkpoint. Measured: with `[0, 2, 2]` and this conjunct absent, the file
-// compiled and all 17 XSK tests passed. Requiring every element non-zero makes
-// "distinct elements" and "distinct executed sizes" the same statement again.
+// The rule the two escapes share: **a self-check must quantify over the same
+// values its fixture drives.** `[0, 2, 2]` passed a distinctness disjunction via
+// a zero that executes no operation at all. `[1, 1, 3]` passed the same
+// disjunction via `B[1] != B[2]`, while the Drop fixtures' explicit loop runs
+// only `B[0]` and `B[1]` — both 1. Each time the constraint MOVED rather than
+// closed, and a neighbouring triple took the dead one's place; a fifth conjunct
+// would move it again. So the arrays below ARE the loops' iterands: each fixture
+// iterates the same const its guard asserts over, which makes "the guard names
+// something the loop never executes" unstateable rather than merely
+// currently-false.
+
+// (1) Every reuse batch NON-ZERO — a zero batch executes no terminal operation,
+// so it contributes no executed size. Measured: with `[0, 2, 2]` and this
+// conjunct absent, the file compiled and all 17 XSK tests passed.
 const _: () = assert!(
     REUSE_BATCHES[0] > 0 && REUSE_BATCHES[1] > 0 && REUSE_BATCHES[2] > 0,
     "every reuse batch must be NON-ZERO: a zero batch executes no terminal op, \
      so it cannot contribute a distinct executed size and a constant advance \
      survives"
 );
+
+// (2) The ORDINARY reuse fixtures drive all three batches with a checkpoint
+// after each (`for n in REUSE_BATCHES`), so two distinct sizes anywhere in the
+// triple do suffice for them. This assertion is correct FOR THEM and was never
+// the hole — it is simply not the Drop fixtures' precondition.
 const _: () = assert!(
     REUSE_BATCHES[0] != REUSE_BATCHES[1]
         || REUSE_BATCHES[1] != REUSE_BATCHES[2]
         || REUSE_BATCHES[0] != REUSE_BATCHES[2],
-    "reuse fixtures need at least two DISTINCT batch sizes to reject a constant advance"
+    "the ordinary reuse fixtures need at least two DISTINCT sizes among the \
+     three they execute, to reject a constant advance"
+);
+
+/// The batches every **Drop** fixture drives to an EXPLICIT terminal op before
+/// leaving the final one partly done. The fixtures iterate THIS, and guard (3)
+/// asserts over THIS, so the two cannot drift apart.
+const EXPLICIT_BATCHES: [u32; 2] = [REUSE_BATCHES[0], REUSE_BATCHES[1]];
+
+// (3) The Drop fixtures' explicit loop executes ONLY these two, so rejecting a
+// constant advance there needs THESE TWO distinct — not merely two distinct
+// somewhere in the triple. `[1, 1, 3]` satisfies (2) and fails here: measured,
+// it compiled, passed 17/17, and greened all four Drop fixtures under a constant
+// `base_idx` advance that reds 4 of 4 at `[1, 3, 3]`.
+const _: () = assert!(
+    EXPLICIT_BATCHES[0] != EXPLICIT_BATCHES[1],
+    "the Drop fixtures explicitly execute only REUSE_BATCHES[0] and [1], so \
+     THOSE TWO must differ; distinct sizes elsewhere in the triple cannot help \
+     a loop that never runs them"
+);
+
+/// How much of the final batch each Drop fixture consumes before letting `Drop`
+/// finish it. Every entry is one drive, so `Drop` runs at
+/// `(terminal, cancel) = (p, REUSE_BATCHES[2] - p)` for each `p`.
+///
+/// Driving MORE THAN ONE is what binds the cancel argument, and its absence was
+/// a live hole. At a single pinned partial both counts are fixed across all four
+/// fixtures and both cursor origins, so a `Drop` hardcoding either position is
+/// indistinguishable. Measured at the r5 shape (`p` pinned to
+/// `REUSE_BATCHES[2] - 1`): hardcoding ONLY the cancel argument to `1` left the
+/// suite at **4266 passed, 0 failed** — identical to baseline. The r5 evidence
+/// (constants `1` and `2` failing at different assertions) proved only that
+/// those two JOINT substitutions fail; it could not speak to the cancel
+/// position, which never varied.
+const DROP_PARTIALS: [u32; 2] = [1, 2];
+
+// (4) Each partial leaves BOTH halves of `Drop` real work: `p` to
+// submit/release and `REUSE_BATCHES[2] - p` to cancel, both non-zero.
+const _: () = assert!(
+    DROP_PARTIALS[0] >= 1
+        && DROP_PARTIALS[1] >= 1
+        && DROP_PARTIALS[0] < REUSE_BATCHES[2]
+        && DROP_PARTIALS[1] < REUSE_BATCHES[2],
+    "every drop partial must lie in 1..REUSE_BATCHES[2] so Drop has a non-zero \
+     terminal count AND a non-zero cancel count"
+);
+
+// (5) The partials must DIFFER, so the terminal count varies across drives —
+// and since cancel is `REUSE_BATCHES[2] - p`, the cancel count varies too,
+// INVERSELY. That inverse pairing is what leaves no constant satisfying either
+// position: whatever value a constant picks is right for at most one drive.
+//
+// The old `REUSE_BATCHES[2] >= 3` floor is now DERIVED from (4)+(5) rather than
+// asserted as its own magic number: two distinct partials both inside
+// `1..B[2]` cannot exist below 3. A floor that follows from the property it
+// serves cannot drift away from it, which is exactly how the previous floor
+// came to be true-but-insufficient.
+const _: () = assert!(
+    DROP_PARTIALS[0] != DROP_PARTIALS[1],
+    "the drop partials must DIFFER, or the terminal and cancel counts are the \
+     same in every drive and a hardcoded constant survives in both positions"
 );
 // Each slot of a run must land in its own ring slot; otherwise a misplaced
 // write could alias onto the very value it was supposed to corrupt.
 const _: () = assert!(REUSE_TOTAL <= REUSE_RING_CAPACITY);
-// The terminal-op-then-`Drop` fixtures leave the FINAL batch partly done, at
-// `REUSE_BATCHES[2] - 1`, so the drop has both a submit/release AND a non-zero
-// cancel to do — and, at a final batch of 3 or more, has them at DIFFERENT
-// magnitudes. Both properties matter and they need different floors:
-//
-//   final batch  drop submits/releases  drop cancels
-//        1                 0                 1        <- no terminal work
-//        2                 1                 1        <- equal: a constant passes
-//        3                 2                 1        <- distinct: binds it
-//
-// The distinctness is the load-bearing one, and its absence was a live hole.
-// At a final batch of 2 the drop's two bridge arguments are both 1, so a `Drop`
-// implementation that hardcoded them — `release(1)` / `cancel(1)`, `submit(1)` /
-// `cancel(1)` — is indistinguishable from one computing the real per-item
-// values. Measured on the branch before #6832 fold r5: with the four `Drop`
-// bodies' bridge arguments replaced by the literal `1`, all 17 XSK tests
-// passed. At 3 the drop must submit 2 and cancel 1, so no single constant can
-// satisfy both.
-//
-// A correction to what this guard was previously documented to do, because the
-// claim was checked and is false. At a final batch of 1 the fixtures do NOT
-// "pass vacuously": each asserts `dropped_read > 0` (resp. `dropped_written`)
-// as a fixture precondition BEFORE reaching drop, so `[1, 3, 1]` with this
-// guard removed compiles and runs — 13 pass and exactly these four fail, at
-// that precondition, before `Drop` executes. What the guard actually buys is
-// centralising that failure at COMPILE time, once, where it cannot be forgotten
-// on a fifth fixture — not preventing a silent vacuous pass. `[_, _, 0]` would
-// underflow the subtraction, which the same floor also excludes.
-const _: () = assert!(
-    REUSE_BATCHES[2] >= 3,
-    "the drop fixtures need a final batch of at least 3 so the drop's terminal \
-     count (REUSE_BATCHES[2] - 1) and its cancel count (1) are DISTINCT and \
-     both non-zero; at 2 they are both 1 and a Drop hardcoding its bridge \
-     arguments to a constant passes, at 1 the fixture preconditions fail, and \
-     at 0 the subtraction underflows"
-);
-
 /// Distinct non-zero payload for the `j`-th slot of a reuse run. Monotone in
 /// `j`, and never 0 (the test ring backing is zero-initialised), so a write
 /// that lands on the wrong slot is detectable both at the slot it corrupted
@@ -724,6 +758,7 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
     // slots were leaked for the life of the socket. Post-#5716 the release
     // reaches the kernel and the cancel covers exactly the peeked-but-unread
     // remainder.
+    for dropped_read in DROP_PARTIALS {
     for origin in CURSOR_ORIGINS {
         let mut rx = RingRx::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_cons_at(&mut rx.ring, origin);
@@ -734,8 +769,8 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
 
         // Read part of the final batch and leave the rest peeked-but-unread,
         // so the drop has BOTH a release and a non-zero cancel to do.
-        let released_explicitly = REUSE_BATCHES[0] + REUSE_BATCHES[1];
-        let dropped_read = REUSE_BATCHES[2] - 1;
+        let released_explicitly = EXPLICIT_BATCHES[0] + EXPLICIT_BATCHES[1];
+        
         assert!(
             dropped_read > 0 && dropped_read < REUSE_BATCHES[2],
             "fixture: the final batch must be partly read so drop does both a \
@@ -744,7 +779,7 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
         {
             let mut r = rx.receive(REUSE_TOTAL);
             let mut read_so_far = 0u32;
-            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+            for n in EXPLICIT_BATCHES {
                 for _ in 0..n {
                     r.read().expect("descriptor inside the peek window");
                 }
@@ -798,8 +833,8 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
              the peeked-but-unread remainder"
         );
     }
+    }
 }
-
 // ── Terminal-op-then-Drop, for the other three guards ────────────
 //
 // #6832 fold r3. The fixture above closed the `read -> release -> read ->
@@ -853,6 +888,7 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
     // completion entries unreleasable — the kernel never learns the TX frames
     // were reaped, so the completion ring loses those slots for the life of the
     // socket.
+    for dropped_read in DROP_PARTIALS {
     for origin in CURSOR_ORIGINS {
         let mut dq = DeviceQueue::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_cons_at(dq.rings.comp_mut(), origin);
@@ -861,8 +897,8 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
         }
         let consumer = dq.rings.comp().consumer;
 
-        let released_explicitly = REUSE_BATCHES[0] + REUSE_BATCHES[1];
-        let dropped_read = REUSE_BATCHES[2] - 1;
+        let released_explicitly = EXPLICIT_BATCHES[0] + EXPLICIT_BATCHES[1];
+        
         assert!(
             dropped_read > 0 && dropped_read < REUSE_BATCHES[2],
             "fixture: the final batch must be partly read so drop does both a \
@@ -871,7 +907,7 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
         {
             let mut r = dq.complete(REUSE_TOTAL);
             let mut read_so_far = 0u32;
-            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+            for n in EXPLICIT_BATCHES {
                 for _ in 0..n {
                     r.read().expect("entry inside the peek window");
                 }
@@ -923,8 +959,8 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
              the peeked-but-unread remainder"
         );
     }
+    }
 }
-
 #[test]
 fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
     // The producer counterpart. `WriteTx::Drop` submits `written` and cancels
@@ -947,13 +983,14 @@ fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
     // A drop that skipped the submit would silently DISCARD descriptors the
     // caller had already inserted — frames the caller believes it queued for TX
     // are never handed to the kernel.
+    for dropped_written in DROP_PARTIALS {
     for origin in CURSOR_ORIGINS {
         let mut tx = RingTx::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_prod_at(&mut tx.ring, origin);
         let producer = tx.ring.producer;
 
-        let committed = REUSE_BATCHES[0] + REUSE_BATCHES[1];
-        let dropped_written = REUSE_BATCHES[2] - 1;
+        let committed = EXPLICIT_BATCHES[0] + EXPLICIT_BATCHES[1];
+        
         assert!(
             dropped_written > 0 && dropped_written < REUSE_BATCHES[2],
             "fixture: the final batch must be partly inserted so drop does both \
@@ -965,7 +1002,7 @@ fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
             base = w.base_idx;
             assert_eq!(base, origin, "reservation must start at the seeded cursor");
             let mut submitted = 0u32;
-            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+            for n in EXPLICIT_BATCHES {
                 let first = submitted;
                 assert_eq!(
                     w.insert((0..n).map(|k| desc(reuse_payload(first + k)))),
@@ -1026,21 +1063,22 @@ fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
             );
         }
     }
+    }
 }
-
 #[test]
 fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
     // Twin of the `WriteTx` fixture above. A fill-ring drop that skipped the
     // submit would strand UMEM frames: the caller has handed them to the fill
     // writer and will not re-post them, but the kernel never sees them, so
     // those RX buffers are lost for the life of the socket.
+    for dropped_written in DROP_PARTIALS {
     for origin in CURSOR_ORIGINS {
         let mut dq = DeviceQueue::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_prod_at(dq.rings.fill_mut(), origin);
         let producer = dq.rings.fill().producer;
 
-        let committed = REUSE_BATCHES[0] + REUSE_BATCHES[1];
-        let dropped_written = REUSE_BATCHES[2] - 1;
+        let committed = EXPLICIT_BATCHES[0] + EXPLICIT_BATCHES[1];
+        
         assert!(
             dropped_written > 0 && dropped_written < REUSE_BATCHES[2],
             "fixture: the final batch must be partly inserted so drop does both \
@@ -1052,7 +1090,7 @@ fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
             base = w.base_idx;
             assert_eq!(base, origin, "reservation must start at the seeded cursor");
             let mut submitted = 0u32;
-            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+            for n in EXPLICIT_BATCHES {
                 let first = submitted;
                 assert_eq!(
                     w.insert((0..n).map(|k| reuse_payload(first + k))),
@@ -1111,8 +1149,8 @@ fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
             );
         }
     }
+    }
 }
-
 // ── libxdp ring ABI contract (#4976) ─────────────────────────────
 //
 // The authoritative guard is the `const _` block in `xsk_ffi.rs` (fails
