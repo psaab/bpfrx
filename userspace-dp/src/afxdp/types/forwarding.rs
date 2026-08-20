@@ -630,11 +630,16 @@ impl ForwardingState {
     /// ingress surface is unreachable — stated carefully, because it is only
     /// unreachable in one of the two shapes:
     ///
-    /// - In the QUARANTINE shape every row on the ifindex is unzoned, and
-    ///   `buildUserspaceIngressInterfaces` (`pkg/dataplane/userspace/
-    ///   interfaces.go`, `if iface.Zone == "" { continue }`) gives an unzoned
-    ///   row no AF_XDP bind target, so no packet ever ingresses there and only
-    ///   the PROPAGATED `ifindex_to_zone_id` entry exists.
+    /// - In the QUARANTINE shape every row on the ifindex is unzoned, and an
+    ///   unzoned row is given no AF_XDP bind target: BOTH Go-side derivations
+    ///   open with the same `if iface.Zone == "" || userspaceSkipsIngressInterface(iface)`
+    ///   guard — `UserspaceBoundLinuxInterfaces`
+    ///   (`pkg/dataplane/userspace/interfaces.go:133`, guard at `:164`), which
+    ///   scopes the ethtool allowlist, and `buildUserspaceIngressIfindexes`
+    ///   (`pkg/dataplane/userspace/maps_sync.go:1585`, guard at `:1592`), which
+    ///   writes the ingress ifindex map the shim keys on. So no packet ever
+    ///   ingresses there and only the PROPAGATED `ifindex_to_zone_id` entry
+    ///   exists.
     /// - In the sibling / divergent shapes the BASE row is zoned, so the
     ///   ifindex genuinely is a bind target and ingress really does answer
     ///   `vpnb` for traffic arriving on it.

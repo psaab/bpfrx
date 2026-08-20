@@ -856,9 +856,12 @@ Scope of the fallback:
   ingress still attributes an arriving packet to `ifindex_to_zone_id`
   (#921/#3618, unchanged), while egress answers 0. The asymmetry is justified by
   DIRECTION, not by the ingress surface being unreachable — that is only true in
-  shape 3, where every row is unzoned and `interfaces.go`'s
-  `if iface.Zone == "" { continue }` gives the ifindex no AF_XDP bind target at
-  all. In shapes 1 and 2 the base row is zoned, so the ifindex *is* a bind
+  shape 3, where every row is unzoned and the two Go-side derivations that scope
+  ingress both open with `if iface.Zone == "" ||
+  userspaceSkipsIngressInterface(iface)`: `UserspaceBoundLinuxInterfaces`
+  (`interfaces.go:133`, guard at `:164`) and `buildUserspaceIngressIfindexes`
+  (`maps_sync.go:1585`, guard at `:1592`). Together they give the ifindex no
+  AF_XDP bind target at all. In shapes 1 and 2 the base row is zoned, so the ifindex *is* a bind
   target and ingress really does answer `vpnb` for arriving traffic. What makes
   the two halves different is that ingress answering wide is pre-existing
   behaviour this change does not touch, while egress answering wide is a NEW
@@ -885,11 +888,14 @@ Scope of the fallback:
   userspace-dp fixtures modelling these shapes cannot drift to a snapshot the
   builder cannot emit.
 - **The egress row's `zone_id` comes from the ledger too (#6722 B1).**
-  `egress_zone_id` reads `state.egress` BEFORE the fallback, and
-  `populate_egress` writes that map **last-write-wins per ifindex**. While the
-  row's own zone was the source, a zoned row emitted last re-armed an ifindex
-  the ledger held ambiguous and the gate was bypassed entirely — the to-zone
-  never consulted the ledger at all.
+  *(Historical, as of round 9.)* `egress_zone_id` then read `state.egress`
+  BEFORE the fallback, and `populate_egress` writes that map **last-write-wins
+  per ifindex**. While the row's own zone was the source, a zoned row emitted
+  last re-armed an ifindex the ledger held ambiguous and the gate was bypassed
+  entirely — the to-zone never consulted the ledger at all. Round 10 removed
+  the `state.egress` arm outright; see the entry below on why it stopped being
+  load-bearing. The defect and the fix are recorded here because the shape is
+  what motivated the single-source rule.
 
   That is not confined to MAC-less interfaces. An interface-level WireGuard
   tunnel maps EVERY unit onto the base device (`TunnelNameMap`,
@@ -902,9 +908,14 @@ Scope of the fallback:
   `from-zone lan to-zone vpnb permit`.
 
   `populate_egress` therefore takes `zone_id` from
-  `ifindex_unambiguous_zone_id`, so both arms of the resolver derive from one
-  source and cannot disagree. Where the rows agree the value is identical to the
-  row's own zone, so an ordinary single-unit interface is unaffected.
+  `ifindex_unambiguous_zone_id` rather than from the row it is writing. That is
+  still true at round 10 and is what makes the single-arm resolver sound: with
+  both the resolver and `EgressInterface::zone_id` reading the same map, the
+  `state.egress` arm could only ever have returned the number the remaining arm
+  returns, which is why it was deleted rather than kept as a second opinion (see
+  "`egress_zone_id` no longer has an `egress` arm" below). Where the rows agree
+  the value is identical to the row's own zone, so an ordinary single-unit
+  interface is unaffected.
 
 - **The egress answer is decided in Go, and the helper corroborates it
   (#6722 round 10).** `stampEgressZones`

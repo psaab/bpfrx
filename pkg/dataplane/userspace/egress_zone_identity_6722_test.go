@@ -562,6 +562,188 @@ func TestContestedNetdevOwnershipFailsClosed_6722(t *testing.T) {
 	}
 }
 
+// N: TWO AUTHORED ZONES on one COHERENT netdev — rule 2's conflict arm.
+//
+// Every other fail-closed cell in this file reaches "" through rule 1
+// (`egressIdentitiesCohere`). This one does not, and that distinction is the
+// reason it exists: here the two identities DO cohere — `ge-0/0/1` is a bare
+// port of `reth1` — and the answer is refused one step later, because the
+// operator wrote a `security-zone ... interfaces` binding for BOTH of them.
+//
+// Reachable by an ORDINARY COMMIT, not only on the tolerant path. This cell
+// compiles through the STRICT `CompileConfig`: `validateRethMemberStrict`
+// rejects a member that carries units, a tunnel, or is itself a reth, but it
+// says nothing about a member the operator also put in a zone. So an operator
+// who zones the port as well as the reth — a plausible mistake, since Junos
+// accepts the words — reaches this arm at commit.
+//
+// Why the answer must be "": the reth's LAN transit and the member's `wan`
+// binding name the same netdev, and `st.authored` is a SET with no ordering.
+// Picking either one would adjudicate one identity's traffic under the other's
+// policy, and picking "whichever the map iterator yields" would make the
+// to-zone NONDETERMINISTIC across restarts — Go randomises map iteration order.
+//
+// The Rust corroboration cannot cover this. `ge-0/0/1`'s row literally carries
+// `wan`, so `carried.contains("wan")` succeeds and a claim of `wan` would be
+// honoured; the helper has no way to know the reth's `lan` was equally
+// authored. This arm is the only thing that refuses.
+//
+// FAIL-ON-REVERT: replace `case len(st.authored) > 1: zone = ""` with any arm
+// that picks one of the authored zones and N1 goes RED (the control N2 stays
+// green either way, which is what makes N1's failure specific to the conflict).
+func TestTwoAuthoredZonesOnOneCoherentNetdevFailClosed_6722(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+		"set interfaces reth1 redundant-ether-options redundancy-group 1",
+		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone lan interfaces reth1",
+		"set security zones security-zone wan interfaces ge-0/0/1",
+	}
+	links := map[string]int{"ge-0-0-1": 24}
+	macs := map[string]string{"ge-0-0-1": "02:bf:72:01:00:01"}
+
+	// N1. `compileWithStubbedLinks6722(..., lenient=false)` fatals if the STRICT
+	// compiler rejects, so reaching the assertion is itself the proof that an
+	// ordinary `commit` admits this config.
+	cfg := compileWithStubbedLinks6722(t, lines, links, macs, false)
+	snaps := buildInterfaceSnapshots(cfg)
+
+	// The preconditions that separate this cell from every rule-1 cell above.
+	member := snapByName6722(t, snaps, "ge-0/0/1")
+	base := snapByName6722(t, snaps, "reth1")
+	if member.Ifindex != 24 || base.Ifindex != 24 {
+		t.Fatalf("precondition: ge-0/0/1=%d reth1=%d, want 24/24 — the two "+
+			"authored identities must share ONE netdev", member.Ifindex, base.Ifindex)
+	}
+	if member.Zone != "wan" || base.Zone != "lan" {
+		t.Fatalf("precondition: ge-0/0/1 Zone=%q reth1 Zone=%q, want \"wan\" and "+
+			"\"lan\" — BOTH identities must be authored into a zone, or this is a "+
+			"single-binding shape rule 2 resolves normally",
+			member.Zone, base.Zone)
+	}
+	// Rule 1 does NOT fire here, which is the whole point. Asserted directly
+	// against the predicate so a future change that starts refusing this shape
+	// at rule 1 fails loudly rather than silently re-pointing the cell at a
+	// different mechanism.
+	if !egressIdentitiesCohere(cfg, map[string]string{
+		"ge-0/0/1": "ge-0/0/1",
+		"reth1":    "reth1",
+	}) {
+		t.Fatalf("precondition: egressIdentitiesCohere refused {ge-0/0/1, reth1}; " +
+			"a bare member port and its reth MUST cohere, and if they no longer do " +
+			"then this cell is measuring rule 1 and the conflict arm is once again " +
+			"unbound")
+	}
+	assertEgressZone6722(t, snaps, 24, "",
+		"the operator authored `lan` on reth1 and `wan` on its member port, and "+
+			"the two name ONE netdev. `st.authored` is an unordered set, so any "+
+			"answer other than \"\" adjudicates one identity's transit under the "+
+			"other's policy — and a map-iteration pick would vary between restarts")
+
+	// N2 — the CONTROL, and the thing that makes N1's failure specific. Drop the
+	// second authored binding and NOTHING else: the same netdev, the same two
+	// coherent identities, one authored zone. It must resolve `lan`. Without
+	// this, a mutation that broke coherence entirely would red N1 and look like
+	// the conflict arm was bound.
+	_, ctlSnaps := buildSnapshotsFromSet6722(t, lines[:4], links, macs)
+	assertEgressZone6722(t, ctlSnaps, 24, "lan",
+		"removing ONLY the member's zone binding leaves one authored zone on a "+
+			"coherent netdev, which rule 2 resolves; if this control also answers "+
+			"\"\" then the cell above is measuring coherence, not the conflict arm")
+}
+
+// O: a UNIT-LESS reth named as another reth's member — the `HasPrefix(name,
+// "reth")` conjunct of `egressMemberIsBarePort`, on the path it exists for.
+//
+// The three sibling cells that exercise "a reth is never a member port" (L, and
+// the two rejection cells) all measure the COMMIT GATE: they assert that strict
+// `CompileConfig` refuses the shape. The runtime clause is a different guarantee
+// — `egressMemberIsBarePort`'s own comment says it "is the runtime half that
+// must hold on the tolerant load / peer-sync path, where those rejections are
+// downgraded to warnings (#1960 no-brick)" — and until this cell nothing bound
+// it. The one lenient-path cell (J) uses `st0`, a name with no `reth` prefix, so
+// the conjunct is irrelevant to it.
+//
+// The clause only bites for a reth with NO configured unit. A member-named reth
+// that carries units is already refused by the `firstConfiguredUnit` conjunct,
+// which is why every fixture written before this one reached the answer through
+// a different clause and this one stayed unbound.
+//
+// FAIL-ON-REVERT: drop `strings.HasPrefix(name, "reth")` from
+// `egressMemberIsBarePort` and O1 goes RED (it resolves `lan`); O2 stays green,
+// which is what shows the failure is caused by the member's NAME and not by
+// anything else in the shape.
+func TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722(t *testing.T) {
+	lines := []string{
+		"set interfaces reth1 gigether-options redundant-parent reth0",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone lan interfaces reth0",
+	}
+	links := map[string]int{"reth1": 24}
+
+	// The commit gate refuses this shape, so the TOLERANT path is the only way
+	// it reaches the builder. Pinned rather than assumed: if strict ever started
+	// admitting it, "only reachable leniently" would be false and the reader
+	// would be misled about which surface this clause defends.
+	if _, err := config.CompileConfig(treeFromSet6722(t, lines)); err == nil {
+		t.Fatalf("precondition: strict CompileConfig ADMITTED a reth naming " +
+			"another reth as its redundant parent; this cell claims the shape only " +
+			"arrives via the tolerant load / peer-sync path, and that claim is now " +
+			"false")
+	}
+
+	cfg := compileWithStubbedLinks6722(t, lines, links, map[string]string{}, true)
+	snaps := buildInterfaceSnapshots(cfg)
+
+	// The precondition that makes the clause the ONLY thing answering: reth1
+	// carries no configured unit, so `firstConfiguredUnit` does not refuse it
+	// and `ifc.Tunnel` is nil.
+	if member := cfg.Interfaces.Interfaces["reth1"]; member == nil {
+		t.Fatalf("precondition: reth1 is absent from the compiled config")
+	} else if _, hasUnit := firstConfiguredUnit(member); hasUnit {
+		t.Fatalf("precondition: reth1 carries a configured unit, so the " +
+			"firstConfiguredUnit conjunct refuses it and the reth-prefix clause is " +
+			"not what this cell measures")
+	}
+	base := snapByName6722(t, snaps, "reth0")
+	unit0 := snapByName6722(t, snaps, "reth0.0")
+	member := snapByName6722(t, snaps, "reth1")
+	if base.Ifindex != 24 || unit0.Ifindex != 24 || member.Ifindex != 24 {
+		t.Fatalf("precondition: reth0=%d reth0.0=%d reth1=%d, want 24/24/24 — "+
+			"reth0 resolves onto its declared member reth1, which is what puts the "+
+			"L3 owner and the supposed port on ONE netdev",
+			base.Ifindex, unit0.Ifindex, member.Ifindex)
+	}
+	if base.Zone != "lan" || member.Zone != "" {
+		t.Fatalf("precondition: reth0 Zone=%q reth1 Zone=%q, want \"lan\" and \"\" "+
+			"— a zone must actually be on the netdev, or a \"\" answer proves "+
+			"nothing", base.Zone, member.Zone)
+	}
+	assertEgressZone6722(t, snaps, 24, "",
+		"a reth is the L3 OWNER of a redundant pair and is never a member port, "+
+			"so reth1 does not defer to reth0 and the two are independent claims on "+
+			"one device. Resolving `lan` here would put reth1's transit — an "+
+			"interface the operator zoned into nothing — under the LAN policy, on "+
+			"exactly the tolerant path where the commit-time rejection is a warning")
+
+	// O2 — the CONTROL. The same shape with an ordinary port name in place of
+	// `reth1`: one bare member, one reth, one authored zone. It must resolve
+	// `lan`. This is what isolates the failure above to the member's NAME.
+	_, ctlSnaps := buildSnapshotsFromSet6722(t, []string{
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth0",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone lan interfaces reth0",
+	}, map[string]int{"ge-0-0-1": 24},
+		map[string]string{"ge-0-0-1": "02:bf:72:01:00:01"})
+	assertEgressZone6722(t, ctlSnaps, 24, "lan",
+		"renaming the member from `reth1` to `ge-0/0/1` — and changing nothing "+
+			"else — must resolve the reth's zone; if this control also answers \"\" "+
+			"then the cell above is measuring something other than the reth-prefix "+
+			"clause")
+}
+
 // F: the field must survive the wire, and the StableZoneID quarantine must
 // reach it.
 //

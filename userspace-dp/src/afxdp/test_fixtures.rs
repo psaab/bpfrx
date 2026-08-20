@@ -33,38 +33,59 @@ use crate::{
 /// Go side by `pkg/dataplane/userspace/egress_zone_identity_6722_test.go`, which
 /// drives the real `CompileConfig` and the real `buildInterfaceSnapshots`.
 ///
-/// WHAT THE MIGRATION COSTS IN BINDING POWER, MEASURED. The risk in stamping 32
-/// fixtures mechanically is that a test starts passing for a NEW reason. That
-/// was checked rather than assumed: the consumer was mutated to source the
-/// egress row's `zone_id` from the row's own `zone` name — `origin/master`'s
-/// behaviour — and the whole crate re-run.
-///
-/// The mutation reds exactly ONE test tree-wide. That is not evidence of
-/// vacuity, and the reason matters: for an ifindex with a single configured
-/// identity the ledger's answer and the row's own zone ARE THE SAME VALUE, so
-/// no mutation swapping one for the other can be observed there. Those fixtures
-/// bind that a zone reaches the policy decision; they never bound WHICH
-/// mechanism supplied it, before the migration or after. The stamp changes what
-/// the fixture MODELS (from a snapshot the wire cannot carry to one it can), not
-/// what it PROVES.
-///
-/// That last sentence is measured, not argued. The same mutation was applied to
-/// the PRE-migration tree — the compat arm present, these fixtures unstamped —
-/// and the two failure SETS compared:
+/// WHAT THE MIGRATION COSTS IN BINDING POWER, MEASURED. The stamp reaches **25
+/// `InterfaceSnapshot` rows across 19 `v5(ConfigSnapshot …)` call sites** — 18
+/// of them in this file and one in `forwarding/tests.rs` — plus the rows
+/// `reth_row_6722` stamps by hand. (Counted with a brace-matching walk over
+/// `v5(ConfigSnapshot`; an earlier revision said "32 fixtures", which is the
+/// number of `InterfaceSnapshot {` literals IN THIS FILE, only 19 of which sit
+/// inside a `v5()` wrapper.) The risk in stamping them mechanically is that a
+/// test starts passing for a NEW reason. That was checked rather than assumed:
+/// the consumer was mutated to source the egress row's `zone_id` from the row's
+/// own `zone` name — `origin/master`'s behaviour — and the whole crate re-run:
 ///
 /// ```text
-/// pre-migration   reds: unzoned_iface_tunnel_unit_..._via_egress_row_6722
-/// post-migration  reds: unzoned_iface_tunnel_unit_..._via_egress_row_6722
+/// let zone_id = state.zone_name_to_id.get(&iface.zone).copied().unwrap_or(0);
+/// // replacing the ifindex_unambiguous_zone_id lookup in
+/// // forwarding_build/interfaces.rs
 /// ```
 ///
-/// Identical. **The migration removed no binding.** (Both cells also fail
-/// `shim_ipv6_ext_walk_matches_userspace_walker`, which reads a manifest outside
-/// the sandboxed subtree; it cancels on both sides.)
+/// The mutation reds TWO tests tree-wide:
+///
+/// ```text
+/// afxdp::forwarding::tests::egress_row_zone_is_order_invariant_not_last_write_6722
+/// afxdp::forwarding::tests::unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722
+/// ```
+///
+/// (`cargo test --bins -- --skip wg::engine::engine_internal_tests`: 4275
+/// passed, 2 failed.) That is not evidence of vacuity in the other fixtures,
+/// and the reason matters: for an ifindex with a single configured identity the
+/// ledger's answer and the row's own zone ARE THE SAME VALUE, so no mutation
+/// swapping one for the other can be observed there. Those fixtures bind that a
+/// zone reaches the policy decision; they never bound WHICH mechanism supplied
+/// it, before the migration or after. The stamp changes what the fixture MODELS
+/// (from a snapshot the wire cannot carry to one it can), not what it PROVES.
+///
+/// That last sentence is measured, not argued. The same mutation was applied to
+/// the PRE-migration tree — `b5560662b`, the last commit before the fixtures
+/// were stamped, NOT `c9b020695`, which predates the wire field entirely — and
+/// the two failure SETS compared:
+///
+/// ```text
+/// pre-migration (b5560662b)   reds: unzoned_iface_tunnel_unit_..._via_egress_row_6722
+/// post-migration              reds: unzoned_iface_tunnel_unit_..._via_egress_row_6722
+///                                   egress_row_zone_is_order_invariant_not_last_write_6722
+/// ```
+///
+/// **Pre is a SUBSET of post: the migration removed no binding and added one.**
+/// (Both trees also fail `shim_ipv6_ext_walk_matches_userspace_walker`, which
+/// reads a manifest outside the sandboxed subtree; it cancels on both sides.)
 ///
 /// What the measurement did expose is a real gap, now closed: the single
-/// surviving discriminator asserted a 0 sentinel, so the positive direction of
-/// B1 — the ledger's non-zero answer beating a dissenting row — had no cell.
-/// `egress_row_zone_is_order_invariant_not_last_write_6722` is that cell.
+/// pre-migration discriminator asserted a 0 sentinel, so the positive direction
+/// of B1 — the ledger's non-zero answer beating a dissenting row — had no cell.
+/// `egress_row_zone_is_order_invariant_not_last_write_6722` is that cell, and it
+/// is the second red above.
 pub(super) fn v5(mut snapshot: ConfigSnapshot) -> ConfigSnapshot {
     use std::collections::{BTreeMap, BTreeSet};
     let mut zones: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();

@@ -353,14 +353,31 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			// interface as the interface, and `snapshotLinuxName` collapses it
 			// onto the base device to match.
 			//
-			// Both halves are load-bearing. Requiring `linuxUnit == parentLinux`
-			// keeps a VLAN unit 0 — which lands on `<dev>.<vlan>` — from being
-			// folded onto a base it does not share. Requiring unit NUMBER 0 keeps
-			// the fold off a unit that merely happens to share the device:
-			// `TunnelNameMap` maps EVERY unit of an interface-level WireGuard
-			// tunnel onto the tunnel netdev, so `wg0.0` and `wg0.1` are one
-			// device but two logical interfaces, and folding `wg0.1` onto `wg0`
-			// would let a zone authored on one of them decide for the other.
+			// The two halves are NOT equally load-bearing, and the difference is
+			// measured rather than asserted:
+			//
+			//	drop `unitNum == 0`         -> RED. TestContestedNetdevOwnership-
+			//	  FailsClosed_6722/two-tunnel-units-on-one-device. `TunnelNameMap`
+			//	  maps EVERY unit of an interface-level WireGuard tunnel onto the
+			//	  tunnel netdev, so `wg0.0` and `wg0.1` are one device but two
+			//	  logical interfaces; folding `wg0.1` onto `wg0` collapses the two
+			//	  identities into one, the ifindex coheres, and the zone authored
+			//	  on `wg0.1` decides for the deliberately unzoned `wg0.0`.
+			//	drop `linuxUnit == parentLinux` -> SURVIVOR. The whole Go suite
+			//	  stays green, and no producible config was found in which it
+			//	  changes the answer. The reason is structural: the clause can
+			//	  only differ for a unit that lands on a netdev OTHER than its
+			//	  base — a VLAN unit 0 on `<dev>.<vlan>` — and such a unit is on a
+			//	  DIFFERENT IFINDEX from the base row, so its identity string
+			//	  never shares a bucket with the base row's and the fold can
+			//	  neither merge two identities nor displace an owner.
+			//
+			// It is kept as an explicit statement of the rule ("unit 0 that lands
+			// on its base's netdev IS the interface"), not as a guard that
+			// currently discriminates. If `snapshotLinuxName` ever puts a VLAN
+			// unit back on the base ifindex, this is the clause that keeps the
+			// fold correct; until then, removing it would be behaviour-preserving
+			// and the comment must not claim otherwise.
 			unitIdentity := unitName
 			if unitNum == 0 && linuxUnit == parentLinux {
 				unitIdentity = name
@@ -686,6 +703,17 @@ func egressIdentitiesCohere(cfg *config.Config, identities map[string]string) bo
 		// interface-level tunnel, say. The operator described two logical
 		// interfaces; the kernel gives them one device. Nothing designates
 		// either as the other's port, so the device identifies no single zone.
+		//
+		// MEASURED SURVIVOR (#6722 round 11): deleting this branch alone leaves
+		// the Go suite green, because a same-owner pair is refused a second time
+		// downstream — `egressRethMemberOf` requires the member to name the reth
+		// as its `redundant-parent`, and `egressMemberIsBarePort` refuses a
+		// `reth*` name outright, so a self-referential pair fails both ways. It
+		// is kept because it states the rule at the level the rule is about
+		// (identity vs. interface), and because the downstream refusals are
+		// keyed on NAMES: a future relaxation of either would silently re-admit
+		// this shape. Recorded as a survivor rather than deleted or claimed to
+		// be load-bearing.
 		return false
 	}
 	return egressRethMemberOf(cfg, owners[0], owners[1]) ||

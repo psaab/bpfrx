@@ -304,31 +304,43 @@ type InterfaceSnapshot struct {
 	// ifindex named. That is the whole of the helper-side check: there is no row
 	// classification left for a config shape to disagree with.
 	//
-	// Emitted UNCONDITIONALLY (no omitempty), because the helper must be able to
-	// tell "this Go binary decided the ifindex identifies no zone" from "this Go
-	// binary predates the field". The Rust side decodes it as Option<String>:
-	// absent is the old binary and falls back to the pre-#6722 row-unanimity
-	// rule; present-and-empty is a decision and resolves the 0 sentinel.
+	// Emitted UNCONDITIONALLY (no omitempty). At ProtocolVersion 5 the field is
+	// part of the contract in both directions: the Rust side decodes it as a
+	// plain `String` (userspace-dp/src/protocol/snapshot.rs), so "" is a
+	// DECISION — this Go binary determined the ifindex identifies no zone — and
+	// resolves the 0 sentinel. There is no "the field was absent" arm to fall
+	// back to; the compatibility arm that used to exist was deleted with the
+	// row-unanimity rule it restored.
 	//
-	// MIXED-VERSION MATRIX, measured on both trees rather than reasoned.
-	// ConfigSnapshotProtocolVersion stays at 4: this repo bumps it when an old
-	// reader MISREADS a snapshot into a wrong answer (#5488's
-	// ErrScopedGlobalZoneSetProtocolIncompatible — an old helper reads only the
-	// singular match_from_zone and NARROWS a global deny, a fail-OPEN). Neither
-	// direction here misreads.
+	// MIXED VERSION IS REFUSED, NOT TOLERATED. ProtocolVersion moved 4 -> 5 in
+	// this change (see the constant above), and ensureEgressZoneProtocolLocked
+	// (manager_compile.go) refuses to commit against a helper whose observed
+	// version is anything else. That is a departure from the sibling gates: this
+	// repo has previously bumped only when an old reader MISREADS a snapshot
+	// into a wrong answer (#5488's ErrScopedGlobalZoneSetProtocolIncompatible —
+	// an old helper reads only the singular match_from_zone and NARROWS a global
+	// deny, a fail-OPEN). Neither direction here misreads, so the bump is not
+	// forced by that rule; it is taken because a mixed window silently loses the
+	// fix, and losing it silently is what this PR exists to stop:
 	//
-	//	new Go -> OLD helper: measured by running the helper at c9b020695
-	//	  against the wire shape this builder emits — it deserializes (no
-	//	  deny_unknown_fields anywhere in userspace-dp/src/protocol, at that
-	//	  commit or this one), reads reth_projection=false from serde's default,
-	//	  and answers ledger[24]=None, to_zone=0, action=Deny.
-	//	old Go -> NEW helper: pinned in-tree by
-	//	  old_go_wire_shape_into_new_helper_fails_closed_6722 — the retired key
-	//	  is ignored, egress_zone is None, and the compat arm answers 0.
+	//	new Go -> OLD helper: the wire shape this builder emits deserializes on
+	//	  a v4 helper (there is no deny_unknown_fields anywhere in
+	//	  userspace-dp/src/protocol, at c9b020695 or here) — it reads
+	//	  reth_projection=false from serde's default and answers ledger[24]=None,
+	//	  to_zone=0, action=Deny. Measured by running that helper against this
+	//	  builder's output.
+	//	old Go -> NEW helper: the retired `reth_projection` key is ignored and
+	//	  `egress_zone` is absent, which serde fills with the empty String —
+	//	  the fail-closed 0 sentinel. Pinned by
+	//	  retired_wire_key_decodes_and_absent_egress_zone_fails_closed_6722
+	//	  (userspace-dp/src/afxdp/forwarding/tests.rs).
 	//
-	// Both directions LOSE the fix during a mixed window and neither invents a
-	// zone: a partially-upgraded bondless-RETH cluster keeps blackholing until
-	// both halves land, which is what it did already.
+	// Neither direction invents a zone; both would blackhole a bondless-RETH
+	// cluster exactly as the pre-#6722 tree did. What the gate changes is that
+	// the commit ABORTS with a named sentinel and DISARMS the helper instead of
+	// promoting an image the dataplane cannot honour — see
+	// TestEgressZoneProtocolAbortDisarmsAndPublishesNothing_6722 for the
+	// measured wire behaviour, including that no apply_snapshot is sent.
 	EgressZone                string                     `json:"egress_zone"`
 	UnitCount                 int                        `json:"unit_count"`
 	Tunnel                    bool                       `json:"tunnel"`

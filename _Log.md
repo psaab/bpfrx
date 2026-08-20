@@ -1,3 +1,234 @@
+## 2026-08-13 — #6722 round 11: bind the two fail-closed DECISIONS the PR exists to make
+
+- **Timestamp**: 2026-08-13 (fix/6713-xfrmi-tozone, PR #6722)
+- **Action**: Fold a hostile MERGE-NEEDS-MAJOR at `f7c8ce7bb`. Two blocking
+  items — both "the guard IS the deliverable, and the guard is unbound" — plus
+  eight claim/citation corrections, every one of them re-measured here rather
+  than accepted from the report.
+- **File(s)**: `pkg/dataplane/userspace/egress_zone_identity_6722_test.go`,
+  `pkg/dataplane/userspace/egress_zone_failclosed_6722_test.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/zones.go`,
+  `pkg/dataplane/userspace/manager_status.go`,
+  `pkg/dataplane/userspace/manager_ha.go`,
+  `userspace-dp/src/afxdp/test_fixtures.rs`,
+  `userspace-dp/src/afxdp/types/forwarding.rs`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **B1 — rule 2's conflict arm was unbound, on the STRICT path.**
+  `stampEgressZones` answers `""` when an ifindex carries two AUTHORED zones
+  (`interfaces.go`, `case len(st.authored) > 1`). Mutating that arm to pick one
+  of them left the entire Go suite green. The shape is reachable by an ORDINARY
+  COMMIT, not only the tolerant path: `validateRethMemberStrict` rejects a
+  member that carries units, a tunnel, or is itself a reth, but says nothing
+  about a member the operator also zoned, so
+
+  ```
+  set interfaces ge-0/0/1 gigether-options redundant-parent reth1
+  set interfaces reth1 redundant-ether-options redundancy-group 1
+  set interfaces reth1 unit 0 family inet address 10.0.61.1/24
+  set security zones security-zone lan interfaces reth1
+  set security zones security-zone wan interfaces ge-0/0/1
+  ```
+
+  compiles under strict `CompileConfig`. The Rust corroboration cannot catch it:
+  the `ge-0/0/1` row literally carries `wan`, so `carried.contains("wan")`
+  succeeds and the helper would honour a `wan` claim. With Go map iteration
+  order the answer would also be NONDETERMINISTIC across restarts.
+  `TestContestedNetdevOwnershipFailsClosed_6722` binds rule 1
+  (`egressIdentitiesCohere`), not this arm — measured, not assumed: the new cell
+  asserts `egressIdentitiesCohere` returns TRUE for this pair, so a future
+  change that starts refusing the shape at rule 1 fails loudly instead of
+  silently re-pointing the cell.
+
+  New cell `TestTwoAuthoredZonesOnOneCoherentNetdevFailClosed_6722` (cell N),
+  with a control that drops the second binding and must still resolve `lan`.
+
+  **B2 — the reth-prefix conjunct was unbound, on the LENIENT path it exists
+  for.** `egressMemberIsBarePort` opens `if ifc == nil ||
+  strings.HasPrefix(name, "reth")`, and its own comment says that clause "is the
+  runtime half that must hold on the tolerant load / peer-sync path, where those
+  rejections are downgraded to warnings (#1960 no-brick)". Dropping the conjunct
+  left the whole Go suite green — it failed open on exactly the path it claimed
+  to hold. The three sibling reth-clause cells all measure the COMMIT GATE, and
+  the one lenient-path cell uses `st0`, a name with no `reth` prefix. The clause
+  only bites for a UNIT-LESS reth (one with units is caught by the
+  `firstConfiguredUnit` conjunct), which is why no fixture reached it.
+
+  New cell `TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722`
+  (cell O), with a control that renames the member `reth1` -> `ge-0/0/1` and
+  changing nothing else, which must resolve `lan`.
+
+  **MUTATION PROOF, POST vs PRE.** Each mutation was applied to a copy and the
+  package suite run twice: once as-is, once with the two 6722 test files
+  reverted to `f7c8ce7bb`. A green PRE with a red POST is what shows the NEW
+  cell is what binds the line.
+
+  ```text
+  M1  rule-2 conflict arm picks the last-sorting authored zone
+        POST FULL_RC=1  RED  TestTwoAuthoredZonesOnOneCoherentNetdevFailClosed_6722
+        PRE  FULL_RC=0  SURVIVOR
+  M2  egressMemberIsBarePort drops the reth-prefix conjunct
+        POST FULL_RC=1  RED  TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722
+        PRE  FULL_RC=0  SURVIVOR
+  ```
+
+  Verbatim assertions:
+
+  ```text
+  egress_zone_identity_6722_test.go:637: egress zone of ifindex 24 = "wan", want ""
+  egress_zone_identity_6722_test.go:723: egress zone of ifindex 24 = "lan", want ""
+  ```
+
+  **N5 — the two arm-site comments assert the opposite of measured behaviour,
+  and the reviewer's "untested at both sites" is REFUTED.**
+  `ensureRequiredSnapshotProtocolLocked` is a chain of four. Three fire only for
+  a config that uses their feature; `ensureEgressZoneProtocolLocked` takes no
+  config and fires for ANY last-applied config. Measured with `lastStatus = 4`
+  and an EMPTY `config.Config{}`, both `SetForwardingArmed(true)` and
+  `syncDesiredForwardingStateLocked()` return `ErrEgressZoneProtocolIncompatible`
+  and send NO arm — while the two comments still said the gate "is a no-op
+  unless the last-applied config requires the protocol". Comments corrected.
+
+  The call sites are NOT untested, contrary to the report: deleting either one
+  reds a pre-existing #5648/#6165 cell
+  (`TestSetForwardingArmedRefusesStaleProtocolMismatch`,
+  `TestSyncDesiredForwardingRefusesStaleProtocolMismatch`). What was untested is
+  the config-UNCONDITIONALITY, and the DISJOINT mutation proves the new cell
+  reaches something no existing cell does — both of those drive
+  `scheduledPolicyCfg()` and assert `ErrPolicySchedulerProtocolIncompatible`:
+
+  ```text
+  M7  both arm sites run only the CONFIG-CONDITIONAL gates
+        POST FULL_RC=1  RED  .../explicit-operator-arm  +  .../ha-reconcile-tick
+        PRE  FULL_RC=0  SURVIVOR   (every pre-existing #5648/#6165 cell green)
+  M9  ensureEgressZoneProtocolLocked drops the re-ask/second-look block
+        FULL_RC=1  RED  .../stale-lastStatus-re-asks-the-helper
+  ```
+
+  New cell `TestEgressZoneProtocolGatesBothArmPaths_6722`: the two arm paths,
+  plus three controls — a DISARM must never be fenced (the fail-closed edge
+  needs it), a MATCHED helper must arm, and a stale `lastStatus` must be cleared
+  by the re-ask. M9 is what makes the re-ask block bound; it was a survivor
+  before this round.
+
+  **N7 — "Both halves are load-bearing" was HALF true; claim downgraded.**
+  Measured on the unit-0 identity fold:
+
+  ```text
+  drop `unitNum == 0`             -> RED, .../two-tunnel-units-on-one-device
+  drop `linuxUnit == parentLinux` -> SURVIVOR, full `go test ./...` RC=0 (62 pkgs)
+  ```
+
+  No producible config was found in which the second conjunct changes the
+  answer, and the reason is structural: it can only differ for a unit that lands
+  on a netdev other than its base — a VLAN unit 0 on `<dev>.<vlan>` — and such a
+  unit is on a DIFFERENT IFINDEX from the base row, so its identity string never
+  shares a bucket with the base row's. The clause is KEPT as an explicit
+  statement of the rule and the comment now says it does not currently
+  discriminate. (First measurement of this claimed a full-suite RED; that was
+  `pkg/refactoraudit` shelling out to git inside a copy whose `.git` the harness
+  had removed. Re-run with `.git` preserved: RC=0. A control mutation that
+  changes the same line while PRESERVING semantics reproduces the same
+  refactoraudit error, which is what identifies it as a harness artefact.)
+
+  **N1 — the wire-compat paragraph in `protocol.go` asserted the opposite of
+  what this PR does, in the file whose own constant contradicted it.** It
+  claimed the Rust side decodes `Option<String>` and falls back to row-unanimity
+  (`snapshot.rs` is `pub egress_zone: String`; the compat arm was deleted this
+  round), that "ConfigSnapshotProtocolVersion stays at 4" (`protocol.go` sets
+  `ProtocolVersion = 5` seventy lines above), that a mixed window "keeps
+  blackholing until both halves land" (the gate aborts the commit and disarms),
+  and cited `old_go_wire_shape_into_new_helper_fails_closed_6722` — a test that
+  **exists nowhere in the tree**; the only occurrence of the name was the
+  citation. Rewritten against the live code; the surviving in-tree pin is
+  `retired_wire_key_decodes_and_absent_egress_zone_fails_closed_6722`
+  (`forwarding/tests.rs:6247`, verified).
+
+  **N2/N3/N4 — stale citations.** The architecture doc described the
+  `state.egress` arm in the present tense at two places when line 1107 of the
+  same file says there is one arm (now marked historical / restated).
+  `zones.go` cited `buildEgressZoneByIfindex`, which does not exist; the
+  consumer is `stampEgressZones`. `forwarding.rs:634` cited
+  `buildUserspaceIngressInterfaces`, which also does not exist — load-bearing,
+  because it is the support for the ingress-unreachability half of the asymmetry
+  justification. The real guards are `UserspaceBoundLinuxInterfaces`
+  (`interfaces.go:133`, guard at `:164`) and `buildUserspaceIngressIfindexes`
+  (`maps_sync.go:1585`, guard at `:1592`), both opening `if iface.Zone == "" ||
+  userspaceSkipsIngressInterface(iface)`. The same false name was in the
+  architecture doc and in this log; all three corrected, and a tree sweep
+  confirms no occurrence remains outside `docs/reviews/archive/`.
+
+  **N6 — the fixture failure-set table was stale.** It recorded ONE red. Re-run
+  at this head (`cargo test --bins -- --skip wg::engine::engine_internal_tests`,
+  4275 passed / 2 failed) the consumer mutation reds TWO:
+  `egress_row_zone_is_order_invariant_not_last_write_6722` and
+  `unzoned_iface_tunnel_unit_..._via_egress_row_6722`. The table was written
+  before round 10 added the first of those, which is the cell the same paragraph
+  says it added. Table corrected, and the pre-migration baseline restated as
+  `b5560662b` (not `c9b020695`, which predates the wire field): pre is a SUBSET
+  of post, so the migration removed no binding and added one.
+
+  **N8 — "the 32 fixture literals" named a file total.** Counted with a
+  brace-matching walk: the stamp reaches 25 `InterfaceSnapshot` rows across 19
+  `v5(ConfigSnapshot …)` call sites (18 in `test_fixtures.rs`, 1 in
+  `forwarding/tests.rs`). 32 is the number of `InterfaceSnapshot {` literals in
+  `test_fixtures.rs`, only 19 of which sit inside a `v5()` wrapper. Corrected in
+  both the log entry and the `v5` doc.
+
+  **SURVIVOR LEDGER — measured, recorded, not "fixed".** A survivor here is a
+  line whose deletion leaves the suite green. Recording one is not conceding it
+  is dead code; it is refusing to let a comment claim a binding that does not
+  exist.
+
+  ```text
+  interfaces.go  `linuxUnit == parentLinux` in the unit-0 fold   SURVIVOR (N7 above)
+  interfaces.go  `owners[0] == owners[1]` in egressIdentitiesCohere
+                   M10 FULL_RC=0 SURVIVOR — a same-owner pair is refused a
+                   second time downstream (egressRethMemberOf needs the member
+                   to name the reth; egressMemberIsBarePort refuses a `reth*`
+                   name). Kept because both downstream refusals are keyed on
+                   NAMES, so relaxing either would silently re-admit the shape.
+  protocol.go    the absent `omitempty` on `egress_zone`
+                   Inert at v5 in the Go->Rust direction: the Rust field is
+                   `#[serde(default)] String`, so an omitted key and an emitted
+                   "" decode identically. It is kept because the omission is
+                   what makes "the builder decided no zone" and "this key was
+                   never written" the same value ON PURPOSE, which is only safe
+                   while the version gate refuses a mismatched helper.
+  zones.go       `if _, exists := out[iface]; !exists` (first-write-wins,
+                 authoredZoneRefs) — see the M11 note below.
+  Rust           forwarding_build/interfaces.rs:79 / :420 / :485-490,
+                   tunnel.rs:655 — provably inert; only gre/ip6gre reach that
+                   loop and both always have an egress row.
+  ```
+
+  **A harness failure this round caught in itself.** The first M11 cell (drop
+  first-write-wins from `authoredZoneRefs`) printed `FULL_RC=0 CLASS=SURVIVOR`
+  while its own anchor assertion had raised `AssertionError: M11 anchor
+  count=2` — the string occurs in BOTH `authoredZoneRefs` (zones.go:84) and
+  `buildInterfaceZoneMap` (zones.go:133). The mutation was never applied, so
+  the "survivor" was an unmutated tree passing its own suite: a harness that
+  fails silently INVERTS its result, because "nothing broke" and "nothing was
+  changed" produce identical output. Re-measured with a line-anchored patch
+  targeting zones.go:84 only, and with a witness canary (below) certifying the
+  binary executed. The verdict is recorded from the second run, not the first.
+
+  **WITNESSED GREENS.** Every cell in this round's matrix was re-run with a
+  canary test in the same package that always fails. A green is otherwise not
+  evidence: "the test passed" and "the test never executed" print the same
+  thing. The canary's named RED in the same `go test -count=1` invocation is
+  what certifies the binary built and ran, so the surrounding greens mean
+  something. Cells are scored on WHICH tests other than the canary reddened.
+
+  A retraction the report made and this round preserves:
+  `forwarding_build/interfaces.rs:78` is BOUND, not a survivor. `carried` is
+  `{"", "lan"}`, so `.iter().next()` returns `""`, which `zone_name_to_id` never
+  holds — the mutation reduces to unmutated behaviour and produces a FALSE
+  survivor. `next_back()` reds
+  `conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722`.
+
 ## 2026-08-13 — #6722 round 10: the ENUMERATION was the defect; the egress-zone answer moves to Go
 
 - **Timestamp**: 2026-08-13 (fix/6713-xfrmi-tozone, PR #6722)
@@ -99,8 +330,14 @@
   rows. Leaving it would have left ~40 fixtures exercising a snapshot that
   cannot exist — coverage in appearance only.
 
-  It is deleted: `egress_zone` is a plain `String`, and the 32 fixture literals
-  that relied on the absent arm are stamped explicitly. The stamping goes
+  It is deleted: `egress_zone` is a plain `String`, and the fixture literals
+  that relied on the absent arm are stamped explicitly — **25
+  `InterfaceSnapshot` rows across 19 `v5(ConfigSnapshot …)` call sites** (18 in
+  `test_fixtures.rs`, 1 in `forwarding/tests.rs`), counted with a brace-matching
+  walk rather than a line grep. An earlier revision of this entry said "the 32
+  fixture literals"; 32 is the number of `InterfaceSnapshot {` literals in
+  `test_fixtures.rs`, only 19 of which sit inside a `v5()` wrapper, so it named
+  a file total and not the migrated set. The stamping goes
   through one helper, `test_fixtures::v5`, whose doc states that it is
   deliberately WEAKER than `stampEgressZones` — it fills only EMPTY rows on
   ifindexes with no explicit stamp, so a fixture can still express a
@@ -72542,8 +72779,10 @@ break — `go vet` confirmed passing under every revert.
   (`types/forwarding.rs`, `forwarding/tests.rs`, the architecture doc): the
   first draft justified the ingress/egress asymmetry with "an empty-zone
   interface is not an AF_XDP ingress bind target", which is only half true.
-  `buildUserspaceIngressInterfaces` (`interfaces.go:164`,
-  `if iface.Zone == "" { continue }`) does skip an unzoned row, so it holds for
+  `UserspaceBoundLinuxInterfaces` (`interfaces.go:133`, guard at `:164`) and
+  `buildUserspaceIngressIfindexes` (`maps_sync.go:1585`, guard at `:1592`) —
+  both open `if iface.Zone == "" || userspaceSkipsIngressInterface(iface)` —
+  do skip an unzoned row, so it holds for
   the QUARANTINE shape where every row is unzoned — but in the sibling and
   divergent shapes the BASE row is zoned, so the ifindex genuinely IS a bind
   target and ingress really does answer `vpnb` for arriving traffic. The

@@ -52,8 +52,9 @@ func hostIPFromCIDR(s string) string {
 // they are restatements of one operator sentence, not independent statements —
 // and once several config identities collapse onto ONE netdev
 // (`snapshotLinuxName`), a derived entry becomes indistinguishable from an
-// authored one by inspection of the result alone. buildEgressZoneByIfindex needs
-// to tell them apart, so the provenance is recorded here rather than
+// authored one by inspection of the result alone. stampEgressZones (the sole
+// consumer of this map, in interfaces.go) needs to tell them apart, so the
+// provenance is recorded here rather than
 // reconstructed downstream from the outcome. Reconstructing it is exactly what
 // #6722 attempted four times, and each attempt was holed by a new config shape.
 //

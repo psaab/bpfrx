@@ -254,3 +254,170 @@ func TestEgressZoneProtocolMatchedHelperPublishes_6722(t *testing.T) {
 			"on the ordinary path. Requests seen: %v", helper.seen())
 	}
 }
+
+// The gate is UNCONDITIONAL IN THE CONFIG DIMENSION, and both arm-side callers
+// route through it (#6722).
+//
+// `ensureRequiredSnapshotProtocolLocked` is a chain of four gates. Its first
+// three fire only for a config that USES the feature they name — policy
+// schedulers, persistent source NAT, scoped global zone sets — and the comments
+// at both call sites below were written for that family: they say the gate "is a
+// no-op unless the last-applied config requires the protocol". Since #6722 that
+// is no longer true of the chain as a whole. Every snapshot carries
+// `EgressZone`, so `ensureEgressZoneProtocolLocked` takes no config at all and
+// fires for ANY last-applied config, including an empty one.
+//
+// The direction is fail-closed and intended — a version-mismatched helper
+// cannot honour a v5 snapshot at all, so arming it forwards on whatever stale
+// image it holds — but it is a widening of what these two call sites refuse, so
+// it is pinned here rather than left to the comments. Both cells drive an EMPTY
+// `config.Config{}`: nothing in it requires any of the three feature gates, so
+// the only thing that can produce the sentinel is the unconditional one.
+//
+// The two controls are what keep this from being a test that a Manager refuses
+// everything: a DISARM must still reach a mismatched helper (the fail-closed
+// edge itself needs it), and a MATCHED helper must arm.
+//
+// FAIL-ON-REVERT, measured per hunk:
+//
+//	drop the ensureRequiredSnapshotProtocolLocked call in SetForwardingArmed
+//	  (manager_status.go)                   -> the explicit-arm sub-test only
+//	drop it in syncDesiredForwardingStateLocked
+//	  (manager_ha.go)                       -> the reconcile sub-test only
+func TestEgressZoneProtocolGatesBothArmPaths_6722(t *testing.T) {
+	// newManager6722 wires a Manager to a recording helper advertising `version`
+	// and gives it an EMPTY last-applied config — the point of the cell.
+	newManager6722 := func(t *testing.T, prefix string, version int) (*Manager, *recordedHelper6722) {
+		t.Helper()
+		dir, err := os.MkdirTemp("", prefix)
+		if err != nil {
+			t.Fatalf("mkdtemp: %v", err)
+		}
+		t.Cleanup(func() { os.RemoveAll(dir) })
+		sock := filepath.Join(dir, "c.sock")
+		helper := startRecordingHelper6722(t, sock, version)
+
+		m := New()
+		m.cfg.ControlSocket = sock
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.lastStatus.ConfigSnapshotProtocolVersion = version
+		// Both gates sit BEHIND a ForwardingSupported check, so without this the
+		// call returns early and the cell would pass without reaching the gate.
+		m.lastStatus.Capabilities.ForwardingSupported = true
+		m.lastSnapshot = &ConfigSnapshot{
+			Version: ProtocolVersion,
+			// EMPTY. Not a config that requires schedulers, persistent source
+			// NAT or a scoped global zone set — if any of those were populated,
+			// a sibling gate could produce an error and this cell would not be
+			// measuring the egress-zone one.
+			Config: &config.Config{},
+		}
+		return m, helper
+	}
+	sawArm := func(helper *recordedHelper6722) bool {
+		for _, got := range helper.seen() {
+			if got == "set_forwarding_state{armed:true}" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("explicit-operator-arm", func(t *testing.T) {
+		m, helper := newManager6722(t, "x6722arm", preV5SnapshotProtocolVersion)
+		_, err := m.SetForwardingArmed(true)
+		if !errors.Is(err, ErrEgressZoneProtocolIncompatible) {
+			t.Fatalf("SetForwardingArmed(true) against a v%d helper returned %v; "+
+				"want ErrEgressZoneProtocolIncompatible. This is the `request "+
+				"chassis` / gRPC arm path (cli_request_chassis.go, "+
+				"server_diag_system_action.go): arming a helper that cannot decode "+
+				"a v5 snapshot forwards on whatever image it already holds",
+				preV5SnapshotProtocolVersion, err)
+		}
+		if sawArm(helper) {
+			t.Errorf("a set_forwarding_state{armed:true} reached the v%d helper "+
+				"anyway; the gate must refuse BEFORE the request, or the refusal is "+
+				"only a return value. Requests seen: %v",
+				preV5SnapshotProtocolVersion, helper.seen())
+		}
+	})
+
+	t.Run("ha-reconcile-tick", func(t *testing.T) {
+		m, helper := newManager6722(t, "x6722ha", preV5SnapshotProtocolVersion)
+		// The ~1s reconcile only acts when desired != current, so the helper must
+		// start DISARMED for the arm direction to be the one under test.
+		m.lastStatus.ForwardingArmed = false
+		err := m.syncDesiredForwardingStateLocked()
+		if !errors.Is(err, ErrEgressZoneProtocolIncompatible) {
+			t.Fatalf("syncDesiredForwardingStateLocked() against a v%d helper "+
+				"returned %v; want ErrEgressZoneProtocolIncompatible. This tick runs "+
+				"unattended roughly once a second, so an ungated one re-arms a "+
+				"version-stale helper without an operator ever asking",
+				preV5SnapshotProtocolVersion, err)
+		}
+		if sawArm(helper) {
+			t.Errorf("the reconcile armed the v%d helper anyway. Requests seen: %v",
+				preV5SnapshotProtocolVersion, helper.seen())
+		}
+	})
+
+	// Control 1. The fail-closed contract DISARMS on the failure edge, so a
+	// blanket refusal would defeat the very thing the gate exists to do.
+	t.Run("control-disarm-is-never-fenced", func(t *testing.T) {
+		m, helper := newManager6722(t, "x6722dis", preV5SnapshotProtocolVersion)
+		m.lastStatus.ForwardingArmed = true
+		// The later error here is the classifier-map load this unit context
+		// cannot do; what matters is that the request REACHED the helper.
+		_, _ = m.SetForwardingArmed(false)
+		if !helper.sawDisarm() {
+			t.Errorf("no set_forwarding_state{armed:false} reached a v%d helper; a "+
+				"gate that also blocked disarms would strand an armed helper on an "+
+				"image the control plane has declared it cannot honour. Requests "+
+				"seen: %v", preV5SnapshotProtocolVersion, helper.seen())
+		}
+	})
+
+	// Control 2. Without it, both assertions above are satisfied by a Manager
+	// that refuses every arm for any reason.
+	t.Run("control-matched-helper-arms", func(t *testing.T) {
+		m, helper := newManager6722(t, "x6722ok", ProtocolVersion)
+		m.lastStatus.ForwardingArmed = false
+		_, err := m.SetForwardingArmed(true)
+		if errors.Is(err, ErrEgressZoneProtocolIncompatible) {
+			t.Fatalf("a MATCHED v%d helper was fenced by the egress-zone gate (%v)",
+				ProtocolVersion, err)
+		}
+		if !sawArm(helper) {
+			t.Fatalf("no set_forwarding_state{armed:true} reached a MATCHED v%d "+
+				"helper, so the two refusals above are not evidence of a gate. "+
+				"Requests seen: %v", ProtocolVersion, helper.seen())
+		}
+	})
+
+	// Control 3 — the SECOND LOOK. `ensureEgressZoneProtocolLocked` re-polls the
+	// helper before failing, because `lastStatus` may predate a helper restart
+	// onto a matching build. Without that block the gate would refuse every
+	// commit and every arm made between "the helper restarted" and "the ~1s poll
+	// noticed", which for an operator looks like an upgrade that took effect and
+	// then would not arm. Nothing bound it before this sub-test; the cached view
+	// and the wire answer agreed in every other cell, which is exactly the
+	// condition under which a re-ask is invisible.
+	t.Run("stale-lastStatus-re-asks-the-helper", func(t *testing.T) {
+		m, helper := newManager6722(t, "x6722reask", ProtocolVersion)
+		// The helper on the wire is CURRENT; only the cached view is stale.
+		m.lastStatus.ConfigSnapshotProtocolVersion = preV5SnapshotProtocolVersion
+		m.lastStatus.ForwardingArmed = false
+		_, err := m.SetForwardingArmed(true)
+		if errors.Is(err, ErrEgressZoneProtocolIncompatible) {
+			t.Fatalf("the gate refused a helper that answers v%d on the wire "+
+				"because the CACHED lastStatus still said v%d (%v). The re-poll in "+
+				"ensureEgressZoneProtocolLocked exists so a helper that has since "+
+				"upgraded arms without waiting for the next status tick",
+				ProtocolVersion, preV5SnapshotProtocolVersion, err)
+		}
+		if !sawArm(helper) {
+			t.Fatalf("no arm reached the helper after the re-ask should have "+
+				"cleared the gate. Requests seen: %v", helper.seen())
+		}
+	})
+}
