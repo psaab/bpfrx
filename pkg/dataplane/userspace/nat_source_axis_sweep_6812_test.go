@@ -603,18 +603,29 @@ func axisIsConstant6812(vals []string) bool {
 }
 
 // snapshotAxisSlot6812 is what TestBuilderEmittedOrderIsStableWithinATier_6812
-// sweeps: the emitted snapshot the production comparator reads, plus the
-// DERIVED keys a comparator could compute from it that no reflective walk can
-// enumerate.
+// sweeps: the emitted snapshot the production comparator reads.
 //
-// This struct's field list is the one list left, and it is deliberately here
-// rather than spread across call sites. Reflection closes the FIELD axis; it
-// cannot close the space of functions of fields. `.len` of every slice is swept
-// mechanically, so cardinality is covered; port capacity is members × range
-// width, which is neither a field nor a length, so it is spelled out.
+// It carries NO derived column, and the reason is the round-12 finding (#6812).
+// Round 11 added `DerivedPortCapacity = len(PoolAddresses) × width` here on the
+// argument that reflection cannot reach derived keys. That formula is not one
+// production computes: the Go charge walk spends
+// `Σ sourceNATPoolMemberHostCount(member) × range` and the Rust apply boundary
+// spends `allocator_capacity(total_pool, …)` over the EXPANDED addresses. The
+// three agreed only because every fixture pool member was a bare host — the
+// fixture-coincidence class this whole round exists to eliminate, sitting inside
+// the one construct added because reflection could not reach it.
+//
+// A WRAPPER COLUMN ASSERTING A DERIVED KEY IS A SECOND IMPLEMENTATION OF THAT
+// KEY, AND SECOND IMPLEMENTATIONS DRIFT. The walk-side wrapper
+// (pkg/config, ruleAxisSlot6812) keeps its derived columns by READING what
+// sourceNATAggregateReferencedCharges produced. This side has no such function
+// to read: the builder computes no charge, and the value it would need lives in
+// Rust. Writing it here would be exactly the second implementation. So the
+// column is gone rather than wrong, and the inputs a capacity is derived from —
+// PortLow, PortHigh, PoolAddresses and its `.len` and `.all` — stay swept and
+// de-correlated on their own.
 type snapshotAxisSlot6812 struct {
-	Snapshot            SourceNATRuleSnapshot
-	DerivedPortCapacity int
+	Snapshot SourceNATRuleSnapshot
 }
 
 // builderTierAxisExemptions6812 is the honest enumeration of what the builder
@@ -731,7 +742,7 @@ var builderRuleSetAxisExemptions6812 = mergeAxisExemptions6812(
 			"would reorder production and stay green here.",
 		"Snapshot.PoolName", "Snapshot.PoolAddresses.len", "Snapshot.PoolAddresses[0]",
 		"Snapshot.PoolAddresses.all", "Snapshot.PoolAddresses.nil",
-		"Snapshot.PortLow", "Snapshot.PortHigh", "DerivedPortCapacity",
+		"Snapshot.PortLow", "Snapshot.PortHigh",
 		"Snapshot.PoolNoTranslation", "Snapshot.PoolUnusable", "Snapshot.PoolUnusableReason",
 		"Snapshot.DeterministicMode", "Snapshot.DeterministicBlockSize",
 		"Snapshot.DeterministicBlocksPerIP", "Snapshot.DeterministicHostBase",
@@ -874,10 +885,7 @@ func snapshotWitnessGroups6812(t *testing.T, whole bool) []axisGroup6812 {
 			if _, seen := byRuleSet[key]; !seen {
 				order = append(order, key)
 			}
-			byRuleSet[key] = append(byRuleSet[key], snapshotAxisSlot6812{
-				Snapshot:            s,
-				DerivedPortCapacity: len(s.PoolAddresses) * (int(s.PortHigh) - int(s.PortLow) + 1),
-			})
+			byRuleSet[key] = append(byRuleSet[key], snapshotAxisSlot6812{Snapshot: s})
 		}
 		if len(order) != len(kinds) {
 			t.Fatalf("witness produced %d rule-set groups %v, want %d — the scope kinds "+

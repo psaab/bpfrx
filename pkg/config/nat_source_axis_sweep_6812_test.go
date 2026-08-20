@@ -590,18 +590,43 @@ func axisIsConstant6812(vals []string) bool {
 // Then.PoolName (a tiebreak can key on pool properties just as easily as on the
 // rule's own), and the DERIVED keys neither struct carries as a field.
 //
-// This struct's field list is the one list left, and it is deliberately here
-// rather than spread across call sites. Reflection closes the FIELD axis; it
-// cannot close the space of functions of fields. `.len` of every slice is swept
-// mechanically, so cardinality is covered; the port-range width and the
-// allocator charge (members × width — what sourceNATAggregateReferencedCharges
-// itself computes, so the most plausible derived tiebreak of all) are neither
-// fields nor lengths, so they are spelled out.
+// The derived keys are READ FROM PRODUCTION, not recomputed (#6812 round 12).
+// Round 11 shipped `DerivedPortCapacity = len(members) × width`, which is NOT
+// the charge: sourceNATAggregateReferencedCharges computes
+// `Σ sourceNATPoolMemberHostCount(member) × range`. The two agree only when
+// every member is a bare host, which every fixture pool was — a fixture
+// coincidence, inside the one construct that exists BECAUSE derived keys cannot
+// be reached by reflection. A pool member that is a prefix broke the agreement
+// and nothing noticed.
+//
+// The general form is worth more than the fix: A WRAPPER COLUMN ASSERTING A
+// DERIVED KEY IS A SECOND IMPLEMENTATION OF THAT KEY, AND SECOND
+// IMPLEMENTATIONS DRIFT. The wrapper exists to EXPOSE the value to the sweep,
+// not to compute it. So these fields carry what
+// sourceNATAggregateReferencedCharges produced for this rule's pool, verbatim;
+// TestDerivedChargeColumnsComeFromProduction_6812 pins that, and the fixture now
+// carries a prefix member so the two formulas would disagree if anyone
+// reintroduced one.
 type ruleAxisSlot6812 struct {
-	Rule                *NATRule
-	Pool                *NATPool
-	DerivedPortWidth    int
-	DerivedPortCapacity int
+	Rule *NATRule
+	Pool *NATPool
+	// ChargeAddrs and ChargePortCap are the production charge for this rule's
+	// pool — the expanded host count and the allocator port capacity the
+	// aggregate budget actually spends.
+	ChargeAddrs   uint64
+	ChargePortCap uint64
+}
+
+// productionChargeByPool6812 indexes what the PRODUCTION charge walk computed,
+// keyed by pool name. The sweep's derived columns read this instead of
+// recomputing, so there is no second implementation to drift (#6812 round 12).
+func productionChargeByPool6812(t *testing.T, cfg *Config) map[string]sourceNATAggregatePoolCharge {
+	t.Helper()
+	out := map[string]sourceNATAggregatePoolCharge{}
+	for _, c := range sourceNATAggregateReferencedCharges(cfg) {
+		out[c.name] = c
+	}
+	return out
 }
 
 // walkRuleAxisExemptions6812 is the honest enumeration of what
@@ -773,6 +798,7 @@ func walkWitness6812() axisWitness6812 {
 					"DNAT-compat scalars, would then be witnessed against a config that has " +
 					"no destination side at all")
 			}
+			charges := productionChargeByPool6812(t, cfg)
 			var groups []axisGroup6812
 			for _, rs := range cfg.Security.NAT.Source {
 				var slots []any
@@ -781,16 +807,16 @@ func walkWitness6812() axisWitness6812 {
 					if pool == nil {
 						t.Fatalf("witness rule %s references unknown pool %q", rule.Name, rule.Then.PoolName)
 					}
-					lo, hi, ok := SourceNATPoolPortRange(pool)
+					ch, ok := charges[rule.Then.PoolName]
 					if !ok {
-						t.Fatalf("witness pool %q has an unusable port range", pool.Name)
+						t.Fatalf("witness pool %q was not charged by the production walk",
+							rule.Then.PoolName)
 					}
-					width := int(hi) - int(lo) + 1
 					slots = append(slots, ruleAxisSlot6812{
-						Rule:                rule,
-						Pool:                pool,
-						DerivedPortWidth:    width,
-						DerivedPortCapacity: len(SourceNATPoolMembers(pool)) * width,
+						Rule:          rule,
+						Pool:          pool,
+						ChargeAddrs:   ch.addrs,
+						ChargePortCap: ch.portCap,
 					})
 				}
 				groups = append(groups, axisGroup6812{label: "witness rule-set " + rs.Name, slots: slots})

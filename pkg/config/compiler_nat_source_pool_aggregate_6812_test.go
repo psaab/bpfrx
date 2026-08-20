@@ -743,9 +743,9 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 	}
 	assertNoTierDeclaredNameAscending6812(t, tiers, names)
 
-	charges := sourceNATAggregateReferencedCharges(cfg)
+	orderedCharges := sourceNATAggregateReferencedCharges(cfg)
 	var got []string
-	for _, c := range charges {
+	for _, c := range orderedCharges {
 		got = append(got, c.name)
 	}
 	if len(got) != len(wantOrder) {
@@ -838,44 +838,8 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 // round 10; before it they were identical for every pool here and a sort keyed
 // on any of them was a measured no-op.
 func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
-	decl := []struct {
-		rule, pool, match, poolAddr string
-		// #6812 round 10: two more columns, each of which round 9's four helper
-		// calls could not see because the FIXTURE held it constant while
-		// production varies it. Every pool used to carry exactly one member at
-		// the default 1024-65535 range, so a sort by len(Addresses), by the
-		// port-range width, or by the allocator charge this very walk computes
-		// was a no-op here and not in general. Extra members ride on `extra`;
-		// the FIRST member stays as it was so the Addresses[0] permutation is
-		// untouched.
-		extra  []string
-		lo, hi int
-	}{
-		{"r07", "qb", "10.0.3.0/24", "203.0.113.2", []string{"198.51.100.7"}, 3000, 3999},
-		{"r02", "qd", "10.0.0.0/24", "203.0.113.3", nil, 1200, 9200},
-		{"r09", "qa", "10.0.2.0/24", "203.0.113.1", []string{"198.51.100.9", "198.51.100.19"}, 5000, 5099},
-		{"r05", "qc", "10.0.1.0/24", "203.0.113.4", nil, 2000, 8000},
-	}
-	cmds := []string{"set security nat source rule-set RS from zone trust"}
-	for _, d := range decl {
-		cmds = append(cmds,
-			fmt.Sprintf("set security nat source pool %s address %s", d.pool, d.poolAddr))
-		for _, a := range d.extra {
-			cmds = append(cmds, fmt.Sprintf("set security nat source pool %s address %s", d.pool, a))
-		}
-		cmds = append(cmds,
-			fmt.Sprintf("set security nat source pool %s port range %d to %d", d.pool, d.lo, d.hi),
-			fmt.Sprintf("set security nat source rule-set RS rule %s match source-address %s", d.rule, d.match),
-			fmt.Sprintf("set security nat source rule-set RS rule %s then source-nat pool %s", d.rule, d.pool),
-		)
-	}
+	cfg, wantDeclRules, wantDeclPools := aggregateChargeOrderFixtureConfig6812(t)
 
-	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
-	if err != nil {
-		t.Fatalf("CompileConfigLenient: %v", err)
-	}
-
-	// PRECONDITION (a): the compiler preserved declaration order, so the
 	// sequence below really is config order and not an artifact of the AST.
 	if n := len(cfg.Security.NAT.Source); n != 1 {
 		t.Fatalf("compiled %d rule-sets, want 1 — a second rule-set would let the TIER "+
@@ -885,11 +849,6 @@ func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
 	for _, rule := range cfg.Security.NAT.Source[0].Rules {
 		gotDeclRules = append(gotDeclRules, rule.Name)
 		gotDeclPools = append(gotDeclPools, rule.Then.PoolName)
-	}
-	var wantDeclRules, wantDeclPools []string
-	for _, d := range decl {
-		wantDeclRules = append(wantDeclRules, d.rule)
-		wantDeclPools = append(wantDeclPools, d.pool)
 	}
 	if strings.Join(gotDeclRules, ",") != strings.Join(wantDeclRules, ",") {
 		t.Fatalf("compiled rule order %v != declared %v — the fixture's premise (config "+
@@ -933,20 +892,21 @@ func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
 	// NATMatch / NATThen / NATPool later joins the sweep with no edit here, and
 	// a column this fixture holds constant must be REGISTERED rather than
 	// silently skipped.
+	charges := productionChargeByPool6812(t, cfg)
 	var slots []any
 	for _, rule := range cfg.Security.NAT.Source[0].Rules {
 		pool := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
-		lo, hi, ok := SourceNATPoolPortRange(pool)
+		ch, ok := charges[rule.Then.PoolName]
 		if !ok {
-			t.Fatalf("rule %s references pool %q with an unusable port range; this fixture "+
-				"configures a valid range on every pool", rule.Name, rule.Then.PoolName)
+			t.Fatalf("rule %s references pool %q, which the production charge walk did not "+
+				"charge; the derived columns below READ that charge rather than recomputing "+
+				"it, so an uncharged pool has no value to expose", rule.Name, rule.Then.PoolName)
 		}
-		width := int(hi) - int(lo) + 1
 		slots = append(slots, ruleAxisSlot6812{
-			Rule:                rule,
-			Pool:                pool,
-			DerivedPortWidth:    width,
-			DerivedPortCapacity: len(SourceNATPoolMembers(pool)) * width,
+			Rule:          rule,
+			Pool:          pool,
+			ChargeAddrs:   ch.addrs,
+			ChargePortCap: ch.portCap,
 		})
 	}
 	sweepAxes6812(t, "charged rule",
@@ -959,9 +919,9 @@ func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
 	byMatch := poolsSortedByKey6812(wantDeclPools, declMatch)
 	config0 := strings.Join(wantDeclPools, ",")
 
-	charges := sourceNATAggregateReferencedCharges(cfg)
+	orderedCharges := sourceNATAggregateReferencedCharges(cfg)
 	var got []string
-	for _, c := range charges {
+	for _, c := range orderedCharges {
 		got = append(got, c.name)
 	}
 	if strings.Join(got, ",") != config0 {
@@ -1215,4 +1175,112 @@ func assertNoTierDeclaredNameAscending6812(t *testing.T, tiers []int, names []st
 			"(tier, name ASC) tiebreak would have nothing to reorder and this fixture " +
 			"cannot bind the tie-break rule at all")
 	}
+}
+
+// TestDerivedChargeColumnsComeFromProduction_6812 is the round-12 guard on the
+// round-11 wrapper.
+//
+// The wrapper exists because reflection cannot reach a key DERIVED from fields.
+// Round 11 filled it by recomputing one — `len(members) × width` — and that is
+// not the charge production spends. sourceNATAggregateReferencedCharges spends
+// `Σ sourceNATPoolMemberHostCount(member) × range`; the Rust apply boundary
+// spends allocator_capacity over the EXPANDED addresses. All three agreed only
+// because every fixture pool member was a bare host, which is the
+// fixture-coincidence class this round exists to eliminate — sitting inside the
+// construct added because reflection could not reach it.
+//
+// Two halves, and the second is the one that keeps working:
+//
+//  1. the wrapper's columns EQUAL the production charge, because they are read
+//     from it rather than recomputed;
+//  2. the fixture can TELL THE TWO FORMULAS APART. A pool carrying a /30
+//     member has four hosts and one member, so the naive product differs from
+//     the charge. Without this the first half is unfalsifiable — every value
+//     would agree with every formula.
+func TestDerivedChargeColumnsComeFromProduction_6812(t *testing.T) {
+	cfg, _, _ := aggregateChargeOrderFixtureConfig6812(t)
+	charges := productionChargeByPool6812(t, cfg)
+
+	discriminating := 0
+	for _, rule := range cfg.Security.NAT.Source[0].Rules {
+		name := rule.Then.PoolName
+		pool := cfg.Security.NAT.SourcePools[name]
+		ch, ok := charges[name]
+		if !ok {
+			t.Fatalf("pool %q was not charged", name)
+		}
+		lo, hi, ok := SourceNATPoolPortRange(pool)
+		if !ok {
+			t.Fatalf("pool %q has an unusable port range", name)
+		}
+		width := uint64(hi-lo) + 1
+		naive := uint64(len(SourceNATPoolMembers(pool))) * width
+		if naive != ch.portCap {
+			discriminating++
+		}
+		// The wrapper must carry the PRODUCTION value, whichever that is.
+		slot := ruleAxisSlot6812{Rule: rule, Pool: pool, ChargeAddrs: ch.addrs, ChargePortCap: ch.portCap}
+		if slot.ChargePortCap != ch.portCap || slot.ChargeAddrs != ch.addrs {
+			t.Fatalf("pool %q: the swept slot does not carry the production charge "+
+				"(addrs %d/%d, portCap %d/%d)", name,
+				slot.ChargeAddrs, ch.addrs, slot.ChargePortCap, ch.portCap)
+		}
+	}
+	if discriminating == 0 {
+		t.Fatalf("no pool in this fixture distinguishes `len(members) × width` from the " +
+			"production charge `Σ host-count × range` — every member is a bare host, so a " +
+			"wrapper that recomputed the naive product would agree with production here and " +
+			"the round-12 finding would be invisible again. Give a pool a prefix or range " +
+			"member.")
+	}
+}
+
+// aggregateChargeOrderFixtureConfig6812 builds the fixture config, shared with
+// TestDerivedChargeColumnsComeFromProduction_6812 so both read ONE input.
+// It also returns the DECLARED rule and pool sequences, so the order assertions
+// compare against the table rather than re-deriving it.
+func aggregateChargeOrderFixtureConfig6812(t *testing.T) (*Config, []string, []string) {
+	t.Helper()
+	decl := []struct {
+		rule, pool, match, poolAddr string
+		// #6812 round 10: two more columns, each of which round 9's four helper
+		// calls could not see because the FIXTURE held it constant while
+		// production varies it. Every pool used to carry exactly one member at
+		// the default 1024-65535 range, so a sort by len(Addresses), by the
+		// port-range width, or by the allocator charge this very walk computes
+		// was a no-op here and not in general. Extra members ride on `extra`;
+		// the FIRST member stays as it was so the Addresses[0] permutation is
+		// untouched.
+		extra  []string
+		lo, hi int
+	}{
+		{"r07", "qb", "10.0.3.0/24", "203.0.113.2", []string{"198.51.100.8/30"}, 3000, 3999},
+		{"r02", "qd", "10.0.0.0/24", "203.0.113.3", nil, 1200, 9200},
+		{"r09", "qa", "10.0.2.0/24", "203.0.113.1", []string{"198.51.100.9", "198.51.100.19"}, 5000, 5099},
+		{"r05", "qc", "10.0.1.0/24", "203.0.113.4", nil, 2000, 8000},
+	}
+	cmds := []string{"set security nat source rule-set RS from zone trust"}
+	for _, d := range decl {
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source pool %s address %s", d.pool, d.poolAddr))
+		for _, a := range d.extra {
+			cmds = append(cmds, fmt.Sprintf("set security nat source pool %s address %s", d.pool, a))
+		}
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source pool %s port range %d to %d", d.pool, d.lo, d.hi),
+			fmt.Sprintf("set security nat source rule-set RS rule %s match source-address %s", d.rule, d.match),
+			fmt.Sprintf("set security nat source rule-set RS rule %s then source-nat pool %s", d.rule, d.pool),
+		)
+	}
+
+	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	var wantRules, wantPools []string
+	for _, d := range decl {
+		wantRules = append(wantRules, d.rule)
+		wantPools = append(wantPools, d.pool)
+	}
+	return cfg, wantRules, wantPools
 }

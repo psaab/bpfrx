@@ -851,10 +851,7 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 			if !ok {
 				t.Fatalf("declared rule %s/%s emitted no snapshot", rule.Then.PoolName, rule.Name)
 			}
-			slot := snapshotAxisSlot6812{
-				Snapshot:            s,
-				DerivedPortCapacity: len(s.PoolAddresses) * (int(s.PortHigh) - int(s.PortLow) + 1),
-			}
+			slot := snapshotAxisSlot6812{Snapshot: s}
 			tier := sourceNATScopeTier(s)
 			if _, seen := tierSlots[tier]; !seen {
 				tierOrder = append(tierOrder, tier)
