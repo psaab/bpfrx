@@ -80014,3 +80014,76 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
   pkg/api/drain_scope_6827_test.go, pkg/api/tls_stale_cert_6827_test.go,
   pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6827 round 11 — state the drain's real bound at both sites; close two
+  deletion-sweep survivors on `Server.serveBound`
+  **Item 1 (wording).** Round 10 described serveBound's new drain as "making the worst
+  case additive" (`pkg/api/server.go`) and "each now gets its own `legDrainTimeout`"
+  (`pkg/api/README.md`). Both read as 5 + 5 = 10s. The quantity has NO fixed ceiling, and
+  this package already says so directly above `legDrainTimeout`: it is a POLL deadline,
+  both phases put serial per-connection closes in front of it, and on an HTTPS leg each
+  `close_notify` carries a five-second write deadline of its OWN. This is the SECOND
+  tightening — round 9 already corrected "bounded 5s drain" to "5s-deadline drain" for the
+  same reason — so both sites now state the MECHANISM and say explicitly that this is not
+  "5s for both" becoming "5s each", which is harder to re-tighten by accident than an
+  adjective. `serveBound` remains test-only: production is `NewServer` + `Start` at
+  `pkg/daemon/management.go:216-217`, and no `.Run(ctx)` in `pkg/daemon` is the api server,
+  so no shipped shutdown path is affected. NOTE: round 10's own entry above carries the
+  same finite gloss ("each now gets its own `legDrainTimeout`", line ~79981). It is left
+  as written — this log is a journal of what was believed at the time, and rewriting it
+  would falsify the record. This entry is the correction.
+  **Item 2 (deletion sweep).** Nobody had run one. Predicate: every EXECUTABLE (non-`//`)
+  line in `git diff 987bfe918..d9fb1de1e -- pkg/api/listener.go pkg/api/server.go` — 8 of
+  the 33 added lines — probed by literal deletion, plus 5 compile-preserving
+  neutralizations for the lines whose deletion is only a compile error, since a build
+  failure is a vacuous red rather than evidence of coverage. Comment lines were excluded by
+  construction: deleting one cannot move `.text`, so "green" there is a tautology, not a
+  finding. Every cell ran the WHOLE of `pkg/api` + `pkg/daemon` with an always-failing
+  sentinel in each package, so GREEN means "exactly 2 FAILs, both sentinels" and a build
+  failure classifies BROKEN rather than GREEN. Results: A1-A4/A8 compile-fenced;
+  A5 RED (4 cells); A6 RED as a HANG — deleting the stop/root-arm drain leaves `<-serveErr`
+  waiting on a Serve that nothing ever stops, and BOTH packages time out; A7 RED;
+  B3/B4/B5 RED. **Two survivors, both on `serveBound`.**
+  **S1: the HTTPS leg was unbound against the exact revert.** Replacing
+  `shutErr = drainLeg(s.httpsServer)` with the pre-round-10 bare `Shutdown` left both
+  packages green. `TestServeBoundSeversInFlightResponses_6827`, the cited binding, called
+  `serveBound(ctx, ln, nil)`, so `s.httpsServer` was nil and the `if s.httpsServer != nil`
+  branch never ran; deleting the line outright reds only
+  `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener CLOSES, not that
+  a response is SEVERED. Round 10's own MUT-2 reverted BOTH legs at once and the bound HTTP
+  leg redded the cell, masking the unbound HTTPS one — a compound mutation cannot localise.
+  **S2: `drainLeg`'s new `return err` could become `return nil`** with both packages green.
+  Self-documented rather than hidden (`t.Logf(...) // not asserted`), but `drainLeg`'s doc
+  says it returns the error "so a caller that reports one can keep doing so" and
+  serveBound's says "the Shutdown error is still what gets reported" — claims with nothing
+  behind them. Both are genuine coverage holes (the lines execute; their values are
+  discarded), not dead code, so both are now bound: the cell runs BOTH legs with a stream
+  held on each via a new `holdStream` helper, and asserts the returned error is the drain
+  deadline. Deterministic — both conns are ACTIVE, so `closeIdleConns` can never report
+  quiescence and `Shutdown` must reach its deadline.
+  **Fix verified against the mutations that found it**: B1 and B2 re-run on the FIXED tree
+  both flip GREEN -> RED. B1: "serveBound returned <nil>, want a context deadline
+  exceeded". B2: "HTTPS leg: ... the connection was still OPEN 3s later (1484 reads, 14840
+  bytes, 0 read timeouts; bytes arrived during the wait)", so the HTTPS stream was
+  genuinely still being delivered rather than merely quiet.
+  **Item 3 (leak check on `TestServingFlipsDuringTheDrainNotAfterIt_6827`).** A temporary
+  `TestMain` snapshotted goroutines and `/proc/self/fd` around `m.Run()` with `-run`
+  narrowed to one test, so anything surviving is attributable to it. Target: goroutines
+  +0, fds +0, sockets +0 — identical to a no-IO control (`TestLegDrainTimeoutDefault_6827`)
+  on all three axes. At `-count=5`, still +0/+0/+0, so there is no per-run accumulation
+  either; the round-11 cell was checked the same way and is also +0/+0/+0.
+  **Harness integrity.** A duplicate `sweep.sh` instance survived its own TERM trap (the
+  handler restored files but did not exit) and was still cycling cells against this
+  worktree while later work ran; it was SIGKILLed and both production files verified
+  sha256-identical to the pristine snapshot afterwards. Neither survivor finding depends on
+  that measurement: both are certain from the pre-fix test SOURCE — the old cell had NO
+  assertion on the returned error, and passed `nil` for `httpsLn` so the HTTPS drain
+  statement never executed. Contamination could only convert a RED into a false GREEN, so
+  the RED verdicts are unaffected in either direction.
+  **Validation** (clean tree, nothing else running in the worktree): `go build ./...` rc 0;
+  `go test -count=1 ./pkg/api/` rc 0, 42.4s, zero `--- FAIL` lines; `go test -count=1
+  ./pkg/daemon/` rc 0, 23.4s, zero `--- FAIL` lines. `go vet ./pkg/api/` rc 0. No `.o`, no
+  `userspace-xdp/`, no protocol or wire file in the change set.
+- **File(s)**: pkg/api/server.go, pkg/api/README.md,
+  pkg/api/tls_stale_cert_6827_test.go

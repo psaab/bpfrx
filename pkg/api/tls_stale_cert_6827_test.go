@@ -1243,6 +1243,44 @@ func TestServingFlipsDuringTheDrainNotAfterIt_6827(t *testing.T) {
 	}
 }
 
+// holdStream opens one connection to addr, asks for the endless stream, and
+// returns once a chunk of the response has arrived — so the connection is
+// ACTIVE rather than idle and the drain has something to wait on. It returns
+// the RAW connection for the same reason streamFixture keeps one: a chunked
+// body reader is permanently poisoned by its first read deadline, so
+// assertConnSevered cannot use it (#6827 round 10).
+func holdStream(t *testing.T, addr string, useTLS bool) net.Conn {
+	t.Helper()
+	var conn net.Conn
+	var err error
+	if useTLS {
+		conn, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // self-signed fixture
+	} else {
+		conn, err = net.Dial("tcp", addr)
+	}
+	if err != nil {
+		t.Fatalf("dial %s (tls=%v): %v", addr, useTLS, err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline (tls=%v): %v", useTLS, err)
+	}
+	if _, err := io.WriteString(conn, "GET /stream HTTP/1.1\r\nHost: "+addr+"\r\n\r\n"); err != nil {
+		t.Fatalf("write request (tls=%v): %v", useTLS, err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response headers (tls=%v): %v", useTLS, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	if _, err := resp.Body.Read(make([]byte, 8)); err != nil {
+		t.Fatalf("precondition (tls=%v): the response must be IN FLIGHT before the shutdown, so "+
+			"the connection is ACTIVE rather than idle and the drain has something to wait on; "+
+			"first chunk read failed: %v", useTLS, err)
+	}
+	return conn
+}
+
 // TestServeBoundSeversInFlightResponses_6827 is the FAIL-ON-REVERT guard for
 // Server.serveBound's drain (#6827 round 10).
 //
@@ -1258,9 +1296,16 @@ func TestServingFlipsDuringTheDrainNotAfterIt_6827(t *testing.T) {
 // NewServer + Start — and that is a reason it was cheap to fix, not a reason to
 // have shipped it.
 //
-// RED on revert: replace the two drainLeg calls in serveBound with
-// `s.httpServer.Shutdown(ctx)` / `s.httpsServer.Shutdown(ctx)` under a shared
-// context and the held stream outlives the call.
+// RED on revert: replace EITHER drainLeg call in serveBound with a bare
+// `Shutdown` and that leg's held stream outlives the call. Both legs are run,
+// with a stream held on each, because serveBound drains them through separate
+// statements — round 10's own revert mutation flipped BOTH at once, so the
+// bound HTTP leg redded the cell and hid the fact that the HTTPS statement was
+// unbound (this fixture passed nil for httpsLn). A compound mutation cannot
+// localise; #6827 round 11 split it and found the hole.
+//
+// The returned error is asserted too, for the same reason: it is what drainLeg
+// grew a return value for.
 func TestServeBoundSeversInFlightResponses_6827(t *testing.T) {
 	restore := legDrainTimeout
 	t.Cleanup(func() { legDrainTimeout = restore })
@@ -1271,74 +1316,90 @@ func TestServeBoundSeversInFlightResponses_6827(t *testing.T) {
 		t.Fatalf("bind loopback listener: %v", err)
 	}
 	addr := ln.Addr().String()
+	httpsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind loopback HTTPS listener: %v", err)
+	}
+	httpsAddr := httpsLn.Addr().String()
 
 	// Endless, for the same reason streamFixture's handler is: Shutdown closes
 	// an IDLE connection outright, so a handler that returns leaves the
 	// force-close nothing to do and the cell passes vacuously.
 	stop := make(chan struct{})
 	t.Cleanup(func() { close(stop) })
-	s := &Server{httpServer: &http.Server{
-		Addr: addr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
-			f, ok := w.(http.Flusher)
-			if !ok {
+	endless := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		f, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		f.Flush()
+		for {
+			select {
+			case <-stop:
 				return
+			default:
+			}
+			if _, err := io.WriteString(w, "tick\n"); err != nil {
+				return // the connection went away: severed, or the test ended
 			}
 			f.Flush()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				if _, err := io.WriteString(w, "tick\n"); err != nil {
-					return // the connection went away: severed, or the test ended
-				}
-				f.Flush()
-				time.Sleep(2 * time.Millisecond)
-			}
-		}),
-	}}
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
+
+	// BOTH legs, sharing ONE handler. serveBound drains the two servers through
+	// SEPARATE statements, so each needs its own held stream or the untested one
+	// can be reverted with the package still green — which is exactly what an
+	// httpsServer-nil fixture allowed until round 11.
+	cert := mintCert(t, "fw", "127.0.0.1")
+	s := &Server{
+		sharedBase: endless,
+		certGen:    func(string) (tls.Certificate, error) { return cert, nil },
+		httpServer: &http.Server{Addr: addr, Handler: endless},
+	}
+	s.httpsSlot = s.newAuthSlot()
+	httpsSrv, err := s.buildHTTPSServer(httpsAddr, s.httpsSlot)
+	if err != nil {
+		t.Fatalf("build HTTPS server: %v", err)
+	}
+	s.httpsServer = httpsSrv
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- s.serveBound(ctx, ln, nil) }() // httpsLn is unread while httpsServer is nil
+	go func() { done <- s.serveBound(ctx, ln, httpsLn) }()
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	t.Cleanup(func() { conn.Close() })
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		t.Fatalf("set deadline: %v", err)
-	}
-	if _, err := io.WriteString(conn, "GET /stream HTTP/1.1\r\nHost: "+addr+"\r\n\r\n"); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatalf("read response headers: %v", err)
-	}
-	t.Cleanup(func() { resp.Body.Close() })
-	if _, err := resp.Body.Read(make([]byte, 8)); err != nil {
-		t.Fatalf("precondition: the response must be IN FLIGHT before the shutdown, so the "+
-			"connection is ACTIVE rather than idle and the drain has something to wait on; "+
-			"first chunk read failed: %v", err)
-	}
+	conn := holdStream(t, addr, false)
+	tlsConn := holdStream(t, httpsAddr, true)
 
 	cancel()
 	select {
 	case err := <-done:
-		t.Logf("serveBound returned %v", err) // a severed drain reports its deadline; not asserted
+		// ASSERTED, not logged (#6827 round 11). drainLeg returns the Shutdown
+		// error precisely so serveBound can keep reporting it, and both doc
+		// comments say so; with the value only logged, `return err` could become
+		// `return nil` and the whole package stayed green. Deterministic here:
+		// both connections are ACTIVE, so closeIdleConns can never report
+		// quiescence and Shutdown MUST reach its deadline.
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("serveBound returned %v, want a %v: both legs held an ACTIVE stream, so "+
+				"each Shutdown had to run out its %v deadline and drainLeg had to hand that "+
+				"error back for serveBound to report (#6827 round 11)",
+				err, context.DeadlineExceeded, legDrainTimeout)
+		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("serveBound did not return after ctx cancellation")
 	}
 
-	assertConnSevered(t, conn, "serveBound returned with an in-flight response still being "+
-		"delivered: Shutdown WAITS for it and abandons it at the deadline, so without the "+
-		"force-close pkg/api/README.md's package-wide drain invariant is false about this "+
-		"function and the shape stays in the tree to be copied (#6827 round 10)")
+	const severed = "serveBound returned with an in-flight response still being " +
+		"delivered: Shutdown WAITS for it and abandons it at the deadline, so without the " +
+		"force-close pkg/api/README.md's package-wide drain invariant is false about this " +
+		"function and the shape stays in the tree to be copied (#6827 round 10)"
+	assertConnSevered(t, conn, "HTTP leg: "+severed)
+	// The HTTPS leg is drained by a SEPARATE statement, and until round 11 no
+	// cell reached it: this fixture passed nil for httpsLn, so reverting that
+	// one statement to a bare Shutdown left both packages green.
+	assertConnSevered(t, tlsConn, "HTTPS leg: "+severed)
 }

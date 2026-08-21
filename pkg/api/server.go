@@ -1000,10 +1000,18 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, 
 // NewServer + Start), so the change is cheap, but "no caller today" is not a
 // reason to ship the defect.
 //
-// One behavioural consequence worth stating: the two servers previously shared
-// ONE 5s context, so 5s was the budget for BOTH. Each now gets its own
-// legDrainTimeout, matching every other drain in the package and making the
-// worst case additive. legDrainTimeout is also the knob a test can shorten.
+// One behavioural consequence worth stating: this path now drains the way the
+// rest of the package does, and that shape has NO wall-clock ceiling. The old
+// code ran a bare Shutdown on each server under ONE shared 5s context and never
+// reached a Close phase at all; each server now gets its own legDrainTimeout
+// AND the severing Close behind it. That is not "5s for both" becoming "5s
+// each": legDrainTimeout is a POLL deadline, and both phases put serial
+// per-connection closes in front of it — on an HTTPS leg each close_notify
+// carries a five-second write deadline of its OWN, so one stalled peer costs up
+// to five seconds, then the next, in each phase of each server. The worst case
+// grows with the number of such connections and has no fixed ceiling;
+// legDrainTimeout's comment is the authority on why. legDrainTimeout is also
+// the knob a test can shorten.
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.

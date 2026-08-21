@@ -1087,9 +1087,28 @@ under the daemon's errgroup. Nothing else imports this package.
       no production caller; the daemon uses `NewServer` + `Start`), which made
       fixing it cheap rather than optional: narrowing the invariant instead would
       have left the shape in the tree for the next reader to copy. Bound by
-      `TestServeBoundSeversInFlightResponses_6827`. One behavioural consequence:
-      the two servers used to share ONE 5s context, so 5s was the budget for
-      both; each now gets its own `legDrainTimeout`.
+      `TestServeBoundSeversInFlightResponses_6827`, which runs BOTH legs with a
+      stream held on each (#6827 round 11). It used to pass `nil` for `httpsLn`,
+      so it never entered the `if s.httpsServer != nil` branch and reverting
+      THAT statement alone to a bare `Shutdown` left `pkg/api` and `pkg/daemon`
+      green — deleting it reds only
+      `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener
+      CLOSES, not that a response is SEVERED. Round 10's own revert mutation
+      flipped both statements together, and the bound HTTP leg redded the cell
+      and masked the unbound HTTPS one: a compound mutation cannot localise. The
+      cell also ASSERTS the returned error now — `drainLeg` grew a return value
+      for exactly that, and with it merely logged, `return err` could become
+      `return nil` with both packages still green.
+      One behavioural consequence,
+      and it is NOT a bigger fixed number: the old code ran a bare `Shutdown` on
+      each server under ONE shared 5s context and never reached a `Close` phase
+      at all, whereas each server now gets its own `legDrainTimeout` AND the
+      severing `Close` behind it. Read that as the package's drain shape, not as
+      "5s for both" becoming "5s each" — `legDrainTimeout` is a POLL deadline
+      with serial per-connection closes in front of it in BOTH phases, each
+      HTTPS `close_notify` carrying a five-second write deadline of its own, so
+      the worst case here grows with the number of stalled connections and has
+      no fixed ceiling, exactly as described below.
       **On the unexpected-serve-exit arm, `dead` is stored BEFORE the drain, and
       the ORDER is load-bearing** (#6827 round 10). `serving()` has to flip the
       instant the socket dies, because for the whole width of the drain — which
