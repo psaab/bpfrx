@@ -2923,6 +2923,7 @@ fn update_fabrics_persists_resolved_fabric_set() {
     }
     // SyncFabricState resolves a peer MAC and pushes it via update_fabrics.
     let resolved = FabricSnapshot {
+        parent_unbindable: false,
         name: "fab0".into(),
         parent_interface: "ge-0/0/0".into(),
         parent_linux_name: "ge-0-0-0".into(),
@@ -2973,6 +2974,7 @@ fn update_fabrics_persists_resolved_fabric_set() {
 fn update_fabrics_unchanged_set_does_not_rewrite_state_file() {
     use crate::{ConfigSnapshot, FabricSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
     let resolved = FabricSnapshot {
+        parent_unbindable: false,
         name: "fab0".into(),
         parent_interface: "ge-0/0/0".into(),
         parent_linux_name: "ge-0-0-0".into(),

@@ -40,6 +40,30 @@ command here automatically propagates to all three frontends.
 - `WriteHelp`, `LookupDesc`, `PrintTreeHelp`, `CompleteFromTree`,
   `CompleteFromTreeWithDesc` — the helper API the three frontends consume
   for the OPERATIONAL tree (and operational typed leaves).
+- `ParseCoSNameTypeArgs`, `CoSNameTypeTopic`, `ParseCoSNameTypeTopic` —
+  `cos_filter_topic.go`. The `name <n>` / `type <t>` filter grammar shared
+  by `show class-of-service classifier|rewrite-rule`, plus the ShowText
+  topic encoding that carries those filters to the gRPC server. See
+  "Shared argument grammars" below.
+
+## Shared argument grammars
+
+Some operational commands take arguments the tree cannot express as
+children — an optional `name <n>` / `type <t>` filter pair, say. When both
+the local CLI and the remote CLI must accept the same tokens, the PARSER
+belongs here next to the tree nodes that offer those tokens, not copied
+into each frontend.
+
+`cos_filter_topic.go` is the worked example (#6858). Its grammar used to
+exist three times: `pkg/cli` parsed args into filters, `cmd/cli` parsed the
+same args into a gRPC topic, and `pkg/grpcapi` decoded the topic. The two
+arg parsers had already drifted, and the topic encoding could not carry a
+filter value containing the `,` it used as its own param separator — so
+`show class-of-service rewrite-rule "rw,x"` rendered a different rule
+remotely than locally. One parser, one encoder and one decoder in this
+package make that class of divergence unrepresentable rather than
+something a mirrored test table has to catch. Per-frontend tests then
+assert only that each surface routes through these functions.
 
 ## Typed leaves
 

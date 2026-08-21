@@ -187,11 +187,28 @@ class):
 - `lo0` — the always-present loopback, a reserved Junos interface a zone may
   reference (host-inbound self-traffic) with no explicit `set interfaces lo0`;
 - every secure-tunnel base derived from an IPsec `bind-interface`
-  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — `bind-interface st0.0`
-  materializes the st0 xfrmi device at apply time (`daemon_apply` →
+  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — a `bind-interface`
+  materializes an xfrmi device at apply time (`daemon_apply` →
   `routing.ApplyXfrmi`) even with no explicit `set interfaces st0 unit 0`. The
   base is the bind string with any `.unit` stripped, so every unit of a bound
   secure tunnel is admitted.
+
+  The device is named after the AUTHORED bind string, not after the unit ref:
+  `bind-interface st0.0` creates a netdev literally named `st0.0`, while
+  `bind-interface st0` creates one named `st0` — and the unit ref is `st0.0` in
+  both cases, so the name cannot be derived from the ref. This line previously
+  read "`bind-interface st0.0` materializes the st0 xfrmi device", which is the
+  exact conflation #5619 exists to correct.
+
+  The bind string is taken VERBATIM; nothing canonicalizes the index. `st5`,
+  `st05` and `st+5` are three different device names that happen to derive one
+  XFRM if_id, and each admits only its own spelling as a zone-referenceable
+  base. Commit accepts all three (`ValidateSecureTunnelBindInterface` only
+  requires a nonzero if_id), and rejecting the unusual spellings was considered
+  and declined in #6691 — a new commit-time rejection would brick a persisted
+  or peer-synced config that already carries one (#1960 no-brick). Ownership is
+  therefore matched on the spelling, so `bind-interface st05` does not claim an
+  interface named `st5`.
 
 The tolerant load / peer-sync path downgrades to a warning
 (`opts.lenientZoneInterfaceDefined`) so an already-persisted or peer-synced
@@ -1540,6 +1557,129 @@ reader took only
 membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
+
+**The COMPACT-LEAF spelling puts the members on the STANZA's own Keys — reading
+only `prop.Children` compiles the zone with ZERO interfaces (#6525).** The
+`interfaces` stanza reaches the compiler in two structurally different shapes,
+and only one of them is reachable from `set`:
+
+| authored as | `interfaces` node | members live in |
+|---|---|---|
+| `interfaces { a; b; }` — BLOCK; `set` also always lands here | `Keys=["interfaces"]` | `Children` — one node per member for a block or a single `set`, but a flat bracket list NESTS (see below) |
+| `interfaces a;` — COMPACT LEAF | `Keys=["interfaces","a"]` | the stanza's own `Keys[1:]`; `Children` nil |
+| `interfaces [ a b ];` | `Keys=["interfaces","a","b"]` | ditto (the lexer strips the brackets, #2419) |
+| `interfaces a { host-inbound-traffic {...} }` | `Keys=["interfaces","a"]` | `Keys[1:]`; `Children` is the member's **BODY**, not more members |
+
+A flat-set bracket list does **not** fan out to one child per member. `set
+security zones security-zone Z interfaces [ a b c ]` produces a NESTED chain,
+because the schema models the interface name as a wildcard CONTAINER: `SetPath`
+descends the wildcard for `a`, then — the interface-name node has no wildcard of
+its own — collapses every remaining token onto ONE leaf beneath it.
+
+```
+interfaces            Keys=["interfaces"]  children=1
+  a                   Keys=["a"]           children=1
+    b c               Keys=["b","c"]       children=0
+```
+
+`zoneInterfaceMembers` RECURSES and reads every key at each level, so this is
+read correctly — but a reader that walked only `prop.Children` one level deep
+would see member `a` alone. Shape pinned by
+`TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning`.
+
+**A body keyword with dropped tokens after it is REJECTED (#6735).**
+Because the lexer has already stripped the brackets, `interfaces [ a
+host-inbound-traffic b ]` and `interfaces a host-inbound-traffic system-services
+ssh` are indistinguishable, and their readings disagree about membership — the
+truncator keeps only the names BEFORE the keyword, dropping either a valid
+member (left with no zone, never dataplane-bound) or the whole override. The
+compiler refuses rather than guessing: `validateZoneInterfacePackedTailStrict`
+hard-rejects at commit and warns on the tolerant load / peer-sync path (#1960
+no-brick). Rewrite in the block spelling, which is unambiguous — `interfaces {
+a; b; }` for membership, `interfaces { a { host-inbound-traffic { ... } } }` for
+a per-interface body. A keyword with NOTHING after it is accepted: truncation
+loses nothing there.
+
+The dropped tokens do **not** have to be on the same `Keys` slice, and assuming
+they were is how the gate first shipped with the headline statement escaping it
+in the `set` ingest. `host-inbound-traffic` is a schema CHILD of the
+interface-name wildcard, so when it is the token immediately after the first
+bracket token, `SetPath` **descends** it instead of collapsing the tail:
+
+```
+set ... interfaces [ a host-inbound-traffic b ]
+interfaces -> a -> host-inbound-traffic -> b        # b parks UNDER the keyword
+set ... interfaces [ a b host-inbound-traffic c ]
+interfaces -> a -> Keys=["b","host-inbound-traffic","c"]   # c on one Keys slice
+```
+
+Both lose their trailing member; only the second was visible to a Keys-only
+detector. The gate therefore also inspects a keyword NODE's subtree
+(`zoneInterfaceHostInboundStrayTokens`): a token there is a dropped member unless
+it is legitimate body content (`system-services` / `protocols`, derived from
+`hostInboundSchemaChildren` so the two cannot drift) or one of the
+`apply-groups` / `apply-groups-except` / `apply-macro` statements that may appear
+anywhere in the hierarchy — `apply-groups-except` and `apply-macro` survive group
+expansion as live nodes, so reading one as a member would false-reject a
+legitimate config.
+
+
+`compileZones` iterated `prop.Children`, so every compact spelling ran the loop
+body ZERO times and the zone compiled with NO interfaces — cleanly, with no
+error and no warning. Both strict zone gates
+(`validateZoneInterfaceMembershipStrict`, `validateZoneInterfaceDefinedStrict`)
+then passed VACUOUSLY: they iterate `zone.Interfaces`, which was empty, so the
+two gates that exist specifically to protect zone membership were inert against
+a membership list that never arrived. Downstream, `UserspaceBoundLinuxInterfaces`
+skips any interface with `Zone == ""`, so the interface was never AF_XDP-bound
+and every policy naming that zone never applied to its traffic.
+
+Two traps in the fix, both live:
+
+- **`zoneInterfaceMembers(prop)` is the WRONG fix.** Its Keys loop starts at
+  index 0, which is a member name for a CHILD but the stanza keyword
+  `interfaces` for the stanza itself — it compiles a zone member literally named
+  `interfaces`. `zoneInterfaceMemberNodes` synthesizes a member node from
+  `prop.Keys[1:]` instead.
+- **Excluding the BODY matters as much as reading the Keys.** In the compact
+  with-body shape `prop.Children` holds the `host-inbound-traffic` node, and in
+  the hierarchical PACKED shape (`interfaces a host-inbound-traffic
+  system-services ssh;`) the body sits on the member's own Keys. Reading either
+  without excluding the body trades a silent DROP for a silent INVENTION — body
+  keywords promoted to interface names (measured on master:
+  `ifaces=[host-inbound-traffic system-services ssh]`). `zoneInterfaceMembers`
+  now truncates a member's Keys at a `zoneInterfaceBodyKeywords` token and stops
+  recursing there; that token set mirrors the schema (the interface-name
+  wildcard's only child is `host-inbound-traffic`) and must be kept in lockstep
+  with it.
+
+Normalizing the compact shape onto the block shape — rather than adding a second
+read path — keeps membership, the #5248 bracket flatten and the #6391 Keys-scoped
+override in ONE implementation; a second derivation is exactly how this defect
+class arises.
+
+**Fail-closed belt (#6525).** `validateZoneInterfacesNonEmptyStrict` rejects an
+`interfaces` stanza that CARRIES CONTENT yet contributes zero members, so any
+future shape the compiler cannot read is LOUD instead of silent. It asks the
+compiler's own reader (`zoneInterfaceStanzaMembers`) and runs on the
+group-expanded `*ConfigTree`, because a compiled `ZoneConfig` cannot distinguish
+"no stanza" from "a stanza that compiled to nothing". It deliberately does NOT
+fire on a stanza that carries nothing at all: `delete security zones
+security-zone <z> interfaces <if>` of the last member leaves the empty container
+behind (`deletePath` does not prune it), and rejecting that would make an
+ordinary edit uncommittable against a stanza that renders invisibly — the #4191
+over-rejection class. Strict on commit / commit-check, downgraded to a warning on
+the tolerant load / peer-sync paths (`lenientZoneInterfacesNonEmpty`, #1960
+no-brick). Covered by
+`pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`.
+
+REACHABILITY (honest bound): the COMPACT-LEAF shape above is hierarchical text
+ingest only — `load override` / `load merge` / the persisted config file / HA
+`SyncApply`. `set` cannot produce it (`SetPath` always descends the `interfaces`
+container), and `show configuration | display set` round-trips safely. Those are
+still the boot path and the peer-sync path. The #6735 packed-tail shape is a
+different matter: it IS reachable from the ordinary `set` CLI, in both the
+Keys-collapsed and keyword-descended arrangements shown above.
 
 **A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
 node it is authored on, never by that node's CHILDREN (#6391).** The
@@ -3065,8 +3205,10 @@ The closed-world keyword audit above validates WHICH keywords may appear under
 `then`, but not HOW MANY translation actions a rule carries. A malformed or
 mixed-version rule could still present a complete `then {}` block with ZERO
 NAT-terminal actions (actionless — the snapshot builder installs no
-translation, so an intended `off` exemption silently disappears and a later
-broader rule is revealed) or TWO+ mutually-exclusive actions (`off` + `pool`,
+translation and the rule does not stop evaluation, so an intended `off`
+exemption silently disappears and the traffic falls through: translated by a
+later broader rule if one matches, otherwise left untranslated) or TWO+
+mutually-exclusive actions (`off` + `pool`,
 `interface` + `pool` — the compiler silently picked one by packed-key / child
 order, so an exemption could publish as a translation). `security nat
 {source,destination} rule … then` must therefore carry EXACTLY ONE NAT-terminal
@@ -3086,6 +3228,137 @@ so the count reflects the winning block) and are NOT rejected. The
 picking one. Production tests:
 `compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
 zero/two/valid + #3850 last-wins preservation).
+
+The gate has a SECOND registration: `validateSourceNATStrictView`
+(`compiler_peer_effective_snat.go`), the source-NAT subject of the #5876
+peer-effective strict list. Both are load-bearing and neither substitutes for
+the other. `runUniformGates` adjudicates the SUBMITTING node's view; the
+peer-effective run adjudicates the PEER's `${node}` / `groups nodeN` expansion,
+and it is the only strict adjudication that view ever gets, because the standby
+ingests the synced config through `Store.SyncApply` →
+`CompileConfigForNodeLenient`, where this gate is downgraded to a warning. A
+peer-only contradiction therefore commits green on the origin and lands
+malformed on the standby unless the peer-effective call runs. Deleting that call
+left four packages green until #6820 added
+`TestPeerOnlyNATTerminalActionRejectedAtOriginCommit_6820` (plus a
+node1-perspective and a both-views-clean over-reject control) in
+`compiler_peer_effective_nat_terminal_action_6820_test.go`.
+
+Both rejection MESSAGES are content-bound by
+`TestNATTerminalActionMessageContent_6820`, not just their firing. They are
+operator-visible on both paths — verbatim at strict commit, wrapped into a
+`cfg.Warnings` entry on the tolerant one — and the 2+-action text used to state
+a mechanism the compiler had stopped using (a packed-key/child-order pick),
+which no test could see. It now says what actually happens — and says it
+PER KIND, because the two kinds do not share a mechanism (#6820 round 3). For
+source NAT every authored action is published and the DATAPLANE resolves the
+rule `off` > `interface` > `pool`. For destination NAT the COMPILER resolves
+`off` itself: `buildDestinationNATSnapshots` short-circuits on `isOff`, never
+looks the pool up, and publishes `PoolAddress: ""`, so "every action is
+published" is false for a DNAT rule; the dataplane's `off` > `pool` branch then
+covers any entry that arrives carrying both. Either way all but one authored
+action is discarded, and the survivor is not chosen by configuration order.
+
+*What the tolerant path actually does (#5717).* Only a malformed rule reaches
+the lenient arm — the strict commit path rejects it — but the two arities land
+there very differently, and the difference is load-bearing:
+
+- **Contradictory (2+ actions) CONTAINING `off` resolves to the EXEMPTION.**
+  Recording every field is what makes this safe: `off` takes precedence over
+  `interface` / `pool`, so such a contradiction can never publish the INVERSE of
+  the authored action. The two builders reach that outcome differently —
+  source NAT forwards every field to Rust, destination NAT short-circuits on
+  `isOff` in `pkg/dataplane/userspace/nat_destination.go` and publishes a
+  pool-less exemption entry — but **the precedence itself is decided in Rust on
+  both paths** (#6820): the `rule.off` early return in
+  `userspace-dp/src/nat/source.rs` for SNAT, and the `off`-only branch of
+  `DnatEntry::to_outcome` in `userspace-dp/src/nat/destination.rs` for DNAT.
+  The Go short-circuit is CANONICALIZATION, not the decision: a snapshot
+  carrying both `Off=true` and a usable pool — which Go never emits but a
+  hand-built or mixed-version one can — still resolves to the exemption,
+  measured by `dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820`
+  (`userspace-dp/src/nat/tests_destination.rs`), whose control arm clears `off`
+  on the same rule and gets the translation. Both halves are now pinned:
+  `TestTolerantContradictory{SNAT,DNAT}*_5717`
+  (`pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go`) and
+  `off_wins_over_contradictory_{interface,pool}_action_5717`
+  (`userspace-dp/src/nat/tests_source.rs`). The pre-existing
+  `off_rule_short_circuits_translation` does NOT cover this — its rule sets
+  `off` alone, so it stays green under a mutation that lets `interface` win.
+
+- **Contradictory WITHOUT `off` gives INTERFACE MODE precedence.** Source NAT
+  also admits `interface` + `pool`, which carries no `off` to take precedence.
+  The Rust matcher checks `off` -> `interface_mode` -> `pool_mode` in that order
+  (`nat/source.rs`), so interface mode wins and the authored pool is silently
+  discarded. That produces interface translation when the egress interface has a
+  suitable same-family address, and a fail-closed `Unavailable`
+  (`InterfaceNoEgressAddress`) when it does not — the #5688 belt, which refuses
+  to forward untranslated rather than leaking the private source. "A contradiction resolves to the exemption" is therefore true ONLY
+  of the `off`-bearing case; stating it unqualified is the same
+  untested-safety-claim defect this section documents. Both halves of this one
+  are pinned, and they need separate fixtures: the translating half by
+  `interface_wins_over_pool_without_off_5717`, the fail-closed half by
+  `interface_with_pool_no_egress_fails_closed_5717`. The generic no-egress
+  tests (`interface_source_nat_no_v{4,6}_egress_addr_fails_closed`) do not
+  cover the second half — they use interface mode with NO pool, so a fallback
+  from the belt into pool translation leaves them green. On the Go side
+  `TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717` pins that
+  the builder publishes BOTH actions (and the tolerant-path warning), since a
+  Rust test building its snapshot directly cannot see a Go edit that drops the
+  pool. Note a claim quantified over
+  "2+ actions" cannot be discharged by pairwise fixtures alone — the three-action
+  `interface` + `off` + `pool` shape needs its own fixture, because two pairwise
+  tests both survive a predicate that mishandles only the three-action case. It
+  needs one on EACH SIDE of the language boundary, which is the correction #6820's
+  re-gate made: `off_wins_over_all_three_actions_5717` pins the Rust resolution
+  but HAND-BUILDS its `SourceNATRuleSnapshot`, so it never crosses Go
+  publication, and the three Go sub-tests were all pairwise. That gap was
+  measured, not inferred — publishing `Off: rule.Then.Off &&
+  !(rule.Then.Interface && rule.Then.PoolName != "")` (correct on every pair,
+  wrong only on the triple) kept the whole Go suite green while the operator's
+  authored `off` published as `Off=false` and Rust translated on the
+  `interface_mode` branch. The Go half is now pinned by the
+  `hierarchical single-node interface+off+pool` sub-test of
+  `TestTolerantContradictorySNATCarriesOff_5717`, which drives the triple through
+  a real tolerant compile.
+
+- **Zero actions is NOT inert.** It installs no translation, but the matched
+  traffic FALLS THROUGH — and what it falls through TO depends on what follows
+  it. If a later, broader rule matches, that rule translates it: the fail-open
+  the gate's own zero-action rejection text describes. If NOTHING later matches,
+  the matcher's loop simply ends and the packet leaves **untranslated**. Only
+  the first is a fail-open: the packet is translated against the operator's
+  intent. In the second the packet's disposition COINCIDES with the intended
+  exemption, so nothing is observably wrong today — calling that a fail-open
+  too conflates a live wrong disposition with a latent one. What is wrong there
+  is the RULE, not the packet: it is non-terminal, so adding any later broader
+  rule silently turns the same config into the first case. That is why the gate
+  rejects it either way. An earlier revision of this bullet asserted only the
+  first outcome ("and is translated by that"), which presumes a later rule
+  exists (#6820 re-gate). Source NAT reaches the fall-through by emitting
+  the actionless rule and letting the Rust matcher's `else` arm `continue`;
+  destination NAT reaches it by skipping the rule in the builder. Making an
+  actionless rule terminal would newly exempt traffic that already-deployed
+  configs translate, so that is a migration-contract decision tracked on #5717
+  rather than a mechanical fix.
+  `TestTolerantActionlessRuleIsNotInert_5717`,
+  `actionless_rule_falls_through_to_later_broader_rule_5717` and
+  `actionless_rule_with_no_later_rule_passes_untranslated_5717` pin BOTH
+  dispositions, so neither the "inert" framing nor the "always translated by a
+  later rule" framing can silently return.
+
+  The no-later-rule test asserts on `SourceNatLookup`, via
+  `match_source_nat_result_for_tuple`, and NOT on the `Option`-returning
+  `match_source_nat` wrapper (#6820 re-gate). The wrapper folds
+  `NoMatch | Unavailable(_) => None`, so a `None` assertion cannot tell
+  "forwarded untranslated" from "dropped" — precisely the distinction the test
+  name makes. Production splits them oppositely: `NoMatch` becomes
+  `Ok(NatDecision::default())` and the packet is forwarded, while `Unavailable`
+  becomes `Err` and `poll_descriptor` records a source-NAT failure and recycles
+  the descriptor — the packet is DROPPED. The wrapper is also reachable in a
+  non-test build only through `match_source_nat_for_flow`, which carries
+  `#[cfg_attr(not(test), allow(dead_code))]`; `match_source_nat_result_for_tuple`
+  is the live entry point.
 
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`
@@ -5427,10 +5700,48 @@ reserved for whole-dataplane selection where a rewrite shim
     `validateSourceNATPoolAddressGrammarStrict`
     (`compiler_validate_strict_nat.go`) closes the divergence by rejecting the
     exact shapes the dataplane rejects: each member must be a bare IP
-    (`netip.ParseAddr`) or a CIDR (`netip.ParsePrefix`, non-canonical allowed,
-    like the Rust `IpNet`) whose host count does not exceed the cap, and a
-    referenced pool must be non-empty. A `/16` (exactly 65536 hosts, at the cap)
-    is accepted, matching the Rust `count > MAX_POOL_PREFIX_HOSTS` comparison.
+    (`netip.ParseAddr`, with no IPv6 `%zone`) or a CIDR (`netip.ParsePrefix`;
+    host bits may be set, the runtime masks to the network base — documented since
+    #5627 but UNOBSERVED until #6812 B2, and now pinned by the fixture's
+    `first`/`last`/`expanded` fields on all three host-bits-set rows) whose host
+    count does not exceed the cap, and a referenced pool must be non-empty. A
+    `/16` (exactly 65536 hosts, at the cap) is accepted, matching the Rust
+    `count > MAX_POOL_PREFIX_HOSTS` comparison.
+    **Grammar parity is a tested claim, not an asserted one (#6812 F1 round
+    3).** "Mirrors the dataplane" is a claim about two PARSERS agreeing, and a
+    measured differential over both real parsers found six inputs where they did
+    not. The runtime's CIDR branch parsed via `ipnet::IpNet`, whose hand-rolled
+    octet reader accepts a leading-zero octet that `std` and `netip` both
+    reject, so `010.0.0.0/24` built a working 256-address allocator while this
+    gate rejected it at strict commit — a commit-vs-apply divergence (an earlier
+    revision of this paragraph called it "an over-rejection on the tolerant
+    path", which inverts the direction: at master the tolerant path stamped
+    nothing for this class, see the disposition note below); and
+    `netip.ParseAddr` accepted a bare `fe80::1%eth0`
+    that `std::net::IpAddr` cannot represent. Both are closed — the runtime now
+    parses its CIDR address half with the same `std::net::IpAddr` its bare
+    branch always used, and the Go predicate rejects a zone on a bare member —
+    and the agreement is pinned by a SHARED fixture,
+    `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json`, read by
+    `TestPoolAddressGrammarMatchesDataplane_6812` (Go) and
+    `nat_pool_grammar_parity_fixture` (Rust, through the real
+    `expand_pool_address`). Neither side keeps a copy of the table.
+    **The disposition of a leading-zero member DID move, and the move is
+    deliberate (#6812 F1 round 4).** On the TOLERANT path a pool carrying
+    `010.0.0.0/24` went from translating (the merge base shipped it unpoisoned
+    and `ipnet` read it as `10.0.0.0/24`) to poisoned and dropping. The poison
+    is not the runtime narrowing's: `SourceNATPoolUnusableReason` does not exist
+    at the merge base, and its membership-grammar clause is what stamps
+    `invalid_pool`. It is kept on the #5875 precedent — a non-representable
+    literal is REJECTED, never silently rewritten, and `010` is the weaker case
+    of the two since it has two readings where `%zone` has one. Normalizing
+    would install a pool on a guess `show configuration` could not reveal. What
+    the operator gets instead is a diagnostic that names the one-character fix
+    ("spells an octet with a leading zero (`010.0.0.0/24`); write it as
+    `10.0.0.0/24` … this pool translates nothing until the address is
+    corrected"), on both tolerant entries — it rides `cfg.Warnings`, which the
+    daemon logs at apply. Upgrade and peer-sync regression tests live in
+    `pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go`.
     The gate iterates ONLY pools a pool-mode rule references — the exact set the
     dataplane snapshot expands, so an unreferenced pool (never seen by the Rust
     grammar) is out of scope and the gate stays grammar-EQUIVALENT with live
@@ -5448,7 +5759,13 @@ reserved for whole-dataplane selection where a rewrite shim
     the Junos lexer admits `%` (`lexer.go` `isIdentChar`) and Go's
     `netip.ParseAddr` honors a zone, so the scoped literal passed the #5627
     grammar gate (a bare IP with a zone parses fine) and the snapshot builder
-    copied the raw string onto the wire. But the Rust allocator parses each pool
+    copied the raw string onto the wire. (Since #6812 F1 round 3 the #5627
+    grammar gate rejects a zone on a bare member too — it was one of the six
+    measured Go/Rust parser divergences. This gate still runs FIRST in both
+    `runUniformGates` and the #5876 peer-effective SNAT set, and
+    `SourceNATPoolUnusableReason` still writes `zone_scoped_pool_address` after
+    the membership-grammar clause, so the operator message and the wire reason
+    are unchanged.) But the Rust allocator parses each pool
     member as `std::net::IpAddr` (`expand_pool_address`,
     `userspace-dp/src/nat/source.rs`), which has **no scope model**, so the
     scoped form fails to parse, the whole pool is marked `InvalidPool`, and the
@@ -5481,13 +5798,13 @@ reserved for whole-dataplane selection where a rewrite shim
     `MaxSourceNATPoolPrefixHosts = 65536`, a pool's port range to 1..65535), but
     nothing bounded the AGGREGATE across a whole config: pool COUNT, the SUM of
     every pool's address cardinality, or total port capacity. Snapshot/apply
-    builds a `PortAllocator` for each pool-mode source-NAT rule BEFORE reuse
-    dedup is known (`userspace-dp/src/nat/{source,allocator}.rs`) — every pool
-    address gets a per-address occupancy bitmap sized to the port range (one bit
-    per port) plus a per-address counter — so a large-but-syntactically-valid
-    config forces substantial memory + CPU during a security-critical
-    commit-apply (stalling commits, watchdogs, HA convergence, or the Rust
-    dataplane), and repeated applies magnify it.
+    builds a `PortAllocator` for each pool-mode source-NAT rule
+    (`userspace-dp/src/nat/{source,allocator}.rs`) — every pool address gets a
+    per-address occupancy bitmap sized to the port range (one bit per port)
+    plus a per-address counter — so a large-but-syntactically-valid config
+    forces substantial memory + CPU during a security-critical commit-apply
+    (stalling commits, watchdogs, HA convergence, or the Rust dataplane), and
+    repeated applies magnify it.
     `validateSourceNATAggregateCardinalityStrict` (`compiler_validate_strict_nat.go`)
     rejects an over-budget config at strict commit, fail-closed, before apply
     constructs any allocator. Three explicit budgets (`compiler_validate_strict_nat.go`):
@@ -5511,15 +5828,156 @@ reserved for whole-dataplane selection where a rewrite shim
     Runs AFTER the per-pool value/grammar gates so a single structurally broken
     pool still wins the first-error slot. It reuses the `lenientDestNATAddresses`
     downgrade (warn on load / peer-sync, #1960 no-brick: a config persisted
-    before this gate existed still boots — apply builds the state it always did
-    and the operator is warned to shrink it). Registered in the SNAT strict set,
-    so the #5876 peer-effective SNAT gate bounds the standby's identical
-    allocator build too. Fail-on-revert:
+    before this gate existed still boots, and the operator is warned to shrink
+    it). Registered in the SNAT strict set, so the #5876 peer-effective SNAT
+    gate bounds the standby's identical allocator build too.
+    **#6812 (opus-review-001 R73) — the tolerant path no longer builds the
+    over-budget state.** Before #6812, a tolerated (warning-only) over-budget
+    config still reached the Rust apply boundary, which built every pool's
+    occupancy bitmap EAGERLY — before the reuse maps were consulted, even for
+    an already-failed pool, and with no aggregate cap at the final allocation
+    boundary (three full-range /16 pools = 12,683,575,296 bitmap bits ≈
+    1.48 GiB, enough to stall or OOM the dataplane on upgrade boot / HA
+    convergence). Three coordinated changes close that: (1) the userspace
+    snapshot builder poisons exactly the pools that do not fit the budget
+    (`SourceNATAggregateOverBudgetPools` — the same referenced-pool walk and
+    saturating charge arithmetic as the strict validator, first-fit so a
+    refused pool does not starve later smaller pools), marking their rules
+    `PoolUnusable` with reason `aggregate_over_budget`; (2) the Rust apply
+    boundary (`resolve_pool_allocators` in `userspace-dp/src/nat/source.rs`)
+    independently enforces the same budgets per distinct allocator key —
+    reuse-before-build (a same-config re-apply no longer builds and discards
+    a full bitmap per pool), nothing built for a failed pool, reused keys
+    consume budget but are always accepted (a no-op re-apply never kills
+    live state, and a two-step apply cannot creep past the cap one
+    generation at a time), and a new key that does not fit fails its rules
+    closed with the `source_nat_pool_over_budget` dataplane diagnostic
+    instead of materialising the bitmap. **Reused keys are RESERVED in a
+    first phase, before any new key is admitted (#6812 F2 round 4)** —
+    charging reuse where the walk MET it made the backstop order-dependent:
+    with two pools live at 160 of a 200-slot test budget and a new pool worth
+    80, the order `A,B,C` refused the newcomer while `C,A,B` admitted it and
+    built its bitmap, landing 240 slots against the cap, repeating one pool
+    per apply. Go-side poisoning masks that for snapshots this control plane
+    generates, which is exactly why it mattered: this boundary is the
+    INDEPENDENT backstop for tolerated, older-control-plane and handcrafted
+    snapshots; (3) the `aggregate_over_budget`
+    wire reason maps to the new `OverBudget` failure variant (an older
+    helper's catch-all maps it to `InvalidPool` — still fail-closed, so the
+    marker is wire-skew safe).
+
+    **#6812 F1 — which pools the budget CHARGES is the runtime's own
+    verdict, not a derived quantity.** A pool the dataplane refuses builds no
+    allocator, so charging it Go-side refuses a HEALTHY pool the dataplane
+    would install — fail-closed over-rejection on the tolerant / peer-sync
+    recovery path (#1960 no-brick). The budget walk therefore excludes any
+    pool `config.SourceNATPoolUnusableReason` calls unusable, and the snapshot
+    builder poisons exactly that same set, so the two cannot drift.
+
+    That predicate is ALL-OR-NOTHING over pool membership because the
+    dataplane is: `expand_pool_address` failing on ONE member sets
+    `invalid_pool_address` and fails the WHOLE pool as `InvalidPool`
+    (`userspace-dp/src/nat/source.rs`). A pool of
+    `[198.51.100.1, not-an-ip]`, or one carrying an over-capacity `10.0.0.0/15`
+    (131,072 hosts against the 65,536 `MaxSourceNATPoolPrefixHosts` cap),
+    installs nothing at runtime and is now excluded from the budget for that
+    reason, carrying the wire reason `invalid_pool` — which
+    `source_nat_failure_reason_from_snapshot` decodes to the same
+    `InvalidPool` the parse loop reached on its own, so the dataplane
+    disposition is unchanged and only the DECIDER moves. An earlier revision
+    approximated this by summing per-member host counts and skipping a
+    zero total, which agreed with the runtime only when EVERY member failed;
+    the mixed and over-capacity shapes above escaped it (the second one
+    precisely because it expands to a LARGE number, charging 98.4% of the
+    port-capacity budget for an allocator that never exists).
+
+    **#6812 F2/F3 round 3 — the walk consults the resolved port range, and
+    admits pools in the order the DATAPLANE charges them.** Two consumers were
+    re-deriving what a shared function already answers. (F2) The charge
+    recomputed the port window from the raw `PortLow`/`PortHigh` fields instead
+    of consulting `SourceNATPoolPortRange`, the resolver the snapshot builder
+    ships — behaviour-identical on the live path, because `compileNATSource`
+    defaults an unset range to 1024-65535 before storing the pool, but a
+    correctness that rested on a defaulting three files away with nothing
+    binding the two together. (F3) The walk ordered rule-sets by NAME, which is
+    neither the emitted order nor any Junos semantic. The snapshot builder
+    STABLE-sorts its emitted rules by #4161 scope tier and
+    `resolve_pool_allocators` charges that emitted slice in order, so with two
+    pools that each fit alone but not together, an alphabetically earlier
+    ZONE-scoped rule-set took the budget and the more-specific INTERFACE-scoped
+    rule-set's pool was poisoned. The walk now stable-sorts by the same tier
+    through ONE shared definition (`config.SourceNATScopeTier`, which the
+    builder also calls), so the pool Go admits is the pool the dataplane charges
+    first. The sibling grammar/scope gates still sort by name — they pick a
+    deterministic first-reported OFFENDER, where admission plays no part.
+
+    Fail-on-revert:
     `TestSourceNATAggregatePoolCountRejected` /
     `TestSourceNATAggregateAddressesRejected` /
     `TestSourceNATAggregatePortCapacityRejected` /
     `TestSourceNATAggregateLenientWarns`
-    (`pkg/config/compiler_nat_source_pool_aggregate_5877_test.go`).
+    (`pkg/config/compiler_nat_source_pool_aggregate_5877_test.go`),
+    `TestAggregateOverBudgetPools{PortCapacity,Addresses,Count,FirstFit,Unreferenced}_6812` /
+    `TestAggregateValidatorMatchesPoisonWalk_6812`
+    (`pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`),
+    `TestAggregateBudgetExcludesUnusablePools_6812` /
+    `TestBudgetChargeImpliesHonorableMembers_6812`
+    (same file),
+    `TestSourceNATSnapshotAggregate{OverBudgetPoisoned,AtBudgetUnaffected}_6812` /
+    `TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812` /
+    `TestSourceNATSnapshotMixedMemberPoolsDoNotPoisonHealthy_6812` /
+    `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812` /
+    `TestSnapshotPoisonFollowsEmittedScopeOrder_6812`
+    (`pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`),
+    `TestAggregateChargeConsultsResolvedPortRange_6812` /
+    `TestCompiledPoolCarriesDefaultedPortRange_6812` /
+    `TestAggregateFirstFitFollowsEmittedScopeOrder_6812` (F2/F3, in the
+    `pkg/config` aggregate file), the grammar-parity pair
+    `TestPoolAddressGrammarMatchesDataplane_6812` /
+    `TestPoolAddressHostCountMatchesDataplane_6812`
+    (`pkg/config/nat_pool_grammar_parity_6812_test.go`), and
+    `nat::tests_aggregate_budget` (`userspace-dp/src/nat/tests_aggregate_budget.rs`),
+    including `go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812`
+    for the disposition-equivalence claim and
+    `nat_pool_grammar_parity_fixture` /
+    `nat_pool_bare_and_host_cidr_grammars_agree` for the F1 round-3 parser
+    parity, plus (round 4)
+    `reused_keys_reserve_budget_before_a_new_key_is_admitted_6812` /
+    `incremental_applies_cannot_creep_past_the_cap_6812` for the reservation,
+    `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` /
+    `TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` for the
+    same-tier tie-break on the WALK side and
+    `TestBuilderEmittedOrderIsStableWithinATier_6812` for the BUILDER side —
+    F3 is an EQUALITY between two sequences and each half needs its own
+    binding; the builder half is the one with a dataplane consequence, since
+    the Rust matcher is first-match on the emitted slice and a split rule-set
+    misroutes (both use MIXED-tier fixtures of 20 rule-sets: Go's
+    `sort.Slice` preserves order for an all-equal key, so a single-keyed
+    same-tier fixture cannot distinguish a stable sort from an unstable one —
+    measured, and it is why the second of these was re-cut), and
+    `TestLeadingZeroPoolMember{Upgrade,PeerSync}IsDiagnosable_6812` for the
+    tolerant-path diagnostic. The reuse and failed-pool guards assert a
+    PortAllocator CONSTRUCTION count (a thread-local `#[cfg(test)]` counter),
+    not just the final allocator's identity or word count — an end-state
+    assertion cannot see a bitmap that was built and discarded, which is the
+    exact behaviour those two rules exist to forbid. The shared grammar fixture
+    also pins WHICH addresses a member expands to (`first` / `last` /
+    `expanded`, asserted Rust-side): a missing network-base mask changes the
+    address set while leaving the host COUNT identical, so deleting both masks
+    left the crate green until those fields existed (#6812 B2). The stake is
+    CROSS-LANGUAGE, not merely wrong addresses: `pkg/nat/deterministic.go`
+    expands the same pool from `net.ParseCIDR`'s already-masked `ipnet.IP`, and
+    `lookupForwardInPool` INDEXES that slice to answer the operator-facing
+    "which external address does this subscriber get?" query — so a drifted Rust
+    base makes the CLI/gRPC/REST deterministic mapping name a different address
+    than the dataplane translates to, the #5794 invariant-8 forensic failure.
+    `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` (pkg/nat)
+    reads the SAME fixture, so all three consumers are pinned to one table —
+    on BOTH halves since #6812 F-C. The accept half pins the expansion identity;
+    the reject half caught `net.ParseCIDR` accepting a leading-zero mask
+    (`10.0.0.0/016` as `/16`) that every other layer refuses, which had the
+    deterministic surface reporting a 65,536-address mapping for a pool that
+    translates nothing.
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix
@@ -9447,10 +9905,25 @@ blocking the whole config. This is accept-with-advisory now:
 - **advisory** — `loginClassAdvisoryWarnings` emits one `cfg.Warnings` entry
   per custom class naming the mapped permissions. `allow-commands` /
   `allow-configuration` / `idle-timeout` are named as accepted-but-not-enforced
-  (neutral). `deny-commands` / `deny-configuration` get an explicit `WARNING`
-  that, because they are unenforced blacklists, the class is **more permissive
-  than the Junos config** (the denied verbs stay allowed) — a weaker posture,
-  not merely "unenforced". Full per-command deny enforcement is a follow-up.
+  (neutral) — ignoring an ADDITIVE grant can only under-grant, so it is
+  fail-closed. The advisory says nothing about `deny-commands` /
+  `deny-configuration`; the pre-#5831 "MORE PERMISSIVE" advisory for those two
+  is **gone**, not reworded.
+- **restrictive-regex gate (#5831)** — `deny-commands` / `deny-configuration`
+  are RESTRICTIVE, so ignoring them over-grants. `validateLoginClassDenyStrict`
+  hard-**rejects** them at commit / commit-check (keyed on leaf PRESENCE, so
+  `deny-commands ""` and a valueless `deny-commands` are caught too — an empty
+  POSIX regex denies *everything*). On the tolerant load / peer-sync path
+  (#1960 no-brick) `foldLoginClassDenyToRepairableFloor` **folds** the class to
+  `{view, configure} ∩ what it already held` and warns. That is a blast-radius
+  reduction, **not** enforcement: `clear` / `control` / `maintenance` / `all`
+  are dropped, but the two RETAINED buckets are levels at which the statement
+  does nothing — `deny-configuration` targets `configure`, and a
+  `deny-commands` naming `show` / `ping` / `traceroute` / `monitor` targets
+  `view`. Both are retained because they are what an operator needs to delete
+  the statement. The warning is generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim can never be wider than the
+  behaviour. Full per-command deny enforcement is a follow-up on #5831.
 - **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
   built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
   custom-class user is enforced against the mapped permissions instead of

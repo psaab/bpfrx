@@ -31,6 +31,58 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 // the multi-zone SHAPE rather than the action so it covers both directions.
 var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-global zone-set snapshot protocol incompatible")
 
+// ErrEgressZoneProtocolIncompatible is the #6722 required-protocol gate
+// sentinel: the RUNNING helper advertises a ConfigSnapshotProtocolVersion that
+// is not this binary's, so the two do not agree on what the interface rows mean.
+//
+// Unlike its siblings this gate is not keyed on a config SHAPE, because the
+// change it fences is not optional for any config: every InterfaceSnapshot now
+// carries the Go-decided EgressZone, and the v4 `reth_projection` field it
+// replaced is gone. A field DELETION cannot ride an unchanged version — two
+// binaries either side of it both advertise their number and read the same
+// bytes differently.
+//
+// It is keyed on EQUALITY, not `>=`. The helper's own apply_snapshot and
+// bump_fib_generation gates are exact-equality, so a helper at ANY other
+// version refuses the snapshot outright; a `>=` gate would additionally stay
+// green at exactly the colliding value, which is the shape this gate exists to
+// catch.
+//
+// MEASURED, so the severity is not a guess: feeding the v4 Go builder's rows to
+// the v5 helper on the reference cluster resolves egress zone 0 for BOTH
+// ifindex 24 and ifindex 25, where origin/master and the matched v5 pair
+// resolve `lan` and `wan`. Ifindex 25 loses a zone even the pre-#6722 helper
+// resolved, so a mixed pairing is strictly worse than either endpoint rather
+// than an intermediate state — a silent transit outage under `default-policy
+// deny-all`, carrying a version number both sides agree on.
+var ErrEgressZoneProtocolIncompatible = errors.New("userspace egress-zone snapshot protocol incompatible")
+
+// ErrSecureTunnelProtocolIncompatible is the #5619/#6691 gate. The snapshot
+// carries InterfaceSnapshot.SecureTunnel, and the helper's binding admission
+// (include_userspace_binding_interface) is AUTHORITATIVE on it: a route-based
+// IPsec xfrmi must not become an AF_XDP binding candidate.
+//
+// #6691 round 8: the flag is set by CONFIG ownership or by the KERNEL link
+// kind, so this gate fires for a stale live xfrmi too — the case the operator
+// cannot fix by editing the config. Round 9: the gate reads the flag off the
+// SNAPSHOT instead of re-deriving it, so it cannot disagree with what was built.
+// Round 11: it reads every CONTRIBUTOR's verdict off that snapshot
+// (snapshotRequiresRefusalProtocol), because round 10's fabric-parent verdict is
+// carried by no row and a row scan could not see it.
+//
+// A helper that predates the field ignores it and plans the candidate. That is
+// not a lost optimisation — the helper's queue count is the GLOBAL MINIMUM
+// across candidates (replan_bindings_from_candidates) and an xfrm interface has
+// exactly ONE RX queue (numrxqueues 1; a single `rx-0` under
+// /sys/class/net/<if>/queues, which is what userspaceRXQueueCount reads and
+// ships). So an ignored flag re-plans EVERY physical interface on the box onto
+// one queue and one worker: the #3091 single-worker regression, on a config
+// this control plane has already decided is safe. Neither the version-equality
+// check (same advertised version on both sides before the #5619 bumps) nor the
+// snapshot content hash can see it, because nothing about the bytes is wrong —
+// only the reader is.
+var ErrSecureTunnelProtocolIncompatible = errors.New("userspace secure-tunnel snapshot protocol incompatible")
+
 // requiredProtocolGateSentinels enumerates every "this config cannot be
 // committed against the helper's current ConfigSnapshotProtocolVersion"
 // sentinel produced by ensureRequiredSnapshotProtocolLocked. ApplyConfig
@@ -66,6 +118,8 @@ var requiredProtocolGateSentinels = []error{
 	ErrPolicySchedulerProtocolIncompatible,
 	ErrPersistentSourceNATProtocolIncompatible,
 	ErrScopedGlobalZoneSetProtocolIncompatible,
+	ErrEgressZoneProtocolIncompatible,
+	ErrSecureTunnelProtocolIncompatible,
 }
 
 // IsRequiredProtocolGateError reports whether err is (or wraps) any
@@ -270,7 +324,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// userspace-dp has entries it doesn't if apply_snapshot fails.
 	// Moved to the post-success path below (after line 343).
 	if pendingXSKStartup {
-		if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(snap); err != nil {
 			if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 				return result, errors.Join(err, disarmErr)
 			}
@@ -324,7 +378,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.ensureProcessLocked(ucfg); err != nil {
 		return result, err
 	}
-	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(snap); err != nil {
 		return result, m.disarmSnapshotProtocolFailClosedLocked(snap, err, samePlanRefresh)
 	}
 	if m.deferWorkers {
@@ -561,7 +615,7 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		return nil
 	}
 
-	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 			slog.Warn("userspace: failed to disarm helper after refusing snapshot publish",
 				"protocol_err", err, "err", disarmErr)
@@ -763,6 +817,105 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 	)
 }
 
+// ensureSecureTunnelProtocolLocked is the fail-closed half of the #5619/#6691
+// protocol bumps — v5 (the SecureTunnel field), v6 (the every-owner refusal
+// rule) and v7 (the fabric parent's verdict), which is why it compares against
+// ProtocolVersion rather than a pinned number: each of the three changes what
+// an older helper does with the same snapshot, and the gate's job is the same
+// for all of them. The bump makes an older helper REFUSE the snapshot outright,
+// which stops it from planning a binding for the xfrmi — but a refused snapshot
+// leaves that helper ARMED on its previous-good image while the commit reports
+// success. This gate closes that window the way the sibling gates do: the
+// caller disarms the helper and the commit aborts with an operator-visible
+// reason.
+//
+// Scoped by snapshotRequiresRefusalProtocol (ingress_exclusions.go), which asks
+// the CONTRIBUTOR ENUMERATION whether this snapshot carries an unbindable
+// verdict a pre-bump helper cannot reproduce. Three earlier scopes were narrower
+// and each was wrong for the same reason — they named the evidence they knew
+// about instead of asking who produces it:
+//
+//   - "no route-based IPsec" outlived the round-8 widening. With zero VPNs
+//     configured the scope is false with no live xfrmi and TRUE with a stale
+//     live `st10`, which is right: a stale xfrmi is exactly the case an operator
+//     cannot fix by editing the config, so an under-version helper must not stay
+//     armed for it.
+//   - A hand-mirrored re-derivation (round 8) took a SECOND RTM_GETLINK dump, so
+//     an xfrm device visible to the builder's dump and gone by this one left the
+//     gate silent for a snapshot carrying SecureTunnel=true. Two samples of a
+//     changing kernel are two answers; round 9 made it a property of the code by
+//     reading the applied rows, of which there is ONE classification per
+//     snapshot.
+//   - Reading the rows ALONE (round 9) then went silent for round 10's fabric
+//     verdict, which is carried by no row at all — the #6691 round 11 blocker,
+//     and the reason the scope is now derived from the same enumeration the
+//     verdict is rather than from a second list beside it.
+//
+// The honest statement of the scope: an operator whose snapshot contains no
+// verdict the older helper would decide differently is never blocked by a
+// version mismatch that cannot affect them.
+//
+// This does NOT eliminate every re-sample in the package —
+// UserspaceBoundLinuxInterfaces still builds its own snapshot from a bare
+// *config.Config, because that is the only thing its daemon call sites have.
+// What it eliminates is the sample whose disagreement was UNSAFE: a silent gate
+// leaves an under-version helper armed on its previous-good image. The
+// allowlist's remaining sample is conservative in its own direction (see its
+// degrade-to-nil path) and cannot leave a helper armed.
+func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
+	if !snapshotRequiresRefusalProtocol(snap) {
+		return nil
+	}
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+			return nil
+		}
+	}
+	// ARM ON AN OBSERVED VERSION, NEVER ON THE ABSENCE OF ONE (#6691 round 10).
+	//
+	// Reaching here without helperStatusObserved means no helper has ever
+	// answered this Manager: lastStatus is a zero value and the live status
+	// request just failed too. The version compared above was 0 because there
+	// is no helper to have a version, not because a helper reported an old one
+	// — so there is nothing to be incompatible WITH, and arming would disarm a
+	// dataplane and abort the operator's commit on the strength of a reading
+	// that never happened.
+	//
+	// It is reachable, not defensive. The deferred-worker arm
+	// (manager_worker_arm_5134.go) calls this gate through
+	// ensureRequiredSnapshotProtocolLocked BEFORE any helper liveness check, so
+	// a pending-XSK re-arm attempted while the helper is down took the abort
+	// path on a config that had merely acquired a live xfrm device.
+	//
+	// An observed 0 still arms: a helper that answers without the field IS too
+	// old, and helperStatusObserved is what separates that from silence —
+	// the value alone cannot (manager.go).
+	//
+	// SCOPE: this gate only. The three sibling required-protocol gates in this
+	// file share the shape and the question of what each SHOULD do when the
+	// helper has never reported is #7002, which has to weigh each one's own
+	// fail-closed argument. Fixing the one this PR introduces is not a licence
+	// to change three others under the same commit.
+	if !m.helperStatusObserved {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d < required %d for a device-level AF_XDP binding refusal "+
+			"(a route-based IPsec secure tunnel, or a fabric parent netdev refused with no interface stanza to "+
+			"carry the flags; an older helper cannot read the verdict and plans an AF_XDP binding for that "+
+			"netdev, and an xfrm device's single RX queue then becomes the global minimum and collapses every "+
+			"interface to one queue and one worker)",
+		ErrSecureTunnelProtocolIncompatible,
+		m.lastStatus.ConfigSnapshotProtocolVersion,
+		ProtocolVersion,
+	)
+}
+
 func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error {
 	if !configHasScheduledPolicy(cfg) {
 		return nil
@@ -807,14 +960,106 @@ func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) er
 	)
 }
 
-func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error {
+// ensureRequiredSnapshotProtocolLocked takes the SNAPSHOT, not the config
+// (#6691 round 9).
+//
+// Three of the four gates are pure config questions and read snap.Config
+// exactly as before. The fourth — the secure-tunnel gate — is not: the flag it
+// arms on is stamped by the snapshot builder from a sample of the KERNEL, and
+// asking the same question from a config a moment later is asking a different
+// kernel. Measured before this round, with an xfrm device visible to the
+// builder's dump and gone by the gate's: the built snapshot carried
+// SecureTunnel=true on `st10` while the gate returned false, so an under-version helper
+// stayed ARMED on its previous-good image for exactly the snapshot the gate
+// exists to refuse.
+//
+// Passing the snapshot makes "arms iff the snapshot carries a flagged row" true
+// by construction rather than by two samples agreeing. Every call site already
+// had one in scope: the apply paths pass the snapshot they are about to
+// publish, and the poll/status/HA paths pass m.lastSnapshot, which is the
+// snapshot actually being enforced — a strictly better oracle than re-deriving
+// from config on a poll tick.
+func (m *Manager) ensureRequiredSnapshotProtocolLocked(snap *ConfigSnapshot) error {
+	var cfg *config.Config
+	if snap != nil {
+		cfg = snap.Config
+	}
 	if err := m.ensurePolicySchedulerProtocolLocked(cfg); err != nil {
 		return err
 	}
 	if err := m.ensurePersistentSourceNATProtocolLocked(cfg); err != nil {
 		return err
 	}
-	return m.ensureScopedGlobalZoneSetProtocolLocked(cfg)
+	if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); err != nil {
+		return err
+	}
+	// Secure-tunnel gate FIRST, then egress-zone. Both fence the same
+	// ProtocolVersion, so on a version mismatch both would fire; the order
+	// decides which sentinel the caller sees. The secure-tunnel gate is SCOPED
+	// (snapshotRequiresRefusalProtocol — it returns nil unless the snapshot
+	// actually carries a flagged row) while the egress-zone gate is
+	// UNCONDITIONAL, so asking the specific one first reports the narrower,
+	// more actionable reason when it applies and falls through to the general
+	// one otherwise. Fail-closed either way: both sentinels are in
+	// requiredProtocolGateSentinels, so the commit aborts and the helper is
+	// disarmed regardless of which one is returned.
+	if err := m.ensureSecureTunnelProtocolLocked(snap); err != nil {
+		return err
+	}
+	return m.ensureEgressZoneProtocolLocked()
+}
+
+// ensureEgressZoneProtocolLocked refuses to commit against a running helper
+// that does not speak this binary's snapshot contract (#6722).
+//
+// Takes no config: every snapshot carries EgressZone, so unlike the sibling
+// gates there is no shape to test. What it IS conditional on is having actually
+// OBSERVED a helper version. That conditioning is load-bearing for #1960
+// no-brick: `lastStatus` is zero before the first handshake, and a gate that
+// fired on "version unknown" would abort every commit made while the helper is
+// down or still starting — a brick, not a fence. When no version can be learned
+// this returns nil and the pre-existing behaviour stands (the helper's own
+// exact-equality gate refuses the snapshot and the apply surfaces that error).
+//
+// The comparison is EQUALITY. `>=` would pass a helper NEWER than this binary,
+// whose own gate would then refuse our snapshot anyway, and — the reason the
+// shape matters — a `> N` spelling stays green at exactly the version that
+// collides.
+func (m *Manager) ensureEgressZoneProtocolLocked() error {
+	observed := m.lastStatus.ConfigSnapshotProtocolVersion
+	if observed == ProtocolVersion {
+		return nil
+	}
+	// Re-ask before failing: `lastStatus` may predate a helper restart onto a
+	// matching build, and the sibling gates take the same second look.
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		observed = status.ConfigSnapshotProtocolVersion
+		if observed == ProtocolVersion {
+			return nil
+		}
+	}
+	if observed <= 0 {
+		// No helper has told us a version. Not evidence of a mismatch.
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d != required %d. The "+
+			"interface rows changed shape in #6722: the egress security zone is "+
+			"now decided by the control plane and carried in `egress_zone`, and "+
+			"the `reth_projection` field the older contract carried is gone. A "+
+			"helper on the other side of that change resolves NO egress zone for "+
+			"an interface described by several rows — measured, both RETH "+
+			"ifindexes of the reference cluster — so every transit flow out of "+
+			"them falls to the default policy. Restart the userspace dataplane "+
+			"helper onto the build that ships with this xpfd (they are pushed "+
+			"together by `make cluster-deploy` / `make test-deploy`), then commit "+
+			"again",
+		ErrEgressZoneProtocolIncompatible,
+		observed,
+		ProtocolVersion,
+	)
 }
 
 // disarmSnapshotProtocolFailClosedLocked is the shared fail-closed action for a

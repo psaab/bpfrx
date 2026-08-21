@@ -1045,13 +1045,129 @@ under the daemon's errgroup. Nothing else imports this package.
       superseded generation is #6716.
     - **A RETIRED leg never gains a credential** (round 14). `stopLegLocked` only
       closes a channel — the socket keeps accepting until the serve goroutine
-      reaches `Shutdown`, and what it accepted is served for the whole bounded
+      reaches `Shutdown`, and what it accepted is served for the whole
       drain — while `ReconcileHTTP`/`ReconcileHTTPS` return immediately, and the
       reconciler then publishes. Each leg therefore carries its own `authSlot`:
       LIVE legs FOLLOW `s.auth` (the live swap above is unchanged), and a leg is
       PINNED at retirement to what it was already serving, after which
       `ReplaceAuth` only intersects it. Revocations still reach a draining
       listener; grants and nils never do.
+    - **Every leg exit DRAINS its connections** (#6827 round 7, `drainLeg`).
+      `ReplaceAuth` keeps tightening a retired leg's pin only while the leg is on
+      `s.retiring`, and `pruneRetiredLocked` reaps it the moment `drained` is
+      set — so `drained` has to mean **"nothing this leg accepted is still being
+      served"**: no further request admitted AND no response still in flight.
+      It meant neither. The unexpected-serve-exit arm returned WITHOUT any
+      `Shutdown`: `Serve` closes the listener on its way out, but the HTTP/1
+      keep-alive and HTTP/2 connections it had already accepted kept being
+      served, under a slot the recovery reconcile then PINNED and the next
+      `ReplaceAuth` PRUNED before tightening — a revoked credential going on
+      working on a socket the box believed was gone. All three exits (requested
+      retirement, root-context shutdown, unexpected exit) now run a bounded
+      `Shutdown` followed by `Close` on deadline.
+      **Both halves of that, and which call does which (#6827 round 8 — round 7
+      named the wrong mechanism here).** `Shutdown` sets `inShutdown`, so
+      `doKeepAlives()` goes false: idle connections are closed and a connection
+      it is still waiting on finishes its current response and then closes, so
+      **no further request** is possible from `Shutdown` alone — measured. What
+      `Shutdown` does not do is END the response already in flight; it WAITS for
+      it and, at the deadline, returns `ctx.Err()` leaving it open and streaming.
+      This server runs with no `WriteTimeout` by design (SSE, large scrapes), so
+      that response has no bound of its own and outlives the drain indefinitely
+      on a leg already marked `drained`. `Close` is what ends it, which is why it
+      is not optional and not redundant. Bound by
+      `TestInFlightResponseIsSeveredOnEveryLegExit_6827` across all three exits;
+      deleting the `Close`, or reverting the retirement/root arm to a bare
+      `Shutdown`, reds it — before round 8 both edits left the package green.
+      **`Server.serveBound` runs the same drain** (#6827 round 10). It had kept
+      the exact shape `drainLeg` exists to fix — a bare `Shutdown` under a
+      deadline with no `Close` — which made this invariant, stated package-wide,
+      FALSE about it; round 9 edited its doc ("bounded 5s drain" → "5s-deadline
+      drain") without touching the behaviour. It is test-only (`Server.Run` has
+      no production caller; the daemon uses `NewServer` + `Start`), which made
+      fixing it cheap rather than optional: narrowing the invariant instead would
+      have left the shape in the tree for the next reader to copy. Bound by
+      `TestServeBoundSeversInFlightResponses_6827`, which runs BOTH legs with a
+      stream held on each (#6827 round 11). It used to pass `nil` for `httpsLn`,
+      so it never entered the `if s.httpsServer != nil` branch and reverting
+      THAT statement alone to a bare `Shutdown` left `pkg/api` and `pkg/daemon`
+      green — deleting it reds only
+      `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener
+      CLOSES, not that a response is SEVERED. Round 10's own revert mutation
+      flipped both statements together, and the bound HTTP leg redded the cell
+      and masked the unbound HTTPS one: a compound mutation cannot localise. The
+      cell also ASSERTS the returned error now — `drainLeg` grew a return value
+      for exactly that, and with it merely logged, `return err` could become
+      `return nil` with both packages still green.
+      One behavioural consequence,
+      and it is NOT a bigger fixed number: the old code ran a bare `Shutdown` on
+      each server under ONE shared 5s context and never reached a `Close` phase
+      at all, whereas each server now gets its own `legDrainTimeout` AND the
+      severing `Close` behind it. Read that as the package's drain shape, not as
+      "5s for both" becoming "5s each" — `legDrainTimeout` is a POLL deadline
+      with serial per-connection closes in front of it in BOTH phases, each
+      HTTPS `close_notify` carrying a five-second write deadline of its own, so
+      the worst case here grows with the number of stalled connections and has
+      no fixed ceiling, exactly as described below.
+      **On the unexpected-serve-exit arm, `dead` is stored BEFORE the drain, and
+      the ORDER is load-bearing** (#6827 round 10). `serving()` has to flip the
+      instant the socket dies, because for the whole width of the drain — which
+      has no wall-clock ceiling, see below — a same-address `ReconcileHTTPS`
+      takes the `serving()` no-op arm and returns nil, `reconcileTo`'s
+      `next.TLS && !HTTPSServing()` recovery term is false, and
+      `WarnStaleMgmtCertForHostName` diagnoses a certificate no socket is
+      presenting. Moving the store below `drainLeg` left both `pkg/api` and
+      `pkg/daemon` green until round 10: every other dead-leg cell kills a leg
+      with NO connection, whose drain returns in microseconds, so both orders
+      look identical there. `TestServingFlipsDuringTheDrainNotAfterIt_6827` holds
+      a stream open and asserts the flip happens WHILE `drained` is still unset.
+      **`legDrainTimeout` bounds NEITHER the drain nor the `Shutdown` in
+      wall-clock terms** — round 8 said "the Shutdown" and that was the second
+      wrong version of the sentence (#6827 round 9). It is a POLL deadline
+      consulted between quiescence checks, and serial per-connection closes sit
+      in front of it in BOTH phases: `Shutdown`'s loop calls `closeIdleConns()`
+      and only reaches its `ctx.Done()` select if that returns false, and
+      `closeIdleConns` walks `activeConn` under `s.mu` closing one at a time; then
+      `Close`, which takes no context at all, does the same again. On an HTTPS leg
+      each close is a `*tls.Conn` sending `close_notify` under its own five-second
+      write deadline (`crypto/tls`), so a stalled peer costs up to five seconds
+      EACH, in series, in either phase. The worst case grows with the number of
+      such connections and has no fixed ceiling, and the
+      knock-on is worth knowing: `Server.Wait` holds `lifeMu` across the drain
+      and `WarnStaleMgmtCertForHostName` holds `staleCertMu` while waiting for
+      `lifeMu`, so a `set system host-name` racing daemon shutdown waits for it.
+      Bounding the sever phase for real needs per-connection tracking with
+      concurrent deadlined closes — a larger change than #6827, deliberately not
+      taken here, and the claim is narrowed to what is true instead of asserting
+      a bound that is not.
+      **Hijacked connections are OUT OF SCOPE, and the exclusion is only partly
+      enforced.** Go
+      excludes them from both calls (`Shutdown` "does not attempt to close nor
+      wait for hijacked connections", `Close` "does not even know about" them),
+      and a hijacked conn leaves `activeConn`, so it can outlive the drain with
+      `drained` stored. Nothing in `drainLeg` can reach it — the handle is gone.
+      This package has no hijacker, and `TestNoHijackerInThisPackage_6827` is a
+      **tripwire, not a gate** — round 8 claimed enforcement and that was too
+      strong (#6827 round 9). It catches three forms: a local `http.Hijacker`
+      assertion, a local `Hijack` call, and an import of a package known to
+      hijack internally. The third exists because a purely local AST walk is
+      defeated by a dependency this module ALREADY has:
+      `golang.org/x/net/websocket`'s `Server` hijacks inside its own handler, so
+      `mux.Handle("/ws", websocket.Handler(h))` would add the case with nothing
+      in this package's syntax to match. That import list is DERIVED, not
+      asserted (#6827 round 10): round 9 called it "the ones reachable from this
+      module today" and it was missing `golang.org/x/net/http2/h2c`, which lives
+      in the SAME direct dependency and hijacks in `NewHandler` — mounting a real
+      `h2c.NewHandler` in a production file left the test PASSING. The map now
+      records the grep that produced it and the dependency version it was run
+      against (`golang.org/x/net v0.48.0`, which yields exactly `websocket` and
+      `http2/h2c`), so the next reader can re-run it and a version bump makes it
+      visibly stale — where an assertion of completeness just stops them looking,
+      which is what happened twice. Reverse proxies, upgrade helpers,
+      aliases and reflection escape even the import check. Read a pass as "none
+      of the three known forms is present". It is an AST scan rather than a text
+      scan so that this documentation, and `drainLeg`'s, do not trip it — a guard
+      has to be able to coexist with its own description.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
@@ -1119,26 +1235,198 @@ under the daemon's errgroup. Nothing else imports this package.
       wildcard (`:8443` → empty) / non-encodable bind host is skipped, and a
       value already present is coalesced. Like the hostname path this only ever
       ADDS an encodable SAN, so it never aborts generation.
-    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual):** a
-      later `set system host-name` (or a bind-address change) does NOT re-mint
-      an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
-      deferred (it needs a mint-ordering / invalidation hook and a decision on
-      churning the durable TOFU pin). What WAS a silent failure is now
-      diagnosed: on the load-success path `generateSelfSignedCertAt` parses the
-      loaded leaf and, when the current bind host is a concrete non-loopback
-      management host (`bindHostWarnable`) that the leaf's SANs do NOT cover
-      (`certCoversHost` — the same strict check a remote client applies), emits
-      a `slog.Warn` naming the bind host and the cert's SANs, so an operator
-      re-mints (remove `/etc/xpf/tls`) instead of chasing a silent
-      verification failure.
+    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual,
+      #6827):** a later `set system host-name` (or a bind-address change) does
+      NOT re-mint an already-persisted cert, so its DNS/IP SANs can go stale.
+      Re-minting is deferred (it needs a mint-ordering / invalidation hook and a
+      decision on churning the durable TOFU pin). What WAS a silent failure is
+      diagnosed from **two** entry points, because one alone cannot reach every
+      way a cert goes stale:
+      - `generateSelfSignedCertAt` calls `warnStaleLoadedCert` on the
+        load-success path — boot, and any HTTPS enable/rebind;
+      - `Server.WarnStaleMgmtCertForHostName` is reached from
+        `Daemon.applyHostname` after a successful `set system host-name` — not
+        synchronously: the rename records a DEBT and the daemon's delivery path
+        makes the call, at the rename when a certificate is already served and
+        otherwise at the first later retry point that finds one. The load path
+        could never see a rename: the HTTPS leg is rebuilt only when the TLS
+        flag or the HTTPS bind address changes
+        (`managementReconciler.reconcileTo`), so a rename on an unchanged
+        endpoint reloads nothing. And `reconcileWebManagement` runs EARLY in
+        `applyConfigLocked` while the kernel name is set in the apply tail, so
+        even a commit that DID move the HTTPS bind would have diagnosed the OLD
+        name — which is why this entry point takes the host name as a
+        PARAMETER instead of re-reading `os.Hostname()` itself: the read moves
+        to the daemon, which performs it after `Sethostname` has returned and
+        abandons the delivery if a newer rename has since been recorded.
+        At BOOT this hook runs before its own dependency exists: the first
+        config apply is startup phase 4 while `startHTTPServer` builds `d.mgmt`
+        later in `Run`. So a rename records a DEBT (`Daemon.staleCertPending`)
+        and `deliverStaleMgmtCertDiagnosis` retries it — at the boot management
+        start, and on every web-management reconcile. Skipping on nil would
+        reproduce the original silence: the load path is not a fallback that
+        covers it, because it runs only while a certificate is being loaded,
+        which on an unchanged endpoint next happens at a restart or an HTTPS
+        rebind (and for a CROSS-shape rename it declines even then — see the
+        narrowing rule below).
+        Two properties matter:
+        - **The debt clears only when a delivery actually reaches a served
+          certificate** (`WarnStaleMgmtCertForHostName` returns that). Clearing
+          it whenever the delivery merely RAN loses the diagnosis permanently
+          when the HTTP start failed or HTTPS is off: the next boot's
+          `applyHostname` sees the name already applied and returns early, and
+          the load path declines cross-shape drift by design. The certificate is
+          durable on disk, so the staleness outlives the listener and the debt
+          must outlive it too.
+        - **The host name is read from the kernel at DELIVERY, never stored at
+          rename time.** A deferred diagnosis is therefore never the replay of a
+          name captured at some earlier commit — and marking the debt and
+          attempting delivery are a single path, so a rename racing `d.mgmt`'s
+          publication cannot be silently dropped. The delivery is also
+          GENERATION-FENCED before it speaks: one whose rename has been
+          superseded abandons without warning and without clearing, so it cannot
+          emit a name a recorded rename has already replaced. The emitted name IS
+          the kernel's current one for every rename the daemon performs (#6827
+          round 7): `Daemon.renameHostNotingStaleMgmtCert` holds `staleCertMu`
+          across BOTH the `Sethostname` and the generation bump, so the two
+          critical sections are ordered and neither order can produce a stale
+          line. Rounds 5 and 6 recorded that gap as unclosable; it was closable
+          by moving the lock acquisition ahead of the syscall. A privileged
+          `sethostname(2)` from outside the daemon remains unfenceable.
+      The RENAME entry point reads the LIVE HTTPS leg via
+      `listenerLeg.serving()` — not a non-nil pointer. (The load path has no leg
+      to read: it runs inside cert generation, before any leg exists, and judges
+      the pair it just loaded.) An unexpected serve exit leaves the leg
+      INSTALLED with `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed
+      with `stopping` set; diagnosing either reports a certificate no socket is
+      presenting. `serving()` therefore tests BOTH: `dead` for a
+      self-termination, and `stopping` — stored explicitly at the top of both
+      drain arms (requested retirement AND root-context shutdown), before
+      the drain, so it covers the leg from the moment the drain is decided
+      through the goroutine's return (the listener closes an instant later, in
+      `Shutdown`, and already-accepted requests drain for up to `legDrainTimeout`
+      — `serving()` answers "is this the leg in front of clients", not "is every
+      byte done").
+      The same predicate now gates `ReconcileHTTPS`'s same-address no-op, so a
+      dead leg is REBUILT rather than mistaken for a converged one (#6827 round
+      6): before that, a self-terminated HTTPS leg could not be replaced by any
+      commit and HTTPS stayed down until a restart. The dead leg's CONNECTIONS
+      are taken down too (#6827 round 7) — see the leg-drain bullet above; the
+      recovery alone left them serving. It does NOT test `stopCh`: a requested
+      retirement is unobservable through `s.httpsLeg`, though not by the
+      ordering — the disable arm retires the leg and THEN clears the field. What
+      makes the interval unobservable is that the whole `ReconcileHTTPS` switch
+      runs under ONE `lifeMu` hold and every `serving()` caller takes `lifeMu`,
+      so a reader lands before the retirement or after the clear, never between;
+      the rebind arm installs the replacement first, so the leg it retires is
+      never the installed one. Either way that would be an arm for a state that
+      cannot occur. `serving()` is
+      stricter than `EffectiveHTTPAddr`'s inline check, which answers
+      `show system services`, where a leg finishing a drain should still report
+      its address.
+      Both parse the leaf ONCE and share these checks (`certCoversHost` — the
+      same strict `x509.VerifyHostname` check a remote client applies):
+      - **no SAN at all** (`certHasNoSANs`) — a pair persisted by an older build
+        or placed by an operator can carry no subjectAltName, and then it covers
+        NOTHING: modern clients do not fall back to CommonName, so even
+        `https://localhost` fails. This case is reported first and is TERMINAL
+        (the per-identity lines below would each report "does not cover X" for a
+        cert that covers no X at all). The per-identity predicates gate out
+        loopback on the premise that the durable cert always carries the
+        loopback SANs, which is true only of certs this mint path produced — so
+        without this check the most broken certificate possible was the one that
+        warned least.
+      - the **HTTPS bind host**, when it is a concrete non-loopback management
+        host (`bindHostWarnable`) — stale after an A→B `web-management https
+        interface` rebind. It needs no plausibility test: the operator
+        configured the listener to answer there. The rename entry point does NOT
+        re-report it (the bind did not change).
+      - the **kernel host name**, when it is one a re-mint could actually cover
+        (`hostnameSANWarnable`) — stale after `set system host-name`. This half
+        was previously UNCHECKED, and because renaming a firewall does not move
+        its management IP the bind-host check did not fire either: the operator
+        got a bare `certificate is not valid for any names` with nothing in the
+        log. `hostnameSANWarnable` additionally requires the name to be
+        DNS-encodable or an IP literal, so a `café` host name — which
+        `isDNSSANSafeHostname` DROPS from the SANs by design and which no
+        re-mint could ever cover — does not warn on every reload.
+        On the LOAD path it is additionally narrowed by
+        `hostNameLikelyAccessIdentity`: a box named `fw` whose cert covers
+        `mgmt.example.com` plus its management IP is verifiable at every URL in
+        use, and telling that operator to re-mint churns remote TOFU pins for
+        nothing. Since this package's mint path is the only thing that puts a
+        bare, unqualified name in a cert (and what it puts there is the kernel
+        host name), an unqualified DNS SAN next to an unqualified kernel name
+        means the TLS identity IS the kernel name and has drifted — diagnose; a
+        domain-qualified SAN next to a short kernel name means the TLS identity
+        is independent of it — stay quiet. The RENAME entry point skips that
+        heuristic: the operator just chose the name, which is direct evidence
+        rather than inference. **Accepted residual:** a rename that CROSSES the
+        qualified/unqualified boundary is diagnosed at the commit but not on any
+        later boot, so it is never diagnosed at all in the two states that had
+        no commit-time diagnosis behind them — a box already drifted before this
+        shipped, and a box RUNNING this build whose commit-time debt was still
+        OWED at shutdown and was discarded by the restart,
+        `Daemon.staleCertPending` being process-local. That second state has
+        more ways in than the obvious one, each an ordinary configuration rather
+        than a fault: HTTPS disabled, its bind failed, its serve loop terminated
+        and no later commit rebuilt the leg, the API disabled entirely
+        (`--api-addr` empty, so there is no reconciler to deliver through), the
+        boot HTTP start failed, the kernel name unreadable at every delivery, or
+        startup aborted on a signal (#5807) after the phase-4 config apply but
+        before the management server was built.
+        Shape-preserving drift (the ordinary case) is still caught on
+        every boot. Closing either half needs persistent state — an upgrade
+        marker, or a durable pending flag plus an invalidation story for a name
+        that changed again while the daemon was down — for one
+        narrow class, and would re-fire the false positive on exactly the boxes
+        the heuristic cannot judge — weighed and declined, see the comment on
+        `hostNameLikelyAccessIdentity`.
+      Each uncovered identity emits its own `slog.Warn` naming the identity and
+      the cert's DNS/IP SANs — which are exactly the identities it DOES cover,
+      so an operator re-mints (remove `/etc/xpf/tls`) or dismisses the line in
+      one read, instead of chasing a silent verification failure.
     An already-persisted cert is NOT auto-regenerated — the #1916 D6
     durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
     pins survive a power loss; only freshly generated certs gain SANs (delete
     `cert.pem`/`key.pem` to force a regenerate). Pinned by
     `tls_san_5719_test.go` (SAN presence, hostname classification, the
     non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
-    `buildHTTPSServer` host-extraction, and the stale-cert-on-rebind
-    mismatch warning), fail-on-revert.
+    `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings on
+    the rebind path) and `tls_stale_cert_6827_test.go` (the SAN-less cert — one
+    fixture for the REACH the check adds where both per-identity gates decline,
+    a second with a warnable bind host so the TERMINAL `return` is observable at
+    all; the unused-kernel-name false positive and its matched positive control;
+    the rename entry point; and the two leg-state transitions driven by the real
+    serve goroutine — `stopping` on a root-context drain, `dead` on an
+    unexpected serve exit, the reconcile that REPLACES a dead leg, the held
+    connection that must not outlive a revocation, and the in-flight response
+    severed on all three leg exits), with
+    the daemon-side wiring pinned by
+    `pkg/daemon/hostname_stale_cert_6827_test.go`: a host-name commit on an
+    UNCHANGED HTTPS endpoint reaches the diagnostic with the NEW name, the debt
+    outlives a delivery that reached nothing, an unreadable kernel name settles
+    nothing, the generation fence defers a rename that lands mid-delivery (once
+    with the test supplying the competing rename, once driving it through the
+    production note path so the `staleCertGen++` itself is bound), a dead HTTPS
+    leg is rebuilt by the next commit so the debt is dischargeable at all, and
+    BOTH deferred retry points are bound at their own call site. Those two are
+    bound on different observables, and the reason is worth stating rather than
+    discovering twice: `reconcileWebManagement`'s per-commit retry is bound on
+    the debt FLAG, because the reconcile that brings HTTPS up makes the
+    certificate LOAD path emit the same warning text — a text assertion there
+    passes with the retry deleted. `startHTTPServer`'s boot delivery is bound on
+    the kernel-name read plus the fact that the management server already
+    exists when it happens; that call site cannot be given a serving HTTPS leg
+    in-process, because `startHTTPServer` CONSTRUCTS the `api.Server` itself and
+    `SetTLSCertDirForTest` only exists after construction, so the alternative is
+    driving the production `/etc/xpf/tls` generator. Deleting either call reds
+    its own subtest and only its own. The boot cell's limit is stated in the
+    test rather than implied: it proves the call happens and happens after the
+    server is built, NOT that it reached a certificate, warned, or discharged
+    anything — replacing the delivery with a bare `osHostname()` would satisfy
+    it, and a stronger cell needs a pre-construction certificate seam on
+    `api.Config`, which was declined as a production knob added for one test.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
