@@ -274,6 +274,20 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #5619 secure-tunnel plaintext advisory. Route-based IPsec decrypts in
+	// the KERNEL XFRM stack and the plaintext is forwarded by Linux routing,
+	// which xpf does not adjudicate — no zone policy, no session, no NAT, no
+	// screen. Before #5619 the config gave an affirmative FALSE signal: a zone
+	// on the tunnel interface commits cleanly and is programmed, so the posture
+	// READS as enforced. This states the truth at commit.
+	//
+	// WARNING ONLY, on EVERY path — there is no lenient flag and no error
+	// return, because route-based IPsec is the only IPsec model xpf supports
+	// (#3114 rejects policy-based) and rejecting it would be a feature removal
+	// that also blocks an unrelated commit on a box with a working tunnel
+	// (#1960 no-brick).
+	plaintextWarnings := warnSecureTunnelPlaintextUnadjudicatedAST(tree.Children)
+
 	// #4098 IPsec traffic-selector injection gate. `security ipsec vpn
 	// <name> traffic-selector <ts> local-ip / remote-ip` are free-form 1-arg
 	// strings the IPsec renderer interpolates into the swanctl.conf
@@ -541,6 +555,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, fwFilterFamilyWarnings...)
 	warnings = append(warnings, fwFilterFamilyAnyWarnings...)
 	warnings = append(warnings, bindIfaceWarnings...)
+	warnings = append(warnings, plaintextWarnings...)
 	warnings = append(warnings, ipsecTSWarnings...)
 	warnings = append(warnings, reservedProposalNameWarnings...)
 	warnings = append(warnings, policyMatchWarnings...)

@@ -1,3 +1,101 @@
+## 2026-08-21 — #5619 PR2 drive: merge master, repair a self-declaring premise
+
+- **Timestamp**: 2026-08-21 (fix/5619-ipsec-plaintext-warn, PR #6698)
+- **Action**: #5619 PR1 (#6691) MERGED to master (fcb7e6160) and its branch was
+  deleted, which auto-closed this stacked PR. Merged `origin/master` (668
+  commits behind; NEVER rebase a review-heavy branch) and retargeted to master.
+  The three-dot diff against master is now exactly this PR's own delta — 823
+  insertions across `compiler_ipsec_plaintext_warn.go`, its test,
+  `compiler_prewalk.go`, `pkg/config/README.md` and `_Log.md`. None of #6691's
+  seven shared files survive on this side, so the stale-duplicate hazard flagged
+  on the PR resolved itself: master's version wins outright.
+- **The merge broke a premise, loudly.**
+  `TestPlaintextWarningSkipsInvalidBindInterface` drove `st-1` and `st65536` as
+  the rows that "pass IsSecureTunnelIfName and are stopped only by the ifID == 0
+  guard". #6691 gave `secureTunnelIndex` a `0 <= idx < 65536` range, so both now
+  FAIL the predicate. The subtest's own premise check caught it and failed the
+  build rather than going vacuously green — which is exactly what that check was
+  written for. Replaced the inputs with `st0.65535` (unit >= 0xffff) and
+  `st0.abc` (unit unparseable): both keep a VALID base, so they still bind the
+  if_id test, and they now pin the axis that actually varies — WHICH HALF of the
+  bind-interface is invalid. A guard written against the base name alone would
+  let both through and emit an advisory about a device routing never creates.
+- **Mutation-proved, not asserted.** Deleting `if ifID == 0 { continue }` reds
+  `unit_out_of_range` and `unit_unparseable` and leaves `invalid_base_name`
+  green. Deleting the `!IsSecureTunnelIfName(base)` line leaves the ENTIRE file
+  green — that branch is unreachable, because `ifID != 0` already implies
+  `secureTunnelIndex(base)` succeeded. Filed rather than folded.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn_5619_test.go, _Log.md
+
+## 2026-08-01 — #5619 PR2 round 2: aggregate the advisory, escalate the zoned case
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
+- **Action**: Per the scope decision, the plaintext advisory now emits ONE
+  aggregated message per commit naming every affected tunnel, instead of one per
+  tunnel. An advisory that fires N times on every commit gets filtered out, and
+  then it protects nobody — same shape compiler_system.go uses when folding
+  several inert knobs into one message.
+
+  It still fires whenever a secure tunnel is configured, NOT only when one
+  carries a zone. Leaving a tunnel out of a zone is not a mitigation: an
+  interface in no zone resolves to zone id 0 and a `from-zone any to-zone any
+  permit` rule matches zone-pair (0,0) with no zone guard (#6682), so an unzoned
+  tunnel's plaintext can be affirmatively PERMITTED by a wildcard rule. Gating
+  on zoning would tell that operator nothing.
+
+  The two groups are worded differently. ZONED reads as an escalation
+  ("ASSIGNED A ZONE THAT IS NOT ENFORCED — this reads as protected and is not")
+  because the operator has been told something specific and untrue; UNZONED is a
+  plain statement of the gap, plus the #6682 caveat so nobody concludes that
+  unzoning is the safe option. The caveat is omitted when every tunnel is zoned,
+  so it does not become noise where it does not apply.
+
+  Rebased onto the round-3 PR1 (bare-`st0` fix), so the advisory keys off the
+  corrected shared predicate.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_ipsec_plaintext_warn_5619_test.go, _Log.md
+
+## 2026-08-01 — #5619 PR2: commit-time advisory that IPsec plaintext is unadjudicated
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
+- **Action**: Added `warnSecureTunnelPlaintextUnadjudicatedAST`, a commit-time
+  WARNING (never a rejection) that a route-based IPsec VPN's decrypted
+  plaintext is not evaluated against xpf security policies.
+
+  The sharpest part of #5619 is not the bypass, it is that the config gives an
+  affirmative FALSE signal: `set security zones security-zone vpn interfaces
+  st0.0` commits cleanly (#4515 accepts it), the compiler programs
+  iface_zone_map for the xfrmi ifindex, and the XDP shim is attached — so the
+  posture READS as enforced. An operator who zones a VPN interface and sees it
+  accepted has been told something specific and untrue. That is fixable now,
+  independently of the dataplane architecture, and this does it.
+
+  Warning, NOT rejection, and the property is STRUCTURAL: the function has no
+  error return and no `lenient` flag, so it cannot be quietly inverted by a
+  later edit. Route-based (st0/XFRM) IPsec is the ONLY IPsec model xpf supports
+  (#3114 hard-rejects policy-based), so rejecting it would be a feature removal
+  — and it would leave an operator with a working tunnel unable to commit an
+  UNRELATED change (#1960 no-brick).
+
+  Keyed off `config.IsSecureTunnelIfName`, the SAME predicate as the dataplane
+  exclusion arms added in PR1, so the advisory and the behaviour it describes
+  cannot drift apart. When the dataplane learns to own an xfrmi end-to-end, the
+  exclusions and this advisory are keyed off one name and go together.
+
+  Message names the VPN and the bind-interface, and when the tunnel interface
+  is in a security zone it additionally names that zone and states plainly that
+  the zone does not govern the decrypted traffic — the false-signal case.
+  Zone membership is read through the shared `zoneInterfaceMembers` flattener
+  so a bracketed list `interfaces [ st0.0 st0.1 ]` (which arrives
+  bracket-stripped and NESTED, #5248/#2419) does not silently lose its tail.
+  An AST pre-walk across EVERY duplicate `security`/`ipsec` block (#3562).
+
+  Validation: pkg/config, pkg/configstore, pkg/cli and pkg/dataplane/... suites
+  green (adding a warning to every IPsec config broke no existing warning-count
+  assertion); 7 new tests including a no-brick test and a negative control.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_ipsec_plaintext_warn_5619_test.go,
+  pkg/config/compiler_prewalk.go, _Log.md
 ## 2026-08-05 — #6304: bind the LIVE mirror call site in stage_flow_cache_hit (salvage + independent verification)
 
 - **Timestamp**: 2026-08-05 (fix/6304-mirror-callsite-bound-sv)

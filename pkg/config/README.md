@@ -1027,6 +1027,37 @@ group-expanded / packed forms the schema layer can miss (#1960 layered defense).
 The pkg/routing "invalid bind-interface name" log is the runtime backstop for a
 tolerated invalid config.
 
+**The decrypted plaintext is NOT zone-adjudicated, and the operator is told so
+at commit (#5619):** a route-based VPN's `bind-interface st<N>[.unit]` is
+deliberately excluded from the ingress-adjudication set, the AF_XDP binding plan
+and the RSS allowlist — and `syncInterfaceAttachments`
+(`pkg/dataplane/userspace/manager_compile.go`) then calls `DetachXDP` on every
+ifindex outside the allowed set, so the shim is detached from the xfrmi rather
+than attached to it. There is no kernel substitute: no `hook forward` rule
+covers it and `ip_forward` is 1.
+
+The problem this advisory solves is not the gap itself but the FALSE
+affirmation around it. `set security zones security-zone vpn interfaces st0.0`
+commits cleanly (#4515 accepts a zone naming a bind-interface with no explicit
+`set interfaces st0 unit 0`), and nothing in the CLI or the commit output
+distinguishes that zone from one that is enforced. An operator who zones a VPN
+interface and sees it accepted has been told something specific and untrue about
+their security posture, which is worse than an unimplemented feature.
+
+Two wordings, on purpose: a ZONED tunnel reads as an escalation, because a
+specific untrue thing was asserted; an unzoned tunnel gets a plain statement of
+the gap. The advisory keys off the SAME predicate as the dataplane exclusion
+(`IsSecureTunnelIfName`), so the two cannot drift into a state where the
+dataplane adjudicates the tunnel while the warning still says it does not. It
+fires on all four compile entry points — strict, lenient, and both node-aware
+variants — because the operator who most needs it is the one whose config
+arrives by restart or peer-sync and who never re-commits.
+
+Like the #2933 and #5297 arms above it, this NEVER rejects: a bind-interface
+resolving to if_id 0 is skipped here, since it is already reported by the #5297
+arm as a silent tunnel-down and a second complaint about a plaintext path that
+does not exist would just be noise.
+
 **Undefined policy community references are rejected at commit (#2881):** a
 policy-statement term's `from community <name>` (rendered FRR `match community
 <name>`) and `then community delete <name>` (the strip-by-list operation added
