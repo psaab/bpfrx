@@ -38,7 +38,7 @@ func (s *warmNeighborTestStore) ForEachV6(fn func(dataplane.SessionKeyV6, datapl
 }
 
 // warmNeighborTestDP is a minimal RuntimeDataPlane whose Sessions() returns the
-// injected store. warmNeighborCache only touches d.dp.Sessions().
+// injected store. warmNeighborCache only touches the dataplane's Sessions().
 type warmNeighborTestDP struct {
 	dataplane.RuntimeDataPlane
 	store dataplane.SessionStore
@@ -122,9 +122,9 @@ func TestWarmNeighborCacheBoundsSocketsAtCGNATScale(t *testing.T) {
 
 	dialer := newCountingWarmDialer()
 	d := &Daemon{
-		dp:                 &warmNeighborTestDP{store: &warmNeighborTestStore{v4: v4, v6: v6}},
 		neighborWarmDialer: dialer,
 	}
+	d.setDataplane(&warmNeighborTestDP{store: &warmNeighborTestStore{v4: v4, v6: v6}}) // #2114: publish through the cell
 
 	d.warmNeighborCache()
 
@@ -149,9 +149,9 @@ func TestWarmNeighborCacheBoundsSocketsAtCGNATScale(t *testing.T) {
 func TestWarmNeighborCacheNoSocketsWhenEmpty(t *testing.T) {
 	dialer := newCountingWarmDialer()
 	d := &Daemon{
-		dp:                 &warmNeighborTestDP{store: &warmNeighborTestStore{}},
 		neighborWarmDialer: dialer,
 	}
+	d.setDataplane(&warmNeighborTestDP{store: &warmNeighborTestStore{}}) // #2114: publish through the cell
 	d.warmNeighborCache()
 	if dialer.opens != 0 {
 		t.Errorf("opened %d sockets for an empty session table; want 0", dialer.opens)

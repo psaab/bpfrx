@@ -16,7 +16,8 @@ import (
 func TestUpdatePolicyScheduleStateLockedPropagatesError(t *testing.T) {
 	wantErr := errors.New("apply_snapshot failed")
 	dp := &runtimeOnlyPolicyUpdaterTestDP{updateErr: wantErr}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	err := d.updatePolicyScheduleStateLocked(&config.Config{}, map[string]bool{"workhours": false})
 	if err == nil || !errors.Is(err, wantErr) {

@@ -63,72 +63,57 @@ func (d *Daemon) shouldSyncUserspaceDelta(ss *cluster.SessionSync, delta dpusers
 	return ok
 }
 
-func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
-	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
-	if !ok || d.cluster == nil || d.getSessionSync() == nil {
-		return
-	}
-
-	const (
-		fastInterval      = 100 * time.Millisecond // event stream disconnected
-		reconcileInterval = 5 * time.Second        // event stream connected
-	)
-	ticker := time.NewTicker(fastInterval)
-	defer ticker.Stop()
-	wasConnected := false
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		// Adjust cadence based on event stream state.
-		connected := d.eventStreamConnected.Load()
-		if connected != wasConnected {
-			wasConnected = connected
-			if connected {
-				ticker.Reset(reconcileInterval)
-			} else {
-				ticker.Reset(fastInterval)
-			}
-		}
-
-		ss := d.getSessionSync()
-		if d.cluster == nil || ss == nil {
-			return
-		}
-		if !d.cluster.IsLocalPrimaryAny() || !ss.IsConnected() {
-			continue
-		}
-		cfg := d.store.ActiveConfig()
-		if cfg == nil {
-			continue
-		}
-		d.userspaceDeltaSyncMu.Lock()
-		_, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
-		d.userspaceDeltaSyncMu.Unlock()
-		if err != nil {
-			slog.Debug("userspace session delta drain failed", "err", err)
-		}
-	}
-}
-
-// runUserspaceEventStream attempts to consume session events from the helper's
-// binary event stream. Falls back to the existing polling loop when the stream
-// is unavailable or disconnected.
+// runUserspaceEventStream consumes session events from the helper's binary
+// event stream, falling back to DrainSessionDeltas polling whenever the
+// stream is unavailable or disconnected.
+//
+// Codex PR #6743 r7-F1b: this used to open with a ONE-SHOT probe —
+// `if _, ok := d.dataplane().(userspaceEventStreamProvider); !ok` — and, on
+// a miss, hand off permanently to a separate polling loop that had no
+// wiring logic at all. An empty cell at that instant (the daemon has not
+// armed the helper yet, or a bootstrap-arm failure cleared it) therefore
+// LATCHED the daemon into pure polling: a corrected commit could publish a
+// perfectly healthy provider afterwards and its callbacks were never
+// installed, so every helper event sat in the callback-not-ready queue for
+// the rest of the process's life. The per-tick drainer resolution (r7-F1)
+// does not reach this one — the decision was already made, and on the
+// standalone path the goroutine had already returned.
+//
+// eventStreamFallbackLoop is now the single loop for both roles: it
+// re-resolves the provider, the stream and the drainer from the #2114 cell
+// every tick, installs callbacks the first time it sees a stream (passing
+// nil for `wired` means "nothing wired yet"), and polls at 100 ms while
+// disconnected — which is exactly what the deleted polling loop did. So a
+// backend published after entry is picked up on the next tick instead of
+// being missed forever.
 func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
-	provider, ok := d.dp.(userspaceEventStreamProvider)
-	if !ok {
-		// Manager doesn't support event stream — fall back to polling.
-		d.syncUserspaceSessionDeltas(ctx)
-		return
-	}
-	if !d.wireUserspaceEventStreamCallbacks(ctx, provider) {
-		return
-	}
 	if d.cluster == nil || d.getSessionSync() == nil {
+		// Standalone: no session sync, so nothing to poll or drain — but
+		// the helper's DATAPLANE events (RT_FLOW records into the event
+		// buffer) still arrive through these callbacks, so they must be
+		// installed. wireUserspaceEventStreamCallbacks re-reads the cell
+		// every 500 ms until a provider with a stream appears, so an empty
+		// cell here is a retry, not a latch.
+		//
+		// KNOWN GAP (#6743 r2-N5), stated because the sentence above is
+		// true of the FIRST wiring only and reads as if the whole path were
+		// self-correcting. wireUserspaceEventStreamCallbacks RETURNS once
+		// it installs, and this arm returns with it. The re-install on a
+		// REPLACED stream instance — the `es != wired` block r6-F4 added —
+		// lives in eventStreamFallbackLoop, which this path never runs. So
+		// on a standalone (no-cluster) daemon, a commit-confirmed rollback
+		// that closes the armed backend's stream followed by a corrected
+		// re-arm that constructs a new one leaves the replacement stream
+		// with no callbacks: its dataplane events accumulate in the
+		// callback-not-ready queue instead of reaching the event buffer,
+		// until the daemon restarts.
+		//
+		// This is PRE-EXISTING in shape — the clustered path had the same
+		// hole before r6-F4 and this arm was never converted — and is left
+		// alone here rather than fixed blind: the fix is either to run a
+		// stream-watch loop on this path too or to hoist the re-install
+		// into the wiring helper, and both want their own binder.
+		d.wireUserspaceEventStreamCallbacks(ctx)
 		return
 	}
 
@@ -137,25 +122,83 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 	// Monitor connection. When the stream is connected, events arrive via
 	// callback and polling drops to 5s reconciliation. When disconnected,
 	// polling resumes at 100ms.
-	d.eventStreamFallbackLoop(ctx, provider)
+	d.eventStreamFallbackLoop(ctx, nil)
 }
 
-func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context, provider userspaceEventStreamProvider) bool {
+// currentEventStreamProvider re-resolves the event-stream provider from the
+// #2114 cell.
+//
+// Codex PR #6743 r6-F4: this loop used to CAPTURE the provider once, at
+// Phase 5 (daemon_run.go), from the constructed-but-unarmed bootstrap
+// backend — before any helper socket existed. If the bootstrap arm then
+// failed and cleared the cell (daemon_run_naming.go), nothing cancelled
+// this goroutine: it kept polling the STALE, disowned backend every 500ms
+// for the daemon's lifetime, which is exactly the escape #2114 exists to
+// close. Re-resolving per tick means an emptied cell yields no provider
+// and a REPLACED backend yields the new one.
+func (d *Daemon) currentEventStreamProvider() (userspaceEventStreamProvider, bool) {
+	p, ok := d.dataplane().(userspaceEventStreamProvider)
+	return p, ok
+}
+
+// currentSessionDeltaDrainer re-resolves the session-delta drainer from the
+// #2114 cell. Every tick of the two polling loops must call this immediately
+// before the drain, for the SAME reason currentEventStreamProvider exists.
+//
+// Codex PR #6743 r7-F1: r6-F4 made the provider and the stream per-tick but
+// left the drainer captured once, at loop entry, in eventStreamFallbackLoop
+// and in the (since removed, see runUserspaceEventStream) sibling polling
+// loop. The loop is launched with commsCtx (daemon_ha_sync.go), which only
+// stopClusterComms cancels — a dataplane disown does not. So after a
+// commit-confirmed
+// rollback + a failed corrected re-arm cleared the cell
+// (daemon_run_naming.go), the provider correctly resolved to nothing, the
+// stream reported disconnected, and the loop dropped to its FAST 100 ms
+// branch — where the captured `hasDrainer` was still true and it kept
+// calling DrainSessionDeltas on the torn-down, disowned backend (taking
+// userspaceDeltaSyncMu each time) for the daemon's lifetime. That is the
+// escape #2114 exists to close, at 10 Hz.
+//
+// The reverse arm matters just as much: a cell that is momentarily empty at
+// loop entry used to latch hasDrainer=false (and, in the sibling polling
+// loop, RETURN outright), so the reconciliation drain stayed dead for the
+// goroutine's life even after a healthy backend was republished. Resolving
+// per tick makes both directions self-correcting.
+func (d *Daemon) currentSessionDeltaDrainer() (userspaceSessionDeltaDrainer, bool) {
+	dr, ok := d.dataplane().(userspaceSessionDeltaDrainer)
+	return dr, ok
+}
+
+// wireUserspaceEventStreamCallbacks waits for a stream to exist on the
+// CURRENTLY published backend and installs the callbacks on it. It returns
+// the stream it wired, or nil if ctx ended first.
+func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context) *dpuserspace.EventStream {
 	// Wait for the event stream to become available (helper may not have started yet).
-	var es *dpuserspace.EventStream
 	for {
-		es = provider.EventStream()
-		if es != nil {
-			break
+		if provider, ok := d.currentEventStreamProvider(); ok {
+			if es := provider.EventStream(); es != nil {
+				d.installEventStreamCallbacks(es)
+				return es
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return nil
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
 
-	// Wire callbacks.
+// installEventStreamCallbacks binds the daemon's handlers onto es.
+//
+// Split out for r6-F4's rewire: the commit-confirmed rollback CLOSES the
+// armed backend's stream (pkg/dataplane/userspace/process.go) and a
+// corrected re-arm constructs a NEW one. Before r6 the wiring ran once, at
+// startup, on a goroutine that had already returned — so the replacement
+// stream had no callbacks and its events accumulated in the
+// callback-not-ready queue instead of reaching session sync. The fallback
+// loop now re-installs whenever it observes a different stream instance.
+func (d *Daemon) installEventStreamCallbacks(es *dpuserspace.EventStream) {
 	es.SetOnEvent(func(eventType uint8, seq uint64, delta dpuserspace.SessionDeltaInfo) bool {
 		return d.handleEventStreamDelta(eventType, delta)
 	})
@@ -175,7 +218,6 @@ func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context, provider
 			}
 		})
 	}
-	return true
 }
 
 // handleEventStreamDelta processes a single session event from the event
@@ -232,7 +274,7 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 		slog.Debug("userspace event stream: full resync deferred (sync not connected)")
 		return false
 	}
-	exporter, ok := d.dp.(userspaceSessionExporter)
+	exporter, ok := d.dataplane().(userspaceSessionExporter)
 	if !ok {
 		return false
 	}
@@ -255,8 +297,9 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 // to polling via DrainSessionDeltas when the stream is disconnected.
 // When the event stream is live, polling slows to 5s reconciliation;
 // when disconnected, it runs at 100ms to compensate for the lost stream.
-func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspaceEventStreamProvider) {
-	drainer, hasDrainer := d.dp.(userspaceSessionDeltaDrainer)
+// wired is the stream whose callbacks are already installed; a different
+// instance observed on a later tick is re-wired in place (r6-F4).
+func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, wired *dpuserspace.EventStream) {
 	if d.cluster == nil || d.getSessionSync() == nil {
 		return
 	}
@@ -278,7 +321,23 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		case <-ticker.C:
 		}
 
-		es := provider.EventStream()
+		// r6-F4 / r7-F1: re-resolve the provider, the stream AND the
+		// drainer each tick. The provider must come from the cell (a
+		// captured one can be a backend the daemon disowned), a stream
+		// instance that is not the one we wired is a post-rollback
+		// replacement whose callbacks were never installed, and the
+		// drainer resolves at each of its two use sites below (see
+		// currentSessionDeltaDrainer — a captured one kept draining a
+		// disowned backend at 10 Hz).
+		var es *dpuserspace.EventStream
+		if provider, ok := d.currentEventStreamProvider(); ok {
+			es = provider.EventStream()
+		}
+		if es != nil && es != wired {
+			d.installEventStreamCallbacks(es)
+			wired = es
+			slog.Info("userspace: event stream replaced (rollback/re-arm), callbacks re-installed")
+		}
 		connected := es != nil && es.IsConnected()
 
 		// Track transitions and adjust cadence.
@@ -297,6 +356,7 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		if connected {
 			// Stream is live — run reconciliation drain to catch any
 			// missed events, but at the slow 5s cadence.
+			drainer, hasDrainer := d.currentSessionDeltaDrainer()
 			if !hasDrainer {
 				continue
 			}
@@ -321,6 +381,7 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		}
 
 		// Stream disconnected — fall back to fast polling.
+		drainer, hasDrainer := d.currentSessionDeltaDrainer()
 		if !hasDrainer {
 			continue
 		}

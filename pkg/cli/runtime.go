@@ -68,8 +68,14 @@ type cliRuntime interface {
 
 // cliUserspaceStatusProvider is implemented by dataplanes that expose
 // the userspace helper's ProcessStatus snapshot (queue/binding/CoS).
-// Replaces the inline `c.dp.(interface{ Status() ... })` probes in
-// cli_show_chassis.go and cli_show_system.go.
+// It replaces the inline `c.dp.(interface{ Status() ... })` probes that
+// were in cli_show_chassis.go and cli_show_system.go — those two sites
+// SPECIFICALLY, not every inline probe in the tree. Codex PR #6743 r7:
+// anonymous-interface probes still exist for OTHER capabilities
+// (cli_show_nat.go's deterministic-NAT view, pkg/api's NAT and system
+// paths); they are correct because they all resolve through dpProbe()
+// first, which is the property the #2114 canary fences — a named interface
+// here is a readability choice, not the safety mechanism.
 type cliUserspaceStatusProvider interface {
 	Status() (dpuserspace.ProcessStatus, error)
 }
@@ -86,4 +92,48 @@ type cliUserspaceControlProvider interface {
 	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+}
+
+// dpProbe returns the value that OPTIONAL-capability assertions must be
+// made against. See pkg/grpcapi/runtime.go's dpProbe for the full #2114 /
+// #6743-F1 rationale: the daemon publishes a live indirection whose method
+// set is exactly cliRuntime, so probing it directly erases
+// cliUserspaceStatusProvider, cliUserspaceControlProvider, the session
+// cursor and the applied-NAT view for a healthy backend. Unwrap is the
+// identity for a plain backend and nil once the daemon has disowned one.
+func (c *CLI) dpProbe() any {
+	if c == nil {
+		return nil
+	}
+	return dataplane.Unwrap(c.dp)
+}
+
+// backendSessionCount and backendMapStats read the mandatory management
+// surface off an ALREADY-RESOLVED backend (Codex PR #6743 r7-F3).
+//
+// showSystemBuffers / showSystemBuffersDetail take exactly one
+// dataplane.Unwrap and must not take another: c.dp.SessionCount() and
+// c.dp.GetMapStats() are each a fresh cell load, and a setDataplane(nil)
+// landing between the publication check and the map read made the render
+// print "No BPF maps available" — a claim about a LOADED backend's maps —
+// for a daemon that had just lost its backend. Asserting off the single
+// resolution keeps the whole render describing one instant.
+//
+// Both narrow interfaces are part of cliRuntime, so every value that can be
+// stored in CLI.dp satisfies them; the ok=false arms are the
+// forward-compatibility answer for a future backend that does not.
+func backendSessionCount(backend any) (v4, v6 int) {
+	c, ok := backend.(interface{ SessionCount() (int, int) })
+	if !ok {
+		return 0, 0
+	}
+	return c.SessionCount()
+}
+
+func backendMapStats(backend any) []dataplane.MapStats {
+	m, ok := backend.(interface{ GetMapStats() []dataplane.MapStats })
+	if !ok {
+		return nil
+	}
+	return m.GetMapStats()
 }

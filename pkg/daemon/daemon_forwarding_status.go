@@ -1,66 +1,21 @@
 package daemon
 
 import (
-	"errors"
-
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 )
 
-var _ fwdstatus.DataPlaneAccessor = forwardingStatusDaemonDataPlane{}
-
+// forwardingStatusDaemonDataPlane is the daemon's sampler-only dataplane
+// adapter (#2114). It deliberately does NOT satisfy
+// fwdstatus.DataPlaneAccessor and has no Status method: Build keys backend
+// identity on Status() presence (pkg/fwdstatus/builder.go), so this type
+// can never be misrouted into a Build path. The pre-#2114 wrapper pair
+// (base + userspace-specialized) resolved capability at CONSTRUCTION time
+// against the d.dp value then current, so a backend transition left a
+// permanently wrong adapter behind; the single-method shape probes the
+// currently published dataplane on every call instead.
 type forwardingStatusDaemonDataPlane struct {
 	daemon *Daemon
-}
-
-// IsLoaded reads liveness off d.dp via the local dataplaneReadyProbe
-// (runtime_probes.go). Both *dataplane.Manager and the userspace
-// *LegacyDataPlaneAdapter satisfy the probe; the prior round-trip
-// through legacyDP() was unnecessary.
-func (a forwardingStatusDaemonDataPlane) IsLoaded() bool {
-	if a.daemon == nil || a.daemon.dp == nil {
-		return false
-	}
-	if ready, ok := a.daemon.dp.(dataplaneReadyProbe); ok {
-		return ready.IsLoaded()
-	}
-	return false
-}
-
-// GetMapStats reads map stats via the runtime Telemetry domain
-// (pkg/dataplane.Telemetry.MapStats — apply.go:154). The prior
-// path went via legacyDP().GetMapStats(); the runtime domain
-// already exposes the same map metadata, so the legacy bridge is
-// no longer needed.
-func (a forwardingStatusDaemonDataPlane) GetMapStats() []fwdstatus.MapStats {
-	if a.daemon == nil || a.daemon.dp == nil {
-		return nil
-	}
-	telemetry := a.daemon.dp.Telemetry()
-	if telemetry == nil {
-		return nil
-	}
-	stats := telemetry.MapStats()
-	out := make([]fwdstatus.MapStats, 0, len(stats))
-	for _, ms := range stats {
-		out = append(out, fwdstatus.MapStats{
-			Type:       ms.Type,
-			MaxEntries: ms.MaxEntries,
-			UsedCount:  ms.UsedCount,
-		})
-	}
-	return out
-}
-
-type forwardingStatusDaemonUserspaceDataPlane struct {
-	forwardingStatusDaemonDataPlane
-}
-
-func (a forwardingStatusDaemonUserspaceDataPlane) Status() (dpuserspace.ProcessStatus, error) {
-	if a.daemon == nil {
-		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
-	}
-	return a.daemon.userspaceDataplaneStatus()
 }
 
 // CachedStatus returns the last control-socket-captured ProcessStatus
@@ -68,22 +23,11 @@ func (a forwardingStatusDaemonUserspaceDataPlane) Status() (dpuserspace.ProcessS
 // consumes this instead of Status() so it reads worker telemetry off
 // the primary 1 Hz status poll rather than doubling the shared
 // control-socket status rate.
-func (a forwardingStatusDaemonUserspaceDataPlane) CachedStatus() (dpuserspace.ProcessStatus, bool) {
+func (a forwardingStatusDaemonDataPlane) CachedStatus() (dpuserspace.ProcessStatus, bool) {
 	if a.daemon == nil {
 		return dpuserspace.ProcessStatus{}, false
 	}
 	return a.daemon.userspaceDataplaneCachedStatus()
-}
-
-// userspaceStatusProbe matches the userspace adapter's Status()
-// method without re-importing the dataplane.DataPlane interface.
-// Satisfied by *dataplane/userspace.LegacyDataPlaneAdapter. The
-// legacy eBPF Manager intentionally does not implement Status() —
-// it carries no ProcessStatus snapshot — so the probe assertion
-// fails on eBPF and forwardingStatusDataplane returns the base
-// wrapper without Status().
-type userspaceStatusProbe interface {
-	Status() (dpuserspace.ProcessStatus, error)
 }
 
 // userspaceCachedStatusProbe matches the userspace adapter's
@@ -93,40 +37,35 @@ type userspaceCachedStatusProbe interface {
 	CachedStatus() (dpuserspace.ProcessStatus, bool)
 }
 
-func (d *Daemon) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
-	if d == nil || d.dp == nil {
-		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
-	}
-	provider, ok := d.dp.(userspaceStatusProbe)
-	if !ok {
-		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
-	}
-	return provider.Status()
-}
-
+// userspaceDataplaneCachedStatus probes the CURRENTLY published dataplane
+// (#2114: one dataplane() load per call) and returns its cached
+// ProcessStatus, ok=false when no dataplane is published or the published
+// backend is not the userspace adapter.
 func (d *Daemon) userspaceDataplaneCachedStatus() (dpuserspace.ProcessStatus, bool) {
-	if d == nil || d.dp == nil {
+	if d == nil {
 		return dpuserspace.ProcessStatus{}, false
 	}
-	provider, ok := d.dp.(userspaceCachedStatusProbe)
+	rt := d.dataplane()
+	if rt == nil {
+		return dpuserspace.ProcessStatus{}, false
+	}
+	provider, ok := rt.(userspaceCachedStatusProbe)
 	if !ok {
 		return dpuserspace.ProcessStatus{}, false
 	}
 	return provider.CachedStatus()
 }
 
-// forwardingStatusDataplane builds the fwdstatus accessor used by
-// the gRPC + CLI forwarding-status sampler. Returns nil when the
-// daemon has no dataplane (config-only mode); returns the
-// userspace-specialized wrapper when d.dp is the AF_XDP helper
-// adapter (so Status() works); returns the base wrapper otherwise.
-func (d *Daemon) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
-	if d == nil || d.dp == nil {
+// forwardingStatusDataplane builds the sampler's dataplane provider
+// (#2114: narrowed to fwdstatus.CachedStatusProvider — the sampler only
+// ever calls CachedStatus). Returns nil when the daemon has no dataplane
+// at all (nil receiver, or config-only NoDataplane mode — the cell stays
+// empty for the daemon lifetime there). A constructed-but-unarmed
+// dataplane (bootstrap mode) still yields a non-nil provider whose
+// per-call probe reports ok=false until a backend publishes status.
+func (d *Daemon) forwardingStatusDataplane() fwdstatus.CachedStatusProvider {
+	if d == nil || d.opts.NoDataplane {
 		return nil
 	}
-	base := forwardingStatusDaemonDataPlane{daemon: d}
-	if _, ok := d.dp.(userspaceStatusProbe); ok {
-		return forwardingStatusDaemonUserspaceDataPlane{forwardingStatusDaemonDataPlane: base}
-	}
-	return base
+	return forwardingStatusDaemonDataPlane{daemon: d}
 }
