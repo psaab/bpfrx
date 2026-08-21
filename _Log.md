@@ -1,3 +1,32 @@
+## 2026-08-21 — #5619 PR2 drive: merge master, repair a self-declaring premise
+
+- **Timestamp**: 2026-08-21 (fix/5619-ipsec-plaintext-warn, PR #6698)
+- **Action**: #5619 PR1 (#6691) MERGED to master (fcb7e6160) and its branch was
+  deleted, which auto-closed this stacked PR. Merged `origin/master` (668
+  commits behind; NEVER rebase a review-heavy branch) and retargeted to master.
+  The three-dot diff against master is now exactly this PR's own delta — 823
+  insertions across `compiler_ipsec_plaintext_warn.go`, its test,
+  `compiler_prewalk.go`, `pkg/config/README.md` and `_Log.md`. None of #6691's
+  seven shared files survive on this side, so the stale-duplicate hazard flagged
+  on the PR resolved itself: master's version wins outright.
+- **The merge broke a premise, loudly.**
+  `TestPlaintextWarningSkipsInvalidBindInterface` drove `st-1` and `st65536` as
+  the rows that "pass IsSecureTunnelIfName and are stopped only by the ifID == 0
+  guard". #6691 gave `secureTunnelIndex` a `0 <= idx < 65536` range, so both now
+  FAIL the predicate. The subtest's own premise check caught it and failed the
+  build rather than going vacuously green — which is exactly what that check was
+  written for. Replaced the inputs with `st0.65535` (unit >= 0xffff) and
+  `st0.abc` (unit unparseable): both keep a VALID base, so they still bind the
+  if_id test, and they now pin the axis that actually varies — WHICH HALF of the
+  bind-interface is invalid. A guard written against the base name alone would
+  let both through and emit an advisory about a device routing never creates.
+- **Mutation-proved, not asserted.** Deleting `if ifID == 0 { continue }` reds
+  `unit_out_of_range` and `unit_unparseable` and leaves `invalid_base_name`
+  green. Deleting the `!IsSecureTunnelIfName(base)` line leaves the ENTIRE file
+  green — that branch is unreachable, because `ifID != 0` already implies
+  `secureTunnelIndex(base)` succeeded. Filed rather than folded.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn_5619_test.go, _Log.md
+
 ## 2026-08-01 — #5619 PR2 round 2: aggregate the advisory, escalate the zoned case
 
 - **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)

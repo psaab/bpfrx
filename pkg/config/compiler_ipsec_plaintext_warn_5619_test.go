@@ -132,29 +132,39 @@ func TestPlaintextWarningIsQuietWithoutIPsec(t *testing.T) {
 // tunnel down). Adding a plaintext advisory on top would be noise about a
 // plaintext path that does not exist.
 //
-// TWO DISTINCT REJECTION SITES, and the inputs are chosen to separate them.
-// An earlier revision of this test drove only `ge-0/0/0.0`, which fails the
-// IsSecureTunnelIfName predicate and is discarded BEFORE the `ifID == 0`
-// guard is ever reached — so deleting that guard left this test, and the whole
-// file, green. It documented a guard it did not bind.
+// ONE reachable rejection site, and the inputs separate the two ways to reach
+// it. The advisory tests `ifID == 0` FIRST and only then the
+// IsSecureTunnelIfName predicate, so every input that fails the predicate has
+// already been discarded by the if_id test — the predicate line is not
+// reachable with any input (tracked separately; it is a dead branch, not a
+// behaviour difference). An earlier revision of this test asserted the
+// opposite: it labelled `ge-0/0/0.0` as "rejected by the predicate" and drove
+// `st-1` / `st65536` as the rows that "pass the predicate", which stopped being
+// true when #6691 gave secureTunnelIndex a `0 <= idx < 65536` range and made
+// IsSecureTunnelIfName reject both. That premise check caught itself on the
+// merge rather than going quietly green, which is why these rows changed.
 //
-// Measured on this tree:
+// What still varies, and is worth pinning, is WHICH HALF of the bind-interface
+// is invalid. A BASE-side rejection is visible to a base-name predicate; a
+// UNIT-side rejection is NOT — `st0.65535` and `st0.abc` have a perfectly valid
+// base and are refused only because XFRMIfNameAndID cannot build an if_id for
+// the unit. A guard written against the base name alone would let those two
+// through and emit an advisory about a device the routing layer never creates.
 //
-//	name         IsSecureTunnelIfName(base)   XFRMIfNameAndID -> ifID
-//	ge-0/0/0.0   false                        0     (sibling predicate rejects)
-//	st-1         TRUE                         0     (only ifID == 0 rejects)
-//	st65536      TRUE                         0     (only ifID == 0 rejects)
+// Measured on this tree (see XFRMIfNameAndID / secureTunnelIndex, xfrmi.go):
 //
-// The st* rows are the ones that bind the guard: they pass the predicate and
-// are stopped solely by the if_id test. They matter on the LENIENT path, where
-// #5297 is not rejecting such names.
+//	name         invalid half   IsSecureTunnelIfName(base)   XFRMIfNameAndID -> ifID
+//	ge-0/0/0.0   base           false                        0
+//	st0.65535    unit           TRUE                         0   (unit >= 0xffff)
+//	st0.abc      unit           TRUE                         0   (unit unparseable)
 func TestPlaintextWarningSkipsInvalidBindInterface(t *testing.T) {
 	for _, tc := range []struct {
-		name, bindIface, rejectedBy string
+		name, bindIface, invalidHalf string
+		basePredicate                bool
 	}{
-		{"not_a_secure_tunnel_name", "ge-0/0/0.0", "IsSecureTunnelIfName predicate"},
-		{"secure_tunnel_name_negative_unit", "st-1", "ifID == 0 guard"},
-		{"secure_tunnel_name_out_of_range", "st65536", "ifID == 0 guard"},
+		{"invalid_base_name", "ge-0/0/0.0", "base", false},
+		{"unit_out_of_range", "st0.65535", "unit", true},
+		{"unit_unparseable", "st0.abc", "unit", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tree := &ConfigTree{}
@@ -166,16 +176,16 @@ func TestPlaintextWarningSkipsInvalidBindInterface(t *testing.T) {
 			if err := tree.SetPath(path); err != nil {
 				t.Fatalf("setpath %q: %v", line, err)
 			}
-			// Premise check: assert this input really does reach the site it is
-			// here to exercise, so a future change to either predicate cannot
-			// quietly turn this subtest back into a duplicate of its sibling.
+			// Premise check: assert this input really is invalid in the half it
+			// is here to exercise, so a future change to either predicate cannot
+			// quietly turn this subtest into a duplicate of its sibling.
 			base, _, _ := strings.Cut(tc.bindIface, ".")
-			_, ifID := XFRMIfNameAndID(tc.bindIface)
-			if tc.rejectedBy == "ifID == 0 guard" && !IsSecureTunnelIfName(base) {
-				t.Fatalf("premise broken: %q no longer passes IsSecureTunnelIfName, so it "+
-					"cannot bind the ifID == 0 guard", tc.bindIface)
+			if got := IsSecureTunnelIfName(base); got != tc.basePredicate {
+				t.Fatalf("premise broken: IsSecureTunnelIfName(%q) = %v, want %v — "+
+					"%q no longer has an invalid %s half", base, got, tc.basePredicate,
+					tc.bindIface, tc.invalidHalf)
 			}
-			if ifID != 0 {
+			if _, ifID := XFRMIfNameAndID(tc.bindIface); ifID != 0 {
 				t.Fatalf("premise broken: %q now yields if_id %d, so it no longer "+
 					"exercises a bind-interface that materializes no device", tc.bindIface, ifID)
 			}
@@ -183,8 +193,8 @@ func TestPlaintextWarningSkipsInvalidBindInterface(t *testing.T) {
 			// the advisory directly against the AST rather than through
 			// CompileConfig.
 			if got := warnSecureTunnelPlaintextUnadjudicatedAST(tree.Children); len(got) != 0 {
-				t.Errorf("advisory fired for a bind-interface that creates no xfrm device "+
-					"(rejected by the %s): %v", tc.rejectedBy, got)
+				t.Errorf("advisory fired for a bind-interface with an invalid %s half, "+
+					"which creates no xfrm device: %v", tc.invalidHalf, got)
 			}
 		})
 	}
