@@ -81210,3 +81210,19 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
   userspace-dp/src/afxdp/forwarding/mod.rs (comment corrections only),
   _Log.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6722 final gate — bind the SHARPEST form of the R1 defect: a Go
+  answer no row on the ifindex CARRIES. `populate_interfaces` honours
+  `egress_zone` only where some row literally names that zone, so an
+  uncorroborated Go answer silently becomes the 0 sentinel with nothing logged on
+  either side. Measured at `451c0b8bc` on the lenient path (strict rejects the
+  doubly-claimed interface): bare `security-zone aaa interfaces ge-0/0/1` plus
+  dotted `security-zone zzz interfaces ge-0/0/1.100` gave
+  `authored[ge-0/0/1.100]="zzz"` against `derived[...]="aaa"`, so the row carried
+  `Zone="aaa"` and `EgressZone="zzz"` — uncorroborated, resolves 0, where
+  origin/master resolved `aaa`. The fan-down closes it; the new cell asserts the
+  corroboration property per ifindex (every nonempty EgressZone is named by some
+  row on that ifindex) and reds on the lone fan-down revert.
+- **File(s)**: pkg/dataplane/userspace/egress_zone_master_parity_6722_test.go,
+  _Log.md

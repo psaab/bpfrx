@@ -24,7 +24,9 @@ import (
 // FAIL-ON-REVERT, measured with each hunk reverted ALONE:
 //
 //	drop the bare-ref fan-down in authoredZoneRefs (zones.go)
-//	  -> RED: TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722, all 3 cells
+//	  -> RED: TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722, all 3 cells;
+//	     TestBareRefFanDownAgreesWithTheDerivedMap_6722;
+//	     TestGoNeverNamesAZoneNoRowOnTheIfindexCarries_6722
 //	  -> GREEN: TestOneOwnersAgreeingUnitsStillResolveOneZone_6722 (dotted refs)
 //	drop the egressOneOwnerUnitsAgree arm (interfaces.go, rule 1)
 //	  -> RED: TestOneOwnersAgreeingUnitsStillResolveOneZone_6722/agreeing
@@ -307,4 +309,92 @@ func TestBareRefFanDownAgreesWithTheDerivedMap_6722(t *testing.T) {
 			"only the two literal refs and cannot see a disagreement about a "+
 			"derived one", fannedDown, refs)
 	}
+}
+
+// S: the sharpest form of the same defect — the Go builder naming a zone NO row
+// on the ifindex carries, which the Rust corroboration then refuses.
+//
+// `populate_interfaces` (userspace-dp/src/afxdp/forwarding_build/interfaces.rs)
+// honours `egress_zone` only when some row on that ifindex literally carries
+// that zone NAME. That check exists to stop a drifted or hostile snapshot
+// conjuring a zone; it also means a Go-side answer the ROWS do not corroborate
+// silently becomes the 0 sentinel. So an `EgressZone` that no row's `Zone`
+// names is not a cosmetic disagreement — it is a blackhole with no error
+// anywhere.
+//
+// A bare reference in one zone and a dotted reference to one of that
+// interface's VLAN units in ANOTHER produced exactly that at 451c0b8bc. The
+// derived map's first-write-wins over SORTED zone names hands the unit row
+// `aaa` (the bare reference's zone, written by its fan-down); the authored map
+// had no fan-down, so it kept only the literal dotted `zzz`:
+//
+//	451c0b8bc   authored[ge-0/0/1.100]="zzz"  derived[...]="aaa"
+//	            row ge-0/0/1.100  Zone="aaa"  EgressZone="zzz"  -> UNCORROBORATED
+//	origin/master                              egress zone "aaa"
+//	here        both maps "aaa"; EgressZone == Zone; corroborated
+//
+// Measured on the LENIENT path — strict CompileConfig rejects the doubly-claimed
+// interface with a multi-zone error — so this is the tolerant load / HA
+// config-sync shape (#1960 no-brick), which is where a grandfathered config
+// arrives.
+//
+// FAIL-ON-REVERT: drop the fan-down in authoredZoneRefs and this goes RED on the
+// EgressZone/Zone comparison, not merely on the map comparison.
+func TestGoNeverNamesAZoneNoRowOnTheIfindexCarries_6722(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/1 vlan-tagging",
+		"set interfaces ge-0/0/1 unit 100 vlan-id 100",
+		"set interfaces ge-0/0/1 unit 100 family inet address 10.0.100.1/24",
+		"set security zones security-zone aaa interfaces ge-0/0/1",
+		"set security zones security-zone zzz interfaces ge-0/0/1.100",
+	}
+	cfg := compileWithStubbedLinks6722(t, lines,
+		map[string]int{"ge-0-0-1": 24, "ge-0-0-1.100": 25},
+		map[string]string{"ge-0-0-1": "02:bf:72:01:00:01", "ge-0-0-1.100": "02:bf:72:01:00:01"},
+		true)
+	snaps := buildInterfaceSnapshots(cfg)
+
+	// Precondition: the config really does claim ge-0/0/1.100 from two zones, so
+	// this cell is exercising the divergence and not a trivially-agreeing map.
+	if len(cfg.Security.Zones) != 2 {
+		t.Fatalf("precondition: expected 2 zones, got %d", len(cfg.Security.Zones))
+	}
+
+	// The corroboration property, stated per ifindex: every nonempty EgressZone
+	// must be named by SOME row on that ifindex, or the helper drops it to 0.
+	carried := map[int]map[string]bool{}
+	for _, s := range snaps {
+		if s.Ifindex <= 0 {
+			continue
+		}
+		if carried[s.Ifindex] == nil {
+			carried[s.Ifindex] = map[string]bool{}
+		}
+		carried[s.Ifindex][s.Zone] = true
+	}
+	checked := 0
+	for _, s := range snaps {
+		if s.Ifindex <= 0 || s.EgressZone == "" {
+			continue
+		}
+		checked++
+		if !carried[s.Ifindex][s.EgressZone] {
+			t.Errorf("row %q: EgressZone=%q but no row on ifindex %d carries that "+
+				"zone (rows carry %v). populate_interfaces refuses an "+
+				"uncorroborated claim, so this ifindex resolves the 0 sentinel and "+
+				"every transit flow out of it falls to the default policy — with "+
+				"nothing logged anywhere, because the Go side believes it answered",
+				s.Name, s.EgressZone, s.Ifindex, carried[s.Ifindex])
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("precondition: no row carries a nonempty EgressZone, so the " +
+			"corroboration loop asserted nothing")
+	}
+	assertNoEgressZoneLostVsMaster6722(t, snaps, 25,
+		"the VLAN unit's zone is whatever the derived map gave its row; the "+
+			"authored map must not name a different one")
+	assertEgressZone6722(t, snaps, 25, "aaa",
+		"first-write-wins over sorted zone names put `aaa` on the row, and the "+
+			"egress answer must be the zone the row carries")
 }
