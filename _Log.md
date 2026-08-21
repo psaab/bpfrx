@@ -1,3 +1,376 @@
+## 2026-08-20 — #6735 r6: close the flat-set (`set` CLI) escape of the packed-tail gate
+
+- **Timestamp**: 2026-08-20 (fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Fix a live commit-path defect the r5 gate left open, plus the
+  operator-facing echo that made its rejects unreadable from the CLI.
+- **File(s)**: `pkg/config/compiler_security_zones.go`,
+  `pkg/config/compiler_validate_strict_zones.go`,
+  `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `docs/config-schema.md`, `pkg/config/README.md`
+
+  **The escape.** The statement this PR is built around still committed from the
+  ordinary operator CLI:
+
+  ```
+  set security zones security-zone Z interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]
+  ```
+
+  Measured firsthand at 2269dd2d1 via `ParseSetCommand` + `tree.SetPath`:
+  detector `found=false`, compiled membership `[ge-0/0/0.0]`, `CompileConfig`
+  ACCEPT. `ge-0/0/1.0` kept `Zone == ""`, was never AF_XDP-bound, and no policy
+  naming Z applied to it.
+
+  Mechanism: `schema_security.go` declares `host-inbound-traffic` as a named
+  child of the interface-name wildcard, so when it is the token immediately
+  after the FIRST bracket token, `SetPath` DESCENDS it rather than collapsing
+  the tail onto one leaf. The trailing member parks a level deeper, under the
+  keyword node — where `zoneInterfaceMembers` and `zoneInterfaceMemberPackedTail`
+  both skipped it by name. They agreed, which is why it was silent. The PR's own
+  flat-set test used the keyword in position THREE, where the tail does collapse
+  and the pre-existing Keys arm fires; the one flat-set arrangement tested was
+  the one that already passed.
+
+  Second escape, same root and a strict REGRESSION against `origin/master`:
+  `zoneInterfaceMemberPackedTail` returned as soon as a keyword sat on a node's
+  Keys even with an EMPTY Keys tail, so that node's children were never walked.
+
+  ```
+  set ... interfaces ge-0/0/0.0
+  set ... interfaces [ host-inbound-traffic ge-0/0/1.0 ]
+  ```
+
+  head: ACCEPT, `members=[ge-0/0/0.0]`, zero warnings. `origin/master`: REJECT,
+  loudly — master compiled `host-inbound-traffic` as a phantom member and the
+  zone-interface-DEFINED gate caught it. #6525's truncation removed the phantom
+  and with it the only thing making the loss visible.
+
+  **The fix.** `zoneInterfaceHostInboundStrayTokens` asks what a
+  `host-inbound-traffic` node carries that CANNOT be body content, and both arms
+  of the detector consult it: the Keys arm when its tail is empty, the child arm
+  instead of skipping keyword children outright. A token is non-member when it is
+  legitimate body content (`system-services` / `protocols`, DERIVED from
+  `hostInboundSchemaChildren()` so the grammar and the gate cannot drift — a
+  divergence is always a bug in one direction or the other) or one of
+  `apply-groups` / `apply-groups-except` / `apply-macro`.
+
+  The `apply-*` exclusion is not defensive padding. `ExpandGroups` removes only
+  `apply-groups`; `apply-groups-except` and `apply-macro` survive expansion as
+  live nodes and reach the gate verbatim. Measured before the exclusion existed:
+  `host-inbound-traffic { apply-groups-except G; system-services ping; }` was
+  hard-rejected at commit — a false reject on a legitimate config, and the same
+  three keywords `nonInterfaceIfKeyword` already carves out for the same reason.
+
+  `zoneInterfaceStanzaTokens` now renders each child's whole SUBTREE. `set`
+  builds this stanza by descent, so joining a child's own Keys showed the
+  one-token echo `(ge-0/0/0.0)` for a message that then discussed a keyword and a
+  trailing token appearing nowhere in it — every flat-set-authored reject, i.e.
+  every reject an operator hits from the CLI.
+
+  **Differential sweep, 1020 cells.** Every token string of length 1..4 over
+  {ge-0/0/0.0, ge-0/0/1.0, ge-0/0/2.0, host-inbound-traffic} x 3 ingests
+  (flat-set bracket, hierarchical compact, hierarchical block), run at
+  `origin/master` and at this head, comparing accept/reject AND compiled
+  membership as a MULTISET (a set comparison hides a dropped duplicate).
+
+  | base -> head | cells |
+  |---|---|
+  | REJECT -> REJECT | 302 |
+  | ACCEPT-exact -> ACCEPT-exact | 243 |
+  | ACCEPT-lossy -> REJECT | 231 |
+  | ACCEPT-lossy -> ACCEPT-exact (#6525/#5248 fix) | 159 |
+  | REJECT -> ACCEPT-exact | 75 |
+  | ACCEPT-exact -> REJECT | 10 |
+  | **new silent loss** | **0** |
+  | silent loss surviving at head | **0** (base: 390) |
+
+  The 10 are stanzas of repeated `host-inbound-traffic` with at most one
+  interface name — they name no interface a correct reading would have kept, so
+  no legitimate config newly fails to commit. Floor caveat unchanged:
+  `zoneInterfaceBodyKeywords` is a singleton today; a second entry needs the
+  sweep re-run.
+
+  **Tolerant path.** All three newly-rejected `set` shapes still LOAD via
+  `CompileConfigLenient` with the packed-tail warning and unchanged membership —
+  no brick (#1960).
+
+  **Mutation matrix.** Each a single production edit applied by `Edit`, `go
+  build` + `go vet` clean, restored by `Edit`; every failure an ASSERTION, not a
+  build break.
+
+  | # | mutation | failing assertion |
+  |---|---|---|
+  | N1 | child arm reverts to `continue` on a keyword child | `detector missed the set-authored keyword CHILD node` + the echo test + 3 stray-table rows |
+  | N2 | Keys arm reverts to `return k, tail, len(tail) > 0` | `detector missed a keyword node whose Keys tail is EMPTY but whose CHILDREN carry a dropped member` + `keyword first in the bracket list` |
+  | N3 | echo reverts to `child.KeyPath()` | `stanza echo = "ge-0/0/0.0", want "ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0"` |
+  | N4 | body-keyword set drops `protocols` (schema drift) | `schema declares "protocols" ... but zoneInterfaceHostInboundBodyKeywords does not` + a legitimate multi-keyword body REJECTED |
+  | N5 | `apply-*` exclusion removed | 3 accept rows RED: `REJECTED a legitimate host-inbound body: ... followed by apply-groups-except G` |
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./...` rc=0 (62 packages ok, zero FAIL). No Rust, no
+  compiled artifact, no cluster/deploy tooling touched — `pkg/config` Go only.
+
+## 2026-08-05 — #6735 r5: measure which added assertions actually BIND
+
+- **Timestamp**: 2026-08-05 (fold/6735-r3 -> fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Gate at ada155b42 = MERGE-NEEDS-MINOR, no runtime finding. The r4
+  entry claimed three mutations gave "every new assertion" a distinguishing one.
+  That was FALSE, and this round measures the truth instead of restating it.
+
+  **Definition used, so the claim stays checkable.** A mutation DISTINGUISHES an
+  assertion when, with that single production edit applied, the failure set
+  across the whole `pkg/config` package is that assertion ALONE. A mutation that
+  also reds assertions predating it proves those older assertions still work; it
+  proves nothing about the new one. Every row below is a measured failure set,
+  not an argument.
+
+  | mutation (production edit) | failing | distinguishes |
+  |---|---|---|
+  | M5 gate ignores the tail (`len(tail) > 0` -> `true`) | 10 | NOTHING — reds pre-branch `TestZoneInterfaces6525EmptyStanzaRejected` + 2 subtests |
+  | M6 override fans to no member | 35 | NOTHING — reds #6391 x9, #5248, #3362, #3703, #4544, #4818, #3226, #4455 |
+  | M7 packed-tail gate strict on the tolerant path | 1 | `…6735LenientPathWarnsInsteadOfRejecting` |
+  | A5 gate fires when the keyword is not FIRST (`i > 0 \|\| len(tail) > 0`) | 1 | `…6735PackedTail…/still_compiles/keyword last, empty body` |
+  | ORD swap the two gate invocations | 1 | `…6735OverlapShapeReportsThePackedTailGate/overlap shape…` |
+  | A6 override compiles to a keyed but EMPTY value | 26 -> 30 | NOTHING (see below) |
+
+  So THREE assertions this branch adds are independently binding, each with a
+  named edit that reds it and nothing else: the tolerant-path warning, the
+  keyword-last accept row, and the gate ORDER. M5 and M6 — two of the three r4
+  cited — distinguish nothing; A5 replaces M5 as the citation for the accept
+  row, and M6 has no replacement because none exists.
+
+  **The wantHIB assertion corroborates, it does not bind, and that is now stated
+  where it lives.** Codex measured that asserting override KEYS accepts an
+  override whose value is nil or empty — the failure DEFAULT of that path, so it
+  was green for exactly the regression it names. Fixed: the accept table now
+  asserts member -> admission TOKENS (`hibTokens6735`), and one row carries a
+  multi-token body (`[ ssh ping ]` + `protocols ospf`) across two bracket
+  members, so a fan that keeps only the first service, and a clone that shares a
+  backing store, both fail it. Proof it closed: the empty-value edit reds 26
+  assertions with the key-only form and 30 with the token form, the +4 being
+  exactly the two body-carrying accept rows. Proof it still does not BIND: all
+  26 are pre-branch (#6391/#5248/#3362/#3703/#4544/#4818/#3226/#4455 already pin
+  override CONTENT for these shapes). The scope note is in the struct comment.
+
+  **A comment the tests disprove — third one this PR.** The packed-tail gate's
+  doc said "a keyword with nothing after it, or a body-only block, leaves this
+  gate silent". A body-only block is NOT silent by virtue of being body-only:
+  `interfaces { host-inbound-traffic system-services ssh; }` carries
+  `system-services ssh` on the keyword's OWN Keys, so it is a tail and the gate
+  FIRES. Only the NESTED-block spelling
+  `interfaces { host-inbound-traffic { system-services ssh; } }` stays silent.
+  The comment now names nested-block explicitly, and the same-Keys spelling is a
+  new REJECT row so the corrected text is pinned rather than merely asserted.
+
+  Also noted in the overlap test that it observes rendered REASON TEXT, not
+  helper identity — an overbroad packed-tail gate rendering the non-empty reason
+  would pass it. That is deliberate (the operator-visible message is the
+  contract) but should not be mistaken for a structural pin.
+
+- **Tests**: `go build ./...` = 0 and `go vet ./...` = 0 in every mutated state
+  and restored; each RED above is an ASSERTION failure, never a build break.
+  Full unsandboxed `go test ./...` exit code recorded in the commit message.
+- **File(s)**: `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `pkg/config/compiler_validate_strict_zones.go`, `_Log.md`
+
+## 2026-08-05 — #6735 r4: bind the accept table's OVERRIDE, not just its membership
+
+- **Timestamp**: 2026-08-05 (fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Gate at a12967cbe = MERGE-NEEDS-MINOR; the runtime sections all
+  passed. Remaining question was which added assertions have a distinguishing
+  mutation, and what the tests still ACCEPT.
+
+  Audited my own additions and found one real gap. The positive-control table
+  asserted compiled MEMBERSHIP only, while two of its cases carry a
+  `host-inbound-traffic` body — and those are precisely the spellings the reject
+  message tells the operator to migrate INTO. So the table would have stayed
+  green if the block-spelling override were silently dropped, i.e. it accepted
+  the exact regression that would make the reject message's advice harmful.
+  Each accept case now also asserts the compiled per-interface override
+  (`wantHIB`), with nil for the packed `keyword last, empty body` case, which is
+  the documented fail-CLOSED #6525 residual rather than an oversight.
+
+  Three further mutations added: a tail-insensitive gate (over-rejects the
+  lossless keyword-last shape), an override that fans to no member (the new
+  wantHIB), and a packed-tail gate made strict on the tolerant path (the #1960
+  no-brick warning).
+
+  CORRECTION (r5, entry above): this paragraph originally claimed those three
+  gave "every new assertion" a distinguishing mutation. That was false. Measured
+  per-mutation failure sets show only the third distinguishes anything; the
+  other two red assertions that predate them. The r5 entry carries the table.
+
+- **Tests**: mutation coverage for the whole #6735 set, each RED from an
+  ASSERTION with `go build` = 0 and `go vet` = 0, GREEN on restore —
+  M1 detector-off, M2 no-recursion, M3 members-nil, M4 filter-never-matches,
+  M5 tail-insensitive, M6 override-fans-to-nothing, M7 lenient->strict, plus the
+  gate-block SWAP for the ordering assertion. `…TruncatorLosesTheTrailingMember`
+  and `…FlatSetBracketNestsRatherThanFanning` are additionally bound by the two
+  reader-half mutations (first-key-only / no-recursion).
+- **File(s)**: `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `_Log.md`
+
+## 2026-08-05 — #6735 r3: bind the gate ORDER, and fix two comments the tests disprove
+
+- **Timestamp**: 2026-08-05 (fold/6735-r2 -> fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Gate at 5b3d7e07b found no runtime defect; two non-runtime items.
+
+  **(1) The ordering claim was unbound.** r2 argued the packed-tail gate must
+  run BEFORE the non-empty gate, because they overlap on
+  `interfaces host-inbound-traffic ge-0/0/1.0;` and "names no interface" would
+  misdirect. Nothing tested WHICH gate rejected it — both return non-nil, so a
+  swap kept every test green while the operator silently got the worse message.
+  Worse, the packed-tail message happens to render the same zone / keyword /
+  dropped-token that the r2 assertion checked, because the non-empty message
+  renders those tokens too via `zoneInterfaceStanzaTokens` — so even the
+  three-token assertion could not separate the gates.
+
+  Fixed by giving each gate a named reason constant
+  (`zoneInterfacePackedTailReason`, `zoneInterfacesNonEmptyReason`) used
+  verbatim in its own message, so the rendered text is unchanged but a test can
+  assert gate IDENTITY rather than prose a reword would unbind.
+  `TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate` asserts BOTH
+  directions: the overlap shape must carry the packed-tail reason and NOT the
+  non-empty one, and a genuinely empty stanza must carry the non-empty reason
+  and NOT the packed-tail one. The second half is what stops a "fix" that makes
+  the packed-tail gate swallow everything.
+
+  **(2) Two comments contradicted the shape this PR's own tests pin.** Both said
+  SetPath "stores each member below it", implying a flat fan-out.
+  `TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning` proves otherwise:
+  a flat bracket list NESTS. The load-bearing claim in both places is narrower —
+  the STANZA node's Keys stay exactly `["interfaces"]` — so both now say that,
+  and explicitly disclaim any statement about how members are arranged below it.
+
+  Also repaired structure I broke in r2: the reorder left the #6525 non-empty
+  comment block stranded above the #6735 comment with its own code far below.
+  Each gate's comment now sits with its own code.
+
+- **Tests**: `TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate` (2
+  subtests, 3 cases). Proven by SWAPPING the two gate invocations: RED on the
+  reason assertion with `go build` = 0 and `go vet` = 0 (both orders compile, so
+  this is an assertion red, not a build break), GREEN on restore.
+- **File(s)**: `pkg/config/compiler_validate_strict_zones.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`, `_Log.md`
+
+## 2026-08-05 — #6735 r2: reject the ambiguous zone-interface packed tail
+
+- **Timestamp**: 2026-08-05 (fold/6735-r2, PR #6735)
+- **Action**: Fold of the MERGE-NEEDS-MAJOR gate on #6735.
+
+  **B1 (RUNTIME).** `zoneInterfaceKeysBeforeBody` truncates a member's Keys at
+  the first body keyword and discards the rest. The lexer strips brackets
+  (#2419), so `interfaces [ a host-inbound-traffic b ]` and the packed body
+  `interfaces a host-inbound-traffic system-services ssh` reach the compiler
+  byte-identical — and their readings DISAGREE about membership. Truncation
+  silently drops either a valid member (`b`, left with Zone == "", never
+  dataplane-bound, no policy naming the zone applies to it) or the entire
+  override. The #6525 non-empty belt cannot see the first: one member survived.
+
+  Resolved by REFUSING, not guessing: `validateZoneInterfacePackedTailStrict`
+  hard-rejects at commit and warns on the tolerant load / peer-sync path (#1960
+  no-brick), naming the zone, the keyword, and the exact tokens that would have
+  been dropped, and pointing at the unambiguous block spelling. A keyword with
+  NOTHING after it is accepted (truncation is lossless there — #4191
+  over-rejection class). Deliberate consequence: the packed-body spelling used
+  to commit while silently discarding an authored host-inbound directive; that
+  is now loud, which is the point rather than collateral. Gate runs BEFORE the
+  non-empty gate so the one overlapping shape (`interfaces
+  host-inbound-traffic ge-0/0/1.0;`) gets the accurate message.
+
+  **REACHABILITY CORRECTION.** #6525 documented this defect class as
+  hierarchical-ingest only, "NOT reachable from the `set` CLI". That is true of
+  the compact-leaf shape but FALSE of this one. Measured: `set security zones
+  security-zone Z interfaces [ ge-0/0/0.0 ge-0/0/1.0 host-inbound-traffic
+  ge-0/0/2.0 ]` builds `interfaces -> ge-0/0/0.0 -> leaf
+  Keys=[ge-0/0/1.0, host-inbound-traffic, ge-0/0/2.0]`, and membership compiles
+  to `[ge-0/0/0.0 ge-0/0/1.0]` — `ge-0/0/2.0` silently dropped from the ordinary
+  operator CLI. The header comment is corrected and the shape is pinned.
+
+  **B2 (test binding).** Verified each claim rather than accepting it. The
+  headline claim was WRONG: reverting `zoneInterfaceMemberNodes` to
+  `prop.Children` fails NINE tests (build+vet clean), including the 4544
+  host-inbound tests and TestNat66SourceRules, which the gate said still pass.
+  Two claims were RIGHT and are fixed: `EmptyStanzaRejected` had no positive
+  control (a members reader returning nil always makes every stanza look empty —
+  measured, it passed under that mutation), and `FlatSetNeverReachesCompactLeaf`
+  asserted inside two filtered loops so it passed vacuously if no `interfaces`
+  stanza was produced.
+
+  **Doc fix.** "one child per member" was wrong for a flat bracket list, in both
+  the code comment and docs/config-schema.md. Empirically the shape is
+  `interfaces -> a(container) -> leaf Keys=[b,c]`. Corrected and pinned.
+
+- **Tests**: new `TestZoneInterfaces6735PackedTailRejectedAndPositiveControl`
+  (reject + accept tables in ONE function so neither can drift),
+  `TestZoneInterfaces6735FlatSetReachesThePackedTail`,
+  `TestZoneInterfaces6735TruncatorLosesTheTrailingMember`,
+  `TestZoneInterfaces6735LenientPathWarnsInsteadOfRejecting`,
+  `TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning`; positive control
+  + non-vacuity counter added to the two #6525 tests. Four mutations, each RED
+  from an ASSERTION with `go build` and `go vet` CLEAN, GREEN on restore.
+- **File(s)**: `pkg/config/compiler_security_zones.go`,
+  `pkg/config/compiler_validate_strict_zones.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-01 — #6525: security-zone `interfaces` compact-leaf compiled ZERO interfaces
+
+- **Timestamp**: 2026-08-01 (fix/6525-zone-compact-leaf)
+- **Action**: `compileZones` iterated `prop.Children` for the `interfaces`
+  stanza and never read `prop` itself, so the hierarchical COMPACT-LEAF spelling
+  `security-zone untrust { interfaces ge-0/0/1.0; }` — member name on the
+  stanza's own `Keys[1]`, nil `Children` — ran the loop body ZERO times and the
+  zone compiled with NO interfaces, cleanly and without a warning. Both strict
+  zone gates (`validateZoneInterfaceMembershipStrict`,
+  `validateZoneInterfaceDefinedStrict`) then passed VACUOUSLY over the empty
+  slice, and downstream `UserspaceBoundLinuxInterfaces` skipped the interface
+  (`Zone == ""`) so it was never AF_XDP-bound and no policy naming the zone
+  applied to its traffic. The with-body variant was worse than a drop: the loop
+  ran once with the `host-inbound-traffic` BODY node mistaken for a member, so
+  the real member was dropped AND its body keywords compiled as phantom
+  interface names. Fixed by NORMALIZING the compact shape onto the block shape
+  (`zoneInterfaceMemberNodes` synthesizes one member node from `prop.Keys[1:]`
+  plus `prop.Children` as its body) so membership, the #5248 bracket flatten and
+  the #6391 Keys-scoped host-inbound override stay in ONE read path — a second
+  derivation is how this class arises. `zoneInterfaceMembers` now also truncates
+  a member's Keys at a body keyword and stops recursing there, which closes the
+  drop→invention trade for the hierarchical PACKED spelling (`interfaces a
+  host-inbound-traffic system-services ssh;`) in the block form too, where it
+  was already compiling three phantom members. Added the fail-closed belt
+  `validateZoneInterfacesNonEmptyStrict`: an `interfaces` stanza that carries
+  content yet contributes zero members is rejected on the strict
+  commit/commit-check path and warned on the tolerant load/peer-sync path
+  (`lenientZoneInterfacesNonEmpty`, #1960 no-brick). It deliberately does NOT
+  fire on a stanza carrying nothing at all — `delete ... interfaces <if>` of the
+  last member leaves the empty container behind (`deletePath` does not prune
+  it), so a blanket check would make an ordinary edit uncommittable against an
+  invisibly-rendered stanza (#4191 over-rejection class); a mutation confirmed
+  that. Four pre-existing tests were relying on the silent drop: their configs
+  used the compact-leaf spelling and never defined the interfaces, which only
+  compiled because the members never reached the defined gate — they now carry
+  the missing `interfaces` definitions.
+- **Validation**: `go build ./...` + `go vet ./...` clean; full Go suite green
+  (59 packages, exit 0). Eight mutations, each build+vet CLEAN with a real
+  assertion failure: normalization reverted to `prop.Children`; the issue's own
+  proposed fix (`prop.Keys` not sliced) which compiles a member named
+  `interfaces`; body-keyword truncation removed; body-on-Keys no longer stopping
+  child recursion; the #6391 override scope widened to `zoneInterfaceMembers`
+  (six pre-existing #6391 sibling-leak guards fired); the non-empty gate call
+  removed; the over-rejection carve-out removed; and an edge mutation collapsing
+  BOTH sides of the differential, which trips the count floor rather than
+  passing vacuously.
+- **File(s)**: pkg/config/compiler_security_zones.go,
+  pkg/config/compiler_validate_strict_zones.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_cluster_zone.go,
+  pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go,
+  pkg/config/host_inbound_dup_block_4544_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/README.md,
+  docs/config-schema.md, _Log.md
 ## 2026-08-13 — #2114 / PR #6743 round 2b: seven surviving mutation sites, plus a seventh AST-escape class
 
 - **Timestamp**: 2026-08-13 (fix/2114-dp-accessor, PR #6743)
