@@ -181,11 +181,18 @@ type SessionDeltaInfo struct {
 	Nat64       bool   `json:"nat64,omitempty"`
 	Nat64SnatV4 string `json:"nat64_snat_v4,omitempty"`
 	// #5212: the ORIGINATING node's stable RT_FLOW session id, decoded from the
-	// trailing u64 of the binary open frame (after the #4565 snat_v4). Stamped
-	// onto the synced SessionValue{,V6}.RTFlowSessionID by daemon_ha_userspace.go
-	// so the cluster sync wire and the peer helper carry it, letting a
-	// peer-synced session adopt the originating node's id (SESSION_CREATE/CLOSE
-	// correlate across HA nodes). Absent on an old helper => 0, the standby
-	// allocs a fresh local id (pre-#5212 behavior, rolling-upgrade safe).
+	// trailing u64 of the binary open frame (after the #4565 snat_v4) AND —
+	// since #6312 — from the JSON RPC-fallback delta, whose Rust producer
+	// declares `#[serde(rename = "rt_flow_session_id")]` on
+	// SessionDeltaInfo.rt_flow_session_id. The two spellings are held in
+	// agreement by TestSessionDeltaRTFlowSessionIDWireKeyLockstepWithRust6312;
+	// before #6312 the JSON leg carried no id at all, so a session recovered
+	// through the drain_session_deltas polling fallback or the owner-RG resync
+	// export lost its cross-node correlation. Stamped onto the synced
+	// SessionValue{,V6}.RTFlowSessionID by daemon_ha_userspace.go so the cluster
+	// sync wire and the peer helper carry it, letting a peer-synced session adopt
+	// the originating node's id (SESSION_CREATE/CLOSE correlate across HA nodes).
+	// Absent on an old helper => 0, the standby allocs a fresh local id
+	// (pre-#5212 behavior, rolling-upgrade safe).
 	RTFlowSessionID uint64 `json:"rt_flow_session_id,omitempty"`
 }

@@ -104,6 +104,118 @@ pub(super) fn purge_queued_flows_for_closed_deltas(
     }
 }
 
+/// Convert one internal `SessionDelta` into the JSON `SessionDeltaInfo` the
+/// control-plane RPC legs carry: the `drain_session_deltas` polling fallback
+/// used while the binary event stream is down, and the owner-RG resync export.
+///
+/// Split out of `flush_session_deltas` so the field-by-field wire mapping is
+/// reachable on its own — that function needs live BPF map fds, per-binding
+/// shared state and an event-stream handle, so nothing could test what this
+/// leg actually puts on the wire (#6312).
+pub(in crate::afxdp) fn session_delta_info(
+    ident: &BindingIdentity,
+    delta: &SessionDelta,
+    zone_id_to_name: &FastMap<u16, String>,
+) -> SessionDeltaInfo {
+    // #919/#922: emit both the resolved zone NAMES (legacy field,
+    // empty when the ID is unknown) and the u16 IDs. New daemons
+    // prefer the IDs; older daemons read the names. The previous
+    // code wrote `metadata.ingress_zone.to_string()` here, which
+    // produced "1"/"2" string literals that broke `zoneIDs[name]`
+    // on the Go side.
+    let ingress_name = zone_id_to_name
+        .get(&delta.metadata.ingress_zone)
+        .cloned()
+        .unwrap_or_default();
+    let egress_name = zone_id_to_name
+        .get(&delta.metadata.egress_zone)
+        .cloned()
+        .unwrap_or_default();
+    SessionDeltaInfo {
+        timestamp: Utc::now(),
+        slot: ident.slot,
+        queue_id: ident.queue_id,
+        worker_id: ident.worker_id,
+        interface: ident.interface.to_string(),
+        ifindex: ident.ifindex,
+        event: session_delta_event(delta.kind).to_string(),
+        addr_family: delta.key.addr_family,
+        protocol: delta.key.protocol,
+        src_ip: delta.key.src_ip.to_string(),
+        dst_ip: delta.key.dst_ip.to_string(),
+        src_port: delta.key.src_port,
+        dst_port: delta.key.dst_port,
+        ingress_zone: ingress_name,
+        egress_zone: egress_name,
+        ingress_zone_id: delta.metadata.ingress_zone,
+        egress_zone_id: delta.metadata.egress_zone,
+        owner_rg_id: delta.metadata.owner_rg_id,
+        disposition: match delta.decision.resolution.disposition {
+            ForwardingDisposition::ForwardCandidate => "forward_candidate",
+            ForwardingDisposition::LocalDelivery => "local_delivery",
+            ForwardingDisposition::NoRoute => "no_route",
+            ForwardingDisposition::MissingNeighbor => "missing_neighbor",
+            ForwardingDisposition::PolicyDenied => "policy_denied",
+            ForwardingDisposition::FabricRedirect => "fabric_redirect",
+            ForwardingDisposition::HAInactive => "ha_inactive",
+            ForwardingDisposition::DiscardRoute => "discard_route",
+            ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
+        }
+        .to_string(),
+        origin: delta.origin.as_str().to_string(),
+        egress_ifindex: delta.decision.resolution.egress_ifindex,
+        tx_ifindex: delta.decision.resolution.tx_ifindex,
+        tunnel_endpoint_id: delta.decision.resolution.tunnel_endpoint_id,
+        tx_vlan_id: delta.decision.resolution.tx_vlan_id,
+        next_hop: delta
+            .decision
+            .resolution
+            .next_hop
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
+        neighbor_mac: delta
+            .decision
+            .resolution
+            .neighbor_mac
+            .map(format_mac)
+            .unwrap_or_default(),
+        src_mac: delta
+            .decision
+            .resolution
+            .src_mac
+            .map(format_mac)
+            .unwrap_or_default(),
+        nat_src_ip: delta
+            .decision
+            .nat
+            .rewrite_src
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
+        nat_dst_ip: delta
+            .decision
+            .nat
+            .rewrite_dst
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
+        nat_src_port: delta.decision.nat.rewrite_src_port.unwrap_or(0),
+        nat_dst_port: delta.decision.nat.rewrite_dst_port.unwrap_or(0),
+        fabric_redirect: delta.fabric_redirect_sync
+            || delta.decision.resolution.disposition == ForwardingDisposition::FabricRedirect,
+        fabric_ingress: delta.metadata.fabric_ingress,
+        // #2785: carry the per-policy log selection on the JSON fallback
+        // delta so the synced session logs identically after failover.
+        log_session_init: delta.metadata.log_session_init,
+        log_session_close: delta.metadata.log_session_close,
+        // #6312: carry the ORIGINATING node's stable RT_FLOW session id on the
+        // JSON leg too. `SessionDelta.session_id` is the same value the binary
+        // open frame's trailing u64 carries (#5212); before this the JSON leg
+        // dropped it and a session recovered through a full resync lost its
+        // cross-node correlation. 0 (a synthesized delta with no backing entry)
+        // keeps the legacy "peer allocates a fresh local id" behaviour.
+        rt_flow_session_id: delta.session_id,
+    }
+}
+
 // #2669: `live` is `Option` because a drain cycle can coincide with an
 // empty `bindings` slice (XSK sockets admin-down / unconfigured during a
 // reload or transaction while the session table is still aging entries
@@ -183,96 +295,7 @@ pub(super) fn flush_session_deltas(
     // worker-loop wait stays ~1 budget regardless of the owned-session count K.
     let mut event_stream_out_of_sync = *worker_lossless_wedged;
     for delta in deltas {
-        // #919/#922: emit both the resolved zone NAMES (legacy field,
-        // empty when the ID is unknown) and the u16 IDs. New daemons
-        // prefer the IDs; older daemons read the names. The previous
-        // code wrote `metadata.ingress_zone.to_string()` here, which
-        // produced "1"/"2" string literals that broke `zoneIDs[name]`
-        // on the Go side.
-        let ingress_name = zone_id_to_name
-            .get(&delta.metadata.ingress_zone)
-            .cloned()
-            .unwrap_or_default();
-        let egress_name = zone_id_to_name
-            .get(&delta.metadata.egress_zone)
-            .cloned()
-            .unwrap_or_default();
-        let info = SessionDeltaInfo {
-            timestamp: Utc::now(),
-            slot: ident.slot,
-            queue_id: ident.queue_id,
-            worker_id: ident.worker_id,
-            interface: ident.interface.to_string(),
-            ifindex: ident.ifindex,
-            event: session_delta_event(delta.kind).to_string(),
-            addr_family: delta.key.addr_family,
-            protocol: delta.key.protocol,
-            src_ip: delta.key.src_ip.to_string(),
-            dst_ip: delta.key.dst_ip.to_string(),
-            src_port: delta.key.src_port,
-            dst_port: delta.key.dst_port,
-            ingress_zone: ingress_name,
-            egress_zone: egress_name,
-            ingress_zone_id: delta.metadata.ingress_zone,
-            egress_zone_id: delta.metadata.egress_zone,
-            owner_rg_id: delta.metadata.owner_rg_id,
-            disposition: match delta.decision.resolution.disposition {
-                ForwardingDisposition::ForwardCandidate => "forward_candidate",
-                ForwardingDisposition::LocalDelivery => "local_delivery",
-                ForwardingDisposition::NoRoute => "no_route",
-                ForwardingDisposition::MissingNeighbor => "missing_neighbor",
-                ForwardingDisposition::PolicyDenied => "policy_denied",
-                ForwardingDisposition::FabricRedirect => "fabric_redirect",
-                ForwardingDisposition::HAInactive => "ha_inactive",
-                ForwardingDisposition::DiscardRoute => "discard_route",
-                ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
-            }
-            .to_string(),
-            origin: delta.origin.as_str().to_string(),
-            egress_ifindex: delta.decision.resolution.egress_ifindex,
-            tx_ifindex: delta.decision.resolution.tx_ifindex,
-            tunnel_endpoint_id: delta.decision.resolution.tunnel_endpoint_id,
-            tx_vlan_id: delta.decision.resolution.tx_vlan_id,
-            next_hop: delta
-                .decision
-                .resolution
-                .next_hop
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
-            neighbor_mac: delta
-                .decision
-                .resolution
-                .neighbor_mac
-                .map(format_mac)
-                .unwrap_or_default(),
-            src_mac: delta
-                .decision
-                .resolution
-                .src_mac
-                .map(format_mac)
-                .unwrap_or_default(),
-            nat_src_ip: delta
-                .decision
-                .nat
-                .rewrite_src
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
-            nat_dst_ip: delta
-                .decision
-                .nat
-                .rewrite_dst
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
-            nat_src_port: delta.decision.nat.rewrite_src_port.unwrap_or(0),
-            nat_dst_port: delta.decision.nat.rewrite_dst_port.unwrap_or(0),
-            fabric_redirect: delta.fabric_redirect_sync
-                || delta.decision.resolution.disposition == ForwardingDisposition::FabricRedirect,
-            fabric_ingress: delta.metadata.fabric_ingress,
-            // #2785: carry the per-policy log selection on the JSON fallback
-            // delta so the synced session logs identically after failover.
-            log_session_init: delta.metadata.log_session_init,
-            log_session_close: delta.metadata.log_session_close,
-        };
+        let info = session_delta_info(ident, delta, zone_id_to_name);
         // #2669: per-binding RPC fallback push is the ONLY binding-dependent
         // step. Skipped when no binding exists; every consumer below is
         // binding-independent and runs regardless.
