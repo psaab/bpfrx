@@ -97281,6 +97281,34 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
 
+## #6896 — three docs asserted a cluster-secondary read-only gate that arming does not universally give
+
+- **Timestamp**: 2026-08-21
+- **Action**: Replaced the categorical claim ("the secondary is read-only",
+  "Secondary nodes operate in read-only mode, rejecting all config mutations",
+  "Configure mode protection: blocked on secondary cluster nodes", REST has
+  "full gRPC parity") with the mechanism plus its precondition, in the three
+  doc trees #6865 did not touch. Verified at `origin/master` f8e720c3e:
+  `SetClusterReadOnly` has exactly two production call sites, both inside
+  `applyRG0OwnershipTransition` (`pkg/daemon/daemon_ha.go:445,477`), driven by
+  an RG0 **transition** event; there is no startup arming and no reconcile that
+  re-derives the flag; `Store.clusterReadOnly` is a plain bool with no
+  constructor initialisation in `configstore.New`, so it starts `false`; and
+  `pkg/api/config.go` reaches `EnterConfigureSession` with no RG0 check where
+  `pkg/grpcapi/server_config.go:76` guards on `IsLocalPrimary(0)` and
+  `pkg/cli/cli_dispatch.go:380` has its own. A node that cold-starts, seats as
+  RG0 secondary and never transitions therefore has a WRITABLE store — the gap
+  filed as #6890 (#6889 is the dropped-event variant), both still OPEN.
+  `pkg/cluster/README.md` already carries the corrected model from #6865 and is
+  the wording these three now match. Pinned the precondition itself with
+  `TestClusterReadOnly_ZeroValueStoreIsWritable_6896`, which uses NO
+  `SetClusterReadOnly` call: mutating `configstore.New` to construct with
+  `clusterReadOnly: true` reds it (rc=1, read from `$?`), so the claim the docs
+  now make is checked rather than asserted. Docs + one test only — no runtime
+  behaviour change, nothing reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/configstore/README.md, docs/feature-coverage.md,
+  docs/phases.md, pkg/configstore/cluster_readonly_3893_test.go, _Log.md
+
 - **Timestamp**: 2026-08-21
 - **Action**: Added `wrap_accept_after_forward_clear` to the #5168 WireGuard
   replay tests (#6118). One ring slot+bit is shared by every counter congruent
