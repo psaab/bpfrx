@@ -80185,3 +80185,32 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+- **Action**: #6743 fold of the two claim defects measured by the hostile review at
+  `d04a98bf3` (zero runtime findings). M1: the escape canary's stated residual list
+  UNDERSTATED the canary. `daemon_dp_escape_canary_test.go:99-102` claimed that a call
+  to a helper assigning the probe through a pointer is invisible because R1/R2 analyse
+  one body at a time. The review built exactly that shape at the gRPC site and the
+  canary RED with `startGRPCServer builds grpcapi.Config with a DP value that is not
+  derived from liveDataplane()`. The reasoning was right and the conclusion wrong: R3
+  does not analyse the callee at all, it requires the `grpcapi.Config{DP:}`
+  composite-literal value to be live-derived IN THE CALLER BODY, so relocating the
+  assignment DEFEATS R3 rather than hiding from it. Rewrote the bullet to say so, kept
+  `go d.wireConsole()` as genuinely unclaimed (that is R4's territory, keyed on
+  `cli.New`'s argument set, and was not tested in either direction), and recorded that
+  understatement is the dangerous direction to be wrong in — it invites the next reader
+  to skip the behavioural half believing the AST half cannot reach the site. M2:
+  `pkg/api/system.go` `systemBuffersHandler` still takes three independent loads of the
+  cell (`IsLoaded`, `dpProbe`, `GetMapStats`) where the gRPC and CLI peers moved to a
+  single resolution in this change. Outcome-equivalent — every load of an empty cell
+  agrees — so NOT a runtime finding; what it leaves is a SURFACE gap, since for
+  identical daemon state gRPC and CLI print "Dataplane not loaded" while REST returns
+  200 with an empty list, which a client cannot distinguish from a healthy firewall
+  with no buffers. Pre-existing, recorded here because this is the change that made
+  every other surface deliberately uniform, which turns leaving REST alone into a
+  decision rather than an oversight. Validation: gofmt clean; `go build ./...` rc=0;
+  `go test ./pkg/daemon/... -count=1` rc=0 and `go test ./pkg/api/... -count=1` rc=0.
+  A first run reported 3 daemon FAILs — all `bind: invalid argument` from a 22-char
+  `GOTMPDIR` overflowing the unix `sun_path` limit against this repo's long test names,
+  a harness artifact that cannot be caused by a comment edit; re-run at
+  `GOTMPDIR=/dev/shm/T6` gave zero such failures.
+- **File(s)**: pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go

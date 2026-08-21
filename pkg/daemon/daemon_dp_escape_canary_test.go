@@ -96,10 +96,20 @@ import (
 // immediately invoked) rather than by deriving execution order. Two things
 // therefore remain outside it, and are stated rather than papered over:
 //
-//   - A wiring that crosses a function boundary. `go d.wireConsole()`, or
-//     a call to a helper that assigns the probe through a pointer, is
-//     invisible here — R1/R2 analyse ONE body at a time, and the call is
-//     in callee position in a function this canary is not looking at.
+//   - A wiring that crosses a function boundary — but NOT uniformly, and
+//     the split was measured rather than reasoned. At a site guarded by
+//     R3 the crossing is CAUGHT, not hidden: R3 does not analyse the
+//     callee at all. It requires the composite-literal field to be
+//     live-derived in the CALLER body, so moving the assignment into a
+//     helper that writes the probe through a pointer DEFEATS R3 rather
+//     than escaping it. That exact shape was built at the gRPC site and
+//     the canary redded on it, naming startGRPCServer. What genuinely
+//     remains unclaimed is `go d.wireConsole()` — R4's territory, keyed
+//     on cli.New's argument set, and not tested in either direction.
+//     An earlier revision of this bullet called both halves invisible.
+//     That is the dangerous direction to be wrong in: an understatement
+//     invites the next reader to skip the behavioural half believing the
+//     AST half cannot reach the site.
 //   - Any ordering that depends on runtime control flow rather than on
 //     syntax (a channel handshake, a sync.Once, a conditional that only
 //     assigns on a path taken later).

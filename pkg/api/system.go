@@ -228,6 +228,20 @@ func buildTracerouteArgv(req TracerouteRequest) []string {
 	})
 }
 
+// systemBuffersHandler answers the REST buffer query.
+//
+// This is the one surface that cannot say "not loaded", and the omission is
+// knowing rather than accidental. It takes three independent loads of the
+// cell — IsLoaded here, dpProbe below, and GetMapStats further down — where
+// the gRPC and CLI peers were converted to a single resolution in #2114.
+// The outcome is equivalent, because every load of an empty cell agrees, so
+// this is not a correctness gap. It is a SURFACE gap: for identical daemon
+// state gRPC and CLI print "Dataplane not loaded", while REST returns 200
+// with an empty list, which a client cannot distinguish from a healthy
+// firewall that simply has no buffers. The divergence predates this change.
+// It is recorded here because this is the change that made every other
+// surface deliberately uniform, which is what turns leaving REST alone into
+// a decision instead of an oversight.
 func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeOK(w, []BufferInfo{})
