@@ -19,8 +19,9 @@ import (
 // testCoSRewriteRuleConfig builds all four rewrite-rule families. The two
 // modeled families carry entry lists; inet-precedence and exp are recorded as
 // NAMES only, which is how the compiler stores them (#4316) — see
-// TestFormatCoSRewriteRulesNameOnlyFamiliesAreProducible for the proof that
-// this shape is what the real compiler emits, not a shape invented here.
+// TestShowTextCoSRewriteRuleNameOnlyFamiliesAreProducible6848 in pkg/grpcapi
+// for the proof that this shape is what the real compiler emits, not a shape
+// invented here.
 func testCoSRewriteRuleConfig() *config.Config {
 	cfg := testCoSConfig()
 	cfg.ClassOfService.DSCPRewriteRules = map[string]*config.CoSDSCPRewriteRule{
@@ -89,10 +90,11 @@ func TestFormatCoSRewriteRulesRendersAllFourFamilies(t *testing.T) {
 
 // TestFormatCoSRewriteRulesMarksInertTypes is the #6848 point of the command.
 //
-// FAIL-ON-REVERT: make cosRewriteRuleEnforced return true unconditionally (or
-// drop the Enforced column) and the three inert assertions go RED. Make it
-// return false for dscp and the enforced assertion goes RED — so the test binds
-// the mapping in BOTH directions rather than just "some marker is present".
+// FAIL-ON-REVERT: cosRewriteRuleEnforcement returns the rendered STRING, not a
+// bool. Make it return "yes" unconditionally (or drop the Enforced column) and
+// the three inert assertions go RED. Make it return an inert reason for dscp
+// and the enforced assertion goes RED — so the test binds the mapping in BOTH
+// directions rather than just "some marker is present".
 func TestFormatCoSRewriteRulesMarksInertTypes(t *testing.T) {
 	out := FormatCoSRewriteRules(testCoSRewriteRuleConfig(), "", "")
 

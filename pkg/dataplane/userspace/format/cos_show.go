@@ -217,11 +217,25 @@ func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) str
 }
 
 // CoSRewriteRuleTypes is the set of `type` filter values FormatCoSRewriteRules
-// accepts, in the order rules are rendered. It is the SSOT this renderer and
-// the cmdtree `type` completion node agree on
-// (TestCoSRewriteRuleTypeFilterMatchesCmdtree pins that they cannot drift).
-// Exported so the cmdtree `type` completion node can be pinned against it
-// across the package boundary (TestCoSRewriteRuleTypeChildrenMatchRenderer).
+// accepts, in the order rules are rendered. It is exported so the cmdtree
+// `type` completion node can be checked against it across the package
+// boundary.
+//
+// It is NOT the SSOT, and the comment that used to say so was false in the
+// load-bearing direction (#6858). The family list exists in three places: these
+// values, the cmdtree `type` completion children, and the renderer's own
+// hardcoded per-family branches below — and nothing in the renderer reads this
+// variable, so pinning it against cmdtree alone was a closed loop that a
+// deleted renderer branch walked straight through.
+//
+// The authority is the config schema: schemaClassOfService["rewrite-rules"]
+// children in pkg/config/schema_cos.go, which is what an operator can commit.
+// pkg/config cannot import this package (format imports config), so the
+// three-way check lives in pkg/cmdtree, which can see all of them:
+// TestCoSRewriteRuleTypeChildrenMatchRenderer holds these values and the
+// completion children against the schema, and
+// TestCoSRewriteRuleRendererCoversEverySchemaFamily renders a committed rule of
+// every schema family, which is the only way to observe the branches.
 var CoSRewriteRuleTypes = []string{"dscp", "ieee-802.1", "inet-precedence", "exp"}
 
 // cosBoundDSCPRewriteRules returns the set of dscp rewrite-rule NAMES that at
@@ -276,9 +290,14 @@ func cosBoundDSCPRewriteRules(cfg *config.Config) map[string]bool {
 // happens to be unbound: the type is the dominant, actionable fact, and such a
 // rule would not act however it were bound.
 //
-// Keep this in step with the advisories: a type that starts being enforced must
-// flip here in the SAME change that drops its advisory, or this command will
-// report a working rewrite as inert.
+// A type that starts being enforced must flip here in the SAME change that
+// drops its commit advisory, or this command reports a working rewrite as
+// inert. That is not left to a comment — see
+// TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858, which asserts the
+// biconditional over every committable family: the commit emits an
+// accepted-but-inert advisory if and only if this function returns the
+// unsupported-TYPE reason. Deleting an advisory without flipping this function
+// reds, and flipping this function without dropping the advisory reds too.
 func cosRewriteRuleEnforcement(cpType string, bound bool) string {
 	if cpType != "dscp" {
 		return "no (accepted for Junos compatibility; the dataplane rewrites dscp only)"

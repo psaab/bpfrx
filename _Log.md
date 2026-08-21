@@ -79157,3 +79157,104 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-20T19:40Z
+- **Action**: #6858 round 2 — folded the first-ever gate on `show class-of-service
+  rewrite-rule` (two blocking, one major, three survivors, three fictional
+  citations).
+
+  **B1 — the guard named "MatchRenderer" could not see the renderer.** The family
+  list exists in THREE places (the renderer's hardcoded per-family branches,
+  `format.CoSRewriteRuleTypes`, and the cmdtree `type` children), and
+  `TestCoSRewriteRuleTypeChildrenMatchRenderer` pinned only the latter two.
+  Nothing but that test reads `CoSRewriteRuleTypes`, so the pair was a closed
+  loop: deleting `appendNameOnly("exp", cos.EXPRewriteRules)` from
+  `FormatCoSRewriteRules` compiled and left `go test ./pkg/cmdtree/ -run
+  TestCoSRewriteRule` at rc=0 (reproduced firsthand at 8941948d3). Both checks
+  now measure against the population the schema accepts —
+  `config.CompleteSetPath(["class-of-service","rewrite-rules"])`, i.e. what an
+  operator can commit — and a new
+  `TestCoSRewriteRuleRendererCoversEverySchemaFamily` commits a rule of every
+  schema family in real `set` syntax and renders it, which is the only way to
+  observe branches that are not a list. The false SSOT sentences at
+  `cos_show.go` and in `docs/cos-validation-notes.md` are corrected rather than
+  softened.
+
+  **B2 — local and remote disagreed on config that commits.** The ShowText topic
+  joined params with `,` and split on `,`, but a rewrite-rule or classifier NAME
+  may contain a comma: `set class-of-service rewrite-rules dscp "rw,x"` commits
+  and reads back as `rw,x` (verified through the real store, along with `%`,
+  `=`, space and the empty name). Remotely the name truncated at the comma, so
+  the server rendered the rule named `rw` — a DIFFERENT rule — or reported that
+  the operator's rule did not exist. The flaw was pre-existing: master's
+  `cos-classifier` encoding is identical, and the two share one decoder, so both
+  are fixed here.
+
+  The fix is structural. The grammar and the codec were written three times —
+  `pkg/cli` args->filters, `cmd/cli` args->topic, `pkg/grpcapi` topic->filters —
+  under a comment asking editors to keep the mirrored test tables in step; they
+  had already drifted (`pkg/cli` honored a trailing `name` keyword over a leading
+  bare token, `cmd/cli` did not). All three now call
+  `cmdtree.ParseCoSNameTypeArgs` / `CoSNameTypeTopic` / `ParseCoSNameTypeTopic`
+  in the new `pkg/cmdtree/cos_filter_topic.go`, which adds no dependency edge:
+  all three already imported cmdtree. Values are percent-escaped for `% , = :`
+  and space; a value with none of them encodes byte-identically to the old form,
+  so ordinary topics are unchanged on the wire and no proto field moved.
+  Parity is now ONE property — `ParseCoSNameTypeTopic` inverts
+  `CoSNameTypeTopic` — and the per-surface tests assert wiring, not grammar.
+
+  **B3 — the doc predicted a drift nothing guarded.** Deleting the ieee-802.1
+  inert advisory reddened exactly one test, in `pkg/config`; formatter, gRPC peer
+  and cmdtree stayed green, so a developer enforcing 802.1 would delete the
+  advisory, see one red, delete that too, and ship a command reporting a working
+  rewrite as inert. `TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858`
+  asserts the biconditional over every committable family: the commit emits an
+  accepted-but-inert advisory iff the rendered rule carries the unsupported-TYPE
+  reason. It keys on the type reason rather than on "Enforced: no", so a family
+  that becomes enforced-but-unbound does not read as a violation, and the
+  unit-bindable subset is read from the schema rather than re-typed.
+
+  **B4 — three survivors from the gate's deletion sweep.** `sort.Strings` in
+  `appendNameOnly` was unobservable because both name-only fixtures held ONE
+  rule; `sort.SliceStable(blk.rows, ...)` was unobservable because every
+  assertion was `strings.Contains`. Both now have fixtures authored in
+  deliberately non-sorted config order with the order asserted, each preceded by
+  a precondition check so the fixture cannot go vacuous. The
+  `unit.DSCPRewriteRule == ""` guard was NOT benign: an empty-named rewrite rule
+  commits, and any unit carrying some other CoS binding (a classifier, say)
+  exists with `DSCPRewriteRule == ""` — the ordinary case — so without the guard
+  the empty string enters the bound set and the empty-named rule reports
+  "Enforced: yes" while nothing references it. Both halves measured through the
+  real commit path before writing the binding.
+
+  **B5** — three cited identifiers that existed only at their citation:
+  `cosRewriteRuleEnforced` (real: `cosRewriteRuleEnforcement`, and its
+  FAIL-ON-REVERT instruction said "return true unconditionally" for a function
+  returning a string), `TestCoSRewriteRuleTypeFilterMatchesCmdtree` (fictional),
+  and `TestFormatCoSRewriteRulesNameOnlyFamiliesAreProducible` (real:
+  `TestShowTextCoSRewriteRuleNameOnlyFamiliesAreProducible6848`, in
+  `pkg/grpcapi`). All verified absent-at-declaration with `git grep` against HEAD
+  before correcting.
+
+  **Validation**: `go build ./...` rc=0; `go vet` rc=0 on the five touched
+  packages; `go test -count=1` over `./pkg/config/ ./pkg/dataplane/userspace/format/
+  ./pkg/cmdtree/ ./pkg/cli/ ./cmd/cli/ ./pkg/grpcapi/` rc=0 with 0 `--- FAIL`.
+  Mutation proof, 13 cells, all RED with an always-failing sentinel and a
+  byte-identical restore verified per cell: the four renderer family branches
+  deleted one at a time (including the exp deletion that PASSED before), the two
+  list copies corrupted, the escape made a no-op (which reproduced the defect
+  verbatim — remote rendered `Classifier: cl` where local rendered
+  `Classifier: cl,x`), the ieee-802.1 and exp advisories deleted, the
+  `cpType != "dscp"` mapping flipped, both sorts deleted, and the empty-name
+  guard removed. No Rust or dataplane code is touched, so no cargo leg is
+  implicated.
+- **File(s)**: pkg/cmdtree/cos_filter_topic.go, pkg/cmdtree/cos_filter_topic_test.go,
+  pkg/cmdtree/cos_rewrite_rule_6848_test.go, pkg/cmdtree/README.md,
+  pkg/dataplane/userspace/format/cos_show.go,
+  pkg/dataplane/userspace/format/cos_rewrite_rule_inert_6858_test.go,
+  pkg/dataplane/userspace/format/cos_rewrite_rule_show_test.go,
+  pkg/cli/show_services_cos.go, pkg/cli/cos_rewrite_rule_args_6848_test.go,
+  cmd/cli/show.go, cmd/cli/cos_rewrite_rule_topic_6848_test.go,
+  pkg/grpcapi/server_show_interfaces_text.go,
+  pkg/grpcapi/server_show_cos_filter_parity_6858_test.go,
+  docs/cos-validation-notes.md, _Log.md

@@ -125,20 +125,88 @@ Two implementation facts worth knowing before changing this:
   rule *with* a code point in real set syntax and asserts it does not
   surface, so this stays honest if the compiler ever starts modeling
   them.
-- **`format.CoSRewriteRuleTypes` is the SSOT for the `type` filter**, and
-  the cmdtree `type` completion node is pinned against it by
-  `TestCoSRewriteRuleTypeChildrenMatchRenderer`. Adding a family means
-  editing one list; the test fails if the other is not updated.
+- **The family list lives in THREE places, and the config schema is the
+  authority.** They are `format.CoSRewriteRuleTypes`, the cmdtree `type`
+  completion children, and the renderer's own hardcoded per-family
+  branches in `FormatCoSRewriteRules`. Adding a family means editing all
+  three. Until #6858 the note here said "editing one list; the test fails
+  if the other is not updated" — that was false in the direction that
+  matters: the test compared the first two, nothing but that test read
+  `CoSRewriteRuleTypes`, and deleting `appendNameOnly("exp", …)` from the
+  renderer left the whole suite green.
 
-`cosRewriteRuleEnforced` (`pkg/dataplane/userspace/format/cos_show.go`)
-is the enforced/inert mapping. **A family that starts being enforced must
-flip there in the same change that drops its commit advisory**, or this
-command will report a working rewrite as inert.
+  Both checks now measure against `schemaClassOfService["rewrite-rules"]`
+  (`pkg/config/schema_cos.go`) — the families an operator can actually
+  commit — and both live in `pkg/cmdtree`, the only package that can see
+  the schema, the renderer and the tree at once (`pkg/config` cannot
+  import `format`, because `format` imports `config`):
+  `TestCoSRewriteRuleTypeChildrenMatchRenderer` for the two lists, and
+  `TestCoSRewriteRuleRendererCoversEverySchemaFamily`, which commits a
+  rule of every schema family and renders it, for the branches. A fifth
+  family added to the schema fails all three until it is handled.
+
+`cosRewriteRuleEnforcement` (`pkg/dataplane/userspace/format/cos_show.go`)
+is the enforced/inert mapping; it returns the rendered `Enforced:` string,
+not a bool. **A family that starts being enforced must flip there in the
+same change that drops its commit advisory**, or this command will report
+a working rewrite as inert. That biconditional is asserted over every
+committable family by
+`TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858`
+(`pkg/dataplane/userspace/format`), so the two halves cannot move apart
+silently — before #6858, deleting the ieee-802.1 advisory reddened exactly
+one test, in `pkg/config`, and the formatter stayed green.
 
 Renderers live in `pkg/dataplane/userspace/format/cos_show.go` (the
 shared SSOT used by both the local CLI in `pkg/cli` and the gRPC
 `ShowText` path in `pkg/grpcapi`); the operational-tree entries and
 tab-completion are in `pkg/cmdtree/tree.go`.
+
+### The `name` / `type` filter grammar is single-sourced (#6858)
+
+`show class-of-service classifier` and `show class-of-service
+rewrite-rule` take the same optional `name <n>` / `type <t>` filters, and
+also accept a **leading bare token** as the name (that is what completion
+offers under the command, so it is what an operator submits after
+tab-completing). All three surfaces call the same functions in
+`pkg/cmdtree/cos_filter_topic.go`:
+
+| surface | calls |
+|---|---|
+| local CLI (`pkg/cli`) | `ParseCoSNameTypeArgs` |
+| remote CLI (`cmd/cli`) | `ParseCoSNameTypeArgs` then `CoSNameTypeTopic` |
+| gRPC server (`pkg/grpcapi`) | `ParseCoSNameTypeTopic` |
+
+Before #6858 the grammar was written three times, and the two arg parsers
+had already drifted — `pkg/cli` honored a trailing `name` keyword over a
+leading bare token and `cmd/cli` did not — under a comment asking editors
+to keep the mirrored test tables in step.
+
+The topic encoding also lost data. It joined params with `,` and split on
+`,`, but a rule or classifier NAME may contain a comma: `set
+class-of-service rewrite-rules dscp "rw,x"` commits and reads back as
+`rw,x`. Remotely the name truncated at the comma, so the server rendered
+the rule named `rw` — a *different* rule — or, where `rw` named nothing,
+reported that the operator's rule did not exist. The flaw was pre-existing
+(`cos-classifier` carried it since #4228) and both commands share the one
+decoder, so #6858 fixed both.
+
+Values are now percent-escaped for `% , = :` and space, and unescaping is
+tolerant of a bare `%` that is not a valid escape. A name containing none
+of those encodes byte-identically to the old form, so ordinary topics are
+unchanged on the wire. Mixed-version behaviour for a comma-bearing name
+degrades to "no match" rather than the wrong rule — visibly wrong instead
+of confidently wrong; `cli` and `xpfd` ship together anyway.
+
+Parity is therefore one property, not a pair of mirrored tables:
+`ParseCoSNameTypeTopic` inverts `CoSNameTypeTopic`
+(`TestCoSNameTypeTopicRoundTrip6858`). The per-surface tests assert
+*wiring* — that each surface routes through these functions —
+rather than restating the grammar:
+`TestLocalCoSRewriteRuleFilterWiring6858` (`pkg/cli`, drives the real
+dispatcher), `TestCoSNameTypeTopic6848` (`cmd/cli`), and
+`TestCoSRewriteRuleLocalRemoteParity6858` (`pkg/grpcapi`), which renders
+the same operator tokens through both paths and requires identical output
+for both commands.
 
 ## How to read admission drop counters live
 

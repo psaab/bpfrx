@@ -2,6 +2,7 @@ package cmdtree
 
 import (
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -10,36 +11,165 @@ import (
 
 // #6848: `show class-of-service rewrite-rule` operational-tree wiring.
 
-// TestCoSRewriteRuleTypeChildrenMatchRenderer pins the two halves of a
-// cross-package SSOT against each other.
+// cosRewriteRuleSchemaFamilies returns the rewrite-rule code-point families an
+// operator can actually COMMIT, read from the config schema
+// (schemaClassOfService["rewrite-rules"].children via the exported completer).
 //
-// The `type` completion node lives in cmdtree; the set of type values the
-// renderer actually filters on lives in format.CoSRewriteRuleTypes. Nothing
-// structural keeps them in step — completion could offer a value the renderer
-// silently ignores (the operator filters and gets everything), or a family
-// could be renderable but uncompletable (the operator cannot find it). Both
-// failures are quiet, so assert equality rather than trusting the two lists to
-// be edited together.
+// This is the population every other copy of the list is measured against.
+// pkg/config cannot import pkg/dataplane/userspace/format (format imports
+// config), but CompleteSetPath crosses the boundary in the safe direction, so a
+// test up here can hold the schema, the renderer and the operational tree in
+// one place.
+func cosRewriteRuleSchemaFamilies(t *testing.T) []string {
+	t.Helper()
+	got := config.CompleteSetPath([]string{"class-of-service", "rewrite-rules"})
+	if len(got) == 0 {
+		t.Fatal("config schema offers no `class-of-service rewrite-rules` children; " +
+			"the derivation this file depends on has moved")
+	}
+	out := append([]string(nil), got...)
+	sort.Strings(out)
+	return out
+}
+
+// TestCoSRewriteRuleTypeChildrenMatchRenderer pins the THREE places the family
+// list is written against the one place it is defined.
+//
+// The copies are: (a) the renderer's per-family branches in
+// FormatCoSRewriteRules, (b) format.CoSRewriteRuleTypes, and (c) the cmdtree
+// `type` completion children. Until #6858 this test compared (b) with (c) only
+// — and NOTHING reads (b) except this test, so the pair was a closed loop.
+// Deleting `appendNameOnly("exp", ...)` from the renderer left the package
+// compiling and this test PASSING, which is precisely the drift its own doc
+// comment said it existed to catch.
+//
+// (a) is behavioural and cannot be read as a list, so it is covered by
+// TestCoSRewriteRuleRendererCoversEverySchemaFamily below; this test covers the
+// two that are lists. Both directions matter: a value completion offers but the
+// renderer ignores means the operator filters and gets everything back, and a
+// family the renderer handles but completion omits means the operator cannot
+// find it.
 func TestCoSRewriteRuleTypeChildrenMatchRenderer(t *testing.T) {
+	want := cosRewriteRuleSchemaFamilies(t)
+
 	node := operationalNode(t, "show", "class-of-service", "rewrite-rule", "type")
-
-	got := make([]string, 0, len(node.Children))
+	treeChildren := make([]string, 0, len(node.Children))
 	for name := range node.Children {
-		got = append(got, name)
+		treeChildren = append(treeChildren, name)
 	}
-	want := append([]string(nil), dpformat.CoSRewriteRuleTypes...)
-	sort.Strings(got)
-	sort.Strings(want)
+	sort.Strings(treeChildren)
 
-	if len(got) != len(want) {
-		t.Fatalf("cmdtree `type` children = %v, renderer types = %v; the completion "+
-			"set and the filter set must be identical", got, want)
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			t.Fatalf("cmdtree `type` children = %v, renderer types = %v", got, want)
+	rendererTypes := append([]string(nil), dpformat.CoSRewriteRuleTypes...)
+	sort.Strings(rendererTypes)
+
+	for _, c := range []struct {
+		what string
+		got  []string
+	}{
+		{"cmdtree `type` completion children", treeChildren},
+		{"format.CoSRewriteRuleTypes", rendererTypes},
+	} {
+		if !equalStrings(c.got, want) {
+			t.Errorf("%s = %v, committable families (from the config schema) = %v; "+
+				"a family an operator can commit must be completable AND filterable",
+				c.what, c.got, want)
 		}
 	}
+}
+
+// TestCoSRewriteRuleRendererCoversEverySchemaFamily is the behavioural half:
+// for every family the schema accepts, a rule authored in real `set` syntax
+// must appear in the unfiltered render AND be selectable by `type <family>`.
+//
+// This is what makes the SSOT claim true rather than circular. The renderer's
+// family handling is four hardcoded branches, not a list, so the only way to
+// observe it is to render.
+//
+// FAIL-ON-REVERT: delete any one of the four branches in FormatCoSRewriteRules
+// — `wantType("dscp")`, `wantType("ieee-802.1")`, `appendNameOnly("inet-
+// precedence", ...)`, `appendNameOnly("exp", ...)` — and that family's rule
+// stops rendering, so both the unfiltered and the filtered assertion go RED.
+func TestCoSRewriteRuleRendererCoversEverySchemaFamily(t *testing.T) {
+	families := cosRewriteRuleSchemaFamilies(t)
+
+	cmds := []string{"set class-of-service forwarding-classes queue 0 best-effort"}
+	for _, fam := range families {
+		// Code point 0 is in range for all four families (dscp 0..63, the
+		// others 0..7), so one command shape covers every family without a
+		// hand-written per-family table that could itself drift.
+		cmds = append(cmds, "set class-of-service rewrite-rules "+fam+" "+cosRuleNameFor(fam)+
+			" forwarding-class best-effort loss-priority low code-point 0")
+	}
+	cfg := compileCoSSet6858(t, cmds...)
+
+	all := dpformat.FormatCoSRewriteRules(cfg, "", "")
+	for _, fam := range families {
+		header := "Rewrite rule: " + cosRuleNameFor(fam) + ", Code point type: " + fam
+		if !strings.Contains(all, header) {
+			t.Errorf("unfiltered render omits committable family %q (expected header %q):\n%s",
+				fam, header, all)
+		}
+	}
+
+	for _, fam := range families {
+		out := dpformat.FormatCoSRewriteRules(cfg, "", fam)
+		want := "Rewrite rule: " + cosRuleNameFor(fam) + ", Code point type: " + fam
+		if !strings.Contains(out, want) {
+			t.Errorf("type=%q filter dropped its own family (expected %q):\n%s", fam, want, out)
+		}
+		for _, other := range families {
+			if other == fam {
+				continue
+			}
+			if leak := "Rewrite rule: " + cosRuleNameFor(other) + ","; strings.Contains(out, leak) {
+				t.Errorf("type=%q filter leaked family %q (%q):\n%s", fam, other, leak, out)
+			}
+		}
+	}
+}
+
+// cosRuleNameFor derives a distinct, plain rule name per family so the test
+// needs no hand-maintained family->name table.
+func cosRuleNameFor(family string) string {
+	return "rw-" + strings.ReplaceAll(family, ".", "-")
+}
+
+// compileCoSSet6858 runs `set` lines through the real grammar gate
+// (SchemaValidate) and the real compiler — the same two steps a commit
+// performs — so a family that reaches the renderer here is one an operator can
+// actually commit.
+func compileCoSSet6858(t *testing.T, cmds ...string) *config.Config {
+	t.Helper()
+	tree := &config.ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	if err := config.SchemaValidate(tree, nil); err != nil {
+		t.Fatalf("SchemaValidate: %v", err)
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	return cfg
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestCoSRewriteRuleNameCompletionIncludesInertFamilies pins that completion

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
@@ -378,24 +379,14 @@ func (s *Server) showCoSRewriteRule(req *pb.ShowTextRequest, cfg *config.Config,
 // parseCoSTopicNameType extracts the `name=` / `type=` params from a
 // "<prefix>[:k=v,k=v]" ShowText topic, shared by the CoS classifier and
 // rewrite-rule handlers (#6848).
+//
+// #6858: the decode is cmdtree's, and it is the exact inverse of the encode the
+// remote `cli` binary runs (cmdtree.CoSNameTypeTopic). Keeping the two halves
+// of one wire format in one package is what lets a filter value containing the
+// separator — `rewrite-rules dscp "rw,x"` commits — round-trip instead of
+// truncating at the comma and rendering a different rule.
 func parseCoSTopicNameType(topic, prefix string) (nameFilter, typeFilter string) {
-	params := strings.TrimPrefix(topic, prefix)
-	params = strings.TrimPrefix(params, ":")
-	for _, kv := range strings.Split(params, ",") {
-		kv = strings.TrimSpace(kv)
-		if kv == "" {
-			continue
-		}
-		if k, v, ok := strings.Cut(kv, "="); ok {
-			switch k {
-			case "name":
-				nameFilter = v
-			case "type":
-				typeFilter = v
-			}
-		}
-	}
-	return nameFilter, typeFilter
+	return cmdtree.ParseCoSNameTypeTopic(topic, prefix)
 }
 
 // showCoSSchedulerMap renders `show class-of-service scheduler-map [<name>]`

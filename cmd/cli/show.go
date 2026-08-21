@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cmdtree"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -503,33 +504,14 @@ func (c *ctl) showSystemInfo(typ string) error {
 
 // cosNameTypeTopic encodes the `name <n>` / `type <t>` filters shared by
 // `show class-of-service classifier` and `show class-of-service rewrite-rule`
-// into a gRPC ShowText topic (#6848). A LEADING BARE TOKEN is taken as the
-// name, matching both the cmdtree completion (which offers rule names directly
-// under the command) and the local CLI's parseCoSNameTypeArgs — the remote and
-// local paths must accept the same grammar or the same keystrokes give
-// different answers depending on which binary the operator ran.
+// into a gRPC ShowText topic (#6848).
+//
+// #6858: it delegates BOTH halves — the argument grammar and the topic
+// encoding — to cmdtree, which the local CLI (pkg/cli) and the gRPC decoder
+// (pkg/grpcapi) also call. The remote and local paths do not merely agree on
+// the grammar by convention; they execute the same code, so they cannot give
+// different answers for the same keystrokes.
 func cosNameTypeTopic(prefix string, rest []string) string {
-	var params []string
-	if len(rest) > 0 && rest[0] != "name" && rest[0] != "type" {
-		params = append(params, "name="+rest[0])
-		rest = rest[1:]
-	}
-	for i := 0; i < len(rest); i++ {
-		switch rest[i] {
-		case "name":
-			if i+1 < len(rest) {
-				params = append(params, "name="+rest[i+1])
-				i++
-			}
-		case "type":
-			if i+1 < len(rest) {
-				params = append(params, "type="+rest[i+1])
-				i++
-			}
-		}
-	}
-	if len(params) == 0 {
-		return prefix
-	}
-	return prefix + ":" + strings.Join(params, ",")
+	nameFilter, typeFilter := cmdtree.ParseCoSNameTypeArgs(rest)
+	return cmdtree.CoSNameTypeTopic(prefix, nameFilter, typeFilter)
 }
