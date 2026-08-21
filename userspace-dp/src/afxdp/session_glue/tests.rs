@@ -244,6 +244,7 @@ fn purge_sessions_for_input_dscp_filter_revalidation_removes_family() {
             true,
             false,
             2,
+            0,
         ),
         1
     );
@@ -515,6 +516,7 @@ fn resolve_flow_session_decision_promotes_stale_fabric_shared_hit_to_local_owner
         0x18,
         21,
         true,
+        0,
         0,
     )
     .expect("resolved");
@@ -1294,6 +1296,7 @@ fn resolve_flow_session_decision_uses_canonical_key_for_translated_forward_hit()
         0,
         false,
         0,
+        0,
     )
     .expect("translated forward hit should resolve");
 
@@ -1384,6 +1387,7 @@ fn resolve_flow_session_decision_promotes_translated_shared_hit_on_active_fabric
         0x18,
         21,
         true,
+        0,
         0,
     )
     .expect("translated shared hit should resolve");
@@ -1476,6 +1480,7 @@ fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_
         0x18,
         21,
         true,
+        0,
         0,
     )
     .expect("translated local hit should resolve");
@@ -1571,6 +1576,7 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         21,
         true,
         0,
+        0,
     )
     .expect("translated shared hit should resolve");
 
@@ -1656,6 +1662,7 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         12,
         false,
         0,
+        0,
     )
     .expect("translated shared hit should resolve");
 
@@ -1732,6 +1739,7 @@ fn resolve_flow_session_decision_keeps_local_synced_translated_hit_transient_on_
         12,
         false,
         0,
+        0,
     )
     .expect("translated local hit should resolve");
 
@@ -1788,6 +1796,7 @@ fn apply_worker_commands_replaces_stale_local_session_for_inactive_owner_rg() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("synced hit");
@@ -1854,6 +1863,7 @@ fn apply_worker_commands_preserves_local_session_for_active_owner_rg() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("live hit");
@@ -1911,6 +1921,7 @@ fn apply_worker_commands_demotes_local_owner_rg_sessions_to_sync_import() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     let Some((_decision, _metadata, origin)) = sessions.entry_with_origin(&key) else {
@@ -1951,6 +1962,7 @@ fn demoted_local_session_promotes_as_synced_on_failback_lookup() {
         &forwarding,
         &inactive_state,
         &dynamic_neighbors,
+        0,
     );
 
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -1983,6 +1995,7 @@ fn demoted_local_session_promotes_as_synced_on_failback_lookup() {
         0x10,
         6,
         false,
+        0,
         0,
     )
     .expect("resolved demoted session");
@@ -2233,6 +2246,7 @@ fn export_owner_rg_command_does_not_overflow_ring_unbounded() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     // (a) the command recorded the owner RG and sequence.
@@ -2331,6 +2345,7 @@ fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -2401,6 +2416,7 @@ fn apply_worker_commands_does_not_export_missing_neighbor_seed_sessions() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -2450,6 +2466,7 @@ fn apply_worker_commands_demote_owner_rg_returns_cancelled_keys() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     assert_eq!(results.exported_sequences, Vec::<u64>::new());
@@ -2684,6 +2701,7 @@ fn apply_worker_commands_demotes_local_owner_rg_sessions_and_cancels_keys() {
         &test_forwarding_state_with_fabric(),
         &BTreeMap::new(),
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert_eq!(results.cancelled_keys, vec![key.clone()]);
@@ -2724,6 +2742,7 @@ fn apply_worker_commands_demote_owner_rg_rewrites_resolution_to_fabric_redirect(
         &test_forwarding_state_with_fabric(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert_eq!(results.cancelled_keys, vec![key.clone()]);
@@ -2799,6 +2818,7 @@ fn apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redire
         &test_forwarding_state_split_rgs(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert_eq!(results.cancelled_keys, vec![reverse_key.clone()]);
@@ -2876,6 +2896,7 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_rewrites_to_forward_cand
         &test_forwarding_state_split_rgs(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -2961,6 +2982,7 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_updates_stale_indexed_se
         &test_forwarding_state_split_rgs(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3046,6 +3068,7 @@ fn apply_worker_commands_refresh_owner_rg_updates_reverse_session_owned_by_other
         &test_forwarding_state_split_rgs(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3131,6 +3154,7 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_remote_reverse_session_on_pee
         &test_forwarding_state_split_rgs(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3211,6 +3235,7 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_shared_promote_reverse_on_pee
         &test_forwarding_state_split_rgs(),
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3262,6 +3287,7 @@ fn export_owner_rg_sessions_skips_locally_demoted_entries() {
         &test_forwarding_state_with_fabric(),
         &BTreeMap::new(),
         &Arc::new(ShardedNeighborMap::new()),
+        0,
     );
 
     assert_eq!(results.exported_sequences, vec![11]);
@@ -4227,6 +4253,7 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
         5,
         false,
         0,
+        0,
     )
     .expect("synced session should resolve");
 
@@ -4370,6 +4397,7 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     // ── (a) Exports preserved ───────────────────────────────────────────────
@@ -4527,6 +4555,7 @@ fn apply_worker_commands_demote_dedup_is_linear_not_quadratic() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
     let elapsed = start.elapsed();
 
@@ -4612,6 +4641,7 @@ fn apply_worker_commands_recovers_poisoned_queue_and_processes_commands() {
         &forwarding,
         &ha_state,
         &dynamic_neighbors,
+        0,
     );
 
     // The queued command was processed (NOT the empty "deaf" result the
@@ -5102,6 +5132,7 @@ fn apply_upsert_local_pair(
         &forwarding,
         &BTreeMap::new(),
         &dynamic_neighbors,
+        0,
     )
 }
 
@@ -6405,6 +6436,7 @@ fn delete_terminal_filtered_session_releases_companion_and_allocator_5622() {
             &hit_metadata,
             SessionOrigin::LocalMiss,
             2,
+            0,
         );
 
         // (a) BOTH the resolved entry and its same-worker companion are gone.
@@ -6541,6 +6573,7 @@ fn purge_translated_synced_hit_releases_source_nat_reservation_5295() {
         SessionOrigin::SyncImport,
         &forwarding,
         1_000_000,
+        0,
     );
 
     // (a) existing behaviour: the transient session entry is gone.
@@ -6630,6 +6663,7 @@ fn purge_translated_synced_hit_releases_nat64_reservation_5295() {
         SessionOrigin::SyncImport,
         &forwarding,
         1_000_000,
+        0,
     );
 
     // After the purge releases the reservation, a fresh local NAT64 flow re-owns
@@ -6748,6 +6782,7 @@ fn purge_translated_synced_hit_reverse_entry_releases_nothing_5295() {
         SessionOrigin::SyncImport,
         &forwarding,
         1_000_000,
+        0,
     );
 
     // The guard rejected the reverse entry: nothing torn down, reservation intact.
@@ -6921,6 +6956,7 @@ fn delete_synced_records_key_for_flow_cache_invalidation() {
         key.clone(),
         2_000_000,
         &mut deleted_keys,
+        0,
     );
 
     assert!(
@@ -6955,6 +6991,7 @@ fn delete_synced_records_key_even_when_session_already_absent() {
         key.clone(),
         2_000_000,
         &mut deleted_keys,
+        0,
     );
 
     assert_eq!(
@@ -7057,6 +7094,7 @@ fn handle_upsert_synced_resolves_active_zone_pair_for_snat_reserve_6211() {
         entry,
         1_000,
         1,
+        0,
     );
 
     // `used_ports` is per-rule and in rule order. Assertion 1 doubles as the
@@ -7171,6 +7209,7 @@ fn delete_synced_frees_both_allocators_end_to_end_6211() {
         make_entry(),
         1_000,
         1,
+        0,
     );
     // Upsert #2 — the SAME live session re-synced (HA reconnect / resync) after
     // the zone drop, so the reserve lands in the dmz rule instead.
@@ -7183,6 +7222,7 @@ fn delete_synced_frees_both_allocators_end_to_end_6211() {
         make_entry(),
         2_000,
         2,
+        0,
     );
 
     let before = crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules);
@@ -7202,6 +7242,7 @@ fn delete_synced_frees_both_allocators_end_to_end_6211() {
         key.clone(),
         3_000,
         &mut deleted_keys,
+        0,
     );
 
     let after = crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules);

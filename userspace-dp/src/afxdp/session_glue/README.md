@@ -89,6 +89,18 @@ than stopping at the first hit. Stopping at the first hit stranded the other
 reservation permanently. The sweep cannot over-free: `release_flow` /
 `rollback_flow` return false unless the stored translated tuple matches.
 
+#6211 F2: the synced entry is fanned out to EVERY worker while the allocator
+is one shared `Arc`, so N workers reserve the same `(flow, translated)` and
+each releases it independently. `LiveAllocation.holders` (a `u128` bitmask
+keyed on `worker_id`) makes the release free the port only when the LAST
+holder lets go — before it, the first worker to reap or delete-sync freed a
+port the other N-1 were still forwarding through. Every release site in this
+module therefore takes a `worker_id`, threaded from
+`WorkerLaunchPlan::worker_id` through `apply_worker_commands` /
+`resolve_flow_session_decision` / `delete_terminal_filtered_session`, and calls
+the `_for_worker` entry points; the untracked twins are `#[cfg(test)]` so
+missing the thread is a build failure.
+
 `purge_translated_synced_hit` therefore ALSO releases that reservation —
 `release_source_nat_allocation` + `release_nat64_allocation`, under the
 same `metadata.is_reverse` ownership guard used everywhere the reservation

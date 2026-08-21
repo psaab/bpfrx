@@ -174,6 +174,10 @@ pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     origin: SessionOrigin,
     forwarding: &ForwardingState,
     now_ns: u64,
+    // #6211 F2: THIS worker's id. This purge tears down a PEER-SYNCED forward
+    // session, whose reservation every worker holds, so it must drop only this
+    // worker's bit.
+    worker_id: u32,
 ) {
     if !origin.is_peer_synced() || !is_translated_forward_session_key(key, decision, metadata) {
         return;
@@ -191,18 +195,20 @@ pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     // `handle_delete_synced` does on the delete-sync teardown. `is_reverse` is
     // the ownership guard (a reverse entry owns no source-NAT/NAT64 reservation);
     // both calls are a no-op for a non-pool / non-reserved session.
-    release_source_nat_allocation(
+    release_source_nat_allocation_for_worker(
         &forwarding.source_nat_rules,
         key,
         decision.nat,
         metadata.is_reverse,
         now_ns,
+        worker_id,
     );
-    crate::nat64::release_nat64_allocation(
+    crate::nat64::release_nat64_allocation_for_worker(
         &forwarding.nat64,
         key,
         decision.nat,
         metadata.is_reverse,
         now_ns,
+        worker_id,
     );
 }

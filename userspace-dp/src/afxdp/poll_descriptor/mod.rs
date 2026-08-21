@@ -132,7 +132,10 @@ pub(super) fn poll_binding_process_descriptor(
     now_ns: u64,
     now_secs: u64,
     ha_startup_grace_until_secs: u64,
-    _worker_id: u32,
+    // #6211 F2: no longer inert. The packet-path rollbacks and the synced-hit
+    // purge below release allocator reservations that a peer-synced session
+    // holds on EVERY worker, so each must drop only THIS worker's holder bit.
+    worker_id: u32,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
     worker_ctx: &WorkerContext,
@@ -449,6 +452,7 @@ pub(super) fn poll_binding_process_descriptor(
                         meta.ingress_ifindex as i32,
                         packet_fabric_ingress,
                         ha_startup_grace_until_secs,
+                        worker_id,
                     ) {
                         telemetry.counters.session_hits += 1;
                         telemetry.dbg.session_hit += 1;
@@ -732,6 +736,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         &resolved.metadata,
                                         resolved.origin,
                                         now_ns,
+                                        worker_id,
                                     );
                                     telemetry.dbg.local += 1;
                                     // #3610/M07: account the host-inbound deny on
@@ -802,6 +807,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             &resolved.metadata,
                                             resolved.origin,
                                             now_ns,
+                                            worker_id,
                                         );
                                         telemetry.dbg.local += 1;
                                         telemetry.dbg.policy_deny += 1;
@@ -858,6 +864,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 &resolved.metadata,
                                 resolved.origin,
                                 now_ns,
+                                worker_id,
                             );
                             telemetry.dbg.local += 1;
                             telemetry.dbg.policy_deny += 1;
@@ -2330,12 +2337,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 );
                                 if let Some(request) = local_icmp_te {
                                     if let Some(release_key) = source_nat_release_key.as_ref() {
-                                        rollback_source_nat_allocation(
+                                        rollback_source_nat_allocation_for_worker(
                                             &worker_ctx.forwarding.source_nat_rules,
                                             release_key,
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                     }
                                     // #4381: a NAT64 forward flow whose hop-limit
@@ -2343,12 +2351,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     // the branch above; roll it back so the
                                     // ICMP-TE bounce does not leak it (self-gated
                                     // on `nat.nat64`).
-                                    crate::nat64::rollback_nat64_allocation(
+                                    crate::nat64::rollback_nat64_allocation_for_worker(
                                         &worker_ctx.forwarding.nat64,
                                         &flow.forward_key,
                                         decision.nat,
                                         false,
                                         now_ns,
+                                        worker_id,
                                     );
                                     binding.scratch.scratch_forwards.push(request);
                                     recycle_now = false;
@@ -2391,7 +2400,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         + usize::from(track_in_userspace && install_local_reverse);
                                     if needed_sessions > 0 && !sessions.can_admit(needed_sessions) {
                                         sessions.note_admission_refused();
-                                        rollback_source_nat_allocation(
+                                        rollback_source_nat_allocation_for_worker(
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -2399,15 +2408,17 @@ pub(super) fn poll_binding_process_descriptor(
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                         // #4381: also roll back any NAT64 pool
                                         // port (self-gated on `nat.nat64`).
-                                        crate::nat64::rollback_nat64_allocation(
+                                        crate::nat64::rollback_nat64_allocation_for_worker(
                                             &worker_ctx.forwarding.nat64,
                                             &flow.forward_key,
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                         binding.scratch.scratch_recycle.push(desc.addr);
                                         continue;
@@ -2489,7 +2500,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             "forward install failed after can_admit preflight"
                                         );
                                         sessions.note_install_partial();
-                                        rollback_source_nat_allocation(
+                                        rollback_source_nat_allocation_for_worker(
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -2497,15 +2508,17 @@ pub(super) fn poll_binding_process_descriptor(
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                         // #4381: also roll back any NAT64 pool
                                         // port (self-gated on `nat.nat64`).
-                                        crate::nat64::rollback_nat64_allocation(
+                                        crate::nat64::rollback_nat64_allocation_for_worker(
                                             &worker_ctx.forwarding.nat64,
                                             &flow.forward_key,
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                         binding.scratch.scratch_recycle.push(desc.addr);
                                         continue;
@@ -2672,7 +2685,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         // release any allocation. No-op for the
                                         // DNS fast-path (its guard requires no
                                         // NAT).
-                                        rollback_source_nat_allocation(
+                                        rollback_source_nat_allocation_for_worker(
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -2680,16 +2693,18 @@ pub(super) fn poll_binding_process_descriptor(
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                         // #4381: also release any NAT64 pool port
                                         // when no session anchors it (self-gated
                                         // on `nat.nat64`).
-                                        crate::nat64::rollback_nat64_allocation(
+                                        crate::nat64::rollback_nat64_allocation_for_worker(
                                             &worker_ctx.forwarding.nat64,
                                             &flow.forward_key,
                                             decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                     }
                                     let reverse_resolution = reverse_resolution_for_session(
@@ -5127,7 +5142,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         // and drop the frame instead of
                                         // buffering it for replay.
                                         seed_install_refused = true;
-                                        rollback_source_nat_allocation(
+                                        rollback_source_nat_allocation_for_worker(
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -5135,6 +5150,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             pending_decision.nat,
                                             false,
                                             now_ns,
+                                            worker_id,
                                         );
                                     }
                                 }

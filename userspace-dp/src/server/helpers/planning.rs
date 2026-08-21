@@ -757,6 +757,34 @@ pub(crate) fn replan_bindings_from_candidates(
         return Vec::new();
     }
     let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0);
+    // #6211 F2: worker ids are MINTED below as `queue_id % workers`, and the NAT
+    // allocator records one holder BIT per worker id
+    // (`nat::MAX_NAT_HOLDER_WORKERS`). An id too wide for that mask would set no
+    // bit on reserve and clear no bit on release — self-consistent, but it
+    // collapses that worker back to the pre-fix single-holder behaviour, freeing
+    // a pool port while another worker still forwards through it. That is the
+    // original over-release reintroduced through its own fix, so refuse the
+    // whole plan instead: no bindings means no forwarding, which is fail-closed.
+    //
+    // Checked HERE and not against the raw `--workers` value. `queue_count` is
+    // the per-interface RX-queue minimum, computed independently of `workers`,
+    // and `queue_id < queue_count`, so the ids actually minted span
+    // `[0, min(queue_count, workers))`. Capping `--workers` alone would REFUSE a
+    // safe box — `--workers 200` on a 16-queue NIC mints ids 0..15 — while this
+    // check refuses exactly the configurations that would mis-key a holder.
+    let max_worker_id = queue_count.min(workers.max(1)).saturating_sub(1);
+    if queue_count > 0 && max_worker_id >= crate::nat::MAX_NAT_HOLDER_WORKERS as usize {
+        eprintln!(
+            "replan_bindings: REFUSING plan — {} queues x {} workers mints worker_id {} \
+             but the NAT holder mask tracks only {} workers (MAX_NAT_HOLDER_WORKERS); \
+             an untracked worker would free a pool port another worker still holds",
+            queue_count,
+            workers,
+            max_worker_id,
+            crate::nat::MAX_NAT_HOLDER_WORKERS
+        );
+        return Vec::new();
+    }
     let interfaces = candidates
         .iter()
         .map(|(name, _)| name.clone())
