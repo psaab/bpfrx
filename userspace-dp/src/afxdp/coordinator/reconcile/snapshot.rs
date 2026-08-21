@@ -419,17 +419,39 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
 /// `build_reconcile_forwarding` passes `Some(&coord.forwarding)` for
 /// carry-over (NAT/source-NAT allocator reuse, cold-path slot retention,
 /// zone-counter totals). But `ForwardingState::zone_counter_store` is a
-/// `Clone`-shares-the-inner-`Arc<Mutex>` store, and the build does
-/// `state.zone_counter_store = previous.zone_counter_store.clone();
-/// state.zone_counter_store.reconcile(&configured)` — an in-place `retain`
-/// UNDER THE SHARED LOCK. With `Some(&coord.forwarding)` a VALIDATION build
-/// would prune the LIVE, published `coord.forwarding.zone_counter_store`,
-/// dropping cumulative per-zone traffic totals for any zone absent from the
-/// candidate snapshot — a mutation of the live observability surface
-/// (`show security zones` / REST / Prometheus) that fires even when
-/// validation later REJECTS, and that the fail-closed restore cannot undo.
-/// `None` gives the discarded build FRESH default counter stores, so it
-/// touches no live state. Verdict PARITY with reconcile is preserved: NONE
+/// `Clone`-shares-the-inner-`Arc<Mutex>` store, so handing a VALIDATION build
+/// the live state hands it the live map, and the build writes to it.
+///
+/// **The harm this prevents changed shape in the #6832 r5 fold, and the
+/// conclusion survived the change — read the current reason, not the old one.**
+/// Until r5 the build ran `state.zone_counter_store.reconcile(&configured)`, an
+/// in-place `retain` under the shared lock, so a validation build with
+/// `Some(&coord.forwarding)` would have PRUNED the live published store,
+/// dropping cumulative per-zone totals for any zone absent from the candidate
+/// and silently resetting `show security zones` / REST / Prometheus. That
+/// specific harm is gone: the destructive prune now lives in
+/// `forwarding_build::commit_zone_counter_prune`, which only an APPLY path
+/// calls at its commit point, and which this validation gate never invokes.
+///
+/// What remains is the ADDITIVE half, and it is still a reason not to relax
+/// this. `attach_zone_counters` get-or-creates a block per SLOT-ASSIGNED zone
+/// (`ZoneCounterSlotMap::build` skips zone id 0 and stops at
+/// `ZONE_COUNTER_ASSIGNABLE_SLOTS`, so it is a subset of the configured set).
+/// With `Some(&coord.forwarding)` every validation build — including one whose
+/// deferred apply never happens — would leave a zero-valued block per
+/// candidate-only zone in the live map: the #6995 residue class, invisible to
+/// the sparse `snapshot()` and evicted only by the next committed prune.
+/// `None` gives the discarded build FRESH stores, so it touches no live state
+/// at all, which is the stronger and simpler guarantee.
+///
+/// #5716 NARROWED this, it did NOT subsume it. A build that REJECTS the
+/// snapshot touches the store not at all. A validation build that ACCEPTS
+/// still runs `attach_zone_counters` and would still write to the live store —
+/// and "accepted" is the common case here, since this gate exists to admit
+/// deferred applies. `previous = None` therefore remains load-bearing; do not
+/// relax it, and do not relax it on the grounds that the prune moved.
+///
+/// Verdict PARITY with reconcile is preserved: NONE
 /// of the fallible integrity legs (duplicate-zone-id, tunnel TTL, interface
 /// address, egress, route family/preference, neighbor family, NPTv6, filter
 /// unresolvable-token, CoS queue-id) reads `previous` for its accept/reject

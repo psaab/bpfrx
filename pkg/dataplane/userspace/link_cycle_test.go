@@ -300,6 +300,25 @@ func newLinkCycleProcessOnlyManager(t *testing.T, controlSock string) *Manager {
 	m.bpfShim.SelectUserspaceXDPShimEntryProgram()
 	m.lastRSTAttempt = time.Now()
 	m.lastRSTInstallOK = true
+	// #6871 round 10 (F1): release any link-cycle lease this manager ends up
+	// holding, HERE rather than at each call site.
+	//
+	// A real lease starts a real heartbeat, and most tests that take one do not
+	// install the fake ticker — so the goroutine sits on the production 15s
+	// period. Once a package run exceeds 15s (this one takes 38-56s) an orphan
+	// from an earlier test beats, reads the linkCycleLeaseElapsed package var,
+	// and races a later test swapping it through fakeLinkCycleClock. Measured:
+	// `go test -race` failed 1 run in 3 at the round-9 head, and every run under
+	// -count=5 on the link-cycle subset.
+	//
+	// Centralised deliberately. The review named three leaking sites; a sweep
+	// found twelve constructions through this helper and several more
+	// PrepareLinkCycle calls among them, including error paths that take the
+	// lease BEFORE the failure they are testing. Fixing the named three would
+	// have left the class open, and the next test to take a lease would reopen
+	// it. releaseLinkCycleLease is idempotent and stops-then-joins, so this is a
+	// no-op for the tests that already release.
+	t.Cleanup(m.releaseLinkCycleLease)
 	return m
 }
 
