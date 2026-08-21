@@ -1,3 +1,65 @@
+## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
+
+- **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
+- **Action**: Keyed `syslogHostMinSeverity` on the facility code the host's
+  `SyslogClient` actually stamps, so a `<facility> <severity>` selector naming a
+  different facility no longer sets that client's threshold.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/syslog_selector_5797_test.go` (new),
+  `pkg/daemon/syslog_severity_5314_test.go`, `pkg/logging/README.md`
+
+  Junos evaluates a host's selectors independently: `daemon info;
+  authorization critical` forwards daemon records at info-or-higher and
+  authorization records at critical-or-higher. xpf folded every selector with
+  `MoreRestrictiveMinSeverity`, so that config filtered the WHOLE destination at
+  critical and dropped the daemon notice/info records the operator had asked for
+  by name. `daemon info; authorization none` was the same defect at full
+  magnitude: `none` outranks everything in `minSeverityRestrictRank`, so one
+  selector naming a facility this client can never emit silenced the destination
+  outright, emergency included.
+
+  The key is the numeric facility CODE, not the authored name, because the code
+  is what appears in the wire PRI. Unmapped Junos names all resolve to local0,
+  so a host that really does stamp local0 stays constrained by them — the
+  selector and the emitted record share a facility on the wire, and pretending
+  otherwise would drop a real restriction. `any` is the wildcard and applies to
+  everything; an exact selector for the stamped facility displaces it
+  (Junos more-specific-wins). Two selectors naming the same facility are a
+  genuine conflict and still fold most-restrictive, which is what
+  `TestSyslogHostMinSeverity_Merge` should have been testing all along — it was
+  asserting the cross-facility fold, i.e. the defect, so it is retargeted rather
+  than deleted.
+
+  Not fixed here, and deliberately: a client carries one facility, so a host
+  naming two mappable facilities can still honor only the one it stamps, and
+  which one that is depends on selector order. Honoring both needs a source
+  facility on the event envelope and per-facility routing.
+
+  Mutation proof, both at production-reachable sites in
+  `syslogHostMinSeverity`:
+  - fold every non-wildcard selector (`case ... == stampedFacility:` ->
+    `default:`, restoring the blind fold) — `go test -count=1 ./pkg/daemon/
+    -run TestSyslogSelector` exit=1, three assertions red including
+    `min severity = SeverityNone: ... silenced the whole destination`;
+  - drop more-specific-wins (`if exactSet {` -> `if exactSet && !wildSet {`) —
+    exit=1, `TestSyslogSelector_ExactWinsOverWildcard` red in BOTH directions,
+    so it is not satisfiable by always taking the permissive threshold.
+
+  Follow-on in the same change: the correct semantics make an inapplicable
+  selector a SILENT no-op — the operator asked for `authorization critical` and
+  now gets neither the records nor a complaint — so `applySystemSyslog` warns
+  once per apply for every selector that names a facility this host's client
+  does not stamp. This is not the existing unmapped-NAME warning: `kern` is
+  perfectly well-formed and still inapplicable on a daemon-stamping host.
+  Mutations: deleting the warn call reds the positive subtest (exit=1);
+  widening it to every selector reds BOTH controls, `stamped_facility_stays_quiet`
+  and `wildcard_stays_quiet` (exit=1), so it cannot be satisfied by warning
+  unconditionally.
+
+  Control at HEAD: `go test -count=1 ./pkg/daemon/ ./pkg/logging/` exit=0.
+  `go vet ./pkg/daemon/` clean. Go-only change; no dataplane binary moves, so no
+  cluster smoke is owed.
+
 ## 2026-08-21 — #5192 item 1: `WorkerUmemInner` unmapped the UMEM before deleting it
 
 - **Timestamp**: 2026-08-21 (fix/5192-umem-drop-order)
@@ -98141,6 +98203,98 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: Correct four in-tree "deferred follow-up" claims that went stale
+  when the issues they pointed at were plan-killed. Claims-only round, but two
+  of the sentences are OPERATOR-FACING commit warnings, so this moves `.text`
+  and is bound by assertions rather than left to review.
+
+  The four claims and what each now says:
+
+  1. `#5837` Track-2 (the dedicated-intent-map DNAT-before-local dataplane fix)
+     was tracked as #6051 and is plan-killed. The two commit advisories told the
+     operator "the dataplane fix is deferred (Track-2)" — an operator reading
+     that would wait for something that is not coming instead of applying the
+     workaround the same sentence offers. Both now read "the dataplane fix is
+     not planned (#6051)". The surrounding doc comments record the three reasons
+     (the shim is still a real eBPF program under a real verifier, so the
+     1M-insn cap and tail-call ban bind; two correctness dimensions unsolved;
+     and the rev6052 interface-mode-SNAT fold showed the canonical masquerade +
+     WAN-port-forward config was never affected) and point at the preserved
+     design on branch `research/5837-xdp-dnat-before-local`.
+  2. `#5840`'s topology preflight said "Full day-2 runtime construction is the
+     separate #5840 follow-up" — but #5840 is closed, and the follow-up (#6187)
+     is plan-killed. The comment now states the restart/offline workflow is
+     terminal, and why: 200+ bare `d.cluster` read sites and rising, and SRX
+     couples the same transition to a reboot in the command itself.
+  3. `docs/ha-no-hitless-restart.md` carried the same stale "tracked as a
+     separate follow-up" line; replaced with a section giving the three reasons
+     and noting the `d.cluster` lifecycle-safety work is independently useful.
+  4. `#5818`'s NPTv6 scope reject said full scoped support was "deferred to a
+     /research follow-up"; that was #6043, plan-killed. The reject is now
+     recorded as the terminal disposition.
+
+  Validation: `go build ./...` exit 0; `go vet ./pkg/config/... ./pkg/daemon/...`
+  exit 0; `go test -count=1 ./pkg/config/...` exit 0 (43.2s);
+  `go test -count=1 ./pkg/daemon/...` exit 0 (37.1s). `gofmt -l` clean on every
+  touched file. Mutation matrix, ONE mutation per cell, one line each, exit
+  codes from `$?`: revert the DNAT advisory string to "deferred (Track-2)" →
+  exit 1 at the new assertion, static-NAT control stayed exit 0; revert the
+  static-NAT advisory string → exit 1, DNAT control stayed exit 0. Each cell
+  localises to its own site rather than masking its sibling. Restored → exit 0.
+  Go + Markdown only; no Rust, no shim `.o`, no protocol movement, so no cluster
+  smoke is owed.
+
+  Known remaining stale claim, deliberately NOT touched here: the #5174 NAT64
+  MissingNeighbor comment in `userspace-dp/src/afxdp/poll_descriptor/mod.rs`
+  still says full buffer-and-translate parity "is deferred to a follow-up"
+  (that follow-up was #6116, plan-killed). Editing it would move the helper
+  binary and owe a cluster smoke for a comment, so it is left for the next PR
+  that touches that file for a real reason.
+- **File(s)**: pkg/config/compiler_validate_warn_nat_iface_addr.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_interface_addr_nat_warning_5837_test.go,
+  pkg/daemon/cluster_topology_preflight.go,
+  docs/ha-no-hitless-restart.md, docs/userspace-dnat-plan.md, _Log.md
+- **Action**: #304 live half. The AF_XDP shim diverted every ESP packet and
+  every non-native GRE packet to the kernel on a PROTOCOL-ONLY test with no
+  destination predicate (`userspace-xdp/src/lib.rs`, the two `cpumap_or_pass`
+  returns ahead of the WireGuard branch), so TRANSIT ESP and transit non-native
+  GRE — addressed to a host beyond the firewall — reached the kernel forwarding
+  path with no zone policy evaluated (`ip_forward=1`, every nft chain
+  `policy accept`, no `hook forward` rule, no tc/clsact). The sibling WireGuard
+  branch has a destination gate its own comment calls MANDATORY, and the
+  DEGRADED path (`is_degraded_local_or_control`) already gates ESP on
+  `is_interface_nat_destination` and GRE on native-GRE + inner PASS_TO_KERNEL
+  and drops other transit — so the healthy path was the weaker of the two.
+  Deleted both protocol-only returns; ESP and non-native GRE now fall into the
+  ordinary session-miss classification, whose `is_local_destination` arm already
+  cpumaps a locally-terminated tunnel. Added the one case that arm cannot see:
+  a tunnel endpoint on an address interface-mode SNAT owns, which
+  `is_local_destination` deliberately reports false for — handled by reusing the
+  existing `is_interface_nat_destination` call rather than adding a second
+  lookup. A remote destination now reaches the worker and is adjudicated by the
+  table-scoped #5620 `owns_configured_ip` gate. Not the obvious
+  `is_local_destination` predicate at the original site (global maps; #5620
+  rules it out).
+
+  Validation: pinned toolchain nightly-2026-05-23 + bpf-linker 0.10.2, kernel
+  verifier gate PASS. Baseline rebuild reproduced byte-identically at 773,966
+  insns / 22.60% headroom; candidate 777,901 insns / 22.21% headroom — +3,935
+  insns, −0.39pp, well inside the #4555 floor. (A first shape that added an
+  explicit `is_interface_nat_destination || is_local_destination` conjunct at
+  the original site also verified but cost 810,906 insns / 18.91% — −3.69pp —
+  and was discarded for the reuse form.) `go build ./...` exit 0, `go vet
+  ./pkg/dataplane/...` exit 0, `go test -count=1 ./pkg/dataplane/...` exit 0
+  (manifest/facts gate green). The shim crate is `no_std` for
+  `bpfel-unknown-none` with no host test harness and its predicates read BPF
+  maps, so there is no host-side red for this property; the `.o` moved, so a
+  cluster smoke on the loss userspace cluster is owed and was NOT run by this
+  lane.
+- **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/userspace-dataplane-architecture.md, _Log.md
 
 ## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
 
