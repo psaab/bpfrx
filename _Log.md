@@ -90020,3 +90020,70 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/interfaces.go,
   pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
   userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6894 drive-to-merge pass at `6eb35c749`. Merged `origin/master`
+  (234 commits, MERGE not rebase; only `_Log.md` conflicted — union-resolved,
+  structural check 3141 = 2991 base + 19 ours + 131 theirs, anchored marker
+  sweep clean). Rebuilt the GENERATED `docs/refactoring-audit-current.txt`.
+
+  **The Codex MERGE-BLOCK at `cf79adff3` does NOT reproduce at this head.**
+  Verified firsthand with a from-scratch fixture (own zone + VLAN
+  sub-interface) driven through production `CompileConfig`, NOT by trusting
+  the `ba3aa2c40` fold: all seven malformed NPTv6 classes — including Codex's
+  verbatim `2001:db8:9::/48` / `not-a-prefix` — are rejected by the pre-pass's
+  `nptv6` row with `zoneConfigCalls=0 vlanIfaceInfoCall=0 ifaceSetupCalls=0`,
+  and the valid control still compiles.
+
+  Ran the fidelity question as a **differential** rather than on hand-picked
+  cases: 21 candidate prefix strings through Go's `net.ParseCIDR` + the
+  length/family/host-bits gates, and a verbatim `rustc`-compiled copy of Rust's
+  `parse_prefix`. **No string is Go-accept / Rust-reject** — the property the
+  review said was false holds. Exactly one diverges the other way (F1).
+
+  **Hostile runtime pass (Go, apply/rollback ordering) — all held:**
+  - Nil-deref through `discardingDataPlane`'s nil embedded interface: audited
+    all 55 non-test `dp.<Method>(` call sites in `pkg/dataplane` mapped to
+    enclosing functions. The 16 un-overridden methods live ONLY in
+    `compileZones`/`mapZoneInterface`/`programZoneMaps`/`applyTunnelHostInbound`,
+    `compileFirewallFilters`, `compilePortMirroring` and `CompileConfig` — none
+    is a `validationPhases` row. Grep is complete: every `DataPlane`-typed
+    param in non-test `pkg/dataplane` is named `dp` (32/32).
+  - Over-rejection from the pre-pass's empty `ifCache`: every `return
+    fmt.Errorf` in `compileNAT` is config-shaped or a `dp` error; none is gated
+    on `hasV4`/`hasV6`/`ifCache`.
+  - Typed-nil `GetPersistentNAT`: both call sites nil-check; neither `pnat`
+    path returns an error.
+  - Double-compile side effects on `cfg`: none. `compilePolicies`' `rule` is a
+    LOCAL `PolicyRule` literal; `assignZoneIDs` is pure.
+
+  **Findings filed, not folded** (campaign bar: non-runtime / pre-existing do
+  not block):
+  - **#7077** — the ONE PR-introduced behaviour change. Rust's `parse_prefix`
+    accepts a `+`-prefixed mask (`u8::from_str`) that Go's `net.ParseCIDR`
+    refuses, so `nptv6-prefix fd00:9::/+48` applied SUCCESSFULLY before this PR
+    and now hard-fails. Reachability measured end-to-end through
+    `ParseSetCommand` + `SetPath` + `CompileConfigLenient` (rule RETAINED with
+    the #1960 warning). Filed rather than folded because the correct fix is on
+    the Rust side and would make a Go-only PR owe a cluster smoke.
+  - **#7078** — pre-existing residual, same shape as the block that was closed:
+    the pre-pass does not replicate the helper's zone-partitioned NPTv6 overlap
+    rejection (#2241/#5176). Measured: `validateBeforeMutate` -> nil,
+    `CompileConfig` -> tripwire with `zoneConfigCalls=1` (mutation phase
+    entered). Identical on master. Records why reusing `validateNPTv6Strict`'s
+    overlap check is WRONG (it does not partition by zone).
+  - **#7079** — pre-existing: `(*Manager).Compile` `os.Remove`s every
+    `/sys/fs/bpf/xpf/links/xdp_*` pin, and `CompileUserspaceShim` runs two more
+    bpffs cleanups, ALL before `CompileConfig` — so host state is mutated ahead
+    of the pre-pass. Bounded (`m.xdpLinks` holds the fd, running attach
+    survives); costs pin survival across a daemon restart.
+
+  Validation, real `$?` written to a file (no piped gate): `go build ./...`
+  rc=0; `go vet ./...` rc=0; `go test -count=1 ./pkg/dataplane/...
+  ./pkg/config/... ./pkg/configstore/...` rc=0; `go test -count=1 ./...` rc=0
+  (62 packages ok, zero FAIL, #6743 `.dpCell` canary included). Diff is
+  **Go-only** — nothing under `userspace-dp/`, `userspace-xdp/`, `bpf/` — so
+  **no cluster smoke is owed**. `Closes #4960` deliberately ABSENT: the body
+  says "Advances #4960 (bounded increment)" and #7078 is a measured residual.
+  Verdict: **MERGE-READY**.
+- **File(s)**: _Log.md, docs/refactoring-audit-current.txt
