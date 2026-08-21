@@ -21,7 +21,8 @@ import (
 func TestSyslogHostMinSeverity_AnyCritical(t *testing.T) {
 	facilities := []config.SyslogFacility{{Facility: "any", Severity: "critical"}}
 
-	min := syslogHostMinSeverity(facilities)
+	// `any` is the wildcard: it applies whatever facility the client stamps.
+	min := syslogHostMinSeverity(facilities, logging.FacilityDaemon)
 	if min != logging.SyslogCritical {
 		t.Fatalf("syslogHostMinSeverity(any critical) = %d, want %d (critical)", min, logging.SyslogCritical)
 	}
@@ -44,7 +45,7 @@ func TestSyslogHostMinSeverity_AnyCritical(t *testing.T) {
 // NOT the send-all sentinel. The old `if sev > 0` guard would also have dropped
 // emergency (its threshold code is negative), leaving MinSeverity at 0.
 func TestSyslogHostMinSeverity_EmergencyNotSendAll(t *testing.T) {
-	min := syslogHostMinSeverity([]config.SyslogFacility{{Facility: "any", Severity: "emergency"}})
+	min := syslogHostMinSeverity([]config.SyslogFacility{{Facility: "any", Severity: "emergency"}}, logging.FacilityDaemon)
 	if min != logging.SeverityEmergency {
 		t.Fatalf("syslogHostMinSeverity(any emergency) = %d, want %d (emergency)", min, logging.SeverityEmergency)
 	}
@@ -57,25 +58,32 @@ func TestSyslogHostMinSeverity_EmergencyNotSendAll(t *testing.T) {
 	}
 }
 
-// TestSyslogHostMinSeverity_Merge folds several facility pairs into the most
-// restrictive client filter, and confirms an unspecified severity defaults to
-// send-all.
-func TestSyslogHostMinSeverity_Merge(t *testing.T) {
-	// Most restrictive of {info, critical, warning} is critical.
+// TestSyslogHostMinSeverity_SameFacilityMerge folds several pairs naming the
+// SAME facility into the most restrictive client filter, and confirms an
+// unspecified severity defaults to send-all.
+//
+// #5797 retarget: this test previously asserted a cross-FACILITY fold —
+// {daemon info, kern critical, auth warning} => critical — which is the defect
+// #5797 names, not a contract. `MoreRestrictiveMinSeverity` is still the merge
+// rule; what changed is the POPULATION it merges, which is now only the
+// selectors that can match a record this client emits. Two selectors naming one
+// facility remain a genuine conflict on that facility and still fold.
+func TestSyslogHostMinSeverity_SameFacilityMerge(t *testing.T) {
+	// Most restrictive of {info, critical, warning} on ONE facility is critical.
 	min := syslogHostMinSeverity([]config.SyslogFacility{
 		{Facility: "daemon", Severity: "info"},
-		{Facility: "kern", Severity: "critical"},
-		{Facility: "auth", Severity: "warning"},
-	})
+		{Facility: "daemon", Severity: "critical"},
+		{Facility: "daemon", Severity: "warning"},
+	}, logging.FacilityDaemon)
 	if min != logging.SyslogCritical {
-		t.Errorf("merge = %d, want %d (critical, most restrictive)", min, logging.SyslogCritical)
+		t.Errorf("same-facility merge = %d, want %d (critical, most restrictive)", min, logging.SyslogCritical)
 	}
 
 	// No facilities / no severity => 0 (send-all) default.
-	if got := syslogHostMinSeverity(nil); got != 0 {
+	if got := syslogHostMinSeverity(nil, logging.FacilityDaemon); got != 0 {
 		t.Errorf("syslogHostMinSeverity(nil) = %d, want 0 (send-all)", got)
 	}
-	if got := syslogHostMinSeverity([]config.SyslogFacility{{Facility: "daemon"}}); got != 0 {
+	if got := syslogHostMinSeverity([]config.SyslogFacility{{Facility: "daemon"}}, logging.FacilityDaemon); got != 0 {
 		t.Errorf("syslogHostMinSeverity(no severity) = %d, want 0 (send-all)", got)
 	}
 }
