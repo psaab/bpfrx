@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -9,217 +8,200 @@ import (
 	"github.com/psaab/xpf/pkg/fwdstatus"
 )
 
+// #2114: the daemon forwarding-status adapter narrowed to the sampler's
+// CachedStatusProvider surface (the IsLoaded/GetMapStats/Status methods
+// left the daemon adapter — the gRPC/CLI Build paths construct their own
+// per-request adapters and are untouched). These tests pin the narrowed
+// contract: per-call probing of the CURRENTLY published dataplane.
+
 type forwardingStatusDaemonTestDP struct {
 	runtimeOnlyApplyTestDP
 	dataplane.DataPlane
-
-	loaded   bool
-	mapStats []dataplane.MapStats
 }
 
-func (f *forwardingStatusDaemonTestDP) IsLoaded() bool {
-	return f.loaded
-}
+// Close/Teardown shadow the ambiguous embedded pair
+// (runtimeOnlyApplyTestDP vs the nil dataplane.DataPlane interface).
+func (f *forwardingStatusDaemonTestDP) Close() error    { return nil }
+func (f *forwardingStatusDaemonTestDP) Teardown() error { return nil }
 
-func (f *forwardingStatusDaemonTestDP) Close() error {
-	return nil
-}
-
-func (f *forwardingStatusDaemonTestDP) Teardown() error {
-	return nil
-}
-
-func (f *forwardingStatusDaemonTestDP) GetMapStats() []dataplane.MapStats {
-	return f.mapStats
-}
-
-// Telemetry overrides runtimeOnlyApplyTestDP.Telemetry() so the
-// fixture's GetMapStats() surface reaches forwardingStatusDataplane
-// through the runtime Telemetry domain. The post-#1519 daemon path
-// reads map stats via d.dp.Telemetry().MapStats() rather than the
-// legacy DataPlane interface; this override keeps the existing
-// test cases (mapStats injected on f) green by routing through the
-// runtime domain.
-func (f *forwardingStatusDaemonTestDP) Telemetry() dataplane.Telemetry {
-	return forwardingStatusTestTelemetry{stats: f.mapStats}
-}
-
-type forwardingStatusTestTelemetry struct {
-	stats []dataplane.MapStats
-}
-
-func (t forwardingStatusTestTelemetry) NewEventSource() (dataplane.EventSource, error) {
-	return nil, nil
-}
-func (t forwardingStatusTestTelemetry) GlobalCounter(uint32) (uint64, error) { return 0, nil }
-func (t forwardingStatusTestTelemetry) InterfaceCounters(int) (dataplane.InterfaceCounterValue, error) {
-	return dataplane.InterfaceCounterValue{}, nil
-}
-func (t forwardingStatusTestTelemetry) ZoneCounters(uint16, int) (dataplane.CounterValue, error) {
-	return dataplane.CounterValue{}, nil
-}
-func (t forwardingStatusTestTelemetry) PolicyCounters(uint32) (dataplane.CounterValue, error) {
-	return dataplane.CounterValue{}, nil
-}
-func (t forwardingStatusTestTelemetry) FilterCounters(uint32) (dataplane.CounterValue, error) {
-	return dataplane.CounterValue{}, nil
-}
-func (t forwardingStatusTestTelemetry) NATRuleCounter(uint32) (dataplane.CounterValue, error) {
-	return dataplane.CounterValue{}, nil
-}
-func (t forwardingStatusTestTelemetry) NATPortCounter(uint32) (uint64, error) { return 0, nil }
-func (t forwardingStatusTestTelemetry) MapStats() []dataplane.MapStats        { return t.stats }
-func (t forwardingStatusTestTelemetry) ReadFloodCounters(uint16) (dataplane.FloodState, error) {
-	return dataplane.FloodState{}, nil
-}
-
+// forwardingStatusDaemonUserspaceTestDP models the userspace adapter's
+// CachedStatus probe surface (#3970).
 type forwardingStatusDaemonUserspaceTestDP struct {
 	*forwardingStatusDaemonTestDP
 
-	status      dpuserspace.ProcessStatus
-	statusCalls int
+	status            dpuserspace.ProcessStatus
+	cachedStatusOK    bool
+	cachedStatusCalls int
 }
 
-func (f *forwardingStatusDaemonUserspaceTestDP) Status() (dpuserspace.ProcessStatus, error) {
-	f.statusCalls++
-	return f.status, nil
+func (f *forwardingStatusDaemonUserspaceTestDP) CachedStatus() (dpuserspace.ProcessStatus, bool) {
+	f.cachedStatusCalls++
+	return f.status, f.cachedStatusOK
 }
 
-func TestForwardingStatusDataplaneProjectsMapStats(t *testing.T) {
-	dp := &forwardingStatusDaemonTestDP{
-		loaded: true,
-		mapStats: []dataplane.MapStats{
-			{
-				Name:       "sessions",
-				Type:       "Hash",
-				MaxEntries: 512,
-				UsedCount:  128,
-				KeySize:    16,
-				ValueSize:  64,
-			},
-			{
-				Name:       "policy",
-				Type:       "PerCPUArray",
-				MaxEntries: 8,
-				UsedCount:  8,
-				KeySize:    4,
-				ValueSize:  128,
-			},
-		},
-	}
-	d := &Daemon{dp: dp}
-
-	accessor := d.forwardingStatusDataplane()
-	if accessor == nil {
-		t.Fatal("forwardingStatusDataplane() returned nil")
-	}
-	if !accessor.IsLoaded() {
-		t.Fatal("IsLoaded() = false, want true")
-	}
-
-	got := accessor.GetMapStats()
-	want := []fwdstatus.MapStats{
-		{Type: "Hash", MaxEntries: 512, UsedCount: 128},
-		{Type: "PerCPUArray", MaxEntries: 8, UsedCount: 8},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("GetMapStats() = %#v, want %#v", got, want)
-	}
-}
-
-func TestForwardingStatusDataplaneUsesUserspaceStatusAdapter(t *testing.T) {
+// TestForwardingStatusAdapterProjectsCachedStatus is the narrowed-adapter
+// successor of the pre-#2114 ProjectsMapStats/UsesUserspaceStatusAdapter
+// pair: the adapter forwards CachedStatus to the currently published
+// userspace dataplane on every call.
+func TestForwardingStatusAdapterProjectsCachedStatus(t *testing.T) {
 	dp := &forwardingStatusDaemonUserspaceTestDP{
-		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{loaded: true},
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{},
 		status: dpuserspace.ProcessStatus{
 			WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{
 				ThreadCPUNS: 987,
 				WallNS:      654,
 			}},
 		},
+		cachedStatusOK: true,
 	}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp)
 
-	accessor := d.forwardingStatusDataplane()
-	statusAccessor, ok := accessor.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	})
+	provider := d.forwardingStatusDataplane()
+	if provider == nil {
+		t.Fatal("forwardingStatusDataplane() returned nil")
+	}
+	got, ok := provider.CachedStatus()
 	if !ok {
-		t.Fatalf("forwardingStatusDataplane() = %T, want userspace Status adapter", accessor)
+		t.Fatal("CachedStatus() ok = false, want true")
 	}
-
-	got, err := statusAccessor.Status()
-	if err != nil {
-		t.Fatalf("Status() error = %v", err)
-	}
-	if dp.statusCalls != 1 {
-		t.Fatalf("Status() calls = %d, want 1", dp.statusCalls)
+	if dp.cachedStatusCalls != 1 {
+		t.Fatalf("CachedStatus() calls = %d, want 1", dp.cachedStatusCalls)
 	}
 	if len(got.WorkerRuntime) != 1 || got.WorkerRuntime[0].ThreadCPUNS != 987 {
-		t.Fatalf("Status() = %#v, want injected userspace status", got)
+		t.Fatalf("CachedStatus() = %#v, want injected userspace status", got)
 	}
 }
 
-func TestForwardingStatusDataplaneUsesCurrentDataplaneAfterSwap(t *testing.T) {
+// TestForwardingStatusAdapterNonUserspaceUnavailable pins the
+// non-userspace leg: a published dataplane without the CachedStatus probe
+// reports ok=false (the sampler holds its last counters), not an error.
+func TestForwardingStatusAdapterNonUserspaceUnavailable(t *testing.T) {
+	d := &Daemon{}
+	d.setDataplane(&forwardingStatusDaemonTestDP{})
+
+	provider := d.forwardingStatusDataplane()
+	if provider == nil {
+		t.Fatal("forwardingStatusDataplane() returned nil")
+	}
+	if _, ok := provider.CachedStatus(); ok {
+		t.Fatal("CachedStatus() ok = true for a non-userspace dataplane, want false")
+	}
+}
+
+// TestForwardingStatusAdapterUsesCurrentDataplaneAfterSwap maps the
+// pre-#2114 UsesCurrentDataplaneAfterSwap test onto the narrowed shape:
+// the single-method adapter probes the CURRENT cell contents per call, so
+// a backend swap (or teardown to nil) is picked up on the very next call.
+func TestForwardingStatusAdapterUsesCurrentDataplaneAfterSwap(t *testing.T) {
 	first := &forwardingStatusDaemonUserspaceTestDP{
-		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{
-			loaded: true,
-			mapStats: []dataplane.MapStats{{
-				Type:       "Hash",
-				MaxEntries: 16,
-				UsedCount:  4,
-			}},
-		},
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{},
 		status: dpuserspace.ProcessStatus{
 			WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{
 				ThreadCPUNS: 111,
 				WallNS:      222,
 			}},
 		},
+		cachedStatusOK: true,
 	}
 	second := &forwardingStatusDaemonUserspaceTestDP{
-		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{
-			loaded: true,
-			mapStats: []dataplane.MapStats{{
-				Type:       "LPMTrie",
-				MaxEntries: 32,
-				UsedCount:  8,
-			}},
-		},
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{},
 		status: dpuserspace.ProcessStatus{
 			WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{
 				ThreadCPUNS: 333,
 				WallNS:      444,
 			}},
 		},
+		cachedStatusOK: true,
 	}
-	d := &Daemon{dp: first}
+	d := &Daemon{}
+	d.setDataplane(first)
 
-	accessor := d.forwardingStatusDataplane()
-	statusAccessor, ok := accessor.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	})
+	provider := d.forwardingStatusDataplane()
+	if provider == nil {
+		t.Fatal("forwardingStatusDataplane() returned nil")
+	}
+
+	d.setDataplane(second)
+
+	got, ok := provider.CachedStatus()
 	if !ok {
-		t.Fatalf("forwardingStatusDataplane() = %T, want userspace Status adapter", accessor)
+		t.Fatal("CachedStatus() after dp swap ok = false, want true")
 	}
-
-	d.dp = second
-
-	if got, want := accessor.GetMapStats(), []fwdstatus.MapStats{
-		{Type: "LPMTrie", MaxEntries: 32, UsedCount: 8},
-	}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("GetMapStats() after dp swap = %#v, want %#v", got, want)
+	if first.cachedStatusCalls != 0 {
+		t.Fatalf("first CachedStatus() calls = %d, want 0", first.cachedStatusCalls)
 	}
-	got, err := statusAccessor.Status()
-	if err != nil {
-		t.Fatalf("Status() after dp swap error = %v", err)
-	}
-	if first.statusCalls != 0 {
-		t.Fatalf("first Status() calls = %d, want 0", first.statusCalls)
-	}
-	if second.statusCalls != 1 {
-		t.Fatalf("second Status() calls = %d, want 1", second.statusCalls)
+	if second.cachedStatusCalls != 1 {
+		t.Fatalf("second CachedStatus() calls = %d, want 1", second.cachedStatusCalls)
 	}
 	if len(got.WorkerRuntime) != 1 || got.WorkerRuntime[0].ThreadCPUNS != 333 {
-		t.Fatalf("Status() after dp swap = %#v, want second dataplane status", got)
+		t.Fatalf("CachedStatus() after dp swap = %#v, want second dataplane status", got)
+	}
+
+	// Teardown to nil: the next call reports unavailable.
+	d.setDataplane(nil)
+	if _, ok := provider.CachedStatus(); ok {
+		t.Fatal("CachedStatus() after teardown ok = true, want false")
+	}
+}
+
+// TestForwardingStatusAdapterIsNotDataPlaneAccessor pins the structural
+// exclusion (#2114): the collapsed sampler-only adapter must NOT satisfy
+// fwdstatus.DataPlaneAccessor, because Build keys backend identity on
+// Status() presence and this type can never be routed there. The `var _`
+// idiom cannot express the negative, so this is a plain type assertion.
+//
+// Codex PR #6743 r4-F3: BOTH method sets are checked. Testing only the
+// value left an escape — a pointer-receiver Status()/IsLoaded() pair puts
+// DataPlaneAccessor on *forwardingStatusDaemonDataPlane and NOT on the
+// value, so the value-only assertion stayed green while the pointer form
+// became routable the moment the constructor returned an address.
+func TestForwardingStatusAdapterIsNotDataPlaneAccessor(t *testing.T) {
+	var _ fwdstatus.CachedStatusProvider = forwardingStatusDaemonDataPlane{}
+
+	if _, ok := any(forwardingStatusDaemonDataPlane{}).(fwdstatus.DataPlaneAccessor); ok {
+		t.Fatal("forwardingStatusDaemonDataPlane must not satisfy fwdstatus.DataPlaneAccessor")
+	}
+	if _, ok := any(&forwardingStatusDaemonDataPlane{}).(fwdstatus.DataPlaneAccessor); ok {
+		t.Fatal("*forwardingStatusDaemonDataPlane must not satisfy fwdstatus.DataPlaneAccessor " +
+			"(a pointer-receiver Status/IsLoaded pair evades the value-only assertion)")
+	}
+}
+
+// TestForwardingStatusDataplaneConstructionContract pins the narrowed
+// constructor contract: nil receiver and NoDataplane mode return nil, but
+// an initially-empty cell (bootstrap mode, dataplane constructed but not
+// yet armed/published) returns a NON-nil provider whose per-call probe
+// reports ok=false until a backend publishes — the pre-#2114 constructor
+// returned nil whenever the dataplane field was nil at construction time, permanently
+// hiding a later-published backend from the sampler.
+func TestForwardingStatusDataplaneConstructionContract(t *testing.T) {
+	var nilDaemon *Daemon
+	if got := nilDaemon.forwardingStatusDataplane(); got != nil {
+		t.Fatalf("nil receiver: forwardingStatusDataplane() = %v, want nil", got)
+	}
+
+	noDP := &Daemon{opts: Options{NoDataplane: true}}
+	if got := noDP.forwardingStatusDataplane(); got != nil {
+		t.Fatalf("NoDataplane: forwardingStatusDataplane() = %v, want nil", got)
+	}
+
+	d := &Daemon{}
+	provider := d.forwardingStatusDataplane()
+	if provider == nil {
+		t.Fatal("empty cell: forwardingStatusDataplane() returned nil, want non-nil probing provider")
+	}
+	if _, ok := provider.CachedStatus(); ok {
+		t.Fatal("empty cell: CachedStatus() ok = true, want false")
+	}
+
+	// A later publication is picked up by the SAME provider.
+	dp := &forwardingStatusDaemonUserspaceTestDP{
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{},
+		cachedStatusOK:               true,
+	}
+	d.setDataplane(dp)
+	if _, ok := provider.CachedStatus(); !ok {
+		t.Fatal("CachedStatus() after publication ok = false, want true")
 	}
 }

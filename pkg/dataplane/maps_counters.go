@@ -43,8 +43,11 @@ var ErrCounterNotPopulated = errors.New("counter not populated in userspace data
 
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
 func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
-	zm, ok := m.maps["global_counters"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("global_counters")
+	if st == registryFresh {
+		return 0, fmt.Errorf("%w: global_counters", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return 0, fmt.Errorf("global_counters map not found")
 	}
 	var perCPU []uint64
@@ -97,8 +100,11 @@ func (m *Manager) ReadUserspaceCounterOffset(index uint32) uint64 {
 // interface_counters is a PERCPU_HASH (#756): a missing key simply means
 // no traffic has traversed the interface yet, which reads as zero.
 func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, error) {
-	zm, ok := m.maps["interface_counters"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("interface_counters")
+	if st == registryFresh {
+		return InterfaceCounterValue{}, fmt.Errorf("%w: interface_counters", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return InterfaceCounterValue{}, fmt.Errorf("interface_counters map not found")
 	}
 	var perCPU []InterfaceCounterValue
@@ -253,8 +259,10 @@ func (m *Manager) ClearGlobalCounters() error {
 	m.userspaceCounterOffsets = nil
 	m.mu.Unlock()
 
-	zm, ok := m.maps["global_counters"]
-	if !ok {
+	// #2114 A3 class 3: state-independent pinned behavior — scoped lookup
+	// only; the zeroing below runs off-lock on the copied handle.
+	zm, present, _ := m.lookupMapLocked("global_counters")
+	if !present {
 		// Userspace-only runtime with no BPF map loaded: the offset reset above
 		// is the meaningful clear, so a missing array is not an error (parity
 		// with ClearZoneCounters/ClearNATRuleCounters).
@@ -274,10 +282,31 @@ func (m *Manager) ClearGlobalCounters() error {
 // interface_counters is a PERCPU_HASH (#756): iterate-and-zero existing
 // keys; missing keys stay absent and read as zero.
 func (m *Manager) ClearInterfaceCounters() error {
-	zm, ok := m.maps["interface_counters"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("interface_counters")
+	if st == registryFresh {
+		return fmt.Errorf("%w: interface_counters", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("interface_counters map not found")
 	}
+	return clearInterfaceCountersIn(zm)
+}
+
+// clearInterfaceCountersRaw is the UNGATED composition leg for
+// ClearAllCounters (#2114 A3 nested-call rule — class-3 hybrids compose
+// through internal raw helpers, never the public gated methods, so the
+// pinned legacy "interface_counters map not found" text survives in every
+// state instead of being replaced by ErrDataplaneNotArmed; the userspace
+// manager counter tests tolerate exactly that text on a mapless manager).
+func (m *Manager) clearInterfaceCountersRaw() error {
+	zm, present, _ := m.lookupMapLocked("interface_counters")
+	if !present {
+		return fmt.Errorf("interface_counters map not found")
+	}
+	return clearInterfaceCountersIn(zm)
+}
+
+func clearInterfaceCountersIn(zm *ebpf.Map) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]InterfaceCounterValue, numCPUs)
 	var key uint32
@@ -305,8 +334,9 @@ func (m *Manager) ClearZoneCounters() error {
 	// even when the legacy dense BPF map is absent, mirroring
 	// ClearNATRuleCounters.
 	m.ClearZoneCounterOffsets()
-	zm, ok := m.maps["zone_counters"]
-	if !ok {
+	// #2114 A3 class 3 (see ClearGlobalCounters).
+	zm, present, _ := m.lookupMapLocked("zone_counters")
+	if !present {
 		return nil
 	}
 	numCPUs := ebpf.MustPossibleCPU()
@@ -318,11 +348,17 @@ func (m *Manager) ClearZoneCounters() error {
 }
 
 // ClearAllCounters zeroes all counter maps (global, interface, zone, policy, filter).
+//
+// #2114 A3 class 3 nested-call rule: the composition runs through the
+// UNGATED raw internals (clearInterfaceCountersRaw / clearPolicyCountersRaw /
+// clearFilterCountersRaw) and the class-3 public clears (global/zone —
+// ungated by design), never the gated class-1 public forms, so the pinned
+// pre-arm legacy error texts survive byte-for-byte in every registry state.
 func (m *Manager) ClearAllCounters() error {
 	if err := m.ClearGlobalCounters(); err != nil {
 		return err
 	}
-	if err := m.ClearInterfaceCounters(); err != nil {
+	if err := m.clearInterfaceCountersRaw(); err != nil {
 		return err
 	}
 	if err := m.ClearZoneCounters(); err != nil {
@@ -331,8 +367,8 @@ func (m *Manager) ClearAllCounters() error {
 	// #3643: drop the userspace-reported per-zone flood offsets too (no dense
 	// map to zero -- flood counters live only in the sparse offset map now).
 	m.ClearFloodCounterOffsets()
-	if err := m.ClearPolicyCounters(); err != nil {
+	if err := m.clearPolicyCountersRaw(); err != nil {
 		return err
 	}
-	return m.ClearFilterCounters()
+	return m.clearFilterCountersRaw()
 }

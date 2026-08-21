@@ -24,6 +24,16 @@ const maxEventFramePayloadForWiringTest = 1 << 20
 
 func (p fixedEventStreamProvider) EventStream() *dpuserspace.EventStream { return p.es }
 
+// eventStreamCellBackend is a publishable RuntimeDataPlane that also
+// implements userspaceEventStreamProvider, so the wiring loop can resolve
+// it out of the daemon's #2114 cell (r6-F4).
+type eventStreamCellBackend struct {
+	*dataplane.Manager
+	es *dpuserspace.EventStream
+}
+
+func (b *eventStreamCellBackend) EventStream() *dpuserspace.EventStream { return b.es }
+
 // buildSessionOpenFrameV4PayloadForWiringTest builds a v4 SessionOpen payload
 // in the #2467 widened wire layout consumed by
 // pkg/dataplane/userspace.decodeSessionEvent:
@@ -1067,8 +1077,16 @@ func TestWireUserspaceEventStreamCallbacksStandaloneWiresSessionAndFullResync(t 
 	}
 	defer es.Close()
 
+	// #6743 r6-F4: the wiring resolves the provider from the #2114 cell
+	// per poll rather than taking one as an argument, so the fake is
+	// PUBLISHED here. That is the production shape: a provider handed in
+	// by the caller could be a backend the daemon has already disowned.
 	d := &Daemon{}
-	if !d.wireUserspaceEventStreamCallbacks(ctx, fixedEventStreamProvider{es: es}) {
+	d.setDataplane(&eventStreamCellBackend{
+		Manager: dataplane.New(),
+		es:      es,
+	})
+	if d.wireUserspaceEventStreamCallbacks(ctx) == nil {
 		t.Fatal("expected callback wiring to succeed")
 	}
 
