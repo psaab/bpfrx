@@ -718,6 +718,30 @@ impl SourceNatRule {
         true
     }
 
+    /// Does the flow satisfy this rule's `from zone` / `to zone` clause? An
+    /// empty zone on the rule is a wildcard (unscoped rule-set).
+    fn zone_matches(&self, from_zone: &str, to_zone: &str) -> bool {
+        (self.from_zone.is_empty() || self.from_zone == from_zone)
+            && (self.to_zone.is_empty() || self.to_zone == to_zone)
+    }
+
+    /// Does the flow satisfy this rule's `match source-address` /
+    /// `match destination-address` sets? A cross-family (v4 source, v6
+    /// destination or vice versa) tuple can never match a rule.
+    fn address_matches(&self, src_ip: IpAddr, dst_ip: IpAddr) -> bool {
+        match (src_ip, dst_ip) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                nets_match_v4(self.source_constrained, &self.source_v4, src)
+                    && nets_match_v4(self.destination_constrained, &self.destination_v4, dst)
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                nets_match_v6(self.source_constrained, &self.source_v6, src)
+                    && nets_match_v6(self.destination_constrained, &self.destination_v6, dst)
+            }
+            _ => false,
+        }
+    }
+
     fn matches(
         &self,
         scope: &NatScopeCtx,
@@ -730,29 +754,47 @@ impl SourceNatRule {
         src_port: u16,
         dst_port: u16,
     ) -> bool {
-        if !self.from_zone.is_empty() && self.from_zone != from_zone {
-            return false;
-        }
-        if !self.to_zone.is_empty() && self.to_zone != to_zone {
-            return false;
-        }
-        if !self.scope_matches(scope) {
-            return false;
-        }
-        if !self.l4_matches(tuple_unknown, protocol, src_port, dst_port) {
-            return false;
-        }
-        match (src_ip, dst_ip) {
-            (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                nets_match_v4(self.source_constrained, &self.source_v4, src)
-                    && nets_match_v4(self.destination_constrained, &self.destination_v4, dst)
-            }
-            (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                nets_match_v6(self.source_constrained, &self.source_v6, src)
-                    && nets_match_v6(self.destination_constrained, &self.destination_v6, dst)
-            }
-            _ => false,
-        }
+        self.zone_matches(from_zone, to_zone)
+            && self.scope_matches(scope)
+            && self.l4_matches(tuple_unknown, protocol, src_port, dst_port)
+            && self.address_matches(src_ip, dst_ip)
+    }
+
+    /// #6211: [`matches`] minus the #3096 interface / routing-instance
+    /// `scope_matches` axis, for the HA STANDBY's synced-reservation rule
+    /// selection ([`reserve_synced_source_nat_allocation`]).
+    ///
+    /// The standby re-derives which source-NAT rule the ACTIVE node matched
+    /// from the synced session alone. Every axis except the scope is carried
+    /// on (or derivable from) the HA session-sync wire: the zone pair rides as
+    /// `ingress_zone_id`/`egress_zone_id`, and the 5-tuple is the session key
+    /// itself. The scope axis is NOT: `NatScopeCtx` is built from the LOCAL
+    /// `ifindex_to_config_name` / `ifindex_to_routing_instance` maps keyed on
+    /// the ACTIVE node's ingress/egress ifindices, which the standby does not
+    /// have (a synced entry's ifindices are the peer's and are re-resolved
+    /// locally on import).
+    ///
+    /// So the scope is treated as UNCONSTRAINED here rather than as a
+    /// mismatch. Rejecting an interface-scoped rule the standby cannot confirm
+    /// would push the selection PAST the rule the active actually used and
+    /// onto a later one — strictly worse than the pre-#6211 first-pool-match.
+    /// Ignoring the axis only declines to narrow on it: every other axis still
+    /// narrows, and the pre-#6211 selection narrowed on none of them.
+    #[allow(clippy::too_many_arguments)]
+    fn matches_ignoring_scope(
+        &self,
+        from_zone: &str,
+        to_zone: &str,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        tuple_unknown: bool,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+    ) -> bool {
+        self.zone_matches(from_zone, to_zone)
+            && self.l4_matches(tuple_unknown, protocol, src_port, dst_port)
+            && self.address_matches(src_ip, dst_ip)
     }
 }
 
@@ -1242,20 +1284,85 @@ fn release_source_nat_allocation_with_mode(
         src_port: key.src_port,
         dst_port: key.dst_port,
     };
+    // #6211: free from EVERY allocator that holds this exact
+    // `(flow, translated)` — do NOT stop at the first.
+    //
+    // State the reason accurately, because the sweep rests on it (#6876): the
+    // reserve has NEVER been a pure function of `rules`, so the "at most one
+    // allocator holds a given flow" invariant did not hold even against an
+    // UNCHANGED rule set. `reserve_synced_on_first_pool_owner` takes the first
+    // rule whose allocator ACCEPTS and skips one that refuses — selection is
+    // OCCUPANCY-dependent. That is pre-#6211 behaviour, not something this fix
+    // introduced: the pre-#6211 loop had the same per-rule fall-through and its
+    // own comment described it ("a collision on the standby ... leaves the rule
+    // untouched and tries the next"). So a rule that refused while an unrelated
+    // local flow held the identity, and accepted later once that flow retired,
+    // could ALREADY put one flow in two allocators across a re-upsert — every
+    // live session re-upserts on HA session-sync reconnect and on a
+    // post-delete-journal-overflow resync — with the rule set untouched.
+    //
+    // Two other routes reach the same state. `parse_source_nat_rules_with_previous`
+    // carries allocators over keyed on `allocator_key()` alone, so an edit that
+    // reshuffled which rule a session matched could strand a flow in a
+    // carried-over allocator. And #6211's two-pass selection adds a third:
+    // pass 1 and pass 2 can choose DIFFERENT rules for the same session at
+    // different times (a zone delete/renumber, or a rule-set `from zone` /
+    // `match` edit, flips `synced_zones` to `None` or moves pass 1's candidate
+    // set), and the two rules' allocators are independent.
+    //
+    // A first-hit `break` was never sufficient under any of them, and the cost
+    // of getting it wrong is unbounded: the teardown freed one allocator and
+    // left the other holding its `(pool_addr, port)` forever — a permanent
+    // standby pool leak that also counted against `max_tracked_flows` until
+    // the allocator reported `AllocatorExhausted`. Nothing reaps it —
+    // `live_by_flow` is only
+    // removed by `release_flow` / `rollback_flow` / the stale-tuple replace in
+    // `reserve_flow`, and `gc_expired_chunked` sweeps persistent LEASES, not
+    // live flows. A config change does not rebuild the allocator either:
+    // carryover is keyed on `allocator_key()` (pool name + addresses + port
+    // range), so the very edit that flips pass 1's outcome preserves the leak.
+    //
+    // Sweeping every rule is safe and cannot over-free: `release_flow` /
+    // `rollback_flow` return false unless `live_by_flow[flow].translated`
+    // equals THIS `translated` tuple, so an allocator holding a different
+    // flow — or the same flow under a different translation — is untouched.
+    // For the single-reservation case — whenever selection never moved, which
+    // is the overwhelmingly common one — the outcome is bit-identical; only
+    // the early exit is gone. Note this is NOT the same as "every pre-#6211
+    // config": occupancy-dependent selection predates #6211, so a pre-#6211
+    // config could already hold one flow in two allocators (see above).
+    //
+    // That early exit was NOT on a cold path, so state the cost honestly rather
+    // than waving it off. This body backs `rollback_source_nat_allocation` as
+    // well as the release, and that has five non-test call sites, all of them on
+    // the packet path in `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472,
+    // :2644, :4912) — :2374 is the admission-refusal arm, i.e. the flood regime.
+    // Per refused SNAT'ed flow the sweep takes K allocator locks instead of
+    // (owning index + 1), where K is the pool-mode rule count. This is a
+    // mechanism statement: no throughput measurement was taken and none is
+    // claimed. The correctness argument above is what justifies it — a leaked
+    // `(pool_addr, port)` is permanent and counts against `max_tracked_flows`
+    // until exhaustion, while the extra locks are bounded and per-teardown.
     for rule in rules {
         if !rule.pool_mode {
             continue;
         }
-        let released = if rollback {
-            rule.pool_allocator.rollback_flow(flow, translated, now_ns)
+        if rollback {
+            rule.pool_allocator.rollback_flow(flow, translated, now_ns);
         } else {
-            rule.pool_allocator.release_flow(flow, translated, now_ns)
-        };
-        if released {
-            break;
+            rule.pool_allocator.release_flow(flow, translated, now_ns);
         }
     }
 }
+
+/// #6211: the ACTIVE node's `(from_zone, to_zone)` NAME pair for a synced
+/// session, when the standby could resolve BOTH from the wire-carried zone
+/// IDs. `None` means "the active's zone pair is unknown here" — an old peer
+/// that carried neither a zone id nor a resolvable zone name, or a zone that
+/// is not in this node's snapshot (config drift) — and selects the pre-#6211
+/// first-pool-match fallback rather than narrowing on a zone the standby is
+/// guessing at.
+pub(crate) type SyncedNatZones<'a> = Option<(&'a str, &'a str)>;
 
 /// #4388: reserve a peer-synced session's translated pool port in THIS node's
 /// local source-NAT allocator so a post-failover local allocation cannot hand
@@ -1296,11 +1403,47 @@ fn release_source_nat_allocation_with_mode(
 /// [`PortAllocator::reserve_flow`] arm; an address-only token carries no port
 /// bit, so — exactly like the active node's #5341 path — it mints via the plain
 /// `reserve_address_only` regardless of the pool's allocation mode.
+///
+/// #6211: WHICH rule the reservation lands on now mirrors the active node's
+/// choice.
+///
+/// SCOPE — the motivating config is NOT reachable through a supported commit.
+/// #5144 hard-rejects duplicate source-NAT pool addresses at strict commit
+/// (`TestNAT5144ExactDuplicateSourcePools` asserts `CompileConfig` refuses
+/// exactly this shape), so the live surface is the two paths that BYPASS the
+/// strict compiler: a pre-#5144 persisted config, and the tolerant
+/// load / peer-sync path (#1960 no-brick). That bounds the original defect's
+/// severity — it is not an ordinary operator configuration.
+///
+/// Two source-NAT rules may carry the SAME pool ADDRESS in SEPARATE
+/// allocators (distinct `pool_name` / port range => distinct `allocator_key`),
+/// and the pre-#6211 selection — "the first rule whose pool CONTAINS
+/// `rewrite_src`" — narrowed on NO other axis, while the active picked its rule
+/// by zone/policy match. Under such a config the standby's reservation could
+/// land in a DIFFERENT allocator than the active used for the same session, so
+/// after a failover a new local flow matching the OTHER rule missed the
+/// collision guard — the reverse-identity token sat in the wrong allocator,
+/// reintroducing the reverse-path ambiguity the token exists to prevent.
+///
+/// The fix is LOCAL, not a wire change: every input the active's rule match
+/// consumes is already synced. The zone pair rides the session-sync wire as
+/// `ingress_zone_id`/`egress_zone_id` (`SessionSyncRequest`, resolved into
+/// `SessionMetadata::ingress_zone`/`egress_zone`) and the 5-tuple IS the
+/// session key, so the standby re-runs the active's own match predicate
+/// ([`SourceNatRule::matches_ignoring_scope`]) instead of inventing a second
+/// identity scheme. Only the #3096 interface / routing-instance scope is
+/// node-local and unconfirmable; see that method for why it is treated as
+/// unconstrained rather than as a mismatch. An unresolvable zone pair
+/// (`synced_zones == None` — an old peer, or config drift) falls back to the
+/// pre-#6211 first-pool-match, which is no worse than what shipped
+/// (rolling-upgrade safe).
 pub(crate) fn reserve_synced_source_nat_allocation(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
+    // #6211: see `SyncedNatZones`.
+    synced_zones: SyncedNatZones<'_>,
 ) {
     if is_reverse {
         return;
@@ -1315,19 +1458,78 @@ pub(crate) fn reserve_synced_source_nat_allocation(
         src_port: key.src_port,
         dst_port: key.dst_port,
     };
-    // #5338: address-only synced decision (pool address chosen, source port
-    // PRESERVED on the wire). Mint the reverse-identity occupancy token on the
-    // rule whose pool owns `rewrite_src`, mirroring the active node's #5336/#5341
-    // mint so the reverse 1:N index disambiguates identically. A collision on the
-    // standby (`Err` — a local flow already owns the identity) or a foreign pool
-    // address (no pool member) leaves the rule untouched and tries the next,
-    // matching the port-bearing arm's per-rule fall-through and the config-drift
-    // skip.
-    let Some(rewrite_src_port) = nat.rewrite_src_port else {
-        for rule in rules {
-            if !rule.pool_mode {
-                continue;
-            }
+    // #6211 PASS 1 — reserve on a rule the ACTIVE node could actually have
+    // matched. `flow` is byte-identical to the active's SNAT-match tuple
+    // (`nat_match_flow.forward_key` in `poll_descriptor`: original source,
+    // POST-DNAT destination, original ports), so feeding it back through the
+    // SAME `matches_*` predicate reproduces the active's rule choice on every
+    // axis the standby can see — and, like the active's
+    // `match_source_nat_result_for_tuple`, takes the FIRST matching rule in
+    // snapshot order (that order IS the Junos specificity precedence, #4161).
+    // A synced session always carries a real L4 protocol, so `tuple_unknown`
+    // is false — the address-only `match_source_nat` wrapper's sentinel
+    // (#5687) does not apply here.
+    if let Some((from_zone, to_zone)) = synced_zones
+        && reserve_synced_on_first_pool_owner(
+            rules.iter().filter(|rule| {
+                rule.matches_ignoring_scope(
+                    from_zone,
+                    to_zone,
+                    flow.src_ip,
+                    flow.dst_ip,
+                    false,
+                    flow.protocol,
+                    flow.src_port,
+                    flow.dst_port,
+                )
+            }),
+            flow,
+            rewrite_src,
+            nat.rewrite_src_port,
+        )
+    {
+        return;
+    }
+    // #6211 PASS 2 — the pre-#6211 behaviour, unchanged: the first rule whose
+    // pool CONTAINS the translated address, with no zone/tuple narrowing.
+    //
+    // Reached when the zone pair is unknown (`synced_zones == None`), when NO
+    // rule the standby can confirm as a match owns the address (the active
+    // matched an interface-scoped rule under a config the standby cannot
+    // reproduce, or the nodes' NAT config has drifted), or when every matching
+    // candidate REFUSED the reservation (a local flow already owns the
+    // identity). Keeping the fallback unconditional is deliberate: it is
+    // exactly what shipped before this fix, so no configuration can come out
+    // of #6211 with FEWER reservations than it had. Pass 1 can only move a
+    // reservation to a better-justified allocator, never remove one.
+    reserve_synced_on_first_pool_owner(rules.iter(), flow, rewrite_src, nat.rewrite_src_port);
+}
+
+/// #6211: reserve the synced translation on the first rule in `rules` whose
+/// pool owns `rewrite_src` and which ACCEPTS the reservation. Returns whether
+/// a reservation was taken. Both #6211 passes share this body, so the two
+/// differ ONLY in which rules they are offered — the reservation semantics
+/// (pool-mode gate, address-index math, address-only vs port-bearing arm,
+/// per-rule fall-through) cannot drift between them.
+fn reserve_synced_on_first_pool_owner<'a>(
+    rules: impl Iterator<Item = &'a SourceNatRule>,
+    flow: SourceNatFlowKey,
+    rewrite_src: IpAddr,
+    rewrite_src_port: Option<u16>,
+) -> bool {
+    for rule in rules {
+        if !rule.pool_mode {
+            continue;
+        }
+        // #5338: address-only synced decision (pool address chosen, source port
+        // PRESERVED on the wire). Mint the reverse-identity occupancy token on
+        // the rule whose pool owns `rewrite_src`, mirroring the active node's
+        // #5336/#5341 mint so the reverse 1:N index disambiguates identically. A
+        // collision on the standby (`Err` — a local flow already owns the
+        // identity) or a foreign pool address (no pool member) leaves the rule
+        // untouched and tries the next, matching the port-bearing arm's per-rule
+        // fall-through and the config-drift skip.
+        let Some(rewrite_src_port) = rewrite_src_port else {
             let in_pool = match rewrite_src {
                 IpAddr::V4(v4) => rule.pool_addresses_v4.iter().any(|a| *a == v4),
                 IpAddr::V6(v6) => rule.pool_addresses_v6.iter().any(|a| *a == v6),
@@ -1340,19 +1542,10 @@ pub(crate) fn reserve_synced_source_nat_allocation(
                 .reserve_address_only(flow, rewrite_src)
                 .is_ok()
             {
-                break;
+                return true;
             }
-        }
-        return;
-    };
-    let translated = TranslatedTuple {
-        ip: rewrite_src,
-        port: rewrite_src_port,
-    };
-    for rule in rules {
-        if !rule.pool_mode {
             continue;
-        }
+        };
         // The absolute allocator address index mirrors the allocation path:
         // v4 addresses occupy `[0, len_v4)`, v6 addresses follow at
         // `[len_v4, len_v4 + len_v6)` (see `address_index` / the v6_offset in
@@ -1375,13 +1568,17 @@ pub(crate) fn reserve_synced_source_nat_allocation(
         // `allocate_deterministic_v4` release path.
         if rule.pool_allocator.reserve_flow(
             flow,
-            translated,
+            TranslatedTuple {
+                ip: rewrite_src,
+                port: rewrite_src_port,
+            },
             addr_index,
             rule.deterministic_v4.is_some(),
         ) {
-            break;
+            return true;
         }
     }
+    false
 }
 
 /// #4381: allocate a UNIQUE translated `(pool v4 address, L4 port/identifier)`

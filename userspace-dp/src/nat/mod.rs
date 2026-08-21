@@ -81,7 +81,8 @@ pub(crate) use allocator::{DeterministicV6, PortAllocator, PortAllocatorSnapshot
 pub(crate) use destination::{DnatKey, DnatTable, DnatValue};
 pub(crate) use source::{
     SourceNatFailure, SourceNatFailureReason, SourceNatFlowKey, SourceNatLookup, SourceNatRule,
-    allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6, match_source_nat,
+    SyncedNatZones, allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6,
+    match_source_nat,
     match_source_nat_result, match_source_nat_result_for_tuple, parse_source_nat_rules,
     parse_source_nat_rules_with_previous, release_nat64_pool_port, release_source_nat_allocation,
     reserve_nat64_pool_port, reserve_synced_source_nat_allocation, rollback_source_nat_allocation,

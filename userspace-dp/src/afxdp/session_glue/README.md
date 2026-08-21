@@ -76,6 +76,19 @@ source-NAT / NAT64 allocator (`reserve_synced_source_nat_allocation` /
 `reserve_synced_nat64_allocation`, #4388 / #4512) so a post-failover local
 allocation cannot re-hand the same tuple.
 
+Since #6211 the source-NAT reserve picks WHICH rule's allocator to use by
+re-running the active node's own match predicate against the synced zone
+pair + 5-tuple, instead of taking the first rule whose pool merely contains
+the translated address (they differ only when two rules carry overlapping
+pool addresses in separate allocators — see
+`docs/session-sync-architecture.md`). Because selection is no longer a pure
+function of `rules`, a session re-upserted after the selection outcome
+changes can hold a reservation in TWO independent allocators, so
+`release_source_nat_allocation` now frees from EVERY pool-mode rule rather
+than stopping at the first hit. Stopping at the first hit stranded the other
+reservation permanently. The sweep cannot over-free: `release_flow` /
+`rollback_flow` return false unless the stored translated tuple matches.
+
 `purge_translated_synced_hit` therefore ALSO releases that reservation —
 `release_source_nat_allocation` + `release_nat64_allocation`, under the
 same `metadata.is_reverse` ownership guard used everywhere the reservation

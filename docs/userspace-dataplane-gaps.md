@@ -93,8 +93,11 @@ neighbor-resolution-retry). #6114 (#5167) fixes the remaining LIVE site, the
 ESTABLISHED-FLOW HOT PATH (`poll_descriptor/flow_cache_hit.rs`), which dominates
 sustained high-PPS mirror, plus the `enqueue_sampled_mirror_clone_to_live` sibling
 that shares it. Both now route the ordering through one shared
-`sample_then_admit_mirror_clone` (`mirror/resolver.rs`) so the invariant has a
-single tested home and cannot silently diverge again. Intent note: the earlier
+`sample_then_admit_mirror_clone` (`mirror/resolver.rs`), so the invariant has a
+single IMPLEMENTATION — but a single tested home bounds the HELPER, not its
+wiring, and the live call site needed its own binding (see the #6304 note
+below; the original "cannot silently diverge again" claim here was wrong).
+Intent note: the earlier
 "admit-first preserves sample budget on a full queue" behavior (documented by
 `sampled_live_mirror_queue_full_does_not_advance_sampler`) was adjudicated a
 SECOND instance of the #5167 bug, not a real requirement — budget preservation
@@ -102,7 +105,374 @@ only matters during a pressure event where clones are already dropped, is
 statistically irrelevant to a 1-in-N decimation of a lossy clone stream, and cost
 an O(PPS) shared-CAS hit on the dominant path; the test is flipped to assert
 sample-first (a SELECTED packet advances the sampler, then reports the full-queue
-pressure).** The
+pressure).** **#6304 call-site binding:** "a single tested home" bounds the
+HELPER, not its wiring. The #6114 tests reach `sample_then_admit_mirror_clone`
+through `enqueue_sampled_mirror_clone_to_live`, which is DEAD in non-test builds
+(drop its `allow(dead_code)` and `cargo build --release` reports the function
+"is never used"), so reverting ONLY the live `stage_flow_cache_hit` call site to
+reserve-before-sample left the entire Rust suite green — the unit was bound and
+the wiring was not. `poll_descriptor/flow_cache_hit_tests.rs` closes that by
+driving `stage_flow_cache_hit` itself, covering BOTH arms of
+`MirrorSampleAdmission` at the live site, since #6114's two tests split the same
+way and only one of them was ported first: a NON-sampled packet must not reserve
+the full queue; a SELECTED packet on a full queue must advance the sampler
+BEFORE reporting the pressure (revert that and the hot path pins itself at the
+sampler's first slot, restoring the O(PPS) shared-CAS hit); and a SELECTED
+packet whose target has room must actually land its clone (drop the
+`Sampled(Ok)` arm and port mirroring silently stops delivering on this path —
+green under both other tests). A fourth covers ROLLBACK: sampling and admission
+run before the in-place rewrite, but the sampler commit and the clone delivery
+are deferred until it succeeds, and every other test needs a SUCCESSFUL rewrite
+— so hoisting the commit above that check passed all of them. It drives a cache
+hit where BOTH in-place rewriters decline (an IPv4 IHL overrunning the L3
+payload, the one gate they share and both apply before their first UMEM write)
+and asserts the sampler does not advance, because `tx/dispatch` re-runs mirror
+selection on the fallback path and committing here would silently halve the
+flow's effective mirror rate.
+
+That decline is reachable ONLY for a frame whose bytes changed AFTER the shim
+described them — NIC DMA into a recycled UMEM frame, the hazard `expected_ports`
+and the #5466/#4965 preflight-then-commit contract exist for — so the fixture
+models exactly that and the metadata it passes is the PRISTINE frame's.
+`parse_ipv4` (`userspace-xdp/src/lib.rs`) does `read_bytes(data, data_end,
+l3_offset, ihl)?` before deriving `l4_offset`, so a shim-delivered IPv4 packet
+always satisfies `frame.len() - l3 >= ihl`, and `ipv4_declared_l3_end` then
+clamps the trimmed payload UP to at least `ihl`: no self-consistent, shim-
+produced IPv4 frame can take the `l3_payload.len() < ihl` bail at all. Those two
+facts COMPOSE rather than corroborate, and the order matters: the shim leg is
+the load-bearing one. `ipv4_declared_l3_end` returns `None` — not a clamp — on
+exactly `frame.len() < l3 + ihl` (`frame/inspect.rs`), the input the shim leg
+excludes, and `trim_l3_payload` then falls through to a `meta.pkt_len`-derived
+length carrying no `ihl` relation at all (`frame/mod.rs`). So the clamp bites
+only where the shim leg already holds; it is not an independent second guard,
+and a reader must not lean on it alone. That is measured, not argued —
+`live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304` feeds
+the SELF-CONSISTENT IHL-15 packet (40 bytes of NOP options, an honest 80-byte
+datagram, metadata derived from it) and the rewrite succeeds. The rollback
+branch is therefore defense-in-depth against a post-parse frame change rather
+than a hot-path case, which is why nothing else in the suite covered it. An
+earlier revision of the fixture asserted an IHL the parser could not have
+emitted alongside those offsets and called the pair well-formed.
+
+The same module also binds `telemetry.dbg.forward` / `.tx` on BOTH staging arms.
+`run_stage` built the debug counters and dropped them unread, so either
+increment could be deleted with every guard above green — an undercounted
+forward-debug metric on every established-flow cache hit **that forwards**. Both
+increments sit inside the forwarding-disposition arm and after successful
+staging, so a cached terminal drop, a red policer, a TTL-expired packet, a
+LocalDelivery/Discard disposition, or a fallback whose builder returned `None`
+never reached them and is not undercounted by the deletion. On a long-lived
+permitted flow that qualifier excludes almost nothing, but it is not "every
+hit", and an earlier revision of this line said it was.
+
+The `BatchCounters` triple on the same arm — `forward_candidate_packets`,
+`snat_packets`, `dnat_packets` — was unbound for the same structural reason and
+one more: `run_stage` constructed `BatchCounters::default()` and dropped it, so
+`StageRun` had nowhere to report them from, AND every fixture carried
+`NatDecision::default()`, which makes the two `rewrite_*.is_some()` guards false
+on every packet the module ever staged. Retention alone would have left the NAT
+pair unreachable as well as unread. All three flush onto the operator-visible
+`BindingLiveState` atomics of the same name (`BatchCounters::flush`,
+`afxdp/mod.rs`) and reach the wire through `protocol/binding.rs`.
+`live_flow_cache_callsite_accounts_forward_and_nat_packets_6304` closes them with
+a fixture whose cached DECISION and cached DESCRIPTOR both carry a real SNAT and
+a real DNAT, and asserts the translated addresses on the staged TX bytes so the
+counters cannot claim a translation the wire never carried; an untranslated
+second run binds the two guards rather than the two increments.
+
+`lookup_counted`'s byte ARGUMENT was unbound in the "reaches past the adapter"
+shape: every other caller in the tree (`flow_cache_tests.rs`,
+`debug_state.rs`) invokes `lookup_counted` DIRECTLY with a literal, so they all
+bind the callee's accumulation, and nothing bound what the cache-hit call site
+chooses to pass. Replacing `meta.pkt_len` with `0` there leaves every lookup
+decision identical and silently zeroes per-hit observed bytes — the number
+`show flow-cache` reports per cached flow and the #4800 connection-rate analysis
+reads. `live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304` drives
+the stage and reads the entry back, on a fresh entry and on one pre-loaded with a
+non-zero count so `+=` is distinguishable from `=`.
+
+Two lines above those, the `record_in_place_l2_rewrite(rewrite_result
+.l2_rewrite)` call was deletable with the WHOLE CRATE green — at the pre-fold
+head, 4283 passed / 0 failed / 2 ignored plus every integration target,
+measured rather than argued — and for a reason worth recording because it
+recurs: the call RAN on every fixture and was observable to none of them. Every frame in the module egressed on the VLAN it arrived on, so
+`eth_len == current_l3 == 18`, the classification was
+`InPlaceL2Rewrite::SameLength`, and that arm of `record_in_place_l2_rewrite` is
+an empty block — while nothing else in the tree asserted
+`pending_in_place_vlan_push_desc_packets` or `_pop_desc_packets` either. A
+counter whose only reachable arm is a no-op looks covered and binds nothing.
+`live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304` closes it by giving
+the same tagged frame an UNTAGGED egress: the tag is popped by sliding the TX
+descriptor 4 bytes forward inside the same UMEM frame, and the cell asserts the
+transmitted extent shrank by exactly 4 (so the label is honest) with the pop
+counter at 1 and its three siblings at 0 (so the CLASSIFICATION is bound, not
+merely "some counter moved").
+
+The fixtures also keep every ifindex DISTINCT — wire VLAN 80 on physical
+ifindex 6 resolving to logical unit 20080, and mirror output unit 200 resolving
+through `forwarding.egress[].bind_ifindex` to physical XSK port 22 — because
+`resolve_mirror_config` is keyed by the LOGICAL unit while `MirrorTargetMap` is
+keyed by the PHYSICAL bind port. An earlier revision collapsed both onto one
+constant and configured no VLAN or interface maps, which left two live
+call-site regressions green: ignoring `meta.ingress_vlan_id` (no mirror config
+resolves at all) and passing `config.output_ifindex` to admission unresolved
+(`NoBinding`, and cache-hit mirroring stops).
+
+Each of these reds under its own call-site-only mutation while both #6114 tests
+stay green — with ONE measured exception worth recording, because it bounds
+what this kind of test can prove. Reserve-before-sample INLINED at the call site
+(rather than reverting the shared helper) is indistinguishable to a
+SINGLE-THREADED observer of one COMPLETED invocation: the reservation is taken
+with an AcqRel CAS and handed straight back by `PendingTxAdmission::drop` before
+the call returns, so no counter, queue, frame, or sampler value differs
+afterwards, and at cap it is not even reachable —
+`try_acquire_pending_tx_admission` bails at its relaxed
+`admitted >= admission_cap` load before the `compare_exchange_weak`.
+
+That scope matters, and an earlier revision of this note got it wrong by
+dropping it: the ordering IS observable to a CONCURRENT producer. While the
+transient reservation is held the target's `pending_tx_admitted` is one higher,
+so another worker pushing to the same mirror target sees the queue full and its
+request is dropped — `mirror/mod_tests.rs::
+live_mirror_admission_reserves_slot_against_interleaving_producer` demonstrates
+exactly that exclusion. Reserve-first can therefore LOSE a second producer's
+clone that sample-first would have admitted. State created and destroyed inside
+one call is invisible to that call by construction and visible to anyone racing
+it; "no state differs" was established by walking one invocation to completion,
+which cannot decide the concurrent case.
+
+No test observes that transient window, and none can observe THE WINDOW
+deterministically: it is a pair of atomic RMWs entirely inside
+`stage_flow_cache_hit`, with no production hook to synchronise against, so a
+racing-producer test would have to catch the window open and would fail only
+probabilistically.
+
+DETECTING THE MUTATION is a strictly weaker requirement than observing the
+window, and that IS deterministically available. It is now TAKEN:
+`live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+counts calls into `try_acquire_pending_tx_admission`
+(`afxdp/binding_state/tx_inbox.rs`) and asserts a NOT-SAMPLED packet reads ZERO
+— reserve-first reads ONE. Single-threaded, no race, no flake, no release cost,
+because it counts the ATTEMPT rather than catching the window open.
+
+The counter is a `#[cfg(test)]` THREAD-LOCAL, not a `#[cfg(test)]` field on
+`BindingLiveState`. That distinction is the whole reason the instrument is
+takeable, and an earlier revision of this note missed it: it evaluated only the
+field form, correctly rejected it — `BindingLiveState` is the very struct whose
+cross-core cacheline behaviour #6114 exists to fix — and then generalised that
+rejection to the instrument as a whole. A thread-local lives in its own storage,
+and `#[cfg(test)]` is false for any non-test build, so the bump does not exist in
+the shipped hot path. Thread-local rather than a process-global atomic for the
+#6294 reason: the default `cargo test` runs in parallel and every sibling test
+that enqueues a redirect bumps the same counter, so a global would be a
+load-sensitive flake. The pattern already exists in the tree —
+`OUTER_ROUTE_RESOLVE_COUNT` in `afxdp/frame/wg.rs`.
+
+Four layout values are MEASURED rather than asserted — "a thread-local lives in
+its own storage" is a claim about the compiler, and the struct it is a claim
+about is the one #6114 is entirely concerned with. What was measured is size,
+alignment and two field offsets. That is a tripwire aimed at one hazard, not
+whole-struct neutrality; the scope paragraph below is part of the claim, not a
+caveat on it. `BindingLiveState`, rustc 1.96.0, x86_64:
+
+| instrument | size | align | off(`pending_tx_admitted`) | off(`delta_loss_pending`) |
+|---|---|---|---|---|
+| none — production build | 2304 | 64 | 2152 | 2280 |
+| `cfg(test)` THREAD-LOCAL (the one taken) | 2304 | 64 | 2152 | 2280 |
+| `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | **2288** |
+| `cfg(test)` FIELD declared last | 2304 | 64 | 2152 | **2288** |
+
+Two things follow, and the second corrects the earlier note rather than restating
+it. (1) The thread-local moves none of those four values, and four
+`const _: [(); N]` asserts beside the struct hold it to that — none of the four,
+which is a real result and a narrower one than "moves nothing": the other ~90
+fields are not pinned and a perturbation confined to them would not show up.
+They are deliberately NOT `cfg`-gated, so the
+same literals are evaluated in the production build AND the test build, and an
+instrument that moved ANY OF THOSE FOUR VALUES could satisfy at most one of the
+two. That is the cross-configuration comparison a `#[test]` cannot make on its
+own, since it only ever observes the test configuration. (2) The reason to decline a
+`cfg(test)` FIELD is NOT that it changes the struct's size — measured, it does
+not; it lands in existing tail slack. It moves OFFSETS, the #6114 counter's own
+among them, so a size-only guard would have called both field shapes harmless.
+`repr(Rust)` reorders, so even a field declared LAST moves a neighbour — which is
+why the sentinel offset is pinned as well as the counter's.
+
+What those four asserts are NOT, stated so the guard is not read as stronger than
+it is. Size, alignment and two field offsets do not fingerprint a ~90-field
+struct: a perturbation that moves only UNPINNED fields satisfies all four
+literals in both configurations. They are a tripwire aimed at one hazard — a
+`cfg(test)` member reaching this struct, in the two shapes measured above — not a
+proof that the test-configuration layout equals the production one. They are also
+toolchain- and target-specific: `BindingLiveState` is `repr(Rust)` and the crate
+pins neither a `rust-version` nor a toolchain file, so a compiler upgrade can trip
+these literals with nothing in the source having moved. That failure direction is
+safe (a changed value is a compile ERROR carrying the actual number, never a
+silent accept), but it means the right response to a trip is to re-measure, not to
+widen the guard. The runtime cell in `binding_state/tests/tx_inbox.rs` mirrors the
+same four numbers and, for the same reason, cannot FAIL — the un-gated `const _`
+fails the build first, so the test binary carrying it would never be produced.
+
+And nothing pins the four asserts themselves. Measured: deleting all four
+compiles the complete test binary and the mirrored runtime cell still passes,
+and each line is individually deletable with the same result. They are given no
+guard of their own on purpose. The only shapes available for guarding a source
+construct are a match on its NAME or on its TEXT, both of which are proxies a
+differently-spelled equivalent satisfies, and a guard that is itself a `const`
+would be exactly as deletable as what it guards. No runtime witness is possible
+either: what the four lines assert is a statement about the PRODUCTION
+configuration, and a test binary is by construction the test configuration.
+Every tripwire terminates somewhere and this one terminates at itself, so the
+scope is written down instead.
+
+What their presence buys is measured, with a `cfg(test)` `AtomicU64` declared
+ahead of `pending_tx_admitted` — the hazard's own shape. Asserts present and
+literals untouched: `cargo build` succeeds and the test build fails, reporting
+2152 -> 2160 and 2280 -> 2288. Asserts present and literals re-measured to
+2160/2288 so the test build passes: the test build succeeds and `cargo build`
+then fails, reporting the two values back the other way — the "at most one of
+the two builds" property, which is what makes the guard un-satisfiable by
+re-measuring in whichever configuration is in front of you. Asserts DELETED and
+the runtime cell's own literals re-measured to 2160/2288: production build and
+test run both pass and the test-only perturbation is accepted in silence. That
+last cell is what deleting the four lines costs, and it is the difference
+between them and the runtime cell — the runtime cell can be re-measured green,
+and they cannot.
+
+Measured, at the head that added it: reverting `sample_then_admit_mirror_clone`
+itself to reserve-first (reserve, then drop the reservation when the sampler
+declines) reds that ONE test and leaves the other 4284 green — including the
+delegation canary, since the call site still delegates. That form was previously
+caught by nothing at all. Also bound either side of the window:
+
+- DELEGATION — a source canary asserts the call site reaches the queue through
+  `sample_then_admit_mirror_clone` and never calls `admit_mirror_clone_to_live`
+  directly. It is retained for diagnosis — it localises a regression to "the
+  call site stopped delegating" rather than leaving only a counter mismatch —
+  but it is no longer what the ordering rests on. Its two enumerated escapes are
+  now covered by the attempt-count test, both measured: a reserve-first rewrite
+  INSIDE the helper (canary green, attempt count red), and the rename escape
+  `use ...::admit_mirror_clone_to_live as admit;` with a stale comment retaining
+  the required spelling (canary green, attempt count red). A call-site
+  open-coding that keeps the plain spelling reds both.
+- SHARED-CAPACITY ACCOUNTING —
+  `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304` drives
+  the target at a soft cap of exactly one slot, so an interleaving producer is
+  the instrument: after a non-sampled packet and after a declined rewrite the
+  slot must be free, and after an admitted clone it must be taken. That reds on
+  any reservation the call site takes and fails to hand back (measured: leaking
+  it on the rollback path reds only that test, with the whole rest of the suite
+  green).
+
+**Telemetry call sites in this function, swept individually.** Two rounds found
+an unbound `record_*` call by severing one line, so the whole set was severed one
+at a time against the full crate rather than continuing one report at a time.
+The sweep was then re-run rather than inherited, and the re-run changed two rows.
+
+| site | single-line production edit | result |
+|---|---|---|
+| `filter::record_filter_counter` TX/output side (#2573) | walk reduced to `.for_each(\|_counter\| {})` | **was GREEN — UNBOUND** |
+| `filter::record_filter_counter` INPUT side (#3777) | same | RED — `txn_flow_cache_hit_replays_input_filter_then_count_3777` |
+| `policy::record_policy_hit_counter` (#3073) | call replaced by `let _ = counter;` | **was GREEN — UNBOUND** |
+| `zone_counters::record_zone_traffic` (#3651) | call deleted | **was GREEN — UNBOUND** |
+| `record_mirror_clone_result` (#6304) | call replaced by `let _ = (..);` | RED — 4 cells |
+| `tx_counters.record_in_place_l2_rewrite` | call deleted | RED — the r3 cell |
+
+Three sites bound nothing, in THREE shapes of one failure:
+
+- `policy::record_policy_hit_counter` was UNREACHABLE — every fixture left
+  `policy_counter: None` with `policy_counter_idx: 0` against a
+  `ForwardingState::default()` policy snapshot, so `resolve_session_hit_counter`
+  returned `None` and the guarded block never ran. Bound by
+  `live_flow_cache_callsite_recounts_the_established_policy_hit_6304`, which binds
+  a real counter handle onto the cached entry and asserts packets AND bytes — the
+  byte cell distinguishes `meta.pkt_len` from a stripped L3 length, which the
+  packet count alone cannot.
+- `zone_counters::record_zone_traffic` RAN on every fixture and did nothing — an
+  empty `ZoneCounterSlotMap` and an `EGRESS_IFINDEX` absent from
+  `forwarding.egress` make both slot lookups 0, and the function returns at
+  `if ingress_slot == 0 && egress_slot == 0`. Bound by
+  `live_flow_cache_callsite_accounts_per_zone_traffic_6304` through a
+  `with_zone_accounting` fixture builder. Both directions are asserted, because
+  the ingress zone comes from the shim metadata and the egress zone from
+  `egress_zone_id(..)` — two independent resolutions, and asserting one leaves the
+  other free.
+- the TX-side `filter::record_filter_counter` RAN and iterated an EMPTY
+  collection, so the closure holding the call never executed. Crate-wide, the one
+  test that puts a real counter on the cached TX-side `tx_selection` is
+  `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779`, and both of its
+  assertions on that counter are NEGATIVE — the seed packet charges it on the COLD
+  path, and the TTL=1 cache-hit packet must NOT charge it. Severing the hit-path
+  replay satisfies both, so a test that looks like coverage for #2573's replay is
+  coverage for #3779's suppression. Bound by
+  `live_flow_cache_callsite_replays_every_filter_count_term_6304`, which carries
+  TWO tx-side handles (#2573's guarantee is that ALL matched count terms replay,
+  not just the last) and asserts the input side at this call site as well, since
+  #3777 exists because the two sides regressed independently once already.
+
+The arguments are bound too, not merely the occurrence: swapping
+`record_zone_traffic`'s ingress/egress zone arguments, zeroing its byte argument,
+zeroing `record_policy_hit_counter`'s byte argument, zeroing
+`record_mirror_clone_result`'s frame length, and forcing its result to `Enqueued`
+each red exactly the cell that asserts that property.
+
+SCOPE, stated with a measurement rather than an assertion. The swept set was the
+calls named `record_*`. That name is not the boundary of the per-packet
+accounting `stage_flow_cache_hit` performs, and an earlier revision of this
+paragraph said there were only two others. The full non-`record_*` set, as of the
+round-3 head:
+
+- `sessions.touch_if_stale(..)` (#918 staleness) and `sessions.account_packet(..)`
+  (#2501 byte/packet accounting, #2749 TCP-flags and DSCP capture for the
+  SESSION_CLOSE RT_FLOW record). Deleting EITHER leaves the whole crate green —
+  4264 passed, 0 failed, on each — so both are STILL unbound at this call site.
+  Recorded rather than closed: binding the session table's accounting is its own
+  piece of work.
+- `flow_cache.lookup_counted(.., meta.pkt_len)` — per-hit observed bytes. Its
+  byte argument is now bound by
+  `live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304`.
+- `apply_cached_three_color_policers(.., meta.pkt_len as u64)` — the cached
+  policer consumes credit per packet from its byte argument. Not swept.
+- The direct field increments: `telemetry.counters.forward_candidate_packets` /
+  `.snat_packets` / `.dnat_packets`, `telemetry.dbg.forward` / `.tx`, and
+  `tx_counters.pending_in_place_tx_packets`. All are now bound (see above); none
+  of them is a `record_*` CALL, and a sweep keyed on that spelling would have
+  missed every one. (`tx_counters.record_in_place_l2_rewrite(..)`, two lines
+  from three of them, IS named `record_*` and IS in the table above — which is
+  how the sweep reached that neighbourhood at all and then walked past its
+  neighbours.)
+
+The generalisation: a sweep keyed on a NAME is a proxy for the property "every
+per-packet accounting effect is bound". It found three real gaps and then
+under-reported its own residue by four, which is what a proxy does.
+
+The generalisation worth keeping: a telemetry call reached by every test is not
+thereby covered. It binds nothing if a guard above it is false in every fixture,
+nothing if its arguments select a no-op arm, nothing if the collection it walks is
+empty — and nothing if the only test holding a live handle asserts the case where
+it must NOT fire. None of the four is visible in a coverage report; all four are
+visible to a one-line severance.
+
+A second canary, living in `mirror/mod_tests.rs` because one inside the module
+could not fire, asserts the test module is still registered at all — deleting
+its three-line `#[cfg(test)] #[path] mod` declaration unregisters every guard
+above with no build error. It matches the block CONTIGUOUSLY, `#[cfg(test)]`
+included, because unregistering needs no deletion: rewriting the predicate to
+`#[cfg(any())]` removes the module from every build while leaving the `#[path]`
+attribute and the `mod` item in place, and a canary looking for those two
+substrings independently passed under exactly that edit (measured — all eight
+module guards silently stopped compiling and the suite stayed green). The
+mirror clone is captured BEFORE the in-place rewrite and `packet_frame` ALIASES
+the UMEM, so the fixtures slice `raw_frame` out of the UMEM as the poll loop
+does: hand them a detached heap buffer instead and "the clone carries the
+pre-rewrite frame" becomes true for free, and deferring the capture past the
+rewrite — which ships a TTL-decremented, checksum-adjusted copy to the analyzer
+port — goes unnoticed. The dispatch-path copy of the ordering
+(`enqueue_sampled_mirror_clone`'s cross-worker
+arm, which inlines the sampler rather than calling the shared helper) is
+separately bound: flipping it to admit-first reds
+`cross_worker_nonsampled_does_not_reserve_full_queue_5167` and
+`cross_worker_sampled_reports_queue_full_5167`. The
 `deriveUserspaceCapabilities()` gate has been removed; #1376 is closed for the
 feature-gap audit, and the #1477 final-validation artifact set is closed.
 Any further mirror-fidelity and pressure-survival work is production hardening,

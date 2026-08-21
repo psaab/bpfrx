@@ -1319,3 +1319,40 @@ fn cross_worker_nonsampled_no_clone_nonfull_5167() {
     target_live.take_pending_tx_into(&mut queued);
     assert!(queued.is_empty(), "a non-sampled packet must not clone");
 }
+
+/// #6304 (test-registration canary). The #6304 guard for the LIVE
+/// established-flow mirror call site lives in
+/// `poll_descriptor/flow_cache_hit_tests.rs`, which reaches the compiler ONLY
+/// through the three-line `#[cfg(test)] #[path = ...] mod` declaration at the
+/// foot of `poll_descriptor/flow_cache_hit.rs`. Before this canary, removing
+/// that declaration failed neither a build nor a test — it silently
+/// unregistered the whole module, and the suite went green with the live call
+/// site unbound again, which is the exact failure mode #6304 exists to close.
+///
+/// The block is matched CONTIGUOUSLY, `#[cfg(test)]` included, because
+/// unregistering does not require deleting anything: rewriting the predicate to
+/// one that is never satisfied — `#[cfg(any())]` — removes the module from
+/// every build just as completely while leaving both the `#[path]` attribute
+/// and the `mod` item in the file. A canary that looked for those two
+/// substrings independently passed under exactly that edit; verified firsthand.
+///
+/// A canary inside that module cannot fire (it disappears with it), so this
+/// one lives here, in the mirror module that owns the #6114 invariant and is
+/// registered independently from `mirror/mod.rs`.
+///
+/// It remains source text, so it pins the declaration's FORM: a legitimate
+/// reformat of those three lines, or a move to a different registration
+/// mechanism, must update this test with it.
+#[test]
+fn live_flow_cache_callsite_tests_are_registered_6304() {
+    let src = include_str!("../poll_descriptor/flow_cache_hit.rs");
+    assert!(
+        src.contains(
+            "#[cfg(test)]\n#[path = \"flow_cache_hit_tests.rs\"]\nmod flow_cache_hit_tests;"
+        ),
+        "#6304: poll_descriptor/flow_cache_hit.rs must still declare its test \
+         module under a plain `#[cfg(test)]` — deleting the declaration, or \
+         narrowing the predicate so it never holds, leaves the LIVE mirror \
+         call-site guards uncompiled and the suite passing vacuously"
+    );
+}
