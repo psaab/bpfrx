@@ -736,7 +736,7 @@ impl WgEngine {
         };
         let now_ns = self.now_ns();
         matches!(
-            peer.current.read().unwrap().as_ref(),
+            peer.current.read().unwrap_or_else(|e| e.into_inner()).as_ref(),
             Some(session) if session.is_confirmed()
                 && now_ns.saturating_sub(session.created_ns)
                     < super::session::REJECT_AFTER_TIME_NS
@@ -843,7 +843,7 @@ impl WgEngine {
     pub(crate) fn reconcile_peers(&self, configs: &[WgPeerConfig]) {
         // Serialize concurrent reconciles. The lock does NOT gate the
         // hot path (readers take only the ArcSwap load).
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         let old = self.table.load_full();
         let mut new_peers: Vec<PeerEntry> = Vec::with_capacity(configs.len());
         let mut new_index: FxHashMap<[u8; 32], u32> = FxHashMap::default();
@@ -909,20 +909,23 @@ impl WgEngine {
                 continue;
             };
             let peer = &entry.peer;
-            if let Some(cur) = peer.current.read().unwrap().as_ref() {
+            if let Some(cur) = peer.current.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 dropped_indices.push(cur.local_index);
             }
-            if let Some(prev) = peer.previous.read().unwrap().as_ref() {
+            if let Some(prev) = peer.previous.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 dropped_indices.push(prev.local_index);
             }
             // #3882: the pending `next` (unconfirmed responder) keypair
             // is also demux-registered; drain it too or its entry leaks.
-            if let Some(next) = peer.next.read().unwrap().as_ref() {
+            if let Some(next) = peer.next.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 dropped_indices.push(next.local_index);
             }
         }
         if !dropped_indices.is_empty() {
-            let mut by_index = self.sessions_by_local_index.write().unwrap();
+            let mut by_index = self
+                .sessions_by_local_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             for li in &dropped_indices {
                 by_index.remove(li);
             }
@@ -938,8 +941,8 @@ impl WgEngine {
         // we drain directly for each removed pubkey. Still under
         // `reconcile_lock`, consistent with `reserve_pending`/`release_pending`.
         {
-            let mut pending = self.pending.write().unwrap();
-            let mut by_peer = self.pending_by_peer.write().unwrap();
+            let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
+            let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
             for pubkey in old.peer_index_by_pubkey.keys() {
                 if new_index.contains_key(pubkey) {
                     continue;
@@ -962,7 +965,7 @@ impl WgEngine {
         // `consume_cookie_reply` slow path releases its `pending` read lock
         // before taking `cookie_gen`, so there is no lock-order coupling.
         {
-            let mut cg = self.cookie_gen.lock().unwrap();
+            let mut cg = self.cookie_gen.lock().unwrap_or_else(|e| e.into_inner());
             for pubkey in old.peer_index_by_pubkey.keys() {
                 if new_index.contains_key(pubkey) {
                     continue;
@@ -1118,7 +1121,7 @@ impl WgEngine {
         // future reconciles because the peer pubkey no longer exists
         // in published tables. This is slow path, so mutex cost is
         // acceptable and keeps install/reconcile linearizable.
-        let _reconcile_guard = self.reconcile_lock.lock().unwrap();
+        let _reconcile_guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.install_session_locked(pubkey, session)
     }
 
@@ -1157,7 +1160,7 @@ impl WgEngine {
         // pattern keeps the (demux, current, previous, next) tuple
         // visible together to any subsequent decap.
         let new_local_index = session.local_index;
-        let mut by_index = self.sessions_by_local_index.write().unwrap();
+        let mut by_index = self.sessions_by_local_index.write().unwrap_or_else(|e| e.into_inner());
         if by_index.contains_key(&new_local_index) {
             return Err(InstallSessionError::LocalIndexCollision);
         }
@@ -1189,17 +1192,17 @@ impl WgEngine {
         // Pre-check WITHOUT the reconcile lock — the double-checked
         // locking pattern (kernel `wg_noise_received_with_keypair`).
         {
-            let next = peer.next.read().unwrap();
+            let next = peer.next.read().unwrap_or_else(|e| e.into_inner());
             match next.as_ref() {
                 Some(n) if Arc::ptr_eq(n, session) => {}
                 _ => return,
             }
         }
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(dropped_previous) = peer.promote_next(session) {
             self.sessions_by_local_index
                 .write()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .remove(&dropped_previous.local_index);
         }
     }
@@ -1248,7 +1251,7 @@ impl WgEngine {
         let peer = self
             .peer_arc(peer_pubkey)
             .ok_or_else(|| self.counters.count_encap_err(EncapError::UnknownPeer))?;
-        let Some(session) = peer.current.read().unwrap().clone() else {
+        let Some(session) = peer.current.read().unwrap_or_else(|e| e.into_inner()).clone() else {
             // #1865: the no-current-session arm — distinct from the
             // unconfirmed gate below (same wire error, different
             // counter; AGY r2 #1736 mandated the split be visible).
@@ -1435,7 +1438,7 @@ impl WgEngine {
         let session = self
             .sessions_by_local_index
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&hdr.receiver_index)
             .cloned()
             .ok_or_else(|| self.counters.count_decap_err(DecapError::UnknownSession))?;
@@ -1469,7 +1472,7 @@ impl WgEngine {
             return Err(self.counters.count_decap_err(DecapError::BufferTooSmall));
         }
         {
-            let replay = session.replay.lock().unwrap();
+            let replay = session.replay.lock().unwrap_or_else(|e| e.into_inner());
             if replay.definitely_out_of_window(hdr.counter) {
                 return Err(self.counters.count_decap_err(DecapError::ReplayOutOfWindow));
             }
@@ -1506,7 +1509,7 @@ impl WgEngine {
         // could DoS the window by injecting bogus high-counter
         // ciphertexts.
         {
-            let mut replay = session.replay.lock().unwrap();
+            let mut replay = session.replay.lock().unwrap_or_else(|e| e.into_inner());
             match replay.check_and_update(hdr.counter) {
                 ReplayDecision::Accept => {}
                 ReplayDecision::Repeat => {
