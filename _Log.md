@@ -97309,6 +97309,44 @@ prose edit above them added. No diff falls in the new test body.
   restored byte-identical (`git status` clean before commit); no runtime
   change, nothing reaches the helper binary, no smoke owed.
 - **File(s)**: pkg/api/README.md, _Log.md
+## #7034 + #7035 — both false clauses of the NAT 2+-action rejection sentence
+
+- **Timestamp**: 2026-08-21
+- **Action**: Rewrote the two false clauses of the
+  `validateNATTerminalActionCardinalityStrict` 2+-action message. They are one
+  `fmt.Errorf` format string, so they are corrected together. Measured through
+  `CompileConfig` / `CompileConfigLenient` at `origin/master` f8e720c3e.
+  (#7035) "the survivor is not chosen by configuration order" is false in
+  exactly the case that prints it: `compileNATSource` resets `rule.Then` at the
+  top of every `then` container (#3850 last-wins), so the LAST container
+  supplies the counted fields — `{off; pool P}` then `{interface; pool P}`
+  resolves to `{Iface:true Pool:"P"}` and the reverse order to
+  `{Off:true Pool:"P"}`, both printing the identical message. The clause is now
+  scoped to the block and the parenthetical carries the cross-container case.
+  (#7034) "this rejects contradictory actions inside one block" is false for
+  every token-packed spelling: the packed branch reads `t.Keys[1]` alone, so
+  `then { source-nat off pool P; }` → `{Off:true}`,
+  `then { source-nat pool P off; }` and `then { source-nat { pool P off; } }` →
+  `{PoolName:"P"}`, and flat `set … then source-nat pool P off` →
+  `{PoolName:"P"}` — all ACCEPT under strict, DNAT identically. The
+  parenthetical now states the shape it covers and names #7033 for the rest.
+  Also narrowed the same overreach in the function's doc comment ("not by
+  anything the operator wrote"), added the packed-token converse to
+  `natThenTerminalActionCount`'s doc, and updated `docs/config-schema.md`,
+  which carried the #7035 phrase verbatim.
+  Mutation-checked, exit codes from `$?`: (1) restore the old message →
+  `TestNATTerminalActionMessageContent_6820` rc=1 with 4 missing substrings;
+  (2) delete the per-container `rule.Then = NATThen{}` reset →
+  `TestNATTerminalActionContainerOrderPicksSurvivor_7035` rc=1, both orders
+  collapsing to `{Off:true Interface:true}`; (3) make the packed branch also
+  read a trailing `off` (i.e. simulate the #7033 fix) →
+  `TestNATTerminalActionPackedContradictionCommits_7034` rc=1. Message +
+  comments + docs + tests; the compiler's behaviour is unchanged, nothing
+  reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/config/compiler_nat_conflict_message_7034_test.go,
+  docs/config-schema.md, _Log.md
 ## #6896 — three docs asserted a cluster-secondary read-only gate that arming does not universally give
 
 - **Timestamp**: 2026-08-21
