@@ -401,3 +401,347 @@ fn fabric_ingress_icmp_echo_reply_seeds_no_reverse_session_6478() {
          for a session-less fabric-ingress ICMP echo reply"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #5798: the ZONE-OVERRIDE dimension of `FragAuthority`, bound at its
+// PRODUCTION WIRING rather than at the struct.
+//
+// `FragAuthority.ingress_zone` had two kinds of coverage and neither reached
+// the wiring:
+//
+//   - `frag_assoc_every_authority_dimension_is_load_bearing` (nat64_tests.rs)
+//     builds `FragAuthority` STRUCT LITERALS and hands them to the key
+//     builders. It proves the key's equality is zone-sensitive. It never calls
+//     `frag_ingress_authority`, so it cannot see whether production ever
+//     POPULATES the field.
+//   - `nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`
+//     (tests_nat64_tunnel.rs) drives the production resolver, but passes
+//     `None` for the override — its fixture has no fabric/tunnel ingress, so
+//     the zone can only move by moving the interface.
+//
+// Measured consequence at the time this was written: replacing BOTH override
+// arguments in `poll_descriptor/mod.rs` — `frag_authority_zone_override` at
+// the install site and `ingress_zone_override` at the consult site — with
+// `None` compiled cleanly and the whole cargo suite stayed green. The wiring
+// could be severed silently.
+//
+// To be precise about what that is and is not: production at the time was
+// CORRECT — both sites passed the right variable. What was missing was any
+// test that would notice if a later edit stopped. These tests are that notice.
+//
+// Why the zone specifically matters: at a fabric ingress the peer-encoded
+// stamp is the ONLY thing distinguishing two fragments that arrive on the same
+// physical ifindex, the same VLAN and the same routing table but belong to
+// different security zones. If the stamp stops reaching the authority they
+// collapse onto ONE key, and a non-first fragment inherits a NAT
+// translate/forward decision cached for a different zone's flow.
+
+/// A second zone (`dmz`) and a third (`mgmt`), each given an RG-2 member
+/// interface. Both the RG BINDING and the zone entry are load-bearing:
+/// `zone_encoded_fabric_stamp_valid` (V1b) honors a stamp only for a zone that
+/// has at least one RG-bound member which is NOT forwarding-active locally, so
+/// a zone with no RG-bound interface could never be legitimately stamped and
+/// the "different domain" leg would degrade into "no stamp at all" — a
+/// different, weaker scenario than the one under test.
+///
+/// RG 2 is deliberate: the tests below place ONLY RG 1 locally
+/// (`ha_state = {1: active}`), so RG 2 is the peer's and every RG-2 zone's
+/// stamp validates.
+fn frag_stamp_snapshot() -> ConfigSnapshot {
+    let mut snapshot = nat_snapshot_with_fabric();
+    for (zone, id, ifname, linux, ifindex) in [
+        ("dmz", TEST_DMZ_ZONE_ID, "reth1.1", "ge-0-0-1.1", 25i32),
+        ("mgmt", TEST_MGMT_ZONE_ID, "reth1.2", "ge-0-0-1.2", 26i32),
+    ] {
+        snapshot.zones.push(ZoneSnapshot {
+            name: zone.to_string(),
+            id,
+            host_inbound_configured: true,
+            host_inbound_system_services: vec!["any-service".to_string()],
+            ..Default::default()
+        });
+        snapshot.interfaces.push(InterfaceSnapshot {
+            name: ifname.to_string(),
+            zone: zone.to_string(),
+            linux_name: linux.to_string(),
+            ifindex,
+            redundancy_group: 2,
+            hardware_addr: "02:bf:72:01:00:02".to_string(),
+            ..Default::default()
+        });
+    }
+    snapshot
+}
+
+/// One IPv4/UDP fragment of ONE datagram, ingressing the FABRIC link with the
+/// zone-encoded src-MAC stamp for `zone_id`.
+///
+/// `frag_word` is the raw IPv4 flags+offset field: `0x2000` = MF set, offset 0
+/// (the FIRST fragment, the one that installs); `0x2001` = MF set, offset 1
+/// unit (a middle fragment); `0x0002` = offset 2 units with MF clear (the last
+/// fragment). Every fragment of a datagram shares IPv4 Identification `id`.
+///
+/// src 10.0.61.102 -> dst 8.8.8.8: the fixture interface-SNATs `lan -> wan`, so
+/// a first fragment admitted under a `lan` stamp installs a same-family NAT
+/// association, and 8.8.8.8 resolves via the default route to the REACHABLE
+/// gateway neighbor 172.16.80.1. A connected-subnet destination would strand
+/// in MissingNeighbor, install nothing, and make every assertion below vacuous.
+///
+/// The dst MAC is the fabric link's own `02:bf:72:ff:00:01` because the #6458
+/// V1a check requires the redirect to be unicast to it — byte-identical to what
+/// a legitimate cluster peer emits.
+fn stamped_fabric_frag_frame(zone_id: u16, frag_word: u16, id: u16) -> Vec<u8> {
+    let [hi, lo] = zone_id.to_be_bytes();
+    let mut f = vec![
+        0x02, 0xbf, 0x72, 0xff, 0x00, 0x01, // dst: our fabric link MAC (V1a)
+        0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, hi, lo, // src: the zone stamp
+        0x08, 0x00, // ethertype IPv4
+    ];
+    // On a first fragment these 8 bytes are a real UDP header (sport 33333,
+    // dport 443); on a non-first fragment they are payload and must never be
+    // read as ports (#2344).
+    let udp = [0x82, 0x35, 0x01, 0xbb, 0x00, 0x08, 0x00, 0x00];
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&((20 + udp.len()) as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&id.to_be_bytes());
+    ip[6..8].copy_from_slice(&frag_word.to_be_bytes());
+    ip[8] = 64; // ttl
+    ip[9] = PROTO_UDP;
+    ip[12..16].copy_from_slice(&[10, 0, 61, 102]); // src (lan-side host)
+    ip[16..20].copy_from_slice(&[8, 8, 8, 8]); // dst (via default route)
+    f.extend_from_slice(&ip);
+    f.extend_from_slice(&udp);
+    f
+}
+
+/// Ingress metadata shared by EVERY fragment below. This is the load-bearing
+/// half of the fixture: `ingress_ifindex`, `ingress_vlan_id` and
+/// `routing_table` are IDENTICAL for the home-domain and foreign-domain
+/// fragments, so the zone stamp carried in the frame's src MAC is the ONLY
+/// thing that can distinguish their authorities. If a future edit varies any
+/// of these, the test silently stops being a zone test — the
+/// `differing == 1` assertion in the guard below exists to catch exactly that.
+fn stamped_fabric_frag_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 21, // ge-0-0-0, the fabric parent
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        pkt_len: 28,
+        l3_offset: 14,
+        l4_offset: 34,
+        flow_src_port: 33333,
+        flow_dst_port: 443,
+        flow_src_addr: [10, 0, 61, 102, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        flow_dst_addr: [8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// #5798 FAIL-ON-REVERT for the zone-override WIRING: a non-first fragment
+/// whose ingress differs from the first fragment's ONLY in the fabric zone
+/// stamp must NOT inherit its cached permit + SNAT + egress.
+///
+/// Everything here goes through `poll_binding_process_descriptor` via
+/// `txn_run_descriptor`. Nothing calls `frag_ingress_authority` to DRIVE
+/// behavior — the one direct call is a read-only guard asserting the fixture
+/// varies exactly one dimension. That is the whole point: the pre-existing
+/// coverage failed precisely because it built the authority by hand.
+///
+/// TWO foreign zones, not one. A single foreign zone is satisfied by any
+/// accidental special-case on one zone id (or by an authority that happens to
+/// differ for an unrelated reason); requiring `dmz` AND `mgmt` to both be
+/// refused, with the home domain still admitted between them, makes "the zone
+/// participates in the key" the only cheap way to pass. The fixture SIZE is
+/// load-bearing — do not simplify it back to one.
+///
+/// This drives the ORDINARY same-family (interface-SNAT) association, not the
+/// cross-family NAT64 one, and that is sufficient for the ARGUMENT under test:
+/// each site computes `frag_authority` ONCE and hands the same value to both
+/// helpers — `nat64_install_forward_fragment_assoc` and
+/// `nat_install_forward_fragment_assoc` at the install site,
+/// `nat64_consult_forward_fragment_assoc` and its `.or_else`
+/// `nat_consult_forward_fragment_assoc` at the consult site. Severing the
+/// argument therefore severs both arms together, so binding either arm binds
+/// the argument. What a same-family fixture additionally buys is a REACHABLE
+/// gateway and a real SNAT rewrite to observe (`nat_applied_snat`), where the
+/// v6 NAT64 fixtures deliberately strip the inet6 routes.
+///
+/// RED on revert:
+///   - both override arguments -> `None`: the foreign fragment's authority
+///     collapses onto the first fragment's, it HITS, and the
+///     `refused_forward == 0` assertion goes RED.
+///   - EITHER site alone -> `None`: install and consult stop agreeing, so the
+///     HOME-domain positive control misses and its `forward == 1` /
+///     `nat_applied_snat == 1` assertions go RED. That asymmetry is why the
+///     positive control is not optional.
+#[test]
+fn frag_assoc_authority_binds_the_fabric_zone_stamp_5798() {
+    let forwarding = build_forwarding_state(&frag_stamp_snapshot());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // Split-RG active/active: WAN RG 1 is ours, RG 2 (lan / dmz / mgmt) is the
+    // peer's. This is the ONLY placement in which a stamp both VALIDATES at
+    // stage 9 (V1b: the claimed zone's RG is not locally active) and SURVIVES
+    // the session-miss V2 owner gate (the resolved egress RG 1 is ours).
+    let ha_state = BTreeMap::from([(1, active_rg(now_secs))]);
+    let ident: u16 = 0x5798;
+    let meta = stamped_fabric_frag_meta();
+
+    // ---- PRECONDITION: every stamp is actually HONORED in production. -------
+    // Without this the test is vacuous in the most dangerous way: if the `dmz`
+    // and `mgmt` stamps were silently REJECTED (V1a/V1b), their fragments would
+    // still be refused below — but for the wrong reason ("no stamp"), not the
+    // reason under test ("a DIFFERENT honored stamp"). Assert the decode
+    // through the production helper the poll loop itself calls at stage 9.
+    for (zone, id) in [
+        ("lan", TEST_LAN_ZONE_ID),
+        ("dmz", TEST_DMZ_ZONE_ID),
+        ("mgmt", TEST_MGMT_ZONE_ID),
+    ] {
+        let frame = stamped_fabric_frag_frame(id, 0x2000, ident);
+        assert_eq!(
+            parse_zone_encoded_fabric_ingress_from_frame(
+                &frame,
+                meta,
+                &forwarding,
+                &ha_state,
+                now_secs,
+            ),
+            Some(id),
+            "precondition: the {zone} stamp must be HONORED at stage 9, else the refusals \
+             below prove only that an INVALID stamp is ignored"
+        );
+    }
+
+    // ---- GUARD: the fixture varies EXACTLY the zone dimension. -------------
+    // Resolved through the production authority builder, not read off the meta
+    // literals, so a future fixture edit that also moved the ifindex/VLAN/table
+    // fails here instead of quietly turning this into the sibling ifindex test.
+    let home_authority = crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(
+        &forwarding,
+        meta,
+        Some(TEST_LAN_ZONE_ID),
+    );
+    for (zone, id) in [("dmz", TEST_DMZ_ZONE_ID), ("mgmt", TEST_MGMT_ZONE_ID)] {
+        let foreign = crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(
+            &forwarding,
+            meta,
+            Some(id),
+        );
+        let differing = [
+            home_authority.ingress_ifindex != foreign.ingress_ifindex,
+            home_authority.ingress_vlan_id != foreign.ingress_vlan_id,
+            home_authority.ingress_zone != foreign.ingress_zone,
+            home_authority.routing_table != foreign.routing_table,
+        ]
+        .into_iter()
+        .filter(|d| *d)
+        .count();
+        assert_eq!(
+            differing, 1,
+            "{zone}: the two ingresses must differ in EXACTLY one dimension for this to be a \
+             zone guard (home {home_authority:?}, foreign {foreign:?})"
+        );
+        assert_ne!(
+            home_authority.ingress_zone, foreign.ingress_zone,
+            "{zone}: and that one dimension must be the ZONE — RED when the override stops \
+             reaching frag_ingress_authority, because both authorities then fall back to the \
+             fabric interface's own zone and compare EQUAL"
+        );
+    }
+
+    let mut binding = fabric_binding();
+    let mut sessions = SessionTable::new();
+
+    // ---- (1) The FIRST fragment installs, under the `lan` stamp. -----------
+    let first = stamped_fabric_frag_frame(TEST_LAN_ZONE_ID, 0x2000, ident);
+    let (_b1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        meta,
+    );
+    assert_eq!(
+        dbg1.nat_applied_snat, 1,
+        "the stamped first fragment must be admitted under lan -> wan and interface-SNAT'd"
+    );
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "the first fragment must publish exactly one association"
+    );
+
+    // ---- (2) Foreign domains are refused; the home domain still inherits. --
+    // Interleaved deliberately: each foreign refusal is followed by a home-
+    // domain hit, so a refusal can never be explained by "the entry was gone by
+    // then", and the final foreign refusal happens AFTER a legitimate hit has
+    // already re-stamped the entry's deadline and touched its LRU position.
+    let mut offset_units = 1u16;
+    for (zone, id) in [("dmz", TEST_DMZ_ZONE_ID), ("mgmt", TEST_MGMT_ZONE_ID)] {
+        let foreign = stamped_fabric_frag_frame(id, 0x2000 | offset_units, ident);
+        let (_bf, dbg_foreign) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &foreign,
+            meta,
+        );
+        assert_eq!(
+            dbg_foreign.forward, 0,
+            "#5798: a non-first fragment stamped {zone} — same ifindex, same VLAN, same routing \
+             table, DIFFERENT security domain — must not inherit the lan flow's permit + egress"
+        );
+        assert_eq!(
+            dbg_foreign.nat_applied_snat, 0,
+            "#5798: nor may it inherit the lan flow's SNAT translation"
+        );
+        offset_units += 1;
+
+        // POSITIVE CONTROL, after each refusal: the HOME domain still inherits.
+        // This is what fails when only ONE of the two override sites is severed
+        // — install and consult then disagree and the legitimate fragment
+        // misses. Without it, a build in which NOTHING ever hits would satisfy
+        // every refusal assertion above.
+        let home = stamped_fabric_frag_frame(TEST_LAN_ZONE_ID, 0x2000 | offset_units, ident);
+        let (_bh, dbg_home) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &home,
+            meta,
+        );
+        assert_eq!(
+            dbg_home.forward, 1,
+            "control after {zone}: the SAME-domain non-first fragment must still inherit and \
+             forward — a fix that refuses everything is not a fix"
+        );
+        assert_eq!(
+            dbg_home.nat_applied_snat, 1,
+            "control after {zone}: and must still inherit the SNAT translation"
+        );
+        offset_units += 1;
+    }
+
+    // ---- NEGATIVE SPACE: what must NOT have changed. -----------------------
+    // The association table still holds exactly the ONE entry the first
+    // fragment published. A foreign fragment must neither evict the home
+    // entry nor publish an entry of its own (it is a non-first fragment; only a
+    // first fragment may install). This is the assertion that catches "the run
+    // exercised a different input set than intended" — a failure which
+    // otherwise looks identical to success.
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "the refused foreign fragments must neither evict the home association nor install \
+         one of their own"
+    );
+}

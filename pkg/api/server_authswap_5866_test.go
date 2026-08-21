@@ -21,7 +21,7 @@ func TestServerReplaceAuthLiveSwap_5866(t *testing.T) {
 	s.auth.Store(&AuthConfig{Users: map[string]string{"admin": "secret"}})
 	// metricsRequireAuth=true models a non-loopback listener (the interesting,
 	// security-relevant case).
-	h := s.dynamicAuthMiddleware(true, ok)
+	h := s.dynamicAuthMiddleware(true, s.newAuthSlot(), ok)
 
 	req := func(user, pass string) int {
 		r := httptest.NewRequest("GET", "/api/v1/thing", nil)

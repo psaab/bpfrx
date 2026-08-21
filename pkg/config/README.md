@@ -224,6 +224,39 @@ parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
 
+**A stanza's members can live on the STANZA's own Keys, not only in its
+children (#6525).** The dual-shape rule above has a third shape that is easy
+to miss because `set` cannot produce it: the hierarchical COMPACT LEAF.
+`security zones security-zone <z> interfaces ge-0/0/1.0;` lowers to
+`Node{Keys:["interfaces","ge-0/0/1.0"]}` with **nil Children**, so a compiler
+arm written as `for _, x := range prop.Children` runs ZERO times and the
+stanza compiles to nothing — silently. For zone membership that meant a zone
+with no interfaces at all: the interface was never AF_XDP-bound (it kept
+`Zone == ""`), every policy naming the zone applied to nothing, and both
+strict zone gates passed VACUOUSLY because they iterate the empty
+`zone.Interfaces`. When you add a compiler arm for a container stanza, read
+`prop.Keys[1:]` as well as `prop.Children` — and when the member can carry a
+BODY (here `host-inbound-traffic`), exclude the body from the member names in
+BOTH positions, or the fix trades a silent drop for a silent invention.
+`compileZones` normalizes the compact shape onto the block shape
+(`zoneInterfaceMemberNodes`, `compiler_security_zones.go`) so there is one
+read path, and `validateZoneInterfacesNonEmptyStrict`
+(`compiler_validate_strict_zones.go`) rejects a content-bearing stanza that
+still compiles to zero members. See `docs/config-schema.md` "The COMPACT-LEAF
+spelling…".
+
+**A bracket tail does not always collapse onto one Keys slice — a schema-named
+keyword makes `SetPath` DESCEND instead (#6735).** `set ... interfaces [ a b c ]`
+collapses `b c` onto one leaf under `a` only because none of them names a child
+the schema declares at that position. Put a declared keyword in the list and
+`SetPath` descends it, parking everything after it a level DEEPER:
+`[ a host-inbound-traffic b ]` becomes the chain `interfaces -> a ->
+host-inbound-traffic -> b`. A reader that skips body keywords by NAME then skips
+`b` with them. So when a stanza's grammar has both a member slot and named body
+keywords, a validator over that stanza has to inspect the keyword node's SUBTREE,
+not only the Keys around it. See `docs/config-schema.md` "A body keyword with
+dropped tokens after it is REJECTED".
+
 **Interface-name canonicalization is not injective (#5832).**
 `LinuxIfName` only replaces `/` with `-`, so the DISTINCT authored names
 `ge-0/0/0` and `ge-0-0-0` collapse to the SAME Linux device / ifindex.
@@ -1241,11 +1274,22 @@ parent on `cfg.Applications.MixedDirectTermApps` and `validateApplicationStructu
 (`compiler_validate_strict.go`) hard-rejects it at commit (move the direct match
 into its own `term`). The same gate also rejects a single-valued (scalar) term
 leaf — `destination-port` / `source-port` / `inactivity-timeout` / `timeout` /
-`alg` — that appears more than once inside ONE inline term with a CONFLICTING
+`alg`, and since #6766 `icmp-type` / `icmp-code` — that appears more than once
+inside ONE inline term with a CONFLICTING
 value: the inline `term` is opaque to the `SchemaValidate` walk, so a repeat (via
 apply-groups, flat-set ordering, or hand authoring) was last-writer-wins,
 silently overriding the earlier value by token order; `parseApplicationTerms`
-records the offending leaf on `Application.DuplicateTermLeaves`. An IDEMPOTENT
+records the offending leaf on `Application.DuplicateTermLeaves`. (#6766: the
+#3366 framework omitted the ICMP leaves, so a conflicting `icmp-type` /
+`icmp-code` repeat overwrote the pointer with no record and a referenced DENY
+enforced only the LAST type/code — a silent narrowing of the deny match, the
+inline-term analogue of the #5574 direct-body ICMP tracking. On the TOLERANT
+path the conflict is only a warning, so whichever value survives is the one
+actually enforced: that keep-LAST outcome is pinned for both `icmp-type` and
+`icmp-code` at the verdict — the discarded value falling through to
+`default-policy permit-all` — in
+`pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`, and at the compiled
+struct in `compiler_application_term_icmp_dup_6766_test.go`.) An IDEMPOTENT
 same-value repeat (e.g. the `timeout` / `inactivity-timeout` aliases both set to
 the same number) is harmless and accepted, and a repeated `protocol` is the
 documented multi-protocol-term syntax (one application per unique protocol) and

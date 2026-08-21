@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cmdtree"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -132,27 +133,14 @@ func (c *ctl) handleShow(args []string) error {
 			case "classifier":
 				// #4228 Gap 7: encode optional `name <n>` / `type <t>`
 				// filters into the topic params.
-				var params []string
-				rest := args[2:]
-				for i := 0; i < len(rest); i++ {
-					switch rest[i] {
-					case "name":
-						if i+1 < len(rest) {
-							params = append(params, "name="+rest[i+1])
-							i++
-						}
-					case "type":
-						if i+1 < len(rest) {
-							params = append(params, "type="+rest[i+1])
-							i++
-						}
-					}
-				}
-				topic := "cos-classifier"
-				if len(params) > 0 {
-					topic += ":" + strings.Join(params, ",")
-				}
-				return c.showText(topic)
+				return c.showText(cosNameTypeTopic("cos-classifier", args[2:]))
+			case "rewrite-rule":
+				// #6848: identical filter grammar to `classifier`, so it shares
+				// the same topic builder. Without this arm the command works in
+				// the local CLI and silently falls through to the help text on
+				// the REMOTE cli binary, which is the surface most operators
+				// actually use.
+				return c.showText(cosNameTypeTopic("cos-rewrite-rule", args[2:]))
 			case "scheduler-map":
 				topic := "cos-scheduler-map"
 				if len(args) >= 3 {
@@ -512,4 +500,18 @@ func (c *ctl) showSystemInfo(typ string) error {
 	}
 	fmt.Print(resp.Output)
 	return nil
+}
+
+// cosNameTypeTopic encodes the `name <n>` / `type <t>` filters shared by
+// `show class-of-service classifier` and `show class-of-service rewrite-rule`
+// into a gRPC ShowText topic (#6848).
+//
+// #6858: it delegates BOTH halves — the argument grammar and the topic
+// encoding — to cmdtree, which the local CLI (pkg/cli) and the gRPC decoder
+// (pkg/grpcapi) also call. The remote and local paths do not merely agree on
+// the grammar by convention; they execute the same code, so they cannot give
+// different answers for the same keystrokes.
+func cosNameTypeTopic(prefix string, rest []string) string {
+	nameFilter, typeFilter := cmdtree.ParseCoSNameTypeArgs(rest)
+	return cmdtree.CoSNameTypeTopic(prefix, nameFilter, typeFilter)
 }

@@ -417,8 +417,17 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	// so an already-persisted or peer-synced config still boots (#1960) — the
 	// policy keeps its match-any-for-missing compilation, now flagged. A
 	// missing dimension is distinct from an explicit `any` (Junos parity).
+	//
+	// #6526: the same walk also rejects a value-bearing dimension written
+	// with NO OPERAND (`source-address;`, or a `set ... match source-address`
+	// line with the value omitted). That form satisfied the #3044 name-based
+	// presence check yet compiled to the byte-identical empty match-ANY slice
+	// the omitted form produces — so `then permit` permitted every source and
+	// a scoped-global `match from-zone`/`to-zone` collapsed to the all-zones
+	// wildcard. It is emitted as a DISTINCT message under its own lenient
+	// flag so the two findings stay independently attributable.
 	policyMissingMatchWarnings, err := validatePolicyRequiredMatchStrict(
-		tree.Children, opts.lenientPolicyMissingMatch)
+		tree.Children, opts.lenientPolicyMissingMatch, opts.lenientPolicyValuelessMatch)
 	if err != nil {
 		return nil, err
 	}
@@ -521,6 +530,14 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// The #6662 packed-login-body gate and the #6701 built-in-class-shadow gate
+	// used to run here, on the ALREADY-EXPANDED single-node view. They now run
+	// PRE-EXPANSION as both-node unions from compileConfigWithOpts /
+	// compileConfigForNodeWithOpts (see compiler_system_login_gates.go), because
+	// the single-node view let a `groups node1` + `apply-groups "${node}"` body
+	// bypass both gates entirely on the committing node and reach the peer
+	// through the tolerant sync path (#6706 review blocker).
 
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)

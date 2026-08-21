@@ -34,7 +34,7 @@ socket mutex and blocking HA session installs.
 
 | Trigger | Call site | Frequency |
 |---------|-----------|-----------|
-| Config commit | `pkg/daemon/daemon.go` `d.dp.Compile(cfg)` | On commit only |
+| Config commit | `pkg/daemon` dataplane apply (the published runtime dataplane) | On commit only |
 | RETH MAC deferred re-compile | `pkg/daemon/daemon.go` | Once per MAC set |
 | HA RG activation/demotion | `pkg/dataplane/userspace/manager_ha.go` `BumpFIBGeneration()` | Per RG transition |
 | Compile tail (eBPF inner) | `pkg/dataplane/compiler.go` `BumpFIBGeneration()` | Every Compile() |

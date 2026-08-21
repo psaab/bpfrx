@@ -157,7 +157,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		pageSize = 10000
 	}
 	if pageSize > 0 {
-		if iterDP, cursorOK := s.dp.(sessionCursorIterator); cursorOK {
+		if iterDP, cursorOK := s.dpProbe().(sessionCursorIterator); cursorOK {
 			s.sessionsCursor(w, r, iterDP, &q, view, pageSize)
 			return
 		}
@@ -1385,14 +1385,15 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		outIf = view.zoneNames[val.EgressZone]
 	}
 	se := SessionEntry{
-		SrcAddr:          net.IP(key.SrcIP[:]).String(),
-		DstAddr:          net.IP(key.DstIP[:]).String(),
-		SrcPort:          ntohs(key.SrcPort),
-		DstPort:          ntohs(key.DstPort),
-		Protocol:         protoName(key.Protocol),
-		State:            sessionStateName(val.State),
-		PolicyID:         val.PolicyID,
-		PolicyName:       view.policyNames[val.PolicyID],
+		SrcAddr:  net.IP(key.SrcIP[:]).String(),
+		DstAddr:  net.IP(key.DstIP[:]).String(),
+		SrcPort:  ntohs(key.SrcPort),
+		DstPort:  ntohs(key.DstPort),
+		Protocol: protoName(key.Protocol),
+		State:    sessionStateName(val.State),
+		PolicyID: val.PolicyID,
+		// #4626: reserved ids must not be resolved through the compiled map.
+		PolicyName:       dataplane.SessionPolicyName(view.policyNames, val.PolicyID),
 		IngressZoneName:  view.zoneNames[val.IngressZone],
 		EgressZoneName:   view.zoneNames[val.EgressZone],
 		InZone:           val.IngressZone,
@@ -1439,14 +1440,15 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		outIf = view.zoneNames[val.EgressZone]
 	}
 	se := SessionEntry{
-		SrcAddr:          net.IP(key.SrcIP[:]).String(),
-		DstAddr:          net.IP(key.DstIP[:]).String(),
-		SrcPort:          ntohs(key.SrcPort),
-		DstPort:          ntohs(key.DstPort),
-		Protocol:         protoName(key.Protocol),
-		State:            sessionStateName(val.State),
-		PolicyID:         val.PolicyID,
-		PolicyName:       view.policyNames[val.PolicyID],
+		SrcAddr:  net.IP(key.SrcIP[:]).String(),
+		DstAddr:  net.IP(key.DstIP[:]).String(),
+		SrcPort:  ntohs(key.SrcPort),
+		DstPort:  ntohs(key.DstPort),
+		Protocol: protoName(key.Protocol),
+		State:    sessionStateName(val.State),
+		PolicyID: val.PolicyID,
+		// #4626: reserved ids must not be resolved through the compiled map.
+		PolicyName:       dataplane.SessionPolicyName(view.policyNames, val.PolicyID),
 		IngressZoneName:  view.zoneNames[val.IngressZone],
 		EgressZoneName:   view.zoneNames[val.EgressZone],
 		InZone:           val.IngressZone,

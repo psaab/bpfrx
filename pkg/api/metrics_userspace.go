@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
@@ -26,7 +27,12 @@ import (
 // map path unaffected), collectUserspaceStatus emits nothing — identical to when
 // each fetched Status() itself.
 func fetchUserspaceStatus(dp apiRuntimeDataPlane) *dpuserspace.ProcessStatus {
-	provider, ok := dp.(interface {
+	// #2114/#6743-F1: probe the PUBLISHED BACKEND, not the daemon's live
+	// indirection — the indirection declares only apiRuntimeDataPlane, so
+	// asserting Status() on it returns !ok for a healthy userspace helper
+	// and suppresses every userspace metric family. Unwrap is the identity
+	// for a plain backend, nil once the daemon has disowned one.
+	provider, ok := dataplane.Unwrap(dp).(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
@@ -600,6 +606,23 @@ func (c *xpfCollector) emitUserspaceSourceNATPoolMetrics(ch chan<- prometheus.Me
 			float64(pool.ExhaustionTotal),
 			labels...,
 		)
+		// #4800: the (denominator, contended) pair for this pool's residual
+		// live-state mutex. Emitted unconditionally so the connection-rate
+		// harness sees an explicit 0 from a pool that never contended,
+		// rather than a missing series it would have to disambiguate from a
+		// scrape failure.
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceSNATPoolLiveLockAcquisitionsTotal,
+			prometheus.CounterValue,
+			float64(pool.LiveLockAcquisitionsTotal),
+			labels...,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceSNATPoolLiveLockContendedTotal,
+			prometheus.CounterValue,
+			float64(pool.LiveLockContendedTotal),
+			labels...,
+		)
 	}
 }
 
@@ -653,6 +676,51 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		c.userspaceSessionPublishErrors,
 		prometheus.CounterValue,
 		float64(status.SessionPublishErrorsTotal),
+	)
+	// #4800: the publish + replication legs of the new-flow-install
+	// contention surface. Emitted unconditionally and always as complete
+	// (denominator, contended) pairs — a missing series would be
+	// indistinguishable from a scrape failure, and a contended series
+	// without its denominator is not interpretable at all.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSharedSessionPublishes,
+		prometheus.CounterValue,
+		float64(status.SharedSessionPublishesTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSharedSessionPublishLockAcquired,
+		prometheus.CounterValue,
+		float64(status.SharedSessionPublishLockAcquisitionsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSharedSessionPublishLockBlocked,
+		prometheus.CounterValue,
+		float64(status.SharedSessionPublishLockContendedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionReplicationUpserts,
+		prometheus.CounterValue,
+		float64(status.SessionReplicationUpsertsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionReplicationEnqueued,
+		prometheus.CounterValue,
+		float64(status.SessionReplicationEnqueuedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionReplicationLockBlocked,
+		prometheus.CounterValue,
+		float64(status.SessionReplicationLockContendedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionReplicationQueueDepthSum,
+		prometheus.CounterValue,
+		float64(status.SessionReplicationQueueDepthSum),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionReplicationQueueDepthMax,
+		prometheus.GaugeValue,
+		float64(status.SessionReplicationQueueDepthMax),
 	)
 
 	// #2244: failed dnat_table reverse-SNAT BPF-map publishes. Also
@@ -1206,6 +1274,9 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.CounterValue, float64(w.SessionInstallAdmissionRefused), label)
 		ch <- prometheus.MustNewConstMetric(c.workerSessionInstallPartial,
 			prometheus.CounterValue, float64(w.SessionInstallPartial), label)
+		// #4800: per-worker transit new-flow installs — the skew signal.
+		ch <- prometheus.MustNewConstMetric(c.workerNewFlowInstalls,
+			prometheus.CounterValue, float64(w.NewFlowInstalls), label)
 		var deadValue float64
 		if w.Dead {
 			deadValue = 1

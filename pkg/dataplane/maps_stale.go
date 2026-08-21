@@ -15,8 +15,8 @@ import (
 
 // DeleteStaleIfaceZone removes iface_zone_map entries not in the written set.
 func (m *Manager) DeleteStaleIfaceZone(written map[IfaceZoneKey]bool) {
-	zm, ok := m.maps["iface_zone_map"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("iface_zone_map")
+	if !present {
 		return
 	}
 	var key IfaceZoneKey
@@ -38,8 +38,8 @@ func (m *Manager) DeleteStaleIfaceZone(written map[IfaceZoneKey]bool) {
 
 // DeleteStaleVlanIface removes vlan_iface_map entries not in the written set.
 func (m *Manager) DeleteStaleVlanIface(written map[uint32]bool) {
-	zm, ok := m.maps["vlan_iface_map"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("vlan_iface_map")
+	if !present {
 		return
 	}
 	var key uint32
@@ -62,8 +62,8 @@ func (m *Manager) DeleteStaleVlanIface(written map[uint32]bool) {
 // DeleteStaleZonePairPolicies zeros zone_pair_policies entries not in the written set.
 // The map is an ARRAY so entries cannot be deleted — zero means "no policy".
 func (m *Manager) DeleteStaleZonePairPolicies(written map[ZonePairKey]bool) {
-	zm, ok := m.maps["zone_pair_policies"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("zone_pair_policies")
+	if !present {
 		return
 	}
 	zeroPS := PolicySet{}
@@ -90,8 +90,8 @@ func (m *Manager) DeleteStaleZonePairPolicies(written map[ZonePairKey]bool) {
 
 // DeleteStaleApplications removes application entries not in the written set.
 func (m *Manager) DeleteStaleApplications(written map[AppKey]bool) {
-	zm, ok := m.maps["applications"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("applications")
+	if !present {
 		return
 	}
 	var key AppKey
@@ -114,8 +114,8 @@ func (m *Manager) DeleteStaleApplications(written map[AppKey]bool) {
 // DeleteStaleSNATRules zeroes snat_rules ARRAY entries not in the written set.
 // The map is an ARRAY so entries cannot be deleted — zero means "no rule".
 func (m *Manager) DeleteStaleSNATRules(written map[SNATKey]bool) {
-	zm, ok := m.maps["snat_rules"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("snat_rules")
+	if !present {
 		return
 	}
 	empty := SNATValue{}
@@ -145,8 +145,8 @@ func (m *Manager) DeleteStaleSNATRules(written map[SNATKey]bool) {
 // DeleteStaleSNATRulesV6 zeroes snat_rules_v6 ARRAY entries not in the written set.
 // The map is an ARRAY so entries cannot be deleted — zero means "no rule".
 func (m *Manager) DeleteStaleSNATRulesV6(written map[SNATKey]bool) {
-	zm, ok := m.maps["snat_rules_v6"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("snat_rules_v6")
+	if !present {
 		return
 	}
 	empty := SNATValueV6{}
@@ -175,8 +175,8 @@ func (m *Manager) DeleteStaleSNATRulesV6(written map[SNATKey]bool) {
 
 // DeleteStaleDNATStatic removes static dnat_table entries not in the written set.
 func (m *Manager) DeleteStaleDNATStatic(written map[DNATKey]bool) {
-	zm, ok := m.maps["dnat_table"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("dnat_table")
+	if !present {
 		return
 	}
 	var key DNATKey
@@ -198,8 +198,8 @@ func (m *Manager) DeleteStaleDNATStatic(written map[DNATKey]bool) {
 
 // DeleteStaleDNATStaticV6 removes static dnat_table_v6 entries not in the written set.
 func (m *Manager) DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool) {
-	zm, ok := m.maps["dnat_table_v6"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("dnat_table_v6")
+	if !present {
 		return
 	}
 	var key DNATKeyV6
@@ -221,7 +221,7 @@ func (m *Manager) DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool) {
 
 // DeleteStaleStaticNAT removes static_nat entries not in the written sets.
 func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writtenV6 map[StaticNATKeyV6]bool) {
-	if zm, ok := m.maps["static_nat_v4"]; ok {
+	if zm, present, _ := m.lookupMapLocked("static_nat_v4"); present {
 		var key StaticNATKeyV4
 		var val []byte
 		iter := zm.Iterate()
@@ -238,7 +238,7 @@ func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writte
 			slog.Info("deleted stale static_nat_v4 entries", "count", len(stale))
 		}
 	}
-	if zm, ok := m.maps["static_nat_v6"]; ok {
+	if zm, present, _ := m.lookupMapLocked("static_nat_v6"); present {
 		var key StaticNATKeyV6
 		var val []byte
 		iter := zm.Iterate()
@@ -259,8 +259,8 @@ func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writte
 
 // DeleteStaleNPTv6 removes nptv6_rules entries not in the written set.
 func (m *Manager) DeleteStaleNPTv6(written map[NPTv6Key]bool) {
-	zm, ok := m.maps["nptv6_rules"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("nptv6_rules")
+	if !present {
 		return
 	}
 	var key NPTv6Key
@@ -282,13 +282,13 @@ func (m *Manager) DeleteStaleNPTv6(written map[NPTv6Key]bool) {
 
 // DeleteStaleNAT64 zeroes stale nat64_configs entries and removes stale prefix map entries.
 func (m *Manager) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {
-	if zm, ok := m.maps["nat64_configs"]; ok {
+	if zm, present, _ := m.lookupMapLocked("nat64_configs"); present {
 		var empty NAT64Config
 		for i := count; i < 4; i++ {
 			zm.Update(i, empty, ebpf.UpdateAny)
 		}
 	}
-	if hm, ok := m.maps["nat64_prefix_map"]; ok {
+	if hm, present, _ := m.lookupMapLocked("nat64_prefix_map"); present {
 		var key NAT64PrefixKey
 		var val []byte
 		iter := hm.Iterate()
@@ -306,8 +306,8 @@ func (m *Manager) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64Prefix
 
 // ZeroStaleScreenConfigs zeroes screen_configs entries above maxID.
 func (m *Manager) ZeroStaleScreenConfigs(maxID uint32) {
-	zm, ok := m.maps["screen_configs"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("screen_configs")
+	if !present {
 		return
 	}
 	empty := ScreenConfig{}
@@ -319,13 +319,13 @@ func (m *Manager) ZeroStaleScreenConfigs(maxID uint32) {
 // ZeroStaleNATPoolConfigs zeroes nat_pool_configs and nat_pool_ips entries
 // for pool IDs from startID onwards.
 func (m *Manager) ZeroStaleNATPoolConfigs(startID uint32) {
-	if zm, ok := m.maps["nat_pool_configs"]; ok {
+	if zm, present, _ := m.lookupMapLocked("nat_pool_configs"); present {
 		empty := NATPoolConfig{}
 		for i := startID; i < 32; i++ {
 			zm.Update(i, empty, ebpf.UpdateAny)
 		}
 	}
-	if v4Map, ok := m.maps["nat_pool_ips_v4"]; ok {
+	if v4Map, present, _ := m.lookupMapLocked("nat_pool_ips_v4"); present {
 		var zeroV4 uint32
 		start := startID * MaxNATPoolIPsPerPool
 		end := uint32(32) * MaxNATPoolIPsPerPool
@@ -333,7 +333,7 @@ func (m *Manager) ZeroStaleNATPoolConfigs(startID uint32) {
 			v4Map.Update(i, zeroV4, ebpf.UpdateAny)
 		}
 	}
-	if v6Map, ok := m.maps["nat_pool_ips_v6"]; ok {
+	if v6Map, present, _ := m.lookupMapLocked("nat_pool_ips_v6"); present {
 		zeroV6 := NATPoolIPV6{}
 		start := startID * MaxNATPoolIPsPerPool
 		end := uint32(32) * MaxNATPoolIPsPerPool
@@ -345,8 +345,8 @@ func (m *Manager) ZeroStaleNATPoolConfigs(startID uint32) {
 
 // DeleteStaleIfaceFilter removes iface_filter_map entries not in the written set.
 func (m *Manager) DeleteStaleIfaceFilter(written map[IfaceFilterKey]bool) {
-	zm, ok := m.maps["iface_filter_map"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("iface_filter_map")
+	if !present {
 		return
 	}
 	var key IfaceFilterKey
@@ -368,8 +368,8 @@ func (m *Manager) DeleteStaleIfaceFilter(written map[IfaceFilterKey]bool) {
 
 // ZeroStaleFilterConfigs zeroes filter_configs entries from startID onwards.
 func (m *Manager) ZeroStaleFilterConfigs(startID uint32) {
-	zm, ok := m.maps["filter_configs"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("filter_configs")
+	if !present {
 		return
 	}
 	var empty FilterConfig

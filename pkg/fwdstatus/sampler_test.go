@@ -7,11 +7,12 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
-// countingAccessor is a fwdstatus.DataPlaneAccessor that also exposes
-// both Status() and CachedStatus(), counting how many times each is
+// countingAccessor is a fwdstatus.CachedStatusProvider (#2114 narrowed
+// surface) that also exposes Status(), counting how many times each is
 // invoked. Used to prove the Sampler reads worker telemetry off the
 // cached status (no control-socket request) and never issues its own
-// Status() poll (#3970).
+// Status() poll (#3970). The IsLoaded/GetMapStats methods keep it
+// satisfying DataPlaneAccessor for the Build-side fixtures.
 type countingAccessor struct {
 	status       userspace.ProcessStatus
 	statusCalls  int // Status() → control-socket request (must stay 0)

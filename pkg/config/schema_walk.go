@@ -104,7 +104,8 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	vc := &walkContext{cfg: cfg, refs: refs}
 	// closed=false: the top-level walk is open-world. The per-subtree
 	// closed-world flag (#4313) is inherited from schemaNode.closedWorld as
-	// the walker descends; no production subtree sets it today.
+	// the walker descends. No count here — see the keyword-resolution gate
+	// below for why prose must not state how many subtrees are armed.
 	return walkSchemaChildren(tree.Children, setSchema, nil, vc, false)
 }
 
@@ -295,7 +296,7 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *wa
 //   - closed:   closed-world enforcement flag (#4313). When true, an
 //     unmodeled child keyword is REJECTED instead of silently accepted.
 //     Inherited from any ancestor subtree whose schemaNode.closedWorld is
-//     set; false (open-world) everywhere in production today.
+//     set; false (open-world) for any subtree that has not opted in.
 func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkContext, siblings []*Node, closed bool) error {
 	keyword := node.Keys[0]
 
@@ -307,7 +308,35 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		// garbage that would commit clean and be silently dropped. Reject it,
 		// mirroring the modifier-level unknown-keyword rejects below. Only a
 		// subtree that opted in (schemaNode.closedWorld, inherited via closed)
-		// reaches this branch; no production subtree does so today.
+		// reaches this branch.
+		//
+		// Deliberately NO count of armed subtrees here — including in this
+		// paragraph, which is why it names no number. The previous wording
+		// ("no production subtree does so today") was written in the mechanism
+		// commit 49fef7174 when it was true, and the first production flip
+		// landed the SAME DAY; it was never updated as the rollout proceeded,
+		// so a month later it still described a mechanism that had not been
+		// dormant since the day the sentence was written, and it mis-scoped a
+		// lane that trusted it. A comment stating
+		// how much of a mechanism is in use is a coverage claim, and it rots
+		// silently. The armed set is exactly whatever sets the closedWorld
+		// field to true in a schema_*.go node — count those, or read the
+		// schema_closedworld_*_4313_test.go files, each of which pins one
+		// subtree. Do not restate the number here.
+		//
+		// This paragraph deliberately does not spell that field-and-value as a
+		// contiguous literal: doing so made this comment a false positive in
+		// the very grep it tells you to run, inflating the count by one. An
+		// instruction that corrupts its own measurement is worse than none.
+		//
+		// Strict-vs-tolerant, since it is asked every round and is written
+		// nowhere else: this rejects at the OPERATOR boundary, where the
+		// alternative is a silent drop. It is NOT a reject on the paths where
+		// refusing would mean an outage — configstore's Store.Load (boot) and
+		// Store.SyncApply (HA peer sync) downgrade schema violations to a
+		// warning (pkg/configstore/store.go), so a config an older build
+		// persisted, or a peer sends, still loads. Strict where the operator
+		// can fix it, tolerant where refusing would brick the node.
 		if closed {
 			return typedLeafErrorf(path, "unknown configuration keyword %q under closed-world subtree", keyword)
 		}

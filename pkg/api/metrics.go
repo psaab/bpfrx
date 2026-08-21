@@ -52,23 +52,25 @@ type xpfCollector struct {
 	// xpf_screen_drops_total above cannot answer "which screen fired?"; this
 	// labeled series can, now that the userspace bridge populates the per-reason
 	// GlobalCtrScreen* counters.
-	screenDropsByReasonTotal    *prometheus.Desc
-	policyDeniesTotal           *prometheus.Desc
-	natAllocFailsTotal          *prometheus.Desc
-	nat64XlateTotal             *prometheus.Desc
-	hostInboundDeny             *prometheus.Desc
-	hostInboundKernelDenies     *prometheus.Desc
-	hostInboundJunosHostDenies  *prometheus.Desc
-	hostInboundICMPNDAccept     *prometheus.Desc
-	hostInboundAddresslessZones *prometheus.Desc
-	hostInboundAddresslessIface *prometheus.Desc
-	hostInboundAmbiguousAddrs   *prometheus.Desc
-	lo0CounterHits              *prometheus.Desc
-	pbrRulesInstalled           *prometheus.Desc
-	pbrDegradedTerms            *prometheus.Desc
-	tcEgressPacketsTotal        *prometheus.Desc
-	syncookieTotal              *prometheus.Desc
-	flowCacheTotal              *prometheus.Desc
+	screenDropsByReasonTotal *prometheus.Desc
+	// #5806: unresolved screen-profile references (see the descriptor).
+	screenUnresolvedProfileZones *prometheus.Desc
+	policyDeniesTotal            *prometheus.Desc
+	natAllocFailsTotal           *prometheus.Desc
+	nat64XlateTotal              *prometheus.Desc
+	hostInboundDeny              *prometheus.Desc
+	hostInboundKernelDenies      *prometheus.Desc
+	hostInboundJunosHostDenies   *prometheus.Desc
+	hostInboundICMPNDAccept      *prometheus.Desc
+	hostInboundAddresslessZones  *prometheus.Desc
+	hostInboundAddresslessIface  *prometheus.Desc
+	hostInboundAmbiguousAddrs    *prometheus.Desc
+	lo0CounterHits               *prometheus.Desc
+	pbrRulesInstalled            *prometheus.Desc
+	pbrDegradedTerms             *prometheus.Desc
+	tcEgressPacketsTotal         *prometheus.Desc
+	syncookieTotal               *prometheus.Desc
+	flowCacheTotal               *prometheus.Desc
 
 	// #3345/#3408: monotonic count of counter reads that failed during a
 	// scrape, across the global, per-zone, per-policy, and per-filter dataplane
@@ -100,6 +102,16 @@ type xpfCollector struct {
 	// so a failure this scrape is reflected this scrape.
 	interfaceCounterReadErrorsTotal *prometheus.Desc
 	interfaceCounterReadErrors      atomic.Uint64
+
+	// Zone counters (#3651, restored after the #3643 HIDE). Sourced from the
+	// Go-side SPARSE zone-counter offset map, never a dense array indexed by
+	// zone id — see initZoneDescriptors for why that distinction is the whole
+	// point. zoneCountersUnpopulatedZones is the explicit "not yet known"
+	// signal that lets the per-zone samples be OMITTED rather than published
+	// as an authoritative 0.
+	zonePacketsTotal             *prometheus.Desc
+	zoneBytesTotal               *prometheus.Desc
+	zoneCountersUnpopulatedZones *prometheus.Desc
 
 	// Policy counters
 	policyHitsTotal *prometheus.Desc
@@ -134,6 +146,11 @@ type xpfCollector struct {
 	userspaceSNATPoolAllocationsTotal *prometheus.Desc
 	userspaceSNATPoolReusesTotal      *prometheus.Desc
 	userspaceSNATPoolExhaustionsTotal *prometheus.Desc
+	// #4800: the per-pool NAT-allocator leg of the new-flow-install
+	// contention surface. Always emitted as a pair — a contention count
+	// without its denominator is not interpretable.
+	userspaceSNATPoolLiveLockAcquisitionsTotal *prometheus.Desc
+	userspaceSNATPoolLiveLockContendedTotal    *prometheus.Desc
 
 	// DHCP lease gauge
 	dhcpLeasesActive *prometheus.Desc
@@ -356,15 +373,26 @@ type xpfCollector struct {
 	workerSessionTableCapacity       *prometheus.Desc
 	workerNatReverseKeyCollisions    *prometheus.Desc
 	// #1861: install-refusal trio (per-worker + aggregate).
-	workerSessionCreateDrops                *prometheus.Desc
-	workerSessionInstallAdmissionRefused    *prometheus.Desc
-	workerSessionInstallPartial             *prometheus.Desc
-	userspaceSessionCreateDrops             *prometheus.Desc
-	userspaceSessionInstallAdmissionRefused *prometheus.Desc
-	userspaceSessionInstallPartial          *prometheus.Desc
-	userspaceSessionTableEntries            *prometheus.Desc
-	userspaceSessionTableCapacity           *prometheus.Desc
-	userspaceNatReverseKeyCollisions        *prometheus.Desc
+	workerSessionCreateDrops             *prometheus.Desc
+	workerSessionInstallAdmissionRefused *prometheus.Desc
+	workerSessionInstallPartial          *prometheus.Desc
+	// #4800: per-worker transit new-flow installs, plus the six
+	// process-global publish/replication contention counters.
+	workerNewFlowInstalls                     *prometheus.Desc
+	userspaceSharedSessionPublishes           *prometheus.Desc
+	userspaceSharedSessionPublishLockAcquired *prometheus.Desc
+	userspaceSharedSessionPublishLockBlocked  *prometheus.Desc
+	userspaceSessionReplicationUpserts        *prometheus.Desc
+	userspaceSessionReplicationEnqueued       *prometheus.Desc
+	userspaceSessionReplicationLockBlocked    *prometheus.Desc
+	userspaceSessionReplicationQueueDepthSum  *prometheus.Desc
+	userspaceSessionReplicationQueueDepthMax  *prometheus.Desc
+	userspaceSessionCreateDrops               *prometheus.Desc
+	userspaceSessionInstallAdmissionRefused   *prometheus.Desc
+	userspaceSessionInstallPartial            *prometheus.Desc
+	userspaceSessionTableEntries              *prometheus.Desc
+	userspaceSessionTableCapacity             *prometheus.Desc
+	userspaceNatReverseKeyCollisions          *prometheus.Desc
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
 	userspaceSessionPublishErrors *prometheus.Desc
@@ -626,6 +654,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.sessionsClosedTotal
 	ch <- c.screenDropsTotal
 	ch <- c.screenDropsByReasonTotal
+	ch <- c.screenUnresolvedProfileZones
 	ch <- c.policyDeniesTotal
 	ch <- c.natAllocFailsTotal
 	ch <- c.nat64XlateTotal
@@ -646,6 +675,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
+	ch <- c.zonePacketsTotal
+	ch <- c.zoneBytesTotal
+	ch <- c.zoneCountersUnpopulatedZones
 	ch <- c.policyHitsTotal
 	ch <- c.filterHitsTotal
 	ch <- c.threeColorPolicerPacketsTotal
@@ -671,6 +703,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSNATPoolAllocationsTotal
 	ch <- c.userspaceSNATPoolReusesTotal
 	ch <- c.userspaceSNATPoolExhaustionsTotal
+	ch <- c.userspaceSNATPoolLiveLockAcquisitionsTotal
+	ch <- c.userspaceSNATPoolLiveLockContendedTotal
 	ch <- c.dhcpLeasesActive
 	ch <- c.dhcpDDNSUpsertsTotal
 	ch <- c.dhcpDDNSDeletesTotal
@@ -779,6 +813,15 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerSessionCreateDrops
 	ch <- c.workerSessionInstallAdmissionRefused
 	ch <- c.workerSessionInstallPartial
+	ch <- c.workerNewFlowInstalls
+	ch <- c.userspaceSharedSessionPublishes
+	ch <- c.userspaceSharedSessionPublishLockAcquired
+	ch <- c.userspaceSharedSessionPublishLockBlocked
+	ch <- c.userspaceSessionReplicationUpserts
+	ch <- c.userspaceSessionReplicationEnqueued
+	ch <- c.userspaceSessionReplicationLockBlocked
+	ch <- c.userspaceSessionReplicationQueueDepthSum
+	ch <- c.userspaceSessionReplicationQueueDepthMax
 	ch <- c.userspaceSessionCreateDrops
 	ch <- c.userspaceSessionInstallAdmissionRefused
 	ch <- c.userspaceSessionInstallPartial
@@ -1075,12 +1118,29 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// config-only / degraded boot. Aggregate (global rules, not per-zone).
 	c.collectHostInboundICMPNDAccepts(ch)
 
+	// #5806: zones whose configured screen profile does NOT resolve. The active
+	// config claims a screen is attached while the dataplane enforces none of it
+	// (tolerant load / HA config-sync / rolling upgrade can reach this state),
+	// and until now the only DATAPLANE-RUNTIME signal was a rate-limited WARN —
+	// the issue's acceptance criterion is explicitly that one warning must not be
+	// the sole signal. (Other reporting exists: tolerant-load configuration
+	// warnings and daemon logging. The precise claim is about the runtime WARN,
+	// which #6860 shows cannot fire at all when NO profile resolves.)
+	// Config-derived and independent of dataplane load, so emit it BEFORE
+	// the dataplane gate: a config-only / degraded boot is exactly when an
+	// unenforced security control must stay visible.
+	c.collectScreenUnresolvedProfileZones(ch)
+
 	// #3698: configured host-inbound-enforcing zones currently in the transient
 	// fail-open admit window (a non-lifeline interface but no resolvable address
 	// yet, so no kernel host-inbound deny is scoped to them). Config-derived and
 	// independent of dataplane load, so emit it BEFORE the dataplane gate — the
 	// window can be open in a config-only / degraded boot too, and that is exactly
 	// when it must stay visible.
+	//
+	// KEEP THIS COMMENT ADJACENT TO ITS CALL (#6839 round 2): the #5806 call above
+	// was inserted between this block and this line, so the #3698 rationale read
+	// as the rationale for the #5806 emit and this call was left bare.
 	c.collectHostInboundAddresslessZones(ch)
 
 	// #3710: the per-interface/per-family refinement of the addressless-zone
@@ -1110,6 +1170,24 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// netlink), so it is a control-plane signal emitted BEFORE the dataplane gate:
 	// a degraded FBF mirror must stay visible in a config-only / degraded boot.
 	c.collectPBRStatus(ch)
+
+	// #6843 R1: per-zone traffic, emitted BEFORE the dataplane gate. The
+	// xpf_zone_counters_unpopulated_zones gauge is documented as ALWAYS emitted
+	// so `> 0` is alertable and its absence cannot be confused with a scrape
+	// that failed to run — but below the gate that promise breaks exactly when
+	// it matters most: on a degraded or config-only boot no sample is emitted at
+	// all, so the alert silently stops evaluating precisely when per-zone volume
+	// is most unavailable. The collector is config-derived (it counts every
+	// configured zone as unpopulated when there is no apply result or no loaded
+	// dataplane), so it degrades correctly above the gate, like collectPBRStatus
+	// and the lo0/host-inbound families hoisted above for the same reason.
+	// #3462 ordering, restated at the new position: a GENUINE per-zone read
+	// failure bumps counterReadErrors, and the deferred emitCounterReadErrors at
+	// the top of Collect runs at function exit — after this — so a failure this
+	// scrape is reflected in THIS scrape's xpf_counter_read_errors_total rather
+	// than lagging one behind. Moving the collector earlier preserves that: it
+	// is still upstream of the deferred emit.
+	c.collectZoneCounters(ch, c.srv.dp)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {

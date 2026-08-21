@@ -20,8 +20,24 @@ import (
 // deny logged with the permit's name — an actively misleading audit trail.
 
 // TestResolvePolicyNameSentinelRendersDefaultPolicy proves the sentinel resolves
-// to "default-policy" and a real policy ID 0 still resolves to the first
-// configured policy's name — the two no longer collide.
+// to "default-policy" and that id 0 resolves to something DISTINCT from it —
+// the two no longer collide, which is the #3057 property.
+//
+// SUPERSEDED IN PART by #4626/#6851. This test originally also asserted that a
+// genuine policy ID 0 "still resolves to the first configured policy". That
+// claim was retired deliberately: id 0 is ALSO the id stamped on every session
+// no policy admitted (host-inbound, neighbour-seed, fabric, tunnel, pre-#3056,
+// and everything synced from an older HA peer), so the wire value is genuinely
+// ambiguous and naming a real rule is the more dangerous of the two possible
+// errors — see dataplane.UnattributedPolicyName. The six session-row surfaces
+// were routed through that guard by #4626; #6851 routed this RT_FLOW resolver
+// through it too, because a syslog record ships off-box and its attribution is
+// durable.
+//
+// The #3057 property this test exists for is UNAFFECTED and is asserted in both
+// directions below: the sentinel must not render as the first policy, and id 0
+// must not render as the default-policy. What changed is only the third value —
+// id 0 now under-claims as "unattributed" instead of naming allow-web.
 func TestResolvePolicyNameSentinelRendersDefaultPolicy(t *testing.T) {
 	er := NewEventReader(nil, NewEventBuffer(16))
 	// The first configured policy is a PERMIT at real runtime ID 0 — exactly
@@ -34,9 +50,19 @@ func TestResolvePolicyNameSentinelRendersDefaultPolicy(t *testing.T) {
 	if got := er.resolvePolicyName(dataplane.DefaultPolicySentinelID); got == "allow-web" {
 		t.Fatalf("sentinel resolved to the first policy name %q — the #3057 collision", got)
 	}
-	// Regression: a genuine policy ID 0 still resolves to the first policy.
-	if got := er.resolvePolicyName(0); got != "allow-web" {
-		t.Fatalf("real policy ID 0 resolved to %q, want \"allow-web\"", got)
+	// #4626/#6851: id 0 under-claims rather than naming the first policy.
+	if got := er.resolvePolicyName(0); got != dataplane.UnattributedPolicyName {
+		t.Fatalf("policy ID 0 resolved to %q, want %q — id 0 is overloaded and must "+
+			"not name the first configured policy (#4626/#6851)",
+			got, dataplane.UnattributedPolicyName)
+	}
+	// The #3057 non-collision, asserted in the OTHER direction too: id 0 must
+	// not be rendered as the implicit default either. A "fix" that collapsed
+	// both reserved ids onto one name would satisfy the assertion above and
+	// re-create exactly the aliasing #3057 removed.
+	if got := er.resolvePolicyName(0); got == dataplane.DefaultPolicyName {
+		t.Fatalf("policy ID 0 resolved to %q — the two RESERVED ids must stay "+
+			"distinct from each other (#3057)", got)
 	}
 }
 

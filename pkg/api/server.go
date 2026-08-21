@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/psaab/xpf/pkg/authz"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
@@ -100,15 +101,38 @@ type Config struct {
 	// nil defaults to net.Listen; a test injects a fake so the
 	// make-before-break listener reconcile is exercised without real ports.
 	ListenFunc func(network, address string) (net.Listener, error)
-	Store      *configstore.Store
-	DP         apiRuntimeDataPlane
-	EventBuf   *logging.EventBuffer
-	GC         *conntrack.GC
-	Routing    *routing.Manager
-	FRR        *frr.Manager
-	IPsec      *ipsec.Manager
-	DHCP       *dhcp.Manager
-	VRRPMgr    *vrrp.Manager // native VRRP manager
+	// PeerLookupFn resolves the identity of the peer end of an accepted
+	// connection, for the #5561 server-side authorization gate. `client` is
+	// the connection's remote address and `server` its local address. nil
+	// defaults to authz.LookupPeer, the kernel socket-table lookup.
+	//
+	// It is a seam, not a mock: a test injects a chosen identity so the route
+	// table and the class evaluation are exercised for a principal the test
+	// picks, instead of only for whichever account happens to run the suite.
+	// The kernel lookup itself is covered against real sockets in pkg/authz,
+	// and the REST gate is covered end-to-end with no injection at all by
+	// TestProductionServerEnforcesRealPeerIdentity_5561.
+	PeerLookupFn func(client, server net.Addr) authz.PeerIdentity
+	// PeerLocalityFn re-derives, at the moment an api-auth credential is about
+	// to speak for a caller, whether that caller is on THIS host (#5561). nil
+	// defaults to authz.PeerCouldBeLocalNow, a fresh interface enumeration.
+	//
+	// It is a second seam rather than a re-use of PeerLookupFn because the two
+	// answer different questions at different moments: PeerLookupFn is the
+	// accept-time identity, this is the authoritative locality re-check the
+	// credential row performs. A test that fabricates an off-box peer over a
+	// real LOOPBACK listener must state that premise here too — the production
+	// re-check would otherwise, correctly, call 127.0.0.1 one of ours and deny.
+	PeerLocalityFn func(client, server net.Addr) bool
+	Store          *configstore.Store
+	DP             apiRuntimeDataPlane
+	EventBuf       *logging.EventBuffer
+	GC             *conntrack.GC
+	Routing        *routing.Manager
+	FRR            *frr.Manager
+	IPsec          *ipsec.Manager
+	DHCP           *dhcp.Manager
+	VRRPMgr        *vrrp.Manager // native VRRP manager
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit and applyConfig, so
 	// two concurrent committers can't interleave their commit→apply
@@ -318,10 +342,26 @@ type Server struct {
 	wg         sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
 	httpLeg    *listenerLeg    // live HTTP listener leg (nil = not started / HTTP off)
 	httpsLeg   *listenerLeg    // live HTTPS listener leg (nil = HTTPS off)
+	// httpSlot / httpsSlot are the credential slots of the legs Start launches
+	// from the construction-time servers (#5561 round 14). Every leg gets one;
+	// a live slot follows s.auth, a retired one is pinned. See authSlot.
+	httpSlot  *authSlot
+	httpsSlot *authSlot
+	// retiring holds the legs that have been asked to stop but have not finished
+	// draining. Their slots are pinned, and ReplaceAuth keeps tightening them so
+	// a revocation still reaches a listener on its way out. Guarded by retireMu
+	// — NOT lifeMu, which Server.Wait holds across the whole drain.
+	retireMu sync.Mutex
+	retiring []*listenerLeg
 	// listen is the listener factory (#5866): Config.ListenFunc or net.Listen. A
 	// test injects a fake so the make-before-break reconcile is exercised without
 	// binding real ports.
-	listen                           func(network, address string) (net.Listener, error)
+	listen func(network, address string) (net.Listener, error)
+	// peerLookupFn is Config.PeerLookupFn; nil means authz.LookupPeer (#5561).
+	peerLookupFn func(client, server net.Addr) authz.PeerIdentity
+	// peerLocalityFn is Config.PeerLocalityFn; nil means
+	// authz.PeerCouldBeLocalNow (#5561).
+	peerLocalityFn                   func(client, server net.Addr) bool
 	store                            *configstore.Store
 	dp                               apiRuntimeDataPlane
 	eventBuf                         *logging.EventBuffer
@@ -453,6 +493,12 @@ func NewServer(cfg Config) *Server {
 	if s.listen == nil {
 		s.listen = net.Listen
 	}
+	// #5561: the peer-identity resolver behind the authorization gate. nil
+	// means the real kernel socket-table lookup (authz.LookupPeer), and nil
+	// PeerLocalityFn means the real fresh enumeration
+	// (authz.PeerCouldBeLocalNow) the credential row re-derives locality with.
+	s.peerLookupFn = cfg.PeerLookupFn
+	s.peerLocalityFn = cfg.PeerLocalityFn
 
 	mux := http.NewServeMux()
 
@@ -569,7 +615,19 @@ func NewServer(cfg Config) *Server {
 	// request that clears auth then hits this guard, so an attacker holding
 	// ambient Basic credentials is still blocked from driving a state change from
 	// a cross-site page. Safe methods and header-key/Bearer clients are unaffected.
-	sharedBase := mutationCrossSiteGuard(mux)
+	// #5561: enforce per-principal authorization on every state-changing route
+	// INSIDE the cross-site guard, so the order a mutation is evaluated in is
+	// (1) does the listener's api-auth policy admit it, (2) is this request of
+	// cross-site provenance, (3) is the CALLER allowed to perform this action.
+	// Steps 1 and 2 are properties of the request; step 3 is the first one that
+	// asks who is making it. (The enumeration listed 1 and 2 the other way round
+	// until #6645; the wrapping below is the authority — listenerHandler applies
+	// the auth middleware OUTSIDE this handler, so auth runs first. No runtime
+	// effect, but a reader reconstructing the order from the comment got it
+	// backwards.) It sits inside the auth middleware
+	// (applied per listener in listenerHandler) because a valid api-auth
+	// credential is one of the identities it considers.
+	sharedBase := mutationCrossSiteGuard(s.mutationAuthzGuard(mux))
 	// #4162: auth policy belongs to the listener that accepted the request.
 	// Keep one mux/collector/CSRF base so HTTP and HTTPS share the scrape
 	// limiter and session-gauge cache, then derive an auth wrapper from each
@@ -588,12 +646,14 @@ func NewServer(cfg Config) *Server {
 	s.certGen = generateSelfSignedCert
 
 	if cfg.Addr != "" {
-		s.httpServer = s.buildHTTPServer(cfg.Addr)
+		s.httpSlot = s.newAuthSlot()
+		s.httpServer = s.buildHTTPServer(cfg.Addr, s.httpSlot)
 	}
 
 	// Set up HTTPS server with auto-generated self-signed certificate
 	if cfg.TLS && cfg.HTTPSAddr != "" {
-		if hs, err := s.buildHTTPSServer(cfg.HTTPSAddr); err != nil {
+		s.httpsSlot = s.newAuthSlot()
+		if hs, err := s.buildHTTPSServer(cfg.HTTPSAddr, s.httpsSlot); err != nil {
 			slog.Warn("failed to generate self-signed certificate", "err", err)
 		} else {
 			s.httpsServer = hs
@@ -603,25 +663,92 @@ func NewServer(cfg Config) *Server {
 	return s
 }
 
+// authSlot is one listener leg's view of the credential policy (#5561 round 14).
+//
+// While the leg is LIVE the slot follows the server-wide snapshot: load() reads
+// s.auth, so a ReplaceAuth is enforced on that leg's very next request with no
+// per-leg bookkeeping — byte-for-byte the pre-round-14 behavior, and the reason
+// the plain day-2 credential swap is untouched by this.
+//
+// When the leg is RETIRED the slot is PINNED to what that address was serving at
+// the moment of retirement, and from then on it can only tighten. That is the
+// ordering fix: retirement is asynchronous (stopLegLocked only wakes the serve
+// goroutine, which closes the socket and drains later), so between
+// ReconcileHTTP returning and the retired listener actually going away there is
+// an interval in which the reconciler publishes the credential set the commit
+// authorized for the NEW address. Following s.auth through that interval handed
+// that credential to the address the commit had just retired.
+type authSlot struct {
+	srv    *Server
+	pinned atomic.Pointer[AuthConfig]
+	// isPinned is separate from a nil `pinned` because nil is a MEANINGFUL
+	// policy (no authentication at all), not "unset".
+	isPinned atomic.Bool
+}
+
+// newAuthSlot allocates a live (following) slot for a new leg.
+func (s *Server) newAuthSlot() *authSlot { return &authSlot{srv: s} }
+
+// load returns the policy this leg must enforce for the request in hand.
+// listenerHandler guarantees every middleware has a slot, so there is no nil
+// receiver here — and deliberately no nil-receiver fallback, because the only
+// plausible one (return nil) is dynamicAuthMiddleware's PASS-THROUGH.
+func (a *authSlot) load() *AuthConfig {
+	if a.isPinned.Load() {
+		return a.pinned.Load()
+	}
+	return a.srv.auth.Load()
+}
+
+// pin freezes the slot at cur. Ordered so the pinned value is visible before the
+// slot stops following: a request racing this sees either the server-wide
+// snapshot or cur, and at the pin instant those are the same value.
+func (a *authSlot) pin(cur *AuthConfig) {
+	a.pinned.Store(cur)
+	a.isPinned.Store(true)
+}
+
+// tighten intersects a PINNED slot with next, so a revocation still reaches a
+// listener that is draining while no grant does. A nil next (remove-all-api-auth)
+// is NOT applied: that direction removes a requirement, and its justification is
+// the #4047/#5127 clamp on the address the COMMITTED config binds — never the
+// address this leg is being retired from.
+func (a *authSlot) tighten(next *AuthConfig) {
+	if next == nil || !a.isPinned.Load() {
+		return
+	}
+	a.pinned.Store(AuthForRetainedListener(a.pinned.Load(), next))
+}
+
 // listenerHandler wraps the shared pre-auth base with the per-listener auth gate
 // for a bind address (#4162/#5866): only a literal loopback bind leaves /metrics
-// open when auth is configured. The dynamic middleware reads the live auth
-// snapshot per request, so ReplaceAuth needs no rebind.
-func (s *Server) listenerHandler(addr string) http.Handler {
-	return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), s.sharedBase)
+// open when auth is configured. The dynamic middleware reads the leg's own slot
+// per request — which follows the live snapshot until the leg is retired — so
+// ReplaceAuth needs no rebind.
+func (s *Server) listenerHandler(addr string, slot *authSlot) http.Handler {
+	if slot == nil {
+		// Never let a missing slot become a pass-through: substitute a FOLLOWING
+		// slot, which is what a live leg has anyway.
+		slot = s.newAuthSlot()
+	}
+	return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), slot, s.sharedBase)
 }
 
 // buildHTTPServer constructs a fresh HTTP *http.Server bound-for addr with the
 // per-listener handler (#5866). Used at construction and by a per-leg HTTP
 // rebind.
-func (s *Server) buildHTTPServer(addr string) *http.Server {
+func (s *Server) buildHTTPServer(addr string, slot *authSlot) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           s.listenerHandler(addr),
+		Handler:           s.listenerHandler(addr, slot),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
 		MaxHeaderBytes:    apiMaxHeaderBytes,
+		// #5561: resolve the peer's identity at ACCEPT and carry it into every
+		// request on the connection. Deferring it would let the caller choose
+		// the moment of the lookup — and choose to make it fail.
+		ConnContext: s.connContext,
 		// WriteTimeout intentionally unset — see the const block above (SSE
 		// streams + large scrapes must not be severed).
 	}
@@ -632,7 +759,7 @@ func (s *Server) buildHTTPServer(addr string) *http.Server {
 // on-disk pair AS-IS and mints a fresh cert ONLY when no on-disk pair exists (a
 // rebind does not re-mint — #1916 D6). A cert-resolution failure is returned so
 // the caller retains the previous leg (fail-closed).
-func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
+func (s *Server) buildHTTPSServer(addr string, slot *authSlot) (*http.Server, error) {
 	// Thread the listener's host into cert generation so a non-loopback
 	// management bind IP (e.g. `web-management https interface 10.0.0.1`)
 	// lands in the cert's SANs and a remote client verifies under strict
@@ -648,11 +775,13 @@ func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
 	}
 	return &http.Server{
 		Addr:              addr,
-		Handler:           s.listenerHandler(addr),
+		Handler:           s.listenerHandler(addr, slot),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
 		MaxHeaderBytes:    apiMaxHeaderBytes,
+		// #5561: same peer-identity plumbing as the HTTP leg.
+		ConnContext: s.connContext,
 		// WriteTimeout intentionally unset — see the const block above.
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},
@@ -715,15 +844,87 @@ func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
 // request, so a revoked credential is rejected immediately — no listener bounce,
 // no restart, no window. a==nil disables auth (only reached on a loopback bind;
 // the #4047/#5127 clamp forces a non-loopback no-auth bind through a rebuild).
+//
+// The swap reaches every LIVE leg at once (they read s.auth through their slots)
+// and reaches each RETIRING leg only as a TIGHTENING (#5561 round 14). A leg
+// that a reconcile replaced is still accepting and serving for the width of its
+// drain (whose width is not a fixed bound — see legDrainTimeout), and the
+// address it is serving is one the committed config asked
+// to leave: a revocation must still land there, a grant must not, and a nil must
+// not — the clamp that licenses a nil was evaluated against the address the
+// commit BOUND, not the one it retired.
 func (s *Server) ReplaceAuth(a *AuthConfig) {
 	s.auth.Store(a)
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
+	for _, leg := range s.pruneRetiredLocked() {
+		leg.slot.tighten(a)
+	}
 }
 
-// AuthSnapshotForTest returns the live auth snapshot (#5866). Test-only: it lets
-// a cross-package test (pkg/daemon managementReconciler) assert that a
-// same-endpoint reconcile published the new snapshot in place. Dep-free (no
-// test-only imports leak into the production binary).
-func (s *Server) AuthSnapshotForTest() *AuthConfig { return s.auth.Load() }
+// LiveAuth returns the credential snapshot the listeners are currently
+// enforcing (#5866). The management reconciler reads it to compute what a
+// listener RETAINED by a failed rebind is allowed to keep accepting (#5561
+// round 12, AuthForRetainedListener); tests read it to assert what a reconcile
+// published. It is the same atomic pointer the middleware reads per request, so
+// it never drifts from what is actually enforced.
+func (s *Server) LiveAuth() *AuthConfig { return s.auth.Load() }
+
+// HTTPHandlerForTest returns the http.Handler the LIVE HTTP leg is serving, or
+// nil when no HTTP leg exists. Test-only, and specifically a CROSS-PACKAGE one
+// (#5561 round 16).
+//
+// LiveAuth reports the SERVER-WIDE snapshot, which is not what a retired leg
+// enforces: that leg's handler closes over its own authSlot, pinned at
+// retirement and only ever tightened afterwards. A pkg/daemon test that wants to
+// assert what the listener a reconcile RETIRED still admits therefore has to
+// hold the handler across the reconcile — the leg itself is unexported,
+// ReconcileHTTP has already replaced s.httpLeg by the time the reconcile
+// returns, and s.retiring holds the old leg only until it finishes draining (any
+// later ReplaceAuth prunes it), so reading it afterwards is a race. Taking the
+// handler BEFORE the reconcile is deterministic and observes exactly what a
+// caller arriving on that still-draining socket would be judged by.
+func (s *Server) HTTPHandlerForTest() http.Handler {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.httpLeg == nil || s.httpLeg.srv == nil {
+		return nil
+	}
+	return s.httpLeg.srv.Handler
+}
+
+// HTTPSLegDrainedForTest reports whether the installed HTTPS leg has finished
+// its EXIT PATH AND ITS DRAIN — the listener is gone and every connection it
+// accepted has been finished or severed, hijacked connections excepted (Go
+// excludes those from both Shutdown and Close; see drainLeg). False when no leg is installed.
+// Test-only, and specifically a CROSS-PACKAGE precondition helper (#6827 round
+// 7).
+//
+// It does NOT report that the serve goroutine has returned (#6827 round 8). The
+// goroutine's defers run LIFO, so `drained` is stored BEFORE `wg.Done`, and a
+// caller can observe true inside that window. That is the right granularity for
+// a precondition — the drain is what the caller is waiting on — but a test that
+// needs the goroutine itself to be gone must use Server.Wait.
+//
+// It exists because a test that arranges a dead leg needs to know the exit path
+// has run, and the obvious way to ask — polling HTTPSServing() until it goes
+// false — reads `dead`, which is the flag such a test is usually there to bind.
+// A mutation that stops `dead` being stored then hangs the poll until its
+// deadline and the cell reds at the SETUP rather than at its own assertion:
+// evidence that the precondition is load-bearing, not that the property is
+// bound. `drained` is stored unconditionally by the goroutine's defer on every
+// exit path, so it answers "has the exit happened" without consulting anything
+// under test.
+//
+// Server.Wait is the better barrier where it applies (it joins deterministically
+// rather than polling), but it joins EVERY leg, so a caller whose server also
+// has a live HTTP leg — the shape the daemon reconciler always has — cannot use
+// it and needs this.
+func (s *Server) HTTPSLegDrainedForTest() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpsLeg != nil && s.httpsLeg.drained.Load()
+}
 
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
 // server is HTTP-only (#5866). Test-only: lets a cross-package test read the cert
@@ -763,14 +964,16 @@ func (s *Server) SetTLSCertDirForTest(dir string) {
 	}
 }
 
-// dynamicAuthMiddleware wraps next with the LIVE auth snapshot (#5866): it reads
-// s.auth atomically per request so a ReplaceAuth swap takes effect immediately.
+// dynamicAuthMiddleware wraps next with the auth snapshot of the LEG that
+// accepted the request (#5866; per-leg since #5561 round 14): a live leg's slot
+// reads s.auth atomically per request so a ReplaceAuth swap takes effect
+// immediately, and a retired leg's slot reads the policy it was pinned to.
 // A nil snapshot passes through (no auth) — the loopback clamp guarantees such a
 // listener is loopback-only. It enforces byte-for-byte the same checks as the
 // static authMiddleware via the shared authCheck.
-func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, next http.Handler) http.Handler {
+func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a := s.auth.Load()
+		a := slot.load()
 		if a == nil {
 			next.ServeHTTP(w, r)
 			return
@@ -784,9 +987,31 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, next http.Handle
 }
 
 // serveBound serves already-bound listeners until ctx is cancelled or a listener
-// terminates with an error, then shuts BOTH down under a bounded 5s drain and
-// joins both serve goroutines before returning (#5058 lifecycle, extracted for
-// the #5866 Start/Run split).
+// terminates with an error, then DRAINS both (drainLeg: graceful Shutdown, then
+// force-close what the deadline did not finish) and joins both serve goroutines
+// before returning (#5058 lifecycle, extracted for the #5866 Start/Run split).
+//
+// It goes through drainLeg rather than calling Shutdown itself (#6827 round 10).
+// It used to hold the exact shape drainLeg exists to fix — a bare Shutdown that
+// returns at its deadline and LEAVES an in-flight response streaming — which
+// made pkg/api/README.md's package-wide drain invariant false about this
+// function and left the shape here for the next reader to copy. This path is
+// test-only today (Server.Run has no production caller; the daemon uses
+// NewServer + Start), so the change is cheap, but "no caller today" is not a
+// reason to ship the defect.
+//
+// One behavioural consequence worth stating: this path now drains the way the
+// rest of the package does, and that shape has NO wall-clock ceiling. The old
+// code ran a bare Shutdown on each server under ONE shared 5s context and never
+// reached a Close phase at all; each server now gets its own legDrainTimeout
+// AND the severing Close behind it. That is not "5s for both" becoming "5s
+// each": legDrainTimeout is a POLL deadline, and both phases put serial
+// per-connection closes in front of it — on an HTTPS leg each close_notify
+// carries a five-second write deadline of its OWN, so one stalled peer costs up
+// to five seconds, then the next, in each phase of each server. The worst case
+// grows with the number of such connections and has no fixed ceiling;
+// legDrainTimeout's comment is the authority on why. legDrainTimeout is also
+// the knob a test can shorten.
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.
@@ -822,16 +1047,16 @@ func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) e
 	case <-ctx.Done():
 	}
 
-	// Shut down BOTH servers regardless of which path woke us. Shutdown closes
-	// the listener and unblocks the matching Serve goroutine with
-	// http.ErrServerClosed; join both so no goroutine outlives Run.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Drain BOTH servers regardless of which path woke us. Shutdown closes the
+	// listener and unblocks the matching Serve goroutine with
+	// http.ErrServerClosed; join both so no goroutine outlives Run. The
+	// Shutdown error is still what gets reported — a drain that had to sever is
+	// visible as a deadline error here, exactly as before.
 	var shutErr error
 	if s.httpsServer != nil {
-		shutErr = s.httpsServer.Shutdown(shutdownCtx)
+		shutErr = drainLeg(s.httpsServer)
 	}
-	if err := s.httpServer.Shutdown(shutdownCtx); err != nil && shutErr == nil {
+	if err := drainLeg(s.httpServer); err != nil && shutErr == nil {
 		shutErr = err
 	}
 	wg.Wait()
@@ -936,6 +1161,26 @@ func bindHostWarnable(bindHost string) bool {
 	return true
 }
 
+// hostnameSANWarnable reports whether the CURRENT kernel host name is an
+// identity worth warning about when a loaded on-disk cert does not cover it.
+//
+// It layers one extra condition on bindHostWarnable: the host name must be one
+// a re-mint COULD actually put in the SANs. generateSelfSignedCertAt
+// deliberately DROPS a non-ASCII / malformed host name from DNSNames rather
+// than hard-failing x509.CreateCertificate (see isDNSSANSafeHostname), so such
+// a name is uncoverable BY DESIGN — warning about it every reload would be
+// permanent noise advising a re-mint that cannot fix anything. An IP-literal
+// host name is warnable because it lands in IPAddresses.
+func hostnameSANWarnable(h string) bool {
+	if !bindHostWarnable(h) {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true // IP-literal host name → IPAddresses SAN
+	}
+	return isDNSSANSafeHostname(h)
+}
+
 // certCoversHost reports whether leaf's SANs cover host under the SAME strict
 // hostname check a remote TLS client applies: an IP-literal host must appear in
 // the cert's IPAddresses SANs, any other host in its DNSNames SANs (a CN-only
@@ -944,6 +1189,311 @@ func bindHostWarnable(bindHost string) bool {
 // verifying the connection by host will reject the served cert.
 func certCoversHost(leaf *x509.Certificate, host string) bool {
 	return leaf.VerifyHostname(host) == nil
+}
+
+// certHasNoSANs reports whether leaf carries NO subjectAltName usable for
+// hostname verification — neither a DNS name nor an IP address. Such a
+// certificate covers NOTHING: every modern client (Go since 1.15, browsers,
+// curl) refuses to fall back to the legacy CommonName, so BOTH
+// `https://localhost` and `https://127.0.0.1` fail against a CN-only cert.
+//
+// The per-identity checks below cannot see this: their warnable predicates gate
+// out loopback and "localhost" on the assumption that the durable cert always
+// carries the loopback SANs. That assumption holds for a cert THIS mint path
+// produced, but the load path accepts whatever is on disk — a pair persisted by
+// an older build, or placed by an operator, can have no SAN extension at all,
+// and then the whole diagnostic goes silent on the most broken cert possible
+// (#6827). Other SAN forms (email, URI) are irrelevant here: VerifyHostname
+// consults only DNSNames and IPAddresses.
+func certHasNoSANs(leaf *x509.Certificate) bool {
+	return len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0
+}
+
+// hostNameEvidence tells the host-name diagnostic HOW the caller learned the
+// kernel host name, which decides how much benefit of the doubt that name gets
+// as a management ACCESS identity (#6827).
+type hostNameEvidence int
+
+const (
+	// hostNameInferred — a certificate (re)load read the kernel host name off
+	// the running system (boot, or an HTTPS enable/rebind). Nothing there proves
+	// an operator ever connects by that name, so hostNameLikelyAccessIdentity's
+	// heuristic applies.
+	hostNameInferred hostNameEvidence = iota
+	// hostNameOperatorSet — the operator's own `set system host-name` commit
+	// JUST moved the kernel host name (Daemon.applyHostname →
+	// Server.WarnStaleMgmtCertForHostName). The name is the identity they
+	// deliberately chose for this device, reported at the moment they chose it,
+	// so it is diagnosed unconditionally: this is the one call site where "is
+	// this an access identity?" has a real answer rather than a heuristic.
+	hostNameOperatorSet
+)
+
+// hostNameLikelyAccessIdentity reports whether the kernel host name is PLAUSIBLY
+// a management access identity, judged from the SANs the loaded cert already
+// carries. It exists so the diagnostic stops crying wolf (#6827): a box named
+// `fw` whose cert covers `mgmt.example.com` and its management IP is reachable
+// and strictly verifiable at every URL actually in use, and telling that
+// operator to re-mint churns remote clients' TOFU pins to fix nothing. A
+// diagnostic that fires on a healthy box gets muted, and the true positive dies
+// with it.
+//
+// THE RULE, and why the cert's own SANs are the best evidence available: this
+// package's mint path is the ONLY thing that puts a bare, UNQUALIFIED name into
+// a generated cert, and what it puts there is the kernel host name of the day
+// (the bind host is the other source, and a management bind is an address or a
+// domain-qualified name). So the qualification SHAPE of the cert's DNS SANs
+// tells us which naming scheme this device's TLS identity follows:
+//
+//   - an unqualified DNS SAN (`old-fw`) next to an unqualified kernel host name
+//     means the TLS identity IS the kernel name, and it has drifted — diagnose;
+//   - a qualified DNS SAN (`mgmt.example.com`) next to an unqualified kernel
+//     host name means the TLS identity is domain-scoped and INDEPENDENT of the
+//     short kernel name, which was therefore never an access identity — silent;
+//   - a cert with no non-loopback DNS SAN at all was never minted for name-based
+//     access — silent.
+//
+// An IP-literal kernel host name is judged the same way against IP SANs:
+// address-based access is evidenced by a non-loopback IP SAN.
+//
+// The heuristic is deliberately NOT applied to hostNameOperatorSet. It is a
+// heuristic precisely because a cert load has no way to know what an operator
+// types; a rename does know, and it is also the one moment the operator is
+// watching the commit output.
+//
+// KNOWN RESIDUAL, weighed and accepted rather than missed. A rename that also
+// CHANGES the naming shape (`old-fw` → `newfw.example.com`, or the reverse) is
+// diagnosed at the commit — the rename path skips this function — but never on
+// a later boot, because from then on the load path sees a shape mismatch and
+// stays quiet. Two states reach that boot with no commit-time diagnosis behind
+// them, and only the first is about old boxes:
+//
+//   - a box ALREADY drifted before this diagnostic shipped never had a commit
+//     to catch it;
+//   - on a box RUNNING this build, the commit's diagnosis is a PROCESS-LOCAL
+//     debt (Daemon.staleCertPending, pkg/daemon), and a restart discards
+//     whatever is still owed. A cross-shape rename reaches that restart
+//     undelivered whenever no delivery between the rename and the shutdown
+//     found a served certificate. The ways in are more than the obvious one and
+//     worth naming, because each is an ordinary configuration rather than a
+//     fault: HTTPS disabled; its bind failed; the HTTPS serve loop terminated
+//     and no later commit rebuilt it (the rebuild itself is #6827 round 6 — the
+//     dead leg used to be unrecoverable, so this was permanent rather than
+//     merely pending); the API disabled entirely (--api-addr empty, so there is
+//     no reconciler to deliver through); the boot HTTP start failed; the kernel
+//     name could not be read at any delivery; or startup aborted on a signal
+//     (#5807) after the phase-4 config apply but before the management server
+//     was built. Enabling `web-management https` after the restart then reaches
+//     only the load path, which declines the shape.
+//
+// So the gap needs a rename that crossed the qualified/unqualified boundary AND
+// either pre-dating drift or a debt that did not survive a restart. It is the
+// rename path, not this function, that catches the ordinary case, and
+// shape-PRESERVING drift — unqualified → unqualified, including the worked
+// `old-fw` → `new-fw` — is still caught on every boot by this one.
+//
+// Closing either half costs the same mechanism and is declined for the same
+// reason: a boot-after-upgrade sweep needs upgrade-scoped persistent state (a
+// marker file or version stamp), and a debt that outlives a restart needs the
+// pending flag persisted plus an invalidation story for a name that changed
+// again while the daemon was down. Both then fire on exactly the boxes where
+// this function cannot tell whether the name is in use, reintroducing the false
+// positive at the least convenient moment. Not worth the mechanism; recorded
+// here so the next reader knows the choice was made deliberately.
+func hostNameLikelyAccessIdentity(leaf *x509.Certificate, hostName string) bool {
+	if net.ParseIP(hostName) != nil {
+		for _, ip := range leaf.IPAddresses {
+			if !ip.IsLoopback() && !ip.IsUnspecified() {
+				return true
+			}
+		}
+		return false
+	}
+	qualified := strings.Contains(hostName, ".")
+	for _, n := range leaf.DNSNames {
+		if strings.EqualFold(n, "localhost") {
+			continue // always minted; carries no evidence either way
+		}
+		if strings.Contains(n, ".") == qualified {
+			return true
+		}
+	}
+	return false
+}
+
+// warnStaleLoadedCert emits a diagnostic for every management identity the
+// LOADED durable cert fails to cover. The cert is served AS-IS (#1916 D6: a
+// re-mint would churn remote clients' TOFU pins), so this is the ONLY signal an
+// operator gets that strict remote verification will fail (#5719 C001).
+//
+// TWO identities are baked into the cert at first generation and BOTH can go
+// stale independently:
+//
+//   - the HTTPS listener bind host — stale after an A→B `web-management https
+//     interface` rebind;
+//   - the kernel host name — stale after `set system host-name`, which the
+//     durable cert does NOT re-mint for. Before this check that half was
+//     entirely SILENT: an operator connecting by the new host name got a bare
+//     "certificate is not valid for any names" with nothing in the log, even
+//     though the bind host was still covered so the bind-host warning never
+//     fired.
+//
+// The leaf is parsed ONCE and every check shares it. A parse failure or an empty
+// chain is not reported here — the caller still serves the pair it loaded, and
+// this function's contract is diagnostics only, never a serving decision.
+//
+// This is only ONE of the two entry points. A `set system host-name` commit does
+// NOT reload the certificate (the HTTPS leg rebinds only on a TLS/bind change),
+// so the rename half of the diagnostic reaches the operator through
+// Server.WarnStaleMgmtCertForHostName instead (#6827).
+func warnStaleLoadedCert(cert tls.Certificate, bindHost string) {
+	if len(cert.Certificate) == 0 {
+		return
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return
+	}
+	hostName, _ := tlsHostname()
+	if warnCertNoSANs(leaf, bindHost, hostName) {
+		return
+	}
+	warnStaleBindHost(leaf, bindHost)
+	warnStaleHostName(leaf, hostName, bindHost, hostNameInferred)
+}
+
+// warnCertNoSANs emits the terminal "this certificate covers nothing"
+// diagnostic and reports whether it fired. It is terminal by design: when the
+// leaf has no SANs at all, the per-identity warnings below would each report
+// "does not cover X" for a cert that covers no X whatsoever, which buries the
+// actual finding under a list of symptoms.
+func warnCertNoSANs(leaf *x509.Certificate, bindHost, hostName string) bool {
+	if !certHasNoSANs(leaf) {
+		return false
+	}
+	slog.Warn("loaded management TLS cert carries NO subjectAltName, so it covers NOTHING — every modern client rejects it for every host name and address (CommonName is not consulted) — remove /etc/xpf/tls to re-mint",
+		"cert_common_name", leaf.Subject.CommonName,
+		"bind_host", bindHost,
+		"host_name", hostName)
+	return true
+}
+
+// warnStaleBindHost warns when the loaded cert does not cover the HTTPS
+// listener's own bind host. The bind host needs no plausibility test: the
+// operator configured the listener to answer there, so it is an access identity
+// by construction.
+func warnStaleBindHost(leaf *x509.Certificate, bindHost string) {
+	if !bindHostWarnable(bindHost) || certCoversHost(leaf, bindHost) {
+		return
+	}
+	slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
+		"bind_host", bindHost,
+		"cert_dns_sans", leaf.DNSNames,
+		"cert_ip_sans", leaf.IPAddresses)
+}
+
+// warnStaleHostName warns when the loaded cert does not cover the kernel host
+// name. Unlike the bind host, the kernel name is only SOMETIMES an access
+// identity, so ev + hostNameLikelyAccessIdentity gate it (#6827) and the message
+// is conditional rather than a bare instruction to re-mint: the SANs it prints
+// are exactly the identities the cert DOES cover, so an operator who reaches the
+// box by one of those can dismiss it in a single read.
+func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hostNameEvidence) {
+	if !hostnameSANWarnable(hostName) || hostName == bindHost {
+		return // uncoverable by any re-mint, or already reported as the bind host
+	}
+	if ev == hostNameInferred && !hostNameLikelyAccessIdentity(leaf, hostName) {
+		return
+	}
+	if certCoversHost(leaf, hostName) {
+		return
+	}
+	slog.Warn("loaded management TLS cert does not cover the current host-name; clients verifying by host-name will fail — if this device is reached by host-name, remove /etc/xpf/tls to re-mint (the SANs below are the identities it does cover)",
+		"host_name", hostName,
+		"cert_dns_sans", leaf.DNSNames,
+		"cert_ip_sans", leaf.IPAddresses)
+}
+
+// WarnStaleMgmtCertForHostName re-runs the stale-certificate diagnostic against
+// the certificate the LIVE HTTPS leg is serving, for an EXPLICITLY supplied
+// kernel host name (#6827).
+//
+// A `set system host-name` commit reaches it through the daemon, but NOT
+// synchronously: Daemon.applyHostname records a debt and the daemon's delivery
+// path (renameHostNotingStaleMgmtCert → deliverStaleMgmtCertDiagnosis) makes the
+// call — at the rename when a certificate is already being served, and
+// otherwise at whichever later retry point first finds one. The name it passes
+// is read from the kernel at that moment, so this function is handed a live
+// identity rather than one captured at commit time.
+//
+// It exists because the load-path diagnostic could never see a rename. Two
+// independent reasons, and a fix for either alone is not enough:
+//
+//  1. REACHABILITY. warnStaleLoadedCert runs only while a certificate is being
+//     loaded, and the HTTPS leg is rebuilt only when the TLS flag or the HTTPS
+//     bind address changes (managementReconciler.reconcileTo). A plain
+//     `set system host-name new-fw` on an unchanged bind reloads nothing, so the
+//     appliance stayed silent until the next restart or HTTPS rebind — the exact
+//     case the host-name check was written for.
+//  2. ORDERING. The management reconcile runs EARLY in applyConfigLocked (before
+//     the dataplane apply, so a credential revocation lands even on an aborting
+//     commit) while the kernel host name is set late, in the apply tail. So even
+//     a commit that DID change the HTTPS bind would have diagnosed the OLD
+//     kernel name. Taking the name as a PARAMETER moves the read out of this
+//     function, which has no idea where in an apply it is running, and into the
+//     daemon, which does: it reads the kernel only after Sethostname has
+//     returned, and a delivery whose rename has since been superseded abandons
+//     before it gets here (pkg/daemon deliverStaleMgmtCertDiagnosis).
+//
+// It returns whether it actually reached a certificate — false means no live
+// HTTPS leg was serving, so the question could not be answered and the CALLER
+// still owes the diagnosis (#6827). Returning false is NOT "nothing was wrong":
+// the durable certificate on disk outlives the listener, so a host name that
+// went stale while HTTPS was down is still stale when HTTPS comes back.
+//
+// It deliberately reads the LIVE leg only, never the s.httpsServer construction
+// template, which survives a TLS disable and would otherwise produce warnings
+// about a certificate nobody serves.
+//
+// "Live" is listenerLeg.serving(), not a non-nil pointer (#6827). A leg whose
+// serve loop exited unexpectedly stays INSTALLED in s.httpsLeg with only its
+// `dead` flag set, and a leg retiring under a requested shutdown is still
+// installed while it drains — diagnosing either would report a certificate that
+// no socket is presenting, which is the same false positive the construction
+// template was rejected for.
+func (s *Server) WarnStaleMgmtCertForHostName(hostName string) bool {
+	s.lifeMu.Lock()
+	var srv *http.Server
+	if s.httpsLeg.serving() {
+		srv = s.httpsLeg.srv
+	}
+	s.lifeMu.Unlock()
+	if srv == nil || srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+		return false
+	}
+	cert := srv.TLSConfig.Certificates[0]
+	if len(cert.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		// A live leg is serving a certificate we cannot parse. The question WAS
+		// reached; re-parsing it later will fail identically, so report it
+		// answered rather than making the caller retry forever.
+		return true
+	}
+	bindHost := ""
+	if h, _, err := net.SplitHostPort(srv.Addr); err == nil {
+		bindHost = h
+	}
+	if warnCertNoSANs(leaf, bindHost, hostName) {
+		return true
+	}
+	// Only the host name is diagnosed here: the bind host did not change, so a
+	// stale one was already reported when the leg last bound, and repeating it on
+	// every rename is noise.
+	warnStaleHostName(leaf, hostName, bindHost, hostNameOperatorSet)
+	return true
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate
@@ -975,24 +1525,16 @@ func generateSelfSignedCertAt(dir, certPath, keyPath, bindHost string) (tls.Cert
 	// first and errors on a key-only / mismatched state → falls through to
 	// regen, which restores a matching pair.
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: bindHost is
-		// deliberately NOT baked into a reload, so an A→B management-IP rebind
-		// keeps the original cert rather than churning remote clients' TOFU
-		// pins. But if the loaded cert's SANs do not cover the current bind
-		// host, strict remote verification by that host will silently fail —
-		// warn loudly (naming the bind host and the cert's SANs) so an operator
-		// can re-mint (remove /etc/xpf/tls) instead of chasing a silent
-		// verification failure. Re-minting here would violate the durable
-		// contract, so this is diagnostic only (#5719 C001 residual).
-		if bindHostWarnable(bindHost) {
-			if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil &&
-				!certCoversHost(leaf, bindHost) {
-				slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
-					"bind_host", bindHost,
-					"cert_dns_sans", leaf.DNSNames,
-					"cert_ip_sans", leaf.IPAddresses)
-			}
-		}
+		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: neither the
+		// bind host NOR the kernel host name is re-baked on a reload, so an A→B
+		// management-IP rebind or a later `set system host-name` keeps the
+		// original cert rather than churning remote clients' TOFU pins. But a
+		// SAN the cert no longer covers makes strict remote verification fail
+		// silently — warn loudly (naming the uncovered identity and the cert's
+		// SANs) so an operator can re-mint (remove /etc/xpf/tls) instead of
+		// chasing a bare handshake failure. Re-minting here would violate the
+		// durable contract, so this is diagnostic only (#5719 C001 residual).
+		warnStaleLoadedCert(cert, bindHost)
 		return cert, nil
 	}
 

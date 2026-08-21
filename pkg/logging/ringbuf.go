@@ -275,8 +275,22 @@ func (er *EventReader) resolvePolicyName(id uint32) string {
 	// pseudo-policy name authoritatively (even before any policyNames map has
 	// been published) so a default-deny/reject RT_FLOW record never aliases the
 	// first configured policy (real ID 0).
-	if id == dataplane.DefaultPolicySentinelID {
-		return dataplane.DefaultPolicyName
+	//
+	// #6851/#4626: UnattributedPolicyID (0) is reserved for the same reason and
+	// must be handled the SAME way, before the map lookup. This is the seventh
+	// policy-name resolver and the one that matters most: RT_FLOW records are
+	// written to syslog and shipped off-box to a collector, so a wrong
+	// attribution here is DURABLE and lands in the record an auditor reads
+	// later, not just in an interactive row an operator can re-run.
+	//
+	// The under-claim applies here as it does on the session surfaces: a real
+	// policy whose id is 0 now renders `unattributed` on its own deny records.
+	// That is the same tradeoff SessionPolicyName documents — the wire value is
+	// genuinely ambiguous, and naming a specific rule on a host-inbound /
+	// fabric / tunnel / older-peer record is the more dangerous of the two
+	// errors. The numeric id remains in the record's own policy_id field.
+	if name, ok := dataplane.ReservedPolicyName(id); ok {
+		return name
 	}
 	er.policyNamesMu.RLock()
 	name := er.policyNames[id]
@@ -365,6 +379,20 @@ func (er *EventReader) SyslogClientCount() int {
 	er.syslogMu.RLock()
 	defer er.syslogMu.RUnlock()
 	return len(er.syslogClients)
+}
+
+// SyslogClients returns the currently installed syslog clients (goroutine-safe).
+//
+// #6829 F2: the sibling of SyslogClientCount, exposing the clients themselves
+// rather than just how many. applySyslogConfig computes each stream's facility
+// on one side of the client construction and assigns it on the other — the
+// compute/assign split that silently drops a value — and a COUNT cannot observe
+// which facility was installed. Deleting either half left the whole package
+// green before this existed.
+func (er *EventReader) SyslogClients() []*SyslogClient {
+	er.syslogMu.RLock()
+	defer er.syslogMu.RUnlock()
+	return append([]*SyslogClient(nil), er.syslogClients...)
 }
 
 // LocalWriterCount reports how many local log writers are currently installed

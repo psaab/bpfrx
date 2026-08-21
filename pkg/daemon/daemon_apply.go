@@ -319,7 +319,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// closed instead of being acknowledged after a partial reconcile.
 	routingRuleErr := d.applyRoutingRules(cfg, commitOverlay)
 
-	// #5642: the full dataplane apply (applyDataplaneAndHACore → d.dp.ApplyConfig)
+	// #5642: the full dataplane apply (applyDataplaneAndHACore → the dataplane's ApplyConfig)
 	// ran BEFORE applyRoutingRules and built its userspace route snapshot from the
 	// PRE-reconcile kernel ip-rule table (buildRouteSnapshots enumerates the live
 	// ip-rules via netlink.RuleList). On a rib-group / next-table transition —

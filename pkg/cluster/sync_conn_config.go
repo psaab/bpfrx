@@ -274,15 +274,58 @@ func (s *SessionSync) shouldApplyConfigGen(gen uint64) bool {
 
 // recordAppliedConfigGen advances the config high-water mark after a config of
 // generation gen has been SUCCESSFULLY applied. gen==0 (legacy / unconditional)
-// never advances the mark, mirroring the pre-#3931 behavior. It is called ONLY
-// from the single-consumer configApplyLoop after OnConfigReceived returns nil,
-// so the load/store pair needs no CAS.
+// never advances the mark, mirroring the pre-#3931 behavior.
+//
+// #5084: the load/compare/store is taken under configGenMu. The prior comment
+// here claimed it is "called ONLY from the single-consumer configApplyLoop, so
+// the load/store pair needs no CAS" — that is the wrong contract. The apply
+// loop is indeed the only ADVANCER, but resetRecvGen CLEARS this mark to 0 from
+// a receive-loop goroutine, so the pair had a concurrent writer. A clear landing
+// between the load and the store is LOST, re-raising a pre-reboot generation the
+// reconnect reset had just cleared and refusing every one of the reconnected
+// peer's lower current generations from then on. See the configGenMu doc.
+//
+// The three writers of lastAppliedConfigGen are:
+//
+//	recordAppliedConfigGen  the advance, here — configApplyLoop, under configGenMu
+//	resetRecvGen            the reconnect clear-to-0 — receive loop, under configGenMu
+//	initGenState            NewSessionSync / NewDualSessionSync, before Start
+//	                        spawns any goroutine, so it needs no lock
 func (s *SessionSync) recordAppliedConfigGen(gen uint64) {
 	if gen == 0 {
 		return
 	}
+	s.configGenMu.Lock()
+	defer s.configGenMu.Unlock()
 	if gen > s.lastAppliedConfigGen.Load() {
+		if s.configGenAdvanceBarrierFn != nil {
+			s.configGenAdvanceBarrierFn()
+		}
 		s.lastAppliedConfigGen.Store(gen)
+	}
+}
+
+// recordRecvConfigGen advances the RECEIVED config high-water (#5563) under
+// configGenMu, for the same reason recordAppliedConfigGen does (#5084): the
+// raise is a load/compare/store and resetRecvGen clears the mark from another
+// goroutine. The prior inline comment justified the bare pair with "the
+// receiveLoop is single-threaded per connection" — true per connection, but
+// there are TWO receive loops (conn0/conn1), so a raise driven by one fabric
+// races a reset driven by the other. A lost clear here leaves PeerConfigGen
+// pinned at a pre-reboot generation, which inverts the manual-failover
+// readiness gate (PeerConfigGen > AppliedConfigGen) into reporting READY while
+// the standby runs the pre-reboot policy.
+func (s *SessionSync) recordRecvConfigGen(gen uint64) {
+	if gen == 0 {
+		return
+	}
+	s.configGenMu.Lock()
+	defer s.configGenMu.Unlock()
+	if gen > s.lastRecvConfigGen.Load() {
+		if s.configGenAdvanceBarrierFn != nil {
+			s.configGenAdvanceBarrierFn()
+		}
+		s.lastRecvConfigGen.Store(gen)
 	}
 }
 
@@ -292,8 +335,15 @@ func (s *SessionSync) recordAppliedConfigGen(gen uint64) {
 // sweep — and configEpochStale folds max(fence, high-water) into its refusal
 // threshold. A gen==0 (legacy/unconditional) apply carries no comparable epoch,
 // so the fence stays 0 and no install is refused on its account. Called ONLY
-// from the single-consumer configApplyLoop, so the store needs no CAS.
+// from the single-consumer configApplyLoop. The store takes configGenMu (#5084)
+// so it cannot straddle resetRecvGen's clear of the same field; a stale fence is
+// less harmful than a stale high-water (the next sweep re-sends the transiently
+// refused installs), but the reset clears all three marks as one transaction and
+// leaving one writer outside the lock invites a reader to conclude none is
+// needed.
 func (s *SessionSync) beginConfigApply(gen uint64) {
+	s.configGenMu.Lock()
+	defer s.configGenMu.Unlock()
 	s.applyingConfigGen.Store(gen)
 }
 
@@ -304,8 +354,11 @@ func (s *SessionSync) beginConfigApply(gen uint64) {
 // advance — closing the residual window. On an apply FAILURE the high-water
 // deliberately stays put (M-2/#4151) and the fence is simply dropped, restoring
 // the pre-apply admission posture (the transiently-refused installs are re-sent
-// by the peer's next sweep). Called ONLY from configApplyLoop.
+// by the peer's next sweep). Called ONLY from configApplyLoop, under configGenMu
+// for the reason given on beginConfigApply (#5084).
 func (s *SessionSync) endConfigApply() {
+	s.configGenMu.Lock()
+	defer s.configGenMu.Unlock()
 	s.applyingConfigGen.Store(0)
 }
 

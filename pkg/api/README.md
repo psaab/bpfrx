@@ -245,6 +245,668 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
   fidelity for cross-system correlation; the CLI keeps human-friendly
   whole-second output.
 
+## Server-side authorization (#5561)
+
+Every state-changing route is gated on a **server-derived principal** before it
+reaches its handler. `authz.go` owns the route table and the middleware; the
+decision itself lives in `pkg/authz` so the gRPC surface can reach the same
+verdict when #5278 lands.
+
+**Why the loopback bind was not enough.** The daemon provisions every `system
+login user` a real shell account (`useradd -m -s /bin/bash`), and the CLI's RBAC
+check runs *in the CLI process*. A `read-only` class holder could therefore
+`curl 127.0.0.1:8080/api/v1/config/set` and commit, and the class boundary never
+ran. The pre-existing gates do not cover this: the #4047/#5127 clamp constrains
+*where* the listener binds, not *who* connects; `api-auth` is off by default on
+a loopback bind (`dynamicAuthMiddleware` passes every request through when the
+snapshot is nil) and is a shared secret rather than an identity; and the #5055
+cross-site guard is a browser-CSRF defense that a non-browser client passes by
+design.
+
+**How the caller is identified.** The peer's UID is read out of the kernel's
+socket table (`/proc/net/tcp` and `/proc/net/tcp6`), resolved to an account name
+via `/etc/passwd`, and then to a class via `system login user <name> class`. The
+caller supplies no part of the answer, so there is nothing to forge.
+`SO_PEERCRED` would answer the same question but only for AF_UNIX, and this is
+an AF_INET listener.
+
+Three properties make the lookup safe rather than merely plausible. Each has a
+mutation proof; each was added because its absence was a live bypass.
+
+- **Both the local AND remote address must match exactly.** The first
+  implementation asked INET_DIAG through `netlink.SocketGet`, assuming a request
+  carrying a 4-tuple is answered for that 4-tuple. It is not: the library issues
+  an `NLM_F_DUMP`, whose kernel-side filter (`inet_diag_dump_icsk`) matches on
+  family, states, `idiag_sport` and `idiag_dport` and **ignores the addresses**,
+  then returns the first reply without checking it. Identity was decided by port
+  pair alone — and since every address in 127/8 is bindable by any local user, a
+  caller that reused the source port of a root-owned connection was reported as
+  **root**. Demonstrated: with one socket at `127.0.0.2:35591`, a query for
+  `127.0.0.9:35591` returned uid 1000 and a reply whose id read `127.0.0.2`.
+  netlink is gone; the socket table is read directly, matched in full.
+- **Only a socket in `TCP_ESTABLISHED` yields a UID.** The kernel reports UID 0
+  for a TIME_WAIT mini-socket, so without the state check a caller that closes
+  right after writing the request is reported as **root**. Demonstrated by
+  mutation, running as uid 1000.
+- **Resolution happens at accept, once per connection** (`connContext`), not per
+  request. Deferring it lets the caller pick the moment — and pick to make it
+  fail (see the precedence rule below).
+
+Those accept-time lookups are **admission-controlled**: a package-global pool of
+`maxConcurrentPeerLookups` (1024) tokens bounds how many run at once, because the
+wedge that motivates the bound is inside the interface enumeration holding its
+own mutex, where a context would not help — only admission control would. Past
+the cap a connection resolves IMMEDIATELY to an unattributable local identity,
+which DENIES, reached without spawning anything.
+
+The pool's accounting has three rules and all three are load-bearing: a running
+lookup HOLDS a token, a finished one RETURNS it, and a connection REFUSED
+admission touches the count in neither direction. Get the second wrong and the
+pool stops being a concurrency ceiling and becomes a *lifetime budget* — the
+1024th connection ever accepted exhausts it permanently and every connection
+after it is denied, which is a total management-plane lockout reached by ordinary
+use with no attacker and no wedge. Get the third wrong in the releasing direction
+and the pool admits past the cap it exists to enforce.
+`TestPeerLookupSlotsAreReturned_5561` pins all three.
+`PeerLookupSlotsInUseForTest()` and `PeerIdentityWaitersForTest()` are the
+accept-side and request-side gauges; a wedge pins both at once.
+
+An **`api-auth` credential** is the second identity. It authorizes as a
+full-power principal, which is what it already grants (#4047 makes it the sole
+gate on an off-loopback bind), so narrowing it would be a separate breaking
+change.
+
+**Precedence: when the caller is LOCAL, the peer identity is authoritative.** A
+credential may speak only for a caller the login model does not describe, or one
+that is not on this host. The four outcomes are explicit because the interesting
+one is the failure:
+
+| peer lookup | principal |
+|---|---|
+| local, attributed to a `system login user` | that class |
+| local, attributed to an account **outside** the login model | **DENIED** |
+| local, **NOT** attributable | **DENIED** |
+| not on this host | a credential may speak for it (remote administrator) |
+
+Rows 1-3 collapse to one sentence: **a caller this host can PLACE never reaches
+the credential check.** If such an account needs access it is given a class —
+that is the one place access is supposed to be written down.
+
+Read "can place", not "is local". The two are not the same, and the gap between
+them is where the residuals live: placement is **namespace-scoped** (a container
+on this box has its own `/proc/net/tcp` and its own interface list, so it is
+local to the machine and unplaceable by this daemon) and **time-scoped** (an
+address can arrive or leave between the two observations). A caller this host
+cannot place is governed by the `api-auth` credential — which is exactly what
+#4047 makes that credential for, not a leak in it. See
+[Residuals](#residuals).
+
+Row 4 is the only one that *admits* on the strength of a negative, so it carries
+one extra obligation: the "not on this host" verdict was drawn at accept from a
+**cached** interface-address snapshot, and the credential row **re-derives it
+from a fresh interface enumeration** (`authz.PeerCouldBeLocalNow`) before
+honoring the credential. That re-derivation can only move a caller from row 4
+into a denial, never the other way, so it narrows row 4 without widening
+anything. It closes the direction that motivated it — an address ADDED since the
+snapshot — and cannot close the reverse; see [Residuals](#residuals) for which
+direction is which. It runs **after** the
+credential is validated — a caller presenting none cannot drive a kernel
+enumeration.
+
+**Every input to the decision is read after the last thing that can block.**
+An authorization verdict is only as current as the state it was drawn from, and
+this gate has two blocking steps a request can sit inside for a long time:
+`pendingPeer.wait` (up to `peerLookupTimeout`, 5s, and the caller can lengthen
+its own by connecting while the socket table is contended) and, on the
+credential row, the fresh interface enumeration above (single-flighted, so a
+request can wait out another goroutine's). Both used to sit *after* the state
+they superseded had already been captured:
+
+- The active config was read *before* the peer wait, so a `commit` demoting a
+  `super-user` to `read-only` — or deleting it from `system login user`
+  outright — did not reach that principal's own in-flight request. The wait now
+  comes first and the snapshot is read after it (`authorizeInputs`), so exactly
+  one snapshot feeds both the principal's class and `Authorize`, and nothing
+  blocks between the read and the verdict. Since round 10 this ordering no
+  longer decides the *outcome* — pass 2 re-reads the snapshot unconditionally
+  and would overrule a stale pass 1 — but it still decides **when** the denial
+  lands: with the fresh read, a revoked caller is refused before the gate
+  buffers a byte on its behalf; with the stale one it is admitted into the
+  caller-controlled body drain first. `TestConfigSnapshotIsReadAfterThePeerWait_5561`
+  asserts that timing (a body-carrying route whose body is declared and never
+  sent must still answer 403), because an assertion on the status alone passes
+  under either ordering.
+- The credential principal was minted *before* the enumeration. It is a value
+  and `ReplaceAuth` swaps a pointer, so a rotated or revoked secret did not
+  invalidate a principal already speaking. The credential is now re-validated
+  against the LIVE snapshot after the enumeration (`authz.go`, the second
+  `s.credential(r)` inside the credential branch); a request whose secret was
+  revoked mid-flight is denied. The re-check compares the *credential*, not
+  snapshot pointer identity — the reconciler republishes on every commit, so
+  pointer identity would 403 a valid caller for an unrelated commit.
+
+The residual is named rather than papered over: a `/etc/passwd` read still
+separates the snapshot from the verdict on the peer-UID row. Snapshot and
+decision cannot be made simultaneous without holding the config store's lock
+across the whole gate; they can be made adjacent.
+`authz_freshness_5561_test.go` pins both orderings, each case with a control
+that must be ADMITTED so a reverted ordering cannot be "caught" by an unrelated
+403. Which case pins which is worth being precise about, because for the
+credential bullet it is *not* the obvious one:
+`TestConfigSnapshotIsReadAfterThePeerWait_5561` pins the first, and
+`TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561` — not
+`TestRevokedCredentialCannotFinishAnInFlightRequest_5561` — pins the second.
+The next section says why.
+
+**What `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` actually
+proves, stated precisely (#6645 r21).** It proves a DISJUNCTION — that *at
+least one* live credential re-validation happens between `PeerLocalityFn` and
+the handler — not that the re-read inside the credential branch is the thing
+doing it. There are two independent live re-validations on that path, and they
+MASK EACH OTHER: reverting the credential branch to return the principal minted
+before the enumeration leaves the test green, because the mutation gate's second
+pass (`reauthorizeInputs`) still re-derives; deleting that second pass also
+leaves it green, because the credential branch still re-reads. Measured, at
+`-count=2`, all three cells:
+
+| mutation | result |
+|---|---|
+| credential branch returns the pre-enumeration principal | PASS |
+| second-pass `reauthorizeInputs` deleted | PASS |
+| **both** | **FAIL** |
+
+So no single-site deletion distinguishes, and an earlier revision of this
+section — which said the test "pins both" — overstated it.
+
+Isolating the credential-branch re-read specifically needs a case the second
+pass cannot answer, and
+`TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561` (#6645 r22) is it: a
+body-carrying route (`POST /api/v1/config/set`) whose body is declared and never
+sent, with the FIRST pass blocked inside `Config.PeerLocalityFn`, the credential
+revoked while it is parked, locality released, and a **prompt 403 required
+before the body is supplied**. Only pass 1 runs before the body, and within pass
+1 only the branch's own re-read can see a revocation that landed after the check
+at the top of `principalFrom` — so the denial has exactly one possible author.
+Its control arm must PARK rather than answer, which is what makes "prompt"
+mean something. Measured against the same three cells:
+
+| mutation | `…CannotFinishAnInFlightRequest` | `…RereadDeniesBeforeTheBody` |
+|---|---|---|
+| credential branch returns the pre-enumeration principal | PASS | **FAIL** |
+| second-pass `reauthorizeInputs` deleted | PASS | PASS |
+| **both** | **FAIL** | **FAIL** |
+
+The middle row is the point as much as the first: the new case stays green when
+the *second* pass is deleted, so it isolates the branch re-read rather than
+restating the disjunction. Two guards that each cover for the other read as
+redundancy and are actually a gap — worth recognising as a shape, not just as
+this instance.
+
+**And the gate is not the last thing that blocks.** Ordering the gate's own
+blocking steps is necessary and was not sufficient, because the *handler* blocks
+too — on the one input the caller owns outright, its request body.
+`decodeJSONBody` reads it after the middleware has already returned its verdict,
+for as long as `apiReadTimeout` (30s) allows, and the caller chooses how long
+that takes:
+
+```
+send headers for POST /api/v1/system/action, withhold the body
+  -> the gate authorizes; the handler is entered and parks in Decode
+another session revokes the credential / demotes the class
+  -> nothing re-reads it
+supply {"action":"reboot"}
+  -> the box reboots on an authorization made 30 seconds ago
+```
+
+So the body is drained **inside the gate**, between two adjudications:
+
+| step | why it is where it is |
+|---|---|
+| **pass 1** | Fail-fast, and it comes first for *availability*, not authorization. Buffering before deciding would let any caller that can open a socket park daemon memory behind a 30s read timeout. With the check first, only a principal already authorized for **this** route can make the daemon hold a buffer. That is a necessary bound and not a sufficient one — the cheapest permission on the surface is `PermView`, held by a `read-only` shell account — so the drain is bounded again below. |
+| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation, and bounded in **three** dimensions. **Per route** (`restMutationBodyLimits`): `POST /api/v1/config/load` keeps the 16 MiB whole-configuration ceiling, config edits get 1 MiB, diagnostics and `system/action` get 64 KiB, and the routes whose handlers never read a body are **not buffered at all** — their own immediate answer is restored rather than moved behind a read the caller controls. That no-body class is `security/sessions/clear`, `security/counters/clear`, and the candidate-lifecycle and commit verbs addressed by the `X-Config-Session` header alone: `config/enter`, `config/exit`, `config/commit`, `config/commit-check` and `config/confirm`. `dhcp/identifiers/clear` is deliberately *not* in it — #4794 made it decode an optional body, so it keeps the ordering — but note its 413 threshold **moved from 16 MiB to 64 KiB**: the gate's ceiling now trips before the handler's own `MaxBytesReader`. **In aggregate** (`mutationBodyBudgetBytes`, 64 MiB): a request is charged for the buffer it has actually ALLOCATED, grown as the caller's bytes arrive, and is refused **429** when a growth step would breach its share — so the memory a caller can pin is capped no matter how many sockets it opens, and a declared `Content-Length` buys nothing on its own. **Per privilege tier** (`mutationBodyTierCeilings`): that aggregate is partitioned by the permission the route requires — view 8 MiB, clear 16 MiB, config 48 MiB, maint 64 MiB — so a caller flooding the cheapest routes cannot deny a privileged one. (`PermControl` had an equal-to-clear row from round 11 to round 19 and it was **vacuous**: no route requires that permission and the lookup is keyed on a route's requirement, so the row was never consulted. It is gone; the unlisted-permission fallback assigns the smallest share, so a `PermControl` route added later is bounded from the moment it exists.) The guarantee is **one-directional**: each ceiling is tested against the *aggregate*, so a tier is protected only from the tiers strictly below it, and a privileged flood can still refuse a cheap one (scheduling, not a denial primitive). That is also why view is **half** what clear gets rather than the same 16 MiB round 11 first gave view, clear and control alike: equal shares put no tier below any other, so a view tier driven to its own ceiling left the clear tier nothing, and 383 sockets on `diagnostics/ping` from a `read-only` account made a super-user's 24-byte `dhcp/identifiers/clear` answer **429**. Each step reserves the **peak charge** of the largest body the tier above it can carry — peak, not body size, because a buffer growing by doubling holds the old allocation and the new one across the copy, so a body that steps to a route's limit *L* is charged 1.5*L* (16−8 = 8 MiB ≥ the 96 KiB a 64 KiB clear body drives; 48−16 = 32 MiB ≥ the 24 MiB a 16 MiB `config/load` drives; 64−48 = 16 MiB ≥ 96 KiB for `system/action`), and 8 MiB still holds **127** concurrent *maximum-size* view bodies (measured: the 128th cannot reach 64 KiB, because its own last doubling would peak at 96 KiB). Round 18 stated those steps in **body** bytes and configure−clear came out **one byte short** — a clear tier at its own ceiling made a super-user's 16 MiB `config/load` answer 429, the exact primitive the ladder removes — because the buffer then grew a whole extra doubling to hold the one byte that DETECTS an oversized body, peaking at 2*L*+1. That byte now lands in a one-byte scratch array instead (round 19). The read is still at most `limit+1` bytes. An oversized body answers **413 from the gate on every route** — same status and same body `decodeJSONBody` writes, measured byte-identical on the wire — and a body of exactly the limit is handed to the handler whole, with the 400/413 split landing exactly on `limit`. One thing is **not** preserved and an earlier revision of this table claimed it was: `http.MaxBytesReader` marks the response `requestTooLarge`, so the pre-gate 413 carried `Connection: close` and the gate's does not. That predates the scratch-byte change — the gate's first commit already took the write away from `MaxBytesReader` — so it is a long-standing wire-level difference, not a round-19 regression. |
+| **pass 2** | The verdict the handler actually runs under. It re-reads the **live** half — the config snapshot and the api-auth credential, the two things a commit can change under an in-flight request — **on every row**, not only on the credential row. The credential re-check used to sit inside `principalFrom`'s off-box branch, which an attributed *local* caller never reaches, so a configured administrator on this host could present secret A, withhold its body, let another session rotate A to B, and still have the mutation run; the same hole in its worst spelling let a request admitted while the listener had *no* api-auth stay credentialless after a commit added one. The **connection-fixed** half (the accept-time peer UID, and the credential row's locality re-derivation) is reused: a connection's addresses do not change mid-request, and re-enumerating interfaces per pass would make every credentialed mutation pay twice for an unchanged answer. The `/etc/passwd` resolution *is* repeated, deliberately — it is a page-cached read of a small local file, and repeating it means an account deleted mid-request is noticed. |
+
+Two residuals, both named. Locality is answered from an enumeration started on
+pass 1, so an address added to this host *while the body was being read* is not
+seen — the same direction [Residuals](#residuals) already names for the
+accept-time snapshot (a scan cannot observe an address that arrives after it),
+widened from the snapshot's TTL to the body window. And a handler that read its
+body in pieces, or blocked on something else of the caller's choosing after the
+decode, would reopen a window the gate cannot see; every mutating handler today
+decodes once, up front, before it acts.
+`TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` drives both
+revocation shapes — a class demotion (caught by the fresh snapshot) and an
+`api-auth` revocation (caught by the fresh credential check) — because a fix
+that re-read only one of the two leaves the other on the old behaviour. It also
+pins the enumeration count at exactly one per request.
+`TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561`
+(`authz_bodywindow_5561_test.go`) drives the **intersection** those two rows
+leave empty — a LOCAL attributed caller whose credential is rotated, or newly
+required, inside the window — which is exactly where the credential re-check
+did not run. `authz_bodybudget_5561_test.go` owns what the window may cost:
+`TestPerRouteBodyLimitIsEnforced_5561`,
+`TestGateBodyBufferIsBoundedInAggregate_5561` (concurrent requests really
+holding more than the budget must be REFUSED, not admitted), and
+`TestEveryGuardedRouteDeclaresABodyLimit_5561`, which keeps the permission and
+body-limit tables from diverging.
+
+**The observability hooks these cases wait on are PROCESS-GLOBAL, and that is a
+test-hygiene obligation (#6645 r22).** `MutationBodyWaitersForTest`,
+`MutationBodyBytesAdmittedForTest` and `PeerLookupSlotsInUseForTest` are
+package-level gauges shared by every `api.Server` in the process, so "some
+request is parked" and "*this* case's request is parked" are the same
+observation unless the count is known to have started at zero. Two rules keep
+them meaningful, and both are load-bearing rather than tidiness:
+
+- A case that waits on a waiter edge calls `waitForGateQuiescent` **before** it
+  opens the request, so its `waitForMutationBodyWaiter` — which accepts any
+  count above zero — cannot be answered by somebody else's parked request.
+- A case must not RETURN with a request still parked. `authzServer`'s cleanup
+  closes the server and then waits for the gate to go quiescent, which puts the
+  failure on the case that leaked rather than on whichever innocent case
+  `-shuffle` ran next. `TestNoBodyRouteIsNotBufferedByTheGate_5561` ends by
+  design with a control request parked on a body it never finishes (measured:
+  `waiters=1 admitted=512` at the end of its body), so it hangs up and drains
+  explicitly.
+
+The same shape bites the accept-time pool from the other side. `connContext`
+returns its admission token in the goroutine's **last** defer and `close(p.done)`
+is deferred after it — so `p.done` closes FIRST, and a case that joins on it (or
+simply drives HTTP and reads the response) returns while the token is still out.
+`TestPeerLookupSlotsAreReturned_5561` therefore waits for genuine zero occupancy
+before filling the pool: with one token already held it can take only
+`maxConcurrentPeerLookups-1` more and reads one OVER, failing its own
+precondition — `pool holds 1024 tokens before the case starts, want 1023` — with
+nothing wrong in production. And because a SAFE request never enters the
+mutation gate, nothing on its request path waits for the lookup at all, so
+`TestPeerIdentityIsResolvedAtAccept_5561` reads its resolver counts through
+`waitForPeerLookupsToFinish` (count reached *and* pool empty) rather than
+sampling when the response lands.
+
+`authz_bodybudget_fairness_5561_test.go` owns the other direction of the same
+availability property — that the bound is not itself a denial lever.
+`TestHalfOpenBodyIsChargedForWhatItHoldsNotWhatItDeclared_5561` pins the
+denomination (a socket that declares a route ceiling and sends one byte is
+charged for one small buffer, not for the declaration);
+`TestLowPrivilegeCallerCannotDenyAPrivilegedOne_5561` drives the exact shape
+that broke — a `read-only` principal opening enough half-open `diagnostics/ping`
+requests to have emptied the undivided budget, after which a super-user's
+`config/set` must still be served;
+`TestViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` does the same
+with real bytes and asserts the view tier is capped with a whole-configuration
+load still free behind it;
+`TestViewTierFloodCannotDenyTheClearTier_5561` drives the *view-versus-clear*
+step — a `read-only` flood saturating the view tier, after which a super-user's
+`dhcp/identifiers/clear` must still be served — which is the step the equal
+16 MiB shares left unprotected;
+`TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561`
+states the ladder in the units of the work it protects (a merely monotonic
+ladder can still protect nothing), walking **every** privilege step derived from
+`config.LoginClassPermissions` against the *measured* peak charge of the largest
+body derived from the route tables — `peakChargeForMaxSizeBody` binary-searches
+the smallest ceiling at which production `bufferMutationBody` admits such a body,
+so one side of every comparison comes from the code rather than from a second
+human-written number — and holding the operational tiers to a concurrency floor
+so separating them by starving one is caught too;
+`TestATierAtItsCeilingCannotRefuseTheTierAboveIt_5561` then *spends* those
+numbers, pinning each lower tier at its ceiling and requiring a real max-size
+request for the tier above to be admitted;
+`TestBufferedBodyLimitBoundaryIsUnchanged_5561` is the over-reach guard on that
+charge fix — 413 starts at exactly `limit+1` and everything under it reaches the
+handler byte for byte, which held before the fix and holds after;
+`TestEveryGuardedRouteDeclaresABodyTier_5561` keeps the ladder covering the
+routes it arbitrates between **and** rejects a tier row no route requires; and
+`TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` binds the release on
+each of the three exit paths (handler returned, caller hung up mid-body, body
+overran the ceiling) rather than leaving it to whichever later test inherits a
+poisoned counter.
+
+Membership of the no-body class is checked against the handlers themselves, not
+asserted: `TestNoBodyClassMatchesTheHandlersThatDecode_5561` sends every guarded
+route a malformed body and requires the set that DECODES it to be exactly the
+complement of the class. A probe that asked "did this request park" would be a
+tautology — the gate parks a buffered route whether or not its handler would
+have read anything — which is how five routes sat in the buffered class while
+answering from headers alone. `TestNoBodyRouteIsNotBufferedByTheGate_5561` then
+pins the resulting behaviour across the whole class, with a control
+(`config/set`) that parks because its handler decodes rather than because of how
+it is classified.
+
+The rule has been narrowed twice, each time because a weaker version had a hole
+the claim did not admit to:
+
+- **v1** used the peer UID when the lookup *succeeded* and fell back to the
+  credential otherwise. The caller controlled whether it succeeded: a
+  `read-only` account holding the api-auth secret escalated to full power by
+  calling `shutdown(SHUT_WR)` before the request was authorized — 403 when
+  polite, **200 on `/config/enter`** when hostile. A precedence rule that only
+  holds on the success path is not a precedence rule.
+- **v2** denied an *unattributable* local caller but still let the credential
+  speak for an *attributed* one outside the login model — the exact population
+  #5561 exists to constrain. It made the per-principal gate optional for anyone
+  holding the shared password, and it contradicted `docs/system-login.md`, which
+  already said such a caller is denied.
+
+**What "local" is allowed to mean.** Absence from *this* namespace's socket
+table is not evidence of being off-box: a peer in another network namespace
+appears in neither `/proc/net/tcp` nor `net.InterfaceAddrs()` here, and calling
+that "remote" would hand it the credential — the same unsound "not found means
+remote" inference that produced the v1 bypass. So "remote" is never inferred
+from a failed lookup.
+
+It is bounded instead by the delivery address: **a connection delivered on a
+loopback address is treated as local.** Under a default configuration that is
+also true — martian filtering drops packets carrying loopback addresses that
+arrive on a real interface — but it is a *conservative* rule, not a guarantee:
+`route_localnet=1`, `IP_TRANSPARENT` and DNAT-to-loopback each defeat that
+filtering. The rule still **fails safe** under all three, because each of them
+classifies a *remote* caller as local, and a local caller with no socket row is
+denied. **That rule** over-denies; it never inverts — scoped to the loopback
+rule, not a claim about the classification as a whole, two of whose
+[residuals](#residuals) do grant. A routable delivery address
+falls back to "is the peer one of *our* addresses", sound positively and
+carrying the residuals below negatively.
+
+The classification is consulted **after** the socket-table read, not before it,
+and only where the table has nothing to say — a matched row settles locality on
+its own. A row that matches the 4-tuple but whose state or uid column will not
+parse proves a socket exists without naming its owner: local, unattributable,
+denied, and logged once per scan rather than dropped in silence.
+
+**A failed table read denies unconditionally — including a remote administrator
+holding a valid credential.** If you are diagnosing a total management-plane
+lockout, this is the paragraph you want. Two states are read failures, and both
+deny: **any** candidate table that could not be read (hidepid, an LSM
+confinement, a `/proc` remount, ENOMEM under pressure) — *one* of two is enough —
+and **no** candidate table read at all. In either, `LookupPeer` returns
+*local-and-unattributable* for every caller, so every `POST /api/v1/config/*`
+answers **403** until `/proc` recovers, whoever is calling and whatever
+credential they present. It does **not** fall back to the address rule "in both
+directions"; an earlier revision of this document said it did, and that was
+wrong.
+
+That is the deliberate trade, and the direction is the reason. The alternative —
+falling back to the address rule on a failed read — makes a *negative* answer
+decisive on the strength of an observation that was never made: the caller's row
+may be in exactly the file that failed (`tcp` and `tcp6` are alternatives, not
+duplicates, so a partial failure is *half* an observation, not a small one), and
+a local caller the cached snapshot did not recognise would be reported off-box
+and handed the credential path. One side of that trade is an availability outage
+on a box whose `/proc` is broken; the other is a privilege-boundary bypass. Only
+the second is unrecoverable, so the read failure denies.
+
+An **absent** table is not a failed read, and the distinction is load-bearing:
+`scanBatch` skips ENOENT, so a kernel with no `/proc/net/tcp6` alongside a
+readable `/proc/net/tcp` reads normally and nothing is denied. Absence only
+denies when it leaves *nothing* read — zero files read **and** zero failed —
+which is the state a scope-qualified IPv6 caller reaches when `/proc/net/tcp6`
+is missing, since `tcp6` is that caller's only candidate. The recovery is to
+restore `/proc/net/tcp{,6}` readability for the daemon's UID; no config change
+reopens the surface, by design.
+
+<a id="residuals"></a>
+**Residuals, stated rather than papered over.** There are FOUR, and they are not
+the same kind — an earlier version of this header said "the first two over-deny
+and grant nothing; the third is closed", which under-counted the list and
+mischaracterised it. Read the kind before the detail:
+
+| # | residual | kind |
+|---|---|---|
+| 1 | DNAT to loopback | over-denies; grants nothing |
+| 2 | Another network namespace | **open** — spatial |
+| 3 | A brand-new local address | **closed** |
+| 4 | Address churn between accept and adjudication | **open** — temporal |
+
+Only #1 over-denies. Only #3 is closed. #2 and #4 are open, both grant, and they
+are one shape rather than two curiosities:
+
+> The locality re-derivation answers **"is this address on this host, in my
+> namespace, right now."** The question authorization actually needs is **"was
+> this caller local when it connected."** Those coincide for the case the fix was
+> written for and come apart in two directions.
+
+- **Spatially** — a caller local to the BOX but not to the daemon's network
+  namespace. Both halves of the lookup are namespace-scoped, so it reads as
+  remote. That is the container case below.
+- **Temporally** — a caller whose address was on this host at accept and is not
+  by the time the request is adjudicated. A fresh scan is by construction fresher
+  than the connection, so it cannot see that. That is the churn case below.
+
+Be precise about what the address-snapshot fix closed, because "closed" without a
+direction is what the previous version of this list got wrong in the other
+direction. It closes the case that motivated it — an address ADDED recently,
+where a stale cache said *not local* and handed the caller the credential. It is
+**definitionally unable** to close the reverse: a scan cannot observe an address
+that is already gone. Both remaining cases need the `api-auth` secret *plus*
+timing, and neither is a regression — before #5561 any secret holder had full
+power unconditionally, so this is a narrowing with a race hole in it rather than
+a new hole.
+
+- **DNAT to loopback.** If a remote connection is redirected to a loopback
+  address before it reaches the listener, the delivery address is loopback, the
+  caller has no socket row here, and it is denied — so a legitimate remote
+  administrator behind such a redirect cannot use the mutation surface even with
+  a valid credential. This is the most plausible of the three; bind
+  `web-management` to a real address rather than DNAT-ing to loopback.
+- **Another network namespace, off-loopback bind — the SPATIAL case of the shape
+  above, and an argument corrected.** A
+  container's veth peer and a real remote client are indistinguishable in the
+  socket table, so a netns caller on a routable bind reaches the credential path.
+  Both halves of the lookup are namespace-scoped: `findPeerSocket` reads only
+  *this* namespace's `/proc/net/tcp{,6}`, and `PeerCouldBeLocalNow` repeats the
+  same namespace-scoped `net.InterfaceAddrs()` test, so a peer in another
+  namespace produces a clean no-match in both and lands `(OK=false, Local=false)`.
+
+  An earlier version of this list argued the path was narrow because "an
+  unprivileged user cannot get there": `unshare -Urn` yields a namespace
+  containing only `lo`, and attaching a veth to the host needs CAP_NET_ADMIN in
+  the host namespace. **That reasoning does not hold, and it is the wrong thing
+  to lean on.** A caller does not have to *create* its own namespace. A process
+  inside an already-provisioned container — Docker, Kubernetes,
+  `systemd-nspawn` — is handed a veth by the runtime and needs no capability of
+  its own; possession of the shared credential is then sufficient.
+
+  The correct statement of the bound is not "nobody can get here", it is **what
+  governs a caller who does**: a peer this host cannot place is treated as
+  remote, and the `api-auth` credential is the authority for it. That is the
+  design #4047 mandates — on an off-loopback bind the credential is the sole
+  gate — not a leak in it. The operational consequence is concrete and worth
+  stating plainly: **a container on this host that holds the `api-auth` secret
+  has the same power over the mutation surface as a remote administrator
+  holding it.** If that is not wanted, do not give containers the secret, and
+  keep `web-management` on loopback where `couldBeLocal` short-circuits before
+  any of this applies.
+- **A brand-new local address — the direction that IS closed.** The
+  host-address snapshot is refreshed at most once per second, for hits *and*
+  misses, so for up to a second after an address is added to this host a caller
+  arriving from that address is classified **off-box**. An earlier version of
+  this list claimed such a caller "still cannot escape a class it holds, because
+  a local caller with a class is only reachable through the socket table, which
+  is not cached." **That was backwards.** Being classified off-box meant the
+  socket table was never read at all — `LookupPeer` short-circuited on
+  `!couldBeLocal` before consulting it — so the caller landed on the credential
+  row, which authorizes as a *full-power* principal. The staleness granted
+  access; it did not over-deny.
+
+  It was reachable, not theoretical: address adds are observable to any
+  unprivileged account (`ip monitor address` needs no privilege) and this box
+  performs them routinely — VRRP VIPs on failover, DHCP leases, RA-derived
+  addresses. Reproduced against one live ESTABLISHED socket, changing only
+  whether the snapshot predated the client's address add:
+
+  ```
+  truthful cache : OK=true  Local=true  uid=1000
+  stale cache    : OK=false Local=false uid=0  "peer 10.166.99.1 is not on this host"
+  ```
+
+  Two changes bound it, and neither is the cache. They close the ADDED
+  direction; residual #4 below is the reverse, which they cannot reach:
+
+  1. **The socket table is read first.** `couldBeLocal` is consulted only where
+     the table has nothing to say. A row hit proves locality from the kernel, so
+     for any caller that has a socket — which is every caller that can read a
+     response — the cached negative decides nothing. The early-out existed only
+     to keep churn off the table, and the single-flight batcher had already
+     removed that argument (120 concurrent fresh connections: **3** reads in
+     82 ms).
+  2. **The credential row re-derives locality.** The one case the table cannot
+     answer is "no row at all", where a local caller that reset its own socket
+     before the read still meets the stale negative. It cannot read a response,
+     but the handler still runs, so a fire-and-forget commit is a real outcome.
+     `authz.PeerCouldBeLocalNow` answers that case from a *fresh* enumeration.
+
+  What remains is an over-denial: for at most a second, a local caller with no
+  socket row is denied instead of resolved to its class.
+
+  **Bounds (of the closed direction).** It required an *off-loopback* bind (on
+  the default loopback bind
+  `couldBeLocal` short-circuits before the cache is ever consulted, so the
+  default posture was provably never exposed), a configured `api-auth` secret in
+  the caller's hands, and an address added to the host within the last second.
+  `pkg/config/compiler.go` still rejects an off-loopback bind with no `api-auth`
+  at strict commit (#4047), so those two conditions travel together.
+- **Address churn between accept and adjudication — the TEMPORAL case, and
+  the direction that is NOT closed.** A *successful*
+  enumeration that finds nothing is not proof the caller is off-box — errors
+  fail closed, omissions cannot. A clean no-match reads the same whether the
+  caller is genuinely remote, in another namespace, or was on this host a moment
+  ago and is not now. The last is reachable without the caller doing anything
+  privileged, because it can ride address churn the **system** performs: on this
+  product a VRRP VIP moves on every failover, and DHCP and RA churn constantly.
+  Both observations are used rather than one — the accept-time verdict still
+  denies before the credential row is reached, and the fresh check adds denials
+  for callers that only became placeable later — but neither covers an address
+  that appeared *and* vanished between them. Closing that needs address-change
+  notification (`RTM_NEWADDR`) rather than two point samples, and is not
+  attempted here. The bound is the same one as for the namespace residual above:
+  a caller this host cannot place is governed by the `api-auth` credential.
+
+**Scoped IPv6 is refused, not guessed.** `/proc/net/tcp6` prints only the 128
+address bits, never the scope id, so two link-local callers on different
+interfaces render an identical key and the first matching row would win — an
+order-dependent identity, the same defect class as matching on ports alone. A
+scope-qualified peer address that we would otherwise have to *attribute* is
+therefore reported local-and-unattributable (denied). Mutating the guard out
+attributes such a caller **uid 0**.
+
+The refusal is checked **after** the locality classification, deliberately: a
+scoped peer that is *not* on this host is a remote administrator reaching an
+IPv6 link-local management bind, and refusing before the locality test locked
+out every credentialed remote on such a bind.
+
+**UID 0 is authorized unconditionally**, without consulting `/etc/passwd` or the
+active config. Root owns the daemon and the on-disk config DB, so denying it
+would be theater — and making root's access depend on an active config would
+lock the operator out of a box that has not loaded one yet.
+
+**Route table.** `restMutationPermissions` is an ALLOW-list keyed by the exact
+`"METHOD /path"` a route was registered under; permissions mirror
+`pkg/cli/permissions.go` so `curl` and the CLI answer the same. A non-safe
+method with no entry is **denied**, so a future `mux.HandleFunc("POST …")`
+without a table entry is inert rather than unguarded.
+`TestEveryMutatingRouteHasAPermission_5561` reads the registrations out of
+`server.go` and requires coverage in both directions, turning that from a
+runtime surprise into a test failure. `POST /api/v1/system/action` is gated at
+**maintenance** — the highest permission any of its body-selected verbs needs —
+because the middleware does not consume the request body; the effect is that an
+`operator` principal cannot use its `clear-config-lock` verb over REST. It
+over-restricts rather than under-restricts.
+
+**Safe methods are untouched.** GET/HEAD/OPTIONS/TRACE, `/health`, `/metrics`
+and the SSE streams keep exactly their previous access rules (the #4162 metrics
+gate and `api-auth` still apply to them).
+
+**What this breaks, and the remedy.** One population changes behavior: a local
+process running as a **non-root UID that is not a configured `system login
+user`** and presenting no credential. It could previously mutate and commit
+config; it now gets `403` naming the reason. Nothing in this repository is in
+that population — the CLI speaks gRPC, and the deploy/day-0/harness tooling
+reads `/metrics` only — but operator automation might be. Any one of these
+restores it:
+
+- run the caller as root, or
+- `set system login user <account> class super-user` (the account then also
+  gets the class's CLI rights), or
+- configure `set system services web-management api-auth …` and present the
+  credential.
+
+A denial is confined to the REST mutation surface: forwarding, the dataplane,
+the console CLI and gRPC are unaffected, so this cannot brick a running box.
+
+**Identity plumbing.** `connContext` (the `http.Server.ConnContext` hook)
+resolves the peer once, at accept, and caches it on the connection;
+`http.Request` exposes `RemoteAddr` only as a string and no local address at
+all. It must be set on **every** `http.Server` literal, including the #5866
+day-2 rebind path in `listener.go` — a listener without it can identify nobody,
+which would refuse every mutation on it after an unrelated bind change.
+`TestEveryListenerCarriesPeerIdentity_5561` enforces that across the package,
+and `TestPeerIdentityIsResolvedAtAccept_5561` pins the once-per-connection
+timing (a per-request lookup is what the caller used to be able to defeat).
+`pendingPeer` keeps the connection's own addresses for the same reason the hook
+exists — the credential row needs them for its locality re-derivation.
+
+`Config` carries two test seams, and they answer different questions at
+different moments: `PeerLookupFn` is the accept-time identity, `PeerLocalityFn`
+the authoritative locality re-check the credential row performs. Both nil in
+production. A case that fabricates an off-box caller over a real *loopback*
+listener has to state that premise in both, because the production re-check
+enumerates the host's real interfaces and would — correctly — call `127.0.0.1`
+one of ours. `TestBrandNewLocalAddressCannotBorrowCredential_5561` leaves the
+second one nil on purpose: that is precisely the "accept-time verdict says
+off-box, the caller is really on this host" state the re-check exists for.
+
+**Cost.** This is load-bearing, not tuning: the lookup runs once per accepted
+CONNECTION, and reading `/proc/net/tcp{,6}` is **not** proportional to row count
+— the kernel walks its entire TCP hash table, sized from RAM. Measured on an idle
+box carrying 11 and 39 rows, a single raw read costs 4.3 ms and 10.1 ms, and a
+full lookup 6-9 ms. Unbounded and per connection, that is a denial of service
+available to any local process with **no credentials at all**: a connect loop at
+~110 conn/s saturates a core inside the daemon — the same unprivileged local
+population #5561 exists to constrain. Three bounds:
+
+- **Single-flight** (`socketscan.go`). One goroutine reads the tables; every
+  waiter registered before that read *started* is answered from it, and a waiter
+  arriving mid-read is served by the next one. 60 concurrent connections cost
+  **2** reads, not 60. The security property is untouched: a connection accepted
+  at T is still only ever answered from a read that started at or after T,
+  because the batch is taken under the same lock the request was appended under.
+- **Off the accept loop.** `ConnContext` runs serially in `http.Server`'s accept
+  loop, so the lookup is *started* there but runs in its own goroutine. A request
+  arriving before its lookup finishes waits for it; a wedged lookup denies rather
+  than hangs, on a deadline stamped **per connection** (not per request, which
+  would charge the full timeout again on every request the connection makes).
+- **The address snapshot, for the cases the table does not answer.** Locality is
+  classified from a cached interface-address snapshot, refreshed at most once per
+  second for hits **and** misses — an earlier version refreshed on every miss,
+  which is precisely the flooding case, so the amplification was fully intact
+  while the comment claimed otherwise. This used to *also* short-circuit the
+  table read for a peer that could not be local; that early-out is **gone**, for
+  the security reason under [residuals](#residuals). Reinstating the read costs
+  nothing measurable because of the bound above — the read it reinstates is the
+  batched one.
+- **The authoritative locality re-check is behind the credential.** The row-4
+  re-derivation enumerates interfaces for real (~32 µs on a box carrying 14
+  addresses, against 4.3–10.1 ms for one `/proc/net/tcp` read). It runs only for
+  a request that already presented a **valid** credential on a connection
+  classified off-box, so an unauthenticated flood — the population that can open
+  sockets without holding anything — drives **zero** enumerations, and a caller
+  that does hold the credential is authorized regardless. Concurrent
+  re-derivations collapse into one enumeration through the same
+  waiter-set-before-read batching `socketscan.go` uses, so the batch is answered
+  from an observation newer than every arrival in it.
+  `TestUncredentialedCallerDrivesNoLocalityRecheck_5561` pins the ordering
+  and `TestConfirmationIsSingleFlighted_5561` the batching.
+
+A *local* attacker can still make connections that each join a batched read.
+They already have a shell on the box, the cost no longer scales with connection
+count, and the outcome is fail-closed.
+
+**Known residual (not #5561).** The READ surface — REST GETs, `/api/v1/show-text`
+— is unchanged and remains reachable by any local process on a loopback bind.
+#5561 is scoped to the mutation surface; a read-side principal check is a
+separate question with a different blast radius (`/metrics` scrapers, health
+probes).
+
 ## Callers
 
 `cmd/xpfd` builds the `Server` from its assembled dependencies and runs it
@@ -252,8 +914,8 @@ under the daemon's errgroup. Nothing else imports this package.
 
 ## Dependencies
 
-`config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`, `ipsec`,
-`logging`, `routing`, `vrrp`.
+`authz`, `config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`,
+`ipsec`, `logging`, `routing`, `vrrp`.
 
 ## Gotchas
 
@@ -305,6 +967,207 @@ under the daemon's errgroup. Nothing else imports this package.
     `authMiddleware`, so the swap enforces byte-identical semantics (the #4157
     constant-time + #5636 empty-secret guards, `/health` + loopback-`/metrics`
     exemptions).
+  - **What is published, and when (#5561 rounds 7/9/10/12).** A commit's
+    credential set is not published as one atomic thing, because a credential
+    change is really two changes with opposite safety directions and a listener
+    may be serving an address the commit asked to leave.
+    - The **revocation** half goes out FIRST — before either leg is (re)bound and
+      regardless of the outcome. Deferring it behind a bind that may never
+      succeed left the retained listener honouring a replaced secret permanently
+      (round 7), and publishing after the rebind left a freshly-bound socket
+      serving under the old snapshot for the width of the intervening HTTPS
+      reconcile (round 9; `ReconcileHTTP` serves before it returns).
+    - The **grant** half waits until every listener that is SERVING sits at an
+      address the committed config names. A credential set is committed together
+      with the endpoint it is meant for, so while a listener is retained at an
+      address this config asked to leave, only
+      `AuthForRetainedListener(live, next)` — the intersection of what that
+      listener already accepted with what is still committed — may be enforced
+      (round 12). Otherwise a commit that moves management to loopback while
+      introducing a credential would, on a failed rebind, publish that credential
+      on the routable address the operator was withdrawing. A **nil** live
+      snapshot is the UNIVERSAL set, not the empty one (it is the pass-through
+      posture), which is what keeps the round-9 case publishing whole. A commit
+      with nothing to converge publishes whole, and so does one whose only
+      failure was to ENABLE a leg — that leaves no listener behind at all, so
+      there is nothing to protect (`mgmtEndpoint.everyLiveLegNamedBy`, round 13;
+      the previous `rebinding && len(errs) == 0` was a proxy wider than the
+      property, and the excess denied every caller on an address the same commit
+      had named).
+    - The intersection can be EMPTY, which denies everyone on the retained
+      listener until a later reconcile converges. That is deliberate — refusing
+      to represent `∅` would mean keeping a credential the committed config no
+      longer carries alive on a listener the operator asked to leave, which is
+      the round-7 fail-open — and it is acceptable because every state that can
+      reach it has an EXIT a later commit reaches: converge the failing bind, or
+      commit the address that is actually serving. **It is not, however, visible
+      to the operator.** `show system services` reports the retained leg as
+      `Listening`, because it genuinely is serving (`pkg/daemon/README.md`
+      "Effective-listener snapshot"); there is no HTTPS row at all
+      (`sysservices.Listeners` renders gRPC and HTTP only); and `applyConfig`
+      logs the reconcile error as a warning rather than failing the commit, so
+      the operator sees a SUCCESSFUL commit. The only signal is in the log — the
+      `Warn` `reconcileTo` emits naming how many credentials it withheld (counted by
+      `CredentialCount`, which skips api-keys mapped to `false` — they authenticate
+      nobody and `AuthForRetainedListener` does not copy them, so counting them
+      over-reported the withholding), and
+      the `Warn` for the incomplete reconcile. Exitability, not diagnosability,
+      is what makes the state acceptable; a dedicated HTTPS row in
+      `show system services` would be a real improvement and is not in this
+      change.
+    - **Removing all api-auth is a revocation and lands immediately** (round 14).
+      The **nil** — the pass-through — publishes only when every live bind
+      address is loopback, because the justification for a nil is the #4047/#5127
+      clamp, which `resolveAPIBinds` evaluates against the config being applied
+      and never re-evaluates against the listener that is serving. While any live
+      leg is still off-loopback, what publishes is the **deny-all** set (non-nil,
+      empty). Rounds 7-13 left the live snapshot ALONE there, so the credential
+      the operator had just deleted kept authenticating on that routable address
+      for as long as the loopback bind kept failing — indefinite, and the exact
+      inversion of the instruction. The decision is re-taken after the rebinds
+      (`publishNilDirectionLocked`), which is what converges deny-all to nil once
+      the loopback bind lands.
+    - **Freshness — one COMMITTED generation, endpoint AND credentials** (round
+      14, `committedDesired`). An apply caller that snapshots `ActiveConfig()`
+      and then waits on the apply semaphore (the DHCP lease-change callback) can
+      be overtaken by commits: serializing applies orders them but not their
+      CONTENT, so an OLDER generation can still be the last one applied. Rounds
+      10 and 12 pinned only the credential half, which left the listener driven
+      toward the STALE endpoint under the COMMITTED policy — a hybrid belonging
+      to no committed generation. With the policy nil that is an off-loopback
+      listener with NO authentication and nothing left to restore; with it
+      non-nil, the hybrid's `next` NAMES the stale address, so
+      `everyLiveLegNamedBy` reads TRUE and the full set publishes at an endpoint
+      the committed config never authorized it for. Deriving both halves from
+      `ActiveConfig()` removes both: a stale replay computes the newest commit's
+      desired state, so it is a no-op or a bind retry. This fences the management
+      listener only; the rest of the apply pipeline reconciling toward a
+      superseded generation is #6716.
+    - **A RETIRED leg never gains a credential** (round 14). `stopLegLocked` only
+      closes a channel — the socket keeps accepting until the serve goroutine
+      reaches `Shutdown`, and what it accepted is served for the whole
+      drain — while `ReconcileHTTP`/`ReconcileHTTPS` return immediately, and the
+      reconciler then publishes. Each leg therefore carries its own `authSlot`:
+      LIVE legs FOLLOW `s.auth` (the live swap above is unchanged), and a leg is
+      PINNED at retirement to what it was already serving, after which
+      `ReplaceAuth` only intersects it. Revocations still reach a draining
+      listener; grants and nils never do.
+    - **Every leg exit DRAINS its connections** (#6827 round 7, `drainLeg`).
+      `ReplaceAuth` keeps tightening a retired leg's pin only while the leg is on
+      `s.retiring`, and `pruneRetiredLocked` reaps it the moment `drained` is
+      set — so `drained` has to mean **"nothing this leg accepted is still being
+      served"**: no further request admitted AND no response still in flight.
+      It meant neither. The unexpected-serve-exit arm returned WITHOUT any
+      `Shutdown`: `Serve` closes the listener on its way out, but the HTTP/1
+      keep-alive and HTTP/2 connections it had already accepted kept being
+      served, under a slot the recovery reconcile then PINNED and the next
+      `ReplaceAuth` PRUNED before tightening — a revoked credential going on
+      working on a socket the box believed was gone. All three exits (requested
+      retirement, root-context shutdown, unexpected exit) now run a bounded
+      `Shutdown` followed by `Close` on deadline.
+      **Both halves of that, and which call does which (#6827 round 8 — round 7
+      named the wrong mechanism here).** `Shutdown` sets `inShutdown`, so
+      `doKeepAlives()` goes false: idle connections are closed and a connection
+      it is still waiting on finishes its current response and then closes, so
+      **no further request** is possible from `Shutdown` alone — measured. What
+      `Shutdown` does not do is END the response already in flight; it WAITS for
+      it and, at the deadline, returns `ctx.Err()` leaving it open and streaming.
+      This server runs with no `WriteTimeout` by design (SSE, large scrapes), so
+      that response has no bound of its own and outlives the drain indefinitely
+      on a leg already marked `drained`. `Close` is what ends it, which is why it
+      is not optional and not redundant. Bound by
+      `TestInFlightResponseIsSeveredOnEveryLegExit_6827` across all three exits;
+      deleting the `Close`, or reverting the retirement/root arm to a bare
+      `Shutdown`, reds it — before round 8 both edits left the package green.
+      **`Server.serveBound` runs the same drain** (#6827 round 10). It had kept
+      the exact shape `drainLeg` exists to fix — a bare `Shutdown` under a
+      deadline with no `Close` — which made this invariant, stated package-wide,
+      FALSE about it; round 9 edited its doc ("bounded 5s drain" → "5s-deadline
+      drain") without touching the behaviour. It is test-only (`Server.Run` has
+      no production caller; the daemon uses `NewServer` + `Start`), which made
+      fixing it cheap rather than optional: narrowing the invariant instead would
+      have left the shape in the tree for the next reader to copy. Bound by
+      `TestServeBoundSeversInFlightResponses_6827`, which runs BOTH legs with a
+      stream held on each (#6827 round 11). It used to pass `nil` for `httpsLn`,
+      so it never entered the `if s.httpsServer != nil` branch and reverting
+      THAT statement alone to a bare `Shutdown` left `pkg/api` and `pkg/daemon`
+      green — deleting it reds only
+      `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener
+      CLOSES, not that a response is SEVERED. Round 10's own revert mutation
+      flipped both statements together, and the bound HTTP leg redded the cell
+      and masked the unbound HTTPS one: a compound mutation cannot localise. The
+      cell also ASSERTS the returned error now — `drainLeg` grew a return value
+      for exactly that, and with it merely logged, `return err` could become
+      `return nil` with both packages still green.
+      One behavioural consequence,
+      and it is NOT a bigger fixed number: the old code ran a bare `Shutdown` on
+      each server under ONE shared 5s context and never reached a `Close` phase
+      at all, whereas each server now gets its own `legDrainTimeout` AND the
+      severing `Close` behind it. Read that as the package's drain shape, not as
+      "5s for both" becoming "5s each" — `legDrainTimeout` is a POLL deadline
+      with serial per-connection closes in front of it in BOTH phases, each
+      HTTPS `close_notify` carrying a five-second write deadline of its own, so
+      the worst case here grows with the number of stalled connections and has
+      no fixed ceiling, exactly as described below.
+      **On the unexpected-serve-exit arm, `dead` is stored BEFORE the drain, and
+      the ORDER is load-bearing** (#6827 round 10). `serving()` has to flip the
+      instant the socket dies, because for the whole width of the drain — which
+      has no wall-clock ceiling, see below — a same-address `ReconcileHTTPS`
+      takes the `serving()` no-op arm and returns nil, `reconcileTo`'s
+      `next.TLS && !HTTPSServing()` recovery term is false, and
+      `WarnStaleMgmtCertForHostName` diagnoses a certificate no socket is
+      presenting. Moving the store below `drainLeg` left both `pkg/api` and
+      `pkg/daemon` green until round 10: every other dead-leg cell kills a leg
+      with NO connection, whose drain returns in microseconds, so both orders
+      look identical there. `TestServingFlipsDuringTheDrainNotAfterIt_6827` holds
+      a stream open and asserts the flip happens WHILE `drained` is still unset.
+      **`legDrainTimeout` bounds NEITHER the drain nor the `Shutdown` in
+      wall-clock terms** — round 8 said "the Shutdown" and that was the second
+      wrong version of the sentence (#6827 round 9). It is a POLL deadline
+      consulted between quiescence checks, and serial per-connection closes sit
+      in front of it in BOTH phases: `Shutdown`'s loop calls `closeIdleConns()`
+      and only reaches its `ctx.Done()` select if that returns false, and
+      `closeIdleConns` walks `activeConn` under `s.mu` closing one at a time; then
+      `Close`, which takes no context at all, does the same again. On an HTTPS leg
+      each close is a `*tls.Conn` sending `close_notify` under its own five-second
+      write deadline (`crypto/tls`), so a stalled peer costs up to five seconds
+      EACH, in series, in either phase. The worst case grows with the number of
+      such connections and has no fixed ceiling, and the
+      knock-on is worth knowing: `Server.Wait` holds `lifeMu` across the drain
+      and `WarnStaleMgmtCertForHostName` holds `staleCertMu` while waiting for
+      `lifeMu`, so a `set system host-name` racing daemon shutdown waits for it.
+      Bounding the sever phase for real needs per-connection tracking with
+      concurrent deadlined closes — a larger change than #6827, deliberately not
+      taken here, and the claim is narrowed to what is true instead of asserting
+      a bound that is not.
+      **Hijacked connections are OUT OF SCOPE, and the exclusion is only partly
+      enforced.** Go
+      excludes them from both calls (`Shutdown` "does not attempt to close nor
+      wait for hijacked connections", `Close` "does not even know about" them),
+      and a hijacked conn leaves `activeConn`, so it can outlive the drain with
+      `drained` stored. Nothing in `drainLeg` can reach it — the handle is gone.
+      This package has no hijacker, and `TestNoHijackerInThisPackage_6827` is a
+      **tripwire, not a gate** — round 8 claimed enforcement and that was too
+      strong (#6827 round 9). It catches three forms: a local `http.Hijacker`
+      assertion, a local `Hijack` call, and an import of a package known to
+      hijack internally. The third exists because a purely local AST walk is
+      defeated by a dependency this module ALREADY has:
+      `golang.org/x/net/websocket`'s `Server` hijacks inside its own handler, so
+      `mux.Handle("/ws", websocket.Handler(h))` would add the case with nothing
+      in this package's syntax to match. That import list is DERIVED, not
+      asserted (#6827 round 10): round 9 called it "the ones reachable from this
+      module today" and it was missing `golang.org/x/net/http2/h2c`, which lives
+      in the SAME direct dependency and hijacks in `NewHandler` — mounting a real
+      `h2c.NewHandler` in a production file left the test PASSING. The map now
+      records the grep that produced it and the dependency version it was run
+      against (`golang.org/x/net v0.48.0`, which yields exactly `websocket` and
+      `http2/h2c`), so the next reader can re-run it and a version bump makes it
+      visibly stale — where an assertion of completeness just stops them looking,
+      which is what happened twice. Reverse proxies, upgrade helpers,
+      aliases and reflection escape even the import check. Read a pass as "none
+      of the three known forms is present". It is an AST scan rather than a text
+      scan so that this documentation, and `drainLeg`'s, do not trip it — a guard
+      has to be able to coexist with its own description.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
@@ -317,8 +1180,13 @@ under the daemon's errgroup. Nothing else imports this package.
     retiring the old (no unreachable window on that plane, no double-bind of an
     unchanged socket); a bind (or HTTPS cert) failure fail-closes to the retained
     previous leg. `Start(ctx)` binds HTTP synchronously (fail-closed if it fails)
-    and HTTPS best-effort (a boot HTTPS failure leaves HTTP up, retried next
-    commit). `Wait()` joins every live + retiring leg goroutine on shutdown.
+    and HTTPS best-effort (a boot HTTPS failure leaves HTTP up). BOTH boot
+    failures are retried on the next commit — but only since #5561 round 14,
+    which made the retry debt real: the reconciler now keeps the `Server` after a
+    failed boot HTTP bind (it holds no socket on that path, and dropping it made
+    every later reconcile a no-op), and asks `HTTPSServing()` instead of
+    inferring a converged HTTPS leg from `Start`'s nil error. `Wait()` joins
+    every live + retiring leg goroutine on shutdown.
     Listeners bind via `Config.ListenFunc` (default `net.Listen`) so tests inject
     a fake factory that models `EADDRINUSE`. Pinned by
     `server_authswap_5866_test.go` (live auth swap) +
@@ -367,26 +1235,198 @@ under the daemon's errgroup. Nothing else imports this package.
       wildcard (`:8443` → empty) / non-encodable bind host is skipped, and a
       value already present is coalesced. Like the hostname path this only ever
       ADDS an encodable SAN, so it never aborts generation.
-    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual):** a
-      later `set system host-name` (or a bind-address change) does NOT re-mint
-      an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
-      deferred (it needs a mint-ordering / invalidation hook and a decision on
-      churning the durable TOFU pin). What WAS a silent failure is now
-      diagnosed: on the load-success path `generateSelfSignedCertAt` parses the
-      loaded leaf and, when the current bind host is a concrete non-loopback
-      management host (`bindHostWarnable`) that the leaf's SANs do NOT cover
-      (`certCoversHost` — the same strict check a remote client applies), emits
-      a `slog.Warn` naming the bind host and the cert's SANs, so an operator
-      re-mints (remove `/etc/xpf/tls`) instead of chasing a silent
-      verification failure.
+    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual,
+      #6827):** a later `set system host-name` (or a bind-address change) does
+      NOT re-mint an already-persisted cert, so its DNS/IP SANs can go stale.
+      Re-minting is deferred (it needs a mint-ordering / invalidation hook and a
+      decision on churning the durable TOFU pin). What WAS a silent failure is
+      diagnosed from **two** entry points, because one alone cannot reach every
+      way a cert goes stale:
+      - `generateSelfSignedCertAt` calls `warnStaleLoadedCert` on the
+        load-success path — boot, and any HTTPS enable/rebind;
+      - `Server.WarnStaleMgmtCertForHostName` is reached from
+        `Daemon.applyHostname` after a successful `set system host-name` — not
+        synchronously: the rename records a DEBT and the daemon's delivery path
+        makes the call, at the rename when a certificate is already served and
+        otherwise at the first later retry point that finds one. The load path
+        could never see a rename: the HTTPS leg is rebuilt only when the TLS
+        flag or the HTTPS bind address changes
+        (`managementReconciler.reconcileTo`), so a rename on an unchanged
+        endpoint reloads nothing. And `reconcileWebManagement` runs EARLY in
+        `applyConfigLocked` while the kernel name is set in the apply tail, so
+        even a commit that DID move the HTTPS bind would have diagnosed the OLD
+        name — which is why this entry point takes the host name as a
+        PARAMETER instead of re-reading `os.Hostname()` itself: the read moves
+        to the daemon, which performs it after `Sethostname` has returned and
+        abandons the delivery if a newer rename has since been recorded.
+        At BOOT this hook runs before its own dependency exists: the first
+        config apply is startup phase 4 while `startHTTPServer` builds `d.mgmt`
+        later in `Run`. So a rename records a DEBT (`Daemon.staleCertPending`)
+        and `deliverStaleMgmtCertDiagnosis` retries it — at the boot management
+        start, and on every web-management reconcile. Skipping on nil would
+        reproduce the original silence: the load path is not a fallback that
+        covers it, because it runs only while a certificate is being loaded,
+        which on an unchanged endpoint next happens at a restart or an HTTPS
+        rebind (and for a CROSS-shape rename it declines even then — see the
+        narrowing rule below).
+        Two properties matter:
+        - **The debt clears only when a delivery actually reaches a served
+          certificate** (`WarnStaleMgmtCertForHostName` returns that). Clearing
+          it whenever the delivery merely RAN loses the diagnosis permanently
+          when the HTTP start failed or HTTPS is off: the next boot's
+          `applyHostname` sees the name already applied and returns early, and
+          the load path declines cross-shape drift by design. The certificate is
+          durable on disk, so the staleness outlives the listener and the debt
+          must outlive it too.
+        - **The host name is read from the kernel at DELIVERY, never stored at
+          rename time.** A deferred diagnosis is therefore never the replay of a
+          name captured at some earlier commit — and marking the debt and
+          attempting delivery are a single path, so a rename racing `d.mgmt`'s
+          publication cannot be silently dropped. The delivery is also
+          GENERATION-FENCED before it speaks: one whose rename has been
+          superseded abandons without warning and without clearing, so it cannot
+          emit a name a recorded rename has already replaced. The emitted name IS
+          the kernel's current one for every rename the daemon performs (#6827
+          round 7): `Daemon.renameHostNotingStaleMgmtCert` holds `staleCertMu`
+          across BOTH the `Sethostname` and the generation bump, so the two
+          critical sections are ordered and neither order can produce a stale
+          line. Rounds 5 and 6 recorded that gap as unclosable; it was closable
+          by moving the lock acquisition ahead of the syscall. A privileged
+          `sethostname(2)` from outside the daemon remains unfenceable.
+      The RENAME entry point reads the LIVE HTTPS leg via
+      `listenerLeg.serving()` — not a non-nil pointer. (The load path has no leg
+      to read: it runs inside cert generation, before any leg exists, and judges
+      the pair it just loaded.) An unexpected serve exit leaves the leg
+      INSTALLED with `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed
+      with `stopping` set; diagnosing either reports a certificate no socket is
+      presenting. `serving()` therefore tests BOTH: `dead` for a
+      self-termination, and `stopping` — stored explicitly at the top of both
+      drain arms (requested retirement AND root-context shutdown), before
+      the drain, so it covers the leg from the moment the drain is decided
+      through the goroutine's return (the listener closes an instant later, in
+      `Shutdown`, and already-accepted requests drain for up to `legDrainTimeout`
+      — `serving()` answers "is this the leg in front of clients", not "is every
+      byte done").
+      The same predicate now gates `ReconcileHTTPS`'s same-address no-op, so a
+      dead leg is REBUILT rather than mistaken for a converged one (#6827 round
+      6): before that, a self-terminated HTTPS leg could not be replaced by any
+      commit and HTTPS stayed down until a restart. The dead leg's CONNECTIONS
+      are taken down too (#6827 round 7) — see the leg-drain bullet above; the
+      recovery alone left them serving. It does NOT test `stopCh`: a requested
+      retirement is unobservable through `s.httpsLeg`, though not by the
+      ordering — the disable arm retires the leg and THEN clears the field. What
+      makes the interval unobservable is that the whole `ReconcileHTTPS` switch
+      runs under ONE `lifeMu` hold and every `serving()` caller takes `lifeMu`,
+      so a reader lands before the retirement or after the clear, never between;
+      the rebind arm installs the replacement first, so the leg it retires is
+      never the installed one. Either way that would be an arm for a state that
+      cannot occur. `serving()` is
+      stricter than `EffectiveHTTPAddr`'s inline check, which answers
+      `show system services`, where a leg finishing a drain should still report
+      its address.
+      Both parse the leaf ONCE and share these checks (`certCoversHost` — the
+      same strict `x509.VerifyHostname` check a remote client applies):
+      - **no SAN at all** (`certHasNoSANs`) — a pair persisted by an older build
+        or placed by an operator can carry no subjectAltName, and then it covers
+        NOTHING: modern clients do not fall back to CommonName, so even
+        `https://localhost` fails. This case is reported first and is TERMINAL
+        (the per-identity lines below would each report "does not cover X" for a
+        cert that covers no X at all). The per-identity predicates gate out
+        loopback on the premise that the durable cert always carries the
+        loopback SANs, which is true only of certs this mint path produced — so
+        without this check the most broken certificate possible was the one that
+        warned least.
+      - the **HTTPS bind host**, when it is a concrete non-loopback management
+        host (`bindHostWarnable`) — stale after an A→B `web-management https
+        interface` rebind. It needs no plausibility test: the operator
+        configured the listener to answer there. The rename entry point does NOT
+        re-report it (the bind did not change).
+      - the **kernel host name**, when it is one a re-mint could actually cover
+        (`hostnameSANWarnable`) — stale after `set system host-name`. This half
+        was previously UNCHECKED, and because renaming a firewall does not move
+        its management IP the bind-host check did not fire either: the operator
+        got a bare `certificate is not valid for any names` with nothing in the
+        log. `hostnameSANWarnable` additionally requires the name to be
+        DNS-encodable or an IP literal, so a `café` host name — which
+        `isDNSSANSafeHostname` DROPS from the SANs by design and which no
+        re-mint could ever cover — does not warn on every reload.
+        On the LOAD path it is additionally narrowed by
+        `hostNameLikelyAccessIdentity`: a box named `fw` whose cert covers
+        `mgmt.example.com` plus its management IP is verifiable at every URL in
+        use, and telling that operator to re-mint churns remote TOFU pins for
+        nothing. Since this package's mint path is the only thing that puts a
+        bare, unqualified name in a cert (and what it puts there is the kernel
+        host name), an unqualified DNS SAN next to an unqualified kernel name
+        means the TLS identity IS the kernel name and has drifted — diagnose; a
+        domain-qualified SAN next to a short kernel name means the TLS identity
+        is independent of it — stay quiet. The RENAME entry point skips that
+        heuristic: the operator just chose the name, which is direct evidence
+        rather than inference. **Accepted residual:** a rename that CROSSES the
+        qualified/unqualified boundary is diagnosed at the commit but not on any
+        later boot, so it is never diagnosed at all in the two states that had
+        no commit-time diagnosis behind them — a box already drifted before this
+        shipped, and a box RUNNING this build whose commit-time debt was still
+        OWED at shutdown and was discarded by the restart,
+        `Daemon.staleCertPending` being process-local. That second state has
+        more ways in than the obvious one, each an ordinary configuration rather
+        than a fault: HTTPS disabled, its bind failed, its serve loop terminated
+        and no later commit rebuilt the leg, the API disabled entirely
+        (`--api-addr` empty, so there is no reconciler to deliver through), the
+        boot HTTP start failed, the kernel name unreadable at every delivery, or
+        startup aborted on a signal (#5807) after the phase-4 config apply but
+        before the management server was built.
+        Shape-preserving drift (the ordinary case) is still caught on
+        every boot. Closing either half needs persistent state — an upgrade
+        marker, or a durable pending flag plus an invalidation story for a name
+        that changed again while the daemon was down — for one
+        narrow class, and would re-fire the false positive on exactly the boxes
+        the heuristic cannot judge — weighed and declined, see the comment on
+        `hostNameLikelyAccessIdentity`.
+      Each uncovered identity emits its own `slog.Warn` naming the identity and
+      the cert's DNS/IP SANs — which are exactly the identities it DOES cover,
+      so an operator re-mints (remove `/etc/xpf/tls`) or dismisses the line in
+      one read, instead of chasing a silent verification failure.
     An already-persisted cert is NOT auto-regenerated — the #1916 D6
     durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
     pins survive a power loss; only freshly generated certs gain SANs (delete
     `cert.pem`/`key.pem` to force a regenerate). Pinned by
     `tls_san_5719_test.go` (SAN presence, hostname classification, the
     non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
-    `buildHTTPSServer` host-extraction, and the stale-cert-on-rebind
-    mismatch warning), fail-on-revert.
+    `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings on
+    the rebind path) and `tls_stale_cert_6827_test.go` (the SAN-less cert — one
+    fixture for the REACH the check adds where both per-identity gates decline,
+    a second with a warnable bind host so the TERMINAL `return` is observable at
+    all; the unused-kernel-name false positive and its matched positive control;
+    the rename entry point; and the two leg-state transitions driven by the real
+    serve goroutine — `stopping` on a root-context drain, `dead` on an
+    unexpected serve exit, the reconcile that REPLACES a dead leg, the held
+    connection that must not outlive a revocation, and the in-flight response
+    severed on all three leg exits), with
+    the daemon-side wiring pinned by
+    `pkg/daemon/hostname_stale_cert_6827_test.go`: a host-name commit on an
+    UNCHANGED HTTPS endpoint reaches the diagnostic with the NEW name, the debt
+    outlives a delivery that reached nothing, an unreadable kernel name settles
+    nothing, the generation fence defers a rename that lands mid-delivery (once
+    with the test supplying the competing rename, once driving it through the
+    production note path so the `staleCertGen++` itself is bound), a dead HTTPS
+    leg is rebuilt by the next commit so the debt is dischargeable at all, and
+    BOTH deferred retry points are bound at their own call site. Those two are
+    bound on different observables, and the reason is worth stating rather than
+    discovering twice: `reconcileWebManagement`'s per-commit retry is bound on
+    the debt FLAG, because the reconcile that brings HTTPS up makes the
+    certificate LOAD path emit the same warning text — a text assertion there
+    passes with the retry deleted. `startHTTPServer`'s boot delivery is bound on
+    the kernel-name read plus the fact that the management server already
+    exists when it happens; that call site cannot be given a serving HTTPS leg
+    in-process, because `startHTTPServer` CONSTRUCTS the `api.Server` itself and
+    `SetTLSCertDirForTest` only exists after construction, so the alternative is
+    driving the production `/etc/xpf/tls` generator. Deleting either call reds
+    its own subtest and only its own. The boot cell's limit is stated in the
+    test rather than implied: it proves the call happens and happens after the
+    server is built, NOT that it reached a certificate, warned, or discharged
+    anything — replacing the delivery with a bare `osHostname()` would satisfy
+    it, and a stronger cell needs a pre-construction certificate seam on
+    `api.Config`, which was declined as a production knob added for one test.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
@@ -629,16 +1669,92 @@ under the daemon's errgroup. Nothing else imports this package.
   genuine-error contract is UNCHANGED for every other surface (global, policy,
   filter, interface, host-inbound): a real read failure — anything other than
   `ErrCounterNotPopulated` — still 500s / warns / bumps
-  `xpf_counter_read_errors_total`. The per-zone POPULATE path (sourcing real
-  per-zone volume + flood-event counts from the Rust helper) is DEFERRED; the
-  sparse offset map's setters are the populate hook. See
-  `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE) and
-  the deferred POPULATE tracker #3651 (the Rust per-zone counter-publish is the
-  outstanding prerequisite). Pinned by
-  `pkg/dataplane/zone_flood_counters_hide_test.go`,
-  `pkg/api/zone_counters_hide_test.go`,
+  `xpf_counter_read_errors_total`. See
+  `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE).
+  Pinned by `pkg/dataplane/zone_flood_counters_hide_test.go`,
   `pkg/cli/zone_flood_counters_hide_test.go`, and
   `pkg/grpcapi/zone_flood_counters_hide_test.go`.
+- **Per-zone TRAFFIC counters are populated again, and the Prometheus family is
+  back (#3651).** The reason #3643 dropped the metrics — nothing populated them
+  — no longer holds: the Rust helper accounts per-zone ingress/egress
+  packet+byte volume on the forward path
+  (`userspace-dp/src/afxdp/zone_counters.rs`), publishes it in
+  `ProcessStatus.zone_traffic_counters`, and the Go status poll mirrors each row
+  into the sparse offset map via `Manager.ReplaceZoneCounterOffsets`. `show security
+  zones` and REST `/security/zones` picked that up immediately;
+  `xpf_zone_packets_total` / `xpf_zone_bytes_total` (labels `zone`,
+  `direction` ∈ `{ingress,egress}` — unchanged from the pre-#3643 family, so
+  existing dashboards keep working) were restored separately in #3651, since
+  Prometheus is the surface an operator actually alerts on.
+  `collectZoneCounters` reads ONLY `ReadZoneCounters`, i.e. the sparse offset
+  map, so it cannot reintroduce the dense-array OOB read-error storm above.
+  Its three-way disposition:
+  - **populated** → emit ingress/egress packets and bytes.
+  - **`ErrCounterNotPopulated`** → **omit** all four samples and count the zone
+    into the `xpf_zone_counters_unpopulated_zones` gauge; do NOT bump
+    `xpf_counter_read_errors_total`. Unpopulated is a legitimate steady state,
+    and treating it as an error is exactly the per-scrape false alert #3643
+    removed the family to stop. The samples are omitted rather than published
+    as `0` because the helper's status snapshot is sparse and drops all-zero
+    rows, so this sentinel cannot distinguish a pre-#3651 helper, a zone past
+    the helper's 63 assignable hot-path slots (whose traffic really is
+    uncounted), and a merely idle zone — a `0` would be an authoritative zero
+    over an unknown. The gauge is always emitted (0 when healthy) and counts
+    exactly the zones REST reports `per_zone_counters_available:false` for.
+
+    **Emitted ABOVE the dataplane-loaded gate (#6843 R1), which widens the
+    membership set beyond the sentinel's.** The gauge is contractually always
+    emitted so `> 0` is alertable and its absence is not confusable with a
+    scrape that failed to run — which means it must also be emitted on a
+    degraded / config-only boot, where per-zone volume is least available. So
+    `collectZoneCounters` runs before the `dp == nil || !dp.IsLoaded()` early
+    return, alongside `collectPBRStatus` and the host-inbound families.
+
+    Consequence: **the gauge's cause set is strictly wider than
+    `ErrCounterNotPopulated`'s.** The sentinel has exactly three meanings; the
+    gauge has those plus every pre-read membership branch. The authoritative
+    enumeration is the metric's own HELP in
+    `pkg/api/metrics_descriptors_zone.go`, and **this document deliberately
+    states no count** — the count is the part that rots, and it rotted right
+    here: this paragraph claimed "a fourth reason" and "three causes none of
+    which applies" while the Go comment it mirrors had already grown past four.
+
+    Two causes are worth naming here because an operator is least likely to
+    guess them, and both follow from the config store being promoted BEFORE the
+    dataplane apply: the dataplane is **loaded but has no apply result yet**
+    (shim loaded, first apply pending or failed), and a zone is **in the active
+    config but absent from the last apply result** (a commit whose apply failed
+    leaves the store ahead of the dataplane). Neither produces the sentinel —
+    the collector increments and `continue`s before it ever calls
+    `ReadZoneCounters` — so do not read the HELP list as a list of sentinel
+    meanings.
+
+    All of this is named in the HELP because there is no `xpf_dataplane_loaded`
+    series to disambiguate against, so an operator paging on `> 0` would
+    otherwise triage toward causes none of which applies.
+
+    **Retention (#6843).** "Not populated" must also be reachable *backwards* —
+    a zone that WAS reporting and stops. The helper's store outlives its slot
+    map: config apply carries the store forward and retains every
+    still-configured zone, so a zone pushed past the hot-path slot capacity by a
+    later config keeps its accumulated totals while no longer being counted. Two
+    guards keep that from becoming a frozen counter. The helper publishes a row
+    only when the zone is configured **and** holds a live slot
+    (`publishable_zone_rows`), and the Go status mirror **replaces** the whole
+    offset map from each snapshot rather than merging into it
+    (`Manager.ReplaceZoneCounterOffsets`). Both are required: without the first
+    the stale row keeps being published; without the second a row that stops
+    being published leaves its last value stranded. Either way the metric would
+    emit a total that can never advance — worse than an omission, because a
+    frozen counter looks alive.
+  - **any other error** → omit the samples and bump
+    `xpf_counter_read_errors_total` (the #3345/#3408 skip-and-bump contract is
+    intact — a degraded counter bridge stays alertable).
+
+  The per-zone FLOOD half remains DEFERRED (use the #3343 aggregate
+  `xpf_screen_drops_total` by reason); the flood offset map's setters remain
+  the populate hook for it. Pinned by `pkg/api/zone_counters_metrics_test.go`,
+  which replaced the `pkg/api` HIDE pin.
 - Per-interface counter read failures get a uniform unavailable/error
   contract across all four interface-counter surfaces (#3464). Interface
   counters are intentionally out of the #3345 SECURITY-counter contract

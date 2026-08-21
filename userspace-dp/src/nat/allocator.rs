@@ -60,6 +60,18 @@
 //   permanently shrink the reusable pool (062-10). The retain buffer
 //   allocates lazily only when a collision actually occurs.
 //
+// Aggregate construction budget (#6812): `PortAllocator::new` is the memory
+// heavyweight — one `AddressOccupancy` word array per pool address, sized to
+// the port range (one bit per port slot). Construction is therefore gated
+// TWICE upstream in `source.rs`: the Go #5877 strict commit gate rejects an
+// over-budget config outright, and `resolve_pool_allocators` enforces the
+// same budgets (pool count / total addresses / total port slots, charged
+// per distinct allocator key, reuse-before-build, nothing built for a
+// failed pool) at this apply boundary — the final backstop for a tolerated
+// (lenient-load / peer-synced) or hand-crafted snapshot. Three full-range
+// /16 pools would otherwise materialise 12,683,575,296 bitmap bits
+// (~1.48 GiB) during apply.
+//
 // Cross-submodule visibility (per #1542 plan v3):
 // - PortAllocator and PortAllocatorSnapshot are pub(crate) at definition
 //   (re-exported by nat/mod.rs).
@@ -81,8 +93,9 @@ use rustc_hash::FxHashMap;
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::Hasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-#[cfg(test)]
-use std::sync::MutexGuard;
+// #4800: both are now used unconditionally by `PortAllocator::lock_live`
+// (previously `MutexGuard` was test-only, for `debug_live`).
+use std::sync::{MutexGuard, TryLockError};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -721,6 +734,25 @@ struct PortAllocatorShared {
     allocations_total: AtomicU64,
     reuses_total: AtomicU64,
     exhaustion_total: AtomicU64,
+    /// #4800: production acquisitions of the `live` mutex (allocate /
+    /// reserve / release / rollback / GC), and the subset of those that
+    /// found the mutex already held. Together they give the contention
+    /// RATIO for the residual Phase-1 (#2852) map mutex, which is the only
+    /// form in which "is the NAT allocator the new-flow bottleneck?" has an
+    /// answer: a raw acquisition rate says nothing without the denominator.
+    ///
+    /// Counted by `lock_live()`, which try-locks first — the LOCK on the
+    /// uncontended path costs exactly one CAS, the same as `lock()` did. It is
+    /// not free, though: the acquisition counter is bumped unconditionally, so
+    /// an uncontended acquisition is 2 relaxed atomic RMWs where it used to be
+    /// 1. The contended path pays one further relaxed increment on top of a
+    /// block that was already going to happen.
+    ///
+    /// Deliberately NOT counted: `snapshot()` (the ~1s status poll that
+    /// READS these counters — the observer must not appear in its own
+    /// observation) and the `debug_*` test/diagnostic accessors.
+    live_lock_acquisitions: AtomicU64,
+    live_lock_contended: AtomicU64,
     max_tracked_flows: usize,
     /// #4676 test seam: counts how many times `gc_expired_chunked` acquired the
     /// `live` mutex. A std `Mutex` is non-reentrant, so N > 1 acquisitions over
@@ -758,6 +790,8 @@ impl Default for PortAllocator {
                 allocations_total: AtomicU64::new(0),
                 reuses_total: AtomicU64::new(0),
                 exhaustion_total: AtomicU64::new(0),
+                live_lock_acquisitions: AtomicU64::new(0),
+                live_lock_contended: AtomicU64::new(0),
                 max_tracked_flows: 0,
                 #[cfg(test)]
                 gc_lock_acquisitions: AtomicUsize::new(0),
@@ -768,8 +802,43 @@ impl Default for PortAllocator {
     }
 }
 
+/// Test-only PortAllocator CONSTRUCTION counter (#6812 F3 round 4).
+///
+/// The #6812 guards previously asserted only on the FINAL allocator a rule
+/// carries — its identity, or its occupancy-word count. Both are end-state
+/// assertions, and both are blind to the exact defect the reuse-before-build
+/// and no-bitmap-for-a-failed-pool rules exist to prevent: a `PortAllocator::
+/// new` that is built and then discarded. A throwaway construction immediately
+/// before the reuse lookup restores the pre-#6812 build-then-discard behaviour
+/// with every one of those assertions still green.
+///
+/// THREAD-LOCAL, deliberately. A process-global counter is shared by every test
+/// `cargo test` runs in parallel and produced a master-red flake once already
+/// (#6819). `resolve_pool_allocators` and everything it calls are synchronous
+/// on the caller's thread, so a thread-local counts exactly the constructions
+/// the test under it caused, with no serialisation and no cross-test coupling.
+#[cfg(test)]
+thread_local! {
+    static PORT_ALLOCATOR_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: reset the calling thread's construction counter and return a
+/// probe that reports constructions since the reset.
+#[cfg(test)]
+pub(super) fn reset_port_allocator_build_count() {
+    PORT_ALLOCATOR_BUILDS.with(|c| c.set(0));
+}
+
+/// Test-only: PortAllocator constructions on this thread since the last reset.
+#[cfg(test)]
+pub(super) fn port_allocator_build_count() -> usize {
+    PORT_ALLOCATOR_BUILDS.with(|c| c.get())
+}
+
 impl PortAllocator {
     pub(crate) fn new(num_addresses: usize, port_low: u16, port_high: u16) -> Self {
+        #[cfg(test)]
+        PORT_ALLOCATOR_BUILDS.with(|c| c.set(c.get() + 1));
         let counters = (0..num_addresses).map(|_| AtomicU32::new(0)).collect();
         let range = if port_low == 0 || port_high == 0 || port_low > port_high {
             0
@@ -791,6 +860,8 @@ impl PortAllocator {
                 allocations_total: AtomicU64::new(0),
                 reuses_total: AtomicU64::new(0),
                 exhaustion_total: AtomicU64::new(0),
+                live_lock_acquisitions: AtomicU64::new(0),
+                live_lock_contended: AtomicU64::new(0),
                 max_tracked_flows,
                 #[cfg(test)]
                 gc_lock_acquisitions: AtomicUsize::new(0),
@@ -798,6 +869,43 @@ impl PortAllocator {
             port_low,
             port_high,
         }
+    }
+
+    /// #4800: acquire the residual `live` map mutex, counting acquisitions
+    /// and the subset that had to block.
+    ///
+    /// `try_lock()` first: on an uncontended mutex that is a single CAS —
+    /// exactly what `lock()` was already doing — so the LOCK ITSELF costs what
+    /// it always did. The acquisition counter is bumped UNCONDITIONALLY, so an
+    /// uncontended acquisition is 2 relaxed atomic read-modify-writes where it
+    /// used to be 1; "unchanged" would be false, though both are relaxed,
+    /// untimed and allocation-free. Only when the CAS fails (another worker
+    /// holds the map mutex) do we bump `live_lock_contended` and fall through
+    /// to the blocking `lock()`, which was going to happen regardless.
+    ///
+    /// Poison policy is preserved verbatim from the call sites this
+    /// replaces (`unwrap_or_else(|e| e.into_inner())`): a worker that
+    /// panicked mid-mutation must not strand every subsequent allocation.
+    /// `try_lock` reports poison only when the mutex is FREE, so the
+    /// blocking arm still has to handle it.
+    ///
+    /// Every production allocate / reserve / release / rollback / GC site
+    /// goes through here. `snapshot()` deliberately does NOT — it is the
+    /// ~1s status poll that reads these very counters, and counting it
+    /// would inject the observer into the observation.
+    fn lock_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
+        self.shared
+            .live_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        match self.shared.live.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        self.shared
+            .live_lock_contended
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// White-box access to the live state for tests. NOT for production
@@ -808,6 +916,24 @@ impl PortAllocator {
     #[cfg(test)]
     pub(super) fn debug_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
         self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only: total occupancy-bitmap WORDS across every pool address.
+    /// The #6812 aggregate-budget tests assert a refused / failed pool
+    /// materialised ZERO words (no eager bitmap) while an admitted pool
+    /// carries `addresses x div_ceil(port_range, 64)` — the direct white-box
+    /// proof the bitmap was (or was not) allocated.
+    #[cfg(test)]
+    pub(super) fn debug_occupancy_words(&self) -> usize {
+        self.shared.occupancy.iter().map(|o| o.words.len()).sum()
+    }
+
+    /// Test-only: identity of the shared allocator state, for proving a
+    /// re-apply REUSED the previous allocator (same Arc) instead of building
+    /// a fresh bitmap (#6812 reuse-before-build).
+    #[cfg(test)]
+    pub(super) fn debug_shared_identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     /// Test-only: mark a translated tuple as owned (set its occupancy bit)
@@ -1031,7 +1157,7 @@ impl PortAllocator {
                 // the lock-free bitmap, so GC here is opportunistic cleanup, not
                 // load-bearing for this allocation).
                 self.gc_expired_chunked(now_ns, ALLOCATION_GC_BUDGET);
-                let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+                let mut live = self.lock_live();
                 if let Some(existing) = live.live_by_flow.get(&flow) {
                     // Idempotent re-entry for an already-allocated flow (a second
                     // packet racing session install). Give back the port we just
@@ -1099,7 +1225,7 @@ impl PortAllocator {
         now_ns: u64,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         let family_len = family_addresses.len();
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
 
         if let Some(existing) = live.live_by_flow.get(&flow) {
@@ -1321,7 +1447,7 @@ impl PortAllocator {
         translated: TranslatedTuple,
         now_ns: u64,
     ) -> bool {
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         let Some(existing) = live.live_by_flow.get(&flow).copied() else {
             return false;
         };
@@ -1395,7 +1521,7 @@ impl PortAllocator {
         translated: TranslatedTuple,
         now_ns: u64,
     ) -> bool {
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         let Some(existing) = live.live_by_flow.get(&flow).copied() else {
             return false;
         };
@@ -1496,7 +1622,7 @@ impl PortAllocator {
         }
         let port_end = (port_start + params.block_size as u32 - 1).min(self.port_high as u32);
 
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         if let Some(existing) = live.live_by_flow.get(&flow) {
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
             return Ok(existing.translated);
@@ -1577,7 +1703,7 @@ impl PortAllocator {
         }
         let port_end = (port_start + params.block_size as u32 - 1).min(self.port_high as u32);
 
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         if let Some(existing) = live.live_by_flow.get(&flow) {
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
             return Ok(existing.translated);
@@ -1661,7 +1787,7 @@ impl PortAllocator {
         if addr_index >= self.shared.occupancy.len() {
             return false;
         }
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         // A refresh of the same synced flow: if it already holds this exact
         // translated tuple, it is reserved — nothing to do. If the tuple
         // changed (should not happen on a stable sync), drop the stale
@@ -1744,7 +1870,7 @@ impl PortAllocator {
             dst_ip: flow.dst_ip,
             dst_port: flow.dst_port,
         };
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         // Idempotent re-entry: a second packet of the same flow (racing session
         // install) reuses its first decision rather than re-keying.
         if let Some(existing) = live.live_by_flow.get(&flow) {
@@ -1830,7 +1956,7 @@ impl PortAllocator {
         // pools rotate through the whole pool (mirrors `allocate_translation`).
         let address_attempts = if address_persistent { 1 } else { family_len };
 
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         // Idempotent re-entry: a second packet of the same flow (racing session
         // install) reuses its first decision rather than re-keying.
         if let Some(existing) = live.live_by_flow.get(&flow) {
@@ -1938,7 +2064,7 @@ impl PortAllocator {
         let key = flow.persistent_source_key(persistent_nat_permit);
         let timeout_ns = persistent_nat_timeout_ns.max(NS_PER_SEC);
 
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self.lock_live();
         self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
 
         // Idempotent re-entry: a second packet of the same flow reuses its first
@@ -2108,6 +2234,11 @@ impl PortAllocator {
             allocations_total: self.shared.allocations_total.load(Ordering::Relaxed),
             reuses_total: self.shared.reuses_total.load(Ordering::Relaxed),
             exhaustion_total: self.shared.exhaustion_total.load(Ordering::Relaxed),
+            live_lock_acquisitions_total: self
+                .shared
+                .live_lock_acquisitions
+                .load(Ordering::Relaxed),
+            live_lock_contended_total: self.shared.live_lock_contended.load(Ordering::Relaxed),
         }
     }
 
@@ -2145,7 +2276,7 @@ impl PortAllocator {
             let chunk = (budget - reclaimed).min(GC_CHUNK);
             freed.clear();
             let collected = {
-                let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+                let mut live = self.lock_live();
                 #[cfg(test)]
                 self.shared
                     .gc_lock_acquisitions
@@ -2328,9 +2459,18 @@ pub(crate) struct PortAllocatorSnapshot {
     pub(crate) allocations_total: u64,
     pub(crate) reuses_total: u64,
     pub(crate) exhaustion_total: u64,
+    /// #4800: `live` map-mutex acquisitions on the production
+    /// allocate/reserve/release/rollback/GC paths, and the subset that
+    /// blocked. Read as a ratio: `contended / acquisitions` is the NAT
+    /// allocator's share of new-flow-install serialization, and the pair
+    /// is what lets a connection-rate run say "the residual Phase-1
+    /// (#2852) mutex saturated" instead of guessing from a flat
+    /// allocations/sec curve. See `PortAllocator::lock_live`.
+    pub(crate) live_lock_acquisitions_total: u64,
+    pub(crate) live_lock_contended_total: u64,
 }
 
-fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
+pub(super) fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
     if num_addresses == 0 || port_low == 0 || port_high == 0 || port_low > port_high {
         return 0;
     }

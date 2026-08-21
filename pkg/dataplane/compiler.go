@@ -78,6 +78,15 @@ type CompileResult struct {
 	tunnelIfindexes     map[int]bool // tunnel interfaces: XDP ingress only, no redirect
 	genericXDPIfindexes map[int]bool // interfaces that must use generic XDP only
 
+	// unarmedSurfaces records attach points the CONFIG required but the
+	// compiler DECLINED to arm while still returning success (#5275) — the
+	// three soft skips in compiler_iface.go (interface not found, VLAN child
+	// create failed, administratively disabled). They are absent from
+	// pendingXDP, so without this record the observe-only arm-coverage proof
+	// (armproof.go) cannot tell a declined surface from one armed
+	// successfully. Appended lazily; nil is a valid empty state.
+	unarmedSurfaces []UnarmedSurface
+
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
 	ManagedInterfaces []networkd.InterfaceConfig
@@ -153,6 +162,49 @@ func (r *CompileResult) cachedLinkByIndex(idx int) (netlink.Link, error) {
 		r.linkCache[name] = link
 	}
 	return link, nil
+}
+
+// peekLinkByIndex resolves idx WITHOUT writing to the result's link caches.
+//
+// cachedLinkByIndex memoises into linkIdxMap and linkCache. The observe-only
+// arm-coverage proof (armproof.go) must not mutate the CompileResult it is
+// proving: a diagnostic that writes into the object it observes cannot honestly
+// call itself observe-only, and a CompileResult reachable by another goroutine
+// would take a concurrent map write for a measurement nobody asked to persist.
+func (r *CompileResult) peekLinkByIndex(idx int) (netlink.Link, error) {
+	if r == nil {
+		return nil, fmt.Errorf("nil compile result")
+	}
+	if link, ok := r.linkIdxMap[idx]; ok {
+		return link, nil
+	}
+	return netlink.LinkByIndex(idx)
+}
+
+// recordUnarmedSurface notes an attach point the compiler declined to arm while
+// still returning success (#5275). See UnarmedSurface.
+//
+// One record per surface. mapZoneInterface runs once per ZONE REFERENCE, and
+// the per-phys dedup (st.attached) sits far below the soft skips, so an
+// interface named by two zones reaches the skip twice — and the count is the
+// deliverable of this phase, so a double count is a wrong number rather than a
+// cosmetic wart. A repeat sighting never downgrades the classification: if
+// either one could not prove the netdev down, the surface keeps the
+// conservative reading.
+func (r *CompileResult) recordUnarmedSurface(u UnarmedSurface) {
+	if r == nil {
+		return
+	}
+	for i := range r.unarmedSurfaces {
+		if r.unarmedSurfaces[i].Name != u.Name || r.unarmedSurfaces[i].Ifindex != u.Ifindex {
+			continue
+		}
+		if u.StillForwarding && !r.unarmedSurfaces[i].StillForwarding {
+			r.unarmedSurfaces[i] = u
+		}
+		return
+	}
+	r.unarmedSurfaces = append(r.unarmedSurfaces, u)
 }
 
 // assignZoneIDs populates result.ZoneIDs with a STABLE, name-derived id for
@@ -350,7 +402,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	}
 
 	if len(result.pendingXDP) > 0 {
-		rcMap := m.maps["redirect_capable"]
+		// #2114 A3: OPTIONAL access — an absent redirect_capable SKIPS the
+		// redirect-map population and CONTINUES into the attachment work
+		// (master's exact outcome; this path is CompileConfig-gated to the
+		// armed state upstream).
+		rcMap, _, _ := m.lookupMapLocked("redirect_capable")
 
 		// Populate redirect_capable BEFORE link.Update() swaps programs.
 		// Skip tunnel interfaces — bpf_redirect_map sends Ethernet frames

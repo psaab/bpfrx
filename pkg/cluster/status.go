@@ -251,6 +251,12 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Heartbeat packets sent:     %d\n", hbStats.Sent)
 	fmt.Fprintf(&b, "  Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "  Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
+	fmt.Fprintf(&b, "  Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
+		epochlessExposureNote(hbStats))
+	fmt.Fprintf(&b, "  Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
+	fmt.Fprintf(&b, "  Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
+	fmt.Fprintf(&b, "  Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
+	fmt.Fprintf(&b, "  Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintln(&b)
 
 	// Sync link statistics.
@@ -399,6 +405,12 @@ func (m *Manager) FormatStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeat packets sent:     %d\n", hbStats.Sent)
 	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "    Heartbeat packet errors:    %d\n", hbStats.SendErrors+hbStats.RecvErrors)
+	fmt.Fprintf(&b, "    Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
+		epochlessExposureNote(hbStats))
+	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
+	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
+	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
+	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintln(&b)
 
 	// Services synchronized table.
@@ -446,6 +458,12 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "    Heartbeat send errors:      %d\n", hbStats.SendErrors)
 	fmt.Fprintf(&b, "    Heartbeat receive errors:   %d\n", hbStats.RecvErrors)
+	fmt.Fprintf(&b, "    Heartbeats without epoch:   %d%s\n", hbStats.EpochlessAdmitted,
+		epochlessExposureNote(hbStats))
+	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
+	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
+	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
+	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
 	return b.String()
 }
@@ -456,11 +474,19 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 // ENGAGED (frames are verified and an unauthenticated peer is rejected) or had
 // silently degraded to DUAL-ACCEPT (an unauthenticated peer is still
 // accepted) — the rolling-upgrade grace #4107 deliberately keeps open. The
-// posture is derived from the SAME two facts syncAuthDecision /
-// heartbeatAuthDecision gate on — the local key (ControlLinkAuthKey) and the
-// sticky peer-authenticated flag (HeartbeatPeerAuthSeen) — so this string
-// tracks the real enforcement decision rather than a separate estimate. It
-// only inspects len(key) and never renders the secret.
+// posture is derived from the SAME two facts heartbeatAuthDecision gates on —
+// the local key (ControlLinkAuthKey) and the sticky peer-authenticated flag
+// (HeartbeatPeerAuthSeen) — so for the HEARTBEAT this string tracks the real
+// enforcement decision rather than a separate estimate.
+//
+// It does NOT track the session-sync channel. #5078 removed peerAuthSeen from
+// syncAuthDecision, so sync admission no longer consults the sticky flag this
+// string is built from; naming syncAuthDecision here would assert a coupling
+// that no longer exists. pkg/cluster/README.md, "Rolling it onto a live
+// unkeyed cluster", scopes the operator-facing line accordingly — it does not
+// tell you whether an existing session-sync connection predates the key.
+//
+// It only inspects len(key) and never renders the secret.
 func (m *Manager) controlLinkAuthStatus() string {
 	keyConfigured := len(m.ControlLinkAuthKey()) > 0
 	switch {
@@ -749,4 +775,60 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 	}
 
 	return b.String()
+}
+
+// epochlessExposureNote annotates the #6169 epoch-less heartbeat counter so the
+// number is actionable without the operator having to know what it means.
+//
+// An authenticated heartbeat with no boot epoch is admitted on the bounded
+// session ring alone — the mechanism that stops working past
+// heartbeatReplaySessions captured incarnations. A non-zero count is expected
+// mid-rollout (the peer is still on a pre-#6169 build), but once BOTH nodes are
+// upgraded it means either a node was left behind or someone is replaying
+// pre-upgrade captures. Rotating the control-link PSK is what retires an
+// attacker's archive; see "Operating the control-link PSK" in
+// pkg/cluster/README.md.
+//
+// The note is suppressed once the downgrade latch has armed, because at that
+// point the historical count is a record of the migration rather than live
+// exposure.
+//
+// It reads the LATCH (HeartbeatStats.PeerEpochLatched), not the rejection
+// counter. The counter was used as a proxy and is not one: it only moves when a
+// later epoch-less frame is actually refused, so a receiver that admitted some
+// epoch-less frames and then saw its first epoch-bearing one is latched with
+// the counter still at 0 — and reported "replay protection is ring-only" when
+// it was not. The exposure the note describes ends when the latch arms, so the
+// latch is what it must test.
+func epochlessExposureNote(s HeartbeatStats) string {
+	if s.EpochlessAdmitted == 0 {
+		return ""
+	}
+	if s.PeerEpochLatched {
+		// "the latch is armed", NOT "the peer now signs boot epochs". They are
+		// not the same statement, and only the first is something this node
+		// knows. An ARCHIVED epoch-bearing frame replayed after a restart arms
+		// the latch just as a live one does (README residual 5), so the latch
+		// can be armed while the peer currently on the wire is a rolled-back,
+		// epoch-less build being refused.
+		//
+		// AND IT REPORTS THE LATCH RATHER THAN ITS CONSEQUENCE, deliberately.
+		// An earlier revision said "epoch-less frames now refused", promoting
+		// the armed latch into a statement about what this node is enforcing
+		// RIGHT NOW. The latch does not survive that promotion, because it is
+		// not the last gate: heartbeatAuthDecision short-circuits to
+		// dual-accept whenever no local key is configured, and UpdateConfig
+		// clears controlAuthKey WITHOUT resetting hbAuth. So the reachable
+		// production sequence — load a legacy unkeyed config leniently, add the
+		// key under `commit confirmed`, accumulate an epoch-less count and arm
+		// the latch, then let the confirmation time out and restore the unkeyed
+		// config in the SAME daemon — leaves epochSeen true while every frame,
+		// epoch-less included, is admitted unverified. Measured: the note still
+		// read "now refused" while heartbeatAuthDecision returned accept=true.
+		//
+		// The latch being armed is a fact about this node's state; what it
+		// enforces depends on the live key. Report the fact.
+		return "  (downgrade latch armed; count is historical)"
+	}
+	return "  (peer not signing boot epochs - replay protection is ring-only; rotate the control-link PSK once both nodes are upgraded)"
 }

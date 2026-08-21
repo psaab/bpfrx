@@ -23,8 +23,16 @@ func (c *CLI) handleShowClassOfService(args []string) error {
 		}
 		return c.showClassOfServiceInterface(selector)
 	case "classifier":
-		nameFilter, typeFilter := parseCoSClassifierArgs(args[1:])
+		nameFilter, typeFilter := cmdtree.ParseCoSNameTypeArgs(args[1:])
 		fmt.Print(dpformat.FormatCoSClassifiers(c.store.ActiveConfig(), nameFilter, typeFilter))
+		return nil
+	case "rewrite-rule":
+		// #6848: same `name`/`type` filter grammar as `classifier`, so the two
+		// sibling commands parse identically; the parser is shared rather than
+		// duplicated. #6858: it is shared with the REMOTE binary too — see
+		// cmdtree.ParseCoSNameTypeArgs.
+		nameFilter, typeFilter := cmdtree.ParseCoSNameTypeArgs(args[1:])
+		fmt.Print(dpformat.FormatCoSRewriteRules(c.store.ActiveConfig(), nameFilter, typeFilter))
 		return nil
 	case "scheduler-map":
 		name := ""
@@ -40,26 +48,6 @@ func (c *CLI) handleShowClassOfService(args []string) error {
 		cmdtree.PrintTreeHelp("show class-of-service:", operationalTree, "show", "class-of-service")
 		return nil
 	}
-}
-
-// parseCoSClassifierArgs extracts optional `name <n>` and `type <t>` filters
-// from `show class-of-service classifier` arguments.
-func parseCoSClassifierArgs(args []string) (nameFilter, typeFilter string) {
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "name":
-			if i+1 < len(args) {
-				nameFilter = args[i+1]
-				i++
-			}
-		case "type":
-			if i+1 < len(args) {
-				typeFilter = args[i+1]
-				i++
-			}
-		}
-	}
-	return nameFilter, typeFilter
 }
 
 func (c *CLI) showClassOfServiceInterface(selector string) error {

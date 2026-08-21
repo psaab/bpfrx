@@ -918,6 +918,29 @@ type DeterministicNATConfig struct {
 type StaticNATRule struct {
 	Name  string
 	Match string // destination-address (external/public IP)
+	// MatchAddresses is the FULL `match destination-address` list as authored
+	// (#6659). The compiler previously read this leaf with nodeVal, so a
+	// bracket / block list silently kept only the first prefix — and, worse,
+	// the dropped values never reached ValidateIPPrefix, so a MALFORMED prefix
+	// in any slot but the first committed clean (a validation fail-open).
+	//
+	// Match still carries the value the LAST authored statement selected — the
+	// nodeVal assignment runs once per child, so the last `match
+	// destination-address` node wins, and within a bracketed list that node's
+	// FIRST value. It is therefore not in general MatchAddresses[0] nor
+	// MatchAddresses[len-1]: for `sibling then bracket` the three differ.
+	// Match is what the dataplane snapshot
+	// lowers to (ExternalIP is a single address in the Rust static_nat table),
+	// so a rule with more than one prefix has no representable meaning today.
+	// validateStaticNATMatchAddressesStrict therefore REJECTS a multi-valued
+	// list at commit rather than letting it silently collapse to the first.
+	// Widening static NAT to fan one rule into N external prefixes is a
+	// separate semantic change (see #6674), not this fix.
+	//
+	// #6673: read with multiLeafAuthoredValues, which KEEPS empty values, so this
+	// list always contains what Match selected; an empty entry is a selection, not
+	// a second prefix. Rationale: compileNATStatic and docs/config-schema.md.
+	MatchAddresses []string
 	// SourceAddress is the FIRST configured `match source-address` value,
 	// retained for back-compat (e.g. "::/0" for NAT64). Prefer
 	// SourceAddresses for the full bracket/repeated list — SourceAddress
@@ -1223,7 +1246,8 @@ type Application struct {
 	// (#3352).
 	UnknownTermLeaves []string
 	// DuplicateTermLeaves records the names of single-valued (scalar) leaves
-	// (destination-port / source-port / inactivity-timeout / timeout / alg) that
+	// (destination-port / source-port / inactivity-timeout / timeout / alg /
+	// icmp-type / icmp-code) that
 	// appeared MORE THAN ONCE with a CONFLICTING (different) value inside one
 	// inline `application <a> term <t>`. The inline term is opaque to the
 	// SchemaValidate walk, so a repeated scalar leaf — via apply-groups, flat-set
@@ -1236,7 +1260,9 @@ type Application struct {
 	// multi-protocol-term syntax. Mirroring UnknownTermLeaves, the offending leaf
 	// name is recorded and the deferred gate (validateApplicationStructureStrict)
 	// hard-rejects the first one on the strict commit path / warns on the tolerant
-	// load / peer-sync path (#3366).
+	// load / peer-sync path (#3366; icmp-type / icmp-code added in #6766 — their
+	// omission let a conflicting repeat silently narrow a referenced deny to the
+	// LAST type/code).
 	DuplicateTermLeaves []string
 	// DuplicateDirectLeaves records the names of single-valued (scalar) DIRECT
 	// match leaves (protocol / destination-port / source-port / inactivity-timeout

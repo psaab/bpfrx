@@ -668,8 +668,9 @@ func TestVerifyBindingsWatchdogSkipsOverCapIfindex(t *testing.T) {
 }
 
 // TestBindingArrayMaxEntriesMirrorsRustSide pins the Go-visible
-// constant to its derivation. If MaxInterfaces or
-// BindingQueuesPerIface drift vs userspace-xdp/src/lib.rs, the
+// constant to its derivation. If MaxInterfaces drifts vs
+// userspace-xdp/src/lib.rs, or BindingQueuesPerIface vs
+// userspace-xdp/src/binding_index.rs, the
 // load-time assertion in loader_ebpf.go catches it — but this test
 // fails at compile/unit-test time before you get that far.
 func TestBindingArrayMaxEntriesMirrorsRustSide(t *testing.T) {

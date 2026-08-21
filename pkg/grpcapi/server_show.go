@@ -45,6 +45,12 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	if req.Topic == "cos-classifier" || strings.HasPrefix(req.Topic, "cos-classifier:") {
 		return s.showCoSClassifier(req, cfg, &buf)
 	}
+	// #6848 (#4228 Gap 7 residual): the rewrite-rule view. Registered here as
+	// well as in the local CLI so the REMOTE cli binary — the surface most
+	// operators use — gets the command too.
+	if req.Topic == "cos-rewrite-rule" || strings.HasPrefix(req.Topic, "cos-rewrite-rule:") {
+		return s.showCoSRewriteRule(req, cfg, &buf)
+	}
 	if req.Topic == "cos-scheduler-map" || strings.HasPrefix(req.Topic, "cos-scheduler-map:") {
 		return s.showCoSSchedulerMap(req, cfg, &buf)
 	}

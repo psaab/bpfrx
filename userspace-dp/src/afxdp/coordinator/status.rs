@@ -177,6 +177,60 @@ impl super::Coordinator {
         per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
+    /// #4800 new-flow-install contention surface. Six process-global
+    /// counters that, read as three (denominator, contended) pairs plus a
+    /// depth high-water, say WHICH of the cross-worker synchronization
+    /// points on the new-flow install path is saturating — the question a
+    /// flat new-flows/sec plateau cannot answer on its own.
+    ///
+    /// `shared_session_publishes_total` is the publish-leg new-flow rate;
+    /// `shared_session_publish_lock_{acquisitions,contended}_total` are the
+    /// map-mutex pair scoped to `publish_shared_session` alone.
+    /// `session_replication_{upserts,enqueued}_total` give the call rate
+    /// and the N-way fan-out multiplier (`enqueued / upserts` = sibling
+    /// worker count), `session_replication_lock_contended_total` is the
+    /// blocked subset of those enqueues, and
+    /// `session_replication_queue_depth_max` is the monotonic high-water
+    /// sibling-queue depth — contention means producers collided, depth
+    /// means the consumer is not keeping up, and the two have different
+    /// remedies.
+    ///
+    /// Surfaced as `xpf_userspace_shared_session_publishes_total` and
+    /// siblings. The NAT-allocator leg of the same question lives on the
+    /// per-pool `SourceNatPoolStatus` (`live_lock_*`), because that mutex
+    /// is per pool, not per process.
+    pub fn shared_session_publishes_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_PUBLISHES.load(Ordering::Relaxed)
+    }
+
+    pub fn shared_session_publish_lock_acquisitions_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS.load(Ordering::Relaxed)
+    }
+
+    pub fn shared_session_publish_lock_contended_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_PUBLISH_LOCK_CONTENDED.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_upserts_total(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_UPSERTS.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_enqueued_total(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_ENQUEUED.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_lock_contended_total(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_LOCK_CONTENDED.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_queue_depth_sum(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_QUEUE_DEPTH_SUM.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_queue_depth_max(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_QUEUE_DEPTH_MAX.load(Ordering::Relaxed)
+    }
+
     /// #2244: total failed `dnat_table` reverse-SNAT BPF-map publishes.
     /// Sum of the per-binding `dnat_publish_errors` atomics bumped on the
     /// two worker poll-path `publish_dnat_table_entry` call sites whose
@@ -204,14 +258,14 @@ impl super::Coordinator {
     /// variant). The authoritative guard is in the Go cluster apply layer;
     /// this is the helper-side back-stop counter.
     pub fn session_install_stale_ignored_total(&self) -> u64 {
-        SESSION_INSTALL_STALE_IGNORED.load(Ordering::Relaxed)
+        self.sessions.install_stale_ignored.load(Ordering::Relaxed)
     }
 
     /// #2170: total stale-generation deletes refused by the helper's
     /// in-memory SyncedSessionEntry guard (belt-and-suspenders for any
     /// helper-side generation-aware delete).
     pub fn session_delete_stale_ignored_total(&self) -> u64 {
-        SESSION_DELETE_STALE_IGNORED.load(Ordering::Relaxed)
+        self.sessions.delete_stale_ignored.load(Ordering::Relaxed)
     }
 
     /// #5674: total peer-synced session imports rejected by the coordinator's
@@ -220,11 +274,19 @@ impl super::Coordinator {
     /// imports were previously uncapped and fanned out to every worker, so a
     /// peer under session-table pressure (or a compromised peer) could drive
     /// this node past its own aggregate session ceiling. A rising value means a
-    /// peer exceeded this appliance's ceiling (`worker_count *
-    /// DEFAULT_MAX_SESSIONS`); a legitimate symmetric-pair failover never trips
-    /// it. Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
+    /// peer exceeded this appliance's ceiling.
+    ///
+    /// #6413: state that ceiling in ENTRIES, matching `synced_import_cap` and
+    /// `coordinator/session_manager.rs` — it is
+    /// `2 * worker_count * DEFAULT_MAX_SESSIONS`,
+    /// not the LOGICAL `worker_count * DEFAULT_MAX_SESSIONS`. Each admitted
+    /// forward publishes TWO keys into `sessions.synced` (the forward and its
+    /// synthesized reverse companion), so N logical sessions arrive as 2N
+    /// entries and EXACTLY fit the 2N cap. A legitimate symmetric-pair failover
+    /// therefore never trips it; firing semantics are unchanged by this wording.
+    /// Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
     pub fn synced_import_cap_drops_total(&self) -> u64 {
-        SYNCED_IMPORT_CAP_DROPS.load(Ordering::Relaxed)
+        self.sessions.import_cap_drops.load(Ordering::Relaxed)
     }
 
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
@@ -874,6 +936,8 @@ impl super::Coordinator {
                     session_table_entries: s.session_table_entries,
                     max_sessions: s.max_sessions,
                     nat_reverse_key_collisions: s.nat_reverse_key_collisions,
+                    // #4800: per-worker transit new-flow installs.
+                    new_flow_installs: s.new_flow_installs,
                     session_create_drops: s.session_create_drops,
                     session_install_admission_refused: s.session_install_admission_refused,
                     session_install_partial: s.session_install_partial,

@@ -145,11 +145,12 @@ var showTextAuditTopics = []string{
 
 	// Topics matched by equality outside the main switch.
 	"class-of-service", "cos-classifier", "cos-forwarding-class",
-	"cos-scheduler-map", "firewall-effective", "interfaces-queue",
+	"cos-rewrite-rule", "cos-scheduler-map", "firewall-effective", "interfaces-queue",
 	"monitor-security-flow", "screen-statistics-all",
 
 	// Parameterized topics, with a representative argument each.
-	"class-of-service:ge-0-0-1", "cos-classifier:c1", "cos-scheduler-map:m1",
+	"class-of-service:ge-0-0-1", "cos-classifier:c1",
+	"cos-rewrite-rule:name=rw-dscp", "cos-scheduler-map:m1",
 	"firewall-effective:inet", "firewall-effective-filter:f1",
 	"firewall-filter:f1", "interfaces-queue:ge-0-0-1", "log:messages",
 	"route-prefix:10.0.0.0/24", "route-protocol:bgp", "route-table:inet.0",

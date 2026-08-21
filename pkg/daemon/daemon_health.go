@@ -138,7 +138,7 @@ func (d *Daemon) shouldScheduleStandbyNeighborRefresh(now time.Time) bool {
 }
 
 func (d *Daemon) scheduleStandbyNeighborRefresh() {
-	if d.cluster == nil || d.dp == nil {
+	if d.cluster == nil || d.dataplane() == nil {
 		return
 	}
 	cfg := d.store.ActiveConfig()

@@ -1000,8 +1000,10 @@ func TestStrictVIPOwnershipToggle(t *testing.T) {
 // TestRGStateMachine_ShouldLogRetry_GatesPerStreak pins the #757 fix:
 // ShouldLogRetry() returns true once per retry streak, then stays false
 // until MarkApplied() resets the gate. Without this gate, the reconcile
-// loop would log "retrying rg_active apply" at INFO every 500ms tick
-// when the helper is down — 3 RGs × 2 ticks/sec = 6 lines/sec forever.
+// loop would log "retrying rg_active apply" at INFO on every pass when
+// the helper is down — 3 RGs on reconcileRGStateLoop's 2s ticker is 1.5
+// lines/sec forever, and higher whenever a dropped event wakes the loop
+// early via reconcileNowCh.
 func TestRGStateMachine_ShouldLogRetry_GatesPerStreak(t *testing.T) {
 	s := newRGStateMachine()
 

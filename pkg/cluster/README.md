@@ -23,10 +23,21 @@ locating any symbol below is now a matter of opening the named file.
   `vrfListenConfig` — `heartbeat_manager.go`.
 - `HeartbeatPacket`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, the #4107 control-channel auth
-  (`MarshalHeartbeatAuth`, `heartbeatAuthTrailer`,
-  `verifyHeartbeatMAC`, `heartbeatAuthReplay`,
-  `heartbeatAuthDecision`), sender/receiver goroutine types —
+  (`MarshalHeartbeatAuth`, `marshalHeartbeatAuthEpoch`,
+  `heartbeatAuthTrailer`, `verifyHeartbeatMAC`, `heartbeatAuthReplay`,
+  `heartbeatAuthState.admitAuthed`, `heartbeatAuthDecision`,
+  `Manager.heartbeatNonce`), sender/receiver goroutine types —
   `heartbeat.go`. See "Control-channel authentication" below.
+- The #6169 across-reboot boot epoch — wire section constants, the
+  key-derived marker (`heartbeatEpochMarker`), the verified-frame reader
+  (`heartbeatFrameEpoch`), the plausibility bound (`epochUsableAsFloor`),
+  the wall-clock seed published synchronously (`Manager.heartbeatBootEpoch`,
+  increasing while the clock advances — not monotonic across a backward step,
+  residual 3) with its off-path, RE-RUNNABLE persistence refinement
+  (`refineBootEpoch`, `withEpochFileLock`, `Manager.refreshBootEpoch`) and the
+  start-time wiring (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`. The downgrade
+  latch itself is process-scoped state on `heartbeatAuthState`; there is no
+  peer-floor file.
 - Single-RG manual failover and transfer-commit protocol
   (`ManualFailover`, `ForceSecondary`, `ResetFailover`,
   `RequestPeerFailover`, `commitRequestedPeerFailover`,
@@ -183,6 +194,193 @@ Two defenses, both fail-safe rather than manufacturing a false winner:
   conflict). Yielding both nodes to SECONDARY produces a clean, obvious,
   loudly-logged outage instead of subtle duplicate-address corruption.
 
+## Session-sync fail-closed authentication (#5078)
+
+The session-sync TCP stream (`sync_auth.go`) authenticates with the SAME
+control-link PSK. Until #5078, a node that HAD a key still **dual-accepted** an
+unkeyed or legacy peer on first contact: `syncAuthDecision` granted a grace
+whenever the sticky downgrade guard (`peerAuthSeen`) had not yet armed.
+
+That grace was not a compatibility affordance, it was an unauthenticated
+**active** bypass, and it did not depend on the reflection weakness this issue
+also tracks:
+
+- the window is open on **every fresh boot** — "before the guard arms" is
+  exactly when a node starts;
+- an admitted peer's first frame was executed **before** the connection was
+  installed (`handleNewConnection`), and `syncMsgFence` on that path reaches
+  `OnFenceReceived`, which disables every routing group;
+- the admitted connection then **displaces** the legitimate peer's connection,
+  and arming the guard later does not evict it.
+
+So a PSK-less host reaching the fabric could fence the node and hold the peer
+slot. Two changes close it:
+
+- **A keyed node requires an authenticated peer.** `syncAuthDecision` no longer
+  consults `peerAuthSeen` for the unkeyed-peer branch — it cannot, since the
+  whole exposure is the pre-arm window. An unkeyed/legacy peer is rejected.
+- **The pre-admission frame mechanism is DELETED, not reordered.** A legacy
+  peer's first frame used to be carried out of the handshake as a
+  `pendingFrame` and executed BEFORE `installConn` — `syncMsgFence` on that
+  path reaches `OnFenceReceived` and disables every routing group, for a peer
+  that had proven nothing. Its only producer sat behind the dual-accept grace,
+  so once that grace is gone the arm can never accept and the mechanism is
+  unreachable. It is removed rather than left dormant: unreachable code that
+  mutates cluster state before admission is one edit away from being live
+  again. There is now no path by which an unadmitted connection executes
+  anything.
+
+**No relaxation knob, deliberately** — but read the rollout constraint below
+before concluding that is easy.
+
+An earlier draft shipped a bounded `authentication-migration-window`. It had to
+bound a connection's LIFETIME rather than just its admission (an admitted
+pass-through stream outlived the deadline and could still fence the node), it
+had to stop an admitted peer re-arming it through config-sync, and its
+in-memory arming meant a crash loop granted a fresh interval on every restart.
+A relaxation needing three guards of its own does not belong inside the fix that
+closes the hole, so it was removed.
+
+What remains is the property a security appliance should have: **for a
+connection established AFTER keying, a node must possess the key to join a
+keyed cluster.**
+
+That qualifier is not pedantry. Verification is gated per-connection on
+`ac.authed()`, fixed at handshake time, so a connection established BEFORE the
+key was committed stays unauthenticated for its whole lifetime and keeps having
+its frames accepted with no HMAC. See "Rolling it onto a live unkeyed cluster"
+below for the operator consequence — the restart there is not optional — and
+**#6628** for the open residual — it covers any auth-key CHANGE and subsumes
+the narrower unkeyed→keyed case. It is PRE-EXISTING, not introduced by #5078.
+
+### Rollout: a secondary whose gate is ARMED cannot be keyed locally
+
+Three earlier revisions of this document got this wrong in three directions —
+first claiming an unavoidable deadlock, then claiming the operator can simply
+"commit the key locally on each node", then claiming the gate covers every entry
+point unconditionally. The mechanism, stated with its precondition:
+
+- `applyRG0OwnershipTransition` calls `store.SetClusterReadOnly(true)` on
+  `StateSecondary` / `StateSecondaryHold` (`pkg/daemon/daemon_ha.go`). It is
+  driven by an RG0 **transition event** and by nothing else — there is no
+  startup arming and no reconcile that re-derives the flag.
+- Once armed, `EnterConfigureSession` returns `ErrClusterReadOnly` before doing
+  anything else (`pkg/configstore/store_lock.go`), whichever entry point the
+  operator used.
+
+So on a secondary whose gate is armed, config mode cannot be opened at all —
+this is not "the local commit gets overwritten by sync", and **config-sync is
+that node's only writer** (`TestClusterReadOnly_SyncApplyBypassesGate` pins that
+the HA-sync ingress path bypasses the gate).
+
+**But arming is not universal, so do not read the heading as unconditional.** A
+node that cold-starts, seats as RG0 secondary and never transitions never
+reaches that call, and `Store.clusterReadOnly` starts false — so its store is
+writable. REST enters a configure session with no RG0 check of its own
+(`pkg/api/config.go`), where gRPC guards on `IsLocalPrimary(0)` and the
+interactive CLI has its own check. That gap is **#6890**; the dropped-event
+variant is **#6889**. Both are OPEN and neither is scheduled — do not read a
+fix date into this sentence. The design intent is what this
+section describes; treat the gap as a bug to avoid, never as a rollout
+procedure.
+
+**Performable procedures:**
+
+1. **At provisioning / console, before the cluster forms.** `clusterReadOnly`
+   zero-values to `false`, so each node can be keyed independently before it
+   ever seats as secondary. This is the recommended path.
+2. **On a live cluster: commit on the PRIMARY while sync is connected.** The
+   established connection carries the key to the secondary. This works only
+   because committing the key does not restart cluster comms — the auth key is
+   deliberately absent from `clusterTransportKey`, pinned by
+   `TestAuthKeyChangeDoesNotRestartClusterComms_5078`. Do not add it there; see
+   that test for why it would deadlock with no self-recovery. ("Deadlock", not
+   "permanent deadlock" — an operator can still break it out of band, by the
+   controlled promotion in row 3 or, on a node whose gate was never armed, by
+   the #6890 hole. What the hypothetical destroys is the cluster's ability to
+   converge on its own.) The step-20 decision
+   that must not fire on a key change is pinned separately by
+   `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` — the struct test alone
+   does not cover the call site.
+
+   **Procedure 2 carries the risk it is trying to avoid.** The key reaches the
+   secondary asynchronously, so if the session-sync connection drops in the
+   window between the primary committing and the secondary applying, you land in
+   exactly the keyed-primary / unkeyed-secondary state below — the now-keyed
+   primary rejects the unkeyed peer's reconnect, and the key can never be
+   delivered. Prefer procedure 1. If you must use procedure 2, confirm sync is
+   connected immediately before committing (`show chassis cluster status`) and
+   verify the secondary applied the key immediately after; treat a drop in that
+   window as requiring the recovery below.
+
+**Recovery: no path is unconditional, and the one you can plan around costs a
+controlled outage.** Three earlier revisions of this section got this wrong in
+three different directions — one proposed a primary-only rekey and labelled it
+UNVERIFIED, the next said no recovery existed at all, the third said exactly one
+path works. Each replaced a hedge with an absolute and each was refuted. So the
+three candidate paths are stated individually, with their preconditions, rather
+than summarised into a verdict:
+
+1. **Primary-only rekey — CLOSED.** "Remove the key on the primary, let the peer
+   reconnect unkeyed, config-sync pushes, re-add the key" cannot start: an
+   unkeyed `chassis cluster` is what the commit gate rejects, so `delete chassis
+   cluster authentication-key; commit` is refused by
+   `validateClusterAuthKeyStrict`. This document says the same thing under "Do
+   not try to return to dual-accept by clearing the key first". Tracked as
+   **#6630**.
+2. **Console on the seated secondary — CLOSED only where the gate is actually
+   ARMED.** The gate is on the **config store**, not the transport, so *when it
+   is armed* `EnterConfigureSession` returns `ErrClusterReadOnly` regardless of
+   which entry point the operator used — console, remote CLI, gRPC or REST.
+   Arming is not automatic, and that is the whole caveat: `SetClusterReadOnly(true)`
+   is reached only from the RG0 **transition** handler, so a node that cold-starts,
+   seats as secondary and never transitions still has a **writable** store. On
+   such a node this row is OPEN, and REST is the way in — `pkg/api/config.go`
+   enters a configure session with no RG0 check of its own, where the interactive
+   CLI (`pkg/cli/cli_dispatch.go`) and gRPC (`IsLocalPrimary(0)`) each have one.
+   Tracked as **#6890**; the dropped-event variant of the same unarmed-gate
+   failure is **#6889**. Do not treat this row as CLOSED on a node whose RG0
+   state you have not checked.
+3. **Controlled RG0 promotion — the only path you can PLAN for, and it is
+   CONDITIONAL.** ("Plan for", not "that works": row 2 is open on an unarmed
+   node, so a path exists there too — it is just a bug you must not build a
+   procedure on.) Stop `xpfd` on the keyed primary; *if* the secondary wins the
+   election, `applyRG0OwnershipTransition(StatePrimary)` calls
+   `d.store.SetClusterReadOnly(false)` and the now-primary node accepts a local
+   commit of the same key. Restart the old primary and the pair converges keyed.
+   Same stop-one-node shape documented above for `configuration-synchronize`.
+
+   **Each "if" is a real precondition, not a formality:**
+   - the secondary must be eligible — `election.go` returns early on
+     `m.kernelUpgradeHold`, and promotes only when `rg.Weight > 0`. Zero weight
+     or an active upgrade hold and no promotion happens at all;
+   - the promotion **event must be delivered**. `Manager.sendEvent` is
+     non-blocking and drops on a full channel, and the dropped-event fallback
+     does not reconcile `Store.ClusterReadOnly` — so the manager can report RG0
+     primary while the store stays read-only. Tracked as **#6889**.
+
+   (The unarmed-gate case from row 2 — **#6890** — is *not* a precondition here.
+   It does not block promotion; it means the gate you are trying to clear was
+   never closed on that node, so the recovery was never needed there. It is
+   listed under row 2, where it belongs, rather than padding this list.)
+
+   So do not read this row as a procedure. It is the path you would design
+   around; whether it is available on a given cluster at a given moment depends
+   on both preconditions above.
+
+So the recovery you can actually plan for is a deliberate cluster failover —
+you have turned a config commit into an outage. (A node that happens to fall in
+the row-2 unarmed-gate case is writable without any of that, but you cannot
+design a procedure around a gap that is merely FILED.) That is why committing
+`authentication-key` must never restart cluster comms: the fallback is
+CONDITIONAL on everything row 3 lists, and even when available it is one you
+would have to schedule. Do not read "a fallback exists" off this sentence —
+that is exactly the absolute this section keeps regrowing.
+`TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
+`TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` pin the no-restart
+behaviour; if either reds, the change under your hand is the one that forces
+that outage.
+
 ## Control-channel authentication (#4107, PR-A)
 
 The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds
@@ -217,6 +415,45 @@ peer liveness (`lastSeen`) or drive election.
   enforcing peer would reject and split the cluster (dual-primary). The
   overflow guard is unreachable at the uint8-bounded RG count and fails
   LOUD (`slog.Error`) rather than emitting cleartext.
+- **Wire, boot-epoch section (#6169).** A signed frame optionally carries
+  a 16-byte boot-epoch section `marker(8) + epoch(8, little-endian)`
+  inserted **BETWEEN the body and the `XPFA` trailer**
+  (`marshalHeartbeatAuthEpoch`):
+
+  ```
+  [ body … version section ][ marker(8) ][ epoch(8) ][ XPFA(4) session(8) counter(8) HMAC(32) ]
+                             \___ #6169 epoch section ___/\_________ #4107 auth trailer _________/
+                                                          \_ signed span ends before the digest _/
+  ```
+
+  The placement is load-bearing and is **not** interchangeable with
+  appending after the trailer. Appending after it (the earlier attempt,
+  #6370) moves the `XPFA` magic off `len-52`, so a pre-#6169 receiver reads
+  the frame as UNSIGNED — and an enforcing pre-#6169 peer then rejects
+  every frame, splitting a keyed cluster mid-upgrade. With the section
+  before the trailer, a pre-#6169 receiver still locates the trailer at
+  `len-52`, still verifies the MAC over exactly the bytes the new sender
+  signed, still decodes an identical packet (the epoch lands past the
+  version section, which `UnmarshalHeartbeat` ignores), and simply never
+  sees the epoch. Bidirectional compatibility with **no**
+  `CurrentHAProtocolVersion` bump.
+
+  `marker = HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]` is key-derived, NOT a
+  fixed ASCII magic. The section is read at a SINGLE FIXED OFFSET back from
+  the fixed-size trailer (`len-68` — one index, no search loop), so the bytes
+  it lands on are the tail of the version section — a stable, build-specific
+  string. A fixed magic could therefore
+  be matched by an ordinary body on **every** frame of some build,
+  deterministically; and because the receiver LATCHES the high-water epoch,
+  a body-derived value read as a uint64 (~7e18, far above a wall-clock
+  epoch ~1.8e18) would permanently lock the peer out. A key-derived marker
+  is a PRF value no attacker can compute without the PSK, and an archived
+  legacy body collides at only ~2⁻⁶⁴. The epoch is read **only** from a
+  MAC-verified frame — only a verified frame authorises treating `len-52`
+  as the end of the signed body. The tail reserve grows to 68 bytes when a
+  marker is emitted, so a maximal frame still fits `maxHeartbeatSize`;
+  reserving only 52 lets the frame overrun the receiver's read buffer,
+  which truncates it and destroys the MAC.
 - **Anti-replay.** `session` is a random per-sender-process id and
   `counter` a monotonic per-session counter. `heartbeatAuthReplay.admit`
   remembers a BOUNDED SET of per-session high-water counters
@@ -249,18 +486,873 @@ peer liveness (`lastSeen`) or drive election.
   or more distinct sessions can churn the ring by REPLAY ALONE (no
   reboot, no minting) and SUSTAIN the replay indefinitely; with fewer than
   65 recordings every retired-session replay is rejected.
-  **The unit is a peer SESSION, not a peer daemon boot.** A session id is
-  minted per `heartbeatSender`, so every peer heartbeat restart (VRF rebind,
-  HA comms restart) mints a fresh one with no reboot involved. So the 65 above
-  is 65 recorded heartbeat sessions — cheaper to harvest than 65 daemon
-  incarnations — and routine peer restarts consume ring slots permanently now
-  that the ring outlives a local restart. Neither is a regression: before
-  #5086 any local heartbeat restart wiped the ring entirely, so this worst
-  case is a strict subset of the previous one. A complete fix
-  needs a boot-epoch / monotonic-across-reboot counter carried in the frame
-  (a wire change) — tracked as a follow-up (#6169). The map still causes NO
+  **The unit is a peer DAEMON INCARNATION — but only since #6169 Stage 0.**
+  A session id used to be minted per `heartbeatSender`, so every peer heartbeat
+  restart (VRF rebind, HA comms restart) minted a fresh one with no reboot
+  involved: the 65 above was 65 recorded heartbeat *sessions*, cheaper to
+  harvest than 65 daemon incarnations, routine peer restarts consumed ring
+  slots permanently once the ring outlived a local restart, and — worst — those
+  extra sessions all shared ONE boot epoch, which the floor cannot separate, so
+  the ring stayed churnable *within* an incarnation even under the epoch gate.
+  `Manager.heartbeatNonce` now draws the session once per `Manager` and only
+  advances the counter (`TestHeartbeatNonceIsIncarnationScoped_6169`), so a
+  restart no longer re-anchors and the 65 really is 65 peer boots. The map
+  still causes NO
   genuine-peer lockout (an evicted live watermark just makes the peer's next
   frame never-seen → admitted) and cannot grow memory (fixed 64 slots).
+  **#6169 closes the ≥65 churn** with the signed boot epoch below; the ring
+  is retained and still owns within-incarnation replay and the whole legacy
+  (epoch-less) path.
+- **Across-incarnation anti-replay — the signed boot epoch (#6169).**
+  The ring can only ever be a bounded set because session ids are random and
+  unordered. The frame therefore carries a **boot epoch**: a per-daemon-
+  incarnation counter that increases across restarts and reboots, giving the
+  receiver an order over peer incarnations in O(1) state. It is **not strictly
+  increasing in every case** — the persisted term of the seed is bounded, so a
+  backward clock step larger than `bootEpochMaxSkew` regresses it even with the
+  file intact (residual 3, #6711).
+  - **Receiver** (`heartbeatAuthState.admitAuthed`, floor `highEpoch` on the
+    `Manager` so it survives a heartbeat restart exactly like the ring):
+    `epoch < highEpoch` → REJECT (an incarnation OLDER than the highest one
+    accepted — which is a retired one only while the sender's epoch has not
+    regressed; see residual 3); `epoch == highEpoch` → fall through to the
+    ring, but only for a BOUNDED SET of sessions at that value
+    (`highEpochSessions`, `heartbeatEpochSessionsPerEpoch` slots);
+    `epoch > highEpoch` → let the ring vet the nonce, then raise the floor and
+    rebind it to that session.
+    **The floor admits at most `heartbeatEpochSessionsPerEpoch` (2) SESSIONS
+    PER EPOCH VALUE**, and bounding that is what makes it bound the ring
+    rather than merely order it. Equality must fall through for a bound
+    session — a live peer signs every frame of its incarnation with one
+    epoch, so refusing equality outright declares a healthy peer dead — and
+    must not fall through unbounded, because distinct sessions sharing one
+    epoch churn the ring exactly as epochless frames do (measured 1625/1625
+    before the binding existed; `epoch == highEpoch` used to fall through
+    unconditionally). A refused frame is counted as `EpochSessionCollision`
+    and rendered by `show chassis cluster status` as "Epoch session
+    collisions".
+
+    **The bound cannot be ONE, and an earlier revision of this document said
+    the cost of making it one was "durable only when the clock is frozen AND
+    the store never completes".** That is false. `refineBootEpoch` chains to
+    `persisted+1`, which is a pure function of the FILE, so a store that
+    READS but cannot WRITE — a full or read-only `/var`, with the state file
+    holding a value ahead of `now` but inside `bootEpochMaxSkew` after an RTC
+    ran fast and NTP corrected it back — hands EVERY successive incarnation
+    the identical epoch, on a healthy advancing clock. Refinement is the
+    equal-epoch generator there, not the escape from one. With a singleton
+    bound the successor incarnation was refused on every heartbeat (measured
+    0/40 through `initHeartbeatEpochState` over a write-failing directory),
+    which at the shipped 200 ms interval and threshold 5 declares a healthy
+    node dead in 1 s and takes its RGs over while it still holds them.
+
+    **What it still costs**, stated as the bound is: a successor beyond the
+    second at ONE unchanged epoch value is refused, and refused for its whole
+    process lifetime, because `bootEpoch` is set once and re-refinement lands
+    on the same `prev+1`. So the honest statement is *durable across every
+    restart in a window up to `bootEpochMaxSkew` whenever the persist half
+    cannot advance the file*, and the bound buys one restart inside that
+    window rather than removing it, and it buys NONE at all against an on-link
+    replay attacker: every prior incarnation's frames carry the current floor
+    value under a distinct session in this regime, so one replayed archived
+    frame fills the second slot and the first genuine successor is refused.
+    Raising the bound does not help — an attacker spends `k-1` slots as cheaply
+    as one. **Sender-side recovery** needs the wall clock to climb past
+    `prev+1` **and** another restart — at most an hour.
+    **Receiver-side, only a full `xpfd` restart on the receiving node clears
+    it**, and an earlier revision of this document had the reason exactly
+    backwards. `highEpoch` and `highEpochSessions` live on the `Manager`, which
+    is why a *heartbeat* restart does **not** clear them: `StartHeartbeat`,
+    `RestartHeartbeat` on a DHCP-triggered VRF rebind and the HA comms restart
+    all preserve `hbAuth` deliberately (#5086/#6642 — a receiver-scoped floor
+    would be zeroed by every routine restart and re-admit a replayed retired
+    epoch). Only a new `Manager`, i.e. restarting the daemon, resets the floor
+    and admits the stranded successor on the raise-from-0 path. That is a
+    heavier operation than it sounds, and it is **not** unconditionally
+    preferable: a restarted floor is also a *cleared* floor, which one archived
+    frame re-raises just as it re-arms a cleared latch (residual 5 below), so
+    on a link an attacker is on, restarting can hand the lockout straight back.
+    **When
+    "Epoch session collisions" climbs alongside a peer that keeps being
+    declared dead, check for a non-writable `/var` on the peer first**
+    (`df`, and a test write under `/var/lib/xpf`); a clock at or before the
+    Unix epoch is the second, degenerate cause. Rebinding on silence instead
+    would cover every successor and is declined: waiting out the dead-peer
+    interval between captures is free, so it hands the attacker back the
+    unbounded churn the bound exists to stop.
+    (`TestEqualEpochsCannotChurnTheRing_6669`,
+    `TestEqualEpochSuccessorIsAdmitted_6669`,
+    `TestFloorRebindsToTheRaisingIncarnation_6669`.)
+    **The floor is tested BEFORE the ring is consulted and a rejected frame
+    never reaches `ring.admit`.** That ordering is load-bearing: `admit`
+    RECORDS a never-seen session as a side effect, so checking the epoch
+    after it would let rejected replays keep evicting live watermarks and
+    flush the ring — the bypass that failed review in #6370. The floor only
+    rises to a value the genuine peer actually signed — but that does **not**
+    bound it by the live peer's *current* epoch: if the peer has since
+    regressed (residual 3, #6711), one archived frame raises the floor above
+    it and locks it out, and re-raises a cleared floor after a restart just as
+    it re-arms a cleared latch (residual 5).
+  - **Sender** (`bootEpochSeed` published synchronously, then `refineBootEpoch`):
+    `max(persisted+1, wall_clock_nanos)`,
+    persisted atomically at `/var/lib/xpf/ha-boot-epoch` (the same durable
+    state root as SNMPv3 `engineBoots`). The two terms cover the two
+    failure modes neither survives alone — a **backward clock step** across
+    a reboot is dominated by `persisted+1`, and **lost persisted state**
+    (fresh image, wiped `/var/lib`, first boot) is dominated by the wall
+    clock. Resolution is NANOSECONDS deliberately: a coarser seed hands two
+    incarnations starting in the same interval identical values.
+    **The first term is BOUNDED, and the bound is `bootEpochMaxSkew` (one
+    hour).** A persisted value further ahead than that is not chained from at
+    all (`epochOrderable` in `refineBootEpoch`), so a backward step LARGER
+    than an hour is not carried across even with the file perfectly intact —
+    see residual 3 and #6711. Read `persisted+1` as covering ordinary RTC
+    skew and NTP corrections, not arbitrary clock faults.
+  - **The DOWNGRADE LATCH — without it the floor closes almost nothing.**
+    The floor only ever sees frames that CARRY an epoch, and an attacker's
+    captures are by construction mostly from BEFORE the upgrade, so they
+    carry none. A receiver that accepts epochless frames forever never
+    consults the floor at all. Measured on the first cut of this change,
+    with the floor latched at a live peer's epoch: **975/975 epochless
+    replays still admitted.** So once the peer has been seen to emit an
+    epoch, an epochless frame from it is REFUSED (`epochSeen` in
+    `heartbeatAuthState`). The latch is armed by OBSERVATION, never by local
+    build version — that is what keeps a rolling upgrade working.
+  - **The latch is PROCESS-SCOPED, and that is the design decision that
+    REPLACED durability.** It lives on `Manager.hbAuth` (#5086/#6642), so a
+    heartbeat restart, a DHCP-triggered VRF rebind and an HA comms restart all
+    PRESERVE it — the routine events. Only a full daemon restart clears it.
+
+    **The cost is bounded by the peer's NEXT GENUINE FRAME — not by wall clock**,
+    and that distinction is the whole of it. Measured after a receiver daemon
+    restart: **1080/1080 epoch-less captures admitted** inside the window, then
+    **0/120** once a genuine frame lands. What the attacker gets is one full
+    ascending pass over their captures — about 60 frames across 12 retired
+    incarnations — not a single frame. A replayed OLD epoch CAN set the floor low
+    (the forward bound constrains only how far AHEAD an epoch may be), but it
+    cannot be sustained *while the peer's own epoch is still climbing*: the
+    genuine frame then dominates and re-arms the latch.
+
+    **"The genuine frame always dominates" is FALSE as an unqualified claim, and
+    this section used to make it.** It holds exactly while the sender is
+    monotonic. If the peer's epoch has REGRESSED (residual 3, #6711 — a backward
+    clock step larger than `bootEpochMaxSkew`), a replayed archived frame
+    carrying the peer's *earlier, higher* epoch raises the floor ABOVE the live
+    peer, and the live peer's genuine frames are then refused indefinitely.
+    Measured: 0/5 live frames admitted after one archived frame poisoned a fresh
+    floor, 0/5 after a sender restart at the same clock, and 0/5 again after a
+    receiver restart followed by one re-injected archived frame
+    (`TestArchivedEpochPoisonsAFreshFloor_6711`).
+
+    With a LIVE peer that is ~100 ms and the trade is clearly good. With a
+    **SILENT** peer the window stays open until the peer returns — and that is
+    precisely the scenario the durable floor was justified by, so this residual
+    is narrow only in the live-peer case. It is stated that way deliberately: the
+    trade was taken with the silent-peer cost known, not overlooked. Measured by
+    `TestReceiverRestartWindowIsOneHeartbeat_6169`.
+
+    In exchange, rollback recovery is a PSK rotation plus `systemctl restart
+    xpfd` rather than deleting a state file, there is no commit window between
+    accepting a frame and durably recording it, the receive path needs no
+    cross-process lock, and an in-range-but-wrong epoch cannot lock a peer out
+    across reboots. The rotation is not optional garnish — a replayed archived
+    epoch frame re-arms the latch against the empty post-restart state, so the
+    restart alone is not reliable recovery (residual 5).
+
+    An earlier revision persisted the FLOOR so the latch also survived a daemon
+    restart. Review priced that and it was removed: a peer-floor state file
+    turns a deliberate ROLLBACK into "delete the right file on the right node
+    and restart" — a procedure done under pressure at 3am — opens a crash
+    window between accepting a frame and committing the floor, needs
+    cross-process locking on the receive path, and lets an in-range-but-wrong
+    epoch lock a peer out across reboots.
+
+    **A durable LATCH is not the same object as a durable FLOOR, and the two
+    must be priced apart.** The narrowest durable latch is a PSK-scoped boolean
+    — `{key fingerprint, epochSeen}` — which persists no epoch, so an in-range
+    wrong floor still dies at the next restart, and which resets by
+    construction on a PSK rotation. Neither floor cost above applies to it. It
+    is still declined, on its own costs: the durable write has to land BEFORE
+    the frame is accepted (a crash in between leaves the latch clear across the
+    reboot, which is exactly the state a replay wants), so it puts storage on
+    the control-channel receive path with no good failure policy — fail-open
+    buys nothing over today, fail-closed lets a disk fault refuse a healthy
+    peer; it needs the same cross-process lock for the same `SO_REUSEPORT`
+    reason; and it makes the NO-ATTACKER rollback strictly worse, since a
+    restart would no longer clear the latch and every deliberate downgrade
+    would require a PSK rotation across both nodes.
+
+    **The rotation does NOT retire captures made after it, and an earlier
+    revision of this section claimed it did.** A PSK rotation retires everything
+    an attacker recorded BEFORE it; a frame recorded AFTER it, under the current
+    key, still verifies. Measured: rotate K1→K2, let the peer arm the latch
+    under K2, roll it back under K2 to a build that signs but emits no epoch,
+    record the frames this receiver refuses, then let the peer go silent and
+    restart this daemon — **5/5 of those post-rotation captures are admitted**
+    against the empty state, and a durable K2-scoped latch would have refused
+    them (`TestRotationDoesNotRetirePostRotationCaptures_6669`). The durable
+    latch is still declined, but on its own merits:
+
+    - **Where it matters most, its benefit and its worst cost are the same
+      configuration.** A signed epoch-less frame under the current key can only
+      exist if the peer held that key while running a pre-#6169 build (ALWAYS-
+      EMIT means a #6169+ build always carries an epoch) — rollback, replacement
+      under the same identity and key, or a partial upgrade. While the peer is
+      still on that build a durable latch refuses the captures *and the live
+      peer*: that is the no-attacker-rollback cost above, not a separate gain.
+
+    A second bullet used to read **"where the live peer is healthy again, it
+    shuts one door with another open beside it"** — the latch can only have
+    armed under this key because an epoch-BEARING frame was accepted under it,
+    so an on-link attacker holds one of those too, and against empty
+    post-restart state an archived epoch-bearing frame is admitted whatever the
+    latch says (residual 5). **That argument is wrong**, because the two doors
+    cost the attacker different things. Measured against a restarted receiver:
+    65 captured epoch-BEARING incarnations admit 325/325 on one ascending pass
+    and 0/1625 across five further rounds (the floor climbs with them and the
+    per-session watermark closes the rest — the set is spent), while 65
+    epoch-LESS incarnations captured under the CURRENT key admit 1625/1625 and
+    keep going, because nothing orders them and FIFO eviction hands back a
+    never-seen session every round. That is indefinitely sustained forged
+    liveness against a silent peer, and a durable PSK-scoped latch refuses all
+    of it.
+
+    So the benefit is real and is larger than "captures taken strictly inside a
+    rollback": it is every epoch-less capture taken under the current key. It is
+    **still declined**, on its own costs — a durable write on the accept path
+    with no good failure policy, cross-process locking there, and a strictly
+    heavier procedure for every no-attacker rollback — and the residual is
+    **accepted**, not closed. The exposure is bounded by the rollback (no
+    rollback under the current key, no epoch-less captures to replay) and is
+    metered rather than silent (`Heartbeats without epoch:`). Reconsider the
+    trade if a rollback under the current key ever becomes routine rather than
+    an incident action.
+
+    Rollback recovery is a rotation followed by `systemctl restart xpfd`, both
+    operations operators already perform, rather than a hand-edit of state; the
+    rotation carries real weight because without it the restart is defeatable by
+    one replayed archived frame (residual 5).
+  - **ALWAYS-EMIT, and why this mechanism costs no HA availability.** The
+    epoch is published SYNCHRONOUSLY from the wall clock with **no file access
+    at all**, so every frame carries one from the very first send. Persistence
+    is a REFINEMENT that runs on a worker and only ever RAISES the value; its
+    single job is surviving a backward clock step.
+
+    This ordering is load-bearing, not tidiness. The latch means a peer REJECTS
+    epoch-less frames from a node that has proved it emits them — so if a
+    storage fault could stop this node emitting one, the latch would convert a
+    disk stall into a **false peer-death**, an availability regression on an HA
+    path caused by the fix itself. With emission decoupled from I/O, a hung
+    disk, a blocking `flock` and a wedged `fsync` are all survivable, and the
+    invariant holds:
+
+    > a keyed heartbeat carries no epoch **iff** the peer runs a pre-#6169 build.
+
+    The residual here is the double fault — storage that never completes AND a
+    clock that stepped backwards. **That is the residual of THIS ordering
+    property, not of the epoch as a whole**, and an earlier revision let it
+    stand as if it were both. A single backward clock step larger than
+    `bootEpochMaxSkew` regresses the epoch on its own, with storage perfectly
+    healthy and the file intact — see residual 3 and #6711.
+  - **The state lock fails CLOSED.** Nothing in xpf enforces a single daemon
+    instance — no pidfile, and the gRPC listener sets `SO_REUSEPORT`
+    (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail on a port
+    collision the way it otherwise would. `withEpochFileLock` therefore
+    serializes the whole read-modify-write of the boot-epoch file across
+    processes. On lock failure it SKIPS the persist rather than running the
+    critical section unlocked: a lock whose failure path runs the work anyway
+    is not a lock. Skipping is free precisely because emission does not depend
+    on it — only backward-clock-step protection is lost.
+  - **Plausibility bound — the floor is a ONE-WAY DOOR.** A latched epoch
+    rejects everything below it forever, so a bogus far-future value is a
+    permanent lockout. Only an epoch below **year 2200**
+    (`epochPlausibleMax`) may be latched: a present-day value is ~0.25x that
+    bound, `MaxUint64` is ~2.5x it (year 2554). `MaxUint64` is unreachable
+    by ordinary operation but IS reachable through a corrupt or hand-edited
+    persist file — and `refineBootEpoch` chaining from such a value would emit
+    `MaxUint64` on one boot and then REGRESS on the next (`MaxUint64+1`
+    overflows, so the wall clock wins), permanently locking this node out of
+    a peer that had latched it. It therefore refuses to chain from an
+    implausible previous value and rewrites the file with a sane one. The
+    bound is deliberately ONE-SIDED and absolute: a low epoch is permissive
+    rather than locking, so bounding below would refuse an appliance with a
+    dead RTC; and an absolute bound means a receiver whose OWN clock is
+    wrong does not start refusing a healthy peer. An implausible epoch still
+    is refused outright rather than admitted-and-ignored: a frame the floor
+    cannot ORDER would be governed by the bounded ring alone, which is the
+    epoch-less bypass in miniature.
+  - **Forward bound — the recoverable half.** The absolute bound alone leaves a
+    single-fault path: a peer whose clock or persisted state runs far ahead, yet
+    still lands before 2200, would latch a floor its own corrected incarnations
+    can never climb back above. So an epoch may also be at most
+    `bootEpochMaxSkew` (one HOUR, 3.6e12 ns) ahead of the RECEIVER's wall
+    clock. The slack IS the worst-case lockout — a bad epoch inside the bound
+    is latched, and a repaired peer sits below that floor until its own
+    wall-clock seed climbs past it — so an hour is deliberate: a year of slack
+    bought nothing over it (the bound only has to exceed real inter-node skew,
+    milliseconds under NTP and minutes without it) and cost a year-long
+    lockout. Bounding the forward side
+    stops the **latch**, which is the unrecoverable half, so a peer that is
+    corrected is accepted again the moment it comes back into range.
+    There are exactly TWO places this forward bound is applied, and no
+    persistent peer-floor store is one of them (there is no such file): the
+    receiver's floor RAISE path, and `refineBootEpoch` validating the persisted
+    value it would chain from — where it now also validates the successor it
+    would actually publish, so a persisted value one below a bound cannot emit
+    an epoch exactly on or past it.
+
+    **Precondition on healing, stated exactly.** A persisted epoch written
+    under a bad clock heals *only when this node's own clock is credible at the
+    moment refinement loads the file*. Below `epochClockSaneFloor` (2020) the
+    forward bound is skipped entirely — deliberately, because a dead-RTC node
+    booting near 1970 cannot distinguish its own legitimate previous epoch from
+    a corrupt future one. Both sit implausibly far "ahead" of a 1970 clock — a
+    legitimate 2026 epoch by ~56 years, the corrupt year-2191 fixture this
+    branch tests with by ~222 — and the node has no reference that separates
+    them, because the forward bound that WOULD discriminate is exactly what is
+    skipped. The magnitudes differ; the indistinguishability does not. Rejecting
+    would
+    discard exactly the value persistence exists to carry across a backward
+    clock step. Only the absolute year-2200 band applies there. So on an
+    appliance whose RTC is dead and whose xpfd always starts before NTP, a
+    wrong-but-below-2200 value is chained from on every boot and never heals;
+    refinement runs once per `Manager`, so NTP correcting the clock later does
+    not re-validate it. See "Honest residuals" below.
+
+    The forward bound gates the RAISE path only (`epoch > highEpoch`), never
+    `epoch == highEpoch`. Re-testing an epoch that has ALREADY been accepted is
+    a different question from vetting a new one, and conflating them was a
+    defect: a backward wall-clock step beyond the skew made every subsequent
+    frame from a healthy, already-latched incarnation fail the bound and be
+    rejected BEFORE the monotonic `lastSeen` update, so the peer was declared
+    dead in ~500ms and the cluster went dual-master. The relaxation has a
+    price and it is worth naming: when the floor already sits beyond the bound,
+    an equal-epoch frame from the BOUND session reaches
+    `heartbeatAuthReplay.admit` and costs one ascending archive pass. That is
+    the whole cost — equality cannot move the floor, so the one-way door is
+    untouched, and the session binding above already refuses every other
+    session at that value.
+
+    The forward bound is applied ONLY when the receiver's own clock is itself
+    credible (`epochClockSaneFloor`, year 2020). An appliance with a dead RTC
+    boots near the Unix epoch and syncs NTP seconds later; during that window a
+    healthy peer's epoch is ~56 years "ahead", and a naive forward bound would
+    make it refuse its peer at exactly the moment cold-boot split-brain is most
+    likely — the hazard `heartbeatStartupGrace` already exists for. Below that
+    floor only the absolute bound applies, which is permissive, never locking.
+    The trade this makes is deliberate: a backward clock step LARGER than the
+    skew allowance regresses this node's epoch rather than chaining. It is NOT
+    true — an earlier revision of this paragraph said it — that such a value is
+    only reachable when this node's own clock was the wrong one at persist
+    time, and therefore that nothing is ever locked out. An incarnation running
+    at the RIGHT time persists `T` and its peer latches floor `T`; the next
+    incarnation starts at `T-2h` (still credible, above year 2020), rejects the
+    intact `T` for exceeding `now+1h`, publishes `T-2h`, and is refused by the
+    peer. Both branches of the trade are lockouts; the choice is between one
+    that is RECOVERABLE and one that never ends, because chaining from an
+    out-of-range value strands this node permanently above the range its peer
+    will ever accept. Recoverable does NOT mean "a restart on either node" — an
+    earlier revision of this paragraph said that, and it is false; see
+    "Recovery is narrower than a restart on either node" under residual 3 below
+    for what actually clears it. A recoverable lockout
+    beats an unrecoverable one — but the residual is real and is tracked as
+    #6711, not argued away. Pinned by
+    `TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169` and
+    the `value_beyond_the_forward_bound_is_not_chained_from` subtest.
+
+    `refineBootEpoch` takes its ONE clock sample AFTER `os.ReadFile` returns,
+    not before it. Sampling first let a stalled read straddle an NTP correction:
+    a dead-RTC boot captured a 1970 instant, the read completed after the clock
+    reached the present, and the value was then judged against the stale sample
+    — so the credibility gate skipped the forward bound on a node whose clock
+    was by then perfectly good, and a corrupt-but-below-2200 successor was
+    published. (`TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`.)
+  - **Cross-process locking on the boot-epoch file** (the only epoch state file
+    — there is no peer-floor file). Nothing in xpf enforces a single daemon
+    instance: there is no pidfile, and the gRPC listener sets `SO_REUSEPORT`
+    (`pkg/grpcapi/server.go`), so a second `xpfd` does NOT fail on a port
+    collision the way it otherwise would. Two overlapping incarnations could
+    therefore interleave read-modify-write, and an interleaved one can lose the
+    update the other just made. An advisory `flock` on a sidecar file
+    (`withEpochFileLock`) serializes the whole read-modify-write, not merely the
+    write.
+
+    **It does NOT order incarnations**, and this section used to say it did
+    ("publish epochs that are not strictly ordered, which is the one property
+    the whole mechanism rests on"). It serializes by lock ACQUISITION, and
+    nothing ties that to daemon start or to survivorship — emission deliberately
+    precedes the worker that takes the lock. Older incarnation A publishes `a`
+    and is delayed; newer B publishes `b > a`, locks first, persists `b`; A locks
+    second, reads `b` and raises *itself* to `b+1`. The peer then latches the
+    OLDER incarnation and refuses the newer, surviving one. It cannot be closed
+    with this file alone — refinement only matters when the persisted value
+    exceeds our seed, and "a predecessor wrote it after a backward clock step"
+    and "a concurrent newer incarnation wrote it" leave the identical file, so
+    separating them needs a lifetime-held liveness lock or a writer identity in
+    the file. What IS closed is the unrecoverable half: refinement is re-run on
+    every later heartbeat start (`Manager.refreshBootEpoch`), so the stranded
+    incarnation climbs back above the file at the next `StartHeartbeat` — a VRF
+    rebind or an HA comms restart — instead of staying below the peer's floor
+    for the life of the process. Between the mis-ordering and that next start
+    this node is refused; there is no periodic re-check. That recovery carries
+    two conditions — the raising epoch must have reached the FILE, and the
+    other incarnation must be gone — spelled out under residual 7.
+    (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
+    `TestBootEpochRefreshIsIdempotent_6669`,
+    `TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.)
+
+    **A post-rename durability failure is not a failed write.**
+    `fsatomic.WriteFileDurable` reports a directory-fsync failure that happened
+    AFTER the rename as a typed `*PostRenameSyncError` (#5185): the new content
+    is already VISIBLE — the next read, or a restart, sees it — and only its
+    durability across power loss is unknown. Refinement records its persist
+    watermark from that value rather than treating the pass as a no-op.
+    Treating it as a failed write left the watermark stale, so the next pass
+    could not recognise its own value, chained from it, and rewrote `epoch+1`
+    — ratcheting the file on EVERY pass for as long as the fsync kept failing.
+    (`TestPostRenameSyncKeepsTheWatermark_6669`.)
+
+    **It fails CLOSED — the write is SKIPPED, not run unlocked.** Proceeding
+    unlocked does not trade correctness for liveness; it trades a TRANSIENT
+    liveness risk for a DURABLE one. A raced read-modify-write can leave a lower
+    epoch in the file, that value is read back as `prev` on the next boot, and it
+    is exactly the term that matters after a backward clock step — the one case
+    persistence exists for. The epoch then produced can sit below the peer's
+    latched floor and be refused: the same false-peer-death, one restart later
+    and durable. Declining costs only backward-clock-step protection, and only
+    until the next resolve succeeds, because the wall-clock epoch is already
+    published and on the wire.
+  - **Layering with #4107's `peerAuthSeen` — two gates, neither redundant.**
+    `peerAuthSeen` latches "the peer proved it holds the PSK" and refuses
+    UNSIGNED frames; `epochSeen` latches "the peer proved it runs an
+    epoch-capable build" and refuses SIGNED-BUT-EPOCH-LESS ones. A replayed
+    pre-upgrade capture is genuinely signed (it came off a keyed cluster), so it
+    passes the first gate and is stopped only by the second — which is precisely
+    why the epoch latch was needed. An unsigned frame never reaches the epoch
+    gate: `heartbeatReceiver.admitFrame` — the single implementation of the
+    receive-side gate, called by `readLoop` for every datagram and by the epoch
+    fixtures instead of a restated copy — reads the epoch and calls
+    `admitAuthed` only when the MAC verified. The one path skipping BOTH is a
+    cluster with no key configured at all, where there is no MAC to verify and
+    the key-derived marker cannot exist; that is #6624's domain (an unkeyed
+    chassis cluster is refused at commit), not the epoch's.
+
+    **The wiring at both ends is bound by an end-to-end test, not by
+    inspection.** `TestBootEpochTraversesTheRealSendAndReceivePath_6169` drives
+    the real `heartbeatSender` through a real UDP socket into the real
+    `readLoop` goroutine and asserts the receiver latched the exact epoch the
+    sender published. Before it existed, passing `0` at the send site
+    (`marshalHeartbeatAuthEpoch`'s last argument, which produces a byte-identical
+    legacy frame) and severing the receiver's epoch read BOTH left `go test
+    ./pkg/cluster` fully green — two nodes could run this code, neither latch,
+    and the sustained replay stay open under passing CI.
+  - **Observability — FIVE counters, and the operator action differs per
+    counter.** Without them the residual is invisible: an operator who has
+    upgraded both nodes has no way to tell whether the cluster is still
+    accepting pre-upgrade-shaped frames, and the documentation would be the
+    only defence.
+
+    | `HeartbeatStats` field | rendered as | what a non-zero value means |
+    |---|---|---|
+    | `EpochlessAdmitted` | `Heartbeats without epoch:` | the exposure meter — frames admitted with no epoch at all |
+    | `EpochDowngradeRejected` | `Epoch downgrades rejected:` | the latch refused a peer that had previously signed epochs |
+    | `EpochSessionCollision` | `Epoch session collisions:` | too many sessions at one epoch value — usually a peer whose epoch store cannot advance |
+    | `EpochOutOfBandRejected` | `Epoch out-of-band rejected:` | the PEER emitted 0 or a post-2200 epoch. A conforming build cannot; check the peer's state file or its build |
+    | `EpochAheadOfClockRejected` | `Epoch ahead of our clock:` | a CLOCK fault, usually on a healthy peer — check NTP on both nodes, not for an attacker |
+
+    The last two exist because `heartbeatAuthDecision` cannot tell those arms
+    apart: it sees only `nonceFresh == false` and reports every epoch refusal as
+    `stale nonce (replay)`. Both arms used to be silent as well as mislabelled,
+    so a clock-skew lockout and a corrupt-epoch peer both read as an on-link
+    replay attack. `admitAuthed` now returns a reason for each and the receive
+    path prefers it over the generic wording. The third silent arm — an epoch
+    BELOW the floor — keeps the generic wording deliberately: that one really is
+    a replay of a retired incarnation.
+
+    All five are rendered on all three surfaces
+    (`FormatInformation`, `FormatStatistics`, `FormatControlPlaneStatistics`)
+    and bound there by `TestEveryEpochCounterIsRendered_6669`, which drives each
+    counter to a DISTINCT value so a transposed pair of render lines fails
+    rather than passing on a label match.
+
+    Every one is RENDERED in the `Control link statistics:` block on all three
+    surfaces that print it — `FormatInformation`, `FormatStatistics` and
+    `FormatControlPlaneStatistics` — under the labels in the table above. While the peer is not yet signing epochs the
+    count carries an inline note naming the action that closes it (rotate the
+    control-link PSK); once the latch has armed the note switches to marking the
+    count historical, since it is then a record of the migration rather than
+    live exposure. A counter populated on an internal struct but rendered
+    nowhere would be documentation, not observability, so the guard asserts the
+    RENDERED string on each surface rather than the struct field.
+
+    **Not yet a Prometheus series.** The collector (`pkg/api`, `xpfCollector`)
+    is dataplane-scoped and has no cluster/heartbeat surface at all, so this
+    would mean plumbing the cluster `Manager` into it — a new dependency edge,
+    not a one-line addition. Worth doing as its own change; the CLI block is
+    what an upgrading operator reads today.
+  - **Sender nonce is INCARNATION-scoped** (`Manager.heartbeatNonce`). It
+    used to be per-`heartbeatSender`, so every `StartHeartbeat` minted a
+    fresh session — and routine events mint them (VRF rebind, comms
+    restart). One long-lived daemon could therefore emit more than a ringful
+    of sessions under ONE epoch, which the floor cannot separate, leaving
+    the ring churnable within an incarnation. One incarnation now emits one
+    session with a counter monotonic across heartbeat restarts, so the floor
+    leaves an attacker at most one session and the ring rejects it on the
+    watermark. Nothing regresses on the receiver: a heartbeat restart keeps
+    the session and advances the counter (admitted); a daemon restart builds
+    a new `Manager` and draws a fresh session (admitted as never-seen).
+  - **What happens on a ROLLBACK — the one legitimate latch trigger.**
+    Because a storage fault no longer stops a node emitting an epoch, the
+    only way a healthy peer goes epochless after having emitted one is a
+    deliberate rollback to a pre-#6169 build (A/B image rollback, #1930).
+    That peer IS refused: this node declares it dead and takes over, and the
+    rolled-back node cannot see that it is being refused. This is a real,
+    deliberate trade — the same one #4107's sticky `peerAuthSeen` already
+    makes for the auth trailer. It is bounded and
+    operator-visible:
+      - a cluster that has never run an epoch-capable build is never latched,
+        so a plain rolling upgrade in either direction is unaffected;
+      - the rejection logs a rate-limited, actionable warning naming the
+        recovery below (`Manager.NoteEpochDowngradeHeartbeat`, once per 30s) —
+        there is no state file, so nothing to clear by hand. The generic
+        per-frame `heartbeat auth rejected` line is rate-limited on the same
+        30s interval (`heartbeatRejectWarnLimiter`) and reports
+        `suppressed_since_last`, so the bound does not hide the rate. Before
+        #6669 r18 only the actionable line was bounded and the generic one
+        fired per frame, so a 10/s epochless stream produced ~10 warnings a
+        second — the sentence promised a rate limit the noisy line did not
+        have;
+      - the archived-frame replay that re-arms the latch is ALSO admitted, so
+        it refreshes `lastSeen` and feeds `handlePeerHeartbeat`: a peer that is
+        DEAD looks alive for as long as the replay continues, and that liveness
+        feeds election. One frame per dead-peer interval sustains it. This is
+        NOT introduced by #6169 — master has no epoch gate at all, so the bare
+        replay ring admits the same frame after the same receiver restart, and
+        `TestHeartbeatRestartStillAcceptsGenuinePeer_5086` REQUIRES that (a
+        genuine peer reboot must be accepted). The epoch floor strictly
+        improves on master once armed and does not close the post-restart
+        window. The recovery below retires it by the same mechanism as the
+        latch half, because it is the same replay;
+      - **recovery, in this order:** rotate the control-link PSK on BOTH nodes,
+        *then* `systemctl restart xpfd` on the node that is refusing. The latch
+        is process-scoped, so the restart brings it back unlatched and it
+        accepts the rolled-back peer again. There is no state file to hand-edit
+        and no new CLI surface to learn. Rolling BOTH nodes back needs no
+        action beyond that on whichever node had latched.
+
+        **If you already did it in the wrong order, you are not stuck — restart
+        once more.** Restarting *before* rotating leaves the latch armed
+        THROUGH the rotation: the replay re-arms it after the restart, and the
+        subsequent key change cannot un-arm what is already set. Measured, one
+        rotate→restart pass recovers; restart→rotate needs a **second** restart
+        after the rotation. Nothing else is required, and no state is lost
+        either way.
+
+        **The restart alone is not reliable, and the order is the reason.**
+        A restart clears the floor, the latch and the ring together, and
+        arming the latch needs only an authenticated, orderable, ring-fresh
+        epoch frame — so ONE frame an attacker captured while the peer still
+        ran an epoch-capable build re-arms it against that empty state
+        (`highEpoch` is 0, so nothing is below the floor; an empty ring calls
+        its session never-seen). The rolled-back peer is refused again, and one
+        replay per restart sustains that indefinitely. Rotating the PSK first
+        makes every archived frame fail MAC verification, so it never reaches
+        the latch; the key is re-read per frame on both the send and receive
+        paths, so rotation itself needs no restart. This is pinned by
+        `TestArchivedEpochReplayReArmsLatchAfterRestart_6169` and stated at the
+        arming site in `admitAuthed`, which also records why a durable
+        latch and a freshness test were both rejected.
+  - **Honest residuals**, each measured rather than asserted.
+    1. **Receiver restart window — bounded by the peer's next genuine frame, not
+       by time.** ~100 ms with a LIVE peer; **open until the peer returns if it is
+       SILENT**, which is the case durability existed for. Measured: 1080/1080
+       epoch-less captures admitted inside the window, 0/120 after a genuine
+       frame lands; the attacker gets one full ascending pass (~60 frames across
+       12 retired incarnations). A replayed old epoch can set the floor low but
+       cannot sustain it **while the peer's own epoch is still climbing** — the
+       genuine frame then dominates. It does NOT dominate if the peer's epoch has
+       regressed (residual 3): there a replayed archived frame raises the floor
+       above the live peer and holds it out, across receiver restarts, at one
+       re-injection each.
+       (`TestReceiverRestartWindowIsOneHeartbeat_6169`,
+       `TestArchivedEpochPoisonsAFreshFloor_6711`.)
+    2. **In-bound clock skew latches a bounded lockout.** A peer epoch ahead of
+       us but INSIDE the skew allowance is latched, so a peer later repaired to
+       real time sits below that floor. Bounded twice: the slack IS the lockout
+       (one hour), which bounds how far a NEW incarnation of the peer has to
+       climb — **not** a window the RUNNING sender waits out. An earlier
+       revision of this list said the peer's seed "climbs past it unattended";
+       that was false. The rejected sender resolved its epoch once at boot and
+       caches it for the life of the process (`bootEpochOnce`), so waiting
+       changes nothing it emits: recovery is a **sender restart** on the peer,
+       or a receiver restart, never elapsed time alone
+       (`TestRunningSenderDoesNotRecoverByWaiting_6669`). The floor is in
+       memory, so `systemctl restart xpfd` on the refusing node clears it
+       immediately — subject to residual 5, since a replayed
+       archived frame can re-raise a cleared floor just as it can re-arm a
+       cleared latch. With a durable floor this needed deleting a state file,
+       which is what made it a MAJOR.
+       (`TestInBoundFarFutureEpochLockoutIsBounded_6169`.)
+    3. **Sender epoch regression — and it is NOT only a double fault.** Losing
+       the persisted epoch AND stepping the clock back below the last emitted
+       value in the same reboot regresses the sender's epoch and the peer
+       refuses it, with the same restart recovery as a rollback. This
+       paragraph used to end "both terms of the seed must fail together", and
+       that margin does not hold: a SINGLE backward step larger than
+       `bootEpochMaxSkew` (one hour) does it on its own with the persisted file
+       perfectly intact, because `refineBootEpoch` declines to chain from a
+       value more than an hour ahead of `now`. The peer had latched the earlier,
+       correct epoch, so it refuses the restarted node; a later NTP correction
+       does NOT repair it, since the epoch is published once per incarnation and
+       the file has by then been overwritten with the lower value.
+
+       **Recovery is narrower than "a restart on either node".** Restarting the
+       SENDER does not help *while its published reading is still below the
+       floor* — the file now holds the *lower* value, so the next incarnation
+       re-publishes from the same bad clock (measured: still below the floor).
+       The operative condition is the reading, not the clock: a clock that stays
+       two hours slow still reads past the floor two real hours later, and a
+       restart then publishes a value STRICTLY ABOVE it, which the peer admits
+       on the RAISE path and which rebinds the floor to that incarnation.
+       The raise path is the one to rely on, and not because equality is shut:
+       a frame landing exactly ON the floor is admitted while one of the
+       value's `heartbeatEpochSessionsPerEpoch` slots is free, so that door is
+       real but finite and does not refill. The raise is the wider of the two
+       (a nanosecond past the floor, rather than landing on one exact value)
+       and cannot be exhausted
+       (`TestPoisonedFloorStillRecoversByRaise_6669`). Restarting the RECEIVER does
+       clear the floor, but an attacker holding one archived frame from the
+       pre-regression incarnation re-raises it immediately, at one re-injection
+       per restart — the same shape as residual 5, and it means the floor can be
+       poisoned by a capture rather than only by the sender's own regression.
+       Reliable recovery is fixing the clock (then restarting the sender), or a
+       PSK rotation before the receiver restart. Tracked as **#6711** — a
+       behavioural fix there touches persistence semantics and is deliberately
+       out of scope here. (`TestArchivedEpochPoisonsAFreshFloor_6711`.)
+    4. **PSK rotation** changes the key-derived marker; the in-memory floor and
+       latch are unaffected and stay valid, since a floor is a per-peer counter
+       rather than key material.
+    5. **A restart does not recover from a rollback while an archived epoch
+       frame is being replayed.** Restarting clears the floor, the latch and the
+       ring together, and arming needs only an authenticated, orderable,
+       ring-fresh epoch frame — so ONE frame captured while the peer still ran
+       an epoch-capable build re-arms the latch against that empty state and the
+       rolled-back peer is refused again, indefinitely, at one replay per
+       restart. The same shape re-raises the floor in residual 2. Recovery is
+       PSK rotation on both nodes FIRST, then the restart, which is what the
+       rejection warning now says. Scope: a peer that has NEVER emitted an epoch
+       cannot be falsely armed this way — there is nothing to capture — so this
+       bites on rollback, replacement under the same identity and key, or a
+       partial upgrade. Not closed in code: a durable FLOOR re-creates the
+       peer-floor file this design deliberately removed; a durable PSK-scoped
+       LATCH avoids that but pays a durable write on the accept path, a
+       cross-process lock there, and a heavier no-attacker rollback. It is
+       **not** declined as redundant: a rotation retires captures taken *before*
+       it and nothing else, and a durable latch refuses the epoch-less captures
+       taken under the CURRENT key — the ones that sustain forged liveness
+       indefinitely (1625/1625 admitted after a restart, against 0/1625 for a
+       spent epoch-bearing set). The pricing is above; and
+       a freshness test needs a challenge-response or timestamp the wire format
+       does not carry (a legitimately long-lived peer's epoch is arbitrarily
+       old, so no recency test separates it from an archived one).
+       (`TestArchivedEpochReplayReArmsLatchAfterRestart_6169`,
+       `TestRollbackRecoveryOrderingIsRotateThenRestart_6169`.)
+    6. **A bad persisted epoch heals only if the local clock is credible when
+       refinement loads it.** Below `epochClockSaneFloor` the forward bound is
+       skipped, so a wrong-but-below-2200 persisted value is chained from rather
+       than ignored. On an appliance with a dead RTC whose `xpfd` starts before
+       time sync, the FIRST pass of every boot is made against an uncredible
+       clock, and a correctly clocked peer then refuses this node's epoch on its
+       raise path — asymmetric visibility, not mutual isolation. Refinement is
+       re-run at each later heartbeat start (`Manager.refreshBootEpoch`), which
+       RE-VALIDATES the file but does **not** heal it — an earlier revision of
+       this paragraph said it did, and that was wrong. Refinement persists the
+       published epoch, which only ever rises, so once the first pass has chained
+       from the corrupt value every later pass writes the same raised value back.
+       Nothing lowers the file, and lowering is what healing would mean. On the
+       dead-RTC box this residual describes, a restart does not clear it either:
+       the first pass of every boot chains again and the value ratchets. No
+       complete close exists:
+       under a dead RTC a legitimate previous epoch and a corrupt future one are
+       indistinguishable (nothing on the node is a trustworthy time reference),
+       and healing after the fact would mean LOWERING a published epoch
+       mid-incarnation, the one direction the design refuses. A PARTIAL
+       narrowing does exist and was declined rather than missed — lowering the
+       arbitrary year-2200 horizon would reject a year-2191 value while still
+       carrying present-day ones — because the horizon is a hard cliff, not
+       spare room: a value at or past it is rejected outright on EVERY frame, so
+       lowering it makes a forward clock fault that much more likely to produce
+       mutual refusal. That trades a fault whose worst case is asymmetric
+       visibility for one whose worst case is dual-master. Reasoned at
+       `epochWithinForwardBound`. Operational close: a working RTC, or ordering
+       `xpfd` after time synchronization.
+       (`TestPersistedEpochHealsOnlyWhenClockCredible_6169`.)
+       Refinement's clock sample is taken AFTER the state read returns, so a
+       stalled read straddling an NTP correction cannot judge the file against a
+       clock that no longer exists
+       (`TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`).
+    7. **The state lock orders lock acquisition, not incarnations.** Two
+       overlapping `xpfd` instances (no pidfile, `SO_REUSEPORT`) can publish in
+       one order and reach `withEpochFileLock` in the other: the OLDER one locks
+       second, reads the newer one's persisted value, and raises *itself* above
+       it. The peer then latches the older incarnation and refuses the newer,
+       surviving one. It cannot be closed with this file alone — a predecessor's
+       value after a backward clock step and a concurrent newer incarnation's
+       value leave the identical file — so a complete fix needs a lifetime-held
+       liveness lock, a writer identity in the file, or single-instance
+       enforcement for `xpfd`. What IS closed is the unrecoverable half:
+       refinement re-runs on every later heartbeat start
+       (`Manager.refreshBootEpoch`), so the stranded incarnation climbs back
+       above the file at the next `StartHeartbeat` instead of staying below the
+       floor for the life of the process. Until that start it is refused, and
+       there is no periodic re-check. Tracked as **#6724**.
+       (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
+       `TestBootEpochRefreshIsIdempotent_6669`.)
+
+       **That recovery carries two conditions**, and they do NOT need the same
+       missing state — an earlier revision of this paragraph said both were the
+       same state as the mis-ordering itself. It re-reads the FILE, so it
+       recovers only what the file expresses. First, **the floor-raising epoch
+       must have reached the file**: refinement publishes a raise before
+       persisting it (deliberately — a node that has read a predecessor's higher
+       value must still order itself above it even when it cannot write), so the
+       other incarnation can EMIT `b+1` while the file still reads `b`. This
+       node then has no signal at all — it wrote `b`, the file says `b` — and
+       every restart returns at the idempotence shortcut, leaving it below the
+       peer's floor for its whole process lifetime. Second, **the other
+       incarnation must be gone**: while both run, each pass raises above the
+       other and rewrites the file, so they leapfrog indefinitely, alternately
+       stranding each other while the file ratchets.
+       (`TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.)
+
+       Only the SECOND needs a writer identity in the file or a lifetime-held
+       liveness lock, which is where the leapfrog lives. The first needs nothing
+       but a **retry trigger**: on a retry A's published value is already `b+1`,
+       so `next := prev+1` does not exceed it, nothing ratchets, and the
+       `WriteFileDurable` is simply re-attempted — once `b+1` lands, B's next
+       refresh reads it and raises to `b+2`. What is missing is only something
+       to schedule that retry, which is the "no periodic re-check" half of
+       **#6724** and a materially smaller change than a writer identity.
+
+       A refine requested while one is in flight used to be DROPPED, which lost
+       exactly this recovery request — the in-flight worker's locked read can
+       already be complete, so an update landing behind it is invisible to that
+       pass. It is now COALESCED into one follow-up pass, which bounds the extra
+       work at one outstanding request rather than an unbounded backlog of
+       fsync-ing workers. (`TestOverlappingRefineRequestIsCoalesced_6669`,
+       `TestCoalescingDoesNotRatchetOnAHealthyNode_6669`.)
+
+       **The in-flight flag and the pending bit are ONE WORD**
+       (`Manager.bootEpochRefine`, claimed and released by CAS on the pair) and
+       that is a correctness requirement rather than packing. As two separate
+       atomics they could be observed torn: a requester that read "a worker is
+       in flight", lost the race while that worker ran all the way out, and only
+       then stored the pending bit published it against a worker that no longer
+       existed, and nothing in production observes a stranded bit — the operator
+       would have seen only a node still below its peer's floor, recovering at
+       some later heartbeat start that nothing bounds. On one word the publish is
+       conditional on the observation still holding, so a requester whose CAS
+       fails takes the idle slot and runs the pass itself. The window was a few
+       instructions wide and unreachable by hammering (3000 rounds x 4 concurrent
+       `refreshBootEpoch`), so it is driven through two seams.
+       (`TestLateRefineRequestIsReclaimed_6669` for a request landing before the
+       release, `TestLateRefineRequestCannotBeStranded_6669` for one landing
+       after.)
+
+       **`Manager.Stop` joins the worker, with a bound.** The worker may park
+       indefinitely in a flock or an fsync, so it outliving `Stop` needs no race
+       — one sequential shutdown over a wedged store reaches it — and it would
+       then still be storing to `m.bootEpoch` and writing the state file on a
+       torn-down manager. `Stop` refuses new workers and waits
+       `bootEpochStopJoinBudget` (2 s) for the one already running; the wait is
+       bounded because the shutdown path has just sent VRRP priority-0 and must
+       not block on a dead disk. A timeout is logged, and leaves behind atomic
+       stores and **up to two** `fsatomic` writes: the wedged pass itself, plus
+       one coalesced follow-up if a request set the pending bit while it was
+       stuck, which the worker serves once it unblocks.
+
+       **The join spawns nothing, and takes no lock.** Writing it as
+       `go func() { wg.Wait(); close(done) }()` selected against a timer returns
+       only the CALLER — nothing cancels a `WaitGroup.Wait` — so each timed-out
+       join left one goroutine parked for as long as the store stayed wedged.
+       That is easy to wave through for a single terminal `Stop` and wrong
+       across repeated calls, and there are several (`Stop` is public; the tests
+       join on every epoch case). The worker publishes its own exit handle
+       (`Manager.bootEpochWorker`, an `atomic.Pointer`), so a join is a select
+       on a channel somebody else closes and a timeout costs nothing.
+       (`TestTimedOutJoinLeavesNoWaiterBehind_6669`.)
+
+       The handle is PUBLISHED under `bootEpochRefineMu`, which is what keeps
+       `Stop`'s refuse-then-join ordering airtight, but it is LOADED and CLEARED
+       without it — and that is a correctness requirement, not tidiness.
+       `bootEpochRefineMu` is held across `claimBootEpochRefine`, hence across
+       its `epochRefineAfterLostClaim` seam, where a requester can park
+       indefinitely; the join and the worker's own exit are precisely the two
+       operations that must make progress regardless. Guarding the handle with
+       that mutex deadlocked all three against each other, and a bounded join
+       that can block forever is not a bounded join.
+       (`TestJoinDoesNotBlockBehindAParkedRequester_6669`.)
+
+       It can also still hold a lock a caller waits on, which an earlier
+       revision of this section denied: `withEpochFileLock` holds the state
+       file's advisory lock across the whole read-modify-write, so another
+       INCARNATION's refine blocks behind a wedged worker until it unwedges.
+       Nothing in *this* process does — the refine slot is a CAS word, not a
+       lock.
+
+       **The timeout path deliberately does not release that flock.** The
+       descriptor is a local on the wedged worker's stack, and dropping the lock
+       while that worker is still mid-write would let another incarnation
+       interleave with a write in progress — trading a delay for the torn update
+       the lock exists to prevent. It does not need releasing: an flock dies
+       with the open file description, so the kernel drops it when the process
+       exits, SIGKILL included. Under the documented restart recovery (systemd
+       `Type=simple`, `TimeoutStopSec=20`) the old unit is reaped before the new
+       one starts, so a **restart never contends for this lock**. What can
+       contend is two concurrently running incarnations — the SO_REUSEPORT
+       overlap this lock was written for — and there the blocked party is the
+       other incarnation's refine worker, whose failure is already survivable:
+       it declines the persist and keeps the wall-clock epoch already on the
+       wire.
+
+  - **`Stop` is not idempotent by construction, only by call topology.** It has
+    no `sync.Once` and no early return; a repeat call re-executes the body and
+    survives only because it captures `hbSender`/`hbReceiver` under `mu` and
+    nils them there, while `Monitor.Stop` is independently idempotent through
+    the same idiom. Both `heartbeatSender.stop` and `heartbeatReceiver.stop`
+    open with a bare `close(stopCh)`, so a second call without that capture
+    panics. The manager is built once per process and stopped once, so the
+    repeat is unreachable today — but by topology, not by design, which is why
+    `TestSecondStopIsANoOp_6669` asserts it.
+
+       **Three rules for tests in this area**, each of which was a real
+       cross-test failure before it was a rule:
+
+       1. `bootEpochReady` **is not a drain.** The worker closes it from inside
+          its loop and then still calls `releaseBootEpochRefine`, which reads a
+          package-var seam, and may run further coalesced passes. Use
+          `awaitFirstRefine`, which waits for the channel AND drains.
+       2. **Unpark every seam on the failure path**, from a `t.Cleanup` rather
+          than the end of the body. `t.Fatalf` runs `runtime.Goexit` and skips
+          the rest of the body, so an assertion that fires while a requester is
+          parked inside `claimBootEpochRefine` leaves that goroutine holding
+          `bootEpochRefineMu` for the life of the process — and every later test
+          that starts or stops a worker then blocks on it, turning one
+          assertion into a package-wide `panic: test timed out` naming an
+          unrelated test.
+       3. **Join a requester goroutine; do not poll the word for it.**
+          `waitBootEpochIdle` reads `bootEpochRefine`, and that word reads 0 in
+          the window after a worker releases the slot and before an unparked
+          requester re-claims it, so a test can return while the requester is
+          still inside `startBootEpochRefine` reading `bootEpochPath`.
+          `keyedEpochManager`'s cleanup join is no backstop: it joins a
+          REGISTERED worker, and a requester that has not claimed yet is not
+          one.
+  - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
+    Epochs are compared per-PEER, never between the two nodes, so two chassis
+    cloned from one image may hold identical persisted boot epochs harmlessly;
+    and a baked-in value can only ever raise a node's starting epoch, which the
+    never-regress rule already permits.
 - **The tracker's LIFETIME is the process, not the heartbeat (#5086).**
   The watermarks and the sticky `peerAuthSeen` flag live in
   `Manager.hbAuth` (`heartbeatAuthState`); a `heartbeatReceiver` holds a
@@ -291,12 +1383,13 @@ peer liveness (`lastSeen`) or drive election.
   restart window (a VRF-rebind restart retries the bind for up to ~5 s)
   and an unsigned fabric RPC was accepted from a peer already known to
   hold the key. It now reads the process-lifetime state.
-  **Residual, unchanged by #5086:** the state is in memory, so a full
-  daemon restart or reboot still starts with an empty tracker and a
-  captured run replays once against the restarted node. Closing that
-  needs the same signed boot-epoch as the ≥65-recording churn — both are
-  #6169. #5086 removes the vectors an attacker can reach without the
-  survivor restarting its whole daemon.
+  **Narrowed, not closed, by #6169:** the session ring, the boot-epoch floor
+  and the downgrade latch are all process state, so a full daemon restart
+  starts with all three empty. What #6169 changes is how fast that repairs:
+  the peer's next epoch-bearing frame re-establishes the floor above every
+  captured older epoch and re-arms the latch, so the exposure is bounded by
+  the peer speaking rather than by the ring alone. With a SILENT peer the
+  window stays open until it returns — see the boot-epoch residuals above.
 - **Dual-accept (rolling upgrade), `heartbeatAuthDecision`.** Mirrors
   the #4126 VRRP-checksum dual-accept migration:
   - No local key → accept everything (this node cannot verify; may be
@@ -394,26 +1487,37 @@ connection is authenticated, then seals every subsequent frame.
   Chose a signed per-frame trailer over a bare sequence because a sequence
   without a MAC is forgeable (an on-path attacker just uses seq+1); the MAC
   cost is negligible at realistic session-sync rates.
-- **Dual-accept (rolling upgrade).** A node with no key never handshakes
-  and is byte-for-byte a legacy peer; a keyed node that sees a
-  legacy/unkeyed peer (no HELLO, or `keyed=0`) negotiates
-  UNAUTHENTICATED — the stream stays legacy-compatible (no brick). The
-  legacy peer's first real frame, consumed by the handshake read, is
-  preserved as a `pendingFrame` and processed before the receive loop
-  starts. Enforcement engages only once BOTH nodes are keyed and signing —
-  and, for an ALREADY-ESTABLISHED connection, only after it is
-  re-established, because the handshake result is fixed at connect and
-  committing a key does not restart cluster comms (#6628; see "Operating
-  the control-link PSK" below).
-- **Downgrade-guard (`syncAuthDecision`, mirrors `heartbeatAuthDecision`).**
-  Once the peer has authenticated on the sync channel (sticky
-  `syncAuthedEver`) OR the heartbeat channel (`HeartbeatPeerAuthSeen`, arms
-  within ~200ms of a keyed peer coming up), a later UNAUTHENTICATED
-  connection from it is REJECTED — a downgrade to cleartext once both nodes
-  are known-keyed is an attack. Consulting the heartbeat closes the window
-  after a keyed node restarts before the first sync auth.
+- **Dual-accept, UNKEYED SIDE ONLY (as of #5078).** A node with no key never
+  handshakes and is byte-for-byte a legacy peer, so an unkeyed node still
+  accepts anything. A KEYED node does **not** dual-accept: it rejects a
+  legacy/unkeyed peer (no HELLO, or `keyed=0`) outright, with no
+  first-contact grace and no migration window — see "Session-sync
+  fail-closed authentication (#5078)" above, which supersedes the
+  paragraph this bullet used to contain. The `pendingFrame` mechanism that
+  carried a legacy peer's first frame out of the handshake is **deleted**,
+  not merely bypassed: with no accepting arm left it was unreachable, and
+  it executed that frame BEFORE the connection was admitted. Enforcement
+  still engages only once BOTH nodes are keyed and signing — and, for an
+  ALREADY-ESTABLISHED connection, only after it is re-established, because
+  the handshake result is fixed at connect and committing a key does not
+  restart cluster comms (#6628, pinned by
+  `TestAuthKeyChangeDoesNotRestartClusterComms_5078`; see "Operating the
+  control-link PSK" below).
+- **No sync-side downgrade-guard (removed in #5078).** There used to be one
+  here: once the peer had authenticated on the sync channel (sticky
+  `syncAuthedEver`) or the heartbeat channel, a later UNAUTHENTICATED
+  connection was rejected. A guard of that shape only matters where an
+  unkeyed peer would otherwise be ADMITTED, and on a keyed node none ever
+  is, so it became unreachable — `syncPeerAuthSeen` ended with zero callers
+  and `syncAuthedEver` write-only — and was deleted along with the
+  `HeartbeatPeerAuthSeen()` requirement on `SyncAuthProvider`. The **#4107
+  heartbeat downgrade-guard is separate state** (`heartbeatAuthDecision`
+  over `heartbeatAuthState.peerAuthenticated`) and is unchanged, as is the
+  #4357 fabric guard that arms off it via `Manager.HeartbeatPeerAuthSeen`
+  — that method is still exported and still consumed, just no longer by
+  this interface.
 - **Wiring.** `SessionSync.SetAuthProvider(*Manager)` (`daemon_ha_sync.go`)
-  supplies both `ControlLinkAuthKey()` and `HeartbeatPeerAuthSeen()`. No new
+  supplies `ControlLinkAuthKey()`. No new
   config leaf — the same `set chassis cluster authentication-key` secret
   authenticates the heartbeat (PR-A), the fabric gRPC (PR-B/#4357), and now
   the session-sync stream. LOW severity (matches Juniper's own
@@ -573,7 +1677,11 @@ them unchanged — so neither is an example of this order; you have to
 remove the line from your own config first. On a new build or during a
 maintenance window you were taking anyway, this costs nothing.
 
-*On a LIVE pair the delete cannot be done without the sync undoing it.*
+*On a LIVE pair whose secondary gate is ARMED, the delete cannot be done
+without the sync undoing it.* (Everything in this subsection assumes an armed
+gate; on the row-2 unarmed node the second delete needs no promotion at all.
+That is the #6890 hole, not a supported route — see the Recovery section. This
+subsection does not restate the caveat again.)
 `configuration-synchronize` is committed from the RG0 primary. Delete it
 there and the SECONDARY still has it enabled — so the moment that secondary
 is promoted, reconciliation (`daemon_ha.go:444`) sees sync enabled in its
@@ -582,7 +1690,7 @@ former primary (`daemon_ha_sync.go:462`), restoring the very line you just
 deleted. You cannot simply "delete on both nodes": the second delete
 requires a promotion, and the promotion re-adds the first.
 
-There is ONE safe order on a live pair, and it is a controlled
+There is one safe order you can RELY on for a live pair, and it is a controlled
 single-node outage — not a two-command sequence, and NOT a link cut:
 
 ```
@@ -636,15 +1744,25 @@ A physical cut also races disconnect detection, so a promotion issued
 immediately after it can still find the session established.
 
 Once BOTH nodes have sync disabled, ongoing config management is manual and
-paired: only the RG0 primary is writable, so every change is a controlled
-RG0 promotion, an edit, verification on both stores, and a failback. That
+paired: treat only the RG0 primary as writable (that is the intent; see the
+#6890 caveat above for where the gate is not actually armed), so every change is
+a controlled RG0 promotion, an edit, verification on both stores, and a
+failback. That
 cost is the reason #6629 (redaction or transport encryption for the
 config-sync payload) is the real fix, and why this is documented as a
 constraint rather than recommended practice.
 
 ### Rolling it onto a live unkeyed cluster
 
-Dual-accept makes the forward direction non-disruptive:
+**STALE — dual-accept was removed by #5078; the sequence below no longer works
+as written.** It is kept for the shape of the problem, not as a procedure. Step 2
+asks the operator to commit the key on the *other* node: on an RG0 secondary
+whose read-only gate is armed that returns `ErrClusterReadOnly`, and if sync
+drops before step 2 the keyed side rejects the unkeyed reconnect outright. See
+the "Recovery" discussion above for what is actually available and under which
+preconditions. Rewriting this section is tracked as **#6881**.
+
+Dual-accept made the forward direction non-disruptive:
 
 1. Set the key on one node and commit. It now signs; the unkeyed peer has no
    key, so it accepts everything, and the keyed node has not armed
@@ -705,6 +1823,77 @@ Procedure:
    possible — that gap is the dual-master window.
 3. Restart `xpfd` on both nodes (per #6628 above, and to clear the sticky
    `peerAuthSeen`).
+
+> [!IMPORTANT]
+> **Rotate the PSK after upgrading both nodes to a #6169-capable build.** This
+> is a REQUIRED post-upgrade step, not a footnote. Every capture an on-link
+> sniffer took before the upgrade was signed with the OLD key, so rotation is
+> the only thing that retires an attacker's existing archive — no code change
+> can retroactively invalidate frames they already hold. The mechanism is
+> `verifyHeartbeatMAC(frame, key)`, which uses the LIVE key: after a rotation
+> every pre-upgrade capture fails `macOK` and is discarded before it reaches
+> any epoch logic at all.
+>
+> **This step is what makes the accepted restart residual acceptable.** The
+> downgrade latch (`epochSeen`) is process-scoped, so a full daemon restart on
+> the surviving node clears it. But do NOT read that as "while the genuine peer
+> is absent nothing re-arms it" — an earlier revision of this paragraph said
+> exactly that and it is false, as residual 5 below records. A single ARCHIVED
+> epoch-bearing frame, captured while the peer still ran an epoch-capable build,
+> re-arms the latch on its own: after the restart `highEpoch` is 0, so the replay
+> passes the absolute band, the forward bound and the empty ring, and arms
+> `epochSeen`. One replay per restart holds the rolled-back peer out
+> indefinitely.
+>
+> That is precisely why rotation comes FIRST. Rotation invalidates the archive,
+> so there is nothing left to replay into the window. Skipping it leaves the
+> residual live, and restarting without rotating leaves the latch armed *through*
+> a later rotation — costing a second restart. The residual was not priced as
+> "narrow" on the assumption that nobody would skip the rotation.
+>
+> **How to tell whether you are still exposed:** `show chassis cluster
+> information` / `statistics` print `Heartbeats without epoch:` in the
+> `Control link statistics:` block. If it is non-zero and still climbing after
+> both nodes are upgraded, this node is still accepting epoch-less frames —
+> either a node is genuinely on an older build, or someone is replaying
+> captures — and the line carries an inline note saying so. Once an accepted
+> epoch-bearing frame arms the latch, the inline note flips to "downgrade latch
+> armed; count is historical" and the epoch-less count stops climbing.
+>
+> That note reports the LATCH, not current enforcement, and the wording is
+> deliberate. `heartbeatAuthDecision` dual-accepts everything when no local key
+> is configured, and `UpdateConfig` clears the live key without resetting
+> `hbAuth` — so a cluster that added the key under `commit confirmed`, armed the
+> latch, then let the confirmation time out back to an unkeyed config is left
+> with the latch armed and epoch-less frames admitted anyway. An armed latch
+> therefore means "this node has seen the peer emit an epoch", not "this node is
+> refusing epoch-less frames right now".
+>
+> **The latch only enforces while a PSK is configured, so read it together with
+> the `Authentication:` line** in `show chassis cluster control-plane
+> statistics`. `engaged (peer authenticated; unauthenticated frames rejected)`
+> means the latch is being applied; `dual-accept (no control-link key
+> configured)` means it is not, whatever the note says.
+>
+> `Epoch downgrades rejected:` is a SEPARATE signal and does **not** start
+> counting when the latch arms — it stays at 0 until some later epoch-less
+> frame actually arrives and is refused, which on a healthy upgraded cluster
+> may never happen. Read it as "something is still sending epoch-less frames
+> and being turned away" (a peer left behind, a rollback, or a replay), not as
+> a confirmation that the latch is armed. The inline note is what reports the
+> latch.
+
+Rotation is also the **anti-replay capture-invalidation** step. Every capture
+an on-link sniffer took BEFORE the rotation was signed under the old key, so
+after a rotation none of it verifies. It does **not** retire a capture taken
+after the rotation: that frame was signed with the key still in force and still
+verifies (`TestRotationDoesNotRetirePostRotationCaptures_6669`). Rotation is the
+recovery step for an existing archive, not a prophylactic against a new one.
+The boot-epoch marker is key-derived (`HMAC(PSK, "xpf-ha-boot-epoch-v1")[:8]`),
+so it changes with the key automatically — no separate rollout step. The
+restart in step 3 also clears each node's in-memory epoch floor and latch; both
+re-arm from the peer's next epoch-bearing heartbeat, within one heartbeat
+interval.
 
 Do **not** try to "return to dual-accept" by clearing the key first: an
 unkeyed `chassis cluster` is exactly what the commit gate rejects, so that
@@ -1155,7 +2344,25 @@ outside the monitor loop:
   sender→receiver #3931 namespace, so the comparison is meaningful across nodes.
   `epoch == 0` (legacy peer / local-origin) disables the check (rolling-upgrade
   safe); the reconnect `resetRecvGen` zeroes `lastAppliedConfigGen` so a
-  rebooted-peer bulk re-prime is never falsely rejected. **The guard is
+  rebooted-peer bulk re-prime is never falsely rejected. **That zeroing is
+  serialized against every advance of the mark by `configGenMu` (#5084)** — the
+  advance is a load/compare/store and the clear runs on a different goroutine
+  (a receive loop, versus `configApplyLoop` for the applied mark and the *other*
+  receive loop for the received mark), so a clear could land inside an advance
+  and be lost, leaving a pre-reboot generation that refuses every generation the
+  reconnected peer can produce. Writers of the three config-generation marks:
+
+  | writer | mark(s) | goroutine | synchronisation |
+  |---|---|---|---|
+  | `recordAppliedConfigGen` | applied | `configApplyLoop` | `configGenMu` |
+  | `recordRecvConfigGen` | received | receive loop (×2) | `configGenMu` |
+  | `beginConfigApply` / `endConfigApply` | applying fence | `configApplyLoop` | `configGenMu` |
+  | `resetRecvGen` | all three, clear to 0 | receive loop (×2) | `configGenMu` |
+  | `initGenState` | all three | `NewSessionSync` | none — pre-`Start`, no goroutines yet |
+
+  Readers stay lock-free (the marks are atomics and `configEpochStale` runs per
+  synced session install); a reader racing a writer observes one side of a
+  single monotone step, which is the tolerance the marks already had. **The guard is
   Go-cluster-authoritative** — the userspace helper's `config_generation` is a
   *local* commit counter (`Manager.bumpGeneration`) that is not cross-node
   comparable, so the receiver rejects the stale install BEFORE forwarding it to
@@ -1174,8 +2381,7 @@ outside the monitor loop:
   active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
   needs a bidirectional config-gen namespace #5274 scoped out).
 - **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
-  `SessionID` (node-local, minted per converted session by
-  `nextUserspaceSyncedSessionID` since #6198) AND the per-key install generation,
+  `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id
   (`SessionValue{,V6}.RTFlowSessionID`, the dataplane's
   `SessionTable::alloc_session_id` value) as a length-gated trailing `uint64` on
@@ -1204,3 +2410,261 @@ outside the monitor loop:
   transition and prevents spurious failover churn. A nil receiver / unset seam
   reports not-fresh, so the no-receiver call paths behave exactly as before the
   re-check existed.
+
+- **The peer heartbeat-ack capability is peer-INCARNATION scoped, not
+  process-sticky (#5718 C01a).** `SessionSync.peerHeartbeatAckEver` latches
+  when the connected peer replies `syncMsgHeartbeatAck`, and that latch is what
+  switches two paths from "assume healthy" to "enforce": the `receiveLoop`
+  missed-heartbeat teardown (`sync_conn_read.go` — two read deadlines with no
+  traffic closes the connection) and `PeerHealthy()`'s silence window
+  (`sync.go`), which `computeUserspaceTransferReadiness` consults before
+  allowing a manual failover. The capability describes the PEER PROCESS, so
+  `handleDisconnect` clears it on FULL disconnect, right beside `clockSynced` —
+  same reason, same place. It must NOT be cleared on a partial disconnect (one
+  fabric link down, the other still up): that is the same peer process, and
+  clearing there would disarm both enforcement paths on every link blip.
+  Leaving it latched across a peer DOWNGRADE is the defect this replaced — new
+  build acks, peer rolls back to a build that never acks, and the stale latch
+  turns a healthy old peer into permanent connection churn plus a
+  failover-readiness block ("session sync disconnected"). Both directions are
+  pinned by `heartbeat_ack_incarnation_5718_test.go`.
+
+  **The incarnation ends at TWO edges, not one (#5718 fold F1).**
+  `handleDisconnect`'s full-disconnect block cannot see a SUPERSESSION, and
+  supersession is precisely the peer-reboot shape: a peer that dies hard sends
+  no FIN/RST, so our TCP connection stays ESTABLISHED, `fabricConnectLoop` will
+  not redial a slot it believes is connected, and the peer's NEW process dials
+  in and lands in `installConn`. `installConn` closes the old connection and
+  takes the slot; the old `receiveLoop` then calls `handleDisconnect`, finds
+  the slot already holding the new conn, and returns down the "ignoring stale
+  disconnect" default branch without clearing anything. `installConn` therefore
+  clears the latch when it REPLACES a live connection in a fabric slot, as well
+  as on the full-disconnect edge. It deliberately does not clear when a link
+  comes up into an EMPTY slot beside a surviving one — that is the same peer
+  process, the mirror of the partial-disconnect scope control above.
+
+  **Only a currently-installed connection may latch it (#5718 fold F1).**
+  `handleMessage` routes `syncMsgHeartbeatAck` through `noteHeartbeatAck`,
+  which stores under `s.mu` — atomic with `installConn`'s clear. Without that
+  ordering an ack already read off the superseded connection re-arms the latch
+  for the incoming incarnation right after the clear, restoring the exact state
+  the clear removed. It also means the pre-install handshake-pending frame
+  cannot arm an enforcement path: an ack is never a legitimate FIRST frame,
+  because we only send `syncMsgHeartbeat` after a read deadline elapses on an
+  established connection.
+
+  **Slot membership is NOT sufficient — the slot carries an incarnation stamp
+  (#5718 fold F1b).** With TWO fabric slots, `s.conn0 == conn || s.conn1 ==
+  conn` asks only whether a connection sits in *either* slot, and after a peer
+  reboot the dead incarnation still occupies one of them: no FIN/RST means both
+  of its sockets stay ESTABLISHED while the new process supersedes just the
+  slot it dialled. An in-flight ack off that survivor passes a membership test
+  and re-arms the capability the supersession cleared — the previous
+  incarnation enforced against the current one, the same defect one level up.
+  `SessionSync` therefore carries `peerIncarnation` plus per-slot `conn0Gen` /
+  `conn1Gen` (all under `mu`): `installConn` stamps each slot at install, and
+  `connIsCurrentIncarnationLocked` accepts an ack only when the slot's stamp
+  equals `peerIncarnation`.
+
+  The counter advances when a supersession replaces a connection that belonged
+  to the CURRENT incarnation. A supersession that merely evicts an
+  ALREADY-STALE connection is the new incarnation reclaiming its second slot,
+  not a further change: advancing there would strand the connection that
+  legitimately proved the capability at a stale stamp, permanently disarming
+  both enforcement paths for the life of that connection. Both directions, and
+  both fabric orderings, are pinned in
+  `heartbeat_ack_incarnation_5718_test.go` — the classification and the
+  acceptance test each branch per fabric, so a single-fabric fixture would
+  leave one arm of each switch unbound.
+
+  Residual, deliberately open. This was previously described as a THIRD
+  incarnation dialling into the slot that still held a stale connection. Fold
+  r4b's eviction made that shape unreachable: no RETIRED-STAMPED connection
+  remains installed after a recognized supersession for a later incarnation to
+  land on. (Precisely that — the accepted residual below can still leave a
+  semantically dead connection installed under a falsely-CURRENT stamp, and a
+  third incarnation can physically land on that corpse; it is then classified as
+  replacing a current connection, which advances the incarnation and evicts, so
+  it does not reach the old no-advance outcome.)
+
+  The residual that survives it is the empty-alternate-slot reboot — a peer
+  whose replacement enters through a slot that is already empty is never
+  classified as a supersession at all, so the incarnation never advances and
+  none of this machinery runs. It is described in full below and in
+  `evictStaleIncarnationConnsLocked`'s KNOWN-INCOMPLETE note. Both shapes need
+  the same thing: a peer-supplied boot incarnation on the wire, which #5480
+  tracks and #6669 implements. Closing it is a wire change, not a local one.
+
+  `installConn` does NOT clear on the full-disconnect edge, because whenever the
+  registry is empty the capability is already clear — reached either by
+  initialization (a fresh `SessionSync` is empty having never seen a disconnect)
+  or because `handleDisconnect` owns the nonempty-to-empty transition. Note the
+  reason is NOT that `conn0`/`conn1` are nilled nowhere else — since fold r4b
+  `evictStaleIncarnationConnsLocked` nils them too. It is that eviction cannot
+  leave the registry EMPTY (below), so an empty one still implicates
+  `handleDisconnect` alone. Adding the condition back is inert
+  rather than wrong, so no behavioural test can reject it; what the tests pin
+  instead is the PREMISE. That has two halves, because the behavioural half
+  alone would be decorative (removing `handleDisconnect`'s clear already reds
+  an older assertion): `TestPeerHeartbeatAckClearedWheneverRegistryEmpties`
+  drives every emptying path it knows of, and
+  `TestOnlyHandleDisconnectEmptiesTheRegistry` asserts on the package AST which
+  functions may assign `conn0`/`conn1` nil. A future teardown that empties a
+  slot elsewhere reds the structural guard even though every behavioural test
+  would still pass, and at that point this narrowing must be revisited.
+
+  `evictStaleIncarnationConnsLocked` is the one exemption in that allowlist. It
+  nils a slot, but it provably cannot EMPTY the registry, and since fold r6 for
+  reasons intrinsic to the function rather than to its caller: it skips the keep
+  slot, **and** it refuses to evict anything at all unless that slot is
+  occupied. The second half matters because the allowlist exempts by function
+  NAME. Before it, soundness rested on what the single caller happened to do —
+  `installConn` installs before it evicts — so a future second call site would
+  have inherited the exemption without inheriting the property it was granted
+  for, and could have emptied the registry with every guard green:
+  `TestInstallConnNeverLeavesTheRegistryEmpty_5718` drives the existing call
+  site and cannot see a new one.
+
+  Both are pinned. `TestEvictionRefusesToEmptyTheRegistry_5718` calls the helper
+  directly with an unoccupied keep slot (and with an out-of-range index) and
+  asserts it declines; `TestInstallConnNeverLeavesTheRegistryEmpty_5718` still
+  covers the live path, so losing the `keepIdx` skip reds there. Removing the
+  refusal reds only the former — which is the point: the pre-r6 tests all stay
+  green under that mutation, so they were not covering it.
+
+  **The SEND path is incarnation-aware too (#5718 fold r4).** The stamp
+  originally taught only the ACK path that an installed connection can belong
+  to a dead peer. `activeConnLocked` still picked by raw slot occupancy, so
+  after a peer reboot whose replacement dials FABRIC 1, `conn0` — the dead
+  incarnation's still-ESTABLISHED socket — was handed to every sender reached
+  through `getActiveConn`: bulk sync (which pins it once and streams the whole
+  session table), config sync, failover requests and acks, the session writer.
+  `preferredFabricLocked` now prefers a CURRENT-incarnation connection and only
+  then applies the historical fab0-before-fab1 order. When nothing is current
+  it falls back to the old preference rather than returning nil, so the
+  pre-existing self-correcting path (write fails -> `handleDisconnect`) is
+  unchanged.
+
+  `installConn` computes `activeAfter` from the same helper, AFTER the
+  incarnation advance and the slot stamp — otherwise the cold-prime decision
+  disagrees with where the data will actually be sent.
+
+  **Selection was not enough — the retired connection is EVICTED (#5718 fold
+  r4b).** `preferredFabricLocked` fixed where traffic GOES. It did not change
+  what is INSTALLED, and three other paths read raw slot occupancy, so the dead
+  incarnation's socket (ESTABLISHED forever — a hard reboot sends no FIN/RST)
+  kept speaking for a process that no longer exists:
+
+  - `handleDisconnect` computes `connected := s.conn0 != nil || s.conn1 != nil`.
+    When the one LIVE connection later dropped it took the "still connected"
+    branch: `stats.Connected` stayed true — so `PeerHealthy()` reported a
+    healthy peer with ZERO live connections, the incarnation advance having
+    already cleared the capability latch that gates its silence check — barrier
+    and failover waiters were never released with `failoverAckDisconnected` and
+    blocked until their own timeouts, `OnPeerDisconnected` never fired, and the
+    in-progress bulk receive was never reset.
+  - `fabricConnectLoop` skips a fabric whose slot is non-nil, so the link to the
+    new peer process was never redialled there and the cluster silently ran on
+    one fabric.
+  - `installConn`'s `d.wasDisconnected` needs BOTH slots nil, so the
+    full-disconnect cold-prime edge was unreachable while the corpse sat in a
+    slot.
+
+  Nothing else removed it either: `receiveLoop`'s missed-heartbeat teardown is
+  gated on `peerHeartbeatAckEver`, which the incarnation advance clears —
+  identifying the connection as retired is precisely what disarmed its only
+  eviction path. `installConn` therefore calls
+  `evictStaleIncarnationConnsLocked`, closing and clearing every slot other than
+  the one just filled whose stamp is no longer current, restoring in one place
+  the invariant all three readers already assume: *installed* means *belongs to
+  the peer incarnation in force*.
+
+  Consequence for the two generation checks: a slot can no longer hold a
+  stale-stamped connection, so `preferredFabricLocked`'s and
+  `connIsCurrentIncarnationLocked`'s comparisons are fail-closed BELTS for an
+  install path added later that forgets to evict, not the load-bearing gates.
+  Their tests build that state by hand and say so, rather than pretending to
+  drive it. Note neither belt could substitute for the eviction: both govern one
+  reader each, and the three readers above never come through either.
+
+  Cost of a false positive: a supersession that is really the same peer process
+  re-dialling a half-open socket also drops the other fabric, which
+  `fabricConnectLoop` redials within a second, plus one redundant authoritative
+  bulk. That is the trade #5480 already took, and it CONVERGES — the
+  pre-eviction shape did not, because the retired socket stayed installed and
+  un-evictable until TCP gave up retransmitting, which is minutes.
+
+  **ACCEPTED RESIDUAL: a rebooted peer entering through an EMPTY alternate slot
+  (#6910, blocked on #6669).** Everything above keys off `installConn`'s
+  occupancy-based classification, and there is one reboot shape that
+  classification cannot see:
+
+  1. Peer A holds `conn0`; `conn1` is already down/empty.
+  2. A hard-reboots. `conn0` stays ESTABLISHED locally — no FIN/RST.
+  3. A's replacement A' connects first (or only) on fabric 1.
+  4. `installConn` sees a NON-empty registry but an EMPTY target slot, so
+     `wasDisconnected` is false and `supersededCurrent` is false. No incarnation
+     advance, no eviction, no capability clear, no cold-prime arm.
+  5. A' is stamped with the SAME incarnation as the dead `conn0`, so both look
+     current and `preferredFabricLocked` picks dead fabric 0 over live fabric 1.
+  6. When `conn0` eventually drops, `conn1` keeps `connected` true, so the
+     full-disconnect path never runs and A' never receives the survivor's
+     session table. The next failover to it can blackhole.
+
+  **Why this is not fixed locally.** Step 4 is observationally IDENTICAL to the
+  routine case — the same peer process bringing up its second fabric after a
+  link flap. Both present as "an empty slot filled while another slot is
+  occupied", and nothing on the wire distinguishes them: the sync handshake
+  carries no peer-cold / boot-incarnation / table-count signal (the same gap
+  #5480 records and defers). Any local heuristic that treats step 4 as a reboot
+  necessarily also treats every routine second-fabric recovery as one, which
+  re-primes the entire session table on every link blip and destroys the #466
+  flap suppression #5480 deliberately preserved.
+  `TestSecondFabricComingUpIsNotEvicted_5718` and
+  `TestRoutineInstallDoesNotReArmColdPrime_5718` pin the ROUTINE reading on
+  purpose. They are correct as written; do NOT "fix" them into failing to close
+  this residual. The separating signal is a peer-supplied boot epoch, which
+  #6669 introduces (signed in the heartbeat) and #6910 consumes.
+
+  **What is and is not bounded, since the two halves differ.** Steps 5 and 6 do
+  not decay at the same rate:
+
+  - Step 5 (dead `conn0` preferred) is TIME-BOUNDED for an ack-capable peer, and
+    for a reason specific to this path: no incarnation advance happens here, so
+    `peerHeartbeatAckEver` is NOT cleared and `receiveLoop`'s missed-heartbeat
+    teardown stays ARMED. `conn0` is closed after 2 read deadlines (~20s at the
+    10s default). This is the opposite of the two-fabric supersession case
+    above, where the advance clears the latch and disarms that teardown — which
+    is exactly why THAT case needed eviction and this one partially self-heals.
+    For a peer that never proved ack support the latch is false, enforcement is
+    intentionally disabled, and no bound applies.
+  - Step 6 (A' never primed) is NOT bounded and does not self-heal. When
+    `conn0` finally drops, `handleDisconnect` takes the `else if
+    !s.outboundBulkAcked` branch — so A' is re-primed ONLY if our outbound bulk
+    to the OLD A had never been acked. In steady state it had been, so no
+    re-drive fires and A' keeps an empty session table indefinitely. This is the
+    half that genuinely requires #6669's boot epoch, and it is the half #6910
+    must close.
+
+  **A supersession re-arms the cold prime (#5718 fold r4).** `needColdPrime`
+  was armed only on the full-disconnect edge. Superseding a CURRENT connection
+  is positive evidence of a new peer process — the signal #5480 records as
+  unavailable on the wire, which is why that path re-primes unconditionally. A
+  rebooted peer has an EMPTY session table, so leaving the obligation unarmed
+  leaves the standby with no synced sessions and blackholes every established
+  flow on the next failover to it. Re-priming is idempotent, so the cost of
+  being wrong is one redundant bulk. A link filling an EMPTY slot beside a live
+  one does NOT re-arm: same peer, and re-priming there would re-bulk on every
+  routine fabric flap (#466).
+
+  **Atomicity of the ack is bound, not merely asserted (#5718 fold r3).** Every
+  scenario test calls `installConn` and `handleMessage` in sequence, so none of
+  them opens the window `s.mu` exists to close — an implementation that checks
+  under the lock, releases it, and only then stores would pass all of them
+  while letting a supersession land in between and resurrect a just-cleared
+  capability. `noteHeartbeatAckMidpointHook` (nil in production) widens that
+  window so a test can start a competing `installConn` from inside it: under
+  the real implementation the competitor BLOCKS on `s.mu` until the ack
+  returns, so it cannot interleave. The assertion is on final state, so it is
+  deterministic in both shapes, and only the correct implementation depends on
+  the (generous) wait EXPIRING.

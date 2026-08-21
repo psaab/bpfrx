@@ -16,8 +16,13 @@ pub(crate) fn source_nat_pool_statuses(rules: &[SourceNatRule]) -> Vec<SourceNat
                 rule_name: rule.name.clone(),
                 pool_name: rule.pool_name.clone(),
                 address_count: rule.pool_addresses_v4.len() + rule.pool_addresses_v6.len(),
-                port_low: rule.pool_allocator.port_low,
-                port_high: rule.pool_allocator.port_high,
+                // #6812: the configured range rides on the rule (config), not
+                // the allocator (state) — a FAILED pool builds no allocator,
+                // and `pool_allocator` is the empty default (1024-65535)
+                // there. Reading the rule keeps the displayed range truthful
+                // for exactly the pools an operator is debugging.
+                port_low: rule.pool_port_low,
+                port_high: rule.pool_port_high,
                 persistent_nat: rule.persistent_nat,
                 // #2823: the legacy binary permit-any-remote-host flag is
                 // kept for wire skew with an older control plane.
@@ -34,6 +39,10 @@ pub(crate) fn source_nat_pool_statuses(rules: &[SourceNatRule]) -> Vec<SourceNat
                 allocations_total: snap.allocations_total,
                 reuses_total: snap.reuses_total,
                 exhaustion_total: snap.exhaustion_total,
+                // #4800: residual map-mutex contention for the new-flow
+                // ceiling harness.
+                live_lock_acquisitions_total: snap.live_lock_acquisitions_total,
+                live_lock_contended_total: snap.live_lock_contended_total,
             }
         })
         .collect()

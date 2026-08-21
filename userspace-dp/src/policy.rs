@@ -740,6 +740,21 @@ impl PolicyCounterStore {
         counters.insert(rule_id.to_string(), counter.clone());
         counter
     }
+
+    /// #6832 fold r6: the stored rule ids, sorted. There is no production
+    /// reader for this registry — `PolicyState::counter_snapshots` reads the
+    /// PUBLISHED state's rules, not the store — so a rejected build's policy
+    /// residue is invisible to operators and, until this accessor existed, to
+    /// tests as well. Mirrors `NatCounterStore::snapshots()` in emitting an
+    /// entry per stored id regardless of its value, which is what lets a test
+    /// distinguish "block never created" from "store empty".
+    #[cfg(test)]
+    pub(crate) fn tracked_rule_ids_for_test(&self) -> Vec<String> {
+        let counters = self.counters.lock().expect("policy counter store poisoned");
+        let mut ids: Vec<String> = counters.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
 }
 
 // ── #3073: per-worker established-session policy hit-count coalescer ──

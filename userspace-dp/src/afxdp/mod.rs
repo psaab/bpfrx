@@ -65,6 +65,12 @@ mod binding_state;
 mod bpf_map;
 #[path = "checksum.rs"]
 mod checksum;
+// #4800: test-only exclusion between readers and movers of the process-global
+// new-flow contention counters. The mover side is taken inside the moving
+// functions, so the mover set is derived rather than inventoried.
+#[cfg(test)]
+#[path = "counter_test_lock.rs"]
+mod counter_test_lock;
 #[path = "ethernet.rs"]
 mod ethernet;
 #[path = "event_emit.rs"]
@@ -227,6 +233,12 @@ pub(crate) use self::frame::MAX_IPV6_EXT_HEADERS;
 // items NAT64/icmp_embed NAME are re-exported here — the `ExtChainWalk`
 // / `ExtChainFragment` field access needs no import.
 pub(crate) use self::frame::{ExtChainOutcome, walk_ipv6_ext_chain};
+// #4555/#6923: the walk's own type classification, re-exported on the same
+// channel so the HA session-sync IMPORT path (`crate::server::helpers`, outside
+// `crate::afxdp`) rejects a peer-supplied key whose protocol is one the walk
+// traverses. The shim's over-limit refusal is an invariant about the session
+// map, and the map has two writers — the packet path and this import.
+pub(crate) use self::frame::ipv6_ext_header_is_traversable;
 use self::umem::*;
 
 // #4435 (test-only): a thin `pub(crate)` wrapper over the canonical

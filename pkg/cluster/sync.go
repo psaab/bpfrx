@@ -301,14 +301,62 @@ type SessionSync struct {
 	mu        sync.Mutex
 	conn0     net.Conn
 	conn1     net.Conn
-	writeMu   sync.Mutex
-	// authProvider supplies the shared control-link PSK + the cross-channel
-	// downgrade-guard signal for #4107 F23 session-sync stream auth. Optional:
-	// nil (or an empty key) ⇒ legacy unauthenticated stream (dual-accept).
+	// peerIncarnation identifies which run of the peer process the currently
+	// installed connections belong to, and conn0Gen/conn1Gen record the
+	// incarnation each slot's connection was installed under. All three are
+	// guarded by mu, alongside the conn0/conn1 they describe.
+	//
+	// #5718 C01a (fold F1b): slot membership alone cannot answer "does this
+	// connection speak for the CURRENT peer incarnation?" once there are TWO
+	// fabric slots. A peer that reboots hard sends no FIN/RST, so BOTH of its
+	// connections stay ESTABLISHED on our side; its new process dials in and
+	// supersedes one slot, and the OTHER slot still holds the dead
+	// incarnation's connection. An `s.conn0 == conn || s.conn1 == conn` test
+	// accepts an in-flight heartbeat-ack off that survivor and re-arms the
+	// capability the supersession just cleared — the previous incarnation
+	// enforced against the current one, which is the whole defect. Stamping
+	// each slot at install and comparing the stamp to peerIncarnation binds an
+	// ack to the incarnation it belongs to rather than to slot membership.
+	//
+	// The counter advances when a supersession replaces a connection that
+	// belonged to the CURRENT incarnation — evidence a new peer process took
+	// over. A supersession that merely evicts an ALREADY-STALE connection (the
+	// new incarnation reclaiming the second slot) is not a further incarnation
+	// change and must not advance it, or the connection that legitimately
+	// proved the capability would be stranded stale and could never re-arm.
+	//
+	// Residual, deliberately not closed here. This used to be described as a
+	// THIRD incarnation dialling into the slot that still held a stale
+	// connection — fold r4b's eviction made that shape unreachable, because no
+	// RETIRED-STAMPED connection remains installed after a recognized
+	// supersession for a later incarnation to land on. (Precisely that: the
+	// accepted residual below can still leave a semantically dead connection
+	// installed carrying a falsely-CURRENT stamp, and a third incarnation can
+	// physically land on that corpse — but it is then classified as replacing a
+	// current connection, which advances the incarnation and evicts, so it does
+	// not reach the old no-advance outcome.)
+	//
+	// The residual that survives is narrower to state and wider in effect: a
+	// peer whose replacement enters through an EMPTY alternate slot is never
+	// classified as a supersession at all, so the incarnation never advances
+	// and none of this machinery runs. See evictStaleIncarnationConnsLocked's
+	// KNOWN-INCOMPLETE note and pkg/cluster/README.md for the sequence. Both
+	// the old shape and this one need the same thing — a peer-supplied boot
+	// incarnation on the wire, which #5480 tracks and #6669 implements. It is a
+	// wire change, not a local one, which is why it is not closed here.
+	peerIncarnation uint64
+	conn0Gen        uint64
+	conn1Gen        uint64
+	writeMu         sync.Mutex
+	// authProvider supplies the shared control-link PSK for #4107 F23
+	// session-sync stream auth. Optional: nil (or an empty key) ⇒ legacy
+	// unauthenticated stream.
+	//
+	// #5078: a sticky syncAuthedEver downgrade-guard used to sit beside this.
+	// It was removed with syncPeerAuthSeen — once a keyed node rejects every
+	// unkeyed peer unconditionally, there is no admission for such a guard to
+	// withdraw, and it had become write-only in effect.
 	authProvider atomic.Pointer[syncAuthProviderBox]
-	// syncAuthedEver is the sticky sync-channel downgrade-guard: once any sync
-	// connection authenticates, a later unauthenticated connection is rejected.
-	syncAuthedEver atomic.Bool
 
 	// #5303 pre-auth admission gate. Bounds the inbound sync connections that
 	// are in setup (pre-handshake) at once so a flood of connections that stall
@@ -455,19 +503,31 @@ type SessionSync struct {
 	// Armed once per overflow episode (CAS) by rejournalTail/journalDelete and
 	// consumed by whichever of the sweep loop (syncSweep) or the next reconnect
 	// (handleNewConnection) runs first.
-	forceResync          atomic.Bool
-	lastNewCounter       uint64
-	lastClosedCounter    uint64
-	lastSweepEmpty       bool
-	vrfDevice            string
-	peerClockOffset      atomic.Int64
-	clockSynced          atomic.Bool
-	zoneRGMu             sync.RWMutex
-	zoneRGMap            map[uint16]int
-	deleteJournalMu      sync.Mutex
-	deleteJournal        [][]byte
-	deleteJournalCap     int
-	lastPeerRxMono       atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+	forceResync       atomic.Bool
+	lastNewCounter    uint64
+	lastClosedCounter uint64
+	lastSweepEmpty    bool
+	vrfDevice         string
+	peerClockOffset   atomic.Int64
+	clockSynced       atomic.Bool
+	zoneRGMu          sync.RWMutex
+	zoneRGMap         map[uint16]int
+	deleteJournalMu   sync.Mutex
+	deleteJournal     [][]byte
+	deleteJournalCap  int
+	lastPeerRxMono    atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+	// peerHeartbeatAckEver latches when the CURRENTLY connected peer proves it
+	// understands syncMsgHeartbeat by replying syncMsgHeartbeatAck. It gates
+	// the two enforcement paths that would otherwise punish a legacy peer that
+	// simply never acks: the receiveLoop missed-heartbeat teardown
+	// (sync_conn_read.go) and PeerHealthy's silence window (below).
+	//
+	// #5718 C01a: this is peer-INCARNATION scoped, NOT SessionSync-lifetime.
+	// handleDisconnect clears it on full disconnect (alongside clockSynced) so
+	// a peer downgrade — new build acks, then rolls back to a build that never
+	// acks — cannot leave the flag latched and turn a healthy old peer into
+	// permanent connection churn plus a failover-readiness block. Do not
+	// promote this back to a set-once flag.
 	peerHeartbeatAckEver atomic.Bool
 	readDeadline         time.Duration
 	peerSilenceLimit     time.Duration
@@ -614,6 +674,54 @@ type SessionSync struct {
 	// monotonic counter lower.
 	lastRecvConfigGen atomic.Uint64
 	configApplyCh     chan configApplyItem
+
+	// configGenMu makes the reconnect RESET of the three config-generation
+	// marks above atomic with respect to every ADVANCE of them (#5084).
+	//
+	// Each mark is advanced by a non-atomic read-modify-write — load, compare,
+	// store — and each is cleared to 0 by resetRecvGen on a peer bulk re-prime.
+	// Those run on DIFFERENT goroutines: resetRecvGen is called from the
+	// syncMsgBulkStart handler on a receive loop, while the applied mark is
+	// advanced by the single configApplyLoop consumer and the received mark by
+	// a receive loop. Nothing ordered them, so a clear could land between an
+	// advance's load and its store and be lost — the store then re-raises the
+	// mark the reset just cleared.
+	//
+	// That is not benign, which is what the pre-#5084 comments assumed. The
+	// whole point of the reset is that a peer which OS-rebooted restarts its
+	// monotonic configGenCounter LOWER; a pre-reboot generation surviving the
+	// reset means every one of the reconnected peer's CURRENT generations is
+	// refused as stale. On lastAppliedConfigGen that silently strands the
+	// standby on the pre-reboot config; on lastRecvConfigGen it poisons the
+	// readiness comparison (PeerConfigGen > AppliedConfigGen) so the node can
+	// report ready while running the wrong policy. Neither self-clears: the
+	// marks are monotone-max, so only another accepted re-prime or ~1.8e12
+	// commits would move them back down.
+	//
+	// Two prior comments stated the contract wrongly and are corrected at their
+	// sites: recordAppliedConfigGen claimed it is "called ONLY from the
+	// single-consumer configApplyLoop", which ignores resetRecvGen's clear; and
+	// the received-mark raise claimed "the receiveLoop is single-threaded per
+	// connection", which is true per connection but there are TWO of them
+	// (conn0/conn1), so a raise on one fabric races a reset on the other.
+	//
+	// Every WRITER takes this mutex; READERS stay lock-free, because they are on
+	// hot paths (configEpochStale runs per synced session install) and a reader
+	// racing a writer only observes one side of a single monotone step, which is
+	// the same tolerance the marks already had.
+	//
+	// LOCK ORDER: configGenMu is a LEAF. No site takes another lock while
+	// holding it, and resetRecvGen takes it strictly after releasing recvGenMu.
+	configGenMu sync.Mutex
+	// configGenAdvanceBarrierFn is a test injection seam (nil in production,
+	// #5084). recordAppliedConfigGen / recordRecvConfigGen call it after reading
+	// the current mark and before storing the advanced value — the exact window
+	// in which a concurrent clear used to be lost. A lost update cannot be
+	// driven deterministically any other way: without a seam the test would have
+	// to race a sleep against the window and would pass on broken code whenever
+	// it lost that race. A test parks a reset in the window and asserts the
+	// clear survives.
+	configGenAdvanceBarrierFn func()
 
 	// Config-sync APPLY health tracking (#6387). These drive the time-based CF
 	// monitor-failure edge. Unlike the loop-local high-water logic they are NOT

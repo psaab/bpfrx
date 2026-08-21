@@ -148,6 +148,37 @@ Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA St
   - `HA State: Active|Backup`
   - `Timeout: <seconds>`
   - `Session State: Valid|Invalid`
+- **Two policy indexes are RESERVED and do not name a configured policy**
+  (#4626). The index is always printed, so nothing is hidden:
+  - `unattributed/0` — no configured policy admitted this session.
+    Index `0` is carried by host-inbound, neighbor-seed, fabric and tunnel
+    installs, by any pre-#3056 session, and by every session synced from an
+    older HA peer during a rolling upgrade. It is ALSO the index of the
+    literal first configured policy, so the value is genuinely ambiguous on
+    the wire; the display deliberately under-claims rather than naming a
+    real rule that may never have seen the traffic. Retiring the overload
+    (reserving the id space so real policies start at 1) is the remaining
+    half of #4626.
+  - `default-policy/4294967295` — the implicit `security policies
+    default-policy` verdict admitted or denied this session, not a
+    configured rule (#3057).
+  The same two reserved indexes appear as `policy_name` on the REST
+  `/sessions` and gRPC `GetSessions` surfaces, which carry `policy_id`
+  alongside, and in the `policy-name` field of RT_FLOW syslog records
+  (#6851) — the one surface where the attribution is DURABLE, since those
+  records ship off-box to a collector.
+- **Cluster peer sessions carry the same guarantee** (#6851), on every
+  surface that shows them: the gRPC and REST fan-outs sanitize in
+  `grpcapi fetchPeerSessions`, and the on-box interactive CLI — which dials
+  the peer daemon directly rather than going through that fan-out — does so
+  at its own ingress. The peer resolved those names itself; a peer on a
+  pre-#4626 build sent the name of ITS first configured policy for every
+  reserved-index session. The local node overrides the name for RESERVED
+  indexes only. It deliberately
+  does NOT re-resolve an unreserved index against its own policy table:
+  indexes are node-local, so the peer is authoritative for the names of
+  its own sessions, and re-resolving would name whichever local policy
+  happened to occupy that slot.
 - **In/Out lines:** Indented 2 spaces.
   - `In: <src_ip>/<src_port> --> <dst_ip>/<dst_port>;<proto>, Conn Tag: 0x0, If: <interface>, Pkts: <N>, Bytes: <N>, `
   - Note the trailing comma+space after Bytes value.

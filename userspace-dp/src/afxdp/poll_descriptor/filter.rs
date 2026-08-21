@@ -165,13 +165,14 @@ pub(super) fn filter_log_ingress_zone_id(
         .unwrap_or(0)
 }
 
+/// #6713: resolve through the shared `egress_zone_id` so a filter-log event
+/// reports the SAME to-zone the policy plane adjudicated. The sibling
+/// `filter_log_ingress_zone_id` above already reads `ifindex_to_zone_id`;
+/// reading only `egress` here logged zone 0 for a MAC-less interface (an IPsec
+/// xfrmi) whose zone the ingress half resolved correctly.
 #[inline]
 pub(super) fn filter_log_egress_zone_id(forwarding: &ForwardingState, egress_ifindex: i32) -> u16 {
-    forwarding
-        .egress
-        .get(&egress_ifindex)
-        .map(|egress| egress.zone_id)
-        .unwrap_or(0)
+    forwarding.egress_zone_id(egress_ifindex)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,7 +205,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
     // #2620: pick the counter-ownership policy. `routing_eval_follows` is true
-    // ONLY on the session-MISS path, where the caller proceeds to
+    // on every path whose caller proceeds to
     // `ingress_route_table_override` after an Accept verdict from this precheck.
     // When that path is taken AND the filter is route-lookup-affecting, the
     // routing-instance evaluator runs on the Accept/defer exit and counts the
@@ -1365,6 +1366,238 @@ mod filter_terminal_tests {
         assert_eq!(
             event.action, RT_FLOW_ACTION_REJECT,
             "an enqueued filter reject must log the truthful REJECT"
+        );
+    }
+}
+
+/// #6713: the filter-log egress-zone field must report exactly the to-zone the
+/// policy plane adjudicated. `emit_cached_output_filter_log_tail` (the
+/// flow-cache-hit output path) is the only production caller of
+/// `filter_log_egress_zone_id`, and before #6713 it open-coded a
+/// `state.egress`-only read.
+///
+/// Nothing bound that call site: every other filter-log assertion in the suite
+/// uses a MAC-FUL interface, where the `egress` row and the ifindex maps agree,
+/// so reverting the helper body to
+/// `forwarding.egress.get(&ifx).map(|i| i.zone_id).unwrap_or(0)` left the whole
+/// suite green.
+///
+/// Scope, stated precisely because an earlier revision of this comment was not:
+/// the tests below that call `filter_log_egress_zone_id` directly bind the
+/// HELPER, not its consumer. A helper proven in isolation says nothing about
+/// whether the production path still routes through it — someone could re-open
+/// the `state.egress`-only read inside `emit_cached_output_filter_log_tail`
+/// itself and every direct-helper test would stay green.
+/// `cached_output_filter_log_reports_the_adjudicated_zone_6722` therefore drives
+/// `emit_cached_output_filter_log_tail` and asserts the EMITTED event, so the
+/// consumer is bound too.
+#[cfg(test)]
+mod filter_log_egress_zone_tests {
+    use super::*;
+    use crate::afxdp::forwarding_build::build_forwarding_state;
+    use crate::afxdp::test_fixtures::{
+        LAN_IFINDEX_6722, SHARED_TUNNEL_IFINDEX_6722, TEST_SIBLING_VPN_ZONE_ID_6722,
+        ZONED_TUNNEL_IFINDEX_6722, sibling_tunnel_units_snapshot_6722,
+    };
+    use crate::test_zone_ids::TEST_LAN_ZONE_ID;
+
+    /// #6722: build the state through the REAL `build_forwarding_state` from the
+    /// shared secure-tunnel fixture rather than hand-populating a
+    /// `ForwardingState`. The round-3 version hand-inserted into
+    /// `ifindex_to_zone_id` only, so it encoded a map layout instead of a
+    /// snapshot and went red on a builder change that was correct — it could
+    /// only ever agree with the resolver by coincidence.
+    ///
+    /// The fixture gives three ifindexes worth logging:
+    ///   - `LAN_IFINDEX_6722`   — MAC-ful and zoned, so it HAS an egress row;
+    ///   - `ZONED_TUNNEL_IFINDEX_6722` (`st0.1`) — MAC-less, zoned, its own
+    ///     ifindex, so no egress row and the #6713 fallback is the only
+    ///     resolver;
+    ///   - `SHARED_TUNNEL_IFINDEX_6722` (`st0`/`st0.0`) — MAC-less and
+    ///     AMBIGUOUS, so the #6722 gate holds it at 0.
+    fn forwarding_with_macless_egress() -> ForwardingState {
+        build_forwarding_state(&sibling_tunnel_units_snapshot_6722())
+    }
+
+    /// #6713 at the log site: a flow egressing a correctly-zoned MAC-less
+    /// tunnel must log that tunnel's zone, not 0.
+    #[test]
+    fn filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713() {
+        let fw = forwarding_with_macless_egress();
+        assert!(
+            !fw.egress.contains_key(&ZONED_TUNNEL_IFINDEX_6722),
+            "precondition: the MAC-less tunnel has NO egress row -- that hole is \
+             what makes this call site interesting"
+        );
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, ZONED_TUNNEL_IFINDEX_6722),
+            TEST_SIBLING_VPN_ZONE_ID_6722,
+            "the logged to-zone must match the zone the policy plane adjudicated"
+        );
+        // Control: the MAC-ful interface is unaffected either way.
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, LAN_IFINDEX_6722),
+            TEST_LAN_ZONE_ID
+        );
+        // An ifindex in neither map is 0.
+        assert_eq!(filter_log_egress_zone_id(&fw, 9999), 0);
+    }
+
+    /// #6722/#6713 at the PRODUCTION call site, not the helper. The tests above
+    /// prove `filter_log_egress_zone_id`; this one drives
+    /// `emit_cached_output_filter_log_tail` — the only production caller — and
+    /// asserts the zone on the event it actually emits.
+    ///
+    /// It adjudicates BOTH ifindexes, and the pairing is what makes it bind.
+    /// An ambiguous ifindex alone would NOT bind the consumer: after #6722 B1
+    /// the egress row's `zone_id` is ledger-derived, so for an ifindex that HAS
+    /// an egress row the helper and a raw `state.egress` read agree by
+    /// construction, and reverting the call inside
+    /// `emit_cached_output_filter_log_tail` stays green. The MAC-less zoned
+    /// tunnel is the discriminator: it has NO egress row, so the helper resolves
+    /// its zone through the #6713 fallback while a raw `state.egress` read
+    /// yields 0.
+    ///
+    /// (That is not hypothetical — the first version of this test used only the
+    /// ambiguous ifindex and the revert-the-caller mutation left it green.)
+    #[test]
+    fn cached_output_filter_log_reports_the_adjudicated_zone_6722() {
+        let fw = forwarding_with_macless_egress();
+
+        // One emission per handle: the event stream is stateful (batching and
+        // rate-limit budget are per handle), so reusing one receiver across two
+        // emissions makes the SECOND assertion depend on stream internals rather
+        // than on the zone. A fresh handle isolates each.
+        let logged_zone_for = |egress_ifindex: i32| -> u16 {
+            let (handle, rx) = crate::event_stream::test_worker_handle(
+                8,
+                crate::event_stream::DataplaneEventRateLimitConfig {
+                    events_per_second: 0,
+                    burst: 0,
+                },
+            );
+            let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+            let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+            let flow = SessionFlow {
+                src_ip: src,
+                dst_ip: dst,
+                forward_key: SessionKey {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: PROTO_TCP,
+                    src_ip: src,
+                    dst_ip: dst,
+                    src_port: 40000,
+                    dst_port: 443,
+                },
+            };
+            let meta = UserspaceDpMeta {
+                ingress_ifindex: LAN_IFINDEX_6722 as u32,
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                ..UserspaceDpMeta::default()
+            };
+            let decision = SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex,
+                    tx_ifindex: egress_ifindex,
+                    tunnel_endpoint_id: 0,
+                    next_hop: None,
+                    neighbor_mac: None,
+                    src_mac: None,
+                    tx_vlan_id: 0,
+                },
+                nat: NatDecision::default(),
+            };
+            let metadata = SessionMetadata {
+                ingress_zone: TEST_LAN_ZONE_ID,
+                egress_zone: 0,
+                owner_rg_id: 0,
+                fabric_ingress: false,
+                is_reverse: false,
+                nat64_reverse: None,
+                log_session_init: false,
+                log_session_close: false,
+                policy_id: 0,
+                inactivity_timeout_ns: None,
+                policy_counter: None,
+                policy_counter_idx: 0,
+            };
+
+            emit_cached_output_filter_log_tail(
+                &fw,
+                Some(&handle),
+                &flow,
+                meta,
+                decision,
+                &metadata,
+                crate::filter::FilterLogMatch {
+                    filter_id: 23,
+                    term_id: 6,
+                    action: crate::filter::FilterAction::Accept,
+                },
+                false,
+                123,
+            );
+
+            let event = rx
+                .try_recv()
+                .expect("cached output filter-log event")
+                .decode_dataplane_event()
+                .expect("filter-log payload");
+            assert_eq!(event.ingress_zone_id, TEST_LAN_ZONE_ID);
+            event.egress_zone_id
+        };
+
+        assert_eq!(
+            logged_zone_for(SHARED_TUNNEL_IFINDEX_6722),
+            0,
+            "the PRODUCTION cached-output path must log the adjudicated 0 for an \
+             ambiguous ifindex, not the sibling unit's zone"
+        );
+
+        // The DISCRIMINATOR: a MAC-less zoned tunnel has no egress row, so only
+        // a caller that still routes through the resolver reports its zone. A
+        // raw `state.egress` read here yields 0.
+        assert!(
+            !fw.egress.contains_key(&ZONED_TUNNEL_IFINDEX_6722),
+            "precondition: no egress row, so the #6713 fallback is the only \
+             thing that can resolve this zone"
+        );
+        assert_eq!(
+            logged_zone_for(ZONED_TUNNEL_IFINDEX_6722),
+            TEST_SIBLING_VPN_ZONE_ID_6722,
+            "the PRODUCTION path must still resolve a MAC-less zoned tunnel's \
+             zone through the resolver -- an `egress`-only read logs 0 here"
+        );
+    }
+
+    /// #6722 at the log site: the log field is derived from the SAME resolver
+    /// the policy plane adjudicates with, so an AMBIGUOUS ifindex must log 0
+    /// here too. A log naming `vpnb` for transit the firewall denied under the
+    /// default policy would send an operator hunting a `lan->vpnb` rule that
+    /// never ran.
+    #[test]
+    fn filter_log_egress_zone_id_reports_no_zone_for_an_ambiguous_ifindex_6722() {
+        let fw = forwarding_with_macless_egress();
+        assert!(
+            !fw.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+            "precondition: MAC-less, so no egress row"
+        );
+        assert_eq!(
+            fw.ifindex_to_zone_id
+                .get(&SHARED_TUNNEL_IFINDEX_6722)
+                .copied()
+                .unwrap_or(0),
+            TEST_SIBLING_VPN_ZONE_ID_6722,
+            "precondition: the map the log site must NOT read carries a real \
+             nonzero zone for this ifindex"
+        );
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, SHARED_TUNNEL_IFINDEX_6722),
+            0,
+            "the logged to-zone must be the adjudicated 0, not the sibling's zone"
         );
     }
 }
