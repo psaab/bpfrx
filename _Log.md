@@ -97280,3 +97280,42 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/wireguard_multiport_warning_1434_test.go,
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
+
+## #7102 — SetSyncReady's comment guaranteed a promotion gate deleted in 0781f7a60
+
+- **Timestamp**: 2026-08-21
+- **Action**: Corrected three source comments (and one doc section) that told a
+  reader RG promotion is gated on session-sync readiness in private-rg-election
+  mode. It is not, at `origin/master` f8e720c3e. Established firsthand:
+  `m.syncReady` is written and read only inside `pkg/cluster/sync_state.go`;
+  the complete non-test caller list for `IsSyncReady()` is the readiness
+  timeout at `pkg/daemon/daemon_ha_sync.go:45` plus two log fields at `:80` and
+  `:130`; and the readiness conjunction at
+  `pkg/daemon/daemon_ha_userspace_readiness.go:215` is
+  `ifReady && takeoverGateReady && fabricReady && userspaceReady` with no sync
+  term — `takeoverGateReady` in this mode is `checkNoRethTakeoverReadiness` →
+  `checkVIPReadiness`, i.e. VIP ownership alone. `git show 0781f7a60` confirms
+  the gate existed (`vrrpReady = d.cluster.IsSyncReady()`, blocker "session
+  sync not ready") and that the same commit replaced it with the VIP-only
+  check, with an empty commit body — so the rationale is unavailable. Per the
+  work item the gate was NOT restored (that is #110's scope and a behaviour
+  change); the comments now say plainly that promotion is not sync-gated, so a
+  reader is not misled in either direction. Sites: `SetSyncReady` doc
+  (sync_state.go), the `syncReady` field comment (manager.go), the
+  private-rg-election `armSyncReadyTimer` note (daemon_run_bringup.go, which
+  also claimed "without this ... would never become primary"), and a new
+  subsection in docs/session-sync-architecture.md, whose connection-lifecycle
+  list invites the same inference. Binding: the existing
+  `TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady` already pinned the
+  behaviour but was uncited and used a fixture with BOTH `no-reth-vrrp` and
+  (by compiler default) `private-rg-election` set, so it could not say which
+  term selected the branch; added
+  `TestTakeoverReadinessForRG_PrivateRGElectionIgnoresClusterSyncReady_7102`
+  with `NoRethVRRP` asserted FALSE, and cited both from the comment. Mutation:
+  restoring the gate in `takeoverReadinessForRG` reds BOTH (rc=1 from `$?`,
+  reason `[session sync not ready]`). Comments, one test and docs — `git diff`
+  shows zero non-comment lines in the production Go files; no runtime change,
+  nothing reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/cluster/sync_state.go, pkg/cluster/manager.go,
+  pkg/daemon/daemon_run_bringup.go, pkg/daemon/vip_readiness_test.go,
+  docs/session-sync-architecture.md, _Log.md
