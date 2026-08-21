@@ -232,16 +232,30 @@ func buildTracerouteArgv(req TracerouteRequest) []string {
 //
 // This is the one surface that cannot say "not loaded", and the omission is
 // knowing rather than accidental. It takes three independent loads of the
-// cell — IsLoaded here, dpProbe below, and GetMapStats further down — where
-// the gRPC and CLI peers were converted to a single resolution in #2114.
-// The outcome is equivalent, because every load of an empty cell agrees, so
-// this is not a correctness gap. It is a SURFACE gap: for identical daemon
-// state gRPC and CLI print "Dataplane not loaded", while REST returns 200
-// with an empty list, which a client cannot distinguish from a healthy
-// firewall that simply has no buffers. The divergence predates this change.
-// It is recorded here because this is the change that made every other
-// surface deliberately uniform, which is what turns leaving REST alone into
-// a decision instead of an oversight.
+// cell — IsLoaded here, dpProbe below, and GetMapStats further down. The
+// gRPC and CLI peers now take one load each, but they did not get there in
+// a single step: #2114 converted only their USERSPACE arm, and their
+// map-stats arm still ended in a second load (dp.SessionCount()) until
+// #6743 r4-F1. Do not read the peers as a finished pattern this handler
+// was measured against; read them as a pattern that took two passes.
+//
+// The outcome here is nonetheless equivalent, and the reason is NOT that
+// "every load of an empty cell agrees" — that answers a different
+// question, since the interesting schedule is a cell that is FULL at load
+// 1 and empty afterwards. What actually saves it is that both later loads
+// FAIL CLOSED to the same body the early return produces: on an emptied
+// cell dpProbe() resolves nil so the Status() assertion fails, and
+// GetMapStats() returns nil so the loop appends nothing and writeOK emits
+// the same empty list as the `!IsLoaded()` return above. A torn view is
+// therefore byte-identical to the untorn one.
+//
+// What remains is a SURFACE gap: for identical daemon state gRPC and CLI
+// print "Dataplane not loaded", while REST returns 200 with an empty list,
+// which a client cannot distinguish from a healthy firewall that simply
+// has no buffers. The divergence predates this change. It is recorded here
+// because this is the change that made every other surface deliberately
+// uniform, which is what turns leaving REST alone into a decision instead
+// of an oversight.
 func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeOK(w, []BufferInfo{})

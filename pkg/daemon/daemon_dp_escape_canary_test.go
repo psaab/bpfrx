@@ -93,26 +93,36 @@ import (
 // GENERAL. R2 proves a value CAME FROM liveDataplane(); only R5's
 // syntactic special-case says anything about WHEN, and it does so by
 // enumerating the deferring forms (`go`, `defer`, a literal that is not
-// immediately invoked) rather than by deriving execution order. Two things
-// therefore remain outside it, and are stated rather than papered over:
+// immediately invoked) rather than by deriving execution order.
 //
-//   - A wiring that crosses a function boundary — but NOT uniformly, and
-//     the split was measured rather than reasoned. At a site guarded by
-//     R3 the crossing is CAUGHT, not hidden: R3 does not analyse the
-//     callee at all. It requires the composite-literal field to be
-//     live-derived in the CALLER body, so moving the assignment into a
-//     helper that writes the probe through a pointer DEFEATS R3 rather
-//     than escaping it. That exact shape was built at the gRPC site and
-//     the canary redded on it, naming startGRPCServer. What genuinely
-//     remains unclaimed is `go d.wireConsole()` — R4's territory, keyed
-//     on cli.New's argument set, and not tested in either direction.
-//     An earlier revision of this bullet called both halves invisible.
-//     That is the dangerous direction to be wrong in: an understatement
-//     invites the next reader to skip the behavioural half believing the
-//     AST half cannot reach the site.
-//   - Any ordering that depends on runtime control flow rather than on
-//     syntax (a channel handshake, a sync.Once, a conditional that only
-//     assigns on a path taken later).
+// A wiring that crosses a function boundary is NOT one of the gaps, at
+// EITHER consumer, and the reason is structural rather than incidental:
+// R3 and R4 both require the value to be live-derived IN THE CALLER BODY
+// (liveness is computed per-function), and neither analyses the callee at
+// all. Moving the assignment into a helper therefore DEFEATS the rule
+// rather than escaping it, whatever the helper's shape. Both sites were
+// built and measured, not reasoned about:
+//
+//   - gRPC (R3): a helper writing the probe through a pointer into the
+//     config literal. The canary redded, naming startGRPCServer.
+//   - console CLI (R4): both readings of `go d.wireConsole()` —
+//     `go d.wireConsole(&cliDP)` with a pointer-writing helper, and the
+//     literal no-argument form with the probe hoisted to package scope.
+//     Each redded with R4's message, "daemon_run.go:Run calls cli.New
+//     without passing a management-probe value derived from
+//     liveDataplane()".
+//
+// An earlier revision listed that console-CLI site among the gaps, as
+// "unclaimed ... and not tested in either direction". It was false, and
+// false in the dangerous direction: a hedge placed inside a list of
+// limitations is not read as a hedge, it is read as a limitation, and it
+// invites the next reader to skip the behavioural half believing the AST
+// half cannot reach the site.
+//
+// ONE thing therefore remains outside R1-R5, and is stated rather than
+// papered over: any ordering that depends on runtime control flow rather
+// than on syntax (a channel handshake, a sync.Once, a conditional that
+// only assigns on a path taken later).
 //
 // Do not read a green run as "the probe is live at the instant the
 // consumer uses it". Read it as "no probe value in a production function

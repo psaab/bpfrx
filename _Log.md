@@ -80214,3 +80214,103 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   a harness artifact that cannot be caused by a comment edit; re-run at
   `GOTMPDIR=/dev/shm/T6` gave zero such failures.
 - **File(s)**: pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go
+- **Timestamp**: 2026-08-20 (fix/2114-dp-accessor, PR #6743 round 4)
+- **Action**: #6743 round 4 — folded a MERGE-BLOCK on the round-3 fold. Round 3
+  was written by the same parent who then dispatched an independent review of
+  it; the review refuted two of round 3's own clauses and found a live defect
+  underneath them.
+
+  **F1/F2 (BLOCKING) — a false single-load claim, stated four times, over a
+  render that measurably took two loads.** `showBuffers` asserted "r7: ONE
+  resolution feeds every decision in this render" and then ended its
+  map-stats arm with `s.dp.SessionCount()`. Under the live indirection that
+  is an independent cell load (`liveDataPlane.SessionCount` -> `resolve()`),
+  so the render described two instants. Four renders carried the same
+  residual while asserting the contract it violated: `pkg/grpcapi`
+  showBuffers + showBuffersDetail, and the `pkg/cli` peers. This PR's own
+  diff converted the SIBLING occurrence three lines away — the userspace arm
+  — in all four, and left the else-branch occurrence unconverted in all four.
+
+  Measured consequence with a fake whose every method is a counted cell load:
+  steady => 2 loads and "Active sessions: 7 IPv4, 3 IPv6, 10 total"; torn =>
+  2 loads, map table rendered, "Active sessions" line SILENTLY DROPPED. One
+  render describing two instants — the defect `pkg/dataplane/live.go` says r7
+  removed.
+
+  **Why the shipped guard could not fire.** `TestShowBuffersResolvesBackendOnce`
+  asserted `dp.resolves.Load() == 1`, but `oneShotIndirection` embedded
+  `*dataplane.Manager`, so `s.dp.SessionCount()` was served by the embedded
+  Manager and never touched the counter: the guard keyed on UNWRAP-CALL count
+  while the property is CELL-LOAD count, and the residual is precisely a load
+  that is not an Unwrap. Its fixture (`mapStatsBackend`, no `Status()`) drove
+  the map-stats arm — the exact arm carrying the unconverted line — and its
+  backend returned (0,0) sessions, so the dropped line was unobservable
+  either way. No CLI-side test asserted a load count at all. Confirmed
+  unbound at 6163445e9: reverting BOTH userspace-arm conversions left
+  `./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/... ./pkg/dataplane/...` rc=0
+  AND `./pkg/daemon/...` rc=0 — complete survivors.
+
+  Fixed in two halves, neither sufficient alone. (1) All four residuals now
+  read `backendSessionCount(backend)`; all 8 call sites across the two files
+  are the single-load form. (2) The guard is re-keyed from the proxy to the
+  property: `countingIndirection` / `cliCountingIndirection` route EVERY
+  backend-reaching method through one counted `load()` and shadow the
+  embedded Manager deliberately, the backends return (7,3) so the render's
+  `v4 > 0 || v6 > 0` gate makes the tear observable, and the grid gains a
+  USERSPACE-ARM row so this PR's own conversion is bound in the arm it
+  changed. CLI-side coverage is new
+  (`pkg/cli/cli_show_system_single_load_6743_test.go`); it did not exist.
+
+  Severity note: dormant today. `buildRuntimeDataPlane` -> `dpuserspace.Boot()`
+  -> `NewLegacyDataPlaneAdapter` has `Status()`, and ebpf/dpdk are
+  hard-rejected, so no shipped backend takes the map-stats arm. Not
+  downgraded on reachability: a false production claim stated four times, a
+  guard that cannot fire, and a live defect the moment a backend without
+  `Status()` is published.
+
+  Proof: 8-cell revert-per-conversion matrix (4 grpcapi + 4 cli, both arms,
+  both renders) — 8/8 rc=1, each cell redding exactly its own subtest and
+  leaving the other three green; pristine controls rc=0 (5 pass / 0 fail
+  each); an always-failing sentinel through the same invocation path rc=1, so
+  a green cell is distinguishable from a suite that never ran. Restore is by
+  file copy, never `git checkout --` (the new CLI guard is untracked and
+  every edit was unstaged). Each mutation was verified PRESENT before its run.
+
+  **F3a — round 3's canary bullet was false.** It said `go d.wireConsole()`
+  "genuinely remains unclaimed — R4's territory, and not tested in either
+  direction". Built in BOTH readings against the real production site —
+  `go d.wireConsole(&cliDP)` with a pointer-writing helper, and the literal
+  no-argument form with the probe hoisted to package scope — the canary REDs
+  in both, rc=1, with R4's message: "daemon_run.go:Run calls cli.New without
+  passing a management-probe value derived from liveDataplane()". Control
+  green post-restore, production block restored verbatim. R4 is the governing
+  rule, and it catches the site for the same structural reason R3 catches the
+  gRPC shape: liveness is computed per-function and must be established in
+  the CALLER body, so any boundary crossing breaks it. The bullet now says
+  that, and the residual list drops from two items to ONE (runtime control
+  flow ordering). The direction matters: the false bullet sat under "Two
+  things therefore remain outside it", one sentence after the paragraph
+  naming understatement as the dangerous direction — a hedge placed inside a
+  list of limitations is not read as a hedge, it is read as a limitation.
+
+  **F3b — round 3's REST doc comment was false and its reasoning was thinner
+  than its conclusion.** "where the gRPC and CLI peers were converted to a
+  single resolution in #2114" — they were converted in ONE ARM only; the
+  map-stats arm was not converted until F1 above. Corrected, and the peers
+  are now described as a pattern that took two passes rather than a finished
+  one. The conclusion (no torn view) is verified but the stated reason —
+  "every load of an empty cell agrees" — answers a different question, since
+  the interesting schedule is a cell FULL at load 1 and empty afterwards.
+  What actually saves it is that both later loads FAIL CLOSED to the same
+  body the early return produces: `dpProbe()` resolves nil so the `Status()`
+  assertion fails, `GetMapStats()` returns nil so the loop appends nothing,
+  and `writeOK` emits the same empty list. Verified against
+  `liveDataPlane.IsLoaded`/`GetMapStats`, both of which return the zero value
+  on an unresolved cell.
+
+  This round touches NO `.o`, no `userspace-xdp/`, and no protocol/wire file
+  — Go control-plane renders, their guards, and comments only.
+- **File(s)**: pkg/grpcapi/server_show_system.go,
+  pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
+  pkg/cli/cli_show_system.go, pkg/cli/cli_show_system_single_load_6743_test.go
+  (new), pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go

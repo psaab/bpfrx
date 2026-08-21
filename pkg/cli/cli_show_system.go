@@ -26,12 +26,19 @@ func (c *CLI) showSystemBuffers() error {
 	// the map branch and print "No BPF maps available" (a claim about a
 	// loaded backend's maps) instead of "Dataplane not loaded".
 	//
-	// r7: ONE resolution feeds every decision here. dataplane.Published()
+	// r7: ONE cell load feeds every decision here. dataplane.Published()
 	// (a predicate deleted in r2-B6 — it was `Unwrap(p) != nil`),
 	// dpProbe() and c.dp.GetMapStats() were three independent cell loads,
 	// so a setDataplane(nil) between them re-created the very confusion
 	// that check was added to prevent. Do not reintroduce a separate
-	// publication predicate here; it is the second resolution.
+	// publication predicate here; it is a second load.
+	//
+	// r4-F1 CORRECTION: r7 asserted this sentence here while the render
+	// still took TWO loads — the map-stats arm ended in
+	// c.dp.SessionCount(), which under the live indirection resolves the
+	// cell again. Only the userspace arm had been converted. No CLI-side
+	// test asserted a load count at all, so nothing could catch it. Now
+	// bound by TestCLIShowSystemBuffersTakesOneCellLoad.
 	backend := dataplane.Unwrap(c.dp)
 	if backend == nil {
 		fmt.Println("Dataplane not loaded")
@@ -84,8 +91,20 @@ func (c *CLI) showSystemBuffers() error {
 		fmt.Printf("\n%d map(s) at high utilization — consider increasing max_entries\n", warnings)
 	}
 
-	// Session counts
-	v4, v6 := c.dp.SessionCount()
+	// Session counts.
+	//
+	// #6743 r4-F1: backendSessionCount(backend), never c.dp.SessionCount().
+	// The live indirection resolves the cell INSIDE SessionCount as well
+	// (liveDataPlane.SessionCount -> resolve(), pkg/daemon's
+	// daemon_dp_live.go), so calling it here is a SECOND load of the same
+	// cell: the map table above would describe backend A while this line
+	// described whatever the cell held an instant later, and against an
+	// emptied cell it returns (0,0) and silently DROPS the "Active
+	// sessions" line rather than reporting anything. The userspace arm
+	// above was converted in the original #2114 pass for exactly this
+	// reason; this arm was missed there because no fixture entered it.
+	// Bound by TestCLIShowSystemBuffersTakesOneCellLoad.
+	v4, v6 := backendSessionCount(backend)
 	if v4 > 0 || v6 > 0 {
 		fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 	}
@@ -93,8 +112,10 @@ func (c *CLI) showSystemBuffers() error {
 }
 
 func (c *CLI) showSystemBuffersDetail() error {
-	// #2114/#6743-F3 + r7: same SINGLE-resolution contract as
-	// showSystemBuffers.
+	// #2114/#6743-F3 + r7: same SINGLE-LOAD contract as showSystemBuffers,
+	// including the session-count tail — which read c.dp.SessionCount()
+	// here too until the r4-F1 correction. Bound, for this render as well,
+	// by TestCLIShowSystemBuffersTakesOneCellLoad.
 	backend := dataplane.Unwrap(c.dp)
 	if backend == nil {
 		fmt.Println("Dataplane not loaded")
@@ -168,8 +189,20 @@ func (c *CLI) showSystemBuffersDetail() error {
 		fmt.Printf("  Status: %s\n\n", status)
 	}
 
-	// Session counts
-	v4, v6 := c.dp.SessionCount()
+	// Session counts.
+	//
+	// #6743 r4-F1: backendSessionCount(backend), never c.dp.SessionCount().
+	// The live indirection resolves the cell INSIDE SessionCount as well
+	// (liveDataPlane.SessionCount -> resolve(), pkg/daemon's
+	// daemon_dp_live.go), so calling it here is a SECOND load of the same
+	// cell: the map table above would describe backend A while this line
+	// described whatever the cell held an instant later, and against an
+	// emptied cell it returns (0,0) and silently DROPS the "Active
+	// sessions" line rather than reporting anything. The userspace arm
+	// above was converted in the original #2114 pass for exactly this
+	// reason; this arm was missed there because no fixture entered it.
+	// Bound by TestCLIShowSystemBuffersTakesOneCellLoad.
+	v4, v6 := backendSessionCount(backend)
 	if v4 > 0 || v6 > 0 {
 		fmt.Printf("Active sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 	}
