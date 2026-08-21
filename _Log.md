@@ -94648,3 +94648,105 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/nat_nptv6_helper_accepted_7077_test.go (new),
   pkg/dataplane/compiler_nat.go, pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/README.md, _Log.md
+
+## 2026-08-21 — drive #6882 to merge-ready: independent 13-cell mutation matrix, #6722 fixture repair
+
+- **Timestamp**: 2026-08-21
+- **Action**: Independent drive/verification pass over PR #6882 (#6304, bind the
+  LIVE mirror call site in `stage_flow_cache_hit`). The PR is a TEST-BINDING PR,
+  so the deliverable IS the binding: a finding that the binding does not bind
+  what it claims goes at the deliverable and blocks. Everything below is a
+  firsthand measurement in a private worktree, tree restored byte-clean
+  (`git status --porcelain` empty) after every cell.
+
+  **Merged master twice** (234 commits, then a further 112). `_Log.md` was the
+  only conflict both times: union-resolved and structurally checked — round 1
+  sections 1596+1656-1587=1665 observed 1665, `Timestamp` 3014+3137-3005=3146
+  observed 3146; round 2 sections 1665+1689-1656=1698 observed 1698, `Timestamp`
+  3146+3201-3137=3210 observed 3210; zero conflict markers; nothing dropped from
+  master either time. Round 2's single ours-side line delta is master's own edit
+  of a line this branch never touched (our side is byte-identical to the merge
+  base there), not a union artefact. No code file was union-resolved.
+  `docs/refactoring-audit-current.txt` regenerated after each merge via
+  `scripts/refactoring-audit.sh` (rc=0, no diff — already current).
+
+  **A RUNTIME-CLASS RED FOUND IN THE MERGE and fixed.**
+  `live_flow_cache_callsite_accounts_per_zone_traffic_6304` passes at the
+  pre-merge head `8dbd9e0c8` (rc=0) and FAILS at the merge commit (rc=101, in
+  isolation, `flow_cache_hit_tests.rs:1876`) — the untrust row was absent from
+  the snapshot entirely. Cause: #6722 rewrote
+  `ForwardingState::egress_zone_id` from a read of `egress[i].zone_id` into a
+  single read of the new `ifindex_unambiguous_zone_id` ledger.
+  `with_zone_accounting` seeded only `forwarding.egress`, which that resolver no
+  longer consults. Production is correct; the fixture had gone stale. Fixed by
+  seeding the ledger with the same ifindex -> zone the fixture already writes
+  into `egress` — which is what `populate_egress` does in production, so the
+  fixture still models a state the builder can produce. Stale half of the doc
+  comment corrected to name the map that is actually read.
+
+  **Mutation matrix, 13 cells at `e8a7dd9f5`.** Every cell: `cargo check
+  --tests --bins` rc=0 FIRST (0 `^error` lines), so every red is an assertion
+  and not a build break; then a full `cargo test --bins --no-fail-fast --
+  --test-threads=1` over all 4358 tests; reds listed are the COMPLETE tree-wide
+  failure set.
+
+  | cell | mutation at the LIVE call site | tree-wide reds |
+  |---|---|---|
+  | BASE | none | 0 among #6304 (1 unrelated wg flake, see below) |
+  | M1 | `config.rate` -> `1` (sampler dropped) | **6** #6304 cells |
+  | M2 | reserve-before-sample, open-coded | **2**: delegation canary + attempt count |
+  | M2b | same, via a RENAMED import | **2**: canary (first arm) + attempt count |
+  | M2c | reserve FIRST via renamed import, delegation KEPT | **1**: attempt count only |
+  | M3 | `Sampled(Ok(_)) => None` | **3** |
+  | M4 | commit the counter except on `Sampled(Err)` | **1**: `selected_full_queue_advances_sampler` |
+  | M5 | capture the clone AFTER the rewrite (code motion) | **1**: `selected_admitted_clone_reaches_target` |
+  | M6a | delete `forward_candidate_packets += 1` | **1** (2 of 6 ROWS, both forward) |
+  | M6b | delete `snat_packets += 1` | **1** (1 of 6 rows, `nat/snat`) |
+  | M6c | delete `dnat_packets += 1` | **1** (1 of 6 rows, `nat/dnat`) |
+  | M7 | `meta.pkt_len` -> `0` at `lookup_counted` | **1**: `counts_observed_bytes_on_the_hit` |
+  | M8 | delete the `record_zone_traffic` call | **1**: `accounts_per_zone_traffic` |
+
+  **M2c is the decisive cell.** Both arms of the source-text canary stay
+  satisfied — `sample_then_admit_mirror_clone(` is still present and
+  `admit_mirror_clone_to_live(` never appears, because the reservation is
+  reached through `use ... as reserve` — so the canary is GREEN and only the
+  runtime attempt count reds (`left: 1, right: 0`). That measures the PR's
+  central claim: the attempt-count instrument catches reserve-first in a
+  spelling source text cannot see. M2b shows why M2c was needed — M2b removes
+  the delegating call, so the canary's FIRST arm fires and the cell cannot
+  isolate.
+
+  **The last review's blocking finding (Codex @ `37d22ac39`: sequential
+  assertions cannot show independence) is CLOSED, re-measured here rather than
+  taken on the fold's word.** Every M6 cell panics at the single aggregate
+  assertion (`flow_cache_hit_tests.rs:2168`) reporting `N of 6 accounting rows
+  diverged. ALL 6 were evaluated`: M6a reds 2 rows, both naming the forward
+  increment, with BOTH NAT rows held in the same run; M6b reds only
+  `nat/snat_packets`; M6c reds only `nat/dnat_packets`. That is exactly the
+  property the fold claims — deleting increment X reds every row about X and no
+  row about either other increment.
+
+  **Reachability of the mutated site** (a red at a site production never reaches
+  measures nothing): `stage_flow_cache_hit` carries no `cfg` gate and is called
+  from the poll loop at `poll_descriptor/mod.rs:321`; the mirror block sits
+  behind the plain runtime `is_self_target && owned_packet_frame.is_none()`
+  condition, not behind a `cfg`. Every mutation cell's `cargo check --tests
+  --bins` includes the non-test `--bins` configuration and compiled the mutated
+  code, so the edits are in the shipped configuration and not `cfg(test)`
+  scaffolding.
+
+  **Production surface of this PR: none.** Everything it adds to a production
+  build is four un-gated `const _: [(); N]` layout assertions in
+  `binding_state/mod.rs` (compile-time only, fail-loud) plus comments; the
+  instrument bump, the thread-local, the `policy.rs` byte accessor, the module
+  hook and the re-export are all `#[cfg(test)]`. Test-only diff, so NO cluster
+  smoke is owed.
+
+  **Environment flake, not this PR**: `afxdp::wg::tests::framed_handshake::
+  concurrent_consume_response_and_reinitiation_is_sound` failed the BASE cell
+  with `no handshake completed — the race path was not exercised` (a PRECONDITION,
+  not the asserted property) while three other lanes were running full cargo
+  suites (load average 55 on 16 cores). It passed in the immediately preceding
+  full run on the same tree and in all 12 other cells. Filed separately.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs,
+  _Log.md
