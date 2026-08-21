@@ -177,7 +177,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 			"old-policy/new-route hybrid as the applied config (#5680)")
 	}
 
-	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 			slog.Warn("userspace: failed to disarm helper after refusing overlay publish",
 				"protocol_err", err, "err", disarmErr)

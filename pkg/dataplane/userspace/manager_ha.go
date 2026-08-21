@@ -163,7 +163,12 @@ func (m *Manager) SyncFabricState() {
 	if build == nil {
 		build = buildFabricSnapshots
 	}
-	fabrics := build(m.lastSnapshot.Config)
+	// #6691 round 11: the refresh carries MACs, ifindexes and link state — never
+	// a device-level binding verdict. The builder re-samples the kernel, and a
+	// verdict re-decided here would apply to a snapshot whose interface rows are
+	// still the applied ones, on two planes that neither replan on this path.
+	// alignFabricVerdicts (fabric.go) holds the reasoning.
+	fabrics := alignFabricVerdicts(build(m.lastSnapshot.Config), m.lastSnapshot)
 	if len(fabrics) == 0 {
 		return
 	}
@@ -602,6 +607,79 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
 	}
+	// #6871 (round 6): DEFER, do not send, while a RETH MAC link cycle owns the
+	// dataplane. set_forwarding_state lands in handlers/forwarding.rs, which
+	// calls reconcile_status_bindings UNCONDITIONALLY -> afxdp.reconcile ->
+	// SPAWNS WORKER THREADS. PrepareLinkCycle has just joined those threads so
+	// the NIC can unmap their UMEM pages; respawning them mid-cycle is the
+	// use-after-unmap #5103 exists to prevent.
+	//
+	// The gate is HERE, at the emitter, rather than at any one caller, because
+	// three callers reach it and only one of them was covered. The 1 Hz status
+	// tick's call (process_status.go) is already inside the tick's own lease
+	// skip, and the compile path's (manager_compile.go) runs under the daemon's
+	// applySem, which the RETH MAC loop also holds — but UpdateHAWatchdog's does
+	// NOT: the daemon's watchdog heartbeat is its own 500ms goroutine
+	// (daemon_ha_sync.go) with no applySem, and its first/change/backstop branch
+	// reaches this function through syncHAStateLocked. Gating here covers all
+	// three, and any future caller that publishes forwarding state THROUGH THIS
+	// FUNCTION; gating UpdateHAWatchdog would have closed one hole and left the
+	// shape that produced it.
+	//
+	// #6871 (round 7): the scope of that sentence is exactly as written, and an
+	// earlier revision overstated it as "all three and any future fourth". This
+	// gate is not a chokepoint for the request type. Three other sites build a
+	// raw set_forwarding_state of their own and do not consult the lease:
+	//
+	//   - SetForwardingArmed (manager_status.go) — the operator verb, which is
+	//     gated at its OWN entry point instead (errLinkCycleInFlight);
+	//   - disarmBeforeUnsupportedPublishLocked (below in this file) — UNGATED,
+	//     reachable only from the compile/publish path, i.e. under applySem;
+	//   - disarmSnapshotProtocolFailureLocked (manager_compile.go) — UNGATED,
+	//     reachable from the same compile path and from the policy-scheduler and
+	//     route-overlay republishes, all of which serialize on applySem too.
+	//
+	// So there is no runtime escape today, but the reason is applySem for those
+	// two, not this gate. A future publisher that runs off applySem — as the
+	// watchdog heartbeat does — would need its own answer, and this line is the
+	// place that says so rather than implying it is already handled.
+	//
+	// The watchdog's OTHER half is deliberately NOT suppressed, and the reason is
+	// concrete rather than cautious. The shim map write in UpdateHAWatchdog is the
+	// kernel-visible liveness signal the BPF ~2s stale window depends on. The
+	// update_ha_state IPC is that same signal in its socket form: it is the ONLY
+	// thing that refreshes the helper's per-RG forwarding lease
+	// (Coordinator::update_ha_state -> HAGroupRuntime::active_lease_until ->
+	// ActiveUntil(watchdog + HA_WATCHDOG_STALE_AFTER_SECS), 10s in
+	// userspace-dp/src/afxdp/mod.rs), and is_forwarding_active consults that lease
+	// per packet. Gating it for the length of a link cycle — whose lease TTL is
+	// 60s — would expire the helper's forwarding lease outright. That is an
+	// OUTAGE, strictly worse than the respawn race being closed, and it is why
+	// the gate is on the set_forwarding_state emitter rather than on
+	// UpdateHAWatchdog as a whole.
+	//
+	// update_ha_state is also safe to let through on its own terms, though not
+	// for the absolute reason an earlier revision gave (#6871 round 7: "reaches
+	// neither reconcile_status_bindings nor any other worker spawn" is not
+	// literally true). Its handler (server/handlers/ha.rs) does call
+	// refresh_status on success, and refresh_status can repair the WG and GRE
+	// auxiliary threads. What it does NOT do is call reconcile_status_bindings or
+	// anything else that spawns the AF_XDP PACKET workers — the only threads
+	// whose UMEM a link cycle's unmap can race. And after a successful
+	// stop_workers the helper has already cleared its worker/WG/GRE records, so
+	// refresh_status finds nothing to repair either. The conclusion stands; the
+	// phrasing now matches the handler.
+	//
+	// Deferral, not loss: the decision is LEVEL-triggered on persistent state
+	// (desiredForwardingArmedLocked vs m.lastStatus.ForwardingArmed), so the
+	// first call after the lease ends re-evaluates the same delta and sends it.
+	// The 1 Hz tick alone guarantees that within a second of NotifyLinkCycle,
+	// and returning nil (rather than an error) is what keeps this a deferral —
+	// the callers log or propagate an error, and nothing here has failed.
+	if m.linkCycleInFlight() {
+		slog.Debug("userspace: deferring set_forwarding_state; RETH MAC link cycle in flight")
+		return nil
+	}
 	desired := m.desiredForwardingArmedLocked()
 	if m.lastStatus.ForwardingArmed == desired {
 		return nil
@@ -622,13 +700,27 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	// operator commit, does not revert the active config, so m.lastSnapshot
 	// keeps requiring the protocol). Scoped exactly like SetForwardingArmed:
 	// only the ARM direction is gated; a disarm (desired==false — shutdown,
-	// demotion, disarmSnapshotProtocolFailureLocked) must NEVER be blocked. The
-	// gate is a no-op unless the last-applied config requires the protocol, and
+	// demotion, disarmSnapshotProtocolFailureLocked) must NEVER be blocked, and
 	// it re-polls the helper first so a helper that has since upgraded still
 	// arms normally. Fail closed: leave the helper disarmed and surface the
 	// error to the poll caller (logged), rather than re-arm a stale image.
+	//
+	// #6722 WIDENED WHAT THIS REFUSES. Three of the four gates in the chain are
+	// no-ops unless the config uses their feature; the fourth
+	// (ensureEgressZoneProtocolLocked) takes no config and fires for ANY
+	// last-applied config, because every snapshot carries EgressZone. This tick
+	// therefore now refuses to arm a version-mismatched helper on every config,
+	// not only a protocol-requiring one — the right answer, since such a helper
+	// cannot decode a v5 snapshot at all, and the reason the refusal must live
+	// HERE and not only at the operator-arm path: this runs unattended about
+	// once a second, so an ungated tick re-arms the stale image with nobody
+	// asking. What still scopes it is the OBSERVED helper version, which is
+	// unknown before the first handshake and returns nil then (#1960 no-brick).
+	// Bound by TestEgressZoneProtocolGatesBothArmPaths_6722/ha-reconcile-tick,
+	// which drives an EMPTY config.Config{} so no sibling gate can be the one
+	// answering.
 	if desired && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
-		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return err
 		}
 	}
@@ -673,8 +765,13 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 
 	// Only log on real transitions. The reconcile loop retries this
 	// call whenever applied != desired (see #757), so emitting INFO
-	// on every call floods journald at 9+ lines/sec when the helper
-	// is down. First-seen registration counts as a transition.
+	// on every call floods journald when the helper is down. The rate
+	// is the reconcileRGStateLoop ticker in daemon_ha.go — 2s, plus
+	// early wakes on dropped-event notifications — times the RG count,
+	// so ~1.5 lines/sec on the cluster's three RGs, sustained for as
+	// long as the helper stays down. (#6871: an earlier revision said "9+
+	// lines/sec", derived from a 500ms period that loop has never had.)
+	// First-seen registration counts as a transition.
 	if !known || prior.Active != active {
 		slog.Info("userspace: RG state updated (helper stays in control)",
 			"rg", rgID, "active", active)

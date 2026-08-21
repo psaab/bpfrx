@@ -24,6 +24,27 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
 	}
+	// #6812: poison the pools that do not fit the #5877 aggregate cardinality
+	// budget (opus-review-001 R73). A STRICT commit never reaches this builder
+	// with an over-budget config (the gate hard-rejects it), so this only ever
+	// fires for a TOLERATED config — lenient load / peer-sync, where the gate
+	// downgrades to a warning (#1960 no-brick). Before this poison the builder
+	// shipped the full pool set and the Rust apply boundary eagerly built
+	// every pool's per-address occupancy bitmap (three full-range /16 pools =
+	// 12,683,575,296 bitmap bits, ~1.48 GiB). The marked pools install nothing
+	// (fail-closed, matching the missing/empty/invalid markers below) and the
+	// Rust boundary independently re-derives admission over what survives —
+	// the first-fit rule is shared (SourceNATAggregateOverBudgetPools /
+	// resolve_pool_allocators), so Go and the dataplane agree on which pools
+	// live. Precisely: a poisoned pool builds no PendingPoolAllocator, so the
+	// set Rust considers is exactly the set Go admitted, whose total charge
+	// already fits every budget — Rust therefore refuses none of it, whatever
+	// order the slice arrives in and whether or not its keys are reused (the
+	// argument is written out on SourceNATAggregateOverBudgetPools). Rust
+	// refusing a pool of its OWN is reserved for the snapshots no Go poison is
+	// coming for: a tolerated, older control plane's, or handcrafted one. The over-budget compile warning still tells the operator to shrink
+	// the config; this marker makes the degraded state per-pool visible.
+	overBudgetPools := config.SourceNATAggregateOverBudgetPools(cfg)
 	out := make([]SourceNATRuleSnapshot, 0)
 	for _, rs := range cfg.Security.NAT.Source {
 		if rs == nil {
@@ -80,48 +101,56 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 					poolUnusable = true
 					poolUnusableReason = "missing_pool"
 				} else {
-					if pool.Address != "" {
-						poolAddresses = append(poolAddresses, pool.Address)
-					}
-					poolAddresses = append(poolAddresses, pool.Addresses...)
-					if len(poolAddresses) == 0 {
-						slog.Warn("userspace snapshot: marking source NAT rule with empty pool unusable",
-							"rule", rule.Name, "pool", rule.Then.PoolName)
-						poolUnusable = true
-						poolUnusableReason = "empty_pool"
-					}
-					// #5875: an IPv6 pool address carrying a `%<zone>` scope
-					// qualifier (`fe80::1%eth0`) is not dataplane-representable —
-					// the Rust allocator parses each member as std::net::IpAddr,
-					// which has no zone model, so expand_pool_address returns false
-					// and the whole pool is marked InvalidPool and dropped. The
-					// strict commit gate (validateSourceNATPoolAddressScopeStrict)
-					// hard-rejects this; on the tolerant load / peer-sync path that
-					// gate only warns, so fail CLOSED here — mark the pool unusable
-					// rather than ship the unparseable string to Rust. A global SNAT
-					// pool address never needs an interface scope.
-					for _, a := range poolAddresses {
-						if config.PoolAddressHasZoneScope(a) {
-							slog.Warn("userspace snapshot: marking source NAT rule with zone-scoped pool address unusable",
-								"rule", rule.Name, "pool", rule.Then.PoolName, "address", a)
-							poolUnusable = true
-							poolUnusableReason = "zone_scoped_pool_address"
-							break
-						}
-					}
+					poolAddresses = config.SourceNATPoolMembers(pool)
 					// #3906: `port no-translation` preserves the source port.
 					// The dataplane takes the address-only path and ignores the
 					// port range in this mode, so a defaulted/valid range is
 					// fine even when no-translation is set.
 					poolNoTranslation = pool.PortNoTranslation
-					var valid bool
-					portLow, portHigh, valid = sourceNATPoolPortRange(pool)
-					if !valid {
-						slog.Warn("userspace snapshot: marking source NAT rule with invalid pool port range unusable",
-							"rule", rule.Name, "pool", rule.Then.PoolName,
+					portLow, portHigh, _ = config.SourceNATPoolPortRange(pool)
+					// #6812 F1: ONE predicate decides a pool is unusable from its
+					// DEFINITION — empty membership, a member the Rust expander
+					// cannot honor (unparseable, malformed mask, or an
+					// over-capacity prefix; round 2), a `%zone` member that is not
+					// dataplane-representable (#5875), or a port range the parser
+					// rejected (#5457). config.SourceNATPoolUnusableReason is the
+					// SSOT that the aggregate budget walk
+					// (sourceNATAggregateReferencedCharges) also reads to EXCLUDE
+					// such a pool from the budget, so the set this builder poisons
+					// and the set the budget charges cannot drift apart. Before
+					// they shared it, the 1,024 pools this loop marked unusable
+					// still consumed the whole pool-count budget and the next
+					// healthy pool was poisoned "aggregate_over_budget" — a pool
+					// the dataplane would have installed.
+					//
+					// Round 2 widened the predicate rather than adding a second
+					// skip beside it, because the runtime's pool grammar is
+					// ALL-OR-NOTHING: `expand_pool_address` failing on ONE member
+					// fails the whole pool as InvalidPool. A pool mixing a valid
+					// member with a bad one was therefore marked usable here,
+					// charged the budget, and installed nothing there. The
+					// "invalid_pool" reason it now carries decodes to exactly the
+					// SourceNatFailureReason::InvalidPool the Rust parse loop
+					// reached on its own, so the dataplane disposition of such a
+					// pool is unchanged — but it is now visible in this warning
+					// and excluded from the budget.
+					if reason := config.SourceNATPoolUnusableReason(pool); reason != "" {
+						slog.Warn("userspace snapshot: marking source NAT rule with unusable pool",
+							"rule", rule.Name, "pool", rule.Then.PoolName, "reason", reason,
 							"port_low", pool.PortLow, "port_high", pool.PortHigh)
 						poolUnusable = true
-						poolUnusableReason = "invalid_port_range"
+						poolUnusableReason = reason
+					}
+					// #6812: a pool that does not fit the #5877 aggregate
+					// cardinality budget on the TOLERANT path is marked
+					// unusable so the dataplane never builds its occupancy
+					// bitmap. Checked AFTER the more specific per-pool
+					// markers so those keep their precise reason.
+					if !poolUnusable && overBudgetPools[rule.Then.PoolName] {
+						slog.Warn("userspace snapshot: marking source NAT rule with over-budget aggregate pool unusable",
+							"rule", rule.Name, "pool", rule.Then.PoolName)
+						poolUnusable = true
+						poolUnusableReason = "aggregate_over_budget"
 					}
 					if pool.PersistentNAT != nil {
 						persistentNAT = true
@@ -237,62 +266,27 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 
 // Source-NAT context-specificity tiers (#4161). LOWER = more specific = higher
 // precedence, matching Junos rule-set selection (interface most specific).
+//
+// #6812 F3: the tier definition moved to pkg/config (SourceNATScopeTier) so the
+// emission order here and the aggregate budget walk's first-fit order
+// (config.sourceNATAggregateReferencedCharges) read ONE definition. These
+// aliases keep the local spelling for this file and its #4161 tests.
 const (
-	snatTierInterface       = 0
-	snatTierZone            = 1
-	snatTierRoutingInstance = 2
-	snatTierUnscoped        = 3
+	snatTierInterface       = config.SourceNATTierInterface
+	snatTierZone            = config.SourceNATTierZone
+	snatTierRoutingInstance = config.SourceNATTierRoutingInstance
+	snatTierUnscoped        = config.SourceNATTierUnscoped
 )
 
 // sourceNATScopeTier returns the Junos context-specificity tier of a
-// source-NAT rule-set snapshot (#4161). A rule-set may carry both a `from` and
-// a `to` context, and they may be of different kinds; either context narrows
-// the match, so the MORE-SPECIFIC of the two governs the rule-set's
-// precedence: tier = MIN(from-tier, to-tier). This MIN default is the
-// vSRX-pinned semantic (confirmed by the L-9 overlap tests).
+// source-NAT rule-set snapshot (#4161) — the MIN of its from- and to-context
+// tiers. The rule (including why an EMPTY context, not a zone literally named
+// "any", is the wildcard) lives on config.SourceNATScopeTier.
 func sourceNATScopeTier(s SourceNATRuleSnapshot) int {
-	from := scopeContextTier(s.FromInterface, s.FromZone, s.FromRoutingInstance)
-	to := scopeContextTier(s.ToInterface, s.ToZone, s.ToRoutingInstance)
-	if to < from {
-		return to
-	}
-	return from
-}
-
-// scopeContextTier maps a single from/to context to its specificity tier
-// (#4161): interface=0, zone=1, routing-instance=2.
-//
-// The wildcard / match-any context is the EMPTY string on every axis (all
-// three args ""), which falls through to snatTierUnscoped (3). That empty
-// value is exactly what the compiler emits for an absent `from`/`to` clause:
-// collectNATScopes (pkg/config/compiler_nat.go:1083-1088) defaults a missing
-// side to {kind:"zone", value:""} → FromZone/ToZone "" — the legacy
-// global/match-any scope. So "wildcard" here means empty, NOT a zone named
-// "any": a NON-EMPTY zone (tier 1) is always a SPECIFIC zone, and a literal
-// `from zone any` is FromZone="any", a specific zone literally named "any", not
-// a wildcard. This is CONSISTENT with the Rust eligibility check
-// (source.rs scope_matches: `!from_zone.is_empty() && from_zone != ingress`),
-// which only special-cases the empty string and matches "any" literally. NAT
-// rule-set from/to-contexts do NOT treat "any" as a wildcard (unlike security
-// policies' from-zone/to-zone). A future maintainer must not special-case
-// "any" as tier-unscoped — that would diverge from the matcher and mis-tier a
-// legitimately-named zone.
-//
-// A Junos from/to clause names exactly one kind of context; a hostile config
-// that sets more than one is ranked by its most-specific present field (the
-// Rust scope_matches AND-filters every set field regardless, so this only
-// affects precedence, never eligibility).
-func scopeContextTier(iface, zone, routingInstance string) int {
-	switch {
-	case iface != "":
-		return snatTierInterface
-	case zone != "":
-		return snatTierZone
-	case routingInstance != "":
-		return snatTierRoutingInstance
-	default:
-		return snatTierUnscoped
-	}
+	return config.SourceNATScopeTier(
+		s.FromInterface, s.FromZone, s.FromRoutingInstance,
+		s.ToInterface, s.ToZone, s.ToRoutingInstance,
+	)
 }
 
 // natProtoAny is the source-NAT match-term protocol wildcard, mirroring the
@@ -524,28 +518,7 @@ func deterministicSourceNATFields(pool *config.NATPool, portLow, portHigh uint16
 	return 1, uint16(det.BlockSize), uint16(bpi), binary.BigEndian.Uint32(base), hc
 }
 
-func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
-	if pool == nil {
-		return 0, 0, false
-	}
-	// #5457: an explicitly-configured but invalid port range (rejected by
-	// parseSourcePoolPortRange; PortLow/PortHigh left at the default) must NOT
-	// silently install the defaulted 1024-65535 range on the tolerant load /
-	// peer-sync path. Mark the pool unusable so it installs nothing rather than
-	// translating over a range the operator did not configure.
-	if pool.PortRangeInvalidSpec != "" {
-		return 0, 0, false
-	}
-	low := pool.PortLow
-	if low == 0 {
-		low = 1024
-	}
-	high := pool.PortHigh
-	if high == 0 {
-		high = 65535
-	}
-	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
-		return 0, 0, false
-	}
-	return uint16(low), uint16(high), true
-}
+// sourceNATPoolPortRange moved to config.SourceNATPoolPortRange in #6812 F1 —
+// the aggregate budget walk (pkg/config) has to read the SAME "is this pool's
+// port range usable" verdict this builder does, or it charges budget for pools
+// that install nothing. See config.SourceNATPoolUnusableReason.

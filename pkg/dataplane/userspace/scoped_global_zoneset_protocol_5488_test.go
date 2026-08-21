@@ -122,7 +122,7 @@ func TestScopedGlobalMultiZoneDenyIsNotNarrowableByPreV4Helper(t *testing.T) {
 	// aborted commit.
 	m := New()
 	m.lastStatus.ConfigSnapshotProtocolVersion = preV4SnapshotProtocolVersion
-	gateErr := m.ensureRequiredSnapshotProtocolLocked(cfg)
+	gateErr := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg))
 	if !errors.Is(gateErr, ErrScopedGlobalZoneSetProtocolIncompatible) {
 		t.Errorf("ensureRequiredSnapshotProtocolLocked against a pre-v4 helper = %v, "+
 			"want ErrScopedGlobalZoneSetProtocolIncompatible (helper must be disarmed, not fed a "+
@@ -137,7 +137,7 @@ func TestScopedGlobalMultiZoneDenyIsNotNarrowableByPreV4Helper(t *testing.T) {
 	// A helper at the current version is not gated.
 	m2 := New()
 	m2.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
-	if err := m2.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m2.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg)); err != nil {
 		t.Errorf("current-version helper gated: %v, want nil", err)
 	}
 }

@@ -144,27 +144,29 @@ func TestCustomLoginClassNoPrivEsc(t *testing.T) {
 	}
 }
 
-// TestCustomLoginClassDenyCommandsAdvisory pins FIX 2: a class with
-// deny-commands must get an advisory that explicitly states the class becomes
-// MORE PERMISSIVE than the Junos config (not merely "not enforced").
-func TestCustomLoginClassDenyCommandsAdvisory(t *testing.T) {
+// TestCustomLoginClassDenyCommandsRejected supersedes the #4304 FIX 2
+// advisory. #4304 accepted a deny-commands class at commit and merely warned
+// that it was MORE PERMISSIVE than the Junos config; #5831 concluded that
+// telling an operator their restriction is inert is not good enough when we
+// can simply refuse it, and made the strict path hard-reject.
+//
+// The #4304 intent — an operator must never silently get a class weaker than
+// they wrote — is preserved and strengthened here: strict rejects outright, and
+// the tolerant path folds the class down to the repair floor rather than
+// leaving it MORE-permissive (see TestLoginClassDenyToleratedButFolded,
+// TestLoginClassDenyFoldKeepsTheRepairPath and the rest of
+// login_class_deny_5831_test.go).
+func TestCustomLoginClassDenyCommandsRejected(t *testing.T) {
 	tree := buildTree4303(t, []string{
 		"set system login class limited permissions all",
 		`set system login class limited deny-commands "request system reboot"`,
 		"set system login user carol class limited",
 	})
-	c, err := CompileConfig(tree)
-	if err != nil {
-		t.Fatalf("compile: %v", err)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("a class carrying an unenforced deny-commands must be REJECTED at commit, not accepted with an advisory")
 	}
-	found := false
-	for _, w := range c.Warnings {
-		if strings.Contains(w, "limited") && strings.Contains(w, "deny-commands") &&
-			strings.Contains(w, "MORE PERMISSIVE") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected a MORE-PERMISSIVE deny-commands advisory for class limited; warnings=%v", c.Warnings)
+	if !strings.Contains(err.Error(), "limited") || !strings.Contains(err.Error(), "deny-commands") {
+		t.Fatalf("rejection must name the class and the offending leaf; got %q", err)
 	}
 }

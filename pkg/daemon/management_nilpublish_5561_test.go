@@ -37,7 +37,7 @@ import (
 //
 // Without the pre-rebind publish the pin captured at step 3 is the DELETED
 // credential, and it keeps authenticating on the routable address for the whole
-// bounded drain plus every keep-alive connection already accepted. The pre-rebind
+// drain plus every keep-alive connection already accepted. The pre-rebind
 // publish is what makes the pinned value deny-all instead.
 //
 // The assertion is the consumer-visible one — whether the retired listener's own
@@ -133,7 +133,7 @@ func TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561(t *testing.T) {
 			"rebind: it is pinned at retirement (api.trackRetiring) and a nil cannot tighten "+
 			"it (api.authSlot.tighten drops a nil next by design). Retirement is asynchronous "+
 			"— the socket keeps accepting until the serve goroutine reaches Shutdown, and "+
-			"connections already accepted are served for the whole bounded drain — so this is "+
+			"connections already accepted are served for the whole drain — so this is "+
 			"a deleted credential live on a routable, MUTATING management API", live.Addr)
 	}
 	// It is pinned to DENY-ALL, not to nil: an unauthenticated caller is refused
