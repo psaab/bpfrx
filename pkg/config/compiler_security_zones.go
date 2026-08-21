@@ -523,11 +523,24 @@ func zoneInterfaceStanzaMembers(prop *Node) []string {
 //
 // A body keyword with NOTHING after it (`interfaces a host-inbound-traffic;`)
 // is NOT flagged: truncation loses nothing there, and rejecting it would be the
-// #4191 over-rejection class. Neither is a body keyword arriving as a CHILD
+// #4191 over-rejection class. Neither is a WELL-FORMED body arriving as a CHILD
 // node (`interfaces a { host-inbound-traffic {...} }`, and the bracket-list form
 // `interfaces [ a b ] { host-inbound-traffic {...} }`) — those spellings are
-// unambiguous, carry no tokens on Keys past a keyword, and compile their
-// override correctly today.
+// unambiguous and compile their override correctly today.
+//
+// A keyword arriving as a child node is NOT automatically safe, though, and
+// assuming it was is the #6735 escape this function was extended to close. The
+// `set` CLI reaches the ambiguous shape by DESCENT rather than by a Keys tail:
+// `host-inbound-traffic` is a schema child of the interface-name wildcard, so
+//
+//	set ... interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]
+//
+// parks `ge-0/0/1.0` in a leaf UNDER the keyword node instead of collapsing it
+// onto one Keys slice. Both this detector and zoneInterfaceMembers skipped
+// keyword children by name, so they agreed — and the statement committed with
+// ge-0/0/1.0 dropped. The child arm now asks
+// zoneInterfaceHostInboundStrayTokens whether the keyword's subtree holds
+// anything that cannot be body content, which is exactly the dropped-member set.
 func zoneInterfaceMemberPackedTail(iface *Node) (keyword string, tail []string, found bool) {
 	for i, k := range iface.Keys {
 		if k == "" {
@@ -541,16 +554,43 @@ func zoneInterfaceMemberPackedTail(iface *Node) (keyword string, tail []string, 
 				tail = append(tail, rest)
 			}
 		}
-		// Either way this node's CHILDREN are the body, not members, so the
-		// recursion below must not descend them — mirroring zoneInterfaceMembers,
-		// which returns as soon as hasBody is true. The matched keyword is
-		// returned rather than re-derived by the caller, so adding a second entry
-		// to zoneInterfaceBodyKeywords cannot leave the reject naming the wrong
-		// token.
-		return k, tail, len(tail) > 0
+		if len(tail) > 0 {
+			// This node's CHILDREN are the body, not members, so the recursion
+			// below must not descend them — mirroring zoneInterfaceMembers,
+			// which returns as soon as hasBody is true. The matched keyword is
+			// returned rather than re-derived by the caller, so adding a second
+			// entry to zoneInterfaceBodyKeywords cannot leave the reject naming
+			// the wrong token.
+			return k, tail, true
+		}
+		// Nothing follows the keyword ON KEYS, but the keyword's own CHILDREN
+		// may still carry dropped member tokens (#6735 secondary escape). That
+		// is the shape `set` produces whenever the keyword is the token
+		// immediately after the first bracket token, e.g.
+		//
+		//	set ... interfaces [ host-inbound-traffic ge-0/0/1.0 ]
+		//	  interfaces -> host-inbound-traffic -> leaf Keys=["ge-0/0/1.0"]
+		//
+		// Returning here without looking would let that statement commit with
+		// ge-0/0/1.0 silently dropped. Only tokens that cannot be BODY content
+		// count — see zoneInterfaceHostInboundStrayTokens.
+		if stray := zoneInterfaceHostInboundStrayTokens(iface); len(stray) > 0 {
+			return k, stray, true
+		}
+		return k, nil, false
 	}
 	for _, child := range iface.Children {
 		if zoneInterfaceBodyKeywords[child.Name()] {
+			// The keyword arrived as a CHILD NODE rather than on this node's
+			// Keys. Its own subtree is the member's BODY — except for tokens
+			// that cannot be body content, which are dropped members `SetPath`
+			// parked under the keyword (#6735 B1, the flat-set/`set` ingest of
+			// the headline statement `interfaces [ a host-inbound-traffic b ]`).
+			// Skipping the node outright — what this loop did before #6735 —
+			// is what let that statement commit with `b` silently dropped.
+			if stray := zoneInterfaceHostInboundStrayTokens(child); len(stray) > 0 {
+				return child.Name(), stray, true
+			}
 			continue
 		}
 		if kw, tail, ok := zoneInterfaceMemberPackedTail(child); ok {
@@ -558,6 +598,122 @@ func zoneInterfaceMemberPackedTail(iface *Node) (keyword string, tail []string, 
 		}
 	}
 	return "", nil, false
+}
+
+// zoneInterfaceHostInboundBodyKeywords is the set of tokens that may legally
+// appear directly UNDER a `host-inbound-traffic` node. It is DERIVED from the
+// schema factory the grammar itself uses (hostInboundSchemaChildren in
+// schema_security.go) rather than restated, because a divergence between the two
+// is always a bug: a body keyword missing here is read as a dropped member and
+// hard-rejected at commit (a false reject on a legitimate override), and a
+// non-body token silently added there would be read as body and dropped. There
+// is no legitimate reason for the two to differ, so they share one source.
+var zoneInterfaceHostInboundBodyKeywords = func() map[string]bool {
+	m := make(map[string]bool, len(hostInboundSchemaChildren()))
+	for name := range hostInboundSchemaChildren() {
+		m[name] = true
+	}
+	return m
+}()
+
+// zoneInterfaceHostInboundStrayTokens returns the tokens a `host-inbound-traffic`
+// KEYWORD NODE carries that cannot be host-inbound BODY content — i.e. the
+// interface names the compiler drops on the floor (#6735).
+//
+// The keyword node is reached two ways, and both are lossy in the same way:
+//
+//	interfaces { a { host-inbound-traffic b; } }   -> keyword node Keys=[kw, b]
+//	set ... interfaces [ a host-inbound-traffic b ] -> keyword node Keys=[kw],
+//	                                                   child leaf Keys=[b]
+//
+// The second is the `set`/flat-set ingest of the exact statement #6735 is built
+// around. `SetPath` DESCENDS `host-inbound-traffic` (schema_security.go declares
+// it as a named child of the interface-name wildcard) instead of collapsing the
+// bracket tail onto one leaf, so the trailing member parks UNDER the keyword
+// where both the truncator and the pre-#6735 detector skipped it by name. The
+// operator got a commit, a zone missing an interface, and no diagnostic.
+//
+// A token is stray only if it cannot be body content:
+//
+//   - the Keys tail is body if its FIRST token is a legal body keyword
+//     (`host-inbound-traffic system-services ssh` — the packed body, whose
+//     override is a separate pre-existing gap, deliberately not made loud here);
+//     otherwise every token in it is a dropped member.
+//   - a CHILD is body if its name is a legal body keyword; otherwise every token
+//     in its subtree is dropped.
+//
+// Anything else — a keyword with nothing under it at all
+// (`interfaces a host-inbound-traffic;`), or a well-formed nested body
+// (`host-inbound-traffic { system-services ssh; }`) — yields no stray tokens and
+// therefore no reject, which keeps the #4191 over-rejection carve-out intact.
+func zoneInterfaceHostInboundStrayTokens(kw *Node) []string {
+	var stray []string
+	var tail []string
+	seenKeyword := false
+	for _, k := range kw.Keys {
+		if k == "" {
+			continue
+		}
+		if !seenKeyword {
+			if zoneInterfaceBodyKeywords[k] {
+				seenKeyword = true
+			}
+			continue
+		}
+		tail = append(tail, k)
+	}
+	if len(tail) > 0 && !zoneInterfaceNonMemberToken(tail[0]) {
+		stray = append(stray, tail...)
+	}
+	for _, child := range kw.Children {
+		if zoneInterfaceNonMemberToken(child.Name()) {
+			continue
+		}
+		stray = append(stray, zoneInterfaceNodeTokens(child)...)
+	}
+	return stray
+}
+
+// zoneInterfaceNonMemberToken reports whether a token appearing under a
+// `host-inbound-traffic` node is something OTHER than a dropped interface name:
+// either legitimate body content, or one of the Junos statements that may
+// appear at ANY point in the hierarchy and never denote content.
+//
+// The second class is not optional. `apply-groups-except` and `apply-macro`
+// SURVIVE group expansion as live nodes (ExpandGroups removes only
+// `apply-groups`, ast_groups.go), so they reach this gate verbatim. Treating one
+// as a dropped member hard-rejects a legitimate config at commit — measured:
+// `host-inbound-traffic { apply-groups-except G; system-services ping; }`
+// rejected with "followed by apply-groups-except G". `apply-groups` is listed
+// too so the set does not depend on expansion having run, which the tolerant
+// display paths do not guarantee. Same three keywords, and the same reason, as
+// nonInterfaceIfKeyword in dup_named_blocks.go.
+func zoneInterfaceNonMemberToken(tok string) bool {
+	if zoneInterfaceHostInboundBodyKeywords[tok] {
+		return true
+	}
+	switch tok {
+	case "apply-groups", "apply-groups-except", "apply-macro":
+		return true
+	}
+	return false
+}
+
+// zoneInterfaceNodeTokens flattens every non-empty token a node subtree carries,
+// in source order: its own Keys followed by each child's tokens. It is how a
+// dropped member that `SetPath` nested several levels deep is named back to the
+// operator instead of rendered as its first token alone.
+func zoneInterfaceNodeTokens(n *Node) []string {
+	var toks []string
+	for _, k := range n.Keys {
+		if k != "" {
+			toks = append(toks, k)
+		}
+	}
+	for _, child := range n.Children {
+		toks = append(toks, zoneInterfaceNodeTokens(child)...)
+	}
+	return toks
 }
 
 // zoneInterfaceStanzaPackedTail is the stanza-level entry point for

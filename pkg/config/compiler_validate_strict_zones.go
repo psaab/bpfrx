@@ -722,11 +722,20 @@ func validateZoneInterfacePackedTailStrict(tree *ConfigTree) error {
 // them. A stanza that names no interface is by definition one whose content the
 // compiler could not read, so naming the offending tokens is the only way the
 // message is actionable.
+//
+// It walks each child's whole SUBTREE (zoneInterfaceNodeTokens), not the child's
+// own Keys. `set` builds this stanza by DESCENT — `set ... interfaces
+// [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]` becomes the chain
+// `interfaces -> ge-0/0/0.0 -> host-inbound-traffic -> ge-0/0/1.0` — so joining
+// only the first child's Keys rendered the one-token echo `(ge-0/0/0.0)` for a
+// message that then went on to discuss a keyword and a trailing token the
+// operator could not see anywhere in it (#6735). Every flat-set-authored reject
+// is affected, which is every reject an operator hits from the CLI.
 func zoneInterfaceStanzaTokens(prop *Node) string {
 	var toks []string
 	toks = append(toks, prop.Keys[1:]...)
 	for _, child := range prop.Children {
-		toks = append(toks, child.KeyPath())
+		toks = append(toks, zoneInterfaceNodeTokens(child)...)
 	}
 	if len(toks) == 0 {
 		return "empty"

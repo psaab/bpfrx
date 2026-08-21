@@ -587,3 +587,399 @@ func TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate(t *testing.T) {
 		}
 	})
 }
+
+// zonePackedTailSetTree builds a candidate tree from FLAT-SET commands the way
+// the operator CLI does — ParseSetCommand + ConfigTree.SetPath, never
+// NewParser, which treats newlines as whitespace and would merge every line
+// into one giant node. It defines the same three interfaces
+// zonePackedTailConfig defines (plus ge-0/0/2), so a rejection can only come
+// from the gate under test.
+func zonePackedTailSetTree(t *testing.T, zoneCmds ...string) *ConfigTree {
+	t.Helper()
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.2.1/24",
+	}
+	cmds = append(cmds, zoneCmds...)
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	return tree
+}
+
+// zoneInterfacesStanza6735 returns zone Z's `interfaces` stanza node, failing
+// the test if there is none. Returning it rather than looping in each caller
+// keeps a subtest from silently asserting nothing when the stanza moves.
+func zoneInterfacesStanza6735(t *testing.T, tree *ConfigTree) *Node {
+	t.Helper()
+	zones := tree.FindChild("security").FindChild("zones")
+	if zones == nil {
+		t.Fatalf("no `security zones` node in the tree")
+	}
+	for _, inst := range namedInstances(zones.FindChildren("security-zone")) {
+		if inst.name != "Z" {
+			continue
+		}
+		for _, prop := range inst.node.Children {
+			if prop.Name() == "interfaces" {
+				return prop
+			}
+		}
+	}
+	t.Fatalf("zone Z has no `interfaces` stanza")
+	return nil
+}
+
+// TestZoneInterfaces6735KeywordArrivesAsAChildNode closes the escape the
+// original #6735 gate left open: `host-inbound-traffic` reaching the compiler as
+// a child NODE with dropped member tokens parked underneath it, rather than as a
+// token on some member's own Keys.
+//
+// This is the FLAT-SET (`set` CLI) ingest of the exact statement #6735 is built
+// around, and it is why "the gate covers the headline statement" was false at
+// the previous head. `schema_security.go` declares `host-inbound-traffic` as a
+// named child of the interface-name wildcard, so when it is the token
+// IMMEDIATELY AFTER the first bracket token, SetPath DESCENDS it instead of
+// collapsing the bracket tail onto one leaf:
+//
+//	set ... interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]
+//	  interfaces -> ge-0/0/0.0 -> host-inbound-traffic -> ge-0/0/1.0
+//
+// The trailing member parks UNDER the keyword node, where the truncator
+// (zoneInterfaceMembers) and the detector (zoneInterfaceMemberPackedTail) both
+// skipped it by name. They agreed, so the statement committed with ge-0/0/1.0
+// silently dropped: Zone == "", never AF_XDP-bound, no policy naming Z applying
+// to it.
+//
+// The keyword's POSITION is the whole discriminator, which is why the position
+// is varied here rather than fixed. With a non-schema token in slot 2 the tail
+// collapses onto one Keys slice and the pre-existing Keys arm of the detector
+// fires; the pre-#6735-fix test used exactly that arrangement, so the one
+// flat-set case covered was the one that already passed.
+func TestZoneInterfaces6735KeywordArrivesAsAChildNode(t *testing.T) {
+	const headline = "set security zones security-zone Z interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]"
+
+	t.Run("SetPath really descends the keyword rather than collapsing the tail", func(t *testing.T) {
+		// Pins the MECHANISM. If a schema change ever stops SetPath descending
+		// `host-inbound-traffic`, this shape disappears and the subtests below
+		// would start passing for a different reason; this says so out loud.
+		prop := zoneInterfacesStanza6735(t, zonePackedTailSetTree(t, headline))
+		if got, want := prop.Keys, []string{"interfaces"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("stanza Keys = %v, want %v — `set` never leaves members on the stanza's own Keys", got, want)
+		}
+		member := prop.Children[0]
+		if got, want := member.Keys, []string{"ge-0/0/0.0"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("first member Keys = %v, want %v — the bracket tail must NOT have collapsed onto this node", got, want)
+		}
+		kw := member.Children[0]
+		if got, want := kw.Keys, []string{"host-inbound-traffic"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("keyword node Keys = %v, want %v", got, want)
+		}
+		if got, want := zoneInterfaceNodeTokens(kw.Children[0]), []string{"ge-0/0/1.0"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("tokens parked under the keyword = %v, want %v — this is the member the compiler drops", got, want)
+		}
+	})
+
+	t.Run("the truncator really does drop the parked member", func(t *testing.T) {
+		// The loss the gate exists to prevent, measured at the compiler level so
+		// the gate answers a demonstrated defect rather than a hypothesis. This
+		// is the TOLERANT reading, which still truncates.
+		prop := zoneInterfacesStanza6735(t, zonePackedTailSetTree(t, headline))
+		got := zoneInterfaceStanzaMembers(prop)
+		want := []string{"ge-0/0/0.0"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("stanza membership = %v, want %v — if the compiler learned to keep ge-0/0/1.0 this test goes red FIRST and the gate should become a no-op rather than a reject", got, want)
+		}
+	})
+
+	t.Run("the detector sees the parked member", func(t *testing.T) {
+		prop := zoneInterfacesStanza6735(t, zonePackedTailSetTree(t, headline))
+		kw, tail, ok := zoneInterfaceStanzaPackedTail(prop)
+		if !ok {
+			t.Fatalf("detector missed the `set`-authored keyword CHILD node; stanza renders as %q — this is the headline #6735 statement and it escaped the gate entirely", zoneInterfaceStanzaTokens(prop))
+		}
+		if kw != "host-inbound-traffic" {
+			t.Fatalf("detector reported keyword %q, want host-inbound-traffic", kw)
+		}
+		if want := []string{"ge-0/0/1.0"}; !reflect.DeepEqual(tail, want) {
+			t.Fatalf("detector reported dropped tokens %v, want %v", tail, want)
+		}
+	})
+
+	t.Run("commit rejects, and the message names the dropped member", func(t *testing.T) {
+		_, err := CompileConfig(zonePackedTailSetTree(t, headline))
+		if err == nil {
+			t.Fatalf("CompileConfig ACCEPTED %q — ge-0/0/1.0 is silently dropped, left with Zone == \"\", never dataplane-bound, and no policy naming Z applies to it (#6735)", headline)
+		}
+		if !strings.Contains(err.Error(), zoneInterfacePackedTailReason) {
+			t.Fatalf("rejected by the WRONG gate: %v\nwant the packed-tail reason %q", err, zoneInterfacePackedTailReason)
+		}
+		// The message must contain the dropped member itself. Asserting on
+		// "host-inbound-traffic" alone would be vacuous — the reject template
+		// contains that literal regardless of what the detector returned.
+		if !strings.Contains(err.Error(), "ge-0/0/1.0") {
+			t.Fatalf("reject message never names the dropped member ge-0/0/1.0: %v", err)
+		}
+	})
+
+	t.Run("control: the same list without the keyword keeps every member", func(t *testing.T) {
+		// Without this the gate could reject every bracket list and every
+		// assertion above would still pass.
+		const clean = "set security zones security-zone Z interfaces [ ge-0/0/0.0 ge-0/0/1.0 ]"
+		cfg, err := CompileConfig(zonePackedTailSetTree(t, clean))
+		if err != nil {
+			t.Fatalf("CompileConfig REJECTED the unambiguous bracket list %q: %v", clean, err)
+		}
+		want := []string{"ge-0/0/0.0", "ge-0/0/1.0"}
+		if got := cfg.Security.Zones["Z"].Interfaces; !reflect.DeepEqual(got, want) {
+			t.Fatalf("control membership = %v, want %v — the reject above must be attributable to the keyword, not to bracket nesting", got, want)
+		}
+	})
+}
+
+// TestZoneInterfaces6735KeywordWithEmptyKeysTailStillWalksItsChildren closes the
+// second escape of the same root: zoneInterfaceMemberPackedTail returned as soon
+// as a body keyword appeared on a node's Keys, EVEN WHEN nothing followed it on
+// Keys, so that node's children were never examined. Two ordinary `set` lines
+// reach it:
+//
+//	set ... interfaces ge-0/0/0.0
+//	set ... interfaces [ host-inbound-traffic ge-0/0/1.0 ]
+//
+// The second line makes `host-inbound-traffic` a member-slot node directly under
+// the stanza with ge-0/0/1.0 parked beneath it. Before the fix this committed
+// with ge-0/0/1.0 dropped and ZERO warnings — a strict REGRESSION against
+// origin/master, where the same statement was rejected loudly (master compiled
+// `host-inbound-traffic` as a phantom member, which the zone-interface-DEFINED
+// gate then caught). #6525's truncation removed the phantom and, with it, the
+// only thing making the loss visible.
+func TestZoneInterfaces6735KeywordWithEmptyKeysTailStillWalksItsChildren(t *testing.T) {
+	cmds := []string{
+		"set security zones security-zone Z interfaces ge-0/0/0.0",
+		"set security zones security-zone Z interfaces [ host-inbound-traffic ge-0/0/1.0 ]",
+	}
+
+	prop := zoneInterfacesStanza6735(t, zonePackedTailSetTree(t, cmds...))
+	kw, tail, ok := zoneInterfaceStanzaPackedTail(prop)
+	if !ok {
+		t.Fatalf("detector missed a keyword node whose Keys tail is EMPTY but whose CHILDREN carry a dropped member; stanza renders as %q", zoneInterfaceStanzaTokens(prop))
+	}
+	if kw != "host-inbound-traffic" {
+		t.Fatalf("detector reported keyword %q, want host-inbound-traffic", kw)
+	}
+	if want := []string{"ge-0/0/1.0"}; !reflect.DeepEqual(tail, want) {
+		t.Fatalf("detector reported dropped tokens %v, want %v", tail, want)
+	}
+
+	_, err := CompileConfig(zonePackedTailSetTree(t, cmds...))
+	if err == nil {
+		t.Fatalf("CompileConfig ACCEPTED %v — ge-0/0/1.0 is silently dropped and origin/master rejected this same config loudly (#6735)", cmds)
+	}
+	if !strings.Contains(err.Error(), zoneInterfacePackedTailReason) {
+		t.Fatalf("rejected by the WRONG gate: %v\nwant the packed-tail reason %q — the operator wrote ge-0/0/1.0 and must be told it was dropped", err, zoneInterfacePackedTailReason)
+	}
+	if !strings.Contains(err.Error(), "ge-0/0/1.0") {
+		t.Fatalf("reject message never names the dropped member ge-0/0/1.0: %v", err)
+	}
+}
+
+// TestZoneInterfaces6735StrayTokenTableAcrossBothIngests is the discriminating
+// table for zoneInterfaceHostInboundStrayTokens: which subtrees under a
+// `host-inbound-traffic` node are BODY (accept) and which are dropped members
+// (reject). The two halves have to be read together — a detector that fired on
+// every keyword child would pass the reject half and red the accept half, and a
+// detector that fired on none would do the reverse.
+func TestZoneInterfaces6735StrayTokenTableAcrossBothIngests(t *testing.T) {
+	t.Run("rejected: a token under the keyword that cannot be body content", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			hier     string   // nil-able: hierarchical stanza
+			set      []string // nil-able: flat-set commands
+			wantLost string
+		}{
+			{
+				name:     "hierarchical: stray token on the keyword node's Keys",
+				hier:     `interfaces { ge-0/0/0.0 { host-inbound-traffic ge-0/0/1.0; } }`,
+				wantLost: "ge-0/0/1.0",
+			},
+			{
+				name:     "flat-set: keyword second in the bracket list",
+				set:      []string{"set security zones security-zone Z interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]"},
+				wantLost: "ge-0/0/1.0",
+			},
+			{
+				name:     "flat-set: keyword first in the bracket list",
+				set:      []string{"set security zones security-zone Z interfaces [ host-inbound-traffic ge-0/0/1.0 ]"},
+				wantLost: "ge-0/0/1.0",
+			},
+			{
+				name: "flat-set: several members parked under the keyword",
+				set:  []string{"set security zones security-zone Z interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ge-0/0/2.0 ]"},
+				// Every parked token is named, not just the first — a
+				// one-token echo would leave the operator restoring half a
+				// zone.
+				wantLost: "ge-0/0/1.0 ge-0/0/2.0",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var tree *ConfigTree
+				if tc.hier != "" {
+					tree = parseHierarchical(t, zonePackedTailConfig(tc.hier))
+				} else {
+					tree = zonePackedTailSetTree(t, tc.set...)
+				}
+				_, err := CompileConfig(tree)
+				if err == nil {
+					t.Fatalf("CompileConfig ACCEPTED a stanza that silently drops %q (#6735)", tc.wantLost)
+				}
+				if !strings.Contains(err.Error(), zoneInterfacePackedTailReason) {
+					t.Fatalf("rejected by the WRONG gate: %v\nwant the packed-tail reason %q", err, zoneInterfacePackedTailReason)
+				}
+				if !strings.Contains(err.Error(), tc.wantLost) {
+					t.Fatalf("reject message does not name the dropped tokens %q: %v", tc.wantLost, err)
+				}
+			})
+		}
+	})
+
+	t.Run("accepted: the keyword's subtree is legitimate body content", func(t *testing.T) {
+		cases := []struct {
+			name string
+			hier string
+			set  []string
+			want []string
+		}{
+			{
+				name: "hierarchical: nested body block",
+				hier: `interfaces { ge-0/0/0.0 { host-inbound-traffic { system-services ssh; } } }`,
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				name: "hierarchical: keyword node with nothing under it",
+				hier: `interfaces { ge-0/0/0.0 { host-inbound-traffic; } }`,
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				name: "flat-set: per-interface override, the ordinary CLI spelling",
+				set: []string{
+					"set security zones security-zone Z interfaces ge-0/0/0.0 host-inbound-traffic system-services ssh",
+				},
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				name: "flat-set: multi-token body and a second body keyword",
+				set: []string{
+					"set security zones security-zone Z interfaces ge-0/0/0.0 host-inbound-traffic system-services [ ssh ping ]",
+					"set security zones security-zone Z interfaces ge-0/0/0.0 host-inbound-traffic protocols ospf",
+				},
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				name: "flat-set: bare keyword, no body at all",
+				set: []string{
+					"set security zones security-zone Z interfaces ge-0/0/0.0 host-inbound-traffic",
+				},
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				// `apply-groups-except` and `apply-macro` may appear at ANY
+				// point in the Junos hierarchy and survive group expansion as
+				// live nodes (ExpandGroups removes only `apply-groups`), so
+				// they reach this gate verbatim under the keyword. Reading one
+				// as a dropped interface name hard-rejects a legitimate config
+				// at commit — measured, before zoneInterfaceNonMemberToken
+				// existed, as `followed by apply-groups-except G`.
+				name: "hierarchical: group machinery under the keyword",
+				hier: `interfaces { ge-0/0/0.0 { host-inbound-traffic { apply-groups-except G; system-services ssh; } } }`,
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				name: "hierarchical: apply-macro under the keyword",
+				hier: `interfaces { ge-0/0/0.0 { host-inbound-traffic { apply-macro M { k v; } system-services ssh; } } }`,
+				want: []string{"ge-0/0/0.0"},
+			},
+			{
+				name: "flat-set: group machinery under the keyword",
+				set: []string{
+					"set security zones security-zone Z interfaces ge-0/0/0.0 host-inbound-traffic apply-groups-except G",
+					"set security zones security-zone Z interfaces ge-0/0/0.0 host-inbound-traffic system-services ssh",
+				},
+				want: []string{"ge-0/0/0.0"},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var tree *ConfigTree
+				if tc.hier != "" {
+					tree = parseHierarchical(t, zonePackedTailConfig(tc.hier))
+				} else {
+					tree = zonePackedTailSetTree(t, tc.set...)
+				}
+				cfg, err := CompileConfig(tree)
+				if err != nil {
+					t.Fatalf("CompileConfig REJECTED a legitimate host-inbound body: %v — the stray-token check must fire only on tokens that cannot be body content (#4191 over-rejection class)", err)
+				}
+				if got := cfg.Security.Zones["Z"].Interfaces; !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("membership = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+}
+
+// TestZoneInterfaces6735BodyKeywordsTrackTheSchema binds
+// zoneInterfaceHostInboundBodyKeywords to the grammar it must mirror. The set
+// decides which tokens under a `host-inbound-traffic` node are body and which
+// are dropped members, so a divergence from the schema is ALWAYS a bug in one
+// direction or the other: a body keyword missing here turns a legitimate
+// override into a hard commit reject, and a token here that the schema does not
+// accept lets a dropped member through as "body". They are derived from one
+// source for that reason; this asserts the derivation actually holds.
+func TestZoneInterfaces6735BodyKeywordsTrackTheSchema(t *testing.T) {
+	schemaChildren := hostInboundSchemaChildren()
+	if len(schemaChildren) == 0 {
+		t.Fatalf("hostInboundSchemaChildren() is empty — this test would assert nothing")
+	}
+	for name := range schemaChildren {
+		if !zoneInterfaceHostInboundBodyKeywords[name] {
+			t.Fatalf("schema declares %q under host-inbound-traffic but zoneInterfaceHostInboundBodyKeywords does not — a legitimate override authored with it would be read as a dropped member and hard-rejected at commit", name)
+		}
+	}
+	for name := range zoneInterfaceHostInboundBodyKeywords {
+		if _, ok := schemaChildren[name]; !ok {
+			t.Fatalf("zoneInterfaceHostInboundBodyKeywords carries %q, which the schema does not accept under host-inbound-traffic — a member token spelled that way would be silently swallowed as body", name)
+		}
+	}
+}
+
+// TestZoneInterfaces6735RejectEchoRendersTheWholeStanza pins the operator-facing
+// echo. `set` builds this stanza by DESCENT, so rendering each child's own Keys
+// alone showed a one-token stanza — `(ge-0/0/0.0)` — for a message that then
+// discussed a keyword and a trailing token appearing nowhere in it. Every
+// flat-set-authored reject was affected, i.e. every reject an operator hits from
+// the CLI.
+func TestZoneInterfaces6735RejectEchoRendersTheWholeStanza(t *testing.T) {
+	tree := zonePackedTailSetTree(t, "set security zones security-zone Z interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]")
+	prop := zoneInterfacesStanza6735(t, tree)
+	got := zoneInterfaceStanzaTokens(prop)
+	want := "ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0"
+	if got != want {
+		t.Fatalf("stanza echo = %q, want %q — the operator must be shown the statement they wrote, not its first token", got, want)
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted the ambiguous flat-set stanza")
+	}
+	if !strings.Contains(err.Error(), "("+want+")") {
+		t.Fatalf("reject message does not echo the full stanza %q: %v", want, err)
+	}
+}

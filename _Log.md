@@ -1,3 +1,114 @@
+## 2026-08-20 — #6735 r6: close the flat-set (`set` CLI) escape of the packed-tail gate
+
+- **Timestamp**: 2026-08-20 (fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Fix a live commit-path defect the r5 gate left open, plus the
+  operator-facing echo that made its rejects unreadable from the CLI.
+- **File(s)**: `pkg/config/compiler_security_zones.go`,
+  `pkg/config/compiler_validate_strict_zones.go`,
+  `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `docs/config-schema.md`, `pkg/config/README.md`
+
+  **The escape.** The statement this PR is built around still committed from the
+  ordinary operator CLI:
+
+  ```
+  set security zones security-zone Z interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]
+  ```
+
+  Measured firsthand at 2269dd2d1 via `ParseSetCommand` + `tree.SetPath`:
+  detector `found=false`, compiled membership `[ge-0/0/0.0]`, `CompileConfig`
+  ACCEPT. `ge-0/0/1.0` kept `Zone == ""`, was never AF_XDP-bound, and no policy
+  naming Z applied to it.
+
+  Mechanism: `schema_security.go` declares `host-inbound-traffic` as a named
+  child of the interface-name wildcard, so when it is the token immediately
+  after the FIRST bracket token, `SetPath` DESCENDS it rather than collapsing
+  the tail onto one leaf. The trailing member parks a level deeper, under the
+  keyword node — where `zoneInterfaceMembers` and `zoneInterfaceMemberPackedTail`
+  both skipped it by name. They agreed, which is why it was silent. The PR's own
+  flat-set test used the keyword in position THREE, where the tail does collapse
+  and the pre-existing Keys arm fires; the one flat-set arrangement tested was
+  the one that already passed.
+
+  Second escape, same root and a strict REGRESSION against `origin/master`:
+  `zoneInterfaceMemberPackedTail` returned as soon as a keyword sat on a node's
+  Keys even with an EMPTY Keys tail, so that node's children were never walked.
+
+  ```
+  set ... interfaces ge-0/0/0.0
+  set ... interfaces [ host-inbound-traffic ge-0/0/1.0 ]
+  ```
+
+  head: ACCEPT, `members=[ge-0/0/0.0]`, zero warnings. `origin/master`: REJECT,
+  loudly — master compiled `host-inbound-traffic` as a phantom member and the
+  zone-interface-DEFINED gate caught it. #6525's truncation removed the phantom
+  and with it the only thing making the loss visible.
+
+  **The fix.** `zoneInterfaceHostInboundStrayTokens` asks what a
+  `host-inbound-traffic` node carries that CANNOT be body content, and both arms
+  of the detector consult it: the Keys arm when its tail is empty, the child arm
+  instead of skipping keyword children outright. A token is non-member when it is
+  legitimate body content (`system-services` / `protocols`, DERIVED from
+  `hostInboundSchemaChildren()` so the grammar and the gate cannot drift — a
+  divergence is always a bug in one direction or the other) or one of
+  `apply-groups` / `apply-groups-except` / `apply-macro`.
+
+  The `apply-*` exclusion is not defensive padding. `ExpandGroups` removes only
+  `apply-groups`; `apply-groups-except` and `apply-macro` survive expansion as
+  live nodes and reach the gate verbatim. Measured before the exclusion existed:
+  `host-inbound-traffic { apply-groups-except G; system-services ping; }` was
+  hard-rejected at commit — a false reject on a legitimate config, and the same
+  three keywords `nonInterfaceIfKeyword` already carves out for the same reason.
+
+  `zoneInterfaceStanzaTokens` now renders each child's whole SUBTREE. `set`
+  builds this stanza by descent, so joining a child's own Keys showed the
+  one-token echo `(ge-0/0/0.0)` for a message that then discussed a keyword and a
+  trailing token appearing nowhere in it — every flat-set-authored reject, i.e.
+  every reject an operator hits from the CLI.
+
+  **Differential sweep, 1020 cells.** Every token string of length 1..4 over
+  {ge-0/0/0.0, ge-0/0/1.0, ge-0/0/2.0, host-inbound-traffic} x 3 ingests
+  (flat-set bracket, hierarchical compact, hierarchical block), run at
+  `origin/master` and at this head, comparing accept/reject AND compiled
+  membership as a MULTISET (a set comparison hides a dropped duplicate).
+
+  | base -> head | cells |
+  |---|---|
+  | REJECT -> REJECT | 302 |
+  | ACCEPT-exact -> ACCEPT-exact | 243 |
+  | ACCEPT-lossy -> REJECT | 231 |
+  | ACCEPT-lossy -> ACCEPT-exact (#6525/#5248 fix) | 159 |
+  | REJECT -> ACCEPT-exact | 75 |
+  | ACCEPT-exact -> REJECT | 10 |
+  | **new silent loss** | **0** |
+  | silent loss surviving at head | **0** (base: 390) |
+
+  The 10 are stanzas of repeated `host-inbound-traffic` with at most one
+  interface name — they name no interface a correct reading would have kept, so
+  no legitimate config newly fails to commit. Floor caveat unchanged:
+  `zoneInterfaceBodyKeywords` is a singleton today; a second entry needs the
+  sweep re-run.
+
+  **Tolerant path.** All three newly-rejected `set` shapes still LOAD via
+  `CompileConfigLenient` with the packed-tail warning and unchanged membership —
+  no brick (#1960).
+
+  **Mutation matrix.** Each a single production edit applied by `Edit`, `go
+  build` + `go vet` clean, restored by `Edit`; every failure an ASSERTION, not a
+  build break.
+
+  | # | mutation | failing assertion |
+  |---|---|---|
+  | N1 | child arm reverts to `continue` on a keyword child | `detector missed the set-authored keyword CHILD node` + the echo test + 3 stray-table rows |
+  | N2 | Keys arm reverts to `return k, tail, len(tail) > 0` | `detector missed a keyword node whose Keys tail is EMPTY but whose CHILDREN carry a dropped member` + `keyword first in the bracket list` |
+  | N3 | echo reverts to `child.KeyPath()` | `stanza echo = "ge-0/0/0.0", want "ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0"` |
+  | N4 | body-keyword set drops `protocols` (schema drift) | `schema declares "protocols" ... but zoneInterfaceHostInboundBodyKeywords does not` + a legitimate multi-keyword body REJECTED |
+  | N5 | `apply-*` exclusion removed | 3 accept rows RED: `REJECTED a legitimate host-inbound body: ... followed by apply-groups-except G` |
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./...` rc=0 (62 packages ok, zero FAIL). No Rust, no
+  compiled artifact, no cluster/deploy tooling touched — `pkg/config` Go only.
+
 ## 2026-08-05 — #6735 r5: measure which added assertions actually BIND
 
 - **Timestamp**: 2026-08-05 (fold/6735-r3 -> fix/6525-zone-compact-leaf, PR #6735)

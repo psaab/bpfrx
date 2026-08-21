@@ -1570,7 +1570,7 @@ read correctly — but a reader that walked only `prop.Children` one level deep
 would see member `a` alone. Shape pinned by
 `TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning`.
 
-**A body keyword with tokens after it on the same `Keys` is REJECTED (#6735).**
+**A body keyword with dropped tokens after it is REJECTED (#6735).**
 Because the lexer has already stripped the brackets, `interfaces [ a
 host-inbound-traffic b ]` and `interfaces a host-inbound-traffic system-services
 ssh` are indistinguishable, and their readings disagree about membership — the
@@ -1582,6 +1582,30 @@ no-brick). Rewrite in the block spelling, which is unambiguous — `interfaces {
 a; b; }` for membership, `interfaces { a { host-inbound-traffic { ... } } }` for
 a per-interface body. A keyword with NOTHING after it is accepted: truncation
 loses nothing there.
+
+The dropped tokens do **not** have to be on the same `Keys` slice, and assuming
+they were is how the gate first shipped with the headline statement escaping it
+in the `set` ingest. `host-inbound-traffic` is a schema CHILD of the
+interface-name wildcard, so when it is the token immediately after the first
+bracket token, `SetPath` **descends** it instead of collapsing the tail:
+
+```
+set ... interfaces [ a host-inbound-traffic b ]
+interfaces -> a -> host-inbound-traffic -> b        # b parks UNDER the keyword
+set ... interfaces [ a b host-inbound-traffic c ]
+interfaces -> a -> Keys=["b","host-inbound-traffic","c"]   # c on one Keys slice
+```
+
+Both lose their trailing member; only the second was visible to a Keys-only
+detector. The gate therefore also inspects a keyword NODE's subtree
+(`zoneInterfaceHostInboundStrayTokens`): a token there is a dropped member unless
+it is legitimate body content (`system-services` / `protocols`, derived from
+`hostInboundSchemaChildren` so the two cannot drift) or one of the
+`apply-groups` / `apply-groups-except` / `apply-macro` statements that may appear
+anywhere in the hierarchy — `apply-groups-except` and `apply-macro` survive group
+expansion as live nodes, so reading one as a member would false-reject a
+legitimate config.
+
 
 `compileZones` iterated `prop.Children`, so every compact spelling ran the loop
 body ZERO times and the zone compiled with NO interfaces — cleanly, with no
@@ -1632,11 +1656,13 @@ the tolerant load / peer-sync paths (`lenientZoneInterfacesNonEmpty`, #1960
 no-brick). Covered by
 `pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`.
 
-REACHABILITY (honest bound): hierarchical text ingest only — `load override` /
-`load merge` / the persisted config file / HA `SyncApply`. `set` cannot produce
-the compact shape (`SetPath` always descends the `interfaces` container), and
-`show configuration | display set` round-trips safely. Those are still the boot
-path and the peer-sync path.
+REACHABILITY (honest bound): the COMPACT-LEAF shape above is hierarchical text
+ingest only — `load override` / `load merge` / the persisted config file / HA
+`SyncApply`. `set` cannot produce it (`SetPath` always descends the `interfaces`
+container), and `show configuration | display set` round-trips safely. Those are
+still the boot path and the peer-sync path. The #6735 packed-tail shape is a
+different matter: it IS reachable from the ordinary `set` CLI, in both the
+Keys-collapsed and keyword-descended arrangements shown above.
 
 **A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
 node it is authored on, never by that node's CHILDREN (#6391).** The
