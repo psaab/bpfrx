@@ -243,7 +243,9 @@ func TestCollectEmitsCounterReadErrorsAfterSubcollectors(t *testing.T) {
 	// Neutralize the pre-gate kernel host-inbound read so it cannot bump the
 	// counter before collectGlobalCounters (which would mask the ordering bug).
 	orig := readHostInboundDenyCounters
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) { return nil, nil }
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
+		return nil, xnft.HostInboundTableAbsent, nil
+	}
 	defer func() { readHostInboundDenyCounters = orig }()
 
 	store := newDescriptorCoverageStore(t)

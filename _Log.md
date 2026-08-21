@@ -98141,3 +98141,56 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed the last live #5719 cohort item (applied-nft truth
+  projection). `ReadHostInboundDenyCounters` answered `(nil, nil)` for BOTH
+  "no `inet xpf_hostinbound` table" and "table PRESENT but carrying no named
+  counter objects", so the #5644 M37 cold-boot fail-closed FENCE — which
+  renders catch-all DROPs with deliberately NO counters — was
+  indistinguishable from no enforcement at all. While a fence enforced, REST
+  `/statistics/global` published `host_inbound_kernel_denies: 0` with
+  `host_inbound_kernel_denies_unavailable` absent, i.e. certified "no denies"
+  during the degraded window in which the appliance is actively dropping
+  host-bound traffic — contradicting the #3345 / #3681-H05 contract the same
+  function cites for the netlink-failure case.
+
+  The read now returns a `HostInboundTableState`
+  (Absent / Counterless / Counted) alongside the rows; `pkg/api/stats.go`
+  routes Counterless onto the EXISTING `HostInboundKernelDeniesUnavailable`
+  channel and `collectHostInboundKernelDenies` bumps
+  `xpf_counter_read_errors_total` (no series exists to omit — there are no
+  counter objects to label), keeping the two surfaces in agreement. The
+  discriminator is "the table carries no named counter OBJECT", not "no DENY
+  counter": a real generation always declares the three #4759 ICMP/ND accept
+  counters, so a junos-host program-only ruleset (no per-zone catch-all DROP,
+  hence no deny counter) still reads Counted and is not false-alarmed. An
+  ABSENT table, and real deny counters that merely READ zero, both stay
+  AUTHORITATIVE. No new REST field, Prometheus series, or gRPC field: the
+  daemon's `hostInboundEnforced` applied-state latch and a dedicated
+  `host_inbound_enforcement_degraded` discriminator are a successor issue.
+
+  Validation: `go build ./...` exit 0; `go vet ./pkg/api/... ./pkg/nftables/...
+  ./pkg/daemon/...` exit 0; `go test -count=1` on the same three packages exit
+  0 (api 42.3s, nftables, daemon 36.6s). `TestFenceTableReadsCounterless` run
+  for real under `unshare -rn` (it SKIPs unprivileged) — absent -> fence ->
+  absent all three states observed against the kernel. Mutation matrix, one
+  mutation per cell, exit codes read from `$?`: revert the REST case -> exit 1,
+  only the counterless row; swap the state constant to Absent -> exit 1, the
+  fence row AND the absent negative control (so the control is not vacuous);
+  revert the Prometheus branch -> exit 1, the counterReadErrors assertion;
+  `namedCounters == 0` -> always-Counted -> exit 1, both counterless rows;
+  wrong discriminator `len(out) == 0` -> exit 1, the accept-counters-only row;
+  rival value-keyed fix (`aggregate == 0 -> unavailable`) -> exit 1, the absent
+  AND real-counters-reading-zero rows. Post-restore control green. Go-only
+  diff, no shim `.o` or protocol movement, so no cluster smoke is owed.
+- **File(s)**: pkg/nftables/host_inbound_counters.go,
+  pkg/nftables/host_inbound_counters_state_5719_test.go,
+  pkg/nftables/netlink_fence.go, pkg/nftables/netlink_kernel_test.go,
+  pkg/nftables/README.md, pkg/api/stats.go, pkg/api/metrics_counters.go,
+  pkg/api/stats_global_host_inbound_fence_5719_test.go,
+  pkg/api/stats_global_host_inbound_3681_test.go,
+  pkg/api/metrics_host_inbound_kernel_test.go,
+  pkg/api/metrics_counter_read_errors_every_path_5045_test.go,
+  pkg/api/filter_counters_metrics_test.go,
+  pkg/api/zone_counters_metrics_test.go, pkg/api/README.md,
+  pkg/daemon/README.md, _Log.md
