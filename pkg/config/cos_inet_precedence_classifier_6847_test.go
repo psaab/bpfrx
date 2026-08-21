@@ -166,3 +166,73 @@ func TestCoSINetPrecedenceCodePointOutOfRangeFailsCommit(t *testing.T) {
 		t.Fatalf("error %q does not state the 0..7 domain", err.Error())
 	}
 }
+
+// TestCoSINetPrecedenceLossPriorityTypoFailsCommit pins the loss-priority
+// typo gate on the inet-precedence classifier.
+//
+// #6847 made the classifier's loss-priority LIVE: the entry's string crosses
+// the wire and the helper maps it with
+// `cos_loss_priority_index(&entry.loss_priority).unwrap_or(0)`
+// (userspace-dp/src/afxdp/forwarding_build/cos.rs), so an unrecognized value
+// silently becomes LOW and the egress rewrite picks the LOW row for that
+// forwarding class. Every sibling classifier — dscp, ieee-802.1, and both
+// rewrite-rule directions — rejects that typo at commit
+// (validateClassOfServiceLossPriorityStrict); without this arm the newly
+// enforced classifier was the one hole in that family, and the hole produced
+// exactly the accepted-but-silently-substituted drop precedence #6847 wired
+// the loss-priority arm to remove.
+//
+// The typo is asserted with the SAME token the dscp control uses below, so a
+// future change that loosens the shared checkEntry reds both.
+func TestCoSINetPrecedenceLossPriorityTypoFailsCommit(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set class-of-service forwarding-classes queue 5 voice",
+		"set class-of-service classifiers inet-precedence prec-cl forwarding-class voice loss-priority hgih code-points 5",
+		"set class-of-service interfaces ge-0/0/2 unit 0 classifiers inet-precedence prec-cl",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit to reject inet-precedence loss-priority \"hgih\"")
+	}
+	if !strings.Contains(err.Error(), "unrecognized loss-priority") ||
+		!strings.Contains(err.Error(), "classifiers inet-precedence") {
+		t.Fatalf("error %q does not name the inet-precedence classifier loss-priority", err.Error())
+	}
+}
+
+// TestCoSINetPrecedenceLossPriorityValidValuesCommitClean is the
+// anti-over-reject control: all four Junos drop precedences must still commit.
+// Without it a gate that rejected EVERY inet-precedence loss-priority would
+// pass the typo test above.
+func TestCoSINetPrecedenceLossPriorityValidValuesCommitClean(t *testing.T) {
+	for _, lp := range []string{"low", "medium-low", "medium-high", "high"} {
+		tree := buildTree(t, []string{
+			"set class-of-service forwarding-classes queue 5 voice",
+			"set class-of-service classifiers inet-precedence prec-cl forwarding-class voice loss-priority " + lp + " code-points 5",
+			"set class-of-service interfaces ge-0/0/2 unit 0 classifiers inet-precedence prec-cl",
+		})
+		if _, err := CompileConfig(tree); err != nil {
+			t.Fatalf("strict commit rejected valid inet-precedence loss-priority %q: %v", lp, err)
+		}
+	}
+}
+
+// TestCoSINetPrecedenceLossPriorityTypoLenientDowngrades keeps the #1960
+// no-brick posture: a config already persisted (or peer-synced) with the typo
+// must still BOOT, with the substitution surfaced as a warning rather than a
+// refusal to load. It shares the tolerant-path call site with the dscp /
+// ieee-802.1 arms (opts.lenientCoSLossPriority).
+func TestCoSINetPrecedenceLossPriorityTypoLenientDowngrades(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set class-of-service forwarding-classes queue 5 voice",
+		"set class-of-service classifiers inet-precedence prec-cl forwarding-class voice loss-priority hgih code-points 5",
+		"set class-of-service interfaces ge-0/0/2 unit 0 classifiers inet-precedence prec-cl",
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile must not fail on an inet-precedence loss-priority typo: %v", err)
+	}
+	if !hasWarningContaining(cfg.Warnings, "class-of-service loss-priority (downgraded to warning on tolerant path)") {
+		t.Fatalf("expected a downgraded loss-priority warning, got: %v", cfg.Warnings)
+	}
+}

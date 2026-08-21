@@ -9836,6 +9836,15 @@ compiled the code-point entries into `INetPrecedenceClassifierDefs`
 like the dscp / 802.1p classifiers. The matching accepted-but-inert advisory
 was retracted with it.
 
+Because that `loss-priority` is now LIVE it is covered by
+`validateClassOfServiceLossPriorityStrict` alongside the dscp / ieee-802.1
+classifiers and both rewrite-rule directions: an unrecognized value (an
+operator typo such as `hgih`) is hard-rejected at commit, and downgraded to a
+warning on the tolerant `Load` / `SyncApply` path. Without that arm the helper
+maps the unknown string with `cos_loss_priority_index(...).unwrap_or(0)` and
+silently applies the LOW rewrite row — the accepted-but-silently-substituted
+drop precedence the classifier's loss-priority arm exists to remove.
+
 A unit may bind **at most one** of `classifiers dscp` and `classifiers
 inet-precedence`: IP precedence is the top 3 bits of the same DS field DSCP
 reads, so the two are alternative interpretations of one field rather than

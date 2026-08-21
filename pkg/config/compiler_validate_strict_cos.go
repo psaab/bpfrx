@@ -292,6 +292,34 @@ func validateClassOfServiceLossPriorityStrict(cos *ClassOfServiceConfig) error {
 		}
 	}
 
+	// #6847: the inet-precedence classifier is ENFORCED, so its entries carry
+	// a loss-priority to the dataplane exactly as the dscp / ieee-802.1
+	// classifiers do. Without this arm a typo (`hgih`) commits CLEAN and the
+	// helper's cos_loss_priority_index() falls back to LOW
+	// (`unwrap_or(0)` in forwarding_build/cos.rs) — silently wrong drop
+	// precedence on the egress rewrite, which is the exact
+	// accepted-but-silently-substituted failure this gate family exists to
+	// stop and the reason #6847 wired the loss-priority arm at all.
+	precNames := make([]string, 0, len(cos.INetPrecedenceClassifierDefs))
+	for name := range cos.INetPrecedenceClassifierDefs {
+		precNames = append(precNames, name)
+	}
+	sort.Strings(precNames)
+	for _, name := range precNames {
+		classifier := cos.INetPrecedenceClassifierDefs[name]
+		if classifier == nil {
+			continue
+		}
+		for _, entry := range classifier.Entries {
+			if entry == nil {
+				continue
+			}
+			if err := checkEntry("classifiers inet-precedence", classifier.Name, entry.ForwardingClass, entry.LossPriority); err != nil {
+				return err
+			}
+		}
+	}
+
 	rewriteNames := make([]string, 0, len(cos.DSCPRewriteRules))
 	for name := range cos.DSCPRewriteRules {
 		rewriteNames = append(rewriteNames, name)
