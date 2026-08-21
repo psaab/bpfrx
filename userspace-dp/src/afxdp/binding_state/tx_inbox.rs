@@ -20,6 +20,74 @@ use super::latency::next_redirect_sample;
 /// excess pushes drop with a `redirect_inbox_overflow_drops` counter bump.
 pub(in crate::afxdp) const PENDING_TX_INBOX_HARD_CAP: usize = 4096;
 
+// #6304: the test instrument for the #6114 sample-before-reserve ordering.
+// Doc comment lives INSIDE the macro, on the static itself — a `///` above a
+// `thread_local!` invocation is an "unused doc comment" warning.
+#[cfg(test)]
+thread_local! {
+    /// #6304: cumulative count of `try_acquire_pending_tx_admission` ATTEMPTS made
+    /// on THIS thread — the test instrument for the #6114 sample-before-reserve
+    /// ordering.
+    ///
+    /// Why the ordering needs an instrument at all. Sample-first and reserve-first
+    /// are indistinguishable from anything a COMPLETED call leaves behind: on the
+    /// reserve-first path a non-sampled packet increments `pending_tx_admitted`,
+    /// then `PendingTxAdmission::drop` decrements it back, and the failing arm
+    /// passes `record_overflow = false` (see `try_reserve_mirror_tx_owned`) so a
+    /// refused reservation bumps no counter either. Net zero, every time. The
+    /// difference is real but transient — it is exactly the O(PPS) cross-core
+    /// true-sharing on this counter's cacheline that #6114 removed — and catching
+    /// the WINDOW open needs a racing observer, which is probabilistic.
+    ///
+    /// Counting the ATTEMPT is strictly weaker than observing the window and is
+    /// deterministic: a non-sampled packet reads ZERO here under sample-first and
+    /// ONE under reserve-first, single-threaded, no race.
+    ///
+    /// Why a thread-local and NOT a `#[cfg(test)]` field on `BindingLiveState`.
+    /// `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+    /// exists to fix, so an instrument that moved anything in it would put a layout
+    /// under test that production never has. A thread-local lives in its own
+    /// storage; `#[cfg(test)]` is false for any non-test build, so the bump below
+    /// does not exist in the shipped hot path either.
+    ///
+    /// What is MEASURED, next to the struct in `binding_state/mod.rs`, is four
+    /// values: four `const _: [(); N]` asserts pin size, align and two field
+    /// offsets in BOTH build configurations, and with this thread-local all
+    /// four are identical to the production build. That is the claim — none of
+    /// the four moved — and not the broader one that the layout is unchanged:
+    /// the struct's other ~90 fields are unpinned, so a perturbation confined
+    /// to them would satisfy all four. A
+    /// `#[cfg(test)]` FIELD is not — and not in the way the objection originally
+    /// assumed: it leaves the SIZE unchanged (it lands in existing tail slack) and
+    /// moves OFFSETS, `pending_tx_admitted`'s own included. See that comment for
+    /// the numbers.
+    ///
+    /// Thread-local and not a process-global atomic, for the #6294 reason: the
+    /// default `cargo test` runs in parallel and every sibling test that enqueues a
+    /// redirect bumps this same counter, so a global would let a sibling's bump
+    /// land between a reset and its read. Per-thread storage isolates each test.
+    static PENDING_TX_ADMISSION_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset THIS thread's admission-attempt count (see the counter doc). A test
+/// calls this immediately before the single call it measures.
+#[cfg(test)]
+pub(in crate::afxdp) fn pending_tx_admission_attempts_reset() {
+    PENDING_TX_ADMISSION_ATTEMPTS.with(|c| c.set(0));
+}
+
+/// Read THIS thread's admission-attempt count (see the counter doc).
+#[cfg(test)]
+pub(in crate::afxdp) fn pending_tx_admission_attempts() -> u64 {
+    PENDING_TX_ADMISSION_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn bump_pending_tx_admission_attempts() {
+    PENDING_TX_ADMISSION_ATTEMPTS.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
 pub(in crate::afxdp) struct PendingTxAdmission {
     live: Arc<BindingLiveState>,
     active: bool,
@@ -48,11 +116,43 @@ impl Drop for PendingTxAdmission {
 }
 
 impl BindingLiveState {
+    /// `Ok(())` here is NOT an acceptance receipt — see `enqueue_tx_owned`
+    /// below, whose doc comment covers both. `push_redirect_inbox` drops the
+    /// request on overflow and this body never reports it: the `Err(String)`
+    /// variant COULD carry the drop, and no path here ever constructs one, so
+    /// the function is `Ok`-only in practice. (An earlier revision said the
+    /// signature had no way to say so, which blamed the type for a choice the
+    /// implementation makes.)
     pub(in crate::afxdp) fn enqueue_tx(&self, req: TxRequest) -> Result<(), String> {
         self.push_redirect_inbox(req);
         Ok(())
     }
 
+    /// Enqueue `req` on the destination's redirect inbox, taking ownership.
+    ///
+    /// **`Ok(())` is not an acceptance receipt.** This returns `Ok` even when
+    /// the request was DROPPED — `push_redirect_inbox` implements the
+    /// drop-newest contract documented on it, so a request refused by the soft
+    /// cap or the ring hard cap is discarded, `tx_errors` and
+    /// `redirect_inbox_overflow_drops` are bumped, and the caller is told
+    /// nothing. That is deliberate: the outcome is reported through the counters
+    /// rather than the return value.
+    ///
+    /// The `Result` is NOT vestigial, and an earlier revision said it existed
+    /// "only to match the shared enqueue signature" with callers having "no
+    /// useful recovery". The CoS TX drain (`tx/drain/mod.rs`) threads
+    /// `Err(req)` back out of both Step 1 and Step 2 and falls through to the
+    /// next step — its own comment records that the signature "MUST be honored
+    /// for cascade-equivalence". So there IS a caller with a recovery path; what
+    /// is true is that this body never exercises it, which makes the cascade's
+    /// fallthrough dead today rather than unnecessary. Introducing a real `Err`
+    /// here would change that caller's behaviour, not just its type-checking.
+    ///
+    /// A caller that must know whether its request was ACCEPTED wants
+    /// `try_enqueue_tx_owned`, which hands the unqueued `TxRequest` back as
+    /// `Err`, or `try_reserve_mirror_tx_owned` + `PendingTxAdmission`, which
+    /// reserves the slot first and reports the refusal before the request is
+    /// built.
     pub(in crate::afxdp) fn enqueue_tx_owned(&self, req: TxRequest) -> Result<(), TxRequest> {
         // #709: redirect-acquire latency, sampled 1-in-256.
         //
@@ -154,6 +254,12 @@ impl BindingLiveState {
         extra_limit: Option<usize>,
         record_overflow: bool,
     ) -> Result<(), ()> {
+        // #6304: count the ATTEMPT, before the cap load decides anything — the
+        // instrument must read the same under a full target as under an empty
+        // one, or it would measure queue depth rather than call ordering. Gone
+        // entirely in any non-test build; see the counter's doc comment.
+        #[cfg(test)]
+        bump_pending_tx_admission_attempts();
         let admission_cap = self.pending_tx_admission_cap(extra_limit);
         let mut admitted = self.pending_tx_admitted.load(Ordering::Relaxed);
         loop {
