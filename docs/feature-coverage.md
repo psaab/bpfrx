@@ -387,12 +387,21 @@ the userspace dataplane admission boundary is in
 - **Remote CLI**: `cli` binary connects via gRPC with full tab/`?` parity.
 - **gRPC API**: 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP,
   cluster).
-- **REST API**: HTTP on port 8080 (health, Prometheus, config, full gRPC
-  parity).
+- **REST API**: HTTP on port 8080 (health, Prometheus, config). Broad
+  surface parity with gRPC, but NOT parity of the cluster guards: the
+  configure-mode entry point (`pkg/api/config.go`) has no RG0 check,
+  where gRPC guards on `IsLocalPrimary(0)` and the interactive CLI has
+  its own check (#6890).
 - **Config management**: candidate/active with commit model, 50 rollback
   slots, `load override`/`load merge`, `show | display set`.
-- **Configure mode protection**: blocked on secondary cluster nodes (RG0
-  primary is config authority).
+- **Configure mode protection**: the RG0 primary is the intended config
+  authority, and on a secondary **whose read-only gate is armed** the
+  configstore rejects every user mutation (`ErrClusterReadOnly`) at every
+  entry point. Arming happens only on an RG0 transition
+  (`applyRG0OwnershipTransition`) and `clusterReadOnly` starts `false`,
+  so a node that cold-starts as secondary and never transitions is NOT
+  gated — see `pkg/configstore/README.md` "Cluster read-only gate" and
+  #6890 (#6889 is the dropped-event variant).
 - **DHCP server**: Kea integration with lease display; static / fixed /
   reserved host bindings (`static-binding <mac> { fixed-address; host-name; }`
   under `dhcp-local-server`/`dhcpv6-local-server` → Kea per-subnet
