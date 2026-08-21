@@ -450,6 +450,734 @@ decision, which requires operator signoff. **No `Closes` keyword added**;
   `pkg/grpcapi/server_show_security_text.go`,
   `pkg/grpcapi/server_show_screen_unresolved_5806_test.go`,
   `docs/feature-coverage.md`, `_Log.md`
+## 2026-08-13 — #6812 round 7: the F-A tripwire could not fire
+
+- **Timestamp**: 2026-08-13
+- **Action**: fix the unreachable round-6 name precondition (B1), extend it to
+  all three same-tier fixtures, retract the round-6 claim, narrow one
+  over-broad conjunct.
+- **File(s)**: `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/nat/deterministic.go`, `docs/deterministic-nat-cgnat.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`, `_Log.md`
+
+**B1 — the precondition was scoped globally, so it was unreachable.** Round 6
+added a check that the declared rule-set-name sequence is not non-decreasing.
+These fixtures interleave two tiers — `if00 zn00 if01 zn01 …` — and
+`"zn00" > "if01"`, so the global sequence is non-monotonic whichever direction
+the loop runs. `nameAscending` was therefore always false and the `t.Fatal`
+unreachable. Reproduced firsthand at `ba44bb85d` on a scratch worktree: with
+the three loops re-cut ascending the test PASSED against pristine production,
+and PASSED AGAIN with the `(tier, PoolName ASC)` builder mutation applied — the
+exact edit the guard exists to catch. Not an off-by-one; a scoping error.
+
+A `(tier, name)` stable sort consults the name only among EQUAL tiers, so the
+blindness that matters is a tier declared ascending by name. The check is now
+`assertNoTierDeclaredNameAscending6812`: group the declared rule-sets by tier,
+fail if any tier holding >= 2 is name-ascending, and fail if no tier holds >= 2
+(no within-tier tie => nothing to bind). Single-element tiers are skipped —
+trivially both ascending and descending, so failing on one would fire the
+tripwire on a sound fixture.
+
+Keyed per package on what that side's sort would actually read: `PoolName` in
+the builder fixture (the emitted snapshot slice carries no rule-set name), the
+RULE-SET name in the two walk fixtures (`sourceNATAggregateReferencedCharges`
+sorts rule-sets, and its round-2 name ordering used exactly that).
+
+**N-coverage — now in all three, not one.** The descending re-cut is a shape
+assumption all three fixtures share and a future re-cut is a per-file edit, so
+the tripwire belongs wherever the assumption lives. No adjacent blindness
+existed today (both walk fixtures are descending with >= 2 distinct tiers), so
+this is hardening. `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` had
+no preconditions at all and also gains the tier-sortedness check its two
+siblings already had.
+
+| step | old predicate | new predicate |
+|---|---|---|
+| ascending re-cut, production pristine | green (silent) | RED — `tier 0 is declared in ascending NAME order [if00 … if09]` |
+| ascending re-cut + `(tier, PoolName ASC)` | green (silent) | RED — same precondition, before the assertion |
+| head fixture + `(tier, PoolName ASC)` | RED on assertion | RED on assertion — precondition does NOT shadow it |
+| head fixture + walk `(tier, Name ASC)` | RED on assertions | RED on assertions (`charge order[0] = if00, want if09`; `poison set = map[q15:true], missing "q00"`) |
+| both walk fixtures re-cut ascending | n/a (no check) | RED — `tier 0 … [if00 … if09]`, `tier 1 … [zrs00 … zrs15]` |
+| one rule-set per tier, tiers high-first | n/a | RED — `no tier holds two or more rule-sets` |
+
+The last row was driven deliberately: the "no within-tier tie" belt is shadowed
+by the callers' tier-sortedness precondition for every multi-element shape, so
+it would otherwise be an unfalsifiable guard. It is reachable — a fixture with
+one rule-set per tier declared high-tier-first reaches it.
+
+**N1 — one conjunct narrowed, conclusion unchanged.** The `expandPoolV4`
+canonical-mask narrowing was justified as "such a pool is already refused at
+commit AND poisoned on the tolerant path". The first conjunct is over-broad:
+`validateSourceNATPoolAddressGrammarStrict` iterates pools reachable from a
+pool-mode rule's `Then.PoolName`, not the pool table, so an UNREFERENCED pool
+carrying `10.0.0.0/016` compiles STRICT-CLEAN. Measured both directions — the
+referenced spelling is refused at commit (`address "10.1.0.0/016" is not a
+valid CIDR`), the unreferenced one compiles with `err = <nil>` and
+`SourceNATPoolUnusableReason == "invalid_pool"`. The conclusion stands and is
+unchanged: it rests on the pool being UNUSABLE (it translates nothing and
+installs no allocator), not on the commit gate.
+
+**No Rust change.** No production behaviour change: the diff is test
+preconditions plus comment/doc text.
+
+## 2026-08-13 — #6812 round 6: a guard that could not see the rule it forbids
+
+- **Timestamp**: 2026-08-13
+- **Action**: fold the round-6 hostile review (F-A..F-D, none blocking).
+- **File(s)**: `pkg/nat/deterministic.go`,
+  `pkg/nat/pool_expansion_parity_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/deterministic-nat-cgnat.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+**F-A**: all three same-tier fixtures declared rule-sets in ASCENDING suffix
+order, so within a tier config order and ascending NAME order were the same
+sequence — a (tier, Name ASC) tiebreak was GREEN on all three. That is the very
+rule F3 removed, so the guard could not see it come back. Fixed by declaring
+high-to-low, plus a precondition that FATALS if declaration order is ever
+ascending by name again. Both halves now red on the name tiebreak; all ORDER
+regressions still hold.
+
+> **RETRACTED IN ROUND 7** — the "plus a precondition that FATALS…" clause was
+> FALSE as written. The precondition asked whether the WHOLE declared name
+> sequence was non-decreasing, which this interleaved fixture shape can never
+> be (`zn00` > `if01`), so it was unreachable in both directions. The
+> descending re-cut itself was real and is what the round-6 mutation table
+> measures; only the tripwire was inert. See the 2026-08-13 round-7 entry.
+
+**F-B**: the walk's summary comment still claimed "rule-sets sorted by name" —
+false since round 4 and contradicted 55 lines below in the same block.
+
+**F-C**: verified before acting. 2 genuine v4 divergences (`198.51.100.1/032`,
+`10.0.0.0/016` accepted by `expandPoolV4`), cause `net.ParseCIDR` reading a
+leading-zero mask where `netip.ParsePrefix` refuses. My first probe said 14 —
+12 were artifacts of conflating "v6, skipped by design" with "rejected".
+FIXED rather than narrowed: the deterministic surface was reporting a
+65,536-address mapping for a pool that translates nothing. Narrowing the claim
+would have been the "document the divergence" option already rejected for F1.
+
+**F-D**: within-set order gated on contiguity; artifact lines 16 -> 10, the
+remaining 10 being genuine violations in contiguous rule-sets.
+
+| mutation | observed RED |
+|---|---|
+| walk (tier, Name ASC) | `charge order[0] = if00, want if09` + `poison set = map[q15:true], missing "q00"` |
+| builder (tier, Name ASC) | `emitted rule-set order[0] = if00, want if09` |
+| revert the `netip.ParsePrefix` check | `expandPoolV4("10.0.0.0/016") ACCEPTED 65536 addresses` |
+
+Whole matrix run under the diff-checksum guard; TREE RESTORED after every leg.
+
+## 2026-08-13 — #6812 round-4 amendment: a mask with no witness, an option that is not one, and a sibling that did not bind
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold the round-4 amendment (B2 new blocker, B1 reframed) into
+  PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json`,
+  `pkg/config/nat_pool_grammar_parity_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### B2 — the round-3 network-base mask had no witness
+
+Deleting BOTH masks from `expand_pool_address` left the crate green. The shared
+fixture asserted VERDICT and HOST COUNT, and **a missing mask changes WHICH
+addresses are produced, never HOW MANY** — the claim lived only in `note`
+strings no assertion read. A comment asserting the opposite ("a verdict-only
+table would not catch a masking drift") was measured false and is corrected.
+
+Fixed by giving the fixture an address-SET dimension — optional `first` /
+`last` / `expanded`, asserted Rust-side, with the Go side refusing a row that
+contradicts itself. Eleven rows carry one, including all three where host bits
+are set. `203.0.113.10/28` is encoded in full: masked it is `.0`-`.15`,
+unmasked `.10`-`.25` — eight addresses in the NEXT `/28`, with the budget
+charging 16 either way.
+
+### B1 — option (c) is not available, and the reason is measurable
+
+Not poisoning on the tolerant builder path does not restore translation: since
+round 3 the RUNTIME refuses a leading-zero octet on its own. A snapshot with
+`pool_unusable: false` still reaches `InvalidPool` with zero expanded addresses
+(`declining_to_poison_a_leading_zero_member_does_not_restore_it_6812`, with a
+canonical-spelling control that installs normally). So (c) is "stop poisoning
+AND revert round 3", and that end state is the one the objection to (a) already
+rules out — `ipnet` silently resolves the ambiguous literal to its decimal
+reading. Decision unchanged: refuse, and name the fix.
+
+Corrected framing: master had a **commit-vs-apply divergence**, not a
+tolerant-path over-rejection; the over-rejection existed only relative to an
+earlier commit of this PR. Blast radius is exactly the leading-zero-octet CIDR
+family — every other shape was already fail-closed at the merge base.
+
+### A sibling that did not bind, found by re-running a mechanism as a query
+
+Round 4 established that `sort.Slice` preserves order for an ALL-EQUAL key, and
+sized its new fixture accordingly. The sibling
+`TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` had 17 rule-sets
+all at one tier — the diagnosed shape — and passed under the mutation while its
+own comment credited it with binding the tie-break. Re-cut to interleaved mixed
+tiers with explicit preconditions (both tiers present, input NOT already
+tier-sorted). Both same-tier tests now red on `sort.SliceStable -> sort.Slice`.
+
+**Rule kept: a discovered vacuity mechanism is a greppable predicate owed a
+sweep over neighbouring cells, not a fix for the one test that was named.**
+
+### Two process failures worth recording
+
+1. The round-4 correction to the `expand_pool_address` doc comment **never
+   reached the commit**: the mutation harness snapshotted before that edit and
+   its final restore reverted it, so the round-4 report claimed a correction
+   that was not in the tree. Backups for a mutation matrix must be taken after
+   the last production edit.
+2. The first attempt at the B2 assertions **silently did not apply**. The
+   `old` pattern assumed `\` line-continuations the file no longer had, the
+   python `assert` raised, the shell continued to the test (no `&&`, no
+   `set -e`), and the grep used to read the result did not match
+   `AssertionError`. A green test was read as success for an edit that never
+   happened. Re-done with an editor that fails loudly, and the mutation script
+   now runs under `set -eu` and prints `MUTATION APPLIED`.
+
+### Mutation proof
+
+| revert | test | observed RED |
+|---|---|---|
+| delete BOTH network-base masks | `nat_pool_grammar_parity_fixture` | `expand_pool_address("10.0.0.1/24") starts at Some("10.0.0.1"), want "10.0.0.0"` |
+| `sort.SliceStable` -> `sort.Slice` | `...FirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
+| " | `...SameTierBudgetBoundaryFollowsConfigOrder_6812` | `poison set = map[q01:true], missing "q15"` (GREEN before the re-cut) |
+
+### Amendment follow-up (same day): cross-language stake, B3, and an uneditable claim
+
+- **Action**: fold the hostile leg's B2 stake analysis, B3, and the remaining
+  prose corrections.
+- **File(s)**: `pkg/nat/pool_expansion_parity_6812_test.go` (new),
+  `pkg/config/nat_pool_grammar_parity_6812_test.go`, `docs/config-schema.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+**The mask's stake is CROSS-LANGUAGE.** `pkg/nat/deterministic.go` expands the
+same pool from `net.ParseCIDR`'s already-masked `ipnet.IP`, and
+`lookupForwardInPool` INDEXES that slice to answer the operator-facing
+deterministic-NAT query. A drifted Rust base makes the Go lookup and the actual
+dataplane translation disagree by the host-bits offset — the #5794 invariant-8
+forensic failure, on a line this PR authored. A pool declared `10.0.0.1/24`
+would SNAT from `10.0.0.1`..`10.0.1.0`, one address into the neighbouring
+prefix. `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` binds
+it against the SAME fixture; the one table now pins THREE consumers.
+
+**B3**: deleting both `canonicalPoolAddressHint` branches left the
+package-scoped `go test ./pkg/config/ -run '6812|LeadingZero'` GREEN, because
+every binding test lived in `pkg/dataplane/userspace`. Closed in-package, with
+the negative half pinned too.
+
+**A false claim in an artefact that cannot be edited.** The round-3 commit
+message `8f9b53b44` says the fixture asserts "verdict AND expanded host count,
+so a masking drift is caught too". The second clause is false. A pushed commit
+message is not editable without rewriting shared history, so the correction
+lives here and in the plan. A false claim in an immutable artefact still has to
+be findable from the mutable ones.
+
+| revert | test | observed RED |
+|---|---|---|
+| delete both `canonicalPoolAddressHint` branches | `TestLeadingZeroHintIsBoundInThisPackage_6812` (package-scoped run) | `reason does not name the canonical spelling "10.0.0.0/24"` |
+| unmask the GO deterministic base | `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` | `expandPoolV4("10.0.0.1/24") starts at 10.0.0.1, want 10.0.0.0` |
+
+
+### Builder half of F3 (same day): the unpinned side of the equality
+
+- **Action**: bind the emission-order half of #6812 F3.
+- **File(s)**: `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+Round 4 pinned the WALK's stable sort. The BUILDER's (`nat_source.go`, #4161
+tier sort) was pinned by nothing — `sort.SliceStable` -> `sort.Slice` left the
+whole Go suite green — and it is the half the Rust first-match matcher
+consumes, so a permutation misroutes rather than merely reorders.
+
+`TestBuilderEmittedOrderIsStableWithinATier_6812` asserts three invariants the
+production comment claims, separately: config order within a tier, rule-set
+CONTIGUITY, within-set rule order. It is the only test in the repo that reds on
+the builder mutation.
+
+**Contiguity proved independent, not asserted.** A stable sort keyed on
+(tier, RULE NAME) preserves every rule-set's first-reference order while
+splitting its rules across nine others: assertion (1) stays GREEN, (2) reds
+with `if00 SPLIT: its 2 rules span indices 0..10`. So a config-order-only
+assertion would not have caught the split — which is the half with the
+misrouting consequence.
+
+Ran under the diff-checksum harness guard adopted this round; TREE RESTORED
+(checksum match) after both mutations.
+
+
+## 2026-08-13 — #6812 round 4: a disposition change I said did not happen, and an order-dependent backstop
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold Codex MERGE-NEEDS-MAJOR at `8f9b53b44` (three blocking
+  findings) into PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/allocator.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/nat_source_scope.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go` (new),
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### F1 — the round-3 claim was false on the path that matters
+
+Round 3 said the narrowing "changes no pool's disposition". True on the STRICT
+path; **false on the TOLERANT one**. A pool with an `010.0.0.0/24` member goes
+from `PoolUnusable=false` — `ipnet` reading it as `10.0.0.0/24`, allocator
+built, flows translating — to poisoned, `Unavailable`, packets dropped. A config
+on disk today, or synced from an older primary, loses SNAT across the upgrade.
+
+**Attribution, which every leg including mine had wrong.**
+`config.SourceNATPoolUnusableReason` **does not exist at the merge base**. The
+clause that stamps `invalid_pool` arrived in ROUND 2 (`bc1329ae0`); round 3's
+Rust narrowing only stopped the runtime disagreeing with a poison Go had already
+begun applying. Reverting round 3 alone restores the divergence without
+restoring the pool. The question is therefore not "narrow Rust or not" but
+"should the shared verdict refuse a non-canonical literal".
+
+**Decision: keep the refusal.** #5875 settled the structurally identical case in
+this same subsystem and chose reject over rewrite — "stripping the `%zone`
+silently would change the modeled address, so the fix rejects rather than
+rewrites" — and a leading zero is the WEAKER case, since `010` has two readings
+where `fe80::1%eth0` has one. Normalizing would install a NAT pool on a guess
+`show configuration` would never reveal: a stopped pool is loud, a silently
+reinterpreted one is quiet and wrong.
+
+**Where "make it loud" needed re-scoping.** Both operator channels already exist
+and already fire — `cfg.Warnings` is logged at apply by daemon_apply.go, and the
+snapshot builder logs its own warning naming pool and reason. A third would be
+noise. What was missing is that the message says "is not a valid CIDR" for a
+string that looks exactly like one, so the operator cannot see the fix is one
+character. Replaced with a specific diagnostic naming the canonical spelling and
+why the ambiguous one is refused. `canonicalPoolAddressHint` renders that
+sentence and is never used to substitute; it reports a rewrite only when the
+rewrite is what made an unparseable literal parse.
+
+Upgrade + peer-sync regression tests drive the real tolerant entries
+(`CompileConfigLenient`, `CompileConfigForNodeLenient` at both node ids), which
+nothing had covered.
+
+### F2 — CONFIRMED by measurement, then fixed
+
+Verified before touching anything. Two live pools at 160 of a 200-slot budget
+plus a new pool worth 80:
+
+| snapshot order | new pool | live occupancy |
+|---|---|---|
+| `A, B, C` (existing test) | `OverBudget` | 16 words |
+| `C, A, B` | **admitted, bitmap built** | **24 words = 240 slots vs a 200 cap** |
+
+Same pools, same reuse map, opposite outcome from ORDER alone, repeating one
+pool per apply. The resolver charged a reused key where it MET it, so a new key
+earlier in the slice was admitted against a total that omitted the reused keys
+behind it. Go-side poisoning masks it for snapshots this control plane
+generates — which is the point: this boundary is the INDEPENDENT backstop for
+tolerated, older-control-plane and handcrafted snapshots.
+
+Fixed by a two-phase resolver: phase 1 reserves every distinct reused key,
+phase 2 admits. Reused keys stay unconditionally accepted and are charged once.
+
+### F3 — guards that could not see a transient allocation
+
+Two were end-state assertions (final allocator identity; final occupancy-word
+count), both blind to a build-then-discard. Fixed with a THREAD-LOCAL
+construction counter — process-global counters in Rust tests caused a master-red
+flake once already (#6819), and the resolver is synchronous on the caller's
+thread.
+
+The third, same-tier tie-break: the property is true but nothing pinned it.
+**The proposed mutation needed a correctly sized fixture to be distinguishing at
+all** — measured, Go's `sort.Slice` preserves order at every size tried (2..64)
+with an all-equal key, so a small same-tier fixture leaves `sort.Slice` and
+`sort.SliceStable` observationally identical. With MIXED tiers and same-tier
+ties it first reorders at **n=13**. The new fixture uses 20 rule-sets across two
+tiers.
+
+### Mutation proof — 5/5 observed RED
+
+| revert | test | observed RED |
+|---|---|---|
+| drop the leading-zero hint branch | `TestLeadingZeroPoolMember{Upgrade,PeerSync,StrictRejection}...` | `no warning named the leading-zero member` |
+| `sort.SliceStable` -> `sort.Slice` | `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
+| charge reuse in phase 2 again | `reused_keys_reserve_budget_before_a_new_key_is_admitted_6812` + `incremental_applies_cannot_creep_past_the_cap_6812` | `the NEW key was admitted ahead of the reused keys behind it` |
+| throwaway `PortAllocator::new` before the reuse lookup | `reuse_consumes_budget_and_preserves_last_good` | `it must construct NO PortAllocator at all` |
+| eager build for a FAILED pool | `failed_pool_builds_no_bitmap` | `the final allocator word count cannot see a bitmap that was built and discarded` |
+
+The last two are the guards Codex named as unbinding: both now red on exactly
+the mutation he described, and both did so on the new construction-count
+assertion while the pre-existing identity / word-count assertions stayed green.
+
+## 2026-08-13 — #6812 round 3: the grammar the shared verdict is expressed in
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold Codex MERGE-NEEDS-MAJOR at `3b7c71cca` (three findings) into
+  PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json` (new),
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/nat_source_scope.go` (new),
+  `pkg/config/nat_pool_grammar_parity_6812_test.go` (new),
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### The correction round 2 owed
+
+Round 2's closing sentence — *"the two sides cannot disagree because there is
+one predicate"* — is false as written, and correcting it is the substance of
+this round. Sharing a predicate between the snapshot builder and the budget walk
+makes the two **Go** call sites agree. Go-vs-dataplane agreement is a claim
+about two **PARSERS**, and nothing in round 2 established it. Round 2 removed
+the last derived quantity; it did not remove the last unverified premise.
+
+### F1 — the cited instance was wrong; the class was real
+
+Codex cited `198.51.100.1/032`. Measured through the real `expand_pool_address`
+and the real `sourceNATPoolAddressReason` over a 53-entry table: **both sides
+reject it.** `ipnet`'s IPv4 prefix-length reader is `read_number(10, 2, 33)` — a
+two-DIGIT cap, not a canonical-form rule — so three-digit `/032` fails there
+too. Its IPv6 reader allows three digits, so `/064` does parse as `/64`, but
+every leading-zero-expressible prefix length is over `MAX_POOL_PREFIX_HOSTS`, so
+the pool is refused anyway. That agreement is a **coincidence of two unrelated
+bounds**, not a property; raising the host cap would split it, so the mask
+grammar is now pinned explicitly rather than left to arithmetic.
+
+The differential did find six real divergences, in both directions. Five plus
+one embedded-v4 variant are the same class: a **leading-zero IPv4 octet inside a
+CIDR** (`010.0.0.0/24`, `10.000.0.0/24`, `192.168.001.1/32`, `010.0.0.0/32`,
+`00.0.0.0/24`, `::ffff:010.0.0.0/120`) — Rust expanded a working 256-address
+allocator while Go stamped `invalid_pool` and poisoned the pool. Root cause: the
+CIDR branch parsed via `ipnet::IpNet`, which hand-rolls its own address parser
+(`read_number(10, 3, 0x100)` per octet), while the BARE branch used
+`std::net::IpAddr`, which rejects leading zeros exactly as Go's `netip` does.
+The function was self-inconsistent: `010.0.0.1` refused, `010.0.0.1/32`
+accepted. The sixth is the reverse direction: `netip.ParseAddr` accepts a zone
+on a bare member (`fe80::1%eth0`) that `std::net::IpAddr` cannot represent.
+
+Fixed in the RUNTIME for the octet class (the CIDR branch now parses its address
+half with the same `std::net::IpAddr` the bare branch always used; `IpNet` is
+off the pool-member path entirely) and in GO for the zone (there the runtime is
+the stricter side). Widening Go to match `ipnet` was rejected: it would bless an
+octal-confusion spelling at commit and mirror a third-party crate's accident as
+firewall policy. The direction chosen is narrowing and fail-closed and changes
+**no** pool's disposition — `InvalidPool` is the verdict Go already assigned;
+only the disagreement is removed.
+
+The class-level fix is a shared fixture, not six special cases:
+`userspace-dp/tests/fixtures/snat_pool_grammar_v1.json` is ONE table read by
+both sides (the #3612 AppID parity convention), asserting verdict AND expanded
+host count.
+
+### F2 — the guard fires; the reasoning under it did not hold
+
+The claimed zero-width port charge is **not reachable**: measured through the
+real `CompileConfigLenient`, `compileNATSource` defaults an unset range to
+1024/65535 before storing the pool, so three no-`port`-leaf `/16` pools charge
+4,227,858,432 slots each and the third is poisoned — what
+`TestAggregateOverBudgetPoolsPortCapacity_6812` has asserted all along. The
+SHAPE is real: a consumer re-deriving what a shared function answers, with the
+equivalence resting on a defaulting three files away and nothing binding them.
+The walk now consults `SourceNATPoolPortRange`; both halves of the equivalence
+are tested.
+
+### F3 — confirmed, and it falsified this PR's own prose
+
+Go ordered rule-sets by NAME; the builder emits STABLE-sorted by #4161 scope
+tier and `resolve_pool_allocators` charges that emitted slice in order. Worth
+stating precisely: this is **not** a Go/Rust disagreement in the shipped
+artefact — the poison travels on the wire and the parse loop honours it, so both
+sides always agree on which pools live. It is a defect of POLICY: the surviving
+pool was chosen by an alphabetical accident, contradicting the most-specific-wins
+precedence the builder enforces for matching one function later. It also made
+this PR's sentence *"the first-fit admission rule here mirrors it exactly — same
+order, same charge"* false on the order axis. The walk now sorts by the same
+tier through one shared definition (`config.SourceNATScopeTier`).
+
+### Mutation proof (each fix reds on revert, observed)
+
+| revert | test | observed RED |
+|---|---|---|
+| drop the Go zone check | `TestPoolAddressGrammarMatchesDataplane_6812` | `sourceNATPoolAddressReason("fe80::1%eth0") ok = true, want false` |
+| restore the raw port recompute | `TestAggregateChargeConsultsResolvedPortRange_6812` | `portCap = 0, want 12683575296` |
+| restore the name sort | `TestAggregateFirstFitFollowsEmittedScopeOrder_6812` | `charge order = [big small], want the interface-scoped pool (small) first` |
+| " | `TestSnapshotPoisonFollowsEmittedScopeOrder_6812` | `the first-charged pool "small" was poisoned ("aggregate_over_budget")` |
+| restore `parse::<IpNet>()` in the CIDR branch | `nat_pool_grammar_parity_fixture` | `expand_pool_address("010.0.0.0/24") = true, want false` |
+| " | `nat_pool_bare_and_host_cidr_grammars_agree` | `expand_pool_address("010.0.0.1") = false but expand_pool_address("010.0.0.1/32") = true` |
+
+## 2026-08-13 — #6812 fold r2: the budget must ask the runtime's question, not a proxy for it (Codex gate, fifth unusability class)
+
+- **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: Codex re-gate at `a00a03fc1` returned MERGE-NEEDS-MAJOR. Four of
+  five questions came back clean (the `SourceNATPoolUnusableReason` extraction
+  is faithful; the skip is not too wide; the `pkg/nat` delegation is
+  behaviour-preserving). The blocking one is that F1 is still reachable on the
+  tolerant / peer-sync path through a FIFTH unusability class — and the
+  existence of a fifth class after round 1 closed four was the real finding.
+  **The class.** The dataplane's pool grammar is ALL-OR-NOTHING:
+  `parse_source_nat_rules_inner` ORs `expand_pool_address` over every member
+  into one `invalid_pool_address` flag and fails the WHOLE pool as
+  `InvalidPool` (`userspace-dp/src/nat/source.rs`), so the
+  `pool_mode && total_pool > 0 && pool_failure.is_none()` gate builds no
+  `PendingPoolAllocator` and the pool occupies no slot in
+  `resolve_pool_allocators`. Round 1's budget walk instead SUMMED per-member
+  host counts and skipped only a zero total, which agrees with the runtime only
+  when EVERY member fails. Two shapes escaped: `[198.51.100.1, not-an-ip]`
+  sums to 1 + 0 = 1, and `10.0.0.0/15` counts 131,072 — twice the 65,536
+  `MaxSourceNATPoolPrefixHosts` / `MAX_POOL_PREFIX_HOSTS` cap the expander
+  enforces. All three Codex claims verified firsthand before building:
+  measured through the real `CompileConfigLenient` +
+  `SourceNATAggregateOverBudgetPools`, 1,024 mixed-membership pools ahead of one
+  healthy pool gave `poison[good] = true` / `aggregate_over_budget` (the
+  original F1 defect, alive), and one `/15` pool charged
+  `addrs=131072 portCap=8,455,716,864` — 98.4% of the 2^33 port-capacity budget
+  for an allocator that never exists.
+  **The fix — a shared verdict, not a fifth condition.**
+  `config.SourceNATPoolUnusableReason`, the predicate the snapshot builder
+  ALREADY stamps on the wire, gained an all-or-nothing membership clause built
+  from the EXISTING `sourceNATPoolAddressReason` — the per-member mirror of
+  `expand_pool_address` that the #5627 strict grammar gate uses. The budget
+  walk's pre-existing `SourceNATPoolUnusableReason(pool) != ""` skip then covers
+  both shapes with NO new condition, so the charged set and the poisoned set
+  cannot disagree by construction; there is no derived quantity left for a sixth
+  spelling. The wire reason is `invalid_pool`, which
+  `source_nat_failure_reason_from_snapshot` already decoded to
+  `SourceNatFailureReason::InvalidPool` — the exact variant the parse loop
+  assigned for these pools on its own — so the dataplane disposition is
+  UNCHANGED and only the decider moves control-plane-ward, where the budget can
+  see it. Precedence places the clause between `empty_pool` and
+  `zone_scoped_pool_address`: `netip.ParsePrefix` rejects a zone qualifier, so
+  `fe80::/112%eth0` fails the grammar too, and only a later zone write keeps it
+  reporting the specific #5875 reason; all three pre-existing reasons stay
+  reachable under exactly their old conditions.
+  **Made unrepresentable, not merely excluded.** The `poolAddrs == 0` skip was
+  DELETED rather than kept as a belt — it is unreachable now that the shared
+  verdict is all-or-nothing (any unparseable member already excludes the pool;
+  no members reports `empty_pool`; a parsing member counts >= 1), so a charged
+  pool always sums to >= 1. A deleted branch cannot be tested, so
+  `TestBudgetChargeImpliesHonorableMembers_6812` binds the two premises the
+  deletion rests on over the full grammar surface (honorable => countable, and
+  no charge is ever zero-address through the real compiler).
+  **An ordering pinned only by a comment — FOUND, not designed in.** Placing
+  the membership clause below `zone_scoped_pool_address` is load-bearing: a
+  zone-scoped CIDR (`fe80::1%eth0/64`) fails the grammar too, so with the
+  clauses swapped it would report `invalid_pool` instead of the specific #5875
+  reason. That was written as a code comment and NOTHING tested it — the #5875
+  tests pin the STRICT diagnostic, which is protected by gate order (zone-scope
+  :163 precedes address-grammar :189), and the snapshot-side #5875 test uses a
+  bare `fe80::1%eth0`, which netip parses, so the clause order never mattered to
+  it. This was discovered while re-cutting the cells, not planned: an invariant
+  held only by prose is the same defect class this whole round is about (a
+  comment asserting a contract is not the contract — cf. correcting Codex's
+  citation of `compiler_validate_strict_nat.go:759`, a doc comment ASSERTING the
+  all-or-nothing rule, when the rule itself lives in `source.rs:923-936`,
+  `:959-960` and `:999`). A `zone_scoped_prefix` cell now binds it.
+  **Fixture vacuity found while re-cutting.** `snatAggregateCfg_6812` emitted
+  `10.<i>.0.0/16`, valid only for i < 256 — so at `MaxSourceNATPoolCount+1`
+  pools, 769 of the 1,025 pools in the "healthy pools past the budget"
+  over-reach control were UNPARSEABLE and never healthy. The old zero-total rule
+  skipped them silently; the shared verdict names them, which is how it
+  surfaced. Fixed via `distinctSlash16_6812` plus a by-name precondition in the
+  fixture builder. The `no_member_expands` cell was re-cut to bind through the
+  shared verdict (`wantReason: "invalid_pool"`) instead of the deleted rule, and
+  every cell now asserts its round-1 host-count sum EXACTLY so a case cannot be
+  mistaken for a class it does not exercise (sum 0 = already excluded by round
+  1; sum non-zero = charged by round 1, excluded only now).
+  **Claim correction folded (Codex, non-blocking).** Round 1's account of the
+  strict path cited `validateSourceNATPoolStrict` and
+  `validateSourceNATPoolAddressScopeStrict` as what keeps unusable pools away
+  from the aggregate sum. The real order in `runUniformGatesNAT` is port-range
+  (:109), pool-reference (:134), zone-scope (:163), ADDRESS-GRAMMAR (:189),
+  aggregate (:228). The conclusion holds — strict acceptance is unchanged — but
+  it is the address-grammar gate at :189, omitted from the original account,
+  that covers the empty, malformed, mixed-invalid and over-capacity membership
+  shapes; the two cited gates cover only the port range and the `%zone`
+  qualifier. Corrected in `_Log.md` (round-1 entry), the plan doc and the code
+  comments.
+- **File(s)**: `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+- **Validation**: RED-on-revert measured for each fix, not asserted.
+  (1) Remove the membership-grammar clause from `SourceNATPoolUnusableReason`:
+  `TestAggregateBudgetExcludesUnusablePools_6812` reds on
+  `no_member_expands` / `some_member_fails` / `member_over_capacity`, and with
+  its precondition bypassed the DISCRIMINATOR itself reds — "the healthy pool
+  was poisoned aggregate_over_budget by 1024 pools that build NO allocator";
+  `TestSourceNATSnapshotMixedMemberPoolsDoNotPoisonHealthy_6812` and
+  `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812` red at the
+  snapshot boundary the same way.
+  (2) Point the `"invalid_pool"` arm of
+  `source_nat_failure_reason_from_snapshot` at any other variant:
+  `go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812` reds
+  (`left: Some(EmptyPool)` / `right: Some(InvalidPool)`).
+  (3) Swap the membership-grammar and zone clauses inside
+  `SourceNATPoolUnusableReason`: the new `zone_scoped_prefix` cell reds with
+  `reason = "invalid_pool", want "zone_scoped_pool_address"`. The clause
+  ordering was documented in a comment and otherwise UNBOUND — no existing test
+  covered the snapshot reason for a zone-scoped CIDR (`fe80::1%eth0/64`); the
+  #5875 tests cover the STRICT diagnostic, which is protected by gate order
+  (zone-scope :163 precedes address-grammar :189), not by clause order.
+  The over-capacity spelling was deliberately NOT left in the 1,024-pool
+  count-budget fixture: there it cannot starve the healthy pool (the address
+  budget refuses those pools first under first-fit, so they consume nothing and
+  the discriminator passes for an unrelated reason). It is driven instead by a
+  two-pool port-capacity fixture where one over-capacity `/15` (8,455,716,864
+  slots) starves a healthy full `/16` (4,227,858,432) — total 12,683,575,296,
+  the review's own R73 number — and the discriminator genuinely fails on revert.
+  `go build ./...` clean; `go test ./...` green; `cargo test --release` green;
+  `nat::` run 3x for flake; gofmt clean on every touched file (no crate-wide
+  `cargo fmt`).
+
+## 2026-08-13 — #6812 fold: failed pools must not charge the aggregate budget (Codex gate F1-F4)
+
+- **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: Codex returned MERGE-NEEDS-MAJOR on PR #6815. F1 (blocking) is a
+  real fail-closed OVER-rejection introduced by the #6812 poison walk itself,
+  and it falsifies the PR's own comments claiming Go and Rust agree on which
+  pools live.
+  **F1 — failed pools charged the Go budget and disabled a healthy pool.**
+  `sourceNATAggregateReferencedCharges` charged every DEFINED referenced pool.
+  The snapshot builder then, further down the same config, marks a pool
+  UNUSABLE for reasons that are settled by the pool definition alone — empty
+  membership, a `%zone` member (#5875), a port range the parser rejected
+  (#5457). Rust never charges those: the parse loop gates
+  `PendingPoolAllocator` on `pool_failure.is_none()`, so `resolve_pool_allocators`
+  neither charges them nor lets them occupy a slot. Reproduced firsthand on all
+  THREE unusable shapes, not just the reversed port range Codex probed:
+  `MaxSourceNATPoolCount` unusable pools exactly fill the pool-count budget and
+  the next healthy pool is poisoned `aggregate_over_budget` — a pool the
+  dataplane would have installed. It lands on the TOLERANT path (lenient load /
+  peer-sync, #1960 no-brick), which is the path an operator uses to recover.
+  Fixed by making the unusability verdict a SHARED predicate rather than
+  builder-local knowledge: new `config.SourceNATPoolMembers` /
+  `config.SourceNATPoolPortRange` (moved from pkg/dataplane/userspace) /
+  `config.SourceNATPoolUnusableReason`, with the builder and the budget walk
+  both reading it — the builder to poison, the walk to SKIP. The walk also
+  skips a pool whose members all fail to expand (zero addresses), which Rust
+  skips via its `total_pool > 0` gate and fails as InvalidPool instead.
+  **[CORRECTED IN ROUND 2 — see the round-2 entry below. That zero-total skip
+  approximated an all-or-nothing runtime contract with a SUM and left a fifth
+  unusability class open; it has been replaced by the shared verdict and
+  deleted.]**
+  Precedence in the extracted predicate preserves the builder's original
+  last-writer-wins order (invalid_port_range over zone_scoped_pool_address over
+  empty_pool) so shipped reasons are unchanged; the three per-condition
+  `slog.Warn` lines collapse to one carrying `reason`.
+  No strict-path change — but **[CORRECTED IN ROUND 2]** the two gates named
+  here were the wrong ones. The order in `runUniformGatesNAT` is port-range
+  (`validateSourceNATPoolStrict`, :109), pool-reference
+  (`validateNATPoolReferencesStrict`, :134), zone-scope
+  (`validateSourceNATPoolAddressScopeStrict`, :163), ADDRESS-GRAMMAR
+  (`validateSourceNATPoolAddressGrammarStrict`, :189), aggregate
+  (`validateSourceNATAggregateCardinalityStrict`, :228). The conclusion holds —
+  strict acceptance is unchanged, every gate precedes the aggregate one — but it
+  is the ADDRESS-GRAMMAR gate at :189, omitted from the original account, that
+  covers the empty, malformed, mixed-invalid and over-capacity membership
+  shapes; the two gates cited cover only the port range and the `%zone`
+  qualifier. The resource claim is unaffected either way, since a pool that
+  builds no allocator costs no allocator memory.
+  **F2 — the at-limit control did not prove all pools install.**
+  `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` filtered
+  only for `OverBudget`, so mutating the fixture's `/32` members to a malformed
+  `/33` failed all 1,024 rules as `InvalidPool`, installed ZERO pools, and the
+  test still passed. Now asserts no `pool_failure` of ANY reason plus a positive
+  occupancy-word check (a rule can carry no failure and still hold the empty
+  default allocator).
+  **F3 — repeated references to a reused key were unbound.** Deleting the
+  reuse-path `pool_allocators.insert(key, existing.clone())` left all 279
+  `nat::` tests green; without it a second rule referencing one previous pool
+  charges the key twice and refuses an unrelated new pool. Behaviour was already
+  correct — this adds the missing regression.
+  **F4 — comment drift.** The tests header claimed the wiring tests inject a
+  scaled budget (they use production wiring); "every test above" overlooked the
+  pure-arithmetic parity test; "these two cross" was false for a control sitting
+  exactly AT the limit; and "10,240 occupancy bits" conflated logical slots with
+  word-rounded physical storage (1024 words = 65,536 bits). All corrected here
+  and in the 2026-08-03 entry below.
+- **File(s)**: `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_deterministic_parity_test.go`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`, `_Log.md`
+- **Parity regression (both sides, same scenario, neither hardcoding the
+  other)**: Go — `TestAggregateBudgetExcludesUnusablePools_6812` (pkg/config,
+  all three unusable shapes) and
+  `TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812`
+  (pkg/dataplane/userspace) drive the real builder and assert the healthy pool
+  survives AND pin the exact snapshot markers the Rust fixture is built from.
+  Rust — `production_entry_admits_a_healthy_pool_after_failed_pools_6812` feeds
+  those markers to the PRODUCTION entry at the REAL budget and asserts the
+  healthy pool installs a real allocator. If the builder stops emitting that
+  shape the Go test reds and the Rust fixture stops standing for anything.
+- **Fail-on-revert (observed, not asserted)**: restoring the unconditional
+  charge in `sourceNATAggregateReferencedCharges` reds all three Go subtests
+  with `the healthy pool was poisoned "aggregate_over_budget" by 1024 pools that
+  build NO allocator` — an assertion failure, not a build break. The Rust half
+  reds under the opposite mutation (widening the parse-loop pending gate to
+  `true`). Over-reach controls stay GREEN under the revert:
+  `TestAggregateOverBudgetPoolsCount_6812`,
+  `TestAggregateValidatorMatchesPoisonWalk_6812`,
+  `TestSourceNATSnapshotAggregateStillPoisonsPastBudget_6812`,
+  `production_entry_enforces_the_real_pool_count_budget_6812`.
+
+## 2026-08-03 — #6812: cap the lenient SNAT aggregate eager bitmap at the apply boundary (opus-review-001 R73)
+
+- **Timestamp**: 2026-08-03 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: The #5877 aggregate cardinality gate hard-rejects an over-budget
+  source-NAT config at strict commit and only warns on the tolerant load /
+  peer-sync path (#1960 no-brick) — but a tolerated over-budget config still
+  reached the Rust apply boundary, which built every pool's per-address
+  occupancy bitmap EAGERLY: `PortAllocator::new` ran for every pool-mode rule
+  with `total_pool > 0` BEFORE the reuse maps were consulted, even when
+  `pool_failure` was already set, with no aggregate cap at the final
+  allocation boundary. Three full-range /16 pools materialise 12,683,575,296
+  bitmap bits (~1.48 GiB) — stall/OOM of the dataplane on upgrade boot or HA
+  convergence while processing the very config the tolerant path exists to
+  recover. Three coordinated changes: (1) Rust `parse_source_nat_rules_with_previous`
+  is split into parse + `resolve_pool_allocators` — reuse-before-build, nothing
+  built for a failed pool, and the Go-mirrored budgets (1024 pools /
+  1,048,576 addresses / 2^33 port slots) charged per distinct allocator key
+  (reused keys consume budget but are always accepted, so a no-op re-apply
+  preserves last-good state and a two-step apply cannot creep past the cap;
+  a non-fitting new key fails its rules closed with the new `OverBudget`
+  variant, `source_nat_pool_over_budget`); (2) the Go snapshot builder poisons
+  exactly the non-fitting pools (`SourceNATAggregateOverBudgetPools`, extracted
+  shared walk `sourceNATAggregateReferencedCharges` so validator and poison
+  cannot drift) with `aggregate_over_budget`; (3) the wire reason maps to
+  `OverBudget` (old helpers' catch-all maps it to `InvalidPool` — still
+  fail-closed, wire-skew safe). Folded in during implementation: with failed
+  pools building no allocator, the pool status view would have reported the
+  default 1024-65535 range for them — the configured range now rides on the
+  rule (`pool_port_low`/`pool_port_high`), read by both the status view and
+  the allocator key, so a failed pool's status keeps telling the truth.
+  Fail-on-revert verified both directions: gate-off simulation turns 5/7 new
+  Rust tests RED; poison-off simulation turns the userspace snapshot test RED.
+  Suites: full `pkg/config`, `pkg/dataplane/userspace`, nat (273) + nat64
+  (201) green; whole-repo `go build ./...` green; full `cargo test --release
+  --test-threads=1` green.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/allocator.rs`, `userspace-dp/src/nat/mod.rs`,
+  `userspace-dp/src/nat/status.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`,
+  `_Log.md`
 ## 2026-08-20 — #6827 drive-to-merge: master merge (31 behind), hostile runtime pass, 9 issues filed instead of a round-12 fold
 
 - **Timestamp**: 2026-08-20 (fix/5719-api-hardening, PR #6827)
@@ -80742,6 +81470,59 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+- **Timestamp**: 2026-08-12
+- **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
+  only in tests that injected their own budget), plus an S3 doc sentence.
+  Every behavioural test in `tests_aggregate_budget.rs` drives
+  `parse_source_nat_rules_with_budget(.., &TEST_BUDGET)` — an injected budget.
+  Production calls `parse_source_nat_rules_with_previous`, which forwards
+  `&SOURCE_NAT_AGGREGATE_BUDGET`. Nothing bound THAT. Measured: leaving the
+  constant untouched (so `real_budget_matches_go_5877_constants` still passes)
+  and replacing only the budget the production entry forwards with an infinite
+  one left `cargo test --release --bins nat::` at 273 passed, 0 failed — ZERO
+  failures. The parity test asserts the constant's VALUES; the `admitted_with`
+  tests call the arithmetic directly; neither observes that production USES it.
+  Cap logic bound, cap wiring unbound — the same caller/callee split as #5103
+  F2.
+  `production_entry_enforces_the_real_pool_count_budget_6812` drives the
+  PRODUCTION entry with 1025 single-address pools and asserts the 1025th comes
+  back `OverBudget`. Under the severed-wiring mutation it is the ONLY failure in
+  the module: `left: None, right: Some(OverBudget)`.
+  Axis choice is deliberate and recorded in the test body: the fixture crosses
+  `max_pools` (1024), NOT `max_port_capacity` (2^33). Crossing port capacity
+  honestly would materialise ~8.6e9 occupancy slots — a test that gets deleted
+  for being slow, and a guard nobody runs is not a guard. Pool count crosses a
+  REAL budget for 10,240 occupancy SLOTS total — stored word-rounded as one u64
+  per address, i.e. 1024 words / 65,536 bits / ~8 KB (corrected 2026-08-13: the
+  original entry wrote "~10,240 occupancy bits", conflating the logical slot
+  count with the physical storage) — and `max_addresses` / `max_port_capacity`
+  stay far below their limits so the refusal cannot be attributed to another
+  axis.
+  Two preconditions run BEFORE the discriminator: the production entry returned
+  one rule per snapshot (a fixture that never entered the path would otherwise
+  pass silently — the same class as the defect being closed), and the first
+  pool is healthy (proving the refusal is a BUDGET refusal, not a wholesale
+  parse failure).
+  `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` is the
+  over-reach control in its OWN body — a control sharing a body with its binder
+  never runs once the binder fails. Exactly 1024 pools must ALL install. It
+  stays GREEN under the severed-wiring mutation and reds on an off-by-one in
+  the first-fit accounting or a production entry forwarding a SMALLER budget.
+  S3 (doc only): the `SourceNatAggregateBudget` doc now states precisely what
+  is bounded and why the ordering is right. The budget runs AFTER the parse
+  loop, so address vectors are already expanded and only the occupancy BITMAP
+  is gated — deliberate, because the bitmap is the exhaustion vector by ~3
+  orders of magnitude (a full-range /16 pool: ~262 KB as addresses vs ~528 MB
+  as bitmap). Recorded so the next reader does not "fix" the ordering on the
+  theory that the guard sits downstream of the growth it limits.
+  NOT addressed here (S2, filed separately): `nat64.rs:940` constructs a second
+  production `PortAllocator` (`pool_v4.len()` x 64512 fixed slots) with no
+  aggregate budget, and the Go #5877 gate body carries no `nat64` reference —
+  uncovered on both planes.
+  Validation: `cargo build --release` rc=0; `cargo test --release --bins nat::`
+  275 passed, 0 failed. Advances #6812.
+- **File(s)**: userspace-dp/src/nat/tests_aggregate_budget.rs,
+  userspace-dp/src/nat/source.rs, _Log.md
 ## 2026-08-12 — #2114 r4 fold: the atomic cell fixed ACQUISITION, not ESCAPE (PR #6743)
 
 - **Timestamp**: 2026-08-12
@@ -85688,6 +86469,346 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/api/metrics_counters.go,
   pkg/cli/cli_show_screen_unresolved_5806_test.go,
   pkg/grpcapi/server_show_screen_unresolved_5806_test.go, _Log.md
+- **Timestamp**: 2026-08-13T18:05Z
+- **Action**: #6815 round 8 — folded three live Codex blockers, all re-verified at
+  the round-7 head `52f7e735a` before anything changed. (B1) Round 7 de-correlated
+  the rule-SET names from declaration order and left the RULES inside each rule-set
+  declared `r0` then `r1` — config order and ascending name order at once. Measured
+  on a scratch worktree, not argued: inserting a `sort.SliceStable(rs.Rules, byName)`
+  ahead of the emit loop in `buildSourceNATSnapshotsWithFeeds` left
+  `TestBuilderEmittedOrderIsStableWithinATier_6812` entirely GREEN. Rules now declare
+  descending; assertion (3) reads the DECLARED sequence out of the compiled config
+  instead of re-deriving `r%d`, so a re-cut cannot leave the expectation behind; and
+  `assertNoRuleSetDeclaredRuleNameAscending6812` is the round-7 tripwire one level in
+  (proven reachable — re-cutting the loop ascending reds against PRISTINE production
+  with `rule-set for pool if00 declares its rules in ascending NAME order [r0 r1]`,
+  while the descending fixture under the mutation reds on the ASSERTION, so the
+  precondition does not shadow it). Enumerated every other generated name in these
+  fixtures against "could a production sort key on it": rule-set/pool names, match
+  address, from-interface, from-zone and pool address are all already descending;
+  the counter ID is constant. No fourth level exists. (B1b) The walk side had NO
+  rule-level assertion — every `pkg/config` ordering fixture declares one rule per
+  rule-set. Added `TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812`
+  (one rule-set so the tier sort is a no-op; four rules `r03 r02 r01 r00` referencing
+  pools `qb qd qa qc`, with the three candidate sequences asserted pairwise
+  distinct). Qualifier recorded because what detected it was an accident: the same
+  mutation also reds the count/address budget fixtures, but only because their 1,025
+  rules are named `r0..r1024` and `"r1000" < "r999"` — zero-pad those names and both
+  go blind. (B2) The reject half of
+  `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` fired only for
+  `nil error && nonempty output`, so EMPTY SUCCESS was admissible — and every fixture
+  row is a single-member pool, so a per-member skip produces exactly that. Measured:
+  changing the `netip.ParsePrefix` branch in `expandPoolV4` to `continue` left it
+  GREEN. Now requires a non-nil error per row, plus a MIXED-member half in BOTH
+  orders with a control that the good member expands alone; under the mutation the
+  mixed row reds `expandPoolV4(pool [198.51.100.1/032 198.51.100.7/32]) returned NO
+  ERROR and 1 addresses [198.51.100.7]`. (B3) Corrected a false claim this PR
+  authored: `SourceNATAggregateOverBudgetPools` said the Go first-fit rule "mirrors
+  it exactly — same order". `resolve_pool_allocators` is TWO passes — reused keys
+  reserved in phase 1, new keys admitted in phase 2 — so the sequences coincide only
+  when `previous_allocators` is empty. The Go/Rust AGREEMENT claim is unaffected and
+  is left standing, with the reason stated: the Go poison travels on the wire and a
+  poisoned pool reaches neither Rust phase. Corrected at both live sites; the round-3
+  narrative in plan.md quotes the sentence as it stood and is accurate as history.
+  DEFERRED with a site list rather than half-fixed: four operator surfaces still
+  derive capacity from `len(pool.Addresses)`, which counts a refused member — six
+  call sites in `pkg/cli`/`pkg/api`/`pkg/grpcapi`, none of which this PR touches.
+  Measured for a `10.0.0.0/016` pool (`SourceNATPoolUnusableReason == "invalid_pool"`,
+  so no allocator is installed): 64,512 ports at cli_show_nat.go:206 and :349,
+  metrics_nat.go:31 and grpcapi/server_nat.go:132; 126 deterministic blocks at
+  metrics_nat.go:109; and REST nat.go:271 keeps the config-derived count when the
+  runtime reports `AddressCount == 0`. Validation: `go test ./pkg/config/ ./pkg/nat/
+  ./pkg/dataplane/userspace/` all ok (29.9s / 0.1s / 20.4s), FULL_RC=0; gofmt and
+  go vet clean on the touched files. No Rust source changed.
+- **File(s)**: pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/nat/pool_expansion_parity_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:20Z
+- **Action**: #6815 round 9 — Codex MERGE-NEEDS-MINOR, zero runtime defects at
+  `1995806ee`. (M1) Round 8's walk-side fixture permuted the rule and pool NAMES
+  and then generated the match address and the pool member address from the loop
+  index, so both ascended with declaration order; its comment also claimed the
+  names were "neither ascending nor descending", which is false of the rule
+  column (`r03 r02 r01 r00` is descending). Measured: a `Match.SourceAddress`
+  sort in the charge walk left the ENTIRE `pkg/config` suite green — strictly
+  worse than the round-8 finding it mirrors, which at least reds two budget
+  fixtures by accident. Every column is now an independent permutation, and all
+  six axis x direction cells are RED. (Generalisation) Round 8 enumerated
+  generated NAMES; two dimensions were being confused with one — WHICH key a
+  sort reads, and WHICH DIRECTION it sorts in. Swept both by measurement at both
+  mutation sites of the builder fixture: all seven ascending cells were visible
+  and FIVE reverse cells were blind, because rounds 7 and 8 each fixed an
+  ascending coincidence by re-cutting DESCENDING, trading one monotone direction
+  for the other. Fixed by emitting a PERMUTATION at both levels (`declOrder`,
+  and `ruleOrder` with THREE rules per rule-set — two cannot be de-correlated
+  from both directions); all fourteen cells now RED. `wantRefs` is derived from
+  the declared sequence stable-sorted by tier rather than transcribed. The
+  closure claim is now by CONSTRUCTION, not by list:
+  `assertDeclarationOrderIsNotSortedBy6812` is called on every column and asks
+  the question mechanically, so a column added later that nobody remembers to
+  permute fails the belt. One deliberate exemption, and it is not a hole — a
+  CONSTANT column is a non-axis (a stable sort on a constant cannot permute
+  anything); this is real, since zone-tier rule-sets carry no `from interface`
+  and interface-tier ones carry no `from zone`. (M2) Round 8 replaced one
+  categorical claim with another: empty previous state GUARANTEES equality, but
+  a re-apply merely CAN differ — an all-reused apply coincides, as does any
+  apply whose reused keys already precede its new ones. Phase 1 also reserves
+  only keys BOTH viable now AND previously allocated. The comment now carries
+  Codex's admission proof: `charge(A)` fits every budget, Rust's pendings are
+  exactly `A`, and `R`/processed-new/`k` are disjoint subsets of `A`, so Rust
+  refuses nothing Go admitted in any order. Three further sites carried the
+  uncorrected claim and now carry the qualified one. (M3) The mixed-member
+  two-order rationale was false for its own mutation — under `continue` both
+  orders skip the bad member and return the good address. Withdrawn; replaced
+  with position-independence of the all-or-nothing contract, plus the internal-
+  state reason, measured: `return out, err` reds 12 rows, all `[good, refused]`,
+  zero `[refused, good]`. Harness note: `/dev/shm` filled mid-round, so the
+  mutation sweeps were re-run with an explicit VOID classification for
+  build/infra failures — a vanished GOCACHE would otherwise read as a red. Both
+  config sweeps reproduced exactly with no VOID cells. Validation: gofmt and go
+  vet clean on touched files. No Rust source changed. VALIDATION RECORD
+  CORRECTED, see the entry below.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go, pkg/config/nat_source_scope.go,
+  pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/nat/pool_expansion_parity_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:35Z
+- **Action**: #6815 round 9 — validation-record correction, plus a re-verification
+  after a shared-tmpfs cache deletion. The parent swept `/dev/shm` and removed
+  `gc-f6815r9` mid-round. My FINAL validation had already moved to a GOCACHE
+  under the job directory, but BOTH builder-fixture mutation sweeps had run
+  against the tmpfs one, so both halves were re-run on the safe cache with a
+  classifier that treats ENOSPC, `build failed`, and a zero exit without an `ok`
+  line as VOID rather than as a result. Both reproduced EXACTLY — 5 blind cells
+  before the permutation, 14 of 14 RED after, zero VOID. Every number in the
+  round-9 plan and commit stands. (The tmpfs directory now exists again at 513 MB
+  with an mtime inside the round, i.e. it was removed and partially rebuilt; that
+  is the shape that makes a straddling cell unreadable, which is why the re-run
+  was owed rather than optional.)
+  CORRECTION. The round-9 commit message and the previous log entry recorded
+  `go test ./...` as exit 0 with 66 packages ok. That run did NOT pass
+  `-count=1`, so an unknown share of it was CACHE-SERVED and the exit code was
+  not evidence the suite had actually executed. Forced with `-count=1` it failed:
+  `pkg/ipmon TestDebounceCoalescing`, "no actuation after debounce window". Run
+  down rather than waved off — `pkg/ipmon` is untouched by this PR (0 files in
+  the range `edefb7570...7547b379f`); the assertion sleeps 40 ms of WALL CLOCK
+  and then requires the debounce goroutine to have actuated, which a loaded box
+  can miss; it passes 5/5 in isolation at the PR head and 8/8 at the PR BASE, so
+  it is pre-existing and load-dependent, not a regression this PR introduced. A
+  second forced `-count=1` full run is clean: **exit 0, 62 packages with tests,
+  zero FAIL**. That is the figure of record; the earlier "66 ok" conflated
+  packages-with-tests and `no test files` lines and came from the unforced run.
+- **File(s)**: _Log.md
+
+- **Timestamp**: 2026-08-14T06:55Z
+- **Action**: #6815 round 10 — the closure claim was still a LIST, one level up,
+  plus three claim corrections. Codex: MERGE-NEEDS-MINOR, no runtime-behaviour
+  defect. (M1) Round 9 said the axis set was closed BY CONSTRUCTION; both
+  fixtures still MANUALLY ENUMERATED the helper calls, so a column with no call
+  stayed silent — the list had moved from axis names to helper calls, which is
+  round 9's own diagnosis of round 8 applied to round 9. Three columns it left
+  open, each confirmed by measurement against the WHOLE package at the PR base
+  a1db9f734: a `(tier, CounterID ASC)` tiebreak GREEN (the fixture passed nil
+  for the ID map so every ID was zero), `(tier, len(PoolAddresses) ASC)` GREEN
+  (one member per pool), `(tier, PortLow ASC)` GREEN (default range everywhere).
+  All three RED at this head. Replacement: `sweepAxes6812`, one twin per
+  package, REFLECTS over the value the production comparator reads — one column
+  per struct field recursing into nested structs and pointers, a `.len` column
+  per slice/map, the first element's columns when non-empty, and a HARD FAILURE
+  for any kind with no order-preserving key encoding. Adding a field to
+  SourceNATRuleSnapshot reds the fixture (cell B1); adding one to NATPool reds
+  the walk fixture (C2). Round 9's silent constant exemption is gone: a constant
+  column must be REGISTERED as `fixtureConstantAxes6812` (an admitted blind
+  spot) or `productionConstantAxes6812` (invariant for every production input),
+  an unregistered constant fails with the full offender list, and an entry that
+  is constant in no swept group fails as stale. Where closure STOPS is written
+  down rather than left implicit — keys derived from fields by arithmetic are
+  not reflectable, so `.len` is swept mechanically and the rest are declared as
+  fields of a wrapper struct the sweep treats like any other column; that
+  wrapper's field list is the only list left. Counted rather than asserted:
+  25 columns guarded across the two fixtures (11 per-tier + 3 per-rule-set on
+  the builder, 11 on the walk) against 6 by hand in round 9, and 74 named holes
+  plus 9 provable non-axes. (M2) The transformation-coverage claim was wider
+  than the measurement — reversal and nonzero rotation are caught elementwise
+  but a PARTITION is caught only when it changes this fixture, and `[1,0,2]` is
+  already stably partitioned by match address `< 10.0.2.0/24`; corrected to
+  "transformations that realise a nonidentity permutation on this data". (M3)
+  "Rust's pendings are exactly A" is false with a shared pool — pendings are
+  per-RULE, a multiset with repeats; corrected to distinct-key granularity, with
+  the reason distinct pool names give distinct keys. (M4) The Rust
+  fail-on-revert rationale named a line it no longer holds: after phase-one
+  reservation, deleting the reuse-path `pool_allocators.insert` is GREEN
+  (measured, cargo release, --test-threads=1); dropping phase 1's distinct-key
+  dedup is RED and is the replacement rationale, with the phase-1-charge
+  deletion recorded as an explicit non-counterexample.
+  Harness notes worth keeping. A `cargo test ... ; echo RC=$? | tee` reported
+  the TEE's exit code to the runner — the real rc (101, a build failure from a
+  missing sibling crate) was only in the log, so the first Rust baseline would
+  have read as a pass. The mutation harness restored files with `git checkout
+  --`, which cannot restore an UNTRACKED file; two of the swept files are new,
+  so it would have aborted mid-matrix leaving a mutation in the tree. Changed to
+  a content backup. And a `go test ./...` was started on the same worktree the
+  mutation matrix was mutating — killed and its output discarded rather than
+  reported, since it may have compiled a mutated tree.
+- **File(s)**: pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go (new),
+  pkg/config/nat_source_axis_sweep_6812_test.go (new),
+  pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  userspace-dp/src/nat/tests_aggregate_budget.rs,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T08:40Z
+- **Action**: #6815 round 11 — the round-10 dichotomy had a THIRD outcome, and it
+  landed on the case round 10 claimed to close. Codex at cade69ad9: no
+  production regression; the headline property false, measured by a
+  switch-for-switch probe of the collector. "Swept, or stops the test" was
+  missing SILENTLY SKIPPED: a nil pointer emitted `.nil` and skipped every
+  pointee field, so adding a field to PersistentNATConfig or
+  DeterministicNATConfig — both nil in every fixture pool — changed no column at
+  all; a `[]byte` emitted `.len` and `[0]` and dropped the rest; a map emitted
+  only `.len`, so three one-entry maps keyed {N:2}, {N:0}, {N:1} were
+  indistinguishable while a comparator keying on the sole key reorders them; a
+  nil interface hid its payload schema; and time.Time was walked as wall/ext/loc,
+  whose lexicographic order is not chronological. A PARTIAL column is worse than
+  no column because it reads as coverage. The collector now gives every kind
+  exactly one of five outcomes: an order-preserving column; a TOTAL column over
+  contents (`.all` for sequences, sorted `.entries` for maps); the contained
+  TYPE's schema with ABSENT keys when the value is missing (nil pointee, empty
+  list, empty map); an explicit `…-UNENCODED` declaration the registry forces
+  someone to justify (nil interface — its dynamic type is genuinely unknowable);
+  or a hard stop. Keys are tagged present ("\x01"+key) / absent ("\x00") so an
+  absent value cannot collide with a legitimately empty string. Measured, all
+  RED with controls green: P1 drop the pointee-schema walk; P2 drop `.all`; P3
+  drop `.entries`; P4 drop the UNENCODED declaration; P5 walk time.Time as a
+  struct; P6 drop the empty-list schema walk; **W1 add a field to
+  PersistentNATConfig, a PRODUCTION type, reds the walk fixture** — the round-10
+  claim, now true. X1-X3 re-confirm the round-10 (tier, CounterID), (tier,
+  len(PoolAddresses)) and (tier, PortLow) cells still bind, so round 11 unbound
+  nothing. REGISTRY: `productionConstant` truth is no longer prose — every such
+  entry carries a WITNESS, an independently built sequence constructed to make
+  the column vary if the claim were false, and
+  TestProductionConstantAxesAreWitnessed_6812 requires each claimed column to
+  EXIST in the witness projection and be constant in every group. Measured:
+  marking Snapshot.PoolName production-constant reds. The witnesses found
+  something themselves — one rule-set carrying all six scope clauses is NOT a
+  representable input, because compileNATSource expands a multi-kind from/to into
+  the CROSS PRODUCT (six clauses on one named rule-set compile to nine
+  rule-sets), so the witness uses one from-kind and one to-kind per rule-set and
+  groups on the rule-NAME prefix rather than on scope, which would be circular.
+  `Pool.nil` moves to fixture-constant: CompileConfigLenient permits a dangling
+  pool reference (compiler_nat_pool_ref_5626_test.go:164) and the charge walk
+  skips it (:3192), so it is order-irrelevant AFTER filtering — not invariant for
+  every input, which is what the definition says. Three columns were classified
+  pessimistically and are corrected with firsthand verification, each now
+  production-constant WITH a witness: Match.Protocol/Protocols (sole non-test
+  writer is compiler_nat_destination.go:167-169), Pool.Address/Port/PortRaw
+  (compileNATSource builds pools fresh at :471 and is the sole SourcePools writer
+  at :686; the only writers of those three are on DNAT pool objects), and
+  Snapshot.AddressPersistent (one config-global bit, types_security.go:620,
+  stamped by nat_source.go:223). Split, with the caveat that the column universe
+  GREW because the collector now sees what it skipped: builder per-tier 13/44/1,
+  builder per-rule-set 4/47/7, walk 13/49/10 — 30 guarded / 140 fixture-constant
+  / 18 production-constant over 188 cells, against round 10's 25/74/9 over 108.
+- **File(s)**: pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go (new),
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-20T09:20Z
+- **Action**: #6815 round 12 — the derived-key guard contained the fixture
+  coincidence it was built to catch. Round 11's wrapper recomputed
+  `len(members) × width`; production spends `Σ host-count × range` (and the Rust
+  boundary the expanded `total_pool`), and the three agreed only because every
+  fixture pool member was a bare host. Fixed by CONSULTING: the walk wrapper now
+  carries ChargeAddrs/ChargePortCap read from sourceNATAggregateReferencedCharges,
+  and the builder wrapper LOSES its derived column rather than gaining a
+  corrected one — the builder computes no charge and the value lives in Rust, so
+  writing it there would be the second implementation the finding is about.
+  Falsifiable now: one pool carries a /30, so a bare-host fixture (which agrees
+  with both formulas and proves neither) reds. Measured D1 revert-the-/30 RED,
+  D2 recompute-the-naive-product RED. Counts re-derived WITH their populations —
+  rounds 10 and 11 both quoted CELL counts as column counts; at this head
+  population A (cells) 186 = 29+139+18, population B (distinct columns) 129 = 25
+  guarded-somewhere + 104 never. Rust MUT-C re-measured with a true control and
+  `--no-fail-fast` (a CARGO flag; after `--` the test binary rejects it and the
+  cell VOIDs): control module rc=0 17/0, MUT-C single GREEN, MUT-C module rc=101
+  RED on the three reserve-before-admit tests — round 10's cell was right and
+  scope-less. My first re-measurement produced a RED control that would have
+  refuted the finding; it was the harness, a relaunch while the previous instance
+  was live so the second run's backup captured the first's mutation. Caught by
+  diffing the scratch against the worktree HEAD before reporting; the harness now
+  takes a flock and asserts pristine-vs-git. Three precision notes added, each
+  measured: the schema walk IS transitive but guardedness is not; a sequence's
+  content is total (`.all`/`.entries`) while its per-index ordering is not (no
+  `[1]` column); and time.Time is special-cased because `wall` carries the
+  monotonic flag in bit 63 and is not chronologically ordered.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6812/#6815 round 13 — the round-12 guard was a tautology, and two
+  "total" columns were not injective. B1 (blocking): `ruleAxisSlot6812` had
+  THREE construction sites from the same inputs — the sweep at
+  compiler_nat_source_pool_aggregate_6812_test.go, `walkWitness6812`, and the
+  round-12 guard — and the guard built its own literal and then asserted about
+  that literal (`x := T{F: v}; if x.F != v`), binding only the site no sweep
+  consumes. Confirmed by measurement: replacing the SWEEP-site formula with
+  round 11's `len(members) x width` left pkg/config green. Fixed by
+  single-sourcing — `ruleAxisSlots6812(t, what, cfg, rules)` is the only
+  constructor, all three sites call it, and the guard asserts over its OUTPUT;
+  three constructions of one slot from one config have no legitimate reason to
+  differ, so collapse makes divergence unrepresentable rather than merely
+  detectable. Guard widened to the other derived column (round 12 checked
+  ChargePortCap only). Matrix: C0 pristine rc=0, S0 always-failing sentinel
+  rc=1, M1 portCap-naive guard RED / sweeps GREEN, M2 addrs-naive guard RED /
+  sweeps GREEN, C1 restored rc=0 — the green sweep column IS the finding.
+  B2 (blocking): `.all`/`.entries` were not injective. axisEncodeValue6812
+  joined `name=key<RS>` with the key raw, so an element field carrying the
+  record separator plus a forged present-tag boundary re-partitioned the record
+  and two different slices encoded identically; nested containers hit it with no
+  adversarial string, since an `.all` key is itself a composite. Fixed with
+  axisEscapeKey6812 applied ONCE at the join — leaf and composite keys take the
+  same path, so depth N is escaped N times; escaping at the leaf would leave
+  composites unescaped at the level embedding them. Column names are not escaped
+  and need not be. B3 (blocking, latent): a POPULATED map returned before
+  emitting its {key}/{value} schema columns, so a field added to a populated
+  map's value type produced no column — the SILENTLY SKIPPED outcome round 11
+  claims to have removed, and it made the map column SET depend on the VALUE not
+  the TYPE (a fixture mixing empty and populated back-fills "" and manufactures
+  a phantom varying column). Fixed by always emitting the schema columns, keys
+  ABSENT — a map has no canonical entry to project, unlike a slice's [0].
+  Measured MUT-B2 and MUT-B3 both RED on the new tests while the OLD prober
+  stayed GREEN in both cells: previously invisible. N1 REFUTED by measurement:
+  the reviewer's third formula (raw PortLow/PortHigh instead of
+  SourceNATPoolPortRange) has no fixture witness because compileNATSource stamps
+  the 1024/65535 default itself, so a compiled no-port-leaf pool carries raw
+  1024/65535 (measured: raw width 64512 == effective width) and a
+  rejected-range pool is never charged at all. Bound the PREMISE instead —
+  TestRawPortFieldsAreNotAThirdFormula_6812 asserts the agreement, rejects any
+  charged pool with a zero endpoint, and requires a no-port-leaf pool in the
+  fixture so the agreement exercises the default. Added pool `qe` for that role.
+  Twin golden gained 8 rows and lost none (3 from B3, 5 from a new SliceSep
+  probe field carrying a separator, so the behavioural half of the twins
+  agreement can see an escaping divergence); every pre-existing row byte-
+  identical, so the key format did not change.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  pkg/config/nat_source_axis_twins_6812_test.go,
+  pkg/config/testdata/axis_collector_twins_6812.golden,
+  pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_twins_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
 - **Timestamp**: 2026-08-13T14:10Z
 - **Action**: #6827 round 6 — folded a Codex MERGE-NEEDS-MAJOR (7 blocking). B1 RUNTIME:
   a dead HTTPS leg made the stale-cert debt permanently undischargeable. An unexpected
