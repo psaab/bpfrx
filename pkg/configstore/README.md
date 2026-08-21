@@ -806,13 +806,32 @@ entrant; that is tracked separately.
 
 ### Cluster read-only gate (#3893)
 
-On an HA chassis cluster the RG0 primary is the sole config authority;
-the secondary is read-only and receives config only via `SyncApply`
-(peer sync from the primary). The daemon toggles the store's read-only
-mode on the RG0 primary↔secondary transition:
+On an HA chassis cluster the RG0 primary is the INTENDED sole config
+authority: on a secondary **whose gate is armed** the store is read-only
+and receives config only via `SyncApply` (peer sync from the primary).
+The daemon arms and disarms that mode from the RG0
+primary↔secondary TRANSITION handler — `applyRG0OwnershipTransition`
+(`pkg/daemon/daemon_ha.go`) — and from nowhere else:
 `SetClusterReadOnly(true)` when this node becomes secondary,
-`SetClusterReadOnly(false)` when it is promoted to primary
-(`pkg/daemon/daemon_ha.go`).
+`SetClusterReadOnly(false)` when it is promoted to primary.
+
+**Arming is not universal — do not read the heading as unconditional
+(#6896).** That transition handler is the only production caller of
+`SetClusterReadOnly` (`git grep -n SetClusterReadOnly -- '*.go'` returns
+the setter plus its two lines in `daemon_ha.go`); there is no startup
+arming and no reconcile that re-derives the flag, and
+`Store.clusterReadOnly` is a plain `bool` with no constructor
+initialisation, so it starts `false` (pinned by
+`TestClusterReadOnly_ZeroValueStoreIsWritable_6896`). A node that
+cold-starts, seats as RG0 secondary and never transitions therefore has
+a **writable** store — and `pkg/api/config.go` enters a configure
+session with no RG0 check of its own, where gRPC guards on
+`IsLocalPrimary(0)` (`pkg/grpcapi/server_config.go`) and the interactive
+CLI has its own check (`pkg/cli/cli_dispatch.go`). That gap is
+**#6890**; the dropped-transition-event variant — the manager reaches
+primary while the store stays read-only — is **#6889**. Both are OPEN.
+Everything below describes what the gate does ONCE ARMED; it is the
+design intent, not a property every secondary has.
 
 `clusterReadOnly` was originally checked ONLY at the `EnterConfigure*`
 gate. That left two holes: a config session **opened before** the node
@@ -839,7 +858,8 @@ config authored by the primary. `SyncApply` (HA peer-sync ingress) and
 `active`/`compiled` state **directly** and never route through the gated
 `Set`/`Commit`/`Load`/`Rollback` methods, so they are unaffected by this
 gate — exactly the distinction between a user-driven mutation (blocked
-on a secondary) and an internal convergence apply (must proceed).
+on a secondary whose gate is armed) and an internal convergence apply
+(must proceed).
 Boot-time `bootstrapFromFile` enters config mode first, so it too is
 governed by the same gate (a no-op there because `clusterReadOnly` is
 `false` at boot, before any RG0 transition).

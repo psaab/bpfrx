@@ -412,10 +412,14 @@ type Manager struct {
 	// once readiness is established.
 	takeoverHoldTime time.Duration
 
-	// syncReady is true once bulk session sync has been received (or timed
-	// out). Used in private-rg-election / no-reth-vrrp mode as the
-	// equivalent of VRRP sync-hold — gates RG promotion until session state
-	// is synchronized from the peer.
+	// syncReady is true once bulk session sync has been received (or the
+	// readiness timeout released the hold). It gates NOTHING: no consumer
+	// reads it to decide RG promotion, in private-rg-election / no-reth-vrrp
+	// mode or any other (#7102). It was the no-RETH equivalent of the VRRP
+	// sync-hold until 0781f7a60 removed that gate; today its only production
+	// readers are the readiness timeout in pkg/daemon/daemon_ha_sync.go and
+	// two log fields. See SetSyncReady in sync_state.go for the full account
+	// and #110 for whether the gate should return.
 	syncReady bool
 
 	// syncTransport records whether session sync uses "fabric" or

@@ -4313,6 +4313,145 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
     assert_eq!(resolved.decision.resolution.tx_ifindex, 11);
 }
 
+// #6313 RED-on-revert: a reverse-direction packet whose 5-tuple hits a
+// peer-synced entry in the SHARED session map is materialized into this
+// worker's local table by `materialize_shared_session_hit`, and that
+// materialize must ADOPT the shared replica's stable session id rather than
+// mint a fresh node-local one (#5212). The reverse companion of a synced
+// session carries the SAME RT_FLOW correlation id as its forward half, so a
+// session that opens on the primary and closes on the standby after a
+// failover emits SESSION_CREATE / SESSION_CLOSE under one correlatable id in
+// BOTH directions.
+//
+// The wire-level adoption in `upsert_synced_with_origin` is covered by
+// `synced_import_adopts_peer_session_id_5212` (session/tests.rs); this test
+// covers the session_glue CALLER — reverting the `session_id: replica.session_id`
+// argument in `materialize_shared_session_hit` back to `session_id: 0` makes
+// the install fall through to `alloc_session_id()` and reddens the first
+// assertion below. The local table is pinned to worker 4 and the peer id is
+// minted in worker 9's namespace so a fresh local alloc can never coincide
+// with the adopted value (the id space carries no node discriminator — #6311).
+#[test]
+fn reverse_materialized_shared_hit_adopts_replica_session_id_6313() {
+    let mut sessions = SessionTable::new();
+    sessions.set_worker_id(4);
+
+    let forward = test_key();
+    // The reverse companion: server -> client, ports swapped.
+    let reverse = SessionKey {
+        addr_family: forward.addr_family,
+        protocol: forward.protocol,
+        src_ip: forward.dst_ip,
+        dst_ip: forward.src_ip,
+        src_port: forward.dst_port,
+        dst_port: forward.src_port,
+    };
+    // A second reverse companion (different client port) for the negative
+    // control below.
+    let reverse_legacy = SessionKey {
+        src_port: forward.dst_port,
+        dst_port: forward.src_port + 1,
+        ..reverse.clone()
+    };
+
+    let peer_session_id: u64 = (9u64 << 48) | 0x5212;
+    let mut reverse_metadata = test_metadata();
+    reverse_metadata.is_reverse = true;
+
+    let forwarding = test_forwarding_state();
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    for (key, session_id) in [
+        (reverse.clone(), peer_session_id),
+        // Control: a legacy peer that predates the #5212 wire field sends 0.
+        (reverse_legacy.clone(), 0u64),
+    ] {
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &SyncedSessionEntry {
+                key,
+                decision: test_decision(),
+                metadata: reverse_metadata.clone(),
+                origin: SessionOrigin::SyncImport,
+                protocol: PROTO_TCP,
+                tcp_flags: TCP_FLAG_ACK,
+                // #2170 test fixture: no peer install generation.
+                generation: 0,
+                session_id,
+            },
+        );
+    }
+
+    let peer_worker_commands = Vec::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // RG 1 (the reverse companion's owner) is locally active, so the shared hit
+    // is NOT held transient and takes the materialize path.
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+
+    for key in [&reverse, &reverse_legacy] {
+        resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &peer_worker_commands,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &SessionFlow {
+                src_ip: key.src_ip,
+                dst_ip: key.dst_ip,
+                forward_key: key.clone(),
+            },
+            1_000_000,
+            now_secs,
+            PROTO_TCP,
+            TCP_FLAG_ACK,
+            5,
+            false,
+            0,
+            0,
+        )
+        .expect("the reverse shared-session hit should resolve");
+    }
+
+    // THE PROPERTY (#6313): the reverse-materialized entry carries the
+    // replica's id verbatim. Reverting `materialize_shared_session_hit` to
+    // `session_id: 0` reds here with a worker-4 local alloc.
+    assert_eq!(
+        sessions.session_id_for(&reverse),
+        peer_session_id,
+        "a reverse-materialized shared-session hit must ADOPT the replica's \
+         session id so both directions correlate across HA nodes (#5212/#6313)"
+    );
+
+    // NEGATIVE CONTROL (passes with and without the revert): a replica with no
+    // wire id still gets a fresh, non-zero, node-local id — the materialize
+    // path must never leave a session unstamped.
+    let control_id = sessions.session_id_for(&reverse_legacy);
+    assert_ne!(
+        control_id, 0,
+        "a zero replica id must fall back to a fresh local alloc, not 0"
+    );
+    assert_eq!(
+        control_id >> 48,
+        4,
+        "the fallback id must be namespaced to THIS node's worker (4)"
+    );
+    assert_ne!(
+        control_id, peer_session_id,
+        "the fallback must be a fresh LOCAL id, never the adopted peer id"
+    );
+}
+
 // === #1346 dispatcher order-pin + dedup test =================================
 //
 // Round-2 Codex review required two test additions:

@@ -512,6 +512,73 @@ mod session_tests {
         );
     }
 
+    // #6118 (#5168 hardening): the anti-false-Repeat WRAP accept — the
+    // availability twin of `ring_preserves_in_window_bit_across_blocks`.
+    //
+    // One ring slot+bit is shared by every counter congruent modulo the ring
+    // capacity (RING_BLOCKS * BLOCK_BITS = 8192), so `X` and `X + 8192` are
+    // indistinguishable to the bitmap read. A FRESH `X + 8192` may therefore be
+    // decided off `X`'s bit, and the only thing that makes it decide correctly
+    // is the forward-clear sweep having zeroed `X`'s block while the high-water
+    // advanced over it. If that sweep is skipped — or stops one block short of
+    // the wrap tail — the fresh counter falsely Repeats and authentic traffic is
+    // dropped after a large counter advance.
+    //
+    // RED-ON-REVERT: neutering the sweep, or narrowing its inclusive bound by
+    // one block (`current + diff` -> `(current + diff).saturating_sub(1)`, which
+    // leaves exactly the seed's block dirty when `diff` saturates at
+    // RING_BLOCKS), turns the wrap accept below into a Repeat. Both mutations
+    // leave the other 13 replay tests GREEN — this case is their sole detector.
+    #[test]
+    fn wrap_accept_after_forward_clear() {
+        // The counters, chosen so the aliasing and the window arm are exact.
+        const RING_SPAN: u64 = RING_BLOCKS as u64 * BLOCK_BITS; // 8192
+        let seed = 100u64;
+        let wrapped = seed + RING_SPAN; // same word, same bit as `seed`
+        // One block PAST `wrapped`: far enough that the advance's `diff`
+        // saturates at RING_BLOCKS (so the sweep wraps all the way back over
+        // the seed's block), yet near enough that `wrapped` is still in window
+        // and so takes the bitmap arm rather than the high-water arm.
+        let advance = wrapped + BLOCK_BITS;
+
+        // The slot aliasing is this test's precondition, not an assumption —
+        // assert it, so a geometry change cannot silently make the case vacuous.
+        let slot = |c: u64| ((c >> BLOCK_BIT_LOG) as usize & BLOCK_MASK, c & BIT_MASK);
+        assert_eq!(
+            slot(seed),
+            slot(wrapped),
+            "precondition: {seed} and {wrapped} must alias ONE ring slot+bit"
+        );
+        assert_ne!(
+            slot(advance),
+            slot(seed),
+            "precondition: the advance must not itself sit on the shared slot"
+        );
+
+        let mut r = ReplayState::default();
+        assert_eq!(r.check_and_update(seed), ReplayDecision::Accept);
+        assert_eq!(r.check_and_update(advance), ReplayDecision::Accept);
+        assert!(
+            !r.definitely_out_of_window(wrapped),
+            "precondition: {wrapped} must be IN window at high-water {advance}, \
+             so the decision is the bitmap read and not the age reject"
+        );
+
+        assert_eq!(
+            r.check_and_update(wrapped),
+            ReplayDecision::Accept,
+            "a fresh counter aliasing a forward-cleared slot must ACCEPT, not \
+             falsely Repeat off the stale bit left by {seed}"
+        );
+        // ...and the accept must have SET the bit, not merely passed the read:
+        // its own replay repeats.
+        assert_eq!(
+            r.check_and_update(wrapped),
+            ReplayDecision::Repeat,
+            "the wrap accept must record {wrapped} as seen"
+        );
+    }
+
     #[test]
     fn reject_after_messages_constant_matches_wireguard_spec() {
         assert_eq!(REJECT_AFTER_MESSAGES, 0xffff_ffff_ffff_dfff);

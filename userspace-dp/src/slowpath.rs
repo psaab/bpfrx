@@ -729,12 +729,14 @@ fn apply_slowpath_outcome(
 ///
 /// Overwriting `*mode` DROPS the [`RingWriter`], whose `Drop` runs a bounded
 /// teardown drain (submit an AsyncCancel per still-in-flight entry, observe each
-/// target write's terminal CQE) and then closes the ring fd. The fd close makes
-/// the kernel cancel and wait for every outstanding op, and the in-flight
-/// registry — dropped AFTER the ring by field order — frees any straggler buffer
-/// only then, so no kernel reference can outlive a buffer across the demotion
-/// (the #5800 buffer-lifetime invariant, now covering the parked-buffer case the
-/// pre-#5800 code could not). No re-promotion (avoids flapping).
+/// target write's terminal CQE) and then closes the ring fd. The drain is the
+/// synchronous proof: every buffer it releases is provably unreferenced, which
+/// is the parked-buffer case the pre-#5800 code could not cover. A straggler the
+/// drain could NOT prove terminal is retained and freed only when the in-flight
+/// registry drops, which field order puts after the ring fd close — a
+/// best-effort narrowing of the window, not a barrier, because the fd close only
+/// queues the kernel's asynchronous `io_ring_exit_work` (#6168; see the
+/// `io_uring_write` module doc). No re-promotion (avoids flapping).
 fn retire_ring_to_sync(mode: &mut WriteMode) {
     *mode = WriteMode::SyncFallback;
 }

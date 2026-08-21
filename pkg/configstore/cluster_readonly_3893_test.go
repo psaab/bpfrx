@@ -152,3 +152,43 @@ func TestClusterReadOnly_PromotedNodeCanCommit(t *testing.T) {
 		t.Fatalf("Commit (promoted primary): %v", err)
 	}
 }
+
+// TestClusterReadOnly_ZeroValueStoreIsWritable_6896 pins the PRECONDITION the
+// three docs corrected in #6896 now state: the gate is not a property a
+// secondary has, it is a property a secondary is GIVEN by an RG0 transition.
+//
+// `clusterReadOnly` is a plain bool with no constructor initialisation and
+// `SetClusterReadOnly` is reached only from applyRG0OwnershipTransition
+// (pkg/daemon/daemon_ha.go), so a node that cold-starts, seats as RG0
+// secondary and never transitions has a WRITABLE store. Three docs asserted
+// the conclusion ("the secondary is read-only", "rejecting all config
+// mutations", "blocked on secondary cluster nodes") without the precondition;
+// a reader who trusted them would stop looking for #6890.
+//
+// This asserts the default, not the gate: an unarmed store enters config mode
+// and commits. It is deliberately NOT an assertion that the hole is
+// acceptable — when #6890 closes by arming the gate at startup (or by adding
+// the missing RG0 check on the REST path), this test is the place the change
+// becomes visible, and the docs above must move with it.
+func TestClusterReadOnly_ZeroValueStoreIsWritable_6896(t *testing.T) {
+	s := newTestStore(t)
+
+	// No SetClusterReadOnly call anywhere in this test — this is exactly the
+	// cold-start standby that never saw an RG0 transition event.
+	if s.ClusterReadOnly() {
+		t.Fatalf("a freshly constructed Store reports ClusterReadOnly()=true; " +
+			"the docs' arming precondition (#6896) assumes the zero value is " +
+			"false. If this is now armed by construction, #6890 may be closed " +
+			"and pkg/configstore/README.md, docs/feature-coverage.md and " +
+			"docs/phases.md must be re-stated")
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure on an unarmed store: %v", err)
+	}
+	if err := s.SetFromInput("system host-name cold-start-standby"); err != nil {
+		t.Fatalf("Set on an unarmed store: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit on an unarmed store: %v", err)
+	}
+}
