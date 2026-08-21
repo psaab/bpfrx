@@ -928,6 +928,30 @@ Keys=[protocol tcp udp icmp]   IsLeaf=true   (no children)
   `20000`/`to`/`20003` is a sibling keyword), matching the hierarchical
   `Keys=[destination-port 20000 to 20003]`.
 
+**A nested BLOCK is a third shape, and it is not the flat-set chain (#6689).**
+The two shapes above are the ones the bracket-list contract is about. A leaf can
+also be authored as a brace block — `from { protocol { bgp; ospf; static; } }` —
+which leaves the node itself with `Keys=["protocol"]` and files one leaf child
+per value as SIBLINGS. A reader that descends `Children[0]` at each level is
+correct for the flat-set CHAIN (one child deep at every level) and reaches
+exactly one value of a block (N children wide at one level). That was the
+`collectProtocolList` defect: a routing-policy term written to filter three
+protocols compiled to one, and with `then reject` the two dropped protocols were
+silently ACCEPTED and installed — a fail-OPEN route-acceptance widening whose
+authored config renders back intact. Descend EVERY child, not the first, and the
+chain and the block are both covered.
+
+Note this leaf has no per-value option keyword, so every token below the node is
+a value and the full descent carries no promotion hazard. That is a property of
+the leaf, not of the descent — see the `system ntp server` case under
+"A widened read must not PROMOTE a token the old reader discarded" for a leaf
+where it does not hold. The routing-policy `from protocol` value domain is
+UNVALIDATED at commit in every spelling (unlike the firewall-filter leaf of the
+same name, which `filterProtocolResolvable` checks): widening the read makes the
+block spelling behave like the four that already reach `pkg/frr`
+`match source-protocol`, rather than adding a new exposure, but the absent gate
+is tracked separately.
+
 **Compiler contract for multi-value leaves.** Because both shapes now deliver
 the values on `child.Keys[1:]` (with the hierarchical-block-with-children
 shape still possible for nested forms), a compiler reading a multi-value leaf
