@@ -419,11 +419,27 @@ def virt_customize(work_qcow, xpf_deb):
         # then VERIFY every enumerated package is actually in `apt-mark showhold`
         # (per-package, not a count) so neither a partial hold nor a pre-existing
         # unrelated hold can ship an unprotected image.
+        #
+        # Two things this fragment gets wrong easily, both of which aborted
+        # every bake (found by running one, #1926):
+        #   1. The `$` in the dpkg-query format must be ESCAPED. This string is
+        #      handed to the guest's `sh -c`, so an unescaped `${Package}` is
+        #      expanded by that shell as an unset variable, the format collapses
+        #      to a bare `\n`, dpkg-query emits one blank line per package, and
+        #      `$(...)` strips them all -> `pkgs` empty -> the FATAL below.
+        #   2. `dpkg-query -W` matches every package dpkg KNOWS OF, not just the
+        #      installed ones -- purged and never-installed names (e.g.
+        #      `linux-headers-3.0`, `linux-image-fb-generic`, referenced only as
+        #      someone else's dependency) come back too. `apt-mark hold` errors
+        #      on those ("Can't select installed nor candidate version"), which
+        #      `set -e` turns fatal. Filter on `${db:Status-Status}` so only
+        #      genuinely installed packages reach apt-mark.
         "--run-command",
         'set -e; export DEBIAN_FRONTEND=noninteractive; '
-        'pkgs=$(dpkg-query -W -f="${Package}\\n" "linux-image-*" "linux-headers-*" '
-        '"linux-modules-*" "linux-generic" 2>/dev/null | sort -u); '
-        '[ -n "$pkgs" ] || { echo "FATAL: no linux-* packages found to hold" >&2; exit 1; }; '
+        'pkgs=$(dpkg-query -W -f="\\${db:Status-Status} \\${Package}\\n" '
+        '"linux-image-*" "linux-headers-*" "linux-modules-*" "linux-generic" '
+        '2>/dev/null | awk \'$1=="installed"{print $2}\' | sort -u); '
+        '[ -n "$pkgs" ] || { echo "FATAL: no installed linux-* packages found to hold" >&2; exit 1; }; '
         # apt-mark hold failure is fatal (set -e + no output swallow); then
         # verify EACH enumerated package is actually in showhold, so a
         # pre-existing unrelated hold cannot mask a partial/failed hold.

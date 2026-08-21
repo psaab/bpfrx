@@ -45,7 +45,8 @@ case "$1" in
         if [ -z "$2" ]; then
             # === #1964 first-install seed (mechanism A) ===
             #
-            # Seed the versioned runtime layout BEFORE #DEBHELPER# starts
+            # Seed the versioned runtime layout BEFORE the debhelper-
+            # generated section (see the token near the end of this file) starts
             # the unit: copy staged/* -> versions/<v>/, set versions/current
             # -> <v>, and repoint /usr/local/sbin/* THROUGH versions/current.
             # This gives the appliance a real, immutable rollback target so
