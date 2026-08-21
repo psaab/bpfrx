@@ -276,6 +276,56 @@
   `pkg/dataplane/userspace/controllers.go`,
   `pkg/dataplane/userspace/legacy_dataplane.go`,
   `pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go` (new), `_Log.md`
+## 2026-08-21 — #6290 drive round (PR #6869): merge-gate pass, runtime-only bar
+
+- **Timestamp**: 2026-08-21
+- **Action**: Drive-to-merge round on PR #6869 (`fix/6290-cluster-transport-lock`).
+  Merged `origin/master` twice (the branch was 439 commits behind at the start,
+  and master gained 15 more — PR #6839 — mid-round); both merges were textually
+  clean, `_Log.md` union-resolved and structurally verified (section and
+  `**Timestamp**` counts equal ours + theirs - base at both merges).
+  Regenerated the GENERATED `docs/refactoring-audit-current.txt`: the #6290
+  guard adds 58 lines to `pkg/daemon/daemon_ha_sync.go`, which sat at 1499
+  lines at the pre-merge base but reached 1515 after the merge and so entered
+  the `[WATCH]` tier, failing `TestHeatmapNotStale`. **This supersedes the
+  "daemon_ha_sync.go at 1499 lines, one under the 1500 threshold" line in the
+  2026-08-05 #6290 entry below — that is no longer true at the merged head.**
+- **Runtime findings**: none. The hostile pass attacked lock ordering
+  (`clusterCommsMu` is still a leaf: no accessor calls out while holding it,
+  and the `applySem -> clusterCommsMu` edge step 20 now takes already existed
+  via `ensureDHCPLeaseSyncLoop` -> `getClusterCommsCtx`), non-reentrancy (both
+  `startClusterComms` call sites — `daemon_run.go` boot and
+  `daemon_apply_tail.go` step 20 — hold neither lock, and
+  `beginClusterCommsEpoch` releases the mutex before returning), and whether
+  the new epoch gate can fail open. It cannot: the boot publish can only be
+  dropped if step 20 first bumped the generation, and step 20's restart branch
+  requires an already-non-zero `activeClusterTransport`, so the field can never
+  be left permanently zero by the gate. The constructor goroutine covered by
+  `clusterCommsWG` never touches `applySem`, `applyConfig` or either transport
+  accessor, so `stopClusterComms`'s join under `applySem` gains no new edge.
+- **Non-runtime findings**: filed as #7066 (step-20 reader edit unbound —
+  reverting `daemon_apply_tail.go` to master's shape stays green, and the
+  README claims otherwise), #7067 (the race test stays green when the write is
+  deleted outright), #7068 (`setActiveTransport` doc references a symbol that
+  does not exist), #7069 (`daemon.go`'s `clusterCommsMu` guard enumeration
+  omits the field), #7070 ("eight log fields" is four), #7071 (the publish
+  bool is discarded while both siblings gate on theirs), #7072
+  (`stopClusterComms` leaves the field naming a dead transport, pre-existing),
+  #7073 (a fabric1-only change logs four identical pairs, pre-existing), and
+  #7075 (`pkg/daemon` `-race` is flaky because the test-local
+  `capturingHandler` is installed as the GLOBAL slog default and races a
+  `configstore.persistRetryLoop` goroutine leaked by an earlier test —
+  reproduced on unmodified `origin/master` at 09767cb76, 1 RED in 3 runs,
+  while this head was 3/3 green in the same probe).
+- **Validation**: `go build ./...` 0, `go vet ./...` 0 (empty output),
+  `go test -count=1 ./pkg/... ./cmd/...` 0, `go test -race -count=2
+  ./pkg/daemon/ ./pkg/cluster/` 0 with zero `DATA RACE` reports,
+  `go test -count=1 ./pkg/refactoraudit/...` 0 (was 1 before the regen).
+  No cluster smoke run — the shared loss cluster is parent-owned. The diff
+  against `origin/master` is Go and Markdown only; it does not reach
+  `userspace-dp/`, `userspace-xdp/` or any compiled artifact.
+- **File(s)**: docs/refactoring-audit-current.txt, _Log.md
+
 ## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
 
 - **Timestamp**: 2026-08-20 (fix/6848-cos-show-rewrite-rule, PR #6858)
@@ -80015,6 +80065,35 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch.go,
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+## 2026-08-05 — #6290 activeClusterTransport epoch guard
+
+- **Timestamp**: 2026-08-05
+- **Action**: Fold `activeClusterTransport` under the #4958 `clusterCommsMu`
+  epoch guard. The issue filed this as "NOT a race today", reasoning that the
+  boot `startClusterComms` completes before the gRPC/HTTP servers accept
+  commits. That accounts for the wrong readers: `applyConfig`'s own doc lists
+  DHCP callbacks, config-poll, feeds, the event engine and cluster sync recv as
+  callers, and the boot `applyConfig` starts the DHCP clients
+  (`reconcileDHCPClients`) with `onDHCPAddressChange` already wired — on
+  goroutines created BEFORE the write. Goroutine creation therefore orders them
+  the wrong way and supplies no happens-before, and `applySem` does not bridge
+  it because the boot writer never takes it. So the race was real on master,
+  the mirror of #5113 on `mgmtVRFInterfaces`. The write now goes through
+  `setActiveTransportIfCurrent(gen, key)` (epoch-gated like
+  `publishSessionSyncIfCurrent`, so a superseded concurrent start cannot land
+  last) and step 20 takes ONE `activeTransport()` snapshot for both its
+  comparison and its eight log fields.
+- **Validation**: `go test -race -count=1` on both new tests PASS. Mutation A
+  (drop both mutex guards = master's shape) -> `WARNING: DATA RACE`, write
+  attributed to `startClusterComms` daemon_ha_sync.go:706. Mutation B (drop the
+  `gen !=` check, keep the mutex) -> `TestSetActiveTransportDropsStaleEpoch`
+  FAILS without `-race` while the race test still passes, so each guard is
+  bound by its own test. `go vet` clean, `gofmt` clean,
+  `go test ./pkg/refactoraudit/` PASS (daemon_ha_sync.go at 1499 lines, one
+  under the 1500 threshold).
+- **File(s)**: pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/cluster_transport_race_6290_test.go, pkg/daemon/README.md, _Log.md
 
 ## 2026-08-01 — #4555 round 7: the replacement corpus floors were themselves proxies
 
