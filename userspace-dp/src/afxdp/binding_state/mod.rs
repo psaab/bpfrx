@@ -507,6 +507,19 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// by `Coordinator::session_publish_errors_total()` (Prometheus
     /// `xpf_userspace_session_publish_errors_total`).
     pub(super) session_publish_errors: AtomicU64,
+    /// #4800: per-binding count of LOCALLY-LEARNED transit forward flows
+    /// installed on the worker poll path — the exact population that runs
+    /// SNAT allocate -> `publish_shared_session` -> `replicate_session_upsert`.
+    ///
+    /// Summed per worker onto `WorkerRuntimeStatus.new_flow_installs`, so a
+    /// connection-rate run can SEE a single-core bound as skew across the
+    /// six mlx5 RX queues instead of inferring it. Counting reverse
+    /// companions, peer-synced imports, promotes or local-delivery caches
+    /// here would make the per-worker figures incomparable to the offered
+    /// connection rate, so none of those bump it. One Relaxed fetch_add on
+    /// a branch that already does a BPF map update and three mutex
+    /// acquisitions.
+    pub(super) new_flow_installs: AtomicU64,
     /// #2244: per-binding count of failed `dnat_table` BPF-map publishes
     /// (`publish_dnat_table_entry` `bpf_map_update_elem` returning < 0)
     /// on the worker poll paths that previously discarded the syscall
@@ -796,6 +809,7 @@ impl BindingLiveState {
             pending_neigh_keys: AtomicU64::new(0),
             neg_neigh_keys: AtomicU64::new(0),
             session_publish_errors: AtomicU64::new(0),
+            new_flow_installs: AtomicU64::new(0),
             dnat_publish_errors: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-

@@ -377,6 +377,39 @@ type compileOpts struct {
 	// flagged. Same doctrine as lenientChassisMonitorWeight.
 	lenientChassisRGStatementArity bool
 
+	// lenientLoginPackedStatements (#6662) downgrades the `system login`
+	// packed-body gate (validateLoginPackedStatementsAST) from a hard compile
+	// error to a cfg.Warnings entry on the tolerant load / peer-sync paths.
+	// `user alice class ops;` and `class ops permissions [ view configure ];`
+	// are valid Junos spellings that xpf compiles to an EMPTY object, and an
+	// empty user class is exactly pkg/cli's legacy "no RBAC configured"
+	// shortcut — allow every command, render secrets in cleartext — so an
+	// operator's configured restriction goes missing in the PERMISSIVE
+	// direction with a clean commit. Commit / commit-check stay strict so a new
+	// operator edit (or a `load override` of a hand-migrated vSRX config) is
+	// rejected with the rewrite spelled out; an already-persisted or
+	// peer-synced config an older binary accepted must still BOOT (warn) per
+	// the #1960 fail-closed-on-load doctrine — leniently loaded the stanza is
+	// exactly as inert as it already was, now flagged. Same doctrine as
+	// lenientChassisRGStatementArity.
+	lenientLoginPackedStatements bool
+
+	// lenientLoginClassShadowsBuiltin (#6701) downgrades the `system login
+	// class <name>` built-in-shadowing gate
+	// (validateLoginClassShadowsBuiltinAST) from a hard compile error to a
+	// cfg.Warnings entry on the tolerant load / peer-sync paths. A custom class
+	// named after a system-defined one is INERT at runtime (resolveClassPerms
+	// resolves the built-in first), so a narrowed `class super-user { permissions
+	// view; }` grants full super-user while the commit advisory reports the
+	// narrowing took effect. Commit / commit-check stay strict so a new operator
+	// edit is rejected; an already-persisted or peer-synced config an older
+	// binary accepted must still BOOT (warn) per the #1960 fail-closed-on-load
+	// doctrine — leniently loaded the definition is exactly as inert as it
+	// already was, now flagged, and built-in-first precedence keeps the runtime
+	// class from being ESCALATED by the shadow. Same doctrine as
+	// lenientLoginPackedStatements.
+	lenientLoginClassShadowsBuiltin bool
+
 	// lenientIPsecProposalProtocol (#4298, V-2) downgrades the IPsec
 	// proposal `protocol ah` reject (validateIPsecProposalProtocolStrict)
 	// from a hard error to a warning on the tolerant load / peer-sync paths.
@@ -1121,6 +1154,34 @@ type compileOpts struct {
 	// non-WG row (fail-closed with a loud eprintln), so a leniently-loaded
 	// bad tunnel is inert. Same doctrine as lenientWireguardPeers.
 	lenientTunnelOuterFamily bool
+
+	// lenientIpipTunnelMode (#4785 half 1) downgrades the IPIP-unimplemented
+	// gate (validateIpipTunnelUnimplementedStrict) from a hard compile error to
+	// a cfg.Warnings entry. IPIP has no userspace decap stage and no egress
+	// encap arm — the endpoint is never entered into gre_decap_index and the
+	// egress dispatcher's TunnelKind::Unknown arm drops — so a `mode ipip`
+	// tunnel is created and passes NO traffic in either direction. The strict
+	// commit / commit-check path hard-rejects so an unimplemented feature fails
+	// loudly instead of succeeding into a blackhole; the tolerant load /
+	// peer-sync paths warn so a config an OLDER binary accepted (it was only an
+	// advisory before this gate) still BOOTS (#1960) — the runtime's own
+	// fail-closed arms keep the tunnel inert either way. Same doctrine as
+	// lenientTunnelOuterFamily.
+	//
+	// #6861 F3 — "load / peer-sync" is NOT the whole set of readers, and the
+	// omission is a trap for whoever tightens this next. The peer-effective
+	// commit gate (ValidatePeerEffectiveStrict, compiler_peer_effective.go)
+	// also compiles LENIENTLY, from a STRICT commit path, on purpose: it must
+	// MODEL the standby's tolerant SyncApply ingest before applying its own
+	// strict subjects to the resulting *Config. That makes this leniency
+	// load-bearing in the opposite direction from how the paragraph above
+	// reads. Set it false and CompileConfigForNodeLenient starts returning an
+	// error for exactly the configs the peer gate exists to catch;
+	// ValidatePeerEffectiveStrict's `err != nil -> return nil` arm swallows it,
+	// and the gate silently stops rejecting peer-only dead tunnels. Any
+	// tightening here must be reviewed against that call site, not only
+	// against Store.Load and Store.SyncApply.
+	lenientIpipTunnelMode bool
 	// lenientPolicyZoneRefs (#2401) downgrades the security-policy
 	// zone-pair reference gate (validatePolicyZoneReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1251,6 +1312,42 @@ type compileOpts struct {
 	// legitimate dynamic-interface reference (the #4191 over-rejection class).
 	// Same doctrine as lenientZoneInterfaceMembership.
 	lenientZoneInterfaceDefined bool
+	// lenientZoneInterfacesNonEmpty (#6525) downgrades the zone-interfaces
+	// NON-EMPTY gate (validateZoneInterfacesNonEmptyStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `security zones security-zone <z> interfaces` stanza that
+	// carries content yet contributes ZERO members — the shape the hierarchical
+	// compact-leaf spelling `interfaces ge-0/0/1.0;` used to produce, where the
+	// member name sat on the stanza's own Keys tail that compileZones never
+	// read. Such a zone binds no interface: the dataplane leaves the interface
+	// with Zone == "" (UserspaceBoundLinuxInterfaces skips it, so it is never
+	// AF_XDP-bound) and every policy naming the zone applies to nothing, while
+	// the two gates above pass VACUOUSLY over the empty member set. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick) —
+	// on that path behavior is unchanged (the stanza contributed no members
+	// before this gate existed and still contributes none), just with an
+	// operator-visible warning. Same doctrine as lenientZoneInterfaceDefined.
+	lenientZoneInterfacesNonEmpty bool
+	// lenientZoneInterfacePackedTail (#6735) downgrades the zone-interfaces
+	// PACKED-TAIL gate (validateZoneInterfacePackedTailStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a `security zones security-zone <z> interfaces` stanza
+	// in which `host-inbound-traffic` appears on a member's Keys with further
+	// tokens AFTER it. The lexer strips brackets (#2419), so the bracket member
+	// list `[ a host-inbound-traffic b ]` and the packed body
+	// `a host-inbound-traffic system-services ssh` are structurally identical by
+	// the time the compiler sees them, and their readings disagree about zone
+	// membership: the truncator keeps only the names BEFORE the keyword, so the
+	// first loses member `b` (left with Zone == "", never dataplane-bound, no
+	// policy naming the zone applies to it) and the second loses the whole
+	// override. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// BOOTS (#1960 no-brick) — on that path behavior is unchanged (the trailing
+	// tokens were dropped before this gate existed and still are), just with an
+	// operator-visible warning naming what was lost. Same doctrine as
+	// lenientZoneInterfacesNonEmpty.
+	lenientZoneInterfacePackedTail bool
 	// lenientHostInboundTokens (#3200) downgrades the host-inbound-traffic
 	// token gate (validateHostInboundTokensStrict) from a hard compile error
 	// to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1637,6 +1734,24 @@ type compileOpts struct {
 	// peer-synced config that predates this gate still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientRethVRRPGroupID.
 	lenientIfNameCollision bool
+	// lenientRethMember (#6722) downgrades the redundant-ethernet membership
+	// coherence gate (validateRethMemberStrict) from a hard compile error to a
+	// cfg.Warnings entry. A reth member is an L2 port whose L3 identity — units,
+	// addresses, tunnel, zone — lives on the reth; the egress-zone answer
+	// (stampEgressZones, pkg/dataplane/userspace/interfaces.go) treats a reth and
+	// its member as ONE device on exactly that basis. A member that names itself,
+	// names an unconfigured parent, carries its own logical units, or carries its
+	// own tunnel breaks the premise, and the last two fail OPEN (an
+	// independently addressed member unit, or an independently routed tunnel
+	// endpoint, silently inherits the reth's zone). The strict commit /
+	// commit-check path hard-rejects so the incoherence is operator-visible; the
+	// tolerant load / peer-sync paths warn so an already-persisted or peer-synced
+	// config that predates this gate still BOOTS (#1960 no-brick). Bounded on the
+	// lenient path by the SAME rule the gate states: a member that is not a bare
+	// port is not a member, so the shared device has two independent claimants
+	// and its ifindex identifies no zone (fail-closed).
+	// Same doctrine as lenientIfNameCollision.
+	lenientRethMember bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1925,19 +2040,32 @@ type compileOpts struct {
 	// (validateNATTerminalActionCardinalityStrict) from a hard compile error to
 	// a cfg.Warnings entry. A NAT rule whose complete `then {}` block carries
 	// ZERO terminal actions (actionless — the snapshot builder installs no
-	// translation, so an intended `off` exemption silently disappears and a
-	// later broader rule is revealed) or TWO+ mutually-exclusive actions inside
-	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
-	// picks one by packed-key / child order, so an exemption can publish as a
-	// translation) was previously accepted. The strict commit / commit-check
+	// translation and the rule does not stop evaluation, so an intended `off`
+	// exemption silently disappears and the traffic falls through: translated by
+	// a later broader rule if one matches, otherwise left untranslated) or TWO+
+	// mutually-exclusive actions inside
+	// one block (`off` + `pool`, `interface` + `pool` — before #5628 the compiler
+	// picked one by packed-key / child order; it now records every field and the
+	// DATAPLANE resolves the rule by a fixed precedence, so all but one authored
+	// action is silently discarded) was previously accepted. The strict commit /
+	// commit-check
 	// path hard-rejects so the malformed rule is operator-visible; the tolerant
 	// load / peer-sync paths downgrade to a warning so an already-persisted or
 	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
-	// closed-on-load class) — a leniently-loaded actionless rule is inert, and a
-	// contradictory one now records BOTH fields (the else-if→if setter change),
-	// so the Rust dataplane's off-precedence governs its resolution (off wins →
-	// exempt), unifying the hierarchical path with the pre-existing flat-set
-	// both-fields behavior rather than the old Go single-field child-order pick.
+	// closed-on-load class) — a leniently-loaded actionless rule is NOT inert
+	// (see the ZERO-actions wording above), though HOW it fails to be inert
+	// differs by kind: source NAT EMITS the rule and the Rust matcher's `else`
+	// arm continues past it, destination NAT SKIPS it in the builder. Either way
+	// the traffic falls through rather than being exempted. A contradictory rule
+	// records EVERY authored field (the else-if→if setter change) — two of them,
+	// or three for `interface` + `off` + `pool` — unifying the hierarchical path
+	// with the pre-existing flat-set behavior rather than the old Go
+	// single-field child-order pick. Resolution is then by a FIXED precedence,
+	// which is off-precedence only when the contradiction CONTAINS `off`:
+	// `interface` + `pool` carries none, and interface mode wins there while the
+	// authored pool is discarded (#6820 round 3 — the earlier "off-precedence
+	// governs" wording was quantified over all contradictions and is false for
+	// that pair).
 	// Only a malformed rule reaches this — the strict commit path rejects it.
 	// Duplicate `then` CONTAINERS remain #3850 last-wins (the gate counts the
 	// winning block only). Same doctrine as lenientNATMixedScope.
@@ -2041,6 +2169,21 @@ type compileOpts struct {
 	// (#5829); this closes the residual #5829 deferred to #5933.
 	lenientInterfaceUnitRef bool
 
+	// lenientLoginClassDeny (#5831) downgrades the custom-login-class
+	// restrictive-regex gate (deny-commands / deny-configuration, which xpf's
+	// coarse RBAC does not enforce) from a hard compile error to a
+	// cfg.Warnings entry PLUS a restrictive fold of the affected class's mapped
+	// permissions. Set ONLY on the tolerant load / peer-sync paths so a config
+	// persisted before this gate existed — or synced from a peer running older
+	// code — still BOOTS (#1960 no-brick). Unlike most lenient flags this one
+	// is not warn-and-continue-unchanged: leaving the permission set intact
+	// would preserve exactly the fail-open the strict gate rejects, so the
+	// tolerant path resolves the un-enforceable restriction in the RESTRICTIVE
+	// direction instead — bounded by a repair floor, because a class the
+	// console operator is bound to must keep the access that deletes the
+	// statement. See foldLoginClassDenyToRepairableFloor.
+	lenientLoginClassDeny bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2087,6 +2230,8 @@ func lenientCompileOpts() compileOpts {
 		lenientChassisClusterIdentities:        true,
 		lenientChassisMonitorWeight:            true,
 		lenientChassisRGStatementArity:         true,
+		lenientLoginPackedStatements:           true,
+		lenientLoginClassShadowsBuiltin:        true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
@@ -2138,6 +2283,7 @@ func lenientCompileOpts() compileOpts {
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientTunnelOuterFamily:               true,
+		lenientIpipTunnelMode:                  true,
 		lenientPolicyZoneRefs:                  true,
 		lenientZoneCount:                       true,
 		lenientWebManagementAuth:               true,
@@ -2147,6 +2293,8 @@ func lenientCompileOpts() compileOpts {
 		lenientAddressBookNameCollision:        true,
 		lenientZoneInterfaceMembership:         true,
 		lenientZoneInterfaceDefined:            true,
+		lenientZoneInterfacesNonEmpty:          true,
+		lenientZoneInterfacePackedTail:         true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,
 		lenientClusterAuthKey:                  true,
@@ -2172,6 +2320,7 @@ func lenientCompileOpts() compileOpts {
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
+		lenientRethMember:                      true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -2194,5 +2343,6 @@ func lenientCompileOpts() compileOpts {
 		lenientCoSNumericCodePoint:             true,
 		lenientNonNumericUnit:                  true,
 		lenientInterfaceUnitRef:                true,
+		lenientLoginClassDeny:                  true,
 	}
 }

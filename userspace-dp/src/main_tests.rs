@@ -941,6 +941,7 @@ fn queue_planner_includes_fabric_parent_interface() {
             },
         ],
         fabrics: vec![FabricSnapshot {
+            parent_unbindable: false,
             name: "fab0".to_string(),
             parent_interface: "ge-0/0/0".to_string(),
             parent_linux_name: "ge-0-0-0".to_string(),
@@ -980,6 +981,7 @@ fn queue_planner_deduplicates_fabric_parent_already_in_interfaces() {
             ..Default::default()
         }],
         fabrics: vec![FabricSnapshot {
+            parent_unbindable: false,
             name: "fab0".to_string(),
             parent_interface: "ge-0/0/0".to_string(),
             parent_linux_name: "ge-0-0-0".to_string(),
@@ -2384,6 +2386,1786 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
     require_static_send::<BindingCountersSnapshot>();
 }
 
+// ---------------------------------------------------------------------------
+// #5619: an IPsec secure tunnel (st<N>) gets no AF_XDP binding.
+// ---------------------------------------------------------------------------
+//
+// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers the
+// plaintext on the xfrmi netdev, and the dataplane has no path to hand a
+// plaintext frame back INTO an xfrmi for the egress direction.
+//
+// THE REASON THAT IS PROVABLE HERE (#6691 round 8) is neither of those: an
+// xfrm interface has exactly ONE RX queue (`numrxqueues 1`; a lone `rx-0`
+// under `/sys/class/net/<if>/queues`), and the planner's queue count is the
+// GLOBAL MINIMUM across candidates. Admitting one therefore takes EVERY
+// physical interface on the box down to one queue and one worker — the #3091
+// single-worker regression. `secure_tunnel_would_collapse_the_global_queue_count`
+// asserts exactly that, and it is the guard to keep if the others are ever
+// rewritten.
+//
+// Earlier rounds of this comment asserted instead that "an XSK cannot come up
+// on a virtual netdev, so the shim would DROP the plaintext". Zero-copy indeed
+// cannot (no `ndo_bpf`/`ndo_xsk_wakeup`) — but zero-copy is not required for
+// every socket role (`XskSocketRole::Private` → `requires_zerocopy() == false`,
+// generic-XDP interfaces are offered `COPY_ONLY_BIND_FLAGS`, and a failed
+// shared-UMEM group falls back to a private socket). A copy-mode binding is
+// REACHABLE in this code, so that claim was never established; settling it
+// needs a live NIC. It is not asserted anywhere below.
+//
+// Before #5619 the xfrmi was kept out of the binding plan by ACCIDENT: the Go
+// snapshot resolved `st0.0` to the nonexistent netdev `st0`, so the unit
+// carried ifindex 0. #5619 fixed that name — which means this exclusion now has
+// to be stated deliberately.
+
+/// The real planner must produce NO binding for a secure tunnel, while still
+/// planning the ordinary data interface beside it.
+///
+/// There is no Rust classification table paired with the Go one any more, and
+/// the paragraph that described one has been removed: #6691 round 5 deleted
+/// `is_secure_tunnel_ifname` and made this plane read the snapshot's
+/// `secure_tunnel` flag, so the name shape is never re-derived here. This test
+/// sets that flag directly, which is exactly what the Go control plane ships.
+#[test]
+fn binding_candidate_excludes_secure_tunnel() {
+    use crate::server::helpers::replan_queues;
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/1".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 11,
+                rx_queues: 2,
+                ..Default::default()
+            },
+            // The xfrmi as it appears AFTER the #5619 name fix: a real netdev
+            // name and a resolved ifindex. Pre-fix this row carried linux_name
+            // "st0" and ifindex 0, so it was excluded for the wrong reason —
+            // this row must be excluded on its own merits.
+            InterfaceSnapshot {
+                name: "st0.0".to_string(),
+                // #6691 r5: ownership is resolved by the Go control plane and
+                // shipped in the snapshot; no Rust-side name rule exists now.
+                secure_tunnel: true,
+                linux_name: "st0.0".to_string(),
+                zone: "vpn".to_string(),
+                ifindex: 42,
+                rx_queues: 1,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    assert!(
+        !bindings.is_empty(),
+        "premise broken: the ordinary data interface must still be planned, \
+         otherwise this test would pass vacuously"
+    );
+    assert!(
+        bindings.iter().all(|b| b.interface != "st0.0"),
+        "the planner produced an AF_XDP binding for a secure tunnel (#5619). \
+         An xfrmi has ONE RX queue and the planner's queue count is the global \
+         minimum, so admitting it collapses every physical interface to a \
+         single queue and a single worker (#3091). Planned: {:?}",
+        bindings.iter().map(|b| &b.interface).collect::<Vec<_>>()
+    );
+    assert!(
+        bindings.iter().any(|b| b.interface == "ge-0-0-1"),
+        "the ordinary data interface must still be planned"
+    );
+}
+
+/// #5619: adding a secure tunnel must leave the binding PLAN byte-identical.
+///
+/// The Go half of this differential lives in
+/// `TestSecureTunnelAddsNothingToTheAdjudicatedSets`
+/// (pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go), which pins the
+/// ingress-adjudication set and the RSS allowlist. This is the binding-plan
+/// half: the same candidate list is planned twice, once with a RESOLVED
+/// secure-tunnel row and once without it, and the produced layout must be
+/// identical — same slots, same queue ids, same interfaces.
+///
+/// The premise matters as much as the result. The tunnel row carries a real
+/// netdev name and a real ifindex, i.e. it is the row as it appears AFTER the
+/// #5619 name fix. Were it the pre-fix row (linux_name "st0", ifindex 0) the
+/// two plans would match for the old accidental reason and this would prove
+/// nothing.
+#[test]
+fn secure_tunnel_adds_nothing_to_the_binding_plan() {
+    use crate::server::helpers::replan_queues;
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 11,
+        rx_queues: 2,
+        ..Default::default()
+    };
+    let tunnel = InterfaceSnapshot {
+        name: "st0.0".to_string(),
+        // #6691 r5: ownership is resolved by the Go control plane and
+        // shipped in the snapshot; no Rust-side name rule exists now.
+        secure_tunnel: true,
+        linux_name: "st0.0".to_string(),
+        zone: "vpn".to_string(),
+        ifindex: 42,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    // PREMISE: this is the POST-fix row — resolved name, real ifindex.
+    assert_eq!(tunnel.linux_name, "st0.0");
+    assert!(tunnel.ifindex > 0);
+
+    let with_tunnel = ConfigSnapshot {
+        interfaces: vec![lan.clone(), tunnel],
+        ..Default::default()
+    };
+    let without_tunnel = ConfigSnapshot {
+        interfaces: vec![lan],
+        ..Default::default()
+    };
+
+    let got = replan_queues(Some(&with_tunnel), 2, &[]);
+    let want = replan_queues(Some(&without_tunnel), 2, &[]);
+
+    assert!(
+        !want.is_empty(),
+        "premise broken: the ordinary data interface must still be planned, \
+         otherwise this differential is vacuous"
+    );
+    let key = |bindings: &[BindingStatus]| -> Vec<(u32, u32, String)> {
+        bindings
+            .iter()
+            .map(|b| (b.slot, b.queue_id, b.interface.clone()))
+            .collect()
+    };
+    assert_eq!(
+        key(&got),
+        key(&want),
+        "adding a route-based IPsec secure tunnel CHANGED the binding plan. The \
+         xfrmi must add nothing: its single RX queue would become the global \
+         minimum and re-plan every other interface onto one queue (#5619 / \
+         #3091). See secure_tunnel_would_collapse_the_global_queue_count for \
+         the queue count itself, which is the property this identity check is \
+         standing in for."
+    );
+}
+
+/// #6691 round 8: the exclusion's LOAD-BEARING reason, asserted directly.
+///
+/// The two guards above assert plan IDENTITY. Identity changes for several
+/// reasons at once, so a reader learns from them that the tunnel must add
+/// nothing, but not WHY admitting it is harmful. The why is a number:
+///
+/// `replan_bindings_from_candidates` computes
+/// `queue_count = candidates.iter().map(|(_, rx)| *rx).min()` — the GLOBAL
+/// MINIMUM — and an xfrm interface has exactly ONE RX queue. Measured on a
+/// real device in a network namespace: `ip -d link show xfrm0` reports
+/// `numrxqueues 1`, and `/sys/class/net/xfrm0/queues/` contains exactly
+/// `rx-0` + `tx-0`. That single `rx-*` entry is what BOTH planes count —
+/// `rx_queue_count` here and `userspaceRXQueueCount` in
+/// pkg/dataplane/userspace/interfaces.go.
+///
+/// So admitting one zoned xfrmi does not cost the tunnel a binding; it costs
+/// the WHOLE BOX its queues. This is the #3091 single-worker regression
+/// (~6 Gbps) arriving through a door #3091 did not name, and unlike the
+/// XSK-cannot-bind story it needs no NIC to demonstrate.
+///
+/// FAIL-ON-REVERT: delete `if iface.secure_tunnel { return false; }` from
+/// `include_userspace_binding_interface` and the LAN interface's planned queue
+/// count drops from 4 to 1.
+#[test]
+fn secure_tunnel_would_collapse_the_global_queue_count() {
+    use crate::server::helpers::replan_queues;
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 11,
+        rx_queues: 4,
+        ..Default::default()
+    };
+    let tunnel = InterfaceSnapshot {
+        name: "st0.0".to_string(),
+        secure_tunnel: true,
+        linux_name: "st0.0".to_string(),
+        zone: "vpn".to_string(),
+        ifindex: 42,
+        // The measured xfrmi property. If this ever stops being 1 the premise
+        // is gone and so is the reason for the exclusion.
+        rx_queues: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.rx_queues, 1,
+        "premise: an xfrm interface has exactly one RX queue"
+    );
+    assert!(
+        lan.rx_queues > tunnel.rx_queues,
+        "premise: the LAN must have MORE queues than the tunnel, or the \
+         minimum cannot move and this test is vacuous"
+    );
+
+    let bindings = replan_queues(
+        Some(&ConfigSnapshot {
+            interfaces: vec![lan.clone(), tunnel],
+            ..Default::default()
+        }),
+        4,
+        &[],
+    );
+
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-1")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN interface was planned onto {} queue(s), not its own {}. A \
+         secure tunnel entered the candidate list, and its single RX queue \
+         became the global minimum — every physical interface on the box is \
+         now one queue and one worker (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #5173: the shim must not transform a packet's queue coordinate.
+// ---------------------------------------------------------------------------
+//
+// AF_XDP delivery is queue-bound: the kernel's `xsk_rcv_check` drops a redirect
+// whose target socket is bound to a different (netdev, queue) than the packet
+// arrived on. So between "which queue did this arrive on" and "which XSK do we
+// redirect to" the queue coordinate must survive unchanged.
+//
+// SCOPE, stated plainly, because the three checks below are NOT the same kind
+// of check and that difference decides what they can catch.
+//
+// The shim is `no_std`, built for `bpfel-unknown-none`, so this crate cannot
+// execute the shim BINARY. What it can do — and now does — is compile the
+// shim's own index module for the host and RUN it: `binding_index.rs` is
+// `#[path]`-included below, so `shim_binding_slot_never_leaves_its_interfaces_row`
+// is a behavioural test of the exact source the BPF object is built from. The
+// mapping and the stride bound are results there, not claims about text.
+//
+// What execution cannot cover is whether the shim still CALLS that function,
+// and with what arguments. That half is unavoidably a source assertion, and a
+// source assertion only sees what it is written to look for. Two hostile rounds
+// escaped earlier versions of it with every guard green:
+//
+//   round 1 — transform the raw `rx_queue_index` before the identity call, and
+//             add a raw fallback lookup in a DIFFERENT file, which a
+//             file-scoped check cannot see by construction.
+//   round 2 — the repo-scoped rewrite that fixed round 1 replaced a token-exact
+//             index pin with a bare occurrence COUNT of the needle
+//             `USERSPACE_BINDINGS.get(` — and a count cannot see an index that
+//             has been transformed. Six mutations reintroduced #5173 green,
+//             including `.get(idx % 4)`, dropping `binding_slot` from the path
+//             entirely, and reinstating the removed unbounded raw-queue
+//             fallback with a single NEWLINE before `.get(` — which is exactly
+//             the formatting rustfmt emits for a chain of that length.
+//
+// Coverage had REGRESSED while the claim strengthened. So the source half is
+// now TOKEN-based rather than substring-based, and it pins whole STATEMENTS
+// rather than counting needles: `shim_token_vec` drops whitespace, so rustfmt
+// reflow is invisible to it while any added, removed or altered token is not.
+// What is STILL unbound is enumerated on
+// `shim_index_path_has_one_construction_and_one_lookup` — that list is not
+// empty and cannot be made empty by a source assertion.
+//
+// The planner half of #5173 was reverted from this PR (see #6702), so the
+// executable coverage that used to be cited here no longer exists in this
+// branch; `queue_planner_uses_smallest_queue_count` — master's own test,
+// restored by that revert — is what exercises the real planner now, and it is
+// the negative control for the mutation matrix precisely because it is true in
+// both worlds.
+
+/// Collapse a Rust snippet to a formatting-insensitive token VECTOR.
+///
+/// Identifiers (and numbers) are single tokens; every other non-whitespace
+/// character is its own token. Whitespace is dropped entirely.
+///
+/// This is the whole reason the checks below survive rustfmt AND catch what a
+/// substring count cannot. A newline is not a token here, so
+/// `USERSPACE_BINDINGS\n.get(` and `USERSPACE_BINDINGS.get(` are the SAME
+/// sequence — while as substrings they differ, and that one-character
+/// difference was the entire bypass for the reinstated raw-queue fallback in
+/// the round-2 review. Conversely `.get(idx)` and `.get(idx % 4)` are the same
+/// SUBSTRING prefix but different token sequences, which is the direction a
+/// bare needle count is blind in.
+fn shim_token_vec(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            let mut w = String::from(c);
+            while let Some(&n) = chars.peek() {
+                if n.is_alphanumeric() || n == '_' {
+                    w.push(n);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(w);
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// Space-joined [`shim_token_vec`], for readable assertion messages.
+fn shim_tokens(src: &str) -> String {
+    shim_token_vec(src).join(" ")
+}
+
+/// Count occurrences of a token SEQUENCE inside a token stream.
+///
+/// Windows overlap, so a repeat that abuts its predecessor is still counted —
+/// undercounting here would be a fail-OPEN, and the whole point of these checks
+/// is that a second occurrence must be impossible to hide.
+fn shim_token_seq_count(hay: &[String], needle: &[&str]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    hay.windows(needle.len())
+        .filter(|w| w.iter().zip(needle).all(|(a, b)| a.as_str() == *b))
+        .count()
+}
+
+// #5173: the index computation is EXECUTED here, not described.
+//
+// `binding_index.rs` is the shim's own source, `#[path]`-included and compiled
+// for the host. What runs below is the code the BPF object is built from.
+#[path = "../../userspace-xdp/src/binding_index.rs"]
+mod shim_binding_index;
+
+/// The value ladder both coordinate axes are driven over: `2^k`, `2^k - 1` and
+/// `2^k + 1` for every representable `k`, plus `0` and `ceiling`.
+///
+/// NOT a hand-picked spread, and the difference IS the round-6 defect. The
+/// executed grid this replaces was `ifindex ∈ {0,1,2,7,63,1000,65535}` ×
+/// `queue ∈ [0,64)`, and on it `& 0xffff` is the identity on every ifindex
+/// while `& 0x3f` is the identity on every queue. Both masks were added to the
+/// shim's own function bodies, compiled, and left all three tests below GREEN
+/// with a masking instruction in the emitted object. The grid's largest tested
+/// value on each axis WAS the boundary of the mask that walked through it — the
+/// check was precisely coextensive with the defect it existed to catch.
+///
+/// A ladder removes that tell, and the caller asserts the property that makes
+/// it work: the bitwise OR of the returned values is all-ones across the
+/// representable range, so ANY mask that clears a bit alters at least one
+/// tested result. That is a property rather than a bigger grid, which matters —
+/// simply widening the old spread would have moved the boundary to the new
+/// maximum and bought one round. It is still not the primary bound: an executed
+/// axis always has a largest value, so the function BODIES are pinned
+/// token-for-token as well, in
+/// `shim_index_path_has_one_construction_and_one_lookup`.
+fn shim_coordinate_ladder(ceiling: u32) -> Vec<u32> {
+    let mut out = vec![0u32, ceiling];
+    for k in 0..u32::BITS {
+        let p = 1u32 << k;
+        out.extend([p - 1, p]);
+        if let Some(next) = p.checked_add(1) {
+            out.push(next);
+        }
+    }
+    out.retain(|v| *v <= ceiling);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Every `(ifindex, queue)` resolves to its OWN interface's row, or to nothing.
+///
+/// This replaces four source-spelling checks that a hostile review escaped
+/// twice. The mapping, the stride bound, and the property that a slot never
+/// leaves its interface's row are now results of running the shim's function.
+///
+/// Driven over [`shim_coordinate_ladder`] on both axes rather than over the
+/// hand-picked spread it used to carry — see there for the two masks that
+/// walked through that spread with this test green.
+#[test]
+fn shim_binding_slot_never_leaves_its_interfaces_row() {
+    use shim_binding_index::{BINDING_QUEUES_PER_IFACE as STRIDE, RawRxQueue, binding_slot};
+
+    // The ifindex axis has a real ceiling; the queue axis does not.
+    // `binding_slot` multiplies the ifindex by the stride, so
+    // `ifindex * STRIDE + (STRIDE - 1)` must stay inside `u32` — and
+    // `(2^28 - 1) * 16 + 15` is exactly `u32::MAX`, so this is the largest
+    // ifindex the host can evaluate at all. Above it host and target genuinely
+    // disagree (a debug host build panics on the overflow, the release target
+    // wraps), which is why the axis stops here and why `binding_index.rs` names
+    // that range — and only that range — as uncovered. The queue coordinate is
+    // rejected before the multiply, so its axis runs to `u32::MAX`.
+    const IFINDEX_CEILING: u32 = (1 << 28) - 1;
+    let ifindexes = shim_coordinate_ladder(IFINDEX_CEILING);
+    let queues = shim_coordinate_ladder(u32::MAX);
+
+    // Each axis is floored on ITS OWN dimension. A combined count would let one
+    // axis collapse to nothing while the other satisfied the threshold alone,
+    // and the round-6 escape lived in exactly one axis at a time.
+    let check_axis = |label: &str, values: &[u32], ceiling: u32, probes: [u32; 3], floor: usize| {
+        assert!(
+            values.len() >= floor,
+            "#5173: the {label} axis must carry at least {floor} values, found {}",
+            values.len(),
+        );
+        for probe in probes {
+            assert!(
+                values.contains(&probe),
+                "#5173: the {label} axis must test {probe}. The spread this replaced stopped just \
+                 below exactly these points, which is what made `& 0xffff` (ifindex) and `& 0x3f` \
+                 (queue) the identity on every value it tested.",
+            );
+        }
+        assert_eq!(
+            values.iter().fold(0u32, |acc, v| acc | v),
+            ceiling,
+            "#5173: the {label} axis must set every bit a representable value can carry, or a \
+             mask clearing one of them is the identity on the whole axis and this test cannot \
+             see it",
+        );
+    };
+    check_axis(
+        "ifindex",
+        &ifindexes,
+        IFINDEX_CEILING,
+        [65536, 65537, IFINDEX_CEILING],
+        80,
+    );
+    check_axis("queue", &queues, u32::MAX, [64, 65, u32::MAX], 90);
+    assert!(
+        queues.iter().any(|q| *q < STRIDE) && queues.iter().any(|q| *q >= STRIDE),
+        "#5173: the queue axis must straddle the stride boundary, or one half of the mapping is \
+         never exercised",
+    );
+
+    for &ifindex in &ifindexes {
+        // u64 throughout: the top of the ifindex axis puts `row_start + STRIDE`
+        // one past `u32::MAX`, and the expected value must be computed in a
+        // width that cannot itself wrap.
+        let row_start = u64::from(ifindex) * u64::from(STRIDE);
+        for &q in &queues {
+            let got = binding_slot(ifindex, RawRxQueue::from_ctx_field(q));
+            if q >= STRIDE {
+                assert_eq!(
+                    got,
+                    None,
+                    "#5173: queue {q} is at or above the stride and must resolve to NO binding; \
+                     clamping it back into range is the mis-steer in another form, and indexing \
+                     with it addresses ifindex {}'s row",
+                    u64::from(ifindex) + u64::from(q) / u64::from(STRIDE),
+                );
+                continue;
+            }
+            let slot = got.unwrap_or_else(|| panic!("in-stride queue {q} resolved to no binding"));
+            assert_eq!(
+                u64::from(slot),
+                row_start + u64::from(q),
+                "#5173: the slot must be the packet's OWN queue in its OWN interface's row",
+            );
+            assert!(
+                u64::from(slot) >= row_start && u64::from(slot) < row_start + u64::from(STRIDE),
+                "#5173: slot {slot} escaped ifindex {ifindex}'s row [{row_start}, {})",
+                row_start + u64::from(STRIDE),
+            );
+        }
+    }
+}
+
+/// The queue coordinate cannot be transformed after it is wrapped.
+///
+/// `RawRxQueue` has a private field and no arithmetic impls, so `queue % 2`,
+/// `queue & 3` and friends do not COMPILE outside its module — enforced by the
+/// compiler rather than asserted about source text. Verified by compiling both
+/// directions: `rx_queue % 4` is rejected (E0369) and the tuple constructor is
+/// unreachable outside the module (E0423), while reducing the raw `u32` BEFORE
+/// construction builds clean — the constructor must accept a bare integer,
+/// because the value originates in an aya context no `core`-only module can
+/// see.
+///
+/// TWO things this does NOT cover, stated because an earlier revision claimed
+/// there was only one:
+///
+///  - a reduction applied before the wrap;
+///  - a value forged out of raw bytes rather than constructed —
+///    `transmute::<u32, RawRxQueue>(..)`, `mem::zeroed()`,
+///    `MaybeUninit::assume_init()`, a pointer read. A private field stops the
+///    CONSTRUCTOR, not a fabrication, and naming `transmute` alone (as an
+///    earlier revision did) understates it: the class is open-ended and every
+///    member of it compiles.
+///
+/// Both are bounded by source instead, in
+/// `shim_index_path_has_one_construction_and_one_lookup` — not by chasing the
+/// symbols, which would always be one symbol behind, but by bounding the one
+/// NAME the pinned lookup statement will accept. Neither is bounded by a type,
+/// and no type can bound them.
+///
+/// This test itself is not decorative: `for_trace()` feeds the queue index the
+/// shim hands to the helper in `record_trace`, so corrupting it is a runtime
+/// defect and reds here — for any corruption visible somewhere on
+/// [`shim_coordinate_ladder`], which is the whole `u32` range at `2^k ± 1`.
+/// The shipped version of that sentence said "reds here" with no qualifier
+/// while the test evaluated `for_trace()` at exactly ONE input, 3; `self.0 &
+/// 0x3f` returns 3 for input 3, so the claim was false for precisely the mask
+/// that was demonstrated walking through the index path in the same round. The
+/// body is also pinned token-for-token in
+/// `shim_index_path_has_one_construction_and_one_lookup`, which is what covers
+/// a corruption no executed value can see.
+#[test]
+fn shim_raw_rx_queue_exposes_no_arithmetic() {
+    use shim_binding_index::RawRxQueue;
+    let a = RawRxQueue::from_ctx_field(3);
+    let b = RawRxQueue::from_ctx_field(3);
+    assert_eq!(a, b, "the wrapper must preserve the coordinate verbatim");
+    for q in shim_coordinate_ladder(u32::MAX) {
+        assert_eq!(
+            RawRxQueue::from_ctx_field(q).for_trace(),
+            q,
+            "#5173: the telemetry readback must return the coordinate VERBATIM; a reduction here \
+             makes every trace record name a queue the redirect did not use, which is the \
+             mis-traced-drop hazard `binding_index.rs` documents",
+        );
+    }
+}
+
+/// REPO-scoped and TOKEN-exact: the whole shim crate wraps the coordinate in
+/// exactly one place and reads the binding map in exactly one place, and BOTH
+/// of those statements are pinned token-for-token.
+///
+/// Two rounds of hostile review shaped this, and both lessons are load-bearing:
+///
+///  1. **File-scoped is not enough.** A reviewer escaped the per-file version by
+///     putting a raw fallback lookup in a DIFFERENT file, which a per-file check
+///     cannot see by construction. Hence the crate walk.
+///  2. **A count is not enough.** The repo-scoped rewrite that fixed (1)
+///     replaced the token-exact index pin with a bare `str::matches` count of
+///     `USERSPACE_BINDINGS.get(`. A count cannot see an index that has been
+///     transformed, so `.get(idx % 4)` — #5173 verbatim — passed, as did
+///     dropping `binding_slot` from the packet path and inlining a reduced
+///     index, and as did reinstating the deleted unbounded raw-queue fallback
+///     with one NEWLINE before `.get(`. Coverage had regressed while the claim
+///     strengthened. Hence whole-STATEMENT token pins.
+///  3. **A statement pin fixes SPELLING, not VALUE.** Both coordinates reach
+///     the pinned lookup by NAME, so pinning that statement says nothing about
+///     what the names are worth. Round 3 shadowed each of them one line above
+///     the pin — `% 4` on the ifindex, and an unsafe raw-bytes forgery on the
+///     queue — and all three tests stayed green. Hence the binding bounds: a
+///     value can only reach the pinned statement through a binding of that
+///     exact name, so bounding the BINDINGS is what bounds the values. (The
+///     first attempt at that bounded one SPELLING of a binding rather than
+///     bindings — see (5).)
+///  4. **A compile-time claim is only true while the type still says so.**
+///     Adding `impl Rem<u32> for RawRxQueue` and a `pub` field reddened
+///     nothing, and with one shadow line reintroduced #5173 with no `unsafe`
+///     at all. Hence the trait-impl and field-privacy bounds.
+///  5. **A binding bound must bound BINDINGS, not one spelling of one.**
+///     `["let", name]` matches a bare-identifier `let` pattern and nothing
+///     else. Round 4 walked through it four ways, all compiling with all three
+///     tests green: `let (rx_queue, _z) = (transmute::<u32, RawRxQueue>(q % 4),
+///     0u32);` — which is #5173 in the EMITTED OBJECT, gaining `r1 &= 0x3`
+///     before the map lookup and losing the `> 0xf` stride guard —
+///     `let Some(<name>) = … else`, a `macro_rules!` body taking an
+///     `$n:ident`, and the closure/`fn` parameter that used to be carried
+///     below as the declared residual. Hence the mention TALLY, which is
+///     complete over binding forms WRITTEN IN THE WALKED SOURCE in a way no
+///     pattern match is: such a binding cannot exist without writing the name
+///     it binds.
+///  6. **"Written in the walked source" is load-bearing, and round 5 broke the
+///     claim that omitted it.** A PROC MACRO binds a name without writing it
+///     here: its expansion carries `Span::call_site()`, so it resolves — and
+///     shadows — at the invocation. `macro_rules!` is not this hole (a body
+///     identifier is def-site hygienic, and an `$n:ident` metavariable is
+///     written by the invocation, which IS in the walk); a proc macro is. A
+///     crate outside `userspace-xdp/src` emitting
+///     `let rx_queue = RawRxQueue::from_ctx_field(rx_queue.for_trace() % 4);`
+///     from a parsed string, invoked by the one line `xdp_evil::tune!();`,
+///     left every tally exactly where it was, all three tests green, and the
+///     emitted object carrying `r2 &= 0x3` after the `xdp_md.rx_queue_index`
+///     load the pristine object performs unmasked. Counting cannot see that by
+///     construction, so the ROUTE is bounded instead: the shim's Cargo manifest
+///     is pinned token-for-token, and both cargo configs read for this build
+///     refuse `--extern`, `[patch]` and `[replace]`. Acquiring a proc macro in
+///     tree therefore reds. Which is a bound on ACQUIRING one, not on the two
+///     already pinned, and not on a config outside the repository — see the
+///     residual below.
+///  7. **A tally is per FILE, or it is fungible.** A crate total lets a mention
+///     freed in one file pay for a shadow added to another; the tally is
+///     therefore pinned per file. For the queue coordinate that is what closes
+///     conservation, because every one of its `lib.rs` mentions is inside a
+///     pinned statement. For the interface coordinate it does not — also below.
+///  8. **Everything above bounds where a value COMES FROM and how it is
+///     PASSED. None of it bounded what the shim's own functions DO with it.**
+///     Round 6 needed one in-place arithmetic edit inside a function BODY —
+///     `RawRxQueue(rx_queue_index & 0x3f)` — and that is cheaper than all six
+///     escapes before it: no binding, no proc macro, no `--extern`, no
+///     `[patch]`, no manifest edit, no deletion, and nothing spent from the
+///     tally, since `rx_queue_index` is a different token to the counted
+///     `rx_queue`. Both bodies took a mask, compiled, and left every bound here
+///     green with the mask in the emitted object. The one value-level check
+///     that should have seen it was an enumerated grid whose LARGEST TESTED
+///     VALUE ON EACH AXIS WAS THE MASK'S BOUNDARY — `65535 & 0xffff == 65535`,
+///     and every `q < 64` satisfies `q & 0x3f == q` — so the check was exactly
+///     coextensive with the defect. Hence the three body pins here, and hence
+///     `shim_coordinate_ladder` replacing the grid with a property. The pins
+///     are the primary bound: widening an axis relocates a boundary, it does
+///     not remove one.
+///
+/// # What is still unbound — and it cannot be driven to zero here
+///
+/// These are source assertions about a call site whose coordinate originates in
+/// an aya `XdpContext`, which a `core`-only module cannot see. So a residual is
+/// structural, not an oversight. The list is SHORTER than it was, because the
+/// binding bounds subsume what used to be enumerated symbol by symbol — a
+/// forged `RawRxQueue` (`transmute`, `mem::zeroed`, `MaybeUninit::assume_init`,
+/// a pointer read: an open-ended class no symbol list could keep up with) can
+/// only be USED by binding the name the pinned lookup passes, and every form of
+/// binding raises that name's count. What remains:
+///
+///  - **A PROC-MACRO EXPANSION binds without writing the name here.** The
+///    tally walks source; a proc macro's tokens are in another crate and its
+///    `Span::call_site()` spans shadow a local at the invocation. Round 5 built
+///    one and it left every bound green with `& 0x3` in the emitted object.
+///    What ships against it is a bound on the ROUTE — the shim's Cargo manifest
+///    is pinned token-for-token and both cargo configs refuse `--extern`,
+///    `[patch]` and `[replace]` — so acquiring a proc macro IN TREE reds. Three
+///    things that does not reach, stated because a route bound is only worth its
+///    coverage: the two dependencies already pinned (`aya-ebpf-macros` is itself
+///    a proc-macro crate, since `#[xdp]` comes from it, and no test here reads
+///    upstream source); a cargo config outside the repository; and `RUSTFLAGS`
+///    in the environment. The last two are properties of the machine running
+///    the build rather than of reviewable source. So the honest statement is
+///    that a proc-macro expansion is bounded by in-tree acquisition cost, not by
+///    the tally, and an existing macro's behaviour is out of scope entirely.
+///    This is the one residual that is not conservation.
+///  - **CONSERVATION — the tally counts, and classifies only in part.** Every
+///    binding form written here has to write the name, so none of them is FREE;
+///    but an author who also DELETES an existing mention pays for one and leaves
+///    the tally where it was. The shipped version of this paragraph then claimed
+///    more than was true for BOTH names, so the inventory is now stated site by
+///    site.
+///
+///    The tally is PER FILE, which stops a mention freed in one file from paying
+///    for a shadow in another. For `rx_queue` the mention budget in `lib.rs` is
+///    fully spent: its three mentions are all inside pinned statements — the
+///    construction, the `for_trace()` readback and the lookup — and `lib.rs` is
+///    the only file a shadow of THAT NAME can sit in, because that is where the
+///    pinned definition and the pinned use are. In `binding_index.rs` the
+///    parameter is pinned by the signature and the two body uses are
+///    load-bearing for the build and the executed stride test, so the one free
+///    mention of that name in the whole crate is a single doc line there — and
+///    per-file pinning means it cannot be spent on `lib.rs`. (Before round 5
+///    this was NOT true and the paragraph claimed it anyway: `for_trace()`'s
+///    caller was unpinned, and renaming `binding_slot`'s parameter freed three
+///    more. Five of the seven were free, not one.)
+///
+///    **The shipped version of the paragraph above said "for `rx_queue` that
+///    closes it", and that was FALSE.** Spending the budget for the two COUNTED
+///    names closes nothing on its own, because a statement pin bounds how the
+///    construction is SPELLED and the tally bounds how often two names are
+///    WRITTEN — neither bounds what a THIRD name in that statement is BOUND TO.
+///    The demonstrated form, measured on this tree and reproduced by hand
+///    before this paragraph was written, attacks `ctx`. Five statement-scope
+///    lines above the pinned construction, shadow `ctx` with a doctored
+///    `xdp_md`, then restore it before `bpf_xdp_adjust_meta` needs the real
+///    one:
+///
+///    ```ignore
+///    let real_ctx = ctx;
+///    let q_masked = unsafe { (*ctx.ctx).rx_queue_index } & 0x3;
+///    let mut shadow_md: xdp_md = unsafe { core::mem::zeroed() };
+///    shadow_md.rx_queue_index = q_masked;
+///    let ctx = &XdpContext { ctx: &mut shadow_md };
+///    // …the PINNED construction statement, byte-identical, reads the
+///    //   doctored struct…
+///    let ctx = real_ctx;
+///    ```
+///
+///    Measured: builds for `bpfel-unknown-none`; the live kernel verifier
+///    PASSes; the emitted object gains `r &= 0x3` AND LOSES the `> 0xf` stride
+///    guard entirely (1 → 0 occurrences of `0xf goto`, which LLVM only removes
+///    once it can prove the value is under 16); every `shim_*` test stays
+///    GREEN. That is #5173 back in the shipped program with the whole merge
+///    path green. The counted names are untouched: `rx_queue` still appears
+///    three times in `lib.rs`, `ingress_ifindex` twenty-two, and the
+///    construction statement still matches its pin token-for-token.
+///
+///    Two bounds below now close the DEMONSTRATED forms of this — `ctx` joins
+///    the per-file tally, and `let ctx` is refused outright. They do not close
+///    the CLASS, and cannot: the class is semantic (what a name resolves to)
+///    and the instrument is syntactic (which names appear, and how often).
+///    Read that as a raised bar, not a proof.
+///
+///    For `ingress_ifindex` it does NOT close, and the previous claim that
+///    buying a shadow there "costs a visibly deleted telemetry call" was false:
+///    an ALIAS refunds mentions with nothing deleted at all. Two pins narrow
+///    that — every `record_trace` call's argument prefix, so an argument cannot
+///    be rerouted through an alias, and `record_trace`'s own signature, because
+///    renaming its interface parameter was itself worth two free mentions.
+///
+///    What is left, stated as inventory rather than as a defence — and stated
+///    COMPLETELY this time, because the shipped version of this paragraph named
+///    three of the six in the round that rewrote it specifically to be
+///    complete. `lib.rs` names `ingress_ifindex` 22 times. Sixteen are pinned:
+///    two by `INGRESS_STATEMENT` (the read writes the name twice), one by
+///    `LOOKUP_STATEMENT`, twelve by `TRACE_ARGUMENT_PREFIX` and one by
+///    `TRACE_SIGNATURE`. The other SIX are free:
+///
+///      - `:127` and `:246` — the two `#[repr(C)]` struct field DECLARATIONS.
+///        The wire contract with userspace-dp is by offset, so this test says
+///        nothing about those names.
+///      - `:437` — the ingress-interface gate, `USERSPACE_INGRESS_IFACES.get`.
+///      - `:696` — the `UserspaceDpMeta` initializer.
+///      - `:1124` — the `UserspaceTraceValue` initializer.
+///      - `:1140` — the trace-key mix. Dropping the coordinate from it compiles
+///        and degrades trace-key distribution rather than the index path.
+///
+///    Buying a shadow of the interface coordinate therefore still costs only
+///    edits that compile and red nothing, and this test does not prevent it.
+///    Driving it to zero would mean pinning most of a trace function that has
+///    nothing to do with the index path; the bound above is the bound that
+///    ships. (Line numbers drift; the count does not — it is pinned by
+///    `MENTIONS_PER_FILE`, so a seventh free mention is a RED whatever it is.)
+///  - **The ifindex half is a bare `u32`.** `binding_slot`'s queue argument is a
+///    newtype; its ifindex argument is not, and it cannot be one without a
+///    second wrapper whose constructor would take a bare `u32` for the same
+///    aya-shaped reason — moving the residual, not closing it. Its definition,
+///    its use, `binding_slot`'s signature, every trace call's argument prefix
+///    and its per-file tally are pinned below; none of that is the type system,
+///    and the paragraph above says where that leaves it.
+///  - **Anything the tokenizer sees as identical text.** Comments and string
+///    literals are tokenized like code. That direction is fail-CLOSED (a
+///    spurious RED, never a silent pass), which is the correct polarity, but it
+///    does mean a prose mention can trip the count bounds below.
+#[test]
+fn shim_index_path_has_one_construction_and_one_lookup() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let crate_dir = repo_root.join("userspace-xdp");
+    let root = crate_dir.join("src");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for e in std::fs::read_dir(dir).expect("read shim src dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                let body = std::fs::read_to_string(&p).expect("read shim source");
+                // RELATIVE to the walked root. The per-file mention tally at the
+                // bottom pins these names, and an absolute path — which depends
+                // on where the checkout lives — is not pinnable.
+                let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
+                out.push((rel, body));
+            }
+        }
+    }
+    walk(&root, &root, &mut sources);
+    // `read_dir` order is unspecified; the per-file tally is compared as an
+    // ordered list, so sort before anything reads this.
+    sources.sort();
+    assert!(
+        !sources.is_empty(),
+        "found no shim sources under {}",
+        root.display()
+    );
+
+    let tokens: Vec<(String, Vec<String>)> = sources
+        .iter()
+        .map(|(name, body)| (name.clone(), shim_token_vec(body)))
+        .collect();
+
+    // Files in which `needle` occurs, one entry per occurrence.
+    let seq = |needle: &[&str]| -> Vec<String> {
+        tokens
+            .iter()
+            .flat_map(|(name, toks)| {
+                std::iter::repeat(name.clone()).take(shim_token_seq_count(toks, needle))
+            })
+            .collect()
+    };
+
+    // ---- The walk IS the crate only while the crate IS the walk. ----------
+    //
+    // A `#[path]` module or an `include!` pulls source in from outside
+    // `userspace-xdp/src/`, and every bound below would silently stop covering
+    // it — a fail-open in the one dimension walking the directory exists to
+    // close. Matched on TOKENS so `#[ path` does not slip past, same as
+    // everything else here.
+    //
+    // The first version of this refusal matched only the literal spellings
+    // `[ path` and `include !`, and round 3 walked straight through it twice:
+    //
+    //   - `#[cfg_attr(all(), path = "…/evil.rs")] mod evil;` never emits the
+    //     token pair `[ path`, and rustc really does compile the off-tree file
+    //     (proven positively: a syntax error in it fails the build pointing at
+    //     the off-tree line). A second, reduced binding-map read was placed on
+    //     the packet path there with every bound below green.
+    //   - `use core::include as inc;` then `inc!("…")` never emits `include !`.
+    //
+    // So match the two capabilities, not their spellings. Any attribute form
+    // that redirects a module — bare, `cfg_attr`-wrapped, or nested to any
+    // depth — has to write the token pair `path =`. Any route to the macro,
+    // aliased or not, has to NAME `include` to import it. Both are refused
+    // outright; prose that trips them is a spurious RED, which is the polarity
+    // this whole test is built on.
+    //
+    // `extern crate` is refused with them, for the CRATE half of the same
+    // fail-open. A crate placed on the search path by `-L dependency=…` — which
+    // the repo-root config may legally spell, since `rustflags` is not banned
+    // there (see below) — is not nameable in edition 2024 without either
+    // `--extern` (refused in both cargo configs) or an `extern crate` item
+    // HERE. Refusing the pair closes the second half, so the route is bounded
+    // at both ends rather than at one, which is what the shipped comment on the
+    // cargo-config refusal claimed and did not have.
+    let offpath: Vec<String> = seq(&["[", "path"])
+        .into_iter()
+        .chain(seq(&["path", "="]))
+        .chain(seq(&["include"]))
+        .chain(seq(&["extern", "crate"]))
+        .collect();
+    assert!(
+        offpath.is_empty(),
+        "#5173: {offpath:?} names a module-path attribute, the `include` macro, or an \
+         `extern crate` item, so the shim crate is no longer confined to {}. The bounds in this \
+         test walk that directory; source pulled in from elsewhere — or a crate pulled in from a \
+         `-L` search path — would be invisible to every one of them, the exact fail-open this \
+         refusal exists to close. Extend the walk before adding any of them. (Prose tripping \
+         this is a false RED; reword it.)",
+        root.display()
+    );
+
+    // ---- …and a DEPENDENCY is a third way in that the walk cannot see. ----
+    //
+    // `#[path]` and `include!` pull SOURCE in from outside the walk, and are
+    // refused above. A proc-macro dependency does something the token bounds
+    // cannot see at all: its expansion is tokens that appear in no file here,
+    // and a `Span::call_site()` token resolves — and SHADOWS — at the
+    // invocation. Round 5 built it. A crate outside `userspace-xdp/src`
+    // emitting, from a parsed string,
+    //
+    //     let rx_queue = RawRxQueue::from_ctx_field(rx_queue.for_trace() % 4);
+    //
+    // invoked by the single line `xdp_evil::tune!();` — thirteen tokens naming
+    // neither coordinate and neither constructor — left EVERY count below
+    // exactly where it was, all three tests green, and the emitted object
+    // carrying `r2 &= 0x3` immediately after the `xdp_md.rx_queue_index` load
+    // that the pristine object performs unmasked. Compiled and disassembled,
+    // not argued.
+    //
+    // `macro_rules!` is not this hole: a body identifier is def-site hygienic,
+    // and an `$n:ident` metavariable is written by the INVOCATION, which is in
+    // the walk. Only a proc macro binds a name that is written nowhere here.
+    //
+    // Counting mentions cannot see it by construction, so bound the ROUTE
+    // instead: the expansion needs a proc-macro crate, a proc-macro crate needs
+    // a dependency entry, and the manifest is pinned token-for-token here. That
+    // makes acquiring one a deliberate act that reds — the same idiom as
+    // `BINDINGS_MENTIONS`. It is a cheap pin to hold: this file has changed
+    // twice in the repo's history, once to add it and once in a repo-wide
+    // rename.
+    //
+    // What this does NOT bound, stated because the rest of this test is only
+    // worth what its claims are worth: the two dependencies already pinned.
+    // `aya-ebpf-macros` IS a proc-macro crate (it supplies `#[xdp]`), and
+    // nothing here reads upstream code. That residual is carried on the doc
+    // comment; it is not covered by any bound below.
+    let manifest_path = crate_dir.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+    #[rustfmt::skip]
+    const SHIM_MANIFEST: &[&str] = &[
+        "[", "package", "]",
+        "name", "=", "\"", "xpf", "-", "userspace", "-", "xdp", "\"",
+        "version", "=", "\"", "0", ".", "1", ".", "0", "\"",
+        "edition", "=", "\"", "2024", "\"",
+        "[", "dependencies", "]",
+        "aya", "-", "ebpf", "=", "\"", "0", ".", "1", ".", "1", "\"",
+        "aya", "-", "ebpf", "-", "macros", "=", "\"", "0", ".", "1", ".", "2", "\"",
+        "[", "lib", "]",
+        "crate", "-", "type", "=", "[", "\"", "cdylib", "\"", "]",
+    ];
+    let manifest_owned = shim_token_vec(&manifest);
+    let manifest_tokens: Vec<&str> = manifest_owned.iter().map(String::as_str).collect();
+    assert_eq!(
+        manifest_tokens,
+        SHIM_MANIFEST,
+        "#5173: {} must be exactly:\n  {}\nA new dependency is the one route by which a binding \
+         of either coordinate can exist without its name appearing anywhere the mention tally \
+         below walks: a proc macro's expansion is call-site hygienic, so it shadows a local here \
+         while writing nothing here. That was demonstrated compiling, with all three tests green \
+         and `& 0x3` in the emitted object. Matched on TOKENS, so whitespace and line breaks are \
+         not a RED, but a `[patch]`, a `[replace]`, a path dependency, a reordered key or a \
+         version bump all are. \
+         If you are changing this deliberately, update this constant and say why — and if what \
+         you added can expand to arbitrary statements, the mention tally below no longer bounds \
+         rebindings and this test's doc comment needs revising with it.",
+        manifest_path.display(),
+        SHIM_MANIFEST.join(" "),
+    );
+
+    // ---- …and the manifest is not the only file that can add a crate. -----
+    //
+    // Pinning `Cargo.toml` bounds the ORDINARY route. Two cargo config files
+    // are read for this build — the crate's own and the repo root's, since
+    // cargo loads ancestor configs — and either can inject a crate the manifest
+    // never names, via a `--extern` rustflag, or swap one it does name, via
+    // `[patch]` / `[replace]`. So refuse those CAPABILITIES rather than pin the
+    // files: both are mostly explanatory comments and a token-exact pin of
+    // either would red on a reworded sentence.
+    //
+    // `extern`, `patch`, `replace` and `rustc` are refused in BOTH files;
+    // `rustflags` is refused only in the crate-local one, because the repo-root
+    // config carries an x86_64-scoped link-arg (#3595) that is inert for
+    // `bpfel-unknown-none`.
+    //
+    // `rustc` is on the list because of what it TOKENIZES: `rustc-wrapper`
+    // becomes `rustc`, `-`, `wrapper`, so none of `extern`/`patch`/`replace`
+    // appears in it and the shipped list did not see it at all. A wrapper is
+    // exec'd as `<wrapper> <rustc> <args…>` and is free to append
+    // `--extern <procmacro>=<path>` to every invocation — the exact acquisition
+    // capability the manifest pin above exists to close, through a door the
+    // refusal did not cover. Measured, not argued: a wrapper added to the
+    // repo-root config IS invoked for the `bpfel-unknown-none` shim build (7
+    // invocations, 3 naming the target triple) with all three tests green.
+    // Neither config contains a bare `rustc` token today, so the ban costs
+    // nothing; `rustc-workspace-wrapper` lands on it too.
+    //
+    // A NARROWER gap that the shipped comment claimed was closed and was not:
+    // it said "the `extern` refusal covers that file's injection route
+    // regardless of the flag it would be spelled with". It does not.
+    // `rustflags` is legal in the repo-root config, and `-L dependency=…`
+    // there spells the injection in the SOURCE instead, as `extern crate evil;`
+    // — which this refusal never reads. Closed at the other end: the walk
+    // refuses the token pair `extern crate` (above, with `[path]`/`include`),
+    // because `-L` only tells rustc where to LOOK. Naming the crate still needs
+    // either `--extern` (refused here) or `extern crate` (refused there).
+    //
+    // NOT covered, and it cannot be: a cargo config outside the repository
+    // (`$CARGO_HOME/config.toml`), or `RUSTFLAGS` in the environment. Those are
+    // properties of the machine running the build, not of reviewable source;
+    // the build recipe that sets the environment is itself hashed by the #4977
+    // freshness manifest.
+    for (label, path, banned) in [
+        (
+            "userspace-xdp/.cargo/config.toml",
+            crate_dir.join(".cargo").join("config.toml"),
+            &["extern", "patch", "replace", "rustflags", "rustc"][..],
+        ),
+        (
+            ".cargo/config.toml",
+            repo_root.join(".cargo").join("config.toml"),
+            &["extern", "patch", "replace", "rustc"][..],
+        ),
+    ] {
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let toks = shim_token_vec(&body);
+        let found: Vec<&str> = banned
+            .iter()
+            .copied()
+            .filter(|k| shim_token_seq_count(&toks, &[k]) > 0)
+            .collect();
+        assert!(
+            found.is_empty(),
+            "#5173: {label} names {found:?}, any of which can put a crate into the shim build \
+             that {} never mentions — `--extern` injects one outright, `[patch]`/`[replace]` \
+             substitutes one already pinned, and `rustc-wrapper` (which contains none of the \
+             other three tokens) wraps every `rustc` invocation and can append `--extern` to \
+             all of them. A proc macro acquired that way expands \
+             call-site-hygienic tokens that shadow a coordinate while writing its name nowhere \
+             the tally below walks, which is the escape the manifest pin above exists to close; \
+             a second door to the same room closes with it. Refused as capabilities rather than \
+             pinned token-for-token because these files are mostly comments. (Prose using one of \
+             these words is a spurious RED; reword it.)",
+            manifest_path.display(),
+        );
+    }
+
+    // ---- The binding lookup, pinned as a whole statement. -----------------
+    //
+    // This single assertion is what closes the round-2 escapes, because the
+    // sequence names every part an attacker has to touch: `binding_slot` is on
+    // the packet path, BOTH of its arguments are untransformed, and the value
+    // handed to the map read is the resolved slot with nothing applied to it.
+    #[rustfmt::skip]
+    const LOOKUP_STATEMENT: &[&str] = &[
+        "let", "binding", "=",
+        "binding_slot", "(", "ingress_ifindex", ",", "rx_queue", ")",
+        ".", "and_then", "(", "|", "idx", "|",
+        "USERSPACE_BINDINGS", ".", "get", "(", "idx", ")", ")", ";",
+    ];
+    let pinned = seq(LOOKUP_STATEMENT);
+    // Show what IS there when the pin fails. "found 0 occurrences" on its own
+    // would send the next author hunting for a needle this test already holds.
+    let actual: Vec<String> = sources
+        .iter()
+        .flat_map(|(name, body)| {
+            body.lines()
+                .filter(|l| l.contains("USERSPACE_BINDINGS"))
+                .map(move |l| format!("{name}: {}", shim_tokens(l)))
+        })
+        .collect();
+    assert_eq!(
+        pinned.len(),
+        1,
+        "#5173: the shim's binding lookup must be exactly this statement, once:\n  {}\nfound \
+         {} occurrence(s) {pinned:?}.\nLines naming the map, tokenized:\n{actual:#?}\nEvery \
+         round-2 escape is a token inside that sequence: `.get(idx % 4)` reduces the resolved \
+         slot; `binding_slot(ingress_ifindex % 4, ..)` reduces the interface coordinate; \
+         inlining the index drops `binding_slot` off the packet path so the executed stride \
+         bound no longer governs anything. A needle COUNT sees none of those — the whole \
+         statement must match.",
+        LOOKUP_STATEMENT.join(" "),
+        pinned.len(),
+    );
+
+    // ---- No second lookup, however it is spelled or wrapped. --------------
+    let lookups = seq(&["USERSPACE_BINDINGS", ".", "get", "("]);
+    assert_eq!(
+        lookups.len(),
+        1,
+        "#5173: the shim crate must contain exactly ONE binding-map read; found {lookups:?}. A \
+         second one is how the removed raw-queue fallback returns, and it indexed with an \
+         unbounded rx_queue_index. This is TOKEN-matched, not substring-matched, because the \
+         predecessor check was defeated by putting a newline before `.get(` — the very \
+         formatting rustfmt produces for a chain this long."
+    );
+
+    // ---- …and no ALIAS that would dodge the check above. ------------------
+    //
+    // `use USERSPACE_BINDINGS as BINDS;` (or `let b = &USERSPACE_BINDINGS;`)
+    // gives a second lookup a name the sequence above cannot match. Pinning the
+    // identifier's total occurrence count is what closes that: any alias, any
+    // re-export, any local rebinding has to NAME the static to create itself.
+    const BINDINGS_MENTIONS: usize = 2; // the `static` item + the one lookup
+    let mentions = seq(&["USERSPACE_BINDINGS"]);
+    assert_eq!(
+        mentions.len(),
+        BINDINGS_MENTIONS,
+        "#5173: `USERSPACE_BINDINGS` must be named exactly {BINDINGS_MENTIONS} times in the shim \
+         crate — its `static` definition and the single lookup — but was named {} times \
+         {mentions:?}. This bound is deliberately tight: an alias, a re-export or a local \
+         rebinding is how a second, unbounded lookup gets a name the sequence checks above \
+         cannot see, and all of them have to mention the static to exist. A comment that spells \
+         the identifier trips this too; that is a spurious RED, never a silent pass. If you are \
+         adding a legitimate mention, raise the constant deliberately and say why.",
+        mentions.len(),
+    );
+
+    // ---- The wrap site, pinned the same way. ------------------------------
+    #[rustfmt::skip]
+    const CONSTRUCTION_STATEMENT: &[&str] = &[
+        "let", "rx_queue", "=",
+        "RawRxQueue", ":", ":", "from_ctx_field", "(",
+        "unsafe", "{", "(", "*", "ctx", ".", "ctx", ")", ".", "rx_queue_index", "}",
+        ")", ";",
+    ];
+    let ctor_site = seq(CONSTRUCTION_STATEMENT);
+    assert_eq!(
+        ctor_site.len(),
+        1,
+        "#5173: the coordinate must be wrapped by exactly this statement, once:\n  {}\nfound {} \
+         occurrence(s) {ctor_site:?}. The constructor takes a bare u32, so a reduction applied \
+         BEFORE the wrap is one of the two escapes the newtype cannot prevent (`transmute` is \
+         the other, and nothing here catches it) — which is why the argument SPELLING is pinned \
+         and not just the call's existence.\nWhat that pin does NOT do, stated because an \
+         earlier revision claimed it did: pinning the spelling does not make the spelling \
+         load-bearing. This sequence is byte-identical whatever `ctx` is bound to, and a \
+         statement-scope rebinding of `ctx` above this line — a zeroed `xdp_md` carrying a \
+         masked queue index, restored immediately after — reintroduces #5173 in the emitted \
+         object with this assertion, the tallies and the kernel verifier all green. That form \
+         is now caught by the `ctx` column of the per-file tally and by the `let ctx` refusal \
+         below, neither of which is this check.",
+        CONSTRUCTION_STATEMENT.join(" "),
+        ctor_site.len(),
+    );
+
+    // A second construction re-opens the pre-wrap reduction, so bound the
+    // constructor's name the same way the static's is bounded above: aliasing
+    // the TYPE (`use RawRxQueue as RQ;`) still has to name the method.
+    const CTOR_MENTIONS: usize = 2; // the `fn` item + the one call
+    let ctors = seq(&["from_ctx_field"]);
+    assert_eq!(
+        ctors.len(),
+        CTOR_MENTIONS,
+        "#5173: `from_ctx_field` must be named exactly {CTOR_MENTIONS} times in the shim crate — \
+         its definition and the single call — but was named {} times {ctors:?}. A second \
+         construction site is a second chance to reduce the raw integer before it is wrapped, \
+         and renaming the type on import does not hide the method name.",
+        ctors.len(),
+    );
+
+    // ---- …and the constructor's BODY, which is where a mask costs NOTHING. -
+    //
+    // Round 6, and structurally unlike the six escapes before it: ONE in-place
+    // arithmetic edit inside a shim function body.
+    //
+    //     RawRxQueue(rx_queue_index & 0x3f)
+    //
+    // It creates no binding, needs no proc macro, no `--extern`, no `[patch]`,
+    // no manifest edit and no deletion, and it spends NOTHING from the per-file
+    // tally — `rx_queue_index` is a different token to the counted `rx_queue`.
+    // Every bound in this test stayed green and the emitted object gained
+    // `r1 &= 0x3f` at insn 1006, on the `xdp_md.rx_queue_index` load the
+    // pristine object performs unmasked. That is byte-for-byte the shape round
+    // 5's proc-macro escape produced, reached with none of its machinery.
+    //
+    // It is RUNTIME-REACHABLE, not a theoretical hole. On a NIC left above 64
+    // combined channels with the helper's queue count capped at ≤16 — one of
+    // the two remediations `docs/afxdp-packet-processing.md` names — a packet on
+    // hardware queue 70 resolves to `None` today and takes the designed
+    // binding-missing path. Masked, `70 & 0x3f = 6` resolves to a LIVE binding,
+    // the shim redirects to an XSK bound to a queue the packet did not arrive
+    // on, `xsk_rcv_check()` returns `-EINVAL` and the driver discards while the
+    // last recorded trace stage stays REDIRECT. #5173 verbatim. The Go
+    // publish-side `queue_id >= 16` refusal (`maps_sync.go`) bounds what Go
+    // WRITES, not what arrives from hardware.
+    //
+    // The pins above fix these functions' INTERFACE; this is what fixes what
+    // they DO. Pinning the body rather than widening the executed axis is
+    // deliberate — see `shim_coordinate_ladder`: any executed axis has a
+    // largest tested value, and a mask sized to it is invisible by
+    // construction, so widening relocates the boundary instead of removing it.
+    // These are 1-, 1- and 4-line functions; the pins are cheap to hold.
+    #[rustfmt::skip]
+    const CTOR_ITEM: &[&str] = &[
+        "pub", "fn", "from_ctx_field", "(", "rx_queue_index", ":", "u32", ")", "-", ">", "Self",
+        "{",
+        "RawRxQueue", "(", "rx_queue_index", ")",
+        "}",
+    ];
+    let ctor_item = seq(CTOR_ITEM);
+    assert_eq!(
+        ctor_item.len(),
+        1,
+        "#5173: the constructor must be exactly this item, once:\n  {}\nfound {} occurrence(s) \
+         {ctor_item:?}. Its SIGNATURE alone is not enough: the wrapper is an identity function \
+         and a reduction written INSIDE it reaches every packet while creating no binding, \
+         spending no mention from the tally below, and touching no other pinned sequence. \
+         Demonstrated compiling with every other bound in this test green.",
+        CTOR_ITEM.join(" "),
+        ctor_item.len(),
+    );
+
+    // ---- The wrap site's only READER, pinned too. -------------------------
+    //
+    // `for_trace()` has exactly one caller, and until round 5 that caller was
+    // the only statement on the packet path naming the queue coordinate that
+    // was NOT pinned — which made it a FREE mention rather than a load-bearing
+    // one. Re-sourcing the traced index straight from the context field,
+    //
+    //     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
+    //
+    // is the same value, deletes nothing, and costs ZERO tokens of the counted
+    // name (`rx_queue_index` is a different token to `rx_queue`). The freed slot
+    // then paid for a tuple-pattern `transmute` shadow with the crate tally
+    // still exactly at its bound: compiled, all three tests green, and the
+    // emitted object carrying `r1 &= 0x3` immediately before the `<<= 0x4`
+    // stride multiply. Pinning the readback removes that slot, and it is worth
+    // pinning on its own account: it makes the queue index every `record_trace`
+    // reports the WRAPPED coordinate read back, not an independent read that
+    // could disagree with the one the lookup consumed.
+    #[rustfmt::skip]
+    const TRACE_READBACK_STATEMENT: &[&str] = &[
+        "let", "rx_queue_index", "=", "rx_queue", ".", "for_trace", "(", ")", ";",
+    ];
+    let readback = seq(TRACE_READBACK_STATEMENT);
+    assert_eq!(
+        readback.len(),
+        1,
+        "#5173: the traced queue index must be read back by exactly this statement, once:\n  \
+         {}\nfound {} occurrence(s) {readback:?}. Re-sourcing it from the context field is the \
+         same value for zero tokens of the counted name, and the mention it frees is enough to \
+         buy a shadow with the crate tally unchanged — demonstrated compiling with every other \
+         bound green and `& 0x3` in the emitted object. It also keeps telemetry honest: what is \
+         traced must be the coordinate that was wrapped, not a second read of the context.",
+        TRACE_READBACK_STATEMENT.join(" "),
+        readback.len(),
+    );
+
+    // …and the readback's own BODY, same class as the constructor's above.
+    // `for_trace(self) -> u32 { self.0 & 0x3f }` is a telemetry defect that
+    // pins on the CALLER cannot see, and the executed test could not either
+    // until this round: it evaluated the readback at one input, 3, and
+    // `3 & 0x3f == 3`.
+    #[rustfmt::skip]
+    const TRACE_READBACK_ITEM: &[&str] = &[
+        "pub", "fn", "for_trace", "(", "self", ")", "-", ">", "u32",
+        "{",
+        "self", ".", "0",
+        "}",
+    ];
+    let readback_item = seq(TRACE_READBACK_ITEM);
+    assert_eq!(
+        readback_item.len(),
+        1,
+        "#5173: the telemetry readback must be exactly this item, once:\n  {}\nfound {} \
+         occurrence(s) {readback_item:?}. A reduction inside it makes every trace record name a \
+         queue the redirect did not use — the mis-traced-drop hazard `binding_index.rs` \
+         documents — while the pinned call site above stays byte-identical.",
+        TRACE_READBACK_ITEM.join(" "),
+        readback_item.len(),
+    );
+
+    // ---- `binding_slot`'s SIGNATURE, pinned. ------------------------------
+    //
+    // The lookup statement pins the CALLER's argument names. Nothing pinned the
+    // callee's parameter names, and three of the seven mentions of the queue
+    // coordinate live there. Renaming the parameter and its two body uses is
+    // behaviour-preserving — the executed stride test calls positionally — so
+    // it reddened nothing while dropping the tally from 7 to 4, and a deficit
+    // is topped back up with prose, which the tokenizer counts identically to
+    // code. That is three free slots bought with a cosmetic edit, and round 5
+    // composed exactly that with the readback re-source above into a compiled
+    // #5173 sitting at the bound.
+    //
+    // With the signature pinned the rename has nowhere to go: rename the
+    // parameter and this sequence breaks; leave it and neither body use can be
+    // deleted without breaking the build or the executed stride test. The pin
+    // also fixes the parameter ORDER and both parameter TYPES, which nothing
+    // else here did.
+    #[rustfmt::skip]
+    const BINDING_SLOT_SIGNATURE: &[&str] = &[
+        "pub", "fn", "binding_slot", "(",
+        "ingress_ifindex", ":", "u32", ",", "rx_queue", ":", "RawRxQueue", ")",
+        "-", ">", "Option", "<", "u32", ">",
+    ];
+    let slot_sig = seq(BINDING_SLOT_SIGNATURE);
+    assert_eq!(
+        slot_sig.len(),
+        1,
+        "#5173: the slot resolver must be declared by exactly this signature, once:\n  {}\nfound \
+         {} occurrence(s) {slot_sig:?}. A parameter rename here is behaviour-preserving and the \
+         executed stride test calls positionally, so nothing else sees it — but it moves three \
+         mentions out of the tally below, and the tally is what bounds rebindings of the name. \
+         Renaming a parameter is not worth breaking a build over; buying three free slots with \
+         it is.",
+        BINDING_SLOT_SIGNATURE.join(" "),
+        slot_sig.len(),
+    );
+
+    // ---- …and the BODY that signature wraps. ------------------------------
+    //
+    // The second instance of the round-6 class, in the other coordinate:
+    //
+    //     Some((ingress_ifindex & 0xffff) * BINDING_QUEUES_PER_IFACE + rx_queue.0)
+    //
+    // adds four tokens inside the body, writes `ingress_ifindex` in the same
+    // place it was already written, and left all three tests green while the
+    // object gained `r1 &= 0xffff0` at insn 1118, wedged between the `<<= 0x4`
+    // stride multiply and the `|= rx_queue`. Its runtime reach is BOUNDED — the
+    // Go publish side fails closed at ifindex ≥ 65536 (#4894) — so this
+    // instance is a GUARD defect rather than a shipping one, and it is pinned
+    // because it proves the hole is a CLASS and not one function.
+    //
+    // Anchored on the return type so the sequence is unambiguously this
+    // function's body. The stride guard is inside the pin deliberately: an
+    // executed axis proves the guard's EFFECT at the values it runs, and this
+    // proves its SPELLING at all of them.
+    //
+    // The sharpest reason the pin and not a wider axis is the primary bound —
+    // measured while closing round 6, because "the executed test would catch a
+    // real one" is the argument that would retire it. This body:
+    //
+    //     #[cfg(target_arch = "bpf")]      const MASK: u32 = 0x3;
+    //     #[cfg(not(target_arch = "bpf"))] const MASK: u32 = !0;
+    //     Some(ingress_ifindex * BINDING_QUEUES_PER_IFACE + (rx_queue.0 & MASK))
+    //
+    // masks the coordinate in the BPF object and is the exact identity on the
+    // host, where `MASK` is `!0`. The executed axis stayed green at every one
+    // of its ~7700 points and so did the per-file tally — the spelling writes
+    // each coordinate the same number of times. ONLY this pin reddened. A host
+    // test cannot see a target-conditional body by construction, however wide
+    // its axes are.
+    #[rustfmt::skip]
+    const BINDING_SLOT_BODY: &[&str] = &[
+        "-", ">", "Option", "<", "u32", ">",
+        "{",
+        "if", "rx_queue", ".", "0", ">", "=", "BINDING_QUEUES_PER_IFACE", "{",
+        "return", "None", ";",
+        "}",
+        "Some", "(",
+        "ingress_ifindex", "*", "BINDING_QUEUES_PER_IFACE", "+", "rx_queue", ".", "0",
+        ")",
+        "}",
+    ];
+    let slot_body = seq(BINDING_SLOT_BODY);
+    assert_eq!(
+        slot_body.len(),
+        1,
+        "#5173: the slot resolver's body must be exactly this, once:\n  {}\nfound {} \
+         occurrence(s) {slot_body:?}. A mask applied to either coordinate INSIDE the body reaches \
+         every packet, creates no binding, spends nothing from the tally below and moves no other \
+         pinned sequence — it is the cheapest reintroduction of #5173 there is, and the executed \
+         axis cannot be relied on to catch it because any axis has a largest tested value that a \
+         mask can be sized to.",
+        BINDING_SLOT_BODY.join(" "),
+        slot_body.len(),
+    );
+
+    // ---- The INTERFACE half of the index, pinned the same way. ------------
+    //
+    // `binding_slot` takes two coordinates and only the queue one is a
+    // newtype, so the ifindex is the half a type cannot defend. Round 3 used
+    // exactly that: the statement pin above fixes how the argument is SPELLED,
+    // not what it is WORTH, and
+    //
+    //     let ingress_ifindex = ingress_ifindex % 4;
+    //
+    // one line above the pinned lookup compiles for the real target, is #5173
+    // through the interface dimension, and left all three tests green. Pinning
+    // where the value comes FROM closes the other half of that: reducing it at
+    // the definition instead breaks this sequence.
+    #[rustfmt::skip]
+    const INGRESS_STATEMENT: &[&str] = &[
+        "let", "ingress_ifindex", "=",
+        "unsafe", "{", "(", "*", "ctx", ".", "ctx", ")", ".", "ingress_ifindex", "}", ";",
+    ];
+    let ifx_site = seq(INGRESS_STATEMENT);
+    assert_eq!(
+        ifx_site.len(),
+        1,
+        "#5173: the interface coordinate must be read by exactly this statement, once:\n  \
+         {}\nfound {} occurrence(s) {ifx_site:?}. It is a bare u32 all the way to `binding_slot`, \
+         so unlike the queue coordinate NOTHING rejects a reduction of it by type — pinning both \
+         its definition and its use is the whole defence. `let mut`, or any arithmetic applied \
+         here, changes this sequence.",
+        INGRESS_STATEMENT.join(" "),
+        ifx_site.len(),
+    );
+
+    // ---- Telemetry must report the coordinates the lookup CONSUMES. -------
+    //
+    // The shipped version of the residual said that buying a shadow of the
+    // interface coordinate "costs a visibly deleted telemetry call". It does
+    // not. Round 5 bought one with an ALIAS and deleted nothing:
+    //
+    //     let ifx = ingress_ifindex;                     // +1
+    //     let (ingress_ifindex, _z) = (ifx % 4, 0u32);   // +1  (tuple pattern)
+    //
+    // then routed TWO existing `record_trace` arguments through `ifx` instead
+    // (-2). Net zero. The tally stayed exactly at its bound, `["let", name]`
+    // stayed at one, all three tests stayed green, no trace call was removed and
+    // the two rerouted sites record the identical integer — while the emitted
+    // object gained `r1 &= 0x3` after the `xdp_md.ingress_ifindex` load. That is
+    // #5173 through the interface dimension, which is precisely the round-3
+    // defect, reintroduced without deleting anything.
+    //
+    // Pinning the argument PREFIX is what sees it, and it is a CLASSIFYING
+    // bound rather than a counting one: it says where the mentions are, not just
+    // how many there are. Every call must report the same three names the
+    // binding lookup consumes, so an alias cannot be refunded there. It also
+    // fixes a real telemetry property — a trace record that names a different
+    // interface or queue than the one the redirect used is the "drop MIS-TRACED
+    // as having reached redirect" hazard `binding_index.rs` documents.
+    //
+    // The two counts are pinned separately so a red says which happened: a new
+    // trace call (raise both), or an existing one no longer passing the
+    // canonical coordinates (raise neither — fix the call).
+    //
+    // The CALLEE's signature is pinned with them, for the same reason
+    // `binding_slot`'s is: pinning only the call sites leaves the parameter name
+    // free, and renaming `record_trace`'s own `ingress_ifindex` parameter is
+    // behaviour-preserving, reds nothing else, and frees TWO mentions — the
+    // declaration and the trace-key mix — which is exactly the price of the
+    // alias shadow above. Found while checking what the residual actually was;
+    // it is cheaper to pin than to document.
+    const TRACE_CALL_SITES: usize = 12;
+    #[rustfmt::skip]
+    const TRACE_SIGNATURE: &[&str] = &[
+        "fn", "record_trace", "(",
+        "ctrl_flags", ":", "u32", ",",
+        "ingress_ifindex", ":", "u32", ",",
+        "rx_queue_index", ":", "u32", ",",
+        "selected_queue", ":", "u32", ",",
+        "slot", ":", "u32", ",",
+        "stage", ":", "u32", ",",
+        "reason", ":", "u32", ",",
+        "parsed", ":", "&", "ParsedPacket", ",",
+        ")",
+    ];
+    let trace_sig = seq(TRACE_SIGNATURE);
+    assert_eq!(
+        trace_sig.len(),
+        1,
+        "#5173: the trace recorder must be declared by exactly this signature, once:\n  {}\nfound \
+         {} occurrence(s) {trace_sig:?}. Renaming the interface parameter here is invisible to \
+         the call-site pin below and to every other bound, and it frees two mentions from the \
+         tally — the declaration and the trace-key mix — which is the exact price of buying a \
+         shadow with an alias. Reordering or retyping the parameters also lands here, which is \
+         worth having on its own: the call sites are pinned positionally.",
+        TRACE_SIGNATURE.join(" "),
+        trace_sig.len(),
+    );
+    #[rustfmt::skip]
+    const TRACE_ARGUMENT_PREFIX: &[&str] = &[
+        "record_trace", "(",
+        "ctrl", ".", "flags", ",",
+        "ingress_ifindex", ",", "rx_queue_index", ",", "selected_queue", ",",
+    ];
+    // The `fn record_trace(` item tokenizes to the same pair as a call, so the
+    // total is the call sites plus the definition.
+    let trace_opens = seq(&["record_trace", "("]);
+    assert_eq!(
+        trace_opens.len(),
+        TRACE_CALL_SITES + 1,
+        "#5173: the shim crate must contain exactly {} `record_trace(` occurrences — \
+         {TRACE_CALL_SITES} call sites plus the `fn` item — but found {} {trace_opens:?}. This \
+         is pinned because the NEXT assertion counts only the calls that DO pass the canonical \
+         coordinates, and on its own that is satisfied by adding a thirteenth call that does \
+         not. Pinning the total is what makes the pair say `all of them`. If you are adding or \
+         removing a trace call, move both constants together and say why.",
+        TRACE_CALL_SITES + 1,
+        trace_opens.len(),
+    );
+    let canonical_traces = seq(TRACE_ARGUMENT_PREFIX);
+    assert_eq!(
+        canonical_traces.len(),
+        TRACE_CALL_SITES,
+        "#5173: every `record_trace` call must open with exactly:\n  {}\nfound {} of \
+         {TRACE_CALL_SITES} {canonical_traces:?}. A call that reports the coordinates under any \
+         OTHER name is how a shadow is paid for without deleting anything: alias the interface \
+         coordinate, reroute two arguments through the alias, and the mention tally below is \
+         refunded while the object gains a mask on the index. It is also wrong on its own terms \
+         — a trace record must describe the packet the binding lookup actually resolved.",
+        TRACE_ARGUMENT_PREFIX.join(" "),
+        canonical_traces.len(),
+    );
+
+    // ---- Neither coordinate may be re-bound, in ANY binding form. ---------
+    //
+    // The two statement pins fix the definition and the use; a SHADOW between
+    // them changes neither. Two bounds close that, and they are deliberately
+    // different in KIND, because the first one alone was escaped.
+    //
+    // `let <name>` is the PRECISE bound. It matches the exact shape of the
+    // three escapes round 3 demonstrated, so when it reds its message can say
+    // what was done:
+    //
+    //   - `ingress_ifindex` rebound to `ingress_ifindex % 4` — #5173 through
+    //     the interface dimension, invisible to both statement pins;
+    //   - `rx_queue` shadowed by an unsafe forgery — `core::mem::zeroed()`,
+    //     `transmute`, `MaybeUninit::assume_init`, a pointer read. The newtype
+    //     stops the CONSTRUCTOR, never a raw-bytes fabrication, and the class
+    //     is open-ended, so bounding the class by symbol name would always be
+    //     one symbol behind. Bounding the BINDING is not: the lookup statement
+    //     is pinned to pass the identifier `rx_queue`, so a forged value is
+    //     only reachable by binding that exact name;
+    //   - `rx_queue` shadowed by arithmetic once an impl makes it legal (see
+    //     the trait bound below) — a complete #5173 reintroduction with no
+    //     `unsafe` anywhere.
+    //
+    // Matching `let <name>` rather than `<name> =` is deliberate: a type
+    // annotation (`let rx_queue: RawRxQueue = …`) puts a token between the two
+    // and slips a `<name> =` pair, and the unsafe-forgery shadow is spelled
+    // exactly that way. Reassignment without `let` needs `mut`, which breaks
+    // whichever statement pin above declares the name.
+    //
+    // The MENTION TALLY is the bound that is complete over binding FORMS, and
+    // it ships because `let <name>` on its own was escaped FOUR ways in round 4
+    // — every one of them compiling for `bpfel-unknown-none`, with all three
+    // tests green. `["let", name]` matches only a BARE-IDENTIFIER `let` pattern;
+    // put any token between the two and it is gone. The four:
+    //
+    //   - a tuple pattern —
+    //         let (rx_queue, _z) = (transmute::<u32, RawRxQueue>(q % 4), 0u32);
+    //     which is a COMPILED #5173, not a theoretical one: the emitted program
+    //     gains `r1 &= 0x3` before the map lookup and LOSES the `> 0xf` stride
+    //     guard, because LLVM can then prove the index in range;
+    //   - `let Some(<name>) = … else { … };`, and every other refutable or
+    //     destructuring pattern with it;
+    //   - a `macro_rules!` body taking an `$n:ident`. An earlier revision of
+    //     this comment asserted that such a body "must still write these tokens
+    //     to define itself, and macro hygiene stops an out-of-crate one from
+    //     shadowing here". That was simply WRONG on the first half: the body
+    //     writes `let $n`, and an `ident` metavariable is call-site-hygienic, so
+    //     an in-crate macro shadows fine;
+    //   - a closure or `fn` PARAMETER — which this test used to carry as its
+    //     declared residual, and no longer does.
+    //
+    // Enumerating binding FORMS would always be one form behind, exactly as
+    // enumerating fabrication symbols would. Counting MENTIONS is not — for
+    // bindings WRITTEN IN THE WALKED SOURCE. A binding of `<name>` — tuple,
+    // struct, slice or `Some(..)` pattern, `let … else`, `if let`, `while let`,
+    // `for`, a match arm, a `macro_rules!` expansion, a closure or `fn`
+    // parameter — cannot exist without writing the name here, so every one of
+    // them moves this tally. Same idiom, and the same reasoning, as
+    // `BINDINGS_MENTIONS` and `CTOR_MENTIONS` above; the numbers are larger only
+    // because these two are ordinary working identifiers rather than one-site
+    // symbols.
+    //
+    // "Written in the walked source" is a REAL qualifier and round 5 found the
+    // gap: a PROC MACRO binds a name without writing it here, because its
+    // expansion carries `Span::call_site()` and therefore resolves — and
+    // shadows — at the invocation. Counting cannot see that by construction; the
+    // manifest pin above bounds the route to it instead, and the doc comment
+    // carries what remains as a residual. Do not restate this tally as complete
+    // over binding forms without that qualifier: an earlier revision did, and it
+    // was false.
+    //
+    // PER FILE, not crate-wide. A crate total is FUNGIBLE across files: a doc
+    // line deleted in `binding_index.rs` would pay for a shadow added to
+    // `lib.rs`, which is a conservation escape the total cannot see. Pinning the
+    // tally per file makes the conservation residual per-file too, and for the
+    // queue coordinate that spends the budget: `lib.rs` names it three times and
+    // all three are inside pinned statements — the construction, the `for_trace`
+    // readback and the lookup. It does NOT spend it for the interface
+    // coordinate; see CONSERVATION on the doc comment for the free slots that
+    // remain there.
+    //
+    // A spent budget is NOT a closed hole, and the shipped version of the
+    // paragraph above said it was ("has nothing left to spend"). Both counted
+    // names can be fully accounted for while #5173 is reintroduced through a
+    // THIRD name that neither of them tracks — `ctx`. Shadow it a few
+    // statement-scope lines above the pinned construction with a zeroed
+    // `xdp_md` whose `rx_queue_index` is masked, restore it before
+    // `bpf_xdp_adjust_meta` needs the real one, and the pinned statement is
+    // byte-identical while reading a different struct. Measured on this tree:
+    // builds for `bpfel-unknown-none`, live kernel verifier PASS, the emitted
+    // object gains `&= 0x3` and LOSES the `> 0xf` stride guard, and every
+    // `shim_*` test green — with `rx_queue` still at 3 in `lib.rs` and
+    // `ingress_ifindex` still at 22.
+    //
+    // So `ctx` gets a column. That closes the DEMONSTRATED forms — a `let`
+    // shadow, a pattern binding, a parameter — and it does not close the class:
+    // the class is what a name RESOLVES TO, and every instrument in this file
+    // is about which names the source WRITES. Do not read a green tally as
+    // proof that the coordinate arrives intact.
+    //
+    // The `ctx` column is only counted on files that already name a coordinate,
+    // and that is sound rather than a gap: the construction statement is pinned
+    // and it names `rx_queue`, so whatever file holds it necessarily has a row.
+    // A shadow has to be in lexical scope AT that statement — same function,
+    // therefore same file — and the two ways to inject a binding across a file
+    // boundary are already refused above (`include!`/`#[path]` by the
+    // confinement bound) or carried as the declared proc-macro residual.
+    //
+    // Paths are relative to the walked root, so this is pinnable and a NEW file
+    // that mentions either coordinate is a red rather than an invisible
+    // addition.
+    #[rustfmt::skip]
+    const MENTIONS_PER_FILE: &[(&str, usize, usize, usize)] = &[
+        //  file                 ingress_ifindex  rx_queue         ctx
+        //                       ---------------  --------         ---
+        //  binding_index.rs:    1 doc + param    1 doc + param    PROSE ONLY —
+        //                       + 1 body use     + 2 body uses    this module is
+        //                                                         `core`-only
+        //                                                         and cannot see
+        //                                                         an
+        //                                                         `XdpContext`:
+        //                                                         2 quoting the
+        //                                                         pinned read,
+        //                                                         1 naming the
+        //                                                         escape
+        //  lib.rs:              2 struct fields, 3, ALL inside    the `#[xdp]`
+        //                       the pinned read  pinned           entry param,
+        //                       (x2), the iface  statements: the  the inner
+        //                       gate, the pinned construction,    fn's param,
+        //                       lookup, 12 trace `for_trace`      and every
+        //                       args, the meta   readback and     `ctx.`/
+        //                       write, the trace the lookup       `(*ctx.ctx)`
+        //                       fn's param, its                   read on the
+        //                       struct init and                   packet path
+        //                       its key mix
+        ("binding_index.rs",     3,               4,               3),
+        ("lib.rs",               22,              3,               17),
+    ];
+
+    // ---- …and `ctx` may not be rebound AT ALL. ---------------------------
+    //
+    // The column above sees a rebinding because it moves the count. This sees
+    // the single most direct form regardless of the count, so that trading a
+    // prose mention for a shadow — the conservation move the tally is honest
+    // about not classifying — still reds on the shape. Zero today: the context
+    // is a parameter on both functions that take one and is never re-`let` in
+    // this crate.
+    let ctx_rebinds = seq(&["let", "ctx"]);
+    assert!(
+        ctx_rebinds.is_empty(),
+        "#5173: `ctx` must never be rebound with a `let` in the shim crate, but {} do \
+         {ctx_rebinds:?}. The construction statement below is pinned token-for-token, which \
+         bounds how it is SPELLED and not what `ctx` resolves to when it runs: shadowing `ctx` \
+         above it with a doctored `xdp_md` and restoring it afterwards puts a masked queue index \
+         into `RawRxQueue` with the pin, the tallies and the kernel verifier all green. That was \
+         demonstrated end to end, so this refusal exists. It closes the `let` form only — a \
+         pattern binding or a parameter is caught by the `ctx` column of the tally above, and \
+         neither bound closes the CLASS, which is semantic while both of these are syntactic. \
+         Prose spelling `let` immediately before the identifier trips this; that is a spurious \
+         RED, never a silent pass, and the shim's own comments are worded around it.",
+        ctx_rebinds.len(),
+    );
+
+    for name in ["ingress_ifindex", "rx_queue"] {
+        let rebinds = seq(&["let", name]);
+        assert_eq!(
+            rebinds.len(),
+            1,
+            "#5173: `{name}` must be bound by exactly ONE `let {name}` statement in the shim \
+             crate, but {} match {rebinds:?}. Both statement pins above stay green when the \
+             coordinate is SHADOWED between its definition and its use, so this is the bound that \
+             sees it — a one-line `%` shadow, or a shadow whose value is forged out of raw bytes \
+             by any `unsafe` construction the newtype cannot prevent. Do not add a second binding \
+             of this name; if the value genuinely needs deriving, give the derived value a \
+             DIFFERENT name and note that the pinned lookup statement will then reject passing \
+             it. (This bound sees a bare-identifier `let` and nothing else — a tuple pattern, a \
+             `let … else`, a macro expansion or a parameter slips it, which is what the tally \
+             below is for.)",
+            rebinds.len(),
+        );
+    }
+
+    // One row per file that names either coordinate, in walk order. Compared as
+    // a whole list so a file appearing, disappearing or trading a mention with
+    // another file is a red — which a pair of crate totals is not.
+    let tally: Vec<(String, usize, usize, usize)> = tokens
+        .iter()
+        .filter_map(|(file, toks)| {
+            let ifx = shim_token_seq_count(toks, &["ingress_ifindex"]);
+            let queue = shim_token_seq_count(toks, &["rx_queue"]);
+            let ctx = shim_token_seq_count(toks, &["ctx"]);
+            (ifx + queue > 0).then(|| (file.clone(), ifx, queue, ctx))
+        })
+        .collect();
+    let expected: Vec<(String, usize, usize, usize)> = MENTIONS_PER_FILE
+        .iter()
+        .map(|(f, ifx, queue, ctx)| ((*f).to_string(), *ifx, *queue, *ctx))
+        .collect();
+    assert_eq!(
+        tally, expected,
+        "#5173: the shim crate must name `ingress_ifindex`, `rx_queue` and `ctx` exactly this \
+         many times in exactly these files — (file, ingress_ifindex, rx_queue, ctx) — but the \
+         walk found {tally:#?} against {expected:#?}.\nThis is the bound that is complete over \
+         binding FORMS written here, and the reason it is a tally rather than a pattern match: a \
+         rebinding in ANY form — a tuple, struct, slice or `Some(..)` pattern, a `let … else`, \
+         `if let`, `while let`, `for`, a match arm, a `macro_rules!` expansion, or a closure/`fn` \
+         parameter — has to WRITE the name to exist, so all of them land here even though only \
+         the bare-identifier `let` lands on the bounds above. Five such forms were demonstrated \
+         compiling with every other check green: a `transmute` forgery bound through a tuple \
+         pattern, and a `ctx` shadow carrying a doctored `xdp_md` past the byte-identical pinned \
+         construction — both reintroduced #5173 in the emitted object.\nComplete over FORMS is \
+         not complete over the CLASS. The `ctx` column exists because two fully-accounted \
+         coordinate columns did not stop the shadow that hijacked the third name, and adding it \
+         closes the forms demonstrated so far, not the possibility of another name. What this \
+         file measures is which identifiers the source writes; what #5173 is about is what they \
+         resolve to at run time. Those are different questions and a green tally answers only \
+         the first.\nIt is PER FILE because a crate total is fungible: a freed mention in one \
+         file would pay for a shadow in another. What it does NOT see is a binding written \
+         outside the walk — a proc-macro expansion; the manifest pin above bounds the route to \
+         that, and this test's doc comment carries it as a residual.\nA comment or doc line that \
+         spells any of the three identifiers lands here too; that is a spurious RED, never a \
+         silent pass. If you are adding a legitimate mention, move the row deliberately and say \
+         why.",
+    );
+
+    // ---- The newtype's compile-time half, tested rather than assumed. -----
+    //
+    // `binding_index.rs` claims the coordinate cannot be reduced because
+    // `RawRxQueue` has a private field and implements no arithmetic — "enforced
+    // by the compiler rather than asserted about source text". True, but only
+    // while both remain so, and nothing tested that. Round 3 added
+    // `impl Rem<u32>` plus a `pub` field and NOTHING went red; with one shadow
+    // line that is a full #5173 reintroduction with no `unsafe` marker for a
+    // reader to catch. These two bounds are what make the compile-time claim a
+    // claim about the code that is actually there.
+    // The shipped needle was the ADJACENT pair `for RawRxQueue`, and its message
+    // said "must implement NO traits" — wider than what it checked.
+    // `impl core::ops::Rem<u32> for &RawRxQueue` tokenizes `… for & RawRxQueue`,
+    // the adjacency fails, and `&rx_queue % 4` then compiles. So step over the
+    // reference sugar (`&`, `mut`, a lifetime) between `for` and the type.
+    //
+    // "NO traits" was also literally false about the type as it stands, in a way
+    // the same message went on to contradict two sentences later: the `struct`
+    // carries `#[derive(Clone, Copy, PartialEq, Eq, Debug)]`, so it implements
+    // five. What this refuses is a WRITTEN `impl … for` block, and the five
+    // derives are exactly why that is the right line to draw — none of them
+    // yields the inner `u32` or an arithmetic operator, so none of them can
+    // reduce the coordinate, whereas a hand-written impl is how `Rem`,
+    // `BitAnd`, `Shr`, `Deref` or `Into` would arrive.
+    let mut trait_impls: Vec<String> = Vec::new();
+    for (name, toks) in &tokens {
+        for i in 0..toks.len() {
+            if toks[i] != "for" {
+                continue;
+            }
+            let mut j = i + 1;
+            loop {
+                match toks.get(j).map(String::as_str) {
+                    Some("&") | Some("mut") => j += 1,
+                    // A lifetime is the tick plus its name, two tokens.
+                    Some("'") => j += 2,
+                    _ => break,
+                }
+            }
+            if toks.get(j).map(String::as_str) == Some("RawRxQueue") {
+                trait_impls.push(name.clone());
+            }
+        }
+    }
+    assert!(
+        trait_impls.is_empty(),
+        "#5173: `RawRxQueue` must carry NO hand-written `impl … for` block, on the type OR on a \
+         reference to it — found {trait_impls:?}. An arithmetic impl (`Rem`, `BitAnd`, `Shr`) \
+         makes reducing the coordinate compile, and `Deref`/`Into` hand out the raw integer to \
+         be reduced elsewhere; either way the module's compile-time half is gone while every \
+         other check here stays green. This is deliberately narrower than \"implements no \
+         traits\", which the type does not satisfy and never has: it derives `Clone`, `Copy`, \
+         `PartialEq`, `Eq` and `Debug`. Those are allowed because none of them exposes the inner \
+         `u32` or an operator — and mechanically they do not trip this needle either, since a \
+         `#[derive]` names its traits BEFORE the type rather than after `for`."
+    );
+
+    // …and the type's mention count, which is the bound that is complete over
+    // impl FORMS the way the needle above is not. Coherence means an impl of
+    // any shape — on the type, on a reference, on a wrapper, inherent or
+    // trait — has to NAME the type to exist, so all of them land here. Same
+    // idiom as `BINDINGS_MENTIONS` and `CTOR_MENTIONS`; the residual is the same
+    // too, and stated rather than papered over: this is a CRATE total, so an
+    // author who also deletes an existing mention can pay for one. What that
+    // buys on its own is an impl, not a defect — reducing the coordinate still
+    // needs a shadow, and the per-file coordinate tally below is what bounds
+    // those.
+    const RAW_TYPE_MENTIONS: usize = 8;
+    let raw_type = seq(&["RawRxQueue"]);
+    assert_eq!(
+        raw_type.len(),
+        RAW_TYPE_MENTIONS,
+        "#5173: `RawRxQueue` must be named exactly {RAW_TYPE_MENTIONS} times in the shim crate — \
+         in `binding_index.rs` the module doc, the `struct` item, the inherent `impl` header, the \
+         constructor body and `binding_slot`'s parameter type; in `lib.rs` the `use`, one doc line \
+         and the pinned construction — but was named {} times {raw_type:?}. An `impl` block of any \
+         shape has to write this name, which is why the count is the bound and the needle above is \
+         only the precise message. A comment spelling the identifier trips it too; that is a \
+         spurious RED, never a silent pass.",
+        raw_type.len(),
+    );
+    let decl = seq(&["RawRxQueue", "(", "u32", ")"]);
+    assert_eq!(
+        decl.len(),
+        1,
+        "#5173: `RawRxQueue`'s field must stay PRIVATE — expected exactly one declaration with an \
+         unqualified `u32` field, found {} {decl:?}. Marking it `pub` re-exposes the coordinate to \
+         arithmetic outside the module, which is the same defect as an arithmetic impl by another \
+         route.",
+        decl.len(),
+    );
+}
+
 // #4555/#6923: the session map has two writers, and the shim's over-limit
 // refusal is an invariant about the MAP, not about the packet in front of it.
 // An IPv6 chain longer than the shim's `MAX_EXT_HDRS` leaves the shim probing
@@ -2469,3 +4251,899 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
         "#6923: the upsert path must refuse the same key the delete path refuses"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// #6691 round 8: an orphan VLAN child must not re-key onto a REFUSED parent.
+// ---------------------------------------------------------------------------
+//
+// `replan_queues` has two reasons to find no parent candidate, and only one of
+// them means "the parent is absent". The other means "the parent is present and
+// the binding contract refused it" — and the orphan branch's remedy (promote
+// the parent into the candidate list) is exactly wrong there: it hands the
+// planner the netdev the contract just excluded, sourced from a sibling row
+// that never had to pass the test itself.
+//
+// The snapshot below is the real Go wire snapshot for a strict-valid config:
+//
+//	set security ipsec vpn V bind-interface st10
+//	set interfaces st10 vlan-tagging
+//	set interfaces st10 unit 5 vlan-id 100
+//	set interfaces st10 unit 5 family inet address 192.0.2.1/24
+//	set security zones security-zone trust interfaces st10.5
+//
+// The base row `st10` carries `secure_tunnel: true` (the VPN binds it); the
+// unit derives `10<<16 | 6` against the bound `10<<16 | 1`, so it is correctly
+// NOT a secure tunnel — and its `parent_linux_name` is the xfrmi.
+//
+// The assertion is the QUEUE COUNT, not plan identity, because the queue count
+// IS the harm: `replan_bindings_from_candidates` takes the global minimum and
+// an xfrm interface has exactly one RX queue, so admitting it drags every
+// physical interface on the box to one queue and one worker (#3091).
+//
+// FAIL-ON-REVERT: measured at head before the fix, this snapshot planned a
+// binding for `st10` and the LAN's planned queue count fell from 4 to 1.
+
+#[test]
+fn orphan_vlan_child_cannot_readmit_its_refused_parent() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+        snapshot_binding_plan_key,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-0", 4);
+    // The measured xfrmi property: `ip -d link` reports `numrxqueues 1` and
+    // /sys/class/net/<if>/queues holds a single `rx-0`.
+    set_rx_queue_count_override("st10", 1);
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 10,
+        rx_queues: 4,
+        ..Default::default()
+    };
+    let xfrmi = InterfaceSnapshot {
+        name: "st10".to_string(),
+        linux_name: "st10".to_string(),
+        zone: "trust".to_string(),
+        secure_tunnel: true,
+        ifindex: 11,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    let sibling = InterfaceSnapshot {
+        name: "st10.5".to_string(),
+        // The VLAN device the Go builder names for `vlan-id 100`; it exists on
+        // no box (a VLAN cannot be created on an ARPHRD_NONE xfrmi), which is
+        // why its own ifindex is 0 and the PARENT redirect is the only way it
+        // contributes anything.
+        linux_name: "st10.100".to_string(),
+        parent_linux_name: "st10".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 0,
+        parent_ifindex: 11,
+        vlan_id: 100,
+        rx_queues: 1,
+        ..Default::default()
+    };
+
+    // Premises. Without all three the assertions below cannot discriminate.
+    assert!(
+        !crate::server::helpers::include_userspace_binding_interface(&xfrmi),
+        "premise: the xfrmi's own row must already be refused a binding"
+    );
+    assert!(
+        crate::server::helpers::include_userspace_binding_interface(&sibling),
+        "premise: the sibling must NOT be refused on its own merits — otherwise \
+         no laundering is being tested"
+    );
+    assert!(
+        lan.rx_queues > xfrmi.rx_queues,
+        "premise: the LAN must have MORE queues than the tunnel, or the global \
+         minimum cannot move and this test is vacuous"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![lan.clone(), xfrmi, sibling],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 4, &[]);
+
+    assert!(
+        bindings.iter().all(|b| b.interface != "st10"),
+        "the planner produced an AF_XDP binding for the xfrmi. Its own row was \
+         refused; a zoned sibling unit re-keyed onto it through the orphan-VLAN \
+         parent redirect. Planned: {:?}",
+        bindings
+            .iter()
+            .map(|b| &b.interface)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-0")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {}. The xfrmi entered \
+         the candidate list through its sibling and its single RX queue became \
+         the global minimum — every interface on the box is now one queue and \
+         one worker (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    // #2915: the plan-key HASH must drop exactly the rows the LAYOUT drops. The
+    // refused sibling contributes no candidate, so a snapshot without it at all
+    // must hash identically — otherwise the key would churn (or, in the unsafe
+    // direction, a change to the dropped row would not bump the key while the
+    // layout stayed the same).
+    let without_sibling = ConfigSnapshot {
+        interfaces: snapshot.interfaces[..2].to_vec(),
+        ..Default::default()
+    };
+    assert_eq!(
+        snapshot_binding_plan_key(&snapshot),
+        snapshot_binding_plan_key(&without_sibling),
+        "the plan key still hashes a row that produces no candidate: the hash and \
+         the layout disagree about the binding plan (#2915)"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// The NON-REFUSED orphan case must keep working. This is #3175's own scenario
+/// and it is the negative control for the refusal above.
+///
+/// THE PARENT ROW IS PRESENT AND UNZONED, which is the only shape that can
+/// discriminate the two predicates. An earlier revision of this test omitted
+/// the parent row entirely, and it did not bind: with no row resolving to
+/// `ge-0-0-2`, BOTH `snapshot_refuses_parent_netdev` and the wrong-but-tempting
+/// `!include_userspace_binding_interface(p)` return false for want of anything
+/// to examine, so the mutation survived. Measured, not reasoned — it survived
+/// the grid before the fixture was corrected.
+///
+/// With the parent row present and unzoned, the parent is NOT a candidate (an
+/// empty zone fails `include_userspace_binding_interface`) yet it is NOT
+/// refused either (an unzoned physical NIC is not an unbindable NETDEV). Its
+/// hardware queues really do carry the child's tagged frames, so the #3175
+/// re-key must still happen.
+///
+/// FAIL-ON-REVERT: widen `snapshot_refuses_parent_netdev` to fire on any
+/// non-candidate parent — the obvious wrong simplification — and this test goes
+/// RED with an empty binding list.
+#[test]
+fn orphan_vlan_child_still_rekeys_onto_an_unzoned_parent() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, include_userspace_binding_interface, replan_queues,
+        set_rx_queue_count_override, userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-2", 6);
+
+    // Present, unzoned: not a candidate, but not refused either.
+    let parent = InterfaceSnapshot {
+        name: "ge-0/0/2".to_string(),
+        linux_name: "ge-0-0-2".to_string(),
+        zone: String::new(),
+        ifindex: 30,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    let child = InterfaceSnapshot {
+        name: "reth0.80".to_string(),
+        linux_name: "ge-0-0-2.80".to_string(),
+        parent_linux_name: "ge-0-0-2".to_string(),
+        zone: "untrust".to_string(),
+        ifindex: 31,
+        parent_ifindex: 30,
+        vlan_id: 80,
+        rx_queues: 1,
+        ..Default::default()
+    };
+
+    assert!(
+        !include_userspace_binding_interface(&parent),
+        "premise: the parent must NOT be a candidate, or this is the ordinary \
+         VLAN-dedup path and the orphan branch never runs"
+    );
+    assert!(
+        !userspace_unbindable_netdev(&parent),
+        "premise: the parent must NOT be refused — the whole point is that \
+         'not a candidate' and 'refused' are different facts"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![parent, child],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        planned.contains("ge-0-0-2"),
+        "an orphan VLAN child whose parent is present-but-not-a-candidate must \
+         still re-key onto the parent netdev (#3175) — refusing it here would \
+         take the child's traffic off the dataplane. Planned: {planned:?}"
+    );
+    let queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-2")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        queues.len(),
+        6,
+        "the orphan re-key must use the PARENT's hardware queue count, not the \
+         child's lone software queue"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 9: `snapshot_refuses_parent_netdev` must need EVERY owner of a
+/// netdev to be unbindable, not just one — the Rust half of the Go blocker in
+/// `buildUserspaceRefusedNetdevs`.
+///
+/// THE SNAPSHOT IS WHAT THE GO BUILDER SHIPS, not a hand-invented shape. A
+/// unit-level `tunnel` stanza sets `Tunnel` on the UNIT row only
+/// (`iface.Tunnel != nil || unit.Tunnel != nil`, interfaces.go), and a unit-0
+/// row with no vlan-id resolves to the BASE netdev (snapshotLinuxName's unit-0
+/// collapse) — so `ge-0/0/5` and `ge-0/0/5.0` arrive here as two rows on ONE
+/// netdev that disagree about whether it may be bound.
+///
+/// THE BASE ROW IS mgmt-ZONED ON PURPOSE, and that is the only shape that makes
+/// this observable rather than merely inconsistent. `buildInterfaceZoneMap` keys
+/// a base off whichever zone entry sorts first, so `security-zone mgmt
+/// interfaces ge-0/0/5.0` + `security-zone trust interfaces ge-0/0/5.100` really
+/// does produce base=mgmt with a trust VLAN unit — the shape
+/// `TestParentRedirectKeepsAMgmtZonedParent` exists for. With the base excluded
+/// for a ROW reason it supplies no candidate of its own, so under the ANY rule
+/// the trust VLAN child's re-key was the netdev's only route into the plan and
+/// refusing it left the plan with NO binding for a netdev whose ifindex the Go
+/// ingress map still carries. An ifindex in the ingress map with no READY
+/// binding is `drop_degraded_transit` (BINDING_MISSING).
+///
+/// FAIL-ON-REVERT: change `snapshot_refuses_parent_netdev` back to
+/// `.iter().any(...)` and this goes RED — planned came back without
+/// `ge-0-0-5` at all.
+#[test]
+fn a_netdev_with_a_bindable_owner_is_not_refused() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, include_userspace_binding_interface, replan_queues,
+        set_rx_queue_count_override, userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-5", 6);
+
+    // The base NIC. Bindable as a DEVICE; excluded only by its mgmt ZONE.
+    let base = InterfaceSnapshot {
+        name: "ge-0/0/5".to_string(),
+        linux_name: "ge-0-0-5".to_string(),
+        zone: "mgmt".to_string(),
+        ifindex: 30,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    // The unit-level tunnel row: Tunnel set, and collapsed onto the base netdev.
+    let tunnel_unit = InterfaceSnapshot {
+        name: "ge-0/0/5.0".to_string(),
+        linux_name: "ge-0-0-5".to_string(),
+        parent_linux_name: "ge-0-0-5".to_string(),
+        zone: "mgmt".to_string(),
+        tunnel: true,
+        ifindex: 30,
+        parent_ifindex: 30,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    // The trust-zoned VLAN child whose frames arrive on the base NIC's queues.
+    let vlan_child = InterfaceSnapshot {
+        name: "ge-0/0/5.100".to_string(),
+        linux_name: "ge-0-0-5.100".to_string(),
+        parent_linux_name: "ge-0-0-5".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 31,
+        parent_ifindex: 30,
+        vlan_id: 100,
+        rx_queues: 1,
+        ..Default::default()
+    };
+
+    // Premises. Without all three this cannot discriminate ANY from EVERY.
+    assert!(
+        !userspace_unbindable_netdev(&base),
+        "premise: the base row must be a BINDABLE device, or the two rows agree"
+    );
+    assert!(
+        userspace_unbindable_netdev(&tunnel_unit),
+        "premise: the unit row must be unbindable, or nothing is disagreeing"
+    );
+    assert!(
+        !include_userspace_binding_interface(&base),
+        "premise: the base must NOT be a candidate on its own (mgmt zone), or the \
+         netdev enters the plan regardless and the refusal is unobservable"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![base, tunnel_unit, vlan_child],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        planned.contains("ge-0-0-5"),
+        "the trust VLAN child produced no candidate because a SIBLING row on the \
+         same netdev is a tunnel. The netdev has a bindable owner, so it is not \
+         refused — and dropping it leaves the Go ingress map carrying ifindex 30 \
+         with no READY binding (drop_degraded_transit). Planned: {planned:?}"
+    );
+    let queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-5")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        queues.len(),
+        6,
+        "the re-key must use the PARENT's 6 hardware queues, not the child's lone \
+         software queue"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 9: `replan_queues`' FABRIC loop must ask the refused index too.
+///
+/// Round 8 gated the interface loop and left the fabric loop unconditional,
+/// recording the gap as unreachable — a judgement made against the PRE-round-8
+/// exclusion, which was keyed on the ref's NAME. The kernel-kind half refuses a
+/// device for what it IS, so a slot-shaped `ge-0/0/0` created out of band is
+/// both refused and a legal `fabric-options member-interfaces` value; the Go
+/// control plane ships it as a fabric row whose parent netdev carries
+/// `secure_tunnel` on its own interface row.
+///
+/// Planning a binding onto it is the same #3091 collapse the exclusion exists to
+/// prevent: an xfrm interface has one RX queue and the planner takes the global
+/// minimum across candidates.
+///
+/// FAIL-ON-REVERT: drop the `snapshot_refuses_parent_netdev` guard from the
+/// fabric candidate loop and this reds — `ge-0-0-0` reappears in the plan and
+/// the LAN's queue count collapses from 6 to 1.
+#[test]
+fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+        userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-3", 6);
+    // The measured xfrmi property: exactly one RX queue.
+    set_rx_queue_count_override("ge-0-0-0", 1);
+
+    // The fabric MEMBER's own interface row: an xfrm device by kernel kind,
+    // under a slot-shaped name. This is what the Go builder ships.
+    let member = InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        zone: String::new(),
+        secure_tunnel: true,
+        ifindex: 20,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/3".to_string(),
+        linux_name: "ge-0-0-3".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 21,
+        rx_queues: 6,
+        ..Default::default()
+    };
+
+    // Premises. Without both, the fabric loop is not being tested.
+    assert!(
+        userspace_unbindable_netdev(&member),
+        "premise: the fabric member's netdev must be REFUSED, or there is nothing \
+         for the fabric loop to re-admit"
+    );
+    assert!(
+        lan.rx_queues > member.rx_queues,
+        "premise: the LAN must have MORE queues than the member, or the global \
+         minimum cannot move and the collapse assertion is vacuous"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![member, lan.clone()],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            // #6691 round 10: the fabric votes on this netdev too, so its vote
+            // is set to what the Go builder ships for this config — the base row
+            // and the fabric parent are judged from the same config and the same
+            // kernel sample (fabricParentUnbindable), so they agree here.
+            //
+            // Round 10 also called the disagreeing snapshot "not producible",
+            // and round 11 measured two ways to produce it: a canonical alias
+            // between the member's name and its stanza, and a fabric refresh
+            // re-sampling the kernel between applies. Both are fixed at their
+            // source in the control plane, and the rule changed as well — a
+            // fabric vote is counted only where no row owns the netdev — so this
+            // fixture no longer depends on the agreement for its verdict. See
+            // `fabric_vote_cannot_overturn_an_owning_row` below, which drives
+            // exactly the disagreement this comment used to call impossible.
+            parent_unbindable: true,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("ge-0-0-0"),
+        "the fabric loop planned an AF_XDP binding for a REFUSED member netdev. \
+         Its own interface row carries secure_tunnel; the fabric row re-admitted \
+         it without asking. Planned: {planned:?}"
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-3")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {} — the refused \
+         member entered the candidate list through the fabric loop and its single \
+         RX queue became the global minimum (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    // #2915: the plan-key HASH must drop exactly what the LAYOUT drops.
+    let without_fabric = ConfigSnapshot {
+        fabrics: Vec::new(),
+        ..snapshot.clone()
+    };
+    assert_eq!(
+        snapshot_binding_plan_key(&snapshot),
+        snapshot_binding_plan_key(&without_fabric),
+        "the plan key still hashes a fabric row that produces no candidate: the \
+         hash and the layout disagree about the binding plan (#2915)"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 10: a fabric parent netdev that NO INTERFACE ROW OWNS is still
+/// refusable, and the fabric's own snapshot row is what carries the verdict.
+///
+/// THE FIXTURE'S POINT IS WHAT IT OMITS. The round-9 guard above builds an
+/// `InterfaceSnapshot` for `ge-0-0-0` carrying `secure_tunnel: true` — and
+/// `snapshot_refuses_parent_netdev` tallies OWNERS, so that row is the only
+/// reason the netdev was refusable at all. A fabric member needs no interface
+/// stanza on the Go side, so the row is routinely absent while the fabric loops
+/// still push the netdev into the candidate list. With zero owners the
+/// unanimity `owners > 0 && owners == unbindable` answers "not refused", and
+/// round 9 planned an AF_XDP binding on the refused device.
+///
+/// This snapshot therefore carries the LAN row and nothing else: the member has
+/// no row, only `FabricSnapshot.parent_unbindable`, which is the wire field the
+/// Go plane computes from evidence (kernel link kind) this process cannot see.
+///
+/// FAIL-ON-REVERT: drop the fabric arm from `snapshot_refuses_parent_netdev`
+/// and this reds on both the planned set and the collapsed LAN queue count.
+#[test]
+fn ownerless_fabric_parent_is_refused() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-3", 6);
+    set_rx_queue_count_override("ge-0-0-0", 1);
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/3".to_string(),
+        linux_name: "ge-0-0-3".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 21,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    let snapshot = ConfigSnapshot {
+        // DELIBERATELY no row for ge-0-0-0 — see above.
+        interfaces: vec![lan.clone()],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            parent_unbindable: true,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // PREMISE: nothing in `interfaces` owns the member netdev. If a future
+    // edit adds one back, this silently becomes the round-9 test.
+    assert!(
+        !snapshot
+            .interfaces
+            .iter()
+            .any(|i| i.linux_name == "ge-0-0-0"),
+        "premise: the ownerless case needs NO interface row for the fabric parent"
+    );
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("ge-0-0-0"),
+        "the fabric loop planned an AF_XDP binding for a netdev the control plane \
+         marked unbindable. No interface row speaks for it, so `parent_unbindable` \
+         is the only evidence this plane has. Planned: {planned:?}"
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-3")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {} — the ownerless \
+         refused parent entered the candidate list and its single RX queue became \
+         the global minimum (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    // #2915: the plan-key HASH must drop exactly what the LAYOUT drops.
+    let without_fabric = ConfigSnapshot {
+        fabrics: Vec::new(),
+        ..snapshot.clone()
+    };
+    assert_eq!(
+        snapshot_binding_plan_key(&snapshot),
+        snapshot_binding_plan_key(&without_fabric),
+        "the plan key hashes an ownerless fabric row that produces no candidate: \
+         the hash and the layout disagree about the binding plan (#2915)"
+    );
+
+    // NEGATIVE CONTROL, and it is the REFERENCE CLUSTER's own shape: an
+    // ownerless fabric parent that is NOT unbindable must still be planned.
+    // loss:xpf-userspace-fw0/fw1 authors `fab0 fabric-options member-interfaces
+    // ge-0/0/0` with no interface row for it, so "ownerless => refused" would
+    // take the fabric parent out of every cluster this project runs.
+    let bindable = ConfigSnapshot {
+        interfaces: vec![lan],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            parent_unbindable: false,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let planned = replan_queues(Some(&bindable), 6, &[])
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        planned.contains("ge-0-0-0"),
+        "an ownerless fabric parent with no refusal was dropped: being ownerless \
+         is not what refuses a netdev, the control plane's verdict is. \
+         Planned: {planned:?}"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 11: a fabric vote must not overturn the verdict of a row that
+/// OWNS the netdev.
+///
+/// Round 10 counted the fabric parent as an owner beside any interface row, so
+/// one device could have TWO owners whose verdicts came from DIFFERENT evidence
+/// — this plane reads a wire field, the Go plane reads a config lookup plus a
+/// kernel dump — and the unanimity rule reads any disagreement as an ADMISSION.
+/// So every way to make those two differ was a fail-open, and round 10's own
+/// fixture comment (above) called the disagreeing snapshot unproducible. Two
+/// producers were then measured on the control plane: a canonical alias between
+/// the member's name and its interface stanza (`gr-0/0/3` vs `gr-0-0-3`, one
+/// device, both spellings legal), and a fabric refresh re-sampling the kernel
+/// between applies.
+///
+/// Both are fixed at their source, and this rule is what makes a THIRD one
+/// harmless: a device has ONE verdict — the row's where a row exists, the
+/// fabric's where none does.
+///
+/// The fixture is the disagreement itself: an unbindable member row with a
+/// fabric row that says bindable. Under the round-10 tally that is
+/// `owners=2, unbindable=1` → not refused → the netdev is planned and its single
+/// RX queue becomes the global minimum (#3091).
+///
+/// FAIL-ON-REVERT: count the fabric vote unconditionally (drop the `owners == 0`
+/// guard in `snapshot_refuses_parent_netdev`) and this reds on both the planned
+/// set and the collapsed LAN queue count.
+#[test]
+fn fabric_vote_cannot_overturn_an_owning_row() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+        userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-3", 6);
+    set_rx_queue_count_override("ge-0-0-0", 1);
+
+    let member = InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        zone: String::new(),
+        secure_tunnel: true,
+        ifindex: 20,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/3".to_string(),
+        linux_name: "ge-0-0-3".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 21,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    assert!(
+        userspace_unbindable_netdev(&member),
+        "premise: the owning row must REFUSE the netdev, or there is no verdict \
+         for the fabric vote to overturn"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![member, lan.clone()],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            // THE DISAGREEMENT. The row says unbindable; the fabric says
+            // bindable.
+            parent_unbindable: false,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("ge-0-0-0"),
+        "a fabric row voting `bindable` overturned the verdict of the only row \
+         that describes the device, and the refused netdev was planned. A \
+         disagreement between two owners of ONE device is not evidence of \
+         bindability — it is evidence that one of them was computed from the \
+         wrong input. Planned: {planned:?}"
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-3")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {} — the refused \
+         netdev entered the candidate list on the fabric's vote and its single \
+         RX queue became the global minimum (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 9b: the version check refuses in BOTH operand orders.
+///
+/// `apply_snapshot_rejects_unsupported_protocol_version` drives
+/// `CONFIG_SNAPSHOT_PROTOCOL_VERSION - 1`, which is a v5 control plane meeting
+/// this v6 helper. The other half of the mixed-version matrix — a v6 control
+/// plane meeting a v5 helper — cannot be run here, because that needs a v5
+/// helper BINARY. What it depends on is that `snapshot.version != CONST`
+/// refuses whichever side is newer, so this drives `+ 1` to measure that
+/// directly rather than inferring it from the symmetry of one line.
+///
+/// Without this, "an older helper refuses a newer snapshot" is READ. With it,
+/// both operand orders are measured against the real `handle_stream` dispatch.
+#[test]
+fn apply_snapshot_rejects_a_newer_protocol_version_too() {
+    use crate::{ConfigSnapshot, ControlRequest, ControlResponse, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let state = Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus::default(),
+        snapshot: None,
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+    let running = Arc::new(AtomicBool::new(true));
+    let state_file = format!(
+        "{}/xpf-newer-version-gate-{}.json",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let handle = {
+        let state = state.clone();
+        let running = running.clone();
+        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+    };
+
+    let request = ControlRequest {
+        request_type: "apply_snapshot".to_string(),
+        snapshot: Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION + 1,
+            generated_at: Utc::now(),
+            ..ConfigSnapshot::default()
+        }),
+        ..ControlRequest::default()
+    };
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    assert!(
+        !response.ok,
+        "a snapshot at a NEWER protocol version was accepted. The check must refuse \
+         whichever side is ahead — an older helper that accepts a newer snapshot \
+         enforces fields it cannot see, which is the failure the version exists to \
+         prevent"
+    );
+    assert!(
+        response
+            .error
+            .contains("unsupported snapshot protocol version"),
+        "unexpected error: {}",
+        response.error
+    );
+    handle
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+}
+
+/// #6691 round 16: `snapshot_refuses_parent_netdev` counts an owning row BY
+/// NAME with no ifindex filter, so a row whose own link lookup missed
+/// (`ifindex: 0`) still speaks for the netdev — and the Go control plane's
+/// ingress-adjudication map must reach the same verdict from the same evidence.
+///
+/// WHY A ROW CAN CARRY IFINDEX 0 WHILE THE FABRIC ROW CARRIES A LIVE ONE: the
+/// two are sampled at different instants. `buildInterfaceSnapshots`
+/// (interfaces.go) and `buildFabricSnapshotsFrom` (fabric.go) each take their
+/// own `buildLinkSnapshot`, and `SyncFabricState` (manager_ha.go) refreshes the
+/// fabric rows ALONE and persists them back into `m.lastSnapshot` beside
+/// interface rows that were never re-sampled.
+///
+/// THE FIXTURE'S POINT IS `parent_unbindable: false`. It isolates the ifindex-0
+/// interface row as the ONLY refusal evidence in the snapshot: the fabric arm of
+/// `snapshot_refuses_parent_netdev` runs only at `owners == 0`, so if this side
+/// ever gained an `ifindex > 0` filter on the owner walk the row would stop
+/// counting, the fabric arm would vote bindable, and this plane would plan a
+/// binding for a netdev Go's NAME-keyed readers (the RSS allowlist and, since
+/// round 16, the ingress map) refuse. That is the split in the other direction —
+/// a binding with no ingress entry takes `cpumap_or_pass` and leaves the
+/// adjudicated path.
+///
+/// FAIL-ON-REVERT: add `|| p.ifindex <= 0` to the `continue` in
+/// `snapshot_refuses_parent_netdev`'s owner walk and this reds — `gr-0-0-3`
+/// appears in the planned set.
+#[test]
+fn zero_ifindex_owner_row_still_refuses_the_fabric_parent() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("gr-0-0-3", 1);
+    set_rx_queue_count_override("ge-0-0-3", 6);
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/3".to_string(),
+                linux_name: "ge-0-0-3".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 21,
+                rx_queues: 6,
+                ..Default::default()
+            },
+            // The stale half: owns `gr-0-0-3` (its bind target is its own
+            // netdev) and is unbindable (the `tunnel` exclusion class), but its
+            // own link lookup missed.
+            InterfaceSnapshot {
+                name: "gr-0/0/3".to_string(),
+                linux_name: "gr-0-0-3".to_string(),
+                zone: "vpn".to_string(),
+                ifindex: 0,
+                tunnel: true,
+                ..Default::default()
+            },
+        ],
+        // The fresh half, deliberately voting BINDABLE — see the doc above.
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "gr-0-0-3".to_string(),
+            parent_ifindex: 20,
+            parent_unbindable: false,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("gr-0-0-3"),
+        "an owning row at ifindex 0 must still refuse the netdev: the Go plane's \
+         name-keyed readers refuse it, so a binding here is a plan/ingress split. \
+         Planned: {planned:?}"
+    );
+    // ANTI-VACUITY: the LAN row must still be planned, so the assertion above is
+    // not passing because the planner produced nothing at all.
+    assert!(
+        planned.contains("ge-0-0-3"),
+        "premise broken: the unrefused LAN netdev must still be planned. Planned: {planned:?}"
+    );
+
+    clear_rx_queue_count_override();
+}
+

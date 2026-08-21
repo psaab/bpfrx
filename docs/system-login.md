@@ -62,7 +62,280 @@ enum is **derived from** `LoginClassPermissions`
 (`config.ValidLoginClasses()`), so the commit-time validator and the
 runtime RBAC table can never drift apart: adding a class in one place
 without the other is impossible. An empty/unset class keeps the legacy
-allow-everything behavior (no class configured = no RBAC restriction).
+allow-everything behavior (no class configured = no RBAC restriction) —
+see the next section for the narrow, and only, way that state is reached.
+
+### Which class you get: identity and the default (#6701)
+
+The **in-process console shell's** class comes from the **OS credential of the
+invoking process**, never from the environment. "The CLI" unqualified was wrong
+here (#6706 review r11): the remote `cli` client has no class at all — its OS
+credential only renders the prompt (`cmd/cli/main.go` `resolveUsername`), and
+the gRPC listener it speaks to has no per-principal authentication yet (#5278),
+so nothing on that path makes an authorization decision. See **Scope** below. `pkg/osident.Current()` reads the **real uid**
+(`os.Getuid`) and resolves it through the passwd database; the resolved name
+is matched against `system login user <name>`. `pkg/daemon`
+`applyCLILoginClass` performs the lookup once, at shell start, and logs the
+outcome (identity, uid, resolved class, reason) so an operator locked out by
+their own config can see why in the journal.
+
+Before #6701 the identity was `os.Getenv("USER")` and a non-match was handed
+**`super-user`**. Both halves were exploitable, and either alone sufficed:
+every `system login user` is provisioned with a real shell account
+(`useradd -m -s /bin/bash`, #5278), so an operator restricted to
+`class read-only` could run `USER=nobody xpf` — or unset the variable — and
+receive the highest class in the system. The `!found` branch also promoted any
+OS account that merely existed on the box but was absent from `system login`.
+
+The decision, in order:
+
+| Caller | Class |
+|---|---|
+| resolved name matches a `system login user` with a class | **that class** |
+| **non-root** account listed with **no** class | `unauthorized` |
+| uid 0 **with** an explicit `system login user root class <c>` | **`<c>`** — an explicit restriction is honoured |
+| uid 0 listed with **no** class | `super-user` — an omission is not an instruction; see below |
+| uid 0, no matching `system login user` | `super-user` (Junos root default) |
+| OS account absent from `system login` | `unauthorized` |
+| **non-root** uid with no passwd entry (unidentifiable) | `unauthorized` |
+| **non-root** uid shared by several passwd accounts (ambiguous) | `unauthorized` — see below |
+| **non-root** uid, passwd database unreadable | `unauthorized` |
+| **uid 0** unidentifiable by any of those three | `super-user` — the root default; a class configured for an ALIAS is not applied |
+| no `system login` stanza at all | **unset** — legacy allow-everything |
+
+All three unidentifiable cases deny identically, but the journal line names
+which one it was: "has no passwd entry", "is shared by more than one passwd
+account", "the passwd database could not be read". They send the operator to
+three different fixes, and reporting one as another sends them hunting for an
+account that is in fact present.
+
+**Why uid 0 listed with no class is not denied, when a non-root account in the
+same shape is.** The two are different questions. For a non-root account
+`system login` is the authority on what it may do, and saying nothing is not
+permission. For uid 0 it is neither an instruction nor enforceable:
+`set system login user root authentication ssh-ed25519 "…"` is an ordinary way
+to give root a key and expresses no intent to restrict anything, so denying on
+it would demote the **console** shell to `unauthorized` — a lockout of the
+lifeline caused by a purely additive config. And uid 0 owns the config database,
+the daemon process and the on-disk secrets, so a CLI denial is advisory
+regardless. An **explicit** class on `user root` is a different matter and is
+honoured.
+
+**uid 0 restriction is advisory.** Honouring `system login user root class <c>`
+prevents accidents; it is not a containment boundary, because uid 0 can edit the
+config database directly. If uid 0 resolves through a passwd **alias** (a second
+passwd row for uid 0, the classic `toor`), the resolved name is consulted first
+and the literal `root` second, so an explicit restriction written for `root`
+still applies to the aliased identity rather than being silently skipped. When
+**both** rows exist the uid is ambiguous (below) and only the literal `root` is
+consulted, which is deterministic and still the console lifeline.
+
+**A uid shared by several accounts fails closed.** The kernel gives xpf a
+number, not a name. If `/etc/passwd` maps that number to more than one account —
+
+```
+admin:x:2001:2001::/home/admin:/bin/bash
+bob:x:2001:2001::/home/bob:/bin/bash
+```
+
+```
+set system login user admin class super-user
+set system login user bob   class read-only
+```
+
+— then bob's shell and admin's shell are indistinguishable to any consumer of
+the credential, and resolving the uid to "whichever passwd row comes first"
+(what `os/user` does) hands bob `super-user`. That is a privilege escalation
+**between two legitimate accounts**, so it is not disposed of by "a duplicate-uid
+passwd file is a broken host". xpf refuses to name such a caller: the identity is
+unresolved and the class is `unauthorized`. The fix is to give the accounts
+distinct uids.
+
+xpf never creates the situation itself — `reconcileSystemUsers` invokes
+`useradd` **without** `-o`, so a duplicate uid is rejected by the tool — but a
+pre-existing, hand-edited or directory-supplied alias is outside its control,
+and an authorization decision must not depend on that.
+
+uid 0 is exempt from the denial for the usual reason: `root` + `toor` is a
+supported layout, uid 0 is not a boundary xpf can enforce, and locking the
+console out over it would be the larger failure. An ambiguous uid 0 keeps the
+Junos root default and still honours an explicit `system login user root
+class <c>`.
+
+**Why the passwd database is read directly instead of through `os/user`.** The
+appliance binaries are built `CGO_ENABLED=0` (Makefile), which selects the Go
+standard library's pure-Go `os/user`. In that implementation `user.LookupId(uid)`
+returns the cached `user.Current()` when the uid matches — it always matches,
+since xpf asks about its own uid — and pure-Go `current()` **fabricates** a user
+from `$USER` and `$HOME`, with a nil error, whenever the real passwd lookup
+fails. On a box where the caller's uid has no passwd row (a minimal container,
+an NSS/LDAP outage, a deleted account, an unreadable `/etc/passwd`),
+`USER=admin HOME=/tmp cli` therefore resolved to the account name `admin` — the
+#6701 hole reopened one layer below the call sites #6701 audited.
+
+`pkg/osident` scans `/etc/passwd` itself instead. Under the shipped build that
+is exactly what the standard library would have done for any uid that HAS a row
+(pure-Go `os/user` reads the same file and consults no NSS), so resolved names
+are unchanged; what changes is that a uid **without** one is now unidentified
+rather than whatever the caller put in `$USER`. A cgo-enabled developer build
+loses NSS name resolution — which affects the RBAC **class decision**, not just
+the displayed prompt: an NSS-only account (LDAP, SSSD) resolves to unidentified
+and is denied. That is a narrowing for every **non-root** uid. At uid 0 it is a
+**promotion**, for the same reason as the table row above: an unnamed uid 0
+takes the root default, so losing the name of an aliased root that carried an
+explicit restrictive class hands it `super-user`. uid 0 is essentially always a
+local passwd row, so this corrects the claim rather than describing a reachable
+production regression, and the shipped build is `CGO_ENABLED=0` either way.
+`TestNoOsUserInIdentityResolution_6701` keeps `os/user` out of the package.
+
+The same narrowing reaches a second route worth naming explicitly. Host-account
+provisioning gates `useradd` on `id -- <name>` failing
+(`pkg/daemon/daemon_system.go`), so an operator account that exists only in a
+directory service never gets a local passwd row — and therefore now resolves to
+`unauthorized` on the CLI. This is sound: before #6701 that population was
+"authenticated" by `$USER`, which is to say not authenticated at all. An
+operator who needs CLI access for such an account should be given a local
+`system login user` entry.
+
+`unauthorized` is used rather than an unset class deliberately. The empty
+string is the legacy no-RBAC mode: `checkPermission` returns `nil` (allow
+everything) and `showConfigRedacted` returns `false` (render PSKs, SNMP
+communities and authentication-keys in cleartext). Failing closed therefore has
+to **name** a class. `unauthorized` resolves to an empty-but-present permission
+set, so `checkPermission` denies every command by name and `showConfigRedacted`
+masks secrets.
+
+That safety depends on one property in a different function: `resolveClassPerms`
+consults the system-defined table **first**. A config carrying
+`system login class unauthorized { permissions all; }` would otherwise turn the
+fail-closed default into a full-power one for every unidentifiable caller. Such
+a definition is rejected at commit (see built-in shadowing below), but the
+tolerant load / peer-sync path only warns, so the runtime precedence is what
+actually holds — pinned by
+`TestUnauthorizedClassCannotBeWidened_6701`.
+
+The uid-0 default is Junos parity and is the console lifeline: uid 0 already
+owns the config database, the daemon process and the on-disk secrets, so it is
+not a boundary xpf could enforce. It applies **only** when `system login` says
+nothing about root — an explicit `system login user root class <c>` wins,
+because a configured restriction silently ignored is exactly the defect class
+#6701 removes.
+
+**Scope.** This is the on-box CLI boundary. The gRPC listener
+(`127.0.0.1:50051`) still has no per-principal authentication, so a shell user
+who speaks gRPC directly bypasses `checkPermission` entirely — that is a
+separate, still-open defect (#5278) and is not addressed here. The remote `cli`
+client's prompt identity was moved to the same OS credential so that when
+#5278 wires per-principal auth it finds the identity already coming from the
+kernel, but the client is not itself an authorization boundary today.
+
+The class **name** is resolved once, at shell start, and is not re-evaluated
+mid-session. That matches Junos (your class is bound at login). The class's
+**permissions** are not bound: `resolveClassPerms` (`pkg/cli/permissions.go`)
+reads `store.ActiveConfig()` on every check, so a custom class's permission set
+is whatever the **currently active** config says.
+
+An earlier revision called that "not an escalation path" on the grounds that
+"changing `system login` requires `configure`, which none of the restricted
+classes hold". The premise is false for **custom** classes, which may carry
+`configure` (see below), and the conclusion does not follow. Measured by driving
+the real store and checker: a session bound to a custom class holding
+`[view configure]` is denied `request system reboot` and gets
+`showConfigRedacted == true`; after that same session commits
+`set system login class <its-own-class> permissions all`, the identical checks
+return **allowed** and **false** — secrets in cleartext — with no re-login.
+
+The accurate statement of the boundary is the asymmetry:
+
+| Change | Takes effect mid-session? |
+|---|---|
+| widening the bound class's permissions | **yes**, immediately |
+| narrowing the bound class's permissions | **yes**, immediately |
+| moving the user to a different class | no — the class NAME is bound |
+| deleting the user from `system login` | no — same reason |
+
+The widening row is not a boundary being crossed that could not be crossed
+otherwise: a class holding `configure` can already author a `super-user` account
+and use it. What is worth stating plainly is that it happens **immediately and
+in the same session**, and that the narrowing row is what makes a mid-session
+revocation of a class's permissions actually effective.
+
+### Where the class is enforced — per control surface (#5561)
+
+The class evaluator is shared (`config.ResolveClassPermissions` /
+`config.ClassHasPermission`), but each control surface must *call* it, and
+until #5561 only the CLI did. That mattered because a login user is a real
+shell account — the daemon creates each one with `useradd -m -s /bin/bash` —
+so the holder can bypass a CLI-side check simply by not using the CLI.
+
+| Surface | Enforcement |
+|---|---|
+| Console / SSH CLI | `checkPermission`, **client-side** — it runs in the CLI process, so it binds only callers who use the CLI. |
+| HTTP REST (`127.0.0.1:8080`) | **Server-side** since #5561: the mutation surface derives the caller's UID from the kernel socket table, maps it to this account, and evaluates the class before the handler runs. See `pkg/api/README.md` "Server-side authorization". |
+| gRPC (`127.0.0.1:50051`) | **Not yet enforced — #5278 is open.** The listener installs no per-principal check, so a login-class holder can still drive privileged RPCs directly. The shared layer (`pkg/authz`) is built for two consumers; the gRPC leg is an interceptor that derives the same principal and calls the same `authz.Authorize`. |
+
+On the REST surface the class is evaluated against a **server-derived**
+identity, so it is a real boundary rather than an advisory one:
+
+- The caller's UID comes from the kernel (`/proc/net/tcp{,6}`), not from
+  anything the request carries, and is fixed at connect rather than at request
+  time so the caller cannot choose when — or whether — it resolves. Concurrent
+  lookups share one table read, so the identity does not cost a kernel hash-table
+  walk per connection.
+- **UID 0 is authorized unconditionally** — root owns the config DB on disk, so
+  a denial would be theater.
+- A local UID that is **not** a configured `system login user` is **denied** the
+  mutation surface. Note the contrast with the CLI, where an unset class means
+  "no restriction": on a network-reachable API the absence of a class means the
+  RBAC model says nothing about that account, which is a reason to deny. Grant
+  it explicitly with `set system login user <account> class <class>` if it needs
+  access.
+- A UID shared by **two passwd accounts** is denied on BOTH surfaces. The kernel
+  reports only the number, so the two callers are indistinguishable and naming
+  one of them would hand that account's class to the other. See "unidentifiable"
+  in the class table above — the REST gate and the CLI resolve this through the
+  same code since #6645, and a divergence here was a privilege escalation
+  between two legitimate accounts.
+- **The class table above governs both surfaces, with one exception**: the row
+  "uid 0 **with** an explicit `system login user root class <c>`" is honoured by
+  the CLI and NOT by the REST gate, which authorizes uid 0 unconditionally (see
+  "UID 0 is authorized unconditionally" above). Root can write the config
+  database directly, so the two are equivalent in effect; the table is the CLI's
+  answer, and this bullet is the REST caveat.
+- A local caller the server cannot identify is **denied**, and an `api-auth`
+  credential does not substitute for it. In fact **no caller this host can PLACE
+  ever reaches the credential check**: the credential speaks only for a caller
+  this host cannot place (the remote administrator #4047 requires it for). Read
+  "can place" rather than "is local" — a process in a container on this same box
+  has its own socket table and interface list, so it is local to the machine yet
+  unplaceable by the daemon, and the credential governs it. That is the design,
+  not a gap in it; `pkg/api/README.md` "Residuals" states the bound. Otherwise a
+  restricted account that also knew the shared secret could escape its class,
+  either by making its own identity unreadable or simply by not being in the
+  login model. That holds even for an address that appeared on this host a
+  moment ago — the "is this caller on our box" question is answered from a
+  cached snapshot for speed, but the answer that would let the credential speak
+  is re-derived from a fresh interface enumeration before it is acted on, so a
+  caller connecting from a just-added VRRP VIP or DHCP lease is still governed
+  by its class rather than by the shared secret.
+- A `system login user` whose **name the daemon would refuse to provision** is
+  denied. A strict commit rejects an invalid name at the schema, but the
+  tolerant load and peer-sync paths (#1960) downgrade that to a warning and keep
+  the stanza active, and account reconciliation then skips it — so the account
+  was never created by xpf. Handing that stanza's class to whatever OS account
+  happens to bear the name would grant authority from a config the runtime
+  declined to realize, so `config.LoginUserClass` applies the same validator and
+  resolves such a user exactly like an absent one. This cannot deny anyone xpf
+  actually provisioned: provisioning runs the identical check. If an operator
+  sees an unexpected denial here, the fix is to rename the user to a valid login
+  name and commit — which is also what makes the shell account appear.
+- Read-only endpoints, `/health` and `/metrics` are unaffected.
+- The authorization is re-made **after** the caller has supplied its request
+  body, not only when its headers arrive. A caller cannot hold a mutation open
+  on a stale verdict by dribbling the body: a `commit` demoting its class, or a
+  `delete system services web-management ... api-auth` revoking its credential,
+  reaches the request before the mutation runs. See `pkg/api/README.md`
+  "Every input to the decision is read after the last thing that can block".
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)
 
@@ -86,10 +359,12 @@ compile (`LoginClass.MappedPermissions`, consulted at runtime by
 
 Because xpf's runtime RBAC is **coarse** (view/clear/control/config/maintenance/
 all) it cannot faithfully represent every fine-grained Junos permission or the
-per-command allow/deny regexes. The mapping is therefore
+per-command allow/deny regexes. The **permission mapping** is therefore
 **accept-with-advisory** — the commit succeeds and the compiler emits a
 per-class advisory (`show system commit` / warnings) describing exactly what
-maps and what does not:
+maps and what does not. That is the treatment for everything below EXCEPT the
+restrictive `deny-commands` / `deny-configuration` regexes, which are refused
+outright (#5831, see the next section):
 
 - `all` / `super-user` → `super-user` (PermAll); `maintenance` → maintenance;
   `clear` → clear; `control` / `reset` → control; `configure` → configure;
@@ -110,14 +385,354 @@ maps and what does not:
   but NOT enforced** by the coarse gate (dropping a whitelist extension or a
   session-lifetime knob cannot make the class more permissive); the advisory
   names them.
-- **`deny-commands` / `deny-configuration` are blacklists** — because xpf does
-  not enforce them, the denied verbs stay **allowed**, so the class is **more
-  permissive than the Junos config**, not merely "unenforced". The advisory
-  states this explicitly as a `WARNING` so the operator knows the security
-  posture is weaker. Full per-command deny enforcement is a follow-up.
+- **`deny-commands` / `deny-configuration` are HARD-REJECTED at commit**
+  (#5831) — see below.
+
+### Restrictive regexes are refused, not accepted-and-ignored (#5831)
+
+The four regex sub-statements are **not symmetric**, and xpf treats the two
+halves differently:
+
+| Leaf | Junos direction | Effect of xpf ignoring it | xpf behavior |
+|---|---|---|---|
+| `allow-commands`, `allow-configuration` | **additive** — grants access *in addition to* the permission bits | class gets a **subset** of what was written — fail-**closed** | accepted, advisory |
+| `deny-commands`, `deny-configuration` | **restrictive** — subtracts from the permission bits | denied verbs stay **allowed** — fail-**open** | **rejected at commit** |
+
+Until #5831, a class carrying `deny-commands` committed cleanly and enforced
+nothing: an operator writing
+
+```
+set system login class limited permissions all
+set system login class limited deny-commands "request system zeroize"
+```
+
+held a config saying the verb was denied and a box on which it was allowed. A
+security restriction accepted as inert state is worse than a refused one, so
+the strict `commit` / `commit-check` path now **hard-rejects** the class
+(`validateLoginClassDenyStrict`). Express the restriction with a narrower
+`permissions` set instead. Note that Junos gives `allow-commands` precedence
+over `deny-commands`, so a class pairing them is a deny-with-exceptions and is
+rejected on the deny leaf alone — no allow leaf makes a deny leaf safe to drop.
+
+Rejection keys off the **presence** of the leaf, not its value. `deny-commands
+""` and a valueless `deny-commands` both flatten to the empty string, so a
+value test would wave them through — yet an empty POSIX regex matches every
+command, i.e. denies *everything*, the most restrictive thing an operator can
+write.
+
+Which leaves count as restrictive is decided by one table,
+`loginClassLeafRestrictive` (`pkg/config/compiler_login_deny.go`), and that
+table is what the compiler consults when recording presence — not a per-leaf
+`case` arm. Adding a row is therefore the only edit needed to gate a new
+restrictive leaf. This matters because Junos has several xpf does not model
+yet (`deny-hidden-commands`, `access-start` / `access-end`, `allowed-days`):
+each would be a fresh instance of the same fail-open the moment the schema
+learned to parse it. A test pins the table's key set against the schema in both
+directions, so a `class` leaf added without a classification reds the suite
+instead of silently defaulting to unrestricted.
+
+#### Tolerant path: fold to the repair floor
+
+On the **tolerant** load / peer-sync path the rejection is downgraded so an
+already-persisted or peer-synced config still boots (#1960 no-brick) — but a
+bare warning would preserve exactly the fail-open the strict gate rejects, so
+that path additionally **folds the class**
+(`foldLoginClassDenyToRepairableFloor`) to
+
+```
+{ view, configure }  ∩  the permissions the class already held
+```
+
+The operator asked for strictly less than `permissions` grants and xpf cannot
+compute how much less, so it resolves the ambiguity in the restrictive
+direction — **bounded by repairability**.
+
+Two properties:
+
+- **Never widens.** `view` / `configure` appear only if the class already held
+  that bucket (or held `all`, which subsumes both). A class that granted
+  nothing keeps granting nothing.
+- **Never folds below the repair floor.** `configure` is exactly what the
+  runtime gate requires to enter configuration mode, and there is no
+  per-statement gate inside it, so `configure` *is* the self-repair channel.
+  Taking it away is the one reduction that cannot be undone from the box.
+- **Folds every block that carries the class name**, not only the block the
+  deny leaf is written on — see below.
+
+Everything else — `clear`, `control`, `maintenance`, and `all` itself — is
+dropped. So the motivating example above (`permissions all` + `deny-commands
+"request system zeroize"`) really does lose the ability to zeroize.
+
+##### Duplicate class names
+
+A config may spell `class limited` twice. That splits the class into two
+blocks, and the fold deliberately narrows **both**:
+
+```
+system {
+    login {
+        class limited { permissions all; }                        # <- also folded
+        class limited { permissions [ view configure ];
+                        deny-commands "request system zeroize"; }
+        user root { class limited; }
+    }
+}
+```
+
+The reason is that the runtime resolves a **name**, not a block:
+`pkg/cli/permissions.go` `resolveClassPerms` walks the class list and returns
+the **first** entry whose name matches. Folding only the offending block leaves
+whichever *other* block the reader happens to pick holding its full permission
+set — `permissions all` above — so the deny statement is again attached to a
+class the box does not enforce. Both orderings failed open before this was
+fixed (#6838 review B1): with the deny on the first block a name-keyed
+last-wins lookup folded the wrong object, and with it on the second block
+folding exactly the right object still left `all` live on the first.
+
+Folding the cohort makes the outcome independent of the reader's tie-break
+rule, which is the property that has to hold. It cannot over-restrict a
+bystander either: the floor is an intersection, so a sibling block is only ever
+narrowed to what it already held. The per-class warning reports the union on
+each side — *at most* this much before, *at most* this much after — because the
+config does not say which block answers.
+
+**The fold SKIPS a class name that shadows a built-in.** The same
+built-in-first lookup that makes a shadowing definition inert (see *built-in
+shadowing* below) means `MappedPermissions` is never read for such a name — on
+the CLI or on the REST control surface, both of which go through the shared
+`config.ResolveClassPermissions` evaluator (#5561) — so there is nothing for the
+floor to narrow. Folding it anyway changed no
+behaviour and produced two claims that were **false**: the per-class warning
+said the class had been "folded from `{super-user}` to `{configure,view}`"
+while `request system zeroize` stayed allowed and secrets stayed in cleartext,
+and the #4304 advisory — the fold's other reader — turned from `mapped to
+{super-user}` into `mapped to {configure,view}`, which is precisely the
+sentence the #6701 warning beside it calls out as untrue. The fold therefore
+stays silent for these names and leaves both claims as #6701 found them; the
+#6701 warning already states the truth for the shape, and the strict path
+rejects the config through that gate. This is a per-*name* skip, so a
+non-shadowing class in the same config is still folded normally.
+
+**Which class the strict gate names.** A config may carry several offending
+classes; the strict error reports exactly one, chosen by **first appearance of
+the class NAME** — not by the first offending *block*. So `class alpha` defined
+first, `class beta` carrying a deny, then a second `alpha` block carrying one,
+reports `alpha`. Both orderings are safe (both reject, and the message names
+the class *and* the offending leaf), but the choice is an operator-facing
+message and is pinned as a contract rather than left to the collection order.
+
+> [!WARNING]
+> **The fold reduces blast radius; it does not enforce the statement.** A
+> RETAINED bucket is a bucket where the deny does nothing, and the floor
+> retains two of them:
+>
+> - `configure` — so `deny-configuration <anything>` is a complete no-op. xpf's
+>   coarse model has only two configuration states, all or none, and "none" is
+>   the state that strands repair, so the tolerant path keeps "all".
+> - `view` — which gates `show`, `ping`, `traceroute` and `monitor`, so a
+>   `deny-commands` naming any of those (e.g. `deny-commands "show interfaces"`)
+>   is *equally* a complete no-op.
+>
+> Only denies aimed at `clear`, `control` or `maintenance` are actually stopped,
+> and then bluntly — the whole bucket goes, not the named command. **The
+> enforcement that exists is the strict gate refusing every commit** until the
+> statement is removed. The per-class warning names the retained set explicitly
+> so you can see which levels are unrestricted on your box.
+
+**Why not fold to view-only.** It would strand the box. `pkg/daemon`
+assigns the *configured* class to any OS user whose name matches a `system
+login user`, and `root` is an accepted user name — account provisioning skips
+root, the CLI class assignment does not. So this previously-accepted config
+
+```
+set system login class noc-admin permissions [ view configure ]
+set system login class noc-admin deny-configuration "security policies"
+set system login user root class noc-admin
+```
+
+binds the **console** operator to `noc-admin`. A view-only collapse would take
+`configure` away from the only login that could delete the offending statement,
+while the strict gate rejects every commit until it *is* deleted. A
+configure-only class would collapse to an empty permission set, which is worse.
+Recovery would need an out-of-band shell. Built-ins-first lookup in
+`resolveClassPerms` does not rescue this: it only decides which table answers
+for a class *name*, not that any actual login is bound to a built-in.
+
+#### Recovery if you already committed such a config
+
+An upgraded box that loads a persisted config carrying these statements emits
+the warning above and keeps the class usable for repair:
+
+1. Log in and run `configure` (retained by the fold).
+2. `delete system login class <name> deny-configuration` (and/or
+   `deny-commands`).
+3. `commit` — this is the first commit the strict gate lets through.
+
+Nothing else about the box can be committed until that statement is gone; that
+is the forcing function, not an accident.
+
+Full per-command deny **enforcement** (matching semantics plus coverage of
+every command and configuration dispatch point) remains open on #5831; this is
+the fail-closed half only.
 
 An undefined class (referenced by a user but never defined, and not a built-in)
 still **fails closed** at commit.
+
+A custom class **may not shadow a system-defined name** (#6701). At runtime
+`resolveClassPerms` consults `LoginClassPermissions` **first**, so a definition
+like
+
+```
+set system login class super-user permissions view
+```
+
+is completely **inert** — the built-in `[PermAll]` wins and the user holds every
+permission — while the compile advisory reported `mapped to xpf coarse
+permissions {view}`, i.e. told the operator the narrowing had taken effect. That
+is the same "configured restriction silently absent in the permissive direction"
+shape as the identity defect above, so a shadowing definition is now
+**hard-rejected at commit** naming the collision, and downgraded to a warning on
+the tolerant load / peer-sync path. Built-in-first precedence itself is
+deliberately unchanged: inverting it would let
+`class read-only permissions all` **escalate** a built-in, which is strictly
+worse. Pick a distinct class name, or reference the built-in directly.
+
+Inertness is why the #5831 deny fold skips these names on the tolerant path
+(above): nothing it could narrow is ever read, so folding one would only add a
+second, false narrowing claim next to the warning above.
+
+> **Compatibility break.** The system-defined names are `super-user`,
+> `operator`, `read-only`, `config-viewer` and `unauthorized`. A migrated vSRX
+> config that defines a **custom** class under one of those names — most
+> plausibly `config-viewer`, which reads like an ordinary site-defined name and
+> appears as one in this repository's own vSRX excerpt
+> (`docs/junos-config-display-reference.md`) — now fails strict import and the
+> next commit. This is intended: on Junos that definition was live, on xpf it
+> was already inert, and the old silence is exactly the defect. **Upgrade boot
+> does not brick** — the tolerant load path warns and keeps running — so the
+> break surfaces on the operator's next `commit` / `load override`, with the
+> collision named. Rename the class (`site-config-viewer`) and update the
+> `system login user <name> class <c>` references, or drop the definition and
+> reference the built-in.
+
+**Both gates are evaluated for BOTH cluster nodes.** The packed-body gate and
+the shadowing gate run **before** apply-group expansion and evaluate the
+effective view of node 0 **and** node 1. Without that, a body scoped to the peer
+
+```
+groups {
+    node1 { system { login { class super-user { permissions view; } } } }
+}
+apply-groups "${node}";
+```
+
+was stripped from node 0's view before either gate ran, so the commit passed on
+node 0; the standby then ingested the config through `Store.SyncApply`, which is
+the **tolerant** path and only warns. The stanza was live on node 1 with no
+strict check anywhere in the cluster. Now whichever node commits rejects it, and
+the verdict is identical on both. A body staged in a group that no
+`apply-groups` references stays inert and is not rejected — it renders on no
+node. (Same doctrine as the QinQ / vlan-map / unit-alias gates, and the
+AST-layer analogue of the peer-effective source-NAT replay in
+`compiler_peer_effective_snat.go`.)
+
+### Write the body as a block or as `set` — never packed on the line (#6662)
+
+Junos accepts a statement written on the instance line; xpf compiles the body
+only from a **nested block** or a flat **`set`** statement:
+
+```
+system { login { user alice { class ops; } } }      # OK — class = "ops"
+set system login user alice class ops               # OK — class = "ops"
+system { login { user alice class ops; } }          # REJECTED at commit
+```
+
+Before #6662 the third form compiled a user with an **empty class** and the
+commit **succeeded**. The mechanism is documented in
+`docs/config-schema.md` ("Packed statements"): `namedInstances` resolves the
+instance name across both AST shapes but leaves the body on `Keys`, and the
+login compiler walks `.Children`, which is empty.
+
+An empty class is precisely the legacy allow-everything mode, so a
+`class read-only` operator hand-migrating a vSRX config got a CLI that allowed
+every command and rendered secrets in cleartext — with `show configuration`
+echoing their intent back. Rejecting is load-bearing because the downstream
+safety nets all read fields the packed drop leaves empty. The `deny-commands` /
+`deny-configuration` gate above is the sharpest case: it keys off
+`LoginClass.DenyLeavesPresent`, so a packed body means the commit it would have
+**refused** is accepted instead, and the restriction the operator wrote is
+discarded without a word. The field the bug empties is the field the check
+reads.
+
+This applies to the whole stanza, at every level:
+
+| Statement | Packed spelling | Result |
+|---|---|---|
+| `login class <n>` — `permissions`, `idle-timeout`, `allow-commands`, `deny-commands`, `allow-configuration`, `deny-configuration`, `login-alarms`, `login-tip` | `class ops permissions view;` | **rejected** |
+| `login user <n>` — `uid`, `class`, `authentication` | `user alice class ops;` | **rejected** |
+| `login user <n> authentication` (a block) written inline inside a nested user body | `user alice { authentication ssh-rsa "…"; }` | **rejected** |
+| the instance on the **`login`** statement line | `system { login user alice class ops; }` | **rejected** |
+| `login` itself on the **`system`** statement line | `system login user alice class ops;` | **rejected** |
+
+#### The `system` and `login` lines too (#6706)
+
+The two ANCESTOR levels of the path drop the same way, and they were the
+dangerous ones. `system login` compiles only when the path descends into a
+nested block at **every** step:
+
+```
+system { login { user alice { class ops; } } }   # OK
+system { login user alice { class ops; } }       # REJECTED — instance on the `login` line
+system login { user alice { class ops; } }       # REJECTED — `login` on the `system` line
+system login user alice class ops;               # REJECTED — the whole path on one line
+```
+
+Before #6706 all three of the rejected forms **committed green** and compiled
+nothing. The cost differs by level, and the message says which:
+
+| Packed at | Compiles to | Runtime |
+|---|---|---|
+| the instance line | a user with an **empty class** | fail-**closed**: `ResolveLoginClass` maps it to `unauthorized` |
+| the `login` line | `System.Login` present but **empty** | fail-**closed** for non-root (`unauthorized`), root keeps its default |
+| the `system` line | `System.Login == nil` | fail-**closed** since #6706: `LoginDroppedByPacking` suppresses the legacy early return, so a non-root caller gets `unauthorized` and root keeps its default. (Before #6706 this row WAS fail-OPEN — empty class, every command allowed, secrets in cleartext.) It applies to content-free prefixes too, e.g. `system login;`; whether it should is #6972 |
+
+At every level, zero configured users also means `reconcileAbsentLoginUsers`
+sees an empty desired set and **deprovisions every xpf-managed operator
+account** on the next apply.
+
+`system login;` and `system login user;` name no user and no class, so there is
+no authored instance to report as dropped and they are **accepted** — rejecting
+them would be an outage of its own. They are **not** equivalent between the two
+spellings, though, and an earlier revision said they "declare nothing in either
+spelling", which is false (#6706 review r11): `system { login; }` compiles a
+non-nil empty `LoginConfig` and denies every non-root caller, while the packed
+`system login;` compiles `System.Login == nil` and reaches the legacy
+allow-everything mode. Deactivated config (`inactive:`) is pruned before any
+gate runs and is unaffected.
+
+The tolerant load / peer-sync path **warns** instead of rejecting (#1960
+no-brick), so a node that persisted such a config under an older binary still
+boots. An earlier revision claimed the resolver kept that from being an RBAC
+hole because "a matched user with an empty class resolves to `unauthorized`".
+That is true only of the `login`-line packing, where `System.Login` is non-nil
+but empty. At the `system` line the stanza compiles to **nil**, there is no
+matched user, and `applyCLILoginClass` used to take its
+`cfg.System.Login == nil` early return — leaving the shell with **no class at
+all**: every command permitted and secrets in cleartext, on a config that reads
+as restrictive.
+
+What closes it is `Config.System.LoginDroppedByPacking` (#6706 review r11): the
+compiler records that a `system login` path was authored packed — for every
+packed shape, including the two short prefixes above that the gate deliberately
+does not report — and `applyCLILoginClass` refuses the legacy unset-class mode
+when it is set, resolving through `ResolveLoginClass` instead. Non-root callers
+get `unauthorized`; uid 0 keeps the console lifeline. A config that never
+configured RBAC is untouched: the flag is false, the early return still fires,
+and the legacy contract is unchanged.
+
+`login-alarms` and `login-tip` are accepted by the grammar but have no compiler
+arm in **either** spelling — a pre-existing accept-but-ignore gap, not a packed
+drop.
 
 ### Command-to-permission mapping
 

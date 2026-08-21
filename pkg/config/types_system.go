@@ -33,8 +33,42 @@ type SystemConfig struct {
 	DHCPServer         DHCPServerConfig
 	SNMP               *SNMPConfig
 	Login              *LoginConfig
-	RootAuthentication *RootAuthConfig
-	Archival           *ArchivalConfig
+	// LoginDroppedByPacking records that the candidate DID author a `system
+	// login` path but wrote it packed onto an ancestor statement line, so the
+	// compiler dropped the stanza (#6662/#6706). It is NOT a finding count and
+	// NOT a commit verdict — the packed gate owns those. It is the one bit
+	// pkg/daemon needs to tell two states apart that otherwise both arrive as
+	// `Login == nil`:
+	//
+	//   - nothing configured RBAC at all -> pkg/cli's legacy unset-class mode,
+	//     which permits every command and renders secrets in cleartext. That
+	//     contract is deliberate (permissions.go) and must not change.
+	//   - RBAC WAS configured and compiled away -> the same nil, reached from a
+	//     config that reads as restrictive. Landing there opens the box.
+	//
+	// The flag is set for EVERY packed `system login` ancestor path, including
+	// the short prefixes the gate deliberately does not report (`system login;`,
+	// `system login user;`). Those commit clean by design — rejecting them
+	// would be a new rejection of config that master accepts — but they are not
+	// inert: the NESTED spelling of the same text compiles a non-nil empty
+	// LoginConfig and denies every non-root caller, while the packed spelling
+	// compiles nil and permits everyone. Reporting is the gate's job; making
+	// the two spellings agree at RUNTIME is this flag's.
+	//
+	// It matters most on the TOLERANT ingress (Store.Load at boot,
+	// Store.SyncApply from a peer), where the #1960 no-brick doctrine downgrades
+	// the packed finding to a warning and KEEPS the config.
+	//
+	// It is NOT only the tolerant path (corrected, #6706 review r11). An
+	// earlier revision said "strict commit rejects, so on that path the flag
+	// is never read". Strict rejects the prefixes that NAME something, but it
+	// ACCEPTS the content-free ones — `system login;`, `system login user;` —
+	// because the reporting gate deliberately does not report a prefix naming
+	// nobody. Those commit strictly AND set this flag, so a strict commit is a
+	// live path for it, not one where it is dead.
+	LoginDroppedByPacking bool
+	RootAuthentication    *RootAuthConfig
+	Archival              *ArchivalConfig
 	// MasterPassword is a misnomer kept for the Junos token: it holds the
 	// `system master-password pseudorandom-function <fn>` value, i.e. the PRF
 	// ALGORITHM-SELECTOR NAME (e.g. hmac-sha256), NOT key material. The actual
@@ -717,18 +751,52 @@ type LoginConfig struct {
 // (view/clear/control/config/maint/all, types_system.go LoginClassPermission).
 // So xpf recognizes the class (a valid config commits instead of being
 // hard-rejected at the `user ... class` enum) and maps the whole-box Junos
-// permission tokens onto the nearest coarse bucket. Fine-grained
-// allow-commands / deny-commands / idle-timeout are recorded but NOT enforced
-// by the coarse gate; the compiler emits an advisory saying so.
+// permission tokens onto the nearest coarse bucket.
+//
+// The four regex sub-statements are NOT symmetric (#5831):
+//
+//   - allow-commands / allow-configuration are ADDITIVE in Junos — they grant
+//     access BEYOND the permission bits. Ignoring an additive grant can only
+//     ever hand the class LESS than the operator wrote, so they stay
+//     recognized-but-not-enforced with an advisory (fail-closed), as does the
+//     idle-timeout session-lifetime knob.
+//   - deny-commands / deny-configuration are RESTRICTIVE — they subtract from
+//     the permission bits. Ignoring them hands the class MORE than the
+//     operator wrote, so they are hard-rejected at commit
+//     (validateLoginClassDenyStrict) and, on the tolerant load / peer-sync
+//     path, fold the class down to the REPAIR FLOOR — {view, configure}
+//     intersected with what the class already held
+//     (foldLoginClassDenyToRepairableFloor). Not to view-only: the configured
+//     class can be bound to the console login, and a class that cannot enter
+//     `configure` cannot delete the statement that is blocking every commit.
 type LoginClass struct {
 	Name               string
 	Permissions        []string               // raw Junos permission tokens as written
 	MappedPermissions  []LoginClassPermission // coarse xpf perms derived from Permissions
 	IdleTimeout        int                    // minutes; recognized, not enforced
-	AllowCommands      string                 // regex; recognized, not enforced
-	DenyCommands       string                 // regex; recognized, not enforced
-	AllowConfiguration string                 // regex; recognized, not enforced
-	DenyConfiguration  string                 // regex; recognized, not enforced
+	AllowCommands      string                 // regex; additive, recognized, not enforced
+	DenyCommands       string                 // regex; restrictive — see DenyLeavesPresent
+	AllowConfiguration string                 // regex; additive, recognized, not enforced
+	DenyConfiguration  string                 // regex; restrictive — see DenyLeavesPresent
+
+	// DenyLeavesPresent records which RESTRICTIVE regex leaves the operator
+	// actually WROTE, in config order, independent of their value (#5831).
+	//
+	// It exists because the value alone cannot answer that question: the
+	// parser compiles `deny-commands ""` and a bare valueless `deny-commands`
+	// to the SAME empty string as an absent leaf (both AST shapes retain the
+	// leaf node — Keys=["deny-commands",""] and Keys=["deny-commands"] — but
+	// nodeVal flattens each to ""). A quoted-empty regex is not a harmless
+	// no-op: an empty POSIX regex matches at every position, so in Junos it
+	// denies EVERY command — the single most restrictive thing an operator can
+	// write, and therefore the most dangerous one to silently drop. Gating on
+	// `DenyCommands != ""` would wave exactly that config through, so the gate
+	// reads this presence list instead.
+	//
+	// Populated by compiler_system.go from loginClassLeafRestrictive
+	// (compiler_login_deny.go) rather than from a per-leaf `case` arm, so
+	// classifying a new restrictive leaf is the only edit needed to gate it.
+	DenyLeavesPresent []string
 }
 
 // mapJunosPermissions folds a custom login class's Junos permission tokens onto

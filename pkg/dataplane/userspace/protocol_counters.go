@@ -21,6 +21,16 @@ type SourceNATPoolStatus struct {
 	AllocationsTotal               uint64 `json:"allocations_total,omitempty"`
 	ReusesTotal                    uint64 `json:"reuses_total,omitempty"`
 	ExhaustionTotal                uint64 `json:"exhaustion_total,omitempty"`
+	// #4800: acquisitions of this pool's residual live-state mutex on the
+	// helper's production allocate/reserve/release/rollback/GC paths, and
+	// the subset that found it already held by another worker. The
+	// connection-rate harness reads the PAIR: a contended count without
+	// its denominator cannot tell "the allocator mutex saturated" from
+	// "the allocator ran hot but never blocked". Zero from an older helper
+	// that predates the counters. JSON tags MUST match the Rust serde
+	// rename(...) exactly (protocol/nat.rs).
+	LiveLockAcquisitionsTotal uint64 `json:"live_lock_acquisitions_total,omitempty"`
+	LiveLockContendedTotal    uint64 `json:"live_lock_contended_total,omitempty"`
 }
 
 type CoSInterfaceStatus struct {

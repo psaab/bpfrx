@@ -517,6 +517,14 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// The #6662 packed-login-body gate and the #6701 built-in-class-shadow gate
+	// used to run here, on the ALREADY-EXPANDED single-node view. They now run
+	// PRE-EXPANSION as both-node unions from compileConfigWithOpts /
+	// compileConfigForNodeWithOpts (see compiler_system_login_gates.go), because
+	// the single-node view let a `groups node1` + `apply-groups "${node}"` body
+	// bypass both gates entirely on the committing node and reach the peer
+	// through the tolerant sync path (#6706 review blocker).
+
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)
 	warnings = append(warnings, trackWarnings...)

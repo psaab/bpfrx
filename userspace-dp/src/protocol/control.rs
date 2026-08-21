@@ -38,7 +38,57 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// zones dropped from the scope. A compatibility extension that changes
 /// deny/reject COVERAGE must not be silently ignorable under an unchanged
 /// protocol version.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 4;
+///
+/// v5 (#6722): the per-interface EGRESS zone is decided by the Go builder and
+/// carried in `InterfaceSnapshot::egress_zone`; the `reth_projection` field the
+/// v4 contract carried is GONE. A DELETION cannot ride an unchanged version the
+/// way an additive field can: at v4 two binaries built either side of the change
+/// both advertise 4 and read the same bytes differently.
+///
+/// MEASURED rather than argued — the v4 Go builder's rows fed to the v5 helper
+/// on the reference cluster (`docs/ha-cluster-userspace.conf`, node 0) resolve
+/// egress zone 0 for BOTH ifindex 24 and ifindex 25, where origin/master and the
+/// v5 pair resolve `lan` and `wan`. Ifindex 25 loses a zone even the pre-#6722
+/// helper resolved, so the mixed pairing is strictly worse than either endpoint.
+/// Under `default-policy deny-all` that is a silent transit outage carrying a
+/// version number both sides agree on.
+/// v5 (#5619 / #6691): `InterfaceSnapshot.secure_tunnel` is AUTHORITATIVE over
+/// AF_XDP binding admission — `include_userspace_binding_interface` refuses a
+/// candidate on it (server/helpers/planning.rs). A helper that predates the
+/// field leaves it `false` and plans the xfrmi anyway, and because
+/// `replan_bindings_from_candidates` takes the GLOBAL MINIMUM queue count and
+/// an xfrm interface has exactly ONE RX queue, that re-plans EVERY physical
+/// interface on the box onto one queue and one worker — the #3091
+/// single-worker regression, on a config the new control plane believes is
+/// safe. Additive-and-ignorable is exactly the shape #5488 was: a new field
+/// that changes how existing bytes behave needs the version, not just the tag.
+///
+/// The bump alone only makes the old helper REFUSE the snapshot and keep
+/// forwarding its previous-good image, so it is paired with
+/// `ensureSecureTunnelProtocolLocked` (pkg/dataplane/userspace/
+/// manager_compile.go), which disarms that helper and aborts the commit.
+///
+/// v6 (#6691 round 9): the REFUSAL RULE over that same field changed from "any
+/// owning row calls this netdev unbindable" to "every owning row does"
+/// (`snapshot_refuses_parent_netdev`). No field moved — the SEMANTICS of the
+/// existing rows did, which is the case an unchanged version number cannot
+/// express: a v5 helper and a v6 control plane both say "5" and disagree about
+/// which netdevs may be bound.
+///
+/// v7 (#6691 round 10): `FabricSnapshot.parent_unbindable` is AUTHORITATIVE
+/// over whether a fabric parent netdev may be bound. A fabric member needs no
+/// interface stanza, so the parent commonly has no row to carry the
+/// device-level flags; a v6 helper decodes the absent field to `false` and
+/// plans an AF_XDP binding on a netdev the control plane refused. The reachable
+/// shape is a live xfrmi under a slot-shaped name used as a fabric member: one
+/// RX queue, global-minimum queue planning, #3091 again.
+/// v8 (integration of #6722 and #6691): both branches independently bumped this
+/// constant for DIFFERENT wire changes — #6722 to 5, #6691 to 7. The merged wire
+/// carries BOTH contracts and so matches NEITHER value. Leaving it at either is
+/// precisely the collision both comments below describe: a helper built from one
+/// branch alone advertises the same number and reads the rows differently. 8 was
+/// never shipped by either side, so no mixed pairing can agree on it by accident.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 8;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level
@@ -309,6 +359,46 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "session_publish_errors_total", default)]
     pub session_publish_errors_total: u64,
+    /// #4800: cross-worker contention accounting for the per-new-flow
+    /// install path, so a connection-rate run can name the saturated
+    /// synchronization point instead of inferring one from a flattened
+    /// new-flows/sec curve.
+    ///
+    /// Read as pairs: `..._lock_contended_total / ..._lock_acquisitions_total`
+    /// is the publish leg's blocked fraction, and
+    /// `session_replication_lock_contended_total / session_replication_enqueued_total`
+    /// the replication leg's. `session_replication_enqueued_total /
+    /// session_replication_upserts_total` recovers the N-way sibling
+    /// fan-out. `session_replication_queue_depth_max` is a monotonic
+    /// high-water gauge, not a counter — do not `rate()` it.
+    ///
+    /// The NAT-allocator leg is per pool and rides `source_nat_pools`
+    /// (`live_lock_acquisitions_total` / `live_lock_contended_total`)
+    /// rather than these process-global fields. All additive / defaulted
+    /// for backward compatibility.
+    #[serde(rename = "shared_session_publishes_total", default)]
+    pub shared_session_publishes_total: u64,
+    #[serde(rename = "shared_session_publish_lock_acquisitions_total", default)]
+    pub shared_session_publish_lock_acquisitions_total: u64,
+    #[serde(rename = "shared_session_publish_lock_contended_total", default)]
+    pub shared_session_publish_lock_contended_total: u64,
+    #[serde(rename = "session_replication_upserts_total", default)]
+    pub session_replication_upserts_total: u64,
+    #[serde(rename = "session_replication_enqueued_total", default)]
+    pub session_replication_enqueued_total: u64,
+    #[serde(rename = "session_replication_lock_contended_total", default)]
+    pub session_replication_lock_contended_total: u64,
+    /// #4800: sum of the per-call deepest sibling-queue depth. Divided by
+    /// `session_replication_upserts_total` over the same window this is the
+    /// MEAN worst-sibling depth per replicated flow — the differenceable
+    /// backlog statistic. The `_max` below is a process-lifetime high-water
+    /// that CANNOT be differenced (it never falls, so a zero delta is
+    /// ambiguous and the absolute value stays elevated forever after one
+    /// spike) and is therefore operator context only, never a verdict input.
+    #[serde(rename = "session_replication_queue_depth_sum", default)]
+    pub session_replication_queue_depth_sum: u64,
+    #[serde(rename = "session_replication_queue_depth_max", default)]
+    pub session_replication_queue_depth_max: u64,
     /// #2244: total failed `dnat_table` reverse-SNAT BPF-map publishes
     /// summed across worker bindings. The `dnat_table` is the reverse
     /// lookup the embedded-ICMP NAT path consults to map an inbound ICMP

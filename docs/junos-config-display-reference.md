@@ -631,6 +631,18 @@ claude@vsrx-bert> show configuration | compare rollback 1
 `| compare` with no argument compares candidate vs. active (useful in
 configuration mode).
 
+> **Note (#6701).** The `config-viewer` class in the excerpt above is a
+> **custom** definition captured from a real vSRX. `config-viewer` is a
+> system-defined class in xpf (`super-user`, `operator`, `read-only`,
+> `config-viewer`, `unauthorized`), and a custom definition that shadows a
+> built-in is now **rejected** at strict import / commit — on xpf it was always
+> inert, because `resolveClassPerms` consults the built-in table first, and the
+> old silence reported a narrowing that never applied. Upgrade boot stays
+> lenient and does not brick; the rejection surfaces on the next commit. This
+> transcript is preserved verbatim as a record of vSRX output — do not copy the
+> class definition into an xpf config. See `docs/system-login.md` ("Compatibility
+> break").
+
 ---
 
 ## 3. `| display` Sub-Options

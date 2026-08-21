@@ -70,7 +70,7 @@ func (s *Server) policySchedulerActiveState() (state map[string]bool, ok bool) {
 	if s == nil || s.dp == nil {
 		return nil, false
 	}
-	p, isProvider := s.dp.(policySchedulerStateProvider)
+	p, isProvider := s.dpProbe().(policySchedulerStateProvider)
 	if !isProvider {
 		return nil, false
 	}

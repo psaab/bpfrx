@@ -723,13 +723,50 @@ const MaxSourceNATPoolPrefixHosts = 65536
 // (`203.0.113.1/garbage`), or an over-capacity prefix (`/15`, `10.0.0.0/8`, a
 // v6 prefix shorter than `/112`) — makes the Rust allocator return false for
 // the member and mark the pool `InvalidPool`, so the Go grammar must reject it
-// too. netip.ParsePrefix (like the Rust `IpNet` parse) accepts a non-canonical
-// prefix with host bits set; the runtime masks to the network base, so the Go
-// side counts hosts off the prefix LENGTH exactly as Rust does.
+// too. netip.ParsePrefix accepts a non-canonical prefix with host bits set; the
+// runtime masks to the network base, so the Go side counts hosts off the prefix
+// LENGTH exactly as Rust does.
+//
+// GRAMMAR PARITY (#6812 F1 round 3). "Mirrors expand_pool_address" is a claim
+// about two PARSERS agreeing, and it is not established by sharing this
+// predicate between two Go call sites — that only makes the two GO sites agree.
+// A measured differential over both real parsers found the two sides disagreed
+// on six inputs, in both directions:
+//
+//   - `010.0.0.0/24` and its siblings (a leading-zero IPv4 octet inside a CIDR,
+//     including the embedded-v4 form `::ffff:010.0.0.0/120`). netip rejects a
+//     leading-zero octet; the Rust CIDR branch used to parse via `IpNet`, whose
+//     hand-rolled octet reader accepts up to three digits with any leading
+//     zeros, so the dataplane expanded a working 256-address allocator for a
+//     pool this predicate stamped `invalid_pool`. Closed in the RUNTIME (round
+//     3): expand_pool_address now parses its address half with the same
+//     `std::net::IpAddr` its bare branch always used, so the ambiguous spelling
+//     is InvalidPool on both sides — the verdict this predicate already gave.
+//     Widening Go instead would have blessed an octal-confusion spelling at
+//     commit, and mirrored a third-party crate's accident as policy.
+//   - `fe80::1%eth0` (a zone qualifier on a BARE member). netip.ParseAddr
+//     carries a zone; std::net::IpAddr has no zone model and refuses it. Closed
+//     HERE, by the zone check below: the CIDR form was already refused (netip
+//     .ParsePrefix rejects a zone outright), so only the bare form diverged.
+//     The pool-level reason is unchanged — SourceNATPoolUnusableReason writes
+//     the specific #5875 `zone_scoped_pool_address` after this clause — and so
+//     is the strict message, because validateSourceNATPoolAddressScopeStrict is
+//     registered BEFORE the grammar gate in both runUniformGates and the
+//     peer-effective SNAT gate set.
+//
+// The table that decides both is ONE file — userspace-dp/tests/fixtures/
+// snat_pool_grammar_v1.json — read by TestPoolAddressGrammarMatchesDataplane_6812
+// here and by nat_pool_grammar_parity_fixture (userspace-dp/src/nat/
+// tests_aggregate_budget.rs) through the real expand_pool_address. Neither side
+// keeps a copy, so the next divergence reds a test instead of surviving to a
+// review round.
 func sourceNATPoolAddressReason(addr string) (string, bool) {
 	if strings.Contains(addr, "/") {
 		p, err := netip.ParsePrefix(addr)
 		if err != nil {
+			if hint := canonicalPoolAddressHint(addr); hint != "" {
+				return leadingZeroPoolAddressReason(addr, hint), false
+			}
 			return "is not a valid CIDR (the dataplane cannot expand it and marks the pool unusable)", false
 		}
 		addrBits := 32
@@ -750,8 +787,19 @@ func sourceNATPoolAddressReason(addr string) (string, bool) {
 		}
 		return "", true
 	}
-	if _, err := netip.ParseAddr(addr); err != nil {
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		if hint := canonicalPoolAddressHint(addr); hint != "" {
+			return leadingZeroPoolAddressReason(addr, hint), false
+		}
 		return "is not a valid IP address (the dataplane cannot parse it and marks the pool unusable)", false
+	}
+	// #6812 F1 round 3: netip carries an IPv6 zone (`fe80::1%eth0`) that
+	// std::net::IpAddr — the parser expand_pool_address's bare branch uses —
+	// cannot represent, so accepting it here would claim a member is honorable
+	// that the dataplane refuses. The scoped CIDR form already failed above.
+	if a.Zone() != "" {
+		return "carries an IPv6 zone qualifier the dataplane cannot represent (it marks the pool unusable)", false
 	}
 	return "", true
 }
@@ -1253,8 +1301,172 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 		}
 		return fmt.Errorf("%s", msg)
 	}
+	// ruleDropped records whether ANY check in the static-NAT rule currently
+	// being validated has already reported a cause that drops the WHOLE rule.
+	// Reset at the top of each rule; read only when resolving the deferred
+	// emitMatchAddr suffixes at the end of that rule.
+	//
+	// #6673: it is set by `emit` itself rather than by a hand-maintained list
+	// of causes. `emit` IS the rule-dropped closure — its suffix is "rule
+	// dropped by dataplane until corrected" — so every present and future
+	// caller of it marks the rule automatically, and a check that reports a
+	// NARROWER effect correctly does not. The previous spelling mirrored the two
+	// match-side loops by hand and was wrong by three causes: the then-side
+	// parse, the then-side host-mask, and the /0 block-pair loop each drop the
+	// rule without touching a match address, so a warning about a non-selected
+	// match value announced that the selected value "stays active" while the
+	// rule was in fact dropped. Observing the emissions cannot drift the way
+	// mirroring them did.
+	//
+	// #6673 fold: "every caller of emit participates" is only worth as much as
+	// the ROUTING of each check, and two whole-rule-dropping checks were routed
+	// through emitSuffix instead — the block-pair-plus-port gate (#3202) and the
+	// out-of-range `match destination-port` gate (#5101). Both were worded as
+	// port-scoped and both really discard the entire rule, so "stays active" was
+	// emitted for a rule the dataplane installs nothing for. They now go through
+	// emit. The complete routing of the static-NAT rule loop, enumerated from
+	// the two lowering stages rather than from the messages:
+	//
+	//	WHOLE-RULE DROP -> emit (marks the rule)
+	//	  match destination-address unparseable   Rust parse_nat_prefix(external)
+	//	  then static-nat prefix unparseable      Rust parse_nat_prefix(internal)
+	//	  match destination-address non-host      Rust host/length/family check
+	//	  then static-nat prefix non-host         Rust host/length/family check
+	//	  /0 block pair                           Rust zero-length reject (#5658)
+	//	  block pair + any port                   Rust block-branch port reject (#3202)
+	//	  match destination-port out of range     Go buildStaticNATSnapshots (#5101)
+	//	NARROWER -> emitSuffix (does NOT mark the rule)
+	//	  match destination-port without mapped-port  installs port-scoped 1:1
+	//	  mapped-port present-but-malformed           installs plain 1:1, port dropped
+	//	  mapped-port without match destination-port  installs plain 1:1, port dropped
+	//	  nat64 source-pool non-host address          that pool entry only
+	//
+	// The three narrower port cases are Rust `(0,_)/(m,0)` folds in the host
+	// branch of from_snapshots, which build an entry rather than `continue`;
+	// each is argued at its own call site. `then static-nat inet` and IsNPTv6
+	// rules drop too, but the loop `continue`s past them before any emit, so no
+	// claim about them is ever made here.
+	//
+	// RESIDUAL — an inventory, not an example, because "one exception" invited
+	// the reader to assume the rest were covered. ruleDropped observes what THIS
+	// validator emits, so a rule-breaking cause it does not itself report leaves
+	// "stays active" standing. Both known cases, measured:
+	//
+	//   - EMPTY `then static-nat` target (a misspelled / unhandled target
+	//     keyword). rule.Then == "" so the then-side checks here are guarded off,
+	//     the Go lowering emits InternalIP: "" and Rust parse_nat_prefix("")
+	//     drops the whole mapping (pinned by tests_static.rs "a static-NAT rule
+	//     with an unparseable internal-ip must be dropped"). It IS reported — by
+	//     validateStaticNATThenTargetStrict (#4290), a SIBLING validator whose
+	//     emissions this flag cannot see. Not the "not checked at all" kind.
+	//   - CROSS-FAMILY host pair: `match destination-address 192.0.2.1/32` with
+	//     `then static-nat prefix 2001:db8::1/128`. Both sides parse and both are
+	//     host routes, so nothing here complains and the Rust host branch builds
+	//     an entry from a v4 external and a v6 internal. This one genuinely is
+	//     not checked at all, by any validator.
+	//
+	// Closing either needs a cross-validator verdict channel or a new rejection,
+	// not a wording change, so both are stated rather than papered over.
+	// selectedMatchInvalid narrows that: the rule-dropping cause was the
+	// SELECTED match address failing one of the match-side checks, so the
+	// complaint about another slot can name it as invalid rather than pointing
+	// vaguely at a different error. Set only by the emitMatchAddr addr ==
+	// selected path, and likewise observed rather than recomputed.
+	ruleDropped, selectedMatchInvalid := false, false
 	emit := func(msg string) error {
+		ruleDropped = true
 		return emitSuffix(msg, " (ignored: rule dropped by dataplane until corrected)")
+	}
+	// emitMatchAddr is emit for a complaint whose operand is ONE authored
+	// `match destination-address` value out of the list #6659 made visible.
+	//
+	// #6673: the plain `emit` suffix — "rule dropped by dataplane until
+	// corrected" — is FALSE for a value the compiler did not select. Only ONE
+	// value is ever lowered (rule.Match, the value nodeVal took from the last
+	// authored statement); a malformed value in any other slot never reaches
+	// the dataplane, so nothing is dropped and the rule installs and translates
+	// normally on rule.Match. Reporting it as a dropped rule tells the operator
+	// their published service is down when it is up, and the reverse mistake —
+	// staying silent — is what #6659 was fixing. Name the actual effect per
+	// value: the selected one really does drop the rule, a non-selected one is
+	// ignored on its own.
+	//
+	// #6673 follow-up: whether a non-selected value's complaint may promise that
+	// the selected value "stays active" depends on whether ANYTHING ELSE drops
+	// the rule — and some of those causes are checked AFTER these loops run.
+	// Without accounting for them the two loops contradicted each other on the
+	// same rule: with `destination-address bad-old; destination-address
+	// bad-selected;` the warning for bad-old announced that bad-selected "stays
+	// active", and the very next warning — for bad-selected, the value that IS
+	// selected — correctly said the dataplane drops the rule.
+	//
+	// So a non-selected complaint is emitted in place (preserving warning
+	// order) but with its suffix left BLANK, and the suffix is patched in at
+	// the end of the rule, once ruleDropped is final. That is what lets the
+	// verdict be OBSERVED from the emissions rather than mirrored by hand.
+	// Strict mode never defers: emitSuffix discards the suffix entirely when
+	// !lenient, and the first violation returns as the error, so deferring
+	// there would only risk changing which error is reported.
+	type deferredMatchAddrSuffix struct {
+		warningIdx int
+		selected   string
+	}
+	var deferredSuffixes []deferredMatchAddrSuffix
+	emitMatchAddr := func(addr, selected, msg string) error {
+		if addr == selected {
+			selectedMatchInvalid = true
+			return emit(msg)
+		}
+		if !lenient {
+			// Suffix is discarded in strict mode; report the violation now.
+			return emitSuffix(msg, "")
+		}
+		warnings = append(warnings, msg)
+		deferredSuffixes = append(deferredSuffixes, deferredMatchAddrSuffix{
+			warningIdx: len(warnings) - 1,
+			selected:   selected,
+		})
+		return nil
+	}
+	// matchAddrSuffix words the effect of a complaint about a match value the
+	// compiler did NOT select, given the rule's final verdict.
+	matchAddrSuffix := func(selected string, dropped, selectedInvalid bool) string {
+		// #6673: an authored-but-EMPTY slot can be the SELECTED value —
+		// `destination-address [ "" bogus ]` blanks the match, and nodeVal
+		// selects the blank. The "%q is, and it stays active" wording then
+		// renders as `"" is, and it stays active`, which translates nothing and
+		// reassures the operator about a rule that does not exist: rule.Match
+		// == "" lowers ExternalIP: "" and the Rust parse_nat_prefix("") returns
+		// None, so from_snapshots drops the whole mapping. Neither of the other
+		// two suffixes is true here — this value still is not the one that
+		// installs, but there is no surviving rule to keep active. Checked
+		// first because an empty selection names no value to quote.
+		if selected == "" {
+			return " (ignored: this value is not the one the rule " +
+				"installs — the selected match destination-address is EMPTY, so " +
+				"the rule is dropped by the dataplane regardless of this value)"
+		}
+		if selectedInvalid {
+			return fmt.Sprintf(
+				" (ignored: this value is not the one the rule installs — %q is, "+
+					"but that value is invalid too, so the rule is dropped by the "+
+					"dataplane regardless of this value)", selected)
+		}
+		if dropped {
+			// The selected match value is fine; something else about the rule
+			// — a then-side parse or host-mask failure, a /0 block pair — drops
+			// it. Do NOT blame the selected value here, and do not promise it
+			// stays active either. The cause is in another warning on the same
+			// rule.
+			return fmt.Sprintf(
+				" (ignored: this value is not the one the rule installs — %q is, "+
+					"but this rule is dropped by the dataplane anyway for a "+
+					"separate reason reported alongside this warning)", selected)
+		}
+		return fmt.Sprintf(
+			" (ignored: this value is not the one the rule installs — %q is, "+
+				"and it stays active; correct or remove the unused value)",
+			selected)
 	}
 
 	for _, rs := range cfg.Security.NAT.Static {
@@ -1295,11 +1507,85 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// blockPair / host-mask checks so an unparseable value reports its
 			// own (clearer) error rather than being skipped as "not a block
 			// pair".
-			if rule.Match != "" {
-				if _, _, _, parsedIP := natStaticPrefixInfo(rule.Match); !parsedIP {
-					if err := emit(fmt.Sprintf(
+			// #6659: validate EVERY authored destination-address, not just the
+			// first. Before #6659 the compiler read this leaf with nodeVal, so
+			// only one value existed to check. It now accumulates into
+			// MatchAddresses, and reading only the scalar rule.Match here would
+			// leave the tail unvalidated.
+			//
+			// WHAT THIS BUYS, stated precisely because the obvious rationale is
+			// FALSE and a false rationale talks the next reader out of checking:
+			// this loop is NOT the last line of defence in front of the Rust
+			// dataplane. Only ONE value is ever lowered — the userspace
+			// snapshot builder sets `ExternalIP: rule.Match`
+			// (pkg/dataplane/userspace/nat_static.go), rule.Match is the value
+			// nodeVal selected from the LAST authored statement
+			// (compiler_nat_static.go) — NOT MatchAddresses[0]; the two differ
+			// whenever a bracketed list precedes a repeated sibling. MatchAddresses has
+			// NO consumer outside these validators. A malformed value in slot 2
+			// is therefore dropped by the Go lowering and never reaches
+			// `parse_nat_prefix` at all.
+			//
+			// What it buys is DIAGNOSTIC COMPLETENESS on the TOLERANT load /
+			// peer-sync path, where validateStaticNATMatchAddressesStrict
+			// downgrades the multi-value rejection to a warning and the config
+			// LOADS with only slot 1 in effect. The remedy that warning
+			// prescribes is "author one rule per external prefix" — so the
+			// operator needs to know that slot 2 is ALSO malformed now, not on
+			// the next commit after they have split the list. At strict commit
+			// the multi-value gate rejects the list outright and fires first, so
+			// the tail is unreachable there. Fall back to the scalar when the
+			// plural is empty so a typed config produced by an older binary
+			// (peer sync, a restored DB) is still checked.
+			matchAddrs := rule.MatchAddresses
+			if len(matchAddrs) == 0 && rule.Match != "" {
+				matchAddrs = []string{rule.Match}
+			}
+			// #6659 follow-up: the block-pair classification below is what
+			// EXEMPTS an address from the host-route requirement, so a
+			// match-side check cannot be widened to the tail without widening
+			// the classification with it — a tail block prefix classified
+			// against slot 1 lands in neither branch and escapes silently
+			// (`[ 192.0.2.1/32 198.51.100.0/24 ]` produced no host-mask
+			// complaint at all while `198.51.100.0/24` alone did).
+			//
+			// blockPairFor answers the question the multi-value warning's own
+			// remedy asks: if this address were split into its own rule against
+			// the same `then` prefix, would that rule be a legal block-to-block
+			// map? That keeps the match-side diagnosis per-address.
+			//
+			// It is deliberately NOT hoisted into an "any address forms a block
+			// pair" flag for the THEN-side and rule-level checks below. Those
+			// describe the ONE pair that actually installs — (rule.Match,
+			// rule.Then) — so an "any" flag would SUPPRESS a true complaint
+			// about the installed pair: `match [ 192.0.2.1/32 198.51.100.0/24 ]
+			// then 10.0.0.1/24` installs host-vs-block, and the Then host-route
+			// complaint that catches it today would vanish because slot 2
+			// happens to pair with the target. Widening a check is only correct
+			// where the operand is the value being widened.
+			blockPairFor := func(matchAddr string) bool {
+				return isStaticBlockPair(matchAddr, rule.Then)
+			}
+			// #6673: a complaint about some OTHER slot must not promise that the
+			// selected value "stays active" when the rule does not survive. The
+			// selected value is the one that lowers to
+			// StaticNATRuleSnapshot.ExternalIP, and the dataplane drops the
+			// whole rule when it cannot parse it — but so do the then-side and
+			// /0 verdicts, which is why this is no longer a hand-written mirror
+			// of the two match-side loops. ruleDropped is set by `emit` itself,
+			// so it accumulates EVERY rule-dropping cause reported for this
+			// rule, including ones added later; the deferred suffixes below are
+			// resolved from it once the rule is fully validated.
+			ruleDropped, selectedMatchInvalid = false, false
+			deferredSuffixes = deferredSuffixes[:0]
+			for _, addr := range matchAddrs {
+				if addr == "" {
+					continue
+				}
+				if _, _, _, parsedIP := natStaticPrefixInfo(addr); !parsedIP {
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
-						rs.Name, rule.Name, rule.Match)); err != nil {
+						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
 					}
 				}
@@ -1319,7 +1605,9 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// NOT reject it as a non-host mask. Only the genuinely-invalid
 			// non-host cases (host-vs-block, mismatched length, mixed family,
 			// malformed mask) fall through to the host-route rejection below.
-			blockPair := isStaticBlockPair(rule.Match, rule.Then)
+			// The rule-level / then-side classification: the pair that actually
+			// installs. See blockPairFor above for why this one stays scalar.
+			blockPair := blockPairFor(rule.Match)
 			// #5658: a valid block pair whose prefix length is ZERO (`/0` on
 			// both sides — isStaticBlockPair already requires equal length) maps
 			// the ENTIRE address family 1:1. The dataplane host mask for a /0 is
@@ -1336,11 +1624,27 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// IPv4 (0.0.0.0/0) and IPv6 (::/0) identically (natStaticPrefixInfo is
 			// family-agnostic on the length). Runs BEFORE the #3202 port check so
 			// the whole-family identity NAT is the primary reported error.
-			if blockPair {
-				if _, bits, _, _ := natStaticPrefixInfo(rule.Match); bits == 0 {
-					if err := emit(fmt.Sprintf(
+			// #6659 follow-up: the operand here is a MATCH address, so it runs
+			// per authored value — a /0 block pair authored in the tail is
+			// reported against its own address rather than being classified
+			// against slot 1 and skipped.
+			//
+			// #6673: and because the operand is a match value, the effect must
+			// be worded per value like its two sibling loops — this one was
+			// widened to iterate matchAddrs but kept the scalar `emit`, whose
+			// suffix says the rule is "dropped by dataplane until corrected".
+			// For a /0 pair in a slot the compiler did not select that is two
+			// falsehoods at once: the quoted pair is not the pair that installs
+			// (rule.Match <-> rule.Then is), and the rule is not dropped — it
+			// installs and translates on the selected value.
+			for _, addr := range matchAddrs {
+				if addr == "" || !blockPairFor(addr) {
+					continue
+				}
+				if _, bits, _, _ := natStaticPrefixInfo(addr); bits == 0 {
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q maps a block-to-block subnet with a zero-length (/0) prefix (match destination-address %q <-> then static-nat prefix %q); a /0 mapping remaps the ENTIRE address family 1:1 (an identity translation that shadows every narrower static/DNAT rule) — use a specific subnet prefix",
-						rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
+						rs.Name, rule.Name, addr, rule.Then)); err != nil {
 						return nil, err
 					}
 				}
@@ -1360,19 +1664,45 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// operator authors a host static-NAT rule for the port forward, or
 			// drops the port tokens for a whole-subnet 1:1. (#3031 added the
 			// address-only block map; it did not add this rejection.)
+			//
+			// #6673 fold: this reports a WHOLE-RULE drop, so it goes through
+			// `emit` and marks the rule. The message's "the port mapping is
+			// silently dropped" described the pre-#3202 hazard the gate was
+			// written to prevent, not what the dataplane does today: from_snapshots
+			// `continue`s on `snap.match_destination_port != 0 || snap.mapped_port
+			// != 0` inside the block-pair branch, dropping the ENTIRE rule (pinned
+			// by static_nat_block_with_port_is_dropped and
+			// static_nat_block_with_match_port_only_is_dropped in
+			// userspace-dp/src/nat/tests_static.rs). Routed through emitSuffix with
+			// a port-scoped suffix it left ruleDropped false, so a complaint about
+			// a non-selected match value on the same rule announced that the
+			// selected value "stays active" while the rule installed nothing.
 			if blockPair && (rule.MatchDestinationPort != 0 || rule.MappedPort != 0) {
-				if err := emitSuffix(fmt.Sprintf(
-					"security nat static rule-set %q rule %q maps a subnet (block-to-block prefix) but also specifies a port (match destination-port / then static-nat mapped-port); subnet static NAT is address-only 1:1 and the dataplane cannot translate per-port for a block, so the port mapping is silently dropped (use a /32 host match+prefix for a port forward, or drop the port tokens for a whole-subnet 1:1)",
-					rs.Name, rule.Name),
-					" (ignored: port mapping dropped by dataplane until corrected)"); err != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q maps a subnet (block-to-block prefix) but also specifies a port (match destination-port / then static-nat mapped-port); subnet static NAT is address-only 1:1 and the dataplane cannot translate per-port for a block, so the whole rule is dropped (use a /32 host match+prefix for a port forward, or drop the port tokens for a whole-subnet 1:1)",
+					rs.Name, rule.Name)); err != nil {
 					return nil, err
 				}
 			}
-			if rule.Match != "" && !blockPair {
-				if host, parsed := isHostMaskAddress(rule.Match); parsed && !host {
-					if err := emit(fmt.Sprintf(
+			// #6659 follow-up: the operand here is a MATCH address, so it runs
+			// per authored value with a per-address block-pair exemption.
+			// Reading only the scalar, a non-host prefix in slot 2 escaped this
+			// check entirely (the reviewer's verified case:
+			// `[ 192.0.2.1/32 198.51.100.0/24 ]` warned about nothing while
+			// `198.51.100.0/24` alone warned).
+			//
+			// #6673: report the effect per value via emitMatchAddr. A non-host
+			// mask in a slot the compiler did not select is not "silently
+			// dropped by the dataplane" as a rule — it never reaches the
+			// dataplane at all, and the rule keeps translating on rule.Match.
+			for _, addr := range matchAddrs {
+				if addr == "" || blockPairFor(addr) {
+					continue
+				}
+				if host, parsed := isHostMaskAddress(addr); parsed && !host {
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
-						rs.Name, rule.Name, rule.Match)); err != nil {
+						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
 					}
 				}
@@ -1394,11 +1724,20 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// destination-port`: without an external port to match, the port
 			// rewrite has no inbound trigger and the reverse SNAT cannot
 			// recover the original port.
+			//
+			// #6673 fold: this too reports a WHOLE-RULE drop, so it goes through
+			// `emit`. buildStaticNATSnapshots (pkg/dataplane/userspace/nat_static.go,
+			// #5101) `continue`s on staticNATPortOutOfRange(rule.MatchDestinationPort)
+			// — the rule never reaches a snapshot at all, let alone the dataplane,
+			// because clamping an invalid port to 0 would fail OPEN onto the
+			// whole-address wildcard. Measured: `destination-port 70000` yields 0
+			// snapshots. The port-scoped suffix understated that and, worse, left
+			// ruleDropped false so a non-selected match value was told the selected
+			// one "stays active" for a rule that installs nothing.
 			if rule.MatchDestinationPort != 0 && (rule.MatchDestinationPort < 1 || rule.MatchDestinationPort > 65535) {
-				if err := emitSuffix(fmt.Sprintf(
+				if err := emit(fmt.Sprintf(
 					"security nat static rule-set %q rule %q match destination-port %d is out of range (1-65535)",
-					rs.Name, rule.Name, rule.MatchDestinationPort),
-					" (ignored: port match dropped by dataplane until corrected)"); err != nil {
+					rs.Name, rule.Name, rule.MatchDestinationPort)); err != nil {
 					return nil, err
 				}
 			}
@@ -1449,6 +1788,30 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// the dataplane installs a plain 1:1 (MappedPort==0, no bogus port).
 			// MappedPortPresent is compile-only (json:"-") and never reaches the
 			// dataplane.
+			//
+			// #6673 fold: this stays on emitSuffix — it is genuinely NARROWER —
+			// even though its sibling `match destination-port` check above now
+			// drops the rule for the arithmetically identical fault. The
+			// asymmetry is in the COMPILER, not in the gate:
+			// combineMappedPortOperands folds ANY malformed mapped-port operand
+			// (empty, bare, non-numeric, out-of-range) to MappedPort == 0 and
+			// records the offending token separately, whereas the
+			// `destination-port` arm stores whatever Atoi returned verbatim
+			// (compiler_nat_static.go). So the value that reaches
+			// buildStaticNATSnapshots is 0, staticNATPortOutOfRange(0) is FALSE
+			// (0 is the legitimate "port absent" sentinel), and the rule lowers
+			// and installs as a plain 1:1 with no port translation — measured:
+			// `mapped-port 70000` yields 1 snapshot with mapped=0, while
+			// `destination-port 70000` yields 0 snapshots. The reported effect
+			// really is "the port translation is dropped", not the rule.
+			//
+			// The bound this rests on: MappedPort is only ever 0 or a valid
+			// 1-65535 on every path that reaches here, because both compile
+			// entry points build it through combineMappedPortOperands and
+			// MappedPortPresent is json:"-" so a peer-synced / restored typed
+			// config cannot arrive with the flag set at all. If either of those
+			// ever changes, a PRESENT non-zero out-of-range MappedPort WOULD hit
+			// the #5101 drop and this call must move to `emit`.
 			if rule.MappedPortPresent && (rule.MappedPort < 1 || rule.MappedPort > 65535) {
 				token := "(missing value)"
 				if rule.MappedPortRaw != "" {
@@ -1474,6 +1837,14 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
 					return nil, err
 				}
+			}
+			// #6673: every rule-dropping cause for THIS rule has now been
+			// reported, so ruleDropped is final — word the non-selected match
+			// value complaints held open above. Patching in place keeps the
+			// warnings in emission order. Only reachable on the lenient path;
+			// strict returned at the first violation.
+			for _, d := range deferredSuffixes {
+				warnings[d.warningIdx] += matchAddrSuffix(d.selected, ruleDropped, selectedMatchInvalid)
 			}
 		}
 	}
@@ -2140,6 +2511,188 @@ func validateStaticNATInetTargetStrict(cfg *Config) error {
 	return nil
 }
 
+// validateStaticNATMatchAddressesStrict (#6659) hard-rejects a static-NAT rule
+// whose `match destination-address` carries MORE THAN ONE prefix.
+//
+// Before #6659 the compiler read this leaf with nodeVal, so a bracket / block
+// list silently kept only the FIRST prefix. Two things went wrong at once:
+//
+//   - the rule translated only one of the authored external prefixes, and the
+//     others fell through static NAT entirely, with no diagnostic; and
+//   - the dropped prefixes never reached prefix validation, so a MALFORMED
+//     entry in any slot but the first committed CLEAN — a validation fail-open.
+//
+// The compiler now accumulates every value into MatchAddresses (so all of them
+// are visible to validation), and this gate rejects the multi-valued case. It
+// is a rejection rather than a fan-out because a static-NAT rule lowers to ONE
+// dataplane row — StaticNATRuleSnapshot.ExternalIP is a single address in the
+// Rust static_nat table — so N prefixes have no representable meaning without
+// inventing rule-fanout semantics (which external prefix pairs with the single
+// `then static-nat prefix`?). Junos likewise takes one prefix here. Rejecting
+// makes the previously-silent collapse loud and fails CLOSED; the operator
+// writes one rule per external prefix. Widening static NAT to fan a rule across
+// several external prefixes is a separate semantic change, tracked as #6674.
+//
+// Strict on commit / commit-check (hard reject); the call site downgrades to a
+// warning on the tolerant load / peer-sync path (#1960 no-brick), where Match
+// still carries the SELECTED prefix so behaviour is exactly pre-#6659.
+//
+// #6673: "selected", not "first". compileNATStatic runs
+// `rule.Match = nodeVal(m)` once per `destination-address` sibling, so the LAST
+// authored statement wins outright — `destination-address 192.0.2.1/32;` then
+// `destination-address 198.51.100.1/32;` installs 198.51.100.1/32, not the
+// first. Only WITHIN a single bracket/block list is the selected value that
+// statement's first, which is why the error below quotes rule.Match rather than
+// addrs[0]. That value can also be an authored blank, handled separately.
+func validateStaticNATMatchAddressesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			// #6673: count only NON-EMPTY values. MatchAddresses records every
+			// authored value slot including the empty ones, because nodeVal
+			// selects an empty slot and the list has to contain what installs
+			// (see multiLeafAuthoredValues). An empty slot is a selection, not a
+			// second external prefix — `destination-address 192.0.2.1/32`
+			// followed by `destination-address [ ]` authors ONE prefix and
+			// blanks it, which master accepted, so counting raw length here
+			// would invent a rejection this gate was never meant to make.
+			//
+			// #6673 fold: and count only DISTINCT ones, for exactly the same
+			// reason the empty slot is spared. A REPEATED prefix —
+			// `destination-address 192.0.2.1/32;` written twice, `[ 192.0.2.1/32
+			// 192.0.2.1/32 ]`, two `match {}` stanzas carrying the same prefix,
+			// or `192.0.2.1` beside `192.0.2.1/32` — authors ONE external
+			// prefix. Master accepted every one of those and compiled a
+			// byte-identical rule.Match; the raw count rejected them at commit,
+			// and the message ("only %q would take effect and the rest would be
+			// silently ignored") was false because "the rest" IS the selected
+			// value. Nothing is ignored and nothing is lost. staticNATMatchAddrKey
+			// collapses only values that lower to the SAME dataplane row, so the
+			// #6659 rejection for genuinely distinct prefixes is untouched.
+			// #6673 fold: the identity a value is deduped on is the
+			// CONSUMER's. Plain static NAT masks a prefix to its length, so two
+			// masked-equal spellings install the same row and count once; NPTv6
+			// REJECTS host bits instead of masking (nptv6.rs parse_prefix,
+			// #4519), so for an NPTv6 rule a host-bits value is NOT the same
+			// prefix as its masked form and must not collapse into it — that
+			// collapse was how `destination-address [ 2001:db8:1::/48
+			// 2001:db8:1:2::/48 ]` committed clean with the invalid tail
+			// visible to no gate at all. See staticNATMatchAddrKeyFor.
+			addrs := dedupeValuesBy(nonEmptyValues(rule.MatchAddresses),
+				staticNATMatchAddrKeyFor(rule.IsNPTv6))
+			if len(addrs) > 1 {
+				// #6673: the selected slot can itself be the authored BLANK —
+				// `destination-address [ "" 192.0.2.1/32 198.51.100.1/32 ];`
+				// counts two prefixes but nodeVal selects the empty one, so
+				// ExternalIP lowers as "" and the Rust parse drops the whole
+				// mapping. "only %q would take effect" printed `only ""` and
+				// implied one of the two still translates.
+				if rule.Match == "" {
+					return fmt.Errorf(
+						"static NAT rule-set %q rule %q declares %d `match "+
+							"destination-address` prefixes (%v); a static-NAT rule "+
+							"translates exactly ONE external prefix to the single "+
+							"`then static-nat prefix` target and the selected value "+
+							"is EMPTY, so NONE of them takes effect and the "+
+							"dataplane drops the rule — author one rule per "+
+							"external prefix (#6659)",
+						rs.Name, rule.Name, len(addrs), addrs)
+				}
+				return fmt.Errorf(
+					"static NAT rule-set %q rule %q declares %d `match "+
+						"destination-address` prefixes (%v); a static-NAT rule "+
+						"translates exactly ONE external prefix to the single "+
+						"`then static-nat prefix` target, so only %q would take "+
+						"effect and the rest would be silently ignored — author "+
+						"one rule per external prefix (#6659)",
+					rs.Name, rule.Name, len(addrs),
+					addrs, rule.Match)
+			}
+		}
+	}
+	return nil
+}
+
+// validateProxyARPAddressesStrict (#6659 follow-up) hard-rejects a
+// `security nat proxy-arp interface <if> address <addr>` value that the
+// dataplane cannot parse.
+//
+// This gate exists because #6659 WIDENED THE READ. Before it, the compiler took
+// this leaf with nodeVal and kept only the first address; `address
+// [ 192.0.2.1 bogus ]` compiled to one entry and the malformed tail was never
+// materialised. #6659 made the arm accumulate every value, so `bogus` now
+// reaches ProxyARPEntry.Addresses as "bogus/32" — and proxyarp.go's installer
+// does `netip.ParsePrefix(cidr)`, logs a bounded warning and `continue`s, so the
+// address answers no ARP/ND and inbound traffic to it is never drawn to this
+// firewall. Widening a read without widening its validator converts a
+// value-drop into a silently-inert entry, so the validator is widened here in
+// the same change.
+//
+// Note the check is NOT tail-only: a malformed address in the FIRST slot
+// committed clean before #6659 too (verified), because proxy-ARP addresses
+// carried no commit-time validator at all. Every slot is checked.
+//
+// That first-slot arm is a DELIBERATE NEW COMMIT GATE, not a consequence of the
+// widening, and the paragraph above does not justify it — say so plainly rather
+// than let the causal framing carry it. Measured on both trees with an identical
+// corpus: `address bogus` (one value, first slot) is STRICT=OK on master and
+// STRICT=REJECT here, while the COMPILED result is byte-identical on both
+// ("bogus/32"). The widening never touched slot 1; this arm closes a hole that
+// predates it.
+//
+// Operator-visible consequence, and the reason this is stated here instead of
+// only in a commit message: an appliance whose ACTIVE config already carries a
+// malformed proxy-ARP address keeps booting (the tolerant path warns), but its
+// operator can no longer `commit` ANY change -- including a fix for an unrelated
+// outage -- until that line is corrected. The gate is still the right call, since
+// the entry was silently inert rather than working, but it is a behaviour change
+// against an existing config and belongs in the release notes.
+//
+// The parse is netip.ParsePrefix — deliberately the SAME call the installer
+// makes (pkg/dataplane/proxyarp.go), so "accepted at commit" and "installed at
+// runtime" cannot diverge. The reported value is the COMPILED form: an address
+// authored without a prefix length has "/32" appended by the compiler, so
+// `address bogus` is reported as "bogus/32".
+//
+// Strict on commit / commit-check (hard reject so the inert entry is
+// operator-visible); the call site downgrades to a warning on the tolerant load
+// / peer-sync path (#1960 no-brick — an already-persisted config with a bad
+// proxy-ARP address must still boot, and the installer already skips exactly
+// that entry, so a leniently-loaded config is no worse than before this gate).
+func validateProxyARPAddressesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, entry := range cfg.Security.NAT.ProxyARP {
+		if entry == nil {
+			continue
+		}
+		for _, addr := range entry.Addresses {
+			if addr == "" {
+				continue
+			}
+			if _, err := netip.ParsePrefix(addr); err != nil {
+				return fmt.Errorf(
+					"security nat proxy-arp interface %q address %q is not a valid "+
+						"IP address or CIDR prefix; the dataplane parses every "+
+						"proxy-ARP address with netip.ParsePrefix and SKIPS the ones "+
+						"that fail, so this address would answer no ARP/ND and inbound "+
+						"traffic to it would never be drawn to this firewall (#6659)",
+					entry.Interface, addr)
+			}
+		}
+	}
+	return nil
+}
+
 // validateStaticNATSingleTargetStrict (#6483) hard-rejects a static-NAT rule
 // that declares MORE THAN ONE translation target. A Junos static-nat rule maps
 // to EXACTLY ONE of `prefix <ip>` | `prefix-name <name>` | `nptv6-prefix <p6>` |
@@ -2235,16 +2788,29 @@ func natThenTerminalActionCount(then NATThen) int {
 //
 //   - ZERO actions (an actionless rule, or a `then {}` whose only child is not a
 //     recognized source-nat/destination-nat terminal): the rule commits but the
-//     snapshot builder installs no translation, so matching traffic falls
-//     through to a later, broader rule — an intended `off` exemption silently
-//     disappears (the #3844 fail-open class).
+//     snapshot builder installs no translation, and the rule is not terminal, so
+//     matching traffic falls THROUGH — translated by a later, broader rule if
+//     one matches, otherwise leaving untranslated. Either way an intended `off`
+//     exemption silently disappears; the first case is the #3844 fail-open, the
+//     second leaves the same hazard latent. See the ZERO-actions bullet below
+//     for why the two are not the same outcome (#6820).
 //
 //   - TWO OR MORE actions (contradictory, mutually-exclusive translations such
-//     as `off` + `pool` or `interface` + `pool` inside ONE block): the actions
-//     are mutually exclusive and the compiler would otherwise pick one by
-//     packed-key / child order, so an intended exemption can publish as a
-//     translation (the inverse of the authored action — a security-boundary
-//     decision).
+//     as `off` + `pool` or `interface` + `pool` inside ONE block): all but one
+//     authored action is silently discarded, and the survivor is chosen by a
+//     FIXED precedence, not by anything the operator wrote. WHERE that happens
+//     differs by kind, and the two do NOT share a mechanism (#6820 round 3):
+//     source NAT publishes every authored field (the #5628 else-if→if setter
+//     change) and the DATAPLANE picks `off` > `interface` > `pool`; destination
+//     NAT resolves `off` in the COMPILER — buildDestinationNATSnapshots
+//     short-circuits on `isOff`, skips the pool lookup entirely and publishes
+//     `PoolAddress: ""` — so "every action is published" is FALSE for a DNAT
+//     rule and must not be written as a shared sentence. Do NOT say the compiler
+//     "picks one by packed-key / child order" either: it did before #5628 and
+//     does not now, and the CONTRADICTORY bullet below says so explicitly
+//     (#6820 re-gate). Nor is the discarded action always harmless —
+//     `interface` + `pool P` translates onto the egress interface address and
+//     never uses P.
 //
 // This counts actions WITHIN one complete then-block only. Duplicate `then`
 // CONTAINERS are #3850's intentional last-wins merge (compileNAT resets
@@ -2252,19 +2818,108 @@ func natThenTerminalActionCount(then NATThen) int {
 // rejected here — a rule with two `then` blocks each naming one action still
 // commits. Strict on commit / commit-check (hard reject so the malformed rule
 // is operator-visible); the caller downgrades to a warning on the tolerant load
-// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick) — a
-// leniently-loaded actionless rule is inert (installs nothing), and a
-// contradictory one now records BOTH fields (the else-if→if setter change), so
-// the Rust dataplane's off-precedence governs (off wins → exempt) — unifying
-// the hierarchical path with the pre-existing flat-set both-fields behavior
-// rather than the old Go single-field pick; only a malformed rule reaches this
-// path (the strict commit path rejects it). Rule-sets are walked in sorted name
-// order for a deterministic first-reported offender.
+// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick). Only a
+// malformed rule reaches that path — the strict commit path rejects it — but
+// what happens there is NOT symmetric between the two arities (#5717):
+//
+//   - CONTRADICTORY (2+ actions) CONTAINING `off`: resolves to the EXEMPTION,
+//     never the inverse. The rule records EVERY field (the else-if→if setter
+//     change). The two builders then reach that outcome by DIFFERENT routes:
+//     source NAT forwards all three fields (nat_source.go) and destination NAT
+//     short-circuits on `isOff`, skipping pool resolution and publishing a
+//     pool-less `Off=true` entry (nat_destination.go). Do not describe this as
+//     "the builders forward everything": that is true of SNAT only, and a
+//     justification naming a mechanism the code does not use is the exact
+//     defect this comment exists to remove. But do NOT describe the DNAT
+//     short-circuit as DECIDING the precedence either (#6820) — it
+//     CANONICALIZES. `DnatEntry::to_outcome` (nat/destination.rs) branches on
+//     `off` ALONE and never consults the pool, so a hand-built or mixed-version
+//     snapshot carrying BOTH `Off=true` and a usable pool still resolves to the
+//     exemption; measured by
+//     dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820
+//     (nat/tests_destination.rs), whose control arm clears `off` on the same
+//     rule and gets the translation. Both languages independently give `off`
+//     precedence; the Go step only removes a pool that would never have been
+//     read. Pinned on both sides: in Go by
+//     TestTolerantContradictory{SNAT,DNAT}*_5717 (pkg/dataplane/userspace) and
+//     in Rust by off_wins_over_contradictory_interface_action_5717,
+//     off_wins_over_contradictory_pool_action_5717, and
+//     off_wins_over_all_three_actions_5717 (nat/tests_source.rs).
+//
+//   - CONTRADICTORY WITHOUT `off` — source NAT `interface` + `pool`: INTERFACE
+//     MODE takes precedence, producing interface translation when the egress
+//     interface has a suitable same-family address and an `Unavailable`
+//     (fail-closed) result otherwise — the matcher returns
+//     `InterfaceNoEgressAddress` rather than forwarding untranslated
+//     (nat/source.rs, the #5688 belt). Either way the authored `pool` is
+//     silently discarded, because the matcher checks off → interface_mode →
+//     pool_mode in that order and there is no `off` here to take precedence.
+//     This is still a malformed rule the strict gate rejects; it is called out
+//     because "a contradiction resolves to the exemption" is TRUE ONLY when the
+//     contradiction contains `off`, and stating it unqualified is the same
+//     untested-safety-claim defect. Both halves are pinned, by SEPARATE
+//     fixtures: the translating half by interface_wins_over_pool_without_off_5717
+//     and the fail-closed half by interface_with_pool_no_egress_fails_closed_5717
+//     (both userspace-dp/src/nat/tests_source.rs). Do not cite only the first
+//     for the fail-closed half — it supplies a same-family egress address, so
+//     it never reaches the belt; and the generic
+//     interface_source_nat_no_v{4,6}_egress_addr_fails_closed pair does not
+//     close the gap either, because those rules carry no pool and so cannot
+//     detect a belt that falls back to pool translation. On the Go side
+//     TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717
+//     (pkg/dataplane/userspace) pins that the builder publishes BOTH actions
+//     plus this gate's tolerant-path warning. Note that BOTH precedences are
+//     enforced in Rust — the `rule.off` early return in nat/source.rs for SNAT
+//     and the `off`-only branch of `DnatEntry::to_outcome` in
+//     nat/destination.rs for DNAT. Mutating either of THOSE publishes the
+//     exemption as a translation. The Go `isOff` short-circuit in
+//     nat_destination.go is canonicalization, not the decision: reverting it
+//     changes the published snapshot's shape but not the packet's fate (#6820).
+//
+//   - ZERO actions: NOT inert, despite installing no translation. For source
+//     NAT the builder EMITS the actionless rule and the Rust matcher's `else`
+//     arm (nat/source.rs) then `continue`s to the next rule; for destination
+//     NAT the builder skips the rule. Either way the matched traffic FALLS
+//     THROUGH — and what it falls through TO depends on what follows it (#6820
+//     re-gate). If a later, broader rule matches, that rule translates it,
+//     which is exactly the fail-open this gate's own zero-action rejection text
+//     describes. If NOTHING later matches, the loop simply ends and the packet
+//     leaves UNTRANSLATED. Only the FIRST is a fail-open: the packet is
+//     translated against the operator's intent. In the second the packet's
+//     disposition COINCIDES with the intended exemption — untranslated — so
+//     nothing is observably wrong today, and calling it a fail-open too
+//     conflates a live wrong disposition with a latent one. What is wrong in
+//     the second case is the RULE, not the packet: it is non-terminal, so the
+//     moment any later broader rule is added the same config silently becomes
+//     the first case. That is why the gate rejects it either way. An earlier
+//     revision of this comment asserted only the first outcome ("...and is
+//     translated by it"), which presumes a later rule exists.
+//     Making an actionless rule terminal instead would newly exempt traffic that
+//     already-deployed configs translate, so it is a migration-contract
+//     decision tracked on #5717, not a mechanical fix.
+//     TestTolerantActionlessRuleIsNotInert_5717,
+//     actionless_rule_falls_through_to_later_broader_rule_5717 and
+//     actionless_rule_with_no_later_rule_passes_untranslated_5717 pin BOTH
+//     dispositions so neither the "inert" framing nor the "always translated by
+//     a later rule" framing can silently return.
+//
+// Rule-sets are walked in sorted name order for a deterministic first-reported
+// offender.
 func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	check := func(kind, actions string, rulesets []*NATRuleSet) error {
+	// mechanism is the WHOLE per-kind explanation of how the surviving action is
+	// chosen, not just a precedence ordering, because the two kinds do not share
+	// a mechanism (#6820 round 3). Source NAT forwards every authored field and
+	// the DATAPLANE picks; destination NAT resolves `off` in the COMPILER —
+	// buildDestinationNATSnapshots short-circuits on `isOff`, skips pool
+	// resolution entirely, and publishes `PoolAddress: ""`
+	// (pkg/dataplane/userspace/nat_destination.go) — so "every one of them is
+	// published" is simply false for a DNAT rule. A shared sentence would have to
+	// be false for one kind, and this is operator-facing text, so it is a
+	// parameter.
+	check := func(kind, actions, mechanism string, rulesets []*NATRuleSet) error {
 		sorted := append([]*NATRuleSet(nil), rulesets...)
 		sort.SliceStable(sorted, func(i, j int) bool {
 			if sorted[i] == nil || sorted[j] == nil {
@@ -2285,18 +2940,20 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries no translation action "+
 							"(expected exactly one of %s); the rule would commit but installs no "+
-							"translation, so matching traffic falls through to a later broader "+
-							"rule — an intended exemption silently disappears",
+							"translation and does not stop rule evaluation, so matching traffic "+
+							"falls through — translated by a later broader rule if one matches, "+
+							"otherwise left untranslated — and an intended exemption silently "+
+							"disappears",
 						kind, rs.Name, rule.Name, actions)
 				case n >= 2:
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
-							"translation actions (expected exactly one of %s); the compiler would "+
-							"silently pick one by packed-key/child order, so an intended exemption "+
-							"can publish as a translation. (Duplicate `then` CONTAINERS resolve "+
+							"translation actions (expected exactly one of %s); %s, so all but "+
+							"one action is silently discarded and the survivor is not chosen "+
+							"by configuration order. (Duplicate `then` CONTAINERS resolve "+
 							"last-wins per #3850; this rejects contradictory actions inside one "+
 							"block.)",
-						kind, rs.Name, rule.Name, n, actions)
+						kind, rs.Name, rule.Name, n, actions, mechanism)
 				}
 			}
 		}
@@ -2304,12 +2961,18 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	}
 	if err := check("source",
 		"`source-nat interface`, `source-nat pool <p>`, or `source-nat off`",
+		"every one of them is published to the dataplane, which resolves the rule "+
+			"by a fixed precedence — `off` wins over `interface`, and `interface` "+
+			"over `pool`",
 		cfg.Security.NAT.Source); err != nil {
 		return err
 	}
 	if cfg.Security.NAT.Destination != nil {
 		if err := check("destination",
 			"`destination-nat pool <p>` or `destination-nat off`",
+			"the compiler resolves `off` itself, publishing a pool-less exemption "+
+				"and never looking the pool up, and the dataplane applies the same "+
+				"`off`-over-`pool` precedence to any entry that carries both",
 			cfg.Security.NAT.Destination.RuleSets); err != nil {
 			return err
 		}
@@ -2406,55 +3069,223 @@ func sourceNATPoolMemberHostCount(addr string) uint64 {
 	return 1
 }
 
-// validateSourceNATAggregateCardinalityStrict (#5877) hard-rejects a config
-// whose AGGREGATE source-NAT pool cardinality exceeds a resource budget: too
-// many pools, too many total pool addresses, or too much total port capacity.
-// The per-field / per-member gates bound ONE pool; this bounds the SUM across
-// every pool so a large-but-syntactically-valid config cannot force the apply
-// path to build multi-gigabyte allocator state (a per-address occupancy bitmap
-// per pool address, sized to the port range) during a security-critical
-// commit-apply. Fail-closed at COMMIT, before apply constructs any allocator.
+// SourceNATPoolMembers returns a source-NAT pool's address membership in the
+// order the dataplane receives it: the singular `address` leaf first, then the
+// repeated `address` list. Nil for a pool with no members, so a caller that
+// ships this straight onto the wire keeps the pre-#6812 nil-vs-empty encoding.
 //
-// Scoping mirrors validateSourceNATPoolAddressGrammarStrict EXACTLY: it walks
-// only the DISTINCT pools a pool-mode `then source-nat pool <name>` rule
-// references — the exact set `parse_source_nat_rules`
-// (userspace-dp/src/nat/source.rs) expands into a PortAllocator. An
-// unreferenced pool never reaches that path and builds no allocator, so it is
-// out of scope (a NAT64-referenced pool uses the separate parse_pool_v4 path and
-// is bounded by isNAT64PoolHostAddress, not here). Because this gate runs AFTER
-// the grammar gate in runUniformGates, every counted member is already validated
-// (parseable, host count <= MaxSourceNATPoolPrefixHosts) on the strict path, so
-// the sums are accurate; the saturating arithmetic only matters on the tolerant
-// path, where a still-over-cap member trips the budget rather than wrapping.
+// Shared by the snapshot builder (pkg/dataplane/userspace/nat_source.go, which
+// ships exactly this slice), the aggregate budget walk below, and
+// SourceNATPoolUnusableReason — so "what is in this pool" has ONE answer.
+func SourceNATPoolMembers(pool *NATPool) []string {
+	if pool == nil || (pool.Address == "" && len(pool.Addresses) == 0) {
+		return nil
+	}
+	members := make([]string, 0, len(pool.Addresses)+1)
+	if pool.Address != "" {
+		members = append(members, pool.Address)
+	}
+	return append(members, pool.Addresses...)
+}
+
+// SourceNATPoolPortRange resolves a source-NAT pool's EFFECTIVE port range and
+// reports whether the pool is usable on that axis. An unset endpoint defaults
+// to the 1024-65535 PAT range.
 //
-// Rule-sets are walked in sorted name order and pools deduped by name (a pool
-// referenced by many rules counts once — allocator reuse dedups on the same key)
-// for a deterministic first-reported offender.
+// #5457: an EXPLICITLY configured but rejected range (a non-canonical token, an
+// endpoint outside 1..65535, or a reversed low>high) is never stamped into
+// PortLow/PortHigh — parseSourcePoolPortRange records the raw spec in
+// PortRangeInvalidSpec instead. Returning ok=false for that marker is what
+// stops the tolerant load / peer-sync path from silently installing the
+// defaulted 1024-65535 range the operator did not configure: the snapshot
+// builder turns ok=false into an "invalid_port_range" pool-unusable marker and
+// the pool installs nothing.
 //
-// Strict on commit / commit-check (hard-reject naming the exceeded budget and by
-// how much); the call site (runUniformGates) downgrades it to a warning on the
-// tolerant load / peer-sync path (opts.lenientDestNATAddresses — #1960 no-brick:
-// a config persisted before this gate existed still boots, apply builds the
-// state it always did, and the operator is warned to shrink it). Shares the SNAT
-// silent-drop doctrine flag with the sibling source-pool gates. Registered in
-// the SNAT strict set (validateSourceNATStrictView) so #5876's peer-effective
-// gate bounds the standby's identical allocator build too.
-func validateSourceNATAggregateCardinalityStrict(cfg *Config) error {
+// Lived in pkg/dataplane/userspace until #6812 F1; it moved here so the
+// aggregate budget walk and the builder read ONE definition of "this pool's
+// port range is usable" (see SourceNATPoolUnusableReason).
+func SourceNATPoolPortRange(pool *NATPool) (uint16, uint16, bool) {
+	if pool == nil {
+		return 0, 0, false
+	}
+	if pool.PortRangeInvalidSpec != "" {
+		return 0, 0, false
+	}
+	low := pool.PortLow
+	if low == 0 {
+		low = 1024
+	}
+	high := pool.PortHigh
+	if high == 0 {
+		high = 65535
+	}
+	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
+		return 0, 0, false
+	}
+	return uint16(low), uint16(high), true
+}
+
+// SourceNATPoolUnusableReason reports the fail-closed snapshot reason a
+// REFERENCED source-NAT pool is unusable from its DEFINITION alone, or "" when
+// the pool installs. The returned strings are the wire reasons the userspace
+// snapshot carries in PoolUnusableReason, decoded on the Rust side by
+// source_nat_failure_reason_from_snapshot (userspace-dp/src/nat/source.rs).
+//
+// Precedence is last-writer-wins — invalid_port_range over
+// zone_scoped_pool_address over invalid_pool over empty_pool — the first three
+// preserved verbatim from the snapshot builder's original inline checks, so a
+// pool tripping more than one condition reports the reason it always did. The
+// membership-grammar clause (invalid_pool, #6812 F1 round 2) is deliberately
+// placed BELOW zone_scoped_pool_address: netip.ParsePrefix rejects a zone
+// qualifier outright, so a `fe80::/112%eth0` member fails the grammar too, and
+// only a later zone_scoped write keeps that member reporting the specific
+// #5875 reason it reported before.
+//
+// TWO callers share this predicate so they cannot drift (#6812 F1):
+//
+//  1. the snapshot builder marks the pool unusable, and
+//  2. sourceNATAggregateReferencedCharges EXCLUDES it from the aggregate
+//     budget.
+//
+// (2) is the load-bearing one. An unusable pool builds NO allocator in the
+// dataplane — the Rust parse loop gates its PendingPoolAllocator on
+// `pool_failure.is_none()`, so resolve_pool_allocators never charges it — and
+// charging it Go-side therefore refuses a HEALTHY pool the dataplane would
+// admit. That over-rejection lands on the tolerant load / peer-sync path
+// (#1960 no-brick), which is exactly the path an operator uses to recover.
+//
+// The membership clause is ALL-OR-NOTHING because the dataplane's is (#6812 F1
+// round 2). The Rust parse loop ORs expand_pool_address over every member into
+// one `invalid_pool_address` flag and marks the WHOLE pool
+// SourceNatFailureReason::InvalidPool when ANY member fails
+// (userspace-dp/src/nat/source.rs) — one malformed or over-capacity member
+// poisons an otherwise honorable pool. This predicate therefore asks the SAME
+// question, member by member, through sourceNATPoolAddressReason: the exact
+// per-member mirror of expand_pool_address that the #5627 strict grammar gate
+// already uses. It does not approximate the verdict with a derived quantity
+// (the pre-round-2 budget walk summed host counts and inferred unusability
+// from a zero total, which agreed with the runtime only when EVERY member
+// failed).
+func SourceNATPoolUnusableReason(pool *NATPool) string {
+	if pool == nil {
+		return "missing_pool"
+	}
+	reason := ""
+	members := SourceNATPoolMembers(pool)
+	if len(members) == 0 {
+		reason = "empty_pool"
+	}
+	// #6812 F1 round 2: ANY member the Rust expander cannot honor — an
+	// unparseable token, a malformed mask, or an over-capacity prefix
+	// (`10.0.0.0/15` enumerates 131,072 hosts against a 65,536 cap) — makes
+	// expand_pool_address return false, which sets `invalid_pool_address` and
+	// fails the WHOLE pool as InvalidPool. "invalid_pool" is the wire reason
+	// source_nat_failure_reason_from_snapshot already decodes to exactly that
+	// variant, so the dataplane disposition for these pools is unchanged: only
+	// WHERE the verdict is reached moves, from the Rust parse loop to the
+	// shared predicate the budget walk consults.
+	for _, a := range members {
+		if _, ok := sourceNATPoolAddressReason(a); !ok {
+			reason = "invalid_pool"
+			break
+		}
+	}
+	// #5875: an IPv6 member carrying a `%<zone>` qualifier is not
+	// dataplane-representable (std::net::IpAddr has no zone model).
+	for _, a := range members {
+		if PoolAddressHasZoneScope(a) {
+			reason = "zone_scoped_pool_address"
+			break
+		}
+	}
+	if _, _, ok := SourceNATPoolPortRange(pool); !ok {
+		reason = "invalid_port_range"
+	}
+	return reason
+}
+
+// sourceNATAggregatePoolCharge is one DISTINCT referenced pool's charge
+// against the #5877 aggregate budgets: its expanded address cardinality and
+// its port capacity (addresses x port range = occupancy bitmap slots).
+type sourceNATAggregatePoolCharge struct {
+	name    string
+	addrs   uint64
+	portCap uint64
+}
+
+// sourceNATAggregateReferencedCharges walks the DISTINCT pools a pool-mode
+// `then source-nat pool <name>` rule references and returns each pool's budget
+// charge in deterministic first-reference order (rule-sets STABLE-sorted by
+// #4161 scope tier — so config order is preserved WITHIN a tier — rules in
+// config order, pools deduped by name). This is the SINGLE source of
+// truth for the #5877 aggregate scoping + charge arithmetic: the strict
+// validator (validateSourceNATAggregateCardinalityStrict) sums it for the
+// whole-config reject, and SourceNATAggregateOverBudgetPools (#6812) first-fits
+// it for the tolerant snapshot poison, so the two can never drift on what is
+// counted or how.
+//
+// SCOPE — the charged set is exactly the set `parse_source_nat_rules`
+// (userspace-dp/src/nat/source.rs) expands into a PortAllocator, which means
+// TWO exclusions, each one a pool that reaches the dataplane and builds
+// nothing:
+//
+//   - UNREFERENCED. No pool-mode rule names it, so it never reaches the
+//     allocator path. (A NAT64-referenced pool uses the separate parse_pool_v4
+//     path and is bounded by isNAT64PoolHostAddress, not here.)
+//   - UNUSABLE (#6812 F1). SourceNATPoolUnusableReason is non-empty — empty
+//     membership, a member the expander cannot honor, a `%zone` member, or a
+//     rejected port range — so the snapshot ships it poisoned and the Rust
+//     parse loop, which gates its PendingPoolAllocator on
+//     `pool_failure.is_none()`, never charges it.
+//
+// Charging either would make this walk refuse a HEALTHY pool that
+// resolve_pool_allocators admits — over-rejection, landing on the tolerant
+// recovery path (#1960 no-brick) where a peer-sync or lenient load is how an
+// operator gets back to a working state.
+//
+// ROUND 2 — WHY THE EXCLUSION IS A SHARED VERDICT AND NOT A LIST OF CONDITIONS.
+// The dataplane's pool grammar is ALL-OR-NOTHING: one member expand_pool_address
+// refuses fails the whole pool. Round 1 approximated that with a SUM — it added
+// per-member host counts and skipped only when the total was zero — which
+// agrees with the runtime only when EVERY member fails. A pool of
+// `[198.51.100.1, not-an-ip]` summed to 1, was charged here, and built nothing
+// there; 1,024 of them ahead of one healthy pool consumed the whole pool-count
+// budget and poisoned the healthy pool `aggregate_over_budget` — the very F1
+// defect this walk exists to prevent, in its fifth spelling. Each of the four
+// earlier spellings had been closed by adding another condition to the sum.
+// The exclusion above is now the SAME predicate the snapshot builder stamps on
+// the wire, so the two cannot disagree by construction; there is no derived
+// quantity left for a sixth spelling to slip through. A pool the walk charges
+// has honorable members by that verdict, so the counted host sums are accurate
+// on BOTH paths; the saturating arithmetic remains only to keep a saturating
+// charge from wrapping into an accept.
+func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCharge {
 	if cfg == nil {
 		return nil
 	}
 	pools := cfg.Security.NAT.SourcePools
 	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Source...)
+	// #6812 F3: walk rule-sets in the order the DATAPLANE charges them. The
+	// snapshot builder STABLE-sorts its emitted rules by #4161 scope tier
+	// (SourceNATScopeTier) and resolve_pool_allocators charges that emitted
+	// slice in that order — exactly so on a first apply; on a re-apply it
+	// charges the REUSED keys first and then walks the remainder in slice
+	// order, which cannot change which pools live (see the ORDER note on
+	// SourceNATAggregateOverBudgetPools). So a stable sort by the same tier —
+	// config order preserved within a tier, exactly as the builder preserves
+	// it — reproduces the dataplane's first-fit sequence. Ordering by rule-set NAME
+	// (through round 2) matched neither that order nor any Junos semantic: with
+	// two pools that each fit alone but not together, the alphabetically
+	// earlier rule-set took the budget, so an unrelated rename could poison the
+	// more-specific rule-set's pool. The sibling walks in this file still sort
+	// by name — they pick a deterministic first-reported OFFENDER for an error
+	// message, where name order is the friendlier choice and admission plays no
+	// part.
 	sort.SliceStable(rulesets, func(i, j int) bool {
-		if rulesets[i] == nil || rulesets[j] == nil {
-			return rulesets[i] != nil
-		}
-		return rulesets[i].Name < rulesets[j].Name
+		return natRuleSetScopeTier(rulesets[i]) < natRuleSetScopeTier(rulesets[j])
 	})
 	seen := make(map[string]bool)
-	var poolCount int
-	var totalAddrs uint64
-	var totalPortCap uint64
+	var charges []sourceNATAggregatePoolCharge
 	for _, rs := range rulesets {
 		if rs == nil {
 			continue
@@ -2473,26 +3304,212 @@ func validateSourceNATAggregateCardinalityStrict(cfg *Config) error {
 				// Undefined reference — validateNATPoolReferencesStrict (#5626).
 				continue
 			}
-			poolCount++
-			var poolAddrs uint64
-			if pool.Address != "" {
-				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(pool.Address))
+			// #6812 F1: a pool the snapshot builder ALREADY marks unusable
+			// (empty / zone-scoped member / invalid port range) never becomes a
+			// PendingPoolAllocator in Rust — the parse loop gates on
+			// `pool_failure.is_none()` — so resolve_pool_allocators neither
+			// charges it nor lets it occupy a slot. Charging it here would
+			// refuse a HEALTHY pool the dataplane admits, which is the wrong
+			// direction on the tolerant recovery path.
+			if SourceNATPoolUnusableReason(pool) != "" {
+				continue
 			}
-			for _, a := range pool.Addresses {
+			// INVARIANT (#6812 F1 round 2): every member of a pool that reaches
+			// this line is honorable — SourceNATPoolUnusableReason above is
+			// all-or-nothing over sourceNATPoolAddressReason, so a single
+			// rejected member already skipped the pool. An honorable member
+			// parses, so sourceNATPoolMemberHostCount returns at least 1 for
+			// it, and a pool with NO members reported empty_pool. poolAddrs is
+			// therefore >= 1 here by construction, which is why there is no
+			// zero-total skip: the shape it used to catch (every member
+			// unparseable) is no longer representable past the shared verdict.
+			// TestBudgetChargeImpliesHonorableMembers_6812 binds both halves.
+			var poolAddrs uint64
+			for _, a := range SourceNATPoolMembers(pool) {
 				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(a))
 			}
-			totalAddrs = checkedAddU64(totalAddrs, poolAddrs)
-			// Port range mirrors the Rust allocator's defaulting (source.rs): an
-			// unset/zero low/high defaults to 1024/65535, and a reversed range yields
-			// a zero-width allocator (no bitmap). compileNATSource already defaults
-			// PortLow/PortHigh to 1024/65535, so a pool with no `port` leaf
-			// contributes the full 64,512-slot PAT range per address.
+			// Port range: CONSULT the shared resolver rather than recompute
+			// from the raw fields (#6812 F2 round 3). SourceNATPoolPortRange is
+			// what the snapshot builder ships to the dataplane
+			// (pkg/dataplane/userspace/nat_source.go), so reading it here is
+			// what makes the charge equal the capacity the allocator is asked
+			// to build — the same "consult, do not re-derive" rule round 2
+			// applied to the usability verdict, one field over.
+			//
+			// This is behavior-preserving on every config the compiler can
+			// produce: compileNATSource defaults an unset PortLow/PortHigh to
+			// 1024/65535 before the pool is stored, so the raw recompute and the
+			// resolver already agreed on the live path (measured: a referenced
+			// 3x /16 no-`port`-leaf config charges 4,227,858,432 slots per pool
+			// either way). What it removes is the DEPENDENCE on that distant
+			// defaulting: a *NATPool that reaches this walk without it — the
+			// resolver's own documented input, raw 0/0 — charged zero port slots
+			// and was admitted, while the builder shipped the resolved
+			// 1024-65535 and the dataplane charged 64,512 per address.
+			// The `ok=false` half cannot reach here (an unusable port range is
+			// already an invalid_port_range skip above), so this reads the pair.
+			portLow, portHigh, _ := SourceNATPoolPortRange(pool)
 			var portRange uint64
-			if pool.PortLow > 0 && pool.PortHigh >= pool.PortLow {
-				portRange = uint64(pool.PortHigh-pool.PortLow) + 1
+			if portHigh >= portLow && portLow > 0 {
+				portRange = uint64(portHigh-portLow) + 1
 			}
-			totalPortCap = checkedAddU64(totalPortCap, checkedMulU64(poolAddrs, portRange))
+			charges = append(charges, sourceNATAggregatePoolCharge{
+				name:    name,
+				addrs:   poolAddrs,
+				portCap: checkedMulU64(poolAddrs, portRange),
+			})
 		}
+	}
+	return charges
+}
+
+// SourceNATAggregateOverBudgetPools (#6812) returns the set of referenced
+// source-NAT pool names that do NOT fit within the #5877 aggregate budgets
+// under a deterministic FIRST-FIT walk: pools are charged in the shared
+// first-reference order (sourceNATAggregateReferencedCharges); a pool whose
+// admission would cross any budget (count / total addresses / total port
+// capacity) is refused WITHOUT consuming budget, so a later, smaller pool
+// can still install. Saturating arithmetic throughout — a saturating charge
+// (e.g. a ::/0 member on the tolerant path) can never fit and poisons its
+// pool, never wraps into an accept.
+//
+// The userspace snapshot builder (pkg/dataplane/userspace/nat_source.go)
+// poisons these pools (PoolUnusable + "aggregate_over_budget") so a
+// TOLERATED over-budget config — lenient load / peer-sync, where the #5877
+// gate only warns (#1960 no-brick) — never asks the dataplane to build the
+// over-budget occupancy bitmaps (opus-review-001 R73: three full-range /16
+// pools = 12,683,575,296 bitmap bits, ~1.48 GiB). The Rust apply boundary
+// independently enforces the same budgets (resolve_pool_allocators in
+// userspace-dp/src/nat/source.rs) as the final backstop; the first-fit
+// admission rule here mirrors it — same charge, and (since #6812 F1) the same
+// EXCLUSIONS, see sourceNATAggregateReferencedCharges — so Go and the dataplane
+// agree on WHICH pools live.
+//
+// ORDER, precisely. Two earlier revisions of this comment were wrong in
+// opposite directions: round 7's said "same order" flatly, and round 8's
+// replaced it with "identical on a first apply, NOT identical on a re-apply" —
+// also too categorical, in the narrower direction.
+//
+// What is actually true. This walk is a single first-fit pass in emitted
+// first-reference order. resolve_pool_allocators is TWO passes: phase 1
+// reserves the distinct keys that are BOTH viable in this apply AND already
+// present in `previous_allocators` — reused keys are accepted unconditionally,
+// so their charge is live state rather than a prediction — and only then does
+// phase 2 admit NEW keys against that total (source.rs, "Reused keys are
+// RESERVED before any new key is admitted", #6812 F2 round 4). Note "viable":
+// a rule whose pool already failed gets no PendingPoolAllocator, so a
+// previously-allocated but currently-poisoned key is NOT reserved.
+//
+//   - Empty `previous_allocators` GUARANTEES the sequences coincide: phase 1
+//     reserves nothing and phase 2 walks the slice in order.
+//   - A re-apply MAY differ, and need not. An all-reused apply coincides
+//     trivially (phase 2 admits nothing new); so does any apply whose reused
+//     keys already precede its new ones in emitted order. The sequences differ
+//     only when a NEW key is emitted before some reused key.
+//
+// AND THE DIFFERENCE CANNOT CHANGE THE OUTCOME, which is the part that matters
+// and is stronger than the round-8 wording ("they are not independent
+// deciders") on its own. Let A be the set this walk admits. First-fit admits
+// greedily and only while the running total fits, so charge(A) is within every
+// budget. The poison travels on the wire and the Rust parse loop builds no
+// pending for a failed pool, so the set of DISTINCT ALLOCATOR KEYS represented
+// by the non-nil pendings is exactly A. The pendings themselves are per-RULE
+// and a shared pool has one per referencing rule, so they are a multiset with
+// repeats — the statement holds only at distinct-key granularity, and that is
+// the granularity everything downstream works at: `reserved` charges a key
+// once, `pool_allocators` assigns it once, and `refused_keys` refuses it
+// consistently. Distinct pool NAMES map to distinct keys, because the key
+// carries the pool name alongside the expanded members and the port range, and
+// this builder derives all three from the pool (SourceNATPoolMembers /
+// SourceNATPoolPortRange), so every rule referencing one pool ships the same
+// three. Phase 1 reserves R, a subset of A. Phase 2 accepts every reused key
+// unconditionally and admits a new key k when used + charge(k) fits — and R,
+// the new keys already processed, and k are DISJOINT subsets of A, so that sum
+// is bounded by charge(A), which fits. Rust therefore refuses nothing this walk
+// admitted, in any emitted order. The live set is exactly A.
+//
+// The reserve-first order still earns its keep for the snapshots no Go poison
+// is coming for — a tolerated, older control plane's, or handcrafted snapshot,
+// where A is whatever arrived rather than something this walk computed. That is
+// what makes the boundary an INDEPENDENT backstop rather than a second
+// opinion.
+//
+// That agreement is a tested claim, not an asserted one:
+// TestAggregateBudgetExcludesUnusablePools_6812
+// (this package) and TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812
+// (pkg/dataplane/userspace) drive the Go half, and
+// production_entry_admits_a_healthy_pool_after_failed_pools_6812
+// (userspace-dp/src/nat/tests_aggregate_budget.rs) drives the same scenario
+// through the Rust production entry. Strict-commit configs never reach the
+// builder over budget, so the poison only ever fires on the tolerant path that
+// needs it.
+func SourceNATAggregateOverBudgetPools(cfg *Config) map[string]bool {
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	if len(charges) == 0 {
+		return nil
+	}
+	var poolCount uint64
+	var totalAddrs uint64
+	var totalPortCap uint64
+	var poison map[string]bool
+	for _, c := range charges {
+		candCount := checkedAddU64(poolCount, 1)
+		candAddrs := checkedAddU64(totalAddrs, c.addrs)
+		candCap := checkedAddU64(totalPortCap, c.portCap)
+		if candCount > uint64(MaxSourceNATPoolCount) ||
+			candAddrs > uint64(MaxSourceNATAggregatePoolAddresses) ||
+			candCap > MaxSourceNATAggregatePortCapacity {
+			if poison == nil {
+				poison = make(map[string]bool)
+			}
+			poison[c.name] = true
+			continue // first-fit: charge not consumed; a later pool may still fit
+		}
+		poolCount, totalAddrs, totalPortCap = candCount, candAddrs, candCap
+	}
+	return poison
+}
+
+// validateSourceNATAggregateCardinalityStrict (#5877) hard-rejects a config
+// whose AGGREGATE source-NAT pool cardinality exceeds a resource budget: too
+// many pools, too many total pool addresses, or too much total port capacity.
+// The per-field / per-member gates bound ONE pool; this bounds the SUM across
+// every pool so a large-but-syntactically-valid config cannot force the apply
+// path to build multi-gigabyte allocator state (a per-address occupancy bitmap
+// per pool address, sized to the port range) during a security-critical
+// commit-apply. Fail-closed at COMMIT, before apply constructs any allocator.
+//
+// The walk (scoping + charge arithmetic) is sourceNATAggregateReferencedCharges;
+// this validator sums the charges for the whole-config reject. Since #6812 F1
+// that walk skips pools already destined to be unusable, so they no longer
+// inflate this sum either — which is a no-op on the strict path (their own
+// gates, validateSourceNATPoolStrict / validateSourceNATPoolAddressScopeStrict,
+// run EARLIER in runUniformGates and reject the config first) and correct on
+// the resource question regardless: a pool that builds no allocator costs no
+// allocator memory.
+//
+// Strict on commit / commit-check (hard-reject naming the exceeded budget and by
+// how much); the call site (runUniformGates) downgrades it to a warning on the
+// tolerant load / peer-sync path (opts.lenientDestNATAddresses — #1960 no-brick:
+// a config persisted before this gate existed still boots, and the operator is
+// warned to shrink it). Since #6812 the tolerant path no longer builds the
+// over-budget state it always did: the snapshot poisons the non-fitting pools
+// (SourceNATAggregateOverBudgetPools) and the Rust apply boundary refuses their
+// bitmaps. Shares the SNAT silent-drop doctrine flag with the sibling
+// source-pool gates. Registered in the SNAT strict set
+// (validateSourceNATStrictView) so #5876's peer-effective gate bounds the
+// standby's identical allocator build too.
+func validateSourceNATAggregateCardinalityStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	poolCount := len(charges)
+	var totalAddrs uint64
+	var totalPortCap uint64
+	for _, c := range charges {
+		totalAddrs = checkedAddU64(totalAddrs, c.addrs)
+		totalPortCap = checkedAddU64(totalPortCap, c.portCap)
 	}
 	if poolCount > MaxSourceNATPoolCount {
 		return fmt.Errorf(

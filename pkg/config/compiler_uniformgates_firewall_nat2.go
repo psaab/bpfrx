@@ -141,17 +141,93 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		}
 	}
 
+	// #6659: a static-NAT `match destination-address` list. The leaf is
+	// declared `multi: true`, but the compiler read it with nodeVal and kept
+	// only the first prefix — so the remaining prefixes were neither translated
+	// NOR validated (a malformed prefix in any slot but the first committed
+	// clean). The compiler now accumulates every value; this gate rejects the
+	// multi-valued case because a static-NAT rule lowers to exactly ONE
+	// dataplane row. Strict on commit / commit-check (hard reject so the
+	// previously-silent collapse is operator-visible); lenient on load /
+	// peer-sync (warn — #1960 no-brick; Match still carries the SELECTED prefix,
+	// so the tolerant path behaves exactly as it did pre-#6659). Reuses
+	// lenientFirewallRefs like the sibling static-NAT gates above.
+	//
+	// #6673: "selected", not "first". compileNATStatic assigns
+	// `rule.Match = nodeVal(m)` once per `destination-address` sibling, so the
+	// LAST authored statement wins; only WITHIN one bracket/block list is the
+	// selected value that statement's first. And "AT MOST one" is honoured, not
+	// "exactly one": the selected slot can be an authored blank
+	// (`destination-address [ "" a b ];`), which lowers ExternalIP as "" and
+	// makes the dataplane drop the rule entirely.
+	if err := validateStaticNATMatchAddressesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("static NAT `match destination-address` LIST FORM IS NOT SUPPORTED — "+
+					"AT MOST ONE prefix is honoured — the one the wrapped error names "+
+					"(the LAST authored `match destination-address` statement, or within "+
+					"a bracketed list that statement's first value; none at all when that "+
+					"value is empty) — and the rest carry no translation; "+
+					"author one rule per external prefix (support for the list form is tracked "+
+					"in #6674). Downgraded to a warning on the tolerant load / peer-sync path "+
+					"so an already-persisted config still boots: %v", err))
+		} else {
+			return err
+		}
+	}
+
+	// #6659 follow-up: a `security nat proxy-arp ... address` value the
+	// dataplane cannot parse. #6659 widened this arm from nodeVal (first value
+	// only) to the full list, so a malformed tail address now MATERIALISES into
+	// ProxyARPEntry.Addresses instead of being dropped at compile — and
+	// proxyarp.go's installer parses each address with netip.ParsePrefix and
+	// SKIPS the failures, leaving a silently-inert entry that answers no
+	// ARP/ND. Widening a read requires widening its validator in the same
+	// change, so the gate lands here rather than being deferred. It is not
+	// tail-only: proxy-ARP addresses carried NO commit-time validator at all
+	// before this, so a malformed FIRST address committed clean too. Strict on
+	// commit / commit-check (hard reject); lenient on load / peer-sync (warn —
+	// #1960 no-brick; the installer already skips the bad entry, so a
+	// leniently-loaded config is no worse than before the gate). Reuses
+	// lenientFirewallRefs like the sibling NAT gates above.
+	if err := validateProxyARPAddressesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("proxy-ARP address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
 	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
-	// rule with ZERO actions installs no translation (an intended `off`
-	// exemption silently disappears, revealing a later broader rule); a rule
+	// rule with ZERO actions installs no translation and is NOT terminal (an
+	// intended `off` exemption silently disappears and the traffic falls
+	// through — translated by a later broader rule if one matches, otherwise
+	// untranslated); a rule
 	// with TWO+ mutually-exclusive actions inside one block let the compiler
-	// silently pick one by packed-key/child order (an exemption can publish as a
-	// translation — the inverse of the authored action). Strict on commit /
+	// silently pick one by packed-key/child order (an exemption COULD then
+	// publish as a translation — the inverse of the authored action). Both
+	// clauses are past tense on purpose: since #5628 the compiler records every
+	// field and the dataplane resolves them by a fixed precedence, so the
+	// present-tense form of this sentence is false — see the corrected
+	// rejection text on validateNATTerminalActionCardinalityStrict (#6820).
+	// Strict on commit /
 	// commit-check (hard reject so the malformed rule is operator-visible);
-	// lenient on load / peer-sync (warn — #1960 no-brick; the dataplane is no
-	// worse than before the gate). Preserves #3850 duplicate-`then`-CONTAINER
-	// last-wins (the count reflects the winning block only).
+	// lenient on load / peer-sync (warn — #1960 no-brick). What happens on that
+	// tolerant path differs per shape: a contradiction CONTAINING `off`
+	// resolves to the EXEMPTION via `off` precedence; a contradiction WITHOUT
+	// `off` (source-NAT `interface` + `pool`) gives INTERFACE MODE precedence,
+	// producing interface translation when a suitable same-family egress
+	// address exists and a fail-closed `Unavailable` otherwise, silently
+	// discarding the pool either way; an actionless rule FALLS THROUGH — to a
+	// later broader rule if one matches, otherwise off the end of the rule list
+	// untranslated. All three are spelled out and test-cited
+	// on validateNATTerminalActionCardinalityStrict (#5717). Do not restate
+	// them as "inert", and do not compress them to "a contradiction resolves to
+	// the exemption" — that is true only for the `off`-bearing case. Preserves #3850
+	// duplicate-`then`-CONTAINER last-wins (the count reflects the winning block
+	// only).
 	if err := validateNATTerminalActionCardinalityStrict(cfg); err != nil {
 		if opts.lenientNATTerminalAction {
 			cfg.Warnings = append(cfg.Warnings,

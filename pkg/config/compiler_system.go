@@ -94,6 +94,20 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, classInst := range namedInstances(child.FindChildren("class")) {
 				lc := &LoginClass{Name: classInst.name}
 				for _, prop := range classInst.node.Children {
+					// #5831: record RESTRICTIVE leaf PRESENCE from the
+					// classification table (compiler_login_deny.go), NOT from
+					// the case arms below. Presence, not value: a
+					// quoted-empty or valueless deny-commands flattens to ""
+					// and would be invisible to a value test, yet an empty
+					// regex denies EVERY command in Junos. Driving it from the
+					// table means a newly-classified restrictive leaf is gated
+					// without also needing a `case` arm here — the missing-arm
+					// fail-open the table exists to prevent. Both AST shapes
+					// carry the leaf name in Keys[0], so prop.Name() is
+					// dual-shape safe, exactly as the switch below relies on.
+					if loginClassLeafRestrictive[prop.Name()] {
+						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, prop.Name())
+					}
 					switch prop.Name() {
 					case "permissions":
 						lc.Permissions = append(lc.Permissions, firewallMatchValues(prop)...)
@@ -106,6 +120,10 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					case "allow-commands":
 						lc.AllowCommands = nodeVal(prop)
 					case "deny-commands":
+						// Value only. PRESENCE is recorded above, off
+						// loginClassLeafRestrictive, because the value cannot
+						// carry it: a quoted-empty or valueless deny-commands
+						// flattens to "" yet denies EVERY command in Junos.
 						lc.DenyCommands = nodeVal(prop)
 					case "allow-configuration":
 						lc.AllowConfiguration = nodeVal(prop)
@@ -199,6 +217,28 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					// URL]. Password lands either in subsequent keys
 					// (leaf form) or as a child leaf (Keys=["password",
 					// "$9$..."]).
+					//
+					// #6692 / #6659 — READ THIS BEFORE WIDENING THE READ
+					// BELOW. This branch takes slot 1 and then `continue`s, so
+					// a BRACKETED LIST (`archive-sites [ "scp://a/b"
+					// "-oProxyCommand=id" ]`, which the lexer collapses onto
+					// Keys[1:]) drops every member past the first — and because
+					// the leading-dash check runs on `url` alone, that dropped
+					// member also ESCAPES the #4589 A7 F-02 gate and commits
+					// CLEAN. Measured: the bracket form ACCEPTS where the same
+					// token authored alone, or in the hierarchical block form
+					// below, REJECTS.
+					//
+					// Today the escape is inert — the value is dropped, so
+					// nothing reaches scp. It STOPS being inert the moment
+					// anyone widens this to accumulate Keys[2:]. Widen the
+					// leading-dash check in the SAME change, over EVERY authored
+					// value. Widening the read alone ships a live CWE-88
+					// argument injection: the second member would land in
+					// ArchiveSites and be handed to `scp <src> <dest>` as an
+					// option. Note also that Keys[2:] is where `password` rides,
+					// so a widening reader must separate values from that
+					// modifier rather than treating the whole tail as URLs.
 					if len(asNode.Keys) >= 2 {
 						url := asNode.Keys[1]
 						// #4589 A7 F-02: reject a leading-dash archive-site at
@@ -927,17 +967,27 @@ func loginClassPermName(p LoginClassPermission) string {
 // `system login class <name>` (#4304 S-2). The class is RECOGNIZED (a valid
 // vSRX RBAC config commits instead of being hard-rejected), but xpf's coarse
 // permission model cannot faithfully represent every Junos permission or the
-// per-command allow/deny regexes, so the advisory states exactly what maps and
-// what is recognized-but-not-enforced. Deterministic order for stable output.
+// per-command ADDITIVE regexes (allow-commands / allow-configuration), so the
+// advisory states exactly what maps and what is recognized-but-not-enforced.
+// It says nothing about the RESTRICTIVE regexes: #5831 moved deny-commands /
+// deny-configuration out of advisory territory entirely — strict rejects the
+// commit, and the tolerant path folds the class and emits its own warning
+// (compiler_login_deny.go). Deterministic order for stable output.
 func loginClassAdvisoryWarnings(cfg *Config) []string {
 	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) == 0 {
 		return nil
 	}
 	var warnings []string
 	for _, lc := range cfg.System.Login.Classes {
-		mapped, folded := mapJunosPermissions(lc.Permissions)
-		names := make([]string, 0, len(mapped))
-		for _, p := range mapped {
+		_, folded := mapJunosPermissions(lc.Permissions)
+		// Report the EFFECTIVE set (lc.MappedPermissions), not a fresh
+		// mapJunosPermissions call (#5831). The two are identical for every
+		// class the tolerant #5831 fold did not touch, so this changes no
+		// existing output; for a folded class the fresh call would report the
+		// pre-fold buckets and tell the operator the class still holds
+		// permissions it no longer has.
+		names := make([]string, 0, len(lc.MappedPermissions))
+		for _, p := range lc.MappedPermissions {
 			names = append(names, loginClassPermName(p))
 		}
 		mappedStr := "none"
@@ -967,21 +1017,27 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 		if len(inert) > 0 {
 			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, "/"))
 		}
-		// SECURITY: deny-commands / deny-configuration are BLACKLISTS. Dropping
-		// them makes the class MORE PERMISSIVE than the Junos config — the
-		// denied verbs stay ALLOWED. State that explicitly so the operator
-		// knows the posture is WEAKER, not merely "not enforced" (per-command
-		// deny enforcement is a larger follow-up).
-		var deny []string
-		if lc.DenyCommands != "" {
-			deny = append(deny, "deny-commands")
-		}
-		if lc.DenyConfiguration != "" {
-			deny = append(deny, "deny-configuration")
-		}
-		if len(deny) > 0 {
-			msg += fmt.Sprintf("; WARNING: %s is NOT enforced, so this class is MORE PERMISSIVE than the Junos config (denied commands/configuration remain ALLOWED); per-command deny enforcement is a follow-up", strings.Join(deny, "/"))
-		}
+		// SECURITY: deny-commands / deny-configuration are BLACKLISTS, and the
+		// #4304 "accepted but MORE PERMISSIVE" advisory that used to be
+		// appended here is GONE (#5831) rather than reworded. Two reasons it
+		// could not stay:
+		//
+		//  1. It is no longer reachable on the strict path at all —
+		//     validateLoginClassDenyStrict rejects the commit outright.
+		//  2. On the tolerant path it would now be misleading. That path folds
+		//     the class to the repair floor before this runs, dropping every
+		//     operational-verb bucket, so the class is MORE restrictive than
+		//     the Junos config on the half deny-commands targets; repeating
+		//     the old text would tell the operator the opposite of what
+		//     happened. (Configuration is the one half where the restriction
+		//     genuinely does not bind — the fold keeps `configure` so the
+		//     statement can be deleted — and the fold's own warning says so
+		//     precisely, which a blanket "MORE PERMISSIVE" cannot.)
+		//
+		// foldLoginClassDenyToRepairableFloor emits the accurate per-class
+		// warning on that path, so this advisory stays out of the
+		// restrictive-regex business entirely and describes only the
+		// permission mapping.
 		warnings = append(warnings, msg)
 	}
 	return warnings

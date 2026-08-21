@@ -263,6 +263,28 @@ non-contiguous ordered list — `ip_idx` is a POSITION in that list, so a direct
 `public_ip - pool_base` subtraction would be wrong; the index maps each pool
 address to the same position the forward path selects with `pool_v4[ip_idx]`.
 
+**Pool member grammar (#6812 F-C).** `expandPoolV4` rejects a member whose CIDR
+mask is not CANONICAL — `netip.ParsePrefix` must accept it, not merely
+`net.ParseCIDR`. The two disagree: `net.ParseCIDR` reads a leading-zero prefix
+length, taking `10.0.0.0/016` as `/16`, while `netip.ParsePrefix` (the commit
+gate's grammar) and `parse_canonical_prefix_len` (the dataplane's) both refuse
+it. Without the check the deterministic surface was the most confident liar in
+the system: the pool is stamped `invalid_pool` and translates NOTHING, while a
+forward-mapping query answered with a 65,536-address pool built off a member no
+other layer accepts — the invariant-8 forensic failure this section exists to
+prevent. Narrowing only: such a pool TRANSLATES NOTHING either way — the
+snapshot builder stamps it `invalid_pool` and it installs no allocator — so the
+lookup now returns an error instead of a fiction. (Round 7 correction: this
+sentence also said "already refused at commit". That holds only for a pool a
+pool-mode rule REFERENCES —
+`validateSourceNATPoolAddressGrammarStrict` walks rule references, not the pool
+table, so an UNREFERENCED pool carrying `10.0.0.0/016` compiles strict-clean.
+It is still unusable, which is what carries the conclusion.)
+Bound by the REJECT half of
+`TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812`, which reads
+the same `snat_pool_grammar_v1.json` the Rust expander and the Go grammar
+predicate read.
+
 ## Operator lookup surface (#5794)
 
 The deterministic mapping is exposed for the CGN compliance / forensics

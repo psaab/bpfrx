@@ -158,13 +158,26 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	// (ValidateIntegerMin(1)) and deriveUserspaceConfig does not cap the
 	// upper side, so e.g. `workers 999999999` reaches the loop below and
 	// uint32(999999999)*32 wraps to ~1.9B iterations that hang the apply
-	// for hours — bounded by heartbeatZeroSlots' map-capacity clamp.
-	workers := maxInt(cfg.Workers, 1)
+	// for hours — bounded by effectiveWorkers' map-capacity clamp.
+	//
+	// #5718 fold F3: ONE derivation feeds every representation of this
+	// quantity. cfg.Workers used to be consumed TWICE under different rules —
+	// `maxInt(cfg.Workers, 1)` cast to uint32 for ctrl.Workers/ctrl.QueueCount,
+	// and the RAW cfg.Workers passed to heartbeatZeroSlots below — so the two
+	// descriptions of "how many workers this dataplane has" could drift, and
+	// after the A6-b01-C1 narrowing fix they demonstrably DID: `workers
+	// 4294967296` clamps to the full heartbeat map for the zero-init loop
+	// while `uint32(maxInt(...))` narrows to 0 for the ctrl fields, telling the
+	// shim there are ZERO workers and ZERO queues. planUserspaceWorkers returns
+	// both numbers from a single clamp, so no call site can pair a clamped
+	// count with a raw one. cfg.Workers is read exactly once, here — a property
+	// worker_count_single_source_5718_test.go asserts on this function's AST.
+	plan := planUserspaceWorkers(cfg.Workers, heartbeatMap.MaxEntries())
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
-		Workers:            uint32(workers),
-		QueueCount:         uint32(workers),
+		Workers:            plan.Workers,
+		QueueCount:         plan.Workers,
 		Flags:              ctrlFlags,
 		WgListenPort:       wgPort,
 		ConfigGeneration:   0,
@@ -182,12 +195,23 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	// XDP shim correctly refuses to redirect until userspace begins updating.
 	{
 		var zeroHB uint64
-		// heartbeatZeroSlots clamps the worker count low to 1 and high to
-		// the Array's real capacity, so neither a negative nor an absurd
-		// cfg.Workers can make this loop wrap uint32 or index past the map
-		// (#4572).
-		slots := heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())
-		for slot := uint32(0); slot < slots; slot++ {
+		// The bound comes from the SAME derivation the ctrl fields above were
+		// built from (#5718 fold F3): heartbeatZeroSlots clamps the worker
+		// count low to 1 and high to the Array's real capacity, so neither a
+		// negative nor an absurd cfg.Workers can make this loop wrap uint32 or
+		// index past the map (#4572). Re-deriving it here from the raw
+		// cfg.Workers is what let the two descriptions diverge.
+		//
+		// #5718 fold r3: read plan.HeartbeatSlots INLINE in the loop condition
+		// rather than through a local. An intermediate `slots := ...` leaves a
+		// decoy an AST guard can be satisfied by while the loop counts against
+		// something else entirely — `slot < plan.Workers` zeroes one entry per
+		// WORKER instead of per SLOT: 1 of 32 at the default worker count
+		// (capabilities.go seeds Workers: 1), and 6 of 192 on the six-worker
+		// loss cluster. Every un-zeroed slot keeps whatever stale value it
+		// held. The bound the loop actually uses is the only thing worth
+		// pinning, so it is the only thing written.
+		for slot := uint32(0); slot < plan.HeartbeatSlots; slot++ {
 			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}
 	}
@@ -714,7 +738,7 @@ ctrlReady:
 		// slot.
 		if binding.QueueID >= bindingQueuesPerIface {
 			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-				"update userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (ifindex=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
+				"update userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (ifindex=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
 				binding.QueueID, uint32(bindingQueuesPerIface), binding.Ifindex,
 			))
 		}
@@ -757,7 +781,7 @@ ctrlReady:
 			// from the parent's binding, so bound it here too.
 			if binding.QueueID >= bindingQueuesPerIface {
 				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-					"update aliased userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (child=%d parent=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
+					"update aliased userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (child=%d parent=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
 					binding.QueueID, uint32(bindingQueuesPerIface), childIfindex, parentIfindex,
 				))
 			}
@@ -1564,11 +1588,61 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	seen := make(map[uint32]bool)
 	out := make([]uint32, 0)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
+			// #6691 round 8: the parent netdev is one a DIFFERENT row has
+			// already been refused a binding for on device grounds — an xfrmi
+			// under `bind-interface st10` with a zoned sibling unit is the
+			// reachable case. Appending its ifindex here re-admits exactly the
+			// netdev the predicate just excluded, and measured at head it did:
+			// the set came back [10 11] with 11 the live xfrmi.
+			//
+			// WHICH ROWS THE REFUSED PARENT ACTUALLY DISQUALIFIES (#6691 round
+			// 9). Round 8 dropped the WHOLE ROW here and justified it with "for
+			// a VLAN child the parent IS the bind target". True — but this
+			// branch is entered on `ParentIfindex > 0`, which is every UNIT
+			// row, not every VLAN row. A plain unit (`st10 unit 5` with no
+			// vlan-id) merely CARRIES a parent ifindex; its bind target is its
+			// OWN netdev, so a refused parent says nothing about it.
+			//
+			// Measured before this round with secure `st10` at ifindex 11 and an
+			// ordinary live `st10.5` at 12: Go ingress came back [10] — 12
+			// missing — while the RSS allowlist named `st10.5` and the Rust
+			// planner made it a candidate. That is the ingress/plan split in
+			// the OTHER direction from the one round 8 fixed: a netdev with a
+			// binding but no ingress entry takes cpumap_or_pass and leaves the
+			// adjudicated path.
+			//
+			// So the parent key is always suppressed, and the row survives iff
+			// it binds its own netdev. For a VLAN child (bind target == the
+			// parent) the whole row still goes, which is what keeps an ifindex
+			// out of the ingress map with no READY binding —
+			// drop_degraded_transit (BINDING_MISSING) — the invariant round 8
+			// was holding up and this preserves.
+			// BOTH KEYS (#6691 round 16, refusesNetdev): the parent's refusal
+			// can hold on the NAME alone — the parent's own base row is a
+			// separate buildLinkSnapshot from this unit row's parent lookup, so
+			// a base row that missed names the netdev without contributing an
+			// ifindex bucket. Rust's binding_target_is_refused asks by name and
+			// drops the child outright, so an ifindex-only reader here left
+			// both the child and the parent key adjudicated with no binding.
+			if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
+				if !userspaceOwnsItsNetdev(iface) {
+					continue
+				}
+				if iface.Ifindex > 0 && !iface.LogicalOnly {
+					key := uint32(iface.Ifindex)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, key)
+					}
+				}
+				continue
+			}
 			if iface.Ifindex > 0 && !iface.LogicalOnly {
 				key := uint32(iface.Ifindex)
 				if !seen[key] {
@@ -1596,6 +1670,21 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	for _, fab := range snapshot.Fabrics {
 		if fab.ParentIfindex <= 0 {
+			continue
+		}
+		// #6691 round 9: the sibling of the allowlist's fabric guard, and the
+		// same reachability — round 8's kernel-kind evidence refuses an xfrm
+		// device by DEVICE KIND, so a slot-shaped `ge-0/0/0` created out of band
+		// is both refused and a legal `fabric-options member-interfaces` value.
+		// Measured: ingress came back [20 21] with 20 the refused member. See
+		// UserspaceBoundLinuxInterfaces for why this is transparent to an
+		// ordinary fabric.
+		// BOTH KEYS (#6691 round 16, refusesNetdev): the fabric row and the
+		// interface rows are separate netlink samples — SyncFabricState
+		// refreshes the fabric rows alone — so an owning, unbindable row that
+		// missed names this netdev while the fabric row carries its live
+		// ifindex. The RSS allowlist's own fabric guard already asked by name.
+		if refused.refusesNetdev(fab.ParentLinuxName, fab.ParentIfindex) {
 			continue
 		}
 		key := uint32(fab.ParentIfindex)
@@ -1649,6 +1738,7 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		return nil
 	}
 	out := make(map[uint32]uint32)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
@@ -1656,37 +1746,22 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 || iface.Ifindex == iface.ParentIfindex || iface.LogicalOnly {
 			continue
 		}
+		// #6691 round 8: same redirect, same refusal. An alias here would tell
+		// the shim to treat frames on the child as arriving on a netdev the
+		// dataplane refused to bind. This site is inert on every config
+		// reachable today and is guarded anyway — the reachability analysis,
+		// per exclusion class, is in userspaceRefusedNetdevs
+		// (ingress_exclusions.go), which owns the contract.
+		// BOTH KEYS (#6691 round 16, refusesNetdev) — same sampling skew as the
+		// ingress loop above. An alias installed for a name-refused parent tells
+		// the shim to treat the child's frames as arriving on a netdev nothing
+		// ever binds.
+		if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
+			continue
+		}
 		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
 	}
 	return out
-}
-
-func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
-	if iface.Tunnel {
-		return true
-	}
-	base := iface.Name
-	if idx := strings.IndexByte(base, '.'); idx >= 0 {
-		base = base[:idx]
-	}
-	switch {
-	case strings.HasPrefix(base, "fxp"):
-		return true
-	case strings.HasPrefix(base, "em"):
-		return true
-	case strings.HasPrefix(base, "fab"):
-		return true
-	case base == "lo0":
-		return true
-	}
-	switch iface.Zone {
-	case "mgmt", "control":
-		return true
-	}
-	if iface.LocalFabric != "" {
-		return true
-	}
-	return false
 }
 
 func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {
@@ -1828,12 +1903,81 @@ const heartbeatSlotsPerWorker = 2 * 16
 // iterations that hang the apply for hours (#4572). Clamping the worker
 // count to mapCap/heartbeatSlotsPerWorker before the multiply keeps the
 // returned slot count <= mapCap and never wraps.
+// #5718 A6-b01-C1: BOTH clamps run in int space, BEFORE the uint32 cast.
+// Casting first (the pre-#5718 shape, `w := uint32(maxInt(workers, 1))`) let a
+// worker count above the uint32 range narrow into the clamp's blind spot and
+// defeat the very bounds this function exists to enforce: `workers` is an int
+// from a min-only schema leaf, so `1<<32` narrows to 0 — under maxW, so the
+// high clamp passes it through — and the function returns 0 slots, zeroing
+// NOTHING and leaving stale heartbeat entries live for every worker. `1<<32+5`
+// narrows to 5 and silently zeroes 5 workers' slots no matter how large maxW
+// is. Clamping in int space keeps the low clamp (>=1) and the high clamp
+// (<=maxW) both binding for every int input, and the cast then happens on a
+// value already proven to be within [1, maxW].
 func heartbeatZeroSlots(workers int, mapCap uint32) uint32 {
-	w := uint32(maxInt(workers, 1))
-	if maxW := mapCap / heartbeatSlotsPerWorker; w > maxW {
+	slots := uint32(effectiveWorkers(workers, mapCap)) * heartbeatSlotsPerWorker
+	if slots > mapCap {
+		// Degenerate: an Array too small to hold even one worker's slots
+		// (mapCap < heartbeatSlotsPerWorker). effectiveWorkers keeps its floor
+		// of 1 because "zero workers" is not a thing to report to the shim;
+		// the loop bound still may not leave the Array.
+		slots = mapCap
+	}
+	return slots
+}
+
+// userspaceWorkerPlan carries every representation of the bootstrap's worker
+// count, produced by one derivation (#5718 fold F3). Returning them together
+// is the contract: a caller cannot pair a clamped count with a raw one,
+// because there is only one clamp and both fields come out of it.
+type userspaceWorkerPlan struct {
+	// Workers is the count reported to the shim in userspaceCtrlValue's
+	// Workers AND QueueCount fields.
+	Workers uint32
+	// HeartbeatSlots is how many leading userspace_heartbeat Array slots the
+	// zero-init loop must write — Workers * heartbeatSlotsPerWorker, capped at
+	// the Array's capacity.
+	HeartbeatSlots uint32
+}
+
+// planUserspaceWorkers clamps the configured worker count ONCE and derives
+// every representation of it from that single value. See userspaceWorkerPlan.
+func planUserspaceWorkers(workers int, heartbeatMapCap uint32) userspaceWorkerPlan {
+	w := effectiveWorkers(workers, heartbeatMapCap)
+	return userspaceWorkerPlan{
+		Workers:        uint32(w),
+		HeartbeatSlots: heartbeatZeroSlots(w, heartbeatMapCap),
+	}
+}
+
+// effectiveWorkers is the single source of truth for "how many workers this
+// dataplane has" (#5718 fold F3). Every representation of that quantity —
+// userspaceCtrlValue.Workers, userspaceCtrlValue.QueueCount, and the heartbeat
+// zero-init loop bound — derives from this one value, so they cannot describe
+// the same number differently.
+//
+// The clamp runs entirely in INT space, before any uint32 cast, for the
+// A6-b01-C1 reason: cfg.Workers is an int from a min-only schema leaf
+// (ValidateIntegerMin(1)) with no upper bound in deriveUserspaceConfig, so a
+// cast-first implementation lets a worker count above the uint32 range narrow
+// into the clamp's blind spot — `1<<32` becomes 0 and `1<<32+5` becomes 5,
+// both of which look like legal counts and sail through every bound. That is
+// how the two representations diverged after A6-b01-C1: the zero-init loop got
+// the clamped value while ctrl.Workers/ctrl.QueueCount got the narrowed one.
+//
+// maxW is how many workers the fixed-size userspace_heartbeat Array can carry
+// slots for (4096 / 32 = 128 today), which is also the honest ceiling for the
+// ctrl fields: a worker with no zero-initialised heartbeat slot has none to
+// keep fresh, and the shim refuses to redirect on a stale slot. The floor
+// stays 1 even when the Array cannot hold a single worker's slots;
+// heartbeatZeroSlots caps the resulting SLOT count at mapCap for that
+// degenerate case instead of reporting zero workers.
+func effectiveWorkers(workers int, heartbeatMapCap uint32) int {
+	w := maxInt(workers, 1)
+	if maxW := int(heartbeatMapCap / heartbeatSlotsPerWorker); maxW >= 1 && w > maxW {
 		w = maxW
 	}
-	return w * heartbeatSlotsPerWorker
+	return w
 }
 
 func maxInt(a, b int) int {

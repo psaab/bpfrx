@@ -269,11 +269,47 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelFamilyWarnings...)
 
+	// #4785 half 1: IPIP (ip-in-ip, proto-4/41) has NO userspace dataplane
+	// primitive in either direction — the endpoint is never entered into
+	// gre_decap_index (only TunnelKind::Gre is) and the egress encap
+	// dispatcher's TunnelKind::Unknown arm fails closed — so a `mode ipip`
+	// tunnel is created, comes UP, and passes no traffic at all. Until #4785
+	// half 2 implements the decap stage, reject at commit / commit-check rather
+	// than accept into a blackhole (this replaces the #4788 warn-only
+	// advisory). Lenient on load / peer-sync (warn) so a config committed
+	// before this gate still boots — #1960; the runtime keeps it inert anyway.
+	// Runs after the outer-family gate so a family error still wins the
+	// first-error slot.
+	ipipWarnings, err := validateIpipTunnelUnimplementedStrict(cfg, opts.lenientIpipTunnelMode)
+	if err != nil {
+		return err
+	}
+	cfg.Warnings = append(cfg.Warnings, ipipWarnings...)
+
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility
 	// but configure nothing — warn so the operator knows the stanza is
 	// inert instead of silently dropping it.
 	cfg.Warnings = append(cfg.Warnings, userspaceRetiredKnobWarnings(cfg)...)
+
+	// #5831: a custom login class carrying a RESTRICTIVE regex the coarse RBAC
+	// gate does not enforce (deny-commands / deny-configuration) is
+	// hard-rejected on commit / commit-check, because accepting it would leave
+	// the denied verbs ALLOWED while the config says they are denied. Lenient
+	// on load / peer-sync (#1960 no-brick) — but there the class is FOLDED to
+	// the repair floor ({view,configure} ∩ what it already held) rather than
+	// merely warned about, so the persisted-config path resolves the
+	// un-enforceable restriction in the restrictive direction instead of
+	// preserving the fail-open, WITHOUT taking away the only access that can
+	// delete the statement. Runs BEFORE the #4304 advisory so the advisory
+	// describes the post-fold permission set.
+	if err := validateLoginClassDenyStrict(cfg); err != nil {
+		if opts.lenientLoginClassDeny {
+			cfg.Warnings = append(cfg.Warnings, foldLoginClassDenyToRepairableFloor(cfg)...)
+		} else {
+			return err
+		}
+	}
 
 	// #4304 S-2: custom `system login class <name>` definitions are
 	// accepted-with-advisory — recognized so a valid vSRX RBAC config commits,

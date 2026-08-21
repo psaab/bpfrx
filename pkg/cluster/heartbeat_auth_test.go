@@ -253,9 +253,19 @@ func TestHeartbeatAuthReplay_RetiredSessionABA(t *testing.T) {
 // bounded (heartbeatReplaySessions) with FIFO eviction, and documents the
 // security consequence: an entry is evicted ONLY after heartbeatReplaySessions
 // distinct NEWER sessions arrive — each of which requires a genuine peer reboot
-// (an attacker cannot mint valid frames for new sessions). A post-eviction
-// replay re-anchors ONCE but cannot be sustained (further replays are <= the
-// restored watermark).
+// (an attacker cannot mint valid frames for new sessions).
+//
+// A post-eviction replay of ONE session re-anchors once and no more (further
+// replays of THAT session are <= the restored watermark), which is all the
+// assertions below exercise — they retry the same session immediately. That is
+// NOT the same as "a post-eviction replay cannot be sustained", which an
+// earlier revision of this header claimed: CYCLING all heartbeatReplaySessions+1
+// captured sessions round-robin does sustain it, because FIFO eviction always
+// leaves exactly one just-evicted session to replay back in as never-seen. See
+// TestHeartbeatBootEpochClosesSustainedReplay_6169's
+// baseline_legacy_over_ring_capacity_is_sustained subtest, which measures the
+// sustained case this ring cannot close on its own — closing it is the boot
+// epoch's job (heartbeat_epoch.go).
 func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 	var r heartbeatAuthReplay
 
@@ -297,63 +307,67 @@ func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 	}
 }
 
-// TestHeartbeatReplayGatesLivenessRefresh binds the read-loop consequence
-// (heartbeat.go readLoop): a heartbeat is only allowed to refresh peer liveness
-// (r.lastSeen) and drive election (handlePeerHeartbeat) when the auth gate
-// ACCEPTS. It reconstructs the exact readLoop gate —
+// TestHeartbeatReplayGatesLivenessRefresh binds the read-loop consequence: a
+// heartbeat may refresh peer liveness (r.lastSeen) and drive election
+// (handlePeerHeartbeat) only when the auth gate ACCEPTS. A #5477 A->B->A replay
+// must therefore leave lastSeen untouched.
 //
-//	macOK      := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
-//	nonceFresh := macOK && r.auth.admit(session, counter)
-//	accept, _  := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, peerAuthSeen)
+// It drives heartbeatReceiver.admitFrame — the SAME function readLoop calls for
+// every datagram — and asserts on the receiver's OWN r.lastSeen.
 //
-// over real signed frames, and asserts that a #5477 A->B->A replay yields
-// accept==false, so the readLoop `continue`s and liveness is NOT refreshed and
-// the stale role is NOT applied. RED-on-revert: reverting admit re-admits the
-// replay, nonceFresh becomes true, accept flips true, and a replayed frame
-// would refresh liveness / drive a bogus election.
+// It used to do neither. It reconstructed the gate in a local `gate` closure
+// and counted a local `liveness` integer "standing in for
+// r.lastSeen.Store(MonotonicNanos()) in the readLoop". That is a third
+// hand-copy of the production gate (the two feed helpers were the others), and
+// it was measuring its own copy: the readLoop epoch read could be severed and
+// this test stayed green. A simulated consequence proves nothing about the real
+// one — assert on the field production writes.
+//
+// RED-on-revert: reverting heartbeatAuthReplay.admit re-admits the replay,
+// accept flips true, and lastSeen advances on a replayed frame.
 func TestHeartbeatReplayGatesLivenessRefresh(t *testing.T) {
-	key := []byte("cluster-shared-secret")
-	r := &heartbeatReceiver{auth: &heartbeatAuthState{}}
+	m := epochGateManager() // keyed with epochTestPSK, which is the key below
+	key := m.controlLinkAuthKey()
+	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
 
 	const (
 		sessA = 0xA11CE
 		sessB = 0xB0B
 	)
-	// gate mirrors the readLoop auth gate and returns whether the frame would
-	// refresh liveness. It mutates the receiver's real authReplay/peerAuthSeen
-	// state exactly as the readLoop does.
-	gate := func(frame []byte) bool {
-		session, counter, present := heartbeatAuthTrailer(frame)
-		macOK := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
-		nonceFresh := macOK && r.auth.admit(session, counter)
-		accept, _ := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.auth.peerAuthenticated())
-		if macOK {
-			r.auth.notePeerAuthenticated()
+	// feed drives the REAL receive gate and reports whether it accepted.
+	feed := func(frame []byte) bool {
+		t.Helper()
+		pkt, err := UnmarshalHeartbeat(frame)
+		if err != nil {
+			t.Fatalf("unmarshal: %v", err)
 		}
-		return accept
-	}
-
-	// A simulated liveness clock that only advances when the gate accepts —
-	// standing in for r.lastSeen.Store(MonotonicNanos()) in the readLoop.
-	var liveness int64
-	feed := func(frame []byte) {
-		if gate(frame) {
-			liveness++
-		}
+		return r.admitFrame(frame, pkt)
 	}
 
 	aOne := MarshalHeartbeatAuth(samplePkt(), key, sessA, 1)
 	bOne := MarshalHeartbeatAuth(samplePkt(), key, sessB, 1)
 
-	feed(aOne) // genuine A(1)
-	feed(bOne) // genuine reboot to B(1) — retires A
-	after := liveness
-	feed(aOne) // #5477 replay of retired A(1)
-	if liveness != after {
-		t.Errorf("replayed retired heartbeat refreshed liveness: liveness advanced %d -> %d (must NOT)", after, liveness)
+	if !feed(aOne) {
+		t.Fatal("genuine A(1) must be accepted")
 	}
-	if gate(aOne) {
-		t.Error("#5477: replayed retired frame must fail the readLoop auth gate (accept==false)")
+	if !feed(bOne) {
+		t.Fatal("genuine reboot to B(1) must be accepted")
+	}
+	// The liveness stamp production actually writes, sampled after the last
+	// GENUINE frame. MonotonicNanos has nanosecond resolution, so a refresh by
+	// the replay below is observable as a change.
+	after := r.lastSeen.Load()
+	if after == 0 {
+		t.Fatal("setup: an accepted frame must have stamped lastSeen")
+	}
+
+	if feed(aOne) { // #5477 replay of retired A(1)
+		t.Error("#5477: replayed retired frame must fail the receive gate")
+	}
+	if got := r.lastSeen.Load(); got != after {
+		t.Errorf("#5477: a replayed retired heartbeat refreshed peer liveness — "+
+			"r.lastSeen moved %d -> %d. A replay that refreshes lastSeen keeps a DEAD peer "+
+			"looking alive, so the survivor never takes over its RGs.", after, got)
 	}
 }
 

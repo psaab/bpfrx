@@ -41,7 +41,7 @@ func TestDeterministicParamsMatchWireBuilders(t *testing.T) {
 		},
 	}
 	for i, pool := range v4Pools {
-		portLow, portHigh, ok := sourceNATPoolPortRange(pool)
+		portLow, portHigh, ok := config.SourceNATPoolPortRange(pool)
 		if !ok {
 			t.Fatalf("v4 pool %d: unexpected invalid port range", i)
 		}
