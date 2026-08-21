@@ -80957,3 +80957,81 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/snapshot_allowlist_test.go,
   userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-20T00:00Z
+- **Action**: #6691 round 12 — hostile MERGE-NEEDS-MINOR at `29b9b84c0`: no runtime
+  defect (14 of 14 production-line reversions caught, protocol genuinely lockstep at
+  7 on both planes), but three guards had measured holes and guards are this PR's
+  deliverable. Test-and-doc round only; ZERO production lines move.
+  **F2 (BLOCKING) — neither new wire field's KEY was pinned on the Go side.**
+  Measured at `29b9b84c0`, both green: `json:"secure_tunnel,omitempty"` ->
+  `json:"secureTunnelXX,omitempty"` and `json:"parent_unbindable"` ->
+  `json:"parentUnbindableXX"`. The version guard cannot see this — both planes still
+  report 7, so `apply_snapshot` accepts, the field is simply absent and serde
+  defaults it false. For `parent_unbindable` that means an ownerless fabric parent
+  stops being refused, `replan_queues` admits the xfrmi, and
+  `replan_bindings_from_candidates` takes the global minimum: every physical NIC
+  drops to one queue and one worker (the #3091 ~6 Gbps regression the v7 bump exists
+  to prevent). Added `TestSecureTunnelWireKeyLockstepWithRust` and
+  `TestFabricParentUnbindableWireKeyLockstepWithRust`, which PARSE the Rust
+  `#[serde(rename = ...)]` out of `protocol/snapshot.rs` rather than mirroring a
+  literal, so they assert an agreement rather than a spelling. `secure_tunnel` is
+  marshalled with the flag TRUE: it is `omitempty` in Go and `skip_serializing_if`
+  in Rust, so the false case is byte-absent by design and a misspelled key is
+  byte-absent too. `parent_unbindable` additionally asserts the Go-emitted key is
+  present in `tests/fixtures/protocol_wire_v1.json`.
+  **F1 (BLOCKING) — the round-11 enumeration guard could not see the state its own
+  error message names.** `TestEveryNetdevProducerIsEnumerated`'s `covered()` helper
+  collected `vote.ifindex` for EVERY vote and never read `vote.role`, but
+  `buildUserspaceRefusedNetdevs` skips `netdevVoteAbstains` outright — so an
+  abstaining vote counted as covered while contributing nothing to the tally, which
+  IS the empty bucket the message describes. Reproduced: forcing the fabric vote to
+  `netdevVoteAbstains` at `29b9b84c0` left the guard PASSING. `netdevVoteAbstains`
+  is iota 0, so a third contributor with a zero-value role lands in the hole by
+  default. A bare role filter is wrong in the other direction — a VLAN child
+  abstains legitimately AND emits its own ifindex, because it binds the parent and
+  the refusal question about it is answered there. The guard now asserts "every
+  emitted netdev has a COUNTED verdict, or is a redirect whose target has one", with
+  the role filter taken from `buildUserspaceRefusedNetdevs` itself; the fixture
+  gained a VLAN child so the second arm is live, and both arms are asserted to have
+  FIRED.
+  **F3 — `fab.ParentUnbindable && !hasOwner` had no test in the hasOwner direction.**
+  Dropping the conjunct left both suites green. The narrowing is sound and its
+  failure direction is conservative (spurious commit abort, not fail-open), so this
+  was a missing test rather than a missing guard; added
+  `TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent` with a negative control so
+  the nil is the narrowing and not an inert gate.
+  **F4/F5 — two false claims in `userspace-dp/src/server/README.md`.** The
+  refusal-rule section still said the planes refuse a netdev "never when the netdev
+  has no owner at all", false since round 10 and contradicting the protocol section
+  250 lines earlier; rewritten as an explicit contributor list (owning row / VLAN
+  child / fabric fallback) that now says "round 10"/"round 11" so the section is
+  findable. The reachability paragraph spliced two incompatible conclusions with an
+  em-dash; the code says it IS reachable (kind-keyed), #6998 is closed.
+  **NON-FINDING recorded, no action:** deleting `t.owners > 0` from `refused()`
+  leaves both suites green and is provably DEAD — every non-abstaining vote does
+  `tally.owners++` before it can reach `tally.unbindable++`, and both call sites
+  range over that map.
+  **Validation — 9 cells, every cell carrying an always-failing sentinel so a green
+  is distinguishable from a suite that never ran; each edit anchor-verified (abort
+  on count != 1) and restore-verified; full `./pkg/dataplane/userspace/... ./pkg/daemon/...`
+  per cell.** CTRL rc=1, sentinel ONLY. M1 fabric vote forced to abstain: rc=1,
+  `TestEveryNetdevProducerIsEnumerated` (ifindex 20, no counted verdict) +
+  `TestOwnerlessFabricParentIsRefused` — the cell that PASSED the round-11 guard.
+  M2 fabric casts no vote at all: rc=1, enumeration guard + both protocol-gate
+  tests, so the round-11 property is preserved. M3 Go tag `secure_tunnel` renamed:
+  rc=1, only the new key test. M4 Go tag `parent_unbindable` renamed: rc=1, only the
+  new key test (both polarities). M5/M6 the RUST rename changed one-sidedly: rc=1,
+  the matching Go key test — the agreement binds in both directions. M7 drop
+  `&& !hasOwner`: rc=1, only the new F3 test. GD1 (guard-design control, my test not
+  production) drop the redirect arm: rc=1, the guard reds at head on the VLAN
+  child's ifindex 25 — the bare role filter really is wrong in the other direction.
+  At the committed head: `go build ./...` rc=0; `go test -count=1
+  ./pkg/dataplane/userspace/... ./pkg/daemon/...` rc=0, 0 `--- FAIL` lines; `cargo
+  test --no-fail-fast --bin xpf-userspace-dp -- --skip
+  afxdp::wg::engine::engine_internal_tests` rc=0, 4262 passed / 0 failed / 2 ignored.
+  No `.o`, no `userspace-xdp/`, no protocol or wire change — protocol stays at 7 on
+  both planes, so no fresh cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/wire_verdict_keys_6691_test.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  userspace-dp/src/server/README.md, _Log.md

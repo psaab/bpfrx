@@ -396,13 +396,40 @@ the Go RSS allowlist while this planner still planned a binding for it, and on
 a `ge-*` NIC the netdev's zoned VLAN sibling also left the ingress-adjudication
 map and the binding-alias table.
 
-Both planes now refuse a netdev only when **every row that OWNS it** — every
-row whose bind target is its own netdev, i.e. not a VLAN child redirecting onto
-a parent — is unbindable, and never when the netdev has no owner at all. The
-question the index answers is "is this netdev, as a DEVICE, one we must never
-bind?", and a device cannot be both: when its owners disagree, at least one
-owner is an ordinary data interface that will contribute the netdev on its own
-account, so refusing cannot prevent the binding and can only strip traffic.
+Both planes now refuse a netdev only when **every contributor that speaks for
+it** is unbindable. The question the index answers is "is this netdev, as a
+DEVICE, one we must never bind?", and a device cannot be both: when its owners
+disagree, at least one owner is an ordinary data interface that will contribute
+the netdev on its own account, so refusing cannot prevent the binding and can
+only strip traffic.
+
+**Who speaks for a netdev** (#6691 rounds 10 and 11 — an earlier revision of this
+paragraph said the planes refuse a netdev "never when the netdev has no owner at
+all", and that has been false since round 10):
+
+- A **row that owns the netdev** — a row whose bind target is its own netdev,
+  i.e. not a VLAN child redirecting onto a parent — always speaks for it.
+- A **VLAN child** speaks for nothing: it binds the PARENT, so it says nothing
+  about whether the parent may be bound, and the refusal question about the child
+  is answered on the target.
+- A **fabric parent** speaks for its netdev only where NO row does. A fabric
+  MEMBER needs no `set interfaces` stanza, so a fabric parent routinely has no
+  `InterfaceSnapshot` at all — and the round-9 rule, tallying over rows alone,
+  answered "not refused" over an EMPTY bucket and planned an AF_XDP binding on a
+  netdev the control plane refused. Round 10 gave the fabric a vote
+  (`FabricSnapshot.parent_unbindable`, the field the protocol moved to 7 for);
+  round 11 made it a FALLBACK rather than a co-voter, because two owners computing
+  one device's verdict from different evidence can DISAGREE, and unanimity reads a
+  disagreement as an admission. So a row-ownerless fabric parent marked unbindable
+  **is** refused — unanimity over a bucket of one — while a row-owned one leaves
+  the decision entirely to the rows. `ownerless_fabric_parent_is_refused` and
+  `TestOwnerlessFabricParentIsRefused` are the fail-on-revert guards.
+
+A netdev with no contributor at all never enters the tally, so the zero-owner
+fall-through in `netdevOwnerTally::refused` is unreachable rather than
+permissive; `snapshotNetdevVotes` (Go) is the single enumeration of who
+contributes, read by both the tally and the required-protocol gate so the two
+scopes cannot drift.
 
 The secure-tunnel exclusion is unaffected, and it survives on the ownership
 half rather than on a special case: under `bind-interface st10` the only row
@@ -432,13 +459,17 @@ the predicate or the index — `replan_queues`' fabric pass here, and
 `interfaces.go` / `maps_sync.go`. Measured with a Tunnel-class member
 (`set interfaces fab0 fabric-options member-interfaces gr-0/0/3`, interface-level
 tunnel on the member), the refused netdev is in the ingress set and in the
-allowlist. It is PRE-EXISTING (master's fabric loops are identical) and is NOT
-reachable for a secure tunnel — `LocalFabricMember` resolves only for
-slot-shaped member names, so an `st*` member yields no fabric row at all — so it
-was CLOSED in round 9 (#6998) rather than deferred — the KIND-keyed
-member (a slot-shaped netdev that IS an xfrm device) is reachable, and all four
-loops now ask the refused index. To bound a laundering question,
-enumerate every CONTRIBUTOR to the set, not every caller of the predicate.
+allowlist. It is PRE-EXISTING (master's fabric loops are identical), and it was
+CLOSED in round 9 (#6998) rather than deferred, because it is REACHABLE.
+
+The reasoning that once called it unreachable is worth keeping visible, because
+it read correctly and was answering the wrong question: "`LocalFabricMember`
+resolves only for slot-shaped member names, so an `st*` member yields no fabric
+row at all" is a statement about the NAME-keyed exclusion, and it did not survive
+round 8 keying the exclusion on device KIND. A slot-shaped `ge-0/0/0` created out
+of band as an `xfrm` device is both refused and a legal fabric member, so all
+four loops now ask the refused index. To bound a laundering question, enumerate
+every CONTRIBUTOR to the set, not every caller of the predicate.
 
 It does **not** enter the **egress map**. `populate_egress` needs a source MAC
 and takes it from the interface's own `hardware_addr`, else the parent's MAC,

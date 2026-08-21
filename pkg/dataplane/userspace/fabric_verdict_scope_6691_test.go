@@ -20,16 +20,21 @@ import (
 // IS an xfrm device by kernel kind. Nothing but the fabric row speaks for that
 // netdev, so its verdict is load-bearing — which is what makes it the case every
 // consumer of the verdict has to be checked against.
-func ownerlessXfrmFabricConfig(t *testing.T) *config.Config {
+//
+// extra appends further `set` lines for a caller that needs a SECOND shape
+// beside this one (#6691 round 12: the enumeration guard needs a VLAN child, the
+// one contributor that legitimately emits a netdev it holds no verdict for).
+// Callers that pass none get the round-11 fixture unchanged.
+func ownerlessXfrmFabricConfig(t *testing.T, extra ...string) *config.Config {
 	t.Helper()
-	return compileForTest5619(t,
+	return compileForTest5619(t, append([]string{
 		"set chassis cluster reth-count 2",
 		"set chassis cluster authentication-key abcdefghijklmnopqrstuvwxyz012345",
 		"set interfaces fab0 fabric-options member-interfaces ge-0/0/0",
 		// DELIBERATELY NO `set interfaces ge-0/0/0` — a member needs none.
 		"set interfaces ge-0/0/3 unit 0 family inet address 10.0.9.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/3.0",
-	)
+	}, extra...)...)
 }
 
 // TestProtocolGateArmsForAnOwnerlessFabricVerdict is the #6691 round 11 guard
@@ -98,6 +103,114 @@ func TestProtocolGateArmsForAnOwnerlessFabricVerdict(t *testing.T) {
 	}
 }
 
+// TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent is the OTHER direction
+// of round 11's protocol-gate narrowing (#6691 round 12).
+//
+// snapshotNetdevVotes declares a fabric verdict as needing the wire only where
+// it decides something: `verdictNeedsProtocol: fab.ParentUnbindable && !hasOwner`.
+// TestProtocolGateArmsForAnOwnerlessFabricVerdict above covers `!hasOwner` ->
+// ARMS. Nothing covered `hasOwner` -> DOES NOT ARM: measured at 29b9b84c0,
+// dropping `&& !hasOwner` left BOTH suites green, so the conjunct was carried by
+// its comment alone.
+//
+// The narrowing is sound, and stating why is the point of the test rather than a
+// caveat on it. With an owning row present the helper reaches the same verdict
+// from the row's own PRE-v7 fields — here the row's `tunnel` stanza, which a v6
+// helper reads and judges with the same exclusion classes — so the v7 field
+// decides nothing for this netdev. Arming anyway would abort a commit over a
+// difference that does not exist. That makes the mutation's direction
+// CONSERVATIVE (a spurious commit abort against an older helper, not a
+// fail-open), which is why this is a missing test rather than a missing guard.
+// An unbound conjunct is still a conjunct the next refactor deletes.
+//
+// FAIL-ON-REVERT: drop `&& !hasOwner` from verdictNeedsProtocol and this reds.
+func TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent(t *testing.T) {
+	const greIfindex = 20
+	defer stubLinkSnapshot5619(t, map[string]int{
+		"gr-0-0-3": greIfindex, "ge-0-0-3": 21, "fab0": 22,
+	})()
+	// No live xfrm device: the fabric parent is unbindable on its TUNNEL stanza,
+	// a pre-v5 field, not on the kernel-kind evidence only Go can sample.
+	defer stubXfrmNetdevs(t)()
+
+	cfg := compileForTest5619(t,
+		"set chassis cluster reth-count 2",
+		"set chassis cluster authentication-key abcdefghijklmnopqrstuvwxyz012345",
+		"set interfaces fab0 fabric-options member-interfaces gr-0/0/3",
+		// THE OWNING ROW: the member has an interface stanza, so a row speaks
+		// for the netdev and the fabric is not the only voice.
+		"set interfaces gr-0/0/3 tunnel source 10.0.0.1",
+		"set interfaces gr-0/0/3 tunnel destination 10.0.0.2",
+		"set interfaces ge-0/0/3 unit 0 family inet address 10.0.9.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/3.0",
+	)
+	snap, err := buildSnapshot(cfg, deriveUserspaceConfig(cfg), 0, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+
+	// PREMISE 1: the fabric row DOES call the parent unbindable. Without it the
+	// dropped conjunct changes nothing and the test passes for the wrong reason.
+	verdict := false
+	for _, fab := range snap.Fabrics {
+		if fab.ParentLinuxName == "gr-0-0-3" && fab.ParentUnbindable {
+			verdict = true
+		}
+	}
+	if !verdict {
+		t.Fatalf("premise broken: no fabric row calls gr-0-0-3 unbindable (fabrics %+v), so "+
+			"`fab.ParentUnbindable` is already false and dropping `&& !hasOwner` would be "+
+			"unobservable here", snap.Fabrics)
+	}
+
+	// PREMISE 2: an interface row OWNS that netdev — this is the hasOwner arm,
+	// not the ownerless one the sibling test covers.
+	owned := false
+	for _, iface := range snap.Interfaces {
+		if iface.LinuxName == "gr-0-0-3" && userspaceOwnsItsNetdev(iface) {
+			owned = true
+		}
+	}
+	if !owned {
+		t.Fatal("premise broken: no interface row owns gr-0-0-3, so this is the ownerless " +
+			"case and the narrowing under test does not apply")
+	}
+
+	// PREMISE 3: no row carries the v5 secure-tunnel flag, which would arm the
+	// gate on its own and mask what the fabric's vote contributes.
+	for _, iface := range snap.Interfaces {
+		if iface.SecureTunnel {
+			t.Fatalf("premise broken: row %q carries SecureTunnel, so the gate arms from the "+
+				"row scan regardless of the fabric's verdictNeedsProtocol", iface.Name)
+		}
+	}
+
+	if snapshotRequiresRefusalProtocol(snap) {
+		t.Errorf("snapshotRequiresRefusalProtocol = true. An owning row is present, so the "+
+			"helper computes this netdev's refusal from the row's own pre-v7 `tunnel` field and "+
+			"the v7 fabric flag decides nothing — requiring the protocol here aborts a commit "+
+			"against a helper that would have planned the identical binding (fabrics %+v)",
+			snap.Fabrics)
+	}
+
+	m := New()
+	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+	if err := m.ensureSecureTunnelProtocolLocked(snap); err != nil {
+		t.Errorf("gate = %v, want nil: an under-version helper must still accept a snapshot "+
+			"whose only unbindable fabric parent is one an interface row already speaks for", err)
+	}
+
+	// NEGATIVE CONTROL: the same gate DOES arm once the owner is taken away, so
+	// the nil above is the narrowing and not a dead gate.
+	ownerless := *snap
+	ownerless.Interfaces = nil
+	if !snapshotRequiresRefusalProtocol(&ownerless) {
+		t.Error("with the interface rows removed the gate still does not require the protocol: " +
+			"the fabric's verdict is not reaching verdictNeedsProtocol at all, so the assertion " +
+			"above cannot distinguish the narrowing from an inert gate")
+	}
+}
+
 // TestEveryNetdevProducerIsEnumerated is the #6691 round 11 structural guard: a
 // snapshot section that can put a netdev into the gated sets must be one the
 // verdict enumeration reads.
@@ -111,13 +224,38 @@ func TestProtocolGateArmsForAnOwnerlessFabricVerdict(t *testing.T) {
 //
 // So it asserts the PROPERTY and DISCOVERS the producer, in that order:
 //
-//  1. Every netdev in the ingress-adjudication set has a verdict in
-//     snapshotNetdevVotes. This is the invariant itself, and it does not care
-//     what produced the netdev — a new snapshot section, or an existing one
-//     emitting a netdev it holds no vote for (a fabric loop emitting its OVERLAY
-//     alongside its parent is that second shape).
+//  1. Every netdev in the ingress-adjudication set has a COUNTED verdict in
+//     snapshotNetdevVotes, or is a redirect whose verdict lives on its target.
+//     This is the invariant itself, and it does not care what produced the
+//     netdev — a new snapshot section, or an existing one emitting a netdev it
+//     holds no vote for (a fabric loop emitting its OVERLAY alongside its parent
+//     is that second shape).
 //  2. Zeroing each section in turn names WHICH input produced an uncovered
 //     netdev, so the failure points at the producer instead of at a number.
+//
+// COUNTED, NOT MERELY PRESENT (#6691 round 12, and this is the correctness half
+// of assertion 1). Round 11 collected `vote.ifindex` for EVERY vote and never
+// looked at `vote.role` — but buildUserspaceRefusedNetdevs skips
+// netdevVoteAbstains outright, so an abstaining vote made a netdev "covered"
+// while contributing nothing to the tally. That is the EMPTY BUCKET this test's
+// own failure text names, so the guard could not see the state it was written
+// for: measured at 29b9b84c0, forcing the fabric vote to netdevVoteAbstains (the
+// vote object still present, only the role changed) left this test PASSING and
+// redded only TestOwnerlessFabricParentIsRefused. Deleting the vote outright DID
+// red it — so round 11 bound "a producer is absent from the list" rather than "a
+// producer casts no counted verdict", and the second is the defect. It is a live
+// trap rather than a hypothetical: netdevVoteAbstains is iota 0, so a third
+// contributor registered with a zero-value role lands in the hole by default.
+//
+// A BARE ROLE FILTER WOULD BE WRONG IN THE OTHER DIRECTION, which is why the
+// predicate has a second arm. A VLAN child abstains legitimately AND emits its
+// own ifindex: it binds the PARENT (#2917 userspaceBindTargetNetdev), so the
+// refusal question about it is answered on the parent — buildUserspaceIngressIfindexes
+// asks refusesIfindex(iface.ParentIfindex), never the child's own. Excluding
+// every abstain would red this guard at head on the child's ifindex. So the
+// honest predicate is "every emitted netdev has a counted verdict, OR is a
+// redirect whose target has one", and both arms are asserted to FIRE below so
+// neither can go vacuous.
 //
 // Keyed on the property — "this input decides what is emitted" — not on a field
 // name, a type or the presence of a loop, any of which a producer can satisfy or
@@ -133,10 +271,20 @@ func TestProtocolGateArmsForAnOwnerlessFabricVerdict(t *testing.T) {
 func TestEveryNetdevProducerIsEnumerated(t *testing.T) {
 	defer stubLinkSnapshot5619(t, map[string]int{
 		"ge-0-0-0": 20, "ge-0-0-3": 21, "fab0": 22,
+		"ge-0-0-4": 24, "ge-0-0-4.100": 25,
 	})()
 	defer stubXfrmNetdevs(t)()
 
-	cfg := ownerlessXfrmFabricConfig(t)
+	// The ownerless fabric member supplies a netdev whose ONLY counted verdict
+	// is the fabric's fallback vote; the VLAN child on ge-0/0/4 supplies a
+	// netdev that is emitted with NO counted verdict of its own and is correct.
+	// Both shapes are required — one arm of the predicate each — and both are
+	// asserted to have fired at the end.
+	cfg := ownerlessXfrmFabricConfig(t,
+		"set interfaces ge-0/0/4 vlan-tagging",
+		"set interfaces ge-0/0/4 unit 100 vlan-id 100 family inet address 10.0.11.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/4.100",
+	)
 	base, err := buildSnapshot(cfg, deriveUserspaceConfig(cfg), 0, 0)
 	if err != nil {
 		t.Fatalf("buildSnapshot: %v", err)
@@ -149,45 +297,118 @@ func TestEveryNetdevProducerIsEnumerated(t *testing.T) {
 		}
 		return out
 	}
-	// The netdevs the enumeration has a verdict about, by ifindex — the key the
-	// ingress set is built on.
-	covered := func(snap *ConfigSnapshot) map[uint32]struct{} {
-		out := make(map[uint32]struct{})
+	// The netdevs the enumeration casts a COUNTED verdict about, split by role.
+	// The role filter is the one buildUserspaceRefusedNetdevs applies, so
+	// "counted here" and "tallied there" cannot drift: a vote this test accepts
+	// is exactly a vote that lands in a netdevOwnerTally.
+	countedVotes := func(snap *ConfigSnapshot) (all, fallback map[uint32]int) {
+		all = make(map[uint32]int)
+		fallback = make(map[uint32]int)
 		for _, vote := range snapshotNetdevVotes(snap) {
-			if vote.ifindex > 0 {
-				out[uint32(vote.ifindex)] = struct{}{}
+			if vote.role == netdevVoteAbstains || vote.ifindex <= 0 {
+				continue
 			}
+			all[uint32(vote.ifindex)]++
+			if vote.role == netdevVoteFallback {
+				fallback[uint32(vote.ifindex)]++
+			}
+		}
+		return all, fallback
+	}
+	covered := func(snap *ConfigSnapshot) map[uint32]int {
+		all, _ := countedVotes(snap)
+		return all
+	}
+	// A REDIRECT: a row whose AF_XDP binding lands on a netdev that is not its
+	// own, mapped to the netdev the binding — and therefore the refusal question
+	// — actually concerns. Derived from userspaceOwnsItsNetdev and
+	// ParentIfindex, the same two things the production branch in
+	// buildUserspaceIngressIfindexes consults, so this cannot excuse a shape
+	// production does not treat as a redirect.
+	redirects := func(snap *ConfigSnapshot) map[uint32]uint32 {
+		out := make(map[uint32]uint32)
+		for _, iface := range snap.Interfaces {
+			if userspaceOwnsItsNetdev(iface) || iface.Ifindex <= 0 || iface.ParentIfindex <= 0 {
+				continue
+			}
+			out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
 		}
 		return out
 	}
 
 	baseEmitted := emitted(base)
-	baseCovered := covered(base)
+	baseCounted, baseFallback := countedVotes(base)
+	baseRedirects := redirects(base)
 	if len(baseEmitted) < 2 {
 		t.Fatalf("premise broken: the fixture emits %d netdevs; the probe needs both "+
 			"producers populated or it cannot tell a producer from an inert field", len(baseEmitted))
 	}
 
-	// PRIMARY: no netdev reaches the gated set without a verdict. This holds
-	// whatever produced it — a new section, or an existing section emitting a
-	// netdev it has no vote for (a fabric emitting its OVERLAY as well as its
+	// PRIMARY: no netdev reaches the gated set without a COUNTED verdict about
+	// it or about the netdev its binding redirects onto. This holds whatever
+	// produced it — a new section, or an existing section emitting a netdev it
+	// casts no counted vote for (a fabric emitting its OVERLAY as well as its
 	// parent would be that second shape, and a probe that only compared set
 	// SIZES would call it covered).
+	excused := 0
 	for ifindex := range baseEmitted {
-		if _, ok := baseCovered[ifindex]; !ok {
-			t.Errorf("ifindex %d is in the ingress-adjudication set with NO verdict in "+
-				"snapshotNetdevVotes. It reaches the dataplane through a producer the "+
-				"enumeration does not read, so its owner bucket is EMPTY — and a unanimity "+
-				"rule over an empty bucket answers \"not refused\" (the #6691 round 9 "+
-				"fail-open). The required-protocol gate is scoped by the same enumeration, "+
-				"so it cannot see that netdev's verdict either", ifindex)
+		if baseCounted[ifindex] > 0 {
+			continue
 		}
+		target, isRedirect := baseRedirects[ifindex]
+		if !isRedirect {
+			t.Errorf("ifindex %d is in the ingress-adjudication set with NO COUNTED verdict in "+
+				"snapshotNetdevVotes, and it is not a redirect whose verdict lives on a target. "+
+				"It reaches the dataplane through a producer that either the enumeration does not "+
+				"read or that registers a vote which abstains, so its owner bucket is EMPTY — and "+
+				"a unanimity rule over an empty bucket answers \"not refused\" (the #6691 round 9 "+
+				"fail-open). netdevVoteAbstains is iota 0, so a contributor added with a "+
+				"zero-value role lands here by default. The required-protocol gate is scoped by "+
+				"the same enumeration, so it cannot see that netdev's verdict either", ifindex)
+			continue
+		}
+		if baseCounted[target] == 0 {
+			t.Errorf("ifindex %d redirects its binding onto ifindex %d, and NEITHER carries a "+
+				"counted verdict. A redirect is excused from having its own verdict only because "+
+				"the decision about it is taken on the TARGET (buildUserspaceIngressIfindexes "+
+				"asks refusesIfindex(ParentIfindex)); with the target's bucket empty too, that "+
+				"question is answered \"not refused\" vacuously", ifindex, target)
+			continue
+		}
+		excused++
+	}
+
+	// BOTH ARMS MUST HAVE FIRED. Without this the predicate could pass by never
+	// reaching either interesting case: a fixture that lost its VLAN child would
+	// make the redirect arm dead (and a bare role filter indistinguishable from
+	// this one), and a fixture that lost the ownerless fabric member would make
+	// the guard insensitive to the abstain regression it exists for.
+	if excused == 0 {
+		t.Error("no emitted netdev was excused as a redirect: the fixture no longer contains a " +
+			"row that binds a netdev other than its own, so the second arm of the predicate is " +
+			"dead code and this guard would be satisfied by a bare `role != abstains` filter — " +
+			"which is wrong at head, because a VLAN child abstains legitimately about the " +
+			"ifindex it emits")
+	}
+	fallbackOnly := 0
+	for ifindex := range baseEmitted {
+		if baseCounted[ifindex] > 0 && baseCounted[ifindex] == baseFallback[ifindex] {
+			fallbackOnly++
+		}
+	}
+	if fallbackOnly == 0 {
+		t.Error("no emitted netdev is covered ONLY by a fallback vote: the fixture no longer " +
+			"contains an ownerless fabric parent, so nothing here would notice if the fabric's " +
+			"vote stopped being counted — which is the #6691 round 10 regression and the reason " +
+			"the protocol moved to 7")
 	}
 
 	// SECONDARY: name the producing SECTION, so the failure above points at the
 	// input rather than at a number. Zeroing a section that changes what is
 	// emitted identifies it as a producer; its netdevs must leave the coverage
-	// with it.
+	// with it. "Coverage" here is the COUNTED coverage above — a section that
+	// took its emission away while a counted verdict about that netdev stayed
+	// behind is a section voting on someone else's device.
 	producers := make(map[string]struct{})
 	v := reflect.ValueOf(base).Elem()
 	for i := 0; i < v.NumField(); i++ {
