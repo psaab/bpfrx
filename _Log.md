@@ -1,3 +1,90 @@
+## 2026-08-20 — #6827 drive-to-merge: master merge (31 behind), hostile runtime pass, 9 issues filed instead of a round-12 fold
+
+- **Timestamp**: 2026-08-20 (fix/5719-api-hardening, PR #6827)
+- **Action**: Drive-to-merge pass under the campaign bar (runtime defects block;
+  every non-runtime finding is FILED, not folded — a tenth wording round does
+  not terminate).
+
+  **Merged `origin/master`** (24 commits behind at merge time, 44 ahead).
+  Only `_Log.md` conflicted; resolved by union with a structural check —
+  ours 1597 `##` headers, theirs 1606, merged 1616, zero headers dropped from
+  either side, zero NEW duplicate headers (the four duplicates present in the
+  result are present on BOTH sides at their respective heads). The #6743
+  `Daemon.dp` → atomic-cell migration that broke a sibling lane's clean textual
+  merge does NOT bite here: this PR adds no `pkg/daemon` test that constructs a
+  `Daemon` literal with a `dp` field. `go build ./...` rc 0 and
+  `go vet ./pkg/... ./cmd/...` rc 0 at the merge commit — checked rather than
+  inferred from a clean merge.
+
+  **Both deferred stale-cert delivery call sites re-verified BOUND at the
+  post-merge head**, by mutation rather than by reading `ccc2f6b09` into the
+  history. Content-copy restore with a `trap`, never `git checkout --`:
+
+  | mutation | result |
+  |---|---|
+  | control | rc 0 |
+  | drop `d.deliverStaleMgmtCertDiagnosis()` from `startHTTPServer` | rc 1 — `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827/boot_start_…` ONLY |
+  | drop it from `reconcileWebManagement` | rc 1 — `…/a_day2_reconcile_settles_a_debt…` + `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` |
+
+  Each mutation reds its own site and not the other: the two call sites are
+  independently bound, and `git status` was clean after each restore.
+
+  **Hostile runtime pass (TLS / net/http / Go stdlib), zero runtime defects.**
+  What was attacked and why it held:
+
+  - *Concurrent rename delivery vs. in-flight TLS handshakes.* 2381 real
+    `WarnStaleMgmtCertForHostName` deliveries against a live `ServeTLS` leg with
+    four goroutines dialling continuously, under `-race`: 0 races, 0 panics.
+    `buildHTTPSServer` hands each leg its own `*tls.Config` and nothing writes
+    `Certificates` after construction; the only stdlib write into that config is
+    `setupHTTP2_ServeTLS` appending to `NextProtos`, a different field, once,
+    before any handshake.
+  - *False NEGATIVE (the dangerous direction).* Walked the ordinary shape end to
+    end — `web-management https interface`, cert minted `[localhost, fw0]` +
+    `[127.0.0.1, ::1, 10.0.61.1]`, `set system host-name fw-edge1`: the rename
+    path WARNs (gate 3 skipped for `hostNameOperatorSet`) and the next boot's
+    load path WARNs too (`hostNameLikelyAccessIdentity` returns true on the
+    unqualified/unqualified shape match). The two halves also compose: a leg that
+    is `dead` at rename time has already been rebuilt by the SAME commit's
+    `reconcileWebManagement` (the new `!HTTPSServing()` term runs early in the
+    apply, `applyHostname` runs in the tail), so the delivery finds a serving
+    certificate. Where it fails to, the debt stands and is retried.
+  - *Wedge / panic on the mgmt listener.* `stopLegLocked` is `sync.Once`-guarded,
+    so a reconcile retiring an already-exited leg cannot double-close `stopCh`.
+    `http.Server.Serve` closes its listener on the way out (`defer l.Close()`)
+    BEFORE the goroutine stores `dead`, so a same-address rebuild after an
+    unexpected exit is not racing a held port. The `staleCertMu → lifeMu` edge is
+    a STALL, not a deadlock: `Server.Wait` waits only on leg goroutines and
+    nothing under them takes `staleCertMu`.
+  - *Commit-bricking.* The new `(next.TLS && !m.srv.HTTPSServing())` disjunct can
+    make `reconcileTo` return an error on every commit while an HTTPS bind keeps
+    failing — `daemon_apply.go:210-213` only WARNs on it, so a commit cannot be
+    bricked. Verified at the call site.
+  - *Certificate expiry.* Not a gap the diagnostic can miss into: the durable
+    cert is minted `NotAfter: +10 years` (`server.go:1611`), and `VerifyHostname`
+    checking no validity dates is therefore not reachable as a silent staleness.
+
+  **Two findings the hostile pass produced, both log-only, both FILED**: the
+  rename path WARNs about "remote clients" on a loopback-only HTTPS bind, where
+  `bindHostWarnable` makes the bind-host half of the same diagnostic decline
+  (#7039, measured with a probe over the package's own fixtures); and the
+  dead-leg retry re-runs the load-path cert diagnostic on every commit while the
+  bind keeps failing (#7041).
+
+  **Filed, not folded** (campaign policy): #7038 (deliverable tracking issue, so
+  the PR body can carry a `Closes` keyword without closing cohort #5719, which
+  still has the unfixed applied-nft item), #7039, #7041, #7043
+  (unparseable-cert `return true` unbound), #7044 (no-SANs terminal arm bound at
+  the load site only), #7045 (`hostName == bindHost` conjunct unbound in both
+  polarities), #7046 (README "reds only …" false at the shipped head), #7047
+  (surviving "up to `legDrainTimeout`" gloss + `serveBound` doc over-scoping the
+  5s `close_notify` to the HTTP leg), #7048 (hijack tripwire misses stdlib
+  `net/rpc`), #7049 (remaining unlocked `d.mgmt` readers — pre-existing on
+  master, verified with `git show origin/master:`).
+
+- **File(s)**: `_Log.md` (merge resolution + this entry). No production file
+  changed this round.
+
 ## 2026-08-13 — #6827 round 6: the two DEFERRED delivery call sites were unbound; the debt ledger's whole justification was unmeasured
 
 - **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
