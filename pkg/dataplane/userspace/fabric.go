@@ -8,7 +8,75 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// buildFabricSnapshots builds the fabric rows against a FRESH kernel xfrm
+// sample. buildSnapshot uses buildFabricSnapshotsFrom instead, so the interface
+// rows and the fabric parents are judged against ONE sample.
+//
+// SyncFabricState (manager_ha.go) uses this form for the MAC/ifindex/link-state
+// half and then discards the freshly sampled verdict — see alignFabricVerdicts,
+// which is also where the reason lives. An earlier revision of this comment said
+// SyncFabricState "has no interface rows to agree with", and that was simply
+// wrong: its rows are written back into m.lastSnapshot beside the existing
+// interface rows on both planes, so its sample has to agree with theirs.
 func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
+	return buildFabricSnapshotsFrom(cfg, sampleLiveXfrmNetdevs())
+}
+
+// alignFabricVerdicts returns fresh fabric rows carrying the device-level
+// VERDICT the applied snapshot already holds for each parent netdev.
+//
+// #6691 round 11. A fabric refresh (SyncFabricState, called after every
+// refreshFabricFwd) re-resolves peer MACs for cross-chassis forwarding; round 10
+// made it re-decide ParentUnbindable as a side effect, because the verdict is
+// computed inside the same builder. That is a partial view of a changing kernel:
+//
+//   - It DESYNCHRONISES THE TWO PLANES. Neither side replans on a refresh —
+//     Rust's `update_fabrics` swaps snapshot.fabrics in place (replan_queues runs
+//     only from the apply path), and the Go ingress-adjudication map was
+//     installed at apply time. The next partial republish (route overlay,
+//     scheduler, #5134 worker arm — all `next := *m.lastSnapshot`) then ships the
+//     new verdict and makes Rust replan while the Go map still carries the old
+//     answer. An ifindex in the ingress map with no READY binding is
+//     drop_degraded_transit (BINDING_MISSING), the unsafe direction.
+//   - It MIXES SAMPLES. The interface rows are only ever re-derived by a full
+//     build, so a refreshed fabric verdict is evidence from a different instant
+//     than the rows it shares a snapshot with.
+//
+// A binding verdict is a property of the APPLIED snapshot — taken once, with the
+// rows it must agree with, and changed only by applying a new one, which is also
+// the single moment both planes recompute together. A kernel that acquires an
+// xfrm device under a member's name is picked up at that next apply exactly as
+// it is for every interface row, so nothing is lost that was not already
+// deferred.
+//
+// Matched by parent NETDEV, which is the identity both planes key on
+// (snapshot_refuses_parent_netdev is name-keyed). A row with no stored
+// counterpart keeps its fresh verdict: fabric rows are derived from
+// m.lastSnapshot.Config, the same config the stored rows were built from, so a
+// new parent netdev cannot appear without a config change — and a config change
+// arrives through a full apply, which re-derives both halves anyway.
+func alignFabricVerdicts(fresh []FabricSnapshot, applied *ConfigSnapshot) []FabricSnapshot {
+	if applied == nil || len(fresh) == 0 {
+		return fresh
+	}
+	stored := make(map[string]bool, len(applied.Fabrics))
+	for _, fab := range applied.Fabrics {
+		if fab.ParentLinuxName == "" {
+			continue
+		}
+		stored[fab.ParentLinuxName] = fab.ParentUnbindable
+	}
+	out := make([]FabricSnapshot, len(fresh))
+	copy(out, fresh)
+	for i := range out {
+		if verdict, ok := stored[out[i].ParentLinuxName]; ok {
+			out[i].ParentUnbindable = verdict
+		}
+	}
+	return out
+}
+
+func buildFabricSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) []FabricSnapshot {
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return nil
 	}
@@ -46,23 +114,136 @@ func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
 		}
 		peerMAC := buildFabricPeerMAC(overlayIfindex, parentIfindex, in.peer)
 		out = append(out, FabricSnapshot{
-			Name:            in.name,
-			ParentInterface: parentName,
-			ParentLinuxName: parentLinux,
-			ParentIfindex:   parentIfindex,
-			OverlayLinux:    overlayLinux,
-			OverlayIfindex:  overlayIfindex,
-			RXQueues:        rxQueues,
-			PeerAddress:     in.peer,
-			LocalMAC:        parentMAC,
-			PeerMAC:         peerMAC,
-			Up:              fabricParentUp(parentLinux),
+			Name:             in.name,
+			ParentInterface:  parentName,
+			ParentLinuxName:  parentLinux,
+			ParentIfindex:    parentIfindex,
+			ParentUnbindable: fabricParentUnbindable(cfg, parentName, parentLinux, liveXfrm),
+			OverlayLinux:     overlayLinux,
+			OverlayIfindex:   overlayIfindex,
+			RXQueues:         rxQueues,
+			PeerAddress:      in.peer,
+			LocalMAC:         parentMAC,
+			PeerMAC:          peerMAC,
+			Up:               fabricParentUp(parentLinux),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// fabricParentUnbindable is the device-level verdict for a fabric parent
+// netdev: may the userspace dataplane bind an AF_XDP socket to it?
+//
+// #6691 round 10, and it exists because A FABRIC MEMBER NEEDS NO INTERFACE
+// STANZA. `set interfaces fab0 fabric-options member-interfaces ge-0/0/0` names
+// ge-0/0/0 without creating a row for it, so the parent netdev can reach the
+// ingress-adjudication map and the RSS allowlist — the fabric loops push it
+// there — while no InterfaceSnapshot owns it. userspaceRefusedNetdevs is built
+// from ROWS, so it had no evidence about such a netdev and, being a
+// unanimity rule over an empty bucket, returned "not refused". Round 9 read
+// that as an ADMISSION and let an unbindable ownerless parent through both
+// loops on both planes.
+//
+// The fix is not a fourth conjunct on the tally. It is that AN EMITTED FABRIC
+// PARENT IS AN OWNER OF ITS NETDEV: the fabric contributes that netdev to the
+// same sets a row does, on its own account, so it must carry a verdict and be
+// counted (snapshotNetdevVotes). This function is that verdict, and it is
+// deliberately computed by handing a synthetic row to userspaceUnbindableNetdev
+// rather than by restating the classes — the class table stays the single
+// authority on what makes a netdev unbindable, so a class added there covers
+// fabric parents without anyone remembering to.
+//
+// WHERE THE VERDICT IS CONSULTED (#6691 round 11): only where NO interface row
+// owns the netdev. Round 10 counted it as a co-owner beside any row, which made
+// one device two owners judged from different evidence, and a disagreement is
+// read as an admission. Two ways to produce one were reachable — a canonical
+// alias (fixed below by keying the stanza lookup on the netdev) and a re-sampled
+// kernel (fixed by alignFabricVerdicts) — but the rule change is what makes a
+// third one harmless. So this verdict is authoritative exactly where it is the
+// only evidence there is, which is the case it was written for.
+//
+// The synthetic row carries exactly the fields the class table reads:
+//
+//   - Name — the CONFIG name (`ge-0/0/0`), which is what the fxp/em/fab/lo0
+//     arms shape-test. A fabric parent is never itself `fab*`; the fab arm
+//     refuses the OVERLAY, which is a different netdev.
+//   - Tunnel — the parent's interface-level `tunnel` stanza, read through
+//     interfaceConfigForNetdev so the stanza is found under EITHER spelling of
+//     the device's name, mirroring what the BASE row would carry. A UNIT-level
+//     tunnel is deliberately not read: it makes the unit row unbindable and
+//     leaves the base row bindable, and the fabric binds the base netdev.
+//   - SecureTunnel — snapshotSecureTunnel against the SHARED sample, so an
+//     ownerless parent gets both halves of the evidence a row would get: an
+//     IPsec bind-interface naming it, OR kernel link kind `xfrm`. The kernel
+//     half is the reachable one here, and it is why this cannot be answered
+//     from config alone: a slot-shaped netdev created out of band is both a
+//     legal fabric member and a refused device.
+//
+// An empty parent name is bindable-by-default: nothing is emitted for it (the
+// fabric loops guard on the name/ifindex), so there is no netdev to judge.
+func fabricParentUnbindable(cfg *config.Config, parentName, parentLinux string, liveXfrm map[string]bool) bool {
+	if parentLinux == "" {
+		return false
+	}
+	parentTunnel := false
+	if parentCfg := interfaceConfigForNetdev(cfg, parentLinux); parentCfg != nil {
+		parentTunnel = parentCfg.Tunnel != nil
+	}
+	return userspaceUnbindableNetdev(InterfaceSnapshot{
+		Name:         parentName,
+		LinuxName:    parentLinux,
+		Tunnel:       parentTunnel,
+		SecureTunnel: snapshotSecureTunnel(cfg, parentName, parentLinux, liveXfrm),
+	})
+}
+
+// interfaceConfigForNetdev returns the authored interface stanza whose NETDEV is
+// linuxName, or nil when no stanza describes that device.
+//
+// #6691 round 11: keyed on the netdev, not on the authored spelling. LinuxIfName
+// maps '/' to '-' and nothing else, so `gr-0/0/3` and `gr-0-0-3` are two legal
+// authored names for ONE device — and a fabric member and its interface stanza
+// routinely carry different ones, because the member MUST be slot-spelled with
+// slashes for InterfaceSlot to resolve it to a node while the stanza name is a
+// wildcard the schema accepts either way. An exact map lookup missed the stanza
+// and returned a verdict about a device the config does describe, which under
+// round 10's co-voting fabric admitted a refused GRE device.
+//
+// The exact hit is tried first as a fast path — it can only hit a stanza whose
+// own name is already the Linux name, so it selects what the scan would.
+//
+// The scan takes the lexicographically LAST matching name rather than the first
+// one the map hands back. A committed config cannot have two:
+// validateInterfaceNameCollisionStrict (pkg/config) rejects one where two
+// authored names canonicalize to a single Linux name. But a verdict must not be
+// decided by Go's map iteration order on a config that never reached that gate,
+// and "last" is not arbitrary — it is the same name that validator names as the
+// winner ("the lexicographically later name would silently win") when two
+// stanzas contend for one device. The verdict then describes the stanza that
+// wins the device.
+func interfaceConfigForNetdev(cfg *config.Config, linuxName string) *config.InterfaceConfig {
+	if cfg == nil || linuxName == "" {
+		return nil
+	}
+	if ifc, ok := config.LookupInterface(cfg, linuxName); ok {
+		return ifc
+	}
+	var (
+		bestName string
+		best     *config.InterfaceConfig
+	)
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil || config.LinuxIfName(name) != linuxName {
+			continue
+		}
+		if best == nil || name > bestName {
+			bestName, best = name, ifc
+		}
+	}
+	return best
 }
 
 // fabricParentUp reports whether the fabric parent link's carrier/oper state is

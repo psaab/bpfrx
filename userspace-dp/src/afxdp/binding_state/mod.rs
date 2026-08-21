@@ -55,6 +55,15 @@ pub(in crate::afxdp) use latency::{
 pub(in crate::afxdp) use latency::REDIRECT_SAMPLE_MASK;
 pub(in crate::afxdp) use profile::{OwnerProfileOwnerWrites, OwnerProfilePeerWrites};
 pub(in crate::afxdp) use tx_inbox::{PENDING_TX_INBOX_HARD_CAP, PendingTxAdmission};
+// #6304: the admission-attempt test instrument. Same `cfg(test)` treatment as
+// `REDIRECT_SAMPLE_MASK` above — it has no production consumer, so gating the
+// re-export keeps production builds warning-free. Consumed by
+// `poll_descriptor/flow_cache_hit_tests.rs` through the absolute path
+// `crate::afxdp::binding_state::pending_tx_admission_attempts`.
+#[cfg(test)]
+pub(in crate::afxdp) use tx_inbox::{
+    pending_tx_admission_attempts, pending_tx_admission_attempts_reset,
+};
 
 /// Atomically published flow-worker diagnostic payload.
 #[derive(Default)]
@@ -686,6 +695,105 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// plain `bool` `SessionTable` can use under its `&mut self`.
     pub(super) delta_loss_pending: AtomicBool,
 }
+
+// #6304: FOUR PINNED LAYOUT VALUES, tripping if the `#[cfg(test)]`
+// admission-attempt instrument (`pending_tx_admission_attempts`, `tx_inbox.rs`)
+// moves any of them. Not a statement of whole-struct layout neutrality — see
+// "WHAT THIS IS, exactly" below, which bounds the claim rather than qualifying
+// it. This struct is the one whose
+// cross-core cacheline behaviour #6114 exists to fix, so an instrument that
+// moved anything in it would put a layout under test that production never has.
+//
+// These four asserts are deliberately NOT `#[cfg(test)]`. They are evaluated
+// once in the PRODUCTION configuration (`cargo build` / `make
+// build-userspace-dp`, instrument absent) and once in the TEST configuration
+// (`cargo test` / `make test-rust`, instrument present), against the same
+// literals — so an instrument that moved ANY OF THESE FOUR VALUES could satisfy
+// at most one of the two builds. That is the cross-configuration comparison a
+// `#[test]` alone cannot make; the runtime cell in
+// `binding_state/tests/tx_inbox.rs` re-asserts these numbers and carries the
+// reasoning.
+//
+// WHAT THIS IS, exactly. Four pinned values are a TRIPWIRE, not a layout
+// fingerprint. Size, alignment and two field offsets do not determine the
+// placement of the other ~90 fields, so a perturbation that moves only unpinned
+// fields satisfies all four literals in both configurations and passes
+// unnoticed. The guard is chosen for the specific hazard — a `#[cfg(test)]`
+// member reaching this struct — and the two offsets are the two shapes that
+// hazard takes (see the measured counterfactuals below); it is not a proof that
+// the test-configuration struct is layout-EQUAL to the production one.
+//
+// It is also a toolchain-and-target tripwire, not a portable invariant.
+// `BindingLiveState` is `repr(Rust)`, and this crate pins neither a
+// `rust-version` nor a toolchain file, so field placement is whatever the
+// compiler in use chooses. That direction of failure is safe — a changed value
+// is a compile ERROR reporting the actual number, never a silent accept — but it
+// does mean a toolchain upgrade or a different target can trip these literals
+// without anything in this file having moved. Re-measure and update; do not
+// widen the guard to make it stop failing.
+//
+// Measured, rustc 1.96.0, x86_64, both configurations:
+//   size 2304, align 64, offset(pending_tx_admitted) 2152,
+//   offset(delta_loss_pending) 2280.
+//
+// The two OFFSET asserts exist because size and align are NOT sufficient — both
+// counterfactuals were measured rather than argued:
+//   - a `#[cfg(test)]` `AtomicU64` FIELD declared ahead of `pending_tx_admitted`
+//     (the instrument shape an earlier round considered and declined) leaves
+//     size 2304 and align 64 UNCHANGED — it lands in existing tail slack — and
+//     moves `pending_tx_admitted` to 2160.
+//   - the same field declared LAST, after `delta_loss_pending`, leaves size,
+//     align and `pending_tx_admitted` all unchanged, and moves
+//     `delta_loss_pending` to 2288 (repr(Rust) reorders, so "declared last" is
+//     not "placed last").
+// A size-only guard would have called both of those harmless.
+//
+// If a legitimately new PRODUCTION field trips these, re-measure and update the
+// literals — the compile error reports the actual value. If only the TEST build
+// trips one, a test-only member has reached the struct and has moved one of
+// these four values.
+//
+// WHAT PINS THESE FOUR LINES — nothing, deliberately, and the cost of that is
+// measured rather than waved at. On this tree, deleting all four compiles the
+// complete test binary and the mirrored runtime cell in
+// `binding_state/tests/tx_inbox.rs` still PASSES; each line is individually
+// deletable with the same result. Nothing in the tree observes their absence.
+//
+// They are given no guard of their own because the only shapes available for
+// guarding a source construct are a match on its NAME or on its TEXT, and both
+// are proxies — a differently-spelled equivalent satisfies them, and they red on
+// a harmless rename while staying green on a semantic gutting. A guard that is
+// itself a `const` is no better: it would be exactly as deletable as what it
+// guards, and guarding IT is the same problem one level up. Every tripwire
+// terminates somewhere; this one terminates at itself, and says so here rather
+// than implying a completeness it does not have.
+//
+// Nor could a runtime witness exist even in principle. What these four lines
+// assert is a statement about the PRODUCTION configuration, and a test binary is
+// by construction the TEST configuration, so no `#[test]` can observe whether
+// they are present in the build that matters.
+//
+// What their presence buys, measured with a `#[cfg(test)]` `AtomicU64` declared
+// ahead of `pending_tx_admitted` — the hazard's own shape:
+//   - asserts present, literals untouched: `cargo build` (production) SUCCEEDS,
+//     because the field does not exist there, and the test build FAILS reporting
+//     2152 -> 2160 AND 2280 -> 2288.
+//   - asserts present, literals re-measured to 2160/2288 so the test build
+//     passes: the test build then SUCCEEDS and `cargo build` FAILS, reporting
+//     the same two values back the other way. That is the "at most one of the
+//     two builds" property, and it is what makes this guard un-satisfiable by
+//     re-measuring in whichever configuration happens to be in front of you.
+//   - asserts DELETED and the runtime cell's own literals re-measured to
+//     2160/2288: the production build and the test run BOTH pass, and the
+//     test-only perturbation is accepted in silence.
+// The last cell is exactly what deleting these four lines costs. It is also the
+// difference between them and the runtime cell: the runtime cell can be
+// re-measured green, and these cannot. Removing them is therefore a reviewable
+// act, not cleanup.
+const _: [(); 2304] = [(); std::mem::size_of::<BindingLiveState>()];
+const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
+const _: [(); 2152] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2280] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {

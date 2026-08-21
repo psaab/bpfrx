@@ -83,6 +83,26 @@ func (a *LegacyDataPlaneAdapter) AppliedNATView() AppliedNATView {
 	return m.AppliedNATView()
 }
 
+// ReadAllPolicyCounters forwards the #3965 bulk policy-counter snapshot.
+//
+// Codex PR #6743 r7-N2: the bulk reader existed on *Manager only, and the
+// daemon publishes the ADAPTER, so NewPolicyCounterReader's probe missed on
+// every one of its seven observability call sites and each of them silently
+// took the O(P*(P+C)) per-policy fallback the bulk path was written to
+// replace. Same capability-erasure class as the #2114 optional-probe bug,
+// with a performance cliff rather than a missing metric as the symptom.
+// This is a pure in-memory read of the manager's last published status (no
+// control-socket round trip), so forwarding it costs nothing on the path it
+// restores. Returns the manager's error when there is no manager, matching
+// every other forwarder here.
+func (a *LegacyDataPlaneAdapter) ReadAllPolicyCounters(cfg *config.Config) (map[uint32]dataplane.CounterValue, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return nil, err
+	}
+	return m.ReadAllPolicyCounters(cfg)
+}
+
 func (a *LegacyDataPlaneAdapter) IsLoaded() bool {
 	m, err := a.managerOrErr()
 	if err != nil || m.bpfShim == nil {
@@ -270,12 +290,18 @@ func (a *LegacyDataPlaneAdapter) BumpFIBGeneration() (uint32, error) {
 	return m.BumpFIBGeneration()
 }
 
+// NotifyLinkCycle on the adapter is NOT the live path, exactly as
+// PrepareLinkCycle below is not: the daemon reaches the manager through Link().
+// This method satisfies dataplane.DataPlane, whose NotifyLinkCycle is void
+// because the eBPF Manager's is a genuine no-op, so the manager's #6871 error has
+// nowhere to go here. It is discarded deliberately and only here — the live path
+// (userspaceLinkController.NotifyLinkCycle) propagates it to the commit.
 func (a *LegacyDataPlaneAdapter) NotifyLinkCycle() {
 	m, err := a.managerOrErr()
 	if err != nil {
 		return
 	}
-	m.NotifyLinkCycle()
+	_ = m.NotifyLinkCycle()
 }
 
 func (a *LegacyDataPlaneAdapter) SyncFabricState() {
@@ -464,12 +490,24 @@ func (a *LegacyDataPlaneAdapter) RecordDeferredWorkerArmDebt() {
 	m.RecordDeferredWorkerArmDebt()
 }
 
-func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() {
+// PrepareLinkCycle on the adapter is NOT the live path. The daemon reaches the
+// manager through Link(), which resolves a nil/unavailable manager to
+// dataplane.NewDataPlaneLinkController(nil) — a no-op controller that returns nil
+// ("nothing to join, proceed"). This method answers the same condition with an
+// error ("worker state unknown, abort") and is retained for the retirement
+// canary's LegacyDataPlaneAdapter surface. The divergence is deliberate: a nil
+// manager reached via Link() means no userspace dataplane is wired at all, while a
+// managerOrErr failure here means one was expected and could not be resolved. A
+// future caller must pick Link() unless it specifically wants the second reading.
+func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() error {
 	m, err := a.managerOrErr()
 	if err != nil {
-		return
+		// #5103: surface the resolution failure rather than reporting a
+		// successful worker join. A caller that cycles the link on this
+		// return would do so with an unknown worker state.
+		return err
 	}
-	m.PrepareLinkCycle()
+	return m.PrepareLinkCycle()
 }
 
 func (a *LegacyDataPlaneAdapter) RegenerateNeighborSnapshot() {

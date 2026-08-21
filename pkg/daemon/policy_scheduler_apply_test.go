@@ -118,9 +118,11 @@ func (d *runtimeOnlyApplyTestDP) SessionDeltas() dpruntime.SessionDeltaSource {
 
 type noopLinkController struct{}
 
-func (noopLinkController) SetDeferWorkers(bool) {}
-func (noopLinkController) PrepareLinkCycle()    {}
-func (noopLinkController) NotifyLinkCycle()     {}
+func (noopLinkController) SetDeferWorkers(bool)    {}
+func (noopLinkController) PrepareLinkCycle() error { return nil }
+func (noopLinkController) NotifyLinkCycle() error  { return nil }
+func (noopLinkController) RenewLinkCycle()         {}
+func (noopLinkController) AbandonLinkCycle() bool  { return false }
 
 type runtimeOnlyPolicyUpdaterTestDP struct {
 	runtimeOnlyApplyTestDP
@@ -188,8 +190,8 @@ func TestApplyConfigClearsDeferWorkersOnAbortCompileError(t *testing.T) {
 	}
 	d := &Daemon{
 		cluster: &cluster.Manager{},
-		dp:      dp,
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	cfg := &config.Config{
 		Chassis: config.ChassisConfig{
 			Cluster: &config.ClusterConfig{
@@ -228,9 +230,9 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 		compileErr: dpuserspace.ErrPolicySchedulerProtocolIncompatible,
 	}
 	d := &Daemon{
-		dp:                        dp,
 		policySchedulerConfigHash: oldHash,
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.scheduler.Store(oldScheduler)
 	d.policySchedulerEpoch.Store(42)
 	newCfg := &config.Config{
@@ -258,7 +260,8 @@ func TestApplyConfigProtocolAbortPreservesExistingScheduler(t *testing.T) {
 
 func TestApplyConfigPublishesScheduleStateToNonUserspaceDataplane(t *testing.T) {
 	dp := &policySchedulerApplyTestDP{}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 	cfg := &config.Config{}
 	activeState := map[string]bool{"workhours": true}
 
@@ -280,9 +283,9 @@ func TestApplyConfigUsesRuntimeConfigSinkWithoutLegacyDataplane(t *testing.T) {
 		t.Fatal("test dataplane unexpectedly implements legacy DataPlane")
 	}
 	d := &Daemon{
-		dp:   dp,
 		opts: Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	err := d.applyConfigLocked(context.Background(), &config.Config{})
 	if !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
@@ -298,7 +301,8 @@ func TestPolicySchedulerUpdateUsesRuntimeUpdaterWithoutLegacyDataplane(t *testin
 	if _, ok := any(dp).(dataplane.DataPlane); ok {
 		t.Fatal("test dataplane unexpectedly implements legacy DataPlane")
 	}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	d.updatePolicyScheduleStateLocked(&config.Config{}, map[string]bool{"workhours": true})
 
@@ -313,7 +317,8 @@ func TestPolicySchedulerUpdateUsesRuntimeUpdaterWithoutLegacyDataplane(t *testin
 func TestApplyConfigSeedsUserspacePolicySchedulerStateBeforeCompile(t *testing.T) {
 	dp := &userspacePolicySchedulerApplyTestDP{}
 	dp.compileErr = dpuserspace.ErrPolicySchedulerProtocolIncompatible
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 	cfg := testPolicySchedulerApplyConfig()
 
 	if err := d.applyConfigLocked(context.Background(), cfg); !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
@@ -340,7 +345,8 @@ func TestApplyConfigSeedsUserspacePolicySchedulerStateBeforeCompile(t *testing.T
 
 func TestPolicySchedulerInitialPublishSkipsUserspaceLegacyMapUpdate(t *testing.T) {
 	dp := &userspacePolicySchedulerApplyTestDP{}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 	cfg := testPolicySchedulerApplyConfig()
 	activeState := d.policySchedulerActiveStateForApplyLocked(cfg, testPolicySchedulerApplyNow())
 

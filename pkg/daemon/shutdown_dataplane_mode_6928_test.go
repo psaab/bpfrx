@@ -27,17 +27,19 @@ import (
 // pkg/dataplane's two source-scanning tests cannot express it, and this round
 // verified that by measurement rather than by reading them:
 //
-//   - inverting the condition to `if !hitless { d.dp.Close() } else {
-//     d.dp.Teardown() }` — the remediation exactly backwards — leaves
+//   - inverting the condition to `if !hitless { rt.Close() } else {
+//     rt.Teardown() }` — the remediation exactly backwards — leaves
 //     `go test -run 6928 ./pkg/dataplane/` GREEN;
-//   - replacing the call with `// d.dp.Teardown()` builds clean and also
+//   - replacing the call with `// rt.Teardown()` builds clean and also
 //     leaves it GREEN.
 //
 // Both are caught here, because this drives the REAL runShutdownSequence with
-// a substituted dataplane and observes which method it called. `d.dp` is a
-// dataplane.RuntimeDataPlane interface, so no production seam had to be added
-// for this; the harness follows daemon_shutdown_wiring_5523_test.go, which
-// already drives the same function end to end.
+// a substituted dataplane and observes which method it called. The published
+// dataplane is a dataplane.RuntimeDataPlane interface reached through the
+// #2114 atomic cell (d.setDataplane / d.dataplane()), so no production seam
+// had to be added for this; the harness follows
+// daemon_shutdown_wiring_5523_test.go, which already drives the same function
+// end to end.
 //
 // It is not a substitute for the pkg/dataplane caller-set test: that one pins
 // the OTHER end of the chain (that Teardown is what reaches Cleanup, and that
@@ -150,8 +152,12 @@ chassis {
 				store:     store,
 				applySem:  semaphore.NewWeighted(1),
 				daemonCtx: daemonCtx,
-				dp:        dp,
 			}
+			// #2114/#6743: the runtime dataplane is published ONLY through
+			// the atomic cell; `Daemon.dp` no longer exists. setDataplane is
+			// the accessor the daemon_dp_canary_test boundary permits, and
+			// runShutdownSequence reads it back with d.dataplane().
+			d.setDataplane(dp)
 
 			var wg sync.WaitGroup // empty: this harness starts no run goroutines
 			_, stopRun := context.WithCancel(context.Background())

@@ -283,7 +283,7 @@ snapshot captured when `startClusterComms` first ran. `startClusterComms` is
 only restarted on a **transport-field** change (`clusterTransportKey`), so a
 redundancy-group added by a day-2 commit would otherwise never receive a
 watchdog write — its watchdog would stay stale and the dataplane would refuse
-to forward for it. The loop is now gated on `d.dp != nil` alone (no startup
+to forward for it. The loop is now gated on a published dataplane alone (no startup
 RG-count precondition) so it also picks up the first RG added to a cluster that
 booted with none.
 
@@ -300,7 +300,7 @@ comms are only restarted on a transport change, a day-2 redundancy-group was
 absent from that snapshot and was **never fenced** — leaving it active on this
 node while the peer also became active for it (split-brain dual-active, the
 exact failure the fence exists to prevent). The handler is nil-safe in
-config-only mode (`d.dp == nil`) and when the config has no cluster stanza.
+config-only mode (no published dataplane) and when the config has no cluster stanza.
 
 ## What Was Eliminated
 

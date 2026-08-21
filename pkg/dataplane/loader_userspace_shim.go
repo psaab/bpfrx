@@ -210,13 +210,12 @@ func (m *Manager) loadUserspaceShimObjectsOnce() (err error) {
 		}
 	}
 
-	m.programs[userspaceShimEntryProg] = userspaceProg
-	for name, umap := range userspaceCollection.Maps {
-		m.maps[name] = umap
-	}
-	for name, smap := range sharedMaps {
-		m.maps[name] = smap
-	}
+	// #2114 A3: the registry assignments (program + both map loops) AND
+	// the armed flag publish as ONE whole-batch critical section —
+	// acquisition above (collection construction, program lookup,
+	// pinning) stays unlocked, the publication is the short locked
+	// publisher body.
+	m.publishShimRegistryLocked(userspaceProg, userspaceCollection.Maps, sharedMaps)
 	keepShared = true
 	return nil
 }
