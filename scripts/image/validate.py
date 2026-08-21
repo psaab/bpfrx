@@ -594,7 +594,26 @@ class Harness:
         e = self.iname("e")   # run-namespaced instance name (#4905-D)
         conf = os.path.join(self.work, "day0-node1.conf")
         with open(conf, "w") as f:
+            # The `chassis cluster` stanza is REQUIRED, not decoration.
+            # /etc/xpf/node-id does NOT select cluster naming: the daemon reads
+            # clusterMode from the committed config
+            # (namingParamsFromConfig -> cfg.Chassis.Cluster != nil), and
+            # hasNodeIDFile() feeds only computeBootClass (bootstrap vs
+            # normal). A node-id box with a cluster-less config runs STANDALONE
+            # naming by design (#4179). Without this stanza the daemon
+            # correctly produces fxp0 + ge-0-0-X and the em0 assertion below
+            # can never pass (#7129).
+            #
+            # authentication-key is mandatory for a cluster stanza to survive
+            # the real commit-check gate — the control channel fails OPEN
+            # without a PSK. It is a throwaway literal: this VM never peers
+            # with anything, and the scenario asserts naming only.
             f.write("system {\n    host-name xpf-node1;\n}\n"
+                    "chassis {\n    cluster {\n        node 1;\n"
+                    "        peer-address 10.99.12.1;\n"
+                    "        authentication-key "
+                    "\"xpf-image-validate-scenario-e-not-a-real-key\";\n"
+                    "    }\n}\n"
                     "interfaces {\n    fxp0 {\n        unit 0 {\n"
                     "            family inet {\n                dhcp;\n"
                     "            }\n        }\n    }\n}\n")
@@ -604,7 +623,7 @@ class Harness:
         iso = make_config_drive.build_config_drive(
             conf, os.path.join(self.work, "day0-node1.iso"), node_id=1,
             validate=False)
-        # Two extra NICs so the namer has em0 (idx 1) and ge-7/0/0 (idx 2).
+        # Two extra NICs so the namer has em0 (idx 1) and ge-7-0-0 (idx 2).
         self.launch(e, iso, extra_nics=2)
         self.wait_xpfd(e)
         if guest(e, "test", "-e", "/etc/xpf/.day0-config-applied",
@@ -622,10 +641,14 @@ class Harness:
         if not guest_sh(e, 'ip link show em0 >/dev/null 2>&1'):
             fail("em0 not present — daemon did not enter cluster naming mode "
                  "for a node-id-present image")
-        if not guest_sh(e, 'ip link show ge-7/0/0 >/dev/null 2>&1'):
-            fail("ge-7/0/0 not present — node-1 FPC-7 positional naming did not "
-                 "run (a node-0 image would name it ge-0/0/0)")
-        info("Scenario E PASS (node-id=1 persisted, cluster em0 + ge-7/0/N naming)")
+        # KERNEL link name, not the Junos display name: the namer assigns
+        # ge-{FPC}-0-{idx-2}, so `ip link show ge-7/0/0` could never match
+        # whatever the daemon did (#7129). `show interfaces terse` is where
+        # the slashes live.
+        if not guest_sh(e, 'ip link show ge-7-0-0 >/dev/null 2>&1'):
+            fail("ge-7-0-0 not present — node-1 FPC-7 positional naming did not "
+                 "run (a node-0 image would name it ge-0-0-0)")
+        info("Scenario E PASS (node-id=1 persisted, cluster em0 + ge-7-0-N naming)")
         self.drop(e)
 
     def scenario_qemu(self):
