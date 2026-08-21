@@ -19,8 +19,13 @@ func TestFirewallInterfaceSpecificAdvisory(t *testing.T) {
 	}
 }
 
-// TestCoSInetPrecedenceExpAdvisory pins fable-167 F-3b: inet-precedence
-// classifiers/rewrite and exp rewrite are captured and warned as inert.
+// TestCoSInetPrecedenceExpAdvisory pins fable-167 F-3b as NARROWED by #6847:
+// the inet-precedence REWRITE and exp rewrite are still captured and warned as
+// inert; the CLASSIFIER advisory was retracted because the classifier is now
+// enforced end to end (published on the wire and consulted by the dataplane BA
+// chain). The negative assertion below is the load-bearing half — it fails if
+// someone reinstates the retracted warning, which would tell an operator their
+// working classifier does nothing.
 func TestCoSInetPrecedenceExpAdvisory(t *testing.T) {
 	cfg := compileHB167(t, []string{
 		"set class-of-service forwarding-classes queue 0 best-effort",
@@ -41,12 +46,17 @@ func TestCoSInetPrecedenceExpAdvisory(t *testing.T) {
 	}
 	warnings := ValidateConfig(cfg)
 	for _, want := range []string{
-		"classifiers inet-precedence is accepted for compatibility but inert",
 		"rewrite-rules inet-precedence is accepted for compatibility but inert",
 		"rewrite-rules exp is accepted for compatibility but inert",
 	} {
 		if !hasWarningContaining(warnings, want) {
 			t.Fatalf("missing advisory %q in %v", want, warnings)
 		}
+	}
+	// #6847: the classifier advisory is RETRACTED. Assert its absence rather
+	// than merely dropping it from the list above — deleting the expectation
+	// would leave a reinstated stale warning undetected.
+	if hasWarningContaining(warnings, "classifiers inet-precedence is accepted for compatibility but inert") {
+		t.Fatalf("inet-precedence CLASSIFIER advisory should be retracted (#6847); got %v", warnings)
 	}
 }

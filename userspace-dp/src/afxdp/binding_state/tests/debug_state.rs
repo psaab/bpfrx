@@ -61,6 +61,8 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
     oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
     oversubscription_guarantee_fraction: 0.0,
     priority_low_min_share_bytes: 0,
+    inet_precedence_classifier: String::new(),
+    inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
     let mut runtime = build_cos_interface_runtime(&cfg, 0);
 
@@ -150,6 +152,8 @@ fn flush_v_min_scratches_no_op_when_all_zero() {
         oversubscription_policy: crate::afxdp::types::CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
     let runtime = build_cos_interface_runtime(&cfg, 0);
     // Pre-load atomics with non-zero values to verify the flush

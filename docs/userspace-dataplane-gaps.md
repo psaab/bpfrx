@@ -493,14 +493,16 @@ These are not "missing", but they are not pure userspace forwarding either:
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. #1379 is closed for the feature-gap audit; the final live cluster syslog proof was delivered in the closed #1477 validation set. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters in the utilization table. #5673 added a bounded aggregate cap (`MAX_DYNAMIC_NEIGHBORS`) as a pre-policy anti-DoS growth bound on the learned map, but surfacing the neighbor-cache count as a fill percentage against it is a separate `show system buffers` display change (deferred) — the cap refuses over-cap learns, it is not yet wired as a utilization denominator. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
 
-## Observability — per-zone traffic (populated, #3651) + flood counters (deferred)
+## Observability — per-zone traffic + flood counters (both populated, #3651)
 
 Per-zone ingress/egress packet+byte volume (`show security zones` "Traffic
-statistics") is now **populated by the userspace dataplane** (#3651). Per-zone
-SYN/ICMP/UDP flood-event counts (`show security screen ids-option statistics`
-"Per-zone flood counters") remain **not published** and render an explicit
-**"not available"** — deferred, leaning on the #3343 aggregate per-reason drop
-counters (see below).
+statistics") and per-zone SYN/ICMP/UDP flood-event counts (`show security screen
+ids-option statistics` "Per-zone flood counters") are both now **populated by
+the userspace dataplane** (#3651). Either surface still renders an explicit
+**"not available"** for a zone the helper did not publish — which is a real
+state, not a feature gap: the helper's blocks are sparse, so the sentinel covers
+a helper predating the accounting, a zone past the hot-path slot capacity, and a
+zone with no traffic / no flood events alike.
 
 - **HIDE (#3643) is what shipped first.** `dataplane.ReadZoneCounters` /
   `ReadFloodCounters` key a Go-side sparse offset map instead of indexing the
@@ -627,17 +629,47 @@ counters (see below).
   and asserts both halves belt-by-belt — the dup-zone belt sits above both
   parses and leaves neither, the other three sit below and leave both.
 
-- **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
-  attribution is NEW drop-path accounting (the screen module holds per-zone
-  rate-limiter state, not cumulative per-zone flood-event counters), and per the
-  §5A "recommended narrowing" it is the lower-value half. `SetFloodCounterOffset`
-  stays sourced only by tests, so `ReadFloodCounters` keeps returning
-  `ErrCounterNotPopulated` ("not available"). The live substitute is the #3343
-  aggregate per-reason drop counters (syn/icmp/udp-flood ordinals), which are
-  populated. Picking this up means adding a per-zone tally on the
-  `record_screen_drop` path (off the fast path) and a second sparse wire block.
+- **POPULATE flood (#3651) now ships too.** Per-zone SYN/ICMP/UDP flood-event
+  attribution is NEW drop-path accounting, not a snapshot of existing state: the
+  screen module holds per-zone rate-LIMITER state (token buckets, count-min
+  sketches), and the only durable screen accounting was global/per-reason
+  (`record_screen_drop` → `screen_reason_drops`, #3343). The tally therefore
+  lives on the DROP path — `BatchCounters::record_screen_drop` now also calls
+  `flood_counters::record_zone_flood_drop`, so one call feeds the aggregate, the
+  per-reason ordinal, and the per-zone family and a new drop site cannot bump one
+  while forgetting the others. Structure mirrors the traffic half exactly
+  (`userspace-dp/src/afxdp/flood_counters.rs`): flat `[u8; 65536]` zone-id → slot
+  LUT built from the same configured zone set (a static assert pins the two
+  capacities equal, so a zone is slotted for both families or neither), a
+  per-worker thread-local coalescer, and a lock-free per-RX-batch fold into
+  per-zone `AtomicU64` blocks the slot map cached at build time. It is coalesced
+  rather than folded at the drop site because a SYN flood IS the primary
+  screen-drop trigger — at attack rate every worker would otherwise `fetch_add`
+  the SAME zone's cache line per packet, the #1187 constraint `stage_screen_check`
+  already documents for the aggregate. The helper pre-sums into a second
+  `ProcessStatus`-level sparse block (`zone_flood_counters`, layout version 1,
+  nonzero rows only); the Go status poll mirrors it via
+  `ReplaceFloodCounterOffsets`; a `clear_flood_counters` control IPC resets the
+  helper store (the Go `ClearAllCounters` override sends it) so an operator clear
+  does not snap back on the next 1 s poll.
 
-- **Live substitutes for the flood gap.** Global flow statistics, per-interface
+  **Rejected-build safety, flood half.** The flood store is the exact sibling
+  of the traffic store above — `Arc`-backed, carried forward by the same
+  `previous` handle — so the #5716/#6832 split applies to it verbatim, and it
+  rides the SAME two functions rather than getting its own pair.
+  `attach_zone_counters` binds both families (additive get-or-create only,
+  after the fallible builder has returned `Ok`), and
+  `commit_zone_counter_prune` reconciles both stores at each apply path's own
+  commit point. Sharing the call sites is deliberate: a
+  `const _: () = assert!(FLOOD_COUNTER_SLOTS == ZONE_COUNTER_SLOTS)` in
+  `flood_counters.rs` exists so a zone is slotted for BOTH families or NEITHER,
+  and a separate `attach_flood_counters` / `commit_flood_counter_prune` pair
+  could be reordered, relocated, or forgotten at a new apply path independently
+  of the traffic pair — which would make that assert claim a coupling the code
+  no longer had. One call site makes the divergence unrepresentable rather than
+  merely tested for.
+
+- **Live substitutes and companions.** Global flow statistics, per-interface
   `Bindings[].RX/TX{Packets,Bytes}`, per-policy hit counters (#2118, zone-pair
   scoped), and per-screen-reason drop counters (#3343). Note that simply summing
   per-interface binding counters into zones (the §5C DERIVE shortcut) was

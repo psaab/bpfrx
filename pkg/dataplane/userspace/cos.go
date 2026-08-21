@@ -12,7 +12,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 		return nil
 	}
 	cos := cfg.ClassOfService
-	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.DSCPRewriteRules) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
+	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.INetPrecedenceClassifierDefs) == 0 && len(cos.DSCPRewriteRules) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
 		return nil
 	}
 	snap := &ClassOfServiceSnapshot{}
@@ -109,6 +109,47 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				})
 			}
 			snap.IEEE8021Classifiers = append(snap.IEEE8021Classifiers, classifierSnap)
+		}
+	}
+
+	// #6847: publish the inet-precedence classifiers. Before this the
+	// classifier compiled into INetPrecedenceClassifierDefs and stopped there
+	// — nothing crossed the wire, so the dataplane had no table to consult.
+	if len(cos.INetPrecedenceClassifierDefs) > 0 {
+		names := make([]string, 0, len(cos.INetPrecedenceClassifierDefs))
+		for name := range cos.INetPrecedenceClassifierDefs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.INetPrecedenceClassifiers = make([]CoSINetPrecedenceClassifierSnapshot, 0, len(names))
+		for _, name := range names {
+			classifier := cos.INetPrecedenceClassifierDefs[name]
+			if classifier == nil {
+				continue
+			}
+			classifierSnap := CoSINetPrecedenceClassifierSnapshot{Name: classifier.Name}
+			for _, entry := range classifier.Entries {
+				if entry == nil {
+					continue
+				}
+				// #2704: same skip+warn as the dscp / ieee-802.1 classifiers —
+				// an undefined forwarding-class ref is a commit-time warning,
+				// and the Rust builder drops the entry silently, so log it here
+				// to keep the loss visible.
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					slog.Warn("cos inet-precedence classifier references undefined forwarding-class; skipping entry (classifier partially absent)",
+						"classifier", classifier.Name,
+						"forwarding_class", entry.ForwardingClass,
+					)
+					continue
+				}
+				classifierSnap.Entries = append(classifierSnap.Entries, CoSINetPrecedenceClassifierEntrySnapshot{
+					ForwardingClass: entry.ForwardingClass,
+					LossPriority:    entry.LossPriority,
+					Precedences:     append([]uint8(nil), entry.Precedences...),
+				})
+			}
+			snap.INetPrecedenceClassifiers = append(snap.INetPrecedenceClassifiers, classifierSnap)
 		}
 	}
 

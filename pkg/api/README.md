@@ -1673,7 +1673,11 @@ under the daemon's errgroup. Nothing else imports this package.
   `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE).
   Pinned by `pkg/dataplane/zone_flood_counters_hide_test.go`,
   `pkg/cli/zone_flood_counters_hide_test.go`, and
-  `pkg/grpcapi/zone_flood_counters_hide_test.go`.
+  `pkg/grpcapi/zone_flood_counters_hide_test.go`. (#3651 later POPULATED both
+  families — see the two bullets below. The HIDE *read-path* fix is unchanged and
+  still load-bearing: the sparse offset map is still never a dense-array index,
+  and `ErrCounterNotPopulated` is still distinct from a read error. What changed
+  is that the sentinel is now the exception rather than the permanent state.)
 - **Per-zone TRAFFIC counters are populated again, and the Prometheus family is
   back (#3651).** The reason #3643 dropped the metrics — nothing populated them
   — no longer holds: the Rust helper accounts per-zone ingress/egress
@@ -1751,10 +1755,31 @@ under the daemon's errgroup. Nothing else imports this package.
     `xpf_counter_read_errors_total` (the #3345/#3408 skip-and-bump contract is
     intact — a degraded counter bridge stays alertable).
 
-  The per-zone FLOOD half remains DEFERRED (use the #3343 aggregate
-  `xpf_screen_drops_total` by reason); the flood offset map's setters remain
-  the populate hook for it. Pinned by `pkg/api/zone_counters_metrics_test.go`,
-  which replaced the `pkg/api` HIDE pin.
+  Pinned by `pkg/api/zone_counters_metrics_test.go`, which replaced the
+  `pkg/api` HIDE pin.
+- **Per-zone FLOOD counters are populated too (#3651, flood half).** The helper
+  now tallies per-zone `syn-flood` / `icmp-flood` / `udp-flood` screen DROPS on
+  the `record_screen_drop` path
+  (`userspace-dp/src/afxdp/flood_counters.rs`), publishes them in a second
+  pre-summed sparse `ProcessStatus` block (`zone_flood_counters`, layout version
+  1, nonzero rows only), and `syncBPFCountersLocked` REPLACES the whole Go flood
+  offset map from it (`Manager.ReplaceFloodCounterOffsets`) — replace, not merge,
+  for the same frozen-counter reason as the traffic half. `show security screen
+  ids-option statistics` (CLI and gRPC text) therefore reports live per-zone
+  flood-event counts. `ErrCounterNotPopulated` stays reachable and is NOT an
+  error: it covers a helper predating the accounting, a zone past the hot-path
+  slot capacity, and a zone that has never tripped a flood check, so the surfaces
+  keep rendering an explicit "not available" (with the CAUSE named, not the
+  retracted "not implemented" claim). There is still no per-zone flood REST or
+  Prometheus surface — the aggregate `xpf_screen_drops_total` by reason (#3343)
+  remains the alerting surface for flood drops. An operator clear
+  (`ClearAllCounters`) sends a `clear_flood_counters` IPC so the helper's
+  cumulative store resets and the cleared value does not snap back on the next
+  1 s poll. Pinned by `pkg/dataplane/flood_counter_retention_3651_test.go`,
+  `pkg/dataplane/userspace/flood_counter_syncloop_3651_test.go`,
+  `.../zone_flood_counters_status_test.go`,
+  `.../flood_counter_clear_3651_test.go`, and the populated-path leg of
+  `pkg/cli/zone_flood_counters_hide_test.go`.
 - Per-interface counter read failures get a uniform unavailable/error
   contract across all four interface-counter surfaces (#3464). Interface
   counters are intentionally out of the #3345 SECURITY-counter contract

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 // notPopulatedGRPCDP is a loaded DP whose per-zone traffic + flood reads report
@@ -86,7 +87,90 @@ func TestShowScreenStatisticsAllTextFloodNotAvailable(t *testing.T) {
 	if !strings.Contains(out, "Per-zone flood counters: not available") {
 		t.Fatalf("screen text lacks the per-zone flood 'not available' marker; got:\n%s", out)
 	}
+	// #3651 (the #6843 M3 lesson, applied to the flood half on the gRPC text
+	// surface too): bind the CAUSE clause, not just the invariant prefix.
+	// "not implemented in the userspace dataplane" was accurate under the #3643
+	// HIDE and is now actively wrong -- #3651 shipped per-zone flood accounting.
+	if !strings.Contains(out, "no per-zone flood counts published for this zone") {
+		t.Errorf("the unavailable line must name the CAUSE (nothing published for "+
+			"this zone), not just report unavailability:\n%s", out)
+	}
+	if strings.Contains(out, "not implemented") {
+		t.Errorf("the unavailable line still claims per-zone flood accounting is not "+
+			"implemented; #3651 shipped it, so this names the wrong cause:\n%s", out)
+	}
 	if strings.Contains(out, "warning") {
 		t.Fatalf("screen text raised a false flood counter-read warning; got:\n%s", out)
 	}
+}
+
+// populatedFloodGRPCDP is a loaded DP whose per-zone flood read reports live
+// counts -- the #3651 POPULATE state.
+type populatedFloodGRPCDP struct {
+	*dataplane.Manager
+	apply *dataplane.ApplyResult
+	rows  map[uint16]dataplane.FloodState
+}
+
+func (d *populatedFloodGRPCDP) IsLoaded() bool                          { return true }
+func (d *populatedFloodGRPCDP) LastApplyResult() *dataplane.ApplyResult { return d.apply }
+func (d *populatedFloodGRPCDP) ReadFloodCounters(id uint16) (dataplane.FloodState, error) {
+	fs, ok := d.rows[id]
+	if !ok {
+		return dataplane.FloodState{}, dataplane.ErrCounterNotPopulated
+	}
+	return fs, nil
+}
+
+// #3651: the SINGLE-ZONE gRPC screen-statistics path has its own
+// ErrCounterNotPopulated branch and its own render, distinct from the all-zones
+// loop above. Cover both of its arms: the unavailable line names the CAUSE, and
+// a published zone renders live counts.
+func TestShowScreenStatisticsSingleZoneTextFlood(t *testing.T) {
+	store := newSchedulerCounterGRPCStore(t)
+	apply := &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"trust": 40000, "untrust": 41000, "dmz": 42000}}
+
+	t.Run("unpopulated", func(t *testing.T) {
+		s := &Server{store: store, dp: &notPopulatedGRPCDP{Manager: dataplane.New(), apply: apply}}
+		var buf strings.Builder
+		if _, err := s.showScreenStatistics(
+			&pb.ShowTextRequest{Topic: "screen-statistics:trust"}, store.ActiveConfig(), &buf,
+		); err != nil {
+			t.Fatalf("showScreenStatistics() error = %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "no per-zone flood counts published for this zone") {
+			t.Errorf("the single-zone unavailable line must name the CAUSE:\n%s", out)
+		}
+		if strings.Contains(out, "not implemented") {
+			t.Errorf("the single-zone unavailable line names the wrong cause:\n%s", out)
+		}
+		if strings.Contains(out, "SYN flood events") {
+			t.Errorf("single-zone printed a misleading flood-event 0 block:\n%s", out)
+		}
+	})
+
+	t.Run("populated", func(t *testing.T) {
+		s := &Server{store: store, dp: &populatedFloodGRPCDP{
+			Manager: dataplane.New(),
+			apply:   apply,
+			rows:    map[uint16]dataplane.FloodState{40000: {SynCount: 11, ICMPCount: 22, UDPCount: 33}},
+		}}
+		var buf strings.Builder
+		if _, err := s.showScreenStatistics(
+			&pb.ShowTextRequest{Topic: "screen-statistics:trust"}, store.ActiveConfig(), &buf,
+		); err != nil {
+			t.Fatalf("showScreenStatistics() error = %v", err)
+		}
+		out := buf.String()
+		// Three DISTINCT values so a renderer that crossed two families fails.
+		for _, want := range []string{"SYN flood events", "11", "ICMP flood events", "22", "UDP flood events", "33"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("a published zone must render live flood counts; missing %q in:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "not available") {
+			t.Errorf("a published zone must not also render 'not available':\n%s", out)
+		}
+	})
 }

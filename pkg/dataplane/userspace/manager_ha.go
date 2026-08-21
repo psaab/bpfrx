@@ -1152,6 +1152,34 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 		}
 	}
 	m.bpfShim.ReplaceZoneCounterOffsets(zoneRows)
+
+	// #3651: the same mirror for the helper's pre-summed per-zone FLOOD-event
+	// totals, so Manager.ReadFloodCounters (and thus `show security screen
+	// ids-option statistics`) reports live SYN/ICMP/UDP flood-event counts
+	// instead of ErrCounterNotPopulated ("not available"). Only the three counts
+	// are sourced; FloodState's legacy WindowStart/SynproxyActive fields
+	// belonged to the deleted eBPF rate-limiter state and stay zero.
+	//
+	// REPLACE the whole map rather than setting row by row, for the identical
+	// reason as the traffic block above: the published set is complete and
+	// rebuilt each poll, so a zone that disappears from it must disappear here
+	// too. A per-row SetFloodCounterOffset can only add or overwrite, which
+	// strands the last value of any zone the helper stops reporting and leaves
+	// the screen-statistics surface serving a FROZEN flood count. That is
+	// reachable in normal operation — a zone pushed past the helper's slot
+	// capacity by a later config keeps its retained counts but stops being
+	// counted, so its row drops out while the zone stays configured. See
+	// ReplaceFloodCounterOffsets for the full disappearance taxonomy.
+	floodRows := make(map[uint16]dataplane.FloodState, len(status.ZoneFloodCounters))
+	for i := range status.ZoneFloodCounters {
+		f := &status.ZoneFloodCounters[i]
+		floodRows[f.ZoneID] = dataplane.FloodState{
+			SynCount:  f.SynFloodEvents,
+			ICMPCount: f.ICMPFloodEvents,
+			UDPCount:  f.UDPFloodEvents,
+		}
+	}
+	m.bpfShim.ReplaceFloodCounterOffsets(floodRows)
 }
 
 // safeDelta returns cur - prev. On counter reset (prev > cur), returns cur

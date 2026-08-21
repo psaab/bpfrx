@@ -198,7 +198,8 @@ pub(super) fn build_forwarding_state_with_counters(
 }
 
 /// Build a candidate `ForwardingState`, then — and only then — bind it to the
-/// carried-forward per-zone traffic-counter store.
+/// carried-forward per-zone counter stores (traffic, and since #3651's flood
+/// half, flood-event as well; `attach_zone_counters` binds both).
 ///
 /// #5716: that two-step shape is the load-bearing part. `ZoneCounterStore` is
 /// `Arc`-backed, so the carry-forward `clone()` is a HANDLE ON THE LIVE STORE
@@ -260,9 +261,12 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     Ok(state)
 }
 
-/// #3651 per-zone traffic counters: carry the cumulative store forward from the
-/// previous state (first apply creates it) so totals survive config commits,
-/// then build this snapshot's slot map against it.
+/// #3651 per-zone counters — BOTH families: carry each cumulative store forward
+/// from the previous state (first apply creates it) so totals survive config
+/// commits, then build this snapshot's slot maps against them. The traffic
+/// family (`zone_counters`) and the flood-event family (`flood_counters`) are
+/// bound here together; see the body for why they share one call site rather
+/// than getting an `attach_flood_counters` of their own.
 ///
 /// INFALLIBLE, and called only after the fallible builder has returned `Ok` —
 /// see [`build_forwarding_state_with_policy_counters_and_previous`].
@@ -292,6 +296,7 @@ fn attach_zone_counters(
     snapshot: &ConfigSnapshot,
     previous: Option<&ForwardingState>,
 ) {
+    use crate::afxdp::flood_counters::{FloodCounterSlotMap, FloodCounterStore};
     use crate::afxdp::zone_counters::{ZoneCounterSlotMap, ZoneCounterStore};
     let zone_ids: Vec<u16> = snapshot.zones.iter().map(|z| z.id).collect();
     let store = previous
@@ -299,6 +304,21 @@ fn attach_zone_counters(
         .unwrap_or_else(ZoneCounterStore::default);
     state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids, &store));
     state.zone_counter_store = store;
+    // #3651 flood half: the SECOND per-zone counter family, bound here rather
+    // than in its own function ON PURPOSE. Both families slot from the SAME
+    // `zone_ids` list in the same order, and a `const _: () = assert!(
+    // FLOOD_COUNTER_SLOTS == ZONE_COUNTER_SLOTS)` in `flood_counters.rs` pins
+    // their capacities equal precisely so a zone is slotted for BOTH or
+    // NEITHER. A separate attach function could be moved, reordered, or dropped
+    // independently of this one, which would make that assert claim a coupling
+    // the code no longer has; sharing one call site makes divergence
+    // unrepresentable instead of merely tested for.
+    let flood_store = previous
+        .map(|p| p.flood_counter_store.clone())
+        .unwrap_or_else(FloodCounterStore::default);
+    state.flood_counter_slot_map =
+        std::sync::Arc::new(FloodCounterSlotMap::build(&zone_ids, &flood_store));
+    state.flood_counter_store = flood_store;
 }
 
 /// Drop the per-zone counter blocks for zones `snapshot` no longer configures.
@@ -353,6 +373,15 @@ pub(in crate::afxdp) fn commit_zone_counter_prune(
 ) {
     let configured: rustc_hash::FxHashSet<u16> = snapshot.zones.iter().map(|z| z.id).collect();
     state.zone_counter_store.reconcile(&configured);
+    // #3651 flood half: same commit point, same `configured` set, same
+    // function — for the reason spelled out in `attach_zone_counters`. A
+    // separate `commit_flood_counter_prune` would need adding at every apply
+    // path this one is already called from, and the failure mode of forgetting
+    // one is silent: the flood store would retain a removed zone's blocks
+    // forever while the traffic store pruned them, so `show security zones` and
+    // `show security screen ids-option statistics` would disagree about which
+    // zones exist.
+    state.flood_counter_store.reconcile(&configured);
 }
 
 /// Every fallible step of the forwarding build. Returns `Err` on any snapshot
@@ -549,10 +578,11 @@ fn build_fallible_forwarding_state(
         let (slot_map, _slots_to_zero) = ColdPathSlotMap::build(prev_map, &pairs);
         state.cold_path_slot_map = std::sync::Arc::new(slot_map);
     }
-    // #3651 per-zone traffic counters are NOT built here. Binding this
-    // candidate to the carried-forward store mutates the LIVE, `Arc`-shared
-    // store (get-or-create per configured zone, plus the destructive prune), so
-    // it happens in `attach_zone_counters` after this fallible builder has
+    // #3651 per-zone traffic counters — and, since the flood half landed, the
+    // per-zone FLOOD-event counters with them — are NOT built here. Binding a
+    // candidate to either carried-forward store mutates the LIVE, `Arc`-shared
+    // store (get-or-create per slot-assigned zone, plus the destructive prune),
+    // so it happens in `attach_zone_counters` after this fallible builder has
     // returned `Ok` — see the doc comment on
     // `build_forwarding_state_with_policy_counters_and_previous`.
     //

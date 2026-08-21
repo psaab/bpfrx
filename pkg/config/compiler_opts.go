@@ -242,6 +242,11 @@ type compileOpts struct {
 	// the SAFE default, preserving the fail-SAFE posture on that boot.
 	// Same doctrine as lenientSchedulerMapRef.
 	lenientCoSLossPriority bool
+	// lenientCoSUnitClassifierConflict (#6847) downgrades the
+	// dscp+inet-precedence same-unit conflict to a warning on the tolerant
+	// Load / SyncApply paths, mirroring lenientCoSLossPriority. Strict on the
+	// operator commit path.
+	lenientCoSUnitClassifierConflict bool
 
 	// lenientCoSForwardingClassQueue (#4594) downgrades the
 	// class-of-service forwarding-class queue-range check
@@ -2221,6 +2226,7 @@ func lenientCompileOpts() compileOpts {
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
 		lenientCoSLossPriority:                 true,
+		lenientCoSUnitClassifierConflict:       true,
 		lenientCoSForwardingClassQueue:         true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,

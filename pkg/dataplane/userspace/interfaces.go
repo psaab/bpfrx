@@ -455,7 +455,12 @@ func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) [
 				CoSSchedulerMap:           coSUnitSchedulerMap(cosUnit),
 				CoSDSCPClassifier:         coSUnitDSCPClassifier(cosUnit),
 				CoSIEEE8021Classifier:     coSUnitIEEE8021Classifier(cosUnit),
-				CoSDSCPRewriteRule:        coSUnitDSCPRewriteRule(cosUnit),
+				// #6847: without this the unit-level inet-precedence binding
+				// compiles and is never published, so the dataplane sees no
+				// classifier and every packet falls through to the default
+				// queue — a bound-but-inert knob.
+				CoSINetPrecedenceClassifier: coSUnitINetPrecedenceClassifier(cosUnit),
+				CoSDSCPRewriteRule:          coSUnitDSCPRewriteRule(cosUnit),
 				// #1614 A1/A2: per-interface oversubscription policy
 				// + priority-low min-share. All default-zero/empty
 				// preserves current scheduler bit-for-bit.
@@ -600,6 +605,13 @@ func coSUnitIEEE8021Classifier(unit *config.CoSInterfaceUnit) string {
 		return ""
 	}
 	return unit.IEEE8021Classifier
+}
+
+func coSUnitINetPrecedenceClassifier(unit *config.CoSInterfaceUnit) string {
+	if unit == nil {
+		return ""
+	}
+	return unit.INetPrecedenceClassifier
 }
 
 func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {

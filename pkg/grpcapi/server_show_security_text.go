@@ -542,15 +542,18 @@ func (s *Server) showScreenStatistics(req *pb.ShowTextRequest, cfg *config.Confi
 				}
 				switch {
 				case errors.Is(err, dataplane.ErrCounterNotPopulated):
-					// #3643 HIDE: per-zone flood counters are not sourced by the
-					// userspace dataplane. Say so explicitly rather than a
-					// misleading 0.
+					// #3651: per-zone flood counters ARE sourced now; this zone
+					// has none published (helper predates the accounting, the
+					// zone lost its hot-path slot, or it never tripped a flood
+					// check). Say so explicitly rather than a misleading 0.
 					fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
 					if screenProfile != "" {
 						fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
 					}
 					buf.WriteString("  Per-zone flood counters: not available " +
-						"(per-zone flood accounting not implemented in the userspace dataplane)\n")
+						"(no per-zone flood counts published for this zone: helper predates " +
+						"per-zone flood accounting, the zone exceeded the dataplane's " +
+						"hot-path slot capacity, or the zone has recorded no flood events)\n")
 					buf.WriteString(s.screenSYNCookieCounterRows())
 				case err != nil:
 					fmt.Fprintf(buf, "Error reading flood counters: %v\n", err)
@@ -595,8 +598,8 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 				screenProfile = z.ScreenProfile
 			}
 			if errors.Is(err, dataplane.ErrCounterNotPopulated) {
-				// #3643 HIDE: per-zone flood counters are not sourced by the
-				// userspace dataplane. NOT a read failure -- do not set readErr
+				// #3651: per-zone flood counters ARE sourced now; this zone has
+				// none published. NOT a read failure -- do not set readErr
 				// (no false #3408 warning) and do not print a misleading 0;
 				// render an explicit "not available" row.
 				fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
@@ -604,7 +607,9 @@ func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builde
 					fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
 				}
 				buf.WriteString("  Per-zone flood counters: not available " +
-					"(per-zone flood accounting not implemented in the userspace dataplane)\n")
+					"(no per-zone flood counts published for this zone: helper predates " +
+					"per-zone flood accounting, the zone exceeded the dataplane's " +
+					"hot-path slot capacity, or the zone has recorded no flood events)\n")
 				buf.WriteString("\n")
 				continue
 			}

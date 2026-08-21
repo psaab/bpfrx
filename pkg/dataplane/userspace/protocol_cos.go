@@ -4,9 +4,14 @@ type ClassOfServiceSnapshot struct {
 	ForwardingClasses   []CoSForwardingClassSnapshot    `json:"forwarding_classes,omitempty"`
 	DSCPClassifiers     []CoSDSCPClassifierSnapshot     `json:"dscp_classifiers,omitempty"`
 	IEEE8021Classifiers []CoSIEEE8021ClassifierSnapshot `json:"ieee8021_classifiers,omitempty"`
-	DSCPRewriteRules    []CoSDSCPRewriteRuleSnapshot    `json:"dscp_rewrite_rules,omitempty"`
-	Schedulers          []CoSSchedulerSnapshot          `json:"schedulers,omitempty"`
-	SchedulerMaps       []CoSSchedulerMapSnapshot       `json:"scheduler_maps,omitempty"`
+	// INetPrecedenceClassifiers (#6847) carries `class-of-service classifiers
+	// inet-precedence <name>`. Additive: omitempty keeps the wire
+	// byte-identical for every config that does not use one, and an older
+	// helper ignores the key.
+	INetPrecedenceClassifiers []CoSINetPrecedenceClassifierSnapshot `json:"inet_precedence_classifiers,omitempty"`
+	DSCPRewriteRules          []CoSDSCPRewriteRuleSnapshot          `json:"dscp_rewrite_rules,omitempty"`
+	Schedulers                []CoSSchedulerSnapshot                `json:"schedulers,omitempty"`
+	SchedulerMaps             []CoSSchedulerMapSnapshot             `json:"scheduler_maps,omitempty"`
 }
 
 type CoSForwardingClassSnapshot struct {
@@ -34,6 +39,21 @@ type CoSIEEE8021ClassifierEntrySnapshot struct {
 	ForwardingClass string        `json:"forwarding_class,omitempty"`
 	LossPriority    string        `json:"loss_priority,omitempty"`
 	CodePoints      WireUint8List `json:"code_points,omitempty"`
+}
+
+// CoSINetPrecedenceClassifierSnapshot carries an IP-precedence
+// behavior-aggregate classifier to the dataplane (#6847). IP precedence is the
+// top 3 bits of the same DS field the DSCP classifier reads, so a unit binds at
+// most one of the two (validateCoSUnitClassifierConflict).
+type CoSINetPrecedenceClassifierSnapshot struct {
+	Name    string                                     `json:"name"`
+	Entries []CoSINetPrecedenceClassifierEntrySnapshot `json:"entries,omitempty"`
+}
+
+type CoSINetPrecedenceClassifierEntrySnapshot struct {
+	ForwardingClass string        `json:"forwarding_class,omitempty"`
+	LossPriority    string        `json:"loss_priority,omitempty"`
+	Precedences     WireUint8List `json:"precedences,omitempty"`
 }
 
 type CoSDSCPRewriteRuleSnapshot struct {

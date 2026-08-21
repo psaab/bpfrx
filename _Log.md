@@ -1,3 +1,168 @@
+## 2026-08-21 — #6211/#6876 drive round: all seven Codex findings re-verified at a moved head; zero attributable runtime defects
+
+- **Timestamp**: 2026-08-21 (fix/6211-synced-snat-rule-identity, PR #6876)
+- **Action**: Drive-lane merge-gate pass on a head that had moved 234 commits
+  behind master. Merged `origin/master` (NOT rebased — #6981 is stacked on
+  this branch), union-resolved `_Log.md` (3 hunks, `##` count 1588 + 1656 -
+  1587 = 1657 measured exactly, zero unique lines lost from either side), and
+  regenerated `docs/refactoring-audit-current.txt`, which this branch had never
+  refreshed after growing `nat/source.rs`.
+
+  RE-CLASSIFIED the seven Codex DO-NOT-MERGE findings against `origin/master`
+  rather than against the PR's own diff, because the F1 precedent showed at
+  least one had been mis-attributed. Result: F1, F2, F3, F4, F5, F6 and F7b all
+  reproduce IDENTICALLY on master and none of their production sites is in this
+  PR's file list — `nat/allocator.rs`, `ha/session_import.rs`,
+  `session_glue/commands/install.rs` and `reconcile/snapshot.rs` are untouched;
+  `allocator_key()` is untouched (its three appearances in the diff are all
+  comment text); and `reserve_synced_nat64_allocation` — F7b's selection site —
+  is untouched, the only nat64.rs production change being the release sweep.
+  F7a is the one fixed here. So the PR leaves no runtime defect of its own.
+
+  MUTATION MATRIX RE-MEASURED AT THIS HEAD rather than carried forward from
+  `6d881ebf8`: master's #6812 landed in `nat/source.rs` between the two, so the
+  tree the earlier matrix was measured against no longer exists. Four
+  discriminating cells, each required to redden a NAMED subset of the thirteen
+  `*6211*` tests (control: 13/13 green):
+
+    M1  disable pass 1 entirely            -> 8 RED / 5 GREEN (the 5 survivors
+                                              are the invariance + fallback
+                                              tests, which must stay green)
+    M6  drop the zone axis from
+        `matches_ignoring_scope`           -> 6 RED — and NOT the l4 / post-DNAT
+                                              cells, which that axis does not
+                                              feed
+    S1  restore the first-hit `break` in
+        the SNAT release sweep             -> exactly 2 RED, both named for the
+                                              sweep property
+    S2  restore the first-hit `break` in
+        the NAT64 release sweep            -> exactly 1 RED,
+                                              `nat64_6876_release_frees_every_prefix_holding_the_flow`
+
+  HOSTILE PASS, NAT + HA session-sync, entered expecting a runtime bug. The
+  new one hunted was the interaction with #6812, which master gained the same
+  day: `resolve_pool_allocators` leaves a budget-refused rule with
+  `pool_mode == true`, a fully expanded address vector and the DEFAULT
+  `PortAllocator`, and the standby's reservation loop gates on `pool_mode`
+  alone — so pass 1 can offer a reservation to a rule with no allocator behind
+  it, and because pass 1 returns on first success it would then SKIP the pass-2
+  fallback. It does not fire: `PortAllocator::default()` carries
+  `occupancy: Vec::new()` and `max_tracked_flows: 0`, so `reserve_flow` fails
+  closed on `addr_index >= occupancy.len()` and `reserve_address_only` fails
+  closed on `live_by_flow.len() >= max_tracked_flows`. Both verified by reading
+  the code, not inferred. The dependence is unbound, though — flipping that
+  default's `max_tracked_flows` to 1 reddens exactly ONE test in the whole
+  4477-test suite, and it is a #6812 status assertion — so it was FILED as
+  #7076 rather than folded (it is pre-existing on master's single-pass loop
+  too). Where the refused rule is the FIRST pool owner but not the active's
+  match, pass 1 is an improvement over master: master reserved on the dead
+  allocator, pass 1 skips to the rule the active matched.
+
+  Also attacked and held: wrong-rule reservation cannot leak (the sweep visits
+  every pool-mode rule and both `release_flow`/`rollback_flow` are guarded on
+  `live_by_flow[flow].translated == translated`, so it can neither over-free
+  nor under-free while the rule set is stable); cardinality is unchanged at one
+  reservation per call (both passes return on first success and pass 2 runs
+  only when pass 1 took none); pass 1's candidate set is a strict subset of
+  pass 2's and both take first-accepting, so no configuration can end with
+  FEWER reservations than master; a hostile peer's zone ids buy no new
+  authority, since the reservation still requires the rule's pool to OWN
+  `rewrite_src` and the peer already controls `rewrite_src` outright; and
+  `matches_ignoring_scope` is still `matches` minus `scope_matches` after the
+  merge — master's only addition inside `impl SourceNatRule` is
+  `allocator_key_for`, no new match axis. Confirmed firsthand that the active
+  stamps the SAME `from_zone_id`/`to_zone_id` into `SessionMetadata` that it
+  resolved its `from_zone`/`to_zone` NAMES from, and that
+  `handle_upsert_synced`'s #326 local re-resolution mutates only
+  `decision.resolution` and `owner_rg_id` — never the zone fields — so the pair
+  fed to pass 1 is the ACTIVE's.
+- **Validation**: `cargo build --release` rc 0;
+  `cargo test --manifest-path userspace-dp/Cargo.toml -- --test-threads=1`
+  rc 0 (4477 passed, 0 failed, 2 ignored); `go build ./...` rc 0;
+  `go vet ./...` rc 0; `make audit-check` rc 0;
+  `go test -count=1 ./pkg/refactoraudit/...` rc 0. A cluster smoke is OWED —
+  the diff moves `userspace-dp/` production code — and was NOT run by this
+  lane.
+- **File(s)**: _Log.md, docs/refactoring-audit-current.txt
+
+## 2026-08-13 — #6211/#6876 PR1 part 1: the NAT64 release kept the first-hit break this PR removed from source NAT
+
+- **Timestamp**: 2026-08-13 (fix/6211-synced-snat-rule-identity)
+- **Action**: Folded three of the four PR1 items from the Codex DO-NOT-MERGE
+  review. F2 (the per-worker reservation refcount) is NOT in this commit — it
+  is blocked on a design question reported to the lead (see below).
+
+  **F7a — the NAT64 release stopped at the first prefix that freed the flow.**
+  `release_nat64_allocation_with_mode` swept `nat64.prefixes` but `break`ed on
+  the first allocator that returned true. That is the SAME first-hit break this
+  PR REMOVED from `release_source_nat_allocation_with_mode`, left in place in
+  the parallel path — while the source-NAT comment explains at length why the
+  break is wrong and calls the resulting retention permanent. The PR fixed one
+  of two parallel paths and left the other contradicting its own reasoning.
+
+  Two prefixes come to hold ONE flow with no config edit, because the reserve
+  is occupancy-dependent: `reserve_synced_nat64_allocation` takes the first
+  prefix whose allocator ACCEPTS. A prefix whose port is transiently held by an
+  unrelated local flow is skipped and the reservation lands on a later prefix;
+  when the earlier one frees and the synced session refreshes (every HA
+  session-sync reconnect and every periodic re-upsert re-runs the reserve), the
+  same flow is held in both. One release then freed one and stranded the other
+  forever — nothing else removes a `live_by_flow` entry.
+
+  **The "at most one allocator" invariant was rewritten, not re-scoped.** The
+  sweep's stated justification was "Before #6211 the reserve was a pure function
+  of `rules`", scoping the invariant to an UNCHANGED rule set. That premise is
+  false on master, and master documents that it is false: its reserve loop has
+  the same per-rule fall-through and its own comment says a collision "leaves
+  the rule untouched and tries the next". Selection has ALWAYS been
+  occupancy-dependent, so a flow could already be held in two allocators with
+  the rule set untouched. The comment now says that, and the trailing
+  "(every pre-#6211 config)" parenthetical — which the rewrite falsified — was
+  corrected rather than left standing.
+
+  **Two stale citations** in the release-sweep rationale: the
+  `rollback_source_nat_allocation` sites are `:2644`/`:4912`, not `:2634`/`:4902`
+  (those are ordinary comment lines ten above). The other three were correct.
+
+- **File(s)**: `userspace-dp/src/nat64.rs`, `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat64_tests.rs`
+
+- **RED shown, not claimed.** `nat64_6876_release_frees_every_prefix_holding_the_flow`
+  reaches the two-prefix state through the production path (a squatting local
+  flow makes prefix A refuse, the reservation lands in B, the squatter retires,
+  the synced session refreshes into A) and then issues ONE release. Against the
+  unfixed code it fails as an ASSERTION, not a build break:
+
+      panicked at src/nat64_tests.rs:5567:5:
+      prefix B still owns the released flow's port: the NAT64 release stopped
+      at the FIRST prefix that freed it ...
+
+  Prefix A's assertion PASSES in the same run, so the guard discriminates
+  rather than merely failing. With the break removed: guard `ok`, and the full
+  suite is `CARGO_RC=0`, 4288 passed / 0 failed in the main suite (7 suites,
+  zero failures). `go build ./...` rc=0 (no Go changed). Exit codes captured
+  unpiped. No `cargo fmt` was run: the diff is three files, and the only
+  non-comment change is the removed `break`.
+
+  The observable is `reserve_nat64_pool_port`'s bool rather than "which port a
+  fresh allocation hands out" — a freed port goes on the recycle queue and is
+  not reissued immediately, which `nat64_4381_release_frees_the_port`'s
+  `assert_ne!` already pins.
+
+- **F2 (per-worker refcount) DEFERRED within PR1, reported to the lead.** The
+  agreed design was a holder-set bitmask keyed by `worker_id`, with the width
+  made structurally impossible to exceed. Verification found that assumption
+  false: `records: BTreeMap<u32, WorkerRuntimeRecord>` and
+  `coordinator/worker_manager.rs:70-79` documents that worker ids are SPARSE —
+  unregister handlers can remove the bindings carrying the low ids while a
+  high-id worker survives — so a sparse id >= 64 sets no bit with only two live
+  workers. There is no constant to assert against either: `MAX_WORKERS_SCRATCH
+  = 32` was removed and a test now exercises 40 slots. A bare counter is worse
+  still, and not only on worker exit: `reserve_flow` early-returns on a
+  same-tuple re-reserve, the path every refresh takes from the same worker, so
+  a counter incremented there inflates without bound and never drains.
+  Awaiting the lead's decision between bounding ids where they are assigned and
+  moving the peer-synced reservation to a single coordinator-owned take/release.
 ## 2026-08-21 — #5619 PR2 drive: merge master, repair a self-declaring premise
 
 - **Timestamp**: 2026-08-21 (fix/5619-ipsec-plaintext-warn, PR #6698)
@@ -2592,6 +2757,32 @@ Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
   against `origin/master` is Go and Markdown only; it does not reach
   `userspace-dp/`, `userspace-xdp/` or any compiled artifact.
 - **File(s)**: docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-08-21 — #6877 drive: inet-precedence loss-priority typo gate
+
+- **Timestamp**: 2026-08-21 (fix/6847-rust, PR #6877)
+- **Action**: First-pass hostile review of PR #6877 found one runtime hole and
+  fixed it. #6847 made the inet-precedence classifier's `loss-priority` LIVE
+  (`inet_precedence_lp_by_prec` feeds the egress rewrite), but
+  `validateClassOfServiceLossPriorityStrict` still covered only the dscp /
+  ieee-802.1 classifiers and the two rewrite-rule directions. MEASURED: `set
+  class-of-service classifiers inet-precedence p1 forwarding-class ef
+  loss-priority hgih code-points 5` committed CLEAN with no error and no
+  warning, carried `loss_priority: "hgih"` to the wire, and the helper's
+  `cos_loss_priority_index(&entry.loss_priority).unwrap_or(0)` silently
+  applied the LOW rewrite row. The identical typo on a `dscp` classifier is
+  rejected at commit. Added the inet-precedence arm to the shared gate; strict
+  on commit, downgraded to a warning on the tolerant Load / SyncApply path via
+  the existing `lenientCoSLossPriority` call site (#1960 no-brick).
+- **Validation**: 3 new guards (typo rejected, all four valid drop precedences
+  still accepted, tolerant path downgrades). Mutation-proved by emptying the
+  new loop's population (`for _, name := range []string(nil)`): the typo guard
+  and the tolerant-downgrade guard both RED, the valid-values control stayed
+  GREEN; restored from a byte snapshot and re-ran green. Full `go test
+  -count=1 ./pkg/config/` green.
+- **File(s)**: `pkg/config/compiler_validate_strict_cos.go`,
+  `pkg/config/cos_inet_precedence_classifier_6847_test.go`,
+  `docs/config-schema.md`, `_Log.md`
 
 ## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
 
@@ -7132,6 +7323,83 @@ tier through one shared definition (`config.SourceNATScopeTier`).
   pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
   userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
   userspace-dp/src/server/README.md, _Log.md
+## 2026-08-05 — #6847: enforce the inet-precedence classifier end to end
+
+- **Timestamp**: 2026-08-05 (fix/6847-rust) — completes the WIP below.
+- **Action**: wired the `inet-precedence` classifier through the wire and the
+  dataplane so the binding site the Go half added actually does something.
+  Wire: `inet_precedence_classifiers` on the CoS snapshot and
+  `cos_inet_precedence_classifier` on the interface snapshot, additive on both
+  sides. Dataplane: an 8-entry `inet_precedence_queue_by_prec` table beside
+  `dscp_queue_by_dscp`, a `resolve_cos_inet_precedence_classifier_queue_id` arm
+  reading `(dscp >> 3) & 0x7`, inserted after the DSCP arm and before 802.1p at
+  all five call sites. Retracted the classifier half of the accepted-but-inert
+  advisory; the rewrite-rules half stays.
+- **Three gaps found while building on the inherited half**, each of which
+  would have left the feature dead in the common case:
+  1. `coSInterfaceUnitHasBinding` did not list `INetPrecedenceClassifier`, so a
+     unit binding ONLY that classifier was parsed and then DISCARDED, taking
+     the whole CoS interface with it. Nothing reached the snapshot.
+  2. The `useful_cos_state` gate (#1183) had no inet-precedence arm, so an
+     interface with no shaping-rate and no scheduler-map was skipped even once
+     the binding survived.
+  3. The `ba_reclassify` gate had no inet-precedence arm, so a flow's queue
+     would freeze on its seed packet's marking.
+  Also wired the entry's `loss-priority` into `resolve_cos_loss_priority`;
+  without it `loss-priority high` would compile and silently apply the LOW
+  egress rewrite — the same accepted-but-inert shape inside the fix.
+- **Validation**: 14 guards mutation-proved, each reverted individually and
+  observed RED with an ASSERTION (not a build break) — 7 Rust, 7 Go; harness
+  snapshots each file's bytes, restores verbatim, and verifies the restore.
+  MEASURED and recorded: the out-of-range bounds check exists at two sites
+  whose key sets are always identical, so mutating either alone leaves the test
+  GREEN; the fail-closed property binds only when both are mutated, and the
+  test comment states that scope rather than claiming each site is independently
+  load-bearing. Full Rust cargo suite and full `go test ./...` green;
+  `go test ./pkg/refactoraudit/` green. `protocol_wire_v1.json` regenerated —
+  diff is exactly three additive keys, 0 removed, 0 changed.
+- **File(s)**: `userspace-dp/src/protocol/cos.rs`,
+  `userspace-dp/src/protocol/snapshot.rs`, `userspace-dp/src/protocol/tests.rs`,
+  `userspace-dp/src/policy_snapshot_error.rs`,
+  `userspace-dp/src/afxdp/types/cos.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/cos.rs`,
+  `userspace-dp/src/afxdp/tx/cos_classify.rs`,
+  `userspace-dp/src/afxdp/tx/test_support.rs`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/protocol_cos.go`,
+  `pkg/dataplane/userspace/cos.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/schema_cos.go`,
+  `docs/config-schema.md`, `docs/cos-traffic-shaping.md`, plus the new tests
+  and the struct-literal updates across the Rust test tree, `_Log.md`
+
+## 2026-08-05 — #6847 WIP: inet-precedence classifier, Go config half
+
+- **Timestamp**: 2026-08-05 (fix/6847-inet-precedence-classifier) — **INCOMPLETE**
+- **Action**: Go config half of enforcing the `inet-precedence` classifier.
+  Scope finding first: the issue described this as "accepted but inert", but the
+  unit-level `classifiers` schema had NO `inet-precedence` child at all, so the
+  classifier was definable at the top level and NOT BINDABLE — the bind line was
+  rejected by the schema. So the work is five layers, not three. Landed here:
+  typed entries (`CoSINetPrecedenceClassifier` + `...Entry`), the keyed
+  `INetPrecedenceClassifierDefs` map, the unit binding field, the unit-level
+  schema binding site, a 0..7 code-point collector, the classifier compile
+  mirroring dscp, interface->unit inheritance, and a dscp+inet-precedence
+  same-unit conflict gate (strict at commit, `lenientCoSUnitClassifierConflict`
+  downgrade on the tolerant Load/SyncApply path per #1960). Golden 4406
+  regenerated after verifying the diff was EXCLUSIVELY the new struct field —
+  18 keys added, 0 removed, 0 changed, all `INetPrecedenceClassifierDefs` — so
+  the regen masks no behavior change.
+- **NOT DONE — this branch must NOT merge as-is**: the wire fields and the Rust
+  classify arm are absent, so the binding site now EXISTS but does NOTHING. That
+  is worse than master, where the bind line is at least rejected outright. See
+  the commit body for the remaining work list.
+- **Validation**: `go test ./pkg/config/` green (real exit 0). No PR opened.
+- **File(s)**: `pkg/config/types_cos.go`, `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_strict_cos.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cos_platform.go`,
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
@@ -14607,6 +14875,7 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
     assertion (`left == right` 0 vs 2); restored → GREEN.
 - **File(s)**: userspace-dp/src/afxdp/coordinator/worker_manager.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
   userspace-dp/src/afxdp/coordinator/status.rs,
@@ -17261,6 +17530,7 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   a reload between them (Arc swap → `build_generation` advances) invalidates.
 - **File(s)**: userspace-dp/src/nat64.rs,
   userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/nat64_tests.rs, docs/feature-coverage.md
 - **Validation**: `cargo build` clean; 179 nat64 tests + full nat/forwarding/
@@ -79114,6 +79384,111 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 13:12
+- **Action**: #6211 — the HA STANDBY's synced source-NAT reservation picked its
+  rule by "first rule whose pool CONTAINS the translated address", while the
+  ACTIVE node picked by zone/policy match. Two source-NAT rules can carry the
+  SAME public pool address in SEPARATE allocators (the allocator is shared per
+  `SourceNatRule::allocator_key` = pool name + addresses + port range, so
+  distinct `pool_name`s with a common member address give one address two
+  independent `PortAllocator`s), and under that config the standby's
+  reservation landed in a DIFFERENT allocator than the active used for the same
+  session — so after a failover a new local flow matching the OTHER rule missed
+  the collision guard, reintroducing the reverse-path ambiguity the token
+  exists to prevent. Pre-existing: byte-identical to the shipped port-bearing
+  arm (#4388/#5336); #6210 mirrored it for the address-only case (#5338)
+  without introducing it. Fixed LOCALLY, with NO wire change: every input the
+  active's rule match consumes is already synced — the zone pair rides as
+  `ingress_zone_id`/`egress_zone_id` (`SessionSyncRequest` →
+  `SessionMetadata::ingress_zone`/`egress_zone`, legacy name strings as the
+  old-peer fallback; Go sender `buildSessionSyncRequestV4/V6` in
+  `manager_ha.go`) and the 5-tuple IS the session key. So rather than inventing
+  a second rule-identity scheme (the `PolicyCounterStore` stable-`rule_id`
+  precedent applies only if the identity must ride the wire, which it need
+  not), `reserve_synced_source_nat_allocation` re-runs the active's OWN
+  predicate: `SourceNatRule::matches` was split into shared `zone_matches` /
+  `l4_matches` / `address_matches` axes plus a new `matches_ignoring_scope`,
+  and the flow key it already built is byte-identical to the active's
+  SNAT-match tuple (original source, POST-DNAT destination, original ports —
+  `nat_match_flow.forward_key` in `poll_descriptor`). The #3096 interface /
+  routing-instance scope is the one axis the standby cannot confirm
+  (`NatScopeCtx` derives from LOCAL ifindex maps keyed on the ACTIVE's
+  ifindices), so it is treated as UNCONSTRAINED, not as a mismatch — rejecting
+  an interface-scoped rule would push the selection PAST the rule the active
+  used. Both passes share one `reserve_synced_on_first_pool_owner` body so the
+  reservation semantics cannot drift; the pre-#6211 first-pool-match remains an
+  unconditional pass-2 fallback (unresolvable zone pair, no confirmable match,
+  or every candidate refusing), so no config ends up with FEWER reservations
+  than before. Validation: a RED probe on the parent (`ad9591177`) proved the
+  divergence (reservation landed in the `dmz->wan` allocator for a `lan->wan`
+  session, cargo exit 101) before any fix; 9 new tests (2 fail-on-revert, 4
+  negative controls, 3 axis guards) + a 6-mutation matrix (disable-pass-1,
+  scope-checked `matches`, no-fallback, drop-l4-axis, pre-DNAT dst,
+  drop-zone-axis) proving each guard fires.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+  (`docs/refactoring-audit-current.txt` NOT regenerated: source.rs grows
+  1765 -> 1896 lines but stays in the same `[WATCH]` tier (1500-1999), and
+  the canary compares tier by path, so `go test ./pkg/refactoraudit/` passes
+  clean — verified, exit 0.)
+- **Timestamp**: 2026-08-05 21:05
+- **Action**: #6211 fold r1 — the rev6876 gate found a MAJOR that the PR itself
+  INTRODUCED, plus an unbound production call site. (1) LEAK: the two-pass
+  selection is not a pure function of `rules`, so a session re-upserted after
+  the selection outcome changes (zone delete/renumber -> `synced_zones` becomes
+  `None`; a rule-set `from zone`/`match` edit moves pass 1's candidate set)
+  reserves a SECOND time in a different, independent allocator —
+  `reserve_flow`'s idempotence is per-allocator and does not short-circuit —
+  and every live session re-upserts on HA session-sync reconnect and on a
+  post-delete-journal-overflow resync. `release_source_nat_allocation` stopped
+  at the FIRST allocator reporting released, stranding the other reservation
+  permanently; nothing reaps it (`live_by_flow` is removed only by
+  `release_flow`/`rollback_flow`/the stale-tuple replace, and
+  `gc_expired_chunked` sweeps LEASES not live flows), a config edit does not
+  rebuild the allocator (carryover keyed on `allocator_key()` alone), and the
+  orphan counts against `max_tracked_flows` to eventual `AllocatorExhausted`.
+  Fixed by dropping the first-hit `break` so release frees from EVERY pool-mode
+  rule; that cannot over-free because `release_flow`/`rollback_flow` return
+  false unless the stored translated tuple matches. The session_glue README had
+  asserted the OPPOSITE ("it locates the reservation wherever the reserve put
+  it") — true for one reservation, and this change is what made two possible;
+  corrected. (2) The only production call site was completely unbound: all nine
+  tests called `reserve_synced_source_nat_allocation` directly with a literal
+  `Some(("lan","wan"))`, so passing `None` at the call site or inverting
+  ingress/egress inside `synced_source_nat_zone_pair` both kept the suite green.
+  Added a `handle_upsert_synced` test driving the real entry point. Also bounded
+  the scope in code + docs (#5144 hard-rejects the motivating config at strict
+  commit — the live surface is pre-#5144 persisted configs and the tolerant
+  load / peer-sync path only), corrected the heatmap line count to 1896, and
+  used the unit-qualified `ge-0/0/1.0` the Go snapshot builder actually ships.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-05 22:40
+- **Action**: #6211 fold r2 — bind the delete-sync teardown END TO END. A
+  call-site deletion matrix over all four `release_source_nat_allocation`
+  call sites found TWO unbound: `handle_delete_synced` (exit 101 but ONLY the
+  known-flaky `shared_cos_lease` / `wg::engine` families failed, so not
+  attributable to the mutation — the full suite at head had zero failures) and
+  the GC reap in `worker/loop_body/mod.rs` (exit 0, zero failures). The r1 leak
+  test called `release_source_nat_allocation` DIRECTLY, binding the function and
+  leaving the wiring deletable. Added
+  `delete_synced_frees_both_allocators_end_to_end_6211`, which drives the whole
+  story through the REAL entry points: `handle_upsert_synced` twice (the second
+  against a snapshot that shares the allocators via the Arc-backed
+  `PortAllocator` clone but has lost `zone_id_to_name`, i.e. a zone
+  delete/renumber) to reach the two-allocator state, then
+  `handle_delete_synced`. Its `(1, 1)` precondition proves the leak state is
+  reachable through the real import path, not only via the direct call. The GC
+  reap gap is PRE-EXISTING and unrelated to #6211, so it was FILED as #6901
+  rather than folded in.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/tests.rs, _Log.md
 - **Timestamp**: 2026-08-05
   **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
   **[SUPERSEDED by the two entries below]**: the "fold to view-only" clause
@@ -85321,6 +85696,222 @@ Every RED above is an assertion failure, not a build break.
   `tests_session_ingress_identity.rs`.
 - **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
   userspace-dp/src/session/README.md, _Log.md
+## 2026-08-06 — #3651 per-zone FLOOD counters: populate the second half
+
+- **Timestamp**: 2026-08-06
+- **Action**: Close the deferred FLOOD half of #3651 (design of record:
+  `docs/research/3643-dead-counters/plan.md` §5A). `show security screen
+  ids-option statistics` rendered "Per-zone flood counters: not available" on
+  every zone because nothing sourced `dataplane.FloodState` — the #3643 HIDE
+  read-path fix shipped, the traffic half of POPULATE shipped, and the flood
+  half was explicitly deferred with `SetFloodCounterOffset` sourced only by
+  tests. Four parts:
+  1. **Rust tally.** New `userspace-dp/src/afxdp/flood_counters.rs` mirrors
+     `zone_counters.rs`: flat `[u8; 65536]` zone-id → slot LUT built from the
+     same configured zone set (a `const _: () = assert!(...)` pins the two
+     capacities equal, so a zone is slotted for both families or neither),
+     per-worker thread-local coalescer, lock-free per-RX-batch fold into
+     per-zone `AtomicU64` blocks the slot map cached at build time, sparse
+     snapshot, in-place `clear`, `reconcile`, and a `publishable_flood_rows`
+     filter that drops a zone that lost its slot (its retained counts can never
+     advance again — a frozen counter that looks alive). The tally is invoked
+     from INSIDE `BatchCounters::record_screen_drop`, which now takes the
+     ingress `zone_id` and the flood slot map, so the aggregate, the #3343
+     per-reason ordinal, and the per-zone family cannot drift at the many drop
+     sites. Deliberate departure from the §5A sketch: NOT a `fetch_add` at the
+     drop site. §5A called `record_screen_drop` "already off the fast path",
+     true of the forwarding path but not of load — a SYN flood IS the primary
+     `screen_drops` trigger, so at attack rate every worker would hammer the
+     ONE zone's cache line per packet, the #1187 constraint `stage_screen_check`
+     already documents for the aggregate.
+  2. **Wire.** One ProcessStatus-level pre-summed sparse block
+     `zone_flood_counters` (nonzero rows only) plus
+     `flood_counter_layout_version` / `flood_counter_overflow_active`, all
+     `#[serde(default)]` + `omitempty`, Rust `ZoneFloodCounterStatus` mirrored
+     by Go `ZoneFloodCounterStatus`. Golden wire fixture regenerated (additive).
+  3. **Go populate.** `Manager.ReplaceFloodCounterOffsets` (whole-map REPLACE,
+     never per-row set — a per-row setter can only add or overwrite, so a zone
+     the helper stops publishing keeps serving a FROZEN total forever), wired at
+     the SAME `syncBPFCountersLocked` poll site as `ReplaceZoneCounterOffsets`.
+  4. **Clear.** `clear_flood_counters` control IPC + helper reset handler, sent
+     from `Manager.ClearAllCounters` (the one-time operator path that already
+     drops the Go flood offsets). Clearing only the Go map snaps back within
+     <=1s. No new periodic control-socket caller.
+  Also corrected the now-false "per-zone flood accounting not implemented in the
+  userspace dataplane" cause clause on all four CLI/gRPC "not available" render
+  sites (the #6843 M3 lesson applied to the flood half).
+- **Validation**: four disjoint fail-on-revert cells, each verified firsthand as
+  an ASSERTION failure (never a build break):
+  (1) drop the `record_zone_flood_drop` call from `record_screen_drop` →
+  `record_screen_drop_attributes_flood_reasons_to_the_ingress_zone` panics
+  "trust zone must have per-zone flood counts after record_screen_drop", while
+  the over-reach guard `record_screen_drop_populates_per_reason_counters` stays
+  GREEN;
+  (2) rename the Go `syn_flood_events` json tag →
+  `TestZoneFloodCounterStatusWireRoundTrip` fails "Rust flood row mismatch:
+  {ZoneID:7 SynFloodEvents:0 ICMPFloodEvents:3 UDPFloodEvents:4}", and the
+  Rust-side twin (rename the serde tag) fails
+  `wire_invariant_default_specimens` "wire-format drift detected vs
+  protocol_wire_v1.json";
+  (3) swap the poll-site `ReplaceFloodCounterOffsets` for a per-row
+  `SetFloodCounterOffset` loop →
+  `TestSyncBPFCountersReplacesFloodOffsetsAcrossPolls3651` fails "the status
+  loop left a stale flood offset for a zone the helper stopped publishing
+  ({SynCount:90 ...}); want ErrCounterNotPopulated";
+  (4) drop `clearHelperFloodCountersLocked` from `ClearAllCounters` →
+  `TestClearAllCountersSendsFloodClearIPCAndIsDurable` fails "helper never
+  received the clear_flood_counters IPC".
+  `go build ./...` 0, `gofmt -l <touched>` clean,
+  `go test ./...` 0 (59 packages, zero FAIL), `cargo test --release --bins
+  --tests -- --test-threads=1` 0. All FOUR render paths that carry the reworded
+  cause clause (CLI single-zone + all-zones, gRPC text single-zone + all-zones)
+  now have both an unavailable-arm and a populated-arm test; the two single-zone
+  paths had no coverage at all before this change.
+  The disappearance fixture uses an ABSENT row in poll N+1, not a row reporting
+  0 -- "reported 0" and "not reported" are the two states the frozen-total bug
+  confuses, so a zero-valued fixture would pass with the defect present. (A
+  zero-valued row cannot occur anyway: FloodCounterStore::snapshot omits
+  all-zero rows at the source.)
+  No serialization guard is taken in the Rust tests, and that is deliberate:
+  there is NO process-global counter here (each test builds its own
+  FloodCounterStore), and the one piece of state that looks shared -- the
+  FLOOD_PENDING thread-local -- is per-test in practice. Verified rather than
+  assumed: a probe pair in which the first test recorded WITHOUT flushing and
+  the second flushed into a fresh store observed DISTINCT thread ids
+  (ThreadId(2)/ThreadId(3)) and ZERO leaked rows under --test-threads=1. A mutex
+  would protect nothing, so the finding is recorded in the test module's own doc
+  comment instead. Trial-merged onto master b8b39a16a in a scratch worktree
+  (master had moved from the e864bc9af base and touched afxdp/mod.rs): merged
+  Rust build 0, merged Go build 0, flood suites green on the merged result.
+
+  ROUND 2 (hostile review, B1 blocking, test-only additive): the Rust
+  COORDINATOR call site was unbound. `Coordinator::zone_flood_counters` had ZERO
+  test callers -- its only reference was the production wiring at
+  server/helpers/status.rs:321, while all 13 Rust flood tests drove the
+  `publishable_flood_rows` PRIMITIVE. A primitive test cannot see an over-reach
+  introduced at the coordinator, which is exactly the asymmetry #6843 closed on
+  the traffic half (its `zone_traffic_counters` accessor carries gates F1/R3 in
+  coordinator/tests.rs); the lesson had been learned on the Go plane and not
+  carried to Rust. Ported both gates as
+  `zone_flood_counters_drops_a_zone_that_lost_its_slot_3651`, mirroring the
+  traffic twin: apply 1 slots Z and publishes it; apply 2 exhausts capacity so Z
+  loses its slot while staying configured and RETAINING its counts (asserted, so
+  the test cannot pass by the data vanishing); a SURVIVOR that kept its slot must
+  keep publishing; then SURVIVOR is removed from the configured set and must stop.
+  THREE mutations, each verified firsthand as a DISTINCT assertion failure (cargo
+  exit 101 = assertion, never a compile error):
+    M1 `|zone_id| configured.contains_key(&zone_id)` -> `|_| true`
+       -> tests.rs:4869 "a zone dropped from the configured set kept publishing:
+       the configured predicate must hold independently of the slot predicate:
+       [ZoneFloodCounterStatus { zone_id: 1, ..., udp_flood_events: 1 }]"
+    M2 blanket `if overflow_active { return Vec::new(); }` (the #6843 F1
+       over-reach verbatim) -> tests.rs:4855 "a zone that KEPT its slot stopped
+       publishing once overflow became active: the filter must drop only the
+       zones that lost their slot, not everything: []"
+    M3 live slot map -> `FloodCounterSlotMap::default()` -> tests.rs:4802
+       "apply 1: the coordinator must publish a slotted zone with flood events
+       (a default/empty slot map publishes nothing): []"
+  Three different assertions catch the three mutations, so the cells are disjoint
+  rather than one assertion absorbing all of them. Round 2 changed NO production
+  code -- `git diff HEAD -- coordinator/mod.rs` is empty after restore.
+  NOT folded: the reviewer's non-blocking N1 (FloodPending::reset clears the full
+  1536 B on every touched flush; a dirty-slot bitmask would avoid it). It is a
+  hot-path change in a round whose blocker is test-only, and `ZonePending` in the
+  shipped traffic half has the IDENTICAL shape -- the two modules are
+  deliberately mirrored down to a static assert tying their capacities, so
+  optimising one alone creates an unexplained asymmetry -- worse, it leaves that
+  static assert implying the two are coupled when their hot paths have diverged.
+  Filed as ONE follow-up covering both accumulators: #6946 (touched-slot u64
+  bitmask shrinks BOTH the reset and the O(64) fold scan to O(touched), in both
+  modules, in the same commit).
+
+  ROUND 3 (re-gate at 3db17c318: MERGE-NEEDS-MINOR, zero runtime defects; F1 +
+  a NIT, both test-only).
+
+  F1 -- the CONFIG-APPLY block that PRODUCES both per-zone families was unbound.
+  `forwarding_build/mod.rs` is the only place `flood_counter_slot_map` /
+  `flood_counter_store` (and their traffic twins) are populated from a
+  ConfigSnapshot, and EVERY other test reference to those fields was a
+  hand-assignment -- so deleting either build block verbatim left the whole cargo
+  suite green. The undetected runtime consequence is total: an unbuilt slot map
+  is `empty()`, every zone resolves to slot 0, `record_zone_flood_drop` /
+  `record_zone_traffic` return at their `slot == 0` guard for every packet on
+  every zone, nothing publishes, and every surface reports
+  ErrCounterNotPopulated -- bit-for-bit the pre-#3651 state this work exists to
+  close, reachable with a green suite. NOT an asymmetry this PR introduced: the
+  already-merged TRAFFIC block at the same site is equally unbound, so this is an
+  inherited pattern and one test closes both cells.
+  `config_apply_builds_both_per_zone_counter_slot_maps_3651`
+  (forwarding_build/tests.rs) calls the real `build_forwarding_state` on a
+  two-zone snapshot and asserts BOTH families slot BOTH zones (two zones, because
+  a one-zone assertion passes on an off-by-one that slots only one), neither
+  claims overflow, and then -- second leg -- re-applies with `previous =
+  Some(&first)` after seeding a count and asserts the totals SURVIVE, which is
+  what makes per-zone counters survive a config commit.
+  TWO REDs, both clean assertions at tests.rs:5643, cargo exit 101:
+    delete the FLOOD build block   -> "config apply did not build the flood slot
+      map: zone TRUST resolves to slot 0, so every packet on it takes the
+      `slot == 0` early return and the zone can never publish -- the pre-#3651
+      not-populated state, with a green suite"  (left: 0)
+    delete the merged TRAFFIC block -> same assertion, "traffic" arm (left: 0)
+  So the one test kills the new cell AND the inherited one.
+
+  NIT -- `flood_reason_index_tracks_the_screen_reason_strings` asserted ORDINAL
+  EQUALITY (`flood_reason_index(r) == screen_reason_drop_index(r)`) while the
+  module doc says the match is deliberately independent. Reworded to
+  `is_some()` on both sides. The coupling was actively wrong, not just
+  inconsistent: the screen ordinals index a 15-wide Go-facing array while
+  `flood_reason_index` indexes a 3-wide accumulator whose layout IS the wire's
+  syn/icmp/udp triple, so a legitimate renumber of the screen ordinals would have
+  red HERE and invited "fixing" flood_reason_index -- silently permuting the
+  flood wire fields. Verified the reworded assertion still catches the hazard it
+  exists for: renaming "syn-flood" in screen/mod.rs REDs with "flood reason
+  \"syn-flood\" is no longer a known screen reason -- a rename in screen/mod.rs
+  has un-wired the per-zone flood tally while leaving the aggregate counting".
+
+  Round 3 changed NO production code: the delta is forwarding_build/tests.rs plus
+  a flood_counters.rs hunk proven (by line-offset check against the
+  `#[cfg(test)]` boundary at line 433) to lie entirely inside the test module.
+
+  PAYLOAD MEASUREMENT CORRECTED. My earlier "+24 B per 1/s status poll" had the
+  right size and the WRONG DENOMINATOR. `zone_flood_counters()` is called from
+  `refresh_status`, which has ~29 call sites -- including
+  server/handlers/session_deltas.rs, the bulk-session-sync path -- so the added
+  mutex acquisition and <=63-row Vec+sort ride EVERY control request that
+  refreshes status, not once per second. Correct statement: +24 B per status
+  REFRESH, ~29 refresh sites, <=8.5 KiB when 63 zones are populated. Magnitude
+  still trivial and NOT a new frequency class (the merged `zone_traffic_counters()`
+  sits on the identical path with the identical shape, so this doubles a small
+  existing per-refresh cost rather than introducing one) -- but a prediction with
+  the wrong denominator can be "falsified" by a result that is actually fine,
+  which is why the correction matters more than the number. N2 (counts lost if the loop exits between
+  record and flush, bounded by one batch) is inherent and matches the traffic
+  half; no action.
+- **File(s)**: userspace-dp/src/afxdp/flood_counters.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/tests_slow_path_disposition.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/helpers/status.rs, userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/maps_screen.go, pkg/dataplane/flood_counter_retention_3651_test.go,
+  pkg/dataplane/userspace/protocol_counters.go,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/floodcounters.go,
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/flood_counter_syncloop_3651_test.go,
+  pkg/dataplane/userspace/zone_flood_counters_status_test.go,
+  pkg/dataplane/userspace/flood_counter_clear_3651_test.go,
+  pkg/cli/cli_show_security_screen.go, pkg/cli/zone_flood_counters_hide_test.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/grpcapi/zone_flood_counters_hide_test.go, pkg/api/README.md,
+  docs/userspace-dataplane-gaps.md, docs/research/3643-dead-counters/plan.md,
 - **Timestamp**: 2026-08-06
 - **Action**: #6894 round 6 — fold the three minors from the MERGE-NEEDS-MINOR
   re-gate at `10b592047`. No blocking findings; no production behaviour changes.
@@ -85906,6 +86497,23 @@ Every RED above is an assertion failure, not a build break.
 - **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
   pkg/daemon/reth_prepare_abort_recovery_5103_test.go, _Log.md
 - **Timestamp**: 2026-08-12
+- **Action**: #6211 review fold — correct two false claims in the source-NAT
+  release/rollback sweep comment. MINOR 1: the comment called the swept body
+  "a cold teardown path"; it is not. `rollback_source_nat_allocation` has five
+  non-test call sites, all on the packet path in
+  `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472, :2634, :4902), and
+  :2374 is the admission-refusal arm — the flood regime. The comment now
+  states the per-refused-flow cost (K allocator locks instead of
+  owning-index + 1) as a mechanism, explicitly noting no throughput
+  measurement was taken, and gives the correctness argument that justifies
+  paying it. MINOR 2: "at most one allocator could ever hold a given flow"
+  was stated unconditionally; it held only against an UNCHANGED `rules`,
+  because `parse_source_nat_rules_with_previous` carries allocators over
+  keyed on `allocator_key()` alone. The comment now scopes the invariant and
+  says #6211 does not create the hazard, it makes it reachable with no config
+  edit at all. Comments only — no behaviour change; `cargo build --release`
+  rc 0.
+- **File(s)**: userspace-dp/src/nat/source.rs, _Log.md
 - **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
   only in tests that injected their own budget), plus an S3 doc sentence.
   Every behavioural test in `tests_aggregate_budget.rs` drives
@@ -90319,6 +90927,97 @@ Every RED above is an assertion failure, not a build break.
   `go test ./pkg/dataplane/userspace/` ok; `cargo build --release` rc 0 (the
   Rust change is comment-only).
 
+- **Timestamp**: 2026-08-13
+- **Action**: #6938 (#3651) — bind the two flood-counter PRODUCTION call sites.
+  The helpers were never the problem; their callers were.
+
+  **The finding, re-verified at the head before any change.** Head `1bb479ae6`
+  had not moved since the parent proof. Three cells, snapshot-restore between
+  each, tree verified clean after:
+
+      baseline                                       ok 4256 passed / 0 failed
+      DELETE worker-loop fold (loop_body:1095)       ok 4256 passed / 0 failed
+      publication -> Vec::new() (helpers/status:320) ok 4256 passed / 0 failed
+
+  Byte-identical counts. Both production call sites were invisible.
+
+  **Why, and it inverts the usual intuition.**
+  `flush_recorded_flood_counters` has THIRTEEN call sites in tests — eleven in
+  flood_counters.rs, plus tests_slow_path_disposition.rs:988,
+  forwarding_build/tests.rs:5671 and coordinator/tests.rs:4797/:4840 — and every
+  one calls the helper DIRECTLY. One production call site. Thirteen tests reads
+  as thorough coverage, and it is, OF THE HELPER; but a helper with many direct
+  test call sites is MORE likely to have an unbound caller, because each of
+  those tests satisfies itself without ever exercising the production path. The
+  count disguises the gap instead of closing it. Same shape one level up for
+  publication: `Coordinator::zone_flood_counters()` is exercised directly while
+  `refresh_status`'s USE of it was observed by nothing.
+
+  **What binds them now.** Two behavioural tests drive the REAL control-socket
+  dispatcher (`handle_stream` via `run_request`) — the path the daemon's accept
+  loop takes — so the assertion rides `refresh_status`'s own use of the
+  coordinator rather than calling the coordinator itself. `ping` is the driver:
+  the dispatcher's post-match block runs `refresh_status` for every non-export
+  verb and attaches the result, so no status-specific verb is needed. The first
+  asserts on the WIRE payload the reply carries, not only in-memory state.
+
+  NO EXTRACTION. Pulling the loop body into a testable helper would have
+  relocated the unbound edge upward and arrived wearing a new passing test;
+  nothing was extracted, and the seam that was opened
+  (`Coordinator::seed_flood_counter_for_test`, `#[cfg(test)]`) is SEEDING, not
+  the path under test — it puts the coordinator in the state a worker leaves
+  behind so the assertion can ride the real caller.
+
+  **The worker-loop fold is pinned STRUCTURALLY, and that limit is stated
+  rather than papered over.** `worker_loop` takes five heavyweight parameters
+  and is spawned only from `coordinator/reconcile/bringup.rs` against real
+  AF_XDP sockets, so no test can drive it; I found no real seam above it. A
+  source pin is the honest instrument for a claim that is itself syntactic. It
+  additionally asserts adjacency to `flush_recorded_zone_counters`, because the
+  comment's load-bearing claim is that the two share a cadence and one
+  `forwarding` snapshot — separated, the two counter families would fold
+  against different slot maps.
+
+  **Sibling parity, observed and NOT fixed here.** The traffic-counter fold on
+  the line above has the identical shape: all its non-production call sites are
+  direct unit tests in zone_counters.rs, and its production call site is equally
+  unbound. That is pre-existing on master and outside this PR's diff, so it is
+  reported rather than folded in.
+- **File(s)**: userspace-dp/src/server/tests.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs, _Log.md
+- **Validation**: four cells, exclusive partition, every RED an assertion.
+
+    | cell | fold binder | publication | clear | over-reach control |
+    |---|---|---|---|---|
+    | baseline | PASS | PASS | PASS | PASS |
+    | sever the worker-loop fold | **FAIL** | PASS | PASS | PASS |
+    | sever the publication | PASS | **FAIL** | **FAIL** | PASS |
+
+  Each cell reds exactly the guards for its own site and nothing else. The
+  over-reach control holds GREEN in both severing cells, which is what makes it
+  a control rather than a second copy of a binder: it lives in its own test
+  body (a control sharing a body with its binder never runs once the binder
+  fails) and runs the binder's matching logic against a synthetic body
+  containing ONLY the sibling zone-counter fold, requiring no match. That
+  catches the plausible widening — loosening the needle to `flush_recorded_`
+  would match the sibling four lines above and keep the binder green with the
+  flood fold deleted. It also asserts the needle DOES match a body that
+  contains it, so the control cannot pass by matching nothing ever.
+
+  Both behavioural tests carry preconditions: the publication test asserts the
+  wire status starts EMPTY (so a pass cannot be explained by a pre-populated
+  fixture), and the clear test asserts the row IS published before the clear
+  (so its absence afterwards cannot be explained by it never having been there).
+
+  A fixture correction worth recording: the first draft drove `req("get_status")`,
+  which is not a request type — the dispatcher answered
+  `unknown request type get_status` and both tests failed. That failure looked
+  exactly like the finding it was meant to demonstrate. Re-run against `ping`,
+  a real verb that reaches the same post-match `refresh_status`, they pass and
+  red correctly. A test that fails for a reason other than its subject is not
+  evidence.
+
+  Gates: `cargo test --release` 6938 filter — 4 passed / 0 failed.
 - **Timestamp**: 2026-08-12
 - **Action**: #6722 B1 — bind the three individually-removable conjuncts of the
   RETH-projection gate, and correct the claims the binding falsified.
@@ -95864,6 +96563,82 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
   userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md
 
+## 2026-08-21 — #6938 merge with master + armed-gate census reconcile
+
+- **Timestamp**: 2026-08-21
+- **Action**: Merged `origin/master` (234 commits) into `fix/3651-flood-counters`.
+  Two conflicts. `_Log.md` union-resolved and structurally verified (sections
+  1588+1658-1587=1659, `Timestamp` occurrences 3007+3140-3005=3142, lines
+  79401+88927-79092=89236 — all exact). `userspace-dp/src/afxdp/forwarding_build/tests.rs`
+  was an add/add at the file tail where BOTH sides appended a `#[test] fn` and
+  SHARED the trailing `}`; union-resolving it would have folded master's
+  `secure_tunnel_unit_ifindex_decides_route_disposition` inside this branch's
+  `config_apply_builds_both_per_zone_counter_slot_maps_3651`. Resolved by hand
+  (both tests kept, closing brace restored for the first) and proven by running
+  both tests, not by the merge being textually clean.
+- **File(s)**: `_Log.md`, `userspace-dp/src/afxdp/forwarding_build/tests.rs`
+
+- **Timestamp**: 2026-08-21
+- **Action**: Semantic merge conflict repair: master's #6743 r4 census
+  (`TestManager_PreArmMethodMatrix`) counts exported `*Manager` methods and
+  requires each to carry exactly one armed-gate class. This branch adds
+  `ReplaceFloodCounterOffsets`, so the merged tree failed with
+  `inventory = 160, want 159`. Classified it `catG` (ungated Go-state helper:
+  takes `m.mu`, rebuilds the `m.mu`-protected `floodCounterOffsets` map, touches
+  neither `m.maps` nor `m.programs` — identical behaviour fresh/armed/retained,
+  the same shape as its `ReplaceZoneCounterOffsets` sibling) and bumped the
+  census to 160.
+- **File(s)**: `pkg/dataplane/armed_gate_matrix_test.go`
+
+## 2026-08-21 — #6938 second merge: carry the flood store onto master's #6832 commit-point split
+
+- **Timestamp**: 2026-08-21
+- **Action**: Merged `origin/master` again (52 more commits, including #6832).
+  Four conflicts. `_Log.md` union-resolved with the structural check exact
+  (lines 89263+91875-88927=92211, sections 1660+1676-1658=1678, `Timestamp`
+  3145+3174-3140=3179). `forwarding_build/tests.rs` was the same shared-closer
+  add/add as the previous merge and was hand-resolved again (both sides' tests
+  kept, both run green). `docs/userspace-dataplane-gaps.md` kept master's
+  #5716/#6832 rejected-build-safety prose and replaced master's now-stale
+  "POPULATE flood is still deferred" bullet with this branch's "now ships too"
+  bullet, extended with a flood-half rejected-build-safety paragraph.
+- **File(s)**: `_Log.md`, `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `docs/userspace-dataplane-gaps.md`
+
+- **Timestamp**: 2026-08-21
+- **Action**: RUNTIME FIX found by the merge. Master's #6832/#5716 removed the
+  destructive per-zone counter prune from inside the fallible forwarding
+  builder and split it into `attach_zone_counters` (additive, after the `?`) +
+  `commit_zone_counter_prune` (destructive, at each apply path's own commit
+  point). This branch's flood block still sat inside
+  `build_fallible_forwarding_state` with its own `store.reconcile()` above the
+  filter and CoS belts, so a straight merge would have REINTRODUCED, for the
+  flood family, exactly the defect master had just removed for the traffic
+  family: a rejected build or a rejected apply destroying a still-configured
+  zone's cumulative flood counts. Moved the flood binding into
+  `attach_zone_counters` and the flood prune into `commit_zone_counter_prune`,
+  sharing the traffic family's call sites rather than adding a second pair —
+  the `FLOOD_COUNTER_SLOTS == ZONE_COUNTER_SLOTS` compile-time assert exists so
+  a zone is slotted for both families or neither, and a separate pair could be
+  relocated or forgotten at a new apply path independently.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `docs/userspace-dataplane-gaps.md`
+
+- **Timestamp**: 2026-08-21
+- **Action**: Bound the fix with two rows, both mutation-verified firsthand as
+  ASSERTION failures (`panicked at ... tests.rs:<line>` carrying the message),
+  never build breaks. `rejected_build_does_not_prune_live_flood_counters_3651`
+  drives master's four position-chosen integrity belts and asserts the live
+  flood store keeps both zones; `accepted_build_defers_the_flood_prune_to_the_commit_point_3651`
+  asserts the clean build is additive-only AND that the commit point still
+  prunes. M1 (re-insert the flood bind+prune into the fallible builder) reds
+  both, the rejection row at the `#3367 filter unparseable tcp-flags` belt —
+  the first belt BELOW the mutation site, exactly the polarity master's belt
+  table documents. M2 (delete only the flood `reconcile` from
+  `commit_zone_counter_prune`) reds only the deferred-prune row. Master's two
+  zone rows stay green under both, which is why the flood rows were needed:
+  they read `zone_counter_store` and never look at the flood store.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/tests.rs`
 - **Timestamp**: 2026-08-21
 - **Action**: #6894 drive-to-merge pass at `6eb35c749`. Merged `origin/master`
   (234 commits, MERGE not rebase; only `_Log.md` conflicted — union-resolved,
@@ -96275,3 +97050,29 @@ prose edit above them added. No diff falls in the new test body.
   pre-existing dirt if you check only `gofmt -l` and not `git show
   origin/master:<path>`.
 - **File(s)**: _Log.md, pkg/dataplane/bpf_session_value_test.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 — second `origin/master` merge (ff532c8e8 -> 598a6f0f2,
+  39 commits) after GitHub reported CONFLICTING against a head that had moved
+  during the drive pass.
+
+  `_Log.md` was again the only textual conflict and was again resolved by
+  deterministic replay of both diffs onto the merge base, never `--union`. Both
+  sides are pure inserts this round (no deletions either direction). Totals
+  predicted before resolving, then measured — **97052 lines** (94850 + 1427 +
+  775), **3236** `- **Timestamp**` (3221 + 3215 - 3200), **3100** `- **Action**`
+  (3084 + 3081 - 3065), **1717** `## ` headings (1709 + 1710 - 1702). All four
+  matched; zero deletions against either parent; zero conflict markers.
+
+  **Zero semantic conflicts this round**, checked rather than assumed. The new
+  master touches two files that are load-bearing for this PR and neither
+  interacts: `pkg/dataplane/userspace/interfaces.go` gains the #6847 unit-level
+  inet-precedence classifier publication (CoS, not the `{ifindex, vlan}` key
+  construction the ingress identity resolves through), and
+  `poll_descriptor/mod.rs` gains two `record_screen_drop` arguments for the
+  #3651 per-zone flood counters (screen drop path, not an install site). No new
+  `SessionMetadata` construction site arrived, so the no-`Default` literal
+  contract raised nothing.
+
+  `docs/refactoring-audit-current.txt` regenerated after the merge.
+- **File(s)**: _Log.md
