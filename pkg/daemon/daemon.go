@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,11 +67,38 @@ type Options struct {
 // not exist, the daemon runs in standalone mode.
 const nodeIDFile = "/etc/xpf/node-id"
 
+// dpSlot is the immutable publication payload for Daemon.dpCell (#2114):
+// the runtime dataplane interface value, frozen at Store time so a reader
+// observes either no dataplane or the full (type, data) pair — never a
+// torn multiword interface read.
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
 // Daemon is the main xpf daemon.
 type Daemon struct {
-	opts     Options
-	store    *configstore.Store
-	dp       dataplane.RuntimeDataPlane
+	opts  Options
+	store *configstore.Store
+	// dpCell is the #2114 single synchronized publication point for the
+	// runtime dataplane. A nil cell means no dataplane (NoDataplane mode,
+	// a retired-backend construction failure, or an arm-failure
+	// teardown). Every ACQUISITION goes through dataplane() /
+	// setDataplane(); the same atomic.Pointer publication idiom as
+	// natPoolAlarm (#2116) below. The plain interface field this replaces
+	// raced the bootstrap-exit `d.dp = nil` writer against the
+	// forwarding-status sampler, the HA watcher chain, and the recovered
+	// commit-confirmed rollback timer (#2114).
+	//
+	// The cell is a PUBLICATION protocol, not a LIFETIME one. It does not
+	// stop an acquired handle from outliving its publication, and it does
+	// not un-publish a backend that Teardown() has detached (the
+	// commit-confirmed rollback deliberately keeps the torn-down object
+	// here so a corrected commit re-arms it — #6741 owns that window).
+	// The three operator-facing management servers therefore receive
+	// liveDataPlane (daemon_dp_live.go), which re-reads this cell per
+	// call, instead of a startup snapshot of the handle; the conntrack
+	// GC, cluster SessionSync, and the userspace event-stream loop stay
+	// deliberate capture-once consumers (rationale in daemon_dp_live.go
+	// and pkg/daemon/README.md).
+	dpCell   atomic.Pointer[dpSlot]
 	networkd *networkd.Manager
 	routing  *routing.Manager
 	frr      *frr.Manager
@@ -1056,11 +1084,49 @@ type Daemon struct {
 	fabricStateResubBackoff time.Duration
 }
 
+// dataplane returns the currently published runtime dataplane, or nil.
+// One atomic load; safe from any goroutine. Callers that nil-check AND use
+// the value must load ONCE into a local (the #2114 plan's §5.3 snapshot
+// boundaries) — a second load may observe a different publication.
+func (d *Daemon) dataplane() dataplane.RuntimeDataPlane {
+	if s := d.dpCell.Load(); s != nil {
+		return s.v
+	}
+	return nil
+}
+
+// setDataplane publishes dp; a nil argument clears the cell. The
+// kind-gated typed-nil check keeps a non-nil interface wrapping a nil
+// value out of the cell WITHOUT panicking on non-nillable kinds
+// (reflect.Value.IsNil panics on struct values) and WITHOUT missing
+// non-pointer nillable kinds (named Chan/Func/Map/Slice types can carry
+// methods — in-repo precedent:
+// pkg/dataplane/userspace/wire_uint8list.go). RuntimeDataPlane has no
+// pointer-only constraint and the backend registry
+// (pkg/dataplane/dataplane.go) returns arbitrary constructor results
+// unchecked, so the guard covers every nillable kind.
+func (d *Daemon) setDataplane(dp dataplane.RuntimeDataPlane) {
+	if dp == nil {
+		d.dpCell.Store(nil)
+		return
+	}
+	v := reflect.ValueOf(dp)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map,
+		reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		if v.IsNil() {
+			d.dpCell.Store(nil)
+			return
+		}
+	}
+	d.dpCell.Store(&dpSlot{v: dp})
+}
+
 func (d *Daemon) applyResult() *dataplane.ApplyResult {
 	if d == nil {
 		return nil
 	}
-	return dataplane.LastApplyResultOf(d.dp)
+	return dataplane.LastApplyResultOf(d.dataplane())
 }
 
 // CompileHealth is a snapshot of dataplane compile health (#758).

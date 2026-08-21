@@ -131,7 +131,8 @@ func TestFenceAllRedundancyGroups_ReadsCurrentConfig(t *testing.T) {
 		"set chassis cluster redundancy-group 2 node 1 priority 100\n")
 
 	rec := &fenceRecorderHA{}
-	d := &Daemon{store: s, dp: &fenceRecorderDP{ha: rec}}
+	d := &Daemon{store: s}
+	d.setDataplane(&fenceRecorderDP{ha: rec}) // #2114: publish through the cell
 
 	d.fenceAllRedundancyGroups(context.Background())
 
@@ -148,7 +149,8 @@ func TestFenceAllRedundancyGroups_ReadsCurrentConfig(t *testing.T) {
 func TestFenceAllRedundancyGroups_StartupRGsFenced(t *testing.T) {
 	s := fenceTestStore(t, fenceStartupClusterSet)
 	rec := &fenceRecorderHA{}
-	d := &Daemon{store: s, dp: &fenceRecorderDP{ha: rec}}
+	d := &Daemon{store: s}
+	d.setDataplane(&fenceRecorderDP{ha: rec}) // #2114: publish through the cell
 
 	d.fenceAllRedundancyGroups(context.Background())
 
@@ -161,7 +163,7 @@ func TestFenceAllRedundancyGroups_StartupRGsFenced(t *testing.T) {
 // (config-only mode) a fence must not panic and must make no HA calls.
 func TestFenceAllRedundancyGroups_ConfigOnlyModeSafe(t *testing.T) {
 	s := fenceTestStore(t, fenceStartupClusterSet)
-	d := &Daemon{store: s, dp: nil}
+	d := &Daemon{store: s}
 	// Must not panic.
 	d.fenceAllRedundancyGroups(context.Background())
 }
@@ -171,7 +173,8 @@ func TestFenceAllRedundancyGroups_ConfigOnlyModeSafe(t *testing.T) {
 func TestFenceAllRedundancyGroups_NoClusterSafe(t *testing.T) {
 	// nil store.
 	rec := &fenceRecorderHA{}
-	d := &Daemon{store: nil, dp: &fenceRecorderDP{ha: rec}}
+	d := &Daemon{store: nil}
+	d.setDataplane(&fenceRecorderDP{ha: rec}) // #2114: publish through the cell
 	d.fenceAllRedundancyGroups(context.Background())
 	if len(rec.deactivated) != 0 {
 		t.Fatalf("nil store must fence nothing, got %v", rec.deactivated)
@@ -180,7 +183,8 @@ func TestFenceAllRedundancyGroups_NoClusterSafe(t *testing.T) {
 	// Committed config with no chassis cluster stanza.
 	s := fenceTestStore(t, "set interfaces ge-0/0/3 unit 0 family inet address 10.0.30.1/24\n")
 	rec2 := &fenceRecorderHA{}
-	d2 := &Daemon{store: s, dp: &fenceRecorderDP{ha: rec2}}
+	d2 := &Daemon{store: s}
+	d2.setDataplane(&fenceRecorderDP{ha: rec2}) // #2114: publish through the cell
 	d2.fenceAllRedundancyGroups(context.Background())
 	if len(rec2.deactivated) != 0 {
 		t.Fatalf("non-cluster config must fence nothing, got %v", rec2.deactivated)
