@@ -352,6 +352,38 @@ func (m *Manager) FormatInformation() string {
 		fmt.Fprintln(&b)
 	}
 
+	// Peer fencing (#72). DISTINCT from the "Install fence" block above:
+	// that one is the bulk-sync install barrier, this is the disable-rg
+	// message the surviving node sends to a peer that stopped heartbeating
+	// (heartbeat_manager.go handlePeerTimeout). Rendered off FenceStatus so
+	// the configured action AND every fence attempt/result is visible in
+	// `show chassis cluster information` on both the local CLI and the gRPC
+	// remote CLI (both render this same function). Suppressed entirely when
+	// fencing was never configured and never fired, matching the
+	// conditional style of the sections around it.
+	fenceAction, fenceEvents := m.FenceStatus()
+	if fenceAction != "" || len(fenceEvents) > 0 {
+		fmt.Fprintln(&b, "Peer fencing:")
+		action := fenceAction
+		if action == "" {
+			// History outlives the config: a fence fired, then the operator
+			// removed `peer-fencing`. Report the CURRENT action, not the one
+			// the events were recorded under.
+			action = "disabled"
+		}
+		fmt.Fprintf(&b, "  Action: %s\n", action)
+		if len(fenceEvents) == 0 {
+			fmt.Fprintln(&b, "  Attempts: none")
+		} else {
+			fmt.Fprintln(&b, "  Attempts:")
+			for _, ev := range fenceEvents {
+				fmt.Fprintf(&b, "    %s  %s\n",
+					ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+			}
+		}
+		fmt.Fprintln(&b)
+	}
+
 	// Interface monitoring events.
 	monEvents := m.history.Events(EventMonitor)
 	if len(monEvents) > 0 {

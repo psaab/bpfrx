@@ -1639,6 +1639,14 @@ event channel (`sendEvent`) before returning. The actual fence — `ResignRG`
 by the daemon's `watchClusterEvents` consumer, not synchronously inside
 `ManualFailover`.
 
+On the RETH-VRRP path `ResignRG` itself is only half-synchronous: it drops the
+instance priority to 0 under the instance lock and then does a **non-blocking**
+send on `resignCh`. The priority-0 adverts and the `becomeBackup` VIP removal
+run on the VRRP instance's own loop, so "resigned" below means *resignation
+signalled and priority driven to 0*, not *VIPs off the wire* (#6177 item 1).
+Direct-VIP mode (`no-reth-vrrp`) has no such gap — `reconcileDirectVIPOwnership`
+removes the addresses inline on the event goroutine.
+
 `handleRemoteFailover` (`pkg/cluster/sync_failover.go`) therefore must **not**
 reply `failoverAckApplied` the instant `OnRemoteFailover` returns: the sender
 treats that ack as authorization to run `commitRequestedPeerFailover` and become
@@ -1650,15 +1658,25 @@ ownership / traffic).
 The fix gates the applied-ack on a fence-completion barrier:
 
 1. The daemon `OnRemoteFailover`/`OnRemoteFailoverBatch` closures call
-   `armFailoverActuation(rgID)` — registering a per-RG barrier — **before**
-   `ManualFailover` enqueues the demotion event, so the actuation signal can
-   never be missed. A `ManualFailover` error disarms the barrier.
+   `armFailoverActuation(rgID, reqID)` — registering a barrier keyed by
+   **(RG, peer request id)** — **before** `ManualFailover` enqueues the demotion
+   event, so the actuation signal can never be missed. A `ManualFailover` error
+   disarms the barrier, passing back the handle `arm` returned so the disarm can
+   only ever remove *that* barrier (#6177 item 2). Keying on the request rather
+   than on the RG alone is what keeps one transfer-out cycle from disturbing
+   another: the responder handles each `syncMsgFailover` on its own goroutine, so
+   before #6177 an older request's expiry could delete the slot a newer request
+   had just armed — the newer wait then found nothing, returned "actuated", and
+   the node acked `failoverAckApplied` for a demotion it had not performed.
 2. `handleRemoteFailover` calls the `WaitFailoverApplied` hook (wired to
    `waitFailoverActuated`) after `OnRemoteFailover` succeeds and before sending
    `failoverAckApplied`. It blocks on the barrier.
 3. `handleClusterEvent` (the per-event body of `watchClusterEvents`), at the end
    of the demotion (non-primary) branch — after `ResignRG` / direct-VIP
    reconcile / `rg_active` clear — resolves the barrier and releases the ack.
+   The demotion event carries no request id — it reports that *this node*
+   finished demoting the RG — so `resolveFailoverActuation` fans the verdict out
+   across every request in flight for that RG.
 4. The barrier carries a **verdict**, not just a completion (#6371). The
    demotion branch tracks whether the dataplane accepted the `rg_active` write:
    on success it calls `signalFailoverActuated(rgID)` (verdict `nil`), and on a
@@ -1679,7 +1697,21 @@ The fix gates the applied-ack on a fence-completion barrier:
    unchanged.
 
 The batch path (`handleRemoteFailoverBatch` / `WaitFailoverAppliedBatch`) applies
-the same per-RG barrier across the whole set.
+the same barrier across the whole set, all members armed under the one batch
+request id; the first non-nil verdict fails the batch ack.
+
+**Residual (#6177 item 1, open).** On the RETH-VRRP path the barrier releases
+once resignation has been *signalled* (priority 0 set synchronously) and
+`rg_active` is cleared — not once `becomeBackup` has physically removed the
+VIPs. A sub-millisecond window therefore remains in which the peer may promote
+while the old owner's VIPs are still on the interface. It is safe-direction
+rather than benign-by-luck: priority-0 is set synchronously so the resigning
+node cannot win a re-election, and the demotion preflight
+(`tryPrepareUserspaceRGDemotion`) has already shifted the flow cache to
+`FabricRedirect`, so transit traffic reaching the old owner is forwarded over
+the fabric rather than dropped. Closing it means gating the barrier release on a
+`becomeBackup` completion signal from the VRRP instance loop, which is a change
+to the VRRP state machine rather than to this barrier.
 
 Once the RG is marked standby, each worker processes a
 `WorkerCommand::DemoteOwnerRGS` on its packet thread
