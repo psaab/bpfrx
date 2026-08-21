@@ -30,7 +30,7 @@ import (
 
 // applyConfig must serialize concurrent callers via d.applySem.
 // Uses applyBodyForTest as a seam so the body of applyConfigLocked
-// (which would otherwise touch d.dp / d.routing / d.frr) is replaced
+// (which would otherwise touch the dataplane / d.routing / d.frr) is replaced
 // with a counter that records the maximum concurrent invocations.
 func TestApplyConfigSerializes(t *testing.T) {
 	d := &Daemon{applySem: semaphore.NewWeighted(1)}

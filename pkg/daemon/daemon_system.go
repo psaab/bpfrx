@@ -37,13 +37,14 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 	}
 	er.SetZoneNames(zoneNames)
 
-	// Wire policy names and app names for structured logging
-	if d.dp != nil {
-		if cr := d.applyResult(); cr != nil {
-			er.SetPolicyNames(cr.PolicyNames)
-			if cr.AppNames != nil {
-				er.SetAppNames(cr.AppNames)
-			}
+	// Wire policy names and app names for structured logging.
+	// #2114: ONE cell load inside applyResult (LastApplyResultOf is
+	// nil-safe) — a separate dataplane() guard here would observe a
+	// different publication than the result read (Codex PR #6743 r3-7).
+	if cr := d.applyResult(); cr != nil {
+		er.SetPolicyNames(cr.PolicyNames)
+		if cr.AppNames != nil {
+			er.SetAppNames(cr.AppNames)
 		}
 	}
 

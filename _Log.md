@@ -1,3 +1,129 @@
+## 2026-08-13 — #2114 / PR #6743 round 2b: seven surviving mutation sites, plus a seventh AST-escape class
+
+- **Timestamp**: 2026-08-13 (fix/2114-dp-accessor, PR #6743)
+- **Action**: Folded an independent reviewer's round-2 findings (B1-B8, N1-N5).
+  Every claim was re-measured before it was acted on, and every fix is bound by
+  a mutation that goes RED. Harness:
+  `$CLAUDE_JOB_DIR/tmp/runmut.sh` (copies the tree to a scratch dir on /tmp,
+  applies the reviewer's own `muts/*.py` verbatim, `go build -buildvcs=false`,
+  then `go test -buildvcs=false -count=1 <pkgs>`).
+
+  **B1 — the gRPC optional-capability probe's Unwrap was unbound.** Severing
+  `return dataplane.Unwrap(s.dp)` -> `return s.dp` in `pkg/grpcapi/runtime.go`
+  left FULL_RC=0 across the complete importer set. The identical mutation IS
+  killed in both siblings (`pkg/cli/runtime.go`, `pkg/api/api.go`) — the round-8
+  sweep bound pkg/api, pkg/cli, pkg/dataplane and pkg/dataplane/userspace and
+  missed pkg/grpcapi. With the unwrap gone every optional probe answers "absent"
+  on a HEALTHY backend: the session cursor drops to the O(N^2) paging fallback,
+  the userspace inject/queue/binding controls go dark, and WireGuard,
+  deterministic NAT, policies text and forwarding all pick the non-userspace
+  wrapper. Bound by `pkg/grpcapi/optional_probe_unwraps_6743_test.go`.
+
+  **B2 — the escape canary was silent at the one site it exists to cover.** The
+  round-4 scanner asked "does this function DECLARE a probe-typed variable
+  (`*ast.ValueSpec` with a named type)?" and "does its body mention the NAME
+  liveDataplane?". Both are proxies, and both were escapable at
+  `daemon_run.go`'s console-CLI block: a `:=` carrying a `TypeAssertExpr` has no
+  ValueSpec so the function was skipped entirely (C6), and a DISCARDED
+  `_, _ = d.liveDataplane()` next to a capture-once assertion satisfied the name
+  check (C7). Rebuilt on POSITION and DATA FLOW as R1-R4.
+
+  Then a SEVENTH escape of the same family, which the rebuild did not close:
+  callee position proves a value CAME FROM liveDataplane() and says nothing
+  about WHEN. `go func() { if live, ok := d.liveDataplane(); ok { cliDP = live }
+  }()` satisfies R1, R2 and R4 while the console is handed the nil zero value
+  (and the write races the read). Measured as a SURVIVOR, FULL_RC=0. Closed by
+  R5: an assignment inside a FuncLit that is not invoked in place — `go`,
+  `defer`, or merely stored — confers no liveness. An immediately-invoked
+  literal still does, so R5 keys on DEFERRAL rather than on the presence of a
+  FuncLit; that distinction has its own fixture.
+
+  The canary's header now STATES what the AST cannot do rather than implying
+  otherwise: R5 enumerates the deferring forms syntactically, so a wiring that
+  crosses a function boundary (`go d.wireConsole()`) or an ordering that depends
+  on runtime control flow remains outside it. A green run means "no probe value
+  in a production function body is sourced from anywhere other than an in-place
+  liveDataplane() call" — not "the probe is live when the consumer uses it".
+
+  **B3 — the drainer binder's scope claim was false.** Its comment claimed a
+  fail-on-revert covering "the resolutions", plural; it covered only the
+  fast-branch site. `countingDeltaDrainerDP` deliberately does not implement the
+  event-stream provider, so `connected` is false on every tick and the entire
+  `if connected` block is DEAD in that fixture — the mutated behaviour was not
+  merely unasserted, it was unexecuted. Added
+  `TestEventStreamFallbackLoop_DrainerReresolvedOnTheConnectedBranch` with a
+  connected-stream fixture, and corrected the comment.
+
+  **B4/B7 — the publication-check set was derived programmatically, not from
+  the review.** Grepping for a `dp == nil` gate followed by a `dpProbe()` call
+  across pkg/api, pkg/cli, pkg/daemon, pkg/dataplane and pkg/grpcapi returns
+  NINE sites. Seven are not defects: their gate arm and their probe-miss arm
+  produce the identical outcome, so a permanently-false gate is redundant rather
+  than wrong, and the three that also test `!dp.IsLoaded()` are covered by that
+  half (`liveDataPlane.IsLoaded()` resolves the cell). The two that DO diverge
+  are `forwardingStatusDataplane` in pkg/grpcapi and pkg/cli.
+
+  That pair is worse than the WireGuard renders the same round fixed. An empty
+  cell fell past the guard, returned the non-userspace `base` wrapper, and
+  `fwdstatus.Build` took its BPF-map arm — where `GetMapStats()` is empty, the
+  max-occupancy loop leaves maxPct at 0, and `BufferKnown` is set to TRUE:
+
+        EMPTY-CELL  "Buffer utilization   0 percent"
+        NIL-DP      "Buffer utilization   unknown (see #878)"   <- control
+
+  A misleading string is read by a human; `BufferKnown = true` tells every
+  downstream consumer the number is trustworthy. The binders assert the trust
+  bit BEFORE the text, so a fix that only changed the string would not pass.
+
+  **B5, B8 — two unbound single-resolution properties in HA actuation.** The
+  "ONE snapshot per reconcile pass" change (blackhole routes + takeover
+  readiness) and the per-call exporter resolution in
+  `handleEventStreamFullResync` both reverted to master's behaviour with the
+  suite green. Both are now bound by fixtures that CHANGE the cell mid-flight
+  and assert on WHICH backend each call reached — an identity assertion, not a
+  count, because a count passes under the latch (two calls, two exports, both
+  from the wrong backend).
+
+  **B6 — `dataplane.Published` had zero callers; DELETED.** Not re-wired.
+  `Published(p)` was exactly `Unwrap(p) != nil`, so a site that asked it and
+  then probed resolved the cell TWICE — the two-resolution race r7 removed.
+  Restoring the calls would reintroduce it at every new call site. The five
+  documents that claimed the code asks `dataplane.Published(dp)` (N1) were false
+  before this deletion and are corrected to the single-resolution shape the code
+  actually uses; a fail-on-revert instruction that named the predicate is
+  respelled so it stays executable.
+
+  **N2, N3, N4, N5.** The README's claim that the canary "covers" the console-CLI
+  site was falsified by B2 and is replaced by an explicit two-halves account.
+  The `-race` gate EXCLUDED the PR's own concurrency tests — a NAME filter over a
+  PROPERTY-defined set, matching 19 of 1118 tests and none of the seven
+  event-stream binders. Widening it once would leave the mechanism intact, so
+  `TestRaceGateCoversTheConcurrencyBinders` now parses the Makefile recipe and
+  fails if any test in the declared concurrency files stops matching; the
+  residual (the file list is hand-maintained) is stated in the file.
+  `ClearCounters` mapped `ErrNotPublished` to `codes.Internal`, reporting daemon
+  lifecycle state as a server fault — now `dataplaneActionError`. N5 (the
+  standalone event-stream path never re-wires a replacement stream) is
+  pre-existing in shape and is DOCUMENTED at the site rather than fixed blind.
+
+- **File(s)**: Makefile; docs/pr/1373-retire-ebpf-dataplane/README.md;
+  pkg/cli/cli_show_chassis.go; pkg/cli/cli_show_security_wireguard.go;
+  pkg/cli/cli_show_system.go; pkg/cli/forwarding_publication_check_6743_test.go;
+  pkg/cli/wireguard_publication_check_6743_test.go; pkg/daemon/README.md;
+  pkg/daemon/daemon_dp_escape_canary_test.go;
+  pkg/daemon/daemon_ha_userspace_stream.go;
+  pkg/daemon/daemon_ha_userspace_stream_live_test.go;
+  pkg/daemon/full_resync_per_call_6743_test.go;
+  pkg/daemon/race_gate_coverage_6743_test.go;
+  pkg/daemon/reconcile_one_snapshot_6743_test.go; pkg/dataplane/live.go;
+  pkg/dataplane/retirement_boundary_canary_test.go;
+  pkg/grpcapi/forwarding_publication_check_6743_test.go;
+  pkg/grpcapi/optional_probe_unwraps_6743_test.go;
+  pkg/grpcapi/server_cluster.go; pkg/grpcapi/server_show_forwarding.go;
+  pkg/grpcapi/server_show_security_text.go; pkg/grpcapi/server_show_system.go;
+  pkg/grpcapi/server_show_system_single_resolve_6743_test.go;
+  pkg/grpcapi/wireguard_publication_check_6743_test.go
+
 ## 2026-08-13 — #6691 round 9c: the v5 → v6 mixed-version matrix, measured on the REFERENCE cluster shapes
 
 - **Timestamp**: 2026-08-13 21:05 (fix/5619-ipsec-passthrough-zone-policy)
@@ -73504,6 +73630,335 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+## 2026-08-02 — #2114 A1: publish the runtime dataplane through the dpCell atomic accessor
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Implemented work item A1 of the converged #2114 plan
+  (docs/research/2114-nat-pool-alarm-dp-race/plan.md v99, PLAN-READY 3-of-3):
+  the plain `dp dataplane.RuntimeDataPlane` field (5 writers / 129 readers,
+  raced by the bootstrap-exit clear, the HA watcher chain, and the recovered
+  commit-confirmed timer) is replaced by `dpCell atomic.Pointer[dpSlot]` with
+  the `dataplane()`/`setDataplane()` accessor pair (kind-gated typed-nil
+  guard over Chan/Func/Map/Pointer/Slice/UnsafePointer). All 5 writer sites
+  converted (4 boot writers in daemon_run_bringup.go, bootstrap-exit arm in
+  daemon_run_naming.go — the latter extracted as armBootstrapExitDataplane so
+  the race tests drive the real writer). All reader ACQUISITION sites
+  converted per the plan's §5.3 snapshot-boundary rules (one load per
+  tick/callback/straight-line block). **CORRECTION (r4, see the r4 entry
+  below): this entry originally read "All readers converted", which was
+  false — six consumers took the handle from an accessor and then kept it
+  for the daemon's lifetime, so the conversion covered acquisition only.**
+  The fwdstatus adapter is structurally narrowed to the sampler-only
+  CachedStatusProvider (fwdstatus.NewSampler retyped; the daemon adapter
+  collapses to one per-call-probing CachedStatus method; IsLoaded/GetMapStats/
+  Status leave the daemon adapter). ~80 `Daemon{dp: ...}` test literals
+  converted to setDataplane publication. Retirement-boundary canary matcher
+  extended (dpCell+dpSlot shape, *ast.IndexExpr rendering, both-direction
+  self-tests); new pkg/daemon AST canary forbids .dpCell access outside the
+  accessors.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/daemon_run_naming.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/daemon_run_shutdown.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_fabric.go, pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go, pkg/daemon/daemon_health.go,
+  pkg/daemon/daemon_ipmon.go, pkg/daemon/daemon_gc.go,
+  pkg/daemon/daemon_apply_dataplane.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/daemon_apply_interfaces.go, pkg/daemon/daemon_apply_routing.go,
+  pkg/daemon/daemon_scheduler.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/daemon_neighbor_listener.go, pkg/daemon/bootstrap.go,
+  pkg/daemon/daemon_forwarding_status.go,
+  pkg/daemon/daemon_forwarding_status_test.go,
+  pkg/daemon/daemon_natpoolalarm.go,
+  pkg/daemon/daemon_natpoolalarm_race_test.go,
+  pkg/daemon/daemon_dp_canary_test.go (new), pkg/fwdstatus/sampler.go,
+  pkg/dataplane/retirement_boundary_canary_test.go, 29 daemon test files
+  (literal conversions), _Log.md
+## 2026-08-02 — #2114 A3: armed-state admission gate in pkg/dataplane
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Implemented work item A3 of the converged #2114 plan. The
+  atomic dpCell closes the interface tear but cannot order mutations the
+  backend performs on ITSELF after publication (the HA watcher can call
+  HA().SetRGActive on a coherent-but-starting backend while Start populates
+  the plain Go registries — a fatal concurrent-map read/write). Manager.loaded
+  is now atomic.Bool; Store(true) is the FINAL step inside the new
+  publishShimRegistryLocked whole-batch m.mu hold (batch+flag publish
+  atomically); Store(false) moved to Close()'s ENTRY (narrows the
+  loaded-check set's admission window and advances the externally visible
+  IsLoaded()/DataplaneLoaded surface during the close window — asserted, not
+  incidental). Every m.maps/m.programs access in every class in every state
+  now goes through the m.mu-scoped typed helper pair (lookupMapLocked/
+  lookupProgramLocked → handle, present, registryState), so classification
+  and handle selection are atomic with the gate outcome. The gate is
+  two-state: it fires ONLY on the FRESH-unarmed state (loaded==false AND
+  m.maps empty) where class-1 required accesses now return the typed
+  errors.Is-compatible ErrDataplaneNotArmed instead of master's per-map
+  "not found" error (or the fatal concurrent-map throw); the
+  RETAINED-unarmed state (Close/Teardown keep the pinned-map registry live)
+  proceeds exactly as master. The attach family + CompileConfig path keep
+  their own pre-registry loaded rejections (the carve-out — the typed error
+  never fires for them). Class-2 neutral outcomes are byte-for-byte
+  preserved; class-3 hybrids (ClearNATRuleCounters/ClearGlobalCounters/
+  ClearZoneCounters/ClearAllCounters) stay ungated with scoped lookups, and
+  ClearAllCounters composes through the ungated raw internals
+  (clearInterfaceCountersRaw/clearPolicyCountersRaw/clearFilterCountersRaw)
+  so the pinned legacy "interface_counters map not found" text survives on
+  every state (nested-call rule). Class-4 getters: Map/Program nil outcomes
+  preserved; NewEventSource's fresh outcome becomes the typed error (its
+  signature carries one). The xdpEntryProg trio + swapXDPEntryProg moved to
+  the locked-helper scheme (raw xdpEntryProgramLocked + scoped sections,
+  never whole-method locking); setXDPAttachedFlag's optional accesses keep
+  master's early-boot no-op (no gate — the DetachXDP claim cleanup must
+  always run). watchdog_test.go's two fresh-state pins moved from the
+  "ha_watchdog map not found" text to errors.Is(ErrDataplaneNotArmed) — the
+  intended class-1 fresh-state change.
+- **File(s)**: pkg/dataplane/armed_gate.go (new), pkg/dataplane/loader.go,
+  pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/maps_counters.go,
+  pkg/dataplane/maps_fabric.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/maps_flow.go, pkg/dataplane/maps_mirror.go,
+  pkg/dataplane/maps_nat.go, pkg/dataplane/maps_policy.go,
+  pkg/dataplane/maps_screen.go, pkg/dataplane/maps_session.go,
+  pkg/dataplane/maps_stale.go, pkg/dataplane/maps_stats.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/watchdog_test.go, _Log.md
+## 2026-08-02 — #2114 A3 enforcement surface: matrix + canary + manifest + gate legs
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Added the A3 enforcement/test surface per the converged plan
+  §9: (1) TestManager_PreArmMethodMatrix — the handwritten 157-method class
+  manifest (90 class-1 incl. the 2 carve-out + 2 delegation, 23 class-2, 4
+  class-3, 3 class-4, 9 catL, 8 catF, 20 catG) with AST-inventory totality
+  and the class-3 raw-helper composition shape assertion. (2)
+  TestManagerRegistryAccessAllowlist — the registry canary (exactly the two
+  lookup helpers + the publisher may touch m.maps/m.programs; index/len-only
+  shape rule kills the alias escape; lock-domination rule kills
+  unlock-before-access; exactly one in-lock Store(true) in the publisher),
+  with stale-allowlist self-check and both-direction synthetic negatives.
+  (3) TestManagerRegistryCallsiteManifest — the stale-checked 135-callsite
+  manifest (91 required + 41 optional + 3 raw composition legs, matching the
+  plan census) with the per-callsite gated bit AST-verified via the
+  non-blank registryState binding. (4) The five-leg armed-gate oracle:
+  quiescent fresh/retained outcomes over every manifest host, blocked
+  fresh-Start and retained-reStart lock-ownership legs (readers block during
+  the whole-batch hold, observe armed after release), the Close-window
+  IsLoaded leg (entry Store(false) visible during the window, registry
+  retained); plus the lookup-ownership (both helpers), swapXDPEntryProg
+  :632-write ownership, XDP-selector two-sided seam, Detach retained-claims
+  (privileged), absent-iface_zone_map no-op (leg iii), seed-interface-counter
+  nil-guard (leg ii absent half), and the privileged continuation legs
+  (ClearNAT64Configs partial-registry count-zeroed, SetNAT64Config
+  required-write-lands, ClearStaticNATEntries v4→v6 continuation,
+  SessionCount both families, ClearSessionCounts both maps,
+  SeedNATPortCounters present-write). The canary immediately caught two of
+  my own implementation bugs (an unlisted classifier touching m.maps —
+  inlined into the helpers per the exact-3 allowlist; the per-function
+  gated-bit being too coarse for mixed methods — replaced with the
+  per-callsite third-LHS signal). Privileged legs skip cleanly on
+  unprivileged hosts per the repo's skipIfBPFUnavailable idiom.
+- **File(s)**: pkg/dataplane/armed_gate.go, pkg/dataplane/loader.go (seam),
+  pkg/dataplane/armed_gate_matrix_test.go (new),
+  pkg/dataplane/armed_gate_legs_test.go (new), _Log.md
+## 2026-08-02 — #2114 §9 race tests + test-race-dp gate
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Added pkg/daemon/daemon_dp_race_test.go — the dataplane-cell
+  regression suite: ConcurrentReadersVsWriter (the §5.4 reader shapes vs
+  the alternating writer), TypedNilAndValueShapes (typed-nil of every
+  nillable kind Stores as nil; value types Store normally),
+  ForwardingStatusAdapter_BackendTypeTransitions (readyProbeOnly →
+  userspace → nil per-call adaptation), BootstrapExit_
+  ArmFailureWithConcurrentReaders (the REAL armBootstrapExitDataplane
+  writer), BootstrapExit_RealSamplerOverlap (the two-sided gate with no
+  happens-before edge between the adapter load and the writer store —
+  verified empirically to trip -race on a plain-field shape),
+  RollbackRearmRecurrence (arm → monitor → rollback-discard → failing
+  re-arm), ClusterStartPublication (RACE-1 watcher shape), and
+  ConfirmTimerStoreVsApplyReader (RACE-3 pure-cell two-sided leg). Wired
+  the test-race-dp make target into test-go (daemon cell patterns +
+  dataplane ArmedGate|PreArm patterns, -count=2 under -race). Fixed the
+  seam-var restore discipline the -race run itself caught (async restore
+  raced the next test's seam read; restores are now synchronous defers
+  with the production loader captured at package init).
+- **File(s)**: pkg/daemon/daemon_dp_race_test.go (new),
+  pkg/dataplane/armed_gate_legs_test.go (restore discipline), Makefile,
+  _Log.md
+## 2026-08-02 — #2114 docs sweep (§5.5)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Documentation contract per the plan's §5.5: pkg/daemon/README.md
+  gains the dpCell publication contract in ARCHITECTURE plus the
+  bootstrap-mode / first-commit-rollback bullet rewords and the live
+  d.dp.ApplyConfig reference; pkg/dataplane/README.md gains the full
+  armed-state admission contract section (the two-state predicate, the
+  four-class pre-arm outcomes, the carve-out set, the Close-entry
+  narrowing, and the enforcement-surface map); pkg/fwdstatus/README.md
+  rekeys the sampler surface to CachedStatusProvider; the residual
+  `d\.dp` comment prose across pkg/daemon production + test files is
+  reworded to the cell/accessor phrasing (the intentional historical
+  references — daemon.go's field-replacement note, the race-test
+  headers, docs/bugs.md's fixed-bug narrative — are deliberate and stay);
+  docs/ sweep covers ha-failover-status.md, ha-no-hitless-restart.md,
+  rib-group-route-leaking.md, snapshot-publish-redesign.md. The
+  recurrence-contradicting comment set (daemon_run_naming.go
+  "one-way/at most once" et al.) is FOLLOW-UP scope per the plan's
+  §5.5 split (those comments document the recurrence class work item H
+  terminates).
+- **File(s)**: pkg/daemon/README.md, pkg/dataplane/README.md,
+  pkg/fwdstatus/README.md, pkg/fwdstatus/sampler_test.go,
+  docs/ha-failover-status.md, docs/ha-no-hitless-restart.md,
+  docs/rib-group-route-leaking.md, docs/snapshot-publish-redesign.md,
+  15 pkg/daemon comment-only reword files, _Log.md
+## 2026-08-02 — #2114 PR #6743 Codex r1 review-round fixes (6M+1m)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Codex hostile code review returned MERGE-NEEDS-MAJOR (6
+  majors + 1 minor); all verified legitimate and fixed. M1:
+  reconcileRGState now takes ONE dataplane snapshot per pass shared across
+  the per-RG actuation loop (a mid-pass clear could previously let one RG
+  actuate through the old backend while a later RG observed nil and skipped
+  deactivation). M2: the registry canary is now type-aware — the registry
+  owner resolves by *Manager receiver TYPE (any name), *Manager-typed
+  parameters, and one-level aliases; an allowlisted function with no
+  m.mu.Lock fails. M3: the callsite collector refuses to collapse duplicate
+  same-function callsites (loud t.Fatal), and the gated-bit check now
+  requires the registryState return to be BOUND non-blank AND COMPARED
+  against registryFresh (a bind-and-ignore no longer passes), with a
+  synthetic self-test. M4: the canary enforces the publisher's single
+  in-lock loaded.Store(true) positioned after the last registry write and
+  before any direct Unlock; the new TestManager_ArmedGate_PassThenBlock leg
+  arms the post-Store seam — a pre-Store AttachTC rejects with master's
+  loaded rejection, a post-Store/pre-unlock AttachTC passes the precheck
+  and blocks at registry selection, and post-release it returns the
+  armed+absent text (probe switched to AttachTC because the publisher
+  writes xdp_userspace_prog and a present-but-nil program would proceed
+  into link.AttachXDP). M5: the continuation oracle is now coextensive —
+  absent-first discriminating legs for SessionCount, ClearSessionCounts,
+  GetMapStats (all descriptors), DeleteStaleStaticNAT, DeleteStaleNAT64,
+  ZeroStaleNATPoolConfigs (v4+v6), and the AddTxPort seed-present half;
+  Compile's redirect_capable continuation is dispositioned to production
+  coverage (the shim registry never carries that map; every cluster compile
+  exercises the skip-and-continue) with the reason recorded in the test
+  comment. M6: the Detach leg gained its concurrent population actor (the
+  blocked re-Start seam — the detach's registry lookup blocks during the
+  hold) and the absent-link no-registry-access oracle. m1: the
+  nat_port_counters fixture is now a PERCPU_ARRAY matching production.
+- **File(s)**: pkg/daemon/daemon_ha.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armed_gate_legs_test.go, _Log.md
+## 2026-08-02 — #2114 self-audit hardening (invoke coextensiveness)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Author self-audit after the Codex r1 fold: the armed-gate
+  invoke driver missed Compile (class 2 — its only registry access runs
+  past CompileConfig's loaded check so it can never block pre-arm; its
+  outcomes were already asserted directly). Added the retained-state
+  Compile rejection assertion and made the coextensiveness mechanical:
+  TestManager_PreArmMethodMatrix now fails if any class-1/2/3 manifest
+  member is neither driven by armedGateInvoke nor named in the new
+  armedGateInvokeExemptions set (AttachXDP/AttachTC/Compile, each with
+  its documented reason), and fails on a driven-and-exempted double
+  listing or a stale exemption.
+- **File(s)**: pkg/dataplane/armed_gate_legs_test.go,
+  pkg/dataplane/armed_gate_matrix_test.go, _Log.md
+## 2026-08-02 — #2114 PR #6743 Codex r2 review-round fixes (6M+2m)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Codex r2 returned MERGE-NEEDS-MAJOR (6 majors + 2 minors,
+  pinned at 989bfca8b). All verified and folded. r2-1: the reconcile pass
+  still reloaded transitively — takeoverReadinessForRG →
+  checkUserspaceTakeoverReadiness (:231) and the blackhole helpers →
+  userspaceDataplaneActive (:202) reloaded per RG. Threaded the pass
+  snapshot through: userspaceDataplaneActiveFor /
+  checkUserspaceTakeoverReadinessFor / injectBlackholeRoutesFor /
+  removeBlackholeRoutesFor snapshot variants with the per-invocation
+  wrappers preserved for the event paths, and takeoverReadinessForRG moved
+  to daemon_ha_userspace_readiness.go (avoids a new pkg/dataplane import
+  in daemon_ha_vip.go, which the legacy-import boundary canary correctly
+  rejected). r2-2: the dpCell canary now requires the *Daemon receiver —
+  a same-named method on an unrelated type no longer passes (collision
+  negative added). r2-3: the registry canary resolves owners through
+  file-scope type aliases, ParenExpr+StarExpr unwraps, and fixpoint alias
+  propagation; lock credit is restricted to the receiver's own alias
+  closure (a locked *Manager parameter does not count). r2-4: the
+  gate-evidence comparison must reference the callsite's own bound
+  identifier, positioned AFTER the assignment, outside any FuncLit
+  (closure/early negatives added). r2-5: method-value lock/unlock aliases
+  flagged; every timeout-based blocking assertion gained an arrival
+  handshake so a goroutine first scheduled after the release can no longer
+  falsely prove it blocked. r2-6: the Compile production-coverage
+  disposition was REBUTTED (userspace compiles never reach root
+  Manager.Compile) — corrected to the dead-surface waiver with the
+  daemon-constructor pin (TestRuntimeDataplaneNeverBareRootManager) that
+  fails if the root Manager ever becomes the daemon's dataplane again.
+  r2-7: restored the both-present SessionCount/ClearSessionCounts legs
+  alongside the absent-first discriminators and added the all-present
+  ZeroStaleNATPoolConfigs middle variant. r2-8: the recurrence test now
+  runs the PRODUCTION enterBootstrapMode default branch (linkDir
+  redirected to a temp dir) so the real dataplane Teardown call executes;
+  identity assertions pin that the SAME object is retained across the
+  rollback and re-Started on the failing re-arm.
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go,
+  pkg/daemon/daemon_dp_canary_test.go,
+  pkg/daemon/daemon_dp_race_test.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armed_gate_legs_test.go, _Log.md
+## 2026-08-02 — #2114 PR #6743 Codex r3 review-round fixes (6M+2m)
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Codex r3 (pinned at 2e84d42fd) returned MERGE-NEEDS-MAJOR
+  (6 majors + 2 minors). All verified against the tree and folded.
+  r3-1 (production): Manager.Teardown now CLEARS the xdpLinks/tcLinks
+  membership after Close+Cleanup — Close closed the Go handles and
+  Cleanup destroyed the kernel links, so the surviving entries made a
+  same-process re-Start (commit-confirmed rollback → bootstrap-exit
+  re-arm) hit AttachXDP's stale "already attached" short-circuit, which
+  attachUserspaceShimXDP swallows: the corrected commit reported success
+  with no AF_XDP ingress. Close alone deliberately keeps the membership
+  (hitless restart's pinned links stay live in the kernel). The /sys
+  sweep is test-neutralized through the new teardownCleanupFn seam;
+  TestManagerTeardownClearsLinkMembership pins both polarities and is
+  fail-on-revert verified. The flow pre-existed on master byte-for-byte;
+  this PR's recurrence test newly drove the real Teardown, so the hole
+  is fixed here rather than deferred to #6741. r3-2: the registry
+  canary's alias resolution is now PACKAGE-wide with a fixpoint
+  (cross-file aliases, chained `type B = A`, pointer-RHS `type P =
+  *Manager` params), local propagation covers `var x = m`, and a shared
+  recursive unwrapOwnerIdent replaces the one-layer paren/star unwraps.
+  r3-3: lock credit is scoped to the receiver's own alias closure (an
+  access through a *Manager parameter in an allowlisted function now
+  fails) and the lock scan prunes FuncLit bodies (a never-called
+  closure's Lock no longer credits a later access). r3-4: the
+  gate-evidence comparison scan stops at the bound identifier's
+  REASSIGNMENT — the ClearNATPoolIPs two-lookup st-reuse no longer
+  cross-credits the second comparison to the first callsite
+  (fail-on-revert verified against the live site). r3-5: method-value
+  detection covers `var u = m.mu.Unlock`, and any lookup-helper
+  reference outside call position (an unmanifested callsite) fails the
+  canary. r3-6: the Daemon field-shape canary rejects a raw
+  dataplane.RuntimeDataPlane field under ANY name, not just `dp`.
+  r3-7: three residual snapshot double-loads threaded —
+  refreshFabricFwd's SetFabricForwarding/SyncFabricState pair now shares
+  one cell load, newConntrackGC takes Run's phase-5 snapshot (as
+  conntrack.RuntimeDomainProvider, keeping daemon_gc.go out of the
+  #1451 import allowlist), and applySyslogConfig drops its redundant
+  dataplane() guard (one nil-safe load inside applyResult). r3-8: every
+  timeout-based blocking leg now proves goroutine arrival from the new
+  muAcquireProbeHook pre-lock seam (lookup helpers, publisher,
+  XDPEntryProgram) — the invoke-table legs use serialized per-member
+  attribution with the direct-first-lock set (the four class-3 Clear*
+  counter methods) computed and pin-checked. Also folded two Copilot
+  suppressed comments (the daemon_system.go double-load — same fix as
+  r3-7c — and a tooling-attribution comment reworded to the invariant).
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/armed_gate.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armed_gate_legs_test.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/dataplane/README.md, pkg/daemon/daemon_ha_fabric.go,
+  pkg/daemon/daemon_gc.go, pkg/daemon/daemon_gc_test.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/daemon_ha_userspace_readiness.go, _Log.md
 - **Timestamp**: 2026-08-01
 - **Action**: #5561 round-5 fold — close the stale-negative locality window that
   let a LOCAL caller reach the api-auth credential row. Round 4 rate-limited the
@@ -77492,6 +77947,306 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+## 2026-08-12 — #2114 r4 fold: the atomic cell fixed ACQUISITION, not ESCAPE (PR #6743)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Folded a DO-NOT-MERGE hostile review of PR #6743 at 36e2d9cff.
+  Its central finding: the PR's claim "every reader and writer goes through
+  dataplane()/setDataplane()" is true only of ACQUISITION. Direct daemon-field
+  access really was migrated (no surviving `d.dp`; `.dpCell` appears only in
+  the accessors), but the handle escaped immediately to six long-lived
+  consumers that snapshotted it once and held it for the daemon's lifetime, so
+  a later `setDataplane(nil)` was invisible to all six.
+
+  **F1 (escape) — FIXED for the three operator-facing management surfaces,
+  NARROWED for the three data-path consumers.** New `pkg/daemon/
+  daemon_dp_live.go` adds `liveDataPlane`, a daemon-owned value type that
+  holds ONLY the `*Daemon` pointer and re-reads the cell on every method
+  (one atomic load + one assertion in `resolve()`), forwarding the UNION of
+  the three `runtime_probes.go` management probes. gRPC (`startGRPCServer`),
+  REST (`startHTTPServer`) and the console CLI (`Run`'s `isInteractive()`
+  block) now receive that indirection instead of the backend handle; it is
+  the same idiom the fwdstatus sampler already used, widened from one method
+  to 27. `--no-dataplane` still hands a genuine nil interface so the
+  consumers' `dp == nil` branches stay reachable. `IsLoaded()` returns false
+  on an empty cell, which is what the dominant downstream guard
+  (`dp == nil || !dp.IsLoaded()`) already keys on, so no new error surfaces
+  where a "not loaded" branch previously ran. Compile-time assertions make
+  the three probes and both in-tree backends drift-fatal. The conntrack GC,
+  cluster SessionSync and the userspace event-stream loop stay capture-once
+  and are now DOCUMENTED as such (they take decomposed
+  SessionStore/Telemetry domains on per-session paths, or own an already-open
+  socket subscription) instead of being claimed converted.
+
+  **F2 (false success on a detached backend) — partly FIXED, partly
+  NARROWED.** `clearPolicyCountersIn` and `clearFilterCountersIn` discarded
+  every `zm.Update` error and returned nil, so `clear security policies
+  statistics` / `clear firewall counters` could not fail. Both now propagate,
+  matching `clearInterfaceCountersIn`, which already did; the index bounds
+  are exact (MAX_POLICIES 4096 / MAX_FILTER_RULES 512 are the maps'
+  max_entries) so no working clear becomes an error. Both helpers now take
+  a two-line `counterMapUpdater` seam (`*ebpf.Map` satisfies it as
+  declared, asserted in the test) because real BPF map creation returns
+  EPERM in the unprivileged unit lane — verified — and a SKIPPED test
+  would have left the mutation cell unknown rather than green. This does NOT close the
+  review's worked interleaving: after `Teardown()` the map fds stay open and
+  the backend stays published on purpose (the rollback re-arms that same
+  object), so an update still succeeds against detached state. That window is
+  a lifetime/generation problem, not a publication one, and is narrowed in
+  the shipped comments at `daemon.go` (the cell doc), `daemon_dp_live.go`
+  (the SCOPE block) and `pkg/daemon/README.md`, pointing at **#6741**.
+
+  **F3 (tests that cannot fire) — repaired.** `churnDataplaneCellReaders`
+  now returns a rendezvous: every reader shape completes one pass before
+  `ready` closes, so the three writer-vs-reader tests provably overlap
+  instead of relying on the scheduler. `TestDataplaneCell_
+  ClusterStartPublication`'s two 2 ms sleeps are replaced by `sawNil` /
+  `sawPublished` channel edges — no timing constant participates.
+  `TestForwardingStatusAdapterIsNotDataPlaneAccessor` now checks the POINTER
+  method set too (a pointer-receiver `Status`/`IsLoaded` pair evaded the
+  value-only assertion). The registry gate-evidence collector required only
+  a bare `st == registryFresh` comparison anywhere in the body, so an inert
+  `_ = st == registryFresh` or an empty `if` read as a gate; it now requires
+  the comparison to be an `if` CONDITION whose body returns, with two new
+  negative fixtures. The `.dpCell` canary's comment no longer calls an atomic
+  Store "unsynchronized" (it is synchronized; it bypasses normalization and
+  the snapshot discipline) and now cross-references
+  `checkDaemonDPFieldShape`, which covers the raw-field case it cannot see.
+
+  **F4 (nothing guarded a real escaping consumer) — closed.** Three new test
+  files construct GENUINE consumers through the PRODUCTION startup paths.
+
+  **Also fixed: the package's test build was RED at 36e2d9cff.** The merge
+  from master brought `armproof_5275_test.go` (#5275), which assigns
+  `m.loaded = true` — but this PR retyped `Manager.loaded` to `atomic.Bool`,
+  so `pkg/dataplane`'s test binary did not compile, and master's two new
+  exported `*Manager` methods (`ProveArmCoverage`,
+  `ReplaceZoneCounterOffsets`) left the class census at 159 against a
+  manifest of 157. A clean `mergeable` flag hid both. Fixed and classified.
+
+- **Validation**: mutation table, each cell run firsthand.
+  (1) Revert the gRPC hunk to the capture-once shape →
+  `TestGRPCServer_DisownedDataplaneIsNotReachable` RED with "gRPC cleared
+  counters on the DISOWNED dataplane 1 time(s) after setDataplane(nil)" and
+  `TestGRPCServer_RepublishedDataplaneIsReachable` RED with "the SUPERSEDED
+  backend took 1 clear call(s)"; `TestGRPCServer_PublishedDataplaneStill
+  Reachable` and `TestGRPCServer_NoDataplaneModeLeavesConfigNil` stay GREEN.
+  (2) Revert the REST hunk → `TestRESTServer_DisownedDataplaneIsNot
+  Reachable` RED with "REST still reports dataplane_loaded=true after
+  setDataplane(nil)" and `TestRESTServer_LateDataplanePublicationIsObserved`
+  RED; `TestRESTServer_PublishedDataplaneStillReachable` stays GREEN (it is
+  the positive control proving `dataplane_loaded=true` is reachable at all,
+  so the binder is not vacuous). (3) Revert either counter-clear error
+  wrapper to the bare `zm.Update(i, zero, ebpf.UpdateAny)` →
+  `TestClearPolicyCountersIn_PropagatesUpdateError` and its filter twin RED
+  with "clearPolicyCountersIn reported SUCCESS after the map rejected the
+  write at index 7; the operator's clear silently did nothing";
+  `TestClearCountersIn_HealthyMapStillClearsEveryEntry` (4096 / 512 writes,
+  no error) stays GREEN. (4) Revert the CLI hunk →
+  `TestManagementProbesComeFromLiveDataplane` RED naming
+  "daemon_run.go:Run declares cliDataPlane without liveDataplane()"; its
+  both-direction self-test stays GREEN. Every RED is an ASSERTION, never a
+  build break. `go build ./...` 0, `gofmt -l` clean on every touched file,
+  `go test ./pkg/daemon/... ./pkg/dataplane/... ./pkg/grpcapi/...
+  ./pkg/api/... ./pkg/cluster/... ./pkg/conntrack/... ./pkg/cli/...
+  ./pkg/fwdstatus/... -count=1` 0, `go test -race ./pkg/daemon/
+  ./pkg/dataplane/ -count=1` 0, `go test ./... -count=1` 0.
+- **File(s)**: pkg/daemon/daemon_dp_live.go (new),
+  pkg/daemon/daemon_dp_escape_test.go (new),
+  pkg/daemon/daemon_dp_escape_rest_test.go (new),
+  pkg/daemon/daemon_dp_escape_canary_test.go (new),
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon.go, pkg/daemon/daemon_run_naming.go,
+  pkg/daemon/bootstrap.go, pkg/daemon/daemon_dp_race_test.go,
+  pkg/daemon/daemon_dp_canary_test.go,
+  pkg/daemon/daemon_forwarding_status_test.go, pkg/daemon/README.md,
+  pkg/dataplane/maps_policy.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/counter_clear_error_2114_test.go (new),
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/dataplane/README.md, docs/pr/1373-retire-ebpf-dataplane/README.md,
+  _Log.md
+
+## 2026-08-12 — #2114 r6: the live indirection ERASED every optional capability (Codex PR #6743 round 6)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Folded a hostile Codex re-gate (six blocking findings) into the
+  #2114 publication work.
+
+  **F1 (FIXED, confirmed firsthand by the parent).** `liveDataPlane` has no
+  embedded field, so Go gave it exactly its 27 declared forwarders as its
+  method set. The management servers reach OPTIONAL capabilities by asserting
+  on `any` — `LastApplyResult`, `Sessions`, `Telemetry`, `Status`,
+  `AppliedNATView`, the session cursor, the userspace controls — and every one
+  of those assertions now failed against the adapter, silently, on a HEALTHY
+  deployment: `pkg/api/metrics_nat.go` stopped emitting every NAT-pool sample,
+  `pkg/grpcapi/server_helpers.go` built null session/telemetry domains so NAT
+  statistics reported healthy zeros, `pkg/api/metrics_userspace.go` suppressed
+  every userspace metric family, `show system buffers` answered "No BPF maps
+  available" about a running helper, session paging fell back to the
+  explicitly O(N^2) HA-watchdog-starving path, and deterministic NAT became
+  unavailable. The r4 compile-time assertions structurally cannot see this:
+  they pin the MANDATORY union, and erasure is the absence of everything
+  outside it. Fixed with a per-call unwrap escape hatch rather than by
+  enumerating the union (which silently re-breaks on the next capability a
+  backend gains): new `pkg/dataplane/live.go` carries `LiveUnwrapper` /
+  `Unwrap` / `Published` / the exported `ErrNotPublished`;
+  `liveDataPlane.Unwrap()` reads the cell DIRECTLY (not through `resolve()`,
+  whose mandatory-surface narrowing would itself erase capabilities on a
+  backend outside that union) and returns nil once the daemon has disowned
+  the backend. The `LastApplyResultOf` / `SessionStoreOf` / `TelemetryOf`
+  family resolves through it, and all ~28 probe sites in `pkg/grpcapi`,
+  `pkg/api` and `pkg/cli` now assert on a new per-package `dpProbe()`
+  accessor instead of the raw `dp` field.
+
+  **F2 (FIXED).** `GetPersistentNAT()` is a fresh cell load per call, and the
+  three callers read it two or three times in a row — nil-check, `.Len()`,
+  `.Clear()`. A `setDataplane(nil)` between the check and the use handed nil
+  to a caller that had already proven non-nil, and `.Len()` dereferenced it
+  (`PersistentNATTable.Len` takes `t.mu.RLock()` — a nil receiver panics).
+  Every caller now resolves ONCE into a local:
+  `pkg/grpcapi/server_diag_system_action.go`, `pkg/cli/cli_clear.go`, and
+  both `pkg/natshow/persistent.go` renderers (via `persistentNATTable`).
+
+  **F3 (FIXED).** (a) `dp != nil` stopped meaning "a dataplane exists" the
+  moment the servers held a permanently non-nil adapter, so a daemon whose
+  startup arm failed and cleared the cell rendered "No BPF maps available" —
+  a claim about a loaded backend's maps — instead of "Dataplane not loaded".
+  The four buffer-render sites ask `dataplane.Published(dp)` now. (b) A clear
+  that RACES the disown passes the `IsLoaded()` pre-check and then fails
+  inside the forwarder with `ErrNotPublished`, which was reported as
+  `codes.Internal` — the daemon's own lifecycle state presented to the
+  operator as a server fault. `dataplaneActionError` maps it to
+  `codes.Unavailable`, the same code the `dp == nil` pre-check returns for
+  the identical operator-visible condition; a genuine backend failure stays
+  Internal (negative control test).
+
+  **F4 (FIXED, both halves).** The event-stream loop CAPTURED its provider at
+  Phase 5, from the constructed-but-unarmed bootstrap backend, before any
+  helper socket existed; if the bootstrap arm then failed and cleared the
+  cell, nothing cancelled the goroutine and it kept polling the STALE,
+  disowned backend every 500ms for the daemon's lifetime.
+  `currentEventStreamProvider()` re-resolves from the cell each tick.
+  Separately, a commit-confirmed rollback closes the armed backend's stream
+  and a corrected re-arm builds a NEW one, but the wiring goroutine had
+  already returned and never installed callbacks on it — events accumulated
+  in the callback-not-ready queue instead of reaching session sync. The
+  callback installation is split into `installEventStreamCallbacks` and the
+  fallback loop re-installs whenever it observes a different stream
+  instance.
+
+  **F5 (NARROWED in the code comment; #6741 is the follow-up, no new issue
+  filed).** The r4 counter-clear error propagation cannot detect the
+  DETACHED-backend false success: `Teardown()` closes only link handles and
+  `Cleanup` merely unpins, so a retained torn-down `Manager` still holds live
+  FD-backed map objects and `Map.Update` through them SUCCEEDS. A successful
+  write is indistinguishable from a correct one at that layer. Both wrapper
+  comments now carry an explicit RESIDUAL paragraph saying so and pointing at
+  #6741 — whose body already names exactly this ("Teardown does not close the
+  `m.maps`/`m.programs` FDs ... a mutation that SUCCEEDS yet never reaches
+  the live generation"), so filing a second issue would have duplicated it.
+  `pkg/dataplane/README.md` gained a matching "what it does NOT cover"
+  subsection.
+
+  **F6 (FIXED for the three probabilistic guards; the BPF-privileged leg
+  stated UNPROVEN).** The r4 reader-ready barrier proved only that readers
+  had run BEFORE the writer: a legal schedule let every reader complete its
+  first pass, park, and never read again while the writer ran to completion.
+  `dataplaneCellReaderChurn` gained `round()`, a fresh per-shape rendezvous
+  that closes only after every shape completes a pass which BEGAN after the
+  round opened. `TestDataplaneCell_ConcurrentReadersVsWriter` opens a round
+  and keeps writing until it closes; the two arm-failure tests park the
+  writer INSIDE the arm (via the fakes' `onStart` hook, immediately before
+  `setDataplane(nil)`) until a round completes, then require a second round
+  after the store — so the write is bracketed by proven reader activity. A
+  30s timeout on the wait is an ASSERTION failure, not a hang.
+  `TestNATPoolAlarm_PointerPublication` got the same two rendezvous (its
+  overlap previously rested on a comment that the code did not establish).
+  `TestManager_ArmedGate_DetachRetainedClaims` still SKIPs without BPF
+  privilege — `Manager.maps` is `map[string]*ebpf.Map` with no substitution
+  seam, so making it privilege-free is its own change; its doc comment now
+  says plainly that a skipped cell is UNKNOWN and must not be counted as
+  covered.
+
+  **False claims corrected in text.** The churn helper's doc no longer says a
+  first-pass barrier proves overlap (it proves liveness before the writer,
+  nothing more), and `GetPersistentNAT`'s doc no longer describes the
+  repeated calls as one bounded expression — they were always separate cell
+  loads.
+
+  **Guards.** `daemon_dp_capability_2114_test.go` binds F1 preservation and
+  F1 disowned-unreachability in SEPARATE function bodies (a guard sharing a
+  body with its binder never runs once the binder fails), each with a control
+  proving the fixture really carries the capability; plus the probe-site
+  end-to-end binder through `startGRPCServer`, the F3(a) unpublished render,
+  the F3(b) status-code mapping with its Internal negative control, and the
+  F2 single-resolution binder. Every fixture embeds a real `*dataplane.Manager`
+  — with a stub-shaped fake, `resolve()` rejects the backend, `IsLoaded()`
+  answers false and the handler takes its "dataplane not loaded" pre-check
+  branch, so the test would pass without the forwarder/probe/mapping under
+  test ever running (two of these tests initially did exactly that and were
+  rebuilt). `daemon_dp_probe_canary_test.go` adds two syntactic fences with
+  both-direction self-tests: no optional-capability assertion on the raw `dp`
+  field, and no function resolving `GetPersistentNAT` more than once — the
+  latter covers `pkg/cli`'s `clearPersistentNAT`, which runs only under
+  `isInteractive()` and has no unit-reachable path.
+  `pkg/natshow/persistent_single_resolution_2114_test.go` binds both
+  renderers plus a no-table negative control.
+
+  **Mutation matrix — every RED observed, not predicted.** (1) Delete the
+  `Unwrap` hunk from `LastApplyResultOf` + `SessionStoreOf` → both F1 tests
+  RED ("LastApplyResultOf(liveDataPlane) = nil for a HEALTHY published
+  backend..."). (1b) Delete it from `SessionStoreOf` ALONE → RED on the
+  session-store assertion specifically ("Count() = (0,0), want (7,11)"), so
+  neither belt is masked by the other. (2) Make `Unwrap` memoise the first
+  resolved backend → F1(b) RED ("Unwrap handed back a DISOWNED backend")
+  while F1(a) stays GREEN — the targeted negative control. (3) Restore the
+  three-call `GetPersistentNAT` shape → the gRPC F2 test RED with an actual
+  nil-pointer panic after 1 resolution; (8) the same revert in `pkg/natshow`
+  → both render tests RED after 2 resolutions, with the no-table control
+  still GREEN. (4) Drop `dataplaneActionError` → F3(b) RED ("code = Internal,
+  want Unavailable") while the Internal control stays GREEN. (5) Restore
+  `if s.dp != nil` → F3(a) RED (`got "No BPF maps available\n"`) while the
+  probe test stays GREEN. (6) Restore `s.dp.(userspaceStatusProvider)` → the
+  probe test RED ("took the BPF-map branch for a backend that implements
+  Status()") while F3(a) stays GREEN. (7) Revert the #2114 cell to a plain
+  interface field → all three rewritten race guards RED under `-race` ("race
+  detected during execution of test"), confirming the new rendezvous did NOT
+  sanitize the race they exist to detect.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0; `go test ./...` 0; `go test -race ./pkg/daemon/ -run
+  'TestDataplaneCell_|TestBootstrapExit_|TestNATPoolAlarm_'` 0. No cluster
+  tooling run (control-plane Go only; no shim `.o` change).
+- **File(s)**: pkg/dataplane/live.go (new), pkg/dataplane/apply.go,
+  pkg/dataplane/maps_policy.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/armed_gate_legs_test.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/dataplane/README.md, pkg/daemon/daemon_dp_live.go,
+  pkg/daemon/daemon_ha_userspace_stream.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_dp_capability_2114_test.go (new),
+  pkg/daemon/daemon_dp_probe_canary_test.go (new),
+  pkg/daemon/daemon_dp_race_test.go,
+  pkg/daemon/daemon_natpoolalarm_race_test.go,
+  pkg/daemon/userspace_sync_test.go, pkg/daemon/README.md,
+  pkg/grpcapi/runtime.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_nat_deterministic.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_show_forwarding.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/grpcapi/server_show_system.go, pkg/api/api.go,
+  pkg/api/metrics_userspace.go, pkg/api/nat.go, pkg/api/sessions.go,
+  pkg/api/system.go, pkg/cli/runtime.go, pkg/cli/cli_clear.go,
+  pkg/cli/cli_helpers.go, pkg/cli/cli_show_chassis.go,
+  pkg/cli/cli_show_nat.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security_wireguard.go, pkg/cli/cli_show_system.go,
+  pkg/natshow/persistent.go,
+  pkg/natshow/persistent_single_resolution_2114_test.go (new),
+  docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
 ## 2026-08-12 — #5619 round 6: key the secure-tunnel exclusion on OWNERSHIP, not name shape
 
 - **Timestamp**: 2026-08-12
@@ -78271,6 +79026,346 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
   docs/cos-validation-notes.md, _Log.md
 
+
+## 2026-08-12 — #2114 r6b: the optional-capability surface is TWO families, and family 2 was unbound
+
+- **Timestamp**: 2026-08-12
+- **Action**: Parent scope correction on r6-F1. The optional-capability
+  erasure has TWO independent code paths, not one, and the r6 guard set
+  only bound the first behaviourally.
+
+  **Family 1** — the `...Of(provider any)` helpers in
+  `pkg/dataplane/apply.go`. Verified a CLOSED set of exactly three at head:
+  `LastApplyResultOf`, `SessionStoreOf`, `TelemetryOf`. Being closed is
+  what makes the `Unwrap` approach tractable there.
+
+  **Family 2** — NAMED interfaces asserted against the consumer's stored
+  `dp` field, which never touch `apply.go` at all: in `pkg/cli` that is
+  `cliUserspaceStatusProvider` (`Status()`, consumed by
+  `cli_show_system.go`, `cli_show_chassis.go`,
+  `cli_show_security_wireguard.go`) and `cliUserspaceControlProvider`
+  (Status + `SetForwardingArmed`/`SetQueueState`/`SetBindingState`/
+  `InjectPacket`, consumed by
+  `cli_request.go:handleRequestChassisClusterDataPlane`). The r6 fix
+  already routed every one of these through `dpProbe()`, but the only
+  behavioural binder for the family went through pkg/grpcapi's
+  `userspaceStatusProvider` — so a regression confined to `pkg/cli`'s
+  `dpProbe()` would have read GREEN.
+
+  **Sweep, run rather than trusted.** `pkg/cli/runtime.go`'s comment claims
+  the named types "replace the inline `c.dp.(interface{ Status() ... })`
+  probes"; verified with `git grep -nE '\.\(interface\{' -- pkg/cli/
+  pkg/api/ pkg/grpcapi/ pkg/natshow/`: ZERO remaining inline anonymous
+  probes in consumer production code at head. The only two hits are the
+  comment itself and generated protobuf (`xpf_grpc.pb.go:957` asserting on
+  `srv`, unrelated to the dataplane). Note the comment was accurate about
+  pkg/cli but NOT about pkg/api — `system.go`, `nat.go` (x2) and
+  `metrics_userspace.go` still carried inline anonymous probes before r6,
+  and `cli_show_nat.go`'s inline `AppliedNATView` probe was outside that
+  comment's scope; all five are converted. Also swept for a local-alias
+  shape (`rt := s.dp; rt.(T)`) that the AST canary would not catch: zero
+  occurrences. All 23 provider-shaped assertions in the consumer packages
+  now go through `dpProbe()`.
+
+  **New binder** (`pkg/cli/cli_capability_probe_2114_test.go`). pkg/daemon
+  cannot host it — pkg/daemon imports pkg/cli, so the real `liveDataPlane`
+  is unreachable from here. The fixture reproduces its ESSENTIAL property
+  instead: `cliLiveIndirection` embeds a `*dataplane.Manager` (the mandatory
+  `cliRuntime` surface and nothing more — no `Status()`, none of the four
+  mutators) and resolves the backend per call through
+  `dataplane.LiveUnwrapper`. Three bodies: `Status()` preserved,
+  the CONTROL provider preserved (asserting `SetForwardingArmed` actually
+  reached the backend, not merely that the assertion succeeded), and
+  disowned-unreachable. Each preservation test carries a positive control
+  proving the backend really implements the interface.
+
+  **Fixture-fidelity guard.** `newCLIWithLiveIndirection` asserts the
+  adapter itself FAILS both probes. Without it the fixture could drift into
+  carrying `Status()` and the guards would pass with no unwrap at all.
+
+  **Mutation matrix.** (9) Delete the unwrap hunk from `pkg/cli`'s
+  `dpProbe()` (`return c.dp`) → both family-2 preservation tests RED
+  ("userspaceDataplaneStatus() = userspace status unavailable for a HEALTHY
+  published backend that implements Status()" / "userspaceDataplaneControl()
+  = userspace dataplane control unavailable") while
+  `TestCLIProbe_DisownedBackendIsUnreachable` stays GREEN — the targeted
+  negative control. (10) Give `cliLiveIndirection` its own `Status()` → all
+  three RED at the fidelity guard ("fixture drift: cliLiveIndirection
+  implements cliUserspaceStatusProvider directly"), so that guard is live
+  rather than decorative. Family 1's distinguishing mutations were recorded
+  in the preceding entry (delete the unwrap from `LastApplyResultOf` +
+  `SessionStoreOf`, and from `SessionStoreOf` alone).
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0. `gofmt -l` clean on the new file.
+- **File(s)**: pkg/cli/cli_capability_probe_2114_test.go (new), _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: PR #6743 round 7 — fold five hostile-review findings. One
+  BLOCKING runtime escape (F1), one BLOCKING guard defect (F2), a canary
+  over-claim (F3), stale docs (F4), and the coverage gap that let the whole
+  r6-F4 hunk pair be deletable (F5).
+
+  **F1 (MAJOR, runtime).** r6-F4 made the event-stream loop re-resolve the
+  PROVIDER and the STREAM per tick but left the third resolution — the
+  session-delta DRAINER — captured at loop entry, in BOTH
+  `eventStreamFallbackLoop` (used at the reconciliation and fast-fallback
+  drains) and `syncUserspaceSessionDeltas`. Both loops run under `commsCtx`,
+  which only `stopClusterComms` cancels; a dataplane disown does not. So
+  after `commit confirmed` timeout → `enterBootstrapMode` (Teardown, object
+  retained) → corrected commit → `armBootstrapExitDataplane`'s `rt.Start()`
+  failure → `setDataplane(nil)`, the provider correctly resolved to nothing
+  and `connected` went false, dropping the loop onto its FAST 100 ms branch
+  — where `hasDrainer` was still true and it kept calling
+  `DrainSessionDeltas` on the torn-down, disowned backend, taking
+  `userspaceDeltaSyncMu` each time, for the daemon's lifetime. Verbatim the
+  escape the r6-F4 comment claims to have closed, at 10 Hz instead of 2 Hz.
+  The reverse arm is as bad: an empty cell at entry latched `hasDrainer =
+  false` (and in `syncUserspaceSessionDeltas`, RETURNED outright), so the
+  reconciliation drain stayed dead even after a healthy backend was
+  republished. Fix: `currentSessionDeltaDrainer()` resolves from the cell
+  immediately before each of the three drains; the `!ok` arm was dropped
+  from `syncUserspaceSessionDeltas`'s entry gate so a later publication is
+  picked up.
+
+  **F2 (MAJOR, guard).** `dataplaneCellReaderChurn`'s doc asserted
+  unconditionally that "the plain-field revert below still fires". Measured
+  here against a plain-field shadow of `dpCell` under `-race`:
+  `TestBootstrapExit_ArmFailureWithConcurrentReaders` 0/5 and
+  `TestDataplaneCell_RollbackRearmRecurrence` 0/5 at GOMAXPROCS=1, while the
+  controls `TestBootstrapExit_RealSamplerOverlap` (3/3) and
+  `TestDataplaneCell_ConcurrentReadersVsWriter` (2/3) DID fire — so P=1 does
+  not blind the detector; the bracketing simply is not a revert-fires gate.
+  Mechanism: the round is a happens-before edge in both directions (reader
+  `wg.Done()` → `Wait()` → `close(ch)` → the caller's `<-ch` orders every
+  credited pass before the store; the caller's next `cur.Store` → a reader's
+  `cur.Load` orders every subsequently credited pass after it), so for a
+  SINGLE-SHOT writer only uncredited passes are unordered and nothing forces
+  one to exist. Fix, both halves: the doc now states what the bracketing
+  proves (liveness) with the measured table, and a new
+  `TestDataplaneCell_RollbackRearmOverlap` supplies the missing
+  deterministic gate for the rollback + re-arm store on the
+  `RealSamplerOverlap` two-sided pattern — reader parked immediately before
+  its `dataplane()` load, the retained backend's re-arm `Start` parked
+  immediately before `setDataplane(nil)`, one `close(release)` for both.
+
+  **F3 (MINOR, canary).** `rawDPAssertionViolations` caught ONE spelling
+  (`x.dp.(T)`) and the comment called it "the 'no new capability-erasing
+  probe' fence". Extended to type-switch heads (`switch x.dp.(type)`) and to
+  a local bound directly from the field (`d := s.dp; d.(T)`), and the scope
+  note now names the covered spellings AND the shapes that pass clean —
+  notably a free function taking the field as a parameter, which is the
+  exact shape of `pkg/api`'s `fetchUserspaceStatus`, the site of the
+  original metric loss. Flagging `.dp` as a call ARGUMENT was rejected: the
+  live call site `fetchUserspaceStatus(s.dp)` is correct, so that would be a
+  false positive rather than coverage. New
+  `TestOptionalCapabilityProbeScannerDocumentedGaps` pins the disclaimed
+  boundary executably, so a later widening (or a wrong disclaimer) fails.
+
+  **F4 (MINOR, docs).** `daemon_dp_live.go` still said the event-stream loop
+  "resolves a helper-specific EventStream provider once", and
+  `pkg/daemon/README.md` still called all three data-path consumers
+  capture-once while describing the third as per-poll. Both corrected: TWO
+  capture-once consumers, one per-tick resolver.
+
+  **F5 (MINOR, coverage).** Both r6-F4 production hunks were entirely
+  unbound — deleting the `es != wired` re-install block, or reverting the
+  per-tick provider resolution, left the whole `pkg/daemon` suite green. New
+  `daemon_ha_userspace_stream_live_test.go` drives
+  `eventStreamFallbackLoop`/`syncUserspaceSessionDeltas` themselves (the
+  production goroutines from `daemon_ha_sync.go`) over a real connected
+  `SessionSync` pair.
+
+  **Mutation matrix (4x4 diagonal, every RED an assertion).**
+  (M1) capture the drainer once at `eventStreamFallbackLoop` entry →
+  `TestEventStreamFallbackLoop_DrainerReresolvedPerTick` RED
+  ("DrainSessionDeltas ran 15 more times on the DISOWNED backend after
+  setDataplane(nil) (1 -> 16)"), other three GREEN. (M4) same revert in
+  `syncUserspaceSessionDeltas` only → `TestSyncUserspaceSessionDeltas_...`
+  RED with the same message, other three GREEN — the two instances are
+  independently bound. (M2) delete the `es != wired` re-install block →
+  `TestEventStreamFallbackLoop_RewiresReplacementStream` RED ("read ack
+  frame: ... i/o timeout"), other three GREEN. (M3) capture the provider
+  once at loop entry → `TestEventStreamFallbackLoop_ProviderResolvedPerTick`
+  RED ("the loop never observed the stream of a backend published AFTER loop
+  entry"), other three GREEN — that test is handed the stream it will later
+  see, so the re-install block is a no-op in it and the two arms do not
+  overlap. (M5) plain-field revert of the cell → the new
+  `TestDataplaneCell_RollbackRearmOverlap` reports DATA RACE 5/5 at
+  GOMAXPROCS=1 and 5/5 at default, pairing `dataplane()` in the parked
+  reader against `setDataplane()` in `armBootstrapExitDataplane`. (P1/P2)
+  rewrite the LIVE `pkg/grpcapi/server.go:235` probe as `switch s.dp.(type)`
+  and as `d := s.dp; d.(T)` → `TestOptionalCapabilityProbesUseDPProbe` RED
+  naming `grpcapi/server.go:235 (type switch on the dp field)` and
+  `grpcapi/server.go:236 (type assertion on d, a local alias of the dp
+  field)` — the extension is proven against production, not only fixtures.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0; `go test -race ./pkg/daemon/ -run 'TestDataplaneCell|
+  TestBootstrapExit|TestForwardingStatusAdapter'` 0. No dataplane artifact
+  changes, so no cluster smoke is owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_stream_live_test.go (new),
+  pkg/daemon/daemon_dp_race_test.go,
+  pkg/daemon/daemon_dp_probe_canary_test.go, pkg/daemon/daemon_dp_live.go,
+  pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: PR #6743 round 8 — a second review round on the r7 head. Codex
+  re-gated DO-NOT-MERGE and found a SECOND schedule in the loop r7 fixed; a
+  parallel reviewer ran the optional-probe scanner against nine evasion
+  shapes and got one hit (the control). Plus three new findings and a
+  correction to a claim the parent had endorsed.
+
+  **F1b (BLOCKING, runtime) — the second schedule.** r7 made the drainer
+  per-tick, which fixes the loop once it is RUNNING. It does not reach the
+  entry point: `runUserspaceEventStream` opened with a ONE-SHOT
+  `d.dataplane().(userspaceEventStreamProvider)` probe and, on a miss,
+  handed off permanently to `syncUserspaceSessionDeltas`, a sibling loop
+  with no wiring logic at all. An empty cell at that instant — the daemon
+  has not armed the helper yet, or a bootstrap-arm failure cleared it —
+  therefore LATCHED the daemon out of the event stream for the life of the
+  process: the corrected commit could publish a perfectly healthy provider
+  a moment later and its callbacks were never installed, so every helper
+  event accumulated in the callback-not-ready queue. A per-tick drainer
+  cannot help; the decision was already made and, on the standalone path,
+  the goroutine had already returned.
+
+  Fix: `eventStreamFallbackLoop` is now the single loop for both roles.
+  It already re-resolves provider + stream + drainer every tick, installs
+  callbacks the first time it sees a stream (`wired == nil` means "nothing
+  wired yet") and polls at 100 ms while disconnected — which is exactly
+  what `syncUserspaceSessionDeltas` did, so that function is DELETED rather
+  than fixed twice. The standalone branch (`d.cluster == nil`) keeps
+  calling `wireUserspaceEventStreamCallbacks`, which re-reads the cell every
+  500 ms: there is no session sync to poll there, but the helper's
+  RT_FLOW dataplane events still reach the event buffer through those
+  callbacks, and routing standalone into the HA loop would silently kill
+  them (bound below).
+
+  **N1 (claim) — "used immediately" is false.** `Unwrap`'s doc said the
+  caller gets "a handle valid for the call it is about to make". Consumers
+  legitimately hold it across a whole OPERATION: pkg/cli's
+  request-chassis inject and pkg/grpcapi's userspace-inject action both
+  `Status()` then `InjectPacket()` on the same provider, and the gRPC
+  session-cursor loops iterate the cursor they resolved. Re-resolving
+  mid-operation would be wrong, not safer. The guarantee is now stated as
+  per-OPERATION, with the observation that no consumer caches it in a
+  FIELD, so the window is bounded by the request and the residual is the
+  same #6741 lifetime gap.
+
+  **N2 (real, predates the PR) — one optional probe never went through
+  `dpProbe()`, for TWO reasons.** `NewPolicyCounterReader` asserted the
+  #3965 bulk interface on the RAW handle, and the bulk reader existed on
+  `*Manager` only while the daemon publishes the ADAPTER. Both had to be
+  fixed: the probe now resolves through `dataplane.Unwrap`, and
+  `LegacyDataPlaneAdapter` gained a `ReadAllPolicyCounters` forwarder.
+  Until now all seven observability callers (pkg/api metrics + security
+  inventory, pkg/cli show-security, pkg/grpcapi policies-text + zones)
+  silently took the `O(P*(P+C))` per-policy fallback the bulk snapshot
+  exists to replace. NOTE this is a deliberate behaviour change on a live
+  path: the bulk path was production-dead and is now live. It is a pure
+  in-memory read of the manager's last published status (no control-socket
+  round trip), and on a bulk read error the reader surfaces that error
+  through the per-policy channel rather than silently falling back — the
+  documented #3965 design.
+
+  **N3 (claim) — the parent's endorsed rationale was technically false.**
+  `daemon_dp_live.go` implied that routing `Unwrap` through `resolve()`
+  would ERASE optional methods. A successful Go interface conversion
+  preserves the dynamic concrete type, so it would not. The real reason is
+  narrower and is now stated: `resolve()` REJECTS a backend that does not
+  satisfy the mandatory management surface, so `Unwrap` would return nil
+  for a published backend that may well carry the capability being probed.
+
+  **F3 (Codex) — the fix was present but the race survived it.**
+  `Published()`, `dpProbe()` and `dp.GetMapStats()` were three INDEPENDENT
+  cell loads in each of the four buffer renders, so a `setDataplane(nil)`
+  between them re-created the exact confusion `Published()` was added to
+  prevent: publication check passes, later loads resolve nil, render prints
+  "No BPF maps available" — a statement about a LOADED backend's maps — for
+  a daemon with no backend at all. All four now take ONE
+  `dataplane.Unwrap` and assert every capability off that single value
+  (`backendSessionCount` / `backendMapStats` helpers in each consumer).
+
+  **F3 (parallel reviewer) — the fence catches one SPELLING.** Three
+  concrete fixes, in the order asked: (a) strip parenthesization before the
+  selector check — `(s.dp).(T)` evaded because `assert.X` was an
+  `*ast.ParenExpr`, and this PR had ALREADY added the paren-stripping
+  helper for the same class in a sibling canary
+  (`unwrapOwnerIdent`, pkg/dataplane/armed_gate_matrix_test.go), so the
+  thinner pkg/daemon fence simply had not inherited the house standard;
+  (b) the type-switch head (already done in r7); (c) recursion into
+  subdirectories, applied to BOTH scanners in the file via a shared
+  `probeScanFiles`. The five dataflow shapes are NOT chased — the scope
+  note now names the covered spellings, names the uncovered ones with the
+  concrete production example (`fetchUserspaceStatus`), and records WHY the
+  alias spelling is the likeliest to walk in: `rt := <handle>; rt.(T)` is
+  the house idiom, with 19 sound instances in pkg/daemon, so a contributor
+  copying that style into pkg/grpcapi writes the erasing version. That one
+  IS caught rather than merely disclaimed. NOTE: the referenced model
+  `pkg/cli/userclass_entrypoint_canary_test.go` is on an unmerged sibling
+  PR — absent from this branch and from origin/master — so `unwrapOwnerIdent`
+  was used as the in-tree model.
+
+  **Completeness-claim sweep (as a class, not case by case).** Four
+  instances were named; the sweep over every absolute claim the PR adds
+  found and corrected: (1) `daemon_run_naming.go`'s "the conntrack GC,
+  cluster SessionSync AND the userspace event-stream loop keep a handle
+  taken before this point" — false since r6-F4/r7-F1, the loop is severed
+  within one tick; (2) `pkg/cli/runtime.go`'s "Replaces the inline probes"
+  — TRUE as scoped (both named files really were converted) but misreadable
+  as a general claim, now explicitly scoped, recording that the surviving
+  anonymous-interface probes in pkg/api and cli_show_nat.go are correct
+  because they resolve through `dpProbe()`; (3)
+  `TestPersistentNATResolvedOncePerOperation`'s "fences every consumer" —
+  now says every consumer PACKAGE, recursively, with the per-FUNCTION limit
+  stated; (4) `dataplaneActionError`'s "anything else is a genuine backend
+  failure and stays Internal" — true of the MAPPING, but
+  `pkg/dataplane/maps_nat.go`'s ClearNATRuleCounters discards every
+  per-entry Update error and returns nil, so a partial clear never gets a
+  code at all. Pre-existing on master, not part of #2114's publication
+  contract, recorded as explicitly out of scope.
+
+  **Mutation matrix (all six RED, every RED an assertion).**
+  (N1a) restore the one-shot provider pre-check in `runUserspaceEventStream`
+  → `TestRunUserspaceEventStream_DrainerReresolvedPerTick` RED ("no
+  DrainSessionDeltas call against the published backend: the loop never
+  reached its drain") AND
+  `TestRunUserspaceEventStream_WiresAfterEmptyCellAtEntry` RED (ack
+  timeout). (N1b) route the STANDALONE branch into the HA fallback loop →
+  `TestRunUserspaceEventStream_StandaloneWiresAfterEmptyCellAtEntry` RED
+  (ack timeout) — the guard against the collapse killing standalone event
+  delivery. (N2a) drop `dataplane.Unwrap` from `NewPolicyCounterReader` →
+  "the reader took the per-policy FALLBACK 1 times for a handle that
+  resolves to a bulk-capable backend". (N2b) delete the adapter forwarder →
+  "the PUBLISHED backend (*LegacyDataPlaneAdapter) does not expose
+  ReadAllPolicyCounters" + the reader test. (F3a) revert both gRPC renders
+  to `Published()` + `dpProbe()` + `s.dp.GetMapStats()` → both subtests RED
+  with `reported "No BPF maps available" after resolving the backend more
+  than once (resolves=2)`. (F3b) reduce `unwrapProbeExpr` to the identity →
+  three self-test cells RED (`violations = [], want exactly one`). (F3c)
+  make the scanner non-recursive again → "a violation in a SUBDIRECTORY
+  must be reported". The r7 4x4 diagonal still holds.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0; `-race` leg on the pkg/daemon cell/bootstrap/
+  event-stream tests 0. Control-plane Go only, no dataplane artifact — no
+  cluster smoke owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_stream_live_test.go,
+  pkg/daemon/daemon_dp_probe_canary_test.go, pkg/daemon/daemon_dp_live.go,
+  pkg/daemon/daemon_run_naming.go,
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/policy_counter_unwrap_6743_test.go (new),
+  pkg/grpcapi/server_show_system.go, pkg/grpcapi/runtime.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_show_system_single_resolve_6743_test.go (new),
+  pkg/cli/cli_show_system.go, pkg/cli/runtime.go, _Log.md
 ## 2026-08-12 — #4800 fold r3: Codex DO-NOT-MERGE, five blocking findings closed
 
 - **Timestamp**: 2026-08-12
@@ -80784,6 +81879,386 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+- **Action**: #6743 fold of the two claim defects measured by the hostile review at
+  `d04a98bf3` (zero runtime findings). M1: the escape canary's stated residual list
+  UNDERSTATED the canary. `daemon_dp_escape_canary_test.go:99-102` claimed that a call
+  to a helper assigning the probe through a pointer is invisible because R1/R2 analyse
+  one body at a time. The review built exactly that shape at the gRPC site and the
+  canary RED with `startGRPCServer builds grpcapi.Config with a DP value that is not
+  derived from liveDataplane()`. The reasoning was right and the conclusion wrong: R3
+  does not analyse the callee at all, it requires the `grpcapi.Config{DP:}`
+  composite-literal value to be live-derived IN THE CALLER BODY, so relocating the
+  assignment DEFEATS R3 rather than hiding from it. Rewrote the bullet to say so, kept
+  `go d.wireConsole()` as genuinely unclaimed (that is R4's territory, keyed on
+  `cli.New`'s argument set, and was not tested in either direction), and recorded that
+  understatement is the dangerous direction to be wrong in — it invites the next reader
+  to skip the behavioural half believing the AST half cannot reach the site. M2:
+  `pkg/api/system.go` `systemBuffersHandler` still takes three independent loads of the
+  cell (`IsLoaded`, `dpProbe`, `GetMapStats`) where the gRPC and CLI peers moved to a
+  single resolution in this change. Outcome-equivalent — every load of an empty cell
+  agrees — so NOT a runtime finding; what it leaves is a SURFACE gap, since for
+  identical daemon state gRPC and CLI print "Dataplane not loaded" while REST returns
+  200 with an empty list, which a client cannot distinguish from a healthy firewall
+  with no buffers. Pre-existing, recorded here because this is the change that made
+  every other surface deliberately uniform, which turns leaving REST alone into a
+  decision rather than an oversight. Validation: gofmt clean; `go build ./...` rc=0;
+  `go test ./pkg/daemon/... -count=1` rc=0 and `go test ./pkg/api/... -count=1` rc=0.
+  A first run reported 3 daemon FAILs — all `bind: invalid argument` from a 22-char
+  `GOTMPDIR` overflowing the unix `sun_path` limit against this repo's long test names,
+  a harness artifact that cannot be caused by a comment edit; re-run at
+  `GOTMPDIR=/dev/shm/T6` gave zero such failures.
+- **File(s)**: pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go
+- **Timestamp**: 2026-08-20 (fix/2114-dp-accessor, PR #6743 round 4)
+- **Action**: #6743 round 4 — folded a MERGE-BLOCK on the round-3 fold. Round 3
+  was written by the same parent who then dispatched an independent review of
+  it; the review refuted two of round 3's own clauses and found a live defect
+  underneath them.
+
+  **F1/F2 (BLOCKING) — a false single-load claim, stated four times, over a
+  render that measurably took two loads.** `showBuffers` asserted "r7: ONE
+  resolution feeds every decision in this render" and then ended its
+  map-stats arm with `s.dp.SessionCount()`. Under the live indirection that
+  is an independent cell load (`liveDataPlane.SessionCount` -> `resolve()`),
+  so the render described two instants. Four renders carried the same
+  residual while asserting the contract it violated: `pkg/grpcapi`
+  showBuffers + showBuffersDetail, and the `pkg/cli` peers. This PR's own
+  diff converted the SIBLING occurrence three lines away — the userspace arm
+  — in all four, and left the else-branch occurrence unconverted in all four.
+
+  Measured consequence with a fake whose every method is a counted cell load:
+  steady => 2 loads and "Active sessions: 7 IPv4, 3 IPv6, 10 total"; torn =>
+  2 loads, map table rendered, "Active sessions" line SILENTLY DROPPED. One
+  render describing two instants — the defect `pkg/dataplane/live.go` says r7
+  removed.
+
+  **Why the shipped guard could not fire.** `TestShowBuffersResolvesBackendOnce`
+  asserted `dp.resolves.Load() == 1`, but `oneShotIndirection` embedded
+  `*dataplane.Manager`, so `s.dp.SessionCount()` was served by the embedded
+  Manager and never touched the counter: the guard keyed on UNWRAP-CALL count
+  while the property is CELL-LOAD count, and the residual is precisely a load
+  that is not an Unwrap. Its fixture (`mapStatsBackend`, no `Status()`) drove
+  the map-stats arm — the exact arm carrying the unconverted line — and its
+  backend returned (0,0) sessions, so the dropped line was unobservable
+  either way. No CLI-side test asserted a load count at all. Confirmed
+  unbound at 6163445e9: reverting BOTH userspace-arm conversions left
+  `./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/... ./pkg/dataplane/...` rc=0
+  AND `./pkg/daemon/...` rc=0 — complete survivors.
+
+  Fixed in two halves, neither sufficient alone. (1) All four residuals now
+  read `backendSessionCount(backend)`; all 8 call sites across the two files
+  are the single-load form. (2) The guard is re-keyed from the proxy to the
+  property: `countingIndirection` / `cliCountingIndirection` route EVERY
+  backend-reaching method through one counted `load()` and shadow the
+  embedded Manager deliberately, the backends return (7,3) so the render's
+  `v4 > 0 || v6 > 0` gate makes the tear observable, and the grid gains a
+  USERSPACE-ARM row so this PR's own conversion is bound in the arm it
+  changed. CLI-side coverage is new
+  (`pkg/cli/cli_show_system_single_load_6743_test.go`); it did not exist.
+
+  Severity note: dormant today. `buildRuntimeDataPlane` -> `dpuserspace.Boot()`
+  -> `NewLegacyDataPlaneAdapter` has `Status()`, and ebpf/dpdk are
+  hard-rejected, so no shipped backend takes the map-stats arm. Not
+  downgraded on reachability: a false production claim stated four times, a
+  guard that cannot fire, and a live defect the moment a backend without
+  `Status()` is published.
+
+  Proof: 8-cell revert-per-conversion matrix (4 grpcapi + 4 cli, both arms,
+  both renders) — 8/8 rc=1, each cell redding exactly its own subtest and
+  leaving the other three green; pristine controls rc=0 (5 pass / 0 fail
+  each); an always-failing sentinel through the same invocation path rc=1, so
+  a green cell is distinguishable from a suite that never ran. Restore is by
+  file copy, never `git checkout --` (the new CLI guard is untracked and
+  every edit was unstaged). Each mutation was verified PRESENT before its run.
+
+  **F3a — round 3's canary bullet was false.** It said `go d.wireConsole()`
+  "genuinely remains unclaimed — R4's territory, and not tested in either
+  direction". Built in BOTH readings against the real production site —
+  `go d.wireConsole(&cliDP)` with a pointer-writing helper, and the literal
+  no-argument form with the probe hoisted to package scope — the canary REDs
+  in both, rc=1, with R4's message: "daemon_run.go:Run calls cli.New without
+  passing a management-probe value derived from liveDataplane()". Control
+  green post-restore, production block restored verbatim. R4 is the governing
+  rule, and it catches the site for the same structural reason R3 catches the
+  gRPC shape: liveness is computed per-function and must be established in
+  the CALLER body, so any boundary crossing breaks it. The bullet now says
+  that, and the residual list drops from two items to ONE (runtime control
+  flow ordering). The direction matters: the false bullet sat under "Two
+  things therefore remain outside it", one sentence after the paragraph
+  naming understatement as the dangerous direction — a hedge placed inside a
+  list of limitations is not read as a hedge, it is read as a limitation.
+
+  **F3b — round 3's REST doc comment was false and its reasoning was thinner
+  than its conclusion.** "where the gRPC and CLI peers were converted to a
+  single resolution in #2114" — they were converted in ONE ARM only; the
+  map-stats arm was not converted until F1 above. Corrected, and the peers
+  are now described as a pattern that took two passes rather than a finished
+  one. The conclusion (no torn view) is verified but the stated reason —
+  "every load of an empty cell agrees" — answers a different question, since
+  the interesting schedule is a cell FULL at load 1 and empty afterwards.
+  What actually saves it is that both later loads FAIL CLOSED to the same
+  body the early return produces: `dpProbe()` resolves nil so the `Status()`
+  assertion fails, `GetMapStats()` returns nil so the loop appends nothing,
+  and `writeOK` emits the same empty list. Verified against
+  `liveDataPlane.IsLoaded`/`GetMapStats`, both of which return the zero value
+  on an unresolved cell.
+
+  This round touches NO `.o`, no `userspace-xdp/`, and no protocol/wire file
+  — Go control-plane renders, their guards, and comments only.
+- **File(s)**: pkg/grpcapi/server_show_system.go,
+  pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
+  pkg/cli/cli_show_system.go, pkg/cli/cli_show_system_single_load_6743_test.go
+  (new), pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go
+- **Timestamp**: 2026-08-20 (fix/2114-dp-accessor, PR #6743 round 5)
+- **Action**: #6743 round 5 — folded a MERGE-BLOCK on the round-4 fold. The
+  review verified round 4's RUNTIME half firsthand and found it complete: all
+  8 sites read `backendSessionCount(backend)`, the 8-cell matrix re-derived
+  independently at 8/8 rc=1, both assertions live, `(7,3)` genuinely
+  un-vacuuming the output assertion. What blocked is that BOTH re-keyed
+  guards shipped a universal they did not deliver. Two corrections, each
+  proven by measurement rather than argued.
+
+  **B1 (BLOCKING) — "route EVERY backend-reaching method through one counted
+  load" was 2 of 25.** The round-4 entry above states that sentence, and both
+  fixture headers stated it as "EVERY method that reaches the backend
+  performs its own counted cell load". It was false. `grpcRuntime` has 25
+  methods and `cliRuntime` 25; `countingIndirection` / `cliCountingIndirection`
+  declared 2 apiece (`SessionCount`, `GetMapStats`) plus `Unwrap`. The other
+  23 on each side were SERVED by the embedded concrete `*dataplane.Manager` —
+  the same shape round 7's guard died of ("an embedded method is a load the
+  counter cannot see"), reintroduced in the fix for it.
+
+  Measured at 44603f888: inserting `if !s.dp.IsLoaded() { buf.WriteString(
+  "stale\n") }` into showBuffers' map-stats arm — a real second cell load —
+  left `loads=1`, all four subtests PASS, `pkg/grpcapi` rc=0.
+
+  Fixed by embedding the runtime INTERFACE (`grpcRuntime` / `cliRuntime`),
+  left nil, instead of the concrete Manager. It still satisfies `Server.dp` /
+  `CLI.dp` (promotion supplies the method set), the three declared methods
+  still shadow, and every OTHER method now dispatches through a nil interface
+  and PANICS at the production call site that took it. The universal is
+  delivered rather than narrowed: there is no method on the fixture that can
+  reach the backend without the counter seeing it, and that is a property of
+  ONE field rather than of an enumeration. A loud panic naming the production
+  line beats a silent zero.
+
+  Bound by `TestShowBuffersCountingIndirectionServesNothingSilently` and its
+  CLI peer, in two clauses: STRUCTURAL (the embedded interface must be nil —
+  this is the clause that quantifies over all 22 undeclared methods at once)
+  and BEHAVIOURAL (`IsLoaded()` must panic rather than return). Re-embedding
+  the Manager reds both.
+
+  Proof: the same `IsLoaded()` insertion re-run at the r5 head. `pkg/grpcapi`
+  rc=1, `TestShowBuffersTakesOneCellLoad/showBuffers/mapStatsArm` FAIL, panic
+  stack naming `server_show_system.go:495`; `pkg/cli` rc=1,
+  `TestCLIShowSystemBuffersTakesOneCellLoad/showSystemBuffers/mapStatsArm`
+  FAIL naming `cli_show_system.go:60`. Each invocation also ran a pristine
+  control (`TestGRPCDpProbeResolvesThroughTheIndirection_6743` /
+  `TestCLIProbe_StatusSurvivesLiveIndirection`) which PASSED, and an
+  always-failing sentinel which FAILED — so a green cell is distinguishable
+  from a suite that never ran. Restore by file copy, never `git checkout --`.
+
+  **B2 (BLOCKING) — the canary's residual list was short again, and round 4
+  made it worse.** The round-4 entry says "the residual list drops from two
+  items to ONE". Re-counting the members of a population nobody had verified
+  yields a number that is more precise and no more true, and "one" reads as
+  audited in a way "two" did not.
+
+  The canary's reach was bounded by three hand-maintained literals —
+  `managementProbeTypes` (3 entries), `managementConsumerConfigs` (2), and
+  the literal `cli.New` selector. No test bound either map to reality; both
+  names appeared only at their declaration and their single use site.
+  `runtime_probes.go` declares SIX interfaces and 3 were registered.
+
+  Measured at 44603f888: a FOURTH management consumer added to real
+  production, wired capture-once with its own probe type, sourced through a
+  type assertion — precisely the escape R1 exists to kill — and handed to its
+  own `Config{DP: ...}` literal, left `pkg/daemon` rc=0 with 0 FAIL. R1
+  missed (type not in the map), R3 missed (config not in the map), R4 missed
+  (not `cli.New`). The file's own opening paragraph motivates itself with
+  exactly this case.
+
+  Two independent closures, so neither carries the property alone:
+
+  (1) `TestManagementProbeRegistryIsComplete` PARSES the probe declaration
+  files and reports any interface they declare that is in NEITHER
+  `managementProbeTypes` nor the new `managementProbeNonConsumerTypes` (an
+  explicit exemption carrying the reason). The population is bounded by the
+  source instead of by a memory, and the scan is scoped by the SAME
+  `managementProbeDeclFiles` map that grants the naming exemption, so the
+  exemption and the obligation cannot drift apart. Driven in both directions
+  by a self-test: clean, a seventh interface in `runtime_probes.go`, and an
+  unclassified one in the other declaration file.
+
+  (2) R3 no longer consults a registry of consumer packages at all. It keys
+  on the FIELD: any qualified composite literal with a `DP:` element must
+  take a live-derived value, whatever package or type name it wears.
+  `managementConsumerConfigs` is retired. Verified free of false positives —
+  `pkg/daemon` production has exactly two such literals and both were already
+  covered.
+
+  Proof, two cells, each with a pristine control and an always-failing
+  sentinel in the same invocation. CELL C: a seventh interface appended to
+  the real `runtime_probes.go` and left unregistered — rc=1,
+  `TestManagementProbeRegistryIsComplete` FAIL naming
+  `runtime_probes.go:mgmtDataPlane`, with the wiring fence still PASSING.
+  CELL D: the reviewer's fourth consumer added to real
+  `daemon_run_servers.go` with its own probe type, type assertion and
+  `mgmt.Config{DP: ...}` — rc=1, `TestManagementProbesComeFromLiveDataplane`
+  FAIL naming "daemon_run_servers.go:startMgmtServer builds mgmt.Config with
+  a DP value that is not derived from liveDataplane()", with the registry
+  test still PASSING. The two cells red on different assertions, which is
+  what makes them independent rather than one guard counted twice.
+
+  The residual is now stated as a PREDICATE, not a count. Two things remain,
+  both properties of the rules: runtime-control-flow ordering (R5 enumerates
+  the SYNTACTIC deferring forms only), and R4's site-keying on `cli.New` —
+  which a consumer escapes only by satisfying all THREE of taking its probe
+  as a plain call argument rather than a `DP:` field, not being `cli.New`,
+  and declaring its probe type outside the two declaration files. The third
+  conjunct is what bounds it: declared inside them, (1) forces registration
+  and R1/R2 apply.
+
+  **N1 — the REST byte-identity clause was proved for one schedule and read
+  unconditional.** "A torn view is therefore byte-identical to the untorn
+  one" holds for MONOTONE schedules only. A REFILL between loads 2 and 3 —
+  `dpProbe()` nil so the userspace arm is skipped, then `GetMapStats()`
+  resolving a RE-PUBLISHED backend — yields MAP rows where an untorn view of
+  either instant would have emitted USERSPACE rows. Commit-confirmed rollback
+  re-arms the dataplane, so the schedule is real. Scoped, and the refill case
+  named and recorded rather than papered over.
+
+  This round touches NO `.o`, no `userspace-xdp/`, and no protocol/wire file
+  — Go control-plane guards and comments only.
+- **File(s)**: pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
+  pkg/cli/cli_show_system_single_load_6743_test.go,
+  pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go
+
+- **Timestamp**: 2026-08-20 (Codex PR #6743, round 6)
+- **Action**: Round 5 shipped the SAME defect in BOTH fixes it was written to
+  close — a repair keyed to the shape of the previous finding rather than to
+  the property. Both escapes were re-measured firsthand at 74ece3ff5 before
+  anything was changed.
+
+  **B1 — the structural clause was a TAUTOLOGY over a value the guard built
+  itself.** `TestShowBuffersCountingIndirectionServesNothingSilently` read
+  `dp.grpcRuntime != nil` on `&countingIndirection{backend: ...}`, a literal
+  that OMITS the embedded field. That is the zero value of an interface:
+  nil, unconditionally. The clause the r5 header called "the one that
+  quantifies" inspected one value, and not the one that matters — the
+  fixture the GRID stores in `Server.dp`. Measured at 74ece3ff5: changing
+  the grid literal to `&countingIndirection{grpcRuntime: dataplane.New(),
+  backend: arm.backend()}` and re-inserting the r4 witness
+  (`if !s.dp.IsLoaded() { buf.WriteString("stale\n") }`) above
+  `stats := backendMapStats(backend)` at `server_show_system.go:495` and
+  `:577` restored the r4 second-load defect VERBATIM and left
+  `go test ./pkg/grpcapi/ -count=1` at **rc=0, 0 FAIL, whole package**. The
+  CLI peer, same shape (`cliRuntime: dataplane.New()` in the grid plus the
+  same insertion at `cli_show_system.go:60` and `:137`): **rc=0**.
+
+  Fixed at the CHOKE POINT rather than at the construction sites: `load()`
+  — the single counted cell read every declared forwarder already goes
+  through — now refuses a non-nil embed with a panic naming the reason. That
+  holds for every instance a render touches, at every construction site
+  present or future, without enumerating them; a site can be respelled, it
+  cannot avoid `load()` and still be a fixture whose loads are counted.
+
+  The behavioural clause was a 1-of-23 SAMPLE (`IsLoaded()`), stated as a
+  universal. It is now an actual universal: `partitionRuntimeMethods` (and
+  its `cliPartitionRuntimeMethods` peer) calls EVERY method of the runtime
+  interface — population read from the TYPE by reflection — with zero-value
+  arguments and asserts the answered set is exactly the fixture's declared
+  shadows and the panicked set is everything else. Zero-value arguments are
+  safe on the correct fixture: dispatch through a nil embedded interface
+  panics before any callee runs.
+
+  Both guards now carry a POSITIVE CONTROL that builds the DEFECTIVE fixture
+  on purpose and proves both halves of the mechanism — that a populated
+  embed really does answer `IsLoaded()` silently, and that `load()` really
+  does refuse it. A guard that cannot be shown to fire is what r5 shipped.
+
+  Also corrected: two rounds carried a hand-typed "22 undeclared methods"
+  against a 25-method interface with 2 shadows, which is 23. The number is
+  not re-typed — it is deleted from the prose and derived from the interface
+  type at every run, because re-counting a quantifier over an unverified
+  population makes it more precise and no more true.
+
+  **B2 — R3 keyed on the literal SHAPE, so conjunct (a) of the r5 residual
+  predicate was FALSE.** The predicate said a consumer escapes only by
+  satisfying all three of (a) taking its probe as a plain call argument
+  rather than a `DP:` field, (b) not being `cli.New`, (c) declaring its
+  probe type outside the declaration files. Measured at 74ece3ff5 in real
+  `pkg/daemon/daemon_run_servers.go`: a fourth consumer written as
+  `cfg := api.Config{DP: probe}` redded by name (control), and the SAME
+  function with ONE line changed — `var cfg api.Config; cfg.DP = probe` —
+  left `go test ./pkg/daemon/ -count=1` at **rc=0, 0 FAIL, whole package**,
+  every `TestManagementProbe*` PASS. That consumer takes its probe as a
+  `DP:` field, so (a) is false, and it escaped anyway. Mechanism: R3
+  inspected only `*ast.CompositeLit`; a field write is an `*ast.AssignStmt`
+  with a `*ast.SelectorExpr` LHS, which R3 never visited and R2 skips
+  because its fixpoint filters on `lhs.(*ast.Ident)`.
+
+  R3 now keys on the field NAME in every write form that names it — a `DP:`
+  key in a composite literal of ANY type, qualified or not, and an
+  assignment through a selector ending in `.DP`, whatever the receiver's
+  shape. Four new self-test rows, in both directions: the field-assignment
+  escape, its live positive control, a pointer/nested-selector receiver
+  (`(*cfg).DP`, `d.held.cfg.DP` — a shape the finding did not name), and the
+  unqualified-type literal (`localCfg{DP: ...}` — predicted by the reviewer
+  from the filters, not measured; measured now). No fourth conjunct was
+  added: a term belongs in the predicate only if removing it lets something
+  through, which is exactly what r5's first conjunct failed.
+
+  The honest residual is a hand-over that never NAMES the field — a
+  positional literal or a plain call argument. That is pinned by a
+  `residual/positional-literal-names-no-field` row asserted CLEAN, so
+  teaching R3 to resolve field positions reds the row and forces the
+  paragraph to be rewritten instead of going stale.
+
+  **B3 — the r5 REST scope note introduced a FALSE claim in a
+  claim-accuracy round.** Half (a) ("a torn view in which the cell only
+  EMPTIES is byte-identical") is TRUE and verified. Half (b) — "commit-
+  confirmed rollback re-arms the dataplane, so that schedule is real" — is
+  false twice, and it contradicts a contract the tree documents twice. The
+  rollback path calls `Teardown()` and KEEPS the object (`bootstrap.go:475`,
+  "Keep the object so a later confirmed commit re-arms it via
+  runBootstrapExitStartup"; restated at `daemon_dp_live.go:33-40`, pinned by
+  `TestDataplaneCell_RollbackRearmRecurrence`), so it never empties the cell
+  and the scenario's premise never holds there. And the cell is MONOTONE
+  within a lifetime: verified firsthand that the only production statement
+  publishing a non-nil dataplane is `daemon_run_bringup.go:469` inside
+  `setupDataplaneAndInitialConfig`, whose single caller is the
+  `dataplane-setup` boot phase at `daemon_run.go:172`; every other
+  production writer publishes nil (`bringup:448, :464, :502`,
+  `naming:264`), and `armBootstrapExitDataplane` returns early on a nil cell
+  and never re-publishes.
+
+  The premise is load-bearing for a paragraph in another package, so it is
+  BOUND rather than asserted: new
+  `pkg/daemon/dp_cell_monotone_6743_test.go` reds if a second non-nil
+  publication site appears, and its failure message names the paragraph in
+  `pkg/api/system.go` that the change would invalidate. The allowlist is
+  itself checked for vacuity — an entry matching no site reds, so the guard
+  cannot go quietly green over an empty population.
+
+  **B4 — clauses that cannot fire.** Deleted `_ grpcRuntime =
+  (*countingIndirection)(nil)` and its CLI peer: the grid stores the fixture
+  in `Server.dp` / `CLI.dp`, already typed as the runtime interface, so the
+  compiler makes exactly that check at a site the tests exercise. Kept
+  `_ dataplane.LiveUnwrapper` — that one is NOT redundant, since the render
+  reaches `Unwrap` through a runtime type assertion. The `loads == 0` tails
+  are retained with their reason stated: they fire when the embed check is
+  moved BELOW `loads.Add(1)`, which leaves the panic in place and pollutes
+  the number the grid asserts on. The two drift guards in
+  `writeProbeDeclFixture` are both retained with the discriminator recorded:
+  membership fires on a RENAME, length fires on an ADD or REMOVE.
+
+  No `.o`, no `userspace-xdp/`, no protocol or wire file — Go control-plane
+  guards, one new Go test file, and comments.
+- **File(s)**: pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
+  pkg/cli/cli_show_system_single_load_6743_test.go,
+  pkg/daemon/daemon_dp_escape_canary_test.go,
+  pkg/daemon/dp_cell_monotone_6743_test.go, pkg/api/system.go
+
 
 - **Timestamp**: 2026-08-13T18:35Z
 - **Action**: #6691 round 10 — Codex MERGE-NEEDS-MAJOR at `4cf507638`: two runtime
