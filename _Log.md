@@ -97281,6 +97281,139 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
 
+- **Timestamp**: 2026-08-21
+- **Action**: Added the missing fail-on-revert test for the #5212 session-id
+  adoption on the reverse-materialize path (#6313). `materialize_shared_session_hit`
+  (`userspace-dp/src/afxdp/session_glue/mod.rs`) reinstalls a shared-map hit
+  into the worker-local table with `session_id: replica.session_id`, so a
+  reverse-direction packet that lands on a peer-synced entry keeps the
+  originating node's RT_FLOW correlation id. Reverting that argument to
+  `session_id: 0` reddened NO test: all 48 `session_id` occurrences in
+  `session_glue/tests.rs` were `session_id: 0,` compile-fills (census, not an
+  empty grep).
+
+  The new `reverse_materialized_shared_hit_adopts_replica_session_id_6313`
+  publishes a peer-synced REVERSE companion (`is_reverse: true`) carrying a
+  worker-9 peer id into the shared session map, pins the local table to worker
+  4, drives `resolve_flow_session_decision` with the reverse 5-tuple under an
+  ACTIVE owner RG (so the hit materializes rather than staying transient), and
+  asserts the materialized entry carries the peer id verbatim. A paired
+  negative control (a legacy peer sending id 0) asserts the fallback is a
+  fresh, non-zero, worker-4-namespaced local id.
+
+  Mutation-verified, exit codes read from `$?`, never through a pipe: reverting
+  the production line to `session_id: 0,` -> `cargo check --all-targets` rc=0
+  (an ASSERTION red, not a build break) and the new test rc=101, panicking on
+  the property assertion with left=0x0004000000000001 (a fresh worker-4 alloc)
+  vs right=the worker-9 peer id. Restored -> rc=0.
+
+  Test-only: no production source changed, so no helper binary movement and no
+  cluster smoke owed.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/tests.rs, _Log.md
+## #7102 — SetSyncReady's comment guaranteed a promotion gate deleted in 0781f7a60
+
+- **Timestamp**: 2026-08-21
+- **Action**: Corrected three source comments (and one doc section) that told a
+  reader RG promotion is gated on session-sync readiness in private-rg-election
+  mode. It is not, at `origin/master` f8e720c3e. Established firsthand:
+  `m.syncReady` is written and read only inside `pkg/cluster/sync_state.go`;
+  the complete non-test caller list for `IsSyncReady()` is the readiness
+  timeout at `pkg/daemon/daemon_ha_sync.go:45` plus two log fields at `:80` and
+  `:130`; and the readiness conjunction at
+  `pkg/daemon/daemon_ha_userspace_readiness.go:215` is
+  `ifReady && takeoverGateReady && fabricReady && userspaceReady` with no sync
+  term — `takeoverGateReady` in this mode is `checkNoRethTakeoverReadiness` →
+  `checkVIPReadiness`, i.e. VIP ownership alone. `git show 0781f7a60` confirms
+  the gate existed (`vrrpReady = d.cluster.IsSyncReady()`, blocker "session
+  sync not ready") and that the same commit replaced it with the VIP-only
+  check, with an empty commit body — so the rationale is unavailable. Per the
+  work item the gate was NOT restored (that is #110's scope and a behaviour
+  change); the comments now say plainly that promotion is not sync-gated, so a
+  reader is not misled in either direction. Sites: `SetSyncReady` doc
+  (sync_state.go), the `syncReady` field comment (manager.go), the
+  private-rg-election `armSyncReadyTimer` note (daemon_run_bringup.go, which
+  also claimed "without this ... would never become primary"), and a new
+  subsection in docs/session-sync-architecture.md, whose connection-lifecycle
+  list invites the same inference. Binding: the existing
+  `TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady` already pinned the
+  behaviour but was uncited and used a fixture with BOTH `no-reth-vrrp` and
+  (by compiler default) `private-rg-election` set, so it could not say which
+  term selected the branch; added
+  `TestTakeoverReadinessForRG_PrivateRGElectionIgnoresClusterSyncReady_7102`
+  with `NoRethVRRP` asserted FALSE, and cited both from the comment. Mutation:
+  restoring the gate in `takeoverReadinessForRG` reds BOTH (rc=1 from `$?`,
+  reason `[session sync not ready]`). Comments, one test and docs — `git diff`
+  shows zero non-comment lines in the production Go files; no runtime change,
+  nothing reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/cluster/sync_state.go, pkg/cluster/manager.go,
+  pkg/daemon/daemon_run_bringup.go, pkg/daemon/vip_readiness_test.go,
+  docs/session-sync-architecture.md, _Log.md
+## #7046 — pkg/api README's "reds only …" cell was false at the head that ships it
+
+- **Timestamp**: 2026-08-21
+- **Action**: Re-measured both mutation cells for the HTTPS `drainLeg` in
+  `Server.serveBound` and rewrote the paragraph to state what was observed, at
+  the head it was observed at. Baseline `go test ./pkg/api/ -count=1` at
+  f8e720c3e rc=0 (42.9s), so both reds below are attributable. (A) DELETING the
+  HTTPS `drainLeg` reds TWO: `TestRunGracefulShutdownClosesBothListeners`
+  (10.02s, `server_run_leak_5058_test.go:152`, "Run did not return after ctx
+  cancellation") and `TestServeBoundSeversInFlightResponses_6827` (30.01s,
+  `tls_stale_cert_6827_test.go:1393`, "serveBound did not return after ctx
+  cancellation"); rc=1. Both fail on the JOIN — with no `Shutdown` the HTTPS
+  `Serve` goroutine is never unblocked and `wg.Wait()` never returns — so
+  neither reaches a severing assertion. (B) REVERTING it to a bare `Shutdown`
+  (deadline, no `Close`) reds ONE, `TestServeBoundSeversInFlightResponses_6827`
+  alone (3.56s, `tls_stale_cert_6827_test.go:1404`, HTTPS connection "still
+  OPEN 3s later"), with `TestRunGracefulShutdownClosesBothListeners` PASSING;
+  rc=1. So the "listener CLOSES vs response SEVERED" distinction the paragraph
+  drew is real but was attached to the wrong mutation — it is cell B that
+  isolates severing. The pre-round-11 claims are kept, in the past tense, as
+  what they were: measurements of a tree in which the cell passed `nil` for
+  `httpsLn`. Also recorded why this class of claim rots: a "reds only X"
+  statement is about the rest of the suite and no test can assert it, so the
+  mutation + head + cells must be written down instead of a bare count.
+  Markdown only — `pkg/api/server.go` was mutated for the measurement and
+  restored byte-identical (`git status` clean before commit); no runtime
+  change, nothing reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/api/README.md, _Log.md
+## #7034 + #7035 — both false clauses of the NAT 2+-action rejection sentence
+
+- **Timestamp**: 2026-08-21
+- **Action**: Rewrote the two false clauses of the
+  `validateNATTerminalActionCardinalityStrict` 2+-action message. They are one
+  `fmt.Errorf` format string, so they are corrected together. Measured through
+  `CompileConfig` / `CompileConfigLenient` at `origin/master` f8e720c3e.
+  (#7035) "the survivor is not chosen by configuration order" is false in
+  exactly the case that prints it: `compileNATSource` resets `rule.Then` at the
+  top of every `then` container (#3850 last-wins), so the LAST container
+  supplies the counted fields — `{off; pool P}` then `{interface; pool P}`
+  resolves to `{Iface:true Pool:"P"}` and the reverse order to
+  `{Off:true Pool:"P"}`, both printing the identical message. The clause is now
+  scoped to the block and the parenthetical carries the cross-container case.
+  (#7034) "this rejects contradictory actions inside one block" is false for
+  every token-packed spelling: the packed branch reads `t.Keys[1]` alone, so
+  `then { source-nat off pool P; }` → `{Off:true}`,
+  `then { source-nat pool P off; }` and `then { source-nat { pool P off; } }` →
+  `{PoolName:"P"}`, and flat `set … then source-nat pool P off` →
+  `{PoolName:"P"}` — all ACCEPT under strict, DNAT identically. The
+  parenthetical now states the shape it covers and names #7033 for the rest.
+  Also narrowed the same overreach in the function's doc comment ("not by
+  anything the operator wrote"), added the packed-token converse to
+  `natThenTerminalActionCount`'s doc, and updated `docs/config-schema.md`,
+  which carried the #7035 phrase verbatim.
+  Mutation-checked, exit codes from `$?`: (1) restore the old message →
+  `TestNATTerminalActionMessageContent_6820` rc=1 with 4 missing substrings;
+  (2) delete the per-container `rule.Then = NATThen{}` reset →
+  `TestNATTerminalActionContainerOrderPicksSurvivor_7035` rc=1, both orders
+  collapsing to `{Off:true Interface:true}`; (3) make the packed branch also
+  read a trailing `off` (i.e. simulate the #7033 fix) →
+  `TestNATTerminalActionPackedContradictionCommits_7034` rc=1. Message +
+  comments + docs + tests; the compiler's behaviour is unchanged, nothing
+  reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/config/compiler_nat_conflict_message_7034_test.go,
+  docs/config-schema.md, _Log.md
 ## #6896 — three docs asserted a cluster-secondary read-only gate that arming does not universally give
 
 - **Timestamp**: 2026-08-21
@@ -97348,3 +97481,26 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/io_uring_write_tests.rs, userspace-dp/src/slowpath.rs,
   userspace-dp/src/state_writer.rs, docs/xdp-io-uring-userspace-dataplane.md,
   _Log.md
+- **Action**: Added `wrap_accept_after_forward_clear` to the #5168 WireGuard
+  replay tests (#6118). One ring slot+bit is shared by every counter congruent
+  modulo the ring capacity (RING_BLOCKS * BLOCK_BITS = 8192), so a fresh
+  `X + 8192` is decided off the very bit `X` set; it decides correctly only
+  because the forward-clear sweep zeroed `X`'s block as the high-water advanced
+  over it. The pre-existing 14 tests covered the security direction (the bit
+  SURVIVES a forward clear) but not this availability twin, where a false
+  Repeat silently drops authentic traffic after a large counter advance.
+
+  The test seeds X=100, advances to X+8192+64 — far enough that the sweep's
+  `diff` saturates at RING_BLOCKS and wraps back over X's block, near enough
+  that X+8192 is still inside the 8128 window and so takes the bitmap arm — and
+  requires X+8192 to Accept, then its own replay to Repeat. Slot aliasing and
+  the in-window precondition are asserted, not assumed.
+
+  Test-only: no production file touched, helper binary unchanged, no smoke owed.
+  Mutation-verified RED two ways, `cargo check` exit 0 for both so each red is
+  an assertion failure and not a build break, and each leaving the other 13
+  replay tests GREEN: (1) forward-clear sweep body neutered; (2) sweep bound
+  narrowed one block, `current + diff` -> `(current + diff).saturating_sub(1)`.
+  Both fire on the wrap-accept assertion itself (Repeat vs Accept). Full Rust
+  suite `cargo test -p userspace-dp -- --test-threads=1` exit 0.
+- **File(s)**: userspace-dp/src/afxdp/wg/session.rs, _Log.md

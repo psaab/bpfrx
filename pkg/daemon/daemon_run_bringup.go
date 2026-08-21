@@ -231,10 +231,18 @@ func (d *Daemon) initManagers(configCompileFailed bool) error {
 		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP && !cc.PrivateRGElection {
 			d.vrrpMgr.SetSyncHold(30 * time.Second)
 		}
-		// Private-rg-election mode: gate RG promotion on session sync
-		// readiness with a 30s timeout fallback (mirrors VRRP sync-hold).
-		// Without this, standalone nodes or nodes with permanently-down
-		// peers would never become primary.
+		// Private-rg-election mode takes no VRRP sync-hold (the branch
+		// above excludes it), so arm the sync-ready timeout instead. Be
+		// exact about what that buys (#7102): cluster.Manager.syncReady
+		// does NOT gate RG promotion in this mode — takeover readiness
+		// here is VIP ownership alone (checkNoRethTakeoverReadiness) and
+		// the readiness conjunction has no sync term — so this is a bound
+		// on a reported/logged state, not on takeover. It is also not the
+		// only arm: the cold-start branch of onSessionSyncPeerConnected
+		// re-arms the timer (bumping syncReadyTimerGen, which supersedes
+		// this one), and this timer's callback returns early while no sync
+		// peer is connected. Whether promotion SHOULD be sync-gated is
+		// #110; do not read this call as already doing it.
 		if cc.PrivateRGElection && cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
 			d.armSyncReadyTimer()
 		}
