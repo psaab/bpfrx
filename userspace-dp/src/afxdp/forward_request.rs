@@ -341,11 +341,10 @@ pub(super) fn build_live_forward_request_from_frame(
                     .copied()
             })
             .unwrap_or(0);
-        let egress_zone_id = forwarding
-            .egress
-            .get(&decision.resolution.egress_ifindex)
-            .map(|egress| egress.zone_id)
-            .unwrap_or(0);
+        // #6713: shared resolver — see `ForwardingState::egress_zone_id`. A
+        // MAC-less interface (IPsec xfrmi) has no `egress` row, so reading that
+        // map directly logged to-zone 0 for a correctly-zoned tunnel.
+        let egress_zone_id = forwarding.egress_zone_id(decision.resolution.egress_ifindex);
         emit_filter_log_event(
             event_stream,
             flow,

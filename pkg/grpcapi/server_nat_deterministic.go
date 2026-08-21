@@ -23,7 +23,7 @@ type appliedNATViewProvider interface {
 }
 
 func (s *Server) appliedNATView() nat.AppliedView {
-	provider, ok := s.dp.(appliedNATViewProvider)
+	provider, ok := s.dpProbe().(appliedNATViewProvider)
 	if !ok {
 		return nat.AppliedView{Available: false}
 	}

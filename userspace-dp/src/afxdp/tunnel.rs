@@ -585,11 +585,18 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     );
     // #921: zone_id is now a u16 field on EgressInterface — direct
     // load, no name round-trip.
-    let zone_id = forwarding
-        .egress
-        .get(&decision.resolution.egress_ifindex)
-        .map(|iface| iface.zone_id)
-        .unwrap_or(0);
+    // #6713/#6722: route through the shared resolver rather than open-coding
+    // the `egress`-only read, so this site cannot drift from the zone the
+    // policy plane adjudicated. `resolve_tunnel_forwarding_resolution` sets
+    // `egress_ifindex` to the tunnel's OWN logical ifindex, so this really is
+    // asking "what zone is this tunnel in". No behavior change today: the ONLY
+    // endpoint types reaching this loop are `gre` and `ip6gre` —
+    // `endpoint_attachment_valid` parks the thread for any other mode — and
+    // both carry a Junos `tunnel { source destination }` stanza and therefore
+    // always have an `egress` row, so the fallback cannot fire. It is the next
+    // MAC-less endpoint type admitted to this loop that would otherwise
+    // reintroduce #6713 here.
+    let zone_id = forwarding.egress_zone_id(decision.resolution.egress_ifindex);
     let bytes = encapsulate_native_gre_frame(&inner_frame, meta, &decision, forwarding)
         .ok_or_else(|| "encapsulate_native_gre_frame_failed".to_string())?;
     let session_entry = SyncedSessionEntry {

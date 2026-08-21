@@ -208,7 +208,7 @@ func (d *Daemon) publishPolicyScheduleState(epoch uint64, activeState map[string
 		return nil
 	}
 	cfg := d.store.ActiveConfig()
-	if cfg == nil || d.dp == nil {
+	if cfg == nil || d.dataplane() == nil {
 		return nil
 	}
 	d.seedPolicySchedulerActiveStateLocked(activeState)
@@ -218,16 +218,14 @@ func (d *Daemon) publishPolicyScheduleState(epoch uint64, activeState map[string
 }
 
 func (d *Daemon) seedPolicySchedulerActiveStateLocked(activeState map[string]bool) {
-	if d.dp == nil {
-		return
-	}
-	if setter, ok := d.dp.(policySchedulerActiveStateSetter); ok {
+	if setter, ok := d.dataplane().(policySchedulerActiveStateSetter); ok {
 		setter.SetPolicySchedulerActiveState(activeState)
 	}
 }
 
 func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState map[string]bool) error {
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		return nil
 	}
 	// Both in-tree backends satisfy policyScheduleStateUpdater
@@ -236,7 +234,7 @@ func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState
 	// and *dataplane/userspace.LegacyDataPlaneAdapter via
 	// pkg/dataplane/userspace/legacy_dataplane.go:161. The legacyDP()
 	// fallback branch was dead code; removed in #1519.
-	if updater, ok := d.dp.(policyScheduleStateUpdater); ok {
+	if updater, ok := rt.(policyScheduleStateUpdater); ok {
 		return updater.UpdatePolicyScheduleState(cfg, activeState)
 	}
 	return nil

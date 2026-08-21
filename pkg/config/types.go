@@ -138,8 +138,8 @@ func (c *Config) ResolveFab(ref string) string {
 // same as ResolveFab (which returns the fabric overlay's parent
 // physical member for BPF attachment). fab0 itself is a real kernel
 // IPVLAN device, so API queries on fab0 must look up "fab0", not
-// its parent. Similarly, st0.x is the kernel XFRM device name
-// verbatim.
+// its parent. st0.x resolves to the xfrmi device derived from the
+// AUTHORED bind-interface, which is not always the ref itself.
 //
 // Resolution semantics, in order:
 //  1. Bare refs (no "." suffix):
@@ -149,8 +149,17 @@ func (c *Config) ResolveFab(ref string) string {
 //     case.
 //  2. Dotted refs (e.g. "ge-0/0/0.80", "reth0.50", "gr-0/0/0.0",
 //     "irb.0", "st0.0"):
-//     a. st<N>.<M> short-circuit: kernel XFRM device is the full
-//     ref verbatim. Matches resolveInterfaceRef + XFRMIfNameAndID.
+//     a. st<N>.<M>: resolve the xfrmi device from the AUTHORED
+//     bind-interface via SecureTunnelUnitNetdev (#5619). A bare
+//     `bind-interface st0` and an explicit `bind-interface st0.0`
+//     derive the same if_id under DIFFERENT device names, while
+//     the unit ref is `st0.0` either way — so it is read from the
+//     config, NOT reconstructed from the ref. Falls back to the
+//     verbatim ref only when no VPN binds the unit, since no xfrmi
+//     device exists for it then. That whole rule lives in
+//     SecureTunnelUnitNetdev, which snapshotLinuxName and
+//     junosHostLinuxName also call — one resolver, not three
+//     copies asserted to agree (#6691).
 //     b. IRB: look up via IRBToBridge(cfg.BridgeDomains) and return
 //     the bridge device name (no suffix).
 //     c. Tunnel: if TunnelNameMap[ref] is set, return that name
@@ -197,11 +206,33 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 		return c.resolveBareKernelIfName(base)
 	}
 
-	// XFRM (st<N>) is verbatim — kernel device is the full ref.
-	if strings.HasPrefix(base, "st") && len(base) >= 3 {
-		if _, err := strconv.Atoi(base[2:]); err == nil {
-			return LinuxIfName(ref)
-		}
+	// XFRM (st<N>): the kernel device is the AUTHORED bind-interface, which
+	// is not always the ref. A bare `bind-interface st0` and an explicit
+	// `bind-interface st0.0` derive the same if_id under DIFFERENT device
+	// names ("st0" vs "st0.0", pkg/routing/xfrm.go), and the unit ref is
+	// `st0.0` either way — so resolve it from the config rather than
+	// reconstructing it from the ref (#5619). Falls back to the verbatim ref
+	// when no VPN binds this unit: no xfrmi device exists for it then, and
+	// the verbatim ref is what this returned before.
+	//
+	// The whole rule lives in SecureTunnelUnitNetdev (xfrmi.go) so
+	// snapshotLinuxName and junosHostLinuxName apply the IDENTICAL one
+	// instead of hand-copied instances of it (#6691).
+	//
+	// The verbatim arm below is THIS function's own fallback, not part of the
+	// shared rule: when no VPN binds the unit, SecureTunnelUnitNetdev declines
+	// (ok=false) so the dataplane resolvers can name the ordinary interface —
+	// the NIC, the VLAN device, the GRE device — while this one keeps
+	// returning the ref, which is what it returned before #5619. The gate is
+	// IsSecureTunnelIfName rather than the unbounded `Atoi(base[2:])` this
+	// replaced, so an out-of-range `st65536.3` now falls through to the
+	// ordinary unit resolution and agrees with the snapshot (#6691): a name
+	// the xfrmi constructor rejects is an ordinary interface here too.
+	if dev, ok := c.SecureTunnelUnitNetdev(ref); ok {
+		return dev
+	}
+	if IsSecureTunnelIfName(base) {
+		return LinuxIfName(ref)
 	}
 
 	// IRB.
