@@ -22,7 +22,7 @@ priorities:
 Current code intentionally preserves dataplane state on daemon shutdown:
 
 - `pkg/daemon/daemon.go` keeps control-plane state and calls non-destructive
-  dataplane close (`d.dp.Close()`).
+  dataplane close (the runtime dataplane's `Close()`).
 - `pkg/dataplane/loader.go` `Close()` keeps pinned links/maps active for reuse.
 
 That is desirable for standalone hitless restart, but risky as the default in

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 )
 
@@ -13,11 +14,18 @@ import (
 // dpformat.FormatWireguardStatus (the FormatSystemBuffers pattern),
 // so local and gRPC output are identical.
 func (c *CLI) showSecurityWireguard(detail bool) error {
-	if c.dp == nil {
+	// #2114/#6743 r2-B4: the publication check must ask the CELL, not the
+	// field. `c.dp == nil` is permanently false under the daemon's live
+	// indirection, so an emptied cell fell into the arm below and told the
+	// operator the firewall is running a non-userspace dataplane — the
+	// r6-F3 defect at a site the dpProbe() conversion left behind. ONE
+	// resolution feeds both decisions, as in showSystemBuffers (r7).
+	backend := dataplane.Unwrap(c.dp)
+	if backend == nil {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	provider, ok := c.dp.(cliUserspaceStatusProvider)
+	provider, ok := backend.(cliUserspaceStatusProvider)
 	if !ok {
 		fmt.Println("WireGuard telemetry requires the userspace dataplane")
 		return nil
@@ -37,11 +45,14 @@ func (c *CLI) showSecurityWireguard(detail bool) error {
 // to the peer. Like the status view it reads helper telemetry only and
 // works without an active config.
 func (c *CLI) showSecurityWireguardPublicKey() error {
-	if c.dp == nil {
+	// #2114/#6743 r2-B4: same single-resolution publication check as
+	// showSecurityWireguard.
+	backend := dataplane.Unwrap(c.dp)
+	if backend == nil {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	provider, ok := c.dp.(cliUserspaceStatusProvider)
+	provider, ok := backend.(cliUserspaceStatusProvider)
 	if !ok {
 		fmt.Println("WireGuard telemetry requires the userspace dataplane")
 		return nil
