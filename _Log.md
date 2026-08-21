@@ -1,3 +1,87 @@
+## 2026-08-21 — #6981 drive-to-merge: master merge + first hostile gate; the holder mask does NOT close #6522
+
+- **Timestamp**: 2026-08-21 (fix/6876-f2-holders, PR #6981)
+- **Action**: First review pass on #6981 (zero prior review comments). Merged
+  `origin/master` (380 commits; NEVER rebased) and hostile-reviewed the
+  `#6211 F2` per-worker holder mask as a NAT-allocator / HA-session-sync
+  subject-matter gate.
+
+  Merge conflicts and how each was resolved:
+    - `_Log.md` — union-resolved across three regions, then STRUCTURALLY
+      verified: sections 1589 + 1702 - 1587 = 1704 (actual 1704) and
+      `**Timestamp**` 3006 + 3207 - 3000 = 3213 (actual 3213). Exact.
+    - `userspace-dp/src/main_tests.rs` — append/append at EOF. Both sides
+      complete (`}`-terminated); markers dropped, both kept.
+    - `userspace-dp/src/nat64_tests.rs` — NOT union-resolvable. BOTH sides end
+      mid-`assert!(...)`, sharing the trailing `);` + `}` after the conflict
+      block. A union would have swallowed our `#6876` NAT64 multi-prefix
+      release cell into master's `#5798` fragment-cache cell — compiling, with
+      one test silently no longer running. Resolved by giving each side its own
+      closer and proving it with `cargo check --tests --bins` (rc 0).
+    - `docs/refactoring-audit-current.txt` — regenerated via
+      `scripts/refactoring-audit.sh` (rc 0), never hand-resolved.
+
+  RUNTIME finding (the headline): **the mask does not close #6522.** The PR
+  fixes the PEER-SYNCED arm — every worker runs `handle_upsert_synced` and ORs
+  its bit in, so the last releaser frees. It does NOT fix the arm #6522 is
+  actually about. A locally-born pool-SNAT flow allocates on its RSS owner via
+  `allocate_translation`, which stores `holders: 0`; the entry is then fanned
+  out by `replicate_session_upsert` over `peer_worker_commands`, which
+  `coordinator/reconcile/bringup.rs` builds with
+  `.filter(|(id, _)| **id != worker_id)` — the OWNER IS EXCLUDED. The siblings
+  install it as `WorkerLocalImport`, whose `is_peer_synced()` is TRUE, so each
+  sibling reserves and records ITS bit. The resulting mask is
+  `{siblings}` with the owner absent. The sibling replicas see no traffic (RSS
+  pins the flow to the owner) and are never refreshed, so they age out FIRST,
+  and the last sibling's reap empties the mask and frees a port the owner is
+  still forwarding through.
+
+  Measured, not inferred. A throwaway probe at head `3f59b6c86` did the real
+  local `allocate_translation`, two sibling
+  `reserve_synced_source_nat_allocation_for_worker` calls, then two
+  `release_source_nat_allocation_for_worker` calls:
+    - anti-vacuity (sibling 1 alone releasing must NOT free) — PASSED, proving
+      both sibling reserves really recorded holder bits;
+    - the #6522 assertion (the port must survive) — FAILED at
+      `tests_pool.rs:6809`.
+  The probe was removed before commit; the tree is clean.
+
+  Classification: PRE-EXISTING, not a regression. The PR's free set is a strict
+  SUBSET of master's (`drop_holder_locked` returns "free" only when
+  `holders == 0` or the mask empties, where master freed unconditionally), so
+  no new over-release is reachable. On master the FIRST sibling frees; here the
+  LAST does. Strict improvement, incomplete fix. Per the campaign bar this does
+  not block the merge — but `Closes #6522` would be a FALSE claim and was
+  therefore NOT added to the PR body.
+
+  Other findings, all filed rather than folded: a holder bit set by a worker
+  that never releases strands the port for the life of the allocator (a
+  panicked worker is marked `dead` with no respawn and its session table is
+  gone; on master a surviving worker's reap reclaimed the port) — a NEW,
+  fail-closed leak vector; the "single holder by construction" premise in
+  `nat/allocator.rs` and `docs/session-sync-architecture.md` is false for
+  exactly the reason above; `rollback_nat64_allocation` is now `#[cfg(test)]`
+  and unreferenced.
+
+  What held under attack: reserve/release pairing (the reserve sits INSIDE the
+  `if sessions.upsert_synced_with_origin(...)` success arm, so a refused
+  install takes no bit); no wrap or over-shift (`1u128.checked_shl(id)
+  .unwrap_or(0)`, and an out-of-range id can only UNDER-release); all
+  holder-mask read-modify-write happens under the single `lock_live()` mutex,
+  so there is no atomic-ordering question to get wrong; the mint-site bound is
+  the only worker-id minter (`planning.rs:805`) and refuses fail-closed; and
+  the compile-enforced completeness guard is real — `cargo check --bins` (the
+  non-test cfg, with every untracked entry point excluded) is rc 0.
+
+- **Validation**: `cargo test --manifest-path userspace-dp/Cargo.toml --
+  --test-threads=1` rc 0 (4407 + 60 + 31 + 22 + 8 + ... passed, 0 failed, 2
+  ignored); `cargo check --tests --bins` rc 0, 0 `error[` lines;
+  `cargo check --bins` rc 0; `go build ./...` rc 0; `go vet ./...` rc 0. All
+  exit codes read from `$?`, none through a pipe.
+- **File(s)**: _Log.md, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/nat64_tests.rs, docs/refactoring-audit-current.txt (all
+  merge-resolution only — no production code changed by this drive)
+
 ## 2026-08-13 — #6211/#6876 PR1 part 1: the NAT64 release kept the first-hit break this PR removed from source NAT
 
 - **Timestamp**: 2026-08-13 (fix/6211-synced-snat-rule-identity)
