@@ -35,6 +35,29 @@ const (
 	// manager_compile.go, which DISARMS the helper and aborts the commit
 	// when the running helper is too old to represent a multi-zone scope.
 	//
+	// v5 (#6722): the per-interface EGRESS zone is decided by the Go builder
+	// and carried in InterfaceSnapshot.EgressZone; the reth_projection field
+	// that the previous contract carried is GONE. This is a field DELETION
+	// paired with an addition, so unlike an additive field it cannot ride an
+	// unchanged version: at v4 two binaries built either side of this change
+	// both advertise 4 and interpret the same bytes differently, and nothing
+	// on the wire distinguishes them.
+	//
+	// The mixed pairing is not merely "not yet fixed", which is why the bump
+	// is not optional. MEASURED, feeding the v4 Go builder's rows to the v5
+	// helper on the reference cluster (docs/ha-cluster-userspace.conf, node
+	// 0): egress zone of ifindex 24 = 0 and ifindex 25 = 0, where BOTH
+	// origin/master and the v5 pair resolve `lan` and `wan`. Ifindex 25 is the
+	// telling one — it loses a zone that even the pre-#6722 helper resolved —
+	// so the pairing is strictly worse than either endpoint, not an
+	// intermediate state. Under `default-policy deny-all` that is a silent
+	// transit outage whose only signature is a version both sides agree on.
+	//
+	// Paired with ensureEgressZoneProtocolLocked (manager_compile.go), which
+	// gates on EQUALITY rather than `>=`: the helper's own apply_snapshot and
+	// bump_fib_generation gates are exact-equality, so a helper at ANY other
+	// version refuses the snapshot, and a `>=` gate would stay green at
+	// exactly the value that collides.
 	// v5 (#5619 / #6691): InterfaceSnapshot.SecureTunnel became AUTHORITATIVE
 	// over AF_XDP binding admission — the helper's
 	// include_userspace_binding_interface refuses a candidate on it. A helper
@@ -67,7 +90,19 @@ const (
 	// fabric member: one RX queue, global-minimum queue planning, #3091 again.
 	// Paired with ensureSecureTunnelProtocolLocked, which gates the whole
 	// secure-tunnel contract on the helper being at ProtocolVersion.
-	ProtocolVersion                  = 7
+	// v8 (integration of #6722 and #6691): both branches independently bumped
+	// this constant for DIFFERENT wire changes — #6722 to 5 for the
+	// EgressZone-for-reth_projection swap, #6691 to 7 for the secure-tunnel
+	// refusal contract. The merged wire carries BOTH contracts and therefore
+	// matches NEITHER 5 nor 7. Leaving it at either value is exactly the
+	// collision the two comments above describe: a helper built from one branch
+	// alone advertises the same number as this control plane and reads the rows
+	// differently. 8 was never shipped by either side, so no mixed pairing can
+	// agree on it by accident. BOTH gates stay armed and both are dispatched
+	// from ensureRequiredSnapshotProtocolLocked. The per-branch prose above
+	// still says "4 -> 5" and "moved to 6"; those describe each branch's own
+	// history, not this constant's current value.
+	ProtocolVersion                  = 8
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 
@@ -295,8 +330,76 @@ type InterfaceSnapshot struct {
 	VLANID          int    `json:"vlan_id,omitempty"`
 	LocalFabric     string `json:"local_fabric_member,omitempty"`
 	RedundancyGroup int    `json:"redundancy_group,omitempty"`
-	UnitCount       int    `json:"unit_count"`
-	Tunnel          bool   `json:"tunnel"`
+	// EgressZone is the security zone this row's IFINDEX egresses into, or "" for
+	// none (#6722). It is the ANSWER, decided in stampEgressZones (interfaces.go)
+	// where the operator's authored `security-zone ... interfaces <ref>` bindings
+	// and snapshotLinuxName's aliasing are both in hand. Every row sharing an
+	// ifindex carries the SAME value.
+	//
+	// It is NOT Zone with a different name. Zone is this row's own zone as
+	// buildInterfaceZoneMap derived it, and is what the INGRESS half attributes an
+	// arriving packet to (#921/#3618, unchanged). EgressZone answers the different
+	// question the egress half must ask — "does this ifindex identify exactly one
+	// zone" — for a netdev that several configured identities may share.
+	//
+	// The Rust helper honours it only when some row on the ifindex literally
+	// carries that zone NAME (forwarding_build::interfaces::populate_interfaces),
+	// so a drifted or hostile snapshot can never conjure a zone no row on the
+	// ifindex named. That is the whole of the helper-side check: there is no row
+	// classification left for a config shape to disagree with.
+	//
+	// Emitted UNCONDITIONALLY (no omitempty), so a "" answer is on the wire as a
+	// DECISION — this Go binary determined the ifindex identifies no zone — and
+	// resolves the 0 sentinel. There is no "the field was absent" arm to fall
+	// back to; the compatibility arm that used to exist was deleted with the
+	// row-unanimity rule it restored.
+	//
+	// THAT IS A DESIGN STATEMENT, NOT A BEHAVIOURAL GUARD, and the difference is
+	// worth stating because it reads like one. The Rust side declares
+	// `#[serde(rename = "egress_zone", default)]` (snapshot.rs), so an ABSENT
+	// key and an emitted "" decode identically: both give `String::new()`, which
+	// `EgressZoneClaim::Decided("")` resolves to `None` and the 0 sentinel.
+	// Adding `omitempty` here would therefore change no answer the helper gives,
+	// and no test can red on it — the one Go wire pin,
+	// TestEgressZoneCrossesTheWireAndTheQuarantine_6722, asserts the NONEMPTY
+	// case, which omitempty does not touch. The tag is kept because "the builder
+	// always states its answer" is the property this field is FOR, and because a
+	// future `deny_unknown_fields` or a non-defaulting decoder would make the
+	// two spellings diverge; it is not kept because something would catch its
+	// removal today.
+	//
+	// MIXED VERSION IS REFUSED, NOT TOLERATED. ProtocolVersion moved 4 -> 5 in
+	// this change (see the constant above), and ensureEgressZoneProtocolLocked
+	// (manager_compile.go) refuses to commit against a helper whose observed
+	// version is anything else. That is a departure from the sibling gates: this
+	// repo has previously bumped only when an old reader MISREADS a snapshot
+	// into a wrong answer (#5488's ErrScopedGlobalZoneSetProtocolIncompatible —
+	// an old helper reads only the singular match_from_zone and NARROWS a global
+	// deny, a fail-OPEN). Neither direction here misreads, so the bump is not
+	// forced by that rule; it is taken because a mixed window silently loses the
+	// fix, and losing it silently is what this PR exists to stop:
+	//
+	//	new Go -> OLD helper: the wire shape this builder emits deserializes on
+	//	  a v4 helper (there is no deny_unknown_fields anywhere in
+	//	  userspace-dp/src/protocol, at c9b020695 or here) — it reads
+	//	  reth_projection=false from serde's default and answers ledger[24]=None,
+	//	  to_zone=0, action=Deny. Measured by running that helper against this
+	//	  builder's output.
+	//	old Go -> NEW helper: the retired `reth_projection` key is ignored and
+	//	  `egress_zone` is absent, which serde fills with the empty String —
+	//	  the fail-closed 0 sentinel. Pinned by
+	//	  retired_wire_key_decodes_and_absent_egress_zone_fails_closed_6722
+	//	  (userspace-dp/src/afxdp/forwarding/tests.rs).
+	//
+	// Neither direction invents a zone; both would blackhole a bondless-RETH
+	// cluster exactly as the pre-#6722 tree did. What the gate changes is that
+	// the commit ABORTS with a named sentinel and DISARMS the helper instead of
+	// promoting an image the dataplane cannot honour — see
+	// TestEgressZoneProtocolAbortDisarmsAndPublishesNothing_6722 for the
+	// measured wire behaviour, including that no apply_snapshot is sent.
+	EgressZone string `json:"egress_zone"`
+	UnitCount  int    `json:"unit_count"`
+	Tunnel     bool   `json:"tunnel"`
 	// SecureTunnel reports that this row's netdev is a route-based IPsec
 	// tunnel device, so the dataplane must neither adjudicate nor bind it.
 	//

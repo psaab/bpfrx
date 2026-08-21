@@ -676,6 +676,7 @@
     "cos_scheduler_map": "",
     "cos_shaping_burst_bytes": 0,
     "cos_shaping_rate_bytes_per_sec": 0,
+    "egress_zone": "",
     "filter_input_v4": "",
     "filter_input_v6": "",
     "filter_output_v4": "",

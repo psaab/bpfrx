@@ -39,6 +39,19 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// deny/reject COVERAGE must not be silently ignorable under an unchanged
 /// protocol version.
 ///
+/// v5 (#6722): the per-interface EGRESS zone is decided by the Go builder and
+/// carried in `InterfaceSnapshot::egress_zone`; the `reth_projection` field the
+/// v4 contract carried is GONE. A DELETION cannot ride an unchanged version the
+/// way an additive field can: at v4 two binaries built either side of the change
+/// both advertise 4 and read the same bytes differently.
+///
+/// MEASURED rather than argued — the v4 Go builder's rows fed to the v5 helper
+/// on the reference cluster (`docs/ha-cluster-userspace.conf`, node 0) resolve
+/// egress zone 0 for BOTH ifindex 24 and ifindex 25, where origin/master and the
+/// v5 pair resolve `lan` and `wan`. Ifindex 25 loses a zone even the pre-#6722
+/// helper resolved, so the mixed pairing is strictly worse than either endpoint.
+/// Under `default-policy deny-all` that is a silent transit outage carrying a
+/// version number both sides agree on.
 /// v5 (#5619 / #6691): `InterfaceSnapshot.secure_tunnel` is AUTHORITATIVE over
 /// AF_XDP binding admission — `include_userspace_binding_interface` refuses a
 /// candidate on it (server/helpers/planning.rs). A helper that predates the
@@ -69,7 +82,13 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// plans an AF_XDP binding on a netdev the control plane refused. The reachable
 /// shape is a live xfrmi under a slot-shaped name used as a fabric member: one
 /// RX queue, global-minimum queue planning, #3091 again.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 7;
+/// v8 (integration of #6722 and #6691): both branches independently bumped this
+/// constant for DIFFERENT wire changes — #6722 to 5, #6691 to 7. The merged wire
+/// carries BOTH contracts and so matches NEITHER value. Leaving it at either is
+/// precisely the collision both comments below describe: a helper built from one
+/// branch alone advertises the same number and reads the rows differently. 8 was
+/// never shipped by either side, so no mixed pairing can agree on it by accident.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 8;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level

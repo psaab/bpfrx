@@ -28,14 +28,14 @@ import (
 // same-version equality check and the snapshot content hash both see a
 // perfectly good snapshot.
 
-// preV5SnapshotProtocolVersion is the version this PR shipped the
+// preSecureTunnelProtocolVersion is the version this PR shipped the
 // `secure_tunnel` field at before the #6691 round-8 bump — the version whose
 // readers cannot see the field. A LITERAL, not `ProtocolVersion - 1`, for the
 // same reason preV4SnapshotProtocolVersion is: the property under test is that
 // the current version no longer COLLIDES with the version that misreads the
 // snapshot, so tracking the constant would make the test vacuous the moment
 // the constant moves again.
-const preV5SnapshotProtocolVersion = 4
+const preSecureTunnelProtocolVersion = 4
 
 // secureTunnelSnapshotProtocolVersion is the version this PR must ship at, and
 // it is asserted by EQUALITY. #6691 round 9 raised it from 5 to 6 because the
@@ -44,13 +44,13 @@ const preV5SnapshotProtocolVersion = 4
 // different bindings for a VLAN sibling of a flagged parent. A version whose
 // meaning depends on which round produced the binary is not a version. Nothing
 // has shipped at either value, so the cost is zero.
-const secureTunnelSnapshotProtocolVersion = 7
+const secureTunnelSnapshotProtocolVersion = 8
 
 // preV5HelperAcceptsSnapshot models the exact-equality version gate a pre-v5
 // helper applies before touching any dataplane state
 // (userspace-dp/src/server/handlers/snapshot.rs).
 func preV5HelperAcceptsSnapshot(version int) bool {
-	return version == preV5SnapshotProtocolVersion
+	return version == preSecureTunnelProtocolVersion
 }
 
 // preV5HelperPlansBinding models a pre-v5 helper's binding admission: the
@@ -106,10 +106,10 @@ func TestSecureTunnelFieldIsNotIgnorableByAPreV5Helper(t *testing.T) {
 			"the version must move whenever either does — an inequality cannot say that",
 			ProtocolVersion, secureTunnelSnapshotProtocolVersion)
 	}
-	if ProtocolVersion <= preV5SnapshotProtocolVersion {
+	if ProtocolVersion <= preSecureTunnelProtocolVersion {
 		t.Fatalf("ProtocolVersion = %d, must be > %d: `secure_tunnel` became authoritative "+
 			"over binding admission, so a reader that cannot see it must not share our version",
-			ProtocolVersion, preV5SnapshotProtocolVersion)
+			ProtocolVersion, preSecureTunnelProtocolVersion)
 	}
 
 	cfg, unitRef, wantDev := spellingConfig(t, "st0.0", "st0", 0)
@@ -154,7 +154,7 @@ func TestSecureTunnelFieldIsNotIgnorableByAPreV5Helper(t *testing.T) {
 	//    success. Drive the REAL dispatcher, not the gate function, so the
 	//    wiring is what is under test.
 	m := New()
-	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 	gateErr := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg))
 	if !errors.Is(gateErr, ErrSecureTunnelProtocolIncompatible) {
 		t.Errorf("ensureRequiredSnapshotProtocolLocked against a pre-v5 helper = %v, want "+
@@ -191,7 +191,7 @@ func TestSecureTunnelGateIsScopedToConfigsThatDeriveAnXfrmi(t *testing.T) {
 	}
 
 	m := New()
-	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 	if err := m.ensureSecureTunnelProtocolLocked(gateSnapshot(t, cfg)); err != nil {
 		t.Errorf("a config with no secure tunnel was gated against a pre-v5 helper: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestSecureTunnelGateSeesEverySpelling(t *testing.T) {
 					"would not arm and a pre-v5 helper would plan its binding", tc.bindIface)
 			}
 			m := New()
-			m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+			m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 			if err := m.ensureSecureTunnelProtocolLocked(gateSnapshot(t, cfg)); !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
 				t.Fatalf("gate for bind-interface %q = %v, want ErrSecureTunnelProtocolIncompatible",
 					tc.bindIface, err)
@@ -310,7 +310,7 @@ func TestSecureTunnelGateReadsTheAppliedSnapshot(t *testing.T) {
 	}
 
 	m := &Manager{}
-	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 	err = m.ensureSecureTunnelProtocolLocked(applied)
 	if !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
 		t.Fatalf("gate returned %v, want %v. The applied snapshot carries "+
@@ -371,11 +371,11 @@ func TestSecureTunnelGateNeedsAnObservedVersion(t *testing.T) {
 
 	t.Run("observed and too old: arms", func(t *testing.T) {
 		m := New()
-		m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+		m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 		if err := m.ensureSecureTunnelProtocolLocked(snap); !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
 			t.Fatalf("gate = %v, want ErrSecureTunnelProtocolIncompatible. A helper "+
 				"DID report version %d, which cannot represent this snapshot",
-				err, preV5SnapshotProtocolVersion)
+				err, preSecureTunnelProtocolVersion)
 		}
 	})
 
@@ -401,7 +401,7 @@ func TestSecureTunnelGateNeedsAnObservedVersion(t *testing.T) {
 		// observation about the one that replaces it, so stopping the helper
 		// must clear both halves together.
 		m := New()
-		m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+		m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 		m.clearLastStatusLocked()
 		if m.helperStatusObserved {
 			t.Fatal("clearLastStatusLocked kept the observation while dropping the " +

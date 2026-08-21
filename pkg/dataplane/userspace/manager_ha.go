@@ -627,11 +627,25 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	// operator commit, does not revert the active config, so m.lastSnapshot
 	// keeps requiring the protocol). Scoped exactly like SetForwardingArmed:
 	// only the ARM direction is gated; a disarm (desired==false — shutdown,
-	// demotion, disarmSnapshotProtocolFailureLocked) must NEVER be blocked. The
-	// gate is a no-op unless the last-applied config requires the protocol, and
+	// demotion, disarmSnapshotProtocolFailureLocked) must NEVER be blocked, and
 	// it re-polls the helper first so a helper that has since upgraded still
 	// arms normally. Fail closed: leave the helper disarmed and surface the
 	// error to the poll caller (logged), rather than re-arm a stale image.
+	//
+	// #6722 WIDENED WHAT THIS REFUSES. Three of the four gates in the chain are
+	// no-ops unless the config uses their feature; the fourth
+	// (ensureEgressZoneProtocolLocked) takes no config and fires for ANY
+	// last-applied config, because every snapshot carries EgressZone. This tick
+	// therefore now refuses to arm a version-mismatched helper on every config,
+	// not only a protocol-requiring one — the right answer, since such a helper
+	// cannot decode a v5 snapshot at all, and the reason the refusal must live
+	// HERE and not only at the operator-arm path: this runs unattended about
+	// once a second, so an ungated tick re-arms the stale image with nobody
+	// asking. What still scopes it is the OBSERVED helper version, which is
+	// unknown before the first handshake and returns nil then (#1960 no-brick).
+	// Bound by TestEgressZoneProtocolGatesBothArmPaths_6722/ha-reconcile-tick,
+	// which drives an EMPTY config.Config{} so no sibling gate can be the one
+	// answering.
 	if desired && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
 		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return err

@@ -64,6 +64,44 @@ pub(crate) struct InterfaceSnapshot {
     pub local_fabric_member: String,
     #[serde(rename = "redundancy_group", default)]
     pub redundancy_group: i32,
+    /// #6722: the security zone this row's IFINDEX egresses into, or "" for
+    /// none. Decided by the Go builder (`stampEgressZones`,
+    /// `pkg/dataplane/userspace/interfaces.go`); every row sharing an ifindex
+    /// carries the SAME value.
+    ///
+    /// It is NOT `zone` under another name. `zone` is this row's own zone and
+    /// feeds the INGRESS attribution (`ifindex_to_zone_id`, #921/#3618).
+    /// `egress_zone` answers "does this ifindex identify exactly one zone",
+    /// which is the only question the egress half may safely ask once several
+    /// configured identities share one netdev — `snapshotLinuxName` collapses a
+    /// non-VLAN unit 0 onto its base, a RETH onto its member, and every unit of
+    /// an interface-level tunnel onto the tunnel device.
+    ///
+    /// Deciding it in Go is what closed this class. `zone` is the OUTCOME of
+    /// `buildInterfaceZoneMap`'s fan-up/fan-down derivation, and the provenance
+    /// that outcome discards — did the operator zone THIS identity, or did it
+    /// inherit another's words — is not recoverable from the rows. #6722 tried
+    /// four times to reconstruct it here by classifying rows and each spelling
+    /// was holed by an unenumerated config shape.
+    ///
+    /// A plain `String`, not an `Option`, because ABSENT and EMPTY are the same
+    /// state at protocol v5: an absent key decodes to `""` via
+    /// `#[serde(default)]`, which is also what the builder stamps when it
+    /// decides the ifindex identifies no zone, and both answer the 0 sentinel.
+    /// Telling them apart would only matter for a snapshot from a control plane
+    /// that predates the field, and `apply_snapshot`'s exact-equality version
+    /// gate refuses that snapshot before it reaches the builder.
+    ///
+    /// Read by `forwarding_build::interfaces::populate_interfaces`:
+    ///
+    /// - nonempty — honoured, but only if some row on the ifindex literally
+    ///   carries that zone NAME. A drifted or hostile snapshot can therefore
+    ///   never conjure a zone no row on the ifindex named.
+    /// - empty — the ifindex resolves the 0 sentinel: no zone pair matches and
+    ///   the default policy decides.
+    /// - rows on one ifindex disagreeing — drift; fails closed.
+    #[serde(rename = "egress_zone", default)]
+    pub egress_zone: String,
     #[serde(rename = "unit_count", default)]
     pub unit_count: usize,
     #[serde(default)]

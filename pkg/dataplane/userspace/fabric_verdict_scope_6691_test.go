@@ -93,7 +93,7 @@ func TestProtocolGateArmsForAnOwnerlessFabricVerdict(t *testing.T) {
 	}
 
 	m := New()
-	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 	if err := m.ensureSecureTunnelProtocolLocked(snap); !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
 		t.Fatalf("gate = %v, want %v. The snapshot's only unbindable verdict rides "+
 			"on FabricSnapshot.ParentUnbindable, which is exactly the field the v7 "+
@@ -194,7 +194,7 @@ func TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent(t *testing.T) {
 	}
 
 	m := New()
-	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preV5SnapshotProtocolVersion})
+	m.setLastStatusLocked(ProcessStatus{ConfigSnapshotProtocolVersion: preSecureTunnelProtocolVersion})
 	if err := m.ensureSecureTunnelProtocolLocked(snap); err != nil {
 		t.Errorf("gate = %v, want nil: an under-version helper must still accept a snapshot "+
 			"whose only unbindable fabric parent is one an interface row already speaks for", err)

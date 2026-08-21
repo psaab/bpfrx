@@ -95,7 +95,7 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 		// Symmetric direction: an older control plane's v6 snapshot refused by
 		// this v7 helper produces the mirror-image string, same classification.
 		older := fmt.Errorf("publish userspace snapshot: %w",
-			errors.New("unsupported snapshot protocol version 6 (want 7)"))
+			errors.New("unsupported snapshot protocol version 7 (want 8)"))
 		if IsRequiredProtocolGateError(older) {
 			t.Fatal("the reverse direction is classified as a gate error")
 		}
@@ -119,7 +119,7 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 
 	// (4) THE TWO PLANES AGREE ON THE NUMBER. A bump that moved only one side
 	// would make every pairing a mismatch — including matched deployments.
-	t.Run("both planes are at 7", func(t *testing.T) {
+	t.Run("both planes are at 8", func(t *testing.T) {
 		if ProtocolVersion != secureTunnelSnapshotProtocolVersion {
 			t.Fatalf("Go ProtocolVersion = %d, want %d", ProtocolVersion,
 				secureTunnelSnapshotProtocolVersion)
