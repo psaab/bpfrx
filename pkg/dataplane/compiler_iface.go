@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -264,6 +265,28 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 // This is a decomposition of a former ~900-line function; the composed
 // behavior is identical (#6426).
 func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error {
+	// #4960 / #6894 r5: validate EVERY zone's screen reference before the first
+	// zone is programmed. programZoneMaps ranges a Go MAP, so which zone is
+	// visited first is not fixed run to run — and both of the screen lookups it
+	// performs abort the whole compile. An unknown reference on the second zone
+	// visited therefore aborts AFTER the first zone has already been through
+	// SetZoneConfig and, if it has interfaces, real netlink and /proc/sys
+	// writes. That is precisely the half-reconfigured host #4960 exists to
+	// prevent, reached by the mechanism it claims to have closed.
+	//
+	// It is hoisted HERE rather than added to the pre-pass phase table alone
+	// because the reference is validated per ZONE inside this call: the pre-pass
+	// already runs compileScreenProfiles and it did not catch this, since what
+	// is unresolvable is the zone's reference TO a profile, not the profile set
+	// itself. Placing the sweep at the top of compileZones makes it structurally
+	// impossible for any zone to mutate before every zone's reference has been
+	// checked, whatever the caller did first. It is ALSO registered as a
+	// pre-pass row (compiler_validate_4960.go) so the pre-pass reports it with
+	// the same precedence as its siblings.
+	if err := validateZoneScreenReferences(cfg, result); err != nil {
+		return err
+	}
+
 	st, err := programZoneMaps(dp, cfg, result)
 	if err != nil {
 		return err
@@ -1463,12 +1486,14 @@ func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResu
 			maxScreenID = uint32(sid)
 		}
 
-		slog.Info("screen profile compiled",
-			"name", name, "id", sid,
-			"flags", fmt.Sprintf("0x%x", sc.Flags),
-			"syn_thresh", sc.SynFloodThresh,
-			"icmp_thresh", sc.ICMPFloodThresh,
-			"udp_thresh", sc.UDPFloodThresh)
+		if !isValidationPass(dp) {
+			slog.Info("screen profile compiled",
+				"name", name, "id", sid,
+				"flags", fmt.Sprintf("0x%x", sc.Flags),
+				"syn_thresh", sc.SynFloodThresh,
+				"icmp_thresh", sc.ICMPFloodThresh,
+				"udp_thresh", sc.UDPFloodThresh)
+		}
 	}
 
 	// Zero screen config entries above the highest used ID.
@@ -1564,4 +1589,66 @@ func buildScreenConfig(profile *config.ScreenProfile, synCookie bool) ScreenConf
 	}
 
 	return sc
+}
+
+// validateZoneScreenReferences resolves EVERY security zone's `screen-profile`
+// reference before any zone is programmed (#4960 / #6894 r5).
+//
+// WHY THIS IS SEPARATE FROM compileScreenProfiles. That phase compiles the
+// profile SET and is already in the pre-pass table; it is not what fails here.
+// What fails is a zone's reference TO a profile that the set does not contain,
+// and that reference is resolved per zone, inside the mutating loop.
+//
+// TWO lookups resolve it, not one, and this checks BOTH because either aborts
+// the compile:
+//
+//   - buildZoneConfig resolves against result.ScreenIDs (the COMPILED id map)
+//     to fill ZoneConfig.ScreenProfileID, immediately before SetZoneConfig; and
+//   - mapZoneInterface resolves against cfg.Security.Screen (the CONFIG map) to
+//     build the per-interface screen flags, after several host mutations.
+//
+// They normally agree — assignScreenIDs derives one from the other — but they
+// are distinct gates and a fix that hoisted only the first would still abort
+// mid-loop on a VLAN sub-interface. Checking both keeps this sweep a faithful
+// pre-image of what the loop enforces.
+//
+// PURE by construction: it takes no DataPlane and writes nothing. That is the
+// property that makes it safe to run before the mutation point, and it is why
+// the pre-pass can run it against the discarding shim as well.
+//
+// Zones are visited in SORTED order, deliberately. programZoneMaps ranges a Go
+// map, so its abort order is unspecified; a config with two bad references
+// would report whichever the runtime happened to reach first, differing run to
+// run and between the pre-pass and the real pass. Sorting makes the reported
+// offender deterministic and identical on both HA nodes.
+func validateZoneScreenReferences(cfg *config.Config, result *CompileResult) error {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		// A nil zone slot is reachable on the tolerant / HA-peer-sync paths and
+		// programZoneMaps skips it, so skip it here too: this sweep must reject
+		// exactly what the loop rejects, never more.
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		if result != nil {
+			if _, ok := result.ScreenIDs[zone.ScreenProfile]; !ok {
+				return fmt.Errorf("screen profile %q not found for zone %q",
+					zone.ScreenProfile, name)
+			}
+		}
+		if _, ok := cfg.Security.Screen[zone.ScreenProfile]; !ok {
+			return fmt.Errorf("screen profile %q not found for zone %q",
+				zone.ScreenProfile, name)
+		}
+	}
+	return nil
 }
