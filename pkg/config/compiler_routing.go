@@ -86,19 +86,7 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 			ro.RibGroups = make(map[string]*RibGroup)
 		}
 		for _, inst := range namedInstances(rgNode.FindChildren("")) {
-			rg := &RibGroup{Name: inst.name}
-			if irNode := inst.node.FindChild("import-rib"); irNode != nil {
-				// import-rib [ rib1 rib2 ... ] or import-rib rib1;
-				for i := 1; i < len(irNode.Keys); i++ {
-					if irNode.Keys[i] == "[" || irNode.Keys[i] == "]" {
-						continue
-					}
-					rg.ImportRibs = append(rg.ImportRibs, irNode.Keys[i])
-				}
-				for _, child := range irNode.Children {
-					rg.ImportRibs = append(rg.ImportRibs, child.Name())
-				}
-			}
+			rg := compileRibGroup(inst.name, inst.node)
 			ro.RibGroups[rg.Name] = rg
 		}
 		// Also handle direct children (non-named instances)
@@ -107,18 +95,7 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 			if _, exists := ro.RibGroups[name]; exists {
 				continue
 			}
-			rg := &RibGroup{Name: name}
-			if irNode := child.FindChild("import-rib"); irNode != nil {
-				for i := 1; i < len(irNode.Keys); i++ {
-					if irNode.Keys[i] == "[" || irNode.Keys[i] == "]" {
-						continue
-					}
-					rg.ImportRibs = append(rg.ImportRibs, irNode.Keys[i])
-				}
-				for _, child := range irNode.Children {
-					rg.ImportRibs = append(rg.ImportRibs, child.Name())
-				}
-			}
+			rg := compileRibGroup(name, child)
 			ro.RibGroups[rg.Name] = rg
 		}
 	}
@@ -1272,6 +1249,48 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 // "main" so the commit-time warn and the runtime applier classify a rib-group
 // import the same way (#3876).
 const mainRIBTableID = 254
+
+// compileRibGroup builds one RibGroup from the AST node that carries its body.
+//
+// It exists because compileRoutingOptions reaches a rib-group by TWO arms — the
+// named-instance arm and the direct-child arm — which held byte-identical
+// import-rib readers. #7126 records the hazard that duplication creates: a fix
+// landing in only one arm leaves the defect in the other spelling, and nothing
+// in the compiler would say so. There is now one body, so the two arms cannot
+// disagree.
+//
+// `import-rib` is the inter-VRF route-leak membership list, so a dropped entry
+// is not cosmetic: the rib-group pulls routes into one table instead of two and
+// the second table's leak simply never happens, with no diagnostic, while
+// `show configuration` renders the full list back. Two strict/warning
+// validators also iterate ImportRibs (compiler_validate_warn_routing.go,
+// compiler_validate_strict_routing.go), so a truncated list also narrows what
+// those checks can see.
+//
+// Two reads had to widen together (#7126):
+//
+//   - FindChildren, not FindChild. Repeated hierarchical statements
+//     (`import-rib inet.0; import-rib inet.2;`) land as SIBLING nodes and only
+//     the first was ever consulted, so that spelling dropped every rib past the
+//     first even though the flat-set repeated spelling — which files the same
+//     configuration as CHILDREN of one node — accumulated correctly.
+//   - plainListValues, not Keys[1:] plus each child's Name(). The old read
+//     already covered both sides of the AST exactly as CLAUDE.md prescribes and
+//     still dropped, because `set … import-rib [ inet.0 inet.2 ]` puts EVERY
+//     rib on ONE child's Keys and Name() is Keys[0]. See plainListValues.
+//
+// The old reader also skipped literal "[" / "]" tokens. That guard was
+// unreachable: the lexer strips brackets on both the hierarchical and the
+// flat-set path (verified against the parsed ASTs — `import-rib [ inet.0
+// inet.2 ]` yields Keys=["import-rib","inet.0","inet.2"] with no bracket
+// token), which is why every other #2419 reader in this package omits it.
+func compileRibGroup(name string, node *Node) *RibGroup {
+	rg := &RibGroup{Name: name}
+	for _, irNode := range node.FindChildren("import-rib") {
+		rg.ImportRibs = append(rg.ImportRibs, plainListValues(irNode)...)
+	}
+	return rg
+}
 
 // ribTargetKind classifies a rib-group import-rib name against a source
 // instance for the #3876 per-prefix leak. It mirrors pkg/routing.resolveRibTable

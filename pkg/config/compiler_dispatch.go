@@ -97,7 +97,8 @@ func compileSections(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 				return fmt.Errorf("snmp: %w", err)
 			}
 		case "bridge-domains":
-			if err := compileBridgeDomains(node, &cfg.BridgeDomains); err != nil {
+			if err := compileBridgeDomains(node, &cfg.BridgeDomains,
+				opts.lenientBridgeDomainVlanID, &cfg.Warnings); err != nil {
 				return fmt.Errorf("bridge-domains: %w", err)
 			}
 		}

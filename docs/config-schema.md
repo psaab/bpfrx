@@ -993,6 +993,59 @@ also ARMS the existing fab0/fab1 shared-member overlap check in
 bracket-authored fabrics; that check emits a warning, not a rejection, so no
 config that committed before is rejected now.
 
+**That leaf shape is a PREDICATE, not three special cases (#7126).** The
+discriminator is mechanical and worth stating as a rule, because the sites it
+catches all LOOK compliant:
+
+> A leaf declared `children: nil` and **NOT** `multi: true` in `setSchema`, read
+> by a compiler that takes `Keys[0]` / `Name()` of each child, drops every value
+> past the first when the operator authors a bracket list through the flat-set
+> path (`set`, `load set`, the CLI).
+
+`SetPath` files a bracket list differently depending on the flag:
+
+| schema | `set … <leaf> [ v1 v2 ]` becomes |
+|---|---|
+| `multi: true, children: nil` | `Keys=["<leaf>","v1","v2"]`, no children — the tail absorber runs |
+| **`multi: false, children: nil`** | `Keys=["<leaf>"]` with **ONE child** `Keys=["v1","v2"]` |
+
+In the second row every value sits on one child's Keys, so `child.Name()`
+returns `v1` and discards the rest — which is why a reader can obey the
+"`Keys[1:]` AND `Children`" rule above to the letter and still drop. **Reading
+`Children` is not the same as reading every KEY of each child.** The
+hierarchical parser is unaffected (it puts the list on the node's own tail), so
+these sites survive every brace-authored test and bite only the `set` path.
+
+`fabricMemberValues` was the first instance; #7126 found two more —
+`routing-options rib-groups <g> import-rib` and `event-options policy <p>
+events` — so the body now lives once, in `ast.go` as **`plainListValues`**, and
+`fabricMemberValues` is a wrapper that keeps its leaf-specific argument attached
+to its leaf. A divergence between the three would always be a bug, so there is
+one implementation rather than three copies. Use it only where every non-empty
+token below the node is a value: NOT for a leaf with per-value option keywords
+(`ntp server <ip> prefer`, `source-prefix-list <name> except`, `route <prefix>
+discard` — promoting a modifier into the value list is the #6690 hazard), and
+NOT where an EMPTY authored value must survive (`multiLeafAuthoredValues`).
+
+Both new sites also needed `FindChildren`, not `FindChild`: repeated
+hierarchical statements land as SIBLING nodes, and reading only the first drops
+that spelling too even where the flat-set repeated spelling — the same
+configuration, filed as CHILDREN of one node — accumulated correctly. And the
+`import-rib` drop was a GATE ESCAPE as well as a value drop: the #2226
+cross-reference check iterates `ImportRibs`, so an undefined rib named in slot 1
+committed CLEAN while the identical name in slot 0 was rejected. The newly
+visible entries land on #2226's existing tolerant-path downgrade
+(`lenientRibGroupRefs`), so no already-persisted config is turned into a boot
+failure.
+
+The two `import-rib` read sites were byte-identical duplicates in two arms of
+`compileRoutingOptions`, which is the hazard #7126 names: a fix landing in one
+arm leaves the other spelling broken and nothing says so. They now share
+`compileRibGroup`. (Measured: the named-instance arm is INERT at HEAD — it
+selects with `FindChildren("")`, which matches only a child whose first key is
+the empty string, and no parse produces one. The duplication was latent, which
+is precisely why no test could have caught a divergence.)
+
 **Widening a multi-value READ requires widening its VALIDATOR in the same
 change (#6659).** Adopting the accumulating reader at a site changes what a
 malformed value DOES. Before, a bad value in slot 2 was discarded at compile and
@@ -1039,7 +1092,7 @@ control so an ACCEPT only counts beside a REJECT of the same token:
 |---|---|---|---|
 | CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 — FIXED |
 | `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
-| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
+| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 — **CLOSED**, see below |
 
 Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
 read `child.Keys[1:]` plus the inline tail and never `child.Children`, while
@@ -1057,6 +1110,23 @@ least one entry. A regression test asserting "the entry has both code points"
 would have passed VACUOUSLY against it, so the tests in
 `cos_code_points_spellings_6697_test.go` report ABSENT and WRONG-VALUES as
 distinct failures.
+
+**Closing a gate escape owes a SEVERITY SPLIT, not just a widened read
+(#6687).** `vlan-id-list` is now read with `multiLeafAuthoredValues` and every
+authored id runs the parse and range checks, so `[ 10 99999 ]` is rejected
+exactly as `vlan-id-list 99999` always was. But the values it now examines are
+values the OLD gate accepted: a config carrying a bad id in slot 1 committed
+clean, persisted, and would refuse to BOOT after the upgrade if the widened
+check kept its old severity on every path. So the check is split the way every
+other AST-level gate in this compiler is split (`compiler_opts.go`): strict
+(commit / commit-check) hard-rejects naming the value, lenient (tolerant load /
+peer-sync, `lenientBridgeDomainVlanID`) warns and drops that one id. The
+leniently-loaded config therefore carries exactly the VLAN set master compiled —
+the bad id was never installed on either build — and only the warning is new.
+The check stays in the compiler rather than moving to a typed `validator` in
+`setSchema` for a second reason: a strict schema gate firing FIRST would mask
+whether the compiler's own loop ever widened, so the regression test could not
+tell a fix from a no-op.
 
 **And an escape can become live when someone else fixes the value-drop.** The
 archive-sites escape is inert TODAY only because the value is also dropped. A
@@ -1087,8 +1157,9 @@ empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
 
-**SIX leaf families, SEVEN read sites — the category table above has FOUR rows
-and is not the inventory.** The four rows classify EMPTY-VALUE semantics, and
+**SIX leaf families, SEVEN read sites AT #6673 — the category table above has
+FOUR rows and is not the inventory.** (The table is appended to as later fixes
+land; row 8 is #6687's, and the counts in this sentence describe #6673 only.) The four rows classify EMPTY-VALUE semantics, and
 its `Reader` column names four reader mechanisms because two of them serve two
 leaves each. Counting rows (or readers) undercounts what this change had to
 widen. The inventory is:
@@ -1102,6 +1173,7 @@ widen. The inventory is:
 | 5 | `security nat proxy-arp … address` | `compiler_nat_source.go` `compileNAT` | `proxyARPAddressValues` | yes |
 | 6 | `event-options … attributes-match` | `compiler_services.go` `eventAttributesMatchExprs` | `eventMultiWordLeafValues` (tail + each child) | yes |
 | 7 | `event-options … then change-configuration commands` | `compiler_services.go` `eventChangeConfigCommands` | `eventMultiWordLeafValues` (tail + each child) | yes |
+| 8 | `bridge-domains <bd> vlan-id-list` | `compiler_services.go` `compileBridgeDomains` | `multiLeafAuthoredValues` | yes (added by #6687, after this inventory was written) |
 
 Family 3 has TWO read sites, and that is the whole reason the count differs from
 the family count: the `flag` leaf is read once by the compiler and once by the
@@ -1117,7 +1189,6 @@ bundled, because each needs its own value-domain gate widened in the same change
 | Leaf | Still one-sided | Tracked |
 |---|---|---|
 | `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
-| `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
 ### The list above is now enforced by a gate, not maintained by hand
@@ -1167,10 +1238,11 @@ fix there cannot be proven by removing an allowlist row.
 **Why a gate and not a lint.** There is no single correct reader to lint FOR:
 this package now has at least six accumulating readers, one of which
 (`ntpServerValues`) must additionally skip per-value option KEYWORDS. A rule
-matching "reads `Keys[1]`" would flag compliant code, and would miss the #7126
-sites entirely — both of those read `Keys[1:]` AND `Children` exactly as this
-document instructs, and still drop, because reading `Children` is not the same as
-reading every KEY of each child. A differential asks whether the compiler
+matching "reads `Keys[1]`" would flag compliant code, and would have missed the
+#7126 sites entirely — both of those read `Keys[1:]` AND `Children` exactly as
+this document instructs, and still dropped, because reading `Children` is not the
+same as reading every KEY of each child (both are fixed and their allowlist rows
+removed; the predicate is stated above). A differential asks whether the compiler
 disagrees with ITSELF, which is the actual defect.
 
 **When the gate fails, there are exactly two correct responses**, and picking the
