@@ -10251,3 +10251,37 @@ is never echoed into a warning.
   separately (S-3, not this change).
 - **tests** — `pkg/config/compiler_inert_knobs_4306_test.go` (advisories fire,
   no secret echoed).
+
+## `system dataplane control-socket` typed as a socket path (#5839)
+
+`control-socket` was an untyped `{args: 1}` leaf, so any string committed and
+reached the dataplane verbatim. Three shapes are pathological:
+
+- a **relative** path — the daemon dials it and the Rust helper binds it from
+  two separate processes, each resolving it against its own working directory;
+- a `..` **traversal** — the path is handed to the stale-socket unlink at every
+  helper bring-up, so a stored config could aim that unlink outside the runtime
+  directory the path appears to name;
+- a path over the **107-octet AF_UNIX `sun_path` limit** — it can never bind, so
+  it surfaces as an opaque dataplane bring-up failure rather than a commit error.
+
+The leaf is now `valueType: ValueUnixSocketPath` with the
+`ValidateUnixSocketPath` validator (`schema_validators_system.go`): absolute, no
+`.`/`..`/empty component, no trailing `/`, no control characters, within the
+`sun_path` limit. `?`-completion gains the `<socket-path>` placeholder plus an
+example.
+
+Per the #1960 layered-defense doctrine this is **strict-on-commit,
+lenient-on-load**: `compileTreeLenient` warns and keeps booting a stored or
+peer-synced config carrying a stale value, so typing the leaf cannot brick a
+node. The gate is therefore NOT what protects the runtime — the dataplane's
+`removeStaleUnixSocket` re-judges the path defensively at every bring-up
+(refuses a non-socket, refuses a live listener's socket, never discards an
+unlink failure; see `docs/userspace-dataplane-architecture.md` "Socket path
+handling"). That runtime layer is what a value which never passed through a
+strict commit runs into.
+
+- **tests** — `pkg/config/control_socket_typed_5839_test.go` (validator
+  accept/reject table including the exact 107/108-octet boundary, plus the
+  leaf driven through `SchemaValidate` + `CompileConfig` so it is pinned as
+  WIRED, not merely defined).
