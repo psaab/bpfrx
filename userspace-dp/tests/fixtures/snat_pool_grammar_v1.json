@@ -1,0 +1,354 @@
+{
+  "version": 1,
+  "description": "Cross-language source-NAT POOL ADDRESS grammar parity fixture (#6812 F1 round 3). Every case is decided by BOTH the Rust runtime expander (expand_pool_address in userspace-dp/src/nat/source.rs) and the Go shared predicate (sourceNATPoolAddressReason + sourceNATPoolMemberHostCount in pkg/config/compiler_validate_strict_nat.go); both MUST reach the same accept/reject verdict AND, when accepted, the same expanded host count. A pool member the runtime honors but Go stamps invalid_pool poisons a working pool on the tolerant load / peer-sync path (#1960 no-brick); a member Go admits but the runtime refuses charges the aggregate budget for an allocator that is never built. `hosts` is meaningful only when `ok` is true. The OPTIONAL `first` / `last` / `expanded` fields pin WHICH addresses a member expands to, not just how many: a missing or wrong network-base mask changes the addresses while leaving the count identical, so a cardinality-only table cannot see it (#6812 B2). They are asserted Rust-side, where the expansion happens; the Go side only cross-checks that a row is self-consistent. This file is the ONE table: neither side keeps a copy, so the two grammars cannot drift apart unnoticed.",
+  "cases": [
+    {
+      "addr": "198.51.100.1/32",
+      "ok": true,
+      "hosts": 1,
+      "note": "IPv4 host CIDR",
+      "first": "198.51.100.1",
+      "last": "198.51.100.1"
+    },
+    {
+      "addr": "10.0.0.0/32",
+      "ok": true,
+      "hosts": 1,
+      "first": "10.0.0.0",
+      "last": "10.0.0.0"
+    },
+    {
+      "addr": "10.0.0.0/24",
+      "ok": true,
+      "hosts": 256,
+      "first": "10.0.0.0",
+      "last": "10.0.0.255"
+    },
+    {
+      "addr": "0.0.0.0/24",
+      "ok": true,
+      "hosts": 256,
+      "note": "a canonical ZERO octet is not a leading zero",
+      "first": "0.0.0.0",
+      "last": "0.0.0.255"
+    },
+    {
+      "addr": "10.0.0.0/16",
+      "ok": true,
+      "hosts": 65536,
+      "note": "exactly at MAX_POOL_PREFIX_HOSTS",
+      "first": "10.0.0.0",
+      "last": "10.0.255.255"
+    },
+    {
+      "addr": "10.0.0.1/24",
+      "ok": true,
+      "hosts": 256,
+      "note": "host bits set: both sides mask to the network base and enumerate the FULL prefix",
+      "first": "10.0.0.0",
+      "last": "10.0.0.255"
+    },
+    {
+      "addr": "203.0.113.10/28",
+      "ok": true,
+      "hosts": 16,
+      "expanded": [
+        "203.0.113.0",
+        "203.0.113.1",
+        "203.0.113.2",
+        "203.0.113.3",
+        "203.0.113.4",
+        "203.0.113.5",
+        "203.0.113.6",
+        "203.0.113.7",
+        "203.0.113.8",
+        "203.0.113.9",
+        "203.0.113.10",
+        "203.0.113.11",
+        "203.0.113.12",
+        "203.0.113.13",
+        "203.0.113.14",
+        "203.0.113.15"
+      ],
+      "note": "host bits set inside a /28: masks to .0 and enumerates .0-.15. Unmasked it would enumerate .10-.25 \u2014 eight addresses in the NEXT /28, translating from IPs the operator never configured. Same host COUNT either way, so a cardinality-only assertion cannot see it (#6812 B2)"
+    },
+    {
+      "addr": "10.0.0.0/15",
+      "ok": false,
+      "hosts": 0,
+      "note": "131072 hosts, over the per-prefix cap"
+    },
+    {
+      "addr": "10.0.0.0/0",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "198.51.100.1/032",
+      "ok": false,
+      "hosts": 0,
+      "note": "leading-zero PREFIX LENGTH: netip rejects the non-canonical spelling; ipnet's reader caps the IPv4 field at 2 digits. Same verdict, different reason -- pinned so raising the host cap cannot split them"
+    },
+    {
+      "addr": "10.0.0.0/00",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.0/08",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.0/016",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "010.0.0.0/24",
+      "ok": false,
+      "hosts": 0,
+      "note": "leading-zero OCTET: the round-3 divergence. ipnet's read_number(10,3,0x100) took this as 10.0.0.0/24 and built a 256-address allocator while Go stamped invalid_pool"
+    },
+    {
+      "addr": "10.000.0.0/24",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "192.168.001.1/32",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "010.0.0.0/32",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "00.0.0.0/24",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "0010.0.0.0/24",
+      "ok": false,
+      "hosts": 0,
+      "note": "4-digit octet: refused by both even before round 3"
+    },
+    {
+      "addr": "10.0.0.0/33",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.0/+32",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.0/ 32",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.256/24",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.1/32extra",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0/16",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.0/",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "10.0.0.0/3.2",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "203.0.113.1/garbage",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "198.51.100.1",
+      "ok": true,
+      "hosts": 1,
+      "note": "bare IPv4"
+    },
+    {
+      "addr": "010.0.0.1",
+      "ok": false,
+      "hosts": 0,
+      "note": "the BARE branch always refused this -- std rejects a leading-zero octet. Before round 3 the CIDR form of the same address was accepted"
+    },
+    {
+      "addr": "10.0.0.1 ",
+      "ok": false,
+      "hosts": 0,
+      "note": "trailing space"
+    },
+    {
+      "addr": "2001:db8::1/128",
+      "ok": true,
+      "hosts": 1,
+      "first": "2001:db8::1",
+      "last": "2001:db8::1"
+    },
+    {
+      "addr": "2001:db8::/113",
+      "ok": true,
+      "hosts": 32768,
+      "first": "2001:db8::",
+      "last": "2001:db8::7fff"
+    },
+    {
+      "addr": "2001:db8::/112",
+      "ok": true,
+      "hosts": 65536,
+      "note": "exactly at the cap",
+      "first": "2001:db8::",
+      "last": "2001:db8::ffff"
+    },
+    {
+      "addr": "2001:DB8::/112",
+      "ok": true,
+      "hosts": 65536
+    },
+    {
+      "addr": "2001:0db8::/112",
+      "ok": true,
+      "hosts": 65536,
+      "note": "leading zeros in a HEXTET are canonical IPv6"
+    },
+    {
+      "addr": "2001:db8:0:0:0:0:0:0/112",
+      "ok": true,
+      "hosts": 65536
+    },
+    {
+      "addr": "2001:db8::ffff/120",
+      "ok": true,
+      "hosts": 256,
+      "note": "masks to 2001:db8::ff00",
+      "first": "2001:db8::ff00",
+      "last": "2001:db8::ffff"
+    },
+    {
+      "addr": "::ffff:10.0.0.0/120",
+      "ok": true,
+      "hosts": 256,
+      "note": "v4-mapped: a V6 member on both sides"
+    },
+    {
+      "addr": "1:2:3:4:5:6:1.2.3.4/128",
+      "ok": true,
+      "hosts": 1
+    },
+    {
+      "addr": "::1.2.3.4/128",
+      "ok": true,
+      "hosts": 1
+    },
+    {
+      "addr": "2001:db8::/111",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "2001:db8::/129",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "2001:db8::/0112",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "2001:db8::/064",
+      "ok": false,
+      "hosts": 0,
+      "note": "ipnet's 3-digit IPv6 field ACCEPTS this as /64; the host cap refuses it anyway"
+    },
+    {
+      "addr": "2001:db8::/096",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "2001:db8::1/0128",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "::ffff:010.0.0.0/120",
+      "ok": false,
+      "hosts": 0,
+      "note": "leading-zero EMBEDDED v4 octet -- the same round-3 divergence through the v6 path"
+    },
+    {
+      "addr": "fe80::/112%eth0",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "fe80::%eth0/112",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "2001:db8::1",
+      "ok": true,
+      "hosts": 1
+    },
+    {
+      "addr": "::ffff:10.0.0.1",
+      "ok": true,
+      "hosts": 1
+    },
+    {
+      "addr": "fe80::1%eth0",
+      "ok": false,
+      "hosts": 0,
+      "note": "netip.ParseAddr carries a zone; std::net::IpAddr has no zone model. Go refused this only from round 3 (#5875 caught it one clause later, so the POOL verdict already agreed)"
+    },
+    {
+      "addr": "::ffff:010.0.0.1",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "not-an-ip",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "",
+      "ok": false,
+      "hosts": 0
+    },
+    {
+      "addr": "1.2.3.4/24 ",
+      "ok": false,
+      "hosts": 0,
+      "note": "trailing space after a CIDR"
+    },
+    {
+      "addr": " 1.2.3.4/24",
+      "ok": false,
+      "hosts": 0
+    }
+  ]
+}

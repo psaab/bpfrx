@@ -107,17 +107,20 @@ func (d *Daemon) shellCommitConfirmedFn() func(context.Context, int) (*config.Co
 // Extracted verbatim from Run()'s PHASE 5 (#4662 Increment 2); the leaf
 // startup block carries no ordering dependency (same code, same call point).
 func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer, fwdSampler *fwdstatus.Sampler) {
-	// d.dp asserted against the local grpcDataPlane probe
-	// (runtime_probes.go) — structurally identical to
-	// pkg/grpcapi's package-private grpcRuntime
-	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
-	// assignment to grpcapi.Config.DP at this site; signature
-	// drift surfaces as a compile error here.
+	// #2114 (r4): wire the LIVE indirection, not a startup snapshot of the
+	// published backend. grpcapi.Server keeps its Config.DP for the daemon's
+	// lifetime (pkg/grpcapi/server.go NewServer), so handing it the interface
+	// value here made every later setDataplane(nil) invisible to gRPC — the
+	// server kept dispatching `show`/`clear` into a backend the daemon had
+	// disowned. liveDataPlane re-reads the cell per call (daemon_dp_live.go).
+	// It satisfies the local grpcDataPlane probe (runtime_probes.go) —
+	// structurally identical to pkg/grpcapi's package-private grpcRuntime
+	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the assignment to
+	// grpcapi.Config.DP at this site; signature drift surfaces as a compile
+	// error here and at the daemon_dp_live.go assertions.
 	var grpcDP grpcDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(grpcDataPlane); ok {
-			grpcDP = probe
-		}
+	if live, ok := d.liveDataplane(); ok {
+		grpcDP = live
 	}
 	grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 		Store:      d.store,
@@ -246,16 +249,16 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 // no ordering dependency (same code, same call point, still guarded by the
 // d.opts.APIAddr check in Run).
 func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer) {
-	// d.dp asserted against the local apiDataPlane probe
-	// (runtime_probes.go) — structurally identical to pkg/api's
-	// package-private apiRuntimeDataPlane. Go duck-types the
-	// assignment to api.Config.DP at this site; signature drift
-	// surfaces as a compile error here.
+	// #2114 (r4): the LIVE indirection, for the same reason as gRPC above —
+	// api.Server keeps Config.DP for the daemon's lifetime, so a startup
+	// snapshot outlived every setDataplane(nil). liveDataPlane satisfies the
+	// local apiDataPlane probe (runtime_probes.go) — structurally identical
+	// to pkg/api's package-private apiRuntimeDataPlane. Go duck-types the
+	// assignment to api.Config.DP at this site; signature drift surfaces as a
+	// compile error here and at the daemon_dp_live.go assertions.
 	var apiDP apiDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(apiDataPlane); ok {
-			apiDP = probe
-		}
+	if live, ok := d.liveDataplane(); ok {
+		apiDP = live
 	}
 	apiCfg := api.Config{
 		Addr:     d.opts.APIAddr,
@@ -406,10 +409,13 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// matching the dataplane's nil-state behavior rather than certifying
 		// an as-if-active verdict it is skipping.
 		PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
-			if d.dp == nil {
+			// #2114: one dataplane snapshot per request (plan §5.3
+			// rule 7).
+			rt := d.dataplane()
+			if rt == nil {
 				return nil, false
 			}
-			p, ok := d.dp.(interface {
+			p, ok := rt.(interface {
 				PolicySchedulerActiveState() map[string]bool
 			})
 			if !ok {
@@ -472,15 +478,28 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// swap on an unchanged bind. Before #5866 the server was constructed once
 	// here and never reconciled, so a committed bind/TLS/port/auth change (e.g.
 	// a revoked credential) sat inert until a daemon restart.
-	d.mgmt = newManagementReconciler(d, apiCfg)
-	if err := d.mgmt.start(ctx); err != nil {
+	// #6827 round 5: publish d.mgmt under staleCertMu, the same mutex the
+	// stale-cert delivery path reads it through, so that read is memory-model
+	// safe rather than a benign-looking data race.
+	mgmt := newManagementReconciler(d, apiCfg)
+	d.staleCertMu.Lock()
+	d.mgmt = mgmt
+	d.staleCertMu.Unlock()
+	if err := mgmt.start(ctx); err != nil {
 		// A boot bind failure is non-fatal (matches the pre-#5866 async
 		// srv.Run error log): the daemon keeps running and the next commit's
 		// reconcileWebManagement retries the bind.
 		slog.Error("HTTP API server initial start failed", "err", err)
 	}
+	// #6827: the boot config apply (startup phase 4) runs BEFORE this
+	// constructor, so a `system host-name` applied at boot reached a nil
+	// reconciler and parked itself. Deliver it now that an HTTPS leg may be
+	// serving — this is the earliest point at which the diagnostic has a real
+	// certificate to judge, and the name is still the one the operator set.
+	d.deliverStaleMgmtCertDiagnosis()
 	// Drain the management serve goroutines on daemon shutdown: ctx cancel
-	// triggers the api.Server bounded 5s graceful drain, and wait() joins every
+	// triggers the api.Server graceful drain (5s deadline, not a wall-clock
+	// bound — see api.legDrainTimeout), and wait() joins every
 	// live + retiring listener goroutine so none leak past Run.
 	wg.Add(1)
 	go func() {

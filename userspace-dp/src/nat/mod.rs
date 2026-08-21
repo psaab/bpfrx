@@ -53,6 +53,10 @@ mod tests_scope;
 #[cfg(test)]
 #[path = "tests_l4_match.rs"]
 mod tests_l4_match;
+#[cfg(test)]
+#[path = "tests_aggregate_budget.rs"]
+mod tests_aggregate_budget;
+
 // #4800: SNAT pool allocator `live` map-mutex contention accounting.
 #[cfg(test)]
 #[path = "tests_newflow_lock.rs"]

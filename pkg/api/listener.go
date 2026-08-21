@@ -29,9 +29,36 @@ type listenerLeg struct {
 	// serving at that instant, and from then on only ever tightens — see
 	// authSlot and Server.ReplaceAuth.
 	slot *authSlot
-	// drained is set by the serve goroutine as its LAST act, so a retired leg can
-	// be reaped from Server.retiring without joining it. Atomic for the same
-	// lock-ordering reason as dead.
+	// drained is set by the serve goroutine after its body and its drain have
+	// finished, so a retired leg can be reaped from Server.retiring without
+	// joining it. Atomic for the same lock-ordering reason as dead.
+	//
+	// It is NOT the goroutine's last act, and the difference is observable
+	// (#6827 round 8): the defers run LIFO — `defer s.wg.Done()` is registered
+	// first, `defer leg.drained.Store(true)` second — so this store happens
+	// BEFORE wg.Done. A reader that sees drained cannot conclude the goroutine
+	// has returned; it can conclude the exit path and the drain are complete,
+	// which is what every caller here actually needs. Server.Wait, which waits
+	// on wg.Done, is the strictly stronger barrier and is what the tests use
+	// where they can.
+	//
+	// It means "nothing this leg accepted is still being served" — no further
+	// request can be admitted AND no response is still in flight (#6827 round 8;
+	// round 7 stated only the first half, which is the half Shutdown alone
+	// already provides, so it understated what the flag has to promise). Modulo
+	// HIJACKED connections, which Go excludes from both Shutdown and Close and
+	// which this package has none of today — a tripwire, not a gate; see
+	// drainLeg.
+	// Server.pruneRetiredLocked spends it as exactly that: a drained leg stops
+	// being tightened by ReplaceAuth because there is nothing left for a
+	// revocation to reach. That reading is only true because EVERY exit path now
+	// runs drainLeg before this store (#6827 round 7). Before it, the
+	// unexpected-exit arm returned without calling Shutdown at all: Serve closes
+	// the LISTENER on its way out, but the HTTP/1 keep-alive and HTTP/2
+	// connections it had already accepted kept being served — so the flag went up
+	// with live connections behind it, the prune dropped the leg, and its pinned
+	// slot stopped tightening while those connections were still presenting
+	// credentials on it.
 	drained atomic.Bool
 	// dead is set when the leg's serve loop exits UNEXPECTEDLY — the listener
 	// terminated on its own, not via a requested shutdown (stopLegLocked /
@@ -46,13 +73,205 @@ type listenerLeg struct {
 	// goroutine waits on lifeMu before it can return -> Done). Storing atomically
 	// with no lock breaks that lock-ordering cycle (#6401 round-3 fix).
 	dead atomic.Bool
+	// stopping is set the moment a graceful drain BEGINS — before Shutdown, not
+	// after the goroutine returns. A flag stored only when the goroutine RETURNS
+	// would stay false for the whole drain window, up to legDrainTimeout (#6827
+	// round 5).
+	//
+	// It marks INTENT, and the socket state trails it by a hair: it is stored
+	// just before the drain, which is what closes the listener, and requests
+	// already accepted keep being served until they finish or the drain severs
+	// them. So a `stopping` leg is not instantaneously silent — and NOT within a
+	// wall-clock bound either (legDrainTimeout is a poll deadline, not a
+	// ceiling; see its doc). It is still the right answer to
+	// "is a certificate in front of clients right now?", which is a question
+	// about whether to warn an operator: this leg is on its way out, no new
+	// client will reach it, and a staleness warning about it is noise. Callers
+	// that want "what address is this leg finishing on" (EffectiveHTTPAddr)
+	// deliberately do not consult it.
+	stopping atomic.Bool
+}
+
+// serving reports whether this leg is the one in front of clients right now: it
+// exists, holds a listener, and its serve goroutine has neither self-terminated
+// (`dead`) nor begun a graceful drain (`stopping`). It is a state question, not
+// an instantaneous claim that no byte is in flight — a leg that has just entered
+// its drain can still be finishing accepted requests (see `stopping`).
+//
+// A non-nil leg pointer is NOT that question (#6827). An unexpected serve exit
+// sets `dead` and leaves the leg INSTALLED in s.httpsLeg; a root-context
+// shutdown sets `stopping` (never `dead`) and also leaves it installed. In both
+// states the pointer is live and the socket is not. A caller that reads the leg
+// to answer "what is this box serving?" must test the state, not the pointer.
+//
+// It tests `stopping` rather than `stopCh` on purpose. A requested retirement
+// (stopLegLocked) is not observable through s.httpsLeg — but not for the reason
+// the shape of ReconcileHTTPS suggests. Its disable arm retires FIRST and clears
+// the field second (stopLegLocked(s.httpsLeg), then s.httpsLeg = nil), so the
+// interleaved state is written; what makes it unobservable is that the whole
+// switch runs under ONE lifeMu hold and every serving() caller takes lifeMu
+// (Server.HTTPSServing, Server.WarnStaleMgmtCertForHostName), so a reader lands
+// before the retirement or after the clear, never between. The rebind arm needs
+// no such argument: it installs the replacement before retiring the old leg, so
+// the leg being retired is never the installed one. So a stopCh test would be an
+// arm for a state that cannot occur — while the state that DOES occur,
+// root-context shutdown, closes no stopCh and would slip past it.
+// `stopping` is set at the TOP of both drain arms — requested retirement and
+// root-context shutdown — before Shutdown runs, so it covers that path from the
+// moment the listener closes through the goroutine's return. Together with
+// `dead` (self-termination) every exit is covered, so this predicate needs no
+// further flag.
+//
+// `drained` is NOT a candidate here even though it is set on every exit
+// (#5561 round 14). It is stored from a defer after the exit path and the drain
+// have run — not as the goroutine's last act, since `defer s.wg.Done()` is
+// registered first and therefore runs after it — which makes it the right
+// answer to "has this leg finished draining, so retiring can reap it?"
+// and the wrong answer to this one: throughout the drain — the whole window
+// in which the socket is already closed but the goroutine has not returned — it
+// still reads false. A predicate built on it would call a closing listener live
+// for the entire window that matters.
+//
+// Deliberately stricter than EffectiveHTTPAddr's inline check, which tests nil
+// / ln / dead only: that one answers `show system services`, where a leg
+// finishing a graceful drain should still report the address it is on. This one
+// answers "is there a certificate in front of clients right now?" The two
+// questions differ, so they are not folded into one predicate.
+func (l *listenerLeg) serving() bool {
+	return l != nil && l.ln != nil && !l.dead.Load() && !l.stopping.Load()
+}
+
+// legDrainTimeout is how long the connections a leg already accepted have to
+// finish GRACEFULLY once that leg is on its way out, on every exit — requested
+// retirement, root-context shutdown, and an unexpected serve-loop exit.
+//
+// It bounds NEITHER the drain nor even the Shutdown in wall-clock terms, and
+// round 8's "it bounds the Shutdown" was the second wrong version of this
+// sentence (#6827 round 9). It is a POLL deadline, consulted between quiescence
+// checks, and both phases put serial per-connection closes in front of it:
+//
+//   - INSIDE Shutdown: the loop calls closeIdleConns() and only reaches its
+//     `select { case <-ctx.Done() }` if that returns false. closeIdleConns walks
+//     s.activeConn under s.mu calling c.rwc.Close() one at a time, so a batch of
+//     stalled IDLE peers overruns the context before the context is ever read.
+//   - AFTER it: http.Server.Close takes no context at all and closes
+//     s.activeConn serially too.
+//
+// On an HTTPS leg each of those closes is a *tls.Conn whose Close sends
+// close_notify under a five-second write deadline of its OWN (crypto/tls
+// conn.go closeNotify), so a peer that stalls its receive window costs up to
+// five seconds EACH, one after another, in both phases. The worst case grows
+// with the number of such connections and has no fixed ceiling. The knock-on is
+// worth knowing before someone rediscovers it as a
+// hang: Server.Wait holds lifeMu across the drain, and
+// WarnStaleMgmtCertForHostName holds staleCertMu while waiting for lifeMu, so a
+// `set system host-name` racing daemon shutdown waits for whatever the drain
+// takes. Bounding the sever phase for real needs per-connection tracking with
+// concurrent deadlined closes, which is a larger change than #6827; what is
+// claimed here is only what is true.
+//
+// A var, not a const, so a test can reach the DEADLINE arm — the one where
+// Shutdown gives up and drainLeg severs what is left — without spending five
+// seconds in every case (#6827 round 8). Production never assigns it, and
+// TestLegDrainTimeoutDefault_6827 pins the shipped value so a leaked override
+// cannot retune it silently.
+var legDrainTimeout = 5 * time.Second
+
+// drainLeg takes srv out of service and does not return until nothing it
+// accepted is still being served: no further request can be admitted, and any
+// response still in flight has been severed. HIJACKED connections are the one
+// exception and they are excluded by construction, not by accident — see below.
+//
+// None of what follows weakens why the drain exists at all. The defect that
+// motivated it (#6827 round 7) was an exit arm that called NO Shutdown
+// WHATSOEVER: with keep-alives never disabled, a connection accepted before the
+// listener died went on serving FURTHER requests under a credential the
+// operator had since revoked. "Shutdown stops further requests" and "that arm
+// was serving further requests" are both true, because that arm was not
+// calling Shutdown.
+//
+// Shutdown delivers the FIRST half and not the second, and that split is
+// the whole reason Close is here (#6827 round 8 — round 7 asserted the same
+// conclusion from the wrong mechanism, which is worse than useless because the
+// next reader reasons from the stated mechanism and this one would tell them
+// the Close is redundant).
+//
+// Measured, not argued:
+//
+//   - FURTHER REQUESTS, on HTTP/1: Shutdown sets `inShutdown`, which makes
+//     `doKeepAlives()` false. Idle connections are closed outright, and a
+//     connection Shutdown is still waiting on finishes its current response and
+//     then closes rather than reading another request. So a surviving HTTP/1
+//     connection cannot serve a second request — Shutdown alone is sufficient
+//     for that half. On HTTP/2 it is weaker (#6827 round 9): the shutdown
+//     callbacks are asynchronous, so an already-established h2 connection can
+//     open another stream in the window before GOAWAY reaches it. Close is what
+//     makes that answer the same on both protocols.
+//   - THE RESPONSE ALREADY IN FLIGHT: Shutdown does not terminate it. It WAITS
+//     for it, and when the deadline expires it returns ctx.Err() and leaves the
+//     response open and still streaming. This server deliberately runs with no
+//     WriteTimeout (SSE streams and large scrapes must not be severed), so an
+//     in-flight response has no upper bound of its own: a subscribed event
+//     stream outlives the deadline indefinitely, still writing to its client, on
+//     a leg the box has already marked `drained`. Close is what ends it.
+//
+// Both halves matter, for different reasons. The request half is the credential
+// story: a leg's policy stops being maintained the moment it drains
+// (listenerLeg.drained, Server.pruneRetiredLocked), so a request admitted after
+// that is judged by a snapshot no ReplaceAuth will ever tighten again. The
+// in-flight half is the data story: a response authorized under the old policy
+// goes on delivering after the box believes the socket is gone.
+//
+// HIJACKED CONNECTIONS ARE OUT OF SCOPE, deliberately — and the exclusion is
+// only PARTLY enforced, which is the honest version of what round 8 claimed
+// (#6827 round 9). Go excludes them from BOTH calls — Shutdown "does not
+// attempt to close nor wait for hijacked connections", Close "does not even
+// know about" them — and a hijacked conn is removed from srv.activeConn, so it
+// can outlive this function with `drained` set. Adding the force-close does not
+// fix that; nothing here can, because the handle is gone.
+//
+// This package has no hijacker today, and TestNoHijackerInThisPackage_6827 is a
+// TRIPWIRE for the two forms it can take LOCALLY — a type assertion to
+// http.Hijacker, or a call to Hijack — plus an import of a package known to
+// hijack internally. It is NOT a proof of absence and must not be read as one:
+// a dependency that hijacks inside its own handler is invisible to a local AST
+// walk. `golang.org/x/net/websocket` is a direct dependency of this module and
+// its Server does exactly that, so `mux.Handle("/ws", websocket.Handler(h))`
+// would introduce the case with nothing in this package's syntax to catch —
+// which is why the import check exists and why even together they are a
+// tripwire rather than a gate. Reverse proxies, upgrade helpers, aliases and
+// reflection escape identically.
+//
+// If a hijacking endpoint is added, drainLeg has to grow per-connection
+// tracking (an http.Server.ConnState hook fires with StateHijacked and hands
+// you the net.Conn) and close those conns itself; otherwise the invariant here,
+// at listenerLeg.drained and in pkg/api/README.md must be narrowed to exclude
+// that endpoint.
+// It returns the Shutdown error so a caller that reports one can keep doing so
+// (Server.serveBound). The leg paths discard it deliberately: a leg's exit is
+// not something anybody returns, and a drain that reached its deadline and
+// severed is not a failure to report — the connections are gone either way.
+func drainLeg(srv *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), legDrainTimeout)
+	defer cancel()
+	err := srv.Shutdown(ctx)
+	if err != nil {
+		// Deadline (or a listener-close error): stop asking and sever. NOT
+		// optional and NOT redundant — see above, and
+		// TestInFlightResponseIsSeveredOnEveryLegExit_6827, which reds if this
+		// line goes.
+		_ = srv.Close()
+	}
+	return err
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
 // server wait group, and returns the leg. The goroutine serves until (a) the
 // listener terminates on its own, (b) the leg is explicitly retired
 // (stopLegLocked), or (c) the daemon root context is cancelled — then it runs a
-// bounded 5s graceful drain (Shutdown closes ln + unblocks Serve) and joins.
+// graceful drain (drainLeg) and joins. Every one of the three ends in
+// that drain: (a) closes the listener but not the connections behind it, so it
+// needs the drain for exactly the same reason the other two do.
 // Caller holds lifeMu (so rootCtx is set and reads are consistent).
 // slot is the credential slot srv's handler was built with (buildHTTPServer /
 // buildHTTPSServer); every production call site supplies the same one, so the
@@ -87,8 +306,10 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 		}
 		select {
 		case err := <-serveErr:
-			// The listener terminated on its own (not a requested shutdown); the
-			// socket is already closed, nothing left to drain.
+			// The listener terminated on its own (not a requested shutdown), so
+			// the LISTENING socket is already closed — but the connections it
+			// accepted before it died are not (#6827 round 7). They are still
+			// being served, by this srv, under this leg's credential slot.
 			if err != nil && err != http.ErrServerClosed {
 				slog.Error("API listener terminated unexpectedly", "addr", srv.Addr, "tls", isTLS, "err", err)
 			}
@@ -102,14 +323,23 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 			// clear. A leg already retired/replaced by a reconcile takes the
 			// stopCh path below instead, so this only fires on a genuine
 			// self-termination.
+			//
+			// Stored BEFORE the drain, not after: serving() must flip the instant
+			// the socket dies so a reconcile can rebuild the leg, rather than a
+			// whole drain timeout later.
 			leg.dead.Store(true)
+			// Then take the accepted connections down. Without this the flag said
+			// the leg was gone while it was still answering requests, and
+			// `drained` — set by the defer immediately below — told
+			// pruneRetiredLocked there was nothing left for a ReplaceAuth to
+			// tighten (#6827 round 7).
+			_ = drainLeg(srv)
 			return
 		case <-leg.stopCh:
 		case <-rootDone:
 		}
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
+		leg.stopping.Store(true)
+		_ = drainLeg(srv)
 		<-serveErr // join the Serve goroutine before the leg is considered drained
 	}()
 	return leg
@@ -122,7 +352,7 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 // Retirement is ASYNCHRONOUS and that is the point of the auth pin (#5561 round
 // 14). Closing stopCh only WAKES the serve goroutine; the socket keeps accepting
 // until that goroutine reaches Shutdown, and connections it already accepted are
-// served for the whole bounded drain. ReconcileHTTP/ReconcileHTTPS return as soon
+// served for the whole drain. ReconcileHTTP/ReconcileHTTPS return as soon
 // as this call does, and the management reconciler then publishes the committed
 // credential set — so without the pin a credential the commit authorized for the
 // NEW address became valid on the address that same commit retired. Pinning the
@@ -160,6 +390,12 @@ func (s *Server) trackRetiring(leg *listenerLeg) {
 
 // pruneRetiredLocked compacts s.retiring down to the legs that are still
 // draining and returns it. Caller holds retireMu.
+//
+// Dropping a leg here ENDS the tightening ReplaceAuth would otherwise keep
+// applying to its pinned slot, so the reap is only sound while `drained` means
+// what serveLegLocked now makes it mean: every connection the leg accepted has
+// been finished or severed (drainLeg), so there is no longer anyone for a
+// revocation to reach.
 func (s *Server) pruneRetiredLocked() []*listenerLeg {
 	live := s.retiring[:0]
 	for _, leg := range s.retiring {
@@ -233,6 +469,26 @@ func (s *Server) EffectiveHTTPAddr() string {
 	return s.httpLeg.ln.Addr().String()
 }
 
+// HTTPSServing reports whether an HTTPS leg is bound and serving right now
+// (#5561 round 14 / #6827 round 5 — both rounds arrived at this predicate
+// independently, for the same reason). Start() deliberately returns SUCCESS when
+// the HTTPS bind fails — HTTPS is best-effort at boot so a failure leaves the
+// HTTP plane up — which means a caller cannot infer from Start's error that
+// HTTPS came up. The management reconciler that records a converged HTTPS
+// fingerprint on that assumption pins itself to a listener that does not exist,
+// so the leg-changed test is false on every subsequent unchanged commit and
+// ReconcileHTTPS is never called again: the boot failure is permanent and
+// silent.
+//
+// The answer is listenerLeg.serving(), not `!= nil && !dead`: a leg that is
+// draining is not carrying traffic either, and a caller asking "did the bind
+// land?" must not be told yes by a leg on its way out.
+func (s *Server) HTTPSServing() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpsLeg.serving()
+}
+
 // ReconcileHTTP make-before-break rebinds ONLY the HTTP listener to addr (#5866),
 // leaving the HTTPS leg untouched. A same-addr call is a no-op. The new listener
 // is bound and serving BEFORE the old is retired (no unreachable HTTP window). A
@@ -259,26 +515,25 @@ func (s *Server) ReconcileHTTP(addr string) error {
 	return nil
 }
 
-// HTTPSServing reports whether an HTTPS leg is CURRENTLY serving (#5561 round
-// 14). Start treats an HTTPS bind failure as non-fatal — the HTTP plane stays up
-// and the leg is simply absent — so the management reconciler must ask this
-// rather than infer convergence from Start's nil error, or it records a desired
-// HTTPS fingerprint that no listener implements and never retries the bind.
-func (s *Server) HTTPSServing() bool {
-	s.lifeMu.Lock()
-	defer s.lifeMu.Unlock()
-	return s.httpsLeg != nil && !s.httpsLeg.dead.Load()
-}
-
 // ReconcileHTTPS enables, disables, or make-before-break rebinds ONLY the HTTPS
 // listener (#5866), leaving the live HTTP listener untouched — this is the fix
 // for the whole-server rebuild that re-bound the still-held HTTP socket on a
 // TLS-enable (EADDRINUSE). useTLS=false or addr=="" disables HTTPS. A same-addr
-// enabled call is a no-op. On enable/rebind the new HTTPS listener (with its
-// durable self-signed cert — loaded AS-IS from disk on a rebind, freshly minted
-// only when no on-disk pair exists, #1916 D6) is bound and serving BEFORE any
-// old one is retired. A cert or bind failure retains the previous HTTPS state
-// (fail-closed) and returns the error for retry debt.
+// call over a leg that is actually SERVING is a no-op. On enable/rebind the new
+// HTTPS listener (with its durable self-signed cert — loaded AS-IS from disk on
+// a rebind, freshly minted only when no on-disk pair exists, #1916 D6) is bound
+// and serving BEFORE any old one is retired. A cert or bind failure retains the
+// previous HTTPS state (fail-closed) and returns the error for retry debt.
+//
+// The same-addr no-op tests listenerLeg.serving(), NOT a non-nil pointer
+// (#6827 round 6). An unexpected serve exit marks the leg `dead` and leaves it
+// INSTALLED in s.httpsLeg, so a pointer test called that address converged and
+// returned nil — a same-address reconcile could never resurrect HTTPS, and
+// neither could any other commit, because the reconciler above it never even
+// reached this call (its own converged fingerprint still matched). The dead leg
+// was a permanent, restart-only dead end on an UNCHANGED configuration. Asking
+// whether a socket is really carrying traffic makes the rebind the recovery
+// path it was always documented to be.
 func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
@@ -290,7 +545,7 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 			s.httpsLeg = nil
 		}
 		return nil
-	case s.httpsLeg != nil && s.httpsLeg.srv.Addr == addr:
+	case s.httpsLeg.serving() && s.httpsLeg.srv.Addr == addr:
 		return nil
 	default:
 		slot := s.newAuthSlot()

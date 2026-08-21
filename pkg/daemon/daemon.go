@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,11 +67,38 @@ type Options struct {
 // not exist, the daemon runs in standalone mode.
 const nodeIDFile = "/etc/xpf/node-id"
 
+// dpSlot is the immutable publication payload for Daemon.dpCell (#2114):
+// the runtime dataplane interface value, frozen at Store time so a reader
+// observes either no dataplane or the full (type, data) pair — never a
+// torn multiword interface read.
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
 // Daemon is the main xpf daemon.
 type Daemon struct {
-	opts     Options
-	store    *configstore.Store
-	dp       dataplane.RuntimeDataPlane
+	opts  Options
+	store *configstore.Store
+	// dpCell is the #2114 single synchronized publication point for the
+	// runtime dataplane. A nil cell means no dataplane (NoDataplane mode,
+	// a retired-backend construction failure, or an arm-failure
+	// teardown). Every ACQUISITION goes through dataplane() /
+	// setDataplane(); the same atomic.Pointer publication idiom as
+	// natPoolAlarm (#2116) below. The plain interface field this replaces
+	// raced the bootstrap-exit `d.dp = nil` writer against the
+	// forwarding-status sampler, the HA watcher chain, and the recovered
+	// commit-confirmed rollback timer (#2114).
+	//
+	// The cell is a PUBLICATION protocol, not a LIFETIME one. It does not
+	// stop an acquired handle from outliving its publication, and it does
+	// not un-publish a backend that Teardown() has detached (the
+	// commit-confirmed rollback deliberately keeps the torn-down object
+	// here so a corrected commit re-arms it — #6741 owns that window).
+	// The three operator-facing management servers therefore receive
+	// liveDataPlane (daemon_dp_live.go), which re-reads this cell per
+	// call, instead of a startup snapshot of the handle; the conntrack
+	// GC, cluster SessionSync, and the userspace event-stream loop stay
+	// deliberate capture-once consumers (rationale in daemon_dp_live.go
+	// and pkg/daemon/README.md).
+	dpCell   atomic.Pointer[dpSlot]
 	networkd *networkd.Manager
 	routing  *routing.Manager
 	frr      *frr.Manager
@@ -285,8 +313,46 @@ type Daemon struct {
 	// listener + authentication snapshot against the committed web-management
 	// config (make-before-break rebind on an endpoint change; live auth swap on
 	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
-	mgmt      *managementReconciler
-	snmpAgent *snmp.Agent
+	mgmt *managementReconciler
+	// staleCertMu guards staleCertPending and staleCertGen, and publishes the
+	// mgmt pointer the stale-cert delivery path reads (#6827 round 5) — so that
+	// read is memory-model safe rather than a benign-looking data race.
+	//
+	// ONLY that read. `mgmt` is still read unguarded elsewhere (daemon_run_servers.go
+	// and reconcileWebManagement), exactly as it was before #6827 — the publish
+	// was unsynchronised on every path then, and this PR narrowed the problem to
+	// the path it touched rather than solving it. Do not read this as "mgmt is
+	// guarded"; it is not, and the remaining readers are tracked separately.
+	staleCertMu sync.Mutex
+	// staleCertPending records that a `set system host-name` moved the kernel
+	// name and the management-TLS staleness diagnostic has NOT yet been
+	// delivered (#6827). It is a FLAG, not a stored name: the host name is read
+	// from the kernel at delivery time, so a deferred diagnosis can never
+	// report a name that is no longer current.
+	//
+	// It stays set until a delivery actually reaches a served certificate. The
+	// boot config apply runs in startup phase 4 while startHTTPServer builds
+	// mgmt much later in Run, and HTTPS may be off or fail to bind for far
+	// longer than that — but the certificate is DURABLE on disk, so the
+	// staleness outlives every one of those gaps. Clearing the flag on a
+	// delivery that reached nothing would lose the diagnosis permanently: the
+	// next boot's applyHostname sees the name already applied and returns
+	// early, and the load path's inferred heuristic declines cross-shape drift
+	// by design (see hostNameLikelyAccessIdentity's residual note).
+	//
+	// It is process-local: a debt still owed when the daemon stops is
+	// discarded, which is one of the two states that residual note covers.
+	//
+	// Guarded by staleCertMu.
+	staleCertPending bool
+	// staleCertGen advances on every rename. A delivery claims a generation and
+	// clears the debt only if it is still current, so a rename landing while an
+	// in-flight delivery is unlocked is not settled by that older delivery
+	// (#6827 round 5).
+	//
+	// Guarded by staleCertMu.
+	staleCertGen uint64
+	snmpAgent    *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in
@@ -1056,11 +1122,49 @@ type Daemon struct {
 	fabricStateResubBackoff time.Duration
 }
 
+// dataplane returns the currently published runtime dataplane, or nil.
+// One atomic load; safe from any goroutine. Callers that nil-check AND use
+// the value must load ONCE into a local (the #2114 plan's §5.3 snapshot
+// boundaries) — a second load may observe a different publication.
+func (d *Daemon) dataplane() dataplane.RuntimeDataPlane {
+	if s := d.dpCell.Load(); s != nil {
+		return s.v
+	}
+	return nil
+}
+
+// setDataplane publishes dp; a nil argument clears the cell. The
+// kind-gated typed-nil check keeps a non-nil interface wrapping a nil
+// value out of the cell WITHOUT panicking on non-nillable kinds
+// (reflect.Value.IsNil panics on struct values) and WITHOUT missing
+// non-pointer nillable kinds (named Chan/Func/Map/Slice types can carry
+// methods — in-repo precedent:
+// pkg/dataplane/userspace/wire_uint8list.go). RuntimeDataPlane has no
+// pointer-only constraint and the backend registry
+// (pkg/dataplane/dataplane.go) returns arbitrary constructor results
+// unchecked, so the guard covers every nillable kind.
+func (d *Daemon) setDataplane(dp dataplane.RuntimeDataPlane) {
+	if dp == nil {
+		d.dpCell.Store(nil)
+		return
+	}
+	v := reflect.ValueOf(dp)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map,
+		reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		if v.IsNil() {
+			d.dpCell.Store(nil)
+			return
+		}
+	}
+	d.dpCell.Store(&dpSlot{v: dp})
+}
+
 func (d *Daemon) applyResult() *dataplane.ApplyResult {
 	if d == nil {
 		return nil
 	}
-	return dataplane.LastApplyResultOf(d.dp)
+	return dataplane.LastApplyResultOf(d.dataplane())
 }
 
 // CompileHealth is a snapshot of dataplane compile health (#758).

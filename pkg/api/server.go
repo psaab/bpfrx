@@ -848,7 +848,8 @@ func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
 // The swap reaches every LIVE leg at once (they read s.auth through their slots)
 // and reaches each RETIRING leg only as a TIGHTENING (#5561 round 14). A leg
 // that a reconcile replaced is still accepting and serving for the width of its
-// bounded drain, and the address it is serving is one the committed config asked
+// drain (whose width is not a fixed bound — see legDrainTimeout), and the
+// address it is serving is one the committed config asked
 // to leave: a revocation must still land there, a grant must not, and a nil must
 // not — the clamp that licenses a nil was evaluated against the address the
 // commit BOUND, not the one it retired.
@@ -890,6 +891,39 @@ func (s *Server) HTTPHandlerForTest() http.Handler {
 		return nil
 	}
 	return s.httpLeg.srv.Handler
+}
+
+// HTTPSLegDrainedForTest reports whether the installed HTTPS leg has finished
+// its EXIT PATH AND ITS DRAIN — the listener is gone and every connection it
+// accepted has been finished or severed, hijacked connections excepted (Go
+// excludes those from both Shutdown and Close; see drainLeg). False when no leg is installed.
+// Test-only, and specifically a CROSS-PACKAGE precondition helper (#6827 round
+// 7).
+//
+// It does NOT report that the serve goroutine has returned (#6827 round 8). The
+// goroutine's defers run LIFO, so `drained` is stored BEFORE `wg.Done`, and a
+// caller can observe true inside that window. That is the right granularity for
+// a precondition — the drain is what the caller is waiting on — but a test that
+// needs the goroutine itself to be gone must use Server.Wait.
+//
+// It exists because a test that arranges a dead leg needs to know the exit path
+// has run, and the obvious way to ask — polling HTTPSServing() until it goes
+// false — reads `dead`, which is the flag such a test is usually there to bind.
+// A mutation that stops `dead` being stored then hangs the poll until its
+// deadline and the cell reds at the SETUP rather than at its own assertion:
+// evidence that the precondition is load-bearing, not that the property is
+// bound. `drained` is stored unconditionally by the goroutine's defer on every
+// exit path, so it answers "has the exit happened" without consulting anything
+// under test.
+//
+// Server.Wait is the better barrier where it applies (it joins deterministically
+// rather than polling), but it joins EVERY leg, so a caller whose server also
+// has a live HTTP leg — the shape the daemon reconciler always has — cannot use
+// it and needs this.
+func (s *Server) HTTPSLegDrainedForTest() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpsLeg != nil && s.httpsLeg.drained.Load()
 }
 
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
@@ -953,9 +987,31 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, 
 }
 
 // serveBound serves already-bound listeners until ctx is cancelled or a listener
-// terminates with an error, then shuts BOTH down under a bounded 5s drain and
-// joins both serve goroutines before returning (#5058 lifecycle, extracted for
-// the #5866 Start/Run split).
+// terminates with an error, then DRAINS both (drainLeg: graceful Shutdown, then
+// force-close what the deadline did not finish) and joins both serve goroutines
+// before returning (#5058 lifecycle, extracted for the #5866 Start/Run split).
+//
+// It goes through drainLeg rather than calling Shutdown itself (#6827 round 10).
+// It used to hold the exact shape drainLeg exists to fix — a bare Shutdown that
+// returns at its deadline and LEAVES an in-flight response streaming — which
+// made pkg/api/README.md's package-wide drain invariant false about this
+// function and left the shape here for the next reader to copy. This path is
+// test-only today (Server.Run has no production caller; the daemon uses
+// NewServer + Start), so the change is cheap, but "no caller today" is not a
+// reason to ship the defect.
+//
+// One behavioural consequence worth stating: this path now drains the way the
+// rest of the package does, and that shape has NO wall-clock ceiling. The old
+// code ran a bare Shutdown on each server under ONE shared 5s context and never
+// reached a Close phase at all; each server now gets its own legDrainTimeout
+// AND the severing Close behind it. That is not "5s for both" becoming "5s
+// each": legDrainTimeout is a POLL deadline, and both phases put serial
+// per-connection closes in front of it — on an HTTPS leg each close_notify
+// carries a five-second write deadline of its OWN, so one stalled peer costs up
+// to five seconds, then the next, in each phase of each server. The worst case
+// grows with the number of such connections and has no fixed ceiling;
+// legDrainTimeout's comment is the authority on why. legDrainTimeout is also
+// the knob a test can shorten.
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.
@@ -991,16 +1047,16 @@ func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) e
 	case <-ctx.Done():
 	}
 
-	// Shut down BOTH servers regardless of which path woke us. Shutdown closes
-	// the listener and unblocks the matching Serve goroutine with
-	// http.ErrServerClosed; join both so no goroutine outlives Run.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Drain BOTH servers regardless of which path woke us. Shutdown closes the
+	// listener and unblocks the matching Serve goroutine with
+	// http.ErrServerClosed; join both so no goroutine outlives Run. The
+	// Shutdown error is still what gets reported — a drain that had to sever is
+	// visible as a deadline error here, exactly as before.
 	var shutErr error
 	if s.httpsServer != nil {
-		shutErr = s.httpsServer.Shutdown(shutdownCtx)
+		shutErr = drainLeg(s.httpsServer)
 	}
-	if err := s.httpServer.Shutdown(shutdownCtx); err != nil && shutErr == nil {
+	if err := drainLeg(s.httpServer); err != nil && shutErr == nil {
 		shutErr = err
 	}
 	wg.Wait()
@@ -1105,6 +1161,26 @@ func bindHostWarnable(bindHost string) bool {
 	return true
 }
 
+// hostnameSANWarnable reports whether the CURRENT kernel host name is an
+// identity worth warning about when a loaded on-disk cert does not cover it.
+//
+// It layers one extra condition on bindHostWarnable: the host name must be one
+// a re-mint COULD actually put in the SANs. generateSelfSignedCertAt
+// deliberately DROPS a non-ASCII / malformed host name from DNSNames rather
+// than hard-failing x509.CreateCertificate (see isDNSSANSafeHostname), so such
+// a name is uncoverable BY DESIGN — warning about it every reload would be
+// permanent noise advising a re-mint that cannot fix anything. An IP-literal
+// host name is warnable because it lands in IPAddresses.
+func hostnameSANWarnable(h string) bool {
+	if !bindHostWarnable(h) {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true // IP-literal host name → IPAddresses SAN
+	}
+	return isDNSSANSafeHostname(h)
+}
+
 // certCoversHost reports whether leaf's SANs cover host under the SAME strict
 // hostname check a remote TLS client applies: an IP-literal host must appear in
 // the cert's IPAddresses SANs, any other host in its DNSNames SANs (a CN-only
@@ -1113,6 +1189,311 @@ func bindHostWarnable(bindHost string) bool {
 // verifying the connection by host will reject the served cert.
 func certCoversHost(leaf *x509.Certificate, host string) bool {
 	return leaf.VerifyHostname(host) == nil
+}
+
+// certHasNoSANs reports whether leaf carries NO subjectAltName usable for
+// hostname verification — neither a DNS name nor an IP address. Such a
+// certificate covers NOTHING: every modern client (Go since 1.15, browsers,
+// curl) refuses to fall back to the legacy CommonName, so BOTH
+// `https://localhost` and `https://127.0.0.1` fail against a CN-only cert.
+//
+// The per-identity checks below cannot see this: their warnable predicates gate
+// out loopback and "localhost" on the assumption that the durable cert always
+// carries the loopback SANs. That assumption holds for a cert THIS mint path
+// produced, but the load path accepts whatever is on disk — a pair persisted by
+// an older build, or placed by an operator, can have no SAN extension at all,
+// and then the whole diagnostic goes silent on the most broken cert possible
+// (#6827). Other SAN forms (email, URI) are irrelevant here: VerifyHostname
+// consults only DNSNames and IPAddresses.
+func certHasNoSANs(leaf *x509.Certificate) bool {
+	return len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0
+}
+
+// hostNameEvidence tells the host-name diagnostic HOW the caller learned the
+// kernel host name, which decides how much benefit of the doubt that name gets
+// as a management ACCESS identity (#6827).
+type hostNameEvidence int
+
+const (
+	// hostNameInferred — a certificate (re)load read the kernel host name off
+	// the running system (boot, or an HTTPS enable/rebind). Nothing there proves
+	// an operator ever connects by that name, so hostNameLikelyAccessIdentity's
+	// heuristic applies.
+	hostNameInferred hostNameEvidence = iota
+	// hostNameOperatorSet — the operator's own `set system host-name` commit
+	// JUST moved the kernel host name (Daemon.applyHostname →
+	// Server.WarnStaleMgmtCertForHostName). The name is the identity they
+	// deliberately chose for this device, reported at the moment they chose it,
+	// so it is diagnosed unconditionally: this is the one call site where "is
+	// this an access identity?" has a real answer rather than a heuristic.
+	hostNameOperatorSet
+)
+
+// hostNameLikelyAccessIdentity reports whether the kernel host name is PLAUSIBLY
+// a management access identity, judged from the SANs the loaded cert already
+// carries. It exists so the diagnostic stops crying wolf (#6827): a box named
+// `fw` whose cert covers `mgmt.example.com` and its management IP is reachable
+// and strictly verifiable at every URL actually in use, and telling that
+// operator to re-mint churns remote clients' TOFU pins to fix nothing. A
+// diagnostic that fires on a healthy box gets muted, and the true positive dies
+// with it.
+//
+// THE RULE, and why the cert's own SANs are the best evidence available: this
+// package's mint path is the ONLY thing that puts a bare, UNQUALIFIED name into
+// a generated cert, and what it puts there is the kernel host name of the day
+// (the bind host is the other source, and a management bind is an address or a
+// domain-qualified name). So the qualification SHAPE of the cert's DNS SANs
+// tells us which naming scheme this device's TLS identity follows:
+//
+//   - an unqualified DNS SAN (`old-fw`) next to an unqualified kernel host name
+//     means the TLS identity IS the kernel name, and it has drifted — diagnose;
+//   - a qualified DNS SAN (`mgmt.example.com`) next to an unqualified kernel
+//     host name means the TLS identity is domain-scoped and INDEPENDENT of the
+//     short kernel name, which was therefore never an access identity — silent;
+//   - a cert with no non-loopback DNS SAN at all was never minted for name-based
+//     access — silent.
+//
+// An IP-literal kernel host name is judged the same way against IP SANs:
+// address-based access is evidenced by a non-loopback IP SAN.
+//
+// The heuristic is deliberately NOT applied to hostNameOperatorSet. It is a
+// heuristic precisely because a cert load has no way to know what an operator
+// types; a rename does know, and it is also the one moment the operator is
+// watching the commit output.
+//
+// KNOWN RESIDUAL, weighed and accepted rather than missed. A rename that also
+// CHANGES the naming shape (`old-fw` → `newfw.example.com`, or the reverse) is
+// diagnosed at the commit — the rename path skips this function — but never on
+// a later boot, because from then on the load path sees a shape mismatch and
+// stays quiet. Two states reach that boot with no commit-time diagnosis behind
+// them, and only the first is about old boxes:
+//
+//   - a box ALREADY drifted before this diagnostic shipped never had a commit
+//     to catch it;
+//   - on a box RUNNING this build, the commit's diagnosis is a PROCESS-LOCAL
+//     debt (Daemon.staleCertPending, pkg/daemon), and a restart discards
+//     whatever is still owed. A cross-shape rename reaches that restart
+//     undelivered whenever no delivery between the rename and the shutdown
+//     found a served certificate. The ways in are more than the obvious one and
+//     worth naming, because each is an ordinary configuration rather than a
+//     fault: HTTPS disabled; its bind failed; the HTTPS serve loop terminated
+//     and no later commit rebuilt it (the rebuild itself is #6827 round 6 — the
+//     dead leg used to be unrecoverable, so this was permanent rather than
+//     merely pending); the API disabled entirely (--api-addr empty, so there is
+//     no reconciler to deliver through); the boot HTTP start failed; the kernel
+//     name could not be read at any delivery; or startup aborted on a signal
+//     (#5807) after the phase-4 config apply but before the management server
+//     was built. Enabling `web-management https` after the restart then reaches
+//     only the load path, which declines the shape.
+//
+// So the gap needs a rename that crossed the qualified/unqualified boundary AND
+// either pre-dating drift or a debt that did not survive a restart. It is the
+// rename path, not this function, that catches the ordinary case, and
+// shape-PRESERVING drift — unqualified → unqualified, including the worked
+// `old-fw` → `new-fw` — is still caught on every boot by this one.
+//
+// Closing either half costs the same mechanism and is declined for the same
+// reason: a boot-after-upgrade sweep needs upgrade-scoped persistent state (a
+// marker file or version stamp), and a debt that outlives a restart needs the
+// pending flag persisted plus an invalidation story for a name that changed
+// again while the daemon was down. Both then fire on exactly the boxes where
+// this function cannot tell whether the name is in use, reintroducing the false
+// positive at the least convenient moment. Not worth the mechanism; recorded
+// here so the next reader knows the choice was made deliberately.
+func hostNameLikelyAccessIdentity(leaf *x509.Certificate, hostName string) bool {
+	if net.ParseIP(hostName) != nil {
+		for _, ip := range leaf.IPAddresses {
+			if !ip.IsLoopback() && !ip.IsUnspecified() {
+				return true
+			}
+		}
+		return false
+	}
+	qualified := strings.Contains(hostName, ".")
+	for _, n := range leaf.DNSNames {
+		if strings.EqualFold(n, "localhost") {
+			continue // always minted; carries no evidence either way
+		}
+		if strings.Contains(n, ".") == qualified {
+			return true
+		}
+	}
+	return false
+}
+
+// warnStaleLoadedCert emits a diagnostic for every management identity the
+// LOADED durable cert fails to cover. The cert is served AS-IS (#1916 D6: a
+// re-mint would churn remote clients' TOFU pins), so this is the ONLY signal an
+// operator gets that strict remote verification will fail (#5719 C001).
+//
+// TWO identities are baked into the cert at first generation and BOTH can go
+// stale independently:
+//
+//   - the HTTPS listener bind host — stale after an A→B `web-management https
+//     interface` rebind;
+//   - the kernel host name — stale after `set system host-name`, which the
+//     durable cert does NOT re-mint for. Before this check that half was
+//     entirely SILENT: an operator connecting by the new host name got a bare
+//     "certificate is not valid for any names" with nothing in the log, even
+//     though the bind host was still covered so the bind-host warning never
+//     fired.
+//
+// The leaf is parsed ONCE and every check shares it. A parse failure or an empty
+// chain is not reported here — the caller still serves the pair it loaded, and
+// this function's contract is diagnostics only, never a serving decision.
+//
+// This is only ONE of the two entry points. A `set system host-name` commit does
+// NOT reload the certificate (the HTTPS leg rebinds only on a TLS/bind change),
+// so the rename half of the diagnostic reaches the operator through
+// Server.WarnStaleMgmtCertForHostName instead (#6827).
+func warnStaleLoadedCert(cert tls.Certificate, bindHost string) {
+	if len(cert.Certificate) == 0 {
+		return
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return
+	}
+	hostName, _ := tlsHostname()
+	if warnCertNoSANs(leaf, bindHost, hostName) {
+		return
+	}
+	warnStaleBindHost(leaf, bindHost)
+	warnStaleHostName(leaf, hostName, bindHost, hostNameInferred)
+}
+
+// warnCertNoSANs emits the terminal "this certificate covers nothing"
+// diagnostic and reports whether it fired. It is terminal by design: when the
+// leaf has no SANs at all, the per-identity warnings below would each report
+// "does not cover X" for a cert that covers no X whatsoever, which buries the
+// actual finding under a list of symptoms.
+func warnCertNoSANs(leaf *x509.Certificate, bindHost, hostName string) bool {
+	if !certHasNoSANs(leaf) {
+		return false
+	}
+	slog.Warn("loaded management TLS cert carries NO subjectAltName, so it covers NOTHING — every modern client rejects it for every host name and address (CommonName is not consulted) — remove /etc/xpf/tls to re-mint",
+		"cert_common_name", leaf.Subject.CommonName,
+		"bind_host", bindHost,
+		"host_name", hostName)
+	return true
+}
+
+// warnStaleBindHost warns when the loaded cert does not cover the HTTPS
+// listener's own bind host. The bind host needs no plausibility test: the
+// operator configured the listener to answer there, so it is an access identity
+// by construction.
+func warnStaleBindHost(leaf *x509.Certificate, bindHost string) {
+	if !bindHostWarnable(bindHost) || certCoversHost(leaf, bindHost) {
+		return
+	}
+	slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
+		"bind_host", bindHost,
+		"cert_dns_sans", leaf.DNSNames,
+		"cert_ip_sans", leaf.IPAddresses)
+}
+
+// warnStaleHostName warns when the loaded cert does not cover the kernel host
+// name. Unlike the bind host, the kernel name is only SOMETIMES an access
+// identity, so ev + hostNameLikelyAccessIdentity gate it (#6827) and the message
+// is conditional rather than a bare instruction to re-mint: the SANs it prints
+// are exactly the identities the cert DOES cover, so an operator who reaches the
+// box by one of those can dismiss it in a single read.
+func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hostNameEvidence) {
+	if !hostnameSANWarnable(hostName) || hostName == bindHost {
+		return // uncoverable by any re-mint, or already reported as the bind host
+	}
+	if ev == hostNameInferred && !hostNameLikelyAccessIdentity(leaf, hostName) {
+		return
+	}
+	if certCoversHost(leaf, hostName) {
+		return
+	}
+	slog.Warn("loaded management TLS cert does not cover the current host-name; clients verifying by host-name will fail — if this device is reached by host-name, remove /etc/xpf/tls to re-mint (the SANs below are the identities it does cover)",
+		"host_name", hostName,
+		"cert_dns_sans", leaf.DNSNames,
+		"cert_ip_sans", leaf.IPAddresses)
+}
+
+// WarnStaleMgmtCertForHostName re-runs the stale-certificate diagnostic against
+// the certificate the LIVE HTTPS leg is serving, for an EXPLICITLY supplied
+// kernel host name (#6827).
+//
+// A `set system host-name` commit reaches it through the daemon, but NOT
+// synchronously: Daemon.applyHostname records a debt and the daemon's delivery
+// path (renameHostNotingStaleMgmtCert → deliverStaleMgmtCertDiagnosis) makes the
+// call — at the rename when a certificate is already being served, and
+// otherwise at whichever later retry point first finds one. The name it passes
+// is read from the kernel at that moment, so this function is handed a live
+// identity rather than one captured at commit time.
+//
+// It exists because the load-path diagnostic could never see a rename. Two
+// independent reasons, and a fix for either alone is not enough:
+//
+//  1. REACHABILITY. warnStaleLoadedCert runs only while a certificate is being
+//     loaded, and the HTTPS leg is rebuilt only when the TLS flag or the HTTPS
+//     bind address changes (managementReconciler.reconcileTo). A plain
+//     `set system host-name new-fw` on an unchanged bind reloads nothing, so the
+//     appliance stayed silent until the next restart or HTTPS rebind — the exact
+//     case the host-name check was written for.
+//  2. ORDERING. The management reconcile runs EARLY in applyConfigLocked (before
+//     the dataplane apply, so a credential revocation lands even on an aborting
+//     commit) while the kernel host name is set late, in the apply tail. So even
+//     a commit that DID change the HTTPS bind would have diagnosed the OLD
+//     kernel name. Taking the name as a PARAMETER moves the read out of this
+//     function, which has no idea where in an apply it is running, and into the
+//     daemon, which does: it reads the kernel only after Sethostname has
+//     returned, and a delivery whose rename has since been superseded abandons
+//     before it gets here (pkg/daemon deliverStaleMgmtCertDiagnosis).
+//
+// It returns whether it actually reached a certificate — false means no live
+// HTTPS leg was serving, so the question could not be answered and the CALLER
+// still owes the diagnosis (#6827). Returning false is NOT "nothing was wrong":
+// the durable certificate on disk outlives the listener, so a host name that
+// went stale while HTTPS was down is still stale when HTTPS comes back.
+//
+// It deliberately reads the LIVE leg only, never the s.httpsServer construction
+// template, which survives a TLS disable and would otherwise produce warnings
+// about a certificate nobody serves.
+//
+// "Live" is listenerLeg.serving(), not a non-nil pointer (#6827). A leg whose
+// serve loop exited unexpectedly stays INSTALLED in s.httpsLeg with only its
+// `dead` flag set, and a leg retiring under a requested shutdown is still
+// installed while it drains — diagnosing either would report a certificate that
+// no socket is presenting, which is the same false positive the construction
+// template was rejected for.
+func (s *Server) WarnStaleMgmtCertForHostName(hostName string) bool {
+	s.lifeMu.Lock()
+	var srv *http.Server
+	if s.httpsLeg.serving() {
+		srv = s.httpsLeg.srv
+	}
+	s.lifeMu.Unlock()
+	if srv == nil || srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+		return false
+	}
+	cert := srv.TLSConfig.Certificates[0]
+	if len(cert.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		// A live leg is serving a certificate we cannot parse. The question WAS
+		// reached; re-parsing it later will fail identically, so report it
+		// answered rather than making the caller retry forever.
+		return true
+	}
+	bindHost := ""
+	if h, _, err := net.SplitHostPort(srv.Addr); err == nil {
+		bindHost = h
+	}
+	if warnCertNoSANs(leaf, bindHost, hostName) {
+		return true
+	}
+	// Only the host name is diagnosed here: the bind host did not change, so a
+	// stale one was already reported when the leg last bound, and repeating it on
+	// every rename is noise.
+	warnStaleHostName(leaf, hostName, bindHost, hostNameOperatorSet)
+	return true
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate
@@ -1144,24 +1525,16 @@ func generateSelfSignedCertAt(dir, certPath, keyPath, bindHost string) (tls.Cert
 	// first and errors on a key-only / mismatched state → falls through to
 	// regen, which restores a matching pair.
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: bindHost is
-		// deliberately NOT baked into a reload, so an A→B management-IP rebind
-		// keeps the original cert rather than churning remote clients' TOFU
-		// pins. But if the loaded cert's SANs do not cover the current bind
-		// host, strict remote verification by that host will silently fail —
-		// warn loudly (naming the bind host and the cert's SANs) so an operator
-		// can re-mint (remove /etc/xpf/tls) instead of chasing a silent
-		// verification failure. Re-minting here would violate the durable
-		// contract, so this is diagnostic only (#5719 C001 residual).
-		if bindHostWarnable(bindHost) {
-			if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil &&
-				!certCoversHost(leaf, bindHost) {
-				slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
-					"bind_host", bindHost,
-					"cert_dns_sans", leaf.DNSNames,
-					"cert_ip_sans", leaf.IPAddresses)
-			}
-		}
+		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: neither the
+		// bind host NOR the kernel host name is re-baked on a reload, so an A→B
+		// management-IP rebind or a later `set system host-name` keeps the
+		// original cert rather than churning remote clients' TOFU pins. But a
+		// SAN the cert no longer covers makes strict remote verification fail
+		// silently — warn loudly (naming the uncovered identity and the cert's
+		// SANs) so an operator can re-mint (remove /etc/xpf/tls) instead of
+		// chasing a bare handshake failure. Re-minting here would violate the
+		// durable contract, so this is diagnostic only (#5719 C001 residual).
+		warnStaleLoadedCert(cert, bindHost)
 		return cert, nil
 	}
 

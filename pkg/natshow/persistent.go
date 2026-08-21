@@ -10,14 +10,32 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// persistentNATTable resolves the persistent-NAT table ONCE.
+//
+// #2114/#6743-F2: the daemon hands these renderers a live indirection
+// whose GetPersistentNAT() performs a fresh cell load per call, so the
+// old `dp.GetPersistentNAT() == nil` check followed by a second
+// `dp.GetPersistentNAT().All()` was a check-then-use across two distinct
+// resolutions — a setDataplane(nil) in between nil-dereferenced. One
+// resolution bound to a local removes the window; the pointer is then
+// live for the render, bounded by the #6741 lifetime gap.
+func persistentNATTable(dp Reader) *dataplane.PersistentNATTable {
+	if dp == nil {
+		return nil
+	}
+	return dp.GetPersistentNAT()
+}
+
 // RenderPersistent renders the persistent-NAT bindings table with
 // remaining timeout per binding.
 func RenderPersistent(w io.Writer, dp Reader) {
-	if dp == nil || dp.GetPersistentNAT() == nil {
+	// #2114/#6743-F2: single resolution — see persistentNATTable.
+	table := persistentNATTable(dp)
+	if table == nil {
 		io.WriteString(w, "Persistent NAT table not available\n")
 		return
 	}
-	bindings := dp.GetPersistentNAT().All()
+	bindings := table.All()
 	if len(bindings) == 0 {
 		io.WriteString(w, "No persistent NAT bindings\n")
 		return
@@ -39,11 +57,13 @@ func RenderPersistent(w io.Writer, dp Reader) {
 // RenderPersistentDetail renders per-binding detail for persistent-NAT
 // bindings, including current session counts per (NAT IP, NAT port).
 func RenderPersistentDetail(w io.Writer, dp Reader) {
-	if dp == nil || dp.GetPersistentNAT() == nil {
+	// #2114/#6743-F2: single resolution — see persistentNATTable.
+	table := persistentNATTable(dp)
+	if table == nil {
 		io.WriteString(w, "Persistent NAT table not available\n")
 		return
 	}
-	bindings := dp.GetPersistentNAT().All()
+	bindings := table.All()
 	if len(bindings) == 0 {
 		io.WriteString(w, "No persistent NAT bindings\n")
 		return
