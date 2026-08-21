@@ -595,6 +595,22 @@ impl PolicyRuleCounter {
         self.packets.load(Ordering::Relaxed)
     }
 
+    /// #6304 (test-only): the shared byte total. Needed to bind the `packet_bytes`
+    /// ARGUMENT at a call site, not merely that some packet was counted — the
+    /// flow-cache-hit replay passes `meta.pkt_len`, and a call site that passed a
+    /// stripped or zero length would still advance `test_packet_count`.
+    ///
+    /// The struct doc's "do not assert an exact `bytes == packets * frame_len`
+    /// relationship on one instantaneous snapshot" is a CONCURRENT-reader
+    /// caveat: the two fields are separate atomics, so a monitor sampling a live
+    /// counter can catch the pair mid-update. A single-threaded test that
+    /// records a known number of packets and reads afterwards observes both
+    /// increments, so the exact relationship holds there.
+    #[cfg(test)]
+    pub(crate) fn test_byte_count(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
     /// #3395: the stable rule identity this counter belongs to (empty for a
     /// `Default` placeholder). See the `rule_id` field doc.
     pub(crate) fn rule_id(&self) -> &str {

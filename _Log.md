@@ -1,3 +1,753 @@
+## 2026-08-05 — #6304: bind the LIVE mirror call site in stage_flow_cache_hit (salvage + independent verification)
+
+- **Timestamp**: 2026-08-05 (fix/6304-mirror-callsite-bound-sv)
+- **Action**: Salvage verification. The implementing lane was killed mid-task by
+  a spend limit with its work complete but uncommitted; it was committed as-is
+  at `02ffefd5d` and is rebased here onto `86927d23c`. The SALVAGE COMMIT
+  rewrote nothing — that diff is the dead lane's, re-verified firsthand end to
+  end, plus the doc update it missed. The rounds after it did rewrite:
+  `02ffefd5d..0938e5913` changes `flow_cache_hit_tests.rs` by +468/-1 (the
+  UMEM-aliasing fidelity fix and two added tests), and the fold round at the
+  foot of this entry replaces the file outright. An earlier revision of this
+  paragraph said "Nothing was rewritten" unqualified, which read as a claim
+  about the PR as a whole rather than about the salvage commit.
+  The gap: the #6114 sample-before-CAS tests reach the shared
+  `sample_then_admit_mirror_clone` (`mirror/resolver.rs`) through
+  `enqueue_sampled_mirror_clone_to_live`, a wrapper that is DEAD in non-test
+  builds. The LIVE call site is inside `stage_flow_cache_hit`
+  (`poll_descriptor/flow_cache_hit.rs`), and `stage_flow_cache_hit` had no test
+  reference anywhere in the tree — so a revert of the live call site alone,
+  leaving the helper correct, was invisible. Classic unit-bound /
+  call-site-unbound. `flow_cache_hit_tests.rs` drives `stage_flow_cache_hit`
+  itself: a hairpin in-place-rewrite cached flow with a cross-worker mirror
+  target whose clone queue is at its cap, and a NON-sampled packet (rate=2,
+  counter=1). Two positive controls assert the in-place rewrite actually
+  succeeded, because the mirror result is recorded only inside that branch — a
+  fixture whose rewrite silently failed would read 0 drops under both the
+  correct and the reverted call site.
+  Completeness sweep beyond the issue's ask: `sample_then_admit_mirror_clone`
+  has exactly two callers (the dead wrapper, and the now-bound live site), and
+  the second live copy of the ordering — `enqueue_sampled_mirror_clone`'s
+  cross-worker arm, which inlines the sampler rather than calling the helper —
+  is separately bound, proven by mutation rather than by reading.
+  Round 2 (gate M1): the salvaged lane ported ONE of #6114's TWO fail-on-revert
+  tests. Its fixture pins `mirror_sample_counter = 1` at `rate = 2`, so
+  `MirrorSampleAdmission::NotSampled` short-circuits and everything downstream
+  of `Sampled(..)` at the live site stayed unbound — the SELECTED arm, which the
+  same thesis condemns. Two companions close it, and the second was NOT
+  redundant: the gate's prescribed test (SELECTED + FULL queue) is green under
+  `Sampled(Ok(_)) => None`, because a full queue never yields `Ok`. Verified
+  before adopting the prescription rather than after. The admitted-clone test
+  also turns the mirror WIRING into a standing assertion: the non-sampled test
+  asserts the drop counters are ZERO, so nothing in it depends on the target
+  being present, cross-worker, or full — a `MirrorTargetMap` re-keying would
+  leave it passing and binding nothing. A "right reason" that lives only in a
+  mutation transcript is not maintained by anything.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs (new),
+  docs/userspace-dataplane-gaps.md, _Log.md
+- **Validation**: every cell run in `/var/tmp/sv6304` with
+  `CARGO_TARGET_DIR=/dev/shm/ct-sv6304 TMPDIR=/dev/shm`; the tree was restored
+  byte-clean (md5 + empty `git status --porcelain`) after each mutation.
+  - `cargo check --release --tests` at HEAD -> rc=0
+  - baseline `cargo test --release --no-fail-fast -- --test-threads=1` -> rc=0,
+    0 FAILED across all 7 binaries (4234 + 60 + 8 + 22 + 31 + 1 + 2 passed)
+  - `go build ./...` -> rc=0; `go test ./...` -> rc=0, 0 FAIL, 59 ok
+    (includes `pkg/refactoraudit`, which the +9-line growth of
+    `flow_cache_hit.rs` could otherwise trip)
+  - DEADNESS (behavioural, not grep): drop the
+    `#[cfg_attr(not(test), allow(dead_code))]` from
+    `enqueue_sampled_mirror_clone_to_live` and `cargo build --release` ->
+    "warning: function `enqueue_sampled_mirror_clone_to_live` is never used".
+    The issue's premise holds; the wrapper has no production caller.
+  - FAIL-ON-REVERT (live call site only — `flow_cache_hit.rs` restored to its
+    exact pre-#6114 form from `1810cb7e7^`, `resolver.rs` untouched; #6114
+    LANDED in `1810cb7e7`, so that commit already carries the sample-first
+    `sample_then_admit_mirror_clone` call and it is its PARENT that holds the
+    old `admit_mirror_clone_to_live` form — an earlier revision of this entry
+    named the commit itself):
+    `cargo check --release --tests` -> rc=0 (compiles; not a build break, 0
+    `^error[` lines), then `cargo test` -> rc=101 with
+    `live_flow_cache_callsite_nonsampled_does_not_reserve_full_queue_6304`
+    FAILED on `assertion left == right failed: #6304: a NON-sampled packet on
+    the LIVE flow-cache path must not reserve the full clone queue ... left: 1
+    right: 0`. `left: 1` also proves the fixture genuinely reaches
+    `admit_mirror_clone_to_live` on a FULL cross-worker target (a mis-wired
+    target would have recorded NoBinding, not QueueFullCrossWorker).
+  - ISOLATION CONTROL (the load-bearing cell) — AS MEASURED IN ROUND 1, when
+    this file held ONE test: under that SAME revert, run with `--no-fail-fast`
+    over every binary -> exactly ONE failure tree-wide, the new test.
+    `flow_cache_nonsampled_does_not_reserve_full_queue_6114` and
+    `sampled_live_mirror_queue_full_advances_sampler_for_selected_6114` both
+    stayed `ok`. The pre-existing suite could not catch this mutation.
+    SUPERSEDED COUNT: with the round-2 companions present the same revert reds
+    TWO tests, per the matrix below — the "exactly one" is a round-1 artifact of
+    there being only one test, not a claim about this head.
+  - RE-EXPRESSION CONTROL: hand-inline the shared helper at the live call site
+    (same ordering, same deferred counter commit, no
+    `sample_then_admit_mirror_clone` call) -> rc=0, 0 FAILED. The test binds the
+    invariant, not the helper call.
+  - SWEEP CONTROL: flip `enqueue_sampled_mirror_clone`'s cross-worker arm
+    (`mirror/fast_path.rs`) to admit-before-sample -> rc=101,
+    `cross_worker_nonsampled_does_not_reserve_full_queue_5167` and
+    `cross_worker_sampled_reports_queue_full_5167` FAILED on assertions. The
+    other live copy of the ordering is already bound; there is no second
+    unbound site.
+  Round-2 mutation matrix (each `cargo check --release --tests` rc=0 first, so
+  every red is an assertion; each row is a full `--no-fail-fast` run over all 7
+  binaries, and the listed reds are the COMPLETE tree-wide failure set):
+  | mutation at the live call site | nonsampled | selected+full | selected+admitted | #6114 |
+  |---|---|---|---|---|
+  | A pre-#6114 revert (`1810cb7e7`) | RED | RED | green | GREEN |
+  | B commit counter on NotSampled/Sampled(Ok), not Sampled(Err) | green | RED | green | GREEN |
+  | C `Sampled(Ok(_)) => None` | green | green | RED | GREEN |
+  | D capture `mirror_frame` AFTER the rewrite (pure code motion) | green | green | RED | GREEN |
+  Row D is round-3 and was GREEN in every column until the fixture was fixed —
+  see the aliasing note below.
+  Coverage honesty, so a later reader does not mistake this for redundancy and
+  delete a test: the SALVAGED non-sampled test is never the SOLE detector in any
+  row — row A also reds `selected_full`, and rows B/C/D leave it green. It is
+  still not redundant: it asserts a property none of the others do, that a
+  DECLINED packet produces NO shared-CAS side effect at all, which is the actual
+  #5167/#6114 invariant. The others all assert what a SELECTED packet must do.
+  Q5b is the load-bearing row: it escapes BOTH the salvaged test and the gate's
+  prescribed one, and would have shipped a silent total loss of port mirroring
+  on this path. Assertions seen: "a NON-sampled packet ... must not reserve the
+  full clone queue" left 1 right 0; "the SELECTED packet advances the sampler
+  before the full-queue admit fails" left 0 right 1; "a SELECTED packet whose
+  cross-worker target has room must have its clone enqueued" left 0 right 1.
+  The #6114 isolation control held GREEN in every row.
+  Pre-existing failure, attributed not dismissed: one full-suite run at machine
+  load ~35 reddened
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  ("readers must have validated at least one snapshot (test not vacuous)",
+  `shared_cos_lease_tests.rs:2496`) — a CPU-starvation liveness assertion, from
+  the SAME unrebuilt binary that had already passed it three times. Attributed
+  at like-for-like scope (full suite, alternating arms) against a detached
+  `origin/master@86927d23c` worktree: 4/4 clean on each arm at load 17-26; under
+  32 synthetic spinners (load 42-50) it fails on MASTER with the identical
+  assertion and line, and master's second loaded run failed instead on
+  `afxdp::wg::engine::engine_internal_tests::install_session_serializes_with_reconcile_removal`
+  ("reconcile loop must have completed at least one full add/remove cycle") —
+  the known parallel-unsafe WG engine family. Same class, both reproduce on
+  master, neither is reachable from this diff (two .md files over a test-only
+  change in `poll_descriptor/`).
+  Round 3 (gate item 1) — an assertion that was true for free. `clone.bytes ==
+  frame` ("the clone carries the full L2 frame verbatim") could not fail as
+  originally written. At the live site the clone is captured BEFORE the in-place
+  rewrite, and in production `packet_frame` ALIASES the UMEM
+  (`poll_descriptor/mod.rs`: `unsafe { &*area }.slice(desc.addr, desc.len)`),
+  which `apply_rewrite_descriptor` then mutates — so the capture-before-rewrite
+  ordering is load-bearing. The fixture had passed the heap `frame` as
+  `raw_frame` while the UMEM copy lived at offset 4096: two different objects,
+  so the assertion held either way. Measured, not argued — mutation D (move the
+  `mirror_frame` capture inside the `if let Some(rewrite_result)` block; pure
+  code motion) compiled rc=0 and the FULL serial suite was rc=0 with zero
+  failures. In production that ships a TTL-63, checksum-adjusted copy to the
+  analyzer port instead of the ingress copy, silently and forever.
+  Fixed by giving all three fixtures production's aliasing: `raw_frame` is now
+  `area.slice(frame_offset, frame.len())`, a borrow INTO the UMEM, while `frame`
+  stays pristine as the comparison value. Under mutation D the same assertion
+  now reds with the rewrite visible in the bytes — index 22 (TTL) 63 vs 64,
+  index 24 (IPv4 checksum) 1 vs 0.
+  Residual, disclosed not closed: the tests drive `stage_flow_cache_hit`
+  directly, so `poll_descriptor/mod.rs:321` — the wiring of the stage into the
+  per-descriptor poll loop — stays unbound one level up. That is outside #6304's
+  claim, which is the mirror call site INSIDE the stage. Concretely, swapping
+  `&mut binding.mirror_sample_counter` (`mod.rs:326`) for a fresh local would
+  make every flow-cache-hit packet re-sample from 0, so `rate=N` would mirror
+  EVERY packet on this path — an N-fold clone flood — and nothing in the tree
+  would red. The SELECTED-arm residual that stood after round 1 is CLOSED.
+  Fixture note (SUPERSEDED — the fold round below sets `pkt_len: frame.len()`):
+  the claim that `(frame.len() - 14)` is "the verbatim convention of every
+  sibling fixture in this module tree" was WRONG; the tree is MIXED.
+  `frame/prop_tests/strategies.rs:337` uses the full `frame.len()` and
+  `frame/tests_parse_forward_pbr.rs:105` uses `raw_payload.len()`, while
+  `cookie_reply_tests.rs:89`, `reject_reply_tests.rs:56` and
+  `tests_native_gre_ecn.rs` do strip 14. The shim is the authority and stamps
+  the FULL wire length (`packet_len = data_end - data`,
+  `userspace-xdp/src/lib.rs:566`; the reinject path agrees at
+  `coordinator/inject.rs:73`), so the stripped form under-reports every byte
+  counter `pkt_len` feeds — filter/policy/zone counters and the session byte
+  accounting. Immaterial to the mirror admission decision either way, but
+  there is no reason for this module's fixture to carry the wrong one.
+
+## 2026-08-12 — #6304 fold r1: three surviving mutations, and one of them is not observable at all
+
+- **Timestamp**: 2026-08-12 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded the Codex MERGE-NEEDS-MAJOR (PR comment 5275830598). The
+  diff is 9 production lines and ~900 test lines, so the GUARD is the
+  deliverable and a surviving mutation is a blocking defect, not a nit. Three
+  survived; all three are closed, but the first is closed differently than the
+  brief assumed and that difference is the important part of this entry.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+  (rewritten), `userspace-dp/src/afxdp/mirror/mod_tests.rs` (+registration
+  canary), `_Log.md`. NO production file changed — `flow_cache_hit.rs` is
+  byte-identical to the pre-fold head.
+
+  1. NON-SAMPLED FIXTURE WAS AT CAP, so its "no shared-CAS side effect"
+     assertion passed for the wrong reason: `try_acquire_pending_tx_admission`
+     (`binding_state/tx_inbox.rs:157-165`) returns `Err` from its RELAXED
+     `admitted >= admission_cap` load BEFORE reaching the
+     `compare_exchange_weak(AcqRel)`, so at cap no CAS is reachable no matter
+     what the call site does. Fixture now has ROOM, and asserts the target's
+     queue is untouched and `mirrored_packets == 0`.
+
+     But giving it room does NOT make the named mutation red, and this was
+     MEASURED rather than argued. Inlining `admit_mirror_clone_to_live` above
+     the sampler and discarding the reservation when the sampler declines is
+     FUNCTIONALLY INERT: the reservation is taken with an AcqRel CAS and handed
+     straight back by `PendingTxAdmission::drop`, so no counter, no queue, no
+     frame, and not even the sampler counter differs. Applied to the tree, that
+     mutation compiles and leaves every behavioural test in the module green —
+     both at cap and with room. #6114 was a shared-cacheline fix, not a
+     correctness fix, so there is no black-box observation that separates the
+     two orderings at this call site.
+
+     **(SUPERSEDED by fold r2 below — the last two sentences of this paragraph
+     are FALSE as written.** The measurement stands: the mutation leaves every
+     single-threaded test green. The CONCLUSION drawn from it does not. The
+     ordering IS observable to a concurrent producer, because the transient
+     reservation elevates the target's `pending_tx_admitted` while it is held.
+     "Nothing differs" was established by walking one invocation to completion,
+     and a state created and destroyed inside a call is invisible to that call
+     by construction. See fold r2.)
+
+     Closed with what CAN be pinned: a source canary asserting the call site
+     reaches the queue through `sample_then_admit_mirror_clone` (the single
+     home of the ordering, itself covered by the #6114 fail-on-revert tests)
+     and never calls `admit_mirror_clone_to_live` directly. Stated in the test
+     doc as a source canary with its limits, not dressed up as a runtime proof.
+
+  2. LIVE WIRING WAS ONLY PARTLY BOUND. Every fixture collapsed logical and
+     physical onto 7 and 22 with no VLAN or interface maps, so two live
+     call-site regressions stayed green. The topology is now distinct
+     throughout: wire VLAN 80 on physical ifindex 6 resolves to logical unit
+     20080 (which is where the mirror config hangs, deliberately NOT duplicated
+     under the physical ifindex — `resolve_mirror_config`'s `.or_else` fallback
+     would otherwise rescue the mutation), and mirror output unit 200 resolves
+     through `forwarding.egress[200].bind_ifindex` to physical XSK port 22
+     (which is what `MirrorTargetMap` is keyed by).
+
+     The ingress frame carries a REAL 802.1Q tag with `l3_offset = 18`. The
+     shim only ever reports a non-zero `ingress_vlan_id` together with
+     `ingress_vlan_present` (`parse_l2`, `userspace-xdp/src/lib.rs:1203-1215`),
+     and the whole dataplane then reads L3 at 18 — a tagged VID over an
+     untagged frame is a meta/frame pair the wire format cannot produce, so it
+     would have been a fixture that binds nothing while looking real.
+
+  3. REWRITE-FAILURE ROLLBACK WAS UNOBSERVED. Sampling and admission run before
+     the rewrite; the sampler commit and clone delivery are deferred until it
+     succeeds. Every prior test required a SUCCESSFUL rewrite, so hoisting the
+     commit above the check passed all of them. New test drives a cache hit
+     where BOTH in-place rewriters decline and asserts the counter stays 0 and
+     the packet falls back to the `PendingForwardRequest` path.
+
+     The decline is an IPv4 IHL of 15 (60 bytes) over a 40-byte L3 payload —
+     the one gate BOTH rewriters share and both apply BEFORE their first UMEM
+     write (`validate_rewrite_descriptor_ipv4` / `validate_generic_rewrite_v4`),
+     so the frame is pristine for the fallback per the #4965/#5466
+     preflight-then-commit contract. A DMA-race port mismatch does NOT work
+     here and the first attempt to use one was wrong: the generic path REPAIRS
+     ports (`restore_l4_tuple_from_meta` / `enforce_expected_ports`) instead of
+     declining, so only the descriptor path would have bailed.
+
+  4. TEST REGISTRATION IS NOW GUARDED, from OUTSIDE the module it guards.
+     Deleting the nine-line `#[cfg(test)] #[path = ...] mod` declaration
+     silently unregisters all of these tests with no build error; a canary
+     inside the module cannot fire because it disappears with it. It lives in
+     `mirror/mod_tests.rs`, registered independently from `mirror/mod.rs:87`.
+
+     **(CORRECTED by fold r2: the declaration is THREE lines, not nine — the
+     comment above it is not part of it. And this round's canary caught only
+     DELETION: rewriting the predicate to `#[cfg(any())]` unregisters the module
+     just as completely and passed. Both fixed below.)**
+
+  MUTATION MATRIX (each applied to production, run, reverted, `git diff` then
+  verified clean; exit codes captured unpiped; every RED confirmed to be an
+  ASSERTION failure, with the only `^error` line being the harness's own
+  "test failed", never a compile break):
+
+  | mutation | result |
+  |---|---|
+  | M1 reserve-before-sample, inlined at the call site | delegation canary RED; 4 behavioural tests GREEN (the mutation is inert) |
+  | M2a `resolve_mirror_config(.., 0)` — drop the VLAN id | 3 RED (admitted-clone, full-queue, non-sampled) |
+  | M2b `config.output_ifindex` passed unresolved | 2 RED (admitted-clone, full-queue); non-sampled + rollback GREEN |
+  | M3 sampler commit hoisted above the rewrite check | 1 RED — exactly the new rollback test; 5 GREEN |
+  | M4 delete the `mod` registration | registration canary RED; the other 5 silently vanish from the run |
+
+  OVER-REACH GUARDS: M3 reds ONE test and leaves the three success-path tests
+  and both canaries green, which is what separates the rollback guard from a
+  restatement of the fix. M2b leaves the non-sampled and rollback tests green.
+  M1 leaves all four behavioural tests green — that is the measurement behind
+  item 1's conclusion, not a gap.
+
+  ALSO FIXED WHILE IN HERE (all four were verified at the source first, and all
+  four claims held): the "on another worker" comment was unfounded —
+  `MirrorTargetMap::insert` (`types/runtime.rs:590-601`) DISCARDS
+  `BindingIdentity.worker_id` and keys on (ifindex, queue_id), so the assertion
+  proves a resolved, full, live queue and now says so; the two `_Log.md`
+  provenance errors corrected in place above (the unqualified "Nothing was
+  rewritten", and `1810cb7e7` -> `1810cb7e7^`); and the `pkt_len` fixture drift
+  corrected to the shim's full wire length.
+
+  STRUCTURE: the three tests each carried their own ~200-line copy of the
+  `WorkerContext` wiring, which is how the mirror maps drifted away from the
+  ifindexes the call site actually resolves. They now share one
+  `LiveCallSiteFixture` + `run_stage`, so adding the fourth test cost ~60 lines
+  instead of ~210 and the topology is defined exactly once.
+
+## 2026-08-13 — #6304 fold r2: the ordering IS observable, and my r1 conclusion was a scope error
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a second Codex MERGE-NEEDS-MAJOR. Four findings plus three
+  claim corrections. Every one was re-measured here rather than taken on trust,
+  because that leg ran without Cargo and without reading the two doc files in
+  the diff — its outcomes were source-derived. All four reproduced.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `userspace-dp/src/afxdp/mirror/mod_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. NO production file changed —
+  `flow_cache_hit.rs` is byte-identical to the pre-fold head (verified with
+  `git diff` after every mutation).
+
+  F1. **THE ORDERING IS OBSERVABLE, AND r1's "functionally inert" was wrong.**
+     Round 1 concluded that reserve-before-sample changes nothing any test can
+     see, added a source canary instead, and recorded the conclusion in the test
+     doc, in `docs/userspace-dataplane-gaps.md`, and in the r1 entry above. The
+     measurement behind it was sound and still reproduces. The inference was a
+     SCOPE error: "no state differs" was established by walking ONE invocation
+     to completion, and a state created and destroyed inside a call is invisible
+     to that call by construction — and visible to anyone racing it. While the
+     transient reservation is held, the target's `pending_tx_admitted` is one
+     higher, so a producer on another worker sees the queue full and its request
+     is DROPPED. `mirror/mod_tests.rs::
+     live_mirror_admission_reserves_slot_against_interleaving_producer` already
+     demonstrates that exclusion. Reserve-first can lose a second producer's
+     clone that sample-first would have admitted — a lost mirror clone, not just
+     bus traffic.
+
+     Both false sentences are corrected in place (test doc, gaps doc, and the r1
+     entry above carries a SUPERSEDED note rather than being rewritten). The
+     `:886` claim that the #6114 tests catch a reserve-before-sample introduced
+     inside the shared helper is corrected too: they catch the HISTORICAL
+     early-return form, not a helper rewritten to reserve first and then
+     suppress on a sampler decline.
+
+     Then the choice Codex put: bind the concurrent case, or label the gap. I
+     LABELLED IT, and bound what is deterministically bindable either side of
+     it. The window is a pair of atomic RMWs entirely inside
+     `stage_flow_cache_hit` with no production hook to synchronise against; a
+     racing-producer test would fail only probabilistically, which is a flake,
+     not a binding. Adding one would have looked like coverage and been worth
+     less than saying so. What IS new and deterministic:
+     `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304`
+     drives the mirror target at a soft cap of exactly ONE slot and uses an
+     interleaving producer as the instrument — after a non-sampled packet and
+     after a declined rewrite the slot must be free; after an ADMITTED clone it
+     must be taken (that cell is the positive control that the cap binds at all,
+     without which the two `is_ok()` cells would be vacuous). It reds on any
+     reservation this call site takes and fails to hand back.
+
+  F2. **THE ROLLBACK FIXTURE WAS NOT PARSER-PRODUCIBLE.** It declared IHL 15
+     (60 bytes) with `total_len` 40 in a 58-byte frame while the metadata put L4
+     at 38; a shim deriving L4 from that header would put it at 78, past the end
+     of the frame. Same domain-parity class the VLAN fixture was caught on in
+     r1 — caught in one place, reintroduced in another.
+
+     Codex's prescribed remedy (rebuild it so metadata and bytes agree) turns
+     out to be IMPOSSIBLE for IPv4, and establishing that is the substance of
+     this item. `parse_ipv4` (`userspace-xdp/src/lib.rs:1236`) does
+     `read_bytes(data, data_end, l3_offset, ihl)?` before deriving `l4_offset`,
+     so a shim-delivered IPv4 packet always satisfies `frame.len() - l3 >= ihl`;
+     `ipv4_declared_l3_end` (`frame/inspect.rs:1156-1160`) then clamps the
+     trimmed payload UP to at least `ihl`. Together those make
+     `l3_payload.len() < ihl` — the only bail gate BOTH rewriters share and
+     apply pre-commit — unreachable for any self-consistent frame the shim can
+     deliver. The other declines are one-sided: the generic path REPAIRS a port
+     mismatch, and it handles non-first fragments the descriptor path bails on.
+
+     So the fixture is relabelled as what it actually is: a frame whose bytes
+     changed AFTER the shim described them (NIC DMA into a recycled UMEM frame)
+     — the hazard `expected_ports` and the #5466/#4965 preflight-then-commit
+     contract exist for, and under which meta/frame disagreement is the DEFINING
+     property, not a defect. `dma_raced_short_ihl_frame` builds it by disturbing
+     exactly one byte of the pristine frame, and the test passes the PRISTINE
+     frame's metadata. The rollback branch is thereby documented as
+     defense-in-depth against a post-parse frame change rather than a hot-path
+     case — which is itself the reason nothing else in the suite covered it.
+
+     The reachability claim is MEASURED, not argued: a new over-reach guard,
+     `live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304`,
+     feeds the SELF-CONSISTENT IHL-15 packet (40 bytes of RFC 791 NOP options,
+     an honest 80-byte datagram, metadata derived from it) and the in-place
+     rewrite SUCCEEDS. The frame builder is now parameterised by option words
+     with `total_len`, frame length and metadata all derived, and `test_meta`
+     computes `l4_offset` from the frame's own IHL instead of hardcoding 38 —
+     the hardcode is what let the metadata detach from the fixture in the first
+     place.
+
+  F3. **THE REGISTRATION CANARY CAUGHT DELETION BUT NOT DISABLING.** Rewriting
+     `#[cfg(test)]` to `#[cfg(any())]` removes the module from every build while
+     leaving both matched substrings in the file. MEASURED: under that edit the
+     r1 canary PASSED (rc=0) and all eight module guards silently stopped
+     compiling. The canary now matches the three-line block CONTIGUOUSLY,
+     `#[cfg(test)]` included, and reds on both edits. (It is still source text,
+     so it pins the declaration's FORM — noted in its doc.)
+
+  F4. **AN UNRELATED PRODUCTION LINE WAS UNBOUND.** `run_stage` built
+     `DebugPollCounters` and dropped it unread, so `telemetry.dbg.forward += 1`
+     / `.tx += 1` could be deleted from EITHER staging arm with the whole module
+     green — an undercounted forward-debug metric on every established-flow
+     cache hit. In scope: the module's remit is this staging function's
+     observable effects. `StageRun` now carries both counters and
+     `live_flow_cache_callsite_accounts_debug_forward_and_tx_6304` asserts them
+     on the in-place arm AND the fallback arm.
+
+  ALSO CORRECTED (claims, no behaviour): the non-sampled test's doc said a call
+  site letting an unsampled packet through to admission "ENQUEUES a real clone"
+  — false, it can drop the admission after sampling declines; it now names the
+  mutation it actually distinguishes and points at the canary for the other.
+  The r1 entry's "nine-line `mod` declaration" is three lines. And the frame
+  fixture was called "well-formed" while both checksum fields are zero: nothing
+  on this path verifies them (both rewriters apply incremental deltas only), so
+  no decision under test changes, but the doc now says that instead of claiming
+  a wire-valid packet.
+
+  MUTATION MATRIX (each applied to production, run, reverted, `git diff` verified
+  clean afterwards; exit codes unpiped; every RED confirmed to be an ASSERTION,
+  never a compile break — the only `^error` line in any run is cargo's own
+  "test failed" summary):
+
+  | mutation | result |
+  |---|---|
+  | M1 `#[cfg(test)]` -> `#[cfg(any())]` | registration canary RED; the 8 module guards VANISH from the run. With the r1 canary restored: **PASSES, rc=0** — the finding, reproduced |
+  | M1b delete the 3-line declaration | registration canary RED |
+  | M2 delete `dbg.forward += 1` (in-place arm) | debug-counter test RED (`left: 0, right: 1`); 8 GREEN |
+  | M3 delete `dbg.forward += 1` (fallback arm) | debug-counter test RED; 8 GREEN |
+  | M4 leak the reservation on the declined-rewrite path | stranding test RED (rollback cell); 8 GREEN — the pre-existing `queued.is_empty()` did NOT catch it |
+  | M5 reserve-first + leak on decline | delegation canary RED + stranding test RED (non-sampled cell); 7 GREEN |
+  | R1 reserve-first + correct drop (Codex's F1 mutation) | delegation canary RED only; stranding test GREEN — **this is the labelled gap, measured** |
+  | R2 defer the sampler commit on `Sampled(Err)` | full-queue test RED; 8 GREEN |
+  | R3 `Sampled(Ok(_)) => None` | admitted-clone RED + stranding-test control RED; 7 GREEN |
+  | R4 hoist the sampler commit above the rewrite check | rollback test RED (`left: 1, right: 0`); 8 GREEN — **the rollback binding SURVIVES the F2 fixture rebuild** |
+  | R5 `resolve_mirror_config(.., 0)` — drop the VLAN id | 5 RED; wiring binding intact |
+
+  OVER-REACH GUARDS: R1 reds exactly one test and leaves the eight others green
+  — that is the gap being labelled rather than a claim of coverage. R2/R3/R4
+  each red their own cell and leave the IP-options guard green, which is what
+  separates it from a restatement of the fix. M4 reds ONLY the new stranding
+  test, proving the older rollback assertions were blind to a leaked admission.
+
+- **Validation**: full `cargo test --release` rc=0 both parallel and
+  `--test-threads=1`: 4283 passed / 0 failed / 2 ignored in the bin target, plus
+  60 + 8 + 22 + 31 + 1 + 2 in the integration targets. `CARGO_TARGET_DIR` and
+  `TMPDIR` private to this lane; no crate-wide `cargo fmt`.
+
+## 2026-08-13 — #6304 fold r3: an impossibility claim I could have disproved, and an adjacent counter with only a no-op arm
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a hostile MERGE-NEEDS-MINOR. The verdict upheld both r2
+  judgements — the F2 reachability claim survived six attacks and the
+  reserve-first labelling stayed defensible — so the round is two real defects
+  and two clause-level corrections, not a rework.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. Again NO production file
+  changed; `flow_cache_hit.rs` and `worker/tx_counters.rs` are byte-identical to
+  the pre-fold head (restored from a saved copy and re-diffed after every
+  mutation).
+
+  M1. **THE REPLACEMENT CLAIM WAS ALSO OVER-BROAD, ONE LEVEL WEAKER.** r2
+     corrected an over-broad "no test could catch this" and wrote
+     `docs/userspace-dataplane-gaps.md`: "No test observes that transient
+     window, and none deterministically can." That absolute is FALSE, and the
+     counter-example is cheap: a `#[cfg(test)]`-gated cumulative acquisition
+     counter on `BindingLiveState`, bumped at the top of
+     `try_acquire_pending_tx_admission` (`binding_state/tx_inbox.rs`), reads ONE
+     attempt under reserve-first and ZERO under sample-first for a non-sampled
+     packet — single-threaded, no race.
+
+     The error is a conflation, and naming it is the point: OBSERVING THE WINDOW
+     does require catching a pair of atomic RMWs open, and that part is
+     genuinely non-deterministic. DETECTING THE MUTATION is strictly weaker and
+     is deterministically available, because a counter observes the ATTEMPT
+     rather than the window. The doc now states both halves separately and NAMES
+     the instrumentation so a later round takes it instead of rediscovering it.
+     The test-file copy was already correctly scoped ("none *here* can") and
+     gets the same pointer so the two agree.
+
+     NOT IMPLEMENTED this round, as a cost judgement stated as one:
+     `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+     exists to fix, so a `#[cfg(test)]` field means the layout under test is not
+     the layout that ships. That is a reason to defer, not a reason to call it
+     impossible — which is exactly the distinction r2 lost.
+
+  M2. **AN ADJACENT PRODUCTION LINE, DELETABLE WITH THE WHOLE CRATE GREEN.**
+     `flow_cache_hit.rs:499` — `tx_counters.record_in_place_l2_rewrite(
+     rewrite_result.l2_rewrite)` — deletes with 4283 passed / 0 failed / 2
+     ignored and every integration target green. Measured here, not inferred;
+     the reported scope was "the 9 #6304 guards", and the true scope is the
+     whole crate.
+
+     The mechanism is worth recording because it generalises. The call RAN on
+     every fixture in the module and was observable to none of them: every frame
+     egressed on the VLAN it arrived on, so `eth_len == current_l3 == 18`, the
+     classification was `InPlaceL2Rewrite::SameLength`, and THAT arm of
+     `record_in_place_l2_rewrite` is an empty block. Nothing else in the tree
+     asserted `pending_in_place_vlan_push_desc_packets` or `_pop_desc_packets`
+     either. **A counter whose only reachable arm is a no-op looks covered and
+     binds nothing** — coverage of the call site is not coverage of the call.
+
+     Bound by `live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304`:
+     `untagged_egress_entry()` hands the same VLAN-80-tagged frame an untagged
+     egress, so `classify_in_place_l2_rewrite(18 -> 14)` returns
+     `VlanPopDescriptor` — the tag is popped by sliding the TX descriptor 4
+     bytes forward inside the same UMEM frame. The harness gained
+     `run_stage_with_entry`, which varies the CACHED DESCRIPTOR rather than the
+     packet; `run_stage_with_meta` is now a thin wrapper over it, so no existing
+     cell changed shape.
+
+     | mutation | result |
+     |---|---|
+     | delete `record_in_place_l2_rewrite(..)` at `flow_cache_hit.rs:499` | new cell RED (`left: 0, right: 1`), 9 pre-existing #6304 guards GREEN |
+     | `VlanPopDescriptor` arm bumps the PUSH counter (`tx_counters.rs:48`) | new cell RED, same 9 GREEN — the cell binds the CLASSIFICATION, not "some counter moved" |
+
+     Both reds are assertion failures, never compile breaks. The positive
+     control is load-bearing in its own right: the cell asserts the transmitted
+     extent is exactly `frame.len() - 4`, so `VlanPopDescriptor` is the honest
+     label for what happened rather than a relabelled same-length rewrite.
+
+  N1. **The F2 argument COMPOSES; it does not corroborate.** Both copies said
+     the shim's `read_bytes(.., ihl)?` guarantees `frame.len() - l3 >= ihl` AND
+     that `ipv4_declared_l3_end` clamps the payload up to `ihl`, as if two
+     independent facts. They are sequential, and only the first is load-bearing:
+     on exactly the input the shim leg excludes (`frame.len() < l3 + ihl`)
+     `ipv4_declared_l3_end` returns `None` rather than clamping
+     (`frame/inspect.rs`), and `trim_l3_payload` falls through to a
+     `meta.pkt_len`-derived length with no `ihl` relation at all
+     (`frame/mod.rs`). The clamp bites only where the shim leg already holds.
+     Both copies now say so, so a future reader cannot lean on the clamp alone.
+
+  N2. **The delegation canary's limits list claimed enumeration it did not
+     have.** The negative substring check `!src.contains(
+     "admit_mirror_clone_to_live(")` is defeated by renaming at the import —
+     `use ...::admit_mirror_clone_to_live as admit;` then `admit(...)`. That
+     needs a deliberate alias rather than an accidental edit, so it bounds what
+     the canary PROVES rather than naming a regression it should catch; it is
+     added to the enumeration at both sites, with the note that only the runtime
+     instrumentation from M1 can close it.
+
+- **Validation**: full `cargo test --release` rc=0 both parallel and
+  `--test-threads=1`: 4284 passed / 0 failed / 2 ignored in the bin target
+  (4283 + the new cell), plus 60 + 8 + 22 + 31 + 1 + 2 in the integration
+  targets. The pre-existing single-threaded flake in
+  `install_session_serializes_with_reconcile_removal` (issue #6989, unrelated to
+  this PR) did not fire this round. `CARGO_TARGET_DIR` and `TMPDIR` private to
+  this lane; no crate-wide `cargo fmt` — the one touched file was checked with
+  `rustfmt --check` alone and carries the same 9 pre-existing deviations as its
+  parent commit, none added.
+
+## 2026-08-13 — #6304 fold r4: the layout objection was true of a FIELD and false of the INSTRUMENT, measured both ways; and a sweep of every `record_*` call found sites that bind nothing
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a Codex MERGE-NEEDS-MAJOR whose blocking finding contradicted
+  a judgement r3 made and the parent ratified — that no layout-neutral instrument
+  for the #6114 ordering was available. Codex was right, and the shape of its being
+  right is the point: r3's rejection was sound about the specific form it evaluated
+  and unsound as a generalisation. Settled here with `size_of` / `align_of` /
+  `offset_of` numbers rather than with a better argument.
+- **File(s)**: `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/policy.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`.
+  `poll_descriptor/flow_cache_hit.rs`, `mirror/resolver.rs` and `mirror/mod.rs` are
+  byte-identical to the pre-fold head (sha256-compared, not eyeballed).
+
+  PROVENANCE, because it bears on how much of this was inherited. The first lane on
+  this round died on an expired login with everything uncommitted, in a worktree the
+  hand-off brief did not name. The work was recovered by patch from
+  `/var/tmp/f6882r2` — MINUS a leftover mutation that lane had left applied to
+  production code (`record_zone_traffic`'s ingress/egress zone arguments swapped in
+  `flow_cache_hit.rs`), which its own draft log described as byte-identical to the
+  head. It was not. A dirty worktree mid-matrix is the harness, not authorship.
+  Every measurement below was then re-run in this lane against a fresh worktree
+  under a fail-closed harness — and that re-run mattered: it CONTRADICTED two rows
+  of the inherited table (F3).
+
+  Harness: `set -euo pipefail`, an `APPLIED <id>` marker plus an independent
+  `git diff --quiet` check before any result is believed, and a
+  `git diff | sha256sum` compared against the pristine value before and after every
+  cell (start and end both `e3b0c442…`, the empty-diff hash). It also had a defect
+  worth recording: `failed=$(grep … FAILED)` under `set -e` + `pipefail` KILLED the
+  matrix on the first GREEN cell, because grep exits 1 when it matches nothing. The
+  failure mode was loud (the matrix stopped) rather than silent (a GREEN recorded as
+  a result), but a `|| true` now guards it, and the guard is load-bearing: the first
+  GREEN cell was a real finding.
+
+  Two documented pre-existing load failures are excluded from the matrix runs and
+  from the counts below — `afxdp::wg::engine::engine_internal_tests::*` (three cells
+  that WEDGE indefinitely under load; four other agents' test binaries were wedged
+  on the same box, up to 2h57m) and the CoS-lease seqlock cell
+  `v8_epoch_seqlock_snapshot_never_tears_tag_grace`. Both are #6657, both were
+  previously attributed against a detached `origin/master` worktree where they
+  reproduce, and neither is reachable from any mutated line. Filtered baseline:
+  4263 passed / 0 failed / 2 ignored / 25 filtered out, plus 60 + 8 + 22 + 31 + 1 + 2
+  green in the integration binaries.
+
+  F1. **THE LAYOUT OBJECTION WAS ABOUT A FIELD, AND IT WAS APPLIED TO THE
+     INSTRUMENT.** r3 declined a `#[cfg(test)]` acquisition counter because
+     `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+     exists to fix, so a test-only FIELD puts a different layout under test than the
+     one that ships. That is a reason to reject the field, not the measurement. A
+     `#[cfg(test)]` THREAD-LOCAL lives in its own storage, and the tree already
+     carried the pattern — #6294's `OUTER_ROUTE_RESOLVE_COUNT` in
+     `afxdp/frame/wg.rs`, thread-local rather than a process-global atomic for
+     exactly the parallel-`cargo test` determinism reason.
+
+     Neutrality MEASURED. `BindingLiveState`, rustc 1.96.0, x86_64:
+
+     | instrument | size | align | off(`pending_tx_admitted`) | off(`delta_loss_pending`) |
+     |---|---|---|---|---|
+     | none — production build | 2304 | 64 | 2152 | 2280 |
+     | `cfg(test)` THREAD-LOCAL (taken) | 2304 | 64 | 2152 | 2280 |
+     | `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | not measured |
+     | `cfg(test)` FIELD declared last | 2304 | 64 | 2152 | **2288** |
+
+     Four `const _: [(); N]` asserts beside the struct pin all four numbers and are
+     deliberately NOT `cfg`-gated, so the same literals are evaluated in the
+     production build AND the test build — an instrument that moved ANY OF THOSE
+     FOUR VALUES could satisfy at most one. That is the cross-configuration
+     comparison a `#[test]` cannot make alone;
+     `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
+     re-asserts the same numbers at runtime and carries the reasoning.
+
+     SCOPE of that guard, corrected in round 3 (Codex): four pinned values are a
+     TRIPWIRE, not a layout fingerprint. Size, alignment and two offsets do not
+     determine where the other ~90 fields sit, so a perturbation that moves only
+     UNPINNED fields satisfies all four literals in both configurations. The guard
+     is aimed at one hazard — a `cfg(test)` member reaching this struct, in the two
+     shapes measured above — and is not a proof of layout EQUALITY between the two
+     configurations. It is also toolchain- and target-specific: `BindingLiveState`
+     is `repr(Rust)` and the crate pins neither `rust-version` nor a toolchain file,
+     so a compiler upgrade can trip these literals with nothing in the source having
+     moved. That direction is safe (a changed value is a compile ERROR reporting the
+     actual number, never a silent accept) but it is brittle, and the response to a
+     trip is to re-measure, not to widen. The un-gated `const _` also means the
+     runtime cell can never FAIL — the build breaks first — so it is a readable
+     mirror of the numbers, not an independent check. The original prescription here
+     (un-gated const asserts, after a size-only guard missed an offset change) was
+     mine; this correction narrows it to what it actually buys.
+
+     The counterfactuals also correct the objection rather than confirming it: a
+     `cfg(test)` FIELD does not change the struct's SIZE — it lands in existing tail
+     slack. It moves OFFSETS. A size-only guard would have called both field shapes
+     harmless, and `repr(Rust)` reorders, so even a field declared LAST moved a
+     neighbour declared before it.
+
+     `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+     asserts a declined packet makes ZERO calls into
+     `try_acquire_pending_tx_admission`, with a SELECTED packet at one and a SELECTED
+     packet against a FULL target also at one — the third cell is what makes the zero
+     mean "never asked" rather than "asked and was refused". The bump sits BEFORE the
+     cap load for the same reason. Measured, one mutation at a time, whole crate:
+
+     | mutation | result |
+     |---|---|
+     | reserve-first INSIDE `sample_then_admit_mirror_clone` (reserve, drop on decline) | 4262 passed / 1 failed — ONLY the attempt-count cell; the delegation canary stays GREEN |
+     | reserve-first OPEN-CODED at the call site, plain spelling | 4261 / 2 — attempt-count AND delegation canary |
+     | reserve-first through `use …::admit_mirror_clone_to_live as reserve_clone_slot;`, with a comment retaining the spelling the canary requires | 4262 / 1 — attempt-count only, canary GREEN |
+
+     The first row is the finding: that mutation was caught by NOTHING before this
+     round. The third confirms the rename escape r3 asserted about its own canary
+     without testing it.
+
+  F2. **CODEX'S NAMED LINE WAS ALREADY BOUND — REFUTED, RECORDED AS A NON-DEFECT.**
+     `record_mirror_clone_result` at `flow_cache_hit.rs:478` is not unbound. The leg
+     volunteered that test files were outside its read scope and asked for empirical
+     confirmation; severing the call reds FOUR cells, forcing its byte argument to 0
+     reds `…_selected_admitted_clone_reaches_target_6304`, and forcing its result to
+     `Enqueued` reds two more. Written down so the next round does not re-derive it.
+
+  F3. **THE SWEEP — AND IT CONTRADICTED THE INHERITED TABLE.** Every `record_*` call
+     in `stage_flow_cache_hit`, one single-line production edit at a time, whole
+     crate, at the pre-fix head:
+
+     | # | site | edit | result |
+     |---|---|---|---|
+     | S1 | `filter::record_filter_counter` TX/output side (#2573) | walk reduced to `.for_each(\|_counter\| {})` | **GREEN 4263/0 — UNBOUND** |
+     | S2 | `filter::record_filter_counter` INPUT side (#3777) | same | RED — `afxdp::tests_txn_flow_cache::txn_flow_cache_hit_replays_input_filter_then_count_3777` |
+     | S3 | `policy::record_policy_hit_counter` (#3073) | call replaced by `let _ = counter;` | RED — `…_recounts_the_established_policy_hit_6304` (added this round; GREEN before it) |
+     | S4 | `zone_counters::record_zone_traffic` (#3651) | call deleted | RED — `…_accounts_per_zone_traffic_6304` (added this round; GREEN before it) |
+     | S5 | `record_mirror_clone_result` (#6304) | call replaced by `let _ = (…);` | RED — 4 cells |
+     | S6 | `tx_counters.record_in_place_l2_rewrite` | call deleted | RED — `…_accounts_vlan_pop_l2_rewrite_6304` (added in r3) |
+
+     The inherited table reported S1 and S2 as bound. S2 is; **S1 is not**, and the
+     reason is sharper than "no fixture populates the list", though that is also true
+     of this module: the ONE crate-wide test that puts a real counter on the TX-side
+     cached `tx_selection` is
+     `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779`, and both of its
+     assertions on that counter are NEGATIVE — the seed packet charges it on the COLD
+     path (`== 1`), and the TTL=1 cache-hit packet must NOT charge it (`== 1` again).
+     Deleting the hit-path replay satisfies both. A test that looks like coverage for
+     #2573's replay is coverage for #3779's suppression, and only that.
+
+     `live_flow_cache_callsite_replays_every_filter_count_term_6304` closes it. TWO
+     tx-side counters, because #2573's guarantee is that ALL matched count terms
+     replay and not merely the last, so a single-counter assertion is satisfied by a
+     walk that stops after one. The input side is asserted at this call site too
+     rather than delegated to the txn-level test: #3777 exists precisely because the
+     TX side had been fixed and the input side had not, so the two demonstrably
+     regress independently.
+
+     Three shapes of the same class now, all invisible to a coverage report and all
+     visible to a one-line deletion: UNREACHABLE behind a false guard (the policy
+     counter), REACHED but landing in a no-op arm (the zone counter, and r3's
+     `record_in_place_l2_rewrite`), and REACHED but iterating an EMPTY collection so
+     the closure holding the call never runs (both filter replays).
+
+     Argument cells, same method, same head — the counters bind their ARGUMENTS and
+     not merely their occurrence:
+
+     | mutation | result |
+     |---|---|
+     | `record_zone_traffic` ingress/egress zone arguments SWAPPED | RED — `…_accounts_per_zone_traffic_6304` |
+     | `record_zone_traffic` byte argument -> `0u64` | RED — same cell |
+     | `record_policy_hit_counter` byte argument -> `0u64` | RED — `…_recounts_the_established_policy_hit_6304` |
+     | `record_mirror_clone_result` byte argument -> `0usize` | RED — `…_selected_admitted_clone_reaches_target_6304` |
+     | `record_mirror_clone_result` result forced to `Enqueued` | RED — 2 cells |
+
+     SCOPE, stated with a measurement rather than by assertion, and it turned up two
+     more. The swept set is the calls named `record_*`. `stage_flow_cache_hit` makes
+     two OTHER per-packet accounting calls that are not — `sessions.touch_if_stale(..)`
+     (#918 staleness) and `sessions.account_packet(..)` (#2501 byte/packet accounting,
+     #2749 TCP-flags/DSCP capture for the SESSION_CLOSE RT_FLOW record). Deleting
+     EITHER leaves the whole crate GREEN, 4264 passed / 0 failed on each, so both are
+     unbound at this call site. NOT closed in this round and not silently dropped
+     either: neither is a telemetry `record_*` call, and binding the session table's
+     per-packet accounting is its own piece of work. Recorded here and in
+     `docs/userspace-dataplane-gaps.md` so the next round starts from the measurement
+     instead of rediscovering it.
+
+  F4. **`enqueue_tx_owned` RETURNS `Ok(())` ON A DROP.** Documented at the definition
+     rather than changed: `push_redirect_inbox` implements the drop-newest contract,
+     so an overflowed request is discarded and the caller is told nothing. The doc
+     names `try_enqueue_tx_owned` and `try_reserve_mirror_tx_owned` as the
+     acceptance-reporting alternatives, and `enqueue_tx` — identical property, two
+     lines above — carries a one-line pointer so a reader arriving at either draws
+     the right conclusion.
+
+  Validation: full `cargo test --release`, UNFILTERED, GREEN at the delivered
+  head — 4289 passed / 0 failed / 2 ignored in the main binary (4284 at the
+  pre-fold head plus the five cells this round adds), and 60 + 8 + 22 + 31 + 1 + 2
+  in the integration binaries. The two #6657 families that the mutation matrix
+  excluded both PASSED in that unfiltered run, which is consistent with their
+  being load-triggered rather than deterministic.
+  Full `go test ./...` GREEN. `CARGO_TARGET_DIR` private to this lane; no crate-wide
+  `cargo fmt` — each touched file checked in place with
+  `rustfmt --edition 2024 --check` against its own parent content and carrying the
+  same deviation count (mod.rs 14, tests/tx_inbox.rs 0, tx_inbox.rs 1,
+  flow_cache_hit_tests.rs 9, policy.rs 102), none added.
 ## 2026-08-05 — #6894 round 3: the log-gating item was PARTIAL, and the count that proved it was unreproducible
 
 - **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
@@ -90191,6 +90941,288 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
 
+## 2026-08-13 — #6304 round 3: bind the batch accounting triple + the lookup byte argument
+
+- **Timestamp**: 2026-08-13
+- **Action**: Close four unbound accounting sites at the flow-cache-hit call
+  site; correct the scope claimed for the `BindingLiveState` layout guard.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
+Four sites in `stage_flow_cache_hit` ran on every forwarded packet and were
+read by nothing. Three are `BatchCounters` fields the harness itself hid:
+`run_stage` built a `BatchCounters::default()` and dropped it, so `StageRun`
+had nowhere to report them from. The fourth is an ARGUMENT rather than a
+counter — `lookup_counted(.., meta.pkt_len)` — unbound in the
+reaches-past-the-adapter shape, since the only other callers invoke the callee
+directly with a literal.
+
+Retention alone would not have closed the NAT pair. Their guards read
+`cached_decision.nat.rewrite_src`/`rewrite_dst`, and every fixture in the
+module carried `NatDecision::default()`, so both lines were unreachable as well
+as unread. `nat_translated_entry` supplies a cached decision AND a matching
+descriptor, with the checksum deltas derived from the same
+`compute_*_csum_delta` helpers the seed path uses so the fixture cannot drift
+from the constructor; the cell asserts the translated addresses on the staged
+TX bytes, so the counters cannot claim a translation the wire never carried.
+
+MUTATION PROOF, four cells, each a full `cargo test --bins` invocation
+(`--skip wg::engine::engine_internal_tests`, a known load artefact) so the RED
+and the greens it is contrasted against share one run. Baseline 4268 passed /
+0 failed; every cell 4267 passed / 1 failed, so no cell has a collapsed
+denominator.
+
+| mutation (production line) | RED test | assertion line |
+|---|---|---|
+| delete `telemetry.counters.forward_candidate_packets += 1` (`flow_cache_hit.rs:333`) | `..._accounts_forward_and_nat_packets_6304` | `:2044` (left 0, right 1) |
+| delete `telemetry.counters.snat_packets += 1` (`:347`) | same test | `:2050` (left 0, right 1) |
+| delete `telemetry.counters.dnat_packets += 1` (`:350`) | same test | `:2055` (left 0, right 1) |
+| `meta.pkt_len` -> `0` (`:108`) | `..._counts_observed_bytes_on_the_hit_6304` | `:2126` (`Some(0)` vs `Some(58)`) |
+
+The three counter mutations red THREE DIFFERENT assertions, which is the
+property that matters: had deleting the snat line red the dnat assertion, the
+two would not be independently bound. Each counter mutation also leaves the
+observed-bytes cell green and vice versa.
+
+LAYOUT-GUARD SCOPE, corrected. The four un-gated `const _: [(); N]` asserts at
+`binding_state/mod.rs:752-755` (verified: four of them, module scope, no `cfg`
+attribute) are a TRIPWIRE for one hazard, not a layout fingerprint. Size,
+alignment and two offsets do not determine where the other fields sit, so a
+perturbation moving only UNPINNED fields satisfies all four literals in both
+build configurations. They are also toolchain- and target-specific:
+`BindingLiveState` is `repr(Rust)` and the crate pins neither a `rust-version`
+nor a toolchain file. That failure direction is safe — a changed value is a
+compile ERROR carrying the actual number, never a silent accept — so the
+response to a trip is to re-measure, not to widen. The earlier prose said an
+instrument "that perturbed the layout could satisfy at most one" build; the
+honest bound is "that moved ANY OF THESE FOUR VALUES". The un-gated const also
+means the runtime mirror cell can never FAIL, since the build breaks before the
+test binary exists; it is a readable mirror, not an independent check.
+
+The original prescription — un-gated const asserts, after a size-only guard
+missed an offset change — narrows here rather than being overturned. It is
+still stricter than a test. It is not proof of whole-struct equality.
+
+MISATTRIBUTED FINDINGS, recorded so the next round does not chase them. The
+round-3 dispatch also carried a block about constant-ambiguous `Drop` fixtures
+(`read_rx_drop_…`, `read_complete_drop_…`, `write_tx_drop_…`,
+`write_fill_drop_…`), a `[0,2,2]` distinct-NONZERO const-assert hole, and seven
+stale-prose citations. None of it belongs to this PR. `xsk_ffi_tests.rs` here
+is 265 lines and contains none of those fixtures or prose;
+`forwarding_build/tests.rs` is 5587 lines, so the cited `:5601` does not exist;
+`zone_counters.rs` here is byte-identical to master. Every one of those
+citations resolves EXACTLY at the head of the #5716 AF_XDP-API-hardening branch
+(`xsk_ffi_tests.rs:352/673/777/787/857/858/937`,
+`forwarding_build/tests.rs:5601`, `forwarding_build/mod.rs:266`, `_Log.md:226`),
+which is where that review was actually written. Routed there rather than
+folded here.
+
+## 2026-08-13 — #6304 round 4 (B1): aggregate the accounting rows so independence is observable
+
+- **Timestamp**: 2026-08-13
+- **Action**: replace the three sequential counter assertions in
+  `live_flow_cache_callsite_accounts_forward_and_nat_packets_6304` with a
+  six-row non-panicking aggregation asserted once at the end; state the property
+  claimed; re-measure the mutation matrix
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+
+WHAT WAS WRONG WITH THE ROUND-3 MATRIX, which is recorded above this entry and
+is superseded by it. The three counter assertions lived in ONE test and it
+panicked on the first failure, so in every cell the later assertions never ran:
+deleting the forward increment red at `:2044` and the SNAT and DNAT assertions
+were never reached; deleting SNAT red at `:2050` and DNAT was never reached.
+Three distinct failure LINES prove the three assertions read three distinct
+FIELDS. They cannot prove same-run independence, because the rows whose silence
+was being read as "still green" had not executed. Separately, the round-3 claim
+that each mutation reds exactly one assertion was not supported even in
+principle: deleting the forward increment also falsifies the untranslated
+forward assertion at `:2069`, which simply never got the chance to fire.
+
+Codex called this BLOCKING at round 4 and the classification is right for this
+PR specifically. The deliverable here IS the accounting bindings, so a finding
+that the bindings do not demonstrate what they claim lands on the deliverable
+rather than beside it; the usual "test plumbing, fold and merge" disposition
+does not apply.
+
+THE FIX. All six discriminators are evaluated into an `observed` array and
+reported by a SINGLE assertion, so every row runs in every cell and the failure
+message is the complete set of rows that moved. The untranslated run is staged
+next to the translated one, before the first row is read, so both runs have
+completed before anything is judged. The positive controls stay panicking and
+are relabelled PRECONDITIONS: a run that did not forward, or did not really
+translate the frame, can say nothing about the counters, and aborting is more
+honest than reporting six meaningless rows. That split is what lets a mutation
+matrix distinguish a broken FIXTURE from a result.
+
+THE PROPERTY CLAIMED, decided rather than left implicit. It is NOT "exactly one
+row reds". It is: deleting production increment X reds every row ABOUT X and no
+row about either other increment. Two rows are about the forward increment
+deliberately — `nat/forward` binds the increment, `plain/forward` binds its
+POSITION outside both `is_some()` NAT guards, since an increment moved inside
+them still satisfies the translated run — so the forward cell reds two rows and
+both name forward. The duplicate forward dependency is therefore KEPT, with the
+claim narrowed to match it, rather than deleted to rescue a stronger-sounding
+claim that was about the test's own redundancy instead of the production code.
+
+RE-MEASURED, tree `/var/tmp/f6882r3` at `37d22ac39` + this change,
+`cargo test --bin xpf-userspace-dp <test>`, each cell mutated from a clean
+production file and restored after. Every cell reached the aggregate assertion,
+so in all five the preconditions held and the red is an assertion about
+production code, never an expired precondition:
+
+| mutation | rc | rows evaluated | rows diverged | failure kind | duration |
+|---|---|---|---|---|---|
+| baseline, unmutated | 0 | 6 | none | — | 0.01s |
+| delete `forward_candidate_packets += 1` (`flow_cache_hit.rs:333`) | 101 | 6 of 6 | `nat/forward` + `plain/forward` (2) | assertion | 0.01s |
+| delete `snat_packets += 1` (`:347`) | 101 | 6 of 6 | `nat/snat` only (1) | assertion | 0.01s |
+| delete `dnat_packets += 1` (`:350`) | 101 | 6 of 6 | `nat/dnat` only (1) | assertion | 0.01s |
+| `rewrite_src.is_some()` -> `true` (`:346`) | 101 | 6 of 6 | `plain/snat` only (1) | assertion | 0.04s |
+| `rewrite_dst.is_some()` -> `true` (`:349`) | 101 | 6 of 6 | `plain/dnat` only (1) | assertion | 0.02s |
+
+The forward cell is the one the old matrix could not read: it now shows the two
+NAT rows EXECUTING and HOLDING while both forward rows move. The two guard cells
+were not in the round-4 brief; they were measured because the test's own prose
+claims each guard is bound and reds "no other" row, and a claim in prose that
+can be measured should not be argued. Durations are uniform and near zero here —
+these are pure unit cells with no polling, so no red in this matrix can be a
+precondition timeout, and the assertion-vs-precondition column is established by
+the panic SITE (all five at the aggregate assertion, none at a control).
+
+## 2026-08-13 — #6304 round 4 (B2+B3): the tripwire is unpinned, and every claim narrowed to the four measured values
+
+- **Timestamp**: 2026-08-13
+- **Action**: record that nothing pins the four `const _` layout asserts, with
+  the cost of deleting them measured; narrow every statement of "layout
+  neutrality" to "none of the four pinned values moved"
+- **File(s)**: `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`
+
+B2 — THE TRIPWIRE IS ITSELF UNPINNED. Measured on tree `/var/tmp/f6882r3` at
+`37d22ac39`, `cargo test --bin xpf-userspace-dp admission_attempt_instrument`,
+each cell mutated from a clean file and restored:
+
+| cell | rc | outcome |
+|---|---|---|
+| delete ALL FOUR `const _` (mod.rs:752-755) | 0 | test binary compiles, mirrored runtime cell PASSES |
+| delete only :752 (size) | 0 | same |
+| delete only :753 (align) | 0 | same |
+| delete only :754 (`pending_tx_admitted`) | 0 | same |
+| delete only :755 (`delta_loss_pending`) | 0 | same |
+| RED CONTROL: `const` literal 2304 -> 2305 | 101 | E0308 at compile time |
+| RED CONTROL: runtime cell literal 2304 -> 2305 | 101 | assertion `left == right` |
+
+The two RED controls ran in the SAME invocation as the green cells, so the
+greens are credible rather than a filter that matched nothing: the asserts are
+live while present, and the runtime cell does exercise its assertions.
+
+DECISION: documented as unpinned, NOT given a canary. The only shapes available
+for guarding a source construct are a match on its NAME or its TEXT. Both are
+proxies satisfiable by a differently-spelled equivalent, both red on a harmless
+rename while staying green on a semantic gutting, and this repo has been bitten
+by that shape repeatedly (#6871, #6743, #6676 among them). A guard that is itself
+a `const` would be exactly as deletable as what it guards, and guarding IT is the
+same problem one level up. No runtime witness is possible either: what the four
+lines assert is a statement about the PRODUCTION configuration, and a test binary
+is by construction the test configuration.
+
+WHAT DELETION COSTS, measured rather than asserted, with a `cfg(test)` `AtomicU64`
+declared ahead of `pending_tx_admitted` (the hazard's own shape):
+
+| cell | production `cargo build` | test build / run |
+|---|---|---|
+| H1 asserts present, literals untouched | rc=0 | rc=101, reports 2152 -> 2160 AND 2280 -> 2288 |
+| H2 asserts present, literals re-measured to 2160/2288 | rc=101, reports 2160 -> 2152 and 2288 -> 2280 | rc=0 |
+| H3 asserts DELETED, runtime cell re-measured to 2160/2288 | rc=0 | rc=0 — perturbation accepted in SILENCE |
+
+H2 is the "could satisfy at most one of the two builds" claim, previously argued
+and now measured: the guard cannot be made green by re-measuring in whichever
+configuration is in front of you. H3 is what deleting the four lines costs, and
+it is the difference between them and the runtime cell — the runtime cell CAN be
+re-measured green and they cannot. That pair is written into the file beside the
+asserts, so a future deleter reads what they are giving up in numbers instead of
+a plea not to.
+
+H1 also fills in a cell the round-3 table recorded as "not measured": the
+FIELD-ahead shape moves `delta_loss_pending` 2280 -> 2288 as well as
+`pending_tx_admitted` 2152 -> 2160. The docs table now carries the measured value.
+
+B3 — PROSE NARROWED. The honest claim is that NONE OF THE FOUR PINNED VALUES
+MOVED, which is a real result and a narrower one. Every statement of it now says
+that:
+  - `docs/userspace-dataplane-gaps.md` "Layout neutrality is MEASURED" ->
+    "Four layout values are MEASURED", with the scope paragraph named as part of
+    the claim rather than a caveat on it.
+  - same doc, "(1) The thread-local moves nothing" -> "moves none of those four
+    values", stating explicitly that a perturbation confined to the other ~90
+    fields would not show up.
+  - `binding_state/mod.rs` heading "LAYOUT NEUTRALITY of ..." -> "FOUR PINNED
+    LAYOUT VALUES, tripping if ... moves any of them"; and "the instrument is no
+    longer layout-neutral" -> "has moved one of these four values".
+  - `binding_state/tx_inbox.rs` "Both halves of that are MEASURED" -> "What is
+    MEASURED ... is four values", with the unpinned ~90 named.
+  - `binding_state/tests/tx_inbox.rs` doc headline "does not perturb
+    `BindingLiveState`" -> "moves none of FOUR PINNED ... layout values", and the
+    test RENAMED
+    `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
+    -> `..._leaves_four_pinned_layout_values_unchanged_6304`, since the name was
+    itself a statement of the overclaim. The reference at `_Log.md:622` is a
+    historical round-3 entry and is left as written; this entry supersedes it.
+  - `poll_descriptor/flow_cache_hit_tests.rs` carried the STRONGEST form of the
+    overclaim, and it was introduced by this PR: "A thread-local is
+    layout-neutral (that struct is BYTE-IDENTICAL with and without it)". That is
+    a whole-struct equality claim which the corrected scope paragraph elsewhere
+    in the same PR flatly contradicts. Replaced with the four-value statement,
+    as was the second instance further down the same file.
+
+Not touched, deliberately: the parts Codex confirmed accurate — the
+whole-struct-fingerprint disclaimer, the `repr(Rust)`/unpinned-toolchain note,
+and the remeasure-don't-widen prescription. Also left alone is
+`binding_state/mod.rs:11`, whose "byte-identical" is about code MOTION of moved
+items in an earlier PR and is not in this PR's diff.
+
+## 2026-08-13 — #6304 round 4 (B1 addendum): the row count is pinned by the array type
+
+- **Timestamp**: 2026-08-13
+- **Action**: record the measured type-level pin on the aggregated row set
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+
+The obvious objection to replacing six `assert_eq!`s with one aggregated
+assertion is that a row could then be dropped from the array and the test would
+still pass with less coverage — the same silent-loss exposure a deleted
+`assert_eq!` has. It does not apply here, and the reason is measured rather than
+argued: `observed` is annotated `[(&str, u64, u64, &str); 6]`, so deleting the
+`plain/dnat_packets` row fails the test build with E0308 (rc=101, tree
+`/var/tmp/f6882r3`, `cargo test --no-run --bin xpf-userspace-dp`).
+
+This is worth stating next to the B2 entry above because it is the pin B2 could
+NOT have. It is a TYPE-level constraint, so it cannot be satisfied by a
+differently-spelled equivalent — unlike a canary matching a NAME or the TEXT of
+an assertion, which is the proxy shape this tree keeps being bitten by. Where
+such a pin is available it should be taken; the four `const _` layout asserts
+are unpinned because no equivalent exists for them, not because pinning was
+judged unnecessary.
+
+FULL SUITE, tree `/var/tmp/f6882r3` at `01728e1c5`:
+`cargo test --bin xpf-userspace-dp` -> rc=0, 4292 passed, 0 failed, 2 ignored,
+34.37s. An earlier invocation of the same command returned rc=101 and that was
+NOT an assertion: the log carries 0 `FAILED` lines, 0 panics and 4289 `... ok`,
+and ends in `signal: 15, SIGTERM` with three `afxdp::wg::engine` concurrency
+tests still running past 60s on a box at load average ~25 with 11 sibling cargo
+runs. The exit code reported a termination, not a result; the clean re-run is
+the measurement.
+
+`cargo fmt --check` is not a gate in this crate (hundreds of pre-existing
+diffs). The relevant check is that this round added none: the file it wrote new
+code in, `flow_cache_hit_tests.rs`, has exactly the same ten rustfmt diff sites
+at `37d22ac39` and at this head — 35/570/753/948/1055/1094/1240 unchanged, and
+the last three shifted 1496/1563/1612 -> 1501/1568/1617 by the five lines the
+prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-13
 - **Action**: #6871 round 9 — close a BLOCKING heartbeat-lifecycle defect the
   round-8 self-reap introduced, build the guard round 8's own comment claimed
@@ -93616,3 +94648,105 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/nat_nptv6_helper_accepted_7077_test.go (new),
   pkg/dataplane/compiler_nat.go, pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/README.md, _Log.md
+
+## 2026-08-21 — drive #6882 to merge-ready: independent 13-cell mutation matrix, #6722 fixture repair
+
+- **Timestamp**: 2026-08-21
+- **Action**: Independent drive/verification pass over PR #6882 (#6304, bind the
+  LIVE mirror call site in `stage_flow_cache_hit`). The PR is a TEST-BINDING PR,
+  so the deliverable IS the binding: a finding that the binding does not bind
+  what it claims goes at the deliverable and blocks. Everything below is a
+  firsthand measurement in a private worktree, tree restored byte-clean
+  (`git status --porcelain` empty) after every cell.
+
+  **Merged master twice** (234 commits, then a further 112). `_Log.md` was the
+  only conflict both times: union-resolved and structurally checked — round 1
+  sections 1596+1656-1587=1665 observed 1665, `Timestamp` 3014+3137-3005=3146
+  observed 3146; round 2 sections 1665+1689-1656=1698 observed 1698, `Timestamp`
+  3146+3201-3137=3210 observed 3210; zero conflict markers; nothing dropped from
+  master either time. Round 2's single ours-side line delta is master's own edit
+  of a line this branch never touched (our side is byte-identical to the merge
+  base there), not a union artefact. No code file was union-resolved.
+  `docs/refactoring-audit-current.txt` regenerated after each merge via
+  `scripts/refactoring-audit.sh` (rc=0, no diff — already current).
+
+  **A RUNTIME-CLASS RED FOUND IN THE MERGE and fixed.**
+  `live_flow_cache_callsite_accounts_per_zone_traffic_6304` passes at the
+  pre-merge head `8dbd9e0c8` (rc=0) and FAILS at the merge commit (rc=101, in
+  isolation, `flow_cache_hit_tests.rs:1876`) — the untrust row was absent from
+  the snapshot entirely. Cause: #6722 rewrote
+  `ForwardingState::egress_zone_id` from a read of `egress[i].zone_id` into a
+  single read of the new `ifindex_unambiguous_zone_id` ledger.
+  `with_zone_accounting` seeded only `forwarding.egress`, which that resolver no
+  longer consults. Production is correct; the fixture had gone stale. Fixed by
+  seeding the ledger with the same ifindex -> zone the fixture already writes
+  into `egress` — which is what `populate_egress` does in production, so the
+  fixture still models a state the builder can produce. Stale half of the doc
+  comment corrected to name the map that is actually read.
+
+  **Mutation matrix, 13 cells at `e8a7dd9f5`.** Every cell: `cargo check
+  --tests --bins` rc=0 FIRST (0 `^error` lines), so every red is an assertion
+  and not a build break; then a full `cargo test --bins --no-fail-fast --
+  --test-threads=1` over all 4358 tests; reds listed are the COMPLETE tree-wide
+  failure set.
+
+  | cell | mutation at the LIVE call site | tree-wide reds |
+  |---|---|---|
+  | BASE | none | 0 among #6304 (1 unrelated wg flake, see below) |
+  | M1 | `config.rate` -> `1` (sampler dropped) | **6** #6304 cells |
+  | M2 | reserve-before-sample, open-coded | **2**: delegation canary + attempt count |
+  | M2b | same, via a RENAMED import | **2**: canary (first arm) + attempt count |
+  | M2c | reserve FIRST via renamed import, delegation KEPT | **1**: attempt count only |
+  | M3 | `Sampled(Ok(_)) => None` | **3** |
+  | M4 | commit the counter except on `Sampled(Err)` | **1**: `selected_full_queue_advances_sampler` |
+  | M5 | capture the clone AFTER the rewrite (code motion) | **1**: `selected_admitted_clone_reaches_target` |
+  | M6a | delete `forward_candidate_packets += 1` | **1** (2 of 6 ROWS, both forward) |
+  | M6b | delete `snat_packets += 1` | **1** (1 of 6 rows, `nat/snat`) |
+  | M6c | delete `dnat_packets += 1` | **1** (1 of 6 rows, `nat/dnat`) |
+  | M7 | `meta.pkt_len` -> `0` at `lookup_counted` | **1**: `counts_observed_bytes_on_the_hit` |
+  | M8 | delete the `record_zone_traffic` call | **1**: `accounts_per_zone_traffic` |
+
+  **M2c is the decisive cell.** Both arms of the source-text canary stay
+  satisfied — `sample_then_admit_mirror_clone(` is still present and
+  `admit_mirror_clone_to_live(` never appears, because the reservation is
+  reached through `use ... as reserve` — so the canary is GREEN and only the
+  runtime attempt count reds (`left: 1, right: 0`). That measures the PR's
+  central claim: the attempt-count instrument catches reserve-first in a
+  spelling source text cannot see. M2b shows why M2c was needed — M2b removes
+  the delegating call, so the canary's FIRST arm fires and the cell cannot
+  isolate.
+
+  **The last review's blocking finding (Codex @ `37d22ac39`: sequential
+  assertions cannot show independence) is CLOSED, re-measured here rather than
+  taken on the fold's word.** Every M6 cell panics at the single aggregate
+  assertion (`flow_cache_hit_tests.rs:2168`) reporting `N of 6 accounting rows
+  diverged. ALL 6 were evaluated`: M6a reds 2 rows, both naming the forward
+  increment, with BOTH NAT rows held in the same run; M6b reds only
+  `nat/snat_packets`; M6c reds only `nat/dnat_packets`. That is exactly the
+  property the fold claims — deleting increment X reds every row about X and no
+  row about either other increment.
+
+  **Reachability of the mutated site** (a red at a site production never reaches
+  measures nothing): `stage_flow_cache_hit` carries no `cfg` gate and is called
+  from the poll loop at `poll_descriptor/mod.rs:321`; the mirror block sits
+  behind the plain runtime `is_self_target && owned_packet_frame.is_none()`
+  condition, not behind a `cfg`. Every mutation cell's `cargo check --tests
+  --bins` includes the non-test `--bins` configuration and compiled the mutated
+  code, so the edits are in the shipped configuration and not `cfg(test)`
+  scaffolding.
+
+  **Production surface of this PR: none.** Everything it adds to a production
+  build is four un-gated `const _: [(); N]` layout assertions in
+  `binding_state/mod.rs` (compile-time only, fail-loud) plus comments; the
+  instrument bump, the thread-local, the `policy.rs` byte accessor, the module
+  hook and the re-export are all `#[cfg(test)]`. Test-only diff, so NO cluster
+  smoke is owed.
+
+  **Environment flake, not this PR**: `afxdp::wg::tests::framed_handshake::
+  concurrent_consume_response_and_reinitiation_is_sound` failed the BASE cell
+  with `no handshake completed — the race path was not exercised` (a PRECONDITION,
+  not the asserted property) while three other lanes were running full cargo
+  suites (load average 55 on 16 cores). It passed in the immediately preceding
+  full run on the same tree and in all 12 other cells. Filed separately.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs,
+  _Log.md
