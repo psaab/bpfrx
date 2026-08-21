@@ -5789,6 +5789,60 @@ fn zone_counter_rejection_rows() -> Vec<(
     ]
 }
 
+/// One EXTRA rejection row, used ONLY by
+/// `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`
+/// and deliberately NOT folded into [`zone_counter_rejection_rows`], whose
+/// four rows are chosen by a different argument (span over the fallible
+/// region) that this row would blur.
+///
+/// #6832 fold r7, review M1. That test asserts two residue facts — one about
+/// the live POLICY store, one about the live NAT store — and each one's
+/// expected value depends on where the row's belt sits relative to a
+/// DIFFERENT call site in `build_fallible_forwarding_state`: the policy parse
+/// (`parse_policy_state_with_counters`) and the source-NAT parse
+/// (`parse_source_nat_rules_with_previous`), about sixty lines below it. Over
+/// the four shared rows the two predicates are the SAME expression, because
+/// every one of the four sits either ABOVE both parses (#3719) or BELOW both
+/// (NPTv6 / filter / CoS). That is correct today only by coincidence of the
+/// current builder layout: a belt landing anywhere in the region BETWEEN the
+/// two parses makes one of the two assertions wrong, and no row in the shared
+/// four can tell the difference.
+///
+/// This row is a belt in that region. #3402's unresolvable-zone reject fires
+/// INSIDE the policy parse's rule loop, downstream of the per-rule
+/// `counter_store.rule_hit_counter(&rule_id)` that resolves the probe rule's
+/// counter (`policy.rs`) and upstream of the source-NAT parse. So it is the
+/// one row with policy residue PRESENT and NAT residue ABSENT, and the two
+/// predicates can no longer be written as one expression without a row
+/// contradicting them.
+///
+/// The row supplies only the DEFECT rule. The caller inserts its probe rule at
+/// index 0, so the probe's counter is resolved before this rule rejects.
+fn policy_parse_interior_rejection_row() -> (
+    &'static str,
+    ConfigSnapshot,
+    fn(&crate::policy::SnapshotIntegrityError) -> bool,
+) {
+    let mut snapshot = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+    snapshot.policies = vec![crate::protocol::PolicyRuleSnapshot {
+        name: "unresolvable-to-zone".into(),
+        from_zone: "zone100".into(),
+        to_zone: "no-such-zone".into(),
+        action: "permit".into(),
+        ..Default::default()
+    }];
+    (
+        "#3402 unresolvable policy zone (inside the policy parse)",
+        snapshot,
+        |e: &crate::policy::SnapshotIntegrityError| {
+            matches!(
+                e,
+                crate::policy::SnapshotIntegrityError::UnresolvableZoneReference { .. }
+            )
+        },
+    )
+}
+
 #[test]
 fn rejected_build_does_not_prune_live_zone_counters() {
     // `ZoneCounterStore` is `Arc`-backed, so the build's carry-forward
@@ -5899,7 +5953,18 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
     // populated off the same coordinator. This row runs the same four
     // rejection belts with all three stores live and asserts the zone half
     // still holds.
-    for (label, snapshot, expected) in zone_counter_rejection_rows() {
+    //
+    // #6832 fold r7 (review M1): plus a FIFTH belt the shared four do not
+    // carry. The two residue predicates below are facts about two different
+    // builder call sites — the policy parse and the source-NAT parse — and
+    // over the shared four they collapse to the same expression, because all
+    // four sit above both parses or below both. `#3402` rejects BETWEEN them,
+    // so the set can now distinguish the two positions instead of merely
+    // asserting them. See `policy_parse_interior_rejection_row`.
+    for (label, snapshot, expected) in zone_counter_rejection_rows()
+        .into_iter()
+        .chain(std::iter::once(policy_parse_interior_rejection_row()))
+    {
         let prev = zone_counter_prev_state();
         // Live siblings, pre-populated the way a running coordinator's are.
         // BOTH of them: r5 seeded only the NAT store and left `live_policy` a
@@ -5939,13 +6004,22 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // residue equals the seed (both just the reserved default-policy
         // counter) and no assertion here could tell a #6995 policy-side fix
         // from the status quo.
-        snapshot.policies = vec![crate::protocol::PolicyRuleSnapshot {
-            name: "probe-rule".into(),
-            from_zone: "zone100".into(),
-            to_zone: "zone300".into(),
-            action: "permit".into(),
-            ..Default::default()
-        }];
+        //
+        // INSERTED at index 0, not assigned over: the four shared rows carry
+        // no policies, so for them this is still exactly `[probe-rule]` — but
+        // the #3402 row's defect IS a policy rule, and it must survive AND
+        // stay after the probe, so the probe's `rule_hit_counter` is resolved
+        // before the defect rejects (#6832 fold r7).
+        snapshot.policies.insert(
+            0,
+            crate::protocol::PolicyRuleSnapshot {
+                name: "probe-rule".into(),
+                from_zone: "zone100".into(),
+                to_zone: "zone300".into(),
+                action: "permit".into(),
+                ..Default::default()
+            },
+        );
 
         let err = match build_forwarding_state_with_policy_counters_and_previous(
             &snapshot,
@@ -5976,16 +6050,23 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // It is row-dependent, and that dependence is itself the useful part.
         // The NAT rule parse sits in the MIDDLE of the fallible builder, so a
         // belt ABOVE it rejects before any NAT counter is resolved and a belt
-        // BELOW it does not. #3719 duplicate-zone-id is the builder's first
-        // fallible step and is the only row above the parse; NPTv6, filter and
-        // CoS all follow it. So this pins the relative order of the dup-zone
-        // belt and the NAT parse as well as the residue itself — move the NAT
-        // parse above `reject_duplicate_zone_ids` and this reds.
-        let rejected_above_the_nat_parse = label.starts_with("#3719");
-        // The policy parse and the NAT parse are both mid-builder, and the
-        // dup-zone belt is above both, so one predicate serves both halves —
-        // but they are named separately because they are separate facts about
-        // separate call sites, and a future reorder could separate them.
+        // BELOW it does not. TWO rows reject above it: #3719 duplicate-zone-id,
+        // the builder's first fallible step, and #3402, which rejects inside
+        // the policy parse — itself upstream of the NAT parse. NPTv6, filter
+        // and CoS all follow it. So this pins the relative order of those two
+        // belts and the NAT parse as well as the residue itself — hoist the
+        // NAT parse above the policy parse and the #3402 row reds
+        // (`left: [4242, 7777], right: [7777]`, measured #6832 fold r7).
+        let rejected_above_the_nat_parse =
+            label.starts_with("#3719") || label.starts_with("#3402");
+        // NOT the same expression as the NAT predicate, and that is the point.
+        // Only #3719 rejects above the POLICY parse; #3402 rejects INSIDE it,
+        // downstream of the probe rule's `rule_hit_counter`, so the policy
+        // residue is present for that row while the NAT residue is not.
+        // Before #6832 fold r7 both predicates read `starts_with("#3719")` and
+        // no row in the set could contradict either one — a belt relocated
+        // into the roughly sixty lines between the two parses would have made
+        // one of them silently wrong.
         let rejected_above_the_policy_parse = label.starts_with("#3719");
         let mut nat_ids: Vec<u32> = live_nat.snapshots().iter().map(|s| s.counter_id).collect();
         nat_ids.sort_unstable();
@@ -6007,14 +6088,17 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // later fix that stops leaving it reds here instead of leaving the
         // gaps-doc claim stale. Belt-dependent for the same reason the NAT one
         // is — the policy parse sits mid-builder, above NPTv6/filter/CoS and
-        // below the dup-zone belt.
+        // below the dup-zone belt. #3402 is the row that separates this
+        // predicate from the NAT one: it is BELOW the probe rule's counter
+        // (residue expected) and ABOVE the NAT parse (no NAT residue).
         let policy_residue_expected = !rejected_above_the_policy_parse;
         assert_eq!(
             policy_ids.iter().any(|id| id.contains("probe-rule")),
             policy_residue_expected,
             "{label}: the documented #6995 policy-side boundary moved. A belt \
-             BELOW the policy parse leaves the candidate rule's counter in the \
-             live store and a belt ABOVE it does not. after={policy_ids:?}"
+             BELOW the probe rule's per-rule counter resolution leaves that \
+             rule's counter in the live store and a belt ABOVE it does not. \
+             after={policy_ids:?}"
         );
         assert_eq!(
             nat_ids, expected_nat_ids,

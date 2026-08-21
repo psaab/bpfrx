@@ -1,4 +1,92 @@
-## 2026-08-20 — #5716 (9/9): the live-sibling insight, applied to only one of two siblings
+## 2026-08-20 — #5716 (10/10): two predicates that could not disagree, and the deletion sweep nobody had run
+
+- **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 review fold r7)
+- **Action**: One test defect where two assertions shared an expression they had
+  no row to distinguish, one stale quantifier, and the deletion sweep this PR
+  had never been subjected to.
+
+  **M1 — two residue predicates, one expression, no row that could tell them
+  apart.** In `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`,
+  `rejected_above_the_nat_parse` and `rejected_above_the_policy_parse` were both
+  `label.starts_with("#3719")`. They name facts about two DIFFERENT builder call
+  sites — the policy parse (`forwarding_build/mod.rs:423`) and the source-NAT
+  parse (`:484`), about sixty lines apart. Every one of the four shared rejection
+  rows sits either above both parses (#3719) or below both (NPTv6 / filter /
+  CoS), so the shared expression was correct only by coincidence of the current
+  builder layout. A belt relocated into the region BETWEEN the two parses would
+  have made one of the two assertions silently wrong, with no row able to notice.
+
+  Fixed by adding the missing row rather than by re-deriving the predicates. The
+  derivation had no honest independent source: the only observable that
+  distinguishes "the policy parse ran" from "the NAT parse ran" IS the residue
+  the test asserts, so deriving each expectation from its own parse position
+  would have been circular. `#3402 UnresolvableZoneReference` supplies the
+  missing quadrant — it rejects INSIDE the policy parse's rule loop
+  (`policy.rs:2228`), downstream of the per-rule `rule_hit_counter` at
+  `policy.rs:2173` and upstream of the source-NAT parse, so it is the one row
+  with policy residue PRESENT and NAT residue ABSENT. It is chained into this
+  test locally rather than folded into `zone_counter_rejection_rows()`, whose
+  four rows are argued by SPAN over the fallible region; a fifth row chosen for
+  a different reason would blur that argument. The test now inserts its probe
+  rule at index 0 instead of assigning over `snapshot.policies`, so the row's
+  defect rule survives and stays after the probe.
+
+  Comparative mutation proof, both legs at this head, mutation = hoist the
+  source-NAT parse above the policy parse: with the PRE-r7 tests.rs the mutation
+  is INVISIBLE (rc 0, 4290 passed, 0 failed) — that is the measurement showing
+  the shared predicate was unfalsifiable. With the r7 tests.rs the same mutation
+  reds exactly one test, reported against the new row's label:
+  `left: [4242, 7777], right: [7777]`.
+
+  **N1 — a quantifier stale against an arity-general loop.** Four fixture
+  preconditions said "the TWO explicit releases/commits" while the loop they
+  guard iterates `EXPLICIT_BATCHES` generally; two in-loop comments carried the
+  same arity-2 phrasing, so six sites, not four. All six now state the
+  quantifier over `EXPLICIT_BATCHES` and name the arity-2 sum as the coupling.
+  Measured rather than asserted: growing `EXPLICIT_BATCHES` to arity 3 without
+  touching the sums reds all four Drop fixtures AT these four preconditions
+  (`xsk_ffi_tests.rs:803, 949, 1050, 1142`, left 7 right 4), so the message text
+  claims exactly what was observed.
+
+  **P4 — the deletion sweep, run for the first time on this PR.** Predicate for
+  the probed set: every line this diff ADDS, in a file containing production
+  code, that is a complete independently-deletable statement — excluding doc and
+  line comments (no build can see a comment), signatures / `use` / closing braces
+  / `Ok(state)` whose deletion is a parse or type error rather than a behaviour
+  probe, and the two `if` conditions the diff NARROWED (deleting a condition is a
+  revert, already covered by the r5/r6 grid). Under that predicate the population
+  is 13, and the sweep is a floor with that stated basis, not an unbounded claim.
+
+  Result: **13 of 13 RED, zero survivors.** `xsk_ffi.rs` — the three
+  `ReadRx::release` statements (986/987/988), the `WriteTx::commit` and
+  `WriteFill::commit` base_idx advances (1065/1132), the `ReadComplete::release`
+  advance (1188), and the `push_comp_for_test` helper (688-701). Deleting 988
+  (`self.read_count = 0`) does not merely fail an assertion: `Drop`'s
+  `self.peeked - self.read_count` then underflows and the test binary ABORTS
+  ("attempt to subtract with overflow" at `xsk_ffi.rs:1007`), taking dozens of
+  unrelated AF_XDP tests with it — which is why that cell reports no `failures:`
+  block. Deleting `push_comp_for_test` is a compile error (E0599 at
+  `xsk_ffi_tests.rs:603`). `forwarding_build/mod.rs` — the `attach_zone_counters`
+  call (259), the slot-map and store assignments (300/301) and the prune's
+  `reconcile` (355). Both commit-point call sites — `reconcile/mod.rs:417` and
+  `snapshot_refresh.rs:388` — red at
+  `committed_reconcile_prunes_zone_counters_...` and
+  `committed_refresh_prunes_zone_counters_for...` respectively.
+
+  **Harness.** `cargo test --tests --no-fail-fast -- --test-threads=1`. The
+  single-threaded flag is not a convenience: the default parallel harness WEDGED
+  this crate — 4347 tests passed, then three `afxdp::wg::engine` tests sat in
+  `futex_do_wait` with a measured utime/stime delta of exactly zero over 10 s,
+  killed after 953 s. That is the deadlock `wg/engine_tests.rs:20` documents as
+  #6157, and the same comment notes `make test-rust` already forces
+  `--test-threads=1` (`Makefile:114`). Every cell restored by content copy from
+  git-HEAD-derived pristine copies under `trap ... EXIT INT TERM`; the tree was
+  verified byte-clean against HEAD between phases.
+
+  **P3 is NOT addressed here** — analysed and reported to the review, not
+  implemented, because it would be new production mechanism at round 7.
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/xsk_ffi_tests.rs, _Log.md
 
 - **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 review fold r6b)
 - **Action**: One test defect that undercuts the r5 test I was most pleased

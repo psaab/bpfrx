@@ -785,11 +785,13 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
                 }
                 r.release();
                 read_so_far += n;
-                // PER-OPERATION checkpoint, not an aggregate. The two explicit
-                // releases sum to `released_explicitly`, and a constant advance
-                // can reach the same total by a different route (2+2 == 1+3), so
-                // an end-of-loop check alone admits it. Checking after EACH
-                // release rejects it at the first batch (#6832 fold r5).
+                // PER-OPERATION checkpoint, not an aggregate. The explicit
+                // releases — one per EXPLICIT_BATCHES entry, whatever that
+                // array's arity — sum to `released_explicitly`, and a constant
+                // advance can reach the same total by a different route
+                // (2+2 == 1+3), so an end-of-loop check alone admits it.
+                // Checking after EACH release rejects it at the first batch
+                // (#6832 fold r5).
                 assert_eq!(
                     unsafe { *consumer },
                     origin.wrapping_add(read_so_far),
@@ -801,8 +803,14 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
             assert_eq!(
                 unsafe { *consumer },
                 origin.wrapping_add(released_explicitly),
-                "origin {origin}: fixture precondition — the two explicit \
-                 releases must already have reached the kernel"
+                "origin {origin}: fixture precondition — EVERY explicit release \
+                 the loop above performed must already have reached the \
+                 kernel. The quantifier is over EXPLICIT_BATCHES, which the \
+                 loop iterates generally; `released_explicitly` is its \
+                 arity-2 sum, so growing the array without changing that sum \
+                 reds HERE rather than passing vacuously — measured (#6832 \
+                 fold r7): at arity 3 all four Drop fixtures red at this \
+                 precondition, left 7 right 4"
             );
             for k in 0..dropped_read {
                 assert_eq!(
@@ -924,11 +932,13 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
                 }
                 r.release();
                 read_so_far += n;
-                // PER-OPERATION checkpoint, not an aggregate. The two explicit
-                // releases sum to `released_explicitly`, and a constant advance
-                // can reach the same total by a different route (2+2 == 1+3), so
-                // an end-of-loop check alone admits it. Checking after EACH
-                // release rejects it at the first batch (#6832 fold r5).
+                // PER-OPERATION checkpoint, not an aggregate. The explicit
+                // releases — one per EXPLICIT_BATCHES entry, whatever that
+                // array's arity — sum to `released_explicitly`, and a constant
+                // advance can reach the same total by a different route
+                // (2+2 == 1+3), so an end-of-loop check alone admits it.
+                // Checking after EACH release rejects it at the first batch
+                // (#6832 fold r5).
                 assert_eq!(
                     unsafe { *consumer },
                     origin.wrapping_add(read_so_far),
@@ -940,8 +950,14 @@ fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
             assert_eq!(
                 unsafe { *consumer },
                 origin.wrapping_add(released_explicitly),
-                "origin {origin}: fixture precondition — the two explicit \
-                 releases must already have reached the kernel"
+                "origin {origin}: fixture precondition — EVERY explicit release \
+                 the loop above performed must already have reached the \
+                 kernel. The quantifier is over EXPLICIT_BATCHES, which the \
+                 loop iterates generally; `released_explicitly` is its \
+                 arity-2 sum, so growing the array without changing that sum \
+                 reds HERE rather than passing vacuously — measured (#6832 \
+                 fold r7): at arity 3 all four Drop fixtures red at this \
+                 precondition, left 7 right 4"
             );
             for k in 0..dropped_read {
                 assert_eq!(
@@ -1036,8 +1052,13 @@ fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
             assert_eq!(
                 unsafe { *producer },
                 base.wrapping_add(committed),
-                "origin {origin}: fixture precondition — the two explicit \
-                 commits must already have reached the kernel"
+                "origin {origin}: fixture precondition — EVERY explicit commit \
+                 the loop above performed must already have reached the \
+                 kernel. The quantifier is over EXPLICIT_BATCHES, which the \
+                 loop iterates generally; `committed` is its arity-2 sum, so \
+                 growing the array without changing that sum reds HERE rather \
+                 than passing vacuously — measured (#6832 fold r7): at arity 3 \
+                 all four Drop fixtures red at this precondition"
             );
             let first = submitted;
             assert_eq!(
@@ -1124,8 +1145,13 @@ fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
             assert_eq!(
                 unsafe { *producer },
                 base.wrapping_add(committed),
-                "origin {origin}: fixture precondition — the two explicit \
-                 commits must already have reached the kernel"
+                "origin {origin}: fixture precondition — EVERY explicit commit \
+                 the loop above performed must already have reached the \
+                 kernel. The quantifier is over EXPLICIT_BATCHES, which the \
+                 loop iterates generally; `committed` is its arity-2 sum, so \
+                 growing the array without changing that sum reds HERE rather \
+                 than passing vacuously — measured (#6832 fold r7): at arity 3 \
+                 all four Drop fixtures red at this precondition"
             );
             let first = submitted;
             assert_eq!(
