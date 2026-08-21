@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -112,6 +113,148 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 	return out
 }
 
+// ScreenMissingProfileRefs is the EXPORTED single source of truth for "which
+// zones claim a screen profile that is not defined" (#5806). It is the same
+// function that builds ConfigSnapshot.ScreenMissingProfiles for the dataplane,
+// so the Prometheus series, the `show security screen` status line, and the
+// dataplane's runtime WARN are all derived from ONE computation and cannot
+// disagree about which references are unresolved — the same SSOT discipline
+// AddresslessEnforcingZones/Interfaces use for their metrics.
+//
+// Deriving these observability surfaces from the config is correct rather than a
+// desired-vs-applied gap, and the distinction is worth keeping straight: the
+// defect this exposes IS a property of the configuration — the config claims a
+// screen is attached and none is enforced — so the config is the authoritative
+// statement of the unresolved reference. That is the opposite of #6828, where an
+// authoritative zero was published from config while a fence was actively
+// dropping; there the config was the wrong source, here it is the only correct
+// one.
+//
+// Callers MUST go through this function rather than re-deriving the predicate.
+// That is the stated contract, not an implementation convenience: this is the
+// same computation that fills ConfigSnapshot.ScreenMissingProfiles. State the
+// guarantee that buys with its condition (#6839 round 2): WHENEVER a snapshot has
+// been published for the config being rendered, that snapshot's
+// ScreenMissingProfiles and every surface reading this function are the same
+// function of the same input, so no surface can report a different set than the
+// helper was told about. That identity is Go-struct to Go-struct; the helper
+// reads JSON, so struct → wire → decoder is a SECOND hop and is NOT part of
+// this argument. It is bound separately rather than assumed:
+// TestScreenMissingProfilesPublishedToSnapshot
+// (screens_ssot_source_5806_test.go) marshals the snapshot and pins the wire key
+// `screen_missing_profile_zones` with its `zone`/`profile` elements — the names
+// the Rust decoder reads. The unqualified form — "can never report a different
+// set" — is false whenever NO snapshot has been published: a config-only /
+// degraded boot, which is exactly the case these surfaces exist to cover (this
+// PR's own metrics fixture compiles a config with a nil dataplane). There is no
+// told-about set to disagree with then, and what the surfaces report is the set
+// the helper WOULD be told on the next publish. A re-derived copy would be free
+// to drift the moment either side's notion of "unresolved" changes, which is
+// what the contract actually prevents, in both cases.
+func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
+	return buildScreenMissingProfileRefs(cfg)
+}
+
+// ScreenUnresolvedDisposition describes what the dataplane CURRENTLY does with a
+// zone whose screen profile does not resolve. It is deliberately narrow: the
+// screen checks are skipped, and nothing else about the packet's treatment
+// changes. An earlier draft said the traffic "is forwarded UNSCREENED", which
+// reads as a permit — an operator could take it to mean the firewall is passing
+// traffic it would otherwise deny. It is not: zone security policy still
+// evaluates the packet normally.
+//
+// The #5806 tag in the text is load-bearing, NOT decoration. The decision this
+// sentence describes lives in the Rust runtime
+// (userspace-dp/src/screen/mod.rs returns ScreenVerdict::Pass on the None
+// branch) and is NOT derivable from the Go control plane, so this string is a
+// hardcoded claim about code that lives somewhere else — precisely the shape
+// that goes stale silently when the other side changes. The fail-closed-vs-pass
+// posture is an OPEN design decision owned by #5806; when it is settled, a grep
+// for 5806 must land on every place that asserts today's behaviour, including
+// this one.
+const ScreenUnresolvedDisposition = "the profile reference does not resolve, so no screen " +
+	"checks are applied to this zone; policy evaluation is unaffected (current " +
+	"behaviour, pending the #5806 enforcement-posture decision)"
+
+// ScreenUnresolvedProfileLines renders the operator-facing status block for
+// every zone whose configured screen profile does not resolve (#5806). Returns
+// nil when every reference resolves, so a caller can append unconditionally.
+//
+// It exists so the local-CLI and gRPC `show security screen` renderers emit ONE
+// wording from ONE predicate — the same no-drift discipline
+// config.ScreenEnabledCheckList enforces for the enabled-check inventory. Both
+// renderers otherwise early-return "No screen profiles configured" when
+// cfg.Security.Screen is empty, which is EXACTLY the tolerant-load shape that
+// strands a zone's screen reference: the profile definitions are gone, the zone
+// still claims one, and the operator is told there is simply nothing configured.
+// Callers must therefore emit these lines BEFORE that early return.
+//
+// The disposition is ONE trailing line, not a per-zone annotation: it is a
+// global statement about the current implementation, identical for every zone,
+// so repeating it per row would be noise.
+func ScreenUnresolvedProfileLines(cfg *config.Config) []string {
+	refs := ScreenMissingProfileRefs(cfg)
+	if len(refs) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(refs)+2)
+	lines = append(lines, "Unresolved screen profile references:")
+	for _, r := range refs {
+		lines = append(lines,
+			fmt.Sprintf("  Zone %s references undefined screen profile '%s' "+
+				"— no screen checks are enforced for this zone", r.Zone, r.Profile))
+	}
+	lines = append(lines, "  Disposition: "+ScreenUnresolvedDisposition+".")
+	return lines
+}
+
+// CheckScreenUnresolvedRenderOrder enforces the ORDERING half of the
+// ScreenUnresolvedProfileLines contract stated above — the block must reach the
+// operator BEFORE the empty-inventory line, not after it. It returns nil when
+// rendered `show security screen` output satisfies that, and an error naming
+// both byte offsets when it does not.
+//
+// It is ONE check because there is ONE contract. Both renderers ship it
+// (pkg/cli/cli_show_security_screen.go and
+// pkg/grpcapi/server_show_security_text.go), so a divergence between two
+// hand-written guards is always a bug rather than a legitimate difference —
+// which is the condition under which single-sourcing beats binding two copies.
+// Through #6839 round 2 only the gRPC guard checked order at all: the local-CLI
+// guard asserted structure INSIDE the block and never mentioned the
+// empty-inventory line, so moving the emit into the early-return branch AFTER
+// that line was measured rc=0 on ./pkg/cli/ and rc=0 across all four packages.
+//
+// The presence check is not redundant with whatever else a caller asserts:
+// without it, output carrying NEITHER string compares -1 > -1 and the ordering
+// check passes vacuously.
+//
+// The empty-inventory wording is re-typed here deliberately. An assertion that
+// read its expected value out of the renderer it is checking would assert
+// nothing; this is an independent statement of what the operator reads, so
+// changing either renderer's wording without revisiting this contract fails
+// here rather than silently agreeing with itself.
+func CheckScreenUnresolvedRenderOrder(out string) error {
+	const emptyInventory = "No screen profiles configured"
+	blockIdx := strings.Index(out, ScreenUnresolvedDisposition)
+	emptyIdx := strings.Index(out, emptyInventory)
+	if blockIdx < 0 || emptyIdx < 0 {
+		return fmt.Errorf("both the unresolved-reference disposition and %q must be "+
+			"present for the ordering check to mean anything (disposition at byte %d, "+
+			"empty-inventory line at byte %d); rendered output:\n%s",
+			emptyInventory, blockIdx, emptyIdx, out)
+	}
+	if blockIdx > emptyIdx {
+		return fmt.Errorf("the unresolved-reference block must be rendered BEFORE %q "+
+			"(disposition at byte %d, empty-inventory line at byte %d). An operator who "+
+			"reads the empty-inventory line first has already been told nothing was "+
+			"configured; a correction printed below it is not the same signal. "+
+			"Containment assertions alone cannot see this — they stay green with the "+
+			"emit moved after the line; rendered output:\n%s",
+			emptyInventory, blockIdx, emptyIdx, out)
+	}
+	return nil
+}
+
 // buildScreenMissingProfileRefs records every zone that REFERENCES a screen
 // profile which is NOT defined in the config (#3082). buildScreenSnapshots
 // silently skips these zones (`sp == nil`), so without this the dataplane
@@ -120,6 +263,9 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 // lenient/HA-sync path where a dangling screen reference loads with only an
 // apply-time warning. The dataplane uses this to emit a rate-limited runtime
 // WARN; the verdict stays Pass (the fail-closed posture is deferred).
+//
+// #5806: exported through ScreenMissingProfileRefs so the observability
+// surfaces share this computation instead of re-deriving the predicate.
 func buildScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
@@ -145,6 +291,30 @@ func buildScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef
 			// Reference resolves to a defined profile.
 			continue
 		}
+		// The loop iterates sorted map KEYS but labels with zone.Name. Those are
+		// two different expressions, and the divergence was raised and REFUTED in
+		// #6839 round 1 — recorded here so it is not re-raised, and so that if the
+		// premise ever stops holding the reader is standing on the line that
+		// breaks.
+		//
+		// What would happen if they diverged: two zones whose Name collapsed to
+		// one value would emit the SAME {zone, profile} label pair, Prometheus
+		// would reject the duplicate const-metric, and the collector error takes
+		// the WHOLE /metrics endpoint to 500 — every series, not just this one.
+		// That outcome is real and was reproduced mechanically by hand-building
+		// the struct.
+		//
+		// Why it is unreachable, verified rather than assumed: compileZones is the
+		// only constructor (compiler_security_zones.go) and it writes
+		// `zone = &ZoneConfig{Name: inst.name}` immediately followed by
+		// `sec.Zones[inst.name] = zone` — one variable, both places. No
+		// deserialization path bypasses it: active.json holds the AST
+		// (json.Unmarshal into ConfigTree, configstore/envelope.go + db.go) and
+		// Store.Load recompiles it, and the HA peer-sync ingress likewise goes
+		// through compileTreeLenient. So Name == key holds for every Config any
+		// production path can produce, and switching this to `name` would change
+		// nothing observable. Left as zone.Name deliberately: it says what the
+		// label MEANS.
 		out = append(out, ScreenMissingProfileRef{
 			Zone:    zone.Name,
 			Profile: zone.ScreenProfile,

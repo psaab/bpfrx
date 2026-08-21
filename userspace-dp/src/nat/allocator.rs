@@ -60,6 +60,18 @@
 //   permanently shrink the reusable pool (062-10). The retain buffer
 //   allocates lazily only when a collision actually occurs.
 //
+// Aggregate construction budget (#6812): `PortAllocator::new` is the memory
+// heavyweight — one `AddressOccupancy` word array per pool address, sized to
+// the port range (one bit per port slot). Construction is therefore gated
+// TWICE upstream in `source.rs`: the Go #5877 strict commit gate rejects an
+// over-budget config outright, and `resolve_pool_allocators` enforces the
+// same budgets (pool count / total addresses / total port slots, charged
+// per distinct allocator key, reuse-before-build, nothing built for a
+// failed pool) at this apply boundary — the final backstop for a tolerated
+// (lenient-load / peer-synced) or hand-crafted snapshot. Three full-range
+// /16 pools would otherwise materialise 12,683,575,296 bitmap bits
+// (~1.48 GiB) during apply.
+//
 // Cross-submodule visibility (per #1542 plan v3):
 // - PortAllocator and PortAllocatorSnapshot are pub(crate) at definition
 //   (re-exported by nat/mod.rs).
@@ -790,8 +802,43 @@ impl Default for PortAllocator {
     }
 }
 
+/// Test-only PortAllocator CONSTRUCTION counter (#6812 F3 round 4).
+///
+/// The #6812 guards previously asserted only on the FINAL allocator a rule
+/// carries — its identity, or its occupancy-word count. Both are end-state
+/// assertions, and both are blind to the exact defect the reuse-before-build
+/// and no-bitmap-for-a-failed-pool rules exist to prevent: a `PortAllocator::
+/// new` that is built and then discarded. A throwaway construction immediately
+/// before the reuse lookup restores the pre-#6812 build-then-discard behaviour
+/// with every one of those assertions still green.
+///
+/// THREAD-LOCAL, deliberately. A process-global counter is shared by every test
+/// `cargo test` runs in parallel and produced a master-red flake once already
+/// (#6819). `resolve_pool_allocators` and everything it calls are synchronous
+/// on the caller's thread, so a thread-local counts exactly the constructions
+/// the test under it caused, with no serialisation and no cross-test coupling.
+#[cfg(test)]
+thread_local! {
+    static PORT_ALLOCATOR_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: reset the calling thread's construction counter and return a
+/// probe that reports constructions since the reset.
+#[cfg(test)]
+pub(super) fn reset_port_allocator_build_count() {
+    PORT_ALLOCATOR_BUILDS.with(|c| c.set(0));
+}
+
+/// Test-only: PortAllocator constructions on this thread since the last reset.
+#[cfg(test)]
+pub(super) fn port_allocator_build_count() -> usize {
+    PORT_ALLOCATOR_BUILDS.with(|c| c.get())
+}
+
 impl PortAllocator {
     pub(crate) fn new(num_addresses: usize, port_low: u16, port_high: u16) -> Self {
+        #[cfg(test)]
+        PORT_ALLOCATOR_BUILDS.with(|c| c.set(c.get() + 1));
         let counters = (0..num_addresses).map(|_| AtomicU32::new(0)).collect();
         let range = if port_low == 0 || port_high == 0 || port_low > port_high {
             0
@@ -869,6 +916,24 @@ impl PortAllocator {
     #[cfg(test)]
     pub(super) fn debug_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
         self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only: total occupancy-bitmap WORDS across every pool address.
+    /// The #6812 aggregate-budget tests assert a refused / failed pool
+    /// materialised ZERO words (no eager bitmap) while an admitted pool
+    /// carries `addresses x div_ceil(port_range, 64)` — the direct white-box
+    /// proof the bitmap was (or was not) allocated.
+    #[cfg(test)]
+    pub(super) fn debug_occupancy_words(&self) -> usize {
+        self.shared.occupancy.iter().map(|o| o.words.len()).sum()
+    }
+
+    /// Test-only: identity of the shared allocator state, for proving a
+    /// re-apply REUSED the previous allocator (same Arc) instead of building
+    /// a fresh bitmap (#6812 reuse-before-build).
+    #[cfg(test)]
+    pub(super) fn debug_shared_identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     /// Test-only: mark a translated tuple as owned (set its occupancy bit)
@@ -2405,7 +2470,7 @@ pub(crate) struct PortAllocatorSnapshot {
     pub(crate) live_lock_contended_total: u64,
 }
 
-fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
+pub(super) fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
     if num_addresses == 0 || port_low == 0 || port_high == 0 || port_low > port_high {
         return 0;
     }

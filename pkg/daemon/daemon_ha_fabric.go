@@ -731,11 +731,12 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 		info.FIBIfindex = 1
 	}
 
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (dataplane not ready)")
 		return false
 	}
-	if err := d.dp.HA().SetFabricForwarding(ctx, dataplane.FabricID(0), info); err != nil {
+	if err := rt.HA().SetFabricForwarding(ctx, dataplane.FabricID(0), info); err != nil {
 		slog.Warn("cluster: failed to update fabric_fwd map", "err", err)
 		return false
 	}
@@ -751,10 +752,11 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 
 	// Push updated fabric MACs to userspace helper so it can do
 	// cross-chassis fabric redirect. The initial snapshot may have
-	// been built before the peer MAC was resolved.
-	if d.dp != nil {
-		d.dp.HA().SyncFabricState(ctx)
-	}
+	// been built before the peer MAC was resolved. #2114 (Codex PR
+	// #6743 r3-7): reuse the snapshot from above — the map update and
+	// the helper sync are one coupled operation, and a second load
+	// could observe a mid-refresh clear (map updated, sync skipped).
+	rt.HA().SyncFabricState(ctx)
 
 	return true
 }
@@ -765,10 +767,11 @@ func (d *Daemon) clearFabricFwd0(ctx context.Context) {
 	d.fabricMu.RLock()
 	populated := d.fabricPopulated
 	d.fabricMu.RUnlock()
-	if !populated || d.dp == nil {
+	rt := d.dataplane()
+	if !populated || rt == nil {
 		return
 	}
-	if err := d.dp.HA().SetFabricForwarding(ctx, dataplane.FabricID(0), dataplane.FabricFwdInfo{}); err != nil {
+	if err := rt.HA().SetFabricForwarding(ctx, dataplane.FabricID(0), dataplane.FabricFwdInfo{}); err != nil {
 		slog.Warn("cluster: failed to clear fabric_fwd[0]", "err", err)
 		return
 	}
@@ -937,11 +940,12 @@ func (d *Daemon) refreshFabricFwd1(ctx context.Context, fabIface, overlay string
 		info.FIBIfindex = 1
 	}
 
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		d.logFabricRefreshFailure(1, "cluster: fabric1 refresh failed (dataplane not ready)")
 		return false
 	}
-	if err := d.dp.HA().SetFabricForwarding(ctx, dataplane.FabricID(1), info); err != nil {
+	if err := rt.HA().SetFabricForwarding(ctx, dataplane.FabricID(1), info); err != nil {
 		slog.Warn("cluster: failed to update fabric1_fwd map", "err", err)
 		return false
 	}
@@ -963,10 +967,11 @@ func (d *Daemon) clearFabricFwd1(ctx context.Context) {
 	d.fabricMu.RLock()
 	populated := d.fabric1Populated
 	d.fabricMu.RUnlock()
-	if !populated || d.dp == nil {
+	rt := d.dataplane()
+	if !populated || rt == nil {
 		return
 	}
-	if err := d.dp.HA().SetFabricForwarding(ctx, dataplane.FabricID(1), dataplane.FabricFwdInfo{}); err != nil {
+	if err := rt.HA().SetFabricForwarding(ctx, dataplane.FabricID(1), dataplane.FabricFwdInfo{}); err != nil {
 		slog.Warn("cluster: failed to clear fabric_fwd[1]", "err", err)
 		return
 	}

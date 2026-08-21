@@ -376,7 +376,7 @@ func mgmtRouteAppliedKey(dst *net.IPNet, family int, gw net.IP, linkIndex int) s
 //
 // Ordering invariant (see daemon_run.go shutdown sequence): this
 // runs AFTER d.cluster.Stop() / d.sessionSync.Stop() and BEFORE
-// d.dp.Close()/d.dp.Teardown(), so the Telemetry provider is
+// the dataplane's Close()/Teardown(), so the Telemetry provider is
 // still backed by a live bpfShim on the userspace path. AGY
 // round-1 walked-trace confirmation: manager.bpfShim teardown
 // only happens inside manager.Close()/Teardown().

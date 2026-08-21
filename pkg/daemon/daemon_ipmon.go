@@ -301,7 +301,7 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) bool {
 
 	// 2. Publish the dataplane snapshot (routes-only partial republish,
 	// no Compile, no helper restart).
-	pub, ok := d.dp.(routeOverlayPublisher)
+	pub, ok := d.dataplane().(routeOverlayPublisher)
 	if !ok {
 		// No dataplane publisher (helperless): FRR is the only routing
 		// consumer and it converged — nothing more to do.

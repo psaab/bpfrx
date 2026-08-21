@@ -424,7 +424,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	}
 
 	if len(result.pendingXDP) > 0 {
-		rcMap := m.maps["redirect_capable"]
+		// #2114 A3: OPTIONAL access — an absent redirect_capable SKIPS the
+		// redirect-map population and CONTINUES into the attachment work
+		// (master's exact outcome; this path is CompileConfig-gated to the
+		// armed state upstream).
+		rcMap, _, _ := m.lookupMapLocked("redirect_capable")
 
 		// Populate redirect_capable BEFORE link.Update() swaps programs.
 		// Skip tunnel interfaces — bpf_redirect_map sends Ethernet frames

@@ -891,8 +891,16 @@ func (s *Server) ClearCounters(_ context.Context, _ *pb.ClearCountersRequest) (*
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+	// #2114/#6743 r2-N4: a clear that RACES a setDataplane(nil) passes the
+	// pre-check above and then fails inside the live indirection's
+	// forwarder with dataplane.ErrNotPublished. Mapping that to
+	// codes.Internal reports the daemon's own lifecycle state as a server
+	// fault, and reports the IDENTICAL operator-visible condition with a
+	// different code purely because of WHEN the cell cleared — the
+	// inconsistency dataplaneActionError exists to remove. Every other
+	// failure still maps to Internal.
 	if err := s.dp.ClearAllCounters(); err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+		return nil, dataplaneActionError(err)
 	}
 	return &pb.ClearCountersResponse{}, nil
 }

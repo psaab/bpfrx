@@ -170,6 +170,38 @@ fn tcp_v4_syn_meta_with_l2(frame: &[u8], vlan: Vlan) -> UserspaceDpMeta {
     }
 }
 
+/// #5806: a ScreenState carrying ONLY an unresolved profile reference — the
+/// tolerant-load shape where the `security screen` definitions are gone
+/// entirely but a zone still names one. No resolved profile exists, so
+/// `has_profiles()` is false.
+fn missing_only_screen() -> ScreenState {
+    let mut screen = ScreenState::new();
+    let mut missing = FxHashMap::default();
+    missing.insert("lan".to_string(), "ghost".to_string());
+    screen.update_missing_profiles(missing);
+    screen
+}
+
+/// #5806: an unresolved reference for `lan` ALONGSIDE a resolved profile for a
+/// different zone, so `has_profiles()` is true and the screen stage actually
+/// runs for the `lan` packet.
+fn missing_plus_resolved_screen() -> ScreenState {
+    let mut profiles = FxHashMap::default();
+    profiles.insert(
+        "other".to_string(),
+        ScreenProfile {
+            source_route: true,
+            ..ScreenProfile::default()
+        },
+    );
+    let mut screen = ScreenState::new();
+    screen.update_profiles(profiles);
+    let mut missing = FxHashMap::default();
+    missing.insert("lan".to_string(), "ghost".to_string());
+    screen.update_missing_profiles(missing);
+    screen
+}
+
 /// Screen state with only the IP source-route check armed. The
 /// check fires on an actual LSRR/SSRR option decoded from the IPv4
 /// options region (post-#2973) read from the frame at the computed
@@ -397,6 +429,185 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
     );
 }
 
+// #5806 (binds the "policy evaluation is unaffected" claim, and records a second
+// finding). The Go-side status text and metric HELP assert that when a zone's
+// screen profile reference does not resolve, "no screen checks are applied to
+// this zone; policy evaluation is unaffected". Go cannot demonstrate that — the
+// decision lives here — so it is bound at the stage where it is decidable.
+//
+// What "policy evaluation is unaffected" MEANS at this seam: the stage must
+// return `StageOutcome::Continue(ScreenCheckOutcome::Pass)` — the EXACT variant,
+// not merely `Continue(_)`. `Continue` alone is too weak: its sibling payload
+// `ScreenCheckOutcome::SynCookieChallenge` also continues, but the caller then
+// answers the packet with a challenge instead of carrying it on to policy, so
+// `Continue(_)` would accept an outcome that does NOT satisfy the claim.
+// `RecycleAndContinue` is the drop outcome.
+//
+// The second subtest records a REAL GAP found while binding this, filed as
+// #6860. It is NOT a property of this change: `stage_screen_check`
+// short-circuits on `!screen.has_profiles()` (poll_stages.rs), and
+// `has_profiles()` is `!self.zones.is_empty()` — the RESOLVED map only. So when
+// the `security screen` stanza is absent ENTIRELY, which is exactly the
+// tolerant-load shape that strands a reference, the stage returns before
+// `maybe_warn_missing_profile` can run and THE RATE-LIMITED RUNTIME WARN
+// specifically cannot fire. Stated precisely: other reporting still exists
+// (tolerant-load configuration warnings, daemon logging), so this is NOT "no
+// diagnostic anywhere" — it is that the runtime dataplane WARN #5806 relies on
+// is unreachable in that configuration.
+//
+// Asserting `warns == 0` alone would bind NOTHING: zero is also the failure
+// default if the missing-profile threading were deleted outright or
+// `update_missing_profiles` were a no-op. The subtest therefore ARMS the gate
+// afterwards on the SAME state — adding a resolved profile for an unrelated
+// zone, leaving the `lan` reference untouched — and requires the warn to
+// appear. That pair distinguishes "the gate suppresses a working mechanism"
+// from "there is no mechanism".
+//
+// RED on revert: make the missing-profile None branch drop instead of pass and
+// the first subtest fails; "fix" has_profiles to count missing zones without
+// re-checking this and the second subtest fails, flagging that the recorded gap
+// changed.
+#[test]
+fn unresolved_screen_profile_zone_continues_to_policy_5806() {
+    let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("reth1.0"),
+        ifindex: 24,
+    };
+    let binding_lookup = WorkerBindingLookup::default();
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        forwarding: &forwarding,
+        mirror_targets: &mirror_targets,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        neighbor_resolver: None,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+
+    let run = |screen: &mut ScreenState| -> (bool, u64) {
+        let frame = tcp_v4_syn_frame_with_l2(Vlan::None, 5);
+        let meta = tcp_v4_syn_meta_with_l2(&frame, Vlan::None);
+        let flow = parse_session_flow_from_bytes(&frame, meta).expect("session flow from SYN");
+        let mut counters = BatchCounters::default();
+        let outcome = stage_screen_check(
+            Some(&flow),
+            &frame,
+            meta,
+            None,
+            TEST_NOW_NS,
+            TEST_NOW_SECS,
+            screen,
+            &mut counters,
+            &worker_ctx,
+        );
+        (
+            matches!(outcome, StageOutcome::Continue(ScreenCheckOutcome::Pass)),
+            screen.missing_profile_warn_count(),
+        )
+    };
+
+    // A zone whose profile reference does not resolve, with the screen stage
+    // actually running: the packet CONTINUES. It is not dropped and the
+    // descriptor is not consumed, so the poll loop goes on to evaluate zone
+    // policy — which is precisely what the operator-facing wording claims.
+    let mut screen = missing_plus_resolved_screen();
+    let (continued, warns) = run(&mut screen);
+    assert!(
+        continued,
+        "#5806: an unresolved screen-profile zone must CONTINUE through the screen          stage (no drop, descriptor not consumed) so policy evaluation still runs"
+    );
+    assert_eq!(
+        warns, 1,
+        "the runtime WARN must fire when the stage actually runs for the zone"
+    );
+
+    // The recorded gap: with NO resolved profile anywhere, has_profiles() is
+    // false, stage_screen_check returns before the missing-profile branch, and
+    // the WARN never fires at all.
+    let mut only_missing = missing_only_screen();
+    assert!(
+        !only_missing.has_profiles(),
+        "#5806: has_profiles() counts RESOLVED profiles only — an unresolved          reference alone does not arm the screen stage"
+    );
+    let (continued, warns) = run(&mut only_missing);
+    assert!(
+        continued,
+        "the short-circuit path must also continue to policy"
+    );
+    assert_eq!(
+        warns, 0,
+        "#6860 GAP (pinned, not fixed here): when every screen definition is \
+         absent — the exact tolerant-load shape that strands a reference — the \
+         has_profiles() short-circuit means the rate-limited runtime WARN cannot \
+         fire at all"
+    );
+
+    // ...and prove that zero is the GATE, not an absent mechanism. Arm
+    // has_profiles() on the SAME state by adding a resolved profile for an
+    // UNRELATED zone; the `lan` reference is untouched. The identical packet now
+    // warns. Delete the missing-profile threading, or make
+    // update_missing_profiles a no-op, and this is 0 too — which is what makes
+    // the assertion above meaningful rather than a restatement of the default.
+    let mut armed = FxHashMap::default();
+    armed.insert(
+        "other".to_string(),
+        ScreenProfile {
+            source_route: true,
+            ..ScreenProfile::default()
+        },
+    );
+    only_missing.update_profiles(armed);
+    assert!(
+        only_missing.has_profiles(),
+        "adding a resolved profile must arm the gate"
+    );
+    let (_, warns_armed) = run(&mut only_missing);
+    assert_eq!(
+        warns_armed, 1,
+        "with the gate armed, the SAME unresolved `lan` reference must warn — \
+         otherwise the zero above proves nothing about the threading"
+    );
+}
+
 /// #2145 regression: a priority-tagged VLAN-0 SYN
 /// (`ingress_vlan_present = 1`, `ingress_vlan_id = 0`) must have its
 /// IP header parsed at offset 18 by the screen + SYN-cookie stages,
@@ -409,6 +620,15 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
 /// source-route did NOT fire, and the SYN passed. An untagged
 /// control frame (with the same IHL-6 header at offset 14) keeps
 /// dropping, proving the assertion is not tautological.
+///
+/// KEEP THIS DOC ADJACENT TO ITS `fn`. #6839 round 2: the #5806 test was
+/// inserted between this block and this declaration. Plain `//` comments are
+/// whitespace to the parser, so the `///` block kept attaching to whatever item
+/// came next — it documented `unresolved_screen_profile_zone_continues_to_policy_5806`
+/// as the #2145 VLAN-0 regression and left this test undocumented. The same
+/// class was already caught and fixed once in this file during the previous
+/// round; it recurs because inserting above a declaration is the natural place
+/// to add code and nothing in the build can see the transfer.
 #[test]
 fn priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18() {
     let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());

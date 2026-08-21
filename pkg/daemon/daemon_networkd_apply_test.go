@@ -20,12 +20,12 @@ func minimalNetworkdDaemon(t *testing.T, networkDir string, ar *dataplane.ApplyR
 	t.Helper()
 	installFakeNetworkctl(t)
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{applyResult: ar},
 		networkd: networkd.NewInDir(networkDir),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{applyResult: ar}) // #2114: publish through the cell
 	cfg := &config.Config{}
 	return d, cfg
 }

@@ -269,8 +269,21 @@ func (m *Manager) ReadAllPolicyCounters(cfg *config.Config) (map[uint32]dataplan
 // cfg should be the config the caller walks for labels/handles so the snapshot's
 // handles line up. dp is taken as any so callers can pass their narrow runtime
 // interface without a shared type.
+//
+// #2114 / Codex PR #6743 r7-N2: the probe resolves through dataplane.Unwrap
+// FIRST. Every one of the seven callers (pkg/api's metrics + security
+// inventory, pkg/cli's show-security paths, pkg/grpcapi's policies-text and
+// zones renders) passes the handle the daemon filled with its live
+// indirection, whose method set is exactly the mandatory management surface
+// — so the bare assertion answered "no bulk provider" for a perfectly
+// healthy userspace helper and every one of them silently dropped to the
+// O(P*(P+C)) per-policy fallback. Same capability-erasure class as the
+// missing Prometheus families, with a performance cliff instead of a
+// missing metric as the symptom. Unwrap is the identity for a plain
+// backend (every test and every pre-#2114 caller) and nil once the daemon
+// has disowned one, in which case the fallback is the correct answer.
 func NewPolicyCounterReader(dp any, cfg *config.Config, fallback func(uint32) (dataplane.CounterValue, error)) func(uint32) (dataplane.CounterValue, error) {
-	provider, ok := dp.(interface {
+	provider, ok := dataplane.Unwrap(dp).(interface {
 		ReadAllPolicyCounters(*config.Config) (map[uint32]dataplane.CounterValue, error)
 	})
 	if !ok {
