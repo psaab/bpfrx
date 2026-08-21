@@ -102,9 +102,22 @@ var (
 	syncAuthFrameMACTag = []byte("xpf-cluster-sync-frame-mac-v1\x00")
 )
 
+// syncAuthZeroNonce is the all-zero challenge nonce — the value a peer whose
+// CSPRNG never seeded emits. It is a comparison target for syncCheckPeerNonce,
+// never something this node sends: localNonce always comes from crypto/rand.
+var syncAuthZeroNonce = make([]byte, syncAuthNonceSize)
+
 var (
 	errSyncFrameAuth   = errors.New("cluster sync: frame HMAC verification failed")
 	errSyncFrameReplay = errors.New("cluster sync: frame sequence replay/regression")
+
+	// Handshake-time nonce rejections (#5078). Distinct sentinels, and distinct
+	// operator-facing text, because they say different things: a reflected
+	// nonce is an ATTACK signature (or a loopback/echo misconfiguration), an
+	// all-zero nonce is a BROKEN PEER. Folding them into one message would
+	// send an operator hunting the wrong fault.
+	errSyncReflectedNonce = errors.New("cluster sync: rejecting reflected handshake nonce (peer echoed our own challenge)")
+	errSyncZeroNonce      = errors.New("cluster sync: rejecting all-zero handshake nonce (peer CSPRNG is not seeded)")
 )
 
 // syncAuthMode is the negotiated auth posture for one sync connection.
@@ -218,6 +231,47 @@ func syncAuthProof(key, challenge []byte) []byte {
 	mac.Write(syncAuthProofTag)
 	mac.Write(challenge)
 	return mac.Sum(nil)
+}
+
+// syncCheckPeerNonce rejects the two degenerate peer challenge nonces, before
+// this node computes a proof over one of them. Returns nil when the nonce is
+// usable.
+//
+// #5078 vector A — REFLECTION. syncAuthProof is HMAC(key, tag ‖ challenge):
+// it carries no role, no node identity, and no transcript, and the accept test
+// is `hmac.Equal(peerProof, syncAuthProof(key, localNonce))`. So a PSK-less
+// attacker that simply ECHOES every byte back authenticates: this node's HELLO
+// returns as the peer HELLO with peerNonce == localNonce, this node computes
+// and sends HMAC(key, tag ‖ localNonce) first, and the attacker replays that
+// same value as the peer proof. Refusing an equal nonce breaks that identity
+// before the proof is emitted, so the echo never obtains the one value it
+// needs.
+//
+// This is NECESSARY, NOT SUFFICIENT, and the distinction is load-bearing: the
+// two-connection variant (vector B) uses a SECOND keyed connection as a proof
+// oracle — the attacker relays a proof computed over connection α's local
+// nonce onto connection β — and there the two nonces on each connection differ,
+// so nothing here fires. Because both nodes share one PSK, that oracle can be
+// the PEER node, which no per-node nonce bookkeeping can see. Closing vector B
+// needs the proof bound to role + identity + transcript, i.e. a new proof
+// construction and a wire flag-day, which #5078 still tracks.
+//
+// The all-zero rejection is the same class of cheap degeneracy check: it is not
+// an entropy test (entropy is unmeasurable from one sample), only a refusal of
+// the single value that a peer with an unseeded CSPRNG emits.
+//
+// Both comparisons are variable-time on purpose. Challenge nonces travel in
+// cleartext in the HELLO — the attacker supplied peerNonce and can observe
+// localNonce — so there is no secret here for a timing side channel to leak,
+// and hmac.Equal would imply one exists.
+func syncCheckPeerNonce(localNonce, peerNonce []byte) error {
+	if bytes.Equal(peerNonce, localNonce) {
+		return errSyncReflectedNonce
+	}
+	if bytes.Equal(peerNonce, syncAuthZeroNonce) {
+		return errSyncZeroNonce
+	}
+	return nil
 }
 
 // syncDeriveFrameKey derives the per-connection frame-MAC key from the PSK and
@@ -436,6 +490,14 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 		// peer that then fences every routing group.
 		_, _, reason := syncAuthDecision(true, true, false, false)
 		return syncAuthUnauthenticated, nil, errors.New(reason)
+	}
+
+	// #5078: refuse a reflected or degenerate peer nonce BEFORE this node emits
+	// a proof over it. Ordered ahead of syncAuthProof deliberately — the proof
+	// this node writes IS the value the echo attack replays back, so a check
+	// that ran after it would already have handed the attacker the answer.
+	if err := syncCheckPeerNonce(localNonce, peerNonce); err != nil {
+		return syncAuthUnauthenticated, nil, err
 	}
 
 	// Both keyed ⇒ mutual challenge-response: prove we hold the key over the

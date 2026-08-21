@@ -4,8 +4,10 @@
 // per-concern layout maps 1:1 onto the new location).
 //
 // Submodules by concern (see each file):
+//   drop_order  — #5192 UMEM-before-munmap field destruction order
 //   mmap_area
 
 use super::*;
 
+mod drop_order;
 mod mmap_area;

@@ -1,3 +1,46 @@
+## 2026-08-21 — #5192 item 1: `WorkerUmemInner` unmapped the UMEM before deleting it
+
+- **Timestamp**: 2026-08-21 (fix/5192-umem-drop-order)
+- **Action**: Swapped the `umem` / `area` field declarations in
+  `WorkerUmemInner` so the libxdp UMEM object is destroyed before the mmap
+  region backing it, and pinned the ordering with a test.
+
+  `xsk_ffi::Umem::new` is `unsafe` on one stated precondition — the caller's
+  `area` must "outlive this Umem". `WorkerUmemInner` owns both halves of that
+  pair and declared `area` first, so Rust's declaration-order field destruction
+  ran `munmap` and only then `xsk_umem__delete`: the pages were released while
+  the UMEM object was still registered against them. Latent rather than a live
+  UAF, because `bridge_xsk_umem_delete` -> `xsk_umem__delete` does not read the
+  user area and the kernel pins UMEM pages while the fd is open — but that
+  mitigation is an unpinned external library's implementation detail, and this
+  box now links libxdp 1.6.3 where the original refutation was written against
+  1.6.0. The fix costs two lines and removes the dependence entirely.
+
+  Rust has NO compile-time drop-order assertion — there is no `const` fact to
+  hang a `const _: () = assert!(..)` on — so inventing one would have been
+  fragile. The order is pinned by OBSERVATION instead: a `cfg(test)`-only
+  `crate::drop_order_probe` that both `Drop` impls append to, and
+  `umem/tests/drop_order.rs` asserting the sequence on the REAL
+  `WorkerUmemInner` (via `WorkerUmem::new_for_test`) and on the
+  `WorkerUmemPool` wrapper production actually builds. The probe is
+  allocation-free (fixed thread-local array, `try_with`) because it runs inside
+  `Drop` and this crate installs a counting global allocator under `cfg(test)`
+  that other tests assert against; a `Vec` push would charge an allocation to
+  whatever hot-path test happened to drop a UMEM inside its window.
+
+  Validation: the test was written BEFORE the swap and observed the defect
+  directly — both cases red at `a77d5568c` with `left: [MmapArea, Umem]`,
+  i.e. munmap first. Green after the swap with `[Umem, MmapArea]`. Full
+  `make test-rust` green. No shim, no Go, no compiled-artifact movement, so no
+  cluster smoke is owed. #5192's second item (the XDP shim's aligned metadata
+  store) is NOT in this change — see below.
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/mmap.rs,
+  userspace-dp/src/afxdp/umem/tests/mod.rs,
+  userspace-dp/src/afxdp/umem/tests/drop_order.rs,
+  userspace-dp/src/afxdp/umem/README.md, userspace-dp/src/drop_order_probe.rs,
+  userspace-dp/src/main.rs, userspace-dp/src/xsk_ffi.rs, _Log.md
+
 ## 2026-08-21 — #6697: the CoS `code-points` BLOCK spelling lost the whole classifier
 
 - **Timestamp**: 2026-08-21 (fix/6697-cos-code-points-spellings)
@@ -98011,6 +98054,39 @@ prose edit above them added. No diff falls in the new test body.
   _Log.md
 
 - **Timestamp**: 2026-08-21
+  - **Action**: #5078 partial — reject reflected/all-zero session-sync handshake nonces
+  - **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync_auth_test.go, pkg/cluster/README.md
+- **Action**: #103 — report the takeover HOLD in cluster status, and correct
+  two stale docs claims about its default. Walking #103's five enumerated
+  sub-conditions against `Daemon.takeoverReadinessForRG` showed items 1a, 1b,
+  2, 3 (peer-alive path) and 4 covered, item 1c covered only for fabric
+  (session-sync is #110), and item 5 covered only for the readiness REASONS —
+  the hold timer was surfaced nowhere. That is not merely missing information:
+  `IsReadyForTakeover` is `Ready` AND `ReadySince+holdTime` elapsed, so inside
+  the hold window `FormatStatus` printed `Takeover ready: yes` while every
+  election gate was actively declining to promote the RG. Verified with a
+  throwaway probe before fixing: with `takeover-hold-time 5000` and a fresh
+  `SetRGReady(0, true, nil)`, `electSingleNode` left the RG `secondary` and the
+  render said `Takeover ready: yes`.
+
+  Added `RedundancyGroupState.TakeoverHoldRemaining` + `Manager.TakeoverHoldTime`
+  and keyed both renders on them. At the default `DefaultTakeoverHoldTime = 0`
+  both renders are byte-identical to before, which bounds the change onto
+  clusters that configured a hold — including `pkg/upgrade`'s precheck, which
+  parses the first token after `Takeover ready:`. Corrected docs/bugs.md and
+  docs/phases.md, which both claimed the default was 3s: it shipped at 3s in
+  `91a57cf` and was changed to 0 in `cd4dbe9`, a bodyless commit.
+
+  Validation: `go test -count=1 ./pkg/cluster/ ./pkg/upgrade/ ./pkg/daemon/
+  ./pkg/cli/ ./pkg/grpcapi/ ./pkg/vrrp/` exit 0. Five single-line mutations,
+  each reding a distinct cell (exit 1 each): FormatStatus hold branch,
+  FormatInformation hold branch, hold-time config line made unconditional,
+  `TakeoverHoldRemaining` losing its `!rg.Ready` guard, and FormatStatus
+  dropping the readiness reasons. Render-only Go control-plane change — no
+  dataplane binary or shim artifact moves.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/manager.go,
+  pkg/cluster/status_takeover_hold_103_test.go, pkg/cluster/README.md,
+  docs/bugs.md, docs/phases.md, _Log.md
 - **Action**: #72 — surface peer-fencing attempts in `show chassis cluster
   information`. `Manager.FenceStatus()` had existed since the fencing
   mechanism landed but had ZERO non-test callers, so acceptance criterion 3
@@ -98066,30 +98142,41 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
 - **Timestamp**: 2026-08-21
-- **Action**: #5081 non-auth half. `transferCommitGracePeriodLocked` sized the
-  manual-transfer grace from the DESIRED heartbeat timing
-  (`m.hbThreshold`/`m.hbInterval`, rewritten by `UpdateConfig` on every commit)
-  while dead-peer detection runs on the receiver's snapshot taken at
-  `StartHeartbeat` — and nothing restarts the heartbeat for a timing change, so
-  after `set chassis cluster heartbeat-interval` the two disagree. A commit that
-  SHORTENS the timing under-runs the grace (desired 3x100ms → the 10s floor,
-  while the running receiver still declares death at 5x1000ms = 5s), so the
-  suppression window can lapse mid-transfer and the transfer takes a spurious
-  peer-death failover. Added `liveHeartbeatTimingLocked` (live receiver values,
-  falling back to desired when no heartbeat runs) and sourced both the grace and
-  `FormatInformation` from it; status now names the committed-but-unapplied
-  values on a `Heartbeat pending restart:` line and is byte-identical when they
-  agree. Applying a committed change to live comms is the remaining half (auth
-  posture + timing in the restart key) and is filed separately.
+- **Action**: #304 live half. The AF_XDP shim diverted every ESP packet and
+  every non-native GRE packet to the kernel on a PROTOCOL-ONLY test with no
+  destination predicate (`userspace-xdp/src/lib.rs`, the two `cpumap_or_pass`
+  returns ahead of the WireGuard branch), so TRANSIT ESP and transit non-native
+  GRE — addressed to a host beyond the firewall — reached the kernel forwarding
+  path with no zone policy evaluated (`ip_forward=1`, every nft chain
+  `policy accept`, no `hook forward` rule, no tc/clsact). The sibling WireGuard
+  branch has a destination gate its own comment calls MANDATORY, and the
+  DEGRADED path (`is_degraded_local_or_control`) already gates ESP on
+  `is_interface_nat_destination` and GRE on native-GRE + inner PASS_TO_KERNEL
+  and drops other transit — so the healthy path was the weaker of the two.
+  Deleted both protocol-only returns; ESP and non-native GRE now fall into the
+  ordinary session-miss classification, whose `is_local_destination` arm already
+  cpumaps a locally-terminated tunnel. Added the one case that arm cannot see:
+  a tunnel endpoint on an address interface-mode SNAT owns, which
+  `is_local_destination` deliberately reports false for — handled by reusing the
+  existing `is_interface_nat_destination` call rather than adding a second
+  lookup. A remote destination now reaches the worker and is adjudicated by the
+  table-scoped #5620 `owns_configured_ip` gate. Not the obvious
+  `is_local_destination` predicate at the original site (global maps; #5620
+  rules it out).
 
-  Validation: `go build ./...` exit 0, `go vet ./pkg/cluster/ ./pkg/dataplane/...`
-  exit 0, `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0. Mutation
-  matrix, one mutation per cell, exit codes from `$?`: revert the grace to
-  `m.hbInterval, m.hbThreshold` → exit 1 (`grace = 10s, want 15s`); revert the
-  status read to `m.hbInterval, m.hbThreshold` → exit 1 (all four render
-  assertions). Restored → exit 0. Go-only diff, no shim `.o` or protocol
-  movement; the change is on the manual-transfer path, so `make test-failover`
-  is owed and was NOT run by this lane.
-- **File(s)**: pkg/cluster/failover.go, pkg/cluster/status.go,
-  pkg/cluster/README.md, pkg/cluster/transfer_grace_live_timing_5081_test.go,
-  _Log.md
+  Validation: pinned toolchain nightly-2026-05-23 + bpf-linker 0.10.2, kernel
+  verifier gate PASS. Baseline rebuild reproduced byte-identically at 773,966
+  insns / 22.60% headroom; candidate 777,901 insns / 22.21% headroom — +3,935
+  insns, −0.39pp, well inside the #4555 floor. (A first shape that added an
+  explicit `is_interface_nat_destination || is_local_destination` conjunct at
+  the original site also verified but cost 810,906 insns / 18.91% — −3.69pp —
+  and was discarded for the reuse form.) `go build ./...` exit 0, `go vet
+  ./pkg/dataplane/...` exit 0, `go test -count=1 ./pkg/dataplane/...` exit 0
+  (manifest/facts gate green). The shim crate is `no_std` for
+  `bpfel-unknown-none` with no host test harness and its predicates read BPF
+  maps, so there is no host-side red for this property; the `.o` moved, so a
+  cluster smoke on the loss userspace cluster is owed and was NOT run by this
+  lane.
+- **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/userspace-dataplane-architecture.md, _Log.md

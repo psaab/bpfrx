@@ -158,6 +158,11 @@ impl MmapArea {
 
 impl Drop for MmapArea {
     fn drop(&mut self) {
+        // #5192: this `munmap` must not run until the `Umem` registered
+        // against the region is gone — see `WorkerUmemInner`'s field
+        // order and `crate::drop_order_probe`.
+        #[cfg(test)]
+        crate::drop_order_probe::record(crate::drop_order_probe::DropTag::MmapArea);
         let _ = unsafe { libc::munmap(self.ptr.as_ptr().cast::<c_void>(), self.mapped_len) };
     }
 }
