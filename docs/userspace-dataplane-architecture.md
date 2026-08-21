@@ -949,9 +949,26 @@ Scope of the fallback:
 
   So the provenance is carried instead. `authoredZoneRefs`
   (`pkg/dataplane/userspace/zones.go`) records the operator's literal
-  `security-zone <z> interfaces <ref>` bindings before any fan-up or fan-down,
-  and `stampEgressZones` resolves them through the same aliasing the builder
-  performs. Three rules, in order:
+  `security-zone <z> interfaces <ref>` bindings — expanded to every identity a
+  reference SPEAKS FOR, but never to one it does not. A BARE interface reference
+  is fanned DOWN onto that interface's configured units, because in xpf
+  `security-zone lan interfaces ge-0/0/1` MEANS "every unit of ge-0/0/1 is in
+  lan": that is the semantics `buildInterfaceZoneMap` defines and the ingress
+  half has always enforced, so a unit of a bare-referenced interface is authored
+  rather than inheriting a sentence about somebody else. A unit-suffixed
+  reference is NOT fanned UP to its base — that is the direction that
+  manufactures a claim about a different identity, since the base netdev is
+  shared with the sibling units the operator said nothing about.
+
+  Omitting the fan-down was measured as a blackhole in its own right: a unit that
+  lands on its OWN netdev (any VLAN unit, any non-zero unit) is reached by
+  neither rule 2 — no reference names its row — nor rule 3, which is skipped
+  because a unit row IS on that ifindex, so a bare-referenced trunk's VLAN units
+  resolved the 0 sentinel on egress while the ingress half still answered the
+  operator's zone. `origin/master` answered the zone in both directions.
+
+  `stampEgressZones` resolves those bindings through the same aliasing the
+  builder performs. Three rules, in order:
 
   1. **Contested ownership → no zone.** An ifindex carrying two or more distinct
      egress identities is one kernel device the config claims twice. That is

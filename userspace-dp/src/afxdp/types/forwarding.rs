@@ -153,8 +153,9 @@ pub(in crate::afxdp) struct ForwardingState {
     /// DECIDED IN GO, CORROBORATED HERE. The answer is `stampEgressZones`
     /// (`pkg/dataplane/userspace/interfaces.go`), which has the two inputs this
     /// side does not: the operator's AUTHORED `security-zone <z> interfaces
-    /// <ref>` bindings before `buildInterfaceZoneMap` fanned them up to bases
-    /// and down onto units, and `snapshotLinuxName` itself. It arrives as
+    /// <ref>` bindings before `buildInterfaceZoneMap` fanned them UP to bases
+    /// (the fan-DOWN onto a bare reference's units is kept — that is what the
+    /// reference means), and `snapshotLinuxName` itself. It arrives as
     /// `InterfaceSnapshot::egress_zone`, identical on every row of an ifindex.
     /// `forwarding_build::interfaces::populate_interfaces` admits it only when a
     /// row on that ifindex literally names that zone — a corroboration, so a

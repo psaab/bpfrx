@@ -155,7 +155,8 @@ pub(super) fn populate_interfaces(
         // ifindex egresses into, because that decision needs two things the
         // rows do not carry: the operator's AUTHORED
         // `security-zone <z> interfaces <ref>` bindings before
-        // `buildInterfaceZoneMap` fanned them up to bases and down onto units,
+        // `buildInterfaceZoneMap` fanned them UP to bases (a bare reference's
+        // fan-DOWN onto its units is kept — that is what the reference means),
         // and `snapshotLinuxName`, the function that collapses several
         // configured identities onto one netdev. A row's `zone` is the OUTCOME
         // of that derivation, and the outcome does not say whether the operator

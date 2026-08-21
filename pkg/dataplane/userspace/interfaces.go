@@ -198,9 +198,11 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			}
 		}
 	}
-	// #6722: the operator's LITERAL zone bindings, before buildInterfaceZoneMap
-	// fanned them up to bases and down onto units. stampEgressZones (run after
-	// this loop) needs the provenance; see authoredZoneRefs in zones.go.
+	// #6722: the operator's LITERAL zone bindings — fanned DOWN onto a bare
+	// reference's units, which is what that reference means, but never fanned UP
+	// from a unit to its base, which is the derivation that manufactures a claim
+	// about a sibling identity. stampEgressZones (run after this loop) needs the
+	// provenance; see authoredZoneRefs in zones.go.
 	//
 	// Bindings to a zone the StableZoneID quarantine will DROP are removed here
 	// rather than scrubbed afterwards. quarantineCollidingZones runs after this
@@ -558,12 +560,14 @@ type egressRowIdentity struct {
 // possible, because a row's Zone is the OUTCOME of two derivations whose inputs
 // the rows no longer carry:
 //
-//   - buildInterfaceZoneMap (zones.go) fans one authored reference up to a base
-//     and down onto units, so a row's Zone may be a restatement of a sentence
-//     the operator wrote about a DIFFERENT identity. Measured: for `ge-0/0/1`
-//     with unit 0 in `lan` and unit 1 in `dmz`, the BASE row carries "dmz" — a
-//     zone nothing on that netdev was ever put in, chosen because "dmz" sorts
-//     before "lan".
+//   - buildInterfaceZoneMap (zones.go) fans one authored reference UP to a base
+//     as well as down onto units, so a row's Zone may be a restatement of a
+//     sentence the operator wrote about a DIFFERENT identity. Measured: for
+//     `ge-0/0/1` with unit 0 in `lan` and unit 1 in `dmz`, the BASE row carries
+//     "dmz" — a zone nothing on that netdev was ever put in, chosen because
+//     "dmz" sorts before "lan". (The fan-DOWN is not such a restatement, and
+//     authoredZoneRefs keeps it: a bare interface reference is a sentence about
+//     every unit of that interface.)
 //   - snapshotLinuxName collapses several configured identities onto one netdev
 //     (a non-VLAN unit 0 onto its base; a RETH and its member, via ResolveReth;
 //     every unit of an interface-level tunnel onto the tunnel device).

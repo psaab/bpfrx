@@ -41,26 +41,46 @@ func hostIPFromCIDR(s string) string {
 }
 
 // authoredZoneRefs returns the operator's LITERAL `security-zone <z> interfaces
-// <ref>` bindings — canonicalised through CanonicalInterfaceUnitRef so ".01" and
-// ".1" agree with the snapshot's unit naming, but NOT fanned up to a base and
-// NOT fanned down onto units (#6722).
+// <ref>` bindings, expanded to every logical identity the reference SPEAKS FOR
+// but never to one it does not (#6722):
 //
-// It is the PROVENANCE half of buildInterfaceZoneMap. That map deliberately
-// derives: a unit-suffixed reference also writes `out[base]`, and a bare
-// reference also writes `out[base.<unit>]` for every configured unit. Those
-// derived entries are right for the INGRESS attribution they were built for, but
-// they are restatements of one operator sentence, not independent statements —
-// and once several config identities collapse onto ONE netdev
-// (`snapshotLinuxName`), a derived entry becomes indistinguishable from an
+//   - canonicalised through CanonicalInterfaceUnitRef, so ".01" and ".1" agree
+//     with the snapshot's unit naming;
+//   - a BARE interface reference is fanned DOWN onto that interface's configured
+//     units, because in xpf `security-zone lan interfaces ge-0/0/1` MEANS "every
+//     unit of ge-0/0/1 is in lan" — that is the semantics buildInterfaceZoneMap
+//     defines and the ingress half has always enforced, so a unit of a bare-
+//     referenced interface really is authored, not inheriting a sentence about
+//     somebody else;
+//   - a unit-suffixed reference is NOT fanned UP to its base. That is the
+//     direction that manufactures a claim about a DIFFERENT identity: `st0.1`
+//     names one unit, and writing `st0` from it says something about `st0.0`
+//     (which shares the base netdev) that the operator never said.
+//
+// It is the PROVENANCE half of buildInterfaceZoneMap. That map derives in BOTH
+// directions; only the fan-UP is a restatement of a sentence about another
+// identity, and once several config identities collapse onto ONE netdev
+// (`snapshotLinuxName`) such a derived entry becomes indistinguishable from an
 // authored one by inspection of the result alone. stampEgressZones (the sole
 // consumer of this map, in interfaces.go) needs to tell them apart, so the
 // provenance is recorded here rather than
 // reconstructed downstream from the outcome. Reconstructing it is exactly what
 // #6722 attempted four times, and each attempt was holed by a new config shape.
 //
+// FAIL-ON-REVERT for the fan-down: drop it and
+// TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722 goes RED. Without it a
+// unit that lands on its OWN netdev (any VLAN unit; any non-zero unit) is
+// reached by NEITHER rule 2 — no authored reference names its row — NOR rule 3,
+// which is skipped precisely because a unit row IS on that ifindex. The ifindex
+// resolves no egress zone at all while its rows carry the operator's zone, so
+// the INGRESS half attributes traffic to `lan` and the EGRESS half answers the 0
+// sentinel: every transit flow out of a bare-referenced trunk's VLAN units falls
+// to the default policy. origin/master answered the operator's zone there.
+//
 // The write policy mirrors buildInterfaceZoneMap exactly — sorted zone names,
-// first-write-wins — so a reference claimed by two zones resolves to the SAME
-// zone in both maps and this function introduces no second opinion about it.
+// first-write-wins, same fan-down over the same unit set — so a reference
+// claimed by two zones resolves to the SAME zone in both maps and this function
+// introduces no second opinion about it.
 func authoredZoneRefs(cfg *config.Config) map[string]string {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
@@ -83,6 +103,24 @@ func authoredZoneRefs(cfg *config.Config) map[string]string {
 			iface := config.CanonicalInterfaceUnitRef(rawIface)
 			if _, exists := out[iface]; !exists {
 				out[iface] = zoneName
+			}
+			// A unit-suffixed reference speaks for exactly that unit. Do NOT
+			// write the base (that is buildInterfaceZoneMap's fan-UP, the
+			// derivation this map exists to keep out).
+			if base, unit, ok := strings.Cut(iface, "."); ok && base != "" && unit != "" {
+				continue
+			}
+			// A bare reference speaks for every configured unit of the
+			// interface. Mirrors buildInterfaceZoneMap's fan-down exactly,
+			// including that a present-but-nil unit slot still takes a key, so
+			// the two maps hold the same references.
+			if ifCfg := cfg.Interfaces.Interfaces[iface]; ifCfg != nil {
+				for unitNum := range ifCfg.Units {
+					unitName := fmt.Sprintf("%s.%d", iface, unitNum)
+					if _, exists := out[unitName]; !exists {
+						out[unitName] = zoneName
+					}
+				}
 			}
 		}
 	}
