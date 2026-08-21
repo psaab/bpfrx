@@ -268,6 +268,38 @@ const axisKeyMaxDepth6812 = 8
 //	    registry then forces someone to justify in writing;
 //	(e) STOP the test.
 //
+// THREE PRECISION NOTES, all measured this round (#6812 round 12), because each
+// is the kind of thing a reader would otherwise have to re-derive:
+//
+//  1. THE SCHEMA WALK IS TRANSITIVE; GUARDEDNESS IS NOT. Recursing a nil
+//     pointee walks that pointee's own pointer fields too, bounded only by the
+//     depth cap — TestCollectorEnumeratesANilPointeesFields_6812 asserts a
+//     column two indirections behind an always-nil gateway. So "a new field
+//     cannot be silently omitted" holds all the way down. What stops at the
+//     gateway is COVERAGE: every column under an absent pointer is constant, so
+//     each is a registered blind spot, and "a sort keyed through this pointer is
+//     guarded" holds nowhere below it. The two are easy to conflate and only the
+//     first is a closure claim.
+//
+//  2. A SEQUENCE'S CONTENT IS TOTAL; ITS PER-INDEX ORDERING IS NOT. `.all` and
+//     `.entries` are injective over contents, so no change to a slice tail or a
+//     map entry can be invisible. But the only per-element column is `[0]`:
+//     there is no `[1]`, and no per-entry column at all. A comparator keying
+//     specifically on `x[1]`, or on one map entry, therefore has no column of
+//     its own — neither asserted non-monotone nor registered. Live today for
+//     PoolAddresses / Pool.Addresses, whose `[1]` does not exist (measured).
+//     Narrower than "the tail is unswept": the tail is visible, its ordering is
+//     not.
+//
+//  3. time.Time IS SPECIAL-CASED FOR A REASON. The generic struct walk would
+//     read `wall`, `ext` and `loc.nil`, and `wall` carries the monotonic-clock
+//     flag in bit 63 — so its lexicographic order is NOT chronological and the
+//     collector's central invariant would break silently for it. The special
+//     case encodes UnixNano instead, and cell P5 measures that it is
+//     load-bearing. The residual: any OTHER type whose in-memory representation
+//     is not order-isomorphic to its semantic order takes the generic walk and
+//     would break the invariant the same way. No such type is swept today.
+//
 // Keys are TAGGED. A present value encodes as "\x01"+key, an absent one as
 // "\x00". Absent sorts below every present key, and a uniform present-prefix
 // preserves order among present keys — so a column that is absent in some slots
@@ -562,9 +594,25 @@ func sweepAxes6812(t *testing.T, what string, groups []axisGroup6812, exempt map
 	// next whether this fixture is closed. `go test -v` prints all three lists,
 	// and the middle one is the answer to "what is still blind here".
 	//
-	// READ A RISING BLIND COUNT AS THE FIX WORKING, NOT AS A REGRESSION. Round 10
-	// reported 74 fixture-constant columns; round 11 reports 140, over a column
-	// universe that grew from 108 cells to 188. Nothing became blind. The
+	// EVERY COUNT HERE NEEDS ITS POPULATION, and there are TWO (#6812 round 12).
+	// Rounds 10 and 11 both reported a "guarded columns" figure that was really
+	// a CELL count — the same column swept at two groupings counts twice — so
+	// round 10's "25 guarded" was 22 distinct columns and round 11's "30" was
+	// likewise inflated. Stated with their populations, measured at this head:
+	//
+	//	POPULATION A, CELLS (sweep x column):  186 = 29 guarded + 139
+	//	                                       fixture-constant + 18 prod-constant
+	//	POPULATION B, DISTINCT COLUMNS:        129 = 25 guarded somewhere +
+	//	                                       104 never guarded
+	//	                                       (builder 57 cols, walk 72)
+	//
+	// Population B is the honest answer to "how much of the struct is guarded";
+	// population A is the honest answer to "how many assertions does the sweep
+	// make". Neither is wrong, and quoting one while naming the other is.
+	//
+	// AND READ A RISING BLIND COUNT AS THE FIX WORKING, NOT AS A REGRESSION.
+	// Round 10 reported 74 fixture-constant columns and this reports 139, over a
+	// universe that grew from 108 cells to 186. Nothing became blind. The
 	// collector stopped SILENTLY SKIPPING nil pointees, list schemas and
 	// container contents, so holes that already existed started being counted.
 	// A blind-spot count that rises after a fix to the instrument is the

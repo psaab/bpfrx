@@ -80123,3 +80123,37 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go (new),
   pkg/config/nat_source_axis_sweep_6812_test.go,
   docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-20T09:20Z
+- **Action**: #6815 round 12 — the derived-key guard contained the fixture
+  coincidence it was built to catch. Round 11's wrapper recomputed
+  `len(members) × width`; production spends `Σ host-count × range` (and the Rust
+  boundary the expanded `total_pool`), and the three agreed only because every
+  fixture pool member was a bare host. Fixed by CONSULTING: the walk wrapper now
+  carries ChargeAddrs/ChargePortCap read from sourceNATAggregateReferencedCharges,
+  and the builder wrapper LOSES its derived column rather than gaining a
+  corrected one — the builder computes no charge and the value lives in Rust, so
+  writing it there would be the second implementation the finding is about.
+  Falsifiable now: one pool carries a /30, so a bare-host fixture (which agrees
+  with both formulas and proves neither) reds. Measured D1 revert-the-/30 RED,
+  D2 recompute-the-naive-product RED. Counts re-derived WITH their populations —
+  rounds 10 and 11 both quoted CELL counts as column counts; at this head
+  population A (cells) 186 = 29+139+18, population B (distinct columns) 129 = 25
+  guarded-somewhere + 104 never. Rust MUT-C re-measured with a true control and
+  `--no-fail-fast` (a CARGO flag; after `--` the test binary rejects it and the
+  cell VOIDs): control module rc=0 17/0, MUT-C single GREEN, MUT-C module rc=101
+  RED on the three reserve-before-admit tests — round 10's cell was right and
+  scope-less. My first re-measurement produced a RED control that would have
+  refuted the finding; it was the harness, a relaunch while the previous instance
+  was live so the second run's backup captured the first's mutation. Caught by
+  diffing the scratch against the worktree HEAD before reporting; the harness now
+  takes a flock and asserts pristine-vs-git. Three precision notes added, each
+  measured: the schema walk IS transitive but guardedness is not; a sequence's
+  content is total (`.all`/`.entries`) while its per-index ordering is not (no
+  `[1]` column); and time.Time is special-cased because `wall` carries the
+  monotonic flag in bit 63 and is not chronologically ordered.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md

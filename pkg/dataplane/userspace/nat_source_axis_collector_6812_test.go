@@ -31,9 +31,14 @@ func collectAxisColumns6812(t *testing.T, v any) map[string]string {
 	return out
 }
 
+type axisProbeDeep6812 struct {
+	Gamma string
+}
+
 type axisProbePointee6812 struct {
-	Alpha string
-	Beta  int
+	Alpha  string
+	Beta   int
+	Deeper *axisProbeDeep6812
 }
 
 type axisProbePtr6812 struct {
@@ -61,6 +66,23 @@ func TestCollectorEnumeratesANilPointeesFields_6812(t *testing.T) {
 			"would collide with a pointee that really carries the zero value",
 			got, axisAbsentKey6812)
 	}
+	// TRANSITIVE, not one indirection deep (#6812 round 12). The schema walk
+	// recurses through a nil pointee's OWN pointer fields, bounded only by the
+	// depth cap, so a field added two indirections behind an always-nil gateway
+	// still produces a column. What is NOT transitive is GUARDEDNESS: every
+	// column under an absent gateway is constant, so each is a registered blind
+	// spot. "A new field cannot be silently omitted" holds all the way down; "a
+	// sort keyed through this pointer is guarded" holds nowhere below the
+	// gateway.
+	if _, ok := cols["P.Deeper.Gamma"]; !ok {
+		t.Fatalf("the schema walk stopped at ONE indirection: no P.Deeper.Gamma column "+
+			"(got %v). A field two pointers deep behind an always-nil gateway would then "+
+			"be silently omitted.", keysOf6812(cols))
+	}
+	if _, ok := cols["P.Deeper.nil"]; !ok {
+		t.Fatalf("no P.Deeper.nil gateway column (got %v)", keysOf6812(cols))
+	}
+
 	live := collectAxisColumns6812(t, axisProbePtr6812{P: &axisProbePointee6812{}})
 	if live["P.Alpha"] == axisAbsentKey6812 {
 		t.Fatal("a PRESENT pointee with a zero field encoded as absent; the two states must " +

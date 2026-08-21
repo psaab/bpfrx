@@ -1614,3 +1614,109 @@ outside the marked region.
 
 Measured: dropping the slice `.len` column in ONE twin reds both halves —
 `differ at region line 141`, and `ONLY IN THE GOLDEN (5)`.
+
+## Round 12 — the guard contained the coincidence it was built to catch
+
+Hostile review at `cade69ad9`, sorted against round 11. MERGE-NEEDS-MINOR; nothing
+blocks.
+
+### The derived-key wrapper computed a different formula from production
+
+Round 11 added a wrapper column because a key DERIVED from fields by arithmetic
+cannot be reached by reflection, and filled it by RECOMPUTING one:
+`DerivedPortCapacity = len(members) × width`. Production spends something else —
+`sourceNATAggregateReferencedCharges` spends
+`Σ sourceNATPoolMemberHostCount(member) × portRange`, and that helper returns
+`2^hostbits` for a CIDR member; the Rust boundary spends `allocator_capacity`
+over the EXPANDED addresses.
+
+The three agreed only because every fixture pool member was a bare host. So the
+construct added to close a fixture coincidence contained one, and no registry
+entry was owed for it because the substitute still varied. It is also the
+re-derive-instead-of-consult defect this PR fixed at F2 round 3, reintroduced
+inside the guard.
+
+**A wrapper column asserting a derived key is a second implementation of that
+key, and second implementations drift.** Fixed by consulting:
+
+- the walk-side wrapper carries `ChargeAddrs` / `ChargePortCap` read straight out
+  of the production charge walk, indexed by pool name;
+- the builder-side wrapper LOSES its derived column rather than gaining a
+  corrected one. The builder computes no charge and the value it would need lives
+  in Rust, so writing it there would be exactly the second implementation. The
+  inputs a capacity derives from — PortLow, PortHigh, PoolAddresses and its
+  `.len` / `.all` — stay swept and de-correlated on their own.
+
+Two halves, because the first alone is unfalsifiable: the columns EQUAL
+production because they are read from it, and the fixture can TELL THE TWO
+FORMULAS APART — one pool now carries a `/30`, four hosts against one member.
+A fixture of bare hosts agrees with both formulas and proves neither.
+
+| cell | mutation | result |
+|---|---|---|
+| D1 | revert the `/30` member to a bare host | RED — `no pool in this fixture distinguishes len(members) × width from the production charge` |
+| D2 | recompute the naive product in the wrapper | RED — `pool "qb": the swept slot does not carry the production charge (addrs 5/5, portCap 2000/5000)` |
+
+### The counts needed their POPULATION, and there are two
+
+Rounds 10 and 11 both reported a "guarded columns" figure that was really a CELL
+count — the same column swept at two groupings counts twice. Round 10's "25
+guarded" was 22 distinct columns. Re-derived at this head:
+
+| population | total | guarded | fixture-constant | production-constant |
+|---|---|---|---|---|
+| A — cells (sweep × column) | 186 | 29 | 139 | 18 |
+| B — distinct columns | 129 | 25 somewhere | 104 never | — |
+
+Population B answers "how much of the struct is guarded"; A answers "how many
+assertions does the sweep make". Quoting one while naming the other is the
+defect. Both are now in the file beside the code that prints them, together with
+the sentence that a rising blind count is the instrument seeing further.
+
+### The Rust MUT-C cell mixed denominators — and my re-measurement nearly repeated the error
+
+Round 10 recorded MUT-C GREEN without its scope. Re-measured with a true
+control, `--no-fail-fast` (a CARGO flag — after the `--` separator the test
+binary rejects it and the cell VOIDs):
+
+| cell | scope | result |
+|---|---|---|
+| control | module | rc=0, 17 passed, 0 failed |
+| control | single test | rc=0 |
+| MUT-C | single test | **GREEN** — what round 10 recorded |
+| MUT-C | module | **rc=101 RED** — `reused_keys_reserve_budget_before_a_new_key_is_admitted_6812`, `incremental_applies_cannot_creep_past_the_cap_6812`, `reuse_consumes_budget_and_preserves_last_good` |
+
+The first attempt at this produced a RED control, which would have refuted the
+finding. It was the harness: the script had been relaunched while the previous
+instance was still running, so the second run's `cp $SRC $ORIG` captured the
+first run's MUTATION as its pristine baseline, and both its cells were MUT-C.
+Caught by diffing the scratch source against the worktree HEAD before reporting.
+
+That is a third face of one primitive. `git checkout <ref> -- path` cannot
+restore an untracked file, cannot remove a file absent from the ref, and — this
+one — a backup is only a baseline if something checked it was pristine. The
+common shape is that **the restore reference itself is unverified**. The harness
+now takes a `flock` and asserts the scratch source equals the worktree HEAD
+before it runs.
+
+### Three precision notes, measured and recorded rather than left implicit
+
+1. **The schema walk is TRANSITIVE; guardedness is not.** Recursing a nil
+   pointee walks that pointee's own pointer fields too — a column two
+   indirections behind an always-nil gateway exists, asserted by the probe. So
+   "a new field cannot be silently omitted" holds all the way down. What stops
+   at the gateway is COVERAGE: every column under an absent pointer is constant,
+   hence a registered blind spot. Only the first is a closure claim.
+2. **A sequence's content is total; its per-index ordering is not.** `.all` and
+   `.entries` are injective over contents, so no slice-tail or map-entry change
+   is invisible. But the only per-element column is `[0]` — there is no `[1]`
+   (measured, for PoolAddresses / Pool.Addresses) and no per-entry column at
+   all. A comparator keying specifically on `x[1]` has no column of its own.
+   Narrower than "the tail is unswept": the tail is visible, its ordering is not.
+3. **`time.Time` is special-cased for a reason.** The generic struct walk would
+   read `wall`/`ext`/`loc.nil`, and `wall` carries the monotonic-clock flag in
+   bit 63, so its lexicographic order is not chronological and the collector's
+   central invariant would break silently. Cell P5 measures the special case is
+   load-bearing. The residual: any other type whose in-memory representation is
+   not order-isomorphic to its semantic order takes the generic walk. None is
+   swept today.
