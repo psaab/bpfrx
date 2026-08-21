@@ -98065,3 +98065,38 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+
+## 2026-08-21 — #5250 LOW cohort: six trivially-bounded Go items
+
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed six of the ten live items on the #5250 ps-review-042 LOW
+  cohort. (1) A8-b2 F3: applied the existing `clampInt32` at the three
+  unclamped int32 protobuf hand-offs and moved the NAT session accumulators to
+  int64 so they cannot wrap while being built. (2) A3-b2 F3: narrowed the
+  host-inbound lifeline fabric fallback from `HasPrefix("fab")` to an exact
+  `fab<digits>` match, so an interface named `fab-foo` no longer gains a silent
+  host-inbound deny bypass (a configured fabric/control link still reaches the
+  set from the chassis-cluster stanza). (3) A6-b2 F1: `ForEachSnapshotNeighbor`
+  now snapshots under `m.mu` and invokes the callback with the lock released —
+  a re-entrant callback used to self-deadlock. (4) A7-b1 F1:
+  `parseEthtoolCoalesce` raises the scanner line cap to 1 MiB and reports
+  `parsed=false` on a scan error, so a long line no longer yields a silently
+  partial parse and per-commit ethtool rewrite churn. (5) A7-b2 F2:
+  `readQueueCount` returns an error distinct from a zero count; on a sysfs read
+  failure the RSS path restores the kernel-default indirection table instead of
+  silently leaving a stale concentrated one live. (6) A9 F3: the default-TTL
+  route-mask cache is now a process singleton, so per-commit exporter rebuilds
+  stop spawning fresh uncancellable background netlink lookups and stop
+  restarting from a cold cache. Each fix carries a fail-on-revert test; the
+  8-cell mutation matrix was green/red/green with zero unsound cells. Go-only
+  diff, no shim `.o` or protocol movement, so no cluster smoke is owed.
+- **File(s)**: pkg/grpcapi/server_helpers.go, pkg/grpcapi/server_nat.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_total_clamp_5250_test.go,
+  pkg/config/lifeline.go, pkg/config/lifeline_fabric_exact_5250_test.go,
+  pkg/dataplane/userspace/manager_neighbor.go,
+  pkg/dataplane/userspace/neighbor_callback_unlocked_5250_test.go,
+  pkg/daemon/coalescence.go, pkg/daemon/coalescence_scan_bound_5250_test.go,
+  pkg/daemon/rss_indirection.go, pkg/daemon/rss_indirection_test.go,
+  pkg/daemon/rss_queue_count_error_5250_test.go, pkg/flowexport/routemask.go,
+  pkg/flowexport/routemask_singleton_5250_test.go, docs/junos-cli-reference.md,
+  docs/host-inbound-service-matrix.md, docs/config-schema.md, _Log.md
