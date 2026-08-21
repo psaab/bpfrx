@@ -640,10 +640,61 @@ handle itself — **#6741**, not this wrapper.
 - `New() *Manager` — `loader.go`.
 - `Compile(cfg *config.Config) (*CompileResult, error)` — multi-phase
   lowering to BPF map entries. Phases live in `compiler.go`: zone IDs,
-  screen profile IDs, zones, address book, applications, policies,
-  NAT, static NAT, NAT64 prefixes, NPTv6, screen profiles, default
-  policy, flow timeouts, firewall filters, flow config, port
-  mirroring.
+  screen profile IDs, **validate-before-mutate pre-pass**, zones, address
+  book, applications, policies, NAT, static NAT, NAT64 prefixes, NPTv6,
+  screen profiles, default policy, flow timeouts, firewall filters, flow
+  config, port mirroring.
+  - The pre-pass (`compiler_validate_4960.go`, #4960) re-runs the fallible
+    HOST-PURE phases against a discarding dataplane BEFORE the zones phase
+    performs the first destructive host netlink mutation, so a config that
+    passes `commit check` but trips a later phase is REJECTED with nothing
+    mutated instead of half-applied with no undo path. It can therefore fail
+    the whole compile on its own. It is additive — every real phase keeps its
+    position — but it does change WHICH error an operator sees when a config
+    carries more than one fault. Precedence is the pre-pass ROW ORDER, because
+    the pre-pass returns on the first failing row. An unknown screen-profile
+    reference is now reported by a pre-pass row (`zone screen references`)
+    sitting FIRST in the table, so it is the error an operator sees when a
+    config carries it alongside any other pre-pass fault. It remains a
+    zones-phase fault as well — #6894 hoisted `validateZoneScreenReferences`
+    to the top of `compileZones`, so a caller reaching that phase without the
+    pre-pass still rejects before any zone is programmed. The earlier wording
+    ("no longer a zones-phase fault at all") described only the pre-pass half
+    and read as though the zones-phase check had been removed. Read the order off `validationPhases` rather than trusting this
+    sentence — the previous wording had the two the wrong way round. That file
+    states what the pre-pass
+    does and does not cover; the coverage table is not the whole compile.
+  - **The pre-pass is only as good as the phases' own strictness** (#6894 r9,
+    #4960). A row that ACCEPTS what the Rust helper later REJECTS puts the
+    half-applied state back: the helper's rejection lands at
+    `publishSnapshotFailClosedLocked`, after the zones phase has already
+    created VLANs and reconciled addresses. NPTv6 was such a row —
+    `compileNPTv6` warned and skipped an unparseable / length-mismatched /
+    host-bits-set prefix while `Nptv6State::try_from_snapshots` rejects the
+    WHOLE snapshot over it (`userspace-dp/src/nptv6.rs`, #2240/#4519). It now
+    returns an error for those, so the same certain failure happens BEFORE the
+    mutation. The error is scoped to rules the helper actually REFUSES, which is
+    not the same as "Go cannot parse it" (#7077): Rust's `parse_prefix` takes a
+    leading `+` on the mask (`u8::from_str`) where Go's `net.ParseCIDR` does not,
+    so `fd00:9::/+48` is a Go parse error and a helper ACCEPT whose apply
+    succeeds today. `nptv6HelperWouldInstall` mirrors the helper's grammar (drift
+    is bound by a rustc-measured parity table) so that class keeps warn-and-skip;
+    a skipped rule still reaches the helper because `buildNptv6Snapshots` copies
+    the config strings independently. The error is also scoped to rules that
+    actually reach the helper at all:
+    `config.NPTv6ScopeUnsupported` is the shared predicate the snapshot builder
+    uses to DROP a rule (#5818), and a dropped rule keeps the warn-and-skip
+    disposition because today's apply succeeds without it. **Residual:** the
+    helper also rejects OVERLAPPING NPTv6 prefixes (#2241) partitioned by zone
+    scope (#5176); the pre-pass does not replicate that partitioning, so an
+    overlap still fails post-mutation. Replicating it coarsely would REJECT
+    configs the helper accepts, which is worse than the residual.
+  - **No-brick note.** A pre-pass rejection cannot strand a boot or an HA
+    peer-sync: `configstore.Store.Load` and `Store.SyncApply` compile through
+    `pkg/config.compileTreeLenient` and never reach `pkg/dataplane.CompileConfig`
+    at all. The config still loads with the warning `validateNPTv6Strict` emits
+    on the tolerant path; what fails is the dataplane apply, which already
+    failed at publish before this change.
 - `CompileResult` — `compiler.go`. Zone/policy/NAT/app IDs, compiled
   policy-scheduler rule slots, and the per-interface networkd configs.
 - Session iteration: `IterateSessions`, `BatchIterateSessions`,
