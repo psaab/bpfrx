@@ -2189,6 +2189,24 @@ type compileOpts struct {
 	// statement. See foldLoginClassDenyToRepairableFloor.
 	lenientLoginClassDeny bool
 
+	// lenientBridgeDomainVlanID (#6687) downgrades the bridge-domain
+	// `vlan-id-list` parse / range gate from a hard compile error to a
+	// cfg.Warnings entry plus a dropped value. The strict commit /
+	// commit-check path rejects a non-numeric or out-of-range (not 1-4094)
+	// id in ANY slot of the list; before #6687 only slot 0 was examined, so
+	// `vlan-id-list [ 10 99999 ]` committed clean and compiled as VLAN 10.
+	// Widening the read without this flag would make a config that the old
+	// gate ACCEPTED refuse to boot after an upgrade, which is precisely what
+	// the tolerant load / peer-sync path exists to prevent (#1960). The
+	// dropped value was never installed under the old compiler either, so a
+	// leniently-loaded config carries exactly the VLAN set master compiled —
+	// only the warning is new. This is a per-value decision inside
+	// compileBridgeDomains rather than a declarative typed leaf, so the check
+	// does NOT live in SchemaValidate; putting it there would also mask the
+	// tail, since a strict schema gate firing first hides whether the
+	// compiler's own check ever ran. Same doctrine as lenientSNMPTrapGroup.
+	lenientBridgeDomainVlanID bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2312,6 +2330,7 @@ func lenientCompileOpts() compileOpts {
 		lenientBGPNeighborPeerAS:               true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
+		lenientBridgeDomainVlanID:              true,
 		lenientDDNSDuration:                    true,
 		lenientPolicyTerminalAction:            true,
 		lenientPolicyLogAction:                 true,

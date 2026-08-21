@@ -1039,12 +1039,29 @@ control so an ACCEPT only counts beside a REJECT of the same token:
 |---|---|---|---|
 | CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 |
 | `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
-| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
+| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 — **CLOSED**, see below |
 
 Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
 reads `child.Keys[1:]` plus the inline tail and never `child.Children`, while
 the archive-sites loop reads children and only slot 1 of the tail. "Which shape
 escapes" is a property of the individual reader; do not generalise from one.
+
+**Closing a gate escape owes a SEVERITY SPLIT, not just a widened read
+(#6687).** `vlan-id-list` is now read with `multiLeafAuthoredValues` and every
+authored id runs the parse and range checks, so `[ 10 99999 ]` is rejected
+exactly as `vlan-id-list 99999` always was. But the values it now examines are
+values the OLD gate accepted: a config carrying a bad id in slot 1 committed
+clean, persisted, and would refuse to BOOT after the upgrade if the widened
+check kept its old severity on every path. So the check is split the way every
+other AST-level gate in this compiler is split (`compiler_opts.go`): strict
+(commit / commit-check) hard-rejects naming the value, lenient (tolerant load /
+peer-sync, `lenientBridgeDomainVlanID`) warns and drops that one id. The
+leniently-loaded config therefore carries exactly the VLAN set master compiled —
+the bad id was never installed on either build — and only the warning is new.
+The check stays in the compiler rather than moving to a typed `validator` in
+`setSchema` for a second reason: a strict schema gate firing FIRST would mask
+whether the compiler's own loop ever widened, so the regression test could not
+tell a fix from a no-op.
 
 **And an escape can become live when someone else fixes the value-drop.** The
 archive-sites escape is inert TODAY only because the value is also dropped. A
@@ -1075,8 +1092,9 @@ empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
 
-**SIX leaf families, SEVEN read sites — the category table above has FOUR rows
-and is not the inventory.** The four rows classify EMPTY-VALUE semantics, and
+**SIX leaf families, SEVEN read sites AT #6673 — the category table above has
+FOUR rows and is not the inventory.** (The table is appended to as later fixes
+land; row 8 is #6687's, and the counts in this sentence describe #6673 only.) The four rows classify EMPTY-VALUE semantics, and
 its `Reader` column names four reader mechanisms because two of them serve two
 leaves each. Counting rows (or readers) undercounts what this change had to
 widen. The inventory is:
@@ -1090,6 +1108,7 @@ widen. The inventory is:
 | 5 | `security nat proxy-arp … address` | `compiler_nat_source.go` `compileNAT` | `proxyARPAddressValues` | yes |
 | 6 | `event-options … attributes-match` | `compiler_services.go` `eventAttributesMatchExprs` | `eventMultiWordLeafValues` (tail + each child) | yes |
 | 7 | `event-options … then change-configuration commands` | `compiler_services.go` `eventChangeConfigCommands` | `eventMultiWordLeafValues` (tail + each child) | yes |
+| 8 | `bridge-domains <bd> vlan-id-list` | `compiler_services.go` `compileBridgeDomains` | `multiLeafAuthoredValues` | yes (added by #6687, after this inventory was written) |
 
 Family 3 has TWO read sites, and that is the whole reason the count differs from
 the family count: the `flag` leaf is read once by the compiler and once by the
@@ -1106,7 +1125,6 @@ bundled, because each needs its own value-domain gate widened in the same change
 |---|---|---|
 | CoS DSCP / IEEE classifier `code-points` | reads tail, never `Children` | #6697 |
 | `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
-| `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
 ### The list above is now enforced by a gate, not maintained by hand
