@@ -250,16 +250,34 @@ func buildTracerouteArgv(req TracerouteRequest) []string {
 // which the cell only EMPTIES is therefore byte-identical to the untorn
 // one.
 //
-// That scope is deliberate: the argument is about MONOTONE schedules and
-// does not cover a REFILL. If the cell empties before load 2 and is
-// RE-PUBLISHED before load 3, dpProbe() is nil so the userspace arm is
-// skipped, and GetMapStats() then resolves the new backend and emits MAP
-// rows where an untorn view of either instant would have emitted
-// userspace rows — a different body, not a byte-identical one. Commit-
-// confirmed rollback re-arms the dataplane, so that schedule is real
-// rather than hypothetical. Recorded, not fixed, here: closing it means
-// the same single-load conversion the gRPC and CLI peers took two passes
-// to finish.
+// That scope is deliberate: the argument covers MONOTONE schedules and not
+// a REFILL. If the cell were to empty before load 2 and be RE-PUBLISHED
+// before load 3, dpProbe() would be nil so the userspace arm is skipped,
+// and GetMapStats() would then resolve the new backend and emit MAP rows
+// where an untorn view of either instant would have emitted userspace rows
+// — a different body, not a byte-identical one.
+//
+// #6743 r6-B3, correcting r5: that schedule is NOT reachable in a running
+// daemon, and the example r5 gave for it was doubly wrong. Commit-confirmed
+// rollback does not empty the cell at all — bootstrap.go's teardown calls
+// Teardown() and deliberately KEEPS the object ("Keep the object so a later
+// confirmed commit re-arms it via runBootstrapExitStartup"), a retention
+// contract daemon_dp_live.go states again and TestDataplaneCell_Rollback-
+// RearmRecurrence pins. Unwrap and resolve key on the cell's NIL-ness, never
+// on armed-ness, so on that path load 2 resolves the retained backend and
+// the userspace arm is not skipped: the scenario's own premise never holds
+// there. More generally the cell is MONOTONE within a daemon lifetime —
+// exactly one production site publishes a non-nil value
+// (daemon_run_bringup.go's setupDataplaneAndInitialConfig, reached once from
+// the boot phase list), and every other writer publishes nil. So the refill
+// arm above is a statement about a shape this handler could take, not a gap
+// it has.
+//
+// That premise is load-bearing for the paragraph above, so it is bound
+// rather than asserted: pkg/daemon's TestDataplaneCellRefilledOnlyAtBoot
+// reds if a second non-nil publication site appears. If you are reading
+// this because that test failed, the byte-identity argument here is what
+// your change invalidated.
 //
 // What remains is a SURFACE gap: for identical daemon state gRPC and CLI
 // print "Dataplane not loaded", while REST returns 200 with an empty list,

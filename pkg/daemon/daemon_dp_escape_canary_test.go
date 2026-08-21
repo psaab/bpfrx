@@ -64,11 +64,16 @@ import (
 //	   liveDataplane(). A discarded call satisfies nothing. Kills C7 a
 //	   second time, independently of R1.
 //
-//	R3 (the consumer's DP field). ANY qualified composite literal with a
-//	   `DP:` element must give it a live-derived identifier. Keyed on the
-//	   FIELD, not on a registry of consumer packages: before r5 this
-//	   consulted a 2-entry managementConsumerConfigs allowlist, so a fourth
-//	   consumer with its own config type was invisible to it.
+//	R3 (the consumer's DP field). A value written to a field named `DP`
+//	   must be a live-derived identifier, in EVERY write form that names
+//	   the field: a `DP:` key in a composite literal of any type, qualified
+//	   or not, and an assignment through a selector ending in `.DP`
+//	   (`cfg.DP`, `(*p).DP`, `d.held.cfg.DP`). Keyed on the field NAME, not
+//	   on a registry of consumer packages and not on the literal's shape.
+//	   Both narrowings shipped a measured escape: the registry (retired in
+//	   r5) exempted a fourth consumer with its own config type, and the
+//	   shape requirement (dropped in r6) exempted the SAME consumer written
+//	   as `cfg.DP = probe`, whole package green.
 //
 //	R4 (the console consumer). A call to cli.New must pass at least one
 //	   argument that is BOTH declared with a management-probe type in that
@@ -145,9 +150,27 @@ import (
 //     declaring a seventh probe without classifying it reds the suite, and
 //     classifying it as a management probe puts it under R1 and R2.
 //   - R3 no longer consults a registry of consumer packages at all. It
-//     keys on the FIELD — any qualified composite literal with a `DP:`
-//     element must take a live-derived value, whatever package or type
-//     name it wears. managementConsumerConfigs is retired.
+//     keys on the FIELD — a value written to a field named `DP` must be
+//     live-derived, whatever package or type name the consumer wears.
+//     managementConsumerConfigs is retired.
+//
+// R6-B2 CORRECTION, and it is the second time this paragraph has been
+// wrong in the same way. r5 wrote the residual as a conjunction whose
+// FIRST conjunct — "takes its probe as a plain call argument rather than a
+// `DP:` field" — was not required. Measured at 74ece3ff5 in real
+// pkg/daemon/daemon_run_servers.go: a fourth consumer whose probe DOES
+// reach a `DP:` field escaped anyway, because r5's R3 keyed on the LITERAL
+// SHAPE (a KeyValueExpr inside a package-qualified *ast.CompositeLit)
+// rather than on the field. `cfg := mgmt.Config{DP: probe}` redded by
+// name; `var cfg mgmt.Config; cfg.DP = probe` — one line, same consumer,
+// same stale value — left the WHOLE of pkg/daemon at rc=0. R2 could not
+// carry it either: its liveness fixpoint filters on `lhs.(*ast.Ident)`,
+// and a field write is a SelectorExpr.
+//
+// R3 now keys on the field NAME in every write form that names it: a `DP:`
+// key in a composite literal of ANY type, qualified or not, and an
+// assignment through a selector ending in `.DP`, whatever the receiver's
+// shape. Each form is pinned by a self-test row, in both directions.
 //
 // TWO things genuinely remain, and both are properties of the rules rather
 // than entries on a list:
@@ -156,13 +179,20 @@ import (
 //     forms; an ordering established by a channel handshake, a sync.Once,
 //     or a conditional that only assigns on a path taken later is not
 //     syntax and is not seen.
-//   - R4 is site-keyed on the `cli.New` selector, because "this call is a
-//     management consumer" has no syntactic signature the way `DP:` does.
-//     A consumer escapes R4 only by satisfying all THREE of: it takes its
-//     probe as a plain call argument rather than a `DP:` field, it is not
-//     cli.New, and its probe type is declared outside the two declaration
-//     files. The third conjunct is what bounds it — declared inside them,
-//     the completeness test forces registration and R1/R2 apply.
+//   - A hand-over that NEVER NAMES THE FIELD. R3 is name-keyed, so it sees
+//     nothing in `mgmt.Config{store, probe}` (a positional literal has no
+//     `DP` token) or in `newThing(store, probe)` (a plain call argument);
+//     R4 covers exactly one call site, `cli.New`, because "this call is a
+//     management consumer" has no syntactic signature the way a field name
+//     does. Such a consumer escapes the whole fence only if it ALSO
+//     declares its probe type outside the two declaration files — declared
+//     inside them, the completeness test forces registration and R1/R2
+//     apply to it. Do not restate this as a conjunction with a fourth
+//     term: a term is only in the predicate if removing it lets something
+//     through, which is what r5's first conjunct failed. The positional
+//     form is pinned CLEAN by the `residual/` self-test row, so teaching
+//     R3 to resolve field positions reds that row and forces this
+//     paragraph to be rewritten rather than left to go stale.
 //
 // Do not read a green run as "the probe is live at the instant the
 // consumer uses it". Read it as "no probe value in a production function
@@ -606,28 +636,119 @@ func probeWiringViolations(body *ast.BlockStmt) []string {
 	return out
 }
 
-// consumerWiringViolations applies R3 (a composite literal's DP field) and
-// R4 (cli.New argument set).
+// compositeLitTypeName names the type a composite literal builds, for the
+// report: "api.Config" for a qualified type, "localCfg" for an unqualified
+// one, "" for an anonymous struct/map/slice literal.
+//
+// #6743 r6-B2: r5 REQUIRED the qualified form (`*ast.SelectorExpr`), which
+// silently exempted every literal of a daemon-local type. The name is a
+// report detail; it must not decide whether the rule looks.
+func compositeLitTypeName(lit *ast.CompositeLit) string {
+	switch t := unwrapTypeExpr(lit.Type).(type) {
+	case *ast.SelectorExpr:
+		if t.Sel == nil {
+			return ""
+		}
+		if pkg, ok := t.X.(*ast.Ident); ok {
+			return pkg.Name + "." + t.Sel.Name
+		}
+		return t.Sel.Name
+	case *ast.Ident:
+		return t.Name
+	}
+	return ""
+}
+
+// selectorWritesDPField reports whether lhs is a write THROUGH a selector
+// to a field named DP — `cfg.DP`, `p.DP`, `(*p).DP`, `d.srv.DP` — and
+// names the receiver for the report. The receiver's shape is irrelevant to
+// the verdict; only the field name is the signature.
+func selectorWritesDPField(lhs ast.Expr) (string, bool) {
+	sel, ok := unwrapTypeExpr(lhs).(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "DP" {
+		return "", false
+	}
+	return receiverName(unwrapTypeExpr(sel.X)), true
+}
+
+// receiverName renders a selector's receiver as a dotted path, so the
+// report says WHICH value was written rather than just "a struct".
+func receiverName(e ast.Expr) string {
+	switch x := e.(type) {
+	case *ast.Ident:
+		return x.Name
+	case *ast.SelectorExpr:
+		if x.Sel == nil {
+			return "a value"
+		}
+		return receiverName(unwrapTypeExpr(x.X)) + "." + x.Sel.Name
+	case *ast.CallExpr:
+		return receiverName(unwrapTypeExpr(x.Fun)) + "()"
+	case *ast.IndexExpr:
+		return receiverName(unwrapTypeExpr(x.X)) + "[...]"
+	}
+	return "a value"
+}
+
+// consumerWiringViolations applies R3 (a write to a consumer's DP field)
+// and R4 (cli.New argument set).
+//
+// R3 keys on the FIELD NAME, in EVERY form that names it: a `DP:` key in a
+// composite literal of any type, qualified or not, and an assignment
+// through a selector ending in `.DP`. It does NOT key on the literal's
+// shape — that was the r5 defect, measured in r6-B2: the same fourth
+// consumer that redded as `api.Config{DP: probe}` went GREEN, whole
+// package, as `var cfg api.Config; cfg.DP = probe`. R3 never visited the
+// AssignStmt and R2 skipped it, because R2's liveness fixpoint filters on
+// `lhs.(*ast.Ident)` and a field write is a SelectorExpr.
+//
+// What a name-keyed rule still cannot see is a hand-over that never names
+// the field: a POSITIONAL literal (`consumer.Config{store, probe}`) or a
+// plain call argument. That is the honest residual, stated at the head of
+// this file and pinned by the `residual/` fixture rows.
 func consumerWiringViolations(body *ast.BlockStmt, w *probeWiring) []string {
 	var out []string
+	report := func(what string) {
+		out = append(out, what+" with a DP value that is not derived from liveDataplane()")
+	}
+	valueIsLive := func(e ast.Expr) bool {
+		id, ok := unwrapTypeExpr(e).(*ast.Ident)
+		return ok && w.live[id.Name]
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch x := n.(type) {
+		case *ast.AssignStmt:
+			// R3, field-write form. `cfg.DP = probe` is the one-line
+			// escape r5 shipped: it hands the SAME stale probe to the SAME
+			// consumer as the composite-literal form and was invisible to
+			// every rule.
+			for i, lhs := range x.Lhs {
+				recv, ok := selectorWritesDPField(lhs)
+				if !ok {
+					continue
+				}
+				var rhs ast.Expr
+				if len(x.Rhs) == 1 && len(x.Lhs) > 1 {
+					// A tuple RHS makes only index 0 the probe; every
+					// other index is some other result, so a `.DP` at
+					// index > 0 is reported rather than credited.
+					if i == 0 {
+						rhs = x.Rhs[0]
+					}
+				} else if i < len(x.Rhs) {
+					rhs = x.Rhs[i]
+				}
+				if rhs == nil || !valueIsLive(rhs) {
+					report("assigns the DP field of " + recv)
+				}
+			}
 		case *ast.CompositeLit:
-			// R3, r5-B2: keyed on the FIELD, not on a registry of consumer
-			// packages. Until r5 this required the literal's type to be in
-			// a 2-entry managementConsumerConfigs map, so a FOURTH
-			// management consumer with its own config type — measured at
-			// 44603f888, pkg/daemon rc=0 — was invisible. `DP:` on a
-			// qualified type is signature enough; the registry bought
-			// nothing and had to be remembered.
-			sel, ok := unwrapTypeExpr(x.Type).(*ast.SelectorExpr)
-			if !ok || sel.Sel == nil {
-				return true
-			}
-			pkg, ok := sel.X.(*ast.Ident)
-			if !ok {
-				return true
-			}
+			// R3, keyed-literal form. r5-B2 retired the 2-entry
+			// managementConsumerConfigs registry that had made a FOURTH
+			// management consumer with its own config type invisible
+			// (measured at 44603f888, pkg/daemon rc=0); r6-B2 drops the
+			// remaining requirement that the type be package-qualified.
+			name := compositeLitTypeName(x)
 			for _, elt := range x.Elts {
 				kv, ok := elt.(*ast.KeyValueExpr)
 				if !ok {
@@ -637,10 +758,12 @@ func consumerWiringViolations(body *ast.BlockStmt, w *probeWiring) []string {
 				if !ok || key.Name != "DP" {
 					continue
 				}
-				id, ok := unwrapTypeExpr(kv.Value).(*ast.Ident)
-				if !ok || !w.live[id.Name] {
-					out = append(out, "builds "+pkg.Name+"."+sel.Sel.Name+
-						" with a DP value that is not derived from liveDataplane()")
+				if !valueIsLive(kv.Value) {
+					if name == "" {
+						report("builds an anonymous literal")
+					} else {
+						report("builds " + name)
+					}
 				}
 			}
 		case *ast.CallExpr:
@@ -823,6 +946,13 @@ type mgmtDataPlane interface{ IsLoaded() bool }
 
 // writeProbeDeclFixture writes one synthetic copy of each file the
 // completeness scan reads.
+// #6743 r6-B4: the two drift guards below overlap but are NOT redundant,
+// and a sweep that deletes either leaves the suite green for a different
+// reason each time. The membership check fires on a RENAME (the map still
+// has two entries, but one of them is a file this fixture never writes);
+// the length check fires on an ADDITION or a REMOVAL (the scan would read
+// a file the fixture never created, or stop reading one it did). Neither
+// covers the other's case, so both stay.
 func writeProbeDeclFixture(t *testing.T, dir, probes, live string) {
 	t.Helper()
 
@@ -1004,6 +1134,123 @@ func (d *Daemon) startMgmt() {
 		mgmtDP = live
 	}
 	_ = mgmt.Config{DP: mgmtDP}
+}
+`,
+		},
+		{
+			name: "bad/fourth-consumer-field-assignment",
+			// #6743 r6-B2, the ONE-LINE escape r5 shipped. The SAME fourth
+			// consumer as the row above, differing only in how the probe
+			// reaches the field: `cfg.DP = probe` instead of
+			// `mgmt.Config{DP: probe}`. Measured at 74ece3ff5 in real
+			// pkg/daemon/daemon_run_servers.go — the composite-literal
+			// spelling redded by name, the field-assignment spelling left
+			// `go test ./pkg/daemon/ -count=1` at rc=0 with the WHOLE
+			// package green and every TestManagementProbe* passing.
+			//
+			// Mechanism: r5's R3 inspected only *ast.CompositeLit for a
+			// KeyValueExpr keyed DP. A field write is an *ast.AssignStmt
+			// with an *ast.SelectorExpr LHS, which R3 never visited and R2
+			// skips because its liveness fixpoint filters on
+			// `lhs.(*ast.Ident)`. R3 now keys on the FIELD NAME in both
+			// write forms.
+			src: preamble + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+
+func (d *Daemon) startMgmt() {
+	var mgmtDP mgmtDataPlane
+	if rt := d.dataplane(); rt != nil {
+		if probe, ok := rt.(mgmtDataPlane); ok {
+			mgmtDP = probe
+		}
+	}
+	var cfg mgmt.Config
+	cfg.DP = mgmtDP
+}
+`,
+			want: []string{"assigns the DP field of cfg"},
+		},
+		{
+			name: "live/fourth-consumer-field-assignment-live",
+			// The field-write form wired correctly must stay clean, or the
+			// new arm is a rule that cannot be satisfied. This is the
+			// positive control WITHOUT it, `want: nil` on the row above
+			// would be satisfiable by a rule that reports every `.DP`
+			// write unconditionally.
+			src: preamble + `
+func (d *Daemon) startMgmt() {
+	var mgmtDP cliDataPlane
+	if live, ok := d.liveDataplane(); ok {
+		mgmtDP = live
+	}
+	var cfg mgmt.Config
+	cfg.DP = mgmtDP
+}
+`,
+		},
+		{
+			name: "bad/fourth-consumer-through-a-pointer-field",
+			// The same write reached through a pointer and a nested
+			// selector. R3 keys on the field NAME, so the receiver's shape
+			// — ident, pointer deref, nested selector — does not decide
+			// whether the rule looks. Reaching a shape the r6 finding did
+			// not name is the point: the finding named `cfg.DP = probe`.
+			src: preamble + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+
+func (d *Daemon) startMgmt(cfg *mgmt.Config) {
+	var mgmtDP mgmtDataPlane
+	if probe, ok := d.dataplane().(mgmtDataPlane); ok {
+		mgmtDP = probe
+	}
+	(*cfg).DP = mgmtDP
+	d.held.cfg.DP = mgmtDP
+}
+`,
+			want: []string{
+				"assigns the DP field of cfg",
+				"assigns the DP field of d.held.cfg",
+			},
+		},
+		{
+			name: "bad/fourth-consumer-unqualified-config-type",
+			// r5's R3 required the literal's TYPE to be package-qualified
+			// (`*ast.SelectorExpr`), so a daemon-local config struct —
+			// `localCfg{DP: probe}`, an *ast.Ident type — was exempt. The
+			// r6 finding predicted this shape from the filters and did not
+			// measure it; this row measures it and keeps it measured.
+			src: preamble + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+type localCfg struct{ DP mgmtDataPlane }
+
+func (d *Daemon) startMgmt() {
+	var mgmtDP mgmtDataPlane
+	if probe, ok := d.dataplane().(mgmtDataPlane); ok {
+		mgmtDP = probe
+	}
+	_ = localCfg{DP: mgmtDP}
+}
+`,
+			want: []string{"builds localCfg with a DP value"},
+		},
+		{
+			name: "residual/positional-literal-names-no-field",
+			// THE HONEST RESIDUAL, pinned rather than described. R3 is
+			// keyed on the field NAME; a positional composite literal
+			// contains no `DP` token at all, so nothing in R1-R5 sees this
+			// hand-over. It is recorded as CLEAN deliberately: if a later
+			// round teaches R3 to resolve field positions, this row reds
+			// and forces the residual paragraph at the head of this file
+			// to be rewritten instead of quietly going stale.
+			src: preamble + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+
+func (d *Daemon) startMgmt() {
+	var mgmtDP mgmtDataPlane
+	if probe, ok := d.dataplane().(mgmtDataPlane); ok {
+		mgmtDP = probe
+	}
+	_ = mgmt.Config{nil, mgmtDP}
 }
 `,
 		},

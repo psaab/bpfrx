@@ -80438,3 +80438,129 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
   pkg/cli/cli_show_system_single_load_6743_test.go,
   pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go
+
+- **Timestamp**: 2026-08-20 (Codex PR #6743, round 6)
+- **Action**: Round 5 shipped the SAME defect in BOTH fixes it was written to
+  close — a repair keyed to the shape of the previous finding rather than to
+  the property. Both escapes were re-measured firsthand at 74ece3ff5 before
+  anything was changed.
+
+  **B1 — the structural clause was a TAUTOLOGY over a value the guard built
+  itself.** `TestShowBuffersCountingIndirectionServesNothingSilently` read
+  `dp.grpcRuntime != nil` on `&countingIndirection{backend: ...}`, a literal
+  that OMITS the embedded field. That is the zero value of an interface:
+  nil, unconditionally. The clause the r5 header called "the one that
+  quantifies" inspected one value, and not the one that matters — the
+  fixture the GRID stores in `Server.dp`. Measured at 74ece3ff5: changing
+  the grid literal to `&countingIndirection{grpcRuntime: dataplane.New(),
+  backend: arm.backend()}` and re-inserting the r4 witness
+  (`if !s.dp.IsLoaded() { buf.WriteString("stale\n") }`) above
+  `stats := backendMapStats(backend)` at `server_show_system.go:495` and
+  `:577` restored the r4 second-load defect VERBATIM and left
+  `go test ./pkg/grpcapi/ -count=1` at **rc=0, 0 FAIL, whole package**. The
+  CLI peer, same shape (`cliRuntime: dataplane.New()` in the grid plus the
+  same insertion at `cli_show_system.go:60` and `:137`): **rc=0**.
+
+  Fixed at the CHOKE POINT rather than at the construction sites: `load()`
+  — the single counted cell read every declared forwarder already goes
+  through — now refuses a non-nil embed with a panic naming the reason. That
+  holds for every instance a render touches, at every construction site
+  present or future, without enumerating them; a site can be respelled, it
+  cannot avoid `load()` and still be a fixture whose loads are counted.
+
+  The behavioural clause was a 1-of-23 SAMPLE (`IsLoaded()`), stated as a
+  universal. It is now an actual universal: `partitionRuntimeMethods` (and
+  its `cliPartitionRuntimeMethods` peer) calls EVERY method of the runtime
+  interface — population read from the TYPE by reflection — with zero-value
+  arguments and asserts the answered set is exactly the fixture's declared
+  shadows and the panicked set is everything else. Zero-value arguments are
+  safe on the correct fixture: dispatch through a nil embedded interface
+  panics before any callee runs.
+
+  Both guards now carry a POSITIVE CONTROL that builds the DEFECTIVE fixture
+  on purpose and proves both halves of the mechanism — that a populated
+  embed really does answer `IsLoaded()` silently, and that `load()` really
+  does refuse it. A guard that cannot be shown to fire is what r5 shipped.
+
+  Also corrected: two rounds carried a hand-typed "22 undeclared methods"
+  against a 25-method interface with 2 shadows, which is 23. The number is
+  not re-typed — it is deleted from the prose and derived from the interface
+  type at every run, because re-counting a quantifier over an unverified
+  population makes it more precise and no more true.
+
+  **B2 — R3 keyed on the literal SHAPE, so conjunct (a) of the r5 residual
+  predicate was FALSE.** The predicate said a consumer escapes only by
+  satisfying all three of (a) taking its probe as a plain call argument
+  rather than a `DP:` field, (b) not being `cli.New`, (c) declaring its
+  probe type outside the declaration files. Measured at 74ece3ff5 in real
+  `pkg/daemon/daemon_run_servers.go`: a fourth consumer written as
+  `cfg := api.Config{DP: probe}` redded by name (control), and the SAME
+  function with ONE line changed — `var cfg api.Config; cfg.DP = probe` —
+  left `go test ./pkg/daemon/ -count=1` at **rc=0, 0 FAIL, whole package**,
+  every `TestManagementProbe*` PASS. That consumer takes its probe as a
+  `DP:` field, so (a) is false, and it escaped anyway. Mechanism: R3
+  inspected only `*ast.CompositeLit`; a field write is an `*ast.AssignStmt`
+  with a `*ast.SelectorExpr` LHS, which R3 never visited and R2 skips
+  because its fixpoint filters on `lhs.(*ast.Ident)`.
+
+  R3 now keys on the field NAME in every write form that names it — a `DP:`
+  key in a composite literal of ANY type, qualified or not, and an
+  assignment through a selector ending in `.DP`, whatever the receiver's
+  shape. Four new self-test rows, in both directions: the field-assignment
+  escape, its live positive control, a pointer/nested-selector receiver
+  (`(*cfg).DP`, `d.held.cfg.DP` — a shape the finding did not name), and the
+  unqualified-type literal (`localCfg{DP: ...}` — predicted by the reviewer
+  from the filters, not measured; measured now). No fourth conjunct was
+  added: a term belongs in the predicate only if removing it lets something
+  through, which is exactly what r5's first conjunct failed.
+
+  The honest residual is a hand-over that never NAMES the field — a
+  positional literal or a plain call argument. That is pinned by a
+  `residual/positional-literal-names-no-field` row asserted CLEAN, so
+  teaching R3 to resolve field positions reds the row and forces the
+  paragraph to be rewritten instead of going stale.
+
+  **B3 — the r5 REST scope note introduced a FALSE claim in a
+  claim-accuracy round.** Half (a) ("a torn view in which the cell only
+  EMPTIES is byte-identical") is TRUE and verified. Half (b) — "commit-
+  confirmed rollback re-arms the dataplane, so that schedule is real" — is
+  false twice, and it contradicts a contract the tree documents twice. The
+  rollback path calls `Teardown()` and KEEPS the object (`bootstrap.go:475`,
+  "Keep the object so a later confirmed commit re-arms it via
+  runBootstrapExitStartup"; restated at `daemon_dp_live.go:33-40`, pinned by
+  `TestDataplaneCell_RollbackRearmRecurrence`), so it never empties the cell
+  and the scenario's premise never holds there. And the cell is MONOTONE
+  within a lifetime: verified firsthand that the only production statement
+  publishing a non-nil dataplane is `daemon_run_bringup.go:469` inside
+  `setupDataplaneAndInitialConfig`, whose single caller is the
+  `dataplane-setup` boot phase at `daemon_run.go:172`; every other
+  production writer publishes nil (`bringup:448, :464, :502`,
+  `naming:264`), and `armBootstrapExitDataplane` returns early on a nil cell
+  and never re-publishes.
+
+  The premise is load-bearing for a paragraph in another package, so it is
+  BOUND rather than asserted: new
+  `pkg/daemon/dp_cell_monotone_6743_test.go` reds if a second non-nil
+  publication site appears, and its failure message names the paragraph in
+  `pkg/api/system.go` that the change would invalidate. The allowlist is
+  itself checked for vacuity — an entry matching no site reds, so the guard
+  cannot go quietly green over an empty population.
+
+  **B4 — clauses that cannot fire.** Deleted `_ grpcRuntime =
+  (*countingIndirection)(nil)` and its CLI peer: the grid stores the fixture
+  in `Server.dp` / `CLI.dp`, already typed as the runtime interface, so the
+  compiler makes exactly that check at a site the tests exercise. Kept
+  `_ dataplane.LiveUnwrapper` — that one is NOT redundant, since the render
+  reaches `Unwrap` through a runtime type assertion. The `loads == 0` tails
+  are retained with their reason stated: they fire when the embed check is
+  moved BELOW `loads.Add(1)`, which leaves the panic in place and pollutes
+  the number the grid asserts on. The two drift guards in
+  `writeProbeDeclFixture` are both retained with the discriminator recorded:
+  membership fires on a RENAME, length fires on an ADD or REMOVE.
+
+  No `.o`, no `userspace-xdp/`, no protocol or wire file — Go control-plane
+  guards, one new Go test file, and comments.
+- **File(s)**: pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
+  pkg/cli/cli_show_system_single_load_6743_test.go,
+  pkg/daemon/daemon_dp_escape_canary_test.go,
+  pkg/daemon/dp_cell_monotone_6743_test.go, pkg/api/system.go
