@@ -1194,6 +1194,54 @@ func parseCoSShapingRate(node *Node) (rateBytes uint64, percent float64) {
 	return rateBytes, percent
 }
 
+// coSCodePointTokens returns every code-point token authored under `leaf`
+// (`code-points`, or the scalar `code-point` a rewrite-rule entry uses) on a
+// CoS loss-priority node, across ALL the spellings the Junos grammar admits:
+//
+//	code-points [ ef af11 ];    -> the leaf node's own tail, Keys[1:]
+//	code-points ef;             -> ditto, once per repeated statement
+//	code-points { ef; af11; }   -> the leaf node's CHILDREN, one token each
+//	loss-priority low code-points ef;  -> the loss-priority node's own tail (#1809)
+//
+// #6697: NONE of the five CoS code-point readers read the leaf node's children,
+// so the hierarchical BLOCK spelling compiled to nothing at all. That is not a
+// truncated list — the compiler stores a classifier only when it has at least
+// one entry, so the whole classifier went MISSING while `show class-of-service`
+// rendered the authored config back intact. Two of the five readers (the
+// rewrite-rule pair) additionally missed the inline `loss-priority low
+// code-point ef;` tail, which is the spelling Junos itself emits.
+//
+// Because each caller's per-value domain check runs on what this returns, the
+// unread shape was also a GATE ESCAPE and not merely a value drop:
+// `code-points { totally-bogus; }` committed CLEAN where the identical token in
+// `code-points [ totally-bogus ]` was REJECTED. Every caller MUST keep running
+// its check over EVERY token this returns; see docs/config-schema.md, "A
+// one-sided read is a GATE ESCAPE".
+//
+// Each child contributes ALL of its keys, not just Keys[0]: the flat-set
+// bracket list lands on a child's Keys when the leaf is not `multi` in
+// setSchema, which is the #7126 shape — reading Children is not the same as
+// reading every KEY of each child.
+func coSCodePointTokens(node *Node, leaf string) []string {
+	var out []string
+	for _, child := range node.FindChildren(leaf) {
+		out = append(out, child.Keys[1:]...)
+		for _, grandchild := range child.Children {
+			out = append(out, grandchild.Keys...)
+		}
+	}
+	// Inline leaf spelling (#1809): "loss-priority low code-points ef;" packs
+	// the code points into the loss-priority node's own Keys after the leaf
+	// token (bracketed lists arrive bracket-stripped).
+	for i := 2; i < len(node.Keys); i++ {
+		if node.Keys[i] == leaf {
+			out = append(out, node.Keys[i+1:]...)
+			break
+		}
+	}
+	return out
+}
+
 func collectCoSDSCPCodePoints(node *Node) ([]uint8, error) {
 	var values []uint8
 	seen := make(map[uint8]struct{})
@@ -1211,35 +1259,12 @@ func collectCoSDSCPCodePoints(node *Node) ([]uint8, error) {
 		}
 		return nil
 	}
-	// #6697 / #6659: this reads the node's own tail and NEVER child.Children,
-	// so the hierarchical BLOCK spelling `code-points { ef; }` compiles to
-	// nothing. Because `add` below is the ONLY place a code point is checked,
-	// that spelling is a GATE ESCAPE and not merely a value-drop:
-	// `code-points { totally-bogus; }` commits CLEAN where the identical token
-	// in `code-points [ totally-bogus ]` is REJECTED "is not a valid DSCP alias
-	// or 0..63 value". Verified through configstore.CheckText. All four
-	// collectCoS{DSCP,8021}{CodePoints,RewriteCodePoint} readers below share
-	// this shape. A widened read MUST keep the per-value check on the path for
-	// the newly-read values; see docs/config-schema.md, "A one-sided read is a
-	// GATE ESCAPE".
-	for _, child := range node.FindChildren("code-points") {
-		for _, raw := range child.Keys[1:] {
-			if err := add(raw); err != nil {
-				return nil, err
-			}
-		}
-	}
-	// Inline leaf spelling (#1809): "loss-priority low code-points ef;"
-	// packs the code points into the loss-priority node's own Keys after
-	// the "code-points" token (bracketed lists arrive bracket-stripped).
-	for i := 2; i < len(node.Keys); i++ {
-		if node.Keys[i] == "code-points" {
-			for _, raw := range node.Keys[i+1:] {
-				if err := add(raw); err != nil {
-					return nil, err
-				}
-			}
-			break
+	// #6697: every authored spelling, INCLUDING the hierarchical block form,
+	// runs through `add` — which is the only place a DSCP code point is
+	// checked, so widening the read also closes the gate escape.
+	for _, raw := range coSCodePointTokens(node, "code-points") {
+		if err := add(raw); err != nil {
+			return nil, err
 		}
 	}
 	return values, nil
@@ -1279,22 +1304,10 @@ func collectCoSINetPrecedenceCodePoints(node *Node) ([]uint8, error) {
 		values = append(values, value)
 		return nil
 	}
-	for _, child := range node.FindChildren("code-points") {
-		for _, raw := range child.Keys[1:] {
-			if err := add(raw); err != nil {
-				return nil, err
-			}
-		}
-	}
-	// Inline leaf spelling (#1809), as for the dscp / 802.1p collectors.
-	for i := 2; i < len(node.Keys); i++ {
-		if node.Keys[i] == "code-points" {
-			for _, raw := range node.Keys[i+1:] {
-				if err := add(raw); err != nil {
-					return nil, err
-				}
-			}
-			break
+	// #6697: every spelling, block form included, runs through `add`.
+	for _, raw := range coSCodePointTokens(node, "code-points") {
+		if err := add(raw); err != nil {
+			return nil, err
 		}
 	}
 	return values, nil
@@ -1334,54 +1347,35 @@ func collectCoS8021CodePoints(node *Node) ([]uint8, error) {
 		values = append(values, value)
 		return nil
 	}
-	for _, child := range node.FindChildren("code-points") {
-		for _, raw := range child.Keys[1:] {
-			if err := add(raw); err != nil {
-				return nil, err
-			}
-		}
-	}
-	// Inline leaf spelling (#1809): "loss-priority low code-points 3;"
-	// packs the code points into the loss-priority node's own Keys after
-	// the "code-points" token.
-	for i := 2; i < len(node.Keys); i++ {
-		if node.Keys[i] == "code-points" {
-			for _, raw := range node.Keys[i+1:] {
-				if err := add(raw); err != nil {
-					return nil, err
-				}
-			}
-			break
+	// #6697: every spelling, block form included, runs through `add`.
+	for _, raw := range coSCodePointTokens(node, "code-points") {
+		if err := add(raw); err != nil {
+			return nil, err
 		}
 	}
 	return values, nil
 }
 
+// A rewrite-rule entry writes exactly ONE code point, so the first resolvable
+// token wins — but EVERY token still passes the domain check on the way there
+// (#6697), because skipping the check for the tokens after the first would
+// re-open the gate escape on a different axis. `code-point` is the Junos leaf;
+// `code-points` is accepted as an alias for it.
 func collectCoSDSCPRewriteCodePoint(node *Node) (uint8, bool, error) {
-	for _, child := range node.FindChildren("code-point") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		values, err := expandCoSCodePointToken(child.Keys[1])
-		if err != nil {
-			return 0, false, err
-		}
-		if len(values) > 0 {
-			return values[0], true, nil
-		}
-	}
-	for _, child := range node.FindChildren("code-points") {
-		for _, raw := range child.Keys[1:] {
+	var first uint8
+	found := false
+	for _, leaf := range []string{"code-point", "code-points"} {
+		for _, raw := range coSCodePointTokens(node, leaf) {
 			values, err := expandCoSCodePointToken(raw)
 			if err != nil {
 				return 0, false, err
 			}
-			if len(values) > 0 {
-				return values[0], true, nil
+			if len(values) > 0 && !found {
+				first, found = values[0], true
 			}
 		}
 	}
-	return 0, false, nil
+	return first, found, nil
 }
 
 // collectCoS8021RewriteCodePoint resolves the single 802.1p PCP code point a
@@ -1414,30 +1408,21 @@ func collectCoS8021RewriteCodePoint(node *Node) (uint8, bool, error) {
 		}
 		return uint8(v), true, nil
 	}
-	for _, child := range node.FindChildren("code-point") {
-		if len(child.Keys) < 2 {
-			continue
-		}
-		value, ok, err := parse(child.Keys[1])
-		if err != nil {
-			return 0, false, err
-		}
-		if ok {
-			return value, true, nil
-		}
-	}
-	for _, child := range node.FindChildren("code-points") {
-		for _, raw := range child.Keys[1:] {
+	// #6697: first resolvable token wins, but every token is still checked.
+	var first uint8
+	found := false
+	for _, leaf := range []string{"code-point", "code-points"} {
+		for _, raw := range coSCodePointTokens(node, leaf) {
 			value, ok, err := parse(raw)
 			if err != nil {
 				return 0, false, err
 			}
-			if ok {
-				return value, true, nil
+			if ok && !found {
+				first, found = value, true
 			}
 		}
 	}
-	return 0, false, nil
+	return first, found, nil
 }
 
 // expandCoSCodePointToken resolves a DSCP code-point token (a symbolic

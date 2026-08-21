@@ -1,3 +1,59 @@
+## 2026-08-21 — #6697: the CoS `code-points` BLOCK spelling lost the whole classifier
+
+- **Timestamp**: 2026-08-21 (fix/6697-cos-code-points-spellings)
+- **Action**: Widened all five CoS code-point readers onto a shared
+  `coSCodePointTokens` helper that returns the leaf node's tail, EVERY key of
+  each of its children, and the inline `loss-priority low code-points ef;`
+  tail. Measured the five families across the five spellings BEFORE fixing;
+  the matrix corrected the issue twice over. With domain-valid values the
+  bracket / repeated / flat-set spellings already kept both code points — the
+  defect was the hierarchical BLOCK form, which compiled to NOTHING for all
+  five families (the compiler stores a classifier only with >= 1 entry, so the
+  whole classifier went missing, not a truncated list). The two rewrite
+  readers additionally missed the inline spelling Junos itself emits, so
+  `loss-priority low code-point ef;` compiled to nothing at all.
+
+  Because each reader's per-value domain check runs on the tokens it reads,
+  the unread shape was a GATE ESCAPE, not just a value drop: `code-points {
+  totally-bogus; }` committed CLEAN where `code-points [ totally-bogus ]` was
+  rejected. Every widened path keeps the check.
+
+  The spelling-differential gate also had to be corrected before it could
+  prove any of this. `cfg.Warnings` was marshalled into the compared output,
+  so a value the leaf REJECTS moved the output off the no-value baseline and
+  defeated the trap-(3) guard; combined with the readers' fail-fast on the
+  first bad token, `[v1]` and `[v1 v2]` produced the identical single warning
+  and every pair OUTSIDE the leaf's domain read as a uniform drop. That is why
+  all five sites were allowlisted while the one in-domain pair reported them
+  clean at the same commit. `gateMarshal` now clears Warnings, and a `pcp`
+  (3/5) value pair was added so the ieee-802.1 / inet-precedence leaves get a
+  verdict at all instead of going inert.
+
+  Three of the five allowlist rows are removed as FIXED (verified compared,
+  not merely uncovered). The two `rewrite-rules` rows moved to
+  `notAValueList`: a rewrite entry writes exactly ONE code point, and
+  `code-points` there is a documented alias of the scalar `code-point`.
+
+  The mutation matrix then falsified the assumption the row removal was
+  supposed to rest on. Reverting ALL FIVE reads left the gate GREEN: it had
+  no sensitivity to this defect at all, because "inert" (the first value not
+  moving the output either) removes a spelling from the comparison, so a
+  reader that ignores a shape ENTIRELY is indistinguishable from a leaf that
+  is unreachable in that shape. A third class was added — a spelling that is
+  READ beside one that is INERT, restricted to `multi: true` leaves where the
+  block form is legal Junos. Unrestricted that rule fires at 119 sites (almost
+  all scalar leaves where `leaf { v; }` is not a spelling); restricted it
+  fires at 2, both already owned by an allowlist row (#6695, #6688). With it
+  the full revert REDs and the row removal is real proof.
+
+  Validation: `go test -count=1 ./pkg/config/...` exit 0 with the rows gone;
+  `go vet ./pkg/config/` and `go build ./...` exit 0. Go-only — nothing
+  reaches the Rust helper binary or the wire format, so no smoke is owed.
+- **File(s)**: pkg/config/compiler_class_of_service.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/config/cos_code_points_spellings_6697_test.go,
+  docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
+
 ## 2026-08-21 — #7114: a factory boot of the appliance image claimed no NIC, so no bake could sign
 
 - **Timestamp**: 2026-08-21 (fix/7114-appliance-factory-bootstrap)

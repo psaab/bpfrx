@@ -18,6 +18,15 @@ package config
 // spellings and not others, which is the #2419 defect class: the operator's
 // config renders back intact and the compiler installed less than it says.
 //
+// Three classes are reported, and the third is not a refinement of the first
+// two — it is the one that catches a reader which ignores a shape ENTIRELY
+// rather than truncating it:
+//
+//	A  shape-dependent drop      some spellings keep the 2nd value, others drop it
+//	B  uniform drop, multi leaf  EVERY spelling drops it at a declared value list
+//	C  shape-dependent inertness some spellings read the leaf, others do not read
+//	                             it at all (multi leaves only)
+//
 // WHY A BEHAVIOURAL DIFFERENTIAL AND NOT A LINT
 //
 // There is no single correct reader to lint FOR. This package now contains at
@@ -79,6 +88,28 @@ package config
 //     the guard was validated against known-GOOD code, not only against known
 //     bad code.
 //
+// (4) THE BASELINE GUARD WAS DEFEATED BY THE DIAGNOSTIC CHANNEL. cfg.Warnings
+//     is a field of Config, so it was marshalled into the compared string. A
+//     value the leaf's domain REJECTS is recorded there by the tolerant compile
+//     path — which moves the output off the no-value baseline and satisfies the
+//     guard trap (3) added. Worse, the CoS readers fail FAST on the first bad
+//     token, so `[v1]` and `[v1 v2]` produced the IDENTICAL single warning and
+//     the pair read as a uniform drop at a leaf with no defect at all: the
+//     second value changed nothing because the FIRST value had already aborted
+//     the read. That is how all five #6697 sites reported "uniform drop" on
+//     seven of the eight value pairs — every pair whose values are not in the
+//     leaf's domain — and why the one pair that IS in the DSCP domain reported
+//     the site clean at the same commit. gateMarshal now clears Warnings before
+//     comparing: a warning is what the compiler says ABOUT the input, not
+//     configuration it installed. The cost is real and is in the coverage line
+//     — 19 sites whose only signal was a warning delta lost their verdict.
+//
+//     The corollary is that a leaf is only covered by a value pair its DOMAIN
+//     accepts. The `pcp` pair (3/5) exists because without a pair inside 0..7
+//     the ieee-802.1 and inet-precedence classifier leaves reject all eight
+//     other pairs, go inert, and carry no verdict — so a fix there could not be
+//     proven by removing an allowlist row.
+//
 // ============================================================================
 // COVERAGE — A GREEN GATE IS NOT A SWEPT SCHEMA
 // ============================================================================
@@ -91,20 +122,31 @@ package config
 //     args <= 1, no midKeyword). Only 5 leaves are excluded by construction
 //     (args > 1 or a midKeyword), because a two-value list is not meaningful for
 //     a compound leaf like route-filter or address-book `address <name> <prefix>`.
-//   - The gate enumerates 1020 SITES from those nodes. The two numbers differ,
+//   - The gate enumerates 1018 SITES from those nodes. The two numbers differ,
 //     and the difference is not an error: a schemaNode reachable by more than one
 //     path (a shared subtree such as the one under both `protocols` and
 //     `routing-instances <n> protocols`) is a distinct site at each path, and
 //     must be, because the compiler arm reading it may differ per path.
-//   - Only 624 of those 1020 sites are actually COMPARED. The remaining 396 come
+//   - Only 608 of those 1018 sites are actually COMPARED. The remaining 410 come
 //     back inert or unstable under synthetic parent paths the compiler rejects —
-//     39% of enumerated sites carry NO verdict from this gate, in either
+//     40% of enumerated sites carry NO verdict from this gate, in either
 //     direction. That is the single largest limit here.
 //   - Class B (uniform drop) is reported ONLY for leaves the schema marks
 //     multi: true. A scalar leaf dropping a second value is the schema working,
 //     not a defect, so there is nothing to assert there.
-//   - Eight value pairs. A leaf whose value domain none of them satisfies stays
-//     invisible; that is how #6697 hid from version two.
+//   - Class C (shape-dependent INERTNESS) exists because classes A and B were
+//     both blind to #6697, and blind in the same place: "inert" — the FIRST
+//     value not moving the output — removes a spelling from the comparison
+//     entirely, so a reader that ignores one shape completely looks identical
+//     to a leaf that is simply unreachable in that shape. Reverting all five
+//     CoS reads left this gate GREEN before class C existed. It is likewise
+//     restricted to multi: true leaves, where the block form is legal Junos:
+//     unrestricted it fires at 119 sites, almost all scalar leaves for which
+//     `leaf { v; }` is not a spelling at all; restricted it fires at 2, both
+//     already owned by a row below.
+//   - Nine value pairs. A leaf whose value domain none of them satisfies stays
+//     invisible; that is how #6697 hid from version two, and — via trap (4) —
+//     how it then reported the WRONG verdict at the same five sites.
 //
 // This gate also sees ONE DIRECTION. It detects a compiler DROPPING a value. It
 // cannot detect the opposite defect — a reader PROMOTING a per-value modifier
@@ -136,15 +178,6 @@ import (
 // rendered as <*>, so a row survives the schema growing a level.
 // ---------------------------------------------------------------------------
 var knownSpellingInconsistencies = map[string]string{
-	// #6697 — CoS code-points. FIVE families, not the two in the issue title;
-	// see the measured enumeration posted on the issue. The block spelling does
-	// not truncate the list, it loses the WHOLE classifier.
-	"class-of-service classifiers dscp <*> forwarding-class <*> loss-priority <*> code-points":            "#6697",
-	"class-of-service classifiers ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-points":      "#6697",
-	"class-of-service classifiers inet-precedence <*> forwarding-class <*> loss-priority <*> code-points": "#6697",
-	"class-of-service rewrite-rules dscp <*> forwarding-class <*> loss-priority <*> code-points":          "#6697",
-	"class-of-service rewrite-rules ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-points":    "#6697",
-
 	// #6687 — vlan-id-list validated/read at slot 0 only.
 	"bridge-domains <*> vlan-id-list": "#6687",
 
@@ -193,6 +226,19 @@ var notAValueList = map[string]string{
 	"security screen ids-option <*> tcp port-scan":      "container with sub-knobs",
 	"security screen ids-option <*> tcp syn-flood":      "container with sub-knobs",
 	"security screen ids-option <*> udp":                "container with sub-knobs",
+
+	// #6697. The CLASSIFIER `code-points` leaves ARE value lists and were
+	// fixed; these two are the rewrite-rule direction, where Junos writes
+	// exactly ONE code point per (forwarding-class, loss-priority) entry. The
+	// leaf here is `code-point`, and `code-points` is an accepted ALIAS for it
+	// whose own setSchema desc says "first value is used". Verified where the
+	// extra tokens land: collectCoSDSCPRewriteCodePoint /
+	// collectCoS8021RewriteCodePoint read and domain-CHECK every token, then
+	// install the first resolvable one — so a second value is rejected if it is
+	// invalid and ignored if it is valid. That is a uniform drop by
+	// construction, in every spelling, and it is not a defect.
+	"class-of-service rewrite-rules dscp <*> forwarding-class <*> loss-priority <*> code-points":       "alias of the scalar `code-point`: a rewrite entry writes ONE code point, first value wins",
+	"class-of-service rewrite-rules ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-points": "alias of the scalar `code-point`: a rewrite entry writes ONE code point, first value wins",
 }
 
 // Value pairs must span the DOMAINS setSchema's typed leaves accept, not merely
@@ -205,6 +251,11 @@ var gateValuePairs = []struct{ name, v1, v2 string }{
 	{"ipv6", "2001:db8::1", "2001:db8::2"},
 	{"iface", "ge-5/0/7", "ge-6/0/7"},
 	{"dscp", "ef", "af11"},
+	// A 3-bit code-point domain (802.1p PCP, IP precedence). Without a pair
+	// inside 0..7 the ieee-802.1 / inet-precedence classifier leaves reject
+	// every pair above and go inert, so the gate carries NO verdict for them
+	// and a fix there cannot be proven by removing an allowlist row.
+	{"pcp", "3", "5"},
 	{"proto", "bgp", "ospf"},
 }
 
@@ -348,6 +399,16 @@ func gateBraceConfig(path []string, stmt string) string {
 	return b.String()
 }
 
+// gateMarshal renders the compiled config for comparison with the DIAGNOSTIC
+// channel removed — see trap (4) in this file's header. cfg.Warnings is not
+// installed configuration; it is what the compiler says ABOUT the input, and
+// comparing it makes a REJECTED value look like an installed one.
+func gateMarshal(cfg *Config) (string, error) {
+	cfg.Warnings = nil
+	j, err := json.Marshal(cfg)
+	return string(j), err
+}
+
 func gateCompileBrace(body string) (string, error) {
 	p := NewParser(body)
 	tree, errs := p.Parse()
@@ -358,8 +419,7 @@ func gateCompileBrace(body string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	j, err := json.Marshal(cfg)
-	return string(j), err
+	return gateMarshal(cfg)
 }
 
 func gateCompileSet(cmds []string) (string, error) {
@@ -377,8 +437,7 @@ func gateCompileSet(cmds []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	j, err := json.Marshal(cfg)
-	return string(j), err
+	return gateMarshal(cfg)
 }
 
 var gateSpellingsMulti = []string{"A-hier-bracket", "B-hier-block", "C-hier-repeat", "D-set-bracket", "E-set-repeat"}
@@ -493,14 +552,34 @@ func TestSchemaSpellingDifferentialGate(t *testing.T) {
 				cmpSet = gateSpellingsMulti
 			}
 			var flags []bool
+			inert := 0
 			for _, name := range cmpSet {
 				switch state[name] {
-				case "err", "inert", "unstable":
+				case "err", "unstable":
+					continue
+				case "inert":
+					inert++
 					continue
 				}
 				flags = append(flags, state[name] == "drop")
 			}
-			if len(flags) < 2 {
+			class := ""
+			// Class C, and the reason #6697 survived the first two classes.
+			// "inert" means the FIRST value did not move the output either, and
+			// the drop/keep comparison discards those spellings — so a reader
+			// that ignores one shape ENTIRELY looks like a leaf that is simply
+			// unreachable there, and both `[v1]` and `[v1 v2]` compiling to
+			// nothing reads as agreement. For a leaf the schema marks multi
+			// (a real value list, where the block form IS legal Junos), a
+			// spelling that is READ sitting next to one that is INERT is a
+			// defect on its own: the CoS block spelling lost the WHOLE
+			// classifier, not one code point of it. Measured at the commit that
+			// added this: exactly 2 sites, both already owned by a row below.
+			if g.multi && inert > 0 && len(flags) > 0 {
+				class = "shape-dependent inertness on a multi:true leaf"
+				leafCompared = true
+			}
+			if class == "" && len(flags) < 2 {
 				continue
 			}
 			leafCompared = true
@@ -513,8 +592,9 @@ func TestSchemaSpellingDifferentialGate(t *testing.T) {
 					allDrop = false
 				}
 			}
-			class := ""
 			switch {
+			case class != "":
+				// class C already assigned
 			case differs:
 				class = "shape-dependent drop"
 			case allDrop && g.multi:
@@ -552,16 +632,25 @@ func TestSchemaSpellingDifferentialGate(t *testing.T) {
 		for _, n := range gateSpellingsMulti {
 			parts = append(parts, n[:1]+"="+h.state[n])
 		}
+		// Class C is a different complaint from A/B and needs a different
+		// remedy line: nothing was TRUNCATED there, a whole shape went unread.
+		what := "  A two-element list authored in one spelling compiles differently\n" +
+			"  from the same list in another."
+		if strings.HasPrefix(h.class, "shape-dependent inertness") {
+			what = "  This leaf is READ in one spelling and NOT READ AT ALL in another\n" +
+				"  (`inert` = even the FIRST value changed nothing). Nothing was\n" +
+				"  truncated: whatever the leaf feeds compiles to nothing in that\n" +
+				"  spelling."
+		}
 		t.Errorf("#2419 class: %s\n"+
 			"  site      : %s\n"+
 			"  siteKey   : %q\n"+
 			"  multi     : %v   (value pair: %s)\n"+
 			"  spellings : %s\n"+
-			"  A two-element list authored in one spelling compiles differently\n"+
-			"  from the same list in another. Either fix the compiler's read, or —\n"+
+			"%s Either fix the compiler's read, or —\n"+
 			"  if this leaf is not a value list at all — add it to notAValueList\n"+
 			"  with the reason, having VERIFIED where the extra tokens land.",
-			h.class, h.site, h.key, h.multi, h.pair, strings.Join(parts, " "))
+			h.class, h.site, h.key, h.multi, h.pair, strings.Join(parts, " "), what)
 	}
 
 	// 2. A stale allowlist row also fails the build: the row must be removed by

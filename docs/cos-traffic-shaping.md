@@ -833,6 +833,32 @@ Future knobs for finer-grained fairness, such as something like
 should be treated as reserved future extensions rather than active baseline
 behavior.
 
+### Classifier and rewrite-rule `code-points` spellings (#6697)
+
+Every spelling of a `code-points` / `code-point` leaf compiles to the same
+thing. All of these author the same DSCP classifier entry:
+
+```text
+classifiers dscp c1 { forwarding-class voice { loss-priority low code-points [ ef af11 ]; } }
+classifiers dscp c1 { forwarding-class voice { loss-priority low { code-points { ef; af11; } } } }
+classifiers dscp c1 { forwarding-class voice { loss-priority low { code-points ef; code-points af11; } } }
+set class-of-service classifiers dscp c1 forwarding-class voice loss-priority low code-points [ ef af11 ]
+```
+
+Before #6697 the hierarchical BLOCK form (`code-points { ef; af11; }`) was read
+by none of the five readers, so it compiled to **nothing at all** — the whole
+classifier was absent, not merely short a code point, while `show
+class-of-service` rendered the authored config back intact and the interface
+binding succeeded. It also let an invalid token commit clean, because each
+reader's domain check runs on the tokens it reads.
+
+The `classifiers` families (`dscp`, `ieee-802.1`, `inet-precedence`) take a
+LIST. The `rewrite-rules` families write exactly ONE code point per
+`(forwarding-class, loss-priority)` entry; there the Junos leaf is `code-point`
+(singular), `code-points` is accepted as an alias, and if more than one value is
+authored the first valid one is installed — but every value is still domain-
+checked, so a typo anywhere in the list is rejected at commit.
+
 ### Example
 
 ```text
