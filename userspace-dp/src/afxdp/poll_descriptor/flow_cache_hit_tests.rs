@@ -639,10 +639,20 @@ impl LiveCallSiteFixture {
     ///
     /// Without this, `record_zone_traffic` early-returns before touching
     /// anything: the default `ZoneCounterSlotMap` is empty so `slot_of` is 0 for
-    /// the ingress zone, and `EGRESS_IFINDEX` is absent from `forwarding.egress`
-    /// so `egress_zone_id` is 0 too — `if ingress_slot == 0 && egress_slot == 0
-    /// { return; }`. That is why deleting the call was green across the whole
-    /// crate.
+    /// the ingress zone, and `EGRESS_IFINDEX` is in no map `egress_zone_id`
+    /// reads so the egress slot is 0 too — `if ingress_slot == 0 && egress_slot
+    /// == 0 { return; }`. That is why deleting the call was green across the
+    /// whole crate.
+    ///
+    /// #6722: the egress half is seeded in `ifindex_unambiguous_zone_id`, NOT
+    /// in `forwarding.egress`. `ForwardingState::egress_zone_id` used to read
+    /// `egress[i].zone_id`; it is now a single read of that ledger, so a
+    /// fixture that populates only `egress` resolves the egress zone to the 0
+    /// sentinel and the untrust row never appears. Both are written here with
+    /// the SAME zone because production writes them that way —
+    /// `forwarding_build::interfaces::populate_egress` sources each
+    /// `EgressInterface::zone_id` from this same ledger — so the fixture stays
+    /// a faithful model rather than a state the builder cannot produce.
     fn with_zone_accounting(mut self) -> Self {
         self.forwarding.egress.insert(
             EGRESS_IFINDEX,
@@ -657,6 +667,10 @@ impl LiveCallSiteFixture {
                 primary_v6: None,
             },
         );
+        // #6722: the map `egress_zone_id` actually reads. See the doc above.
+        self.forwarding
+            .ifindex_unambiguous_zone_id
+            .insert(EGRESS_IFINDEX, TEST_UNTRUST_ZONE_ID);
         self.forwarding.zone_counter_slot_map =
             Arc::new(crate::afxdp::zone_counters::ZoneCounterSlotMap::build(
                 &[TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID],
