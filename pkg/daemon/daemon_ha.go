@@ -139,6 +139,17 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 	}
 }
 
+// failoverActuation is the per-RG fence-completion barrier armed before a
+// remote-requested transfer-out. done is closed exactly once, when the local
+// demotion has been RESOLVED; err is the verdict (nil = the demotion actually
+// actuated, non-nil = it did not) and is written under failoverActuateMu before
+// done is closed, so every observer of the close also observes the verdict.
+type failoverActuation struct {
+	done     chan struct{}
+	resolved bool
+	err      error
+}
+
 // armFailoverActuation registers a fence-completion barrier for rgID before a
 // remote-requested transfer-out enqueues its async demotion event. It MUST be
 // called before cluster.ManualFailover so the demotion actuation
@@ -149,9 +160,9 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 func (d *Daemon) armFailoverActuation(rgID int) {
 	d.failoverActuateMu.Lock()
 	if d.failoverActuateWait == nil {
-		d.failoverActuateWait = make(map[int]chan struct{})
+		d.failoverActuateWait = make(map[int]*failoverActuation)
 	}
-	d.failoverActuateWait[rgID] = make(chan struct{})
+	d.failoverActuateWait[rgID] = &failoverActuation{done: make(chan struct{})}
 	d.failoverActuateMu.Unlock()
 }
 
@@ -166,30 +177,63 @@ func (d *Daemon) disarmFailoverActuation(rgID int) {
 }
 
 // signalFailoverActuated marks rgID's demotion as actuated (VRRP resigned /
-// rg_active cleared) and releases any waiter. It is idempotent: the channel is
-// deleted under the lock, so a second demotion event for the same RG is a
-// no-op and never double-closes. Safe to call for every non-primary cluster
-// event — an unarmed RG simply has no channel to close.
+// rg_active cleared) and releases any waiter with a success verdict. Safe to
+// call for every non-primary cluster event — an unarmed RG simply has no
+// barrier to resolve.
 func (d *Daemon) signalFailoverActuated(rgID int) {
-	d.failoverActuateMu.Lock()
-	ch := d.failoverActuateWait[rgID]
-	delete(d.failoverActuateWait, rgID)
-	d.failoverActuateMu.Unlock()
-	if ch != nil {
-		close(ch)
+	d.resolveFailoverActuation(rgID, nil)
+}
+
+// signalFailoverActuationFailed releases rgID's barrier with a FAILURE verdict:
+// the demotion side effects did not land (e.g. the dataplane rejected the
+// rg_active clear), so this node may still be forwarding for the RG. The waiter
+// surfaces cause, the sync layer downgrades the applied-ack to failed, and the
+// peer holds instead of promoting into a two-owner window (#6371). cause must
+// be non-nil; a nil cause would be indistinguishable from success.
+func (d *Daemon) signalFailoverActuationFailed(rgID int, cause error) {
+	if cause == nil {
+		cause = fmt.Errorf("redundancy group %d demotion not actuated", rgID)
 	}
+	d.resolveFailoverActuation(rgID, cause)
+}
+
+// resolveFailoverActuation completes rgID's barrier exactly once with verdict
+// cause (nil = actuated). It is idempotent: the resolved flag is set under the
+// lock, so a second demotion event for the same RG is a no-op and never
+// double-closes. The verdict is written BEFORE the close, so any goroutine that
+// observes the close also observes the verdict.
+//
+// The barrier is left in the map rather than deleted — waitFailoverActuated
+// consumes it. Deleting here would make a resolution that lands before the
+// waiter arrives read as "never armed", i.e. success, which would throw away
+// exactly the failure verdict this path exists to deliver (#6371). A re-arm
+// replaces the entry, so the map stays bounded by the RG count.
+func (d *Daemon) resolveFailoverActuation(rgID int, cause error) {
+	d.failoverActuateMu.Lock()
+	b := d.failoverActuateWait[rgID]
+	if b == nil || b.resolved {
+		d.failoverActuateMu.Unlock()
+		return
+	}
+	b.resolved = true
+	b.err = cause
+	d.failoverActuateMu.Unlock()
+	close(b.done)
 }
 
 // waitFailoverActuated blocks until the local demotion for rgID has been
-// actuated (barrier closed by signalFailoverActuated) or the bounded timeout
-// elapses. A nil barrier means the actuation already completed (or was never
-// armed) — return immediately. This gates the remote-failover applied-ack so
-// the peer never promotes into a two-owner window (#5640).
+// resolved (barrier closed by signalFailoverActuated / -Failed) or the bounded
+// timeout elapses. A nil barrier means the RG was never armed (or an earlier
+// waiter already consumed the verdict) — return immediately. It returns nil
+// only when the demotion actually actuated: a failed actuation surfaces its
+// cause (#6371) and a barrier that never resolves surfaces a timeout. This
+// gates the remote-failover applied-ack so the peer never promotes into a
+// two-owner window (#5640).
 func (d *Daemon) waitFailoverActuated(rgID int) error {
 	d.failoverActuateMu.Lock()
-	ch := d.failoverActuateWait[rgID]
+	b := d.failoverActuateWait[rgID]
 	d.failoverActuateMu.Unlock()
-	if ch == nil {
+	if b == nil {
 		return nil
 	}
 	timeout := d.failoverActuateTimeout
@@ -199,8 +243,16 @@ func (d *Daemon) waitFailoverActuated(rgID int) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case <-ch:
-		return nil
+	case <-b.done:
+		// Consume the resolved barrier: this waiter owns the verdict, and
+		// leaving it behind would let a later wait re-read a stale one.
+		d.failoverActuateMu.Lock()
+		err := b.err
+		if d.failoverActuateWait[rgID] == b {
+			delete(d.failoverActuateWait, rgID)
+		}
+		d.failoverActuateMu.Unlock()
+		return err
 	case <-timer.C:
 		// Drop the stranded barrier so a later actuation event does not
 		// close an orphaned channel that no one reads.
@@ -261,165 +313,197 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-d.cluster.Events():
-			noRethVRRP := d.isNoRethVRRP()
-
-			// Dual-active winner reaffirm: no state change but send
-			// GARPs to refresh upstream ARP/NDP caches after split-brain.
-			if ev.DualActiveWin && noRethVRRP {
-				d.scheduleDirectAnnounce(ev.GroupID, "dual-active-win")
-				continue
-			}
-
-			// Update rg_active through unified state machine.
-			//
-			// Both cluster and VRRP events funnel through rgStateMachine
-			// which determines rg_active = clusterPri || anyVrrpMaster.
-			// This prevents the dual-inactive window (both nodes
-			// rg_active=false during failover) and eliminates the race
-			// between the two independent goroutine writers.
-			//
-			// Transition ordering safety:
-			// - Activation: set rg_active FIRST, then remove blackholes,
-			//   then trigger VRRP MASTER (#485). Neighbor readiness is
-			//   maintained continuously in the background.
-			// - Deactivation: run preflight FIRST, then resign VRRP,
-			//   add blackholes, then clear rg_active (#485)
-			isPrimary := ev.NewState == cluster.StatePrimary
-			clusterDemotionEdge := ev.OldState == cluster.StatePrimary && !isPrimary
-			d.setLocalFailoverCommitReady(ev.GroupID, false)
-			s := d.getOrCreateRGState(ev.GroupID)
-			tr := s.SetCluster(isPrimary)
-			if isPrimary {
-				// Activation: enable forwarding first.
-				// Re-read desired state to guard against a
-				// concurrent VRRP goroutine that may have
-				// already superseded this transition.
-				if rt := d.dataplane(); tr.Changed && rt != nil {
-					cur, _ := s.CurrentDesired()
-					if err := rt.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
-						slog.Warn("failed to update rg_active from cluster event",
-							"rg", ev.GroupID, "active", cur, "err", err)
-					} else {
-						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
-					}
-				}
-				// Only remove blackholes once this node's desired state is
-				// actually active. In strict VIP ownership mode, a cluster
-				// primary event alone does not activate the RG until VRRP
-				// ownership has moved as well.
-				if shouldRemoveBlackholesOnClusterPrimary(s) {
-					d.removeBlackholeRoutes(ev.GroupID)
-				}
-
-				// VRRP priority + ForceRGMaster AFTER rg_active and
-				// blackhole removal (#485).
-				if !noRethVRRP {
-					d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
-					// With preempt=false, VRRP won't self-elect even at
-					// higher priority. Force MASTER since cluster state
-					// is authoritative (e.g. after failover reset).
-					// Only do this for intentional promotions (Secondary →
-					// Primary), NOT on initial boot (SecondaryHold → Primary)
-					// where VRRP should follow its own election timer.
-					if ev.OldState == cluster.StateSecondary {
-						d.vrrpMgr.ForceRGMaster(ev.GroupID)
-					}
-				}
-
-				// no-reth-vrrp direct mode: reconcile VIP ownership from
-				// actual cluster local/peer state, not just this rg_active
-				// edge. This prevents stale VIPs from surviving a demotion
-				// when the rg_state machine has already drifted inactive.
-				if noRethVRRP {
-					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-primary")
-					go d.RefreshFabricFwd()
-				}
-				if noRethVRRP && d.cluster != nil && d.cluster.IsLocalPrimary(ev.GroupID) && (d.dataplane() == nil || !s.NeedsApply()) {
-					d.setLocalFailoverCommitReady(ev.GroupID, true)
-				}
-			} else {
-				// Demotion: run preflight and resign VRRP BEFORE
-				// clearing rg_active (#485). The preflight shifts
-				// userspace flow cache entries to FabricRedirect so
-				// the demoting node forwards via fabric during the
-				// transition window. ResignRG must follow preflight
-				// so traffic is already on the fabric path before
-				// the VRRP BACKUP transition removes VIPs.
-				if clusterDemotionEdge && d.dataplane() != nil {
-					d.tryPrepareUserspaceRGDemotion(ev.GroupID)
-				}
-				if !noRethVRRP {
-					if ev.OldState == cluster.StatePrimary &&
-						(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
-						d.vrrpMgr.ResignRG(ev.GroupID)
-					}
-				}
-				// Deactivation: blackhole routes first (if transitioning
-				// to inactive), then clear rg_active.
-				if tr.Changed && !tr.Active {
-					d.injectBlackholeRoutes(ev.GroupID)
-				}
-				if rt := d.dataplane(); tr.Changed && rt != nil {
-					cur, _ := s.CurrentDesired()
-					if !cur && !clusterDemotionEdge {
-						d.tryPrepareUserspaceRGDemotion(ev.GroupID)
-					}
-					if err := rt.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
-						slog.Warn("failed to update rg_active from cluster event",
-							"rg", ev.GroupID, "active", cur, "err", err)
-					} else {
-						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
-					}
-				}
-
-				// no-reth-vrrp direct mode: always reconcile actual VIP
-				// ownership on non-primary transitions. Removal must not
-				// depend on a fresh rg_active edge because stale VIPs can
-				// survive a failback if the state machine already drifted.
-				if noRethVRRP {
-					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-secondary")
-				}
-
-				// #5640: the local demotion is now actuated — VRRP has
-				// resigned to priority-0 (or direct VIP ownership was
-				// reconciled away) and rg_active is cleared. Release any
-				// remote-failover applied-ack that is holding for this fence
-				// so the peer only promotes AFTER this node stopped owning
-				// the RG. Fires for every non-primary edge; unarmed RGs no-op.
-				d.signalFailoverActuated(ev.GroupID)
-			}
-
-			// Strict VIP ownership: suppress GARP on secondary, allow on primary.
-			// Not applicable with no-reth-vrrp (no VRRP instances).
-			if !noRethVRRP && s.IsStrictVIPOwnership() {
-				d.vrrpMgr.SetGARPSuppression(ev.GroupID, !isPrimary)
-			}
-
-			// Debounced VRRP priority update — 500ms coalesce window.
-			// Skipped in no-reth-vrrp mode (no RETH VRRP instances to update).
-			if !noRethVRRP {
-				if vrrpTimer != nil {
-					vrrpTimer.Stop()
-				}
-				vrrpTimer = time.AfterFunc(500*time.Millisecond, func() {
-					if cfg := d.store.ActiveConfig(); cfg != nil {
-						localPri := d.cluster.LocalPriorities()
-						var all []*vrrp.Instance
-						all = append(all, vrrp.CollectInstances(cfg)...)
-						all = append(all, vrrp.CollectRethInstances(cfg, localPri)...)
-						if err := d.vrrpMgr.UpdateInstances(all); err != nil {
-							slog.Warn("cluster: failed to update VRRP instances", "err", err)
-						}
-					}
-				})
-			}
-
-			// RG0-specific: config ownership and IPsec SA re-initiation.
-			if ev.GroupID == 0 {
-				d.applyRG0OwnershipTransition(ev.NewState)
-			}
+			vrrpTimer = d.handleClusterEvent(ctx, ev, vrrpTimer)
 		}
 	}
+}
+
+// handleClusterEvent applies one cluster state-change event: it drives
+// rg_active through the unified rgStateMachine, orders the VRRP and blackhole
+// side effects around that write, and releases the #5640 fence barrier on a
+// demotion.
+//
+// vrrpTimer is the caller's in-flight VRRP-priority debounce timer (nil when
+// none is armed); the possibly re-armed timer is returned so watchClusterEvents
+// keeps exactly one pending update and can stop it on exit. Split out of the
+// select loop so the handling is reachable from a test without an injectable
+// cluster event channel (cluster.Manager only exposes a receive-only Events()).
+func (d *Daemon) handleClusterEvent(ctx context.Context, ev cluster.ClusterEvent, vrrpTimer *time.Timer) *time.Timer {
+	noRethVRRP := d.isNoRethVRRP()
+
+	// Dual-active winner reaffirm: no state change but send
+	// GARPs to refresh upstream ARP/NDP caches after split-brain.
+	if ev.DualActiveWin && noRethVRRP {
+		d.scheduleDirectAnnounce(ev.GroupID, "dual-active-win")
+		return vrrpTimer
+	}
+
+	// Update rg_active through unified state machine.
+	//
+	// Both cluster and VRRP events funnel through rgStateMachine
+	// which determines rg_active = clusterPri || anyVrrpMaster.
+	// This prevents the dual-inactive window (both nodes
+	// rg_active=false during failover) and eliminates the race
+	// between the two independent goroutine writers.
+	//
+	// Transition ordering safety:
+	// - Activation: set rg_active FIRST, then remove blackholes,
+	//   then trigger VRRP MASTER (#485). Neighbor readiness is
+	//   maintained continuously in the background.
+	// - Deactivation: run preflight FIRST, then resign VRRP,
+	//   add blackholes, then clear rg_active (#485)
+	isPrimary := ev.NewState == cluster.StatePrimary
+	clusterDemotionEdge := ev.OldState == cluster.StatePrimary && !isPrimary
+	d.setLocalFailoverCommitReady(ev.GroupID, false)
+	s := d.getOrCreateRGState(ev.GroupID)
+	tr := s.SetCluster(isPrimary)
+	if isPrimary {
+		// Activation: enable forwarding first.
+		// Re-read desired state to guard against a
+		// concurrent VRRP goroutine that may have
+		// already superseded this transition.
+		if rt := d.dataplane(); tr.Changed && rt != nil {
+			cur, _ := s.CurrentDesired()
+			if err := rt.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
+				slog.Warn("failed to update rg_active from cluster event",
+					"rg", ev.GroupID, "active", cur, "err", err)
+			} else {
+				recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
+			}
+		}
+		// Only remove blackholes once this node's desired state is
+		// actually active. In strict VIP ownership mode, a cluster
+		// primary event alone does not activate the RG until VRRP
+		// ownership has moved as well.
+		if shouldRemoveBlackholesOnClusterPrimary(s) {
+			d.removeBlackholeRoutes(ev.GroupID)
+		}
+
+		// VRRP priority + ForceRGMaster AFTER rg_active and
+		// blackhole removal (#485).
+		if !noRethVRRP {
+			d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
+			// With preempt=false, VRRP won't self-elect even at
+			// higher priority. Force MASTER since cluster state
+			// is authoritative (e.g. after failover reset).
+			// Only do this for intentional promotions (Secondary →
+			// Primary), NOT on initial boot (SecondaryHold → Primary)
+			// where VRRP should follow its own election timer.
+			if ev.OldState == cluster.StateSecondary {
+				d.vrrpMgr.ForceRGMaster(ev.GroupID)
+			}
+		}
+
+		// no-reth-vrrp direct mode: reconcile VIP ownership from
+		// actual cluster local/peer state, not just this rg_active
+		// edge. This prevents stale VIPs from surviving a demotion
+		// when the rg_state machine has already drifted inactive.
+		if noRethVRRP {
+			d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-primary")
+			go d.RefreshFabricFwd()
+		}
+		if noRethVRRP && d.cluster != nil && d.cluster.IsLocalPrimary(ev.GroupID) && (d.dataplane() == nil || !s.NeedsApply()) {
+			d.setLocalFailoverCommitReady(ev.GroupID, true)
+		}
+	} else {
+		// Demotion: run preflight and resign VRRP BEFORE
+		// clearing rg_active (#485). The preflight shifts
+		// userspace flow cache entries to FabricRedirect so
+		// the demoting node forwards via fabric during the
+		// transition window. ResignRG must follow preflight
+		// so traffic is already on the fabric path before
+		// the VRRP BACKUP transition removes VIPs.
+		if clusterDemotionEdge && d.dataplane() != nil {
+			d.tryPrepareUserspaceRGDemotion(ev.GroupID)
+		}
+		if !noRethVRRP {
+			if ev.OldState == cluster.StatePrimary &&
+				(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
+				d.vrrpMgr.ResignRG(ev.GroupID)
+			}
+		}
+		// Deactivation: blackhole routes first (if transitioning
+		// to inactive), then clear rg_active.
+		if tr.Changed && !tr.Active {
+			d.injectBlackholeRoutes(ev.GroupID)
+		}
+		// #6371: track whether the dataplane accepted the demotion write.
+		// A failed rg_active update means this node may still be forwarding
+		// for the RG, so the fence below must NOT report actuation.
+		var actuateErr error
+		if rt := d.dataplane(); tr.Changed && rt != nil {
+			cur, _ := s.CurrentDesired()
+			if !cur && !clusterDemotionEdge {
+				d.tryPrepareUserspaceRGDemotion(ev.GroupID)
+			}
+			if err := rt.HA().SetRGActive(ctx, ev.GroupID, cur); err != nil {
+				slog.Warn("failed to update rg_active from cluster event",
+					"rg", ev.GroupID, "active", cur, "err", err)
+				actuateErr = fmt.Errorf("redundancy group %d rg_active=%v not applied on demotion: %w",
+					ev.GroupID, cur, err)
+			} else {
+				recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
+			}
+		}
+
+		// no-reth-vrrp direct mode: always reconcile actual VIP
+		// ownership on non-primary transitions. Removal must not
+		// depend on a fresh rg_active edge because stale VIPs can
+		// survive a failback if the state machine already drifted.
+		if noRethVRRP {
+			d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-secondary")
+		}
+
+		// #5640: the local demotion is now actuated — VRRP has
+		// resigned to priority-0 (or direct VIP ownership was
+		// reconciled away) and rg_active is cleared. Release any
+		// remote-failover applied-ack that is holding for this fence
+		// so the peer only promotes AFTER this node stopped owning
+		// the RG. Fires for every non-primary edge; unarmed RGs no-op.
+		//
+		// #6371: when the rg_active write above FAILED, the fence did not
+		// complete — resolve the barrier with that error instead, so the
+		// applied-ack downgrades to failed and the peer holds rather than
+		// promoting into a two-owner window. Reporting the failure (rather
+		// than staying silent) keeps the waiter from burning its full
+		// timeout on a fence that is already known not to have landed.
+		if actuateErr != nil {
+			d.signalFailoverActuationFailed(ev.GroupID, actuateErr)
+		} else {
+			d.signalFailoverActuated(ev.GroupID)
+		}
+	}
+
+	// Strict VIP ownership: suppress GARP on secondary, allow on primary.
+	// Not applicable with no-reth-vrrp (no VRRP instances).
+	if !noRethVRRP && s.IsStrictVIPOwnership() {
+		d.vrrpMgr.SetGARPSuppression(ev.GroupID, !isPrimary)
+	}
+
+	// Debounced VRRP priority update — 500ms coalesce window.
+	// Skipped in no-reth-vrrp mode (no RETH VRRP instances to update).
+	if !noRethVRRP {
+		if vrrpTimer != nil {
+			vrrpTimer.Stop()
+		}
+		vrrpTimer = time.AfterFunc(500*time.Millisecond, func() {
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				localPri := d.cluster.LocalPriorities()
+				var all []*vrrp.Instance
+				all = append(all, vrrp.CollectInstances(cfg)...)
+				all = append(all, vrrp.CollectRethInstances(cfg, localPri)...)
+				if err := d.vrrpMgr.UpdateInstances(all); err != nil {
+					slog.Warn("cluster: failed to update VRRP instances", "err", err)
+				}
+			}
+		})
+	}
+
+	// RG0-specific: config ownership and IPsec SA re-initiation.
+	if ev.GroupID == 0 {
+		d.applyRG0OwnershipTransition(ev.NewState)
+	}
+	return vrrpTimer
 }
 
 // applyRG0OwnershipTransition reacts to a RG0 ownership change: it toggles the

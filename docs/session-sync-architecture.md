@@ -1650,16 +1650,28 @@ ownership / traffic).
 The fix gates the applied-ack on a fence-completion barrier:
 
 1. The daemon `OnRemoteFailover`/`OnRemoteFailoverBatch` closures call
-   `armFailoverActuation(rgID)` — registering a per-RG channel — **before**
+   `armFailoverActuation(rgID)` — registering a per-RG barrier — **before**
    `ManualFailover` enqueues the demotion event, so the actuation signal can
    never be missed. A `ManualFailover` error disarms the barrier.
 2. `handleRemoteFailover` calls the `WaitFailoverApplied` hook (wired to
    `waitFailoverActuated`) after `OnRemoteFailover` succeeds and before sending
-   `failoverAckApplied`. It blocks on the barrier channel.
-3. `watchClusterEvents`, at the end of the demotion (non-primary) branch — after
-   `ResignRG` / direct-VIP reconcile / `rg_active` clear — calls
-   `signalFailoverActuated(rgID)`, closing the channel and releasing the ack.
-4. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
+   `failoverAckApplied`. It blocks on the barrier.
+3. `handleClusterEvent` (the per-event body of `watchClusterEvents`), at the end
+   of the demotion (non-primary) branch — after `ResignRG` / direct-VIP
+   reconcile / `rg_active` clear — resolves the barrier and releases the ack.
+4. The barrier carries a **verdict**, not just a completion (#6371). The
+   demotion branch tracks whether the dataplane accepted the `rg_active` write:
+   on success it calls `signalFailoverActuated(rgID)` (verdict `nil`), and on a
+   `SetRGActive` error it calls `signalFailoverActuationFailed(rgID, err)`.
+   `waitFailoverActuated` returns that verdict, so a REJECTED clear — this node
+   may still be forwarding for the RG — downgrades the ack to
+   `failoverAckFailed` instead of reporting the fence applied. Failing loudly
+   rather than staying silent also keeps the waiter from burning its whole
+   timeout on a fence already known not to have landed. The resolved barrier is
+   left in the map for `waitFailoverActuated` to consume (a re-arm replaces it):
+   deleting it at resolution time would make a failure that lands before the
+   waiter arrives read as "never armed", i.e. success.
+5. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
    never actuates (superseded reset, event-channel drop) downgrades the ack to
    `failoverAckFailed` so the peer **holds** rather than promoting into the
    two-owner window — safety over latency in the race. On the normal path the

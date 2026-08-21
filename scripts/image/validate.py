@@ -173,11 +173,26 @@ class Harness:
 
     # ── lifecycle ──
     def ensure_network(self):
+        # dns.mode=none is REQUIRED, not cosmetic. incus registers one DNS
+        # record per instance per managed network, so a second NIC on the same
+        # network is refused at device-add time:
+        #   Instance DNS name "<inst>" conflict between "extranic0" and "eth0"
+        #   because both are connected to same network
+        # Scenario e needs three NICs on one network to prove the node-1
+        # positional naming (em0 + ge-7/0/N), and scenario d's control leg
+        # needs none of the DNS records. Turning DNS off keeps DHCP — which is
+        # all any scenario consumes — and removes the conflict.
         if incus("network", "show", self.net, check=False, capture=True).returncode != 0:
-            info(f"creating validation network {self.net} (NAT + DHCP)")
+            info(f"creating validation network {self.net} (NAT + DHCP, no DNS)")
             incus("network", "create", self.net, "ipv4.address=10.199.99.1/24",
-                  "ipv4.nat=true", "ipv6.address=none")
+                  "ipv4.nat=true", "ipv6.address=none", "dns.mode=none")
             self.created_net = True
+        else:
+            # A network left behind by an earlier run (or a concurrent bake)
+            # may predate this setting. Idempotent, and harmless to a
+            # concurrent run: no scenario resolves an instance by DNS.
+            incus("network", "set", self.net, "dns.mode=none", check=False,
+                  capture=True)
 
     def verify_signatures(self):
         """Verify the EXACT qcow2 + metadata files against the signed
@@ -240,6 +255,13 @@ class Harness:
         incus("init", self.alias, name, "--vm", "--network", self.net,
               "-c", "limits.cpu=2", "-c", "limits.memory=2GiB",
               "-c", f"user.xpf-owner={self.run_id}", capture=True)
+        # Register for teardown IMMEDIATELY after init, not after the device
+        # adds below. The instance exists and carries this run's ownership tag
+        # from the moment init returns; registering later meant any failure
+        # between here and the end of launch() (a refused device add, a bad
+        # ISO path) left a VM behind that cleanup could not see, because
+        # cleanup only walks self.instances.
+        self.instances.append(name)
         if root_size:
             # Override the instance's root disk to a size LARGER than the
             # image (#1925 Scenario D). `device override root` materializes an
@@ -256,7 +278,6 @@ class Harness:
         if iso:
             incus("config", "device", "add", name, "day0", "disk",
                   f"source={os.path.realpath(iso)}", capture=True)
-        self.instances.append(name)
         incus("start", name)
         self.wait_agent(name)
 

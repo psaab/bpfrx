@@ -936,15 +936,18 @@ type Daemon struct {
 	// the bit have a chance to propagate before the peer finalizes demotion.
 	localFailoverCommitDelay time.Duration
 	// failoverActuateMu guards failoverActuateWait. The map holds, per RG, a
-	// channel that watchClusterEvents closes once it has ACTUATED a demotion
-	// (VRRP resign to priority-0 / rg_active clear). armFailoverActuation
-	// registers a fresh channel BEFORE ManualFailover enqueues the demotion
-	// event, so the close can never be missed; waitFailoverActuated blocks the
-	// remote-failover applied-ack on that close. This closes the #5640
-	// two-owner window where the peer promoted off an ack sent before this
-	// (old-owner) node had actually resigned.
+	// barrier that watchClusterEvents resolves once it has finished ACTUATING
+	// a demotion (VRRP resign to priority-0 / rg_active clear).
+	// armFailoverActuation registers a fresh barrier BEFORE ManualFailover
+	// enqueues the demotion event, so the resolution can never be missed;
+	// waitFailoverActuated blocks the remote-failover applied-ack on it. This
+	// closes the #5640 two-owner window where the peer promoted off an ack
+	// sent before this (old-owner) node had actually resigned. The barrier
+	// carries a verdict, not just a completion: a demotion whose rg_active
+	// clear was REJECTED by the dataplane resolves with that error so the ack
+	// is downgraded rather than reported applied (#6371).
 	failoverActuateMu   sync.Mutex
-	failoverActuateWait map[int]chan struct{}
+	failoverActuateWait map[int]*failoverActuation
 	// failoverActuateTimeout bounds waitFailoverActuated so a demotion event
 	// that is never actuated (superseded reset, event-channel drop) downgrades
 	// the ack to failed instead of hanging the peer's failover request.
@@ -1257,7 +1260,7 @@ func New(opts Options) (*Daemon, error) {
 		localFailoverCommitReady:   make(map[int]bool),
 		localFailoverCommitTimeout: 3 * time.Second,
 		localFailoverCommitDelay:   200 * time.Millisecond,
-		failoverActuateWait:        make(map[int]chan struct{}),
+		failoverActuateWait:        make(map[int]*failoverActuation),
 		failoverActuateTimeout:     3 * time.Second,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 		applySem:                   semaphore.NewWeighted(1),
