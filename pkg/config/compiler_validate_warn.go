@@ -940,6 +940,27 @@ func ValidateConfig(cfg *Config) []string {
 			warnings = append(warnings,
 				"security flow sync-icmp-session configured but has no effect — xpf syncs ICMP sessions to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic), so this Junos opt-in knob is a no-op: ICMP session sync is already always on and cannot be turned off (config-only parity, #4231)")
 		}
+		// #5804: gre-performance-acceleration is the same accepted-only
+		// doctrine, and it gets its own line because its consequence is
+		// SPECIFIC rather than "no effect". The flag reaches
+		// ForwardingState.gre_acceleration and stops there; no packet path
+		// reads it. GRE (protocol 47) has no L4 ports, so the shim stamps
+		// flow_src_port = flow_dst_port = 0 and SessionKey — a 5-tuple with no
+		// tunnel discriminator — is identical for every keyed tunnel sharing
+		// the outer addresses. Two GRE/PPTP tunnels between the same pair of
+		// outer endpoints therefore ALIAS one firewall session, and the second
+		// one inherits the first's policy decision, NAT state, counters and
+		// timeout. An operator enabling this knob is asking for exactly the
+		// opposite, so saying "no effect" would understate it.
+		if flow.GREPerformanceAcceleration {
+			warnings = append(warnings,
+				"security flow gre-performance-acceleration configured but accepted-only — "+
+					"the userspace dataplane keys GRE sessions on the 5-tuple with no tunnel "+
+					"discriminator, so distinct RFC 2890 keys or PPTP call IDs between the SAME "+
+					"outer endpoints still share one session and its policy/NAT/counter/timeout "+
+					"state; independent per-tunnel sessions are not provided (config-only "+
+					"parity, #5804)")
+		}
 	}
 
 	// #4299 (fable-167 V-3): `security ipsec vpn <v> vpn-monitor` is typed +

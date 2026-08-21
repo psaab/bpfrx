@@ -1261,7 +1261,17 @@ drift) closed in `fix/2008-quickwins-batch1`:
   packet/forwarding path (the field is still `#[allow(dead_code)]`). The
   consumer — GRE key/call-id extraction into the session tuple — is the deferred
   feature, and this is the seam it would read; it is not part of this
-  config-truth fix.
+  config-truth fix. **#5804 correction:** "DONE (threaded)" describes config
+  truth only, and the operator surfaces used to overstate it — `show security
+  flow` rendered a bare `gre-performance-acceleration: enabled` and commit said
+  nothing at all, so an operator read a tunnel-aware session identity into a
+  box that keys GRE on the bare 5-tuple. Both `show` surfaces now qualify it
+  (`configured (accepted-only; GRE sessions remain 5-tuple keyed)`) and commit
+  emits the #2078/#4231 accepted-only advisory, naming the consequence: two
+  GRE/PPTP tunnels between the SAME outer endpoints share one session and its
+  policy/NAT/counter/timeout state. The dataplane feature — an RFC 2890 tunnel
+  discriminator in `SessionKey` — is #7188, which retires both the advisory and
+  the qualifier when it lands.
 - **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
   the schema child (`pkg/config/schema_security.go`), the
   `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),
