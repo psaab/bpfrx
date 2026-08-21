@@ -229,9 +229,17 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
 		// #4304 S-2: custom `login class <name>` RBAC definition. Recognized so
 		// a real vSRX config commits; the Junos permission set is mapped onto
-		// xpf's coarse permission model at compile (compiler_system.go). The
-		// fine-grained allow/deny-command regexes are accepted structurally but
-		// not enforced (see the compile advisory).
+		// xpf's coarse permission model at compile (compiler_system.go).
+		//
+		// The four regex leaves are accepted STRUCTURALLY here but split at
+		// compile (#5831): the ADDITIVE allow-commands / allow-configuration
+		// stay recognized-but-not-enforced with the #4304 advisory, while the
+		// RESTRICTIVE deny-commands / deny-configuration are hard-REJECTED at
+		// commit (validateLoginClassDenyStrict) and fold the class toward the
+		// repair floor on the tolerant load / peer-sync path. Structural
+		// acceptance is deliberate: the schema must still parse the leaf so
+		// the compiler can produce the actionable rejection rather than an
+		// opaque "unknown statement".
 		"class": {desc: "Login class definition", args: 1, placeholder: "<class-name>", children: map[string]*schemaNode{
 			"permissions":         {desc: "Permission bits granted to the class", args: 1, multi: true, placeholder: "<permission>", children: nil},
 			"idle-timeout":        {desc: "Idle timeout (minutes)", args: 1, placeholder: "<minutes>", valueType: ValueInteger, validator: ValidateInteger(0, 4294967295), children: nil},

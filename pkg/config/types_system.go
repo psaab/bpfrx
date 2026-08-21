@@ -751,18 +751,52 @@ type LoginConfig struct {
 // (view/clear/control/config/maint/all, types_system.go LoginClassPermission).
 // So xpf recognizes the class (a valid config commits instead of being
 // hard-rejected at the `user ... class` enum) and maps the whole-box Junos
-// permission tokens onto the nearest coarse bucket. Fine-grained
-// allow-commands / deny-commands / idle-timeout are recorded but NOT enforced
-// by the coarse gate; the compiler emits an advisory saying so.
+// permission tokens onto the nearest coarse bucket.
+//
+// The four regex sub-statements are NOT symmetric (#5831):
+//
+//   - allow-commands / allow-configuration are ADDITIVE in Junos — they grant
+//     access BEYOND the permission bits. Ignoring an additive grant can only
+//     ever hand the class LESS than the operator wrote, so they stay
+//     recognized-but-not-enforced with an advisory (fail-closed), as does the
+//     idle-timeout session-lifetime knob.
+//   - deny-commands / deny-configuration are RESTRICTIVE — they subtract from
+//     the permission bits. Ignoring them hands the class MORE than the
+//     operator wrote, so they are hard-rejected at commit
+//     (validateLoginClassDenyStrict) and, on the tolerant load / peer-sync
+//     path, fold the class down to the REPAIR FLOOR — {view, configure}
+//     intersected with what the class already held
+//     (foldLoginClassDenyToRepairableFloor). Not to view-only: the configured
+//     class can be bound to the console login, and a class that cannot enter
+//     `configure` cannot delete the statement that is blocking every commit.
 type LoginClass struct {
 	Name               string
 	Permissions        []string               // raw Junos permission tokens as written
 	MappedPermissions  []LoginClassPermission // coarse xpf perms derived from Permissions
 	IdleTimeout        int                    // minutes; recognized, not enforced
-	AllowCommands      string                 // regex; recognized, not enforced
-	DenyCommands       string                 // regex; recognized, not enforced
-	AllowConfiguration string                 // regex; recognized, not enforced
-	DenyConfiguration  string                 // regex; recognized, not enforced
+	AllowCommands      string                 // regex; additive, recognized, not enforced
+	DenyCommands       string                 // regex; restrictive — see DenyLeavesPresent
+	AllowConfiguration string                 // regex; additive, recognized, not enforced
+	DenyConfiguration  string                 // regex; restrictive — see DenyLeavesPresent
+
+	// DenyLeavesPresent records which RESTRICTIVE regex leaves the operator
+	// actually WROTE, in config order, independent of their value (#5831).
+	//
+	// It exists because the value alone cannot answer that question: the
+	// parser compiles `deny-commands ""` and a bare valueless `deny-commands`
+	// to the SAME empty string as an absent leaf (both AST shapes retain the
+	// leaf node — Keys=["deny-commands",""] and Keys=["deny-commands"] — but
+	// nodeVal flattens each to ""). A quoted-empty regex is not a harmless
+	// no-op: an empty POSIX regex matches at every position, so in Junos it
+	// denies EVERY command — the single most restrictive thing an operator can
+	// write, and therefore the most dangerous one to silently drop. Gating on
+	// `DenyCommands != ""` would wave exactly that config through, so the gate
+	// reads this presence list instead.
+	//
+	// Populated by compiler_system.go from loginClassLeafRestrictive
+	// (compiler_login_deny.go) rather than from a per-leaf `case` arm, so
+	// classifying a new restrictive leaf is the only edit needed to gate it.
+	DenyLeavesPresent []string
 }
 
 // mapJunosPermissions folds a custom login class's Junos permission tokens onto

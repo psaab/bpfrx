@@ -9905,10 +9905,25 @@ blocking the whole config. This is accept-with-advisory now:
 - **advisory** — `loginClassAdvisoryWarnings` emits one `cfg.Warnings` entry
   per custom class naming the mapped permissions. `allow-commands` /
   `allow-configuration` / `idle-timeout` are named as accepted-but-not-enforced
-  (neutral). `deny-commands` / `deny-configuration` get an explicit `WARNING`
-  that, because they are unenforced blacklists, the class is **more permissive
-  than the Junos config** (the denied verbs stay allowed) — a weaker posture,
-  not merely "unenforced". Full per-command deny enforcement is a follow-up.
+  (neutral) — ignoring an ADDITIVE grant can only under-grant, so it is
+  fail-closed. The advisory says nothing about `deny-commands` /
+  `deny-configuration`; the pre-#5831 "MORE PERMISSIVE" advisory for those two
+  is **gone**, not reworded.
+- **restrictive-regex gate (#5831)** — `deny-commands` / `deny-configuration`
+  are RESTRICTIVE, so ignoring them over-grants. `validateLoginClassDenyStrict`
+  hard-**rejects** them at commit / commit-check (keyed on leaf PRESENCE, so
+  `deny-commands ""` and a valueless `deny-commands` are caught too — an empty
+  POSIX regex denies *everything*). On the tolerant load / peer-sync path
+  (#1960 no-brick) `foldLoginClassDenyToRepairableFloor` **folds** the class to
+  `{view, configure} ∩ what it already held` and warns. That is a blast-radius
+  reduction, **not** enforcement: `clear` / `control` / `maintenance` / `all`
+  are dropped, but the two RETAINED buckets are levels at which the statement
+  does nothing — `deny-configuration` targets `configure`, and a
+  `deny-commands` naming `show` / `ping` / `traceroute` / `monitor` targets
+  `view`. Both are retained because they are what an operator needs to delete
+  the statement. The warning is generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim can never be wider than the
+  behaviour. Full per-command deny enforcement is a follow-up on #5831.
 - **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
   built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
   custom-class user is enforced against the mapped permissions instead of
