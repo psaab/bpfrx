@@ -2768,6 +2768,14 @@ func validateStaticNATSingleTargetStrict(cfg *Config) error {
 // carries contradictory actions (e.g. `off` + `pool`, or a single hierarchical
 // `source-nat { interface; pool P; }` node, which #5628's setter change now
 // records as two set fields rather than silently picking one by child order).
+//
+// The converse does NOT hold, and the gate's message must not imply it
+// (#7034): a count of ONE does not mean the block carried one action. A
+// contradiction whose tokens are packed onto a single node —
+// `source-nat pool P off`, `source-nat off pool P`, `source-nat { pool P off; }`
+// — never reaches two fields, because the packed branch of compileNATSource /
+// compileNATDestination reads `t.Keys[1]` alone and drops the rest. Those
+// spellings resolve to one field, count one, and commit. Tracked as #7033.
 func natThenTerminalActionCount(then NATThen) int {
 	n := 0
 	if then.Interface {
@@ -2797,8 +2805,15 @@ func natThenTerminalActionCount(then NATThen) int {
 //
 //   - TWO OR MORE actions (contradictory, mutually-exclusive translations such
 //     as `off` + `pool` or `interface` + `pool` inside ONE block): all but one
-//     authored action is silently discarded, and the survivor is chosen by a
-//     FIXED precedence, not by anything the operator wrote. WHERE that happens
+//     authored action is silently discarded, and WITHIN THAT BLOCK the survivor
+//     is chosen by a FIXED precedence rather than by the order the actions were
+//     written. Scope that to the block and no further (#7035): across duplicate
+//     `then` CONTAINERS configuration order DOES decide, because the reset
+//     below makes the LAST container the one that supplies the fields — swap
+//     `then { source-nat { off; pool P; } }` with
+//     `then { source-nat { interface; pool P; } }` and the surviving action
+//     changes from `interface` to `off` while the message stays the same.
+//     WHERE that happens
 //     differs by kind, and the two do NOT share a mechanism (#6820 round 3):
 //     source NAT publishes every authored field (the #5628 else-if→if setter
 //     change) and the DATAPLANE picks `off` > `interface` > `pool`; destination
@@ -2816,7 +2831,22 @@ func natThenTerminalActionCount(then NATThen) int {
 // CONTAINERS are #3850's intentional last-wins merge (compileNAT resets
 // rule.Then per block, so the count reflects the winning block) and are NOT
 // rejected here — a rule with two `then` blocks each naming one action still
-// commits. Strict on commit / commit-check (hard reject so the malformed rule
+// commits.
+//
+// It counts RESOLVED FIELDS, not authored tokens, and that is a real bound on
+// the gate rather than a restatement of it (#7034). The compiler reads a
+// packed `source-nat`/`destination-nat` node by a SINGLE key —
+// `switch t.Keys[1]` in compileNATSource / compileNATDestination — so every
+// token-packed spelling of a contradiction lowers to ONE field and is counted
+// as one action: `then { source-nat off pool P; }` resolves to `{Off:true}`,
+// `then { source-nat pool P off; }` and `then { source-nat { pool P off; } }`
+// to `{PoolName:"P"}`, and the flat `set … then source-nat pool P off` to
+// `{PoolName:"P"}` — all four COMMIT under strict (measured through
+// CompileConfig at f8e720c3e; the DNAT spellings behave identically). So a
+// count of one does not mean the operator wrote one action, and this gate must
+// not be read as covering the block-level case in general. That gap is the
+// behaviour half, #7033; the message below says so rather than claiming the
+// strong form. Strict on commit / commit-check (hard reject so the malformed rule
 // is operator-visible); the caller downgrades to a warning on the tolerant load
 // / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick). Only a
 // malformed rule reaches that path — the strict commit path rejects it — but
@@ -2949,10 +2979,16 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
 							"translation actions (expected exactly one of %s); %s, so all but "+
-							"one action is silently discarded and the survivor is not chosen "+
-							"by configuration order. (Duplicate `then` CONTAINERS resolve "+
-							"last-wins per #3850; this rejects contradictory actions inside one "+
-							"block.)",
+							"one action is silently discarded and, WITHIN THIS BLOCK, the "+
+							"survivor is decided by that fixed precedence rather than by the "+
+							"order the actions were written. (Duplicate `then` CONTAINERS "+
+							"resolve last-wins per #3850, so a rule with several containers is "+
+							"counted on the LAST one — container order therefore does decide "+
+							"WHICH contradiction you get here. This gate counts the actions the "+
+							"rule RESOLVED to, so it catches a block that LOWERS two distinct "+
+							"actions; a contradiction whose tokens are PACKED onto one node, as "+
+							"in `pool <p> off`, lowers to a single action, is counted as one and "+
+							"is NOT caught here — tracked as #7033.)",
 						kind, rs.Name, rule.Name, n, actions, mechanism)
 				}
 			}
