@@ -201,30 +201,21 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						// DNAT rule). Both AST shapes are handled: the flat-set
 						// leaf (Keys=["destination-nat","off"]) and the
 						// hierarchical child (`destination-nat { off; }`).
-						if len(t.Keys) >= 2 && t.Keys[1] == "off" {
-							rule.Then.Type = NATDestination
-							rule.Then.Off = true
-						} else if len(t.Keys) >= 3 && t.Keys[1] == "pool" {
-							rule.Then.Type = NATDestination
-							rule.Then.PoolName = t.Keys[2]
-						} else {
-							// #5628: read EVERY hierarchical terminal child, not
-							// the first one only (see the source-NAT note). A valid
-							// single-child block (`destination-nat { pool P; }` or
-							// `{ off; }`) is bit-identical; a contradictory
-							// `destination-nat { pool P; off; }` now sets BOTH
-							// fields so validateNATTerminalActionCardinalityStrict
-							// can reject it instead of the compiler silently
-							// picking pool by child order.
-							if poolNode := t.FindChild("pool"); poolNode != nil {
-								rule.Then.Type = NATDestination
-								rule.Then.PoolName = nodeVal(poolNode)
-							}
-							if t.FindChild("off") != nil {
-								rule.Then.Type = NATDestination
-								rule.Then.Off = true
-							}
-						}
+						//
+						// #5628 reads EVERY hierarchical terminal child rather than
+						// the first; #6820 B1 extends that to the PACKED Keys tail,
+						// which was still read as Keys[1] alone — a packed
+						// `destination-nat pool P off` lowered the pool and dropped
+						// the `off` EXEMPTION, so the cardinality gate counted
+						// n == 1 and the contradiction strictly COMMITTED as a
+						// TRANSLATION, the exact inverse of an authored `off`.
+						// A valid single-action node stays bit-identical; a
+						// contradictory one sets every authored field so
+						// validateNATTerminalActionCardinalityStrict rejects it.
+						// `allowInterface` is FALSE: destination NAT has no
+						// interface translation mode and must never lower one.
+						// See applyNATThenActions.
+						applyNATThenActions(t, &rule.Then, NATDestination, false)
 					}
 				}
 			}

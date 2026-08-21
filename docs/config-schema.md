@@ -3117,7 +3117,33 @@ rule `off` > `interface` > `pool`. For destination NAT the COMPILER resolves
 looks the pool up, and publishes `PoolAddress: ""`, so "every action is
 published" is false for a DNAT rule; the dataplane's `off` > `pool` branch then
 covers any entry that arrives carrying both. Either way all but one authored
-action is discarded, and the survivor is not chosen by configuration order.
+action is discarded, and which one survives is decided by that precedence
+rather than by the order the actions are written *inside the block*.
+
+Scope that qualifier exactly. Configuration order is **not** irrelevant to the
+rule as a whole, and the unqualified claim ("the survivor is not chosen by
+configuration order") shipped here and in the rejection text in #6820 round 4
+and is false. `compileNATSource` / `compileNATDestination` reset `rule.Then` at
+the top of **every** `then` container (#3850 last-wins), so when a rule carries
+duplicate containers the **last** one supplies the actions the gate counts, and
+the fixed precedence resolves only among those. Authoring
+`then { source-nat { off; pool P; } }` followed by
+`then { source-nat { interface; pool P; } }` resolves to **interface**;
+swapping the two containers resolves to **off**. Order chose, at container
+granularity, before precedence ran.
+
+*Packed contradictions (#6820).* A `then` action leaf may pack several tokens —
+`destination-nat pool P off` parses to `Keys = [destination-nat, pool, P, off]`,
+because `parseKeys` retains every token and schema validation deliberately
+ignores leftover container keys. Reading `Keys[1]` alone therefore lowered ONE
+action and silently dropped the rest, leaving nothing for the cardinality gate
+to count: the contradiction committed under a **strict** commit, as `off` or as
+`pool` depending only on which token came first. This is the same multi-value
+leaf hazard as #2419 (see "Multi-value leaves and bracketed lists" below): a
+compiler reading a packed leaf must read `Keys[1:]` **and** the node's children
+and accumulate. `applyNATThenActions` (`compiler_nat_helpers.go`) does that for
+both NAT kinds, so a packed contradiction now reaches the gate as 2+ actions and
+is rejected.
 
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land

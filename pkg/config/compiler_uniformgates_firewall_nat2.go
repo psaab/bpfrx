@@ -208,10 +208,15 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// with TWO+ mutually-exclusive actions inside one block let the compiler
 	// silently pick one by packed-key/child order (an exemption COULD then
 	// publish as a translation — the inverse of the authored action). Both
-	// clauses are past tense on purpose: since #5628 the compiler records every
-	// field and the dataplane resolves them by a fixed precedence, so the
-	// present-tense form of this sentence is false — see the corrected
-	// rejection text on validateNATTerminalActionCardinalityStrict (#6820).
+	// clauses are past tense on purpose, but the tenses were only HALF earned
+	// until #6820 B1: #5628 stopped the CHILD-order pick, while a PACKED leaf
+	// (`destination-nat pool P off`) went on being read as Keys[1] alone, so the
+	// packed-key pick was still live — and invisible, because the dropped action
+	// never reached NATThen for the gate to count. applyNATThenActions now
+	// accumulates both shapes, so the compiler records every field and the
+	// dataplane resolves them by a fixed precedence, and the present-tense form
+	// of this sentence is false for BOTH halves — see the corrected rejection
+	// text on validateNATTerminalActionCardinalityStrict (#6820).
 	// Strict on commit /
 	// commit-check (hard reject so the malformed rule is operator-visible);
 	// lenient on load / peer-sync (warn — #1960 no-brick). What happens on that

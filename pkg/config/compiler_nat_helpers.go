@@ -427,3 +427,85 @@ func applyDeterministicHost(det *DeterministicNATConfig, hostNode *Node) {
 		det.HostAddress = hostNode.Keys[1]
 	}
 }
+
+// applyNATThenActions records EVERY NAT-terminal translation action a
+// `then { source-nat ... }` or `then { destination-nat ... }` node carries onto
+// then: the action tokens PACKED onto the node's own Keys tail AND the
+// hierarchical child nodes, ACCUMULATED rather than first-match. kind is the
+// NATType to stamp when any action is found; allowInterface admits the
+// source-NAT-only `interface` mode, which a destination-NAT node must never
+// lower (destination NAT has no interface translation).
+//
+// #6820 B1 — WHY accumulate. The packed tail used to be read as Keys[1] ALONE
+// (`if Keys[1] == "off" { … } else if Keys[1] == "pool" { … }`), so a packed
+// CONTRADICTION lowered exactly one field and silently dropped the rest:
+//
+//	destination-nat off pool P;   Keys=[destination-nat off pool P] -> Off only
+//	destination-nat pool P off;   Keys=[destination-nat pool P off] -> Pool only
+//
+// Nothing downstream saw the dropped action either. parseKeys retains every
+// token (parser.go) and schema validation deliberately IGNORES leftover
+// container keys (schema_walk.go), so
+// validateNATTerminalActionCardinalityStrict counted the one lowered field,
+// found n == 1, and the contradiction STRICTLY COMMITTED — as `off` or as
+// `pool` decided by nothing but which token the operator happened to write
+// first. Two silently different dispositions for one malformed statement, on
+// the very path this gate exists to close.
+//
+// This is the #2419 multi-value-leaf family (docs/config-schema.md,
+// "Multi-value leaves and bracketed lists"): a compiler reading a packed leaf
+// must read Keys[1:] AND the node's Children and accumulate, never Keys[1]
+// alone. Accumulating makes every authored action reach NATThen, so the
+// cardinality gate sees n >= 2 and rejects the contradiction at strict commit
+// (warns on the tolerant #1960 path) instead of silently picking one.
+//
+// A WELL-FORMED single-action node is bit-identical under this scan: `pool`
+// consumes exactly one value token, so a pool legitimately NAMED "off" or
+// "interface" (`source-nat pool off`) is still read as a pool NAME and stays
+// one action. A `pool` with no following token stamps kind but leaves PoolName
+// empty, which the zero-action arm of the gate then rejects — the pre-#6820
+// behaviour for that shape, preserved.
+//
+// Tokens the scan does not recognize are ignored, exactly as before: the
+// flat-set grammar parks trailing garbage that the schema gate handles
+// separately, and widening THIS function into a grammar check would reject
+// shapes unrelated to terminal-action cardinality.
+func applyNATThenActions(t *Node, then *NATThen, kind NATType, allowInterface bool) {
+	set := func(apply func()) {
+		then.Type = kind
+		apply()
+	}
+	for i := 1; i < len(t.Keys); i++ {
+		switch t.Keys[i] {
+		case "interface":
+			if allowInterface {
+				set(func() { then.Interface = true })
+			}
+		case "off":
+			set(func() { then.Off = true })
+		case "pool":
+			// `pool` takes exactly ONE value token; consume it so a pool
+			// named "off"/"interface" is a NAME, not a second action.
+			set(func() {})
+			if i+1 < len(t.Keys) {
+				then.PoolName = t.Keys[i+1]
+				i++
+			}
+		}
+	}
+	for _, c := range t.Children {
+		switch c.Name() {
+		case "interface":
+			if allowInterface {
+				set(func() { then.Interface = true })
+			}
+		case "off":
+			set(func() { then.Off = true })
+		case "pool":
+			set(func() {})
+			if v := nodeVal(c); v != "" {
+				then.PoolName = v
+			}
+		}
+	}
+}

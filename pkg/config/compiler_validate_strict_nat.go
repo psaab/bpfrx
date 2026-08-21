@@ -2717,9 +2717,15 @@ func validateStaticNATSingleTargetStrict(cfg *Config) error {
 // this count reflects only the WINNING (last) block — duplicate `then`
 // CONTAINERS that each carry a single action resolve to one action here, never
 // a false conflict. A count of two only arises when one complete then-block
-// carries contradictory actions (e.g. `off` + `pool`, or a single hierarchical
-// `source-nat { interface; pool P; }` node, which #5628's setter change now
-// records as two set fields rather than silently picking one by child order).
+// carries contradictory actions: a single hierarchical `source-nat { interface;
+// pool P; }` node, which #5628's setter change records as two set fields rather
+// than silently picking one by child order, or a PACKED `source-nat off pool P`
+// / `destination-nat pool P off` leaf, which #6820 B1 records as two set fields
+// rather than reading Keys[1] alone. The packed case is the one this counter
+// could NOT see before #6820: parseKeys keeps every token and schema validation
+// ignores leftover container keys, so the dropped action left no trace anywhere
+// — n was 1 and the contradiction strictly committed. Both shapes now reach
+// this counter through applyNATThenActions.
 func natThenTerminalActionCount(then NATThen) int {
 	n := 0
 	if then.Interface {
@@ -2750,7 +2756,20 @@ func natThenTerminalActionCount(then NATThen) int {
 //   - TWO OR MORE actions (contradictory, mutually-exclusive translations such
 //     as `off` + `pool` or `interface` + `pool` inside ONE block): all but one
 //     authored action is silently discarded, and the survivor is chosen by a
-//     FIXED precedence, not by anything the operator wrote. WHERE that happens
+//     FIXED precedence, not by the order the actions are written WITHIN the
+//     block. Scope that qualifier exactly — the unqualified form ("not by
+//     configuration order", "not by anything the operator wrote") is FALSE and
+//     shipped in #6820 round 4: when a rule carries DUPLICATE `then`
+//     CONTAINERS, compileNATSource/compileNATDestination reset `rule.Then` per
+//     container, so the LAST authored container supplies the fields this gate
+//     counts, and the fixed precedence only resolves among THOSE. Authoring
+//     `off`+`pool` then `interface`+`pool` yields Interface; swapping the two
+//     containers yields Off. Configuration order chose, at container
+//     granularity, before precedence ran. Bound behaviourally (both axes, not
+//     by quoting the sentence) in
+//     compiler_nat_terminal_action_5628_test.go — see
+//     TestNATSurvivorIsOrderInvariantWithinBlock_6820 and
+//     TestNATDuplicateContainerLastWinsChoosesSurvivor_6820. WHERE that happens
 //     differs by kind, and the two do NOT share a mechanism (#6820 round 3):
 //     source NAT publishes every authored field (the #5628 else-if→if setter
 //     change) and the DATAPLANE picks `off` > `interface` > `pool`; destination
@@ -2901,10 +2920,14 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
 							"translation actions (expected exactly one of %s); %s, so all but "+
-							"one action is silently discarded and the survivor is not chosen "+
-							"by configuration order. (Duplicate `then` CONTAINERS resolve "+
-							"last-wins per #3850; this rejects contradictory actions inside one "+
-							"block.)",
+							"one action is silently discarded, and which one survives is decided "+
+							"by that precedence rather than by the order the actions are written "+
+							"inside this block. Configuration order is not irrelevant to the rule "+
+							"as a whole: duplicate `then` CONTAINERS are resolved FIRST, "+
+							"last-wins per #3850 — the LAST container supplies the actions "+
+							"counted here — and the precedence above then resolves among them. "+
+							"(This rejects contradictory actions inside one block; it does not "+
+							"reject duplicate containers.)",
 						kind, rs.Name, rule.Name, n, actions, mechanism)
 				}
 			}
