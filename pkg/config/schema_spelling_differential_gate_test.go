@@ -22,11 +22,12 @@ package config
 //
 // There is no single correct reader to lint FOR. This package now contains at
 // least six accumulating readers — firewallMatchValues, multiLeafAuthoredValues,
-// proxyARPAddressValues, eventMultiWordLeafValues, fabricMemberValues, and
-// ntpServerValues, the last of which must additionally skip per-value option
-// KEYWORDS. A rule matching "reads Keys[1]" would flag compliant code, and would
-// miss the #7126 sites entirely: both of those read Keys[1:] AND Children exactly
-// as CLAUDE.md instructs, and still drop, because reading Children is not the
+// proxyARPAddressValues, eventMultiWordLeafValues, plainListValues (#7126
+// single-sourced #6694's fabricMemberValues into it), and ntpServerValues, the
+// last of which must additionally skip per-value option KEYWORDS. A rule
+// matching "reads Keys[1]" would flag compliant code, and would have missed the
+// #7126 sites entirely: both of those read Keys[1:] AND Children exactly as
+// CLAUDE.md instructs, and still dropped, because reading Children is not the
 // same as reading every KEY of each child. A differential has no such blind
 // spot — it asks whether the compiler disagrees with ITSELF, which is the defect.
 //
@@ -145,20 +146,8 @@ var knownSpellingInconsistencies = map[string]string{
 	"class-of-service rewrite-rules dscp <*> forwarding-class <*> loss-priority <*> code-points":          "#6697",
 	"class-of-service rewrite-rules ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-points":    "#6697",
 
-	// #6687 — vlan-id-list validated/read at slot 0 only.
-	"bridge-domains <*> vlan-id-list": "#6687",
-
 	// #6695 — RA dns-server-address drops every RDNSS server past the first.
 	"protocols router-advertisement interface <*> dns-server-address": "#6695",
-
-	// #6688 — source-NAT port range compiles a one-port pool.
-	"security nat source pool <*> port range": "#6688",
-
-	// #7126 — the flat-set bracket list lands on a CHILD's Keys for any leaf
-	// setSchema does not mark multi, so a reader taking Keys[0] of each child
-	// keeps only the first value even though it reads both sides.
-	"routing-options rib-groups <*> import-rib": "#7126",
-	"event-options policy <*> events":           "#7126",
 }
 
 // ---------------------------------------------------------------------------

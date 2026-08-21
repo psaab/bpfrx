@@ -398,6 +398,27 @@ func compileNAT64(node *Node, sec *SecurityConfig) error {
 // downstream strict gate caught the non-zero cases (the stamped bad value), and
 // a 0-valued endpoint slipped through the parser as the "unconfigured" sentinel
 // and silently widened to the default PAT range.
+//
+// #6688: BOTH shapes have a FIXED arity, and a token the grammar does not
+// consume now rejects instead of being ignored. `port range` is not a value
+// list — it is a compound value TAIL — but the lexer strips brackets before the
+// compiler sees anything, so `port range [ 1000 2000 ]` and a mistyped
+// `port range 1000 2000` (the `to` dropped) arrive as the SAME token slice
+// ["1000","2000"]. The pre-#6688 reader took toks[0] as both endpoints and
+// discarded the rest, so an operator who sized a pool at 1001 ports got ONE,
+// with no diagnostic anywhere: the pool exhausts under the first real
+// translation load and the symptom points nowhere near the config that caused
+// it. The same silent discard let an out-of-range or non-numeric second slot
+// ("1000 99999", "1000 notaport") commit clean, because the strict pool gate
+// only ever saw the stamped first endpoint.
+//
+// Accepting ["1000","2000"] as [1000,2000] was rejected as the fix: it would
+// INVENT a two-token `range <low> <high>` grammar that Junos does not have, and
+// — because the brackets are already gone — it would silently redefine the
+// mistyped bare form too. Failing closed keeps the authored spec in
+// PortRangeInvalidSpec, where validateSourceNATPoolStrict hard-rejects it at
+// commit and SourceNATPoolPortRange marks the pool unusable on the tolerant
+// load / peer-sync path.
 func parseSourcePoolPortRange(toks []string) (low, high int, ok bool) {
 	// parsePort validates a single token as a canonical port in 1..65535.
 	parsePort := func(s string) (int, bool) {
@@ -407,8 +428,9 @@ func parseSourcePoolPortRange(toks []string) (low, high int, ok bool) {
 		}
 		return n, true
 	}
-	// Legacy explicit-keyword shape: low <lo> high <hi>.
-	if len(toks) >= 4 && toks[0] == "low" && toks[2] == "high" {
+	// Legacy explicit-keyword shape: low <lo> high <hi>. EXACTLY four tokens —
+	// a fifth token is not part of this grammar (#6688).
+	if len(toks) == 4 && toks[0] == "low" && toks[2] == "high" {
 		lo, ok1 := parsePort(toks[1])
 		hi, ok2 := parsePort(toks[3])
 		if !ok1 || !ok2 || lo > hi {
@@ -416,26 +438,24 @@ func parseSourcePoolPortRange(toks []string) (low, high int, ok bool) {
 		}
 		return lo, hi, true
 	}
-	// Junos shape: <low> [to <high>].
-	if len(toks) == 0 {
-		return 0, 0, false
-	}
-	lo, ok1 := parsePort(toks[0])
-	if !ok1 {
-		return 0, 0, false
-	}
-	hi := lo
-	if len(toks) >= 3 && toks[1] == "to" {
-		v, ok2 := parsePort(toks[2])
-		if !ok2 {
+	// Junos shape: `<low>` (single port) or `<low> to <high>`. Both are FIXED
+	// arities; see the #6688 note above for why a leftover token rejects.
+	switch {
+	case len(toks) == 1:
+		lo, ok1 := parsePort(toks[0])
+		if !ok1 {
 			return 0, 0, false
 		}
-		hi = v
+		return lo, lo, true
+	case len(toks) == 3 && toks[1] == "to":
+		lo, ok1 := parsePort(toks[0])
+		hi, ok2 := parsePort(toks[2])
+		if !ok1 || !ok2 || lo > hi {
+			return 0, 0, false
+		}
+		return lo, hi, true
 	}
-	if lo > hi {
-		return 0, 0, false
-	}
-	return lo, hi, true
+	return 0, 0, false
 }
 
 func compileNATSource(node *Node, sec *SecurityConfig) error {
