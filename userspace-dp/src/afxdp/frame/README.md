@@ -244,9 +244,9 @@ inspect or rewrite a packet sitting in a UMEM frame.
   on the metadata path too. `meta_icmp_identifier_bearing` requires the FULL
   identifier range `[l4..l4+6)` inside `declared_end` — frame-equivalent to
   `parse_flow_ports` (a query packet truncated between the type byte and the
-  identifier fails closed, not just the type byte). **All THREE metadata
+  identifier fails closed, not just the type byte). **All FOUR metadata
   consumers gate identically** so the shim's ungated pseudo-port can never
-  reach a session/flow key: (1) the conntrack-side
+  reach a session/flow key OR the wire: (1) the conntrack-side
   `parse_session_flow_from_bytes`; (2) the immediate
   `build_live_forward_request_from_frame` TX/CoS meta-fallback
   (`afxdp/forward_request.rs`); and (3) the pending-neighbor buffering
@@ -254,7 +254,31 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `MissingNeighbor` handler in `poll_descriptor`) — a non-query ICMP packet
   whose next-hop is unresolved buffers `flow_key = None`, so
   `retry_pending_neigh` flushes it to the interface default queue with no
-  output-filter eval.
+  output-filter eval; and (4) — #5191 — the only consumer that WRITES the
+  pseudo-port back onto the wire, `restore_l4_tuple_from_meta`. The first
+  three decide a KEY; the fourth mutates BYTES, which is why it was the
+  costly omission: it stamped `meta.flow_src_port` into `[l4+4, l4+6)` for
+  every ICMP type. On a GRE-decapped Redirect / Parameter-Problem / RA /
+  MLD message (whose synthesized `flow_src_port` is 0 precisely BECAUSE
+  `parse_flow_ports` declines a non-query type) that zeroed the gateway
+  address / pointer / Maximum Response Delay. Both writers of that field —
+  the NAT identifier translation (#4074) and this restore — now route
+  through ONE helper, `write_icmp_identifier`, which owns the query-type
+  gate AND the incremental (RFC 1624) ICMP-checksum repair.
+- **The ICMP identifier field has exactly ONE writer (#5191)**:
+  `write_icmp_identifier` (`mod.rs`). It repairs the ICMP/ICMPv6 checksum
+  INCREMENTALLY over the single changed 16-bit word rather than deferring
+  to `recompute_l4_checksum_ipv4/6`, for two independent reasons. First,
+  `recompute_l4_checksum_ipv4` has NO ICMP arm (only TCP and UDP, with a
+  `_ => {}` fallthrough) — the v4 `repaired_ports` recompute was therefore a
+  silent no-op and every restored ICMPv4 message left the box carrying its
+  PRE-change checksum, which the receiver discards. Second, the in-place
+  rewrite path hands the helper a slice bounded by the RX descriptor length,
+  which includes Ethernet min-frame zero-pad; a from-scratch recompute would
+  fold that pad into the checksum, whereas the incremental delta is immune to
+  trailing slack. (The v6 side's `PROTO_ICMPV6` arm in
+  `recompute_l4_checksum_ipv6` is unchanged and still runs on the
+  `repaired_ports` path; the incremental write is idempotent with it.)
 - **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
   diagnostic/telemetry helpers `frame_has_tcp_rst`,
   `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all

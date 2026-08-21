@@ -1472,18 +1472,61 @@ pub(in crate::afxdp::frame) fn apply_nat_icmp_identifier_rewrite(
     let Some(new_ident) = nat.rewrite_src_port.or(nat.rewrite_dst_port) else {
         return Some(());
     };
+    write_icmp_identifier(packet, l4_offset, protocol, family, new_ident)?;
+    Some(())
+}
+
+/// #5191: the SINGLE writer of the ICMP / ICMPv6 Query Identifier at
+/// `l4_offset + 4`. Both producers of that write — the NAT identifier
+/// translation (`apply_nat_icmp_identifier_rewrite`, #4074) and the metadata
+/// restore (`restore_l4_tuple_from_meta`) — route through here so the
+/// query-type gate and the checksum repair cannot drift between them. Before
+/// #5191 only the NAT writer carried either: the restore wrote the field for
+/// ANY ICMP type and left the checksum stale, so a repaired ICMPv4 message left
+/// the box with a checksum the receiver discards, and a non-query message
+/// (Redirect gateway / Parameter-Problem pointer / RA fields / MLD maximum
+/// response delay) had two semantic bytes overwritten with a pseudo-port.
+///
+/// Returns `Some(true)` when the field actually changed, `Some(false)` when it
+/// did not (already equal, not an identifier-bearing query type, not ICMP, or a
+/// header too short to hold type + checksum + identifier). Never `None` on a
+/// short header — a truncated message is left byte-identical, matching the
+/// fail-closed disposition the NAT writer already had.
+///
+/// Gate: the `l4+4` bytes are an Identifier ONLY for query types (ICMPv4 echo /
+/// timestamp / information, ICMPv6 echo). For an error or control message they
+/// are a gateway address, a next-hop MTU, a pointer, or a reserved field — the
+/// same gate `parse_flow_ports` applies when it lifts the id into the session
+/// tuple, which is why the metadata pseudo-port for such a packet is 0 in the
+/// first place (`parse_flow_ports` declines, so the GRE-decap meta synthesis in
+/// `gre.rs` falls back to `unwrap_or_default()`).
+///
+/// Checksum: repaired INCREMENTALLY (RFC 1624) over the single changed 16-bit
+/// word, never by a full recompute. The in-place rewrite path hands this
+/// function a slice bounded by the RX descriptor length, which includes any
+/// Ethernet min-frame zero-pad; a full recompute would fold that pad into the
+/// checksum. The incremental delta is immune to trailing slack.
+#[inline(always)]
+pub(in crate::afxdp::frame) fn write_icmp_identifier(
+    packet: &mut [u8],
+    l4_offset: usize,
+    protocol: u8,
+    family: ChecksumFamily,
+    new_ident: u16,
+) -> Option<bool> {
+    if !matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return Some(false);
+    }
     // Need type[0], checksum[2..4], and identifier[4..6].
     if packet.len() < l4_offset + 6 {
-        return Some(());
+        return Some(false);
     }
-    // The l4+4 bytes are an identifier ONLY for query types (echo / timestamp /
-    // information). Anything else keeps its bytes untouched (fail closed).
     if !icmp_identifier_bearing(protocol, packet[l4_offset]) {
-        return Some(());
+        return Some(false);
     }
     let old_ident = u16::from_be_bytes([packet[l4_offset + 4], packet[l4_offset + 5]]);
     if old_ident == new_ident {
-        return Some(());
+        return Some(false);
     }
     packet
         .get_mut(l4_offset + 4..l4_offset + 6)?
@@ -1501,7 +1544,7 @@ pub(in crate::afxdp::frame) fn apply_nat_icmp_identifier_rewrite(
     packet
         .get_mut(csum_off..csum_off + 2)?
         .copy_from_slice(&updated.to_be_bytes());
-    Some(())
+    Some(true)
 }
 
 /// Incremental L4 checksum update for a single 16-bit port change.
@@ -1663,13 +1706,27 @@ pub(super) fn restore_l4_tuple_from_meta(
     match meta.protocol {
         PROTO_TCP | PROTO_UDP => Some(false),
         PROTO_ICMP | PROTO_ICMPV6 => {
-            let ident = packet.get_mut(rel_l4 + 4..rel_l4 + 6)?;
-            let expected = meta.flow_src_port.to_be_bytes();
-            let repaired = *ident != expected;
-            if repaired {
-                ident.copy_from_slice(&expected);
-            }
-            Some(repaired)
+            // #5191: route the write through the shared identifier writer so
+            // the query-type gate AND the incremental checksum repair apply
+            // here exactly as they do on the NAT translation path. Before
+            // #5191 this arm wrote `meta.flow_src_port` into [rel_l4+4,
+            // rel_l4+6) for EVERY ICMP type with no gate and no checksum fix.
+            //
+            // Both halves were reachable together: `gre.rs`'s inner-meta
+            // synthesis derives `flow_src_port` from `parse_session_flow_from_
+            // frame`, which declines (0) for every non-query ICMP type — so a
+            // GRE-decapped Redirect / Parameter-Problem / RA / MLD message had
+            // its gateway-address, pointer, or max-response-delay bytes zeroed.
+            // On IPv4 the stale checksum then had the receiver drop it; on IPv6
+            // the trailing full recompute made the CORRUPTED message verify,
+            // which is the worse of the two outcomes.
+            //
+            // An unknown address family yields no checksum family, so nothing
+            // is written at all (fail closed) rather than written unrepaired.
+            let Some(family) = checksum_family_of(meta.addr_family) else {
+                return Some(false);
+            };
+            write_icmp_identifier(packet, rel_l4, meta.protocol, family, meta.flow_src_port)
         }
         _ => Some(false),
     }

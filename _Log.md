@@ -98180,3 +98180,11 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
   pkg/dataplane/userspace_xdp_manifest.json,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  **Action**: #5191 A1-b2-F7 — route the metadata ICMP-identifier restore through the
+    shared `write_icmp_identifier` writer (query-type gate + incremental checksum repair);
+    add three fail-on-revert tests; document the fourth metadata consumer in the frame README.
+  **File(s)**: userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests_nat_rewrite.rs,
+    userspace-dp/src/afxdp/frame/README.md
