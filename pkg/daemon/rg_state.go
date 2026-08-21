@@ -51,10 +51,13 @@ type rgStateMachine struct {
 	// This prevents the brief dual-active window during failover.
 	strictVIPOwnership bool
 
-	// Log-once state for the reconcile loop (#757). The loop retries
-	// UpdateRGActive every 500ms when applied != desired. Without these
-	// gates, the "retrying" INFO and "failed" WARN fire every tick —
-	// 9+ lines/sec per cluster, which buries real diagnostics.
+	// Log-once state for the reconcile loop (#757). reconcileRGStateLoop
+	// (daemon_ha.go) retries UpdateRGActive on its 2s ticker when applied
+	// != desired, and additionally whenever a dropped event wakes it via
+	// reconcileNowCh — so the real rate is at least one pass per RG every
+	// 2s and bursts higher under event loss. Without these gates the
+	// "retrying" INFO and "failed" WARN fire on every one of those passes
+	// for as long as the helper is down, which buries real diagnostics.
 	//
 	// Reset contract: both fields are cleared by MarkApplied() AND by
 	// ApplyIfCurrent() on success. A successful apply starts a fresh

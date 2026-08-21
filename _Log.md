@@ -80,6 +80,334 @@ Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
 - **Validation**: comment-only — production diff filtered to non-comment lines is
   empty. `go build ./...` rc=0; `go test ./pkg/dataplane/ -count=1` rc=0;
   `gofmt -l` clean.
+## 2026-08-21 — #6871 round 17: merge master's #6743 dataplane cell; runtime re-gate
+
+- **Timestamp**: 2026-08-21 (fix/5103-reth-worker-join)
+- **File(s)**: `_Log.md`, `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/reth_callsite_effect_5103_test.go`,
+  `pkg/daemon/reth_lease_abandon_6871_test.go`,
+  `pkg/daemon/reth_lease_renew_6871_test.go`,
+  `pkg/daemon/reth_prepare_abort_recovery_5103_test.go`,
+  `pkg/daemon/reth_rollback_failure_6871_test.go`,
+  `pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go`,
+  `pkg/dataplane/userspace/runtime_adapter_binding_6871_test.go`,
+  `docs/refactoring-audit-current.txt`
+- **Action**: merged `origin/master` (222 commits) and re-gated the runtime
+  property rather than opening another guard round. Rounds 15 and 16 moved no
+  production code, so the executable work has been settled since `aec8e7881`;
+  this round is the master merge plus an independent runtime pass.
+
+  **The merge.** Master's #6743 replaced `Daemon.dp` with an atomic cell read
+  through `d.dataplane()`, with an AST canary that fails the build on direct
+  `.dpCell` access. Two conflicts in `daemon_apply_dataplane.go`, both resolved
+  to this branch: master's only change to that file over the merge base is the
+  mechanical accessor rename, verified by reading master's own diff hunk by
+  hunk, so the branch's `programRethMemberMAC` / `finishRethMemberLinkTail`
+  decomposition supersedes it. `_Log.md` union-resolved and checked
+  STRUCTURALLY, not by eye: 3143 Timestamps / 1660 `##` / 25 `###`, exactly
+  ours+theirs-base. `docs/refactoring-audit-current.txt` is generated, so it was
+  rebuilt with `scripts/refactoring-audit.sh`.
+
+  **One substantive resolution, not a rename.** The rollback in
+  `programRethMACWithWorkerJoin` re-read `d.dp` and relied on `joinRan`
+  implying non-nil. Against a publication CELL that reasoning no longer holds —
+  the value can be swapped or cleared between the join and the rollback, so a
+  re-read could nil-deref or rebind a dataplane whose workers this hook never
+  stopped. The hook now pins the instance it joined in `joined` and the
+  rollback rebinds through that pin, which makes the rollback provably the
+  inverse of its own join. Measured as UNBOUND: reverting the pin to
+  `d.dataplane().Link()` and deleting the local leaves `go test -count=1
+  ./pkg/daemon/...` GREEN (rc=0). Filed rather than folded, per the campaign
+  bar.
+
+  **The guard did its job on the merge.** The receiver spelling changed from
+  `d.dp.Link()` to `rt.Link()`, and
+  `TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871` failed in BOTH
+  directions — naming the new site as unlisted and the old allowlist entry as
+  stale. That is the round-15 occurrence table working as designed. Both keys
+  were re-spelled, along with the guard's illustrative plant snippets and two
+  RED-on-revert instructions that quoted a field which no longer exists.
+
+  **Independent runtime pass — no defect found.** What was attacked:
+
+  - *A blocked or timing-out join.* `requestLocked` -> `requestDetailedLocked`
+    dials with a 2s timeout and sets `controlRoundtripDeadline` on the
+    round trip, so `stop_workers` cannot block forever. On any error
+    `programRethMAC` returns `(false, err)` BEFORE `setDown`, so the link is
+    never cycled with workers possibly live; the member keeps its old MAC and
+    the commit fails closed. Correct direction.
+  - *A repeated join across members.* This PR calls `PrepareLinkCycle` per
+    cycling member where master called it once. The helper's `stop_workers`
+    handler returns `()` with no error path and `stop_and_clear` iterates a
+    possibly-empty `records`, so the second join is a clean no-op — no new
+    failure mode from the extra call.
+  - *Racing `ReconcileVIPs` / the GARP burst.* `reconcileAfterRethLinkCycle` is
+    gated on `needLinkCycleRecovery` and still runs after the whole member
+    loop, exactly as on master; the reorder moves the join, not the reconcile.
+    The lease gates helper IPC only — it does not touch netlink address adds or
+    the AF_PACKET GARP path.
+  - *A failover arriving mid-cycle.* The asymmetry is the right one and it is
+    load-bearing. `update_ha_state` carries per-RG `Active` and is deliberately
+    NOT lease-gated, so a DEMOTION reaches the helper immediately. A PROMOTION's
+    `set_forwarding_state` is deferred, but the decision is level-triggered on
+    `desiredForwardingArmedLocked()` vs `lastStatus.ForwardingArmed` and
+    `syncDesiredForwardingStateLocked` sits in the status-tick body
+    (`process_status.go:276`) after the gate, so the first tick after
+    `NotifyLinkCycle` re-evaluates and sends it. Deferral, not loss.
+  - *Deadlock against the VRRP state machine.* `PrepareLinkCycle` holds `m.mu`
+    across a socket round trip whose completion depends only on the helper
+    process; nothing under `m.mu` calls back into the daemon or VRRP, so a
+    VRRP-driven `UpdateRGActive` blocking on `m.mu` is a wait, not a cycle.
+    `stopLinkCycleHeartbeat` drops `linkCycleHB.mu` BEFORE joining, and the
+    heartbeat goroutine touches only the atomic lease word.
+  - *Completeness of the gate, enumerated rather than trusted.* Every
+    production site building a worker-affecting request was listed and each leg
+    checked: the three operator verbs carry `errLinkCycleInFlight`;
+    `maybeAutoRebindBusyBindingsLocked` and `retryDeferredWorkerArmLocked` have
+    exactly one caller each and it is the lease-gated tick body;
+    `syncDesiredForwardingStateLocked` gates itself; the compile-path and
+    overlay publishes serialize on `d.applySem`, which
+    `applyDataplaneAndHACore` also holds (`daemon_apply.go:50` ->
+    `applyConfigLocked` -> `:289`), and `actuateRouteOverlay` — the only
+    cross-goroutine publisher — acquires the same semaphore at
+    `daemon_ipmon.go:249` before its publish at `:314`.
+  - *`programRethMAC` itself.* Comment-stripped against master, the ONLY code
+    changes are the signature, the `liveSetErr` capture, the log wording and
+    the hook block. Every pre-existing return path — `setDown` failure, cycled
+    MAC-write failure, `setUp` failure — is byte-identical. The reordering is
+    surgical.
+
+  **#6996 (`renameRethMember`), checked rather than assumed.** Comment-stripped
+  `renameRethMember` is IDENTICAL to `origin/master`, so it is untouched by this
+  PR and non-blocking under the campaign bar. Its open reachability question is
+  narrowed, not answered: AF_XDP binds by `binding.ifindex`
+  (`userspace-dp/src/afxdp/bind.rs:80`), and a netlink rename PRESERVES the
+  ifindex — so a socket bound before a rename keeps polling the same queue, and
+  `renameRethMember`'s DOWN/rename/UP would race it. What is still unmeasured is
+  whether a binding can be live at that moment at all, since the call is reached
+  only when `LinkByName(linuxName)` fails. Recorded on the issue.
+
+- **Validation**: `go build ./...` rc=0; `go vet ./...` rc=0 (read directly, not
+  through a pipe); `go test -count=1 ./...` rc=0, 62 packages, zero FAIL. No
+  Rust in the diff (`userspace-dp/`, `userspace-xdp/`, `bpf/` all empty), so no
+  helper-binary change — but the Go daemon binary does move and this is RETH /
+  VRRP / failover code, so a `make test-failover` smoke is OWED before merge and
+  is the parent's to run.
+
+## 2026-08-13 — #6871 round 7: bind the production adapters; renew the lease where the time actually goes
+
+- **Timestamp**: 2026-08-13 (fix/5103-reth-worker-join)
+- **Action**: Codex returned MERGE-NEEDS-MAJOR at `1b645a614` with three
+  blocking findings that are one defect: this PR's tests reach PAST the
+  thin production adapters and drive the inner `Manager` methods, so the
+  adapters themselves are load-bearing and unguarded.
+
+  Reproduced firsthand before writing anything. Each of these edits left
+  `go test ./pkg/dataplane/userspace/ ./pkg/daemon/` fully GREEN:
+
+  | severance | before |
+  |---|---|
+  | `managerHAOps.UpdateHAWatchdog` -> `return nil` | GREEN |
+  | `userspaceHAController.SetHAWatchdog` -> `return nil` | GREEN |
+  | `userspaceLinkController.RenewLinkCycle` -> `{}` | GREEN |
+  | `userspaceLinkController.SetDeferWorkers` -> `{}` | GREEN |
+  | `managerHAOps.UpdateRGActive` -> `return nil` | GREEN |
+  | `userspaceHAController.SetRGActive` -> `return nil` | GREEN |
+  | `LegacyDataPlaneAdapter.PrepareLinkCycle` -> `return nil` | GREEN |
+  | `managerHAOps.UpdateFabricFwd` / `UpdateFabricFwd1` -> `return nil` | GREEN |
+  | `managerHAOps.SyncFabricState` / `userspaceHAController.SyncFabricState` -> `{}` | GREEN |
+
+  Only `PrepareLinkCycle` and `NotifyLinkCycle` on the link controller
+  were already bound, and only because the #5103/#6871 error-return work
+  happened to drive them through `Link()`.
+
+  So the fix is the CLASS, not the three instances. The sweep the fold
+  asked for found four more unbound seams beyond Codex's two — the
+  fabric pair, the RG-active pair, `SetDeferWorkers`, and (new in this
+  PR, so squarely in scope) the `LegacyDataPlaneAdapter.PrepareLinkCycle`
+  error return whose whole reason for existing is a divergence from
+  `Link()` that nothing checked.
+  `runtime_adapter_binding_6871_test.go` now drives EVERY method of both
+  production adapters through `m.Link()` / `m.HA()` — the constructors
+  the daemon uses, so severing a constructor is caught too — against an
+  observable only the real inner `Manager` produces: a control-socket
+  request, a manager field, the lease deadline, or the specific error a
+  missing BPF map raises. Deliberately map-free, so no cell SKIPs
+  unprivileged.
+
+  B3 (renewal density) was also real, and the round-6 comment claiming
+  the per-member renewal made the TTL bound "one member interval" was
+  false: `programRethMemberMAC` renews at the end of the MAC SET, which
+  is BEFORE that member's 20s-ceiling `ethtool` and its child-netdev
+  loop, and the FINAL member's tail ran through the VIP/link-local
+  reconcile into `NotifyLinkCycle` with no renewal at all. Two more
+  renewal points close those spans, each in an extracted function that
+  exists to be bindable (inline they were reachable only through
+  `applyDataplaneAndHACore`, i.e. only by a structural canary, which an
+  unreachable or shadowed statement satisfies): `finishRethMemberLinkTail`
+  and `reconcileAfterRethLinkCycle`, both routed through a new
+  `Daemon.renewLinkCycleLease` so the nil guard has one home.
+
+  What that buys is stated as what it is rather than restated as 60s.
+  Exactly one interval now holds the only term with a hard ceiling — the
+  20s ethtool — so 60s is 3x it, for any member count. It is NOT an
+  invariant: every interval also holds netlink, netlink has no
+  elapsed-time bound, and the child-netdev loop and per-RG reconcile
+  scale with operator-controlled cardinality. The code comment and
+  `docs/reth-mac.md` both now say "estimate with a 3x margin, not a
+  proof", and say why that is acceptable — an overrun degrades to
+  master's behaviour (loud Warn, reconcile resumes) rather than creating
+  a state master did not have.
+
+  Four claim corrections, all Codex's and all verified against the code:
+  the emitter gate covers callers that publish THROUGH
+  `syncDesiredForwardingStateLocked`, not the request type — `manager_ha.go`
+  and `manager_compile.go` build raw `set_forwarding_state` and are safe
+  only via `applySem`; "no worker spawn" is too absolute, since
+  `handlers/ha.rs` calls `refresh_status` (WG/GRE repair — but not
+  `reconcile_status_bindings`, and the records are cleared after a
+  successful `stop_workers`); "never renews an expired lease" is stronger
+  than the code, which can CAS a stale-but-nonzero deadline forward if
+  descheduled past it; and the composed watchdog assertion genuinely does
+  not exist.
+- **File(s)**: `pkg/dataplane/userspace/runtime_adapter_binding_6871_test.go`
+  (new), `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/dataplane/userspace/process_linkcycle.go`,
+  `pkg/dataplane/userspace/link_cycle_ha_watchdog_6871_test.go`,
+  `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/reth_lease_renew_6871_test.go`, `docs/reth-mac.md`, `_Log.md`
+- **Validation**: the same 13-severance matrix re-run AFTER the fix — all
+  13 now RED, each at its own named cell, with the anchor verified to
+  match exactly once per file and the tree restored byte-for-byte between
+  runs. `go build ./...`, `go vet ./...`, and the FULL `go test ./...`
+  green (including `TestHeatmapNotStale`, run explicitly — the extraction
+  moves ~55 lines within `daemon_apply_dataplane.go`).
+  `pkg/dataplane/userspace` + `pkg/daemon` run 3x with no flake. `gofmt`
+  clean on every file touched.
+  ONE GAP LEFT OPEN, deliberately and named in the source: severing
+  `syncHAStateLocked`'s closing `return m.syncDesiredForwardingStateLocked()`
+  to `return nil` is still invisible to both packages — measured, not
+  assumed. Closing it needs `applyHelperStatusLocked` to succeed, which
+  needs real BPF maps, which makes the cell SKIP unprivileged; the
+  alternative is a production seam on the HA status path serving only a
+  test, which would then itself be the unbound thing. Its production
+  effect is bounded and self-healing (the decision is level-triggered;
+  the 1 Hz tick re-evaluates within a second).
+  NOT run: `make test-failover` or any cluster tooling. This changes
+  production behaviour on the RETH/VRRP MAC path, so a fresh smoke is
+  owed at this head and is scheduled centrally.
+
+## 2026-08-05 — #5103: join the AF_XDP workers BEFORE the RETH MAC link cycle, not after
+
+- **Timestamp**: 2026-08-05 (fix/5103-reth-worker-join)
+- **Action**: Re-verified GENUINE on origin/master first (the file had moved
+  from `daemon_apply.go` to `daemon_apply_dataplane.go`, so the issue's
+  line references were stale but the defect was not): `programRethMAC`
+  runs the DOWN → set-MAC → UP cycle, and only afterwards, on
+  `linkCycled=true`, did the daemon call `PrepareLinkCycle()`. The code's
+  own comment conceded the workers "may have been accessing UMEM during
+  the DOWN/UP".
+  The join cannot simply be hoisted above `programRethMAC`: whether a
+  cycle is needed at all is only knowable by ATTEMPTING the live MAC set,
+  and joining unconditionally would impose a forwarding outage on every
+  RETH MAC apply on the drivers (mlx5, virtio — the cluster's own NICs)
+  that support IFF_LIVE_ADDR_CHANGE and need no cycle. So `programRethMAC`
+  takes a `beforeCycle func() error` hook, invoked on the fallback path
+  only: after the live set has been rejected, and before `setDown`, the
+  first mutation. A rejected live set does not change link state, so on a
+  hook error the function returns with nothing to unwind and the member
+  keeps its previous MAC — recoverable and retried next apply, unlike
+  cycling out from under live workers.
+  `PrepareLinkCycle()` gained an `error` return across the
+  `LinkController` interface and all five implementations. Its
+  `stop_workers` failure path was previously a `slog.Warn` + bare return,
+  which the void signature made invisible to the one caller that had to
+  decide whether the NIC could safely go down.
+  Two things the tests caught in my own work rather than in the original
+  defect. First, propagating the ctrl-disable error short-circuited the
+  worker join — skipping the very join the function exists for whenever
+  the ctrl map was unreadable; the join now always runs. Second, folding
+  that error into the RETURN was an over-rejection: "userspace_ctrl map
+  not loaded" is a legitimate state (no shim attached) in which there is
+  no redirect path for the gate to protect, so failing there would block
+  RETH MAC programming on a healthy deployment. The error contract is now
+  scoped explicitly to the worker join, with the reasoning recorded at the
+  return.
+- **Validation**: five-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile. All five
+  RED: move the join after the cycle (the original inversion); swallow the
+  hook's error so the link cycles anyway; fire the hook on every call
+  (the over-rejection); make `PrepareLinkCycle` swallow the stop_workers
+  failure again; and have the daemon pass `nil` for the hook. That last
+  one is why the structural canary exists — passing `nil` compiles, keeps
+  every producer-side ordering test green, and restores the defect whole.
+  An earlier matrix run had M4 and M6 GREEN, which is what prompted the
+  fail-closed and call-site tests; both are stated-scope rather than
+  claimed complete. Full `go test ./pkg/... ./cmd/...` passes.
+  NOT run: `make test-failover` and any cluster tooling. This touches the
+  RETH/VRRP MAC path, so cluster validation is owed before merge and is
+  scheduled centrally.
+- **File(s)**: `pkg/daemon/daemon_reth.go`,
+  `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/reth_worker_join_order_5103_test.go` (new),
+  `pkg/daemon/reth_hook_wired_5103_test.go` (new),
+  `pkg/daemon/daemon_reth_rename_up_test.go`,
+  `pkg/daemon/policy_scheduler_apply_test.go`,
+  `pkg/dataplane/apply.go`,
+  `pkg/dataplane/userspace/process_linkcycle.go`,
+  `pkg/dataplane/userspace/controllers.go`,
+  `pkg/dataplane/userspace/legacy_dataplane.go`,
+  `pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go` (new), `_Log.md`
+## 2026-08-21 — #6290 drive round (PR #6869): merge-gate pass, runtime-only bar
+
+- **Timestamp**: 2026-08-21
+- **Action**: Drive-to-merge round on PR #6869 (`fix/6290-cluster-transport-lock`).
+  Merged `origin/master` twice (the branch was 439 commits behind at the start,
+  and master gained 15 more — PR #6839 — mid-round); both merges were textually
+  clean, `_Log.md` union-resolved and structurally verified (section and
+  `**Timestamp**` counts equal ours + theirs - base at both merges).
+  Regenerated the GENERATED `docs/refactoring-audit-current.txt`: the #6290
+  guard adds 58 lines to `pkg/daemon/daemon_ha_sync.go`, which sat at 1499
+  lines at the pre-merge base but reached 1515 after the merge and so entered
+  the `[WATCH]` tier, failing `TestHeatmapNotStale`. **This supersedes the
+  "daemon_ha_sync.go at 1499 lines, one under the 1500 threshold" line in the
+  2026-08-05 #6290 entry below — that is no longer true at the merged head.**
+- **Runtime findings**: none. The hostile pass attacked lock ordering
+  (`clusterCommsMu` is still a leaf: no accessor calls out while holding it,
+  and the `applySem -> clusterCommsMu` edge step 20 now takes already existed
+  via `ensureDHCPLeaseSyncLoop` -> `getClusterCommsCtx`), non-reentrancy (both
+  `startClusterComms` call sites — `daemon_run.go` boot and
+  `daemon_apply_tail.go` step 20 — hold neither lock, and
+  `beginClusterCommsEpoch` releases the mutex before returning), and whether
+  the new epoch gate can fail open. It cannot: the boot publish can only be
+  dropped if step 20 first bumped the generation, and step 20's restart branch
+  requires an already-non-zero `activeClusterTransport`, so the field can never
+  be left permanently zero by the gate. The constructor goroutine covered by
+  `clusterCommsWG` never touches `applySem`, `applyConfig` or either transport
+  accessor, so `stopClusterComms`'s join under `applySem` gains no new edge.
+- **Non-runtime findings**: filed as #7066 (step-20 reader edit unbound —
+  reverting `daemon_apply_tail.go` to master's shape stays green, and the
+  README claims otherwise), #7067 (the race test stays green when the write is
+  deleted outright), #7068 (`setActiveTransport` doc references a symbol that
+  does not exist), #7069 (`daemon.go`'s `clusterCommsMu` guard enumeration
+  omits the field), #7070 ("eight log fields" is four), #7071 (the publish
+  bool is discarded while both siblings gate on theirs), #7072
+  (`stopClusterComms` leaves the field naming a dead transport, pre-existing),
+  #7073 (a fabric1-only change logs four identical pairs, pre-existing), and
+  #7075 (`pkg/daemon` `-race` is flaky because the test-local
+  `capturingHandler` is installed as the GLOBAL slog default and races a
+  `configstore.persistRetryLoop` goroutine leaked by an earlier test —
+  reproduced on unmodified `origin/master` at 09767cb76, 1 RED in 3 runs,
+  while this head was 3/3 green in the same probe).
+- **Validation**: `go build ./...` 0, `go vet ./...` 0 (empty output),
+  `go test -count=1 ./pkg/... ./cmd/...` 0, `go test -race -count=2
+  ./pkg/daemon/ ./pkg/cluster/` 0 with zero `DATA RACE` reports,
+  `go test -count=1 ./pkg/refactoraudit/...` 0 (was 1 before the regen).
+  No cluster smoke run — the shared loss cluster is parent-owned. The diff
+  against `origin/master` is Go and Markdown only; it does not reach
+  `userspace-dp/`, `userspace-xdp/` or any compiled artifact.
+- **File(s)**: docs/refactoring-audit-current.txt, _Log.md
+
 ## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
 
 - **Timestamp**: 2026-08-20 (fix/6848-cos-show-rewrite-rule, PR #6858)
@@ -72670,7 +72998,8 @@ Zl/Zp, so `unicode.IsControl` misses them and the single-line variant's
 documented bidi/Cf out-scope let them through. A terminal that honors U+2028 as
 a break lets a peer hostname add a row to the very table the function is
 keeping printable. Same argument that escapes CR. Rendered as
-` ` (a `\xHH` escape cannot represent a rune above U+00FF);
+`
+` (a `\xHH` escape cannot represent a rune above U+00FF);
 `blockDisplaySafe` rejects them so the fast path cannot bypass.
 
 ## 2026-07-31 — fold the Codex round on #6579 (parsed FRR cells + %q correction)
@@ -79819,6 +80148,35 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
 
+## 2026-08-05 — #6290 activeClusterTransport epoch guard
+
+- **Timestamp**: 2026-08-05
+- **Action**: Fold `activeClusterTransport` under the #4958 `clusterCommsMu`
+  epoch guard. The issue filed this as "NOT a race today", reasoning that the
+  boot `startClusterComms` completes before the gRPC/HTTP servers accept
+  commits. That accounts for the wrong readers: `applyConfig`'s own doc lists
+  DHCP callbacks, config-poll, feeds, the event engine and cluster sync recv as
+  callers, and the boot `applyConfig` starts the DHCP clients
+  (`reconcileDHCPClients`) with `onDHCPAddressChange` already wired — on
+  goroutines created BEFORE the write. Goroutine creation therefore orders them
+  the wrong way and supplies no happens-before, and `applySem` does not bridge
+  it because the boot writer never takes it. So the race was real on master,
+  the mirror of #5113 on `mgmtVRFInterfaces`. The write now goes through
+  `setActiveTransportIfCurrent(gen, key)` (epoch-gated like
+  `publishSessionSyncIfCurrent`, so a superseded concurrent start cannot land
+  last) and step 20 takes ONE `activeTransport()` snapshot for both its
+  comparison and its eight log fields.
+- **Validation**: `go test -race -count=1` on both new tests PASS. Mutation A
+  (drop both mutex guards = master's shape) -> `WARNING: DATA RACE`, write
+  attributed to `startClusterComms` daemon_ha_sync.go:706. Mutation B (drop the
+  `gen !=` check, keep the mutex) -> `TestSetActiveTransportDropsStaleEpoch`
+  FAILS without `-race` while the race test still passes, so each guard is
+  bound by its own test. `go vet` clean, `gofmt` clean,
+  `go test ./pkg/refactoraudit/` PASS (daemon_ha_sync.go at 1499 lines, one
+  under the 1500 threshold).
+- **File(s)**: pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/cluster_transport_race_6290_test.go, pkg/daemon/README.md, _Log.md
+
 ## 2026-08-01 — #4555 round 7: the replacement corpus floors were themselves proxies
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
@@ -80966,6 +81324,152 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/README.md,
   _Log.md
+## 2026-08-06 — #6871 gate fold: bind the production adapter, restore the aborted-cycle recovery
+
+- **Timestamp**: 2026-08-06
+- **Action**: F1 — the fail-closed tests drove `Manager.PrepareLinkCycle`
+  directly, leaving `userspaceLinkController.PrepareLinkCycle` (the ONLY
+  production path from the daemon's `beforeCycle` hook to the manager) unbound:
+  `_ = c.manager.PrepareLinkCycle()` there still detected and logged the failed
+  join, handed the caller nil, and restored #5103 whole with the whole suite
+  green. All three now call through `m.Link()`, plus a new nil-manager guard.
+  F2 — `process_linkcycle.go` claimed the ctrl-disable error "is RETURNED rather
+  than discarded" directly above the block that discards it; reworded to
+  CAPTURED, pointing at the scope note at the return. F3 — `docs/reth-mac.md`
+  gained a "#5103" section covering the join -> cycle -> rebind contract, the
+  abort-without-touching-the-link semantics and the rollback; the #5134 table
+  still pointed `reapplyAfterDeferredMAC` at `daemon_apply.go` (moved in #4407).
+  F4 (REGRESSION) — a `beforeCycle` failure aborts with ctrl already disabled
+  and workers possibly joined, and nothing re-armed them: the post-cycle rebind
+  is gated on `linkCycled` (false) and `reapplyAfterDeferredMAC` on
+  `rethMACPending`, computed BEFORE `networkd.Apply` and false for a member
+  renamed into existence by the same apply. Before this PR the triple self-healed
+  because the cycle ran regardless. New `programRethMACWithWorkerJoin` owns the
+  hook, sends the documented inverse of `stop_workers` (`rebind`, via
+  `NotifyLinkCycle`) on the abort, and returns an `errRethPrepareLinkCycle`
+  commit error the loop joins into `networkdErr`; ordinary MAC-set failures stay
+  warn-only. NIT — named which of the two `PrepareLinkCycle` implementations is
+  the live path.
+- **Validation**: `go build ./...` exit 0; `go test ./pkg/daemon ./pkg/cluster
+  ./pkg/vrrp ./pkg/dataplane/... -count=1 -race` exit 0. Mutations: M1 (drop the
+  `NotifyLinkCycle` rollback) REDs `...AbortRebindsAfterFailedJoin_5103` at
+  "NotifyLinkCycle calls = 0, want 1"; M2 (return nil instead of the classified
+  error) REDs the same test at "a failed worker join must reach the commit";
+  M3 (escalate every MAC error) REDs `...OrdinaryFailureStaysWarnOnly_5103`;
+  M4 (call `programRethMAC(.., nil)` from the loop) REDs the AST canary on both
+  the nil-hook and call-count assertions. F1 mutation (`_ =` in the adapter)
+  REDs `...ErrorsWhenStopWorkersFails_5103` at `:41`. Every over-reach guard
+  stayed GREEN under M1/M2.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/reth_hook_wired_5103_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go,
+  pkg/dataplane/userspace/legacy_dataplane.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5103 review round 3 (F-A MAJOR / F-B / F-C) — the rollback keyed
+  on the wrong condition, so a half-applied prepare escaped it. `joinFailed` was
+  set only inside the hook's error path, but after a SUCCESSFUL
+  `PrepareLinkCycle` two more fallible steps follow inside `programRethMAC`
+  (`setDown`, and the cycled `setHardwareAddr`), and both return
+  `linkCycled=false`. In both, `joinFailed` stayed false, so
+  `programRethMACWithWorkerJoin` returned `(false, nil)`: `ctrl` disabled,
+  `stop_workers` sent, workers joined, cycle NOT completed, `NotifyLinkCycle`
+  never fired, step 2.6b2's rebind skipped (gated on `linkCycled`),
+  `reapplyAfterDeferredMAC` skipped (gated on `rethMACPending`) — and the commit
+  reported SUCCESS over a node dropping transit. On master this triple was
+  harmless because `PrepareLinkCycle` was never called on that path at all; the
+  ordering fix made it a forwarding outage under a green commit. F-A fix: gate on
+  whether the hook RAN, not whether it failed — `joinRan` is set after the
+  `d.dp == nil` guard (so the `d.dp.Link()` deref stays unreachable with no
+  dataplane) and any subsequent failure rolls back. A cycle that COMPLETED and
+  failed only on `link-up` (`linkCycled=true`) now fails the commit too but does
+  NOT roll back here: step 2.6b2 already rebinds off `linkCycled`, and a second
+  rebind is the one that gets EBUSY on mlx5 zero-copy queues. Reworded
+  `errRethPrepareLinkCycle` from "af_xdp worker join before link cycle" to "link
+  cycle failed after the af_xdp worker join" — the class is a prepare not
+  followed by a clean cycle, not a failed join (no `errors.Is` call site reads
+  the text). F-B — noted at the call site that the rollback's `NotifyLinkCycle`
+  is inside the per-member RETH loop and opens with a 1s NIC-settle sleep, worst
+  case N extra seconds of `applySem` hold (N = RETH count, 2 on the loss
+  cluster). F-C — corrected the `rethMACPending` phrasing in both the code
+  comment and `docs/reth-mac.md`: it is one bool for the whole apply set by a
+  `break`, not per member, so a multi-RETH apply where a DIFFERENT member was
+  present with the wrong MAC does set it. NOT closed: step 2.6b's VIP reconcile
+  is also gated on `linkCycled`, so a cycled-MAC-write failure still skips it —
+  identical on master, documented in `docs/reth-mac.md`, filed separately.
+- **Validation**: `go build ./...` exit 0; `go vet ./...` exit 0; `go test
+  ./pkg/daemon ./pkg/cluster ./pkg/vrrp ./pkg/dataplane/... -count=1 -race` exit
+  0; `go test ./pkg/refactoraudit/...` exit 0; `go test ./pkg/daemon -run 5103
+  -v` 12/12 (the prior 10 plus the two new). RED-on-revert: restoring the
+  `joinFailed` gate REDs `...AbortRebindsWhenCycleFailsAfterJoin_5103` in BOTH
+  subtests at "NotifyLinkCycle calls = 0, want 1: the worker join SUCCEEDED and
+  the cycle then aborted..." and "the commit must FAIL: the dataplane was
+  deliberately torn down...", and REDs
+  `...LinkUpFailureFailsCommitWithoutDoubleRebind_5103` at "the commit must FAIL:
+  the member is left administratively DOWN...". All assertion failures, not
+  build breaks — the package compiled and the other ten 5103 tests passed in the
+  same run. Over-reach guards GREEN under the revert:
+  `...NoRollbackWhenJoinSucceeds_5103`, `...NoJoinOrRollbackOnLiveSet_5103`,
+  `...OrdinaryFailureStaysWarnOnly_5103`, and the `notifyCalls == 0` half of the
+  new link-up test. Restored file verified byte-identical to the pre-mutation
+  copy.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go, docs/reth-mac.md, _Log.md
+
+## 2026-08-06 — #6871 fold r4 (gate MINOR-1 / MINOR-2)
+
+- **Timestamp**: 2026-08-06 04:20 PDT
+- **Action**: Bind the errors.Join line that carries the wrapper's commit error
+  into the tail — the entire payload of the fail-the-commit widening, and
+  previously unbound. Correct the double-rebind comment: the suppression is
+  per-MEMBER while step 2.6b2's gate is a per-APPLY accumulator.
+- **File(s)**: pkg/daemon/reth_hook_wired_5103_test.go,
+  pkg/daemon/daemon_apply_dataplane.go
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/cluster
+  ./pkg/vrrp ./pkg/dataplane/... -count=1 -race rc=0; gofmt clean.
+- **NOTE — the first attempt at this guard did not bind.** A presence-only AST
+  walk for the AssignStmt passed under `if false && prepareErr != nil`, because
+  the node is still present, merely unreachable. That is the shape-not-effect
+  failure this canary exists to catch, and it was found only by RUNNING the
+  reported mutation rather than assuming. The guard now asserts the guarding
+  CONDITION is exactly the binary expression `prepareErr != nil`, so a
+  `false &&` wrapper (Op == token.LAND) fails it. Both mutations now red:
+  neutralising the condition, and deleting the join outright.
+
+## 2026-08-06 — #6871 fold r5 (gate F1 BLOCKING / F2)
+
+- **Timestamp**: 2026-08-06 03:55 PDT
+- **Action**: Replace the r4 AST canary over the commit-error fold with real
+  BEHAVIOURAL coverage. Extract step 2.6's per-member fold into
+  `programRethMemberMAC`, which joins the wrapper's classified error into the
+  accumulated commit error and ORs `linkCycled` into step 2.6b2's rebind gate.
+  New `reth_commit_fold_5103_test.go` drives it against the existing fake link
+  seam + fake dataplane. Shrink the canary to three call-shape claims and add a
+  constant-false reachability check plus a `token.ASSIGN` check. Reword the
+  double-rebind comment: which rebind arms the 500ms quiesce depends on the map
+  visit order, so both orders are now stated.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_commit_fold_5103_test.go,
+  pkg/daemon/reth_hook_wired_5103_test.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go, docs/reth-mac.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./... rc=0; go test ./pkg/daemon
+  ./pkg/cluster ./pkg/vrrp ./pkg/dataplane/... -count=1 -race rc=0; go test
+  ./pkg/refactoraudit/... rc=0; `-run 5103` = 20 `=== RUN` lines (was 14);
+  gofmt clean on every touched file.
+- **NOTE — the r4 canary had three escapes, all vet-clean.** Wrapping the
+  accepted `if` in `if false { ... }`, preceding the assignment with a
+  duplicate-condition early return, and shadowing the target with `:=` each
+  left the matched AST nodes in place while the fold did nothing. Tightening
+  the matcher would have bought one clause per escape shape. Ten mutations were
+  run against the replacement; all ten are ASSERTION failures with `go vet
+  ./pkg/daemon` rc=0: fold deleted, the three r4 escapes, gate assigned instead
+  of ORed, error assigned instead of joined, and four call-site escapes
+  (constant-false `if`, `:=` shadow, result discarded, commit error dropped).
+  The three over-reach guards — completed program, ordinary warn-only failure,
+  and the `prepareCalls`/`notifyCalls` counts — stayed GREEN under the fold
+  revert. Restore verified with `cmp` against a pristine copy after each cell.
 ## 2026-08-06 — #6827 gate fold r2: bind the generation fence and listener recovery
 
 - **Timestamp**: 2026-08-06
@@ -82761,6 +83265,48 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   GATES: `gofmt -l` clean; `go vet ./pkg/dataplane/...` rc=0;
   `go test ./pkg/dataplane/... ./pkg/config/... -count=1` rc=0.
 - **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md
+## 2026-08-12 — #6871 F3/F4/F5: three claim/test corrections (F2 harness separate)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Landed the three findings that are independent of the F2 harness,
+  so the round banks value whether or not the harness lands.
+
+  **F3 — a comment claim that was not universally true.** The teardown
+  reasoning said "every stop_workers empties records". The prepare can fail on
+  the DIAL or the WRITE, before the helper ever runs the handler — which is
+  precisely the failure class the surrounding block exists for — and records
+  then stay live. Corrected to "a stop_workers that REACHES ITS HANDLER", with
+  the consequence stated: `had_live_workers` samples true rather than false, so
+  the 500ms quiesce is PAID rather than skipped. Behaviour is unaffected (the
+  rebind is correct either way); the sentence was wrong, and the two visit
+  orders it goes on to describe are the handler-ran case.
+
+  **F4 — a deliberate gap documented only outside the shipping artifact.**
+  Step 2.6b's VIP reconcile is gated on `linkCycled`, so a MAC write that fails
+  AFTER the cycle skips it and the member returns without its VRRP VIPs until
+  the next apply that cycles it. That is deliberate and predates #5103, but it
+  lived only in `docs/reth-mac.md:159` — the wrong place for a caveat a
+  maintainer needs while reading the `if linkCycled` branch. Stated inline now;
+  the full table stays in the doc.
+
+  **F5 — a fatal that suppressed the guard.** Both abort-recovery fixtures
+  checked the link sequence with `t.Fatalf`, so a fixture-sequence mismatch left
+  the `linkCycled` / `commitErr` assertions — the ones actually carrying the
+  guard — UNEXECUTED. A run reporting only "link sequence" said nothing about
+  linkCycled either way. Both are `t.Errorf` now, so the fixture problem reports
+  itself without suppressing the guard.
+
+  **F2 is NOT in this commit.** It needs a harness that reaches
+  `applyDataplaneAndHACore`'s RETH loop (the function spans 45-447 and no test
+  in pkg/daemon calls it — all six mentions are comments). Deliberately NOT
+  closed by extracting the loop: extraction is what produced this finding in the
+  first place, and doing it again would relocate the unbound edge a second time
+  while wearing the evidence of a fix.
+
+  **Validation.** `go vet ./pkg/daemon/` 0; `go test -count=1 ./pkg/daemon/` 0
+  (`ok 16.945s`); `gofmt -l` clean on both touched files.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go, _Log.md
 - **Timestamp**: 2026-08-12
 - **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
   only in tests that injected their own budget), plus an S3 doc sentence.
@@ -83196,7 +83742,6 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   secure_tunnel_ownership_6691_test.go (new),
   userspace-dp/src/protocol/snapshot.rs, server/helpers/planning.rs,
   src/main_tests.rs, src/server/README.md, _Log.md
-
 ## 2026-08-07 — #5561 round 18: the view tier could 429 the clear tier
 
 - **Timestamp**: 2026-08-07
@@ -87359,6 +87904,516 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/zone_propagation_6722_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 - **Timestamp**: 2026-08-12
+- **Action**: #5103 F2 — bind the CALLER -> `programRethMemberMAC` boundary
+  behaviourally. Tests only; no production change.
+  The helper is bound (`reth_commit_fold_5103_test.go`) and the call site is
+  bound STRUCTURALLY (`reth_hook_wired_5103_test.go`: one call, `=` not `:=`,
+  two assignment targets, not under a constant-false branch). Nothing bound the
+  step between them — that the value the helper returns is still the value
+  `applyDataplaneAndHACore` reports. An AST canary cannot express reachability;
+  it can only say the call is WRITTEN, not that its result is CONSUMED. This
+  insertion satisfies every structural assertion and keeps the effect from
+  reaching production:
+
+      prevNetworkdErr6871 := networkdErr
+      networkdErr, needLinkCycleRecovery = d.programRethMemberMAC(
+          linuxName, mac, networkdErr, needLinkCycleRecovery)
+      networkdErr = prevNetworkdErr6871 // effect discarded
+
+  Measured under it: `go vet ./pkg/daemon/` rc=0, and the ENTIRE pre-existing
+  `pkg/daemon` suite rc=0 with ZERO failures — the AST canary included. The
+  escape was complete.
+  `reth_callsite_effect_5103_test.go` closes it by driving the REAL
+  `applyConfigLocked` body (no `applyBodyForTest` seam — the same approach
+  `apply_ctx_cancel_test.go` uses) with a one-member RETH config, the
+  `withRethOps` fake link forcing a cycle, and an `abortRecoveryTestDP` whose
+  `PrepareLinkCycle` fails. The observable is the apply's own returned error:
+  the abort is classified `errRethPrepareLinkCycle`, folded into the commit
+  accumulator, and handed to `applyTailReconciles`. Under the discard mutation
+  the full `pkg/daemon` suite now has exactly ONE failure, this guard, at
+  "the apply reported SUCCESS over a RETH member whose link cycle was ABORTED".
+  A `prepareCalls == 1` precondition runs first so a fixture that never reached
+  the hook fails loudly instead of passing vacuously.
+  The over-reach control is a SEPARATE top-level test (a control sharing a body
+  with its binder never runs once the binder fails): same fixture, join
+  SUCCEEDS, apply must return nil. It stays GREEN under the discard mutation
+  and would go RED if the guard were widened to "the apply errors whenever a
+  RETH member is processed".
+  Note on shape: an earlier round answered "the canary is defeatable" by
+  extracting the logic into a testable helper, which MOVED the unbound boundary
+  up to the caller rather than closing it — and arrived wearing the evidence of
+  a fix. This round binds the boundary itself rather than extracting again.
+  Adjacent sweep (no change made): every other bare-statement call in that loop
+  (`ensureRethLinkOriginalName`, `setRethIPv6Knobs`, `clearDadFailed`,
+  `removeAutoLinkLocal`, `ensureRethLinkLocal`, `setVLANSubAddrGenMode`,
+  `fixRethLinkFile`) returns NOTHING, so there is no result to discard, and
+  `renameRethMember`'s string IS consumed. The only other discarded result in
+  `applyDataplaneAndHACore` is `links, _ := netlink.LinkList()` at
+  `daemon_apply_dataplane.go:319` — pre-existing, untouched by this PR, and
+  reported separately.
+  Validation: `go build ./...` rc=0; `go vet ./pkg/daemon/` rc=0;
+  `go test ./pkg/daemon/...` rc=0 (both packages ok); `gofmt -l` clean.
+  Advances #5103.
+- **File(s)**: pkg/daemon/reth_callsite_effect_5103_test.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #5103 / #6871 — hold the AF_XDP worker join across the RETH MAC
+  link cycle with a lease, and give the rollback a real failure signal.
+  Codex's leg at 16b65ec81 returned DO-NOT-MERGE with two RUNTIME blockers.
+  Both reproduced firsthand before writing anything.
+  B1 — the join was a MOMENT, not a barrier. `PrepareLinkCycle` joins the
+  workers and returns, releasing `m.mu`, and the daemon does not reach
+  `setDown` until several netlink calls later. Every other holder of `m.mu`
+  runs in that window. The 1 Hz status tick alone undoes the join five ways:
+  `syncSnapshotLocked`'s plan-key branch `stopLocked()`s and RESPAWNS the
+  helper process; `retryDeferredWorkerArmLocked` republishes with
+  `DeferWorkers=false`; `maybeAutoRebindBusyBindingsLocked` sends `rebind`
+  directly; `verifyBindingsMapLocked` repopulates rows a fail-closed ctrl
+  disable just cleared; `applyHelperStatusLocked` re-enables ctrl on sockets
+  whose queues are being destroyed. `stop_workers` preserves registered
+  bindings and `forwarding_armed`, so the Rust same-plan predicate sees
+  runnable-but-not-live bindings and restarts workers.
+  Scope: OPTION B, a tick-wide lease. A publish-scoped lease (Option A) closes
+  the reported symptom and provably leaves the same bug in three other places.
+  `m.linkCycleLeaseUntil` is an `atomic.Int64` DEADLINE — atomic for exactly
+  the reason `rgTransitionInFlight` is (the guard must survive `m.mu` being
+  released), a deadline rather than a bool because a stranded lease would
+  suppress the reconcile loop permanently, which is worse than the race.
+  `m.deferWorkers` was deliberately NOT reused as the substrate: it is set and
+  cleared entirely from outside the package, `PrepareLinkCycle`/
+  `NotifyLinkCycle` never touch it, and two of the five producers do not read
+  it.
+  Acquire: in `PrepareLinkCycle`, BEFORE the ctrl disable — the window opens at
+  the first mutation of dataplane state, and a `stop_workers` can fail after
+  the disable has already cleared binding rows. Release: at the TOP of
+  `NotifyLinkCycle`'s critical section, which is both the earliest correct
+  point (from there `m.mu` is held for the rest of the function, so no producer
+  can interleave) and the latest (it precedes EVERY return, including the
+  rebind failure — a release placed after those would strand the lease on
+  exactly the paths where forwarding is already down). Releasing there also
+  keeps the ctrl gate out of the way of `NotifyLinkCycle`'s own post-rebind
+  status apply, so a completed cycle re-enables ctrl on that call rather than
+  costing an extra tick of fail-closed transit.
+  Two consult sites. (1) The top of the status tick's critical section, which
+  skips the WHOLE body. Nothing is lost: every action in that body is
+  level-triggered on persistent manager state, so the next tick after release
+  services whatever is still outstanding. (2) The ctrl write in
+  `applyHelperStatusLocked`, alongside the existing `rgTransitionInFlight`
+  check — CONDITION 1 from the brief, traced to a verdict: `UpdateRGActive` IS
+  a producer of the ctrl-re-enable class. Path: `reconcileRGStateLoop` (2s
+  ticker, plus early wakes on dropped-event notifications; an earlier revision
+  of this entry said 500ms, which was inherited from a stale comment in
+  `pkg/daemon/rg_state.go` and is corrected there too)
+  and the VRRP/cluster event handlers -> `d.dp.HA().SetRGActive` ->
+  `Manager.UpdateRGActive` -> `applyHelperStatusLocked`. None of those holds
+  `d.applySem`, so it lands mid-cycle on its own schedule, and its own
+  `rgTransitionInFlight` guard does not cover it (a demotion never sets the
+  flag; an activation clears it before the status apply). A tick-only lease
+  would have shipped with that hole.
+  CONDITION 2, lease release: `RegenerateNeighborSnapshot` (60s + netlink
+  debounce) and `SyncFabricState` -> `persistResolvedFabricsLocked` (30s) both
+  publish FIRST and then advance `m.generation`, `lastSnapshot.Generation` and
+  `m.publishedSnapshot` in LOCKSTEP to the same value. So they never leave the
+  tick's predicate (`publishedSnapshot < lastSnapshot.Generation`) true and
+  unserviceable, and the post-release reconcile sees a coherent "nothing
+  pending". A suppressed publish is retried, not lost. There IS a residual
+  hazard — a `Compile` pendingXSKStartup snapshot left genuinely unpublished
+  can be swallowed by either lockstep advance — but it is PRE-EXISTING and
+  independent of the lease (both run under `m.mu` and can land between any two
+  ticks); the lease widens its window by roughly one tick period for the
+  duration of a cycle. Filed separately rather than widening this diff.
+  B2 — the rollback was attempted, never guaranteed. `NotifyLinkCycle` was
+  void: a failed `rebind` was a `slog.Warn` and a bare return, so a CLEAN cycle
+  whose rebind failed left every worker stopped WHILE THE COMMIT REPORTED
+  SUCCESS. Chose the ERROR RETURN of the three offered (error / recovery debt /
+  guaranteed retry): it is the mechanism this PR already chose for
+  `PrepareLinkCycle`, it needs no new machinery (the daemon's
+  `errRethPrepareLinkCycle` + `errors.Join` fold already exists at both call
+  sites), and it is what makes the shipped claim "owns its own rollback" true
+  rather than merely asserted. `LinkController.NotifyLinkCycle()` now returns
+  `error`; `DataPlane.NotifyLinkCycle()` stays void (the eBPF Manager's is a
+  genuine no-op) and `LegacyDataPlaneAdapter` discards it with a note — that
+  adapter is not the live path. Error scope is deliberately narrow, mirroring
+  `PrepareLinkCycle`'s: it reports whether the REBIND landed, NOT whether the
+  subsequent `applyHelperStatusLocked` did. Folding the latter was tried and
+  reverted — it fails with "userspace_ctrl map not loaded" whenever no shim is
+  attached, which is a legitimate state, so folding it would fail commits on a
+  healthy deployment: the same over-rejection this PR already corrected once.
+  Fixed the fake: `abortRecoveryLinkController` only counted calls, so a failed
+  unwind was unobservable BY CONSTRUCTION. It now carries `notifyErr`.
+  Also pinned `needLinkCycleRecovery`, which had no behavioural binding at all.
+  `TestApplyFailsWhenPostCycleRebindFails_6871` makes it observable through the
+  apply's own returned error: the cycle completes cleanly (so the flag must be
+  armed) and the rebind only the armed flag reaches then fails.
+  Six claim contradictions from the Codex audit, all corrected: `docs/reth-mac.md`
+  "stops the workers whether it then succeeds or fails" (a `stop_workers` that
+  never reaches the helper joins nothing) and "every stop_workers empties
+  records" (a dial/write failure precedes the handler);
+  `daemon_apply_dataplane.go` "only the failed-worker-join class produces a
+  commit error" (the gate is "the hook RAN") and "cleared every binding row"
+  (`clearAllBindingRowsLocked` is best-effort and discards each Update error);
+  `daemon_reth.go` a failed live set "proves" no `IFF_LIVE_ADDR_CHANGE` (the
+  branch is taken on EVERY error, and Linux's MAC path never consults the flag);
+  `reth_callsite_effect_5103_test.go` "left administratively DOWN" (a hook
+  failure returns before `setDown` — the link is untouched and still UP).
+  Test seam: `statusLoopInterval` is now a package var so the concurrency test
+  can drive many real ticks in a fraction of a second. Production never
+  reassigns it; mirrors `linkCycleRebindSleep` in the same subsystem.
+  Validation. `go build ./...` rc=0; `go vet ./pkg/daemon/... ./pkg/dataplane/...`
+  rc=0; `gofmt -l` clean on every touched file; `go test ./...` (whole repo,
+  unprivileged) rc=0. The discriminator deliberately needs NO BPF maps — map
+  creation is EPERM here, so a map-backed fixture would have made it SKIP rather
+  than run. Under root the `pkg/dataplane/userspace` suite has 8 failures; the
+  identical 8 fail at the unmodified PR head 16b65ec81 in a detached worktree
+  (`diff` of the sorted FAIL sets is empty), so they are pre-existing root-only
+  failures, not regressions. No Rust changed, so no cargo leg is owed.
+  Mutation matrix, 15 cells, every RED an ASSERTION failure (zero build breaks,
+  zero skips): tick guard removed -> RED (discriminator) / GREEN (resume);
+  ctrl gate `|| linkCycleInFlight()` removed -> RED (UpdateRGActive) / GREEN
+  (NotifyLinkCycle's own apply); acquire removed -> RED x2 / GREEN (no-helper);
+  release moved to a defer -> RED (ctrl costs an extra tick) / GREEN (resume);
+  TTL expiry removed -> RED; rollback `NotifyLinkCycle` discarded -> RED /
+  GREEN; step 2.6b2 fold discarded -> RED / GREEN; `needLinkCycleRecovery=false`
+  after its assignment -> RED / GREEN (the #5103 call-site guard).
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/controllers.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/apply.go, pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/daemon_reth.go, pkg/daemon/reth_rollback_failure_6871_test.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/reth_callsite_effect_5103_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6871 hostile-review fold: bind the rebind error at the live
+  adapter, and close the sixth worker-respawn producer (the operator verbs).
+  F1 (blocking). The production line that makes the #6871 fail-closed rebind
+  real could be severed TWO independent ways with the entire suite still green:
+  `return fmt.Errorf("userspace: rebind after link cycle: %w", err)` ->
+  `return nil` in `process_linkcycle.go` (the PRODUCER), and
+  `_ = c.manager.NotifyLinkCycle(); return nil` in `controllers.go` (the
+  TRANSPORT). Reproduced firsthand: with the new suite hidden, each revert
+  leaves `go test ./pkg/dataplane/userspace/` fully green. The daemon-side
+  tests drive `abortRecoveryLinkController.notifyErr`, a FAKE, so they bind the
+  daemon's CONSUMPTION of the error and never the manager's PRODUCTION of it;
+  `link_cycle_test.go` calls the real `m.NotifyLinkCycle()` as a bare
+  statement, discarding the return; no daemon test constructs a real
+  `userspace.Manager`. New `link_cycle_failclosed_6871_test.go` mirrors the
+  #5103 Prepare-half suite structurally: four cells, ALL through `m.Link()` —
+  rebind failure names "rebind"; healthy helper answers both and returns nil;
+  no helper returns nil; nil-manager adapter returns nil. Each of the first
+  cell's assertions goes RED under BOTH reverts.
+  F2. Sixth producer. `SetForwardingArmed` / `SetQueueState` / `SetBindingState`
+  take only `m.mu` and never consulted the lease. They are reachable ONLY from
+  outside the daemon (`request chassis cluster data-plane userspace ...` via
+  `pkg/cli/cli_request_chassis.go` and gRPC `SystemAction` via
+  `pkg/grpcapi/server_diag_system_action.go`), and neither call site is
+  serialized on `applySem` — there is no `applySem` use anywhere in `pkg/cli`
+  or `pkg/grpcapi`. Each lands in a helper handler that reaches
+  `afxdp.reconcile` and SPAWNS WORKER THREADS (`handlers/forwarding.rs`
+  unconditionally; `handlers/binding.rs` / `handlers/queue.rs` on
+  `registration_changed`). So an operator or automation firing one between
+  `PrepareLinkCycle` and `setDown` — a window up to `externalCommandTimeout` of
+  `ethtool` per RETH member — respawns workers into a NIC about to unmap their
+  UMEM, which is the use-after-unmap #5103 exists to prevent. The ctrl gate at
+  `maps_sync.go` does NOT cover it: the spawn happens INSIDE the helper, before
+  the status this manager applies, so the gate has nothing left to un-spawn.
+  Gated at the three verbs with `errLinkCycleInFlight`, NOT centrally in
+  `requestLocked`: `requestLocked` also carries the cycle's own `stop_workers`,
+  sent AFTER the lease is taken, so a central gate would need an exemption list
+  for exactly the requests that take and release the lease. Both directions are
+  refused, not only arming — a disarm does not spawn but still drives
+  `afxdp.reconcile`'s teardown arm over sockets the cycle quiesced, and nothing
+  inside the daemon calls these three, so the broader scope blocks no internal
+  path (unlike the #5648 gate beside it, which is scoped to `armed==true`
+  precisely because the daemon's own disarm paths must never be refused).
+  F3. A wrong cadence in seven places. `reconcileRGStateLoop`
+  (`daemon_ha.go:611`) is `time.NewTicker(2 * time.Second)`, not 500ms.
+  Corrected at `maps_sync.go`, `process_linkcycle.go`, `docs/reth-mac.md`,
+  `link_cycle_lease_6871_test.go` (comment + failure message), this log, and at
+  the stale pre-existing source the rest inherited it from,
+  `pkg/daemon/rg_state.go` — plus its echo in `rg_state_test.go`, whose derived
+  "6 lines/sec" was wrong for the same reason. The load-bearing half of the
+  claim is unchanged and verified: the loop is its own goroutine calling
+  `SetRGActive` with no `applySem`.
+  F4. Two claim sites contradicting a correction this PR itself made.
+  `daemon_reth.go` logged "driver does not support live change" on a branch
+  taken on EVERY `setHardwareAddr` error; it now says the live set was refused
+  and CARRIES the actual error (hoisted to `liveSetErr`, previously scoped to
+  the `if` and lost). `daemon_apply_dataplane.go`'s "Reachability is narrow — a
+  driver without IFF_LIVE_ADDR_CHANGE (not the cluster's mlx5/virtio NICs)"
+  understated reachability: a transient refusal on an mlx5 VF enters the same
+  abort/rollback class.
+  F5. A test that passed for the wrong reason.
+  `TestStatusTickSendsNothingWhileLinkCycleInFlight_6871` still passed with
+  `statusLoopInterval` inlined back to `time.Second` — the 300ms hold then held
+  zero ticks, so `requestsBetween` came back empty vacuously. Added an
+  equal-length pre-cycle CONTROL window requiring >= 2 polls. Verified
+  comparatively: under the severed seam the PRE-FOLD test body PASSES and the
+  new one FAILS at "only 0 status polls in a 300ms control window".
+  Also: the 60s TTL doc now names its assumption — it is the N=2 worst case
+  (15s x (1 + members visited after the last cycling one)), the traversal is a
+  Go map range so the tail is nondeterministic, and >= 4 wedging members
+  afterwards exceed it; overrun is loud (Warn under the CAS) and degrades to
+  master's behaviour.
+  Validation. `go build ./...` rc=0; `go vet` rc=0 on both packages; `gofmt -l`
+  clean on every touched file (the other files it lists are pre-existing
+  deviations, confirmed at the unmodified PR head). Root run of
+  `./pkg/dataplane/userspace/ ./pkg/daemon/`: 8 failures, byte-identical to the
+  same run at the unmodified head 9060c6126 (sorted FAIL-set diff empty) — the
+  known pre-existing root-only set. `-race` clean on the userspace package. No
+  Rust changed, so no cargo leg is owed.
+  CORRECTION (#6871 round 6, Codex): the sentence that stood here — "All 10 new
+  cells RUN unprivileged; none skip" — was FALSE. Three leaf cells DO skip
+  without privilege, all in `link_cycle_lease_6871_test.go`:
+  `TestUpdateRGActiveCannotReEnableCtrlDuringLinkCycle_6871/{activation,demotion}`
+  and `TestNotifyLinkCycleReleasesLeaseBeforeItsOwnCtrlApply_6871`. They go
+  through `newLinkCycleTestManager`, which calls `rlimit.RemoveMemlock` (EPERM
+  unprivileged) because the ctrl gate they exercise lives in
+  `applyHelperStatusLocked` and reads real shim maps. Go reports a PARENT as PASS
+  when every subtest skipped, which is how the claim survived a green summary
+  line. Consequence, stated rather than implied: the `|| m.linkCycleInFlight()`
+  clause in `maps_sync.go` is bound ONLY under root. The tick and operator-verb
+  discriminators are deliberately map-free and DO run unprivileged.
+  Mutation matrix, 6 revert cells + 4 comparative cells, every RED an ASSERTION
+  (zero build breaks, zero skips): producer `return nil` -> RED / 3 guards
+  GREEN; adapter swallows -> RED / same 3 GREEN; each of the three verb gates
+  removed individually -> RED on that verb / 2 guards GREEN; statusLoopInterval
+  seam severed -> RED on the density guard / resume guard GREEN. Comparative:
+  with the new suites hidden, both F1 reverts AND all three gates removed leave
+  the package green; the pre-fold tick test passes under the severed seam.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/manager_status.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/link_cycle_failclosed_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_operator_verbs_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/daemon/daemon_reth.go, pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/rg_state.go, pkg/daemon/rg_state_test.go,
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13 05:05 PDT
+- **Action**: #6871 round 6 — fold the Codex MERGE-NEEDS-MAJOR on the #5103
+  link-cycle lease. Seven items, two of them runtime.
+  F1 (blocking, runtime). A SEVENTH producer of the worker-respawn class
+  bypassed the lease. `SetHAWatchdog` (daemon_ha_sync.go) runs on its own 500ms
+  goroutine with NO applySem; its first/change/3s-backstop branch reaches
+  `syncHAStateLocked`, whose tail is `syncDesiredForwardingStateLocked` — a raw
+  `set_forwarding_state`, which lands in the helper's `handlers/forwarding.rs`
+  and calls `reconcile_status_bindings` UNCONDITIONALLY -> `afxdp.reconcile` ->
+  SPAWNS WORKER THREADS. Codex recorded the sequence with a privileged probe:
+  `[stop_workers update_ha_state set_forwarding_state]`, i.e. workers respawn
+  mid-cycle. The gate is placed at the EMITTER, not at `UpdateHAWatchdog`: three
+  callers reach it and only one was covered (the status tick has its own lease
+  skip; the compile path holds applySem), so gating the emitter closes the class
+  rather than the instance. It DEFERS (returns nil) rather than erroring — the
+  decision is level-triggered on `desiredForwardingArmedLocked` vs
+  `lastStatus.ForwardingArmed`, so the first pass after the lease ends publishes
+  the same delta, and the 1 Hz tick guarantees that within a second.
+  The watchdog's OTHER half is deliberately NOT suppressed, and this was the
+  decision to get right. `update_ha_state` is the ONLY refresh of the helper's
+  per-RG forwarding lease — `Coordinator::update_ha_state` ->
+  `HAGroupRuntime::active_lease_until` -> `ActiveUntil(watchdog +
+  HA_WATCHDOG_STALE_AFTER_SECS)`, **10s** (userspace-dp/src/afxdp/mod.rs) — and
+  `is_forwarding_active` consults it per packet. Gating it for the length of a
+  60s link-cycle lease would EXPIRE that lease and stop forwarding for the RG:
+  an outage, strictly worse than the race being closed. Its handler reaches no
+  worker spawn, so there is nothing to gain by suppressing it either.
+  F2 (blocking). The 60s TTL was not a bound for supported RETH counts. Only a
+  member that CYCLES re-arms the lease, so the exposure was the tail of members
+  visited after the last cycling one; `reth-count` is settable to 128
+  (schema_chassis.go) and the per-member `ethtool -K rxvlan off` has a **20s**
+  hard ceiling (externalCommandTimeout 15s + the 5s `WaitDelay` in
+  exec_timeout.go — the earlier note said 15s). Four wedging members in that tail
+  already exceed 60s, and `rethToPhys` is a Go MAP so the tail differs per run:
+  the same config passes or fails at random. Fixed by making the lease track the
+  SEQUENCE: `Manager.RenewLinkCycle` (new, on `dataplane.LinkController` so every
+  implementation answers at compile time) extends a lease that is ALREADY held
+  and can never create one, and `programRethMemberMAC` calls it on every member's
+  turn. The TTL now bounds ONE member interval — one `ethtool` plus netlink —
+  which is N-independent. A larger constant was rejected as the same defect with
+  a bigger number.
+  F3. The deadline discarded Go's monotonic clock (`time.Now().Add(TTL).UnixNano()`
+  compared against another `UnixNano`). Replaced with monotonic nanoseconds since
+  a package-level `linkCycleLeaseEpoch`; this appliance runs chrony and a first
+  sync can step the wall clock by minutes, which would expire a one-second-old
+  lease (re-opening the race) or strand a dead one.
+  F4. The operator-verb table only ever passed `true`. Extended to BOTH
+  directions (6 cells): the production gates are direction-BLIND, unlike the
+  #5648 protocol gate beside them, and the table has to be able to tell.
+  F5. The `_Log.md` "all 10 new cells RUN unprivileged; none skip" claim was
+  false — corrected in place above, naming the three cells that skip and the
+  `maps_sync.go` clause that is therefore root-only-bound.
+  F6. `manager_ha.go` claimed the helper-down retry floods "at 9+ lines/sec".
+  The loop is `reconcileRGStateLoop`'s 2s ticker (daemon_ha.go) plus event wakes,
+  so ~1.5 lines/sec on three RGs.
+  F7. The previous round's `liveSetErr` hoist — which recovered the actual
+  `setHardwareAddr` failure reason for the journal — had NO regression binding;
+  deleting the attribute left both suites green. Now bound. Also corrected the
+  three `docs/reth-mac.md` sites and `daemon_apply_dataplane.go`/`daemon_reth.go`
+  sentences that read a live-set outcome as an `IFF_LIVE_ADDR_CHANGE` verdict:
+  `dev_set_mac_address` refuses a BUSY device just as readily, so the cluster's
+  own mlx5 VFs can take the fallback transiently and the capability reading is
+  the wrong diagnosis on exactly this hardware.
+  F8. `errRethPrepareLinkCycle` said "after the af_xdp worker join" while the
+  class keys on `joinRan` — the prepare can fail at the DIAL, before the helper
+  reaches its `stop_workers` handler, so the join may not have happened. Reworded
+  to "after the af_xdp worker-join hook ran" plus the three test-file sentences
+  with the same overstatement. Runtime behaviour unchanged; the diagnosis was.
+  Also corrected a claim folded last round:
+  `link_cycle_failclosed_6871_test.go` said "each cell below goes RED on BOTH
+  reverts". Only the DISCRIMINATOR does; the healthy-helper, no-helper and
+  nil-manager cells are CONTROLS and stay green under both, which is what makes
+  them controls rather than restatements.
+  Validation. `go build ./...` rc=0; `go vet` rc=0 on pkg/dataplane/... and
+  pkg/daemon; `gofmt -l` clean on every file this change touches (the wider
+  package list has pre-existing deviations in files it does not touch). Full
+  `go test ./...` green. `./pkg/dataplane/... ./pkg/daemon/` run 3x with
+  `-count=1`, green every pass.
+  Mutation matrix — 6 revert cells, every RED an ASSERTION, zero build breaks:
+  M1 emitter lease gate removed -> `TestDesiredForwardingStateDeferredDuringLinkCycle_6871`
+  RED at "set_forwarding_state reached the helper DURING the link cycle:
+  [set_forwarding_state]" (3 guards GREEN: resume, watchdog-reachability,
+  watchdog-keeps-publishing). M2 `Manager.RenewLinkCycle` body emptied ->
+  `TestRenewLinkCycleExtendsALiveLease_6871` RED at "the lease expired
+  mid-sequence after 1m58s of member turns". M3 the daemon call site
+  `d.dp.Link().RenewLinkCycle()` deleted -> all four
+  `TestRethMemberMACRenewsTheLinkCycleLease_6871` cells RED at "RenewLinkCycle
+  calls = 0, want 1". M2 and M3 are INDEPENDENT severances of the same fix —
+  neither test catches the other's, which is why both exist. M4 monotonic
+  deadline reverted to `time.Now().Add(TTL).UnixNano()` ->
+  `TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871` RED at "lease deadline
+  1786622224814477730 is in the WALL-CLOCK domain". M5 the `"err", liveSetErr`
+  attribute deleted -> `TestRethMACFallbackLogsTheLiveSetError_6871` RED at "the
+  live-set failure reason never reached the journal". M6 all three verb gates
+  narrowed to `armed &&` / `registered &&` -> exactly the three new
+  disarm/deregister cells RED at "reached the helper DURING the link cycle",
+  arm/register cells GREEN. COMPARATIVE for M6: under the same mutation the
+  PRE-FOLD arm-only cells all PASS — the direction narrowing was a total escape,
+  which is the measurement rather than an argument.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/controllers.go,
+  pkg/dataplane/apply.go,
+  pkg/dataplane/userspace/link_cycle_ha_watchdog_6871_test.go (new),
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_operator_verbs_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_failclosed_6871_test.go,
+  pkg/daemon/daemon_apply_dataplane.go, pkg/daemon/daemon_reth.go,
+  pkg/daemon/reth_lease_renew_6871_test.go (new),
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/reth_commit_fold_5103_test.go,
+  pkg/daemon/reth_rollback_failure_6871_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go,
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 8 — close a live CAS race in the link-cycle guard,
+  replace the TTL estimate with a self-renewing lease plus a guaranteed release,
+  and make the controller-adapter layer impossible to sever silently.
+  B1 (BLOCKING, live race, reproduced before fixing): `linkCycleInFlight` could
+  return FALSE after LOSING its expiry CAS. Three writers touch
+  `linkCycleLeaseUntil` — the expiry CAS, `RenewLinkCycle`'s CAS and
+  `acquireLinkCycleLease`'s Store — so either of the latter two can land between
+  the reader's Load and its CAS; the old code discarded the CAS result and
+  returned false regardless. Two of the three possible new values read the
+  OPPOSITE way (a renewal extended a live cycle; a fresh PrepareLinkCycle took a
+  new one), so the guard unlatched for the rest of a cycle that was still
+  running — and the renewal case is the sharp one, because a renewal landing on
+  the expiry instant is precisely what renewal is FOR. The mechanism round 6
+  added to strengthen the lease was the one most likely to defeat it. Fix:
+  `linkCycleInFlight` loops, reporting "expired" only when THIS goroutine's CAS
+  retired the lease, otherwise re-reading and judging the new value.
+  B2 (BLOCKING): round 7's "60s is 3x the only bounded term" was honest and
+  insufficient. Measured firsthand, the other terms in that same interval scale
+  with operator-controlled cardinality — `finishRethMemberLinkTail` runs one pass
+  per CHILD NETDEV (a member can carry one VLAN sub-interface per VLAN id, each
+  pass a sysctl write plus up to three netlink round trips),
+  `reconcileAfterRethLinkCycle` runs one pass per redundancy group, the enclosing
+  loop runs up to the schema's reth-count ceiling of 128
+  (`pkg/config/schema_chassis.go`), and a single netlink syscall has no
+  elapsed-time bound at all. The last of those is unreachable by call-site
+  renewal by construction: a blocking syscall sits BETWEEN two renewals. A bigger
+  constant is the same defect with a bigger number, so the lease stopped
+  estimating: `acquireLinkCycleLease` now starts a heartbeat that renews every
+  `linkCycleLeaseHeartbeat` (TTL/4 = 15s) and `releaseLinkCycleLease` stops AND
+  JOINS it. The interval the TTL covers is now a constant. Because a
+  self-renewing lease would make a LEAK permanent rather than 60s long, the
+  daemon owes a release nothing can skip: `applyDataplaneAndHACore` defers
+  `abandonLinkCycleLease` -> new `LinkController.AbandonLinkCycle() bool`, which
+  drops a still-held lease, reports it (a true is a bug report, logged at Error)
+  and deliberately does NOT rebind — that has two owners already and a third is
+  the double rebind that EBUSYs on mlx5. Neither half is correct alone.
+  B3: a SEVENTH unbound adapter (`RecordDeferredWorkerArmDebt`) after Codex found
+  two and the round-7 sweep found six, so the answer is structural rather than an
+  eighth cell. `controllers_binding_table_6871_test.go` DERIVES the surface: it
+  parses this package's non-test sources for every method declared on any of the
+  four controller types and fails BY NAME if one has no row in
+  `adapterBindingTable`; each row then drives the method through the production
+  constructor, and a row may instead carry a `cannotDrive` reason so a gap is
+  VISIBLE in the table rather than absent from it. 16 methods derived, 16 rows,
+  zero cannotDrive, zero skips. Two enumeration-only misses are now covered:
+  `SetFabricForwarding` calls `managerHAOps.SyncFabricState` DIRECTLY (bypassing
+  `userspaceHAController.SyncFabricState`'s body) and the map-free fixture never
+  reaches that tail because the fabric update fails first — a fake
+  `userspaceHAOps` whose updates succeed drives both entry points; and
+  `RecordDeferredWorkerArmDebt` is reached by an optional type assertion, so its
+  cell asserts the same way `Daemon.recordDataplaneWorkerArmDebt` does.
+  CLAIM CORRECTED by measurement: Codex placed `RecordDeferredWorkerArmDebt` on
+  the LIVE path via the link fallback at daemon_apply_dataplane.go. It is not
+  reached there today — production `d.dp` is `*LegacyDataPlaneAdapter`
+  (`Boot()` -> `NewLegacyDataPlaneAdapter`), which satisfies the `debtRecorder`
+  assertion itself, so the `d.dp.Link()` fallback is dead for that caller. The
+  finding stands (a production method, reachable through `Manager.Link()`, that
+  was unbound) but the harm is a latent fallback rather than a live one.
+  `runtime_adapter_binding_6871_test.go` is deliberately NOT replaced — its cells
+  were each measured against a real severance and a subsuming table could retire
+  one by accident. The two overlap on purpose.
+  Mutation matrix — 18 severances, 18 RED, zero build breaks. The 13 from round 7
+  ALL still red (P1 managerHAOps.UpdateHAWatchdog, P2
+  userspaceHAController.SetHAWatchdog, P3 userspaceLinkController.RenewLinkCycle,
+  P4 SetDeferWorkers, P5 managerHAOps.UpdateRGActive, P6
+  userspaceHAController.SetRGActive, P7 LegacyAdapter.PrepareLinkCycle, P8
+  userspaceLinkController.PrepareLinkCycle, P9 NotifyLinkCycle, P10
+  managerHAOps.UpdateFabricFwd, P11 UpdateFabricFwd1, P12
+  managerHAOps.SyncFabricState, P13 userspaceHAController.SyncFabricState), plus
+  five new: N14 RecordDeferredWorkerArmDebt -> {}, N15 AbandonLinkCycle ->
+  return false, N16 SessionDeltas -> return nil, N17 the SyncFabricState tail
+  deleted from SetFabricForwarding (RED at "SyncFabricState calls after a
+  SUCCESSFUL fabric update = 0, want 1"), N18 a NEW adapter method with no table
+  row (RED at "controller adapter methods with NO entry in adapterBindingTable:
+  [userspaceLinkController.ProbeUnboundAdapter6871]" — the structural property,
+  demonstrated rather than asserted). Separately: B1's straight-line
+  `linkCycleInFlight` -> both discriminator cells RED, both controls
+  (release-wins, stranded-lease-still-expires) GREEN; `startLinkCycleHeartbeat`
+  removed from acquire -> `TestLinkCycleLeaseRenewsItself_6871` +
+  `TestLinkCycleHeartbeatStopsOnRelease_6871` RED; `defer
+  d.abandonLinkCycleLease()` deleted -> both
+  `TestApplyDataplaneCoreAlwaysAbandonsAHeldLease_6871` cells RED (normal return
+  AND panic unwind) while the helper-level control stays GREEN.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/controllers.go,
+  pkg/dataplane/apply.go,
+  pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go (new),
+  pkg/dataplane/userspace/link_cycle_heartbeat_6871_test.go (new),
+  pkg/dataplane/userspace/controllers_binding_table_6871_test.go (new),
+  pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_lease_abandon_6871_test.go (new),
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go,
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-12
 - **Action**: #5561 round 21b — the master merge was NOT semantically free, and
   a clean textual merge hid it.
 
@@ -87649,6 +88704,908 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
 
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 9 — close a BLOCKING heartbeat-lifecycle defect the
+  round-8 self-reap introduced, build the guard round 8's own comment claimed
+  existed, and fix a data race round 8 added.
+  F1 (BLOCKING, runtime): the round-8 heartbeat loop self-reaped on
+  `linkCycleLeaseUntil == 0` and returned WITHOUT clearing
+  `linkCycleHB.stop/done`, while `startLinkCycleHeartbeat`'s idempotence guard
+  tests that FIELD rather than goroutine liveness. One reap therefore left the
+  field non-nil with nothing running, and every later `acquireLinkCycleLease` IN
+  THE SAME APPLY silently started no heartbeat — leaving every RETH member
+  cycled after that point on round-7 protection, which the TTL block itself
+  argues is not survivable at operator-controlled cardinality. The trigger is
+  the case this design is built around: the word reaches 0 either via
+  `releaseLinkCycleLease` (which stops the heartbeat first, so no reap follows)
+  or via `linkCycleInFlight`'s backstop CAS after four missed beats — exactly
+  the starvation the 4x TTL margin exists to absorb. Blast radius is bounded to
+  the apply by the deferred `AbandonLinkCycle`, which resets the fields.
+  FIX: delete the self-reap so the loop has EXACTLY ONE exit. Clearing the
+  fields inside the reap was the other candidate and is rejected — a release
+  plus a fresh acquire can install a new stop/done between the reap's decision
+  and its lock, so the dying goroutine would clear its SUCCESSOR's state,
+  orphaning a live heartbeat and letting a third acquire stack a second one.
+  Making that safe needs an identity check; one exit needs nothing. The cost of
+  no reap is one atomic load per beat on a retired lease until the guaranteed
+  release.
+  F2: `process_linkcycle.go` claimed "TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871
+  fails if one appears". `grep -rn AcquisitionSite --include=*.go` returned
+  exactly one hit: that comment. The factual half was true — enumerated
+  independently — but a shipped comment asserting absent enforcement is worse
+  than no comment, because it is why the next reader does not add the check.
+  Two guards now exist in `link_cycle_acquisition_site_6871_test.go`: a
+  TREE-WIDE AST scan of every production CALL of `PrepareLinkCycle` against an
+  allowlist (keyed on *ast.CallExpr, so declarations and interface members are
+  correctly ignored — the distinction a grep cannot make), and an IN-PACKAGE
+  scan pinning that the unexported `acquireLinkCycleLease` is reached only from
+  `Manager.PrepareLinkCycle`. The second matters because an in-package caller
+  bypasses the chokepoint entirely and inherits none of the daemon's deferred
+  release. `reth_hook_wired_5103_test.go` does NOT cover this — it parses only
+  daemon_apply_dataplane.go and never looks at PrepareLinkCycle.
+  F3: round 8 introduced a DATA RACE — the heartbeat goroutine reads
+  `linkCycleLeaseElapsed` (beat -> RenewLinkCycle -> linkCycleInFlight -> the
+  seam) while the test writes the plain `elapsed` var `fakeLinkCycleClock`
+  captures. Measured at the round-8 head: 1 DATA RACE, `TestLinkCycleLeaseRenewsItself_6871`
+  (the B2 discriminator itself) FAILING under `-race`. Pre-round-8 nothing read
+  the seam off another goroutine. Fixed with atomic.Int64. ALSO corrected a
+  false claim in `fakeLinkCycleHeartbeat`: it said the beat func "waits for the
+  heartbeat goroutine to have consumed it", but an unbuffered send returns at
+  the RENDEZVOUS, before RenewLinkCycle runs — every assertion after a beat was
+  racing the renewal it was there to observe. It now waits for the OBSERVABLE
+  (the deadline reaching what a renewal at the current clock would set).
+  F4: the `|| m.linkCycleInFlight()` clause in `applyHelperStatusLocked`'s ctrl
+  branch had ZERO unprivileged coverage — deleting it left both packages green,
+  because `applyHelperStatusLocked` opens by resolving userspace_ctrl/bindings
+  off the shim and every unprivileged test stops at line one. Extracted the
+  condition to `ctrlMustStayDisabledLocked` and bound it with an EXHAUSTIVE 2x2x2
+  truth table, map-free. SCOPE STATED: this binds the predicate, not the call
+  site. The full remedy (routing the map handles through an interface as
+  `ctrlMapForDisableLocked` does) threads two handles through
+  `failClosedUserspaceCtrlLocked`, `clearStaleBindingRowsLocked` and ~15 other
+  sites inside a 481-line function ON THE FAIL-CLOSED PATH, so it is
+  deliberately not bundled into this round.
+  F5: a type ALIAS escaped the derived adapter table —
+  `type aliasEscape = userspaceLinkController` plus a method on the alias is in
+  userspaceLinkController's method set but missed a literal receiver-name match.
+  Closed by resolving aliases (`ts.Assign != 0`) to their canonical controller
+  through a fixed-point pass, and keying the method under the CANONICAL name so
+  it lands on the type it really extends. INCLUSION rather than rejection: the
+  alias's methods are bound rather than merely forbidden. Recorded in-file as
+  explicit NON-DEFECTS, so nobody re-derives them: BUILD TAGS over-include
+  (parser.ParseDir ignores //go:build, so a tagged method still fails loudly —
+  the safe direction) and POINTER-vs-VALUE receivers are covered by the StarExpr
+  unwrap.
+  F6: `AbandonLinkCycle`'s doc said dropping the lease hands the helper to "the
+  1 Hz reconcile, which re-arms bindings and workers on its own", implying one
+  tick. Verified firsthand that it is not: `shouldAutoRebindBusyBindingsLocked`
+  requires a wedge observed for >= 5s, rate-limits to one rebind per 15s, and
+  `hasBusyBindingsWedgeLocked` additionally requires `lastStatus.ForwardingArmed`.
+  The RECONCILE resumes within a tick; FORWARDING is seconds. Doc now names the
+  path and the order of magnitude. Also bound the previously untested abandon
+  path (`TestStatusTickResumesAfterAbandon_6871`) for the half a map-free
+  fixture can reach — that the abandon un-suppresses the tick — with a CONTROL
+  asserting the suppression was real first.
+  Mutation matrix — 4 direct reverts RED, plus a comparative pair for F5:
+  restoring the self-reap -> THREE cells RED, not two as an earlier revision of
+  this entry said ("the second lease has no live heartbeat"); dropping `|| m.linkCycleInFlight()` -> the enabled/no_rg/link_cycle
+  row RED; dropping the rgTransition term -> the enabled/rg/no_cycle row RED
+  (so the truth table discriminates EACH disjunct, not just the new one);
+  `AbandonLinkCycle` reporting without releasing -> 3 cells RED. F5 is a
+  COMPARATIVE pair rather than a revert: with the fix, alias+method REDS naming
+  `userspaceLinkController.EscapedAdapterMethod6871`; with the fix reverted the
+  same alias+method is GREEN — which is the escape, and is why a single
+  mutation cannot express it. Also RED: a new production `PrepareLinkCycle`
+  call site in pkg/daemon, and an in-package `acquireLinkCycleLease` outside
+  PrepareLinkCycle.
+  FIXTURE CORRECTION worth recording: the F1 discriminator PASSED on the
+  unfixed code until a wait on the reap was added. `deliverLinkCycleBeat`
+  returns as soon as the beat is consumed, which is BEFORE the loop re-reads
+  the lease word — so a re-acquire landing first stored a non-zero deadline,
+  the reap arm never fired, and the cell passed with the bug fully present. The
+  fixture raced the defect instead of driving it.
+  `-race` NOTE for the lead: there is no -race leg in the Makefile or the
+  workflows, so this class is invisible to the gate. At the round-8 head the
+  package showed 1 DATA RACE plus an unrelated timing failure
+  (`TestLargeApplySnapshotDoesNotFalseTimeout`); at this head it shows 0 DATA
+  RACES and a different unrelated timing failure
+  (`TestEventStreamSessionCloseRTFlowRoutesToRawCallback`, which passes 3/3 in
+  isolation under -race and which this diff does not touch). So `-race` on this
+  package is load-sensitive independently of #6871; adding it to the gate is a
+  separate decision.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/link_cycle_heartbeat_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/controllers_binding_table_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go (new),
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 10 — fix a `-race` defect THIS PR introduces, close two
+  measured escapes from the round-9 guards, and correct three of my own claims.
+  F1: `go test -race` fails at the round-9 head — 1 run in 3, and every run under
+  `-count=5` on the link-cycle subset. The racing READER is this PR's heartbeat
+  goroutine (`startLinkCycleHeartbeat` -> `RenewLinkCycle` ->
+  `linkCycleLeaseDeadline`), the racing WRITER is this PR's `fakeLinkCycleClock`
+  seam, and the leak source is this PR's own derived binding table: a row drives
+  the real `PrepareLinkCycle` and never releases, so a heartbeat runs on the
+  PRODUCTION 15s ticker and outlives the test. Once a package run exceeds 15s
+  (this one takes 38-56s) the orphan beats and collides with a later swap.
+  MY ROUND-9 COMMIT MESSAGE WAS WRONG ABOUT THIS and the correction matters more
+  than the fix. I wrote that the residual `-race` failures were "different
+  timing-sensitive tests this diff does not touch, so -race on this package is
+  load-sensitive independently of #6871". Every clause of that is false for the
+  race itself: reader, writer and leak source are all this diff. I had observed
+  the *symptom* (different test names failing on different runs), inferred a
+  cause that exonerated my change, and shipped the inference as a finding. That
+  sends the next reader away from the defect, which is the exact harm this
+  campaign keeps paying for.
+  FIX, and NOT the one suggested. The review named three leaking sites and
+  proposed `t.Cleanup(m.releaseLinkCycleLease)` at each. I did that first and
+  MEASURED IT INSUFFICIENT — races persisted, because the leak class is any of
+  TWENTY `acquireLinkCycleLease` sites in this package's tests, not the three
+  that reach it via `PrepareLinkCycle`. Chasing sites is the "N is a lower bound"
+  trap again. So the seam itself is now race-free:
+  `linkCycleLeaseElapsedOverride` is an `atomic.Pointer[func() time.Duration]`
+  behind a plain `linkCycleLeaseElapsed()` function, and every test swaps through
+  one helper (`swapLinkCycleLeaseElapsed`) — a direct assignment no longer
+  compiles, which is the point. A leaked heartbeat can no longer race the
+  override VARIABLE. **Corrected in round 11:** this sentence originally read "A
+  leaked heartbeat is now harmless: it renews its own dead Manager and races
+  nothing", which annexes a guarantee the atomic does not give — it protects the
+  POINTER, not the closure it points at, and a leaked beat CALLS whichever
+  override is installed. See the round-11 entry. The central `t.Cleanup` in
+  `newLinkCycleProcessOnlyManager` stays as hygiene (it covers all 12
+  constructions through that helper) but is no longer what correctness rests on.
+  Production installs no override, so the path is one atomic load plus the same
+  `time.Since` it always did. Re-ran the reviewer's exact repro 3x after: 0 races,
+  0 failures, where it was red every run before.
+  F2: two MEASURED escapes from the round-9 acquisition guards, both compiling
+  production Go that takes a lease with both guards green — a method VALUE
+  (`prep := d.dp.Link().PrepareLinkCycle; prep()`), which has no `CallExpr` at
+  the selector at all, and a package-level initializer (`var x = func(...) {...
+  PrepareLinkCycle() }`), which is a `GenDecl` my per-`FuncDecl` walk never
+  inspected. Fixed by keying on ANY `*ast.SelectorExpr` rather than
+  `CallExpr.Fun`, and walking the whole file with a decl-kind switch so
+  `ValueSpec` initializers get a key. Green at HEAD with the widening alone, so
+  the stated exclusions (declaration, interface member, doc comment) all survive
+  it — none is a SelectorExpr. Over-inclusion is the safe direction and is now
+  stated as such.
+  F3: two of my round-9 doc insertions STOLE the sentence below them.
+  `docs/reth-mac.md` — my one-exit paragraph landed between the self-renewal
+  sentence and its continuation, so "The interval the TTL must cover is therefore
+  a constant" read as a consequence of "one exit needs no identity check" (wrong
+  antecedent AND a wrong claim — it is a consequence of the self-renewal). The
+  second split a pair so "Neither half is correct alone" read against the wrong
+  two things. Fixed by MOVING both insertions below the blocks they interrupted,
+  restoring the original adjacency, rather than patching around them. This is the
+  prose form of the insertion-steals-its-neighbour failure already on record.
+  F4: two of my own overstatements corrected. "Both F2 guards red on a planted
+  call site" — each reds on its OWN plant; one plant does not red both, and the
+  round-9 controls in fact show the tree-wide guard staying correctly SILENT on
+  an in-package acquire. "Restoring the self-reap reds both F1 cells" understated
+  it at two; it is three. The second is corrected in place in the round-9 entry
+  above (superseded phrasing verified absent by content, not by count); the first
+  lived only in the round-9 commit message, which is immutable, so it is
+  corrected here and on the PR.
+  Mutation matrix — 4 escapes RED + 2 controls behaving:
+  method-VALUE plant (tree-wide) RED naming
+  `pkg/daemon/daemon_reth.go:probeMethodValue6871`; package-level INITIALIZER
+  plant RED naming `probeInitializer6871`; in-package method-VALUE acquire RED
+  naming `manager_status.go:probeInPkgMethodValue6871`; a plant behind
+  `//go:build never_ever_built` RED (build tags over-include — the safe
+  direction, now measured rather than assumed). Controls: an ordinary call reds
+  the tree-wide guard, and an ordinary IN-PACKAGE acquire leaves the tree-wide
+  guard GREEN while the in-package guard reds it — so the second guard does bind
+  something the first structurally cannot, which is what round 9 claimed.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/link_cycle_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 11 — fix a MEASURED data race in a test seam closure,
+  move a code comment onto the branch it describes, close two guard-key escapes,
+  and correct the round-10 claim that overstated what round 10 bought.
+  N1: `injectAtLeaseExpiryCheck`'s one-shot flag was a plain `bool` read from two
+  goroutines. Round 10 made `linkCycleLeaseElapsedOverride` an `atomic.Pointer`,
+  which makes the SWAP race-free — but the atomic protects the POINTER, not what
+  it points AT. A leaked heartbeat reaching `linkCycleLeaseElapsed` CALLS
+  whichever override is installed, so every closure a test installs is shared
+  state. `fakeLinkCycleClock`'s counter was already an `atomic.Int64` for exactly
+  this reason; this flag had not been given the same treatment. Reproduced from
+  the reviewer's script first (`WARNING: DATA RACE`, read at the flag through
+  `linkCycleInFlight`, previous write through `startLinkCycleHeartbeat.func1`),
+  then measured on the REAL helper rather than on an inlined copy of its shape:
+  with the beat accelerated 15s -> 200us, BEFORE = 1 race under `-race -count=5`
+  and a 200-run functional loop ending in
+  `panic: Fail in goroutine after ... has completed` (the second injector calling
+  `t.Fatal` off-goroutine, taking the whole test binary down); AFTER
+  (`fired atomic.Bool`, `CompareAndSwap`) = 0 races, no panic in 200 runs.
+  WHAT THE FIX DOES NOT BUY, stated because overstating it is the finding: a
+  leaked beat is not thereby harmless. It can still WIN the one-shot and inject
+  on its own goroutine.
+  **CORRECTED IN ROUND 12 — the next two sentences of this entry were INVERTED,
+  and are struck rather than deleted because the wrong version was relayed on the
+  PR.** They read: "the discriminator's own read finds the lease word unmoved and
+  reds at 'reported NO cycle in flight' — ~10 times in the same 200 accelerated
+  runs. The direction is what holds: every assertion demands the lease be judged
+  LIVE, and a stolen injection can only make the reader see an expiry, so it reds
+  a cell and never greens one." Backwards on both halves. The steal is what MOVES
+  the lease word early — `inject()` runs BEFORE the reader's `Load`, so the reader
+  compares 61s against an already-advanced 121s and returns true on its FIRST
+  comparison, never entering the expiry branch. A steal therefore GREENS the cell
+  vacuously; it reds only on the narrow ordering where the reader's own
+  `CAS(stale -> 0)` commits before the thief's store lands. Measured in round 12,
+  B1 reverted so the cell must fail: ~24% of accelerated iterations PASSED, every
+  one a false green. The `~10 in 200` figure was also unreproducible as stated:
+  reds at HEAD under acceleration are 4 of 200 accumulating iterations and 1 of
+  200 separate invocations, all in `fresh_prepare_wins_the_cas`. See the round-12
+  entry at the end of this file. At the production 15s period the window is
+  microseconds and none of it has been observed — that part stands, and it is why
+  round 12 is not a blocker.
+  CLAIM CORRECTIONS, two sentences that were false: the round-10 commit message's
+  "A leaked heartbeat now renews its own dead Manager and races nothing", and
+  `process_linkcycle.go`'s "an atomic override cannot be raced by any of them".
+  Both are true of the pointer swap and false of the installed closure. The
+  in-tree copy of the first (round-10 entry above) is corrected in place;
+  the commit message itself is immutable, so it is corrected here and on the PR.
+  The seam comment now scopes the guarantee to install-and-read of the variable
+  and names closure captures as the caller's obligation. It also records that a
+  red `-race` run in this package is NOT automatically a race:
+  `TestLargeApplySnapshotDoesNotFalseTimeout` and
+  `TestEventStreamRawDataplaneEventsFeedSyslogFanout` are load-sensitive DEADLINE
+  tests that fail under load. Round 10 was right to retract the round-9 claim
+  that the observed races WERE that class; it does not follow that the class is
+  empty.
+  N3: the "AND THE ADDRESS GAP IS DELIBERATE" paragraph sat inside
+  `if linkCycled {`, where `needLinkCycleRecovery` is necessarily true and step
+  2.6b's VIP reconcile therefore DOES run — so the caveat contradicted the branch
+  it was attached to. The gap belongs to the `linkCycled==false` cycled-MAC-write
+  row: `setDown` succeeded, the MAC write was refused, the link went down and
+  back up (flushing addresses) and `programRethMAC` still returns false. Moved to
+  the rollback arm. Verified against `origin/master` that the pre-#5103 code
+  returns false on that same path, so "predates #5103 and is unchanged by it"
+  holds. `docs/reth-mac.md`'s outcome table already had it on the right row, so
+  the doc needed no change. Same insertion-lands-against-the-wrong-antecedent
+  class as round 10's F3, this time in code rather than prose.
+  N3b, a THIRD instance of that class, found by looking for one rather than by
+  review. Round 10 split
+  `var linkCycleLeaseElapsed = func() time.Duration {...}` into
+  `var linkCycleLeaseElapsedOverride` plus a `linkCycleLeaseElapsed()` function.
+  The doc comment stayed attached to the renamed VARIABLE and kept its old
+  subject, so `go doc -u` printed "linkCycleLeaseElapsed reports monotonic time
+  since linkCycleLeaseEpoch..." under the seam variable and showed the function
+  itself with no doc at all — verified through `go doc` rather than by reading.
+  The variable's comment now describes the variable; the function has its own
+  one-liner pointing at it.
+  N2: both acquisition guards keyed sites as `<path>:<enclosing decl name>`, and
+  Go allows two declarations of one name in one file when the receivers differ.
+  Measured, both plants compiling production Go that takes a real lease: (a) a
+  second acquisition in `daemon_apply_dataplane.go` under a same-named method on
+  a different receiver, absorbed by the allowlist entry — the exact failure the
+  guard exists to prevent; (b) a shadow `PrepareLinkCycle` in
+  `process_linkcycle.go`, absorbed by the in-package want-set. BEFORE: both
+  plants green. AFTER (receiver-qualified key via `types.ExprString`): both RED,
+  each naming its plant — `(*rethMACRetry).programRethMACWithWorkerJoin` and
+  `(*linkCycleShadow).PrepareLinkCycle`. The key format is self-binding: revert
+  `declSiteKey` to the bare name and both guards fail on every entry, no plant
+  needed. (c) `reflect...MethodByName("PrepareLinkCycle").Call(nil)` has no
+  SelectorExpr at all and is out of reach for an AST guard; recorded as a KNOWN
+  LIMIT rather than papered over, since matching the string literal would fire on
+  every doc comment that spells it.
+  N7 (out of scope here, filed): `renameRethMember` does its own link
+  DOWN/rename/UP in the same step 2.6 loop with no worker join — the #5103 class,
+  unchanged by this PR, reachability explicitly NOT claimed. Filed as #6996 with
+  that provenance rather than fixed here.
+  N5/N6 recorded as explicit NON-DEFECTS so they are not re-raised: severing the
+  ctrl-stay-disabled call site leaves both packages green (the PREDICATE is
+  bound; master's pre-PR condition was equally unbound — round 9's F4 scope note
+  declares and defers exactly this), and a lease surviving forever when
+  `applyDataplaneAndHACore` never RETURNS is the residual `docs/reth-mac.md`
+  already states and argues for, because the workers really are joined.
+  Validation: `go build ./...`, `go vet ./...`, full `go test ./pkg/... ./cmd/...`
+  green; `-race -count=5` on `pkg/dataplane/userspace` x3 and `pkg/daemon` x1,
+  zero races. Cluster smoke `make test-failover` was run centrally at this head
+  before the round: 14/14 PASS, 22.9 Gbps.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/daemon/daemon_apply_dataplane.go, _Log.md
+
+## 2026-08-13 — #6871 round 12: a stolen injection GREENS the cell; the leak class is wider than the site that was named
+
+- **Timestamp**: 2026-08-13 (fix/5103-reth-worker-join)
+- **Action**: Two items from an independent hostile review that returned
+  MERGE-NEEDS-MINOR with zero blocking findings. The first is a claim of mine
+  that was INVERTED, not merely overstated. The second is the leak it rides,
+  which measurement turned into a class rather than the one site named.
+
+  ITEM 1 — THE DIRECTION WAS BACKWARDS, corrected in all three artefacts that
+  carried it (the fixture comment, the round-11 entry above, the PR body).
+  Round 11 wrote that a stolen injection can only produce a RED, "because every
+  assertion demands the lease be judged LIVE". `injectAtLeaseExpiryCheck`
+  installs its one-shot in a PROCESS-GLOBAL seam, so a heartbeat left beating by
+  an earlier test calls that closure too. When such a beat WINS the one-shot,
+  `inject()` runs BEFORE the discriminator's own `Load` and ADVANCES
+  `linkCycleLeaseUntil` past the fake clock. The reader then loads the
+  already-advanced word and finds 61s < 121s on its FIRST comparison: it returns
+  true without entering the expiry branch, without attempting a CAS, and
+  therefore without exercising the fix under test. The B1-reverted implementation
+  returns true on that same path, so the cell PASSES VACUOUSLY. The steal is
+  precisely what REMOVES the expiry the reader was going to observe — the exact
+  opposite of "finds the lease word it expected to move unmoved".
+
+  MEASURED, with B1 REVERTED so both cells are OBLIGED to fail, the beat
+  accelerated 15s -> 200us, and `-test.count` in one binary so leaked beats
+  accumulate. Every PASS is a false green:
+
+  | configuration | renewal | fresh_prepare |
+  |---|---|---|
+  | whole package, HEAD fixture | 5/20 PASS | 7/20 PASS |
+  | whole package, the four leaks in `link_cycle_lease_6871_test.go` closed | 4/20 PASS | 5/20 PASS |
+  | whole package, goroutine gate + those closures | **0/20** | **0/20** |
+  | this file's tests only, HEAD fixture | 13/54 PASS | 13/54 PASS |
+  | this file's tests only, goroutine gate | **0/100** | **0/100** |
+
+  The 54 is not a typo: that run died at iteration 54 on a stolen inject calling
+  `t.Fatal` off-goroutine.
+
+  ITEM 2 — THE LEAK, AND WHY IT IS NOT ENOUGH.
+  `TestLinkCycleLeaseExpiresAfterTTL_6871` was named as "the leak the steal
+  rides". It does leak a heartbeat, but it is the HARMLESS kind and closing it
+  alone removes ZERO false greens (measured: 0 of 100 with only that site closed;
+  100/100 RED both cells). Its assertions drive the lease word to the 0 sentinel,
+  and `linkCycleInFlight` returns from `until == 0` BEFORE it ever reads the
+  clock seam, so that orphan can never inject. The two sites that actually
+  produced false greens are
+  `TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871` and
+  `TestRenewLinkCycleExtendsALiveLease_6871`, which leave the word NON-ZERO —
+  their orphaned beats then renew the dead Manager forever and read the seam on
+  every beat. In isolation those two produce 22+11 and 29+34 false greens per 100.
+  Found by registering every heartbeat goroutine with its creator stack and
+  dumping the ones whose lease word was still non-zero at the discriminator's
+  entry, rather than by reading the acquisition sites.
+
+  All four unreleased acquires in that file are now closed. That is hygiene, and
+  it is explicitly NOT the fix: at PACKAGE scope, closing them moves the false
+  greens from 12 to 9 out of 40 cell-runs. A separate instrumented build printed
+  the installing and firing goroutine ids whenever they differed and reported one
+  mismatch over six package runs — firing from `startLinkCycleHeartbeat.func1`,
+  on a goroutine created long before the test — against exactly one false green,
+  the same cell in the same run. So the thief survives the closures, and the leak
+  class is wider than any one file.
+
+  THE FIX IS THEREFORE STRUCTURAL, not another site. `injectAtLeaseExpiryCheck`
+  now records the installing goroutine's id and admits an injection only from
+  that goroutine, using the same `runtime.Stack` header parse, for the same
+  reason, as `pkg/logging`'s `goID` (#2287): a flag records THAT someone read,
+  never WHO, and the property under test belongs to one goroutine's Load->CAS
+  window. A stolen injection is now unrepresentable regardless of how many leaks
+  exist — including ones added later. The atomic one-shot stays: the gate narrows
+  who may inject, not who may read.
+
+  WHAT ROUND 11 GOT RIGHT AND KEEPS. The `-race` result stands (1 report before,
+  0 after). The off-goroutine `panic: Fail in goroutine after ... has completed`
+  stands as NOT occurring at HEAD — 0 in 200 accelerated runs here, and the
+  reviewer saw it only with the B1 revert also applied. Its stated MECHANISM is
+  refined: that panic has two producers, and the round-11 atomic retires only
+  one. The double injection is gone by construction; the SINGLE stolen injection
+  panics identically when the thief's emulated renewal loses its CAS and calls
+  `t.Fatal` from the heartbeat goroutine, which is what round 12 reproduced. The
+  gate retires that second producer.
+
+  A SECOND CLAIM OF MINE THAT DID NOT SURVIVE. Round 11 said a steal reds at HEAD
+  "~10 times in 200 accelerated runs". The reviewer measured 200/200 PASS and
+  could not reproduce it. Both are close to right and neither is the number: reds
+  at HEAD are 4 of 200 accumulating iterations and 1 of 200 separate binary
+  invocations, all in `fresh_prepare_wins_the_cas`, none in `renewal_wins_the_cas`.
+  The ordering that reds is narrow — the reader's own `CAS(stale -> 0)` has to
+  commit before the thief's store lands, after which the failure message prints
+  the thief's deadline (121000000000) as though the lease were live. So reds at
+  HEAD are real but ~1/200, not ~10/200, and they are not the dominant outcome of
+  a steal; the vacuous green is.
+
+  NIT — a count that no rule yields. `process_linkcycle.go` said there are
+  "twenty acquisition sites in this package's tests". There are 42 non-comment
+  `acquireLinkCycleLease()` / `PrepareLinkCycle(` call lines
+  (`grep -nE 'acquireLinkCycleLease\(\)|PrepareLinkCycle\(' *_test.go`, minus the
+  six whose line is a comment). The number is load-bearing there — it is the
+  argument for fixing the seam instead of the sites — so it now carries the
+  command that reproduces it.
+
+  SEVERITY. Not a blocker, and that is the reviewer's and the lead's call, not a
+  softening of the finding: at the SHIPPED 15s beat the discriminator is 200/200
+  RED under the B1 revert, and the vacuity needs the 75000x acceleration this
+  work introduced as an instrument, which no shipped configuration uses. It is
+  fixed now because that instrument is a reasonable thing for a later lane to
+  reach for, and because the fixture comment was actively misdirecting whoever
+  does.
+
+  VALIDATION: `go build ./...` clean, `go vet ./pkg/dataplane/userspace/` clean,
+  `go test ./pkg/dataplane/userspace/ ./pkg/daemon/` green (26.4s / 27.0s). At
+  package scope with the accelerated beat and B1 reverted, the delivered fixture
+  is 20/20 RED on both discriminator cells with the two controls green and no
+  other test disturbed.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 13 — both lease-acquisition guards were blind to a
+  METHOD VALUE, which Codex compiled into a working escape; plus the fixture's
+  one-shot injection was consumable by the installing goroutine, and nine
+  comment/doc claims were false.
+
+  B1 (BLOCKING, fixed). `callSitesOf` recorded any `*ast.SelectorExpr` naming the
+  target and keyed it by its enclosing declaration. Round 10 widened it to that
+  from `CallExpr.Fun` for a good reason — a method value has no CallExpr — but
+  the widening was not sufficient, because keying a method VALUE by its enclosing
+  declaration files it under whatever key that declaration has, and the
+  declaration bounds nothing:
+
+	var escapedAcquire func()
+	// inside (*Manager).PrepareLinkCycle — the one allowlisted site:
+	take := m.acquireLinkCycleLease
+	escapedAcquire = func() { m.mu.Lock(); defer m.mu.Unlock(); take() }
+	take()
+	func TakeLeaseOutsideApply() { escapedAcquire() }   // no selector at all
+
+  The only selector naming the method sits in the allowlisted declaration, so the
+  scan produced exactly the expected key and both guards passed. Calling
+  `TakeLeaseOutsideApply` after the daemon's apply has returned takes a lease
+  outside the deferred `abandonLinkCycleLease`, and since round 8 made the lease
+  renew itself that suppresses the 1 Hz reconcile for the life of the process.
+
+  THE GUARD IS THE DELIVERABLE, so a guard that cannot see this is not weak, it
+  does not hold. The rule is now positional: `callSitesOf` returns `methodRefs`
+  splitting CALLS (the selector is a CallExpr's callee, after unwrapping paren
+  and generic-instantiation forms) from ESCAPES (every other reference form).
+  Escapes are reported by BOTH guards as violations regardless of the enclosing
+  declaration, because no allowlist entry can honestly cover a value that can be
+  stored and invoked anywhere.
+
+  Third escape of one family in this campaign — #6676's binding_slot callee
+  substitution and #6706's `*x.field = CLI{}` write form were both an AST matcher
+  matching a NAME where the property is about a POSITION.
+
+  SIBLING CANARY AUDIT (asked for, and reported either way). Five other AST/text
+  canaries in pkg/dataplane/userspace plus the named #5103 sibling:
+    - `maps_decouple_test.go` — `.Map(literal)` is callee-only, but a SECOND
+      canary (`TestNoMapNameLiteralAliasesOutsideRegistry`) already exists
+      specifically to close the const-alias / parenthesized-selector / METHOD-
+      ALIAS bypasses. Answered, not holed.
+    - `controllers_binding_table_6871_test.go` — enumerates method DECLARATIONS
+      (FuncDecl + receiver). A declaration has no non-callee form. Not applicable.
+    - `manager_coupling_test.go` — struct/type shape. Not applicable.
+    - `worker_count_single_source_5718_test.go` — the `cfg.Workers` count is
+      position-FREE (any read in any position counts, the safe direction); the
+      clamp-helper prohibition is `call.Fun.(*ast.Ident)`-only, so
+      `f := heartbeatZeroSlots; f(...)` would evade it. Same family, different
+      property and issue — reported, not changed here.
+    - `pkg/daemon/reth_hook_wired_5103_test.go` — exact-count assertions, so a
+      method-value SUBSTITUTION drops the count to 0 and fails loudly. A method
+      value ADDED alongside the direct call would be invisible. Weaker instance,
+      fails-safe on the substitution form.
+    - `shim_loader_boundary_test.go` — `strings.Contains` over function source;
+      `.Load()` / `.Compile(cfg)` would not match a method value. Text-level
+      instance of the same family, on a #1476 boundary property. Reported.
+
+  B1 PROOF — 10 cells, each a fresh source copy with its own GOCACHE, GOTMPDIR
+  and TMPDIR, `set -euo pipefail`, an APPLIED marker required on disk, and a
+  BUILD_RC gate so a plant that does not compile is not scored. 10/10 MATCH:
+
+	plant                                   guard=HEAD   guard=FIXED
+	none (control)                            GREEN         GREEN
+	A  method value @ process_linkcycle:669   GREEN         RED
+	B  ordinary 2nd call @ :670               GREEN         GREEN
+	C  method value in NotifyLinkCycle        RED           RED
+	D  PrepareLinkCycle method value in the
+	   allowlisted daemon declaration         GREEN         RED
+
+  A and B are ONE LINE APART with different outcomes under the fixed guard, which
+  is the anti-staleness evidence and also the substantive point: the guard now
+  discriminates the FORM of a reference, not its name or its neighbourhood. The
+  reference trees were md5-verified unchanged after the grid.
+
+  B2 (fixed). Codex confirmed the round-12 goroutine gate closes the reported
+  thief, but ANY earlier `linkCycleLeaseElapsed()` call on the INSTALLING
+  goroutine consumes the one-shot. Reproduced: with an intervening read inserted
+  after installation and the production lost-CAS fix reverted, the HEAD fixture
+  passes 100/100 VACUOUSLY. "My goroutine" was only ever a proxy for "my call";
+  the gate now requires the read to be made BY the installing goroutine AND FROM
+  INSIDE `Manager.linkCycleInFlight`, and a `t.Cleanup` fails the cell if the
+  injection never ran at all — a stricter gate must not be able to trade one
+  false green for another.
+
+  Chose the frame gate over a per-manager injection seam because the seam would
+  mean adding a field to the production Manager to serve a fixture, and because
+  the frame states the property directly. `leaseSeamGoID` became
+  `leaseSeamCaller`, which VERIFIES the "goroutine " prefix rather than skipping
+  its length — an unverified skip makes an undocumented runtime format an
+  unstated dependency, and a changed header would have yielded a parsed id from
+  whatever followed.
+
+  B2 PROOF — 8 more isolated cells, 50 iterations each unless noted:
+
+	cell  fixture  plants               result
+	b1    HEAD     revert + interven.   GREEN  100/100 vacuous (the defect)
+	b2    FIXED    revert + interven.   RED    100/100 discriminator fails
+	b3    HEAD     revert               RED    100/100  (so: brittleness,
+	b4    FIXED    revert               RED    100/100   not an inert assertion)
+	b5    FIXED    none                 GREEN
+	b6    FIXED    intervening read     GREEN  (no false red introduced)
+	b7    FIXED    frame name broken    RED    60 vacuity failures (x20 iters)
+	b8    FIXED    header prefix broken RED    fails loudly at install
+
+  b7 and b8 are the controls for the two new belts: neither is decorative.
+
+  B3 — nine claim corrections, each verified against the code before editing.
+  All nine were REAL:
+   1. `process_linkcycle.go` + `docs/reth-mac.md` said the TTL backstops a lease
+      acquired outside the deferred extent. It backstops it NOT AT ALL — the
+      heartbeat re-arms the deadline every 15s wherever the lease was taken, so
+      such a lease renews itself until the process exits. This is the sentence
+      that made B1 sound survivable. Both now say so, and say what the TTL DOES
+      cover: a heartbeat that is alive but starved past four beats.
+   2. "every production CALL of PrepareLinkCycle" — now true by construction, and
+      the allowlist doc says why a call is the only form a key can bound.
+   3. "no thread touches UMEM after this returns" holds only on a SUCCESSFUL
+      join; a `stop_workers` error returns with workers possibly live. Fixed in
+      the numbered contract, at `docs/reth-mac.md:73`, and in the round-9
+      "true only for the instant it returned" correction, which repeated it.
+   4. `releaseLinkCycleLease` with no lease is NOT a no-op: the expiry CAS can
+      clear the word while leaving the heartbeat alive, and release stops and
+      JOINS it. It is idempotent in effect, which is a different claim.
+   5. FOUR writers touch the lease word, not three — `releaseLinkCycleLease`'s
+      `Store(0)` was omitted from the count while its outcome was listed in the
+      table three lines below.
+   6. A release placed after an early return would not "wait for the TTL": the
+      daemon's deferred abandon drops it at the end of the apply, and the TTL
+      could not have fired first anyway because the heartbeat keeps re-arming it.
+   7. The race test's "no goroutines" is false — the fresh-prepare injection
+      starts the heartbeat. Corrected, with what actually makes it deterministic.
+   8. The ATOMIC paragraph claimed cross-goroutine protection the code no longer
+      provides: `&&` short-circuits, so a non-owner returns before touching
+      `fired`. The measurement it cites was taken against the UNGATED round-11
+      closure. Rewritten to say the atomic is retained deliberately, not
+      load-bearing, and that `fakeLinkCycleClock`'s counter still is.
+   9. "none of this is reachable" at the production 15s beat is stronger than the
+      measurement: unlikely, not impossible.
+
+  NON-DEFECT, recorded so a later round does not re-open it. Codex traced the
+  lease lifecycle and found NO finite production path that leaves an acquired
+  lease unreleased: no helper means no acquisition; a `stop_workers` failure is
+  after acquisition and the wrapper's rollback `NotifyLinkCycle` releases before
+  its no-helper/rebind-error returns; post-join setDown/MAC-write failures take
+  the same rollback; a link-up failure reports `linkCycled=true` which arms the
+  final step-2.6b2 `NotifyLinkCycle`; rebind failures are after `NotifyLinkCycle`
+  already released; panics and later early returns are covered by the outer
+  `defer d.abandonLinkCycleLease()`. Release runs more than once on normal and
+  mixed-member paths, but retirement is state-idempotent, and `RenewLinkCycle`
+  observes the zero sentinel so no retired lease is resurrected.
+
+  VALIDATION: `go test ./...` green. Rust untouched. The 18 mutation cells above
+  are the discriminating evidence; the two grids are 10/10 and 8/8 MATCH.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-14
+- **Action**: #6871 round 13b — fold the hostile leg's two MINORs. MINOR-1 binds
+  the gate's reader (a constant reader was caught by nothing). MINOR-2 turned
+  out to be larger than the reported mislabel: the round-12 table is not
+  reproducible at head AT ANY SCOPE, because the tree it was measured on no
+  longer exists.
+
+  HEAD CERTIFICATION FIRST, because it decides whether a smoke is owed. Both
+  production files parsed with go/parser (comments dropped) and re-printed with
+  go/printer are byte-identical between a5e9ecd06 and this branch:
+  process_linkcycle.go sha256 9be501b6b07dce0f..., daemon_apply_dataplane.go
+  89608582ee50867a.... The round-13 B1 fix is entirely in the test file and in
+  comments, so the 14/14 smoke at 57d45d8ab still carries. No re-run owed.
+
+  MINOR-1 — the reader was unbound. Forced to return a CONSTANT, leaseSeamCaller
+  degenerates the gate to "every goroutine, from every call site, is the owner",
+  restoring the vacuity rounds 12 and 13 closed. Measured: with the constant
+  planted, `go test ./pkg/dataplane/userspace/ -skip
+  TestLeaseSeamCallerDistinguishes...` fails only three eventstream tests, and
+  the UNMUTATED control fails a SUPERSET of six of the same load-sensitive
+  eventstream tests — so the constant is invisible to the whole package, and the
+  three are load flakes rather than a plant effect. The new
+  TestLeaseSeamCallerDistinguishesGoroutinesAndCallSites_6871 catches it,
+  firing two assertions by name: the frame half reported in-flight from a plain
+  test function, and a second goroutine reported the same id (424242).
+
+  It binds both halves and both directions: id non-zero, id STABLE across two
+  reads on one goroutine, id DIFFERENT on a second goroutine, frame half FALSE
+  from a plain test function and TRUE from inside Manager.linkCycleInFlight, and
+  the id unchanged by call depth.
+
+  B2 DECISION, narrowed by the hostile leg's evidence and stated because the
+  lead asked for a reason if I deviated. Their measurement (100,000 goroutines,
+  0 reused ids, 0 parse failures; forcing a parse error reds all three cells
+  loudly) argues for the cheap prefix check over a per-manager seam, and I agree
+  — the seam would add a production field to serve a fixture, and it is not
+  built. But the prefix check does NOT address what B2 actually is. Goid reuse
+  and parse failure are about whether the reader IDENTIFIES the right goroutine;
+  the consumable one-shot is about the installing goroutine's own earlier read
+  through linkCycleLeaseDeadline, where identification is perfectly correct and
+  still wrong. So: prefix check YES, per-manager seam NO, and the frame gate as
+  well, because it is the only one of the three that closes the measured defect.
+
+  MINOR-2 — the reported fix was a scope relabel; the measurement says the
+  numbers are gone entirely. Round 12's table attributed its false greens to a
+  scope. They were a property of a TREE STATE: the round-11 fixture with the
+  four acquisitions in link_cycle_lease_6871_test.go unreleased. Round 12 closed
+  all four (each now pairs t.Cleanup(m.releaseLinkCycleLease) with its acquire,
+  and release stops AND JOINS the beat), so no heartbeat outlives its test.
+
+  Re-measured at head with the same instrument — gate OFF, 15s -> 200us beat, B1
+  reverted so both cells are obliged to fail — and counting non-owner arrivals at
+  the seam DIRECTLY rather than inferring them from outcomes, split into those
+  that can win the one-shot (before `fired`) and those that cannot:
+
+	scope                              false greens   pre-fire   post-fire
+	this file's tests, -count=100 ...   0/100  0/100      0        0 and 4
+	+ link_cycle_lease_6871_test.go .   0/100  0/100      0          10
+	whole package, -count=20 .......    0/12   0/12       0           0
+
+  The lead's and the hostile leg's DIRECTION is confirmed — arrivals scale with
+  scope and come from the leak-bearing file, 10 against 0. Their replacement
+  numbers (15/62, 12/62) are not, and neither are round 12's: at head not one
+  arrival landed before the one-shot had fired, so there is no false green to
+  attribute to any scope. Reported rather than quietly adopted, because a number
+  attributed to the wrong tree is exactly what this round is correcting.
+
+  The whole-package denominator is 12 rather than 20 because the run hit `go
+  test`'s 10-minute default timeout at iteration 12 — verified as a timeout
+  panic, not the off-goroutine t.Fatal panic round 12 attributed its own
+  truncation to.
+
+  This does NOT weaken the gate. What justifies it at head needs no thief:
+  self-consumption by the installing goroutine reproduces 100/100 (round 13 B2,
+  cell b1). The cross-goroutine steal is the case that no longer reproduces here,
+  and the gate retires a producer that returns the moment anyone adds an
+  unreleased acquire — which is the argument for gating rather than for chasing
+  releases.
+
+  NIT, answered rather than left: the lead called `if owner == 0 { t.Fatal }`
+  unfireable. Severing it is unfireable given a WORKING prefix parse, but the
+  check's real trigger is a header-format change, and cell b8 fires it — 20
+  iterations, every cell red at the t.Fatal. Kept.
+
+  HARNESS CORRECTION worth recording. The first scope run reported "0 of 0" for
+  two cells: /dev/shm was 100% full and both were build breaks. A zero
+  denominator reads exactly like a clean result. The harness now gates on
+  build-break markers BEFORE counting and refuses a zero denominator, and TMPDIR
+  moved to /var/tmp (still short enough for sun_path). The 18 B1/B2 cells were
+  re-checked and are unaffected: no space or build failure in any of their logs,
+  no nonzero BUILD_RC, no zero denominator.
+
+  VALIDATION: `go test ./...` re-run at this head. The package's known
+  load-sensitive eventstream/deadline tests flake under concurrent agent load
+  (six failures on an unmutated control run mid-round, zero on the quiescent
+  full-suite run).
+- **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 14 — make the lease guards judge a call's EXECUTION
+  EXTENT, not only its position; give the callback dependency a behavioural
+  binding
+
+  Round 13 established that a reference must be in CALLEE position to be filed
+  under an enclosing declaration. Codex's re-review showed position is not
+  containment: `callSitesOf` attributed every callee selector under a `FuncDecl`
+  to that declaration, function literals included, so two forms were green
+  against it. Both were measured against the round-13 guard at 419ef99a7, both
+  RC=0:
+
+    PLANT A  an acquisition inside a func literal assigned to a package-level
+             var and invoked from a function the apply never reaches
+    PLANT B  `go m.acquireLinkCycleLease()`
+    PLANT C  `hooks.acquireLinkCycleLease[0]()` substituted FOR the real
+             `m.acquireLinkCycleLease()` — both guards green with the manager
+             taking no lease at all (Codex B2, the IndexExpr unwrap plus the
+             name-only key)
+
+  A call's key now carries the form for every way of writing it the AST cannot
+  prove runs inside the enclosing declaration's extent — `[in a func literal]`,
+  `[started by a go statement]`. Ordinary flow, `defer`, and an immediately
+  invoked literal are contained and unmarked. `classifyRef` walks the real
+  ancestor chain (ast.Inspect push/pop) rather than two name-keyed passes.
+  Identity is the selector's full source text, not the method name.
+
+  THE AST CANNOT ESTABLISH TEMPORAL CONTAINMENT IN GENERAL, and the guard now
+  says so instead of implying otherwise. The daemon's own production site is a
+  marked one: the acquisition is written in the `beforeCycle` callback and is
+  covered only because `programRethMAC` invokes it synchronously. So every
+  marked site must name a behavioural test in `linkCycleUnprovenFormBindings`,
+  the guard scans the tree for that test, and a marked site with no binding, a
+  binding naming a test that does not exist, and a binding for a site no longer
+  allowlisted each fail.
+
+  `TestRethMACHookRunsOnTheCallersGoroutine_6871` is that proof for the daemon
+  site: the hook must run on the caller's goroutine, which puts it inside the
+  dynamic extent of the `programRethMAC` call. Deliberately stricter than
+  required — a spawn-and-join hook is contained and still fails it, because that
+  is a different containment argument and should be re-argued.
+
+  MEASURED (all `-count=1`, plants reverted after each):
+    round-13 guard  A,B,C -> RC=0, RC=0, RC=0
+    round-14 guard  A -> `[in a func literal]`; B -> `[started by a go
+                    statement]`; C -> escape + "no longer acquires the lease".
+                    In A and B the ordinary call one line away keeps satisfying
+                    the allowlist (the "no longer acquires" arm stays silent),
+                    and C shows that arm firing — so the failure is about the
+                    FORM, not about the name being present.
+    guard mutations D (drop the marker from both maps) -> RED naming the marker
+                    the scanner DERIVES from the production closure; D2 (same
+                    method name, different receiver text) -> RED; E (binding
+                    names a renamed-away test) -> RED; F (marked site, no
+                    binding) -> RED.
+    production mutations of programRethMAC's callback invocation: `go
+                    beforeCycle()` -> RED; spawn-and-JOIN -> RED naming both
+                    goroutine ids while EVERY other TestRethMAC test and both
+                    static guards stay green, which is the coverage the AST
+                    cannot supply.
+
+  CORRECTION recorded rather than glossed. Removing the `IndexExpr` unwrap is a
+  classification fix, not the thing that closes plant C: restoring the unwrap
+  alone leaves C RED, because `refKey`'s selector identity no longer lets it
+  reach the allowlisted key. Round 13 needed the unwrap AND the name-only key
+  together. Round 13's "over-inclusion is always fail-safe" is also corrected —
+  it holds for what a decoy ADDS, not for the allowlist's assertion that a
+  listed site still EXISTS, which any key-reproducing decoy defeated.
+
+  No executable production change: the two production files touched by the
+  measurement were reverted, and the committed diff is tests plus docs.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/daemon/reth_worker_join_order_5103_test.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-14
+- **Action**: #6871 round 15 — close two key/scope holes an independent hostile
+  review measured, and correct the renewal claim at both sites
+
+  F1 (BLOCKING). Round 14's key carried the selector's SOURCE TEXT, which fixed
+  round 13's name collision and INHERITED a different one: source text is not
+  unique either, and `calls` was a `map[string]bool`, so two distinct func
+  literals in one declaration calling the same selector merged into one entry.
+  Reproduced at aec8e7881: a second escaping `d.dp.Link().PrepareLinkCycle()`
+  literal in `programRethMACWithWorkerJoin` plus an invoker outside the apply
+  compiled with `go test ./...` RC=0.
+
+  Replacing a colliding key with another key moves the collision domain; it does
+  not remove it. So the container changed, not just the key: `calls` is now
+  `map[string][]string` (key -> every position), allowlist entries carry an
+  asserted `occurrences`, and a func literal is additionally LABELLED by what
+  the source binds it to (`[in a func literal beforeCycle]`), which is
+  per-occurrence and does not churn the way a file:line would. The label and the
+  count are independently load-bearing and each has a plant the other misses.
+
+  F2 (BLOCKING). `reth_hook_wired_5103_test.go` parsed ONE named file, so its
+  three "exactly one call site" counts answered a narrower question. A
+  `reassertRethMemberMACOnRGTransition` calling programRethMACWithWorkerJoin,
+  appended to daemon_reth.go, kept the suite green; the identical function in
+  the parsed file failed with "found 2". The consequence is the hazard the PR
+  exists for: the wrapper's success path returns without NotifyLinkCycle, so a
+  second caller acquires a self-renewing lease nothing releases. Now derives the
+  file set from the package directory. Package scope is COMPLETE here as an
+  argument, not a convenience: all three functions are unexported.
+
+  F3 (MEDIUM, runtime) — the premise is right, the prescribed refcount is NOT,
+  and this was settled by reading the loop boundaries rather than by assertion.
+  The lease does end at the FIRST NotifyLinkCycle, which in a mixed apply is an
+  aborted member's in-loop rollback, and the later renewals are no-ops off the 0
+  sentinel. But acquisitions and releases do not pair: acquire is per MEMBER,
+  release is per REPAIR — one per aborted member plus at most one for the whole
+  apply at step 2.6b2, which sits OUTSIDE the per-member loop
+  (daemon_apply_dataplane.go:341 vs the loop ending at :317). A two-member apply
+  where BOTH cycle takes two leases and issues one release, so a refcount would
+  leave the count at 1 on the most ordinary multi-member path and make the
+  deferred abandon log its "leaving with a lease still held" error on every such
+  commit. What makes the early release safe is that a rebind is helper-GLOBAL:
+  NotifyLinkCycle recreates every worker and re-enables ctrl, so the cycled
+  member's torn-down state is repaired too. Residual stated: a rollback whose
+  rebind FAILS has already released — the same trade already argued for the
+  single-member case, on a path where the commit fails anyway. Written into
+  process_linkcycle.go at the release and into docs/reth-mac.md as a section.
+
+  F4 (CLAIM). Both sites justified the unconditional renewals by an abort path
+  whose lease is already released. Corrected: renewing ungated is right because
+  no gate is needed, not because a gate would lose a case.
+
+  MEASURED, all -count=1. Round-14 guard vs the three new plants: RC=0, RC=0
+  (label-defeating variant), RC=0. Round-15: the differently-labelled literal
+  RED as a new site; the SAME-labelled literal RED only on the count, naming
+  both positions; the sibling-file caller RED as "in package daemon, found 2".
+  Round 14's own three plants stay RED (no regression).
+
+  NO EXECUTABLE PRODUCTION CHANGE: comment-stripped daemon_apply_dataplane.go
+  and process_linkcycle.go hash identically to HEAD, so the 14/14 cluster smoke
+  at aec8e7881 still certifies this binary.
+
+  HARNESS CORRECTION worth recording: the plant script reverts with `git
+  checkout --`, which silently discarded an uncommitted production comment edit
+  mid-matrix and left a plant in the tree. Production edits are now committed
+  BEFORE any plant runs, so the revert restores them instead of erasing them.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/daemon/reth_hook_wired_5103_test.go, pkg/daemon/daemon_apply_dataplane.go,
+  pkg/dataplane/userspace/process_linkcycle.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-14
+- **Action**: #6871 round 16 — stop collapsing the MARKER list, reject an
+  unreachable decoy, and make the behavioural-proof binding require a test that
+  actually runs
+
+  Codex reviewed aec8e7881 (round 14) and found a nested-literal escape:
+
+	beforeCycle := func() error {
+	    prepare := func() { _ = d.dp.Link().PrepareLinkCycle() }
+	    go prepare()
+	    return nil
+	}
+
+  MEASURED AT 3557017da FIRST, because the finding was raised against the
+  PREVIOUS head. That exact plant is already RED at round 15: the labels round
+  15 added render the two nesting levels as different marker texts, so the
+  dedup no longer collapses them. Codex's finding is real for round 14 and was
+  closed by round 15 as a side effect rather than on purpose.
+
+  The residual it left is the shadowed spelling, and that one WAS green:
+
+	beforeCycle := func() error {
+	    beforeCycle := func() { _ = d.dp.Link().PrepareLinkCycle() }
+	    go beforeCycle()
+	    return nil
+	}
+
+  Same marker text at both levels -> deduplicated to one -> key byte-identical
+  to the allowlisted single-level one. This is the round-15 defect in a
+  different container: a list of boundaries that collapses equal entries
+  destroys nesting DEPTH exactly as map[string]bool destroyed multiplicity. The
+  dedup is gone; marks is now every boundary in order.
+
+  Also measured, from the lead's supplement: the removed-direction decoy closes
+  only PARTLY under multiplicity. A decoy in a DIFFERENT literal is caught by
+  the label (RED). A decoy in the SAME literal behind `if false`, with the real
+  call deleted, keeps both the key and the count and was GREEN. Added a third
+  marker, `[under a constant-false if]`. General reachability stays
+  undecidable; what bounds THAT residual is the daemon's own suite, since an
+  acquisition that stops happening changes observable behaviour.
+
+  Codex's binding-check finding confirmed live at round 15 and FIXED rather
+  than recorded as a philosophical limit: the check was "a receiverless
+  declaration with this name exists", which a `//go:build never` dummy and a
+  non-test function both satisfy — both measured GREEN. It now asks go/build
+  whether the file is in the current build context and requires a
+  `func TestXxx(*testing.T)` signature. Note the deliberate asymmetry with
+  callSitesOf, which does NOT consult build constraints: for an acquisition
+  SITE, a false build tag must not hide it; for a PROOF, being excluded from
+  the build is disqualifying. The one honest residual is that nothing judges
+  whether the named test proves what the entry claims.
+
+  F3 preconditions written down as the lead asked: >=2 RETH members, member A's
+  live set refused and its cycle completing, a LATER member B's live set
+  refused and B failing after the join, and B's rollback rebind failing. Steps
+  2-3 are ordered by Go map range, so it is nondeterministic across runs. Not a
+  regression against master (master had no lease at all).
+
+  MEASURED, all -count=1. Round 15 vs the six new plants: N1 RED, N2 GREEN, R1
+  RED, R2 GREEN, B1 GREEN, B2 GREEN. Round 16: all six RED, each with a
+  distinct message. Regression sweep: round-14 A/B/C and round-15 F1/F1B/F1C
+  all still RED; guard mutations D/D2/E/F all still RED; clean head green.
+
+  NO EXECUTABLE PRODUCTION CHANGE in this round either — the only non-test file
+  touched is docs/reth-mac.md.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  docs/reth-mac.md, _Log.md
 - **Timestamp**: 2026-08-20T19:40Z
 - **Action**: #6858 round 2 — folded the first-ever gate on `show class-of-service
   rewrite-rule` (two blocking, one major, three survivors, three fictional
