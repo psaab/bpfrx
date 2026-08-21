@@ -1997,8 +1997,62 @@ system {
 | workers | 1 | Number of AF_XDP worker threads |
 | ring-entries | 1024 | RX/TX/fill/completion ring size per binding |
 | binary | — | Path to Rust binary |
-| control-socket | — | Unix socket for control protocol |
+| control-socket | — | Unix socket for control protocol (typed leaf: absolute, no `.`/`..` component, ≤107 octets — see below) |
 | state-file | — | JSON state persistence path |
+
+### Socket path handling (#5273, #5839)
+
+`control-socket` is operator-supplied and xpfd runs as root, so both helper
+sockets are treated as untrusted paths at every bring-up.
+
+**Commit check.** `control-socket` is a typed leaf
+(`ValueUnixSocketPath` / `ValidateUnixSocketPath`, `pkg/config`): it must be an
+absolute path with no `.`, `..`, or empty component, and must fit the 107-octet
+AF_UNIX `sun_path` limit. This is a STRICT-commit gate only — the tolerant
+load / peer-sync path warns and boots on a stale value (#1960), so the runtime
+never relies on it.
+
+**Runtime.** `removeStaleUnixSocket` (`pkg/dataplane/userspace/stale_socket.go`)
+is the single implementation of stale-socket removal for BOTH the control socket
+and the event socket. Before it unlinks anything it:
+
+1. `Lstat`s the path, tolerating "does not exist" (the normal first boot) and
+   judging a symlink on its own inode rather than following it;
+2. refuses any path that is not a Unix socket — a regular file, directory,
+   FIFO, device, or symlink is preserved, not deleted;
+3. refuses a socket the kernel Unix socket table still lists, i.e. one a LIVE
+   listener holds. Unlinking a live socket does not stop that listener; it makes
+   it unreachable (including to the #1993 boot armed-probe) while a second
+   helper binds a fresh socket at the same name and then fails to claim the
+   AF_XDP queues. An unreadable `/proc/net/unix` is inconclusive and fails
+   closed. The probe is non-invasive by design: DIALING the event socket would
+   make the daemon accept the probe as its new helper and drop the real one;
+4. surfaces an `os.Remove` failure instead of discarding it.
+
+**Known residual (#7139).** Those checks judge a path STRING, and the unlink is
+a separate syscall on that same string. A live socket reached through a
+different spelling of the same file — most plausibly a symlinked parent
+directory — is not matched in `/proc/net/unix` and so reads as stale, and the
+target or its parent can be swapped between the check and the unlink. Closing
+either needs the trusted-directory rework (`openat2` with `RESOLVE_BENEATH`, or
+an inode-keyed liveness decision) that #7139 tracks. The typed `control-socket`
+leaf removes the spelling most likely to be written by hand (a `.`/`..`
+component) from any strict commit, but does not close the alias.
+
+`EventStream.Start` additionally holds a sidecar `flock` across the call, which
+serializes daemon-side owners of the socket it binds. The control socket has no
+such lock because xpfd does not bind it — the Rust helper does
+(`remove_stale_socket` in `userspace-dp/src/server/lifecycle.rs`), and it does
+not participate in the flock protocol.
+
+**Ordering.** `ensureProcessLocked` stops generation N before it prepares
+generation N+1, so `preflightHelperPaths` runs the DETERMINISTIC path checks —
+control/event/state must name distinct paths, and neither socket path may
+already exist as a non-socket — BEFORE the running helper is torn down. A
+config that could never bring up a new generation therefore leaves the previous
+one, and its forwarding, running. The liveness check is deliberately NOT
+hoisted: the control socket is live precisely until the helper holding it is
+stopped.
 
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)
