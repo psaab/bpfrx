@@ -810,6 +810,46 @@ lands, only the first configured WG listen port is steered, so a second
 tunnel on a different port will not receive inbound transport packets.
 Design of record: `docs/research/1434-multi-tunnel-wireguard/plan.md`.
 
+**The limitation is now SURFACED AT COMMIT.** It used to be silent: a
+config declaring two WireGuard tunnels on distinct listen ports committed
+clean and the second tunnel was simply, permanently dead with no operator
+signal at all. `validateWireguardSingleSteeredPort`
+(`pkg/config/compiler_validate_wireguard_multiport.go`, run from
+`runTailGates`) now emits a commit **warning** whenever the configuration
+resolves to more than one distinct WireGuard listen port. The warning names
+the port that WILL be programmed (with its tunnel ref) and every port that
+will NOT be, e.g.:
+
+```
+wireguard: 2 distinct listen-ports are configured, but the dataplane steers
+inbound WireGuard transport for only ONE of them. listen-port 51820 (wg0) IS
+steered and works. listen-port 51900 (wg1) is NOT steered - no inbound
+WireGuard transport reaches that tunnel, so no handshake ever completes and
+no return traffic arrives: dead while appearing configured. Only one
+WireGuard listen-port can receive inbound transport until multi-port steering
+lands (#1434 Increment 2, deferred); remove or re-point the unsteered
+tunnel(s) rather than leaving them silently down.
+```
+
+It is a WARNING, never a reject — the config is legal, its first tunnel
+works exactly as authored, and rejecting would change commit acceptance for
+configs that commit clean at every released version. The steered port is
+derived from `config.EmitTunnelEndpointNames`, the same SSOT emitter
+`buildTunnelEndpointSnapshots` drives, so the port the warning names is the
+port `snapshotWgListenPort` packs into the shim ctrl block; two WG tunnels
+that SHARE one listen port lose nothing to the steering scalar and draw no
+warning. This removes the silence only — the dataplane behaviour, the shim,
+and the ABI are unchanged, and #1434 stays open for Increment 2.
+
+Fail-on-revert guards: `TestWireGuardDistinctListenPortsWarnsAtCommit_1434`,
+`TestWireGuardSingleListenPortDoesNotWarn_1434`,
+`TestWireGuardSameListenPortDoesNotWarn_1434`,
+`TestWireGuardThreeListenPortsWarnsOnce_1434` (`pkg/config`), and the
+cross-package parity binding
+`TestWireGuardSteeringAdvisoryNamesTheProgrammedPort_1434`
+(`pkg/dataplane/userspace`), which requires the port the warning names to
+equal the port `snapshotWgListenPort` actually programs.
+
 ## Host-inbound admission of the WG listen port (#5582)
 
 The shim steers local-destination UDP on the configured WG listen port to
@@ -864,10 +904,11 @@ hook (`emitHostInboundWireGuardAccept`). Rationale:
 port (the compile-time SSOT), which is also what the shim packs into the
 ctrl block, so kernel filter and shim steering agree. The shim's
 single-port WG-RX steering (S2a) only steers the FIRST configured port
-today (see "Multi-tunnel status" above); the host-inbound filter admits
-ALL configured WG ports, so a second-tunnel rule is currently a no-op at
-the kernel (nothing steers that port up) but is correct-in-intent and
-ready for the deferred multi-tunnel steering (#1434 Increment 2).
+today (see "Multi-tunnel status" above, where that limitation is now
+warned about at commit); the host-inbound filter admits ALL configured WG
+ports, so a second-tunnel rule is currently a no-op at the kernel (nothing
+steers that port up) but is correct-in-intent and ready for the deferred
+multi-tunnel steering (#1434 Increment 2).
 
 Fail-on-revert guards: `TestHostInboundFilterAdmitsWireGuardListenPort`
 and `TestHostInboundFilterWireGuardPayloadParses` (`pkg/daemon`),

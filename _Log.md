@@ -97240,3 +97240,43 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cluster/sync_conn_sweep.go,
   pkg/cluster/sync_cold_prime_late_runtime_82_test.go,
   pkg/daemon/daemon_ha_sync.go, docs/session-sync-architecture.md, _Log.md
+## #1434 — surface the single-steered-WireGuard-port limitation at commit
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added a commit-time WARNING for a config that resolves to more
+  than one distinct WireGuard listen port. The AF_XDP shim's WG-RX steering
+  gate is a single scalar (`UserspaceCtrl.wg_listen_port`, compared in
+  `wg_steer_to_kernel`), fed by `snapshotWgListenPort`, which returns the FIRST
+  configured WireGuard endpoint's port. Two WG tunnels on distinct ports
+  therefore committed clean while the second tunnel received no inbound
+  transport at all — permanently, silently down. The new gate
+  `validateWireguardSingleSteeredPort` names the port that WILL be programmed
+  (with its tunnel ref) and every port that will NOT be.
+
+  Deliberately a warning, not a reject: the config is legal, the first tunnel
+  works exactly as authored, and rejecting would change commit acceptance for
+  configs that commit clean at every released version. It also leaves the
+  premise of `TestWireGuardListenPorts_5582` intact (that test compiles a
+  two-distinct-port config and asserts the port SET) — verified still green.
+
+  No dataplane behaviour change: `userspace-xdp/` untouched, no ABI bump, no
+  multi-port support. #1434 stays open for Increment 2 (the verifier-gated,
+  lab-gated shim change); this removes only the silence.
+
+  The steered port is derived from `config.EmitTunnelEndpointNames`, the same
+  SSOT emitter `buildTunnelEndpointSnapshots` drives, and a cross-package
+  parity test requires the port the warning names to equal what
+  `snapshotWgListenPort` actually programs — so the advisory cannot become a
+  confident lie if either order is ever changed.
+
+  Mutation-checked three ways, exit codes read from `$?`, never through a pipe:
+  (1) delete the `runTailGates` emission -> `pkg/config` rc=1, `pkg/dataplane/
+  userspace` rc=1; (2) pick `refs[len(refs)-1]` as the winner -> rc=1/rc=1;
+  (3) invert the emitter order so the WRONG port is named -> rc=1/rc=1, with
+  the parity test reporting "advisory claims listen-port 51900 is steered, but
+  the dataplane programs 51820".
+- **File(s)**: pkg/config/compiler_validate_wireguard_multiport.go,
+  pkg/config/compiler_tailgates.go,
+  pkg/config/wireguard_multiport_warning_1434_test.go,
+  pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
+  docs/wireguard-interop.md, _Log.md
