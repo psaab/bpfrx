@@ -374,6 +374,33 @@ func (m *Manager) blindFailClosedUserspaceCtrlLocked(
 	)
 }
 
+// ctrlMustStayDisabledLocked reports whether the ctrl gate must be held at 0
+// even though the helper reports Enabled. It is the exact condition that used to
+// be inline in applyHelperStatusLocked's ctrl branch; the reasoning for each
+// disjunct lives at that branch.
+//
+// #6871 (round 9, F4): extracted so the clause is REACHABLE without privileges.
+// applyHelperStatusLocked opens by resolving userspace_ctrl and userspace_bindings
+// off the shim and returns "userspace_ctrl map not loaded" when either is absent,
+// so every unprivileged test stops at line one and the clause behind it is bound
+// by nothing CI runs — deleting `|| m.linkCycleInFlight()` left BOTH
+// pkg/dataplane/userspace and pkg/daemon fully green. The three cells that do
+// cover it need real BPF maps and SKIP unprivileged, and Go reports a parent as
+// PASS when every subtest skipped.
+//
+// SCOPE OF THE REMEDY, stated rather than implied. This binds the PREDICATE, not
+// the call site: a change that stopped calling it, or inlined a different
+// condition, would not be caught here. The full remedy is to route
+// applyHelperStatusLocked's map handles through an interface the way
+// ctrlMapForDisableLocked does (process_linkcycle.go), and that is a wide change
+// — the two handles are threaded through failClosedUserspaceCtrlLocked,
+// clearStaleBindingRowsLocked and ~15 other call sites inside a 481-line function
+// on the fail-closed path — so it is deliberately NOT bundled into this round.
+// What this buys is the difference between "unbound" and "bound one level in".
+func (m *Manager) ctrlMustStayDisabledLocked(statusEnabled bool) bool {
+	return statusEnabled && (m.rgTransitionInFlight.Load() || m.linkCycleInFlight())
+}
+
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
@@ -412,11 +439,26 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if status.Enabled && m.rgTransitionInFlight.Load() {
-		// One or more RG transitions are in progress and the helper hasn't
-		// acked the HA state update yet. Keep ctrl disabled until
-		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
+	if m.ctrlMustStayDisabledLocked(status.Enabled) {
+		// rgTransitionInFlight: one or more RG transitions are in progress and
+		// the helper hasn't acked the HA state update yet. Keep ctrl disabled
+		// until syncHAStateLocked succeeds to avoid re-enabling ctrl during the
 		// handoff (#279, #284).
+		//
+		// linkCycleInFlight (#6871): a RETH MAC link cycle has joined the
+		// workers and is taking the NIC down, so the XSK sockets this gate
+		// steers into are dead or about to be. The status tick is gated on the
+		// same lease and skips its whole body, but this is not only the tick's
+		// path: UpdateRGActive ends in applyHelperStatusLocked too, and it is
+		// driven by VRRP/cluster events and by reconcileRGStateLoop's 2s pass
+		// (daemon_ha.go, which also wakes early on dropped-event
+		// notifications), NEITHER of which is serialized on the daemon's
+		// applySem — so it can land in
+		// the middle of a cycle and re-enable ctrl on its own. Gating at the
+		// write is what makes the lease cover the producer rather than one
+		// caller of it. NotifyLinkCycle releases the lease at the top of its
+		// critical section, so its own post-rebind status apply is NOT gated
+		// here and a completed cycle re-enables ctrl on that call.
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
