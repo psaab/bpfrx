@@ -377,7 +377,7 @@ impl CookieChecker {
     /// sticky grace: crossing the threshold arms the under-load state for
     /// [`UNDER_LOAD_GRACE_NS`].
     pub(crate) fn note_initiation(&self, now_ns: u64) -> bool {
-        let mut s = self.load.lock().unwrap();
+        let mut s = self.load.lock().unwrap_or_else(|e| e.into_inner());
         let new_window = match s.window_start_ns {
             None => true,
             Some(start) => now_ns.saturating_sub(start) >= UNDER_LOAD_WINDOW_NS,
@@ -397,7 +397,7 @@ impl CookieChecker {
     /// True iff a cookie reply may still be emitted in the current window
     /// (and reserves one slot). Fixed-window budget mirroring the load gate.
     pub(crate) fn reply_budget_available(&self, now_ns: u64) -> bool {
-        let mut b = self.budget.lock().unwrap();
+        let mut b = self.budget.lock().unwrap_or_else(|e| e.into_inner());
         let new_window = match b.window_start_ns {
             None => true,
             Some(start) => now_ns.saturating_sub(start) >= UNDER_LOAD_WINDOW_NS,
@@ -434,7 +434,7 @@ impl CookieChecker {
     /// cannot be replayed into an over-credit to the ceiling on the next forward
     /// step — the exact weakening that guard prevents.
     pub(crate) fn source_reply_allowed(&self, src_ip: IpAddr, now_ns: u64) -> bool {
-        let mut t = self.per_source.lock().unwrap();
+        let mut t = self.per_source.lock().unwrap_or_else(|e| e.into_inner());
 
         // Periodic GC — at most once per interval — drops buckets idle for a
         // full GC interval, so a transient spoofed-IP burst does not keep the
@@ -492,7 +492,7 @@ impl CookieChecker {
     /// keeps the existing secure secret rather than rotating to a
     /// predictable one if getrandom fails mid-flight.
     fn secrets(&self, now_ns: u64) -> Option<([u8; 32], Option<[u8; 32]>)> {
-        let mut s = self.secret.lock().unwrap();
+        let mut s = self.secret.lock().unwrap_or_else(|e| e.into_inner());
         if !s.secure {
             // Lazy re-acquire — getrandom may have been transiently
             // unavailable at construction. NEVER seed from a weak source.
