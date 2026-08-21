@@ -70,7 +70,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	rethMACPending := false
 	deferWorkersActive := false
 	var clearDeferWorkers func()
-	if d.cluster != nil && cfg.Chassis.Cluster != nil && d.dp != nil {
+	if d.cluster != nil && cfg.Chassis.Cluster != nil && d.dataplane() != nil {
 		cc := cfg.Chassis.Cluster
 		for rethName, physName := range cfg.RethToPhysical() {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -115,7 +115,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// that removes or edits a policy never republishes the stale
 	// entries; the same filtered view feeds the FRR render in step 3.
 	commitOverlay = d.commitOverlayForConfig(cfg)
-	if setter, ok := d.dp.(routeOverlaySetter); ok {
+	if setter, ok := d.dataplane().(routeOverlaySetter); ok {
 		setter.SetRouteOverlay(commitOverlay)
 	}
 
@@ -139,7 +139,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// feed prefixes (the never-enforced gap #2049 closes). The overlay is
 	// joined against the INCOMING config's bindings so a commit that removes
 	// a binding stops enforcing its feed. Mirrors SetRouteOverlay above.
-	if setter, ok := d.dp.(feedSnapshotSetter); ok {
+	if setter, ok := d.dataplane().(feedSnapshotSetter); ok {
 		setter.SetFeedSnapshots(d.feedSnapshotsForConfig(cfg))
 	}
 
@@ -147,7 +147,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// sync push). The fabric-IPVLAN / VRF / tunnel / bond netlink reconciles
 	// above are idempotent and have each run to completion, so bailing here
 	// leaves a consistent kernel state with the dataplane untouched. Once
-	// d.dp.ApplyConfig and the RETH MAC / VIP / worker-rebind sequence that
+	// the dataplane ApplyConfig and the RETH MAC / VIP / worker-rebind sequence that
 	// follows it begin, they run as one unit (no mid-sequence abort) — the
 	// next boundary is before the FRR reload.
 	if err := ctx.Err(); err != nil {
@@ -156,15 +156,15 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 
 	// 2. Apply dataplane config through the runtime config sink.
 	var applyResult *dataplane.ApplyResult
-	if d.dp != nil {
+	if rt := d.dataplane(); rt != nil {
 		var err error
-		if applyResult, err = d.dp.ApplyConfig(context.Background(), cfg); err != nil {
+		if applyResult, err = rt.ApplyConfig(context.Background(), cfg); err != nil {
 			d.recordCompileFailure(err)
 			if compileErrorMustAbortApply(err) {
 				return commitOverlay, networkdErr, nil, err
 			}
 			// #5679: an ORDINARY (non-abort-class) full-apply failure does
-			// NOT disarm the dataplane — d.dp.ApplyConfig leaves the OLD
+			// NOT disarm the dataplane — the dataplane ApplyConfig leaves the OLD
 			// compiled policy live and forwarding while store.Commit has
 			// already promoted+persisted the NEW config. Left unhandled the
 			// commit reported SUCCESS against stale enforcement (a tightening
@@ -328,7 +328,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// or rethMACPending=true). Calling NotifyLinkCycle without a prior
 	// PrepareLinkCycle causes a spurious rebind that gets EBUSY on mlx5
 	// zero-copy queues because the first bind is still in progress.
-	if d.dp != nil && needLinkCycleRecovery {
+	if rt := d.dataplane(); rt != nil && needLinkCycleRecovery {
 		// Actual link DOWN/UP occurred — old XSK sockets are dead.
 		// Rebind to create fresh sockets on the reinitialized queues.
 		//
@@ -338,7 +338,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		// the node forwarding nothing, and reporting the commit successful over
 		// it is a silent total outage. Same errRethPrepareLinkCycle class as a
 		// failed join — the observable state is identical.
-		if err := d.dp.Link().NotifyLinkCycle(); err != nil {
+		if err := rt.Link().NotifyLinkCycle(); err != nil {
 			slog.Error("failed to rebind AF_XDP sockets after the RETH MAC link cycle; "+
 				"workers stay stopped", "err", err)
 			networkdErr = errors.Join(networkdErr,
@@ -347,7 +347,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		if d.ra != nil {
 			d.ra.ResendBurst()
 		}
-	} else if d.dp != nil && rethMACPending && !needLinkCycleRecovery {
+	} else if rt != nil && rethMACPending && !needLinkCycleRecovery {
 		// MAC set live (no link cycle) but workers were deferred.
 		// Trigger a re-apply to start workers with the now-correct MAC.
 		// This is cheaper than NotifyLinkCycle (no stop_workers/rebind).
@@ -500,10 +500,11 @@ func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
 // a no-op, and it can never become a way to suppress the 1 Hz reconcile with
 // nothing obliged to release it.
 func (d *Daemon) renewLinkCycleLease() {
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		return
 	}
-	d.dp.Link().RenewLinkCycle()
+	rt.Link().RenewLinkCycle()
 }
 
 // abandonLinkCycleLease drops a link-cycle lease the apply is leaving behind. It
@@ -518,10 +519,11 @@ func (d *Daemon) renewLinkCycleLease() {
 // lease resumes the 1 Hz reconcile but does NOT rebind — the reconcile has to
 // re-arm the workers itself, which is exactly master's pre-#6871 behaviour.
 func (d *Daemon) abandonLinkCycleLease() {
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		return
 	}
-	if d.dp.Link().AbandonLinkCycle() {
+	if rt.Link().AbandonLinkCycle() {
 		slog.Error("userspace: the config apply is leaving with a RETH link-cycle lease " +
 			"still held; dropping it so the reconcile loop resumes. The AF_XDP workers " +
 			"may still be joined and ctrl disabled — the 1 Hz reconcile is now what has " +
@@ -737,15 +739,25 @@ func (d *Daemon) reconcileAfterRethLinkCycle(cfg *config.Config, needLinkCycleRe
 func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAddr) (linkCycled bool, commitErr error) {
 	// joinRan, not joinFailed: set AFTER the nil-dataplane guard, so it means
 	// exactly "the hook ran, and the dataplane may be half torn down". A nil
-	// d.dp leaves it false, which keeps the d.dp.Link() deref below unreachable.
+	// dataplane leaves it false, which keeps the joined.Link() deref below
+	// unreachable.
+	//
+	// #6743: the dataplane is read through d.dataplane() (the atomic cell), not
+	// a plain field, so a bootstrap-exit publish can swap or clear it between
+	// the join and the rollback below. joined pins the EXACT instance whose
+	// workers this hook stopped, so the rollback rebinds the dataplane it
+	// actually tore down rather than whichever one is published later.
 	joinRan := false
+	var joined dataplane.RuntimeDataPlane
 	beforeCycle := func() error {
-		if d.dp == nil {
+		rt := d.dataplane()
+		if rt == nil {
 			return nil
 		}
+		joined = rt
 		joinRan = true
 		slog.Info("userspace: stopping workers before RETH MAC link cycle", "iface", ifName)
-		return d.dp.Link().PrepareLinkCycle()
+		return rt.Link().PrepareLinkCycle()
 	}
 	linkCycled, err := programRethMAC(ifName, mac, beforeCycle)
 	if err != nil {
@@ -847,7 +859,7 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 	// The commit already fails on this branch either way; the rollback error is
 	// JOINED onto the abort cause rather than replacing it, because the abort is
 	// the more actionable of the two and must not be lost.
-	if rebindErr := d.dp.Link().NotifyLinkCycle(); rebindErr != nil {
+	if rebindErr := joined.Link().NotifyLinkCycle(); rebindErr != nil {
 		slog.Error("userspace: the RETH MAC rollback rebind ALSO failed; this node's "+
 			"AF_XDP workers are stopped with nothing left to re-arm them",
 			"iface", ifName, "err", rebindErr)
@@ -858,15 +870,16 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 }
 
 func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		return
 	}
 	type deferSetter interface{ SetDeferWorkers(bool) }
-	if setter, ok := d.dp.(deferSetter); ok {
+	if setter, ok := rt.(deferSetter); ok {
 		setter.SetDeferWorkers(deferWorkers)
 		return
 	}
-	d.dp.Link().SetDeferWorkers(deferWorkers)
+	rt.Link().SetDeferWorkers(deferWorkers)
 }
 
 // reapplyAfterDeferredMAC runs the MANDATORY dataplane re-apply that arms the
@@ -885,10 +898,11 @@ func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {
 // publish until the workers bind, self-healing a transient helper /
 // control-socket error.
 func (d *Daemon) reapplyAfterDeferredMAC(cfg *config.Config) {
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		return
 	}
-	if _, err := d.dp.ApplyConfig(context.Background(), cfg); err != nil {
+	if _, err := rt.ApplyConfig(context.Background(), cfg); err != nil {
 		slog.Warn("failed to re-apply after deferred MAC; recording worker-arm debt for retry",
 			"err", err)
 		d.recordDataplaneWorkerArmDebt()
@@ -897,18 +911,19 @@ func (d *Daemon) reapplyAfterDeferredMAC(cfg *config.Config) {
 
 // recordDataplaneWorkerArmDebt records the #5134 deferred-MAC worker-arm debt on
 // the dataplane so status reconciliation retries the DeferWorkers=false publish.
-// Mirrors setDataplaneDeferWorkers: assert the recorder directly on d.dp, else
-// reach it through the link controller.
+// Mirrors setDataplaneDeferWorkers: assert the recorder directly on the
+// dataplane, else reach it through the link controller.
 func (d *Daemon) recordDataplaneWorkerArmDebt() {
-	if d.dp == nil {
+	rt := d.dataplane()
+	if rt == nil {
 		return
 	}
 	type debtRecorder interface{ RecordDeferredWorkerArmDebt() }
-	if r, ok := d.dp.(debtRecorder); ok {
+	if r, ok := rt.(debtRecorder); ok {
 		r.RecordDeferredWorkerArmDebt()
 		return
 	}
-	if r, ok := d.dp.Link().(debtRecorder); ok {
+	if r, ok := rt.Link().(debtRecorder); ok {
 		r.RecordDeferredWorkerArmDebt()
 	}
 }

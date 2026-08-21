@@ -44,7 +44,7 @@ import (
 // renewal is NOT conditional on this member cycling: the member that keeps the
 // lease alive for the loop's tail is precisely the one that did nothing.
 //
-// RED-on-revert: delete the `d.dp.Link().RenewLinkCycle()` call from
+// RED-on-revert: delete the `rt.Link().RenewLinkCycle()` call from
 // programRethMemberMAC and every subtest fails at "did not renew the link-cycle
 // lease".
 func TestRethMemberMACRenewsTheLinkCycleLease_6871(t *testing.T) {
@@ -108,7 +108,7 @@ func TestRethMemberMACRenewsTheLinkCycleLease_6871(t *testing.T) {
 func TestRethMemberMACSkipsRenewWithNoDataplane_6871(t *testing.T) {
 	var events []string
 	withRethOps(t, newRecordingRethOps(t, &events, curMAC5103, true))
-	d := &Daemon{} // d.dp is nil
+	d := &Daemon{} // no dataplane published (#6743 cell empty)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -125,7 +125,7 @@ func TestRethMemberMACSkipsRenewWithNoDataplane_6871(t *testing.T) {
 	}
 	// The link really was cycled — the hook is a no-op with no dataplane, but
 	// programRethMAC still takes its DOWN/set/UP fallback — so the recovery gate
-	// must report that honestly. Step 2.6b2 is separately gated on d.dp != nil,
+	// must report that honestly. Step 2.6b2 is separately gated on a published dataplane,
 	// which is what keeps an armed gate from dereferencing a nil dataplane.
 	if !needRecovery {
 		t.Error("the link WAS cycled, so the recovery gate must be armed; suppressing it " +
@@ -247,12 +247,12 @@ func TestReconcileAfterRethLinkCycleRenewsTheLease_6871(t *testing.T) {
 // TestRethLeaseRenewalIsNilDataplaneSafe_6871 is the over-reach guard shared by
 // both new call sites: they route through Daemon.renewLinkCycleLease, whose nil
 // check is the only thing standing between a daemon with no dataplane wired and
-// a panic on d.dp.Link().
+// a panic on rt.Link().
 //
 // It stays GREEN under either revert above (no call, no panic either way).
 func TestRethLeaseRenewalIsNilDataplaneSafe_6871(t *testing.T) {
 	stubRethTailCommand(t, nil)
-	d := &Daemon{} // d.dp is nil
+	d := &Daemon{} // no dataplane published (#6743 cell empty)
 
 	defer func() {
 		if r := recover(); r != nil {

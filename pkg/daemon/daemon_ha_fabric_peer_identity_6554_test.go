@@ -150,8 +150,8 @@ func fabPeerTestDaemon(t *testing.T, parentV6 []netlink.Neigh) (*Daemon, *fabric
 			// fallback exists to recover from.
 			return nil, nil
 		},
-		dp: &fabricProgramDP{ha: rec},
 	}
+	d.setDataplane(&fabricProgramDP{ha: rec}) // #2114: publish through the cell
 	return d, rec
 }
 

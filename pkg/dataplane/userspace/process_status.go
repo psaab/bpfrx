@@ -89,7 +89,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// branch, which ALWAYS mutated the classifier maps in place first. So a
 	// failed disarm here must also drive ctrl to 0 rather than leave the shim
 	// running maps a generation ahead of the applied snapshot.
-	if err := m.ensureRequiredSnapshotProtocolLocked(publishSnap.Config); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(&publishSnap); err != nil {
 		return m.disarmSnapshotProtocolFailClosedLocked(&publishSnap, err, true)
 	}
 	// #2124: this is the XSK-startup deferred same-plan publish path, which

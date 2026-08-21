@@ -40,7 +40,7 @@ var errRollbackRebind = errors.New("rebind: helper control socket closed")
 // does not know. Escalating anyway is correct — that unknown is the reason — but
 // the sentence must not claim the join happened.
 //
-// RED-on-revert: restore `d.dp.Link().NotifyLinkCycle()` as a bare statement
+// RED-on-revert: restore `joined.Link().NotifyLinkCycle()` as a bare statement
 // (discarding the error) and this fails at "the rollback's own failure never
 // reached the commit".
 func TestRethRollbackRebindFailureReachesTheCommit_6871(t *testing.T) {

@@ -1630,11 +1630,61 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	seen := make(map[uint32]bool)
 	out := make([]uint32, 0)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
+			// #6691 round 8: the parent netdev is one a DIFFERENT row has
+			// already been refused a binding for on device grounds — an xfrmi
+			// under `bind-interface st10` with a zoned sibling unit is the
+			// reachable case. Appending its ifindex here re-admits exactly the
+			// netdev the predicate just excluded, and measured at head it did:
+			// the set came back [10 11] with 11 the live xfrmi.
+			//
+			// WHICH ROWS THE REFUSED PARENT ACTUALLY DISQUALIFIES (#6691 round
+			// 9). Round 8 dropped the WHOLE ROW here and justified it with "for
+			// a VLAN child the parent IS the bind target". True — but this
+			// branch is entered on `ParentIfindex > 0`, which is every UNIT
+			// row, not every VLAN row. A plain unit (`st10 unit 5` with no
+			// vlan-id) merely CARRIES a parent ifindex; its bind target is its
+			// OWN netdev, so a refused parent says nothing about it.
+			//
+			// Measured before this round with secure `st10` at ifindex 11 and an
+			// ordinary live `st10.5` at 12: Go ingress came back [10] — 12
+			// missing — while the RSS allowlist named `st10.5` and the Rust
+			// planner made it a candidate. That is the ingress/plan split in
+			// the OTHER direction from the one round 8 fixed: a netdev with a
+			// binding but no ingress entry takes cpumap_or_pass and leaves the
+			// adjudicated path.
+			//
+			// So the parent key is always suppressed, and the row survives iff
+			// it binds its own netdev. For a VLAN child (bind target == the
+			// parent) the whole row still goes, which is what keeps an ifindex
+			// out of the ingress map with no READY binding —
+			// drop_degraded_transit (BINDING_MISSING) — the invariant round 8
+			// was holding up and this preserves.
+			// BOTH KEYS (#6691 round 16, refusesNetdev): the parent's refusal
+			// can hold on the NAME alone — the parent's own base row is a
+			// separate buildLinkSnapshot from this unit row's parent lookup, so
+			// a base row that missed names the netdev without contributing an
+			// ifindex bucket. Rust's binding_target_is_refused asks by name and
+			// drops the child outright, so an ifindex-only reader here left
+			// both the child and the parent key adjudicated with no binding.
+			if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
+				if !userspaceOwnsItsNetdev(iface) {
+					continue
+				}
+				if iface.Ifindex > 0 && !iface.LogicalOnly {
+					key := uint32(iface.Ifindex)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, key)
+					}
+				}
+				continue
+			}
 			if iface.Ifindex > 0 && !iface.LogicalOnly {
 				key := uint32(iface.Ifindex)
 				if !seen[key] {
@@ -1662,6 +1712,21 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	for _, fab := range snapshot.Fabrics {
 		if fab.ParentIfindex <= 0 {
+			continue
+		}
+		// #6691 round 9: the sibling of the allowlist's fabric guard, and the
+		// same reachability — round 8's kernel-kind evidence refuses an xfrm
+		// device by DEVICE KIND, so a slot-shaped `ge-0/0/0` created out of band
+		// is both refused and a legal `fabric-options member-interfaces` value.
+		// Measured: ingress came back [20 21] with 20 the refused member. See
+		// UserspaceBoundLinuxInterfaces for why this is transparent to an
+		// ordinary fabric.
+		// BOTH KEYS (#6691 round 16, refusesNetdev): the fabric row and the
+		// interface rows are separate netlink samples — SyncFabricState
+		// refreshes the fabric rows alone — so an owning, unbindable row that
+		// missed names this netdev while the fabric row carries its live
+		// ifindex. The RSS allowlist's own fabric guard already asked by name.
+		if refused.refusesNetdev(fab.ParentLinuxName, fab.ParentIfindex) {
 			continue
 		}
 		key := uint32(fab.ParentIfindex)
@@ -1715,6 +1780,7 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		return nil
 	}
 	out := make(map[uint32]uint32)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
@@ -1722,37 +1788,22 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 || iface.Ifindex == iface.ParentIfindex || iface.LogicalOnly {
 			continue
 		}
+		// #6691 round 8: same redirect, same refusal. An alias here would tell
+		// the shim to treat frames on the child as arriving on a netdev the
+		// dataplane refused to bind. This site is inert on every config
+		// reachable today and is guarded anyway — the reachability analysis,
+		// per exclusion class, is in userspaceRefusedNetdevs
+		// (ingress_exclusions.go), which owns the contract.
+		// BOTH KEYS (#6691 round 16, refusesNetdev) — same sampling skew as the
+		// ingress loop above. An alias installed for a name-refused parent tells
+		// the shim to treat the child's frames as arriving on a netdev nothing
+		// ever binds.
+		if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
+			continue
+		}
 		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
 	}
 	return out
-}
-
-func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
-	if iface.Tunnel {
-		return true
-	}
-	base := iface.Name
-	if idx := strings.IndexByte(base, '.'); idx >= 0 {
-		base = base[:idx]
-	}
-	switch {
-	case strings.HasPrefix(base, "fxp"):
-		return true
-	case strings.HasPrefix(base, "em"):
-		return true
-	case strings.HasPrefix(base, "fab"):
-		return true
-	case base == "lo0":
-		return true
-	}
-	switch iface.Zone {
-	case "mgmt", "control":
-		return true
-	}
-	if iface.LocalFabric != "" {
-		return true
-	}
-	return false
 }
 
 func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {

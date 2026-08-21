@@ -232,7 +232,7 @@ type Server struct {
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
-	provider, ok := s.dp.(userspaceStatusProvider)
+	provider, ok := s.dpProbe().(userspaceStatusProvider)
 	if !ok {
 		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
 	}
@@ -240,7 +240,7 @@ func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 }
 
 func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
-	provider, ok := s.dp.(userspaceControlProvider)
+	provider, ok := s.dpProbe().(userspaceControlProvider)
 	if !ok {
 		return nil, fmt.Errorf("userspace dataplane control unavailable")
 	}

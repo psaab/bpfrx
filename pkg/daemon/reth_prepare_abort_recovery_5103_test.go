@@ -94,7 +94,9 @@ func (d *abortRecoveryTestDP) Link() dataplane.LinkController { return d.link }
 
 func newAbortRecoveryDaemon(prepareErr error) (*Daemon, *abortRecoveryLinkController) {
 	lc := &abortRecoveryLinkController{prepareErr: prepareErr}
-	return &Daemon{dp: &abortRecoveryTestDP{link: lc}}, lc
+	d := &Daemon{}
+	d.setDataplane(&abortRecoveryTestDP{link: lc}) // #2114: publish through the cell
+	return d, lc
 }
 
 // TestRethMACAbortRebindsAfterFailedJoin_5103 is the F4 guard. The live MAC set

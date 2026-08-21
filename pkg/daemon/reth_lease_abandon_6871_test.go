@@ -52,7 +52,9 @@ func (d *leaseAbandonTestDP) ApplyConfig(ctx context.Context, cfg *config.Config
 
 func newLeaseAbandonDaemon(applyPanic string) (*Daemon, *abortRecoveryLinkController) {
 	lc := &abortRecoveryLinkController{leaseHeld: true}
-	return &Daemon{dp: &leaseAbandonTestDP{link: lc, applyPanic: applyPanic}}, lc
+	d := &Daemon{}
+	d.setDataplane(&leaseAbandonTestDP{link: lc, applyPanic: applyPanic}) // #2114: publish through the cell
+	return d, lc
 }
 
 // TestApplyDataplaneCoreAlwaysAbandonsAHeldLease_6871 is the B2 discriminator.
@@ -115,7 +117,7 @@ func TestApplyDataplaneCoreAlwaysAbandonsAHeldLease_6871(t *testing.T) {
 //
 // The nil-dataplane arm is the one that matters: applyDataplaneAndHACore runs on
 // every commit, including on a node with no dataplane wired at all, so a defer
-// that dereferenced d.dp would panic on the most common configuration in the
+// that dereferenced the dataplane cell would panic on the most common configuration in the
 // test suite rather than on an exotic one.
 func TestAbandonLinkCycleLeaseReachesTheController_6871(t *testing.T) {
 	t.Run("no_lease_held_is_silent", func(t *testing.T) {

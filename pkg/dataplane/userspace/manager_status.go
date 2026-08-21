@@ -25,7 +25,32 @@ func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
 		es := m.eventStream.Status()
 		status.EventStream = &es
 	}
-	m.lastStatus = *status
+	m.setLastStatusLocked(*status)
+}
+
+// setLastStatusLocked stores a helper status AND the fact that one has been
+// observed, so no caller can record the first without the second (#6691 round
+// 10).
+//
+// The pair is what lets a required-protocol gate distinguish "a helper reported
+// a version too old for this snapshot" from "no helper has reported at all" —
+// two states that both leave ConfigSnapshotProtocolVersion at a value below
+// ProtocolVersion, and only one of which is an incompatibility. Keeping them in
+// one function is deliberate: a bool maintained separately at seven assignment
+// sites is a bool that drifts, and a drifted one here silently re-arms the gate
+// on absence.
+func (m *Manager) setLastStatusLocked(status ProcessStatus) {
+	m.lastStatus = status
+	m.helperStatusObserved = true
+}
+
+// clearLastStatusLocked forgets the helper status and the observation together.
+// It is called where the helper is gone (stopLocked, a restart): a version read
+// from a process that no longer exists is not an observation about the one that
+// replaces it.
+func (m *Manager) clearLastStatusLocked() {
+	m.lastStatus = ProcessStatus{}
+	m.helperStatusObserved = false
 }
 
 func (m *Manager) Status() (ProcessStatus, error) {
@@ -148,14 +173,32 @@ func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	// without re-checking it would re-arm the STALE accepted image and forward
 	// on a config the helper cannot represent — the fail-OPEN this closes.
 	//
-	// The gate is scoped, not a blanket refuse: ensureRequiredSnapshotProtocolLocked
-	// is a no-op unless the last-applied config requires the protocol, and it
-	// re-polls the helper first so a helper that has since upgraded (accepted a
-	// current image) still arms normally. Only armed==true is gated — the
-	// disarm paths (shutdown, disarmSnapshotProtocolFailureLocked) must never be
-	// blocked, and this mirrors the ForwardingSupported guard above.
+	// The gate is scoped, not a blanket refuse — but READ THE SCOPE CAREFULLY,
+	// because #6722 widened it. ensureRequiredSnapshotProtocolLocked is a chain
+	// of four. The first three (schedulers, persistent source NAT, scoped global
+	// zone sets) are no-ops unless the last-applied config USES the feature they
+	// name. The fourth, ensureEgressZoneProtocolLocked, takes no config at all:
+	// every snapshot carries EgressZone, so it fires for ANY last-applied
+	// config, an empty one included. What still scopes it is the OBSERVED helper
+	// version — it returns nil when no handshake has yet reported one, which is
+	// what keeps a down or still-starting helper from bricking commits (#1960).
+	//
+	// So since #6722 this call refuses an arm against a version-mismatched
+	// helper regardless of what the config contains. That is deliberate: a
+	// helper on the other side of the v5 contract cannot decode the snapshot at
+	// all, so arming it forwards on whatever stale image it holds. It does not
+	// endanger a rolling HA upgrade — each node talks only to its own helper,
+	// and both halves move together (`make cluster-deploy` / `make
+	// test-deploy`). Measured at both sites by
+	// TestEgressZoneProtocolGatesBothArmPaths_6722, which drives an EMPTY
+	// config.Config{} precisely so no sibling gate can be what answers.
+	//
+	// The chain re-polls the helper first, so one that has since upgraded
+	// (accepted a current image) still arms normally. Only armed==true is gated
+	// — the disarm paths (shutdown, disarmSnapshotProtocolFailureLocked) must
+	// never be blocked, and this mirrors the ForwardingSupported guard above.
 	if armed && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
-		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return m.lastStatus, err
 		}
 	}

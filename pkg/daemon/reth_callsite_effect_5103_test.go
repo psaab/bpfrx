@@ -58,12 +58,12 @@ func rethCallsiteDaemon(t *testing.T, prepareErr error) (*Daemon, *abortRecovery
 	installFakeNetworkctl(t)
 	lc := &abortRecoveryLinkController{prepareErr: prepareErr}
 	d := &Daemon{
-		dp:      &abortRecoveryTestDP{link: lc},
 		cluster: cluster.NewManager(0, 1),
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(&abortRecoveryTestDP{link: lc}) // #2114: publish through the cell
 	return d, lc
 }
 

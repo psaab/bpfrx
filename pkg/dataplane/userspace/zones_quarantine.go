@@ -97,6 +97,14 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 		if _, drop := quarantined[snap.Interfaces[i].Zone]; drop {
 			snap.Interfaces[i].Zone = ""
 		}
+		// #6722: the EGRESS answer (InterfaceSnapshot.EgressZone) is NOT blanked
+		// here, deliberately. stampEgressZones already excludes a quarantined
+		// zone from the AUTHORED bindings it decides from — it must, because
+		// dropping one of two colliding zones can turn a contested ifindex into
+		// an unanimous one, and blanking after the fact would leave that ifindex
+		// unzoned instead of resolving the SURVIVOR. Doing it in one place also
+		// keeps a second, weaker copy of the rule from going quietly vacuous.
+		// Pinned by TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722.
 	}
 	// Scrub quarantined zones out of policies so the snapshot carries no dangling
 	// policy->zone reference (which the Rust UnresolvableZoneReference preflight

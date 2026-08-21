@@ -51,7 +51,15 @@ type TelemetryProvider interface {
 	Telemetry() Telemetry
 }
 
+// The three ...Of helpers below are OPTIONAL-CAPABILITY probes: they ask
+// "does this provider happen to expose X?" and degrade to a null object
+// when it does not. Each therefore resolves through Unwrap first — a live
+// indirection (pkg/daemon's liveDataPlane, #2114) declares only the
+// MANDATORY management surface, so probing the adapter itself would report
+// "capability absent" for a perfectly healthy backend that has it.
+
 func LastApplyResultOf(provider any) *ApplyResult {
+	provider = Unwrap(provider)
 	if provider == nil {
 		return nil
 	}
@@ -63,7 +71,7 @@ func LastApplyResultOf(provider any) *ApplyResult {
 }
 
 func SessionStoreOf(provider any) SessionStore {
-	switch p := provider.(type) {
+	switch p := Unwrap(provider).(type) {
 	case nil:
 		return NewDataPlaneSessionStore(nil)
 	case SessionStore:
@@ -79,7 +87,7 @@ func SessionStoreOf(provider any) SessionStore {
 }
 
 func TelemetryOf(provider any) Telemetry {
-	switch p := provider.(type) {
+	switch p := Unwrap(provider).(type) {
 	case nil:
 		return NewDataPlaneTelemetry(nil)
 	case Telemetry:

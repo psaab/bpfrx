@@ -37,32 +37,6 @@ func (d *Daemon) checkNoRethTakeoverReadiness(rgID int) (bool, []string) {
 	return d.checkVIPReadiness(rgID)
 }
 
-func (d *Daemon) takeoverReadinessForRG(rgID int, ifReady bool, ifReasons []string, fabricReady, noRethVRRP bool) (bool, []string) {
-	var takeoverGateReady bool
-	var takeoverGateReasons []string
-	if noRethVRRP {
-		// This reduces the no-RETH VRRP/takeover gate component to
-		// whether VIP ownership can be established on the local node.
-		takeoverGateReady, takeoverGateReasons = d.checkNoRethTakeoverReadiness(rgID)
-	} else if d.vrrpMgr != nil {
-		hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
-		takeoverGateReady, takeoverGateReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
-	} else {
-		takeoverGateReady = true // no VRRP = always ready
-	}
-
-	userspaceReady, userspaceReasons := d.checkUserspaceTakeoverReadiness(rgID)
-	ready := ifReady && takeoverGateReady && fabricReady && userspaceReady
-
-	var reasons []string
-	reasons = append(reasons, ifReasons...)
-	reasons = append(reasons, takeoverGateReasons...)
-	if !fabricReady {
-		reasons = append(reasons, "fabric forwarding path not ready")
-	}
-	reasons = append(reasons, userspaceReasons...)
-	return ready, reasons
-}
 
 // checkVIPReadinessForConfig verifies that RETH interfaces for the given RG
 // exist and have operational carrier. Pure function for testability.

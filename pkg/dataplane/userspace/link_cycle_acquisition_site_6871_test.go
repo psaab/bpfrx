@@ -66,7 +66,7 @@ import (
 // moving the chain shows up here as a diff rather than as silence.
 var linkCycleAcquisitionSites = map[string]acquisitionSite{
 	"pkg/daemon/daemon_apply_dataplane.go:(*Daemon).programRethMACWithWorkerJoin: " +
-		"d.dp.Link().PrepareLinkCycle [in a func literal beforeCycle]": {occurrences: 1, reason: "" +
+		"rt.Link().PrepareLinkCycle [in a func literal beforeCycle]": {occurrences: 1, reason: "" +
 		"the ONLY production acquisition site. It sits inside step 2.6 of " +
 		"applyDataplaneAndHACore, which defers abandonLinkCycleLease over its whole " +
 		"body — but it is written in the beforeCycle CALLBACK, so being inside that " +
@@ -119,7 +119,7 @@ type acquisitionSite struct {
 // same way — by the test being renamed or deleted somewhere else entirely.
 var linkCycleUnprovenFormBindings = map[string]string{
 	"pkg/daemon/daemon_apply_dataplane.go:(*Daemon).programRethMACWithWorkerJoin: " +
-		"d.dp.Link().PrepareLinkCycle [in a func literal beforeCycle]": "" +
+		"rt.Link().PrepareLinkCycle [in a func literal beforeCycle]": "" +
 		"TestRethMACHookRunsOnTheCallersGoroutine_6871",
 }
 
@@ -158,7 +158,7 @@ func repoRootFromPackage(t *testing.T) string {
 //	type rethMACRetry struct{ d *Daemon }
 //	// same file, same name, different receiver — key collides with the entry below
 //	func (r *rethMACRetry) programRethMACWithWorkerJoin(n string) error {
-//	    return r.d.dp.Link().PrepareLinkCycle()   // a REAL second acquisition
+//	    return r.rt.Link().PrepareLinkCycle()   // a REAL second acquisition
 //	}
 //
 // That is exactly the failure the tree-wide guard exists to prevent: an
@@ -208,7 +208,7 @@ func declSiteKey(d *ast.FuncDecl) string {
 // Both fields hold every OCCURRENCE, not a set of keys. A map[string]bool
 // merges two references that render the same key, and "two escaping literals in
 // the declaration that is allowed one call" is exactly what that looks like
-// (#6871 round 15) — measured, as a second d.dp.Link().PrepareLinkCycle()
+// (#6871 round 15) — measured, as a second rt.Link().PrepareLinkCycle()
 // literal planted in programRethMACWithWorkerJoin plus an invoker outside the
 // apply, compiling with the whole suite green. So the key answers WHICH site and
 // the slice answers HOW MANY, and the guards assert both.
@@ -236,7 +236,7 @@ const (
 // assertion without changing the key or the count:
 //
 //	beforeCycle := func() error {
-//	    if false { return d.dp.Link().PrepareLinkCycle() }   // decoy
+//	    if false { return rt.Link().PrepareLinkCycle() }   // decoy
 //	    return nil                                            // the real one, gone
 //	}
 //
@@ -339,7 +339,7 @@ func funcLitLabel(chain []ast.Node, j int) string {
 // and one key added.
 //
 // What this does NOT reach is a decoy whose selector has the same SOURCE TEXT
-// and a different type — say d.dp.Link() coming to return something else. Only
+// and a different type — say rt.Link() coming to return something else. Only
 // a type-checked scan distinguishes those, and this guard deliberately does not
 // run go/types over the whole module. The claim is therefore "identity by
 // written form", not "identity by resolved method".
@@ -446,7 +446,7 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 	// duplicates removed,
 	//
 	//	beforeCycle := func() error {
-	//	    beforeCycle := func() { _ = d.dp.Link().PrepareLinkCycle() }
+	//	    beforeCycle := func() { _ = rt.Link().PrepareLinkCycle() }
 	//	    go beforeCycle()
 	//	    return nil
 	//	}
@@ -496,7 +496,7 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 // from CallExpr.Fun to any *ast.SelectorExpr, because a method value has no
 // CallExpr at all:
 //
-//	prep := d.dp.Link().PrepareLinkCycle   // method VALUE
+//	prep := rt.Link().PrepareLinkCycle   // method VALUE
 //	prep()                                 // ...called through the variable
 //
 // That widening was necessary and NOT sufficient, and the gap was compiled
@@ -511,7 +511,7 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 // It also walks the whole FILE rather than each *ast.FuncDecl body, because a
 // package-level initializer is a *ast.GenDecl and was never inspected:
 //
-//	var takeLease = func(d *Daemon) error { return d.dp.Link().PrepareLinkCycle() }
+//	var takeLease = func(d *Daemon) error { return rt.Link().PrepareLinkCycle() }
 //
 // The stated exclusions all survive both passes, verified at HEAD: a method
 // DECLARATION is a FuncDecl whose name is an *ast.Ident, an interface MEMBER is

@@ -139,7 +139,8 @@ func TestApplyRoutingRulesNoRibGroupNoChurn(t *testing.T) {
 // published snapshot stale and this test fails (publish/bump never fire).
 func TestReconcileRouteLeakSnapshotRepublishesOnChange(t *testing.T) {
 	dp := &fakeOverlayDP{}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	d.reconcileRouteLeakSnapshot(&config.Config{}, nil)
 
@@ -154,7 +155,8 @@ func TestReconcileRouteLeakSnapshotRepublishesOnChange(t *testing.T) {
 // publish nothing and churn nothing.
 func TestReconcileRouteLeakSnapshotSkipsBumpOnDuplicate(t *testing.T) {
 	dp := &fakeOverlayDP{publishSkipped: true}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	d.reconcileRouteLeakSnapshot(&config.Config{}, nil)
 

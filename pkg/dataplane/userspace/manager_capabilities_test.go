@@ -254,7 +254,7 @@ func TestEnsureRequiredSnapshotProtocolRejectsOldHelperForPersistentSourceNAT(t 
 
 	m := New()
 	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion - 1
-	err := m.ensureRequiredSnapshotProtocolLocked(cfg)
+	err := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg))
 	if !errors.Is(err, ErrPersistentSourceNATProtocolIncompatible) {
 		t.Fatalf("error = %v, want ErrPersistentSourceNATProtocolIncompatible", err)
 	}

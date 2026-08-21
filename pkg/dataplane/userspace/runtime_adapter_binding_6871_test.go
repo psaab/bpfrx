@@ -155,7 +155,7 @@ func TestHAControllerWatchdogPropagatesContextCancellation_6871(t *testing.T) {
 
 // TestLinkControllerRenewReachesTheManager_6871 is the B2 guard.
 //
-// The daemon renews the link-cycle lease through d.dp.Link().RenewLinkCycle()
+// The daemon renews the link-cycle lease through rt.Link().RenewLinkCycle()
 // (Daemon.renewLinkCycleLease). pkg/daemon's own renewal test uses a FAKE
 // controller and this package's test calls m.RenewLinkCycle() directly, so the
 // REAL adapter sat between two green tests with nothing on it: making its body a

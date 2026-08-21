@@ -103,8 +103,19 @@ type Manager struct {
 	neighborReplaceGen uint64
 	syncCancel         context.CancelFunc
 	lastStatus         ProcessStatus
-	lastSnapshot       *ConfigSnapshot
-	lastApply          *dataplane.ApplyResult
+	// helperStatusObserved records that a helper status has been decoded at
+	// least once in this Manager's life — i.e. that lastStatus describes a
+	// helper we actually heard from rather than a zero value (#6691 round 10).
+	//
+	// It exists because a required-protocol gate must arm on an OBSERVED
+	// too-old version and never on the ABSENCE of one, and
+	// lastStatus.ConfigSnapshotProtocolVersion == 0 cannot tell those apart: it
+	// is equally "no helper has ever answered" and "a helper answered without
+	// the field". Both are < ProtocolVersion, and only the second is an
+	// incompatibility. Guarded by m.mu, like lastStatus itself.
+	helperStatusObserved bool
+	lastSnapshot         *ConfigSnapshot
+	lastApply            *dataplane.ApplyResult
 	// lastSnapshotRejectReasons holds the #3261 diagnostic: the reasons the
 	// most recently built snapshot carries unrepresentable policy content that
 	// the helper integrity preflight rejects (previous-good retained, or

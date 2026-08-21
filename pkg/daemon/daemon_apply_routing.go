@@ -332,7 +332,7 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 
 // reconcileRouteLeakSnapshot republishes the userspace route snapshot after
 // applyRoutingRules has reconciled the kernel policy-routing (ip rule) table
-// (#5642). The full dataplane apply (applyDataplaneAndHACore → d.dp.ApplyConfig)
+// (#5642). The full dataplane apply (applyDataplaneAndHACore → the dataplane's ApplyConfig)
 // runs BEFORE applyRoutingRules and derives its route snapshot from the LIVE
 // kernel ip-rules (buildRouteSnapshots → netlink.RuleList). On an inter-VRF
 // route-leak transition — most importantly the final-rib-group removal that
@@ -364,7 +364,7 @@ func (d *Daemon) reconcileRouteLeakSnapshot(cfg *config.Config, overlay []config
 	if cfg == nil {
 		return nil
 	}
-	pub, ok := d.dp.(routeOverlayPublisher)
+	pub, ok := d.dataplane().(routeOverlayPublisher)
 	if !ok {
 		// Helperless (no userspace dataplane publisher): the kernel ip-rule
 		// reconcile above is the only route-leak consumer and it already ran.
