@@ -36,16 +36,31 @@ import (
 // conversions left ./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/...
 // ./pkg/dataplane/... AND ./pkg/daemon/... at rc=0 — a complete survivor.
 //
-// The fixture below is keyed on the property instead: EVERY method that
-// reaches the backend performs its own counted cell load, exactly as
-// liveDataPlane does (Unwrap reads d.dataplane(); resolve() reads
-// d.dataplane() again). A render that takes a second load therefore both
-// bumps the counter AND observably tears, because the cell is empty from
-// load 2 onward.
+// The fixture below is keyed on the property instead. Its reach is TOTAL
+// over grpcRuntime's 25 methods, and that is a property of how it is
+// built rather than of how many methods it happens to declare:
 //
-// This is deterministic, not a race: a cell that holds a backend at load 1
-// and nothing afterwards is the observable consequence of a concurrent
-// setDataplane(nil) with the timing removed.
+//   - the three methods declared below (Unwrap, SessionCount, GetMapStats)
+//     each perform their OWN counted cell load, exactly as liveDataPlane
+//     does — Unwrap reads d.dataplane(); resolve() reads it again;
+//   - EVERY OTHER method PANICS, because the embedded grpcRuntime is a nil
+//     interface. Method promotion dispatches all 22 undeclared methods
+//     through that field, so none of them can quietly answer.
+//
+// There is therefore no method on this value that reaches the backend
+// without the counter seeing it. That is the r4 correction: r4 embedded a
+// concrete *dataplane.Manager, which SERVED those 22 — closing 2 of 25
+// while the header claimed all of them. Measured at 44603f888: inserting
+// `if !s.dp.IsLoaded() { buf.WriteString("stale\n") }` into showBuffers'
+// map-stats arm — a real second cell load — left loads=1, all four
+// subtests PASS, pkg/grpcapi rc=0. Bound now by
+// TestShowBuffersCountingIndirectionServesNothingSilently.
+//
+// A render that takes a second load through a DECLARED method both bumps
+// the counter AND observably tears, because the cell is empty from load 2
+// onward. That is deterministic, not a race: a cell that holds a backend
+// at load 1 and nothing afterwards is the observable consequence of a
+// concurrent setDataplane(nil) with the timing removed.
 
 const (
 	// The published backend's session counts. Non-zero on BOTH families so
@@ -62,16 +77,25 @@ const (
 const singleLoadActiveSessions = "Active sessions: 7 IPv4, 3 IPv6, 10 total"
 
 // countingIndirection is a live indirection modelled on pkg/daemon's
-// liveDataPlane: every method that reaches the backend performs its OWN
-// cell load, and the cell is empty from the second load onward.
+// liveDataPlane: a backend-reaching method performs its OWN cell load, and
+// the cell is empty from the second load onward.
 //
-// It satisfies grpcRuntime by embedding the root Manager, so it can be
-// stored in Server.dp exactly as the daemon's liveDataPlane is. The
-// methods declared below shadow the embedded Manager's deliberately —
-// that shadowing is the whole point, because an embedded method is a load
-// the counter cannot see.
+// The embedded grpcRuntime is a nil INTERFACE, never a concrete value. It
+// is what makes this value assignable to Server.dp — the promoted method
+// set is grpcRuntime's, so *countingIndirection satisfies the field — and
+// it is simultaneously what makes the counter's reach total: the three
+// methods below shadow their promoted counterparts, and every OTHER
+// promoted method dispatches through a nil interface and panics at the
+// production call site that took it.
+//
+// Do NOT restore the r4 `*dataplane.Manager` embed. A concrete embed
+// satisfies the same field while SERVING the 22 undeclared methods, so a
+// render that reached the backend through any of them took a cell load
+// this fixture could not see, and the counter stayed at 1. A loud panic
+// naming the production line is the intended answer; a silent zero is the
+// bug. TestShowBuffersCountingIndirectionServesNothingSilently binds it.
 type countingIndirection struct {
-	*dataplane.Manager
+	grpcRuntime
 	backend any
 	loads   atomic.Int32
 }
@@ -106,7 +130,13 @@ func (o *countingIndirection) GetMapStats() []dataplane.MapStats {
 	return m.GetMapStats()
 }
 
-var _ dataplane.LiveUnwrapper = (*countingIndirection)(nil)
+var (
+	_ dataplane.LiveUnwrapper = (*countingIndirection)(nil)
+	// The nil embed is what makes the fixture storable in Server.dp. If
+	// this assertion ever needs a concrete embed to hold, the counter has
+	// lost its reach — see the type's doc comment.
+	_ grpcRuntime = (*countingIndirection)(nil)
+)
 
 // mapStatsBackend drives the MAP-STATS arm: no userspace Status() probe,
 // and a non-empty map list so "No BPF maps available" can only mean the
@@ -212,10 +242,7 @@ func TestShowBuffersTakesOneCellLoad(t *testing.T) {
 	for _, render := range singleLoadRenders {
 		for _, arm := range singleLoadArms {
 			t.Run(render.name+"/"+arm.name, func(t *testing.T) {
-				dp := &countingIndirection{
-					Manager: dataplane.New(),
-					backend: arm.backend(),
-				}
+				dp := &countingIndirection{backend: arm.backend()}
 				s := &Server{
 					dp:    dp,
 					store: newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf")),
@@ -268,7 +295,7 @@ func TestShowBuffersTakesOneCellLoad(t *testing.T) {
 // the userspace-arm row above would pass without any unwrap at all and the
 // grid would be vacuous in the arm this PR changed.
 func TestShowBuffersCountingIndirectionErasesCapabilities(t *testing.T) {
-	dp := &countingIndirection{Manager: dataplane.New(), backend: &userspaceArmBackend{Manager: dataplane.New()}}
+	dp := &countingIndirection{backend: &userspaceArmBackend{Manager: dataplane.New()}}
 	if _, ok := any(dp).(userspaceStatusProvider); ok {
 		t.Fatal("fixture drift: countingIndirection implements userspaceStatusProvider " +
 			"directly, so the userspace-arm rows no longer exercise a resolution")
@@ -279,12 +306,61 @@ func TestShowBuffersCountingIndirectionErasesCapabilities(t *testing.T) {
 	}
 }
 
+// TestShowBuffersCountingIndirectionServesNothingSilently is what makes
+// the grid's claim a UNIVERSAL over grpcRuntime's 25 methods rather than a
+// statement about the 3 this fixture declares.
+//
+// r4 embedded a concrete *dataplane.Manager. That satisfies Server.dp
+// identically, and it ALSO answers the 22 methods the fixture does not
+// declare — so a render reaching the backend through any of them took a
+// cell load the counter could not see, and the grid stayed green at
+// loads=1. The r4 fixture closed 2 of 25 while its header said EVERY.
+//
+// Two clauses, because they say different things:
+//
+//   - STRUCTURAL, and this is the one that quantifies: the embedded
+//     grpcRuntime must be nil. Go promotes every undeclared method through
+//     that one field, so nil covers all 22 at once without naming them —
+//     an enumeration here would be the same mistake in a new place.
+//   - BEHAVIOURAL: IsLoaded() — the method a reviewer actually inserted
+//     into showBuffers' map-stats arm at 44603f888 and measured green —
+//     must panic rather than return. A panic names the production line in
+//     its stack; a silent `false` names nothing.
+func TestShowBuffersCountingIndirectionServesNothingSilently(t *testing.T) {
+	dp := &countingIndirection{backend: &mapStatsBackend{Manager: dataplane.New()}}
+
+	if dp.grpcRuntime != nil {
+		t.Fatal("fixture drift: countingIndirection embeds a non-nil grpcRuntime, so the " +
+			"22 methods it does not declare are SERVED rather than promoted through a nil " +
+			"interface. A render reaching the backend through one of them would take a cell " +
+			"load this fixture cannot count, and the grid would stay green at loads=1 — " +
+			"which is exactly how the r4 *dataplane.Manager embed closed 2 of 25 methods " +
+			"while claiming all of them")
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("countingIndirection.IsLoaded() returned instead of panicking: an " +
+					"undeclared backend-reaching method is answerable, so the load counter's " +
+					"reach is not total")
+			}
+		}()
+		_ = dp.IsLoaded()
+	}()
+
+	if got := dp.loads.Load(); got != 0 {
+		t.Fatalf("the panicking call took %d cell loads, want 0: it must not be able to "+
+			"reach the backend at all", got)
+	}
+}
+
 // TestShowBuffersEmptyCellSaysNotLoaded is the negative control: with NO
 // backend at all the render must still say "Dataplane not loaded", so the
 // grid above cannot pass merely because the "No BPF maps available" string
 // was deleted.
 func TestShowBuffersEmptyCellSaysNotLoaded(t *testing.T) {
-	dp := &countingIndirection{Manager: dataplane.New(), backend: nil}
+	dp := &countingIndirection{backend: nil}
 	s := &Server{
 		dp:    dp,
 		store: newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf")),

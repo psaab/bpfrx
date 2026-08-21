@@ -48,7 +48,7 @@ import (
 // unwrapping, and decide on DATA FLOW rather than on the enclosing
 // declaration.
 //
-// WHAT IS ASSERTED NOW, in four rules:
+// WHAT IS ASSERTED NOW, in five rules:
 //
 //	R1 (no re-derivation). A type assertion to a management-probe type in
 //	   a production file outside the declaration allowlist is a violation,
@@ -64,8 +64,11 @@ import (
 //	   liveDataplane(). A discarded call satisfies nothing. Kills C7 a
 //	   second time, independently of R1.
 //
-//	R3 (the consumer's DP field). A grpcapi.Config / api.Config composite
-//	   literal's `DP:` value must be a live-derived identifier.
+//	R3 (the consumer's DP field). ANY qualified composite literal with a
+//	   `DP:` element must give it a live-derived identifier. Keyed on the
+//	   FIELD, not on a registry of consumer packages: before r5 this
+//	   consulted a 2-entry managementConsumerConfigs allowlist, so a fourth
+//	   consumer with its own config type was invisible to it.
 //
 //	R4 (the console consumer). A call to cli.New must pass at least one
 //	   argument that is BOTH declared with a management-probe type in that
@@ -119,10 +122,47 @@ import (
 // invites the next reader to skip the behavioural half believing the AST
 // half cannot reach the site.
 //
-// ONE thing therefore remains outside R1-R5, and is stated rather than
-// papered over: any ordering that depends on runtime control flow rather
-// than on syntax (a channel handshake, a sync.Once, a conditional that
-// only assigns on a path taken later).
+// WHAT REMAINS OUTSIDE R1-R5. An earlier revision said "ONE thing". That
+// number came from re-counting the members of a list nobody had checked
+// for completeness, which made it more precise and no more true — and
+// "one" reads as audited in a way "two" did not. The bound is stated as a
+// PREDICATE here instead.
+//
+// R1 and R2 only see a type that is in managementProbeTypes, so before r5
+// the whole analysis was gated on a hand-maintained 3-entry literal that
+// no test bound to reality, and R3 on a 2-entry one. A FOURTH management
+// consumer wired capture-once with its OWN probe type therefore escaped
+// every rule. Measured at 44603f888: a fourth consumer added to Run(),
+// sourced through a type assertion — precisely the escape R1 exists to
+// kill — and handed to its own Config{DP: ...}, left pkg/daemon at rc=0
+// with 0 FAIL. R1 missed (type not in the map), R3 missed (config not in
+// the map), R4 missed (not cli.New). Two INDEPENDENT closures in r5:
+//
+//   - TestManagementProbeRegistryIsComplete PARSES the probe declaration
+//     files and reports any interface they declare that is in NEITHER
+//     managementProbeTypes nor managementProbeNonConsumerTypes. The
+//     population is bounded by the source rather than by a memory:
+//     declaring a seventh probe without classifying it reds the suite, and
+//     classifying it as a management probe puts it under R1 and R2.
+//   - R3 no longer consults a registry of consumer packages at all. It
+//     keys on the FIELD — any qualified composite literal with a `DP:`
+//     element must take a live-derived value, whatever package or type
+//     name it wears. managementConsumerConfigs is retired.
+//
+// TWO things genuinely remain, and both are properties of the rules rather
+// than entries on a list:
+//
+//   - Runtime-control-flow ordering. R5 enumerates the SYNTACTIC deferring
+//     forms; an ordering established by a channel handshake, a sync.Once,
+//     or a conditional that only assigns on a path taken later is not
+//     syntax and is not seen.
+//   - R4 is site-keyed on the `cli.New` selector, because "this call is a
+//     management consumer" has no syntactic signature the way `DP:` does.
+//     A consumer escapes R4 only by satisfying all THREE of: it takes its
+//     probe as a plain call argument rather than a `DP:` field, it is not
+//     cli.New, and its probe type is declared outside the two declaration
+//     files. The third conjunct is what bounds it — declared inside them,
+//     the completeness test forces registration and R1/R2 apply.
 //
 // Do not read a green run as "the probe is live at the instant the
 // consumer uses it". Read it as "no probe value in a production function
@@ -141,28 +181,43 @@ import (
 
 // managementProbeTypes are the daemon-local probe types whose values are
 // handed to a LONG-LIVED downstream consumer (grpcapi.Server.dp,
-// api.Server.dp, cli.CLI.dp). dataplaneReadyProbe / natSeeder /
-// fibSyncStarter are deliberately absent: those are used inline within a
-// single statement and never stored.
+// api.Server.dp, cli.CLI.dp). R1 and R2 see a function only through this
+// map, so an omission here is not a narrower check — it is NO check.
+//
+// #6743 r5-B2: this map and managementProbeNonConsumerTypes below must
+// between them account for EVERY interface the declaration files declare.
+// TestManagementProbeRegistryIsComplete enforces that by parsing them, so
+// a probe added to runtime_probes.go and forgotten here reds the suite
+// instead of silently leaving its consumer unanalysed.
 var managementProbeTypes = map[string]bool{
 	"apiDataPlane":  true,
 	"grpcDataPlane": true,
 	"cliDataPlane":  true,
 }
 
+// managementProbeNonConsumerTypes are the interfaces the declaration files
+// declare that are deliberately NOT management probes, each with the reason
+// it is exempt. Being listed here is a CLAIM that the type's values are
+// never stored by a long-lived consumer; it is the only way to keep an
+// interface out of managementProbeTypes.
+var managementProbeNonConsumerTypes = map[string]string{
+	"dataplaneReadyProbe":  "lifecycle gate, called inline within one statement; never stored",
+	"natSeeder":            "post-Start map seeding, called inline; never stored",
+	"fibSyncStarter":       "StartFIBSync, called inline; never stored",
+	"liveDataPlaneSurface": "the UNION liveDataPlane forwards to, not a value handed to a consumer",
+}
+
 // managementProbeDeclFiles are the files allowed to name a management
 // probe type WITHOUT sourcing it from liveDataplane: the declaration site
 // and the live adapter's own compile-time assertions.
+//
+// The SAME set scopes the r5 completeness scan, deliberately: the files
+// that may name a probe freely are exactly the files whose interface
+// declarations must be classified, so the exemption and the obligation
+// cannot drift apart.
 var managementProbeDeclFiles = map[string]bool{
 	"runtime_probes.go": true,
 	"daemon_dp_live.go": true,
-}
-
-// managementConsumerConfigs are the consumer config literals whose DP
-// field must carry the live indirection (R3).
-var managementConsumerConfigs = map[string]bool{
-	"grpcapi.Config": true,
-	"api.Config":     true,
 }
 
 // captureOnceProbeViolations reports every production function that takes
@@ -551,19 +606,26 @@ func probeWiringViolations(body *ast.BlockStmt) []string {
 	return out
 }
 
-// consumerWiringViolations applies R3 (config literal DP field) and R4
-// (cli.New argument set).
+// consumerWiringViolations applies R3 (a composite literal's DP field) and
+// R4 (cli.New argument set).
 func consumerWiringViolations(body *ast.BlockStmt, w *probeWiring) []string {
 	var out []string
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.CompositeLit:
+			// R3, r5-B2: keyed on the FIELD, not on a registry of consumer
+			// packages. Until r5 this required the literal's type to be in
+			// a 2-entry managementConsumerConfigs map, so a FOURTH
+			// management consumer with its own config type — measured at
+			// 44603f888, pkg/daemon rc=0 — was invisible. `DP:` on a
+			// qualified type is signature enough; the registry bought
+			// nothing and had to be remembered.
 			sel, ok := unwrapTypeExpr(x.Type).(*ast.SelectorExpr)
 			if !ok || sel.Sel == nil {
 				return true
 			}
 			pkg, ok := sel.X.(*ast.Ident)
-			if !ok || !managementConsumerConfigs[pkg.Name+"."+sel.Sel.Name] {
+			if !ok {
 				return true
 			}
 			for _, elt := range x.Elts {
@@ -623,6 +685,162 @@ func TestManagementProbesComeFromLiveDataplane(t *testing.T) {
 	if v := captureOnceProbeViolations(t, "."); len(v) > 0 {
 		t.Fatalf("management-probe values taken as a capture-once snapshot instead of the "+
 			"#2114 live indirection:\n%s", strings.Join(v, "\n"))
+	}
+}
+
+// declaredInterfaceNames returns every interface type name one file
+// declares. Parse failures — including a file that has been renamed out
+// from under managementProbeDeclFiles — are fatal rather than skipped, so
+// the completeness check cannot go vacuously green by finding nothing.
+func declaredInterfaceNames(t *testing.T, path string) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var out []string
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name == nil {
+				continue
+			}
+			if _, ok := ts.Type.(*ast.InterfaceType); ok {
+				out = append(out, ts.Name.Name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unclassifiedProbeDecls reports every interface declared in the probe
+// declaration files that appears in NEITHER registry.
+func unclassifiedProbeDecls(t *testing.T, root string) []string {
+	t.Helper()
+
+	var out []string
+	for file := range managementProbeDeclFiles {
+		for _, name := range declaredInterfaceNames(t, filepath.Join(root, file)) {
+			if managementProbeTypes[name] {
+				continue
+			}
+			if _, exempt := managementProbeNonConsumerTypes[name]; exempt {
+				continue
+			}
+			out = append(out, file+":"+name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestManagementProbeRegistryIsComplete binds managementProbeTypes to the
+// SOURCE (#6743 r5-B2).
+//
+// R1 and R2 see a function only through managementProbeTypes, so a probe
+// type that is not in it is not checked more loosely — it is not checked at
+// all. Until r5 nothing bound that map to reality: both it and the retired
+// managementConsumerConfigs appeared exactly twice in the tree, at their
+// declaration and their single use site, and a FOURTH management consumer
+// with its own probe type left pkg/daemon at rc=0 with 0 FAIL.
+//
+// This test makes the population bounded by the source instead. Every
+// interface the declaration files declare must be classified: a management
+// probe (managementProbeTypes, hence under R1/R2), or an explicit
+// non-consumer with a stated reason (managementProbeNonConsumerTypes).
+// There is no third outcome — in particular, no "silently unclassified".
+//
+// FAIL-ON-REVERT: declare a seventh interface in runtime_probes.go and
+// leave it out of both maps. Bound in both directions by
+// TestManagementProbeRegistryIsCompleteSelfTest.
+func TestManagementProbeRegistryIsComplete(t *testing.T) {
+	t.Parallel()
+
+	if v := unclassifiedProbeDecls(t, "."); len(v) > 0 {
+		t.Fatalf("probe interfaces declared but classified in NEITHER "+
+			"managementProbeTypes nor managementProbeNonConsumerTypes:\n%s\n\n"+
+			"A type missing from managementProbeTypes is invisible to R1 and R2, so its "+
+			"consumer is not analysed at all. Add it there if its values are handed to a "+
+			"long-lived consumer, or to managementProbeNonConsumerTypes with the reason "+
+			"it is not.", strings.Join(v, "\n"))
+	}
+}
+
+// TestManagementProbeRegistryIsCompleteSelfTest drives the completeness
+// check in BOTH directions, so it cannot pass by having stopped looking.
+func TestManagementProbeRegistryIsCompleteSelfTest(t *testing.T) {
+	t.Parallel()
+
+	// Both declaration files must exist in the fixture root: the scan is
+	// scoped by managementProbeDeclFiles and a missing file is fatal.
+	const classifiedOnly = `package daemon
+
+type cliDataPlane interface{ IsLoaded() bool }
+type natSeeder interface{ SeedNATPortCounters() }
+`
+	const withASeventh = classifiedOnly + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+`
+
+	t.Run("clean", func(t *testing.T) {
+		dir := t.TempDir()
+		writeProbeDeclFixture(t, dir, classifiedOnly, "package daemon\n")
+		if v := unclassifiedProbeDecls(t, dir); len(v) > 0 {
+			t.Fatalf("a fully classified fixture reported %v — the check reports types it "+
+				"should accept, which would push maintainers to weaken it", v)
+		}
+	})
+
+	t.Run("seventh-interface-unclassified", func(t *testing.T) {
+		dir := t.TempDir()
+		writeProbeDeclFixture(t, dir, withASeventh, "package daemon\n")
+		got := unclassifiedProbeDecls(t, dir)
+		if len(got) != 1 || !strings.Contains(got[0], "mgmtDataPlane") {
+			t.Fatalf("an unclassified probe interface must be reported exactly once, got %v", got)
+		}
+	})
+
+	t.Run("unclassified-in-the-other-decl-file", func(t *testing.T) {
+		// The scan is scoped by managementProbeDeclFiles, not by the name
+		// runtime_probes.go: the SECOND allowlisted file is where a probe
+		// declaration would most plausibly go to dodge the first.
+		dir := t.TempDir()
+		writeProbeDeclFixture(t, dir, classifiedOnly,
+			"package daemon\n\ntype sneakyDataPlane interface{ IsLoaded() bool }\n")
+		got := unclassifiedProbeDecls(t, dir)
+		if len(got) != 1 || !strings.Contains(got[0], "sneakyDataPlane") {
+			t.Fatalf("an unclassified probe in daemon_dp_live.go must be reported, got %v", got)
+		}
+	})
+}
+
+// writeProbeDeclFixture writes one synthetic copy of each file the
+// completeness scan reads.
+func writeProbeDeclFixture(t *testing.T, dir, probes, live string) {
+	t.Helper()
+
+	for name, src := range map[string]string{
+		"runtime_probes.go": probes,
+		"daemon_dp_live.go": live,
+	} {
+		if !managementProbeDeclFiles[name] {
+			t.Fatalf("fixture drift: %s is no longer in managementProbeDeclFiles, so this "+
+				"self-test is writing a file the scan does not read", name)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if got := len(managementProbeDeclFiles); got != 2 {
+		t.Fatalf("fixture drift: managementProbeDeclFiles has %d entries, this self-test "+
+			"writes 2; the scan would read a file the fixture never created", got)
 	}
 }
 
@@ -742,6 +960,52 @@ func (d *Daemon) startGRPCServer(stale grpcDataPlane) {
 }
 `,
 			want: []string{"builds grpcapi.Config with a DP value"},
+		},
+		{
+			name: "bad/fourth-consumer-own-probe-type-own-config",
+			// #6743 r5-B2, the measured escape. A FOURTH management
+			// consumer, with a probe type in no registry, sourced through a
+			// type assertion — the exact shape R1 exists to kill — and
+			// handed to its own config literal. Measured at 44603f888
+			// against the registry-keyed rules: pkg/daemon rc=0, 0 FAIL.
+			// R1 missed (mgmtDataPlane not in managementProbeTypes), R3
+			// missed (mgmt.Config not in the retired
+			// managementConsumerConfigs), R4 missed (not cli.New).
+			//
+			// Caught now by R3 alone, on the `DP:` FIELD — deliberately
+			// WITHOUT registering mgmtDataPlane, so this row stays a
+			// witness for the unregistered case rather than quietly
+			// becoming an R1 row.
+			src: preamble + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+
+func (d *Daemon) startMgmt() {
+	var mgmtDP mgmtDataPlane
+	if rt := d.dataplane(); rt != nil {
+		if probe, ok := rt.(mgmtDataPlane); ok {
+			mgmtDP = probe
+		}
+	}
+	_ = mgmt.Config{DP: mgmtDP}
+}
+`,
+			want: []string{"builds mgmt.Config with a DP value"},
+		},
+		{
+			name: "live/fourth-consumer-with-a-live-probe",
+			// The same fourth consumer wired correctly must stay clean, or
+			// the widened R3 is a rule that cannot be satisfied.
+			src: preamble + `
+type mgmtDataPlane interface{ IsLoaded() bool }
+
+func (d *Daemon) startMgmt() {
+	var mgmtDP cliDataPlane
+	if live, ok := d.liveDataplane(); ok {
+		mgmtDP = live
+	}
+	_ = mgmt.Config{DP: mgmtDP}
+}
+`,
 		},
 		{
 			name: "bad/cli.New-without-a-live-probe",

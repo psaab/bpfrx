@@ -80314,3 +80314,127 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
   pkg/cli/cli_show_system.go, pkg/cli/cli_show_system_single_load_6743_test.go
   (new), pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go
+- **Timestamp**: 2026-08-20 (fix/2114-dp-accessor, PR #6743 round 5)
+- **Action**: #6743 round 5 — folded a MERGE-BLOCK on the round-4 fold. The
+  review verified round 4's RUNTIME half firsthand and found it complete: all
+  8 sites read `backendSessionCount(backend)`, the 8-cell matrix re-derived
+  independently at 8/8 rc=1, both assertions live, `(7,3)` genuinely
+  un-vacuuming the output assertion. What blocked is that BOTH re-keyed
+  guards shipped a universal they did not deliver. Two corrections, each
+  proven by measurement rather than argued.
+
+  **B1 (BLOCKING) — "route EVERY backend-reaching method through one counted
+  load" was 2 of 25.** The round-4 entry above states that sentence, and both
+  fixture headers stated it as "EVERY method that reaches the backend
+  performs its own counted cell load". It was false. `grpcRuntime` has 25
+  methods and `cliRuntime` 25; `countingIndirection` / `cliCountingIndirection`
+  declared 2 apiece (`SessionCount`, `GetMapStats`) plus `Unwrap`. The other
+  23 on each side were SERVED by the embedded concrete `*dataplane.Manager` —
+  the same shape round 7's guard died of ("an embedded method is a load the
+  counter cannot see"), reintroduced in the fix for it.
+
+  Measured at 44603f888: inserting `if !s.dp.IsLoaded() { buf.WriteString(
+  "stale\n") }` into showBuffers' map-stats arm — a real second cell load —
+  left `loads=1`, all four subtests PASS, `pkg/grpcapi` rc=0.
+
+  Fixed by embedding the runtime INTERFACE (`grpcRuntime` / `cliRuntime`),
+  left nil, instead of the concrete Manager. It still satisfies `Server.dp` /
+  `CLI.dp` (promotion supplies the method set), the three declared methods
+  still shadow, and every OTHER method now dispatches through a nil interface
+  and PANICS at the production call site that took it. The universal is
+  delivered rather than narrowed: there is no method on the fixture that can
+  reach the backend without the counter seeing it, and that is a property of
+  ONE field rather than of an enumeration. A loud panic naming the production
+  line beats a silent zero.
+
+  Bound by `TestShowBuffersCountingIndirectionServesNothingSilently` and its
+  CLI peer, in two clauses: STRUCTURAL (the embedded interface must be nil —
+  this is the clause that quantifies over all 22 undeclared methods at once)
+  and BEHAVIOURAL (`IsLoaded()` must panic rather than return). Re-embedding
+  the Manager reds both.
+
+  Proof: the same `IsLoaded()` insertion re-run at the r5 head. `pkg/grpcapi`
+  rc=1, `TestShowBuffersTakesOneCellLoad/showBuffers/mapStatsArm` FAIL, panic
+  stack naming `server_show_system.go:495`; `pkg/cli` rc=1,
+  `TestCLIShowSystemBuffersTakesOneCellLoad/showSystemBuffers/mapStatsArm`
+  FAIL naming `cli_show_system.go:60`. Each invocation also ran a pristine
+  control (`TestGRPCDpProbeResolvesThroughTheIndirection_6743` /
+  `TestCLIProbe_StatusSurvivesLiveIndirection`) which PASSED, and an
+  always-failing sentinel which FAILED — so a green cell is distinguishable
+  from a suite that never ran. Restore by file copy, never `git checkout --`.
+
+  **B2 (BLOCKING) — the canary's residual list was short again, and round 4
+  made it worse.** The round-4 entry says "the residual list drops from two
+  items to ONE". Re-counting the members of a population nobody had verified
+  yields a number that is more precise and no more true, and "one" reads as
+  audited in a way "two" did not.
+
+  The canary's reach was bounded by three hand-maintained literals —
+  `managementProbeTypes` (3 entries), `managementConsumerConfigs` (2), and
+  the literal `cli.New` selector. No test bound either map to reality; both
+  names appeared only at their declaration and their single use site.
+  `runtime_probes.go` declares SIX interfaces and 3 were registered.
+
+  Measured at 44603f888: a FOURTH management consumer added to real
+  production, wired capture-once with its own probe type, sourced through a
+  type assertion — precisely the escape R1 exists to kill — and handed to its
+  own `Config{DP: ...}` literal, left `pkg/daemon` rc=0 with 0 FAIL. R1
+  missed (type not in the map), R3 missed (config not in the map), R4 missed
+  (not `cli.New`). The file's own opening paragraph motivates itself with
+  exactly this case.
+
+  Two independent closures, so neither carries the property alone:
+
+  (1) `TestManagementProbeRegistryIsComplete` PARSES the probe declaration
+  files and reports any interface they declare that is in NEITHER
+  `managementProbeTypes` nor the new `managementProbeNonConsumerTypes` (an
+  explicit exemption carrying the reason). The population is bounded by the
+  source instead of by a memory, and the scan is scoped by the SAME
+  `managementProbeDeclFiles` map that grants the naming exemption, so the
+  exemption and the obligation cannot drift apart. Driven in both directions
+  by a self-test: clean, a seventh interface in `runtime_probes.go`, and an
+  unclassified one in the other declaration file.
+
+  (2) R3 no longer consults a registry of consumer packages at all. It keys
+  on the FIELD: any qualified composite literal with a `DP:` element must
+  take a live-derived value, whatever package or type name it wears.
+  `managementConsumerConfigs` is retired. Verified free of false positives —
+  `pkg/daemon` production has exactly two such literals and both were already
+  covered.
+
+  Proof, two cells, each with a pristine control and an always-failing
+  sentinel in the same invocation. CELL C: a seventh interface appended to
+  the real `runtime_probes.go` and left unregistered — rc=1,
+  `TestManagementProbeRegistryIsComplete` FAIL naming
+  `runtime_probes.go:mgmtDataPlane`, with the wiring fence still PASSING.
+  CELL D: the reviewer's fourth consumer added to real
+  `daemon_run_servers.go` with its own probe type, type assertion and
+  `mgmt.Config{DP: ...}` — rc=1, `TestManagementProbesComeFromLiveDataplane`
+  FAIL naming "daemon_run_servers.go:startMgmtServer builds mgmt.Config with
+  a DP value that is not derived from liveDataplane()", with the registry
+  test still PASSING. The two cells red on different assertions, which is
+  what makes them independent rather than one guard counted twice.
+
+  The residual is now stated as a PREDICATE, not a count. Two things remain,
+  both properties of the rules: runtime-control-flow ordering (R5 enumerates
+  the SYNTACTIC deferring forms only), and R4's site-keying on `cli.New` —
+  which a consumer escapes only by satisfying all THREE of taking its probe
+  as a plain call argument rather than a `DP:` field, not being `cli.New`,
+  and declaring its probe type outside the two declaration files. The third
+  conjunct is what bounds it: declared inside them, (1) forces registration
+  and R1/R2 apply.
+
+  **N1 — the REST byte-identity clause was proved for one schedule and read
+  unconditional.** "A torn view is therefore byte-identical to the untorn
+  one" holds for MONOTONE schedules only. A REFILL between loads 2 and 3 —
+  `dpProbe()` nil so the userspace arm is skipped, then `GetMapStats()`
+  resolving a RE-PUBLISHED backend — yields MAP rows where an untorn view of
+  either instant would have emitted USERSPACE rows. Commit-confirmed rollback
+  re-arms the dataplane, so the schedule is real. Scoped, and the refill case
+  named and recorded rather than papered over.
+
+  This round touches NO `.o`, no `userspace-xdp/`, and no protocol/wire file
+  — Go control-plane guards and comments only.
+- **File(s)**: pkg/grpcapi/server_show_system_single_resolve_6743_test.go,
+  pkg/cli/cli_show_system_single_load_6743_test.go,
+  pkg/daemon/daemon_dp_escape_canary_test.go, pkg/api/system.go

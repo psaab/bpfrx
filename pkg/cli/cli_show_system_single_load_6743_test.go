@@ -22,12 +22,25 @@ import (
 // `c.dp.SessionCount()` — a second load — with the header comment as the
 // only guard. A comment cannot fail.
 //
-// The fixture models pkg/daemon's liveDataPlane, where EVERY forwarder
+// The fixture models pkg/daemon's liveDataPlane, where a forwarder
 // performs its own cell load (Unwrap reads d.dataplane(); resolve() reads
-// it again). A render that loads twice therefore both bumps the counter
-// and observably tears, because the cell is empty from load 2 onward.
-// That is deterministic, not a race: it is a concurrent setDataplane(nil)
-// with the timing removed.
+// it again). Its reach is TOTAL over cliRuntime's 25 methods, and by
+// construction rather than by count:
+//
+//   - the three declared below (Unwrap, SessionCount, GetMapStats) each
+//     take their own counted load;
+//   - EVERY OTHER method PANICS, because the embedded cliRuntime is a nil
+//     interface and promotion dispatches all 22 undeclared methods through
+//     it. None of them can quietly answer.
+//
+// That is the r4 correction: r4 embedded a concrete *dataplane.Manager,
+// which SERVED those 22 — closing 2 of 25 while the header claimed all of
+// them. Bound now by TestCLICountingIndirectionServesNothingSilently.
+//
+// A render that loads twice through a DECLARED method both bumps the
+// counter and observably tears, because the cell is empty from load 2
+// onward. That is deterministic, not a race: it is a concurrent
+// setDataplane(nil) with the timing removed.
 
 const (
 	cliSingleLoadV4 = 7
@@ -40,13 +53,23 @@ const (
 // silently drops this line — the firewall reads as having no sessions.
 const cliSingleLoadActiveSessions = "Active sessions: 7 IPv4, 3 IPv6, 10 total"
 
-// cliCountingIndirection is a live indirection whose every backend-reaching
-// method is a counted cell load. The embedded *dataplane.Manager supplies
-// the mandatory cliRuntime surface; the methods below shadow it
-// deliberately, because an embedded method is a load the counter cannot
-// see — which is exactly how the gRPC peer's guard went blind.
+// cliCountingIndirection is a live indirection whose backend-reaching
+// methods are counted cell loads.
+//
+// The embedded cliRuntime is a nil INTERFACE, never a concrete value. It
+// is what makes this value assignable to CLI.dp — the promoted method set
+// is cliRuntime's — and simultaneously what makes the counter's reach
+// total: the three methods below shadow their promoted counterparts, and
+// every OTHER promoted method dispatches through a nil interface and
+// panics at the production call site that took it.
+//
+// Do NOT restore the r4 `*dataplane.Manager` embed. A concrete embed
+// satisfies the same field while SERVING the 22 undeclared methods, so a
+// render reaching the backend through any of them takes a load this
+// fixture cannot see — which is exactly how the gRPC peer's guard went
+// blind. TestCLICountingIndirectionServesNothingSilently binds it.
 type cliCountingIndirection struct {
-	*dataplane.Manager
+	cliRuntime
 	backend any
 	loads   atomic.Int32
 }
@@ -79,7 +102,13 @@ func (a *cliCountingIndirection) GetMapStats() []dataplane.MapStats {
 	return m.GetMapStats()
 }
 
-var _ dataplane.LiveUnwrapper = (*cliCountingIndirection)(nil)
+var (
+	_ dataplane.LiveUnwrapper = (*cliCountingIndirection)(nil)
+	// The nil embed is what makes the fixture storable in CLI.dp. If this
+	// assertion ever needs a concrete embed to hold, the counter has lost
+	// its reach — see the type's doc comment.
+	_ cliRuntime = (*cliCountingIndirection)(nil)
+)
 
 // cliMapStatsBackend drives the MAP-STATS arm: no Status(), plus a
 // non-empty map list so "No BPF maps available" can only mean the render
@@ -172,10 +201,7 @@ func TestCLIShowSystemBuffersTakesOneCellLoad(t *testing.T) {
 	for _, render := range renders {
 		for _, arm := range arms {
 			t.Run(render.name+"/"+arm.name, func(t *testing.T) {
-				dp := &cliCountingIndirection{
-					Manager: dataplane.New(),
-					backend: arm.backend(),
-				}
+				dp := &cliCountingIndirection{backend: arm.backend()}
 				c := &CLI{dp: dp}
 
 				var renderErr error
@@ -218,10 +244,7 @@ func TestCLIShowSystemBuffersTakesOneCellLoad(t *testing.T) {
 // userspace-arm rows would pass with no unwrap at all and the grid would be
 // vacuous in the arm this PR changed.
 func TestCLICountingIndirectionErasesStatus(t *testing.T) {
-	dp := &cliCountingIndirection{
-		Manager: dataplane.New(),
-		backend: &cliUserspaceArmBackend{Manager: dataplane.New()},
-	}
+	dp := &cliCountingIndirection{backend: &cliUserspaceArmBackend{Manager: dataplane.New()}}
 	if _, ok := any(dp).(cliUserspaceStatusProvider); ok {
 		t.Fatal("fixture drift: cliCountingIndirection implements " +
 			"cliUserspaceStatusProvider directly, so the userspace-arm rows no " +
@@ -229,6 +252,49 @@ func TestCLICountingIndirectionErasesStatus(t *testing.T) {
 	}
 	if got := dp.loads.Load(); got != 0 {
 		t.Fatalf("fixture drift: constructing cliCountingIndirection loaded the cell %d times, want 0", got)
+	}
+}
+
+// TestCLICountingIndirectionServesNothingSilently is what makes the grid's
+// claim a UNIVERSAL over cliRuntime's 25 methods rather than a statement
+// about the 3 this fixture declares. Peer of the gRPC side's
+// TestShowBuffersCountingIndirectionServesNothingSilently — the two guards
+// are separate because the two fixtures are separate values; a single
+// shared assertion would leave whichever side it did not run on unbound.
+//
+// r4 embedded a concrete *dataplane.Manager, which satisfies CLI.dp
+// identically AND answers the 22 undeclared methods, so a render reaching
+// the backend through one of them took a load the counter could not see.
+//
+//   - STRUCTURAL, and this is the clause that quantifies: the embedded
+//     cliRuntime must be nil. Every undeclared method promotes through
+//     that one field, so nil covers all 22 without naming them.
+//   - BEHAVIOURAL: IsLoaded() must panic rather than return. A panic names
+//     the production line in its stack; a silent `false` names nothing.
+func TestCLICountingIndirectionServesNothingSilently(t *testing.T) {
+	dp := &cliCountingIndirection{backend: &cliMapStatsBackend{Manager: dataplane.New()}}
+
+	if dp.cliRuntime != nil {
+		t.Fatal("fixture drift: cliCountingIndirection embeds a non-nil cliRuntime, so the " +
+			"22 methods it does not declare are SERVED rather than promoted through a nil " +
+			"interface. A render reaching the backend through one of them would take a cell " +
+			"load this fixture cannot count, and the grid would stay green at loads=1")
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("cliCountingIndirection.IsLoaded() returned instead of panicking: an " +
+					"undeclared backend-reaching method is answerable, so the load counter's " +
+					"reach is not total")
+			}
+		}()
+		_ = dp.IsLoaded()
+	}()
+
+	if got := dp.loads.Load(); got != 0 {
+		t.Fatalf("the panicking call took %d cell loads, want 0: it must not be able to "+
+			"reach the backend at all", got)
 	}
 }
 
@@ -244,7 +310,7 @@ func TestCLIShowSystemBuffersEmptyCellSaysNotLoaded(t *testing.T) {
 		{"showSystemBuffersDetail", (*CLI).showSystemBuffersDetail},
 	} {
 		t.Run(render.name, func(t *testing.T) {
-			c := &CLI{dp: &cliCountingIndirection{Manager: dataplane.New(), backend: nil}}
+			c := &CLI{dp: &cliCountingIndirection{backend: nil}}
 			var renderErr error
 			out := captureStdout(t, func() {
 				renderErr = render.render(c)

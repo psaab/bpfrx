@@ -246,8 +246,20 @@ func buildTracerouteArgv(req TracerouteRequest) []string {
 // FAIL CLOSED to the same body the early return produces: on an emptied
 // cell dpProbe() resolves nil so the Status() assertion fails, and
 // GetMapStats() returns nil so the loop appends nothing and writeOK emits
-// the same empty list as the `!IsLoaded()` return above. A torn view is
-// therefore byte-identical to the untorn one.
+// the same empty list as the `!IsLoaded()` return above. A torn view in
+// which the cell only EMPTIES is therefore byte-identical to the untorn
+// one.
+//
+// That scope is deliberate: the argument is about MONOTONE schedules and
+// does not cover a REFILL. If the cell empties before load 2 and is
+// RE-PUBLISHED before load 3, dpProbe() is nil so the userspace arm is
+// skipped, and GetMapStats() then resolves the new backend and emits MAP
+// rows where an untorn view of either instant would have emitted
+// userspace rows — a different body, not a byte-identical one. Commit-
+// confirmed rollback re-arms the dataplane, so that schedule is real
+// rather than hypothetical. Recorded, not fixed, here: closing it means
+// the same single-load conversion the gRPC and CLI peers took two passes
+// to finish.
 //
 // What remains is a SURFACE gap: for identical daemon state gRPC and CLI
 // print "Dataplane not loaded", while REST returns 200 with an empty list,
