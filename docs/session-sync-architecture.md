@@ -539,6 +539,25 @@ On disconnect:
 - the readiness timeout is invalidated with a generation guard so a stale timer
   callback cannot flip readiness back to true after disconnect
 
+### What cluster sync readiness does NOT do (#7102)
+
+It is not a promotion gate. Nothing in the RG readiness conjunction
+(`ifReady && takeoverGateReady && fabricReady && userspaceReady`,
+`pkg/daemon/daemon_ha_userspace_readiness.go`) reads
+`cluster.Manager.syncReady`; in no-RETH / private-rg-election mode
+`takeoverGateReady` is VIP ownership alone. A node in that mode can take over an
+RG before bulk sync completes. The gate that did read it — `vrrpReady =
+d.cluster.IsSyncReady()`, reporting `session sync not ready` as a takeover
+blocker — was deleted in `0781f7a60` (2026-04-05, empty commit body); whether it
+should return is **#110**, open. Today `IsSyncReady()` has exactly three
+production readers: the readiness timeout in `daemon_ha_sync.go` and two log
+fields.
+
+The **VRRP sync hold** released above is a real preemption suppressor, but it is
+a separate mechanism (`vrrp.Manager.SetSyncHold` / `ReleaseSyncHold`) armed only
+in RETH VRRP mode — do not read the two as one thing because they are released
+on the same edge.
+
 ### Pre-Auth Connection Admission (#5303)
 
 The accept loop admits every inbound connection into a small **pre-auth setup

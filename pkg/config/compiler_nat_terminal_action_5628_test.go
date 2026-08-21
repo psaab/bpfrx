@@ -102,7 +102,26 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 		// the wrong one, in a round whose subject was an operator-facing sentence
 		// being false. Assert the exact phrase, because the loose form reads
 		// better and that is precisely where it wins.
-		"the survivor is not chosen by configuration order",
+		//
+		// #7035 narrowed that phrase. The unscoped form ("the survivor is not
+		// chosen by configuration order") was false in exactly the case that
+		// prints it: with duplicate `then` CONTAINERS the #3850 reset makes the
+		// LAST container supply the counted fields, so container order selects
+		// which contradiction — and therefore which survivor — you get. The
+		// clause is now scoped to the block, and the parenthetical carries the
+		// cross-container case. Both halves are asserted, so neither the old
+		// unscoped form nor a silent drop of the scope can return.
+		"WITHIN THIS BLOCK, the survivor is decided by that fixed precedence " +
+			"rather than by the order the actions were written",
+		"container order therefore does decide WHICH contradiction you get here",
+		// #7034: the parenthetical used to end "this rejects contradictory
+		// actions inside one block", which reads as a completeness claim and is
+		// false for every token-packed spelling (`source-nat pool P off` and
+		// friends lower to ONE field and commit — see
+		// TestNATTerminalActionPackedContradictionCommits_7034). It now states
+		// the shape it actually covers and names #7033 for the rest.
+		"a contradiction whose tokens are PACKED onto one node",
+		"#7033",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("2+-action SNAT rejection missing %q — the message must describe the "+
