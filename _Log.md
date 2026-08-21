@@ -89234,3 +89234,30 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/interfaces.go,
   pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
   userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md
+
+## 2026-08-21 — #6938 merge with master + armed-gate census reconcile
+
+- **Timestamp**: 2026-08-21
+- **Action**: Merged `origin/master` (234 commits) into `fix/3651-flood-counters`.
+  Two conflicts. `_Log.md` union-resolved and structurally verified (sections
+  1588+1658-1587=1659, `Timestamp` occurrences 3007+3140-3005=3142, lines
+  79401+88927-79092=89236 — all exact). `userspace-dp/src/afxdp/forwarding_build/tests.rs`
+  was an add/add at the file tail where BOTH sides appended a `#[test] fn` and
+  SHARED the trailing `}`; union-resolving it would have folded master's
+  `secure_tunnel_unit_ifindex_decides_route_disposition` inside this branch's
+  `config_apply_builds_both_per_zone_counter_slot_maps_3651`. Resolved by hand
+  (both tests kept, closing brace restored for the first) and proven by running
+  both tests, not by the merge being textually clean.
+- **File(s)**: `_Log.md`, `userspace-dp/src/afxdp/forwarding_build/tests.rs`
+
+- **Timestamp**: 2026-08-21
+- **Action**: Semantic merge conflict repair: master's #6743 r4 census
+  (`TestManager_PreArmMethodMatrix`) counts exported `*Manager` methods and
+  requires each to carry exactly one armed-gate class. This branch adds
+  `ReplaceFloodCounterOffsets`, so the merged tree failed with
+  `inventory = 160, want 159`. Classified it `catG` (ungated Go-state helper:
+  takes `m.mu`, rebuilds the `m.mu`-protected `floodCounterOffsets` map, touches
+  neither `m.maps` nor `m.programs` — identical behaviour fresh/armed/retained,
+  the same shape as its `ReplaceZoneCounterOffsets` sibling) and bumped the
+  census to 160.
+- **File(s)**: `pkg/dataplane/armed_gate_matrix_test.go`
