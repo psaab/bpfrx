@@ -993,7 +993,7 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 ## Sprint CC-9: Config Sync (Primary→Secondary)
 
 ### Overview
-Configuration synchronization between chassis cluster nodes. Primary node pushes full config text to secondary after each commit. Secondary nodes operate in read-only mode, rejecting all config mutations.
+Configuration synchronization between chassis cluster nodes. Primary node pushes full config text to secondary after each commit. A secondary **whose read-only gate is armed** rejects every user config mutation. Arming is not universal (#6896): `SetClusterReadOnly(true)` is reached only from the RG0 **transition** handler (see the CC-9 store section below) and `clusterReadOnly` starts `false`, so a node that cold-starts as secondary and never transitions is not gated — tracked as #6890, with #6889 the dropped-event variant. Read this as the design intent, not as a property every secondary has.
 
 ### Config Sync Protocol (pkg/cluster/sync.go)
 - **New message type:** `syncMsgConfig = 8` — full config text sync from primary to secondary
