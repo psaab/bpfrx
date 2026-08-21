@@ -1088,12 +1088,39 @@ under the daemon's errgroup. Nothing else imports this package.
       fixing it cheap rather than optional: narrowing the invariant instead would
       have left the shape in the tree for the next reader to copy. Bound by
       `TestServeBoundSeversInFlightResponses_6827`, which runs BOTH legs with a
-      stream held on each (#6827 round 11). It used to pass `nil` for `httpsLn`,
-      so it never entered the `if s.httpsServer != nil` branch and reverting
-      THAT statement alone to a bare `Shutdown` left `pkg/api` and `pkg/daemon`
-      green — deleting it reds only
-      `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener
-      CLOSES, not that a response is SEVERED. Round 10's own revert mutation
+      stream held on each (#6827 round 11). BEFORE round 11 that cell passed
+      `nil` for `httpsLn`, so it never entered the `if s.httpsServer != nil`
+      branch and the HTTPS statement was unbound: against THAT tree, reverting
+      it alone to a bare `Shutdown` left `pkg/api` and `pkg/daemon` green, and
+      deleting it redded only `TestRunGracefulShutdownClosesBothListeners`.
+      Neither cell was re-measured when round 11 bound the HTTPS leg, and the
+      second stopped being true (#7046). Re-measured on the SHIPPED tree — head
+      `f8e720c3e`, `pkg/api` green at baseline, exit codes read from `$?`:
+
+      - **Deleting** the HTTPS `drainLeg` reds TWO, not one:
+        `TestRunGracefulShutdownClosesBothListeners`
+        (`server_run_leak_5058_test.go:152`, "Run did not return after ctx
+        cancellation") and `TestServeBoundSeversInFlightResponses_6827`
+        (`tls_stale_cert_6827_test.go:1393`, "serveBound did not return after
+        ctx cancellation"). Both fail on the SAME observable and neither
+        reaches its severing assertion: with no `Shutdown` at all the HTTPS
+        `Serve` goroutine is never unblocked, so `wg.Wait()` never joins.
+      - **Reverting** it to a bare `Shutdown` (deadline, no `Close`) reds ONE:
+        `TestServeBoundSeversInFlightResponses_6827` alone
+        (`tls_stale_cert_6827_test.go:1404` — the HTTPS connection "was still
+        OPEN 3s later"), with `TestRunGracefulShutdownClosesBothListeners`
+        PASSING.
+
+      So "the listener CLOSES, not a response SEVERED" is the right distinction
+      attached to the wrong mutation. It is the BARE-SHUTDOWN cell that isolates
+      severing, because a `Shutdown` still unblocks `Serve` and both tests get
+      their join; the DELETE cell is coarser — it breaks the join, which any
+      test that cancels and waits can see. Note also what cannot be fixed by
+      testing harder: a "reds only X" claim is a statement about the rest of the
+      suite, and no test can assert it. State the mutation, the head it was
+      measured at, and the observed cells — a bare count silently goes stale the
+      next time a fixture grows a leg, which is exactly what happened here.
+      Round 10's own revert mutation
       flipped both statements together, and the bound HTTP leg redded the cell
       and masked the unbound HTTPS one: a compound mutation cannot localise. The
       cell also ASSERTS the returned error now — `drainLeg` grew a return value
