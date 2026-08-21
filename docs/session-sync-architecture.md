@@ -672,6 +672,31 @@ discharged) do not re-bulk.
 where a newer full-disconnect epoch's arm is cleared by an older epoch's success
 self-heals via `forceResync` / the #4090 survivor re-drive / the next reconnect.
 
+**The connected sweep is the third consumer (#82).** Both consumers above are
+disconnect-edge triggered — `installConn` on a reconnect, `handleDisconnect` on
+a survivor fabric. A cold-prime bulk that fails WITHOUT dropping the connection
+therefore left the obligation armed with no consumer for the life of that
+connection. `BulkSync`'s own preconditions produce exactly that shape: it
+returns `session store not ready` (nil `s.sessions`) or `no peer connection`
+before it writes a byte, so no `handleDisconnect` follows. The startup window is
+the real trigger — `startClusterComms` used to call `ss.Start()` (which spawns
+the accept/dial goroutines) and only then `ss.SetRuntime(rt)`, so a peer that
+connected in between drove the cold prime against a nil session store.
+
+The incremental sweep cannot cover for it: `StartSyncSweep` seeds
+`lastSweepTime` to "now" and the sweep only queues sessions with
+`Created >= threshold`, so every session that existed before the sweep started
+is permanently invisible to it — and only a `BulkStart -> BulkEnd` window drives
+the peer's authoritative `reconcileStaleSessions`. `syncSweep` therefore
+re-drives an owed cold prime on the live connection, past its `s.sessions == nil`
+guard so the store is known wired, discharging on success and leaving the arm in
+place on failure so the next tick retries. It is an `else if` on the
+`forceResync` consume (a forced resync sends the same authoritative snapshot, so
+at most one bulk leaves per tick) and shares `bulkRedriveInFlight` with the
+survivor re-drive so the two cannot stack. The daemon also now wires the runtime
+BEFORE `ss.Start()`, which removes the trigger and gives the `SetRuntime` writes
+a happens-before edge over the goroutines `Start` spawns.
+
 ## Incremental Sweep and Delete Journal
 
 ### Background Sweep

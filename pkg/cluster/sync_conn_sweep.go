@@ -121,6 +121,44 @@ func (s *SessionSync) syncSweep() int {
 			s.forceResync.Store(true)
 			slog.Warn("cluster sync: forced resync bulk failed, will retry", "err", err)
 		}
+	} else if s.needColdPrime.Load() && s.bulkRedriveInFlight.CompareAndSwap(false, true) {
+		// #82: an OWED cold prime had exactly two consumers — installConn (a
+		// reconnect) and handleDisconnect's survivor re-drive. Both are
+		// disconnect-edge triggered, so a first bulk that failed WITHOUT
+		// dropping the connection left the obligation armed with no consumer
+		// for the life of that connection.
+		//
+		// BulkSync's own preconditions produce exactly that shape: it returns
+		// "session store not ready" (nil s.sessions) or "no peer connection"
+		// BEFORE it writes a byte, so no handleDisconnect follows. The startup
+		// window is the real trigger — the daemon starts session sync and only
+		// then wires the dataplane runtime, so a peer that connects in between
+		// drives the cold prime against a nil session store.
+		//
+		// The incremental path below cannot cover for it. StartSyncSweep seeds
+		// lastSweepTime to "now" and the sweep only queues sessions with
+		// Created >= threshold, so every session that existed before the sweep
+		// started is permanently invisible to it — and only a BulkStart ->
+		// BulkEnd window drives the peer's authoritative
+		// reconcileStaleSessions. Re-drive here, past the s.sessions nil guard
+		// above so the store is known wired, discharging on success and
+		// leaving the arm in place on failure so the next tick retries.
+		//
+		// else-if, not a second independent block: a forced resync sends the
+		// same authoritative snapshot, so at most one bulk leaves per tick.
+		//
+		// Share bulkRedriveInFlight with the survivor-fabric re-drive so the
+		// two cannot stack a second bulk on top of an in-flight one; the CAS
+		// simply skips this tick when that re-drive owns the flag, and the arm
+		// it is still holding brings us back on the next one.
+		slog.Warn("cluster sync: re-driving owed cold-prime bulk on the live connection (first attempt did not complete)")
+		err := s.doBulkSync()
+		s.bulkRedriveInFlight.Store(false)
+		if err != nil {
+			slog.Warn("cluster sync: owed cold-prime re-drive failed, will retry", "err", err)
+		} else {
+			s.needColdPrime.Store(false)
+		}
 	}
 	if s.lastSweepEmpty && !s.syncBackfillNeeded.Load() {
 		if s.telemetry != nil {
