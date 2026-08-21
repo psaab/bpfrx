@@ -73,21 +73,14 @@ func TestShowScreenReportsUnresolvedReferenceWithNoProfilesDefined(t *testing.T)
 	// of showScreen keeps all of them green while the operator reads
 	// "No screen profiles configured" FIRST — the exact misreading this guard
 	// exists to prevent, since that line says "nothing was asked for" and the
-	// correction arrives after it. Assert the block precedes it.
-	refIdx := strings.Index(out, dpuserspace.ScreenUnresolvedDisposition)
-	emptyIdx := strings.Index(out, "No screen profiles configured")
-	if refIdx < 0 || emptyIdx < 0 {
-		t.Fatalf("both the disposition and the empty-inventory line must be present "+
-			"for the ordering check to mean anything; got:\n%s", out)
-	}
-	if refIdx > emptyIdx {
-		t.Errorf("the unresolved-reference block must be rendered BEFORE "+
-			"%q (disposition at byte %d, empty-inventory line at byte %d). An operator "+
-			"who reads the empty-inventory line first has already been told nothing was "+
-			"configured; a correction below it is not the same signal. Containment "+
-			"assertions alone cannot see this — they pass with the emit moved to the end "+
-			"of showScreen; got:\n%s",
-			"No screen profiles configured", refIdx, emptyIdx, out)
+	// correction arrives after it.
+	//
+	// The check itself is SHARED with the local-CLI guard (#6839 round 3) rather
+	// than hand-written here. Both renderers ship one contract, so a divergence
+	// between two copies of its assertion is always a bug; round 2 wrote this
+	// check here only, and the CLI peer stayed position-blind.
+	if err := dpuserspace.CheckScreenUnresolvedRenderOrder(out); err != nil {
+		t.Errorf("gRPC showScreen: %v", err)
 	}
 }
 

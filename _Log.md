@@ -79452,3 +79452,115 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-20T19:55Z
+- **Action**: #6839 round 3 — closed the ordering property on the SECOND renderer
+  that ships it, and narrowed two claims to what was measured.
+
+  **B1 (blocking).** Round 2 established "the unresolved-reference block must
+  precede the empty-inventory line", measured it at three placements, and bound
+  it — on the gRPC renderer only. The local-CLI renderer ships the identical
+  contract (its own comment at `cli_show_security_screen.go:22-28` names the
+  hazard) and its guard `TestShowScreenLocalCLIReportsUnresolvedReference`
+  asserted structure INSIDE the block, never mentioning
+  `"No screen profiles configured"` at all, so it could not see position
+  relative to it. Measured at 1858bdf50: emitting inside the early-return branch
+  AFTER that line was rc=0 on `./pkg/cli/`.
+
+  Fixed by SINGLE-SOURCING the check rather than mirroring it —
+  `dpuserspace.CheckScreenUnresolvedRenderOrder` (screens.go), called from both
+  guards. The two renderers ship one contract, so a divergence between two
+  copies of its assertion is always a bug rather than a legitimate difference,
+  which is the condition under which single-sourcing beats binding two copies.
+  It takes no `testing` dependency (returns `error`) and lives next to the
+  `ScreenUnresolvedProfileLines` doc clause it makes executable. The
+  empty-inventory wording is re-typed inside it deliberately: an assertion that
+  read its expected value out of the renderer it checks would assert nothing.
+  The presence check relocated from the gRPC test lives here, where it is NOT
+  dead — without it, output carrying NEITHER string compares `-1 > -1` and the
+  ordering check passes vacuously.
+
+  Mutation matrix, one mutation per cell, each renderer separately, sentinel
+  rc=1 in every cell and the tree verified clean after each restore:
+
+  | cell | pre-fix | post-fix | source of the red |
+  |---|---|---|---|
+  | CLI: delete the emit loop | rc=1 | rc=1 | COMPILER — `cli_show_security_screen.go:11` unused `dpuserspace`; 0 `--- FAIL` |
+  | CLI: move after the early return | rc=1 | rc=1 | heading assertion |
+  | CLI: emit inside the branch, after the line | **rc=0** | **rc=1** | `cli_show_screen_unresolved_5806_test.go:164`, the shared check |
+  | gRPC: emit inside the branch, after the line | (bound r2) | rc=1 | `server_show_screen_unresolved_5806_test.go:83`, same shared check |
+
+  The CLI guard's own doc claimed deleting the loop makes "every assertion here
+  fails". Measured: it is a build failure with 0 `--- FAIL`. Corrected forward
+  to the three-placement matrix, matching its gRPC peer.
+
+  **B2 — the `"however spelled"` claim was FALSE; narrowed to the seam.**
+  `screens_ssot_source_5806_test.go` claimed the SSOT scan catches a duplicated
+  sentence "however spelled". `concatSplice` is `"\s*\+\s*\n?\s*"` — double
+  quotes, and only whitespace in the seam. Four escapes planted and measured,
+  each `go build` rc=0 and guard rc=0: (1) the `+` seam interrupted by a
+  `// comment`, (2) backtick raw-string chunks joined by `+`, (3) one character
+  written `\x79` — all three in `pkg/api/metrics.go` — and (4)
+  `strings.Join([]string{…}, "")` in `pkg/grpcapi/server_show_security_text.go`.
+  Two of those are split-concatenation copies, so the claim failed even on its
+  charitable reading. Narrowed to "however split across a `\" + \"` seam" with
+  the four escapes named as the boundary. The doc sentence in
+  `docs/feature-coverage.md` carries the same B4 wire-hop clause as the two code
+  sites, so the three do not diverge on the claim they share.
+
+  The "rc=0 across all four packages" figure for the third placement is measured
+  here, not inherited: the five round-3 files were rolled back to their
+  1858bdf50 blobs, the CLI third-placement mutation applied, and
+  `./pkg/api/... ./pkg/dataplane/userspace/... ./pkg/grpcapi/... ./pkg/cli/...`
+  run — rc=0 with 0 `--- FAIL`. The escape was total, not local to ./pkg/cli/.
+
+  The widening round 2 bought is real, and is now measured both ways rather than
+  asserted: a plain `+`-seam copy planted in `pkg/api/metrics.go` — a file no
+  round tested, not on the consumer list — builds rc=0 and REDS the guard; and
+  reverting just that walk to the round-1 raw `strings.Count` shape makes the
+  same plant pass rc=0. The round-2 sentence "Measured rc=0 before this change"
+  was inherited, not re-measured; it is now replaced by these two cells.
+
+  **B3 — comment false positive recorded, not fixed.** Quoting the sentence
+  inside a `//` comment in any non-test `.go` under `pkg/`/`cmd/` reds the guard
+  (measured) with a message asserting a duplicated literal that "lets the metric
+  HELP and the status block drift". A comment cannot cause drift. Pre-existing
+  (round 1 counted raw bytes too) so left alone, but `screens.go` and
+  `server_show_security_text.go` now carry long comments ABOUT this sentence, so
+  a near-miss is one reword away. Recorded in the test file where someone
+  hitting it will find it.
+
+  **B4 — wire-hop clause.** "cannot name a different set than the dataplane was
+  told about" is a claim about the Rust side; the argument given covers only
+  Go-struct to Go-struct identity, and struct -> wire -> decoder is a second hop.
+  It IS bound, so the clause now says so and cites
+  `TestScreenMissingProfilesPublishedToSnapshot`, which marshals the snapshot and
+  pins `screen_missing_profile_zones` with its `zone`/`profile` elements. Added
+  at BOTH sites that make the claim (`metrics_counters.go:193` "the dataplane",
+  `screens.go:139` "the helper") — fixing one and not the other would have left
+  exactly the divergence the sentence is about.
+
+  **CORRECTION to the round-3 review, on the record.** The review listed
+  `server_show_screen_unresolved_5806_test.go:63`
+  (`Contains(out, "policy evaluation is unaffected")`) as dead-but-not-defective,
+  "subsumed by line 57's Fatalf", and left deletion to this round. It is NOT
+  dead and was NOT deleted. Line 57 asserts `Contains(out,
+  ScreenUnresolvedDisposition)` — a SOURCE-IDENTITY check that stays green for
+  whatever the constant happens to say; line 63 is the only assertion that pins
+  the constant's CONTENT. Measured: dropping "; policy evaluation is unaffected"
+  from the constant leaves line 57 green and reds at line 64. Two assertions,
+  two different properties. Its CLI peer is live for the same reason. The
+  per-consumer splice check was kept as directed (belt-and-braces, better
+  message).
+
+  **Validation at the committed head.** `gofmt -l` clean on all five touched
+  files; `go build ./...` rc 0; `go vet` rc 0 over the four packages;
+  `go test -count=1 ./pkg/api/... ./pkg/dataplane/userspace/... ./pkg/grpcapi/...
+  ./pkg/cli/...` rc 0 with 0 `--- FAIL`. No production forwarding logic changed;
+  the only non-test production edits are the new checker and three doc comments.
+  No cluster smoke owed — no shim `.o`, no protocol, no dataplane path touched.
+- **File(s)**: pkg/dataplane/userspace/screens.go,
+  pkg/dataplane/userspace/screens_ssot_source_5806_test.go,
+  pkg/api/metrics_counters.go,
+  pkg/cli/cli_show_screen_unresolved_5806_test.go,
+  pkg/grpcapi/server_show_screen_unresolved_5806_test.go, _Log.md

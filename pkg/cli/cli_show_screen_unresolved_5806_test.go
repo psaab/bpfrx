@@ -74,8 +74,26 @@ security {
 // passed the entire suite. This binds it, through the real tolerant-load path
 // rather than a hand-built config, so it also exercises `c.store.ActiveConfig()`.
 //
-// RED on revert: delete the ScreenUnresolvedProfileLines loop from
-// cli_show_security_screen.go and every assertion here fails.
+// RED on revert, measured at the same three placements as the gRPC peer rather
+// than asserted (#6839 round 3 — the round-2 claim that deleting the loop makes
+// "every assertion here fails" is not what happens: no assertion runs at all,
+// because the package stops compiling):
+//
+//   - DELETE the loop from cli_show_security_screen.go → rc=1, but from the
+//     COMPILER, not from here: `dpuserspace` becomes an unused import, and the
+//     run reports 0 `--- FAIL`. Worth naming, because a build failure is not
+//     this guard firing, and if any other reference to that package is ever
+//     added to that file the deletion becomes invisible to it.
+//   - MOVE it AFTER the empty-inventory early return (so the empty-Screen case
+//     skips it) → rc=1 here, on the heading assertion. This is the placement
+//     the original claim described.
+//   - MOVE it INSIDE the early-return branch, AFTER the "No screen profiles
+//     configured" line → rc=0 on ./pkg/cli/ AND rc=0 across all four packages
+//     before round 3. Every assertion below was structural-within-the-block or
+//     `strings.Contains`, and neither can see position relative to a line this
+//     test never mentioned, so the operator read "nothing was configured" first
+//     and the correction after it. The shared ordering check at the end closes
+//     that third placement.
 func TestShowScreenLocalCLIReportsUnresolvedReference(t *testing.T) {
 	c := &CLI{store: danglingScreenRefStore(t)}
 	out := captureStdout(t, func() {
@@ -134,6 +152,17 @@ func TestShowScreenLocalCLIReportsUnresolvedReference(t *testing.T) {
 	}
 	if !strings.Contains(out, "policy evaluation is unaffected") {
 		t.Errorf("disposition must not read as a permit; got:\n%s", out)
+	}
+	// ORDER (#6839 round 3). Everything above asserts structure INSIDE the block
+	// or containment, and neither can see where the block sits relative to
+	// "No screen profiles configured" — the line this renderer prints two
+	// statements later, and the one whose "nothing was asked for" reading the
+	// block exists to correct. The check is SHARED with the gRPC guard, not
+	// re-typed: both renderers ship one contract, so a divergence between two
+	// copies of its assertion is always a bug rather than a legitimate
+	// difference.
+	if err := dpuserspace.CheckScreenUnresolvedRenderOrder(out); err != nil {
+		t.Errorf("local CLI showScreen: %v", err)
 	}
 }
 

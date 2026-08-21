@@ -68,10 +68,44 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 	// counting. Round 1 normalised only the two files on the consumer list below,
 	// so a split copy in any THIRD non-test file under pkg/ or cmd/ was invisible
 	// to both halves: the raw scan could not see it (the fragment spans a chunk
-	// boundary) and the splice check never looked at that file. Measured rc=0
-	// before this change. Normalising the whole walk makes the count itself the
-	// property — one literal, anywhere, however spelled — instead of a property
-	// of an enumeration that has to be kept in sync with the consumer set.
+	// boundary) and the splice check never looked at that file. Normalising the
+	// whole walk makes the count itself the property — one literal, anywhere,
+	// however split across a `" + "` seam — instead of a property of an
+	// enumeration that has to be kept in sync with the consumer set.
+	//
+	// That widening is real, and measured both ways (#6839 round 3): a plain
+	// `+`-seam copy planted in pkg/api/metrics.go — a file no round tested and
+	// which is not on the consumer list — builds rc=0 and REDS this guard, and
+	// reverting just this walk to the round-1 raw strings.Count shape makes that
+	// same plant pass rc=0.
+	//
+	// The seam is also the BOUNDARY, and it is narrower than "however spelled".
+	// concatSplice below requires double quotes around a single `+`, with
+	// NOTHING but whitespace elsewhere in the seam, so the scan is a source-text
+	// scan, not a semantic one.
+	// Four escapes were planted and measured at round 3 — each `go build` rc=0
+	// and this guard rc=0, i.e. a compiling duplicate the count cannot see:
+	//
+	//   1. the `+` seam interrupted by a `// comment`   (pkg/api/metrics.go)
+	//   2. backtick raw-string chunks joined by `+`     (pkg/api/metrics.go)
+	//   3. one character written `\x79`                 (pkg/api/metrics.go)
+	//   4. strings.Join([]string{…}, "")                (pkg/grpcapi/…_text.go)
+	//
+	// Two of those (1 and 2) are split-concatenation copies, so the claim fails
+	// even on its charitable reading. This is a deliberate limit, not a defect to
+	// chase: catching them needs a go/ast or type-checked constant walk, and the
+	// failure mode being defended against is an ordinary copy-paste of a
+	// sentence, not an adversary hand-obfuscating one.
+	//
+	// Known FALSE POSITIVE, pre-existing and deliberately not fixed here: the
+	// scan counts raw source bytes, so quoting this sentence inside a `//`
+	// comment in any non-test .go under pkg/ or cmd/ also reds the guard —
+	// measured — with a message asserting a duplicated literal that "lets the
+	// metric HELP and the status block drift". A comment cannot cause drift. It
+	// predates round 2 (round 1 counted raw bytes too) and is left alone, but
+	// screens.go and server_show_security_text.go now carry long comments ABOUT
+	// this sentence, so a near-miss is one reword away: if this guard reds on a
+	// file you only added prose to, that is this, not a duplicated literal.
 	total := 0
 	var hits []string
 	for _, sub := range []string{"pkg", "cmd"} {

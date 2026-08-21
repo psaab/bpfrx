@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -136,7 +137,13 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 // been published for the config being rendered, that snapshot's
 // ScreenMissingProfiles and every surface reading this function are the same
 // function of the same input, so no surface can report a different set than the
-// helper was told about. The unqualified form — "can never report a different
+// helper was told about. That identity is Go-struct to Go-struct; the helper
+// reads JSON, so struct → wire → decoder is a SECOND hop and is NOT part of
+// this argument. It is bound separately rather than assumed:
+// TestScreenMissingProfilesPublishedToSnapshot
+// (screens_ssot_source_5806_test.go) marshals the snapshot and pins the wire key
+// `screen_missing_profile_zones` with its `zone`/`profile` elements — the names
+// the Rust decoder reads. The unqualified form — "can never report a different
 // set" — is false whenever NO snapshot has been published: a config-only /
 // degraded boot, which is exactly the case these surfaces exist to cover (this
 // PR's own metrics fixture compiles a config with a nil dataplane). There is no
@@ -199,6 +206,53 @@ func ScreenUnresolvedProfileLines(cfg *config.Config) []string {
 	}
 	lines = append(lines, "  Disposition: "+ScreenUnresolvedDisposition+".")
 	return lines
+}
+
+// CheckScreenUnresolvedRenderOrder enforces the ORDERING half of the
+// ScreenUnresolvedProfileLines contract stated above — the block must reach the
+// operator BEFORE the empty-inventory line, not after it. It returns nil when
+// rendered `show security screen` output satisfies that, and an error naming
+// both byte offsets when it does not.
+//
+// It is ONE check because there is ONE contract. Both renderers ship it
+// (pkg/cli/cli_show_security_screen.go and
+// pkg/grpcapi/server_show_security_text.go), so a divergence between two
+// hand-written guards is always a bug rather than a legitimate difference —
+// which is the condition under which single-sourcing beats binding two copies.
+// Through #6839 round 2 only the gRPC guard checked order at all: the local-CLI
+// guard asserted structure INSIDE the block and never mentioned the
+// empty-inventory line, so moving the emit into the early-return branch AFTER
+// that line was measured rc=0 on ./pkg/cli/ and rc=0 across all four packages.
+//
+// The presence check is not redundant with whatever else a caller asserts:
+// without it, output carrying NEITHER string compares -1 > -1 and the ordering
+// check passes vacuously.
+//
+// The empty-inventory wording is re-typed here deliberately. An assertion that
+// read its expected value out of the renderer it is checking would assert
+// nothing; this is an independent statement of what the operator reads, so
+// changing either renderer's wording without revisiting this contract fails
+// here rather than silently agreeing with itself.
+func CheckScreenUnresolvedRenderOrder(out string) error {
+	const emptyInventory = "No screen profiles configured"
+	blockIdx := strings.Index(out, ScreenUnresolvedDisposition)
+	emptyIdx := strings.Index(out, emptyInventory)
+	if blockIdx < 0 || emptyIdx < 0 {
+		return fmt.Errorf("both the unresolved-reference disposition and %q must be "+
+			"present for the ordering check to mean anything (disposition at byte %d, "+
+			"empty-inventory line at byte %d); rendered output:\n%s",
+			emptyInventory, blockIdx, emptyIdx, out)
+	}
+	if blockIdx > emptyIdx {
+		return fmt.Errorf("the unresolved-reference block must be rendered BEFORE %q "+
+			"(disposition at byte %d, empty-inventory line at byte %d). An operator who "+
+			"reads the empty-inventory line first has already been told nothing was "+
+			"configured; a correction printed below it is not the same signal. "+
+			"Containment assertions alone cannot see this — they stay green with the "+
+			"emit moved after the line; rendered output:\n%s",
+			emptyInventory, blockIdx, emptyIdx, out)
+	}
+	return nil
 }
 
 // buildScreenMissingProfileRefs records every zone that REFERENCES a screen

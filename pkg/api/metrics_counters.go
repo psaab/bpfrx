@@ -191,7 +191,14 @@ func (c *xpfCollector) collectPBRStatus(ch chan<- prometheus.Metric) {
 // WHENEVER a snapshot has been published for the current active config, that
 // snapshot's ScreenMissingProfiles and this metric are the same function of the
 // same input, so this metric cannot name a different set than the dataplane was
-// told about. The unqualified form — "impossible to report a different set" —
+// told about. "The dataplane" is the Rust helper, and that identity is only
+// Go-struct to Go-struct: struct → wire → decoder is a SECOND hop, not part of
+// this argument. It is bound separately rather than assumed —
+// dpuserspace.TestScreenMissingProfilesPublishedToSnapshot
+// (pkg/dataplane/userspace/screens_ssot_source_5806_test.go) marshals the
+// snapshot and pins the wire key `screen_missing_profile_zones` with its
+// `zone`/`profile` elements, the names the Rust decoder reads.
+// The unqualified form — "impossible to report a different set" —
 // is false in the config-only / degraded boot this collector exists to survive:
 // there is no published snapshot at all then (this PR's own fixture compiles a
 // config with a nil dataplane), so there is no told-about set to agree with, and
