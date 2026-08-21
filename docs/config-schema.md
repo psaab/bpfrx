@@ -1090,8 +1090,8 @@ control so an ACCEPT only counts beside a REJECT of the same token:
 
 | Leaf | Shape that ESCAPES | Same token REJECTED as | Tracked |
 |---|---|---|---|
-| CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 — FIXED |
-| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
+| CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 — **CLOSED**, see below |
+| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 — **CLOSED**, see below |
 | `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 — **CLOSED**, see below |
 
 Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
@@ -1133,6 +1133,11 @@ archive-sites escape is inert TODAY only because the value is also dropped. A
 follow-up that widens that read without widening the leading-dash check in the
 same change ships a live CWE-88 argument injection; the warning is stated at the
 read site itself in `compiler_system.go`, not only here.
+
+That follow-up is #6692, and it widened BOTH in one change — see
+"#6692: four system-stanza multi-value leaves" below. The leading-dash gate now
+runs over every entry `archiveSiteEntries` returns, so the escape closed in the
+same commit that could have armed it.
 
 **An EMPTY authored value is a value, and whether to keep it depends on whether
 the leaf SELECTS or SETS (#6673).** `firewallMatchValues` skips blank tokens,
@@ -1188,7 +1193,7 @@ bundled, because each needs its own value-domain gate widened in the same change
 
 | Leaf | Still one-sided | Tracked |
 |---|---|---|
-| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
+| ~~`system archival archive-sites` (+ three sibling system leaves)~~ | ~~reads `Children` and only slot 1 of the tail~~ | #6692 — FIXED |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
 ### The list above is now enforced by a gate, not maintained by hand
@@ -1215,9 +1220,12 @@ CoS code-point reads left this gate green. The third class closes it: for a leaf
 the schema marks `multi: true` — a declared value list, where the block form is
 legal Junos — a spelling that is READ sitting beside one that is INERT is itself
 the finding. Restricting it to `multi` leaves is what makes it usable: over all
-value-bearing leaves the same rule fires at 119 sites, almost all scalar leaves
-for which `leaf { v; }` is not a Junos spelling; over `multi` leaves it fires at
-2, both already owned by an allowlist row.
+value-bearing leaves the same rule fires at 117 sites, almost all scalar leaves
+for which `leaf { v; }` is not a Junos spelling. Over `multi` leaves it fires at
+ZERO today, and that is what lets it be a build gate rather than a report; its
+non-vacuity is the mutation, not the count — revert the five CoS code-point
+reads and it names all three classifier sites, where the first two classes stay
+silent.
 
 **The compared output must exclude the DIAGNOSTIC channel, and a leaf is only
 covered by a value pair its DOMAIN accepts (#6697).** `cfg.Warnings` is a field
@@ -1262,7 +1270,7 @@ so the row is removed by whoever fixes the defect and closes the issue, rather
 than being deleted quietly to get green.
 
 **A green run is not a swept schema, and the gate says so in its own output.**
-It compares 608 of the 1018 sites it enumerates; the other 410 go inert under
+It compares 607 of the 1017 sites it enumerates; the other 410 go inert under
 synthetic parent paths the compiler rejects and carry no verdict in either
 direction. It also sees ONE DIRECTION — a compiler DROPPING a value. The opposite
 defect, a reader PROMOTING a per-value modifier keyword into the value list (the
@@ -1286,6 +1294,81 @@ cardinality gate must also count only DISTINCT entries (`dedupeValuesBy`): a
 repeated value is one value, and rejecting it invents a rejection too. See
 "A cardinality gate counts DISTINCT values" below for how each leaf picks its
 identity.
+
+### #6692: four system-stanza multi-value leaves, and why only three shared a fix
+
+Four `multi: true` leaves under `system` were read with a single-value accessor,
+so a bracketed list — which the lexer collapses onto ONE node's `Keys` — compiled
+its first member and silently dropped the rest. Measured with the
+spelling-differential gate's own `spellingVerdicts`, before the fix:
+
+| Site | A hier-bracket | B hier-block | C hier-repeat | D set-bracket | E set-repeat |
+|---|---|---|---|---|---|
+| `system archival configuration archive-sites` | drop | keep | keep | drop | keep |
+| `system services ssh key-exchange` | drop | drop | keep | drop | keep |
+| `system services web-management api-auth api-key` | drop | drop | keep | drop | keep |
+| `system dataplane shared-umem interface` | drop | drop | keep | drop | keep |
+
+(Identical for all eight of the gate's value pairs — the drop is shape-driven,
+not domain-driven.) `archive-sites` differs on B because its reader already
+walked `Children`; the other three read neither side past slot 0.
+
+**Three of the four share a fix; the fourth does not, and assuming otherwise
+would have shipped a secret into an scp argv.**
+
+- `key-exchange` and `shared-umem interface` take `firewallMatchValues` — every
+  value they return is installed and an empty token means absence. `key-exchange`
+  now matches the `ciphers`/`macs` siblings that were already converted in
+  #4305/#4902.
+- `api-key` takes `multiLeafAuthoredValues`, NOT `firewallMatchValues`, because
+  an EMPTY value is load-bearing on this leaf: a quoted-empty `api-key ""`
+  authenticates any request presenting the empty token, so it must still reach
+  `validateAPIAuthNoEmptySecretsStrict` to be hard-rejected (#5636). An
+  empty-skipping reader would make an empty key in a non-zero slot VANISH,
+  silently withdrawing an operator-visible security rejection. The
+  `multiLeafAuthoredValues(n)[0] == nodeVal(n)` invariant is what keeps slot 0
+  byte-identical to the pre-fix read.
+- `archive-sites` takes neither. Its value tail INTERLEAVES a `password
+  <secret>` modifier with the site URLs (`archive-sites "scp://a/cfg" password
+  "$9$..."` → `Keys=["archive-sites","scp://a/cfg","password","$9$..."]`), so
+  accumulating the tail wholesale would promote the keyword AND the secret into
+  `ArchiveSites`, where runtime archival hands each entry to `scp <src> <dest>`.
+  It needs a GROUPING reader — `archiveSiteEntries` (`compiler_system.go`), the
+  same `<value> [modifier ...]` shape as `firewallPrefixListRefs` — which binds
+  `password` to the site preceding it and consumes its operand. A trailing
+  `password` with no operand still marks the preceding site rather than becoming
+  one.
+
+The four AST shapes `archiveSiteEntries` covers were measured, not assumed:
+
+```
+archive-sites [ a b ];              Keys=["archive-sites","a","b"]
+archive-sites a password S;         Keys=["archive-sites","a","password","S"]
+archive-sites a { password S; }     Keys=["archive-sites","a"], child ["password","S"]
+archive-sites { a password S; b; }  Keys=["archive-sites"], one child per site
+archive-sites { a { password S; } } Keys=["archive-sites"], child "a" with a password child
+```
+
+**Widening the read is what CLOSED the #4589 gate escape, because the gate was
+widened in the same change.** The leading-dash check (`must not begin with '-'`,
+CWE-88) previously ran on slot 1 alone, so a `-oProxyCommand=` member authored
+past the first was both dropped and unchecked — the bracket form ACCEPTED what
+the same token authored alone REJECTED. It now runs over every entry
+`archiveSiteEntries` returns.
+
+On the validator axis for the other two security-relevant leaves: `key-exchange`
+declares a schema `validator` (`ValidateSSHAlgorithm`), so `validateMultiValueLeaf`
+already walks `Keys[1:]` AND every child's `Keys[0]` — the widened read does not
+outrun its validation, which `TestSSHKeyExchangeValidatorCoversEverySlot_6692`
+pins with a rejection in a NON-ZERO slot plus an over-reject control. `api-key`
+has no schema validator; its check is the #5636 empty-secret gate, which the
+widened read now feeds every authored slot.
+
+Fail-on-revert: `pkg/config/compiler_system_multivalue_6692_test.go`. Six
+single-site mutations were run, each localising to its own assertion with
+`go build` and `go vet` at exit 0 — including one that narrows ONLY the
+leading-dash gate (leaving the read widened) and one that swaps `api-key` to the
+empty-skipping reader.
 
 ### A widened read must not PROMOTE a token the old reader discarded (#6673)
 
@@ -4193,6 +4276,39 @@ PAT-translating over a range the operator did not configure. Fail-on-revert:
 `TestSourceNATSnapshotInvalidPortRangeUnusable_5457`
 (`pkg/dataplane/userspace/nat_source_pool_port_5457_test.go`).
 
+**Source-NAT pool `port range` has a FIXED arity, and `port range` is not a
+value list (#6688).** `#5457` validated the endpoints the grammar consumed; it
+did not bound how many tokens the grammar consumed. `parseSourcePoolPortRange`
+matched `low <lo> high <hi>` at `len(toks) >= 4` and `<low> to <high>` at
+`len(toks) >= 3`, discarding the remainder — so `port range 1000 2000` parsed as
+the bare single-port shape `<low>` and compiled `PortLow == PortHigh == 1000`. A
+pool the operator sized at 1001 ports provided ONE, committed clean, and
+exhausted under the first real translation load; the second slot was never
+parsed, so `port range [ 1000 99999 ]` and `port range [ 1000 notaport ]`
+committed clean as well.
+
+The lexer strips `[`/`]` before the compiler observes anything (see "Multi-value
+leaves and bracketed lists"), so the bracketed spelling and the mistyped bare
+spelling arrive as the SAME token slice. Reading `["1000","2000"]` as
+`[1000,2000]` was therefore rejected as the fix: it would invent a two-token
+`range <low> <high>` grammar Junos does not have AND silently redefine the
+mistyped bare form. Both shapes now match at an EXACT arity and any unconsumed
+token fails closed through the existing `PortRangeInvalidSpec` channel — strict
+commit hard-rejects naming the offending spec, the tolerant path marks the pool
+unusable. Fail-on-revert:
+`TestParseSourcePoolPortRangeUnconsumedTail_6688` /
+`TestSourceNATPoolPortRangeTailFailsClosed_6688` /
+`TestSourceNATPoolPortRangeValidUnaffected_6688` (the over-reject control)
+(`pkg/config/compiler_nat_source_pool_port_6688_test.go`).
+
+This also retired the `security nat source pool <*> port range` row from
+`knownSpellingInconsistencies` (the #2419 spelling-differential gate): with the
+tail rejected rather than discarded, every compared spelling of a two-token tail
+now reaches the same verdict. The site is still ENUMERATED and COMPARED by the
+gate (4 of 5 spellings carry a verdict) — it was not moved to `notAValueList`,
+because the agreement is now a real property of the compiler rather than a
+meaningless verdict.
+
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
 `firewallMatchValues`. Both are `multi:true`; before the second #2419 fold
@@ -6312,6 +6428,10 @@ reserved for whole-dataplane selection where a rewrite shim
     new validator: bare IPv6 literal, IPv4 rejected). The RDNSS option
     (RFC 8106) is IPv6-only; the sender skipped unparseable strings but
     did NOT family-gate, so a valid IPv4 literal reached the wire.
+    Because the leaf is `multi: true` with `children == nil`,
+    `validateMultiValueLeaf` runs this validator over EVERY authored
+    slot — `Keys[1:]` and every block-child — which is what made #6695
+    safe to widen without an unwidened validator behind it.
   - `link-mtu` — floor raised to `ValidateIntegerMin(1280)` (RFC 8200 §5
     IPv6 minimum link MTU); a smaller value was advertised verbatim and
     blackholes hosts that honor it.
@@ -6320,6 +6440,28 @@ reserved for whole-dataplane selection where a rewrite shim
   configs). New validators `ValidateIPv6Address` / `ValidatePREF64CIDR`
   live in `schema_validators.go`. Regression coverage:
   `pkg/config/schema_validate_2497_test.go`.
+- **#6695 (router-advertisement `dns-server-address` multi-value read):**
+  the leaf is `multi: true`, but `compileRouterAdvertisement` read it with
+  `nodeVal` — `Keys[1]` alone. Measured across all five spellings before
+  fixing: A hier-bracket `drop`, B hier-block **inert** (no `Keys[1]` exists
+  in that shape, so the block spelling compiled NOTHING), C hier-repeat
+  `keep`, D set-bracket `drop`, E set-repeat `keep`. Hosts on the link
+  therefore learned ONE RDNSS server while `show configuration` rendered
+  both, and the missing redundancy stayed invisible until the primary
+  resolver failed. The reader is now `firewallMatchValues` (every value it
+  returns is installed into one RFC 8106 `RecursiveDNSServer` option, so an
+  empty token legitimately means absence). The
+  `protocols router-advertisement interface <*> dns-server-address` row was
+  removed from `knownSpellingInconsistencies` in the same change; after the
+  fix all FIVE spellings are compared and all report `keep`, so gate coverage
+  of this site went UP — the previously inert block spelling now carries a
+  verdict. Fail-on-revert:
+  `pkg/config/compiler_ra_dns_server_6695_test.go` (compiled slice contents
+  per spelling, a three-address case, and the every-slot validator guard) and
+  `pkg/ra/sender_marshal_rdnss_6695_test.go`, which drives the real Junos text
+  through `CompileConfig` into `buildRA` and re-parses the marshalled option —
+  a dropped address is invisible in the option COUNT (the sender emits one
+  option holding every server) and shows only in its `Servers` list.
 - **#4307 (router-advertisement reachable-time / retransmit-timer,
   fable-review-167 I-2):** the RFC 4861 §4.2 Reachable Time and Retrans
   Timer RA header fields had no schema leaf, no `RAInterfaceConfig`

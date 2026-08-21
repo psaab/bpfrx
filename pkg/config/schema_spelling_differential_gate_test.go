@@ -123,12 +123,12 @@ package config
 //     args <= 1, no midKeyword). Only 5 leaves are excluded by construction
 //     (args > 1 or a midKeyword), because a two-value list is not meaningful for
 //     a compound leaf like route-filter or address-book `address <name> <prefix>`.
-//   - The gate enumerates 1018 SITES from those nodes. The two numbers differ,
+//   - The gate enumerates 1017 SITES from those nodes. The two numbers differ,
 //     and the difference is not an error: a schemaNode reachable by more than one
 //     path (a shared subtree such as the one under both `protocols` and
 //     `routing-instances <n> protocols`) is a distinct site at each path, and
 //     must be, because the compiler arm reading it may differ per path.
-//   - Only 608 of those 1018 sites are actually COMPARED. The remaining 410 come
+//   - Only 607 of those 1017 sites are actually COMPARED. The remaining 410 come
 //     back inert or unstable under synthetic parent paths the compiler rejects —
 //     40% of enumerated sites carry NO verdict from this gate, in either
 //     direction. That is the single largest limit here.
@@ -142,9 +142,15 @@ package config
 //     to a leaf that is simply unreachable in that shape. Reverting all five
 //     CoS reads left this gate GREEN before class C existed. It is likewise
 //     restricted to multi: true leaves, where the block form is legal Junos:
-//     unrestricted it fires at 119 sites, almost all scalar leaves for which
-//     `leaf { v; }` is not a spelling at all; restricted it fires at 2, both
-//     already owned by a row below.
+//     unrestricted it fires at 117 sites, almost all scalar leaves for which
+//     `leaf { v; }` is not a spelling at all. Restricted, it fires at ZERO at
+//     this commit — which is not an argument that it is vacuous but the reason
+//     it can be a build gate at all. Its non-vacuity is the mutation: revert
+//     the five CoS code-point reads and it names all three classifier sites,
+//     where classes A and B stay silent. When it was written the restricted
+//     count was 2 (#6695 and the source-NAT `port range`); #6695 landed and
+//     `port range` is classified below as the compound tail its own reader says
+//     it is.
 //   - Nine value pairs. A leaf whose value domain none of them satisfies stays
 //     invisible; that is how #6697 hid from version two, and — via trap (4) —
 //     how it then reported the WRONG verdict at the same five sites.
@@ -179,17 +185,11 @@ import (
 // rendered as <*>, so a row survives the schema growing a level.
 // ---------------------------------------------------------------------------
 var knownSpellingInconsistencies = map[string]string{
-	// #6695 — RA dns-server-address drops every RDNSS server past the first.
-	"protocols router-advertisement interface <*> dns-server-address": "#6695",
-
-	// #6692 — five system-stanza multi-value leaves drop everything past slot 0.
-	"system archival configuration archive-sites":     "#6692",
-	"system services ssh key-exchange":                "#6692",
-	"system services web-management api-auth api-key": "#6692",
-	"system dataplane shared-umem interface":          "#6692",
-
-	// #6688 — source-NAT port range compiles a one-port pool.
-	"security nat source pool <*> port range": "#6688",
+	// EMPTY, and that is a state to defend rather than a state to fill. Every
+	// row this map has ever carried has been removed by the change that fixed
+	// its defect: #6687, #6688, #6692, #6695, #6697, #7126. Adding a row is the
+	// THIRD response to a gate failure and the rarest — see the header: fix the
+	// read, or classify the leaf as not-a-value-list with a verified reason.
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +218,16 @@ var notAValueList = map[string]string{
 	"security screen ids-option <*> tcp port-scan":      "container with sub-knobs",
 	"security screen ids-option <*> tcp syn-flood":      "container with sub-knobs",
 	"security screen ids-option <*> udp":                "container with sub-knobs",
+
+	// #6688 fixed the value drop here and its own reader states the
+	// classification in as many words: "`port range` is not a value list — it
+	// is a compound value TAIL". Both grammars have FIXED arity (`<low> to
+	// <high>` and the legacy `low <lo> high <hi>`), and since #6688 a token the
+	// grammar does not consume REJECTS, stamping PortRangeInvalidSpec. So a
+	// two-element "list" here does change the compiled output — but only by
+	// recording an invalid spec, which is not a value-list verdict in either
+	// direction. Verified at parseSourcePoolPortRange (compiler_nat_source.go).
+	"security nat source pool <*> port range": "compound value tail with fixed arity (`<low> to <high>`), not a value list — see parseSourcePoolPortRange",
 
 	// #6697. The CLASSIFIER `code-points` leaves ARE value lists and were
 	// fixed; these two are the rewrite-rule direction, where Junos writes
