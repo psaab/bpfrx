@@ -685,6 +685,20 @@ impl DeviceQueue {
         }
     }
 
+    /// Publish one completion-ring entry from the "kernel" side, for
+    /// hermetic `ReadComplete` tests. Mirrors [`RingRx::push_for_test`].
+    #[cfg(test)]
+    pub(crate) fn push_comp_for_test(&mut self, addr: u64) {
+        let ring = self.rings.comp_mut();
+        let prod = unsafe { *ring.producer };
+        let idx = prod & ring.mask;
+        let slot = unsafe { (ring.ring as *mut u64).add(idx as usize) };
+        unsafe {
+            *slot = addr;
+            *ring.producer = prod.wrapping_add(1);
+        }
+    }
+
     /// Reap completed TX buffers from the completion ring.
     pub fn complete(&mut self, n: u32) -> ReadComplete<'_> {
         let mut idx: u32 = 0;
@@ -818,7 +832,6 @@ impl RingRx {
             base_idx: idx,
             peeked,
             read_count: 0,
-            released: false,
         }
     }
 
@@ -916,12 +929,16 @@ impl std::os::fd::AsRawFd for RingTx {
 // ── ReadRx ───────────────────────────────────────────────────────────
 
 /// Iterator over received descriptors. Must call `release()` when done.
+///
+/// #5716: `release()` is a *checkpoint*, not a terminal seal — it advances
+/// `base_idx` past the released entries and resets `read_count`, so a guard
+/// that keeps reading after a release stays correct and every subsequent
+/// batch is releasable. See [`ReadRx::release`].
 pub struct ReadRx<'a> {
     ring: &'a mut XskRingCons,
     base_idx: u32,
     peeked: u32,
     read_count: u32,
-    released: bool,
 }
 
 impl ReadRx<'_> {
@@ -940,21 +957,50 @@ impl ReadRx<'_> {
         Some(XdpDesc { addr, len, options })
     }
 
+    /// Release the descriptors read so far back to the kernel.
+    ///
+    /// #5716: this ADVANCES the guard's base cursor past the released
+    /// entries and resets `read_count`, exactly like
+    /// [`ReadComplete::release`]. Pre-#5716 it instead set a sticky
+    /// `released` flag, which made a post-release `read()` unreleasable:
+    /// the second `release()` was swallowed by the flag and `Drop`'s
+    /// `cancel(peeked - read_count)` then under-cancelled by the extra
+    /// reads, leaving `cached_cons` permanently ahead of the kernel-facing
+    /// `*consumer`. Those ring slots were leaked for the life of the
+    /// socket — an unrecoverable RX capacity loss. No current caller reads
+    /// after releasing (every production site is
+    /// `receive -> read* -> release -> drop`), so this is API hardening,
+    /// not a live-path fix.
+    ///
+    /// For a single release-then-drop (every current caller) the observable
+    /// effect is unchanged: `Drop` still cancels exactly the peeked-but-
+    /// unread remainder, because the advance decrements `peeked` by the
+    /// same amount it zeroes from `read_count`.
     pub fn release(&mut self) {
-        if !self.released && self.read_count > 0 {
+        if self.read_count > 0 {
             // `self.ring` is `&mut XskRingCons`, so the release bridge (which
             // mutates `cached_cons` and the shared `*consumer`) is called
             // through an exclusive reference — no `*const -> *mut` cast, no
             // write-through-`&T` UB. Mirrors `ReadComplete::release`.
             unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };
-            self.released = true;
+            self.base_idx = self.base_idx.wrapping_add(self.read_count);
+            self.peeked -= self.read_count;
+            self.read_count = 0;
         }
     }
 }
 
 impl Drop for ReadRx<'_> {
+    /// #5716: the condition is `read_count > 0` alone. It was
+    /// `!self.released && self.read_count > 0`, which meant a guard that read
+    /// anything AFTER an explicit `release()` reached drop with those reads
+    /// neither released nor cancelled — `cached_cons` ended ahead of the
+    /// kernel-facing `*consumer` and the slots were leaked for the life of the
+    /// socket. `read_rx_drop_releases_a_batch_read_after_an_explicit_release`
+    /// drives that shape; the reuse fixture beside it does NOT (it releases
+    /// everything it reads, so it never enters this branch).
     fn drop(&mut self) {
-        if !self.released && self.read_count > 0 {
+        if self.read_count > 0 {
             unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };
         }
         // Cancel any peeked-but-unread entries so cached_cons doesn't
@@ -1002,9 +1048,21 @@ impl WriteTx<'_> {
     }
 
     /// Commit written descriptors to the kernel.
+    ///
+    /// #5716: this ADVANCES `base_idx` past the submitted slots. Pre-#5716
+    /// it reset `written` to 0 without moving the base cursor, so a second
+    /// `insert()` on the same guard restarted at `base_idx + 0` and
+    /// OVERWROTE the descriptors the commit had just handed to the kernel
+    /// — a silent TX corruption (duplicate/garbled frames) for any
+    /// insert -> commit -> insert caller. No current caller reuses a
+    /// writer after committing (every production site is
+    /// `transmit -> insert -> commit -> drop`), so this is API hardening,
+    /// not a live-path fix. With the advance, `reserve(n) -> (insert,
+    /// commit)*` is a correct streaming pattern.
     pub fn commit(&mut self) {
         if self.written > 0 {
             unsafe { bridge_xsk_ring_prod_submit(self.ring, self.written) };
+            self.base_idx = self.base_idx.wrapping_add(self.written);
             self.reserved -= self.written;
             self.written = 0;
         }
@@ -1059,9 +1117,19 @@ impl WriteFill<'_> {
         n
     }
 
+    /// Commit written offsets to the kernel.
+    ///
+    /// #5716: ADVANCES `base_idx` past the submitted slots, for the same
+    /// reason as [`WriteTx::commit`] — without it a second `insert()` on a
+    /// committed guard would overwrite already-submitted fill entries,
+    /// handing the kernel two RX slots pointing at one UMEM frame. No
+    /// current caller reuses a fill writer after committing (the
+    /// `prime_fill_ring` retry loop constructs a FRESH guard per attempt),
+    /// so this is API hardening, not a live-path fix.
     pub fn commit(&mut self) {
         if self.written > 0 {
             unsafe { bridge_xsk_ring_prod_submit(self.ring, self.written) };
+            self.base_idx = self.base_idx.wrapping_add(self.written);
             self.reserved -= self.written;
             self.written = 0;
         }
@@ -1101,10 +1169,23 @@ impl ReadComplete<'_> {
         Some(addr)
     }
 
+    /// Release the completion entries read so far back to the kernel.
+    ///
+    /// #5716: ADVANCES `base_idx` past the released entries. Pre-#5716 it
+    /// reset `read_count` to 0 (and shrank `peeked`) without moving the
+    /// base cursor, so a post-release `read()` restarted at `base_idx + 0`
+    /// and RE-READ completion addresses the caller had already reaped —
+    /// the same UMEM frame offset handed out twice, which a TX-reap caller
+    /// would recycle twice into the fill ring (two RX slots aliasing one
+    /// frame). No current caller reads after releasing (`reap_tx_completions`
+    /// is `complete -> read* -> release -> drop`), so this is API
+    /// hardening, not a live-path fix.
     pub fn release(&mut self) {
         if self.read_count > 0 {
             unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };
-            // Prevent double-release in drop
+            // Advance past the released entries and prevent double-release
+            // in drop.
+            self.base_idx = self.base_idx.wrapping_add(self.read_count);
             self.peeked -= self.read_count;
             self.read_count = 0;
         }

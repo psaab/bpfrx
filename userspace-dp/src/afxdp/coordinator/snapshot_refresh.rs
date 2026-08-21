@@ -378,6 +378,14 @@ impl super::Coordinator {
             tunnel_remap_purge_ids(&self.forwarding, &new_forwarding, prior_snapshot_installed);
         self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
         self.forwarding = new_forwarding;
+        // #6832 fold r5: the refresh's commit point for the #3651 per-zone
+        // counters. Unlike the full reconcile there is no worker bring-up after
+        // this swap — a same-plan refresh keeps the live workers — so the swap
+        // itself IS the commit and the destructive prune is safe here. The
+        // additive get-or-create already ran inside the build; see
+        // `forwarding_build::commit_zone_counter_prune` for why the two halves
+        // are split.
+        crate::afxdp::forwarding_build::commit_zone_counter_prune(&self.forwarding, snapshot);
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
         } else if !preserved_fabrics.is_empty() {
