@@ -1,3 +1,50 @@
+## 2026-08-21 — #6692: four system-stanza multi-value leaves dropped everything past slot 0
+
+- **Timestamp**: 2026-08-21 (fix/6692-system-multivalue-leaves)
+- **Action**: Widened four `multi: true` `system` leaves that a single-value
+  accessor truncated to their first bracket member: `archival configuration
+  archive-sites`, `services ssh key-exchange`, `services web-management
+  api-auth api-key`, and `dataplane shared-umem interface`.
+
+  Reproduced first across all five spellings with the differential gate's own
+  `spellingVerdicts`. `archive-sites` measured A=drop B=keep C=keep D=drop
+  E=keep; the other three measured A=drop B=drop C=keep D=drop E=keep —
+  identical for all eight value pairs, so the drop is shape-driven, not
+  domain-driven.
+
+  Three of the four shared a fix and the fourth did NOT, which is the point of
+  auditing rather than assuming: `key-exchange` and `shared-umem interface`
+  take `firewallMatchValues` (every value installs, empty means absent);
+  `api-key` takes `multiLeafAuthoredValues` because an EMPTY value is
+  load-bearing there — a quoted-empty key must still reach
+  `validateAPIAuthNoEmptySecretsStrict` (#5636), and an empty-skipping reader
+  would silently withdraw that rejection; `archive-sites` takes a new GROUPING
+  reader `archiveSiteEntries`, because its tail interleaves a `password
+  <secret>` MODIFIER with the URLs and accumulating it wholesale would promote
+  the keyword and the secret into `ArchiveSites`, which runtime archival hands
+  to `scp <src> <dest>` (#6673's symmetric hazard, named at that read site).
+
+  The #4589 leading-dash gate was widened in the SAME change, as the pre-fix
+  comment demanded: it now runs over every entry rather than slot 1, so the
+  bracket-form gate escape closed in the commit that could otherwise have armed
+  a live CWE-88 argv injection.
+
+  The four `knownSpellingInconsistencies` rows are removed in the same PR.
+  Measured after the fix: all five spellings COMPARED and all `keep` at every
+  site — coverage went up, not down.
+
+  Validation: `go test -count=1 ./pkg/config/ ./pkg/daemon/ ./pkg/api/
+  ./pkg/configstore/ ./pkg/dataplane/...` exit 0; `go build ./...` and
+  `go vet ./pkg/config/` exit 0. Mutation proof: six SINGLE-site mutations,
+  each localising to its own assertion with build+vet at exit 0 — including one
+  narrowing ONLY the leading-dash gate (read left widened) and one swapping
+  `api-key` to the empty-skipping reader. Go-only in `pkg/config`; nothing
+  reaches the Rust helper binary, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_system.go,
+  pkg/config/compiler_system_multivalue_6692_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  docs/config-schema.md, _Log.md
+
 ## 2026-08-21 — #7114: a factory boot of the appliance image claimed no NIC, so no bake could sign
 
 - **Timestamp**: 2026-08-21 (fix/7114-appliance-factory-bootstrap)

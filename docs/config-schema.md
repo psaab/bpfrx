@@ -1038,7 +1038,7 @@ control so an ACCEPT only counts beside a REJECT of the same token:
 | Leaf | Shape that ESCAPES | Same token REJECTED as | Tracked |
 |---|---|---|---|
 | CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 |
-| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
+| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 — **CLOSED**, see below |
 | `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
 
 Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
@@ -1051,6 +1051,11 @@ archive-sites escape is inert TODAY only because the value is also dropped. A
 follow-up that widens that read without widening the leading-dash check in the
 same change ships a live CWE-88 argument injection; the warning is stated at the
 read site itself in `compiler_system.go`, not only here.
+
+That follow-up is #6692, and it widened BOTH in one change — see
+"#6692: four system-stanza multi-value leaves" below. The leading-dash gate now
+runs over every entry `archiveSiteEntries` returns, so the escape closed in the
+same commit that could have armed it.
 
 **An EMPTY authored value is a value, and whether to keep it depends on whether
 the leaf SELECTS or SETS (#6673).** `firewallMatchValues` skips blank tokens,
@@ -1105,7 +1110,7 @@ bundled, because each needs its own value-domain gate widened in the same change
 | Leaf | Still one-sided | Tracked |
 |---|---|---|
 | CoS DSCP / IEEE classifier `code-points` | reads tail, never `Children` | #6697 |
-| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
+| ~~`system archival archive-sites` (+ three sibling system leaves)~~ | ~~reads `Children` and only slot 1 of the tail~~ | #6692 — FIXED |
 | `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
@@ -1172,6 +1177,81 @@ cardinality gate must also count only DISTINCT entries (`dedupeValuesBy`): a
 repeated value is one value, and rejecting it invents a rejection too. See
 "A cardinality gate counts DISTINCT values" below for how each leaf picks its
 identity.
+
+### #6692: four system-stanza multi-value leaves, and why only three shared a fix
+
+Four `multi: true` leaves under `system` were read with a single-value accessor,
+so a bracketed list — which the lexer collapses onto ONE node's `Keys` — compiled
+its first member and silently dropped the rest. Measured with the
+spelling-differential gate's own `spellingVerdicts`, before the fix:
+
+| Site | A hier-bracket | B hier-block | C hier-repeat | D set-bracket | E set-repeat |
+|---|---|---|---|---|---|
+| `system archival configuration archive-sites` | drop | keep | keep | drop | keep |
+| `system services ssh key-exchange` | drop | drop | keep | drop | keep |
+| `system services web-management api-auth api-key` | drop | drop | keep | drop | keep |
+| `system dataplane shared-umem interface` | drop | drop | keep | drop | keep |
+
+(Identical for all eight of the gate's value pairs — the drop is shape-driven,
+not domain-driven.) `archive-sites` differs on B because its reader already
+walked `Children`; the other three read neither side past slot 0.
+
+**Three of the four share a fix; the fourth does not, and assuming otherwise
+would have shipped a secret into an scp argv.**
+
+- `key-exchange` and `shared-umem interface` take `firewallMatchValues` — every
+  value they return is installed and an empty token means absence. `key-exchange`
+  now matches the `ciphers`/`macs` siblings that were already converted in
+  #4305/#4902.
+- `api-key` takes `multiLeafAuthoredValues`, NOT `firewallMatchValues`, because
+  an EMPTY value is load-bearing on this leaf: a quoted-empty `api-key ""`
+  authenticates any request presenting the empty token, so it must still reach
+  `validateAPIAuthNoEmptySecretsStrict` to be hard-rejected (#5636). An
+  empty-skipping reader would make an empty key in a non-zero slot VANISH,
+  silently withdrawing an operator-visible security rejection. The
+  `multiLeafAuthoredValues(n)[0] == nodeVal(n)` invariant is what keeps slot 0
+  byte-identical to the pre-fix read.
+- `archive-sites` takes neither. Its value tail INTERLEAVES a `password
+  <secret>` modifier with the site URLs (`archive-sites "scp://a/cfg" password
+  "$9$..."` → `Keys=["archive-sites","scp://a/cfg","password","$9$..."]`), so
+  accumulating the tail wholesale would promote the keyword AND the secret into
+  `ArchiveSites`, where runtime archival hands each entry to `scp <src> <dest>`.
+  It needs a GROUPING reader — `archiveSiteEntries` (`compiler_system.go`), the
+  same `<value> [modifier ...]` shape as `firewallPrefixListRefs` — which binds
+  `password` to the site preceding it and consumes its operand. A trailing
+  `password` with no operand still marks the preceding site rather than becoming
+  one.
+
+The four AST shapes `archiveSiteEntries` covers were measured, not assumed:
+
+```
+archive-sites [ a b ];              Keys=["archive-sites","a","b"]
+archive-sites a password S;         Keys=["archive-sites","a","password","S"]
+archive-sites a { password S; }     Keys=["archive-sites","a"], child ["password","S"]
+archive-sites { a password S; b; }  Keys=["archive-sites"], one child per site
+archive-sites { a { password S; } } Keys=["archive-sites"], child "a" with a password child
+```
+
+**Widening the read is what CLOSED the #4589 gate escape, because the gate was
+widened in the same change.** The leading-dash check (`must not begin with '-'`,
+CWE-88) previously ran on slot 1 alone, so a `-oProxyCommand=` member authored
+past the first was both dropped and unchecked — the bracket form ACCEPTED what
+the same token authored alone REJECTED. It now runs over every entry
+`archiveSiteEntries` returns.
+
+On the validator axis for the other two security-relevant leaves: `key-exchange`
+declares a schema `validator` (`ValidateSSHAlgorithm`), so `validateMultiValueLeaf`
+already walks `Keys[1:]` AND every child's `Keys[0]` — the widened read does not
+outrun its validation, which `TestSSHKeyExchangeValidatorCoversEverySlot_6692`
+pins with a rejection in a NON-ZERO slot plus an over-reject control. `api-key`
+has no schema validator; its check is the #5636 empty-secret gate, which the
+widened read now feeds every authored slot.
+
+Fail-on-revert: `pkg/config/compiler_system_multivalue_6692_test.go`. Six
+single-site mutations were run, each localising to its own assertion with
+`go build` and `go vet` at exit 0 — including one that narrows ONLY the
+leading-dash gate (leaving the read widened) and one that swaps `api-key` to the
+empty-skipping reader.
 
 ### A widened read must not PROMOTE a token the old reader discarded (#6673)
 
