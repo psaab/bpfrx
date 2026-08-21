@@ -332,12 +332,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri6}] = true
 						v6RuleIdx[zp] = ri6 + 1
 
-						slog.Info("source NAT off rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
+						if !isValidationPass(dp) {
+							slog.Info("source NAT off rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"from", rs.FromZone, "to", rs.ToZone,
+								"counter_id", counterID,
+								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+								"src_addr", srcAddr, "dst_addr", dstAddr)
+						}
 					}
 				}
 				continue
@@ -425,15 +427,19 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						slog.Warn("failed to set SNAT egress IP",
 							"interface", ifaceRef, "err", err)
 					} else {
-						slog.Info("SNAT egress IP set",
-							"interface", ifaceRef, "ifindex", physIface.Index,
-							"vlan", vlanID, "v4", unitV4, "v6", unitV6)
+						if !isValidationPass(dp) {
+							slog.Info("SNAT egress IP set",
+								"interface", ifaceRef, "ifindex", physIface.Index,
+								"vlan", vlanID, "v4", unitV4, "v6", unitV6)
+						}
 					}
 				}
 
 				if len(v4IPs) == 0 && len(v6IPs) == 0 {
-					slog.Warn("no IP addresses for interface SNAT",
-						"zone", rs.ToZone)
+					if !isValidationPass(dp) {
+						slog.Warn("no IP addresses for interface SNAT",
+							"zone", rs.ToZone)
+					}
 					continue
 				}
 
@@ -612,10 +618,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 									pnat.RegisterNATIP(addr, pool.Name)
 								}
 							}
-							slog.Info("persistent NAT pool registered",
-								"pool", pool.Name,
-								"timeout", timeout,
-								"permit", string(pool.PersistentNAT.Permit))
+							if !isValidationPass(dp) {
+								slog.Info("persistent NAT pool registered",
+									"pool", pool.Name,
+									"timeout", timeout,
+									"permit", string(pool.PersistentNAT.Permit))
+							}
 						}
 					}
 
@@ -673,13 +681,15 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						}
 						writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
 						v4RuleIdx[zp] = ri + 1
-						slog.Info("source NAT rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"pool_id", curPoolID, "rule_idx", ri,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
+						if !isValidationPass(dp) {
+							slog.Info("source NAT rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"from", rs.FromZone, "to", rs.ToZone,
+								"pool_id", curPoolID, "rule_idx", ri,
+								"counter_id", counterID,
+								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+								"src_addr", srcAddr, "dst_addr", dstAddr)
+						}
 					}
 
 					// Write SNAT rule (v6)
@@ -701,13 +711,15 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						}
 						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
 						v6RuleIdx[zp] = ri + 1
-						slog.Info("source NAT v6 rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"pool_id", curPoolID, "rule_idx", ri,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
+						if !isValidationPass(dp) {
+							slog.Info("source NAT v6 rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"from", rs.FromZone, "to", rs.ToZone,
+								"pool_id", curPoolID, "rule_idx", ri,
+								"counter_id", counterID,
+								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+								"src_addr", srcAddr, "dst_addr", dstAddr)
+						}
 					}
 				} // end dstAddr loop
 			} // end srcAddr loop
@@ -916,12 +928,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 								writtenDNATv6[dk] = true
 							}
 
-							slog.Info("destination NAT rule compiled",
-								"rule-set", rs.Name, "rule", rule.Name,
-								"match_ip", matchIP, "match_port", dstPort,
-								"proto", proto,
-								"pool", pool.Name, "pool_ip", poolIP,
-								"pool_port", poolPort)
+							if !isValidationPass(dp) {
+								slog.Info("destination NAT rule compiled",
+									"rule-set", rs.Name, "rule", rule.Name,
+									"match_ip", matchIP, "match_port", dstPort,
+									"proto", proto,
+									"pool", pool.Name, "pool_ip", poolIP,
+									"pool_port", poolPort)
+							}
 						}
 					}
 				}
@@ -1032,13 +1046,15 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			}
 
 			count++
-			slog.Info("static NAT rule compiled",
-				"rule-set", rs.Name, "rule", rule.Name,
-				"external", rule.Match, "internal", rule.Then)
+			if !isValidationPass(dp) {
+				slog.Info("static NAT rule compiled",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"external", rule.Match, "internal", rule.Then)
+			}
 		}
 	}
 
-	if count > 0 {
+	if count > 0 && !isValidationPass(dp) {
 		slog.Info("static NAT compilation complete", "entries", count)
 	}
 
@@ -1098,10 +1114,73 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 				continue
 			}
 
+			// #6894 r9 F1 (#4960): choose the DISPOSITION of a per-rule prefix
+			// fault by whether the rule will actually reach the enforcement
+			// plane.
+			//
+			// A rule the userspace snapshot builder EMITS is handed to
+			// `Nptv6State::try_from_snapshots`, which rejects the WHOLE snapshot
+			// on any unparseable / length-mismatched / host-bits-set prefix
+			// (userspace-dp/src/nptv6.rs, #2240/#4519). That rejection lands in
+			// publishSnapshotFailClosedLocked -- AFTER compileZones has created
+			// VLANs and reconciled addresses -- so warning and skipping here left
+			// the #4960 validate-before-mutate pre-pass ACCEPTING a config the
+			// real backend then rejects post-mutation, which is the precise shape
+			// the pre-pass exists to prevent. Returning the error instead moves
+			// an ALREADY-CERTAIN apply failure ahead of the mutation point; it
+			// does not create a new one. It also cannot brick a boot or a peer
+			// sync: Store.Load / Store.SyncApply compile through
+			// pkg/config.compileTreeLenient and never reach this function, so the
+			// config still loads with the warning validateNPTv6Strict emits, and
+			// only the dataplane apply -- which already fails today -- fails.
+			//
+			// A rule the builder DROPS (#5818 unsupported match scope) never
+			// reaches the helper: today's apply SUCCEEDS with the rule simply not
+			// installed. It keeps the warn-and-skip disposition, because erroring
+			// on it would fail an apply that works today.
+			installed := !config.NPTv6ScopeUnsupported(rs, rule)
+			// #7077 (#6894 r10): the SAME argument applies a second time, and
+			// missing it turned this fix into a regression. "The helper rejects
+			// this" was inferred from Go's own parse failing, but the two
+			// grammars are not identical: Rust's `parse_prefix` parses the mask
+			// with `u8::from_str`, which takes a leading `+`, while Go's
+			// net.ParseCIDR mask parser does not. So `nptv6-prefix fd00:9::/+48`
+			// is a Go parse ERROR and a helper ACCEPT -- today's apply succeeds
+			// and installs the translation. Hard-erroring on it failed an apply
+			// that works, reached on the tolerant-load / HA-peer-sync path #1960
+			// exists to keep booting.
+			//
+			// Note this cannot be discriminated by strict-vs-lenient instead:
+			// validateNPTv6Strict rejects EVERY malformed class at commit, so a
+			// malformed rule only ever arrives here from the lenient path, and
+			// "warn when lenient" would be a full revert. See
+			// compiler_nptv6_helper_grammar.go for the measurement.
+			//
+			// So a rule the helper would INSTALL keeps warn-and-skip for the
+			// same reason a DROPPED rule does: erroring fails an apply that
+			// succeeds today. Skipping costs nothing observable -- this function
+			// writes the retired eBPF map surface, while buildNptv6Snapshots
+			// copies Match/Then out of the config independently, so the rule
+			// still reaches the helper and is still installed.
+			helperInstalls := nptv6HelperWouldInstall(rule.Match, rule.Then)
+			reject := func(reason string, attrs ...any) error {
+				if !installed || helperInstalls {
+					slog.Warn("nptv6: "+reason, attrs...)
+					return nil
+				}
+				return fmt.Errorf("rule-set %q rule %q: %s (match %q, nptv6-prefix %q); "+
+					"the userspace helper rejects the whole NPTv6 snapshot on this rule "+
+					"(#2240/#4519), so the apply cannot succeed -- correct or remove the "+
+					"rule",
+					rs.Name, rule.Name, reason, rule.Match, rule.Then)
+			}
+
 			// Parse external prefix (match destination-address)
 			extIP, extNet, err := net.ParseCIDR(rule.Match)
 			if err != nil {
-				slog.Warn("nptv6: invalid match prefix", "addr", rule.Match, "err", err)
+				if rerr := reject("invalid match prefix", "addr", rule.Match, "err", err); rerr != nil {
+					return rerr
+				}
 				continue
 			}
 			extOnes, _ := extNet.Mask.Size()
@@ -1109,27 +1188,51 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			// Parse internal prefix (nptv6-prefix)
 			intIP, intNet, err := net.ParseCIDR(rule.Then)
 			if err != nil {
-				slog.Warn("nptv6: invalid nptv6-prefix", "addr", rule.Then, "err", err)
+				if rerr := reject("invalid nptv6-prefix", "addr", rule.Then, "err", err); rerr != nil {
+					return rerr
+				}
 				continue
 			}
 			intOnes, _ := intNet.Mask.Size()
 
 			// Validate: both must be same length, /48 or /64 IPv6
 			if extOnes != intOnes {
-				slog.Warn("nptv6: prefix lengths must match",
-					"external", rule.Match, "internal", rule.Then)
+				if rerr := reject("prefix lengths must match",
+					"external", rule.Match, "internal", rule.Then); rerr != nil {
+					return rerr
+				}
 				continue
 			}
 			if extOnes != 48 && extOnes != 64 {
-				slog.Warn("nptv6: only /48 and /64 prefix lengths supported",
-					"external", rule.Match, "internal", rule.Then)
+				if rerr := reject("only /48 and /64 prefix lengths supported",
+					"external", rule.Match, "internal", rule.Then); rerr != nil {
+					return rerr
+				}
 				continue
 			}
 			ext16 := extIP.To16()
 			int16 := intIP.To16()
 			if ext16 == nil || int16 == nil {
-				slog.Warn("nptv6: prefixes must be IPv6",
-					"external", rule.Match, "internal", rule.Then)
+				if rerr := reject("prefixes must be IPv6",
+					"external", rule.Match, "internal", rule.Then); rerr != nil {
+					return rerr
+				}
+				continue
+			}
+			// #4519 parity: the helper's parse_prefix fails CLOSED when any bit
+			// is set beyond the prefix length rather than masking, because
+			// masking-and-accepting would silently WIDEN the translation past
+			// what the operator authored. The prefix-byte truncation below does
+			// exactly that masking, so without this check the compiler accepts a
+			// prefix the helper rejects -- the same pre-pass/backend divergence
+			// as an unparseable prefix, one string away. /48 and /64 are both
+			// word-aligned, so "host bits clear" is equivalent to the address
+			// equalling its own network address.
+			if !extIP.Equal(extNet.IP) || !intIP.Equal(intNet.IP) {
+				if rerr := reject("host bits set beyond the prefix length",
+					"external", rule.Match, "internal", rule.Then); rerr != nil {
+					return rerr
+				}
 				continue
 			}
 
@@ -1164,14 +1267,16 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			written[outKey] = true
 
 			count++
-			slog.Info("nptv6 rule compiled",
-				"rule-set", rs.Name, "rule", rule.Name,
-				"external", rule.Match, "internal", rule.Then,
-				"prefix_len", extOnes)
+			if !isValidationPass(dp) {
+				slog.Info("nptv6 rule compiled",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"external", rule.Match, "internal", rule.Then,
+					"prefix_len", extOnes)
+			}
 		}
 	}
 
-	if count > 0 {
+	if count > 0 && !isValidationPass(dp) {
 		slog.Info("nptv6 compilation complete", "rules", count)
 	}
 
@@ -1286,8 +1391,10 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				return fmt.Errorf("NAT64 rule-set %q: set pool config %d: %w",
 					rs.Name, newID, err)
 			}
-			slog.Info("auto-assigned NAT64 source pool",
-				"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
+			if !isValidationPass(dp) {
+				slog.Info("auto-assigned NAT64 source pool",
+					"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
+			}
 		}
 
 		nat64Cfg := NAT64Config{
@@ -1299,9 +1406,11 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 		writtenPrefixes[NAT64PrefixKey{Prefix: nat64Cfg.Prefix}] = true
 
-		slog.Info("compiled NAT64 prefix",
-			"rule-set", rs.Name, "prefix", rs.Prefix,
-			"pool", rs.SourcePool, "pool_id", poolID)
+		if !isValidationPass(dp) {
+			slog.Info("compiled NAT64 prefix",
+				"rule-set", rs.Name, "prefix", rs.Prefix,
+				"pool", rs.SourcePool, "pool_id", poolID)
+		}
 		count++
 	}
 
@@ -1312,6 +1421,8 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	// Delete stale NAT64 entries.
 	dp.DeleteStaleNAT64(count, writtenPrefixes)
 
-	slog.Info("NAT64 compilation complete", "prefixes", count)
+	if !isValidationPass(dp) {
+		slog.Info("NAT64 compilation complete", "prefixes", count)
+	}
 	return nil
 }
