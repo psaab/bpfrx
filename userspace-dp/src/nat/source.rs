@@ -39,8 +39,8 @@
 // reverse session entry).
 
 use super::allocator::{
-    DeterministicV4, DeterministicV6, NS_PER_SEC, PersistentSourceKey, PoolAddressFamily,
-    PortAllocator, TranslatedTuple, deterministic_indices_v4,
+    DeterministicV4, DeterministicV6, NS_PER_SEC, NatHolder, PersistentSourceKey,
+    PoolAddressFamily, PortAllocator, TranslatedTuple, deterministic_indices_v4,
 };
 use super::{NatCounterStore, NatDecision, NatRuleCounter, NatScopeCtx};
 use crate::SourceNATRuleSnapshot;
@@ -1231,6 +1231,20 @@ fn source_nat_runtime_compatible(new_rule: &SourceNatRule, old_rule: &SourceNatR
         && new_rule.pool_port_high == old_rule.pool_port_high
 }
 
+/// Release an UNTRACKED (single-holder) source-NAT allocation — the
+/// pre-#6211-F2 contract, where the first release frees the port.
+///
+/// Production forwarding paths must use
+/// [`release_source_nat_allocation_for_worker`] instead: an HA-synced session is
+/// reserved once per worker against one shared allocator, and only the LAST
+/// holder may free the port. This entry point remains for local-only callers and
+/// for tests that exercise the single-holder semantics directly.
+/// Compile-time completeness guard for #6211 F2: this untracked entry point is
+/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
+/// BUILD FAILURE in the non-test profile rather than a silent single-holder
+/// release of a reservation every worker holds. Production uses the
+/// `_for_worker` twin.
+#[cfg(test)]
 pub(crate) fn release_source_nat_allocation(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -1238,9 +1252,52 @@ pub(crate) fn release_source_nat_allocation(
     is_reverse: bool,
     now_ns: u64,
 ) {
-    release_source_nat_allocation_with_mode(rules, key, nat, is_reverse, now_ns, false);
+    release_source_nat_allocation_with_mode(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        false,
+        NatHolder::Untracked,
+    );
 }
 
+/// #6211 F2: release THIS worker's hold on a source-NAT allocation.
+///
+/// For a local allocation (no holder set) this is bit-identical to
+/// [`release_source_nat_allocation`] — the port is freed. For an HA-synced
+/// reservation, which every worker took against the single shared allocator,
+/// only `worker_id`'s bit is cleared and the port survives until the last worker
+/// releases it.
+pub(crate) fn release_source_nat_allocation_for_worker(
+    rules: &[SourceNatRule],
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+    worker_id: u32,
+) {
+    release_source_nat_allocation_with_mode(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        false,
+        NatHolder::Worker(worker_id),
+    );
+}
+
+/// Roll back an UNTRACKED (single-holder) source-NAT allocation. See
+/// [`release_source_nat_allocation`]; production paths use
+/// [`rollback_source_nat_allocation_for_worker`].
+/// Compile-time completeness guard for #6211 F2: this untracked entry point is
+/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
+/// BUILD FAILURE in the non-test profile rather than a silent single-holder
+/// release of a reservation every worker holds. Production uses the
+/// `_for_worker` twin.
+#[cfg(test)]
 pub(crate) fn rollback_source_nat_allocation(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -1248,9 +1305,39 @@ pub(crate) fn rollback_source_nat_allocation(
     is_reverse: bool,
     now_ns: u64,
 ) {
-    release_source_nat_allocation_with_mode(rules, key, nat, is_reverse, now_ns, true);
+    release_source_nat_allocation_with_mode(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        true,
+        NatHolder::Untracked,
+    );
 }
 
+/// #6211 F2: roll back THIS worker's hold on a source-NAT allocation. The
+/// holder-aware twin of [`rollback_source_nat_allocation`].
+pub(crate) fn rollback_source_nat_allocation_for_worker(
+    rules: &[SourceNatRule],
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+    worker_id: u32,
+) {
+    release_source_nat_allocation_with_mode(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        true,
+        NatHolder::Worker(worker_id),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn release_source_nat_allocation_with_mode(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -1258,6 +1345,7 @@ fn release_source_nat_allocation_with_mode(
     is_reverse: bool,
     now_ns: u64,
     rollback: bool,
+    holder: NatHolder,
 ) {
     if is_reverse {
         return;
@@ -1348,9 +1436,11 @@ fn release_source_nat_allocation_with_mode(
             continue;
         }
         if rollback {
-            rule.pool_allocator.rollback_flow(flow, translated, now_ns);
+            rule.pool_allocator
+                .rollback_flow(flow, translated, now_ns, holder);
         } else {
-            rule.pool_allocator.release_flow(flow, translated, now_ns);
+            rule.pool_allocator
+                .release_flow(flow, translated, now_ns, holder);
         }
     }
 }
@@ -1437,6 +1527,16 @@ pub(crate) type SyncedNatZones<'a> = Option<(&'a str, &'a str)>;
 /// (`synced_zones == None` — an old peer, or config drift) falls back to the
 /// pre-#6211 first-pool-match, which is no worse than what shipped
 /// (rolling-upgrade safe).
+/// Reserve a synced translation WITHOUT recording a worker holder — the
+/// pre-#6211-F2 contract. Production must use
+/// [`reserve_synced_source_nat_allocation_for_worker`]; this entry point remains
+/// for tests that exercise the single-holder semantics directly.
+/// Compile-time completeness guard for #6211 F2: this untracked entry point is
+/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
+/// BUILD FAILURE in the non-test profile rather than a silent single-holder
+/// release of a reservation every worker holds. Production uses the
+/// `_for_worker` twin.
+#[cfg(test)]
 pub(crate) fn reserve_synced_source_nat_allocation(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -1444,6 +1544,51 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     is_reverse: bool,
     // #6211: see `SyncedNatZones`.
     synced_zones: SyncedNatZones<'_>,
+) {
+    reserve_synced_source_nat_allocation_with_holder(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        synced_zones,
+        NatHolder::Untracked,
+    );
+}
+
+/// #6211 F2: reserve a synced translation and record `worker_id` as a HOLDER.
+///
+/// `handle_upsert_synced` runs on EVERY worker (the entry is fanned out to each
+/// worker's command queue) while the source-NAT allocator is a single shared
+/// `Arc`, so the same `(flow, translated)` is reserved N times. Recording each
+/// worker's bit is what lets the release path free the port only after the LAST
+/// worker lets go — without it the first worker to reap or delete-sync the
+/// session frees a port the other N-1 are still forwarding through.
+pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
+    rules: &[SourceNatRule],
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    synced_zones: SyncedNatZones<'_>,
+    worker_id: u32,
+) {
+    reserve_synced_source_nat_allocation_with_holder(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        synced_zones,
+        NatHolder::Worker(worker_id),
+    );
+}
+
+fn reserve_synced_source_nat_allocation_with_holder(
+    rules: &[SourceNatRule],
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    // #6211: see `SyncedNatZones`.
+    synced_zones: SyncedNatZones<'_>,
+    holder: NatHolder,
 ) {
     if is_reverse {
         return;
@@ -1486,6 +1631,7 @@ pub(crate) fn reserve_synced_source_nat_allocation(
             flow,
             rewrite_src,
             nat.rewrite_src_port,
+            holder,
         )
     {
         return;
@@ -1502,7 +1648,13 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     // exactly what shipped before this fix, so no configuration can come out
     // of #6211 with FEWER reservations than it had. Pass 1 can only move a
     // reservation to a better-justified allocator, never remove one.
-    reserve_synced_on_first_pool_owner(rules.iter(), flow, rewrite_src, nat.rewrite_src_port);
+    reserve_synced_on_first_pool_owner(
+        rules.iter(),
+        flow,
+        rewrite_src,
+        nat.rewrite_src_port,
+        holder,
+    );
 }
 
 /// #6211: reserve the synced translation on the first rule in `rules` whose
@@ -1516,6 +1668,9 @@ fn reserve_synced_on_first_pool_owner<'a>(
     flow: SourceNatFlowKey,
     rewrite_src: IpAddr,
     rewrite_src_port: Option<u16>,
+    // #6211 F2: the worker taking this reservation, so a fan-out to N workers
+    // records N holders on ONE allocator record.
+    holder: NatHolder,
 ) -> bool {
     for rule in rules {
         if !rule.pool_mode {
@@ -1539,7 +1694,7 @@ fn reserve_synced_on_first_pool_owner<'a>(
             }
             if rule
                 .pool_allocator
-                .reserve_address_only(flow, rewrite_src)
+                .reserve_address_only(flow, rewrite_src, holder)
                 .is_ok()
             {
                 return true;
@@ -1574,6 +1729,7 @@ fn reserve_synced_on_first_pool_owner<'a>(
             },
             addr_index,
             rule.deterministic_v4.is_some(),
+            holder,
         ) {
             return true;
         }
@@ -1644,6 +1800,7 @@ pub(crate) fn allocate_nat64_pool_port_deterministic_v6(
 /// mirroring [`release_source_nat_allocation`]'s flow-key / translated-tuple
 /// construction so the SAME `release_flow` / `rollback_flow` frees the port the
 /// forward flow allocated. Returns whether the allocation was found and freed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn release_nat64_pool_port(
     allocator: &PortAllocator,
     flow: SourceNatFlowKey,
@@ -1651,15 +1808,19 @@ pub(crate) fn release_nat64_pool_port(
     port: u16,
     now_ns: u64,
     rollback: bool,
+    // #6211 F2: the worker letting go. `NatHolder::Untracked` keeps the
+    // pre-#6211-F2 first-release-frees contract for a local NAT64 flow; a synced
+    // reservation taken by N workers frees only on the last one.
+    holder: NatHolder,
 ) -> bool {
     let translated = TranslatedTuple {
         ip: IpAddr::V4(snat_v4),
         port,
     };
     if rollback {
-        allocator.rollback_flow(flow, translated, now_ns)
+        allocator.rollback_flow(flow, translated, now_ns, holder)
     } else {
-        allocator.release_flow(flow, translated, now_ns)
+        allocator.release_flow(flow, translated, now_ns, holder)
     }
 }
 
@@ -1689,6 +1850,7 @@ pub(crate) fn release_nat64_pool_port(
 /// is tagged deterministic and released via `free_no_recycle` — matching the
 /// active node's `allocate_deterministic_v6` release. A round-robin NAT64 pool
 /// passes `false` and keeps today's recycle behaviour.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reserve_nat64_pool_port(
     allocator: &PortAllocator,
     flow: SourceNatFlowKey,
@@ -1696,12 +1858,16 @@ pub(crate) fn reserve_nat64_pool_port(
     port: u16,
     addr_index: usize,
     deterministic: bool,
+    // #6211 F2: the worker taking this reservation. The synced NAT64 entry is
+    // fanned out to every worker against ONE shared allocator, exactly like the
+    // pool-mode SNAT reservation.
+    holder: NatHolder,
 ) -> bool {
     let translated = TranslatedTuple {
         ip: IpAddr::V4(snat_v4),
         port,
     };
-    allocator.reserve_flow(flow, translated, addr_index, deterministic)
+    allocator.reserve_flow(flow, translated, addr_index, deterministic, holder)
 }
 
 pub(crate) fn match_source_nat(
@@ -2038,7 +2204,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                         // as the round-robin branch — no new release site, no leak.
                         match rule
                             .pool_allocator
-                            .reserve_address_only(flow, IpAddr::V4(pool_addr))
+                            .reserve_address_only(flow, IpAddr::V4(pool_addr), NatHolder::Untracked)
                         {
                             Ok(translated) => {
                                 return SourceNatLookup::Matched(NatDecision {

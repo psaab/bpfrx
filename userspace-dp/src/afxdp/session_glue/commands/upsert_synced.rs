@@ -51,6 +51,10 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
     mut entry: SyncedSessionEntry,
     now_ns: u64,
     now_secs: u64,
+    // #6211 F2: THIS worker's id, from `WorkerLaunchPlan::worker_id` via
+    // `apply_worker_commands`. The synced entry is fanned out to every worker,
+    // so the reservation below must record which worker took it.
+    worker_id: u32,
 ) {
     let key = entry.key.clone();
     let allow_replace_local =
@@ -115,7 +119,7 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
         // the active path). The reservation is freed by the standard teardown
         // (`release_source_nat_allocation`) on reap or delete-sync.
         if entry.origin.is_peer_synced() && !metadata.is_reverse {
-            reserve_synced_source_nat_allocation(
+            reserve_synced_source_nat_allocation_for_worker(
                 &forwarding.source_nat_rules,
                 &key,
                 entry.decision.nat,
@@ -125,6 +129,11 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
                 // address. `None` (old peer / unknown zone) keeps the
                 // pre-#6211 first-pool-match.
                 synced_source_nat_zone_pair(forwarding, &metadata),
+                // #6211 F2: record this worker as a HOLDER. Every worker
+                // reserves the same `(flow, translated)` against ONE shared
+                // allocator; without the holder bit the first worker to reap or
+                // delete-sync frees a port the others still forward through.
+                worker_id,
             );
             // #4512: same treatment for NAT64. The translated `(pool v4, port)`
             // rides the synced `NatDecision` (`rewrite_src_port`), but the
@@ -134,11 +143,12 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
             // translated source (RFC 6146 BIB violation across a cross-node
             // failover). No-op for a non-NAT64 decision. Freed by the same
             // `release_nat64_allocation` on reap / delete-sync.
-            crate::nat64::reserve_synced_nat64_allocation(
+            crate::nat64::reserve_synced_nat64_allocation_for_worker(
                 &forwarding.nat64,
                 &key,
                 entry.decision.nat,
                 metadata.is_reverse,
+                worker_id,
             );
         }
         publish_worker_session_map_entry(

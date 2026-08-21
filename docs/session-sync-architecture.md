@@ -844,12 +844,50 @@ source tuple (reply mis-delivery / a session-hijack surface).
   sweep cannot over-free: `release_flow` / `rollback_flow` return false unless
   the stored translated tuple matches this one.
 - **Release site:** the reservation uses the synced flow key, so the standard
-  teardown — `release_source_nat_allocation`, already called on GC reap
+  teardown — `release_source_nat_allocation_for_worker`, already called on GC reap
   (`reap_expired_sessions`), on a peer delete-sync (`handle_delete_synced`), and
   on DSCP-filter purge — frees it with no new delete path (the address-only token
   is cleared from `address_only_owners` by the same `release_flow`). A reverse
   synced entry, or a session with no source NAT at all (`rewrite_src` unset),
   reserves nothing.
+- **Per-worker holder set (#6211 F2):** a synced entry is pushed to EVERY
+  worker's session table (`afxdp/ha/session_import.rs` fans `UpsertSynced` out to
+  each worker's command queue) while the source-NAT / NAT64 allocator is ONE
+  shared `Arc`. So N workers reserve the same `(flow, translated)` and each
+  releases it independently — the reap, the replicated `DeleteSynced`, and the
+  alias purge all run per worker. `LiveAllocation.holders` is a `u128` bitmask,
+  one bit per `worker_id`, OR-ed in at `reserve_flow`'s (and
+  `reserve_address_only`'s) idempotent early return — which is BOTH where workers
+  2..N land AND the path an already-holding worker takes on every refresh, so OR
+  is required where an increment would inflate without bound. The port is freed
+  only when the LAST holder's bit clears. `holders == 0` marks an untracked LOCAL
+  allocation (RSS steers a 5-tuple to one worker, so it has a single holder by
+  construction) and keeps the first-release-frees contract unchanged.
+
+  Without the holder set the N reserves collapsed into one record and the FIRST
+  worker to let go freed a port the other N-1 were still forwarding through. That
+  is the expected steady state after any failover carrying a synced SNAT session
+  older than the inactivity timeout: the active's periodic `UpsertSynced` refresh
+  stops, RSS lands traffic on exactly one worker, and the other replicas idle out
+  with nothing refreshing them.
+
+  `worker_id` comes from `WorkerLaunchPlan::worker_id` — the worker's own
+  identity established at spawn — threaded through `apply_worker_commands`,
+  `reap_expired_sessions`, `resolve_flow_session_decision` and
+  `delete_terminal_filtered_session`. The untracked entry points
+  (`release_source_nat_allocation`, `reserve_synced_source_nat_allocation`, and
+  their NAT64/rollback twins) are `#[cfg(test)]`, so a production path that
+  forgot to thread its worker id is a BUILD failure rather than a silent
+  single-holder release.
+- **Worker-id bound (#6211 F2):** the mask tracks
+  `nat::MAX_NAT_HOLDER_WORKERS` (128) workers, tied to the `u128` width by a
+  `const` assertion so the two cannot drift. The bound is enforced where ids are
+  MINTED — `replan_bindings_from_candidates` refuses the whole plan (fail-closed:
+  no bindings, no forwarding) if any `queue_id % workers` would exceed it. It is
+  deliberately NOT a cap on `--workers`: `queue_count` is the per-interface
+  RX-queue minimum computed independently of `workers`, so the ids actually
+  minted span `[0, min(queue_count, workers))` and a raw `--workers` cap would
+  refuse a safe box (`--workers 200` on a 16-queue NIC mints ids 0..15).
 - **Config-drift edge:** if the synced pool address is not a member of any local
   pool (the two nodes' pool config diverged), the reserve is skipped gracefully
   — never a panic, never a reservation on the wrong pool.

@@ -4066,19 +4066,19 @@ fn nat64_4512_reserve_release_wrapper_symmetry() {
         ..flow1
     };
     assert!(
-        reserve_nat64_pool_port(alloc, flow1, snat, 1024, 0, false),
+        reserve_nat64_pool_port(alloc, flow1, snat, 1024, 0, false, crate::nat::NatHolder::Untracked),
         "first reserve of an unowned port must take"
     );
     assert!(
-        !reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false),
+        !reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false, crate::nat::NatHolder::Untracked),
         "a second flow must NOT steal a port owned by a live reservation"
     );
     assert!(
-        release_nat64_pool_port(alloc, flow1, snat, 1024, 1, false),
+        release_nat64_pool_port(alloc, flow1, snat, 1024, 1, false, crate::nat::NatHolder::Untracked),
         "release must free the reservation for the owning flow"
     );
     assert!(
-        reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false),
+        reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false, crate::nat::NatHolder::Untracked),
         "after release the port is free and a later flow can re-own it"
     );
 }
@@ -5598,6 +5598,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
             1024,
             0,
             false,
+            crate::nat::NatHolder::Untracked,
         ),
         "prefix A must have freed the released flow's port"
     );
@@ -5609,6 +5610,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
             1024,
             0,
             false,
+            crate::nat::NatHolder::Untracked,
         ),
         "prefix B still owns the released flow's port: the NAT64 release stopped \
          at the FIRST prefix that freed it, stranding every other holder \

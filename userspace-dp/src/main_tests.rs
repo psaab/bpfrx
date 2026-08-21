@@ -4252,6 +4252,93 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #6211 F2 — the worker-id MINT-SITE bound
+// ---------------------------------------------------------------------------
+//
+// `replan_bindings_from_candidates` mints `worker_id = queue_id % workers`, and
+// the NAT allocator records one holder BIT per worker id. An id too wide for
+// that mask sets no bit on reserve and clears none on release — self-consistent,
+// but it collapses that worker to the pre-fix single-holder behaviour: it frees
+// a pool port another worker is still forwarding through. That is the original
+// over-release reintroduced through its own fix, so the plan is refused instead.
+//
+// This is the ONLY bound. A cap on the raw `--workers` value would be wrong, and
+// the third case below is the control that proves it.
+#[test]
+fn replan_refuses_worker_ids_beyond_the_nat_holder_mask_6211_f2() {
+    let queues = crate::nat::MAX_NAT_HOLDER_WORKERS as usize + 1;
+    let bindings = replan_bindings_from_candidates(
+        queues,
+        &[],
+        vec![("ge-0-0-1".to_string(), queues)],
+        BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+    );
+    assert!(
+        bindings.is_empty(),
+        "#6211 F2: {queues} queues x {queues} workers mints worker_id {} — wider \
+         than the {}-bit NAT holder mask — so the plan must be REFUSED, not \
+         planned with a worker whose holder bit silently does not exist",
+        queues - 1,
+        crate::nat::MAX_NAT_HOLDER_WORKERS
+    );
+}
+
+// #6211 F2 boundary control: the widest id the mask CAN represent is accepted.
+// Without this, "refuse everything" would satisfy the cell above.
+#[test]
+fn replan_accepts_the_widest_representable_worker_id_6211_f2() {
+    let queues = crate::nat::MAX_NAT_HOLDER_WORKERS as usize;
+    let bindings = replan_bindings_from_candidates(
+        queues,
+        &[],
+        vec![("ge-0-0-1".to_string(), queues)],
+        BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+    );
+    assert_eq!(
+        bindings.len(),
+        queues,
+        "worker ids 0..{} all fit the holder mask and must be planned",
+        queues - 1
+    );
+    assert_eq!(
+        bindings.iter().map(|b| b.worker_id).max(),
+        Some(crate::nat::MAX_NAT_HOLDER_WORKERS - 1),
+        "the boundary id itself is representable"
+    );
+}
+
+// #6211 F2 FALSE-REFUSAL control — the reason the check lives at the MINT site
+// and not on the raw `--workers` value.
+//
+// `queue_count` is the per-interface RX-queue minimum, computed independently of
+// `workers`, and the id is `queue_id % workers` with `queue_id < queue_count`.
+// So a huge `--workers` on a small NIC mints only SMALL ids: 200 workers on a
+// 16-queue interface yields ids 0..15, every one of them representable. A cap on
+// `--workers` would refuse this safe configuration; the mint-site check must
+// accept it.
+#[test]
+fn replan_accepts_huge_worker_count_on_a_small_queue_nic_6211_f2() {
+    let workers = crate::nat::MAX_NAT_HOLDER_WORKERS as usize + 72; // 200
+    let bindings = replan_bindings_from_candidates(
+        workers,
+        &[],
+        vec![("ge-0-0-1".to_string(), 16)],
+        BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+    );
+    assert_eq!(
+        bindings.len(),
+        16,
+        "16 RX queues plan 16 bindings however large --workers is"
+    );
+    assert_eq!(
+        bindings.iter().map(|b| b.worker_id).max(),
+        Some(15),
+        "#6211 F2: --workers {workers} on a 16-queue NIC mints ids 0..15, all \
+         representable — the bound is on the MINTED id, not on --workers, so \
+         this safe configuration must NOT be refused"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // #6691 round 8: an orphan VLAN child must not re-key onto a REFUSED parent.

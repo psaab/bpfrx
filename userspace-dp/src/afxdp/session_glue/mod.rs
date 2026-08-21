@@ -351,6 +351,9 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
     purge_v4: bool,
     purge_v6: bool,
     now_ns: u64,
+    // #6211 F2: THIS worker's id — the purge tears down sessions that may be
+    // peer-synced, whose reservation every worker holds.
+    worker_id: u32,
 ) -> usize {
     if !purge_v4 && !purge_v6 {
         return 0;
@@ -388,6 +391,7 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
             &metadata,
             origin,
             now_ns,
+            worker_id,
         );
     }
     purged
@@ -466,6 +470,10 @@ pub(super) fn delete_terminal_filtered_session(
     metadata: &SessionMetadata,
     origin: SessionOrigin,
     now_ns: u64,
+    // #6211 F2: THIS worker's id, threaded from `WorkerLaunchPlan::worker_id`
+    // in the worker loop. A peer-synced reservation is held by every worker, so
+    // a release must drop THIS worker's bit rather than free the port outright.
+    worker_id: u32,
 ) {
     // #5622: a translated LocalDelivery terminal hit (host-inbound deny, lo0
     // input-filter deny, or `to-zone junos-host` deny on the session-HIT path)
@@ -496,6 +504,7 @@ pub(super) fn delete_terminal_filtered_session(
     };
 
     delete_terminal_half(
+        worker_id,
         sessions,
         session_map_fd,
         conntrack_v4_fd,
@@ -515,6 +524,7 @@ pub(super) fn delete_terminal_filtered_session(
 
     if let Some((companion_decision, companion_metadata, companion_origin)) = companion {
         delete_terminal_half(
+            worker_id,
             sessions,
             session_map_fd,
             conntrack_v4_fd,
@@ -544,6 +554,7 @@ pub(super) fn delete_terminal_filtered_session(
 /// teardown the idle reap and DSCP purge do.
 #[allow(clippy::too_many_arguments)]
 fn delete_terminal_half(
+    worker_id: u32,
     sessions: &mut SessionTable,
     session_map_fd: c_int,
     conntrack_v4_fd: c_int,
@@ -560,19 +571,21 @@ fn delete_terminal_half(
     origin: SessionOrigin,
     now_ns: u64,
 ) {
-    release_source_nat_allocation(
+    release_source_nat_allocation_for_worker(
         &forwarding.source_nat_rules,
         key,
         decision.nat,
         metadata.is_reverse,
         now_ns,
+        worker_id,
     );
-    crate::nat64::release_nat64_allocation(
+    crate::nat64::release_nat64_allocation_for_worker(
         &forwarding.nat64,
         key,
         decision.nat,
         metadata.is_reverse,
         now_ns,
+        worker_id,
     );
     delete_session_map_entry_for_removed_session_with_origin(
         session_map_fd,
@@ -669,6 +682,10 @@ pub(super) fn apply_worker_commands(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    // #6211 F2: THIS worker's id, threaded from `WorkerLaunchPlan::worker_id`
+    // in the worker loop. A peer-synced reservation is held by every worker, so
+    // a release must drop THIS worker's bit rather than free the port outright.
+    worker_id: u32,
 ) -> WorkerCommandResults {
     // Hot path: try_lock avoids blocking on the mutex when another thread
     // holds it (rare) and avoids the cost of lock+unlock on empty queues
@@ -773,6 +790,7 @@ pub(super) fn apply_worker_commands(
                     entry,
                     now_ns,
                     now_secs,
+                    worker_id,
                 );
             }
             WorkerCommand::UpsertLocal(entry) => {
@@ -838,6 +856,7 @@ pub(super) fn apply_worker_commands(
                     key,
                     now_ns,
                     &mut deleted_synced_keys,
+                    worker_id,
                 );
             }
             WorkerCommand::EnqueueShapedLocal(req) => {
@@ -1267,6 +1286,10 @@ pub(super) fn resolve_flow_session_decision(
     ingress_ifindex: i32,
     fabric_ingress: bool,
     ha_startup_grace_until_secs: u64,
+    // #6211 F2: THIS worker's id, threaded from `WorkerLaunchPlan::worker_id`
+    // in the worker loop. A peer-synced reservation is held by every worker, so
+    // a release must drop THIS worker's bit rather than free the port outright.
+    worker_id: u32,
 ) -> Option<ResolvedFlowSessionDecision> {
     // Bundle the four shared-session refs once per call. `SharedSessionRefs`
     // is `#[derive(Copy)]`, so the three downstream uses below
@@ -1316,6 +1339,7 @@ pub(super) fn resolve_flow_session_decision(
                 origin,
                 forwarding,
                 now_ns,
+                worker_id,
             );
         }
         let resolved = if keep_transient {
