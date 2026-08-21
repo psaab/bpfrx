@@ -294,12 +294,25 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// break an existing stanza) but have NO effect; the compiler
 		// emits a per-knob commit warning instead (#1892,
 		// userspaceRetiredKnobWarnings).
-		"cores":          {args: 1, desc: "Legacy DPDK core count (retired, ignored)", children: nil},
-		"memory":         {args: 1, desc: "Legacy DPDK memory allocation (retired, ignored)", children: nil},
-		"socket-mem":     {args: 1, desc: "Legacy DPDK socket memory (retired, ignored)", children: nil},
-		"binary":         {args: 1, desc: "Userspace dataplane helper binary path", children: nil},
-		"control-socket": {args: 1, desc: "Unix control socket path", children: nil},
-		"state-file":     {args: 1, desc: "Helper state file path", children: nil},
+		"cores":      {args: 1, desc: "Legacy DPDK core count (retired, ignored)", children: nil},
+		"memory":     {args: 1, desc: "Legacy DPDK memory allocation (retired, ignored)", children: nil},
+		"socket-mem": {args: 1, desc: "Legacy DPDK socket memory (retired, ignored)", children: nil},
+		"binary":     {args: 1, desc: "Userspace dataplane helper binary path", children: nil},
+		// #5839: typed so a path the dataplane bring-up would have to refuse
+		// — relative, `..`-escaping, or over the AF_UNIX sun_path limit —
+		// fails at commit check instead of at helper start. Strict commits
+		// only; the tolerant load path warns and boots (#1960), and
+		// removeStaleUnixSocket re-judges the path defensively at runtime.
+		"control-socket": {
+			args:          1,
+			desc:          "Unix control socket path",
+			valueType:     ValueUnixSocketPath,
+			valueDesc:     "Absolute path the dataplane helper binds its control socket at",
+			valueExamples: []string{"/run/xpf/userspace-dp.sock"},
+			validator:     ValidateUnixSocketPath,
+			children:      nil,
+		},
+		"state-file": {args: 1, desc: "Helper state file path", children: nil},
 		// #1319 PR 3 typed dataplane knobs. Each compiled with the
 		// Atoi error swallowed (compileUserspaceDataplane), so
 		// garbage silently fell back to the 0 zero-value, which the

@@ -97879,3 +97879,45 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_ha_actuation_6371_test.go,
   pkg/cluster/sync_failover_fence_verdict_6371_test.go,
   docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #5839 — harden the userspace helper control-socket stale-socket
+  removal and type the `control-socket` leaf. The control-socket half of helper
+  bring-up still did a bare `_ = os.Remove(cfg.ControlSocket)`: the path is
+  operator-supplied and xpfd runs as root, so it deleted whatever object the
+  path named (regular file, symlink, a running helper's live socket) and
+  swallowed the failure when it could not. The sibling EVENT-socket half was
+  hardened in #5273 (`removeStaleEventStreamSocket`); this extracts that logic
+  into `removeStaleUnixSocket` in a new `stale_socket.go` so both halves share
+  ONE implementation (an explicit #5839 invariant), and points the control
+  socket at it. All four checks apply to the control socket: Lstat with
+  not-exists tolerated (and a symlink judged on its own inode), an
+  `os.ModeSocket` gate, a `/proc/net/unix` liveness probe, and a non-ignored
+  `os.Remove`. The sidecar flock is NOT extended to the control socket: xpfd
+  does not bind it (the Rust helper does) so a daemon-side lock would serialize
+  nothing.
+
+  Because `ensureProcessLocked` stops generation N before preparing N+1, the
+  guarded removal alone would have converted "silently delete a regular file and
+  continue" into "tear down forwarding, then fail" — worse for availability. So
+  `preflightHelperPaths` runs the deterministic checks (control/event/state must
+  be distinct; neither socket path may already exist as a non-socket) BEFORE the
+  stop, via `stopForNewGenerationLocked`. The liveness check is deliberately not
+  hoisted: the control socket is live precisely until the helper holding it is
+  stopped.
+
+  `control-socket` also becomes a typed leaf (`ValueUnixSocketPath` /
+  `ValidateUnixSocketPath`): absolute, no `.`/`..`/empty component, no trailing
+  slash, no control characters, within the 107-octet AF_UNIX sun_path limit.
+  No-brick per #1960 — `compileTreeLenient` warns and boots on a stale stored or
+  peer-synced value, so the gate binds strict commits only and the runtime layer
+  is what actually protects bring-up.
+
+  Validation: `go test -count=1 ./...` exit 0. Mutation matrix over the four
+  checks + the preflight + the typed leaf recorded in the PR. Go-only diff — no
+  Rust/shim artifact moves, so no cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/stale_socket.go,
+  pkg/dataplane/userspace/process.go, pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/stale_socket_5839_test.go,
+  pkg/config/schema_system.go, pkg/config/schema_validators_system.go,
+  pkg/config/value_type.go, pkg/config/control_socket_typed_5839_test.go,
+  docs/userspace-dataplane-architecture.md, docs/config-schema.md, _Log.md
