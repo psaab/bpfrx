@@ -1090,16 +1090,26 @@ control so an ACCEPT only counts beside a REJECT of the same token:
 
 | Leaf | Shape that ESCAPES | Same token REJECTED as | Tracked |
 |---|---|---|---|
-| CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 |
+| CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 — **CLOSED**, see below |
 | `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 — **CLOSED**, see below |
-| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
-| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
 | `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 — **CLOSED**, see below |
 
 Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
-reads `child.Keys[1:]` plus the inline tail and never `child.Children`, while
+read `child.Keys[1:]` plus the inline tail and never `child.Children`, while
 the archive-sites loop reads children and only slot 1 of the tail. "Which shape
 escapes" is a property of the individual reader; do not generalise from one.
+
+The CoS row is closed: all five code-point readers now go through
+`coSCodePointTokens` (`compiler_class_of_service.go`), which returns the leaf
+node's tail, EVERY key of each of its children, and the inline `loss-priority
+low code-points ef;` tail, and every caller still runs its per-value domain
+check over every token it returns. Its escape was worse than the table row
+suggests: the block spelling did not truncate the code-point list, it lost the
+WHOLE classifier, because the compiler stores a classifier only when it has at
+least one entry. A regression test asserting "the entry has both code points"
+would have passed VACUOUSLY against it, so the tests in
+`cos_code_points_spellings_6697_test.go` report ABSENT and WRONG-VALUES as
+distinct failures.
 
 **Closing a gate escape owes a SEVERITY SPLIT, not just a widened read
 (#6687).** `vlan-id-list` is now read with `multiLeafAuthoredValues` and every
@@ -1183,10 +1193,7 @@ bundled, because each needs its own value-domain gate widened in the same change
 
 | Leaf | Still one-sided | Tracked |
 |---|---|---|
-| CoS DSCP / IEEE classifier `code-points` | reads tail, never `Children` | #6697 |
 | ~~`system archival archive-sites` (+ three sibling system leaves)~~ | ~~reads `Children` and only slot 1 of the tail~~ | #6692 — FIXED |
-| `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
-| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
 ### The list above is now enforced by a gate, not maintained by hand
@@ -1201,6 +1208,40 @@ deliberately behavioural rather than syntactic:
 ```
 dropped(spelling) := compile(spelling, [v1]) == compile(spelling, [v1 v2])
 ```
+
+**A DROPPED value and an UNREAD SHAPE are different defects, and the
+differential only sees the first (#6697).** The primitive above discards any
+spelling where the FIRST value did not move the output — "inert" — because a
+synthetic parent path the compiler rejects makes every form identical. A reader
+that ignores one shape ENTIRELY is indistinguishable from that: both `[v1]` and
+`[v1 v2]` compile to nothing in the shape it does not read, so the spelling is
+dropped from the comparison and the leaf reports agreement. Reverting all five
+CoS code-point reads left this gate green. The third class closes it: for a leaf
+the schema marks `multi: true` — a declared value list, where the block form is
+legal Junos — a spelling that is READ sitting beside one that is INERT is itself
+the finding. Restricting it to `multi` leaves is what makes it usable: over all
+value-bearing leaves the same rule fires at 117 sites, almost all scalar leaves
+for which `leaf { v; }` is not a Junos spelling. Over `multi` leaves it fires at
+ZERO today, and that is what lets it be a build gate rather than a report; its
+non-vacuity is the mutation, not the count — revert the five CoS code-point
+reads and it names all three classifier sites, where the first two classes stay
+silent.
+
+**The compared output must exclude the DIAGNOSTIC channel, and a leaf is only
+covered by a value pair its DOMAIN accepts (#6697).** `cfg.Warnings` is a field
+of `Config`, so it used to be marshalled into the compared string. A value the
+leaf rejects is recorded there by the tolerant compile path, which moves the
+output off the no-value baseline and satisfies the guard that exists to catch
+exactly that case — and because these readers fail FAST on the first bad token,
+`[v1]` and `[v1 v2]` then produce the IDENTICAL single warning and the pair
+reads as a uniform drop at a leaf with no defect. That is how all five #6697
+sites reported "uniform drop" on every value pair OUTSIDE their domain while
+reporting clean on the one pair inside it, at the same commit. `gateMarshal`
+clears `Warnings` before comparing: a warning is what the compiler says ABOUT
+the input, not configuration it installed. The corollary is the `pcp` value pair
+(3/5) — without a pair inside 0..7 the `ieee-802.1` and `inet-precedence`
+classifier leaves reject all the others, go inert, and carry no verdict, so a
+fix there cannot be proven by removing an allowlist row.
 
 **Why a gate and not a lint.** There is no single correct reader to lint FOR:
 this package now has at least six accumulating readers, one of which
@@ -1229,7 +1270,7 @@ so the row is removed by whoever fixes the defect and closes the issue, rather
 than being deleted quietly to get green.
 
 **A green run is not a swept schema, and the gate says so in its own output.**
-It compares 624 of the 1020 sites it enumerates; the other 396 go inert under
+It compares 607 of the 1017 sites it enumerates; the other 410 go inert under
 synthetic parent paths the compiler rejects and carry no verdict in either
 direction. It also sees ONE DIRECTION — a compiler DROPPING a value. The opposite
 defect, a reader PROMOTING a per-value modifier keyword into the value list (the
