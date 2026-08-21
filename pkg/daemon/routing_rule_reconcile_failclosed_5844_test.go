@@ -112,12 +112,12 @@ func TestApplyTailReconcilesSurfacesRoutingRuleError_5844(t *testing.T) {
 	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
 
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{},
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -166,12 +166,12 @@ func TestApplyTailReconcilesSurfacesMgmtRouteError_5867(t *testing.T) {
 	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
 
 	d := &Daemon{
-		dp:       &runtimeOnlyApplyTestDP{},
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{

@@ -173,7 +173,7 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 }
 
 func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
-	provider, ok := c.dp.(cliUserspaceStatusProvider)
+	provider, ok := c.dpProbe().(cliUserspaceStatusProvider)
 	if !ok {
 		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
 	}
@@ -181,7 +181,7 @@ func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 }
 
 func (c *CLI) userspaceDataplaneControl() (cliUserspaceControlProvider, error) {
-	provider, ok := c.dp.(cliUserspaceControlProvider)
+	provider, ok := c.dpProbe().(cliUserspaceControlProvider)
 	if !ok {
 		return nil, fmt.Errorf("userspace dataplane control unavailable")
 	}

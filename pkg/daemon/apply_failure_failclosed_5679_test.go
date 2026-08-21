@@ -14,7 +14,7 @@ import (
 
 // TestApplyConfigLockedFailsCommitOnOrdinaryDataplaneApplyError_5679 is the
 // #5679 commit-level wiring proof. An ORDINARY (non-abort-class) full dataplane
-// apply failure — d.dp.ApplyConfig returns a plain error that is NOT one of the
+// apply failure — the dataplane ApplyConfig returns a plain error that is NOT one of the
 // required-protocol-gate sentinels compileErrorMustAbortApply matches — does
 // NOT disarm the dataplane: the OLD compiled policy stays live and forwarding
 // while store.Commit has already promoted+persisted the NEW config. Before the
@@ -47,12 +47,12 @@ func TestApplyConfigLockedFailsCommitOnOrdinaryDataplaneApplyError_5679(t *testi
 
 	dp := &runtimeOnlyApplyTestDP{applyErr: injected}
 	d := &Daemon{
-		dp:       dp,
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -100,12 +100,12 @@ func TestApplyConfigLockedAbortClassStillEarlyReturns_5679(t *testing.T) {
 
 	dp := &runtimeOnlyApplyTestDP{applyErr: dpuserspace.ErrPolicySchedulerProtocolIncompatible}
 	d := &Daemon{
-		dp:       dp,
 		networkd: networkd.NewInDir(t.TempDir()),
 		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:  vrrp.NewManager(),
 		opts:     Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{

@@ -35,7 +35,7 @@ func (s *Server) runtimeSourceNATPools() (map[string]dpuserspace.SourceNATPoolSt
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, nil
 	}
-	provider, ok := s.dp.(interface {
+	provider, ok := s.dpProbe().(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
@@ -69,7 +69,7 @@ func (s *Server) appliedNATView() nat.AppliedView {
 	if s.dp == nil {
 		return nat.AppliedView{Available: false}
 	}
-	provider, ok := s.dp.(interface {
+	provider, ok := s.dpProbe().(interface {
 		AppliedNATView() dpuserspace.AppliedNATView
 	})
 	if !ok {

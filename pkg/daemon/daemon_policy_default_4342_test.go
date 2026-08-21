@@ -107,7 +107,8 @@ func TestClearSessionsForDefaultPolicyChange(t *testing.T) {
 		newCfg := permit()
 		newCfg.Security.DefaultPolicy = config.PolicyDeny
 
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForDefaultPolicyChange(permit(), newCfg)
 
 		if _, ok := dp.v4[defSess]; ok {
@@ -130,7 +131,8 @@ func TestClearSessionsForDefaultPolicyChange(t *testing.T) {
 		newCfg.Security.DefaultPolicyLogSessionInit = true
 		newCfg.Security.PolicyRematch = true
 
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForDefaultPolicyChange(permit(), newCfg)
 
 		if _, ok := dp.v4[defSess]; ok {
@@ -143,7 +145,8 @@ func TestClearSessionsForDefaultPolicyChange(t *testing.T) {
 		newCfg := permit()
 		newCfg.Security.DefaultPolicyLogSessionClose = true // no policy-rematch
 
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForDefaultPolicyChange(permit(), newCfg)
 
 		if _, ok := dp.v4[defSess]; !ok {
@@ -156,7 +159,8 @@ func TestClearSessionsForDefaultPolicyChange(t *testing.T) {
 
 	t.Run("no default-policy change is a zero-cost no-op", func(t *testing.T) {
 		dp, defSess, _, _, _ := defaultPolicyTestSessions()
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForDefaultPolicyChange(permit(), permit())
 
 		if _, ok := dp.v4[defSess]; !ok {

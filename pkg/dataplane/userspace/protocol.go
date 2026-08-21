@@ -34,7 +34,75 @@ const (
 	// ensureScopedGlobalZoneSetProtocolLocked required-protocol gate in
 	// manager_compile.go, which DISARMS the helper and aborts the commit
 	// when the running helper is too old to represent a multi-zone scope.
-	ProtocolVersion                  = 4
+	//
+	// v5 (#6722): the per-interface EGRESS zone is decided by the Go builder
+	// and carried in InterfaceSnapshot.EgressZone; the reth_projection field
+	// that the previous contract carried is GONE. This is a field DELETION
+	// paired with an addition, so unlike an additive field it cannot ride an
+	// unchanged version: at v4 two binaries built either side of this change
+	// both advertise 4 and interpret the same bytes differently, and nothing
+	// on the wire distinguishes them.
+	//
+	// The mixed pairing is not merely "not yet fixed", which is why the bump
+	// is not optional. MEASURED, feeding the v4 Go builder's rows to the v5
+	// helper on the reference cluster (docs/ha-cluster-userspace.conf, node
+	// 0): egress zone of ifindex 24 = 0 and ifindex 25 = 0, where BOTH
+	// origin/master and the v5 pair resolve `lan` and `wan`. Ifindex 25 is the
+	// telling one — it loses a zone that even the pre-#6722 helper resolved —
+	// so the pairing is strictly worse than either endpoint, not an
+	// intermediate state. Under `default-policy deny-all` that is a silent
+	// transit outage whose only signature is a version both sides agree on.
+	//
+	// Paired with ensureEgressZoneProtocolLocked (manager_compile.go), which
+	// gates on EQUALITY rather than `>=`: the helper's own apply_snapshot and
+	// bump_fib_generation gates are exact-equality, so a helper at ANY other
+	// version refuses the snapshot, and a `>=` gate would stay green at
+	// exactly the value that collides.
+	// v5 (#5619 / #6691): InterfaceSnapshot.SecureTunnel became AUTHORITATIVE
+	// over AF_XDP binding admission — the helper's
+	// include_userspace_binding_interface refuses a candidate on it. A helper
+	// that predates the field leaves it false and plans the xfrmi anyway, and
+	// since the helper's queue count is the GLOBAL MINIMUM across candidates
+	// and an xfrm interface has exactly ONE RX queue, that re-plans EVERY
+	// physical interface onto one queue and one worker — the #3091
+	// single-worker regression, silently, on a config this control plane
+	// believes is safe. The same-version equality check cannot see it, which
+	// is why the field needed the version and not just a new JSON tag.
+	// Paired with ensureSecureTunnelProtocolLocked (manager_compile.go).
+	//
+	// v6 (#6691 round 9): the REFUSAL RULE over that same field changed from
+	// "any owning row calls this netdev unbindable" to "every owning row
+	// does" (userspaceRefusedNetdevs, mirrored by
+	// snapshot_refuses_parent_netdev). No field moved — the SEMANTICS of the
+	// existing rows did, which is precisely the case an unchanged version
+	// number cannot express: a v5 helper and a v6 control plane both say "5"
+	// and disagree about which netdevs may be bound, so a netdev one plane
+	// admits the other refuses and the two produce different binding plans
+	// from one snapshot. A wire change with no new field still needs the
+	// version.
+	//
+	// v7 (#6691 round 10): FabricSnapshot.ParentUnbindable is AUTHORITATIVE
+	// over whether a fabric parent netdev may be bound. A fabric member needs
+	// no interface stanza, so the parent commonly has no row to carry the
+	// device-level flags, and a v6 helper — which decodes the absent field to
+	// false — plans an AF_XDP binding on a netdev this control plane refused.
+	// The reachable shape is a live xfrmi under a slot-shaped name used as a
+	// fabric member: one RX queue, global-minimum queue planning, #3091 again.
+	// Paired with ensureSecureTunnelProtocolLocked, which gates the whole
+	// secure-tunnel contract on the helper being at ProtocolVersion.
+	// v8 (integration of #6722 and #6691): both branches independently bumped
+	// this constant for DIFFERENT wire changes — #6722 to 5 for the
+	// EgressZone-for-reth_projection swap, #6691 to 7 for the secure-tunnel
+	// refusal contract. The merged wire carries BOTH contracts and therefore
+	// matches NEITHER 5 nor 7. Leaving it at either value is exactly the
+	// collision the two comments above describe: a helper built from one branch
+	// alone advertises the same number as this control plane and reads the rows
+	// differently. 8 was never shipped by either side, so no mixed pairing can
+	// agree on it by accident. BOTH gates stay armed and both are dispatched
+	// from ensureRequiredSnapshotProtocolLocked. The per-branch prose above
+	// still says "4 -> 5" and "moved to 6"; those describe each branch's own
+	// history, not this constant's current value.
+	ProtocolVersion                  = 8
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 
@@ -252,18 +320,146 @@ type InterfaceSnapshot struct {
 	// across VRF boundaries (#2388). Additive: an old Rust helper that does
 	// not know the field treats every interface as the default instance
 	// (the pre-#2388 global behavior); an old Go binary omits it.
-	RoutingInstance           string                     `json:"routing_instance,omitempty"`
-	LinuxName                 string                     `json:"linux_name,omitempty"`
-	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
-	Ifindex                   int                        `json:"ifindex,omitempty"`
-	ParentIfindex             int                        `json:"parent_ifindex,omitempty"`
-	LogicalOnly               bool                       `json:"logical_only,omitempty"`
-	RXQueues                  int                        `json:"rx_queues,omitempty"`
-	VLANID                    int                        `json:"vlan_id,omitempty"`
-	LocalFabric               string                     `json:"local_fabric_member,omitempty"`
-	RedundancyGroup           int                        `json:"redundancy_group,omitempty"`
-	UnitCount                 int                        `json:"unit_count"`
-	Tunnel                    bool                       `json:"tunnel"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
+	LinuxName       string `json:"linux_name,omitempty"`
+	ParentLinuxName string `json:"parent_linux_name,omitempty"`
+	Ifindex         int    `json:"ifindex,omitempty"`
+	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
+	LogicalOnly     bool   `json:"logical_only,omitempty"`
+	RXQueues        int    `json:"rx_queues,omitempty"`
+	VLANID          int    `json:"vlan_id,omitempty"`
+	LocalFabric     string `json:"local_fabric_member,omitempty"`
+	RedundancyGroup int    `json:"redundancy_group,omitempty"`
+	// EgressZone is the security zone this row's IFINDEX egresses into, or "" for
+	// none (#6722). It is the ANSWER, decided in stampEgressZones (interfaces.go)
+	// where the operator's authored `security-zone ... interfaces <ref>` bindings
+	// and snapshotLinuxName's aliasing are both in hand. Every row sharing an
+	// ifindex carries the SAME value.
+	//
+	// It is NOT Zone with a different name. Zone is this row's own zone as
+	// buildInterfaceZoneMap derived it, and is what the INGRESS half attributes an
+	// arriving packet to (#921/#3618, unchanged). EgressZone answers the different
+	// question the egress half must ask — "does this ifindex identify exactly one
+	// zone" — for a netdev that several configured identities may share.
+	//
+	// The Rust helper honours it only when some row on the ifindex literally
+	// carries that zone NAME (forwarding_build::interfaces::populate_interfaces),
+	// so a drifted or hostile snapshot can never conjure a zone no row on the
+	// ifindex named. That is the whole of the helper-side check: there is no row
+	// classification left for a config shape to disagree with.
+	//
+	// Emitted UNCONDITIONALLY (no omitempty), so a "" answer is on the wire as a
+	// DECISION — this Go binary determined the ifindex identifies no zone — and
+	// resolves the 0 sentinel. There is no "the field was absent" arm to fall
+	// back to; the compatibility arm that used to exist was deleted with the
+	// row-unanimity rule it restored.
+	//
+	// THAT IS A DESIGN STATEMENT, NOT A BEHAVIOURAL GUARD, and the difference is
+	// worth stating because it reads like one. The Rust side declares
+	// `#[serde(rename = "egress_zone", default)]` (snapshot.rs), so an ABSENT
+	// key and an emitted "" decode identically: both give `String::new()`, which
+	// `EgressZoneClaim::Decided("")` resolves to `None` and the 0 sentinel.
+	// Adding `omitempty` here would therefore change no answer the helper gives,
+	// and no test can red on it — the one Go wire pin,
+	// TestEgressZoneCrossesTheWireAndTheQuarantine_6722, asserts the NONEMPTY
+	// case, which omitempty does not touch. The tag is kept because "the builder
+	// always states its answer" is the property this field is FOR, and because a
+	// future `deny_unknown_fields` or a non-defaulting decoder would make the
+	// two spellings diverge; it is not kept because something would catch its
+	// removal today.
+	//
+	// MIXED VERSION IS REFUSED, NOT TOLERATED. ProtocolVersion moved 4 -> 5 in
+	// this change (see the constant above), and ensureEgressZoneProtocolLocked
+	// (manager_compile.go) refuses to commit against a helper whose observed
+	// version is anything else. That is a departure from the sibling gates: this
+	// repo has previously bumped only when an old reader MISREADS a snapshot
+	// into a wrong answer (#5488's ErrScopedGlobalZoneSetProtocolIncompatible —
+	// an old helper reads only the singular match_from_zone and NARROWS a global
+	// deny, a fail-OPEN). Neither direction here misreads, so the bump is not
+	// forced by that rule; it is taken because a mixed window silently loses the
+	// fix, and losing it silently is what this PR exists to stop:
+	//
+	//	new Go -> OLD helper: the wire shape this builder emits deserializes on
+	//	  a v4 helper (there is no deny_unknown_fields anywhere in
+	//	  userspace-dp/src/protocol, at c9b020695 or here) — it reads
+	//	  reth_projection=false from serde's default and answers ledger[24]=None,
+	//	  to_zone=0, action=Deny. Measured by running that helper against this
+	//	  builder's output.
+	//	old Go -> NEW helper: the retired `reth_projection` key is ignored and
+	//	  `egress_zone` is absent, which serde fills with the empty String —
+	//	  the fail-closed 0 sentinel. Pinned by
+	//	  retired_wire_key_decodes_and_absent_egress_zone_fails_closed_6722
+	//	  (userspace-dp/src/afxdp/forwarding/tests.rs).
+	//
+	// Neither direction invents a zone; both would blackhole a bondless-RETH
+	// cluster exactly as the pre-#6722 tree did. What the gate changes is that
+	// the commit ABORTS with a named sentinel and DISARMS the helper instead of
+	// promoting an image the dataplane cannot honour — see
+	// TestEgressZoneProtocolAbortDisarmsAndPublishesNothing_6722 for the
+	// measured wire behaviour, including that no apply_snapshot is sent.
+	EgressZone string `json:"egress_zone"`
+	UnitCount  int    `json:"unit_count"`
+	Tunnel     bool   `json:"tunnel"`
+	// SecureTunnel reports that this row's netdev is a route-based IPsec
+	// tunnel device, so the dataplane must neither adjudicate nor bind it.
+	//
+	// TWO ORACLES, ONE CLAIM (#6691 round 8, snapshotSecureTunnel):
+	//
+	//   - CONFIG. Some `security ipsec vpn <name> bind-interface` NAMES this
+	//     row's xfrmi device (Config.SecureTunnelNetdevForRef).
+	//   - KERNEL. The netdev this row resolves to has link kind `xfrm`
+	//     (liveXfrmNetdevs). This half exists because every config-keyed
+	//     predicate is blind to a device the config no longer describes: a
+	//     failed LinkDel retains the xfrmi (pkg/routing, #4901) while the
+	//     apply proceeds on a deferred error, and a daemon restart leaves an
+	//     untracked one that no sweep enumerates. Only the kernel knows.
+	//
+	// The two cover different instants, so the flag is their union and neither
+	// is redundant. The instant that matters is narrower than "the commit that
+	// creates a tunnel", though: on the NORMAL apply path the daemon's
+	// interface/xfrmi reconcile runs BEFORE snapshot construction, so the
+	// device usually exists by the time the builder samples and the kernel half
+	// sees it. The config half is load-bearing where reconciliation has not run
+	// or did not succeed — a build that precedes it, or an xfrmi routing failed
+	// to create — not for every creation commit.
+	//
+	// It is OWNERSHIP or DEVICE KIND, never name shape: nothing reserves the
+	// `st` prefix, so a wildcard-authored `st5` with no VPN is an ordinary
+	// data interface, is not an xfrm device, and this stays false (#6691).
+	//
+	// The field's MEANING, type and JSON tag are unchanged by the kernel half;
+	// what changed is the evidence the control plane accepts for the same
+	// claim. The version still moved to 6 in #6691 round 9, for a different
+	// reason: the REFUSAL RULE this flag feeds changed within the PR (ANY
+	// owner -> EVERY owner), so two helpers at the same number would plan
+	// different bindings for identical bytes.
+	//
+	// It is NOT read by one consumer. include_userspace_binding_interface was
+	// the only one when round 8 wrote that; userspace_unbindable_netdev and,
+	// through it, snapshot_refuses_parent_netdev / binding_target_is_refused
+	// read it too (planning.rs), which is how a VLAN child's redirect is
+	// refused.
+	//
+	// "Names the device", not "derives the if_id" — the two differ, and the
+	// difference was a defect (#6691 round 6). strconv.Atoi erases a leading
+	// `+` and leading zeros, so `bind-interface st05` derives the SAME if_id
+	// as `st5` under a DIFFERENT device name; keying on the if_id alone set
+	// this flag on a NIC no VPN names, taking it out of the dataplane.
+	//
+	// "THIS ROW's device", and the row decides which name that is (#6691
+	// round 7). A UNIT row's netdev comes from the authored bind-interface,
+	// so `st5.0` is the xfrmi under either spelling. A BASE row's netdev is
+	// `LinuxIfName(ifName)` — literally `st5` — so it is the xfrmi only under
+	// a bare `bind-interface st5`. Round 6 compared only the base part of
+	// each name, which set this flag on the `st5` row for a VPN whose device
+	// is `st5.0`, and a live NIC lost its AF_XDP/RSS binding to it.
+	//
+	// Additive: an old Rust helper that does not know the field treats every
+	// interface as not-a-secure-tunnel, so an xfrmi would get an AF_XDP
+	// binding it cannot use — the #5619 GAP, which both planes' comments
+	// already rank as less bad than the outage over-matching causes. An old
+	// Go binary omits it.
+	SecureTunnel              bool                       `json:"secure_tunnel,omitempty"`
 	MTU                       int                        `json:"mtu,omitempty"`
 	HardwareAddr              string                     `json:"hardware_addr,omitempty"`
 	Addresses                 []InterfaceAddressSnapshot `json:"addresses,omitempty"`
@@ -323,12 +519,30 @@ type FabricSnapshot struct {
 	ParentInterface string `json:"parent_interface,omitempty"`
 	ParentLinuxName string `json:"parent_linux_name,omitempty"`
 	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
-	OverlayLinux    string `json:"overlay_linux_name,omitempty"`
-	OverlayIfindex  int    `json:"overlay_ifindex,omitempty"`
-	RXQueues        int    `json:"rx_queues,omitempty"`
-	PeerAddress     string `json:"peer_address,omitempty"`
-	LocalMAC        string `json:"local_mac,omitempty"`
-	PeerMAC         string `json:"peer_mac,omitempty"`
+	// ParentUnbindable is the device-level verdict for the parent netdev: the
+	// userspace dataplane must never bind an AF_XDP socket to it (#6691 round
+	// 10, fabricParentUnbindable).
+	//
+	// It rides on the wire because a fabric MEMBER NEEDS NO INTERFACE STANZA,
+	// so the parent netdev routinely has no InterfaceSnapshot to carry the
+	// flags — and the Rust plane, which runs the mirror of the Go unanimity
+	// tally, cannot recompute the verdict from what it has: the kernel-kind
+	// half of the secure-tunnel evidence is a Go-side RTM_GETLINK dump.
+	//
+	// NOT omitempty, for the same reason as Up below: this field decides
+	// whether a netdev enters the ingress-adjudication map and the AF_XDP
+	// binding plan, and an operator reading a snapshot dump is entitled to see
+	// the verdict rather than infer it from an absence. An absent field decodes
+	// to false (bindable) in Rust, which is the pre-round-10 behaviour, and is
+	// why the protocol version moved to 7 — a v6 reader silently plans the
+	// binding this flag exists to refuse.
+	ParentUnbindable bool   `json:"parent_unbindable"`
+	OverlayLinux     string `json:"overlay_linux_name,omitempty"`
+	OverlayIfindex   int    `json:"overlay_ifindex,omitempty"`
+	RXQueues         int    `json:"rx_queues,omitempty"`
+	PeerAddress      string `json:"peer_address,omitempty"`
+	LocalMAC         string `json:"local_mac,omitempty"`
+	PeerMAC          string `json:"peer_mac,omitempty"`
 	// Up is the local fabric parent link's carrier/oper state (#4082). The
 	// Rust dataplane prefers an UP fabric when resolving the cross-chassis
 	// redirect, so a dual-fabric cluster fails over to the secondary when the

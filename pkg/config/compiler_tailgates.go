@@ -292,6 +292,25 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// inert instead of silently dropping it.
 	cfg.Warnings = append(cfg.Warnings, userspaceRetiredKnobWarnings(cfg)...)
 
+	// #5831: a custom login class carrying a RESTRICTIVE regex the coarse RBAC
+	// gate does not enforce (deny-commands / deny-configuration) is
+	// hard-rejected on commit / commit-check, because accepting it would leave
+	// the denied verbs ALLOWED while the config says they are denied. Lenient
+	// on load / peer-sync (#1960 no-brick) — but there the class is FOLDED to
+	// the repair floor ({view,configure} ∩ what it already held) rather than
+	// merely warned about, so the persisted-config path resolves the
+	// un-enforceable restriction in the restrictive direction instead of
+	// preserving the fail-open, WITHOUT taking away the only access that can
+	// delete the statement. Runs BEFORE the #4304 advisory so the advisory
+	// describes the post-fold permission set.
+	if err := validateLoginClassDenyStrict(cfg); err != nil {
+		if opts.lenientLoginClassDeny {
+			cfg.Warnings = append(cfg.Warnings, foldLoginClassDenyToRepairableFloor(cfg)...)
+		} else {
+			return err
+		}
+	}
+
 	// #4304 S-2: custom `system login class <name>` definitions are
 	// accepted-with-advisory — recognized so a valid vSRX RBAC config commits,
 	// with a per-class note on which Junos permissions map to xpf's coarse

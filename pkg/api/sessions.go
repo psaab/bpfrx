@@ -157,7 +157,7 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		pageSize = 10000
 	}
 	if pageSize > 0 {
-		if iterDP, cursorOK := s.dp.(sessionCursorIterator); cursorOK {
+		if iterDP, cursorOK := s.dpProbe().(sessionCursorIterator); cursorOK {
 			s.sessionsCursor(w, r, iterDP, &q, view, pageSize)
 			return
 		}

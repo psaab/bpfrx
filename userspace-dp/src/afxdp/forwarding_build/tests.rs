@@ -2759,6 +2759,10 @@ fn egress_interface_zone_id_set_from_snapshot() {
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/1".into(),
             zone: "wan".into(),
+            // #6722: the EGRESS zone is decided by the Go builder and carried
+            // here; the helper does not re-derive it from `zone`. A snapshot
+            // that omits it is one the v5 contract cannot carry.
+            egress_zone: "wan".into(),
             ifindex: 99,
             hardware_addr: "02:00:00:00:00:99".into(),
             ..Default::default()
@@ -5737,4 +5741,122 @@ fn cos_inet_precedence_classifier_alone_admits_the_interface() {
     // u8::MAX (unclassified).
     assert_eq!(cfg.inet_precedence_queue_by_prec[5], 0);
     assert_eq!(cfg.inet_precedence_queue_by_prec[4], u8::MAX);
+}
+
+/// #5619: the secure-tunnel unit's ifindex is what decides whether a
+/// LAN->tunnel route resolves `NoRoute` or `MissingNeighbor`, and the two
+/// dispositions are NOT interchangeable.
+///
+/// This pins the FIB half of a claim made in the Go control plane
+/// (`snapshotLinuxName`, pkg/dataplane/userspace/interfaces.go): resolving a
+/// secure-tunnel unit to the netdev that actually exists admits the tunnel's
+/// connected prefix here, which moves the disposition. Without this test the
+/// Go-side comment and the PR that documents the behaviour change could rot
+/// silently against a later FIB edit.
+///
+/// Both rows are otherwise byte-identical; ONLY `ifindex` differs, which is
+/// exactly the field the Go fix changes.
+///
+/// `NoRoute` and `MissingNeighbor` are both slow-path eligible, so the
+/// difference is not "delivered vs dropped" at this layer — it is that the
+/// `MissingNeighbor` arm in `poll_descriptor` evaluates zone policy before the
+/// reinject gate and the `NoRoute` arm does not.
+#[test]
+fn secure_tunnel_unit_ifindex_decides_route_disposition() {
+    fn snapshot(st_unit_ifindex: i32) -> ConfigSnapshot {
+        let addr = |a: &str| crate::InterfaceAddressSnapshot {
+            family: "inet".into(),
+            address: a.into(),
+            scope: 0,
+        };
+        ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "trust".into(),
+                    id: 1,
+                    ..Default::default()
+                },
+                ZoneSnapshot {
+                    name: "vpn".into(),
+                    id: 2,
+                    ..Default::default()
+                },
+            ],
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0/0/0.0".into(),
+                    zone: "trust".into(),
+                    linux_name: "ge-0-0-0".into(),
+                    ifindex: 11,
+                    mtu: 1500,
+                    addresses: vec![addr("10.0.1.1/24")],
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "st0.0".into(),
+                    zone: "vpn".into(),
+                    linux_name: "st0.0".into(),
+                    ifindex: st_unit_ifindex,
+                    mtu: 1400,
+                    addresses: vec![addr("10.5.5.1/30")],
+                    ..Default::default()
+                },
+            ],
+            routes: vec![crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "192.168.99.0/24".into(),
+                next_hops: vec!["10.5.5.2".into()],
+                preference: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    let dst = Ipv4Addr::new(192, 168, 99, 5);
+
+    // Unresolved unit (the pre-#5619 `st0.0` -> nonexistent `st0` lookup):
+    // the row is skipped by populate_interfaces, so the gateway 10.5.5.2 has
+    // no connected prefix to infer an egress ifindex from.
+    let unresolved = build_forwarding_state(&snapshot(0));
+    assert!(
+        !unresolved
+            .connected_v4
+            .iter()
+            .any(|c| c.prefix.contains(Ipv4Addr::new(10, 5, 5, 2))),
+        "premise broken: an ifindex-0 tunnel row must contribute no connected prefix"
+    );
+    let r0 = lookup_forwarding_resolution_v4(&unresolved, None, dst, "inet.0", 0, true, None);
+    assert_eq!(
+        r0.disposition,
+        ForwardingDisposition::NoRoute,
+        "an unresolved secure-tunnel unit must leave the route unresolvable"
+    );
+    assert_eq!(r0.egress_ifindex, 0);
+
+    // Resolved unit (post-#5619): the connected prefix exists, the gateway
+    // infers ifindex 42, and the xfrmi has no neighbor to resolve against.
+    let resolved = build_forwarding_state(&snapshot(42));
+    assert!(
+        resolved
+            .connected_v4
+            .iter()
+            .any(|c| c.prefix.contains(Ipv4Addr::new(10, 5, 5, 2)) && c.ifindex == 42),
+        "premise broken: a resolved tunnel row must contribute its connected prefix"
+    );
+    let r42 = lookup_forwarding_resolution_v4(&resolved, None, dst, "inet.0", 0, true, None);
+    assert_eq!(
+        r42.disposition,
+        ForwardingDisposition::MissingNeighbor,
+        "a resolved secure-tunnel unit must claim the route on the MissingNeighbor arm, \
+         which is the arm that evaluates zone policy before the reinject gate"
+    );
+    assert_eq!(r42.egress_ifindex, 42);
+
+    // The two arms differ in policy handling, not in slow-path eligibility —
+    // state that here so a future reader does not misread the change as
+    // "delivered becomes dropped unconditionally".
+    assert!(r0.disposition.is_slow_path_eligible());
+    assert!(r42.disposition.is_slow_path_eligible());
 }

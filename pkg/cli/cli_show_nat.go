@@ -910,7 +910,7 @@ func (c *CLI) appliedNATView() nat.AppliedView {
 	if c.dp == nil {
 		return nat.AppliedView{Available: false}
 	}
-	provider, ok := c.dp.(interface {
+	provider, ok := c.dpProbe().(interface {
 		AppliedNATView() dpuserspace.AppliedNATView
 	})
 	if !ok {

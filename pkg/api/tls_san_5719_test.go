@@ -428,3 +428,172 @@ func TestIsDNSSANSafeHostname(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadedCertHostNameMismatchWarns is a FAIL-ON-REVERT guard for the SECOND
+// half of the #5719 C001 stale-durable-cert residual: the kernel HOST NAME.
+//
+// The durable cert (#1916 D6) bakes the host name into a DNS SAN at first
+// generation and is never re-minted, so a later `set system host-name` leaves
+// the cert naming the OLD host. Before this guard that was completely silent:
+// warnStaleLoadedCert's predecessor checked only the BIND HOST, so with the
+// bind address unchanged (the normal case — renaming a firewall does not move
+// its management IP) NOTHING was logged, and an operator connecting by the new
+// host name got a bare "certificate is not valid for any names".
+//
+// RED on revert: delete the warnHost branch in warnStaleLoadedCert (or make
+// hostnameSANWarnable always return false) and host_name_change_warns /
+// ip_literal_host_name_change_warns fail — the reload emits no host-name
+// diagnostic.
+func TestLoadedCertHostNameMismatchWarns(t *testing.T) {
+	restore := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(restore) })
+
+	// mintThenRename mints a durable cert as mintHost, then RELOADS it with the
+	// kernel host name changed to reloadHost and the bind address UNCHANGED,
+	// returning whatever the reload logged.
+	mintThenRename := func(t *testing.T, mintHost, reloadHost, bind string) string {
+		t.Helper()
+		resetTLSSeams(t)
+		tlsHostname = func() (string, error) { return mintHost, nil }
+		dir, certPath, keyPath := tlsPaths(t)
+		if _, err := generateSelfSignedCertAt(dir, certPath, keyPath, bind); err != nil {
+			t.Fatalf("first mint (host %q): %v", mintHost, err)
+		}
+		tlsHostname = func() (string, error) { return reloadHost, nil }
+		var buf bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, bind)
+		if err != nil {
+			t.Fatalf("reload (host %q): %v", reloadHost, err)
+		}
+		// The reload must serve the SAME durable leaf — the no-re-mint contract
+		// this diagnostic exists to compensate for. If the cert were re-minted
+		// the host name would be covered and the warning would be pointless.
+		leaf, perr := x509.ParseCertificate(cert.Certificate[0])
+		if perr != nil {
+			t.Fatalf("parse reloaded leaf: %v", perr)
+		}
+		if leaf.Subject.CommonName != mintHost {
+			t.Fatalf("reload minted a fresh cert (CN=%q, want the durable %q)", leaf.Subject.CommonName, mintHost)
+		}
+		return buf.String()
+	}
+
+	const hostMsg = "does not cover the current host-name"
+
+	t.Run("host_name_change_warns", func(t *testing.T) {
+		// `set system host-name new-fw` with the management IP unchanged: the
+		// bind host is still covered, so ONLY the host-name check can catch this.
+		out := mintThenRename(t, "old-fw", "new-fw", "10.0.0.1")
+		if !strings.Contains(out, hostMsg) {
+			t.Fatalf("a host-name change must warn on the stale durable cert; got log %q", out)
+		}
+		if !strings.Contains(out, "new-fw") {
+			t.Fatalf("warning must name the uncovered host-name new-fw; got %q", out)
+		}
+		if strings.Contains(out, "does not cover bind host") {
+			t.Fatalf("bind host 10.0.0.1 IS covered and must not warn; got %q", out)
+		}
+	})
+
+	t.Run("ip_literal_host_name_change_warns", func(t *testing.T) {
+		// An IP-literal host name lands in IPAddresses, so it is warnable too.
+		out := mintThenRename(t, "10.9.9.9", "10.9.9.10", "mgmt.example.com")
+		if !strings.Contains(out, hostMsg) {
+			t.Fatalf("an IP-literal host-name change must warn; got %q", out)
+		}
+	})
+
+	t.Run("unchanged_host_name_is_silent", func(t *testing.T) {
+		out := mintThenRename(t, "old-fw", "old-fw", "10.0.0.1")
+		if strings.Contains(out, hostMsg) {
+			t.Fatalf("an unchanged, covered host-name must not warn; got %q", out)
+		}
+	})
+
+	t.Run("unencodable_host_name_is_silent", func(t *testing.T) {
+		// A non-ASCII host name is DROPPED from the SANs by design
+		// (isDNSSANSafeHostname / #5058), so it is uncoverable and a re-mint
+		// cannot help. Warning every reload would be permanent noise advising a
+		// fix that does not exist.
+		out := mintThenRename(t, "old-fw", "café", "10.0.0.1")
+		if strings.Contains(out, hostMsg) {
+			t.Fatalf("an unencodable host-name must not warn (a re-mint cannot cover it); got %q", out)
+		}
+	})
+
+	t.Run("empty_host_name_is_silent", func(t *testing.T) {
+		out := mintThenRename(t, "old-fw", "", "10.0.0.1")
+		if strings.Contains(out, hostMsg) {
+			t.Fatalf("an empty host-name must not warn; got %q", out)
+		}
+	})
+
+	t.Run("bind_host_warning_still_fires", func(t *testing.T) {
+		// Regression guard for the refactor into warnStaleLoadedCert: BOTH
+		// identities must be reported when BOTH are stale.
+		resetTLSSeams(t)
+		tlsHostname = func() (string, error) { return "old-fw", nil }
+		dir, certPath, keyPath := tlsPaths(t)
+		if _, err := generateSelfSignedCertAt(dir, certPath, keyPath, "10.0.0.1"); err != nil {
+			t.Fatalf("first mint: %v", err)
+		}
+		tlsHostname = func() (string, error) { return "new-fw", nil }
+		var buf bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		if _, err := generateSelfSignedCertAt(dir, certPath, keyPath, "10.0.0.2"); err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "does not cover bind host") {
+			t.Fatalf("stale bind host must still warn; got %q", out)
+		}
+		if !strings.Contains(out, hostMsg) {
+			t.Fatalf("stale host-name must warn alongside it; got %q", out)
+		}
+	})
+}
+
+// TestHostnameSANWarnable unit-checks the host-name predicate directly so a
+// neutralization is caught even if the load-path integration changes. The
+// contrast with bindHostWarnable is the point: an unencodable host name is NOT
+// warnable (a re-mint could never cover it) while any non-loopback bind host is.
+func TestHostnameSANWarnable(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"fw-node0", true},
+		{"fw.example.com", true},
+		{"10.9.9.9", true}, // IP literal → IPAddresses SAN
+		{"", false},
+		{"localhost", false},
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"0.0.0.0", false},
+		{"::", false},
+		{"café", false},        // dropped from SANs by design
+		{"under_score", false}, // '_' is not DNS-safe here
+		{"has space", false},
+	}
+	for _, c := range cases {
+		if got := hostnameSANWarnable(c.in); got != c.want {
+			t.Errorf("hostnameSANWarnable(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestWarnStaleLoadedCertEmptyChain pins the standalone helper's defensive
+// precondition: an empty certificate chain is a no-op, not a panic.
+func TestWarnStaleLoadedCertEmptyChain(t *testing.T) {
+	restore := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(restore) })
+	resetTLSSeams(t)
+	tlsHostname = func() (string, error) { return "fw-node0", nil }
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	warnStaleLoadedCert(tls.Certificate{}, "10.0.0.1")
+	if buf.Len() != 0 {
+		t.Fatalf("empty chain must produce no diagnostic; got %q", buf.String())
+	}
+}

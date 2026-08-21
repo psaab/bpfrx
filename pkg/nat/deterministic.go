@@ -481,24 +481,15 @@ func poolParams(pool *config.NATPool, nat64Referenced bool) (detParams, *LookupE
 	return p, lerrf(ErrCodeNotDeterministic, "unsupported deterministic NAT mode %d", mode)
 }
 
-// poolPortRangeV4 mirrors sourceNATPoolPortRange (pkg/dataplane/userspace):
-// default 1024-65535, but a configured-yet-invalid range fails closed.
+// poolPortRangeV4 DELEGATES to config.SourceNATPoolPortRange: default
+// 1024-65535, but a configured-yet-invalid range fails closed. It used to be a
+// hand-copied third implementation of that rule, alongside the snapshot
+// builder's; #6812 F1 made the config package the SSOT (the aggregate budget
+// walk has to agree with the builder about which pools install), so this reads
+// it rather than mirroring it — the block-boundary parity these derived
+// deterministic params depend on is now true by construction, not by review.
 func poolPortRangeV4(pool *config.NATPool) (uint16, uint16, bool) {
-	if pool == nil || pool.PortRangeInvalidSpec != "" {
-		return 0, 0, false
-	}
-	low := pool.PortLow
-	if low == 0 {
-		low = 1024
-	}
-	high := pool.PortHigh
-	if high == 0 {
-		high = 65535
-	}
-	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
-		return 0, 0, false
-	}
-	return uint16(low), uint16(high), true
+	return config.SourceNATPoolPortRange(pool)
 }
 
 // expandPoolV4 resolves the pool's ordered external IPv4 addresses using the
@@ -543,6 +534,41 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 		}
 		// fam == "v4": a dotted-quad host, optionally with a CIDR mask.
 		if strings.Contains(a, "/") {
+			// #6812 F-C: net.ParseCIDR's mask reader accepts a LEADING-ZERO
+			// prefix length — it takes `10.0.0.0/016` as `/16` — where
+			// netip.ParsePrefix (the control-plane grammar,
+			// sourceNATPoolAddressReason) and parse_canonical_prefix_len (the
+			// dataplane's, userspace-dp/src/nat/source.rs) both reject it.
+			//
+			// Without this check the deterministic surface is the most
+			// confident liar in the system: the pool is stamped `invalid_pool`
+			// and translates NOTHING, while `show`/gRPC/REST answer a
+			// forward-mapping query with a 65,536-address pool computed off a
+			// member no other layer accepts. That is the #5794 invariant-8
+			// forensic failure — the operator-facing map describing a pool the
+			// dataplane does not have — and it is the same divergence class
+			// #6812 exists to close, one consumer over.
+			//
+			// Narrowing only: such a pool TRANSLATES NOTHING either way — the
+			// snapshot builder stamps it `invalid_pool` and it installs no
+			// allocator — so no config that works today changes behaviour; the
+			// lookup now reports an error instead of a fiction.
+			//
+			// #6812 round 7 — the "already refused at commit" half of that
+			// sentence was over-broad and is now dropped. It holds only when a
+			// pool-mode rule REFERENCES the pool:
+			// validateSourceNATPoolAddressGrammarStrict walks RULE REFERENCES,
+			// not the pool table, so an UNREFERENCED pool carrying
+			// `10.0.0.0/016` compiles STRICT-CLEAN (measured). Such a pool is
+			// still stamped unusable, which is why the conclusion stands — it
+			// is unusability, not the commit gate, that carries it. Bound by
+			// the reject half of
+			// TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812.
+			if _, perr := netip.ParsePrefix(a); perr != nil {
+				return nil, lerrf(ErrCodeNotDeterministic,
+					"pool address %q is not a canonical CIDR (%v); the dataplane refuses it and the pool translates nothing",
+					a, perr)
+			}
 			_, ipnet, err := net.ParseCIDR(a)
 			if err != nil {
 				return nil, lerrf(ErrCodeNotDeterministic, "unparseable pool address %q", a)
