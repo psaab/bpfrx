@@ -942,8 +942,43 @@ func (m *Manager) restorePeerTransferOutOverrideLocked(rgID int, reqID uint64) b
 	return true
 }
 
+// liveHeartbeatTiming returns the interval/threshold the RUNNING heartbeat
+// is actually using, which is NOT necessarily the committed configuration.
+// StartHeartbeat snapshots m.hbInterval/m.hbThreshold into the sender and
+// receiver (heartbeat_manager.go), and UpdateConfig then rewrites the
+// manager fields on every commit — but nothing restarts the heartbeat for a
+// timing change, so after `set chassis cluster heartbeat-interval` the wire
+// keeps the OLD cadence and the receiver keeps declaring the peer dead at
+// the OLD threshold*interval until some other event (a VRF rebind, a comms
+// restart) happens to rebuild it.
+//
+// #5081: every derived duration that has to cover dead-peer detection must
+// therefore be sized from the live values, not the desired ones. The
+// receiver's threshold/interval are written once in newHeartbeatReceiver and
+// never mutated; only the m.hbReceiver pointer is, and that is written under
+// m.mu, so this read is race-free.
+//
+// Falls back to the desired values when no heartbeat is running (standalone,
+// pre-bringup, or between StopHeartbeat and StartHeartbeat) — there is no
+// live cadence to be wrong about, and the next StartHeartbeat will adopt
+// exactly these.
+func (m *Manager) liveHeartbeatTimingLocked() (time.Duration, int) {
+	if r := m.hbReceiver; r != nil && r.interval > 0 && r.threshold > 0 {
+		return r.interval, r.threshold
+	}
+	return m.hbInterval, m.hbThreshold
+}
+
 func (m *Manager) transferCommitGracePeriodLocked() time.Duration {
-	grace := 2*time.Duration(m.hbThreshold)*m.hbInterval + transferCommitHeartbeatSlack
+	// #5081: size the transfer-commit grace from the LIVE dead-peer
+	// detection window. Sizing it from the desired configuration under-runs
+	// the window whenever a commit SHORTENS the configured timing: desired
+	// 3x100ms yields a 10s floor while the running receiver still declares
+	// death at 5x1000ms = 5s from the last frame, so the grace can expire
+	// before the timeout it exists to suppress and a manual transfer takes
+	// a spurious peer-death failover.
+	interval, threshold := m.liveHeartbeatTimingLocked()
+	grace := 2*time.Duration(threshold)*interval + transferCommitHeartbeatSlack
 	if grace < minTransferCommitGracePeriod {
 		grace = minTransferCommitGracePeriod
 	}
