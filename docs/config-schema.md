@@ -3132,18 +3132,55 @@ the fixed precedence resolves only among those. Authoring
 swapping the two containers resolves to **off**. Order chose, at container
 granularity, before precedence ran.
 
-*Packed contradictions (#6820).* A `then` action leaf may pack several tokens —
-`destination-nat pool P off` parses to `Keys = [destination-nat, pool, P, off]`,
-because `parseKeys` retains every token and schema validation deliberately
-ignores leftover container keys. Reading `Keys[1]` alone therefore lowered ONE
-action and silently dropped the rest, leaving nothing for the cardinality gate
-to count: the contradiction committed under a **strict** commit, as `off` or as
-`pool` depending only on which token came first. This is the same multi-value
-leaf hazard as #2419 (see "Multi-value leaves and bracketed lists" below): a
-compiler reading a packed leaf must read `Keys[1:]` **and** the node's children
-and accumulate. `applyNATThenActions` (`compiler_nat_helpers.go`) does that for
-both NAT kinds, so a packed contradiction now reaches the gate as 2+ actions and
-is rejected.
+*Packed contradictions, and the three shapes they arrive in (#6820).* One
+contradictory `then` block reaches the compiler in three structurally different
+shapes, and **which one you get is decided by the syntax the operator used, not
+by what they wrote**:
+
+| authored | AST |
+|---|---|
+| `then { source-nat off pool P; }` | `Keys=[source-nat, off, pool, P]` — packed on the container |
+| `then { source-nat { off pool P; } }` | `[source-nat]` / `[off, pool, P]` — packed on a **child** |
+| `set … then source-nat off pool P` | `[source-nat]` / `[off]` / `[pool, P]` — a **grandchild chain** |
+
+The flat-set row is the one to watch. `SetPath` builds a CHAIN, so the second
+action is a GRANDCHILD, and swapping the authored order swaps which action ends
+up nested (`set … then source-nat pool P off` → `[source-nat]` / `[pool, P]` /
+`[off]`). A scan that reads only the container's `Keys[1:]` plus each child's
+`Name()`/`nodeVal()` sees the first shape and lowers exactly ONE action from the
+other two.
+
+Nothing downstream notices: `parseKeys` retains every token, schema validation
+deliberately ignores leftover container keys, **and the source-NAT `then`
+subtree is deliberately open-world** (see "NOT flipped — source-NAT rule
+then-action" above), so `SchemaValidate` returns nil for every source-NAT row.
+The contradiction therefore committed under a **strict** commit, as `off` or as
+`pool` depending only on which token came first. The worst row is `set … then
+source-nat pool P off`: the `off` EXEMPTION is dropped and a translation is
+published in its place. (`then { destination-nat { pool PD off; } }` is the
+destination-NAT twin; DNAT's *flat-set* rows are stopped, but by closed-world
+`SchemaValidate`, not by the compiler.)
+
+This is the #2419 multi-value-leaf hazard (see "Multi-value leaves and bracketed
+lists" below) extended one level: a compiler reading a packed leaf must read
+`Keys[1:]` **and** the node's descendants and accumulate — never `Keys[1]`
+alone, and never `Name()`/`nodeVal()` alone. `applyNATThenActions`
+(`compiler_nat_helpers.go`) walks the whole `then` subtree as one action-token
+stream for both NAT kinds, so a contradiction in ANY of the three shapes reaches
+the gate as 2+ actions and is rejected.
+
+Within one node's token tail the walk STOPS at the first token that is not a
+recognized action for that kind, which is what keeps it from changing any
+ACCEPTING decision. Trailing non-action grammar is still ignored (`source-nat
+pool P persistent-nat permit any-remote-host` — the rule-level shape the
+source-NAT `then` is left open-world for). A LEADING unrecognized token
+contributes nothing, exactly as the old `Keys[1]`-only read did when `Keys[1]`
+was neither `off` nor `pool` — load-bearing, because an accumulating scan that
+merely SKIPS an unrecognized token reads the NEXT one instead, so `then {
+destination-nat interface pool PD; }` (no interface mode exists for destination
+NAT) would newly resolve to a pool translation instead of being rejected. The
+same hole exists for arbitrary garbage on either kind (`source-nat frobnicate
+pool P`), so the rule is stated on the token, not on `interface`.
 
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land

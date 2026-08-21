@@ -2717,15 +2717,22 @@ func validateStaticNATSingleTargetStrict(cfg *Config) error {
 // this count reflects only the WINNING (last) block — duplicate `then`
 // CONTAINERS that each carry a single action resolve to one action here, never
 // a false conflict. A count of two only arises when one complete then-block
-// carries contradictory actions: a single hierarchical `source-nat { interface;
-// pool P; }` node, which #5628's setter change records as two set fields rather
-// than silently picking one by child order, or a PACKED `source-nat off pool P`
-// / `destination-nat pool P off` leaf, which #6820 B1 records as two set fields
-// rather than reading Keys[1] alone. The packed case is the one this counter
-// could NOT see before #6820: parseKeys keeps every token and schema validation
-// ignores leftover container keys, so the dropped action left no trace anywhere
-// — n was 1 and the contradiction strictly committed. Both shapes now reach
-// this counter through applyNATThenActions.
+// carries contradictory actions. That block reaches the compiler in THREE
+// distinct AST shapes and this counter must see all three, because the shape is
+// chosen by the SYNTAX the operator used, not by what they wrote:
+//
+//	then { source-nat { interface; pool P; } }  sibling children (#5628)
+//	then { source-nat off pool P; }             packed on the container's Keys tail
+//	then { source-nat { off pool P; } }         packed on a CHILD's Keys tail
+//	set … then source-nat off pool P            a GRANDCHILD chain (SetPath)
+//
+// (the last two are the shapes #6820 round 5 still missed). #5628 made the
+// sibling-children shape countable; #6820 makes the packed and chained ones
+// countable, via applyNATThenActions' subtree walk. Until then the dropped
+// action left no trace anywhere for this counter to find: parseKeys keeps every
+// token (parser.go), schema validation ignores leftover container keys
+// (schema_walk.go), and the source-NAT `then` subtree is deliberately
+// open-world (#4313) — so n was 1 and the contradiction strictly committed.
 func natThenTerminalActionCount(then NATThen) int {
 	n := 0
 	if then.Interface {
@@ -2926,8 +2933,10 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 							"as a whole: duplicate `then` CONTAINERS are resolved FIRST, "+
 							"last-wins per #3850 — the LAST container supplies the actions "+
 							"counted here — and the precedence above then resolves among them. "+
-							"(This rejects contradictory actions inside one block; it does not "+
-							"reject duplicate containers.)",
+							"(This rejects contradictory actions inside one block. Duplicate "+
+							"containers are NOT rejected, but only the brace syntax can author "+
+							"them: repeated `set ... then ...` commands MERGE into a single "+
+							"block, so in `set` syntax this rejection is what you get.)",
 						kind, rs.Name, rule.Name, n, actions, mechanism)
 				}
 			}

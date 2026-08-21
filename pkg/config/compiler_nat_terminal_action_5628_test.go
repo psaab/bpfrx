@@ -482,6 +482,15 @@ func tolerantNATThen6820(t *testing.T, label, cfgText string, dest bool) NATThen
 	if len(perrs) > 0 {
 		t.Fatalf("%s: parse: %v", label, perrs)
 	}
+	return tolerantNATThenTree6820(t, label, tree, dest)
+}
+
+// tolerantNATThenTree6820 is tolerantNATThen6820 over an already-built tree, so
+// a flat-set fixture (ParseSetCommand + SetPath — the only way to build the
+// grandchild-chain AST shape, per CLAUDE.md) can be resolved the same way a
+// hierarchical one is.
+func tolerantNATThenTree6820(t *testing.T, label string, tree *ConfigTree, dest bool) NATThen {
+	t.Helper()
 	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
 		t.Fatalf("%s: CompileConfigLenient: %v", label, err)
@@ -530,91 +539,321 @@ security { nat { destination {
 `
 }
 
+// natThenShape6820 is ONE of the AST shapes a NAT rule's `then` action block
+// reaches the compiler in. Which shape an operator gets is decided by the
+// SYNTAX they used, not by what they wrote, so a table that builds only one
+// shape cannot see a compiler bug that lives in another (#6820 round 6, B1):
+//
+//	set … then source-nat off pool P       [source-nat] / [off] / [pool P]   a GRANDCHILD chain
+//	then { source-nat off pool P; }        Keys=[source-nat off pool P]      packed on the container
+//	then { source-nat { off pool P; } }    [source-nat] / [off pool P]       packed on a CHILD
+//	then { source-nat { off; pool P; } }   [source-nat] / [off] + [pool P]   sibling children (#5628)
+//
+// The flat-set row is the one the round-5 table missed entirely, and CLAUDE.md
+// says why it must be built with ParseSetCommand + SetPath rather than
+// NewParser: "the parser treats newlines as whitespace and will merge all set
+// lines into one giant node". Only SetPath builds the chain, so only SetPath
+// exercises the grandchild read.
+//
+// Each shape takes the SAME list of action clauses (e.g. ["off", "pool P"]) so
+// one row of a table is authored once and measured in every shape.
+type natThenShape6820 struct {
+	name  string
+	build func(t *testing.T, dest bool, actions []string) *ConfigTree
+}
+
+// natSetPrologue6820 returns the flat-set commands that define the pool,
+// rule-set and match for one NAT kind, plus the `set … rule R1 ` prefix a
+// then-clause is appended to.
+func natSetPrologue6820(dest bool) (prologue []string, rulePrefix string) {
+	if dest {
+		return []string{
+			"set security nat destination pool PD address 10.0.0.5",
+			"set security nat destination rule-set RD from zone untrust",
+			"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.1/32",
+		}, "set security nat destination rule-set RD rule R1 "
+	}
+	return []string{
+		"set security nat source pool P address 203.0.113.5",
+		"set security nat source rule-set RS from zone trust",
+		"set security nat source rule-set RS to zone untrust",
+		"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
+	}, "set security nat source rule-set RS rule R1 "
+}
+
+func natThenKeyword6820(dest bool) string {
+	if dest {
+		return "destination-nat"
+	}
+	return "source-nat"
+}
+
+// natHierTree6820 parses a hierarchical config carrying the given `then` block.
+func natHierTree6820(t *testing.T, dest bool, thenBlock string) *ConfigTree {
+	t.Helper()
+	text := snatCfg6820(thenBlock)
+	if dest {
+		text = dnatCfg6820(thenBlock)
+	}
+	p := NewParser(text)
+	tree, perrs := p.Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse %q: %v", thenBlock, perrs)
+	}
+	return tree
+}
+
+// natThenShapes6820 is the shape matrix every contradiction row is run through.
+var natThenShapes6820 = []natThenShape6820{
+	{
+		name: "flat-set (SetPath grandchild chain)",
+		build: func(t *testing.T, dest bool, actions []string) *ConfigTree {
+			t.Helper()
+			prologue, prefix := natSetPrologue6820(dest)
+			lines := append(append([]string{}, prologue...),
+				prefix+"then "+natThenKeyword6820(dest)+" "+strings.Join(actions, " "))
+			tree := &ConfigTree{}
+			for _, l := range lines {
+				path, err := ParseSetCommand(l)
+				if err != nil {
+					t.Fatalf("ParseSetCommand(%q): %v", l, err)
+				}
+				if err := tree.SetPath(path); err != nil {
+					t.Fatalf("SetPath(%q): %v", l, err)
+				}
+			}
+			return tree
+		},
+	},
+	{
+		name: "hierarchical packed on the container",
+		build: func(t *testing.T, dest bool, actions []string) *ConfigTree {
+			t.Helper()
+			return natHierTree6820(t, dest,
+				"then { "+natThenKeyword6820(dest)+" "+strings.Join(actions, " ")+"; }")
+		},
+	},
+	{
+		name: "hierarchical packed on a child",
+		build: func(t *testing.T, dest bool, actions []string) *ConfigTree {
+			t.Helper()
+			return natHierTree6820(t, dest,
+				"then { "+natThenKeyword6820(dest)+" { "+strings.Join(actions, " ")+"; } }")
+		},
+	},
+	{
+		name: "hierarchical sibling children (#5628)",
+		build: func(t *testing.T, dest bool, actions []string) *ConfigTree {
+			t.Helper()
+			return natHierTree6820(t, dest,
+				"then { "+natThenKeyword6820(dest)+" { "+strings.Join(actions, "; ")+"; } }")
+		},
+	},
+}
+
 // TestNATSurvivorIsOrderInvariantWithinBlock_6820 binds the corrected message's
 // scoped claim — the survivor is decided by the fixed precedence "rather than
 // by the order the actions are written inside this block" — by AUTHORING each
-// contradiction in both within-block orders and asserting the resolved NATThen
-// is identical.
+// contradiction in both within-block orders, IN EVERY AST SHAPE, and asserting
+// the resolved NATThen is identical across all of them.
 //
-// This is also the behavioural binding for #6820 B1. A packed action leaf
-// (`source-nat off pool P` -> Keys=[source-nat off pool P]) used to be read as
-// Keys[1] ALONE, so the two orders resolved DIFFERENTLY — off for one, pool for
-// the other — and, because only one field was ever lowered, the cardinality
-// gate counted n == 1 and STRICTLY COMMITTED the contradiction. Both halves are
-// asserted: the two orders agree, AND strict commit rejects.
+// This is the behavioural binding for #6820 B1. A contradiction used to lower
+// exactly ONE field, so the two orders resolved DIFFERENTLY — off for one, pool
+// for the other — and, because only one field was ever lowered, the cardinality
+// gate counted n == 1 and STRICTLY COMMITTED the contradiction. Round 5 fixed
+// the container-packed shape; the flat-set chain and the child-packed tail were
+// still escaping, and no fixture in this file could see them because every row
+// was built with NewParser. Three assertions per shape — the two orders agree,
+// the survivor is the documented one, and strict commit rejects — plus a
+// cross-shape assertion that all four shapes resolve IDENTICALLY, which is the
+// property the operator actually depends on (the same config, typed two ways,
+// must mean the same thing).
 //
-// RED on revert: restoring the Keys[1]-only read (or any first-match scan) in
-// applyNATThenActions makes the packed rows resolve to different survivors and
-// makes strict commit accept them.
+// RED on revert: restoring any first-match / single-level read in
+// applyNATThenActions makes the affected shapes resolve to different survivors
+// and makes strict commit accept them.
 func TestNATSurvivorIsOrderInvariantWithinBlock_6820(t *testing.T) {
 	cases := []struct {
 		name         string
 		dest         bool
-		orderA       string
-		orderB       string
+		orderA       []string
+		orderB       []string
 		wantSurvivor string
 	}{
 		{
-			name: "SNAT packed off/pool", orderA: "then { source-nat off pool P; }",
-			orderB: "then { source-nat pool P off; }", wantSurvivor: "off",
+			name: "SNAT off/pool", orderA: []string{"off", "pool P"},
+			orderB: []string{"pool P", "off"}, wantSurvivor: "off",
 		},
 		{
-			name: "SNAT packed interface/pool", orderA: "then { source-nat interface pool P; }",
-			orderB: "then { source-nat pool P interface; }", wantSurvivor: "interface",
+			name: "SNAT interface/pool", orderA: []string{"interface", "pool P"},
+			orderB: []string{"pool P", "interface"}, wantSurvivor: "interface",
 		},
 		{
-			name: "SNAT hierarchical off/pool", orderA: "then { source-nat { off; pool P; } }",
-			orderB: "then { source-nat { pool P; off; } }", wantSurvivor: "off",
-		},
-		{
-			name: "SNAT hierarchical interface/pool", orderA: "then { source-nat { interface; pool P; } }",
-			orderB: "then { source-nat { pool P; interface; } }", wantSurvivor: "interface",
-		},
-		{
-			name: "DNAT packed off/pool", dest: true, orderA: "then { destination-nat off pool PD; }",
-			orderB: "then { destination-nat pool PD off; }", wantSurvivor: "off",
-		},
-		{
-			name: "DNAT hierarchical off/pool", dest: true, orderA: "then { destination-nat { off; pool PD; } }",
-			orderB: "then { destination-nat { pool PD; off; } }", wantSurvivor: "off",
+			name: "DNAT off/pool", dest: true, orderA: []string{"off", "pool PD"},
+			orderB: []string{"pool PD", "off"}, wantSurvivor: "off",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			build := snatCfg6820
-			if tc.dest {
-				build = dnatCfg6820
-			}
-			thenA := tolerantNATThen6820(t, tc.name+" orderA", build(tc.orderA), tc.dest)
-			thenB := tolerantNATThen6820(t, tc.name+" orderB", build(tc.orderB), tc.dest)
-			if thenA != thenB {
-				t.Errorf("within-block authoring order CHANGED the resolved translation:\n"+
-					"  %-8s %q -> %+v\n  %-8s %q -> %+v\n"+
-					"The rejection message tells the operator the survivor is decided by the "+
-					"fixed precedence rather than by the order the actions are written inside "+
-					"the block. That is only true if every authored action is lowered; a "+
-					"first-match read of the packed Keys tail or the children drops all but "+
-					"one and makes the outcome depend on which token came first (#6820 B1).",
-					"orderA", tc.orderA, thenA, "orderB", tc.orderB, thenB)
-			}
-			if got := natThenSurvivor6820(thenA); got != tc.wantSurvivor {
-				t.Errorf("survivor = %q, want %q (resolved %+v)", got, tc.wantSurvivor, thenA)
-			}
-			// Every authored action must reach the gate, so STRICT commit must
-			// reject both orders. Before #6820 B1 the packed rows committed.
-			for _, order := range []string{tc.orderA, tc.orderB} {
-				p := NewParser(build(order))
-				tree, perrs := p.Parse()
-				if len(perrs) > 0 {
-					t.Fatalf("parse %q: %v", order, perrs)
+			perShape := make(map[string]NATThen, len(natThenShapes6820))
+			for _, shape := range natThenShapes6820 {
+				treeA := shape.build(t, tc.dest, tc.orderA)
+				treeB := shape.build(t, tc.dest, tc.orderB)
+				thenA := tolerantNATThenTree6820(t, tc.name+" "+shape.name+" orderA", treeA, tc.dest)
+				thenB := tolerantNATThenTree6820(t, tc.name+" "+shape.name+" orderB", treeB, tc.dest)
+				if thenA != thenB {
+					t.Errorf("[%s] within-block authoring order CHANGED the resolved translation:\n"+
+						"  orderA %v -> %+v\n  orderB %v -> %+v\n"+
+						"The rejection message tells the operator the survivor is decided by the "+
+						"fixed precedence rather than by the order the actions are written inside "+
+						"the block. That is only true if every authored action is lowered; a scan "+
+						"that misses this AST shape drops all but one and makes the outcome depend "+
+						"on which token came first (#6820 B1).",
+						shape.name, tc.orderA, thenA, tc.orderB, thenB)
 				}
-				if _, err := CompileConfig(tree); err == nil {
-					t.Errorf("STRICT commit ACCEPTED the contradictory rule %q — the "+
-						"cardinality gate saw fewer actions than were authored, which is "+
-						"exactly the #6820 B1 escape (packed tail read as Keys[1] alone)", order)
-				} else if !strings.Contains(err.Error(), "mutually-exclusive translation actions") {
-					t.Errorf("STRICT commit rejected %q with the wrong gate: %v", order, err)
+				if got := natThenSurvivor6820(thenA); got != tc.wantSurvivor {
+					t.Errorf("[%s] survivor = %q, want %q (resolved %+v)",
+						shape.name, got, tc.wantSurvivor, thenA)
 				}
+				// Every authored action must reach the gate, so STRICT commit
+				// must reject both orders in every shape.
+				for label, tree := range map[string]*ConfigTree{"orderA": treeA, "orderB": treeB} {
+					if _, err := CompileConfig(tree); err == nil {
+						t.Errorf("[%s] STRICT commit ACCEPTED the contradictory %s rule — the "+
+							"cardinality gate saw fewer actions than were authored, which is "+
+							"exactly the #6820 escape", shape.name, label)
+					} else if !strings.Contains(err.Error(), "mutually-exclusive translation actions") {
+						t.Errorf("[%s] STRICT commit rejected %s with the wrong gate: %v",
+							shape.name, label, err)
+					}
+				}
+				perShape[shape.name] = thenA
+			}
+			// Cross-shape: the same authored actions must resolve to the same
+			// translation whichever syntax typed them.
+			ref := perShape[natThenShapes6820[0].name]
+			for _, shape := range natThenShapes6820[1:] {
+				if got := perShape[shape.name]; got != ref {
+					t.Errorf("the SAME actions resolve differently per syntax:\n"+
+						"  %-38s -> %+v\n  %-38s -> %+v\n"+
+						"An operator typing one config two ways must get one meaning.",
+						natThenShapes6820[0].name, ref, shape.name, got)
+				}
+			}
+		})
+	}
+}
+
+// TestNATThenPoolNamedLikeAnActionKeyword_6820 binds the claim on
+// applyNATThenActions that "`pool` consumes exactly ONE value token, so a pool
+// legitimately NAMED off/interface/pool is read as a NAME and stays one
+// action". That claim is what keeps the accumulating scan from turning a VALID
+// config into a false rejection, and nothing bound it (#6820 round 6, B4 M3).
+//
+// RED on revert: deleting the value-token consumption (`i++`) in
+// applyNATThenActions makes `then source-nat pool off` re-read "off" as the
+// `off` EXEMPTION, so the rule carries two actions and a legitimate config is
+// REJECTED at commit.
+func TestNATThenPoolNamedLikeAnActionKeyword_6820(t *testing.T) {
+	for _, poolName := range []string{"off", "interface", "pool"} {
+		for _, shape := range natThenShapes6820 {
+			t.Run(poolName+"/"+shape.name, func(t *testing.T) {
+				// Build with the stock prologue, then rename the pool: the
+				// shape builders all reference pool "P".
+				tree := shape.build(t, false, []string{"pool " + poolName})
+				renameSourcePool6820(t, tree, poolName)
+				then := tolerantNATThenTree6820(t, "pool named "+poolName, tree, false)
+				if then.PoolName != poolName {
+					t.Errorf("`source-nat pool %s` resolved PoolName=%q, want %q (%+v) — "+
+						"the pool NAME was re-read as an action keyword",
+						poolName, then.PoolName, poolName, then)
+				}
+				if then.Off || then.Interface {
+					t.Errorf("`source-nat pool %s` lowered a second action (%+v); a pool NAME "+
+						"that happens to spell an action keyword is still just a name",
+						poolName, then)
+				}
+				if _, err := CompileConfig(tree); err != nil {
+					t.Errorf("STRICT commit REJECTED the VALID single-action rule "+
+						"`source-nat pool %s`: %v", poolName, err)
+				}
+			})
+		}
+	}
+}
+
+// renameSourcePool6820 renames the `security nat source pool P` definition to
+// name, so a rule referencing a pool called "off"/"interface"/"pool" resolves.
+func renameSourcePool6820(t *testing.T, tree *ConfigTree, name string) {
+	t.Helper()
+	sec := tree.FindChild("security")
+	if sec == nil {
+		t.Fatal("no security node")
+	}
+	nat := sec.FindChild("nat")
+	if nat == nil {
+		t.Fatal("no nat node")
+	}
+	src := nat.FindChild("source")
+	if src == nil {
+		t.Fatal("no source node")
+	}
+	for _, c := range src.Children {
+		if c.Name() == "pool" && len(c.Keys) >= 2 {
+			c.Keys[1] = name
+			return
+		}
+	}
+	t.Fatal("no source pool node to rename")
+}
+
+// TestNATThenUnrecognizedLeadingTokenIsNotSkipped_6820 binds the
+// stop-at-unrecognized rule in applyNATThenActions, which is what keeps the
+// accumulating scan from changing an ACCEPTING decision (#6820 round 6, B3/B4).
+//
+// Round 5's scan SKIPPED a token it did not recognize and read the next one, so
+// `then { destination-nat interface pool PD; }` — rejected before the PR, since
+// destination NAT has no interface translation mode — began COMMITTING as a
+// pool translation. That is a silent reinterpretation of an operator action,
+// introduced by the PR whose purpose is to stop exactly that. The same hole
+// applied to arbitrary unrecognized tokens on BOTH kinds, so both are bound.
+//
+// RED on revert: deleting the `allowInterface` guard makes the `interface`-only
+// destination rows ACCEPT (and lower Interface on a DNAT rule, which has no
+// such mode); deleting the `default: break scan` arm makes every
+// leading-garbage row ACCEPT as a pool translation.
+func TestNATThenUnrecognizedLeadingTokenIsNotSkipped_6820(t *testing.T) {
+	cases := []struct {
+		name   string
+		dest   bool
+		then   string
+		reason string
+	}{
+		{"DNAT interface alone", true, "then { destination-nat interface; }",
+			"destination NAT has no interface translation mode"},
+		{"DNAT interface then pool", true, "then { destination-nat interface pool PD; }",
+			"skipping `interface` would silently publish a pool translation"},
+		{"DNAT garbage then pool", true, "then { destination-nat frobnicate pool PD; }",
+			"skipping an unknown token would silently publish a pool translation"},
+		{"SNAT garbage then pool", false, "then { source-nat frobnicate pool P; }",
+			"skipping an unknown token would silently publish a pool translation"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := natHierTree6820(t, tc.dest, tc.then)
+			if _, err := CompileConfig(tree); err == nil {
+				t.Errorf("STRICT commit ACCEPTED %q — %s. An accumulating scan must STOP at "+
+					"an unrecognized leading token, not skip past it to the next one "+
+					"(#6820 round 6, B3)", tc.then, tc.reason)
+			}
+			then := tolerantNATThenTree6820(t, tc.name, tree, tc.dest)
+			if natThenSurvivor6820(then) != "none" {
+				t.Errorf("%q resolved to a translation %+v (survivor %q); it must lower NO "+
+					"terminal action", tc.then, then, natThenSurvivor6820(then))
+			}
+			if tc.dest && then.Interface {
+				t.Errorf("%q lowered Interface on a DESTINATION-NAT rule (%+v); destination "+
+					"NAT has no interface translation mode", tc.then, then)
 			}
 		})
 	}
@@ -691,34 +930,43 @@ func TestNATDuplicateContainerLastWinsChoosesSurvivor_6820(t *testing.T) {
 
 // natCardinalityMessageDefects6820 reports every way msg fails to STATE the
 // #6820 mechanism claims for the given NAT kind. An empty result means the
-// message states them. kind is "source" or "destination".
+// message carries the pinned runs and none of the listed stale/refutation
+// markers. kind is "source" or "destination".
 //
-// WHY a function over a string, and not inline strings.Contains calls in the
-// test (#6820 round 5, B3). The round-4 binder pinned one bare clause — "the
-// survivor is not chosen by configuration order" — with a case-sensitive
-// Contains. That pins BYTES, not MEANING, and this rewrite passes it verbatim:
+// # What this checker does, and what it explicitly does NOT do
 //
-//	The statement "the survivor is not chosen by configuration order" is
-//	false; configuration order chooses it.
-//
-// Proving that a PARAPHRASE reds proves only that the pin detects rewording; a
-// bare-clause pin cannot see polarity at all. So this checker does two things a
-// clause pin cannot, and is a FUNCTION so the test can feed it a negation and
-// prove it fires — a green assertion with no witnessing red shows only that the
-// checker ran:
+// It does two things a bare `strings.Contains` on one clause cannot:
 //
 //   - it pins each kind's mechanism sentence CONCATENATED with the shared claim
 //     tail, as ONE contiguous run. A run is what makes an interior deletion
 //     visible: dropping "and never looking the pool up, and the dataplane
 //     applies the same " from the DNAT text leaves a semantically damaged
 //     message that every clause-level pin still accepts (#6820 B4).
-//   - it rejects a REFUTATION FRAME anywhere in the message. None of these
-//     markers occur in the true text (note "is not irrelevant" is deliberately
-//     not matched by them), and a message that quotes the claim in order to
-//     deny it necessarily carries one.
+//   - it rejects a fixed VOCABULARY of stale-mechanism and refutation markers,
+//     matched after normalisation (case, whitespace, hyphen-vs-space), so
+//     "packed key order" and "packed-key order" are one token.
 //
-// The behavioural half of these claims is NOT checked here — a message is not
-// evidence about the code. It is measured by
+// It is NOT a polarity oracle, and #6820 round 5 wrongly claimed it was: that
+// revision asserted "a message that quotes the claim in order to deny it
+// necessarily carries one [refutation marker]". That is false. `The above is
+// untrue.` denies the claim and carries none of the markers, and eight more
+// rewrites that are FLATLY FALSE about the compiler score zero defects here —
+// enumerated and measured in natCardinalityMessageRewrites6820. A keyword list
+// cannot express "this message contains no claim that contradicts the message";
+// extending the list to cover those nine would pin ten fixtures instead of one
+// and leave the tenth-plus-one bypass just as open. So the claim is narrowed to
+// what the list delivers: it is a FLOOR over a specific vocabulary.
+//
+// The property the round-5 text wanted is expressed instead by
+// natCardinalitySourceMessage6820 / natCardinalityDestMessage6820: the whole
+// operator-facing message, pinned by EQUALITY. Equality has no vocabulary and
+// no polarity model — any appended denial, any prepended disclaimer, any
+// interior edit is a mismatch. That is the guard
+// TestNATCardinalityMessageRewritesAreCaught_6820 puts every rewrite through;
+// this checker's remaining job is to say WHICH WAY a drifted message drifted.
+//
+// The behavioural half of these claims is NOT checked by either — a message is
+// not evidence about the code. It is measured by
 // TestNATSurvivorIsOrderInvariantWithinBlock_6820 (within-block order does not
 // choose) and TestNATDuplicateContainerLastWinsChoosesSurvivor_6820 (container
 // order does).
@@ -729,7 +977,9 @@ func natCardinalityMessageDefects6820(kind, msg string) []string {
 		"rule as a whole: duplicate `then` CONTAINERS are resolved FIRST, last-wins " +
 		"per #3850 — the LAST container supplies the actions counted here — and the " +
 		"precedence above then resolves among them. (This rejects contradictory " +
-		"actions inside one block; it does not reject duplicate containers.)"
+		"actions inside one block. Duplicate containers are NOT rejected, but only " +
+		"the brace syntax can author them: repeated `set ... then ...` commands " +
+		"MERGE into a single block, so in `set` syntax this rejection is what you get.)"
 
 	const sourceMechanism = "every one of them is published to the dataplane, which " +
 		"resolves the rule by a fixed precedence — `off` wins over `interface`, and " +
@@ -767,85 +1017,217 @@ func natCardinalityMessageDefects6820(kind, msg string) []string {
 			wantRun)
 	}
 
+	// Marker scans run on the NORMALISED text so a rewrite cannot slip a marker
+	// past on spelling alone — "packed key order" and "packed-key order" are the
+	// same token here (#6820 round 6, B2).
+	norm := natMessageNormalize6820(msg)
+
 	// The mechanism the compiler stopped using. Both halves are dead since
-	// #6820 B1 (child order died at #5628, packed-key order at #6820).
-	for _, stale := range []string{"packed-key", "child order"} {
-		if strings.Contains(msg, stale) {
+	// #6820 (child order died at #5628; the packed/chained reads at rounds 5-6).
+	for _, stale := range []string{"packed key", "child order"} {
+		if strings.Contains(norm, stale) {
 			defects = append(defects, "still tells the operator the compiler picks an action "+
-				"by "+stale+"; it records every authored field from both the packed tail and "+
-				"the children (applyNATThenActions) and the dataplane resolves them")
+				"by "+stale+" order; it records every authored field from the whole `then` "+
+				"subtree (applyNATThenActions) and the dataplane resolves them")
 		}
 	}
 
-	// Polarity. A message that quotes a claim to DENY it satisfies every
-	// substring pin above; only a refutation-frame check sees it.
-	for _, frame := range []string{
-		"is false", "is not true", "is incorrect", "is wrong",
-		"the statement", "contrary to", "does choose", "chooses it",
-	} {
-		if strings.Contains(strings.ToLower(msg), frame) {
+	// A FLOOR over a refutation vocabulary — not a polarity gate. See the
+	// function comment and natCardinalityMessageRewrites6820: nine rewrites that
+	// are false about the compiler score zero here. Equality against the golden
+	// message is what actually catches those.
+	for _, frame := range natCardinalityRefutationMarkers6820 {
+		if strings.Contains(norm, frame) {
 			defects = append(defects, "carries the refutation marker "+strconv.Quote(frame)+
-				" — the rejection text must ASSERT the mechanism, not quote and deny it. A "+
-				"negation that embeds the pinned run verbatim passes every substring pin "+
-				"(#6820 B3)")
+				" — the rejection text must ASSERT the mechanism, not quote and deny it")
 		}
 	}
 	return defects
 }
 
-// TestNATCardinalityMessageCheckerRejectsNegation_6820 is the witnessing RED for
-// natCardinalityMessageDefects6820: without it, "the checker returned no
-// defects" is indistinguishable from a checker that cannot fail.
-//
-// The negative fixture is deliberately the HARD one. It is the REAL rejection
-// text, unmodified, with a refutation frame prepended — so every contiguous-run
-// pin still matches and only the polarity gate can catch it. That is exactly
-// the shape round 4's binder admitted.
-func TestNATCardinalityMessageCheckerRejectsNegation_6820(t *testing.T) {
-	twoActionSNAT := buildTree(t, []string{
+// natCardinalityRefutationMarkers6820 is the refutation vocabulary
+// natCardinalityMessageDefects6820 scans for, in NORMALISED form (lower-case,
+// hyphens as spaces, single-spaced). It is a FLOOR, deliberately not extended
+// to cover every measured bypass — see natCardinalityMessageRewrites6820.
+var natCardinalityRefutationMarkers6820 = []string{
+	"is false", "is not true", "is incorrect", "is wrong",
+	"the statement", "contrary to", "does choose", "chooses it",
+}
+
+// natMessageNormalize6820 folds the spellings a marker scan must not be fooled
+// by: case, hyphen-vs-space, and whitespace runs.
+func natMessageNormalize6820(s string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(strings.ToLower(s), "-", " ")), " ")
+}
+
+// twoActionRejectionMessage6820 compiles a rule carrying two mutually-exclusive
+// terminal actions and returns the strict rejection text verbatim. The fixture
+// names are fixed so the message is fully determined and can be pinned by
+// equality.
+func twoActionRejectionMessage6820(t *testing.T, dest bool) string {
+	t.Helper()
+	lines := []string{
 		"set security nat source pool P address 203.0.113.5",
 		"set security nat source rule-set RS from zone trust",
 		"set security nat source rule-set RS to zone untrust",
 		"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
 		"set security nat source rule-set RS rule R1 then source-nat pool P",
 		"set security nat source rule-set RS rule R1 then source-nat off",
-	})
-	_, err := CompileConfig(twoActionSNAT)
+	}
+	if dest {
+		lines = []string{
+			"set security nat destination pool PD address 10.0.0.5",
+			"set security nat destination rule-set RD from zone untrust",
+			"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.1/32",
+			"set security nat destination rule-set RD rule R1 then destination-nat pool PD",
+			"set security nat destination rule-set RD rule R1 then destination-nat off",
+		}
+	}
+	_, err := CompileConfig(buildTree(t, lines))
 	if err == nil {
-		t.Fatal("CompileConfig ACCEPTED a two-action source-NAT rule")
+		t.Fatalf("CompileConfig ACCEPTED a two-action NAT rule (dest=%v)", dest)
 	}
-	real := err.Error()
+	return err.Error()
+}
 
-	// Control: the real message must pass, or the negatives below prove nothing.
-	if defects := natCardinalityMessageDefects6820("source", real); len(defects) > 0 {
-		t.Fatalf("control: the REAL rejection text was reported defective, so this test's "+
-			"negatives are meaningless: %v", defects)
-	}
+// The WHOLE operator-facing rejection text, pinned by equality (#6820 round 6,
+// B2). Equality is the guard that expresses what a keyword list cannot: it has
+// no vocabulary and no polarity model, so an appended denial, a prepended
+// disclaimer, a reworded clause and an interior deletion are all just
+// mismatches. Editing the message is expected to red these constants — that IS
+// the review prompt, on text an operator reads when a commit is refused.
+const natCardinalitySourceMessage6820 = "source-nat rule-set \"RS\" rule \"R1\": " +
+	"`then` carries 2 mutually-exclusive translation actions (expected exactly one of " +
+	"`source-nat interface`, `source-nat pool <p>`, or `source-nat off`); every one of " +
+	"them is published to the dataplane, which resolves the rule by a fixed precedence " +
+	"— `off` wins over `interface`, and `interface` over `pool`, so all but one action " +
+	"is silently discarded, and which one survives is decided by that precedence rather " +
+	"than by the order the actions are written inside this block. Configuration order is " +
+	"not irrelevant to the rule as a whole: duplicate `then` CONTAINERS are resolved " +
+	"FIRST, last-wins per #3850 — the LAST container supplies the actions counted here " +
+	"— and the precedence above then resolves among them. (This rejects contradictory " +
+	"actions inside one block. Duplicate containers are NOT rejected, but only the brace " +
+	"syntax can author them: repeated `set ... then ...` commands MERGE into a single " +
+	"block, so in `set` syntax this rejection is what you get.)"
 
-	negated := "The statement below is false; configuration order chooses it. " + real
-	if defects := natCardinalityMessageDefects6820("source", negated); len(defects) == 0 {
-		t.Errorf("a NEGATION of the claim passed the checker. It embeds the whole pinned "+
-			"run verbatim, so every substring pin matches; only the refutation-frame gate "+
-			"can reject it, and it did not fire:\n  %s", negated)
-	}
+const natCardinalityDestMessage6820 = "destination-nat rule-set \"RD\" rule \"R1\": " +
+	"`then` carries 2 mutually-exclusive translation actions (expected exactly one of " +
+	"`destination-nat pool <p>` or `destination-nat off`); the compiler resolves `off` " +
+	"itself, publishing a pool-less exemption and never looking the pool up, and the " +
+	"dataplane applies the same `off`-over-`pool` precedence to any entry that carries " +
+	"both, so all but one action is silently discarded, and which one survives is decided " +
+	"by that precedence rather than by the order the actions are written inside this " +
+	"block. Configuration order is not irrelevant to the rule as a whole: duplicate " +
+	"`then` CONTAINERS are resolved FIRST, last-wins per #3850 — the LAST container " +
+	"supplies the actions counted here — and the precedence above then resolves among " +
+	"them. (This rejects contradictory actions inside one block. Duplicate containers " +
+	"are NOT rejected, but only the brace syntax can author them: repeated " +
+	"`set ... then ...` commands MERGE into a single block, so in `set` syntax this " +
+	"rejection is what you get.)"
 
-	// B4: an interior deletion from the DNAT mechanism must be visible. The
-	// fragment below was deletable at round 4 with the binder still green.
-	twoActionDNAT := buildTree(t, []string{
-		"set security nat destination pool PD address 10.0.0.5",
-		"set security nat destination rule-set RD from zone untrust",
-		"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.1/32",
-		"set security nat destination rule-set RD rule R1 then destination-nat pool PD",
-		"set security nat destination rule-set RD rule R1 then destination-nat off",
-	})
-	_, err = CompileConfig(twoActionDNAT)
-	if err == nil {
-		t.Fatal("CompileConfig ACCEPTED a two-action destination-NAT rule")
+// natCardinalityMessageRewrites6820 enumerates rewrites of the REAL rejection
+// text that are FALSE about the compiler. Each carries the measured verdict of
+// natCardinalityMessageDefects6820's marker vocabulary, so the vocabulary's
+// reach is RECORDED rather than claimed.
+//
+// The `vocabularyCatches: false` rows are the point. Round 5 claimed the
+// checker rejects any message that "quotes the claim in order to deny it";
+// `The above is untrue.` does exactly that and scores zero. A keyword list
+// cannot express the property, and adding these nine phrases to the list would
+// pin ten fixtures instead of one — the same defect one turn later. The list
+// stays a FLOOR; equality against the golden is what catches every row.
+var natCardinalityMessageRewrites6820 = []struct {
+	name              string
+	rewrite           func(real string) string
+	vocabularyCatches bool
+	why               string
+}{
+	{"prepended-negation", func(r string) string {
+		return "The statement below is false; configuration order chooses it. " + r
+	}, true, "carries three listed markers; the one fixture round 5 tested"},
+	{"untrue", func(r string) string { return r + " The above is untrue." },
+		false, "denies the claim with a word the list does not carry"},
+	{"inaccurate", func(r string) string { return r + " That description is inaccurate." },
+		false, "same, different word"},
+	{"never-applied", func(r string) string {
+		return r + " In practice the precedence above is never applied; the first action written wins."
+	}, false, "asserts the pre-#5628 behaviour as current, with no refutation vocabulary"},
+	{"order-selects", func(r string) string {
+		return r + " In fact, the order the actions appear inside the block selects the survivor."
+	}, false, "directly contradicts the pinned run; no marker"},
+	{"disregard", func(r string) string { return r + " Disregard the preceding sentence." },
+		false, "retracts without denying"},
+	{"opposite-plain", func(r string) string {
+		return r + " The opposite holds: whichever action you write first is the one kept."
+	}, false, "states the inverse in plain words"},
+	{"no-longer-current", func(r string) string {
+		return "The following no longer describes this release. " + r
+	}, false, "a prefix disclaimer, not a denial"},
+	{"stale-round4-claim-returns", func(r string) string {
+		return r + " Note that the survivor is not chosen by configuration order."
+	}, false, "re-adds the exact unqualified sentence #6820 round 4 shipped and round 5 removed as FALSE"},
+	{"packed-key-respelled", func(r string) string {
+		return r + " The compiler selects an action by packed key order."
+	}, true, "the stale-mechanism marker, caught only because the scan now normalises hyphen-vs-space"},
+}
+
+// TestNATCardinalityMessageRewritesAreCaught_6820 is the witnessing RED for the
+// message guards: without it, "the checker returned no defects" is
+// indistinguishable from a checker that cannot fail.
+//
+// It asserts three things. (1) The REAL text equals its golden and scores zero
+// defects — the control, without which every negative below proves nothing.
+// (2) EVERY rewrite in natCardinalityMessageRewrites6820 is caught by the
+// equality guard. (3) The marker vocabulary's verdict on each rewrite matches
+// the recorded `vocabularyCatches` column — so the eight it cannot see stay
+// visible in this file rather than being papered over, and any future widening
+// of the list has to update the column.
+func TestNATCardinalityMessageRewritesAreCaught_6820(t *testing.T) {
+	for _, kind := range []struct {
+		name   string
+		dest   bool
+		golden string
+	}{
+		{"source", false, natCardinalitySourceMessage6820},
+		{"destination", true, natCardinalityDestMessage6820},
+	} {
+		t.Run(kind.name, func(t *testing.T) {
+			real := twoActionRejectionMessage6820(t, kind.dest)
+			if real != kind.golden {
+				t.Fatalf("the %s-NAT rejection text CHANGED. If the edit is intended, update "+
+					"the golden — and re-read it as an operator would, because this text is "+
+					"the only signal a refused commit gives.\n  got:  %s\n  want: %s",
+					kind.name, real, kind.golden)
+			}
+			if defects := natCardinalityMessageDefects6820(kind.name, real); len(defects) > 0 {
+				t.Fatalf("control: the REAL %s rejection text was reported defective, so this "+
+					"test's negatives are meaningless: %v", kind.name, defects)
+			}
+			for _, rw := range natCardinalityMessageRewrites6820 {
+				rewritten := rw.rewrite(real)
+				if rewritten == kind.golden {
+					t.Errorf("%s: rewrite %q left the message IDENTICAL to the golden; the "+
+						"rewrite is not exercising anything", kind.name, rw.name)
+				}
+				caught := len(natCardinalityMessageDefects6820(kind.name, rewritten)) > 0
+				if caught != rw.vocabularyCatches {
+					t.Errorf("%s: rewrite %q — marker vocabulary caught=%v, recorded %v (%s).\n"+
+						"The column records the vocabulary's REACH; it is a floor, not a "+
+						"polarity guarantee. Update it if the list changed on purpose.\n  %s",
+						kind.name, rw.name, caught, rw.vocabularyCatches, rw.why, rewritten)
+				}
+			}
+		})
 	}
-	realDNAT := err.Error()
-	if defects := natCardinalityMessageDefects6820("destination", realDNAT); len(defects) > 0 {
-		t.Fatalf("control: the REAL DNAT rejection text was reported defective: %v", defects)
-	}
+}
+
+// TestNATCardinalityMessageInteriorDeletionIsVisible_6820 keeps the #6820 B4
+// case explicit: an interior deletion from the DNAT mechanism sentence leaves a
+// semantically damaged message that every clause-level pin accepts. Both guards
+// must see it — the contiguous-run pin (which is what makes the checker useful
+// as a diagnostic) and equality.
+func TestNATCardinalityMessageInteriorDeletionIsVisible_6820(t *testing.T) {
+	realDNAT := twoActionRejectionMessage6820(t, true)
 	const b4Fragment = "and never looking the pool up, and the dataplane applies the same "
 	if !strings.Contains(realDNAT, b4Fragment) {
 		t.Fatalf("the #6820 B4 fragment is no longer in the DNAT message; re-derive this "+
@@ -857,4 +1239,83 @@ func TestNATCardinalityMessageCheckerRejectsNegation_6820(t *testing.T) {
 			"is not contiguous enough to see an interior deletion (#6820 B4):\n  %s",
 			b4Fragment, damaged)
 	}
+	if damaged == natCardinalityDestMessage6820 {
+		t.Errorf("the interior deletion left the message equal to the golden")
+	}
+}
+
+// TestNATDuplicateThenSetCommandsMergeAndAreRejected_6820 binds the corrected
+// closing sentence of the rejection text: duplicate `then` CONTAINERS are not
+// rejected, "but only the brace syntax can author them: repeated `set ... then
+// ...` commands MERGE into a single block".
+//
+// The previous wording — "it does not reject duplicate containers" — misleads
+// exactly the operator most likely to hit this, because in `set` syntax there
+// is no way to author a duplicate container: SetPath merges the repeated
+// commands into ONE `then` node, so the two actions land in one block and ARE
+// rejected here. Both halves are measured.
+func TestNATDuplicateThenSetCommandsMergeAndAreRejected_6820(t *testing.T) {
+	// set syntax: two `then source-nat` commands MERGE into one block.
+	merged := buildTree(t, []string{
+		"set security nat source pool P address 203.0.113.5",
+		"set security nat source rule-set RS from zone trust",
+		"set security nat source rule-set RS to zone untrust",
+		"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
+		"set security nat source rule-set RS rule R1 then source-nat pool P",
+		"set security nat source rule-set RS rule R1 then source-nat off",
+	})
+	thenNodes := findNATRuleThenNodes6820(t, merged)
+	if len(thenNodes) != 1 {
+		t.Fatalf("repeated `set ... then source-nat ...` produced %d `then` containers, want "+
+			"1 — the message tells the operator they MERGE", len(thenNodes))
+	}
+	if _, err := CompileConfig(merged); err == nil {
+		t.Error("repeated `set ... then source-nat ...` commands COMMITTED; they merge into " +
+			"one block carrying two actions, which this gate must reject")
+	} else if !strings.Contains(err.Error(), "mutually-exclusive translation actions") {
+		t.Errorf("merged set commands rejected by the wrong gate: %v", err)
+	}
+
+	// brace syntax: two containers stay two, and #3850 last-wins keeps them
+	// committing.
+	braced := natHierTree6820(t, false,
+		"then { source-nat { off; } }\n      then { source-nat { pool P; } }")
+	if n := len(findNATRuleThenNodes6820(t, braced)); n != 2 {
+		t.Fatalf("the brace syntax produced %d `then` containers, want 2", n)
+	}
+	if _, err := CompileConfig(braced); err != nil {
+		t.Errorf("duplicate `then` CONTAINERS must keep committing (#3850 last-wins), and "+
+			"the message says so: %v", err)
+	}
+}
+
+// findNATRuleThenNodes6820 returns the `then` nodes of the first source-NAT
+// rule in the tree, so a test can assert how many CONTAINERS a syntax produced.
+func findNATRuleThenNodes6820(t *testing.T, tree *ConfigTree) []*Node {
+	t.Helper()
+	sec := tree.FindChild("security")
+	if sec == nil {
+		t.Fatal("no security node")
+	}
+	nat := sec.FindChild("nat")
+	if nat == nil {
+		t.Fatal("no nat node")
+	}
+	src := nat.FindChild("source")
+	if src == nil {
+		t.Fatal("no source node")
+	}
+	for _, rs := range src.Children {
+		if rs.Name() != "rule-set" {
+			continue
+		}
+		for _, rule := range rs.Children {
+			if rule.Name() != "rule" {
+				continue
+			}
+			return rule.FindChildren("then")
+		}
+	}
+	t.Fatal("no source-NAT rule node")
+	return nil
 }
