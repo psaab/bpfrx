@@ -542,6 +542,9 @@ mod tests_policy_inbound_nat;
 #[cfg(test)]
 #[path = "tests_fragment.rs"]
 mod tests_fragment;
+#[cfg(test)]
+#[path = "tests_session_delta_json.rs"]
+mod tests_session_delta_json;
 #[path = "worker/mod.rs"]
 mod worker;
 // #1807: shared poison-recovery helpers (lock_recover /

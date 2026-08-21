@@ -466,9 +466,10 @@ impl SessionTable {
         // table — so look it up by key and carry it on the wire, letting the
         // peer adopt the same id it will emit its own RT_FLOW records under
         // (`session_id_for` returns 0 if the key is somehow absent, the safe
-        // fallback-to-local-alloc sentinel). NB: only the event-stream leg of
-        // this owner-RG export carries the id; the JSON resync leg still drops
-        // it (#6312).
+        // fallback-to-local-alloc sentinel). BOTH legs of this owner-RG export
+        // carry the id since #6312: the binary event-stream frame's trailing u64
+        // (`encode_session_open`) and the JSON `SessionDeltaInfo`
+        // (`rt_flow_session_id`, populated by `afxdp::session_delta_info`).
         let session_id = self.session_id_for(&key);
         self.push_delta(SessionDelta {
             kind: SessionDeltaKind::Open,

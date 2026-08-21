@@ -97544,6 +97544,48 @@ prose edit above them added. No diff falls in the new test body.
   suite `cargo test -p userspace-dp -- --test-threads=1` exit 0.
 - **File(s)**: userspace-dp/src/afxdp/wg/session.rs, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: Fixed #6312 sub-item 1 — the JSON session-resync leg now carries
+  the #5212 stable RT_FLOW session id. The Rust JSON `SessionDeltaInfo`
+  (`protocol/binding.rs`) had no session-id field at all and the internal
+  delta -> JSON conversion never copied `delta.session_id`, so every session
+  recovered through the `drain_session_deltas` polling fallback or the owner-RG
+  resync export imported id 0 and the peer minted a fresh local id. The
+  originating node's SESSION_CREATE and the peer's post-failover SESSION_CLOSE
+  then carried different ids — the cross-node correlation #5212 exists to
+  provide, absent exactly in the full-resync recovery window.
+
+  Added `#[serde(rename = "rt_flow_session_id", default)] pub
+  rt_flow_session_id: u64` and populated it from `delta.session_id`. The Go
+  consumer field already existed for the binary leg
+  (`SessionDeltaInfo.RTFlowSessionID`, `json:"rt_flow_session_id"`), so nothing
+  changed downstream. NO protocol-version bump: `ProtocolVersion` (8) governs
+  the CONFIG-SNAPSHOT contract (`apply_snapshot` / `bump_fib_generation`
+  equality + the `ensureRequiredSnapshotProtocolLocked` gates), not this control
+  RPC; and the addition degrades in both directions to 0, the pre-existing
+  "no id carried" sentinel that is the pre-#6312 behaviour of this leg.
+
+  The delta -> JSON conversion was extracted from `flush_session_deltas` as
+  `afxdp::session_delta_info` (pure movement): the parent needs live BPF map
+  fds, per-binding shared state and an event-stream handle, so nothing could
+  test what this leg puts on the wire. Sub-item 2 (the overstated
+  `emit_open_delta_with_origin` comment) was already fixed on master and is now
+  re-tightened to say BOTH legs carry the id.
+
+  Validation: 3 new Rust tests (value carried, wire KEY, zero sentinel) + 1 Go
+  test parsing the Rust `serde(rename)` and asserting the Go decoder agrees.
+  Full Rust suite `cargo test -- --test-threads=1` exit 0 (4452 + 124 passed);
+  `go test -count=1 ./pkg/dataplane/... ./pkg/daemon/ ./pkg/cluster/` exit 0;
+  `cargo check --all-targets` and `go vet` exit 0. Wire fixture regenerated
+  (one additive key). Reaches the helper binary — a cluster smoke is owed.
+- **File(s)**: userspace-dp/src/protocol/binding.rs,
+  userspace-dp/src/afxdp/session_delta.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_session_delta_json.rs,
+  userspace-dp/src/session/install.rs, userspace-dp/src/session/README.md,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol_ha.go,
+  pkg/dataplane/userspace/wire_verdict_keys_6691_test.go,
+  pkg/dataplane/userspace/session_delta_rt_flow_session_id_key_6312_test.go,
+  _Log.md
 - **Action**: Fixed #6371 — a FAILED `rg_active` clear no longer reports the HA
   fence as actuated. On a peer-requested transfer-out the demotion branch of
   `watchClusterEvents` called `d.signalFailoverActuated(ev.GroupID)`
