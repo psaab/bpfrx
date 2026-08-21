@@ -1946,6 +1946,13 @@ pub(super) fn poll_binding_process_descriptor(
                             let local_metadata = SessionMetadata {
                                 ingress_zone: from_zone_id,
                                 egress_zone: to_zone_id,
+                                // #4983: stamp the session's TRUE ingress identity from the frame that
+                                // created it — the binding it was actually received on plus its 802.1Q
+                                // tag. Recorded ONCE here and never re-derived from the zone, which is
+                                // the approximation `show/clear security flow session interface <name>`
+                                // is being freed from.
+                                ingress_ifindex: meta.ingress_ifindex,
+                                ingress_vlan_id: meta.ingress_vlan_id,
                                 owner_rg_id: 0,
                                 fabric_ingress: false,
                                 is_reverse: false,
@@ -2438,6 +2445,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     let forward_metadata = SessionMetadata {
                                         ingress_zone: from_zone_id,
                                         egress_zone: to_zone_id,
+                                        // #4983: stamp the session's TRUE ingress identity from the frame that
+                                        // created it — the binding it was actually received on plus its 802.1Q
+                                        // tag. Recorded ONCE here and never re-derived from the zone, which is
+                                        // the approximation `show/clear security flow session interface <name>`
+                                        // is being freed from.
+                                        ingress_ifindex: meta.ingress_ifindex,
+                                        ingress_vlan_id: meta.ingress_vlan_id,
                                         owner_rg_id,
                                         fabric_ingress,
                                         is_reverse: false,
@@ -2791,6 +2805,17 @@ pub(super) fn poll_binding_process_descriptor(
                                     let reverse_metadata = SessionMetadata {
                                         ingress_zone: to_zone_id,
                                         egress_zone: from_zone_id,
+                                        // #4983: the reverse companion has NO ingress identity of its own —
+                                        // the reply's ingress has not been OBSERVED yet, and routing may be
+                                        // asymmetric, so there is nothing truthful to stamp. Note the forward
+                                        // flow's egress IS available here (`decision.resolution.egress_ifindex`,
+                                        // resolved above); it is simply the wrong datum, being a prediction of
+                                        // where the reply will arrive rather than an observation of where it
+                                        // did. Stamping either it or the forward frame's own ingress would put
+                                        // a confident value on an unobserved binding. Left 0 = "no identity
+                                        // carried"; the Go filter falls back to the zone approximation.
+                                        ingress_ifindex: 0,
+                                        ingress_vlan_id: 0,
                                         owner_rg_id,
                                         fabric_ingress,
                                         is_reverse: true,
@@ -5025,6 +5050,20 @@ pub(super) fn poll_binding_process_descriptor(
                                         worker_ctx.forwarding,
                                         from_zone_id,
                                         to_zone_id,
+                                        // #4983: stamp the seed's TRUE ingress identity from the
+                                        // frame that created it, exactly as the two other
+                                        // FRAME-DRIVEN install sites above do. ("Frame-driven",
+                                        // not "policy-admitted": the transit install is
+                                        // policy-admitted, but the LocalDelivery install also runs
+                                        // for a `JunosHostLocalPolicy::NoMatch` host-bound flow
+                                        // that the zone's host-inbound set admits with no
+                                        // junos-host policy matching at all -- #6928 review.)
+                                        // This seed is published to the BPF
+                                        // conntrack map below and is never re-installed once the
+                                        // neighbor resolves, so it is the session's only chance to
+                                        // record where the flow actually arrived.
+                                        meta.ingress_ifindex,
+                                        meta.ingress_vlan_id,
                                         packet_fabric_ingress,
                                         pending_decision,
                                     );

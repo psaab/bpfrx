@@ -605,6 +605,8 @@ pub(super) fn build_local_origin_tunnel_tx_request(
         metadata: SessionMetadata {
             ingress_zone: zone_id,
             egress_zone: zone_id,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
             fabric_ingress: false,
             is_reverse: false,

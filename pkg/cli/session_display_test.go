@@ -115,7 +115,7 @@ func TestMatchesV4_InterfaceFilter(t *testing.T) {
 		f := &sessionFilter{
 			iface:           "ge-0/0/0",
 			zoneIfaces:      zoneIfaces,
-			egressIfacesMap: egressIfaces,
+			ifaceNamesByKey: egressIfaces,
 		}
 		key := dataplane.SessionKey{Protocol: 6}
 		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
@@ -128,7 +128,7 @@ func TestMatchesV4_InterfaceFilter(t *testing.T) {
 		f := &sessionFilter{
 			iface:           "ge-0/0/1",
 			zoneIfaces:      zoneIfaces,
-			egressIfacesMap: egressIfaces,
+			ifaceNamesByKey: egressIfaces,
 		}
 		key := dataplane.SessionKey{Protocol: 6}
 		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
@@ -141,7 +141,7 @@ func TestMatchesV4_InterfaceFilter(t *testing.T) {
 		f := &sessionFilter{
 			iface:           "ge-0/0/2",
 			zoneIfaces:      zoneIfaces,
-			egressIfacesMap: egressIfaces,
+			ifaceNamesByKey: egressIfaces,
 		}
 		key := dataplane.SessionKey{Protocol: 6}
 		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
@@ -154,7 +154,7 @@ func TestMatchesV4_InterfaceFilter(t *testing.T) {
 		f := &sessionFilter{
 			iface:           "ge-0/0/2",
 			zoneIfaces:      zoneIfaces,
-			egressIfacesMap: egressIfaces,
+			ifaceNamesByKey: egressIfaces,
 		}
 		key := dataplane.SessionKey{Protocol: 6}
 		// FibIfindex 20 resolves to ge-0/0/2 via egressIfaces map
@@ -167,7 +167,7 @@ func TestMatchesV4_InterfaceFilter(t *testing.T) {
 	t.Run("no interface filter passes all", func(t *testing.T) {
 		f := &sessionFilter{
 			zoneIfaces:      zoneIfaces,
-			egressIfacesMap: egressIfaces,
+			ifaceNamesByKey: egressIfaces,
 		}
 		key := dataplane.SessionKey{Protocol: 6}
 		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}

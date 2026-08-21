@@ -277,6 +277,13 @@ fn cached_entry() -> FlowCacheEntry {
         metadata: SessionMetadata {
             ingress_zone: TEST_TRUST_ZONE_ID,
             egress_zone: TEST_UNTRUST_ZONE_ID,
+            // #4983: the cached session was installed from a frame that
+            // arrived on {PHYS_INGRESS_IFINDEX, INGRESS_VLAN_ID}, so mirror
+            // the same pair the fixture's UserspaceDpMeta carries above --
+            // a flow-cache-hit fixture that zeroed it would model a session
+            // production cannot install on this path.
+            ingress_ifindex: PHYS_INGRESS_IFINDEX as u32,
+            ingress_vlan_id: INGRESS_VLAN_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,

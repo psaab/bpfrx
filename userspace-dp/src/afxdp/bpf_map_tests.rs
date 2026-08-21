@@ -30,6 +30,8 @@ fn synced_forward_metadata() -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_TRUST_ZONE_ID,
         egress_zone: TEST_TRUST_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         owner_rg_id: 1,
         fabric_ingress: false,
         is_reverse: false,
@@ -192,13 +194,18 @@ fn bpf_conntrack_struct_sizes_match_c() {
     // Must match C struct sizes from xpf_conntrack.h exactly.
     // The value structs grew 128->136 / 176->184 when `flags` widened from
     // __u8 to __u16 (#5460): the compiler pads the leading state/flags/
-    // tcp_state/is_reverse block from 8 to 16 bytes. The Go on-map ABI mirror
-    // (bpfSessionValue / bpfSessionValueV6) is asserted to the same 136/184 in
+    // tcp_state/is_reverse block from 8 to 16 bytes. #4983 appended the
+    // `ingress_ifindex` u32 (the session's TRUE ingress-binding identity),
+    // growing them again 136->144 / 184->192: the u32 lands on the existing
+    // 8-byte boundary and the compiler tail-pads 4 bytes to the struct's
+    // 8-byte alignment. The Go on-map ABI mirror (bpfSessionValue /
+    // bpfSessionValueV6, whose tail pad is DECLARED for the #6082 zero-copy
+    // marshal path) is asserted to the same 144/192 in
     // pkg/dataplane/bpf_session_value_test.go.
     assert_eq!(core::mem::size_of::<BpfSessionKeyV4>(), 16);
-    assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 136);
+    assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 144);
     assert_eq!(core::mem::size_of::<BpfSessionKeyV6>(), 40);
-    assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 184);
+    assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 192);
 }
 
 // #5460: SESS_FLAG_NPTV6 is bit 8 (0x100 = 256), which does not fit the
@@ -269,6 +276,8 @@ fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         owner_rg_id: 1,
         fabric_ingress: false,
         is_reverse: false,
@@ -465,6 +474,8 @@ fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
         let metadata = SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -513,5 +524,121 @@ fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
     assert!(
         slices > 1,
         "full table must span more than one budgeted slice, got {slices}"
+    );
+}
+
+// #4983 FAIL-ON-REVERT: the conntrack mirror value must carry the session's
+// TRUE ingress-interface identity — `SessionMetadata::ingress_ifindex` plus
+// `ingress_vlan_id`, the binding its first packet arrived on, stamped once at
+// install. `show security flow session interface <name>` and the matching
+// `clear` read exactly these two slots (Go `dataplane.SessionValue`
+// .IngressIfindex/.IngressVlanID) and, when the ifindex is non-zero, resolve
+// the one interface it names instead of asking "is <name> bound to the
+// session's ingress ZONE?" — the approximation that made a session on
+// interface X match a filter for every sibling interface Y of that zone.
+// Reverting the builder to `ingress_ifindex: 0` turns this RED and the Go
+// filter silently falls back to the zone answer for every session.
+#[test]
+fn build_conntrack_value_stamps_ingress_identity_v4_4983() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 41086,
+        dst_port: 5201,
+    };
+    let decision = local_delivery_decision(0);
+    let mut metadata = synced_forward_metadata();
+    // A plain kernel ifindex on a VLAN 80 trunk unit — the loss cluster's own
+    // shape (reth0.80 over the physical WAN NIC), not a sentinel.
+    metadata.ingress_ifindex = 24;
+    metadata.ingress_vlan_id = 80;
+
+    let value = publish_conntrack::build_conntrack_value_v4(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0,
+    )
+    .expect("a v4 session must map to a v4 conntrack value");
+
+    assert_eq!(
+        value.ingress_ifindex, 24,
+        "the conntrack mirror must carry the session's recorded ingress ifindex, not 0 \
+         (0 sends the Go filter back to the zone approximation, #4983)"
+    );
+    assert_eq!(
+        value.ingress_vlan_id, 80,
+        "the conntrack mirror must carry the ingress VLAN id: without it two units of \
+         one trunk NIC alias onto the parent and the cross-interface match returns (#4983)"
+    );
+}
+
+// #4983 v6 sibling — matchesV6 carries the identical filter arm, so the v6
+// mirror must carry the identical identity.
+#[test]
+fn build_conntrack_value_stamps_ingress_identity_v6_4983() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: 6,
+        src_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x102)),
+        dst_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200)),
+        src_port: 41086,
+        dst_port: 5201,
+    };
+    let decision = local_delivery_decision(0);
+    let mut metadata = synced_forward_metadata();
+    metadata.ingress_ifindex = 24;
+    metadata.ingress_vlan_id = 80;
+
+    let value = publish_conntrack::build_conntrack_value_v6(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0,
+    )
+    .expect("a v6 session must map to a v6 conntrack value");
+
+    assert_eq!(
+        value.ingress_ifindex, 24,
+        "v6 mirror must carry the ingress ifindex (#4983)"
+    );
+    assert_eq!(
+        value.ingress_vlan_id, 80,
+        "v6 mirror must carry the ingress VLAN id (#4983)"
+    );
+}
+
+// #4983 OVER-REACH GUARD: the ingress identity and the cached FIB EGRESS
+// result are two different things occupying two different slots. A session
+// with a recorded ingress must leave fib_ifindex/fib_vlan_id exactly as the
+// pre-#4983 builder left them (0 — the helper does not populate the FIB cache
+// here), so the CLI's egress arm keeps resolving from the FIB result and its
+// zone fallback rather than from the ingress binding. This assertion stays
+// GREEN with the ingress stamping reverted; it fails only if someone
+// "implements" the ingress identity by reusing the egress slots.
+#[test]
+fn ingress_identity_does_not_occupy_the_fib_egress_slots_4983() {
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 41086,
+        dst_port: 5201,
+    };
+    let decision = local_delivery_decision(0);
+    let mut metadata = synced_forward_metadata();
+    metadata.ingress_ifindex = 24;
+    metadata.ingress_vlan_id = 80;
+
+    let value = publish_conntrack::build_conntrack_value_v4(
+        &key, decision, &metadata, 0, 1, 2, 100, 0, 0, 0,
+    )
+    .expect("a v4 session must map to a v4 conntrack value");
+
+    assert_eq!(
+        value.fib_ifindex, 0,
+        "the ingress identity must not leak into the FIB EGRESS ifindex slot: the CLI \
+         resolves the egress interface from it and would report the ingress one (#4983)"
+    );
+    assert_eq!(
+        value.fib_vlan_id, 0,
+        "the ingress VLAN must not leak into the FIB EGRESS vlan slot (#4983)"
     );
 }

@@ -197,6 +197,8 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
             metadata: SessionMetadata {
                 ingress_zone: 1,
                 egress_zone: 2,
+                ingress_ifindex: 0,
+                ingress_vlan_id: 0,
                 owner_rg_id: 1,
                 fabric_ingress: false,
                 is_reverse,
@@ -308,6 +310,8 @@ fn replay_filter_preserves_order_and_survivors_across_many_drops() {
             metadata: SessionMetadata {
                 ingress_zone: 1,
                 egress_zone: 2,
+                ingress_ifindex: 0,
+                ingress_vlan_id: 0,
                 owner_rg_id: 1,
                 fabric_ingress: false,
                 is_reverse,

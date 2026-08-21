@@ -84809,6 +84809,184 @@ paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
+## 2026-08-06 — #4983: true ingress-interface identity on sessions
+
+- **Timestamp**: 2026-08-06
+- **Action**: Record the ingress binding on the session and match on it in the
+  session filter, replacing the zone approximation
+- **File(s)**: `bpf/headers/xpf_conntrack.h`,
+  `userspace-dp/src/afxdp/bpf_map/mod.rs`,
+  `userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs`,
+  `userspace-dp/src/afxdp/bpf_map_tests.rs`,
+  `userspace-dp/src/session/entry.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/mod.rs` (+ 27 files carrying the new
+  `SessionMetadata` fields), `pkg/dataplane/types.go`,
+  `pkg/dataplane/bpf_session_value.go`,
+  `pkg/dataplane/bpf_session_value_test.go`, `pkg/cli/session_filter.go`,
+  `pkg/cli/session_filter_ingress_identity_4983_test.go`,
+  `pkg/cli/session_display_test.go`, `userspace-dp/src/session/README.md`,
+  `docs/session-sync-architecture.md`, `_Log.md`
+
+A session carried only its ingress ZONE, so
+`show security flow session interface <name>` and the matching `clear` could
+only ask whether `<name>` was bound to that zone — a session on interface X
+matched a filter for every sibling interface Y of the same zone. #4792 widened
+the CLI's zone map from the first bound interface to all of them, which is as
+precise as a zone-derived answer can be. This adds the real datum.
+
+`SessionMetadata` gains `ingress_ifindex` + `ingress_vlan_id`, stamped ONCE at
+install in `poll_descriptor` from the frame's `UserspaceDpMeta` (the binding it
+actually arrived on, plus its 802.1Q tag) and never re-derived from the zone.
+`publish_conntrack` mirrors both into the conntrack value; `pkg/cli`'s new
+`resolveIngressIfaces` resolves the pair through the SAME `{parent ifindex,
+VLAN}` map the egress side already uses, so one map defines one interface
+identity for both directions and `reth0.50` / `reth0.80` on one trunk NIC stop
+aliasing onto the parent. `cli_clear.go` needed no edit — it shares
+`matchesV4`/`V6` and already calls `populateIfaceMaps`.
+
+`0` = no identity carried, and the CLI falls back to the zone approximation for
+it — never "matches nothing" (which would hide sessions from `show`/`clear`),
+never "matches everything". The populations that legitimately carry 0 are: the
+reverse companion (its ingress is the forward flow's egress, unresolved at
+install — and the CLI never interface-matches a reverse row anyway, every
+show/clear call site skips `IsReverse != 0` first), a peer-synced session, the
+host-outbound GRE encapsulation path in `afxdp/tunnel.rs` (firewall-originated
+traffic off the TUN device has no ingress binding to record), the flow-cache
+descriptor seed (replay state, never published as a session), and a pre-#4983
+helper's session. The peer case is a DESIGN choice, not an omission: an ifindex
+is node-local, so node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different
+numbers for the same logical RETH member and shipping the peer's value would
+name the wrong interface locally. The identity is therefore deliberately not
+carried on the cluster wire.
+
+SURFACE SCOPE: the consumer change is in the IN-DAEMON CLI (`pkg/cli`) only.
+`pkg/grpcapi/server_sessions.go` — which the REMOTE `cli` binary uses for both
+`show security flow session interface <name>` and the matching `clear` — and
+`pkg/api/sessions.go` still resolve an interface filter from the ingress ZONE,
+in the pre-#4792 FIRST-interface-only form (`zone.Interfaces[0]`). This PR's
+diff against both packages is empty. So an interface-filtered show/clear is
+exact on the console and still approximate over gRPC/REST; the port is tracked
+separately.
+
+ABI: the fields join the shared C conntrack struct (not the sync-only trailing
+fields), growing it 136 -> 144 / 184 -> 192 — the u32 on the existing 8-byte
+boundary, the u16 inside the tail pad it forces, so the pair costs 8 bytes not
+16. Sizes bumped in lockstep in `bpf_map_tests.rs` and
+`bpf_session_value_test.go`. `sessions`/`sessions_v6` are pinned, so as with
+the #5460 flags widen a rolling deploy cannot cross this: the #5307 pre-flight
+refuses while the old daemon still forwards and the remediation is a full
+dataplane reload with brief downtime.
+
+Validation: Go `pkg/cli` tests RED on assertion with the two
+`resolveIngressIfaces` call sites reverted (`go vet` still exit 0 — not a build
+break) and GREEN restored; Rust `build_conntrack_value_*_4983` RED on
+assertion (`left: 0, right: 24`) with the publish hunk reverted. The
+over-reach guards — `TestIngressIdentityDoesNotDisturbEgressMatching4983` and
+`ingress_identity_does_not_occupy_the_fib_egress_slots_4983` — stayed GREEN
+under both reverts.
+
+Those two reverts covered the CLI FILTER and the conntrack PUBLISH — the
+mirror and the consumer. Neither claimed the PRODUCER (the poll-body stamp)
+was bound, and it was not: replacing both
+`ingress_ifindex: meta.ingress_ifindex` / `ingress_vlan_id:
+meta.ingress_vlan_id` lines with `0` left the whole Rust suite green, because
+the Rust tests hand-set a `SessionMetadata` and the Go tests hand-build a
+`dataplane.SessionValue`. See the follow-up entry below for the producer
+binding and the missing-neighbor seed stamp.
+
+## 2026-08-12 — #4983 review fold: bind the producer, stamp the seed
+
+- **Timestamp**: 2026-08-12
+- **Action**: Bind the poll-body ingress stamp with a fail-on-revert test,
+  stamp the missing-neighbor seed, resolve the display column from the same
+  identity, and scope the shipped claims to the surface they are true of
+- **File(s)**: `userspace-dp/src/afxdp/neighbor_dispatch.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+  `userspace-dp/src/afxdp/tests_session_ingress_identity.rs` (new),
+  `userspace-dp/src/afxdp/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`,
+  `userspace-dp/src/afxdp/bpf_map/mod.rs`,
+  `userspace-dp/src/session/entry.rs`, `userspace-dp/src/session/README.md`,
+  `bpf/headers/xpf_conntrack.h`, `pkg/dataplane/types.go`,
+  `pkg/cli/cli_show_flow.go`, `pkg/cli/cli_show_flow_ingress_if_4983_test.go`
+  (new), `_Log.md`
+
+F1 (producer unbound). The only two places a real packet's binding reached
+`SessionMetadata` were the host-inbound LocalDelivery and transit-forward
+install literals in `poll_binding_process_descriptor`. Replacing both with `0`
+left the Rust suite fully green (4255 passed; 0 failed) — the three Rust
+#4983 tests hand-set a `SessionMetadata` and so bind the conntrack MIRROR, and
+the four Go tests hand-build a `dataplane.SessionValue` and so bind the
+CONSUMER. Nothing observed the producer. A future refactor of the 5000-line
+poll body could drop those four lines and every session would silently carry
+`ingress_ifindex 0`, returning `show/clear ... interface X` to exact pre-#4983
+behaviour with CI green.
+
+`tests_session_ingress_identity.rs` drives the real
+`poll_binding_process_descriptor` (via `txn_run_descriptor`) with a permitted
+LAN -> WAN SYN ingressing on a VLAN unit of a TRUNK NIC — parent ifindex 11,
+VID 50 — whose SIBLING unit on the same parent (reth0.80, VID 80) is the
+egress, and whose parent resolves to a DIFFERENT zone. The forward install must
+carry 11/50; a separate `#[test]` asserts the reverse companion installed by
+the same call carries 0/0, so the two arms are distinguished rather than both
+satisfied by one constant.
+
+F3 (missing-neighbor seed unstamped). `build_missing_neighbor_session_metadata`
+hardcoded 0/0 for a FORWARD session, while the caller had `meta` in scope 32
+lines above. That seed is installed for any flow whose first packet races an
+unresolved ARP/NDP — an ordinary cold start on a busy LAN — is published to the
+conntrack map at install, and is never re-installed: `retry_pending_neigh`
+replays the buffered frame and does not take a `&mut SessionTable`. So the flow
+kept the zone approximation for its whole life. The builder now takes the
+ingress binding and the call site passes `meta.ingress_ifindex` /
+`meta.ingress_vlan_id`.
+
+F5 (filter and column disagreed). `cli_show_flow.go` derived the displayed
+`In: ... If:` name from the ingress zone's FIRST interface, so after this PR an
+interface-filtered show selected exactly the right sessions and then printed
+the wrong interface for every one. A `sessionIngressIf` closure — same shape as
+the existing `sessionEgressIf` — resolves it from the recorded identity.
+
+F2/F4 (claims). The shipped contract stated the CLI behaviour unconditionally;
+it is true of the in-daemon console CLI only. `pkg/grpcapi` (the remote `cli`
+binary, show AND clear) and `pkg/api` keep the zone approximation in its
+pre-#4792 first-interface-only form, and this PR's diff against both is empty.
+`session/entry.rs`, `session/README.md`, `pkg/dataplane/types.go` and the
+entry above are now scoped, and the population list is corrected: it had listed
+the reverse companion (whose fallback is inert — every CLI show/clear call site
+skips `IsReverse != 0` before filtering) and omitted the seed path and the
+host-outbound GRE path in `tunnel.rs`. Two ABI notes still said "size-asserted
+at 136"; the assertions are 144/192.
+
+Validation. `cargo test --release` 4257 passed / 0 failed / 2 ignored in the
+main binary (three new tests), all other targets ok. `go build ./...` exit 0,
+`go test ./pkg/cli/... ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/...`
+all ok. Mutation matrix, each applied via edit and restored with a clean
+`git diff` on the production file:
+
+- both poll-body stamps -> `0`, measured against the FULL Rust suite: 4256
+  passed / 1 FAILED — the single failure is
+  `poll_descriptor_transit_install_stamps_ingress_binding_4983`, "the forward
+  session must record the ifindex of the binding its first packet arrived on
+  ... left: 0, right: 11". Nothing else among 4257 tests observes the revert,
+  which is the finding this entry exists to close. Reverse guard and seed test
+  GREEN.
+- transit `ingress_vlan_id` -> `0` only (ifindex left stamped): same test RED
+  on the VID assertion, "left: 0, right: 50" — the two halves bind
+  independently.
+- seed stamp -> `0` with both poll-body stamps intact:
+  `poll_descriptor_missing_neighbor_seed_stamps_ingress_binding_4983` RED,
+  "left: 0, right: 11"; transit test GREEN.
+- reverse companion -> `meta.ingress_*`:
+  `poll_descriptor_reverse_companion_carries_no_ingress_identity_4983` RED,
+  "left: 11, right: 0" — the over-reach guard is proven to FIRE, not merely to
+  stay green.
+- `sessionIngressIf` display call sites -> `zoneIfaces[val.IngressZone]`:
+  `TestShowFlowSessionIngressIfColumnUsesRecordedIdentity4983` RED on both the
+  v4 and v6 arms.
+
+Every RED above is an assertion failure, not a build break.
+
 ## 2026-08-06 — #4960 ID probe: run the phases it claims to (#6894 r4)
 - **Timestamp**: 2026-08-06
 - **Action**: Fold the r4 gate finding on PR #6894. r3 widened `idProbeConfig`
@@ -85517,6 +85695,91 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+## 2026-08-12 — #4983: bind the HOST-INBOUND (LocalMiss) ingress stamp
+
+- **Timestamp**: 2026-08-12
+- **Action**: Close the last unbound production stamp site on PR #6928. A
+  per-site mutation matrix at 0e5d35f11 found that reverting the LocalMiss
+  install's `ingress_ifindex` / `ingress_vlan_id` to `0`
+  (`poll_descriptor/mod.rs`, the `local_metadata` literal) left the whole Rust
+  suite GREEN at 4257/4257, while the same loop applied to the ForwardFlow
+  install and to the `build_missing_neighbor_seed` call site both went RED —
+  so the green was a real "nothing binds it", not a stale-binary artifact.
+  `tests_session_ingress_identity.rs` had zero occurrences of `localmiss` /
+  `local_miss` / `install_helper`: no test drove the host-inbound install path
+  at all, in a PR whose claim is that every forward session carries a true
+  ingress identity. Host-bound flows (management SSH, BGP, syslog-TCP) are
+  exactly the population an operator filters by interface when the firewall
+  itself is the endpoint.
+- **Fix**: new `poll_descriptor_local_miss_install_stamps_ingress_binding_4983`
+  drives ONE host-bound TCP SYN through the real
+  `poll_binding_process_descriptor` body — dst is the ingress unit's OWN
+  address, so the session-miss resolution is `LocalDelivery` and the poll takes
+  `install_helper_local_session_on_miss` -> `publish_bpf_conntrack_entry` — and
+  asserts the installed `SessionOrigin::LocalMiss` metadata. The fixture adds a
+  THIRD LAN unit `reth2.70` on its own trunk: {parent ifindex 7, VLAN 80},
+  logical ifindex 17. Every number is disjoint from every other value the stamp
+  could have been copied from: 7 != 0/1 (no default satisfies it), 7 != 80 (a
+  transposition is RED), 7 != 17 (stamping the resolved LOGICAL unit is RED),
+  7 is neither zone id, and {7,80} is neither the transit fixture's {11,50} nor
+  its egress sibling's {11,80} — so no single constant satisfies this test and
+  the transit test at once. VLAN 80 is deliberately REUSED from reth0.80 on a
+  different parent: the ingress map is keyed by the {parent, VLAN} PAIR, so
+  this separates "recorded the pair it arrived on" from "found whichever unit
+  carries VLAN 80". Fixture liveness is asserted before the metadata
+  (`dbg.local == 1`, exactly one installed session, the binding resolves to the
+  lan logical unit), so a fixture that stopped admitting the flow or started
+  taking a transit arm is RED, not vacuously green.
+- **Validation**: per-site mutation, one cell each, full `cargo test --release`.
+  Cell A (`ingress_ifindex: 0` + `ingress_vlan_id: 0` at the LocalMiss literal)
+  rc=101, and the ONLY failure is the new test —
+  "assertion `left == right` failed: the host-local session must record the
+  ifindex of the binding its first packet arrived on ... left: 0 right: 7";
+  the transit, reverse-companion and neighbor-seed tests stay GREEN, so the
+  fixture is distinguishing rather than a restatement. Cell B (restore the
+  ifindex, zero ONLY `ingress_vlan_id`) rc=101 with "... must record the
+  ingress 802.1Q VID ... left: 0 right: 80", proving the VLAN half binds
+  independently of the ifindex half rather than hiding behind the first
+  assertion. Restored: `cargo test --release` rc=0, 4382 passed / 0 failed
+  (4258 in the main binary, +1 vs the 4257 baseline);
+  `go test ./pkg/cli/... ./pkg/dataplane/...` rc=0.
+- **Site-enumeration completeness**: re-derived the population list rather than
+  trusting it. `SessionMetadata {` across `userspace-dp/src` yields 11 literal
+  sites; two (`ha/session_import.rs`, `worker/loop_body/mod.rs`) are inside
+  `#[cfg(test)]` blocks. The nine live ones are the four stamped/deliberate-zero
+  poll populations plus `shared_ops` (synthesized reverse companion),
+  `server/helpers/session_sync.rs` (peer-synced), `tunnel.rs` (host-outbound
+  GRE), `flow_cache.rs` (descriptor seed), and `session_glue/promote.rs` (which
+  MUTATES an existing metadata and preserves the pair). Cross-checked against
+  every session install site (`install_with_protocol_with_origin` /
+  `upsert_synced_session` / `promote_synced_with_origin`) and every
+  `publish_bpf_conntrack_entry` call site, plus a grep for any direct write to
+  `.ingress_ifindex` / `.ingress_vlan_id` (there are none outside the
+  literals). NAT64 and fabric-redirect ride the ordinary ForwardFlow install;
+  there are no ALG child/pinhole session installs. No FIFTH site exists. The
+  `tunnel.rs` zero is confirmed correct at its source: `local_origin_packet_meta`
+  builds its `UserspaceDpMeta` with `..UserspaceDpMeta::default()`, so there is
+  no ingress binding to record.
+- **Reverse-companion rationale verified**: the documented claim that the
+  reverse row's `0` never reaches an interface filter holds. All eight
+  production `matchesV4`/`matchesV6` call sites in `pkg/cli` skip
+  `val.IsReverse != 0` immediately before the matcher (`cli_show_flow.go`
+  417/544/798/837 behind guards at 414/541/795/834; `cli_clear.go`
+  356/404/494/532 behind guards at 353/401/491/529), and the `In: ... If:`
+  display closures `printV4`/`printV6` are invoked only from inside those same
+  guarded callbacks. In `pkg/grpcapi`, `sessionFilter.matchV4`/`matchV6`
+  (`server_sessions.go` 549/594) reject `IsReverse != 0` as their FIRST
+  statement, ahead of the `ifaceFilter` arm, covering all twelve call sites;
+  that surface reads `f.zoneIfaces[val.IngressZone]` and never touches
+  `IngressIfindex` at all.
+- **Docs**: the zero-population list is UNCHANGED — this fold adds coverage of
+  an already-stamped site, it does not move a site between populations, so
+  `pkg/dataplane/types.go` and `session/entry.rs` need no edit.
+  `session/README.md` gains one paragraph recording that all three stamping
+  sites now carry a per-site fail-on-revert test in
+  `tests_session_ingress_identity.rs`.
+- **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/README.md, _Log.md
 ## 2026-08-06 — #3651 per-zone FLOOD counters: populate the second half
 
 - **Timestamp**: 2026-08-06
@@ -87465,6 +87728,124 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
   docs/cos-validation-notes.md, _Log.md
 
+## 2026-08-12 — #4983 round 2: standalone stamp arm, ABI sizes, population list
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fold three review items onto the #4983 head. (1) A hostile
+  reviewer claimed the transit stamp could be gated on `owner_rg_id > 0` with
+  every test still green. Verified firsthand: mutating the transit literal to
+  `if owner_rg_id > 0 { meta.ingress_ifindex } else { 0 }` left all four
+  ingress-identity tests GREEN. The claim is correct and the escape is not
+  academic — it is the shape a future HA-scoping change would take, and it
+  would drop the identity on every STANDALONE (non-clustered) firewall, the
+  majority deployment, with CI green. (2) Ten ABI size figures in
+  `pkg/dataplane/bpf_session_value.go` still read 136/184; the PR had updated
+  `types.go` and the parity test but not the file that documents the ABI.
+  (3) `session/README.md` listed "a session installed by a pre-#4983 helper"
+  as a legitimate zero population while the ABI note directly below said a
+  rolling deploy cannot cross this.
+- **Fix**: new `poll_descriptor_transit_install_stamps_ingress_binding_without_an_rg_4983`
+  replays the SAME driven flow on a standalone topology — every interface in
+  redundancy group 0 AND an empty `ha_state`. Both are required and the driver
+  now says why: `enforce_ha_resolution_snapshot` (forwarding/ha.rs:84-96) turns
+  `owner_rg_id <= 0` into `HAInactive` when `ha_state` is NON-empty, because
+  that combination means a cluster node with a pre-RG-propagation snapshot. My
+  first attempt cleared only the redundancy groups and the arm went RED on the
+  LIVENESS assertion (0 sessions installed, not 2) — a fixture that never drove
+  the path, which would have "passed" a careless mutation check for the wrong
+  reason. The arm asserts `owner_rg_id == 0` as an explicit precondition so it
+  cannot silently reacquire an RG and degrade into a copy of its sibling.
+  `run_ingress_identity_flow_on(snapshot, ha_state)` carries the liveness
+  assertions so both arms inherit them.
+  Sizes corrected to 144/192 at all ten sites, with the prior values retained
+  as explicit history (136/184 pre-#4983, 128/176 pre-#5460) and the #6082
+  binary.Size measurement re-scoped to "the struct's size at the time".
+  Population 5 replaced in `session/README.md`, `pkg/dataplane/types.go` (both
+  copies) and `session/entry.rs` with the reason it cannot occur: `sessions` /
+  `sessions_v6` are in `userspaceABICheckedPinnedMaps` (which unions
+  `userspaceShimSharedMapSpecs`, loader_userspace_shim.go:655-665) and
+  `validateUserspaceShimLivePins` (:461-489) hard-refuses a `ValueSize`
+  mismatch against the live pin — verified at both sites, not taken on trust.
+- **Validation**: the standalone arm goes RED on the `owner_rg_id` gate with
+  the failure on the IDENTITY assertion, not the liveness one —
+  "a standalone firewall's transit session must record its ingress binding too
+  ... left: 0 right: 11" — while the chassis-cluster sibling, the LocalMiss
+  test, the seed test and the reverse over-reach guard all stay GREEN, which is
+  precisely the discrimination the arm exists to provide. Restored:
+  `cargo test --release` rc=0, 4259 passed in the main binary (+2 over the 4257
+  baseline). `go test ./pkg/cli/... ./pkg/dataplane/...` rc=0; `go build` and
+  `go vet ./pkg/dataplane/...` rc=0. `rustfmt --check` rc=0 on the two touched
+  Rust files only (no crate-wide fmt); `gofmt -l` does not list either touched
+  Go file.
+  One unrelated failure appeared mid-work and is recorded rather than dropped:
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  FAILED in one heavily-loaded run in which the wg-engine concurrency tests also
+  reported "running for over 60 seconds". It passes 5/5 in isolation and again
+  in the clean full-suite run above; `shared_cos_lease.rs` is untouched by this
+  branch. Attributed to machine contention, not the diff.
+- **Scope note recorded in the test module**: these tests bind what the poll
+  body STAMPS. They cannot assert the identity reaches the operator-visible
+  conntrack map for TRANSIT sessions, because the transit install never calls
+  `publish_bpf_conntrack_entry` — a pre-existing gap traced separately.
+- **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  pkg/dataplane/bpf_session_value.go, pkg/dataplane/types.go, _Log.md
+
+## 2026-08-12 — #4983 round 3: narrow the operator-visibility claim to #6965
+
+- **Timestamp**: 2026-08-12
+- **Action**: The #4983 docs claimed the stamped ingress identity is mirrored
+  into the conntrack value "where the Go control plane reads them". That is
+  true of the METADATA and false of what reaches `show security flow session`.
+  A trace (recorded on #6965) established that the command enumerates the BPF
+  conntrack map — `Manager.IterateSessions` over `m.maps["sessions"]`,
+  pkg/dataplane/maps_session.go — and that `publish_bpf_conntrack_entry` has
+  exactly three production callers in `afxdp/poll_descriptor`: the host-inbound
+  LocalMiss install, the missing-neighbor-seed install, and the
+  reverse-companion repair (whose row is `IsReverse != 0` and is skipped before
+  filtering). The ordinary TRANSIT forward install is NOT among them: it calls
+  `publish_live_session_entry`, which writes the shim's steering table — a
+  36-byte key with a ONE-BYTE action value, a different map from the 144-byte
+  conntrack value — plus `publish_shared_session`. Instrumenting the publisher
+  and running the whole 4260-test bin suite produced 23 fires, every one a
+  LocalDelivery or MissingNeighborSeed install plus one reverse repair, and
+  ZERO transit-forward publishes even from tests that drive complete permitted
+  transit flows with replies. The remaining escape routes are closed:
+  `refresh_bpf_conntrack_last_seen` updates with `BPF_EXIST` so it can never
+  create a missing row, `session_delta.rs` only deletes, `ConntrackCtx` has no
+  caller in any commit, and the Go side's only conntrack writers are the
+  cluster-sync install and snapshot rollback. So a transit session has no row
+  at all — not a zeroed identity — and an interface filter cannot select it
+  either way.
+- **Decision**: the gap is PRE-EXISTING (origin `fab9230c5`, the commit that
+  first added the conntrack mirror and wired only these three sites) and is
+  strictly larger than #4983, so it is NOT fixed here. Publishing the full
+  entry at the transit install would add a BPF syscall to the new-session cold
+  path — the path #5287 exists because a full-table conntrack pass stalled the
+  low-latency core — and forces three decisions this PR has no basis to make
+  (reverse-companion row, conntrack-map capacity once the mirror is
+  near-complete, `SessionCount`/Prometheus/GC semantics). Filed as **#6965**,
+  marked as needing research before implementation.
+- **Fix**: narrow the claim rather than overstate it. `session/README.md` gains
+  a "Which sessions this is OPERATOR-VISIBLE for (#6965)" paragraph naming the
+  three publishing sites, the two-map distinction, and the transit exclusion;
+  `pkg/dataplane/types.go` gains the same SCOPE note on both `IngressIfindex`
+  field docs; `session/entry.rs` likewise. The transit test's own doc comment
+  now records WHY no assertion is added for the mirror: it stays green if you
+  "omit the full conntrack publication" because there IS no transit publication
+  to omit, so such an assertion would fail today and would be testing #6965's
+  fix rather than #4983's. The module header says the same in one place and
+  points at #6965.
+- **Validation**: docs/comments only — no production or test logic changed this
+  round. `cargo test --release` rc=0, 4261 passed / 0 failed;
+  `go build ./pkg/dataplane/...` rc=0, `go vet ./pkg/dataplane/...` rc=0,
+  `go test -count=1 ./pkg/cli/... ./pkg/dataplane/...` rc=0.
+  `rustfmt --check` rc=0 on the two touched .rs files; `gofmt -l` clean on the
+  touched .go file.
+- **File(s)**: userspace-dp/src/session/README.md,
+  userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  pkg/dataplane/types.go, _Log.md
 
 ## 2026-08-12 — #2114 r6b: the optional-capability surface is TWO families, and family 2 was unbound
 
@@ -87993,6 +88374,174 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
   and 226 after the union — the resolve introduced none.
 
+## 2026-08-12 — #4983 fold: Codex #2 (claim) + #6 (ABI offsets)
+
+- **Timestamp**: 2026-08-12
+- **Action**: First two of the five surviving Codex blockers on PR #6928.
+
+  **#2 — the "exact on the console" claim is false, and the runtime hole under
+  it is PRE-EXISTING.** Verified the mechanism firsthand at every link:
+  `clearFilteredSessions` propagates unconditionally
+  (`pkg/cli/cli_clear.go:252`, no interface-filter guard); the filter rides
+  gRPC (`:677`); the peer collapses the zone to one interface
+  (`server_sessions.go:508-515`, `f.zoneIfaces[zid] = zone.Interfaces[0]`) and
+  matches on it at BOTH sites (`:578-583`, `:623-628`), where `inIf` depends
+  only on the ingress zone and not on the session. So on zone
+  `[reth0.50, reth0.80]`, clearing `.50` deletes peer flows received on `.80`.
+
+  Provenance, measured rather than assumed: this PR touches NEITHER path —
+  `git diff origin/master...HEAD -- pkg/grpcapi/ pkg/api/` is empty and its
+  `pkg/cli/cli_clear.go` diff is empty. `resolveIngressIfaces` is new in the PR
+  (0 on master, 4 at head), so the PR makes the LOCAL half exact and NARROWS
+  the defect. What it introduced was the claim, also new (0 on master, 2 at
+  head). Corrected at both sites to state that SHOW is exact only for
+  locally-owned rows and CLEAR is not exact at all because it leaves this node.
+  Runtime gap filed as #6975 with the full trace; the previous "tracked
+  separately" carried no issue number.
+
+  **#6 — the ABI guards pin SIZE, not OFFSETS.** Added
+  `TestBPFSessionValueIngressIdentityOffsets` pinning all four offsets against
+  the C header (v4 136/140, v6 184/188, measured to match
+  `bpf/headers/xpf_conntrack.h`).
+- **File(s)**: pkg/dataplane/types.go, pkg/dataplane/bpf_session_value_test.go,
+  _Log.md
+- **Validation**: #6 mutation is Codex's own — reorder the tail of BOTH structs
+  to `IngressVlanID; pad; IngressIfindex`. The size guards
+  (`TestBPFSessionValueMatchesConntrackABI`,
+  `TestBPFSessionValueMarshalsAtConntrackABISize`) stay **GREEN** (`ok`) under
+  it, which is the negative control proving they cannot see a reorder, while
+  the new guard REDs on all four offsets: `offsetof(bpfSessionValue.IngressIfindex)
+  = 140, want 136` and its three siblings, each naming the transposition.
+  `go build ./...` 0; `go vet ./pkg/dataplane/... ./pkg/cli/...` 0;
+  `go test ./pkg/dataplane/... ./pkg/cli/...` all packages ok.
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6928 (#4983) round 3 — close the last three Codex blockers (#5,
+  #8, #7). Every one was CONFIRMED by running the reviewer's own mutation
+  before anything was written; one of the three is confirmed only at a
+  narrower scope than it was filed, and that correction is recorded below
+  rather than folded silently.
+
+  **#5 — both Go conversion directions are deletable with tests green.**
+  CONFIRMED: deleting all four `IngressIfindex`/`IngressVlanID` assignment
+  pairs from `toBPF`/`sessionValue` (v4 and v6) left
+  `go test ./pkg/dataplane/` **ok**. Cause is exactly as filed —
+  `TestSessionValueBPFRoundTripDropsGeneration` left both identity fields at
+  0, so `0 -> absent -> 0` compares equal.
+
+  Fixed in two parts, because the round-trip fixture alone does not cover the
+  residual. (a) The round-trip fixture now carries non-zero, mutually distinct
+  values (v4 11/50, v6 14/80). (b) Two new direction-specific tests assert on
+  the intermediate value: `TestSessionValueToBPFCarriesIngressIdentity`
+  (SessionValue -> bpfSessionValue) and
+  `TestBPFSessionValueLiftsIngressIdentity` (bpfSessionValue built DIRECTLY,
+  not via toBPF, -> SessionValue). The direct construction is deliberate: the
+  real case is a record the Rust helper wrote, which Go's writer never touched.
+
+  **#8 — the claimed egress-FIB control cannot fire.** CONFIRMED AS FILED AT
+  SUBTEST SCOPE, REFUTED AT PACKAGE SCOPE, and the distinction matters. With
+  `resolveEgressIfaces`' precise arm deleted,
+  `TestIngressIdentityDoesNotDisturbEgressMatching4983` and all three of its
+  subtests still **PASS** — the fixture's `FibIfindex=12` resolves to
+  `ge-0/0/1`, which was the untrust zone's only member, so precise answer and
+  zone fallback were the same one-element list. But the package does NOT stay
+  green: the PRE-EXISTING
+  `TestMatchesV4_InterfaceFilter/matches_egress_via_FIB_lookup`
+  (`session_display_test.go:163`) FAILS, because its FIB name `ge-0/0/2` is
+  outside the egress zone. So the arm was never unbound; what was unbound is
+  its NARROWING half, and what was wrong is this PR's own subtest presenting
+  as a control it could not be.
+
+  Both fixed. The untrust zone now binds two interfaces (`ge-0/0/1`,
+  `ge-0/0/4`), so the zone fallback is a strict superset of any FIB-precise
+  answer, and `TestEgressFIBIdentityDoesNotMatchEgressZoneSibling4983` asserts
+  the sibling is EXCLUDED (v4 + v6) with a built-in fixture control: with
+  `FibIfindex=0` the same session must still reach `ge-0/0/4` through the
+  fallback, or the exclusion would be explained by unreachability instead of
+  narrowing. The old subtest keeps its over-reach charter and now says so, and
+  names both real bindings.
+
+  Producibility was checked before the shape was relied on, per the standing
+  warning: `populateIfaceMaps` does
+  `zoneIfaces[zid] = append(zoneIfaces[zid], zone.Interfaces...)` and #4792
+  exists precisely because a zone binds more than one interface. Each member
+  is a separate NIC with its own `unit 0` and its own ifindex; no
+  redundancy-group or reth property is involved, so there is no
+  base-interface constraint to violate (unlike the retired `reth0.50` at RG2
+  beside `reth0.80` at RG1).
+
+  **#7 — the display fallback is unguarded.** CONFIRMED, and wider than
+  filed: replacing `sessionIngressIf`'s zone fallback with `return ""` left
+  the ENTIRE `pkg/cli` package green, not just the two added display tests.
+  Added `TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983`
+  covering the three ways the resolver is asked — identity absent, identity
+  present but unnameable, and zone binding no interfaces — the first two
+  expecting the zone's interface and the third the zone NAME. The fixture
+  builder is parameterised (`ingressIfColumnCLIWith`) so one config drives the
+  precise arm and every fallback arm; the empty `quarantine` zone goes through
+  the real parser and commit, and the builder asserts it survived with zero
+  interfaces, so the last-resort arm is reachable by construction rather than
+  by assumption.
+
+  README: the column's FALLBACK symmetry with the filter is now stated. It
+  previously described only the precise arm, which reads as if a blank column
+  were acceptable for the populations that carry no identity — the exact
+  behaviour the new tests forbid.
+- **File(s)**: pkg/dataplane/bpf_session_value_test.go,
+  pkg/cli/session_filter_ingress_identity_4983_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  userspace-dp/src/session/README.md, _Log.md
+- **Validation**: no production code changed in this round — all three
+  findings were binding/claim gaps. Every cell below ran `go vet` first and
+  got rc 0, so each RED is an assertion failure and not a build break.
+
+  #5 matrix (4 tests x 5 cells). `transpose` is the negative control the
+  finding asked for: `toBPF` writes `uint32(v.IngressVlanID)` and
+  `sessionValue` reads it back symmetrically, the "identical mistake in both
+  directions" a round trip composes away.
+
+  | cell | round trip | offsets | toBPF | lift |
+  |---|---|---|---|---|
+  | baseline | PASS | PASS | PASS | PASS |
+  | delete both directions | FAIL | PASS | FAIL | FAIL |
+  | **transpose both directions** | **PASS** | PASS | **FAIL** | **FAIL** |
+  | delete v4 toBPF only | FAIL | PASS | FAIL | PASS |
+  | delete v4 sessionValue only | FAIL | PASS | PASS | FAIL |
+
+  The transpose row is the whole point: the round trip is structurally blind
+  to it while both direction tests RED (`v4 toBPF().IngressIfindex = 50, want
+  11`). Rows 4 and 5 show each direction test binds its OWN direction. The
+  offsets guard is PASS in every row — it pins layout, not assignment, so the
+  three tests are orthogonal rather than overlapping.
+
+  #8 mutation: delete `resolveEgressIfaces`' precise arm.
+  `TestEgressFIBIdentityDoesNotMatchEgressZoneSibling4983` **FAILS** —
+  "session egresses ge-0/0/1 per its FIB result but matched a filter for
+  ge-0/0/4, the OTHER interface of the same egress zone" plus the v6 sibling
+  assertion — while `TestIngressIdentityDoesNotDisturbEgressMatching4983`
+  stays PASS on all three subtests, which is the recorded evidence that it is
+  an over-reach guard and not a control.
+
+  #7 matrix. Cell A: whole fallback -> `""`. All three new subtests FAIL;
+  `TestShowFlowSessionIngressIfColumnUsesRecordedIdentity4983` and
+  `TestShowFlowSessionEgressIfColumnUnchanged4983` stay PASS — the built-in
+  control showing the new tests reach an arm the existing ones never touch.
+  Cell B: only the final `return zoneName` -> `""`, keeping the zoneIfaces
+  arm. ONLY the zone-with-no-interfaces subtest FAILS; the other two PASS. So
+  each arm is separately bound, not covered as a block.
+
+  A process note worth keeping: the first #5 matrix run was VOID and was
+  discarded, not reported. The probe helper's `restore` branch sat below its
+  own occurrence-count assert, so the assert tripped and the restore never
+  ran; cells 2-4 executed against cell 1's still-mutated tree and printed
+  four identical rows. Four cells agreeing exactly is the tell. Fixed by
+  hoisting `restore` above the assert and scoping the cleanliness check to
+  the mutated paths, then re-running from a verified-clean baseline.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/ -count=2` both ok;
+  `go test ./pkg/refactoraudit/` ok (three test files grew).
+  `git status --short` shows only the four files above.
 ## 2026-08-12 — #4800 fold r5: exact fqName extraction + the open seam named
 
 - **Timestamp**: 2026-08-12
@@ -91591,6 +92140,648 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   docs/session-sync-architecture.md,
   userspace-dp/src/afxdp/session_glue/README.md, _Log.md
 - **Timestamp**: 2026-08-12
+- **Action**: #6928 merge with master (a3f333fc2) — a TEXTUALLY clean merge
+  that did not compile. Recording it because the shape is general, not
+  specific to this PR.
+
+  Only `_Log.md` conflicted; every `.rs` file auto-merged. The merged tree
+  then failed `cargo test --release` with
+  `error[E0063]: missing fields ingress_ifindex and ingress_vlan_id in
+  initializer of entry::SessionMetadata` at
+  `session_glue/newflow_contention_tests.rs:68`.
+
+  Neither side is at fault and neither side's diff overlaps the other's:
+  this PR ADDS two fields to `SessionMetadata`, and master's `3775af5b5`
+  ADDS a whole new file that constructs `SessionMetadata` with a struct
+  literal. Git sees an added field in one file and an added file in another —
+  no textual conflict exists. The incompatibility is in the type system, and
+  only a build can see it. This is the concrete case of "a clean MERGEABLE
+  flag hides a semantic conflict on signature changes": for any PR that adds
+  a required field, widens a signature, or adds an enum variant, `mergeable`
+  and a clean `git merge` are both silent, and the only real check is
+  building the merge result.
+
+  Resolved in the merge commit itself rather than a follow-up, so the merge
+  commit builds and the branch stays bisectable. The value is
+  `ingress_ifindex: 0, ingress_vlan_id: 0`, which is CORRECT rather than a
+  placeholder: the fixture builds a `SyncedSessionEntry`, and a peer-synced
+  session carries no ingress identity by design (an ifindex is node-local, so
+  the originating node's number names a different NIC on the importing node
+  and is deliberately kept off the cluster wire). It matches what
+  `session_glue/tests.rs::test_metadata` already does, and the comment states
+  the reason so the next reader does not "fix" it to a non-zero value.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  _Log.md
+- **Validation**: `_Log.md` union-resolved (4 hunks) and verified
+  STRUCTURALLY, not by keyword — the merged file is a superset of both
+  parents by line multiset, 0 lines of `190ea01fe` and 0 lines of
+  `a3f333fc2` missing. A keyword probe was tried first and matched nothing,
+  which is evidence about the probe and not about the resolve; it was
+  discarded rather than reported as a pass. Anchored marker sweep over the
+  whole tree returns nothing.
+
+  On the merge result: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/` both ok;
+  `go test ./pkg/refactoraudit/` ok; `cargo test --release` in userspace-dp
+  exit 0 — 4279 passed / 0 failed plus 60, 8, 22, 31, 1, 2 passed and 0
+  failed. The shim `.o` and its manifest are NOT touched by this PR
+  (`userspace-xdp/` is unchanged), so no `make generate` is owed.
+## 2026-08-12 — #4983 round 4: fixture realism (#9) + the claim sweep (#10/#11/#12)
+
+- **Timestamp**: 2026-08-12
+- **Context**: a separate Codex leg (`cx6928.log`, DO-NOT-MERGE) pinned
+  `0e5d35f11`, two folds behind. Re-verified every blocking finding at the
+  current head BEFORE acting; three of eight were already closed by later
+  rounds (see below). This entry covers the two items scoped to this agent.
+- **#9 — my own fixture asserted a topology production cannot emit.**
+  `ingress_identity_snapshot` gave `reth0.50` RG 2 while `nat_snapshot`'s
+  `reth0.80` — its SIBLING unit on the same parent 11 — is RG 1. Verified the
+  constraint firsthand rather than taking it on report:
+  `pkg/dataplane/userspace/interfaces.go:214-218` resolves ONE `rg` per base
+  interface (own, else inherited from the RETH parent) and `:302` stamps that
+  single value onto every unit, so two units of one parent cannot differ.
+  Changed to RG 1 and replaced the justification, which had cited reth1.0 — a
+  DIFFERENT base, so not the unit that constrains this one. Behaviour is
+  unchanged because ownership derives from the EGRESS resolution (reth0.80,
+  RG 1), not the ingress unit's RG. The second site (`reth2.70`, parent 7) keeps
+  RG 2 and now says WHY that one is producible: it is the only unit on its
+  parent, so there is no sibling to conflict with.
+  A fixture change owes a fresh mutation check, so the F3 guard was re-proven
+  RED against the corrected fixture (`left: 0, right: 11`), not assumed.
+- **Claim sweep, done as one pass** (the class clusters — this is the second
+  PR in a row where it held):
+  - **#10** `session/README.md`: "the filter and the displayed interface name
+    cannot disagree" is true only for a non-zero, nameable identity. On the
+    fallback the filter considers EVERY zone interface while the display uses
+    the first, so a zero-identity row in zone `[A,B]` is selected by
+    `interface B` and prints `If: A`. Scoped, with the divergence named.
+  - **#11a** `session/entry.rs`: the reverse companion's zero was justified as
+    "the forward flow's egress interface is not resolved at install time".
+    False — the installed decision already carries `egress_ifindex`. The real
+    reason is that the forward egress PREDICTS where the reply will arrive
+    rather than observing where it did, and routing may be asymmetric.
+  - **#11b** "0 = untagged" is not synonymous: a priority-tagged frame carries
+    VID 0 with the tag present (`afxdp/frame/prop_tests/inspect.rs`). Reworded
+    to "no VLAN id recorded" with the caveat.
+  - **#11c** "the two policy-admitted install sites" — the LocalDelivery install
+    also runs for a `JunosHostLocalPolicy::NoMatch` host-bound flow, admitted by
+    the zone's host-inbound set with no junos-host policy matching. Corrected in
+    `entry.rs` and `README.md`.
+  - **#12a** `pkg/dataplane/types.go` still described the C/Rust layout as 128
+    bytes and the over-size as "exactly eight". Corrected to 144 (v4,
+    post-#4983) and to "whatever the sync-only trailing fields sum to". Swept
+    for other instances of the stale number: this was the only surviving one.
+  - **#12b** the same file called REST show/clear "approximate". `pkg/api/
+    sessions.go:783` REJECTS a filtered clear with HTTP 400 rather than
+    degrading it, so there is no approximate REST clear. Corrected at both
+    copies.
+  - **#12c** (pre-#4983 mixed-helper population conflicting with the ABI note)
+    was already fixed in round 2 — verified present, not re-done.
+- **Validation**: `cargo test --release` rc=0, 4261 passed / 0 failed;
+  `go test ./pkg/cli/... ./pkg/dataplane/...` rc=0. `rustfmt --check` clean on
+  the two touched .rs files; `gofmt -l` clean on `types.go`.
+- **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  pkg/dataplane/types.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6928 (#4983) round 4 — hostile re-gate MERGE-NEEDS-MINOR at
+  6eca116db. B1 (blocking, second limb: a guard unable to fire) plus B2/B3/B4
+  and five cheap items. One production change: four compile-time offset
+  assertions. Everything else is claim correction.
+
+  **B1 — the Rust half of the ABI offset guard did not exist.** CONFIRMED
+  FIRSTHAND before writing anything: swapping the declaration order of
+  `ingress_ifindex` / `ingress_vlan_id` in BOTH `BpfSessionValueV4` and
+  `BpfSessionValueV6` puts the u16 at 136/184 and the u32 at 140/188 while
+  `size_of` stays 144/192, so `bpf_conntrack_struct_sizes_match_c` reports
+  **ok** and the crate suite passes. The Go half genuinely binds; only the
+  Rust side was open, and its consequence is the helper writing the VLAN id
+  where Go reads the ifindex — `{ifindex 24, VLAN 80}` becomes
+  `IngressIfindex=80, IngressVlanID=24`, the name lookup misses and every row
+  degrades to the zone, or names the WRONG NIC on a box that really has an
+  ifindex 80. Fixed with four `const _: [(); N] = [(); offset_of!(..)]`
+  assertions beside the structs, the same idiom `UserspaceDpMeta` already uses.
+
+  ONE CORRECTION TO THE FINDING, measured not argued: the transposed tree did
+  NOT come back fully green for me. `slowpath::tests::enqueue_refuses_frame_
+  above_live_mtu` failed once with "slow-path worker is not running". That is
+  a worker-startup flake under parallel load, not a layout consequence: on the
+  SAME transposed tree the test passes 6/6 when run alone, each run verified
+  to have actually executed (`ran=1`, verdict `ok`) rather than filtered out.
+  Reported rather than quietly folded, because "the whole suite stayed green"
+  is the evidence B1 rests on and it was 4278/1 here, not 4280/0.
+
+  **B2 — the retracted reverse-companion reason survived in 7 places.**
+  Verified all seven verbatim first; the brief was accurate. Also verified the
+  CORRECTION before propagating it into a shipped ABI header:
+  `ForwardingResolution::egress_ifindex` really is populated by the FIB,
+  local-delivery and fabric resolvers, and the reverse install sits in the same
+  scope as the forward decision — so "not resolved at install time" is false,
+  and the true reason is that the forward egress PREDICTS where the reply will
+  arrive rather than recording where it did (and routing may be asymmetric).
+  One phrasing now used at all eight sites (the seven plus the entry.rs SSOT,
+  whose parenthetical had become unreadable).
+
+  **B3 — a false universal at three sites.** Verified both counter-examples
+  carry `is_reverse: false` with `ingress_ifindex: 0`: `tunnel.rs` (literal
+  `is_reverse: false`) and `session_sync.rs` (`is_reverse: req.is_reverse`, so
+  a forward import lands there). Reworded to "every forward session installed
+  FROM A RECEIVED FRAME — the three frame-driven install sites", and both
+  counter-examples are now named as instances of the rule rather than
+  exceptions to it: neither has an observed local ingress to copy.
+
+  **B4 — the enumeration omitted fabric ingress**, the one population where
+  the zone and the ifindex name DIFFERENT interfaces. Verified the mechanism
+  (`poll_stages.rs` parses a zone-encoded override; `forwarding/mod.rs` gives
+  it precedence over the ifindex->zone map) and the inertness claim: the
+  fabric member appears in `docs/ha-cluster-userspace.conf` only under
+  `fab0 { fabric-options { member-interfaces { ge-0/0/0; } } }` with NO unit,
+  and the name map keys on `{parent ifindex, unit VLAN}`, so it has no entry
+  and the lookup falls back to the zone. Documented in entry.rs, types.go
+  (both families) and the README, including what changes if that member is
+  ever given a unit — and that the path is unreachable from the shipped
+  topology rather than merely uncovered, which is why no test or smoke sees it.
+
+  **Cheap items, each verified rather than taken on trust.** The shim steering
+  key: compiled the `#[repr(C)]` shape standalone, `size=40 align=2`, so
+  README's "36-byte key" is corrected to 40. The tail pad: 4 and 2 are the same
+  layout described from either end (the append grew the struct 136->140->144, a
+  4-byte pad; the u16 lands inside it at 140, leaving 2 unused), now stated once
+  in the header so a reader diffing it against `bpf_map_tests.rs` does not read
+  one as a bug. `cli_clear.go`: the peer-clear call is at :251, cited as :252
+  at two sites. The ABI remediation: `dataplane.Cleanup()` is reachable only
+  from the `xpfd cleanup` subcommand (`cmd/xpfd/main.go`), so "a full dataplane
+  reload" was wrong — a bpffs pin outlives the process, and a restart leaves
+  the old-size pin in place for the pre-flight to refuse again. Corrected at
+  three sites. And `session_sync.rs`, the only zero site with no rationale,
+  now has one.
+
+  NOT fixed here, by instruction: the #1917 in-place `xpfd upgrade` path
+  appears not to call `Cleanup()`, so an ABI flag day may not release the pin
+  on that path. The maintainer is filing it separately.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/server/helpers/session_sync.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  bpf/headers/xpf_conntrack.h, pkg/dataplane/types.go,
+  pkg/cli/session_filter.go, _Log.md
+- **Validation**: B1 is a two-cell proof, and the RED is a BUILD failure at the
+  assertion rather than a test failure.
+
+  GREEN cell — assertions present, layout untouched: `cargo build --release`
+  exit 0, zero errors. That is also the evidence the asserted numbers are the
+  real ones rather than copied hopefully from the C header.
+
+  RED cell — same tree, the two fields' declaration order swapped in both
+  structs: exit 101, and the ONLY errors are the four assertions, each naming
+  its field and both offsets:
+
+      error[E0308]: mismatched types
+        --> src/afxdp/bpf_map/mod.rs:292:22
+      expected an array with a size of 136, found one with a size of 140
+      expected an array with a size of 140, found one with a size of 136
+      expected an array with a size of 184, found one with a size of 188
+      expected an array with a size of 188, found one with a size of 184
+
+      error: could not compile `xpf-userspace-dp` due to 4 previous errors
+
+  Four errors, four assertions, no incidental breakage — the guard fires for
+  the reason claimed.
+
+  A harness note worth keeping: the first restore wiped the new assertions.
+  The probe restored with `git checkout --`, which reverts to HEAD, and the
+  assertions were uncommitted work in the same file — the documented
+  restore-from-HEAD trap, hit anyway. Rewritten to restore from a
+  pre-mutation snapshot and to assert afterwards that BOTH the two field
+  declarations and the four assertions are present, so a restore that
+  silently drops the fold's own edits fails loudly instead.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/` both ok;
+  `go test ./pkg/refactoraudit/` ok; `cargo test --release` exit 0 —
+  4279 passed / 0 failed plus 60, 8, 22, 31, 1, 2 passed and 0 failed.
+  `userspace-xdp/` is untouched, so the shim `.o` and its manifest are
+  unchanged and no `make generate` is owed.
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6928 round 4b — the bpffs-pin remediation correction reaches the
+  OPERATOR-FACING string. r4 fixed the claim in four comments; this fixes it
+  where an operator actually reads it, plus the doc the message points them at,
+  plus the two assertions that were defending the wrong text.
+
+  `pkg/dataplane/loader_userspace_shim.go` printed, on a live-pin ABI refusal:
+
+      Do a FULL dataplane reload (stop xpfd so the old pin is released,
+      then start it to load the new shim), accepting brief downtime
+
+  That instruction does not work, and the mechanism was verified rather than
+  inferred: releasing a pin means UNLINKING it, which is `Cleanup()` in
+  `loader.go:1245` doing `os.RemoveAll(bpfPinPath)`, and `Cleanup()` is
+  reachable only from the `xpfd cleanup` subcommand (`cmd/xpfd/main.go:213`).
+  A bpffs pin outlives the process that created it. So an operator hitting the
+  refusal, following our message, stops xpfd, starts it, and hits the identical
+  refusal — mid-upgrade, with the dataplane down. That is materially worse than
+  an inaccurate comment, which is why it is folded here rather than left with
+  the behavioural half (#6978, the question of whether the #1917 in-place
+  `xpfd upgrade` path calls `Cleanup()` at all).
+
+  Message now names the mechanism and states plainly that a restart is not
+  enough, kept short because it is read mid-incident.
+  `pkg/dataplane/README.md:328` carried the same instruction — and is the
+  document the message cites — so it is corrected too, with the reason recorded
+  so it is not re-simplified back to "a reload".
+
+  **The two assertions were defending the text, not the behaviour.**
+  `stalepin_remediation_5363_test.go:105` required the phrases
+  `"FULL dataplane reload"`, `"stale pin"`, `"released"`. Every one of those was
+  satisfied by the broken instruction — a phrase-presence assertion cannot tell
+  a correct instruction from an incorrect one. Replaced with the two properties
+  that make the message USEFUL: it names `xpfd cleanup`, and it says a restart
+  does NOT release the pin. The reasoning is written into the test so the next
+  person does not restore the old phrase to satisfy a string match.
+
+  The negative case at `:145` asserted the SSOT-drift path does not contain
+  `"FULL dataplane reload"`. That phrase no longer exists anywhere, so as
+  written the guard had become a no-op that could never fire again — a rewording
+  of the OTHER message silently retired it. Now pins the CONSTANT
+  (`userspaceShimStalePinRemediation`), which survives any rewording of either
+  message, plus a second assertion that the drift path must not tell the
+  operator to `xpfd cleanup` — that is destructive and wrong for a drift that
+  `make generate-userspace-xdp` fixes in place.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go, pkg/dataplane/README.md,
+  _Log.md
+- **Validation**: two cells, each an assertion RED with `go vet` rc 0 first, and
+  the partition is exclusive — each cell reds exactly one test while the other
+  stays GREEN as its control.
+
+  | cell | SSOT-drift test | live-pin test |
+  |---|---|---|
+  | baseline | PASS | PASS |
+  | restore the OLD wording verbatim | PASS | **FAIL** |
+  | mis-wire the stale-pin remediation into the SSOT-drift site | **FAIL** | PASS |
+
+  Cell 2 reds with the pasted operator text and names what is missing:
+  "remediation must name `xpfd cleanup` — the only path that unpins bpffs state
+  and therefore the only thing that clears this refusal", on both subtests
+  (cpumap-genuine-valuesize-break and dnat-table-live-pin-drift).
+
+  A discarded cell, recorded because scoring it would have been wrong: my first
+  mis-wire swapped every `userspaceShimGenerateRemediation` use site at once
+  (10 of them) and produced `go vet` rc 1 — a BUILD break, not an assertion RED,
+  so the cell proves nothing. Re-run against exactly ONE site (the ValueSize
+  drift arm at `:390`), which is the edge of the claim, and it reds cleanly with
+  vet at 0.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/` both ok;
+  `go test ./pkg/refactoraudit/` ok. No Rust and no shim artefact touched.
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 r6 — the stale-pin remediation was wrong in the OPPOSITE
+  direction from the one r5 fixed, and the test that was supposed to prevent
+  that inherited the same blind spot.
+  r5 replaced "a reload releases the pin" (nothing does) with "restarting xpfd
+  does NOT release it; run `xpfd cleanup`". Also false. Verified firsthand:
+  `Manager.Teardown` (loader.go) is `m.Close()` then `return Cleanup()`, and
+  `daemon_run_shutdown.go` calls `d.dp.Teardown()` on every NON-hitless
+  shutdown ("HA shutdown: tearing down BPF state") while only the HITLESS arm
+  takes `d.dp.Close()` ("preserving BPF state"). So `dataplane.Cleanup()` has
+  TWO production callers, not one, and whether a restart clears the pin is
+  MODE-DEPENDENT. The r5 message pointed the operator at a destructive action
+  (`xpfd cleanup` additionally GCs every pinned dataplane map AND clears the
+  FRR managed routes, cmd/xpfd/main.go), understated what it destroys, and did
+  so in a mode where a plain restart would have sufficed — mid-upgrade, with
+  the dataplane down.
+  Fixed: the message now states the mode dependency and leads with the TARGETED
+  recovery (unlink the one named pin, docs/operations/userspace-shim-pin-
+  recovery.md — which already documented exactly that and was never referenced)
+  before naming `xpfd cleanup` and what else it takes. `types.go:138` and
+  `:386` ("Cleanup() is reachable only from the `xpfd cleanup` subcommand")
+  corrected at both sites. `pkg/dataplane/README.md` carried the same false
+  paragraph and is corrected. The runbook gains the `xpfd cleanup` scope note
+  and the mode dependency.
+  **Why nothing caught it.** `stalepin_remediation_5363_test.go:117` asserted
+  SUBSTRINGS. A phrase-presence assertion is satisfied identically by a correct
+  and an incorrect instruction — it defends the text, not the behaviour. That
+  is how the r4 wrong message passed and how r5's replacement inherited the
+  blind spot: the block was rewritten to require "restarting xpfd does NOT
+  release" / "OUTLIVES the process", locking in the new wrong claim.
+  The false claim is a CALL-GRAPH claim, so the binder is a call-graph check —
+  the same kind of fact, not a proxy. `cleanup_reachability_6928_test.go`
+  parses the repo (go/ast, non-test files) and pins the production caller set
+  of `Cleanup()` to exactly {cmd/xpfd/main.go:main, loader.go:Teardown}, with a
+  zero-caller arm that DIAGNOSES a broken walk (it is not a vacuity guard —
+  the exact comparison is against a nonempty want, so an empty result already
+  reds; corrected in r6 after this entry claimed otherwise) and a second
+  assertion that >= 2 callers exist, so a collapse back to the single CLI
+  caller reds and forces the wording to be revisited. A companion asserts both
+  shutdown arms (`d.dp.Close()` / `d.dp.Teardown()`) are still WRITTEN in
+  daemon_run_shutdown.go. Scope of that companion, corrected in r6: it is a
+  substring check on the file text, so it proves the call expressions are still
+  present — NOT which branch each sits in, and not that either is reached
+  rather than sitting in a comment. It narrows the dead-code gap; it does not
+  close it. The caller-set test likewise pins WHO calls Cleanup(), not mode
+  placement or reachability — the honest limit of a call-graph instrument, now
+  stated in the test doc rather than implied.
+  The phrase-presence block is replaced by a NEGATIVE on the two claims the
+  code disproves ("restarting xpfd does NOT release", "reachable only from").
+  RED-first, both verified: severing `Teardown` -> `Cleanup` reds the
+  caller-set test with `got: cmd/xpfd/main.go:main` vs the 2-entry want;
+  restoring the disproven phrase into the message reds
+  TestLivePinABIMismatchUsesStalePinRemediation at
+  "remediation restored the categorical claim". Production restored and
+  verified clean after each.
+  The SSOT-drift negatives (`:173` on the CONSTANT, `:178` on `xpfd cleanup`)
+  were checked for the vacuity trap and both still fire: `:173` keys on the
+  constant so it survives any rewording, and `:178` keys on the action name,
+  which the new message still contains.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/... ./pkg/daemon/...
+  ./pkg/cli/...` rc=0, all 7 packages ok. `gofmt -l` clean on all four touched
+  Go files. NOT reformatted: pkg/dataplane/constants.go and
+  bpf_session_value_test.go are gofmt-dirty at the PR head already and are
+  untouched here.
+  NOT in scope, per the dispatch: the C-mirror ABI offset pinning gap.
+  Advances #4983.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/types.go,
+  pkg/dataplane/README.md, pkg/dataplane/stalepin_remediation_5363_test.go,
+  pkg/dataplane/cleanup_reachability_6928_test.go,
+  docs/operations/userspace-shim-pin-recovery.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 claim pass, item 4 of 4 ("VLAN 0 = untagged"). The other
+  three are NOT done — see the stopping note below.
+  Verified before rewriting, and all three cites in the brief were wrong:
+  `types.go:169` is the REST-clear-rejection note, not a VLAN claim;
+  `userspace-dp/src/inspect.rs` does not exist (the file is
+  `userspace-dp/src/afxdp/frame/inspect.rs`); and the claim occurs at SIX
+  sites, not three.
+  The claim IS false. `IngressVlanID` / `ingress_vlan_id` stores a BARE VID, so
+  0 covers both an untagged frame and an 802.1p priority-tagged one (a real
+  802.1Q tag with VID 0 and PCP/DEI set). The in-repo counterexample is
+  `userspace-dp/src/afxdp/README.md:603-607`, which documents that the TX side
+  deliberately emits a tag on PRESENCE via `TxVlanTag` (#2149) precisely so a
+  priority-tagged VLAN-0 frame does not collapse to untagged — so the case is
+  real and handled elsewhere in the same crate, and only the session row
+  cannot distinguish it. A consumer reading "0 = untagged" would conclude such
+  a session arrived untagged, which is wrong.
+  Corrected at all six: `pkg/dataplane/types.go` (x2, v4 + v6),
+  `pkg/dataplane/bpf_session_value.go` (x2), `bpf/headers/xpf_conntrack.h`,
+  and `userspace-dp/src/afxdp/bpf_map/mod.rs` (x2). Each now says 0 means the
+  VID was zero — untagged OR priority-tagged — and that the row does not
+  distinguish them, naming the TX-side contrast. Residual sweep for
+  "0 = untagged" across those trees returns nothing.
+  Doc comments only; no behaviour change. The Rust edit sits directly above
+  the compile-time `offset_of!` ABI assertions, so `cargo check --all-targets`
+  was run rather than assumed: rc=0, zero errors.
+  **Stopping note.** Items 1-3 (session/README.md:1011 vs :1021;
+  `types.go:150` "locally-owned rows are exact"; the three "pre-#4983 helper"
+  sites) are NOT started. Having found every cite in this item wrong, each
+  remaining item needs a full independent derivation rather than a
+  verification of a supplied trace — roughly double the estimated work. Three
+  more at this depth is where the risk of writing a confident wrong sentence
+  becomes real, in a PR whose entire subject is wrong sentences. Left for a
+  fresh pass with the corrected expectation that the cites need re-deriving.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/` rc=0;
+  `cargo check --all-targets` rc=0; `gofmt -l` clean on both touched Go files.
+  Advances #4983.
+- **File(s)**: pkg/dataplane/types.go, pkg/dataplane/bpf_session_value.go,
+  bpf/headers/xpf_conntrack.h, userspace-dp/src/afxdp/bpf_map/mod.rs, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 — adjudicate the "exact for rows this node owns" claim on
+  the session ingress identity. Verdict: it does NOT hold as written; narrowed
+  at both sites. Doc/comment only, no behaviour change.
+  Sweep first (cites are topic pointers, not lines): the claim restates at
+  exactly TWO sites, `pkg/dataplane/types.go:155` and `:410` (v4 + v6), with a
+  companion "exact where this node is the authority" at `:165`/`:420`. No Rust
+  or C restatement — the Rust mirror documents the FIELD, not the resolver's
+  exactness, so this one is Go-only. Count matched the brief this time.
+  The mechanism: `sessionFilter.resolveIngressIfaces`
+  (pkg/cli/session_filter.go:456) returns ONE name only on a hit in
+  `ifaceNamesByKey`, else falls back to `zoneIfaces[ingressZone]`. That map is
+  rebuilt per query by `buildSessionEgressIfacesWithLookup`
+  (pkg/cli/session_display.go:44) from the CURRENT config and the CURRENT
+  kernel ifindex — while the row's ifindex was recorded at INSTALL.
+  Three shapes tested:
+  1. UNNAMEABLE ifindex — non-zero but no current config unit (unit deleted
+     since install, tunnel/fabric ingress). MISSES, falls back to the zone.
+     Approximate, not exact. The resolver's own doc comment states this
+     (session_filter.go:450-455). CLAIM FALSE.
+  2. RECYCLED ifindex — the kernel reassigns an index over the node's
+     lifetime, so a stale ifindex can HIT a key now owned by a DIFFERENT
+     interface. Worse than approximate: one confident WRONG name instead of a
+     zone list. CLAIM FALSE.
+  3. NON-VLAN UNIT — the brief's "unit-0 collapse" hypothesis is REFUTED.
+     `sessionDisplayVLANID` falls back to `unit.Number` when `VlanID == 0`, so
+     units do NOT collide onto `{ifindex, 0}`. But that same fallback creates a
+     different gap: the map keys a unit under `vlan-id` ELSE `unit number`,
+     while the row carries the VID OBSERVED ON THE WIRE. They agree only when
+     unit number == vlan id, or both are 0. A unit with a populated number
+     whose traffic is untagged keys 0 on the wire and `number` in the map, and
+     misses. The function's own doc acknowledges the config "may only populate
+     one of them". CLAIM FALSE, by a different mechanism than the brief's.
+  Narrowed both sites to state the precondition (exact only on a hit against a
+  currently-configured unit) and enumerate the three shapes, including the
+  collision the map DOES avoid, so the refuted hypothesis is not re-derived.
+  Nothing behavioural touched; the recycled-ifindex shape is a real correctness
+  wrinkle in an operator-facing filter, but fixing it is a different PR and was
+  not in scope — reported rather than acted on.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/ ./pkg/cli/`
+  rc=0; `gofmt -l` clean. Advances #4983.
+- **File(s)**: pkg/dataplane/types.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 / #6928 — two claim derivations. Both cite lists were treated
+  as pointers to a topic and re-resolved against the head; both counts were
+  short, and one of the two supplied "correct accounts" was itself defective.
+  ITEM 1 — the `session/README.md` internal contradiction is REAL, and the
+  passage at `:1012` ("the two diverge by construction") is the CORRECT one.
+  Derived from types, not prose: the FILTER's `zoneIfaces` is
+  `map[uint16][]string` built with `append(zoneIfaces[zid], zone.Interfaces...)`
+  (`session_filter.go`, `populateIfaceMaps`) and its fallback returns EVERY
+  bound interface; the DISPLAY's is `map[uint16]string` built with
+  `zone.Interfaces[0]` (`cli_show_flow.go`) and its fallback returns the FIRST,
+  else the zone name. `cli_show_flow.go` states the split itself where it builds
+  them ("rather than the single-first-interface zoneIfaces built above for
+  display ... stay display-only"). So the passage at `:1021` — "the same
+  degradation `resolveIngressIfaces` applies" — is false and has been replaced.
+  Two consequences the old text hid, now documented: a zone binding NO interface
+  gives the filter an empty slice, so `ifaceMatchesAny` is false and no
+  interface filter selects that row at all while the column prints the zone
+  NAME (not an interface name, and not typeable back into the filter); and the
+  display chain is pinned by
+  `TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983` while
+  nothing pins agreement, because there is none. Kept `:1012` verbatim — a
+  claim mis-triaged as wrong is a better outcome than a correct sentence
+  rewritten into a wrong one.
+  ITEM 2 — the reference account at `README.md:1094` is CORRECT IN SUBSTANCE
+  but carried a defect of its own, which is the more interesting half. Its
+  conclusion holds: `sessions`/`sessions_v6` are both in
+  `userspaceShimSharedMapSpecs`, `userspaceABICheckedPinnedMaps` unions that
+  into the checked set, `userspaceMapABIDiff` compares `ValueSize`, and
+  `validateUserspaceShimLivePins` returns an error on a diff — so no path
+  delivers old-format rows to a new reader. But it named the remediation "full
+  dataplane reload", and `loader_userspace_shim.go:37-39` says in terms that "a
+  reload ... never releases a pin at all" — the exact wording #6928 r5 already
+  corrected once. `entry.rs` carried the OPPOSITE superseded form ("NOT a
+  restart"), which the same comment records as equally false: a NON-hitless HA
+  shutdown calls `Manager.Teardown` -> `os.RemoveAll(bpfPinPath)`, so there a
+  restart does suffice. `pkg/dataplane/types.go` already had the fully corrected
+  mode-dependent account, so that is the reconciliation target rather than
+  `:1094` verbatim.
+  Site count: briefed as three, the sweep found FIVE asserting the stale
+  "pre-#4983 helper" population, and BOTH omissions were in the Rust mirror
+  (`afxdp/bpf_map/mod.rs:187` and `:257`, the v4/v6 twins) — the same shape as
+  the other lane's finding on the previous item, where a Go-side sweep
+  structurally cannot reach. Four test-comment restatements were found on top of
+  that. All nine reconciled to the `types.go` account; every surviving
+  `pre-#4983` mention in Go/Rust/C/docs is now either a NEGATION or a corrective
+  note, except two behaviour-parity references (`tests_session_ingress_identity.rs`,
+  `bpf_map_tests.rs`) that describe pre-#4983 BEHAVIOUR rather than a live
+  population and are correctly untouched.
+  The replacement third population is the HOST-OUTBOUND GRE path
+  (`afxdp/tunnel.rs`) — self-originated traffic off the TUN device with no
+  ingress binding to record — which is a real 0-carrying case per the README's
+  own enumeration, so the lists stay at three rather than shrinking to two.
+  Doc/comment only: no behavioural change, and none was found to be needed.
+  Validation: `go build ./...` rc=0; `go vet ./pkg/cli/... ./pkg/dataplane/...`
+  rc=0; `gofmt -l` clean on all touched Go files; `go test ./pkg/cli/...
+  ./pkg/dataplane/... -count=1` rc=0 (5 packages ok); `cargo test --release`
+  rc=0 (7 suites, 4406 passed, 0 failed) — run because Rust doc comments and a
+  shared C header comment changed.
+  Advances #4983.
+- **File(s)**: userspace-dp/src/session/README.md, userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs, bpf/headers/xpf_conntrack.h,
+  pkg/cli/session_filter.go, pkg/cli/session_filter_ingress_identity_4983_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go, docs/session-sync-architecture.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-13
+  **Action**: #4983 review round 6 (Codex MERGE-NEEDS-MAJOR at c0b7b4f2e) —
+  claim corrections only; ZERO behavioural change (every changed line in every
+  file is a comment, verified mechanically: `git diff -U0` minus comment-prefixed
+  lines is 0 for all five production files and all five test files).
+
+  **F1, the self-contradiction this PR introduced.** `pkg/dataplane/types.go`
+  narrowed the exactness claim on locally-owned rows at `:155` (exact ONLY for a
+  row whose {ifindex, vlan} names a currently-configured unit; three local shapes
+  besides peer rows are approximate) and then REASSERTED the superseded form 27
+  lines later at `:182`: "it is exact where this node is the authority". Both
+  twins. The counterexample is the recycled-ifindex bullet the same block already
+  carries: a row installed for interface A as {17, 0}, A removed, the kernel
+  reuses 17 for a configured B, the per-query `ifaceNamesByKey` maps the old row
+  onto B, and filter AND `If:` column report B — a confident WRONG name on a row
+  this node owns outright. Rewritten to say local authority buys exactness only
+  for the nameable subset, and to keep the two-sided bound (the clear path also
+  leaves this node, #6975). Same failure shape as the `session/README.md`
+  contradiction this PR already resolved once.
+
+  **F2 — mis-triaged, corrected in the doc rather than accepted.** Codex reported
+  a THIRD undocumented shape: a valid non-VLAN unit (`ge-0/0/0 unit 3`, no
+  `vlan-id`) binding child netdev `ge-0-0-0.3` and installing `{child-ifindex, 0}`
+  against the CLI's `{parent-ifindex, 3}`. Verified firsthand and the MECHANISM is
+  wrong: the row carries the PARENT ifindex, not the child. `meta.ingress_ifindex`
+  is the physical AF_XDP bind — `forwarding_build/interfaces.rs:292` keys
+  `ingress_logical_ifindex` as `(bind_ifindex, vlan_id) -> iface.ifindex` with
+  `bind_ifindex = parent_ifindex` for every unit row, so the logical child index
+  is what the map resolves TO, never what the row carries (`poll_descriptor`
+  itself calls it "the raw physical `meta.ingress_ifindex`"). Only the VLAN half
+  diverges — and that shape is ALREADY the third documented bullet ("a unit whose
+  number is populated and whose traffic is untagged keys 0 on the wire and
+  `number` in the map, and misses"). The doc listed three shapes, not two. Rather
+  than leave a bullet a reader can misread the same way twice, the bullet now
+  names the concrete config (`ge-0/0/0 unit 3`) and states explicitly that BOTH
+  sides key the physical parent, so nobody goes hunting for a `ge-0-0-0.3` ifindex
+  that is not in the row.
+
+  **F3 — a filter description that was false.** `cli_show_flow.go` and its test
+  preamble said an `interface` filter "would select exactly / precisely the
+  sessions that arrived" there. `matchesV4`/`matchesV6` OR the ingress and egress
+  arms (`!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)`,
+  session_filter.go:269), so a session that arrived on A and EGRESSES B matches a
+  filter for B. The OR is intentional — an operator naming an interface wants
+  flows crossing it in either direction — so the sentence was fixed, not the
+  behaviour, and both sites now name the OR and note it is also why the column can
+  legitimately print a name other than the one filtered on.
+
+  **F4 — superseded accounts still restated, swept across Go, Rust and C.** The
+  count "seven" was not trusted; the sweep found eight, and the sharpest was the
+  cross-language mirror again:
+  - `session/README.md` ABI note still said "Note it is NOT a restart ...
+    `Cleanup()` is reachable only from the `xpfd cleanup` subcommand" — 35 lines
+    AFTER the corrected mode-dependent account in the SAME file, and exactly the
+    categorical claim r5 was reverted for. Replaced with the targeted single-pin
+    remediation plus the mode-dependence, and an explicit "do not restate it here"
+    with the pointer to `cleanup_reachability_6928_test.go`.
+  - `bpf/headers/xpf_conntrack.h:91` still equated VID 0 with untagged. The v6
+    twin (`:172`) and the Go/Rust mirrors were corrected in earlier rounds; this
+    one was missed. Now carries the priority-tagged case and cites the in-tree
+    counterexample (`frame/prop_tests/inspect.rs`, real tag, PCP 5, VID 0).
+  - `poll_descriptor/mod.rs` and `tests_session_ingress_identity.rs` called the
+    other two producers "policy-admitted". A host-bound SYN can take
+    `JunosHostLocalPolicy::NoMatch` and be admitted solely by the zone's
+    host-inbound set. Both now say FRAME-DRIVEN and name the exception.
+  - `session/README.md:972` said only three install sites ever write the conntrack
+    map. A peer-synced row reaches it Go-side:
+    `SetClusterSyncedSessionV4`/`V6` -> `bpfShim.SetSessionV4`/`V6` ->
+    `m.maps["sessions"].Update`. The claim is now scoped to the HELPER's three
+    publication sites, with the Go writer named.
+  - `session/README.md:1025` said the zero/unnameable populations remain
+    selectable, while `:1043` correctly said a zero-interface zone yields an empty
+    slice and no match. Scoped to "where the ingress zone binds at least one
+    interface", pointing at the consequence below. The same unqualified claim in
+    `pkg/cli/session_filter.go`'s `resolveIngressIfaces` doc got the same clause.
+  - `pkg/dataplane/README.md:372`, `stalepin_remediation_5363_test.go:15`/`:30`,
+    and `userspace_shim_loader_test.go:259` still labelled the constant
+    "full-reload"/"full-dataplane-reload" remediation. Since #6928 the constant is
+    the TARGETED single-pin unlink; nothing in the product reloads a bpffs pin, so
+    the label named an action no operator can perform. All four now say stale-pin
+    and name the constant.
+
+  **F5 — two of my own artefacts, both corrected.**
+  - `cleanup_reachability_6928_test.go:137` claimed the zero-caller arm stopped
+    the rest passing "vacuously". PROVEN FALSE firsthand: with that arm disabled
+    (`if false &&`) and `got` forced to nil, the test still fails at the exact
+    comparison — `production callers of Cleanup() changed. got: <empty> want:
+    cmd/xpfd/main.go:main, pkg/dataplane/loader.go:Teardown`. The arm is a
+    DIAGNOSTIC (it names a broken walk instead of showing a zero-vs-two diff that
+    reads as deleted call sites), so the arm was kept and the claim rewritten.
+    Probe reverted via Edit, file restored byte-identical, suite re-run green.
+  - Two `_Log.md` claims from the r5 entry overstated the companion: the same
+    vacuity claim, and "so `Teardown` cannot become dead code". The companion is a
+    substring check on `daemon_run_shutdown.go`, so it proves the two call
+    expressions are still WRITTEN there — not which branch each sits in, and it
+    would be satisfied by the text appearing in a comment. Corrected in place.
+
+  **Honest limit now stated, not implied.** The caller-set check pins WHO calls
+  `Cleanup()` — the exact direct-caller set — and NOT mode placement or
+  reachability. A call-graph instrument cannot express reachability. That limit,
+  and the substring companion's narrower one, are now in the test doc rather than
+  left for the next reviewer to rediscover; the companion's own doc no longer
+  claims to close the dead-code gap, only to narrow it.
+
+  Validation: `gofmt -l` clean on every file touched (the eight files gofmt still
+  lists are unformatted at HEAD too, none of them touched here); `go build ./...`
+  exit 0; `go vet ./pkg/dataplane/... ./pkg/cli/...` exit 0; `go test -count=1
+  ./pkg/dataplane/... ./pkg/cli/...` all ok (dataplane 2.9s, userspace 17.3s, cli
+  4.1s); `cargo check --all-targets` exit 0; the five `tests_session_ingress_identity`
+  binding tests 5 passed / 0 failed. No test assertion was changed anywhere, so no
+  fail-on-revert is owed for this round — the only RED run was the F5-a probe
+  above, which exists to prove the claim I wrote is true.
+  Advances #4983.
+- **File(s)**: pkg/dataplane/types.go, pkg/dataplane/README.md,
+  pkg/dataplane/cleanup_reachability_6928_test.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go,
+  pkg/dataplane/userspace_shim_loader_test.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go, pkg/cli/session_filter.go,
+  bpf/headers/xpf_conntrack.h, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-08-12
 - **Action**: #5561 round 21b — the master merge was NOT semantically free, and
   a clean textual merge hid it.
 
@@ -91880,6 +93071,84 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13
+- **Action**: #4983 round 7 (PR #6928) — three prose claims this PR asserts were
+  FALSE, and one of them was refuted by the same round's own derivation. Every
+  one was falsified by CONSTRUCTING the case first, never by taking the review
+  at its word.
+- **CLAIM 1, `session/README.md` + `session_filter.go`: "a zone binding NO
+  interface ... no interface filter selects that row at all."** Refuted with no
+  edit required. `matchesV4`/`matchesV6` reject only when BOTH arms miss
+  (`!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)`), so an empty ingress
+  slice removes ONE route in, not the row. New
+  `TestInterfaceFilterReachesRowViaEgressArm6928` builds exactly the described
+  row — ingress zone `quarantine` (binds nothing), ingress identity 0, egress
+  `lo.80` — and `show security flow session interface lo.80` selects it, with a
+  negative control (`ge-0/0/8.0`) selecting nothing. Both README sites and the
+  `resolveIngressIfaces` comment now say "lost route in", and name the real
+  unreachability condition: both arms empty.
+- **CLAIM 2, "the caller test stops the categorical wording coming back
+  green."** Refuted by substitution: rewriting the remediation to "A plain
+  restart ALWAYS releases this pin, on every shutdown path" — categorically
+  false, false in the OPPOSITE direction from the two banned literals — left the
+  whole `./pkg/dataplane/...` suite green. A guard over two strings constrains
+  VOCABULARY, not the claim, and no test can decide whether English describes a
+  code fact. Did NOT add a third literal. The two facts underneath are now bound
+  instead, and the vocabulary check is labelled as one where it lives.
+- **CLAIM 3, "the filter and the displayed interface name cannot disagree" for a
+  non-zero nameable identity.** False with no fallback anywhere: a session
+  arriving on `lo.50` and egressing `lo.80`, both stamped and both nameable, is
+  selected by `interface lo.80` through the egress arm and prints `If: lo.50`.
+  This contradicted the round's own ingress-or-egress derivation, which lives at
+  `cli_show_flow.go:307-315` (NOT elsewhere in the README, as the dispatch had
+  it). The derivation is the correct account; the README now carries it, and the
+  narrower property that DOES hold — an ingress-arm match names the interface
+  typed, because arm and column read one stamped pair through one map — is
+  pinned by the two sub-tests of
+  `TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928`.
+- **BOUND, not narrowed: mode placement.** The prior round admitted its own gap
+  at `cleanup_reachability_6928_test.go:200`. Both escapes were reproduced, not
+  argued: inverting `if hitless` and replacing the call with
+  `// d.dp.Teardown()` (still builds) each left `-run 6928 ./pkg/dataplane/`
+  GREEN. `d.dp` is a `RuntimeDataPlane` interface, so no production seam was
+  needed: new `pkg/daemon/shutdown_dataplane_mode_6928_test.go` drives the real
+  `runShutdownSequence` with a substituted dataplane and asserts both arms
+  (non-hitless -> Teardown not Close; hitless -> Close not Teardown). Both
+  mutations are RED against it. The superseded substring companion was DELETED
+  rather than re-labelled — it proved a strict subset.
+- **BOUND, not narrowed: the caller set.** "Exact direct-caller set" was false in
+  both directions, measured: `import dp ".../pkg/dataplane"` + `dp.Cleanup()`
+  added a real production caller the walk silently missed, and an unrelated bare
+  `Cleanup()` in `pkg/zzprobe` was falsely counted. The walk now resolves each
+  file's IMPORT binding for the dataplane path (alias, dot-import, blank import,
+  plain), counting a bare `Cleanup()` only inside `pkg/dataplane` itself or a
+  dot-importing file. Re-measured: the aliased caller is now REPORTED (test reds
+  naming it), the unrelated one is IGNORED (green), and a newly-tried dot-import
+  case is also caught. Residual stated rather than claimed away: a local
+  identifier shadowing the package name, and indirect calls — both need
+  `go/types`.
+- **Validation**: full `go test ./...` rc 0 (62 ok, 0 FAIL) and full
+  `cargo test --release` rc 0 (4282 passed). One earlier cargo run failed
+  `afxdp::wg::engine::...::install_session_serializes_with_reconcile_removal`, a
+  thread-starvation flake on a loaded box: it passed 5/5 in isolation and 4282/0
+  on a clean full re-run, and this PR touches zero files under `afxdp/wg/`.
+  gofmt clean on all five touched Go files; `go build ./...` and `go vet` on
+  pkg/{dataplane,daemon,cli} rc 0. Merged `origin/master` (edefb7570):
+  `_Log.md` was the only conflict. `git merge-file --union` was REJECTED for the
+  resolve — it fused a shared boundary line, collapsing one blank plus one
+  `- **Timestamp**: 2026-08-12`, which would have stripped master's "#5561 round
+  21b" entry of its timestamp bullet while passing a zero-deletions check. The
+  resolve is a deterministic replay of both diffs onto the merge base instead;
+  predicted BEFORE resolving and matched exactly: 80283 lines (77129 + 1191 +
+  1963), 1594 `##` headings (1573 + 7 + 14), 487 headings preceded by a
+  non-blank line (476 + 4 + 7), and zero deletions in both directions with each
+  parent differing from the result by exactly the other's insertions.
+- **File(s)**: pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  pkg/cli/session_filter.go, pkg/dataplane/cleanup_reachability_6928_test.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go, pkg/dataplane/types.go,
+  pkg/daemon/shutdown_dataplane_mode_6928_test.go,
+  userspace-dp/src/session/README.md, _Log.md
 
 ## 2026-08-13 — #6304 round 3: bind the batch accounting triple + the lookup byte argument
 
@@ -95766,3 +97035,187 @@ prose edit above them added. No diff falls in the new test body.
   full run on the same tree and in all 12 other cells. Filed separately.
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Merged `origin/master` (ff532c8e8, 380 commits) into
+  `fix/4983-session-ingress-iface` for PR #6928, and repaired the two SEMANTIC
+  conflicts the textual merge could not see.
+
+  **`_Log.md` — resolved by deterministic replay, NOT by union.** The union
+  hazard is live on this file (both sides append entries whose first line is a
+  templated `- **Timestamp**: ...`, so a shared boundary line is hoisted as
+  common context and two entries fuse). Resolution: reconstruct from the merge
+  base by replaying both `difflib` opcode sets, ours-then-theirs at each anchor,
+  with an explicit overlap check on the non-insert ops. Totals were PREDICTED
+  before resolving and then measured: **96119 lines** (79092 + 1269 + 15759 − 1),
+  **3217** `- **Timestamp**` (3011 + 3200 − 2994), **3080** `- **Action**`
+  (2871 + 3065 − 2856), **1709** `## ` headings (1594 + 1702 − 1587). All four
+  matched. Zero deletions against master; exactly ONE line absent versus our
+  side, and it is master's own deliberate `replace` op (splitting a line that
+  contains a literal control character), verified by hand rather than assumed.
+  A set-based line invariant alone would NOT have caught a fusion; the entry
+  COUNT is what does.
+
+  **Semantic conflict 1 — `Daemon.dp` no longer exists (#6743).** Master replaced
+  the field with an atomic cell published through `setDataplane` and guarded by
+  an AST canary that fails the build on direct `.dpCell` access. This branch's
+  `pkg/daemon/shutdown_dataplane_mode_6928_test.go` built its `Daemon` with a
+  `dp:` struct-literal field. Textually clean, `vet`-broken: `unknown field dp in
+  struct literal of type Daemon`. Repaired to publish through `d.setDataplane(dp)`
+  — the accessor the canary permits — and the doc comment's `d.dp.Close()` /
+  `d.dp.Teardown()` spellings refreshed to the `rt.Close()` / `rt.Teardown()`
+  the shutdown sequence now uses, so the recorded mutation escapes still name
+  real code.
+
+  **Semantic conflict 2 — two new `SessionMetadata` construction sites.** Master
+  added `poll_descriptor/filter.rs` (#6722 cached-output filter-log test) and
+  `poll_descriptor/flow_cache_hit_tests.rs`; both broke with `E0063: missing
+  fields ingress_ifindex and ingress_vlan_id`. That break is the intended
+  behaviour of the no-`Default` struct literal contract documented at
+  `session/entry.rs:292` — every new site must decide the ingress identity
+  consciously. Both are `#[cfg(test)]`; each was stamped with the ingress
+  binding its OWN fixture frame already carries (`PHYS_INGRESS_IFINDEX`/
+  `INGRESS_VLAN_ID` and `LAN_IFINDEX_6722`/untagged respectively) rather than
+  zeroed, so neither fixture models a session the production install sites
+  cannot create.
+
+  **`docs/refactoring-audit-current.txt`** is generated: regenerated with
+  `bash scripts/refactoring-audit.sh` after the merge; byte-identical to the
+  textually merged file, so the merge did not corrupt it.
+- **File(s)**: _Log.md, pkg/daemon/shutdown_dataplane_mode_6928_test.go,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 post-merge repair — the `Cleanup()` reachability guard
+  went RED against master and the RED was TRUE about the source while FALSE
+  about the behaviour, which is the dangerous polarity.
+
+  **What happened.** #6743 introduced a test seam: `Manager.Teardown` no longer
+  calls `Cleanup()`, it calls `teardownCleanupFn()`, a package-level var whose
+  production value is `Cleanup`. `TestCleanupProductionCallersMatchRemediation_6928`
+  walks the AST for CALL expressions only, so the edge vanished from its census
+  and it reported `got: cmd/xpfd/main.go:main` against a two-entry `want`. Read
+  naively that says "a non-hitless shutdown no longer unpins the maps", which
+  would have sent the next round to REWRITE the operator-facing stale-pin
+  remediation to a claim that is not true. Production still reaches `Cleanup`;
+  only the syntax moved.
+
+  **Repair, in two parts, because the guard could no longer prove what it
+  claimed with one.**
+
+  1. The walk now records function-VALUE references as well as calls, tagging
+     each entry `(call)` or `(value)`, and descends into package-level
+     `var`/`const` initializers — `var teardownCleanupFn = Cleanup` has no
+     enclosing `FuncDecl` at all, so a body-only walk cannot see it. Selector
+     expressions are matched at the selector and NOT descended into, because
+     `e.Sel` is an `Ident` literally named `Cleanup` (double-count) and inside
+     package `dataplane` an unrelated method call `x.Cleanup()` would otherwise
+     be counted as this package's function.
+  2. New `TestTeardownInvokesTheCleanupSeam_6928` binds the half the walk
+     structurally CANNOT: a function value sitting in a var proves nothing
+     about whether anything invokes it. It substitutes the seam, drives the
+     real `Manager.Teardown`, and asserts one invocation — plus the polarity
+     control that `Manager.Close` invokes it ZERO times, without which the test
+     stays green if BOTH lifecycle methods swept and the mode-dependent wording
+     becomes wrong in the other direction.
+
+  **Two-cell measurement proving neither guard subsumes the other** (anchor
+  uniqueness asserted at 1 per cell; `pkg/dataplane/loader.go` restored and
+  `git diff --quiet`-verified after each):
+
+  | cell | mutation | behavioural | walk |
+  |---|---|---|---|
+  | B | delete `err := teardownCleanupFn()` from `Teardown` | **RED** ("invoked the pinned-state sweep 0 times, want 1") | GREEN |
+  | C | `var teardownCleanupFn = func() error { return nil }` | GREEN (it substitutes the seam itself) | **RED**, naming the missing `(value)` entry |
+
+  Cell B is the whole justification for part 2: the mutation that most directly
+  falsifies the operator sentence is invisible to the call-graph instrument.
+
+  **No operator-facing claim was falsified by the merge.** `types.go:130-160`,
+  its v6 twin, `loader_userspace_shim.go:37-55` and `pkg/dataplane/README.md`
+  all say `Manager.Teardown` unpins on a non-hitless shutdown; that remains
+  true through the seam. No prose was changed.
+- **File(s)**: _Log.md, pkg/dataplane/cleanup_reachability_6928_test.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 — reconciled the four prose sites that describe the
+  `Cleanup()` reachability guard with what the guard now reports, after #6743
+  made `Manager.Teardown`'s reach INDIRECT.
+
+  The substantive operator claim did not change and no site was false: a
+  non-hitless shutdown still unpins, so a restart still suffices there. What
+  changed is that the guard's `want` set now names
+  `pkg/dataplane/loader.go:var teardownCleanupFn (value)` instead of
+  `pkg/dataplane/loader.go:Teardown`, and four places told a reader to read the
+  claim against that test. A reader following the pointer would have found a
+  set that does not mention `Teardown` and concluded the doc had drifted —
+  which is the exact failure mode this PR exists to remove. Updated
+  `pkg/dataplane/types.go` (v4 + v6 twins), `loader_userspace_shim.go`,
+  `pkg/dataplane/README.md` and `userspace-dp/src/session/README.md`, each
+  naming the seam, the indirection, and the second guard.
+
+  **Swept tree-wide rather than working a list** (`Teardown` co-occurring with
+  `Cleanup` across `.go`/`.rs`/`.md`/`.h`). Nine further sites mention both;
+  every one is still TRUE under the indirection (`Teardown -> Cleanup unpins
+  everything`, `Teardown (= Close + Cleanup)`), so they were deliberately left
+  rather than annotated. The four edited are exactly the ones that point a
+  reader at the guard's reported set; adding "(indirectly)" to a sentence that
+  is already true buys nothing and dilutes the four that needed it.
+- **File(s)**: _Log.md, pkg/dataplane/types.go,
+  pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/README.md,
+  userspace-dp/src/session/README.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 — fixed a gofmt regression this branch DID cause, and
+  corrected an earlier round's claim about it.
+
+  Round 5 recorded `pkg/dataplane/bpf_session_value_test.go` and
+  `pkg/dataplane/constants.go` as "gofmt-dirty at the PR head already and
+  confirmed unmodified in this diff", and left both. Re-derived against
+  `git show origin/master:` rather than inherited:
+
+  - `constants.go` — dirty on master AND here, and untouched by this branch.
+    Claim holds. Deliberately left; formatting it would widen the diff into an
+    unrelated file.
+  - `bpf_session_value_test.go` — **CLEAN on master**. The branch caused the
+    dirtiness, so that half of the claim was wrong. Mechanism: this PR inserts
+    a comment block between `FibGen: 99,` and the new `IngressIfindex` /
+    `IngressVlanID` fields, and a comment line BREAKS a gofmt alignment group.
+    The fields above it therefore stopped being padded to the width of
+    `IngressIfindex` (14) and gofmt wanted them at `IngressZone`/`NATSrcPort`
+    width (11). `gofmt -w`; the result is 29 insertions / 29 deletions, all
+    whitespace, confined to that one struct literal.
+
+  General shape worth keeping: inserting a comment INTO a keyed struct literal
+  re-partitions gofmt's alignment groups, so a comment-only insertion can make
+  a file gofmt-dirty in lines the author never edited — and it reads as
+  pre-existing dirt if you check only `gofmt -l` and not `git show
+  origin/master:<path>`.
+- **File(s)**: _Log.md, pkg/dataplane/bpf_session_value_test.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 — second `origin/master` merge (ff532c8e8 -> 598a6f0f2,
+  39 commits) after GitHub reported CONFLICTING against a head that had moved
+  during the drive pass.
+
+  `_Log.md` was again the only textual conflict and was again resolved by
+  deterministic replay of both diffs onto the merge base, never `--union`. Both
+  sides are pure inserts this round (no deletions either direction). Totals
+  predicted before resolving, then measured — **97052 lines** (94850 + 1427 +
+  775), **3236** `- **Timestamp**` (3221 + 3215 - 3200), **3100** `- **Action**`
+  (3084 + 3081 - 3065), **1717** `## ` headings (1709 + 1710 - 1702). All four
+  matched; zero deletions against either parent; zero conflict markers.
+
+  **Zero semantic conflicts this round**, checked rather than assumed. The new
+  master touches two files that are load-bearing for this PR and neither
+  interacts: `pkg/dataplane/userspace/interfaces.go` gains the #6847 unit-level
+  inet-precedence classifier publication (CoS, not the `{ifindex, vlan}` key
+  construction the ingress identity resolves through), and
+  `poll_descriptor/mod.rs` gains two `record_screen_drop` arguments for the
+  #3651 per-zone flood counters (screen drop path, not an install site). No new
+  `SessionMetadata` construction site arrived, so the no-`Default` literal
+  contract raised nothing.
+
+  `docs/refactoring-audit-current.txt` regenerated after the merge.
+- **File(s)**: _Log.md

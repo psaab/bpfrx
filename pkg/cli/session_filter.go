@@ -63,8 +63,14 @@ type sessionFilter struct {
 	// `show security flow session interface <name>` / the matching
 	// `clear` — the interface never matched anything, so a filtered show
 	// undercounted and a filtered clear left sessions behind.
-	zoneIfaces      map[uint16][]string        // zone ID → all bound interface names
-	egressIfacesMap map[sessionIfaceKey]string // {ifindex,vlanID} → interface name
+	zoneIfaces map[uint16][]string // zone ID → all bound interface names
+	// ifaceNamesByKey resolves a {parent netdev ifindex, 802.1Q VLAN id} pair
+	// to the Junos config interface name of that logical unit. Built once by
+	// buildSessionEgressIfaces. #4983: BOTH directions read it — the egress
+	// side keys on the session's FIB result, the ingress side on the session's
+	// recorded ingress binding — so one map defines one interface identity for
+	// the whole filter.
+	ifaceNamesByKey map[sessionIfaceKey]string
 }
 
 // parseSessionFilter parses session-selector and presentation tokens for
@@ -261,7 +267,7 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 		return false
 	}
 	if f.iface != "" {
-		inIfs := f.zoneIfaces[val.IngressZone]
+		inIfs := f.resolveIngressIfaces(val.IngressIfindex, val.IngressVlanID, val.IngressZone)
 		outIfs := f.resolveEgressIfaces(val.FibIfindex, val.FibVlanID, val.EgressZone)
 		if !f.ifaceMatchesAny(inIfs) && !f.ifaceMatchesAny(outIfs) {
 			return false
@@ -306,7 +312,7 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 		return false
 	}
 	if f.iface != "" {
-		inIfs := f.zoneIfaces[val.IngressZone]
+		inIfs := f.resolveIngressIfaces(val.IngressIfindex, val.IngressVlanID, val.IngressZone)
 		outIfs := f.resolveEgressIfaces(val.FibIfindex, val.FibVlanID, val.EgressZone)
 		if !f.ifaceMatchesAny(inIfs) && !f.ifaceMatchesAny(outIfs) {
 			return false
@@ -389,7 +395,7 @@ func (f *sessionFilter) populateIfaceMaps(c *CLI) {
 		}
 	}
 	f.zoneIfaces = zoneIfaces
-	f.egressIfacesMap = buildSessionEgressIfaces(f.cfg)
+	f.ifaceNamesByKey = buildSessionEgressIfaces(f.cfg)
 }
 
 // ifaceMatches checks whether ifName matches the filter's interface name.
@@ -414,6 +420,73 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 	return false
 }
 
+// resolveIngressIfaces resolves a session's candidate INGRESS interface
+// names.
+//
+// #4983: when the session carries a true ingress identity — the
+// {ifindex, VLAN} of the binding its first packet actually arrived on,
+// recorded once by the dataplane at install — this returns the single
+// interface that identity names, so a session on interface X no longer
+// matches a filter for a SIBLING interface Y of the same zone. That
+// cross-interface match is the defect #4792 could only narrow (it widened
+// the zone map to hold every bound interface, which is as precise as a
+// zone-derived answer can be) and this datum removes.
+//
+// Otherwise it falls back to EVERY interface bound to the ingress zone —
+// the #4792 approximation — and that fallback is deliberate, not an
+// accident of a zero value. Three populations legitimately carry no
+// ingress identity and MUST stay reachable by an interface-filtered show
+// and clear — as far as the zone approximation can carry them, which is
+// nowhere if the ingress zone binds NO interface: the fallback is then an
+// empty slice and ifaceMatchesAny is false on THIS arm.
+//
+// That is not the same as the row being unreachable, and an earlier
+// revision of this comment said it was (#6928). matchesV4/matchesV6
+// reject only when BOTH arms miss — `!f.ifaceMatchesAny(inIfs) &&
+// !f.ifaceMatchesAny(outIfs)` — so an empty ingress slice removes one of
+// two routes in, and the row is still selected by the name of the
+// interface it EGRESSES on (resolveEgressIfaces below, precise from the
+// FIB identity or falling back to the egress zone). Only when both arms
+// come up empty is the row invisible to every interface filter.
+// TestInterfaceFilterReachesRowViaEgressArm6928 in pkg/cli constructs
+// the empty-ingress case and shows it selected.
+//
+// The three populations:
+//   - the reverse companion, whose own ingress has not been OBSERVED yet.
+//     The forward flow's egress IS resolved at install; it is the wrong
+//     datum, predicting where the reply will arrive rather than recording
+//     where it did, and routing may be asymmetric;
+//   - a peer-synced session: an ifindex is NODE-LOCAL, so the originating
+//     node's number names a different NIC here. It is deliberately not
+//     carried across the cluster wire — doing so would render a
+//     confidently WRONG interface, strictly worse than approximating;
+//   - the host-outbound GRE encapsulation path: firewall-self-originated
+//     traffic read off the TUN device has no ingress binding to record,
+//     so 0 is the correct answer rather than a gap.
+//
+// #6928: this list used to end with "a session installed by a pre-#4983
+// helper mid rolling upgrade". There is no such population. `sessions` /
+// `sessions_v6` are in the shim ABI pre-flight's checked set and
+// validateUserspaceShimLivePins hard-refuses a ValueSize mismatch against
+// the live pin, so a new daemon never reads an old helper's 136/184-byte
+// rows — see pkg/dataplane/types.go for the full account and the
+// mode-dependent recovery.
+//
+// A NON-ZERO ifindex the config cannot name (an interface deleted since
+// install, a tunnel/fabric ingress with no config unit) also falls back
+// rather than matching nothing: an unnameable identity is not evidence
+// the session is uninteresting. So ingress ifindex 0 never means "matches
+// nothing", and never means "matches everything" either — it means
+// "answer from the zone, as before".
+func (f *sessionFilter) resolveIngressIfaces(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16) []string {
+	if ingressIfindex != 0 {
+		if ifName, ok := f.ifaceNamesByKey[sessionIfaceKey{ifindex: ingressIfindex, vlanID: ingressVlanID}]; ok && ifName != "" {
+			return []string{ifName}
+		}
+	}
+	return f.zoneIfaces[ingressZone]
+}
+
 // resolveEgressIfaces resolves a session's candidate egress interface
 // names: a precise single-element result from the FIB lookup when
 // available, otherwise EVERY interface bound to the egress zone (#4792 —
@@ -421,7 +494,7 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 // silently missed sessions egressing on any interface but the first).
 func (f *sessionFilter) resolveEgressIfaces(fibIfindex uint32, fibVlanID uint16, egressZone uint16) []string {
 	if fibIfindex != 0 {
-		if ifName, ok := f.egressIfacesMap[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+		if ifName, ok := f.ifaceNamesByKey[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
 			return []string{ifName}
 		}
 	}

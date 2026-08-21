@@ -953,6 +953,313 @@ omits the fields decodes to `false` (no per-policy log) — bit-identical to
 pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
 `protocol/binding.rs`) carries the same fields at parity with the binary frame.
 
+### True ingress-interface identity on the session (#4983)
+
+A session records the interface its FIRST packet arrived on. At install
+`afxdp/poll_descriptor` stamps `SessionMetadata::ingress_ifindex` and
+`ingress_vlan_id` from the frame's `UserspaceDpMeta` — the binding the packet
+was actually received on plus its 802.1Q tag. For the sessions that ARE
+mirrored to the kernel-visible conntrack map (see the next paragraph),
+`afxdp/bpf_map/publish_conntrack` copies both into the conntrack value
+(`session_value.ingress_ifindex` / `ingress_vlan_id`), where the Go control
+plane reads them as `dataplane.SessionValue.IngressIfindex` /
+`IngressVlanID`.
+
+**Which sessions this is OPERATOR-VISIBLE for (#6965).** The stamp above is on
+the helper's in-memory `SessionEntry`, and that is a different question from
+what `show security flow session` can see. That command enumerates the BPF
+conntrack map (`pkg/dataplane/maps_session.go`'s `Manager.IterateSessions`
+over `m.maps["sessions"]`), and inside the HELPER only three install sites ever
+write it: `publish_bpf_conntrack_entry`'s callers in `afxdp/poll_descriptor` —
+the host-inbound `LocalMiss` install, the `MissingNeighborSeed` install, and the
+reverse-companion repair on the session-hit path (that third row is
+`is_reverse != 0`, which every `show`/`clear` call site skips before filtering,
+so it never surfaces a flow on its own).
+
+"Inside the helper" is load-bearing, because the map has a writer OUTSIDE it
+(#6928 review). Every HA peer-synced row reaches the same `sessions` /
+`sessions_v6` map from the GO side:
+`Manager.SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/manager_ha.go`)
+call `bpfShim.SetSessionV4`/`V6`, which is `maps_session.go`'s
+`m.maps["sessions"].Update`. That is the "for peer-synced sessions the Go side
+installs directly" case named below; the three-site count is a claim about the
+Rust helper's publication sites, never about the map's writers. The ordinary TRANSIT forward
+install does NOT publish there: it calls `publish_live_session_entry`, which
+writes the shim's steering table (`session_map_fd`, a 40-byte key with a
+one-byte action value — a different map from the 144-byte conntrack value),
+plus `publish_shared_session` for the shared/HA maps.
+
+So the identity is stamped on every forward session installed from a RECEIVED
+FRAME — the three frame-driven install sites, the only ones with an observed
+binding to copy. (The two forward installs that carry `0`, host-outbound GRE
+and the HA peer import, are not exceptions: neither has an observed local
+ingress. Both are enumerated under "`0` means no ingress identity carried"
+below.) Of those stamps, the identity reaches the operator
+surface only for the host-inbound and missing-neighbor-seed populations, and
+for peer-synced sessions the Go side installs directly. Transit sessions are
+absent from that map entirely — not carrying a zeroed identity, but having no
+row at all — so `show`/`clear ... interface <name>` cannot select them either
+way. That gap is PRE-EXISTING (it dates to `fab9230c5`, the commit that first
+added the conntrack mirror and wired only these three sites) and is tracked as
+**#6965**; #4983 neither introduced nor widened it. Closing #6965 is what makes
+this datum operator-visible for the dominant population.
+
+Before this the session carried only its ingress ZONE, so
+`show security flow session interface <name>` and the matching `clear` had to
+ask "is `<name>` bound to the session's ingress zone?". A session on interface
+X therefore matched a filter for EVERY sibling interface Y of that zone.
+(#4792 widened the CLI's zone map from one interface to all of them, which is
+as precise as a zone-derived answer can be; this is the datum that makes it
+exact.) `pkg/cli/session_filter.go`'s `resolveIngressIfaces` now resolves the
+recorded pair through the very same `{parent ifindex, VLAN}` map the EGRESS
+side already uses (`buildSessionEgressIfaces`), so one map defines one
+interface identity for both directions and two units of a single trunk NIC —
+`reth0.50` vs `reth0.80` — do not alias onto the parent. The `In: ... If:`
+column of the detailed `show` output is resolved from the same identity
+(`sessionIngressIf` in `pkg/cli/cli_show_flow.go`).
+
+**What that buys, stated at the width it actually holds.** A previous revision
+said the filter and the displayed name therefore "cannot disagree" for a
+non-zero nameable identity. That is false, and no fallback is needed to break
+it. `matchesV4`/`matchesV6` are a DISJUNCTION over two arms —
+`!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)` in
+`pkg/cli/session_filter.go` — while the `If:` column renders the INGRESS side
+alone. A session that arrives on `A` and egresses on `B`, both stamped and both
+nameable, is selected by `interface B` through the EGRESS arm and prints
+`If: A`. Filter term and column differ with no zero identity and no fallback
+anywhere in the derivation. That is the same account
+`pkg/cli/cli_show_flow.go:307-315` derives at the print site, and this sentence
+used to contradict it.
+
+The property that DOES hold is narrower: when a row is selected BY ITS INGRESS
+ARM and carries a non-zero nameable identity, the column names the interface
+that was typed — because the arm and the column read the SAME stamped pair
+through the SAME `{ifindex, VLAN}` map. Both halves are pinned by
+`TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928`
+(`pkg/cli/cli_show_flow_ingress_if_4983_test.go`), whose two sub-tests assert
+the egress-arm disagreement and the ingress-arm agreement against the real
+`showFlowSession`.
+
+For a ZERO or unresolvable identity the ingress arm and the column degrade
+differently as well: the FILTER falls back to every interface bound to the zone
+(`resolveIngressIfaces`), the DISPLAY to the zone's first/representative
+interface (`sessionIngressIf`). So a zero-identity row in zone `[A, B]` is
+selected by `interface B` yet prints `If: A`. That is a second, independent way
+the two can name different interfaces — a fallback artefact, not a filtering
+error.
+
+The DISPLAY side's own fallback chain, for completeness: an absent or an
+unnameable identity falls back to the ingress zone's FIRST interface, and a
+zone that binds none falls back to the zone NAME. Never to a blank column, and
+that part matters — WHERE THE INGRESS ZONE BINDS AT LEAST ONE INTERFACE, those
+populations (§ "`0` means no ingress identity carried" below) are still
+selectable by an interface filter through the zone approximation, so a blank
+would hide a row the filter can still reach. Where the zone binds NONE, that
+particular route in is gone — but the row is NOT thereby unreachable, because
+the filter still has its egress arm; see the consequence spelled out below. The
+never-blank rule is still right there — the column prints the zone name — but
+its justification is the bound-interface case, not every case.
+
+**Verified at this head, because the paragraph that used to stand here said the
+two fallbacks were "the same degradation" and they are not.** They are
+different TYPES, built from the same config in different shapes:
+
+| side | map | built from | fallback yields |
+|---|---|---|---|
+| FILTER (`session_filter.go`, `populateIfaceMaps`) | `map[uint16][]string` | `append(zoneIfaces[zid], zone.Interfaces...)` | EVERY bound interface |
+| DISPLAY (`cli_show_flow.go`) | `map[uint16]string` | `zone.Interfaces[0]` | the FIRST one, else the zone name |
+
+`cli_show_flow.go` states the split itself where it builds them: use
+`populateIfaceMaps` "rather than the single-first-interface `zoneIfaces` built
+above for display", which "stay display-only". So the divergence is deliberate
+on the filter's side — an interface-filtered `show` must see every interface of
+a zone (#4792) — and simply not mirrored into the one-name column.
+
+Two consequences beyond the `[A, B]` example above. A zone binding NO interface
+gives the filter an empty slice, so `ifaceMatchesAny` is false on the INGRESS
+arm, while the column prints the zone name — which is not an interface name and
+cannot be typed back into the filter.
+
+That is a lost route in, not an unreachable row, and an earlier revision said
+otherwise (#6928): "no interface filter selects that row at all" is refuted by
+the code as written, with no edit required. `matchesV4`/`matchesV6` reject only
+when BOTH arms miss, so a session whose ingress zone binds nothing is still
+selected by the name of the interface it EGRESSES on whenever the FIB identity
+is nameable — or, failing that, by any interface bound to its EGRESS zone.
+`TestInterfaceFilterReachesRowViaEgressArm6928` constructs exactly that row
+(ingress zone `quarantine`, which binds nothing, ingress identity 0, egress
+`lo.80`) and shows `show security flow session interface lo.80` selecting it,
+with a negative control that an interface neither arm can name selects nothing.
+A row is invisible to every interface filter only when BOTH arms come up
+empty — no nameable egress identity AND an egress zone that binds no
+interface, on top of the ingress side already being empty. And the
+`TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983`
+(`pkg/cli/cli_show_flow_ingress_if_4983_test.go`), which asserts exactly those
+three arms; there is no corresponding test asserting the two sides agree,
+because they do not.
+
+**Which surfaces this applies to.** The consumer side landed in the IN-DAEMON
+CLI only (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
+the same session table and still answer an `interface` filter from the ingress
+ZONE, in the pre-#4792 FIRST-interface-only form:
+
+- `pkg/grpcapi/server_sessions.go` (`f.zoneIfaces[zid] = zone.Interfaces[0]`),
+  which is what the REMOTE `cli` binary uses for both `show security flow
+  session interface <name>` and the matching `clear`;
+- `pkg/api/sessions.go`, the HTTP/REST session query.
+
+Neither is changed here (this PR's diff against `pkg/grpcapi` and `pkg/api` is
+empty), so on those surfaces an interface filter still selects every session of
+the named interface's zone whose zone happens to resolve to that first
+interface. Porting `resolveIngressIfaces` to them is tracked separately.
+
+The identity is stamped ONCE and never re-derived from the zone; re-deriving
+is the approximation it exists to remove.
+
+**Fabric ingress: the one path where the zone and the ifindex name DIFFERENT
+interfaces.** A frame arriving over the fabric carries a zone-encoded override
+(`poll_stages.rs`), which takes precedence over the ifindex->zone map in
+`forwarding/mod.rs`, so `ingress_zone` is the ORIGINATING chassis's zone. The
+identity stamp is unconditional and records the LOCAL fabric NIC the frame
+physically arrived on. Neither is wrong — they answer different questions — but
+an exact interface filter follows the ifindex, so the enumeration above is not
+exhaustive without this case.
+
+It is INERT in the shipped topology: the fabric member is declared only under
+`fab0 { fabric-options { member-interfaces { ... } } }` with no unit
+(`docs/ha-cluster-userspace.conf`), and `buildSessionEgressIfaces` keys on
+`{parent ifindex, unit VLAN}` — a unit-less interface produces no entry, so the
+lookup misses and the CLI falls back to the zone exactly as before. Give that
+member a unit and the behaviour changes: on node B,
+`show security flow session interface reth0.50` would stop matching a
+cross-chassis flow it used to reach through the wan zone, and the matching
+`clear` would leave it behind. No test or smoke covers this because the path is
+unreachable from the shipped config, not merely uncovered.
+
+**`0` means "no ingress identity carried" and is never a valid ifindex.** These
+populations legitimately carry `0`, and the CLI falls back to the zone
+approximation for all of them — never "matches nothing" (which would hide them
+from `show`/`clear`), never "matches everything":
+
+1. the REVERSE companion (`poll_descriptor` reverse install, `shared_ops`
+   synthesized companion) — its own ingress has not been OBSERVED yet. The
+   forward flow's egress IS resolved at install (`resolution.egress_ifindex`),
+   so availability is not the reason: it is a PREDICTION of where the reply
+   will arrive rather than an observation of where it did, and routing may be
+   asymmetric, so there is nothing truthful to stamp. Note the CLI fallback is
+   INERT for this one: every `show`/`clear` call site skips `IsReverse != 0`
+   rows before reaching the filter, so a reverse entry is never
+   interface-matched at all;
+2. a PEER-SYNCED session (`server/helpers/session_sync.rs`) — an ifindex is
+   NODE-LOCAL, so node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different
+   numbers for the same logical RETH member. The identity is deliberately NOT
+   carried across the cluster wire: shipping the peer's number would render a
+   confidently WRONG interface name locally, strictly worse than approximating;
+3. the HOST-OUTBOUND GRE encapsulation path (`afxdp/tunnel.rs`,
+   `build_local_origin_tunnel_tx_request`) — firewall-self-originated traffic
+   read off the TUN device. There is no ingress binding to record: its
+   `UserspaceDpMeta` is synthesized from the raw packet, so `0` here is the
+   correct answer, not a gap;
+4. the flow-cache descriptor seed (`afxdp/flow_cache.rs`) — replay state for an
+   already-installed session, never published as a session itself.
+
+There is deliberately no "installed by a pre-#4983 helper" population. It looks
+like one, but the ABI note below rules it out: `sessions` / `sessions_v6` are in
+the pre-flight's ABI-checked set (`userspaceABICheckedPinnedMaps`, which unions
+`userspaceShimSharedMapSpecs`), and `validateUserspaceShimLivePins` hard-refuses
+a `ValueSize` mismatch against the live pin — so a new daemon never comes up
+against an old helper's 136/184-byte map. Every recovery path leaves the old pin
+GONE before the next load, so the map the new daemon reads is freshly created and
+EMPTY.
+
+Do NOT call that recovery "a reload" (this sentence did until #6928). A reload
+never releases a pin at all — a bpffs pin outlives the process that made it. The
+accurate, mode-dependent form is the one in `pkg/dataplane/types.go`: the
+targeted recovery is to unlink the ONE named pin
+(`docs/operations/userspace-shim-pin-recovery.md`); whether a plain restart is
+enough DEPENDS on how xpfd last stopped, because a HITLESS shutdown
+(`Manager.Close`) preserves the pins on purpose and hits the same refusal, while
+a NON-hitless HA shutdown calls `Manager.Teardown` — which `os.RemoveAll`s the
+pin path — so there a restart already suffices. The conclusion is unaffected in
+every one of those modes: either the old pin is gone and the new map is empty, or
+the pre-flight refuses and the new daemon does not read the map at all. There is
+no path on which old-format rows reach a new reader. A row written in the old
+format can therefore never be read by a new reader; the mixed state the
+population would describe is unreachable rather than merely rare.
+
+The MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`) is NOT in
+that list: it is a forward session installed when a flow's first packet races
+an unresolved ARP/NDP, it is published to the conntrack map, and the
+pending-neighbor retry sweep never re-installs it — so it is stamped from the
+frame's `meta` exactly like the two other forward install sites. Those two are
+not both policy-admitted: the transit install is, but the LocalDelivery install
+also runs for a `JunosHostLocalPolicy::NoMatch` host-bound flow, admitted by the
+zone's host-inbound set with no junos-host policy matching at all (#6928 review).
+
+That leaves exactly THREE production sites that stamp the pair — the TRANSIT
+forward install and the HOST-INBOUND (`LocalMiss`) install, both in
+`afxdp/poll_descriptor`, plus the missing-neighbor seed. Each has its own
+fail-on-revert test in `afxdp/tests_session_ingress_identity.rs`, driven
+through the real `poll_binding_process_descriptor` body on a binding whose
+{ifindex, VLAN} is distinct from the other two fixtures', so reverting any ONE
+site to `0` reddens exactly its own test. The reverse companion's deliberate
+`0` is pinned by an over-reach test in the same module.
+
+A NON-ZERO ifindex the running config cannot name (an interface deleted since
+install, a tunnel/fabric ingress with no config unit) falls back the same way.
+
+**ABI note.** The two fields are part of the shared C conntrack struct, not the
+sync-only trailing fields: `session_value` grows 136 -> 144 and
+`session_value_v6` 184 -> 192 (the u32 lands on the existing 8-byte boundary
+and the u16 inside the tail pad it forces, so the pair costs 8 bytes, not 16).
+`sessions`/`sessions_v6` are PINNED maps, so — exactly as for the #5460 flags
+widen — a rolling deploy cannot cross this: the pre-flight
+(`validateUserspaceShimLivePins`) refuses while the old daemon still forwards.
+The TARGETED remediation is to unlink the ONE named pin
+(`docs/operations/userspace-shim-pin-recovery.md`); `xpfd cleanup` also clears
+it but is far broader (every pinned dataplane map plus the FRR managed routes).
+Either way there is brief downtime and the next load recreates the map at the
+new size.
+
+Whether a plain RESTART is enough is MODE-DEPENDENT, exactly as the paragraph
+above this one says — do not restate it here as "it is NOT a restart" (#6928).
+That categorical form was as wrong as the "a reload" it replaced: a HITLESS
+shutdown (`Manager.Close`) preserves the pins on purpose and hits the same
+refusal, but a NON-hitless HA shutdown calls `Manager.Teardown` →
+`dataplane.Cleanup()`, which unpins everything, so on that path a restart
+already suffices.
+
+Two facts underneath that sentence are pinned, and one thing is NOT (#6928).
+`Cleanup()` has TWO production reference sites, not one, and
+`pkg/dataplane/cleanup_reachability_6928_test.go` pins that set — resolving
+each reference through the file's IMPORT bindings, so an aliased
+`dp.Cleanup()` counts and an unrelated `Cleanup()` in some other package does
+not. Since #6743 the Teardown site is a function VALUE
+(`var teardownCleanupFn = Cleanup`) that `Manager.Teardown` invokes rather
+than a direct call, so the walk records it as `(value)` and
+`TestTeardownInvokesTheCleanupSeam_6928` binds the part a value reference
+cannot prove — that Teardown still invokes it, with a polarity control that
+`Manager.Close` does not. Which shutdown arm calls which lifecycle method is pinned behaviourally
+by `TestShutdownModeChoosesCloseOrTeardown6928`
+(`pkg/daemon/shutdown_dataplane_mode_6928_test.go`), which drives the real
+`runShutdownSequence` against a substituted dataplane.
+
+What is NOT pinned is this paragraph's WORDING, and an earlier revision claimed
+otherwise — that the caller test stopped "the categorical wording coming back
+green". It does not, and the check was run rather than reasoned about: replace
+the remediation with a different false sentence ("A plain restart ALWAYS
+releases this pin"), and the caller graph is unchanged, the two banned literals
+in `stalepin_remediation_5363_test.go` are absent, and the whole
+`./pkg/dataplane/...` suite stays green. A guard that forbids two strings
+constrains VOCABULARY, not the claim — no test can decide whether an arbitrary
+English sentence describes the pinned facts correctly. The two literals are
+kept only to stop the two specific disproven phrasings returning verbatim, and
+are labelled as that where they live. Correctness of this paragraph rests on
+reading it against the two tests above.
+
+Sizes are asserted in lockstep at `afxdp/bpf_map_tests.rs` and
+`pkg/dataplane/bpf_session_value_test.go`.
+
 ### Admitting policy ID on the session (#3056)
 
 A policy-admitted session stamps the admitting policy's ID onto

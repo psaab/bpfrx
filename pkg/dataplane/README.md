@@ -324,11 +324,36 @@ Guard layers (`build-userspace-xdp.sh`):
    this build's embedded shim against the RUNNING (old) daemon's pinned
    map, so the pin is ALWAYS the stale side. The embedded shim is the
    intended, un-broken target, so `make generate` is the WRONG action;
-   instead it prints `userspaceShimStalePinRemediation`, directing a FULL
-   dataplane reload (stop xpfd so the old pin is released, then start it to
-   load the new shim). A rolling deploy cannot cross a genuine shim-map ABI
-   change because the new map can only be pinned after the stale pin is
-   released.
+   instead it prints `userspaceShimStalePinRemediation`, which directs the
+   operator to unlink the ONE named pin
+   (`docs/operations/userspace-shim-pin-recovery.md`) and then start xpfd. A
+   rolling deploy cannot cross a genuine shim-map ABI change while the old
+   pin is still present, because the new map can only be pinned after the
+   stale one is released.
+
+   **Whether a restart releases the pin is MODE-DEPENDENT**, and this text
+   has been wrong in both directions (#6928). It first said "a reload"
+   releases it — nothing does. It then said restarting NEVER releases it and
+   only `xpfd cleanup` does — also false. A bpffs pin outlives the process
+   that created it, so releasing it means UNLINKING it, which is `Cleanup()`
+   in `loader.go` doing `os.RemoveAll(bpfPinPath)`. `Cleanup()` has TWO
+   production callers: the `xpfd cleanup` subcommand (`cmd/xpfd/main.go`)
+   **and** `Manager.Teardown`. `daemon_run_shutdown.go` calls `Teardown` on
+   every NON-hitless shutdown ("HA shutdown: tearing down BPF state"), so on
+   that path the pins are already gone and a plain restart suffices. Only a
+   HITLESS shutdown takes `Manager.Close`, which preserves the pins
+   deliberately — that is the path where a restart hits the identical
+   refusal, mid-upgrade, with the dataplane down.
+
+   `xpfd cleanup` also clears it, but it is a much broader hammer: it
+   removes EVERY pinned dataplane map (sessions, DNAT, all compatibility
+   state) and clears the FRR managed routes. Name the targeted unlink first.
+   `TestCleanupProductionCallersMatchRemediation_6928` binds the reference set
+   this paragraph describes, so it cannot drift again without a red test. Since
+   #6743 `Manager.Teardown` reaches `Cleanup` INDIRECTLY, through the
+   `teardownCleanupFn` seam var, so that test reports the var rather than
+   `Teardown` and `TestTeardownInvokesTheCleanupSeam_6928` binds the half a
+   function-value reference cannot: that Teardown still invokes it.
 
    **CPUMAP MaxEntries is CPU-sized, not a stale-pin signal (#5364):**
    `userspace_cpumap` is a `BPF_MAP_TYPE_CPUMAP`. The shim declares it as
@@ -348,8 +373,13 @@ Guard layers (`build-userspace-xdp.sh`):
    CPU-count-sized (per-CPU ARRAY/HASH maps keep their declared `MaxEntries`
    and replicate the VALUE per-CPU; XskMap keeps its declared size), so every
    other map keeps a strict `MaxEntries` check, and a genuine cpumap
-   Type/KeySize/ValueSize/Flags break still yields the full-reload
-   remediation.
+   Type/KeySize/ValueSize/Flags break still yields the stale-pin
+   remediation (`userspaceShimStalePinRemediation`). Since #6928 that
+   constant is the TARGETED single-pin unlink plus a mode-dependent note
+   on restart — NOT a "full reload". Nothing in the product reloads a
+   bpffs pin: a pin outlives the process that made it, so "full-reload"
+   was only ever a label for the constant, never an instruction an
+   operator could follow.
 
    **Residual (documented, not caught here):** a *same-size* Go/Rust
    value **field reorder** — identical `KeySize`/`ValueSize`/`Type`/

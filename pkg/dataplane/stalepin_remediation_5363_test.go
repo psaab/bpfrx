@@ -12,8 +12,14 @@ import (
 // embedded shim's map ABI differs from the RUNNING daemon's LIVE pinned map,
 // the live pin is ALWAYS the stale side — it is the OLD daemon's map, while the
 // embedded shim is the intended (and un-broken) deploy target. So the
-// remediation must be the full-dataplane-reload guidance, NEVER `make generate`
-// (which would tell the operator to rebuild a shim that is not broken).
+// remediation must be the stale-pin guidance
+// (`userspaceShimStalePinRemediation`), NEVER `make generate` (which would tell
+// the operator to rebuild a shim that is not broken).
+//
+// "full-dataplane-reload" was this comment's original NAME for that constant
+// and is retired (#6928 review): the constant now instructs a TARGETED
+// single-pin unlink, and no reload releases a bpffs pin at all — so the old
+// label described an action nothing performs.
 //
 // This is direction-INDEPENDENT: it holds both when the embedded shape is the
 // larger side AND when it is the smaller side. Both cases exercise the SAME
@@ -27,7 +33,7 @@ import (
 // by livePinRefABI and is no longer rejected (see TestCPUMapLivePinPossibleCPU*).
 // The cases below therefore use a genuine cpumap ABI break (a ValueSize change)
 // and a genuine non-cpumap MaxEntries drift, both of which are still stale-pin
-// mismatches that must carry the full-reload remediation.
+// mismatches that must carry the stale-pin remediation.
 //
 // RED-on-revert: with the pre-#5363 code the live-pin error appended
 // userspaceShimGenerateRemediation ("Re-run `make generate-userspace-xdp`."),
@@ -98,13 +104,55 @@ func TestLivePinABIMismatchUsesStalePinRemediation(t *testing.T) {
 					t.Fatalf("err = %v, want substring %q", err, want)
 				}
 			}
-			// The remediation is the full-reload / stale-pin guidance...
+			// The remediation is the stale-pin guidance...
 			if !strings.Contains(msg, userspaceShimStalePinRemediation) {
 				t.Fatalf("err = %v, want stale-pin remediation constant", err)
 			}
-			for _, phrase := range []string{"FULL dataplane reload", "stale pin", "released"} {
-				if !strings.Contains(msg, phrase) {
-					t.Fatalf("err = %v, want distinctive stale-pin phrase %q", err, phrase)
+			// ...and it must be ACTIONABLE, not merely distinctive.
+			//
+			// This block has now pinned the WORDING of two DIFFERENT wrong
+			// instructions (#6928). It first required "FULL dataplane reload" /
+			// "stale pin" / "released", which was satisfied by text telling the
+			// operator to "stop xpfd so the old pin is released" — a bpffs pin
+			// outlives the process, so following it reproduced the refusal. r5
+			// replaced those with "restarting xpfd does NOT release" and
+			// "OUTLIVES the process", which locked in the OPPOSITE categorical
+			// claim, equally false: Cleanup() also runs from Manager.Teardown,
+			// which non-hitless HA shutdown calls, so on that path a restart IS
+			// enough.
+			//
+			// A phrase-presence assertion is satisfied identically by a correct
+			// and an incorrect instruction — that is how both wrong messages
+			// acquired a passing test. So the only assertion kept here is the
+			// NEGATIVE on the specific claims the code disproves.
+			//
+			// WHAT THIS IS: a VOCABULARY check, not a property check (#6928).
+			// It stops those two disproven phrasings returning VERBATIM. It
+			// cannot tell a correct remediation from an incorrect one that
+			// avoids those words, and this was measured, not assumed: rewriting
+			// the constant to say "A plain restart ALWAYS releases this pin, on
+			// every shutdown path" — categorically false, and false in the
+			// opposite direction from the claims banned below — leaves every
+			// test in ./pkg/dataplane/... green.
+			//
+			// Adding a third banned literal would repeat the mistake a third
+			// time, so the escape is not narrowed, it is stated. What IS bound
+			// is the pair of facts the message describes:
+			// TestCleanupProductionCallersMatchRemediation_6928 pins Cleanup()'s
+			// production caller set, and TestShutdownModeChoosesCloseOrTeardown6928
+			// (pkg/daemon) pins which shutdown arm calls Teardown versus Close.
+			// Whether this English sentence reports those two facts correctly is
+			// not decidable by a test; it is decided by reading it against them.
+			for _, disproven := range []string{
+				"restarting xpfd does NOT release",
+				"reachable only from",
+			} {
+				if strings.Contains(msg, disproven) {
+					t.Fatalf("err = %v, remediation restored the categorical claim %q. "+
+						"Cleanup() also runs from Manager.Teardown, which "+
+						"daemon_run_shutdown.go calls on every NON-hitless shutdown, so "+
+						"whether a restart clears the pin is mode-dependent (#6928)",
+						err, disproven)
 				}
 			}
 			// ...and NEVER the "rebuild the shim" remediation.
@@ -141,8 +189,19 @@ func TestSSOTDriftKeepsGenerateRemediation(t *testing.T) {
 			t.Fatalf("err = %v, want substring %q (SSOT-drift site must keep make-generate)", err, want)
 		}
 	}
-	// The SSOT-drift remediation must NOT be the stale-pin one.
-	if strings.Contains(msg, "FULL dataplane reload") {
+	// The SSOT-drift remediation must NOT be the stale-pin one. Pin the
+	// CONSTANT rather than a phrase from it: the previous form matched on
+	// "FULL dataplane reload", so rewording the stale-pin message silently
+	// turned this guard into a no-op that could never fire again (#6928).
+	// Comparing against the constant survives any rewording of either message.
+	if strings.Contains(msg, userspaceShimStalePinRemediation) {
 		t.Fatalf("err = %v, embedded-vs-Go SSOT drift must NOT use the stale-pin remediation", err)
+	}
+	// And it must not smuggle in the stale-pin ACTION either: `xpfd cleanup`
+	// destroys all pinned dataplane state, which is the wrong and destructive
+	// answer to a drift that `make generate-userspace-xdp` fixes in place.
+	if strings.Contains(msg, "xpfd cleanup") {
+		t.Fatalf("err = %v, SSOT drift must not tell the operator to unpin — "+
+			"the embedded shim is rebuildable, the pinned state is not disposable", err)
 	}
 }

@@ -54,3 +54,13 @@ or DNAT reverse mappings.
   `xdp_progs`, `tc_progs`, and `policer_states`.
 - A targeted migration tool does not exist yet. Until one exists, manual pin
   removal is an explicit state-reset operation.
+- `xpfd cleanup` will also clear the refusal, but it is a much broader action
+  than step 4 and should not be the first thing tried: it removes **every**
+  pinned dataplane map — all sessions, DNAT and compatibility state, not just
+  the incompatible one — and clears the FRR managed routes
+  (`cmd/xpfd/main.go`). Prefer the targeted unlink above.
+- Whether a plain restart is enough depends on how `xpfd` last stopped
+  (#6928). A **hitless** shutdown preserves the pins on purpose
+  (`Manager.Close`), so a restart reproduces this refusal — that is when you
+  need this runbook. A **non-hitless** HA shutdown runs `Manager.Teardown`,
+  which unpins everything, so a restart alone already clears it.

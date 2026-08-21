@@ -18,7 +18,7 @@ type SessionValue struct {
 	// Flags is uint16 (not uint8): SessFlagNPTV6 is bit 8 (0x100), which
 	// overflows a byte (#5460). The C `struct session_value.flags` and the Rust
 	// `BpfSessionValueV4::flags` mirror this width; the on-map ABI is size-
-	// asserted at 136 (bpf_session_value_test.go / bpf_map_tests.rs).
+	// asserted at 144 (bpf_session_value_test.go / bpf_map_tests.rs).
 	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
@@ -63,6 +63,167 @@ type SessionValue struct {
 	FibSmac    [6]byte
 	FibGen     uint16
 
+	// IngressIfindex is the #4983 TRUE ingress-interface identity: the ifindex
+	// of the binding the session's FIRST packet arrived on. The helper stamps
+	// it ONCE at session install from the packet's ingress binding
+	// (SessionMetadata.ingress_ifindex -> publish_conntrack) and never
+	// re-derives it from the zone — re-deriving is exactly the approximation
+	// this field exists to remove. It rides the on-map C conntrack ABI
+	// (session_value.ingress_ifindex), NOT the sync-only trailing fields below,
+	// so it is present on bpfSessionValue and round-trips through the BPF
+	// mirror.
+	//
+	// SCOPE (#6965): the stamp is on every forward session installed FROM A
+	// RECEIVED FRAME — i.e. at the three frame-driven install sites, the only
+	// places an observed ingress binding exists to copy. Two production sites
+	// install a forward (is_reverse=false) session with 0 and are not
+	// exceptions to the rule but instances of it: the host-outbound GRE
+	// encapsulation path (afxdp/tunnel.rs), where firewall-originated traffic
+	// read off the TUN device never arrived on a binding, and the HA peer
+	// import (server/helpers/session_sync.rs), which deliberately does not
+	// carry the peer's node-local ifindex. Both are listed among the
+	// legitimate zeros below.
+	//
+	// Of the frame-driven stamps, only some reach THIS map, which is what
+	// IterateSessions — and therefore `show`/`clear security flow session` —
+	// enumerates. The helper's publish_bpf_conntrack_entry is called from only
+	// three sites in afxdp/poll_descriptor: the host-inbound (LocalMiss)
+	// install, the missing-neighbor-seed install, and the reverse-companion
+	// repair (whose row is IsReverse != 0 and is skipped before filtering).
+	// The ordinary TRANSIT forward install does NOT publish here — it writes
+	// the shim's separate steering table via publish_live_session_entry — so a
+	// transit session has NO row in this map at all, and an interface filter
+	// cannot select it either way. That gap predates #4983 (it dates to the
+	// commit that first added the conntrack mirror) and is tracked as #6965;
+	// until it is closed, this field is operator-visible for the host-inbound
+	// and missing-neighbor-seed populations plus peer-synced sessions the Go
+	// side installs directly.
+	//
+	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
+	// populations legitimately carry 0 and MUST keep working:
+	//   - the reverse companion (its own ingress has not been OBSERVED yet).
+	//     The forward flow's egress IS known at install — it is the wrong
+	//     datum, being a prediction of where the reply will arrive rather than
+	//     an observation of where it did, and routing may be asymmetric. Note
+	//     every pkg/cli show/clear call site skips IsReverse != 0 before
+	//     filtering, so a reverse row is never interface-matched anyway;
+	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
+	//     number names a different NIC on this node, so carrying it across the
+	//     cluster wire would be confidently wrong, worse than approximating);
+	//   - the helper's host-outbound GRE encapsulation path, where the traffic
+	//     is firewall-self-originated off the TUN device and has no ingress
+	//     binding to record;
+	//   - the helper's flow-cache descriptor seed, which is replay state for an
+	//     already-installed session and is never published as one.
+	//
+	// FABRIC INGRESS is the one population where this field and IngressZone
+	// name DIFFERENT interfaces, so the list above is not exhaustive without
+	// it. A frame arriving over the fabric carries a zone-encoded override, so
+	// IngressZone is the ORIGINATING chassis's zone while this stamp records
+	// the LOCAL fabric NIC the frame physically arrived on. Both answer
+	// different questions correctly; they simply disagree, and an exact
+	// interface filter follows the ifindex rather than the zone. Inert today —
+	// the fabric member is declared with no config unit, so it has no
+	// {ifindex, vlan} name, the lookup misses and the CLI falls back to the
+	// zone as before. See userspace-dp/src/session/entry.rs for the full note
+	// and the operator consequence if a unit is ever added.
+	// There is deliberately NO "pre-#4983 helper, rolling upgrade" population:
+	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
+	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
+	// ValueSize mismatch against the live pin, so a new daemon never reads an
+	// old helper's 136/184-byte rows — the recovery is to unlink the named pin
+	// (docs/operations/userspace-shim-pin-recovery.md) so the next load
+	// recreates it at the new size. Whether a plain restart suffices is
+	// MODE-DEPENDENT (#6928): a bpffs pin outlives its process, and a HITLESS
+	// shutdown deliberately preserves the pins (Manager.Close), so there a
+	// restart leaves the old-size pin in place and the pre-flight refuses
+	// again; a NON-hitless HA shutdown calls Manager.Teardown, which unpins
+	// everything, so there a restart is enough. dataplane.Cleanup() therefore
+	// has TWO production reference sites — the `xpfd cleanup` subcommand
+	// (cmd/xpfd/main.go, a direct call) and `var teardownCleanupFn = Cleanup`
+	// (loader.go), the #6743 test seam Manager.Teardown invokes — not one.
+	// Teardown's reach became INDIRECT in #6743; it did not go away.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that reference
+	// set, TestTeardownInvokesTheCleanupSeam_6928 binds that Teardown actually
+	// invokes the seam (a func value sitting in a var proves nothing on its
+	// own — deleting the invocation leaves the set unchanged), and
+	// TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) binds WHICH
+	// shutdown arm calls Teardown versus Close. None binds this comment's
+	// wording — no test can; read it against those three.
+	// Consumers MUST fall back to the zone approximation for those (see
+	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
+	// nothing" or "matches everything".
+	//
+	// Only pkg/cli — the IN-DAEMON console CLI — consumes this today. The gRPC
+	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
+	// AND clear) and the REST query in pkg/api still resolve an interface
+	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
+	// Porting them is tracked in #6975.
+	//
+	// Until that lands, an interface-filtered SHOW is exact for rows this node
+	// owns ONLY when the row's {ifindex, vlan} names a currently-configured
+	// unit; it is approximate for peer rows and for three local shapes besides
+	// (#6928 derivation). `sessionFilter.resolveIngressIfaces` returns a single
+	// name only on a hit in `ifaceNamesByKey`, and that map is rebuilt per
+	// query from the CURRENT config and the CURRENT kernel ifindex:
+	//   - a non-zero ifindex the config cannot name (unit deleted since
+	//     install, tunnel/fabric ingress with no config unit) MISSES and falls
+	//     back to the zone — the resolver's own doc says so;
+	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
+	//     different interface, which is worse than approximate: it renders one
+	//     confident WRONG name rather than a zone list;
+	//   - the map keys a unit under `vlan-id`, else `unit number`
+	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
+	//     THE WIRE. Those agree when the unit number equals the vlan id, or
+	//     when both are 0; a unit whose number is populated and whose traffic
+	//     is untagged — a plain `ge-0/0/0 unit 3` with no `vlan-id`, the
+	//     concrete case — keys 0 on the wire and `number` in the map, and
+	//     misses. Only the VLAN half diverges there: BOTH sides name the
+	//     PHYSICAL parent netdev. The helper binds AF_XDP to the parent and
+	//     stamps that bind (`UserspaceDpMeta::ingress_ifindex`); the LOGICAL
+	//     child ifindex is what `ingress_logical_ifindex` maps the
+	//     {parent, vid} pair TO, never what the row carries. So a reader
+	//     chasing this miss should not go looking for a `ge-0-0-0.3` child
+	//     ifindex in the row — it is not there (#6928 review).
+	// (Note the collision the map DOES avoid: units do not collapse onto
+	// {ifindex, 0}, because that same number-fallback separates them; a
+	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
+	// exact even when typed on the console: `clearFilteredSessions`
+	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
+	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
+	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
+	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
+	// DELETES peer flows actually received on `reth0.80`.
+	//
+	// Do not read the local exactness this field buys as an end-to-end
+	// guarantee. It is bounded on BOTH sides, and the local bound is the one
+	// easy to lose: "this node is the authority" does NOT upgrade to "exact"
+	// — the three shapes enumerated above are all rows this node owns
+	// outright, and the recycled-ifindex one is not even a miss. An interface
+	// removed and its kernel index reused by a configured sibling makes the
+	// filter AND the `If:` column report that SIBLING, confidently, for a
+	// locally-owned row. Local authority buys exactness only for the nameable
+	// subset. On the other side the clear path leaves this node entirely.
+	// #6975 carries the trace and the fix shape.
+	//
+	// REST is a separate case and is NOT merely approximate: pkg/api
+	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
+	// degrading it to a clear-all, so there is no approximate REST clear to
+	// be wrong about (#6928 review).
+	IngressIfindex uint32
+
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
+	// packet carried. 0 means the first packet's VID was zero, which is BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q tag with VID 0 and PCP/DEI set). The row stores a bare VID, so it does not distinguish them; the TX side does, via TxVlanTag on tag PRESENCE (#2149, userspace-dp/src/afxdp/README.md). Do not read 0 as "arrived untagged" (#6928).
+	//
+	// It is meaningful ONLY alongside a
+	// non-zero IngressIfindex: the pair {IngressIfindex, IngressVlanID} is
+	// exactly the sessionIfaceKey the CLI already resolves the EGRESS
+	// interface name by (buildSessionEgressIfaces keys on the PARENT netdev
+	// ifindex + the unit's VLAN), so the ingress side reuses that one map and
+	// two VLAN units of a single trunk NIC do not alias onto each other.
+	// Also part of the on-map C conntrack ABI.
+	IngressVlanID uint16
+
 	// Generation is a per-(sender,key) monotonic install generation used
 	// by the HA session-sync deferred-delete guard (#2170). It is
 	// userspace-sync-only metadata — like the LogFlagUserspace* bits — and
@@ -78,9 +239,13 @@ type SessionValue struct {
 	// Because this field is sync-only, the BPF conntrack maps are NOT
 	// registered at sizeof(SessionValue): they use the dedicated on-map ABI
 	// type bpfSessionValue (bpf_session_value.go), which omits Generation and
-	// matches the C/Rust 128-byte layout. Registering at sizeof(SessionValue)
-	// would over-size value_size by 8 bytes and OOB-write the Rust helper's
-	// lookup buffer (#2360). Do NOT mirror Generation into the BPF map.
+	// matches the C/Rust layout — 144 bytes for v4 post-#4983 (128 was the
+	// figure before the #5460 flags widen and this issue's ingress-identity
+	// growth; corrected here, #6928 review). Registering at sizeof(SessionValue)
+	// would over-size value_size and OOB-write the Rust helper's smaller lookup
+	// buffer (#2360). The excess is NOT a fixed 8 bytes either: SessionValue
+	// carries several sync-only trailing fields, so the gap is whatever they sum
+	// to. Do NOT mirror Generation into the BPF map.
 	Generation uint64
 
 	// PolicyCounterIdx is the #3073 1-based handle to the admitting rule's
@@ -193,6 +358,167 @@ type SessionValueV6 struct {
 	FibDmac    [6]byte
 	FibSmac    [6]byte
 	FibGen     uint16
+
+	// IngressIfindex is the #4983 TRUE ingress-interface identity: the ifindex
+	// of the binding the session's FIRST packet arrived on. The helper stamps
+	// it ONCE at session install from the packet's ingress binding
+	// (SessionMetadata.ingress_ifindex -> publish_conntrack) and never
+	// re-derives it from the zone — re-deriving is exactly the approximation
+	// this field exists to remove. It rides the on-map C conntrack ABI
+	// (session_value.ingress_ifindex), NOT the sync-only trailing fields below,
+	// so it is present on bpfSessionValue and round-trips through the BPF
+	// mirror.
+	//
+	// SCOPE (#6965): the stamp is on every forward session installed FROM A
+	// RECEIVED FRAME — i.e. at the three frame-driven install sites, the only
+	// places an observed ingress binding exists to copy. Two production sites
+	// install a forward (is_reverse=false) session with 0 and are not
+	// exceptions to the rule but instances of it: the host-outbound GRE
+	// encapsulation path (afxdp/tunnel.rs), where firewall-originated traffic
+	// read off the TUN device never arrived on a binding, and the HA peer
+	// import (server/helpers/session_sync.rs), which deliberately does not
+	// carry the peer's node-local ifindex. Both are listed among the
+	// legitimate zeros below.
+	//
+	// Of the frame-driven stamps, only some reach THIS map, which is what
+	// IterateSessions — and therefore `show`/`clear security flow session` —
+	// enumerates. The helper's publish_bpf_conntrack_entry is called from only
+	// three sites in afxdp/poll_descriptor: the host-inbound (LocalMiss)
+	// install, the missing-neighbor-seed install, and the reverse-companion
+	// repair (whose row is IsReverse != 0 and is skipped before filtering).
+	// The ordinary TRANSIT forward install does NOT publish here — it writes
+	// the shim's separate steering table via publish_live_session_entry — so a
+	// transit session has NO row in this map at all, and an interface filter
+	// cannot select it either way. That gap predates #4983 (it dates to the
+	// commit that first added the conntrack mirror) and is tracked as #6965;
+	// until it is closed, this field is operator-visible for the host-inbound
+	// and missing-neighbor-seed populations plus peer-synced sessions the Go
+	// side installs directly.
+	//
+	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
+	// populations legitimately carry 0 and MUST keep working:
+	//   - the reverse companion (its own ingress has not been OBSERVED yet).
+	//     The forward flow's egress IS known at install — it is the wrong
+	//     datum, being a prediction of where the reply will arrive rather than
+	//     an observation of where it did, and routing may be asymmetric. Note
+	//     every pkg/cli show/clear call site skips IsReverse != 0 before
+	//     filtering, so a reverse row is never interface-matched anyway;
+	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
+	//     number names a different NIC on this node, so carrying it across the
+	//     cluster wire would be confidently wrong, worse than approximating);
+	//   - the helper's host-outbound GRE encapsulation path, where the traffic
+	//     is firewall-self-originated off the TUN device and has no ingress
+	//     binding to record;
+	//   - the helper's flow-cache descriptor seed, which is replay state for an
+	//     already-installed session and is never published as one.
+	//
+	// FABRIC INGRESS is the one population where this field and IngressZone
+	// name DIFFERENT interfaces, so the list above is not exhaustive without
+	// it. A frame arriving over the fabric carries a zone-encoded override, so
+	// IngressZone is the ORIGINATING chassis's zone while this stamp records
+	// the LOCAL fabric NIC the frame physically arrived on. Both answer
+	// different questions correctly; they simply disagree, and an exact
+	// interface filter follows the ifindex rather than the zone. Inert today —
+	// the fabric member is declared with no config unit, so it has no
+	// {ifindex, vlan} name, the lookup misses and the CLI falls back to the
+	// zone as before. See userspace-dp/src/session/entry.rs for the full note
+	// and the operator consequence if a unit is ever added.
+	// There is deliberately NO "pre-#4983 helper, rolling upgrade" population:
+	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
+	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
+	// ValueSize mismatch against the live pin, so a new daemon never reads an
+	// old helper's 136/184-byte rows — the recovery is to unlink the named pin
+	// (docs/operations/userspace-shim-pin-recovery.md) so the next load
+	// recreates it at the new size. Whether a plain restart suffices is
+	// MODE-DEPENDENT (#6928): a bpffs pin outlives its process, and a HITLESS
+	// shutdown deliberately preserves the pins (Manager.Close), so there a
+	// restart leaves the old-size pin in place and the pre-flight refuses
+	// again; a NON-hitless HA shutdown calls Manager.Teardown, which unpins
+	// everything, so there a restart is enough. dataplane.Cleanup() therefore
+	// has TWO production reference sites — the `xpfd cleanup` subcommand
+	// (cmd/xpfd/main.go, a direct call) and `var teardownCleanupFn = Cleanup`
+	// (loader.go), the #6743 test seam Manager.Teardown invokes — not one.
+	// Teardown's reach became INDIRECT in #6743; it did not go away.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that reference
+	// set, TestTeardownInvokesTheCleanupSeam_6928 binds that Teardown actually
+	// invokes the seam (a func value sitting in a var proves nothing on its
+	// own — deleting the invocation leaves the set unchanged), and
+	// TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) binds WHICH
+	// shutdown arm calls Teardown versus Close. None binds this comment's
+	// wording — no test can; read it against those three.
+	// Consumers MUST fall back to the zone approximation for those (see
+	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
+	// nothing" or "matches everything".
+	//
+	// Only pkg/cli — the IN-DAEMON console CLI — consumes this today. The gRPC
+	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
+	// AND clear) and the REST query in pkg/api still resolve an interface
+	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
+	// Porting them is tracked in #6975.
+	//
+	// Until that lands, an interface-filtered SHOW is exact for rows this node
+	// owns ONLY when the row's {ifindex, vlan} names a currently-configured
+	// unit; it is approximate for peer rows and for three local shapes besides
+	// (#6928 derivation). `sessionFilter.resolveIngressIfaces` returns a single
+	// name only on a hit in `ifaceNamesByKey`, and that map is rebuilt per
+	// query from the CURRENT config and the CURRENT kernel ifindex:
+	//   - a non-zero ifindex the config cannot name (unit deleted since
+	//     install, tunnel/fabric ingress with no config unit) MISSES and falls
+	//     back to the zone — the resolver's own doc says so;
+	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
+	//     different interface, which is worse than approximate: it renders one
+	//     confident WRONG name rather than a zone list;
+	//   - the map keys a unit under `vlan-id`, else `unit number`
+	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
+	//     THE WIRE. Those agree when the unit number equals the vlan id, or
+	//     when both are 0; a unit whose number is populated and whose traffic
+	//     is untagged — a plain `ge-0/0/0 unit 3` with no `vlan-id`, the
+	//     concrete case — keys 0 on the wire and `number` in the map, and
+	//     misses. Only the VLAN half diverges there: BOTH sides name the
+	//     PHYSICAL parent netdev. The helper binds AF_XDP to the parent and
+	//     stamps that bind (`UserspaceDpMeta::ingress_ifindex`); the LOGICAL
+	//     child ifindex is what `ingress_logical_ifindex` maps the
+	//     {parent, vid} pair TO, never what the row carries. So a reader
+	//     chasing this miss should not go looking for a `ge-0-0-0.3` child
+	//     ifindex in the row — it is not there (#6928 review).
+	// (Note the collision the map DOES avoid: units do not collapse onto
+	// {ifindex, 0}, because that same number-fallback separates them; a
+	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
+	// exact even when typed on the console: `clearFilteredSessions`
+	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
+	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
+	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
+	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
+	// DELETES peer flows actually received on `reth0.80`.
+	//
+	// Do not read the local exactness this field buys as an end-to-end
+	// guarantee. It is bounded on BOTH sides, and the local bound is the one
+	// easy to lose: "this node is the authority" does NOT upgrade to "exact"
+	// — the three shapes enumerated above are all rows this node owns
+	// outright, and the recycled-ifindex one is not even a miss. An interface
+	// removed and its kernel index reused by a configured sibling makes the
+	// filter AND the `If:` column report that SIBLING, confidently, for a
+	// locally-owned row. Local authority buys exactness only for the nameable
+	// subset. On the other side the clear path leaves this node entirely.
+	// #6975 carries the trace and the fix shape.
+	//
+	// REST is a separate case and is NOT merely approximate: pkg/api
+	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
+	// degrading it to a clear-all, so there is no approximate REST clear to
+	// be wrong about (#6928 review).
+	IngressIfindex uint32
+
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
+	// packet carried. 0 means the first packet's VID was zero, which is BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q tag with VID 0 and PCP/DEI set). The row stores a bare VID, so it does not distinguish them; the TX side does, via TxVlanTag on tag PRESENCE (#2149, userspace-dp/src/afxdp/README.md). Do not read 0 as "arrived untagged" (#6928).
+	//
+	// It is meaningful ONLY alongside a
+	// non-zero IngressIfindex: the pair {IngressIfindex, IngressVlanID} is
+	// exactly the sessionIfaceKey the CLI already resolves the EGRESS
+	// interface name by (buildSessionEgressIfaces keys on the PARENT netdev
+	// ifindex + the unit's VLAN), so the ingress side reuses that one map and
+	// two VLAN units of a single trunk NIC do not alias onto each other.
+	// Also part of the on-map C conntrack ABI.
+	IngressVlanID uint16
 
 	// Generation: see SessionValue.Generation. Userspace-sync-only HA
 	// deferred-delete guard metadata (#2170), not in the BPF C struct.

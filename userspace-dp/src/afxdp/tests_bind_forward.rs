@@ -1158,6 +1158,8 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
         metadata: SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -1208,6 +1210,8 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
         metadata: SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -1260,6 +1264,8 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
         metadata: SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -1323,6 +1329,8 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
         metadata: SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,

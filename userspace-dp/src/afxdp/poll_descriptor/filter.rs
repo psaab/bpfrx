@@ -1512,6 +1512,11 @@ mod filter_log_egress_zone_tests {
             };
             let metadata = SessionMetadata {
                 ingress_zone: TEST_LAN_ZONE_ID,
+                // #4983: mirror the frame's own ingress binding (`meta`
+                // above), which is what the production install sites stamp.
+                // Untagged, hence vlan id 0.
+                ingress_ifindex: LAN_IFINDEX_6722 as u32,
+                ingress_vlan_id: 0,
                 egress_zone: 0,
                 owner_rg_id: 0,
                 fabric_ingress: false,

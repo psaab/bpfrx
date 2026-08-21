@@ -294,6 +294,37 @@ func (c *CLI) showFlowSession(args []string) error {
 		return zoneName
 	}
 
+	// #4983: resolve the "In: ... If:" column from the session's RECORDED
+	// ingress binding, the same datum `sessionFilter.resolveIngressIfaces`
+	// selects on. Without this the filter and the column disagree: `show
+	// security flow session interface ge-0/0/2` would select the sessions that
+	// arrived on ge-0/0/2 and then print `If: ge-0/0/0` for every one of them
+	// (the zone's FIRST interface), which reads as a bug in the filter. Same
+	// shape as sessionEgressIf above — precise when the identity is carried
+	// and nameable, zone-derived otherwise — so the two columns of one row are
+	// resolved by one rule.
+	//
+	// "the sessions that arrived on ge-0/0/2" describes the INGRESS ARM, not
+	// the whole selection (#6928 review). `matchesV4`/`matchesV6` OR the two
+	// arms — `!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)` in
+	// session_filter.go — so `interface ge-0/0/2` ALSO selects a session that
+	// arrived elsewhere and EGRESSES there. That is deliberate: an operator
+	// naming an interface wants the flows crossing it in either direction. It
+	// is also why this column can legitimately print a name other than the one
+	// filtered on, without the filter and the column having disagreed about
+	// the ingress identity.
+	sessionIngressIf := func(ingressIfindex uint32, ingressVlanID uint16, zoneID uint16, zoneName string) string {
+		if ingressIfindex != 0 {
+			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: ingressIfindex, vlanID: ingressVlanID}]; ok && ifName != "" {
+				return ifName
+			}
+		}
+		if ifName := zoneIfaces[zoneID]; ifName != "" {
+			return ifName
+		}
+		return zoneName
+	}
+
 	now := monotonicSeconds()
 
 	// printV4 prints a single IPv4 session entry inline during iteration.
@@ -357,10 +388,7 @@ func (c *CLI) showFlowSession(args []string) error {
 				sid, polName, val.PolicyID, val.Timeout)
 		}
 
-		inIf := zoneIfaces[val.IngressZone]
-		if inIf == "" {
-			inIf = inZone
-		}
+		inIf := sessionIngressIf(val.IngressIfindex, val.IngressVlanID, val.IngressZone, inZone)
 		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			srcIP, srcPort, dstIP, dstPort, protoName,
 			inIf, inZone, val.FwdPackets, val.FwdBytes)
@@ -487,10 +515,7 @@ func (c *CLI) showFlowSession(args []string) error {
 				sid, polName, val.PolicyID, val.Timeout)
 		}
 
-		inIf := zoneIfaces[val.IngressZone]
-		if inIf == "" {
-			inIf = inZone
-		}
+		inIf := sessionIngressIf(val.IngressIfindex, val.IngressVlanID, val.IngressZone, inZone)
 		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			srcIP, srcPort, dstIP, dstPort, protoName,
 			inIf, inZone, val.FwdPackets, val.FwdBytes)

@@ -36,6 +36,8 @@ mod new_flow_session_limit_tests {
         SessionMetadata {
             ingress_zone: 1,
             egress_zone: 2,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -200,6 +202,8 @@ mod strict_syn_check_tests {
         SessionMetadata {
             ingress_zone: 1,
             egress_zone: 2,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,

@@ -1276,6 +1276,8 @@ fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
         &state,
         TEST_LAN_ZONE_ID,
         TEST_WAN_ZONE_ID,
+        11,
+        50,
         true,
         decision,
     );
@@ -1284,6 +1286,9 @@ fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
     assert_eq!(metadata.egress_zone, 2);
     assert!(metadata.fabric_ingress);
     assert!(!metadata.is_reverse);
+    // #4983: the seed carries the frame's ingress binding through, not 0.
+    assert_eq!(metadata.ingress_ifindex, 11);
+    assert_eq!(metadata.ingress_vlan_id, 50);
 }
 
 #[test]
@@ -1479,6 +1484,8 @@ fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -1537,6 +1544,8 @@ fn embedded_icmp_no_route_uses_zone_encoded_fabric_redirect() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -1595,6 +1604,8 @@ fn embedded_icmp_discard_route_uses_zone_encoded_fabric_redirect() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -1649,6 +1660,8 @@ fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -2326,6 +2339,8 @@ fn helper_local_session_on_miss_stays_out_of_shared_alias_maps() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -2396,6 +2411,8 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,

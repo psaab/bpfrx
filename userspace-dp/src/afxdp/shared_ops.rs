@@ -753,6 +753,8 @@ pub(super) fn build_reverse_session_from_forward_match(
     let metadata = SessionMetadata {
         ingress_zone: forward_match.metadata.egress_zone,
         egress_zone: forward_match.metadata.ingress_zone,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         // Reverse companions are owned by the RG that currently owns the
         // client-side egress resolution, not necessarily the RG that owned the
         // original forward session. This matters during failback when a second

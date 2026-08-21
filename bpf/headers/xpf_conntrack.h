@@ -21,7 +21,8 @@ struct session_value {
 				* (0x100), which does not fit a __u8 (#5460). The
 				* compiler inserts one pad byte after `state` and
 				* two after `is_reverse`; the C/Rust/Go layouts
-				* stay byte-identical (size-asserted 136/184). */
+				* stay byte-identical (size-asserted 144/192 -- 136/184
+				* before #4983 appended the ingress-identity pair). */
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
 	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */
@@ -66,6 +67,47 @@ struct session_value {
 	__u8  fib_dmac[6];
 	__u8  fib_smac[6];
 	__u16 fib_gen;      /* FIB cache generation (matches fib_gen_map[0]) */
+
+	/* #4983: the ifindex of the binding the session's FIRST packet arrived
+	 * on -- the session's TRUE ingress-interface identity, stamped once at
+	 * install and never re-derived. Distinct from fib_ifindex above, which
+	 * is the resolved EGRESS. 0 means "no ingress identity carried" and is
+	 * NOT a valid ifindex: the reverse companion (whose own ingress has not
+	 * been OBSERVED yet -- the forward flow's egress is known at install but
+	 * is a PREDICTION of where the reply will arrive, not an observation of
+	 * where it did, and routing may be asymmetric), an HA peer-synced session
+	 * (an ifindex is node-local -- the peer's number names a different NIC
+	 * here), and the host-outbound GRE encapsulation path (self-originated
+	 * traffic read off the TUN device, which has no ingress binding to
+	 * record) all leave it 0. There is deliberately NO "pre-#4983 helper"
+	 * population here (#6928): this struct's size is part of the shim ABI
+	 * pre-flight's checked set, and validateUserspaceShimLivePins hard-refuses
+	 * a ValueSize mismatch against the live pin, so a new reader never sees an
+	 * old writer's 136/184-byte rows. Consumers MUST treat
+	 * 0 as "fall back to the zone approximation", never as "matches
+	 * nothing" or "matches everything". */
+	__u32 ingress_ifindex;
+	/* #4983: the 802.1Q VLAN id the session's first packet arrived with. 0 is
+	 * BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q
+	 * tag with VID 0 and PCP/DEI set); this bare VID does not distinguish
+	 * them, so do NOT read 0 as "arrived untagged" (#6928 -- the counter-
+	 * example is in-tree at userspace-dp/src/afxdp/frame/prop_tests/inspect.rs,
+	 * a real tag with PCP 5 and VID 0). The TX side DOES distinguish, via
+	 * TxVlanTag on tag PRESENCE (#2149).
+	 * Paired with ingress_ifindex it names the LOGICAL ingress
+	 * unit -- the same {parent ifindex, vlan} identity the egress side is
+	 * already resolved by (fib_ifindex/fib_vlan_id), so two units of one
+	 * trunk NIC are distinguishable.
+	 *
+	 * Padding, stated once so the figures elsewhere agree: appending
+	 * ingress_ifindex at the old 136/184 tail took the struct to 140/188, and
+	 * the 8-byte alignment padded it to 144/192 -- a 4-byte growth.
+	 * ingress_vlan_id then lands INSIDE that pad at 140/188, leaving 2 unused
+	 * bytes after it. So "4 bytes of tail pad" (the growth the append cost,
+	 * as bpf_map_tests.rs and the Rust mirror put it) and "2 bytes of tail
+	 * pad" (what remains unused) describe the SAME layout from either end.
+	 * sizeof grows 136 -> 144, not 136 -> 152. */
+	__u16 ingress_vlan_id;
 };
 
 /* IPv6 session key -- 5-tuple with 128-bit addresses. */
@@ -128,6 +170,15 @@ struct session_value_v6 {
 	__u8  fib_dmac[6];
 	__u8  fib_smac[6];
 	__u16 fib_gen;      /* FIB cache generation (matches fib_gen_map[0]) */
+
+	/* #4983: ingress-binding ifindex -- see session_value.ingress_ifindex
+	 * for the full contract (0 = no identity carried, fall back to the
+	 * zone approximation). */
+	__u32 ingress_ifindex;
+	/* #4983: ingress 802.1Q VLAN id -- see session_value.ingress_vlan_id.
+	 * 0 is BOTH untagged and 802.1p priority-tagged (real tag, VID 0); this
+	 * bare VID does not distinguish them (#6928). sizeof grows 184 -> 192. */
+	__u16 ingress_vlan_id;
 };
 
 /* TCP state machine transition. Returns new state. */
