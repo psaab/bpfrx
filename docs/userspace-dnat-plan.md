@@ -987,8 +987,29 @@ VIPs, so a VIP stays kernel-local and a DNAT/static match on it is still inert
 (still warns). The advisory now fires only when the address is genuinely
 kernel-local, not when it is interface-NAT-routed.
 
-**Track-2 (deferred): the full dataplane fix.** A dedicated intent map probed
+**Track-2 (NOT PLANNED): the full dataplane fix.** A dedicated intent map probed
 before the local classification (Option B) is a large, verifier-gated, HA-aware
-project deferred by the converged #5837 research plan
-(`docs/research/5837-xdp-dnat-before-local/plan.md` §0/§0a/§0b). Until it lands
-the commit warning is the honest mitigation.
+project. It was tracked as #6051 and is **plan-killed** — the commit warning is
+the terminal mitigation, not an interim one.
+
+The three reasons, all still true at HEAD:
+
+- **The verifier constraint is real and current.** `is_local_destination` lives
+  in `userspace-xdp/src/lib.rs` — the retained AF_XDP shim, which is a real eBPF
+  program under a real verifier. The eBPF *dataplane* retirement (#1373/#1476)
+  deleted `bpf/xdp/` and `bpf/tc/` but did not retire this shim, so the 1M-insn
+  cap and the tail-call ban still bind. The probe would have to live in the miss
+  arm and every degraded / binding-missing / heartbeat-stale branch and behind an
+  IPv6-AH guard, with no shimverify headroom metric to size it against.
+- **Two correctness dimensions are unsolved, not merely unimplemented**:
+  fail-closed behaviour on incomplete/failed intent-reconcile state, and
+  HA-failover generation-safety of the intent map across a primary swap.
+- **The affected population is small.** Per the interface-mode SNAT fold above,
+  the canonical masquerade + WAN-port-forward config is not affected at all. The
+  residual is a DNAT / static-NAT rule matching an interface address on an
+  interface whose zone is not the to-zone of any interface-mode source-NAT rule —
+  and it warns at commit with the workaround stated.
+
+The converged design survives on branch `research/5837-xdp-dnat-before-local`
+(`docs/research/5837-xdp-dnat-before-local/plan.md` §0b + §1-§13) if a measured
+operator report on that residual ever revives it.

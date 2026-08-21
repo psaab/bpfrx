@@ -2172,10 +2172,15 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 // canonical source-prefix list on the Go and Rust wire, stable logical-
 // interface / routing-instance identity at both lookup points, symmetric
 // outbound interpretation for stateless NPTv6, and overlap-registry
-// partitioning) is a substantial wire+dataplane change deferred to a /research
-// follow-up. Until then the only correct disposition is to reject the
-// unsupported-scope NPTv6 rule LOUDLY at commit rather than silently install an
-// over-broad rewrite.
+// partitioning) is a substantial wire+dataplane change. It was tracked as #6043
+// and is PLAN-KILLED: `from zone`-only NPTv6 (#5176) is fully honored and is the
+// RFC 6296 deployment shape, so full scoped support is a demand-gated enhancement
+// whose price includes a helper capability/protocol gate to stop a newer manager
+// handing a constrained rule to an older helper that would install it globally.
+// This reject is therefore the TERMINAL disposition, not an interim one: refuse
+// the unsupported-scope NPTv6 rule LOUDLY at commit rather than silently install
+// an over-broad rewrite. The acceptance matrix in #5818 is preserved and remains
+// the correct starting point if a real operator request ever revives it.
 //
 // Reject condition (precise): an NPTv6 rule-set (one containing >= 1 nptv6-prefix
 // rule) whose FromInterface != "" OR FromRoutingInstance != "", or any NPTv6 rule
