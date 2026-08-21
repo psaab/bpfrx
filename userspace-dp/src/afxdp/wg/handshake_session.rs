@@ -135,7 +135,7 @@ impl WgEngine {
         state: Option<HandshakeState>,
         role: SessionRole,
     ) -> Result<u32, HandshakeError> {
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.reserve_pending_locked(peer_pubkey, state, role)
     }
 
@@ -162,9 +162,9 @@ impl WgEngine {
         if self.peer_arc(&peer_pubkey).is_none() {
             return Err(HandshakeError::UnknownPeer);
         }
-        let by_index = self.sessions_by_local_index.read().unwrap();
-        let mut pending = self.pending.write().unwrap();
-        let mut by_peer = self.pending_by_peer.write().unwrap();
+        let by_index = self.sessions_by_local_index.read().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
+        let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
 
         // Abort any prior PENDING (not-yet-completed) handshake for this
         // peer (DoS bound: at most one pending reservation per peer). The
@@ -242,10 +242,10 @@ impl WgEngine {
     /// `pending` (never in the live-session demux map), so there is nothing
     /// to undo in `sessions_by_local_index`. Idempotent.
     fn release_pending(&self, local_index: u32) {
-        let _guard = self.reconcile_lock.lock().unwrap();
-        let mut pending = self.pending.write().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ph) = pending.remove(&local_index) {
-            let mut by_peer = self.pending_by_peer.write().unwrap();
+            let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
             // Only clear the peer→index map if it still points at us.
             if by_peer.get(&ph.peer_pubkey) == Some(&local_index) {
                 by_peer.remove(&ph.peer_pubkey);
@@ -321,7 +321,7 @@ impl WgEngine {
         // Stash the real (post-write) snow state into the pending entry so
         // `consume_response` can resume it.
         {
-            let mut pending = self.pending.write().unwrap();
+            let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
             if let Some(ph) = pending.get_mut(&local_index) {
                 ph.state = Some(state);
             } else {
@@ -339,7 +339,7 @@ impl WgEngine {
     /// `create_initiation_inner` after `build_initiation` has written MAC1
     /// and zeroed MAC2. Slow path (control thread only).
     fn add_initiator_macs(&self, peer_pubkey: &[u8; WG_KEY_LEN], out: &mut [u8], now_ns: u64) {
-        let mut cg = self.cookie_gen.lock().unwrap();
+        let mut cg = self.cookie_gen.lock().unwrap_or_else(|e| e.into_inner());
         let entry = cg
             .entry(*peer_pubkey)
             .or_insert_with(super::cookie::InitiatorCookie::new);
@@ -383,7 +383,7 @@ impl WgEngine {
         let Some(peer_pubkey) = self.peer_for_pending_index(recv_index) else {
             return false;
         };
-        let mut cg = self.cookie_gen.lock().unwrap();
+        let mut cg = self.cookie_gen.lock().unwrap_or_else(|e| e.into_inner());
         let entry = cg
             .entry(peer_pubkey)
             .or_insert_with(super::cookie::InitiatorCookie::new);
@@ -398,7 +398,7 @@ impl WgEngine {
     fn peer_for_pending_index(&self, index: u32) -> Option<[u8; WG_KEY_LEN]> {
         self.pending
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&index)
             .map(|ph| ph.peer_pubkey)
     }
@@ -442,12 +442,12 @@ impl WgEngine {
         // Hold reconcile_lock across the whole completion so the reservation
         // cannot be aborted out from under us and the index never disappears
         // from both maps.
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // Validate + take the snow state. The entry stays in `pending`
         // (state = None) so the index remains reserved.
         let (peer_pubkey, mut state) = {
-            let mut pending = self.pending.write().unwrap();
+            let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
             let ph = pending
                 .get_mut(&local_index)
                 .ok_or(HandshakeError::NoPendingHandshake)?;
@@ -465,7 +465,12 @@ impl WgEngine {
         // kill the pending handshake.
         let mut sink = [0u8; MSG_RESPONSE_NOISE_LEN];
         if state.read_message(parsed.noise_body, &mut sink).is_err() {
-            if let Some(ph) = self.pending.write().unwrap().get_mut(&local_index) {
+            if let Some(ph) = self
+                .pending
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&local_index)
+            {
                 ph.state = Some(state);
             }
             return Err(HandshakeError::Crypto);
@@ -509,9 +514,9 @@ impl WgEngine {
     /// Clear a reservation's `pending` entry and its `pending_by_peer` marker
     /// (if it still points at this index). Caller MUST hold `reconcile_lock`.
     fn clear_reservation_locked(&self, local_index: u32, peer_pubkey: &[u8; WG_KEY_LEN]) {
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
         pending.remove(&local_index);
-        let mut by_peer = self.pending_by_peer.write().unwrap();
+        let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
         if by_peer.get(peer_pubkey) == Some(&local_index) {
             by_peer.remove(peer_pubkey);
         }
@@ -599,7 +604,7 @@ impl WgEngine {
         // reserve and install (Codex round-2 race). The responder completes
         // synchronously in this single call, so the pending entry is a bare
         // reservation marker (state = None).
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         let local_index =
             self.reserve_pending_locked(peer_pubkey, None, SessionRole::Responder)?;
 
