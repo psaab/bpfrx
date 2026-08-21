@@ -1,3 +1,117 @@
+## 2026-08-21 — #6871 round 17: merge master's #6743 dataplane cell; runtime re-gate
+
+- **Timestamp**: 2026-08-21 (fix/5103-reth-worker-join)
+- **File(s)**: `_Log.md`, `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/reth_callsite_effect_5103_test.go`,
+  `pkg/daemon/reth_lease_abandon_6871_test.go`,
+  `pkg/daemon/reth_lease_renew_6871_test.go`,
+  `pkg/daemon/reth_prepare_abort_recovery_5103_test.go`,
+  `pkg/daemon/reth_rollback_failure_6871_test.go`,
+  `pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go`,
+  `pkg/dataplane/userspace/runtime_adapter_binding_6871_test.go`,
+  `docs/refactoring-audit-current.txt`
+- **Action**: merged `origin/master` (222 commits) and re-gated the runtime
+  property rather than opening another guard round. Rounds 15 and 16 moved no
+  production code, so the executable work has been settled since `aec8e7881`;
+  this round is the master merge plus an independent runtime pass.
+
+  **The merge.** Master's #6743 replaced `Daemon.dp` with an atomic cell read
+  through `d.dataplane()`, with an AST canary that fails the build on direct
+  `.dpCell` access. Two conflicts in `daemon_apply_dataplane.go`, both resolved
+  to this branch: master's only change to that file over the merge base is the
+  mechanical accessor rename, verified by reading master's own diff hunk by
+  hunk, so the branch's `programRethMemberMAC` / `finishRethMemberLinkTail`
+  decomposition supersedes it. `_Log.md` union-resolved and checked
+  STRUCTURALLY, not by eye: 3143 Timestamps / 1660 `##` / 25 `###`, exactly
+  ours+theirs-base. `docs/refactoring-audit-current.txt` is generated, so it was
+  rebuilt with `scripts/refactoring-audit.sh`.
+
+  **One substantive resolution, not a rename.** The rollback in
+  `programRethMACWithWorkerJoin` re-read `d.dp` and relied on `joinRan`
+  implying non-nil. Against a publication CELL that reasoning no longer holds —
+  the value can be swapped or cleared between the join and the rollback, so a
+  re-read could nil-deref or rebind a dataplane whose workers this hook never
+  stopped. The hook now pins the instance it joined in `joined` and the
+  rollback rebinds through that pin, which makes the rollback provably the
+  inverse of its own join. Measured as UNBOUND: reverting the pin to
+  `d.dataplane().Link()` and deleting the local leaves `go test -count=1
+  ./pkg/daemon/...` GREEN (rc=0). Filed rather than folded, per the campaign
+  bar.
+
+  **The guard did its job on the merge.** The receiver spelling changed from
+  `d.dp.Link()` to `rt.Link()`, and
+  `TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871` failed in BOTH
+  directions — naming the new site as unlisted and the old allowlist entry as
+  stale. That is the round-15 occurrence table working as designed. Both keys
+  were re-spelled, along with the guard's illustrative plant snippets and two
+  RED-on-revert instructions that quoted a field which no longer exists.
+
+  **Independent runtime pass — no defect found.** What was attacked:
+
+  - *A blocked or timing-out join.* `requestLocked` -> `requestDetailedLocked`
+    dials with a 2s timeout and sets `controlRoundtripDeadline` on the
+    round trip, so `stop_workers` cannot block forever. On any error
+    `programRethMAC` returns `(false, err)` BEFORE `setDown`, so the link is
+    never cycled with workers possibly live; the member keeps its old MAC and
+    the commit fails closed. Correct direction.
+  - *A repeated join across members.* This PR calls `PrepareLinkCycle` per
+    cycling member where master called it once. The helper's `stop_workers`
+    handler returns `()` with no error path and `stop_and_clear` iterates a
+    possibly-empty `records`, so the second join is a clean no-op — no new
+    failure mode from the extra call.
+  - *Racing `ReconcileVIPs` / the GARP burst.* `reconcileAfterRethLinkCycle` is
+    gated on `needLinkCycleRecovery` and still runs after the whole member
+    loop, exactly as on master; the reorder moves the join, not the reconcile.
+    The lease gates helper IPC only — it does not touch netlink address adds or
+    the AF_PACKET GARP path.
+  - *A failover arriving mid-cycle.* The asymmetry is the right one and it is
+    load-bearing. `update_ha_state` carries per-RG `Active` and is deliberately
+    NOT lease-gated, so a DEMOTION reaches the helper immediately. A PROMOTION's
+    `set_forwarding_state` is deferred, but the decision is level-triggered on
+    `desiredForwardingArmedLocked()` vs `lastStatus.ForwardingArmed` and
+    `syncDesiredForwardingStateLocked` sits in the status-tick body
+    (`process_status.go:276`) after the gate, so the first tick after
+    `NotifyLinkCycle` re-evaluates and sends it. Deferral, not loss.
+  - *Deadlock against the VRRP state machine.* `PrepareLinkCycle` holds `m.mu`
+    across a socket round trip whose completion depends only on the helper
+    process; nothing under `m.mu` calls back into the daemon or VRRP, so a
+    VRRP-driven `UpdateRGActive` blocking on `m.mu` is a wait, not a cycle.
+    `stopLinkCycleHeartbeat` drops `linkCycleHB.mu` BEFORE joining, and the
+    heartbeat goroutine touches only the atomic lease word.
+  - *Completeness of the gate, enumerated rather than trusted.* Every
+    production site building a worker-affecting request was listed and each leg
+    checked: the three operator verbs carry `errLinkCycleInFlight`;
+    `maybeAutoRebindBusyBindingsLocked` and `retryDeferredWorkerArmLocked` have
+    exactly one caller each and it is the lease-gated tick body;
+    `syncDesiredForwardingStateLocked` gates itself; the compile-path and
+    overlay publishes serialize on `d.applySem`, which
+    `applyDataplaneAndHACore` also holds (`daemon_apply.go:50` ->
+    `applyConfigLocked` -> `:289`), and `actuateRouteOverlay` — the only
+    cross-goroutine publisher — acquires the same semaphore at
+    `daemon_ipmon.go:249` before its publish at `:314`.
+  - *`programRethMAC` itself.* Comment-stripped against master, the ONLY code
+    changes are the signature, the `liveSetErr` capture, the log wording and
+    the hook block. Every pre-existing return path — `setDown` failure, cycled
+    MAC-write failure, `setUp` failure — is byte-identical. The reordering is
+    surgical.
+
+  **#6996 (`renameRethMember`), checked rather than assumed.** Comment-stripped
+  `renameRethMember` is IDENTICAL to `origin/master`, so it is untouched by this
+  PR and non-blocking under the campaign bar. Its open reachability question is
+  narrowed, not answered: AF_XDP binds by `binding.ifindex`
+  (`userspace-dp/src/afxdp/bind.rs:80`), and a netlink rename PRESERVES the
+  ifindex — so a socket bound before a rename keeps polling the same queue, and
+  `renameRethMember`'s DOWN/rename/UP would race it. What is still unmeasured is
+  whether a binding can be live at that moment at all, since the call is reached
+  only when `LinkByName(linuxName)` fails. Recorded on the issue.
+
+- **Validation**: `go build ./...` rc=0; `go vet ./...` rc=0 (read directly, not
+  through a pipe); `go test -count=1 ./...` rc=0, 62 packages, zero FAIL. No
+  Rust in the diff (`userspace-dp/`, `userspace-xdp/`, `bpf/` all empty), so no
+  helper-binary change — but the Go daemon binary does move and this is RETH /
+  VRRP / failover code, so a `make test-failover` smoke is OWED before merge and
+  is the parent's to run.
+
 ## 2026-08-13 — #6871 round 7: bind the production adapters; renew the lease where the time actually goes
 
 - **Timestamp**: 2026-08-13 (fix/5103-reth-worker-join)
