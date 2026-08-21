@@ -7,15 +7,15 @@
 [REFACTOR]   2459  userspace-dp/src/afxdp/worker/loop_body/mod.rs
 [REFACTOR]   2458  userspace-dp/src/nat/allocator.rs
 [REFACTOR]   2358  pkg/daemon/daemon_nft.go
-[REFACTOR]   2313  pkg/config/compiler_opts.go
+[REFACTOR]   2332  pkg/config/compiler_opts.go
 [REFACTOR]   2310  pkg/daemon/daemon_system.go
 [REFACTOR]   2310  userspace-dp/src/afxdp/neighbor.rs
 [REFACTOR]   2288  pkg/ddns/surface_a.go
 [REFACTOR]   2258  userspace-dp/src/afxdp/cos/queue_service/mod.rs
 [REFACTOR]   2227  userspace-dp/src/session/mod.rs
 [REFACTOR]   2165  pkg/config/compiler_services.go
+[REFACTOR]   2087  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2074  pkg/dhcprelay/relay.go
-[REFACTOR]   2073  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
 [REFACTOR]   2034  userspace-dp/src/afxdp/frame/mod.rs
 [WATCH]      1990  pkg/grpcapi/server_sessions.go
@@ -37,6 +37,7 @@
 [WATCH]      1639  pkg/api/sessions.go
 [WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
 [WATCH]      1606  pkg/cmdtree/tree.go
+[WATCH]      1603  userspace-dp/src/afxdp/poll_descriptor/filter.rs
 [WATCH]      1595  pkg/cluster/heartbeat.go
 [WATCH]      1581  pkg/routing/rules.go
 [WATCH]      1575  pkg/dataplane/userspace/eventstream.go

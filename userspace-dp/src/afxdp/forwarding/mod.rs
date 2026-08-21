@@ -56,11 +56,17 @@ pub(super) fn zone_pair_for_flow_with_override(
                 .and_then(|id| forwarding.zone_id_to_name.get(id).cloned())
         })
         .unwrap_or_default();
-    let to_zone = forwarding
-        .egress
-        .get(&egress_ifindex)
-        .and_then(|iface| forwarding.zone_id_to_name.get(&iface.zone_id).cloned())
-        .unwrap_or_default();
+    // #6713: resolve through the shared `egress_zone_id` so this test-only
+    // String twin cannot report a different to-zone than the production
+    // u16 resolver below.
+    let to_zone = match forwarding.egress_zone_id(egress_ifindex) {
+        0 => String::new(),
+        id => forwarding
+            .zone_id_to_name
+            .get(&id)
+            .cloned()
+            .unwrap_or_default(),
+    };
     (from_zone, to_zone)
 }
 
@@ -83,11 +89,21 @@ pub(super) fn zone_pair_ids_for_flow_with_override(
     let from_id = ingress_zone_override
         .or_else(|| forwarding.ifindex_to_zone_id.get(&ingress_ifindex).copied())
         .unwrap_or(0);
-    let to_id = forwarding
-        .egress
-        .get(&egress_ifindex)
-        .map(|iface| iface.zone_id)
-        .unwrap_or(0);
+    // #6713: the to-zone comes from `ForwardingState::egress_zone_id`, which
+    // reads `ifindex_unambiguous_zone_id` — the ONLY map it reads; the `egress`
+    // arm this comment once described was removed once `populate_egress` began
+    // sourcing `EgressInterface::zone_id` from that same ledger, so the two arms
+    // had become the same number (see that function's doc, "WHY THERE IS NO
+    // LONGER AN `egress` ARM"). NOT `ifindex_to_zone_id` — that map is the from-zone source
+    // and carries the LAST zoned row on an ifindex plus the child->parent
+    // propagation, so reading it as the to-zone hands an interface a zone the
+    // operator never configured on it (#6722). An IPsec secure tunnel (xfrmi) NEVER has one — it is
+    // MAC-less, and `populate_egress` requires a resolvable link-layer address
+    // — so before this the to-zone of a correctly-zoned tunnel resolved to the
+    // "unknown" sentinel 0, against which policy evaluation refuses to match
+    // any rule, and every LAN->tunnel packet fell to the default policy no
+    // matter what the operator permitted.
+    let to_id = forwarding.egress_zone_id(egress_ifindex);
     (from_id, to_id)
 }
 

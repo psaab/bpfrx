@@ -791,6 +791,467 @@ supports protocol + port ranges. `rule.inactive` is the policy-scheduler result
 published by the Go daemon; inactive scheduled rules are skipped before any
 match side effects or counters.
 
+**Zone-pair resolution — the egress half (#6713).** `ingress_zone` and
+`egress_zone` above are u16 ids resolved by
+`forwarding::zone_pair_ids_for_flow_with_override`. The ingress half reads
+`ForwardingState::ifindex_to_zone_id`; the egress half calls
+`ForwardingState::egress_zone_id`, which prefers the denormalized
+`EgressInterface.zone_id` (one map lookup + a field load on the hot path,
+**including when that field is 0** — see the short-circuit below) and falls back
+to `ForwardingState::ifindex_unambiguous_zone_id` when the interface has **no
+`egress` row at all**.
+
+That fallback is load-bearing, not defensive. `forwarding_build::populate_egress`
+builds an `EgressInterface` only for an interface whose link-layer address it can
+resolve — the row carries `src_mac` + `bind_ifindex`, i.e. an assertion that an
+Ethernet frame can be built for it and handed to an AF_XDP bind target. An IPsec
+secure tunnel (`st0`, an xfrmi) is `ARPHRD_NONE` and fails that gate
+unconditionally: `hardware_addr` is empty, `mac_by_ifindex[parent]` is absent
+(the parent is itself a MAC-less xfrmi), and `iface.tunnel` means a Junos
+`tunnel { source destination }` stanza that `st0` does not have. Reading the
+to-zone from `egress` alone therefore yielded id **0** for a correctly-zoned
+tunnel — and 0 is the reserved "unknown zone" sentinel that
+`evaluate_policy_result_l3_aware` refuses to match ANY exact, wildcard or
+`junos-global` rule against. Every LAN→tunnel packet was adjudicated as
+`(lan, 0)`, no operator-authored permit could apply, and the drop was attributed
+to the implicit default policy — pointing every diagnostic at the wrong place.
+
+Scope of the fallback:
+
+- **An ifindex is not a unit identity, so the fallback refuses to guess (#6722).**
+  `pkg/dataplane/userspace/interfaces.go`'s `snapshotLinuxName` collapses a
+  non-VLAN unit 0 onto its base netdev, so `st0` and `st0.0` are ONE ifindex, as
+  are `ge-0/0/1` and `ge-0/0/1.0`. And `buildInterfaceZoneMap`
+  (`pkg/dataplane/userspace/zones.go`) writes `out[base]` for a unit-suffixed
+  zone reference, so zoning `st0.1` zones `st0` as well. `ifindex_to_zone_id` is
+  therefore a per-NETDEV map: the last zoned row on that ifindex, plus the zone
+  `populate_interfaces` propagates from a zoned child unit onto
+  `parent_ifindex`.
+
+  Reading it as the egress answer hands an interface a nonzero zone it was never
+  configured with — and a nonzero to-zone is exactly what makes an operator's
+  permit MATCH, so that direction is fail-OPEN. Three producible shapes do it:
+
+  1. Zone only `st0.1`; the Go builder still stamps the `st0` BASE row with
+     `vpnb`, and `st0.0` — which the operator deliberately left in NO zone —
+     shares the base's ifindex.
+  2. Two units in DIFFERENT zones on one `st0` with unit 0 unzoned. The
+     `out[base]` write is first-write-wins over SORTED zone names, so unit 0's
+     ifindex carries the alphabetically-first sibling's zone.
+  3. StableZoneID quarantine (`zones_quarantine.go`), which blanks `Zone` on the
+     interfaces of a colliding zone AFTER `buildInterfaceSnapshots` ran,
+     precisely so they fail CLOSED. The base arrives unzoned beside a surviving
+     zoned child, the Rust child→parent propagation re-zones the parent ifindex,
+     and reading it would hand the quarantine's deliberate default-deny back the
+     survivor's zone.
+
+  So the fallback reads `ifindex_unambiguous_zone_id`, which carries an ifindex
+  only when the **Go builder** decided that ifindex identifies exactly one zone
+  and a row on it corroborated the name. An ifindex Go left with no answer, and
+  one whose claim no row supports, are both absent, and `egress_zone_id` then
+  resolves the **0 sentinel** — the pre-#6713 answer, against which no exact,
+  wildcard or `junos-global` rule matches, so the default policy decides.
+
+  This deliberately makes the two DIRECTIONS disagree for an ambiguous ifindex:
+  ingress still attributes an arriving packet to `ifindex_to_zone_id`
+  (#921/#3618, unchanged), while egress answers 0. The asymmetry is justified by
+  DIRECTION, not by the ingress surface being unreachable — that is only true in
+  shape 3, where every row is unzoned and the two Go-side derivations that scope
+  ingress both open with `if iface.Zone == "" ||
+  userspaceSkipsIngressInterface(iface)`: `UserspaceBoundLinuxInterfaces`
+  (`interfaces.go:133`, guard at `:164`) and `buildUserspaceIngressIfindexes`
+  (`maps_sync.go:1585`, guard at `:1592`). Together they give the ifindex no
+  AF_XDP bind target at all. In shapes 1 and 2 the base row is zoned, so the ifindex *is* a bind
+  target and ingress really does answer `vpnb` for arriving traffic. What makes
+  the two halves different is that ingress answering wide is pre-existing
+  behaviour this change does not touch, while egress answering wide is a NEW
+  fail-open on the exact interface class #6713 routed through the fallback:
+  a to-zone is what makes a permit match. Whether the ingress half should be
+  narrowed the same way is a separate #921/#3618 question, not settled here.
+  Where the ifindex is UNambiguous — #6713's own shape, `bind-interface st0`
+  with its unit in the same zone — both halves still answer the same zone, so
+  #6713 is untouched.
+
+  Junos zones logical UNITS, so the remaining gap runs the other way: `st0.0`
+  and `st0.1` cannot be given DIFFERENT zones and both forward. Closing that
+  needs per-unit identity end to end — the snapshot's unit-0 ifindex collapse,
+  both halves of the zone resolver, and the AF_XDP bind keying — and is tracked
+  separately rather than papered over at this one read. Until then such a pair
+  fails closed rather than guessing.
+
+  The Rust child→parent zone propagation in `populate_interfaces` is
+  **reachable** for a Go-produced snapshot: shape 3 above is the counterexample.
+  `pkg/dataplane/userspace/zone_propagation_6722_test.go` measures all of it —
+  the `out[base]` write, the unit-0 ifindex collapse, and (through the full
+  `buildSnapshot`, on the lenient load path the strict commit gate rejects) the
+  post-quarantine unzoned base beside a surviving zoned child — so the
+  userspace-dp fixtures modelling these shapes cannot drift to a snapshot the
+  builder cannot emit.
+- **The egress row's `zone_id` comes from the ledger too (#6722 B1).**
+  *(Historical, as of round 9.)* `egress_zone_id` then read `state.egress`
+  BEFORE the fallback, and `populate_egress` writes that map **last-write-wins
+  per ifindex**. While the row's own zone was the source, a zoned row emitted
+  last re-armed an ifindex the ledger held ambiguous and the gate was bypassed
+  entirely — the to-zone never consulted the ledger at all. Round 10 removed
+  the `state.egress` arm outright; see the entry below on why it stopped being
+  load-bearing. The defect and the fix are recorded here because the shape is
+  what motivated the single-source rule.
+
+  That is not confined to MAC-less interfaces. An interface-level WireGuard
+  tunnel maps EVERY unit onto the base device (`TunnelNameMap`,
+  `pkg/config/types.go`, whose interface-level branch explicitly admits
+  WireGuard despite its empty GRE-style `source`), so `wg0`, `wg0.0` and
+  `wg0.1` are one netdev and one ifindex; they carry `tunnel = true`, so
+  `populate_egress`'s `src_mac` gate admits them via
+  `iface.tunnel.then_some([0; 6])` and they DO get egress rows. Zone only
+  `wg0.1` and transit routed out the deliberately-unzoned `wg0.0` matched
+  `from-zone lan to-zone vpnb permit`.
+
+  `populate_egress` therefore takes `zone_id` from
+  `ifindex_unambiguous_zone_id` rather than from the row it is writing. That is
+  still true at round 10 and is what makes the single-arm resolver sound: with
+  both the resolver and `EgressInterface::zone_id` reading the same map, the
+  `state.egress` arm could only ever have returned the number the remaining arm
+  returns, which is why it was deleted rather than kept as a second opinion (see
+  "`egress_zone_id` no longer has an `egress` arm" below). Where the rows agree
+  the value is identical to the row's own zone, so an ordinary single-unit
+  interface is unaffected.
+
+- **The egress answer is decided in Go, and the helper corroborates it
+  (#6722 round 10).** `stampEgressZones`
+  (`pkg/dataplane/userspace/interfaces.go`) computes, per ifindex, the zone that
+  ifindex egresses into, and ships it as `InterfaceSnapshot.egress_zone`.
+  `populate_interfaces` reads it and adjudicates nothing.
+
+  **Why the decision had to move.** Rounds 4 through 9 built the answer in Rust
+  by polling the rows — "do all rows on this ifindex agree?" — and exempting the
+  rows whose agreement or dissent was an artefact rather than an observation.
+  NINE spellings of that exemption were produced across the issue's life and
+  every one was holed by a config shape it had not enumerated: the raw
+  `redundant-parent` string re-derived from row names; co-resident row names;
+  the SET of netdevs the parent's rows occupy; and finally `snapshotLinuxName`
+  of the parent's BASE row, which was holed three more times in one round (a
+  multi-unit base row whose zone is fanned up from a sibling unit and votes
+  against unit 0; an AUTHORED dotted name `ge-0/0/1.100` aliasing `reth1.100`;
+  a WireGuard interface named as a reth member, which inherited the reth's zone
+  — the one fail-OPEN of the set).
+
+  The reason is structural. A row's `zone` is the OUTCOME of
+  `buildInterfaceZoneMap`'s derivation: a unit-suffixed reference also writes
+  `out[base]`, and a bare reference also writes `out[base.<unit>]` for every
+  unit. By the time a row exists, "the operator zoned this identity" and "some
+  other identity was zoned and this row inherited the words" are
+  indistinguishable — and several identities land on ONE netdev
+  (`snapshotLinuxName` collapses a non-VLAN unit 0 onto its base, a RETH onto
+  its member via `ResolveReth`, and every unit of an interface-level tunnel onto
+  the tunnel device). Provenance is not recoverable downstream from the outcome.
+  **The enumeration was the defect, not any particular missing case.**
+
+  So the provenance is carried instead. `authoredZoneRefs`
+  (`pkg/dataplane/userspace/zones.go`) records the operator's literal
+  `security-zone <z> interfaces <ref>` bindings — expanded to every identity a
+  reference SPEAKS FOR, but never to one it does not. A BARE interface reference
+  is fanned DOWN onto that interface's configured units, because in xpf
+  `security-zone lan interfaces ge-0/0/1` MEANS "every unit of ge-0/0/1 is in
+  lan": that is the semantics `buildInterfaceZoneMap` defines and the ingress
+  half has always enforced, so a unit of a bare-referenced interface is authored
+  rather than inheriting a sentence about somebody else. A unit-suffixed
+  reference is NOT fanned UP to its base — that is the direction that
+  manufactures a claim about a different identity, since the base netdev is
+  shared with the sibling units the operator said nothing about.
+
+  Omitting the fan-down was measured as a blackhole in its own right: a unit that
+  lands on its OWN netdev (any VLAN unit, any non-zero unit) is reached by
+  neither rule 2 — no reference names its row — nor rule 3, which is skipped
+  because a unit row IS on that ifindex, so a bare-referenced trunk's VLAN units
+  resolved the 0 sentinel on egress while the ingress half still answered the
+  operator's zone. `origin/master` answered the zone in both directions.
+
+  `stampEgressZones` resolves those bindings through the same aliasing the
+  builder performs. Three rules, in order:
+
+  1. **Contested ownership → no zone.** An ifindex carrying two or more distinct
+     egress identities is one kernel device the config claims twice. That is
+     legitimate for exactly one relation — a reth and the bare member port that
+     names it (`egressRethMemberOf` / `egressMemberIsBarePort`) — and a fiction
+     otherwise.
+
+     ONE narrowing (`egressOneOwnerUnitsAgree`): when every identity on the
+     ifindex belongs to the SAME configured interface — an interface-level
+     tunnel maps every unit onto the tunnel netdev, so `gr-0/0/0.0` and
+     `gr-0/0/0.1` are two identities on one device — the refusal applies only
+     when they DISAGREE. If every logical-unit row on the ifindex carries the
+     same authored zone there is nothing to be ambiguous about, and refusing
+     costs the tunnel every transit flow it has (`origin/master` resolved it). If
+     any unit row is unauthored the omission is a statement and the ifindex still
+     fails closed, which is what keeps `wg0.1` zoned beside a deliberately
+     unzoned `wg0.0` from adjudicating under its sibling's policy.
+  2. **Authored → that zone.** Every literal binding, resolved to an ifindex by
+     the row whose name it uses. Exactly one distinct zone wins; two or more is
+     a real conflict about a real device and resolves to no zone.
+  3. **Trunk carrier → the units' unanimous zone.** An ifindex with no authored
+     binding and NO logical unit row on it is a bare tagged-parent netdev whose
+     children all live on their own `<dev>.<vlan>` devices. It takes the zone its
+     units unanimously name — which is what keeps the reference cluster's
+     `reth0` base (ifindex 25) zoned `wan`, matching `origin/master`.
+     Unanimity is over the units that actually SAY something: an unzoned unit
+     and a present-but-nil unit slot (the tolerant-load / HA config-sync shape of
+     #3494/#5068) are skipped rather than counted as dissent, and units naming
+     DIFFERENT zones resolve no zone at all.
+
+  Two properties hold across all three rules and are load-bearing rather than
+  incidental, so each has a binder in
+  `pkg/dataplane/userspace/egress_zone_identity_6722_test.go` (#6722 round 12):
+
+  - **The two zone maps must not disagree.** `authoredZoneRefs` and
+    `buildInterfaceZoneMap` are built by separate code for separate consumers,
+    but they read the same operator sentences through the same canonicalizer and
+    pick a winner the same way — zone names sorted, first write wins. Rule 2
+    resolves from the first while the helper's corroboration check reads rows
+    stamped from the second, so a divergence about a reference BOTH maps hold is
+    a claim the helper will honour under a zone the operator did not write for
+    that identity. They are free to diverge in future — a move to Junos per-unit
+    zoning would want one to stop fanning up to the base — but not silently.
+  - **Every answer must be order-stable.** Nothing here may depend on Go's
+    randomized map iteration. An egress zone that varies with the map seed is a
+    to-zone that changes across daemon restarts on an unchanged config, and a
+    "fail closed" that holds in only some iteration orders is not failing closed.
+    The fail-closed cells therefore rebuild and re-assert rather than sampling
+    one order.
+
+  Measured through the full `buildSnapshot` on `docs/ha-cluster-userspace.conf`
+  (node 0 — the topology `test/incus/loss-userspace-cluster.env` points every HA
+  smoke test at):
+
+  ```
+  ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]  -> egress_zone "lan" (rule 2)
+  ifindex 25: [ge-0/0/2="" reth0="wan"]                -> egress_zone "wan" (rule 3)
+  DefaultPolicy="deny"
+  ```
+
+  Before #6722 those ifindexes went ambiguous, collapsed the egress zone to the
+  0 sentinel and — under `deny-all` — blackholed every WAN→LAN, sfmix→LAN and
+  tunnel→LAN transit flow on a bondless-RETH cluster. LAN→WAN survived because
+  its egress ifindex has a single identity, which is why an iperf3 smoke in the
+  usual direction came back green. The INGRESS half was unaffected throughout
+  (`ifindex_to_zone_id[24]` still carried `lan`); that asymmetry is the
+  diagnostic tell.
+
+- **What this makes unrepresentable, and what it does not.** There is no longer
+  any per-row classification predicate on the dataplane side — no "is this row a
+  projection", no exemption list, nothing for a new config shape to disagree
+  with. A row's `zone` is never consulted to adjudicate. What the helper still
+  does is CORROBORATE: an ifindex takes `egress_zone` only if some row on it
+  literally names that zone, so a version-drifted or hostile snapshot can never
+  conjure a zone no row on the ifindex named (the #2391/#2409/#2706
+  helper-boundary property). An absent, unknown or uncorroborated answer
+  resolves 0.
+
+  What it does NOT make unrepresentable is the model rule itself. "A reth member
+  is a bare L2 port — no logical units, no tunnel, not itself a reth" is
+  imported from Junos and is irreducibly a definition. It now lives in one place,
+  stated positively, and is read by both halves:
+  `validateRethMemberStrict` (`pkg/config/compiler_validate_strict_reth_member.go`)
+  hard-rejects a violation at commit, and `egressMemberIsBarePort` applies the
+  same rule at runtime for the tolerant load / peer-sync path where that
+  rejection is downgraded to a warning (#1960 no-brick). A violation admitted
+  there leaves the shared device with two independent claimants, so its ifindex
+  identifies no zone and fails CLOSED.
+
+  The five rejected shapes: a member naming **itself**; a **reth** naming a
+  redundant parent of its own; a member naming a parent that is **not
+  configured**; a member carrying its **own logical units**; and a member
+  carrying its **own tunnel**. The last two are the fail-OPEN pair — an
+  independently addressed member unit, and an independently routed WireGuard
+  endpoint, each silently inheriting the reth's zone.
+
+- **The snapshot wire contract moved to version 5 (#6722 round 10).** This
+  round DELETES `reth_projection` and ADDS `egress_zone`. A deletion cannot ride
+  an unchanged version the way this repo's additive fields do: two binaries built
+  either side of it both advertise the same number and read the same bytes
+  differently, and the number that would have collided is 4 — the one master
+  ships.
+
+  The mixed pairing is not an intermediate state. Measured, feeding the v4 Go
+  builder's rows to the v5 helper on `docs/ha-cluster-userspace.conf` (node 0):
+
+  ```
+  ifindex 24   egress zone 0    (origin/master and the matched v5 pair: lan)
+  ifindex 25   egress zone 0    (origin/master and the matched v5 pair: wan)
+  ```
+
+  Ifindex 25 is the one that settles it — the mixed pairing loses a zone even the
+  PRE-#6722 helper resolved, so it is strictly worse than either endpoint. Under
+  `default-policy deny-all` that is a silent transit outage carrying a version
+  both halves agree on.
+
+  `ensureEgressZoneProtocolLocked` (`pkg/dataplane/userspace/manager_compile.go`)
+  is the paired required-protocol gate. It is keyed on **equality**, not `>=`:
+  the helper's own `apply_snapshot` / `bump_fib_generation` gates are
+  exact-equality, so a helper NEWER than xpfd refuses our snapshot too, and a
+  `> N` spelling stays green at exactly the colliding value. It takes no config —
+  every snapshot carries `EgressZone`, so there is no shape to test — but it IS
+  conditional on having observed a helper version, because firing on "version
+  unknown" would abort every commit made while the helper is down (#1960
+  no-brick). **Operator ordering: upgrade xpfd and the helper together;
+  `make cluster-deploy` / `make test-deploy` already push and restart both.** A
+  partial upgrade is refused loudly with the observed version and the remedy
+  named.
+
+  **What "refused" costs, corrected — this is NOT a keep-forwarding outcome.**
+  An earlier revision of this section claimed the running helper keeps
+  forwarding its previous-good image. Measured, it does not, and the two
+  outcomes have opposite availability profiles:
+
+  - A bump with **no** gate would leave the helper to refuse the snapshot at
+    its own exact-equality check, keeping its previous-good image — available,
+    but with the failure legible only as a generic apply error.
+  - A bump **with** the gate, which is what this PR does, refuses in the
+    control plane FIRST: `ErrEgressZoneProtocolIncompatible` is a
+    required-protocol sentinel, so `disarmSnapshotProtocolFailClosedLocked`
+    DISARMS the helper and the commit aborts (#2138). Transit falls to the
+    kernel path — fail-CLOSED, deliberately, and consistent with every other
+    member of `requiredProtocolGateSentinels`.
+
+  `pkg/dataplane/userspace/egress_zone_failclosed_6722_test.go` measures this
+  against a recording helper rather than arguing it from the call graph: the
+  sentinel is returned, a `set_forwarding_state{Armed:false}` really reaches
+  the helper, and NO `apply_snapshot` is sent — nothing is half-applied. A
+  matched-version control proves the gate does not fence the ordinary path.
+
+- **A deliberate behaviour change beyond the four findings: the #5832
+  canonical collision (#6722 round 10).** Two interface names that merely
+  CANONICALIZE onto one device (`ge-0/0/1` and `ge-0-0-1`), with a
+  `redundant-parent` between them and no reth anywhere, are rejected at commit
+  by `validateInterfaceNameCollisionStrict` but ADMITTED on the tolerant load /
+  peer-sync path. Measured on all three trees:
+
+  ```
+  origin/master (edefb7570)   egress_zone_id(24) = 0
+  PR head c9b020695           resolves `lan`        <-- fail-OPEN
+  now                         egress_zone_id(24) = 0
+  ```
+
+  At the previous head the collision row is marked a projection, its empty vote
+  is withheld, and the ledger resolves the zone the operator wrote on the OTHER
+  name for that same device — a fail-OPEN this document previously admitted in
+  passing. `egressRethMemberOf` requires the PARENT to be a `reth*`, so neither
+  name is the other's member port and the device's ownership is contested. The
+  net effect is a RESTORATION of master, retiring a delta an earlier round of
+  this PR introduced; it is recorded here as its own change rather than as a
+  side effect because the config is accepted on the tolerant path and an
+  operator who has one will see the difference. Pinned by cell E4 of
+  `pkg/dataplane/userspace/egress_zone_identity_6722_test.go`.
+
+- **Both directions of the 0 sentinel, stated.** The sections above argue the
+  fail-CLOSED consequence because that is what the reference cluster runs
+  (`default-policy deny-all`). Under `default-policy permit-all` the same
+  resolution is fail-OPEN: zone id 0 matches no rule in ANY tier — exact pair,
+  from-any, to-any, both-any or `junos-global` — so a DENY the operator wrote for
+  that zone pair is skipped along with everything else and the permissive default
+  decides. Refusing to guess a zone is therefore not universally "the safe
+  answer"; it is safe exactly to the extent the default policy is. This is
+  consistent with the pre-existing #3110 decision to treat zone 0 as
+  unmatchable rather than as a wildcard, and it is why #6722 B2 is a blocker
+  rather than a cosmetic correctness fix: on a deny-all cluster the ambiguity
+  cost total LAN reachability, and on a permit-all one it would cost the
+  operator's deny rules instead.
+
+  **Provenance, stated so a bisect is not misled.** This ambiguity was already
+  latent in the index-keyed `egress` map before #6713/#6722: on `origin/master`
+  `egress_zone_id` was an `egress`-only read and `populate_egress` already
+  sourced the row's own zone last-write-wins, so the WireGuard shape above
+  already adjudicated `vpnb` there. #6713 did not create the defect — it added
+  the fallback and routed more consumers through the same incomplete resolver,
+  widening the blast radius without enforcing the invariant it stated. What the
+  ledger adds is the enforcement: the gate now covers BOTH arms, so the
+  pre-existing case is closed rather than merely narrowed.
+
+- **`egress_zone_id` no longer has an `egress` arm, and the reason is worth
+  recording.** Through round 9 it read `state.egress` first and fell back to the
+  ledger, with a `Some(0)` short-circuit documented as load-bearing. It stopped
+  being either once `populate_egress` began sourcing `EgressInterface::zone_id`
+  from the SAME ledger: `egress[i].zone_id` is then the ledger's value for `i`,
+  or 0 where the ledger has no entry, so both arms returned the same number for
+  every state and the short-circuit could not fire on one they would have
+  answered differently. Its claimed binder,
+  `unzoned_interface_with_egress_row_stays_zone_zero_6713`, had gone VACUOUS
+  accordingly — filtering zero before `or_else` still returned 0. The resolver is
+  now a single map read, exactly equivalent for every state and with no branch
+  left to mutate; the surviving binding is on the MAP it reads.
+
+  For an ifindex that HAS an egress row the resolved to-zone is **not**
+  universally bit-identical to the pre-#6713 read. It is bit-identical for every
+  ifindex whose identities agree — every ordinary single-unit interface, and so
+  the overwhelming majority — and it is deliberately DIFFERENT where they do
+  not. `origin/master` answered whichever row `populate_egress` wrote last,
+  which made the adjudicated zone a function of interface NAMING: for `ge-0/0/1`
+  with unit 0 in `lan` and unit 1 in `dmz`, master answers unit 0's `lan` only
+  because `ge-0/0/1.0` sorts after `ge-0/0/1`. Deciding it from the operator's
+  authored bindings gives the same `lan` for a stated reason rather than a
+  sorting accident.
+
+- `egress_zone_id` is the single egress-zone resolver: policy adjudication, the
+  #3651 per-zone traffic counter, the filter-log `egress_zone_id` field (both
+  the flow-cache-hit path via `filter_log_egress_zone_id` and
+  `forward_request`'s own independent call), and the local-origin tunnel TX
+  path's `SyncedSessionEntry` zones all route through it, so the adjudicated
+  zone and the logged/counted zone do not disagree.
+
+  That holds **by enumeration of the callers, not by construction** — nothing
+  prevents a new site from reading `state.egress` directly and silently
+  reintroducing the #6713 split. Four sites are pinned by tests
+  (`zoned_macless_unit_still_reaches_policy_6713`,
+  `filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713`,
+  `cached_output_filter_log_reports_the_adjudicated_zone_6722` — which drives
+  the production `emit_cached_output_filter_log_tail` rather than the helper —
+  and `build_live_forward_request_logs_a_macless_egress_zone_6713`). The
+  zone-accounting readers (`disposition.rs`, `flow_cache_hit.rs`, the slow path)
+  are **not**, so a direct `state.egress` read added there would not be caught
+  by this suite. Route new consumers through the resolver.
+- The MAC-less interface is still ABSENT from `state.egress`, so nothing on the
+  TX path changes: `session_glue::populate_egress_resolution` still leaves
+  `src_mac = None` and `tx_ifindex = egress_ifindex` for it, and the packet still
+  reaches the kernel through the slow-path reinject rather than an AF_XDP TX with
+  an all-zero source MAC on a link-layer-less device.
+
+**Downstream consumers of the corrected to-zone.** Resolving a real to-zone
+where the code previously saw 0 changes more than the policy verdict. All are
+correct-direction — the zone the operator configured is finally the zone the
+dataplane uses — but they are behavior changes on a LAN→tunnel flow and are
+listed here so a bisect does not have to rediscover them. Every entry is scoped
+to an **unambiguous** ifindex: an ambiguous one resolves 0, so none of these
+fire for it. Note that "resolves 0" is only bit-identical to pre-#6713 for an
+ambiguous ifindex with NO egress row; one that HAS an egress row previously
+resolved whichever zone `populate_egress` wrote last, so for it this is a
+deliberate change (see the `[Z, 0, Z]` counterexample above):
+
+- **Source-NAT rule-set scoping** and the `MissingNeighborSeed` metadata now see
+  the tunnel's zone; a rule-set scoped `to zone <vpn>` fires where it did not.
+- **NPTv6 outbound translation** (`poll_descriptor::translate_outbound`, plus the
+  fragment probe in `frag_assoc`) is egress-zone-scoped by #5176, so an NPTv6
+  rule-set scoped to the tunnel's zone now translates LAN→tunnel traffic. This is
+  a *translation* change, not only a policy change.
+- **Fabric zone-encoded redirect.** The reverse companion of a LAN→tunnel
+  session carries the forward session's egress zone as its `ingress_zone`, so
+  when locally HA-inactive it emits a zone-stamped synthetic fabric source MAC
+  where it previously emitted the real fabric MAC. The receiving side gates the
+  decode on `zone_encoded_fabric_stamp_valid`, which requires `zone_to_rgs[zone]`
+  to be non-empty — and `populate_zone_to_rgs` reads `state.egress`, which a
+  MAC-less tunnel has no row in. For a tunnel-only zone the stamp is therefore
+  rejected and the frame degrades to an ordinary unstamped fabric-ingress
+  packet: wire-visible on the HA fabric, but graceful, with no drop.
+- **Per-zone half-open window.** The #3527 SYN-flood `timeout` override is keyed
+  on the reverse companion's `ingress_zone`, so the tunnel zone's override now
+  applies where the global default used to.
+
+**Upgrade direction.** The change is bidirectional, not permit-only. Under
+`default-policy permit-all` plus an explicit `from-zone lan to-zone <vpn> ...
+then deny`, the pre-#6713 build adjudicated `(lan, 0)` → default permit → traffic
+flowed; it now adjudicates `(lan, vpn)` → the operator's deny matches → traffic
+STOPS on upgrade. That is the configured verdict finally being honored, but it
+is a live-traffic change in the deny direction.
+
 **Malformed-address fail-closed (#3367 legacy, #3711 v3 + books).** Every
 address parse path in the snapshot builder REPORTS an unparseable token and
 fails the WHOLE snapshot closed rather than silently dropping it. Silent-drop is
