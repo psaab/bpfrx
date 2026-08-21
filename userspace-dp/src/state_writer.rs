@@ -316,8 +316,10 @@ fn persist_with_mode(mode: &mut WriteMode, path: &str, data: Vec<u8>) -> Persist
                 // reference it, #5800) and cannot be synchronously retried — the
                 // buffer is no longer ours and the op may be in flight. Fail this
                 // write and demote; dropping the RingWriter on demotion runs the
-                // teardown drain and closes the ring fd, which is what frees the
-                // parked buffer safely.
+                // teardown drain, which frees the parked buffer once it observes
+                // the write's terminal CQE, and then closes the ring fd (#6168:
+                // the fd close narrows, but does not close, the window for a
+                // buffer the drain could not prove terminal).
                 let cause =
                     format!("io_uring write deferred (buffer retained), demoting to sync: {ring_err}");
                 PersistOutcome {

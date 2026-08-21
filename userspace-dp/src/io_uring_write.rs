@@ -46,13 +46,50 @@
 //!     AND the target write's terminal CQE before freeing — cancellation
 //!     SUBMISSION alone is insufficient), or
 //!   * the ring fd is closed: [`RingWriter`]'s field order drops the ring BEFORE
-//!     the registry, so the kernel's ring-exit cancel+wait completes before any
-//!     buffer is freed (invariant 2/4).
+//!     the registry, so the kernel's teardown of the ring is INITIATED before
+//!     any buffer is freed. This last one is a best-effort narrowing of the
+//!     window, NOT a proof — see "What the fd close does and does not buy"
+//!     below and the [`RingWriter`] field-order note.
 //!
 //! Ring-global ids (never restarting per call, [`InflightRegistry::alloc_id`])
 //! close the stale-CQE aliasing hole; the id space is fail-closed on wrap
 //! (invariant 3) — `alloc_id` returns `None` at exhaustion and `write_all`
 //! refuses to submit rather than reuse a possibly-live id.
+//!
+//! ### What the fd close does and does not buy (#6168)
+//!
+//! The PRIMARY release is the SYNCHRONOUS [`InflightRegistry::drain_for_teardown`]:
+//! it blocks in `submit_and_wait` until each target write's terminal CQE is
+//! observed, and only then frees that write's buffer. That covers every
+//! realistic teardown.
+//!
+//! The fd-close fallback is WEAKER than a synchronous barrier, and this comment
+//! used to say otherwise. Closing the ring fd runs the kernel's
+//! `io_uring_release`, which kills the ctx reference (nothing further can be
+//! submitted) and then QUEUES `io_ring_exit_work` on a workqueue; that work item
+//! is what actually cancels and waits for the in-flight ops. `close()` does NOT
+//! block on it. So:
+//!
+//!   * GUARANTEED — Rust drops struct fields in declaration order, so the ring
+//!     fd close (and with it the START of the kernel's cancellation) always
+//!     happens BEFORE any registry buffer is freed. The ordering is
+//!     deterministic and it strictly narrows the window.
+//!   * NOT GUARANTEED — that the cancellation has FINISHED. `io_ring_exit_work`
+//!     runs asynchronously, so a write already executing in io-wq can still be
+//!     dereferencing a buffer at the instant the registry frees it. The fd close
+//!     is not a synchronous io-wq barrier.
+//!
+//! That residual is ACCEPTED, not closed (#6168). Reaching it requires the drain
+//! to fail first — its `MAX_WAIT_RETRIES` ceiling of 4096 consecutive failed
+//! waits, or a fatally dead ring — with a write still mid-io-wq. And even there
+//! it is strictly better than the pre-#5800 code, which freed the buffer on
+//! EVERY retry ceiling with no drain at all.
+//!
+//! Closing the residual completely would mean RETAINING (leaking) an unproven
+//! buffer at registry drop rather than freeing it — trading a narrow, hard-to-
+//! reach lifetime hazard for an unconditional bounded leak on a path that has
+//! already failed. #6168 weighed that and did not take it; if this comment and
+//! the reachability argument above ever stop holding, that is the lever to pull.
 //!
 //! Error classification (two further defects, retained from #2477/#2478):
 //!
@@ -160,9 +197,11 @@ struct InFlightWrite {
 /// Buffers are moved in ([`Self::defer`]) only when [`write_all`] must return
 /// before its op reached a terminal state. They are released — the owned buffer
 /// dropped — only when ONE terminal state is observed: the matching write CQE is
-/// reaped ([`Self::reap_ready`]) or a teardown drain proves no kernel reference
-/// remains ([`Self::drain_for_teardown`], or the ring fd closing before the
-/// registry drops).
+/// reaped ([`Self::reap_ready`]), or a teardown drain PROVES no kernel reference
+/// remains ([`Self::drain_for_teardown`]). If the drain cannot prove it, the
+/// entries survive until the registry itself drops — which [`RingWriter`]'s
+/// field order puts after the ring fd close, a best-effort narrowing rather than
+/// a proof (see the module doc, "What the fd close does and does not buy").
 pub(crate) struct InflightRegistry {
     /// Next `user_data` to hand out. Monotonic from 1; 0 is the stale/uninit
     /// sentinel and is never a valid id. Fail-closed on wrap (invariant 3).
@@ -248,7 +287,10 @@ impl InflightRegistry {
     /// `MAX_WAIT_RETRIES`; if the ceiling is hit, or the ring is fatally dead,
     /// the still-live entries are RETAINED (never freed early) — their buffers
     /// are freed only when the registry itself drops, which for [`RingWriter`]
-    /// happens AFTER the ring fd is closed (invariant 4).
+    /// happens after the ring fd is closed. That ordering narrows the window but
+    /// does not prove the kernel is done (#6168 — the fd close only STARTS an
+    /// asynchronous `io_ring_exit_work`); this drain returning without releasing
+    /// an entry is therefore the accepted residual, not a second proof.
     ///
     /// Returns the number of entries released by this drain (for tests).
     fn drain_for_teardown(&mut self, port: &mut dyn RingPort) -> usize {
@@ -298,9 +340,11 @@ impl InflightRegistry {
                 Err(err) => {
                     if is_permanent(&err) {
                         // The ring fd is dead: no further CQE can surface. Retain
-                        // the remaining entries; they free when the registry
-                        // drops (after the ring fd closes), which is when the
-                        // kernel can no longer reference them.
+                        // the remaining entries — never free one here, where
+                        // nothing has been proven. They free when the registry
+                        // drops, after the ring fd close has started the kernel's
+                        // teardown. That is the accepted best-effort residual,
+                        // not a proof the kernel is done (#6168).
                         break;
                     }
                     std::thread::yield_now();
@@ -372,11 +416,21 @@ impl RingPort for IoUringPort<'_> {
 /// A persistent io_uring plus its in-flight owned-buffer registry (#5800). Both
 /// slow-path callers own one of these across their lifetime.
 ///
-/// **Field order is load-bearing (invariant 4).** `ring` (field 0) drops BEFORE
-/// `inflight` (field 1). Dropping `ring` closes the io_uring fd, which makes the
-/// kernel cancel and wait for every in-flight op; only THEN does `inflight` drop
-/// and free the buffers, by which point no kernel reference can remain. Do not
-/// reorder these fields.
+/// **Field order is load-bearing.** `ring` (field 0) drops BEFORE `inflight`
+/// (field 1) — Rust drops struct fields in declaration order, so the ordering is
+/// deterministic. Dropping `ring` closes the io_uring fd, which starts the
+/// kernel's ring teardown: `io_uring_release` kills the ctx reference (nothing
+/// further can be submitted) and queues `io_ring_exit_work`, the work item that
+/// cancels and waits for the in-flight ops. Only THEN does `inflight` drop and
+/// free any buffer the teardown drain could not prove terminal.
+///
+/// What that buys is a strictly narrowed window, NOT a barrier: `close()` does
+/// not wait for `io_ring_exit_work`, so an op already running in io-wq may still
+/// reference a buffer when `inflight` drops (#6168). The proof lives in the
+/// synchronous [`InflightRegistry::drain_for_teardown`] this type's `Drop` runs
+/// first; the field order is the fallback for the residual where that drain
+/// hits its ceiling or the ring is dead. Do not reorder these fields — the
+/// ordering costs nothing and it is the only thing narrowing that window.
 pub(crate) struct RingWriter {
     ring: IoUring,
     inflight: InflightRegistry,
@@ -411,14 +465,16 @@ impl RingWriter {
 
 impl Drop for RingWriter {
     fn drop(&mut self) {
-        // Best-effort bounded drain: submit cancels and observe the target
-        // writes' terminal CQEs so buffers are freed cleanly. Even if the drain
-        // hits its ceiling (or the ring is fatally dead), correctness holds: the
-        // ring fd closes when `self.ring` drops immediately after this returns,
-        // which makes the kernel cancel+wait every in-flight op, and only THEN
-        // does `self.inflight` drop and free any straggler buffers. Disjoint
-        // field borrows let the drain hold `&mut ring` and `&mut inflight` at
-        // once without moving out of `self`.
+        // The bounded drain is the PROOF path: it submits cancels and blocks on
+        // the target writes' terminal CQEs, so every buffer it releases is
+        // provably unreferenced. If it hits its ceiling (or the ring is fatally
+        // dead) it releases nothing and the stragglers are retained; the ring fd
+        // then closes when `self.ring` drops immediately after this returns,
+        // starting the kernel's ring teardown BEFORE `self.inflight` drops and
+        // frees them. That ordering narrows the window but is not a barrier —
+        // the fd close only queues `io_ring_exit_work` (#6168). Disjoint field
+        // borrows let the drain hold `&mut ring` and `&mut inflight` at once
+        // without moving out of `self`.
         let ring = &mut self.ring;
         let inflight = &mut self.inflight;
         let mut port = IoUringPort { ring, fd: -1 };

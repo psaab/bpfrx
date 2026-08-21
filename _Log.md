@@ -97443,6 +97443,44 @@ prose edit above them added. No diff falls in the new test body.
   docs/phases.md, pkg/configstore/cluster_readonly_3893_test.go, _Log.md
 
 - **Timestamp**: 2026-08-21
+- **Action**: Corrected the io_uring teardown drop-order guarantee across five
+  files (#6168). The docstrings claimed that closing the ring fd "makes the
+  kernel cancel and wait for every in-flight op", so `RingWriter`'s field order
+  made the fallback safe outright. Verified against `io_uring/io_uring.c`:
+  `io_uring_release` -> `io_ring_ctx_wait_and_kill` kills the ctx percpu ref and
+  then `queue_work()`s `io_ring_exit_work`, which is what runs the
+  `io_uring_try_cancel_requests` loop. `close()` returns without waiting on it.
+  So the field order buys the START of the kernel teardown before any buffer is
+  freed, not its completion.
+
+  No behaviour change — the code was already structured correctly; the CLAIM was
+  false, which is worse than silence because it invites a future reader to lean
+  on the fallback as a barrier and relax the drain doing the real work. The docs
+  now state exactly what holds (field drop order is deterministic and narrows
+  the window; the cancellation finishing is NOT guaranteed) and name the real
+  proof: the synchronous `drain_for_teardown`, which blocks on each target
+  write's terminal CQE before freeing that buffer.
+
+  Per #6168 task 2 the residual is ACCEPTED, not hardened, and the module doc
+  records why: reaching it needs the drain to fail first (4096 consecutive
+  failed waits, or a fatally dead ring) with a write still mid-io-wq; it is
+  strictly better than pre-#5800, which freed on every retry ceiling with no
+  drain; and closing it would trade a narrow hazard for an unconditional
+  bounded leak of unproven buffers at registry drop. The doc names that leak as
+  the lever to pull if the reachability argument stops holding.
+
+  The issue named three sites; a grep for the claim found ten, all corrected.
+  The "invariant 4" label is dropped everywhere — the numbering implied a proof
+  the code does not have.
+
+  Comments and docs only: every changed Rust line outside the
+  `#[cfg(test)]`-gated `io_uring_write_tests.rs` is a comment, and the one line
+  inside it is an assert message. Helper binary unchanged, no smoke owed.
+  `cargo check --all-targets` exit 0; full Rust suite exit 0.
+- **File(s)**: userspace-dp/src/io_uring_write.rs,
+  userspace-dp/src/io_uring_write_tests.rs, userspace-dp/src/slowpath.rs,
+  userspace-dp/src/state_writer.rs, docs/xdp-io-uring-userspace-dataplane.md,
+  _Log.md
 - **Action**: Added `wrap_accept_after_forward_clear` to the #5168 WireGuard
   replay tests (#6118). One ring slot+bit is shared by every counter congruent
   modulo the ring capacity (RING_BLOCKS * BLOCK_BITS = 8192), so a fresh
