@@ -773,8 +773,16 @@ func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
 	// local-CLI renderer's SSOT so the two cannot drift. The empty-Screen
 	// branch below is the worst case for this: when the profile definitions are
 	// absent entirely it says "No screen profiles configured", which reads as
-	// "nothing was asked for" even though a zone still claims a screen and is
-	// being forwarded unscreened.
+	// "nothing was asked for" even though a zone still claims a screen and none
+	// of that zone's screen checks are applied.
+	//
+	// Do not restore "forwarded unscreened" here (#6839 round 2). This PR removed
+	// that framing from the operator-facing string and tests against it — see
+	// dpuserspace.ScreenUnresolvedDisposition and the assertion in
+	// server_show_screen_unresolved_5806_test.go — because it reads as a permit
+	// and suggests the firewall is passing traffic it would otherwise deny. Zone
+	// security policy still evaluates the packet normally; only the screen checks
+	// are skipped. The comment shipped the removed wording anyway.
 	for _, line := range dpuserspace.ScreenUnresolvedProfileLines(cfg) {
 		buf.WriteString(line)
 		buf.WriteString("\n")

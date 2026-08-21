@@ -18,9 +18,22 @@ import (
 // told, in as many words, that nothing was configured. The unresolved-reference
 // block must therefore be emitted BEFORE that early return.
 //
-// RED on revert: move the ScreenUnresolvedProfileLines loop below the
-// empty-Screen branch (or delete it) and the output is the bare
-// "No screen profiles configured", failing every assertion here.
+// RED on revert, measured at three placements rather than asserted (#6839
+// round 2 — the round-1 claim held for two of them and the third was rc=0):
+//
+//   - DELETE the loop → rc=1, but from the COMPILER, not from here:
+//     `dpuserspace` becomes an unused import. Worth naming, because a build
+//     failure is not this guard firing, and if any other reference to that
+//     package is ever added the deletion becomes invisible to it.
+//   - MOVE it INTO the `else` branch (so the empty-Screen case skips it) →
+//     rc=1 here, on the zone/profile assertion. This is the placement the
+//     original claim described.
+//   - MOVE it AFTER the whole if/else, to the end of showScreen → rc=0 before
+//     this round. Every assertion below was `strings.Contains`, which cannot
+//     see position, so the block still appeared — just last — and the guard
+//     stayed green while the stated property ("emitted BEFORE that early
+//     return") was violated. The ordering assertion at the end of this test
+//     closes that third placement.
 func TestShowScreenReportsUnresolvedReferenceWithNoProfilesDefined(t *testing.T) {
 	cfg := &config.Config{}
 	// No cfg.Security.Screen entries at all — the stranding shape.
@@ -53,6 +66,28 @@ func TestShowScreenReportsUnresolvedReferenceWithNoProfilesDefined(t *testing.T)
 	}
 	if !strings.Contains(out, "No screen profiles configured") {
 		t.Errorf("the pre-existing empty-inventory line must still be rendered; got:\n%s", out)
+	}
+
+	// ORDER, not just presence (#6839 round 2). Every assertion above is
+	// containment, and containment is position-blind: moving the emit to the end
+	// of showScreen keeps all of them green while the operator reads
+	// "No screen profiles configured" FIRST — the exact misreading this guard
+	// exists to prevent, since that line says "nothing was asked for" and the
+	// correction arrives after it. Assert the block precedes it.
+	refIdx := strings.Index(out, dpuserspace.ScreenUnresolvedDisposition)
+	emptyIdx := strings.Index(out, "No screen profiles configured")
+	if refIdx < 0 || emptyIdx < 0 {
+		t.Fatalf("both the disposition and the empty-inventory line must be present "+
+			"for the ordering check to mean anything; got:\n%s", out)
+	}
+	if refIdx > emptyIdx {
+		t.Errorf("the unresolved-reference block must be rendered BEFORE "+
+			"%q (disposition at byte %d, empty-inventory line at byte %d). An operator "+
+			"who reads the empty-inventory line first has already been told nothing was "+
+			"configured; a correction below it is not the same signal. Containment "+
+			"assertions alone cannot see this — they pass with the emit moved to the end "+
+			"of showScreen; got:\n%s",
+			"No screen profiles configured", refIdx, emptyIdx, out)
 	}
 }
 

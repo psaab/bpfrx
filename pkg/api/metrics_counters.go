@@ -173,16 +173,6 @@ func (c *xpfCollector) collectPBRStatus(ch chan<- prometheus.Metric) {
 		prometheus.GaugeValue, float64(degraded))
 }
 
-// collectHostInboundAddresslessZones emits xpf_host_inbound_addressless_zones
-// (#3698): a 1 per configured host-inbound-enforcing zone currently in the
-// transient fail-open admit window — it has a non-lifeline interface but no
-// resolvable address yet, so BuildZoneHostInboundViews yields an empty address
-// set and applyHostInboundFilter emits no deny for it. The series is present
-// only for zones IN the window (absent = enforced), matching the deny-counter
-// contract where a missing sample is meaningful. Config-derived (no dataplane
-// dependency), so Collect calls this BEFORE the dataplane gate. The SSOT for the
-// window is dpuserspace.AddresslessEnforcingZones, the same builder that drives
-// the daemon's state-transition warning log, so the metric and the log agree.
 // collectScreenUnresolvedProfileZones emits xpf_screen_unresolved_profile_zones
 // (#5806): a 1 per {zone, profile} whose configured screen ids-option reference
 // does not resolve to a defined profile, so the dataplane enforces none of that
@@ -196,9 +186,18 @@ func (c *xpfCollector) collectPBRStatus(ch chan<- prometheus.Metric) {
 //
 // The SSOT is dpuserspace.ScreenMissingProfileRefs — the SAME builder whose
 // output is published to the helper as ConfigSnapshot.ScreenMissingProfiles and
-// drives the dataplane WARN. Going through it is the contract, not a shortcut:
-// it is what makes it impossible for this metric to report a different set than
-// the dataplane was actually told about.
+// drives the dataplane WARN. Going through it is the contract, not a shortcut,
+// and the guarantee it buys is this, stated with its condition (#6839 round 2):
+// WHENEVER a snapshot has been published for the current active config, that
+// snapshot's ScreenMissingProfiles and this metric are the same function of the
+// same input, so this metric cannot name a different set than the dataplane was
+// told about. The unqualified form — "impossible to report a different set" —
+// is false in the config-only / degraded boot this collector exists to survive:
+// there is no published snapshot at all then (this PR's own fixture compiles a
+// config with a nil dataplane), so there is no told-about set to agree with, and
+// what the metric reports is the set the dataplane WOULD be told on the next
+// publish. That is the useful reading, but it is a different claim, and only the
+// conditional one is provable.
 //
 // The enforcement disposition is carried in the descriptor's HELP text rather
 // than as a label — it is identical for every series, so a label would add
@@ -220,6 +219,23 @@ func (c *xpfCollector) collectScreenUnresolvedProfileZones(ch chan<- prometheus.
 	}
 }
 
+// collectHostInboundAddresslessZones emits xpf_host_inbound_addressless_zones
+// (#3698): a 1 per configured host-inbound-enforcing zone currently in the
+// transient fail-open admit window — it has a non-lifeline interface but no
+// resolvable address yet, so BuildZoneHostInboundViews yields an empty address
+// set and applyHostInboundFilter emits no deny for it. The series is present
+// only for zones IN the window (absent = enforced), matching the deny-counter
+// contract where a missing sample is meaningful. Config-derived (no dataplane
+// dependency), so Collect calls this BEFORE the dataplane gate. The SSOT for the
+// window is dpuserspace.AddresslessEnforcingZones, the same builder that drives
+// the daemon's state-transition warning log, so the metric and the log agree.
+//
+// KEEP THIS COMMENT ADJACENT TO ITS FUNC. #6839 round 2: the #5806 collector was
+// inserted between this block and this declaration, so `go doc` reported
+// collectScreenUnresolvedProfileZones as emitting xpf_host_inbound_addressless_zones
+// and left this one undocumented. Inserting a new declaration immediately above
+// an existing one is the natural place to put it, and it transfers the doc
+// comment silently — no build, vet, or test can see it.
 func (c *xpfCollector) collectHostInboundAddresslessZones(ch chan<- prometheus.Metric) {
 	if c.srv == nil || c.srv.store == nil {
 		return

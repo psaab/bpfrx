@@ -429,18 +429,6 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
     );
 }
 
-/// #2145 regression: a priority-tagged VLAN-0 SYN
-/// (`ingress_vlan_present = 1`, `ingress_vlan_id = 0`) must have its
-/// IP header parsed at offset 18 by the screen + SYN-cookie stages,
-/// not at the untagged offset 14. The screen carries an IPv4 header
-/// with IHL = 6 holding an LSRR source-route option, so the
-/// `ip-source-route` check fires *iff* the stage reads the IP header
-/// (and decodes the option) from the real header at offset 18.
-/// Pre-fix (`ingress_vlan_id > 0`) the stage used offset 14, read the
-/// 802.1Q TPID byte (0x81) as the IP header → `ip_ihl = 1`,
-/// source-route did NOT fire, and the SYN passed. An untagged
-/// control frame (with the same IHL-6 header at offset 14) keeps
-/// dropping, proving the assertion is not tautological.
 // #5806 (binds the "policy evaluation is unaffected" claim, and records a second
 // finding). The Go-side status text and metric HELP assert that when a zone's
 // screen profile reference does not resolve, "no screen checks are applied to
@@ -620,6 +608,27 @@ fn unresolved_screen_profile_zone_continues_to_policy_5806() {
     );
 }
 
+/// #2145 regression: a priority-tagged VLAN-0 SYN
+/// (`ingress_vlan_present = 1`, `ingress_vlan_id = 0`) must have its
+/// IP header parsed at offset 18 by the screen + SYN-cookie stages,
+/// not at the untagged offset 14. The screen carries an IPv4 header
+/// with IHL = 6 holding an LSRR source-route option, so the
+/// `ip-source-route` check fires *iff* the stage reads the IP header
+/// (and decodes the option) from the real header at offset 18.
+/// Pre-fix (`ingress_vlan_id > 0`) the stage used offset 14, read the
+/// 802.1Q TPID byte (0x81) as the IP header → `ip_ihl = 1`,
+/// source-route did NOT fire, and the SYN passed. An untagged
+/// control frame (with the same IHL-6 header at offset 14) keeps
+/// dropping, proving the assertion is not tautological.
+///
+/// KEEP THIS DOC ADJACENT TO ITS `fn`. #6839 round 2: the #5806 test was
+/// inserted between this block and this declaration. Plain `//` comments are
+/// whitespace to the parser, so the `///` block kept attaching to whatever item
+/// came next — it documented `unresolved_screen_profile_zone_continues_to_policy_5806`
+/// as the #2145 VLAN-0 regression and left this test undocumented. The same
+/// class was already caught and fixed once in this file during the previous
+/// round; it recurs because inserting above a declaration is the natural place
+/// to add code and nothing in the build can see the transfer.
 #[test]
 fn priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18() {
     let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());

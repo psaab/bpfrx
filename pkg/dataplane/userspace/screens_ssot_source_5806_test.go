@@ -62,6 +62,16 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 
 	// Count OCCURRENCES, not files: a second copy in the SAME file is exactly as
 	// drift-prone as one in another file, and a file-level count would miss it.
+	//
+	// The count is taken on the SPLICE-NORMALISED source (#6839 round 2), so a
+	// copy deliberately broken across `+` concatenation chunks is rejoined before
+	// counting. Round 1 normalised only the two files on the consumer list below,
+	// so a split copy in any THIRD non-test file under pkg/ or cmd/ was invisible
+	// to both halves: the raw scan could not see it (the fragment spans a chunk
+	// boundary) and the splice check never looked at that file. Measured rc=0
+	// before this change. Normalising the whole walk makes the count itself the
+	// property — one literal, anywhere, however spelled — instead of a property
+	// of an enumeration that has to be kept in sync with the consumer set.
 	total := 0
 	var hits []string
 	for _, sub := range []string{"pkg", "cmd"} {
@@ -74,7 +84,7 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 			if rerr != nil {
 				return nil
 			}
-			if n := strings.Count(string(b), fragment); n > 0 {
+			if n := strings.Count(concatSplice.ReplaceAllString(string(b), ""), fragment); n > 0 {
 				total += n
 				hits = append(hits, fmt.Sprintf("%s (x%d)", p, n))
 			}
@@ -93,9 +103,15 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 	}
 
 	// And the consumers must reach it by identifier, not by their own copy.
-	// EVERY non-test file that renders the disposition must be listed here; the
-	// scan above cannot tell a shared const from a literal that was split across
-	// a `+` concatenation to dodge it, so this is the complementary check.
+	//
+	// What this list DOES cover, stated exactly (#6839 round 2): that each named
+	// file mentions the identifier. It is no longer the only defence against a
+	// split-concatenation copy — the tree-wide count above is spliced first, so a
+	// split copy in ANY non-test .go file under pkg/ or cmd/ raises that count,
+	// listed or not. Keeping the per-consumer splice check as well is deliberate
+	// belt-and-braces: it reports the offending file by name with a message about
+	// the shared constant, which is the more useful failure when the copy lands
+	// in a known renderer.
 	for _, consumer := range []string{
 		filepath.Join(root, "pkg", "api", "metrics_descriptors_global.go"),
 		filepath.Join(root, "pkg", "dataplane", "userspace", "screens.go"),

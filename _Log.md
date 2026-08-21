@@ -1,3 +1,127 @@
+## 2026-08-20 — #5806 fold r4: three doc comments changed owner by insertion; two guards claimed more than they check
+
+- **Timestamp**: 2026-08-20 (fix/5806-screen-unresolved-visibility, PR #6839)
+- **Action**: First-ever gate returned MERGE-NEEDS-MINOR with NO runtime finding —
+  the wiring is bound (12 of 14 mutations RED, including severing the CLI emit,
+  the gRPC emit and the metrics collector call, and flipping the Rust `None`
+  branch from `Pass` to `Drop`). This round is claim hygiene only. No production
+  logic changed.
+
+  **A — DOC MISATTRIBUTION, three sites, one editing motion.** A new declaration
+  or call was inserted BETWEEN an existing one and its doc comment, silently
+  transferring ownership. Nothing in the build can see this: a comment has no
+  compiler, no vet check and no test.
+
+  | site | before | after |
+  |---|---|---|
+  | `pkg/api/metrics_counters.go` | `go doc` renders `collectScreenUnresolvedProfileZones` as emitting `xpf_host_inbound_addressless_zones` (#3698); `collectHostInboundAddresslessZones` has NO doc | each carries its own |
+  | `pkg/api/metrics.go` | `go/ast` CommentMap: the `collectScreenUnresolvedProfileZones(ch)` call owns the `#3698` block; the `collectHostInboundAddresslessZones(ch)` call owns `<no associated comment>` | each call owns its own block |
+  | `userspace-dp/src/afxdp/poll_stages_tests.rs` | the `/// #2145 regression` rustdoc attaches to `unresolved_screen_profile_zone_continues_to_policy_5806`; `priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18` is undocumented | attaches to the VLAN-0 test again |
+
+  Verified by INSTRUMENT, not by eye — presence-checking a comment is the one
+  thing a green build cannot do:
+
+  - `go doc -u -all ./pkg/api` for site 1, before and after.
+  - `go/ast` + `ast.NewCommentMap` for site 2: `go doc` cannot render a comment
+    inside a function body, and the CommentMap is the same association a reader
+    makes. BEFORE `doc[1121..1137] -> collectScreenUnresolvedProfileZones` /
+    `collectHostInboundAddresslessZones <no associated comment>`; AFTER
+    `doc[1121..1131] -> collectScreenUnresolvedProfileZones` and
+    `doc[1134..1143] -> collectHostInboundAddresslessZones`.
+  - For Rust, the attachment RULE was established with a real `rustdoc` run on a
+    two-function fixture (`/// DOC-A` + a plain `//` line + `fn`), and
+    `fn.inserted_neighbour.html` came back carrying `DOC-A` — plain `//`
+    comments are whitespace to the parser, so the `///` block walks past them to
+    the next item. The rule was then applied to the file.
+
+  Worth recording WHY three survived: `_Log.md` shows this exact class was
+  already caught and fixed once in that same Rust file in the previous round.
+  It recurs because it is a property of the EDITING MOTION, not of attention —
+  inserting above an existing declaration is the natural place to put new code,
+  and the comment above it changes owner with no diff noise and no signal from
+  any tool that runs. Each of the three fixed sites now carries a
+  KEEP-THIS-ADJACENT note naming the failure, so the next reader recognises the
+  shape rather than rediscovering it.
+
+  **B — two wording corrections.**
+
+  - `pkg/grpcapi/server_show_security_text.go:777` shipped the "forwarded
+    unscreened" framing that THIS PR removed from the operator-facing string and
+    now asserts against. Replaced, with a do-not-restore note pointing at
+    `ScreenUnresolvedDisposition` and the test that pins it.
+  - The SSOT contract sentence — "impossible to report a different set than the
+    dataplane was actually told about" — appeared in THREE places
+    (`metrics_counters.go`, `screens.go`, `docs/feature-coverage.md`) and is
+    over-strong. It is FALSE in this PR's own config-only-boot fixture, where no
+    snapshot has been published at all. Narrowed with its CONDITION rather than
+    softened: WHENEVER a snapshot has been published for the config being
+    rendered, both sides are the same function of the same input and cannot
+    disagree; when none has been published there is no told-about set to
+    disagree with, and the surfaces report what the dataplane WOULD be told. A
+    narrowed true claim beats a broad false one.
+
+  **C — two guards claimed more than they check. Both MEASURED, both WIDENED.**
+
+  - `TestScreenUnresolvedDispositionHasOneSource` normalised Go string
+    concatenation only across a TWO-ITEM consumer list, so a split-concatenation
+    copy in any third non-test `.go` file evaded both halves: the tree-wide scan
+    could not see it (the fragment spans a chunk boundary) and the splice check
+    never looked at that file. Measured by planting one in
+    `pkg/cli/cli_show_security_screen.go`: **rc=0**. Fixed by splicing inside the
+    WALK, so the count itself is the property — one literal, anywhere under
+    `pkg/` + `cmd/`, however spelled — instead of a property of an enumeration
+    that must be kept in sync with the consumer set. Same probe now **rc=1**,
+    naming the file; clean tree rc=0. The consumer list is kept and its comment
+    now states exactly what it still covers.
+  - `TestShowScreenReportsUnresolvedReferenceWithNoProfilesDefined` claimed RED
+    on revert. Measured at three placements: DELETE the loop → rc=1 but from the
+    COMPILER (`dpuserspace` becomes an unused import), not from this guard; MOVE
+    it into the `else` branch → rc=1 on the zone/profile assertion; MOVE it AFTER
+    the whole if/else → **rc=0**. Every assertion was `strings.Contains`, which
+    is position-blind, so the block still appeared — just after
+    "No screen profiles configured", which is the misreading the guard exists to
+    prevent. Added an ordering assertion; the third placement now rc=1 on it,
+    control rc=0. The doc comment records all three measurements rather than
+    re-asserting a bare claim.
+
+  **D — refuted item kept refuted, and recorded.** `buildScreenMissingProfileRefs`
+  iterates sorted map KEYS but labels with `zone.Name`. Were those to diverge,
+  two zones would emit the same `{zone, profile}` pair, Prometheus would reject
+  the duplicate const-metric and the collector error would take the WHOLE
+  `/metrics` endpoint to 500 — reproduced mechanically in round 1. It is
+  unreachable, and the premise was re-verified here rather than taken on faith:
+  `compileZones` is the only constructor and writes
+  `zone = &ZoneConfig{Name: inst.name}` immediately followed by
+  `sec.Zones[inst.name] = zone`, and no deserialization path bypasses it —
+  `active.json` holds the AST (`json.Unmarshal` into `ConfigTree`) which
+  `Store.Load` recompiles, and the HA peer-sync ingress likewise goes through
+  `compileTreeLenient`. NOT changed. The whole chain is now recorded at the
+  label site so the next reader finds the reasoning on the line that would
+  break, instead of re-raising it.
+
+- **File(s)**: `pkg/api/metrics_counters.go`, `pkg/api/metrics.go`,
+  `pkg/dataplane/userspace/screens.go`,
+  `pkg/dataplane/userspace/screens_ssot_source_5806_test.go`,
+  `pkg/grpcapi/server_show_security_text.go`,
+  `pkg/grpcapi/server_show_screen_unresolved_5806_test.go`,
+  `userspace-dp/src/afxdp/poll_stages_tests.rs`, `docs/feature-coverage.md`
+- **Validation** (at the committed head, not a mutation copy; `GOTMPDIR=/tmp/t`,
+  `GOCACHE=/var/tmp/gc-f6839r2`, `CARGO_TARGET_DIR=/var/tmp/ct-f6839r2`, never
+  `/dev/shm`; each rc read from its own command):
+  - `go build ./...` → **rc=0**
+  - `go vet ./pkg/api/... ./pkg/dataplane/userspace/... ./pkg/grpcapi/... ./pkg/cli/...` → **rc=0**
+  - `go test -count=1 ./pkg/api/... ./pkg/dataplane/userspace/... ./pkg/grpcapi/... ./pkg/cli/...`
+    → **rc=0**; 0 `--- FAIL`, 0 build/space failures. ok api 34.8s, userspace
+    17.7s, userspace/format 0.01s, grpcapi 11.9s, cli 4.1s
+  - `cargo test --no-fail-fast --bin xpf-userspace-dp` → **rc=0**;
+    4276 passed / 0 failed / 2 ignored
+- **Smoke**: NOT owed. This round is tests-and-comments only on the Rust side —
+  the single Rust file touched is `userspace-dp/src/afxdp/poll_stages_tests.rs`,
+  a `#[cfg(test)]` file, and the change there is moving a `///` block. NO
+  non-test Rust, NO `.o`, NO `userspace-xdp/`, NO protocol/wire file. Everything
+  else is Go comments plus two Go test files plus one Markdown doc. Enumerated
+  mechanically from `git diff --name-only`, not from memory.
+
 ## 2026-08-05 — #5806 fold r3: two MAJORs where the guard could not run or accepted a no-op
 
 - **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility, PR #6839)

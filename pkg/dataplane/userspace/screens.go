@@ -131,11 +131,19 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 //
 // Callers MUST go through this function rather than re-deriving the predicate.
 // That is the stated contract, not an implementation convenience: this is the
-// same computation that fills ConfigSnapshot.ScreenMissingProfiles, so routing
-// every surface through it is what guarantees the metric and the status block
-// can never report a different set than the one the helper was actually told
-// about. A re-derived copy would be free to drift the moment either side's
-// notion of "unresolved" changes.
+// same computation that fills ConfigSnapshot.ScreenMissingProfiles. State the
+// guarantee that buys with its condition (#6839 round 2): WHENEVER a snapshot has
+// been published for the config being rendered, that snapshot's
+// ScreenMissingProfiles and every surface reading this function are the same
+// function of the same input, so no surface can report a different set than the
+// helper was told about. The unqualified form — "can never report a different
+// set" — is false whenever NO snapshot has been published: a config-only /
+// degraded boot, which is exactly the case these surfaces exist to cover (this
+// PR's own metrics fixture compiles a config with a nil dataplane). There is no
+// told-about set to disagree with then, and what the surfaces report is the set
+// the helper WOULD be told on the next publish. A re-derived copy would be free
+// to drift the moment either side's notion of "unresolved" changes, which is
+// what the contract actually prevents, in both cases.
 func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 	return buildScreenMissingProfileRefs(cfg)
 }
@@ -229,6 +237,30 @@ func buildScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef
 			// Reference resolves to a defined profile.
 			continue
 		}
+		// The loop iterates sorted map KEYS but labels with zone.Name. Those are
+		// two different expressions, and the divergence was raised and REFUTED in
+		// #6839 round 1 — recorded here so it is not re-raised, and so that if the
+		// premise ever stops holding the reader is standing on the line that
+		// breaks.
+		//
+		// What would happen if they diverged: two zones whose Name collapsed to
+		// one value would emit the SAME {zone, profile} label pair, Prometheus
+		// would reject the duplicate const-metric, and the collector error takes
+		// the WHOLE /metrics endpoint to 500 — every series, not just this one.
+		// That outcome is real and was reproduced mechanically by hand-building
+		// the struct.
+		//
+		// Why it is unreachable, verified rather than assumed: compileZones is the
+		// only constructor (compiler_security_zones.go) and it writes
+		// `zone = &ZoneConfig{Name: inst.name}` immediately followed by
+		// `sec.Zones[inst.name] = zone` — one variable, both places. No
+		// deserialization path bypasses it: active.json holds the AST
+		// (json.Unmarshal into ConfigTree, configstore/envelope.go + db.go) and
+		// Store.Load recompiles it, and the HA peer-sync ingress likewise goes
+		// through compileTreeLenient. So Name == key holds for every Config any
+		// production path can produce, and switching this to `name` would change
+		// nothing observable. Left as zone.Name deliberately: it says what the
+		// label MEANS.
 		out = append(out, ScreenMissingProfileRef{
 			Zone:    zone.Name,
 			Profile: zone.ScreenProfile,

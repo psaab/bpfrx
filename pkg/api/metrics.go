@@ -1118,12 +1118,6 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// config-only / degraded boot. Aggregate (global rules, not per-zone).
 	c.collectHostInboundICMPNDAccepts(ch)
 
-	// #3698: configured host-inbound-enforcing zones currently in the transient
-	// fail-open admit window (a non-lifeline interface but no resolvable address
-	// yet, so no kernel host-inbound deny is scoped to them). Config-derived and
-	// independent of dataplane load, so emit it BEFORE the dataplane gate — the
-	// window can be open in a config-only / degraded boot too, and that is exactly
-	// when it must stay visible.
 	// #5806: zones whose configured screen profile does NOT resolve. The active
 	// config claims a screen is attached while the dataplane enforces none of it
 	// (tolerant load / HA config-sync / rolling upgrade can reach this state),
@@ -1137,6 +1131,16 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// unenforced security control must stay visible.
 	c.collectScreenUnresolvedProfileZones(ch)
 
+	// #3698: configured host-inbound-enforcing zones currently in the transient
+	// fail-open admit window (a non-lifeline interface but no resolvable address
+	// yet, so no kernel host-inbound deny is scoped to them). Config-derived and
+	// independent of dataplane load, so emit it BEFORE the dataplane gate — the
+	// window can be open in a config-only / degraded boot too, and that is exactly
+	// when it must stay visible.
+	//
+	// KEEP THIS COMMENT ADJACENT TO ITS CALL (#6839 round 2): the #5806 call above
+	// was inserted between this block and this line, so the #3698 rationale read
+	// as the rationale for the #5806 emit and this call was left bare.
 	c.collectHostInboundAddresslessZones(ch)
 
 	// #3710: the per-interface/per-family refinement of the addressless-zone
