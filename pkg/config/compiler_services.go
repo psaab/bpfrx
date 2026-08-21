@@ -2053,16 +2053,20 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 		for _, child := range pInst.node.Children {
 			switch child.Name() {
 			case "events":
-				// Hierarchical: events [ evt1 evt2 ]; → Keys = ["events", "evt1", "evt2"]
-				// Hierarchical: events evt1;          → Keys = ["events", "evt1"]
-				// Brackets are stripped by the lexer, so just take Keys[1:]
-				for i := 1; i < len(child.Keys); i++ {
-					ep.Events = append(ep.Events, child.Keys[i])
-				}
-				// Flat set format: children are individual event name nodes
-				for _, evtChild := range child.Children {
-					ep.Events = append(ep.Events, evtChild.Name())
-				}
+				// `events` is the trigger set of the policy, so a lost value is
+				// the fail-SILENT direction: the automation the operator
+				// configured never runs for part of what they asked for.
+				//
+				// The old read covered both sides of the AST — Keys[1:] for the
+				// hierarchical bracket and packed spellings, one value per child
+				// for the block and flat-set-repeated ones — exactly as
+				// CLAUDE.md prescribes, and STILL dropped (#7126). `events` is
+				// not marked `multi: true` in setSchema, so SetPath files
+				// `set … events [ ev_one ev_two ]` as ONE child whose Keys hold
+				// BOTH names; evtChild.Name() is Keys[0] and returned only
+				// ev_one. Reading Children is not reading every KEY of each
+				// child. plainListValues reads both sides AND every key.
+				ep.Events = append(ep.Events, plainListValues(child)...)
 			case "within":
 				w := &EventWithin{}
 				if v := nodeVal(child); v != "" {
@@ -2115,8 +2119,17 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 	return nil
 }
 
-// compileBridgeDomains parses the bridge-domains AST section into typed BridgeDomainConfig structs.
-func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig) error {
+// compileBridgeDomains parses the bridge-domains AST section into typed
+// BridgeDomainConfig structs.
+//
+// #6687: `vlan-id-list` is the leaf's ONLY validator (setSchema declares none
+// for it), and it is read for EVERY authored value rather than slot 0 alone.
+// Strict (commit / commit-check) hard-rejects a non-numeric or out-of-range id
+// in any slot; lenient (tolerant load / peer-sync) warns and skips that one
+// value so a config already persisted under the narrower gate still boots.
+// See the value-reading comment below for why both halves had to change
+// together.
+func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig, lenient bool, warnings *[]string) error {
 	for _, child := range node.Children {
 		if child.IsLeaf {
 			continue
@@ -2126,27 +2139,55 @@ func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig) error {
 			Name: bdName,
 		}
 
-		// Collect VLAN IDs — multi-value leaf: each "vlan-id-list" child is a separate leaf
-		// #6687 / #6659: nodeVal takes slot 0 only, and the range/parse checks
-		// below are the leaf's ONLY validator (it declares none in setSchema),
-		// so every value past the first is a GATE ESCAPE and not merely a
-		// value-drop: `[ 100 99999 ]` and `{ 100; 99999; }` both commit CLEAN
-		// where a bare `vlan-id-list 99999` is REJECTED "out of range
-		// (1-4094)". Verified through configstore.CheckText. A widened read
-		// MUST run these two checks over every authored value.
+		// Collect VLAN IDs — `vlan-id-list` is a `multi: true` value leaf, so
+		// one node can carry several ids and a bridge domain can carry several
+		// nodes. The range/parse checks here are the leaf's ONLY validator (it
+		// declares none in setSchema), so reading slot 0 alone was both a value
+		// DROP and a GATE ESCAPE (#6687 / #6659): `[ 10 99999 ]`,
+		// `{ 10; 99999; }` and `set ... vlan-id-list [ 10 99999 ]` all committed
+		// CLEAN and compiled VlanIDs=[10], while the identical bad value in slot
+		// 0 was correctly REJECTED "out of range (1-4094)". Measured across all
+		// five spellings; the bracketed list is the idiomatic Junos one, so the
+		// unvalidated path was the COMMON path.
+		//
+		// multiLeafAuthoredValues is the documented reader for a `multi: true`
+		// leaf: it accumulates the node's own Keys[1:] (hierarchical bracket,
+		// and — because the multi flag makes SetPath absorb the tail — the
+		// flat-set bracket too) AND one value per child (hierarchical block,
+		// flat-set repeated). It keeps empty tokens, which a value list must
+		// skip: `vlan-id-list;` carries no id at all and is not a parse error.
+		//
+		// Widening the READ without widening the TOLERANCE would turn a config
+		// that committed clean under the old gate into a boot failure after
+		// upgrade, so the severity is now split the same way every other
+		// AST-level gate in this compiler splits it (see compiler_opts.go):
+		// strict rejects, lenient warns and skips the offending value.
 		for _, vlanNode := range child.FindChildren("vlan-id-list") {
-			valStr := nodeVal(vlanNode)
-			if valStr == "" {
-				continue
+			for _, valStr := range multiLeafAuthoredValues(vlanNode) {
+				if valStr == "" {
+					continue
+				}
+				v, err := strconv.Atoi(valStr)
+				if err != nil {
+					if lenient {
+						*warnings = append(*warnings, fmt.Sprintf(
+							"bridge-domain %s: invalid vlan-id-list value %q: %v (ignored: value dropped)",
+							bdName, valStr, err))
+						continue
+					}
+					return fmt.Errorf("bridge-domain %s: invalid vlan-id-list value %q: %w", bdName, valStr, err)
+				}
+				if v < 1 || v > 4094 {
+					if lenient {
+						*warnings = append(*warnings, fmt.Sprintf(
+							"bridge-domain %s: vlan-id %d out of range (1-4094) (ignored: value dropped)",
+							bdName, v))
+						continue
+					}
+					return fmt.Errorf("bridge-domain %s: vlan-id %d out of range (1-4094)", bdName, v)
+				}
+				bd.VlanIDs = append(bd.VlanIDs, v)
 			}
-			v, err := strconv.Atoi(valStr)
-			if err != nil {
-				return fmt.Errorf("bridge-domain %s: invalid vlan-id-list value %q: %w", bdName, valStr, err)
-			}
-			if v < 1 || v > 4094 {
-				return fmt.Errorf("bridge-domain %s: vlan-id %d out of range (1-4094)", bdName, v)
-			}
-			bd.VlanIDs = append(bd.VlanIDs, v)
 		}
 
 		// Routing interface (e.g. "irb.0")

@@ -993,6 +993,59 @@ also ARMS the existing fab0/fab1 shared-member overlap check in
 bracket-authored fabrics; that check emits a warning, not a rejection, so no
 config that committed before is rejected now.
 
+**That leaf shape is a PREDICATE, not three special cases (#7126).** The
+discriminator is mechanical and worth stating as a rule, because the sites it
+catches all LOOK compliant:
+
+> A leaf declared `children: nil` and **NOT** `multi: true` in `setSchema`, read
+> by a compiler that takes `Keys[0]` / `Name()` of each child, drops every value
+> past the first when the operator authors a bracket list through the flat-set
+> path (`set`, `load set`, the CLI).
+
+`SetPath` files a bracket list differently depending on the flag:
+
+| schema | `set … <leaf> [ v1 v2 ]` becomes |
+|---|---|
+| `multi: true, children: nil` | `Keys=["<leaf>","v1","v2"]`, no children — the tail absorber runs |
+| **`multi: false, children: nil`** | `Keys=["<leaf>"]` with **ONE child** `Keys=["v1","v2"]` |
+
+In the second row every value sits on one child's Keys, so `child.Name()`
+returns `v1` and discards the rest — which is why a reader can obey the
+"`Keys[1:]` AND `Children`" rule above to the letter and still drop. **Reading
+`Children` is not the same as reading every KEY of each child.** The
+hierarchical parser is unaffected (it puts the list on the node's own tail), so
+these sites survive every brace-authored test and bite only the `set` path.
+
+`fabricMemberValues` was the first instance; #7126 found two more —
+`routing-options rib-groups <g> import-rib` and `event-options policy <p>
+events` — so the body now lives once, in `ast.go` as **`plainListValues`**, and
+`fabricMemberValues` is a wrapper that keeps its leaf-specific argument attached
+to its leaf. A divergence between the three would always be a bug, so there is
+one implementation rather than three copies. Use it only where every non-empty
+token below the node is a value: NOT for a leaf with per-value option keywords
+(`ntp server <ip> prefer`, `source-prefix-list <name> except`, `route <prefix>
+discard` — promoting a modifier into the value list is the #6690 hazard), and
+NOT where an EMPTY authored value must survive (`multiLeafAuthoredValues`).
+
+Both new sites also needed `FindChildren`, not `FindChild`: repeated
+hierarchical statements land as SIBLING nodes, and reading only the first drops
+that spelling too even where the flat-set repeated spelling — the same
+configuration, filed as CHILDREN of one node — accumulated correctly. And the
+`import-rib` drop was a GATE ESCAPE as well as a value drop: the #2226
+cross-reference check iterates `ImportRibs`, so an undefined rib named in slot 1
+committed CLEAN while the identical name in slot 0 was rejected. The newly
+visible entries land on #2226's existing tolerant-path downgrade
+(`lenientRibGroupRefs`), so no already-persisted config is turned into a boot
+failure.
+
+The two `import-rib` read sites were byte-identical duplicates in two arms of
+`compileRoutingOptions`, which is the hazard #7126 names: a fix landing in one
+arm leaves the other spelling broken and nothing says so. They now share
+`compileRibGroup`. (Measured: the named-instance arm is INERT at HEAD — it
+selects with `FindChildren("")`, which matches only a child whose first key is
+the empty string, and no parse produces one. The duplication was latent, which
+is precisely why no test could have caught a divergence.)
+
 **Widening a multi-value READ requires widening its VALIDATOR in the same
 change (#6659).** Adopting the accumulating reader at a site changes what a
 malformed value DOES. Before, a bad value in slot 2 was discarded at compile and
@@ -1038,19 +1091,43 @@ control so an ACCEPT only counts beside a REJECT of the same token:
 | Leaf | Shape that ESCAPES | Same token REJECTED as | Tracked |
 |---|---|---|---|
 | CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 |
-| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
+| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 — **CLOSED**, see below |
 | `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
+| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
+| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 — **CLOSED**, see below |
 
 Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
 reads `child.Keys[1:]` plus the inline tail and never `child.Children`, while
 the archive-sites loop reads children and only slot 1 of the tail. "Which shape
 escapes" is a property of the individual reader; do not generalise from one.
 
+**Closing a gate escape owes a SEVERITY SPLIT, not just a widened read
+(#6687).** `vlan-id-list` is now read with `multiLeafAuthoredValues` and every
+authored id runs the parse and range checks, so `[ 10 99999 ]` is rejected
+exactly as `vlan-id-list 99999` always was. But the values it now examines are
+values the OLD gate accepted: a config carrying a bad id in slot 1 committed
+clean, persisted, and would refuse to BOOT after the upgrade if the widened
+check kept its old severity on every path. So the check is split the way every
+other AST-level gate in this compiler is split (`compiler_opts.go`): strict
+(commit / commit-check) hard-rejects naming the value, lenient (tolerant load /
+peer-sync, `lenientBridgeDomainVlanID`) warns and drops that one id. The
+leniently-loaded config therefore carries exactly the VLAN set master compiled —
+the bad id was never installed on either build — and only the warning is new.
+The check stays in the compiler rather than moving to a typed `validator` in
+`setSchema` for a second reason: a strict schema gate firing FIRST would mask
+whether the compiler's own loop ever widened, so the regression test could not
+tell a fix from a no-op.
+
 **And an escape can become live when someone else fixes the value-drop.** The
 archive-sites escape is inert TODAY only because the value is also dropped. A
 follow-up that widens that read without widening the leading-dash check in the
 same change ships a live CWE-88 argument injection; the warning is stated at the
 read site itself in `compiler_system.go`, not only here.
+
+That follow-up is #6692, and it widened BOTH in one change — see
+"#6692: four system-stanza multi-value leaves" below. The leading-dash gate now
+runs over every entry `archiveSiteEntries` returns, so the escape closed in the
+same commit that could have armed it.
 
 **An EMPTY authored value is a value, and whether to keep it depends on whether
 the leaf SELECTS or SETS (#6673).** `firewallMatchValues` skips blank tokens,
@@ -1075,8 +1152,9 @@ empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
 
-**SIX leaf families, SEVEN read sites — the category table above has FOUR rows
-and is not the inventory.** The four rows classify EMPTY-VALUE semantics, and
+**SIX leaf families, SEVEN read sites AT #6673 — the category table above has
+FOUR rows and is not the inventory.** (The table is appended to as later fixes
+land; row 8 is #6687's, and the counts in this sentence describe #6673 only.) The four rows classify EMPTY-VALUE semantics, and
 its `Reader` column names four reader mechanisms because two of them serve two
 leaves each. Counting rows (or readers) undercounts what this change had to
 widen. The inventory is:
@@ -1090,6 +1168,7 @@ widen. The inventory is:
 | 5 | `security nat proxy-arp … address` | `compiler_nat_source.go` `compileNAT` | `proxyARPAddressValues` | yes |
 | 6 | `event-options … attributes-match` | `compiler_services.go` `eventAttributesMatchExprs` | `eventMultiWordLeafValues` (tail + each child) | yes |
 | 7 | `event-options … then change-configuration commands` | `compiler_services.go` `eventChangeConfigCommands` | `eventMultiWordLeafValues` (tail + each child) | yes |
+| 8 | `bridge-domains <bd> vlan-id-list` | `compiler_services.go` `compileBridgeDomains` | `multiLeafAuthoredValues` | yes (added by #6687, after this inventory was written) |
 
 Family 3 has TWO read sites, and that is the whole reason the count differs from
 the family count: the `flag` leaf is read once by the compiler and once by the
@@ -1105,8 +1184,9 @@ bundled, because each needs its own value-domain gate widened in the same change
 | Leaf | Still one-sided | Tracked |
 |---|---|---|
 | CoS DSCP / IEEE classifier `code-points` | reads tail, never `Children` | #6697 |
-| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
+| ~~`system archival archive-sites` (+ three sibling system leaves)~~ | ~~reads `Children` and only slot 1 of the tail~~ | #6692 — FIXED |
 | `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
+| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
 ### The list above is now enforced by a gate, not maintained by hand
@@ -1125,10 +1205,11 @@ dropped(spelling) := compile(spelling, [v1]) == compile(spelling, [v1 v2])
 **Why a gate and not a lint.** There is no single correct reader to lint FOR:
 this package now has at least six accumulating readers, one of which
 (`ntpServerValues`) must additionally skip per-value option KEYWORDS. A rule
-matching "reads `Keys[1]`" would flag compliant code, and would miss the #7126
-sites entirely — both of those read `Keys[1:]` AND `Children` exactly as this
-document instructs, and still drop, because reading `Children` is not the same as
-reading every KEY of each child. A differential asks whether the compiler
+matching "reads `Keys[1]`" would flag compliant code, and would have missed the
+#7126 sites entirely — both of those read `Keys[1:]` AND `Children` exactly as
+this document instructs, and still dropped, because reading `Children` is not the
+same as reading every KEY of each child (both are fixed and their allowlist rows
+removed; the predicate is stated above). A differential asks whether the compiler
 disagrees with ITSELF, which is the actual defect.
 
 **When the gate fails, there are exactly two correct responses**, and picking the
@@ -1172,6 +1253,81 @@ cardinality gate must also count only DISTINCT entries (`dedupeValuesBy`): a
 repeated value is one value, and rejecting it invents a rejection too. See
 "A cardinality gate counts DISTINCT values" below for how each leaf picks its
 identity.
+
+### #6692: four system-stanza multi-value leaves, and why only three shared a fix
+
+Four `multi: true` leaves under `system` were read with a single-value accessor,
+so a bracketed list — which the lexer collapses onto ONE node's `Keys` — compiled
+its first member and silently dropped the rest. Measured with the
+spelling-differential gate's own `spellingVerdicts`, before the fix:
+
+| Site | A hier-bracket | B hier-block | C hier-repeat | D set-bracket | E set-repeat |
+|---|---|---|---|---|---|
+| `system archival configuration archive-sites` | drop | keep | keep | drop | keep |
+| `system services ssh key-exchange` | drop | drop | keep | drop | keep |
+| `system services web-management api-auth api-key` | drop | drop | keep | drop | keep |
+| `system dataplane shared-umem interface` | drop | drop | keep | drop | keep |
+
+(Identical for all eight of the gate's value pairs — the drop is shape-driven,
+not domain-driven.) `archive-sites` differs on B because its reader already
+walked `Children`; the other three read neither side past slot 0.
+
+**Three of the four share a fix; the fourth does not, and assuming otherwise
+would have shipped a secret into an scp argv.**
+
+- `key-exchange` and `shared-umem interface` take `firewallMatchValues` — every
+  value they return is installed and an empty token means absence. `key-exchange`
+  now matches the `ciphers`/`macs` siblings that were already converted in
+  #4305/#4902.
+- `api-key` takes `multiLeafAuthoredValues`, NOT `firewallMatchValues`, because
+  an EMPTY value is load-bearing on this leaf: a quoted-empty `api-key ""`
+  authenticates any request presenting the empty token, so it must still reach
+  `validateAPIAuthNoEmptySecretsStrict` to be hard-rejected (#5636). An
+  empty-skipping reader would make an empty key in a non-zero slot VANISH,
+  silently withdrawing an operator-visible security rejection. The
+  `multiLeafAuthoredValues(n)[0] == nodeVal(n)` invariant is what keeps slot 0
+  byte-identical to the pre-fix read.
+- `archive-sites` takes neither. Its value tail INTERLEAVES a `password
+  <secret>` modifier with the site URLs (`archive-sites "scp://a/cfg" password
+  "$9$..."` → `Keys=["archive-sites","scp://a/cfg","password","$9$..."]`), so
+  accumulating the tail wholesale would promote the keyword AND the secret into
+  `ArchiveSites`, where runtime archival hands each entry to `scp <src> <dest>`.
+  It needs a GROUPING reader — `archiveSiteEntries` (`compiler_system.go`), the
+  same `<value> [modifier ...]` shape as `firewallPrefixListRefs` — which binds
+  `password` to the site preceding it and consumes its operand. A trailing
+  `password` with no operand still marks the preceding site rather than becoming
+  one.
+
+The four AST shapes `archiveSiteEntries` covers were measured, not assumed:
+
+```
+archive-sites [ a b ];              Keys=["archive-sites","a","b"]
+archive-sites a password S;         Keys=["archive-sites","a","password","S"]
+archive-sites a { password S; }     Keys=["archive-sites","a"], child ["password","S"]
+archive-sites { a password S; b; }  Keys=["archive-sites"], one child per site
+archive-sites { a { password S; } } Keys=["archive-sites"], child "a" with a password child
+```
+
+**Widening the read is what CLOSED the #4589 gate escape, because the gate was
+widened in the same change.** The leading-dash check (`must not begin with '-'`,
+CWE-88) previously ran on slot 1 alone, so a `-oProxyCommand=` member authored
+past the first was both dropped and unchecked — the bracket form ACCEPTED what
+the same token authored alone REJECTED. It now runs over every entry
+`archiveSiteEntries` returns.
+
+On the validator axis for the other two security-relevant leaves: `key-exchange`
+declares a schema `validator` (`ValidateSSHAlgorithm`), so `validateMultiValueLeaf`
+already walks `Keys[1:]` AND every child's `Keys[0]` — the widened read does not
+outrun its validation, which `TestSSHKeyExchangeValidatorCoversEverySlot_6692`
+pins with a rejection in a NON-ZERO slot plus an over-reject control. `api-key`
+has no schema validator; its check is the #5636 empty-secret gate, which the
+widened read now feeds every authored slot.
+
+Fail-on-revert: `pkg/config/compiler_system_multivalue_6692_test.go`. Six
+single-site mutations were run, each localising to its own assertion with
+`go build` and `go vet` at exit 0 — including one that narrows ONLY the
+leading-dash gate (leaving the read widened) and one that swaps `api-key` to the
+empty-skipping reader.
 
 ### A widened read must not PROMOTE a token the old reader discarded (#6673)
 
@@ -4078,6 +4234,39 @@ PAT-translating over a range the operator did not configure. Fail-on-revert:
 (`pkg/config/compiler_nat_source_pool_port_5457_test.go`) and
 `TestSourceNATSnapshotInvalidPortRangeUnusable_5457`
 (`pkg/dataplane/userspace/nat_source_pool_port_5457_test.go`).
+
+**Source-NAT pool `port range` has a FIXED arity, and `port range` is not a
+value list (#6688).** `#5457` validated the endpoints the grammar consumed; it
+did not bound how many tokens the grammar consumed. `parseSourcePoolPortRange`
+matched `low <lo> high <hi>` at `len(toks) >= 4` and `<low> to <high>` at
+`len(toks) >= 3`, discarding the remainder — so `port range 1000 2000` parsed as
+the bare single-port shape `<low>` and compiled `PortLow == PortHigh == 1000`. A
+pool the operator sized at 1001 ports provided ONE, committed clean, and
+exhausted under the first real translation load; the second slot was never
+parsed, so `port range [ 1000 99999 ]` and `port range [ 1000 notaport ]`
+committed clean as well.
+
+The lexer strips `[`/`]` before the compiler observes anything (see "Multi-value
+leaves and bracketed lists"), so the bracketed spelling and the mistyped bare
+spelling arrive as the SAME token slice. Reading `["1000","2000"]` as
+`[1000,2000]` was therefore rejected as the fix: it would invent a two-token
+`range <low> <high>` grammar Junos does not have AND silently redefine the
+mistyped bare form. Both shapes now match at an EXACT arity and any unconsumed
+token fails closed through the existing `PortRangeInvalidSpec` channel — strict
+commit hard-rejects naming the offending spec, the tolerant path marks the pool
+unusable. Fail-on-revert:
+`TestParseSourcePoolPortRangeUnconsumedTail_6688` /
+`TestSourceNATPoolPortRangeTailFailsClosed_6688` /
+`TestSourceNATPoolPortRangeValidUnaffected_6688` (the over-reject control)
+(`pkg/config/compiler_nat_source_pool_port_6688_test.go`).
+
+This also retired the `security nat source pool <*> port range` row from
+`knownSpellingInconsistencies` (the #2419 spelling-differential gate): with the
+tail rejected rather than discarded, every compared spelling of a two-token tail
+now reaches the same verdict. The site is still ENUMERATED and COMPARED by the
+gate (4 of 5 spellings carry a verdict) — it was not moved to `notAValueList`,
+because the agreement is now a real property of the compiler rather than a
+meaningless verdict.
 
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
