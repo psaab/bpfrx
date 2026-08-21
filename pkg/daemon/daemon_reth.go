@@ -235,7 +235,36 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 // programRethMAC sets a deterministic virtual MAC on a RETH member interface.
 // Skips if the interface already has the correct MAC.
 // The interface must be brought DOWN to change its MAC, then back UP.
-func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err error) {
+//
+// beforeCycle (#5103) is invoked at most once, on the ONLY path that cycles the
+// link, and strictly BEFORE the first mutation of that link. It exists because
+// whether a cycle is needed cannot be predicted: the live set is ATTEMPTED
+// first, and the fallback runs on its failure.
+//
+// #6871: that failure does NOT prove the driver lacks IFF_LIVE_ADDR_CHANGE, and
+// an earlier revision of this comment said it did. The branch below is taken on
+// EVERY error from setHardwareAddr, and Linux's dev_set_mac_address path does
+// not consult that flag at all — it fails for a missing ndo_set_mac_address, a
+// wrong sa_family, an absent or busy device, or a driver/notifier rejection just
+// the same. So the fallback is "a live set was refused, for whatever reason, and
+// a cycle is the remaining option", which is why it is worth the cost only on the
+// drivers that actually need it. The distinction matters here: a cycle entered
+// for a transient reason still joins the workers and still drops forwarding.
+//
+// A rejected live set does not change link state — the kernel refuses the address
+// change outright — so at the moment beforeCycle runs the link is still exactly
+// as it was found, and returning an error from it aborts with nothing to undo.
+//
+// The caller uses this to join the AF_XDP workers. Previously the join happened
+// AFTER programRethMAC returned linkCycled=true, so the workers were still
+// running through the DOWN/UP and could touch UMEM while the NIC unmapped its
+// pages. A nil beforeCycle means "no join needed" and is used by callers with
+// no dataplane attached.
+//
+// On a beforeCycle error programRethMAC returns (false, err) WITHOUT touching
+// the link: leaving the member on its old MAC is recoverable, cycling the link
+// out from under live workers is not.
+func programRethMAC(ifName string, mac net.HardwareAddr, beforeCycle func() error) (linkCycled bool, err error) {
 	ops := rethLinkOpsFn
 	link, err := ops.byName(ifName)
 	if err != nil {
@@ -248,15 +277,42 @@ func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err e
 	slog.Info("setting RETH virtual MAC", "iface", ifName, "mac", mac)
 	// Try setting MAC while link is UP (avoids link DOWN/UP cycle).
 	// mlx5 zero-copy AF_XDP sockets break on link cycle — the driver
-	// doesn't reinitialize XSK WQEs after link UP. If the driver
-	// supports IFF_LIVE_ADDR_CHANGE, this succeeds without any cycle.
-	if err := ops.setHardwareAddr(link, mac); err == nil {
+	// doesn't reinitialize XSK WQEs after link UP. When the kernel accepts
+	// the change, no cycle happens.
+	//
+	// #6871: IFF_LIVE_ADDR_CHANGE is a necessary condition for this to succeed
+	// on an UP link, not a sufficient one, and an earlier revision of this line
+	// said "if the driver supports IFF_LIVE_ADDR_CHANGE, this succeeds". A busy
+	// device is refused whether or not it carries the flag — which is why the
+	// fallback below reports the actual error instead of naming a capability.
+	liveSetErr := ops.setHardwareAddr(link, mac)
+	if liveSetErr == nil {
 		slog.Info("RETH MAC set without link cycle", "iface", ifName)
 		return false, nil
 	}
 	// Fallback: bring link down, set MAC, bring back up.
-	slog.Info("RETH MAC requires link cycle (driver does not support live change)",
-		"iface", ifName)
+	//
+	// Say only what the failure proves. This branch is taken on EVERY error from
+	// setHardwareAddr, and a refused live set does NOT establish that the driver
+	// lacks IFF_LIVE_ADDR_CHANGE — dev_set_mac_address fails identically for a
+	// missing ndo_set_mac_address, a wrong sa_family, an absent or busy device,
+	// or a notifier rejection (see the beforeCycle contract above, which this
+	// line used to contradict: it says exactly this, forty lines up, while the
+	// log claimed the opposite). The remaining option is the same either way,
+	// but the journal must not assert a driver capability it did not observe —
+	// and it is the only place the actual reason survives, since the fallback
+	// swallows it. So carry the error instead of guessing at its cause.
+	slog.Info("RETH MAC live set refused; falling back to a link cycle",
+		"iface", ifName, "err", liveSetErr)
+	// #5103: the worker join belongs HERE — after the live-set attempt has
+	// proven a cycle is unavoidable, and before setDown, the first mutation.
+	// The barrier must precede the NIC queue/link teardown so no thread or DMA
+	// path is using the UMEM/rings the driver is about to unmap.
+	if beforeCycle != nil {
+		if err := beforeCycle(); err != nil {
+			return false, fmt.Errorf("prepare link cycle %s: %w", ifName, err)
+		}
+	}
 	if err := ops.setDown(link); err != nil {
 		return false, fmt.Errorf("link down %s: %w", ifName, err)
 	}

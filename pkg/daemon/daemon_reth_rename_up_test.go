@@ -110,7 +110,7 @@ func TestRenameRethMemberBringsLinkUpWhenMACMatches(t *testing.T) {
 
 	// programRethMAC on the just-renamed member no-ops (MAC already matches)
 	// and must NOT disturb the UP state that renameRethMember established.
-	cycled, err := programRethMAC("ge-0-0-1", mac)
+	cycled, err := programRethMAC("ge-0-0-1", mac, nil)
 	if err != nil {
 		t.Fatalf("programRethMAC: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestProgramRethMACCyclePathEndsUp(t *testing.T) {
 	var ops []string
 	installFakeRethLinkOps(t, link, &adminUp, &ops, true /* needs cycle */)
 
-	cycled, err := programRethMAC("ge-0-0-2", virt)
+	cycled, err := programRethMAC("ge-0-0-2", virt, nil)
 	if err != nil {
 		t.Fatalf("programRethMAC: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestProgramRethMACLiveChangeNoCycle(t *testing.T) {
 	var ops []string
 	installFakeRethLinkOps(t, link, &adminUp, &ops, false /* live change ok */)
 
-	cycled, err := programRethMAC("ge-0-0-2", virt)
+	cycled, err := programRethMAC("ge-0-0-2", virt, nil)
 	if err != nil {
 		t.Fatalf("programRethMAC: %v", err)
 	}

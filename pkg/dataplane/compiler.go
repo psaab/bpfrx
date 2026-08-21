@@ -224,6 +224,40 @@ func assignZoneIDs(result *CompileResult, cfg *config.Config) {
 	}
 }
 
+// assignScreenIDs populates result.ScreenIDs with 1-based ids for every
+// configured screen profile, in sorted-name order so the assignment is
+// deterministic. Id 0 is reserved for "no profile", which is why the counter
+// starts at 1.
+//
+// This is a single site DELIBERATELY. Three verbatim copies of this loop used
+// to exist — here, in validateBeforeMutateWithResult, and in the ID-stability
+// probe's own driver (compiler_idprobe_4960_test.go) — and the third copy is
+// what made TestPrePassDoesNotPerturbIDAssignment_4960's ScreenIDs column
+// unable to observe a CROSS-PASS drift: the probe re-implemented the
+// assignment instead of calling it, so that column compared the test's own
+// loop against itself. Measured at the time: seeding this assignment from a
+// package-level counter, at EITHER production site, left the whole package
+// green. Keep every caller on this function; a fourth copy re-opens the hole.
+//
+// Note the limit of what that column can bind, which is narrower than "the ids
+// are right" — see compileIDsOnce's doc. The probe compares two passes, so a
+// change applied identically to both (a different seed, a different sort key)
+// leaves pass 1 == pass 2 and stays green by construction. What it detects is
+// state outliving a CompileResult. Correctness of the assignment itself is not
+// measured here.
+func assignScreenIDs(result *CompileResult, cfg *config.Config) {
+	screenID := uint16(1)
+	screenNames := make([]string, 0, len(cfg.Security.Screen))
+	for name := range cfg.Security.Screen {
+		screenNames = append(screenNames, name)
+	}
+	sort.Strings(screenNames)
+	for _, name := range screenNames {
+		result.ScreenIDs[name] = screenID
+		screenID++
+	}
+}
+
 // CompileConfig translates a typed Config into dataplane table entries.
 // It works with any DataPlane backend (eBPF or DPDK) via the interface.
 // The isRecompile flag triggers FIB generation bump for hitless restarts.
@@ -235,42 +269,30 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		return nil, fmt.Errorf("dataplane not loaded")
 	}
 
-	result := &CompileResult{
-		ZoneIDs:             make(map[string]uint16),
-		ScreenIDs:           make(map[string]uint16),
-		AddrIDs:             make(map[string]uint32),
-		AppIDs:              make(map[string]uint32),
-		PoolIDs:             make(map[string]uint8),
-		implicitSets:        make(map[string]uint32),
-		NATCounterIDs:       make(map[string]uint32),
-		FilterSpans:         make(map[string]FilterCounterSpan),
-		Lo0FilterV4:         0xFFFFFFFF, // sentinel: no lo0 filter
-		Lo0FilterV6:         0xFFFFFFFF,
-		ifCache:             make(map[string]*net.Interface),
-		linkCache:           make(map[string]netlink.Link),
-		linkIdxMap:          make(map[int]netlink.Link),
-		rxVlanOffCache:      make(map[string]bool),
-		ethtoolApplied:      make(map[string]bool),
-		genericXDPIfindexes: make(map[int]bool),
-	}
+	result := newValidationResult()
 
 	// Phase 1: Assign STABLE zone IDs (#3075).
 	assignZoneIDs(result, cfg)
 
 	// Phase 1.5: Assign screen profile IDs (1-based; 0 = no profile).
-	// Sorted for deterministic IDs.
-	screenID := uint16(1)
-	screenNames := make([]string, 0, len(cfg.Security.Screen))
-	for name := range cfg.Security.Screen {
-		screenNames = append(screenNames, name)
-	}
-	sort.Strings(screenNames)
-	for _, name := range screenNames {
-		result.ScreenIDs[name] = screenID
-		screenID++
+	assignScreenIDs(result, cfg)
+
+	// #4960: validate every fallible HOST-PURE phase against a discarding
+	// dataplane BEFORE Phase 2 touches the host. compileZones below is the
+	// first and only destructive netlink mutation in this function -- VLAN
+	// create/link-up and address delete/add, AND netlink.LinkDel /
+	// LinkSetDown on unmanaged interfaces via stripUnmanagedInterfaces
+	// (compiler_iface.go, stripUnmanagedInterfaces' netlink.LinkDel / LinkSetDown), plus ethtool and /proc/sys writes
+	// (#6894 r1 F5: the earlier parenthetical understated this) -- and
+	// nothing after it has an undo path, so a config that trips a later phase must be rejected here rather
+	// than half-applied. See compiler_validate_4960.go for what is and is not
+	// covered, and why this is additive rather than a reordering.
+	if err := validateBeforeMutate(cfg); err != nil {
+		return nil, err
 	}
 
-	// Phase 2: Compile zones
+	// Phase 2: Compile zones — FIRST HOST MUTATION. Everything above this line
+	// must be non-destructive.
 	if err := compileZones(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile zones: %w", err)
 	}
@@ -402,7 +424,11 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	}
 
 	if len(result.pendingXDP) > 0 {
-		rcMap := m.maps["redirect_capable"]
+		// #2114 A3: OPTIONAL access — an absent redirect_capable SKIPS the
+		// redirect-map population and CONTINUES into the attachment work
+		// (master's exact outcome; this path is CompileConfig-gated to the
+		// armed state upstream).
+		rcMap, _, _ := m.lookupMapLocked("redirect_capable")
 
 		// Populate redirect_capable BEFORE link.Update() swaps programs.
 		// Skip tunnel interfaces — bpf_redirect_map sends Ethernet frames
@@ -1132,9 +1158,13 @@ func compileDefaultPolicy(dp DataPlane, cfg *config.Config) error {
 		return fmt.Errorf("set default policy: %w", err)
 	}
 	if action == ActionPermit {
-		slog.Info("default policy compiled", "action", "permit-all")
+		if !isValidationPass(dp) {
+			slog.Info("default policy compiled", "action", "permit-all")
+		}
 	} else {
-		slog.Info("default policy compiled", "action", "deny-all")
+		if !isValidationPass(dp) {
+			slog.Info("default policy compiled", "action", "deny-all")
+		}
 	}
 	return nil
 }
@@ -1160,16 +1190,22 @@ func compileFlowTimeouts(dp DataPlane, cfg *config.Config) error {
 		}
 	}
 
-	// Log only if any non-default value was set.
+	// Log only if any non-default value was set, and only on the REAL pass:
+	// the pre-pass's SetFlowTimeout is a no-op, so logging here records
+	// "compiled" for a write that never happened and an operator reading the
+	// journal of a FAILED apply sees success followed by failure, for a
+	// compile whose result was thrown away (#6894 r8 F6).
 	for _, v := range timeouts {
 		if v > 0 {
-			slog.Info("flow timeouts compiled",
-				"tcp_established", timeouts[FlowTimeoutTCPEstablished],
-				"tcp_initial", timeouts[FlowTimeoutTCPInitial],
-				"tcp_closing", timeouts[FlowTimeoutTCPClosing],
-				"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
-				"udp", timeouts[FlowTimeoutUDP],
-				"icmp", timeouts[FlowTimeoutICMP])
+			if !isValidationPass(dp) {
+				slog.Info("flow timeouts compiled",
+					"tcp_established", timeouts[FlowTimeoutTCPEstablished],
+					"tcp_initial", timeouts[FlowTimeoutTCPInitial],
+					"tcp_closing", timeouts[FlowTimeoutTCPClosing],
+					"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
+					"udp", timeouts[FlowTimeoutUDP],
+					"icmp", timeouts[FlowTimeoutICMP])
+			}
 			break
 		}
 	}
@@ -1249,15 +1285,17 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		return err
 	}
 
-	slog.Info("flow config compiled",
-		"tcp_mss_ipsec", fc.TCPMSSIPsec,
-		"tcp_mss_gre_in", fc.TCPMSSGreIn,
-		"tcp_mss_gre_out", fc.TCPMSSGreOut,
-		"allow_dns_reply", fc.AllowDNSReply,
-		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
-		"app_flags", fc.AppFlags,
-		"lo0_filter_v4", fc.Lo0FilterV4,
-		"lo0_filter_v6", fc.Lo0FilterV6)
+	if !isValidationPass(dp) {
+		slog.Info("flow config compiled",
+			"tcp_mss_ipsec", fc.TCPMSSIPsec,
+			"tcp_mss_gre_in", fc.TCPMSSGreIn,
+			"tcp_mss_gre_out", fc.TCPMSSGreOut,
+			"allow_dns_reply", fc.AllowDNSReply,
+			"allow_embedded_icmp", fc.AllowEmbeddedICMP,
+			"app_flags", fc.AppFlags,
+			"lo0_filter_v4", fc.Lo0FilterV4,
+			"lo0_filter_v6", fc.Lo0FilterV6)
+	}
 
 	return nil
 }

@@ -500,6 +500,121 @@ input, so a linker-pin bump moves the manifest too), so commit the
 regenerated object and manifest together — the #4977 freshness gate
 then stays green.
 
+## Armed-state admission contract (#2114 A3)
+
+`Manager.loaded` is an `atomic.Bool` admission bit, and every
+`m.maps`/`m.programs` access in every method class goes through the
+`m.mu`-scoped typed helper pair (`lookupMapLocked`/`lookupProgramLocked`,
+which return the handle, a comma-ok `present` bit, and the under-lock
+`registryState` classification). The shim loader publishes the registry
+and the armed flag as ONE whole-batch critical section
+(`publishShimRegistryLocked`: the program assignment, both map insert
+loops, then `Store(true)` as the final in-hold step), so a reader
+released from a lookup hold observes either the pre-arm state or the
+fully populated armed registry — never a partial one, and never a
+concurrent-map read/write against the populating Start.
+
+The gate predicate is TWO-STATE on the unarmed side:
+
+- **FRESH-unarmed** (`loaded == false` AND `m.maps` empty — a
+  never-armed manager): class-1 (fallible, map-required) methods return
+  the typed, `errors.Is`-compatible `ErrDataplaneNotArmed` at their
+  first REQUIRED registry access, replacing master's per-map "not
+  found" error (or, on the pre-#2114 concurrent path, a fatal
+  concurrent-map throw). Class-2 neutral methods keep master's
+  missing-map outcome byte-for-byte. Class-3 hybrids
+  (`ClearNATRuleCounters`/`ClearGlobalCounters`/`ClearZoneCounters`/
+  `ClearAllCounters`) keep their pinned side-effect-plus-legacy-outcome
+  behavior and are UNGATED — `ClearAllCounters` composes through the
+  ungated raw internals (`clearInterfaceCountersRaw` et al.) so the
+  pinned legacy "interface_counters map not found" text survives in
+  every state. Class-4 getters return nil (`NewEventSource` returns the
+  typed error — its signature carries one).
+- **RETAINED-unarmed** (`loaded == false` with a populated registry —
+  an armed manager's `Close`, which keeps the pinned-map handles live
+  for hitless restart, or a bootstrap-Teardown-retained manager): every
+  class proceeds EXACTLY as master — retained reads report the retained
+  registry, retained mutations reach the retained maps. The loaded-check
+  set (`AttachXDP`/`AttachTC`/the `CompileConfig` path) keeps its own
+  pre-registry rejection ("eBPF programs not loaded" / "dataplane not
+  loaded") on BOTH unarmed states; the typed error never fires for
+  them.
+- `Close()` stores `loaded=false` at ENTRY (before the link-handle
+  closes), which narrows the loaded-check set's admission window and
+  advances the externally visible `IsLoaded()`/REST/gRPC
+  `DataplaneLoaded` surface during the close window. The bit is an
+  admission flag, NOT a lease — it cannot drain an in-flight operation,
+  and no teardown/lifetime exclusion is claimed (cilium/ebpf documents
+  close-in-use as unsafe).
+- `Teardown()` (= `Close` + `Cleanup`) additionally CLEARS the
+  `xdpLinks`/`tcLinks` membership maps: `Close` closed the Go handles
+  and `Cleanup` unpinned and destroyed the kernel links, so the entries
+  would otherwise point at dead handles for links that no longer exist,
+  and a same-process re-Start (the commit-confirmed rollback →
+  bootstrap-exit re-arm) would hit `AttachXDP`'s stale-membership
+  "already attached" short-circuit — which `attachUserspaceShimXDP`
+  deliberately swallows — and report success with no AF_XDP ingress
+  (Codex PR #6743 r3-1). `Close` alone deliberately keeps the
+  membership: its pinned links stay live in the kernel for hitless
+  reuse, so the entries remain truthful there.
+  `TestManagerTeardownClearsLinkMembership` pins both polarities.
+
+Enforcement (all in `armed_gate_matrix_test.go` /
+`armed_gate_legs_test.go`): the 159-method class manifest is
+AST-verified for totality; the registry canary fails the build on any
+raw `m.maps`/`m.programs` access outside the two helpers + the
+publisher, with negatives covering package-wide/chained/pointer type
+aliases, `var`-declared and fixpoint local aliases, multi-layer
+parenthesized access, cross-object lock credit (a locked `*Manager`
+parameter never covers the receiver's registry), closure-hidden locks,
+method-value lock/unlock escapes, and helper method-value escapes; the
+stale-checked callsite manifest pins all 135 helper callsites with
+their outcome roles, and the per-callsite gate evidence only counts a
+`registryFresh` comparison that evaluates THAT callsite's own binding
+(the scan stops at the bound identifier's reassignment — the
+`ClearNATPoolIPs` two-lookup reuse shape). The five-leg runtime oracle
+(fresh outcomes, retained outcomes, blocked fresh-Start, blocked
+retained-reStart, Close-window `IsLoaded`) plus the continuation legs
+run under `make test-race-dp`; every blocking leg proves goroutine
+arrival from the `muAcquireProbeHook` pre-lock seam (a signal before
+the contended call can pass the silence window without the goroutine
+ever reaching the mutex).
+
+## Live-indirection primitives (#2114 / #6743 r6)
+
+`live.go` carries the three things the daemon's `liveDataPlane` adapter
+(`pkg/daemon/daemon_dp_live.go`) needs the consumers to share:
+
+- `ErrNotPublished` — returned by every forwarder when the daemon's cell
+  is empty AT CALL TIME. It is EXPORTED so `pkg/grpcapi` can map it to
+  `codes.Unavailable` (the code its own `dp == nil || !IsLoaded()`
+  pre-check already returns) rather than reporting daemon lifecycle state
+  as `codes.Internal`.
+- `LiveUnwrapper` / `Unwrap` — an adapter's method set is exactly its
+  declared forwarders, so every OPTIONAL capability consumers reach by
+  asserting on `any` is ERASED by it. `Unwrap` resolves to the backend
+  published at the instant of the call, and returns nil once the daemon
+  has disowned one — capability transparency WITHOUT resurrecting a
+  disowned backend. It is the identity for a plain backend, so every
+  non-daemon caller and every test is unaffected. The
+  `LastApplyResultOf` / `SessionStoreOf` / `TelemetryOf` helpers resolve
+  through it, as does each consumer package's `dpProbe()`.
+- `Published` — the honest replacement for `dp != nil` at render sites:
+  the adapter is permanently non-nil, so the field cannot answer "does a
+  dataplane exist?".
+
+### Counter-clear error propagation: what it does NOT cover
+
+`clearPolicyCountersIn` / `clearFilterCountersIn` propagate their
+`Map.Update` error (#6743 r4-F2), which fixes the discarded-error false
+success. It does NOT fix the DETACHED-backend false success: `Teardown()`
+closes only the link handles and `Cleanup` merely unpins, so a retained,
+torn-down `Manager` still holds live FD-backed map objects and an
+`Update` through them SUCCEEDS. A `clear` issued against a disowned
+generation therefore still reports success while the live generation
+keeps its counters. Detecting that needs a generation tag or lease on the
+handle itself — **#6741**, not this wrapper.
+
 ## Entry points
 
 - `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the
@@ -525,10 +640,61 @@ then stays green.
 - `New() *Manager` — `loader.go`.
 - `Compile(cfg *config.Config) (*CompileResult, error)` — multi-phase
   lowering to BPF map entries. Phases live in `compiler.go`: zone IDs,
-  screen profile IDs, zones, address book, applications, policies,
-  NAT, static NAT, NAT64 prefixes, NPTv6, screen profiles, default
-  policy, flow timeouts, firewall filters, flow config, port
-  mirroring.
+  screen profile IDs, **validate-before-mutate pre-pass**, zones, address
+  book, applications, policies, NAT, static NAT, NAT64 prefixes, NPTv6,
+  screen profiles, default policy, flow timeouts, firewall filters, flow
+  config, port mirroring.
+  - The pre-pass (`compiler_validate_4960.go`, #4960) re-runs the fallible
+    HOST-PURE phases against a discarding dataplane BEFORE the zones phase
+    performs the first destructive host netlink mutation, so a config that
+    passes `commit check` but trips a later phase is REJECTED with nothing
+    mutated instead of half-applied with no undo path. It can therefore fail
+    the whole compile on its own. It is additive — every real phase keeps its
+    position — but it does change WHICH error an operator sees when a config
+    carries more than one fault. Precedence is the pre-pass ROW ORDER, because
+    the pre-pass returns on the first failing row. An unknown screen-profile
+    reference is now reported by a pre-pass row (`zone screen references`)
+    sitting FIRST in the table, so it is the error an operator sees when a
+    config carries it alongside any other pre-pass fault. It remains a
+    zones-phase fault as well — #6894 hoisted `validateZoneScreenReferences`
+    to the top of `compileZones`, so a caller reaching that phase without the
+    pre-pass still rejects before any zone is programmed. The earlier wording
+    ("no longer a zones-phase fault at all") described only the pre-pass half
+    and read as though the zones-phase check had been removed. Read the order off `validationPhases` rather than trusting this
+    sentence — the previous wording had the two the wrong way round. That file
+    states what the pre-pass
+    does and does not cover; the coverage table is not the whole compile.
+  - **The pre-pass is only as good as the phases' own strictness** (#6894 r9,
+    #4960). A row that ACCEPTS what the Rust helper later REJECTS puts the
+    half-applied state back: the helper's rejection lands at
+    `publishSnapshotFailClosedLocked`, after the zones phase has already
+    created VLANs and reconciled addresses. NPTv6 was such a row —
+    `compileNPTv6` warned and skipped an unparseable / length-mismatched /
+    host-bits-set prefix while `Nptv6State::try_from_snapshots` rejects the
+    WHOLE snapshot over it (`userspace-dp/src/nptv6.rs`, #2240/#4519). It now
+    returns an error for those, so the same certain failure happens BEFORE the
+    mutation. The error is scoped to rules the helper actually REFUSES, which is
+    not the same as "Go cannot parse it" (#7077): Rust's `parse_prefix` takes a
+    leading `+` on the mask (`u8::from_str`) where Go's `net.ParseCIDR` does not,
+    so `fd00:9::/+48` is a Go parse error and a helper ACCEPT whose apply
+    succeeds today. `nptv6HelperWouldInstall` mirrors the helper's grammar (drift
+    is bound by a rustc-measured parity table) so that class keeps warn-and-skip;
+    a skipped rule still reaches the helper because `buildNptv6Snapshots` copies
+    the config strings independently. The error is also scoped to rules that
+    actually reach the helper at all:
+    `config.NPTv6ScopeUnsupported` is the shared predicate the snapshot builder
+    uses to DROP a rule (#5818), and a dropped rule keeps the warn-and-skip
+    disposition because today's apply succeeds without it. **Residual:** the
+    helper also rejects OVERLAPPING NPTv6 prefixes (#2241) partitioned by zone
+    scope (#5176); the pre-pass does not replicate that partitioning, so an
+    overlap still fails post-mutation. Replicating it coarsely would REJECT
+    configs the helper accepts, which is worse than the residual.
+  - **No-brick note.** A pre-pass rejection cannot strand a boot or an HA
+    peer-sync: `configstore.Store.Load` and `Store.SyncApply` compile through
+    `pkg/config.compileTreeLenient` and never reach `pkg/dataplane.CompileConfig`
+    at all. The config still loads with the warning `validateNPTv6Strict` emits
+    on the tolerant path; what fails is the dataplane apply, which already
+    failed at publish before this change.
 - `CompileResult` — `compiler.go`. Zone/policy/NAT/app IDs, compiled
   policy-scheduler rule slots, and the per-interface networkd configs.
 - Session iteration: `IterateSessions`, `BatchIterateSessions`,

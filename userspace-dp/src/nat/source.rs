@@ -109,6 +109,15 @@ pub(crate) enum SourceNatFailureReason {
     /// count) rather than forwarding the private/internal source UNTRANSLATED
     /// onto the egress — the leak this closes.
     InterfaceNoEgressAddress,
+    /// #6812: the pool's allocator key did not fit within the source-NAT
+    /// AGGREGATE cardinality budget (pool count / total addresses / total port
+    /// capacity — the same budgets the Go #5877 strict commit gate enforces)
+    /// at the apply boundary, so no allocator was built for it. Reached only
+    /// from a tolerated (lenient-load / peer-synced) config or a hand-crafted
+    /// snapshot: a strict commit rejects the over-budget config before apply.
+    /// Fail-closed exactly like the other pool-unusable reasons — the flow
+    /// gets `Unavailable` (drop + count), never an untranslated forward.
+    OverBudget,
 }
 
 impl SourceNatFailureReason {
@@ -125,6 +134,7 @@ impl SourceNatFailureReason {
                 "source_nat_deterministic_subscriber_out_of_range"
             }
             Self::InterfaceNoEgressAddress => "source_nat_interface_no_egress_address",
+            Self::OverBudget => "source_nat_pool_over_budget",
         }
     }
 }
@@ -134,9 +144,21 @@ fn source_nat_failure_reason_from_snapshot(reason: &str) -> SourceNatFailureReas
         "missing_pool" => SourceNatFailureReason::MissingPool,
         "empty_pool" => SourceNatFailureReason::EmptyPool,
         "invalid_port_range" => SourceNatFailureReason::InvalidPortRange,
+        // #6812 F1 round 2: the Go snapshot builder now emits this for a pool
+        // with ANY member `expand_pool_address` would refuse — an unparseable
+        // token, a malformed mask, or an over-capacity prefix. It decodes to the
+        // SAME variant the parse loop below assigns from its own
+        // `invalid_pool_address` flag, so the disposition of such a pool is
+        // unchanged; deciding it Go-side is what lets the aggregate budget walk
+        // exclude the pool it knows builds no allocator.
         "invalid_pool" => SourceNatFailureReason::InvalidPool,
         "wrong_address_family" => SourceNatFailureReason::WrongAddressFamily,
         "allocator_exhausted" => SourceNatFailureReason::AllocatorExhausted,
+        // #6812: the Go tolerant snapshot poison for a pool that does not fit
+        // the #5877 aggregate cardinality budget. Wire-skew safe: an older
+        // helper maps the unknown string to InvalidPool via the catch-all —
+        // still fail-closed, just a less specific diagnostic.
+        "aggregate_over_budget" => SourceNatFailureReason::OverBudget,
         _ => SourceNatFailureReason::InvalidPool,
     }
 }
@@ -307,6 +329,16 @@ pub(crate) struct SourceNatRule {
     pub(crate) persistent_nat_timeout_ns: u64,
     pub(crate) pool_addresses_v4: Vec<Ipv4Addr>,
     pub(crate) pool_addresses_v6: Vec<Ipv6Addr>,
+    /// The pool's CONFIGURED port range after snapshot defaulting (1024-65535
+    /// when unset). Carried on the rule — config, not allocator state — so the
+    /// pool status view (`source_nat_pool_statuses`) and the allocator key
+    /// read the same values for a healthy pool AND keep reporting the
+    /// configured range for a FAILED pool, whose `pool_allocator` is the
+    /// empty default since #6812 (failed pools build no bitmap). The
+    /// allocator of a healthy pool is always built with exactly these values
+    /// (`resolve_pool_allocators`), so the two can never diverge.
+    pub(crate) pool_port_low: u16,
+    pub(crate) pool_port_high: u16,
     /// #4559: deterministic CGNAT (mode 1, IPv4 subscriber) block-allocation
     /// parameters. `Some` => this rule's pool maps each in-range subscriber IPv4
     /// to a fixed external IP + port block (`allocate_deterministic_v4`) instead
@@ -337,14 +369,278 @@ impl SourceNatRule {
     fn allocator_key(&self) -> Option<SourceNatPoolAllocatorKey> {
         let total_pool = self.pool_addresses_v4.len() + self.pool_addresses_v6.len();
         (self.pool_mode && total_pool > 0 && self.pool_failure.is_none()).then(|| {
-            SourceNatPoolAllocatorKey {
-                pool_name: self.pool_name.clone(),
-                pool_addresses_v4: self.pool_addresses_v4.clone(),
-                pool_addresses_v6: self.pool_addresses_v6.clone(),
-                port_low: self.pool_allocator.port_low,
-                port_high: self.pool_allocator.port_high,
-            }
+            self.allocator_key_for(self.pool_port_low, self.pool_port_high)
         })
+    }
+
+    /// Build the allocator key with an EXPLICIT port range. The resolve pass
+    /// (#6812) keys a rule BEFORE its allocator exists, so it cannot read the
+    /// range back off `pool_allocator` (still the empty default there); the
+    /// range must come from the snapshot defaulting the parse loop applied.
+    fn allocator_key_for(&self, port_low: u16, port_high: u16) -> SourceNatPoolAllocatorKey {
+        SourceNatPoolAllocatorKey {
+            pool_name: self.pool_name.clone(),
+            pool_addresses_v4: self.pool_addresses_v4.clone(),
+            pool_addresses_v6: self.pool_addresses_v6.clone(),
+            port_low,
+            port_high,
+        }
+    }
+}
+
+/// #6812: source-NAT AGGREGATE allocator budget at the apply boundary — the
+/// Rust mirror of the Go #5877 strict commit gate
+/// (`validateSourceNATAggregateCardinalityStrict`, pkg/config). The Go gate
+/// rejects an over-budget config at strict commit, but the TOLERANT load /
+/// peer-sync path only warns (#1960 no-brick), so an over-budget config can
+/// still reach this apply boundary; before this gate the boundary expanded
+/// every pool and built each address's occupancy bitmap EAGERLY — three
+/// full-range /16 pools materialise 12,683,575,296 bitmap bits (~1.48 GiB)
+/// and can stall or OOM the dataplane during an upgrade boot / HA convergence.
+///
+/// WHAT THIS BOUNDS, precisely, because the ordering invites a wrong reading:
+/// the budget is checked in `resolve_pool_allocators`, which runs AFTER the
+/// parse loop — so the pools' ADDRESS VECTORS (`pool_addresses_v4/v6`) are
+/// already expanded when it runs, and only the per-address occupancy BITMAP is
+/// gated (`PortAllocator::new` is reached solely from the `admitted_with(..) ==
+/// Some` arm). That is deliberate and it is the right split: the bitmap is the
+/// exhaustion vector by roughly three orders of magnitude. A full-range /16
+/// pool costs 65536 x 4 B = ~262 KB as addresses against 65536 x 64512 bits =
+/// ~528 MB as bitmap. Bounding the address vectors too would mean restructuring
+/// the parse loop to defer expansion, for ~0.05% of the memory. Do not "fix"
+/// the ordering on the theory that the guard sits downstream of the growth it
+/// limits — for the quantity that matters it sits upstream (#6812).
+/// The values MUST match the Go constants
+/// (`MaxSourceNATPoolCount` / `MaxSourceNATAggregatePoolAddresses` /
+/// `MaxSourceNATAggregatePortCapacity`); the parity is pinned by
+/// `real_budget_matches_go_5877_constants` in tests_aggregate_budget.rs.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SourceNatAggregateBudget {
+    /// Max DISTINCT pool allocator instances (one per referenced pool key).
+    pub(super) max_pools: u64,
+    /// Max SUM of every referenced pool's expanded address count.
+    pub(super) max_addresses: u64,
+    /// Max SUM of (addresses x port range) = occupancy bitmap SLOTS.
+    pub(super) max_port_capacity: u64,
+}
+
+pub(super) const SOURCE_NAT_AGGREGATE_BUDGET: SourceNatAggregateBudget = SourceNatAggregateBudget {
+    max_pools: 1024,
+    max_addresses: 16 * MAX_POOL_PREFIX_HOSTS, // 1,048,576
+    max_port_capacity: 1 << 33,                // 8,589,934,592
+};
+
+/// Running aggregate charge across the distinct allocator keys one apply will
+/// hold live. u64 with saturating adds: a hand-crafted snapshot can claim
+/// absurd cardinalities, and saturation (never wrap) keeps the over-budget
+/// verdict fail-closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SourceNatAggregateUse {
+    pub(super) pools: u64,
+    pub(super) addresses: u64,
+    pub(super) port_capacity: u64,
+}
+
+impl SourceNatAggregateUse {
+    /// Cumulative use UNCONDITIONALLY including `charge` (saturating adds —
+    /// the one add formula). Used directly for keys that must be accepted
+    /// regardless of budget (reused last-good state), and as the candidate
+    /// inside `admitted_with`.
+    fn saturating_with(self, charge: Self) -> Self {
+        Self {
+            pools: self.pools.saturating_add(charge.pools),
+            addresses: self.addresses.saturating_add(charge.addresses),
+            port_capacity: self.port_capacity.saturating_add(charge.port_capacity),
+        }
+    }
+
+    /// Cumulative use IF `charge` is admitted. Returns None when admitting it
+    /// would cross any budget — the caller then refuses the key WITHOUT
+    /// committing the charge (first-fit: a later, smaller key may still fit).
+    pub(super) fn admitted_with(
+        self,
+        charge: Self,
+        budget: &SourceNatAggregateBudget,
+    ) -> Option<Self> {
+        let next = self.saturating_with(charge);
+        (next.pools <= budget.max_pools
+            && next.addresses <= budget.max_addresses
+            && next.port_capacity <= budget.max_port_capacity)
+            .then_some(next)
+    }
+}
+
+/// Per-rule deferred allocator inputs, captured by the parse loop for every
+/// rule that passes the `allocator_key()` gate (`pool_mode && total_pool > 0
+/// && pool_failure.is_none()`). `total_pool` is the EXPANDED address count
+/// (v4 + v6); `port_low`/`port_high` are the snapshot-defaulted range.
+struct PendingPoolAllocator {
+    port_low: u16,
+    port_high: u16,
+    total_pool: usize,
+}
+
+impl PendingPoolAllocator {
+    fn charge(&self) -> SourceNatAggregateUse {
+        SourceNatAggregateUse {
+            pools: 1,
+            addresses: self.total_pool as u64,
+            // One formula for "port slots this allocator materialises" —
+            // shared with PortAllocator::new's own capacity arithmetic.
+            port_capacity: super::allocator::allocator_capacity(
+                self.total_pool,
+                self.port_low,
+                self.port_high,
+            ) as u64,
+        }
+    }
+}
+
+/// #6812: assign pool allocators AFTER parsing, under the aggregate budget.
+///
+/// Three invariants the pre-#6812 inline block violated:
+///
+/// 1. REUSE BEFORE BUILD — the this-apply and previous-apply allocator maps
+///    are consulted FIRST; only a miss constructs `PortAllocator::new`. The
+///    old code built a full per-address occupancy bitmap per rule and THEN
+///    discarded it on a reuse hit.
+/// 2. FAILED POOLS BUILD NOTHING — a rule whose pool already failed
+///    (missing/empty/invalid/Go-poisoned) keeps the empty default allocator;
+///    the match path short-circuits on `pool_failure` before touching the
+///    allocator and `reserve_flow` on an empty allocator returns false
+///    gracefully, so no consumer can observe the difference.
+/// 3. AGGREGATE BUDGET — distinct keys are charged (count / addresses /
+///    port capacity). A REUSED key consumes budget but is ALWAYS accepted: a
+///    no-op re-apply must not kill live state, and charging it stops a
+///    two-step apply from creeping past the cap one generation at a time (two
+///    full-range /16 pools, then the same two plus a third — the review's
+///    1.48 GiB scenario via incremental applies). A NEW key is admitted only
+///    if it fits the remaining budget (first-fit: a refused key consumes
+///    nothing, so a later smaller key can still install); a refused key marks
+///    every referencing rule `OverBudget` — fail-closed with a dataplane
+///    diagnostic — and builds no bitmap.
+///
+/// # Reused keys are RESERVED before any new key is admitted (#6812 F2 round 4)
+///
+/// Invariant 3 above is order-sensitive if reuse is charged where it is met.
+/// A single pass charging in snapshot order lets a NEW key be admitted against
+/// a `used` total that does not yet include reused keys appearing LATER in the
+/// slice — and those keys are then accepted unconditionally, so the live set
+/// ends up over the cap. Measured, with two live pools A and B at 160 of a
+/// 200-slot budget and a new C worth 80:
+///
+/// | snapshot order | C | live |
+/// |---|---|---|
+/// | `A, B, C` | refused | 160 |
+/// | `C, A, B` | **admitted, bitmap built** | **240 — over the cap** |
+///
+/// Same pools, same reuse map, opposite outcome from ORDER alone; and it
+/// repeats, one extra pool per apply. The Go-side poison hides it for
+/// snapshots this control plane generates, which is precisely why it mattered:
+/// this boundary exists as the INDEPENDENT backstop for a tolerated,
+/// older-control-plane, or handcrafted snapshot, where no Go poison is coming.
+///
+/// Phase 1 therefore charges every DISTINCT key that will be reused, before
+/// phase 2 admits anything. Reused keys are still always accepted and are
+/// charged exactly once; new-key admission now sees the true live total
+/// whatever order the snapshot arrives in.
+fn resolve_pool_allocators(
+    out: &mut [SourceNatRule],
+    pendings: &[Option<PendingPoolAllocator>],
+    previous_allocators: &FxHashMap<SourceNatPoolAllocatorKey, PortAllocator>,
+    budget: &SourceNatAggregateBudget,
+) {
+    let mut pool_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
+    let mut refused_keys = FxHashMap::<SourceNatPoolAllocatorKey, ()>::default();
+    let mut used = SourceNatAggregateUse::default();
+
+    // PHASE 1: reserve the reused keys. These are accepted unconditionally in
+    // phase 2, so their charge is not a prediction — it is live state this
+    // apply is already committed to holding.
+    let mut reserved = FxHashMap::<SourceNatPoolAllocatorKey, ()>::default();
+    for (rule, pending) in out.iter().zip(pendings.iter()) {
+        let Some(pending) = pending else {
+            continue;
+        };
+        let key = rule.allocator_key_for(pending.port_low, pending.port_high);
+        if !previous_allocators.contains_key(&key) || reserved.contains_key(&key) {
+            continue;
+        }
+        used = used.saturating_with(pending.charge());
+        reserved.insert(key, ());
+    }
+
+    // PHASE 2: assign. Reused keys were charged in phase 1 and must NOT be
+    // charged again here.
+    for (rule, pending) in out.iter_mut().zip(pendings.iter()) {
+        let Some(pending) = pending else {
+            continue;
+        };
+        let key = rule.allocator_key_for(pending.port_low, pending.port_high);
+        if refused_keys.contains_key(&key) {
+            rule.pool_failure = Some(SourceNatFailureReason::OverBudget);
+            rule.deterministic_v4 = None;
+            continue;
+        }
+        if let Some(existing) = pool_allocators.get(&key) {
+            rule.pool_allocator = existing.clone();
+            continue;
+        }
+        let charge = pending.charge();
+        if let Some(existing) = previous_allocators.get(&key) {
+            // Reuse preserves last-good live state: always accepted. Its
+            // budget was charged in PHASE 1 — charging it again here would
+            // double-count, and charging it ONLY here is the #6812 F2 defect
+            // (a new key earlier in the slice would be admitted against a
+            // `used` that omits it). A reused key that alone overflows (legacy
+            // pre-cap state) saturated `used` in phase 1, which only refuses
+            // NEW keys.
+            debug_assert!(
+                reserved.contains_key(&key),
+                "a previously-allocated key must have been reserved in phase 1",
+            );
+            pool_allocators.insert(key, existing.clone());
+            rule.pool_allocator = existing.clone();
+            continue;
+        }
+        match used.admitted_with(charge, budget) {
+            Some(next) => {
+                used = next;
+                let allocator = PortAllocator::new(
+                    pending.total_pool,
+                    pending.port_low,
+                    pending.port_high,
+                );
+                pool_allocators.insert(key, allocator.clone());
+                rule.pool_allocator = allocator;
+            }
+            None => {
+                // One journald line per refused key per apply — a one-time
+                // config-apply event, not a per-packet path.
+                eprintln!(
+                    "xpf-dp: source-nat pool {:?} refused at apply: aggregate allocator \
+                     budget exceeded (count {}/{}, addresses {}/{}, port slots {}/{} would \
+                     grow by {}/{}/{}); rule(s) referencing it fail closed (#6812)",
+                    key.pool_name,
+                    used.pools,
+                    budget.max_pools,
+                    used.addresses,
+                    budget.max_addresses,
+                    used.port_capacity,
+                    budget.max_port_capacity,
+                    charge.pools,
+                    charge.addresses,
+                    charge.port_capacity,
+                );
+                refused_keys.insert(key, ());
+                rule.pool_failure = Some(SourceNatFailureReason::OverBudget);
+                // Keep the parse-loop invariant `deterministic_v4.is_some() =>
+                // pool_failure.is_none()` that the resolve-time refusal would
+                // otherwise break (the match path is safe either way — it
+                // short-circuits on pool_failure first).
+                rule.deterministic_v4 = None;
+            }
+        }
     }
 }
 
@@ -511,6 +807,42 @@ impl SourceNatRule {
 /// signal rather than a silently clamped pool.
 pub(crate) const MAX_POOL_PREFIX_HOSTS: u64 = 65536;
 
+/// Parse a CIDR mask field in the CANONICAL decimal spelling, or `None`
+/// (#6812 F1 round 3).
+///
+/// Canonical means: 1-3 ASCII digits, no leading zero unless the field is the
+/// single digit `0`, value `<= max`. That is exactly what Go's
+/// `netip.ParsePrefix` accepts, so the two sides agree on the mask field by
+/// construction.
+///
+/// `ipnet` instead reads the field with `read_number(10, 2, 33)` for IPv4 and
+/// `read_number(10, 3, 129)` for IPv6 — a DIGIT-COUNT cap, not a canonical-form
+/// rule. It therefore refuses `/032` (3 digits, v4) but accepts `/064` as `/64`
+/// (3 digits, v6). Neither spelling changes any pool's disposition today
+/// (every leading-zero-expressible prefix length is over `MAX_POOL_PREFIX_HOSTS`
+/// anyway, so both sides refuse the pool either way), but that agreement is a
+/// coincidence of two unrelated bounds, not a property. Raising
+/// `MAX_POOL_PREFIX_HOSTS` would turn it into a live divergence, so the mask
+/// grammar is pinned here rather than left to arithmetic.
+fn parse_canonical_prefix_len(mask: &str, max: u32) -> Option<u32> {
+    // No length cap: a 4+ digit field either carries a leading zero (refused
+    // below) or exceeds `max` (refused at the end), and an absurdly long one
+    // fails the `parse` itself. A `mask.len() > 3` clause was measured to
+    // change 0 of 137,879 differential verdicts — it read like a bound guard
+    // and was not one.
+    if mask.is_empty() || !mask.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if mask.len() > 1 && mask.starts_with('0') {
+        return None;
+    }
+    let value: u32 = mask.parse().ok()?;
+    if value > max {
+        return None;
+    }
+    Some(value)
+}
+
 /// Expand one source-NAT pool address entry into its constituent host
 /// addresses (#3049). A pool entry is either a bare IP, a host CIDR
 /// (`/32`, `/128`), or a subnet CIDR (e.g. `203.0.113.0/28`). Junos uses the
@@ -521,34 +853,103 @@ pub(crate) const MAX_POOL_PREFIX_HOSTS: u64 = 65536;
 ///
 /// Returns `false` if the entry does not parse or expands beyond
 /// `MAX_POOL_PREFIX_HOSTS` (caller marks the pool invalid).
-fn expand_pool_address(
+///
+/// # One address grammar for both forms (#6812 F1 round 3)
+///
+/// The CIDR branch parses its address half with the SAME `std::net::IpAddr`
+/// parser the bare branch uses, and its mask half with
+/// `parse_canonical_prefix_len` — it deliberately does NOT call
+/// `IpNet::from_str`. `ipnet` hand-rolls its own address parser
+/// (`ipnet::parser`, a fork of an old `std` implementation) whose octet reader
+/// is `read_number(10, 3, 0x100)`: any 1-3 digit decimal below 256, **leading
+/// zeros included**. `std` (since Rust 1.53) and Go's `netip.ParseAddr` both
+/// reject a leading-zero octet, because `010` is octal 8 to some resolvers and
+/// the ambiguity is a spoofing vector.
+///
+/// That made this function self-inconsistent and made it disagree with the Go
+/// control plane: `010.0.0.1` (bare) was refused here, while `010.0.0.1/32`
+/// (CIDR) was accepted as `10.0.0.1`, and the shared Go predicate
+/// (`sourceNATPoolAddressReason`, pkg/config/compiler_validate_strict_nat.go)
+/// refused both — so the STRICT commit gate has rejected the spelling since
+/// #5627 while this function installed it. That commit-vs-apply divergence is
+/// what the narrowing closes.
+///
+/// # What moved, stated correctly (#6812 B1)
+///
+/// Two earlier revisions of this comment claimed the narrowing "changes no
+/// config's disposition", and described the pre-fix state as an over-rejection
+/// on the tolerant path. **Both are wrong, and the second inverts the
+/// direction.** At the merge base the tolerant path did NOT poison this class:
+/// `config.SourceNATPoolUnusableReason` does not exist there, and the
+/// membership-grammar clause that stamps `invalid_pool` was added mid-branch by
+/// this PR. So master had a commit-vs-apply divergence (strict rejects, runtime
+/// installs), not an over-rejection — and a pool carrying `010.0.0.0/24` really
+/// did translate at the merge base and really does fail closed now.
+///
+/// The blast radius is exactly the leading-zero-octet CIDR family. Every other
+/// shape the membership clause catches was already fail-closed at the merge
+/// base: a mixed pool with an unparseable member and an over-capacity `/15`
+/// were both refused by this function, and a bare `%zone` member was poisoned
+/// by the #5875 builder check.
+///
+/// The disposition change is kept deliberately, on the #5875 precedent (reject
+/// a non-representable literal, never silently rewrite it). Declining to poison
+/// it on the tolerant path is not an alternative — the runtime refuses the
+/// member on its own, so the pool fails closed either way; that is measured by
+/// `declining_to_poison_a_leading_zero_member_does_not_restore_it_6812`. The
+/// operator-facing half of the decision is `leadingZeroPoolAddressReason`,
+/// which names the canonical spelling, and the upgrade / peer-sync regression
+/// tests in pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go.
+///
+/// `nat_pool_grammar_parity_fixture`
+/// (tests_aggregate_budget.rs) pins the agreement over
+/// `tests/fixtures/snat_pool_grammar_v1.json` — the SAME file
+/// `TestPoolAddressGrammarMatchesDataplane_6812` reads on the Go side, so
+/// neither side keeps a copy of the table — and
+/// `nat_pool_bare_and_host_cidr_grammars_agree` drives the bare-vs-CIDR
+/// invariant directly.
+///
+/// Scope: `expand_pool_address` has exactly one production caller (the
+/// source-NAT pool parse loop below), so this is the source-NAT pool
+/// membership grammar only. Rule-set MATCH prefixes still parse via `IpNet`
+/// and are a separate question.
+pub(super) fn expand_pool_address(
     addr_str: &str,
     out_v4: &mut Vec<Ipv4Addr>,
     out_v6: &mut Vec<Ipv6Addr>,
 ) -> bool {
-    if addr_str.contains('/') {
+    if let Some((addr_part, mask_part)) = addr_str.split_once('/') {
         // CIDR form: enumerate every address in the prefix range.
-        match addr_str.parse::<IpNet>() {
-            Ok(IpNet::V4(net)) => {
-                let host_bits = (32 - net.prefix_len()) as u32;
+        match addr_part.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => {
+                let Some(prefix_len) = parse_canonical_prefix_len(mask_part, 32) else {
+                    return false;
+                };
+                let host_bits = 32 - prefix_len;
                 let count = 1u64 << host_bits; // 1 for /32
                 if count > MAX_POOL_PREFIX_HOSTS {
                     return false;
                 }
-                let base = u32::from(net.network());
+                // Mask to the network base. `count` is <= MAX_POOL_PREFIX_HOSTS
+                // (65536) here, so the `as u32` narrowing cannot truncate; the
+                // over-cap prefixes that would overflow returned above.
+                let base = u32::from(ip) & !(count as u32 - 1);
                 for i in 0..count {
                     out_v4.push(Ipv4Addr::from(base.wrapping_add(i as u32)));
                 }
                 true
             }
-            Ok(IpNet::V6(net)) => {
-                let host_bits = (128 - net.prefix_len()) as u32;
+            Ok(IpAddr::V6(ip)) => {
+                let Some(prefix_len) = parse_canonical_prefix_len(mask_part, 128) else {
+                    return false;
+                };
+                let host_bits = 128 - prefix_len;
                 // host_bits >= 17 already exceeds the cap; avoid 1u128 << 64+.
                 if host_bits >= 64 || (1u128 << host_bits) > MAX_POOL_PREFIX_HOSTS as u128 {
                     return false;
                 }
                 let count = 1u128 << host_bits; // 1 for /128
-                let base = u128::from(net.network());
+                let base = u128::from(ip) & !(count - 1);
                 for i in 0..count {
                     out_v6.push(Ipv6Addr::from(base.wrapping_add(i)));
                 }
@@ -582,12 +983,37 @@ pub(crate) fn parse_source_nat_rules_with_previous(
     previous: Option<&[SourceNatRule]>,
     nat_counters: &NatCounterStore,
 ) -> Vec<SourceNatRule> {
+    parse_source_nat_rules_inner(snaps, previous, nat_counters, &SOURCE_NAT_AGGREGATE_BUDGET)
+}
+
+/// Test-only entry with an injectable aggregate budget: the production budget
+/// (2^33 port slots) cannot be exercised end-to-end in a unit test without
+/// materialising ~1 GiB of real bitmaps, so the budget-gate WIRING tests
+/// scale the budget down and drive the identical resolve path. The budget
+/// VALUES are pinned separately against the Go #5877 constants.
+#[cfg(test)]
+pub(crate) fn parse_source_nat_rules_with_budget(
+    snaps: &[SourceNATRuleSnapshot],
+    previous: Option<&[SourceNatRule]>,
+    nat_counters: &NatCounterStore,
+    budget: &SourceNatAggregateBudget,
+) -> Vec<SourceNatRule> {
+    parse_source_nat_rules_inner(snaps, previous, nat_counters, budget)
+}
+
+fn parse_source_nat_rules_inner(
+    snaps: &[SourceNATRuleSnapshot],
+    previous: Option<&[SourceNatRule]>,
+    nat_counters: &NatCounterStore,
+    budget: &SourceNatAggregateBudget,
+) -> Vec<SourceNatRule> {
     // Persistent SNAT allocator state is helper-local runtime state. A
     // compatible in-process refresh may reuse the previous allocator below,
     // but a helper cold start passes `None` here and intentionally resets live
     // tuple ownership, persistent leases, and allocator counters instead of
     // replaying unproven translated tuple ownership.
     let mut out = Vec::with_capacity(snaps.len());
+    let mut pendings: Vec<Option<PendingPoolAllocator>> = Vec::with_capacity(snaps.len());
     let mut previous_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
     if let Some(prev_rules) = previous {
         for prev in prev_rules {
@@ -598,7 +1024,6 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             }
         }
     }
-    let mut pool_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
     for snap in snaps {
         let timeout_secs = if snap.persistent_nat_inactivity_timeout > 0 {
             snap.persistent_nat_inactivity_timeout
@@ -724,6 +1149,12 @@ pub(crate) fn parse_source_nat_rules_with_previous(
         } else {
             65535
         };
+        // #6812: carry the configured (snapshot-defaulted) port range on the
+        // rule itself — config, not allocator state — so the status view and
+        // the allocator key keep reading it even when no allocator is built
+        // (failed / over-budget pool).
+        rule.pool_port_low = port_low;
+        rule.pool_port_high = port_high;
         if snap.pool_unusable {
             rule.pool_failure = Some(source_nat_failure_reason_from_snapshot(
                 &snap.pool_unusable_reason,
@@ -762,23 +1193,23 @@ pub(crate) fn parse_source_nat_rules_with_previous(
                 host_count: snap.deterministic_host_count,
             });
         }
-        if total_pool > 0 {
-            rule.pool_allocator = PortAllocator::new(total_pool, port_low, port_high);
-        }
-        if let Some(key) = rule.allocator_key() {
-            if let Some(existing) = pool_allocators.get(&key) {
-                rule.pool_allocator = existing.clone();
-            } else {
-                let allocator = previous_allocators
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| rule.pool_allocator.clone());
-                rule.pool_allocator = allocator.clone();
-                pool_allocators.insert(key, allocator);
-            }
-        }
+        // #6812: allocator construction is DEFERRED to `resolve_pool_allocators`
+        // (reuse-before-build, nothing for a failed pool, aggregate budget
+        // enforced). The parse loop only records the deferred inputs for rules
+        // that pass the `allocator_key()` gate — a failed or pool-less rule
+        // keeps the empty default allocator and never builds a bitmap.
+        pendings.push(
+            (rule.pool_mode && total_pool > 0 && rule.pool_failure.is_none()).then_some(
+                PendingPoolAllocator {
+                    port_low,
+                    port_high,
+                    total_pool,
+                },
+            ),
+        );
         out.push(rule);
     }
+    resolve_pool_allocators(&mut out, &pendings, &previous_allocators, budget);
     out
 }
 
@@ -796,8 +1227,8 @@ fn source_nat_runtime_compatible(new_rule: &SourceNatRule, old_rule: &SourceNatR
             == old_rule.persistent_nat_inactivity_timeout_secs
         && new_rule.pool_addresses_v4 == old_rule.pool_addresses_v4
         && new_rule.pool_addresses_v6 == old_rule.pool_addresses_v6
-        && new_rule.pool_allocator.port_low == old_rule.pool_allocator.port_low
-        && new_rule.pool_allocator.port_high == old_rule.pool_allocator.port_high
+        && new_rule.pool_port_low == old_rule.pool_port_low
+        && new_rule.pool_port_high == old_rule.pool_port_high
 }
 
 /// Release an UNTRACKED (single-holder) source-NAT allocation — the

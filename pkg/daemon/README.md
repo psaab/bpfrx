@@ -12,6 +12,118 @@ every other internal package.
 
 The daemon stores dataplane backends behind `dataplane.RuntimeDataPlane` and
 uses the split config, HA/fabric, sessions, telemetry, and link-cycle domains.
+The runtime dataplane is published through ONE synchronized point (#2114):
+`Daemon.dpCell` (`atomic.Pointer[dpSlot]`) with the `dataplane()` /
+`setDataplane()` accessor pair — the `natPoolAlarm` (#2116) idiom. Every
+in-package ACQUISITION of the handle goes through the accessors; a
+`pkg/daemon` AST canary (`daemon_dp_canary_test.go`) fails the build on a
+direct `.dpCell` reference outside them. Readers that nil-check AND use
+the value load ONCE into a local (the plan's §5.3 snapshot boundaries: one
+load per sampler/watchdog tick, per event/request callback, or per
+straight-line block — never per-element). `setDataplane`'s kind-gated
+guard keeps a non-nil interface wrapping a nil value (any nillable kind)
+out of the cell.
+
+**Publication is not lifetime.** The cell answers "what is published
+now?"; it does not bound how long a handle someone already took stays
+usable. Two consequences the code makes explicit:
+
+- **Escaping consumers.** Six things outlive a single call. The three
+  OPERATOR-FACING management servers — gRPC, REST, and the console CLI —
+  do NOT receive the backend handle: they receive `liveDataPlane`
+  (`daemon_dp_live.go`), a daemon-owned indirection that re-reads the cell
+  on every method, so a later `setDataplane(nil)` is immediately visible
+  to them. TWO of the three DATA-PATH consumers are deliberate
+  capture-once wiring, and are documented as such rather than claimed
+  converted: conntrack GC and cluster `SessionSync` take the DECOMPOSED
+  `dataplane.SessionStore` / `dataplane.Telemetry` domains (a live
+  indirection would put an atomic load + interface assertion +
+  `SessionStoreOf` allocation on every per-session step). The THIRD — the
+  userspace event-stream loop — is NOT capture-once: it re-resolves the
+  provider, the stream instance AND the session-delta drainer from the
+  cell on every poll tick (#6743 r6-F4 for the first two — it used to
+  capture a provider at Phase 5 from the constructed-but-unarmed bootstrap
+  backend and keep polling it after an arm failure cleared the cell; r7-F1
+  for the drainer, which stayed captured at loop entry and kept draining a
+  disowned backend at 10 Hz on the fast fallback branch) and re-installs
+  its callbacks when a rollback + corrected re-arm replaces the stream
+  instance. `handleEventStreamFullResync` likewise resolves its session
+  exporter from the cell on every call, so a full resync after a rollback
+  + corrected re-arm exports from the CURRENT backend rather than the
+  torn-down one (#6743 r2-B8, bound by
+  `full_resync_per_call_6743_test.go`). Behavioural guards live in
+  `daemon_dp_escape_test.go` (gRPC) and `daemon_dp_escape_rest_test.go`
+  (REST); `daemon_ha_userspace_stream_live_test.go` drives the event-stream
+  loop across a `setDataplane(nil)`, across a stream replacement, and —
+  on the reconcile-cadence branch, which needs its own connected-stream
+  fixture — across a backend republication (#6743 r2-B3).
+
+  The console-CLI site has TWO halves, and neither covers it alone
+  (corrected in #6743 r2 — an earlier revision of this paragraph said the
+  canary "covers" the site, which was falsified by two compiled escapes
+  that left the whole package green):
+  - `daemon_dp_escape_canary_test.go` is the SYNTACTIC fence. It asserts
+    that no production function sources a management-probe value from
+    anywhere other than an in-place `liveDataplane()` call — keyed on the
+    POSITION of a type assertion and on DATA FLOW, not on a declaration
+    form or on the presence of the name, both of which were escapable.
+    Its stated limit is in the file header and is real: the AST cannot
+    establish temporal containment in general, so a wiring that crosses a
+    function boundary is outside it.
+  - `TestConsoleCLIProbeWiringFollowsTheCell` is the BEHAVIOURAL half: it
+    drives the site's exact wiring through the `cliDataPlane` interface
+    across a publication and a disown. The site itself is inside
+    `if isInteractive()`, so no unit test can execute the real block —
+    which is why the structural half exists at all.
+- **The indirection must not ERASE capabilities.** Go computes a method
+  set statically, so `liveDataPlane`'s is exactly its declared forwarders:
+  the MANDATORY management surface and nothing else. Consumers reach
+  OPTIONAL capabilities by asserting on `any` — `LastApplyResult`,
+  `Sessions`, `Telemetry`, `Status`, `AppliedNATView`, the session cursor,
+  the userspace controls — and every one of those assertions fails against
+  the adapter, silently, on a HEALTHY deployment (#6743 r6-F1: NAT-pool
+  and userspace Prometheus families stop being emitted, NAT statistics
+  report healthy zeros, session paging falls back to the O(N^2) path).
+  Every such probe therefore resolves through `dataplane.Unwrap` first —
+  `dpProbe()` in `pkg/grpcapi`, `pkg/api` and `pkg/cli`, and the
+  `dataplane.LastApplyResultOf` / `SessionStoreOf` / `TelemetryOf` helper
+  family. `Unwrap` is NOT a way to keep a backend: it performs the same
+  per-call cell load and returns nil once the daemon has disowned one, so
+  a probe after `setDataplane(nil)` still fails closed.
+  `daemon_dp_capability_2114_test.go` binds preservation and
+  unreachability in separate bodies; `daemon_dp_probe_canary_test.go` is
+  the fence against a new probe asserting on the raw `dp` field.
+- **Resolve ONCE per operation.** `GetPersistentNAT()` returns a pointer,
+  and each call is its own cell load; a `check == nil` followed by a
+  second call to `.Len()`/`.Clear()`/`.All()` nil-dereferences if the
+  daemon disowns the backend in between (#6743 r6-F2). Every caller binds
+  the result to a local; `TestPersistentNATResolvedOncePerOperation`
+  fences the shape across `pkg/grpcapi`, `pkg/api`, `pkg/cli` and
+  `pkg/natshow`.
+- **`dp != nil` no longer means "a dataplane exists".** The servers hold a
+  permanently non-nil adapter, so a render keyed on the field describes a
+  backend that may not be there — `show system buffers` answered "No BPF
+  maps available" (a claim about a loaded backend's maps) for a daemon
+  whose startup arm failed. Those sites bind `backend :=
+  dataplane.Unwrap(dp)` to a local and make BOTH the publication decision
+  (`backend == nil`) and every capability assertion against that ONE value
+  (#6743 r6-F3, single-resolution form since r7 — an earlier revision of
+  this line said they ask `dataplane.Published(dp)`, which was never true
+  of the merged code; that predicate resolved the cell a second time and
+  was deleted in r2-B6). For the same reason a clear that RACES the
+  disown fails inside the forwarder with `dataplane.ErrNotPublished`;
+  `pkg/grpcapi` maps it to `codes.Unavailable`, matching what its
+  `dp == nil || !IsLoaded()` pre-check returns for the identical
+  operator-visible condition, instead of reporting daemon lifecycle state
+  as `codes.Internal`.
+- **A torn-down backend can still be published.** The commit-confirmed
+  rollback calls `Teardown()` and deliberately LEAVES the object in the
+  cell so a corrected commit re-arms that same object
+  (`TestDataplaneCell_RollbackRearmRecurrence` pins this). Between the
+  teardown and the re-arm, a management call resolves to a detached
+  backend and the `pkg/dataplane` retained-unarmed registry state proceeds
+  exactly as it did pre-#2114. Closing that window needs a
+  generation/lease on the backend itself and is tracked as **#6741**.
 Legacy `dataplane.DataPlane` access is isolated behind `legacyDP()` for
 callers that still need legacy eBPF compatibility while their domain adapters
 are completed (DPDK retired #1525). Userspace currently reaches those old callers through
@@ -339,7 +451,7 @@ credential revocation is enforced even on an apply that returns early
       `m.cur` is loopback so the committed nil is what publishes, and
       `api.authSlot.tighten` drops a nil `next` by design. Without the
       pre-rebind publish the pin captures the credential the operator DELETED,
-      and it keeps authenticating on the routable address for the whole bounded
+      and it keeps authenticating on the routable address for the whole
       drain plus every keep-alive connection already accepted. Pinned by
       `TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561`, which is the
       only case in the package where this nil-direction rebind converges — every
@@ -390,6 +502,22 @@ credential revocation is enforced even on an apply that returns early
     `ReconcileHTTPS` was never called again. `startTo` now adopts the server
     whether or not the bind succeeded, and asks `api.Server.HTTPSServing()`
     rather than inferring convergence from a nil error.
+  - **A converged fingerprint is not a live listener** (#6827 round 6). The
+    same inference failed in the STEADY state, not just at boot: an HTTPS serve
+    loop that terminates unexpectedly marks its leg `dead` and leaves it
+    INSTALLED (it cannot be unlinked there without taking `lifeMu`, which
+    deadlocks a shutdown racing the exit). The fingerprint still matched the
+    committed endpoint, so `reconcileTo`'s leg-changed test was false on every
+    later commit and `ReconcileHTTPS` was never called; and had it been called,
+    its same-address arm returned `nil` on a non-nil pointer. HTTPS was
+    therefore unrecoverable on an UNCHANGED configuration for the life of the
+    process — and with it any stale-cert diagnosis, which can only be
+    discharged against a served certificate. The HTTPS arm now also fires when
+    `next.TLS && !m.srv.HTTPSServing()`, and the api-side no-op tests
+    `listenerLeg.serving()` instead of the pointer. Pinned by
+    `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` (daemon, end to end from
+    `reconcileWebManagement`) and `TestReconcileHTTPSReplacesADeadLeg_6827`
+    (`pkg/api`).
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),
@@ -409,6 +537,83 @@ credential revocation is enforced even on an apply that returns early
   intermediate exits), and `pkg/api/listener_retiredauth_5561_test.go` (a
   retired leg gains no grant and is never dropped to no-auth, while a live leg
   still follows the snapshot).
+
+#### Stale management-TLS-certificate diagnosis on rename (#6827)
+
+The auto-generated management HTTPS certificate is DURABLE on disk and is NOT
+re-minted by a later `set system host-name`, so its SANs go stale and clients
+verifying by host name start failing. `pkg/api`'s own load-path diagnostic
+cannot see a plain rename — the HTTPS leg is rebuilt only when the TLS flag or
+the HTTPS bind address changes, so a rename on an unchanged endpoint reloads
+nothing. `Daemon.renameHostNotingStaleMgmtCert` closes that gap from the apply
+side. `applyHostname` calls it in place of a bare `Sethostname` — it performs
+the rename AND records the debt under ONE hold of `staleCertMu` (#6827 round 7,
+see the fence bullet below) — and then delivers the diagnosis as its last act.
+The delivery is deliberately NOT part of `reconcile()`, which runs early in the
+apply and can only ever see the old name.
+
+Marking and delivering are ONE path (`deliverStaleMgmtCertDiagnosis`), because
+at BOOT the hook runs before its own dependency exists — the first config apply
+is startup phase 4 while `startHTTPServer` publishes `d.mgmt` later in `Run`.
+Three properties carry the mechanism:
+
+- **A debt, not a one-shot.** `staleCertPending` clears only when a delivery
+  actually REACHED a served certificate (`WarnStaleMgmtCertForHostName` reports
+  that). Clearing it whenever the delivery merely RAN loses the diagnosis
+  permanently when HTTPS is off or its bind failed: the next boot's
+  `applyHostname` sees the name already applied and returns early, and the load
+  path's inferred heuristic declines a CROSS-SHAPE rename by design (a
+  shape-preserving one it would still catch, but only at the next certificate
+  load — a restart or an HTTPS rebind, not the commit). Delivery is attempted at
+  the rename itself and RETRIED at the boot management start and on every
+  web-management reconcile (so a later `web-management https` enable — or the
+  rebuild of an HTTPS leg whose serve loop died — settles an old debt). The
+  two DEFERRED retry points are bound at their own call site by
+  `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on deliberately different
+  observables: the `reconcileWebManagement` one on the debt FLAG, because the
+  reconcile that brings HTTPS up makes `pkg/api`'s LOAD path emit the same
+  warning text (a text assertion there passes with the retry deleted); the
+  `startHTTPServer` one on the kernel-name read, which sits past the
+  nil-reconciler guard, because that call site cannot be handed a serving HTTPS
+  leg in-process — it constructs the `api.Server` itself and the cert-dir test
+  seam exists only afterwards.
+- **The name is read from the kernel at DELIVERY**, never stored at rename time,
+  so a deferred diagnosis is never the replay of a name captured at some earlier
+  commit. It IS the kernel's current name for every rename the daemon performs
+  (#6827 round 7). Rounds 5 and 6 claimed otherwise — that `Sethostname` moves
+  the name before the generation is recorded, so no fence could close the gap —
+  but that was a property of where the lock was taken.
+  `renameHostNotingStaleMgmtCert` holds `staleCertMu` ACROSS both the syscall
+  and the bump, so the generation exists before the window can open: a delivery
+  either warns while
+  the rename is still blocked on the mutex (name still current) or finds the
+  generation already moved and abandons. The residual is a privileged
+  `sethostname(2)` from OUTSIDE the daemon, which no in-process fence can see.
+  Bound by `TestRenameAndGenerationBumpAreOneCriticalSection_6827`, which
+  observes from inside the syscall seam that the mutex is held.
+- **The delivery is generation-fenced, before it speaks.** The kernel read runs
+  unlocked; `staleCertGen` is sampled before it and RE-VALIDATED after it, under
+  `staleCertMu` held across the certificate inspection and the clear. A delivery
+  whose generation has been superseded abandons without warning and without
+  clearing — it must not settle a newer rename's debt with older evidence, and
+  must not emit a diagnosis naming a host name that a recorded rename has
+  already replaced (round 5 checked only on the clear side, after the warning
+  was already out). The re-validation tests `staleCertPending` as well as the
+  generation (#6827 round 7): two deliveries for ONE rename — the boot delivery
+  racing the rename's own attempt, say — sample the same generation, so a
+  generation-only re-check lets the second one duplicate the line the first has
+  already emitted. Nothing is lost by either arm: the newer rename's own
+  `applyHostname` runs its own delivery. The race is reachable
+  because the boot delivery runs on the `Run` goroutine outside `applySem` while
+  cluster comms — started right after the mutating startup phases, before
+  `startHTTPServer` — can drive a peer `SyncApply` into `applyHostname`. Pinned
+  by `TestDebtClearIsGenerationSafe_6827`: one subtest supplies the competing
+  rename itself, one drives it through the production note path (so the
+  `staleCertGen++` is bound, not just the comparison), one is the negative
+  control where an unraced delivery MUST settle, one overlaps two
+  same-generation deliveries so the second must stay silent, and one pins the
+  unreadable-kernel-name guard that would otherwise discharge the debt with no
+  identity behind it.
 
 #### Effective-listener snapshot for `show system services` (#6385/#6401)
 
@@ -474,10 +679,10 @@ data-race failure modes:
 
 The lifecycle is now **epoch-guarded** by `clusterCommsMu` + a `clusterCommsGen`
 generation counter (all comms-epoch fields — `sessionSync`,
-`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel` — are read/written only under
-that lock; every reader goes through `getSessionSync()` /
-`snapshotFabricRefreshChans()` / `getClusterCommsCtx()`, capturing the pointer
-once):
+`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel`, `activeClusterTransport` —
+are read/written only under that lock; every reader goes through
+`getSessionSync()` / `snapshotFabricRefreshChans()` / `getClusterCommsCtx()` /
+`activeTransport()`, capturing the value once):
 
 - `beginClusterCommsEpoch` bumps the generation and installs the fresh
   sub-context; `startClusterComms` hands the post-bump generation to the
@@ -497,9 +702,26 @@ once):
   sync. The join runs outside the lock (the constructor's publish path also
   takes it), so there is no deadlock.
 
+- `activeClusterTransport` joined the epoch in **#6290** and publishes the same
+  way, via `setActiveTransportIfCurrent(gen, key)`. It had been written by
+  `startClusterComms` holding neither `clusterCommsMu` nor `applySem`, and read
+  by `applyTailReconciles` step 20 under `applySem` — and a semaphore only
+  excludes participants that take it. The issue judged that benign because the
+  boot `startClusterComms` precedes the gRPC/HTTP servers, but those are not the
+  only appliers: the boot `applyConfig` starts the DHCP clients
+  (`reconcileDHCPClients`) with `onDHCPAddressChange` already wired, and that
+  callback re-enters `applyConfig` — hence step 20 — on a goroutine created
+  BEFORE the write. Goroutine creation therefore orders them the wrong way and
+  supplies no happens-before, so a lease landing in that window was a real data
+  race, the mirror of #5113 on `mgmtVRFInterfaces`. Step 20 now takes ONE
+  `activeTransport()` snapshot for both its comparison and its eight log
+  fields.
+
 `make test-failover` is the required smoke for this path. The guard is covered
 by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
-`-race` concurrency).
+`-race` concurrency) and, for the transport key, by
+`cluster_transport_race_6290_test.go` (production writer vs production reader
+under `-race`, plus a deterministic stale-epoch drop).
 
 ### Per-RG Router-Advertisement reconcile (#5861)
 
@@ -709,8 +931,8 @@ never lock an operator out of a remote box it manages.
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), the boot-time
   `applyConfig`, and the #2079 NAT pool-alarm monitor start (#2114: the
-  monitor samples `d.dp`, which is still nil-able on a bootstrap-exit arm
-  failure, so it must not run during the bootstrap window). Managers are
+  monitor samples the dataplane cell, which a bootstrap-exit arm failure
+  clears, so it must not run during the bootstrap window). Managers are
   still constructed (so the exit reconcile wires every subsystem). A plain
   first `commit` is REFUSED — the operator must `commit confirmed`. Exit is
   one-way, on the first non-empty config apply (confirmed commit OR cluster
@@ -729,10 +951,13 @@ never lock an operator out of a remote box it manages.
   always-down / address-stripped, even on an empty/absent/rolled-back config.
   An explicit non-fxp0 leaf narrows fxp0 off the auto-protection.
 - **First-commit rollback** (`enterBootstrapMode`): a timed-out first
-  `commit confirmed` stops+discards the NAT pool-alarm monitor (#2114 — so
-  no sampler survives to race a later re-arm's `d.dp = nil` write; the
-  monitor is rebuilt fresh on a corrected re-arm because it is not
-  restartable after `Stop`), removes the takeover `.network` files (keeping
+  `commit confirmed` stops+discards the NAT pool-alarm monitor (#2114 — the
+  reason is NOT a data race: `dpCell` is an `atomic.Pointer`, so a
+  concurrent load against a later re-arm's clear is well-defined. The
+  reason is that a surviving sampler would keep issuing control-socket
+  calls into a backend the rollback has just torn down. The monitor is
+  rebuilt fresh on a corrected re-arm because it is not restartable after
+  `Stop`), removes the takeover `.network` files (keeping
   the lifeline + `.link` files), clears the FRR managed section, and
   detaches the dataplane — instead of applying an empty config — and the
   store persists the never-committed marker so a restart re-enters
@@ -1086,7 +1311,7 @@ never lock an operator out of a remote box it manages.
   `xfrmManager.Apply` returns-error / tolerates-already-exists half).
   **Ordinary dataplane-apply fail-closed (#5679, mirroring the above):** the
   main config-apply's full dataplane push (`applyDataplaneAndHACore` →
-  `d.dp.ApplyConfig`) split its error into two classes but ACTED on only one.
+  the runtime dataplane's `ApplyConfig`) split its error into two classes but ACTED on only one.
   A required-protocol-gate error (`compileErrorMustAbortApply`) DISARMS the
   dataplane and returns early (terminal `err`, commit fails, peer sync skipped).
   But an ORDINARY (non-abort) apply failure — a control-socket / helper hiccup

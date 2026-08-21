@@ -67,7 +67,7 @@ func (m *Manager) retryDeferredWorkerArmLocked() error {
 
 	publishSnap := next
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
-	if err := m.ensureRequiredSnapshotProtocolLocked(publishSnap.Config); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(&publishSnap); err != nil {
 		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 			return errors.Join(err, disarmErr)
 		}

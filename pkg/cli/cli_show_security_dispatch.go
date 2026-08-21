@@ -42,7 +42,7 @@ func (c *CLI) policySchedulerActiveState() (state map[string]bool, ok bool) {
 	if c == nil || c.dp == nil {
 		return nil, false
 	}
-	p, isProvider := c.dp.(policySchedulerStateProvider)
+	p, isProvider := c.dpProbe().(policySchedulerStateProvider)
 	if !isProvider {
 		return nil, false
 	}

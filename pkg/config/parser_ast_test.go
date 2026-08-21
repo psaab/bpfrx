@@ -2299,7 +2299,11 @@ func TestInterfacePointToPointAndMTU(t *testing.T) {
 }
 
 func TestInterfaceDescriptionSetSyntax(t *testing.T) {
-	cmds := []string{"set interfaces ge-0/0/0 description \"Uplink to core\"", "set interfaces ge-0/0/0 gigether-options redundant-parent reth0", "set interfaces gr-0/0/0 unit 0 point-to-point", "set interfaces gr-0/0/0 unit 0 description \"Tunnel unit\"", "set interfaces gr-0/0/0 unit 0 family inet mtu 1420", "set interfaces gr-0/0/0 unit 0 family inet address 10.0.0.1/30"}
+	// #6722: `redundant-parent` must name a configured interface
+	// (validateRethMemberStrict), so the reth this port belongs to is declared
+	// here. The subject under test is unchanged — description parsing beside a
+	// gigether-options stanza.
+	cmds := []string{"set interfaces ge-0/0/0 description \"Uplink to core\"", "set interfaces ge-0/0/0 gigether-options redundant-parent reth0", "set interfaces reth0 redundant-ether-options redundancy-group 1", "set interfaces gr-0/0/0 unit 0 point-to-point", "set interfaces gr-0/0/0 unit 0 description \"Tunnel unit\"", "set interfaces gr-0/0/0 unit 0 family inet mtu 1420", "set interfaces gr-0/0/0 unit 0 family inet address 10.0.0.1/30"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -5241,7 +5245,28 @@ func TestHostInboundRouterDiscovery(t *testing.T) {
 }
 
 func TestNat66SourceRules(t *testing.T) {
-	input := `security {
+	// The two zone members must be DEFINED under `interfaces`: since #6525 the
+	// compact-leaf `interfaces trust0;` spelling actually compiles into zone
+	// membership, so the strict zone-interface-defined gate now sees these
+	// members (before the fix they were silently dropped and the gate passed
+	// vacuously over an empty set).
+	input := `interfaces {
+    trust0 {
+        unit 0 {
+            family inet6 {
+                address 2001:db8::1/64;
+            }
+        }
+    }
+    untrust0 {
+        unit 0 {
+            family inet6 {
+                address 2001:db8:1::1/64;
+            }
+        }
+    }
+}
+security {
     nat {
         source {
             rule-set internal-to-internet {

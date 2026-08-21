@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -63,11 +64,33 @@ func (a forwardingStatusServerUserspaceDataPlane) Status() (dpuserspace.ProcessS
 }
 
 func (s *Server) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
-	if s == nil || s.dp == nil {
+	if s == nil {
+		return nil
+	}
+	// #2114/#6743 r2-B7: the publication check must ask the CELL, not the
+	// field. `s.dp == nil` is permanently false under the daemon's live
+	// indirection, so a daemon whose startup arm failed and cleared the
+	// cell fell PAST this guard and returned the non-userspace `base`
+	// wrapper. fwdstatus.Build then took its BPF-map arm, where
+	// GetMapStats() returns nil and the max-occupancy loop over an empty
+	// slice leaves maxPct at 0 — and sets BufferKnown=true. The render is
+	// "Buffer utilization   0 percent" where the nil-dp control correctly
+	// says "unknown (see #878)".
+	//
+	// This is worse than the sibling r6-F3 renders: a misleading string is
+	// read by a human, but BufferKnown=true tells every downstream consumer
+	// the zero is TRUSTWORTHY. Returning nil here restores
+	// BufferKnown=false, not merely the string.
+	//
+	// ONE resolution feeds both decisions, as in showBuffers (r7): a
+	// setDataplane(nil) landing between a publication check and a separate
+	// dpProbe() re-creates the confusion the check exists to prevent.
+	backend := dataplane.Unwrap(s.dp)
+	if backend == nil {
 		return nil
 	}
 	base := forwardingStatusServerDataPlane{server: s}
-	if _, ok := s.dp.(userspaceStatusProvider); ok {
+	if _, ok := backend.(userspaceStatusProvider); ok {
 		return forwardingStatusServerUserspaceDataPlane{forwardingStatusServerDataPlane: base}
 	}
 	return base

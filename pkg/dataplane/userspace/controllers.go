@@ -27,16 +27,35 @@ func (c userspaceLinkController) RecordDeferredWorkerArmDebt() {
 	}
 }
 
-func (c userspaceLinkController) PrepareLinkCycle() {
+func (c userspaceLinkController) PrepareLinkCycle() error {
 	if c.manager != nil {
-		c.manager.PrepareLinkCycle()
+		return c.manager.PrepareLinkCycle()
+	}
+	return nil
+}
+
+func (c userspaceLinkController) NotifyLinkCycle() error {
+	if c.manager != nil {
+		return c.manager.NotifyLinkCycle()
+	}
+	// No manager wired: no workers were joined, so there is nothing to rebind
+	// and nothing to report. Mirrors PrepareLinkCycle's nil-manager reading.
+	return nil
+}
+
+func (c userspaceLinkController) RenewLinkCycle() {
+	if c.manager != nil {
+		c.manager.RenewLinkCycle()
 	}
 }
 
-func (c userspaceLinkController) NotifyLinkCycle() {
+// AbandonLinkCycle drops a lease the departing apply still holds (#6871 round
+// 8). No manager wired: no lease was ever taken, so nothing was held.
+func (c userspaceLinkController) AbandonLinkCycle() bool {
 	if c.manager != nil {
-		c.manager.NotifyLinkCycle()
+		return c.manager.AbandonLinkCycle()
 	}
+	return false
 }
 
 type userspaceHAOps interface {

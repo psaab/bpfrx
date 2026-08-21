@@ -224,6 +224,39 @@ parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
 
+**A stanza's members can live on the STANZA's own Keys, not only in its
+children (#6525).** The dual-shape rule above has a third shape that is easy
+to miss because `set` cannot produce it: the hierarchical COMPACT LEAF.
+`security zones security-zone <z> interfaces ge-0/0/1.0;` lowers to
+`Node{Keys:["interfaces","ge-0/0/1.0"]}` with **nil Children**, so a compiler
+arm written as `for _, x := range prop.Children` runs ZERO times and the
+stanza compiles to nothing — silently. For zone membership that meant a zone
+with no interfaces at all: the interface was never AF_XDP-bound (it kept
+`Zone == ""`), every policy naming the zone applied to nothing, and both
+strict zone gates passed VACUOUSLY because they iterate the empty
+`zone.Interfaces`. When you add a compiler arm for a container stanza, read
+`prop.Keys[1:]` as well as `prop.Children` — and when the member can carry a
+BODY (here `host-inbound-traffic`), exclude the body from the member names in
+BOTH positions, or the fix trades a silent drop for a silent invention.
+`compileZones` normalizes the compact shape onto the block shape
+(`zoneInterfaceMemberNodes`, `compiler_security_zones.go`) so there is one
+read path, and `validateZoneInterfacesNonEmptyStrict`
+(`compiler_validate_strict_zones.go`) rejects a content-bearing stanza that
+still compiles to zero members. See `docs/config-schema.md` "The COMPACT-LEAF
+spelling…".
+
+**A bracket tail does not always collapse onto one Keys slice — a schema-named
+keyword makes `SetPath` DESCEND instead (#6735).** `set ... interfaces [ a b c ]`
+collapses `b c` onto one leaf under `a` only because none of them names a child
+the schema declares at that position. Put a declared keyword in the list and
+`SetPath` descends it, parking everything after it a level DEEPER:
+`[ a host-inbound-traffic b ]` becomes the chain `interfaces -> a ->
+host-inbound-traffic -> b`. A reader that skips body keywords by NAME then skips
+`b` with them. So when a stanza's grammar has both a member slot and named body
+keywords, a validator over that stanza has to inspect the keyword node's SUBTREE,
+not only the Keys around it. See `docs/config-schema.md` "A body keyword with
+dropped tokens after it is REJECTED".
+
 **Interface-name canonicalization is not injective (#5832).**
 `LinuxIfName` only replaces `/` with `-`, so the DISTINCT authored names
 `ge-0/0/0` and `ge-0-0-0` collapse to the SAME Linux device / ifindex.
@@ -993,6 +1026,37 @@ schema layer — the `bind-interface` leaf is `ValueSecureTunnelIf` with the
 group-expanded / packed forms the schema layer can miss (#1960 layered defense).
 The pkg/routing "invalid bind-interface name" log is the runtime backstop for a
 tolerated invalid config.
+
+**The decrypted plaintext is NOT zone-adjudicated, and the operator is told so
+at commit (#5619):** a route-based VPN's `bind-interface st<N>[.unit]` is
+deliberately excluded from the ingress-adjudication set, the AF_XDP binding plan
+and the RSS allowlist — and `syncInterfaceAttachments`
+(`pkg/dataplane/userspace/manager_compile.go`) then calls `DetachXDP` on every
+ifindex outside the allowed set, so the shim is detached from the xfrmi rather
+than attached to it. There is no kernel substitute: no `hook forward` rule
+covers it and `ip_forward` is 1.
+
+The problem this advisory solves is not the gap itself but the FALSE
+affirmation around it. `set security zones security-zone vpn interfaces st0.0`
+commits cleanly (#4515 accepts a zone naming a bind-interface with no explicit
+`set interfaces st0 unit 0`), and nothing in the CLI or the commit output
+distinguishes that zone from one that is enforced. An operator who zones a VPN
+interface and sees it accepted has been told something specific and untrue about
+their security posture, which is worse than an unimplemented feature.
+
+Two wordings, on purpose: a ZONED tunnel reads as an escalation, because a
+specific untrue thing was asserted; an unzoned tunnel gets a plain statement of
+the gap. The advisory keys off the SAME predicate as the dataplane exclusion
+(`IsSecureTunnelIfName`), so the two cannot drift into a state where the
+dataplane adjudicates the tunnel while the warning still says it does not. It
+fires on all four compile entry points — strict, lenient, and both node-aware
+variants — because the operator who most needs it is the one whose config
+arrives by restart or peer-sync and who never re-commits.
+
+Like the #2933 and #5297 arms above it, this NEVER rejects: a bind-interface
+resolving to if_id 0 is skipped here, since it is already reported by the #5297
+arm as a silent tunnel-down and a second complaint about a plaintext path that
+does not exist would just be noise.
 
 **Undefined policy community references are rejected at commit (#2881):** a
 policy-statement term's `from community <name>` (rendered FRR `match community

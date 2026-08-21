@@ -119,6 +119,16 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			ruleCounterID := natCounterID(natCounterIDs, dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 			var pool *config.NATPool
 			var poolAddr string
+			// #6820: this skip CANONICALIZES an exemption entry to an empty pool;
+			// it does NOT decide off-over-pool precedence, and gate comments that
+			// said it did have been corrected. `DnatEntry::to_outcome`
+			// (userspace-dp/src/nat/destination.rs) branches on `off` alone and
+			// never reads the pool, and `DnatTable::from_snapshots` independently
+			// refuses to parse an off entry's pool address. A snapshot carrying
+			// both Off=true and a usable pool — which this builder never emits,
+			// but a mixed-version xpfd/helper pair can, since the snapshot IS the
+			// xpfd->helper wire form — still resolves to the exemption; see
+			// dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820.
 			if !isOff {
 				var ok bool
 				pool, ok = cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]

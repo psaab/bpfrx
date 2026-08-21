@@ -5,6 +5,29 @@
 
 use super::*;
 
+/// #5798: a fixed ingress authority for fragment-key tests that are not ABOUT
+/// the authority. `frag_other_authority` mints a DIFFERENT domain so a test can
+/// assert the cross-domain miss.
+fn frag_test_authority() -> FragAuthority {
+    FragAuthority {
+        ingress_ifindex: 11,
+        ingress_vlan_id: 0,
+        ingress_zone: 3,
+        routing_table: 0,
+    }
+}
+
+/// #5798: an authority for a DIFFERENT ingress domain (a second logical
+/// interface in a second zone) — the neighbouring domain's view.
+fn frag_other_authority() -> FragAuthority {
+    FragAuthority {
+        ingress_ifindex: 22,
+        ingress_vlan_id: 0,
+        ingress_zone: 9,
+        routing_table: 0,
+    }
+}
+
 fn well_known_prefix() -> NAT64RuleSnapshot {
     NAT64RuleSnapshot {
         name: "nat64-wkp".to_string(),
@@ -4668,19 +4691,19 @@ fn nat64_frag_assoc_v6_to_v4_nonfirst_inherits_and_translates() {
 
     // Port-free key co-location: first and non-first share ONE key so the
     // non-first fragment finds the first fragment's association.
-    let kf = nat64_first_fragment_key(&first, libc::AF_INET6).expect("first-fragment key");
+    let kf = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority()).expect("first-fragment key");
     let kn =
-        nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6).expect("non-first-fragment key");
+        nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("non-first-fragment key");
     assert_eq!(
         kf, kn,
         "first and non-first fragments must share the port-free key"
     );
     // DoS property: a non-first fragment can NEVER produce a first-fragment key
     // (so it can never INSTALL into the cache).
-    assert!(nat64_first_fragment_key(&nonfirst, libc::AF_INET6).is_none());
+    assert!(nat64_first_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).is_none());
     // An atomic fragment (MF=0, offset 0) is not a first fragment either.
     let atomic = make_ipv6_frag_udp(src_v6, dst_v6, 1, 2, &[0u8; 8], 0, false, ident);
-    assert!(nat64_first_fragment_key(&atomic, libc::AF_INET6).is_none());
+    assert!(nat64_first_fragment_key(&atomic, libc::AF_INET6, frag_test_authority()).is_none());
 
     // Install the first fragment's decision; the non-first fragment inherits it.
     let cache = Nat64FragAssoc::new();
@@ -4747,8 +4770,8 @@ fn nat64_frag_assoc_v4_to_v6_nonfirst_inherits_and_translates() {
     let first = make_ipv4_frag_udp(server_v4, snat_v4, 53, 1000, &[0xCCu8; 16], 0, true, ident);
     let nonfirst = make_ipv4_frag_udp(server_v4, snat_v4, 0, 0, &[0xDDu8; 24], 120, false, ident);
 
-    let kf = nat64_first_fragment_key(&first, libc::AF_INET).expect("first key");
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET).expect("non-first key");
+    let kf = nat64_first_fragment_key(&first, libc::AF_INET, frag_test_authority()).expect("first key");
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_test_authority()).expect("non-first key");
     assert_eq!(kf, kn, "reverse fragments share the port-free key");
     assert_eq!(
         kf.ident,
@@ -4817,7 +4840,7 @@ fn nat64_frag_assoc_nonfirst_without_first_misses_and_drops() {
     let src_v6: Ipv6Addr = "2001:db8::5".parse().unwrap();
     let dst_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
     let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0u8; 16], 100, false, 0x9999);
-    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6).expect("key");
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("key");
     assert!(
         cache.lookup(&kn, 10, 1).is_none(),
         "orphan non-first fragment misses"
@@ -4851,6 +4874,8 @@ fn nat64_frag_assoc_cache_is_bounded() {
             src: IpAddr::V6(src_v6),
             dst: IpAddr::V6(dst_v6),
             ident: i,
+            protocol: PROTO_UDP,
+            authority: frag_test_authority(),
         };
         cache.install(key, decision, None, 1_000, 1);
     }
@@ -4873,6 +4898,8 @@ fn nat64_frag_assoc_ttl_evicts() {
         src: IpAddr::V6("2001:db8::1".parse().unwrap()),
         dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
         ident: 7,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
     };
     let decision = frag_test_decision(Nat64State::forward_decision(
         Ipv4Addr::new(198, 51, 100, 1),
@@ -4911,6 +4938,8 @@ fn frag_idents_in_one_shard(
         src,
         dst,
         ident: 0,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
     });
     let mut ident: u32 = 0;
     while out.len() < count && ident < 1_000_000 {
@@ -4919,6 +4948,8 @@ fn frag_idents_in_one_shard(
             src,
             dst,
             ident,
+            protocol: PROTO_UDP,
+            authority: frag_test_authority(),
         };
         if nat64_frag_shard_index(&key) == target {
             out.push(ident);
@@ -4960,6 +4991,8 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
         src,
         dst,
         ident,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
     };
 
     let cache = Nat64FragAssoc::new();
@@ -5020,6 +5053,8 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
         src,
         dst,
         ident,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
     };
 
     let cache = Nat64FragAssoc::new();
@@ -5069,6 +5104,8 @@ fn nat64_frag_assoc_generation_change_invalidates_stale_association() {
         src: IpAddr::V6("2001:db8::1".parse().unwrap()),
         dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
         ident: 0x5624,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
     };
     let decision = frag_test_decision(Nat64State::forward_decision(
         Ipv4Addr::new(198, 51, 100, 1),
@@ -5580,5 +5617,263 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
          permanently — nothing else removes a live_by_flow entry. This is the \
          exact first-hit break this PR removed from the source-NAT release \
          (#6876)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #5798: ingress-authority + protocol scoping of the shared fragment cache.
+//
+// A fragment-association HIT short-circuits the flowless enforcement arm and
+// returns the FIRST fragment's whole SessionDecision (permit + egress + NAT).
+// Before #5798 the key was only (family, src, dst, ident), so a non-first
+// fragment from ANY security domain that reproduced that tuple inherited the
+// first domain's authority — bypassing its own input filter, PBR, zone
+// derivation and zone security policy. These are FAIL-ON-REVERT guards: drop a
+// field from Nat64FragKey (or stop threading it through nat64_fragment_fields)
+// and the corresponding "must NOT inherit" assertion fires.
+// ---------------------------------------------------------------------------
+
+/// Build the (first, non-first) IPv6 UDP fragment pair every #5798 case uses.
+fn frag_pair_v6() -> (Vec<u8>, Vec<u8>) {
+    let src_v6: Ipv6Addr = "2001:db8::7".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let ident: u32 = 0x5798_0001;
+    let first = make_ipv6_frag_udp(src_v6, dst_v6, 1000, 53, &[0xAAu8; 16], 0, true, ident);
+    let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0xBBu8; 24], 185, false, ident);
+    (first, nonfirst)
+}
+
+fn frag_v6_decision() -> SessionDecision {
+    frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ))
+}
+
+/// A permitted first fragment from domain A must NOT authorize a non-first
+/// fragment arriving from domain B. This is the #5798 root: the cross-domain
+/// permit-inheritance bypass.
+///
+/// RED on revert: remove `authority` from `Nat64FragKey` (or stop stamping it in
+/// `nat64_fragment_fields`) and the domain-B lookup HITS — the cross-domain
+/// assertion below fails.
+#[test]
+fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
+    let (first, nonfirst) = frag_pair_v6();
+    let cache = Nat64FragAssoc::new();
+    let decision = frag_v6_decision();
+
+    // Domain A: the permitted first fragment installs its decision.
+    let ka = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
+        .expect("domain-A first-fragment key");
+    cache.install(ka, decision, None, 1_000, 1);
+
+    // Domain B: a non-first fragment with the SAME (family, src, dst, ident) —
+    // an attacker only has to reproduce a 32-bit fragment ID, which is not an
+    // authorization mechanism.
+    let kb = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_other_authority())
+        .expect("domain-B non-first-fragment key");
+    assert_ne!(
+        ka, kb,
+        "a different ingress domain must build a DIFFERENT key (fail-closed by construction)"
+    );
+    assert!(
+        cache.lookup(&kb, 1_100, 1).is_none(),
+        "a non-first fragment from another security domain must NOT inherit domain A's permit"
+    );
+
+    // Control: the SAME domain still inherits — the fix must not blackhole
+    // legitimate fragmented traffic. The cache is Arc-shared across workers, so
+    // this also covers "same domain, different worker".
+    let ka_nonfirst = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
+        .expect("domain-A non-first-fragment key");
+    assert_eq!(ka, ka_nonfirst, "same-domain first/non-first share one key");
+    assert!(
+        cache.lookup(&ka_nonfirst, 1_100, 1).is_some(),
+        "a same-domain non-first fragment must still inherit (no over-blocking)"
+    );
+}
+
+/// Each authority DIMENSION must bind on its own. A test that only varied the
+/// whole struct could pass while three of the four fields were ignored, so this
+/// perturbs one field at a time against a fixed baseline.
+///
+/// Every iteration carries a POSITIVE CONTROL: the same-authority non-first
+/// fragment must HIT the very entry the perturbed one missed. Without it the
+/// whole test is satisfied by a cache that never returns a hit — "no
+/// association" is the correct answer here often enough that a totally broken
+/// lookup would look identical to a correctly discriminating one.
+///
+/// RED on revert: delete any single field from `FragAuthority` (or from the
+/// key's `PartialEq`) and that field's iteration hits.
+#[test]
+fn frag_assoc_every_authority_dimension_is_load_bearing() {
+    let (first, nonfirst) = frag_pair_v6();
+    let base = frag_test_authority();
+    let decision = frag_v6_decision();
+
+    let perturbations: [(&str, FragAuthority); 4] = [
+        (
+            "logical ingress interface",
+            FragAuthority { ingress_ifindex: base.ingress_ifindex + 1, ..base },
+        ),
+        (
+            "ingress VLAN (two VLAN siblings on one physical port)",
+            FragAuthority { ingress_vlan_id: base.ingress_vlan_id + 100, ..base },
+        ),
+        (
+            "ingress security zone",
+            FragAuthority { ingress_zone: base.ingress_zone + 1, ..base },
+        ),
+        (
+            "routing instance / VRF (duplicate address space across VRFs)",
+            FragAuthority { routing_table: base.routing_table + 1, ..base },
+        ),
+    ];
+
+    for (dimension, other) in perturbations {
+        // Exactly ONE field differs from the baseline — assert that here rather
+        // than trusting the struct-update literals above, so a future edit that
+        // accidentally perturbs two fields cannot make a weaker test look like
+        // this one.
+        let differing = [
+            other.ingress_ifindex != base.ingress_ifindex,
+            other.ingress_vlan_id != base.ingress_vlan_id,
+            other.ingress_zone != base.ingress_zone,
+            other.routing_table != base.routing_table,
+        ]
+        .into_iter()
+        .filter(|d| *d)
+        .count();
+        assert_eq!(
+            differing, 1,
+            "{dimension}: the perturbation must vary exactly one dimension"
+        );
+
+        let cache = Nat64FragAssoc::new();
+        let kf = nat64_first_fragment_key(&first, libc::AF_INET6, base).expect("first key");
+        cache.install(kf, decision, None, 1_000, 1);
+
+        // POSITIVE CONTROL FIRST: the baseline non-first fragment HITS. Ordered
+        // before the negative assertion so a lookup that never returns anything
+        // fails here rather than passing the "must not inherit" check for free.
+        let kn_base =
+            nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, base).expect("baseline key");
+        assert!(
+            cache.lookup(&kn_base, 1_100, 1).is_some(),
+            "{dimension} control: the SAME-authority non-first fragment must inherit — without \
+             this the negative assertion below is also satisfied by a cache that never hits"
+        );
+
+        let kn =
+            nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, other).expect("non-first key");
+        assert!(
+            cache.lookup(&kn, 1_100, 1).is_none(),
+            "{dimension} must be part of the association authority; a fragment differing only \
+             in it inherited the permit"
+        );
+        // And the entry the perturbed fragment failed to match is still LIVE —
+        // it MISSED, rather than the lookup above having consumed or expired it.
+        assert!(
+            cache.lookup(&kn_base, 1_200, 1).is_some(),
+            "{dimension}: the baseline association must survive the cross-authority miss"
+        );
+    }
+}
+
+/// Two datagrams that collide on (src, dst, ident) but carry DIFFERENT
+/// upper-layer protocols must not alias — required-fix #2's protocol-in-key.
+/// The protocol is read from L3 only (the IPv6 Fragment Header's Next Header /
+/// the IPv4 Protocol byte), both of which every fragment carries, so a non-first
+/// fragment never has to have its payload interpreted as L4.
+///
+/// RED on revert: drop `protocol` from `Nat64FragKey` and the TCP-labelled
+/// non-first fragment inherits the UDP datagram's decision.
+#[test]
+fn frag_assoc_protocol_collision_does_not_alias() {
+    let (first, nonfirst) = frag_pair_v6();
+    let cache = Nat64FragAssoc::new();
+    let decision = frag_v6_decision();
+
+    let kf =
+        nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority()).expect("first key");
+    // The builder emits UDP, so the key's protocol must come from the packet —
+    // not be defaulted or zeroed.
+    assert_eq!(
+        kf.protocol, PROTO_UDP,
+        "the key's protocol must be parsed from the IPv6 Fragment Header's Next Header"
+    );
+    cache.install(kf, decision, None, 1_000, 1);
+
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
+        .expect("non-first key");
+    let collided = Nat64FragKey { protocol: PROTO_TCP, ..kn };
+    assert!(
+        cache.lookup(&collided, 1_100, 1).is_none(),
+        "a TCP fragment must not inherit a UDP datagram's decision on an ident collision"
+    );
+    assert!(
+        cache.lookup(&kn, 1_100, 1).is_some(),
+        "the matching-protocol fragment must still inherit"
+    );
+}
+
+/// The IPv4 side reads its protocol from the header's Protocol byte, which is
+/// present in EVERY fragment (unlike the L4 header, which only the first
+/// carries). Guards the v4 arm of the same SSOT builder.
+///
+/// The key comparisons alone would all hold against a cache that never serves a
+/// hit, so the second half drives the SAME keys through a real `Nat64FragAssoc`
+/// — same-domain HIT (the positive control) then cross-domain MISS.
+#[test]
+fn frag_assoc_v4_key_carries_protocol_and_authority() {
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 9);
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 9);
+    let ident: u16 = 0x5798;
+    let first = make_ipv4_frag_udp(server_v4, snat_v4, 53, 1000, &[0xCCu8; 16], 0, true, ident);
+    let nonfirst = make_ipv4_frag_udp(server_v4, snat_v4, 0, 0, &[0xDDu8; 24], 120, false, ident);
+
+    let kf =
+        nat64_first_fragment_key(&first, libc::AF_INET, frag_test_authority()).expect("v4 first key");
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_test_authority())
+        .expect("v4 non-first key");
+    assert_eq!(
+        kf.protocol, PROTO_UDP,
+        "the v4 key's protocol must come from IPv4 header byte 9"
+    );
+    assert_eq!(
+        kn.protocol, PROTO_UDP,
+        "a v4 NON-first fragment carries the same Protocol byte"
+    );
+    assert_eq!(kf.authority, frag_test_authority(), "authority is stamped");
+    assert_eq!(kf, kn, "same domain + protocol still co-locates the datagram");
+
+    // Cross-domain on the v4 arm too.
+    let kn_other = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET, frag_other_authority())
+        .expect("v4 non-first key, other domain");
+    assert_ne!(
+        kf, kn_other,
+        "a v4 fragment from another domain must build a different key"
+    );
+
+    // Drive the same keys through a real cache. Everything above compares keys
+    // and would hold verbatim against a `Nat64FragAssoc` that never returns a
+    // hit, so the discrimination below needs a positive control to mean
+    // anything: same-domain HITS, other-domain MISSES, and the entry the
+    // other-domain fragment failed to match is still live afterwards.
+    let cache = Nat64FragAssoc::new();
+    cache.install(kf, frag_v6_decision(), None, 1_000, 1);
+    assert!(
+        cache.lookup(&kn, 1_100, 1).is_some(),
+        "control: the same-domain v4 non-first fragment must inherit"
+    );
+    assert!(
+        cache.lookup(&kn_other, 1_100, 1).is_none(),
+        "a v4 non-first fragment from another domain must NOT inherit"
+    );
+    assert!(
+        cache.lookup(&kn, 1_200, 1).is_some(),
+        "the v4 association must survive the cross-domain miss (it missed, it did not vanish)"
     );
 }

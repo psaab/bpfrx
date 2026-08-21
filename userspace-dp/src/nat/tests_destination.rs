@@ -2072,3 +2072,96 @@ fn dnat_all_valid_reports_no_parse_errors() {
 
 // --- Pool-mode SNAT tests ---
 
+
+/// #6820: the DNAT `off` exemption is decided by `off` ALONE in Rust — the
+/// pool plays no part. The Go builder's `if !isOff` short-circuit
+/// (`pkg/dataplane/userspace/nat_destination.go`) CANONICALIZES an exemption
+/// entry to an empty pool; it does not decide the precedence, and an earlier
+/// revision of the #5628/#5717 gate comments said it did.
+///
+/// Every other `off: true` fixture in this file also leaves `pool_address`
+/// empty — exactly the shape Go emits — so the suite could not tell "Rust
+/// ignores the pool" from "Go removed the pool". This one carries BOTH `off`
+/// and a usable pool, i.e. the snapshot Go never produces — a hand-built one, or
+/// a mixed-version xpfd/helper pair, since `DestinationNATRuleSnapshot` is the
+/// xpfd->helper wire form. NOT a "mixed-version peer" (#6820 round 3): HA config
+/// sync ships configuration TEXT and the receiver recompiles locally, so a peer
+/// never transports a snapshot at all.
+///
+/// Two arms, because a bare `None` is also what a DROPPED entry returns:
+///   - control: the SAME rule with `off: false` must TRANSLATE, proving the
+///     match criteria and pool are live;
+///   - measurement: with `off: true` and a later broader translate rule
+///     present, the lookup must still be `None` — an entry that was dropped
+///     rather than installed would let the later rule translate.
+///
+/// Measured under the killing edit `to_outcome`'s `if self.off` -> `if false`:
+/// the measurement arm goes RED with
+/// `Some(rewrite_dst: 0.0.0.0, rewrite_dst_port: 8080)`. The `0.0.0.0` is the
+/// second half of the answer — `from_snapshots` also refuses to parse an `off`
+/// entry's pool ADDRESS, substituting the placeholder. So Rust drops the pool
+/// at two independent points, both keyed on `off` and neither on anything Go
+/// did; the pool PORT survives into the entry and is simply never read. Note
+/// this is why the narrower edit "exempt only when the pool is also empty"
+/// would NOT discriminate: the address is already the placeholder by then.
+#[test]
+fn dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820() {
+    let exempt_rule_with_pool = |off: bool| DestinationNATRuleSnapshot {
+        name: "exempt-with-pool".to_string(),
+        destination_address: "203.0.113.10".to_string(),
+        destination_port: 80,
+        protocol: "tcp".to_string(),
+        off,
+        // The Go canonicalization is bypassed by construction: an `off` rule
+        // that nevertheless carries a fully usable pool.
+        pool_address: "192.168.1.10".to_string(),
+        pool_port: 8080,
+        ..DestinationNATRuleSnapshot::default()
+    };
+    // A later, broader rule that WOULD translate this flow to a DIFFERENT pool
+    // if the exemption entry were dropped instead of installed.
+    let later_broader = DestinationNATRuleSnapshot {
+        name: "catch-all".to_string(),
+        destination_address: "203.0.113.10".to_string(),
+        destination_port: 80,
+        protocol: "tcp".to_string(),
+        pool_address: "192.168.99.99".to_string(),
+        pool_port: 9999,
+        ..DestinationNATRuleSnapshot::default()
+    };
+    let lookup = |rules: &[DestinationNATRuleSnapshot]| {
+        DnatTable::from_snapshots(rules, &crate::nat::NatCounterStore::default()).lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        )
+    };
+
+    // CONTROL: same rule, `off` cleared. The pool must be honoured — this is
+    // what proves the fixture's match criteria are live and its pool usable,
+    // so the measurement arm's `None` cannot be a silently dropped entry.
+    assert_eq!(
+        lookup(&[exempt_rule_with_pool(false)]),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "control: with `off` cleared the SAME rule must translate to its pool — \
+         if it does not, the measurement arm below proves nothing"
+    );
+
+    // MEASUREMENT: `off` set, pool still populated, later broader rule present.
+    // Exemption, and NOT the later rule's 192.168.99.99 — so the entry was
+    // installed, matched, and short-circuited while ignoring its own pool.
+    assert_eq!(
+        lookup(&[exempt_rule_with_pool(true), later_broader]),
+        None,
+        "a DNAT `off` rule carrying a pool must still EXEMPT: Rust keys the \
+         exemption on `off` alone. ANY rewrite here means it no longer does — \
+         192.168.99.99 specifically would mean the off entry was dropped \
+         rather than installed and the later broader rule won"
+    );
+}

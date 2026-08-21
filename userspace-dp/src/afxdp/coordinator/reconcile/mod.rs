@@ -400,6 +400,22 @@ impl Coordinator {
         // (some workers up, then a spawn aborted the rest) still needs the
         // refresh so status shows which slots came up and which did not.
         self.refresh_bindings(bindings);
+        // #6832 fold r5: THIS is the reconcile's commit point for the #3651
+        // per-zone counters, and it is deliberately AFTER `bring_up_workers`
+        // rather than inside the build. The destructive prune drops the blocks
+        // for zones this snapshot no longer configures, and those blocks hold
+        // cumulative totals in a store every generation's handle shares. A
+        // build that succeeded but whose workers then failed to come up has NOT
+        // been committed — the `WorkerSpawn` arm below leaves `coord.forwarding`
+        // published, so `show security zones` keeps reporting from this store
+        // while nothing is forwarding. Pruning at build time destroyed the
+        // removed zone's totals for exactly that configuration (measured: live
+        // {100,200} + candidate {100,300} + forced spawn failure took the
+        // visible rows to [100]). The additive get-or-create stays at build
+        // time — see `forwarding_build::commit_zone_counter_prune`.
+        if bringup_result.is_ok() {
+            crate::afxdp::forwarding_build::commit_zone_counter_prune(&self.forwarding, snapshot);
+        }
         // #4952 / #5143: a POST-TEARDOWN worker-bringup failure fails the
         // reconcile closed. `bring_up_workers` returned the specific failure —
         // a worker thread that failed to SPAWN (#4952) or a worker that

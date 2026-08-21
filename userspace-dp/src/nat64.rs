@@ -290,9 +290,14 @@ pub(crate) struct Nat64ReverseInfo {
 // traverses NAT64 end-to-end and reassembles at the receiver.
 //
 // Design (converged /research pass; see issue #2562 / PR #4686):
-//   * Key is PORT-FREE `(addr_family, src, dst, ip_id)` so ALL fragments of one
-//     datagram co-locate (the #2344 invariant — payload bytes are NEVER read as
-//     L4 ports).
+//   * Key is PORT-FREE — `(addr_family, src, dst, ip_id, protocol,
+//     ingress-authority)` since #5798 — so ALL fragments of one datagram
+//     co-locate (the #2344 invariant — payload bytes are NEVER read as L4
+//     ports). Every added dimension is an L3 field present in EVERY fragment
+//     (`protocol` is the IPv4 Protocol byte / the IPv6 Fragment Header's Next
+//     Header) or a property of the INGRESS, so widening the key did not cost
+//     the co-location property: first and non-first fragments of one datagram
+//     arriving on one interface still build the identical key.
 //   * Value is the first fragment's FULL, per-flow `SessionDecision`
 //     (resolution + NatDecision) — data-sufficient for the forward direction
 //     (`decision.nat` carries this flow's snat_v4/dst_v4) — plus the optional
@@ -340,12 +345,31 @@ pub(crate) struct Nat64ReverseInfo {
 //     shared across all workers behind `Arc<ForwardingState>` (ArcSwap) and
 //     threaded across config reloads by `from_snapshots_with_previous` — the
 //     same Arc-sharing pattern the `PortAllocator` uses. No new sharded mutex,
-//     no session-sync/control-socket traffic (HA does NOT sync it: transient,
-//     sub-second; on failover an in-flight fragmented datagram is dropped ->
-//     retransmitted, documented + bounded).
+//     no session-sync/control-socket traffic. HA does NOT sync it, and #6927
+//     corrected what that costs: the TTL is an IDLE timeout, RE-STAMPED on
+//     every hit (`lookup`), so a continuously hit entry does NOT expire in two
+//     seconds — it lives as long as fragments keep arriving. Calling the state
+//     "transient, sub-second" and "bounded" was true of an idle entry and false
+//     of a busy one, and the difference mattered: an association that outlives
+//     an RG transition kept serving the OLD owner. What bounds it now is
+//     enforcement, not time — the hit arm re-runs `enforce_ha_resolution_snapshot`
+//     on the cached resolution every packet, so an inactive owner is demoted to
+//     `HAInactive` on the very next fragment however often the entry is
+//     refreshed. Memory is separately bounded (16 shards x 64 entries).
 //
-// Miss (reorder / orphan / eviction / cross-node failover) falls to the #4617
-// fail-closed drop (`nat64_frag_dropped`), never a wrong-source forward.
+// Miss (reorder / orphan / eviction / cross-node failover) falls to a
+// fail-closed drop (`nat64_frag_dropped`) when the packet would otherwise have
+// been FORWARDED — that is the disposition the Pref64 gate is scoped to
+// (`ForwardCandidate`). It is not a blanket claim over every disposition:
+// NoRoute, MissingNeighbor, HAInactive and LocalDelivery reach their own arms,
+// none of which emits the packet natively, so they are safe for their own
+// reasons rather than by this gate (#6927 r2).
+// #6927: that was an ASPIRATION until the Pref64-destination gate on the
+// flowless arm (`poll_descriptor/mod.rs`) existed. `nat64_consult_forward_fragment_assoc`
+// returning `None` only means "no association"; the packet then resolved like
+// any other IPv6 destination and, with a default route, FORWARDED — untranslated,
+// to a synthetic Pref64 address, with the client's real IPv6 source on the wire.
+// Every test agreed with this comment because the fixture deleted `::/0`.
 // ===========================================================================
 
 /// Number of independent shards. Power of two so the shard index is a mask.
@@ -362,10 +386,113 @@ const NAT64_FRAG_CAP_PER_SHARD: usize = 64;
 /// microseconds-milliseconds. Refreshed on every hit.
 const NAT64_FRAG_TTL_NS: u64 = 2_000_000_000;
 
+/// #5798: the INGRESS SECURITY AUTHORITY a fragment association was minted
+/// under — the part of the key that makes "same key" mean "same enforcement
+/// domain".
+///
+/// A fragment-association HIT short-circuits the flowless enforcement arm and
+/// returns the FIRST fragment's whole `SessionDecision` (permit + egress
+/// resolution + NAT translation). Without an authority in the key, a non-first
+/// fragment arriving from a DIFFERENT security domain that merely reproduces
+/// `(family, src, dst, ident)` inherits the first domain's permit and is
+/// forwarded under an authority it was never granted — bypassing its own
+/// interface input filter, PBR, zone derivation and zone security policy.
+/// Fragment-ID guessing is not an authorization mechanism.
+///
+/// Carrying the authority IN THE KEY (rather than validating it in the value)
+/// makes the fix FAIL-CLOSED BY CONSTRUCTION: a cross-domain fragment computes
+/// a DIFFERENT key, so it simply MISSES and falls through to the full
+/// enforcement arm under its own real identity. There is no window in which a
+/// wrong decision is returned and then rejected.
+///
+/// Dimensions, and why these: the **effective logical ingress interface**
+/// (`ingress_ifindex` + `ingress_vlan_id`) is the finest binding and the one
+/// that DETERMINES the gates a hit bypasses — the interface input filter is
+/// bound per logical interface, so two interfaces in the SAME zone can carry
+/// DIFFERENT filters and keying on zone alone would still alias them. `zone`
+/// and `routing_table` are functions of that interface, but they are carried
+/// explicitly because the enforcement arm reads them directly (a zone override
+/// or a fabric-origin packet can make the effective zone differ from the one
+/// the raw ifindex would imply), and a key must be derived from EXACTLY the
+/// ingress inputs enforcement uses for "same key <=> same domain" to hold.
+///
+/// NOT included: the config/FIB generation, which `Nat64FragEntry.generation`
+/// already fences (#5624), and direction, which is constant — the cache is
+/// forward-install / forward-consult only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FragAuthority {
+    /// Effective logical ingress interface index.
+    pub(crate) ingress_ifindex: u32,
+    /// Effective ingress VLAN (0 = untagged); part of the LOGICAL interface
+    /// identity, so two VLAN siblings on one physical port never alias.
+    pub(crate) ingress_vlan_id: u16,
+    /// Ingress security zone after the RAW zone-encoded fabric/tunnel stamp
+    /// (`ingress_zone_override`), which can re-home a packet's zone; otherwise
+    /// the logical unit's configured zone.
+    ///
+    /// This is the RAW stamp, NOT the post-#6458 value. The flowless arm later
+    /// re-binds `ingress_zone_override` through
+    /// `gate_fabric_zone_override_on_owner_rg`, which DISCARDS the stamp when
+    /// the resolution's owner RG is not forwarding-active locally — but that
+    /// gate takes a RESOLVED forwarding decision, which does not exist yet at
+    /// the association install/consult sites (resolving one is the very work a
+    /// hit skips). Install and consult both read the same pre-gate value, so
+    /// the key stays symmetric and "same key <=> same ingress authority" holds.
+    ///
+    /// Residual, NARROWED in #6927 r2 because the original wording outlived the
+    /// fix. Because the owner-RG gate is runtime HA state (not config, so
+    /// `build_generation` does not fence it), an RG that stops forwarding
+    /// locally between a first and a non-first fragment leaves the association
+    /// keyed on a stamp the post-gate enforcement would now ignore.
+    ///
+    /// What that no longer implies is that the fragment is FORWARDED under the
+    /// stale authority. #6927 runs `enforce_ha_resolution_snapshot` on the hit
+    /// arm (poll_descriptor/mod.rs), so an inactive owner is demoted to
+    /// `HAInactive` on the very next fragment and the shared safety net
+    /// fabric-redirects it to the node that now owns the egress RG. Measured:
+    /// deleting that call makes the inactive leg of
+    /// `nat64_frag_assoc_hit_reenforces_owner_rg_6927` forward again.
+    ///
+    /// What genuinely remains is the ZONE-POLICY half: a hit still inherits the
+    /// first fragment's permit and re-runs only the INTERFACE filter, so a
+    /// policy change between fragments is not re-applied.
+    ///
+    /// Be precise about the WINDOW, because the obvious reading is wrong and an
+    /// earlier revision of this paragraph got it wrong. `NAT64_FRAG_TTL_NS` is
+    /// 2s, but `Nat64FragAssoc::lookup` RE-STAMPS `deadline_ns` on every hit
+    /// (pre-existing, #2562/#5624 — not introduced here), so it is an IDLE
+    /// timeout, not an absolute lifetime. A stream of non-first fragments
+    /// carrying the same (src, dst, ident, protocol, authority) spaced under
+    /// 2s renews the association indefinitely, and the Fragment Identification
+    /// is attacker-chosen. So the window is "as long as fragments of that
+    /// datagram keep arriving", NOT ~2s. For a legitimate sender, which uses a
+    /// fresh Identification per datagram, it really is ~2s — which is where
+    /// that number came from.
+    ///
+    /// Nothing else bounds it: the config fence (`build_generation`) does not
+    /// move on an RG transition, eviction lives in `install` so a pure-consult
+    /// stream never triggers it, `retain` only prunes already-expired entries,
+    /// and the input filter this PR runs on a hit is the INTERFACE filter — it
+    /// does not re-apply zone policy. (It DOES re-apply the owner-RG gate:
+    /// #6927 added `enforce_ha_resolution_snapshot` to the hit arm,
+    /// poll_descriptor/mod.rs. An earlier revision of this sentence said
+    /// otherwise and contradicted the module header above, which had it right.)
+    /// This is the same
+    /// already-admitted-flow property the flow-backed session table has across
+    /// an RG transition; do not describe it as bounded by a shorter lifetime.
+    pub(crate) ingress_zone: u16,
+    /// Routing instance / VRF the ingress resolves in.
+    pub(crate) routing_table: u32,
+}
+
 /// Port-free fragment-association key (#2562). Identical shape for both NAT64
 /// directions; the family byte distinguishes a v6->v4 forward association from
 /// a v4->v6 reverse one, so a forward and a reverse datagram that happen to
 /// share addresses/ident never alias.
+///
+/// #5798: additionally scoped by upper-layer protocol and by the ingress
+/// security authority (see [`FragAuthority`]) so a datagram can only inherit a
+/// decision minted for the SAME protocol in the SAME enforcement domain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Nat64FragKey {
     pub(crate) addr_family: u8,
@@ -375,6 +502,15 @@ pub(crate) struct Nat64FragKey {
     /// Identification zero-extended (v4 side). The SAME value labels every
     /// fragment of one datagram, so it co-locates them under one key.
     pub(crate) ident: u32,
+    /// #5798: upper-layer protocol — the IPv4 header's Protocol field, or the
+    /// IPv6 Fragment Header's Next Header. BOTH are L3 fields present and
+    /// IDENTICAL in EVERY fragment of a datagram (no payload byte is read as
+    /// L4, per required-fix #2), so install and consult derive the same value
+    /// while a TCP datagram and a UDP datagram that collide on
+    /// `(src, dst, ident)` no longer alias.
+    pub(crate) protocol: u8,
+    /// #5798: the ingress security domain the association was minted under.
+    pub(crate) authority: FragAuthority,
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +563,18 @@ fn ip_octets(ip: IpAddr, out: &mut [u8; 16]) -> usize {
 
 /// FNV-1a over the port-free key -> shard index. Deterministic so the same key
 /// always maps to the same shard on install and consult (across workers).
+///
+/// #5798: the #5798 authority + protocol fields are DELIBERATELY NOT mixed in
+/// here. The shard index stays the coarse `(family, src, dst, ident)` digest —
+/// including the documented `ident.to_be_bytes()` byte order — for two reasons:
+///
+///  1. Correctness does not need it. Shard selection only decides WHICH bucket
+///     is scanned; membership is decided by full-key equality inside that
+///     bucket. A cross-domain fragment lands in the SAME shard, finds no equal
+///     key, and misses cleanly — which is exactly the fail-closed outcome.
+///  2. It keeps same-datagram candidates CO-LOCATED, so a cross-domain
+///     aliasing attempt is observable with a single-shard scan rather than a
+///     walk of all `NAT64_FRAG_SHARDS` buckets.
 fn nat64_frag_shard_index(key: &Nat64FragKey) -> usize {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: u8| {
@@ -586,7 +734,18 @@ impl Nat64FragAssoc {
 /// `(key, more, offset_units)` triple. `addr_family` selects the family. Shared
 /// by [`nat64_first_fragment_key`] and [`nat64_nonfirst_fragment_key`] so the
 /// install and consult key derivations are byte-identical.
-fn nat64_fragment_fields(packet: &[u8], addr_family: i32) -> Option<(Nat64FragKey, bool, u16)> {
+///
+/// #5798: `authority` is the ingress security domain the caller resolved for
+/// THIS packet (see [`FragAuthority`]). It is stamped verbatim into the key so
+/// install and consult agree by construction; this ONE builder is the SSOT for
+/// both derivations, so the two can never drift into keying on different
+/// dimensions. Every other field is read from the packet's L3 headers only —
+/// no payload byte is interpreted as L4.
+fn nat64_fragment_fields(
+    packet: &[u8],
+    addr_family: i32,
+    authority: FragAuthority,
+) -> Option<(Nat64FragKey, bool, u16)> {
     match addr_family {
         libc::AF_INET6 => {
             if packet.len() < 40 {
@@ -600,6 +759,10 @@ fn nat64_fragment_fields(packet: &[u8], addr_family: i32) -> Option<(Nat64FragKe
                 src: IpAddr::V6(src),
                 dst: IpAddr::V6(dst),
                 ident: frag.ident,
+                // The Fragment Header's Next Header — present in every
+                // fragment, so first and non-first derive the same protocol.
+                protocol: frag.next_header,
+                authority,
             };
             Some((key, frag.more, frag.offset_units))
         }
@@ -618,6 +781,10 @@ fn nat64_fragment_fields(packet: &[u8], addr_family: i32) -> Option<(Nat64FragKe
                 src: IpAddr::V4(src),
                 dst: IpAddr::V4(dst),
                 ident: u32::from(ident),
+                // IPv4 header byte 9 — the Protocol field, present in every
+                // fragment (unlike the L4 header, which only the first carries).
+                protocol: packet[9],
+                authority,
             };
             Some((key, more, offset_units))
         }
@@ -628,8 +795,16 @@ fn nat64_fragment_fields(packet: &[u8], addr_family: i32) -> Option<(Nat64FragKe
 /// Association key for a FIRST fragment (offset 0, MF=1) — the fragment that
 /// INSTALLS the entry. Returns `None` for a non-first fragment, an atomic
 /// fragment (MF=0, offset 0), or a non-fragmented packet.
-pub(crate) fn nat64_first_fragment_key(packet: &[u8], addr_family: i32) -> Option<Nat64FragKey> {
-    let (key, more, offset_units) = nat64_fragment_fields(packet, addr_family)?;
+///
+/// #5798: `authority` is the ingress security domain that admitted this first
+/// fragment; a non-first fragment can only inherit the entry by presenting the
+/// SAME authority.
+pub(crate) fn nat64_first_fragment_key(
+    packet: &[u8],
+    addr_family: i32,
+    authority: FragAuthority,
+) -> Option<Nat64FragKey> {
+    let (key, more, offset_units) = nat64_fragment_fields(packet, addr_family, authority)?;
     if more && offset_units == 0 {
         Some(key)
     } else {
@@ -640,8 +815,17 @@ pub(crate) fn nat64_first_fragment_key(packet: &[u8], addr_family: i32) -> Optio
 /// Association key for a NON-first fragment (offset > 0) — the fragment that
 /// CONSULTS the entry. Returns `None` for a first / atomic / non-fragmented
 /// packet.
-pub(crate) fn nat64_nonfirst_fragment_key(packet: &[u8], addr_family: i32) -> Option<Nat64FragKey> {
-    let (key, _more, offset_units) = nat64_fragment_fields(packet, addr_family)?;
+///
+/// #5798: `authority` is THIS fragment's own ingress domain. A fragment from a
+/// different domain therefore builds a different key and MISSES, falling
+/// through to full flowless enforcement under its real identity instead of
+/// inheriting the first fragment's permit.
+pub(crate) fn nat64_nonfirst_fragment_key(
+    packet: &[u8],
+    addr_family: i32,
+    authority: FragAuthority,
+) -> Option<Nat64FragKey> {
+    let (key, _more, offset_units) = nat64_fragment_fields(packet, addr_family, authority)?;
     if offset_units != 0 {
         Some(key)
     } else {
@@ -1878,6 +2062,11 @@ struct Ipv6FragInfo {
     more: bool,
     /// The 32-bit Identification value.
     ident: u32,
+    /// #5798: the Fragment Header's Next Header byte — the upper-layer protocol
+    /// (or the next extension-header type). It is a field OF the Fragment
+    /// Header, so it is present and identical in EVERY fragment of a datagram,
+    /// including non-first ones that carry no L4 header at all.
+    next_header: u8,
 }
 
 /// Parse the IPv6 Fragment Header (next-header 44) if present (#2488).
@@ -1899,6 +2088,8 @@ fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
         offset_units: word >> 3,
         more: (word & 0x0001) != 0,
         ident: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        // byte 0: Next Header (#5798 protocol scoping).
+        next_header: bytes[0],
     })
 }
 

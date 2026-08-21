@@ -374,6 +374,33 @@ func (m *Manager) blindFailClosedUserspaceCtrlLocked(
 	)
 }
 
+// ctrlMustStayDisabledLocked reports whether the ctrl gate must be held at 0
+// even though the helper reports Enabled. It is the exact condition that used to
+// be inline in applyHelperStatusLocked's ctrl branch; the reasoning for each
+// disjunct lives at that branch.
+//
+// #6871 (round 9, F4): extracted so the clause is REACHABLE without privileges.
+// applyHelperStatusLocked opens by resolving userspace_ctrl and userspace_bindings
+// off the shim and returns "userspace_ctrl map not loaded" when either is absent,
+// so every unprivileged test stops at line one and the clause behind it is bound
+// by nothing CI runs — deleting `|| m.linkCycleInFlight()` left BOTH
+// pkg/dataplane/userspace and pkg/daemon fully green. The three cells that do
+// cover it need real BPF maps and SKIP unprivileged, and Go reports a parent as
+// PASS when every subtest skipped.
+//
+// SCOPE OF THE REMEDY, stated rather than implied. This binds the PREDICATE, not
+// the call site: a change that stopped calling it, or inlined a different
+// condition, would not be caught here. The full remedy is to route
+// applyHelperStatusLocked's map handles through an interface the way
+// ctrlMapForDisableLocked does (process_linkcycle.go), and that is a wide change
+// — the two handles are threaded through failClosedUserspaceCtrlLocked,
+// clearStaleBindingRowsLocked and ~15 other call sites inside a 481-line function
+// on the fail-closed path — so it is deliberately NOT bundled into this round.
+// What this buys is the difference between "unbound" and "bound one level in".
+func (m *Manager) ctrlMustStayDisabledLocked(statusEnabled bool) bool {
+	return statusEnabled && (m.rgTransitionInFlight.Load() || m.linkCycleInFlight())
+}
+
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
@@ -412,11 +439,26 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if status.Enabled && m.rgTransitionInFlight.Load() {
-		// One or more RG transitions are in progress and the helper hasn't
-		// acked the HA state update yet. Keep ctrl disabled until
-		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
+	if m.ctrlMustStayDisabledLocked(status.Enabled) {
+		// rgTransitionInFlight: one or more RG transitions are in progress and
+		// the helper hasn't acked the HA state update yet. Keep ctrl disabled
+		// until syncHAStateLocked succeeds to avoid re-enabling ctrl during the
 		// handoff (#279, #284).
+		//
+		// linkCycleInFlight (#6871): a RETH MAC link cycle has joined the
+		// workers and is taking the NIC down, so the XSK sockets this gate
+		// steers into are dead or about to be. The status tick is gated on the
+		// same lease and skips its whole body, but this is not only the tick's
+		// path: UpdateRGActive ends in applyHelperStatusLocked too, and it is
+		// driven by VRRP/cluster events and by reconcileRGStateLoop's 2s pass
+		// (daemon_ha.go, which also wakes early on dropped-event
+		// notifications), NEITHER of which is serialized on the daemon's
+		// applySem — so it can land in
+		// the middle of a cycle and re-enable ctrl on its own. Gating at the
+		// write is what makes the lease cover the producer rather than one
+		// caller of it. NotifyLinkCycle releases the lease at the top of its
+		// critical section, so its own post-rebind status apply is NOT gated
+		// here and a completed cycle re-enables ctrl on that call.
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
@@ -1588,11 +1630,61 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	seen := make(map[uint32]bool)
 	out := make([]uint32, 0)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
+			// #6691 round 8: the parent netdev is one a DIFFERENT row has
+			// already been refused a binding for on device grounds — an xfrmi
+			// under `bind-interface st10` with a zoned sibling unit is the
+			// reachable case. Appending its ifindex here re-admits exactly the
+			// netdev the predicate just excluded, and measured at head it did:
+			// the set came back [10 11] with 11 the live xfrmi.
+			//
+			// WHICH ROWS THE REFUSED PARENT ACTUALLY DISQUALIFIES (#6691 round
+			// 9). Round 8 dropped the WHOLE ROW here and justified it with "for
+			// a VLAN child the parent IS the bind target". True — but this
+			// branch is entered on `ParentIfindex > 0`, which is every UNIT
+			// row, not every VLAN row. A plain unit (`st10 unit 5` with no
+			// vlan-id) merely CARRIES a parent ifindex; its bind target is its
+			// OWN netdev, so a refused parent says nothing about it.
+			//
+			// Measured before this round with secure `st10` at ifindex 11 and an
+			// ordinary live `st10.5` at 12: Go ingress came back [10] — 12
+			// missing — while the RSS allowlist named `st10.5` and the Rust
+			// planner made it a candidate. That is the ingress/plan split in
+			// the OTHER direction from the one round 8 fixed: a netdev with a
+			// binding but no ingress entry takes cpumap_or_pass and leaves the
+			// adjudicated path.
+			//
+			// So the parent key is always suppressed, and the row survives iff
+			// it binds its own netdev. For a VLAN child (bind target == the
+			// parent) the whole row still goes, which is what keeps an ifindex
+			// out of the ingress map with no READY binding —
+			// drop_degraded_transit (BINDING_MISSING) — the invariant round 8
+			// was holding up and this preserves.
+			// BOTH KEYS (#6691 round 16, refusesNetdev): the parent's refusal
+			// can hold on the NAME alone — the parent's own base row is a
+			// separate buildLinkSnapshot from this unit row's parent lookup, so
+			// a base row that missed names the netdev without contributing an
+			// ifindex bucket. Rust's binding_target_is_refused asks by name and
+			// drops the child outright, so an ifindex-only reader here left
+			// both the child and the parent key adjudicated with no binding.
+			if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
+				if !userspaceOwnsItsNetdev(iface) {
+					continue
+				}
+				if iface.Ifindex > 0 && !iface.LogicalOnly {
+					key := uint32(iface.Ifindex)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, key)
+					}
+				}
+				continue
+			}
 			if iface.Ifindex > 0 && !iface.LogicalOnly {
 				key := uint32(iface.Ifindex)
 				if !seen[key] {
@@ -1620,6 +1712,21 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	for _, fab := range snapshot.Fabrics {
 		if fab.ParentIfindex <= 0 {
+			continue
+		}
+		// #6691 round 9: the sibling of the allowlist's fabric guard, and the
+		// same reachability — round 8's kernel-kind evidence refuses an xfrm
+		// device by DEVICE KIND, so a slot-shaped `ge-0/0/0` created out of band
+		// is both refused and a legal `fabric-options member-interfaces` value.
+		// Measured: ingress came back [20 21] with 20 the refused member. See
+		// UserspaceBoundLinuxInterfaces for why this is transparent to an
+		// ordinary fabric.
+		// BOTH KEYS (#6691 round 16, refusesNetdev): the fabric row and the
+		// interface rows are separate netlink samples — SyncFabricState
+		// refreshes the fabric rows alone — so an owning, unbindable row that
+		// missed names this netdev while the fabric row carries its live
+		// ifindex. The RSS allowlist's own fabric guard already asked by name.
+		if refused.refusesNetdev(fab.ParentLinuxName, fab.ParentIfindex) {
 			continue
 		}
 		key := uint32(fab.ParentIfindex)
@@ -1673,6 +1780,7 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		return nil
 	}
 	out := make(map[uint32]uint32)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
@@ -1680,37 +1788,22 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 || iface.Ifindex == iface.ParentIfindex || iface.LogicalOnly {
 			continue
 		}
+		// #6691 round 8: same redirect, same refusal. An alias here would tell
+		// the shim to treat frames on the child as arriving on a netdev the
+		// dataplane refused to bind. This site is inert on every config
+		// reachable today and is guarded anyway — the reachability analysis,
+		// per exclusion class, is in userspaceRefusedNetdevs
+		// (ingress_exclusions.go), which owns the contract.
+		// BOTH KEYS (#6691 round 16, refusesNetdev) — same sampling skew as the
+		// ingress loop above. An alias installed for a name-refused parent tells
+		// the shim to treat the child's frames as arriving on a netdev nothing
+		// ever binds.
+		if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
+			continue
+		}
 		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
 	}
 	return out
-}
-
-func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
-	if iface.Tunnel {
-		return true
-	}
-	base := iface.Name
-	if idx := strings.IndexByte(base, '.'); idx >= 0 {
-		base = base[:idx]
-	}
-	switch {
-	case strings.HasPrefix(base, "fxp"):
-		return true
-	case strings.HasPrefix(base, "em"):
-		return true
-	case strings.HasPrefix(base, "fab"):
-		return true
-	case base == "lo0":
-		return true
-	}
-	switch iface.Zone {
-	case "mgmt", "control":
-		return true
-	}
-	if iface.LocalFabric != "" {
-		return true
-	}
-	return false
 }
 
 func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {
