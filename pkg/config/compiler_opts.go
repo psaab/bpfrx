@@ -1312,6 +1312,42 @@ type compileOpts struct {
 	// legitimate dynamic-interface reference (the #4191 over-rejection class).
 	// Same doctrine as lenientZoneInterfaceMembership.
 	lenientZoneInterfaceDefined bool
+	// lenientZoneInterfacesNonEmpty (#6525) downgrades the zone-interfaces
+	// NON-EMPTY gate (validateZoneInterfacesNonEmptyStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `security zones security-zone <z> interfaces` stanza that
+	// carries content yet contributes ZERO members — the shape the hierarchical
+	// compact-leaf spelling `interfaces ge-0/0/1.0;` used to produce, where the
+	// member name sat on the stanza's own Keys tail that compileZones never
+	// read. Such a zone binds no interface: the dataplane leaves the interface
+	// with Zone == "" (UserspaceBoundLinuxInterfaces skips it, so it is never
+	// AF_XDP-bound) and every policy naming the zone applies to nothing, while
+	// the two gates above pass VACUOUSLY over the empty member set. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick) —
+	// on that path behavior is unchanged (the stanza contributed no members
+	// before this gate existed and still contributes none), just with an
+	// operator-visible warning. Same doctrine as lenientZoneInterfaceDefined.
+	lenientZoneInterfacesNonEmpty bool
+	// lenientZoneInterfacePackedTail (#6735) downgrades the zone-interfaces
+	// PACKED-TAIL gate (validateZoneInterfacePackedTailStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a `security zones security-zone <z> interfaces` stanza
+	// in which `host-inbound-traffic` appears on a member's Keys with further
+	// tokens AFTER it. The lexer strips brackets (#2419), so the bracket member
+	// list `[ a host-inbound-traffic b ]` and the packed body
+	// `a host-inbound-traffic system-services ssh` are structurally identical by
+	// the time the compiler sees them, and their readings disagree about zone
+	// membership: the truncator keeps only the names BEFORE the keyword, so the
+	// first loses member `b` (left with Zone == "", never dataplane-bound, no
+	// policy naming the zone applies to it) and the second loses the whole
+	// override. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// BOOTS (#1960 no-brick) — on that path behavior is unchanged (the trailing
+	// tokens were dropped before this gate existed and still are), just with an
+	// operator-visible warning naming what was lost. Same doctrine as
+	// lenientZoneInterfacesNonEmpty.
+	lenientZoneInterfacePackedTail bool
 	// lenientHostInboundTokens (#3200) downgrades the host-inbound-traffic
 	// token gate (validateHostInboundTokensStrict) from a hard compile error
 	// to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2224,6 +2260,8 @@ func lenientCompileOpts() compileOpts {
 		lenientAddressBookNameCollision:        true,
 		lenientZoneInterfaceMembership:         true,
 		lenientZoneInterfaceDefined:            true,
+		lenientZoneInterfacesNonEmpty:          true,
+		lenientZoneInterfacePackedTail:         true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,
 		lenientClusterAuthKey:                  true,

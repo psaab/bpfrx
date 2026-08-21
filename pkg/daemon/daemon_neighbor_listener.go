@@ -301,13 +301,11 @@ func shouldTriggerRegenWithProvider(u netlink.NeighUpdate, provider neighborSnap
 // snapshot interface, or nil if the dataplane doesn't expose
 // the methods (defensive: tests / non-userspace dataplanes).
 func (d *Daemon) neighborProvider() neighborSnapshotProvider {
-	if d.dp == nil {
+	p, ok := d.dataplane().(neighborSnapshotProvider)
+	if !ok {
 		return nil
 	}
-	if p, ok := d.dp.(neighborSnapshotProvider); ok {
-		return p
-	}
-	return nil
+	return p
 }
 
 // criticality levels for force-probe target prioritization.
@@ -466,11 +464,15 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 	// forwarding-correctness. The neighborIndex reflects publishable-
 	// only entries (we built it that way after publish-success), so
 	// use that as the source for snapshot keys.
-	if provider := d.neighborProvider(); provider != nil {
+	//
+	// #2114: provider and indexEnumerator derive from ONE dataplane load
+	// (plan §5.3 rule 4).
+	if rt := d.dataplane(); rt != nil {
+		_, isProvider := rt.(neighborSnapshotProvider)
 		type indexEnumerator interface {
 			ForEachSnapshotNeighbor(fn func(ifindex int, ip net.IP))
 		}
-		if e, ok := d.dp.(indexEnumerator); ok {
+		if e, ok := rt.(indexEnumerator); ok && isProvider {
 			e.ForEachSnapshotNeighbor(func(ifindex int, ip net.IP) {
 				addTarget(ip, ifindex, criticalityNormal)
 			})
