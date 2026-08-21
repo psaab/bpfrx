@@ -5623,6 +5623,124 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
     assert_eq!(iface.dscp_queue_by_dscp[0], 0);
 }
 
+/// #3651 gate F1: bind the CONFIG-APPLY block that produces BOTH per-zone
+/// counter families.
+///
+/// `forwarding_build` is the only place `zone_counter_slot_map` /
+/// `zone_counter_store` and `flood_counter_slot_map` / `flood_counter_store`
+/// are populated from a `ConfigSnapshot`. Before this test, every other test
+/// reference to those fields was a HAND-ASSIGNMENT — so deleting either build
+/// block verbatim left the whole cargo suite green (measured: `4256 passed;
+/// 0 failed` with the flood block gone, and the same with the already-merged
+/// traffic block gone).
+///
+/// The undetected runtime consequence is total: an unbuilt slot map is
+/// `empty()`, so every zone resolves to slot 0, `record_zone_flood_drop` /
+/// `record_zone_traffic` return at their `slot == 0` guard for every packet on
+/// every zone, nothing is ever published, and every read surface reports
+/// `ErrCounterNotPopulated`. That is bit-for-bit the pre-#3651 state the
+/// populate work exists to close — reachable with a fully green suite.
+///
+/// Covers BOTH families deliberately: the traffic half is an inherited gap of
+/// the same shape, and one test closes both cells.
+///
+/// Second leg binds the CARRY-FORWARD half: `previous`-threaded totals must
+/// survive a re-apply, which is what makes counters survive a config commit.
+#[test]
+fn config_apply_builds_both_per_zone_counter_slot_maps_3651() {
+    use crate::afxdp::flood_counters::{flush_recorded_flood_counters, record_zone_flood_drop};
+    use crate::afxdp::zone_counters::{flush_recorded_zone_counters, record_zone_traffic};
+
+    const TRUST: u16 = 50675; // config::StableZoneID("trust")
+    const UNTRUST: u16 = 20665; // config::StableZoneID("untrust")
+
+    let mut snapshot = ConfigSnapshot::default();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "trust".to_string(),
+            id: TRUST,
+            ..Default::default()
+        },
+        ZoneSnapshot {
+            name: "untrust".to_string(),
+            id: UNTRUST,
+            ..Default::default()
+        },
+    ];
+
+    let first = build_forwarding_state(&snapshot);
+
+    // Leg 1: BOTH slot maps must come back built from the snapshot's zone set.
+    // Deleting either build block leaves that family's map `empty()`, so every
+    // zone resolves to slot 0 and the assertion below fires.
+    for (label, slotted) in [
+        ("flood", first.flood_counter_slot_map.slot_of(TRUST)),
+        ("traffic", first.zone_counter_slot_map.slot_of(TRUST)),
+    ] {
+        assert_ne!(
+            slotted, 0,
+            "config apply did not build the {label} slot map: zone TRUST resolves to \
+             slot 0, so every packet on it takes the `slot == 0` early return and the \
+             zone can never publish -- the pre-#3651 not-populated state, with a \
+             green suite"
+        );
+    }
+    for (label, slotted) in [
+        ("flood", first.flood_counter_slot_map.slot_of(UNTRUST)),
+        ("traffic", first.zone_counter_slot_map.slot_of(UNTRUST)),
+    ] {
+        assert_ne!(
+            slotted, 0,
+            "config apply did not build the {label} slot map for the SECOND zone: a \
+             one-zone assertion could pass on an off-by-one that still slots only one"
+        );
+    }
+    // Neither family may claim overflow on a two-zone config -- that would mean
+    // the build ran with the wrong id set.
+    assert!(!first.flood_counter_slot_map.overflow_active);
+    assert!(!first.zone_counter_slot_map.overflow_active);
+
+    // Leg 2: totals must SURVIVE a re-apply through the `previous` thread. This
+    // is what makes per-zone counters survive a config commit; without the
+    // carry-forward the store is recreated empty and every count resets to 0 on
+    // every commit.
+    record_zone_flood_drop(&first.flood_counter_slot_map, TRUST, "syn-flood");
+    flush_recorded_flood_counters(&first.flood_counter_store, &first.flood_counter_slot_map);
+    record_zone_traffic(&first.zone_counter_slot_map, TRUST, UNTRUST, 1500);
+    flush_recorded_zone_counters(&first.zone_counter_store, &first.zone_counter_slot_map);
+
+    let second = build_forwarding_state_with_policy_counters_and_previous(
+        &snapshot,
+        &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&first),
+    )
+    .expect("re-apply of a clean snapshot must build");
+
+    let flood = second.flood_counter_store.snapshot();
+    let trust_flood = flood
+        .iter()
+        .find(|r| r.zone_id == TRUST)
+        .expect("flood totals must survive the re-apply (previous store carried forward)");
+    assert_eq!(
+        trust_flood.syn_flood_events, 1,
+        "flood count reset across a config apply: the carry-forward is what makes \
+         per-zone counters survive a commit"
+    );
+
+    let traffic = second.zone_counter_store.snapshot();
+    let trust_traffic = traffic
+        .iter()
+        .find(|r| r.zone_id == TRUST)
+        .expect("traffic totals must survive the re-apply (previous store carried forward)");
+    assert_eq!(trust_traffic.ingress_packets, 1);
+    assert_eq!(trust_traffic.ingress_bytes, 1500);
+
+    // And the rebuilt maps are still live, not left empty by the re-apply.
+    assert_ne!(second.flood_counter_slot_map.slot_of(TRUST), 0);
+    assert_ne!(second.zone_counter_slot_map.slot_of(TRUST), 0);
+}
+
 /// #6847: an inet-precedence classifier code-point outside the 3-bit
 /// IP-precedence domain (0..=7) fails the snapshot CLOSED via
 /// `CosInetPrecedenceCodePointOutOfRange`, mirroring the #2447 dscp / 802.1p
@@ -6339,6 +6457,137 @@ fn accepted_build_defers_the_prune_to_the_commit_point() {
     // The prune is on the shared store, so the previous state's handle
     // observes it too (same Arc).
     assert_eq!(prev.zone_counter_store.snapshot().len(), 1);
+}
+
+// ── #3651 flood half of the #5716/#6832 rejected-build guarantee ──────
+//
+// The flood-event store is the traffic store's exact sibling: `Arc`-backed,
+// carried forward through the SAME `previous` handle, get-or-created per
+// slot-assigned zone by `FloodCounterSlotMap::build`, and pruned by the same
+// `reconcile`. #6938 therefore binds it inside `attach_zone_counters` and
+// prunes it inside `commit_zone_counter_prune` rather than giving it its own
+// pair, so it inherits the ordering structurally.
+//
+// These two rows check that the inheritance is REAL rather than assumed.
+// Master's `rejected_build_does_not_prune_live_zone_counters` and
+// `accepted_build_defers_the_prune_to_the_commit_point` read
+// `zone_counter_store` and nothing else, so they stay green with the flood
+// prune moved back inside the fallible builder — which is precisely the shape
+// this branch's pre-merge code had, and precisely the defect #5716/#6832
+// removed for the traffic family.
+
+/// Live state for the two flood rows: zones 100 and 200 configured, each with
+/// a recorded SYN-flood event so both produce a row in the sparse store
+/// snapshot (which omits all-zero rows by design).
+fn flood_counter_prev_state() -> ForwardingState {
+    use crate::afxdp::flood_counters::{flush_recorded_flood_counters, record_zone_flood_drop};
+    let prev = zone_counter_prev_state();
+    record_zone_flood_drop(&prev.flood_counter_slot_map, 100, "syn-flood");
+    record_zone_flood_drop(&prev.flood_counter_slot_map, 200, "syn-flood");
+    flush_recorded_flood_counters(&prev.flood_counter_store, &prev.flood_counter_slot_map);
+    assert_eq!(
+        flood_store_zone_ids(&prev),
+        vec![100, 200],
+        "both zones must be counting flood events before the build under test"
+    );
+    prev
+}
+
+/// Sorted zone ids currently tracked by a state's flood store.
+fn flood_store_zone_ids(state: &ForwardingState) -> Vec<u16> {
+    let mut ids: Vec<u16> = state
+        .flood_counter_store
+        .snapshot()
+        .iter()
+        .map(|r| r.zone_id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A build the integrity belts REJECT must leave the live flood store intact.
+///
+/// Same four belts, same candidate zone set (`ZONE_COUNTER_CANDIDATE_ZONES`
+/// drops live zone 200 and adds a new zone 300) as the traffic rows, so a
+/// relocation of the flood work into the fallible region is caught wherever it
+/// lands: every straight-line position that is still a defect has a `?` below
+/// it, hence sits above the LAST belt.
+#[test]
+fn rejected_build_does_not_prune_live_flood_counters_3651() {
+    let prev = flood_counter_prev_state();
+    for (label, snapshot, is_expected) in zone_counter_rejection_rows() {
+        let err = build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &PolicyCounterStore::default(),
+            &crate::nat::NatCounterStore::default(),
+            Some(&prev),
+        )
+        .expect_err(&format!("{label}: this snapshot must be rejected"));
+        assert!(
+            is_expected(&err),
+            "{label}: rejected for the wrong reason ({err:?}) — the row would \
+             then prove nothing about where the flood binding sits"
+        );
+        assert_eq!(
+            flood_store_zone_ids(&prev),
+            vec![100, 200],
+            "{label}: the REJECTED build pruned zone 200's cumulative flood \
+             counts out of the LIVE, Arc-shared flood store. The apply never \
+             happened — zone 200 is still configured — so `show security screen \
+             ids-option statistics` now reads \"not available\" for it forever \
+             (#3651 flood half of #5716/#6832)"
+        );
+    }
+}
+
+/// The flood prune is DEFERRED to the commit point, not deleted.
+///
+/// Anti-over-fix control for the row above, and the row that reds if
+/// `commit_zone_counter_prune` prunes only the traffic store: without the
+/// flood `reconcile` there, a removed zone's flood blocks would be retained
+/// forever while its traffic blocks were dropped, so the two per-zone surfaces
+/// would disagree about which zones exist.
+#[test]
+fn accepted_build_defers_the_flood_prune_to_the_commit_point_3651() {
+    let prev = flood_counter_prev_state();
+    let good_snapshot = zone_counter_snapshot_with_zones(&[100]);
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &good_snapshot,
+        &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&prev),
+    )
+    .expect("a clean snapshot must build");
+
+    // Half 1 — a clean BUILD is additive only for the flood family too. This
+    // is also the precondition that stops half 2 passing vacuously: if the
+    // build had already pruned, half 2's post-commit assertion would hold for
+    // the wrong reason.
+    assert_eq!(
+        flood_store_zone_ids(&next),
+        vec![100, 200],
+        "a clean BUILD must not prune the flood store: the apply it belongs to \
+         can still be rejected by worker bring-up (#4952 spawn, #5143 bind), \
+         and the prune is unrecoverable"
+    );
+
+    // Half 2 — the commit point prunes BOTH families.
+    commit_zone_counter_prune(&next, &good_snapshot);
+    assert_eq!(
+        flood_store_zone_ids(&next),
+        vec![100],
+        "a COMMITTED apply must prune the removed zone from the FLOOD store as \
+         well as the traffic store — commit_zone_counter_prune reconciles both"
+    );
+    // The survivor keeps its carried-forward count rather than resetting.
+    let live = next.flood_counter_store.snapshot();
+    assert_eq!(live[0].zone_id, 100);
+    assert!(
+        live[0].syn_flood_events > 0,
+        "the surviving zone must keep its carried-forward flood totals"
+    );
+    // Shared Arc: the previous state's handle observes the same prune.
+    assert_eq!(flood_store_zone_ids(&prev), vec![100]);
 }
 
 /// #5619: the secure-tunnel unit's ifindex is what decides whether a

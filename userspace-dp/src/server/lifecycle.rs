@@ -292,6 +292,11 @@ pub(crate) fn run() -> Result<(), String> {
             zone_counter_layout_version: 0,
             zone_counter_overflow_active: false,
             zone_traffic_counters: Vec::new(),
+            // #3651: per-zone flood-event block is empty until the first status
+            // refresh reads the helper's flood-counter store.
+            flood_counter_layout_version: 0,
+            flood_counter_overflow_active: false,
+            zone_flood_counters: Vec::new(),
             three_color_policer_counters: Vec::new(),
             source_nat_pools: Vec::new(),
             last_resolution: None,

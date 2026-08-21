@@ -1097,6 +1097,16 @@ pub(crate) fn worker_loop(
             &forwarding.zone_counter_store,
             &forwarding.zone_counter_slot_map,
         );
+        // #3651: and this worker's coalesced per-zone flood-EVENT tally. Same
+        // cadence and same `forwarding` snapshot, so the slot map matches the
+        // one the `record_screen_drop` calls resolved their slots against.
+        // Coalesced rather than folded at the drop site because a SYN flood is
+        // the primary screen-drop trigger: at attack rate every worker would be
+        // `fetch_add`ing the SAME zone's cache line per packet (#1187).
+        crate::afxdp::flood_counters::flush_recorded_flood_counters(
+            &forwarding.flood_counter_store,
+            &forwarding.flood_counter_slot_map,
+        );
         #[cfg(feature = "debug-log")]
         {
             dbg.accumulate(&dbg_poll);

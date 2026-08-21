@@ -384,6 +384,14 @@ func (m *Manager) ClearAllCounters() error {
 	if err := m.clearHelperZoneCountersLocked(); err != nil {
 		errs = append(errs, err)
 	}
+	// #3651: and the helper per-zone FLOOD-event store, for the same reason.
+	// bpfShim.ClearAllCounters() already dropped the Go flood offset map (via
+	// ClearFloodCounterOffsets); without this IPC the helper's cumulative counts
+	// are re-mirrored onto that map by the next 1/s poll and the cleared value
+	// snaps back.
+	if err := m.clearHelperFloodCountersLocked(); err != nil {
+		errs = append(errs, err)
+	}
 
 	// #5098: restart the global-counter delta epoch. syncBPFCountersLocked
 	// ACCUMULATES each 1/s helper delta (cur - prevBindingCounters) into the

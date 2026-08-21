@@ -960,6 +960,7 @@
     "worker_heartbeats": [],
     "worker_runtime": [],
     "workers": 0,
+    "zone_flood_counters": [],
     "zone_traffic_counters": []
   },
   "queue_control_request": {
@@ -1262,6 +1263,12 @@
     "window_ns": 0,
     "work_loops": 0,
     "worker_id": 0
+  },
+  "zone_flood_counter_status": {
+    "icmp_flood_events": 0,
+    "syn_flood_events": 0,
+    "udp_flood_events": 0,
+    "zone_id": 0
   },
   "zone_snapshot": {
     "host_inbound_configured": false,

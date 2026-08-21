@@ -907,17 +907,22 @@ fn nat_alloc_fail_flushes_and_snapshots() {
 // ordinals at 0.
 #[test]
 fn record_screen_drop_populates_per_reason_counters() {
+    use crate::afxdp::flood_counters::FloodCounterSlotMap;
     use crate::screen::screen_reason_drop_index;
     let live = BindingLiveState::new();
     let mut counters = BatchCounters::default();
+    // #3651 added the per-zone flood arguments. An EMPTY slot map (every zone
+    // resolves to slot 0) keeps this test scoped to the aggregate + per-reason
+    // tallies it was written for, so it stays a clean over-reach guard for them.
+    let no_zones = FloodCounterSlotMap::empty();
 
-    counters.record_screen_drop("syn-flood");
-    counters.record_screen_drop("syn-flood");
-    counters.record_screen_drop("port-scan");
-    counters.record_screen_drop("session-limit-src");
-    counters.record_screen_drop("session-limit-dst");
+    counters.record_screen_drop("syn-flood", 7, &no_zones);
+    counters.record_screen_drop("syn-flood", 7, &no_zones);
+    counters.record_screen_drop("port-scan", 7, &no_zones);
+    counters.record_screen_drop("session-limit-src", 7, &no_zones);
+    counters.record_screen_drop("session-limit-dst", 7, &no_zones);
     // A reason with no published ordinal bumps only the aggregate.
-    counters.record_screen_drop("syn-cookie");
+    counters.record_screen_drop("syn-cookie", 7, &no_zones);
 
     let syn_flood = screen_reason_drop_index("syn-flood").unwrap();
     let port_scan = screen_reason_drop_index("port-scan").unwrap();
@@ -952,6 +957,61 @@ fn record_screen_drop_populates_per_reason_counters() {
     assert_eq!(snap.screen_reason_drops[session_limit], 2);
 }
 
+// #3651: the SAME `record_screen_drop` call that bumps the aggregate must also
+// attribute the three FLOOD reasons to the packet's ingress zone. This binds
+// the production wiring, not the flood module in isolation: the per-zone tally
+// has to be reachable from the one method every screen drop site calls.
+//
+// FAIL-ON-REVERT: delete the `record_zone_flood_drop` line from
+// `BatchCounters::record_screen_drop` and both zones' asserted counts stay 0.
+#[test]
+fn record_screen_drop_attributes_flood_reasons_to_the_ingress_zone() {
+    use crate::afxdp::flood_counters::{
+        flush_recorded_flood_counters, FloodCounterSlotMap, FloodCounterStore,
+    };
+    const TRUST: u16 = 50675; // config::StableZoneID("trust")
+    const UNTRUST: u16 = 12345;
+
+    let store = FloodCounterStore::default();
+    let slots = FloodCounterSlotMap::build(&[TRUST, UNTRUST], &store);
+    let mut counters = BatchCounters::default();
+
+    counters.record_screen_drop("syn-flood", TRUST, &slots);
+    counters.record_screen_drop("syn-flood", TRUST, &slots);
+    counters.record_screen_drop("icmp-flood", TRUST, &slots);
+    counters.record_screen_drop("udp-flood", UNTRUST, &slots);
+    // Non-flood screen drops still bump the aggregate but must NOT land in any
+    // per-zone flood family — otherwise "SYN flood events" would silently
+    // include port scans.
+    counters.record_screen_drop("port-scan", TRUST, &slots);
+    counters.record_screen_drop("strict-syn-check", TRUST, &slots);
+    flush_recorded_flood_counters(&store, &slots);
+
+    let snap = store.snapshot();
+    let trust = snap
+        .iter()
+        .find(|s| s.zone_id == TRUST)
+        .expect("trust zone must have per-zone flood counts after record_screen_drop");
+    assert_eq!(
+        trust.syn_flood_events, 2,
+        "record_screen_drop must attribute syn-flood drops to the ingress zone"
+    );
+    assert_eq!(trust.icmp_flood_events, 1);
+    assert_eq!(
+        trust.udp_flood_events, 0,
+        "udp-flood happened on a different zone"
+    );
+
+    let untrust = snap
+        .iter()
+        .find(|s| s.zone_id == UNTRUST)
+        .expect("untrust zone must have per-zone flood counts");
+    assert_eq!(untrust.udp_flood_events, 1);
+    assert_eq!(untrust.syn_flood_events, 0);
+
+    // The aggregate is unchanged by the per-zone work: all six drops counted.
+    assert_eq!(counters.screen_drops, 6);
+}
 
 #[test]
 fn syn_cookie_counters_hot_path_accumulate_in_batch() {

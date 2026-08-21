@@ -27,7 +27,7 @@ converged, the fork resolved as recommended:
   `pkg/cli`, and `pkg/grpcapi`. (The `pkg/api` half of that pin was replaced by
   `zone_counters_metrics_test.go` when #3651 restored the metrics — see below.)
 
-- **POPULATE traffic (§5A) SHIPPED under #3651; per-zone flood still deferred.**
+- **POPULATE (§5A) SHIPPED IN FULL under #3651 — traffic first, then flood.**
   This document is its design of record. The Rust helper now accounts per-zone
   ingress/egress packet+byte volume on the forward hot path (flat `[u8; 65536]`
   zone-id → slot LUT + per-worker thread-local coalescer in
@@ -54,8 +54,27 @@ converged, the fork resolved as recommended:
   counts it into the `xpf_zone_counters_unpopulated_zones` gauge — explicitly
   "not known", and explicitly not a read error.
 
-  The lower-value per-zone FLOOD half stays deferred (lean on the #3343
-  aggregate). The
+  **The per-zone FLOOD half then shipped too**, closing §5A rather than taking
+  its "recommended narrowing". It follows the same shape, with one deliberate
+  departure from the §5A sketch: the tally is NOT a `fetch_add` at the drop
+  site. §5A reasoned that `record_screen_drop` is "already off the fast path",
+  which is true of the FORWARDING path but not of load — a SYN flood is the
+  primary `screen_drops` trigger, so at attack rate the drop path runs per
+  packet on every worker and a per-ZONE atomic would concentrate every worker on
+  the ONE zone under attack. `stage_screen_check` already documents that
+  constraint for the aggregate (#1187). So the flood half reuses the traffic
+  half's coalesce-then-fold machinery verbatim: flat `[u8; 65536]` LUT (capacity
+  statically asserted equal to the traffic map's, so the two families slot the
+  same zones), per-worker thread-local accumulator, lock-free per-RX-batch fold
+  into per-zone atomics, one pre-summed sparse `zone_flood_counters` block,
+  `ReplaceFloodCounterOffsets` on the Go side, and a `clear_flood_counters` IPC.
+  The tally is invoked from inside `BatchCounters::record_screen_drop` itself,
+  so the aggregate / per-reason / per-zone tallies cannot drift at the many drop
+  sites. Per-zone flood remains CLI/gRPC-only — there is still no per-zone flood
+  REST or Prometheus surface; the #3343 aggregate `xpf_screen_drops_total` by
+  reason stays the alerting surface.
+
+  The
   historical VERIFY-FIRST note below described the pre-#3651 master where the
   userspace dataplane did **not** publish per-zone traffic or flood counters. `ProcessStatus`
   (`pkg/dataplane/userspace/protocol.go`) carries no per-zone block, and the

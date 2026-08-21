@@ -608,7 +608,11 @@ pub(super) fn stage_screen_check(
                     reason,
                     event_now_ns_from_secs(now_secs),
                 );
-                counters.record_screen_drop(reason);
+                counters.record_screen_drop(
+                    reason,
+                    zone_id,
+                    &worker_ctx.forwarding.flood_counter_slot_map,
+                );
                 return StageOutcome::RecycleAndContinue;
             }
         };
@@ -646,7 +650,11 @@ pub(super) fn stage_screen_check(
                         reason,
                         event_now_ns_from_secs(now_secs),
                     );
-                    counters.record_screen_drop(reason);
+                    counters.record_screen_drop(
+                        reason,
+                        zone_id,
+                        &worker_ctx.forwarding.flood_counter_slot_map,
+                    );
                     StageOutcome::RecycleAndContinue
                 }
             }
@@ -686,7 +694,11 @@ pub(super) fn stage_screen_check(
                 reason,
                 event_now_ns_from_secs(now_secs),
             );
-            counters.record_screen_drop(reason);
+            counters.record_screen_drop(
+                reason,
+                zone_id,
+                &worker_ctx.forwarding.flood_counter_slot_map,
+            );
             return StageOutcome::RecycleAndContinue;
         }
     };
@@ -745,7 +757,11 @@ pub(super) fn stage_screen_check(
                     reason,
                     event_now_ns_from_secs(now_secs),
                 );
-                counters.record_screen_drop(reason);
+                counters.record_screen_drop(
+                    reason,
+                    zone_id,
+                    &worker_ctx.forwarding.flood_counter_slot_map,
+                );
                 if reason == "syn-cookie-unavailable" {
                     counters.syn_cookie_secret_unavailable += 1;
                 }
@@ -776,7 +792,11 @@ pub(super) fn stage_screen_check(
                     "syn-cookie",
                     event_now_ns_from_secs(now_secs),
                 );
-                counters.record_screen_drop("syn-cookie");
+                counters.record_screen_drop(
+                    "syn-cookie",
+                    zone_id,
+                    &worker_ctx.forwarding.flood_counter_slot_map,
+                );
                 counters.syn_cookie_challenges += 1;
                 StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge))
             }
@@ -877,7 +897,11 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
                 reason,
                 event_now_ns_from_secs(now_secs),
             );
-            counters.record_screen_drop(reason);
+            counters.record_screen_drop(
+                reason,
+                zone_id,
+                &worker_ctx.forwarding.flood_counter_slot_map,
+            );
             return StageOutcome::RecycleAndContinue;
         }
     };
@@ -903,7 +927,11 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
                 "syn-cookie",
                 event_now_ns_from_secs(now_secs),
             );
-            counters.record_screen_drop("syn-cookie");
+            counters.record_screen_drop(
+                "syn-cookie",
+                zone_id,
+                &worker_ctx.forwarding.flood_counter_slot_map,
+            );
             counters.syn_cookie_ack_invalid += 1;
             StageOutcome::RecycleAndContinue
         }

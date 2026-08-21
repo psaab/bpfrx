@@ -1640,6 +1640,82 @@ fn zone_traffic_counters_wire_roundtrip_and_default_omits() {
     assert_eq!(decoded.zone_traffic_counters[0].egress_bytes, 100);
 }
 
+// #3651: the per-zone FLOOD block round-trips both directions and a default
+// (no per-zone flood data) ProcessStatus omits the layout-version / overflow
+// keys. The Go mirror lives in
+// pkg/dataplane/userspace/zone_flood_counters_status_test.go.
+#[test]
+fn zone_flood_counters_wire_roundtrip_and_default_omits() {
+    // Default helper: no flood data -> version/overflow omitted from the wire.
+    let default_status = ProcessStatus::default();
+    let body = serde_json::to_string(&default_status).expect("serialize default ProcessStatus");
+    assert!(
+        !body.contains("flood_counter_layout_version"),
+        "default ProcessStatus must omit flood_counter_layout_version: {body}"
+    );
+    assert!(
+        !body.contains("flood_counter_overflow_active"),
+        "default ProcessStatus must omit flood_counter_overflow_active: {body}"
+    );
+
+    // Populated block round-trips (Rust encode -> JSON -> Rust decode).
+    let mut status = ProcessStatus::default();
+    status.flood_counter_layout_version = 1;
+    status.flood_counter_overflow_active = true;
+    status.zone_flood_counters = vec![ZoneFloodCounterStatus {
+        zone_id: 40000,
+        syn_flood_events: 11,
+        icmp_flood_events: 22,
+        udp_flood_events: 33,
+    }];
+    let json = serde_json::to_string(&status).expect("serialize populated ProcessStatus");
+    assert!(
+        json.contains("\"zone_flood_counters\""),
+        "the populated flood block must be on the wire under its Go-facing key: {json}"
+    );
+    let back: ProcessStatus = serde_json::from_str(&json).expect("deserialize ProcessStatus");
+    assert_eq!(back.flood_counter_layout_version, 1);
+    assert!(back.flood_counter_overflow_active);
+    assert_eq!(back.zone_flood_counters.len(), 1);
+    let z = &back.zone_flood_counters[0];
+    assert_eq!(z.zone_id, 40000);
+    // Three DISTINCT values, so a decoder that crossed two families (or read
+    // one field into all three) cannot pass.
+    assert_eq!(z.syn_flood_events, 11);
+    assert_eq!(z.icmp_flood_events, 22);
+    assert_eq!(z.udp_flood_events, 33);
+
+    // A Go-style payload (flood fields injected into an otherwise-default
+    // ProcessStatus so every required field is present) decodes into the flood
+    // struct — mirrors the Go encode side / a mixed-version helper.
+    let mut v = serde_json::to_value(ProcessStatus::default()).expect("default to value");
+    v["flood_counter_layout_version"] = serde_json::json!(1);
+    v["zone_flood_counters"] = serde_json::json!([
+        {"zone_id": 7, "syn_flood_events": 2, "icmp_flood_events": 3,
+         "udp_flood_events": 4}
+    ]);
+    let decoded: ProcessStatus =
+        serde_json::from_value(v).expect("decode Go-style flood payload");
+    assert_eq!(decoded.flood_counter_layout_version, 1);
+    assert_eq!(decoded.zone_flood_counters.len(), 1);
+    assert_eq!(decoded.zone_flood_counters[0].zone_id, 7);
+    assert_eq!(decoded.zone_flood_counters[0].syn_flood_events, 2);
+    assert_eq!(decoded.zone_flood_counters[0].icmp_flood_events, 3);
+    assert_eq!(decoded.zone_flood_counters[0].udp_flood_events, 4);
+
+    // #[serde(default)] cross-version safety: a PRE-#3651 helper's status (no
+    // flood keys at all) must still decode, reporting "no per-zone flood data"
+    // rather than failing the whole status decode.
+    let mut old = serde_json::to_value(ProcessStatus::default()).expect("default to value");
+    old.as_object_mut()
+        .expect("status object")
+        .remove("zone_flood_counters");
+    let old_decoded: ProcessStatus =
+        serde_json::from_value(old).expect("a status with no flood keys must still decode");
+    assert_eq!(old_decoded.flood_counter_layout_version, 0);
+    assert!(old_decoded.zone_flood_counters.is_empty());
+}
+
 #[test]
 fn wire_invariant_default_specimens() {
     use serde_json::{Map, Value};
@@ -1724,6 +1800,7 @@ fn wire_invariant_default_specimens() {
     s.insert("userspace_capabilities".into(), dump(&UserspaceCapabilities::default()));
     s.insert("worker_runtime_status".into(), dump(&WorkerRuntimeStatus::default()));
     s.insert("zone_snapshot".into(), dump(&ZoneSnapshot::default()));
+    s.insert("zone_flood_counter_status".into(), dump(&ZoneFloodCounterStatus::default()));
     s.insert("zone_traffic_counter_status".into(), dump(&ZoneTrafficCounterStatus::default()));
     let specimens = Value::Object(s);
 

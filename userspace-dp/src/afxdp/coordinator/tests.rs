@@ -4987,6 +4987,120 @@ fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
     );
 }
 
+#[test]
+fn zone_flood_counters_drops_a_zone_that_lost_its_slot_3651() {
+    // #3651 gate B1: drive the PRODUCTION publication accessor,
+    // `Coordinator::zone_flood_counters`, not the extracted
+    // `publishable_flood_rows` primitive. The primitive tests in
+    // flood_counters.rs prove the filter; they do NOT prove the coordinator
+    // calls it, so THREE distinct over-reaches introduced HERE compile and
+    // leave the entire Rust suite green:
+    //
+    //   1. `|zone_id| configured.contains_key(&zone_id)` -> `|_| true`
+    //      (publishes unconfigured zones). Made likelier by the accessor's own
+    //      doc calling that filter "defence in depth", which invites a trim.
+    //   2. a blanket `if overflow_active { return Vec::new(); }` -- verbatim
+    //      the #6843 gate F1 over-reach, one plane over. Runtime consequence:
+    //      at >=64 configured zones the ENTIRE per-zone flood surface vanishes
+    //      and `show security screen ids-option statistics` reports
+    //      "not available" for every zone.
+    //   3. passing `FloodCounterSlotMap::default()` instead of the live map
+    //      (publishes nothing).
+    //
+    // This is the exact asymmetry #6843 closed on the traffic half: the Go
+    // call site was bound by TestSyncBPFCountersReplacesFloodOffsetsAcrossPolls3651,
+    // the Rust one was not. Mirrors
+    // `zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843` above.
+    use crate::afxdp::flood_counters::{
+        flush_recorded_flood_counters, record_zone_flood_drop, FloodCounterSlotMap,
+        FLOOD_COUNTER_ASSIGNABLE_SLOTS,
+    };
+    const Z: u16 = 50675; // config::StableZoneID("trust")
+
+    let mut coord = Coordinator::new();
+
+    // Apply 1: Z alone, holding a slot, tripping a flood check.
+    let map1 = FloodCounterSlotMap::build(&[Z], &coord.forwarding.flood_counter_store);
+    record_zone_flood_drop(&map1, Z, "syn-flood");
+    flush_recorded_flood_counters(&coord.forwarding.flood_counter_store, &map1);
+    coord.forwarding.flood_counter_slot_map = std::sync::Arc::new(map1);
+    coord.forwarding.zone_id_to_name.insert(Z, "trust".to_string());
+
+    let published = coord.zone_flood_counters();
+    assert!(
+        published.iter().any(|r| r.zone_id == Z),
+        "apply 1: the coordinator must publish a slotted zone with flood events \
+         (a default/empty slot map publishes nothing): {published:?}"
+    );
+
+    // Apply 2: enough lower ids to exhaust capacity. Z stays CONFIGURED and
+    // keeps its retained counts, but loses its slot.
+    let mut ids: Vec<u16> = (1..=(FLOOD_COUNTER_ASSIGNABLE_SLOTS as u16)).collect();
+    ids.push(Z);
+    for id in &ids {
+        coord
+            .forwarding
+            .zone_id_to_name
+            .insert(*id, format!("z{id}"));
+    }
+    let map2 = FloodCounterSlotMap::build(&ids, &coord.forwarding.flood_counter_store);
+    assert_eq!(map2.slot_of(Z), 0, "Z must lose its slot in apply 2");
+    assert!(map2.overflow_active, "apply 2 must set overflow_active");
+    coord.forwarding.flood_counter_slot_map = std::sync::Arc::new(map2);
+
+    // The store still retains Z's counts -- assert it, so this test cannot pass
+    // because the data vanished for an unrelated reason.
+    assert!(
+        coord
+            .forwarding
+            .flood_counter_store
+            .snapshot()
+            .iter()
+            .any(|r| r.zone_id == Z),
+        "precondition: the store must still retain Z's flood counts"
+    );
+
+    // Trip a flood check on a zone that KEPT its slot in apply 2, so the
+    // assertions below constrain both directions.
+    const SURVIVOR: u16 = 1;
+    let survivor_map = FloodCounterSlotMap::build(&ids, &coord.forwarding.flood_counter_store);
+    record_zone_flood_drop(&survivor_map, SURVIVOR, "udp-flood");
+    flush_recorded_flood_counters(&coord.forwarding.flood_counter_store, &survivor_map);
+
+    let published = coord.zone_flood_counters();
+    assert!(
+        !published.iter().any(|r| r.zone_id == Z),
+        "the coordinator kept publishing a zone that lost its slot: its count can \
+         never advance again, so the screen-statistics surface would report a \
+         FROZEN flood total that under-reports every subsequent attack: {published:?}"
+    );
+    // Gate (a), the over-reach half: without this, a coordinator-level blanket
+    // `if overflow_active { return Vec::new() }` -- or a default slot map --
+    // satisfies the assertion above and escapes the WHOLE suite. The primitive
+    // sibling test that exists to stop exactly that over-reach drives
+    // `publishable_flood_rows` directly, so it cannot see an over-reach
+    // introduced HERE.
+    assert!(
+        published.iter().any(|r| r.zone_id == SURVIVOR),
+        "a zone that KEPT its slot stopped publishing once overflow became \
+         active: the filter must drop only the zones that lost their slot, not \
+         everything: {published:?}"
+    );
+
+    // Gate (b): bind the coordinator's CONFIGURED predicate too. Dropping it
+    // (`|_| true`) is the mirror of the over-reach above -- the accessor's doc
+    // calls it defence in depth (apply-time `reconcile` prunes unconfigured
+    // zones), so it is documented as load-bearing at the call site and gets a
+    // test rather than an unbound claim.
+    coord.forwarding.zone_id_to_name.remove(&SURVIVOR);
+    let published = coord.zone_flood_counters();
+    assert!(
+        !published.iter().any(|r| r.zone_id == SURVIVOR),
+        "a zone dropped from the configured set kept publishing: the configured \
+         predicate must hold independently of the slot predicate: {published:?}"
+    );
+}
+
 /// #3402: a FRESH-BOOT snapshot ships its zones AND a concrete-zone policy in
 /// the SAME atomic ConfigSnapshot, with the coordinator's live forwarding zone
 /// table still EMPTY (populate_zones(snapshot) runs only later inside

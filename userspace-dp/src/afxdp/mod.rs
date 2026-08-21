@@ -143,6 +143,9 @@ mod umem;
 mod cold_path_hist;
 // #3651: per-zone ingress/egress traffic counters (POPULATE half of #3643).
 mod zone_counters;
+// #3651: per-zone SYN/ICMP/UDP flood-event counters — the flood half of the
+// same POPULATE, accounted on the screen-drop path rather than the forward path.
+mod flood_counters;
 // Clean-room WireGuard tunnel termination — see
 // docs/pr/wireguard-clean/plan.md. Engine + tests only in this PR;
 // hot-path activation lands in a follow-up.
@@ -788,13 +791,27 @@ impl BatchCounters {
     /// "syn-cookie", "icmp-fragment", "ip-malformed") are surfaced only through
     /// the aggregate. Centralizing here keeps the aggregate and per-reason
     /// tallies from drifting at the many drop sites.
+    ///
+    /// #3651: also feeds the PER-ZONE flood tally (`flood_counters`) for the
+    /// three flood checks, which is why `zone_id` and the flood slot map are
+    /// parameters. Routing it through this one method rather than a second call
+    /// at each drop site extends the same anti-drift property: a new screen drop
+    /// site cannot bump the aggregate while forgetting the per-zone counters.
+    /// `zone_id` is the packet's INGRESS zone (0 = unzoned, uncounted); a
+    /// non-flood reason or a zone with no hot-path slot contributes nothing.
     #[inline]
-    pub(in crate::afxdp) fn record_screen_drop(&mut self, reason: &str) {
+    pub(in crate::afxdp) fn record_screen_drop(
+        &mut self,
+        reason: &str,
+        zone_id: u16,
+        flood_slots: &crate::afxdp::flood_counters::FloodCounterSlotMap,
+    ) {
         self.touched = true;
         self.screen_drops += 1;
         if let Some(i) = crate::screen::screen_reason_drop_index(reason) {
             self.screen_reason_drops[i] += 1;
         }
+        crate::afxdp::flood_counters::record_zone_flood_drop(flood_slots, zone_id, reason);
     }
 
     /// #4520: attribute a NAT64 forward-flow source-allocation failure to the
