@@ -835,6 +835,164 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_refill_under_contention_neither_over_nor_under_grants_6307() {
+        // #6307 fail-on-revert: the bundled
+        // `concurrent_meter_is_lock_free_and_preserves_trTCM_thresholds` pins
+        // `now_ns = 0`, so it exercises only the consume `compare_exchange_weak`
+        // under contention — the REFILL path (the win-the-window timestamp CAS
+        // plus the #4261 sub-byte rewind composing across concurrent partial
+        // windows) never runs there, and that is the actual over-grant hazard
+        // of the lock-free design. This test advances the clock while N threads
+        // meter, so refills and consumes race.
+        //
+        // SHARED-BUDGET LOOP (not equal per-thread iteration counts): every op
+        // claims its timestamp from one `fetch_add` clock and threads race until
+        // the shared budget is exhausted, so a fast thread simply takes more ops
+        // and a descheduled thread cannot shorten the run. Total simulated time
+        // is therefore EXACTLY `T_MAX_NS` no matter how the scheduler
+        // interleaves, which is what makes the ceiling below deterministic.
+        //
+        // Ceiling arithmetic (committed bucket binds; see below):
+        //   CBS = 50_000 B initial burst
+        //   + CIR x T_MAX_NS / 1e9 = 1e6 x 0.175 = 175_000 B refilled
+        //   = 225_000 B of green budget over the whole run.
+        // Offered load is 250_000 x 100 B = 25_000_000 B, i.e. ~100x the supply,
+        // so the committed bucket is drained continuously: it never re-saturates
+        // (a saturated bucket would silently discard grants and blur the
+        // ceiling) and it ends holding less than one packet.
+        //
+        // STEP_NS = 700 with CIR = 1e6 B/s accrues 0.7 B per op, so most ops
+        // grant NOTHING and `compute_refill_add` must carry the sub-byte credit
+        // across ops via its `last_refill_ns` rewind — the #4261 dust path, here
+        // composed across concurrent partial windows.
+        //
+        // The peak bucket never binds: PIR = 1e9 B/s regrants 700 B per 700 ns
+        // step against a 100 B debit, so `peak >= cost` always holds and a
+        // packet is Green exactly when the COMMITTED bucket covers it. Packets
+        // that miss committed fall to Yellow (they are not counted).
+        use std::sync::Barrier;
+
+        const THREADS: usize = 8;
+        const PKT: u64 = 100;
+        const STEP_NS: u64 = 700;
+        const OPS: u64 = 250_000;
+        const T_MAX_NS: u64 = OPS * STEP_NS;
+        const CIR: u64 = 1_000_000;
+        const CBS: u64 = 50_000;
+        const PIR: u64 = 1_000_000_000;
+        const PBS: u64 = 5_000_000;
+
+        let policer = Arc::new(tr_tcm(CIR, CBS, PIR, PBS, true));
+        // Prime both refill clocks at t=0 from ONE thread. Without this the
+        // first thread to reach `refill()` stamps `last_refill_ns` at ITS
+        // timestamp and the window [0, that timestamp) is never granted, which
+        // would make the ceiling scheduler-dependent. Priming also opens PKT
+        // bytes of headroom in the committed bucket so the very first
+        // concurrent refill has somewhere to land (no start-of-run saturation
+        // loss). Its 100 green bytes are counted in the total below.
+        assert_eq!(
+            policer.meter(0, PKT, PacketColor::Green).color,
+            PacketColor::Green,
+            "the priming meter must be Green (the bucket starts at CBS)"
+        );
+
+        let clock = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let p = Arc::clone(&policer);
+            let clock = Arc::clone(&clock);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut green_bytes = 0u64;
+                let mut ops = 0u64;
+                // How many of this thread's ops saw the shared clock move by
+                // more than its own step since its previous op — i.e. observed
+                // another thread's advance. This is the achieved-contention
+                // RATE, reported below; 0 means the run degenerated to serial
+                // execution and the race was never exercised.
+                let mut interleaved = 0u64;
+                let mut prev_ns = 0u64;
+                barrier.wait();
+                loop {
+                    let now_ns = clock.fetch_add(STEP_NS, Ordering::Relaxed) + STEP_NS;
+                    if now_ns > T_MAX_NS {
+                        break;
+                    }
+                    if ops > 0 && now_ns != prev_ns + STEP_NS {
+                        interleaved += 1;
+                    }
+                    prev_ns = now_ns;
+                    ops += 1;
+                    if p.meter(now_ns, PKT, PacketColor::Green).color == PacketColor::Green {
+                        green_bytes += PKT;
+                    }
+                }
+                (green_bytes, ops, interleaved)
+            }));
+        }
+        let results: Vec<(u64, u64, u64)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let total_green: u64 = PKT + results.iter().map(|r| r.0).sum::<u64>();
+        let total_ops: u64 = results.iter().map(|r| r.1).sum();
+        let interleaved: u64 = results.iter().map(|r| r.2).sum();
+
+        // The shared-budget loop must have consumed exactly the budget — this
+        // pins T_MAX_NS as the real elapsed window the ceiling is computed from.
+        assert_eq!(
+            total_ops, OPS,
+            "the shared timestamp budget must be fully consumed exactly once"
+        );
+        eprintln!(
+            "#6307 refill-under-contention: {total_ops} ops / {THREADS} threads, \
+             per-thread ops {:?}, {interleaved} ops ({:.1}%) observed a foreign \
+             clock advance, {total_green} B green admitted",
+            results.iter().map(|r| r.1).collect::<Vec<_>>(),
+            100.0 * interleaved as f64 / total_ops as f64,
+        );
+
+        let refilled = CIR * T_MAX_NS / 1_000_000_000;
+        let ceiling = CBS + refilled;
+
+        // NO OVER-GRANT. A refill window credited twice (the losing side of the
+        // `last_refill_ns` compare_exchange adding tokens anyway) admits green
+        // bytes the aggregate CIR/CBS contract never issued.
+        assert!(
+            total_green <= ceiling,
+            "over-grant under concurrent refill: admitted {total_green} B green \
+             but the CBS + CIR*T budget is only {ceiling} B \
+             (CBS {CBS} + {refilled} refilled over {T_MAX_NS} ns)"
+        );
+
+        // NO LOST REFILL. Demand is ~100x supply, so a correct meter ends with
+        // less than one packet of committed credit unspent. Slack accounts for
+        // that residue (<PKT), the at-most-one-byte of sub-byte dust still owed
+        // at T_MAX_NS, and one packet of margin. A dropped refill (e.g. the
+        // window winner abandoning its credit add when the packed-credits CAS
+        // loses) starves the policer by far more than this.
+        const SLACK: u64 = 3 * PKT;
+        assert!(
+            total_green + SLACK >= ceiling,
+            "starved under concurrent refill: admitted only {total_green} B \
+             green against a {ceiling} B budget (CBS {CBS} + {refilled} \
+             refilled over {T_MAX_NS} ns) — a refill was lost"
+        );
+
+        // Non-vacuity, checked LAST so a real over/under-grant is reported
+        // first: with 8 threads over 250_000 ops this floor of ONE observed
+        // foreign advance is many orders of magnitude below the measured
+        // 99.4-99.7%, so it fires only if the run degenerated to strictly
+        // serial execution — in which case the two assertions above proved
+        // nothing about the refill race and the result must not read as
+        // covered.
+        assert!(
+            interleaved > 0,
+            "no op observed another thread's clock advance: the threads ran \
+             serially and the refill race was never exercised"
+        );
+    }
+
+    #[test]
     fn meter_hot_path_takes_no_shared_mutex_source_guard() {
         // #5390 fail-on-revert source guard: bind the metered hot path to the
         // lock-free design. A revert to `Mutex<ThreeColorPolicerState>` +
