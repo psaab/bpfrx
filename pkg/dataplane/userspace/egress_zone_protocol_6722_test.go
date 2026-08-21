@@ -152,7 +152,7 @@ func TestEgressZoneProtocolGateIsWiredIntoTheOrchestrator_6722(t *testing.T) {
 
 	// A config with none of the sibling gates' shapes, so any error can only
 	// come from the egress-zone gate.
-	err := m.ensureRequiredSnapshotProtocolLocked(&config.Config{})
+	err := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, &config.Config{}))
 	if err == nil {
 		t.Fatalf("ensureRequiredSnapshotProtocolLocked accepted a pre-v5 helper; " +
 			"the egress-zone gate is not wired into the orchestrator, so nothing " +

@@ -41,12 +41,14 @@ import (
 //     the defect is that a config WITH RBAC configured reaches it. That
 //     compounds with the #6701 identity fix in the permissive direction, which
 //     is why the two ship together;
-//   - an empty class permission set maps to the coarse `{none}` bucket, and the
-//     `deny-commands` / `deny-configuration` advisory at
-//     loginClassAdvisoryWarnings is guarded on `lc.DenyCommands != ""` — the
-//     very warning that tells the operator the class is MORE PERMISSIVE than
-//     the Junos source never fires, because the field the bug dropped is the
-//     one the guard reads;
+//   - an empty class permission set maps to the coarse `{none}` bucket, and a
+//     dropped `deny-commands` / `deny-configuration` never reaches the #5831
+//     gate: that gate reads LoginClass.DenyLeavesPresent, which the packed drop
+//     leaves empty, so the commit it would have REFUSED is accepted and the
+//     restriction the operator wrote is silently discarded. (Before #5831 the
+//     same drop instead suppressed a MORE PERMISSIVE advisory; the gate
+//     replaced that advisory, but the field the bug empties is still the one
+//     the check reads.);
 //   - a dropped `authentication` block leaves the account with no key and no
 //     password.
 //
@@ -172,8 +174,8 @@ func loginPackedConsequence(keyword string) string {
 			"cleartext)"
 	case "class":
 		return "the class compiles with NO permissions and NO allow/deny regexes, so it " +
-			"grants nothing and the commit advisory that would flag a dropped deny-commands " +
-			"as MORE PERMISSIVE than the source config never fires"
+			"grants nothing and a dropped deny-commands / deny-configuration never reaches " +
+			"the #5831 gate that would refuse the commit outright"
 	}
 	return "the instance compiles with an EMPTY body"
 }

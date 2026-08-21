@@ -2063,7 +2063,7 @@ additive *in meaning* (an old reader that ignores it still enforces
 exactly what it enforced before) does not need a bump; a field that
 changes what a rule COVERS does.
 
-**Why it is at 4.** #4626 gave a scoped global policy a zone-SET scope in
+**Why it went to 4.** #4626 gave a scoped global policy a zone-SET scope in
 the plural `match_from_zones`/`match_to_zones` fields, made them
 authoritative, and left the singular `match_from_zone`/`match_to_zone`
 carrying only the FIRST element — but did not bump the version. A
@@ -2075,6 +2075,28 @@ that reports agreement while the two sides disagree about the message.
 The invariant #5488 records is that **a compatibility extension which
 changes deny/reject COVERAGE must not be silently ignorable under an
 unchanged protocol version.**
+
+**Why it is at 6.** #5619/#6691 added
+`InterfaceSnapshot.secure_tunnel`, and made it AUTHORITATIVE over AF_XDP
+binding admission: `include_userspace_binding_interface`
+(`userspace-dp/src/server/helpers/planning.rs`) refuses a candidate on
+it, so a route-based IPsec xfrmi never becomes a binding candidate. A
+helper that predates the field leaves it `false` and plans the xfrmi
+anyway — and that is not a lost optimisation. The planner's queue count
+is the GLOBAL MINIMUM across candidates
+(`replan_bindings_from_candidates`), and an xfrm interface has exactly
+ONE RX queue: `ip -d link` reports `numrxqueues 1` and
+`/sys/class/net/<if>/queues` holds a single `rx-0`, which is the entry
+BOTH `userspaceRXQueueCount` (Go, `interfaces.go`) and `rx_queue_count`
+(Rust) count. So one ignored flag re-plans EVERY physical interface on
+the box onto one queue and one worker — the #3091 single-worker
+regression, arriving through a door #3091 did not name (it named the
+1-queue VLAN child, which the same function already re-keys onto its
+parent for exactly this reason). Nothing about the bytes is malformed,
+so neither the version-equality check nor the snapshot content hash can
+see it; only the reader is wrong. That is the same shape as the v4 case
+— a new field that changes how existing bytes behave needs the version,
+not just a new JSON tag.
 
 **The bump is paired with a fail-closed gate.** On its own, a bump only
 makes an old helper *refuse* the snapshot — and a refused snapshot leaves
@@ -2100,6 +2122,128 @@ covers both directions of misrepresentation — narrowing a `deny`/`reject`
 global emits neither side, so neither can be narrowed by a singular-only
 reader and neither is gated; that keeps the disarm blast radius to
 exactly the misrepresentable population.
+
+**Why it went 5 -> 6 -> 7 inside the same PR.** #6691 round 8 shipped v5 with a
+refused-netdev index that refused a netdev as soon as ANY row was unbindable for
+it; round 9 replaced that with EVERY-owner unanimity. Those two readers accept
+identical bytes and plan DIFFERENT bindings — a round-8 v5 helper drops a zoned
+VLAN sibling of a flagged parent where a round-9 v5 helper keeps it. A version
+whose meaning depends on which round produced the binary is not a version, so it
+moved. Round 10 then moved it again, for a NEW FIELD:
+`FabricSnapshot.parent_unbindable`. None of 5, 6 or 7 has ever shipped (#6691 is
+unmerged), so the bumps cost nothing, and the Go-side assertion is now an
+EQUALITY (`ProtocolVersion != secureTunnelSnapshotProtocolVersion`) rather than
+`> 4`, which stayed green at the colliding value.
+
+**What v7 adds, and why a row-derived index was not enough.** The unanimity rule
+is only as good as its enumeration of OWNERS, and a unanimity over an EMPTY
+bucket answers "not refused" — right when nothing emits the netdev, catastrophic
+when something does and was not counted. A fabric MEMBER needs no interface
+stanza: `set interfaces fab0 fabric-options member-interfaces ge-0/0/0` pushes
+that netdev into the ingress-adjudication map and the RSS allowlist (and into the
+Rust candidate loop) with ZERO interface rows owning it. Measured on the round-9
+head with a live-xfrm `ge-0-0-0`: `rows OWNING ge-0-0-0: 0`, both `refuses*`
+false, the netdev present in both sets. Round 9's four fabric guards asked the
+right question of an oracle that could not answer it.
+
+Round 10 fixed the ORACLE rather than the loops, which are unchanged. An emitted
+fabric parent IS an owner of its netdev, so it carries a verdict —
+`fabricParentUnbindable` (`pkg/dataplane/userspace/fabric.go`), which hands a
+synthetic row to the SAME `netdevExclusionClasses` table an interface row is
+judged by, so a class added there covers fabric parents automatically — and it is
+tallied like any other owner. Being ownerless is NOT itself a refusal: the
+reference cluster authors exactly this stanza with no row for the member, so
+refusing on absence would strip the fabric parent out of every cluster this
+project runs. The verdict rides the wire because the Rust plane cannot recompute
+it: half the evidence is a Go-side RTM_GETLINK dump of kernel link kinds. That
+dump is also now taken ONCE per snapshot and shared by the row builder and the
+fabric builder, so two samples of a changing kernel cannot put one netdev's
+owners on opposite sides of the unanimity.
+
+**Round 11: one device, one verdict.** Round 10 rested on an invariant it stated
+and did not have — that a BASE row and a fabric parent on the same netdev never
+disagree, "since production computes both from identical config fields and the
+same kernel sample". Two ways to produce the disagreement were then measured, and
+because the unanimity rule reads a disagreement as an ADMISSION, each was a
+fail-open on a netdev the only row describing it had refused:
+
+- **A canonical alias.** `LinuxIfName` maps `/` to `-` and nothing else, so
+  `gr-0/0/3` and `gr-0-0-3` are one device under two authored names — and both
+  are legal, because a fabric member MUST be slot-spelled with slashes for
+  `InterfaceSlot` to resolve it to a node while the interface stanza's name is a
+  wildcard. `validateInterfaceNameCollisionStrict` cannot object: it compares
+  authored interface-map KEYS and there is only one. The verdict's exact map
+  lookup missed the stanza's `tunnel` and voted bindable against an unbindable
+  row. Fixed by keying the lookup on the NETDEV (`interfaceConfigForNetdev`).
+- **A re-sampled kernel.** `SyncFabricState` rebuilds the fabric rows from a
+  FRESH xfrm sample and writes them back beside interface rows that only a full
+  build re-derives. Neither plane replans on that path (`update_fabrics` swaps
+  `snapshot.fabrics` in place; `replan_queues` runs only from the apply path), so
+  the next partial republish shipped a verdict the Go ingress map had never seen
+  — and an ifindex in that map with no READY binding is `drop_degraded_transit`.
+  Fixed by `alignFabricVerdicts`: the refresh carries MACs, ifindexes and link
+  state, and the VERDICT stays the applied snapshot's until a new one is applied,
+  which is the only moment both planes recompute together.
+
+Fixing both would still leave the next such divergence a fail-open, so the RULE
+changed too: **a fabric parent votes only where no interface row owns the
+netdev** (`snapshotNetdevVotes`, mirrored by the `owners == 0` guard in Rust's
+`snapshot_refuses_parent_netdev`). That preserves round 9 exactly for row-owned
+netdevs and round 10 exactly for ownerless ones, and it is never less refusing
+than either — suppressing a bindable fabric vote can only turn "not refused" into
+"refused". The disagreements the rule still tolerates are between a UNIT row and
+its base, which is the case the round-9 argument was actually about.
+
+The secure-tunnel bump carries the matching gate,
+`ensureSecureTunnelProtocolLocked`, with sentinel
+`ErrSecureTunnelProtocolIncompatible` (also registered in
+`requiredProtocolGateSentinels`). It arms off
+`snapshotRequiresRefusalProtocol`, which reads the SNAPSHOT the caller is
+publishing rather than re-deriving it.
+
+Its scope is derived from the SAME enumeration the verdicts are
+(`snapshotNetdevVotes`), and that is a round-11 repair with a specific cause:
+round 10 added a second producer of verdicts and taught the tally about it by
+hand, while the gate kept its own walk of `snap.Interfaces` — so the gate was
+silent for exactly the verdict the v7 bump exists for. An ownerless xfrm fabric
+parent shipped a v7 snapshot to a v6 helper, which refuses it on the
+exact-equality version check, and the commit reported success while the helper
+stayed armed on a plan that binds the refused netdev. Each contributor now
+declares for itself whether its verdict needs the wire, and
+`TestEveryNetdevProducerIsEnumerated` zeroes each snapshot section in turn to
+DISCOVER producers — a section that changes the emitted netdev set but not the
+enumeration reds under its own field name, so a third producer cannot repeat
+this. Round 8 hand-mirrored the builder's walk here and claimed the
+two "cannot diverge"; a review round measured them diverging, because the mirror
+took a SECOND RTM_GETLINK dump and an xfrm device visible to the builder and gone
+by the gate produced a flagged snapshot with a silent gate — the pre-v6 helper
+stayed armed on its previous-good image. Reading the rows makes "arms iff the
+snapshot carries a flagged row" true by construction, and costs no dump at all. Since #6691 round 8 the flag has TWO
+halves — config ownership (`Config.SecureTunnelNetdevForRef`) and the
+kernel's link kind (`liveXfrmNetdevs`) — because a stale live xfrmi is exactly
+the case an operator cannot fix by editing the config. Scoped that way, an
+operator with neither route-based IPsec nor a leftover xfrm device is never
+blocked by a helper-version mismatch that cannot affect them. The kernel half
+costs one `RTM_GETLINK` dump per SNAPSHOT BUILD (the builder, once, for all
+rows) — not one per gate call, and the gate itself takes none. That dump no
+longer discards a partial result: netlink returns the links it did deserialize
+together with `ErrDumpInterrupted`, and round 8's `if err != nil { return nil }`
+threw away real evidence including the xfrm device itself.
+
+**The gate arms on an OBSERVED version, never on the absence of one** (#6691
+round 10). `lastStatus.ConfigSnapshotProtocolVersion == 0` is two states with
+opposite verdicts — "no helper has ever answered" (nothing to be incompatible
+with) and "a helper answered without the field" (genuinely too old) — and the
+value alone cannot separate them, so the observation is recorded explicitly:
+`setLastStatusLocked` / `clearLastStatusLocked` move `lastStatus` and
+`helperStatusObserved` together at every assignment site, and the gate returns
+nil when nothing has ever been observed. Without it the gate armed on silence,
+which is reachable: the deferred-worker arm
+(`manager_worker_arm_5134.go`) calls `ensureRequiredSnapshotProtocolLocked`
+BEFORE any helper liveness check, so a pending-XSK re-apply attempted while the
+helper was down disarmed the dataplane and aborted the commit on a reading that
+never happened. The three sibling required-protocol gates keep the older
+behaviour pending #7002, which has to weigh each one's own fail-closed argument.
 
 If the disarm ITSELF fails, the helper is still armed on its
 previous-good snapshot — and on a publish path whose classifier BPF maps

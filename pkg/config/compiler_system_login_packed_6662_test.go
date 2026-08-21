@@ -79,11 +79,16 @@ func mustReject(t *testing.T, err error, marker, what string) {
 // ---------------------------------------------------------------------------
 
 // TestLoginNestedCompilesCorrectly_6662 is the baseline: the block spelling
-// carries every leaf through, INCLUDING the ones whose downstream warnings are
-// guarded on non-emptiness. Asserting the deny-commands advisory fires is the
-// point — that advisory (`if lc.DenyCommands != ""`, loginClassAdvisoryWarnings)
-// is one of the safety nets the packed drop silently disabled, so a test that
-// only checked struct fields would miss half of what the bug cost.
+// carries every leaf through.
+//
+// The fixture carries no deny-* leaf, and that is a #5831 consequence, not an
+// oversight: those two leaves are now hard-REJECTED at commit
+// (validateLoginClassDenyStrict), so a fixture carrying one can no longer be a
+// positive control for "this spelling compiles". Their carry-through moved to
+// TestLoginNestedCarriesDenyLeaves_6662 below, which drives the same nested
+// spelling through the tolerant path where the class is folded rather than
+// refused. Splitting them keeps BOTH properties bound; deleting the leaves
+// outright would have dropped the second one.
 // ROLE: POSITIVE CONTROL — the shape that must keep working. Measured, not assumed: disabling
 // validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
 // review r11), so it binds no gate behaviour and must not be counted as gate
@@ -95,8 +100,6 @@ func TestLoginNestedCompilesCorrectly_6662(t *testing.T) {
 			class ops {
 				permissions [ view configure ];
 				idle-timeout 30;
-				deny-commands "request system zeroize";
-				deny-configuration "system login";
 				allow-commands "show .*";
 			}
 			user alice {
@@ -132,12 +135,6 @@ func TestLoginNestedCompilesCorrectly_6662(t *testing.T) {
 	if lc.IdleTimeout != 30 {
 		t.Errorf("IdleTimeout = %d, want 30", lc.IdleTimeout)
 	}
-	if lc.DenyCommands != "request system zeroize" {
-		t.Errorf("DenyCommands = %q, want \"request system zeroize\"", lc.DenyCommands)
-	}
-	if lc.DenyConfiguration != "system login" {
-		t.Errorf("DenyConfiguration = %q, want \"system login\"", lc.DenyConfiguration)
-	}
 	if lc.AllowCommands != "show .*" {
 		t.Errorf("AllowCommands = %q, want \"show .*\"", lc.AllowCommands)
 	}
@@ -156,20 +153,98 @@ func TestLoginNestedCompilesCorrectly_6662(t *testing.T) {
 		t.Errorf("EncryptedPassword = %q, want the configured hash", u.EncryptedPassword.Reveal())
 	}
 
-	// The safety net the packed drop disabled: deny-* is not enforced by xpf's
-	// coarse RBAC, so the class is MORE PERMISSIVE than the Junos source and
-	// the operator must be told. The warning is guarded on DenyCommands != "".
+	// The safety net the packed drop disabled. It used to be the "MORE
+	// PERMISSIVE" deny-commands advisory; #5831 replaced that advisory with a
+	// hard rejection, so what a dropped body costs is now measured on the
+	// leaves this fixture still carries — the #4304 per-class advisory, which
+	// only fires because the class survived the nested spelling at all.
 	var advisory string
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "MORE PERMISSIVE") {
+		if strings.Contains(w, `system login class "ops"`) && strings.Contains(w, "recognized (custom RBAC)") {
 			advisory = w
 		}
 	}
 	if advisory == "" {
-		t.Fatalf("the deny-commands MORE PERMISSIVE advisory did not fire; warnings: %v", cfg.Warnings)
+		t.Fatalf("the #4304 per-class advisory did not fire; warnings: %v", cfg.Warnings)
 	}
-	if !strings.Contains(advisory, "deny-commands") || !strings.Contains(advisory, "deny-configuration") {
-		t.Errorf("advisory does not name both deny leaves: %q", advisory)
+	if !strings.Contains(advisory, "allow-commands") {
+		t.Errorf("advisory does not name the recognized-but-unenforced leaf the fixture "+
+			"carries: %q", advisory)
+	}
+}
+
+// TestLoginCarriesDenyLeavesBothShapes_6662 holds the half that moved out of
+// the two positive controls when #5831 made deny-* a commit rejection.
+//
+// Both spellings must still carry the restrictive leaves into the typed class —
+// value AND presence — because that is exactly what the packed-body bug
+// destroyed, and because a #5831 gate reading DenyLeavesPresent is only ever as
+// good as the parse that fills it. Compiled through the tolerant path (the
+// peer-sync / persisted-load ingress) because the strict path now refuses the
+// config outright; that rejection is the #5831 suite's job, not this file's.
+//
+// Running BOTH shapes is the point: DenyLeavesPresent is populated off
+// prop.Name() from the loginClassLeafRestrictive table, and the two AST shapes
+// reach that switch by different routes (a nested block child vs a flat-set
+// leaf), so a one-shape test would leave half the parse unbound.
+// ROLE: POSITIVE CONTROL — the leaves the packed drop silently emptied.
+func TestLoginCarriesDenyLeavesBothShapes_6662(t *testing.T) {
+	t.Run("nested", func(t *testing.T) {
+		cfg, err := compileLogin6662Lenient(t, `system {
+			login {
+				class ops {
+					permissions [ view configure ];
+					deny-commands "request system zeroize";
+					deny-configuration "system login";
+				}
+			}
+		}`)
+		if err != nil {
+			t.Fatalf("tolerant compile must not reject a previously-accepted config (#1960): %v", err)
+		}
+		assertOpsCarriesDenyLeaves6662(t, cfg)
+	})
+
+	t.Run("flat-set", func(t *testing.T) {
+		tree := &ConfigTree{}
+		for _, l := range []string{
+			"set system login class ops permissions [ view configure ]",
+			`set system login class ops deny-commands "request system zeroize"`,
+			`set system login class ops deny-configuration "system login"`,
+		} {
+			path, err := ParseSetCommand(l)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", l, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%v): %v", path, err)
+			}
+		}
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("tolerant compile must not reject a previously-accepted config (#1960): %v", err)
+		}
+		assertOpsCarriesDenyLeaves6662(t, cfg)
+	})
+}
+
+func assertOpsCarriesDenyLeaves6662(t *testing.T, cfg *Config) {
+	t.Helper()
+	if cfg.System.Login == nil || len(cfg.System.Login.Classes) != 1 {
+		t.Fatalf("got %+v, want exactly one class", cfg.System.Login)
+	}
+	lc := cfg.System.Login.Classes[0]
+	if lc.DenyCommands != "request system zeroize" {
+		t.Errorf("DenyCommands = %q, want \"request system zeroize\"", lc.DenyCommands)
+	}
+	if lc.DenyConfiguration != "system login" {
+		t.Errorf("DenyConfiguration = %q, want \"system login\"", lc.DenyConfiguration)
+	}
+	// Presence is what the gate actually reads, and it is recorded separately
+	// from the value (a quoted-empty regex is the most restrictive thing an
+	// operator can write and flattens to the same "").
+	if got := strings.Join(lc.DenyLeavesPresent, ","); got != "deny-commands,deny-configuration" {
+		t.Errorf("DenyLeavesPresent = %q, want both leaves recorded in config order", got)
 	}
 }
 
@@ -332,6 +407,11 @@ func TestLoginPackedUserRejectionExplainsTheRBACCost_6662(t *testing.T) {
 // this, a gate keyed on "the instance node carries extra tokens" that got the
 // identity-key count wrong would reject every `set system login ...` line and
 // brick config authoring, while the reject-table above stayed green.
+//
+// Carries no deny-* line for the same #5831 reason as the nested control above:
+// those leaves are refused at commit now, so they cannot appear in a fixture
+// whose job is to compile. Their flat-set carry-through is bound by
+// TestLoginCarriesDenyLeavesBothShapes_6662.
 // ROLE: POSITIVE CONTROL — the ingress the gate must never touch. Measured, not assumed: disabling
 // validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
 // review r11), so it binds no gate behaviour and must not be counted as gate
@@ -341,7 +421,6 @@ func TestLoginFlatSetStillCompiles_6662(t *testing.T) {
 	cfg, err := compileLogin6662FlatSet(t,
 		"set system login class ops permissions [ view configure ]",
 		"set system login class ops idle-timeout 30",
-		`set system login class ops deny-commands "request system zeroize"`,
 		`set system login class ops allow-commands "show .*"`,
 		"set system login class ops login-alarms",
 		"set system login user alice uid 2001",
@@ -362,9 +441,6 @@ func TestLoginFlatSetStillCompiles_6662(t *testing.T) {
 	}
 	if lc.IdleTimeout != 30 {
 		t.Errorf("IdleTimeout = %d, want 30", lc.IdleTimeout)
-	}
-	if lc.DenyCommands != "request system zeroize" {
-		t.Errorf("DenyCommands = %q, want the configured regex", lc.DenyCommands)
 	}
 	if lc.AllowCommands != "show .*" {
 		t.Errorf("AllowCommands = %q, want the configured regex", lc.AllowCommands)

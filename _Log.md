@@ -115,6 +115,1276 @@
   `pkg/grpcapi/server_fabric_secret_render_6532_test.go`, `cmd/cli/show.go`,
   `cmd/cli/cos_rewrite_rule_topic_6848_test.go` (new),
   `docs/cos-validation-notes.md`, `_Log.md`
+## 2026-08-13 — #6812 round 7: the F-A tripwire could not fire
+
+- **Timestamp**: 2026-08-13
+- **Action**: fix the unreachable round-6 name precondition (B1), extend it to
+  all three same-tier fixtures, retract the round-6 claim, narrow one
+  over-broad conjunct.
+- **File(s)**: `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/nat/deterministic.go`, `docs/deterministic-nat-cgnat.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`, `_Log.md`
+
+**B1 — the precondition was scoped globally, so it was unreachable.** Round 6
+added a check that the declared rule-set-name sequence is not non-decreasing.
+These fixtures interleave two tiers — `if00 zn00 if01 zn01 …` — and
+`"zn00" > "if01"`, so the global sequence is non-monotonic whichever direction
+the loop runs. `nameAscending` was therefore always false and the `t.Fatal`
+unreachable. Reproduced firsthand at `ba44bb85d` on a scratch worktree: with
+the three loops re-cut ascending the test PASSED against pristine production,
+and PASSED AGAIN with the `(tier, PoolName ASC)` builder mutation applied — the
+exact edit the guard exists to catch. Not an off-by-one; a scoping error.
+
+A `(tier, name)` stable sort consults the name only among EQUAL tiers, so the
+blindness that matters is a tier declared ascending by name. The check is now
+`assertNoTierDeclaredNameAscending6812`: group the declared rule-sets by tier,
+fail if any tier holding >= 2 is name-ascending, and fail if no tier holds >= 2
+(no within-tier tie => nothing to bind). Single-element tiers are skipped —
+trivially both ascending and descending, so failing on one would fire the
+tripwire on a sound fixture.
+
+Keyed per package on what that side's sort would actually read: `PoolName` in
+the builder fixture (the emitted snapshot slice carries no rule-set name), the
+RULE-SET name in the two walk fixtures (`sourceNATAggregateReferencedCharges`
+sorts rule-sets, and its round-2 name ordering used exactly that).
+
+**N-coverage — now in all three, not one.** The descending re-cut is a shape
+assumption all three fixtures share and a future re-cut is a per-file edit, so
+the tripwire belongs wherever the assumption lives. No adjacent blindness
+existed today (both walk fixtures are descending with >= 2 distinct tiers), so
+this is hardening. `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` had
+no preconditions at all and also gains the tier-sortedness check its two
+siblings already had.
+
+| step | old predicate | new predicate |
+|---|---|---|
+| ascending re-cut, production pristine | green (silent) | RED — `tier 0 is declared in ascending NAME order [if00 … if09]` |
+| ascending re-cut + `(tier, PoolName ASC)` | green (silent) | RED — same precondition, before the assertion |
+| head fixture + `(tier, PoolName ASC)` | RED on assertion | RED on assertion — precondition does NOT shadow it |
+| head fixture + walk `(tier, Name ASC)` | RED on assertions | RED on assertions (`charge order[0] = if00, want if09`; `poison set = map[q15:true], missing "q00"`) |
+| both walk fixtures re-cut ascending | n/a (no check) | RED — `tier 0 … [if00 … if09]`, `tier 1 … [zrs00 … zrs15]` |
+| one rule-set per tier, tiers high-first | n/a | RED — `no tier holds two or more rule-sets` |
+
+The last row was driven deliberately: the "no within-tier tie" belt is shadowed
+by the callers' tier-sortedness precondition for every multi-element shape, so
+it would otherwise be an unfalsifiable guard. It is reachable — a fixture with
+one rule-set per tier declared high-tier-first reaches it.
+
+**N1 — one conjunct narrowed, conclusion unchanged.** The `expandPoolV4`
+canonical-mask narrowing was justified as "such a pool is already refused at
+commit AND poisoned on the tolerant path". The first conjunct is over-broad:
+`validateSourceNATPoolAddressGrammarStrict` iterates pools reachable from a
+pool-mode rule's `Then.PoolName`, not the pool table, so an UNREFERENCED pool
+carrying `10.0.0.0/016` compiles STRICT-CLEAN. Measured both directions — the
+referenced spelling is refused at commit (`address "10.1.0.0/016" is not a
+valid CIDR`), the unreferenced one compiles with `err = <nil>` and
+`SourceNATPoolUnusableReason == "invalid_pool"`. The conclusion stands and is
+unchanged: it rests on the pool being UNUSABLE (it translates nothing and
+installs no allocator), not on the commit gate.
+
+**No Rust change.** No production behaviour change: the diff is test
+preconditions plus comment/doc text.
+
+## 2026-08-13 — #6812 round 6: a guard that could not see the rule it forbids
+
+- **Timestamp**: 2026-08-13
+- **Action**: fold the round-6 hostile review (F-A..F-D, none blocking).
+- **File(s)**: `pkg/nat/deterministic.go`,
+  `pkg/nat/pool_expansion_parity_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/deterministic-nat-cgnat.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+**F-A**: all three same-tier fixtures declared rule-sets in ASCENDING suffix
+order, so within a tier config order and ascending NAME order were the same
+sequence — a (tier, Name ASC) tiebreak was GREEN on all three. That is the very
+rule F3 removed, so the guard could not see it come back. Fixed by declaring
+high-to-low, plus a precondition that FATALS if declaration order is ever
+ascending by name again. Both halves now red on the name tiebreak; all ORDER
+regressions still hold.
+
+> **RETRACTED IN ROUND 7** — the "plus a precondition that FATALS…" clause was
+> FALSE as written. The precondition asked whether the WHOLE declared name
+> sequence was non-decreasing, which this interleaved fixture shape can never
+> be (`zn00` > `if01`), so it was unreachable in both directions. The
+> descending re-cut itself was real and is what the round-6 mutation table
+> measures; only the tripwire was inert. See the 2026-08-13 round-7 entry.
+
+**F-B**: the walk's summary comment still claimed "rule-sets sorted by name" —
+false since round 4 and contradicted 55 lines below in the same block.
+
+**F-C**: verified before acting. 2 genuine v4 divergences (`198.51.100.1/032`,
+`10.0.0.0/016` accepted by `expandPoolV4`), cause `net.ParseCIDR` reading a
+leading-zero mask where `netip.ParsePrefix` refuses. My first probe said 14 —
+12 were artifacts of conflating "v6, skipped by design" with "rejected".
+FIXED rather than narrowed: the deterministic surface was reporting a
+65,536-address mapping for a pool that translates nothing. Narrowing the claim
+would have been the "document the divergence" option already rejected for F1.
+
+**F-D**: within-set order gated on contiguity; artifact lines 16 -> 10, the
+remaining 10 being genuine violations in contiguous rule-sets.
+
+| mutation | observed RED |
+|---|---|
+| walk (tier, Name ASC) | `charge order[0] = if00, want if09` + `poison set = map[q15:true], missing "q00"` |
+| builder (tier, Name ASC) | `emitted rule-set order[0] = if00, want if09` |
+| revert the `netip.ParsePrefix` check | `expandPoolV4("10.0.0.0/016") ACCEPTED 65536 addresses` |
+
+Whole matrix run under the diff-checksum guard; TREE RESTORED after every leg.
+
+## 2026-08-13 — #6812 round-4 amendment: a mask with no witness, an option that is not one, and a sibling that did not bind
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold the round-4 amendment (B2 new blocker, B1 reframed) into
+  PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json`,
+  `pkg/config/nat_pool_grammar_parity_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### B2 — the round-3 network-base mask had no witness
+
+Deleting BOTH masks from `expand_pool_address` left the crate green. The shared
+fixture asserted VERDICT and HOST COUNT, and **a missing mask changes WHICH
+addresses are produced, never HOW MANY** — the claim lived only in `note`
+strings no assertion read. A comment asserting the opposite ("a verdict-only
+table would not catch a masking drift") was measured false and is corrected.
+
+Fixed by giving the fixture an address-SET dimension — optional `first` /
+`last` / `expanded`, asserted Rust-side, with the Go side refusing a row that
+contradicts itself. Eleven rows carry one, including all three where host bits
+are set. `203.0.113.10/28` is encoded in full: masked it is `.0`-`.15`,
+unmasked `.10`-`.25` — eight addresses in the NEXT `/28`, with the budget
+charging 16 either way.
+
+### B1 — option (c) is not available, and the reason is measurable
+
+Not poisoning on the tolerant builder path does not restore translation: since
+round 3 the RUNTIME refuses a leading-zero octet on its own. A snapshot with
+`pool_unusable: false` still reaches `InvalidPool` with zero expanded addresses
+(`declining_to_poison_a_leading_zero_member_does_not_restore_it_6812`, with a
+canonical-spelling control that installs normally). So (c) is "stop poisoning
+AND revert round 3", and that end state is the one the objection to (a) already
+rules out — `ipnet` silently resolves the ambiguous literal to its decimal
+reading. Decision unchanged: refuse, and name the fix.
+
+Corrected framing: master had a **commit-vs-apply divergence**, not a
+tolerant-path over-rejection; the over-rejection existed only relative to an
+earlier commit of this PR. Blast radius is exactly the leading-zero-octet CIDR
+family — every other shape was already fail-closed at the merge base.
+
+### A sibling that did not bind, found by re-running a mechanism as a query
+
+Round 4 established that `sort.Slice` preserves order for an ALL-EQUAL key, and
+sized its new fixture accordingly. The sibling
+`TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` had 17 rule-sets
+all at one tier — the diagnosed shape — and passed under the mutation while its
+own comment credited it with binding the tie-break. Re-cut to interleaved mixed
+tiers with explicit preconditions (both tiers present, input NOT already
+tier-sorted). Both same-tier tests now red on `sort.SliceStable -> sort.Slice`.
+
+**Rule kept: a discovered vacuity mechanism is a greppable predicate owed a
+sweep over neighbouring cells, not a fix for the one test that was named.**
+
+### Two process failures worth recording
+
+1. The round-4 correction to the `expand_pool_address` doc comment **never
+   reached the commit**: the mutation harness snapshotted before that edit and
+   its final restore reverted it, so the round-4 report claimed a correction
+   that was not in the tree. Backups for a mutation matrix must be taken after
+   the last production edit.
+2. The first attempt at the B2 assertions **silently did not apply**. The
+   `old` pattern assumed `\` line-continuations the file no longer had, the
+   python `assert` raised, the shell continued to the test (no `&&`, no
+   `set -e`), and the grep used to read the result did not match
+   `AssertionError`. A green test was read as success for an edit that never
+   happened. Re-done with an editor that fails loudly, and the mutation script
+   now runs under `set -eu` and prints `MUTATION APPLIED`.
+
+### Mutation proof
+
+| revert | test | observed RED |
+|---|---|---|
+| delete BOTH network-base masks | `nat_pool_grammar_parity_fixture` | `expand_pool_address("10.0.0.1/24") starts at Some("10.0.0.1"), want "10.0.0.0"` |
+| `sort.SliceStable` -> `sort.Slice` | `...FirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
+| " | `...SameTierBudgetBoundaryFollowsConfigOrder_6812` | `poison set = map[q01:true], missing "q15"` (GREEN before the re-cut) |
+
+### Amendment follow-up (same day): cross-language stake, B3, and an uneditable claim
+
+- **Action**: fold the hostile leg's B2 stake analysis, B3, and the remaining
+  prose corrections.
+- **File(s)**: `pkg/nat/pool_expansion_parity_6812_test.go` (new),
+  `pkg/config/nat_pool_grammar_parity_6812_test.go`, `docs/config-schema.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+**The mask's stake is CROSS-LANGUAGE.** `pkg/nat/deterministic.go` expands the
+same pool from `net.ParseCIDR`'s already-masked `ipnet.IP`, and
+`lookupForwardInPool` INDEXES that slice to answer the operator-facing
+deterministic-NAT query. A drifted Rust base makes the Go lookup and the actual
+dataplane translation disagree by the host-bits offset — the #5794 invariant-8
+forensic failure, on a line this PR authored. A pool declared `10.0.0.1/24`
+would SNAT from `10.0.0.1`..`10.0.1.0`, one address into the neighbouring
+prefix. `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` binds
+it against the SAME fixture; the one table now pins THREE consumers.
+
+**B3**: deleting both `canonicalPoolAddressHint` branches left the
+package-scoped `go test ./pkg/config/ -run '6812|LeadingZero'` GREEN, because
+every binding test lived in `pkg/dataplane/userspace`. Closed in-package, with
+the negative half pinned too.
+
+**A false claim in an artefact that cannot be edited.** The round-3 commit
+message `8f9b53b44` says the fixture asserts "verdict AND expanded host count,
+so a masking drift is caught too". The second clause is false. A pushed commit
+message is not editable without rewriting shared history, so the correction
+lives here and in the plan. A false claim in an immutable artefact still has to
+be findable from the mutable ones.
+
+| revert | test | observed RED |
+|---|---|---|
+| delete both `canonicalPoolAddressHint` branches | `TestLeadingZeroHintIsBoundInThisPackage_6812` (package-scoped run) | `reason does not name the canonical spelling "10.0.0.0/24"` |
+| unmask the GO deterministic base | `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` | `expandPoolV4("10.0.0.1/24") starts at 10.0.0.1, want 10.0.0.0` |
+
+
+### Builder half of F3 (same day): the unpinned side of the equality
+
+- **Action**: bind the emission-order half of #6812 F3.
+- **File(s)**: `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+Round 4 pinned the WALK's stable sort. The BUILDER's (`nat_source.go`, #4161
+tier sort) was pinned by nothing — `sort.SliceStable` -> `sort.Slice` left the
+whole Go suite green — and it is the half the Rust first-match matcher
+consumes, so a permutation misroutes rather than merely reorders.
+
+`TestBuilderEmittedOrderIsStableWithinATier_6812` asserts three invariants the
+production comment claims, separately: config order within a tier, rule-set
+CONTIGUITY, within-set rule order. It is the only test in the repo that reds on
+the builder mutation.
+
+**Contiguity proved independent, not asserted.** A stable sort keyed on
+(tier, RULE NAME) preserves every rule-set's first-reference order while
+splitting its rules across nine others: assertion (1) stays GREEN, (2) reds
+with `if00 SPLIT: its 2 rules span indices 0..10`. So a config-order-only
+assertion would not have caught the split — which is the half with the
+misrouting consequence.
+
+Ran under the diff-checksum harness guard adopted this round; TREE RESTORED
+(checksum match) after both mutations.
+
+
+## 2026-08-13 — #6812 round 4: a disposition change I said did not happen, and an order-dependent backstop
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold Codex MERGE-NEEDS-MAJOR at `8f9b53b44` (three blocking
+  findings) into PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/allocator.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/nat_source_scope.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go` (new),
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### F1 — the round-3 claim was false on the path that matters
+
+Round 3 said the narrowing "changes no pool's disposition". True on the STRICT
+path; **false on the TOLERANT one**. A pool with an `010.0.0.0/24` member goes
+from `PoolUnusable=false` — `ipnet` reading it as `10.0.0.0/24`, allocator
+built, flows translating — to poisoned, `Unavailable`, packets dropped. A config
+on disk today, or synced from an older primary, loses SNAT across the upgrade.
+
+**Attribution, which every leg including mine had wrong.**
+`config.SourceNATPoolUnusableReason` **does not exist at the merge base**. The
+clause that stamps `invalid_pool` arrived in ROUND 2 (`bc1329ae0`); round 3's
+Rust narrowing only stopped the runtime disagreeing with a poison Go had already
+begun applying. Reverting round 3 alone restores the divergence without
+restoring the pool. The question is therefore not "narrow Rust or not" but
+"should the shared verdict refuse a non-canonical literal".
+
+**Decision: keep the refusal.** #5875 settled the structurally identical case in
+this same subsystem and chose reject over rewrite — "stripping the `%zone`
+silently would change the modeled address, so the fix rejects rather than
+rewrites" — and a leading zero is the WEAKER case, since `010` has two readings
+where `fe80::1%eth0` has one. Normalizing would install a NAT pool on a guess
+`show configuration` would never reveal: a stopped pool is loud, a silently
+reinterpreted one is quiet and wrong.
+
+**Where "make it loud" needed re-scoping.** Both operator channels already exist
+and already fire — `cfg.Warnings` is logged at apply by daemon_apply.go, and the
+snapshot builder logs its own warning naming pool and reason. A third would be
+noise. What was missing is that the message says "is not a valid CIDR" for a
+string that looks exactly like one, so the operator cannot see the fix is one
+character. Replaced with a specific diagnostic naming the canonical spelling and
+why the ambiguous one is refused. `canonicalPoolAddressHint` renders that
+sentence and is never used to substitute; it reports a rewrite only when the
+rewrite is what made an unparseable literal parse.
+
+Upgrade + peer-sync regression tests drive the real tolerant entries
+(`CompileConfigLenient`, `CompileConfigForNodeLenient` at both node ids), which
+nothing had covered.
+
+### F2 — CONFIRMED by measurement, then fixed
+
+Verified before touching anything. Two live pools at 160 of a 200-slot budget
+plus a new pool worth 80:
+
+| snapshot order | new pool | live occupancy |
+|---|---|---|
+| `A, B, C` (existing test) | `OverBudget` | 16 words |
+| `C, A, B` | **admitted, bitmap built** | **24 words = 240 slots vs a 200 cap** |
+
+Same pools, same reuse map, opposite outcome from ORDER alone, repeating one
+pool per apply. The resolver charged a reused key where it MET it, so a new key
+earlier in the slice was admitted against a total that omitted the reused keys
+behind it. Go-side poisoning masks it for snapshots this control plane
+generates — which is the point: this boundary is the INDEPENDENT backstop for
+tolerated, older-control-plane and handcrafted snapshots.
+
+Fixed by a two-phase resolver: phase 1 reserves every distinct reused key,
+phase 2 admits. Reused keys stay unconditionally accepted and are charged once.
+
+### F3 — guards that could not see a transient allocation
+
+Two were end-state assertions (final allocator identity; final occupancy-word
+count), both blind to a build-then-discard. Fixed with a THREAD-LOCAL
+construction counter — process-global counters in Rust tests caused a master-red
+flake once already (#6819), and the resolver is synchronous on the caller's
+thread.
+
+The third, same-tier tie-break: the property is true but nothing pinned it.
+**The proposed mutation needed a correctly sized fixture to be distinguishing at
+all** — measured, Go's `sort.Slice` preserves order at every size tried (2..64)
+with an all-equal key, so a small same-tier fixture leaves `sort.Slice` and
+`sort.SliceStable` observationally identical. With MIXED tiers and same-tier
+ties it first reorders at **n=13**. The new fixture uses 20 rule-sets across two
+tiers.
+
+### Mutation proof — 5/5 observed RED
+
+| revert | test | observed RED |
+|---|---|---|
+| drop the leading-zero hint branch | `TestLeadingZeroPoolMember{Upgrade,PeerSync,StrictRejection}...` | `no warning named the leading-zero member` |
+| `sort.SliceStable` -> `sort.Slice` | `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
+| charge reuse in phase 2 again | `reused_keys_reserve_budget_before_a_new_key_is_admitted_6812` + `incremental_applies_cannot_creep_past_the_cap_6812` | `the NEW key was admitted ahead of the reused keys behind it` |
+| throwaway `PortAllocator::new` before the reuse lookup | `reuse_consumes_budget_and_preserves_last_good` | `it must construct NO PortAllocator at all` |
+| eager build for a FAILED pool | `failed_pool_builds_no_bitmap` | `the final allocator word count cannot see a bitmap that was built and discarded` |
+
+The last two are the guards Codex named as unbinding: both now red on exactly
+the mutation he described, and both did so on the new construction-count
+assertion while the pre-existing identity / word-count assertions stayed green.
+
+## 2026-08-13 — #6812 round 3: the grammar the shared verdict is expressed in
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold Codex MERGE-NEEDS-MAJOR at `3b7c71cca` (three findings) into
+  PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json` (new),
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/nat_source_scope.go` (new),
+  `pkg/config/nat_pool_grammar_parity_6812_test.go` (new),
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### The correction round 2 owed
+
+Round 2's closing sentence — *"the two sides cannot disagree because there is
+one predicate"* — is false as written, and correcting it is the substance of
+this round. Sharing a predicate between the snapshot builder and the budget walk
+makes the two **Go** call sites agree. Go-vs-dataplane agreement is a claim
+about two **PARSERS**, and nothing in round 2 established it. Round 2 removed
+the last derived quantity; it did not remove the last unverified premise.
+
+### F1 — the cited instance was wrong; the class was real
+
+Codex cited `198.51.100.1/032`. Measured through the real `expand_pool_address`
+and the real `sourceNATPoolAddressReason` over a 53-entry table: **both sides
+reject it.** `ipnet`'s IPv4 prefix-length reader is `read_number(10, 2, 33)` — a
+two-DIGIT cap, not a canonical-form rule — so three-digit `/032` fails there
+too. Its IPv6 reader allows three digits, so `/064` does parse as `/64`, but
+every leading-zero-expressible prefix length is over `MAX_POOL_PREFIX_HOSTS`, so
+the pool is refused anyway. That agreement is a **coincidence of two unrelated
+bounds**, not a property; raising the host cap would split it, so the mask
+grammar is now pinned explicitly rather than left to arithmetic.
+
+The differential did find six real divergences, in both directions. Five plus
+one embedded-v4 variant are the same class: a **leading-zero IPv4 octet inside a
+CIDR** (`010.0.0.0/24`, `10.000.0.0/24`, `192.168.001.1/32`, `010.0.0.0/32`,
+`00.0.0.0/24`, `::ffff:010.0.0.0/120`) — Rust expanded a working 256-address
+allocator while Go stamped `invalid_pool` and poisoned the pool. Root cause: the
+CIDR branch parsed via `ipnet::IpNet`, which hand-rolls its own address parser
+(`read_number(10, 3, 0x100)` per octet), while the BARE branch used
+`std::net::IpAddr`, which rejects leading zeros exactly as Go's `netip` does.
+The function was self-inconsistent: `010.0.0.1` refused, `010.0.0.1/32`
+accepted. The sixth is the reverse direction: `netip.ParseAddr` accepts a zone
+on a bare member (`fe80::1%eth0`) that `std::net::IpAddr` cannot represent.
+
+Fixed in the RUNTIME for the octet class (the CIDR branch now parses its address
+half with the same `std::net::IpAddr` the bare branch always used; `IpNet` is
+off the pool-member path entirely) and in GO for the zone (there the runtime is
+the stricter side). Widening Go to match `ipnet` was rejected: it would bless an
+octal-confusion spelling at commit and mirror a third-party crate's accident as
+firewall policy. The direction chosen is narrowing and fail-closed and changes
+**no** pool's disposition — `InvalidPool` is the verdict Go already assigned;
+only the disagreement is removed.
+
+The class-level fix is a shared fixture, not six special cases:
+`userspace-dp/tests/fixtures/snat_pool_grammar_v1.json` is ONE table read by
+both sides (the #3612 AppID parity convention), asserting verdict AND expanded
+host count.
+
+### F2 — the guard fires; the reasoning under it did not hold
+
+The claimed zero-width port charge is **not reachable**: measured through the
+real `CompileConfigLenient`, `compileNATSource` defaults an unset range to
+1024/65535 before storing the pool, so three no-`port`-leaf `/16` pools charge
+4,227,858,432 slots each and the third is poisoned — what
+`TestAggregateOverBudgetPoolsPortCapacity_6812` has asserted all along. The
+SHAPE is real: a consumer re-deriving what a shared function answers, with the
+equivalence resting on a defaulting three files away and nothing binding them.
+The walk now consults `SourceNATPoolPortRange`; both halves of the equivalence
+are tested.
+
+### F3 — confirmed, and it falsified this PR's own prose
+
+Go ordered rule-sets by NAME; the builder emits STABLE-sorted by #4161 scope
+tier and `resolve_pool_allocators` charges that emitted slice in order. Worth
+stating precisely: this is **not** a Go/Rust disagreement in the shipped
+artefact — the poison travels on the wire and the parse loop honours it, so both
+sides always agree on which pools live. It is a defect of POLICY: the surviving
+pool was chosen by an alphabetical accident, contradicting the most-specific-wins
+precedence the builder enforces for matching one function later. It also made
+this PR's sentence *"the first-fit admission rule here mirrors it exactly — same
+order, same charge"* false on the order axis. The walk now sorts by the same
+tier through one shared definition (`config.SourceNATScopeTier`).
+
+### Mutation proof (each fix reds on revert, observed)
+
+| revert | test | observed RED |
+|---|---|---|
+| drop the Go zone check | `TestPoolAddressGrammarMatchesDataplane_6812` | `sourceNATPoolAddressReason("fe80::1%eth0") ok = true, want false` |
+| restore the raw port recompute | `TestAggregateChargeConsultsResolvedPortRange_6812` | `portCap = 0, want 12683575296` |
+| restore the name sort | `TestAggregateFirstFitFollowsEmittedScopeOrder_6812` | `charge order = [big small], want the interface-scoped pool (small) first` |
+| " | `TestSnapshotPoisonFollowsEmittedScopeOrder_6812` | `the first-charged pool "small" was poisoned ("aggregate_over_budget")` |
+| restore `parse::<IpNet>()` in the CIDR branch | `nat_pool_grammar_parity_fixture` | `expand_pool_address("010.0.0.0/24") = true, want false` |
+| " | `nat_pool_bare_and_host_cidr_grammars_agree` | `expand_pool_address("010.0.0.1") = false but expand_pool_address("010.0.0.1/32") = true` |
+
+## 2026-08-13 — #6812 fold r2: the budget must ask the runtime's question, not a proxy for it (Codex gate, fifth unusability class)
+
+- **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: Codex re-gate at `a00a03fc1` returned MERGE-NEEDS-MAJOR. Four of
+  five questions came back clean (the `SourceNATPoolUnusableReason` extraction
+  is faithful; the skip is not too wide; the `pkg/nat` delegation is
+  behaviour-preserving). The blocking one is that F1 is still reachable on the
+  tolerant / peer-sync path through a FIFTH unusability class — and the
+  existence of a fifth class after round 1 closed four was the real finding.
+  **The class.** The dataplane's pool grammar is ALL-OR-NOTHING:
+  `parse_source_nat_rules_inner` ORs `expand_pool_address` over every member
+  into one `invalid_pool_address` flag and fails the WHOLE pool as
+  `InvalidPool` (`userspace-dp/src/nat/source.rs`), so the
+  `pool_mode && total_pool > 0 && pool_failure.is_none()` gate builds no
+  `PendingPoolAllocator` and the pool occupies no slot in
+  `resolve_pool_allocators`. Round 1's budget walk instead SUMMED per-member
+  host counts and skipped only a zero total, which agrees with the runtime only
+  when EVERY member fails. Two shapes escaped: `[198.51.100.1, not-an-ip]`
+  sums to 1 + 0 = 1, and `10.0.0.0/15` counts 131,072 — twice the 65,536
+  `MaxSourceNATPoolPrefixHosts` / `MAX_POOL_PREFIX_HOSTS` cap the expander
+  enforces. All three Codex claims verified firsthand before building:
+  measured through the real `CompileConfigLenient` +
+  `SourceNATAggregateOverBudgetPools`, 1,024 mixed-membership pools ahead of one
+  healthy pool gave `poison[good] = true` / `aggregate_over_budget` (the
+  original F1 defect, alive), and one `/15` pool charged
+  `addrs=131072 portCap=8,455,716,864` — 98.4% of the 2^33 port-capacity budget
+  for an allocator that never exists.
+  **The fix — a shared verdict, not a fifth condition.**
+  `config.SourceNATPoolUnusableReason`, the predicate the snapshot builder
+  ALREADY stamps on the wire, gained an all-or-nothing membership clause built
+  from the EXISTING `sourceNATPoolAddressReason` — the per-member mirror of
+  `expand_pool_address` that the #5627 strict grammar gate uses. The budget
+  walk's pre-existing `SourceNATPoolUnusableReason(pool) != ""` skip then covers
+  both shapes with NO new condition, so the charged set and the poisoned set
+  cannot disagree by construction; there is no derived quantity left for a sixth
+  spelling. The wire reason is `invalid_pool`, which
+  `source_nat_failure_reason_from_snapshot` already decoded to
+  `SourceNatFailureReason::InvalidPool` — the exact variant the parse loop
+  assigned for these pools on its own — so the dataplane disposition is
+  UNCHANGED and only the decider moves control-plane-ward, where the budget can
+  see it. Precedence places the clause between `empty_pool` and
+  `zone_scoped_pool_address`: `netip.ParsePrefix` rejects a zone qualifier, so
+  `fe80::/112%eth0` fails the grammar too, and only a later zone write keeps it
+  reporting the specific #5875 reason; all three pre-existing reasons stay
+  reachable under exactly their old conditions.
+  **Made unrepresentable, not merely excluded.** The `poolAddrs == 0` skip was
+  DELETED rather than kept as a belt — it is unreachable now that the shared
+  verdict is all-or-nothing (any unparseable member already excludes the pool;
+  no members reports `empty_pool`; a parsing member counts >= 1), so a charged
+  pool always sums to >= 1. A deleted branch cannot be tested, so
+  `TestBudgetChargeImpliesHonorableMembers_6812` binds the two premises the
+  deletion rests on over the full grammar surface (honorable => countable, and
+  no charge is ever zero-address through the real compiler).
+  **An ordering pinned only by a comment — FOUND, not designed in.** Placing
+  the membership clause below `zone_scoped_pool_address` is load-bearing: a
+  zone-scoped CIDR (`fe80::1%eth0/64`) fails the grammar too, so with the
+  clauses swapped it would report `invalid_pool` instead of the specific #5875
+  reason. That was written as a code comment and NOTHING tested it — the #5875
+  tests pin the STRICT diagnostic, which is protected by gate order (zone-scope
+  :163 precedes address-grammar :189), and the snapshot-side #5875 test uses a
+  bare `fe80::1%eth0`, which netip parses, so the clause order never mattered to
+  it. This was discovered while re-cutting the cells, not planned: an invariant
+  held only by prose is the same defect class this whole round is about (a
+  comment asserting a contract is not the contract — cf. correcting Codex's
+  citation of `compiler_validate_strict_nat.go:759`, a doc comment ASSERTING the
+  all-or-nothing rule, when the rule itself lives in `source.rs:923-936`,
+  `:959-960` and `:999`). A `zone_scoped_prefix` cell now binds it.
+  **Fixture vacuity found while re-cutting.** `snatAggregateCfg_6812` emitted
+  `10.<i>.0.0/16`, valid only for i < 256 — so at `MaxSourceNATPoolCount+1`
+  pools, 769 of the 1,025 pools in the "healthy pools past the budget"
+  over-reach control were UNPARSEABLE and never healthy. The old zero-total rule
+  skipped them silently; the shared verdict names them, which is how it
+  surfaced. Fixed via `distinctSlash16_6812` plus a by-name precondition in the
+  fixture builder. The `no_member_expands` cell was re-cut to bind through the
+  shared verdict (`wantReason: "invalid_pool"`) instead of the deleted rule, and
+  every cell now asserts its round-1 host-count sum EXACTLY so a case cannot be
+  mistaken for a class it does not exercise (sum 0 = already excluded by round
+  1; sum non-zero = charged by round 1, excluded only now).
+  **Claim correction folded (Codex, non-blocking).** Round 1's account of the
+  strict path cited `validateSourceNATPoolStrict` and
+  `validateSourceNATPoolAddressScopeStrict` as what keeps unusable pools away
+  from the aggregate sum. The real order in `runUniformGatesNAT` is port-range
+  (:109), pool-reference (:134), zone-scope (:163), ADDRESS-GRAMMAR (:189),
+  aggregate (:228). The conclusion holds — strict acceptance is unchanged — but
+  it is the address-grammar gate at :189, omitted from the original account,
+  that covers the empty, malformed, mixed-invalid and over-capacity membership
+  shapes; the two cited gates cover only the port range and the `%zone`
+  qualifier. Corrected in `_Log.md` (round-1 entry), the plan doc and the code
+  comments.
+- **File(s)**: `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+- **Validation**: RED-on-revert measured for each fix, not asserted.
+  (1) Remove the membership-grammar clause from `SourceNATPoolUnusableReason`:
+  `TestAggregateBudgetExcludesUnusablePools_6812` reds on
+  `no_member_expands` / `some_member_fails` / `member_over_capacity`, and with
+  its precondition bypassed the DISCRIMINATOR itself reds — "the healthy pool
+  was poisoned aggregate_over_budget by 1024 pools that build NO allocator";
+  `TestSourceNATSnapshotMixedMemberPoolsDoNotPoisonHealthy_6812` and
+  `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812` red at the
+  snapshot boundary the same way.
+  (2) Point the `"invalid_pool"` arm of
+  `source_nat_failure_reason_from_snapshot` at any other variant:
+  `go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812` reds
+  (`left: Some(EmptyPool)` / `right: Some(InvalidPool)`).
+  (3) Swap the membership-grammar and zone clauses inside
+  `SourceNATPoolUnusableReason`: the new `zone_scoped_prefix` cell reds with
+  `reason = "invalid_pool", want "zone_scoped_pool_address"`. The clause
+  ordering was documented in a comment and otherwise UNBOUND — no existing test
+  covered the snapshot reason for a zone-scoped CIDR (`fe80::1%eth0/64`); the
+  #5875 tests cover the STRICT diagnostic, which is protected by gate order
+  (zone-scope :163 precedes address-grammar :189), not by clause order.
+  The over-capacity spelling was deliberately NOT left in the 1,024-pool
+  count-budget fixture: there it cannot starve the healthy pool (the address
+  budget refuses those pools first under first-fit, so they consume nothing and
+  the discriminator passes for an unrelated reason). It is driven instead by a
+  two-pool port-capacity fixture where one over-capacity `/15` (8,455,716,864
+  slots) starves a healthy full `/16` (4,227,858,432) — total 12,683,575,296,
+  the review's own R73 number — and the discriminator genuinely fails on revert.
+  `go build ./...` clean; `go test ./...` green; `cargo test --release` green;
+  `nat::` run 3x for flake; gofmt clean on every touched file (no crate-wide
+  `cargo fmt`).
+
+## 2026-08-13 — #6812 fold: failed pools must not charge the aggregate budget (Codex gate F1-F4)
+
+- **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: Codex returned MERGE-NEEDS-MAJOR on PR #6815. F1 (blocking) is a
+  real fail-closed OVER-rejection introduced by the #6812 poison walk itself,
+  and it falsifies the PR's own comments claiming Go and Rust agree on which
+  pools live.
+  **F1 — failed pools charged the Go budget and disabled a healthy pool.**
+  `sourceNATAggregateReferencedCharges` charged every DEFINED referenced pool.
+  The snapshot builder then, further down the same config, marks a pool
+  UNUSABLE for reasons that are settled by the pool definition alone — empty
+  membership, a `%zone` member (#5875), a port range the parser rejected
+  (#5457). Rust never charges those: the parse loop gates
+  `PendingPoolAllocator` on `pool_failure.is_none()`, so `resolve_pool_allocators`
+  neither charges them nor lets them occupy a slot. Reproduced firsthand on all
+  THREE unusable shapes, not just the reversed port range Codex probed:
+  `MaxSourceNATPoolCount` unusable pools exactly fill the pool-count budget and
+  the next healthy pool is poisoned `aggregate_over_budget` — a pool the
+  dataplane would have installed. It lands on the TOLERANT path (lenient load /
+  peer-sync, #1960 no-brick), which is the path an operator uses to recover.
+  Fixed by making the unusability verdict a SHARED predicate rather than
+  builder-local knowledge: new `config.SourceNATPoolMembers` /
+  `config.SourceNATPoolPortRange` (moved from pkg/dataplane/userspace) /
+  `config.SourceNATPoolUnusableReason`, with the builder and the budget walk
+  both reading it — the builder to poison, the walk to SKIP. The walk also
+  skips a pool whose members all fail to expand (zero addresses), which Rust
+  skips via its `total_pool > 0` gate and fails as InvalidPool instead.
+  **[CORRECTED IN ROUND 2 — see the round-2 entry below. That zero-total skip
+  approximated an all-or-nothing runtime contract with a SUM and left a fifth
+  unusability class open; it has been replaced by the shared verdict and
+  deleted.]**
+  Precedence in the extracted predicate preserves the builder's original
+  last-writer-wins order (invalid_port_range over zone_scoped_pool_address over
+  empty_pool) so shipped reasons are unchanged; the three per-condition
+  `slog.Warn` lines collapse to one carrying `reason`.
+  No strict-path change — but **[CORRECTED IN ROUND 2]** the two gates named
+  here were the wrong ones. The order in `runUniformGatesNAT` is port-range
+  (`validateSourceNATPoolStrict`, :109), pool-reference
+  (`validateNATPoolReferencesStrict`, :134), zone-scope
+  (`validateSourceNATPoolAddressScopeStrict`, :163), ADDRESS-GRAMMAR
+  (`validateSourceNATPoolAddressGrammarStrict`, :189), aggregate
+  (`validateSourceNATAggregateCardinalityStrict`, :228). The conclusion holds —
+  strict acceptance is unchanged, every gate precedes the aggregate one — but it
+  is the ADDRESS-GRAMMAR gate at :189, omitted from the original account, that
+  covers the empty, malformed, mixed-invalid and over-capacity membership
+  shapes; the two gates cited cover only the port range and the `%zone`
+  qualifier. The resource claim is unaffected either way, since a pool that
+  builds no allocator costs no allocator memory.
+  **F2 — the at-limit control did not prove all pools install.**
+  `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` filtered
+  only for `OverBudget`, so mutating the fixture's `/32` members to a malformed
+  `/33` failed all 1,024 rules as `InvalidPool`, installed ZERO pools, and the
+  test still passed. Now asserts no `pool_failure` of ANY reason plus a positive
+  occupancy-word check (a rule can carry no failure and still hold the empty
+  default allocator).
+  **F3 — repeated references to a reused key were unbound.** Deleting the
+  reuse-path `pool_allocators.insert(key, existing.clone())` left all 279
+  `nat::` tests green; without it a second rule referencing one previous pool
+  charges the key twice and refuses an unrelated new pool. Behaviour was already
+  correct — this adds the missing regression.
+  **F4 — comment drift.** The tests header claimed the wiring tests inject a
+  scaled budget (they use production wiring); "every test above" overlooked the
+  pure-arithmetic parity test; "these two cross" was false for a control sitting
+  exactly AT the limit; and "10,240 occupancy bits" conflated logical slots with
+  word-rounded physical storage (1024 words = 65,536 bits). All corrected here
+  and in the 2026-08-03 entry below.
+- **File(s)**: `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_deterministic_parity_test.go`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`, `_Log.md`
+- **Parity regression (both sides, same scenario, neither hardcoding the
+  other)**: Go — `TestAggregateBudgetExcludesUnusablePools_6812` (pkg/config,
+  all three unusable shapes) and
+  `TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812`
+  (pkg/dataplane/userspace) drive the real builder and assert the healthy pool
+  survives AND pin the exact snapshot markers the Rust fixture is built from.
+  Rust — `production_entry_admits_a_healthy_pool_after_failed_pools_6812` feeds
+  those markers to the PRODUCTION entry at the REAL budget and asserts the
+  healthy pool installs a real allocator. If the builder stops emitting that
+  shape the Go test reds and the Rust fixture stops standing for anything.
+- **Fail-on-revert (observed, not asserted)**: restoring the unconditional
+  charge in `sourceNATAggregateReferencedCharges` reds all three Go subtests
+  with `the healthy pool was poisoned "aggregate_over_budget" by 1024 pools that
+  build NO allocator` — an assertion failure, not a build break. The Rust half
+  reds under the opposite mutation (widening the parse-loop pending gate to
+  `true`). Over-reach controls stay GREEN under the revert:
+  `TestAggregateOverBudgetPoolsCount_6812`,
+  `TestAggregateValidatorMatchesPoisonWalk_6812`,
+  `TestSourceNATSnapshotAggregateStillPoisonsPastBudget_6812`,
+  `production_entry_enforces_the_real_pool_count_budget_6812`.
+
+## 2026-08-03 — #6812: cap the lenient SNAT aggregate eager bitmap at the apply boundary (opus-review-001 R73)
+
+- **Timestamp**: 2026-08-03 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: The #5877 aggregate cardinality gate hard-rejects an over-budget
+  source-NAT config at strict commit and only warns on the tolerant load /
+  peer-sync path (#1960 no-brick) — but a tolerated over-budget config still
+  reached the Rust apply boundary, which built every pool's per-address
+  occupancy bitmap EAGERLY: `PortAllocator::new` ran for every pool-mode rule
+  with `total_pool > 0` BEFORE the reuse maps were consulted, even when
+  `pool_failure` was already set, with no aggregate cap at the final
+  allocation boundary. Three full-range /16 pools materialise 12,683,575,296
+  bitmap bits (~1.48 GiB) — stall/OOM of the dataplane on upgrade boot or HA
+  convergence while processing the very config the tolerant path exists to
+  recover. Three coordinated changes: (1) Rust `parse_source_nat_rules_with_previous`
+  is split into parse + `resolve_pool_allocators` — reuse-before-build, nothing
+  built for a failed pool, and the Go-mirrored budgets (1024 pools /
+  1,048,576 addresses / 2^33 port slots) charged per distinct allocator key
+  (reused keys consume budget but are always accepted, so a no-op re-apply
+  preserves last-good state and a two-step apply cannot creep past the cap;
+  a non-fitting new key fails its rules closed with the new `OverBudget`
+  variant, `source_nat_pool_over_budget`); (2) the Go snapshot builder poisons
+  exactly the non-fitting pools (`SourceNATAggregateOverBudgetPools`, extracted
+  shared walk `sourceNATAggregateReferencedCharges` so validator and poison
+  cannot drift) with `aggregate_over_budget`; (3) the wire reason maps to
+  `OverBudget` (old helpers' catch-all maps it to `InvalidPool` — still
+  fail-closed, wire-skew safe). Folded in during implementation: with failed
+  pools building no allocator, the pool status view would have reported the
+  default 1024-65535 range for them — the configured range now rides on the
+  rule (`pool_port_low`/`pool_port_high`), read by both the status view and
+  the allocator key, so a failed pool's status keeps telling the truth.
+  Fail-on-revert verified both directions: gate-off simulation turns 5/7 new
+  Rust tests RED; poison-off simulation turns the userspace snapshot test RED.
+  Suites: full `pkg/config`, `pkg/dataplane/userspace`, nat (273) + nat64
+  (201) green; whole-repo `go build ./...` green; full `cargo test --release
+  --test-threads=1` green.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/allocator.rs`, `userspace-dp/src/nat/mod.rs`,
+  `userspace-dp/src/nat/status.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`,
+  `_Log.md`
+## 2026-08-20 — #6827 drive-to-merge: master merge (31 behind), hostile runtime pass, 9 issues filed instead of a round-12 fold
+
+- **Timestamp**: 2026-08-20 (fix/5719-api-hardening, PR #6827)
+- **Action**: Drive-to-merge pass under the campaign bar (runtime defects block;
+  every non-runtime finding is FILED, not folded — a tenth wording round does
+  not terminate).
+
+  **Merged `origin/master`** (24 commits behind at merge time, 44 ahead).
+  Only `_Log.md` conflicted; resolved by union with a structural check —
+  ours 1597 `##` headers, theirs 1606, merged 1616, zero headers dropped from
+  either side, zero NEW duplicate headers (the four duplicates present in the
+  result are present on BOTH sides at their respective heads). The #6743
+  `Daemon.dp` → atomic-cell migration that broke a sibling lane's clean textual
+  merge does NOT bite here: this PR adds no `pkg/daemon` test that constructs a
+  `Daemon` literal with a `dp` field. `go build ./...` rc 0 and
+  `go vet ./pkg/... ./cmd/...` rc 0 at the merge commit — checked rather than
+  inferred from a clean merge.
+
+  **Both deferred stale-cert delivery call sites re-verified BOUND at the
+  post-merge head**, by mutation rather than by reading `ccc2f6b09` into the
+  history. Content-copy restore with a `trap`, never `git checkout --`:
+
+  | mutation | result |
+  |---|---|
+  | control | rc 0 |
+  | drop `d.deliverStaleMgmtCertDiagnosis()` from `startHTTPServer` | rc 1 — `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827/boot_start_…` ONLY |
+  | drop it from `reconcileWebManagement` | rc 1 — `…/a_day2_reconcile_settles_a_debt…` + `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` |
+
+  Each mutation reds its own site and not the other: the two call sites are
+  independently bound, and `git status` was clean after each restore.
+
+  **Hostile runtime pass (TLS / net/http / Go stdlib), zero runtime defects.**
+  What was attacked and why it held:
+
+  - *Concurrent rename delivery vs. in-flight TLS handshakes.* 2381 real
+    `WarnStaleMgmtCertForHostName` deliveries against a live `ServeTLS` leg with
+    four goroutines dialling continuously, under `-race`: 0 races, 0 panics.
+    `buildHTTPSServer` hands each leg its own `*tls.Config` and nothing writes
+    `Certificates` after construction; the only stdlib write into that config is
+    `setupHTTP2_ServeTLS` appending to `NextProtos`, a different field, once,
+    before any handshake.
+  - *False NEGATIVE (the dangerous direction).* Walked the ordinary shape end to
+    end — `web-management https interface`, cert minted `[localhost, fw0]` +
+    `[127.0.0.1, ::1, 10.0.61.1]`, `set system host-name fw-edge1`: the rename
+    path WARNs (gate 3 skipped for `hostNameOperatorSet`) and the next boot's
+    load path WARNs too (`hostNameLikelyAccessIdentity` returns true on the
+    unqualified/unqualified shape match). The two halves also compose: a leg that
+    is `dead` at rename time has already been rebuilt by the SAME commit's
+    `reconcileWebManagement` (the new `!HTTPSServing()` term runs early in the
+    apply, `applyHostname` runs in the tail), so the delivery finds a serving
+    certificate. Where it fails to, the debt stands and is retried.
+  - *Wedge / panic on the mgmt listener.* `stopLegLocked` is `sync.Once`-guarded,
+    so a reconcile retiring an already-exited leg cannot double-close `stopCh`.
+    `http.Server.Serve` closes its listener on the way out (`defer l.Close()`)
+    BEFORE the goroutine stores `dead`, so a same-address rebuild after an
+    unexpected exit is not racing a held port. The `staleCertMu → lifeMu` edge is
+    a STALL, not a deadlock: `Server.Wait` waits only on leg goroutines and
+    nothing under them takes `staleCertMu`.
+  - *Commit-bricking.* The new `(next.TLS && !m.srv.HTTPSServing())` disjunct can
+    make `reconcileTo` return an error on every commit while an HTTPS bind keeps
+    failing — `daemon_apply.go:210-213` only WARNs on it, so a commit cannot be
+    bricked. Verified at the call site.
+  - *Certificate expiry.* Not a gap the diagnostic can miss into: the durable
+    cert is minted `NotAfter: +10 years` (`server.go:1611`), and `VerifyHostname`
+    checking no validity dates is therefore not reachable as a silent staleness.
+
+  **Two findings the hostile pass produced, both log-only, both FILED**: the
+  rename path WARNs about "remote clients" on a loopback-only HTTPS bind, where
+  `bindHostWarnable` makes the bind-host half of the same diagnostic decline
+  (#7039, measured with a probe over the package's own fixtures); and the
+  dead-leg retry re-runs the load-path cert diagnostic on every commit while the
+  bind keeps failing (#7041).
+
+  **Filed, not folded** (campaign policy): #7038 (deliverable tracking issue, so
+  the PR body can carry a `Closes` keyword without closing cohort #5719, which
+  still has the unfixed applied-nft item), #7039, #7041, #7043
+  (unparseable-cert `return true` unbound), #7044 (no-SANs terminal arm bound at
+  the load site only), #7045 (`hostName == bindHost` conjunct unbound in both
+  polarities), #7046 (README "reds only …" false at the shipped head), #7047
+  (surviving "up to `legDrainTimeout`" gloss + `serveBound` doc over-scoping the
+  5s `close_notify` to the HTTP leg), #7048 (hijack tripwire misses stdlib
+  `net/rpc`), #7049 (remaining unlocked `d.mgmt` readers — pre-existing on
+  master, verified with `git show origin/master:`).
+
+- **File(s)**: `_Log.md` (merge resolution + this entry). No production file
+  changed this round.
+
+## 2026-08-13 — #6827 round 6: the two DEFERRED delivery call sites were unbound; the debt ledger's whole justification was unmeasured
+
+- **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded the post-merge hostile review at `d73835136`
+  (MERGE-NEEDS-MINOR, one blocking item).
+  **B1 (BLOCKING) — both deferred-delivery call sites were unbound.** The
+  daemon half of this PR is a debt ledger whose entire justification is that a
+  boot rename reaches a nil reconciler and must be RETRIED later. Measured, each
+  severed in its own cell: deleting `d.deliverStaleMgmtCertDiagnosis()` from
+  `startHTTPServer` left `pkg/daemon` GREEN; deleting it from
+  `reconcileWebManagement` left `pkg/daemon` GREEN; deleting BOTH — collapsing
+  the mechanism to "diagnose synchronously at the rename or never" — also left
+  it GREEN. Only ONE of the two was self-declared (the reconcile one, in a "NOT
+  YET BOUND" block); two artefacts read as if the boot one were covered
+  (`TestBootHostNameReachesTheDiagnostic_6827`, which calls the delivery
+  DIRECTLY, and a `pkg/api/README.md` "All fail-on-revert" sentence).
+  Now bound by `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on
+  deliberately different observables, from ONE fixture
+  (`newMgmtDeliveryDaemon`, a Daemon with a REAL configstore):
+  the reconcile site on the DEBT FLAG, because bringing HTTPS up makes
+  `pkg/api`'s LOAD path emit the same warning text (a text assertion passes with
+  the retry deleted, which is why the earlier attempt was abandoned); the boot
+  site on the KERNEL-NAME READ, which sits past the delivery's
+  `!pending || mgmt == nil` guard and which nothing else on that path performs.
+  The boot site cannot be driven end-to-end in-process: `startHTTPServer`
+  CONSTRUCTS the `api.Server` itself and `SetTLSCertDirForTest` exists only
+  after construction, so a serving HTTPS leg there would mean driving the
+  production `/etc/xpf/tls` generator.
+  **N3** — `listenerLeg.serving()`'s doc and `pkg/api/README.md` both said the
+  disable arm clears `s.httpsLeg` BEFORE retiring. `ReconcileHTTPS` does the
+  reverse (`stopLegLocked`, then `s.httpsLeg = nil`). The conclusion survives —
+  a `stopCh` test would arm an unreachable state — but because the whole switch
+  runs under ONE `lifeMu` hold and both `serving()` callers take `lifeMu`.
+  Corrected in both places.
+  **N5** — `hostNameLikelyAccessIdentity`'s residual note scoped the never-
+  diagnosed class to boxes drifted BEFORE this shipped. A box RUNNING this build
+  reaches the same silence: `staleCertPending` is process-local, so a
+  cross-shape rename committed while nothing served a certificate is discarded
+  by a restart. Note widened (and in `pkg/api/README.md`); the durable-debt
+  implementation is DECLINED for the same reason as the upgrade sweep it sits
+  beside — persistent state plus an invalidation story, re-firing the false
+  positive on exactly the boxes the heuristic cannot judge.
+  **N6** — verified with `go doc -u` (not by reading): the `// Guarded by
+  staleCertMu.` block ran straight into `// staleCertGen advances ...` above a
+  three-field group, so godoc attached the whole thing to `staleCertMu`. Split
+  so each field carries its own comment.
+  **N-accounting** — the merge commit message and its `_Log.md` entry are
+  corrected in place: the removal of the branch's listener-recovery arm is
+  justified by DEAD CODE, not by a fail-open (master's recovery publishes the
+  same full credential set on that path), and THREE things went from
+  `management_recovery_6827_test.go`, one of them a duplicate rather than a
+  casualty. The dropped `noAddr` half's behaviour — after a failed boot bind, a
+  reconcile to an EMPTY HTTP bind must bind nothing — had no replacement
+  anywhere in the package, so it is restored as
+  `a_failed_boot_then_an_empty_bind_binds_nothing`, framed as the master-owned,
+  incidentally-held behaviour it now is.
+- **Validation**: `go build ./...` rc 0; `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0; `go test ./pkg/api/ ./pkg/daemon/` rc 0 (`TMPDIR=/dev/shm/t`, per-cell
+  `GOCACHE` under `/dev/shm`). Four mutations driven to RED, each in its own
+  cell, restored and re-run GREEN: **MUT-A** delete the boot delivery →
+  `boot_start_delivers_a_debt_parked_before_the_reconciler_existed` fails
+  ("the boot management start did not attempt the parked diagnosis: the kernel
+  name was never read"), the reconcile subtest stays GREEN; **MUT-B** delete the
+  reconcile delivery → `a_day2_reconcile_settles_a_debt_incurred_while_https_was_down`
+  fails ("left the host-name diagnosis still owed: nothing retried the
+  delivery"), the boot subtest stays GREEN; **MUT-A+B** together → both fail and
+  the rest of `pkg/daemon` is unaffected; **ordering** — move the boot delivery
+  ABOVE the `d.mgmt` publish → MUT-A's subtest fails, so the read also binds the
+  publish-then-deliver order. The restored empty-bind guard is not vacuous:
+  making `reconcileTo`'s HTTP arm unconditional reds it.
+- **File(s)**: `pkg/daemon/hostname_stale_cert_6827_test.go`,
+  `pkg/daemon/management_recovery_6827_test.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/README.md`, `pkg/api/listener.go`, `pkg/api/server.go`,
+  `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-13 — #6827 semantic merge with master: the listener-recovery half was master's fix in a second spelling
+
+- **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
+- **Action**: Real merge of `origin/master` (edefb7570, the #6645 REST-auth
+  wave) into the PR head b7272cddf. Merge base 4960e7bee; both sides had
+  independently changed listener identity, credential-publish gating and
+  management-state derivation, so a clean textual merge was not evidence of
+  correctness. Four textual conflicts, plus one collision git merged CLEANLY
+  into a compile error.
+  **DUPLICATE METHOD (no conflict marker)** — both sides added
+  `Server.HTTPSServing()` at different offsets in `listener.go`, for the same
+  stated reason (Start returns nil on an HTTPS bind failure, so a caller that
+  records a converged fingerprint pins to a listener that does not exist). Kept
+  ONE, with the branch's strictly stronger body (`httpsLeg.serving()` — adds
+  `ln != nil` and `!stopping` over master's `!= nil && !dead`) and a doc
+  comment carrying both rounds' rationale.
+  **TWO RETRY MECHANISMS, ONE SURVIVES** — #5561 round 14 (master) and #6827
+  round 5 (branch) both fixed the absorbing boot-bind failure. Master's
+  survives: `startTo` ADOPTS the server whether or not the bind succeeded, so
+  the retry runs through `reconcileTo`'s ordinary path. The branch's — retain
+  the root context, re-CONSTRUCT from the `m.srv == nil` branch — was REMOVED,
+  not kept alongside, because on top of master's `startTo` it is UNREACHABLE:
+  `m.srv = srv` runs unconditionally before the error return and
+  `api.NewServer` never returns nil, so the nil-srv branch is reachable only
+  when start never ran — and there the branch's own
+  `if m.rootCtx == nil || next.Addr == ""` guard returns nil, `rootCtx` being
+  assigned only inside `startTo`. (Corrected 2026-08-13: this entry first
+  argued the removal on a FAIL-OPEN — a fresh `api.Server` with the committed
+  `Auth` installed, bypassing `everyLiveLegNamedBy`/`publishNilDirectionLocked`.
+  That is false. Master's own recovery publishes the same full set on that path:
+  the error arm resets `m.cur, m.curSet` to `mgmtEndpoint{}, false`, so
+  `everyLiveLegNamedBy` is vacuously true, the grant is sanctioned, and
+  `ReplaceAuth(next.Auth)` publishes the whole set. The nil-Auth case is
+  unreachable off-loopback because the #4047/#5127 clamp keys on
+  `Auth != nil`.) Master's `b27ab99b5` (an absent HTTP leg imposes no
+  requirement) is reachable ONLY because the server is adopted, so taking the
+  branch's non-adopting `startTo` would have re-stranded the state that commit
+  fixed. `m.rootCtx` and `startLocked` are gone; merged
+  `startTo`/`reconcileTo` are byte-identical to master's.
+  **PROSE CORRECTED** — `serving()`'s comment claimed "there is no third
+  defer-set flag: it would be unbindable". Master added exactly that
+  (`drained`, for reaping `s.retiring`). The comment now says why `drained` is
+  the wrong answer to `serving()`'s question: it is stored as the goroutine's
+  LAST act, so it reads false throughout the 5s drain — the whole window that
+  matters.
+  **DOCS** — dropped the branch's "Failed BOOT start" bullet from
+  `pkg/daemon/README.md` (it documented the removed mechanism; master's "Boot
+  retry debt is real debt" bullet documents the surviving one). The #6827
+  stale-cert-on-rename section is untouched.
+  **TESTS** — `management_recovery_6827_test.go` is rewritten down to the two
+  over-reach guards that are still true and that master's
+  `management_bootretry_5561_test.go` does not cover: a reconcile before any
+  start must not construct, and a SUCCESSFUL boot HTTPS bind must still record
+  its fingerprint. (Corrected 2026-08-13: THREE things went, not "two subtests
+  binding the removed mechanism". `boot_http_bind_failure_recovers_on_a_later_reconcile`
+  and the `noAddr` half of `a_disabled_api_still_does_not_construct` asserted
+  m.srv stays nil — those two bound the mechanism that lost.
+  `boot_https_bind_failure_retries_on_an_identical_reconcile` went as a
+  DUPLICATE of `management_bootretry_5561_test.go`; its own precondition
+  asserted the OPPOSITE, that the server IS adopted.)
+- **Validation**: `go build ./...` rc 0; `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0; `go test ./pkg/api/ ./pkg/daemon/` rc 0 (`TMPDIR=/dev/shm/t`). Two
+  mutations driven to RED on real assertions with build+vet clean under each,
+  then restored + `touch`ed and re-run GREEN: widening the HTTPS-fingerprint
+  clear to unconditional (`if next.TLS`) reds three tests including the retained
+  over-reach guard; weakening `serving()` back to master's `!= nil && !dead`
+  reds four assertions in `pkg/api` — so the stricter predicate is still bound
+  after the merge rather than silently reverted.
+  `_Log.md` union verified STRUCTURALLY before this entry: 1595 `^## ` headers
+  = 1581 (branch) + 1587 (master) - 1573 (base), and the header multiset equals
+  branch + master - base exactly (no missing, no duplicates).
+- **File(s)**: `pkg/api/listener.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/management_recovery_6827_test.go`, `pkg/daemon/README.md`,
+  `_Log.md`
+
+## 2026-08-05 — #6827 round 5: two absorbing start paths, a generation-unsafe debt clear, and three edits no test bound
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded the Codex gate at `2c569fb22`.
+  **MAJOR 1a** — a boot HTTP bind failure was ABSORBING: `startTo` assigns
+  `m.srv` only after `Start` succeeds, so every later reconcile returned at the
+  `m.srv == nil` early exit and clearing the cause never recovered. `startTo`
+  now retains the root context even on failure and `reconcileTo` retries the
+  construction (`startLocked`).
+  **MAJOR 1b** — `api.Server.Start` LOGS an HTTPS bind failure and returns
+  SUCCESS (HTTPS is best-effort at boot), but `startTo` recorded the HTTPS
+  fingerprint anyway, so an identical later reconcile saw no change and never
+  retried. Added `Server.HTTPSServing()`; `startLocked` leaves that leg's
+  fingerprint unrecorded when it did not bind, matching reconcileTo's retry-debt
+  posture. Checked the other caller of `Start` — only `management.go` — so no
+  other site trusts that return.
+  **MAJOR 2** — the debt clear was not generation-safe: delivery read the flag
+  under the mutex, ran the hostname read + certificate inspection UNLOCKED, then
+  cleared unconditionally, so a rename landing in that window was settled by the
+  older delivery. Added `staleCertGen`; the clear is conditioned on the claimed
+  generation still being current. `d.mgmt` is now published under `staleCertMu`,
+  the same mutex the delivery path reads it through.
+  **Fix 3** — `serving()` was still true during the up-to-5s graceful drain.
+  Decided drain does NOT count as serving (the listener is closed, no new client
+  can reach the certificate, and the process is going down) and recorded that on
+  the predicate. `stopping` is set at the top of both drain arms.
+  **The redundant flag was deleted.** Round 4 added `exited` from a defer; with
+  `stopping` covering both drain arms and `dead` covering self-termination,
+  every exit is already covered, so `exited` became unbindable — a mutation
+  deleting it left the suite green. Rather than keep an arm no test can drive
+  (the exact criticism of round 4's `stopCh`), it is removed.
+- **Validation**: the gate was right that three production edits were unbound.
+  Now: deleting the drain flag REDs
+  `TestDrainFlagIsSetByTheRealServeGoroutine_6827`, which starts a REAL leg,
+  cancels the root context and joins the goroutine rather than storing the flag
+  itself; noting before `Sethostname` REDs
+  `TestRenameIsNotedOnlyAfterSethostname_6827`.
+  **STILL UNBOUND, reported not papered over**: the per-reconcile retry call
+  site. Asserting on the warning text does not isolate it (the certificate LOAD
+  path emits the same message, so that version passed with the retry deleted);
+  asserting on the debt flag is right but a bare `&Daemon{}` resolves an empty
+  bind, so the reconcile DISABLES HTTPS before the retry runs. Binding it needs
+  a Daemon with a real configstore. A comment in the test file records exactly
+  this instead of a vacuous passing test.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code);
+  `go vet` clean; `gofmt -l` clean. `pkg/api/server.go` 1424 lines — 76 under
+  the 1500 audit threshold, unchanged this round.
+- **File(s)**: `pkg/api/listener.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/daemon/management.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
+## 2026-08-05 — #6827 fold r4: three MAJORs — the debt was cleared on delivery, not on success
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded three runtime findings from the gate at `608e570d9`.
+  (1) **The r3 unconditional drain lost the diagnosis permanently.** Verified
+  both paths: an HTTP-start failure leaves `m.srv` nil and `management.go`'s
+  `if m.srv == nil { return nil }` means no later reconcile recovers it; and
+  with HTTPS off/bind-failed the drain cleared the parked name having emitted
+  nothing. In both cases the next boot's `applyHostname` returns early (name
+  already applied) and the load path's INFERRED heuristic declines cross-shape
+  drift — which this PR's own residual note at `server.go` already said. The
+  r3 trade was therefore not "a miss with a backstop" but a permanent loss.
+  Redesigned: `Daemon.staleCertPending` is a DEBT, `WarnStaleMgmtCertForHostName`
+  now RETURNS whether it reached a served certificate, and the debt clears only
+  on true. Retried at the rename, the boot start, and every web-management
+  reconcile.
+  (2) **The mark/deliver handoff was not atomic.** The old code branched on
+  `d.mgmt == nil` outside `staleCertMu` while `startHTTPServer` published
+  `d.mgmt` and drained separately. Fixed at the root rather than by widening the
+  lock: the host name is now read from the kernel AT DELIVERY (`osHostname`
+  seam) instead of stored at rename time, so a deferred diagnosis always
+  describes the current identity; and marking + attempting are one code path,
+  so there is no window to lose a rename in.
+  (3) **`serving()` missed the state that occurs and covered one that cannot.**
+  The root-context arm of `serveLegLocked` drains and RETURNS setting neither
+  `dead` nor `stopCh`, leaving the leg installed forever with every flag clear.
+  Meanwhile a requested retirement is unobservable through `s.httpsLeg` by
+  construction (disable clears the field before retiring; rebind installs the
+  replacement first). Replaced the `stopCh` arm with an `exited` atomic stored
+  from a DEFER over the whole serve goroutine, so no exit path — present or
+  future — can skip marking it.
+- **Validation**: two new mutations, each with `go build ./...` + `go vet` rc=0
+  first so the RED is an ASSERTION; files snapshotted and restored, verified
+  with `sha256sum -c`.
+  (1) clear the debt whenever delivery runs (the retracted r3 design) →
+  `debt_survives_a_delivery_that_reached_nothing` FAILs;
+  (2) drop `exited` from `serving()` (the r3 predicate) →
+  `root_shutdown_exited_leg_is_not_diagnosed` and
+  `reports_whether_it_reached_a_certificate` FAIL.
+  Note the r3 API test helper had to change again: `serving()` now also gates on
+  `exited`, and the earlier fixtures were still only as realistic as the
+  previous predicate demanded.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/listener.go`,
+  `pkg/api/tls_stale_cert_6827_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
+## 2026-08-05 — #6827 fold r3: two REACH findings — the hook's own boot ordering, and a dead leg treated as live
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded two runtime MAJORs from the gate at `78b70ed3f`. Both are
+  about WHETHER the diagnostic has something real to look at, not about the
+  narrowing heuristic (which the gate passed and I did not touch).
+  (1) **The hook was itself ordered before its dependency.** Verified the chain
+  first: the initial config apply is startup phase 4
+  (`daemon_run.go:170` → `setupDataplaneAndInitialConfig` →
+  `daemon_run_bringup.go:520` `applyConfig` → `applyTailReconciles` →
+  `applyHostname`), while `startHTTPServer` constructs `d.mgmt` at
+  `daemon_run_servers.go:475`, reached from `daemon_run.go:588`. So a
+  `system host-name` applied at boot reached a nil reconciler. A bare
+  nil-check-and-return would have reproduced the original silence exactly,
+  because the surviving fallback — the load path's INFERRED heuristic —
+  declines this very shape (cert `[localhost, oldfw.example.com]` qualified vs
+  new name `new-fw` unqualified). The name is now PARKED on the Daemon
+  (`staleCertHostName`, mutex-guarded) and delivered by
+  `drainDeferredStaleCertHostName` immediately after the boot management start,
+  still carrying `hostNameOperatorSet` evidence. The drain CONSUMES the name
+  unconditionally: with no serving leg there is nothing to be stale, and
+  holding it would let a later HTTPS enable replay an arbitrarily old rename as
+  though it just happened.
+  (2) **A terminated leg was still treated as live.** An unexpected serve exit
+  sets only `leg.dead` (`listener.go:69` — marking it under `lifeMu` would
+  deadlock a shutdown racing the exit) and leaves the leg INSTALLED in
+  `s.httpsLeg`; a leg retiring under a requested shutdown is likewise installed
+  while it drains, and on THAT path `dead` is never set. The r1 predicate was a
+  non-nil pointer test, so both states produced a warning about a certificate no
+  socket is presenting — the same false positive the construction template was
+  rejected for. Added `listenerLeg.serving()` (non-nil + listener + not `dead` +
+  no retirement requested) and switched the diagnostic to it. Deliberately
+  STRICTER than `EffectiveHTTPAddr`'s inline check, which omits the `stopCh`
+  test because `show system services` should still report a draining leg's
+  address; the two questions differ, so they are not folded into one predicate.
+- **Validation**: two mutations, each with `go build ./...` + `go vet` rc=0
+  first so the RED is an ASSERTION; each file restored from a byte snapshot and
+  re-verified with `sha256sum -c`.
+  (1) replace the park with `if d.mgmt == nil { return }` (the reviewed
+  anti-pattern) → `boot_rename_is_diagnosed_once_mgmt_is_up` FAILs with
+  `got ""` — the original silence, verbatim — plus
+  `last_name_wins_while_mgmt_is_down`;
+  (2) revert `serving()` to the r1 `s.httpsLeg != nil` → all three of
+  `dead_leg_is_not_diagnosed` / `draining_leg_is_not_diagnosed` /
+  `leg_without_a_listener_is_not_diagnosed` FAIL, each logging a full
+  host-name warning for a leg serving nothing.
+  Note the r1 api test helper built legs with no listener, so adopting
+  `serving()` correctly turned every positive subtest silent until the helper
+  was fixed to construct a genuinely SERVING leg — the predicate binding its own
+  fixtures.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/listener.go`,
+  `pkg/api/tls_stale_cert_6827_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
+## 2026-08-05 — #6827 fold r2: write down the accepted residual of the narrowing heuristic
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Documentation-only follow-up to the r1 fold, at the gate's
+  request. The `hostNameLikelyAccessIdentity` narrowing has a second edge that
+  r1 stated only in the hand-off, not in the shipping artifact: a rename that
+  CROSSES the qualified/unqualified boundary (`old-fw` → `newfw.example.com`)
+  is diagnosed at the commit — the rename path skips the heuristic — but never
+  on a later boot, because the load path then sees a shape mismatch and stays
+  quiet. For a box ALREADY in that state before this diagnostic shipped there
+  was no commit to catch it, so it is never diagnosed at all. The gap is bounded
+  on two sides (drift pre-dating the feature AND a shape-crossing rename);
+  shape-preserving drift, including the worked `old-fw` → `new-fw`, is still
+  caught on every boot. Closing it would take a one-shot sweep at first boot
+  after upgrade — upgrade-scoped persistent state for one narrow class, firing
+  on exactly the boxes where the heuristic cannot tell whether the name is in
+  use, so it would re-introduce the false positive at the least convenient
+  moment. Weighed and declined; the reasoning now lives on the function itself
+  rather than in a review thread. `TestUnusedKernelHostNameIsSilent_6827/
+  unused_qualified_cert_identity_is_silent` is the executable statement of the
+  residual — its doc comment now says so, so closing the gap later is a
+  deliberate edit to a named subtest rather than a surprise RED.
+- **Validation**: comments and prose only — no production statement changed
+  (`git diff` on `pkg/api/server.go` is entirely within a doc comment).
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `go test ./pkg/refactoraudit/` exit 0 — `pkg/api/server.go` 1390 →
+  1408, still below the 1500 audit-entry threshold, so no tier change and no
+  heatmap regeneration. `gofmt -l` clean on both touched Go files.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-05 — #6827 fold: the stale-mgmt-cert diagnostic never fired on a rename
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded a MERGE-NEEDS-MAJOR review of the #5719 C001 stale-cert
+  diagnostic. Verified the reported chain before touching anything:
+  `warnStaleLoadedCert` is called ONLY from the cert-load path
+  (`pkg/api/server.go` `generateSelfSignedCertAt`); the HTTPS leg is rebuilt
+  only when TLS or the HTTPS bind changes (`pkg/daemon/management.go`
+  `reconcileTo`); and `reconcileWebManagement` runs at `daemon_apply.go:210`
+  while `applyHostname` runs in the apply tail (`daemon_apply_tail.go:73`). So
+  `set system host-name new-fw` on an unchanged bind reached nothing, and a
+  SIMULTANEOUS HTTPS change would have checked the OLD kernel name. Three
+  fixes:
+  (1) **Reach + ordering.** New `Server.WarnStaleMgmtCertForHostName(hostName)`
+  reads the LIVE HTTPS leg's served certificate (never the `httpsServer`
+  construction template, which survives a TLS disable) and diagnoses an
+  EXPLICIT host name; `applyHostname` calls it inline with a successful
+  `Sethostname`, passing `cfg.System.HostName`. Taking the name as a parameter
+  removes the ordering hazard by construction rather than by placement — the
+  caller supplies the name it just applied instead of racing `os.Hostname()`
+  against the apply order. `syscall.Sethostname` and `/etc/hostname` became
+  package seams so this is unit-testable without CAP_SYS_ADMIN.
+  (2) **No-SAN certificate.** A CN-only pair (persisted by an older build or
+  placed by an operator) matched neither warnable predicate, so the most broken
+  certificate possible produced total silence. `certHasNoSANs` now reports it
+  FIRST and TERMINALLY — the per-identity lines would each report "does not
+  cover X" for a cert that covers no X at all.
+  (3) **False positive.** The kernel host name was diagnosed unconditionally, so
+  a box named `fw` whose cert covers `mgmt.example.com` + its management IP —
+  verifiable at every URL in use — was told to re-mint, churning remote TOFU
+  pins for nothing. `hostNameLikelyAccessIdentity` narrows the LOAD path by
+  naming shape: this package's mint path is the only thing that puts a bare
+  unqualified name in a cert, and what it puts there is the kernel host name, so
+  an unqualified SAN next to an unqualified kernel name means the TLS identity
+  IS that name and drifted (diagnose), while a domain-qualified SAN next to a
+  short kernel name means the TLS identity is independent of it (stay quiet).
+  The RENAME entry point deliberately skips the heuristic — the operator just
+  chose the name, which is evidence, not inference. The remaining load-path
+  noise is bounded to one line per HTTPS bind and the message now names the
+  identities the cert DOES cover, so it can be dismissed in one read.
+  The overstated docs were corrected: `pkg/api/README.md` now describes two
+  entry points and the narrowing rule, and the 2026-08-05 entry below carries an
+  explicit correction of its "closes only the diagnostic half" claim.
+- **Validation**: five mutations, each with `go build ./...` + `go vet` rc=0
+  BEFORE the run so every RED is an ASSERTION, not a compile break; each file
+  restored from a byte-snapshot and re-verified with `sha256sum -c`.
+  (1) delete the `warnStaleMgmtCertForHostName` call in `applyHostname` →
+  `renamed_box_is_diagnosed` FAILs with `got log ""` (the pre-fix silence);
+  (2) pass the PRE-rename `current` instead of `cfg.System.HostName` →
+  "must observe the NEW kernel host name" FAILs (host_name=<test host>), plus
+  both silence controls;
+  (3) neutralize `certHasNoSANs` → `TestLoadedCertWithoutSANsWarns_6827` FAILs
+  with `got log ""` and the rename-path no-SAN subtest FAILs;
+  (4) delete the `hostNameLikelyAccessIdentity` gate →
+  `unused_qualified_cert_identity_is_silent` FAILs (the healthy box is told to
+  re-mint), while its matched positive control `drifted_short_name_warns` keeps
+  passing — the pair is the discrimination proof;
+  (5) pass `hostNameInferred` instead of `hostNameOperatorSet` on the rename
+  path → `operator_chosen_name_overrides_the_heuristic` FAILs with `got ""`.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped), `go test ./pkg/refactoraudit/` exit 0 (daemon_system.go 1889 →
+  1909, still [WATCH]); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/api/README.md`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/management.go`, `pkg/daemon/hostname_stale_cert_6827_test.go`,
+  `_Log.md`
+
+## 2026-08-05 — #5719 C001 residual-2: the host-name half of the stale-cert diagnostic
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening)
+- **Action**: STEP-0 re-verification of the #5719 C-API cohort against current
+  `origin/master` (ad9591177) found two of the three named survivors already
+  fixed (unknown NAT stats selector — `pkg/grpcapi/server_nat.go:225-227`,
+  merged #6373; SAN-less generated cert base + management bind-IP threading —
+  merged #6373/#6378). The surviving gap was the SECOND identity the durable
+  cert bakes in. `generateSelfSignedCertAt` LOADS the on-disk pair as-is (#1916
+  D6 — a re-mint would churn remote TOFU pins) and warned only when the current
+  BIND HOST was uncovered. A later `set system host-name` leaves the cert's DNS
+  SAN naming the old host, and because renaming a firewall does not move its
+  management IP the bind-host check does not fire either — so the operator got a
+  bare "certificate is not valid for any names" with NOTHING in the log. Proved
+  empirically before writing the fix: mint as `old-fw`/bind `10.0.0.1`, reload
+  as `new-fw`/same bind → log output `""`. The load-success path now calls a
+  factored-out `warnStaleLoadedCert`, which parses the leaf ONCE and warns per
+  uncovered identity. `hostnameSANWarnable` gates the new check on the name
+  being DNS-encodable or an IP literal, so a `café` kernel host name — dropped
+  from the SANs by design (`isDNSSANSafeHostname`, the #5058 no-abort guard) and
+  uncoverable by any re-mint — does not warn on every reload. Re-minting itself
+  stays deferred. **CORRECTION (#6827, entry above):** this entry claimed the
+  change "closes only the diagnostic half" — it did not close even that. The
+  check ran ONLY on the certificate LOAD path, and a `set system host-name`
+  commit on an unchanged HTTPS endpoint reloads nothing, so the case the
+  host-name half was written for stayed silent until a restart. The #6827 fold
+  adds the rename entry point (with the apply-ordering fix), the no-SAN case,
+  and the false-positive narrowing. The third cohort item
+  (applied-nft truth projection) is NOT fixed here — scoping analysis posted to
+  the issue: the state exists post-#5757 but is process-local to `pkg/daemon`
+  with no exported accessor, and `ReadHostInboundDenyCounters` returns
+  `(nil, nil)` for BOTH a fenced table and an absent one, so REST/Prometheus
+  publish an authoritative "0 kernel denies" while a fail-closed fence is
+  actively dropping. Deciding which kernel state maps to which projection
+  channel is a design call, not a mechanical guard.
+- **Validation**: two mutations, each with `go build` + `go vet` rc=0 first so
+  the RED is an ASSERTION, not a compile break. (1) delete the host-name warn
+  branch → `host_name_change_warns` / `ip_literal_host_name_change_warns` /
+  `bind_host_warning_still_fires` FAIL, pre-existing
+  `TestLoadedCertBindHostMismatchWarns` still PASSES (mutation is scoped to the
+  new guard). (2) drop the encodability gate from `hostnameSANWarnable` →
+  `unencodable_host_name_is_silent` FAILs plus three
+  `TestHostnameSANWarnable` rows, proving the gate is not vacuous. Restored +
+  `touch`ed after each; GREEN both times. `go test ./pkg/api/...
+  ./pkg/grpcapi/...` and the full `go test ./...` exit 0; `gofmt -l` clean.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_san_5719_test.go`,
+  `pkg/api/README.md`, `_Log.md`
 ## 2026-08-13 — #6722 round 11: bind the two fail-closed DECISIONS the PR exists to make
 
 - **Timestamp**: 2026-08-13 (fix/6713-xfrmi-tozone, PR #6722)
@@ -1204,6 +2474,1617 @@
   pkg/grpcapi/server_show_system_single_resolve_6743_test.go;
   pkg/grpcapi/wireguard_publication_check_6743_test.go
 
+## 2026-08-13 — #6691 round 9c: the v5 → v6 mixed-version matrix, measured on the REFERENCE cluster shapes
+
+- **Timestamp**: 2026-08-13 21:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Measured both directions of the protocol bump before a cluster
+  smoke, on the shapes the clusters actually run rather than the shape the
+  change was designed around.
+- **File(s)**: `pkg/dataplane/userspace/mixed_version_matrix_6691_test.go` (new),
+  `pkg/daemon/mixed_version_commit_6691_test.go` (new),
+  `userspace-dp/src/main_tests.rs`, `_Log.md`
+
+  **WHY THE REFERENCE SHAPE AND NOT THE MOTIVATING ONE.** #6722 bumped 4 → 5
+  earlier the same day, and its first matrix measured ONE ifindex and
+  generalised to the population; the counterexample was an ifindex master
+  forwarded, the buggy head forwarded, and the MIXED pairing dropped — strictly
+  worse than both endpoints. The motivating shape here (a route-based IPsec
+  tunnel) is the LEAST likely to expose a compatibility defect, because it is
+  the one the gate was built for. The question that matters is what a mixed
+  pairing does to a cluster with no secure tunnel at all.
+
+  **MEASURED: the reference cluster arms NOTHING.** The real
+  `docs/ha-cluster-userspace.conf` parses and strict-compiles to **16 interface
+  rows, 0 SecureTunnel rows**. So on the loss userspace cluster the v6 gate is
+  INERT and the only mechanism in a mixed pairing is the helper's
+  version-equality check. That makes the mixed-version behaviour there identical
+  in KIND to every previous bump — it is not specific to this change.
+
+  **MEASURED: both operand orders refuse, against the real dispatcher.**
+  `apply_snapshot_rejects_unsupported_protocol_version` already drove
+  `CONFIG_SNAPSHOT_PROTOCOL_VERSION - 1` (a v5 control plane meeting this v6
+  helper) through `handle_stream` over a socketpair. Round 9c adds
+  `apply_snapshot_rejects_a_newer_protocol_version_too` for `+ 1`, because the
+  other direction — a v6 control plane meeting a v5 HELPER — cannot be run
+  without a v5 binary, and what it depends on is that
+  `snapshot.version != CONST` refuses whichever side is ahead. That was READ
+  from the symmetry of one line; it is now measured. Fail-on-revert confirmed:
+  weakening the check to `<` makes the new cell RED with "a snapshot at a NEWER
+  protocol version was accepted".
+
+  **MEASURED: the commit consequence, both directions, with the REAL error.**
+  The existing #5679 proof injects a GENERIC apply failure ("control-socket sync
+  failed"), which leaves the step from "the helper refused on version" to "the
+  commit fails via the deferred path" as a READ of the classification.
+  `TestMixedVersionHelperRefusalFailsTheCommit_6691` injects the actual string
+  the helper emits, wrapped as `process_control.go` and
+  `publishSnapshotFailClosedLocked` wrap it, in both operand orders. Result:
+  `applyConfigLocked` FAILS the commit, the apply was attempted exactly once,
+  the error is NOT abort-class, and the peer config-sync is NOT skipped.
+
+  **THE ANSWER IS A CLEAN REFUSAL IN BOTH DIRECTIONS — no wrong answers.** But
+  the two halves of "aborts the commit with the helper still forwarding" belong
+  to DIFFERENT paths, and conflating them would misdescribe the design:
+
+  | pairing | gate arms? | commit | helper |
+  |---|---|---|---|
+  | v6 CP → v5 helper, no secure tunnel (every reference cluster) | no | FAILS (#5679 deferred) | refused the snapshot, still ARMED on previous-good, forwarding |
+  | v5 CP → v6 helper, no secure tunnel | no | FAILS (#5679 deferred) | same |
+  | v6 CP → v5 helper, WITH a secure tunnel | YES | ABORTS early | deliberately DISARMED |
+
+  The asymmetry is the designed one and is worth stating out loud: a helper that
+  cannot PARSE the snapshot keeps forwarding what it already enforces, because
+  disarming it would convert a handshake disagreement into a dataplane outage. A
+  helper that would MISENFORCE the snapshot (a pre-v6 reader that ignores
+  `secure_tunnel` and plans an AF_XDP binding for the xfrmi) is disarmed,
+  because forwarding under a rule it reads wrongly is worse than not forwarding.
+  Both classifications are asserted, so neither can drift into the other.
+
+  **Both planes are asserted at 6 in the same test**, since a bump that moved
+  only one side would make EVERY pairing a mismatch, matched deployments
+  included.
+
+## 2026-08-13 — #6691 round 9b: the kernel evidence was sampled three times, and two of the guards meant to make round 8 safe could not fire
+
+- **Timestamp**: 2026-08-13 19:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded an independent Codex DO-NOT-MERGE (8 blocking) on top of
+  round 9. Two of the eight overturn earlier conclusions of MINE that a previous
+  round had endorsed; two more are guards that were incapable of failing.
+- **File(s)**: `pkg/dataplane/userspace/{ingress_exclusions,interfaces,maps_sync,manager_compile,protocol,manager_status,manager_ha,manager_overlay,process_status,manager_worker_arm_5134}.go`,
+  `pkg/dataplane/userspace/{secure_tunnel_parent_redirect_6691,secure_tunnel_protocol_6691,snapshot_allowlist,scoped_global_zoneset_*,manager_capabilities}_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`, `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **EVERY ITEM WAS MEASURED AT MY OWN HEAD (8de9691d8) BEFORE BEING CHANGED**,
+  because two of the eight were about round 9's fix rather than round 8's, and
+  one of the eight turned out to be ALREADY CLOSED by round 9. Reporting a fix
+  for something already fixed is the same failure as missing one.
+
+  **#2 GRE spelling — ALREADY CLOSED by round 9, reported as such.** The
+  `gr-0/0/0 unit 0 tunnel …` shape is the third combination of the round-9
+  blocker, and the EVERY-owner rule covers it identically to WireGuard: measured
+  at 8de9691d8, refused index empty, ingress [10 41], allowlist
+  [ge-0-0-0 gr-0-0-0], no divergence. Added as a case, not as a fix.
+
+  **#2b DIRECT own-ifindex path — NOT a hole under the EVERY rule, and the
+  reason is structural.** A row reaching the direct arm has passed
+  userspaceSkipsIngressInterface, and unbindable ⇒ skipped, so it is a BINDABLE
+  owner of its own ifindex bucket and that bucket cannot be unanimous. The
+  refusal is unaskable there. Adding the call would have been an inert conjunct;
+  the invariant is asserted instead.
+
+  **#3 — the over-exclusion ran the OTHER way, and round 9 did not fix it.**
+  buildUserspaceIngressIfindexes' refused-parent arm dropped the WHOLE ROW.
+  Correct for a VLAN child (the parent IS its bind target); wrong for a plain
+  unit that merely CARRIES a parent ifindex. Measured with secure `st10` at 11
+  and an ordinary live `st10.5` at 12: ingress [10] — 12 missing — while the RSS
+  allowlist named `st10.5` and Rust made it a candidate. A netdev with a binding
+  and no ingress entry takes cpumap_or_pass and leaves the adjudicated path — the
+  ingress/plan split in the opposite direction from the one round 8 fixed. The
+  parent key is now always suppressed and the row survives iff it owns its
+  netdev. After: ingress [10 12], with 11 still out.
+
+  **#1 — the FABRIC gap is REACHABLE, and the reachability is this PR's own
+  doing.** Round 8 recorded it as unreachable on the ground that
+  LocalFabricMember resolves only for slot-shaped names, so an `st*` member
+  yields no fabric row. That reasoning answered the PRE-round-8 question, when
+  the exclusion was keyed on the ref's NAME. Round 8's kernel-kind half refuses
+  a device for what it IS, so a slot-shaped `ge-0/0/0` created or renamed out of
+  band is BOTH refused AND a legal `fabric-options member-interfaces` value.
+  Measured: refused index name{ge-0-0-0} ifx{20}, yet allowlist
+  [ge-0-0-0 ge-0-0-3] and ingress [20 21]. All FOUR loops now ask the index —
+  two in Go, plus Rust's replan_queues layout AND its plan-key hash, so the
+  #2915 hash/layout invariant holds for fabrics too. After: allowlist
+  [ge-0-0-3], ingress [21]. **#6998 was filed by round 9 as pre-existing and is
+  now CLOSED by round 9b**, with its own repro re-measured: ingress [25],
+  allowlist [ge-0-0-9], the refused member in neither.
+
+  **#4 — the kernel evidence was sampled THREE times, fail-open, and one
+  disagreement was unsafe.** Measured with an oracle that shows the xfrm device
+  to the first dump only: the built snapshot carried SecureTunnel=true on `st10`
+  and correctly excluded it from ingress, while `configHasSecureTunnel`
+  re-enumerated and returned **false** — the required-protocol gate stayed
+  SILENT for exactly the snapshot it exists to refuse, leaving a pre-v6 helper
+  ARMED on its previous-good image. That falsified the function's own documented
+  invariant ("cannot … stay silent for one that does").
+
+  Fixed structurally rather than per-path: `ensureRequiredSnapshotProtocolLocked`
+  now takes the **snapshot**, not the config, and the secure-tunnel gate reads
+  the flag the builder stamped (`snapshotHasSecureTunnel`). Every call site
+  already had one in scope — the apply paths pass what they are about to
+  publish, the poll/status/HA paths pass `m.lastSnapshot`, which is what is
+  actually being enforced and is a better oracle than re-deriving. The gate now
+  takes NO dump at all. Measured after: gate `true` on the applied snapshot with
+  the sample count still 1.
+
+  Also fixed: `liveXfrmNetdevs` discarded a PARTIAL dump. netlink v1.3.1 returns
+  the links it did deserialize together with `ErrDumpInterrupted`
+  (link_linux.go returns early only for a non-interrupt error, then
+  `return res, executeErr`), so an interrupted dump threw away real evidence
+  INCLUDING the xfrm device, while the per-row buildLinkSnapshot lookups still
+  resolved it — the stale xfrmi came back Ifindex > 0 with SecureTunnel false,
+  the exact state the belt exists to catch. Round 8 called that "fails OPEN
+  because the config half is the primary"; it was not a considered trade.
+
+  **NOT claimed as eliminated:** UserspaceBoundLinuxInterfaces still takes its
+  own sample, because its three daemon call sites hold only a
+  `*config.Config`. That is documented at the site rather than papered over, and
+  its disagreement is conservative by construction — an allowlist entry is
+  permission to reshape a NIC, so doubt must NAME FEWER netdevs, which is what
+  the degrade-to-nil path and the partial-dump fix both do.
+
+  **#7 — the enumeration guard was TAUTOLOGICAL.** It compared six hard-coded
+  strings against a hard-coded 6. Codex's mutation (add an unenumerated
+  production exclusion class) fired NO assertion, so the fail-on-revert contract
+  in that test's own doc comment was false — and it is the guard round 9 quoted
+  on the PR as pinning its enumeration. Fixed by making PRODUCTION enumerate its
+  classes: the switch is now `netdevExclusionClasses`, a named table, and
+  `userspaceNetdevExclusionClass` returns WHICH class fired. The test asserts
+  both directions against that slice and adds a per-case positive control, so a
+  case cannot claim a class it does not trigger. Verified: the same mutation now
+  reds.
+
+  **#8 — the `Type() == "xfrm"` discriminator was UNBOUND.** Every test presents
+  a kernel by replacing the whole liveXfrmNetdevs closure, so deleting the kind
+  filter — a mutation that classifies EVERY link as an xfrm interface and would
+  strip every NIC of its AF_XDP binding — left the package green. A test that
+  supplies the answer cannot check the thing that computes it. Split into two
+  pure functions, `xfrmNetdevNames` (the classifier) and `xfrmDumpNames` (the
+  error policy), each driven directly. The FIRST 9b grid then found the error
+  policy still surviving, which is why it is two functions and not one.
+
+  **#5 — protocol bumped 5 → 6, assertion pinned to EQUALITY.** Not for the
+  kernel half: for the fact that the REFUSAL RULE the flag feeds changed inside
+  this PR. A round-8 v5 helper and a round-9 v5 helper accept identical bytes and
+  plan different bindings for a VLAN sibling of a flagged parent. A version whose
+  meaning depends on which round produced the binary is not a version. The old
+  assertion was `ProtocolVersion > 4`, which stays GREEN at the colliding value —
+  a weak assertion independent of reachability. Neither 5 nor 6 has shipped
+  (#6691 is unmerged), so the bump costs nothing.
+
+  **Claim corrections, each measured before rewriting.** The mgmt/control
+  device-predicate mutation fires ONLY the placement assertion (a t.Fatal, so the
+  ingress and allowlist assertions below never run) — round 9 said "both
+  assertions" and that was wrong. `configHasSecureTunnel`'s cost sentence was
+  wrong three ways (the dump was unconditional once the config half found
+  nothing; "skipped on a box with no xfrm devices" described the RESULT being
+  empty, not the dump being skipped; the poll-triggered arm reconciliation does
+  reach the gate). `secure_tunnel` is no longer read by one Rust consumer.
+  The allowlist builder DOES depend on ordinary link/ifindex resolution. The
+  README's ParentIfindex-guard ORDER was backwards — maps_sync calls the
+  predicate first. `ensureSecureTunnelProtocolLocked` detects an older HELPER,
+  not an older control plane. And "on the commit that CREATES a tunnel only the
+  config knows" is narrower than stated: on the normal apply path the interface
+  reconcile runs BEFORE snapshot construction.
+
+  **Mutation grid — 17 severances across two rounds, each required to COMPILE
+  first, ALL KILLED.**
+
+  | # | severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:145` ingress set) |
+  | M2 | RSS `refusesName` | KILLED (`:155` + the SSOT parity premise) |
+  | M3 | alias-table `refusesIfindex` | KILLED (`:719` alias -> refused xfrmi) |
+  | M4 | refused index EVERY → ANY | KILLED (`:632` + the B1 table) |
+  | M5 | refused index → refuse nothing | KILLED (`:145`) |
+  | M6 | ownership qualifier dropped | KILLED (`:767` LogicalOnly owns its netdev) |
+  | M7 | SSOT derivation → pre-round-8 rule | KILLED (allowlist diverges) |
+  | N1 | #3 whole-row drop restored | KILLED (`:1283` ingress missing ifindex 12) |
+  | N2 | #1 allowlist fabric guard | KILLED (`:1219` allowlist regains ge-0-0-0) |
+  | N3 | #1 ingress fabric guard | KILLED (`:1224` ingress regains 20) |
+  | N4 | #8 kind discriminator | KILLED (`:1140` ge-0-0-0 + veth0 classified) |
+  | N5 | #4a partial-dump discard | KILLED (`:1334` the xfrmi discarded) |
+  | N6 | #4c gate re-derives | KILLED (`:316` gate returned nil for a flagged snapshot) |
+  | N7 | #5 protocol back to 5 | KILLED (equality assertion) |
+  | N8 | #7 unenumerated production class | KILLED (placement + coverage) |
+  | R1 | Rust EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner…`) |
+  | R2 | Rust refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit…`) |
+  | R3 | Rust fabric LAYOUT guard | KILLED (`fabric_loop_cannot_readmit…`) |
+  | R4 | Rust fabric PLAN-KEY guard | KILLED (same test, #2915 assertion) |
+
+  **The 9b grid's first pass found N5 and N6 unbound, and both were fixed rather
+  than reported.** N6 additionally reds on a PREMISE in its first form, which
+  would have misdirected a future reader to the fixture instead of production —
+  so the premise no longer expresses itself with the function under test.
+
+## 2026-08-13 — #6691 round 9: the refused-netdev index refused a netdev an ADMITTED row owns
+
+- **Timestamp**: 2026-08-13 16:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Re-founded round 8's refused-netdev index on OWNERSHIP — refuse a
+  netdev only when EVERY row that owns it is unbindable, never on a
+  disagreement between two rows — on both planes, plus five claim corrections
+  round 8 owed and one pre-existing gap filed as #6998.
+- **File(s)**: `pkg/dataplane/userspace/ingress_exclusions.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go`,
+  `pkg/dataplane/userspace/snapshot_allowlist_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`, `_Log.md`
+
+  **B1 — round 8 introduced this, and it is reachable on the canonical
+  WireGuard spelling.** `buildInterfaceSnapshots` sets a unit row's Tunnel flag
+  to `iface.Tunnel != nil || unit.Tunnel != nil` (pre-existing, master line
+  304), and `snapshotLinuxName` collapses a unit-0 row with no vlan-id onto the
+  BASE netdev. So a unit-level `tunnel` stanza puts an UNBINDABLE unit row and
+  a BINDABLE base row on ONE netdev. Round 8's index refused a netdev as soon
+  as ANY row was unbindable for it, which reads that disagreement as a refusal
+  — and because a base row's own name is asked of the same index, it took the
+  base row out of the RSS allowlist.
+
+  Measured, head `1c5b8e69a` vs the same tree with the three round-8 guards
+  severed (which for these configs is exactly origin/master — no VPN, no live
+  xfrmi, so every SecureTunnel flag is false):
+
+  ```
+  set interfaces ge-0/0/5 vlan-tagging
+  set interfaces ge-0/0/5 unit 0 tunnel source 10.0.0.1
+  set interfaces ge-0/0/5 unit 0 tunnel destination 10.0.0.2
+  set interfaces ge-0/0/5 unit 100 vlan-id 100
+  set security zones security-zone trust interfaces ge-0/0/5.0
+  set security zones security-zone trust interfaces ge-0/0/5.100
+  (plus an unrelated LAN ge-0/0/0.0 in trust; ge-0-0-5=30, ge-0-0-5.100=31)
+
+                    HEAD                    SEVERED (= master)      ROUND 9
+  refused index     ifx{30} name{ge-0-0-5}  --                      empty
+  ingress           [10 30]                 [10 30 31]              [10 30 31]
+  RSS allowlist     [ge-0-0-0]              [ge-0-0-0 ge-0-0-5]     [ge-0-0-0 ge-0-0-5]
+  aliases           map[]                   map[31:30]              map[31:30]
+  ```
+
+  And on `set interfaces wg1408 unit 0 tunnel mode wireguard` — THE spelling,
+  verbatim in `pkg/config/tunnelid_test.go` and in an operator config in
+  `docs/issues/issue-history.md` — `wg1408` was admitted, `wg1408.0` refused,
+  both on ifindex 40 with linux name `wg1408`; the allowlist came back
+  `[ge-0-0-0]` at head against `[ge-0-0-0 wg1408]` on master, and is
+  `[ge-0-0-0 wg1408]` again at round 9.
+
+  An ifindex absent from `userspace_ingress_ifaces` takes `cpumap_or_pass`
+  (`userspace-xdp/src/lib.rs`) and `syncInterfaceAttachments`
+  (`manager_compile.go`) DetachXDP/DetachTCs it. Dropping a name from the
+  allowlist also removes the only revert path: `restoreDefaultRSSIndirection`
+  and `applyCoalescence` are both allowlist-scoped, so a reshaped NIC keeps
+  xpf's concentrated RSS table and pinned coalescence until daemon Stop. The
+  reviewer's scoping is preserved and correct: `applyRSSIndirectionOne` and
+  `applyCoalescenceOne` gate on `readDriver()==mlx5`, so the allowlist drop is
+  a no-op for a wg/gre netdev and observable harm needs the shared netdev to be
+  a real mlx5 data NIC — a unit-level tunnel authored on a `ge-*` NIC,
+  strict-valid but unusual.
+
+  **The fix, and which half correctness rests on.** A netdev's OWNERS are the
+  rows whose AF_XDP bind target is their own netdev — `userspaceOwnsItsNetdev`,
+  expressed through the #2917 SSOT `userspaceBindTargetNetdev` rather than a
+  restated VLAN test, and mirroring Rust's existing
+  `vlan_child_parent_netdev(p, &p_linux).is_none()` qualifier word for word.
+  A netdev is refused iff it has at least one owner and every owner is
+  unbindable.
+
+  Correctness rests on the OWNERSHIP half, not on the redirect half. The index
+  answers "is this netdev, AS A DEVICE, one we must never bind?", and a device
+  cannot be both — so when its owners disagree, at least one owner is an
+  ordinary data interface that will contribute the netdev to the binding plan
+  on its own account whatever the redirect does. Refusing on a disagreement
+  therefore cannot prevent the binding; it can only strip traffic from rows
+  entitled to it.
+
+  F1 is preserved exactly, and on the same half rather than a special case:
+  under `bind-interface st10` the only row whose LinuxName is `st10` is the
+  base xfrmi row (a `unit 5 vlan-id 100` sibling resolves to `st10.100`), so
+  that bucket is a single unbindable owner. A `unit 0` sibling DOES share the
+  netdev, and is itself SecureTunnel by the same ownership oracle plus the
+  live-xfrmi half — measured both ways, so the bucket is unanimous there too.
+
+  A corollary worth knowing: for a row that owns its own netdev the refusal is
+  now STRUCTURALLY unreachable (such a row only reaches the check after passing
+  `userspaceSkipsIngressInterface`, and unbindable ⇒ skipped, so it is a
+  bindable owner of its own bucket). The index can only fire through a
+  REDIRECT — the property round 8 claimed and did not have — which also puts
+  the Go rule in the same shape as Rust's `binding_target_is_refused`, whose
+  non-VLAN arm is the literal `false`.
+
+  **The Rust half moved with it, and not only for symmetry.** With a
+  `mgmt`-zoned base plus a unit-0 tunnel row and a trust VLAN child, the ANY
+  rule made `replan_queues` produce NO binding for a netdev whose ifindex the
+  Go ingress map still carried — and an ifindex in the ingress map with no
+  READY binding is `drop_degraded_transit` (BINDING_MISSING), the unsafe
+  direction by this code's own invariant. `snapshot_refuses_parent_netdev` now
+  tallies owners the same way.
+
+  **The `!iface.LogicalOnly` clause is DELETED, not re-justified.** A round-8
+  reviewer was right that nothing could distinguish it, and the reason is
+  better than "inert": it was REDUNDANT. A LogicalOnly row is a bondless RETH
+  VLAN unit, so `shouldUseLogicalOnlyParentBoundRethVLAN`'s own conditions
+  (`unit.VlanID > 0`, a resolved parent netdev with a different name) make it a
+  VLAN CHILD, which the ownership rule already excludes.
+  `TestLogicalOnlyRowNeverOwnsANetdev` asserts that implication on the real
+  fixture, so the redundancy is a measured fact rather than this paragraph's
+  assertion.
+
+  **N1 — the round-8 grid's M6 verdict was WRONG, and it is corrected here.**
+  Round 8 reported the alias-table guard as a surviving mutation and justified
+  it with "inert on every reachable config … no test can distinguish it — that
+  is a structural claim, not a bound one". That reasoning covered only the
+  SecureTunnel class. It was LIVE at `1c5b8e69a`: on the B1 config, severing
+  that line ALONE changed the alias table from `map[]` to `map[31:30]`
+  (measured firsthand at head, both with and without the guard). The
+  reachability came from the B1 defect itself and is gone with it. Re-checked
+  per class rather than for one class: for Tunnel and the four name arms a VLAN
+  child INHERITS the parent's exclusion and is dropped before the refusal is
+  reached; for LocalFabric and mgmt/control the parent is not in the index at
+  all; for SecureTunnel the child does not inherit but its own netdev
+  `st<N>.<vlan>` cannot exist. So it is inert again — and rather than report
+  that as an unbindable guard a second time,
+  `TestAliasTableRefusesEvenWhenTheChildNetdevResolves` STUBS the child netdev
+  into existence and binds the site. The fixture is labelled synthetic in its
+  own doc comment; the guard is retained because the invariant is about the
+  SITE, and #5619 has already made three of four secure-tunnel spellings
+  resolve to netdevs that previously did not.
+
+  **N3 — the enumeration bound round 8 used does not hold, and two sentences
+  are corrected.** "A redirect can only launder within the sets the predicate
+  gates, so the sites are the predicate's callers per plane" is false: the
+  FABRIC loops contribute to two of the same sets without asking the predicate
+  or the index — `add(fab.ParentLinuxName)` (`interfaces.go`),
+  `key := uint32(fab.ParentIfindex)` (`maps_sync.go`) and `replan_queues`'
+  fabric pass. Measured with a Tunnel-class member (`fab0 fabric-options
+  member-interfaces gr-0/0/3`, interface-level tunnel): the refused netdev is
+  in the ingress set AND in the allowlist. PRE-EXISTING — master's loops are
+  identical — and NOT reachable for a secure tunnel (`LocalFabricMember`
+  resolves only for slot-shaped member names, so an `st*` member yields zero
+  fabric rows), so it is filed as **#6998** rather than fixed here. Both false
+  sentences are corrected in `ingress_exclusions.go` and in the README, with
+  the rule stated: to bound a laundering question, enumerate every CONTRIBUTOR
+  to the set, not every caller of the predicate.
+
+  **N4/N5/N6 — three stale sentences, each measured before rewriting.**
+  `ensureSecureTunnelProtocolLocked`'s "scoped … so an operator with no
+  route-based IPsec is never blocked" outlived the round-8 widening of
+  `configHasSecureTunnel`: measured with zero VPNs, it returns false with no
+  live xfrmi and TRUE with a stale live `st10`. The arming is right (a stale
+  xfrmi is exactly what an operator cannot fix by editing the config); only the
+  sentence was the defect, and it now matches the architecture doc's wording.
+  `ingress_exclusions.go`'s file header still said "a pure move: no signature,
+  no behaviour and no caller changes" — true of `be8aec13e`, which created the
+  file, and false of everything since. And
+  `TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT` re-derived `want`
+  from the PRE-round-8 rule, so it encoded an invariant production does not
+  hold and stayed green only because its fixture had no refused row; the
+  derivation now applies the refusal AND the fixture gained a live-xfrm `st10`
+  with a zoned VLAN sibling so the filter is load-bearing (M7 below).
+
+  **Mutation grid — 7 Go + 2 Rust, each guard severed one at a time, every
+  mutation required to COMPILE (`go vet` / `cargo build --tests`) before its
+  result counted.**
+
+  | # | guard severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:145` ingress, `:155` allowlist) |
+  | M2 | RSS `refusesName` | KILLED (`:155` allowlist) |
+  | M3 | alias-table `refusesIfindex` (round-8's M6) | KILLED (`:692` "binding alias 12 -> 11 points at the refused xfrmi") |
+  | M4 | refused index: EVERY owner → ANY owner | KILLED (`:598` "netdev \"ge-0-0-5\" is refused even though ge-0/0/5 owns it and is bindable"; `:769`/`:774`/`:779` the B1 table) |
+  | M5 | refused index: refuse nothing | KILLED (`:145` "the excluded xfrmi (ifindex 11) is in the ingress-adjudication set [10 11]") |
+  | M6 | ownership qualifier dropped (`userspaceOwnsItsNetdev` → true) | KILLED (`:740` "a LogicalOnly row owns its netdev … LinuxName \"lo.80\"") |
+  | M7 | SSOT parity derivation reverted to the pre-round-8 rule | KILLED ("allowlist diverges from the bind-target SSOT: got [ge-0-0-1 ge-0-0-2], want [… st10]") |
+  | R1 | `snapshot_refuses_parent_netdev`: EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner_is_not_refused`) |
+  | R2 | `snapshot_refuses_parent_netdev`: refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit_its_refused_parent`) |
+
+  **maps_sync.go spends none of the headroom round 8 bought it.** The
+  per-class inertness analysis was first written at the alias call site, which
+  took the file 1958 -> 1986 against the 2000-line refactor threshold — the
+  exact "a comment grows the file" pattern the round-8 split existed to undo.
+  It is a property of the refusal CONTRACT, not of the alias builder, so it
+  lives in `userspaceRefusedNetdevs` with a one-line pointer at the site:
+  maps_sync.go 1957, one line below where round 9 found it.
+
+  **R2's first run reported SURVIVED and the HARNESS was the defect**, recorded
+  because a mutation harness that silently under-runs inverts its own result:
+  the driver's Rust test list omitted
+  `orphan_vlan_child_cannot_readmit_its_refused_parent` — the F1 guard, the
+  only test that can see that mutation. Added and re-run; KILLED. The Go rows
+  were unaffected (their `-run` regex names every test in the file).
+
+## 2026-08-13 — #6691 round 8c: a sibling unit laundered its own excluded xfrmi, and a live one the config forgot was invisible
+
+- **Timestamp**: 2026-08-13 14:20 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded the two Codex blockers that survived verification at the
+  true head (2ec16ae72). Both are the same defect seen from opposite sides —
+  the exclusion is decided per ROW, but what enters an adjudicated set is a
+  NETDEV — so both are fixed by moving the refusal onto the netdev.
+- **File(s)**: `pkg/dataplane/userspace/ingress_exclusions.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go` (new),
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/protocol/snapshot.rs`, `userspace-dp/src/main_tests.rs`,
+  `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-architecture.md`,
+  `docs/refactoring-audit-current.txt`, `_Log.md`
+
+  **Three of the five Codex findings were already closed at the true head** and
+  are recorded here as verified-closed rather than re-fixed: the `st010.0`
+  if_id-aliasing claim (`bindInterfaceOwnsRef` cuts on `.` and compares the
+  authored spelling, so `st010 != st10`), the "shared resolver still classifies
+  lexically" claim (`SecureTunnelUnitNetdev` returns `("", false)` in the
+  `secureTunnelUnbound` arm), and the missing version gate (both sides are at 5).
+
+  **F1 — an unowned VLAN sibling re-admitted its OWNED xfrmi parent.** Measured
+  at head on a STRICT-valid config (`config.CompileConfig`, no lenient path):
+
+  ```
+  set security ipsec vpn V bind-interface st10
+  set interfaces st10 vlan-tagging
+  set interfaces st10 unit 5 vlan-id 100
+  set interfaces st10 unit 5 family inet address 192.0.2.1/24
+  set security zones security-zone trust interfaces st10.5
+  ```
+
+  The base row `st10` is the xfrmi and is correctly excluded. The unit derives
+  `10<<16 | 6` against the bound `10<<16 | 1`, so it is correctly
+  `SecureTunnel=false` — and it carries `ParentIfindex`/`ParentLinuxName`
+  pointing at the live xfrmi. All THREE consumers Codex named do redirect,
+  verified one at a time with the xfrmi stubbed live at ifindex 11:
+
+  - `buildUserspaceIngressIfindexes` → `[10 11]`, 11 being the xfrmi.
+  - `UserspaceBoundLinuxInterfaces` → `[ge-0-0-0 st10]`.
+  - `replan_queues` (Rust, fed the real Go wire snapshot) → planned a binding
+    for `st10`, and the LAN's planned queue count fell from **4 to 1**. That is
+    the #3091 single-worker regression the exclusion's load-bearing reason
+    names, arriving through the child.
+
+  Two things Codex's report did not distinguish, both measured:
+
+  - **The ingress leak is not VLAN-specific.** A plain `set interfaces st10 unit
+    5 family inet address ...` (no `vlan-id`) leaks the parent ifindex exactly
+    the same way. The RSS-name leak IS VLAN-specific — `userspaceBindTargetNetdev`
+    redirects only a VLAN row, so the plain sibling contributes its own
+    `st10.5`, not `st10`.
+  - **`compiler_validate_strict_zones.go` admits the zone member two ways**, not
+    one. Codex named the IPsec term of `zoneReferenceableInterfaceBases` (which
+    does admit every sibling unit of a bound base, confirmed); but the config
+    also carries `set interfaces st10 unit 5`, so `st10` is a key of
+    `cfg.Interfaces.Interfaces` and would be admitted without the IPsec term.
+
+  **F3 — a live xfrmi the config no longer describes was invisible to every
+  predicate in this PR**, all of which are config-keyed. Two routes, both driven
+  through the REAL `pkg/routing` reconciler against a fake kernel in
+  `TestRetainedLiveXfrmiLeavesTheAdjudicatedSets`, so the retention and the
+  snapshot are composed rather than reasoned about across a gap:
+
+  - `LinkDel` fails → `deleteLocked` retains tracking and returns the error
+    (#4901); `applyInterfaceReconcile`'s result is a DEFERRED error
+    (`daemon_apply.go:280`, "All steps still run (no early return)"), so the
+    apply proceeds through `applyDataplaneAndHACore` with the device live.
+  - After a daemon restart `xfrmManager.xfrmis` is EMPTY, so the removed-desired
+    delete pass has nothing to iterate and issues no `LinkDel` at all — and this
+    route reports a CLEAN convergence, which makes it the worse of the two.
+
+  Measured at head in that state (`st10` live at ifindex 11, no VPN in the
+  config): ingress `[10 11]`, allowlist `[ge-0-0-0 st10]`.
+
+  **The fix, and which half correctness rests on.** The exclusion predicate is
+  split into a NETDEV half (`userspaceUnbindableNetdev`: Tunnel, fxp/em/fab/lo0,
+  SecureTunnel) and a ROW half (mgmt/control zone, LocalFabric). The netdev half
+  is what a redirect inherits; the row half is not, and that distinction is
+  load-bearing in BOTH directions — a mgmt-zoned base with a data-zoned VLAN
+  child is reachable (`buildInterfaceZoneMap` keys the base off whichever zone
+  sorts first) and its parent MUST stay admitted, because the child's tagged
+  frames really do arrive on that netdev's queues.
+
+  Correctness then rests on two independent mechanisms, and neither subsumes the
+  other:
+
+  - `userspaceRefusedNetdevs` indexes every refused netdev by ifindex AND by
+    name, and the three set-changing consumers consult it. This is what stops
+    the laundering; the kernel fact below does not.
+  - `snapshotSecureTunnel` unions the config oracle with a KERNEL one —
+    `liveXfrmNetdevs`, one `RTM_GETLINK` dump per snapshot, filtered on link
+    kind `xfrm`. This is what makes a forgotten device visible; the refused
+    index does not. The two cover different instants (the reconciler runs during
+    apply, so on the commit that CREATES a tunnel only the config knows), so the
+    union is not belt-and-braces on one fact but two facts.
+
+  On the Rust plane the same split lands as `userspace_unbindable_netdev` plus
+  `snapshot_refuses_parent_netdev`. `snapshot_has_parent_candidate` returning
+  false conflated "the parent is ABSENT" (the #3175 orphan, where re-keying is
+  correct) with "the parent is REFUSED" (where re-keying re-admits the excluded
+  netdev); those now answer separately. The refusal is read by the plan-key
+  filter and the candidate loop through ONE helper, `binding_target_is_refused`,
+  so the #2915 hash/layout invariant is a property of the code.
+
+  **No protocol bump is owed.** `secure_tunnel`'s meaning, type and JSON tag are
+  unchanged and its only Rust consumer reads it identically at v5; what widened
+  is the evidence the control plane accepts for the same claim.
+  `configHasSecureTunnel` widened with it, because its documented invariant is
+  "the gate cannot stay silent for a snapshot that DOES carry a flagged row" —
+  and a stale xfrmi is precisely the case an operator cannot fix by editing the
+  config.
+
+  **Mutation matrix — 7 Go + 3 Rust, each guard severed one at a time.** Every
+  mutation was required to COMPILE first: the initial run reported M1/M2/M6 as
+  killed when they had only failed to build (an unused `refused` binding), and
+  R1/R2 as build failures when cargo's `error: test failed` line had been
+  misread. Both classifiers were fixed and the grid re-run.
+
+  | # | guard severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:143`, ingress set) |
+  | M2 | RSS `refusesName` | KILLED (`:153`, allowlist) |
+  | M3 | kernel half of `snapshotSecureTunnel` | KILLED (`:504`,`:511`) |
+  | M4 | mgmt/control moved to the DEVICE half | KILLED (`:218`, negative control) |
+  | M5 | kernel half of `configHasSecureTunnel` | KILLED (`:528`) |
+  | M6 | alias-table `refusesIfindex` | **SURVIVED** |
+  | M7 | refused index built from the ROW predicate | KILLED (`:225`,`:230`) |
+  | R1 | `replan_queues` refusal | KILLED ("the planner produced an AF_XDP binding") |
+  | R2 | plan-key refusal filter | KILLED ("plan key still hashes") |
+  | R3 | refusal widened to any non-candidate parent | KILLED ("must still re-key onto") |
+
+  **M6 SURVIVED and is reported as such rather than papered over.**
+  `buildUserspaceIngressBindingAliases` is inert on every config reachable
+  today: the sibling unit of an xfrmi resolves to a netdev that does not exist
+  (a VLAN child cannot be created on an ARPHRD_NONE device), so the
+  `Ifindex <= 0` guard drops the row before the refusal is consulted. The guard
+  is there so the alias table cannot become the one site that does not ask, and
+  no test can distinguish it — that is a structural claim, not a bound one.
+
+  **R3's negative control did not bind on the first attempt, and the fixture was
+  the defect.** `orphan_vlan_child_still_rekeys_onto_an_absent_parent` omitted
+  the parent ROW entirely, so with nothing resolving to `ge-0-0-2` both the
+  correct predicate and the wrong-but-tempting
+  `!include_userspace_binding_interface(p)` returned false for want of anything
+  to examine — the mutation survived. Renamed to
+  `..._onto_an_unzoned_parent` and given a PRESENT, unzoned parent row, which is
+  the only shape that reaches the branch. Measured both before and after.
+
+  **Enumeration, bounded mechanically.** A redirect can only launder within the
+  sets the predicate gates, so the sites are the predicate's callers on each
+  plane: four in Go (three that change an installed set plus the plan-key hash)
+  and two in Rust (the layout and its hash). The FIB/zone maps in
+  `forwarding_build/interfaces.rs` also read `parent_ifindex`, but they are
+  deliberately outside this predicate's scope (stated in the arm's own SCOPE
+  paragraph) and are not laundering sites.
+  `TestExclusionClassesAgreeAcrossParentAndChild` pins the other half of the
+  enumeration: of the six exclusion classes, only SecureTunnel can have a parent
+  and its unit disagree — Tunnel and LocalFabric are the same InterfaceConfig
+  field on both rows, and the name arms test the shared base name.
+
+  **Validation.** `go test ./pkg/dataplane/userspace/ ./pkg/config/
+  ./pkg/routing/ ./pkg/daemon/` and the full `cargo test` suite; the new Go
+  guards, the two new Rust guards, and the pre-existing #3175/#3091/#5619 orphan
+  and secure-tunnel tests all pass. `docs/refactoring-audit-current.txt`
+  regenerated (`maps_sync.go` 1925 → 1958, still WATCH, under the 2000 gate).
+  No cluster smoke run — none of this touches the shim `.o`.
+
+## 2026-08-13 — #6691 round 8b: the version doc still said "why it is at 4", and the round-8 evidence re-measured independently
+
+- **Timestamp**: 2026-08-13 12:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Second pass over the round-8 fold. Re-established every load-bearing
+  claim from scratch rather than inheriting it, found one real documentation
+  regression the fold introduced, and widened the mutation matrix from three Go
+  mutations to six.
+- **File(s)**: `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **The doc regression.** The v5 bump left
+  `docs/userspace-dataplane-architecture.md` carrying a section literally headed
+  **"Why it is at 4"** — the SSOT prose explaining what the config-snapshot
+  protocol version means and why it currently holds its value. Bumping the
+  constant to 5 in three places and leaving that heading is exactly the shape
+  this repo's doc-contract rule exists to catch: the next reader reconciling
+  `ProtocolVersion = 5` against a doc that explains version 4 has no way to tell
+  which one is stale. Retitled the #4626/#5488 paragraph to "Why it went to 4"
+  (it is history now, not the current state) and added a **"Why it is at 5"**
+  block carrying the measured reason, plus a paragraph naming
+  `ensureSecureTunnelProtocolLocked` / `ErrSecureTunnelProtocolIncompatible` and
+  its `configHasSecureTunnel` arming predicate alongside the existing #5488 gate
+  description. No code change.
+
+  **B1 re-established independently, not inherited.** The three legs of the
+  queue-collapse argument were each measured here rather than read:
+
+  - an xfrm interface really does have exactly one RX queue. `unshare -rn` with
+    a private sysfs mount, `ip link add name xfrmprobe0 type xfrm dev lo if_id
+    7`: `numrxqueues 1` / `numtxqueues 1`, `/sys/class/net/xfrmprobe0/queues`
+    holds exactly `rx-0` and `tx-0`, and `/sys/class/net/xfrmprobe0/type` is
+    `65534` (ARPHRD_NONE). `lo` as a control shows the same single pair.
+  - BOTH planes count that same sysfs entry, so neither can disagree with the
+    device: `userspaceRXQueueCount` (`interfaces.go:706-724`) reads
+    `/sys/class/net/<if>/queues` and counts `rx-` prefixed dirs;
+    `rx_queue_count` (`planning.rs:666-683`) reads the same path with the same
+    prefix filter.
+  - `replan_bindings_from_candidates` takes the global minimum verbatim:
+    `let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0)`.
+
+  Corroboration nobody had cited: the SAME function already re-keys a 1-queue
+  VLAN child onto its parent's hardware queue count expressly so it "still
+  cannot collapse the min", naming #3091. The codebase independently treats
+  this exact failure class as a regression — the xfrmi is the same defect
+  through an unnamed door, which is why the exclusion is load-bearing rather
+  than an optimisation.
+
+  **The missing link, and it inverts the review's framing.** The round-8 write-up
+  argued the exclusion is right; it did not establish that MASTER is wrong, and
+  the review leg's charge was specifically that the exclusion "deletes a WORKING
+  inbound policy path". So: does master actually admit the row? Probed the
+  snapshot builder directly for a zoned `bind-interface st0.0` —
+
+      row "st0.0": Zone="vpn" Tunnel=false SecureTunnel=true LocalFabric=""
+      master's binding predicate would ADMIT this row: true
+
+  `Tunnel` is `iface.Tunnel != nil || unit.Tunnel != nil`, the GRE/IPIP `tunnel`
+  stanza — a route-based IPsec unit does not set it, so nothing else in the
+  predicate keeps the row out. Master's `interfaces.go:262` populates `RXQueues`
+  from the same `userspaceRXQueueCount` this branch uses (identical line on both
+  revisions), which on a real box is the xfrmi's 1.
+
+  So the path the exclusion "deletes" is not a working policy path. On master
+  today, an operator who zones a route-based IPsec tunnel silently re-plans
+  every physical interface on the box onto one queue and one worker. That is a
+  live #3091-class regression this PR CLOSES, not one it opens — and it is why
+  the answer to B1 is neither "narrow the exclusion" nor "restore the path", but
+  "the exclusion is correct and the reason on record was the wrong one".
+
+  **The v5 gate is reached from production, not just from its test.**
+  `ensureRequiredSnapshotProtocolLocked` has seven production call sites
+  (`manager_compile.go:292`, `:346`, `:583`; `manager_worker_arm_5134.go:70`;
+  `process_status.go:92`; `manager_overlay.go:180`; `manager_ha.go:631`;
+  `manager_status.go:112`) and `pkg/daemon/daemon_apply.go:413` delegates the
+  commit-abort decision to `IsRequiredProtocolGateError`. A sentinel that no
+  path consults is the recurring failure mode this campaign keeps finding; it
+  is not this one.
+
+  **Mutation matrix — six Go mutations, all RED, each on its intended
+  assertion.** Every mutation applied to a fresh `/dev/shm` copy; the
+  worktree's `git status --porcelain` checksum captured before and after each
+  batch and identical both times, so nothing under test was ever the mutated
+  tree.
+
+  | # | mutation | assertion that went RED |
+  |---|----------|-------------------------|
+  | G1 | unwire `ensureSecureTunnelProtocolLocked` from the dispatcher | `secure_tunnel_protocol_6691_test.go:135` |
+  | G2 | drop the sentinel from `requiredProtocolGateSentinels` | `:142` — gate fires, commit would NOT abort |
+  | G3 | revert Go `ProtocolVersion` 5 → 4 | lockstep parity (`5488_test.go:396`) + `:85` collision + all FOUR spellings |
+  | G4 | `configHasSecureTunnel` always TRUE | `:165` — the no-xfrmi negative control |
+  | G5 | `configHasSecureTunnel` always FALSE | `:135`, `:142` and all four spellings at `:184` |
+  | G6 | gate body inert (`return nil` first) | `:135`, `:142` and all four spellings at `:190` |
+
+  G4 and G5 are new here. They matter because the arming predicate is the one
+  place this gate can fail SILENTLY in either direction — over-arming disarms
+  every operator who has no route-based IPsec at all, under-arming leaves the
+  upgrade it exists to stop wide open — and only the pair binds both.
+
+  **One claim of round 8's own was wrong and is corrected in place.** The
+  round-8 entry below described the `maps_sync.go` → `ingress_exclusions.go`
+  split as moving the predicate and its rationale "verbatim". Checked by
+  extracting `userspaceSkipsIngressInterface` from `bcb5335cc:maps_sync.go` and
+  from the new file and diffing with comments stripped: the EXECUTABLE body is
+  byte-identical, 29 code lines on both revisions, so the "no behaviour change"
+  half of the claim holds. The COMMENT block is not verbatim — it carries the
+  four-call-site correction made in the same commit. A refactor commit that
+  says "verbatim" is asking the next reviewer to skip the diff, so the word is
+  not one to leave standing loosely.
+
+  Full `go build ./...` + `go vet ./...` + `go test ./...` green at this head.
+  Full `cargo test --release` green: exit 0, seven targets, 4402 tests, zero
+  failures.
+
+  **A note on the Rust leg, because the first attempt looked like a red.** The
+  first `cargo test --release` reached 4335 passing tests and then sat in three
+  `afxdp::wg::engine` serial tests for over ten minutes; a direct run of the
+  built binary then reported one failure,
+  `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, panicking on
+  "readers must have validated at least one snapshot (test not vacuous)". Both
+  were box contention — load average was 31 on 16 cores with several concurrent
+  cargo suites. The three wg tests pass in 0.37s in isolation on that same
+  binary, the seqlock test passes 3/3 in isolation, and a second full pass of
+  the same binary was 4278/0. None of the three subsystems (wg engine, shared
+  CoS lease, HA counters) is touched by this branch, and the same
+  one-test-fails pattern is on record for a BASELINE run and for unrelated
+  branches. Recorded rather than dropped: a load-sensitive non-vacuity guard
+  that reds under contention is indistinguishable from a real red at a glance,
+  and the next agent to hit it should not have to re-derive that.
+
+## 2026-08-13 — #6691 round 8: the exclusion's stated reason could not be established; the real one could
+
+- **Timestamp**: 2026-08-13 10:35 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR at `bcb5335cc` — two blocking
+  findings. B1 required settling a kernel/AF_XDP capability claim this branch
+  had been asserting since round 1; the answer moved the justification, not the
+  code.
+- **File(s)**: `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/ingress_exclusions.go` (new),
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go`,
+  `pkg/dataplane/userspace/secure_tunnel_binding_order_6691_test.go`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/refactoring-audit-current.txt`, `_Log.md`
+
+  **B1 — Codex was right about the premise and wrong about the conclusion.**
+
+  The branch justified excluding a route-based IPsec xfrmi from the userspace
+  dataplane with: "an XSK cannot come up on a virtual netdev, so admitting one
+  would make `drop_degraded_transit` DROP the plaintext." Codex called that
+  false. Checked, and it does not hold as written:
+
+  - `XskSocketRole::Private` returns `false` from `requires_zerocopy`
+    (`afxdp/bind.rs`), so zero-copy is role-conditional, not universal;
+  - `bind_flag_candidates_for_interface` hands a generic-XDP interface
+    `COPY_ONLY_BIND_FLAGS`;
+  - and — stronger than the review said — `fallback_shared_group_to_private`
+    converts a failed shared-UMEM group into private bindings automatically,
+    so the copy path is not merely present but REACHED without operator action.
+
+  So a copy-mode binding is reachable in this code. Whether it SUCCEEDS on an
+  `ARPHRD_NONE` netdev is still unsettled: BPF program load needs `CAP_BPF` in
+  the INIT user namespace, so `unshare -rn` cannot answer it (the veth control
+  failed identically). That link needs a live NIC and is NOT asserted anywhere
+  in the tree now.
+
+  **What replaced it is measurable here.** In a network namespace, an xfrm
+  interface reports `numrxqueues 1`, and with sysfs remounted
+  `/sys/class/net/xfrm0/queues/` holds exactly `rx-0` + `tx-0`. That single
+  entry is what BOTH planes count — `userspaceRXQueueCount` (Go) and
+  `rx_queue_count` (Rust) — and `replan_bindings_from_candidates` takes the
+  GLOBAL MINIMUM queue count across candidates. So admitting one zoned xfrmi
+  does not risk the tunnel's binding; it re-plans EVERY physical interface on
+  the box onto one queue and one worker. That is the #3091 single-worker
+  regression arriving through a door #3091 did not name.
+
+  Measured, by deleting `if iface.secure_tunnel { return false; }`:
+
+	the LAN interface was planned onto 1 queue(s), not its own 4
+	Planned: [("ge-0-0-1", 0), ("st0.0", 0)]
+
+  where the unmutated plan is `[(0,0,"ge-0-0-1"), (1,1,"ge-0-0-1")]`.
+
+  **Why the exclusion stays, and why the two narrower options do not work.**
+  Narrowing it per spelling cannot work: the queue count is a property of the
+  DEVICE, not of `st0` vs `st10.5`, so every spelling that resolves to a real
+  xfrmi carries it. Splitting it — adjudicate but do not bind — is worse than
+  either: an ifindex in the shim's ingress map with no READY binding takes
+  `drop_degraded_transit` (`userspace-xdp/src/lib.rs`, BINDING_MISSING), which
+  is the dead-tunnel configuration the old comment described. The two sets move
+  together or transit dies. Building an independent inbound policy path is real
+  work (TC ingress on the xfrmi, or host-inbound adjudication) and is #5619's
+  open half, already filed as #6700 — not a fold.
+
+  **The cost is stated plainly now, and it is a policy gap, not a drop.**
+  Decrypted plaintext traverses Linux routing with no xpf zone policy. Three of
+  four spellings lose an ingress claim they had on master. What master actually
+  did with that claim was not "working policy": it was either a one-worker box
+  (if the copy bind succeeds) or a dead tunnel (if it does not). The trade is
+  defensible; the previous framing, which advertised only the second branch as
+  certain, was not.
+
+  `secure_tunnel_would_collapse_the_global_queue_count` is the new guard. It
+  asserts the QUEUE COUNT rather than plan identity, so the reason is visible in
+  the failure rather than inferred from a diff of two layouts.
+
+  **B2 — a new authoritative wire field shipped at an unchanged version.**
+
+  `InterfaceSnapshot.secure_tunnel` is authoritative over binding admission, and
+  both sides stayed at protocol 4 — the exact shape `server/README.md` forbids
+  and #5488 was filed for. The skew consequence is the same collapse: a v4
+  helper ignores the tag, plans the xfrmi, and its one RX queue becomes the
+  global minimum. Nothing on the wire is malformed, so neither the version
+  equality check nor the content hash can see it.
+
+  Fixed as a lockstep v5 bump (`ProtocolVersion`, `CONFIG_SNAPSHOT_PROTOCOL_VERSION`)
+  plus `ensureSecureTunnelProtocolLocked` + `ErrSecureTunnelProtocolIncompatible`,
+  registered in `requiredProtocolGateSentinels`. The gate arms off
+  `configHasSecureTunnel`, which asks the SAME question the snapshot builder
+  asks (`Config.SecureTunnelNetdevForRef`) over the same refs, so it cannot arm
+  for a config with no flagged row or stay silent for one that has one.
+
+  Three mutations, each red on its intended assertion: unwiring the gate from
+  `ensureRequiredSnapshotProtocolLocked` reds the dispatcher assertion; dropping
+  the sentinel from the abort set reds `IsRequiredProtocolGateError`; reverting
+  `ProtocolVersion` to 4 reds the collision assertion AND all four spellings.
+
+  **Non-blocking, folded.**
+
+  - `secure_tunnel_binding_order_6691_test.go` carried a comment stating the
+    opposite of the assertion under it ("a name on no box must not enter the
+    allowlist" — it does, by construction, and `maps_sync.go` says so for the
+    sibling case). Corrected to describe what the assertion pins: the allowlist
+    tracks the RESOLUTION, not existence.
+  - "gates three sets and only three" was a miscount. Four Go call sites;
+    `snapshotBindingPlanKey` genuinely changes and
+    `buildUserspaceIngressBindingAliases` is inert for this row (no parent
+    ifindex, skipped before the predicate). Both the in-tree comment and the
+    README now enumerate all four and say which is inert and why.
+  - A unit that is BOTH `vlan-id 80` and a `bind-interface st5.3` target had no
+    doc and no test on either revision, though strict compile accepts it and the
+    two arms name DIFFERENT devices (`st5.80` vs `st5.3`).
+    `TestSecureTunnelOwnershipPrecedesVlanID` pins the order without arguing it
+    is the right one, and names the consequence if it moves.
+  - `maps_sync.go` had crossed the 2000-line refactor threshold on comment.
+    `userspaceSkipsIngressInterface` and its ~180 lines of rationale moved to
+    `ingress_exclusions.go`; the file drops 2130 → 1925, below both
+    the threshold and master's 1953. (Round 8b correction: an earlier draft of
+    this line said the block moved "verbatim". The EXECUTABLE body did — it is
+    byte-identical across the move, 29 code lines on both revisions, verified by
+    extracting the function from `bcb5335cc:maps_sync.go` and from the new file
+    and diffing with comments stripped. The COMMENT block did not: it carries
+    the call-site correction two bullets above, made in the same commit.) No
+    signature, behaviour or
+    caller change. Audit regenerated: `[REFACTOR] 2076` → `[WATCH] 1925`.
+
+  Validation: `go build ./...`, `go vet`, full `go test ./...`; full
+  `cargo test --release`. Mutation evidence above observed, not asserted.
+
+## 2026-08-13 — #6691 round 7: the veto fired before ownership, and ownership was not directional
+
+- **Timestamp**: 2026-08-13 09:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR at `0e807ec1a` — two blocking
+  findings, both reproduced firsthand against `origin/master` as a control
+  before anything was changed.
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_binding_order_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go`,
+  `userspace-dp/src/server/README.md`
+
+  **The diagnosis.** Round 6 got the DECOMPOSITION right and the EVALUATION
+  wrong. Splitting one key into two questions — ownership by the authored
+  spelling, the routing veto by if_id — is correct and stands; the questions
+  really are independent, because a device can be owned-but-not-created (a
+  collision) or created-but-not-this-ref's. What round 6 got wrong is that it
+  asked them in the wrong ORDER, and asked the first one SYMMETRICALLY.
+
+  **F1 — the collision veto fired before ownership was established.**
+  `secureTunnelBindingForRef` returned `secureTunnelIDCollision` from inside
+  the scan loop, so a collision between two spellings that name NEITHER of the
+  ref's devices still vetoed the ref. Measured through the REAL tolerant
+  compiler (`CompileConfigLenient` — the #2933 gate hard-rejects this at
+  commit, so the tolerant load / peer-sync path is the only way in, and it is
+  precisely the path the veto exists to govern) plus the real snapshot builder,
+  with `st5` stubbed live at ifindex 11:
+
+      set security ipsec vpn a bind-interface st05
+      set security ipsec vpn b bind-interface st0005
+      set interfaces st5 unit 0 family inet address 192.0.2.1/24
+
+  | measurement | origin/master | `0e807ec1a` | after |
+  |---|---|---|---|
+  | `SecureTunnelUnitNetdev("st5.0")` | n/a (no such function) | `("st5.0", true)` | `("", false)` |
+  | `st5.0` row netdev / ifindex | `st5` / 11 | `st5.0` / 0 | `st5` / 11 |
+  | RSS + AF_XDP allowlist | `[ge-0-0-0 st5]` | `[ge-0-0-0 st5 st5.0]` | `[ge-0-0-0 st5]` |
+
+  Both bindings derive if_id `0x50001` and neither creates a device called
+  `st5`, so their collision is real and routing will refuse both — it is simply
+  not `st5.0`'s collision. At a name on no box the row reports ifindex 0 and
+  `userspace-dp/src/filter/compiler.rs` skips `if iface.ifindex <= 0`: no
+  `filter input`, no per-unit CoS, no routing-instance binding, and the
+  junos-host deny scoped to a device that does not exist. The phantom `st5.0`
+  in the name-keyed allowlist is the other half.
+
+  **F2 — ownership was not directional.** The predicate compared BASES ONLY,
+  which is symmetric, and the relation is not: a DOTTED ref (`st5.0`) is a
+  logical unit that resolves through either authored spelling, while a BARE ref
+  (`st5`) is a base row whose netdev `snapshotLinuxName` sets to
+  `LinuxIfName(ifName)` — literally `st5` — so it is an xfrmi only under a bare
+  `bind-interface st5`. Measured with a real NIC `st5` at ifindex 11 carrying a
+  zoned unit 3, and a VPN binding `st5.0`:
+
+  | measurement | origin/master | `0e807ec1a` | after |
+  |---|---|---|---|
+  | `SecureTunnelNetdevForRef("st5")` | n/a | `("st5.0", true)` | `("", false)` |
+  | `st5` row `secureTunnel` / skipIngress | n/a / false | true / true | false / false |
+  | RSS + AF_XDP allowlist | `[ge-0-0-0 st5 st5.3]` | `[ge-0-0-0 st5.3]` | `[ge-0-0-0 st5 st5.3]` |
+
+  A live NIC removed from the dataplane by a VPN whose device is `st5.0` —
+  the same harm the round-6 `st05` finding describes, one spelling over. Note
+  what the master column says: `origin/master` carries NO secure-tunnel
+  exclusion arm at all (`userspaceSkipsIngressInterface` there has no
+  `iface.SecureTunnel` case), so both defects were introduced by this PR and
+  both fixes return these two configs to master's answers exactly.
+
+  **The decomposition was checked, not assumed.** The reviewer invited the
+  finding that these are not two independent questions. They are: with
+  `bind-interface st5` and `bind-interface st05` both present, `st5.0` HAS an
+  owner (`st5`) AND collides, and the veto must still fire — routing creates
+  neither device. That case is the negative control in the new test, and it is
+  why accumulating the collision across the whole loop (rather than dropping
+  the veto) is the fix. Both facts stay order-independent: `owner` is set by
+  any binding that names the ref, `collision` once two distinct names are seen,
+  and with no collision every claimant carries one name so `owner` is unique.
+
+  **Consequence accepted and stated, not hidden.** Under the canonical
+  `bind-interface st0.0`, the BASE row `st0` now reports `secureTunnel=false`,
+  and being zoned it contributes `st0` to the name-keyed AF_XDP/RSS allowlist
+  even though no `st0` netdev exists. Measured: `origin/master` does exactly
+  the same for that config, and the allowlist already behaves this way for any
+  zoned interface whose netdev is absent — a `ge-0/0/9` with no card is in it
+  on master too. It has no ifindex guard by design (it is consumed by name,
+  by `ethtool`), so this is a pre-existing property of that set rather than a
+  new class, and suppressing it would mean re-asserting that the `st0` row is
+  the xfrmi, which is the F2 defect.
+
+  **Mutation matrix — seven cells, each an exact revert edit on a clean tree,
+  restored and verified byte-identical by sha256; control green.** Scope
+  `./pkg/config/... ./pkg/dataplane/...`.
+
+  | cell | revert edit | result |
+  |---|---|---|
+  | A | none (control) | rc=0 |
+  | R7-M1 | collision verdict returned from inside the scan loop (round-6 order) | RED — `CollisionVetoRequiresAnOwner/neither name owns the ref` |
+  | R7-M2 | bare-ref arm `return !bindHasUnit` → `return true` (round-6 base-only compare) | RED — `BareRowRequiresTheBareSpelling/st5.0` |
+  | M1 | `SecureTunnelUnitNetdev` unowned arm → `(LinuxIfName(ref), true)` | RED — 3 tests / 5 subtests |
+  | M2 | ownership by if_id alone (drop the `bindInterfaceOwnsRef` call) | RED — 3 tests / 5 subtests |
+  | M3 | `snapshotLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M4 | `junosHostLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M5 | `ResolveKernelIfName` st arm reverted to master | RED |
+
+  **Which cells now bind differently, checked rather than assumed** — a
+  reordering fix is exactly the kind that can retire an existing cell silently.
+
+  - **M1 GAINED a test and lost none.** Measured at `0e807ec1a` (both at this
+    scope and at the full `./...`) it REDs 2 tests / 4 subtests
+    (`TestUnownedStNameKeepsItsDataplaneRole` ×1,
+    `TestUnownedSecureTunnelUnitResolvesToItsRealDevice` ×3); after this round
+    it REDs those same 4 plus the new collision sub-test. A strict superset.
+  - **M2 likewise:** it kept `OwnershipRequiresTheAuthoredSpelling`
+    (`st05`/`st+5`/`st0000005`) and gained both new tests.
+  - **M3, M4, M5 are unchanged** — same single test each
+    (`OwnershipPrecedesTheTunnelNameMap` for M3/M4,
+    `ResolveKernelIfNameUsesTheAuthoredBindInterface/st0` for M5).
+  - **One existing cell now binds for a DIFFERENT reason.** In
+    `TestSecureTunnelAddsNothingToTheAdjudicatedSets`, the `dotted_st0_0`
+    spelling's BASE row `st0` used to be held out of the ingress set by the
+    secure-tunnel arm; it is now held out only by `Ifindex <= 0`, because that
+    fixture stubs `st0.0` and not `st0`. Two independent reasons before, one
+    now. The `bare_st0` spelling is unaffected — there the base row IS the
+    device, stubbed at ifindex 42, and the arm is the only thing excluding it.
+  - **Two fixtures were vacuous for the NEW properties and are annotated as
+    such rather than left to look like coverage:**
+    `TestSecureTunnelOwnershipRequiresTheAuthoredSpelling` carries ONE VPN (so
+    no collision is reachable and the ORDER is invisible in it) and only BARE
+    spellings (so the DIRECTION is invisible too).
+  - **`FailsClosedUnderCollision` / `FallsBackUnderCollision` keep their
+    verdicts but reach them by a new route:** ownership is now established
+    first and the veto applied after, so those two also prove the ref was in
+    scope, which they previously could not distinguish.
+
+  **A round-6 claim corrected.** The round-6 entry below records M1 as
+  "RED — 4 tests, 5 subtests". Re-measured at that exact commit it is 2 tests
+  / 4 subtests, at both the scoped and the full `./...` scope. The cell was
+  and is RED; the count was wrong.
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  rc=0 (62 packages ok, zero failures — no flakes on this pass),
+  `cargo test --release` rc=0 (main target 4277 passed / 0 failed, the same
+  number the merge entry below records; 4401 across all 7 test binaries).
+  `origin/master` is unchanged at `edefb7570` and IS this branch's merge base,
+  so no merge was needed and `git merge-tree --write-tree` is clean. No Rust
+  source changed this round, so no `make generate` and no cluster smoke are
+  owed. The mutation matrix above ran at scope
+  `./pkg/config/... ./pkg/dataplane/...`; the M1 baseline comparison was taken
+  at both that scope and the full `./...` so the "superset" claim does not rest
+  on a narrower run.
+
+## 2026-08-13 — #6691: merge master edefb7570; the only conflict was _Log.md
+
+- **Timestamp**: 2026-08-13 07:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Merged `origin/master` (`edefb7570`, which had taken #6645's RBAC
+  work) into the round-6 fold (`03c747edd`). The PR went CONFLICTING between the
+  hostile verdict and this push purely because master moved.
+- **File(s)**: `_Log.md`
+
+  Master touched ~30 files across `pkg/api`, `pkg/authz`, `pkg/cli`,
+  `pkg/daemon` and `pkg/config/login_perms.go`; this branch touches none of
+  them, so `_Log.md` was the sole conflict — two hunks, each a pure INSERTION on
+  both sides at a shared anchor.
+
+  Union-resolved and proved structurally rather than eyeballed: the result
+  differs from OUR parent by exactly 1963 added / 0 deleted lines (precisely
+  master's insertions) and from THEIR parent by exactly 650 added / 0 deleted
+  (precisely ours), and 77130 + 650 + 1963 = 79743 is the resulting line count.
+  Zero lines lost from either side. The tree-wide marker sweep is ANCHORED
+  (`^(<<<<<<< |=======$|>>>>>>> |\|\|\|\|\|\|\|)`) because this file
+  accumulates prose ABOUT conflict markers and an unanchored grep
+  false-positives on it.
+
+  Gated on the MERGE RESULT, not the pre-merge head, because a conflict-free
+  merge can still fail to compile or trip a guard that arrived with master:
+  `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...` rc=0 (62 packages,
+  one more than before the merge), `cargo test --release` rc=0 (4277 passed / 0
+  failed). The `pkg/cluster` WaitForIdle flake seen earlier in this session
+  passed here too.
+
+## 2026-08-13 — #6691 round 6: the exclusion moved to ownership, the RESOLVER did not
+
+- **Timestamp**: 2026-08-13 06:10 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a hostile MERGE-NEEDS-MAJOR at `b847bbfc2` — three blocking
+  findings, all reproduced firsthand before being fixed.
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/config/types.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_ownership_6691_test.go`,
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/config-schema.md`, `docs/refactoring-audit-current.txt`
+
+  **The diagnosis, because it is the whole point.** Round 5 moved the EXCLUSION
+  predicate from a name shape to ownership. The NAME RESOLVER did not move.
+  `Config.SecureTunnelUnitNetdev` stayed purely lexical — it returned
+  `ok=true` with the verbatim ref for ANY `st<N>.<unit>` no VPN owned — and it
+  is consulted FIRST by all three resolvers. A half-moved two-part mechanism is
+  the worst outcome available: the half that moved is defended by tests, and the
+  half that stayed is what ships.
+
+  **F1 — an unowned `st<N>` unit resolved to a netdev that does not exist.**
+  Measured with `set interfaces st5 unit 0` and NO IPsec anywhere (nothing
+  reserves the `st` prefix; `schema_interfaces.go` takes a wildcard name, and on
+  bare metal `set chassis device-map` renames a real card to exactly this):
+
+  | ref | before | after |
+  |---|---|---|
+  | `st5.0` | `st5.0` | `st5` |
+  | `st5 unit 3 vlan-id 80` | `st5.3` | `st5.80` |
+  | junos-host scope (unit 0) | `[st5 st5.0]` | `[st5]` |
+
+  At a name that exists on no box the row reports ifindex 0, and
+  `userspace-dp/src/filter/compiler.rs` skips `if iface.ifindex <= 0` — so the
+  unit's `filter input` was never installed, nor its per-unit CoS, nor its
+  routing-instance binding. On the VLAN unit it also took the junos-host DENY
+  with it: the guard was scoped to a device on no box and could not fire, which
+  is verbatim what `TestJunosHostDenyScopeNamesTheSecureTunnelDevice` exists to
+  prevent.
+
+  **F2 — ownership keyed on `if_id`, a lossy digest of the authored string.**
+  `strconv.Atoi` erases a leading `+` and leading zeros, so `st5`, `st05`,
+  `st+5` and `st0000005` all derive if_id `0x50001` while `LinuxIfName` keeps
+  them as four DIFFERENT device names — and `pkg/routing/xfrm.go` creates the
+  device under the AUTHORED name. Measured: `bind-interface st05` plus a NIC
+  named `st5` left both `st5` rows `secureTunnel=true` with an empty ingress set
+  and an empty RSS allowlist. A live NIC removed from the dataplane by a VPN
+  that never names it.
+
+  **F3 — the `st` arm was placed BEFORE the `TunnelNameMap` lookup**, reversing
+  #6861 r5 at two NEW call sites. Strict-committable, no IPsec, no device-map:
+  `st0 unit 1 tunnel mode gre` has real device `st0u1`, and the snapshot
+  returned `st0.1`. `TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861`
+  established TunnelNameMap-FIRST three PRs ago and stayed green throughout,
+  because it only checks `ResolveKernelIfName` and the TunnelNameMap-derived
+  live set — an ordering invariant bound at one call site does not survive a
+  second call site being added.
+
+  **The fix.** `SecureTunnelUnitNetdev` now returns `ok=false` when NOTHING
+  binds the ref, so each caller runs its ordinary resolution and names the real
+  device. The verbatim ref survives in exactly two places, both deliberate: an
+  if_id COLLISION (routing creates NEITHER device, and the unit-0 collapse would
+  alias the unit row onto `st<N>` — a name equally absent but which LOOKS
+  resolvable, and which is also the base row's name), and `ResolveKernelIfName`'s
+  own fallback, which keeps master's answer for an unowned unit. That fallback
+  is gated on `IsSecureTunnelIfName` rather than master's unbounded
+  `Atoi(base[2:])`, so an out-of-range `st65536.3` now falls through to the
+  ordinary unit resolution and AGREES with the snapshot instead of diverging.
+
+  For F2 the choice was between comparing the resolved NAME, canonicalizing the
+  index, and rejecting the non-canonical spelling at commit. **Name comparison,
+  and the reasoning is the #1960 no-brick doctrine.** Canonicalizing the index
+  or rejecting at commit both make `bind-interface st05` invalid — and a config
+  already carrying that spelling is persisted and peer-syncable, so the
+  rejection would brick it on reload rather than at authoring time. Name
+  comparison is resolver-local: `XFRMIfNameAndID`,
+  `ValidateSecureTunnelBindInterface` and `pkg/routing/xfrm.go` are all
+  untouched, so nothing that
+  commits today stops committing.
+
+  **The if_id collision veto is KEPT and is now a separate test**, which the
+  name comparison alone would have lost. If a config binds BOTH `st5` and
+  `st05`, routing sees one if_id under two names and creates NEITHER; ownership
+  by name would have resolved `st5.0` to `st5`, naming a device routing has
+  already refused to create — the same divergence one spelling over. So
+  `secureTunnelBindingForRef` answers three-way: bound / unbound / id-collision.
+  Ownership asks "is this ref THIS device?" (authored base spelling); the veto
+  asks "will routing create it at all?" (if_id, the key routing collides on).
+
+  **The PR's own proof was VACUOUS.** `TestUnownedStNameKeepsItsDataplaneRole`
+  still PASSED with `buildUserspaceIngressIfindexes` returning nil
+  unconditionally — measured, not inferred. Two of its three assertions asserted
+  nothing: the ingress branch was gated on `row.Ifindex > 0` with no link
+  snapshot stubbed, so every row carried 0; and the RSS assertion accepted
+  `n == row.LinuxName || n == "st5"`, which cannot tell the correct `st5` from
+  the round-5 `st5.0`. Only the predicate assertion bound, so the comment's
+  claim that the sets were "asserted per SET rather than through the predicate
+  alone" was false. Both are now live — the netdev is stubbed to ifindex 11 and
+  both sets are asserted against the ABSOLUTE name — and the repaired test REDs
+  on that same nil mutation.
+
+  **Mutation matrix — five cells, each an exact revert edit, all RED by
+  assertion; control green.**
+
+  | cell | revert edit | result |
+  |---|---|---|
+  | A | none (control) | rc=0 |
+  | M1 | `SecureTunnelUnitNetdev` unowned arm → `(LinuxIfName(ref), true)` | RED — 4 tests, 5 subtests |
+  | M2 | ownership by if_id alone (drop `secureTunnelRefsNameOneDevice`) | RED — `st05`, `st+5`, `st0000005` |
+  | M3 | `snapshotLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M4 | `junosHostLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M5 | `ResolveKernelIfName` st arm reverted to master | RED |
+
+  M3, M4 and the `types.go` revert were the reviewer's three "DO NOT BIND"
+  mutations — all three left the whole suite green before this round. The arm
+  order is observable only on the config that names one ref as BOTH a bound
+  xfrmi and a GRE tunnel, so that overlap is where it is now pinned; ownership
+  wins, matching `ResolveKernelIfName`'s long-standing ordering.
+
+  **Six stale citations folded**, several pointing at symbols this PR itself
+  deleted: `xfrmi.go` cited a Rust `is_secure_tunnel_ifname` using
+  `parse::<i64>()` that round 5 removed; it named `userspaceSkipsIngressInterface`
+  as a caller of the predicate, which it no longer is; the 5619 test cited a Rust
+  `secure_tunnel_ifname_matches_go` that does not exist; `interfaces.go` cited a
+  `TestSecureTunnelResolverParity` that does not exist; `main_tests.rs` carried an
+  orphan doc paragraph for that nonexistent shared table; and `server/README.md`
+  restated the exclusion as the NAME SHAPE `st<N>`, repudiated 30 lines later in
+  the same file. Two file:line cites were off by ~50 lines
+  (`compiler_iface.go:72/754` → `:73/:805`). The claim that
+  `SecureTunnelNetdevForRef` is "the same resolver that decides which xfrmi
+  devices exist" is corrected in both places that made it: `pkg/routing/xfrm.go`
+  does not call it — they agree by both deriving through `XFRMIfNameAndID`, which
+  is a shared derivation and a drift risk, not a guarantee.
+
+  **A pre-existing red gate on the branch, fixed here.** `TestHeatmapNotStale`
+  was FAILING at `b847bbfc2`: the PR grew `maps_sync.go` from master's 1953 to
+  2076, crossing the 2000-line tier boundary, and the round-5 gate run was
+  scoped to `pkg/dataplane`/`pkg/config`/`pkg/routing` so it never covered
+  `pkg/refactoraudit`. Heatmap regenerated;
+  `pkg/dataplane/userspace/maps_sync.go` is now recorded `[REFACTOR]`. The tier
+  is accepted rather than worked around — trimming comments to duck a threshold
+  would be gaming the gate — and the split is left as follow-up, since it is
+  orthogonal to this fold and PR #6698 is stacked on this branch.
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  green, `cargo test --release` rc=0 (4277 passed / 0 failed). `pkg/config` and
+  `pkg/dataplane/userspace` run 3x each, green every time. Two failures seen on
+  the first full pass were triaged, not waved through: `TestHeatmapNotStale` was
+  the real pre-existing red described above and is fixed; the `pkg/cluster`
+  `TestWaitForIdleTimesOutWhileQueueAdvances` and the Rust
+  `install_session_serializes_with_reconcile_removal` are load-dependent timing
+  flakes, both 3/3 green in isolation and neither in any file this round
+  touches. No shim source changed, so no `make generate` and no cluster smoke
+  owed.
+
+## 2026-08-12 — #5619/#6691: merge master 4960e7bee; both conflicts were adjacency, not rewrite
+
+- **Timestamp**: 2026-08-12 19:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Merged `origin/master` (`4960e7bee`) into the #6691 secure-tunnel
+  ownership branch (`81962949f`) so the runtime-blocker fix is gated against
+  what it will actually land on. Result `5b2cfba97`.
+
+  **Two files conflicted; neither was a semantic collision.** Master's side is
+  the #6676/#5173 shim queue-coordinate work (`3f6faf297`, `4de0f9319`,
+  `a40766dad`, `2794010a1`, `db6b22576`), already merged to master, so none of
+  its hunks could be dropped.
+
+  `userspace-dp/src/main_tests.rs` — master added 1525 lines and this branch
+  added 152, both immediately after the same section separator. Relative to the
+  merge base BOTH sides are pure additions: neither deleted or altered a line
+  the other owns. A naive union would nonetheless have been WRONG here, because
+  each side's last test ends mid-`assert_eq!` and the two shared a single
+  trailing `);\n}` — dropping the markers alone would have left this branch's
+  assertion unterminated and fused two tests into one. Resolved instead by
+  composing from the three merge stages (base head + this branch's block +
+  master's block + base tail) and then proving the composition: it differs from
+  each parent by exactly the other parent's insertion (1525 and 152 lines
+  respectively) with ZERO deleted lines on either side.
+
+  `_Log.md` — both sides appended at the head and at the tail. Union-resolved
+  and checked the same way: zero lines lost from either parent.
+
+  Tree-wide anchored marker sweep (`^(<<<<<<< |=======$|>>>>>>> |\|\|\|\|\|\|\|)`)
+  returns nothing, `_Log.md` included; the anchor matters because this file
+  accumulates prose ABOUT conflict markers.
+
+- **File(s)**: `userspace-dp/src/main_tests.rs`, `_Log.md`
+
+- **Validation on the MERGE RESULT, not the pre-merge head** — the point being
+  that a conflict-free-looking merge can still fail to compile (master adds a
+  constructor while the branch adds required fields) or break a test (a guard
+  arriving with master closes a hole a fixture depended on). Neither shape
+  occurred here:
+    - `cargo test --release`: rc=0, 4401 passed / 0 failed across 7 suites
+      (main suite 4277, up from 4257 pre-merge — master's new shim tests).
+    - `TestUserspaceXDPShimObjectMatchesSourceManifest`: PASS, run explicitly
+      by name so a SKIP could not be read as a pass.
+    - `go build ./...` rc=0; `go vet` rc=0; `go test` on `pkg/dataplane`,
+      `pkg/config`, `pkg/routing` rc=0 (6/6 packages ok).
+    - `git diff --stat origin/master...HEAD -- userspace-xdp/` is EMPTY, and the
+      branch diff carries no `.o`/binary artifact — so no `make generate` and no
+      cluster smoke are owed.
+  All exit codes captured unpiped. An earlier Go run showed six socket tests
+  failing with `bind: invalid argument`; that was the 108-byte `sun_path` limit
+  hit by my own long TMPDIR prefix, not the merge — re-run under a short TMPDIR,
+  all green.
+
+- **#6691 fix confirmed intact after the merge**: `case iface.SecureTunnel:`
+  (`maps_sync.go:1705`, shifted from 1681 by master), `secureTunnelOwned`
+  (`interfaces.go:457`), the `secure_tunnel` serde field still omitted-when-false
+  on both planes, and `is_secure_tunnel_ifname` still deleted — only the comment
+  recording why it went remains.
+
+## 2026-08-01 — #5619 PR1 round 6: four Codex MAJORs folded; a security guard that could not fire
+
+- **Timestamp**: 2026-08-01 20:46 (fix/6691-secure-tunnel-ifname-r4)
+- **Action**: Folded four of the five MAJORs from the hostile Codex review of
+  `ebe370701...f754bee3a`. The fifth (a MAC-less xfrmi egress resolving to zone
+  0) is a pre-existing defect tracked as #6713 and fixed by open PR #6722, which
+  owns the same two Rust files; it is NOT touched here, and the documentation
+  claims that depended on it being fixed are corrected instead.
+
+  **M4 — junos-host denies were scoped to the wrong kernel device (FAIL-OPEN).**
+  This one the PR CREATED. `junosHostLinuxName` resolves the `iifname` scope for
+  `to-zone junos-host ... then deny` nft rules and claims to mirror
+  `snapshotLinuxName` exactly, but it still performed the generic unit-zero
+  collapse. Before the PR both sides collapsed `st0.0` -> `st0` and agreed on a
+  wrong name; the PR fixed only the snapshot, so with `bind-interface st0.0` the
+  renderer emitted `iifname st0` while the decrypted plaintext arrives on
+  `st0.0`. The deny could never match. Fixed by deriving BOTH names from one
+  resolver, `Config.SecureTunnelUnitNetdev` (`pkg/config/xfrmi.go`), which
+  `ResolveKernelIfName`, `snapshotLinuxName` and `junosHostLinuxName` now all
+  call — not three copies asserted to agree.
+
+  **M2 — the secure-tunnel predicate admitted names that cannot be xfrmis.**
+  `XFRMIfNameAndID` bounds the index to `[0, 65536)` (the if_id is
+  `stIndex<<16 | unit+1`); `IsSecureTunnelIfName` ran a bare `Atoi` with no
+  bounds, so `st-3` and `st65536` classified as secure tunnels. Interface names
+  are wildcard-authorable with no `st` reservation, so `st65536` is an ordinary
+  data interface — and the PR's new exclusion removed it from the ingress map,
+  the AF_XDP binding plan and the RSS allowlist. A traffic outage on a valid
+  interface. Both now share one unexported `secureTunnelIndex`; the Rust mirror
+  `is_secure_tunnel_ifname` gets the identical bound.
+
+  **M5 — the collision fallback contradicted the routing fail-closed contract.**
+  Two DISTINCT bind-interface strings deriving one if_id made
+  `SecureTunnelNetdevForRef` return the lexicographically smallest name "for
+  determinism", and a test REQUIRED that. `pkg/routing/xfrm.go` deletes BOTH
+  colliding devices from its desired set, so neither exists on the box; naming
+  one is deterministically wrong. Now returns `("", false)`. Two VPNs authoring
+  the SAME string are still not a collision — one name, one device — and still
+  resolve.
+
+  **M3 — multiple resolvers disagree.** Scoped deliberately. The three that this
+  PR's rule belongs to are unified above. Four pre-existing divergences in LIVE
+  code (reached via `CompileUserspaceShim` -> `CompileConfig` -> `compileZones`,
+  not retired-eBPF-only) were verified firsthand and FILED rather than
+  half-fixed: #6728, #6729, #6730, #6731.
+
+  **Documentation.** Six claims Codex flagged as false were verified against the
+  code and corrected, not softened: the xfrmi does NOT enter the egress map
+  (`populate_egress`'s src_mac gate needs a MAC, a parent's MAC or the tunnel
+  flag, and an ARPHRD_NONE xfrmi has none); a matching permit does NOT preserve
+  delivery today (`evaluate_policy_result_l3_aware` wraps its whole walk —
+  exact, wildcard AND `junos-global` — in `if from_id != 0 && to_id != 0`), and
+  that behaviour DEPENDS ON #6722; an any/any policy does NOT match zone zero
+  (same guard, since #3110); `next-hop st0.0` still does not resolve; and a
+  deployment with no bound VPN is NOT unchanged (the merge base collapsed an
+  unbound unit zero to `st0`, head returns `st0.0`, and the exclusion keys on
+  the NAME, not on the presence of a VPN).
+
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/config/types.go`,
+  `pkg/config/junos_host_deny.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go`,
+  `pkg/dataplane/userspace/junos_host_netdev_parity_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`
+- **Validation**: Every behavioural fix was proven by mutating the fix OUT and
+  confirming build + `go vet` CLEAN with the specific guard RED on a real
+  assertion. Six mutations, including two at the EDGE of the claim rather than
+  its centre: an off-by-one bound (`>` for `>=`) that keeps `st65535` green
+  while `st65536` reds, and an over-strict collision test that reds only the
+  same-bind-interface case. One mutation deliberately moved the SHARED resolver
+  so both planes agreed on the wrong name — the parity test stayed GREEN and
+  only the new absolute test went RED, which is why an absolute assertion was
+  added rather than relying on parity.
+
+## 2026-08-01 — #5619 PR1 round 5: the TX-disposition trace was WRONG; retraced by execution
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Retracted and replaced the round-4 conclusion recorded above.
+  Round 4 concluded "no new drop; the TX dispatcher drops it either way". That
+  is **false**: a LAN->tunnel packet never reaches the TX dispatcher, because
+  the FIB claims it on an earlier arm. The round-4 trace analysed a site that
+  neither revision executes for this flow.
+
+  Retraced by EXECUTION rather than by reading, on both revisions:
+
+  1. Go half — the same probe file run at HEAD `dcd9f7207` and at the merge-base
+     `ebe370701`, dumping `buildInterfaceSnapshots` with `buildLinkSnapshot`
+     stubbed so only the netdev `XFRMIfNameAndID(bind-interface)` names exists.
+     Measured: the secure-tunnel UNIT row's ifindex changes for **exactly one**
+     spelling. `bind-interface st0.0` goes 0 -> 42. `st0`, `st10.5` and `st0.7`
+     were ALREADY 42 pre-fix (no unit-0 collapse fires for a non-zero unit, and
+     for bare `st0` the collapsed name IS the device).
+
+  2. Wire half — the real `buildSnapshotWithSchedulerStateAndNATCounters` output
+     serialized to JSON on each revision, then deserialized by the REAL Rust
+     `build_forwarding_state` + `lookup_forwarding_resolution_v4`. Matrix:
+     2 spellings x 3 next-hop spellings x 2 destinations = 12 cells.
+
+  Result: 4 of 12 cells flip disposition, ALL of them in the dotted
+  `bind-interface st0.0` spelling (4 of that spelling's 6). Zero cells flip for
+  bare `bind-interface st0`. The flip is `NoRoute` (egress 0) ->
+  `MissingNeighbor` (egress 42), caused by the tunnel's connected prefix
+  entering `connected_v4` once the unit row clears
+  `populate_interfaces`' `ifindex <= 0` skip.
+
+  Classification: **correction, not regression.** Both spellings describe ONE
+  tunnel (same if_id, same unit ref `st0.0`); pre-fix they took DIFFERENT
+  dispositions purely because of the name bug, and post-fix they converge on
+  what the canonical bare spelling already did. Operator-visible consequence,
+  now stated in the code and the PR body: `NoRoute` reinjects to the kernel
+  unconditionally while the `MissingNeighbor` arm evaluates zone policy first
+  and a DENY exits before the reinject gate — so LAN->tunnel transit with no
+  `from-zone <lan> to-zone <tunnel-zone>` permit goes from kernel-delivered to
+  dropped on the dotted spelling. That reinject was a zone-policy bypass, which
+  is #5619's subject. Under a PERMIT both arms reinject; nothing changes there.
+
+  Also measured and corrected: the "exclusion was an accident before #5619"
+  claim held for the dotted spelling ONLY. At the merge-base, `st0`, `st10.5`
+  and `st0.7` were in `buildUserspaceIngressIfindexes` AND
+  `UserspaceBoundLinuxInterfaces`. The exclusion arm is therefore NEW behaviour
+  for three of four spellings, not a preserved accident — it must not be deleted
+  as inert.
+
+- **File(s)**:
+  - `pkg/dataplane/userspace/interfaces.go` — the disposition caveat at the fix
+    site (the code, not just the PR body, now carries it).
+  - `pkg/dataplane/userspace/maps_sync.go` — replaced the false
+    "changes no disposition" paragraph with the measured result; corrected the
+    accident claim to three-of-four-spellings; fixed a dangling citation to
+    `TestSecureTunnelSpellingsAllExcluded` (never existed) ->
+    `TestSecureTunnelStaysOutOfDataplaneSets`.
+  - `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go` —
+    `TestSecureTunnelSpellingsAgreeOnForwardingInputs` plus the
+    `connectedPrefixInputs` projection that mirrors the Rust
+    `populate_interfaces` gate.
+  - `userspace-dp/src/afxdp/forwarding_build/tests.rs` —
+    `secure_tunnel_unit_ifindex_decides_route_disposition` pins the FIB half.
+  - `userspace-dp/src/main_tests.rs` — dangling citation
+    `TestSecureTunnelAddsNothingToDataplaneSets` ->
+    `TestSecureTunnelAddsNothingToTheAdjudicatedSets`.
+
+- **Validation**: `go build ./...` 0 and `go vet ./pkg/dataplane/...` 0 asserted
+  BEFORE trusting any red. Mutation at BOTH edges of the fix's scope, each with
+  build+vet clean first and named PASS/FAIL lines, never a bare exit code:
+    - M1 remove the arm (original unit-0 collapse): target test FAILS on
+      `dotted_st0_0` (both the per-spelling ifindex assertion and the
+      cross-spelling set equality); 3 controls PASS.
+    - M2 reconstruct `<ifName>.<unit>` (round-1 bug): target test FAILS on
+      `bare_st0` via the PER-SPELLING assertion ONLY — the set-equality half
+      stays green because the base `st0` row still carries (42, 10.5.5.1/30).
+      That is exactly why both halves are asserted; a set-only guard would have
+      been scoped narrower than its claim.
+    - M3 widen the FIB gate to `ifindex < 0`: the Rust test FAILS with
+      `left: MissingNeighbor / right: NoRoute`; 3 sibling secure-tunnel tests
+      PASS. (First re-run after restoring the file reported FAIL from a stale
+      mtime, not a real failure; `touch` + re-run is green.)
+  Full suites green at the head: `go test ./...` rc 0, zero FAIL lines;
+  `cargo test --bin xpf-userspace-dp` 4238 passed / 0 failed.
+
+- **Not verified**: no cluster smoke (parent schedules those; the loss cluster
+  runs no route-based IPsec) and nothing exercised against a live xfrmi. The
+  `poll_descriptor` consequence of the flip (the `MissingNeighbor` arm's
+  deny -> `break RecycleAndContinue` bypassing the reinject gate) is read from
+  source plus the pinned `is_slow_path_eligible` table, NOT executed — the
+  worker loop was not run. INCONCLUSIVE and not chased: whether the
+  negative-neighbor cache (3 s TTL, armed on `pending_neigh` timeout) makes a
+  PERMITTED tunnel flow fast-fail instead of reinject. If it does it is
+  PRE-EXISTING — bare `st0` already resolved MissingNeighbor at the merge-base —
+  but this change extends its reach to the dotted spelling.
+
+## 2026-08-01 — #5619 PR1 round 4: TX disposition traced; claim narrowed
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Traced the TX path to a terminal outcome before deciding whether
+  to widen the exclusion into populate_interfaces/populate_egress. Verdict: DO
+  NOT WIDEN — the current state introduces no new drop and is a strict
+  improvement, and widening would trade an already-existing drop for a possible
+  policy bypass.
+
+  The chain, verified in code rather than from doc comments:
+    - resolve_next_hop_target_v4 (forwarding_build/fib.rs) ends
+      `.unwrap_or((0, 0))`, so an interface-named next-hop that fails to resolve
+      keeps the route with ifindex 0.
+    - PRE-#5619 the xfrmi was absent from names/linux_names (populate_interfaces
+      gates on ifindex > 0 and its ifindex was 0), so `next-hop st0.0` resolved
+      to ifindex 0.
+    - resolve_tx_binding_ifindex (tx/dispatch/shared_recycle.rs) does
+      `egress.get(&ifindex) ... .unwrap_or(egress_ifindex)`, so target 0 stayed 0.
+    - A target ifindex with no XSK binding is dropped by the TX dispatcher:
+      `missing_egress_binding` + recycle_ingress_frame (tx/dispatch/mod.rs).
+      There is NO kernel fallback arm.
+    - POST-#5619 the ifindex resolves to the real xfrmi, which still has no
+      binding (deliberately) — so the frame drops at the SAME site for the SAME
+      reason. Only the ifindex named in the exception differs.
+
+  Net change is therefore a strict improvement: the egress zone now resolves, so
+  a LAN->tunnel flow is adjudicated against the real zone pair instead of an
+  unresolved one. Widening the exclusion would remove that, and an interface
+  absent from the zone maps resolves to zone_id 0, which a `from-zone any
+  to-zone any permit` matches with no zone guard (#6682) — trading a
+  pre-existing drop for a possible policy bypass.
+
+  Claim narrowed in both shipping artifacts (maps_sync.go exclusion comment and
+  userspace-dp/src/server/README.md): the predicate gates the ingress map, the
+  binding plan and the RSS allowlist — and ONLY those. The FIB/egress/zone maps
+  DO see the xfrmi, with the traced consequence stated and an explicit warning
+  not to "fix" it by widening.
+
+  Also completed the vacuity audit of earlier mutation rounds under the strict
+  run-detector: round 1 4/4 tests RAN, round 2 7/7 RAN, and the only vacuous run
+  was the transitional round-3 baseline (3 renamed-away tests) which was never
+  used as evidence. Rust rows were safe by construction — proven by feeding a
+  deliberately missing test name through the detector (cargo rc=0, "0 passed",
+  detector correctly reports NOTRUN).
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+## 2026-08-01 — #5619 PR1 round 3: bare `bind-interface st0` regression (MAJOR-1/2/3)
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Hostile re-gate found the round-1 fix REGRESSED the bare
+  `bind-interface st0` spelling — the same defect it fixed, in the opposite
+  direction.
+
+  `snapshotLinuxName` synthesized `fmt.Sprintf("%s.%d", ifName, unit.Number)`,
+  but the reconciler creates `LinuxIfName(bind-interface)` VERBATIM and those
+  are equal only for the dotted spelling. pkg/routing/xfrm.go:87-89 states it
+  outright: a bare "st0" and an explicit "st0.0" derive the SAME if_id under
+  DIFFERENT device names. Measured: with `bind-interface st0` the device is
+  `st0`; PRE-round-1 snapshotLinuxName returned "st0" (correct), POST-round-1 it
+  returned "st0.0" (a name on no box).
+
+  Fix: resolve from the AUTHORED bind-interface via a new
+  `Config.SecureTunnelNetdevForRef`, joining on if_id — XFRMIfNameAndID is the
+  SSOT for both halves. Reconstructing a name another component owns is what
+  caused the original drift; the round-1 fix repeated it one level down.
+  `ResolveKernelIfName` had the SAME bug and now shares the helper, so the
+  parity guard stays meaningful instead of pinning two identically-wrong
+  resolvers. Deterministic under an if_id collision (lexicographically smallest
+  device), for the tolerant-load path.
+
+  Tests were keyholes: every case was dotted and the expected device was
+  hardcoded. Now table-driven over bare `st0`, dotted `st0.0`, multi-digit
+  `st10.5` and non-zero unit `st0.7`, with the expected device DERIVED from
+  XFRMIfNameAndID so a reconstruction bug cannot be mirrored by the test.
+
+  MAJOR-2 measured rather than argued. The "identical before and after" claim
+  was too broad and is withdrawn; what holds is the ADJUDICATION boundary.
+  Deltas, measured by resolving/not-resolving the unit through the
+  buildLinkSnapshot seam:
+    - buildLocalAddressEntries 2 -> 3: the CONFIGURED address was already
+      present pre-fix (unit rows merge configured addrs regardless of the live
+      lookup), so the delta is live-ONLY addresses (the xfrmi link-local).
+      Correct — those are genuinely firewall-local.
+    - connected-route FIB: prefixes IDENTICAL; only ifindex/MTU fields change.
+    - BuildZoneHostInboundViews: gains the live-only address in the deny scope
+      — CLOSES scope rather than opening it.
+    - AddresslessEnforcingInterfaces: no change.
+    - MonitoredInterfaceLinkIndexes / buildNeighborSnapshots: not exercisable
+      through the seam (they call netlink.LinkByName against the real kernel).
+      By inspection the tunnel link becomes monitored, which is correct — and
+      notably the bare-st0 regression would have REMOVED monitoring that
+      previously worked.
+    - UserspaceBoundLinuxInterfaces: [ge-0-0-0 st0] -> [ge-0-0-0]. Correct: it
+      is keyed by NAME with no ifindex guard, so it had been listing a device
+      that does not exist for the dotted spelling.
+- **File(s)**: pkg/config/xfrmi.go, pkg/config/types.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go, _Log.md
+
+## 2026-08-01 — #5619 PR1 round 2: prove the exclusion changes nothing
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Review conditions on the reshape. "Net forwarding behaviour is
+  identical before and after" was the load-bearing claim and was asserted in
+  prose; it is now proven by DIFFERENTIAL tests on both planes — the same
+  config/candidate list is built twice, with and without the route-based VPN,
+  and the ingress-adjudication set, the RSS allowlist and the AF_XDP binding
+  plan must come out byte-identical. Both differentials assert the tunnel row
+  is RESOLVED first, so neither can be satisfied by the pre-fix ifindex-0
+  accident.
+
+  Exclusion scope stated rather than implied: a BASE-name match (unit stripped)
+  against `st` + numeric remainder. Covers `st0`, `st0.0`, `st10.5`; does NOT
+  cover `stx` / `start0`, which stay adjudicated — over-matching would silently
+  drop a real data interface out of adjudication.
+
+  MTU/addresses now asserted rather than riding along: a secure-tunnel unit
+  reported MTU 0 and no live addresses because it resolved to the nonexistent
+  netdev `st0`.
+
+  Mutation matrix extended to 6 rows with a `go vet` gate added alongside the
+  two build gates. Row 3 reds the Rust arm alone and row 2 the Go arm, so each
+  exclusion arm is independently bound. Row 5 mutates the OTHER resolver
+  (`ResolveKernelIfName`) and reds `parity` ALONE — the parity guard binds
+  DIVERGENCE symmetrically, not merely the absence of the rule on one side.
+  Row 6 resolves to a wrong-but-plausible netdev and reds the MTU/address
+  guard, so it binds the real device rather than "the name changed".
+
+  Filed #6700 for the remaining work with the evidence verbatim: the AF_XDP
+  bind on a virtual netdev (1 RX queue, no ndo_bpf/ndo_xsk_wakeup) AND the
+  reverse direction — LAN->tunnel egress needs the dataplane to hand plaintext
+  INTO the xfrmi for kernel encryption, which is a new egress mechanism, not a
+  config change.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  _Log.md
+
+## 2026-08-01 — #5619 PR1: secure-tunnel netdev name drift + explicit dataplane exclusion
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: `snapshotLinuxName` resolved a secure-tunnel unit `st0.0` to the
+  netdev `st0` via the generic unit-0 collapse, but the xfrmi reconciler
+  creates the device under the VERBATIM dotted ref (`XFRMIfNameAndID` returns
+  `LinuxIfName(bindInterface)`), so the real netdev is `st0.0`. The dataplane
+  therefore looked up a name that exists on no box: the unit reported ifindex
+  0, MTU 0 and no addresses.
+
+  `Config.ResolveKernelIfName` already had the correct `st<N>.<M>`-verbatim
+  short-circuit AND a doc comment requiring `snapshotLinuxName` to be kept in
+  sync with it — nothing enforced that, and the dataplane copy silently lacked
+  the rule. Extracted the lexical test to `config.IsSecureTunnelIfName` so both
+  resolvers apply one predicate instead of a hand-copied third instance, and
+  added `TestSecureTunnelResolverParity` as the drift guard that was missing.
+
+  Fixing the name alone would have been a REGRESSION, not a fix. Measured
+  before writing it: with the ifindex resolving, the xfrmi enters
+  `userspace_ingress_ifaces` (`[11]` -> `[11 42]`), the AF_XDP binding plan and
+  the RSS allowlist. The shim would then claim the xfrmi's ingress and steer it
+  to an XSK that cannot come up on a virtual netdev (no `ndo_bpf` /
+  `ndo_xsk_wakeup`, so no zero-copy), and `drop_degraded_transit` would DROP
+  the decrypted plaintext — turning a policy gap into a dead tunnel. The
+  exclusion that previously happened by ACCIDENT (ifindex 0) is now stated
+  deliberately on both planes: `userspaceSkipsIngressInterface` (Go, gates the
+  ingress map + RSS allowlist) and `include_userspace_binding_interface`
+  (Rust, an INDEPENDENT gate on the binding plan — the Go snapshot ships every
+  interface regardless). Net forwarding behavior is identical before and after.
+
+  Scope: this does NOT close #5619. Decrypted IPsec plaintext still traverses
+  Linux routing with no xpf zone policy — the open half needs the dataplane to
+  own the xfrmi end-to-end including a plaintext egress path into the tunnel.
+  Both exclusion sites and the README say so explicitly so a future reader
+  cannot mistake the exclusion for a decision that the gap is acceptable.
+
+  Validation: Go `pkg/config` + `pkg/dataplane/userspace` suites green; Rust
+  build clean; 4-row mutation matrix with build gates on both toolchains.
+- **File(s)**: pkg/config/xfrmi.go, pkg/config/types.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/server/README.md, _Log.md
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
@@ -73185,6 +76066,110 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
+  **[SUPERSEDED by the two entries below]**: the "fold to view-only" clause
+  never shipped. The #6838 review found it strands `configure` on a
+  configured-root class, so the tolerant path folds to a REPAIR FLOOR
+  ({view,configure} ∩ what the class already held) instead. Annotated in place
+  rather than rewritten — this log is append-only history, not current state.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/types_system.go, pkg/config/compiler_system.go, pkg/config/compiler_opts.go, pkg/config/compiler_tailgates.go, pkg/config/login_class_deny_5831_test.go, pkg/config/login_custom_class_4304_test.go, docs/system-login.md
+- **Timestamp**: 2026-08-05
+  **Action**: #6838 review fold — the tolerant view-only collapse stranded
+  `configure`, so it now folds to a REPAIR FLOOR ({view,configure} ∩ what the
+  class already held). `daemon_run.go` binds the configured class to any
+  matching OS user including root, so a configured-root class lost the only
+  access that could delete the offending statement while the strict gate
+  rejected every commit. Also corrected four comment/doc claims that still
+  described pre-PR behaviour.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_opts.go, pkg/config/compiler_system.go, pkg/config/compiler_tailgates.go, pkg/config/schema_system.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
+- **Timestamp**: 2026-08-05
+  **Action**: #6838 review fold r2 — the repair floor retains {view,configure},
+  so a deny AIMED AT A RETAINED BUCKET is unenforceable AND unrestricted, but
+  the warning carved out CONFIGURATION only. `deny-commands "show interfaces"`
+  targets PermView, also retained, and was silently described as restricted.
+  The warning is now generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim cannot be wider than the
+  behaviour, and states plainly that the fold reduces blast radius rather than
+  enforcing anything. Also converted permission expectations to rendered
+  strings — `PermView` is the iota ZERO value, so slice expectations could be
+  satisfied by an uninitialised element.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
+- **Timestamp**: 2026-08-13
+  **Action**: #6838 review fold r3 — the tolerant fold resolved the class to
+  mutate by NAME through a last-wins map, but pkg/cli's `resolveClassPerms`
+  returns the FIRST match, so a config spelling `class limited` twice folded an
+  object the runtime never reads. Measured through the real peer-sync ingress
+  (SyncApply -> ActiveConfig -> checkPermission): PermAll live, `request system
+  zeroize` allowed, secrets in cleartext, and a warning claiming a reduction
+  that had not happened. BOTH orderings failed open, and the pointer fix alone
+  closes only one — with the deny on the SECOND block, folding exactly the
+  offender is correct by identity and useless in effect, because the runtime
+  reads the first block. So the fold now carries the *LoginClass pointers AND
+  narrows the whole same-named cohort, making the outcome independent of the
+  reader's tie-break rule rather than matching it (matching would be a proxy
+  that rots the day resolveClassPerms changes its pick). Each half is bound by
+  its own subtest and reds on its own revert. Also: repaired the two #6662
+  packed-gate tests the master merge left RED — their fixtures carried deny
+  leaves the new strict gate refuses, and one asserted the MORE PERMISSIVE
+  advisory this PR deleted; the deny carry-through they were buying moved to a
+  new both-AST-shapes test rather than being dropped. Bound the previously
+  unguarded `range lc.MappedPermissions` advisory line. Replaced the per-leaf
+  `case` arm that recorded DenyLeavesPresent with a loginClassLeafRestrictive
+  classification table the compiler consults, plus a two-direction
+  schema-drift canary, so a restrictive leaf added to the schema cannot
+  silently default to unrestricted. Corrected two further stale references to
+  the deleted MORE PERMISSIVE advisory.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_system.go, pkg/config/compiler_system_login_gates.go, pkg/config/types_system.go, pkg/config/login_class_deny_5831_test.go, pkg/config/compiler_system_login_packed_6662_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
+- **Timestamp**: 2026-08-13
+  **Action**: #6838 review fold r4 — the tolerant fold shipped a NEW
+  operator-facing claim that was false for a class NAME shadowing a
+  system-defined one. `class super-user { permissions all; deny-commands
+  "request system zeroize"; }` warned "The class is folded from {super-user} to
+  {configure,view}" while the RBAC evaluator consulted the built-in table
+  first, so the runtime returned PermAll: zeroize allowed, secrets in
+  cleartext. Reproduced firsthand through the real peer-sync ingress on this
+  head AND on origin/master (edefb7570) — the SAME probe allows zeroize and
+  renders cleartext on both, so the runtime delta is zero and this is a message
+  defect, not a regression. Fixed as a message defect: the fold now skips a
+  name in `LoginClassPermissions`, per NAME, so the whole cohort is skipped
+  together. That also repairs a knock-on the fold had introduced — the #4304
+  advisory is the second and only other production reader of
+  `MappedPermissions` (the other being `config.ResolveClassPermissions`), and
+  folding a shadowing class had turned its "mapped to
+  {super-user}" (true, the built-in grants everything) into "mapped to
+  {configure,view}", which is the precise sentence the #6701 warning beside it
+  calls out as untrue. Both claims are now back to what #6701 found. Nothing is
+  added in their place: #6701 already states the truth for this shape in the
+  same warning list, and whether an inert definition deserves more than a
+  warning is #6701's question. Also bound three message-rendering lines this
+  round's cohort fold had added or made load-bearing, each removable with the
+  full pkg/config + pkg/cli suites green — the `seen` leaf-name dedup (only
+  reachable once the cohort's leaves were concatenated), `sort.Strings(leaves)`,
+  and `unionPerms`' dedup scan — with ONE two-block fixture whose leaves
+  duplicate across blocks, arrive out of sorted order, and whose permission
+  sets overlap, so all three degrade the same rendered string on different
+  clauses. And pinned the strict gate's report-one CHOICE, which is
+  first-appearance-of-NAME rather than of the offending BLOCK: only an
+  alpha/beta/alpha straddle distinguishes the two rules, and the choice is an
+  operator-facing message no test constrained.
+  **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  rc=0 (whole tree, 62 packages ok, zero FAIL) on the merge result. Five
+  independent revert proofs, each observed RED: removing the shadowing guard
+  reds three separate assertions (narrowed MappedPermissions, the false fold
+  claim, the narrowed advisory); removing `sort.Strings(leaves)`, the `seen`
+  dedup, or `unionPerms`' dedup each reds the rendered-message comparison; and
+  reporting `rejections[len-1]` instead of `rejections[0]` reds the ordering
+  pin with `beta`. After merging origin/master (edefb7570) every citation in
+  this round's new comments was re-checked and corrected: #5561 moved the
+  built-in-first lookup out of `pkg/cli resolveClassPerms` into
+  `config.ResolveClassPermissions`, now shared by the CLI adapter and the REST
+  surface's `pkg/authz` gate. Precedence is unchanged, so the fix's premise
+  holds on both surfaces — and it is asserted rather than assumed: the new test
+  fails with "premise changed" if a built-in ever stops answering for a
+  shadowing name. All five revert proofs were re-run on the merge result and
+  each still reds.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-08-01 16:40
 - **Action**: #6713 — a MAC-less IPsec secure tunnel (`st0`, an xfrmi) is
   skipped by `forwarding_build::populate_egress` (its `src_mac` gate is
@@ -77251,6 +80236,85 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
   pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
 
+## 2026-08-06 — #6827 gate fold r2: bind the generation fence and listener recovery
+
+- **Timestamp**: 2026-08-06
+- **Action**: F1 — `TestDebtClearIsGenerationSafe_6827` was a TAUTOLOGY. It
+  re-implemented `d.staleCertGen == gen` in its own body and asserted on its
+  own arithmetic (`2 == 1` is false, so `stillPending` was true
+  unconditionally); the production comparison was never called. Measured:
+  `if true || d.staleCertGen == gen` left `pkg/api` + `pkg/daemon` GREEN. It
+  now drives `deliverStaleMgmtCertDiagnosis` for real and bumps the generation
+  from INSIDE the unlocked window via the `osHostname` seam (which
+  `management.go` reads at exactly that point), then asserts the debt survives.
+  A second subtest is the negative control: with no concurrent rename the debt
+  MUST settle, so the pair distinguishes the fence from both an unconditional
+  clear and a never-clear.
+- **Action**: F2 — two runtime behaviour changes in the merge range were
+  wholly unbound. (a) `reconcileTo` used to `return nil` when `m.srv == nil`,
+  making a boot HTTP bind failure ABSORBING; it now retries construction via
+  `startLocked`. (b) `startLocked` now unrecords `cur.tls`/`cur.httpsAddr`
+  when the boot HTTPS bind failed, so a later IDENTICAL reconcile issues
+  `ReconcileHTTPS` instead of seeing "no change". Both could be reverted
+  wholesale with the suite green — `TestHTTPSBindFailureIsNotReportedAsServing_6827`
+  binds the `HTTPSServing` predicate but calls it DIRECTLY, so the
+  reconciler's USE of it was unbound. New
+  `TestMgmtListenerRecoversFromAFailedStart_6827` binds both at the call site,
+  with an over-reach guard on each side (a disabled API must NOT be
+  constructed by a reconcile; a SUCCESSFUL boot HTTPS bind must still record
+  its fingerprint). Behaviour unchanged — the retry builds from
+  `desired(cfg)` with the #4047/#5127 loopback clamp intact and retains no
+  prior listener.
+- **Action**: F3 — `pkg/api/README.md` and three `listener.go` comments
+  documented a field named `exited` "stored from a defer over the whole serve
+  goroutine". No such field exists: the shipped predicate tests `dead` and
+  `stopping`, and `stopping` is stored EXPLICITLY at the top of the drain arm,
+  before `Shutdown`. Corrected there and in four `tls_stale_cert_6827_test.go`
+  sites, one of which gave a "RED on revert: delete the defer in
+  serveLegLocked" recipe for code that is not there. The replacement recipe
+  was verified firsthand. Two adjacent clauses claiming root-context shutdown
+  "sets no flag at all" were also corrected — it sets `stopping`.
+- **Action**: DOCS — `pkg/daemon/README.md` had NO coverage of this work and
+  was untouched by the PR even though `pkg/daemon/management.go` gained ~120
+  lines. Added the boot-start recovery bullet (both halves) and a
+  stale-certificate-diagnosis subsection covering the debt, the delivery-time
+  kernel read, and the generation fence.
+- **Validation**: `go build ./...` 0; `go test ./pkg/api ./pkg/daemon
+  ./pkg/config -count=1` 0; `go test -race ./pkg/api ./pkg/daemon -count=1` 0;
+  `go vet ./pkg/api ./pkg/daemon` 0; `go test ./pkg/refactoraudit/...` 0.
+  Mutation grid, every red an ASSERTION (no build breaks), production restored
+  byte-identical after each (`git diff` empty on `management.go`):
+  `if true || d.staleCertGen == gen` → F1 subtest 1 FAILS
+  ("an older delivery settled a rename that landed AFTER it sampled the
+  generation"), subtest 2 PASSES. `if false && d.staleCertGen == gen` →
+  subtest 1 PASSES, subtest 2 FAILS ("must settle the debt — the generation
+  fence must not suppress the clear"). `if true || m.rootCtx == nil ||
+  next.Addr == ""` → `boot_http_bind_failure_recovers_on_a_later_reconcile`
+  FAILS, other three subtests PASS. `if false && next.TLS && ...
+  !srv.HTTPSServing()` → `boot_https_bind_failure_retries_on_an_identical_reconcile`
+  FAILS, other three PASS. Deleting `leg.stopping.Store(true)` →
+  `TestDrainFlagIsSetByTheRealServeGoroutine_6827` FAILS, confirming the F3
+  recipe text.
+- **File(s)**: pkg/daemon/hostname_stale_cert_6827_test.go,
+  pkg/daemon/management_recovery_6827_test.go, pkg/daemon/README.md,
+  pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/api/README.md, _Log.md
+
+## 2026-08-06 — #6827 fold r3 (re-gate MINOR-1 / MINOR-2)
+
+- **Timestamp**: 2026-08-06 03:55 PDT
+- **Action**: Complete the osHostname seam at the already-applied early return,
+  bind that guard (it had ZERO coverage and is load-bearing since #6827), and
+  rewrite the boot_rename fixture off an impossible kernel state onto the
+  stateful-stub pattern the file already uses.
+- **File(s)**: pkg/daemon/daemon_system.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/api
+  ./pkg/config -count=1 rc=0; gofmt clean. M1 (neutralise the early return)
+  reds an_unchanged_host_name_is_a_no_op as an ASSERTION at :200. M2 (revert
+  the seam to os.Hostname) reds the SAME subtest — which is the point: the
+  half-applied seam is exactly what made the guard untestable and let the old
+  fixture describe a kernel state production cannot reach.
 ## 2026-08-06 — #6829 fold r3 (hostile-gate F1/F2)
 
 - **Timestamp**: 2026-08-06 01:35 PDT
@@ -78071,6 +81135,59 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+- **Timestamp**: 2026-08-12
+- **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
+  only in tests that injected their own budget), plus an S3 doc sentence.
+  Every behavioural test in `tests_aggregate_budget.rs` drives
+  `parse_source_nat_rules_with_budget(.., &TEST_BUDGET)` — an injected budget.
+  Production calls `parse_source_nat_rules_with_previous`, which forwards
+  `&SOURCE_NAT_AGGREGATE_BUDGET`. Nothing bound THAT. Measured: leaving the
+  constant untouched (so `real_budget_matches_go_5877_constants` still passes)
+  and replacing only the budget the production entry forwards with an infinite
+  one left `cargo test --release --bins nat::` at 273 passed, 0 failed — ZERO
+  failures. The parity test asserts the constant's VALUES; the `admitted_with`
+  tests call the arithmetic directly; neither observes that production USES it.
+  Cap logic bound, cap wiring unbound — the same caller/callee split as #5103
+  F2.
+  `production_entry_enforces_the_real_pool_count_budget_6812` drives the
+  PRODUCTION entry with 1025 single-address pools and asserts the 1025th comes
+  back `OverBudget`. Under the severed-wiring mutation it is the ONLY failure in
+  the module: `left: None, right: Some(OverBudget)`.
+  Axis choice is deliberate and recorded in the test body: the fixture crosses
+  `max_pools` (1024), NOT `max_port_capacity` (2^33). Crossing port capacity
+  honestly would materialise ~8.6e9 occupancy slots — a test that gets deleted
+  for being slow, and a guard nobody runs is not a guard. Pool count crosses a
+  REAL budget for 10,240 occupancy SLOTS total — stored word-rounded as one u64
+  per address, i.e. 1024 words / 65,536 bits / ~8 KB (corrected 2026-08-13: the
+  original entry wrote "~10,240 occupancy bits", conflating the logical slot
+  count with the physical storage) — and `max_addresses` / `max_port_capacity`
+  stay far below their limits so the refusal cannot be attributed to another
+  axis.
+  Two preconditions run BEFORE the discriminator: the production entry returned
+  one rule per snapshot (a fixture that never entered the path would otherwise
+  pass silently — the same class as the defect being closed), and the first
+  pool is healthy (proving the refusal is a BUDGET refusal, not a wholesale
+  parse failure).
+  `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` is the
+  over-reach control in its OWN body — a control sharing a body with its binder
+  never runs once the binder fails. Exactly 1024 pools must ALL install. It
+  stays GREEN under the severed-wiring mutation and reds on an off-by-one in
+  the first-fit accounting or a production entry forwarding a SMALLER budget.
+  S3 (doc only): the `SourceNatAggregateBudget` doc now states precisely what
+  is bounded and why the ordering is right. The budget runs AFTER the parse
+  loop, so address vectors are already expanded and only the occupancy BITMAP
+  is gated — deliberate, because the bitmap is the exhaustion vector by ~3
+  orders of magnitude (a full-range /16 pool: ~262 KB as addresses vs ~528 MB
+  as bitmap). Recorded so the next reader does not "fix" the ordering on the
+  theory that the guard sits downstream of the growth it limits.
+  NOT addressed here (S2, filed separately): `nat64.rs:940` constructs a second
+  production `PortAllocator` (`pool_v4.len()` x 64512 fixed slots) with no
+  aggregate budget, and the Go #5877 gate body carries no `nat64` reference —
+  uncovered on both planes.
+  Validation: `cargo build --release` rc=0; `cargo test --release --bins nat::`
+  275 passed, 0 failed. Advances #6812.
+- **File(s)**: userspace-dp/src/nat/tests_aggregate_budget.rs,
+  userspace-dp/src/nat/source.rs, _Log.md
 ## 2026-08-12 — #2114 r4 fold: the atomic cell fixed ACQUISITION, not ESCAPE (PR #6743)
 
 - **Timestamp**: 2026-08-12
@@ -78370,6 +81487,89 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/natshow/persistent.go,
   pkg/natshow/persistent_single_resolution_2114_test.go (new),
   docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
+## 2026-08-12 — #5619 round 6: key the secure-tunnel exclusion on OWNERSHIP, not name shape
+
+- **Timestamp**: 2026-08-12
+- **Action**: The round-5 blocker was UNFIXED at `91c08e0a6` — the only commit
+  since the r5 verdict was a claim retraction, and a claim retraction does not
+  fix a runtime regression.
+
+  **The defect.** Interface names are wildcard-authorable and nothing reserves
+  the `st` prefix, so this is a valid config naming a real physical NIC with no
+  VPN anywhere:
+
+      set interfaces st5 unit 0 family inet address 192.0.2.1/24
+      set security zones security-zone trust interfaces st5.0
+
+  `userspaceSkipsIngressInterface` excluded on `config.IsSecureTunnelIfName` —
+  `st` plus an index in [0, 65536) — which matches `st5`, dropping the physical
+  ifindex out of ingress adjudication, out of the binding-plan inputs and out
+  of the RSS allowlist, with Rust independently refusing the binding. The
+  arm's own comment named that failure mode ("a traffic outage") and
+  over-matched anyway.
+
+  **The fix: ownership, resolved once, shipped.** An `st` name is a secure
+  tunnel because an IPsec configuration BINDS it. `secureTunnelOwned` consults
+  `Config.SecureTunnelNetdevForRef` — the same resolver that decides which
+  xfrmi devices exist — and the verdict rides the snapshot as
+  `InterfaceSnapshot.SecureTunnel`. Both planes read that flag, so they agree
+  by CONSTRUCTION rather than by convention.
+
+  **The Rust name grammar is DELETED, not corrected.** With the decision made
+  from ownership, `is_secure_tunnel_ifname` had nothing left to decide and
+  could only drift from the Go one, so it and its hand-maintained mirror table
+  are gone. That closes the "two hand-written artifacts compared to each other"
+  item by removing the second artifact rather than guarding it.
+
+  **A bug my own fix introduced, caught by an existing guard.** The first
+  version resolved the UNIT row's ownership from the BASE name.
+  `TestSecureTunnelAddsNothingToTheAdjudicatedSets` went RED on the
+  `multidigit_st10_5` spelling: the if_id is `stIndex<<16 | unit+1`, so `st10.5`
+  and `st10` derive DIFFERENT ids and a VPN binding `st10.5` does not own
+  `st10`. Only unit 0 coincides. The unit row now resolves from the unit ref
+  and the helper's doc says so.
+
+  **The range rationale, made coherent.** The old test asserted that in-range
+  `st` names are excluded and out-of-range ones are not — pure name-shape
+  semantics, the belief the blocker rests on. Replaced by
+  `TestSecureTunnelRangeBoundsWhatCanBeOwned`, which states what the range NOW
+  decides: not what is excluded, but what can be OWNED. In range + bound is a
+  tunnel; in range + unbound is an ordinary NIC; out of range + bound is NOT
+  AUTHORABLE — #5297 rejects the bind-interface at commit — asserted as a
+  commit rejection, which is a stronger statement than the old test made.
+
+  **Two weak assertions closed.** The collision guard checked only `ok` and
+  never the documented empty name, so a hypothetical `("st0", false)` passed
+  it; it now asserts both halves. The live-address fixture stubbed the SAME
+  address the config authors, and production merges the configured value, so
+  the assertion held whether or not the live lookup resolved — the stub now
+  returns an address only `buildLinkSnapshot` can supply.
+
+  **A process failure worth recording.** Running `cargo fmt -- <one file>`
+  reformatted the WHOLE crate: ~330 files, including
+  `userspace-xdp/src/ipv6_ext_walk.rs`, which put the shim source out of
+  lockstep with the tracked object and turned
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` RED. `cargo fmt` takes a
+  package, not a path; `--` passes the file to rustfmt but the package is still
+  formatted. Every unintended file was reverted and the four Rust edits
+  re-applied by hand. Both suspect failures were measured at the PRISTINE head
+  first rather than assumed pre-existing: the manifest guard was mine; a
+  `slowpath` failure in the same run was a load flake and passes in isolation
+  on both revisions.
+
+  **Validation.** RED at `91c08e0a6` with no fix:
+  `TestUnownedStNameKeepsItsDataplaneRole/no_VPN_binds_st5` — "= true, want
+  false" plus "st5 in the RSS/binding allowlist = false, want true" — while the
+  owned control PASSED, so the guard is not "keep everything". GREEN after the
+  fix at `-count=2`. `go build ./...` 0; `go test ./pkg/dataplane/...
+  ./pkg/config/... ./pkg/routing/...` GO_RC=0; `cargo test` CARGO_RC=0
+  (4257 passed).
+- **File(s)**: pkg/dataplane/userspace/interfaces.go, maps_sync.go,
+  protocol.go, secure_tunnel_ifname_5619_test.go,
+  secure_tunnel_ownership_6691_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs, server/helpers/planning.rs,
+  src/main_tests.rs, src/server/README.md, _Log.md
 
 ## 2026-08-07 — #5561 round 18: the view tier could 429 the clear tier
 
@@ -82923,6 +86123,808 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/grpcapi/server_show_interfaces_text.go,
   pkg/grpcapi/server_show_cos_filter_parity_6858_test.go,
   docs/cos-validation-notes.md, _Log.md
+- **Timestamp**: 2026-08-13T18:05Z
+- **Action**: #6815 round 8 — folded three live Codex blockers, all re-verified at
+  the round-7 head `52f7e735a` before anything changed. (B1) Round 7 de-correlated
+  the rule-SET names from declaration order and left the RULES inside each rule-set
+  declared `r0` then `r1` — config order and ascending name order at once. Measured
+  on a scratch worktree, not argued: inserting a `sort.SliceStable(rs.Rules, byName)`
+  ahead of the emit loop in `buildSourceNATSnapshotsWithFeeds` left
+  `TestBuilderEmittedOrderIsStableWithinATier_6812` entirely GREEN. Rules now declare
+  descending; assertion (3) reads the DECLARED sequence out of the compiled config
+  instead of re-deriving `r%d`, so a re-cut cannot leave the expectation behind; and
+  `assertNoRuleSetDeclaredRuleNameAscending6812` is the round-7 tripwire one level in
+  (proven reachable — re-cutting the loop ascending reds against PRISTINE production
+  with `rule-set for pool if00 declares its rules in ascending NAME order [r0 r1]`,
+  while the descending fixture under the mutation reds on the ASSERTION, so the
+  precondition does not shadow it). Enumerated every other generated name in these
+  fixtures against "could a production sort key on it": rule-set/pool names, match
+  address, from-interface, from-zone and pool address are all already descending;
+  the counter ID is constant. No fourth level exists. (B1b) The walk side had NO
+  rule-level assertion — every `pkg/config` ordering fixture declares one rule per
+  rule-set. Added `TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812`
+  (one rule-set so the tier sort is a no-op; four rules `r03 r02 r01 r00` referencing
+  pools `qb qd qa qc`, with the three candidate sequences asserted pairwise
+  distinct). Qualifier recorded because what detected it was an accident: the same
+  mutation also reds the count/address budget fixtures, but only because their 1,025
+  rules are named `r0..r1024` and `"r1000" < "r999"` — zero-pad those names and both
+  go blind. (B2) The reject half of
+  `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` fired only for
+  `nil error && nonempty output`, so EMPTY SUCCESS was admissible — and every fixture
+  row is a single-member pool, so a per-member skip produces exactly that. Measured:
+  changing the `netip.ParsePrefix` branch in `expandPoolV4` to `continue` left it
+  GREEN. Now requires a non-nil error per row, plus a MIXED-member half in BOTH
+  orders with a control that the good member expands alone; under the mutation the
+  mixed row reds `expandPoolV4(pool [198.51.100.1/032 198.51.100.7/32]) returned NO
+  ERROR and 1 addresses [198.51.100.7]`. (B3) Corrected a false claim this PR
+  authored: `SourceNATAggregateOverBudgetPools` said the Go first-fit rule "mirrors
+  it exactly — same order". `resolve_pool_allocators` is TWO passes — reused keys
+  reserved in phase 1, new keys admitted in phase 2 — so the sequences coincide only
+  when `previous_allocators` is empty. The Go/Rust AGREEMENT claim is unaffected and
+  is left standing, with the reason stated: the Go poison travels on the wire and a
+  poisoned pool reaches neither Rust phase. Corrected at both live sites; the round-3
+  narrative in plan.md quotes the sentence as it stood and is accurate as history.
+  DEFERRED with a site list rather than half-fixed: four operator surfaces still
+  derive capacity from `len(pool.Addresses)`, which counts a refused member — six
+  call sites in `pkg/cli`/`pkg/api`/`pkg/grpcapi`, none of which this PR touches.
+  Measured for a `10.0.0.0/016` pool (`SourceNATPoolUnusableReason == "invalid_pool"`,
+  so no allocator is installed): 64,512 ports at cli_show_nat.go:206 and :349,
+  metrics_nat.go:31 and grpcapi/server_nat.go:132; 126 deterministic blocks at
+  metrics_nat.go:109; and REST nat.go:271 keeps the config-derived count when the
+  runtime reports `AddressCount == 0`. Validation: `go test ./pkg/config/ ./pkg/nat/
+  ./pkg/dataplane/userspace/` all ok (29.9s / 0.1s / 20.4s), FULL_RC=0; gofmt and
+  go vet clean on the touched files. No Rust source changed.
+- **File(s)**: pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/nat/pool_expansion_parity_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:20Z
+- **Action**: #6815 round 9 — Codex MERGE-NEEDS-MINOR, zero runtime defects at
+  `1995806ee`. (M1) Round 8's walk-side fixture permuted the rule and pool NAMES
+  and then generated the match address and the pool member address from the loop
+  index, so both ascended with declaration order; its comment also claimed the
+  names were "neither ascending nor descending", which is false of the rule
+  column (`r03 r02 r01 r00` is descending). Measured: a `Match.SourceAddress`
+  sort in the charge walk left the ENTIRE `pkg/config` suite green — strictly
+  worse than the round-8 finding it mirrors, which at least reds two budget
+  fixtures by accident. Every column is now an independent permutation, and all
+  six axis x direction cells are RED. (Generalisation) Round 8 enumerated
+  generated NAMES; two dimensions were being confused with one — WHICH key a
+  sort reads, and WHICH DIRECTION it sorts in. Swept both by measurement at both
+  mutation sites of the builder fixture: all seven ascending cells were visible
+  and FIVE reverse cells were blind, because rounds 7 and 8 each fixed an
+  ascending coincidence by re-cutting DESCENDING, trading one monotone direction
+  for the other. Fixed by emitting a PERMUTATION at both levels (`declOrder`,
+  and `ruleOrder` with THREE rules per rule-set — two cannot be de-correlated
+  from both directions); all fourteen cells now RED. `wantRefs` is derived from
+  the declared sequence stable-sorted by tier rather than transcribed. The
+  closure claim is now by CONSTRUCTION, not by list:
+  `assertDeclarationOrderIsNotSortedBy6812` is called on every column and asks
+  the question mechanically, so a column added later that nobody remembers to
+  permute fails the belt. One deliberate exemption, and it is not a hole — a
+  CONSTANT column is a non-axis (a stable sort on a constant cannot permute
+  anything); this is real, since zone-tier rule-sets carry no `from interface`
+  and interface-tier ones carry no `from zone`. (M2) Round 8 replaced one
+  categorical claim with another: empty previous state GUARANTEES equality, but
+  a re-apply merely CAN differ — an all-reused apply coincides, as does any
+  apply whose reused keys already precede its new ones. Phase 1 also reserves
+  only keys BOTH viable now AND previously allocated. The comment now carries
+  Codex's admission proof: `charge(A)` fits every budget, Rust's pendings are
+  exactly `A`, and `R`/processed-new/`k` are disjoint subsets of `A`, so Rust
+  refuses nothing Go admitted in any order. Three further sites carried the
+  uncorrected claim and now carry the qualified one. (M3) The mixed-member
+  two-order rationale was false for its own mutation — under `continue` both
+  orders skip the bad member and return the good address. Withdrawn; replaced
+  with position-independence of the all-or-nothing contract, plus the internal-
+  state reason, measured: `return out, err` reds 12 rows, all `[good, refused]`,
+  zero `[refused, good]`. Harness note: `/dev/shm` filled mid-round, so the
+  mutation sweeps were re-run with an explicit VOID classification for
+  build/infra failures — a vanished GOCACHE would otherwise read as a red. Both
+  config sweeps reproduced exactly with no VOID cells. Validation: gofmt and go
+  vet clean on touched files. No Rust source changed. VALIDATION RECORD
+  CORRECTED, see the entry below.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go, pkg/config/nat_source_scope.go,
+  pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/nat/pool_expansion_parity_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:35Z
+- **Action**: #6815 round 9 — validation-record correction, plus a re-verification
+  after a shared-tmpfs cache deletion. The parent swept `/dev/shm` and removed
+  `gc-f6815r9` mid-round. My FINAL validation had already moved to a GOCACHE
+  under the job directory, but BOTH builder-fixture mutation sweeps had run
+  against the tmpfs one, so both halves were re-run on the safe cache with a
+  classifier that treats ENOSPC, `build failed`, and a zero exit without an `ok`
+  line as VOID rather than as a result. Both reproduced EXACTLY — 5 blind cells
+  before the permutation, 14 of 14 RED after, zero VOID. Every number in the
+  round-9 plan and commit stands. (The tmpfs directory now exists again at 513 MB
+  with an mtime inside the round, i.e. it was removed and partially rebuilt; that
+  is the shape that makes a straddling cell unreadable, which is why the re-run
+  was owed rather than optional.)
+  CORRECTION. The round-9 commit message and the previous log entry recorded
+  `go test ./...` as exit 0 with 66 packages ok. That run did NOT pass
+  `-count=1`, so an unknown share of it was CACHE-SERVED and the exit code was
+  not evidence the suite had actually executed. Forced with `-count=1` it failed:
+  `pkg/ipmon TestDebounceCoalescing`, "no actuation after debounce window". Run
+  down rather than waved off — `pkg/ipmon` is untouched by this PR (0 files in
+  the range `edefb7570...7547b379f`); the assertion sleeps 40 ms of WALL CLOCK
+  and then requires the debounce goroutine to have actuated, which a loaded box
+  can miss; it passes 5/5 in isolation at the PR head and 8/8 at the PR BASE, so
+  it is pre-existing and load-dependent, not a regression this PR introduced. A
+  second forced `-count=1` full run is clean: **exit 0, 62 packages with tests,
+  zero FAIL**. That is the figure of record; the earlier "66 ok" conflated
+  packages-with-tests and `no test files` lines and came from the unforced run.
+- **File(s)**: _Log.md
+
+- **Timestamp**: 2026-08-14T06:55Z
+- **Action**: #6815 round 10 — the closure claim was still a LIST, one level up,
+  plus three claim corrections. Codex: MERGE-NEEDS-MINOR, no runtime-behaviour
+  defect. (M1) Round 9 said the axis set was closed BY CONSTRUCTION; both
+  fixtures still MANUALLY ENUMERATED the helper calls, so a column with no call
+  stayed silent — the list had moved from axis names to helper calls, which is
+  round 9's own diagnosis of round 8 applied to round 9. Three columns it left
+  open, each confirmed by measurement against the WHOLE package at the PR base
+  a1db9f734: a `(tier, CounterID ASC)` tiebreak GREEN (the fixture passed nil
+  for the ID map so every ID was zero), `(tier, len(PoolAddresses) ASC)` GREEN
+  (one member per pool), `(tier, PortLow ASC)` GREEN (default range everywhere).
+  All three RED at this head. Replacement: `sweepAxes6812`, one twin per
+  package, REFLECTS over the value the production comparator reads — one column
+  per struct field recursing into nested structs and pointers, a `.len` column
+  per slice/map, the first element's columns when non-empty, and a HARD FAILURE
+  for any kind with no order-preserving key encoding. Adding a field to
+  SourceNATRuleSnapshot reds the fixture (cell B1); adding one to NATPool reds
+  the walk fixture (C2). Round 9's silent constant exemption is gone: a constant
+  column must be REGISTERED as `fixtureConstantAxes6812` (an admitted blind
+  spot) or `productionConstantAxes6812` (invariant for every production input),
+  an unregistered constant fails with the full offender list, and an entry that
+  is constant in no swept group fails as stale. Where closure STOPS is written
+  down rather than left implicit — keys derived from fields by arithmetic are
+  not reflectable, so `.len` is swept mechanically and the rest are declared as
+  fields of a wrapper struct the sweep treats like any other column; that
+  wrapper's field list is the only list left. Counted rather than asserted:
+  25 columns guarded across the two fixtures (11 per-tier + 3 per-rule-set on
+  the builder, 11 on the walk) against 6 by hand in round 9, and 74 named holes
+  plus 9 provable non-axes. (M2) The transformation-coverage claim was wider
+  than the measurement — reversal and nonzero rotation are caught elementwise
+  but a PARTITION is caught only when it changes this fixture, and `[1,0,2]` is
+  already stably partitioned by match address `< 10.0.2.0/24`; corrected to
+  "transformations that realise a nonidentity permutation on this data". (M3)
+  "Rust's pendings are exactly A" is false with a shared pool — pendings are
+  per-RULE, a multiset with repeats; corrected to distinct-key granularity, with
+  the reason distinct pool names give distinct keys. (M4) The Rust
+  fail-on-revert rationale named a line it no longer holds: after phase-one
+  reservation, deleting the reuse-path `pool_allocators.insert` is GREEN
+  (measured, cargo release, --test-threads=1); dropping phase 1's distinct-key
+  dedup is RED and is the replacement rationale, with the phase-1-charge
+  deletion recorded as an explicit non-counterexample.
+  Harness notes worth keeping. A `cargo test ... ; echo RC=$? | tee` reported
+  the TEE's exit code to the runner — the real rc (101, a build failure from a
+  missing sibling crate) was only in the log, so the first Rust baseline would
+  have read as a pass. The mutation harness restored files with `git checkout
+  --`, which cannot restore an UNTRACKED file; two of the swept files are new,
+  so it would have aborted mid-matrix leaving a mutation in the tree. Changed to
+  a content backup. And a `go test ./...` was started on the same worktree the
+  mutation matrix was mutating — killed and its output discarded rather than
+  reported, since it may have compiled a mutated tree.
+- **File(s)**: pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go (new),
+  pkg/config/nat_source_axis_sweep_6812_test.go (new),
+  pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  userspace-dp/src/nat/tests_aggregate_budget.rs,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T08:40Z
+- **Action**: #6815 round 11 — the round-10 dichotomy had a THIRD outcome, and it
+  landed on the case round 10 claimed to close. Codex at cade69ad9: no
+  production regression; the headline property false, measured by a
+  switch-for-switch probe of the collector. "Swept, or stops the test" was
+  missing SILENTLY SKIPPED: a nil pointer emitted `.nil` and skipped every
+  pointee field, so adding a field to PersistentNATConfig or
+  DeterministicNATConfig — both nil in every fixture pool — changed no column at
+  all; a `[]byte` emitted `.len` and `[0]` and dropped the rest; a map emitted
+  only `.len`, so three one-entry maps keyed {N:2}, {N:0}, {N:1} were
+  indistinguishable while a comparator keying on the sole key reorders them; a
+  nil interface hid its payload schema; and time.Time was walked as wall/ext/loc,
+  whose lexicographic order is not chronological. A PARTIAL column is worse than
+  no column because it reads as coverage. The collector now gives every kind
+  exactly one of five outcomes: an order-preserving column; a TOTAL column over
+  contents (`.all` for sequences, sorted `.entries` for maps); the contained
+  TYPE's schema with ABSENT keys when the value is missing (nil pointee, empty
+  list, empty map); an explicit `…-UNENCODED` declaration the registry forces
+  someone to justify (nil interface — its dynamic type is genuinely unknowable);
+  or a hard stop. Keys are tagged present ("\x01"+key) / absent ("\x00") so an
+  absent value cannot collide with a legitimately empty string. Measured, all
+  RED with controls green: P1 drop the pointee-schema walk; P2 drop `.all`; P3
+  drop `.entries`; P4 drop the UNENCODED declaration; P5 walk time.Time as a
+  struct; P6 drop the empty-list schema walk; **W1 add a field to
+  PersistentNATConfig, a PRODUCTION type, reds the walk fixture** — the round-10
+  claim, now true. X1-X3 re-confirm the round-10 (tier, CounterID), (tier,
+  len(PoolAddresses)) and (tier, PortLow) cells still bind, so round 11 unbound
+  nothing. REGISTRY: `productionConstant` truth is no longer prose — every such
+  entry carries a WITNESS, an independently built sequence constructed to make
+  the column vary if the claim were false, and
+  TestProductionConstantAxesAreWitnessed_6812 requires each claimed column to
+  EXIST in the witness projection and be constant in every group. Measured:
+  marking Snapshot.PoolName production-constant reds. The witnesses found
+  something themselves — one rule-set carrying all six scope clauses is NOT a
+  representable input, because compileNATSource expands a multi-kind from/to into
+  the CROSS PRODUCT (six clauses on one named rule-set compile to nine
+  rule-sets), so the witness uses one from-kind and one to-kind per rule-set and
+  groups on the rule-NAME prefix rather than on scope, which would be circular.
+  `Pool.nil` moves to fixture-constant: CompileConfigLenient permits a dangling
+  pool reference (compiler_nat_pool_ref_5626_test.go:164) and the charge walk
+  skips it (:3192), so it is order-irrelevant AFTER filtering — not invariant for
+  every input, which is what the definition says. Three columns were classified
+  pessimistically and are corrected with firsthand verification, each now
+  production-constant WITH a witness: Match.Protocol/Protocols (sole non-test
+  writer is compiler_nat_destination.go:167-169), Pool.Address/Port/PortRaw
+  (compileNATSource builds pools fresh at :471 and is the sole SourcePools writer
+  at :686; the only writers of those three are on DNAT pool objects), and
+  Snapshot.AddressPersistent (one config-global bit, types_security.go:620,
+  stamped by nat_source.go:223). Split, with the caveat that the column universe
+  GREW because the collector now sees what it skipped: builder per-tier 13/44/1,
+  builder per-rule-set 4/47/7, walk 13/49/10 — 30 guarded / 140 fixture-constant
+  / 18 production-constant over 188 cells, against round 10's 25/74/9 over 108.
+- **File(s)**: pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go (new),
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-20T09:20Z
+- **Action**: #6815 round 12 — the derived-key guard contained the fixture
+  coincidence it was built to catch. Round 11's wrapper recomputed
+  `len(members) × width`; production spends `Σ host-count × range` (and the Rust
+  boundary the expanded `total_pool`), and the three agreed only because every
+  fixture pool member was a bare host. Fixed by CONSULTING: the walk wrapper now
+  carries ChargeAddrs/ChargePortCap read from sourceNATAggregateReferencedCharges,
+  and the builder wrapper LOSES its derived column rather than gaining a
+  corrected one — the builder computes no charge and the value lives in Rust, so
+  writing it there would be the second implementation the finding is about.
+  Falsifiable now: one pool carries a /30, so a bare-host fixture (which agrees
+  with both formulas and proves neither) reds. Measured D1 revert-the-/30 RED,
+  D2 recompute-the-naive-product RED. Counts re-derived WITH their populations —
+  rounds 10 and 11 both quoted CELL counts as column counts; at this head
+  population A (cells) 186 = 29+139+18, population B (distinct columns) 129 = 25
+  guarded-somewhere + 104 never. Rust MUT-C re-measured with a true control and
+  `--no-fail-fast` (a CARGO flag; after `--` the test binary rejects it and the
+  cell VOIDs): control module rc=0 17/0, MUT-C single GREEN, MUT-C module rc=101
+  RED on the three reserve-before-admit tests — round 10's cell was right and
+  scope-less. My first re-measurement produced a RED control that would have
+  refuted the finding; it was the harness, a relaunch while the previous instance
+  was live so the second run's backup captured the first's mutation. Caught by
+  diffing the scratch against the worktree HEAD before reporting; the harness now
+  takes a flock and asserts pristine-vs-git. Three precision notes added, each
+  measured: the schema walk IS transitive but guardedness is not; a sequence's
+  content is total (`.all`/`.entries`) while its per-index ordering is not (no
+  `[1]` column); and time.Time is special-cased because `wall` carries the
+  monotonic flag in bit 63 and is not chronologically ordered.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6812/#6815 round 13 — the round-12 guard was a tautology, and two
+  "total" columns were not injective. B1 (blocking): `ruleAxisSlot6812` had
+  THREE construction sites from the same inputs — the sweep at
+  compiler_nat_source_pool_aggregate_6812_test.go, `walkWitness6812`, and the
+  round-12 guard — and the guard built its own literal and then asserted about
+  that literal (`x := T{F: v}; if x.F != v`), binding only the site no sweep
+  consumes. Confirmed by measurement: replacing the SWEEP-site formula with
+  round 11's `len(members) x width` left pkg/config green. Fixed by
+  single-sourcing — `ruleAxisSlots6812(t, what, cfg, rules)` is the only
+  constructor, all three sites call it, and the guard asserts over its OUTPUT;
+  three constructions of one slot from one config have no legitimate reason to
+  differ, so collapse makes divergence unrepresentable rather than merely
+  detectable. Guard widened to the other derived column (round 12 checked
+  ChargePortCap only). Matrix: C0 pristine rc=0, S0 always-failing sentinel
+  rc=1, M1 portCap-naive guard RED / sweeps GREEN, M2 addrs-naive guard RED /
+  sweeps GREEN, C1 restored rc=0 — the green sweep column IS the finding.
+  B2 (blocking): `.all`/`.entries` were not injective. axisEncodeValue6812
+  joined `name=key<RS>` with the key raw, so an element field carrying the
+  record separator plus a forged present-tag boundary re-partitioned the record
+  and two different slices encoded identically; nested containers hit it with no
+  adversarial string, since an `.all` key is itself a composite. Fixed with
+  axisEscapeKey6812 applied ONCE at the join — leaf and composite keys take the
+  same path, so depth N is escaped N times; escaping at the leaf would leave
+  composites unescaped at the level embedding them. Column names are not escaped
+  and need not be. B3 (blocking, latent): a POPULATED map returned before
+  emitting its {key}/{value} schema columns, so a field added to a populated
+  map's value type produced no column — the SILENTLY SKIPPED outcome round 11
+  claims to have removed, and it made the map column SET depend on the VALUE not
+  the TYPE (a fixture mixing empty and populated back-fills "" and manufactures
+  a phantom varying column). Fixed by always emitting the schema columns, keys
+  ABSENT — a map has no canonical entry to project, unlike a slice's [0].
+  Measured MUT-B2 and MUT-B3 both RED on the new tests while the OLD prober
+  stayed GREEN in both cells: previously invisible. N1 REFUTED by measurement:
+  the reviewer's third formula (raw PortLow/PortHigh instead of
+  SourceNATPoolPortRange) has no fixture witness because compileNATSource stamps
+  the 1024/65535 default itself, so a compiled no-port-leaf pool carries raw
+  1024/65535 (measured: raw width 64512 == effective width) and a
+  rejected-range pool is never charged at all. Bound the PREMISE instead —
+  TestRawPortFieldsAreNotAThirdFormula_6812 asserts the agreement, rejects any
+  charged pool with a zero endpoint, and requires a no-port-leaf pool in the
+  fixture so the agreement exercises the default. Added pool `qe` for that role.
+  Twin golden gained 8 rows and lost none (3 from B3, 5 from a new SliceSep
+  probe field carrying a separator, so the behavioural half of the twins
+  agreement can see an escaping divergence); every pre-existing row byte-
+  identical, so the key format did not change.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  pkg/config/nat_source_axis_twins_6812_test.go,
+  pkg/config/testdata/axis_collector_twins_6812.golden,
+  pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_twins_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+- **Timestamp**: 2026-08-13T14:10Z
+- **Action**: #6827 round 6 — folded a Codex MERGE-NEEDS-MAJOR (7 blocking). B1 RUNTIME:
+  a dead HTTPS leg made the stale-cert debt permanently undischargeable. An unexpected
+  serve-loop exit marks the leg `dead` and leaves it INSTALLED, so the reconciler's
+  fingerprint test still matched the committed endpoint (ReconcileHTTPS never called)
+  and ReconcileHTTPS's own same-address arm returned nil on a non-nil pointer. HTTPS
+  was unrecoverable on an UNCHANGED configuration for the life of the process. Fixed at
+  both levels: the api-side no-op now tests `listenerLeg.serving()`, and reconcileTo's
+  HTTPS arm also fires on `next.TLS && !m.srv.HTTPSServing()`. B2 RUNTIME: the delivery
+  emitted its warning BEFORE re-checking the generation, so a rename landing after the
+  kernel read logged a diagnosis naming the previous host name — a line the clear-side
+  fence could not retract. The re-validation, certificate inspection and clear now run
+  under one staleCertMu hold and a superseded delivery abandons silently. B3/B4:
+  `d.staleCertGen++` and the unreadable-kernel-name guard were both unbound (the race
+  test supplied its own increment). B5/B6/B7: three assertions could not fail on their
+  own fixtures — the rejected-rename cert covered the kernel name, the bind-failure test
+  asserts a state no implementation reaches, and the no-SAN terminality assertion used a
+  loopback fixture where both downstream predicates decline anyway. Fixtures replaced,
+  not assertions. Nine claim defects corrected across server.go, listener.go,
+  management.go, both READMEs and the tests (applyHostname does not call Warn
+  synchronously; the deferred name is not guaranteed current; only the rename entry
+  point reads a live leg; `stopping` precedes Shutdown; the rename call is the INITIAL
+  attempt; the load heuristic ACCEPTS the worked unqualified→unqualified shape; cluster
+  comms start after the phase-4 apply, not inside it), plus the restart-residual cause
+  list widened from two causes to seven. Validation: `go test ./pkg/daemon ./pkg/api`
+  rc 0; 9-cell mutation matrix, every new assertion has a production line whose
+  deletion reds it and only it.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/daemon/management.go,
+  pkg/daemon/README.md, pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-13T15:05Z
+- **Action**: #6827 — regenerated `docs/refactoring-audit-current.txt`. `go test ./...` at the
+  round-6 head surfaced `pkg/refactoraudit.TestHeatmapNotStale` RED: `pkg/api/server.go`
+  had entered the audit at `[WATCH]` (>=1500 LOC) without the heatmap being refreshed.
+  The gate was ALREADY red at the round-5 head `ccc2f6b09` — server.go was 1606 LOC
+  there (1307 on master), the heatmap is byte-identical between the two commits, and it
+  lists no `pkg/api/server.go` row; measured directly against a checkout at that commit.
+  Round 6 added 18 lines (comment corrections), taking it to 1624; the regenerated file
+  also picks up `pkg/daemon/daemon_system.go` 2262 -> 2297 from an earlier round of this
+  same PR. `[WATCH]` is advisory, so no split is demanded at this size. Also confirmed
+  the one other `go test ./...` failure — `pkg/ddns` "bind: address already in use" on an
+  ephemeral port — is a collision with a concurrent agent, not a regression: the package
+  passes standalone (rc 0).
+- **File(s)**: docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-08-13T22:55Z
+- **Action**: #6827 round 7 — folded a Codex "would not merge" (2 MAJOR, 1 MINOR) plus a
+  correction to one of my own round-6 claims. **B1 RUNTIME (credential lifetime).** An
+  unexpected `ServeTLS`/`Serve` exit marked the leg `dead` and returned WITHOUT any
+  `Shutdown`: `Serve` closes the listener on its way out, but the HTTP/1 keep-alive and
+  HTTP/2 connections it had already accepted kept being served. `drained` — the goroutine's
+  last act — therefore went up with live connections behind it, and `pruneRetiredLocked`
+  spends that flag as "nothing left for a revocation to reach": the recovery reconcile
+  (round 6) PINNED the dead leg's auth slot, the next `ReplaceAuth` PRUNED it before
+  tightening, and a credential the operator had revoked went on being accepted on a socket
+  the box believed was gone. Fixed with `drainLeg` on ALL THREE exits (requested
+  retirement, root-context shutdown, unexpected exit): bounded `Shutdown` then `Close` on
+  deadline. `Close` is not optional — this server runs with no `WriteTimeout` by design, so
+  an SSE stream or a slow reader outlives any deadline `Shutdown` alone respects. The three
+  existing recovery cells could not see any of it: they drive the exit with `errLn`, which
+  fails from the FIRST Accept, so no connection is ever accepted and nothing can survive.
+  New cell `TestDeadLegConnectionCannotOutliveRevocation_6827` binds a REAL loopback
+  socket, holds one TLS connection across the kill + recovery + revocation, and asserts it
+  cannot be admitted once the leg reports drained. **B2 (my round-6 claim was wrong).**
+  Rounds 5 and 6 argued no generation fence could make the emitted host name provably
+  current, because `Sethostname` moves the kernel name before the generation is recorded.
+  That was a property of where the lock was taken, not of the mechanism. New
+  `Daemon.renameHostNotingStaleMgmtCert` holds `staleCertMu` ACROSS the syscall AND the
+  bump, so the two critical sections are ordered either way round: delivery first (the
+  rename cannot move the name until it lets go) or rename first (the delivery re-validates
+  against a moved generation and abandons). No lock-order inversion — the fence is a LEAF
+  hold around the syscall seam, while delivery takes the mutex at the top of staleCertMu ->
+  managementReconciler.mu -> api.Server.lifeMu. The residual is a privileged
+  `sethostname(2)` from outside the daemon, which is now stated instead of the blanket
+  impossibility claim. **B3.** The delivery's re-validation tested the generation alone, so
+  two same-generation deliveries (boot racing the rename's own attempt) both warned; it now
+  requires `staleCertPending` too.
+  **CORRECTION to the round-6 entry above**: it claimed "every new assertion has a
+  production line whose deletion reds it and only it". That is false for M8. Deleting
+  `leg.dead.Store(true)` reds SIX cells across two packages — the three #6827 recovery
+  cells, the new B1 cell, and the pre-existing `TestServeExitDoesNotDeadlockConcurrentWait_6401`
+  + `TestEffectiveHTTPListenerServeExitFails` — because `dead` is a production precondition
+  the whole dead-leg cohort shares. Measured here, not inferred. M1 is the same shape. The
+  cells that DO isolate are M4, M5a/M5b, M7 and this round's B1/B2a/B2b/B3.
+  Validation: control `go test ./pkg/api ./pkg/daemon -count=1` rc 0; mutation cells — B1
+  (delete `drainLeg` from the serveErr arm) RED, only the new cell, whole `pkg/api`; M8
+  re-measured RED across six cells as above; B2a (leave the syscall outside the hold — the
+  literal pre-round-7 shape) RED, only the new fence cell; B2b (write the ledger before the
+  syscall) RED, only `failed_sethostname_is_not_diagnosed`; B3 (drop the `pending`
+  re-check) RED, only the new sibling-delivery subtest. One measured NON-binding, recorded
+  rather than glossed: B2c — hold the mutex across the syscall, release, re-take for the
+  bump — stays GREEN. That shape is still defective, but the gap is a few instructions and
+  the probe loses the race to the re-acquire; the guard against it is structural (one
+  `defer`red unlock over a body with no intermediate release) and is documented as such at
+  the function and in the test.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md,
+  pkg/api/server.go, pkg/daemon/management.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-08-13T23:40Z
+- **Action**: #6827 round 7b — repaired the EVIDENCE the round-7 entry above rests on, after the
+  round-6 lane read my M8 durations back to me. The M8 row reported six reds; five of them
+  carried times of 5.00s / 5.01s / 5.00s / 5.01s / 3.00s, and only one (0.10s) was an
+  assertion firing. A red clustered at a round deadline value is a poll expiring, not a
+  property failing. Three of those five were SETUP GUARDS on the very flag M8 deletes:
+  `startWithDeadHTTPSLeg` polled `dead` for 5s and `t.Fatal`ed, so
+  `TestUnexpectedServeExitLeavesADeadInstalledLeg_6827` and
+  `TestReconcileHTTPSReplacesADeadLeg_6827` — which SHARE that helper, one entry path
+  between them — died there and NEITHER ever reached "HTTPSServing must report false" or
+  "the reconcile left the DEAD leg installed"; and the daemon rebuild cell polled
+  `HTTPSServing()`, which reads the same flag.
+  Fixed at the fixtures, not at the row. `startWithDeadHTTPSLeg` now uses `Server.Wait()`
+  — a deterministic join of the one leg that server has, reading nothing under test — and
+  asserts only the installation. The new B1 cell does the same after its kill, then asserts
+  dead+drained explicitly as a labelled, immediate precondition. The daemon cell keeps a
+  poll (its server also has a live HTTP leg, so `Wait` would block until shutdown) but
+  polls the new `api.Server.HTTPSLegDrainedForTest()`: `drained` is stored by the
+  goroutine's defer on every exit path, so it reports THAT the exit happened without
+  consulting the flag under test.
+  Re-measured M8 on the repaired tree: same six cells, but now
+  `serve_exit_wait_deadlock_6401_test.go:85` (0.10s),
+  `tls_stale_cert_6827_test.go:630` "HTTPSServing must report false" (0.00s),
+  `tls_stale_cert_6827_test.go:674` "the reconcile left the DEAD leg installed" (0.00s) and
+  `effective_listeners_6401_test.go:154` (3.00s) fail on their own ASSERTIONS, and only two
+  fail at a precondition — both immediate and self-labelled. So M8's blast radius is
+  unchanged (it is a shared production precondition) but four of the six now witness a
+  property instead of a timeout.
+  **A refinement of the heuristic, because it would otherwise condemn a legitimate cell.**
+  `TestEffectiveHTTPListenerServeExitFails` reds at 3.00s and that is CORRECT: its poll IS
+  its assertion (it waits for `effectiveHTTPListener()` to report Failed, which is the
+  property). The discriminator is not the duration but whether the polled predicate is the
+  asserted property or a precondition for it. Durations are the trigger to go and look.
+  Also fixed one of my own: under B2a the fence cell asserted INSIDE the syscall seam,
+  consuming the channel value its closing assertion then waited 5s for — so a genuine catch
+  reported itself twice, once truthfully and once as "the observer never acquired
+  staleCertMu", the opposite of what had happened. It now records in the seam and asserts
+  after the rename returns: B2a reds in 0.00s with one true message.
+  Validation on the repaired tree: `go test ./... -count=1` FULL_RC=0 (62 packages, zero
+  failures). Cells: B1 RED 0.00s (only cell in `pkg/api`, its own assertion); B2a RED 0.00s
+  (only cell in `pkg/daemon`); B2b RED 0.00s (`failed_sethostname_is_not_diagnosed` only);
+  B3 RED 0.00s (the sibling-delivery subtest only); B2c GREEN (the measured non-binding,
+  unchanged); M8 as above.
+  **PROVENANCE, corrected against a measurement rather than relayed.** The round-6 lane
+  states B1's consequence was ENABLED by its recovery. Checked at `ccc2f6b09`: pre-round-6
+  `ReconcileHTTPS` still reached `stopLegLocked` on a dead leg through its `!want` arm (a
+  TLS disable) and its default arm (an HTTPS-bind change), so the pin-then-prune was
+  reachable before round 6 — but only via a commit that disabled TLS or moved the bind.
+  What round 6 added is reachability on an UNCHANGED configuration, through the
+  same-address recovery and the reconciler's `!HTTPSServing()` arm, which fires on every
+  commit while the leg is dead. That is the common case, so the fix belongs with the
+  recovery either way; the claim is narrowed to what the code shows.
+- **File(s)**: pkg/api/server.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T07:55Z
+- **Action**: #6827 round 8 — hostile review at `d7157b7e1` returned MERGE-NEEDS-MINOR with no
+  runtime defect, and two items about the round-7 work itself. **F1 (blocking): the
+  force-close was bound by NOTHING.** `_ = srv.Close()` could be deleted, and the
+  retirement/root arm reverted to the pre-round-7 bare `Shutdown`, with `go test ./pkg/api/
+  -count=1` green both times. The only bound property was that the serveErr arm called
+  `drainLeg` at all — so the half of the drain guarantee I called "not optional" was exactly
+  the half a later edit could delete silently, restoring the vulnerability with `drained`
+  still reporting true. New `TestInFlightResponseIsSeveredOnEveryLegExit_6827` holds an
+  in-flight streaming response across each of the three leg exits and asserts it is severed.
+  `legDrainTimeout` becomes a `var` (production never assigns it) so the DEADLINE arm — the
+  case under test — is reachable without 5s per subtest; the cell runs in 0.47s.
+  **F2: my justification named the wrong mechanism, and I verified that firsthand before
+  rewriting it.** A standalone probe measured both halves: after `Shutdown`, a second request
+  on a surviving keep-alive connection fails (`unexpected EOF`) — `inShutdown` makes
+  `doKeepAlives()` false — so "Shutdown alone is NOT that guarantee [no connection can serve
+  another request]" was FALSE. What `Shutdown` does not do is terminate the response already
+  in flight: with a 300ms deadline it returned `context deadline exceeded` and the stream kept
+  delivering; only `Close` ended it. Conclusion unchanged, reason corrected at `drainLeg`, at
+  the `drained` field, and in `pkg/api/README.md` — it matters because the stated mechanism is
+  what the next reader reasons from, and the round-7 version would have told them the `Close`
+  was redundant. The `drained` invariant is restated to what drainLeg actually provides:
+  "nothing this leg accepted is still being served" — no further request AND no response in
+  flight. Round 7 stated only the first half, which is the half `Shutdown` alone already gives.
+  The probe also produced a test-design fact worth keeping: after the server severs a
+  connection the client still returns BUFFERED bytes (measured: 3 reads / 19 bytes before the
+  error), so the assertion must drain until the read errors — a single successful read proves
+  nothing either way.
+  Validation on this tree: control `go test ./pkg/api ./pkg/daemon -count=1` rc 0.
+  Mutations, each over the whole `pkg/api` package, with what fired and how long:
+  F1a (delete `_ = srv.Close()`) RED — all three subtests, 2.40s each, each failing on
+  `assertSevered`'s own bounded wait, which IS the asserted property (severed within the
+  bound), not a setup guard; F1b (retirement/root arm back to a bare `Shutdown`) RED —
+  `requested_retirement` and `root_context_shutdown` at 2.41s, `unexpected_serve_exit` GREEN,
+  a clean adjacency pair INSIDE one test proving the three cases bind three distinct call
+  sites; B1 (delete `drainLeg` from the serveErr arm) RED — the held-connection cell at 0.01s
+  on its assertion PLUS `unexpected_serve_exit` at 2.26s, and the other two subtests green.
+  One harness note, reported rather than buried: the F1b cell was killed by a command timeout
+  mid-run, which left the mutation APPLIED in the worktree. Caught immediately by checking
+  `git diff` before doing anything else, restored by content, verified by md5 and a rebuild,
+  and only then re-run with a longer budget. An interrupted mutation cell leaves the tree
+  dirty even when the harness restores by content — check the tree, do not assume the restore
+  ran.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-08-14T09:10Z
+- **Action**: #6827 round 8b — folded the reviewer supplement plus four Codex corrections,
+  two of which contradict prose I shipped at `baae30371` and were verified against the
+  go1.26.4 source before I touched anything. **(1) `legDrainTimeout` bounds the SHUTDOWN, not
+  the drain.** `net/http.Server.Close` takes no context and closes `s.activeConn` serially
+  (`server.go:3100-3118`), and on an HTTPS leg each entry is a `*tls.Conn` whose `Close` →
+  `closeNotify` sets its OWN 5s write deadline (`crypto/tls/conn.go:1471-1483`). A peer
+  stalling its receive window therefore costs up to 5s EACH, in series, so the worst case
+  grows with connection count. My "the bound this function promises is real" was false.
+  Corrected at `legDrainTimeout`, at `drainLeg` and in `pkg/api/README.md`, with the
+  knock-on stated rather than hand-waved: `Server.Wait` holds `lifeMu` across the drain and
+  `WarnStaleMgmtCertForHostName` waits on `lifeMu` under `staleCertMu`, so a rename racing
+  shutdown waits for it — and the earlier "well inside TimeoutStopSec=20" reassurance does
+  NOT hold at scale. Bounding the sever phase for real needs per-connection tracking with
+  concurrent deadlined closes; deliberately not taken in an eighth round, and the claim is
+  narrowed instead of the code being widened. **(2) Hijacked connections escape the drain.**
+  Verified in the stdlib docs: `Shutdown` "does not attempt to close nor wait for hijacked
+  connections", `Close` "does not even know about" them, and a hijacked conn is deleted from
+  `activeConn`. So `drained` can be stored while such a connection is still usable, and the
+  force-close cannot help — the handle is gone. Two reviewers noted pkg/api has no hijacker
+  and read that as closing the case; it makes it UNREACHABLE, not enforced. Chose the third
+  option deliberately — narrow the stated invariant AND gate it: new
+  `TestNoHijackerInThisPackage_6827` walks the AST of every production file for a
+  `http.Hijacker` assertion or a `.Hijack()` call (AST, not text, so the comments about
+  hijacking are not false positives) and fails with what `drainLeg` would have to grow.
+  **(3) The fence cell was probabilistic while claiming otherwise.** Its observer goroutine
+  might never be scheduled inside the 100ms window, so a pass could mean "never looked".
+  Replaced with a synchronous `sync.Mutex.TryLock` inside the syscall seam — no goroutine, no
+  sleep, and the answer is the state of the mutex. Cell now runs in 0.00s and MUT-B2a still
+  reds it in 0.00s naming the free-mutex generation. The split-hold non-binding now carries
+  the MECHANISM rather than "a few instructions wide": the first Unlock happens in normal
+  mode, so the re-acquirer wins the fast-path CAS and any woken waiter re-queues — no probe
+  of any kind lands there. **(4) The documented lock order was inaccurate.** I wrote a nested
+  three-lock chain staleCertMu → mgmt.mu → lifeMu; `warnStaleCertForHostName` releases m.mu
+  before calling the server, so the real shape is two independent edges. Corrected at both
+  sites. Also: `drained` is NOT the goroutine's "last act" (defers are LIFO, so it precedes
+  `wg.Done`) — corrected at the field and at `HTTPSLegDrainedForTest`, which proves the exit
+  path and drain completed, not that the goroutine returned; `d.mgmt` is guarded for the
+  stale-cert read ONLY and the field comment now says so explicitly, so nobody reads the PR
+  as having fixed the other readers; and `drainLeg` now states that the original defect's arm
+  called NO `Shutdown` at all, so the F2 correction cannot be misread as undercutting B1.
+  On the deadline in the fixture: the reviewer asked for the full 5s because "the deadline is
+  the thing under test". Split the difference on the merits — `unexpected_serve_exit` (the arm
+  the defect was in) now runs at the PRODUCTION 5s so the shipped value is exercised end to
+  end, the other two keep the seam, and new `TestLegDrainTimeoutDefault_6827` pins the shipped
+  value so a leaked override cannot retune production silently. Whole cell: 5.33s.
+  Validation: `go test ./... -count=1` FULL_RC=0 (62 packages). Cells re-run on this tree:
+  B2a RED 0.00s (fence cell only); F1a/F1b/B1 unchanged from round 8.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
+  pkg/daemon/daemon.go, pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T09:45Z
+- **Action**: #6827 round 8c — **correcting my own delivery report.** The round-8b commit
+  `047c9e38d` did NOT contain three of the changes the entry above and my report to the lead
+  claimed for it. The mechanism is worth writing down because it is silent: the listener.go
+  edits were applied by ONE python script that asserts every anchor and writes the file ONCE
+  at the end, so when the fourth anchor was stale the script raised and **none** of its three
+  earlier edits were written. The traceback was followed by `BUILD_OK` from the next command
+  in the same cell, and I read the pair as success. `go build` cannot fail on missing COMMENT
+  edits, so the build proved nothing about them — the same "which process authored this exit
+  code" trap, one level up: I checked that something succeeded rather than that the intended
+  change was present.
+  What was missing at `047c9e38d`, all of it comment-only: `legDrainTimeout`'s correction
+  (that it bounds the Shutdown and not the drain, with the serial-Close + per-connection
+  tls close_notify mechanism and the Server.Wait/staleCertMu knock-on); `drainLeg`'s
+  hijacked-connections out-of-scope paragraph — which the new gate test's failure message
+  points at with "see drainLeg", so the pointer dangled; `drainLeg`'s clause recording that
+  the original defect's arm called NO Shutdown at all; and `listenerLeg.drained`'s "not the
+  goroutine's last act" correction. What HAD landed, because they were separate calls:
+  `pkg/api/README.md` (all of the above in prose), the hijack gate test itself, the
+  TryLock fence rewrite, the lock-order edges, the mgmt half-guard note, and
+  `HTTPSLegDrainedForTest`'s semantics. So the README described corrections the source
+  comments did not carry — the exact divergence this PR spent round 8 arguing is dangerous,
+  since the next reader reasons from the code.
+  Applied all four here, individually, each verified present by grep rather than by a build
+  that cannot see them. Also added the SCOPE note the reviewer supplement asked for on the
+  streaming cell: the fixture holds ONE connection, so `assertSevered`'s bounded wait is
+  sound for it and is NOT evidence of a per-leg wall-clock bound — what the cell binds is
+  that the deadline arm severs rather than abandons, which holds at any N.
+  Validation: `gofmt` clean on every touched file, `go vet ./pkg/api ./pkg/daemon` clean,
+  `go test ./pkg/api ./pkg/daemon -count=1` rc 0, `go test ./... -count=1` FULL_RC=0.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T10:40Z
+- **Action**: #6827 round 9 — a Codex leg at `047c9e38d` refuted three things I built, including
+  two the lead had praised. All verified in source before folding. **(1) "bounds the Shutdown"
+  was ALSO wrong — my second wrong version of that sentence.** `Shutdown`'s loop calls
+  `closeIdleConns()` and only reaches its `select { case <-ctx.Done() }` if that returns
+  false, and `closeIdleConns` walks `activeConn` under `s.mu` closing serially — so stalled
+  IDLE TLS peers overrun the context INSIDE Shutdown, before it is ever consulted
+  (`net/http/server.go` Shutdown + closeIdleConns, read directly). `legDrainTimeout` is a POLL
+  deadline bounding neither phase in wall-clock terms. Corrected there and swept across the
+  eight enumerated stale sites plus two more the enumeration missed
+  (`management_nilpublish_5561_test.go`, found by grepping the claim rather than the list).
+  **(2) The hijack gate is not a semantic gate, and `x/net/websocket` is a DIRECT dependency
+  of this module** (`go.mod:16`) whose `Server` hijacks internally — so
+  `mux.Handle("/ws", websocket.Handler(h))` adds the case with nothing in local syntax to
+  match. "by gate", "absence is enforced", "fails if one is added" were all false. Narrowed to
+  TRIPWIRE everywhere it is claimed, and the test now checks a third form — an import of a
+  package known to hijack (`x/net/websocket`, `net/http/httputil`) — while saying in its own
+  doc that reverse proxies, aliases and reflection still escape. **(3) `assertSevered` treated
+  ANY read error as closure, including its own 250ms read deadline**, so a stream merely
+  PAUSED would have passed. This is the second time this fixture trusted the wrong signal
+  (round 8 fixed a single-read version). It now treats a timeout as "keep waiting", requires a
+  non-timeout error for closure, and reports WHICH state it timed out in — "STILL STREAMING"
+  vs "OPEN BUT SILENT" — because those are different bugs. Re-ran F1a with the stricter
+  assertion: still RED on all three subtests, "STILL STREAMING", 3649/1426/1433 reads, so the
+  mutant's streams were genuinely alive rather than merely quiet.
+  Also: TryLock is stated as a TRADE, not a closure — it proves the mutex is held WHILE
+  sethostname runs, not that the hold is uninterrupted to the bump, so the split-hold shape
+  (B2c, GREEN) passes it; and I removed the starvation-mode sentence I had shipped on relay.
+  Codex retracted its own mechanism claim and it was right to: normal-mode waiters COMPETE
+  rather than re-queue, and `sync.Mutex` switches to starvation mode after ~1ms and hands
+  ownership to the waiter — so the window is improbable to observe, not impossible, and B2c's
+  GREEN means "did not observe", not "cannot be observed". `Shutdown` stopping further
+  requests is qualified as HTTP/1-only (h2 shutdown callbacks are async, so a stream can open
+  before GOAWAY). `listener.go:124`'s second "LAST act" corrected.
+  Validation: `go test ./pkg/api ./pkg/daemon -count=1` rc 0; `go test ./... -count=1`
+  FULL_RC=0.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/hostname_stale_cert_6827_test.go,
+  pkg/daemon/management_nilpublish_5561_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6827 round 10 — bind the `dead`-before-drain ORDER (BLOCKING F1), make
+  `serveBound` run the real drain (F5), add `x/net/http2/h2c` to the hijacker map and
+  record how that map was DERIVED (F3), stop `assertSevered` reading through a poisoned
+  chunked body (F4), and correct the refuted `legDrainTimeout` sentence that was still
+  living inside its own guard (F2).
+  **F1 was a total survivor.** Moving `leg.dead.Store(true)` below `drainLeg(srv)` in
+  serveLegLocked's serve-exit arm left `go test -count=1 ./pkg/api/` AND `./pkg/daemon/`
+  at rc 0. Nothing could see it: every existing dead-leg cell
+  (`TestUnexpectedServeExitLeavesADeadInstalledLeg_6827`,
+  `TestReconcileHTTPSReplacesADeadLeg_6827`) kills a leg with NO connection, so its drain
+  returns in microseconds and both statement orders look identical there. With ONE stream
+  held open the window is the whole drain, which has no wall-clock ceiling — and for its
+  width a same-address `ReconcileHTTPS` takes the `serving()` no-op arm and returns nil
+  (so an operator commit cannot rebuild the dead leg), `reconcileTo`'s
+  `next.TLS && !HTTPSServing()` recovery term is false, and
+  `WarnStaleMgmtCertForHostName` diagnoses a certificate no socket is presenting.
+  `TestServingFlipsDuringTheDrainNotAfterIt_6827` asserts the flip within 750ms AND that
+  `drained` is still unset when it happens — the second half is what stops it passing on
+  a leg that merely finished draining, which is where the mutant also ends up.
+  **F5**: `serveBound` still held the exact shape `drainLeg` exists to fix — a bare
+  `Shutdown` under a 5s context, no `Close`. Round 9 edited its doc ("bounded 5s drain" ->
+  "5s-deadline drain") without touching the behaviour, which made README.md's
+  package-wide drain invariant FALSE about it. Fixed rather than narrowed: it is test-only
+  (`Server.Run` has no production caller), so the change is cheap, and narrowing would
+  have left the copy-hazard in the tree. `drainLeg` now RETURNS the Shutdown error so
+  serveBound reports exactly what it reported before; the two leg call sites discard it
+  explicitly. Consequence: the two servers used to share ONE 5s context; each now gets its
+  own `legDrainTimeout`.
+  **F3**: the import map said "the ones reachable from this module today" and was missing
+  `golang.org/x/net/http2/h2c` — same direct dependency (`x/net v0.48.0`), hijacks at
+  h2c.go:136/:171. A census of that module returns exactly two hijacking files
+  (`websocket/server.go`, `http2/h2c/h2c.go`), so the map CAN be complete for the current
+  dependency set; what it now records is the grep and the version it was run against,
+  which the next reader can re-run and which goes visibly stale on a bump. The outer
+  "tripwire, not a gate" claim is unchanged.
+  **F4**: `assertSevered` read through `http.Response.Body` while claiming a timeout was
+  "a reason to keep waiting". For a chunked body it cannot be — `internal/chunked`
+  stores the first error and guards its loop with `for cr.err == nil`. Measured firsthand
+  on a connection whose peer HAD closed it 2.4s earlier: the round-9 loop spun
+  **6,611,020 reads, 0 bytes, 6,611,020 timeouts** in its 3s bound and reported the
+  connection OPEN; the raw-connection loop detected EOF in **3 reads / 600.5ms**, the
+  instant the peer closed. Never a false GREEN — the three drain mutations all redded —
+  but a false RED plus a burned core. It now reads the raw conn (crypto/tls does not make
+  a deadline sticky: `readRecordOrCCS` calls `setErrorLocked` only for a non-temporary
+  `net.Error`) and the two-state label is gone, replaced by what is actually measured.
+  Also re-wrapped the three added comment lines over 100 columns.
+  Validation at the committed head: `go build ./...` rc 0; `go test -count=1 ./pkg/api/`
+  rc 0 (42.2s); `go test -count=1 ./pkg/daemon/` rc 0 (16.9s); `go test -count=1 -race
+  -run _6827 ./pkg/api/ ./pkg/daemon/` rc 0. Mutation matrix, each cell run over the WHOLE
+  package with an always-failing sentinel so a survivor cannot be confused with a suite
+  that never ran: MUT-1 (`dead.Store` moved below `drainLeg`) rc 1 — the only non-sentinel
+  failure out of 445 top-level cells is `TestServingFlipsDuringTheDrainNotAfterIt_6827`
+  ("HTTPSServing() was STILL true 750.1ms after the listening socket died, drained=false"),
+  which confirms the survivor claim firsthand: 444 other cells stay green. MUT-2
+  (serveBound reverted to a shared-context bare `Shutdown`) rc 1 — the only non-sentinel
+  failure is `TestServeBoundSeversInFlightResponses_6827` ("still OPEN 3s later, 1395
+  reads, 35240 bytes, 0 read timeouts, bytes arrived during the wait"), so the stream was
+  genuinely still being delivered rather than merely quiet. Pristine control: both cells
+  PASS, sentinel FAILS. Production files restored byte-for-byte (sha256 verified) after
+  each cell. No `.o`, no `userspace-xdp/`, no protocol/wire file touched.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/api/drain_scope_6827_test.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6827 round 11 — state the drain's real bound at both sites; close two
+  deletion-sweep survivors on `Server.serveBound`
+  **Item 1 (wording).** Round 10 described serveBound's new drain as "making the worst
+  case additive" (`pkg/api/server.go`) and "each now gets its own `legDrainTimeout`"
+  (`pkg/api/README.md`). Both read as 5 + 5 = 10s. The quantity has NO fixed ceiling, and
+  this package already says so directly above `legDrainTimeout`: it is a POLL deadline,
+  both phases put serial per-connection closes in front of it, and on an HTTPS leg each
+  `close_notify` carries a five-second write deadline of its OWN. This is the SECOND
+  tightening — round 9 already corrected "bounded 5s drain" to "5s-deadline drain" for the
+  same reason — so both sites now state the MECHANISM and say explicitly that this is not
+  "5s for both" becoming "5s each", which is harder to re-tighten by accident than an
+  adjective. `serveBound` remains test-only: production is `NewServer` + `Start` at
+  `pkg/daemon/management.go:216-217`, and no `.Run(ctx)` in `pkg/daemon` is the api server,
+  so no shipped shutdown path is affected. NOTE: round 10's own entry above carries the
+  same finite gloss ("each now gets its own `legDrainTimeout`", line ~79981). It is left
+  as written — this log is a journal of what was believed at the time, and rewriting it
+  would falsify the record. This entry is the correction.
+  **Item 2 (deletion sweep).** Nobody had run one. Predicate: every EXECUTABLE (non-`//`)
+  line in `git diff 987bfe918..d9fb1de1e -- pkg/api/listener.go pkg/api/server.go` — 8 of
+  the 33 added lines — probed by literal deletion, plus 5 compile-preserving
+  neutralizations for the lines whose deletion is only a compile error, since a build
+  failure is a vacuous red rather than evidence of coverage. Comment lines were excluded by
+  construction: deleting one cannot move `.text`, so "green" there is a tautology, not a
+  finding. Every cell ran the WHOLE of `pkg/api` + `pkg/daemon` with an always-failing
+  sentinel in each package, so GREEN means "exactly 2 FAILs, both sentinels" and a build
+  failure classifies BROKEN rather than GREEN. Results: A1-A4/A8 compile-fenced;
+  A5 RED (4 cells); A6 RED as a HANG — deleting the stop/root-arm drain leaves `<-serveErr`
+  waiting on a Serve that nothing ever stops, and BOTH packages time out; A7 RED;
+  B3/B4/B5 RED. **Two survivors, both on `serveBound`.**
+  **S1: the HTTPS leg was unbound against the exact revert.** Replacing
+  `shutErr = drainLeg(s.httpsServer)` with the pre-round-10 bare `Shutdown` left both
+  packages green. `TestServeBoundSeversInFlightResponses_6827`, the cited binding, called
+  `serveBound(ctx, ln, nil)`, so `s.httpsServer` was nil and the `if s.httpsServer != nil`
+  branch never ran; deleting the line outright reds only
+  `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener CLOSES, not that
+  a response is SEVERED. Round 10's own MUT-2 reverted BOTH legs at once and the bound HTTP
+  leg redded the cell, masking the unbound HTTPS one — a compound mutation cannot localise.
+  **S2: `drainLeg`'s new `return err` could become `return nil`** with both packages green.
+  Self-documented rather than hidden (`t.Logf(...) // not asserted`), but `drainLeg`'s doc
+  says it returns the error "so a caller that reports one can keep doing so" and
+  serveBound's says "the Shutdown error is still what gets reported" — claims with nothing
+  behind them. Both are genuine coverage holes (the lines execute; their values are
+  discarded), not dead code, so both are now bound: the cell runs BOTH legs with a stream
+  held on each via a new `holdStream` helper, and asserts the returned error is the drain
+  deadline. Deterministic — both conns are ACTIVE, so `closeIdleConns` can never report
+  quiescence and `Shutdown` must reach its deadline.
+  **Fix verified against the mutations that found it**: B1 and B2 re-run on the FIXED tree
+  both flip GREEN -> RED. B1: "serveBound returned <nil>, want a context deadline
+  exceeded". B2: "HTTPS leg: ... the connection was still OPEN 3s later (1484 reads, 14840
+  bytes, 0 read timeouts; bytes arrived during the wait)", so the HTTPS stream was
+  genuinely still being delivered rather than merely quiet.
+  **Item 3 (leak check on `TestServingFlipsDuringTheDrainNotAfterIt_6827`).** A temporary
+  `TestMain` snapshotted goroutines and `/proc/self/fd` around `m.Run()` with `-run`
+  narrowed to one test, so anything surviving is attributable to it. Target: goroutines
+  +0, fds +0, sockets +0 — identical to a no-IO control (`TestLegDrainTimeoutDefault_6827`)
+  on all three axes. At `-count=5`, still +0/+0/+0, so there is no per-run accumulation
+  either; the round-11 cell was checked the same way and is also +0/+0/+0.
+  **Harness integrity.** A duplicate `sweep.sh` instance survived its own TERM trap (the
+  handler restored files but did not exit) and was still cycling cells against this
+  worktree while later work ran; it was SIGKILLed and both production files verified
+  sha256-identical to the pristine snapshot afterwards. Neither survivor finding depends on
+  that measurement: both are certain from the pre-fix test SOURCE — the old cell had NO
+  assertion on the returned error, and passed `nil` for `httpsLn` so the HTTPS drain
+  statement never executed. Contamination could only convert a RED into a false GREEN, so
+  the RED verdicts are unaffected in either direction.
+  **Validation** (clean tree, nothing else running in the worktree): `go build ./...` rc 0;
+  `go test -count=1 ./pkg/api/` rc 0, 42.4s, zero `--- FAIL` lines; `go test -count=1
+  ./pkg/daemon/` rc 0, 23.4s, zero `--- FAIL` lines. `go vet ./pkg/api/` rc 0. No `.o`, no
+  `userspace-xdp/`, no protocol or wire file in the change set.
+- **File(s)**: pkg/api/server.go, pkg/api/README.md,
+  pkg/api/tls_stale_cert_6827_test.go
 - **Timestamp**: 2026-08-13T15:52Z
 - **Action**: #6722 round 7 — the RETH-projection predicate's case split is FOUR-way,
   not two, and the two uncovered rows were REACHABLE. `rethProjectionMembers`
@@ -83878,3 +87880,406 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cli/cli_show_system_single_load_6743_test.go,
   pkg/daemon/daemon_dp_escape_canary_test.go,
   pkg/daemon/dp_cell_monotone_6743_test.go, pkg/api/system.go
+
+
+- **Timestamp**: 2026-08-13T18:35Z
+- **Action**: #6691 round 10 — Codex MERGE-NEEDS-MAJOR at `4cf507638`: two runtime
+  blockers, a refuted claim of mine, and four stale-prose minors.
+  **B1 (zero-owner fabric fall-through).** `userspaceRefusedNetdevs` was built from
+  interface ROWS and refused only on `owners > 0 && owners == unbindable`. A fabric
+  MEMBER NEEDS NO INTERFACE STANZA, so `set interfaces fab0 fabric-options
+  member-interfaces ge-0/0/0` emits that netdev into the ingress map and the RSS
+  allowlist with ZERO rows owning it, and a unanimity rule over an empty bucket
+  answers "not refused". Measured at `4cf507638` with a live-xfrm `ge-0-0-0`:
+  `rows OWNING ge-0-0-0: 0`, `refusesName=false`, `refusesIfindex(20)=false`,
+  ingress `[20 21]`, allowlist `[ge-0-0-0 ge-0-0-3]` — the refused device in both
+  sets, on both planes. Round 9 had asked the RIGHT question of an oracle that could
+  not answer it. FIXED BY CORRECTING THE OWNER SET, not by a fourth conjunct: an
+  emitted fabric parent IS an owner, so it carries a verdict
+  (`fabricParentUnbindable`, which hands a synthetic row to the SAME
+  `netdevExclusionClasses` table rather than restating any class) and is tallied like
+  any other owner. "Ownerless" is NOT itself a refusal — the reference cluster's own
+  `fab0 member-interfaces ge-0/0/0` has no row, so refusing on absence would strip
+  the fabric parent from every cluster this project runs; that is a named negative
+  control on both planes. The verdict rides the wire as
+  `FabricSnapshot.ParentUnbindable` because the Rust plane cannot recompute it (the
+  kernel-link-kind half is a Go-side RTM_GETLINK dump), which forces protocol 6->7.
+  Also hoisted the xfrm sample into `buildSnapshot` so the rows and the fabric
+  parents are judged against ONE dump — two samples of a changing kernel put a
+  netdev's owners on opposite sides of the unanimity for no reason but sampling.
+  **B2 (gate armed with no observed version).** `ensureSecureTunnelProtocolLocked`
+  compared `lastStatus.ConfigSnapshotProtocolVersion` against `ProtocolVersion` and
+  armed whenever the live status request also failed — i.e. it armed on the ABSENCE
+  of a reading. Reachable: the deferred-worker arm (manager_worker_arm_5134.go)
+  reaches this gate BEFORE any helper liveness check. The value alone cannot separate
+  "no helper answered" from "a helper answered without the field" (both 0, opposite
+  verdicts), so the observation is now explicit and inseparable from the status:
+  `setLastStatusLocked` / `clearLastStatusLocked` move `lastStatus` and
+  `helperStatusObserved` together at all seven assignment sites. Scoped to THIS gate;
+  the three siblings are #7002.
+  **M1 (my claim, refuted).** `TestMixedVersionHelperRefusalFailsTheCommit_6691` said
+  the injected error was "the REAL one ... wrapped the way process_control.go wraps an
+  ok=false response". It is a pre-formed error VALUE: no socket, no decode, no
+  `resp.Error` pass-through. Took the option the lead authorized — the comment now
+  states plainly what the test does not prove and names where each end of the chain
+  IS pinned.
+  **MINORs.** Bound the previously-untestable xfrm-dump diagnostic by extracting
+  `sampleLiveXfrmNetdevs` (Codex's deletion-survivor claim CONFIRMED firsthand: with
+  round 10's test removed, deleting the `slog.Error` leaves the whole package green
+  at 25.8s); removed a duplicated comment fragment at planning.rs ~340; corrected the
+  round-9 "closed all four loops" paragraph, which read as done and was not; retired
+  the pinned `v5`/`pre-v5` wording now that three versions share one gate.
+  **Validation.** 8/8 Go mutations + 1/1 Rust mutation killed, each by the intended
+  assertion — sever the fabric owner arm (Go and Rust), force the verdict false,
+  bypass the class table, un-hoist the sample, delete the diagnostic, delete/invert
+  the observed-version conditional, and substitute a `version > 0` shortcut for the
+  explicit marker (that last one reds ONLY the "helper answers without the field"
+  cell, which is why the marker is not redundant). Full Go suite: 61 packages ok;
+  `pkg/ddns` failed on `bind: address already in use` from a concurrent agent and is
+  clean in isolation. Full Rust suite green with `FULL_RC=0`. The wire fixture
+  `protocol_wire_v1.json` was REGENERATED (one added key) rather than hand-edited.
+  Fixing the round-9 Rust fixture surfaced a real invariant worth pinning: a BASE row
+  and a fabric parent on one netdev must never disagree (production computes both
+  from identical inputs), because that disagreement would re-admit the device from
+  the other side — `TestFabricAndBaseRowNeverDisagree`.
+- **File(s)**: pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/manager_status.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/fabric_ownerless_parent_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go,
+  pkg/dataplane/userspace/mixed_version_matrix_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  pkg/daemon/mixed_version_commit_6691_test.go,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+
+- **Timestamp**: 2026-08-14T00:20Z
+- **Action**: #6691 round 11 — Codex MERGE-NEEDS-MAJOR at `8c011681c`: three runtime
+  blockers, all downstream of round 10 adding a SECOND producer of netdev verdicts
+  and teaching each consumer about it by hand. All three reproduced first at
+  `8c011681c`, then fixed.
+  **B1 (the v7 gate could not see the v7 verdict) — CONFIRMED, FIXED.**
+  `ensureSecureTunnelProtocolLocked` scoped itself with a scan of `snap.Interfaces`,
+  so a snapshot whose only unbindable verdict was a fabric parent's did not arm it:
+  measured at `8c011681c` on an ownerless live-xfrm member, `ParentUnbindable=true`,
+  no flagged row, `gate = nil`. The snapshot ships, a v6 helper refuses it on the
+  exact-equality version check, the commit reports success, and that helper stays
+  ARMED on a plan binding the refused netdev — the window the gate exists to close,
+  missed for the field the bump was made for. NOT fixed by adding a fabric loop to
+  the gate (the same hand-maintained second list, one round later):
+  `snapshotNetdevVotes` is now the ONE enumeration of who contributes a netdev, and
+  each contributor declares whether it speaks for the netdev, what its verdict is,
+  and whether that verdict rides on a field an older helper cannot read. The tally
+  and the gate both read it.
+  **B2 (a refresh re-decided the verdict) — REPRODUCED, FIXED.** `SyncFabricState`
+  rebuilds fabric rows from a FRESH xfrm sample and writes them back beside
+  interface rows only a full build re-derives. Neither plane replans there
+  (`update_fabrics` swaps `snapshot.fabrics` in place; `replan_queues` runs only
+  from the apply path), so the next partial republish ships a verdict the Go ingress
+  map never saw — an ifindex in that map with no READY binding is
+  `drop_degraded_transit`. Measured at `8c011681c`: ingress `[20 21]` before a
+  refresh, `[21]` after. `alignFabricVerdicts` keeps the verdict with the APPLIED
+  snapshot; the refresh carries MACs, ifindexes and link state as intended. Codex's
+  claim that the "SyncFabricState has no interface rows to agree with" comment was
+  wrong is CONFIRMED — both planes persist its rows beside existing interface rows —
+  and the comment is corrected with the fix.
+  **B3 (canonical aliases split one device into two owners) — REPRODUCED, FIXED.**
+  `member-interfaces gr-0/0/3` with the stanza authored `gr-0-0-3` is ONE device
+  under two legal names: the member must be slash-spelled for `InterfaceSlot` to
+  resolve its node, the stanza name is a wildcard, and
+  `validateInterfaceNameCollisionStrict` sees a single map key and cannot object.
+  The verdict's exact map lookup missed the `tunnel` stanza and voted bindable
+  against an unbindable row; measured at `8c011681c`, ingress `[20 21]` with 20 the
+  GRE device and allowlist `[ge-0-0-3 gr-0-0-3]`. Lookup now keyed on the NETDEV
+  (`interfaceConfigForNetdev`); it is the only exact-match lookup in `fabric.go`
+  that could miss (the fab interface itself is keyed by its own map key, and
+  `snapshotSecureTunnel`'s kernel half is netdev-keyed already).
+  **AND THE RULE CHANGED, because fixing both leaves the next divergence a
+  fail-open.** Round 10 counted the fabric as an owner beside any row, so one device
+  had two owners judged from different evidence — and unanimity reads a
+  disagreement as an ADMISSION. A fabric now votes only where NO interface row owns
+  the netdev: round 9 preserved exactly for row-owned netdevs, round 10 exactly for
+  ownerless ones, and never less refusing than either (suppressing a bindable fabric
+  vote can only turn "not refused" into "refused"). Mirrored in Rust's
+  `snapshot_refuses_parent_netdev`.
+  **REFUTED.** Codex's second B1 case — fabric-only `Tunnel` verdicts missed the
+  same way — does not exist. The Tunnel evidence comes from
+  `cfg.Interfaces.Interfaces`, and `buildInterfaceSnapshotsFrom` emits a base row
+  for EVERY entry in that map, so a Tunnel-class fabric verdict always has an owning
+  row and (under the new rule) is never load-bearing. A v6 helper reaches the same
+  verdict from the row's own pre-v7 `tunnel` field, so arming there would abort a
+  commit over a difference that does not exist — the gate deliberately does not.
+  **MINORS.** Bound the second `clearLastStatusLocked` in `stopLocked` (Codex's
+  deletion-survivor claim CONFIRMED: every existing stopLocked test runs with
+  `proc == nil`; deleting the post-teardown clear leaves them green while a stopped
+  helper keeps a stale `ConfigSnapshotProtocolVersion` with `helperStatusObserved`
+  still true — the exact pair the required-protocol gates read). Widened
+  `TestFabricAndBaseRowNeverDisagree` to pair a row with a fabric by NETDEV instead
+  of by authored spelling, which is why it could not see the alias, plus an alias
+  case.
+  **Validation — mutation grid, all cells on the worktree at `ee880b805` unless
+  noted.** G1 fabric verdict never needs the wire: rc=1, killed by the gate test AND
+  by the producer guard's coupling assertion. G2 fabric votes even when a row owns
+  it: rc=0 FIRST TIME — the rule was unguarded on the Go plane because the other two
+  fixes removed every config that reaches the state; added
+  `TestAFabricVoteCannotOverturnAnOwningRow`, which builds the snapshot by hand, and
+  re-ran: rc=1. G3 exact-spelling stanza lookup: rc=1, killed by
+  `TestFabricAndBaseRowNeverDisagree`. G4 refresh ships a freshly sampled verdict:
+  rc=1, `ingress [20 21] -> [21]`. G5 delete the post-teardown status clear: rc=1,
+  killed only by the new test. G6 a third producer emits a netdev with no verdict
+  (fabric loop also emits its OVERLAY ifindex): rc=1, the producer guard named the
+  section and the ifindex. G7 fabric never votes: rc=1, killed by the round-10
+  guard. R1 fabric counted beside an owning row: rc=101,
+  `fabric_vote_cannot_overturn_an_owning_row`. R2 fabric never votes: rc=101,
+  `ownerless_fabric_parent_is_refused`. Targeted Rust baseline before mutation: 103
+  passed / 0 failed.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/fabric.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  pkg/dataplane/userspace/fabric_ownerless_parent_6691_test.go,
+  pkg/dataplane/userspace/manager_ha_test.go,
+  pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go,
+  pkg/dataplane/userspace/mixed_version_matrix_6691_test.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-20T00:00Z
+- **Action**: #6691 round 12 — hostile MERGE-NEEDS-MINOR at `29b9b84c0`: no runtime
+  defect (14 of 14 production-line reversions caught, protocol genuinely lockstep at
+  7 on both planes), but three guards had measured holes and guards are this PR's
+  deliverable. Test-and-doc round only; ZERO production lines move.
+  **F2 (BLOCKING) — neither new wire field's KEY was pinned on the Go side.**
+  Measured at `29b9b84c0`, both green: `json:"secure_tunnel,omitempty"` ->
+  `json:"secureTunnelXX,omitempty"` and `json:"parent_unbindable"` ->
+  `json:"parentUnbindableXX"`. The version guard cannot see this — both planes still
+  report 7, so `apply_snapshot` accepts, the field is simply absent and serde
+  defaults it false. For `parent_unbindable` that means an ownerless fabric parent
+  stops being refused, `replan_queues` admits the xfrmi, and
+  `replan_bindings_from_candidates` takes the global minimum: every physical NIC
+  drops to one queue and one worker (the #3091 ~6 Gbps regression the v7 bump exists
+  to prevent). Added `TestSecureTunnelWireKeyLockstepWithRust` and
+  `TestFabricParentUnbindableWireKeyLockstepWithRust`, which PARSE the Rust
+  `#[serde(rename = ...)]` out of `protocol/snapshot.rs` rather than mirroring a
+  literal, so they assert an agreement rather than a spelling. `secure_tunnel` is
+  marshalled with the flag TRUE: it is `omitempty` in Go and `skip_serializing_if`
+  in Rust, so the false case is byte-absent by design and a misspelled key is
+  byte-absent too. `parent_unbindable` additionally asserts the Go-emitted key is
+  present in `tests/fixtures/protocol_wire_v1.json`.
+  **F1 (BLOCKING) — the round-11 enumeration guard could not see the state its own
+  error message names.** `TestEveryNetdevProducerIsEnumerated`'s `covered()` helper
+  collected `vote.ifindex` for EVERY vote and never read `vote.role`, but
+  `buildUserspaceRefusedNetdevs` skips `netdevVoteAbstains` outright — so an
+  abstaining vote counted as covered while contributing nothing to the tally, which
+  IS the empty bucket the message describes. Reproduced: forcing the fabric vote to
+  `netdevVoteAbstains` at `29b9b84c0` left the guard PASSING. `netdevVoteAbstains`
+  is iota 0, so a third contributor with a zero-value role lands in the hole by
+  default. A bare role filter is wrong in the other direction — a VLAN child
+  abstains legitimately AND emits its own ifindex, because it binds the parent and
+  the refusal question about it is answered there. The guard now asserts "every
+  emitted netdev has a COUNTED verdict, or is a redirect whose target has one", with
+  the role filter taken from `buildUserspaceRefusedNetdevs` itself; the fixture
+  gained a VLAN child so the second arm is live, and both arms are asserted to have
+  FIRED.
+  **F3 — `fab.ParentUnbindable && !hasOwner` had no test in the hasOwner direction.**
+  Dropping the conjunct left both suites green. The narrowing is sound and its
+  failure direction is conservative (spurious commit abort, not fail-open), so this
+  was a missing test rather than a missing guard; added
+  `TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent` with a negative control so
+  the nil is the narrowing and not an inert gate.
+  **F4/F5 — two false claims in `userspace-dp/src/server/README.md`.** The
+  refusal-rule section still said the planes refuse a netdev "never when the netdev
+  has no owner at all", false since round 10 and contradicting the protocol section
+  250 lines earlier; rewritten as an explicit contributor list (owning row / VLAN
+  child / fabric fallback) that now says "round 10"/"round 11" so the section is
+  findable. The reachability paragraph spliced two incompatible conclusions with an
+  em-dash; the code says it IS reachable (kind-keyed), #6998 is closed.
+  **NON-FINDING recorded, no action:** deleting `t.owners > 0` from `refused()`
+  leaves both suites green and is provably DEAD — every non-abstaining vote does
+  `tally.owners++` before it can reach `tally.unbindable++`, and both call sites
+  range over that map.
+  **Validation — 9 cells, every cell carrying an always-failing sentinel so a green
+  is distinguishable from a suite that never ran; each edit anchor-verified (abort
+  on count != 1) and restore-verified; full `./pkg/dataplane/userspace/... ./pkg/daemon/...`
+  per cell.** CTRL rc=1, sentinel ONLY. M1 fabric vote forced to abstain: rc=1,
+  `TestEveryNetdevProducerIsEnumerated` (ifindex 20, no counted verdict) +
+  `TestOwnerlessFabricParentIsRefused` — the cell that PASSED the round-11 guard.
+  M2 fabric casts no vote at all: rc=1, enumeration guard + both protocol-gate
+  tests, so the round-11 property is preserved. M3 Go tag `secure_tunnel` renamed:
+  rc=1, only the new key test. M4 Go tag `parent_unbindable` renamed: rc=1, only the
+  new key test (both polarities). M5/M6 the RUST rename changed one-sidedly: rc=1,
+  the matching Go key test — the agreement binds in both directions. M7 drop
+  `&& !hasOwner`: rc=1, only the new F3 test. GD1 (guard-design control, my test not
+  production) drop the redirect arm: rc=1, the guard reds at head on the VLAN
+  child's ifindex 25 — the bare role filter really is wrong in the other direction.
+  At the committed head: `go build ./...` rc=0; `go test -count=1
+  ./pkg/dataplane/userspace/... ./pkg/daemon/...` rc=0, 0 `--- FAIL` lines; `cargo
+  test --no-fail-fast --bin xpf-userspace-dp -- --skip
+  afxdp::wg::engine::engine_internal_tests` rc=0, 4262 passed / 0 failed / 2 ignored.
+  No `.o`, no `userspace-xdp/`, no protocol or wire change — protocol stays at 7 on
+  both planes, so no fresh cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/wire_verdict_keys_6691_test.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21T01:50Z
+- **Action**: #6691 round 14 — hostile MERGE-NEEDS-MINOR at `cb3df5163`: 19 of 20
+  round-13 cells behaved exactly as claimed, and the one that did not is the round-12
+  guard reproducing, in its own body, the anti-pattern the PR exists to remove.
+  **F1 (BLOCKING) — "cannot drift" was false, and the drift is measurable.**
+  `fabric_verdict_scope_6691_test.go` claimed its role filter was "the one
+  `buildUserspaceRefusedNetdevs` applies, so 'counted here' and 'tallied there'
+  cannot drift". It was not lifted from production; it was a RE-TYPED literal —
+  test `vote.role == netdevVoteAbstains || vote.ifindex <= 0`, production
+  `vote.role == netdevVoteAbstains`. Measured (cell DRIFT, one production edit
+  narrowing the tally, `if vote.role == netdevVoteAbstains` ->
+  `if vote.role != netdevVoteOwner`): `TestOwnerlessFabricParentIsRefused` FAILS
+  (`fabric_ownerless_parent_6691_test.go:104`, `refusesName(ge-0-0-0) = false`) while
+  `TestEveryNetdevProducerIsEnumerated` still PASSES — the enumeration guard is
+  SILENT for exactly the regression it was written to catch, because its own copy of
+  the filter still counts the fabric's fallback vote. That matters beyond the wording:
+  `netdevVote`'s production doc states the principle as "A hand-maintained second list
+  is the defect, not the omission: the repair is that ONE enumeration answers 'who
+  contributes a netdev verdict', and both the tally and the gate read it."
+  Fixed by single-sourcing the ROLE axis: new `func (v netdevVote) counted() bool`
+  (`ingress_exclusions.go`), applied by `buildUserspaceRefusedNetdevs` as
+  `if !vote.counted()` and read by the guard as `vote.counted()`. Re-measured against
+  the fixed tree, same production narrowing (now on `counted()` itself):
+  `TestEveryNetdevProducerIsEnumerated` FAILS on BOTH its primary assertion
+  (`:364`, ifindex 20 emitted with no counted verdict) and its anti-vacuity control
+  (`:404`, no netdev covered only by a fallback vote). The guard is no longer silent.
+  The replacement sentence is scoped to what was actually single-sourced — the ROLE
+  axis. Production's per-key `name != ""` and `ifindex > 0` guards stay separate, and
+  the test's `|| vote.ifindex <= 0` is still its own literal; asserting a universal
+  over all three axes is the defect this round is fixing, so the doc on `counted`
+  and the comment in the test both say ROLE and both say what is NOT covered.
+  **CORRECTION to the round-12 entry above (`cb3df5163`), appended not edited.**
+  (a) That entry says the guard now asserts its property "with the role filter taken
+  from `buildUserspaceRefusedNetdevs` itself". That was FALSE as written — the filter
+  was re-typed, not taken, which is what F1 above measures. It becomes true only at
+  this round's head, via `netdevVote.counted`.
+  (b) That entry records cell M2 (fabric casts no vote at all) as reddening "the
+  enumeration guard + both protocol-gate tests" — three. Re-measured here over the
+  whole package: M2 reds FOUR — `TestOwnerlessFabricParentIsRefused`,
+  `TestProtocolGateArmsForAnOwnerlessFabricVerdict`,
+  `TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent`,
+  `TestEveryNetdevProducerIsEnumerated`. The omission is harmless to the conclusion
+  (M2 was already sensitive), but it is an enumeration presented as a census, which
+  is the same defect shape as F1.
+  **F2 — `userspace-dp/src/server/README.md` said "all four loops now ask the refused
+  index"; there are FIVE Go consult sites** (`interfaces.go:207,237`,
+  `maps_sync.go:1626,1675,1743` — the binding-alias site at `:1743` is the uncounted
+  one, and it IS guarded). Carried over from `cb3df5163^` rather than introduced at
+  head, and the count was never right at any point checked: `git show` at
+  `1c5b8e69a` (round 8, where `:1743` was added) has THREE sites, `cb3df5163^` has
+  five, and the prose said "four" at both. Rewritten to name the PREDICATE — every Go
+  loop that plans a binding from a snapshot or fabric row asks the index — with the
+  site list demoted to an as-of-this-writing aid plus the grep that regenerates it.
+  **F3 — README "A VLAN child speaks for nothing" is true of the TALLY and loose
+  about the GATE.** An abstaining row still carries
+  `verdictNeedsProtocol: iface.SecureTunnel` (`ingress_exclusions.go:679`, set on
+  every row unconditionally), so a VLAN child that is a secure tunnel DOES arm
+  `snapshotRequiresRefusalProtocol` while contributing nothing to any
+  `netdevOwnerTally`. Behaviour is correct and deliberate; only the sentence was
+  unscoped. Now says "casts no COUNTED vote" and spells out the protocol-gate half.
+  **F4 — README wrote the Go method `netdevOwnerTally.refused` in Rust path syntax
+  (`::`)**, two lines after correctly tagging `snapshotNetdevVotes` as "(Go)".
+  `netdevOwnerTally` exists only in Go (`ingress_exclusions.go:578`); there is no
+  Rust type of that name. Corrected and tagged "(Go)".
+  **Validation.** Every cell carried an always-failing sentinel in the SAME
+  invocation, so a green is distinguishable from a suite that never ran; every edit
+  was anchor-verified (abort unless the anchor matched exactly once), gated on having
+  actually produced a diff (a cell with no diff aborts rather than reporting green),
+  and restored by content copy under a `trap`. CONTROL (pristine, `cb3df5163`):
+  `TestOwnerlessFabricParentIsRefused` PASS, `TestEveryNetdevProducerIsEnumerated`
+  PASS, sentinel FAIL. DRIFT before the fix: rc=1, OwnerlessFabricParent FAIL /
+  EveryNetdevProducerIsEnumerated PASS. DRIFT after the fix: rc=1, BOTH FAIL. M2
+  re-measure: rc=1, four named tests. At the committed head: `go build ./...` rc=0;
+  `go test -count=1 ./pkg/dataplane/userspace/... ./pkg/daemon/...` rc=0 with zero
+  `--- FAIL` lines. No Rust source in the diff, so no cargo leg is implicated.
+  **Smoke:** this round moves a PRODUCTION file (`ingress_exclusions.go`) for the
+  first time since round 12, but no fresh cluster smoke is owed. `counted()` is a Go
+  control-plane refactor of a filter whose truth table is unchanged (`role !=
+  netdevVoteAbstains`, byte-identical semantics, verified by an unchanged CONTROL);
+  no `.o`, no `userspace-xdp/`, no wire or protocol change — protocol stays at 7 on
+  both planes.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21 (round 16, drive-to-merge lane)
+- **Action**: #6691 round 16 — CONFIRMED both Codex runtime blockers firsthand at
+  `76045dfae`, fixed the one that is this PR's to fix, and generalized it to two
+  further sites the review had not reached.
+  **B2 (fixed here) — the refusal index has TWO keys populated from DIFFERENTLY
+  SAMPLED evidence, and the Go readers split on which one they asked.**
+  `buildUserspaceRefusedNetdevs` gives a netdev a NAME bucket from any counted
+  vote carrying a name, but an IFINDEX bucket only from a vote whose own
+  `buildLinkSnapshot` resolved (`vote.ifindex > 0`). A snapshot is not one
+  netlink sample: `buildInterfaceSnapshots` takes one per base row AND a second
+  per unit row for that unit's parent, `buildFabricSnapshotsFrom` takes its own,
+  and `SyncFabricState` refreshes the fabric rows ALONE and persists them back
+  into `m.lastSnapshot` (`persistResolvedFabricsLocked`) beside interface rows
+  never re-sampled. So a netdev can be NAMED by a row whose lookup missed — no
+  ifindex bucket — while a sibling row or fabric row carries its live ifindex.
+  Both name-keyed readers (the Rust planner's `snapshot_refuses_parent_netdev` /
+  `binding_target_is_refused`, and the RSS allowlist) then refuse the netdev and
+  plan NO binding, while the three ifindex-keyed readers in `maps_sync.go`
+  admitted its ifindex to the ingress-adjudication map — and an ifindex there
+  with no READY binding is `drop_degraded_transit` (BINDING_MISSING), i.e.
+  transit on that netdev drops. MEASURED at `76045dfae`, both planes, firsthand:
+  rows `{gr-0-0-3 ifindex 0, tunnel}` + fabric `{gr-0-0-3, parent ifindex 20}` →
+  Go ingress `[20]`, Rust planned `{}`; rows `{ge-0-0-5 ifindex 0, tunnel}` +
+  `{ge-0-0-5.100 ifindex 12, parent 11}` → Go ingress `[11 12]` + alias `12→11`,
+  Rust planned `{}`. The second shape needs no fabric refresh at all. FIX:
+  single-sourced the question as `userspaceRefusedNetdevs.refusesNetdev(name,
+  ifindex)` and routed every caller holding both identities through it — three
+  sites in `maps_sync.go` plus the fabric guard in `interfaces.go`. A divergence
+  between the two keys for one netdev is ALWAYS a bug, so this is a predicate,
+  not a convention. The bind-target arm of `UserspaceBoundLinuxInterfaces` keeps
+  `refusesName` — it has no ifindex to bring. Strict tightening at each site: it
+  can only stop a loop ADDING a key, and what it stops adding is exactly the set
+  the binding planner already refuses. Transparent to the reference cluster,
+  whose `fab0 member-interfaces ge-0/0/0` is ownerless and bindable (checked in
+  `docs/ha-cluster-userspace.conf`: no `ge-0/0/0` stanza) — pinned by an
+  anti-vacuity arm in each new test.
+  **B1 (NOT fixed here, confirmed real, merge-ORDER item)** — a dotted
+  `bind-interface st0.0` moves from kernel-reinjected to policy-DENIED. Measured
+  end to end in Rust at `76045dfae`: `disposition=MissingNeighbor
+  egress_ifindex=42`, no `state.egress` row for 42, zone pair `(1, 0)`, and an
+  explicit `trust → vpn permit` evaluates `Deny` on the default policy
+  (`policy_id=4294967295`). `MissingNeighbor` converts a deny to `PolicyDenied`
+  before the reinject gate, and `PolicyDenied` is not slow-path eligible. Root
+  cause is the pre-existing MAC-less-xfrmi egress (#6713, live on master for bare
+  `st0`) and the fix is open PR **#6722**, which rewrites the two Rust files this
+  branch does not touch. The naive local fix — extending `populate_egress`'s
+  `src_mac` fallback to `secure_tunnel` — is explicitly rejected by #6722's own
+  design (it would put an all-zero source MAC on an AF_XDP TX to a
+  link-layer-less device), so it is NOT fixed here. **#6722 must merge before
+  #6691.** That sequencing was already recorded on the PR on 2026-08-02 and is
+  now backed by a firsthand measurement.
+  **Validation** at the round head: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./pkg/dataplane/...` rc=0, full `cargo test --
+  --test-threads=1` rc=0. Per-site mutation matrix: reverting each of the three
+  `maps_sync.go` sites to `refusesIfindex` reds its OWN assertion and only its
+  own (A → the two ingress assertions, B → the alias assertion, C → the fabric
+  assertion); reverting the Rust owner walk to skip `ifindex <= 0` reds
+  `zero_ifindex_owner_row_still_refuses_the_fabric_parent`.
+  **Smoke:** owed — the diff moves Rust (`main_tests.rs` only, tests) and Go
+  production forwarding-set builders. Protocol stays at 7 on both planes; no
+  wire, `.o` or `userspace-xdp/` change.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md

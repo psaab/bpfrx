@@ -116,7 +116,7 @@ func gateErr5488(t *testing.T, m *Manager) error {
 	t.Helper()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	err := m.ensureRequiredSnapshotProtocolLocked(multiZoneScopedGlobalDenyConfig())
+	err := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, multiZoneScopedGlobalDenyConfig()))
 	if !errors.Is(err, ErrScopedGlobalZoneSetProtocolIncompatible) {
 		t.Fatalf("precondition: gate error = %v, want ErrScopedGlobalZoneSetProtocolIncompatible", err)
 	}
