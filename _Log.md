@@ -1,3 +1,545 @@
+## 2026-08-20 — #6827 drive-to-merge: master merge (31 behind), hostile runtime pass, 9 issues filed instead of a round-12 fold
+
+- **Timestamp**: 2026-08-20 (fix/5719-api-hardening, PR #6827)
+- **Action**: Drive-to-merge pass under the campaign bar (runtime defects block;
+  every non-runtime finding is FILED, not folded — a tenth wording round does
+  not terminate).
+
+  **Merged `origin/master`** (24 commits behind at merge time, 44 ahead).
+  Only `_Log.md` conflicted; resolved by union with a structural check —
+  ours 1597 `##` headers, theirs 1606, merged 1616, zero headers dropped from
+  either side, zero NEW duplicate headers (the four duplicates present in the
+  result are present on BOTH sides at their respective heads). The #6743
+  `Daemon.dp` → atomic-cell migration that broke a sibling lane's clean textual
+  merge does NOT bite here: this PR adds no `pkg/daemon` test that constructs a
+  `Daemon` literal with a `dp` field. `go build ./...` rc 0 and
+  `go vet ./pkg/... ./cmd/...` rc 0 at the merge commit — checked rather than
+  inferred from a clean merge.
+
+  **Both deferred stale-cert delivery call sites re-verified BOUND at the
+  post-merge head**, by mutation rather than by reading `ccc2f6b09` into the
+  history. Content-copy restore with a `trap`, never `git checkout --`:
+
+  | mutation | result |
+  |---|---|
+  | control | rc 0 |
+  | drop `d.deliverStaleMgmtCertDiagnosis()` from `startHTTPServer` | rc 1 — `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827/boot_start_…` ONLY |
+  | drop it from `reconcileWebManagement` | rc 1 — `…/a_day2_reconcile_settles_a_debt…` + `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` |
+
+  Each mutation reds its own site and not the other: the two call sites are
+  independently bound, and `git status` was clean after each restore.
+
+  **Hostile runtime pass (TLS / net/http / Go stdlib), zero runtime defects.**
+  What was attacked and why it held:
+
+  - *Concurrent rename delivery vs. in-flight TLS handshakes.* 2381 real
+    `WarnStaleMgmtCertForHostName` deliveries against a live `ServeTLS` leg with
+    four goroutines dialling continuously, under `-race`: 0 races, 0 panics.
+    `buildHTTPSServer` hands each leg its own `*tls.Config` and nothing writes
+    `Certificates` after construction; the only stdlib write into that config is
+    `setupHTTP2_ServeTLS` appending to `NextProtos`, a different field, once,
+    before any handshake.
+  - *False NEGATIVE (the dangerous direction).* Walked the ordinary shape end to
+    end — `web-management https interface`, cert minted `[localhost, fw0]` +
+    `[127.0.0.1, ::1, 10.0.61.1]`, `set system host-name fw-edge1`: the rename
+    path WARNs (gate 3 skipped for `hostNameOperatorSet`) and the next boot's
+    load path WARNs too (`hostNameLikelyAccessIdentity` returns true on the
+    unqualified/unqualified shape match). The two halves also compose: a leg that
+    is `dead` at rename time has already been rebuilt by the SAME commit's
+    `reconcileWebManagement` (the new `!HTTPSServing()` term runs early in the
+    apply, `applyHostname` runs in the tail), so the delivery finds a serving
+    certificate. Where it fails to, the debt stands and is retried.
+  - *Wedge / panic on the mgmt listener.* `stopLegLocked` is `sync.Once`-guarded,
+    so a reconcile retiring an already-exited leg cannot double-close `stopCh`.
+    `http.Server.Serve` closes its listener on the way out (`defer l.Close()`)
+    BEFORE the goroutine stores `dead`, so a same-address rebuild after an
+    unexpected exit is not racing a held port. The `staleCertMu → lifeMu` edge is
+    a STALL, not a deadlock: `Server.Wait` waits only on leg goroutines and
+    nothing under them takes `staleCertMu`.
+  - *Commit-bricking.* The new `(next.TLS && !m.srv.HTTPSServing())` disjunct can
+    make `reconcileTo` return an error on every commit while an HTTPS bind keeps
+    failing — `daemon_apply.go:210-213` only WARNs on it, so a commit cannot be
+    bricked. Verified at the call site.
+  - *Certificate expiry.* Not a gap the diagnostic can miss into: the durable
+    cert is minted `NotAfter: +10 years` (`server.go:1611`), and `VerifyHostname`
+    checking no validity dates is therefore not reachable as a silent staleness.
+
+  **Two findings the hostile pass produced, both log-only, both FILED**: the
+  rename path WARNs about "remote clients" on a loopback-only HTTPS bind, where
+  `bindHostWarnable` makes the bind-host half of the same diagnostic decline
+  (#7039, measured with a probe over the package's own fixtures); and the
+  dead-leg retry re-runs the load-path cert diagnostic on every commit while the
+  bind keeps failing (#7041).
+
+  **Filed, not folded** (campaign policy): #7038 (deliverable tracking issue, so
+  the PR body can carry a `Closes` keyword without closing cohort #5719, which
+  still has the unfixed applied-nft item), #7039, #7041, #7043
+  (unparseable-cert `return true` unbound), #7044 (no-SANs terminal arm bound at
+  the load site only), #7045 (`hostName == bindHost` conjunct unbound in both
+  polarities), #7046 (README "reds only …" false at the shipped head), #7047
+  (surviving "up to `legDrainTimeout`" gloss + `serveBound` doc over-scoping the
+  5s `close_notify` to the HTTP leg), #7048 (hijack tripwire misses stdlib
+  `net/rpc`), #7049 (remaining unlocked `d.mgmt` readers — pre-existing on
+  master, verified with `git show origin/master:`).
+
+- **File(s)**: `_Log.md` (merge resolution + this entry). No production file
+  changed this round.
+
+## 2026-08-13 — #6827 round 6: the two DEFERRED delivery call sites were unbound; the debt ledger's whole justification was unmeasured
+
+- **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded the post-merge hostile review at `d73835136`
+  (MERGE-NEEDS-MINOR, one blocking item).
+  **B1 (BLOCKING) — both deferred-delivery call sites were unbound.** The
+  daemon half of this PR is a debt ledger whose entire justification is that a
+  boot rename reaches a nil reconciler and must be RETRIED later. Measured, each
+  severed in its own cell: deleting `d.deliverStaleMgmtCertDiagnosis()` from
+  `startHTTPServer` left `pkg/daemon` GREEN; deleting it from
+  `reconcileWebManagement` left `pkg/daemon` GREEN; deleting BOTH — collapsing
+  the mechanism to "diagnose synchronously at the rename or never" — also left
+  it GREEN. Only ONE of the two was self-declared (the reconcile one, in a "NOT
+  YET BOUND" block); two artefacts read as if the boot one were covered
+  (`TestBootHostNameReachesTheDiagnostic_6827`, which calls the delivery
+  DIRECTLY, and a `pkg/api/README.md` "All fail-on-revert" sentence).
+  Now bound by `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on
+  deliberately different observables, from ONE fixture
+  (`newMgmtDeliveryDaemon`, a Daemon with a REAL configstore):
+  the reconcile site on the DEBT FLAG, because bringing HTTPS up makes
+  `pkg/api`'s LOAD path emit the same warning text (a text assertion passes with
+  the retry deleted, which is why the earlier attempt was abandoned); the boot
+  site on the KERNEL-NAME READ, which sits past the delivery's
+  `!pending || mgmt == nil` guard and which nothing else on that path performs.
+  The boot site cannot be driven end-to-end in-process: `startHTTPServer`
+  CONSTRUCTS the `api.Server` itself and `SetTLSCertDirForTest` exists only
+  after construction, so a serving HTTPS leg there would mean driving the
+  production `/etc/xpf/tls` generator.
+  **N3** — `listenerLeg.serving()`'s doc and `pkg/api/README.md` both said the
+  disable arm clears `s.httpsLeg` BEFORE retiring. `ReconcileHTTPS` does the
+  reverse (`stopLegLocked`, then `s.httpsLeg = nil`). The conclusion survives —
+  a `stopCh` test would arm an unreachable state — but because the whole switch
+  runs under ONE `lifeMu` hold and both `serving()` callers take `lifeMu`.
+  Corrected in both places.
+  **N5** — `hostNameLikelyAccessIdentity`'s residual note scoped the never-
+  diagnosed class to boxes drifted BEFORE this shipped. A box RUNNING this build
+  reaches the same silence: `staleCertPending` is process-local, so a
+  cross-shape rename committed while nothing served a certificate is discarded
+  by a restart. Note widened (and in `pkg/api/README.md`); the durable-debt
+  implementation is DECLINED for the same reason as the upgrade sweep it sits
+  beside — persistent state plus an invalidation story, re-firing the false
+  positive on exactly the boxes the heuristic cannot judge.
+  **N6** — verified with `go doc -u` (not by reading): the `// Guarded by
+  staleCertMu.` block ran straight into `// staleCertGen advances ...` above a
+  three-field group, so godoc attached the whole thing to `staleCertMu`. Split
+  so each field carries its own comment.
+  **N-accounting** — the merge commit message and its `_Log.md` entry are
+  corrected in place: the removal of the branch's listener-recovery arm is
+  justified by DEAD CODE, not by a fail-open (master's recovery publishes the
+  same full credential set on that path), and THREE things went from
+  `management_recovery_6827_test.go`, one of them a duplicate rather than a
+  casualty. The dropped `noAddr` half's behaviour — after a failed boot bind, a
+  reconcile to an EMPTY HTTP bind must bind nothing — had no replacement
+  anywhere in the package, so it is restored as
+  `a_failed_boot_then_an_empty_bind_binds_nothing`, framed as the master-owned,
+  incidentally-held behaviour it now is.
+- **Validation**: `go build ./...` rc 0; `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0; `go test ./pkg/api/ ./pkg/daemon/` rc 0 (`TMPDIR=/dev/shm/t`, per-cell
+  `GOCACHE` under `/dev/shm`). Four mutations driven to RED, each in its own
+  cell, restored and re-run GREEN: **MUT-A** delete the boot delivery →
+  `boot_start_delivers_a_debt_parked_before_the_reconciler_existed` fails
+  ("the boot management start did not attempt the parked diagnosis: the kernel
+  name was never read"), the reconcile subtest stays GREEN; **MUT-B** delete the
+  reconcile delivery → `a_day2_reconcile_settles_a_debt_incurred_while_https_was_down`
+  fails ("left the host-name diagnosis still owed: nothing retried the
+  delivery"), the boot subtest stays GREEN; **MUT-A+B** together → both fail and
+  the rest of `pkg/daemon` is unaffected; **ordering** — move the boot delivery
+  ABOVE the `d.mgmt` publish → MUT-A's subtest fails, so the read also binds the
+  publish-then-deliver order. The restored empty-bind guard is not vacuous:
+  making `reconcileTo`'s HTTP arm unconditional reds it.
+- **File(s)**: `pkg/daemon/hostname_stale_cert_6827_test.go`,
+  `pkg/daemon/management_recovery_6827_test.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/README.md`, `pkg/api/listener.go`, `pkg/api/server.go`,
+  `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-13 — #6827 semantic merge with master: the listener-recovery half was master's fix in a second spelling
+
+- **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
+- **Action**: Real merge of `origin/master` (edefb7570, the #6645 REST-auth
+  wave) into the PR head b7272cddf. Merge base 4960e7bee; both sides had
+  independently changed listener identity, credential-publish gating and
+  management-state derivation, so a clean textual merge was not evidence of
+  correctness. Four textual conflicts, plus one collision git merged CLEANLY
+  into a compile error.
+  **DUPLICATE METHOD (no conflict marker)** — both sides added
+  `Server.HTTPSServing()` at different offsets in `listener.go`, for the same
+  stated reason (Start returns nil on an HTTPS bind failure, so a caller that
+  records a converged fingerprint pins to a listener that does not exist). Kept
+  ONE, with the branch's strictly stronger body (`httpsLeg.serving()` — adds
+  `ln != nil` and `!stopping` over master's `!= nil && !dead`) and a doc
+  comment carrying both rounds' rationale.
+  **TWO RETRY MECHANISMS, ONE SURVIVES** — #5561 round 14 (master) and #6827
+  round 5 (branch) both fixed the absorbing boot-bind failure. Master's
+  survives: `startTo` ADOPTS the server whether or not the bind succeeded, so
+  the retry runs through `reconcileTo`'s ordinary path. The branch's — retain
+  the root context, re-CONSTRUCT from the `m.srv == nil` branch — was REMOVED,
+  not kept alongside, because on top of master's `startTo` it is UNREACHABLE:
+  `m.srv = srv` runs unconditionally before the error return and
+  `api.NewServer` never returns nil, so the nil-srv branch is reachable only
+  when start never ran — and there the branch's own
+  `if m.rootCtx == nil || next.Addr == ""` guard returns nil, `rootCtx` being
+  assigned only inside `startTo`. (Corrected 2026-08-13: this entry first
+  argued the removal on a FAIL-OPEN — a fresh `api.Server` with the committed
+  `Auth` installed, bypassing `everyLiveLegNamedBy`/`publishNilDirectionLocked`.
+  That is false. Master's own recovery publishes the same full set on that path:
+  the error arm resets `m.cur, m.curSet` to `mgmtEndpoint{}, false`, so
+  `everyLiveLegNamedBy` is vacuously true, the grant is sanctioned, and
+  `ReplaceAuth(next.Auth)` publishes the whole set. The nil-Auth case is
+  unreachable off-loopback because the #4047/#5127 clamp keys on
+  `Auth != nil`.) Master's `b27ab99b5` (an absent HTTP leg imposes no
+  requirement) is reachable ONLY because the server is adopted, so taking the
+  branch's non-adopting `startTo` would have re-stranded the state that commit
+  fixed. `m.rootCtx` and `startLocked` are gone; merged
+  `startTo`/`reconcileTo` are byte-identical to master's.
+  **PROSE CORRECTED** — `serving()`'s comment claimed "there is no third
+  defer-set flag: it would be unbindable". Master added exactly that
+  (`drained`, for reaping `s.retiring`). The comment now says why `drained` is
+  the wrong answer to `serving()`'s question: it is stored as the goroutine's
+  LAST act, so it reads false throughout the 5s drain — the whole window that
+  matters.
+  **DOCS** — dropped the branch's "Failed BOOT start" bullet from
+  `pkg/daemon/README.md` (it documented the removed mechanism; master's "Boot
+  retry debt is real debt" bullet documents the surviving one). The #6827
+  stale-cert-on-rename section is untouched.
+  **TESTS** — `management_recovery_6827_test.go` is rewritten down to the two
+  over-reach guards that are still true and that master's
+  `management_bootretry_5561_test.go` does not cover: a reconcile before any
+  start must not construct, and a SUCCESSFUL boot HTTPS bind must still record
+  its fingerprint. (Corrected 2026-08-13: THREE things went, not "two subtests
+  binding the removed mechanism". `boot_http_bind_failure_recovers_on_a_later_reconcile`
+  and the `noAddr` half of `a_disabled_api_still_does_not_construct` asserted
+  m.srv stays nil — those two bound the mechanism that lost.
+  `boot_https_bind_failure_retries_on_an_identical_reconcile` went as a
+  DUPLICATE of `management_bootretry_5561_test.go`; its own precondition
+  asserted the OPPOSITE, that the server IS adopted.)
+- **Validation**: `go build ./...` rc 0; `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0; `go test ./pkg/api/ ./pkg/daemon/` rc 0 (`TMPDIR=/dev/shm/t`). Two
+  mutations driven to RED on real assertions with build+vet clean under each,
+  then restored + `touch`ed and re-run GREEN: widening the HTTPS-fingerprint
+  clear to unconditional (`if next.TLS`) reds three tests including the retained
+  over-reach guard; weakening `serving()` back to master's `!= nil && !dead`
+  reds four assertions in `pkg/api` — so the stricter predicate is still bound
+  after the merge rather than silently reverted.
+  `_Log.md` union verified STRUCTURALLY before this entry: 1595 `^## ` headers
+  = 1581 (branch) + 1587 (master) - 1573 (base), and the header multiset equals
+  branch + master - base exactly (no missing, no duplicates).
+- **File(s)**: `pkg/api/listener.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/management_recovery_6827_test.go`, `pkg/daemon/README.md`,
+  `_Log.md`
+
+## 2026-08-05 — #6827 round 5: two absorbing start paths, a generation-unsafe debt clear, and three edits no test bound
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded the Codex gate at `2c569fb22`.
+  **MAJOR 1a** — a boot HTTP bind failure was ABSORBING: `startTo` assigns
+  `m.srv` only after `Start` succeeds, so every later reconcile returned at the
+  `m.srv == nil` early exit and clearing the cause never recovered. `startTo`
+  now retains the root context even on failure and `reconcileTo` retries the
+  construction (`startLocked`).
+  **MAJOR 1b** — `api.Server.Start` LOGS an HTTPS bind failure and returns
+  SUCCESS (HTTPS is best-effort at boot), but `startTo` recorded the HTTPS
+  fingerprint anyway, so an identical later reconcile saw no change and never
+  retried. Added `Server.HTTPSServing()`; `startLocked` leaves that leg's
+  fingerprint unrecorded when it did not bind, matching reconcileTo's retry-debt
+  posture. Checked the other caller of `Start` — only `management.go` — so no
+  other site trusts that return.
+  **MAJOR 2** — the debt clear was not generation-safe: delivery read the flag
+  under the mutex, ran the hostname read + certificate inspection UNLOCKED, then
+  cleared unconditionally, so a rename landing in that window was settled by the
+  older delivery. Added `staleCertGen`; the clear is conditioned on the claimed
+  generation still being current. `d.mgmt` is now published under `staleCertMu`,
+  the same mutex the delivery path reads it through.
+  **Fix 3** — `serving()` was still true during the up-to-5s graceful drain.
+  Decided drain does NOT count as serving (the listener is closed, no new client
+  can reach the certificate, and the process is going down) and recorded that on
+  the predicate. `stopping` is set at the top of both drain arms.
+  **The redundant flag was deleted.** Round 4 added `exited` from a defer; with
+  `stopping` covering both drain arms and `dead` covering self-termination,
+  every exit is already covered, so `exited` became unbindable — a mutation
+  deleting it left the suite green. Rather than keep an arm no test can drive
+  (the exact criticism of round 4's `stopCh`), it is removed.
+- **Validation**: the gate was right that three production edits were unbound.
+  Now: deleting the drain flag REDs
+  `TestDrainFlagIsSetByTheRealServeGoroutine_6827`, which starts a REAL leg,
+  cancels the root context and joins the goroutine rather than storing the flag
+  itself; noting before `Sethostname` REDs
+  `TestRenameIsNotedOnlyAfterSethostname_6827`.
+  **STILL UNBOUND, reported not papered over**: the per-reconcile retry call
+  site. Asserting on the warning text does not isolate it (the certificate LOAD
+  path emits the same message, so that version passed with the retry deleted);
+  asserting on the debt flag is right but a bare `&Daemon{}` resolves an empty
+  bind, so the reconcile DISABLES HTTPS before the retry runs. Binding it needs
+  a Daemon with a real configstore. A comment in the test file records exactly
+  this instead of a vacuous passing test.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code);
+  `go vet` clean; `gofmt -l` clean. `pkg/api/server.go` 1424 lines — 76 under
+  the 1500 audit threshold, unchanged this round.
+- **File(s)**: `pkg/api/listener.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/daemon/management.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
+## 2026-08-05 — #6827 fold r4: three MAJORs — the debt was cleared on delivery, not on success
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded three runtime findings from the gate at `608e570d9`.
+  (1) **The r3 unconditional drain lost the diagnosis permanently.** Verified
+  both paths: an HTTP-start failure leaves `m.srv` nil and `management.go`'s
+  `if m.srv == nil { return nil }` means no later reconcile recovers it; and
+  with HTTPS off/bind-failed the drain cleared the parked name having emitted
+  nothing. In both cases the next boot's `applyHostname` returns early (name
+  already applied) and the load path's INFERRED heuristic declines cross-shape
+  drift — which this PR's own residual note at `server.go` already said. The
+  r3 trade was therefore not "a miss with a backstop" but a permanent loss.
+  Redesigned: `Daemon.staleCertPending` is a DEBT, `WarnStaleMgmtCertForHostName`
+  now RETURNS whether it reached a served certificate, and the debt clears only
+  on true. Retried at the rename, the boot start, and every web-management
+  reconcile.
+  (2) **The mark/deliver handoff was not atomic.** The old code branched on
+  `d.mgmt == nil` outside `staleCertMu` while `startHTTPServer` published
+  `d.mgmt` and drained separately. Fixed at the root rather than by widening the
+  lock: the host name is now read from the kernel AT DELIVERY (`osHostname`
+  seam) instead of stored at rename time, so a deferred diagnosis always
+  describes the current identity; and marking + attempting are one code path,
+  so there is no window to lose a rename in.
+  (3) **`serving()` missed the state that occurs and covered one that cannot.**
+  The root-context arm of `serveLegLocked` drains and RETURNS setting neither
+  `dead` nor `stopCh`, leaving the leg installed forever with every flag clear.
+  Meanwhile a requested retirement is unobservable through `s.httpsLeg` by
+  construction (disable clears the field before retiring; rebind installs the
+  replacement first). Replaced the `stopCh` arm with an `exited` atomic stored
+  from a DEFER over the whole serve goroutine, so no exit path — present or
+  future — can skip marking it.
+- **Validation**: two new mutations, each with `go build ./...` + `go vet` rc=0
+  first so the RED is an ASSERTION; files snapshotted and restored, verified
+  with `sha256sum -c`.
+  (1) clear the debt whenever delivery runs (the retracted r3 design) →
+  `debt_survives_a_delivery_that_reached_nothing` FAILs;
+  (2) drop `exited` from `serving()` (the r3 predicate) →
+  `root_shutdown_exited_leg_is_not_diagnosed` and
+  `reports_whether_it_reached_a_certificate` FAIL.
+  Note the r3 API test helper had to change again: `serving()` now also gates on
+  `exited`, and the earlier fixtures were still only as realistic as the
+  previous predicate demanded.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/listener.go`,
+  `pkg/api/tls_stale_cert_6827_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
+## 2026-08-05 — #6827 fold r3: two REACH findings — the hook's own boot ordering, and a dead leg treated as live
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded two runtime MAJORs from the gate at `78b70ed3f`. Both are
+  about WHETHER the diagnostic has something real to look at, not about the
+  narrowing heuristic (which the gate passed and I did not touch).
+  (1) **The hook was itself ordered before its dependency.** Verified the chain
+  first: the initial config apply is startup phase 4
+  (`daemon_run.go:170` → `setupDataplaneAndInitialConfig` →
+  `daemon_run_bringup.go:520` `applyConfig` → `applyTailReconciles` →
+  `applyHostname`), while `startHTTPServer` constructs `d.mgmt` at
+  `daemon_run_servers.go:475`, reached from `daemon_run.go:588`. So a
+  `system host-name` applied at boot reached a nil reconciler. A bare
+  nil-check-and-return would have reproduced the original silence exactly,
+  because the surviving fallback — the load path's INFERRED heuristic —
+  declines this very shape (cert `[localhost, oldfw.example.com]` qualified vs
+  new name `new-fw` unqualified). The name is now PARKED on the Daemon
+  (`staleCertHostName`, mutex-guarded) and delivered by
+  `drainDeferredStaleCertHostName` immediately after the boot management start,
+  still carrying `hostNameOperatorSet` evidence. The drain CONSUMES the name
+  unconditionally: with no serving leg there is nothing to be stale, and
+  holding it would let a later HTTPS enable replay an arbitrarily old rename as
+  though it just happened.
+  (2) **A terminated leg was still treated as live.** An unexpected serve exit
+  sets only `leg.dead` (`listener.go:69` — marking it under `lifeMu` would
+  deadlock a shutdown racing the exit) and leaves the leg INSTALLED in
+  `s.httpsLeg`; a leg retiring under a requested shutdown is likewise installed
+  while it drains, and on THAT path `dead` is never set. The r1 predicate was a
+  non-nil pointer test, so both states produced a warning about a certificate no
+  socket is presenting — the same false positive the construction template was
+  rejected for. Added `listenerLeg.serving()` (non-nil + listener + not `dead` +
+  no retirement requested) and switched the diagnostic to it. Deliberately
+  STRICTER than `EffectiveHTTPAddr`'s inline check, which omits the `stopCh`
+  test because `show system services` should still report a draining leg's
+  address; the two questions differ, so they are not folded into one predicate.
+- **Validation**: two mutations, each with `go build ./...` + `go vet` rc=0
+  first so the RED is an ASSERTION; each file restored from a byte snapshot and
+  re-verified with `sha256sum -c`.
+  (1) replace the park with `if d.mgmt == nil { return }` (the reviewed
+  anti-pattern) → `boot_rename_is_diagnosed_once_mgmt_is_up` FAILs with
+  `got ""` — the original silence, verbatim — plus
+  `last_name_wins_while_mgmt_is_down`;
+  (2) revert `serving()` to the r1 `s.httpsLeg != nil` → all three of
+  `dead_leg_is_not_diagnosed` / `draining_leg_is_not_diagnosed` /
+  `leg_without_a_listener_is_not_diagnosed` FAIL, each logging a full
+  host-name warning for a leg serving nothing.
+  Note the r1 api test helper built legs with no listener, so adopting
+  `serving()` correctly turned every positive subtest silent until the helper
+  was fixed to construct a genuinely SERVING leg — the predicate binding its own
+  fixtures.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/listener.go`,
+  `pkg/api/tls_stale_cert_6827_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
+## 2026-08-05 — #6827 fold r2: write down the accepted residual of the narrowing heuristic
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Documentation-only follow-up to the r1 fold, at the gate's
+  request. The `hostNameLikelyAccessIdentity` narrowing has a second edge that
+  r1 stated only in the hand-off, not in the shipping artifact: a rename that
+  CROSSES the qualified/unqualified boundary (`old-fw` → `newfw.example.com`)
+  is diagnosed at the commit — the rename path skips the heuristic — but never
+  on a later boot, because the load path then sees a shape mismatch and stays
+  quiet. For a box ALREADY in that state before this diagnostic shipped there
+  was no commit to catch it, so it is never diagnosed at all. The gap is bounded
+  on two sides (drift pre-dating the feature AND a shape-crossing rename);
+  shape-preserving drift, including the worked `old-fw` → `new-fw`, is still
+  caught on every boot. Closing it would take a one-shot sweep at first boot
+  after upgrade — upgrade-scoped persistent state for one narrow class, firing
+  on exactly the boxes where the heuristic cannot tell whether the name is in
+  use, so it would re-introduce the false positive at the least convenient
+  moment. Weighed and declined; the reasoning now lives on the function itself
+  rather than in a review thread. `TestUnusedKernelHostNameIsSilent_6827/
+  unused_qualified_cert_identity_is_silent` is the executable statement of the
+  residual — its doc comment now says so, so closing the gap later is a
+  deliberate edit to a named subtest rather than a surprise RED.
+- **Validation**: comments and prose only — no production statement changed
+  (`git diff` on `pkg/api/server.go` is entirely within a doc comment).
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `go test ./pkg/refactoraudit/` exit 0 — `pkg/api/server.go` 1390 →
+  1408, still below the 1500 audit-entry threshold, so no tier change and no
+  heatmap regeneration. `gofmt -l` clean on both touched Go files.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-05 — #6827 fold: the stale-mgmt-cert diagnostic never fired on a rename
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded a MERGE-NEEDS-MAJOR review of the #5719 C001 stale-cert
+  diagnostic. Verified the reported chain before touching anything:
+  `warnStaleLoadedCert` is called ONLY from the cert-load path
+  (`pkg/api/server.go` `generateSelfSignedCertAt`); the HTTPS leg is rebuilt
+  only when TLS or the HTTPS bind changes (`pkg/daemon/management.go`
+  `reconcileTo`); and `reconcileWebManagement` runs at `daemon_apply.go:210`
+  while `applyHostname` runs in the apply tail (`daemon_apply_tail.go:73`). So
+  `set system host-name new-fw` on an unchanged bind reached nothing, and a
+  SIMULTANEOUS HTTPS change would have checked the OLD kernel name. Three
+  fixes:
+  (1) **Reach + ordering.** New `Server.WarnStaleMgmtCertForHostName(hostName)`
+  reads the LIVE HTTPS leg's served certificate (never the `httpsServer`
+  construction template, which survives a TLS disable) and diagnoses an
+  EXPLICIT host name; `applyHostname` calls it inline with a successful
+  `Sethostname`, passing `cfg.System.HostName`. Taking the name as a parameter
+  removes the ordering hazard by construction rather than by placement — the
+  caller supplies the name it just applied instead of racing `os.Hostname()`
+  against the apply order. `syscall.Sethostname` and `/etc/hostname` became
+  package seams so this is unit-testable without CAP_SYS_ADMIN.
+  (2) **No-SAN certificate.** A CN-only pair (persisted by an older build or
+  placed by an operator) matched neither warnable predicate, so the most broken
+  certificate possible produced total silence. `certHasNoSANs` now reports it
+  FIRST and TERMINALLY — the per-identity lines would each report "does not
+  cover X" for a cert that covers no X at all.
+  (3) **False positive.** The kernel host name was diagnosed unconditionally, so
+  a box named `fw` whose cert covers `mgmt.example.com` + its management IP —
+  verifiable at every URL in use — was told to re-mint, churning remote TOFU
+  pins for nothing. `hostNameLikelyAccessIdentity` narrows the LOAD path by
+  naming shape: this package's mint path is the only thing that puts a bare
+  unqualified name in a cert, and what it puts there is the kernel host name, so
+  an unqualified SAN next to an unqualified kernel name means the TLS identity
+  IS that name and drifted (diagnose), while a domain-qualified SAN next to a
+  short kernel name means the TLS identity is independent of it (stay quiet).
+  The RENAME entry point deliberately skips the heuristic — the operator just
+  chose the name, which is evidence, not inference. The remaining load-path
+  noise is bounded to one line per HTTPS bind and the message now names the
+  identities the cert DOES cover, so it can be dismissed in one read.
+  The overstated docs were corrected: `pkg/api/README.md` now describes two
+  entry points and the narrowing rule, and the 2026-08-05 entry below carries an
+  explicit correction of its "closes only the diagnostic half" claim.
+- **Validation**: five mutations, each with `go build ./...` + `go vet` rc=0
+  BEFORE the run so every RED is an ASSERTION, not a compile break; each file
+  restored from a byte-snapshot and re-verified with `sha256sum -c`.
+  (1) delete the `warnStaleMgmtCertForHostName` call in `applyHostname` →
+  `renamed_box_is_diagnosed` FAILs with `got log ""` (the pre-fix silence);
+  (2) pass the PRE-rename `current` instead of `cfg.System.HostName` →
+  "must observe the NEW kernel host name" FAILs (host_name=<test host>), plus
+  both silence controls;
+  (3) neutralize `certHasNoSANs` → `TestLoadedCertWithoutSANsWarns_6827` FAILs
+  with `got log ""` and the rename-path no-SAN subtest FAILs;
+  (4) delete the `hostNameLikelyAccessIdentity` gate →
+  `unused_qualified_cert_identity_is_silent` FAILs (the healthy box is told to
+  re-mint), while its matched positive control `drifted_short_name_warns` keeps
+  passing — the pair is the discrimination proof;
+  (5) pass `hostNameInferred` instead of `hostNameOperatorSet` on the rename
+  path → `operator_chosen_name_overrides_the_heuristic` FAILs with `got ""`.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped), `go test ./pkg/refactoraudit/` exit 0 (daemon_system.go 1889 →
+  1909, still [WATCH]); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/api/README.md`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/management.go`, `pkg/daemon/hostname_stale_cert_6827_test.go`,
+  `_Log.md`
+
+## 2026-08-05 — #5719 C001 residual-2: the host-name half of the stale-cert diagnostic
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening)
+- **Action**: STEP-0 re-verification of the #5719 C-API cohort against current
+  `origin/master` (ad9591177) found two of the three named survivors already
+  fixed (unknown NAT stats selector — `pkg/grpcapi/server_nat.go:225-227`,
+  merged #6373; SAN-less generated cert base + management bind-IP threading —
+  merged #6373/#6378). The surviving gap was the SECOND identity the durable
+  cert bakes in. `generateSelfSignedCertAt` LOADS the on-disk pair as-is (#1916
+  D6 — a re-mint would churn remote TOFU pins) and warned only when the current
+  BIND HOST was uncovered. A later `set system host-name` leaves the cert's DNS
+  SAN naming the old host, and because renaming a firewall does not move its
+  management IP the bind-host check does not fire either — so the operator got a
+  bare "certificate is not valid for any names" with NOTHING in the log. Proved
+  empirically before writing the fix: mint as `old-fw`/bind `10.0.0.1`, reload
+  as `new-fw`/same bind → log output `""`. The load-success path now calls a
+  factored-out `warnStaleLoadedCert`, which parses the leaf ONCE and warns per
+  uncovered identity. `hostnameSANWarnable` gates the new check on the name
+  being DNS-encodable or an IP literal, so a `café` kernel host name — dropped
+  from the SANs by design (`isDNSSANSafeHostname`, the #5058 no-abort guard) and
+  uncoverable by any re-mint — does not warn on every reload. Re-minting itself
+  stays deferred. **CORRECTION (#6827, entry above):** this entry claimed the
+  change "closes only the diagnostic half" — it did not close even that. The
+  check ran ONLY on the certificate LOAD path, and a `set system host-name`
+  commit on an unchanged HTTPS endpoint reloads nothing, so the case the
+  host-name half was written for stayed silent until a restart. The #6827 fold
+  adds the rename entry point (with the apply-ordering fix), the no-SAN case,
+  and the false-positive narrowing. The third cohort item
+  (applied-nft truth projection) is NOT fixed here — scoping analysis posted to
+  the issue: the state exists post-#5757 but is process-local to `pkg/daemon`
+  with no exported accessor, and `ReadHostInboundDenyCounters` returns
+  `(nil, nil)` for BOTH a fenced table and an absent one, so REST/Prometheus
+  publish an authoritative "0 kernel denies" while a fail-closed fence is
+  actively dropping. Deciding which kernel state maps to which projection
+  channel is a design call, not a mechanical guard.
+- **Validation**: two mutations, each with `go build` + `go vet` rc=0 first so
+  the RED is an ASSERTION, not a compile break. (1) delete the host-name warn
+  branch → `host_name_change_warns` / `ip_literal_host_name_change_warns` /
+  `bind_host_warning_still_fires` FAIL, pre-existing
+  `TestLoadedCertBindHostMismatchWarns` still PASSES (mutation is scoped to the
+  new guard). (2) drop the encodability gate from `hostnameSANWarnable` →
+  `unencodable_host_name_is_silent` FAILs plus three
+  `TestHostnameSANWarnable` rows, proving the gate is not vacuous. Restored +
+  `touch`ed after each; GREEN both times. `go test ./pkg/api/...
+  ./pkg/grpcapi/...` and the full `go test ./...` exit 0; `gofmt -l` clean.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_san_5719_test.go`,
+  `pkg/api/README.md`, `_Log.md`
 ## 2026-08-13 — #6722 round 11: bind the two fail-closed DECISIONS the PR exists to make
 
 - **Timestamp**: 2026-08-13 (fix/6713-xfrmi-tozone, PR #6722)
@@ -78745,6 +79287,85 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
   pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
 
+## 2026-08-06 — #6827 gate fold r2: bind the generation fence and listener recovery
+
+- **Timestamp**: 2026-08-06
+- **Action**: F1 — `TestDebtClearIsGenerationSafe_6827` was a TAUTOLOGY. It
+  re-implemented `d.staleCertGen == gen` in its own body and asserted on its
+  own arithmetic (`2 == 1` is false, so `stillPending` was true
+  unconditionally); the production comparison was never called. Measured:
+  `if true || d.staleCertGen == gen` left `pkg/api` + `pkg/daemon` GREEN. It
+  now drives `deliverStaleMgmtCertDiagnosis` for real and bumps the generation
+  from INSIDE the unlocked window via the `osHostname` seam (which
+  `management.go` reads at exactly that point), then asserts the debt survives.
+  A second subtest is the negative control: with no concurrent rename the debt
+  MUST settle, so the pair distinguishes the fence from both an unconditional
+  clear and a never-clear.
+- **Action**: F2 — two runtime behaviour changes in the merge range were
+  wholly unbound. (a) `reconcileTo` used to `return nil` when `m.srv == nil`,
+  making a boot HTTP bind failure ABSORBING; it now retries construction via
+  `startLocked`. (b) `startLocked` now unrecords `cur.tls`/`cur.httpsAddr`
+  when the boot HTTPS bind failed, so a later IDENTICAL reconcile issues
+  `ReconcileHTTPS` instead of seeing "no change". Both could be reverted
+  wholesale with the suite green — `TestHTTPSBindFailureIsNotReportedAsServing_6827`
+  binds the `HTTPSServing` predicate but calls it DIRECTLY, so the
+  reconciler's USE of it was unbound. New
+  `TestMgmtListenerRecoversFromAFailedStart_6827` binds both at the call site,
+  with an over-reach guard on each side (a disabled API must NOT be
+  constructed by a reconcile; a SUCCESSFUL boot HTTPS bind must still record
+  its fingerprint). Behaviour unchanged — the retry builds from
+  `desired(cfg)` with the #4047/#5127 loopback clamp intact and retains no
+  prior listener.
+- **Action**: F3 — `pkg/api/README.md` and three `listener.go` comments
+  documented a field named `exited` "stored from a defer over the whole serve
+  goroutine". No such field exists: the shipped predicate tests `dead` and
+  `stopping`, and `stopping` is stored EXPLICITLY at the top of the drain arm,
+  before `Shutdown`. Corrected there and in four `tls_stale_cert_6827_test.go`
+  sites, one of which gave a "RED on revert: delete the defer in
+  serveLegLocked" recipe for code that is not there. The replacement recipe
+  was verified firsthand. Two adjacent clauses claiming root-context shutdown
+  "sets no flag at all" were also corrected — it sets `stopping`.
+- **Action**: DOCS — `pkg/daemon/README.md` had NO coverage of this work and
+  was untouched by the PR even though `pkg/daemon/management.go` gained ~120
+  lines. Added the boot-start recovery bullet (both halves) and a
+  stale-certificate-diagnosis subsection covering the debt, the delivery-time
+  kernel read, and the generation fence.
+- **Validation**: `go build ./...` 0; `go test ./pkg/api ./pkg/daemon
+  ./pkg/config -count=1` 0; `go test -race ./pkg/api ./pkg/daemon -count=1` 0;
+  `go vet ./pkg/api ./pkg/daemon` 0; `go test ./pkg/refactoraudit/...` 0.
+  Mutation grid, every red an ASSERTION (no build breaks), production restored
+  byte-identical after each (`git diff` empty on `management.go`):
+  `if true || d.staleCertGen == gen` → F1 subtest 1 FAILS
+  ("an older delivery settled a rename that landed AFTER it sampled the
+  generation"), subtest 2 PASSES. `if false && d.staleCertGen == gen` →
+  subtest 1 PASSES, subtest 2 FAILS ("must settle the debt — the generation
+  fence must not suppress the clear"). `if true || m.rootCtx == nil ||
+  next.Addr == ""` → `boot_http_bind_failure_recovers_on_a_later_reconcile`
+  FAILS, other three subtests PASS. `if false && next.TLS && ...
+  !srv.HTTPSServing()` → `boot_https_bind_failure_retries_on_an_identical_reconcile`
+  FAILS, other three PASS. Deleting `leg.stopping.Store(true)` →
+  `TestDrainFlagIsSetByTheRealServeGoroutine_6827` FAILS, confirming the F3
+  recipe text.
+- **File(s)**: pkg/daemon/hostname_stale_cert_6827_test.go,
+  pkg/daemon/management_recovery_6827_test.go, pkg/daemon/README.md,
+  pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/api/README.md, _Log.md
+
+## 2026-08-06 — #6827 fold r3 (re-gate MINOR-1 / MINOR-2)
+
+- **Timestamp**: 2026-08-06 03:55 PDT
+- **Action**: Complete the osHostname seam at the already-applied early return,
+  bind that guard (it had ZERO coverage and is load-bearing since #6827), and
+  rewrite the boot_rename fixture off an impossible kernel state onto the
+  stateful-stub pattern the file already uses.
+- **File(s)**: pkg/daemon/daemon_system.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/api
+  ./pkg/config -count=1 rc=0; gofmt clean. M1 (neutralise the early return)
+  reds an_unchanged_host_name_is_a_no_op as an ASSERTION at :200. M2 (revert
+  the seam to os.Hostname) reds the SAME subtest — which is the point: the
+  half-applied seam is exactly what made the guard untestable and let the old
+  fixture describe a kernel state production cannot reach.
 ## 2026-08-06 — #6829 fold r3 (hostile-gate F1/F2)
 
 - **Timestamp**: 2026-08-06 01:35 PDT
@@ -84400,6 +85021,468 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
 
+- **Timestamp**: 2026-08-13T14:10Z
+- **Action**: #6827 round 6 — folded a Codex MERGE-NEEDS-MAJOR (7 blocking). B1 RUNTIME:
+  a dead HTTPS leg made the stale-cert debt permanently undischargeable. An unexpected
+  serve-loop exit marks the leg `dead` and leaves it INSTALLED, so the reconciler's
+  fingerprint test still matched the committed endpoint (ReconcileHTTPS never called)
+  and ReconcileHTTPS's own same-address arm returned nil on a non-nil pointer. HTTPS
+  was unrecoverable on an UNCHANGED configuration for the life of the process. Fixed at
+  both levels: the api-side no-op now tests `listenerLeg.serving()`, and reconcileTo's
+  HTTPS arm also fires on `next.TLS && !m.srv.HTTPSServing()`. B2 RUNTIME: the delivery
+  emitted its warning BEFORE re-checking the generation, so a rename landing after the
+  kernel read logged a diagnosis naming the previous host name — a line the clear-side
+  fence could not retract. The re-validation, certificate inspection and clear now run
+  under one staleCertMu hold and a superseded delivery abandons silently. B3/B4:
+  `d.staleCertGen++` and the unreadable-kernel-name guard were both unbound (the race
+  test supplied its own increment). B5/B6/B7: three assertions could not fail on their
+  own fixtures — the rejected-rename cert covered the kernel name, the bind-failure test
+  asserts a state no implementation reaches, and the no-SAN terminality assertion used a
+  loopback fixture where both downstream predicates decline anyway. Fixtures replaced,
+  not assertions. Nine claim defects corrected across server.go, listener.go,
+  management.go, both READMEs and the tests (applyHostname does not call Warn
+  synchronously; the deferred name is not guaranteed current; only the rename entry
+  point reads a live leg; `stopping` precedes Shutdown; the rename call is the INITIAL
+  attempt; the load heuristic ACCEPTS the worked unqualified→unqualified shape; cluster
+  comms start after the phase-4 apply, not inside it), plus the restart-residual cause
+  list widened from two causes to seven. Validation: `go test ./pkg/daemon ./pkg/api`
+  rc 0; 9-cell mutation matrix, every new assertion has a production line whose
+  deletion reds it and only it.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/daemon/management.go,
+  pkg/daemon/README.md, pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-13T15:05Z
+- **Action**: #6827 — regenerated `docs/refactoring-audit-current.txt`. `go test ./...` at the
+  round-6 head surfaced `pkg/refactoraudit.TestHeatmapNotStale` RED: `pkg/api/server.go`
+  had entered the audit at `[WATCH]` (>=1500 LOC) without the heatmap being refreshed.
+  The gate was ALREADY red at the round-5 head `ccc2f6b09` — server.go was 1606 LOC
+  there (1307 on master), the heatmap is byte-identical between the two commits, and it
+  lists no `pkg/api/server.go` row; measured directly against a checkout at that commit.
+  Round 6 added 18 lines (comment corrections), taking it to 1624; the regenerated file
+  also picks up `pkg/daemon/daemon_system.go` 2262 -> 2297 from an earlier round of this
+  same PR. `[WATCH]` is advisory, so no split is demanded at this size. Also confirmed
+  the one other `go test ./...` failure — `pkg/ddns` "bind: address already in use" on an
+  ephemeral port — is a collision with a concurrent agent, not a regression: the package
+  passes standalone (rc 0).
+- **File(s)**: docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-08-13T22:55Z
+- **Action**: #6827 round 7 — folded a Codex "would not merge" (2 MAJOR, 1 MINOR) plus a
+  correction to one of my own round-6 claims. **B1 RUNTIME (credential lifetime).** An
+  unexpected `ServeTLS`/`Serve` exit marked the leg `dead` and returned WITHOUT any
+  `Shutdown`: `Serve` closes the listener on its way out, but the HTTP/1 keep-alive and
+  HTTP/2 connections it had already accepted kept being served. `drained` — the goroutine's
+  last act — therefore went up with live connections behind it, and `pruneRetiredLocked`
+  spends that flag as "nothing left for a revocation to reach": the recovery reconcile
+  (round 6) PINNED the dead leg's auth slot, the next `ReplaceAuth` PRUNED it before
+  tightening, and a credential the operator had revoked went on being accepted on a socket
+  the box believed was gone. Fixed with `drainLeg` on ALL THREE exits (requested
+  retirement, root-context shutdown, unexpected exit): bounded `Shutdown` then `Close` on
+  deadline. `Close` is not optional — this server runs with no `WriteTimeout` by design, so
+  an SSE stream or a slow reader outlives any deadline `Shutdown` alone respects. The three
+  existing recovery cells could not see any of it: they drive the exit with `errLn`, which
+  fails from the FIRST Accept, so no connection is ever accepted and nothing can survive.
+  New cell `TestDeadLegConnectionCannotOutliveRevocation_6827` binds a REAL loopback
+  socket, holds one TLS connection across the kill + recovery + revocation, and asserts it
+  cannot be admitted once the leg reports drained. **B2 (my round-6 claim was wrong).**
+  Rounds 5 and 6 argued no generation fence could make the emitted host name provably
+  current, because `Sethostname` moves the kernel name before the generation is recorded.
+  That was a property of where the lock was taken, not of the mechanism. New
+  `Daemon.renameHostNotingStaleMgmtCert` holds `staleCertMu` ACROSS the syscall AND the
+  bump, so the two critical sections are ordered either way round: delivery first (the
+  rename cannot move the name until it lets go) or rename first (the delivery re-validates
+  against a moved generation and abandons). No lock-order inversion — the fence is a LEAF
+  hold around the syscall seam, while delivery takes the mutex at the top of staleCertMu ->
+  managementReconciler.mu -> api.Server.lifeMu. The residual is a privileged
+  `sethostname(2)` from outside the daemon, which is now stated instead of the blanket
+  impossibility claim. **B3.** The delivery's re-validation tested the generation alone, so
+  two same-generation deliveries (boot racing the rename's own attempt) both warned; it now
+  requires `staleCertPending` too.
+  **CORRECTION to the round-6 entry above**: it claimed "every new assertion has a
+  production line whose deletion reds it and only it". That is false for M8. Deleting
+  `leg.dead.Store(true)` reds SIX cells across two packages — the three #6827 recovery
+  cells, the new B1 cell, and the pre-existing `TestServeExitDoesNotDeadlockConcurrentWait_6401`
+  + `TestEffectiveHTTPListenerServeExitFails` — because `dead` is a production precondition
+  the whole dead-leg cohort shares. Measured here, not inferred. M1 is the same shape. The
+  cells that DO isolate are M4, M5a/M5b, M7 and this round's B1/B2a/B2b/B3.
+  Validation: control `go test ./pkg/api ./pkg/daemon -count=1` rc 0; mutation cells — B1
+  (delete `drainLeg` from the serveErr arm) RED, only the new cell, whole `pkg/api`; M8
+  re-measured RED across six cells as above; B2a (leave the syscall outside the hold — the
+  literal pre-round-7 shape) RED, only the new fence cell; B2b (write the ledger before the
+  syscall) RED, only `failed_sethostname_is_not_diagnosed`; B3 (drop the `pending`
+  re-check) RED, only the new sibling-delivery subtest. One measured NON-binding, recorded
+  rather than glossed: B2c — hold the mutex across the syscall, release, re-take for the
+  bump — stays GREEN. That shape is still defective, but the gap is a few instructions and
+  the probe loses the race to the re-acquire; the guard against it is structural (one
+  `defer`red unlock over a body with no intermediate release) and is documented as such at
+  the function and in the test.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md,
+  pkg/api/server.go, pkg/daemon/management.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-08-13T23:40Z
+- **Action**: #6827 round 7b — repaired the EVIDENCE the round-7 entry above rests on, after the
+  round-6 lane read my M8 durations back to me. The M8 row reported six reds; five of them
+  carried times of 5.00s / 5.01s / 5.00s / 5.01s / 3.00s, and only one (0.10s) was an
+  assertion firing. A red clustered at a round deadline value is a poll expiring, not a
+  property failing. Three of those five were SETUP GUARDS on the very flag M8 deletes:
+  `startWithDeadHTTPSLeg` polled `dead` for 5s and `t.Fatal`ed, so
+  `TestUnexpectedServeExitLeavesADeadInstalledLeg_6827` and
+  `TestReconcileHTTPSReplacesADeadLeg_6827` — which SHARE that helper, one entry path
+  between them — died there and NEITHER ever reached "HTTPSServing must report false" or
+  "the reconcile left the DEAD leg installed"; and the daemon rebuild cell polled
+  `HTTPSServing()`, which reads the same flag.
+  Fixed at the fixtures, not at the row. `startWithDeadHTTPSLeg` now uses `Server.Wait()`
+  — a deterministic join of the one leg that server has, reading nothing under test — and
+  asserts only the installation. The new B1 cell does the same after its kill, then asserts
+  dead+drained explicitly as a labelled, immediate precondition. The daemon cell keeps a
+  poll (its server also has a live HTTP leg, so `Wait` would block until shutdown) but
+  polls the new `api.Server.HTTPSLegDrainedForTest()`: `drained` is stored by the
+  goroutine's defer on every exit path, so it reports THAT the exit happened without
+  consulting the flag under test.
+  Re-measured M8 on the repaired tree: same six cells, but now
+  `serve_exit_wait_deadlock_6401_test.go:85` (0.10s),
+  `tls_stale_cert_6827_test.go:630` "HTTPSServing must report false" (0.00s),
+  `tls_stale_cert_6827_test.go:674` "the reconcile left the DEAD leg installed" (0.00s) and
+  `effective_listeners_6401_test.go:154` (3.00s) fail on their own ASSERTIONS, and only two
+  fail at a precondition — both immediate and self-labelled. So M8's blast radius is
+  unchanged (it is a shared production precondition) but four of the six now witness a
+  property instead of a timeout.
+  **A refinement of the heuristic, because it would otherwise condemn a legitimate cell.**
+  `TestEffectiveHTTPListenerServeExitFails` reds at 3.00s and that is CORRECT: its poll IS
+  its assertion (it waits for `effectiveHTTPListener()` to report Failed, which is the
+  property). The discriminator is not the duration but whether the polled predicate is the
+  asserted property or a precondition for it. Durations are the trigger to go and look.
+  Also fixed one of my own: under B2a the fence cell asserted INSIDE the syscall seam,
+  consuming the channel value its closing assertion then waited 5s for — so a genuine catch
+  reported itself twice, once truthfully and once as "the observer never acquired
+  staleCertMu", the opposite of what had happened. It now records in the seam and asserts
+  after the rename returns: B2a reds in 0.00s with one true message.
+  Validation on the repaired tree: `go test ./... -count=1` FULL_RC=0 (62 packages, zero
+  failures). Cells: B1 RED 0.00s (only cell in `pkg/api`, its own assertion); B2a RED 0.00s
+  (only cell in `pkg/daemon`); B2b RED 0.00s (`failed_sethostname_is_not_diagnosed` only);
+  B3 RED 0.00s (the sibling-delivery subtest only); B2c GREEN (the measured non-binding,
+  unchanged); M8 as above.
+  **PROVENANCE, corrected against a measurement rather than relayed.** The round-6 lane
+  states B1's consequence was ENABLED by its recovery. Checked at `ccc2f6b09`: pre-round-6
+  `ReconcileHTTPS` still reached `stopLegLocked` on a dead leg through its `!want` arm (a
+  TLS disable) and its default arm (an HTTPS-bind change), so the pin-then-prune was
+  reachable before round 6 — but only via a commit that disabled TLS or moved the bind.
+  What round 6 added is reachability on an UNCHANGED configuration, through the
+  same-address recovery and the reconciler's `!HTTPSServing()` arm, which fires on every
+  commit while the leg is dead. That is the common case, so the fix belongs with the
+  recovery either way; the claim is narrowed to what the code shows.
+- **File(s)**: pkg/api/server.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T07:55Z
+- **Action**: #6827 round 8 — hostile review at `d7157b7e1` returned MERGE-NEEDS-MINOR with no
+  runtime defect, and two items about the round-7 work itself. **F1 (blocking): the
+  force-close was bound by NOTHING.** `_ = srv.Close()` could be deleted, and the
+  retirement/root arm reverted to the pre-round-7 bare `Shutdown`, with `go test ./pkg/api/
+  -count=1` green both times. The only bound property was that the serveErr arm called
+  `drainLeg` at all — so the half of the drain guarantee I called "not optional" was exactly
+  the half a later edit could delete silently, restoring the vulnerability with `drained`
+  still reporting true. New `TestInFlightResponseIsSeveredOnEveryLegExit_6827` holds an
+  in-flight streaming response across each of the three leg exits and asserts it is severed.
+  `legDrainTimeout` becomes a `var` (production never assigns it) so the DEADLINE arm — the
+  case under test — is reachable without 5s per subtest; the cell runs in 0.47s.
+  **F2: my justification named the wrong mechanism, and I verified that firsthand before
+  rewriting it.** A standalone probe measured both halves: after `Shutdown`, a second request
+  on a surviving keep-alive connection fails (`unexpected EOF`) — `inShutdown` makes
+  `doKeepAlives()` false — so "Shutdown alone is NOT that guarantee [no connection can serve
+  another request]" was FALSE. What `Shutdown` does not do is terminate the response already
+  in flight: with a 300ms deadline it returned `context deadline exceeded` and the stream kept
+  delivering; only `Close` ended it. Conclusion unchanged, reason corrected at `drainLeg`, at
+  the `drained` field, and in `pkg/api/README.md` — it matters because the stated mechanism is
+  what the next reader reasons from, and the round-7 version would have told them the `Close`
+  was redundant. The `drained` invariant is restated to what drainLeg actually provides:
+  "nothing this leg accepted is still being served" — no further request AND no response in
+  flight. Round 7 stated only the first half, which is the half `Shutdown` alone already gives.
+  The probe also produced a test-design fact worth keeping: after the server severs a
+  connection the client still returns BUFFERED bytes (measured: 3 reads / 19 bytes before the
+  error), so the assertion must drain until the read errors — a single successful read proves
+  nothing either way.
+  Validation on this tree: control `go test ./pkg/api ./pkg/daemon -count=1` rc 0.
+  Mutations, each over the whole `pkg/api` package, with what fired and how long:
+  F1a (delete `_ = srv.Close()`) RED — all three subtests, 2.40s each, each failing on
+  `assertSevered`'s own bounded wait, which IS the asserted property (severed within the
+  bound), not a setup guard; F1b (retirement/root arm back to a bare `Shutdown`) RED —
+  `requested_retirement` and `root_context_shutdown` at 2.41s, `unexpected_serve_exit` GREEN,
+  a clean adjacency pair INSIDE one test proving the three cases bind three distinct call
+  sites; B1 (delete `drainLeg` from the serveErr arm) RED — the held-connection cell at 0.01s
+  on its assertion PLUS `unexpected_serve_exit` at 2.26s, and the other two subtests green.
+  One harness note, reported rather than buried: the F1b cell was killed by a command timeout
+  mid-run, which left the mutation APPLIED in the worktree. Caught immediately by checking
+  `git diff` before doing anything else, restored by content, verified by md5 and a rebuild,
+  and only then re-run with a longer budget. An interrupted mutation cell leaves the tree
+  dirty even when the harness restores by content — check the tree, do not assume the restore
+  ran.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-08-14T09:10Z
+- **Action**: #6827 round 8b — folded the reviewer supplement plus four Codex corrections,
+  two of which contradict prose I shipped at `baae30371` and were verified against the
+  go1.26.4 source before I touched anything. **(1) `legDrainTimeout` bounds the SHUTDOWN, not
+  the drain.** `net/http.Server.Close` takes no context and closes `s.activeConn` serially
+  (`server.go:3100-3118`), and on an HTTPS leg each entry is a `*tls.Conn` whose `Close` →
+  `closeNotify` sets its OWN 5s write deadline (`crypto/tls/conn.go:1471-1483`). A peer
+  stalling its receive window therefore costs up to 5s EACH, in series, so the worst case
+  grows with connection count. My "the bound this function promises is real" was false.
+  Corrected at `legDrainTimeout`, at `drainLeg` and in `pkg/api/README.md`, with the
+  knock-on stated rather than hand-waved: `Server.Wait` holds `lifeMu` across the drain and
+  `WarnStaleMgmtCertForHostName` waits on `lifeMu` under `staleCertMu`, so a rename racing
+  shutdown waits for it — and the earlier "well inside TimeoutStopSec=20" reassurance does
+  NOT hold at scale. Bounding the sever phase for real needs per-connection tracking with
+  concurrent deadlined closes; deliberately not taken in an eighth round, and the claim is
+  narrowed instead of the code being widened. **(2) Hijacked connections escape the drain.**
+  Verified in the stdlib docs: `Shutdown` "does not attempt to close nor wait for hijacked
+  connections", `Close` "does not even know about" them, and a hijacked conn is deleted from
+  `activeConn`. So `drained` can be stored while such a connection is still usable, and the
+  force-close cannot help — the handle is gone. Two reviewers noted pkg/api has no hijacker
+  and read that as closing the case; it makes it UNREACHABLE, not enforced. Chose the third
+  option deliberately — narrow the stated invariant AND gate it: new
+  `TestNoHijackerInThisPackage_6827` walks the AST of every production file for a
+  `http.Hijacker` assertion or a `.Hijack()` call (AST, not text, so the comments about
+  hijacking are not false positives) and fails with what `drainLeg` would have to grow.
+  **(3) The fence cell was probabilistic while claiming otherwise.** Its observer goroutine
+  might never be scheduled inside the 100ms window, so a pass could mean "never looked".
+  Replaced with a synchronous `sync.Mutex.TryLock` inside the syscall seam — no goroutine, no
+  sleep, and the answer is the state of the mutex. Cell now runs in 0.00s and MUT-B2a still
+  reds it in 0.00s naming the free-mutex generation. The split-hold non-binding now carries
+  the MECHANISM rather than "a few instructions wide": the first Unlock happens in normal
+  mode, so the re-acquirer wins the fast-path CAS and any woken waiter re-queues — no probe
+  of any kind lands there. **(4) The documented lock order was inaccurate.** I wrote a nested
+  three-lock chain staleCertMu → mgmt.mu → lifeMu; `warnStaleCertForHostName` releases m.mu
+  before calling the server, so the real shape is two independent edges. Corrected at both
+  sites. Also: `drained` is NOT the goroutine's "last act" (defers are LIFO, so it precedes
+  `wg.Done`) — corrected at the field and at `HTTPSLegDrainedForTest`, which proves the exit
+  path and drain completed, not that the goroutine returned; `d.mgmt` is guarded for the
+  stale-cert read ONLY and the field comment now says so explicitly, so nobody reads the PR
+  as having fixed the other readers; and `drainLeg` now states that the original defect's arm
+  called NO `Shutdown` at all, so the F2 correction cannot be misread as undercutting B1.
+  On the deadline in the fixture: the reviewer asked for the full 5s because "the deadline is
+  the thing under test". Split the difference on the merits — `unexpected_serve_exit` (the arm
+  the defect was in) now runs at the PRODUCTION 5s so the shipped value is exercised end to
+  end, the other two keep the seam, and new `TestLegDrainTimeoutDefault_6827` pins the shipped
+  value so a leaked override cannot retune production silently. Whole cell: 5.33s.
+  Validation: `go test ./... -count=1` FULL_RC=0 (62 packages). Cells re-run on this tree:
+  B2a RED 0.00s (fence cell only); F1a/F1b/B1 unchanged from round 8.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
+  pkg/daemon/daemon.go, pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T09:45Z
+- **Action**: #6827 round 8c — **correcting my own delivery report.** The round-8b commit
+  `047c9e38d` did NOT contain three of the changes the entry above and my report to the lead
+  claimed for it. The mechanism is worth writing down because it is silent: the listener.go
+  edits were applied by ONE python script that asserts every anchor and writes the file ONCE
+  at the end, so when the fourth anchor was stale the script raised and **none** of its three
+  earlier edits were written. The traceback was followed by `BUILD_OK` from the next command
+  in the same cell, and I read the pair as success. `go build` cannot fail on missing COMMENT
+  edits, so the build proved nothing about them — the same "which process authored this exit
+  code" trap, one level up: I checked that something succeeded rather than that the intended
+  change was present.
+  What was missing at `047c9e38d`, all of it comment-only: `legDrainTimeout`'s correction
+  (that it bounds the Shutdown and not the drain, with the serial-Close + per-connection
+  tls close_notify mechanism and the Server.Wait/staleCertMu knock-on); `drainLeg`'s
+  hijacked-connections out-of-scope paragraph — which the new gate test's failure message
+  points at with "see drainLeg", so the pointer dangled; `drainLeg`'s clause recording that
+  the original defect's arm called NO Shutdown at all; and `listenerLeg.drained`'s "not the
+  goroutine's last act" correction. What HAD landed, because they were separate calls:
+  `pkg/api/README.md` (all of the above in prose), the hijack gate test itself, the
+  TryLock fence rewrite, the lock-order edges, the mgmt half-guard note, and
+  `HTTPSLegDrainedForTest`'s semantics. So the README described corrections the source
+  comments did not carry — the exact divergence this PR spent round 8 arguing is dangerous,
+  since the next reader reasons from the code.
+  Applied all four here, individually, each verified present by grep rather than by a build
+  that cannot see them. Also added the SCOPE note the reviewer supplement asked for on the
+  streaming cell: the fixture holds ONE connection, so `assertSevered`'s bounded wait is
+  sound for it and is NOT evidence of a per-leg wall-clock bound — what the cell binds is
+  that the deadline arm severs rather than abandons, which holds at any N.
+  Validation: `gofmt` clean on every touched file, `go vet ./pkg/api ./pkg/daemon` clean,
+  `go test ./pkg/api ./pkg/daemon -count=1` rc 0, `go test ./... -count=1` FULL_RC=0.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T10:40Z
+- **Action**: #6827 round 9 — a Codex leg at `047c9e38d` refuted three things I built, including
+  two the lead had praised. All verified in source before folding. **(1) "bounds the Shutdown"
+  was ALSO wrong — my second wrong version of that sentence.** `Shutdown`'s loop calls
+  `closeIdleConns()` and only reaches its `select { case <-ctx.Done() }` if that returns
+  false, and `closeIdleConns` walks `activeConn` under `s.mu` closing serially — so stalled
+  IDLE TLS peers overrun the context INSIDE Shutdown, before it is ever consulted
+  (`net/http/server.go` Shutdown + closeIdleConns, read directly). `legDrainTimeout` is a POLL
+  deadline bounding neither phase in wall-clock terms. Corrected there and swept across the
+  eight enumerated stale sites plus two more the enumeration missed
+  (`management_nilpublish_5561_test.go`, found by grepping the claim rather than the list).
+  **(2) The hijack gate is not a semantic gate, and `x/net/websocket` is a DIRECT dependency
+  of this module** (`go.mod:16`) whose `Server` hijacks internally — so
+  `mux.Handle("/ws", websocket.Handler(h))` adds the case with nothing in local syntax to
+  match. "by gate", "absence is enforced", "fails if one is added" were all false. Narrowed to
+  TRIPWIRE everywhere it is claimed, and the test now checks a third form — an import of a
+  package known to hijack (`x/net/websocket`, `net/http/httputil`) — while saying in its own
+  doc that reverse proxies, aliases and reflection still escape. **(3) `assertSevered` treated
+  ANY read error as closure, including its own 250ms read deadline**, so a stream merely
+  PAUSED would have passed. This is the second time this fixture trusted the wrong signal
+  (round 8 fixed a single-read version). It now treats a timeout as "keep waiting", requires a
+  non-timeout error for closure, and reports WHICH state it timed out in — "STILL STREAMING"
+  vs "OPEN BUT SILENT" — because those are different bugs. Re-ran F1a with the stricter
+  assertion: still RED on all three subtests, "STILL STREAMING", 3649/1426/1433 reads, so the
+  mutant's streams were genuinely alive rather than merely quiet.
+  Also: TryLock is stated as a TRADE, not a closure — it proves the mutex is held WHILE
+  sethostname runs, not that the hold is uninterrupted to the bump, so the split-hold shape
+  (B2c, GREEN) passes it; and I removed the starvation-mode sentence I had shipped on relay.
+  Codex retracted its own mechanism claim and it was right to: normal-mode waiters COMPETE
+  rather than re-queue, and `sync.Mutex` switches to starvation mode after ~1ms and hands
+  ownership to the waiter — so the window is improbable to observe, not impossible, and B2c's
+  GREEN means "did not observe", not "cannot be observed". `Shutdown` stopping further
+  requests is qualified as HTTP/1-only (h2 shutdown callbacks are async, so a stream can open
+  before GOAWAY). `listener.go:124`'s second "LAST act" corrected.
+  Validation: `go test ./pkg/api ./pkg/daemon -count=1` rc 0; `go test ./... -count=1`
+  FULL_RC=0.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/hostname_stale_cert_6827_test.go,
+  pkg/daemon/management_nilpublish_5561_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6827 round 10 — bind the `dead`-before-drain ORDER (BLOCKING F1), make
+  `serveBound` run the real drain (F5), add `x/net/http2/h2c` to the hijacker map and
+  record how that map was DERIVED (F3), stop `assertSevered` reading through a poisoned
+  chunked body (F4), and correct the refuted `legDrainTimeout` sentence that was still
+  living inside its own guard (F2).
+  **F1 was a total survivor.** Moving `leg.dead.Store(true)` below `drainLeg(srv)` in
+  serveLegLocked's serve-exit arm left `go test -count=1 ./pkg/api/` AND `./pkg/daemon/`
+  at rc 0. Nothing could see it: every existing dead-leg cell
+  (`TestUnexpectedServeExitLeavesADeadInstalledLeg_6827`,
+  `TestReconcileHTTPSReplacesADeadLeg_6827`) kills a leg with NO connection, so its drain
+  returns in microseconds and both statement orders look identical there. With ONE stream
+  held open the window is the whole drain, which has no wall-clock ceiling — and for its
+  width a same-address `ReconcileHTTPS` takes the `serving()` no-op arm and returns nil
+  (so an operator commit cannot rebuild the dead leg), `reconcileTo`'s
+  `next.TLS && !HTTPSServing()` recovery term is false, and
+  `WarnStaleMgmtCertForHostName` diagnoses a certificate no socket is presenting.
+  `TestServingFlipsDuringTheDrainNotAfterIt_6827` asserts the flip within 750ms AND that
+  `drained` is still unset when it happens — the second half is what stops it passing on
+  a leg that merely finished draining, which is where the mutant also ends up.
+  **F5**: `serveBound` still held the exact shape `drainLeg` exists to fix — a bare
+  `Shutdown` under a 5s context, no `Close`. Round 9 edited its doc ("bounded 5s drain" ->
+  "5s-deadline drain") without touching the behaviour, which made README.md's
+  package-wide drain invariant FALSE about it. Fixed rather than narrowed: it is test-only
+  (`Server.Run` has no production caller), so the change is cheap, and narrowing would
+  have left the copy-hazard in the tree. `drainLeg` now RETURNS the Shutdown error so
+  serveBound reports exactly what it reported before; the two leg call sites discard it
+  explicitly. Consequence: the two servers used to share ONE 5s context; each now gets its
+  own `legDrainTimeout`.
+  **F3**: the import map said "the ones reachable from this module today" and was missing
+  `golang.org/x/net/http2/h2c` — same direct dependency (`x/net v0.48.0`), hijacks at
+  h2c.go:136/:171. A census of that module returns exactly two hijacking files
+  (`websocket/server.go`, `http2/h2c/h2c.go`), so the map CAN be complete for the current
+  dependency set; what it now records is the grep and the version it was run against,
+  which the next reader can re-run and which goes visibly stale on a bump. The outer
+  "tripwire, not a gate" claim is unchanged.
+  **F4**: `assertSevered` read through `http.Response.Body` while claiming a timeout was
+  "a reason to keep waiting". For a chunked body it cannot be — `internal/chunked`
+  stores the first error and guards its loop with `for cr.err == nil`. Measured firsthand
+  on a connection whose peer HAD closed it 2.4s earlier: the round-9 loop spun
+  **6,611,020 reads, 0 bytes, 6,611,020 timeouts** in its 3s bound and reported the
+  connection OPEN; the raw-connection loop detected EOF in **3 reads / 600.5ms**, the
+  instant the peer closed. Never a false GREEN — the three drain mutations all redded —
+  but a false RED plus a burned core. It now reads the raw conn (crypto/tls does not make
+  a deadline sticky: `readRecordOrCCS` calls `setErrorLocked` only for a non-temporary
+  `net.Error`) and the two-state label is gone, replaced by what is actually measured.
+  Also re-wrapped the three added comment lines over 100 columns.
+  Validation at the committed head: `go build ./...` rc 0; `go test -count=1 ./pkg/api/`
+  rc 0 (42.2s); `go test -count=1 ./pkg/daemon/` rc 0 (16.9s); `go test -count=1 -race
+  -run _6827 ./pkg/api/ ./pkg/daemon/` rc 0. Mutation matrix, each cell run over the WHOLE
+  package with an always-failing sentinel so a survivor cannot be confused with a suite
+  that never ran: MUT-1 (`dead.Store` moved below `drainLeg`) rc 1 — the only non-sentinel
+  failure out of 445 top-level cells is `TestServingFlipsDuringTheDrainNotAfterIt_6827`
+  ("HTTPSServing() was STILL true 750.1ms after the listening socket died, drained=false"),
+  which confirms the survivor claim firsthand: 444 other cells stay green. MUT-2
+  (serveBound reverted to a shared-context bare `Shutdown`) rc 1 — the only non-sentinel
+  failure is `TestServeBoundSeversInFlightResponses_6827` ("still OPEN 3s later, 1395
+  reads, 35240 bytes, 0 read timeouts, bytes arrived during the wait"), so the stream was
+  genuinely still being delivered rather than merely quiet. Pristine control: both cells
+  PASS, sentinel FAILS. Production files restored byte-for-byte (sha256 verified) after
+  each cell. No `.o`, no `userspace-xdp/`, no protocol/wire file touched.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/api/drain_scope_6827_test.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6827 round 11 — state the drain's real bound at both sites; close two
+  deletion-sweep survivors on `Server.serveBound`
+  **Item 1 (wording).** Round 10 described serveBound's new drain as "making the worst
+  case additive" (`pkg/api/server.go`) and "each now gets its own `legDrainTimeout`"
+  (`pkg/api/README.md`). Both read as 5 + 5 = 10s. The quantity has NO fixed ceiling, and
+  this package already says so directly above `legDrainTimeout`: it is a POLL deadline,
+  both phases put serial per-connection closes in front of it, and on an HTTPS leg each
+  `close_notify` carries a five-second write deadline of its OWN. This is the SECOND
+  tightening — round 9 already corrected "bounded 5s drain" to "5s-deadline drain" for the
+  same reason — so both sites now state the MECHANISM and say explicitly that this is not
+  "5s for both" becoming "5s each", which is harder to re-tighten by accident than an
+  adjective. `serveBound` remains test-only: production is `NewServer` + `Start` at
+  `pkg/daemon/management.go:216-217`, and no `.Run(ctx)` in `pkg/daemon` is the api server,
+  so no shipped shutdown path is affected. NOTE: round 10's own entry above carries the
+  same finite gloss ("each now gets its own `legDrainTimeout`", line ~79981). It is left
+  as written — this log is a journal of what was believed at the time, and rewriting it
+  would falsify the record. This entry is the correction.
+  **Item 2 (deletion sweep).** Nobody had run one. Predicate: every EXECUTABLE (non-`//`)
+  line in `git diff 987bfe918..d9fb1de1e -- pkg/api/listener.go pkg/api/server.go` — 8 of
+  the 33 added lines — probed by literal deletion, plus 5 compile-preserving
+  neutralizations for the lines whose deletion is only a compile error, since a build
+  failure is a vacuous red rather than evidence of coverage. Comment lines were excluded by
+  construction: deleting one cannot move `.text`, so "green" there is a tautology, not a
+  finding. Every cell ran the WHOLE of `pkg/api` + `pkg/daemon` with an always-failing
+  sentinel in each package, so GREEN means "exactly 2 FAILs, both sentinels" and a build
+  failure classifies BROKEN rather than GREEN. Results: A1-A4/A8 compile-fenced;
+  A5 RED (4 cells); A6 RED as a HANG — deleting the stop/root-arm drain leaves `<-serveErr`
+  waiting on a Serve that nothing ever stops, and BOTH packages time out; A7 RED;
+  B3/B4/B5 RED. **Two survivors, both on `serveBound`.**
+  **S1: the HTTPS leg was unbound against the exact revert.** Replacing
+  `shutErr = drainLeg(s.httpsServer)` with the pre-round-10 bare `Shutdown` left both
+  packages green. `TestServeBoundSeversInFlightResponses_6827`, the cited binding, called
+  `serveBound(ctx, ln, nil)`, so `s.httpsServer` was nil and the `if s.httpsServer != nil`
+  branch never ran; deleting the line outright reds only
+  `TestRunGracefulShutdownClosesBothListeners`, which asserts the listener CLOSES, not that
+  a response is SEVERED. Round 10's own MUT-2 reverted BOTH legs at once and the bound HTTP
+  leg redded the cell, masking the unbound HTTPS one — a compound mutation cannot localise.
+  **S2: `drainLeg`'s new `return err` could become `return nil`** with both packages green.
+  Self-documented rather than hidden (`t.Logf(...) // not asserted`), but `drainLeg`'s doc
+  says it returns the error "so a caller that reports one can keep doing so" and
+  serveBound's says "the Shutdown error is still what gets reported" — claims with nothing
+  behind them. Both are genuine coverage holes (the lines execute; their values are
+  discarded), not dead code, so both are now bound: the cell runs BOTH legs with a stream
+  held on each via a new `holdStream` helper, and asserts the returned error is the drain
+  deadline. Deterministic — both conns are ACTIVE, so `closeIdleConns` can never report
+  quiescence and `Shutdown` must reach its deadline.
+  **Fix verified against the mutations that found it**: B1 and B2 re-run on the FIXED tree
+  both flip GREEN -> RED. B1: "serveBound returned <nil>, want a context deadline
+  exceeded". B2: "HTTPS leg: ... the connection was still OPEN 3s later (1484 reads, 14840
+  bytes, 0 read timeouts; bytes arrived during the wait)", so the HTTPS stream was
+  genuinely still being delivered rather than merely quiet.
+  **Item 3 (leak check on `TestServingFlipsDuringTheDrainNotAfterIt_6827`).** A temporary
+  `TestMain` snapshotted goroutines and `/proc/self/fd` around `m.Run()` with `-run`
+  narrowed to one test, so anything surviving is attributable to it. Target: goroutines
+  +0, fds +0, sockets +0 — identical to a no-IO control (`TestLegDrainTimeoutDefault_6827`)
+  on all three axes. At `-count=5`, still +0/+0/+0, so there is no per-run accumulation
+  either; the round-11 cell was checked the same way and is also +0/+0/+0.
+  **Harness integrity.** A duplicate `sweep.sh` instance survived its own TERM trap (the
+  handler restored files but did not exit) and was still cycling cells against this
+  worktree while later work ran; it was SIGKILLed and both production files verified
+  sha256-identical to the pristine snapshot afterwards. Neither survivor finding depends on
+  that measurement: both are certain from the pre-fix test SOURCE — the old cell had NO
+  assertion on the returned error, and passed `nil` for `httpsLn` so the HTTPS drain
+  statement never executed. Contamination could only convert a RED into a false GREEN, so
+  the RED verdicts are unaffected in either direction.
+  **Validation** (clean tree, nothing else running in the worktree): `go build ./...` rc 0;
+  `go test -count=1 ./pkg/api/` rc 0, 42.4s, zero `--- FAIL` lines; `go test -count=1
+  ./pkg/daemon/` rc 0, 23.4s, zero `--- FAIL` lines. `go vet ./pkg/api/` rc 0. No `.o`, no
+  `userspace-xdp/`, no protocol or wire file in the change set.
+- **File(s)**: pkg/api/server.go, pkg/api/README.md,
+  pkg/api/tls_stale_cert_6827_test.go
 - **Timestamp**: 2026-08-13T15:52Z
 - **Action**: #6722 round 7 — the RETH-projection predicate's case split is FOUR-way,
   not two, and the two uncovered rows were REACHABLE. `rethProjectionMembers`
