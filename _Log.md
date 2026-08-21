@@ -97219,3 +97219,24 @@ prose edit above them added. No diff falls in the new test body.
 
   `docs/refactoring-audit-current.txt` regenerated after the merge.
 - **File(s)**: _Log.md
+
+## #82 — HA startup race: cold-prime bulk owed after late runtime wiring
+
+- **Timestamp**: 2026-08-21
+- **Action**: Reproduced #82 at `e344c9df5` and fixed it. `startClusterComms`
+  called `ss.Start(commsCtx)` — which spawns the accept/dial goroutines that run
+  the authoritative cold-prime bulk on the first connection — BEFORE
+  `ss.SetRuntime(rt)`. A peer connecting in that window drove `BulkSync` against
+  a nil session store; it returns `session store not ready` before writing a
+  byte, so no `handleDisconnect` follows, and both existing `needColdPrime`
+  consumers (`installConn` on reconnect, `handleDisconnect`'s survivor re-drive)
+  are disconnect-edge triggered. The obligation stayed armed with no consumer for
+  the life of the connection, and the incremental sweep cannot substitute:
+  `StartSyncSweep` seeds `lastSweepTime` to "now" and only queues sessions with
+  `Created >= threshold`, so every pre-startup session is permanently invisible
+  to it. Fix is two parts — `syncSweep` re-drives an owed cold prime on the live
+  connection (`else if` on the `forceResync` consume, sharing
+  `bulkRedriveInFlight`), and the daemon wires the runtime before `Start`.
+- **File(s)**: pkg/cluster/sync_conn_sweep.go,
+  pkg/cluster/sync_cold_prime_late_runtime_82_test.go,
+  pkg/daemon/daemon_ha_sync.go, docs/session-sync-architecture.md, _Log.md

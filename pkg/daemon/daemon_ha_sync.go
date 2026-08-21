@@ -1148,6 +1148,36 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Retry sync start: the VRF device and address binding may not
 			// be ready during daemon startup (networkd race).
 			for i := 0; i < 30; i++ {
+				// #82: wire the runtime and the ownership predicates BEFORE
+				// Start opens the listeners and dialers, not after it returns.
+				//
+				// Start spawns the accept/connect goroutines, and the first
+				// connection they establish runs the authoritative cold-prime
+				// bulk inside handleNewConnection. Wiring afterwards left a
+				// window in which that bulk ran against a nil session store:
+				// BulkSync returns "session store not ready" before it writes a
+				// byte, so no disconnect follows and — before the sweep
+				// re-drive added alongside this — nothing re-drove the owed
+				// prime for the life of that connection. It also made
+				// SetRuntime an unsynchronized write to fields the goroutines
+				// Start had already spawned were reading. Assigning before the
+				// goroutines exist gives the writes a happens-before edge and
+				// removes the race outright.
+				//
+				// ONE snapshot of the published dataplane per iteration feeds
+				// both this wiring and the post-Start sweep launch, so a
+				// setDataplane(nil) landing mid-retry cannot be seen as non-nil
+				// by one site and nil by the other (#2114 / #6743 rule).
+				rt := d.dataplane()
+				if rt != nil {
+					ss.SetRuntime(rt)
+					ss.IsPrimaryFn = func() bool {
+						return d.cluster != nil && d.cluster.IsLocalPrimary(0)
+					}
+					ss.IsPrimaryForRGFn = func(rgID int) bool {
+						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
+					}
+				}
 				if err := ss.Start(commsCtx); err != nil {
 					if i < 5 {
 						slog.Info("cluster: sync bind not ready, retrying",
@@ -1166,23 +1196,16 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				slog.Info("cluster session sync started",
 					"local", syncLocal, "peer", syncPeer, "vrf", vrfDevice)
 
-				// Wire dataplane into session sync and start the sweep.
-				// Must happen here (not in Run) because the session-sync
-				// object `ss` is created asynchronously in this goroutine. The
-				// published dataplane is a dataplane.RuntimeDataPlane; both the
-				// legacy *Manager and
-				// the userspace LegacyDataPlaneAdapter implement
-				// Sessions()/Telemetry() so they satisfy the cluster
-				// package's narrow clusterRuntime contract directly
-				// (#1518).
-				if rt := d.dataplane(); rt != nil {
-					ss.SetRuntime(rt)
-					ss.IsPrimaryFn = func() bool {
-						return d.cluster != nil && d.cluster.IsLocalPrimary(0)
-					}
-					ss.IsPrimaryForRGFn = func(rgID int) bool {
-						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
-					}
+				// Start the sweep and the event-stream drain now that the
+				// listeners are up. The runtime itself was wired above, before
+				// Start (#82). All of it must happen here (not in Run) because
+				// the session-sync object `ss` is created asynchronously in
+				// this goroutine. The published dataplane is a
+				// dataplane.RuntimeDataPlane; both the legacy *Manager and the
+				// userspace LegacyDataPlaneAdapter implement
+				// Sessions()/Telemetry() so they satisfy the cluster package's
+				// narrow clusterRuntime contract directly (#1518).
+				if rt != nil {
 					ss.StartSyncSweep(commsCtx)
 					if wiredStream != nil {
 						go d.eventStreamFallbackLoop(commsCtx, wiredStream)
