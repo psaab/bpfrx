@@ -974,7 +974,7 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 ### HA startup premature primary takeover (FIXED #103)
 - **Symptom:** On startup/rejoin, RG election could promote to primary before interfaces/VRRP are ready → transient loss/blackhole during HA transitions
 - **Root cause:** No readiness gate before takeover — election promoted on peer-loss/no-peer with weight>0; monitor skipped missing interfaces; VRRP skipped missing interfaces; posture check returned OK with no VRRP instances
-- **Fix:** Per-RG readiness contract + hold timer (default 3s): election blocks promotion until interfaces + VRRP ready for holdTime. Monitor reports missing interfaces as not-ready. VRRP manager reports per-RG instance readiness. Already-primary nodes never demoted. Configurable `takeover-hold-time`
+- **Fix:** Per-RG readiness contract + hold timer: election blocks promotion until interfaces + VRRP ready for holdTime. Monitor reports missing interfaces as not-ready. VRRP manager reports per-RG instance readiness. Already-primary nodes never demoted. Configurable `takeover-hold-time`, **default 0** (`DefaultTakeoverHoldTime`, `pkg/cluster/manager.go`) — the gate is readiness-only unless an operator sets a hold. It shipped at 3s in `91a57cf` and was changed to 0 in the bodyless `cd4dbe9`; this line said 3s until #103 was re-walked
 - **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/election.go`, `pkg/cluster/monitor.go`, `pkg/vrrp/manager.go`, `pkg/daemon/daemon.go`, `pkg/config/types.go`, `pkg/config/ast.go`, `pkg/config/compiler.go`
 
 ### warmNeighborCache UDP connect doesn't trigger ARP — double-failover traffic death (FIXED CC-11)

@@ -18,6 +18,7 @@ func (m *Manager) FormatStatus() string {
 	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	configSyncFailing := m.configSyncFailing // #6387: node-global CF annotation
+	takeoverHold := m.takeoverHoldTime       // #103: hold is part of eligibility
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -74,12 +75,22 @@ func (m *Manager) FormatStatus() string {
 				monFails += ", CF"
 			}
 		}
+		// #103 item 5: report the property ELECTION gates on
+		// (IsReadyForTakeover), not the weaker rg.Ready. Inside the
+		// takeover-hold window the RG is Ready but every election gate still
+		// declines to promote it, so a bare "yes" here would contradict the
+		// election with nothing naming the hold. With takeover-hold-time
+		// unset (the default 0) this branch never fires and the line is
+		// unchanged.
 		readyStr := "yes"
 		if !rg.Ready {
 			readyStr = "no"
 			if len(rg.ReadinessReasons) > 0 {
 				readyStr = "no (" + strings.Join(rg.ReadinessReasons, ", ") + ")"
 			}
+		} else if hold := rg.TakeoverHoldRemaining(takeoverHold); hold > 0 {
+			readyStr = fmt.Sprintf("no (takeover hold: %s of %s remaining)",
+				hold.Round(time.Millisecond), takeoverHold)
 		}
 		transferReadyStr := "yes"
 		if !rg.TransferReady {
@@ -121,6 +132,7 @@ func (m *Manager) FormatInformation() string {
 	controlIface := m.controlInterface
 	configSyncFailing := m.configSyncFailing   // #6387
 	configSyncReason := m.configSyncFailReason // #6387
+	takeoverHold := m.takeoverHoldTime         // #103
 	m.mu.RUnlock()
 
 	states := m.GroupStates()
@@ -152,6 +164,11 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Node ID: %d\n", m.nodeID)
 	fmt.Fprintf(&b, "  Heartbeat interval: %d ms\n", interval.Milliseconds())
 	fmt.Fprintf(&b, "  Heartbeat threshold: %d\n", threshold)
+	if takeoverHold > 0 {
+		// #103 item 5: an operator cannot reason about a hold they cannot see.
+		// Omitted at the default 0, where the hold contributes nothing.
+		fmt.Fprintf(&b, "  Takeover hold time: %s\n", takeoverHold)
+	}
 	if controlIface != "" {
 		fmt.Fprintf(&b, "  Control interface: %s\n", controlIface)
 	}
@@ -206,7 +223,13 @@ func (m *Manager) FormatInformation() string {
 		}
 		fmt.Fprintf(&b, "  Preempt: %s\n", preempt)
 		fmt.Fprintf(&b, "  Failover count: %d\n", rg.FailoverCount)
-		if rg.Ready {
+		if hold := rg.TakeoverHoldRemaining(takeoverHold); hold > 0 {
+			// Ready, but election still declines: name the hold and how much
+			// of it is left rather than reporting a "yes" the election
+			// contradicts (#103 item 5).
+			fmt.Fprintf(&b, "  Takeover ready: no (takeover hold: %s of %s remaining, ready since %s)\n",
+				hold.Round(time.Millisecond), takeoverHold, rg.ReadySince.Format("15:04:05"))
+		} else if rg.Ready {
 			fmt.Fprintf(&b, "  Takeover ready: yes (since %s)\n", rg.ReadySince.Format("15:04:05"))
 		} else {
 			reasons := "none"
@@ -325,6 +348,38 @@ func (m *Manager) FormatInformation() string {
 			fmt.Fprintf(&b, "  Last fence ack:      %s\n", ackTime.Format("Jan 02 15:04:05.000"))
 		} else {
 			fmt.Fprintln(&b, "  Last fence ack:      pending")
+		}
+		fmt.Fprintln(&b)
+	}
+
+	// Peer fencing (#72). DISTINCT from the "Install fence" block above:
+	// that one is the bulk-sync install barrier, this is the disable-rg
+	// message the surviving node sends to a peer that stopped heartbeating
+	// (heartbeat_manager.go handlePeerTimeout). Rendered off FenceStatus so
+	// the configured action AND every fence attempt/result is visible in
+	// `show chassis cluster information` on both the local CLI and the gRPC
+	// remote CLI (both render this same function). Suppressed entirely when
+	// fencing was never configured and never fired, matching the
+	// conditional style of the sections around it.
+	fenceAction, fenceEvents := m.FenceStatus()
+	if fenceAction != "" || len(fenceEvents) > 0 {
+		fmt.Fprintln(&b, "Peer fencing:")
+		action := fenceAction
+		if action == "" {
+			// History outlives the config: a fence fired, then the operator
+			// removed `peer-fencing`. Report the CURRENT action, not the one
+			// the events were recorded under.
+			action = "disabled"
+		}
+		fmt.Fprintf(&b, "  Action: %s\n", action)
+		if len(fenceEvents) == 0 {
+			fmt.Fprintln(&b, "  Attempts: none")
+		} else {
+			fmt.Fprintln(&b, "  Attempts:")
+			for _, ev := range fenceEvents {
+				fmt.Fprintf(&b, "    %s  %s\n",
+					ev.Time.Format("Jan 02 15:04:05"), ev.Message)
+			}
 		}
 		fmt.Fprintln(&b)
 	}

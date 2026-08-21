@@ -97880,6 +97880,61 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/sync_failover_fence_verdict_6371_test.go,
   docs/session-sync-architecture.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: Fixed #6177 items 2 and 3 — the HA failover fence barrier is now
+  keyed by the peer's REQUEST id, not by the redundancy group alone, and its
+  arm/disarm/wait/timeout lifecycle has direct tests. Item 1 (the RETH VIP
+  removal window) stays OPEN: it is a VRRP state-machine design change, not a
+  barrier fix, and the issue keeps it.
+
+  Item 2. `disarmFailoverActuation` deleted `failoverActuateWait[rgID]` by KEY,
+  with no check that the entry was still the barrier the caller armed, and
+  `waitFailoverActuated`'s expiry called it. The responder handles every
+  `syncMsgFailover` on its own goroutine (`go s.handleRemoteFailover`, sync_conn_read.go),
+  so two transfer-out cycles for one RG can overlap: an older request's expiry
+  then deleted the slot a newer request had just armed, the newer wait found
+  nothing, `waitFailoverActuated` returned nil — "actuated" — and the node
+  replied `failoverAckApplied` for a demotion it had not performed. That is the
+  two-owner window #5640 exists to close, reached through the bookkeeping
+  instead of through the ack.
+
+  The map is now keyed by `failoverActuationKey{rgID, reqID}`;
+  `armFailoverActuation(rgID, reqID)` returns the barrier it stored and
+  `disarmFailoverActuation(rgID, reqID, b)` removes the entry only while it is
+  still that barrier, so a superseded handle — a duplicate request message
+  re-using one request id — cannot evict a live one either. reqID reaches the
+  wait through `SessionSync.WaitFailoverApplied`/`WaitFailoverAppliedBatch`,
+  whose signatures gain the request id that `OnRemoteFailover` already received
+  (no wire change; the id is already on the wire). The demotion event carries no
+  request id — it reports that this node finished demoting the RG — so
+  `resolveFailoverActuation` fans its verdict out over every request in flight
+  for that RG.
+
+  Item 3. `daemon_ha_actuation_6371_test.go` (added by #7118) covers the verdict
+  legs — success, dataplane rejection, a parked waiter, an unarmed RG — but
+  nothing covered the barrier's own lifecycle. Seven new tests in
+  `daemon_ha_actuation_barrier_6177_test.go` drive arm/disarm/wait/timeout
+  directly: the bounded-wait expiry returns a failure and drops the stranded
+  barrier, an expired request leaves a concurrent request armed, a stale handle
+  cannot disarm a re-armed request, the verdict fans out across requests, a
+  disarmed request returns immediately, the batch wait takes the first failure,
+  and concurrent resolves never double-close.
+
+  Validation: `go test -count=1 ./pkg/daemon/ ./pkg/cluster/` exit 0;
+  `go test -count=1 -race -run FailoverActuation ./pkg/daemon/` exit 0;
+  `go vet ./...` and `go build ./...` exit 0. Mutation matrix, 7/7 RED on the
+  intended assertion: key by RG only; disarm without the identity check; wait
+  returning nil on timeout; timeout leaving the barrier stranded; resolve
+  stopping at the first request; and both fence hooks called with reqID 0.
+  HA/failover code — `make test-failover` is owed before merge (not run here:
+  the loss cluster is shared and lock-protected).
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ha_sync.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_failover.go, pkg/cluster/sync_test.go,
+  pkg/cluster/sync_failover_fence_verdict_6371_test.go,
+  pkg/daemon/daemon_ha_actuation_6371_test.go,
+  pkg/daemon/daemon_ha_actuation_barrier_6177_test.go,
+  docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-21
 - **Action**: #5839 — harden the userspace helper control-socket stale-socket
   removal and type the `control-socket` leaf. The control-socket half of helper
   bring-up still did a bare `_ = os.Remove(cfg.ControlSocket)`: the path is
@@ -97958,3 +98013,88 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-21
   - **Action**: #5078 partial — reject reflected/all-zero session-sync handshake nonces
   - **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync_auth_test.go, pkg/cluster/README.md
+- **Action**: #103 — report the takeover HOLD in cluster status, and correct
+  two stale docs claims about its default. Walking #103's five enumerated
+  sub-conditions against `Daemon.takeoverReadinessForRG` showed items 1a, 1b,
+  2, 3 (peer-alive path) and 4 covered, item 1c covered only for fabric
+  (session-sync is #110), and item 5 covered only for the readiness REASONS —
+  the hold timer was surfaced nowhere. That is not merely missing information:
+  `IsReadyForTakeover` is `Ready` AND `ReadySince+holdTime` elapsed, so inside
+  the hold window `FormatStatus` printed `Takeover ready: yes` while every
+  election gate was actively declining to promote the RG. Verified with a
+  throwaway probe before fixing: with `takeover-hold-time 5000` and a fresh
+  `SetRGReady(0, true, nil)`, `electSingleNode` left the RG `secondary` and the
+  render said `Takeover ready: yes`.
+
+  Added `RedundancyGroupState.TakeoverHoldRemaining` + `Manager.TakeoverHoldTime`
+  and keyed both renders on them. At the default `DefaultTakeoverHoldTime = 0`
+  both renders are byte-identical to before, which bounds the change onto
+  clusters that configured a hold — including `pkg/upgrade`'s precheck, which
+  parses the first token after `Takeover ready:`. Corrected docs/bugs.md and
+  docs/phases.md, which both claimed the default was 3s: it shipped at 3s in
+  `91a57cf` and was changed to 0 in `cd4dbe9`, a bodyless commit.
+
+  Validation: `go test -count=1 ./pkg/cluster/ ./pkg/upgrade/ ./pkg/daemon/
+  ./pkg/cli/ ./pkg/grpcapi/ ./pkg/vrrp/` exit 0. Five single-line mutations,
+  each reding a distinct cell (exit 1 each): FormatStatus hold branch,
+  FormatInformation hold branch, hold-time config line made unconditional,
+  `TakeoverHoldRemaining` losing its `!rg.Ready` guard, and FormatStatus
+  dropping the readiness reasons. Render-only Go control-plane change — no
+  dataplane binary or shim artifact moves.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/manager.go,
+  pkg/cluster/status_takeover_hold_103_test.go, pkg/cluster/README.md,
+  docs/bugs.md, docs/phases.md, _Log.md
+- **Action**: #72 — surface peer-fencing attempts in `show chassis cluster
+  information`. `Manager.FenceStatus()` had existed since the fencing
+  mechanism landed but had ZERO non-test callers, so acceptance criterion 3
+  of #72 ("operators can observe fence attempts/results in runtime status")
+  was unmet: a fence attempt was visible only in journald. Added a "Peer
+  fencing:" block to `FormatInformation` — the single render behind `show
+  chassis cluster information` on BOTH the local CLI and the gRPC remote CLI
+  — showing the currently configured action and every EventFence attempt
+  with its result. The block is suppressed when fencing was never configured
+  and never fired, matching the conditional style of the neighbouring
+  "Install fence:" / "Interface monitoring events:" sections.
+
+  Also recorded, as a comment at the fence call site and in
+  docs/ha-failover-status.md, the FACT that `SendFence` is fire-and-forget
+  (no fence-ack message exists on the wire), which is why `handlePeerTimeout`
+  elects before fencing and never gates ownership on the fence.
+
+  Validation: `go test -count=1 ./pkg/cluster/ ./pkg/upgrade/ ./pkg/cli/
+  ./pkg/grpcapi/` exit 0; `go vet ./pkg/cluster/` exit 0. Two mutations, each
+  one line/hunk: deleting the render hunk reds 4 of the 5 new assertions
+  (exit 1); forcing the section unconditional (`if true`) reds the fifth,
+  the anti-noise guard (exit 1). Render-only change to a Go control-plane
+  path — no dataplane binary or shim artifact moves.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/status_peer_fence_72_test.go, pkg/cluster/README.md,
+  docs/ha-failover-status.md, _Log.md
+## 2026-08-21 — #7149 dataplane: recompile FIB generation bump error no longer discarded
+
+- **Timestamp**: 2026-08-21
+- **Action**: Split #7149 out of #4960 and fixed it. `CompileConfig` ended a
+  recompile with a bare `dp.BumpFIBGeneration()`, dropping both results.
+  Diffing every `dp.<Method>` the compiler calls against
+  `userspaceShimCompileDataplane`'s override set shows only three are NOT
+  overridden as no-ops — `IsLoaded` and `GetPersistentNAT` (pre-mutation, no
+  error) and `BumpFIBGeneration`, which promotes to the embedded `*Manager` and
+  performs a real bpffs map write. Driving the production shim returns
+  `dataplane not armed: fib_gen_map`, and `(*Manager).BumpFIBGeneration`'s
+  not-armed branch logs nothing. `userspace/manager_compile.go` then builds the
+  snapshot with `m.readFIBGeneration()` off that same map, so a failed bump
+  publishes the PREVIOUS generation and established flows keep a cached
+  next-hop the recompile may have invalidated, apply reporting success.
+  Reported rather than returned: the site is post-`compileZones`, so
+  propagating would manufacture the #4960 half-applied shape.
+
+  Validation: `go test -count=1 ./pkg/dataplane/...` exit 0, `go vet
+  ./pkg/dataplane/...` exit 0. Mutation matrix, one mutation per cell, exit
+  codes captured from `$?`: revert the call site to the bare call → exit 1,
+  source walk only; gut the helper to `_, _ =` → exit 1, both guards; warn
+  unconditionally → exit 1, success control only; delete the only production
+  call → exit 1 on the floor. Go-only diff, no shim `.o` or protocol movement,
+  so no cluster smoke is owed.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
+  pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
+  _Log.md
