@@ -97921,3 +97921,36 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/schema_system.go, pkg/config/schema_validators_system.go,
   pkg/config/value_type.go, pkg/config/control_socket_typed_5839_test.go,
   docs/userspace-dataplane-architecture.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #7143 — gate the slot-1 VALIDATION-escape class. Assert that a
+  value the commit check rejects in slot 0 is also rejected in every later
+  slot, over every multi-value leaf in `setSchema`.
+
+  Four such escapes were confirmed and fixed in one campaign (#7126 import-rib,
+  #6687 vlan-id-list, #6692 archive-sites CWE-88, #6688 source-NAT port range)
+  and two more closed by #7138 (#6697 CoS rewrite-rule code-points) — every one
+  found as a side effect of fixing a READ defect, none by looking for the
+  property. The #2419 spelling-differential gate cannot see it: it compares
+  compiled output across spellings, so a leaf that drops nothing but checks only
+  slot 0 compiles identically in every spelling.
+
+  Two harnesses. `TestSlotEscapeSweep` probes the 43 of 124 multi sites where a
+  synthetic parent path commits clean; `TestSlotEscapeTable` carries hand
+  fixtures for the 45 where it does not (security policies, NAT rule-sets,
+  VRRP, CoS classifiers, BGP import/export, ...) — those are more than a third
+  of the schema, and a harness that silently skips them reports a healthy zero.
+  The remaining 36 reject none of an 81-token pool, so there is no check to
+  escape; that list is logged, never asserted. `TestSlotEscapeCoverage` FAILS if
+  a schema addition lands a multi leaf in none of the three.
+
+  Validation: 0 escapes at 3bbe56f43. Calibration: run unchanged at 22e17c2de,
+  all six historical instances FAIL as named rows. Three independent mutations
+  at three production sites each kill it — `multiLeafAuthoredValues(vlanNode)`
+  narrowed to `[:1]`, a `break` in `validateMultiValueLeaf`'s `Keys[1:]` loop,
+  and `coSCodePointTokens` truncated to one token. `go test -count=1
+  ./pkg/config/` exit 0. Test-only diff — no binary or shim artifact moves, so
+  no cluster smoke is owed.
+- **File(s)**: pkg/config/schema_slot_escape_gate_test.go,
+  pkg/config/schema_slot_escape_fixtures_test.go, docs/config-schema.md,
+  _Log.md

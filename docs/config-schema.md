@@ -1295,6 +1295,61 @@ repeated value is one value, and rejecting it invents a rejection too. See
 "A cardinality gate counts DISTINCT values" below for how each leaf picks its
 identity.
 
+### The ESCAPE half is a second gate, because the differential cannot see it
+
+`TestSlotEscapeSweep` / `TestSlotEscapeTable` / `TestSlotEscapeCoverage`
+(`pkg/config/schema_slot_escape_gate_test.go`, fixtures in
+`schema_slot_escape_fixtures_test.go`) assert the other half of the property in
+the GATE ESCAPE table above: **a value the commit check REJECTS in slot 0 must
+also be rejected in every later slot.**
+
+```
+escape := commit(leaf, [bad]) != nil  &&  commit(leaf, [good bad]) == nil
+```
+
+Neither gate subsumes the other, and the reason is structural rather than a
+matter of thoroughness. The spelling differential compares COMPILED OUTPUT
+across spellings, so a leaf that drops NOTHING but checks only slot 0 compiles
+identically in every spelling and reports agreement. Conversely a leaf can read
+every value and check only the first (#6687, #6692, #6688), or read only the
+first and thereby never check the rest (#7126) — the same defect reached from
+opposite directions, and only one of those two is a value drop.
+
+The escape gate's control is a CLEAN COMMIT, not a compiled string, so it needs
+a parent path the compiler accepts. That splits the schema three ways, and
+`TestSlotEscapeCoverage` re-derives the split on every run rather than stating
+it here:
+
+- sites where a synthetic parent commits clean AND some pool token is rejected
+  are probed automatically by the sweep;
+- sites where every pool token commits clean have no check to escape; the list
+  is LOGGED, never asserted, because a leaf that later GAINS a check must not
+  fail the build for it;
+- sites whose synthetic parent is rejected for reasons unrelated to the leaf —
+  a bare `security policies from-zone ... policy p match source-address` is
+  refused for its two missing criteria — carry no verdict from any automatic
+  probe. Those need a hand fixture supplying a real prerequisite config, and
+  the coverage test FAILS if a schema addition lands one there without a row.
+  That is the anti-rot property: growing the schema without covering the new
+  leaf is a build failure, not a silent hole.
+
+**Calibrate a sweep on defects you have already confirmed.** All six escapes
+that existed at 22e17c2de — #6687, #6688, #6692, #6697 (two CoS rewrite-rule
+families) and #7126 — are pinned as named rows in `slotEscapeHistoricalRows`,
+and the file records that every one of them FAILS there and passes at master.
+Three independent mutations kill it at three separate production sites: narrow
+`multiLeafAuthoredValues(vlanNode)` to `[:1]`, `break` out of
+`validateMultiValueLeaf`'s `Keys[1:]` loop, or truncate `coSCodePointTokens` to
+one token.
+
+**A token the GRAMMAR rejects is not a value the leaf refused.** An earlier
+version of the pool carried `scp://u@h:/p`, which `ParseSetCommand` fails to
+lex. That gave every site a "rejected" token, so every site with any accepted
+token looked probed and the coverage figure came out nearly twice its true
+value. Keep the pool to tokens the grammar accepts; a sweep that counts its own
+parse failure as a leaf's gate over-reports coverage in exactly the direction
+nobody checks.
+
 ### #6692: four system-stanza multi-value leaves, and why only three shared a fix
 
 Four `multi: true` leaves under `system` were read with a single-value accessor,
