@@ -679,10 +679,10 @@ data-race failure modes:
 
 The lifecycle is now **epoch-guarded** by `clusterCommsMu` + a `clusterCommsGen`
 generation counter (all comms-epoch fields — `sessionSync`,
-`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel` — are read/written only under
-that lock; every reader goes through `getSessionSync()` /
-`snapshotFabricRefreshChans()` / `getClusterCommsCtx()`, capturing the pointer
-once):
+`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel`, `activeClusterTransport` —
+are read/written only under that lock; every reader goes through
+`getSessionSync()` / `snapshotFabricRefreshChans()` / `getClusterCommsCtx()` /
+`activeTransport()`, capturing the value once):
 
 - `beginClusterCommsEpoch` bumps the generation and installs the fresh
   sub-context; `startClusterComms` hands the post-bump generation to the
@@ -702,9 +702,26 @@ once):
   sync. The join runs outside the lock (the constructor's publish path also
   takes it), so there is no deadlock.
 
+- `activeClusterTransport` joined the epoch in **#6290** and publishes the same
+  way, via `setActiveTransportIfCurrent(gen, key)`. It had been written by
+  `startClusterComms` holding neither `clusterCommsMu` nor `applySem`, and read
+  by `applyTailReconciles` step 20 under `applySem` — and a semaphore only
+  excludes participants that take it. The issue judged that benign because the
+  boot `startClusterComms` precedes the gRPC/HTTP servers, but those are not the
+  only appliers: the boot `applyConfig` starts the DHCP clients
+  (`reconcileDHCPClients`) with `onDHCPAddressChange` already wired, and that
+  callback re-enters `applyConfig` — hence step 20 — on a goroutine created
+  BEFORE the write. Goroutine creation therefore orders them the wrong way and
+  supplies no happens-before, so a lease landing in that window was a real data
+  race, the mirror of #5113 on `mgmtVRFInterfaces`. Step 20 now takes ONE
+  `activeTransport()` snapshot for both its comparison and its eight log
+  fields.
+
 `make test-failover` is the required smoke for this path. The guard is covered
 by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
-`-race` concurrency).
+`-race` concurrency) and, for the transport key, by
+`cluster_transport_race_6290_test.go` (production writer vs production reader
+under `-race`, plus a deterministic stale-epoch drop).
 
 ### Per-RG Router-Advertisement reconcile (#5861)
 
