@@ -230,6 +230,49 @@ slot. Two changes close it:
   again. There is now no path by which an unadmitted connection executes
   anything.
 
+### Degenerate handshake nonces are refused (partial #5078)
+
+Separate from the dual-accept bypass above, `performSyncHandshake` calls
+`syncCheckPeerNonce` before it computes a proof, and drops the connection when
+the peer's challenge nonce is either **equal to our own** or **all zero**.
+
+The equal case is the live one. `syncAuthProof` is `HMAC(key, tag ‖ challenge)`
+— no role, no node identity, no transcript — and the accept test is
+`hmac.Equal(peerProof, syncAuthProof(key, localNonce))`. So a PSK-less attacker
+that ECHOES every byte back authenticates: our HELLO returns as the peer HELLO
+with `peerNonce == localNonce`, we compute and send `HMAC(key, tag ‖
+localNonce)` first, and the attacker replays that value as the peer proof.
+Measured on `a77d5568c` a pure byte-mirror negotiated
+`syncAuthAuthenticated` with a derived frame key. Because
+`syncDeriveFrameKey` sorts the two nonces canonically, the resulting key is
+UNDIRECTED, so the attacker could also reflect our own sealed frames back into
+our `receiveLoop` and have them verify.
+
+The all-zero case is hygiene: it is not an entropy test (entropy is
+unmeasurable from one sample), only a refusal of the single value a peer with
+an unseeded CSPRNG emits.
+
+**This is NECESSARY, NOT SUFFICIENT, and #5078 stays open for the rest.** The
+two-connection variant uses a SECOND keyed connection as a proof oracle — a
+proof computed over connection α's local nonce is relayed onto connection β —
+and there the nonces on each connection differ, so nothing here fires. Since
+both nodes share ONE PSK, that oracle can be the PEER node, which no
+per-node nonce bookkeeping could see either. Closing it requires the proof to
+be bound to role + identity + transcript, i.e. a new proof construction and a
+keyed↔keyed wire flag-day. Do not read the guard, or its tests, as closing the
+reflection issue.
+
+Both comparisons are variable-time on purpose: challenge nonces travel in
+cleartext in the HELLO, so there is no secret for a timing side channel to
+leak, and `hmac.Equal` here would imply one exists.
+
+Why this needed **no migration window**, unlike everything else in #5078: it
+adds no field, bumps no version, and changes not one emitted byte. It only
+NARROWS what is accepted, and the values it refuses are ones two honest
+`crypto/rand` peers hit with probability ~2^-256. An old-build node and a
+new-build node interoperate exactly as before, in both directions, so there is
+no state in which a keyed pair cannot converge.
+
 **No relaxation knob, deliberately** — but read the rollout constraint below
 before concluding that is easy.
 
@@ -1470,7 +1513,11 @@ connection is authenticated, then seals every subsequent frame.
   advertising a fresh 32-byte challenge nonce; when BOTH peers are keyed
   each proves possession with `syncMsgAuthProof` (type 28) =
   `HMAC-SHA256(key, tag ‖ peer-nonce)` (mutual challenge-response). Fresh
-  per-connection nonces make the proof replay-safe at setup. HELLO/PROOF
+  per-connection nonces make the proof replay-safe at setup. A peer nonce that
+  is EQUAL TO OUR OWN or ALL ZERO is refused before any proof is emitted
+  (`syncCheckPeerNonce`) — that kills the byte-echo reflection attack but NOT
+  the two-connection proof-oracle variant; see "Degenerate handshake nonces are
+  refused (partial #5078)" above. HELLO/PROOF
   are written CONCURRENTLY with reading the peer's frame so the handshake
   does not deadlock on a fully-synchronous transport (`net.Pipe` in tests /
   a strict write-then-read on two symmetric peers). Types 27/28 sit above

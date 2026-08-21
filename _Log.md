@@ -97954,3 +97954,7 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_slot_escape_gate_test.go,
   pkg/config/schema_slot_escape_fixtures_test.go, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #5078 partial — reject reflected/all-zero session-sync handshake nonces
+  - **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync_auth_test.go, pkg/cluster/README.md
