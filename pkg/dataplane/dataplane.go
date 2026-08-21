@@ -391,7 +391,19 @@ type DataPlane interface {
 	// BumpFIBGeneration invalidates cached per-session FIB entries.
 	// #1844: returns the bump error so callers with retry semantics
 	// (the ip-monitoring routes-only actuator's pendingFIBBump) can
-	// see a failed bump; fire-and-forget callers may ignore it.
+	// see a failed bump.
+	//
+	// #7149: no production caller ignores it any more, and the phrase
+	// that used to sit here -- "fire-and-forget callers may ignore it"
+	// -- named exactly one caller, CompileConfig, which is the one it
+	// was wrong for. Each of the three picks the treatment its own path
+	// supports: the ip-monitoring actuator retries (pendingFIBBump), the
+	// route-leak commit tail fails the commit closed for want of a retry
+	// owner (#5696 M19), and the compiler REPORTS -- it runs after
+	// compileZones has mutated the host, so returning the error there
+	// would manufacture the half-applied apply #4960 exists to prevent.
+	// A new caller must choose one of the three; silently dropping it
+	// publishes a snapshot carrying the previous generation.
 	BumpFIBGeneration() (uint32, error)
 	// StartFIBSync is a no-op on every in-tree backend: eBPF resolves
 	// FIB queries via bpf_fib_lookup in-kernel and the userspace
