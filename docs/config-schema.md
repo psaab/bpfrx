@@ -3188,8 +3188,10 @@ The closed-world keyword audit above validates WHICH keywords may appear under
 `then`, but not HOW MANY translation actions a rule carries. A malformed or
 mixed-version rule could still present a complete `then {}` block with ZERO
 NAT-terminal actions (actionless — the snapshot builder installs no
-translation, so an intended `off` exemption silently disappears and a later
-broader rule is revealed) or TWO+ mutually-exclusive actions (`off` + `pool`,
+translation and the rule does not stop evaluation, so an intended `off`
+exemption silently disappears and the traffic falls through: translated by a
+later broader rule if one matches, otherwise left untranslated) or TWO+
+mutually-exclusive actions (`off` + `pool`,
 `interface` + `pool` — the compiler silently picked one by packed-key / child
 order, so an exemption could publish as a translation). `security nat
 {source,destination} rule … then` must therefore carry EXACTLY ONE NAT-terminal
@@ -3209,6 +3211,137 @@ so the count reflects the winning block) and are NOT rejected. The
 picking one. Production tests:
 `compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
 zero/two/valid + #3850 last-wins preservation).
+
+The gate has a SECOND registration: `validateSourceNATStrictView`
+(`compiler_peer_effective_snat.go`), the source-NAT subject of the #5876
+peer-effective strict list. Both are load-bearing and neither substitutes for
+the other. `runUniformGates` adjudicates the SUBMITTING node's view; the
+peer-effective run adjudicates the PEER's `${node}` / `groups nodeN` expansion,
+and it is the only strict adjudication that view ever gets, because the standby
+ingests the synced config through `Store.SyncApply` →
+`CompileConfigForNodeLenient`, where this gate is downgraded to a warning. A
+peer-only contradiction therefore commits green on the origin and lands
+malformed on the standby unless the peer-effective call runs. Deleting that call
+left four packages green until #6820 added
+`TestPeerOnlyNATTerminalActionRejectedAtOriginCommit_6820` (plus a
+node1-perspective and a both-views-clean over-reject control) in
+`compiler_peer_effective_nat_terminal_action_6820_test.go`.
+
+Both rejection MESSAGES are content-bound by
+`TestNATTerminalActionMessageContent_6820`, not just their firing. They are
+operator-visible on both paths — verbatim at strict commit, wrapped into a
+`cfg.Warnings` entry on the tolerant one — and the 2+-action text used to state
+a mechanism the compiler had stopped using (a packed-key/child-order pick),
+which no test could see. It now says what actually happens — and says it
+PER KIND, because the two kinds do not share a mechanism (#6820 round 3). For
+source NAT every authored action is published and the DATAPLANE resolves the
+rule `off` > `interface` > `pool`. For destination NAT the COMPILER resolves
+`off` itself: `buildDestinationNATSnapshots` short-circuits on `isOff`, never
+looks the pool up, and publishes `PoolAddress: ""`, so "every action is
+published" is false for a DNAT rule; the dataplane's `off` > `pool` branch then
+covers any entry that arrives carrying both. Either way all but one authored
+action is discarded, and the survivor is not chosen by configuration order.
+
+*What the tolerant path actually does (#5717).* Only a malformed rule reaches
+the lenient arm — the strict commit path rejects it — but the two arities land
+there very differently, and the difference is load-bearing:
+
+- **Contradictory (2+ actions) CONTAINING `off` resolves to the EXEMPTION.**
+  Recording every field is what makes this safe: `off` takes precedence over
+  `interface` / `pool`, so such a contradiction can never publish the INVERSE of
+  the authored action. The two builders reach that outcome differently —
+  source NAT forwards every field to Rust, destination NAT short-circuits on
+  `isOff` in `pkg/dataplane/userspace/nat_destination.go` and publishes a
+  pool-less exemption entry — but **the precedence itself is decided in Rust on
+  both paths** (#6820): the `rule.off` early return in
+  `userspace-dp/src/nat/source.rs` for SNAT, and the `off`-only branch of
+  `DnatEntry::to_outcome` in `userspace-dp/src/nat/destination.rs` for DNAT.
+  The Go short-circuit is CANONICALIZATION, not the decision: a snapshot
+  carrying both `Off=true` and a usable pool — which Go never emits but a
+  hand-built or mixed-version one can — still resolves to the exemption,
+  measured by `dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820`
+  (`userspace-dp/src/nat/tests_destination.rs`), whose control arm clears `off`
+  on the same rule and gets the translation. Both halves are now pinned:
+  `TestTolerantContradictory{SNAT,DNAT}*_5717`
+  (`pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go`) and
+  `off_wins_over_contradictory_{interface,pool}_action_5717`
+  (`userspace-dp/src/nat/tests_source.rs`). The pre-existing
+  `off_rule_short_circuits_translation` does NOT cover this — its rule sets
+  `off` alone, so it stays green under a mutation that lets `interface` win.
+
+- **Contradictory WITHOUT `off` gives INTERFACE MODE precedence.** Source NAT
+  also admits `interface` + `pool`, which carries no `off` to take precedence.
+  The Rust matcher checks `off` -> `interface_mode` -> `pool_mode` in that order
+  (`nat/source.rs`), so interface mode wins and the authored pool is silently
+  discarded. That produces interface translation when the egress interface has a
+  suitable same-family address, and a fail-closed `Unavailable`
+  (`InterfaceNoEgressAddress`) when it does not — the #5688 belt, which refuses
+  to forward untranslated rather than leaking the private source. "A contradiction resolves to the exemption" is therefore true ONLY
+  of the `off`-bearing case; stating it unqualified is the same
+  untested-safety-claim defect this section documents. Both halves of this one
+  are pinned, and they need separate fixtures: the translating half by
+  `interface_wins_over_pool_without_off_5717`, the fail-closed half by
+  `interface_with_pool_no_egress_fails_closed_5717`. The generic no-egress
+  tests (`interface_source_nat_no_v{4,6}_egress_addr_fails_closed`) do not
+  cover the second half — they use interface mode with NO pool, so a fallback
+  from the belt into pool translation leaves them green. On the Go side
+  `TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717` pins that
+  the builder publishes BOTH actions (and the tolerant-path warning), since a
+  Rust test building its snapshot directly cannot see a Go edit that drops the
+  pool. Note a claim quantified over
+  "2+ actions" cannot be discharged by pairwise fixtures alone — the three-action
+  `interface` + `off` + `pool` shape needs its own fixture, because two pairwise
+  tests both survive a predicate that mishandles only the three-action case. It
+  needs one on EACH SIDE of the language boundary, which is the correction #6820's
+  re-gate made: `off_wins_over_all_three_actions_5717` pins the Rust resolution
+  but HAND-BUILDS its `SourceNATRuleSnapshot`, so it never crosses Go
+  publication, and the three Go sub-tests were all pairwise. That gap was
+  measured, not inferred — publishing `Off: rule.Then.Off &&
+  !(rule.Then.Interface && rule.Then.PoolName != "")` (correct on every pair,
+  wrong only on the triple) kept the whole Go suite green while the operator's
+  authored `off` published as `Off=false` and Rust translated on the
+  `interface_mode` branch. The Go half is now pinned by the
+  `hierarchical single-node interface+off+pool` sub-test of
+  `TestTolerantContradictorySNATCarriesOff_5717`, which drives the triple through
+  a real tolerant compile.
+
+- **Zero actions is NOT inert.** It installs no translation, but the matched
+  traffic FALLS THROUGH — and what it falls through TO depends on what follows
+  it. If a later, broader rule matches, that rule translates it: the fail-open
+  the gate's own zero-action rejection text describes. If NOTHING later matches,
+  the matcher's loop simply ends and the packet leaves **untranslated**. Only
+  the first is a fail-open: the packet is translated against the operator's
+  intent. In the second the packet's disposition COINCIDES with the intended
+  exemption, so nothing is observably wrong today — calling that a fail-open
+  too conflates a live wrong disposition with a latent one. What is wrong there
+  is the RULE, not the packet: it is non-terminal, so adding any later broader
+  rule silently turns the same config into the first case. That is why the gate
+  rejects it either way. An earlier revision of this bullet asserted only the
+  first outcome ("and is translated by that"), which presumes a later rule
+  exists (#6820 re-gate). Source NAT reaches the fall-through by emitting
+  the actionless rule and letting the Rust matcher's `else` arm `continue`;
+  destination NAT reaches it by skipping the rule in the builder. Making an
+  actionless rule terminal would newly exempt traffic that already-deployed
+  configs translate, so that is a migration-contract decision tracked on #5717
+  rather than a mechanical fix.
+  `TestTolerantActionlessRuleIsNotInert_5717`,
+  `actionless_rule_falls_through_to_later_broader_rule_5717` and
+  `actionless_rule_with_no_later_rule_passes_untranslated_5717` pin BOTH
+  dispositions, so neither the "inert" framing nor the "always translated by a
+  later rule" framing can silently return.
+
+  The no-later-rule test asserts on `SourceNatLookup`, via
+  `match_source_nat_result_for_tuple`, and NOT on the `Option`-returning
+  `match_source_nat` wrapper (#6820 re-gate). The wrapper folds
+  `NoMatch | Unavailable(_) => None`, so a `None` assertion cannot tell
+  "forwarded untranslated" from "dropped" — precisely the distinction the test
+  name makes. Production splits them oppositely: `NoMatch` becomes
+  `Ok(NatDecision::default())` and the packet is forwarded, while `Unavailable`
+  becomes `Err` and `poll_descriptor` records a source-NAT failure and recycles
+  the descriptor — the packet is DROPPED. The wrapper is also reachable in a
+  non-test build only through `match_source_nat_for_flow`, which carries
+  `#[cfg_attr(not(test), allow(dead_code))]`; `match_source_nat_result_for_tuple`
+  is the live entry point.
 
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`
