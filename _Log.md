@@ -1,3 +1,93 @@
+## 2026-08-20 — #5806 drive round (PR #6839): merge-gate pass, runtime-only bar
+
+- **Timestamp**: 2026-08-20 (fix/5806-screen-unresolved-visibility, PR #6839)
+- **Action**: Drive-to-merge round at head 05e35c9d8. Classified the round-2
+  MERGE-BLOCK against the campaign's runtime-only bar, merged origin/master,
+  re-measured the load-bearing guards at the merged head, ran an independent
+  hostile pass as a screen/IDS + observability subject, and filed three
+  non-runtime residuals rather than folding them.
+- **File(s)**: `_Log.md` (this entry); `origin/master` merge resolved
+  union-with-structural-check on `_Log.md` (base ts=2991 / HEAD +6 /
+  master +34 → merged 3031; h2 1587 / +5 / +20 → 1612). No production code
+  changed this round.
+
+### Round-2 MERGE-BLOCK classification — all NON-RUNTIME
+
+- **B1** (CLI render-order guard is position-blind) is a statement about a
+  TEST, not production. Verified firsthand at BOTH reviewed heads: at
+  `954a523b6` and `1858bdf50` the local-CLI emit already precedes the
+  `No screen profiles configured` early return
+  (`git show <sha>:pkg/cli/cli_show_security_screen.go`). Production ordering
+  was never wrong; only the guard could not see it. Folded at `05e35c9d8`
+  regardless.
+- **B2 / B4** are claim-scope wording; folded at `05e35c9d8`.
+- **B3** (source scan reds on a `//` comment) is test-only and pre-existing →
+  filed, not folded.
+
+### Guards re-measured at the merged head (745bbffd0), one mutation per cell
+
+| mutation | rc | assertion that fired |
+|---|---|---|
+| CLI emit moved INSIDE the empty-`Screen` branch, after the line | 1 | `CheckScreenUnresolvedRenderOrder` (cli test:165) |
+| gRPC emit moved INSIDE the same branch, after the line | 1 | same shared check (grpcapi test:83) |
+| `c.collectScreenUnresolvedProfileZones(ch)` severed in `Collect` | 1 | `TestScreenUnresolvedProfileZonesEmittedOnTolerantLoad` |
+
+Each restored; scratch worktree verified clean (`git status --porcelain` = 0)
+after each. Mutations ran in `/var/tmp/mut6839drive`, never in the drive
+worktree.
+
+### Independent hostile pass — one gap found, three hazards refuted
+
+- **FOUND (filed #7059).** A screen profile that is DEFINED but enables zero
+  checks is reported RESOLVED by every #5806 surface while the dataplane
+  enforces nothing: `buildScreenSnapshots`'s emit gate publishes no snapshot,
+  the Rust `zones` map has no entry, and `maybe_warn_missing_profile` is silent
+  because the zone is not in `screen_missing_profile_zones`. Measured through
+  the real compile path — `ids-option p alarm-without-drop` + a zone claiming
+  `p` passes STRICT commit with ZERO warnings (unresolvedRefs=0,
+  publishedSnapshots=0, statusLines=0). Pre-existing #3082 predicate, so filed.
+- **REFUTED — invalid-UTF-8 label panic.** `MustNewConstMetric` does panic on a
+  non-UTF-8 label value (measured), which inside `Collect` would take the
+  daemon down. Unreachable: the lexer rejects invalid UTF-8 in an identifier
+  (`ParseSetCommand` → `unexpected token error`), and `active.json` round-trips
+  through JSON, which cannot yield invalid UTF-8.
+- **REFUTED — desired-vs-applied divergence.** A promoted config whose screen
+  snapshot never reached the helper would make the metric say "resolved" while
+  the zone runs unscreened. Closed by #5679/#2138: a fatal dataplane apply
+  error DISARMS the dataplane (no forwarding at all), and any other apply error
+  still leaves the new snapshot armed and surfaces the failure on the commit.
+- **REFUTED — concurrent map access.** `ActiveConfig()` hands out
+  `store.compiled`; a scrape ranges `cfg.Security.Zones`. No writer:
+  `grep 'Security.Zones\['` outside `pkg/config/` is read-only everywhere.
+
+### Filed, not folded
+
+- **#7059** — defined-but-check-less profile reported resolved (runtime-adjacent
+  but pre-existing on `origin/master`).
+- **#7060** — `show security screen ids-option <profile>` renderers
+  (`server_show_security_text.go:416,644`) omit the unresolved block before
+  their empty-inventory line.
+- **#7061** — the disposition source-identity scan reds on a single-line `//`
+  comment quoting the sentence (B3). Measured both ways: contiguous one-line
+  comment rc=1; the same sentence wrapped across two `//` lines rc=0, so the
+  false positive is narrower than round 2 implied.
+
+### Smoke posture
+
+Exactly one Rust file changed on the branch,
+`userspace-dp/src/afxdp/poll_stages_tests.rs`, reached only through
+`poll_stages.rs:1206` `#[cfg(test)] #[path = "poll_stages_tests.rs"] mod tests;`.
+No production Rust, no shim object, no protocol/wire change → **no cluster
+smoke owed**. The PR body's "No Rust touched" line was factually wrong and is
+corrected to state the `#[cfg(test)]`-only scope.
+
+### #5806 scope
+
+This PR advances acceptance criterion 4 only. Criteria 1, 2, 3, 5 and the
+RED-on-revert matrix in 6 all depend on the open fail-closed-vs-pass posture
+decision, which requires operator signoff. **No `Closes` keyword added**;
+#5806 stays open as the owner of the residual.
+
 ## 2026-08-20 — #5806 fold r4: three doc comments changed owner by insertion; two guards claimed more than they check
 
 - **Timestamp**: 2026-08-20 (fix/5806-screen-unresolved-visibility, PR #6839)
