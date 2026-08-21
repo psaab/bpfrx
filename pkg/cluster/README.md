@@ -87,6 +87,17 @@ locating any symbol below is now a matter of opening the named file.
   `FormatIPMonitoringStatus`, `FormatInterfaces`,
   `InterfaceMonitorInfo`, `RethInfo`, `InterfacesInput`) —
   `status.go`.
+  `FormatInformation` is the ONE render behind `show chassis cluster
+  information` on both surfaces — the local CLI
+  (`pkg/cli/cli_show_cluster.go`) and the gRPC remote CLI
+  (`pkg/grpcapi/server_show_cluster_text.go`) both call it — so a section
+  added there reaches both. Its "Peer fencing:" block (#72) renders
+  `FenceStatus()`: the CURRENTLY configured action (`disabled` when the
+  `peer-fencing` leaf is absent, which can differ from the action past
+  events were recorded under) plus every `EventFence` attempt and its
+  result. Do not confuse it with the "Install fence:" block above it —
+  that one is the bulk-sync install barrier (`LastFenceSeq`), not the
+  peer split-brain fence.
 - `triggerGARP` (no-op/log hook today — native VRRP owns GARP),
   plus the gratuitous-ARP / unsolicited-NA burst senders — `garp.go`.
   `SendGratuitousARPBurst` / `SendGratuitousIPv6Burst` send the first

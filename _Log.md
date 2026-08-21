@@ -97954,3 +97954,31 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_slot_escape_gate_test.go,
   pkg/config/schema_slot_escape_fixtures_test.go, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #72 — surface peer-fencing attempts in `show chassis cluster
+  information`. `Manager.FenceStatus()` had existed since the fencing
+  mechanism landed but had ZERO non-test callers, so acceptance criterion 3
+  of #72 ("operators can observe fence attempts/results in runtime status")
+  was unmet: a fence attempt was visible only in journald. Added a "Peer
+  fencing:" block to `FormatInformation` — the single render behind `show
+  chassis cluster information` on BOTH the local CLI and the gRPC remote CLI
+  — showing the currently configured action and every EventFence attempt
+  with its result. The block is suppressed when fencing was never configured
+  and never fired, matching the conditional style of the neighbouring
+  "Install fence:" / "Interface monitoring events:" sections.
+
+  Also recorded, as a comment at the fence call site and in
+  docs/ha-failover-status.md, the FACT that `SendFence` is fire-and-forget
+  (no fence-ack message exists on the wire), which is why `handlePeerTimeout`
+  elects before fencing and never gates ownership on the fence.
+
+  Validation: `go test -count=1 ./pkg/cluster/ ./pkg/upgrade/ ./pkg/cli/
+  ./pkg/grpcapi/` exit 0; `go vet ./pkg/cluster/` exit 0. Two mutations, each
+  one line/hunk: deleting the render hunk reds 4 of the 5 new assertions
+  (exit 1); forcing the section unconditional (`if true`) reds the fifth,
+  the anti-noise guard (exit 1). Render-only change to a Go control-plane
+  path — no dataplane binary or shim artifact moves.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/status_peer_fence_72_test.go, pkg/cluster/README.md,
+  docs/ha-failover-status.md, _Log.md
