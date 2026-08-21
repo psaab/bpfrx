@@ -142,12 +142,19 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 			}
 		}
 
-		// Check for fabric-options member-interfaces
+		// Check for fabric-options member-interfaces.
+		//
+		// #6694: read the member names out of EVERY AST shape, not just
+		// miNode.Children. The `Children`-only descent compiled an EMPTY
+		// member list for the two hierarchical spellings that carry the names
+		// on the node's own Keys — the idiomatic bracket list
+		// `member-interfaces [ ge-0/0/0 ge-0/0/1 ];` and the plain single
+		// `member-interfaces ge-0/0/0;`. FindChildren, not FindChild, because
+		// repeated hierarchical statements land as SIBLING nodes and only the
+		// first was ever consulted.
 		if foNode := child.FindChild("fabric-options"); foNode != nil {
-			if miNode := foNode.FindChild("member-interfaces"); miNode != nil {
-				for _, m := range miNode.Children {
-					ifc.FabricMembers = append(ifc.FabricMembers, m.Name())
-				}
+			for _, miNode := range foNode.FindChildren("member-interfaces") {
+				ifc.FabricMembers = append(ifc.FabricMembers, fabricMemberValues(miNode)...)
 			}
 			if len(ifc.FabricMembers) > 0 {
 				ifc.BondMode = "active-backup"
@@ -1344,4 +1351,55 @@ func compileInterfaceDynamicDNS(afNode *Node) *InterfaceDynamicDNSConfig {
 		return nil
 	}
 	return d
+}
+
+// fabricMemberValues returns every member interface name carried by one
+// `fabric-options member-interfaces` node.
+//
+// The names reach the compiler on the node's own Keys, on its children's Keys,
+// or both, depending on how the config was authored (#6694 / the #2419
+// multi-value-leaf class):
+//
+//   - hierarchical block      `member-interfaces { a; b; }`
+//     → Keys=["member-interfaces"], one leaf child per name
+//   - hierarchical bracket    `member-interfaces [ a b ];`
+//     → Keys=["member-interfaces","a","b"], no children
+//   - hierarchical single     `member-interfaces a;`
+//     → Keys=["member-interfaces","a"], no children
+//   - flat-set repeated       `set ... member-interfaces a` (x2)
+//     → Keys=["member-interfaces"], one leaf child per name
+//   - flat-set bracket        `set ... member-interfaces [ a b ]`
+//     → Keys=["member-interfaces"], ONE child whose Keys hold every name
+//
+// The last shape is why firewallMatchValues is not enough here: it reads only
+// Keys[0] of each child, so it would keep the first name of a flat-set bracket
+// list and drop the rest. Descend the whole subtree and take every key.
+//
+// `member-interfaces` has no per-member option keywords in Junos, so unlike
+// the NTP server list there is no trailing-token ambiguity to resolve — every
+// non-empty token below the node is a member name.
+func fabricMemberValues(n *Node) []string {
+	if n == nil {
+		return nil
+	}
+	var members []string
+	add := func(tokens []string) {
+		for _, tok := range tokens {
+			if tok != "" {
+				members = append(members, tok)
+			}
+		}
+	}
+	if len(n.Keys) > 1 {
+		add(n.Keys[1:])
+	}
+	var walk func(*Node)
+	walk = func(parent *Node) {
+		for _, c := range parent.Children {
+			add(c.Keys)
+			walk(c)
+		}
+	}
+	walk(n)
+	return members
 }
