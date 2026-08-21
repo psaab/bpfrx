@@ -97280,3 +97280,44 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/wireguard_multiport_warning_1434_test.go,
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added the missing refill-under-contention race test for the
+  lock-free three-color policer (#6307). The bundled
+  `concurrent_meter_is_lock_free_and_preserves_trTCM_thresholds` pins
+  `now_ns = 0`, so it hammers only the consume `compare_exchange_weak`; the
+  REFILL path — the win-the-window `last_refill_ns` CAS plus the #4261 sub-byte
+  rewind composing across concurrent partial windows — never ran under
+  contention, and that is the actual over-grant hazard of the #5390 design.
+
+  `concurrent_refill_under_contention_neither_over_nor_under_grants_6307` runs
+  8 threads against ONE shared trTCM policer with an ADVANCING clock. Every op
+  claims its timestamp from a single `fetch_add` clock and the threads race
+  until a shared budget is exhausted (a shared-budget loop, NOT equal
+  per-thread iteration counts), so total simulated time is exactly 175 ms no
+  matter how the scheduler interleaves and the ceiling is deterministic:
+  CBS 50_000 B + CIR 1e6 B/s x 0.175 s = 225_000 B. Offered load is ~100x the
+  supply, so the committed bucket never re-saturates and ends holding less than
+  one packet. STEP_NS = 700 accrues 0.7 B per op, so most ops grant nothing and
+  the sub-byte credit must survive across ops (#4261 dust) under contention.
+  The test asserts BOTH directions — admitted <= ceiling (no over-grant) and
+  admitted + 3 packets >= ceiling (no lost refill) — and reports the achieved
+  contention rate (share of ops that observed a foreign clock advance) plus the
+  per-thread op split, so a run that degenerated to serial execution is visible
+  rather than passing silently.
+
+  Production is CORRECT: 5/5 runs admitted EXACTLY 225_000 B at a 99.4-99.7%
+  interleave rate. Mutation-verified with two concurrency-only mutations of
+  `refill_independent_bucket` (the site the trTCM path actually reaches), exit
+  codes read from `$?`, never through a pipe: (A) credit the refill even when
+  the `last_refill_ns` compare_exchange LOSES -> `cargo check --all-targets`
+  rc=0, test rc=101, "over-grant ... admitted 321500 B ... budget is only
+  225000 B"; (B) abandon the credit add when the packed-credits
+  `compare_exchange_weak` loses -> check rc=0, test rc=101, "starved ...
+  admitted only 113000 B". Each mutation reddens ONLY the new test — the other
+  11 `filter::policer` tests, including the now_ns=0 concurrent one, stay green,
+  which is exactly the gap #6307 named.
+
+  Test-only: no production source changed, so no helper binary movement and no
+  cluster smoke owed.
+- **File(s)**: userspace-dp/src/filter/policer.rs (tests module only), _Log.md
