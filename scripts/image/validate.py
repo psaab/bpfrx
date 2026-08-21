@@ -336,6 +336,17 @@ class Harness:
         if guest(a, "nice", "-n", "19", "/usr/local/sbin/xpfd", "verify-dataplane",
                  check=False).returncode != 0:
             fail("in-guest verify-dataplane REJECTED — image must not ship")
+        # #7114: the appliance marker is what re-enables the factory
+        # fxp0-DHCP bootstrap on this artifact. The bake purges cloud-init and
+        # netplan, so on a no-config-drive boot xpfd's #1922 lifeline finds no
+        # default route; without the marker it declines to touch any NIC and
+        # the port below stays DOWN and unrenamed. Assert the marker FIRST so a
+        # bake that stopped writing it fails with its own cause instead of as
+        # the downstream "fxp0 has no address" timeout.
+        if not guest_sh(a, 'test -f /etc/xpf/appliance'):
+            fail("/etc/xpf/appliance missing — the bake did not write the #7114 "
+                 "appliance-image marker; xpfd will hold the factory boot in the "
+                 "console-only bootstrap state (no fxp0, no DHCP)")
         self.wait_fxp0_dhcp(a)
         # #4172: frr-pythontools (/usr/lib/frr/frr-reload.py) MUST be present
         # or every FRR reload silently degrades to the additive `vtysh -f`
