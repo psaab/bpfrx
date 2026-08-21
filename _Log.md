@@ -97281,6 +97281,34 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
 
+## #7046 — pkg/api README's "reds only …" cell was false at the head that ships it
+
+- **Timestamp**: 2026-08-21
+- **Action**: Re-measured both mutation cells for the HTTPS `drainLeg` in
+  `Server.serveBound` and rewrote the paragraph to state what was observed, at
+  the head it was observed at. Baseline `go test ./pkg/api/ -count=1` at
+  f8e720c3e rc=0 (42.9s), so both reds below are attributable. (A) DELETING the
+  HTTPS `drainLeg` reds TWO: `TestRunGracefulShutdownClosesBothListeners`
+  (10.02s, `server_run_leak_5058_test.go:152`, "Run did not return after ctx
+  cancellation") and `TestServeBoundSeversInFlightResponses_6827` (30.01s,
+  `tls_stale_cert_6827_test.go:1393`, "serveBound did not return after ctx
+  cancellation"); rc=1. Both fail on the JOIN — with no `Shutdown` the HTTPS
+  `Serve` goroutine is never unblocked and `wg.Wait()` never returns — so
+  neither reaches a severing assertion. (B) REVERTING it to a bare `Shutdown`
+  (deadline, no `Close`) reds ONE, `TestServeBoundSeversInFlightResponses_6827`
+  alone (3.56s, `tls_stale_cert_6827_test.go:1404`, HTTPS connection "still
+  OPEN 3s later"), with `TestRunGracefulShutdownClosesBothListeners` PASSING;
+  rc=1. So the "listener CLOSES vs response SEVERED" distinction the paragraph
+  drew is real but was attached to the wrong mutation — it is cell B that
+  isolates severing. The pre-round-11 claims are kept, in the past tense, as
+  what they were: measurements of a tree in which the cell passed `nil` for
+  `httpsLn`. Also recorded why this class of claim rots: a "reds only X"
+  statement is about the rest of the suite and no test can assert it, so the
+  mutation + head + cells must be written down instead of a bare count.
+  Markdown only — `pkg/api/server.go` was mutated for the measurement and
+  restored byte-identical (`git status` clean before commit); no runtime
+  change, nothing reaches the helper binary, no smoke owed.
+- **File(s)**: pkg/api/README.md, _Log.md
 ## #7034 + #7035 — both false clauses of the NAT 2+-action rejection sentence
 
 - **Timestamp**: 2026-08-21
