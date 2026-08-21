@@ -1,3 +1,85 @@
+## 2026-08-05 — #6894 round 3: the log-gating item was PARTIAL, and the count that proved it was unreproducible
+
+- **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
+- **Action**: Correct four claims the Codex gate refuted; file the real residue
+  as #6903. Comment-only in Go — `git diff -U0 -- '*.go'` shows zero non-comment
+  changed lines.
+- **File(s)**: `pkg/dataplane/compiler_validate_4960.go`, `_Log.md`
+
+Codex returned MERGE-NEEDS-MINOR with no runtime findings. What it refuted:
+
+1. **"the pre-pass log duplication is suppressed via `isValidationPass(dp)`"**
+   is PARTIAL, not closed. The gate suppresses the sites it is wired into; a
+   large inventory inside the covered phases still logs unconditionally and
+   still emits twice — applications, the NAT/DNAT/static-NAT/NPTv6/NAT64
+   families, and flow timeouts. Measured on a composite config: 25 INFO/WARN
+   records, eleven distinct covered-phase records appearing twice. Reproduction:
+   make `failLaterPhaseConfig()` valid, set `UDPSessionTimeout = 30`, and one
+   `udp=30` record prints twice. Filed as **#6903**; the round-2 log entry now
+   says PARTIAL and the doc comment carries the scope limit plus the issue
+   pointer, so nobody reads it as "duplicates are impossible".
+
+2. **"measured 15 -> 22 lines"** was unbound. The fixture that produced those
+   numbers was never recorded, so the claim is unreproducible — the likely
+   `idProbeConfig()` candidate now emits 12. Deleted rather than re-measured: a
+   count assertion has to ship with the fixture that produces it, which is what
+   #6903 says to do if a count is wanted.
+
+3. **"validateFilterProtocols is the FIRST statement of Phase 10"** is
+   literally false — a local map init precedes it. Corrected to "first FALLIBLE
+   statement", which is the property the hoist actually depends on.
+
+4. **`dp.BumpFIBGeneration()`** sat outside both the phase table and the
+   exclusion prose while being able to return an error. Named in the exclusion
+   prose as out-of-scope-by-construction (the caller discards it under the
+   fire-and-forget contract, so it cannot produce a returned CompileConfig
+   error) so the next coverage audit does not have to rediscover it.
+
+Also documented, not changed: hoisting the filter row changes operator-visible
+diagnostic PRECEDENCE. A config carrying both an unknown screen-profile ref and
+`from protocol bogus-proto` now reports the filter error where it previously
+reported `compile zones: screen profile ... not found`. Both are hard errors
+aborting the same apply — nothing reaches the dataplane either way — so only the
+message changes. The comment says not to "fix" it by moving the row later,
+because the ordering is what keeps the mutation point clean.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
+`gofmt -l` clean; Go diff verified comment-only.
+
+## 2026-08-05 — #6894 round 2: the coverage count went stale again, in the fix for it
+
+- **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
+- **Action**: The round-1 fold closed four of five gate items — the table-contents
+  assertion exists (`TestValidationPhaseTableMatchesDocumentedCoverage_4960` pins
+  length AND name order), `validateFilterProtocols` is hoisted in and is
+  idempotent (reads `cfg` only), the pre-pass log duplication is suppressed via
+  `isValidationPass(dp)` **at the sites it is wired into — see the round-3 entry
+  above: that item is PARTIAL, not closed**, and the test fixture now uses
+  synthetic names
+  (`xpft4960a`/`xpft4960b`) behind a `skipIfCouldMutateAHost` root guard.
+  The fifth item came back: `compiler_validate_4960.go` still said **"Eleven of
+  the thirteen fallible post-zones phases"** while the table it introduces now
+  holds **twelve** — the filter-protocols hoist added a row and the header was
+  not updated. That is the third time this campaign a fold has grown a list and
+  left its count behind, and the second time on this exact class of comment.
+  Fixed by removing the count rather than correcting it. Prose now defers to the
+  table as the authority and says so explicitly, pointing at the test that makes
+  a silent row deletion impossible. A number in a comment is a coverage claim; a
+  pointer to an asserted table is not.
+  Also restated the exclusion accurately: it is `compilePortMirroring` entirely
+  plus all of `compileFirewallFilters` EXCEPT its cfg-pure prefix, not "two
+  phases" — the hoist made that sentence wrong in a second way that a numeral
+  swap would not have caught.
+  And separated the two kinds of binding, because the gate measured them and the
+  file did not distinguish them: the table test binds the SET (no row can vanish),
+  while behavioural fixtures bind that a row actually rejects pre-mutation, and
+  there are exactly two of those (`applications`, `nat`). The remaining rows are
+  set-bound only. That is the intended trade and is now written down instead of
+  being inferred.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md
+- **Validation**: comment-only — production diff filtered to non-comment lines is
+  empty. `go build ./...` rc=0; `go test ./pkg/dataplane/ -count=1` rc=0;
+  `gofmt -l` clean.
 ## 2026-08-06 — #5798 round 2: three things an association HIT was still inheriting
 
 - **Timestamp**: 2026-08-06 (fix/5798-nat64-frag-scope, PR #6835)
@@ -82040,6 +82122,88 @@ diff markers and filtering. `cargo check` exit 0.
   pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
+- **Timestamp**: 2026-08-05 20:41
+- **Action**: #4960 (bounded increment) — `CompileConfig` runs at APPLY time,
+  after commit already succeeded (`pkg/configstore` has ZERO `pkg/dataplane`
+  imports, so `commit check` validates only the pure `pkg/config.CompileConfig`;
+  the two share a name). Phase 2 `compileZones` then performs the first and only
+  destructive host netlink mutation — `ensureVLANSubInterface` (create + link
+  up) and `reconcileInterfaceAddresses` (delete + add) — and every later phase
+  is a bare `return nil, err` with no undo. `userspace/flow.go:139` documents
+  the reachable input class: a malformed application-set reference or app_id
+  overflow (#3438 H4) makes compileApplications (Phase 4) hard-error and abort
+  the apply, leaving VLANs created and addresses reconciled on the live host.
+  Added `validateBeforeMutate`: runs the eleven fallible HOST-PURE phases
+  against a `discardingDataPlane` BEFORE `compileZones`. ADDITIVE, not a
+  reorder — moving the real phases ahead of Phase 2 would be a silent
+  fail-open, because `compileFirewallFilters`/`compilePortMirroring` resolve
+  VLAN SUB-INTERFACE names that only exist because Phase 2 created them and a
+  miss there is `slog.Warn; continue`, so filters would go unassigned on EVERY
+  apply. Excluded those two phases from the pre-pass for the same reason and
+  named the residual. Also factored CompileConfig's inline result init into a
+  shared `newValidationResult()` so the two passes cannot drift.
+  Correction to prior art: `research/4960-apply-txn` §4.4 says destructive host
+  mutation is in "exactly two phases — compileZones and compilePortMirroring
+  (netlink at :1758/:1811)". Verified wrong at 86927d23c: compilePortMirroring
+  (1704-1748) contains NO `netlink.` reference — only `dp.ClearMirrorConfigs`/
+  `SetMirrorConfig` map writes — and :1758/:1816 are `netlink.LinkByName` READS
+  inside `getPermAddr`/`getOriginalKernelName`. It is ONE phase, which is why a
+  single pre-pass covers all host mutation. §4.4's middle-phase purity claim
+  agrees with my independent enumeration.
+  Validation: `TestNoHostMutationWhenALaterPhaseFails_4960` (host-unmutated
+  property), `TestValidConfigStillReachesZoneCompile_4960` (control — a valid
+  config still reaches compileZones), `TestPrePassDoesNotPerturbIDAssignment_4960`
+  (two passes assign byte-identical IDs incl. the #5099 NAT-counter family;
+  proven sensitive by injecting drift AFTER finalizeNATCounterIDs' re-derive).
+  Revert cell: removing the pre-pass REDs the property test with "compileZones
+  RAN before the failing phase was caught (2 SetZoneConfig calls)".
+  `go test ./...` rc=0.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+- **Timestamp**: 2026-08-05 21:58
+- **Action**: #4960 / PR #6894 gate fold r1 — five items. (F1, the one that
+  mattered) The coverage claim was asserted by NOTHING: dropping 10 of 11 phase
+  rows left the whole package suite green, because the single binding fixture
+  used an unresolvable APPLICATION name and pinned exactly one row. The call
+  site was bound; the table's CONTENTS were not. Hoisted the literal into
+  `validationPhases()` so it can be asserted over, added
+  `TestValidationPhaseTableMatchesDocumentedCoverage_4960` (length + ordered
+  name set vs the doc comment) and a SECOND binding fixture from a different
+  phase (`TestNoHostMutationWhenNATPhaseFails_4960`, unresolvable SNAT pool).
+  (F2) `validateFilterProtocols` — the first statement of Phase 10 and 100%
+  cfg-pure (no result, no dp, no logging) — is now a pre-pass row, taking
+  coverage to TWELVE of thirteen. It is ADDED, not moved: the in-place call
+  stays, so a config where compileFirewallFilters succeeds is bit-identical.
+  It was the sole config-shape hard error still reachable post-mutation, via the
+  TOLERANT load paths. (F3) The covered phases logged twice per compile (15 ->
+  22 INFO lines) and `flow config compiled` printed lo0_filter_v4=65535 from the
+  pre-pass then =0 from the real pass — an operator reading NO then YES for one
+  apply. Added `isValidationPass(dp)` (marker on the DATAPLANE, because
+  compileDefaultPolicy/compileFlowTimeouts take no result) and gated 8 log
+  sites. (F4) The test fixture used `ge-0-0-0.50`/`ge-0-0-1.0`, byte-identical
+  to real interfaces on the standalone VM and loss node 0, and this is the first
+  pkg/dataplane test to drive compileZones to completion — as root it would have
+  run LinkAdd/AddrDel/ethtool//proc/sys writes. Renamed to `xpft4960a/b` and
+  added a root+live-link skip belt. (F5) Three citations corrected: the
+  parenthetical understated the mutation set (LinkDel/LinkSetDown via
+  stripUnmanagedInterfaces); the shim was cited as "the LegacyDataPlaneAdapter
+  idiom" when it is the INVERSION (that one embeds a NON-nil dataplane and
+  delegates; this one leaves it nil so un-overridden methods panic) — now says
+  so and names `TestPrePassShimCoversTheCalledSurface_4960` as what enforces
+  completeness, since nothing does at compile time; and the ID probe's "same
+  order as CompileConfig" was not literally true.
+  Cells: dropping 10 of 12 rows REDs BOTH the table assertion ("covers 2 phases
+  but the documented coverage is 12") and the new NAT fixture ("host was mutated
+  before the NAT phase failed: 2 SetZoneConfig"). Gates: go build rc=0, go vet
+  rc=0, go test ./... rc=0, go test ./pkg/refactoraudit/ rc=0 (6 top-level, 0
+  SKIP).
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_iface.go, _Log.md
 
 - **Timestamp**: 2026-08-05
 - **Action**: #5797 invariant 7 — make an unmappable syslog facility VISIBLE and
@@ -82420,6 +82584,120 @@ diff markers and filtering. `cargo check` exit 0.
   pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
   pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
 
+## 2026-08-06 — #4960 r2: stop the negative control from stripping a root host's interfaces (#6894 F1/F2/F3)
+- **Timestamp**: 2026-08-06
+- **Action**: F1 (MAJOR, test safety) —
+  `TestValidConfigStillReachesZoneCompile_4960` drove `CompileConfig` all the
+  way through `compileZones`, whose tail `stripUnmanagedInterfaces` enumerates
+  the REAL host and runs `netlink.AddrDel` + `netlink.LinkSetDown` (and
+  `LinkDel` for a bond) on every unmanaged link. Confirmed firsthand with an
+  instrumented panic at `compiler_iface.go:1255`: it fired on `eno2` via
+  `compiler_validate_4960_test.go:117`. Unprivileged that is EPERM; as root it
+  black-holes host networking. Fixed with a #5268-style tripwire —
+  `recordingDP.SetZoneConfig` counts the call and then returns
+  `errStopBeforeHostReconcile`, which halts `programZoneMaps` before
+  `mapZoneInterface` and therefore before `ensureVLANSubInterface`,
+  `reconcileInterfaceAddresses`, the ethtool/procfs writes and the strip.
+  The control stays live: `errors.Is` on that sentinel is reachable only after
+  the pre-pass has PASSED the config. Removed `skipIfCouldMutateAHost` — it
+  guarded only the two fixture names while the exposure was the host's other
+  50+ links, and the tripwire subsumes it unconditionally at any euid.
+  F2 — named the three fallible steps that run AFTER the mutation and BEFORE
+  the snapshot publishes (`preflightCheckIfindexCaps`, structurally
+  unhoistable; `attachUserspaceShimXDP`, the reachable one;
+  `buildSnapshotWithSchedulerStateAndNATCounters`), so "bounded" has a stated
+  boundary. F3 — `TestValidationPhaseTableMatchesDocumentedCoverage_4960`
+  asserts only `got[i].name`, so it binds INDEX -> NAME and nothing else;
+  added `TestEachValidationPhaseRowRunsItsOwnCompiler_4960` to bind
+  NAME -> BODY for all twelve rows.
+- **Validation**: `go build ./...` exit 0. `go test ./pkg/dataplane/...
+  ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. All runs at uid 1000.
+  F1 proof: with the panic probe armed in `stripUnmanagedInterfaces` the WHOLE
+  `pkg/dataplane` package passes; neutralising the tripwire (`return nil`) with
+  the probe still armed re-fires it on `eno2`. Pre-pass revert (move
+  `validateBeforeMutate` after `compileZones`) reds both no-mutation tests as
+  ASSERTIONS — "compileZones RAN before the failing phase was caught (1
+  SetZoneConfig calls)" — and the revert path is itself now host-safe.
+  F3 proof: gutting the ten unbound row bodies to `func() error { return nil }`
+  reds exactly those ten subtests ("row %q accepted an input its own compiler
+  rejects"); `applications` and `nat` stay green, and
+  `TestValidationPhaseTableMatchesDocumentedCoverage_4960` stays GREEN through
+  it, which is the gap. Swapping the `static nat` / `nat64` bodies with names
+  intact reds both on the `validate <name>: ` prefix.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go, _Log.md
+
+## 2026-08-06 — #4960 pre-pass: cover the shim's whole write surface (#6894 r3)
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r3 gate findings on PR #6894.
+  F1 (MAJOR) — the completeness guard was blind to nine of the surfaces its
+  doc comment claimed it enforced. `discardingDataPlane` embeds a NIL
+  `DataPlane`, so an un-overridden method nil-panics, and
+  `TestPrePassShimCoversTheCalledSurface_4960` is the only thing enforcing the
+  override set. Measured by instrumenting all 40 overrides with a name
+  recorder: that test reached 28/40, and `SetDNATEntry`, `SetDNATEntryV6`,
+  `SetNAT64Config`, `SetNATPoolIPV6`, `SetNPTv6Rule`, `SetSNATEgressIP`,
+  `SetSNATRuleV6`, `SetStaticNATEntryV4`, `SetStaticNATEntryV6` were reached by
+  NO test in the package — `idProbeConfig` reached every PHASE but not every
+  phase's WRITE SURFACE. Widened the fixture: destination NAT (v4+v6), static
+  NAT (v4+v6), an NPTv6 rule, a NAT64 rule-set, an IPv6 source pool with its v6
+  SNAT rule, an interface-SNAT rule and a security policy. Reached set is now
+  39/40; the 40th, `IsLoaded`, is called by `CompileConfig` itself
+  (compiler.go:182) above the pre-pass, and is bound by the CompileConfig-
+  driving tests. Renamed the fixture's zone interfaces off the vSRX scheme —
+  the interface list became load-bearing here for the first time, and
+  `ge-0-0-1` is a real link on the standalone VM and on loss node 0.
+  `SetSNATEgressIP` is the one covered write that is not a pure function of
+  cfg (compileNAT resolves the egress member through
+  `result.cachedInterfaceByName` and soft-skips on a miss), so added
+  `validateBeforeMutateWithResult` and seeded a SYNTHETIC ifCache entry rather
+  than naming a live link — a resolving name is one `CompileConfig` call away
+  from reconciling a real interface's addresses, the r2 F1 hazard.
+  F2 (MINOR) — corrected a claim this file has now made twice. r2 said
+  `vlanIfaceInfoCall == 0` / `ifaceSetupCalls == 0` "turn the safety property
+  into a runtime assertion instead of a structural argument". They do not: both
+  read 0 with AND without the tripwire, because `mapZoneInterface` soft-skips
+  at compiler_iface.go:450-454 (xpft4960a/xpft4960b exist on no host).
+  `zoneConfigCalls` is what distinguishes. Reworded `recordingDP`,
+  `assertNoHostMutation` and the control test's inner assertion to say so; the
+  counters stay as defence in depth and must NOT be made live with real
+  interface names.
+  F3 (MINOR) — `pkg/dataplane/README.md` listed the compile phases without the
+  pre-pass, which can reject a config on its own and changes which error an
+  operator sees when a config carries both a Phase-2 fault and a bad filter
+  protocol. Named it, and pointed at compiler_validate_4960.go.
+  F4 (NIT) — "any dp passed here MUST embed discardingDataPlane" was a note
+  with nothing enforcing it; it is now an `isValidationPass` guard at the top
+  of the shared body, ahead of the phase loop.
+- **Validation**: uid 1000 throughout. `go build ./...` exit 0.
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. `gofmt -l` on the three Go
+  files touched: clean (the seven files it does list are unformatted at the PR
+  head too).
+  F1 proof, 9x2 matrix, each mutation grepped back out of the file and the file
+  restored byte-identical after every cell: deleting any ONE of the nine
+  overrides at PR head 5fcb494d9 leaves the WHOLE `pkg/dataplane` package GREEN
+  (9/9, rc=0); at this head all nine RED with a nil-pointer panic at their own
+  call site — `SetDNATEntry` compiler_nat.go:900, `SetDNATEntryV6` :918,
+  `SetNAT64Config` :1305, `SetNATPoolIPV6` :579, `SetNPTv6Rule` :1161,
+  `SetSNATEgressIP` :424, `SetSNATRuleV6` :704, `SetStaticNATEntryV4` :1020,
+  `SetStaticNATEntryV6` :1032. Deleting `IsLoaded` reds
+  `TestNoHostMutationWhenALaterPhaseFails_4960`, so all 40 are bound.
+  F2 proof: driving `programZoneMaps` directly (it does NOT contain the
+  `stripUnmanagedInterfaces` tail, which lives in `compileZones` at
+  compiler_iface.go:287, so the probe cannot reach the host-stripping path) —
+  WITH tripwire `zoneConfigCalls=1 vlanIfaceInfoCall=0 ifaceSetupCalls=0`,
+  WITHOUT `zoneConfigCalls=2 vlanIfaceInfoCall=0 ifaceSetupCalls=0`.
+  F4 proof, both ASSERTIONS not panics: deleting the guard reds
+  `TestPrePassRejectsADataPlaneWithoutTheMarker_4960` on "the pre-pass accepted
+  a dataplane that does not carry the discardingDataPlane marker"; MOVING the
+  guard to after the phase loop reds it on "the pre-pass wrote 6 address-book
+  entries to a non-marker dataplane before rejecting it".
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/README.md,
+  _Log.md
 ## 2026-08-06 — #6871 gate fold: bind the production adapter, restore the aborted-cycle recovery
 
 - **Timestamp**: 2026-08-06
@@ -83224,6 +83502,413 @@ paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
+## 2026-08-06 — #4960 ID probe: run the phases it claims to (#6894 r4)
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r4 gate finding on PR #6894. r3 widened `idProbeConfig`
+  for the SHIM-coverage test; the ID DRIVER did not widen with it, so three of
+  the dimensions `TestPrePassDoesNotPerturbIDAssignment_4960` compares were
+  structurally unable to differ. `compileIDsOnce` ran address book ->
+  applications -> NAT -> finalize, while the real pre-pass runs policies, nat,
+  static nat and nat64. `{}` DeepEquals `{}`, so each omission passed silently.
+  Measured before the change: `implicitSets len=0`; `PoolIDs len=3
+  [pool-a pool-b pool-v6]` with `pool-nat64` absent; `NATCounterIDs len=5`
+  with no `static/` key at all.
+  Fix. The driver now runs CompileConfig Phases 3, 4, 5, 6, 6.5, the
+  finalization and 6.6 IN PRODUCTION ORDER — `compilePolicies`,
+  `compileStaticNAT`, `finalizeNATCounterIDs`, `compileNAT64`. `compileNPTv6`
+  (6.7) stays out: it takes no `*CompileResult` and assigns no IDs.
+  `implicitSets` needed a SECOND, fixture-side half: `resolveAddrList` filters
+  `any` out entirely and returns a lone surviving name through the direct-ID
+  branch, so the old policy's `["any"]` / `["servers"]` lists built no set even
+  once `compilePolicies` ran. The fixture's `p-multi` policy now carries
+  genuinely multi-valued lists (`web`+`db`, `dns`+`servers`); `p-single` is
+  kept alongside as the negative control for the two shapes that build nothing.
+  Assertions. `NextPoolID` joins the compared set (a scalar: an off-by-one in
+  the NAT64 auto-assign branch leaves every map identical while the next pool
+  collides). Non-vacuity assertions now name the SPECIFIC entries expected —
+  one counter key per NAT type including both static ones, both implicit-set
+  cache keys, `pool-nat64` in `PoolIDs`, and `NextPoolID > pool-nat64`'s id —
+  rather than only checking a map is non-empty, which a partial regression
+  would still satisfy.
+  The finalize POSITION is asserted as a PRECONDITION, not through the output.
+  Measured: moving `finalizeNATCounterIDs` above `compileStaticNAT` left the
+  whole test GREEN, because finalization only changes an id under a base-hash
+  collision and this fixture has none. What the position buys is that the
+  sorted re-derivation sees every NAT type's keys, so the driver now asserts
+  exactly that, with the expectation derived from the CONFIG
+  (`staticNATCounterKeys`) and compared against the COMPILER's map.
+- **Validation**: uid 1000 throughout. `go build ./...` exit 0.
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. `go vet ./pkg/dataplane/`
+  exit 0. `gofmt -l` on the one file touched: clean. No hangs.
+  BEFORE -> AFTER: `implicitSets` 0 -> 2 (`db,web:5`, `dns,servers:6`);
+  `PoolIDs` 3 -> 4 (`pool-nat64` present), `NextPoolID` 4;
+  `NATCounterIDs` 5 -> 7 (`static/rs-static/s-v4`, `static/rs-static/s-v6`).
+  PERTURBATION PROOF, each injecting a PROCESS-GLOBAL drift into one
+  ID-assignment site — the exact state class a discarded double-compile would
+  expose — each grepped back in before the run and every file restored
+  byte-identical after: drift in `resolveAddrList`'s implicit-set id, in
+  `finalizeNATCounterIDs` for `static/`-prefixed keys, and in `compileNAT64`'s
+  auto-assign allocator. At head bf7b0291e all three leave the WHOLE
+  `pkg/dataplane` package GREEN. At this head all three RED on their own
+  dimension: "implicitSets differs between pass 1 and pass 2",
+  "NATCounterIDs differs ...", "PoolIDs differs ...".
+  NON-VACUITY PROOF, one driver/fixture knockout per cell, all RED with their
+  own message: drop `compilePolicies` -> `implicit address-set "db,web" is
+  absent`; drop `compileStaticNAT` -> `finalizeNATCounterIDs is about to run
+  without "static/rs-static/s-v4" in the key set`; drop `compileNAT64` ->
+  `pool-nat64 is absent from PoolIDs`; move the finalize above static NAT ->
+  same precondition message (GREEN before this assertion existed); revert
+  `p-multi` to the single/`any` shapes -> `implicit address-set "db,web" is
+  absent`, which is the fixture half of the fix. Neutering
+  `staticNATCounterKeys` AND dropping `compileStaticNAT` together reds the
+  hardcoded key assertion instead, so it is not dead weight behind the
+  precondition.
+  DELETE-ONE-OVERRIDE MATRIX RE-RUN, all 40 `discardingDataPlane` overrides
+  against the whole package: 40 RED / 0 GREEN / 0 SKIP. Widening the ID driver
+  did not weaken the shim-coverage test. 16 red via
+  `TestPrePassShimCoversTheCalledSurface_4960`; the rest via
+  `TestValidConfigStillReachesZoneCompile_4960` /
+  `TestNoHostMutationWhenALaterPhaseFails_4960`, `IsLoaded` among them
+  (compiler.go:182).
+  No doc change: this round is test-only — no production file is touched and
+  no compile behaviour changes, so the `pkg/dataplane/README.md` pre-pass
+  entry added in r3 still describes the shipped behaviour exactly.
+- **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r5 gate finding on PR #6894. r4 fixed the ID-probe
+  columns that were vacuous because the driver never RAN the phase that
+  populates them; `ScreenIDs` failed one level lower. The driver
+  RE-IMPLEMENTED Phase 1.5 instead of calling production, so that column
+  compared `compileIDsOnce`'s own loop against itself. Three ALPHA-EQUIVALENT
+  copies of the screen-ID prelude existed — `CompileConfig` (compiler.go:245-254),
+  `validateBeforeMutateWithResult` (compiler_validate_4960.go:254-263), and
+  the driver (compiler_idprobe_4960_test.go:315-324). (Corrected in r6: this
+  said "verbatim ... token-identical", which is literally false — the driver's
+  copy used the locals `names`/`n` where production used `screenNames`/`name`.
+  The loops were alpha-equivalent and behaviour-identical, so the conclusion
+  stands, but the wording overstated what was measured.) Same `uint16(1)`
+  seed, same `cfg.Security.Screen` source,
+  same `sort.Strings`, same 1-based increment, all three against a
+  `newValidationResult()`-allocated map behind their own nil-cfg guard.
+  Collapsing them is therefore a cleanup, not a behaviour change.
+  Extracted `assignScreenIDs(result, cfg)` next to `assignZoneIDs` in
+  compiler.go and pointed all three sites at it; dropped the now-unused
+  `"sort"` import from compiler_validate_4960.go (it had exactly one use, the
+  prelude — compiler.go keeps its four, the idprobe test keeps its
+  `sortedKeys` use). Added two per-column non-emptiness floors: `ScreenIDs`
+  (naming `alpha`, `mid`, `zeta`) and `AddrIDs`, which had been protected only
+  BY ACCIDENT — the implicitSets assertion demands `db,web` / `dns,servers`,
+  which cannot exist without their AddrIDs entries, but that covers only ONE
+  of the map's two writers. The floor now names entries from both:
+  compileAddressBook's `db dns servers web` and compileNAT ->
+  resolveSNATMatchAddr's `_snat_match_10.1.0.0/16`, `_snat_match_10.2.0.0/16`,
+  `_snat_match_2001:db8:1::/64`. Measured full key set before writing the
+  floor, not assumed.
+  MUTATION GRID, whole `pkg/dataplane` package, `-count=1`, every mutation
+  applied only inside a throwaway `git archive` extract and restored by
+  re-extraction (never reverse-substitution); the worktree tree hash was
+  verified byte-identical before and after the grid. Each cell run at BOTH the
+  base commit (4ae41d85d) and this head, so every claim is a measured flip
+  rather than a one-sided red:
+  D/E — seed the screen-ID assignment from a package-level counter, so pass 1
+  and pass 2 differ (the cross-pass-state defect class this test names in its
+  own doc comment). At base, applied to the compiler.go inline prelude: GREEN.
+  At base, applied to the compiler_validate_4960.go inline prelude: GREEN.
+  Both production sites could drift with the suite passing. At this head,
+  applied inside `assignScreenIDs`: RED, `ScreenIDs differs between pass 1 and
+  pass 2` (compiler_idprobe_4960_test.go:396). D and E are one cell now
+  because there is one site.
+  F — fixture drops the three screen profiles: GREEN at base (no floor
+  existed; `{}` DeepEquals `{}`), RED at this head with three messages,
+  `screen profile "alpha"/"mid"/"zeta" is absent from ScreenIDs`. Note the
+  DeepEqual stays quiet in this cell — the floor is what fires, which is the
+  point of having it.
+  G (negative control) — drift `assignZoneIDs`: RED, `ZoneIDs differs between
+  pass 1 and pass 2`. The harness can red on a dimension this change did not
+  touch.
+  H — delete `result.AddrIDs[synthName] = addrID` from resolveSNATMatchAddr
+  (compiler_nat.go:36), emptying the compileNAT half of AddrIDs: GREEN at base
+  — the whole package passed with that writer silently contributing nothing,
+  confirming the by-accident protection — and RED at this head with three
+  messages, `address id "_snat_match_..." is absent`.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` rc=0;
+  `go test ./pkg/refactoraudit/ -count=1` rc=0 (the new production function in
+  compiler.go does not trip the heatmap gate); `go test ./pkg/dataplane/ -run
+  4960 -count=10 -race` rc=0. `gofmt -l` clean on all three touched files.
+  No doc change: no live module doc describes the screen-ID prelude or its
+  call sites (grep over docs/ finds only archived review transcripts and a
+  `docs/config-schema.md` reference to `assignZoneIDs` about STABLE ZONE ids,
+  which this change does not touch). The rationale for the single site is
+  carried in the `assignScreenIDs` doc comment and the driver's, which is
+  where the next person reading either would look. The
+  `pkg/dataplane/README.md` pre-pass entry added in r3 still describes the
+  shipped behaviour exactly — compile behaviour is unchanged.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: Narrow an overclaim in the #6894 r5 comments. COMMENT-ONLY — no
+  production or test behaviour changes.
+  `TestPrePassDoesNotPerturbIDAssignment_4960` compares two passes of the same
+  phases over the same config, so what it detects is perturbation ACROSS
+  passes: state outliving a `CompileResult` (a process-global, a counter on the
+  DataPlane, an interned table), which is the #4960 question because the
+  pre-pass compiles twice and discards the first result. It does NOT detect
+  incorrect assignment WITHIN a pass — anything applied identically to both
+  passes (a wrong seed, a wrong sort key, a wrong id formula) yields two
+  identical maps and stays green by construction. The r5 wording said the
+  ScreenIDs column "could not observe a production drift", which claims the
+  stronger property; it could not observe a CROSS-PASS drift.
+  Reworded three places: `assignScreenIDs`'s doc (compiler.go) now says
+  cross-pass and describes the measured mutation as seeding the assignment from
+  a package-level counter rather than the vaguer "drifting"; `compileIDsOnce`'s
+  doc likewise; and a new paragraph in `compileIDsOnce` states the general form
+  ONCE, explicitly scoped to EVERY column rather than to ScreenIDs, since a
+  reader who takes a green as "the ids are right" is misreading all of them.
+  That paragraph also separates the third mechanism in this test so the three
+  are not conflated: the DeepEqual binds cross-pass stability, the phase list
+  binds which dimensions exist at all, and the non-vacuity floors only keep a
+  column from being an empty-vs-empty comparison.
+  COMMENT-ONLY PROOF, stronger than reading the diff: both touched files were
+  compared against HEAD (420e37c1e) with blank lines and whole-line `//`
+  comments stripped from each side. compiler.go 1377 non-comment lines
+  identical; compiler_idprobe_4960_test.go 330 identical. That covers the
+  floors, the driver's phase list and its order, `assignScreenIDs`'s body, and
+  all three call sites — none moved.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... -count=1` rc=0 (4 packages ok); `gofmt -l` clean
+  on both touched files. The r5 mutation grid is not re-run and does not need
+  to be: no line it exercises changed.
+  No doc change, for the same reason as r5 — no live module doc describes the
+  screen-ID prelude, and this round alters only comment prose.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+## 2026-08-06 — #6894 fold r6 (gate BLOCKER + three text corrections)
+
+- **Timestamp**: 2026-08-06 07:40 PDT
+- **Action**: BLOCKER — a stale zone `screen-profile` reference escaped the
+  #4960 validate-before-mutate pre-pass and aborted `compileZones` MID-LOOP.
+  `programZoneMaps` ranges `cfg.Security.Zones` (a Go MAP) and per zone calls
+  `buildZoneConfig` (which resolves the reference) then `SetZoneConfig`, then
+  iterates that zone's interfaces into `mapZoneInterface` where the netlink and
+  `/proc/sys` writes live. An unknown reference on a zone visited second or
+  later therefore aborts AFTER earlier zones are already programmed — the
+  half-reconfigured host #4960 exists to prevent, via the mechanism it claims
+  to close. Added the pure `validateZoneScreenReferences`, called at the TOP of
+  `compileZones` (so no zone can mutate before every reference is checked,
+  whatever the caller did) and registered as the `zone screen references`
+  pre-pass row (so the pre-pass reports it with sibling precedence).
+- **File(s)**: pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go (new), _Log.md
+- **Validation**: go build ./... rc=0; go vet ./pkg/dataplane rc=0; go test
+  ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race rc=0; go test
+  ./pkg/refactoraudit/ -count=1 rc=0; gofmt clean on every touched file.
+- **NOTE — the generalising question, answered.** There are TWO config-shaped
+  aborts inside the zone loop, not one, and a fix hoisting only the first would
+  still abort mid-loop: `buildZoneConfig` (compiler_iface.go:364) resolves the
+  reference against `result.ScreenIDs` (the COMPILED id map), and
+  `mapZoneInterface` (compiler_iface.go:584) resolves the SAME reference against
+  `cfg.Security.Screen` (the CONFIG map) on the VLAN sub-interface path, after
+  several host mutations. The sweep checks BOTH sources. Every other error
+  return in that loop — `set vlan_iface_info`, `set zone`, `add tx port`, and
+  the address-reconcile tail — is a dataplane/netlink I/O failure, not a
+  config-shape one, so it is not pre-validatable against a discarding shim and
+  is out of scope for this class.
+- **NOTE — the revert probe is multi-trial ON PURPOSE.** Map iteration order is
+  randomised per range, so with the fix reverted the bad zone is visited first
+  about 1/N of the time and the compile aborts before any mutation — which
+  looks exactly like a pass. A single-run probe would be FLAKY, reporting green
+  on broken code a fraction of the time. The fixture uses 8 valid
+  interface-carrying zones + 1 offender and runs 24 trials: a reverted build
+  slips through with probability 8^-24. [CORRECTED in #6894 r5 F3: that
+  denominator counted only the eight VALID zones, and the model assumed
+  uniformity. The map holds NINE keys and Go's range is not uniform over which
+  lands first. Measured over 200,000 single-trial compiles with both halves
+  reverted: 12632/200000 = 0.0632 per trial, so 24 trials give ~1e-29, not
+  8^-24 ~ 2e-22. The guard is stronger than this entry claimed, but the number
+  was not measured when written.] Measured with BOTH halves of the fix
+  removed: `go vet ./pkg/dataplane` rc=0 (an ASSERTION failure, not a build
+  break) and `go test -run 'StaleZoneScreenRef|ValidZoneScreenRef|
+  ZoneScreenSweepSkips'` rc=1, failing at "compileZones programmed 1 zone(s)
+  before rejecting the stale screen reference" on trial 0. The three over-reach
+  guards stayed GREEN under that revert. Restored and `cmp`-verified against a
+  pristine copy of both production files.
+- **NOTE — three text corrections, all to claims that overstated.**
+  (1) `compiler_validate_4960.go` called filter protocols "the ONE config-shape
+  hard error still reachable after the mutation point" and, in the same block,
+  acknowledged the unknown screen reference while asserting "nothing reaches
+  the dataplane either way". Both could not be true; that self-contradiction is
+  how the blocker survived four rounds. Corrected, with a note not to restore
+  a bare count. (2) The ID-stability comment offered "a counter on the
+  DataPlane" as an example of state the driver could observe — inapt, because
+  `compileIDsOnce` constructs a fresh stateless `idProbeDP{}` per invocation;
+  replaced with "a package-level sequence" and the reason recorded. (3) The r5
+  entry above called the three screen-ID preludes "verbatim ... token-identical";
+  the driver's copy used the locals `names`/`n` where production used
+  `screenNames`/`name`, so they were ALPHA-EQUIVALENT. The conclusion stands;
+  the wording did not. Also corrected the `AddrIDs` floor comment, which named
+  the synthetic writer as the "interface-SNAT branch" when the pinned keys come
+  from named-pool rules.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 5. Codex returned MERGE-NEEDS-MAJOR at `b0c74194c`
+  with six findings. Two of them invert on measurement, and this entry records
+  why rather than quietly not doing them.
+  **F1 (raised as BLOCKING) is a FALSE POSITIVE, and its prescribed fix would
+  be a regression.** The claim was that `discardingDataPlane.SetAddressBookEntry`
+  returns nil unconditionally while "the real backend" calls `net.ParseCIDR`
+  (`maps_policy.go`), so an empty address-book prefix could clear the pre-pass,
+  let compileZones mutate the host, and then fail. That `ParseCIDR` belongs to
+  `(*dataplane.Manager)` — the RETIRED eBPF backend. `NewDataPlane` and
+  `NewRuntimeDataPlane` both refuse `TypeEBPF` with `ErrEBPFBackendRetired`
+  (`dataplane.go`), so no apply reaches it. Production passes
+  `userspaceShimCompileDataplane` (`loader.go`), via
+  `userspace.Manager.ApplyConfig -> .Compile -> bpfShim.CompileUserspaceShim`.
+  Measured across the whole surface, not spot-checked: all 55 shim methods have
+  a bare `return nil`/empty body, and all 38 methods shared with the fake are
+  byte-identical. So `compileAddressBook` cannot fail from an empty `Value` on
+  the only supported runtime path. Teaching the fake to ParseCIDR would make the
+  PRE-PASS STRICTER than production and reject at commit what the runtime
+  accepts — empty `value` is a deliberate WARNING (#2229), and this gate has
+  already swung through over-rejection twice.
+  Instead of the prescribed change, added
+  `TestPrePassFakeIsNoMorePermissiveThanProduction_4960`: an AST scan asserting
+  every `userspaceShimCompileDataplane` method is still a no-op, with a floor
+  (>=40 methods seen) so a rename cannot make the scan vacuous. That turns the
+  one-off measurement into a standing guard and catches the REAL version of the
+  concern — someone adding a validating method to the production shim.
+  PROVEN TO FIRE: giving the shim a ParseCIDR body reds it on
+  "non-no-op body: [SetAddressBookEntry]", with `go vet` rc=0 so it is an
+  assertion, not a build break.
+  **F2 also inverts.** "Neither screen-resolution site is independently bound"
+  is true but not closable: `result.ScreenIDs` is built by `assignScreenIDs`
+  FROM `cfg.Security.Screen`, so the two key sets are identical by construction
+  and no real config separates them; and since `c3497a64a` hoisted
+  `validateZoneScreenReferences` to the top of `compileZones`, both sites are
+  backstops the sweep pre-empts. Binding them independently would need a
+  hand-built `result` disagreeing with `cfg` — a state production cannot
+  produce. Documented rather than faked.
+  **F3 (probability math) fixed with MEASURED numbers.** The comment called a
+  single run "a coin flip" (0.5) and gave `8^-24` from a uniformity assumption
+  over the wrong denominator. The fixture holds NINE zones, and Go's map range
+  is not uniform over which key lands first. Reverting both halves and running
+  200,000 single-trial compiles: 12632/200000 = 0.0632 per trial, versus 0.1111
+  for uniform 1/9 — so 24 trials give ~1e-29. Corrected in the test comment AND
+  in the r5-1 `_Log.md` entry above. Also closed the vacuity hole: nothing tied
+  the trial count to the fixture, so trimming the valid-zone loop to zero left
+  only the offender, which is then visited first every time and makes the probe
+  pass 24/24 on BROKEN code. Added a fixture floor asserting 8 valid +
+  1 offender and that all 8 carry interfaces. PROVEN TO FIRE: shrinking the loop
+  to zero reds it, `go vet` rc=0.
+  **F5 (my own prior error, and worse than reported).** The phase table claimed
+  "in the same order CompileConfig runs them" while `zone screen references` sat
+  EIGHTH. Production reaches it FIRST — `validateZoneScreenReferences` is the
+  first statement in `compileZones`, and `compileZones` is the first phase. A
+  config with both a stale screen reference and a broken address-book set was
+  therefore reported by the pre-pass as "address book" while production would
+  abort on the screen reference, pointing the operator at the wrong stanza.
+  Fixed by MOVING the row to first, making the documented claim true rather than
+  weakening it. The coverage test could not have caught this — it compares the
+  table against another hand-written list, so both were wrong together — so
+  added `TestPrePassReportsTheSamePhaseProductionWould_4960`, which drives a
+  config tripping BOTH phases and asserts the pre-pass names the one production
+  would. PROVEN TO FIRE: moving the row back to eighth while keeping the
+  index list consistent reds the new test and leaves the coverage test GREEN,
+  which is exactly the discrimination that was missing. Also corrected the row
+  count ("five of the twelve" and "ten of the twelve" -> thirteen) and four
+  rotting line references (`compiler.go:182` -> `:268` for the IsLoaded check,
+  x3 files; `compiler.go:245-254` -> `:330` for the NAT finalize, x2 sites).
+  **NOT DONE, and owed:** F4 (widen the ID driver to PolicySetID / RuleID /
+  PolicyNames / scheduler slots) and F6 (success logs emitted for no-op
+  validation-pass operations). Both are coverage/log-noise, neither is a runtime
+  defect; they are not started, not partially done.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages ok); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 5b. The lead confirmed the F1 refutation firsthand and
+  asked for two hardenings; acting on the first found a REAL divergence my r5
+  claim had missed, so this entry corrects that claim as well as implementing
+  the asks.
+  **MY r5 CLAIM WAS TOO STRONG.** r5 said the fake and
+  `userspaceShimCompileDataplane` are equivalent because "all 38 shared methods
+  are byte-identical". True, but incomplete: the shim EMBEDS `*Manager`, so any
+  DataPlane method it does not override is PROMOTED to the retired-eBPF
+  implementation. Reflection says DataPlane has 130 methods while the shim
+  declares 55 — about 75 promote. Comparing the pre-pass CALL SURFACE (the 41
+  methods `discardingDataPlane` declares) against the shim's 55 finds THREE the
+  shim does not override, and one of them is live:
+  `GetPersistentNAT`. The fake returns a typed-nil `*PersistentNATTable`; the
+  shim promotes to `(*Manager).GetPersistentNAT`, which returns the live
+  `m.PersistentNAT`. It is called on the compile path, inside `compileNAT`
+  (`compiler_nat.go` twice). Both sites nil-guard, so the PRE-PASS SKIPS
+  `ClearPoolConfigs` and `SetPoolConfig` while production RUNS them. Neither
+  returns an error, so nothing can escape the pre-pass into the post-mutation
+  window and the F1 refutation stands — but "the pre-pass sees what the real
+  compile sees" was not true, and nothing pinned it. `IsLoaded` diverges too
+  (fake true, shim promoted) but is checked at the top of CompileConfig before
+  any mutation, so it cannot half-apply. `xpfValidationPass` is not a DataPlane
+  method.
+  **The equivalence guard is rebuilt around the correct invariant**, per the
+  lead's ask to enumerate dynamically rather than from a hardcoded list. It is
+  hybrid by necessity: REFLECTION enumerates the DataPlane method set (so a
+  method added later is automatically in scope), and AST classifies bodies and
+  declared-vs-promoted, because reflection CANNOT distinguish the two — Go
+  synthesizes a wrapper on the outer type for an embedded pointer, so a promoted
+  method and an overridden one have different func pointers and look identical.
+  A first attempt compared `sm.Func.Pointer()` against `mm.Func.Pointer()` and
+  reported 0 promoted out of 130, which is how that trap presents.
+  Four checks: (1) every shim-declared method is a no-op; (2) every method on
+  the pre-pass call surface is also overridden by the shim, or allowlisted in
+  `prePassShimDivergence` WITH an argument; (3) the allowlist is MINIMAL, so a
+  stale exemption cannot wave a future divergence through; (4) the shim
+  satisfies every DataPlane method, with a >=100 floor so the reflection half
+  cannot go vacuous.
+  MUTATION GRID, all in throwaway `git archive` extracts, `go vet` rc=0 on every
+  cell so each RED is an assertion and not a build break:
+  A — give the shim a validating `SetAddressBookEntry` (a ParseCIDR body):
+  **RED**, "non-no-op body: [SetAddressBookEntry]".
+  B — delete the `GetPersistentNAT` allowlist entry: **RED**, "discardingDataPlane
+  overrides [GetPersistentNAT], but userspaceShimCompileDataplane does NOT — so
+  in production those calls PROMOTE to the embedded *Manager".
+  C (negative control) — delete the shim's `AddTxPort` override, a method the
+  pre-pass never calls: **GREEN**, correctly, because a method outside the call
+  surface cannot cause a pre-pass/production divergence.
+  D — delete the shim's `SetAddressBookEntry` override so it promotes to the
+  validating eBPF Manager: **RED** on the same PROMOTE message. D is the
+  review's original F1 chain made real, and the guard catches it.
+  **F2's construction invariant is now pinned**, per the lead's caveat. The
+  argument that the two zone->screen resolution sites are redundant rests on
+  `assignScreenIDs` populating `result.ScreenIDs` BY RANGING
+  `cfg.Security.Screen`, which was implicit.
+  `TestScreenIDsKeySetMirrorsConfig_4960` asserts the two key sets agree in both
+  directions over three fixtures (empty / one / several). PROVEN TO FIRE: adding
+  a single `ScreenIDs["synced-from-peer"]` key that no config declares reds it,
+  `go vet` rc=0. Without this the comment claiming independent binding is
+  "structurally impossible" would silently become false the day ScreenIDs gains
+  a second source.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on both touched files.
+  STILL OWED, unchanged: F4 (widen the ID driver to PolicySetID / RuleID /
+  PolicyNames / scheduler slots) and F6 (success logs for no-op validation-pass
+  operations). Neither started.
+- **File(s)**: pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go, _Log.md
 ## 2026-08-06 — #4800 new-flow-ceiling instrumentation + harness
 
 - **Timestamp**: 2026-08-06
@@ -83525,6 +84210,495 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 6 — fold the three minors from the MERGE-NEEDS-MINOR
+  re-gate at `10b592047`. No blocking findings; no production behaviour changes.
+  **F1 — the pin I added in r5b did NOT cover the shape its own comment named,
+  and the reviewer is right.** `TestScreenIDsKeySetMirrorsConfig_4960` calls
+  `assignScreenIDs` and compares its output against `cfg.Security.Screen`, so it
+  fires when the divergence is introduced INSIDE that function — which is where
+  my r5b mutation put it. A realistic second writer (synced peer, cached
+  snapshot) is a SEPARATE SITE writing after `assignScreenIDs` returns.
+  Reproduced firsthand: inserting `result.ScreenIDs["synced-from-peer"] = 0xfffe`
+  at BOTH production call sites left the whole package GREEN, so the comment's
+  "this test is what fails at that moment" was false for the shape it described.
+  Added `TestAssignScreenIDsIsTheSoleWriter_4960`: an AST scan over every
+  non-test .go file in pkg/dataplane for index-assignments and `delete()` on
+  `.ScreenIDs`, asserting exactly one enclosing function and that it is
+  `assignScreenIDs`. Satisfiable today — `compiler.go` carries the only write;
+  the other three non-test mentions are reads. Two floors (>=10 files scanned,
+  >0 writers found) so a rename cannot make it vacuous.
+  PROVEN TO FIRE on the exact previously-GREEN mutation: `result.ScreenIDs is
+  written from [CompileConfig assignScreenIDs validateBeforeMutateWithResult],
+  expected only assignScreenIDs` with per-site file:line, `go vet` rc=0.
+  **F2 — the hoist's own claim was unbound.** `compileZones` opens with
+  `validateZoneScreenReferences` and the comment says that makes it
+  "structurally impossible for any zone to mutate ... whatever the caller did
+  first". Deleting the hoist while keeping the pre-pass row left the package
+  GREEN, because `compileZones` has one production caller and the pre-pass
+  rejects ahead of it. Added
+  `TestCompileZonesRejectsStaleScreenRefWhateverTheCallerDid_4960`, which calls
+  `compileZones` DIRECTLY (the idiom `compiler_rxvlan_failclosed_5268_test.go`
+  already uses), bypassing CompileConfig and therefore the pre-pass. PROVEN TO
+  FIRE on the previously-GREEN hoist deletion: `compileZones programmed 1
+  zone(s) before rejecting`, `go vet` rc=0. Note the measured count is 1, which
+  corroborates the reviewer over the PR body's stale "2 SetZoneConfig calls".
+  **F3 — three ID-driver dimensions added, one deliberately NOT.** `PolicyNames`
+  (4 entries), `PolicySets` (1) and `AppNames` (92) are all written by
+  `compilePolicies` / `compileApplications`, both already in the driver, so they
+  were omitted rather than unreachable. Each has a floor: the
+  `DefaultPolicySentinelID` key plus a >=2 count for PolicyNames, non-zero for
+  PolicySets, non-empty for AppNames. `PolicyScheduleRuleSlots` is NOT added —
+  `idProbeConfig` declares no scheduler, so the slice is empty and the column
+  would be empty-vs-empty, the exact vacuity the r4 round removed from three
+  other columns. Recorded in the test with what to do first (add a
+  `then schedule` to the fixture).
+  **NITs.** PR body corrected: "Eleven of thirteen" -> Thirteen, "all seven
+  maps" -> eight, "2 SetZoneConfig calls" -> 1. README: "no longer a zones-phase
+  fault at all" described only the pre-pass half and read as though the
+  zones-phase check had been removed — it has not, #6894 hoisted it there.
+  TWELVE rotted file:line citations de-rotted, and per the re-gate's habit note
+  they are now SYMBOL citations rather than re-pinned numbers, because these
+  keep rotting inside this PR: `compiler_iface.go:1256/1284` ->
+  stripUnmanagedInterfaces' LinkDel/LinkSetDown, `compiler.go:723/771/753` ->
+  resolveAddrList and its implicitSets write / cacheKey join,
+  `compiler_iface.go:1255/287/450-454`, and `compiler.go:268/330`. Two of those
+  (`:268`, `:330`) were still CORRECT at this head — verified before touching —
+  and were converted anyway so the next shift cannot rot them; one
+  (`compiler_iface.go:287` -> 310) had rotted since r5 because MY OWN hoist
+  insertion shifted it, which is the habit note earning itself.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_screenids_solewriter_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/compiler.go,
+  pkg/dataplane/README.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 7 — fold Codex's MERGE-NEEDS-MAJOR (C2-C5) plus the
+  re-gate's F8. Two Major findings; both are guards that did not bind what their
+  claims asserted. No production behaviour changes.
+  **C3 (Major) — the ordering claim was TRUE but UNBOUND, and this supersedes a
+  reading I was given as settled.** `validationPhases` says it lists phases "in
+  the same order CompileConfig runs them". Two guards both missed it: the
+  structural test compares the table against a hand-written `want` list (both
+  written together, so both can be wrong together — which is exactly what
+  happened when the zone-screen row sat eighth), and
+  `TestPrePassReportsTheSamePhaseProductionWould_4960` calls only
+  `validateBeforeMutate`, so CompileConfig is never on its path. Moving the
+  TABLE reds that test; swapping the PRODUCTION calls does not. Codex mutated
+  the thing the claim is about and it stayed green.
+  Added `TestPrePassRowOrderMatchesCompileConfig_4960`, which DERIVES the order
+  from CompileConfig's source by AST and compares it to the table, with a
+  per-row map to the production symbol whose position defines that row's
+  precedence (`zone screen references` -> compileZones, because the sweep is
+  hoisted to its top; `firewall filter protocols` -> compileFirewallFilters,
+  because the row runs a pure check production performs inside that phase).
+  Floors on both the derived count and the row count so a rename cannot make it
+  vacuous. PROVEN TO FIRE on Codex's own mutation — swapping compileNAT and
+  compileStaticNAT in CompileConfig: `row 4 is "nat" (production compileNAT),
+  but CompileConfig runs compileStaticNAT in that position`, `go vet` rc=0, and
+  no other ordering test reds, which is the point.
+  **C2 (Major) — allowlist minimality was far weaker than "proven to fire".**
+  The stale check was `shimDecl[name] && fakeDecl[name]`, so a NONEXISTENT
+  method, a non-interface name, an empty rationale, or a declaration that moved
+  outside either scanned file all passed silently. Measured: an arbitrary bogus
+  entry left the fidelity test green. That matters because a name can be
+  pre-added and a later fake stub plus compile call is then silently excused
+  while production promotes the fallible Manager implementation. Replaced with a
+  positive test of legitimacy — an entry must be on the pre-pass call surface
+  (the fake declares it) AND not overridden by the shim (so it really does
+  promote) AND carry a non-empty rationale. PROVEN TO FIRE on
+  `ClearNATPoolConfigs`, the pre-added nonexistent name Codex used.
+  Also per C2: `xpfValidationPass` is NOT a fake-vs-production DataPlane
+  divergence — it is the unexported marker, absent from the DataPlane interface
+  (verified) — so it is scoped out of the call-surface comparison rather than
+  sitting in the allowlist on the same footing as the two real entries.
+  **F8 — the exemption vouched for two methods; the pre-pass skips three.**
+  `compileNAT` makes FOUR `pnat.*` calls over THREE methods —
+  `ClearPoolConfigs`, `SetPoolConfig`, and `RegisterNATIP` (twice). The
+  rationale named two and said "neither returns an error", a two-item word for a
+  three-item set. The conclusion held (all three have empty result lists) but
+  the artifact under-described what it vouched for, and a reviewer re-checking
+  the premise would have verified two of three.
+  Took the self-maintaining fix rather than naming three:
+  `TestPrePassPersistentNATCallsCannotFail_4960` derives the method set by AST
+  from `compileNAT`'s `pnat.*` calls, then asserts each is declared in
+  persistent_nat.go with an EMPTY result list. A fourth call is covered the
+  moment it is written. It also discharges an obligation that previously had NO
+  consumer: the exemption said "if either ever gains an error return this entry
+  must go", but both call sites are bare statements, so adding a result compiles
+  silently at both and nothing observed the transition. This fires on the
+  DECLARATION. PROVEN TO FIRE: giving `RegisterNATIP` an error return reds it —
+  and note it caught the method the old prose never named.
+  Recorded in the exemption, because it inverts the reader's instinct: the typed
+  nil is load-bearing in the SAFE direction. Under master `compileNAT` ran once
+  against the real dp; under the pre-pass it is skipped and then run once by the
+  real pass, so the live table sees an identical sequence. Had the fake modelled
+  a real table, the PRE-PASS would have cleared and repopulated the LIVE
+  persistent-NAT table from a compile whose result is discarded, blanking
+  poolConfigs/natIPToPool for any concurrent LookupPool. The obvious
+  "improvement" is the harmful change — the same shape as the original F1
+  refutation.
+  **C4 (Medium) — a false enforcement claim.** `validateBeforeMutateWith` said
+  any dp "MUST embed discardingDataPlane ... That is enforced". It is not: the
+  implementation checks the unexported MARKER. An in-package type can return
+  true from `xpfValidationPass()` while delegating writes to a live dataplane
+  and would be accepted. Production is safe because the only caller constructs
+  `discardingDataPlane{}` directly and the marker is unexported, so the hole is
+  in-package — but that is a property of the call site, not an enforced
+  invariant. Claim corrected to say what is checked.
+  **C5 (Minor) — the ID-probe header contradicted its own implementation.** It
+  said the phases run "twice against the same dp"; `compileIDsOnce` constructs a
+  fresh `idProbeDP{}` per invocation, so a per-instance counter would reset and
+  both snapshots would compare equal. Header now states what the probe actually
+  detects: state outliving a CompileResult that is not per-dp-instance.
+  NOT RE-LITIGATED, per the brief: the F1 ParseCIDR refutation (independently
+  confirmed), the absence of function-pointer comparison in any guard, and the
+  probability work — `trials = 24` is extrapolation over a fixture whose eight
+  programmable zones plus one offender ARE asserted, so removing valid elements
+  fails deterministically. F3-probability closed.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_prepass_order_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 8 — fold the scoped re-gate at `e42fa044c`. One
+  BLOCKING item, in my own r6 work, plus three minors and four NITs.
+  **F1 (BLOCKING, and my defect) — three columns added, never compared.** r6
+  added `PolicyNames` / `PolicySets` / `AppNames` to `compileIDsOnce`'s return
+  map with a comment claiming an order-dependent id "shows here and nowhere else
+  in this comparison". The `reflect.DeepEqual` loop still listed EIGHT keys and
+  none of the three. Nothing read them. Reproduced: a package-level counter
+  perturbing `result.PolicyNames` across passes left the test PASSING, while the
+  same mutation shape on `implicitSets` — a compared column — reds.
+  This is the shape my own notes name and I walked into it: a prescribed test
+  FORM can be satisfied with the defect intact. Three columns were asked for,
+  three columns appeared, the property stayed unmeasured. The acceptance check
+  for adding a column to a comparison-driven test is a MUTATION IN THAT COLUMN,
+  never the column's presence — now recorded at the loop.
+  Fixed by appending the three keys. PROVEN PER COLUMN, `go vet` rc=0 on each:
+  `PolicyNames differs between pass 1 and pass 2`, `AppNames differs ...`,
+  `PolicySets differs ...`. (First attempt injected the drift at the top of
+  `compilePolicies` and nil-map-panicked — `PolicyNames`/`AppNames` are NOT
+  allocated by `newValidationResult`; they are made inside their phases. Moved
+  the injection after the allocation. A panic is not a red.)
+  The `PolicyScheduleRuleSlots` refusal was independently verified CORRECT:
+  `compiler.go` appends only under `if pol.SchedulerName != ""` and neither
+  probe policy sets it, so it would be nil-vs-nil.
+  **F2 — the pnat guard's floor was `>0`, not exact.** It matched the literal
+  receiver name `pnat`; `compileNAT` has TWO such blocks, so renaming the inner
+  one dropped coverage 3 methods -> 1 while the floor still passed, and a
+  genuinely fallible `RegisterNATIP` would have gone unnoticed. Now the receiver
+  identifiers are DERIVED from the `x := dp.GetPersistentNAT()` assignments (so
+  a rename is no longer an evasion — verified: renaming one block keeps the
+  count at 3 and the test correctly stays green) and the floor is EXACT, the
+  same discipline the ordering guard already uses. PROVEN TO FIRE on a real
+  coverage drop — deleting one whole pnat block: `found 2 distinct methods ...
+  expected 3`, `go vet` rc=0.
+  **F3 — both halves of the fidelity guard were single-file scoped.** They read
+  `loader.go` and `compiler_validate_4960.go` BY NAME, so moving `SetFilterRule`
+  to a sibling file with a REJECTING body left the guard passing — and
+  `compileFirewallFilters` is a late phase, after `compileZones` has mutated the
+  host, which is exactly the #4960 shape. The `<40` floor only catches a
+  wholesale move; with 55 methods, fifteen can migrate first. Now scans the
+  package DIRECTORY, matching the sole-writer canary's discipline, with an exact
+  receiver-name match instead of a substring. PROVEN TO FIRE on the
+  demonstrated escape — `SetAddressBookEntry` moved to a sibling with a
+  rejecting body: `non-no-op body: [SetAddressBookEntry]`, `go vet` rc=0.
+  **F4 — the sole-writer canary's header overclaimed.** It said `assignScreenIDs`
+  is "the ONLY thing that writes the map" and "a second writer ANYWHERE". It
+  binds two SYNTACTIC FORMS: a local alias and a helper taking the map as a
+  parameter both evade it. Escapes are inherent to an AST canary and are not
+  chased; the header now states the scope, and says the realistic regression
+  (a second index-assignment beside the first) is what the redundancy argument
+  is actually exposed to.
+  NITs: `declared` in the pnat assertion was keyed by bare method name across
+  all receivers (last-declaration-wins if a second appears) — now filtered to
+  `PersistentNATTable`; removed `var _ = strings.TrimSpace` and its dead import;
+  replaced single-arg `filepath.Join` and the hand-rolled `itoa` with
+  `fmt.Sprintf`.
+  NOT RE-LITIGATED per the brief: the source-derived ordering guard, all three
+  legitimacy arms of the divergence check, the pnat assertion's derivation, and
+  all twelve citation conversions — each attacked and each held.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean.
+- **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_prepass_order_4960_test.go,
+  pkg/dataplane/compiler_screenids_solewriter_4960_test.go, _Log.md
+
+## 2026-08-06 — #6894 r8: comparison-loop defect + validation-pass success logs
+
+- **Timestamp**: 2026-08-06
+- **Action**: Cherry-pick candidate on top of `e42fa044c`. Carries only what r7
+  does not already have or does better: the F4 comparison-loop defect a re-gate
+  found blocking, the F6 log gating, one F3 measurement, and two stale row-index
+  comments. Deliberately does NOT carry F1, F2, or the F5 ordering treatment.
+- **File(s)**: `pkg/dataplane/compiler.go`, `pkg/dataplane/compiler_nat.go`,
+  `pkg/dataplane/compiler_idprobe_4960_test.go`,
+  `pkg/dataplane/compiler_prepass_logging_4960_test.go` (new),
+  `pkg/dataplane/compiler_validate_4960.go`,
+  `pkg/dataplane/compiler_validate_4960_test.go`,
+  `pkg/dataplane/compiler_zone_screen_prepass_4960_test.go`, `_Log.md`
+
+- **F4 — the blocking half was ALREADY FIXED at `fdc19cab2` while this was
+  being written, so what remains is one level up.** That commit appended the
+  three names to the comparison list, which closes the immediate defect. The
+  failure mode, though, was a SECOND list falling out of sync with the returned
+  map — and a list that must be edited whenever a column is added can fall out
+  of sync again. This derives the key set from the map instead, so a new column
+  is compared the moment it exists. Measured on this tree with the same
+  mutation (seed `policySetID` from a package-level sequence): the eight-key
+  list was GREEN, the eleven-key list and the derived set are both RED on
+  `PolicyNames differs between pass 1 and pass 2`. So this is a
+  RECURRENCE-PREVENTION change, not a defect fix, and it should be graded as
+  one.
+- **F4, second half — `PolicyScheduleRuleSlots`, and the r8 refusal of it was
+  CORRECT on its own terms.** The r8 entry above records refusing this column
+  because `compiler.go` appends only under `if pol.SchedulerName != ""` and
+  neither probe policy set it, so it would have been nil-vs-nil. That reasoning
+  is right and the refusal was the correct call **for that fixture**. This
+  change removes the premise rather than overriding the conclusion: `p-single`
+  now carries `SchedulerName: "sched-6894"`, which reaches the sole writer, and
+  only then is the column added. Adding it without widening the fixture would
+  have been exactly the vacuous comparison r8 declined.
+  It is also the column that DISCRIMINATES: under the seeded-id mutation
+  `PolicyNames` and the slots both move while `PolicySets` (a count) does not,
+  and that asymmetry is only observable if the columns are genuinely consumed. Floors name the specific rule ids (0,1,2 -> p-multi/p-multi/p-single)
+  and the slot's `PolicySetID`/`RuleIndex`/`RuleID`, because a count-only floor is
+  satisfied by a shifted numbering.
+- **F6 — eleven INFO success records gated on `!isValidationPass(dp)`.** The
+  pre-pass's writes are no-ops, so "static NAT compilation complete" and
+  friends recorded success for work that never happened; on a failed apply the
+  journal read success-then-failure for a compile whose result was discarded.
+  Two-way grid, both verified at this head: removing one gate REDs
+  `TestPrePassLogsNoSuccessForWorkItDidNotDo_4960` ("the pre-pass logged 1
+  success record(s)..."), and over-widening it to suppress BOTH passes REDs
+  `TestRealPassStillLogsItsSuccesses_4960` ("the REAL pass no longer logs ...").
+  WARN duplication is left alone and stays on #6903 — noise, not a false claim.
+- **F3 — one measurement, not a rewrite.** r7 already corrected the "coin flip"
+  and uniformity errors and measured 0.0632. What it does not say is that the
+  rate is a property of the fixture's INSERTION ORDER rather than of N: measured
+  over 200,000 constructions, 8-valid-then-offender gives 0.0622 while
+  offender-first gives **0.31** — same nine keys, same value type, factor of
+  five. So hoisting the offender's assignment above the builder loop is a
+  refactor that changes no test, no N and no constant, and silently moves the
+  24-trial bound from ~1e-29 to ~1e-12. Recorded next to the constant.
+- **F5 — two stale comments only.** The r7 reorder moved every row index but no
+  row name, and three comments still said "row 2 / row 3 / row 5 / row 7".
+  Replaced with row NAMES so they cannot rot on the next insertion.
+- **NOT CARRIED, deliberately.** F1: the premise was refuted — the production
+  compile dataplane is `userspaceShimCompileDataplane`, whose
+  `SetAddressBookEntry` is itself a no-op, and `NewDataPlane` refuses the eBPF
+  `Manager`, so there is no divergence on a reachable path and the delegation
+  machinery is unnecessary on an apply path. F2: r7's sole-writer +
+  key-set-mirror pair proves the two screen maps cannot disagree, which is
+  stronger than binding each lookup behind a fixture — and a fixture that seeds
+  them divergently now describes a state production cannot reach. F5 ordering:
+  r7 moved the row to first and derives the order from `CompileConfig`, which
+  makes the claim true and bound rather than merely dropped.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 9 — accept fold6894b's `939405da3` and record MY OWN
+  verification of it, rather than its self-report. It is a clean descendant of
+  `fdc19cab2` (`git merge-base --is-ancestor` confirms), so there is no union
+  merge and no conflict to resolve; this entry adds the checks the merging lane
+  owes.
+  **_Log.md STRUCTURAL CHECK (the one that silently ate 66 lines on their
+  side).** Compared the file at `fdc19cab2` against `939405da3`: 70812 -> 70883
+  lines, delta +71, and the older file is an EXACT PREFIX of the newer
+  (`b.startswith(a)`). Nothing of the r8 entry was dropped. Line-count growth
+  alone is NOT sufficient — a union that both adds and silently drops can still
+  grow — so the prefix property is what was checked. Worth keeping as the test:
+  in a rebase `--theirs` means your OWN commit, not upstream, which is how a
+  union loses the side it was supposed to preserve.
+  **PRODUCIBILITY CHECK on the fixture widening — mine to run, not theirs to
+  assert.** I declined `PolicyScheduleRuleSlots` in r6 because `compiler.go`
+  appends only under `if pol.SchedulerName != ""` and no probe policy set it, so
+  the column would compare nil to nil. Their commit removes that premise by
+  giving `p-single` a `SchedulerName`. Verified the widening actually REACHES
+  the writer rather than assuming it: the column now yields ONE real slot,
+  `PolicySetID=0 RuleIndex=2 RuleID=2 PolicyName="p-single"
+  SchedulerName="sched-6894"`. Only with that confirmed is the column
+  non-vacuous, so the addition is accepted.
+  **THE SIX INFO SITES — the runtime regression this round exists for.**
+  `isValidationPass` gating expands from 9 to 20 non-test occurrences. The six
+  named sites (flow timeouts compiled / source NAT off rule / persistent NAT
+  pool registered / source NAT v6 rule / static NAT rule / static NAT
+  compilation complete) are all gated, plus nptv6 and two `count > 0 &&`
+  summaries. The defect was introduced BY THIS PR's own pre-pass: every commit
+  double-logged all six, and a config the pre-pass then REJECTED still logged
+  "persistent NAT pool registered" and "static NAT compilation complete" for
+  work that never happened. `TestPrePassLogsNoSuccessForWorkItDidNotDo_4960`
+  binds it and `TestRealPassStillLogsItsSuccesses_4960` is the over-reach arm —
+  both retained, because without the second a gate widened to suppress BOTH
+  passes would pass the first.
+  **BOTH ID-DRIVER TREATMENTS KEPT, not either.** Their derivation (the compared
+  key set derived from `compileIDsOnce`'s return map) is what stops the r8
+  defect recurring — a parallel list you must remember to edit fell out of sync
+  exactly once already. My per-column mutation proof is what shows it currently
+  binds. RE-RUN on the merged result, `go vet` rc=0 on every cell: `PolicyNames
+  differs`, `AppNames differs`, `PolicySets differs`, and now
+  `PolicyScheduleRuleSlots differs`. Four columns, four independent reds. The
+  two lanes were running DIFFERENT experiments, not disagreeing: one mutation
+  can only move the columns it touches, which is why their single-seed probe
+  moved two of three.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean.
+- **File(s)**: _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6894 r9 — fold the Codex MERGE-BLOCK at `cf79adff3`. F1 (BLOCKING):
+  the pre-pass ACCEPTS an NPTv6 config the Rust helper REJECTS post-mutation.
+  F2/F3 (MINOR): the log gate's over-reach arm and the ID probe's aliasing hole.
+
+  **F1 — chose (i) make the pre-pass reject what Rust rejects, NOT (ii) make the
+  Go snapshot builder drop the malformed rule, NOT (iii) narrow the claim.**
+  The reasoning is the load-bearing part:
+  - **(ii) is a security regression.** The Go side dropping the rule is exactly
+    the fail-open #2240 closed. `compileNPTv6` calls `DeleteStaleNPTv6(written)`
+    over only the VALID subset, so editing one previously-good rule into an
+    invalid one TEARS DOWN its working translation with no replacement. The
+    Rust whole-snapshot rejection is what makes the apply preflight keep the
+    previous live state — and `validateNPTv6Strict`'s own lenient warning text
+    PROMISES exactly that ("the helper rejects the whole NPTv6 snapshot and the
+    previous state is kept"). Dropping in Go falsifies that promise.
+  - **(iii) is unnecessary**, because (i) does not brick. Verified firsthand:
+    `configstore.Store.Load` (store_persist.go) and `Store.SyncApply` (store.go)
+    both compile through `s.compileTreeLenient` — `pkg/config`, not
+    `pkg/dataplane`. Neither reaches `CompileConfig`, so a pre-pass rejection
+    cannot fail a boot or an HA peer sync. What it fails is the dataplane apply,
+    which ALREADY fails today at `publishSnapshotFailClosedLocked` — just after
+    `compileZones` created VLANs and reconciled addresses. (i) moves an
+    already-certain failure ahead of the mutation; it creates no new one.
+  - **Over-rejection was the real hazard and is gated.** A rule the snapshot
+    builder DROPS (#5818 unsupported match scope) never reaches the helper, so
+    today's apply SUCCEEDS without it; hard-erroring on it would break a working
+    tolerant-load config. `config.NPTv6ScopeUnsupported` (new,
+    `pkg/config/nptv6_scope.go`) is now the SSOT both `buildNptv6Snapshots` and
+    `compileNPTv6` read, so the two cannot drift.
+  - Added the **#4519 host-bits check** the Go compiler lacked: it truncates to
+    the prefix BYTES (silently masking), the helper's `parse_prefix` fails
+    CLOSED. Without it the fix would close the class Codex demonstrated and
+    leave an identical one one string away.
+  - **RESIDUAL, named in the code**: the helper also rejects overlapping
+    prefixes (#2241) partitioned by zone scope (#5176). Not replicated —
+    `validateNPTv6Strict`'s overlap check does NOT partition, so reusing it
+    would reject configs the helper ACCEPTS. An overlap still lands
+    post-mutation.
+
+  **Mutation cells, `go vet` rc=0 before each, verbatim assertion captured:**
+  - F1 revert (restore the four `slog.Warn; continue` arms, drop the host-bits
+    block): `TestNPTv6UnparseablePrefixRejectedBeforeHostMutation_4960` RED with
+    *"compileZones RAN before the failing phase was caught (1 SetZoneConfig
+    calls) — the host was mutated before a later phase failed, which is #4960"*.
+    Host-bits and length-mismatch tests RED the same way. **Over-reach guards
+    stayed GREEN** under that revert: the five scope-excluded sub-cases and the
+    valid-NPTv6 control.
+  - Builder inline-copy divergence (drop `MatchDestinationPort` from a
+    re-inlined predicate): `TestNptv6BuilderDropSetMatchesScopePredicate_4960`
+    RED naming the disagreeing rule.
+  - Rust half verified firsthand, non-zero match: `cargo test --release --bin
+    xpf-userspace-dp -- invalid_snapshot_rejected_fail_closed
+    host_bits_snapshot_rejected_fail_closed parse_prefix_rejects_host_bits` →
+    3 passed, 4250 filtered. The `"not-a-prefix"` / `"2001:db8:9::/48"` pair is
+    literally the `bad-parse` fixture over there.
+
+  **F2 — the gate is complete; its two-way grid was not.** MEASURED the
+  pre-pass's reachable set rather than reasoning: of 19 `!isValidationPass(dp)`
+  sites, 17 are reachable and 2 are NOT (`SNAT egress IP set` — the pre-pass's
+  `newValidationResult` has an empty ifCache so the branch soft-skips;
+  `persistent NAT pool registered` — the shim's typed-nil `GetPersistentNAT`
+  skips the block). Both are stated in the test, not papered over. The
+  over-reach arm went from 13 named records to 17 + 2 separately bound:
+  `logProbeConfig` now reaches the source-NAT-off, persistent-NAT and
+  no-address-SNAT paths, the real-pass driver seeds the egress ifCache and a
+  live persistent-NAT table, `successLogLines` returns FULL records so the two
+  `default policy compiled` arms are distinguishable, and
+  `TestOverReachArmCoversEveryReachableGate_4960` derives the gate COUNT by AST
+  so a newly gated site cannot be added unaccounted.
+  Cells: screen gate suppress-both → RED (the exact case Codex measured GREEN);
+  SNAT-egress suppress-both → RED; gated WARN removed → negative arm RED;
+  deny-all gate removed → ONLY the `default-deny` subtest RED (`default-permit`
+  stayed green — the arms are separately bound); a new gated record added → the
+  completeness test RED at 20 vs 19.
+
+  **F3 — aliasing hole closed with an A/B, not an assertion.** `first` is now
+  rendered to strings BEFORE the second compile. Proof: simulated the exact
+  regression class (a column served from process-global storage, drifting on the
+  second call) — WITH the pre-second snapshot the test REDs *"ZoneIDs differs
+  between pass 1 and pass 2"*; with the snapshot moved AFTER the second compile
+  (the r8 shape) the SAME regression is GREEN. Added a mechanical universal
+  floor (`columnIsEmpty` over every column — an always-empty column REDs), and
+  tightened the four loose floors to match the file's own "specific entry, not
+  merely non-empty" claim: ZoneIDs and AppIDs name entries, AppNames is DERIVED
+  from AppIDs (reverse-index agreement), PolicySets is exact, PoolIDs names all
+  four pools, NextPoolID is derived as max+1. Production cells: a
+  `result.PolicySets++` double-increment → RED at "PolicySets is 2, want exactly
+  1" (the old `!= 0` accepted it); a `result.NextPoolID++` over-advance → RED at
+  "NextPoolID is 5 but the highest assigned pool id is 3" (the old `> nat64ID`
+  accepted it).
+
+  Every mutated file restored from a byte-level backup and verified by sha256 /
+  `git diff HEAD` being empty. No `git checkout` used to undo a probe.
+- **File(s)**: pkg/config/nptv6_scope.go (new),
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/userspace/nat_nptv6.go,
+  pkg/dataplane/compiler_validate_4960.go, pkg/dataplane/README.md,
+  pkg/dataplane/compiler_nptv6_prepass_4960_test.go (new),
+  pkg/dataplane/userspace/nat_nptv6_scope_parity_4960_test.go (new),
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6894 r9b — COMMENT-ONLY. Restate the #4960 pre-pass's no-brick
+  argument as an IMPORT CLOSURE instead of a call trace, and carry a positive
+  control with it. No production behaviour, no test, no fixture changed; the
+  only non-comment edit in the commit is this log entry.
+
+  The r9 comment said configstore's `Load` / `SyncApply` "compile through
+  `pkg/config.compileTreeLenient` and never reach `CompileConfig`". True, but
+  it is a statement about today's call sites: one new call site makes it
+  silently false, and false in the direction that matters, because the next
+  reader trusts it and skips the check. The durable form is that
+  `pkg/dataplane` is not in `pkg/configstore`'s dependency CLOSURE — not merely
+  un-imported, but unreachable through any intermediate package — so the path
+  cannot be created without a visible new dependency edge.
+
+  Measured firsthand at `ba3aa2c40`, including the `-test` variant (a
+  `_test.go` import is a real edge for this purpose):
+
+      go list -deps       ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane -> 0
+      go list -deps -test ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane -> 0
+      go list -deps       ./pkg/daemon      | grep -c psaab/xpf/pkg/dataplane -> non-zero (CONTROL)
+
+  **The control is the load-bearing part and it is why this edit was worth
+  making at all.** A bare `grep -c ... = 0` is indistinguishable from a broken
+  query — wrong module path, wrong flag, a swallowed build failure all print 0.
+  The `pkg/daemon` leg proves the query can find a real edge, which is what
+  converts "0" from an absence of OUTPUT into an absence of DEPENDENCY. Its
+  four edges were listed to confirm the control is not itself a coincidence:
+  `pkg/dataplane`, `.../runtime`, `.../userspace`, `.../userspace/format`. The
+  comment records the control COMMAND and the required NON-ZERO property but
+  deliberately does NOT pin the count — this file already carries one lesson
+  about a stated number going stale (the "ONE such error" note in
+  `validationPhases`), and the value is not what makes the query trustworthy.
+
+  Scope held deliberately tight: nothing else in the file was touched, so the
+  diff is trivially verifiable as comment-only at re-gate time.
+  GATES: `gofmt -l` clean; `go vet ./pkg/dataplane/...` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config/... -count=1` rc=0.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md
 ## 2026-08-07 — #5798 fold: bind the fragment-authority ZONE OVERRIDE at its production wiring
 
 - **Timestamp**: 2026-08-07
@@ -92290,3 +93464,155 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/interfaces.go,
   pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
   userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6894 drive-to-merge pass at `6eb35c749`. Merged `origin/master`
+  (234 commits, MERGE not rebase; only `_Log.md` conflicted — union-resolved,
+  structural check 3141 = 2991 base + 19 ours + 131 theirs, anchored marker
+  sweep clean). Rebuilt the GENERATED `docs/refactoring-audit-current.txt`.
+
+  **The Codex MERGE-BLOCK at `cf79adff3` does NOT reproduce at this head.**
+  Verified firsthand with a from-scratch fixture (own zone + VLAN
+  sub-interface) driven through production `CompileConfig`, NOT by trusting
+  the `ba3aa2c40` fold: all seven malformed NPTv6 classes — including Codex's
+  verbatim `2001:db8:9::/48` / `not-a-prefix` — are rejected by the pre-pass's
+  `nptv6` row with `zoneConfigCalls=0 vlanIfaceInfoCall=0 ifaceSetupCalls=0`,
+  and the valid control still compiles.
+
+  Ran the fidelity question as a **differential** rather than on hand-picked
+  cases: 21 candidate prefix strings through Go's `net.ParseCIDR` + the
+  length/family/host-bits gates, and a verbatim `rustc`-compiled copy of Rust's
+  `parse_prefix`. **No string is Go-accept / Rust-reject** — the property the
+  review said was false holds. Exactly one diverges the other way (F1).
+
+  **Hostile runtime pass (Go, apply/rollback ordering) — all held:**
+  - Nil-deref through `discardingDataPlane`'s nil embedded interface: audited
+    all 55 non-test `dp.<Method>(` call sites in `pkg/dataplane` mapped to
+    enclosing functions. The 16 un-overridden methods live ONLY in
+    `compileZones`/`mapZoneInterface`/`programZoneMaps`/`applyTunnelHostInbound`,
+    `compileFirewallFilters`, `compilePortMirroring` and `CompileConfig` — none
+    is a `validationPhases` row. Grep is complete: every `DataPlane`-typed
+    param in non-test `pkg/dataplane` is named `dp` (32/32).
+  - Over-rejection from the pre-pass's empty `ifCache`: every `return
+    fmt.Errorf` in `compileNAT` is config-shaped or a `dp` error; none is gated
+    on `hasV4`/`hasV6`/`ifCache`.
+  - Typed-nil `GetPersistentNAT`: both call sites nil-check; neither `pnat`
+    path returns an error.
+  - Double-compile side effects on `cfg`: none. `compilePolicies`' `rule` is a
+    LOCAL `PolicyRule` literal; `assignZoneIDs` is pure.
+
+  **Findings filed, not folded** (campaign bar: non-runtime / pre-existing do
+  not block):
+  - **#7077** — the ONE PR-introduced behaviour change. Rust's `parse_prefix`
+    accepts a `+`-prefixed mask (`u8::from_str`) that Go's `net.ParseCIDR`
+    refuses, so `nptv6-prefix fd00:9::/+48` applied SUCCESSFULLY before this PR
+    and now hard-fails. Reachability measured end-to-end through
+    `ParseSetCommand` + `SetPath` + `CompileConfigLenient` (rule RETAINED with
+    the #1960 warning). Filed rather than folded because the correct fix is on
+    the Rust side and would make a Go-only PR owe a cluster smoke.
+  - **#7078** — pre-existing residual, same shape as the block that was closed:
+    the pre-pass does not replicate the helper's zone-partitioned NPTv6 overlap
+    rejection (#2241/#5176). Measured: `validateBeforeMutate` -> nil,
+    `CompileConfig` -> tripwire with `zoneConfigCalls=1` (mutation phase
+    entered). Identical on master. Records why reusing `validateNPTv6Strict`'s
+    overlap check is WRONG (it does not partition by zone).
+  - **#7079** — pre-existing: `(*Manager).Compile` `os.Remove`s every
+    `/sys/fs/bpf/xpf/links/xdp_*` pin, and `CompileUserspaceShim` runs two more
+    bpffs cleanups, ALL before `CompileConfig` — so host state is mutated ahead
+    of the pre-pass. Bounded (`m.xdpLinks` holds the fd, running attach
+    survives); costs pin survival across a daemon restart.
+
+  Validation, real `$?` written to a file (no piped gate): `go build ./...`
+  rc=0; `go vet ./...` rc=0; `go test -count=1 ./pkg/dataplane/...
+  ./pkg/config/... ./pkg/configstore/...` rc=0; `go test -count=1 ./...` rc=0
+  (62 packages ok, zero FAIL, #6743 `.dpCell` canary included). Diff is
+  **Go-only** — nothing under `userspace-dp/`, `userspace-xdp/`, `bpf/` — so
+  **no cluster smoke is owed**. `Closes #4960` deliberately ABSENT: the body
+  says "Advances #4960 (bounded increment)" and #7078 is a measured residual.
+  Verdict: **MERGE-READY**.
+- **File(s)**: _Log.md, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6894 r10 — fold the parent's override on #7077. The r9 NPTv6
+  hard error was a no-brick REGRESSION for one class, and the fix is a
+  NARROWING, not a revert.
+
+  **The literal instruction could not be implemented and would have re-opened
+  the block.** The brief was "hard-error when strict, warn-and-skip when
+  lenient". Two problems, the second decisive:
+  - `pkg/dataplane` has NO strict/lenient signal. `CompileConfig` receives a
+    `*config.Config` with no provenance; the distinction lives entirely in
+    `pkg/config`'s `compileOpts.lenientNPTv6`.
+  - It is not a DISCRIMINATOR, because it does not vary. MEASURED through the
+    production `ParseSetCommand` + `SetPath` path: `validateNPTv6Strict`
+    REJECTs all five malformed classes (unparseable, `+`-mask, host-bits,
+    length-mismatch, /56) and lenient RETAINS all five with the #1960 warning.
+    So a malformed rule can only ever reach `compileNPTv6` from the lenient
+    path, and "warn when lenient" == "warn always" == a full revert of the r9
+    #4960 fix, re-opening the Codex half-applied shape.
+
+  **The correct discriminator is whether the HELPER installs the rule.** Rust's
+  `parse_prefix` parses the mask with `u8::from_str` (takes a leading `+`);
+  Go's `net.ParseCIDR` is digits-only. So `fd00:9::/+48` is a Go parse ERROR
+  and a helper ACCEPT — the apply SUCCEEDS today. Every class r9 closed is one
+  the helper REFUSES, so all of them still hard-error.
+  `nptv6HelperWouldInstall` (new,
+  `pkg/dataplane/compiler_nptv6_helper_grammar.go`) mirrors `parse_prefix` plus
+  its per-rule length gate; `compileNPTv6`'s reject closure now warns-and-skips
+  when `!installed || helperInstalls`.
+
+  Skipping costs nothing observable — `compileNPTv6` writes the RETIRED eBPF
+  map surface while `buildNptv6Snapshots` copies Match/Then out of the config
+  INDEPENDENTLY, so a skipped rule still reaches the helper and is still
+  installed. Bound in `pkg/dataplane/userspace` (not asserted in prose) with a
+  #5818 scope-drop control so the assertion is not satisfied by a builder that
+  emits unconditionally.
+
+  **Mutation cells, `go vet` rc=0 on EVERY cell (no build break masked an
+  assertion), tree restored from byte-level backups + sha256 verified — no
+  `git checkout` used:**
+  - **M1 (the fix reverted, `helperInstalls := false`)**:
+    `TestHelperAcceptedNPTv6PrefixIsSkippedNotRejected_7077` +
+    `TestStrictCommitStillRejectsHelperAcceptedMalformedPrefix_7077` RED with
+    *"the apply was REJECTED for an NPTv6 rule the helper ACCEPTS, so a config
+    whose apply SUCCEEDS today now fails"*. The over-reach control and ALL
+    THREE r9 #4960 NPTv6 tests stayed GREEN — the two arms are separately
+    bound.
+  - **M2 (over-reach control, `helperInstalls := true` = full revert)**: all
+    EIGHT sub-cases of `TestHelperRefusedNPTv6PrefixStillHardErrors_7077` RED
+    plus the three r9 tests, verbatim *"compileZones RAN before the failing
+    phase was caught (1 SetZoneConfig calls)"* — i.e. it demonstrably
+    re-opens #4960. The r10 behavioural test stayed green.
+  - **M3 (drift: `+` arm dropped from the mirror)**: the parity table RED
+    naming `"2001:db8::/+48"`, AND the behavioural test RED — the drift guard
+    has a real consequence, not just a table.
+  - **M4 (constant word count, `case 64: words = 3`)**: parity table RED on the
+    /64 rows AND the over-reach control RED — a yes/no-only table would have
+    missed it, which is why word counts are asserted.
+
+  Drift for the second copy of a Rust grammar is bound, not hoped for: the
+  parity table's expected column was produced by compiling `parse_prefix`
+  VERBATIM with rustc (40 rows, 11 accepted / 29 refused, with a non-vacuity
+  guard so a one-sided table fails rather than passing under a constant
+  implementation), covering both signs, leading zeros, `_` separators,
+  non-ASCII digits, u8 overflow at 256, zones, v4-mapped literals and host
+  bits.
+
+  Docs updated as part of the contract: the "FOURTH class" paragraph in
+  `compiler_validate_4960.go` now says THREE properties keep it from
+  over-rejecting and names the grammar one, and `pkg/dataplane/README.md`'s r9
+  bullet is narrowed from "the parse class" to "the parse class the helper
+  REFUSES".
+
+  #7077 retitled and re-scoped to the Rust half (tighten `parse_prefix`'s mask
+  token to digits-only), with the three-step retirement plan for the Go mirror
+  recorded so it is not read as closed by this PR.
+
+  Validation at `f1191d1ba`+: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./...` rc=0 (62 packages ok, ZERO FAIL — no ddns flake this
+  run). Diff still Go-only; no cluster smoke owed.
+- **File(s)**: pkg/dataplane/compiler_nptv6_helper_grammar.go (new),
+  pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go (new),
+  pkg/dataplane/userspace/nat_nptv6_helper_accepted_7077_test.go (new),
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/README.md, _Log.md

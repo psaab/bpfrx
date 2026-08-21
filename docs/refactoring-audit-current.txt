@@ -21,7 +21,7 @@
 [REFACTOR]   2046  pkg/dataplane/userspace/maps_sync.go
 [REFACTOR]   2034  userspace-dp/src/afxdp/frame/mod.rs
 [WATCH]      1990  pkg/grpcapi/server_sessions.go
-[WATCH]      1954  pkg/dataplane/compiler.go
+[WATCH]      1988  pkg/dataplane/compiler.go
 [WATCH]      1953  pkg/api/metrics_userspace.go
 [WATCH]      1932  pkg/ddns/manager.go
 [WATCH]      1892  pkg/config/compiler_validate_warn.go
@@ -34,6 +34,7 @@
 [WATCH]      1764  userspace-dp/src/screen/scan.rs
 [WATCH]      1752  pkg/config/types_system.go
 [WATCH]      1680  pkg/api/server.go
+[WATCH]      1654  pkg/dataplane/compiler_iface.go
 [WATCH]      1652  pkg/cmdtree/tree.go
 [WATCH]      1639  pkg/api/sessions.go
 [WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
@@ -41,7 +42,6 @@
 [WATCH]      1595  pkg/cluster/heartbeat.go
 [WATCH]      1581  pkg/routing/rules.go
 [WATCH]      1575  pkg/dataplane/userspace/eventstream.go
-[WATCH]      1567  pkg/dataplane/compiler_iface.go
 [WATCH]      1535  userspace-dp/src/afxdp/tx/cos_classify.rs
 [WATCH]      1523  userspace-dp/src/afxdp/session_glue/mod.rs
 [WATCH]      1515  pkg/daemon/daemon_ha_sync.go
