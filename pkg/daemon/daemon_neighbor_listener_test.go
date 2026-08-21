@@ -132,7 +132,7 @@ func (s *stubProviderForListener) LookupSnapshotNeighbor(ifindex int, ip net.IP)
 
 // withStubProvider runs body with a fresh stub provider. Tests
 // invoke shouldTriggerRegenWithProvider directly with the stub
-// rather than going through d.dp (which expects the full
+// rather than going through the published dataplane (which expects the full
 // dataplane.DataPlane interface).
 func withStubProvider(t *testing.T, fn func(p *stubProviderForListener)) {
 	t.Helper()

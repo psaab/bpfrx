@@ -1053,11 +1053,27 @@ func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
 // (#1865). Shared rendering with the local CLI via
 // dpformat.FormatWireguardStatus.
 func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
-	if s.dp == nil {
+	// #2114/#6743 r2-B4: the publication check must ask the CELL, not the
+	// field. `s.dp == nil` is permanently false under the daemon's live
+	// indirection, so an emptied cell fell into the arm below and told the
+	// operator the firewall is running a non-userspace dataplane — the
+	// r6-F3 defect ("a claim about a LOADED backend for a daemon that had
+	// just lost its backend") at a site the dpProbe() conversion left
+	// behind. The only runtime forwarding path is the userspace helper
+	// (#1373), so that answer names a backend class that cannot exist and
+	// points the operator at `system dataplane-type` instead of at the arm
+	// that failed.
+	//
+	// ONE resolution feeds both decisions, for the same reason showBuffers
+	// takes exactly one (r7): a setDataplane(nil) landing between a
+	// publication check and a separate probe re-creates the confusion the
+	// check exists to prevent.
+	backend := dataplane.Unwrap(s.dp)
+	if backend == nil {
 		buf.WriteString("Dataplane not loaded\n")
 		return
 	}
-	provider, ok := s.dp.(userspaceStatusProvider)
+	provider, ok := backend.(userspaceStatusProvider)
 	if !ok {
 		buf.WriteString("WireGuard telemetry requires the userspace dataplane\n")
 		return
@@ -1075,11 +1091,14 @@ func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
 // tunnel in WireGuard-canonical base64. Shared rendering with the local
 // CLI via dpformat.FormatWireguardPublicKeys.
 func (s *Server) showWireguardPublicKey(buf *strings.Builder) {
-	if s.dp == nil {
+	// #2114/#6743 r2-B4: same single-resolution publication check as
+	// showWireguard — ask the cell, not the permanently non-nil field.
+	backend := dataplane.Unwrap(s.dp)
+	if backend == nil {
 		buf.WriteString("Dataplane not loaded\n")
 		return
 	}
-	provider, ok := s.dp.(userspaceStatusProvider)
+	provider, ok := backend.(userspaceStatusProvider)
 	if !ok {
 		buf.WriteString("WireGuard telemetry requires the userspace dataplane\n")
 		return

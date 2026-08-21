@@ -5241,7 +5241,28 @@ func TestHostInboundRouterDiscovery(t *testing.T) {
 }
 
 func TestNat66SourceRules(t *testing.T) {
-	input := `security {
+	// The two zone members must be DEFINED under `interfaces`: since #6525 the
+	// compact-leaf `interfaces trust0;` spelling actually compiles into zone
+	// membership, so the strict zone-interface-defined gate now sees these
+	// members (before the fix they were silently dropped and the gate passed
+	// vacuously over an empty set).
+	input := `interfaces {
+    trust0 {
+        unit 0 {
+            family inet6 {
+                address 2001:db8::1/64;
+            }
+        }
+    }
+    untrust0 {
+        unit 0 {
+            family inet6 {
+                address 2001:db8:1::1/64;
+            }
+        }
+    }
+}
+security {
     nat {
         source {
             rule-set internal-to-internet {

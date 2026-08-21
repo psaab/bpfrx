@@ -56,11 +56,11 @@ func TestApplyConfigLockedReconcilesSNMPAuthorization(t *testing.T) {
 	d := &Daemon{
 		applySem:  semaphore.NewWeighted(1),
 		snmpAgent: agent,
-		dp:        &runtimeOnlyApplyTestDP{},
 		vrrpMgr:   vrrp.NewManager(),
 		store:     newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:      Options{NoDataplane: true},
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 
 	if err := d.applyConfigLocked(context.Background(), snmpDowngradeConfig()); err != nil {
 		t.Fatalf("applyConfigLocked: %v", err)
@@ -107,10 +107,10 @@ func TestApplyConfigLockedReconcilesSNMPBeforeDataplaneAbort(t *testing.T) {
 	d := &Daemon{
 		applySem:  semaphore.NewWeighted(1),
 		snmpAgent: agent,
-		dp:        dp,
 		store:     newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:      Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	err := d.applyConfigLocked(context.Background(), snmpDowngradeConfig())
 	if !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
@@ -165,7 +165,6 @@ func newSNMPReconcileDaemon(t *testing.T, serve func(context.Context, *snmp.Agen
 	installFakeNetworkctl(t)
 	d := &Daemon{
 		applySem:         semaphore.NewWeighted(1),
-		dp:               &runtimeOnlyApplyTestDP{},
 		vrrpMgr:          vrrp.NewManager(),
 		store:            newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:             Options{NoDataplane: true},
@@ -183,6 +182,7 @@ func newSNMPReconcileDaemon(t *testing.T, serve func(context.Context, *snmp.Agen
 		},
 		linkStateList: func() ([]netlink.Link, error) { return nil, nil },
 	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{}) // #2114: publish through the cell
 	t.Cleanup(d.teardownSNMP)
 	return d
 }

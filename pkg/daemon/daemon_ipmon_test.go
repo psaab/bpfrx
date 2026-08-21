@@ -74,9 +74,9 @@ func TestActuatorPublishesBeforeFIBBump(t *testing.T) {
 	dp := &fakeOverlayDP{}
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.actuateRouteOverlayLocked(&config.Config{})
 
 	if len(dp.calls) != 2 || dp.calls[0] != "publish" || dp.calls[1] != "bump" {
@@ -93,9 +93,9 @@ func TestActuatorSkipsBumpOnPublishFailure(t *testing.T) {
 	dp := &fakeOverlayDP{publishErr: errors.New("socket down")}
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.actuateRouteOverlayLocked(&config.Config{})
 
 	for _, c := range dp.calls {
@@ -282,9 +282,9 @@ func TestActuatorSkipsBumpOnDuplicatePublish(t *testing.T) {
 	dp := &fakeOverlayDP{publishSkipped: true}
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.actuateRouteOverlayLocked(&config.Config{})
 
 	if len(dp.calls) != 1 || dp.calls[0] != "publish" {
@@ -302,9 +302,9 @@ func TestActuatorRetriesUnconfirmedBump(t *testing.T) {
 	dp := &fakeOverlayDP{bumpErr: errors.New("control socket timeout")}
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	// Actuation 1: publish OK, bump fails → pending.
 	d.actuateRouteOverlayLocked(&config.Config{})
@@ -351,10 +351,10 @@ func TestActuatorPublishFailureKeepsPendingBump(t *testing.T) {
 	dp := &fakeOverlayDP{publishErr: errors.New("socket down")}
 	d := &Daemon{
 		applySem:       semaphore.NewWeighted(1),
-		dp:             dp,
 		ipmon:          failedIPMonEngine(t),
 		pendingFIBBump: true,
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.actuateRouteOverlayLocked(&config.Config{})
 
 	if len(dp.calls) != 1 || dp.calls[0] != "publish" {
@@ -396,9 +396,9 @@ func TestActuatorAbortsPublishOnHardFRRError(t *testing.T) {
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
 		frr:      frr.NewForTest(filepath.Join(t.TempDir(), "frr.conf"), hardFailFRRExec{}),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	if ok := d.actuateRouteOverlayLocked(&config.Config{}); ok {
 		t.Fatal("actuator reported success on a hard FRR reload failure")
@@ -422,9 +422,9 @@ func TestActuatorPublishesOnDegradedFRR(t *testing.T) {
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
 		frr:      frr.NewForTest(filepath.Join(t.TempDir(), "frr.conf"), &frr.RecordingExecutor{ReloadErr: errors.New("frr-reload down")}),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	if ok := d.actuateRouteOverlayLocked(&config.Config{}); !ok {
 		t.Fatal("actuator reported failure on a DEGRADED (additive-applied) reload")
@@ -454,9 +454,9 @@ func TestActuateRouteOverlaySkipsWhenResetting(t *testing.T) {
 	d := &Daemon{
 		applySem: semaphore.NewWeighted(1),
 		frr:      frr.NewForTest(filepath.Join(t.TempDir(), "frr.conf"), exec),
-		dp:       dp,
 		ipmon:    failedIPMonEngine(t),
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.enterResetGeneration()
 
 	if ok := d.actuateRouteOverlayLocked(&config.Config{}); ok {
