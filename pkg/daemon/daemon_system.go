@@ -941,11 +941,49 @@ func (d *Daemon) applyTimezone(cfg *config.Config) {
 // applySystemSyslog configures system-level syslog forwarding from
 // system { syslog { host ... } } config. This forwards daemon log
 // messages (Go slog) to remote syslog servers.
-// syslogHostMinSeverity folds the severity of every `<facility> <severity>`
-// pair of one syslog host into a single SyslogClient.MinSeverity threshold —
-// the most restrictive one, since the client carries a single filter. It
-// returns 0 (no filter / send-all) when no entry names a severity, matching
+// syslogHostMinSeverity computes the SyslogClient.MinSeverity threshold for
+// one syslog host from its `<facility> <severity>` selectors. It returns 0
+// (no filter / send-all) when no APPLICABLE entry names a severity, matching
 // the SyslogClient zero value.
+//
+// stampedFacility is the numeric facility code this host's client will stamp
+// into every record it emits (SyslogClient.Facility, chosen by the caller from
+// the authored selector list). It is the key, and it is what makes the
+// selection Junos-shaped rather than a blind fold.
+//
+// #5797 — WHICH SELECTORS APPLY. Junos evaluates `<facility> <severity>`
+// pairs INDEPENDENTLY: `daemon info; authorization critical` forwards daemon
+// records at info-or-higher and authorization records at critical-or-higher.
+// This function previously folded every pair to the single most restrictive
+// severity, so that config filtered the WHOLE destination at critical and
+// silently dropped the daemon notice/info records the operator explicitly
+// asked for. `daemon info; authorization none` was worse: `none` outranks
+// everything, so ONE selector naming a facility this client never emits
+// silenced the entire destination.
+//
+// A selector can only match a record whose facility it names. Every record
+// this client sends carries stampedFacility, so a selector resolving to a
+// DIFFERENT facility code matches nothing this client will ever send and must
+// not constrain it. Only two kinds of selector apply:
+//
+//   - the `any` wildcard (FacilityIsWildcard), which matches every record;
+//   - a selector whose facility resolves to stampedFacility.
+//
+// Resolution is by numeric CODE, not by authored name, because the code is
+// what appears in the wire PRI. Unmapped Junos names all resolve to local0
+// (ParseFacility's fallback, warned about at the call site), so a host that
+// actually stamps local0 is correctly constrained by them — the selector and
+// the emitted record genuinely share a facility on the wire.
+//
+// Junos more-specific-wins: when at least one exact-code selector applies, the
+// `any` wildcard does NOT also constrain the threshold. Two selectors naming
+// the SAME code are a genuine conflict on one facility and still fold to the
+// most restrictive of the two.
+//
+// RESIDUAL (tracked separately, NOT fixed here): a client carries one facility,
+// so a host naming two mappable facilities can still only honor one of them,
+// and which one is stamped depends on selector order. Honoring both needs a
+// source facility on the event envelope and per-facility routing.
 //
 // ParseSeverity maps ALL ten Junos severities (#5314): emergency
 // (SeverityEmergency), alert/critical/error/warning/notice/info/debug (raw
@@ -955,22 +993,44 @@ func (d *Daemon) applyTimezone(cfg *config.Config) {
 // them), so `host H <facility> critical` left MinSeverity at the 0 send-all
 // sentinel and over-forwarded info/warning/error records the operator never
 // authorized.
-func syslogHostMinSeverity(facilities []config.SyslogFacility) int {
-	min := 0 // no filter (send-all) default; also the SyslogClient zero value
-	set := false
+func syslogHostMinSeverity(facilities []config.SyslogFacility, stampedFacility int) int {
+	exact := 0 // fold of selectors naming stampedFacility
+	exactSet := false
+	wild := 0 // fold of `any` selectors
+	wildSet := false
+
 	for _, f := range facilities {
 		if f.Severity == "" {
 			continue
 		}
 		sev := logging.ParseSeverity(f.Severity)
-		if !set {
-			min = sev
-			set = true
-			continue
+		switch {
+		case logging.FacilityIsWildcard(f.Facility):
+			if !wildSet {
+				wild, wildSet = sev, true
+			} else {
+				wild = logging.MoreRestrictiveMinSeverity(wild, sev)
+			}
+		case logging.ParseFacility(f.Facility) == stampedFacility:
+			if !exactSet {
+				exact, exactSet = sev, true
+			} else {
+				exact = logging.MoreRestrictiveMinSeverity(exact, sev)
+			}
 		}
-		min = logging.MoreRestrictiveMinSeverity(min, sev)
+		// Any other selector names a facility this client never emits. It
+		// matches nothing here, so it contributes nothing — that is the whole
+		// #5797 correction.
 	}
-	return min
+
+	// Junos more-specific-wins: an exact selector displaces the wildcard.
+	if exactSet {
+		return exact
+	}
+	if wildSet {
+		return wild
+	}
+	return 0 // no applicable selector named a severity: send-all
 }
 
 func (d *Daemon) applySystemSyslog(cfg *config.Config) {
@@ -1037,6 +1097,30 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 					"host", host.Address, "facility", raw, "using", "local0")
 			}
 			facility = f
+
+			// #5797: a selector naming a facility OTHER than the one this
+			// client stamps can never match a record it sends, so it no longer
+			// contributes to the threshold (syslogHostMinSeverity). That is the
+			// correct semantics, and it is also a silent no-op the operator has
+			// no way to see — they asked for `authorization critical` and get
+			// neither the records nor a complaint. Say so, once per apply.
+			//
+			// This is not the unmapped-name warning above: the name may be
+			// perfectly well-formed (`kern`, `auth`) and still be inapplicable,
+			// because a client carries ONE facility. Honoring several needs a
+			// source facility on the event envelope, which is the successor
+			// issue's architecture.
+			for _, sel := range host.Facilities {
+				if logging.FacilityIsWildcard(sel.Facility) ||
+					logging.ParseFacility(sel.Facility) == facility {
+					continue
+				}
+				slog.Warn("system syslog: selector names a facility this host's client does not "+
+					"emit, so it selects nothing — every record to this host carries the "+
+					"stamped facility (#5797)",
+					"host", host.Address, "selector", sel.Facility,
+					"severity", sel.Severity, "stamped", facility)
+			}
 		}
 
 		c, err := logging.NewSyslogClientWithSource(host.Address, port, host.SourceAddress)
@@ -1048,7 +1132,10 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 
 		c.Facility = facility
 		if len(host.Facilities) > 0 {
-			c.MinSeverity = syslogHostMinSeverity(host.Facilities)
+			// #5797: keyed on the facility this client actually stamps, so a
+			// selector naming a DIFFERENT facility cannot restrict (or, with
+			// `none`, silence) records it can never match.
+			c.MinSeverity = syslogHostMinSeverity(host.Facilities, facility)
 		}
 
 		clients = append(clients, c)
