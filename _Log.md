@@ -276,6 +276,123 @@
   `pkg/dataplane/userspace/controllers.go`,
   `pkg/dataplane/userspace/legacy_dataplane.go`,
   `pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go` (new), `_Log.md`
+## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
+
+- **Timestamp**: 2026-08-20 (fix/6848-cos-show-rewrite-rule, PR #6858)
+- **Action**: Drive-lane hostile pass, scoped to the dangerous direction the
+  command exists to close: can it report a rewrite rule as ENFORCED when the
+  dataplane is not applying it. It could, and round 2 did not close it.
+  `cosBoundDSCPRewriteRules` walked `cfg.ClassOfService.Interfaces` — the CoS
+  stanza — while `buildInterfaceSnapshots` (pkg/dataplane/userspace/
+  interfaces.go) walks `cfg.Interfaces.Interfaces` and reads the CoS unit off
+  each REAL logical unit. A `class-of-service interfaces ge-9-9-9 unit 0
+  rewrite-rules dscp rw` stanza with no `interfaces ge-9-9-9` anywhere COMMITS,
+  and the command answered `Enforced: yes` for a rewrite the helper can never
+  see. (A first draft of this entry claimed the commit was silent. It is not —
+  `compiler_validate_warn.go:1586`/`:1599` warn "class-of-service interface %s
+  is bound but not configured under [interfaces]". That was an enumeration read
+  as a census: a grep for `rewrite-rule` plus a read starting at :1600 missed two
+  warnings that sit above it and say "shaping/classifiers". The advisory fires
+  ONCE at commit and scrolls past, which is the exact signal this command exists
+  to replace with a standing view, so the finding stands and only the claim was
+  wrong. Issue #7064, filed on the false claim, is closed as invalid with the
+  correction.) Same
+  for a UNIT mismatch (CoS binds unit 0, the interface declares only unit 100).
+  Both measured through the real compile path, not reasoned about. The
+  predicate now mirrors the snapshot builder, and an operator who DID write a
+  binding is told WHERE the dead reference is rather than a bare "not bound",
+  which reads as "you forgot to bind it" and sends them to the wrong place.
+  Two fixtures were pinning the defect: the grpcapi `newCoSRewriteRuleServer`
+  and `TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858` both bound to
+  `ge-0-0-1` with no `interfaces` stanza, so both went RED on the fix and both
+  now author the logical unit. The empty-named-rule guard test would have gone
+  VACUOUS under the new walk (its unit is no longer reached), so its
+  precondition was moved onto the real-unit path and re-checked by deleting the
+  fixture line — it fires. Mutation cells: reverting the walk to the pre-fix
+  shape and deleting the dangling reason each RED the new pin, build clean, with
+  byte-identical restores verified by sha256. Three non-runtime findings filed
+  rather than folded: #7063 (enforcement cannot see the helper's own
+  `useful_cos_state` / queue-materialization gate, so a rule whose
+  forwarding-classes miss the interface's queues still reads enforced) and #7065
+  (`show class-of-service` renders such a phantom interface identically to a live
+  one, pre-existing since #4228 Gap 7). #7064 was filed and then closed as
+  invalid — see the correction above. Also merged origin/master: `_Log.md` union-resolved (section and
+  Timestamp counts equal ours+theirs-base, and every heading/timestamp from both
+  sides present set-wise) and `docs/refactoring-audit-current.txt` REBUILT with
+  `scripts/refactoring-audit.sh` rather than hand-resolved — it had gone stale on
+  `pkg/cmdtree/tree.go` (1606 -> 1652).
+- **File(s)**: pkg/dataplane/userspace/format/cos_show.go,
+  pkg/dataplane/userspace/format/cos_rewrite_rule_inert_6858_test.go,
+  pkg/grpcapi/server_show_cos_rewrite_rule_6848_test.go,
+  docs/cos-validation-notes.md, docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-08-05 — #6858 fold: `Enforced: yes` for an UNBOUND dscp rewrite rule
+
+- **Timestamp**: 2026-08-05 (fix/6848-cos-show-rewrite-rule, PR #6858)
+- **Action**: Gate MAJOR, and a self-inflicted one. `Enforced` was computed from
+  the code-point TYPE alone, but runtime DSCP rewriting happens only for the
+  rule an egress interface REFERENCES — the rewrite table is built from
+  `tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`. So a dscp rule
+  no unit binds rewrites nothing, and the command printed `Enforced: yes` for
+  it. That is the accepted-but-inert failure class reproduced INSIDE the command
+  written to expose it, and worse than shipping no command at all: it converts
+  an unanswered question into a confidently wrong answer. Fixed by splitting
+  into THREE states — bound dscp / unbound dscp / unsupported type — with a
+  distinct reason for each. An unbound dscp rule deliberately does NOT borrow
+  the unsupported-type wording: the type is supported and the binding is what is
+  missing, and conflating them would send the operator to fix the wrong thing.
+- **BOTH fixtures pinned the defect**, not just the one the gate named. The gRPC
+  fixture bound no rewrite rule, and so did the format-level one (via
+  `testCoSConfig`, which binds classifiers but no rewrite rule) — both asserted
+  `Enforced: yes`. Surveyed every `Enforced:` assertion in the tree to confirm
+  those two are the complete set rather than assuming it. `Enforced: yes` is now
+  earned by a real binding in both.
+- **Validation**: full `go test ./...` green, real exit 0. New pins: unbound-is-
+  not-enforced (format + a producible gRPC case authored in real `set` syntax
+  with no bind line) plus a bound-IS-enforced positive control, without which
+  "never says yes" would satisfy the unbound assertion. Mutation-proven.
+- **File(s)**: `pkg/dataplane/userspace/format/cos_show.go`,
+  `pkg/dataplane/userspace/format/cos_rewrite_rule_show_test.go`,
+  `pkg/grpcapi/server_show_cos_rewrite_rule_6848_test.go`,
+  `docs/cos-validation-notes.md`, `_Log.md`
+
+## 2026-08-05 — #6848: `show class-of-service rewrite-rule` (#4228 Gap 7 residual)
+
+- **Timestamp**: 2026-08-05 (fix/6848-cos-show-rewrite-rule)
+- **Action**: Added the one Junos CoS show command the #4228 Gap 7 pass did not
+  land. It matters more now than at plan time: `rewrite-rules` has since grown
+  `ieee-802.1` (#4228 Gap 4), `inet-precedence` and `exp` (#4316), and all
+  three are accepted-but-inert — so an operator could configure four kinds of
+  rewrite rule, three of which do nothing at runtime, with no command to
+  display any of them and only a one-shot commit advisory as a signal. The
+  renderer therefore reports enforcement as a COLUMN, not a footnote; rendering
+  an inert rule identically to an enforced one would reproduce the silence
+  inside the command built to expose it. The four families do not carry equal
+  data — `dscp`/`ieee-802.1` compile to entry lists while `inet-precedence`/
+  `exp` record names only — so the latter render "Code points not modeled"
+  rather than an empty table that would imply a fidelity the config lacks.
+  Wired on BOTH surfaces (local CLI + gRPC/remote `cli`); a command on only one
+  works interactively and falls through to help text on the binary most
+  operators use. Also fixed a latent completion/behavior mismatch in the
+  pre-existing sibling: cmdtree offers rule names directly under the command,
+  but the keyword-only parser ignored a bare positional and dumped everything —
+  the shared parser now accepts it, so `classifier` and `rewrite-rule` match
+  what they advertise.
+- **Validation**: full `go test ./...` green, scored from a REAL exit code
+  (`REAL_EXIT=0`), not a pipe. The #6532 fabric secret-render audit canary
+  caught the new topic as peer-reachable over the cluster fabric and was
+  extended accordingly — a genuine cross-cutting catch, not a formality.
+  Fail-on-revert proven by mutation with build+vet clean at each step.
+- **File(s)**: `pkg/dataplane/userspace/format/cos_show.go`,
+  `pkg/dataplane/userspace/format/cos_rewrite_rule_show_test.go` (new),
+  `pkg/cmdtree/tree.go`, `pkg/cmdtree/cos_rewrite_rule_6848_test.go` (new),
+  `pkg/cli/show_services_cos.go`,
+  `pkg/cli/cos_rewrite_rule_args_6848_test.go` (new),
+  `pkg/grpcapi/server_show.go`, `pkg/grpcapi/server_show_interfaces_text.go`,
+  `pkg/grpcapi/server_show_cos_rewrite_rule_6848_test.go` (new),
+  `pkg/grpcapi/server_fabric_secret_render_6532_test.go`, `cmd/cli/show.go`,
+  `cmd/cli/cos_rewrite_rule_topic_6848_test.go` (new),
+  `docs/cos-validation-notes.md`, `_Log.md`
 ## 2026-08-20 — #5806 drive round (PR #6839): merge-gate pass, runtime-only bar
 
 - **Timestamp**: 2026-08-20 (fix/5806-screen-unresolved-visibility, PR #6839)
@@ -88236,6 +88353,106 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   touched is docs/reth-mac.md.
 - **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   docs/reth-mac.md, _Log.md
+- **Timestamp**: 2026-08-20T19:40Z
+- **Action**: #6858 round 2 — folded the first-ever gate on `show class-of-service
+  rewrite-rule` (two blocking, one major, three survivors, three fictional
+  citations).
+
+  **B1 — the guard named "MatchRenderer" could not see the renderer.** The family
+  list exists in THREE places (the renderer's hardcoded per-family branches,
+  `format.CoSRewriteRuleTypes`, and the cmdtree `type` children), and
+  `TestCoSRewriteRuleTypeChildrenMatchRenderer` pinned only the latter two.
+  Nothing but that test reads `CoSRewriteRuleTypes`, so the pair was a closed
+  loop: deleting `appendNameOnly("exp", cos.EXPRewriteRules)` from
+  `FormatCoSRewriteRules` compiled and left `go test ./pkg/cmdtree/ -run
+  TestCoSRewriteRule` at rc=0 (reproduced firsthand at 8941948d3). Both checks
+  now measure against the population the schema accepts —
+  `config.CompleteSetPath(["class-of-service","rewrite-rules"])`, i.e. what an
+  operator can commit — and a new
+  `TestCoSRewriteRuleRendererCoversEverySchemaFamily` commits a rule of every
+  schema family in real `set` syntax and renders it, which is the only way to
+  observe branches that are not a list. The false SSOT sentences at
+  `cos_show.go` and in `docs/cos-validation-notes.md` are corrected rather than
+  softened.
+
+  **B2 — local and remote disagreed on config that commits.** The ShowText topic
+  joined params with `,` and split on `,`, but a rewrite-rule or classifier NAME
+  may contain a comma: `set class-of-service rewrite-rules dscp "rw,x"` commits
+  and reads back as `rw,x` (verified through the real store, along with `%`,
+  `=`, space and the empty name). Remotely the name truncated at the comma, so
+  the server rendered the rule named `rw` — a DIFFERENT rule — or reported that
+  the operator's rule did not exist. The flaw was pre-existing: master's
+  `cos-classifier` encoding is identical, and the two share one decoder, so both
+  are fixed here.
+
+  The fix is structural. The grammar and the codec were written three times —
+  `pkg/cli` args->filters, `cmd/cli` args->topic, `pkg/grpcapi` topic->filters —
+  under a comment asking editors to keep the mirrored test tables in step; they
+  had already drifted (`pkg/cli` honored a trailing `name` keyword over a leading
+  bare token, `cmd/cli` did not). All three now call
+  `cmdtree.ParseCoSNameTypeArgs` / `CoSNameTypeTopic` / `ParseCoSNameTypeTopic`
+  in the new `pkg/cmdtree/cos_filter_topic.go`, which adds no dependency edge:
+  all three already imported cmdtree. Values are percent-escaped for `% , = :`
+  and space; a value with none of them encodes byte-identically to the old form,
+  so ordinary topics are unchanged on the wire and no proto field moved.
+  Parity is now ONE property — `ParseCoSNameTypeTopic` inverts
+  `CoSNameTypeTopic` — and the per-surface tests assert wiring, not grammar.
+
+  **B3 — the doc predicted a drift nothing guarded.** Deleting the ieee-802.1
+  inert advisory reddened exactly one test, in `pkg/config`; formatter, gRPC peer
+  and cmdtree stayed green, so a developer enforcing 802.1 would delete the
+  advisory, see one red, delete that too, and ship a command reporting a working
+  rewrite as inert. `TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858`
+  asserts the biconditional over every committable family: the commit emits an
+  accepted-but-inert advisory iff the rendered rule carries the unsupported-TYPE
+  reason. It keys on the type reason rather than on "Enforced: no", so a family
+  that becomes enforced-but-unbound does not read as a violation, and the
+  unit-bindable subset is read from the schema rather than re-typed.
+
+  **B4 — three survivors from the gate's deletion sweep.** `sort.Strings` in
+  `appendNameOnly` was unobservable because both name-only fixtures held ONE
+  rule; `sort.SliceStable(blk.rows, ...)` was unobservable because every
+  assertion was `strings.Contains`. Both now have fixtures authored in
+  deliberately non-sorted config order with the order asserted, each preceded by
+  a precondition check so the fixture cannot go vacuous. The
+  `unit.DSCPRewriteRule == ""` guard was NOT benign: an empty-named rewrite rule
+  commits, and any unit carrying some other CoS binding (a classifier, say)
+  exists with `DSCPRewriteRule == ""` — the ordinary case — so without the guard
+  the empty string enters the bound set and the empty-named rule reports
+  "Enforced: yes" while nothing references it. Both halves measured through the
+  real commit path before writing the binding.
+
+  **B5** — three cited identifiers that existed only at their citation:
+  `cosRewriteRuleEnforced` (real: `cosRewriteRuleEnforcement`, and its
+  FAIL-ON-REVERT instruction said "return true unconditionally" for a function
+  returning a string), `TestCoSRewriteRuleTypeFilterMatchesCmdtree` (fictional),
+  and `TestFormatCoSRewriteRulesNameOnlyFamiliesAreProducible` (real:
+  `TestShowTextCoSRewriteRuleNameOnlyFamiliesAreProducible6848`, in
+  `pkg/grpcapi`). All verified absent-at-declaration with `git grep` against HEAD
+  before correcting.
+
+  **Validation**: `go build ./...` rc=0; `go vet` rc=0 on the five touched
+  packages; `go test -count=1` over `./pkg/config/ ./pkg/dataplane/userspace/format/
+  ./pkg/cmdtree/ ./pkg/cli/ ./cmd/cli/ ./pkg/grpcapi/` rc=0 with 0 `--- FAIL`.
+  Mutation proof, 13 cells, all RED with an always-failing sentinel and a
+  byte-identical restore verified per cell: the four renderer family branches
+  deleted one at a time (including the exp deletion that PASSED before), the two
+  list copies corrupted, the escape made a no-op (which reproduced the defect
+  verbatim — remote rendered `Classifier: cl` where local rendered
+  `Classifier: cl,x`), the ieee-802.1 and exp advisories deleted, the
+  `cpType != "dscp"` mapping flipped, both sorts deleted, and the empty-name
+  guard removed. No Rust or dataplane code is touched, so no cargo leg is
+  implicated.
+- **File(s)**: pkg/cmdtree/cos_filter_topic.go, pkg/cmdtree/cos_filter_topic_test.go,
+  pkg/cmdtree/cos_rewrite_rule_6848_test.go, pkg/cmdtree/README.md,
+  pkg/dataplane/userspace/format/cos_show.go,
+  pkg/dataplane/userspace/format/cos_rewrite_rule_inert_6858_test.go,
+  pkg/dataplane/userspace/format/cos_rewrite_rule_show_test.go,
+  pkg/cli/show_services_cos.go, pkg/cli/cos_rewrite_rule_args_6848_test.go,
+  cmd/cli/show.go, cmd/cli/cos_rewrite_rule_topic_6848_test.go,
+  pkg/grpcapi/server_show_interfaces_text.go,
+  pkg/grpcapi/server_show_cos_filter_parity_6858_test.go,
+  docs/cos-validation-notes.md, _Log.md
 - **Timestamp**: 2026-08-20T19:55Z
 - **Action**: #6839 round 3 — closed the ordering property on the SECOND renderer
   that ships it, and narrowed two claims to what was measured.
