@@ -38,7 +38,13 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 			Userspace:     ucfg,
 		}, nil
 	}
-	interfaces := buildInterfaceSnapshots(cfg)
+	// ONE kernel xfrm sample for the whole snapshot (#6691 round 10). The
+	// interface rows and the fabric parents are both judged against it, and a
+	// second dump could disagree with the first about the same device — which
+	// would put a netdev's owners on opposite sides of the unanimity rule for
+	// no reason but sampling.
+	liveXfrm := sampleLiveXfrmNetdevs()
+	interfaces := buildInterfaceSnapshotsFrom(cfg, liveXfrm)
 	// #2514: the address-book content-ID assignment and the policy
 	// snapshot builder (which consumes the same nameToID map) can return
 	// an AddressBookIDCollisionError on an unresolvable folded-hash
@@ -85,7 +91,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		Userspace:       ucfg,
 		Zones:           buildZoneSnapshots(cfg),
 		Interfaces:      interfaces,
-		Fabrics:         buildFabricSnapshots(cfg),
+		Fabrics:         buildFabricSnapshotsFrom(cfg, liveXfrm),
 		TunnelEndpoints: buildTunnelEndpointSnapshots(cfg, interfaces),
 		Neighbors:       buildNeighborSnapshots(cfg),
 		Routes:          routes,

@@ -106,6 +106,39 @@ pub(crate) struct InterfaceSnapshot {
     pub unit_count: usize,
     #[serde(default)]
     pub tunnel: bool,
+    /// #6691: the Go control plane resolved that this row's netdev IS a
+    /// route-based IPsec tunnel device, so this plane must not bind it.
+    ///
+    /// Two oracles, one claim (`snapshotSecureTunnel`, round 8): some
+    /// `security ipsec vpn <name> bind-interface` NAMES the row's device
+    /// (`Config.SecureTunnelNetdevForRef`), OR the netdev the row resolves to
+    /// has kernel link kind `xfrm`. The second half sees a live xfrmi the
+    /// config no longer describes — a failed `LinkDel` retains one while the
+    /// apply proceeds on a deferred error, and a daemon restart leaves an
+    /// untracked one — which every config-keyed predicate is blind to. The
+    /// wire meaning, type and tag are unchanged, so no protocol bump is owed
+    /// for the second half; only the evidence the control plane accepts.
+    ///
+    /// OWNERSHIP or DEVICE KIND, never name shape. Nothing reserves the `st`
+    /// prefix, so a wildcard-authored `st5` with no VPN is an ordinary data
+    /// interface, is not an xfrm device, and this stays false. Classifying by
+    /// shape here used to strip such an interface of its AF_XDP binding — a
+    /// traffic outage on a working NIC.
+    ///
+    /// Absent from an older Go control plane's snapshot, in which case serde
+    /// defaults it to false and an xfrmi would receive a binding it cannot
+    /// use. That is the #5619 gap, which both planes' comments rank as less
+    /// bad than the outage the shape test caused.
+    ///
+    /// Serialized only when TRUE, mirroring the Go side's `omitempty`, so a
+    /// snapshot with no secure tunnels is byte-identical to the pre-#6691
+    /// wire format (`protocol_wire_v1.json`).
+    #[serde(
+        rename = "secure_tunnel",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub secure_tunnel: bool,
     #[serde(default)]
     pub mtu: i32,
     #[serde(rename = "hardware_addr", default)]
@@ -489,6 +522,21 @@ pub(crate) struct FabricSnapshot {
     pub parent_linux_name: String,
     #[serde(rename = "parent_ifindex", default)]
     pub parent_ifindex: i32,
+    /// #6691 round 10: the device-level verdict for the parent netdev — the
+    /// dataplane must never bind an AF_XDP socket to it.
+    ///
+    /// A fabric MEMBER needs no interface stanza, so the parent netdev usually
+    /// has no `InterfaceSnapshot` in this snapshot at all, and
+    /// `snapshot_refuses_parent_netdev`'s unanimity tally over an empty owner
+    /// set answers "not refused". This field is that missing owner's vote. It
+    /// is computed Go-side because half its evidence is a kernel RTM_GETLINK
+    /// dump (link kind `xfrm`) this process does not take.
+    ///
+    /// `default` decodes an absent field to `false` = bindable, which is the
+    /// pre-round-10 behaviour; the protocol version moved to 7 so a control
+    /// plane that relies on the flag never meets a helper that ignores it.
+    #[serde(rename = "parent_unbindable", default)]
+    pub parent_unbindable: bool,
     #[serde(rename = "overlay_linux_name", default)]
     pub overlay_linux_name: String,
     #[serde(rename = "overlay_ifindex", default)]

@@ -1087,6 +1087,1617 @@
   pkg/grpcapi/server_show_system_single_resolve_6743_test.go;
   pkg/grpcapi/wireguard_publication_check_6743_test.go
 
+## 2026-08-13 — #6691 round 9c: the v5 → v6 mixed-version matrix, measured on the REFERENCE cluster shapes
+
+- **Timestamp**: 2026-08-13 21:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Measured both directions of the protocol bump before a cluster
+  smoke, on the shapes the clusters actually run rather than the shape the
+  change was designed around.
+- **File(s)**: `pkg/dataplane/userspace/mixed_version_matrix_6691_test.go` (new),
+  `pkg/daemon/mixed_version_commit_6691_test.go` (new),
+  `userspace-dp/src/main_tests.rs`, `_Log.md`
+
+  **WHY THE REFERENCE SHAPE AND NOT THE MOTIVATING ONE.** #6722 bumped 4 → 5
+  earlier the same day, and its first matrix measured ONE ifindex and
+  generalised to the population; the counterexample was an ifindex master
+  forwarded, the buggy head forwarded, and the MIXED pairing dropped — strictly
+  worse than both endpoints. The motivating shape here (a route-based IPsec
+  tunnel) is the LEAST likely to expose a compatibility defect, because it is
+  the one the gate was built for. The question that matters is what a mixed
+  pairing does to a cluster with no secure tunnel at all.
+
+  **MEASURED: the reference cluster arms NOTHING.** The real
+  `docs/ha-cluster-userspace.conf` parses and strict-compiles to **16 interface
+  rows, 0 SecureTunnel rows**. So on the loss userspace cluster the v6 gate is
+  INERT and the only mechanism in a mixed pairing is the helper's
+  version-equality check. That makes the mixed-version behaviour there identical
+  in KIND to every previous bump — it is not specific to this change.
+
+  **MEASURED: both operand orders refuse, against the real dispatcher.**
+  `apply_snapshot_rejects_unsupported_protocol_version` already drove
+  `CONFIG_SNAPSHOT_PROTOCOL_VERSION - 1` (a v5 control plane meeting this v6
+  helper) through `handle_stream` over a socketpair. Round 9c adds
+  `apply_snapshot_rejects_a_newer_protocol_version_too` for `+ 1`, because the
+  other direction — a v6 control plane meeting a v5 HELPER — cannot be run
+  without a v5 binary, and what it depends on is that
+  `snapshot.version != CONST` refuses whichever side is ahead. That was READ
+  from the symmetry of one line; it is now measured. Fail-on-revert confirmed:
+  weakening the check to `<` makes the new cell RED with "a snapshot at a NEWER
+  protocol version was accepted".
+
+  **MEASURED: the commit consequence, both directions, with the REAL error.**
+  The existing #5679 proof injects a GENERIC apply failure ("control-socket sync
+  failed"), which leaves the step from "the helper refused on version" to "the
+  commit fails via the deferred path" as a READ of the classification.
+  `TestMixedVersionHelperRefusalFailsTheCommit_6691` injects the actual string
+  the helper emits, wrapped as `process_control.go` and
+  `publishSnapshotFailClosedLocked` wrap it, in both operand orders. Result:
+  `applyConfigLocked` FAILS the commit, the apply was attempted exactly once,
+  the error is NOT abort-class, and the peer config-sync is NOT skipped.
+
+  **THE ANSWER IS A CLEAN REFUSAL IN BOTH DIRECTIONS — no wrong answers.** But
+  the two halves of "aborts the commit with the helper still forwarding" belong
+  to DIFFERENT paths, and conflating them would misdescribe the design:
+
+  | pairing | gate arms? | commit | helper |
+  |---|---|---|---|
+  | v6 CP → v5 helper, no secure tunnel (every reference cluster) | no | FAILS (#5679 deferred) | refused the snapshot, still ARMED on previous-good, forwarding |
+  | v5 CP → v6 helper, no secure tunnel | no | FAILS (#5679 deferred) | same |
+  | v6 CP → v5 helper, WITH a secure tunnel | YES | ABORTS early | deliberately DISARMED |
+
+  The asymmetry is the designed one and is worth stating out loud: a helper that
+  cannot PARSE the snapshot keeps forwarding what it already enforces, because
+  disarming it would convert a handshake disagreement into a dataplane outage. A
+  helper that would MISENFORCE the snapshot (a pre-v6 reader that ignores
+  `secure_tunnel` and plans an AF_XDP binding for the xfrmi) is disarmed,
+  because forwarding under a rule it reads wrongly is worse than not forwarding.
+  Both classifications are asserted, so neither can drift into the other.
+
+  **Both planes are asserted at 6 in the same test**, since a bump that moved
+  only one side would make EVERY pairing a mismatch, matched deployments
+  included.
+
+## 2026-08-13 — #6691 round 9b: the kernel evidence was sampled three times, and two of the guards meant to make round 8 safe could not fire
+
+- **Timestamp**: 2026-08-13 19:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded an independent Codex DO-NOT-MERGE (8 blocking) on top of
+  round 9. Two of the eight overturn earlier conclusions of MINE that a previous
+  round had endorsed; two more are guards that were incapable of failing.
+- **File(s)**: `pkg/dataplane/userspace/{ingress_exclusions,interfaces,maps_sync,manager_compile,protocol,manager_status,manager_ha,manager_overlay,process_status,manager_worker_arm_5134}.go`,
+  `pkg/dataplane/userspace/{secure_tunnel_parent_redirect_6691,secure_tunnel_protocol_6691,snapshot_allowlist,scoped_global_zoneset_*,manager_capabilities}_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`, `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **EVERY ITEM WAS MEASURED AT MY OWN HEAD (8de9691d8) BEFORE BEING CHANGED**,
+  because two of the eight were about round 9's fix rather than round 8's, and
+  one of the eight turned out to be ALREADY CLOSED by round 9. Reporting a fix
+  for something already fixed is the same failure as missing one.
+
+  **#2 GRE spelling — ALREADY CLOSED by round 9, reported as such.** The
+  `gr-0/0/0 unit 0 tunnel …` shape is the third combination of the round-9
+  blocker, and the EVERY-owner rule covers it identically to WireGuard: measured
+  at 8de9691d8, refused index empty, ingress [10 41], allowlist
+  [ge-0-0-0 gr-0-0-0], no divergence. Added as a case, not as a fix.
+
+  **#2b DIRECT own-ifindex path — NOT a hole under the EVERY rule, and the
+  reason is structural.** A row reaching the direct arm has passed
+  userspaceSkipsIngressInterface, and unbindable ⇒ skipped, so it is a BINDABLE
+  owner of its own ifindex bucket and that bucket cannot be unanimous. The
+  refusal is unaskable there. Adding the call would have been an inert conjunct;
+  the invariant is asserted instead.
+
+  **#3 — the over-exclusion ran the OTHER way, and round 9 did not fix it.**
+  buildUserspaceIngressIfindexes' refused-parent arm dropped the WHOLE ROW.
+  Correct for a VLAN child (the parent IS its bind target); wrong for a plain
+  unit that merely CARRIES a parent ifindex. Measured with secure `st10` at 11
+  and an ordinary live `st10.5` at 12: ingress [10] — 12 missing — while the RSS
+  allowlist named `st10.5` and Rust made it a candidate. A netdev with a binding
+  and no ingress entry takes cpumap_or_pass and leaves the adjudicated path — the
+  ingress/plan split in the opposite direction from the one round 8 fixed. The
+  parent key is now always suppressed and the row survives iff it owns its
+  netdev. After: ingress [10 12], with 11 still out.
+
+  **#1 — the FABRIC gap is REACHABLE, and the reachability is this PR's own
+  doing.** Round 8 recorded it as unreachable on the ground that
+  LocalFabricMember resolves only for slot-shaped names, so an `st*` member
+  yields no fabric row. That reasoning answered the PRE-round-8 question, when
+  the exclusion was keyed on the ref's NAME. Round 8's kernel-kind half refuses
+  a device for what it IS, so a slot-shaped `ge-0/0/0` created or renamed out of
+  band is BOTH refused AND a legal `fabric-options member-interfaces` value.
+  Measured: refused index name{ge-0-0-0} ifx{20}, yet allowlist
+  [ge-0-0-0 ge-0-0-3] and ingress [20 21]. All FOUR loops now ask the index —
+  two in Go, plus Rust's replan_queues layout AND its plan-key hash, so the
+  #2915 hash/layout invariant holds for fabrics too. After: allowlist
+  [ge-0-0-3], ingress [21]. **#6998 was filed by round 9 as pre-existing and is
+  now CLOSED by round 9b**, with its own repro re-measured: ingress [25],
+  allowlist [ge-0-0-9], the refused member in neither.
+
+  **#4 — the kernel evidence was sampled THREE times, fail-open, and one
+  disagreement was unsafe.** Measured with an oracle that shows the xfrm device
+  to the first dump only: the built snapshot carried SecureTunnel=true on `st10`
+  and correctly excluded it from ingress, while `configHasSecureTunnel`
+  re-enumerated and returned **false** — the required-protocol gate stayed
+  SILENT for exactly the snapshot it exists to refuse, leaving a pre-v6 helper
+  ARMED on its previous-good image. That falsified the function's own documented
+  invariant ("cannot … stay silent for one that does").
+
+  Fixed structurally rather than per-path: `ensureRequiredSnapshotProtocolLocked`
+  now takes the **snapshot**, not the config, and the secure-tunnel gate reads
+  the flag the builder stamped (`snapshotHasSecureTunnel`). Every call site
+  already had one in scope — the apply paths pass what they are about to
+  publish, the poll/status/HA paths pass `m.lastSnapshot`, which is what is
+  actually being enforced and is a better oracle than re-deriving. The gate now
+  takes NO dump at all. Measured after: gate `true` on the applied snapshot with
+  the sample count still 1.
+
+  Also fixed: `liveXfrmNetdevs` discarded a PARTIAL dump. netlink v1.3.1 returns
+  the links it did deserialize together with `ErrDumpInterrupted`
+  (link_linux.go returns early only for a non-interrupt error, then
+  `return res, executeErr`), so an interrupted dump threw away real evidence
+  INCLUDING the xfrm device, while the per-row buildLinkSnapshot lookups still
+  resolved it — the stale xfrmi came back Ifindex > 0 with SecureTunnel false,
+  the exact state the belt exists to catch. Round 8 called that "fails OPEN
+  because the config half is the primary"; it was not a considered trade.
+
+  **NOT claimed as eliminated:** UserspaceBoundLinuxInterfaces still takes its
+  own sample, because its three daemon call sites hold only a
+  `*config.Config`. That is documented at the site rather than papered over, and
+  its disagreement is conservative by construction — an allowlist entry is
+  permission to reshape a NIC, so doubt must NAME FEWER netdevs, which is what
+  the degrade-to-nil path and the partial-dump fix both do.
+
+  **#7 — the enumeration guard was TAUTOLOGICAL.** It compared six hard-coded
+  strings against a hard-coded 6. Codex's mutation (add an unenumerated
+  production exclusion class) fired NO assertion, so the fail-on-revert contract
+  in that test's own doc comment was false — and it is the guard round 9 quoted
+  on the PR as pinning its enumeration. Fixed by making PRODUCTION enumerate its
+  classes: the switch is now `netdevExclusionClasses`, a named table, and
+  `userspaceNetdevExclusionClass` returns WHICH class fired. The test asserts
+  both directions against that slice and adds a per-case positive control, so a
+  case cannot claim a class it does not trigger. Verified: the same mutation now
+  reds.
+
+  **#8 — the `Type() == "xfrm"` discriminator was UNBOUND.** Every test presents
+  a kernel by replacing the whole liveXfrmNetdevs closure, so deleting the kind
+  filter — a mutation that classifies EVERY link as an xfrm interface and would
+  strip every NIC of its AF_XDP binding — left the package green. A test that
+  supplies the answer cannot check the thing that computes it. Split into two
+  pure functions, `xfrmNetdevNames` (the classifier) and `xfrmDumpNames` (the
+  error policy), each driven directly. The FIRST 9b grid then found the error
+  policy still surviving, which is why it is two functions and not one.
+
+  **#5 — protocol bumped 5 → 6, assertion pinned to EQUALITY.** Not for the
+  kernel half: for the fact that the REFUSAL RULE the flag feeds changed inside
+  this PR. A round-8 v5 helper and a round-9 v5 helper accept identical bytes and
+  plan different bindings for a VLAN sibling of a flagged parent. A version whose
+  meaning depends on which round produced the binary is not a version. The old
+  assertion was `ProtocolVersion > 4`, which stays GREEN at the colliding value —
+  a weak assertion independent of reachability. Neither 5 nor 6 has shipped
+  (#6691 is unmerged), so the bump costs nothing.
+
+  **Claim corrections, each measured before rewriting.** The mgmt/control
+  device-predicate mutation fires ONLY the placement assertion (a t.Fatal, so the
+  ingress and allowlist assertions below never run) — round 9 said "both
+  assertions" and that was wrong. `configHasSecureTunnel`'s cost sentence was
+  wrong three ways (the dump was unconditional once the config half found
+  nothing; "skipped on a box with no xfrm devices" described the RESULT being
+  empty, not the dump being skipped; the poll-triggered arm reconciliation does
+  reach the gate). `secure_tunnel` is no longer read by one Rust consumer.
+  The allowlist builder DOES depend on ordinary link/ifindex resolution. The
+  README's ParentIfindex-guard ORDER was backwards — maps_sync calls the
+  predicate first. `ensureSecureTunnelProtocolLocked` detects an older HELPER,
+  not an older control plane. And "on the commit that CREATES a tunnel only the
+  config knows" is narrower than stated: on the normal apply path the interface
+  reconcile runs BEFORE snapshot construction.
+
+  **Mutation grid — 17 severances across two rounds, each required to COMPILE
+  first, ALL KILLED.**
+
+  | # | severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:145` ingress set) |
+  | M2 | RSS `refusesName` | KILLED (`:155` + the SSOT parity premise) |
+  | M3 | alias-table `refusesIfindex` | KILLED (`:719` alias -> refused xfrmi) |
+  | M4 | refused index EVERY → ANY | KILLED (`:632` + the B1 table) |
+  | M5 | refused index → refuse nothing | KILLED (`:145`) |
+  | M6 | ownership qualifier dropped | KILLED (`:767` LogicalOnly owns its netdev) |
+  | M7 | SSOT derivation → pre-round-8 rule | KILLED (allowlist diverges) |
+  | N1 | #3 whole-row drop restored | KILLED (`:1283` ingress missing ifindex 12) |
+  | N2 | #1 allowlist fabric guard | KILLED (`:1219` allowlist regains ge-0-0-0) |
+  | N3 | #1 ingress fabric guard | KILLED (`:1224` ingress regains 20) |
+  | N4 | #8 kind discriminator | KILLED (`:1140` ge-0-0-0 + veth0 classified) |
+  | N5 | #4a partial-dump discard | KILLED (`:1334` the xfrmi discarded) |
+  | N6 | #4c gate re-derives | KILLED (`:316` gate returned nil for a flagged snapshot) |
+  | N7 | #5 protocol back to 5 | KILLED (equality assertion) |
+  | N8 | #7 unenumerated production class | KILLED (placement + coverage) |
+  | R1 | Rust EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner…`) |
+  | R2 | Rust refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit…`) |
+  | R3 | Rust fabric LAYOUT guard | KILLED (`fabric_loop_cannot_readmit…`) |
+  | R4 | Rust fabric PLAN-KEY guard | KILLED (same test, #2915 assertion) |
+
+  **The 9b grid's first pass found N5 and N6 unbound, and both were fixed rather
+  than reported.** N6 additionally reds on a PREMISE in its first form, which
+  would have misdirected a future reader to the fixture instead of production —
+  so the premise no longer expresses itself with the function under test.
+
+## 2026-08-13 — #6691 round 9: the refused-netdev index refused a netdev an ADMITTED row owns
+
+- **Timestamp**: 2026-08-13 16:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Re-founded round 8's refused-netdev index on OWNERSHIP — refuse a
+  netdev only when EVERY row that owns it is unbindable, never on a
+  disagreement between two rows — on both planes, plus five claim corrections
+  round 8 owed and one pre-existing gap filed as #6998.
+- **File(s)**: `pkg/dataplane/userspace/ingress_exclusions.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go`,
+  `pkg/dataplane/userspace/snapshot_allowlist_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`, `_Log.md`
+
+  **B1 — round 8 introduced this, and it is reachable on the canonical
+  WireGuard spelling.** `buildInterfaceSnapshots` sets a unit row's Tunnel flag
+  to `iface.Tunnel != nil || unit.Tunnel != nil` (pre-existing, master line
+  304), and `snapshotLinuxName` collapses a unit-0 row with no vlan-id onto the
+  BASE netdev. So a unit-level `tunnel` stanza puts an UNBINDABLE unit row and
+  a BINDABLE base row on ONE netdev. Round 8's index refused a netdev as soon
+  as ANY row was unbindable for it, which reads that disagreement as a refusal
+  — and because a base row's own name is asked of the same index, it took the
+  base row out of the RSS allowlist.
+
+  Measured, head `1c5b8e69a` vs the same tree with the three round-8 guards
+  severed (which for these configs is exactly origin/master — no VPN, no live
+  xfrmi, so every SecureTunnel flag is false):
+
+  ```
+  set interfaces ge-0/0/5 vlan-tagging
+  set interfaces ge-0/0/5 unit 0 tunnel source 10.0.0.1
+  set interfaces ge-0/0/5 unit 0 tunnel destination 10.0.0.2
+  set interfaces ge-0/0/5 unit 100 vlan-id 100
+  set security zones security-zone trust interfaces ge-0/0/5.0
+  set security zones security-zone trust interfaces ge-0/0/5.100
+  (plus an unrelated LAN ge-0/0/0.0 in trust; ge-0-0-5=30, ge-0-0-5.100=31)
+
+                    HEAD                    SEVERED (= master)      ROUND 9
+  refused index     ifx{30} name{ge-0-0-5}  --                      empty
+  ingress           [10 30]                 [10 30 31]              [10 30 31]
+  RSS allowlist     [ge-0-0-0]              [ge-0-0-0 ge-0-0-5]     [ge-0-0-0 ge-0-0-5]
+  aliases           map[]                   map[31:30]              map[31:30]
+  ```
+
+  And on `set interfaces wg1408 unit 0 tunnel mode wireguard` — THE spelling,
+  verbatim in `pkg/config/tunnelid_test.go` and in an operator config in
+  `docs/issues/issue-history.md` — `wg1408` was admitted, `wg1408.0` refused,
+  both on ifindex 40 with linux name `wg1408`; the allowlist came back
+  `[ge-0-0-0]` at head against `[ge-0-0-0 wg1408]` on master, and is
+  `[ge-0-0-0 wg1408]` again at round 9.
+
+  An ifindex absent from `userspace_ingress_ifaces` takes `cpumap_or_pass`
+  (`userspace-xdp/src/lib.rs`) and `syncInterfaceAttachments`
+  (`manager_compile.go`) DetachXDP/DetachTCs it. Dropping a name from the
+  allowlist also removes the only revert path: `restoreDefaultRSSIndirection`
+  and `applyCoalescence` are both allowlist-scoped, so a reshaped NIC keeps
+  xpf's concentrated RSS table and pinned coalescence until daemon Stop. The
+  reviewer's scoping is preserved and correct: `applyRSSIndirectionOne` and
+  `applyCoalescenceOne` gate on `readDriver()==mlx5`, so the allowlist drop is
+  a no-op for a wg/gre netdev and observable harm needs the shared netdev to be
+  a real mlx5 data NIC — a unit-level tunnel authored on a `ge-*` NIC,
+  strict-valid but unusual.
+
+  **The fix, and which half correctness rests on.** A netdev's OWNERS are the
+  rows whose AF_XDP bind target is their own netdev — `userspaceOwnsItsNetdev`,
+  expressed through the #2917 SSOT `userspaceBindTargetNetdev` rather than a
+  restated VLAN test, and mirroring Rust's existing
+  `vlan_child_parent_netdev(p, &p_linux).is_none()` qualifier word for word.
+  A netdev is refused iff it has at least one owner and every owner is
+  unbindable.
+
+  Correctness rests on the OWNERSHIP half, not on the redirect half. The index
+  answers "is this netdev, AS A DEVICE, one we must never bind?", and a device
+  cannot be both — so when its owners disagree, at least one owner is an
+  ordinary data interface that will contribute the netdev to the binding plan
+  on its own account whatever the redirect does. Refusing on a disagreement
+  therefore cannot prevent the binding; it can only strip traffic from rows
+  entitled to it.
+
+  F1 is preserved exactly, and on the same half rather than a special case:
+  under `bind-interface st10` the only row whose LinuxName is `st10` is the
+  base xfrmi row (a `unit 5 vlan-id 100` sibling resolves to `st10.100`), so
+  that bucket is a single unbindable owner. A `unit 0` sibling DOES share the
+  netdev, and is itself SecureTunnel by the same ownership oracle plus the
+  live-xfrmi half — measured both ways, so the bucket is unanimous there too.
+
+  A corollary worth knowing: for a row that owns its own netdev the refusal is
+  now STRUCTURALLY unreachable (such a row only reaches the check after passing
+  `userspaceSkipsIngressInterface`, and unbindable ⇒ skipped, so it is a
+  bindable owner of its own bucket). The index can only fire through a
+  REDIRECT — the property round 8 claimed and did not have — which also puts
+  the Go rule in the same shape as Rust's `binding_target_is_refused`, whose
+  non-VLAN arm is the literal `false`.
+
+  **The Rust half moved with it, and not only for symmetry.** With a
+  `mgmt`-zoned base plus a unit-0 tunnel row and a trust VLAN child, the ANY
+  rule made `replan_queues` produce NO binding for a netdev whose ifindex the
+  Go ingress map still carried — and an ifindex in the ingress map with no
+  READY binding is `drop_degraded_transit` (BINDING_MISSING), the unsafe
+  direction by this code's own invariant. `snapshot_refuses_parent_netdev` now
+  tallies owners the same way.
+
+  **The `!iface.LogicalOnly` clause is DELETED, not re-justified.** A round-8
+  reviewer was right that nothing could distinguish it, and the reason is
+  better than "inert": it was REDUNDANT. A LogicalOnly row is a bondless RETH
+  VLAN unit, so `shouldUseLogicalOnlyParentBoundRethVLAN`'s own conditions
+  (`unit.VlanID > 0`, a resolved parent netdev with a different name) make it a
+  VLAN CHILD, which the ownership rule already excludes.
+  `TestLogicalOnlyRowNeverOwnsANetdev` asserts that implication on the real
+  fixture, so the redundancy is a measured fact rather than this paragraph's
+  assertion.
+
+  **N1 — the round-8 grid's M6 verdict was WRONG, and it is corrected here.**
+  Round 8 reported the alias-table guard as a surviving mutation and justified
+  it with "inert on every reachable config … no test can distinguish it — that
+  is a structural claim, not a bound one". That reasoning covered only the
+  SecureTunnel class. It was LIVE at `1c5b8e69a`: on the B1 config, severing
+  that line ALONE changed the alias table from `map[]` to `map[31:30]`
+  (measured firsthand at head, both with and without the guard). The
+  reachability came from the B1 defect itself and is gone with it. Re-checked
+  per class rather than for one class: for Tunnel and the four name arms a VLAN
+  child INHERITS the parent's exclusion and is dropped before the refusal is
+  reached; for LocalFabric and mgmt/control the parent is not in the index at
+  all; for SecureTunnel the child does not inherit but its own netdev
+  `st<N>.<vlan>` cannot exist. So it is inert again — and rather than report
+  that as an unbindable guard a second time,
+  `TestAliasTableRefusesEvenWhenTheChildNetdevResolves` STUBS the child netdev
+  into existence and binds the site. The fixture is labelled synthetic in its
+  own doc comment; the guard is retained because the invariant is about the
+  SITE, and #5619 has already made three of four secure-tunnel spellings
+  resolve to netdevs that previously did not.
+
+  **N3 — the enumeration bound round 8 used does not hold, and two sentences
+  are corrected.** "A redirect can only launder within the sets the predicate
+  gates, so the sites are the predicate's callers per plane" is false: the
+  FABRIC loops contribute to two of the same sets without asking the predicate
+  or the index — `add(fab.ParentLinuxName)` (`interfaces.go`),
+  `key := uint32(fab.ParentIfindex)` (`maps_sync.go`) and `replan_queues`'
+  fabric pass. Measured with a Tunnel-class member (`fab0 fabric-options
+  member-interfaces gr-0/0/3`, interface-level tunnel): the refused netdev is
+  in the ingress set AND in the allowlist. PRE-EXISTING — master's loops are
+  identical — and NOT reachable for a secure tunnel (`LocalFabricMember`
+  resolves only for slot-shaped member names, so an `st*` member yields zero
+  fabric rows), so it is filed as **#6998** rather than fixed here. Both false
+  sentences are corrected in `ingress_exclusions.go` and in the README, with
+  the rule stated: to bound a laundering question, enumerate every CONTRIBUTOR
+  to the set, not every caller of the predicate.
+
+  **N4/N5/N6 — three stale sentences, each measured before rewriting.**
+  `ensureSecureTunnelProtocolLocked`'s "scoped … so an operator with no
+  route-based IPsec is never blocked" outlived the round-8 widening of
+  `configHasSecureTunnel`: measured with zero VPNs, it returns false with no
+  live xfrmi and TRUE with a stale live `st10`. The arming is right (a stale
+  xfrmi is exactly what an operator cannot fix by editing the config); only the
+  sentence was the defect, and it now matches the architecture doc's wording.
+  `ingress_exclusions.go`'s file header still said "a pure move: no signature,
+  no behaviour and no caller changes" — true of `be8aec13e`, which created the
+  file, and false of everything since. And
+  `TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT` re-derived `want`
+  from the PRE-round-8 rule, so it encoded an invariant production does not
+  hold and stayed green only because its fixture had no refused row; the
+  derivation now applies the refusal AND the fixture gained a live-xfrm `st10`
+  with a zoned VLAN sibling so the filter is load-bearing (M7 below).
+
+  **Mutation grid — 7 Go + 2 Rust, each guard severed one at a time, every
+  mutation required to COMPILE (`go vet` / `cargo build --tests`) before its
+  result counted.**
+
+  | # | guard severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:145` ingress, `:155` allowlist) |
+  | M2 | RSS `refusesName` | KILLED (`:155` allowlist) |
+  | M3 | alias-table `refusesIfindex` (round-8's M6) | KILLED (`:692` "binding alias 12 -> 11 points at the refused xfrmi") |
+  | M4 | refused index: EVERY owner → ANY owner | KILLED (`:598` "netdev \"ge-0-0-5\" is refused even though ge-0/0/5 owns it and is bindable"; `:769`/`:774`/`:779` the B1 table) |
+  | M5 | refused index: refuse nothing | KILLED (`:145` "the excluded xfrmi (ifindex 11) is in the ingress-adjudication set [10 11]") |
+  | M6 | ownership qualifier dropped (`userspaceOwnsItsNetdev` → true) | KILLED (`:740` "a LogicalOnly row owns its netdev … LinuxName \"lo.80\"") |
+  | M7 | SSOT parity derivation reverted to the pre-round-8 rule | KILLED ("allowlist diverges from the bind-target SSOT: got [ge-0-0-1 ge-0-0-2], want [… st10]") |
+  | R1 | `snapshot_refuses_parent_netdev`: EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner_is_not_refused`) |
+  | R2 | `snapshot_refuses_parent_netdev`: refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit_its_refused_parent`) |
+
+  **maps_sync.go spends none of the headroom round 8 bought it.** The
+  per-class inertness analysis was first written at the alias call site, which
+  took the file 1958 -> 1986 against the 2000-line refactor threshold — the
+  exact "a comment grows the file" pattern the round-8 split existed to undo.
+  It is a property of the refusal CONTRACT, not of the alias builder, so it
+  lives in `userspaceRefusedNetdevs` with a one-line pointer at the site:
+  maps_sync.go 1957, one line below where round 9 found it.
+
+  **R2's first run reported SURVIVED and the HARNESS was the defect**, recorded
+  because a mutation harness that silently under-runs inverts its own result:
+  the driver's Rust test list omitted
+  `orphan_vlan_child_cannot_readmit_its_refused_parent` — the F1 guard, the
+  only test that can see that mutation. Added and re-run; KILLED. The Go rows
+  were unaffected (their `-run` regex names every test in the file).
+
+## 2026-08-13 — #6691 round 8c: a sibling unit laundered its own excluded xfrmi, and a live one the config forgot was invisible
+
+- **Timestamp**: 2026-08-13 14:20 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded the two Codex blockers that survived verification at the
+  true head (2ec16ae72). Both are the same defect seen from opposite sides —
+  the exclusion is decided per ROW, but what enters an adjudicated set is a
+  NETDEV — so both are fixed by moving the refusal onto the netdev.
+- **File(s)**: `pkg/dataplane/userspace/ingress_exclusions.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go` (new),
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/protocol/snapshot.rs`, `userspace-dp/src/main_tests.rs`,
+  `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-architecture.md`,
+  `docs/refactoring-audit-current.txt`, `_Log.md`
+
+  **Three of the five Codex findings were already closed at the true head** and
+  are recorded here as verified-closed rather than re-fixed: the `st010.0`
+  if_id-aliasing claim (`bindInterfaceOwnsRef` cuts on `.` and compares the
+  authored spelling, so `st010 != st10`), the "shared resolver still classifies
+  lexically" claim (`SecureTunnelUnitNetdev` returns `("", false)` in the
+  `secureTunnelUnbound` arm), and the missing version gate (both sides are at 5).
+
+  **F1 — an unowned VLAN sibling re-admitted its OWNED xfrmi parent.** Measured
+  at head on a STRICT-valid config (`config.CompileConfig`, no lenient path):
+
+  ```
+  set security ipsec vpn V bind-interface st10
+  set interfaces st10 vlan-tagging
+  set interfaces st10 unit 5 vlan-id 100
+  set interfaces st10 unit 5 family inet address 192.0.2.1/24
+  set security zones security-zone trust interfaces st10.5
+  ```
+
+  The base row `st10` is the xfrmi and is correctly excluded. The unit derives
+  `10<<16 | 6` against the bound `10<<16 | 1`, so it is correctly
+  `SecureTunnel=false` — and it carries `ParentIfindex`/`ParentLinuxName`
+  pointing at the live xfrmi. All THREE consumers Codex named do redirect,
+  verified one at a time with the xfrmi stubbed live at ifindex 11:
+
+  - `buildUserspaceIngressIfindexes` → `[10 11]`, 11 being the xfrmi.
+  - `UserspaceBoundLinuxInterfaces` → `[ge-0-0-0 st10]`.
+  - `replan_queues` (Rust, fed the real Go wire snapshot) → planned a binding
+    for `st10`, and the LAN's planned queue count fell from **4 to 1**. That is
+    the #3091 single-worker regression the exclusion's load-bearing reason
+    names, arriving through the child.
+
+  Two things Codex's report did not distinguish, both measured:
+
+  - **The ingress leak is not VLAN-specific.** A plain `set interfaces st10 unit
+    5 family inet address ...` (no `vlan-id`) leaks the parent ifindex exactly
+    the same way. The RSS-name leak IS VLAN-specific — `userspaceBindTargetNetdev`
+    redirects only a VLAN row, so the plain sibling contributes its own
+    `st10.5`, not `st10`.
+  - **`compiler_validate_strict_zones.go` admits the zone member two ways**, not
+    one. Codex named the IPsec term of `zoneReferenceableInterfaceBases` (which
+    does admit every sibling unit of a bound base, confirmed); but the config
+    also carries `set interfaces st10 unit 5`, so `st10` is a key of
+    `cfg.Interfaces.Interfaces` and would be admitted without the IPsec term.
+
+  **F3 — a live xfrmi the config no longer describes was invisible to every
+  predicate in this PR**, all of which are config-keyed. Two routes, both driven
+  through the REAL `pkg/routing` reconciler against a fake kernel in
+  `TestRetainedLiveXfrmiLeavesTheAdjudicatedSets`, so the retention and the
+  snapshot are composed rather than reasoned about across a gap:
+
+  - `LinkDel` fails → `deleteLocked` retains tracking and returns the error
+    (#4901); `applyInterfaceReconcile`'s result is a DEFERRED error
+    (`daemon_apply.go:280`, "All steps still run (no early return)"), so the
+    apply proceeds through `applyDataplaneAndHACore` with the device live.
+  - After a daemon restart `xfrmManager.xfrmis` is EMPTY, so the removed-desired
+    delete pass has nothing to iterate and issues no `LinkDel` at all — and this
+    route reports a CLEAN convergence, which makes it the worse of the two.
+
+  Measured at head in that state (`st10` live at ifindex 11, no VPN in the
+  config): ingress `[10 11]`, allowlist `[ge-0-0-0 st10]`.
+
+  **The fix, and which half correctness rests on.** The exclusion predicate is
+  split into a NETDEV half (`userspaceUnbindableNetdev`: Tunnel, fxp/em/fab/lo0,
+  SecureTunnel) and a ROW half (mgmt/control zone, LocalFabric). The netdev half
+  is what a redirect inherits; the row half is not, and that distinction is
+  load-bearing in BOTH directions — a mgmt-zoned base with a data-zoned VLAN
+  child is reachable (`buildInterfaceZoneMap` keys the base off whichever zone
+  sorts first) and its parent MUST stay admitted, because the child's tagged
+  frames really do arrive on that netdev's queues.
+
+  Correctness then rests on two independent mechanisms, and neither subsumes the
+  other:
+
+  - `userspaceRefusedNetdevs` indexes every refused netdev by ifindex AND by
+    name, and the three set-changing consumers consult it. This is what stops
+    the laundering; the kernel fact below does not.
+  - `snapshotSecureTunnel` unions the config oracle with a KERNEL one —
+    `liveXfrmNetdevs`, one `RTM_GETLINK` dump per snapshot, filtered on link
+    kind `xfrm`. This is what makes a forgotten device visible; the refused
+    index does not. The two cover different instants (the reconciler runs during
+    apply, so on the commit that CREATES a tunnel only the config knows), so the
+    union is not belt-and-braces on one fact but two facts.
+
+  On the Rust plane the same split lands as `userspace_unbindable_netdev` plus
+  `snapshot_refuses_parent_netdev`. `snapshot_has_parent_candidate` returning
+  false conflated "the parent is ABSENT" (the #3175 orphan, where re-keying is
+  correct) with "the parent is REFUSED" (where re-keying re-admits the excluded
+  netdev); those now answer separately. The refusal is read by the plan-key
+  filter and the candidate loop through ONE helper, `binding_target_is_refused`,
+  so the #2915 hash/layout invariant is a property of the code.
+
+  **No protocol bump is owed.** `secure_tunnel`'s meaning, type and JSON tag are
+  unchanged and its only Rust consumer reads it identically at v5; what widened
+  is the evidence the control plane accepts for the same claim.
+  `configHasSecureTunnel` widened with it, because its documented invariant is
+  "the gate cannot stay silent for a snapshot that DOES carry a flagged row" —
+  and a stale xfrmi is precisely the case an operator cannot fix by editing the
+  config.
+
+  **Mutation matrix — 7 Go + 3 Rust, each guard severed one at a time.** Every
+  mutation was required to COMPILE first: the initial run reported M1/M2/M6 as
+  killed when they had only failed to build (an unused `refused` binding), and
+  R1/R2 as build failures when cargo's `error: test failed` line had been
+  misread. Both classifiers were fixed and the grid re-run.
+
+  | # | guard severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:143`, ingress set) |
+  | M2 | RSS `refusesName` | KILLED (`:153`, allowlist) |
+  | M3 | kernel half of `snapshotSecureTunnel` | KILLED (`:504`,`:511`) |
+  | M4 | mgmt/control moved to the DEVICE half | KILLED (`:218`, negative control) |
+  | M5 | kernel half of `configHasSecureTunnel` | KILLED (`:528`) |
+  | M6 | alias-table `refusesIfindex` | **SURVIVED** |
+  | M7 | refused index built from the ROW predicate | KILLED (`:225`,`:230`) |
+  | R1 | `replan_queues` refusal | KILLED ("the planner produced an AF_XDP binding") |
+  | R2 | plan-key refusal filter | KILLED ("plan key still hashes") |
+  | R3 | refusal widened to any non-candidate parent | KILLED ("must still re-key onto") |
+
+  **M6 SURVIVED and is reported as such rather than papered over.**
+  `buildUserspaceIngressBindingAliases` is inert on every config reachable
+  today: the sibling unit of an xfrmi resolves to a netdev that does not exist
+  (a VLAN child cannot be created on an ARPHRD_NONE device), so the
+  `Ifindex <= 0` guard drops the row before the refusal is consulted. The guard
+  is there so the alias table cannot become the one site that does not ask, and
+  no test can distinguish it — that is a structural claim, not a bound one.
+
+  **R3's negative control did not bind on the first attempt, and the fixture was
+  the defect.** `orphan_vlan_child_still_rekeys_onto_an_absent_parent` omitted
+  the parent ROW entirely, so with nothing resolving to `ge-0-0-2` both the
+  correct predicate and the wrong-but-tempting
+  `!include_userspace_binding_interface(p)` returned false for want of anything
+  to examine — the mutation survived. Renamed to
+  `..._onto_an_unzoned_parent` and given a PRESENT, unzoned parent row, which is
+  the only shape that reaches the branch. Measured both before and after.
+
+  **Enumeration, bounded mechanically.** A redirect can only launder within the
+  sets the predicate gates, so the sites are the predicate's callers on each
+  plane: four in Go (three that change an installed set plus the plan-key hash)
+  and two in Rust (the layout and its hash). The FIB/zone maps in
+  `forwarding_build/interfaces.rs` also read `parent_ifindex`, but they are
+  deliberately outside this predicate's scope (stated in the arm's own SCOPE
+  paragraph) and are not laundering sites.
+  `TestExclusionClassesAgreeAcrossParentAndChild` pins the other half of the
+  enumeration: of the six exclusion classes, only SecureTunnel can have a parent
+  and its unit disagree — Tunnel and LocalFabric are the same InterfaceConfig
+  field on both rows, and the name arms test the shared base name.
+
+  **Validation.** `go test ./pkg/dataplane/userspace/ ./pkg/config/
+  ./pkg/routing/ ./pkg/daemon/` and the full `cargo test` suite; the new Go
+  guards, the two new Rust guards, and the pre-existing #3175/#3091/#5619 orphan
+  and secure-tunnel tests all pass. `docs/refactoring-audit-current.txt`
+  regenerated (`maps_sync.go` 1925 → 1958, still WATCH, under the 2000 gate).
+  No cluster smoke run — none of this touches the shim `.o`.
+
+## 2026-08-13 — #6691 round 8b: the version doc still said "why it is at 4", and the round-8 evidence re-measured independently
+
+- **Timestamp**: 2026-08-13 12:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Second pass over the round-8 fold. Re-established every load-bearing
+  claim from scratch rather than inheriting it, found one real documentation
+  regression the fold introduced, and widened the mutation matrix from three Go
+  mutations to six.
+- **File(s)**: `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **The doc regression.** The v5 bump left
+  `docs/userspace-dataplane-architecture.md` carrying a section literally headed
+  **"Why it is at 4"** — the SSOT prose explaining what the config-snapshot
+  protocol version means and why it currently holds its value. Bumping the
+  constant to 5 in three places and leaving that heading is exactly the shape
+  this repo's doc-contract rule exists to catch: the next reader reconciling
+  `ProtocolVersion = 5` against a doc that explains version 4 has no way to tell
+  which one is stale. Retitled the #4626/#5488 paragraph to "Why it went to 4"
+  (it is history now, not the current state) and added a **"Why it is at 5"**
+  block carrying the measured reason, plus a paragraph naming
+  `ensureSecureTunnelProtocolLocked` / `ErrSecureTunnelProtocolIncompatible` and
+  its `configHasSecureTunnel` arming predicate alongside the existing #5488 gate
+  description. No code change.
+
+  **B1 re-established independently, not inherited.** The three legs of the
+  queue-collapse argument were each measured here rather than read:
+
+  - an xfrm interface really does have exactly one RX queue. `unshare -rn` with
+    a private sysfs mount, `ip link add name xfrmprobe0 type xfrm dev lo if_id
+    7`: `numrxqueues 1` / `numtxqueues 1`, `/sys/class/net/xfrmprobe0/queues`
+    holds exactly `rx-0` and `tx-0`, and `/sys/class/net/xfrmprobe0/type` is
+    `65534` (ARPHRD_NONE). `lo` as a control shows the same single pair.
+  - BOTH planes count that same sysfs entry, so neither can disagree with the
+    device: `userspaceRXQueueCount` (`interfaces.go:706-724`) reads
+    `/sys/class/net/<if>/queues` and counts `rx-` prefixed dirs;
+    `rx_queue_count` (`planning.rs:666-683`) reads the same path with the same
+    prefix filter.
+  - `replan_bindings_from_candidates` takes the global minimum verbatim:
+    `let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0)`.
+
+  Corroboration nobody had cited: the SAME function already re-keys a 1-queue
+  VLAN child onto its parent's hardware queue count expressly so it "still
+  cannot collapse the min", naming #3091. The codebase independently treats
+  this exact failure class as a regression — the xfrmi is the same defect
+  through an unnamed door, which is why the exclusion is load-bearing rather
+  than an optimisation.
+
+  **The missing link, and it inverts the review's framing.** The round-8 write-up
+  argued the exclusion is right; it did not establish that MASTER is wrong, and
+  the review leg's charge was specifically that the exclusion "deletes a WORKING
+  inbound policy path". So: does master actually admit the row? Probed the
+  snapshot builder directly for a zoned `bind-interface st0.0` —
+
+      row "st0.0": Zone="vpn" Tunnel=false SecureTunnel=true LocalFabric=""
+      master's binding predicate would ADMIT this row: true
+
+  `Tunnel` is `iface.Tunnel != nil || unit.Tunnel != nil`, the GRE/IPIP `tunnel`
+  stanza — a route-based IPsec unit does not set it, so nothing else in the
+  predicate keeps the row out. Master's `interfaces.go:262` populates `RXQueues`
+  from the same `userspaceRXQueueCount` this branch uses (identical line on both
+  revisions), which on a real box is the xfrmi's 1.
+
+  So the path the exclusion "deletes" is not a working policy path. On master
+  today, an operator who zones a route-based IPsec tunnel silently re-plans
+  every physical interface on the box onto one queue and one worker. That is a
+  live #3091-class regression this PR CLOSES, not one it opens — and it is why
+  the answer to B1 is neither "narrow the exclusion" nor "restore the path", but
+  "the exclusion is correct and the reason on record was the wrong one".
+
+  **The v5 gate is reached from production, not just from its test.**
+  `ensureRequiredSnapshotProtocolLocked` has seven production call sites
+  (`manager_compile.go:292`, `:346`, `:583`; `manager_worker_arm_5134.go:70`;
+  `process_status.go:92`; `manager_overlay.go:180`; `manager_ha.go:631`;
+  `manager_status.go:112`) and `pkg/daemon/daemon_apply.go:413` delegates the
+  commit-abort decision to `IsRequiredProtocolGateError`. A sentinel that no
+  path consults is the recurring failure mode this campaign keeps finding; it
+  is not this one.
+
+  **Mutation matrix — six Go mutations, all RED, each on its intended
+  assertion.** Every mutation applied to a fresh `/dev/shm` copy; the
+  worktree's `git status --porcelain` checksum captured before and after each
+  batch and identical both times, so nothing under test was ever the mutated
+  tree.
+
+  | # | mutation | assertion that went RED |
+  |---|----------|-------------------------|
+  | G1 | unwire `ensureSecureTunnelProtocolLocked` from the dispatcher | `secure_tunnel_protocol_6691_test.go:135` |
+  | G2 | drop the sentinel from `requiredProtocolGateSentinels` | `:142` — gate fires, commit would NOT abort |
+  | G3 | revert Go `ProtocolVersion` 5 → 4 | lockstep parity (`5488_test.go:396`) + `:85` collision + all FOUR spellings |
+  | G4 | `configHasSecureTunnel` always TRUE | `:165` — the no-xfrmi negative control |
+  | G5 | `configHasSecureTunnel` always FALSE | `:135`, `:142` and all four spellings at `:184` |
+  | G6 | gate body inert (`return nil` first) | `:135`, `:142` and all four spellings at `:190` |
+
+  G4 and G5 are new here. They matter because the arming predicate is the one
+  place this gate can fail SILENTLY in either direction — over-arming disarms
+  every operator who has no route-based IPsec at all, under-arming leaves the
+  upgrade it exists to stop wide open — and only the pair binds both.
+
+  **One claim of round 8's own was wrong and is corrected in place.** The
+  round-8 entry below described the `maps_sync.go` → `ingress_exclusions.go`
+  split as moving the predicate and its rationale "verbatim". Checked by
+  extracting `userspaceSkipsIngressInterface` from `bcb5335cc:maps_sync.go` and
+  from the new file and diffing with comments stripped: the EXECUTABLE body is
+  byte-identical, 29 code lines on both revisions, so the "no behaviour change"
+  half of the claim holds. The COMMENT block is not verbatim — it carries the
+  four-call-site correction made in the same commit. A refactor commit that
+  says "verbatim" is asking the next reviewer to skip the diff, so the word is
+  not one to leave standing loosely.
+
+  Full `go build ./...` + `go vet ./...` + `go test ./...` green at this head.
+  Full `cargo test --release` green: exit 0, seven targets, 4402 tests, zero
+  failures.
+
+  **A note on the Rust leg, because the first attempt looked like a red.** The
+  first `cargo test --release` reached 4335 passing tests and then sat in three
+  `afxdp::wg::engine` serial tests for over ten minutes; a direct run of the
+  built binary then reported one failure,
+  `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, panicking on
+  "readers must have validated at least one snapshot (test not vacuous)". Both
+  were box contention — load average was 31 on 16 cores with several concurrent
+  cargo suites. The three wg tests pass in 0.37s in isolation on that same
+  binary, the seqlock test passes 3/3 in isolation, and a second full pass of
+  the same binary was 4278/0. None of the three subsystems (wg engine, shared
+  CoS lease, HA counters) is touched by this branch, and the same
+  one-test-fails pattern is on record for a BASELINE run and for unrelated
+  branches. Recorded rather than dropped: a load-sensitive non-vacuity guard
+  that reds under contention is indistinguishable from a real red at a glance,
+  and the next agent to hit it should not have to re-derive that.
+
+## 2026-08-13 — #6691 round 8: the exclusion's stated reason could not be established; the real one could
+
+- **Timestamp**: 2026-08-13 10:35 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR at `bcb5335cc` — two blocking
+  findings. B1 required settling a kernel/AF_XDP capability claim this branch
+  had been asserting since round 1; the answer moved the justification, not the
+  code.
+- **File(s)**: `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/ingress_exclusions.go` (new),
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go`,
+  `pkg/dataplane/userspace/secure_tunnel_binding_order_6691_test.go`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/refactoring-audit-current.txt`, `_Log.md`
+
+  **B1 — Codex was right about the premise and wrong about the conclusion.**
+
+  The branch justified excluding a route-based IPsec xfrmi from the userspace
+  dataplane with: "an XSK cannot come up on a virtual netdev, so admitting one
+  would make `drop_degraded_transit` DROP the plaintext." Codex called that
+  false. Checked, and it does not hold as written:
+
+  - `XskSocketRole::Private` returns `false` from `requires_zerocopy`
+    (`afxdp/bind.rs`), so zero-copy is role-conditional, not universal;
+  - `bind_flag_candidates_for_interface` hands a generic-XDP interface
+    `COPY_ONLY_BIND_FLAGS`;
+  - and — stronger than the review said — `fallback_shared_group_to_private`
+    converts a failed shared-UMEM group into private bindings automatically,
+    so the copy path is not merely present but REACHED without operator action.
+
+  So a copy-mode binding is reachable in this code. Whether it SUCCEEDS on an
+  `ARPHRD_NONE` netdev is still unsettled: BPF program load needs `CAP_BPF` in
+  the INIT user namespace, so `unshare -rn` cannot answer it (the veth control
+  failed identically). That link needs a live NIC and is NOT asserted anywhere
+  in the tree now.
+
+  **What replaced it is measurable here.** In a network namespace, an xfrm
+  interface reports `numrxqueues 1`, and with sysfs remounted
+  `/sys/class/net/xfrm0/queues/` holds exactly `rx-0` + `tx-0`. That single
+  entry is what BOTH planes count — `userspaceRXQueueCount` (Go) and
+  `rx_queue_count` (Rust) — and `replan_bindings_from_candidates` takes the
+  GLOBAL MINIMUM queue count across candidates. So admitting one zoned xfrmi
+  does not risk the tunnel's binding; it re-plans EVERY physical interface on
+  the box onto one queue and one worker. That is the #3091 single-worker
+  regression arriving through a door #3091 did not name.
+
+  Measured, by deleting `if iface.secure_tunnel { return false; }`:
+
+	the LAN interface was planned onto 1 queue(s), not its own 4
+	Planned: [("ge-0-0-1", 0), ("st0.0", 0)]
+
+  where the unmutated plan is `[(0,0,"ge-0-0-1"), (1,1,"ge-0-0-1")]`.
+
+  **Why the exclusion stays, and why the two narrower options do not work.**
+  Narrowing it per spelling cannot work: the queue count is a property of the
+  DEVICE, not of `st0` vs `st10.5`, so every spelling that resolves to a real
+  xfrmi carries it. Splitting it — adjudicate but do not bind — is worse than
+  either: an ifindex in the shim's ingress map with no READY binding takes
+  `drop_degraded_transit` (`userspace-xdp/src/lib.rs`, BINDING_MISSING), which
+  is the dead-tunnel configuration the old comment described. The two sets move
+  together or transit dies. Building an independent inbound policy path is real
+  work (TC ingress on the xfrmi, or host-inbound adjudication) and is #5619's
+  open half, already filed as #6700 — not a fold.
+
+  **The cost is stated plainly now, and it is a policy gap, not a drop.**
+  Decrypted plaintext traverses Linux routing with no xpf zone policy. Three of
+  four spellings lose an ingress claim they had on master. What master actually
+  did with that claim was not "working policy": it was either a one-worker box
+  (if the copy bind succeeds) or a dead tunnel (if it does not). The trade is
+  defensible; the previous framing, which advertised only the second branch as
+  certain, was not.
+
+  `secure_tunnel_would_collapse_the_global_queue_count` is the new guard. It
+  asserts the QUEUE COUNT rather than plan identity, so the reason is visible in
+  the failure rather than inferred from a diff of two layouts.
+
+  **B2 — a new authoritative wire field shipped at an unchanged version.**
+
+  `InterfaceSnapshot.secure_tunnel` is authoritative over binding admission, and
+  both sides stayed at protocol 4 — the exact shape `server/README.md` forbids
+  and #5488 was filed for. The skew consequence is the same collapse: a v4
+  helper ignores the tag, plans the xfrmi, and its one RX queue becomes the
+  global minimum. Nothing on the wire is malformed, so neither the version
+  equality check nor the content hash can see it.
+
+  Fixed as a lockstep v5 bump (`ProtocolVersion`, `CONFIG_SNAPSHOT_PROTOCOL_VERSION`)
+  plus `ensureSecureTunnelProtocolLocked` + `ErrSecureTunnelProtocolIncompatible`,
+  registered in `requiredProtocolGateSentinels`. The gate arms off
+  `configHasSecureTunnel`, which asks the SAME question the snapshot builder
+  asks (`Config.SecureTunnelNetdevForRef`) over the same refs, so it cannot arm
+  for a config with no flagged row or stay silent for one that has one.
+
+  Three mutations, each red on its intended assertion: unwiring the gate from
+  `ensureRequiredSnapshotProtocolLocked` reds the dispatcher assertion; dropping
+  the sentinel from the abort set reds `IsRequiredProtocolGateError`; reverting
+  `ProtocolVersion` to 4 reds the collision assertion AND all four spellings.
+
+  **Non-blocking, folded.**
+
+  - `secure_tunnel_binding_order_6691_test.go` carried a comment stating the
+    opposite of the assertion under it ("a name on no box must not enter the
+    allowlist" — it does, by construction, and `maps_sync.go` says so for the
+    sibling case). Corrected to describe what the assertion pins: the allowlist
+    tracks the RESOLUTION, not existence.
+  - "gates three sets and only three" was a miscount. Four Go call sites;
+    `snapshotBindingPlanKey` genuinely changes and
+    `buildUserspaceIngressBindingAliases` is inert for this row (no parent
+    ifindex, skipped before the predicate). Both the in-tree comment and the
+    README now enumerate all four and say which is inert and why.
+  - A unit that is BOTH `vlan-id 80` and a `bind-interface st5.3` target had no
+    doc and no test on either revision, though strict compile accepts it and the
+    two arms name DIFFERENT devices (`st5.80` vs `st5.3`).
+    `TestSecureTunnelOwnershipPrecedesVlanID` pins the order without arguing it
+    is the right one, and names the consequence if it moves.
+  - `maps_sync.go` had crossed the 2000-line refactor threshold on comment.
+    `userspaceSkipsIngressInterface` and its ~180 lines of rationale moved to
+    `ingress_exclusions.go`; the file drops 2130 → 1925, below both
+    the threshold and master's 1953. (Round 8b correction: an earlier draft of
+    this line said the block moved "verbatim". The EXECUTABLE body did — it is
+    byte-identical across the move, 29 code lines on both revisions, verified by
+    extracting the function from `bcb5335cc:maps_sync.go` and from the new file
+    and diffing with comments stripped. The COMMENT block did not: it carries
+    the call-site correction two bullets above, made in the same commit.) No
+    signature, behaviour or
+    caller change. Audit regenerated: `[REFACTOR] 2076` → `[WATCH] 1925`.
+
+  Validation: `go build ./...`, `go vet`, full `go test ./...`; full
+  `cargo test --release`. Mutation evidence above observed, not asserted.
+
+## 2026-08-13 — #6691 round 7: the veto fired before ownership, and ownership was not directional
+
+- **Timestamp**: 2026-08-13 09:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR at `0e807ec1a` — two blocking
+  findings, both reproduced firsthand against `origin/master` as a control
+  before anything was changed.
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_binding_order_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go`,
+  `userspace-dp/src/server/README.md`
+
+  **The diagnosis.** Round 6 got the DECOMPOSITION right and the EVALUATION
+  wrong. Splitting one key into two questions — ownership by the authored
+  spelling, the routing veto by if_id — is correct and stands; the questions
+  really are independent, because a device can be owned-but-not-created (a
+  collision) or created-but-not-this-ref's. What round 6 got wrong is that it
+  asked them in the wrong ORDER, and asked the first one SYMMETRICALLY.
+
+  **F1 — the collision veto fired before ownership was established.**
+  `secureTunnelBindingForRef` returned `secureTunnelIDCollision` from inside
+  the scan loop, so a collision between two spellings that name NEITHER of the
+  ref's devices still vetoed the ref. Measured through the REAL tolerant
+  compiler (`CompileConfigLenient` — the #2933 gate hard-rejects this at
+  commit, so the tolerant load / peer-sync path is the only way in, and it is
+  precisely the path the veto exists to govern) plus the real snapshot builder,
+  with `st5` stubbed live at ifindex 11:
+
+      set security ipsec vpn a bind-interface st05
+      set security ipsec vpn b bind-interface st0005
+      set interfaces st5 unit 0 family inet address 192.0.2.1/24
+
+  | measurement | origin/master | `0e807ec1a` | after |
+  |---|---|---|---|
+  | `SecureTunnelUnitNetdev("st5.0")` | n/a (no such function) | `("st5.0", true)` | `("", false)` |
+  | `st5.0` row netdev / ifindex | `st5` / 11 | `st5.0` / 0 | `st5` / 11 |
+  | RSS + AF_XDP allowlist | `[ge-0-0-0 st5]` | `[ge-0-0-0 st5 st5.0]` | `[ge-0-0-0 st5]` |
+
+  Both bindings derive if_id `0x50001` and neither creates a device called
+  `st5`, so their collision is real and routing will refuse both — it is simply
+  not `st5.0`'s collision. At a name on no box the row reports ifindex 0 and
+  `userspace-dp/src/filter/compiler.rs` skips `if iface.ifindex <= 0`: no
+  `filter input`, no per-unit CoS, no routing-instance binding, and the
+  junos-host deny scoped to a device that does not exist. The phantom `st5.0`
+  in the name-keyed allowlist is the other half.
+
+  **F2 — ownership was not directional.** The predicate compared BASES ONLY,
+  which is symmetric, and the relation is not: a DOTTED ref (`st5.0`) is a
+  logical unit that resolves through either authored spelling, while a BARE ref
+  (`st5`) is a base row whose netdev `snapshotLinuxName` sets to
+  `LinuxIfName(ifName)` — literally `st5` — so it is an xfrmi only under a bare
+  `bind-interface st5`. Measured with a real NIC `st5` at ifindex 11 carrying a
+  zoned unit 3, and a VPN binding `st5.0`:
+
+  | measurement | origin/master | `0e807ec1a` | after |
+  |---|---|---|---|
+  | `SecureTunnelNetdevForRef("st5")` | n/a | `("st5.0", true)` | `("", false)` |
+  | `st5` row `secureTunnel` / skipIngress | n/a / false | true / true | false / false |
+  | RSS + AF_XDP allowlist | `[ge-0-0-0 st5 st5.3]` | `[ge-0-0-0 st5.3]` | `[ge-0-0-0 st5 st5.3]` |
+
+  A live NIC removed from the dataplane by a VPN whose device is `st5.0` —
+  the same harm the round-6 `st05` finding describes, one spelling over. Note
+  what the master column says: `origin/master` carries NO secure-tunnel
+  exclusion arm at all (`userspaceSkipsIngressInterface` there has no
+  `iface.SecureTunnel` case), so both defects were introduced by this PR and
+  both fixes return these two configs to master's answers exactly.
+
+  **The decomposition was checked, not assumed.** The reviewer invited the
+  finding that these are not two independent questions. They are: with
+  `bind-interface st5` and `bind-interface st05` both present, `st5.0` HAS an
+  owner (`st5`) AND collides, and the veto must still fire — routing creates
+  neither device. That case is the negative control in the new test, and it is
+  why accumulating the collision across the whole loop (rather than dropping
+  the veto) is the fix. Both facts stay order-independent: `owner` is set by
+  any binding that names the ref, `collision` once two distinct names are seen,
+  and with no collision every claimant carries one name so `owner` is unique.
+
+  **Consequence accepted and stated, not hidden.** Under the canonical
+  `bind-interface st0.0`, the BASE row `st0` now reports `secureTunnel=false`,
+  and being zoned it contributes `st0` to the name-keyed AF_XDP/RSS allowlist
+  even though no `st0` netdev exists. Measured: `origin/master` does exactly
+  the same for that config, and the allowlist already behaves this way for any
+  zoned interface whose netdev is absent — a `ge-0/0/9` with no card is in it
+  on master too. It has no ifindex guard by design (it is consumed by name,
+  by `ethtool`), so this is a pre-existing property of that set rather than a
+  new class, and suppressing it would mean re-asserting that the `st0` row is
+  the xfrmi, which is the F2 defect.
+
+  **Mutation matrix — seven cells, each an exact revert edit on a clean tree,
+  restored and verified byte-identical by sha256; control green.** Scope
+  `./pkg/config/... ./pkg/dataplane/...`.
+
+  | cell | revert edit | result |
+  |---|---|---|
+  | A | none (control) | rc=0 |
+  | R7-M1 | collision verdict returned from inside the scan loop (round-6 order) | RED — `CollisionVetoRequiresAnOwner/neither name owns the ref` |
+  | R7-M2 | bare-ref arm `return !bindHasUnit` → `return true` (round-6 base-only compare) | RED — `BareRowRequiresTheBareSpelling/st5.0` |
+  | M1 | `SecureTunnelUnitNetdev` unowned arm → `(LinuxIfName(ref), true)` | RED — 3 tests / 5 subtests |
+  | M2 | ownership by if_id alone (drop the `bindInterfaceOwnsRef` call) | RED — 3 tests / 5 subtests |
+  | M3 | `snapshotLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M4 | `junosHostLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M5 | `ResolveKernelIfName` st arm reverted to master | RED |
+
+  **Which cells now bind differently, checked rather than assumed** — a
+  reordering fix is exactly the kind that can retire an existing cell silently.
+
+  - **M1 GAINED a test and lost none.** Measured at `0e807ec1a` (both at this
+    scope and at the full `./...`) it REDs 2 tests / 4 subtests
+    (`TestUnownedStNameKeepsItsDataplaneRole` ×1,
+    `TestUnownedSecureTunnelUnitResolvesToItsRealDevice` ×3); after this round
+    it REDs those same 4 plus the new collision sub-test. A strict superset.
+  - **M2 likewise:** it kept `OwnershipRequiresTheAuthoredSpelling`
+    (`st05`/`st+5`/`st0000005`) and gained both new tests.
+  - **M3, M4, M5 are unchanged** — same single test each
+    (`OwnershipPrecedesTheTunnelNameMap` for M3/M4,
+    `ResolveKernelIfNameUsesTheAuthoredBindInterface/st0` for M5).
+  - **One existing cell now binds for a DIFFERENT reason.** In
+    `TestSecureTunnelAddsNothingToTheAdjudicatedSets`, the `dotted_st0_0`
+    spelling's BASE row `st0` used to be held out of the ingress set by the
+    secure-tunnel arm; it is now held out only by `Ifindex <= 0`, because that
+    fixture stubs `st0.0` and not `st0`. Two independent reasons before, one
+    now. The `bare_st0` spelling is unaffected — there the base row IS the
+    device, stubbed at ifindex 42, and the arm is the only thing excluding it.
+  - **Two fixtures were vacuous for the NEW properties and are annotated as
+    such rather than left to look like coverage:**
+    `TestSecureTunnelOwnershipRequiresTheAuthoredSpelling` carries ONE VPN (so
+    no collision is reachable and the ORDER is invisible in it) and only BARE
+    spellings (so the DIRECTION is invisible too).
+  - **`FailsClosedUnderCollision` / `FallsBackUnderCollision` keep their
+    verdicts but reach them by a new route:** ownership is now established
+    first and the veto applied after, so those two also prove the ref was in
+    scope, which they previously could not distinguish.
+
+  **A round-6 claim corrected.** The round-6 entry below records M1 as
+  "RED — 4 tests, 5 subtests". Re-measured at that exact commit it is 2 tests
+  / 4 subtests, at both the scoped and the full `./...` scope. The cell was
+  and is RED; the count was wrong.
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  rc=0 (62 packages ok, zero failures — no flakes on this pass),
+  `cargo test --release` rc=0 (main target 4277 passed / 0 failed, the same
+  number the merge entry below records; 4401 across all 7 test binaries).
+  `origin/master` is unchanged at `edefb7570` and IS this branch's merge base,
+  so no merge was needed and `git merge-tree --write-tree` is clean. No Rust
+  source changed this round, so no `make generate` and no cluster smoke are
+  owed. The mutation matrix above ran at scope
+  `./pkg/config/... ./pkg/dataplane/...`; the M1 baseline comparison was taken
+  at both that scope and the full `./...` so the "superset" claim does not rest
+  on a narrower run.
+
+## 2026-08-13 — #6691: merge master edefb7570; the only conflict was _Log.md
+
+- **Timestamp**: 2026-08-13 07:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Merged `origin/master` (`edefb7570`, which had taken #6645's RBAC
+  work) into the round-6 fold (`03c747edd`). The PR went CONFLICTING between the
+  hostile verdict and this push purely because master moved.
+- **File(s)**: `_Log.md`
+
+  Master touched ~30 files across `pkg/api`, `pkg/authz`, `pkg/cli`,
+  `pkg/daemon` and `pkg/config/login_perms.go`; this branch touches none of
+  them, so `_Log.md` was the sole conflict — two hunks, each a pure INSERTION on
+  both sides at a shared anchor.
+
+  Union-resolved and proved structurally rather than eyeballed: the result
+  differs from OUR parent by exactly 1963 added / 0 deleted lines (precisely
+  master's insertions) and from THEIR parent by exactly 650 added / 0 deleted
+  (precisely ours), and 77130 + 650 + 1963 = 79743 is the resulting line count.
+  Zero lines lost from either side. The tree-wide marker sweep is ANCHORED
+  (`^(<<<<<<< |=======$|>>>>>>> |\|\|\|\|\|\|\|)`) because this file
+  accumulates prose ABOUT conflict markers and an unanchored grep
+  false-positives on it.
+
+  Gated on the MERGE RESULT, not the pre-merge head, because a conflict-free
+  merge can still fail to compile or trip a guard that arrived with master:
+  `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...` rc=0 (62 packages,
+  one more than before the merge), `cargo test --release` rc=0 (4277 passed / 0
+  failed). The `pkg/cluster` WaitForIdle flake seen earlier in this session
+  passed here too.
+
+## 2026-08-13 — #6691 round 6: the exclusion moved to ownership, the RESOLVER did not
+
+- **Timestamp**: 2026-08-13 06:10 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a hostile MERGE-NEEDS-MAJOR at `b847bbfc2` — three blocking
+  findings, all reproduced firsthand before being fixed.
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/config/types.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_ownership_6691_test.go`,
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/config-schema.md`, `docs/refactoring-audit-current.txt`
+
+  **The diagnosis, because it is the whole point.** Round 5 moved the EXCLUSION
+  predicate from a name shape to ownership. The NAME RESOLVER did not move.
+  `Config.SecureTunnelUnitNetdev` stayed purely lexical — it returned
+  `ok=true` with the verbatim ref for ANY `st<N>.<unit>` no VPN owned — and it
+  is consulted FIRST by all three resolvers. A half-moved two-part mechanism is
+  the worst outcome available: the half that moved is defended by tests, and the
+  half that stayed is what ships.
+
+  **F1 — an unowned `st<N>` unit resolved to a netdev that does not exist.**
+  Measured with `set interfaces st5 unit 0` and NO IPsec anywhere (nothing
+  reserves the `st` prefix; `schema_interfaces.go` takes a wildcard name, and on
+  bare metal `set chassis device-map` renames a real card to exactly this):
+
+  | ref | before | after |
+  |---|---|---|
+  | `st5.0` | `st5.0` | `st5` |
+  | `st5 unit 3 vlan-id 80` | `st5.3` | `st5.80` |
+  | junos-host scope (unit 0) | `[st5 st5.0]` | `[st5]` |
+
+  At a name that exists on no box the row reports ifindex 0, and
+  `userspace-dp/src/filter/compiler.rs` skips `if iface.ifindex <= 0` — so the
+  unit's `filter input` was never installed, nor its per-unit CoS, nor its
+  routing-instance binding. On the VLAN unit it also took the junos-host DENY
+  with it: the guard was scoped to a device on no box and could not fire, which
+  is verbatim what `TestJunosHostDenyScopeNamesTheSecureTunnelDevice` exists to
+  prevent.
+
+  **F2 — ownership keyed on `if_id`, a lossy digest of the authored string.**
+  `strconv.Atoi` erases a leading `+` and leading zeros, so `st5`, `st05`,
+  `st+5` and `st0000005` all derive if_id `0x50001` while `LinuxIfName` keeps
+  them as four DIFFERENT device names — and `pkg/routing/xfrm.go` creates the
+  device under the AUTHORED name. Measured: `bind-interface st05` plus a NIC
+  named `st5` left both `st5` rows `secureTunnel=true` with an empty ingress set
+  and an empty RSS allowlist. A live NIC removed from the dataplane by a VPN
+  that never names it.
+
+  **F3 — the `st` arm was placed BEFORE the `TunnelNameMap` lookup**, reversing
+  #6861 r5 at two NEW call sites. Strict-committable, no IPsec, no device-map:
+  `st0 unit 1 tunnel mode gre` has real device `st0u1`, and the snapshot
+  returned `st0.1`. `TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861`
+  established TunnelNameMap-FIRST three PRs ago and stayed green throughout,
+  because it only checks `ResolveKernelIfName` and the TunnelNameMap-derived
+  live set — an ordering invariant bound at one call site does not survive a
+  second call site being added.
+
+  **The fix.** `SecureTunnelUnitNetdev` now returns `ok=false` when NOTHING
+  binds the ref, so each caller runs its ordinary resolution and names the real
+  device. The verbatim ref survives in exactly two places, both deliberate: an
+  if_id COLLISION (routing creates NEITHER device, and the unit-0 collapse would
+  alias the unit row onto `st<N>` — a name equally absent but which LOOKS
+  resolvable, and which is also the base row's name), and `ResolveKernelIfName`'s
+  own fallback, which keeps master's answer for an unowned unit. That fallback
+  is gated on `IsSecureTunnelIfName` rather than master's unbounded
+  `Atoi(base[2:])`, so an out-of-range `st65536.3` now falls through to the
+  ordinary unit resolution and AGREES with the snapshot instead of diverging.
+
+  For F2 the choice was between comparing the resolved NAME, canonicalizing the
+  index, and rejecting the non-canonical spelling at commit. **Name comparison,
+  and the reasoning is the #1960 no-brick doctrine.** Canonicalizing the index
+  or rejecting at commit both make `bind-interface st05` invalid — and a config
+  already carrying that spelling is persisted and peer-syncable, so the
+  rejection would brick it on reload rather than at authoring time. Name
+  comparison is resolver-local: `XFRMIfNameAndID`,
+  `ValidateSecureTunnelBindInterface` and `pkg/routing/xfrm.go` are all
+  untouched, so nothing that
+  commits today stops committing.
+
+  **The if_id collision veto is KEPT and is now a separate test**, which the
+  name comparison alone would have lost. If a config binds BOTH `st5` and
+  `st05`, routing sees one if_id under two names and creates NEITHER; ownership
+  by name would have resolved `st5.0` to `st5`, naming a device routing has
+  already refused to create — the same divergence one spelling over. So
+  `secureTunnelBindingForRef` answers three-way: bound / unbound / id-collision.
+  Ownership asks "is this ref THIS device?" (authored base spelling); the veto
+  asks "will routing create it at all?" (if_id, the key routing collides on).
+
+  **The PR's own proof was VACUOUS.** `TestUnownedStNameKeepsItsDataplaneRole`
+  still PASSED with `buildUserspaceIngressIfindexes` returning nil
+  unconditionally — measured, not inferred. Two of its three assertions asserted
+  nothing: the ingress branch was gated on `row.Ifindex > 0` with no link
+  snapshot stubbed, so every row carried 0; and the RSS assertion accepted
+  `n == row.LinuxName || n == "st5"`, which cannot tell the correct `st5` from
+  the round-5 `st5.0`. Only the predicate assertion bound, so the comment's
+  claim that the sets were "asserted per SET rather than through the predicate
+  alone" was false. Both are now live — the netdev is stubbed to ifindex 11 and
+  both sets are asserted against the ABSOLUTE name — and the repaired test REDs
+  on that same nil mutation.
+
+  **Mutation matrix — five cells, each an exact revert edit, all RED by
+  assertion; control green.**
+
+  | cell | revert edit | result |
+  |---|---|---|
+  | A | none (control) | rc=0 |
+  | M1 | `SecureTunnelUnitNetdev` unowned arm → `(LinuxIfName(ref), true)` | RED — 4 tests, 5 subtests |
+  | M2 | ownership by if_id alone (drop `secureTunnelRefsNameOneDevice`) | RED — `st05`, `st+5`, `st0000005` |
+  | M3 | `snapshotLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M4 | `junosHostLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M5 | `ResolveKernelIfName` st arm reverted to master | RED |
+
+  M3, M4 and the `types.go` revert were the reviewer's three "DO NOT BIND"
+  mutations — all three left the whole suite green before this round. The arm
+  order is observable only on the config that names one ref as BOTH a bound
+  xfrmi and a GRE tunnel, so that overlap is where it is now pinned; ownership
+  wins, matching `ResolveKernelIfName`'s long-standing ordering.
+
+  **Six stale citations folded**, several pointing at symbols this PR itself
+  deleted: `xfrmi.go` cited a Rust `is_secure_tunnel_ifname` using
+  `parse::<i64>()` that round 5 removed; it named `userspaceSkipsIngressInterface`
+  as a caller of the predicate, which it no longer is; the 5619 test cited a Rust
+  `secure_tunnel_ifname_matches_go` that does not exist; `interfaces.go` cited a
+  `TestSecureTunnelResolverParity` that does not exist; `main_tests.rs` carried an
+  orphan doc paragraph for that nonexistent shared table; and `server/README.md`
+  restated the exclusion as the NAME SHAPE `st<N>`, repudiated 30 lines later in
+  the same file. Two file:line cites were off by ~50 lines
+  (`compiler_iface.go:72/754` → `:73/:805`). The claim that
+  `SecureTunnelNetdevForRef` is "the same resolver that decides which xfrmi
+  devices exist" is corrected in both places that made it: `pkg/routing/xfrm.go`
+  does not call it — they agree by both deriving through `XFRMIfNameAndID`, which
+  is a shared derivation and a drift risk, not a guarantee.
+
+  **A pre-existing red gate on the branch, fixed here.** `TestHeatmapNotStale`
+  was FAILING at `b847bbfc2`: the PR grew `maps_sync.go` from master's 1953 to
+  2076, crossing the 2000-line tier boundary, and the round-5 gate run was
+  scoped to `pkg/dataplane`/`pkg/config`/`pkg/routing` so it never covered
+  `pkg/refactoraudit`. Heatmap regenerated;
+  `pkg/dataplane/userspace/maps_sync.go` is now recorded `[REFACTOR]`. The tier
+  is accepted rather than worked around — trimming comments to duck a threshold
+  would be gaming the gate — and the split is left as follow-up, since it is
+  orthogonal to this fold and PR #6698 is stacked on this branch.
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  green, `cargo test --release` rc=0 (4277 passed / 0 failed). `pkg/config` and
+  `pkg/dataplane/userspace` run 3x each, green every time. Two failures seen on
+  the first full pass were triaged, not waved through: `TestHeatmapNotStale` was
+  the real pre-existing red described above and is fixed; the `pkg/cluster`
+  `TestWaitForIdleTimesOutWhileQueueAdvances` and the Rust
+  `install_session_serializes_with_reconcile_removal` are load-dependent timing
+  flakes, both 3/3 green in isolation and neither in any file this round
+  touches. No shim source changed, so no `make generate` and no cluster smoke
+  owed.
+
+## 2026-08-12 — #5619/#6691: merge master 4960e7bee; both conflicts were adjacency, not rewrite
+
+- **Timestamp**: 2026-08-12 19:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Merged `origin/master` (`4960e7bee`) into the #6691 secure-tunnel
+  ownership branch (`81962949f`) so the runtime-blocker fix is gated against
+  what it will actually land on. Result `5b2cfba97`.
+
+  **Two files conflicted; neither was a semantic collision.** Master's side is
+  the #6676/#5173 shim queue-coordinate work (`3f6faf297`, `4de0f9319`,
+  `a40766dad`, `2794010a1`, `db6b22576`), already merged to master, so none of
+  its hunks could be dropped.
+
+  `userspace-dp/src/main_tests.rs` — master added 1525 lines and this branch
+  added 152, both immediately after the same section separator. Relative to the
+  merge base BOTH sides are pure additions: neither deleted or altered a line
+  the other owns. A naive union would nonetheless have been WRONG here, because
+  each side's last test ends mid-`assert_eq!` and the two shared a single
+  trailing `);\n}` — dropping the markers alone would have left this branch's
+  assertion unterminated and fused two tests into one. Resolved instead by
+  composing from the three merge stages (base head + this branch's block +
+  master's block + base tail) and then proving the composition: it differs from
+  each parent by exactly the other parent's insertion (1525 and 152 lines
+  respectively) with ZERO deleted lines on either side.
+
+  `_Log.md` — both sides appended at the head and at the tail. Union-resolved
+  and checked the same way: zero lines lost from either parent.
+
+  Tree-wide anchored marker sweep (`^(<<<<<<< |=======$|>>>>>>> |\|\|\|\|\|\|\|)`)
+  returns nothing, `_Log.md` included; the anchor matters because this file
+  accumulates prose ABOUT conflict markers.
+
+- **File(s)**: `userspace-dp/src/main_tests.rs`, `_Log.md`
+
+- **Validation on the MERGE RESULT, not the pre-merge head** — the point being
+  that a conflict-free-looking merge can still fail to compile (master adds a
+  constructor while the branch adds required fields) or break a test (a guard
+  arriving with master closes a hole a fixture depended on). Neither shape
+  occurred here:
+    - `cargo test --release`: rc=0, 4401 passed / 0 failed across 7 suites
+      (main suite 4277, up from 4257 pre-merge — master's new shim tests).
+    - `TestUserspaceXDPShimObjectMatchesSourceManifest`: PASS, run explicitly
+      by name so a SKIP could not be read as a pass.
+    - `go build ./...` rc=0; `go vet` rc=0; `go test` on `pkg/dataplane`,
+      `pkg/config`, `pkg/routing` rc=0 (6/6 packages ok).
+    - `git diff --stat origin/master...HEAD -- userspace-xdp/` is EMPTY, and the
+      branch diff carries no `.o`/binary artifact — so no `make generate` and no
+      cluster smoke are owed.
+  All exit codes captured unpiped. An earlier Go run showed six socket tests
+  failing with `bind: invalid argument`; that was the 108-byte `sun_path` limit
+  hit by my own long TMPDIR prefix, not the merge — re-run under a short TMPDIR,
+  all green.
+
+- **#6691 fix confirmed intact after the merge**: `case iface.SecureTunnel:`
+  (`maps_sync.go:1705`, shifted from 1681 by master), `secureTunnelOwned`
+  (`interfaces.go:457`), the `secure_tunnel` serde field still omitted-when-false
+  on both planes, and `is_secure_tunnel_ifname` still deleted — only the comment
+  recording why it went remains.
+
+## 2026-08-01 — #5619 PR1 round 6: four Codex MAJORs folded; a security guard that could not fire
+
+- **Timestamp**: 2026-08-01 20:46 (fix/6691-secure-tunnel-ifname-r4)
+- **Action**: Folded four of the five MAJORs from the hostile Codex review of
+  `ebe370701...f754bee3a`. The fifth (a MAC-less xfrmi egress resolving to zone
+  0) is a pre-existing defect tracked as #6713 and fixed by open PR #6722, which
+  owns the same two Rust files; it is NOT touched here, and the documentation
+  claims that depended on it being fixed are corrected instead.
+
+  **M4 — junos-host denies were scoped to the wrong kernel device (FAIL-OPEN).**
+  This one the PR CREATED. `junosHostLinuxName` resolves the `iifname` scope for
+  `to-zone junos-host ... then deny` nft rules and claims to mirror
+  `snapshotLinuxName` exactly, but it still performed the generic unit-zero
+  collapse. Before the PR both sides collapsed `st0.0` -> `st0` and agreed on a
+  wrong name; the PR fixed only the snapshot, so with `bind-interface st0.0` the
+  renderer emitted `iifname st0` while the decrypted plaintext arrives on
+  `st0.0`. The deny could never match. Fixed by deriving BOTH names from one
+  resolver, `Config.SecureTunnelUnitNetdev` (`pkg/config/xfrmi.go`), which
+  `ResolveKernelIfName`, `snapshotLinuxName` and `junosHostLinuxName` now all
+  call — not three copies asserted to agree.
+
+  **M2 — the secure-tunnel predicate admitted names that cannot be xfrmis.**
+  `XFRMIfNameAndID` bounds the index to `[0, 65536)` (the if_id is
+  `stIndex<<16 | unit+1`); `IsSecureTunnelIfName` ran a bare `Atoi` with no
+  bounds, so `st-3` and `st65536` classified as secure tunnels. Interface names
+  are wildcard-authorable with no `st` reservation, so `st65536` is an ordinary
+  data interface — and the PR's new exclusion removed it from the ingress map,
+  the AF_XDP binding plan and the RSS allowlist. A traffic outage on a valid
+  interface. Both now share one unexported `secureTunnelIndex`; the Rust mirror
+  `is_secure_tunnel_ifname` gets the identical bound.
+
+  **M5 — the collision fallback contradicted the routing fail-closed contract.**
+  Two DISTINCT bind-interface strings deriving one if_id made
+  `SecureTunnelNetdevForRef` return the lexicographically smallest name "for
+  determinism", and a test REQUIRED that. `pkg/routing/xfrm.go` deletes BOTH
+  colliding devices from its desired set, so neither exists on the box; naming
+  one is deterministically wrong. Now returns `("", false)`. Two VPNs authoring
+  the SAME string are still not a collision — one name, one device — and still
+  resolve.
+
+  **M3 — multiple resolvers disagree.** Scoped deliberately. The three that this
+  PR's rule belongs to are unified above. Four pre-existing divergences in LIVE
+  code (reached via `CompileUserspaceShim` -> `CompileConfig` -> `compileZones`,
+  not retired-eBPF-only) were verified firsthand and FILED rather than
+  half-fixed: #6728, #6729, #6730, #6731.
+
+  **Documentation.** Six claims Codex flagged as false were verified against the
+  code and corrected, not softened: the xfrmi does NOT enter the egress map
+  (`populate_egress`'s src_mac gate needs a MAC, a parent's MAC or the tunnel
+  flag, and an ARPHRD_NONE xfrmi has none); a matching permit does NOT preserve
+  delivery today (`evaluate_policy_result_l3_aware` wraps its whole walk —
+  exact, wildcard AND `junos-global` — in `if from_id != 0 && to_id != 0`), and
+  that behaviour DEPENDS ON #6722; an any/any policy does NOT match zone zero
+  (same guard, since #3110); `next-hop st0.0` still does not resolve; and a
+  deployment with no bound VPN is NOT unchanged (the merge base collapsed an
+  unbound unit zero to `st0`, head returns `st0.0`, and the exclusion keys on
+  the NAME, not on the presence of a VPN).
+
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/config/types.go`,
+  `pkg/config/junos_host_deny.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go`,
+  `pkg/dataplane/userspace/junos_host_netdev_parity_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`
+- **Validation**: Every behavioural fix was proven by mutating the fix OUT and
+  confirming build + `go vet` CLEAN with the specific guard RED on a real
+  assertion. Six mutations, including two at the EDGE of the claim rather than
+  its centre: an off-by-one bound (`>` for `>=`) that keeps `st65535` green
+  while `st65536` reds, and an over-strict collision test that reds only the
+  same-bind-interface case. One mutation deliberately moved the SHARED resolver
+  so both planes agreed on the wrong name — the parity test stayed GREEN and
+  only the new absolute test went RED, which is why an absolute assertion was
+  added rather than relying on parity.
+
+## 2026-08-01 — #5619 PR1 round 5: the TX-disposition trace was WRONG; retraced by execution
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Retracted and replaced the round-4 conclusion recorded above.
+  Round 4 concluded "no new drop; the TX dispatcher drops it either way". That
+  is **false**: a LAN->tunnel packet never reaches the TX dispatcher, because
+  the FIB claims it on an earlier arm. The round-4 trace analysed a site that
+  neither revision executes for this flow.
+
+  Retraced by EXECUTION rather than by reading, on both revisions:
+
+  1. Go half — the same probe file run at HEAD `dcd9f7207` and at the merge-base
+     `ebe370701`, dumping `buildInterfaceSnapshots` with `buildLinkSnapshot`
+     stubbed so only the netdev `XFRMIfNameAndID(bind-interface)` names exists.
+     Measured: the secure-tunnel UNIT row's ifindex changes for **exactly one**
+     spelling. `bind-interface st0.0` goes 0 -> 42. `st0`, `st10.5` and `st0.7`
+     were ALREADY 42 pre-fix (no unit-0 collapse fires for a non-zero unit, and
+     for bare `st0` the collapsed name IS the device).
+
+  2. Wire half — the real `buildSnapshotWithSchedulerStateAndNATCounters` output
+     serialized to JSON on each revision, then deserialized by the REAL Rust
+     `build_forwarding_state` + `lookup_forwarding_resolution_v4`. Matrix:
+     2 spellings x 3 next-hop spellings x 2 destinations = 12 cells.
+
+  Result: 4 of 12 cells flip disposition, ALL of them in the dotted
+  `bind-interface st0.0` spelling (4 of that spelling's 6). Zero cells flip for
+  bare `bind-interface st0`. The flip is `NoRoute` (egress 0) ->
+  `MissingNeighbor` (egress 42), caused by the tunnel's connected prefix
+  entering `connected_v4` once the unit row clears
+  `populate_interfaces`' `ifindex <= 0` skip.
+
+  Classification: **correction, not regression.** Both spellings describe ONE
+  tunnel (same if_id, same unit ref `st0.0`); pre-fix they took DIFFERENT
+  dispositions purely because of the name bug, and post-fix they converge on
+  what the canonical bare spelling already did. Operator-visible consequence,
+  now stated in the code and the PR body: `NoRoute` reinjects to the kernel
+  unconditionally while the `MissingNeighbor` arm evaluates zone policy first
+  and a DENY exits before the reinject gate — so LAN->tunnel transit with no
+  `from-zone <lan> to-zone <tunnel-zone>` permit goes from kernel-delivered to
+  dropped on the dotted spelling. That reinject was a zone-policy bypass, which
+  is #5619's subject. Under a PERMIT both arms reinject; nothing changes there.
+
+  Also measured and corrected: the "exclusion was an accident before #5619"
+  claim held for the dotted spelling ONLY. At the merge-base, `st0`, `st10.5`
+  and `st0.7` were in `buildUserspaceIngressIfindexes` AND
+  `UserspaceBoundLinuxInterfaces`. The exclusion arm is therefore NEW behaviour
+  for three of four spellings, not a preserved accident — it must not be deleted
+  as inert.
+
+- **File(s)**:
+  - `pkg/dataplane/userspace/interfaces.go` — the disposition caveat at the fix
+    site (the code, not just the PR body, now carries it).
+  - `pkg/dataplane/userspace/maps_sync.go` — replaced the false
+    "changes no disposition" paragraph with the measured result; corrected the
+    accident claim to three-of-four-spellings; fixed a dangling citation to
+    `TestSecureTunnelSpellingsAllExcluded` (never existed) ->
+    `TestSecureTunnelStaysOutOfDataplaneSets`.
+  - `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go` —
+    `TestSecureTunnelSpellingsAgreeOnForwardingInputs` plus the
+    `connectedPrefixInputs` projection that mirrors the Rust
+    `populate_interfaces` gate.
+  - `userspace-dp/src/afxdp/forwarding_build/tests.rs` —
+    `secure_tunnel_unit_ifindex_decides_route_disposition` pins the FIB half.
+  - `userspace-dp/src/main_tests.rs` — dangling citation
+    `TestSecureTunnelAddsNothingToDataplaneSets` ->
+    `TestSecureTunnelAddsNothingToTheAdjudicatedSets`.
+
+- **Validation**: `go build ./...` 0 and `go vet ./pkg/dataplane/...` 0 asserted
+  BEFORE trusting any red. Mutation at BOTH edges of the fix's scope, each with
+  build+vet clean first and named PASS/FAIL lines, never a bare exit code:
+    - M1 remove the arm (original unit-0 collapse): target test FAILS on
+      `dotted_st0_0` (both the per-spelling ifindex assertion and the
+      cross-spelling set equality); 3 controls PASS.
+    - M2 reconstruct `<ifName>.<unit>` (round-1 bug): target test FAILS on
+      `bare_st0` via the PER-SPELLING assertion ONLY — the set-equality half
+      stays green because the base `st0` row still carries (42, 10.5.5.1/30).
+      That is exactly why both halves are asserted; a set-only guard would have
+      been scoped narrower than its claim.
+    - M3 widen the FIB gate to `ifindex < 0`: the Rust test FAILS with
+      `left: MissingNeighbor / right: NoRoute`; 3 sibling secure-tunnel tests
+      PASS. (First re-run after restoring the file reported FAIL from a stale
+      mtime, not a real failure; `touch` + re-run is green.)
+  Full suites green at the head: `go test ./...` rc 0, zero FAIL lines;
+  `cargo test --bin xpf-userspace-dp` 4238 passed / 0 failed.
+
+- **Not verified**: no cluster smoke (parent schedules those; the loss cluster
+  runs no route-based IPsec) and nothing exercised against a live xfrmi. The
+  `poll_descriptor` consequence of the flip (the `MissingNeighbor` arm's
+  deny -> `break RecycleAndContinue` bypassing the reinject gate) is read from
+  source plus the pinned `is_slow_path_eligible` table, NOT executed — the
+  worker loop was not run. INCONCLUSIVE and not chased: whether the
+  negative-neighbor cache (3 s TTL, armed on `pending_neigh` timeout) makes a
+  PERMITTED tunnel flow fast-fail instead of reinject. If it does it is
+  PRE-EXISTING — bare `st0` already resolved MissingNeighbor at the merge-base —
+  but this change extends its reach to the dotted spelling.
+
+## 2026-08-01 — #5619 PR1 round 4: TX disposition traced; claim narrowed
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Traced the TX path to a terminal outcome before deciding whether
+  to widen the exclusion into populate_interfaces/populate_egress. Verdict: DO
+  NOT WIDEN — the current state introduces no new drop and is a strict
+  improvement, and widening would trade an already-existing drop for a possible
+  policy bypass.
+
+  The chain, verified in code rather than from doc comments:
+    - resolve_next_hop_target_v4 (forwarding_build/fib.rs) ends
+      `.unwrap_or((0, 0))`, so an interface-named next-hop that fails to resolve
+      keeps the route with ifindex 0.
+    - PRE-#5619 the xfrmi was absent from names/linux_names (populate_interfaces
+      gates on ifindex > 0 and its ifindex was 0), so `next-hop st0.0` resolved
+      to ifindex 0.
+    - resolve_tx_binding_ifindex (tx/dispatch/shared_recycle.rs) does
+      `egress.get(&ifindex) ... .unwrap_or(egress_ifindex)`, so target 0 stayed 0.
+    - A target ifindex with no XSK binding is dropped by the TX dispatcher:
+      `missing_egress_binding` + recycle_ingress_frame (tx/dispatch/mod.rs).
+      There is NO kernel fallback arm.
+    - POST-#5619 the ifindex resolves to the real xfrmi, which still has no
+      binding (deliberately) — so the frame drops at the SAME site for the SAME
+      reason. Only the ifindex named in the exception differs.
+
+  Net change is therefore a strict improvement: the egress zone now resolves, so
+  a LAN->tunnel flow is adjudicated against the real zone pair instead of an
+  unresolved one. Widening the exclusion would remove that, and an interface
+  absent from the zone maps resolves to zone_id 0, which a `from-zone any
+  to-zone any permit` matches with no zone guard (#6682) — trading a
+  pre-existing drop for a possible policy bypass.
+
+  Claim narrowed in both shipping artifacts (maps_sync.go exclusion comment and
+  userspace-dp/src/server/README.md): the predicate gates the ingress map, the
+  binding plan and the RSS allowlist — and ONLY those. The FIB/egress/zone maps
+  DO see the xfrmi, with the traced consequence stated and an explicit warning
+  not to "fix" it by widening.
+
+  Also completed the vacuity audit of earlier mutation rounds under the strict
+  run-detector: round 1 4/4 tests RAN, round 2 7/7 RAN, and the only vacuous run
+  was the transitional round-3 baseline (3 renamed-away tests) which was never
+  used as evidence. Rust rows were safe by construction — proven by feeding a
+  deliberately missing test name through the detector (cargo rc=0, "0 passed",
+  detector correctly reports NOTRUN).
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+## 2026-08-01 — #5619 PR1 round 3: bare `bind-interface st0` regression (MAJOR-1/2/3)
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Hostile re-gate found the round-1 fix REGRESSED the bare
+  `bind-interface st0` spelling — the same defect it fixed, in the opposite
+  direction.
+
+  `snapshotLinuxName` synthesized `fmt.Sprintf("%s.%d", ifName, unit.Number)`,
+  but the reconciler creates `LinuxIfName(bind-interface)` VERBATIM and those
+  are equal only for the dotted spelling. pkg/routing/xfrm.go:87-89 states it
+  outright: a bare "st0" and an explicit "st0.0" derive the SAME if_id under
+  DIFFERENT device names. Measured: with `bind-interface st0` the device is
+  `st0`; PRE-round-1 snapshotLinuxName returned "st0" (correct), POST-round-1 it
+  returned "st0.0" (a name on no box).
+
+  Fix: resolve from the AUTHORED bind-interface via a new
+  `Config.SecureTunnelNetdevForRef`, joining on if_id — XFRMIfNameAndID is the
+  SSOT for both halves. Reconstructing a name another component owns is what
+  caused the original drift; the round-1 fix repeated it one level down.
+  `ResolveKernelIfName` had the SAME bug and now shares the helper, so the
+  parity guard stays meaningful instead of pinning two identically-wrong
+  resolvers. Deterministic under an if_id collision (lexicographically smallest
+  device), for the tolerant-load path.
+
+  Tests were keyholes: every case was dotted and the expected device was
+  hardcoded. Now table-driven over bare `st0`, dotted `st0.0`, multi-digit
+  `st10.5` and non-zero unit `st0.7`, with the expected device DERIVED from
+  XFRMIfNameAndID so a reconstruction bug cannot be mirrored by the test.
+
+  MAJOR-2 measured rather than argued. The "identical before and after" claim
+  was too broad and is withdrawn; what holds is the ADJUDICATION boundary.
+  Deltas, measured by resolving/not-resolving the unit through the
+  buildLinkSnapshot seam:
+    - buildLocalAddressEntries 2 -> 3: the CONFIGURED address was already
+      present pre-fix (unit rows merge configured addrs regardless of the live
+      lookup), so the delta is live-ONLY addresses (the xfrmi link-local).
+      Correct — those are genuinely firewall-local.
+    - connected-route FIB: prefixes IDENTICAL; only ifindex/MTU fields change.
+    - BuildZoneHostInboundViews: gains the live-only address in the deny scope
+      — CLOSES scope rather than opening it.
+    - AddresslessEnforcingInterfaces: no change.
+    - MonitoredInterfaceLinkIndexes / buildNeighborSnapshots: not exercisable
+      through the seam (they call netlink.LinkByName against the real kernel).
+      By inspection the tunnel link becomes monitored, which is correct — and
+      notably the bare-st0 regression would have REMOVED monitoring that
+      previously worked.
+    - UserspaceBoundLinuxInterfaces: [ge-0-0-0 st0] -> [ge-0-0-0]. Correct: it
+      is keyed by NAME with no ifindex guard, so it had been listing a device
+      that does not exist for the dotted spelling.
+- **File(s)**: pkg/config/xfrmi.go, pkg/config/types.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go, _Log.md
+
+## 2026-08-01 — #5619 PR1 round 2: prove the exclusion changes nothing
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Review conditions on the reshape. "Net forwarding behaviour is
+  identical before and after" was the load-bearing claim and was asserted in
+  prose; it is now proven by DIFFERENTIAL tests on both planes — the same
+  config/candidate list is built twice, with and without the route-based VPN,
+  and the ingress-adjudication set, the RSS allowlist and the AF_XDP binding
+  plan must come out byte-identical. Both differentials assert the tunnel row
+  is RESOLVED first, so neither can be satisfied by the pre-fix ifindex-0
+  accident.
+
+  Exclusion scope stated rather than implied: a BASE-name match (unit stripped)
+  against `st` + numeric remainder. Covers `st0`, `st0.0`, `st10.5`; does NOT
+  cover `stx` / `start0`, which stay adjudicated — over-matching would silently
+  drop a real data interface out of adjudication.
+
+  MTU/addresses now asserted rather than riding along: a secure-tunnel unit
+  reported MTU 0 and no live addresses because it resolved to the nonexistent
+  netdev `st0`.
+
+  Mutation matrix extended to 6 rows with a `go vet` gate added alongside the
+  two build gates. Row 3 reds the Rust arm alone and row 2 the Go arm, so each
+  exclusion arm is independently bound. Row 5 mutates the OTHER resolver
+  (`ResolveKernelIfName`) and reds `parity` ALONE — the parity guard binds
+  DIVERGENCE symmetrically, not merely the absence of the rule on one side.
+  Row 6 resolves to a wrong-but-plausible netdev and reds the MTU/address
+  guard, so it binds the real device rather than "the name changed".
+
+  Filed #6700 for the remaining work with the evidence verbatim: the AF_XDP
+  bind on a virtual netdev (1 RX queue, no ndo_bpf/ndo_xsk_wakeup) AND the
+  reverse direction — LAN->tunnel egress needs the dataplane to hand plaintext
+  INTO the xfrmi for kernel encryption, which is a new egress mechanism, not a
+  config change.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  _Log.md
+
+## 2026-08-01 — #5619 PR1: secure-tunnel netdev name drift + explicit dataplane exclusion
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: `snapshotLinuxName` resolved a secure-tunnel unit `st0.0` to the
+  netdev `st0` via the generic unit-0 collapse, but the xfrmi reconciler
+  creates the device under the VERBATIM dotted ref (`XFRMIfNameAndID` returns
+  `LinuxIfName(bindInterface)`), so the real netdev is `st0.0`. The dataplane
+  therefore looked up a name that exists on no box: the unit reported ifindex
+  0, MTU 0 and no addresses.
+
+  `Config.ResolveKernelIfName` already had the correct `st<N>.<M>`-verbatim
+  short-circuit AND a doc comment requiring `snapshotLinuxName` to be kept in
+  sync with it — nothing enforced that, and the dataplane copy silently lacked
+  the rule. Extracted the lexical test to `config.IsSecureTunnelIfName` so both
+  resolvers apply one predicate instead of a hand-copied third instance, and
+  added `TestSecureTunnelResolverParity` as the drift guard that was missing.
+
+  Fixing the name alone would have been a REGRESSION, not a fix. Measured
+  before writing it: with the ifindex resolving, the xfrmi enters
+  `userspace_ingress_ifaces` (`[11]` -> `[11 42]`), the AF_XDP binding plan and
+  the RSS allowlist. The shim would then claim the xfrmi's ingress and steer it
+  to an XSK that cannot come up on a virtual netdev (no `ndo_bpf` /
+  `ndo_xsk_wakeup`, so no zero-copy), and `drop_degraded_transit` would DROP
+  the decrypted plaintext — turning a policy gap into a dead tunnel. The
+  exclusion that previously happened by ACCIDENT (ifindex 0) is now stated
+  deliberately on both planes: `userspaceSkipsIngressInterface` (Go, gates the
+  ingress map + RSS allowlist) and `include_userspace_binding_interface`
+  (Rust, an INDEPENDENT gate on the binding plan — the Go snapshot ships every
+  interface regardless). Net forwarding behavior is identical before and after.
+
+  Scope: this does NOT close #5619. Decrypted IPsec plaintext still traverses
+  Linux routing with no xpf zone policy — the open half needs the dataplane to
+  own the xfrmi end-to-end including a plaintext egress path into the tunnel.
+  Both exclusion sites and the README say so explicitly so a future reader
+  cannot mistake the exclusion for a decision that the gap is acceptable.
+
+  Validation: Go `pkg/config` + `pkg/dataplane/userspace` suites green; Rust
+  build clean; 4-row mutation matrix with build gates on both toolchains.
+- **File(s)**: pkg/config/xfrmi.go, pkg/config/types.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/server/README.md, _Log.md
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
@@ -78254,6 +79865,89 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/natshow/persistent_single_resolution_2114_test.go (new),
   docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
 
+## 2026-08-12 — #5619 round 6: key the secure-tunnel exclusion on OWNERSHIP, not name shape
+
+- **Timestamp**: 2026-08-12
+- **Action**: The round-5 blocker was UNFIXED at `91c08e0a6` — the only commit
+  since the r5 verdict was a claim retraction, and a claim retraction does not
+  fix a runtime regression.
+
+  **The defect.** Interface names are wildcard-authorable and nothing reserves
+  the `st` prefix, so this is a valid config naming a real physical NIC with no
+  VPN anywhere:
+
+      set interfaces st5 unit 0 family inet address 192.0.2.1/24
+      set security zones security-zone trust interfaces st5.0
+
+  `userspaceSkipsIngressInterface` excluded on `config.IsSecureTunnelIfName` —
+  `st` plus an index in [0, 65536) — which matches `st5`, dropping the physical
+  ifindex out of ingress adjudication, out of the binding-plan inputs and out
+  of the RSS allowlist, with Rust independently refusing the binding. The
+  arm's own comment named that failure mode ("a traffic outage") and
+  over-matched anyway.
+
+  **The fix: ownership, resolved once, shipped.** An `st` name is a secure
+  tunnel because an IPsec configuration BINDS it. `secureTunnelOwned` consults
+  `Config.SecureTunnelNetdevForRef` — the same resolver that decides which
+  xfrmi devices exist — and the verdict rides the snapshot as
+  `InterfaceSnapshot.SecureTunnel`. Both planes read that flag, so they agree
+  by CONSTRUCTION rather than by convention.
+
+  **The Rust name grammar is DELETED, not corrected.** With the decision made
+  from ownership, `is_secure_tunnel_ifname` had nothing left to decide and
+  could only drift from the Go one, so it and its hand-maintained mirror table
+  are gone. That closes the "two hand-written artifacts compared to each other"
+  item by removing the second artifact rather than guarding it.
+
+  **A bug my own fix introduced, caught by an existing guard.** The first
+  version resolved the UNIT row's ownership from the BASE name.
+  `TestSecureTunnelAddsNothingToTheAdjudicatedSets` went RED on the
+  `multidigit_st10_5` spelling: the if_id is `stIndex<<16 | unit+1`, so `st10.5`
+  and `st10` derive DIFFERENT ids and a VPN binding `st10.5` does not own
+  `st10`. Only unit 0 coincides. The unit row now resolves from the unit ref
+  and the helper's doc says so.
+
+  **The range rationale, made coherent.** The old test asserted that in-range
+  `st` names are excluded and out-of-range ones are not — pure name-shape
+  semantics, the belief the blocker rests on. Replaced by
+  `TestSecureTunnelRangeBoundsWhatCanBeOwned`, which states what the range NOW
+  decides: not what is excluded, but what can be OWNED. In range + bound is a
+  tunnel; in range + unbound is an ordinary NIC; out of range + bound is NOT
+  AUTHORABLE — #5297 rejects the bind-interface at commit — asserted as a
+  commit rejection, which is a stronger statement than the old test made.
+
+  **Two weak assertions closed.** The collision guard checked only `ok` and
+  never the documented empty name, so a hypothetical `("st0", false)` passed
+  it; it now asserts both halves. The live-address fixture stubbed the SAME
+  address the config authors, and production merges the configured value, so
+  the assertion held whether or not the live lookup resolved — the stub now
+  returns an address only `buildLinkSnapshot` can supply.
+
+  **A process failure worth recording.** Running `cargo fmt -- <one file>`
+  reformatted the WHOLE crate: ~330 files, including
+  `userspace-xdp/src/ipv6_ext_walk.rs`, which put the shim source out of
+  lockstep with the tracked object and turned
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` RED. `cargo fmt` takes a
+  package, not a path; `--` passes the file to rustfmt but the package is still
+  formatted. Every unintended file was reverted and the four Rust edits
+  re-applied by hand. Both suspect failures were measured at the PRISTINE head
+  first rather than assumed pre-existing: the manifest guard was mine; a
+  `slowpath` failure in the same run was a load flake and passes in isolation
+  on both revisions.
+
+  **Validation.** RED at `91c08e0a6` with no fix:
+  `TestUnownedStNameKeepsItsDataplaneRole/no_VPN_binds_st5` — "= true, want
+  false" plus "st5 in the RSS/binding allowlist = false, want true" — while the
+  owned control PASSED, so the guard is not "keep everything". GREEN after the
+  fix at `-count=2`. `go build ./...` 0; `go test ./pkg/dataplane/...
+  ./pkg/config/... ./pkg/routing/...` GO_RC=0; `cargo test` CARGO_RC=0
+  (4257 passed).
+- **File(s)**: pkg/dataplane/userspace/interfaces.go, maps_sync.go,
+  protocol.go, secure_tunnel_ifname_5619_test.go,
+  secure_tunnel_ownership_6691_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs, server/helpers/planning.rs,
+  src/main_tests.rs, src/server/README.md, _Log.md
+
 ## 2026-08-07 — #5561 round 18: the view tier could 429 the clear tier
 
 - **Timestamp**: 2026-08-07
@@ -83661,3 +85355,406 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cli/cli_show_system_single_load_6743_test.go,
   pkg/daemon/daemon_dp_escape_canary_test.go,
   pkg/daemon/dp_cell_monotone_6743_test.go, pkg/api/system.go
+
+
+- **Timestamp**: 2026-08-13T18:35Z
+- **Action**: #6691 round 10 — Codex MERGE-NEEDS-MAJOR at `4cf507638`: two runtime
+  blockers, a refuted claim of mine, and four stale-prose minors.
+  **B1 (zero-owner fabric fall-through).** `userspaceRefusedNetdevs` was built from
+  interface ROWS and refused only on `owners > 0 && owners == unbindable`. A fabric
+  MEMBER NEEDS NO INTERFACE STANZA, so `set interfaces fab0 fabric-options
+  member-interfaces ge-0/0/0` emits that netdev into the ingress map and the RSS
+  allowlist with ZERO rows owning it, and a unanimity rule over an empty bucket
+  answers "not refused". Measured at `4cf507638` with a live-xfrm `ge-0-0-0`:
+  `rows OWNING ge-0-0-0: 0`, `refusesName=false`, `refusesIfindex(20)=false`,
+  ingress `[20 21]`, allowlist `[ge-0-0-0 ge-0-0-3]` — the refused device in both
+  sets, on both planes. Round 9 had asked the RIGHT question of an oracle that could
+  not answer it. FIXED BY CORRECTING THE OWNER SET, not by a fourth conjunct: an
+  emitted fabric parent IS an owner, so it carries a verdict
+  (`fabricParentUnbindable`, which hands a synthetic row to the SAME
+  `netdevExclusionClasses` table rather than restating any class) and is tallied like
+  any other owner. "Ownerless" is NOT itself a refusal — the reference cluster's own
+  `fab0 member-interfaces ge-0/0/0` has no row, so refusing on absence would strip
+  the fabric parent from every cluster this project runs; that is a named negative
+  control on both planes. The verdict rides the wire as
+  `FabricSnapshot.ParentUnbindable` because the Rust plane cannot recompute it (the
+  kernel-link-kind half is a Go-side RTM_GETLINK dump), which forces protocol 6->7.
+  Also hoisted the xfrm sample into `buildSnapshot` so the rows and the fabric
+  parents are judged against ONE dump — two samples of a changing kernel put a
+  netdev's owners on opposite sides of the unanimity for no reason but sampling.
+  **B2 (gate armed with no observed version).** `ensureSecureTunnelProtocolLocked`
+  compared `lastStatus.ConfigSnapshotProtocolVersion` against `ProtocolVersion` and
+  armed whenever the live status request also failed — i.e. it armed on the ABSENCE
+  of a reading. Reachable: the deferred-worker arm (manager_worker_arm_5134.go)
+  reaches this gate BEFORE any helper liveness check. The value alone cannot separate
+  "no helper answered" from "a helper answered without the field" (both 0, opposite
+  verdicts), so the observation is now explicit and inseparable from the status:
+  `setLastStatusLocked` / `clearLastStatusLocked` move `lastStatus` and
+  `helperStatusObserved` together at all seven assignment sites. Scoped to THIS gate;
+  the three siblings are #7002.
+  **M1 (my claim, refuted).** `TestMixedVersionHelperRefusalFailsTheCommit_6691` said
+  the injected error was "the REAL one ... wrapped the way process_control.go wraps an
+  ok=false response". It is a pre-formed error VALUE: no socket, no decode, no
+  `resp.Error` pass-through. Took the option the lead authorized — the comment now
+  states plainly what the test does not prove and names where each end of the chain
+  IS pinned.
+  **MINORs.** Bound the previously-untestable xfrm-dump diagnostic by extracting
+  `sampleLiveXfrmNetdevs` (Codex's deletion-survivor claim CONFIRMED firsthand: with
+  round 10's test removed, deleting the `slog.Error` leaves the whole package green
+  at 25.8s); removed a duplicated comment fragment at planning.rs ~340; corrected the
+  round-9 "closed all four loops" paragraph, which read as done and was not; retired
+  the pinned `v5`/`pre-v5` wording now that three versions share one gate.
+  **Validation.** 8/8 Go mutations + 1/1 Rust mutation killed, each by the intended
+  assertion — sever the fabric owner arm (Go and Rust), force the verdict false,
+  bypass the class table, un-hoist the sample, delete the diagnostic, delete/invert
+  the observed-version conditional, and substitute a `version > 0` shortcut for the
+  explicit marker (that last one reds ONLY the "helper answers without the field"
+  cell, which is why the marker is not redundant). Full Go suite: 61 packages ok;
+  `pkg/ddns` failed on `bind: address already in use` from a concurrent agent and is
+  clean in isolation. Full Rust suite green with `FULL_RC=0`. The wire fixture
+  `protocol_wire_v1.json` was REGENERATED (one added key) rather than hand-edited.
+  Fixing the round-9 Rust fixture surfaced a real invariant worth pinning: a BASE row
+  and a fabric parent on one netdev must never disagree (production computes both
+  from identical inputs), because that disagreement would re-admit the device from
+  the other side — `TestFabricAndBaseRowNeverDisagree`.
+- **File(s)**: pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/manager_status.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/fabric_ownerless_parent_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go,
+  pkg/dataplane/userspace/mixed_version_matrix_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  pkg/daemon/mixed_version_commit_6691_test.go,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md
+
+- **Timestamp**: 2026-08-14T00:20Z
+- **Action**: #6691 round 11 — Codex MERGE-NEEDS-MAJOR at `8c011681c`: three runtime
+  blockers, all downstream of round 10 adding a SECOND producer of netdev verdicts
+  and teaching each consumer about it by hand. All three reproduced first at
+  `8c011681c`, then fixed.
+  **B1 (the v7 gate could not see the v7 verdict) — CONFIRMED, FIXED.**
+  `ensureSecureTunnelProtocolLocked` scoped itself with a scan of `snap.Interfaces`,
+  so a snapshot whose only unbindable verdict was a fabric parent's did not arm it:
+  measured at `8c011681c` on an ownerless live-xfrm member, `ParentUnbindable=true`,
+  no flagged row, `gate = nil`. The snapshot ships, a v6 helper refuses it on the
+  exact-equality version check, the commit reports success, and that helper stays
+  ARMED on a plan binding the refused netdev — the window the gate exists to close,
+  missed for the field the bump was made for. NOT fixed by adding a fabric loop to
+  the gate (the same hand-maintained second list, one round later):
+  `snapshotNetdevVotes` is now the ONE enumeration of who contributes a netdev, and
+  each contributor declares whether it speaks for the netdev, what its verdict is,
+  and whether that verdict rides on a field an older helper cannot read. The tally
+  and the gate both read it.
+  **B2 (a refresh re-decided the verdict) — REPRODUCED, FIXED.** `SyncFabricState`
+  rebuilds fabric rows from a FRESH xfrm sample and writes them back beside
+  interface rows only a full build re-derives. Neither plane replans there
+  (`update_fabrics` swaps `snapshot.fabrics` in place; `replan_queues` runs only
+  from the apply path), so the next partial republish ships a verdict the Go ingress
+  map never saw — an ifindex in that map with no READY binding is
+  `drop_degraded_transit`. Measured at `8c011681c`: ingress `[20 21]` before a
+  refresh, `[21]` after. `alignFabricVerdicts` keeps the verdict with the APPLIED
+  snapshot; the refresh carries MACs, ifindexes and link state as intended. Codex's
+  claim that the "SyncFabricState has no interface rows to agree with" comment was
+  wrong is CONFIRMED — both planes persist its rows beside existing interface rows —
+  and the comment is corrected with the fix.
+  **B3 (canonical aliases split one device into two owners) — REPRODUCED, FIXED.**
+  `member-interfaces gr-0/0/3` with the stanza authored `gr-0-0-3` is ONE device
+  under two legal names: the member must be slash-spelled for `InterfaceSlot` to
+  resolve its node, the stanza name is a wildcard, and
+  `validateInterfaceNameCollisionStrict` sees a single map key and cannot object.
+  The verdict's exact map lookup missed the `tunnel` stanza and voted bindable
+  against an unbindable row; measured at `8c011681c`, ingress `[20 21]` with 20 the
+  GRE device and allowlist `[ge-0-0-3 gr-0-0-3]`. Lookup now keyed on the NETDEV
+  (`interfaceConfigForNetdev`); it is the only exact-match lookup in `fabric.go`
+  that could miss (the fab interface itself is keyed by its own map key, and
+  `snapshotSecureTunnel`'s kernel half is netdev-keyed already).
+  **AND THE RULE CHANGED, because fixing both leaves the next divergence a
+  fail-open.** Round 10 counted the fabric as an owner beside any row, so one device
+  had two owners judged from different evidence — and unanimity reads a
+  disagreement as an ADMISSION. A fabric now votes only where NO interface row owns
+  the netdev: round 9 preserved exactly for row-owned netdevs, round 10 exactly for
+  ownerless ones, and never less refusing than either (suppressing a bindable fabric
+  vote can only turn "not refused" into "refused"). Mirrored in Rust's
+  `snapshot_refuses_parent_netdev`.
+  **REFUTED.** Codex's second B1 case — fabric-only `Tunnel` verdicts missed the
+  same way — does not exist. The Tunnel evidence comes from
+  `cfg.Interfaces.Interfaces`, and `buildInterfaceSnapshotsFrom` emits a base row
+  for EVERY entry in that map, so a Tunnel-class fabric verdict always has an owning
+  row and (under the new rule) is never load-bearing. A v6 helper reaches the same
+  verdict from the row's own pre-v7 `tunnel` field, so arming there would abort a
+  commit over a difference that does not exist — the gate deliberately does not.
+  **MINORS.** Bound the second `clearLastStatusLocked` in `stopLocked` (Codex's
+  deletion-survivor claim CONFIRMED: every existing stopLocked test runs with
+  `proc == nil`; deleting the post-teardown clear leaves them green while a stopped
+  helper keeps a stale `ConfigSnapshotProtocolVersion` with `helperStatusObserved`
+  still true — the exact pair the required-protocol gates read). Widened
+  `TestFabricAndBaseRowNeverDisagree` to pair a row with a fabric by NETDEV instead
+  of by authored spelling, which is why it could not see the alias, plus an alias
+  case.
+  **Validation — mutation grid, all cells on the worktree at `ee880b805` unless
+  noted.** G1 fabric verdict never needs the wire: rc=1, killed by the gate test AND
+  by the producer guard's coupling assertion. G2 fabric votes even when a row owns
+  it: rc=0 FIRST TIME — the rule was unguarded on the Go plane because the other two
+  fixes removed every config that reaches the state; added
+  `TestAFabricVoteCannotOverturnAnOwningRow`, which builds the snapshot by hand, and
+  re-ran: rc=1. G3 exact-spelling stanza lookup: rc=1, killed by
+  `TestFabricAndBaseRowNeverDisagree`. G4 refresh ships a freshly sampled verdict:
+  rc=1, `ingress [20 21] -> [21]`. G5 delete the post-teardown status clear: rc=1,
+  killed only by the new test. G6 a third producer emits a netdev with no verdict
+  (fabric loop also emits its OVERLAY ifindex): rc=1, the producer guard named the
+  section and the ifindex. G7 fabric never votes: rc=1, killed by the round-10
+  guard. R1 fabric counted beside an owning row: rc=101,
+  `fabric_vote_cannot_overturn_an_owning_row`. R2 fabric never votes: rc=101,
+  `ownerless_fabric_parent_is_refused`. Targeted Rust baseline before mutation: 103
+  passed / 0 failed.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/fabric.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  pkg/dataplane/userspace/fabric_ownerless_parent_6691_test.go,
+  pkg/dataplane/userspace/manager_ha_test.go,
+  pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go,
+  pkg/dataplane/userspace/mixed_version_matrix_6691_test.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-20T00:00Z
+- **Action**: #6691 round 12 — hostile MERGE-NEEDS-MINOR at `29b9b84c0`: no runtime
+  defect (14 of 14 production-line reversions caught, protocol genuinely lockstep at
+  7 on both planes), but three guards had measured holes and guards are this PR's
+  deliverable. Test-and-doc round only; ZERO production lines move.
+  **F2 (BLOCKING) — neither new wire field's KEY was pinned on the Go side.**
+  Measured at `29b9b84c0`, both green: `json:"secure_tunnel,omitempty"` ->
+  `json:"secureTunnelXX,omitempty"` and `json:"parent_unbindable"` ->
+  `json:"parentUnbindableXX"`. The version guard cannot see this — both planes still
+  report 7, so `apply_snapshot` accepts, the field is simply absent and serde
+  defaults it false. For `parent_unbindable` that means an ownerless fabric parent
+  stops being refused, `replan_queues` admits the xfrmi, and
+  `replan_bindings_from_candidates` takes the global minimum: every physical NIC
+  drops to one queue and one worker (the #3091 ~6 Gbps regression the v7 bump exists
+  to prevent). Added `TestSecureTunnelWireKeyLockstepWithRust` and
+  `TestFabricParentUnbindableWireKeyLockstepWithRust`, which PARSE the Rust
+  `#[serde(rename = ...)]` out of `protocol/snapshot.rs` rather than mirroring a
+  literal, so they assert an agreement rather than a spelling. `secure_tunnel` is
+  marshalled with the flag TRUE: it is `omitempty` in Go and `skip_serializing_if`
+  in Rust, so the false case is byte-absent by design and a misspelled key is
+  byte-absent too. `parent_unbindable` additionally asserts the Go-emitted key is
+  present in `tests/fixtures/protocol_wire_v1.json`.
+  **F1 (BLOCKING) — the round-11 enumeration guard could not see the state its own
+  error message names.** `TestEveryNetdevProducerIsEnumerated`'s `covered()` helper
+  collected `vote.ifindex` for EVERY vote and never read `vote.role`, but
+  `buildUserspaceRefusedNetdevs` skips `netdevVoteAbstains` outright — so an
+  abstaining vote counted as covered while contributing nothing to the tally, which
+  IS the empty bucket the message describes. Reproduced: forcing the fabric vote to
+  `netdevVoteAbstains` at `29b9b84c0` left the guard PASSING. `netdevVoteAbstains`
+  is iota 0, so a third contributor with a zero-value role lands in the hole by
+  default. A bare role filter is wrong in the other direction — a VLAN child
+  abstains legitimately AND emits its own ifindex, because it binds the parent and
+  the refusal question about it is answered there. The guard now asserts "every
+  emitted netdev has a COUNTED verdict, or is a redirect whose target has one", with
+  the role filter taken from `buildUserspaceRefusedNetdevs` itself; the fixture
+  gained a VLAN child so the second arm is live, and both arms are asserted to have
+  FIRED.
+  **F3 — `fab.ParentUnbindable && !hasOwner` had no test in the hasOwner direction.**
+  Dropping the conjunct left both suites green. The narrowing is sound and its
+  failure direction is conservative (spurious commit abort, not fail-open), so this
+  was a missing test rather than a missing guard; added
+  `TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent` with a negative control so
+  the nil is the narrowing and not an inert gate.
+  **F4/F5 — two false claims in `userspace-dp/src/server/README.md`.** The
+  refusal-rule section still said the planes refuse a netdev "never when the netdev
+  has no owner at all", false since round 10 and contradicting the protocol section
+  250 lines earlier; rewritten as an explicit contributor list (owning row / VLAN
+  child / fabric fallback) that now says "round 10"/"round 11" so the section is
+  findable. The reachability paragraph spliced two incompatible conclusions with an
+  em-dash; the code says it IS reachable (kind-keyed), #6998 is closed.
+  **NON-FINDING recorded, no action:** deleting `t.owners > 0` from `refused()`
+  leaves both suites green and is provably DEAD — every non-abstaining vote does
+  `tally.owners++` before it can reach `tally.unbindable++`, and both call sites
+  range over that map.
+  **Validation — 9 cells, every cell carrying an always-failing sentinel so a green
+  is distinguishable from a suite that never ran; each edit anchor-verified (abort
+  on count != 1) and restore-verified; full `./pkg/dataplane/userspace/... ./pkg/daemon/...`
+  per cell.** CTRL rc=1, sentinel ONLY. M1 fabric vote forced to abstain: rc=1,
+  `TestEveryNetdevProducerIsEnumerated` (ifindex 20, no counted verdict) +
+  `TestOwnerlessFabricParentIsRefused` — the cell that PASSED the round-11 guard.
+  M2 fabric casts no vote at all: rc=1, enumeration guard + both protocol-gate
+  tests, so the round-11 property is preserved. M3 Go tag `secure_tunnel` renamed:
+  rc=1, only the new key test. M4 Go tag `parent_unbindable` renamed: rc=1, only the
+  new key test (both polarities). M5/M6 the RUST rename changed one-sidedly: rc=1,
+  the matching Go key test — the agreement binds in both directions. M7 drop
+  `&& !hasOwner`: rc=1, only the new F3 test. GD1 (guard-design control, my test not
+  production) drop the redirect arm: rc=1, the guard reds at head on the VLAN
+  child's ifindex 25 — the bare role filter really is wrong in the other direction.
+  At the committed head: `go build ./...` rc=0; `go test -count=1
+  ./pkg/dataplane/userspace/... ./pkg/daemon/...` rc=0, 0 `--- FAIL` lines; `cargo
+  test --no-fail-fast --bin xpf-userspace-dp -- --skip
+  afxdp::wg::engine::engine_internal_tests` rc=0, 4262 passed / 0 failed / 2 ignored.
+  No `.o`, no `userspace-xdp/`, no protocol or wire change — protocol stays at 7 on
+  both planes, so no fresh cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/wire_verdict_keys_6691_test.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21T01:50Z
+- **Action**: #6691 round 14 — hostile MERGE-NEEDS-MINOR at `cb3df5163`: 19 of 20
+  round-13 cells behaved exactly as claimed, and the one that did not is the round-12
+  guard reproducing, in its own body, the anti-pattern the PR exists to remove.
+  **F1 (BLOCKING) — "cannot drift" was false, and the drift is measurable.**
+  `fabric_verdict_scope_6691_test.go` claimed its role filter was "the one
+  `buildUserspaceRefusedNetdevs` applies, so 'counted here' and 'tallied there'
+  cannot drift". It was not lifted from production; it was a RE-TYPED literal —
+  test `vote.role == netdevVoteAbstains || vote.ifindex <= 0`, production
+  `vote.role == netdevVoteAbstains`. Measured (cell DRIFT, one production edit
+  narrowing the tally, `if vote.role == netdevVoteAbstains` ->
+  `if vote.role != netdevVoteOwner`): `TestOwnerlessFabricParentIsRefused` FAILS
+  (`fabric_ownerless_parent_6691_test.go:104`, `refusesName(ge-0-0-0) = false`) while
+  `TestEveryNetdevProducerIsEnumerated` still PASSES — the enumeration guard is
+  SILENT for exactly the regression it was written to catch, because its own copy of
+  the filter still counts the fabric's fallback vote. That matters beyond the wording:
+  `netdevVote`'s production doc states the principle as "A hand-maintained second list
+  is the defect, not the omission: the repair is that ONE enumeration answers 'who
+  contributes a netdev verdict', and both the tally and the gate read it."
+  Fixed by single-sourcing the ROLE axis: new `func (v netdevVote) counted() bool`
+  (`ingress_exclusions.go`), applied by `buildUserspaceRefusedNetdevs` as
+  `if !vote.counted()` and read by the guard as `vote.counted()`. Re-measured against
+  the fixed tree, same production narrowing (now on `counted()` itself):
+  `TestEveryNetdevProducerIsEnumerated` FAILS on BOTH its primary assertion
+  (`:364`, ifindex 20 emitted with no counted verdict) and its anti-vacuity control
+  (`:404`, no netdev covered only by a fallback vote). The guard is no longer silent.
+  The replacement sentence is scoped to what was actually single-sourced — the ROLE
+  axis. Production's per-key `name != ""` and `ifindex > 0` guards stay separate, and
+  the test's `|| vote.ifindex <= 0` is still its own literal; asserting a universal
+  over all three axes is the defect this round is fixing, so the doc on `counted`
+  and the comment in the test both say ROLE and both say what is NOT covered.
+  **CORRECTION to the round-12 entry above (`cb3df5163`), appended not edited.**
+  (a) That entry says the guard now asserts its property "with the role filter taken
+  from `buildUserspaceRefusedNetdevs` itself". That was FALSE as written — the filter
+  was re-typed, not taken, which is what F1 above measures. It becomes true only at
+  this round's head, via `netdevVote.counted`.
+  (b) That entry records cell M2 (fabric casts no vote at all) as reddening "the
+  enumeration guard + both protocol-gate tests" — three. Re-measured here over the
+  whole package: M2 reds FOUR — `TestOwnerlessFabricParentIsRefused`,
+  `TestProtocolGateArmsForAnOwnerlessFabricVerdict`,
+  `TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent`,
+  `TestEveryNetdevProducerIsEnumerated`. The omission is harmless to the conclusion
+  (M2 was already sensitive), but it is an enumeration presented as a census, which
+  is the same defect shape as F1.
+  **F2 — `userspace-dp/src/server/README.md` said "all four loops now ask the refused
+  index"; there are FIVE Go consult sites** (`interfaces.go:207,237`,
+  `maps_sync.go:1626,1675,1743` — the binding-alias site at `:1743` is the uncounted
+  one, and it IS guarded). Carried over from `cb3df5163^` rather than introduced at
+  head, and the count was never right at any point checked: `git show` at
+  `1c5b8e69a` (round 8, where `:1743` was added) has THREE sites, `cb3df5163^` has
+  five, and the prose said "four" at both. Rewritten to name the PREDICATE — every Go
+  loop that plans a binding from a snapshot or fabric row asks the index — with the
+  site list demoted to an as-of-this-writing aid plus the grep that regenerates it.
+  **F3 — README "A VLAN child speaks for nothing" is true of the TALLY and loose
+  about the GATE.** An abstaining row still carries
+  `verdictNeedsProtocol: iface.SecureTunnel` (`ingress_exclusions.go:679`, set on
+  every row unconditionally), so a VLAN child that is a secure tunnel DOES arm
+  `snapshotRequiresRefusalProtocol` while contributing nothing to any
+  `netdevOwnerTally`. Behaviour is correct and deliberate; only the sentence was
+  unscoped. Now says "casts no COUNTED vote" and spells out the protocol-gate half.
+  **F4 — README wrote the Go method `netdevOwnerTally.refused` in Rust path syntax
+  (`::`)**, two lines after correctly tagging `snapshotNetdevVotes` as "(Go)".
+  `netdevOwnerTally` exists only in Go (`ingress_exclusions.go:578`); there is no
+  Rust type of that name. Corrected and tagged "(Go)".
+  **Validation.** Every cell carried an always-failing sentinel in the SAME
+  invocation, so a green is distinguishable from a suite that never ran; every edit
+  was anchor-verified (abort unless the anchor matched exactly once), gated on having
+  actually produced a diff (a cell with no diff aborts rather than reporting green),
+  and restored by content copy under a `trap`. CONTROL (pristine, `cb3df5163`):
+  `TestOwnerlessFabricParentIsRefused` PASS, `TestEveryNetdevProducerIsEnumerated`
+  PASS, sentinel FAIL. DRIFT before the fix: rc=1, OwnerlessFabricParent FAIL /
+  EveryNetdevProducerIsEnumerated PASS. DRIFT after the fix: rc=1, BOTH FAIL. M2
+  re-measure: rc=1, four named tests. At the committed head: `go build ./...` rc=0;
+  `go test -count=1 ./pkg/dataplane/userspace/... ./pkg/daemon/...` rc=0 with zero
+  `--- FAIL` lines. No Rust source in the diff, so no cargo leg is implicated.
+  **Smoke:** this round moves a PRODUCTION file (`ingress_exclusions.go`) for the
+  first time since round 12, but no fresh cluster smoke is owed. `counted()` is a Go
+  control-plane refactor of a filter whose truth table is unchanged (`role !=
+  netdevVoteAbstains`, byte-identical semantics, verified by an unchanged CONTROL);
+  no `.o`, no `userspace-xdp/`, no wire or protocol change — protocol stays at 7 on
+  both planes.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21 (round 16, drive-to-merge lane)
+- **Action**: #6691 round 16 — CONFIRMED both Codex runtime blockers firsthand at
+  `76045dfae`, fixed the one that is this PR's to fix, and generalized it to two
+  further sites the review had not reached.
+  **B2 (fixed here) — the refusal index has TWO keys populated from DIFFERENTLY
+  SAMPLED evidence, and the Go readers split on which one they asked.**
+  `buildUserspaceRefusedNetdevs` gives a netdev a NAME bucket from any counted
+  vote carrying a name, but an IFINDEX bucket only from a vote whose own
+  `buildLinkSnapshot` resolved (`vote.ifindex > 0`). A snapshot is not one
+  netlink sample: `buildInterfaceSnapshots` takes one per base row AND a second
+  per unit row for that unit's parent, `buildFabricSnapshotsFrom` takes its own,
+  and `SyncFabricState` refreshes the fabric rows ALONE and persists them back
+  into `m.lastSnapshot` (`persistResolvedFabricsLocked`) beside interface rows
+  never re-sampled. So a netdev can be NAMED by a row whose lookup missed — no
+  ifindex bucket — while a sibling row or fabric row carries its live ifindex.
+  Both name-keyed readers (the Rust planner's `snapshot_refuses_parent_netdev` /
+  `binding_target_is_refused`, and the RSS allowlist) then refuse the netdev and
+  plan NO binding, while the three ifindex-keyed readers in `maps_sync.go`
+  admitted its ifindex to the ingress-adjudication map — and an ifindex there
+  with no READY binding is `drop_degraded_transit` (BINDING_MISSING), i.e.
+  transit on that netdev drops. MEASURED at `76045dfae`, both planes, firsthand:
+  rows `{gr-0-0-3 ifindex 0, tunnel}` + fabric `{gr-0-0-3, parent ifindex 20}` →
+  Go ingress `[20]`, Rust planned `{}`; rows `{ge-0-0-5 ifindex 0, tunnel}` +
+  `{ge-0-0-5.100 ifindex 12, parent 11}` → Go ingress `[11 12]` + alias `12→11`,
+  Rust planned `{}`. The second shape needs no fabric refresh at all. FIX:
+  single-sourced the question as `userspaceRefusedNetdevs.refusesNetdev(name,
+  ifindex)` and routed every caller holding both identities through it — three
+  sites in `maps_sync.go` plus the fabric guard in `interfaces.go`. A divergence
+  between the two keys for one netdev is ALWAYS a bug, so this is a predicate,
+  not a convention. The bind-target arm of `UserspaceBoundLinuxInterfaces` keeps
+  `refusesName` — it has no ifindex to bring. Strict tightening at each site: it
+  can only stop a loop ADDING a key, and what it stops adding is exactly the set
+  the binding planner already refuses. Transparent to the reference cluster,
+  whose `fab0 member-interfaces ge-0/0/0` is ownerless and bindable (checked in
+  `docs/ha-cluster-userspace.conf`: no `ge-0/0/0` stanza) — pinned by an
+  anti-vacuity arm in each new test.
+  **B1 (NOT fixed here, confirmed real, merge-ORDER item)** — a dotted
+  `bind-interface st0.0` moves from kernel-reinjected to policy-DENIED. Measured
+  end to end in Rust at `76045dfae`: `disposition=MissingNeighbor
+  egress_ifindex=42`, no `state.egress` row for 42, zone pair `(1, 0)`, and an
+  explicit `trust → vpn permit` evaluates `Deny` on the default policy
+  (`policy_id=4294967295`). `MissingNeighbor` converts a deny to `PolicyDenied`
+  before the reinject gate, and `PolicyDenied` is not slow-path eligible. Root
+  cause is the pre-existing MAC-less-xfrmi egress (#6713, live on master for bare
+  `st0`) and the fix is open PR **#6722**, which rewrites the two Rust files this
+  branch does not touch. The naive local fix — extending `populate_egress`'s
+  `src_mac` fallback to `secure_tunnel` — is explicitly rejected by #6722's own
+  design (it would put an all-zero source MAC on an AF_XDP TX to a
+  link-layer-less device), so it is NOT fixed here. **#6722 must merge before
+  #6691.** That sequencing was already recorded on the PR on 2026-08-02 and is
+  now backed by a firsthand measurement.
+  **Validation** at the round head: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./pkg/dataplane/...` rc=0, full `cargo test --
+  --test-threads=1` rc=0. Per-site mutation matrix: reverting each of the three
+  `maps_sync.go` sites to `refusesIfindex` reds its OWN assertion and only its
+  own (A → the two ingress assertions, B → the alias assertion, C → the fabric
+  assertion); reverting the Rust owner walk to skip `ifindex <= 0` reds
+  `zero_ifindex_owner_row_still_refuses_the_fabric_parent`.
+  **Smoke:** owed — the diff moves Rust (`main_tests.rs` only, tests) and Go
+  production forwarding-set builders. Protocol stays at 7 on both planes; no
+  wire, `.o` or `userspace-xdp/` change.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md
