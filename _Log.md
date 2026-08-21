@@ -81035,3 +81035,88 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/dataplane/userspace/wire_verdict_keys_6691_test.go,
   pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
   userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21T01:50Z
+- **Action**: #6691 round 14 — hostile MERGE-NEEDS-MINOR at `cb3df5163`: 19 of 20
+  round-13 cells behaved exactly as claimed, and the one that did not is the round-12
+  guard reproducing, in its own body, the anti-pattern the PR exists to remove.
+  **F1 (BLOCKING) — "cannot drift" was false, and the drift is measurable.**
+  `fabric_verdict_scope_6691_test.go` claimed its role filter was "the one
+  `buildUserspaceRefusedNetdevs` applies, so 'counted here' and 'tallied there'
+  cannot drift". It was not lifted from production; it was a RE-TYPED literal —
+  test `vote.role == netdevVoteAbstains || vote.ifindex <= 0`, production
+  `vote.role == netdevVoteAbstains`. Measured (cell DRIFT, one production edit
+  narrowing the tally, `if vote.role == netdevVoteAbstains` ->
+  `if vote.role != netdevVoteOwner`): `TestOwnerlessFabricParentIsRefused` FAILS
+  (`fabric_ownerless_parent_6691_test.go:104`, `refusesName(ge-0-0-0) = false`) while
+  `TestEveryNetdevProducerIsEnumerated` still PASSES — the enumeration guard is
+  SILENT for exactly the regression it was written to catch, because its own copy of
+  the filter still counts the fabric's fallback vote. That matters beyond the wording:
+  `netdevVote`'s production doc states the principle as "A hand-maintained second list
+  is the defect, not the omission: the repair is that ONE enumeration answers 'who
+  contributes a netdev verdict', and both the tally and the gate read it."
+  Fixed by single-sourcing the ROLE axis: new `func (v netdevVote) counted() bool`
+  (`ingress_exclusions.go`), applied by `buildUserspaceRefusedNetdevs` as
+  `if !vote.counted()` and read by the guard as `vote.counted()`. Re-measured against
+  the fixed tree, same production narrowing (now on `counted()` itself):
+  `TestEveryNetdevProducerIsEnumerated` FAILS on BOTH its primary assertion
+  (`:364`, ifindex 20 emitted with no counted verdict) and its anti-vacuity control
+  (`:404`, no netdev covered only by a fallback vote). The guard is no longer silent.
+  The replacement sentence is scoped to what was actually single-sourced — the ROLE
+  axis. Production's per-key `name != ""` and `ifindex > 0` guards stay separate, and
+  the test's `|| vote.ifindex <= 0` is still its own literal; asserting a universal
+  over all three axes is the defect this round is fixing, so the doc on `counted`
+  and the comment in the test both say ROLE and both say what is NOT covered.
+  **CORRECTION to the round-12 entry above (`cb3df5163`), appended not edited.**
+  (a) That entry says the guard now asserts its property "with the role filter taken
+  from `buildUserspaceRefusedNetdevs` itself". That was FALSE as written — the filter
+  was re-typed, not taken, which is what F1 above measures. It becomes true only at
+  this round's head, via `netdevVote.counted`.
+  (b) That entry records cell M2 (fabric casts no vote at all) as reddening "the
+  enumeration guard + both protocol-gate tests" — three. Re-measured here over the
+  whole package: M2 reds FOUR — `TestOwnerlessFabricParentIsRefused`,
+  `TestProtocolGateArmsForAnOwnerlessFabricVerdict`,
+  `TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent`,
+  `TestEveryNetdevProducerIsEnumerated`. The omission is harmless to the conclusion
+  (M2 was already sensitive), but it is an enumeration presented as a census, which
+  is the same defect shape as F1.
+  **F2 — `userspace-dp/src/server/README.md` said "all four loops now ask the refused
+  index"; there are FIVE Go consult sites** (`interfaces.go:207,237`,
+  `maps_sync.go:1626,1675,1743` — the binding-alias site at `:1743` is the uncounted
+  one, and it IS guarded). Carried over from `cb3df5163^` rather than introduced at
+  head, and the count was never right at any point checked: `git show` at
+  `1c5b8e69a` (round 8, where `:1743` was added) has THREE sites, `cb3df5163^` has
+  five, and the prose said "four" at both. Rewritten to name the PREDICATE — every Go
+  loop that plans a binding from a snapshot or fabric row asks the index — with the
+  site list demoted to an as-of-this-writing aid plus the grep that regenerates it.
+  **F3 — README "A VLAN child speaks for nothing" is true of the TALLY and loose
+  about the GATE.** An abstaining row still carries
+  `verdictNeedsProtocol: iface.SecureTunnel` (`ingress_exclusions.go:679`, set on
+  every row unconditionally), so a VLAN child that is a secure tunnel DOES arm
+  `snapshotRequiresRefusalProtocol` while contributing nothing to any
+  `netdevOwnerTally`. Behaviour is correct and deliberate; only the sentence was
+  unscoped. Now says "casts no COUNTED vote" and spells out the protocol-gate half.
+  **F4 — README wrote the Go method `netdevOwnerTally.refused` in Rust path syntax
+  (`::`)**, two lines after correctly tagging `snapshotNetdevVotes` as "(Go)".
+  `netdevOwnerTally` exists only in Go (`ingress_exclusions.go:578`); there is no
+  Rust type of that name. Corrected and tagged "(Go)".
+  **Validation.** Every cell carried an always-failing sentinel in the SAME
+  invocation, so a green is distinguishable from a suite that never ran; every edit
+  was anchor-verified (abort unless the anchor matched exactly once), gated on having
+  actually produced a diff (a cell with no diff aborts rather than reporting green),
+  and restored by content copy under a `trap`. CONTROL (pristine, `cb3df5163`):
+  `TestOwnerlessFabricParentIsRefused` PASS, `TestEveryNetdevProducerIsEnumerated`
+  PASS, sentinel FAIL. DRIFT before the fix: rc=1, OwnerlessFabricParent FAIL /
+  EveryNetdevProducerIsEnumerated PASS. DRIFT after the fix: rc=1, BOTH FAIL. M2
+  re-measure: rc=1, four named tests. At the committed head: `go build ./...` rc=0;
+  `go test -count=1 ./pkg/dataplane/userspace/... ./pkg/daemon/...` rc=0 with zero
+  `--- FAIL` lines. No Rust source in the diff, so no cargo leg is implicated.
+  **Smoke:** this round moves a PRODUCTION file (`ingress_exclusions.go`) for the
+  first time since round 12, but no fresh cluster smoke is owed. `counted()` is a Go
+  control-plane refactor of a filter whose truth table is unchanged (`role !=
+  netdevVoteAbstains`, byte-identical semantics, verified by an unchanged CONTROL);
+  no `.o`, no `userspace-xdp/`, no wire or protocol change — protocol stays at 7 on
+  both planes.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
+  userspace-dp/src/server/README.md, _Log.md

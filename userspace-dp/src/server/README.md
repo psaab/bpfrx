@@ -409,9 +409,15 @@ all", and that has been false since round 10):
 
 - A **row that owns the netdev** — a row whose bind target is its own netdev,
   i.e. not a VLAN child redirecting onto a parent — always speaks for it.
-- A **VLAN child** speaks for nothing: it binds the PARENT, so it says nothing
+- A **VLAN child** casts no COUNTED vote: it binds the PARENT, so it says nothing
   about whether the parent may be bound, and the refusal question about the child
-  is answered on the target.
+  is answered on the target. Scope that to the TALLY. An abstaining row still
+  carries its own `verdictNeedsProtocol` (`iface.SecureTunnel`), so a VLAN child
+  that is a secure tunnel DOES arm `snapshotRequiresRefusalProtocol` even though
+  it contributes nothing to any `netdevOwnerTally`. That is deliberate: the v5
+  field on the row means an older helper plans a binding this control plane
+  refuses, which is true whoever wins the tally — the protocol question is asked
+  per contributor, the refusal question per netdev.
 - A **fabric parent** speaks for its netdev only where NO row does. A fabric
   MEMBER needs no `set interfaces` stanza, so a fabric parent routinely has no
   `InterfaceSnapshot` at all — and the round-9 rule, tallying over rows alone,
@@ -426,7 +432,7 @@ all", and that has been false since round 10):
   `TestOwnerlessFabricParentIsRefused` are the fail-on-revert guards.
 
 A netdev with no contributor at all never enters the tally, so the zero-owner
-fall-through in `netdevOwnerTally::refused` is unreachable rather than
+fall-through in `netdevOwnerTally.refused` (Go) is unreachable rather than
 permissive; `snapshotNetdevVotes` (Go) is the single enumeration of who
 contributes, read by both the tally and the required-protocol gate so the two
 scopes cannot drift.
@@ -467,9 +473,15 @@ it read correctly and was answering the wrong question: "`LocalFabricMember`
 resolves only for slot-shaped member names, so an `st*` member yields no fabric
 row at all" is a statement about the NAME-keyed exclusion, and it did not survive
 round 8 keying the exclusion on device KIND. A slot-shaped `ge-0/0/0` created out
-of band as an `xfrm` device is both refused and a legal fabric member, so all
-four loops now ask the refused index. To bound a laundering question, enumerate
-every CONTRIBUTOR to the set, not every caller of the predicate.
+of band as an `xfrm` device is both refused and a legal fabric member, so EVERY
+Go loop that plans a binding from a snapshot row or a fabric row asks the refused
+index. That predicate is the claim; a count is not, and this paragraph carried a
+wrong one for several rounds — it said "four" while the tree held three (round 8)
+and then five. As of this writing the sites are `interfaces.go` (bind target,
+fabric parent — name-keyed) and `maps_sync.go` (ingress row, fabric parent,
+binding alias — ifindex-keyed). Regenerate that list rather than trusting it:
+`grep -rn 'refused\.refuses' pkg/dataplane/userspace/ --include='*.go' | grep -v '_test\.go'`. To bound a laundering question,
+enumerate every CONTRIBUTOR to the set, not every caller of the predicate.
 
 It does **not** enter the **egress map**. `populate_egress` needs a source MAC
 and takes it from the interface's own `hardware_addr`, else the parent's MAC,

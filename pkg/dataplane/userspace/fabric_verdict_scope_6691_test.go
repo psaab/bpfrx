@@ -298,14 +298,18 @@ func TestEveryNetdevProducerIsEnumerated(t *testing.T) {
 		return out
 	}
 	// The netdevs the enumeration casts a COUNTED verdict about, split by role.
-	// The role filter is the one buildUserspaceRefusedNetdevs applies, so
-	// "counted here" and "tallied there" cannot drift: a vote this test accepts
-	// is exactly a vote that lands in a netdevOwnerTally.
+	// The ROLE filter is netdevVote.counted, the same method
+	// buildUserspaceRefusedNetdevs applies, so the role axis of "counted here"
+	// and "tallied there" cannot drift — narrowing which roles the tally counts
+	// narrows this probe too, and the assertions below go red instead of
+	// staying silent. Scope: the ROLE axis only. The `ifindex > 0` test below
+	// is this probe's own literal, and production additionally keys its buckets
+	// on `name != ""`; neither of those axes is single-sourced here.
 	countedVotes := func(snap *ConfigSnapshot) (all, fallback map[uint32]int) {
 		all = make(map[uint32]int)
 		fallback = make(map[uint32]int)
 		for _, vote := range snapshotNetdevVotes(snap) {
-			if vote.role == netdevVoteAbstains || vote.ifindex <= 0 {
+			if !vote.counted() || vote.ifindex <= 0 {
 				continue
 			}
 			all[uint32(vote.ifindex)]++

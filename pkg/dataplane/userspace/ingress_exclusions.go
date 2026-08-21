@@ -620,6 +620,18 @@ type netdevVote struct {
 	verdictNeedsProtocol bool
 }
 
+// counted reports whether this vote lands in a netdevOwnerTally — i.e. whether
+// its unbindable verdict participates in the unanimity that decides refusal.
+//
+// It exists so the ROLE axis of that filter has exactly one definition. The
+// tally applies it and the #6691 enumeration guard reads it, so a change to
+// which roles count moves the guard with it instead of leaving the guard
+// asserting a rule the tally no longer follows — the hand-maintained second
+// list this type's doc names as the defect. It single-sources the role test
+// ONLY: the per-key `name != ""` and `ifindex > 0` guards in
+// buildUserspaceRefusedNetdevs are separate and stay separate.
+func (v netdevVote) counted() bool { return v.role != netdevVoteAbstains }
+
 // snapshotNetdevVotes enumerates every contributor to the sets the binding
 // exclusion gates, with the verdict each one casts.
 //
@@ -728,7 +740,7 @@ func buildUserspaceRefusedNetdevs(snap *ConfigSnapshot) userspaceRefusedNetdevs 
 	byName := make(map[string]netdevOwnerTally)
 	byIfindex := make(map[int]netdevOwnerTally)
 	for _, vote := range snapshotNetdevVotes(snap) {
-		if vote.role == netdevVoteAbstains {
+		if !vote.counted() {
 			continue
 		}
 		if vote.name != "" {
