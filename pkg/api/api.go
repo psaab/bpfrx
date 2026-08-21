@@ -249,3 +249,18 @@ func allInterfaceNames(cfg *config.Config) map[string]bool {
 	}
 	return names
 }
+
+// dpProbe returns the value that OPTIONAL-capability assertions must be
+// made against. See pkg/grpcapi/runtime.go's dpProbe for the full #2114 /
+// #6743-F1 rationale: the daemon publishes a live indirection whose method
+// set is exactly apiRuntimeDataPlane, so probing it directly erases every
+// optional capability (Status(), AppliedNATView, the session cursor) and
+// blanks the NAT-pool and userspace Prometheus families on a healthy
+// deployment. Unwrap is the identity for a plain backend and nil once the
+// daemon has disowned one.
+func (s *Server) dpProbe() any {
+	if s == nil {
+		return nil
+	}
+	return dataplane.Unwrap(s.dp)
+}

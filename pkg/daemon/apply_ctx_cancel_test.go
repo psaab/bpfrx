@@ -22,11 +22,11 @@ func minimalApplyCtxDaemon(t *testing.T) (*Daemon, *runtimeOnlyApplyTestDP, *con
 	installFakeNetworkctl(t)
 	dp := &runtimeOnlyApplyTestDP{}
 	d := &Daemon{
-		dp:      dp,
 		vrrpMgr: vrrp.NewManager(),
 		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		opts:    Options{NoDataplane: true},
 	}
+	d.setDataplane(dp) // #2114: publish through the cell
 	return d, dp, &config.Config{}
 }
 

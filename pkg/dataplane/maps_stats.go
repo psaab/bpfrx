@@ -69,8 +69,8 @@ var mapStatsReportDescriptors = []mapStatDescriptor{
 func (m *Manager) GetMapStats() []MapStats {
 	var stats []MapStats
 	for _, rm := range mapStatsReportDescriptors {
-		bm, ok := m.maps[rm.name]
-		if !ok || bm == nil {
+		bm, present, _ := m.lookupMapLocked(rm.name)
+		if !present || bm == nil {
 			continue
 		}
 		info, err := bm.Info()

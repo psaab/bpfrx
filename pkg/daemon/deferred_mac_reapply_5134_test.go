@@ -60,7 +60,8 @@ func (d *deferredMACReapplyTestDP) RecordDeferredWorkerArmDebt() { d.debtRecords
 // outage).
 func TestReapplyAfterDeferredMACRecordsDebtOnFailure(t *testing.T) {
 	dp := &deferredMACReapplyTestDP{applyErr: errors.New("helper rejected apply_snapshot")}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	d.reapplyAfterDeferredMAC(&config.Config{})
 
@@ -77,7 +78,8 @@ func TestReapplyAfterDeferredMACRecordsDebtOnFailure(t *testing.T) {
 // for the reconcile loop to retry.
 func TestReapplyAfterDeferredMACNoDebtOnSuccess(t *testing.T) {
 	dp := &deferredMACReapplyTestDP{}
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 
 	d.reapplyAfterDeferredMAC(&config.Config{})
 

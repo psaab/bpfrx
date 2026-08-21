@@ -138,7 +138,8 @@ func TestClearSessionsForModifiedPolicies(t *testing.T) {
 		newCfg := withPolicyRematch(twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, nil), false)
 		newCfg.Security.Policies[0].Policies[1].Action = config.PolicyDeny // p-web permit->deny
 		dp := newStore()
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForModifiedPolicies(old, newCfg)
 
 		if _, ok := dp.v4[webSess]; ok {
@@ -156,7 +157,8 @@ func TestClearSessionsForModifiedPolicies(t *testing.T) {
 		newCfg := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, nil) // no policy-rematch
 		newCfg.Security.Policies[0].Policies[1].Action = config.PolicyDeny
 		dp := newStore()
-		d := &Daemon{dp: dp}
+		d := &Daemon{}
+		d.setDataplane(dp) // #2114: publish through the cell
 		d.clearSessionsForModifiedPolicies(old, newCfg)
 
 		if _, ok := dp.v4[webSess]; !ok {
@@ -189,7 +191,8 @@ func TestClearSessionsForPolicyIDs_EnumerateErrorNotSilent(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 
-	d := &Daemon{dp: dp}
+	d := &Daemon{}
+	d.setDataplane(dp) // #2114: publish through the cell
 	d.clearSessionsForPolicyIDs(map[uint32]struct{}{7: {}}, dataplane.DeleteReasonPolicyModified, "modified (test)")
 
 	out := buf.String()
