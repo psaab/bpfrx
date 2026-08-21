@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
@@ -26,7 +27,12 @@ import (
 // map path unaffected), collectUserspaceStatus emits nothing — identical to when
 // each fetched Status() itself.
 func fetchUserspaceStatus(dp apiRuntimeDataPlane) *dpuserspace.ProcessStatus {
-	provider, ok := dp.(interface {
+	// #2114/#6743-F1: probe the PUBLISHED BACKEND, not the daemon's live
+	// indirection — the indirection declares only apiRuntimeDataPlane, so
+	// asserting Status() on it returns !ok for a healthy userspace helper
+	// and suppresses every userspace metric family. Unwrap is the identity
+	// for a plain backend, nil once the daemon has disowned one.
+	provider, ok := dataplane.Unwrap(dp).(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {

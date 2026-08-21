@@ -124,7 +124,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 // provider probes; we fall through to the legacy full-table scan
 // when the underlying dataplane does not satisfy it.
 func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
-	iterDP, ok := s.dp.(sessionCursorIterator)
+	iterDP, ok := s.dpProbe().(sessionCursorIterator)
 	if !ok {
 		// Dataplane doesn't support cursor iteration; fall back to legacy.
 		return s.getSessionsLegacy(ctx, req)
@@ -1383,7 +1383,7 @@ func (b *clearBatchV4) deleteAll(s *Server, agg *clearErrors) int {
 // always implements it, compile-asserted in pkg/dataplane/userspace) falls back
 // to a bounded fresh-rescan.
 func (s *Server) clearFilteredSessionsV4(ctx context.Context, filter *sessionFilter, agg *clearErrors) int {
-	iterDP, ok := s.dp.(sessionCursorIterator)
+	iterDP, ok := s.dpProbe().(sessionCursorIterator)
 	if !ok {
 		return s.clearFilteredSessionsV4Rescan(ctx, filter, agg)
 	}
@@ -1526,7 +1526,7 @@ func (b *clearBatchV6) deleteAll(s *Server, agg *clearErrors) int {
 // clearFilteredSessionsV6 is the IPv6 analogue of clearFilteredSessionsV4; see
 // that function for the iterate-delete-safety and bounded-cursor rationale.
 func (s *Server) clearFilteredSessionsV6(ctx context.Context, filter *sessionFilter, agg *clearErrors) int {
-	iterDP, ok := s.dp.(sessionCursorIterator)
+	iterDP, ok := s.dpProbe().(sessionCursorIterator)
 	if !ok {
 		return s.clearFilteredSessionsV6Rescan(ctx, filter, agg)
 	}

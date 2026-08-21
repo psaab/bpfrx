@@ -13,8 +13,11 @@ import (
 
 // SetMirrorConfig writes a port-mirroring entry for the given ingress ifindex.
 func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error {
-	zm, ok := m.maps["mirror_config"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("mirror_config")
+	if st == registryFresh {
+		return fmt.Errorf("%w: mirror_config", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("mirror_config map not found")
 	}
 	val := MirrorConfig{
@@ -27,8 +30,11 @@ func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) e
 // ClearMirrorConfigs removes all mirror_config entries.
 // mirror_config is a HASH (#756): iterate-and-delete existing keys.
 func (m *Manager) ClearMirrorConfigs() error {
-	zm, ok := m.maps["mirror_config"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("mirror_config")
+	if st == registryFresh {
+		return fmt.Errorf("%w: mirror_config", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("mirror_config map not found")
 	}
 	var key uint32
