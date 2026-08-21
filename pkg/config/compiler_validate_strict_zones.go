@@ -511,3 +511,234 @@ func validateHostInboundStanzaStrict(zone, ifName string, hib *HostInboundTraffi
 	}
 	return nil
 }
+
+// validateZoneInterfacesNonEmptyStrict rejects a `security zones security-zone
+// <z> interfaces` stanza that CARRIES CONTENT yet contributes ZERO members to
+// the zone (#6525). It is the fail-closed belt for the whole "restrictive-
+// looking config compiles to something weaker" class in this stanza: whatever
+// AST shape a future parser/schema change introduces, membership that the
+// compiler cannot read becomes LOUD instead of silent.
+//
+// The defect it was written for: the hierarchical COMPACT-LEAF spelling
+//
+//	security { zones { security-zone untrust { interfaces ge-0/0/1.0; } } }
+//
+// put the member name on the STANZA's own Keys tail with nil Children, so
+// compileZones — which iterated prop.Children — ran its body zero times and the
+// zone compiled with NO interfaces, cleanly and without a warning. The two
+// gates above then passed VACUOUSLY over the empty slice: the very gates that
+// exist to protect zone membership are inert against a membership list that
+// never arrives. Downstream the interface is left with Zone == "", which
+// dataplane/userspace.UserspaceBoundLinuxInterfaces skips, so it is never
+// AF_XDP-bound and every policy naming that zone never applies to its traffic.
+// compileZones now normalizes the compact shape (zoneInterfaceMemberNodes); this
+// gate makes the residue of the class impossible to ship silently.
+//
+// It asks the COMPILER'S OWN reader (zoneInterfaceStanzaMembers) whether the
+// stanza named anything, deliberately — a gate that re-derived membership from
+// the AST itself would be a second implementation, which is exactly how this
+// defect class arises. It therefore runs on the group-expanded, inactive-pruned
+// *ConfigTree rather than the compiled *Config: the compiled ZoneConfig cannot
+// distinguish "no interfaces stanza" from "a stanza that compiled to nothing".
+//
+// A stanza that carries NOTHING AT ALL — no member token on its Keys tail and no
+// child node — is NOT flagged. That is the residue `delete security zones
+// security-zone <z> interfaces <if>` leaves behind when the last member goes
+// (deletePath removes the member node but does not prune the now-empty
+// container, ast_edit.go), and it is what a bare hand-authored `interfaces;`
+// parses to. Neither declares a member, so neither can lose one; rejecting them
+// would make an ordinary "remove the last interface from this zone" edit
+// uncommittable, against a stanza that renders invisibly — the #4191
+// over-rejection class.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject, same as
+// the two zone-interface gates above, so the operator sees it while they are
+// editing); downgraded to a cfg.Warnings entry on the tolerant load / peer-sync
+// paths (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientZoneInterfacesNonEmpty) so an already-persisted or peer-synced config
+// that an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine). On that tolerant path behavior is unchanged: the stanza contributed
+// no members before this gate existed and still contributes none, just with an
+// operator-visible warning.
+//
+// Zones are walked in the tree's source order, which is deterministic for a
+// given config, so the first-reported error is stable.
+func validateZoneInterfacesNonEmptyStrict(tree *ConfigTree) error {
+	if tree == nil {
+		return nil
+	}
+	// Mirrors the compile walk exactly: compileSections dispatches every
+	// top-level `security` node (duplicate roots merge in author order),
+	// compileSecurity every `zones` child, compileZones every `security-zone`
+	// instance via namedInstances.
+	for _, root := range tree.Children {
+		if root.Name() != "security" {
+			continue
+		}
+		for _, zonesNode := range root.Children {
+			if zonesNode.Name() != "zones" {
+				continue
+			}
+			for _, inst := range namedInstances(zonesNode.FindChildren("security-zone")) {
+				for _, prop := range inst.node.Children {
+					if prop.Name() != "interfaces" {
+						continue
+					}
+					if len(prop.Keys) <= 1 && len(prop.Children) == 0 {
+						// Declares nothing — see the doc above.
+						continue
+					}
+					if len(zoneInterfaceStanzaMembers(prop)) > 0 {
+						continue
+					}
+					return fmt.Errorf(
+						"security zone %q has an `interfaces` stanza (%s) "+
+							zoneInterfacesNonEmptyReason+
+							"; the zone compiles with an EMPTY member set, so every "+
+							"interface the stanza was meant to cover is left with no zone — the "+
+							"dataplane never binds it and no policy naming this zone applies to "+
+							"its traffic, while the zone-membership and zone-interface-defined "+
+							"gates pass vacuously over the empty set — name a configured "+
+							"interface or remove the stanza",
+						inst.name, zoneInterfaceStanzaTokens(prop))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// zoneInterfacePackedTailReason and zoneInterfacesNonEmptyReason are the
+// distinguishing clause of each gate's reject message. They exist so a test can
+// assert WHICH of the two rejected a stanza rather than matching prose that a
+// later reword would silently unbind.
+//
+// This matters for exactly one shape. `interfaces host-inbound-traffic
+// ge-0/0/1.0;` is rejectable by BOTH gates — the keyword is first, so nothing
+// precedes it and the stanza also compiles to zero members — and
+// validateZoneInterfacePackedTailStrict runs FIRST so the operator is told
+// which token was dropped instead of "names no interface", which is true but
+// misdirecting. Nothing about the ORDER is otherwise observable: both paths
+// return a non-nil error, so a test that only asserted "rejected" would stay
+// green with the two gates swapped and the operator would silently get the
+// worse message. TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate
+// asserts on these markers in both directions and is what binds the order.
+const (
+	zoneInterfacePackedTailReason = "the bracket-list and packed-body readings of that statement disagree about zone membership"
+	zoneInterfacesNonEmptyReason  = "that names no interface"
+)
+
+// validateZoneInterfacePackedTailStrict rejects a `security zones security-zone
+// <z> interfaces` stanza in which a body keyword appears on a member's Keys with
+// FURTHER TOKENS AFTER IT — the one shape whose two readings disagree about zone
+// membership and which the compiler therefore cannot resolve (#6735).
+//
+// See zoneInterfaceMemberPackedTail for why the shape is irreducibly ambiguous
+// (the lexer strips brackets, so a bracket member list and the packed-body
+// spelling parse identically) and why refusing beats guessing. The concrete loss
+// this closes:
+//
+//	interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ];
+//
+// compiled membership as `[ge-0/0/0.0]` alone. `ge-0/0/1.0` — a valid, defined
+// interface the operator put in this zone — was SILENTLY DROPPED, left with
+// Zone == "" so the dataplane never bound it and no policy naming the zone ever
+// applied to its traffic. The #6525 non-empty belt cannot see it: one member
+// survived, so the stanza is not empty.
+//
+// This gate runs on the group-expanded *ConfigTree for the same reason the
+// non-empty gate does — the compiled ZoneConfig has already lost the tokens.
+//
+// Strict on commit / commit-check; downgraded to a cfg.Warnings entry on the
+// tolerant load / peer-sync paths (flag lenientZoneInterfacePackedTail) so an
+// already-persisted or peer-synced config an older binary accepted still BOOTS
+// (#1960 no-brick). On that path behavior is unchanged — the trailing tokens
+// were dropped before this gate existed and still are, now with an
+// operator-visible warning naming exactly what was lost.
+//
+// Ordering: runs BEFORE the non-empty gate. They overlap on exactly one shape —
+// `interfaces host-inbound-traffic ge-0/0/1.0;`, where the keyword is FIRST, so
+// the truncator keeps nothing and the stanza ALSO compiles to zero members.
+// Both would fire; this one goes first because its message is the accurate one.
+// Telling an operator who plainly wrote `ge-0/0/1.0` that the stanza "names no
+// interface" sends them hunting the wrong defect. Everywhere else the two are
+// disjoint: a keyword with NOTHING after it (`interfaces a
+// host-inbound-traffic;`), or a NESTED-BLOCK body
+// (`interfaces { host-inbound-traffic { system-services ssh; } }`, where the
+// body's tokens are the keyword node's CHILDREN and its own Keys tail is empty),
+// leaves this gate silent and still reaches the non-empty gate.
+//
+// Note the qualifier "nested-block". A body-only block is NOT silent by virtue
+// of being body-only: the SAME-Keys spelling
+// `interfaces { host-inbound-traffic system-services ssh; }` carries
+// `system-services ssh` as a tail on the keyword's own Keys and therefore FIRES
+// this gate. Both spellings are pinned —
+// TestZoneInterfaces6735PackedTailRejectedAndPositiveControl rejects the
+// same-Keys one, and the overlap test's sibling subtest holds the nested-block
+// one on the non-empty gate — so the distinction is measured rather than
+// asserted here.
+func validateZoneInterfacePackedTailStrict(tree *ConfigTree) error {
+	if tree == nil {
+		return nil
+	}
+	for _, root := range tree.Children {
+		if root.Name() != "security" {
+			continue
+		}
+		for _, zonesNode := range root.Children {
+			if zonesNode.Name() != "zones" {
+				continue
+			}
+			for _, inst := range namedInstances(zonesNode.FindChildren("security-zone")) {
+				for _, prop := range inst.node.Children {
+					if prop.Name() != "interfaces" {
+						continue
+					}
+					keyword, tail, ok := zoneInterfaceStanzaPackedTail(prop)
+					if !ok {
+						continue
+					}
+					return fmt.Errorf(
+						"security zone %q has an `interfaces` stanza (%s) with %q followed by %s; "+
+							zoneInterfacePackedTailReason+
+							" and the lexer has already stripped the brackets that would "+
+							"tell them apart, so the compiler silently keeps only the names BEFORE the "+
+							"keyword — a trailing interface is left with no zone (never dataplane-bound, "+
+							"no policy naming this zone applies to it) and a trailing body is discarded "+
+							"unapplied — rewrite in the block spelling, which is unambiguous: "+
+							"`interfaces { a; b; }` for membership, "+
+							"`interfaces { a { host-inbound-traffic { ... } } }` for a per-interface body",
+						inst.name, zoneInterfaceStanzaTokens(prop),
+						keyword, strings.Join(tail, " "))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// zoneInterfaceStanzaTokens renders the tokens an `interfaces` stanza node
+// actually carries, so the reject above quotes the operator's own text back at
+// them. A stanza that names no interface is by definition one whose content the
+// compiler could not read, so naming the offending tokens is the only way the
+// message is actionable.
+//
+// It walks each child's whole SUBTREE (zoneInterfaceNodeTokens), not the child's
+// own Keys. `set` builds this stanza by DESCENT — `set ... interfaces
+// [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ]` becomes the chain
+// `interfaces -> ge-0/0/0.0 -> host-inbound-traffic -> ge-0/0/1.0` — so joining
+// only the first child's Keys rendered the one-token echo `(ge-0/0/0.0)` for a
+// message that then went on to discuss a keyword and a trailing token the
+// operator could not see anywhere in it (#6735). Every flat-set-authored reject
+// is affected, which is every reject an operator hits from the CLI.
+func zoneInterfaceStanzaTokens(prop *Node) string {
+	var toks []string
+	toks = append(toks, prop.Keys[1:]...)
+	for _, child := range prop.Children {
+		toks = append(toks, zoneInterfaceNodeTokens(child)...)
+	}
+	if len(toks) == 0 {
+		return "empty"
+	}
+	return strings.Join(toks, " ")
+}

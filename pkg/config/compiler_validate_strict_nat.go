@@ -2788,16 +2788,29 @@ func natThenTerminalActionCount(then NATThen) int {
 //
 //   - ZERO actions (an actionless rule, or a `then {}` whose only child is not a
 //     recognized source-nat/destination-nat terminal): the rule commits but the
-//     snapshot builder installs no translation, so matching traffic falls
-//     through to a later, broader rule — an intended `off` exemption silently
-//     disappears (the #3844 fail-open class).
+//     snapshot builder installs no translation, and the rule is not terminal, so
+//     matching traffic falls THROUGH — translated by a later, broader rule if
+//     one matches, otherwise leaving untranslated. Either way an intended `off`
+//     exemption silently disappears; the first case is the #3844 fail-open, the
+//     second leaves the same hazard latent. See the ZERO-actions bullet below
+//     for why the two are not the same outcome (#6820).
 //
 //   - TWO OR MORE actions (contradictory, mutually-exclusive translations such
-//     as `off` + `pool` or `interface` + `pool` inside ONE block): the actions
-//     are mutually exclusive and the compiler would otherwise pick one by
-//     packed-key / child order, so an intended exemption can publish as a
-//     translation (the inverse of the authored action — a security-boundary
-//     decision).
+//     as `off` + `pool` or `interface` + `pool` inside ONE block): all but one
+//     authored action is silently discarded, and the survivor is chosen by a
+//     FIXED precedence, not by anything the operator wrote. WHERE that happens
+//     differs by kind, and the two do NOT share a mechanism (#6820 round 3):
+//     source NAT publishes every authored field (the #5628 else-if→if setter
+//     change) and the DATAPLANE picks `off` > `interface` > `pool`; destination
+//     NAT resolves `off` in the COMPILER — buildDestinationNATSnapshots
+//     short-circuits on `isOff`, skips the pool lookup entirely and publishes
+//     `PoolAddress: ""` — so "every action is published" is FALSE for a DNAT
+//     rule and must not be written as a shared sentence. Do NOT say the compiler
+//     "picks one by packed-key / child order" either: it did before #5628 and
+//     does not now, and the CONTRADICTORY bullet below says so explicitly
+//     (#6820 re-gate). Nor is the discarded action always harmless —
+//     `interface` + `pool P` translates onto the egress interface address and
+//     never uses P.
 //
 // This counts actions WITHIN one complete then-block only. Duplicate `then`
 // CONTAINERS are #3850's intentional last-wins merge (compileNAT resets
@@ -2805,19 +2818,108 @@ func natThenTerminalActionCount(then NATThen) int {
 // rejected here — a rule with two `then` blocks each naming one action still
 // commits. Strict on commit / commit-check (hard reject so the malformed rule
 // is operator-visible); the caller downgrades to a warning on the tolerant load
-// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick) — a
-// leniently-loaded actionless rule is inert (installs nothing), and a
-// contradictory one now records BOTH fields (the else-if→if setter change), so
-// the Rust dataplane's off-precedence governs (off wins → exempt) — unifying
-// the hierarchical path with the pre-existing flat-set both-fields behavior
-// rather than the old Go single-field pick; only a malformed rule reaches this
-// path (the strict commit path rejects it). Rule-sets are walked in sorted name
-// order for a deterministic first-reported offender.
+// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick). Only a
+// malformed rule reaches that path — the strict commit path rejects it — but
+// what happens there is NOT symmetric between the two arities (#5717):
+//
+//   - CONTRADICTORY (2+ actions) CONTAINING `off`: resolves to the EXEMPTION,
+//     never the inverse. The rule records EVERY field (the else-if→if setter
+//     change). The two builders then reach that outcome by DIFFERENT routes:
+//     source NAT forwards all three fields (nat_source.go) and destination NAT
+//     short-circuits on `isOff`, skipping pool resolution and publishing a
+//     pool-less `Off=true` entry (nat_destination.go). Do not describe this as
+//     "the builders forward everything": that is true of SNAT only, and a
+//     justification naming a mechanism the code does not use is the exact
+//     defect this comment exists to remove. But do NOT describe the DNAT
+//     short-circuit as DECIDING the precedence either (#6820) — it
+//     CANONICALIZES. `DnatEntry::to_outcome` (nat/destination.rs) branches on
+//     `off` ALONE and never consults the pool, so a hand-built or mixed-version
+//     snapshot carrying BOTH `Off=true` and a usable pool still resolves to the
+//     exemption; measured by
+//     dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820
+//     (nat/tests_destination.rs), whose control arm clears `off` on the same
+//     rule and gets the translation. Both languages independently give `off`
+//     precedence; the Go step only removes a pool that would never have been
+//     read. Pinned on both sides: in Go by
+//     TestTolerantContradictory{SNAT,DNAT}*_5717 (pkg/dataplane/userspace) and
+//     in Rust by off_wins_over_contradictory_interface_action_5717,
+//     off_wins_over_contradictory_pool_action_5717, and
+//     off_wins_over_all_three_actions_5717 (nat/tests_source.rs).
+//
+//   - CONTRADICTORY WITHOUT `off` — source NAT `interface` + `pool`: INTERFACE
+//     MODE takes precedence, producing interface translation when the egress
+//     interface has a suitable same-family address and an `Unavailable`
+//     (fail-closed) result otherwise — the matcher returns
+//     `InterfaceNoEgressAddress` rather than forwarding untranslated
+//     (nat/source.rs, the #5688 belt). Either way the authored `pool` is
+//     silently discarded, because the matcher checks off → interface_mode →
+//     pool_mode in that order and there is no `off` here to take precedence.
+//     This is still a malformed rule the strict gate rejects; it is called out
+//     because "a contradiction resolves to the exemption" is TRUE ONLY when the
+//     contradiction contains `off`, and stating it unqualified is the same
+//     untested-safety-claim defect. Both halves are pinned, by SEPARATE
+//     fixtures: the translating half by interface_wins_over_pool_without_off_5717
+//     and the fail-closed half by interface_with_pool_no_egress_fails_closed_5717
+//     (both userspace-dp/src/nat/tests_source.rs). Do not cite only the first
+//     for the fail-closed half — it supplies a same-family egress address, so
+//     it never reaches the belt; and the generic
+//     interface_source_nat_no_v{4,6}_egress_addr_fails_closed pair does not
+//     close the gap either, because those rules carry no pool and so cannot
+//     detect a belt that falls back to pool translation. On the Go side
+//     TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717
+//     (pkg/dataplane/userspace) pins that the builder publishes BOTH actions
+//     plus this gate's tolerant-path warning. Note that BOTH precedences are
+//     enforced in Rust — the `rule.off` early return in nat/source.rs for SNAT
+//     and the `off`-only branch of `DnatEntry::to_outcome` in
+//     nat/destination.rs for DNAT. Mutating either of THOSE publishes the
+//     exemption as a translation. The Go `isOff` short-circuit in
+//     nat_destination.go is canonicalization, not the decision: reverting it
+//     changes the published snapshot's shape but not the packet's fate (#6820).
+//
+//   - ZERO actions: NOT inert, despite installing no translation. For source
+//     NAT the builder EMITS the actionless rule and the Rust matcher's `else`
+//     arm (nat/source.rs) then `continue`s to the next rule; for destination
+//     NAT the builder skips the rule. Either way the matched traffic FALLS
+//     THROUGH — and what it falls through TO depends on what follows it (#6820
+//     re-gate). If a later, broader rule matches, that rule translates it,
+//     which is exactly the fail-open this gate's own zero-action rejection text
+//     describes. If NOTHING later matches, the loop simply ends and the packet
+//     leaves UNTRANSLATED. Only the FIRST is a fail-open: the packet is
+//     translated against the operator's intent. In the second the packet's
+//     disposition COINCIDES with the intended exemption — untranslated — so
+//     nothing is observably wrong today, and calling it a fail-open too
+//     conflates a live wrong disposition with a latent one. What is wrong in
+//     the second case is the RULE, not the packet: it is non-terminal, so the
+//     moment any later broader rule is added the same config silently becomes
+//     the first case. That is why the gate rejects it either way. An earlier
+//     revision of this comment asserted only the first outcome ("...and is
+//     translated by it"), which presumes a later rule exists.
+//     Making an actionless rule terminal instead would newly exempt traffic that
+//     already-deployed configs translate, so it is a migration-contract
+//     decision tracked on #5717, not a mechanical fix.
+//     TestTolerantActionlessRuleIsNotInert_5717,
+//     actionless_rule_falls_through_to_later_broader_rule_5717 and
+//     actionless_rule_with_no_later_rule_passes_untranslated_5717 pin BOTH
+//     dispositions so neither the "inert" framing nor the "always translated by
+//     a later rule" framing can silently return.
+//
+// Rule-sets are walked in sorted name order for a deterministic first-reported
+// offender.
 func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	check := func(kind, actions string, rulesets []*NATRuleSet) error {
+	// mechanism is the WHOLE per-kind explanation of how the surviving action is
+	// chosen, not just a precedence ordering, because the two kinds do not share
+	// a mechanism (#6820 round 3). Source NAT forwards every authored field and
+	// the DATAPLANE picks; destination NAT resolves `off` in the COMPILER —
+	// buildDestinationNATSnapshots short-circuits on `isOff`, skips pool
+	// resolution entirely, and publishes `PoolAddress: ""`
+	// (pkg/dataplane/userspace/nat_destination.go) — so "every one of them is
+	// published" is simply false for a DNAT rule. A shared sentence would have to
+	// be false for one kind, and this is operator-facing text, so it is a
+	// parameter.
+	check := func(kind, actions, mechanism string, rulesets []*NATRuleSet) error {
 		sorted := append([]*NATRuleSet(nil), rulesets...)
 		sort.SliceStable(sorted, func(i, j int) bool {
 			if sorted[i] == nil || sorted[j] == nil {
@@ -2838,18 +2940,20 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries no translation action "+
 							"(expected exactly one of %s); the rule would commit but installs no "+
-							"translation, so matching traffic falls through to a later broader "+
-							"rule — an intended exemption silently disappears",
+							"translation and does not stop rule evaluation, so matching traffic "+
+							"falls through — translated by a later broader rule if one matches, "+
+							"otherwise left untranslated — and an intended exemption silently "+
+							"disappears",
 						kind, rs.Name, rule.Name, actions)
 				case n >= 2:
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
-							"translation actions (expected exactly one of %s); the compiler would "+
-							"silently pick one by packed-key/child order, so an intended exemption "+
-							"can publish as a translation. (Duplicate `then` CONTAINERS resolve "+
+							"translation actions (expected exactly one of %s); %s, so all but "+
+							"one action is silently discarded and the survivor is not chosen "+
+							"by configuration order. (Duplicate `then` CONTAINERS resolve "+
 							"last-wins per #3850; this rejects contradictory actions inside one "+
 							"block.)",
-						kind, rs.Name, rule.Name, n, actions)
+						kind, rs.Name, rule.Name, n, actions, mechanism)
 				}
 			}
 		}
@@ -2857,12 +2961,18 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	}
 	if err := check("source",
 		"`source-nat interface`, `source-nat pool <p>`, or `source-nat off`",
+		"every one of them is published to the dataplane, which resolves the rule "+
+			"by a fixed precedence — `off` wins over `interface`, and `interface` "+
+			"over `pool`",
 		cfg.Security.NAT.Source); err != nil {
 		return err
 	}
 	if cfg.Security.NAT.Destination != nil {
 		if err := check("destination",
 			"`destination-nat pool <p>` or `destination-nat off`",
+			"the compiler resolves `off` itself, publishing a pool-less exemption "+
+				"and never looking the pool up, and the dataplane applies the same "+
+				"`off`-over-`pool` precedence to any entry that carries both",
 			cfg.Security.NAT.Destination.RuleSets); err != nil {
 			return err
 		}

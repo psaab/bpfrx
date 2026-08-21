@@ -478,15 +478,28 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// swap on an unchanged bind. Before #5866 the server was constructed once
 	// here and never reconciled, so a committed bind/TLS/port/auth change (e.g.
 	// a revoked credential) sat inert until a daemon restart.
-	d.mgmt = newManagementReconciler(d, apiCfg)
-	if err := d.mgmt.start(ctx); err != nil {
+	// #6827 round 5: publish d.mgmt under staleCertMu, the same mutex the
+	// stale-cert delivery path reads it through, so that read is memory-model
+	// safe rather than a benign-looking data race.
+	mgmt := newManagementReconciler(d, apiCfg)
+	d.staleCertMu.Lock()
+	d.mgmt = mgmt
+	d.staleCertMu.Unlock()
+	if err := mgmt.start(ctx); err != nil {
 		// A boot bind failure is non-fatal (matches the pre-#5866 async
 		// srv.Run error log): the daemon keeps running and the next commit's
 		// reconcileWebManagement retries the bind.
 		slog.Error("HTTP API server initial start failed", "err", err)
 	}
+	// #6827: the boot config apply (startup phase 4) runs BEFORE this
+	// constructor, so a `system host-name` applied at boot reached a nil
+	// reconciler and parked itself. Deliver it now that an HTTPS leg may be
+	// serving — this is the earliest point at which the diagnostic has a real
+	// certificate to judge, and the name is still the one the operator set.
+	d.deliverStaleMgmtCertDiagnosis()
 	// Drain the management serve goroutines on daemon shutdown: ctx cancel
-	// triggers the api.Server bounded 5s graceful drain, and wait() joins every
+	// triggers the api.Server graceful drain (5s deadline, not a wall-clock
+	// bound — see api.legDrainTimeout), and wait() joins every
 	// live + retiring listener goroutine so none leak past Run.
 	wg.Add(1)
 	go func() {
