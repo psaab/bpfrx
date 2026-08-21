@@ -98011,6 +98011,8 @@ prose edit above them added. No diff falls in the new test body.
   _Log.md
 
 - **Timestamp**: 2026-08-21
+  - **Action**: #5078 partial — reject reflected/all-zero session-sync handshake nonces
+  - **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync_auth_test.go, pkg/cluster/README.md
 - **Action**: #103 — report the takeover HOLD in cluster status, and correct
   two stale docs claims about its default. Walking #103's five enumerated
   sub-conditions against `Daemon.takeoverReadinessForRG` showed items 1a, 1b,
