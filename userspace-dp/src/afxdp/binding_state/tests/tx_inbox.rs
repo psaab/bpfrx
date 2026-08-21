@@ -92,3 +92,72 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
     );
     assert_eq!(live.tx_errors.load(Ordering::Relaxed), 0);
 }
+
+/// #6304: the admission-attempt instrument moves none of FOUR PINNED
+/// `BindingLiveState` layout values. Stated that narrowly on purpose — it is
+/// what was measured, and it is weaker than "does not perturb the struct",
+/// which the last paragraph here explains this cell cannot show.
+///
+/// `try_acquire_pending_tx_admission` carries a `#[cfg(test)]` bump into a
+/// THREAD-LOCAL counter so
+/// `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+/// can distinguish sample-first from reserve-first at the live call site. This
+/// struct is the one whose cross-core cacheline behaviour #6114 exists to fix,
+/// so the standing objection to instrumenting it is real: a test-only member
+/// puts a layout under test that production never has.
+///
+/// A thread-local answers that objection by construction — it lives in its own
+/// storage — and this cell is the measurement rather than the argument. It reads
+/// the TEST configuration; the `const _: [(); N]` asserts beside the struct in
+/// `binding_state/mod.rs` are what make the statement a CROSS-configuration one,
+/// since they are not `cfg`-gated and must hold in the production build too.
+/// Both numbers here and there are the same literals on purpose.
+///
+/// Why the two offsets and not just the size — measured, not assumed. A
+/// `#[cfg(test)]` `AtomicU64` field declared ahead of `pending_tx_admitted`
+/// leaves size and align UNCHANGED (it fits in existing tail slack) and moves
+/// `pending_tx_admitted` 2152 -> 2160; declared last, after
+/// `delta_loss_pending`, it leaves size, align and `pending_tx_admitted`
+/// unchanged and moves `delta_loss_pending` 2280 -> 2288. A size-only guard
+/// calls both of those layout-neutral, and both would be exactly the
+/// perturbation #6114 cares about.
+///
+/// WHAT THIS CELL CAN AND CANNOT DO. It cannot FAIL. The four `const _`
+/// asserts beside the struct are not `cfg`-gated, so a wrong value in the test
+/// configuration is a compile error and this binary never gets built — the
+/// assertions below execute, always pass, and exist as a readable mirror of the
+/// numbers plus their reasoning, not as an independent check. Nor are four
+/// pinned values a whole-struct fingerprint: a perturbation that moves only
+/// unpinned fields satisfies all four. See the comment beside the struct for the
+/// full scope, including why `repr(Rust)` plus an unpinned toolchain makes these
+/// literals a build tripwire rather than a portable invariant.
+#[test]
+fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304() {
+    assert_eq!(
+        std::mem::size_of::<BindingLiveState>(),
+        2304,
+        "#6304: the `cfg(test)` admission-attempt instrument must not change \
+         `BindingLiveState`'s SIZE — the same literal is asserted at compile \
+         time in `binding_state/mod.rs`, which is where the production build \
+         checks it"
+    );
+    assert_eq!(
+        std::mem::align_of::<BindingLiveState>(),
+        64,
+        "#6304: ...nor its ALIGNMENT"
+    );
+    assert_eq!(
+        std::mem::offset_of!(BindingLiveState, pending_tx_admitted),
+        2152,
+        "#6304/#6114: ...nor the OFFSET of the admission counter whose \
+         cacheline this is all about. A `cfg(test)` field ahead of it moves \
+         this to 2160 while leaving the size assert above satisfied"
+    );
+    assert_eq!(
+        std::mem::offset_of!(BindingLiveState, delta_loss_pending),
+        2280,
+        "#6304: ...nor the offset of the last-declared field, which is the \
+         sentinel for a `cfg(test)` member appended at the END of the struct — \
+         that shape moves this to 2288 and trips nothing else"
+    );
+}

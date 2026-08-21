@@ -5486,6 +5486,138 @@ fn nat64_6475_embedded_v4_predicate_range_boundaries() {
     }
 }
 
+// === #6876: the NAT64 release must free EVERY prefix holding the flow ===
+//
+// `release_nat64_allocation_with_mode` sweeps the prefixes but `break`s on the
+// first allocator that frees the flow. That is the SAME first-hit break this
+// PR REMOVED from the source-NAT release (`release_source_nat_allocation_with_mode`
+// in nat/source.rs), where the accompanying comment explains at length that one
+// flow can come to be held in TWO allocators and that stopping at the first
+// leaves the other holding its `(pool_addr, port)` FOREVER — nothing else
+// removes a `live_by_flow` entry (`release_flow` / `rollback_flow` / the
+// stale-tuple replace in `reserve_flow` are the only removers, and
+// `gc_expired_chunked` sweeps persistent LEASES, not live flows). The NAT64
+// twin was left contradicting that reasoning.
+//
+// Two prefixes come to hold ONE flow with no config edit at all, because the
+// reserve is OCCUPANCY-dependent: `reserve_synced_nat64_allocation` takes the
+// first prefix whose allocator ACCEPTS. If prefix A's port is transiently held
+// by an unrelated local flow, the synced reservation lands in B; when A frees
+// and the synced session REFRESHES — every HA session-sync reconnect and every
+// periodic re-upsert re-runs the reserve — A now accepts, and the same flow is
+// held in A *and* B. One release then frees A and strands B.
+//
+// The observable is `reserve_nat64_pool_port`'s bool: it returns false when the
+// port is still owned by a DIFFERENT live allocation, so a post-release probe
+// with a fresh flow answers "is this port still held here" directly, rather
+// than inferring it from which port a fresh `allocate_source` happens to hand
+// out (a freed port goes on the recycle queue and is NOT reissued immediately —
+// see `nat64_4381_release_frees_the_port`'s `assert_ne!`).
+//
+// FAIL-ON-REVERT: restore the `break` and prefix B's assertion goes RED.
+fn shared_pool_prefix(name: &str, pref64: &str) -> NAT64RuleSnapshot {
+    NAT64RuleSnapshot {
+        name: name.to_string(),
+        prefix: pref64.to_string(),
+        // BOTH prefixes publish the SAME one-address pool, so a synced
+        // `(snat_v4, port)` is a member of both and either allocator can hold
+        // it — the precondition for a two-prefix reservation.
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
+    let state = Nat64State::from_snapshots(&[
+        shared_pool_prefix("nat64-a", "64:ff9b::/96"),
+        shared_pool_prefix("nat64-b", "64:ff9b:1::/96"),
+    ]);
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let synced_key = nat64_synced_key("2001:db8::1");
+    let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
+
+    // A local flow takes port 1024 in prefix A (1024 is the first sequential
+    // NAT64 port), so A cannot accept the synced reservation.
+    let squatter_key = nat64_synced_key("2001:db8::9");
+    let squatter = state
+        .allocate_source(
+            0,
+            crate::ip_proto::PROTO_TCP,
+            "2001:db8::9".parse().unwrap(),
+            dst_v4,
+            5000,
+            443,
+            1,
+        )
+        .expect("prefix A allocates for the squatting flow");
+    assert_eq!(
+        squatter,
+        (snat, 1024),
+        "fixture precondition: the squatting flow must hold prefix A's port 1024"
+    );
+
+    // The synced flow arrives. A REFUSES (1024 is the squatter's), so the
+    // reservation lands in B.
+    reserve_synced_nat64_allocation(&state, &synced_key, synced, false);
+
+    // The squatter retires, freeing 1024 in A. It is held only in A, so the
+    // break under test cannot affect this release.
+    release_nat64_allocation(
+        &state,
+        &squatter_key,
+        Nat64State::forward_decision(snat, dst_v4, 1024),
+        false,
+        2,
+    );
+
+    // The synced session refreshes (HA reconnect / periodic re-upsert). A now
+    // accepts, so the SAME flow is held in BOTH prefixes.
+    reserve_synced_nat64_allocation(&state, &synced_key, synced, false);
+
+    // ONE release, exactly as the teardown path issues it.
+    release_nat64_allocation(&state, &synced_key, synced, false, 3);
+
+    // Both allocators must have given the port back. Probe each with a fresh,
+    // unrelated flow: `reserve_nat64_pool_port` returns false while a different
+    // live allocation still owns the port.
+    let probe = |client: &str| crate::nat::SourceNatFlowKey {
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(client.parse().unwrap()),
+        dst_ip: IpAddr::V4(dst_v4),
+        src_port: 6000,
+        dst_port: 443,
+    };
+    assert!(
+        crate::nat::reserve_nat64_pool_port(
+            &state.prefixes[0].port_allocator,
+            probe("2001:db8::a"),
+            snat,
+            1024,
+            0,
+            false,
+        ),
+        "prefix A must have freed the released flow's port"
+    );
+    assert!(
+        crate::nat::reserve_nat64_pool_port(
+            &state.prefixes[1].port_allocator,
+            probe("2001:db8::b"),
+            snat,
+            1024,
+            0,
+            false,
+        ),
+        "prefix B still owns the released flow's port: the NAT64 release stopped \
+         at the FIRST prefix that freed it, stranding every other holder \
+         permanently — nothing else removes a live_by_flow entry. This is the \
+         exact first-hit break this PR removed from the source-NAT release \
+         (#6876)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #5798: ingress-authority + protocol scoping of the shared fragment cache.
 //

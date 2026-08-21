@@ -11,6 +11,7 @@ use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
     CoSDSCPRewriteRuleEntrySnapshot, CoSDSCPRewriteRuleSnapshot, CoSForwardingClassSnapshot,
     CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
+    CoSINetPrecedenceClassifierEntrySnapshot, CoSINetPrecedenceClassifierSnapshot,
     CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
     FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot,
 };
@@ -247,6 +248,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -313,6 +315,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -376,6 +379,7 @@ fn build_cos_state_resolves_transmit_rate_percent_against_interface_shaping_rate
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -432,6 +436,7 @@ fn build_cos_state_transmit_rate_percent_no_shaping_rate_stays_inert() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -482,6 +487,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -568,6 +574,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -672,6 +679,7 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -745,6 +753,7 @@ fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -809,6 +818,7 @@ fn build_cos_state_fails_closed_on_unknown_scheduler_priority() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -898,6 +908,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -958,6 +969,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1010,6 +1022,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1062,6 +1075,7 @@ fn build_cos_state_dangling_scheduler_reference_uses_safe_best_effort_default() 
                     scheduler: "ef-typo".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3699,6 +3713,7 @@ fn cos_forwarding_class_queue_out_of_range_fails_closed() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3750,6 +3765,7 @@ fn cos_forwarding_class_in_range_queue_builds_and_empty_name_skipped() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3791,6 +3807,7 @@ fn cos_dscp_classifier_out_of_range_code_point_fails_closed() {
             dscp_rewrite_rules: vec![],
             schedulers: vec![],
             scheduler_maps: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3834,6 +3851,7 @@ fn cos_ieee8021_classifier_out_of_range_code_point_fails_closed() {
             dscp_rewrite_rules: vec![],
             schedulers: vec![],
             scheduler_maps: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3884,6 +3902,7 @@ fn cos_classifier_in_range_boundary_code_points_build() {
             dscp_rewrite_rules: vec![],
             schedulers: vec![],
             scheduler_maps: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3991,6 +4010,7 @@ fn build_cos_state_includes_zero_shaping_rate_interface() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4048,6 +4068,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4108,6 +4129,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4165,6 +4187,7 @@ fn build_cos_state_mixed_zero_and_nonzero_shaping_rate() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4226,6 +4249,7 @@ fn build_cos_state_skips_interface_with_no_cos_config() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4287,6 +4311,7 @@ fn build_cos_state_admits_each_cos_field_in_isolation() {
                 dscp_value: 0,
             }],
         }],
+        inet_precedence_classifiers: vec![],
     };
     let cases: &[(i32, &str, InterfaceSnapshot)] = &[
         (
@@ -4427,6 +4452,7 @@ fn build_cos_state_skips_interface_with_unresolvable_named_references() {
                 dscp_value: 0,
             }],
         }],
+        inet_precedence_classifiers: vec![],
     };
     // Each typo'd reference (one CoS field non-empty but unresolvable)
     // must NOT admit the interface to CoSState.
@@ -4512,6 +4538,7 @@ fn build_cos_state_skips_interface_with_resolvable_but_empty_scheduler_map() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4574,6 +4601,7 @@ fn build_cos_state_fails_closed_on_scheduler_map_undefined_forwarding_class() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4625,6 +4653,7 @@ fn build_cos_state_skips_classifier_only_mapping_to_unmaterialized_queue() {
         }],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
+        inet_precedence_classifiers: vec![],
     };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -4666,6 +4695,7 @@ fn build_cos_state_admits_classifier_mapping_to_materialized_queue() {
         }],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
+        inet_precedence_classifiers: vec![],
     };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -4713,6 +4743,7 @@ fn build_cos_state_skips_rewrite_only_mapping_to_unmaterialized_class() {
                 dscp_value: 0x2e,
             }],
         }],
+        inet_precedence_classifiers: vec![],
     };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -4753,6 +4784,7 @@ fn build_cos_state_admits_rewrite_only_mapping_to_materialized_class() {
                 dscp_value: 0,
             }],
         }],
+        inet_precedence_classifiers: vec![],
     };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -5564,6 +5596,7 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
                     scheduler: "be".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -5706,6 +5739,126 @@ fn config_apply_builds_both_per_zone_counter_slot_maps_3651() {
     // And the rebuilt maps are still live, not left empty by the re-apply.
     assert_ne!(second.flood_counter_slot_map.slot_of(TRUST), 0);
     assert_ne!(second.zone_counter_slot_map.slot_of(TRUST), 0);
+}
+
+/// #6847: an inet-precedence classifier code-point outside the 3-bit
+/// IP-precedence domain (0..=7) fails the snapshot CLOSED via
+/// `CosInetPrecedenceCodePointOutOfRange`, mirroring the #2447 dscp / 802.1p
+/// backstops. Masking it (`& 0x7`) would install the classifier for a DIFFERENT
+/// traffic class — 9 aliases onto precedence 1 — with no apply failure.
+///
+/// The Go commit gate (`collectCoSINetPrecedenceCodePoints`) rejects this
+/// first; this guards helper-boundary version/snapshot drift, where the
+/// producer is not necessarily the Go binary that was validated.
+///
+/// SCOPE — the check exists at TWO sites, and they are redundant for this
+/// input: `build_cos_inet_precedence_queue_table` (over `queue_by_prec`) and
+/// `build_cos_inet_precedence_lp_table` (over `lp_by_prec`). Those two maps are
+/// filled in the same loop from the same entries, so their key sets are always
+/// identical and no snapshot can reach one check without the other. Mutating
+/// either site alone therefore leaves this test GREEN — measured, not assumed.
+/// Both are kept because each is the natural bounds check for its own table and
+/// neither should silently start depending on the other.
+///
+/// FAIL-ON-REVERT: replace BOTH `table.get_mut(usize::from(precedence))` bounds
+/// checks with a masked `table[usize::from(precedence & 0x7)]` write and the
+/// build succeeds, so the `expect_err` goes red.
+#[test]
+fn cos_inet_precedence_classifier_out_of_range_code_point_fails_closed() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 82,
+            cos_shaping_rate_bytes_per_sec: 1,
+            cos_inet_precedence_classifier: "wan-prec".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            inet_precedence_classifiers: vec![CoSINetPrecedenceClassifierSnapshot {
+                name: "wan-prec".into(),
+                entries: vec![CoSINetPrecedenceClassifierEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    loss_priority: "low".into(),
+                    precedences: vec![9], // > 7 — masking would alias onto 1
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+        }),
+        ..Default::default()
+    };
+    let err = super::cos::build_cos_state(&snapshot).expect_err(
+        "an out-of-range IP-precedence code-point must fail closed, not alias onto precedence 1",
+    );
+    match err {
+        crate::policy::SnapshotIntegrityError::CosInetPrecedenceCodePointOutOfRange {
+            classifier,
+            precedence,
+        } => {
+            assert_eq!(classifier, "wan-prec");
+            assert_eq!(precedence, 9);
+        }
+        other => panic!("expected CosInetPrecedenceCodePointOutOfRange, got {other:?}"),
+    }
+}
+
+/// #6847: an interface whose ONLY CoS state is an inet-precedence classifier is
+/// ADMITTED to `CoSState`.
+///
+/// The #1183 `useful_cos_state` gate skips interfaces that contribute no usable
+/// CoS state. Omitting the inet-precedence arm from that gate would drop
+/// exactly the plain `set class-of-service interfaces <if> unit 0 classifiers
+/// inet-precedence <name>` config this issue is about — no shaping-rate, no
+/// scheduler-map, no other classifier — so the classify arm would be
+/// unreachable for the common case while every other test still passed.
+///
+/// FAIL-ON-REVERT: drop `|| inet_precedence_classifier_targets_iface_queue`
+/// from `contributes_usable_cos_state` and `state.interfaces` is empty here.
+#[test]
+fn cos_inet_precedence_classifier_alone_admits_the_interface() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 83,
+            cos_inet_precedence_classifier: "wan-prec".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            inet_precedence_classifiers: vec![CoSINetPrecedenceClassifierSnapshot {
+                name: "wan-prec".into(),
+                entries: vec![CoSINetPrecedenceClassifierEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    loss_priority: "low".into(),
+                    precedences: vec![5],
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = super::cos::build_cos_state(&snapshot).expect("classifier-only snapshot must build");
+    let cfg = state
+        .interfaces
+        .get(&83)
+        .expect("an inet-precedence classifier alone must admit the interface to CoSState");
+    assert_eq!(cfg.inet_precedence_classifier, "wan-prec");
+    // precedence 5 -> best-effort -> queue 0; every other code-point stays
+    // u8::MAX (unclassified).
+    assert_eq!(cfg.inet_precedence_queue_by_prec[5], 0);
+    assert_eq!(cfg.inet_precedence_queue_by_prec[4], u8::MAX);
 }
 
 // ── #5716: a rejected build must not prune the LIVE zone counters ─────
@@ -5872,6 +6025,10 @@ fn zone_counter_rejection_rows() -> Vec<(
         scheduler_maps: vec![],
         dscp_classifiers: vec![],
         ieee8021_classifiers: vec![],
+        // #6847: this literal is exhaustive, so the new BA-classifier list
+        // has to be named here. Empty keeps the fixture's meaning — the case
+        // under test is the queue-id overflow on `forwarding_classes`.
+        inet_precedence_classifiers: vec![],
         dscp_rewrite_rules: vec![],
     });
 

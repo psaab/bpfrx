@@ -1,3 +1,1098 @@
+## 2026-08-21 — #6211/#6876 drive round: all seven Codex findings re-verified at a moved head; zero attributable runtime defects
+
+- **Timestamp**: 2026-08-21 (fix/6211-synced-snat-rule-identity, PR #6876)
+- **Action**: Drive-lane merge-gate pass on a head that had moved 234 commits
+  behind master. Merged `origin/master` (NOT rebased — #6981 is stacked on
+  this branch), union-resolved `_Log.md` (3 hunks, `##` count 1588 + 1656 -
+  1587 = 1657 measured exactly, zero unique lines lost from either side), and
+  regenerated `docs/refactoring-audit-current.txt`, which this branch had never
+  refreshed after growing `nat/source.rs`.
+
+  RE-CLASSIFIED the seven Codex DO-NOT-MERGE findings against `origin/master`
+  rather than against the PR's own diff, because the F1 precedent showed at
+  least one had been mis-attributed. Result: F1, F2, F3, F4, F5, F6 and F7b all
+  reproduce IDENTICALLY on master and none of their production sites is in this
+  PR's file list — `nat/allocator.rs`, `ha/session_import.rs`,
+  `session_glue/commands/install.rs` and `reconcile/snapshot.rs` are untouched;
+  `allocator_key()` is untouched (its three appearances in the diff are all
+  comment text); and `reserve_synced_nat64_allocation` — F7b's selection site —
+  is untouched, the only nat64.rs production change being the release sweep.
+  F7a is the one fixed here. So the PR leaves no runtime defect of its own.
+
+  MUTATION MATRIX RE-MEASURED AT THIS HEAD rather than carried forward from
+  `6d881ebf8`: master's #6812 landed in `nat/source.rs` between the two, so the
+  tree the earlier matrix was measured against no longer exists. Four
+  discriminating cells, each required to redden a NAMED subset of the thirteen
+  `*6211*` tests (control: 13/13 green):
+
+    M1  disable pass 1 entirely            -> 8 RED / 5 GREEN (the 5 survivors
+                                              are the invariance + fallback
+                                              tests, which must stay green)
+    M6  drop the zone axis from
+        `matches_ignoring_scope`           -> 6 RED — and NOT the l4 / post-DNAT
+                                              cells, which that axis does not
+                                              feed
+    S1  restore the first-hit `break` in
+        the SNAT release sweep             -> exactly 2 RED, both named for the
+                                              sweep property
+    S2  restore the first-hit `break` in
+        the NAT64 release sweep            -> exactly 1 RED,
+                                              `nat64_6876_release_frees_every_prefix_holding_the_flow`
+
+  HOSTILE PASS, NAT + HA session-sync, entered expecting a runtime bug. The
+  new one hunted was the interaction with #6812, which master gained the same
+  day: `resolve_pool_allocators` leaves a budget-refused rule with
+  `pool_mode == true`, a fully expanded address vector and the DEFAULT
+  `PortAllocator`, and the standby's reservation loop gates on `pool_mode`
+  alone — so pass 1 can offer a reservation to a rule with no allocator behind
+  it, and because pass 1 returns on first success it would then SKIP the pass-2
+  fallback. It does not fire: `PortAllocator::default()` carries
+  `occupancy: Vec::new()` and `max_tracked_flows: 0`, so `reserve_flow` fails
+  closed on `addr_index >= occupancy.len()` and `reserve_address_only` fails
+  closed on `live_by_flow.len() >= max_tracked_flows`. Both verified by reading
+  the code, not inferred. The dependence is unbound, though — flipping that
+  default's `max_tracked_flows` to 1 reddens exactly ONE test in the whole
+  4477-test suite, and it is a #6812 status assertion — so it was FILED as
+  #7076 rather than folded (it is pre-existing on master's single-pass loop
+  too). Where the refused rule is the FIRST pool owner but not the active's
+  match, pass 1 is an improvement over master: master reserved on the dead
+  allocator, pass 1 skips to the rule the active matched.
+
+  Also attacked and held: wrong-rule reservation cannot leak (the sweep visits
+  every pool-mode rule and both `release_flow`/`rollback_flow` are guarded on
+  `live_by_flow[flow].translated == translated`, so it can neither over-free
+  nor under-free while the rule set is stable); cardinality is unchanged at one
+  reservation per call (both passes return on first success and pass 2 runs
+  only when pass 1 took none); pass 1's candidate set is a strict subset of
+  pass 2's and both take first-accepting, so no configuration can end with
+  FEWER reservations than master; a hostile peer's zone ids buy no new
+  authority, since the reservation still requires the rule's pool to OWN
+  `rewrite_src` and the peer already controls `rewrite_src` outright; and
+  `matches_ignoring_scope` is still `matches` minus `scope_matches` after the
+  merge — master's only addition inside `impl SourceNatRule` is
+  `allocator_key_for`, no new match axis. Confirmed firsthand that the active
+  stamps the SAME `from_zone_id`/`to_zone_id` into `SessionMetadata` that it
+  resolved its `from_zone`/`to_zone` NAMES from, and that
+  `handle_upsert_synced`'s #326 local re-resolution mutates only
+  `decision.resolution` and `owner_rg_id` — never the zone fields — so the pair
+  fed to pass 1 is the ACTIVE's.
+- **Validation**: `cargo build --release` rc 0;
+  `cargo test --manifest-path userspace-dp/Cargo.toml -- --test-threads=1`
+  rc 0 (4477 passed, 0 failed, 2 ignored); `go build ./...` rc 0;
+  `go vet ./...` rc 0; `make audit-check` rc 0;
+  `go test -count=1 ./pkg/refactoraudit/...` rc 0. A cluster smoke is OWED —
+  the diff moves `userspace-dp/` production code — and was NOT run by this
+  lane.
+- **File(s)**: _Log.md, docs/refactoring-audit-current.txt
+
+## 2026-08-13 — #6211/#6876 PR1 part 1: the NAT64 release kept the first-hit break this PR removed from source NAT
+
+- **Timestamp**: 2026-08-13 (fix/6211-synced-snat-rule-identity)
+- **Action**: Folded three of the four PR1 items from the Codex DO-NOT-MERGE
+  review. F2 (the per-worker reservation refcount) is NOT in this commit — it
+  is blocked on a design question reported to the lead (see below).
+
+  **F7a — the NAT64 release stopped at the first prefix that freed the flow.**
+  `release_nat64_allocation_with_mode` swept `nat64.prefixes` but `break`ed on
+  the first allocator that returned true. That is the SAME first-hit break this
+  PR REMOVED from `release_source_nat_allocation_with_mode`, left in place in
+  the parallel path — while the source-NAT comment explains at length why the
+  break is wrong and calls the resulting retention permanent. The PR fixed one
+  of two parallel paths and left the other contradicting its own reasoning.
+
+  Two prefixes come to hold ONE flow with no config edit, because the reserve
+  is occupancy-dependent: `reserve_synced_nat64_allocation` takes the first
+  prefix whose allocator ACCEPTS. A prefix whose port is transiently held by an
+  unrelated local flow is skipped and the reservation lands on a later prefix;
+  when the earlier one frees and the synced session refreshes (every HA
+  session-sync reconnect and every periodic re-upsert re-runs the reserve), the
+  same flow is held in both. One release then freed one and stranded the other
+  forever — nothing else removes a `live_by_flow` entry.
+
+  **The "at most one allocator" invariant was rewritten, not re-scoped.** The
+  sweep's stated justification was "Before #6211 the reserve was a pure function
+  of `rules`", scoping the invariant to an UNCHANGED rule set. That premise is
+  false on master, and master documents that it is false: its reserve loop has
+  the same per-rule fall-through and its own comment says a collision "leaves
+  the rule untouched and tries the next". Selection has ALWAYS been
+  occupancy-dependent, so a flow could already be held in two allocators with
+  the rule set untouched. The comment now says that, and the trailing
+  "(every pre-#6211 config)" parenthetical — which the rewrite falsified — was
+  corrected rather than left standing.
+
+  **Two stale citations** in the release-sweep rationale: the
+  `rollback_source_nat_allocation` sites are `:2644`/`:4912`, not `:2634`/`:4902`
+  (those are ordinary comment lines ten above). The other three were correct.
+
+- **File(s)**: `userspace-dp/src/nat64.rs`, `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat64_tests.rs`
+
+- **RED shown, not claimed.** `nat64_6876_release_frees_every_prefix_holding_the_flow`
+  reaches the two-prefix state through the production path (a squatting local
+  flow makes prefix A refuse, the reservation lands in B, the squatter retires,
+  the synced session refreshes into A) and then issues ONE release. Against the
+  unfixed code it fails as an ASSERTION, not a build break:
+
+      panicked at src/nat64_tests.rs:5567:5:
+      prefix B still owns the released flow's port: the NAT64 release stopped
+      at the FIRST prefix that freed it ...
+
+  Prefix A's assertion PASSES in the same run, so the guard discriminates
+  rather than merely failing. With the break removed: guard `ok`, and the full
+  suite is `CARGO_RC=0`, 4288 passed / 0 failed in the main suite (7 suites,
+  zero failures). `go build ./...` rc=0 (no Go changed). Exit codes captured
+  unpiped. No `cargo fmt` was run: the diff is three files, and the only
+  non-comment change is the removed `break`.
+
+  The observable is `reserve_nat64_pool_port`'s bool rather than "which port a
+  fresh allocation hands out" — a freed port goes on the recycle queue and is
+  not reissued immediately, which `nat64_4381_release_frees_the_port`'s
+  `assert_ne!` already pins.
+
+- **F2 (per-worker refcount) DEFERRED within PR1, reported to the lead.** The
+  agreed design was a holder-set bitmask keyed by `worker_id`, with the width
+  made structurally impossible to exceed. Verification found that assumption
+  false: `records: BTreeMap<u32, WorkerRuntimeRecord>` and
+  `coordinator/worker_manager.rs:70-79` documents that worker ids are SPARSE —
+  unregister handlers can remove the bindings carrying the low ids while a
+  high-id worker survives — so a sparse id >= 64 sets no bit with only two live
+  workers. There is no constant to assert against either: `MAX_WORKERS_SCRATCH
+  = 32` was removed and a test now exercises 40 slots. A bare counter is worse
+  still, and not only on worker exit: `reserve_flow` early-returns on a
+  same-tuple re-reserve, the path every refresh takes from the same worker, so
+  a counter incremented there inflates without bound and never drains.
+  Awaiting the lead's decision between bounding ids where they are assigned and
+  moving the peer-synced reservation to a single coordinator-owned take/release.
+## 2026-08-21 — #5619 PR2 drive: merge master, repair a self-declaring premise
+
+- **Timestamp**: 2026-08-21 (fix/5619-ipsec-plaintext-warn, PR #6698)
+- **Action**: #5619 PR1 (#6691) MERGED to master (fcb7e6160) and its branch was
+  deleted, which auto-closed this stacked PR. Merged `origin/master` (668
+  commits behind; NEVER rebase a review-heavy branch) and retargeted to master.
+  The three-dot diff against master is now exactly this PR's own delta — 823
+  insertions across `compiler_ipsec_plaintext_warn.go`, its test,
+  `compiler_prewalk.go`, `pkg/config/README.md` and `_Log.md`. None of #6691's
+  seven shared files survive on this side, so the stale-duplicate hazard flagged
+  on the PR resolved itself: master's version wins outright.
+- **The merge broke a premise, loudly.**
+  `TestPlaintextWarningSkipsInvalidBindInterface` drove `st-1` and `st65536` as
+  the rows that "pass IsSecureTunnelIfName and are stopped only by the ifID == 0
+  guard". #6691 gave `secureTunnelIndex` a `0 <= idx < 65536` range, so both now
+  FAIL the predicate. The subtest's own premise check caught it and failed the
+  build rather than going vacuously green — which is exactly what that check was
+  written for. Replaced the inputs with `st0.65535` (unit >= 0xffff) and
+  `st0.abc` (unit unparseable): both keep a VALID base, so they still bind the
+  if_id test, and they now pin the axis that actually varies — WHICH HALF of the
+  bind-interface is invalid. A guard written against the base name alone would
+  let both through and emit an advisory about a device routing never creates.
+- **Mutation-proved, not asserted.** Deleting `if ifID == 0 { continue }` reds
+  `unit_out_of_range` and `unit_unparseable` and leaves `invalid_base_name`
+  green. Deleting the `!IsSecureTunnelIfName(base)` line leaves the ENTIRE file
+  green — that branch is unreachable, because `ifID != 0` already implies
+  `secureTunnelIndex(base)` succeeded. Filed rather than folded.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn_5619_test.go, _Log.md
+
+## 2026-08-01 — #5619 PR2 round 2: aggregate the advisory, escalate the zoned case
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
+- **Action**: Per the scope decision, the plaintext advisory now emits ONE
+  aggregated message per commit naming every affected tunnel, instead of one per
+  tunnel. An advisory that fires N times on every commit gets filtered out, and
+  then it protects nobody — same shape compiler_system.go uses when folding
+  several inert knobs into one message.
+
+  It still fires whenever a secure tunnel is configured, NOT only when one
+  carries a zone. Leaving a tunnel out of a zone is not a mitigation: an
+  interface in no zone resolves to zone id 0 and a `from-zone any to-zone any
+  permit` rule matches zone-pair (0,0) with no zone guard (#6682), so an unzoned
+  tunnel's plaintext can be affirmatively PERMITTED by a wildcard rule. Gating
+  on zoning would tell that operator nothing.
+
+  The two groups are worded differently. ZONED reads as an escalation
+  ("ASSIGNED A ZONE THAT IS NOT ENFORCED — this reads as protected and is not")
+  because the operator has been told something specific and untrue; UNZONED is a
+  plain statement of the gap, plus the #6682 caveat so nobody concludes that
+  unzoning is the safe option. The caveat is omitted when every tunnel is zoned,
+  so it does not become noise where it does not apply.
+
+  Rebased onto the round-3 PR1 (bare-`st0` fix), so the advisory keys off the
+  corrected shared predicate.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_ipsec_plaintext_warn_5619_test.go, _Log.md
+
+## 2026-08-01 — #5619 PR2: commit-time advisory that IPsec plaintext is unadjudicated
+
+- **Timestamp**: 2026-08-01 (fix/5619-ipsec-plaintext-warn)
+- **Action**: Added `warnSecureTunnelPlaintextUnadjudicatedAST`, a commit-time
+  WARNING (never a rejection) that a route-based IPsec VPN's decrypted
+  plaintext is not evaluated against xpf security policies.
+
+  The sharpest part of #5619 is not the bypass, it is that the config gives an
+  affirmative FALSE signal: `set security zones security-zone vpn interfaces
+  st0.0` commits cleanly (#4515 accepts it), the compiler programs
+  iface_zone_map for the xfrmi ifindex, and the XDP shim is attached — so the
+  posture READS as enforced. An operator who zones a VPN interface and sees it
+  accepted has been told something specific and untrue. That is fixable now,
+  independently of the dataplane architecture, and this does it.
+
+  Warning, NOT rejection, and the property is STRUCTURAL: the function has no
+  error return and no `lenient` flag, so it cannot be quietly inverted by a
+  later edit. Route-based (st0/XFRM) IPsec is the ONLY IPsec model xpf supports
+  (#3114 hard-rejects policy-based), so rejecting it would be a feature removal
+  — and it would leave an operator with a working tunnel unable to commit an
+  UNRELATED change (#1960 no-brick).
+
+  Keyed off `config.IsSecureTunnelIfName`, the SAME predicate as the dataplane
+  exclusion arms added in PR1, so the advisory and the behaviour it describes
+  cannot drift apart. When the dataplane learns to own an xfrmi end-to-end, the
+  exclusions and this advisory are keyed off one name and go together.
+
+  Message names the VPN and the bind-interface, and when the tunnel interface
+  is in a security zone it additionally names that zone and states plainly that
+  the zone does not govern the decrypted traffic — the false-signal case.
+  Zone membership is read through the shared `zoneInterfaceMembers` flattener
+  so a bracketed list `interfaces [ st0.0 st0.1 ]` (which arrives
+  bracket-stripped and NESTED, #5248/#2419) does not silently lose its tail.
+  An AST pre-walk across EVERY duplicate `security`/`ipsec` block (#3562).
+
+  Validation: pkg/config, pkg/configstore, pkg/cli and pkg/dataplane/... suites
+  green (adding a warning to every IPsec config broke no existing warning-count
+  assertion); 7 new tests including a no-brick test and a negative control.
+- **File(s)**: pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_ipsec_plaintext_warn_5619_test.go,
+  pkg/config/compiler_prewalk.go, _Log.md
+## 2026-08-05 — #6304: bind the LIVE mirror call site in stage_flow_cache_hit (salvage + independent verification)
+
+- **Timestamp**: 2026-08-05 (fix/6304-mirror-callsite-bound-sv)
+- **Action**: Salvage verification. The implementing lane was killed mid-task by
+  a spend limit with its work complete but uncommitted; it was committed as-is
+  at `02ffefd5d` and is rebased here onto `86927d23c`. The SALVAGE COMMIT
+  rewrote nothing — that diff is the dead lane's, re-verified firsthand end to
+  end, plus the doc update it missed. The rounds after it did rewrite:
+  `02ffefd5d..0938e5913` changes `flow_cache_hit_tests.rs` by +468/-1 (the
+  UMEM-aliasing fidelity fix and two added tests), and the fold round at the
+  foot of this entry replaces the file outright. An earlier revision of this
+  paragraph said "Nothing was rewritten" unqualified, which read as a claim
+  about the PR as a whole rather than about the salvage commit.
+  The gap: the #6114 sample-before-CAS tests reach the shared
+  `sample_then_admit_mirror_clone` (`mirror/resolver.rs`) through
+  `enqueue_sampled_mirror_clone_to_live`, a wrapper that is DEAD in non-test
+  builds. The LIVE call site is inside `stage_flow_cache_hit`
+  (`poll_descriptor/flow_cache_hit.rs`), and `stage_flow_cache_hit` had no test
+  reference anywhere in the tree — so a revert of the live call site alone,
+  leaving the helper correct, was invisible. Classic unit-bound /
+  call-site-unbound. `flow_cache_hit_tests.rs` drives `stage_flow_cache_hit`
+  itself: a hairpin in-place-rewrite cached flow with a cross-worker mirror
+  target whose clone queue is at its cap, and a NON-sampled packet (rate=2,
+  counter=1). Two positive controls assert the in-place rewrite actually
+  succeeded, because the mirror result is recorded only inside that branch — a
+  fixture whose rewrite silently failed would read 0 drops under both the
+  correct and the reverted call site.
+  Completeness sweep beyond the issue's ask: `sample_then_admit_mirror_clone`
+  has exactly two callers (the dead wrapper, and the now-bound live site), and
+  the second live copy of the ordering — `enqueue_sampled_mirror_clone`'s
+  cross-worker arm, which inlines the sampler rather than calling the helper —
+  is separately bound, proven by mutation rather than by reading.
+  Round 2 (gate M1): the salvaged lane ported ONE of #6114's TWO fail-on-revert
+  tests. Its fixture pins `mirror_sample_counter = 1` at `rate = 2`, so
+  `MirrorSampleAdmission::NotSampled` short-circuits and everything downstream
+  of `Sampled(..)` at the live site stayed unbound — the SELECTED arm, which the
+  same thesis condemns. Two companions close it, and the second was NOT
+  redundant: the gate's prescribed test (SELECTED + FULL queue) is green under
+  `Sampled(Ok(_)) => None`, because a full queue never yields `Ok`. Verified
+  before adopting the prescription rather than after. The admitted-clone test
+  also turns the mirror WIRING into a standing assertion: the non-sampled test
+  asserts the drop counters are ZERO, so nothing in it depends on the target
+  being present, cross-worker, or full — a `MirrorTargetMap` re-keying would
+  leave it passing and binding nothing. A "right reason" that lives only in a
+  mutation transcript is not maintained by anything.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs (new),
+  docs/userspace-dataplane-gaps.md, _Log.md
+- **Validation**: every cell run in `/var/tmp/sv6304` with
+  `CARGO_TARGET_DIR=/dev/shm/ct-sv6304 TMPDIR=/dev/shm`; the tree was restored
+  byte-clean (md5 + empty `git status --porcelain`) after each mutation.
+  - `cargo check --release --tests` at HEAD -> rc=0
+  - baseline `cargo test --release --no-fail-fast -- --test-threads=1` -> rc=0,
+    0 FAILED across all 7 binaries (4234 + 60 + 8 + 22 + 31 + 1 + 2 passed)
+  - `go build ./...` -> rc=0; `go test ./...` -> rc=0, 0 FAIL, 59 ok
+    (includes `pkg/refactoraudit`, which the +9-line growth of
+    `flow_cache_hit.rs` could otherwise trip)
+  - DEADNESS (behavioural, not grep): drop the
+    `#[cfg_attr(not(test), allow(dead_code))]` from
+    `enqueue_sampled_mirror_clone_to_live` and `cargo build --release` ->
+    "warning: function `enqueue_sampled_mirror_clone_to_live` is never used".
+    The issue's premise holds; the wrapper has no production caller.
+  - FAIL-ON-REVERT (live call site only — `flow_cache_hit.rs` restored to its
+    exact pre-#6114 form from `1810cb7e7^`, `resolver.rs` untouched; #6114
+    LANDED in `1810cb7e7`, so that commit already carries the sample-first
+    `sample_then_admit_mirror_clone` call and it is its PARENT that holds the
+    old `admit_mirror_clone_to_live` form — an earlier revision of this entry
+    named the commit itself):
+    `cargo check --release --tests` -> rc=0 (compiles; not a build break, 0
+    `^error[` lines), then `cargo test` -> rc=101 with
+    `live_flow_cache_callsite_nonsampled_does_not_reserve_full_queue_6304`
+    FAILED on `assertion left == right failed: #6304: a NON-sampled packet on
+    the LIVE flow-cache path must not reserve the full clone queue ... left: 1
+    right: 0`. `left: 1` also proves the fixture genuinely reaches
+    `admit_mirror_clone_to_live` on a FULL cross-worker target (a mis-wired
+    target would have recorded NoBinding, not QueueFullCrossWorker).
+  - ISOLATION CONTROL (the load-bearing cell) — AS MEASURED IN ROUND 1, when
+    this file held ONE test: under that SAME revert, run with `--no-fail-fast`
+    over every binary -> exactly ONE failure tree-wide, the new test.
+    `flow_cache_nonsampled_does_not_reserve_full_queue_6114` and
+    `sampled_live_mirror_queue_full_advances_sampler_for_selected_6114` both
+    stayed `ok`. The pre-existing suite could not catch this mutation.
+    SUPERSEDED COUNT: with the round-2 companions present the same revert reds
+    TWO tests, per the matrix below — the "exactly one" is a round-1 artifact of
+    there being only one test, not a claim about this head.
+  - RE-EXPRESSION CONTROL: hand-inline the shared helper at the live call site
+    (same ordering, same deferred counter commit, no
+    `sample_then_admit_mirror_clone` call) -> rc=0, 0 FAILED. The test binds the
+    invariant, not the helper call.
+  - SWEEP CONTROL: flip `enqueue_sampled_mirror_clone`'s cross-worker arm
+    (`mirror/fast_path.rs`) to admit-before-sample -> rc=101,
+    `cross_worker_nonsampled_does_not_reserve_full_queue_5167` and
+    `cross_worker_sampled_reports_queue_full_5167` FAILED on assertions. The
+    other live copy of the ordering is already bound; there is no second
+    unbound site.
+  Round-2 mutation matrix (each `cargo check --release --tests` rc=0 first, so
+  every red is an assertion; each row is a full `--no-fail-fast` run over all 7
+  binaries, and the listed reds are the COMPLETE tree-wide failure set):
+  | mutation at the live call site | nonsampled | selected+full | selected+admitted | #6114 |
+  |---|---|---|---|---|
+  | A pre-#6114 revert (`1810cb7e7`) | RED | RED | green | GREEN |
+  | B commit counter on NotSampled/Sampled(Ok), not Sampled(Err) | green | RED | green | GREEN |
+  | C `Sampled(Ok(_)) => None` | green | green | RED | GREEN |
+  | D capture `mirror_frame` AFTER the rewrite (pure code motion) | green | green | RED | GREEN |
+  Row D is round-3 and was GREEN in every column until the fixture was fixed —
+  see the aliasing note below.
+  Coverage honesty, so a later reader does not mistake this for redundancy and
+  delete a test: the SALVAGED non-sampled test is never the SOLE detector in any
+  row — row A also reds `selected_full`, and rows B/C/D leave it green. It is
+  still not redundant: it asserts a property none of the others do, that a
+  DECLINED packet produces NO shared-CAS side effect at all, which is the actual
+  #5167/#6114 invariant. The others all assert what a SELECTED packet must do.
+  Q5b is the load-bearing row: it escapes BOTH the salvaged test and the gate's
+  prescribed one, and would have shipped a silent total loss of port mirroring
+  on this path. Assertions seen: "a NON-sampled packet ... must not reserve the
+  full clone queue" left 1 right 0; "the SELECTED packet advances the sampler
+  before the full-queue admit fails" left 0 right 1; "a SELECTED packet whose
+  cross-worker target has room must have its clone enqueued" left 0 right 1.
+  The #6114 isolation control held GREEN in every row.
+  Pre-existing failure, attributed not dismissed: one full-suite run at machine
+  load ~35 reddened
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  ("readers must have validated at least one snapshot (test not vacuous)",
+  `shared_cos_lease_tests.rs:2496`) — a CPU-starvation liveness assertion, from
+  the SAME unrebuilt binary that had already passed it three times. Attributed
+  at like-for-like scope (full suite, alternating arms) against a detached
+  `origin/master@86927d23c` worktree: 4/4 clean on each arm at load 17-26; under
+  32 synthetic spinners (load 42-50) it fails on MASTER with the identical
+  assertion and line, and master's second loaded run failed instead on
+  `afxdp::wg::engine::engine_internal_tests::install_session_serializes_with_reconcile_removal`
+  ("reconcile loop must have completed at least one full add/remove cycle") —
+  the known parallel-unsafe WG engine family. Same class, both reproduce on
+  master, neither is reachable from this diff (two .md files over a test-only
+  change in `poll_descriptor/`).
+  Round 3 (gate item 1) — an assertion that was true for free. `clone.bytes ==
+  frame` ("the clone carries the full L2 frame verbatim") could not fail as
+  originally written. At the live site the clone is captured BEFORE the in-place
+  rewrite, and in production `packet_frame` ALIASES the UMEM
+  (`poll_descriptor/mod.rs`: `unsafe { &*area }.slice(desc.addr, desc.len)`),
+  which `apply_rewrite_descriptor` then mutates — so the capture-before-rewrite
+  ordering is load-bearing. The fixture had passed the heap `frame` as
+  `raw_frame` while the UMEM copy lived at offset 4096: two different objects,
+  so the assertion held either way. Measured, not argued — mutation D (move the
+  `mirror_frame` capture inside the `if let Some(rewrite_result)` block; pure
+  code motion) compiled rc=0 and the FULL serial suite was rc=0 with zero
+  failures. In production that ships a TTL-63, checksum-adjusted copy to the
+  analyzer port instead of the ingress copy, silently and forever.
+  Fixed by giving all three fixtures production's aliasing: `raw_frame` is now
+  `area.slice(frame_offset, frame.len())`, a borrow INTO the UMEM, while `frame`
+  stays pristine as the comparison value. Under mutation D the same assertion
+  now reds with the rewrite visible in the bytes — index 22 (TTL) 63 vs 64,
+  index 24 (IPv4 checksum) 1 vs 0.
+  Residual, disclosed not closed: the tests drive `stage_flow_cache_hit`
+  directly, so `poll_descriptor/mod.rs:321` — the wiring of the stage into the
+  per-descriptor poll loop — stays unbound one level up. That is outside #6304's
+  claim, which is the mirror call site INSIDE the stage. Concretely, swapping
+  `&mut binding.mirror_sample_counter` (`mod.rs:326`) for a fresh local would
+  make every flow-cache-hit packet re-sample from 0, so `rate=N` would mirror
+  EVERY packet on this path — an N-fold clone flood — and nothing in the tree
+  would red. The SELECTED-arm residual that stood after round 1 is CLOSED.
+  Fixture note (SUPERSEDED — the fold round below sets `pkt_len: frame.len()`):
+  the claim that `(frame.len() - 14)` is "the verbatim convention of every
+  sibling fixture in this module tree" was WRONG; the tree is MIXED.
+  `frame/prop_tests/strategies.rs:337` uses the full `frame.len()` and
+  `frame/tests_parse_forward_pbr.rs:105` uses `raw_payload.len()`, while
+  `cookie_reply_tests.rs:89`, `reject_reply_tests.rs:56` and
+  `tests_native_gre_ecn.rs` do strip 14. The shim is the authority and stamps
+  the FULL wire length (`packet_len = data_end - data`,
+  `userspace-xdp/src/lib.rs:566`; the reinject path agrees at
+  `coordinator/inject.rs:73`), so the stripped form under-reports every byte
+  counter `pkt_len` feeds — filter/policy/zone counters and the session byte
+  accounting. Immaterial to the mirror admission decision either way, but
+  there is no reason for this module's fixture to carry the wrong one.
+
+## 2026-08-12 — #6304 fold r1: three surviving mutations, and one of them is not observable at all
+
+- **Timestamp**: 2026-08-12 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded the Codex MERGE-NEEDS-MAJOR (PR comment 5275830598). The
+  diff is 9 production lines and ~900 test lines, so the GUARD is the
+  deliverable and a surviving mutation is a blocking defect, not a nit. Three
+  survived; all three are closed, but the first is closed differently than the
+  brief assumed and that difference is the important part of this entry.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+  (rewritten), `userspace-dp/src/afxdp/mirror/mod_tests.rs` (+registration
+  canary), `_Log.md`. NO production file changed — `flow_cache_hit.rs` is
+  byte-identical to the pre-fold head.
+
+  1. NON-SAMPLED FIXTURE WAS AT CAP, so its "no shared-CAS side effect"
+     assertion passed for the wrong reason: `try_acquire_pending_tx_admission`
+     (`binding_state/tx_inbox.rs:157-165`) returns `Err` from its RELAXED
+     `admitted >= admission_cap` load BEFORE reaching the
+     `compare_exchange_weak(AcqRel)`, so at cap no CAS is reachable no matter
+     what the call site does. Fixture now has ROOM, and asserts the target's
+     queue is untouched and `mirrored_packets == 0`.
+
+     But giving it room does NOT make the named mutation red, and this was
+     MEASURED rather than argued. Inlining `admit_mirror_clone_to_live` above
+     the sampler and discarding the reservation when the sampler declines is
+     FUNCTIONALLY INERT: the reservation is taken with an AcqRel CAS and handed
+     straight back by `PendingTxAdmission::drop`, so no counter, no queue, no
+     frame, and not even the sampler counter differs. Applied to the tree, that
+     mutation compiles and leaves every behavioural test in the module green —
+     both at cap and with room. #6114 was a shared-cacheline fix, not a
+     correctness fix, so there is no black-box observation that separates the
+     two orderings at this call site.
+
+     **(SUPERSEDED by fold r2 below — the last two sentences of this paragraph
+     are FALSE as written.** The measurement stands: the mutation leaves every
+     single-threaded test green. The CONCLUSION drawn from it does not. The
+     ordering IS observable to a concurrent producer, because the transient
+     reservation elevates the target's `pending_tx_admitted` while it is held.
+     "Nothing differs" was established by walking one invocation to completion,
+     and a state created and destroyed inside a call is invisible to that call
+     by construction. See fold r2.)
+
+     Closed with what CAN be pinned: a source canary asserting the call site
+     reaches the queue through `sample_then_admit_mirror_clone` (the single
+     home of the ordering, itself covered by the #6114 fail-on-revert tests)
+     and never calls `admit_mirror_clone_to_live` directly. Stated in the test
+     doc as a source canary with its limits, not dressed up as a runtime proof.
+
+  2. LIVE WIRING WAS ONLY PARTLY BOUND. Every fixture collapsed logical and
+     physical onto 7 and 22 with no VLAN or interface maps, so two live
+     call-site regressions stayed green. The topology is now distinct
+     throughout: wire VLAN 80 on physical ifindex 6 resolves to logical unit
+     20080 (which is where the mirror config hangs, deliberately NOT duplicated
+     under the physical ifindex — `resolve_mirror_config`'s `.or_else` fallback
+     would otherwise rescue the mutation), and mirror output unit 200 resolves
+     through `forwarding.egress[200].bind_ifindex` to physical XSK port 22
+     (which is what `MirrorTargetMap` is keyed by).
+
+     The ingress frame carries a REAL 802.1Q tag with `l3_offset = 18`. The
+     shim only ever reports a non-zero `ingress_vlan_id` together with
+     `ingress_vlan_present` (`parse_l2`, `userspace-xdp/src/lib.rs:1203-1215`),
+     and the whole dataplane then reads L3 at 18 — a tagged VID over an
+     untagged frame is a meta/frame pair the wire format cannot produce, so it
+     would have been a fixture that binds nothing while looking real.
+
+  3. REWRITE-FAILURE ROLLBACK WAS UNOBSERVED. Sampling and admission run before
+     the rewrite; the sampler commit and clone delivery are deferred until it
+     succeeds. Every prior test required a SUCCESSFUL rewrite, so hoisting the
+     commit above the check passed all of them. New test drives a cache hit
+     where BOTH in-place rewriters decline and asserts the counter stays 0 and
+     the packet falls back to the `PendingForwardRequest` path.
+
+     The decline is an IPv4 IHL of 15 (60 bytes) over a 40-byte L3 payload —
+     the one gate BOTH rewriters share and both apply BEFORE their first UMEM
+     write (`validate_rewrite_descriptor_ipv4` / `validate_generic_rewrite_v4`),
+     so the frame is pristine for the fallback per the #4965/#5466
+     preflight-then-commit contract. A DMA-race port mismatch does NOT work
+     here and the first attempt to use one was wrong: the generic path REPAIRS
+     ports (`restore_l4_tuple_from_meta` / `enforce_expected_ports`) instead of
+     declining, so only the descriptor path would have bailed.
+
+  4. TEST REGISTRATION IS NOW GUARDED, from OUTSIDE the module it guards.
+     Deleting the nine-line `#[cfg(test)] #[path = ...] mod` declaration
+     silently unregisters all of these tests with no build error; a canary
+     inside the module cannot fire because it disappears with it. It lives in
+     `mirror/mod_tests.rs`, registered independently from `mirror/mod.rs:87`.
+
+     **(CORRECTED by fold r2: the declaration is THREE lines, not nine — the
+     comment above it is not part of it. And this round's canary caught only
+     DELETION: rewriting the predicate to `#[cfg(any())]` unregisters the module
+     just as completely and passed. Both fixed below.)**
+
+  MUTATION MATRIX (each applied to production, run, reverted, `git diff` then
+  verified clean; exit codes captured unpiped; every RED confirmed to be an
+  ASSERTION failure, with the only `^error` line being the harness's own
+  "test failed", never a compile break):
+
+  | mutation | result |
+  |---|---|
+  | M1 reserve-before-sample, inlined at the call site | delegation canary RED; 4 behavioural tests GREEN (the mutation is inert) |
+  | M2a `resolve_mirror_config(.., 0)` — drop the VLAN id | 3 RED (admitted-clone, full-queue, non-sampled) |
+  | M2b `config.output_ifindex` passed unresolved | 2 RED (admitted-clone, full-queue); non-sampled + rollback GREEN |
+  | M3 sampler commit hoisted above the rewrite check | 1 RED — exactly the new rollback test; 5 GREEN |
+  | M4 delete the `mod` registration | registration canary RED; the other 5 silently vanish from the run |
+
+  OVER-REACH GUARDS: M3 reds ONE test and leaves the three success-path tests
+  and both canaries green, which is what separates the rollback guard from a
+  restatement of the fix. M2b leaves the non-sampled and rollback tests green.
+  M1 leaves all four behavioural tests green — that is the measurement behind
+  item 1's conclusion, not a gap.
+
+  ALSO FIXED WHILE IN HERE (all four were verified at the source first, and all
+  four claims held): the "on another worker" comment was unfounded —
+  `MirrorTargetMap::insert` (`types/runtime.rs:590-601`) DISCARDS
+  `BindingIdentity.worker_id` and keys on (ifindex, queue_id), so the assertion
+  proves a resolved, full, live queue and now says so; the two `_Log.md`
+  provenance errors corrected in place above (the unqualified "Nothing was
+  rewritten", and `1810cb7e7` -> `1810cb7e7^`); and the `pkt_len` fixture drift
+  corrected to the shim's full wire length.
+
+  STRUCTURE: the three tests each carried their own ~200-line copy of the
+  `WorkerContext` wiring, which is how the mirror maps drifted away from the
+  ifindexes the call site actually resolves. They now share one
+  `LiveCallSiteFixture` + `run_stage`, so adding the fourth test cost ~60 lines
+  instead of ~210 and the topology is defined exactly once.
+
+## 2026-08-13 — #6304 fold r2: the ordering IS observable, and my r1 conclusion was a scope error
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a second Codex MERGE-NEEDS-MAJOR. Four findings plus three
+  claim corrections. Every one was re-measured here rather than taken on trust,
+  because that leg ran without Cargo and without reading the two doc files in
+  the diff — its outcomes were source-derived. All four reproduced.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `userspace-dp/src/afxdp/mirror/mod_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. NO production file changed —
+  `flow_cache_hit.rs` is byte-identical to the pre-fold head (verified with
+  `git diff` after every mutation).
+
+  F1. **THE ORDERING IS OBSERVABLE, AND r1's "functionally inert" was wrong.**
+     Round 1 concluded that reserve-before-sample changes nothing any test can
+     see, added a source canary instead, and recorded the conclusion in the test
+     doc, in `docs/userspace-dataplane-gaps.md`, and in the r1 entry above. The
+     measurement behind it was sound and still reproduces. The inference was a
+     SCOPE error: "no state differs" was established by walking ONE invocation
+     to completion, and a state created and destroyed inside a call is invisible
+     to that call by construction — and visible to anyone racing it. While the
+     transient reservation is held, the target's `pending_tx_admitted` is one
+     higher, so a producer on another worker sees the queue full and its request
+     is DROPPED. `mirror/mod_tests.rs::
+     live_mirror_admission_reserves_slot_against_interleaving_producer` already
+     demonstrates that exclusion. Reserve-first can lose a second producer's
+     clone that sample-first would have admitted — a lost mirror clone, not just
+     bus traffic.
+
+     Both false sentences are corrected in place (test doc, gaps doc, and the r1
+     entry above carries a SUPERSEDED note rather than being rewritten). The
+     `:886` claim that the #6114 tests catch a reserve-before-sample introduced
+     inside the shared helper is corrected too: they catch the HISTORICAL
+     early-return form, not a helper rewritten to reserve first and then
+     suppress on a sampler decline.
+
+     Then the choice Codex put: bind the concurrent case, or label the gap. I
+     LABELLED IT, and bound what is deterministically bindable either side of
+     it. The window is a pair of atomic RMWs entirely inside
+     `stage_flow_cache_hit` with no production hook to synchronise against; a
+     racing-producer test would fail only probabilistically, which is a flake,
+     not a binding. Adding one would have looked like coverage and been worth
+     less than saying so. What IS new and deterministic:
+     `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304`
+     drives the mirror target at a soft cap of exactly ONE slot and uses an
+     interleaving producer as the instrument — after a non-sampled packet and
+     after a declined rewrite the slot must be free; after an ADMITTED clone it
+     must be taken (that cell is the positive control that the cap binds at all,
+     without which the two `is_ok()` cells would be vacuous). It reds on any
+     reservation this call site takes and fails to hand back.
+
+  F2. **THE ROLLBACK FIXTURE WAS NOT PARSER-PRODUCIBLE.** It declared IHL 15
+     (60 bytes) with `total_len` 40 in a 58-byte frame while the metadata put L4
+     at 38; a shim deriving L4 from that header would put it at 78, past the end
+     of the frame. Same domain-parity class the VLAN fixture was caught on in
+     r1 — caught in one place, reintroduced in another.
+
+     Codex's prescribed remedy (rebuild it so metadata and bytes agree) turns
+     out to be IMPOSSIBLE for IPv4, and establishing that is the substance of
+     this item. `parse_ipv4` (`userspace-xdp/src/lib.rs:1236`) does
+     `read_bytes(data, data_end, l3_offset, ihl)?` before deriving `l4_offset`,
+     so a shim-delivered IPv4 packet always satisfies `frame.len() - l3 >= ihl`;
+     `ipv4_declared_l3_end` (`frame/inspect.rs:1156-1160`) then clamps the
+     trimmed payload UP to at least `ihl`. Together those make
+     `l3_payload.len() < ihl` — the only bail gate BOTH rewriters share and
+     apply pre-commit — unreachable for any self-consistent frame the shim can
+     deliver. The other declines are one-sided: the generic path REPAIRS a port
+     mismatch, and it handles non-first fragments the descriptor path bails on.
+
+     So the fixture is relabelled as what it actually is: a frame whose bytes
+     changed AFTER the shim described them (NIC DMA into a recycled UMEM frame)
+     — the hazard `expected_ports` and the #5466/#4965 preflight-then-commit
+     contract exist for, and under which meta/frame disagreement is the DEFINING
+     property, not a defect. `dma_raced_short_ihl_frame` builds it by disturbing
+     exactly one byte of the pristine frame, and the test passes the PRISTINE
+     frame's metadata. The rollback branch is thereby documented as
+     defense-in-depth against a post-parse frame change rather than a hot-path
+     case — which is itself the reason nothing else in the suite covered it.
+
+     The reachability claim is MEASURED, not argued: a new over-reach guard,
+     `live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304`,
+     feeds the SELF-CONSISTENT IHL-15 packet (40 bytes of RFC 791 NOP options,
+     an honest 80-byte datagram, metadata derived from it) and the in-place
+     rewrite SUCCEEDS. The frame builder is now parameterised by option words
+     with `total_len`, frame length and metadata all derived, and `test_meta`
+     computes `l4_offset` from the frame's own IHL instead of hardcoding 38 —
+     the hardcode is what let the metadata detach from the fixture in the first
+     place.
+
+  F3. **THE REGISTRATION CANARY CAUGHT DELETION BUT NOT DISABLING.** Rewriting
+     `#[cfg(test)]` to `#[cfg(any())]` removes the module from every build while
+     leaving both matched substrings in the file. MEASURED: under that edit the
+     r1 canary PASSED (rc=0) and all eight module guards silently stopped
+     compiling. The canary now matches the three-line block CONTIGUOUSLY,
+     `#[cfg(test)]` included, and reds on both edits. (It is still source text,
+     so it pins the declaration's FORM — noted in its doc.)
+
+  F4. **AN UNRELATED PRODUCTION LINE WAS UNBOUND.** `run_stage` built
+     `DebugPollCounters` and dropped it unread, so `telemetry.dbg.forward += 1`
+     / `.tx += 1` could be deleted from EITHER staging arm with the whole module
+     green — an undercounted forward-debug metric on every established-flow
+     cache hit. In scope: the module's remit is this staging function's
+     observable effects. `StageRun` now carries both counters and
+     `live_flow_cache_callsite_accounts_debug_forward_and_tx_6304` asserts them
+     on the in-place arm AND the fallback arm.
+
+  ALSO CORRECTED (claims, no behaviour): the non-sampled test's doc said a call
+  site letting an unsampled packet through to admission "ENQUEUES a real clone"
+  — false, it can drop the admission after sampling declines; it now names the
+  mutation it actually distinguishes and points at the canary for the other.
+  The r1 entry's "nine-line `mod` declaration" is three lines. And the frame
+  fixture was called "well-formed" while both checksum fields are zero: nothing
+  on this path verifies them (both rewriters apply incremental deltas only), so
+  no decision under test changes, but the doc now says that instead of claiming
+  a wire-valid packet.
+
+  MUTATION MATRIX (each applied to production, run, reverted, `git diff` verified
+  clean afterwards; exit codes unpiped; every RED confirmed to be an ASSERTION,
+  never a compile break — the only `^error` line in any run is cargo's own
+  "test failed" summary):
+
+  | mutation | result |
+  |---|---|
+  | M1 `#[cfg(test)]` -> `#[cfg(any())]` | registration canary RED; the 8 module guards VANISH from the run. With the r1 canary restored: **PASSES, rc=0** — the finding, reproduced |
+  | M1b delete the 3-line declaration | registration canary RED |
+  | M2 delete `dbg.forward += 1` (in-place arm) | debug-counter test RED (`left: 0, right: 1`); 8 GREEN |
+  | M3 delete `dbg.forward += 1` (fallback arm) | debug-counter test RED; 8 GREEN |
+  | M4 leak the reservation on the declined-rewrite path | stranding test RED (rollback cell); 8 GREEN — the pre-existing `queued.is_empty()` did NOT catch it |
+  | M5 reserve-first + leak on decline | delegation canary RED + stranding test RED (non-sampled cell); 7 GREEN |
+  | R1 reserve-first + correct drop (Codex's F1 mutation) | delegation canary RED only; stranding test GREEN — **this is the labelled gap, measured** |
+  | R2 defer the sampler commit on `Sampled(Err)` | full-queue test RED; 8 GREEN |
+  | R3 `Sampled(Ok(_)) => None` | admitted-clone RED + stranding-test control RED; 7 GREEN |
+  | R4 hoist the sampler commit above the rewrite check | rollback test RED (`left: 1, right: 0`); 8 GREEN — **the rollback binding SURVIVES the F2 fixture rebuild** |
+  | R5 `resolve_mirror_config(.., 0)` — drop the VLAN id | 5 RED; wiring binding intact |
+
+  OVER-REACH GUARDS: R1 reds exactly one test and leaves the eight others green
+  — that is the gap being labelled rather than a claim of coverage. R2/R3/R4
+  each red their own cell and leave the IP-options guard green, which is what
+  separates it from a restatement of the fix. M4 reds ONLY the new stranding
+  test, proving the older rollback assertions were blind to a leaked admission.
+
+- **Validation**: full `cargo test --release` rc=0 both parallel and
+  `--test-threads=1`: 4283 passed / 0 failed / 2 ignored in the bin target, plus
+  60 + 8 + 22 + 31 + 1 + 2 in the integration targets. `CARGO_TARGET_DIR` and
+  `TMPDIR` private to this lane; no crate-wide `cargo fmt`.
+
+## 2026-08-13 — #6304 fold r3: an impossibility claim I could have disproved, and an adjacent counter with only a no-op arm
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a hostile MERGE-NEEDS-MINOR. The verdict upheld both r2
+  judgements — the F2 reachability claim survived six attacks and the
+  reserve-first labelling stayed defensible — so the round is two real defects
+  and two clause-level corrections, not a rework.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. Again NO production file
+  changed; `flow_cache_hit.rs` and `worker/tx_counters.rs` are byte-identical to
+  the pre-fold head (restored from a saved copy and re-diffed after every
+  mutation).
+
+  M1. **THE REPLACEMENT CLAIM WAS ALSO OVER-BROAD, ONE LEVEL WEAKER.** r2
+     corrected an over-broad "no test could catch this" and wrote
+     `docs/userspace-dataplane-gaps.md`: "No test observes that transient
+     window, and none deterministically can." That absolute is FALSE, and the
+     counter-example is cheap: a `#[cfg(test)]`-gated cumulative acquisition
+     counter on `BindingLiveState`, bumped at the top of
+     `try_acquire_pending_tx_admission` (`binding_state/tx_inbox.rs`), reads ONE
+     attempt under reserve-first and ZERO under sample-first for a non-sampled
+     packet — single-threaded, no race.
+
+     The error is a conflation, and naming it is the point: OBSERVING THE WINDOW
+     does require catching a pair of atomic RMWs open, and that part is
+     genuinely non-deterministic. DETECTING THE MUTATION is strictly weaker and
+     is deterministically available, because a counter observes the ATTEMPT
+     rather than the window. The doc now states both halves separately and NAMES
+     the instrumentation so a later round takes it instead of rediscovering it.
+     The test-file copy was already correctly scoped ("none *here* can") and
+     gets the same pointer so the two agree.
+
+     NOT IMPLEMENTED this round, as a cost judgement stated as one:
+     `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+     exists to fix, so a `#[cfg(test)]` field means the layout under test is not
+     the layout that ships. That is a reason to defer, not a reason to call it
+     impossible — which is exactly the distinction r2 lost.
+
+  M2. **AN ADJACENT PRODUCTION LINE, DELETABLE WITH THE WHOLE CRATE GREEN.**
+     `flow_cache_hit.rs:499` — `tx_counters.record_in_place_l2_rewrite(
+     rewrite_result.l2_rewrite)` — deletes with 4283 passed / 0 failed / 2
+     ignored and every integration target green. Measured here, not inferred;
+     the reported scope was "the 9 #6304 guards", and the true scope is the
+     whole crate.
+
+     The mechanism is worth recording because it generalises. The call RAN on
+     every fixture in the module and was observable to none of them: every frame
+     egressed on the VLAN it arrived on, so `eth_len == current_l3 == 18`, the
+     classification was `InPlaceL2Rewrite::SameLength`, and THAT arm of
+     `record_in_place_l2_rewrite` is an empty block. Nothing else in the tree
+     asserted `pending_in_place_vlan_push_desc_packets` or `_pop_desc_packets`
+     either. **A counter whose only reachable arm is a no-op looks covered and
+     binds nothing** — coverage of the call site is not coverage of the call.
+
+     Bound by `live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304`:
+     `untagged_egress_entry()` hands the same VLAN-80-tagged frame an untagged
+     egress, so `classify_in_place_l2_rewrite(18 -> 14)` returns
+     `VlanPopDescriptor` — the tag is popped by sliding the TX descriptor 4
+     bytes forward inside the same UMEM frame. The harness gained
+     `run_stage_with_entry`, which varies the CACHED DESCRIPTOR rather than the
+     packet; `run_stage_with_meta` is now a thin wrapper over it, so no existing
+     cell changed shape.
+
+     | mutation | result |
+     |---|---|
+     | delete `record_in_place_l2_rewrite(..)` at `flow_cache_hit.rs:499` | new cell RED (`left: 0, right: 1`), 9 pre-existing #6304 guards GREEN |
+     | `VlanPopDescriptor` arm bumps the PUSH counter (`tx_counters.rs:48`) | new cell RED, same 9 GREEN — the cell binds the CLASSIFICATION, not "some counter moved" |
+
+     Both reds are assertion failures, never compile breaks. The positive
+     control is load-bearing in its own right: the cell asserts the transmitted
+     extent is exactly `frame.len() - 4`, so `VlanPopDescriptor` is the honest
+     label for what happened rather than a relabelled same-length rewrite.
+
+  N1. **The F2 argument COMPOSES; it does not corroborate.** Both copies said
+     the shim's `read_bytes(.., ihl)?` guarantees `frame.len() - l3 >= ihl` AND
+     that `ipv4_declared_l3_end` clamps the payload up to `ihl`, as if two
+     independent facts. They are sequential, and only the first is load-bearing:
+     on exactly the input the shim leg excludes (`frame.len() < l3 + ihl`)
+     `ipv4_declared_l3_end` returns `None` rather than clamping
+     (`frame/inspect.rs`), and `trim_l3_payload` falls through to a
+     `meta.pkt_len`-derived length with no `ihl` relation at all
+     (`frame/mod.rs`). The clamp bites only where the shim leg already holds.
+     Both copies now say so, so a future reader cannot lean on the clamp alone.
+
+  N2. **The delegation canary's limits list claimed enumeration it did not
+     have.** The negative substring check `!src.contains(
+     "admit_mirror_clone_to_live(")` is defeated by renaming at the import —
+     `use ...::admit_mirror_clone_to_live as admit;` then `admit(...)`. That
+     needs a deliberate alias rather than an accidental edit, so it bounds what
+     the canary PROVES rather than naming a regression it should catch; it is
+     added to the enumeration at both sites, with the note that only the runtime
+     instrumentation from M1 can close it.
+
+- **Validation**: full `cargo test --release` rc=0 both parallel and
+  `--test-threads=1`: 4284 passed / 0 failed / 2 ignored in the bin target
+  (4283 + the new cell), plus 60 + 8 + 22 + 31 + 1 + 2 in the integration
+  targets. The pre-existing single-threaded flake in
+  `install_session_serializes_with_reconcile_removal` (issue #6989, unrelated to
+  this PR) did not fire this round. `CARGO_TARGET_DIR` and `TMPDIR` private to
+  this lane; no crate-wide `cargo fmt` — the one touched file was checked with
+  `rustfmt --check` alone and carries the same 9 pre-existing deviations as its
+  parent commit, none added.
+
+## 2026-08-13 — #6304 fold r4: the layout objection was true of a FIELD and false of the INSTRUMENT, measured both ways; and a sweep of every `record_*` call found sites that bind nothing
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a Codex MERGE-NEEDS-MAJOR whose blocking finding contradicted
+  a judgement r3 made and the parent ratified — that no layout-neutral instrument
+  for the #6114 ordering was available. Codex was right, and the shape of its being
+  right is the point: r3's rejection was sound about the specific form it evaluated
+  and unsound as a generalisation. Settled here with `size_of` / `align_of` /
+  `offset_of` numbers rather than with a better argument.
+- **File(s)**: `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/policy.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`.
+  `poll_descriptor/flow_cache_hit.rs`, `mirror/resolver.rs` and `mirror/mod.rs` are
+  byte-identical to the pre-fold head (sha256-compared, not eyeballed).
+
+  PROVENANCE, because it bears on how much of this was inherited. The first lane on
+  this round died on an expired login with everything uncommitted, in a worktree the
+  hand-off brief did not name. The work was recovered by patch from
+  `/var/tmp/f6882r2` — MINUS a leftover mutation that lane had left applied to
+  production code (`record_zone_traffic`'s ingress/egress zone arguments swapped in
+  `flow_cache_hit.rs`), which its own draft log described as byte-identical to the
+  head. It was not. A dirty worktree mid-matrix is the harness, not authorship.
+  Every measurement below was then re-run in this lane against a fresh worktree
+  under a fail-closed harness — and that re-run mattered: it CONTRADICTED two rows
+  of the inherited table (F3).
+
+  Harness: `set -euo pipefail`, an `APPLIED <id>` marker plus an independent
+  `git diff --quiet` check before any result is believed, and a
+  `git diff | sha256sum` compared against the pristine value before and after every
+  cell (start and end both `e3b0c442…`, the empty-diff hash). It also had a defect
+  worth recording: `failed=$(grep … FAILED)` under `set -e` + `pipefail` KILLED the
+  matrix on the first GREEN cell, because grep exits 1 when it matches nothing. The
+  failure mode was loud (the matrix stopped) rather than silent (a GREEN recorded as
+  a result), but a `|| true` now guards it, and the guard is load-bearing: the first
+  GREEN cell was a real finding.
+
+  Two documented pre-existing load failures are excluded from the matrix runs and
+  from the counts below — `afxdp::wg::engine::engine_internal_tests::*` (three cells
+  that WEDGE indefinitely under load; four other agents' test binaries were wedged
+  on the same box, up to 2h57m) and the CoS-lease seqlock cell
+  `v8_epoch_seqlock_snapshot_never_tears_tag_grace`. Both are #6657, both were
+  previously attributed against a detached `origin/master` worktree where they
+  reproduce, and neither is reachable from any mutated line. Filtered baseline:
+  4263 passed / 0 failed / 2 ignored / 25 filtered out, plus 60 + 8 + 22 + 31 + 1 + 2
+  green in the integration binaries.
+
+  F1. **THE LAYOUT OBJECTION WAS ABOUT A FIELD, AND IT WAS APPLIED TO THE
+     INSTRUMENT.** r3 declined a `#[cfg(test)]` acquisition counter because
+     `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+     exists to fix, so a test-only FIELD puts a different layout under test than the
+     one that ships. That is a reason to reject the field, not the measurement. A
+     `#[cfg(test)]` THREAD-LOCAL lives in its own storage, and the tree already
+     carried the pattern — #6294's `OUTER_ROUTE_RESOLVE_COUNT` in
+     `afxdp/frame/wg.rs`, thread-local rather than a process-global atomic for
+     exactly the parallel-`cargo test` determinism reason.
+
+     Neutrality MEASURED. `BindingLiveState`, rustc 1.96.0, x86_64:
+
+     | instrument | size | align | off(`pending_tx_admitted`) | off(`delta_loss_pending`) |
+     |---|---|---|---|---|
+     | none — production build | 2304 | 64 | 2152 | 2280 |
+     | `cfg(test)` THREAD-LOCAL (taken) | 2304 | 64 | 2152 | 2280 |
+     | `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | not measured |
+     | `cfg(test)` FIELD declared last | 2304 | 64 | 2152 | **2288** |
+
+     Four `const _: [(); N]` asserts beside the struct pin all four numbers and are
+     deliberately NOT `cfg`-gated, so the same literals are evaluated in the
+     production build AND the test build — an instrument that moved ANY OF THOSE
+     FOUR VALUES could satisfy at most one. That is the cross-configuration
+     comparison a `#[test]` cannot make alone;
+     `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
+     re-asserts the same numbers at runtime and carries the reasoning.
+
+     SCOPE of that guard, corrected in round 3 (Codex): four pinned values are a
+     TRIPWIRE, not a layout fingerprint. Size, alignment and two offsets do not
+     determine where the other ~90 fields sit, so a perturbation that moves only
+     UNPINNED fields satisfies all four literals in both configurations. The guard
+     is aimed at one hazard — a `cfg(test)` member reaching this struct, in the two
+     shapes measured above — and is not a proof of layout EQUALITY between the two
+     configurations. It is also toolchain- and target-specific: `BindingLiveState`
+     is `repr(Rust)` and the crate pins neither `rust-version` nor a toolchain file,
+     so a compiler upgrade can trip these literals with nothing in the source having
+     moved. That direction is safe (a changed value is a compile ERROR reporting the
+     actual number, never a silent accept) but it is brittle, and the response to a
+     trip is to re-measure, not to widen. The un-gated `const _` also means the
+     runtime cell can never FAIL — the build breaks first — so it is a readable
+     mirror of the numbers, not an independent check. The original prescription here
+     (un-gated const asserts, after a size-only guard missed an offset change) was
+     mine; this correction narrows it to what it actually buys.
+
+     The counterfactuals also correct the objection rather than confirming it: a
+     `cfg(test)` FIELD does not change the struct's SIZE — it lands in existing tail
+     slack. It moves OFFSETS. A size-only guard would have called both field shapes
+     harmless, and `repr(Rust)` reorders, so even a field declared LAST moved a
+     neighbour declared before it.
+
+     `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+     asserts a declined packet makes ZERO calls into
+     `try_acquire_pending_tx_admission`, with a SELECTED packet at one and a SELECTED
+     packet against a FULL target also at one — the third cell is what makes the zero
+     mean "never asked" rather than "asked and was refused". The bump sits BEFORE the
+     cap load for the same reason. Measured, one mutation at a time, whole crate:
+
+     | mutation | result |
+     |---|---|
+     | reserve-first INSIDE `sample_then_admit_mirror_clone` (reserve, drop on decline) | 4262 passed / 1 failed — ONLY the attempt-count cell; the delegation canary stays GREEN |
+     | reserve-first OPEN-CODED at the call site, plain spelling | 4261 / 2 — attempt-count AND delegation canary |
+     | reserve-first through `use …::admit_mirror_clone_to_live as reserve_clone_slot;`, with a comment retaining the spelling the canary requires | 4262 / 1 — attempt-count only, canary GREEN |
+
+     The first row is the finding: that mutation was caught by NOTHING before this
+     round. The third confirms the rename escape r3 asserted about its own canary
+     without testing it.
+
+  F2. **CODEX'S NAMED LINE WAS ALREADY BOUND — REFUTED, RECORDED AS A NON-DEFECT.**
+     `record_mirror_clone_result` at `flow_cache_hit.rs:478` is not unbound. The leg
+     volunteered that test files were outside its read scope and asked for empirical
+     confirmation; severing the call reds FOUR cells, forcing its byte argument to 0
+     reds `…_selected_admitted_clone_reaches_target_6304`, and forcing its result to
+     `Enqueued` reds two more. Written down so the next round does not re-derive it.
+
+  F3. **THE SWEEP — AND IT CONTRADICTED THE INHERITED TABLE.** Every `record_*` call
+     in `stage_flow_cache_hit`, one single-line production edit at a time, whole
+     crate, at the pre-fix head:
+
+     | # | site | edit | result |
+     |---|---|---|---|
+     | S1 | `filter::record_filter_counter` TX/output side (#2573) | walk reduced to `.for_each(\|_counter\| {})` | **GREEN 4263/0 — UNBOUND** |
+     | S2 | `filter::record_filter_counter` INPUT side (#3777) | same | RED — `afxdp::tests_txn_flow_cache::txn_flow_cache_hit_replays_input_filter_then_count_3777` |
+     | S3 | `policy::record_policy_hit_counter` (#3073) | call replaced by `let _ = counter;` | RED — `…_recounts_the_established_policy_hit_6304` (added this round; GREEN before it) |
+     | S4 | `zone_counters::record_zone_traffic` (#3651) | call deleted | RED — `…_accounts_per_zone_traffic_6304` (added this round; GREEN before it) |
+     | S5 | `record_mirror_clone_result` (#6304) | call replaced by `let _ = (…);` | RED — 4 cells |
+     | S6 | `tx_counters.record_in_place_l2_rewrite` | call deleted | RED — `…_accounts_vlan_pop_l2_rewrite_6304` (added in r3) |
+
+     The inherited table reported S1 and S2 as bound. S2 is; **S1 is not**, and the
+     reason is sharper than "no fixture populates the list", though that is also true
+     of this module: the ONE crate-wide test that puts a real counter on the TX-side
+     cached `tx_selection` is
+     `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779`, and both of its
+     assertions on that counter are NEGATIVE — the seed packet charges it on the COLD
+     path (`== 1`), and the TTL=1 cache-hit packet must NOT charge it (`== 1` again).
+     Deleting the hit-path replay satisfies both. A test that looks like coverage for
+     #2573's replay is coverage for #3779's suppression, and only that.
+
+     `live_flow_cache_callsite_replays_every_filter_count_term_6304` closes it. TWO
+     tx-side counters, because #2573's guarantee is that ALL matched count terms
+     replay and not merely the last, so a single-counter assertion is satisfied by a
+     walk that stops after one. The input side is asserted at this call site too
+     rather than delegated to the txn-level test: #3777 exists precisely because the
+     TX side had been fixed and the input side had not, so the two demonstrably
+     regress independently.
+
+     Three shapes of the same class now, all invisible to a coverage report and all
+     visible to a one-line deletion: UNREACHABLE behind a false guard (the policy
+     counter), REACHED but landing in a no-op arm (the zone counter, and r3's
+     `record_in_place_l2_rewrite`), and REACHED but iterating an EMPTY collection so
+     the closure holding the call never runs (both filter replays).
+
+     Argument cells, same method, same head — the counters bind their ARGUMENTS and
+     not merely their occurrence:
+
+     | mutation | result |
+     |---|---|
+     | `record_zone_traffic` ingress/egress zone arguments SWAPPED | RED — `…_accounts_per_zone_traffic_6304` |
+     | `record_zone_traffic` byte argument -> `0u64` | RED — same cell |
+     | `record_policy_hit_counter` byte argument -> `0u64` | RED — `…_recounts_the_established_policy_hit_6304` |
+     | `record_mirror_clone_result` byte argument -> `0usize` | RED — `…_selected_admitted_clone_reaches_target_6304` |
+     | `record_mirror_clone_result` result forced to `Enqueued` | RED — 2 cells |
+
+     SCOPE, stated with a measurement rather than by assertion, and it turned up two
+     more. The swept set is the calls named `record_*`. `stage_flow_cache_hit` makes
+     two OTHER per-packet accounting calls that are not — `sessions.touch_if_stale(..)`
+     (#918 staleness) and `sessions.account_packet(..)` (#2501 byte/packet accounting,
+     #2749 TCP-flags/DSCP capture for the SESSION_CLOSE RT_FLOW record). Deleting
+     EITHER leaves the whole crate GREEN, 4264 passed / 0 failed on each, so both are
+     unbound at this call site. NOT closed in this round and not silently dropped
+     either: neither is a telemetry `record_*` call, and binding the session table's
+     per-packet accounting is its own piece of work. Recorded here and in
+     `docs/userspace-dataplane-gaps.md` so the next round starts from the measurement
+     instead of rediscovering it.
+
+  F4. **`enqueue_tx_owned` RETURNS `Ok(())` ON A DROP.** Documented at the definition
+     rather than changed: `push_redirect_inbox` implements the drop-newest contract,
+     so an overflowed request is discarded and the caller is told nothing. The doc
+     names `try_enqueue_tx_owned` and `try_reserve_mirror_tx_owned` as the
+     acceptance-reporting alternatives, and `enqueue_tx` — identical property, two
+     lines above — carries a one-line pointer so a reader arriving at either draws
+     the right conclusion.
+
+  Validation: full `cargo test --release`, UNFILTERED, GREEN at the delivered
+  head — 4289 passed / 0 failed / 2 ignored in the main binary (4284 at the
+  pre-fold head plus the five cells this round adds), and 60 + 8 + 22 + 31 + 1 + 2
+  in the integration binaries. The two #6657 families that the mutation matrix
+  excluded both PASSED in that unfiltered run, which is consistent with their
+  being load-triggered rather than deterministic.
+  Full `go test ./...` GREEN. `CARGO_TARGET_DIR` private to this lane; no crate-wide
+  `cargo fmt` — each touched file checked in place with
+  `rustfmt --edition 2024 --check` against its own parent content and carrying the
+  same deviation count (mod.rs 14, tests/tx_inbox.rs 0, tx_inbox.rs 1,
+  flow_cache_hit_tests.rs 9, policy.rs 102), none added.
+## 2026-08-05 — #6894 round 3: the log-gating item was PARTIAL, and the count that proved it was unreproducible
+
+- **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
+- **Action**: Correct four claims the Codex gate refuted; file the real residue
+  as #6903. Comment-only in Go — `git diff -U0 -- '*.go'` shows zero non-comment
+  changed lines.
+- **File(s)**: `pkg/dataplane/compiler_validate_4960.go`, `_Log.md`
+
+Codex returned MERGE-NEEDS-MINOR with no runtime findings. What it refuted:
+
+1. **"the pre-pass log duplication is suppressed via `isValidationPass(dp)`"**
+   is PARTIAL, not closed. The gate suppresses the sites it is wired into; a
+   large inventory inside the covered phases still logs unconditionally and
+   still emits twice — applications, the NAT/DNAT/static-NAT/NPTv6/NAT64
+   families, and flow timeouts. Measured on a composite config: 25 INFO/WARN
+   records, eleven distinct covered-phase records appearing twice. Reproduction:
+   make `failLaterPhaseConfig()` valid, set `UDPSessionTimeout = 30`, and one
+   `udp=30` record prints twice. Filed as **#6903**; the round-2 log entry now
+   says PARTIAL and the doc comment carries the scope limit plus the issue
+   pointer, so nobody reads it as "duplicates are impossible".
+
+2. **"measured 15 -> 22 lines"** was unbound. The fixture that produced those
+   numbers was never recorded, so the claim is unreproducible — the likely
+   `idProbeConfig()` candidate now emits 12. Deleted rather than re-measured: a
+   count assertion has to ship with the fixture that produces it, which is what
+   #6903 says to do if a count is wanted.
+
+3. **"validateFilterProtocols is the FIRST statement of Phase 10"** is
+   literally false — a local map init precedes it. Corrected to "first FALLIBLE
+   statement", which is the property the hoist actually depends on.
+
+4. **`dp.BumpFIBGeneration()`** sat outside both the phase table and the
+   exclusion prose while being able to return an error. Named in the exclusion
+   prose as out-of-scope-by-construction (the caller discards it under the
+   fire-and-forget contract, so it cannot produce a returned CompileConfig
+   error) so the next coverage audit does not have to rediscover it.
+
+Also documented, not changed: hoisting the filter row changes operator-visible
+diagnostic PRECEDENCE. A config carrying both an unknown screen-profile ref and
+`from protocol bogus-proto` now reports the filter error where it previously
+reported `compile zones: screen profile ... not found`. Both are hard errors
+aborting the same apply — nothing reaches the dataplane either way — so only the
+message changes. The comment says not to "fix" it by moving the row later,
+because the ordering is what keeps the mutation point clean.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
+`gofmt -l` clean; Go diff verified comment-only.
+
+## 2026-08-05 — #6894 round 2: the coverage count went stale again, in the fix for it
+
+- **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
+- **Action**: The round-1 fold closed four of five gate items — the table-contents
+  assertion exists (`TestValidationPhaseTableMatchesDocumentedCoverage_4960` pins
+  length AND name order), `validateFilterProtocols` is hoisted in and is
+  idempotent (reads `cfg` only), the pre-pass log duplication is suppressed via
+  `isValidationPass(dp)` **at the sites it is wired into — see the round-3 entry
+  above: that item is PARTIAL, not closed**, and the test fixture now uses
+  synthetic names
+  (`xpft4960a`/`xpft4960b`) behind a `skipIfCouldMutateAHost` root guard.
+  The fifth item came back: `compiler_validate_4960.go` still said **"Eleven of
+  the thirteen fallible post-zones phases"** while the table it introduces now
+  holds **twelve** — the filter-protocols hoist added a row and the header was
+  not updated. That is the third time this campaign a fold has grown a list and
+  left its count behind, and the second time on this exact class of comment.
+  Fixed by removing the count rather than correcting it. Prose now defers to the
+  table as the authority and says so explicitly, pointing at the test that makes
+  a silent row deletion impossible. A number in a comment is a coverage claim; a
+  pointer to an asserted table is not.
+  Also restated the exclusion accurately: it is `compilePortMirroring` entirely
+  plus all of `compileFirewallFilters` EXCEPT its cfg-pure prefix, not "two
+  phases" — the hoist made that sentence wrong in a second way that a numeral
+  swap would not have caught.
+  And separated the two kinds of binding, because the gate measured them and the
+  file did not distinguish them: the table test binds the SET (no row can vanish),
+  while behavioural fixtures bind that a row actually rejects pre-mutation, and
+  there are exactly two of those (`applications`, `nat`). The remaining rows are
+  set-bound only. That is the intended trade and is now written down instead of
+  being inferred.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md
+- **Validation**: comment-only — production diff filtered to non-comment lines is
+  empty. `go build ./...` rc=0; `go test ./pkg/dataplane/ -count=1` rc=0;
+  `gofmt -l` clean.
 ## 2026-08-06 — #5798 round 2: three things an association HIT was still inheriting
 
 - **Timestamp**: 2026-08-06 (fix/5798-nat64-frag-scope, PR #6835)
@@ -1662,6 +2757,32 @@
   against `origin/master` is Go and Markdown only; it does not reach
   `userspace-dp/`, `userspace-xdp/` or any compiled artifact.
 - **File(s)**: docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-08-21 — #6877 drive: inet-precedence loss-priority typo gate
+
+- **Timestamp**: 2026-08-21 (fix/6847-rust, PR #6877)
+- **Action**: First-pass hostile review of PR #6877 found one runtime hole and
+  fixed it. #6847 made the inet-precedence classifier's `loss-priority` LIVE
+  (`inet_precedence_lp_by_prec` feeds the egress rewrite), but
+  `validateClassOfServiceLossPriorityStrict` still covered only the dscp /
+  ieee-802.1 classifiers and the two rewrite-rule directions. MEASURED: `set
+  class-of-service classifiers inet-precedence p1 forwarding-class ef
+  loss-priority hgih code-points 5` committed CLEAN with no error and no
+  warning, carried `loss_priority: "hgih"` to the wire, and the helper's
+  `cos_loss_priority_index(&entry.loss_priority).unwrap_or(0)` silently
+  applied the LOW rewrite row. The identical typo on a `dscp` classifier is
+  rejected at commit. Added the inet-precedence arm to the shared gate; strict
+  on commit, downgraded to a warning on the tolerant Load / SyncApply path via
+  the existing `lenientCoSLossPriority` call site (#1960 no-brick).
+- **Validation**: 3 new guards (typo rejected, all four valid drop precedences
+  still accepted, tolerant path downgrades). Mutation-proved by emptying the
+  new loop's population (`for _, name := range []string(nil)`): the typo guard
+  and the tolerant-downgrade guard both RED, the valid-values control stayed
+  GREEN; restored from a byte snapshot and re-ran green. Full `go test
+  -count=1 ./pkg/config/` green.
+- **File(s)**: `pkg/config/compiler_validate_strict_cos.go`,
+  `pkg/config/cos_inet_precedence_classifier_6847_test.go`,
+  `docs/config-schema.md`, `_Log.md`
 
 ## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
 
@@ -6202,6 +7323,83 @@ tier through one shared definition (`config.SourceNATScopeTier`).
   pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
   userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
   userspace-dp/src/server/README.md, _Log.md
+## 2026-08-05 — #6847: enforce the inet-precedence classifier end to end
+
+- **Timestamp**: 2026-08-05 (fix/6847-rust) — completes the WIP below.
+- **Action**: wired the `inet-precedence` classifier through the wire and the
+  dataplane so the binding site the Go half added actually does something.
+  Wire: `inet_precedence_classifiers` on the CoS snapshot and
+  `cos_inet_precedence_classifier` on the interface snapshot, additive on both
+  sides. Dataplane: an 8-entry `inet_precedence_queue_by_prec` table beside
+  `dscp_queue_by_dscp`, a `resolve_cos_inet_precedence_classifier_queue_id` arm
+  reading `(dscp >> 3) & 0x7`, inserted after the DSCP arm and before 802.1p at
+  all five call sites. Retracted the classifier half of the accepted-but-inert
+  advisory; the rewrite-rules half stays.
+- **Three gaps found while building on the inherited half**, each of which
+  would have left the feature dead in the common case:
+  1. `coSInterfaceUnitHasBinding` did not list `INetPrecedenceClassifier`, so a
+     unit binding ONLY that classifier was parsed and then DISCARDED, taking
+     the whole CoS interface with it. Nothing reached the snapshot.
+  2. The `useful_cos_state` gate (#1183) had no inet-precedence arm, so an
+     interface with no shaping-rate and no scheduler-map was skipped even once
+     the binding survived.
+  3. The `ba_reclassify` gate had no inet-precedence arm, so a flow's queue
+     would freeze on its seed packet's marking.
+  Also wired the entry's `loss-priority` into `resolve_cos_loss_priority`;
+  without it `loss-priority high` would compile and silently apply the LOW
+  egress rewrite — the same accepted-but-inert shape inside the fix.
+- **Validation**: 14 guards mutation-proved, each reverted individually and
+  observed RED with an ASSERTION (not a build break) — 7 Rust, 7 Go; harness
+  snapshots each file's bytes, restores verbatim, and verifies the restore.
+  MEASURED and recorded: the out-of-range bounds check exists at two sites
+  whose key sets are always identical, so mutating either alone leaves the test
+  GREEN; the fail-closed property binds only when both are mutated, and the
+  test comment states that scope rather than claiming each site is independently
+  load-bearing. Full Rust cargo suite and full `go test ./...` green;
+  `go test ./pkg/refactoraudit/` green. `protocol_wire_v1.json` regenerated —
+  diff is exactly three additive keys, 0 removed, 0 changed.
+- **File(s)**: `userspace-dp/src/protocol/cos.rs`,
+  `userspace-dp/src/protocol/snapshot.rs`, `userspace-dp/src/protocol/tests.rs`,
+  `userspace-dp/src/policy_snapshot_error.rs`,
+  `userspace-dp/src/afxdp/types/cos.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/cos.rs`,
+  `userspace-dp/src/afxdp/tx/cos_classify.rs`,
+  `userspace-dp/src/afxdp/tx/test_support.rs`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/protocol_cos.go`,
+  `pkg/dataplane/userspace/cos.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/schema_cos.go`,
+  `docs/config-schema.md`, `docs/cos-traffic-shaping.md`, plus the new tests
+  and the struct-literal updates across the Rust test tree, `_Log.md`
+
+## 2026-08-05 — #6847 WIP: inet-precedence classifier, Go config half
+
+- **Timestamp**: 2026-08-05 (fix/6847-inet-precedence-classifier) — **INCOMPLETE**
+- **Action**: Go config half of enforcing the `inet-precedence` classifier.
+  Scope finding first: the issue described this as "accepted but inert", but the
+  unit-level `classifiers` schema had NO `inet-precedence` child at all, so the
+  classifier was definable at the top level and NOT BINDABLE — the bind line was
+  rejected by the schema. So the work is five layers, not three. Landed here:
+  typed entries (`CoSINetPrecedenceClassifier` + `...Entry`), the keyed
+  `INetPrecedenceClassifierDefs` map, the unit binding field, the unit-level
+  schema binding site, a 0..7 code-point collector, the classifier compile
+  mirroring dscp, interface->unit inheritance, and a dscp+inet-precedence
+  same-unit conflict gate (strict at commit, `lenientCoSUnitClassifierConflict`
+  downgrade on the tolerant Load/SyncApply path per #1960). Golden 4406
+  regenerated after verifying the diff was EXCLUSIVELY the new struct field —
+  18 keys added, 0 removed, 0 changed, all `INetPrecedenceClassifierDefs` — so
+  the regen masks no behavior change.
+- **NOT DONE — this branch must NOT merge as-is**: the wire fields and the Rust
+  classify arm are absent, so the binding site now EXISTS but does NOTHING. That
+  is worse than master, where the bind line is at least rejected outright. See
+  the commit body for the remaining work list.
+- **Validation**: `go test ./pkg/config/` green (real exit 0). No PR opened.
+- **File(s)**: `pkg/config/types_cos.go`, `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_strict_cos.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cos_platform.go`,
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
@@ -78186,6 +79384,111 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 13:12
+- **Action**: #6211 — the HA STANDBY's synced source-NAT reservation picked its
+  rule by "first rule whose pool CONTAINS the translated address", while the
+  ACTIVE node picked by zone/policy match. Two source-NAT rules can carry the
+  SAME public pool address in SEPARATE allocators (the allocator is shared per
+  `SourceNatRule::allocator_key` = pool name + addresses + port range, so
+  distinct `pool_name`s with a common member address give one address two
+  independent `PortAllocator`s), and under that config the standby's
+  reservation landed in a DIFFERENT allocator than the active used for the same
+  session — so after a failover a new local flow matching the OTHER rule missed
+  the collision guard, reintroducing the reverse-path ambiguity the token
+  exists to prevent. Pre-existing: byte-identical to the shipped port-bearing
+  arm (#4388/#5336); #6210 mirrored it for the address-only case (#5338)
+  without introducing it. Fixed LOCALLY, with NO wire change: every input the
+  active's rule match consumes is already synced — the zone pair rides as
+  `ingress_zone_id`/`egress_zone_id` (`SessionSyncRequest` →
+  `SessionMetadata::ingress_zone`/`egress_zone`, legacy name strings as the
+  old-peer fallback; Go sender `buildSessionSyncRequestV4/V6` in
+  `manager_ha.go`) and the 5-tuple IS the session key. So rather than inventing
+  a second rule-identity scheme (the `PolicyCounterStore` stable-`rule_id`
+  precedent applies only if the identity must ride the wire, which it need
+  not), `reserve_synced_source_nat_allocation` re-runs the active's OWN
+  predicate: `SourceNatRule::matches` was split into shared `zone_matches` /
+  `l4_matches` / `address_matches` axes plus a new `matches_ignoring_scope`,
+  and the flow key it already built is byte-identical to the active's
+  SNAT-match tuple (original source, POST-DNAT destination, original ports —
+  `nat_match_flow.forward_key` in `poll_descriptor`). The #3096 interface /
+  routing-instance scope is the one axis the standby cannot confirm
+  (`NatScopeCtx` derives from LOCAL ifindex maps keyed on the ACTIVE's
+  ifindices), so it is treated as UNCONSTRAINED, not as a mismatch — rejecting
+  an interface-scoped rule would push the selection PAST the rule the active
+  used. Both passes share one `reserve_synced_on_first_pool_owner` body so the
+  reservation semantics cannot drift; the pre-#6211 first-pool-match remains an
+  unconditional pass-2 fallback (unresolvable zone pair, no confirmable match,
+  or every candidate refusing), so no config ends up with FEWER reservations
+  than before. Validation: a RED probe on the parent (`ad9591177`) proved the
+  divergence (reservation landed in the `dmz->wan` allocator for a `lan->wan`
+  session, cargo exit 101) before any fix; 9 new tests (2 fail-on-revert, 4
+  negative controls, 3 axis guards) + a 6-mutation matrix (disable-pass-1,
+  scope-checked `matches`, no-fallback, drop-l4-axis, pre-DNAT dst,
+  drop-zone-axis) proving each guard fires.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+  (`docs/refactoring-audit-current.txt` NOT regenerated: source.rs grows
+  1765 -> 1896 lines but stays in the same `[WATCH]` tier (1500-1999), and
+  the canary compares tier by path, so `go test ./pkg/refactoraudit/` passes
+  clean — verified, exit 0.)
+- **Timestamp**: 2026-08-05 21:05
+- **Action**: #6211 fold r1 — the rev6876 gate found a MAJOR that the PR itself
+  INTRODUCED, plus an unbound production call site. (1) LEAK: the two-pass
+  selection is not a pure function of `rules`, so a session re-upserted after
+  the selection outcome changes (zone delete/renumber -> `synced_zones` becomes
+  `None`; a rule-set `from zone`/`match` edit moves pass 1's candidate set)
+  reserves a SECOND time in a different, independent allocator —
+  `reserve_flow`'s idempotence is per-allocator and does not short-circuit —
+  and every live session re-upserts on HA session-sync reconnect and on a
+  post-delete-journal-overflow resync. `release_source_nat_allocation` stopped
+  at the FIRST allocator reporting released, stranding the other reservation
+  permanently; nothing reaps it (`live_by_flow` is removed only by
+  `release_flow`/`rollback_flow`/the stale-tuple replace, and
+  `gc_expired_chunked` sweeps LEASES not live flows), a config edit does not
+  rebuild the allocator (carryover keyed on `allocator_key()` alone), and the
+  orphan counts against `max_tracked_flows` to eventual `AllocatorExhausted`.
+  Fixed by dropping the first-hit `break` so release frees from EVERY pool-mode
+  rule; that cannot over-free because `release_flow`/`rollback_flow` return
+  false unless the stored translated tuple matches. The session_glue README had
+  asserted the OPPOSITE ("it locates the reservation wherever the reserve put
+  it") — true for one reservation, and this change is what made two possible;
+  corrected. (2) The only production call site was completely unbound: all nine
+  tests called `reserve_synced_source_nat_allocation` directly with a literal
+  `Some(("lan","wan"))`, so passing `None` at the call site or inverting
+  ingress/egress inside `synced_source_nat_zone_pair` both kept the suite green.
+  Added a `handle_upsert_synced` test driving the real entry point. Also bounded
+  the scope in code + docs (#5144 hard-rejects the motivating config at strict
+  commit — the live surface is pre-#5144 persisted configs and the tolerant
+  load / peer-sync path only), corrected the heatmap line count to 1896, and
+  used the unit-qualified `ge-0/0/1.0` the Go snapshot builder actually ships.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-05 22:40
+- **Action**: #6211 fold r2 — bind the delete-sync teardown END TO END. A
+  call-site deletion matrix over all four `release_source_nat_allocation`
+  call sites found TWO unbound: `handle_delete_synced` (exit 101 but ONLY the
+  known-flaky `shared_cos_lease` / `wg::engine` families failed, so not
+  attributable to the mutation — the full suite at head had zero failures) and
+  the GC reap in `worker/loop_body/mod.rs` (exit 0, zero failures). The r1 leak
+  test called `release_source_nat_allocation` DIRECTLY, binding the function and
+  leaving the wiring deletable. Added
+  `delete_synced_frees_both_allocators_end_to_end_6211`, which drives the whole
+  story through the REAL entry points: `handle_upsert_synced` twice (the second
+  against a snapshot that shares the allocators via the Arc-backed
+  `PortAllocator` clone but has lost `zone_id_to_name`, i.e. a zone
+  delete/renumber) to reach the two-allocator state, then
+  `handle_delete_synced`. Its `(1, 1)` precondition proves the leak state is
+  reachable through the real import path, not only via the direct call. The GC
+  reap gap is PRE-EXISTING and unrelated to #6211, so it was FILED as #6901
+  rather than folded in.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/tests.rs, _Log.md
 - **Timestamp**: 2026-08-05
   **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
   **[SUPERSEDED by the two entries below]**: the "fold to view-only" clause
@@ -82042,6 +83345,88 @@ diff markers and filtering. `cargo check` exit 0.
   pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
+- **Timestamp**: 2026-08-05 20:41
+- **Action**: #4960 (bounded increment) — `CompileConfig` runs at APPLY time,
+  after commit already succeeded (`pkg/configstore` has ZERO `pkg/dataplane`
+  imports, so `commit check` validates only the pure `pkg/config.CompileConfig`;
+  the two share a name). Phase 2 `compileZones` then performs the first and only
+  destructive host netlink mutation — `ensureVLANSubInterface` (create + link
+  up) and `reconcileInterfaceAddresses` (delete + add) — and every later phase
+  is a bare `return nil, err` with no undo. `userspace/flow.go:139` documents
+  the reachable input class: a malformed application-set reference or app_id
+  overflow (#3438 H4) makes compileApplications (Phase 4) hard-error and abort
+  the apply, leaving VLANs created and addresses reconciled on the live host.
+  Added `validateBeforeMutate`: runs the eleven fallible HOST-PURE phases
+  against a `discardingDataPlane` BEFORE `compileZones`. ADDITIVE, not a
+  reorder — moving the real phases ahead of Phase 2 would be a silent
+  fail-open, because `compileFirewallFilters`/`compilePortMirroring` resolve
+  VLAN SUB-INTERFACE names that only exist because Phase 2 created them and a
+  miss there is `slog.Warn; continue`, so filters would go unassigned on EVERY
+  apply. Excluded those two phases from the pre-pass for the same reason and
+  named the residual. Also factored CompileConfig's inline result init into a
+  shared `newValidationResult()` so the two passes cannot drift.
+  Correction to prior art: `research/4960-apply-txn` §4.4 says destructive host
+  mutation is in "exactly two phases — compileZones and compilePortMirroring
+  (netlink at :1758/:1811)". Verified wrong at 86927d23c: compilePortMirroring
+  (1704-1748) contains NO `netlink.` reference — only `dp.ClearMirrorConfigs`/
+  `SetMirrorConfig` map writes — and :1758/:1816 are `netlink.LinkByName` READS
+  inside `getPermAddr`/`getOriginalKernelName`. It is ONE phase, which is why a
+  single pre-pass covers all host mutation. §4.4's middle-phase purity claim
+  agrees with my independent enumeration.
+  Validation: `TestNoHostMutationWhenALaterPhaseFails_4960` (host-unmutated
+  property), `TestValidConfigStillReachesZoneCompile_4960` (control — a valid
+  config still reaches compileZones), `TestPrePassDoesNotPerturbIDAssignment_4960`
+  (two passes assign byte-identical IDs incl. the #5099 NAT-counter family;
+  proven sensitive by injecting drift AFTER finalizeNATCounterIDs' re-derive).
+  Revert cell: removing the pre-pass REDs the property test with "compileZones
+  RAN before the failing phase was caught (2 SetZoneConfig calls)".
+  `go test ./...` rc=0.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+- **Timestamp**: 2026-08-05 21:58
+- **Action**: #4960 / PR #6894 gate fold r1 — five items. (F1, the one that
+  mattered) The coverage claim was asserted by NOTHING: dropping 10 of 11 phase
+  rows left the whole package suite green, because the single binding fixture
+  used an unresolvable APPLICATION name and pinned exactly one row. The call
+  site was bound; the table's CONTENTS were not. Hoisted the literal into
+  `validationPhases()` so it can be asserted over, added
+  `TestValidationPhaseTableMatchesDocumentedCoverage_4960` (length + ordered
+  name set vs the doc comment) and a SECOND binding fixture from a different
+  phase (`TestNoHostMutationWhenNATPhaseFails_4960`, unresolvable SNAT pool).
+  (F2) `validateFilterProtocols` — the first statement of Phase 10 and 100%
+  cfg-pure (no result, no dp, no logging) — is now a pre-pass row, taking
+  coverage to TWELVE of thirteen. It is ADDED, not moved: the in-place call
+  stays, so a config where compileFirewallFilters succeeds is bit-identical.
+  It was the sole config-shape hard error still reachable post-mutation, via the
+  TOLERANT load paths. (F3) The covered phases logged twice per compile (15 ->
+  22 INFO lines) and `flow config compiled` printed lo0_filter_v4=65535 from the
+  pre-pass then =0 from the real pass — an operator reading NO then YES for one
+  apply. Added `isValidationPass(dp)` (marker on the DATAPLANE, because
+  compileDefaultPolicy/compileFlowTimeouts take no result) and gated 8 log
+  sites. (F4) The test fixture used `ge-0-0-0.50`/`ge-0-0-1.0`, byte-identical
+  to real interfaces on the standalone VM and loss node 0, and this is the first
+  pkg/dataplane test to drive compileZones to completion — as root it would have
+  run LinkAdd/AddrDel/ethtool//proc/sys writes. Renamed to `xpft4960a/b` and
+  added a root+live-link skip belt. (F5) Three citations corrected: the
+  parenthetical understated the mutation set (LinkDel/LinkSetDown via
+  stripUnmanagedInterfaces); the shim was cited as "the LegacyDataPlaneAdapter
+  idiom" when it is the INVERSION (that one embeds a NON-nil dataplane and
+  delegates; this one leaves it nil so un-overridden methods panic) — now says
+  so and names `TestPrePassShimCoversTheCalledSurface_4960` as what enforces
+  completeness, since nothing does at compile time; and the ID probe's "same
+  order as CompileConfig" was not literally true.
+  Cells: dropping 10 of 12 rows REDs BOTH the table assertion ("covers 2 phases
+  but the documented coverage is 12") and the new NAT fixture ("host was mutated
+  before the NAT phase failed: 2 SetZoneConfig"). Gates: go build rc=0, go vet
+  rc=0, go test ./... rc=0, go test ./pkg/refactoraudit/ rc=0 (6 top-level, 0
+  SKIP).
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_iface.go, _Log.md
 
 - **Timestamp**: 2026-08-05
 - **Action**: #5797 invariant 7 — make an unmappable syslog facility VISIBLE and
@@ -82422,6 +83807,120 @@ diff markers and filtering. `cargo check` exit 0.
   pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
   pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
 
+## 2026-08-06 — #4960 r2: stop the negative control from stripping a root host's interfaces (#6894 F1/F2/F3)
+- **Timestamp**: 2026-08-06
+- **Action**: F1 (MAJOR, test safety) —
+  `TestValidConfigStillReachesZoneCompile_4960` drove `CompileConfig` all the
+  way through `compileZones`, whose tail `stripUnmanagedInterfaces` enumerates
+  the REAL host and runs `netlink.AddrDel` + `netlink.LinkSetDown` (and
+  `LinkDel` for a bond) on every unmanaged link. Confirmed firsthand with an
+  instrumented panic at `compiler_iface.go:1255`: it fired on `eno2` via
+  `compiler_validate_4960_test.go:117`. Unprivileged that is EPERM; as root it
+  black-holes host networking. Fixed with a #5268-style tripwire —
+  `recordingDP.SetZoneConfig` counts the call and then returns
+  `errStopBeforeHostReconcile`, which halts `programZoneMaps` before
+  `mapZoneInterface` and therefore before `ensureVLANSubInterface`,
+  `reconcileInterfaceAddresses`, the ethtool/procfs writes and the strip.
+  The control stays live: `errors.Is` on that sentinel is reachable only after
+  the pre-pass has PASSED the config. Removed `skipIfCouldMutateAHost` — it
+  guarded only the two fixture names while the exposure was the host's other
+  50+ links, and the tripwire subsumes it unconditionally at any euid.
+  F2 — named the three fallible steps that run AFTER the mutation and BEFORE
+  the snapshot publishes (`preflightCheckIfindexCaps`, structurally
+  unhoistable; `attachUserspaceShimXDP`, the reachable one;
+  `buildSnapshotWithSchedulerStateAndNATCounters`), so "bounded" has a stated
+  boundary. F3 — `TestValidationPhaseTableMatchesDocumentedCoverage_4960`
+  asserts only `got[i].name`, so it binds INDEX -> NAME and nothing else;
+  added `TestEachValidationPhaseRowRunsItsOwnCompiler_4960` to bind
+  NAME -> BODY for all twelve rows.
+- **Validation**: `go build ./...` exit 0. `go test ./pkg/dataplane/...
+  ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. All runs at uid 1000.
+  F1 proof: with the panic probe armed in `stripUnmanagedInterfaces` the WHOLE
+  `pkg/dataplane` package passes; neutralising the tripwire (`return nil`) with
+  the probe still armed re-fires it on `eno2`. Pre-pass revert (move
+  `validateBeforeMutate` after `compileZones`) reds both no-mutation tests as
+  ASSERTIONS — "compileZones RAN before the failing phase was caught (1
+  SetZoneConfig calls)" — and the revert path is itself now host-safe.
+  F3 proof: gutting the ten unbound row bodies to `func() error { return nil }`
+  reds exactly those ten subtests ("row %q accepted an input its own compiler
+  rejects"); `applications` and `nat` stay green, and
+  `TestValidationPhaseTableMatchesDocumentedCoverage_4960` stays GREEN through
+  it, which is the gap. Swapping the `static nat` / `nat64` bodies with names
+  intact reds both on the `validate <name>: ` prefix.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go, _Log.md
+
+## 2026-08-06 — #4960 pre-pass: cover the shim's whole write surface (#6894 r3)
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r3 gate findings on PR #6894.
+  F1 (MAJOR) — the completeness guard was blind to nine of the surfaces its
+  doc comment claimed it enforced. `discardingDataPlane` embeds a NIL
+  `DataPlane`, so an un-overridden method nil-panics, and
+  `TestPrePassShimCoversTheCalledSurface_4960` is the only thing enforcing the
+  override set. Measured by instrumenting all 40 overrides with a name
+  recorder: that test reached 28/40, and `SetDNATEntry`, `SetDNATEntryV6`,
+  `SetNAT64Config`, `SetNATPoolIPV6`, `SetNPTv6Rule`, `SetSNATEgressIP`,
+  `SetSNATRuleV6`, `SetStaticNATEntryV4`, `SetStaticNATEntryV6` were reached by
+  NO test in the package — `idProbeConfig` reached every PHASE but not every
+  phase's WRITE SURFACE. Widened the fixture: destination NAT (v4+v6), static
+  NAT (v4+v6), an NPTv6 rule, a NAT64 rule-set, an IPv6 source pool with its v6
+  SNAT rule, an interface-SNAT rule and a security policy. Reached set is now
+  39/40; the 40th, `IsLoaded`, is called by `CompileConfig` itself
+  (compiler.go:182) above the pre-pass, and is bound by the CompileConfig-
+  driving tests. Renamed the fixture's zone interfaces off the vSRX scheme —
+  the interface list became load-bearing here for the first time, and
+  `ge-0-0-1` is a real link on the standalone VM and on loss node 0.
+  `SetSNATEgressIP` is the one covered write that is not a pure function of
+  cfg (compileNAT resolves the egress member through
+  `result.cachedInterfaceByName` and soft-skips on a miss), so added
+  `validateBeforeMutateWithResult` and seeded a SYNTHETIC ifCache entry rather
+  than naming a live link — a resolving name is one `CompileConfig` call away
+  from reconciling a real interface's addresses, the r2 F1 hazard.
+  F2 (MINOR) — corrected a claim this file has now made twice. r2 said
+  `vlanIfaceInfoCall == 0` / `ifaceSetupCalls == 0` "turn the safety property
+  into a runtime assertion instead of a structural argument". They do not: both
+  read 0 with AND without the tripwire, because `mapZoneInterface` soft-skips
+  at compiler_iface.go:450-454 (xpft4960a/xpft4960b exist on no host).
+  `zoneConfigCalls` is what distinguishes. Reworded `recordingDP`,
+  `assertNoHostMutation` and the control test's inner assertion to say so; the
+  counters stay as defence in depth and must NOT be made live with real
+  interface names.
+  F3 (MINOR) — `pkg/dataplane/README.md` listed the compile phases without the
+  pre-pass, which can reject a config on its own and changes which error an
+  operator sees when a config carries both a Phase-2 fault and a bad filter
+  protocol. Named it, and pointed at compiler_validate_4960.go.
+  F4 (NIT) — "any dp passed here MUST embed discardingDataPlane" was a note
+  with nothing enforcing it; it is now an `isValidationPass` guard at the top
+  of the shared body, ahead of the phase loop.
+- **Validation**: uid 1000 throughout. `go build ./...` exit 0.
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. `gofmt -l` on the three Go
+  files touched: clean (the seven files it does list are unformatted at the PR
+  head too).
+  F1 proof, 9x2 matrix, each mutation grepped back out of the file and the file
+  restored byte-identical after every cell: deleting any ONE of the nine
+  overrides at PR head 5fcb494d9 leaves the WHOLE `pkg/dataplane` package GREEN
+  (9/9, rc=0); at this head all nine RED with a nil-pointer panic at their own
+  call site — `SetDNATEntry` compiler_nat.go:900, `SetDNATEntryV6` :918,
+  `SetNAT64Config` :1305, `SetNATPoolIPV6` :579, `SetNPTv6Rule` :1161,
+  `SetSNATEgressIP` :424, `SetSNATRuleV6` :704, `SetStaticNATEntryV4` :1020,
+  `SetStaticNATEntryV6` :1032. Deleting `IsLoaded` reds
+  `TestNoHostMutationWhenALaterPhaseFails_4960`, so all 40 are bound.
+  F2 proof: driving `programZoneMaps` directly (it does NOT contain the
+  `stripUnmanagedInterfaces` tail, which lives in `compileZones` at
+  compiler_iface.go:287, so the probe cannot reach the host-stripping path) —
+  WITH tripwire `zoneConfigCalls=1 vlanIfaceInfoCall=0 ifaceSetupCalls=0`,
+  WITHOUT `zoneConfigCalls=2 vlanIfaceInfoCall=0 ifaceSetupCalls=0`.
+  F4 proof, both ASSERTIONS not panics: deleting the guard reds
+  `TestPrePassRejectsADataPlaneWithoutTheMarker_4960` on "the pre-pass accepted
+  a dataplane that does not carry the discardingDataPlane marker"; MOVING the
+  guard to after the phase loop reds it on "the pre-pass wrote 6 address-book
+  entries to a non-marker dataplane before rejecting it".
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/README.md,
+  _Log.md
 ## 2026-08-06 — #6871 gate fold: bind the production adapter, restore the aborted-cycle recovery
 
 - **Timestamp**: 2026-08-06
@@ -83226,6 +84725,413 @@ paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
+## 2026-08-06 — #4960 ID probe: run the phases it claims to (#6894 r4)
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r4 gate finding on PR #6894. r3 widened `idProbeConfig`
+  for the SHIM-coverage test; the ID DRIVER did not widen with it, so three of
+  the dimensions `TestPrePassDoesNotPerturbIDAssignment_4960` compares were
+  structurally unable to differ. `compileIDsOnce` ran address book ->
+  applications -> NAT -> finalize, while the real pre-pass runs policies, nat,
+  static nat and nat64. `{}` DeepEquals `{}`, so each omission passed silently.
+  Measured before the change: `implicitSets len=0`; `PoolIDs len=3
+  [pool-a pool-b pool-v6]` with `pool-nat64` absent; `NATCounterIDs len=5`
+  with no `static/` key at all.
+  Fix. The driver now runs CompileConfig Phases 3, 4, 5, 6, 6.5, the
+  finalization and 6.6 IN PRODUCTION ORDER — `compilePolicies`,
+  `compileStaticNAT`, `finalizeNATCounterIDs`, `compileNAT64`. `compileNPTv6`
+  (6.7) stays out: it takes no `*CompileResult` and assigns no IDs.
+  `implicitSets` needed a SECOND, fixture-side half: `resolveAddrList` filters
+  `any` out entirely and returns a lone surviving name through the direct-ID
+  branch, so the old policy's `["any"]` / `["servers"]` lists built no set even
+  once `compilePolicies` ran. The fixture's `p-multi` policy now carries
+  genuinely multi-valued lists (`web`+`db`, `dns`+`servers`); `p-single` is
+  kept alongside as the negative control for the two shapes that build nothing.
+  Assertions. `NextPoolID` joins the compared set (a scalar: an off-by-one in
+  the NAT64 auto-assign branch leaves every map identical while the next pool
+  collides). Non-vacuity assertions now name the SPECIFIC entries expected —
+  one counter key per NAT type including both static ones, both implicit-set
+  cache keys, `pool-nat64` in `PoolIDs`, and `NextPoolID > pool-nat64`'s id —
+  rather than only checking a map is non-empty, which a partial regression
+  would still satisfy.
+  The finalize POSITION is asserted as a PRECONDITION, not through the output.
+  Measured: moving `finalizeNATCounterIDs` above `compileStaticNAT` left the
+  whole test GREEN, because finalization only changes an id under a base-hash
+  collision and this fixture has none. What the position buys is that the
+  sorted re-derivation sees every NAT type's keys, so the driver now asserts
+  exactly that, with the expectation derived from the CONFIG
+  (`staticNATCounterKeys`) and compared against the COMPILER's map.
+- **Validation**: uid 1000 throughout. `go build ./...` exit 0.
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. `go vet ./pkg/dataplane/`
+  exit 0. `gofmt -l` on the one file touched: clean. No hangs.
+  BEFORE -> AFTER: `implicitSets` 0 -> 2 (`db,web:5`, `dns,servers:6`);
+  `PoolIDs` 3 -> 4 (`pool-nat64` present), `NextPoolID` 4;
+  `NATCounterIDs` 5 -> 7 (`static/rs-static/s-v4`, `static/rs-static/s-v6`).
+  PERTURBATION PROOF, each injecting a PROCESS-GLOBAL drift into one
+  ID-assignment site — the exact state class a discarded double-compile would
+  expose — each grepped back in before the run and every file restored
+  byte-identical after: drift in `resolveAddrList`'s implicit-set id, in
+  `finalizeNATCounterIDs` for `static/`-prefixed keys, and in `compileNAT64`'s
+  auto-assign allocator. At head bf7b0291e all three leave the WHOLE
+  `pkg/dataplane` package GREEN. At this head all three RED on their own
+  dimension: "implicitSets differs between pass 1 and pass 2",
+  "NATCounterIDs differs ...", "PoolIDs differs ...".
+  NON-VACUITY PROOF, one driver/fixture knockout per cell, all RED with their
+  own message: drop `compilePolicies` -> `implicit address-set "db,web" is
+  absent`; drop `compileStaticNAT` -> `finalizeNATCounterIDs is about to run
+  without "static/rs-static/s-v4" in the key set`; drop `compileNAT64` ->
+  `pool-nat64 is absent from PoolIDs`; move the finalize above static NAT ->
+  same precondition message (GREEN before this assertion existed); revert
+  `p-multi` to the single/`any` shapes -> `implicit address-set "db,web" is
+  absent`, which is the fixture half of the fix. Neutering
+  `staticNATCounterKeys` AND dropping `compileStaticNAT` together reds the
+  hardcoded key assertion instead, so it is not dead weight behind the
+  precondition.
+  DELETE-ONE-OVERRIDE MATRIX RE-RUN, all 40 `discardingDataPlane` overrides
+  against the whole package: 40 RED / 0 GREEN / 0 SKIP. Widening the ID driver
+  did not weaken the shim-coverage test. 16 red via
+  `TestPrePassShimCoversTheCalledSurface_4960`; the rest via
+  `TestValidConfigStillReachesZoneCompile_4960` /
+  `TestNoHostMutationWhenALaterPhaseFails_4960`, `IsLoaded` among them
+  (compiler.go:182).
+  No doc change: this round is test-only — no production file is touched and
+  no compile behaviour changes, so the `pkg/dataplane/README.md` pre-pass
+  entry added in r3 still describes the shipped behaviour exactly.
+- **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r5 gate finding on PR #6894. r4 fixed the ID-probe
+  columns that were vacuous because the driver never RAN the phase that
+  populates them; `ScreenIDs` failed one level lower. The driver
+  RE-IMPLEMENTED Phase 1.5 instead of calling production, so that column
+  compared `compileIDsOnce`'s own loop against itself. Three ALPHA-EQUIVALENT
+  copies of the screen-ID prelude existed — `CompileConfig` (compiler.go:245-254),
+  `validateBeforeMutateWithResult` (compiler_validate_4960.go:254-263), and
+  the driver (compiler_idprobe_4960_test.go:315-324). (Corrected in r6: this
+  said "verbatim ... token-identical", which is literally false — the driver's
+  copy used the locals `names`/`n` where production used `screenNames`/`name`.
+  The loops were alpha-equivalent and behaviour-identical, so the conclusion
+  stands, but the wording overstated what was measured.) Same `uint16(1)`
+  seed, same `cfg.Security.Screen` source,
+  same `sort.Strings`, same 1-based increment, all three against a
+  `newValidationResult()`-allocated map behind their own nil-cfg guard.
+  Collapsing them is therefore a cleanup, not a behaviour change.
+  Extracted `assignScreenIDs(result, cfg)` next to `assignZoneIDs` in
+  compiler.go and pointed all three sites at it; dropped the now-unused
+  `"sort"` import from compiler_validate_4960.go (it had exactly one use, the
+  prelude — compiler.go keeps its four, the idprobe test keeps its
+  `sortedKeys` use). Added two per-column non-emptiness floors: `ScreenIDs`
+  (naming `alpha`, `mid`, `zeta`) and `AddrIDs`, which had been protected only
+  BY ACCIDENT — the implicitSets assertion demands `db,web` / `dns,servers`,
+  which cannot exist without their AddrIDs entries, but that covers only ONE
+  of the map's two writers. The floor now names entries from both:
+  compileAddressBook's `db dns servers web` and compileNAT ->
+  resolveSNATMatchAddr's `_snat_match_10.1.0.0/16`, `_snat_match_10.2.0.0/16`,
+  `_snat_match_2001:db8:1::/64`. Measured full key set before writing the
+  floor, not assumed.
+  MUTATION GRID, whole `pkg/dataplane` package, `-count=1`, every mutation
+  applied only inside a throwaway `git archive` extract and restored by
+  re-extraction (never reverse-substitution); the worktree tree hash was
+  verified byte-identical before and after the grid. Each cell run at BOTH the
+  base commit (4ae41d85d) and this head, so every claim is a measured flip
+  rather than a one-sided red:
+  D/E — seed the screen-ID assignment from a package-level counter, so pass 1
+  and pass 2 differ (the cross-pass-state defect class this test names in its
+  own doc comment). At base, applied to the compiler.go inline prelude: GREEN.
+  At base, applied to the compiler_validate_4960.go inline prelude: GREEN.
+  Both production sites could drift with the suite passing. At this head,
+  applied inside `assignScreenIDs`: RED, `ScreenIDs differs between pass 1 and
+  pass 2` (compiler_idprobe_4960_test.go:396). D and E are one cell now
+  because there is one site.
+  F — fixture drops the three screen profiles: GREEN at base (no floor
+  existed; `{}` DeepEquals `{}`), RED at this head with three messages,
+  `screen profile "alpha"/"mid"/"zeta" is absent from ScreenIDs`. Note the
+  DeepEqual stays quiet in this cell — the floor is what fires, which is the
+  point of having it.
+  G (negative control) — drift `assignZoneIDs`: RED, `ZoneIDs differs between
+  pass 1 and pass 2`. The harness can red on a dimension this change did not
+  touch.
+  H — delete `result.AddrIDs[synthName] = addrID` from resolveSNATMatchAddr
+  (compiler_nat.go:36), emptying the compileNAT half of AddrIDs: GREEN at base
+  — the whole package passed with that writer silently contributing nothing,
+  confirming the by-accident protection — and RED at this head with three
+  messages, `address id "_snat_match_..." is absent`.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` rc=0;
+  `go test ./pkg/refactoraudit/ -count=1` rc=0 (the new production function in
+  compiler.go does not trip the heatmap gate); `go test ./pkg/dataplane/ -run
+  4960 -count=10 -race` rc=0. `gofmt -l` clean on all three touched files.
+  No doc change: no live module doc describes the screen-ID prelude or its
+  call sites (grep over docs/ finds only archived review transcripts and a
+  `docs/config-schema.md` reference to `assignZoneIDs` about STABLE ZONE ids,
+  which this change does not touch). The rationale for the single site is
+  carried in the `assignScreenIDs` doc comment and the driver's, which is
+  where the next person reading either would look. The
+  `pkg/dataplane/README.md` pre-pass entry added in r3 still describes the
+  shipped behaviour exactly — compile behaviour is unchanged.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: Narrow an overclaim in the #6894 r5 comments. COMMENT-ONLY — no
+  production or test behaviour changes.
+  `TestPrePassDoesNotPerturbIDAssignment_4960` compares two passes of the same
+  phases over the same config, so what it detects is perturbation ACROSS
+  passes: state outliving a `CompileResult` (a process-global, a counter on the
+  DataPlane, an interned table), which is the #4960 question because the
+  pre-pass compiles twice and discards the first result. It does NOT detect
+  incorrect assignment WITHIN a pass — anything applied identically to both
+  passes (a wrong seed, a wrong sort key, a wrong id formula) yields two
+  identical maps and stays green by construction. The r5 wording said the
+  ScreenIDs column "could not observe a production drift", which claims the
+  stronger property; it could not observe a CROSS-PASS drift.
+  Reworded three places: `assignScreenIDs`'s doc (compiler.go) now says
+  cross-pass and describes the measured mutation as seeding the assignment from
+  a package-level counter rather than the vaguer "drifting"; `compileIDsOnce`'s
+  doc likewise; and a new paragraph in `compileIDsOnce` states the general form
+  ONCE, explicitly scoped to EVERY column rather than to ScreenIDs, since a
+  reader who takes a green as "the ids are right" is misreading all of them.
+  That paragraph also separates the third mechanism in this test so the three
+  are not conflated: the DeepEqual binds cross-pass stability, the phase list
+  binds which dimensions exist at all, and the non-vacuity floors only keep a
+  column from being an empty-vs-empty comparison.
+  COMMENT-ONLY PROOF, stronger than reading the diff: both touched files were
+  compared against HEAD (420e37c1e) with blank lines and whole-line `//`
+  comments stripped from each side. compiler.go 1377 non-comment lines
+  identical; compiler_idprobe_4960_test.go 330 identical. That covers the
+  floors, the driver's phase list and its order, `assignScreenIDs`'s body, and
+  all three call sites — none moved.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... -count=1` rc=0 (4 packages ok); `gofmt -l` clean
+  on both touched files. The r5 mutation grid is not re-run and does not need
+  to be: no line it exercises changed.
+  No doc change, for the same reason as r5 — no live module doc describes the
+  screen-ID prelude, and this round alters only comment prose.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+## 2026-08-06 — #6894 fold r6 (gate BLOCKER + three text corrections)
+
+- **Timestamp**: 2026-08-06 07:40 PDT
+- **Action**: BLOCKER — a stale zone `screen-profile` reference escaped the
+  #4960 validate-before-mutate pre-pass and aborted `compileZones` MID-LOOP.
+  `programZoneMaps` ranges `cfg.Security.Zones` (a Go MAP) and per zone calls
+  `buildZoneConfig` (which resolves the reference) then `SetZoneConfig`, then
+  iterates that zone's interfaces into `mapZoneInterface` where the netlink and
+  `/proc/sys` writes live. An unknown reference on a zone visited second or
+  later therefore aborts AFTER earlier zones are already programmed — the
+  half-reconfigured host #4960 exists to prevent, via the mechanism it claims
+  to close. Added the pure `validateZoneScreenReferences`, called at the TOP of
+  `compileZones` (so no zone can mutate before every reference is checked,
+  whatever the caller did) and registered as the `zone screen references`
+  pre-pass row (so the pre-pass reports it with sibling precedence).
+- **File(s)**: pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go (new), _Log.md
+- **Validation**: go build ./... rc=0; go vet ./pkg/dataplane rc=0; go test
+  ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race rc=0; go test
+  ./pkg/refactoraudit/ -count=1 rc=0; gofmt clean on every touched file.
+- **NOTE — the generalising question, answered.** There are TWO config-shaped
+  aborts inside the zone loop, not one, and a fix hoisting only the first would
+  still abort mid-loop: `buildZoneConfig` (compiler_iface.go:364) resolves the
+  reference against `result.ScreenIDs` (the COMPILED id map), and
+  `mapZoneInterface` (compiler_iface.go:584) resolves the SAME reference against
+  `cfg.Security.Screen` (the CONFIG map) on the VLAN sub-interface path, after
+  several host mutations. The sweep checks BOTH sources. Every other error
+  return in that loop — `set vlan_iface_info`, `set zone`, `add tx port`, and
+  the address-reconcile tail — is a dataplane/netlink I/O failure, not a
+  config-shape one, so it is not pre-validatable against a discarding shim and
+  is out of scope for this class.
+- **NOTE — the revert probe is multi-trial ON PURPOSE.** Map iteration order is
+  randomised per range, so with the fix reverted the bad zone is visited first
+  about 1/N of the time and the compile aborts before any mutation — which
+  looks exactly like a pass. A single-run probe would be FLAKY, reporting green
+  on broken code a fraction of the time. The fixture uses 8 valid
+  interface-carrying zones + 1 offender and runs 24 trials: a reverted build
+  slips through with probability 8^-24. [CORRECTED in #6894 r5 F3: that
+  denominator counted only the eight VALID zones, and the model assumed
+  uniformity. The map holds NINE keys and Go's range is not uniform over which
+  lands first. Measured over 200,000 single-trial compiles with both halves
+  reverted: 12632/200000 = 0.0632 per trial, so 24 trials give ~1e-29, not
+  8^-24 ~ 2e-22. The guard is stronger than this entry claimed, but the number
+  was not measured when written.] Measured with BOTH halves of the fix
+  removed: `go vet ./pkg/dataplane` rc=0 (an ASSERTION failure, not a build
+  break) and `go test -run 'StaleZoneScreenRef|ValidZoneScreenRef|
+  ZoneScreenSweepSkips'` rc=1, failing at "compileZones programmed 1 zone(s)
+  before rejecting the stale screen reference" on trial 0. The three over-reach
+  guards stayed GREEN under that revert. Restored and `cmp`-verified against a
+  pristine copy of both production files.
+- **NOTE — three text corrections, all to claims that overstated.**
+  (1) `compiler_validate_4960.go` called filter protocols "the ONE config-shape
+  hard error still reachable after the mutation point" and, in the same block,
+  acknowledged the unknown screen reference while asserting "nothing reaches
+  the dataplane either way". Both could not be true; that self-contradiction is
+  how the blocker survived four rounds. Corrected, with a note not to restore
+  a bare count. (2) The ID-stability comment offered "a counter on the
+  DataPlane" as an example of state the driver could observe — inapt, because
+  `compileIDsOnce` constructs a fresh stateless `idProbeDP{}` per invocation;
+  replaced with "a package-level sequence" and the reason recorded. (3) The r5
+  entry above called the three screen-ID preludes "verbatim ... token-identical";
+  the driver's copy used the locals `names`/`n` where production used
+  `screenNames`/`name`, so they were ALPHA-EQUIVALENT. The conclusion stands;
+  the wording did not. Also corrected the `AddrIDs` floor comment, which named
+  the synthetic writer as the "interface-SNAT branch" when the pinned keys come
+  from named-pool rules.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 5. Codex returned MERGE-NEEDS-MAJOR at `b0c74194c`
+  with six findings. Two of them invert on measurement, and this entry records
+  why rather than quietly not doing them.
+  **F1 (raised as BLOCKING) is a FALSE POSITIVE, and its prescribed fix would
+  be a regression.** The claim was that `discardingDataPlane.SetAddressBookEntry`
+  returns nil unconditionally while "the real backend" calls `net.ParseCIDR`
+  (`maps_policy.go`), so an empty address-book prefix could clear the pre-pass,
+  let compileZones mutate the host, and then fail. That `ParseCIDR` belongs to
+  `(*dataplane.Manager)` — the RETIRED eBPF backend. `NewDataPlane` and
+  `NewRuntimeDataPlane` both refuse `TypeEBPF` with `ErrEBPFBackendRetired`
+  (`dataplane.go`), so no apply reaches it. Production passes
+  `userspaceShimCompileDataplane` (`loader.go`), via
+  `userspace.Manager.ApplyConfig -> .Compile -> bpfShim.CompileUserspaceShim`.
+  Measured across the whole surface, not spot-checked: all 55 shim methods have
+  a bare `return nil`/empty body, and all 38 methods shared with the fake are
+  byte-identical. So `compileAddressBook` cannot fail from an empty `Value` on
+  the only supported runtime path. Teaching the fake to ParseCIDR would make the
+  PRE-PASS STRICTER than production and reject at commit what the runtime
+  accepts — empty `value` is a deliberate WARNING (#2229), and this gate has
+  already swung through over-rejection twice.
+  Instead of the prescribed change, added
+  `TestPrePassFakeIsNoMorePermissiveThanProduction_4960`: an AST scan asserting
+  every `userspaceShimCompileDataplane` method is still a no-op, with a floor
+  (>=40 methods seen) so a rename cannot make the scan vacuous. That turns the
+  one-off measurement into a standing guard and catches the REAL version of the
+  concern — someone adding a validating method to the production shim.
+  PROVEN TO FIRE: giving the shim a ParseCIDR body reds it on
+  "non-no-op body: [SetAddressBookEntry]", with `go vet` rc=0 so it is an
+  assertion, not a build break.
+  **F2 also inverts.** "Neither screen-resolution site is independently bound"
+  is true but not closable: `result.ScreenIDs` is built by `assignScreenIDs`
+  FROM `cfg.Security.Screen`, so the two key sets are identical by construction
+  and no real config separates them; and since `c3497a64a` hoisted
+  `validateZoneScreenReferences` to the top of `compileZones`, both sites are
+  backstops the sweep pre-empts. Binding them independently would need a
+  hand-built `result` disagreeing with `cfg` — a state production cannot
+  produce. Documented rather than faked.
+  **F3 (probability math) fixed with MEASURED numbers.** The comment called a
+  single run "a coin flip" (0.5) and gave `8^-24` from a uniformity assumption
+  over the wrong denominator. The fixture holds NINE zones, and Go's map range
+  is not uniform over which key lands first. Reverting both halves and running
+  200,000 single-trial compiles: 12632/200000 = 0.0632 per trial, versus 0.1111
+  for uniform 1/9 — so 24 trials give ~1e-29. Corrected in the test comment AND
+  in the r5-1 `_Log.md` entry above. Also closed the vacuity hole: nothing tied
+  the trial count to the fixture, so trimming the valid-zone loop to zero left
+  only the offender, which is then visited first every time and makes the probe
+  pass 24/24 on BROKEN code. Added a fixture floor asserting 8 valid +
+  1 offender and that all 8 carry interfaces. PROVEN TO FIRE: shrinking the loop
+  to zero reds it, `go vet` rc=0.
+  **F5 (my own prior error, and worse than reported).** The phase table claimed
+  "in the same order CompileConfig runs them" while `zone screen references` sat
+  EIGHTH. Production reaches it FIRST — `validateZoneScreenReferences` is the
+  first statement in `compileZones`, and `compileZones` is the first phase. A
+  config with both a stale screen reference and a broken address-book set was
+  therefore reported by the pre-pass as "address book" while production would
+  abort on the screen reference, pointing the operator at the wrong stanza.
+  Fixed by MOVING the row to first, making the documented claim true rather than
+  weakening it. The coverage test could not have caught this — it compares the
+  table against another hand-written list, so both were wrong together — so
+  added `TestPrePassReportsTheSamePhaseProductionWould_4960`, which drives a
+  config tripping BOTH phases and asserts the pre-pass names the one production
+  would. PROVEN TO FIRE: moving the row back to eighth while keeping the
+  index list consistent reds the new test and leaves the coverage test GREEN,
+  which is exactly the discrimination that was missing. Also corrected the row
+  count ("five of the twelve" and "ten of the twelve" -> thirteen) and four
+  rotting line references (`compiler.go:182` -> `:268` for the IsLoaded check,
+  x3 files; `compiler.go:245-254` -> `:330` for the NAT finalize, x2 sites).
+  **NOT DONE, and owed:** F4 (widen the ID driver to PolicySetID / RuleID /
+  PolicyNames / scheduler slots) and F6 (success logs emitted for no-op
+  validation-pass operations). Both are coverage/log-noise, neither is a runtime
+  defect; they are not started, not partially done.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages ok); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 5b. The lead confirmed the F1 refutation firsthand and
+  asked for two hardenings; acting on the first found a REAL divergence my r5
+  claim had missed, so this entry corrects that claim as well as implementing
+  the asks.
+  **MY r5 CLAIM WAS TOO STRONG.** r5 said the fake and
+  `userspaceShimCompileDataplane` are equivalent because "all 38 shared methods
+  are byte-identical". True, but incomplete: the shim EMBEDS `*Manager`, so any
+  DataPlane method it does not override is PROMOTED to the retired-eBPF
+  implementation. Reflection says DataPlane has 130 methods while the shim
+  declares 55 — about 75 promote. Comparing the pre-pass CALL SURFACE (the 41
+  methods `discardingDataPlane` declares) against the shim's 55 finds THREE the
+  shim does not override, and one of them is live:
+  `GetPersistentNAT`. The fake returns a typed-nil `*PersistentNATTable`; the
+  shim promotes to `(*Manager).GetPersistentNAT`, which returns the live
+  `m.PersistentNAT`. It is called on the compile path, inside `compileNAT`
+  (`compiler_nat.go` twice). Both sites nil-guard, so the PRE-PASS SKIPS
+  `ClearPoolConfigs` and `SetPoolConfig` while production RUNS them. Neither
+  returns an error, so nothing can escape the pre-pass into the post-mutation
+  window and the F1 refutation stands — but "the pre-pass sees what the real
+  compile sees" was not true, and nothing pinned it. `IsLoaded` diverges too
+  (fake true, shim promoted) but is checked at the top of CompileConfig before
+  any mutation, so it cannot half-apply. `xpfValidationPass` is not a DataPlane
+  method.
+  **The equivalence guard is rebuilt around the correct invariant**, per the
+  lead's ask to enumerate dynamically rather than from a hardcoded list. It is
+  hybrid by necessity: REFLECTION enumerates the DataPlane method set (so a
+  method added later is automatically in scope), and AST classifies bodies and
+  declared-vs-promoted, because reflection CANNOT distinguish the two — Go
+  synthesizes a wrapper on the outer type for an embedded pointer, so a promoted
+  method and an overridden one have different func pointers and look identical.
+  A first attempt compared `sm.Func.Pointer()` against `mm.Func.Pointer()` and
+  reported 0 promoted out of 130, which is how that trap presents.
+  Four checks: (1) every shim-declared method is a no-op; (2) every method on
+  the pre-pass call surface is also overridden by the shim, or allowlisted in
+  `prePassShimDivergence` WITH an argument; (3) the allowlist is MINIMAL, so a
+  stale exemption cannot wave a future divergence through; (4) the shim
+  satisfies every DataPlane method, with a >=100 floor so the reflection half
+  cannot go vacuous.
+  MUTATION GRID, all in throwaway `git archive` extracts, `go vet` rc=0 on every
+  cell so each RED is an assertion and not a build break:
+  A — give the shim a validating `SetAddressBookEntry` (a ParseCIDR body):
+  **RED**, "non-no-op body: [SetAddressBookEntry]".
+  B — delete the `GetPersistentNAT` allowlist entry: **RED**, "discardingDataPlane
+  overrides [GetPersistentNAT], but userspaceShimCompileDataplane does NOT — so
+  in production those calls PROMOTE to the embedded *Manager".
+  C (negative control) — delete the shim's `AddTxPort` override, a method the
+  pre-pass never calls: **GREEN**, correctly, because a method outside the call
+  surface cannot cause a pre-pass/production divergence.
+  D — delete the shim's `SetAddressBookEntry` override so it promotes to the
+  validating eBPF Manager: **RED** on the same PROMOTE message. D is the
+  review's original F1 chain made real, and the guard catches it.
+  **F2's construction invariant is now pinned**, per the lead's caveat. The
+  argument that the two zone->screen resolution sites are redundant rests on
+  `assignScreenIDs` populating `result.ScreenIDs` BY RANGING
+  `cfg.Security.Screen`, which was implicit.
+  `TestScreenIDsKeySetMirrorsConfig_4960` asserts the two key sets agree in both
+  directions over three fixtures (empty / one / several). PROVEN TO FIRE: adding
+  a single `ScreenIDs["synced-from-peer"]` key that no config declares reds it,
+  `go vet` rc=0. Without this the comment claiming independent binding is
+  "structurally impossible" would silently become false the day ScreenIDs gains
+  a second source.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on both touched files.
+  STILL OWED, unchanged: F4 (widen the ID driver to PolicySetID / RuleID /
+  PolicyNames / scheduler slots) and F6 (success logs for no-op validation-pass
+  operations). Neither started.
+- **File(s)**: pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go, _Log.md
 ## 2026-08-06 — #4800 new-flow-ceiling instrumentation + harness
 
 - **Timestamp**: 2026-08-06
@@ -83743,6 +85649,495 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/grpcapi/server_show_security_text.go,
   pkg/grpcapi/zone_flood_counters_hide_test.go, pkg/api/README.md,
   docs/userspace-dataplane-gaps.md, docs/research/3643-dead-counters/plan.md,
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 6 — fold the three minors from the MERGE-NEEDS-MINOR
+  re-gate at `10b592047`. No blocking findings; no production behaviour changes.
+  **F1 — the pin I added in r5b did NOT cover the shape its own comment named,
+  and the reviewer is right.** `TestScreenIDsKeySetMirrorsConfig_4960` calls
+  `assignScreenIDs` and compares its output against `cfg.Security.Screen`, so it
+  fires when the divergence is introduced INSIDE that function — which is where
+  my r5b mutation put it. A realistic second writer (synced peer, cached
+  snapshot) is a SEPARATE SITE writing after `assignScreenIDs` returns.
+  Reproduced firsthand: inserting `result.ScreenIDs["synced-from-peer"] = 0xfffe`
+  at BOTH production call sites left the whole package GREEN, so the comment's
+  "this test is what fails at that moment" was false for the shape it described.
+  Added `TestAssignScreenIDsIsTheSoleWriter_4960`: an AST scan over every
+  non-test .go file in pkg/dataplane for index-assignments and `delete()` on
+  `.ScreenIDs`, asserting exactly one enclosing function and that it is
+  `assignScreenIDs`. Satisfiable today — `compiler.go` carries the only write;
+  the other three non-test mentions are reads. Two floors (>=10 files scanned,
+  >0 writers found) so a rename cannot make it vacuous.
+  PROVEN TO FIRE on the exact previously-GREEN mutation: `result.ScreenIDs is
+  written from [CompileConfig assignScreenIDs validateBeforeMutateWithResult],
+  expected only assignScreenIDs` with per-site file:line, `go vet` rc=0.
+  **F2 — the hoist's own claim was unbound.** `compileZones` opens with
+  `validateZoneScreenReferences` and the comment says that makes it
+  "structurally impossible for any zone to mutate ... whatever the caller did
+  first". Deleting the hoist while keeping the pre-pass row left the package
+  GREEN, because `compileZones` has one production caller and the pre-pass
+  rejects ahead of it. Added
+  `TestCompileZonesRejectsStaleScreenRefWhateverTheCallerDid_4960`, which calls
+  `compileZones` DIRECTLY (the idiom `compiler_rxvlan_failclosed_5268_test.go`
+  already uses), bypassing CompileConfig and therefore the pre-pass. PROVEN TO
+  FIRE on the previously-GREEN hoist deletion: `compileZones programmed 1
+  zone(s) before rejecting`, `go vet` rc=0. Note the measured count is 1, which
+  corroborates the reviewer over the PR body's stale "2 SetZoneConfig calls".
+  **F3 — three ID-driver dimensions added, one deliberately NOT.** `PolicyNames`
+  (4 entries), `PolicySets` (1) and `AppNames` (92) are all written by
+  `compilePolicies` / `compileApplications`, both already in the driver, so they
+  were omitted rather than unreachable. Each has a floor: the
+  `DefaultPolicySentinelID` key plus a >=2 count for PolicyNames, non-zero for
+  PolicySets, non-empty for AppNames. `PolicyScheduleRuleSlots` is NOT added —
+  `idProbeConfig` declares no scheduler, so the slice is empty and the column
+  would be empty-vs-empty, the exact vacuity the r4 round removed from three
+  other columns. Recorded in the test with what to do first (add a
+  `then schedule` to the fixture).
+  **NITs.** PR body corrected: "Eleven of thirteen" -> Thirteen, "all seven
+  maps" -> eight, "2 SetZoneConfig calls" -> 1. README: "no longer a zones-phase
+  fault at all" described only the pre-pass half and read as though the
+  zones-phase check had been removed — it has not, #6894 hoisted it there.
+  TWELVE rotted file:line citations de-rotted, and per the re-gate's habit note
+  they are now SYMBOL citations rather than re-pinned numbers, because these
+  keep rotting inside this PR: `compiler_iface.go:1256/1284` ->
+  stripUnmanagedInterfaces' LinkDel/LinkSetDown, `compiler.go:723/771/753` ->
+  resolveAddrList and its implicitSets write / cacheKey join,
+  `compiler_iface.go:1255/287/450-454`, and `compiler.go:268/330`. Two of those
+  (`:268`, `:330`) were still CORRECT at this head — verified before touching —
+  and were converted anyway so the next shift cannot rot them; one
+  (`compiler_iface.go:287` -> 310) had rotted since r5 because MY OWN hoist
+  insertion shifted it, which is the habit note earning itself.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_screenids_solewriter_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/compiler.go,
+  pkg/dataplane/README.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 7 — fold Codex's MERGE-NEEDS-MAJOR (C2-C5) plus the
+  re-gate's F8. Two Major findings; both are guards that did not bind what their
+  claims asserted. No production behaviour changes.
+  **C3 (Major) — the ordering claim was TRUE but UNBOUND, and this supersedes a
+  reading I was given as settled.** `validationPhases` says it lists phases "in
+  the same order CompileConfig runs them". Two guards both missed it: the
+  structural test compares the table against a hand-written `want` list (both
+  written together, so both can be wrong together — which is exactly what
+  happened when the zone-screen row sat eighth), and
+  `TestPrePassReportsTheSamePhaseProductionWould_4960` calls only
+  `validateBeforeMutate`, so CompileConfig is never on its path. Moving the
+  TABLE reds that test; swapping the PRODUCTION calls does not. Codex mutated
+  the thing the claim is about and it stayed green.
+  Added `TestPrePassRowOrderMatchesCompileConfig_4960`, which DERIVES the order
+  from CompileConfig's source by AST and compares it to the table, with a
+  per-row map to the production symbol whose position defines that row's
+  precedence (`zone screen references` -> compileZones, because the sweep is
+  hoisted to its top; `firewall filter protocols` -> compileFirewallFilters,
+  because the row runs a pure check production performs inside that phase).
+  Floors on both the derived count and the row count so a rename cannot make it
+  vacuous. PROVEN TO FIRE on Codex's own mutation — swapping compileNAT and
+  compileStaticNAT in CompileConfig: `row 4 is "nat" (production compileNAT),
+  but CompileConfig runs compileStaticNAT in that position`, `go vet` rc=0, and
+  no other ordering test reds, which is the point.
+  **C2 (Major) — allowlist minimality was far weaker than "proven to fire".**
+  The stale check was `shimDecl[name] && fakeDecl[name]`, so a NONEXISTENT
+  method, a non-interface name, an empty rationale, or a declaration that moved
+  outside either scanned file all passed silently. Measured: an arbitrary bogus
+  entry left the fidelity test green. That matters because a name can be
+  pre-added and a later fake stub plus compile call is then silently excused
+  while production promotes the fallible Manager implementation. Replaced with a
+  positive test of legitimacy — an entry must be on the pre-pass call surface
+  (the fake declares it) AND not overridden by the shim (so it really does
+  promote) AND carry a non-empty rationale. PROVEN TO FIRE on
+  `ClearNATPoolConfigs`, the pre-added nonexistent name Codex used.
+  Also per C2: `xpfValidationPass` is NOT a fake-vs-production DataPlane
+  divergence — it is the unexported marker, absent from the DataPlane interface
+  (verified) — so it is scoped out of the call-surface comparison rather than
+  sitting in the allowlist on the same footing as the two real entries.
+  **F8 — the exemption vouched for two methods; the pre-pass skips three.**
+  `compileNAT` makes FOUR `pnat.*` calls over THREE methods —
+  `ClearPoolConfigs`, `SetPoolConfig`, and `RegisterNATIP` (twice). The
+  rationale named two and said "neither returns an error", a two-item word for a
+  three-item set. The conclusion held (all three have empty result lists) but
+  the artifact under-described what it vouched for, and a reviewer re-checking
+  the premise would have verified two of three.
+  Took the self-maintaining fix rather than naming three:
+  `TestPrePassPersistentNATCallsCannotFail_4960` derives the method set by AST
+  from `compileNAT`'s `pnat.*` calls, then asserts each is declared in
+  persistent_nat.go with an EMPTY result list. A fourth call is covered the
+  moment it is written. It also discharges an obligation that previously had NO
+  consumer: the exemption said "if either ever gains an error return this entry
+  must go", but both call sites are bare statements, so adding a result compiles
+  silently at both and nothing observed the transition. This fires on the
+  DECLARATION. PROVEN TO FIRE: giving `RegisterNATIP` an error return reds it —
+  and note it caught the method the old prose never named.
+  Recorded in the exemption, because it inverts the reader's instinct: the typed
+  nil is load-bearing in the SAFE direction. Under master `compileNAT` ran once
+  against the real dp; under the pre-pass it is skipped and then run once by the
+  real pass, so the live table sees an identical sequence. Had the fake modelled
+  a real table, the PRE-PASS would have cleared and repopulated the LIVE
+  persistent-NAT table from a compile whose result is discarded, blanking
+  poolConfigs/natIPToPool for any concurrent LookupPool. The obvious
+  "improvement" is the harmful change — the same shape as the original F1
+  refutation.
+  **C4 (Medium) — a false enforcement claim.** `validateBeforeMutateWith` said
+  any dp "MUST embed discardingDataPlane ... That is enforced". It is not: the
+  implementation checks the unexported MARKER. An in-package type can return
+  true from `xpfValidationPass()` while delegating writes to a live dataplane
+  and would be accepted. Production is safe because the only caller constructs
+  `discardingDataPlane{}` directly and the marker is unexported, so the hole is
+  in-package — but that is a property of the call site, not an enforced
+  invariant. Claim corrected to say what is checked.
+  **C5 (Minor) — the ID-probe header contradicted its own implementation.** It
+  said the phases run "twice against the same dp"; `compileIDsOnce` constructs a
+  fresh `idProbeDP{}` per invocation, so a per-instance counter would reset and
+  both snapshots would compare equal. Header now states what the probe actually
+  detects: state outliving a CompileResult that is not per-dp-instance.
+  NOT RE-LITIGATED, per the brief: the F1 ParseCIDR refutation (independently
+  confirmed), the absence of function-pointer comparison in any guard, and the
+  probability work — `trials = 24` is extrapolation over a fixture whose eight
+  programmable zones plus one offender ARE asserted, so removing valid elements
+  fails deterministically. F3-probability closed.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_prepass_order_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 8 — fold the scoped re-gate at `e42fa044c`. One
+  BLOCKING item, in my own r6 work, plus three minors and four NITs.
+  **F1 (BLOCKING, and my defect) — three columns added, never compared.** r6
+  added `PolicyNames` / `PolicySets` / `AppNames` to `compileIDsOnce`'s return
+  map with a comment claiming an order-dependent id "shows here and nowhere else
+  in this comparison". The `reflect.DeepEqual` loop still listed EIGHT keys and
+  none of the three. Nothing read them. Reproduced: a package-level counter
+  perturbing `result.PolicyNames` across passes left the test PASSING, while the
+  same mutation shape on `implicitSets` — a compared column — reds.
+  This is the shape my own notes name and I walked into it: a prescribed test
+  FORM can be satisfied with the defect intact. Three columns were asked for,
+  three columns appeared, the property stayed unmeasured. The acceptance check
+  for adding a column to a comparison-driven test is a MUTATION IN THAT COLUMN,
+  never the column's presence — now recorded at the loop.
+  Fixed by appending the three keys. PROVEN PER COLUMN, `go vet` rc=0 on each:
+  `PolicyNames differs between pass 1 and pass 2`, `AppNames differs ...`,
+  `PolicySets differs ...`. (First attempt injected the drift at the top of
+  `compilePolicies` and nil-map-panicked — `PolicyNames`/`AppNames` are NOT
+  allocated by `newValidationResult`; they are made inside their phases. Moved
+  the injection after the allocation. A panic is not a red.)
+  The `PolicyScheduleRuleSlots` refusal was independently verified CORRECT:
+  `compiler.go` appends only under `if pol.SchedulerName != ""` and neither
+  probe policy sets it, so it would be nil-vs-nil.
+  **F2 — the pnat guard's floor was `>0`, not exact.** It matched the literal
+  receiver name `pnat`; `compileNAT` has TWO such blocks, so renaming the inner
+  one dropped coverage 3 methods -> 1 while the floor still passed, and a
+  genuinely fallible `RegisterNATIP` would have gone unnoticed. Now the receiver
+  identifiers are DERIVED from the `x := dp.GetPersistentNAT()` assignments (so
+  a rename is no longer an evasion — verified: renaming one block keeps the
+  count at 3 and the test correctly stays green) and the floor is EXACT, the
+  same discipline the ordering guard already uses. PROVEN TO FIRE on a real
+  coverage drop — deleting one whole pnat block: `found 2 distinct methods ...
+  expected 3`, `go vet` rc=0.
+  **F3 — both halves of the fidelity guard were single-file scoped.** They read
+  `loader.go` and `compiler_validate_4960.go` BY NAME, so moving `SetFilterRule`
+  to a sibling file with a REJECTING body left the guard passing — and
+  `compileFirewallFilters` is a late phase, after `compileZones` has mutated the
+  host, which is exactly the #4960 shape. The `<40` floor only catches a
+  wholesale move; with 55 methods, fifteen can migrate first. Now scans the
+  package DIRECTORY, matching the sole-writer canary's discipline, with an exact
+  receiver-name match instead of a substring. PROVEN TO FIRE on the
+  demonstrated escape — `SetAddressBookEntry` moved to a sibling with a
+  rejecting body: `non-no-op body: [SetAddressBookEntry]`, `go vet` rc=0.
+  **F4 — the sole-writer canary's header overclaimed.** It said `assignScreenIDs`
+  is "the ONLY thing that writes the map" and "a second writer ANYWHERE". It
+  binds two SYNTACTIC FORMS: a local alias and a helper taking the map as a
+  parameter both evade it. Escapes are inherent to an AST canary and are not
+  chased; the header now states the scope, and says the realistic regression
+  (a second index-assignment beside the first) is what the redundancy argument
+  is actually exposed to.
+  NITs: `declared` in the pnat assertion was keyed by bare method name across
+  all receivers (last-declaration-wins if a second appears) — now filtered to
+  `PersistentNATTable`; removed `var _ = strings.TrimSpace` and its dead import;
+  replaced single-arg `filepath.Join` and the hand-rolled `itoa` with
+  `fmt.Sprintf`.
+  NOT RE-LITIGATED per the brief: the source-derived ordering guard, all three
+  legitimacy arms of the divergence check, the pnat assertion's derivation, and
+  all twelve citation conversions — each attacked and each held.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean.
+- **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_prepass_order_4960_test.go,
+  pkg/dataplane/compiler_screenids_solewriter_4960_test.go, _Log.md
+
+## 2026-08-06 — #6894 r8: comparison-loop defect + validation-pass success logs
+
+- **Timestamp**: 2026-08-06
+- **Action**: Cherry-pick candidate on top of `e42fa044c`. Carries only what r7
+  does not already have or does better: the F4 comparison-loop defect a re-gate
+  found blocking, the F6 log gating, one F3 measurement, and two stale row-index
+  comments. Deliberately does NOT carry F1, F2, or the F5 ordering treatment.
+- **File(s)**: `pkg/dataplane/compiler.go`, `pkg/dataplane/compiler_nat.go`,
+  `pkg/dataplane/compiler_idprobe_4960_test.go`,
+  `pkg/dataplane/compiler_prepass_logging_4960_test.go` (new),
+  `pkg/dataplane/compiler_validate_4960.go`,
+  `pkg/dataplane/compiler_validate_4960_test.go`,
+  `pkg/dataplane/compiler_zone_screen_prepass_4960_test.go`, `_Log.md`
+
+- **F4 — the blocking half was ALREADY FIXED at `fdc19cab2` while this was
+  being written, so what remains is one level up.** That commit appended the
+  three names to the comparison list, which closes the immediate defect. The
+  failure mode, though, was a SECOND list falling out of sync with the returned
+  map — and a list that must be edited whenever a column is added can fall out
+  of sync again. This derives the key set from the map instead, so a new column
+  is compared the moment it exists. Measured on this tree with the same
+  mutation (seed `policySetID` from a package-level sequence): the eight-key
+  list was GREEN, the eleven-key list and the derived set are both RED on
+  `PolicyNames differs between pass 1 and pass 2`. So this is a
+  RECURRENCE-PREVENTION change, not a defect fix, and it should be graded as
+  one.
+- **F4, second half — `PolicyScheduleRuleSlots`, and the r8 refusal of it was
+  CORRECT on its own terms.** The r8 entry above records refusing this column
+  because `compiler.go` appends only under `if pol.SchedulerName != ""` and
+  neither probe policy set it, so it would have been nil-vs-nil. That reasoning
+  is right and the refusal was the correct call **for that fixture**. This
+  change removes the premise rather than overriding the conclusion: `p-single`
+  now carries `SchedulerName: "sched-6894"`, which reaches the sole writer, and
+  only then is the column added. Adding it without widening the fixture would
+  have been exactly the vacuous comparison r8 declined.
+  It is also the column that DISCRIMINATES: under the seeded-id mutation
+  `PolicyNames` and the slots both move while `PolicySets` (a count) does not,
+  and that asymmetry is only observable if the columns are genuinely consumed. Floors name the specific rule ids (0,1,2 -> p-multi/p-multi/p-single)
+  and the slot's `PolicySetID`/`RuleIndex`/`RuleID`, because a count-only floor is
+  satisfied by a shifted numbering.
+- **F6 — eleven INFO success records gated on `!isValidationPass(dp)`.** The
+  pre-pass's writes are no-ops, so "static NAT compilation complete" and
+  friends recorded success for work that never happened; on a failed apply the
+  journal read success-then-failure for a compile whose result was discarded.
+  Two-way grid, both verified at this head: removing one gate REDs
+  `TestPrePassLogsNoSuccessForWorkItDidNotDo_4960` ("the pre-pass logged 1
+  success record(s)..."), and over-widening it to suppress BOTH passes REDs
+  `TestRealPassStillLogsItsSuccesses_4960` ("the REAL pass no longer logs ...").
+  WARN duplication is left alone and stays on #6903 — noise, not a false claim.
+- **F3 — one measurement, not a rewrite.** r7 already corrected the "coin flip"
+  and uniformity errors and measured 0.0632. What it does not say is that the
+  rate is a property of the fixture's INSERTION ORDER rather than of N: measured
+  over 200,000 constructions, 8-valid-then-offender gives 0.0622 while
+  offender-first gives **0.31** — same nine keys, same value type, factor of
+  five. So hoisting the offender's assignment above the builder loop is a
+  refactor that changes no test, no N and no constant, and silently moves the
+  24-trial bound from ~1e-29 to ~1e-12. Recorded next to the constant.
+- **F5 — two stale comments only.** The r7 reorder moved every row index but no
+  row name, and three comments still said "row 2 / row 3 / row 5 / row 7".
+  Replaced with row NAMES so they cannot rot on the next insertion.
+- **NOT CARRIED, deliberately.** F1: the premise was refuted — the production
+  compile dataplane is `userspaceShimCompileDataplane`, whose
+  `SetAddressBookEntry` is itself a no-op, and `NewDataPlane` refuses the eBPF
+  `Manager`, so there is no divergence on a reachable path and the delegation
+  machinery is unnecessary on an apply path. F2: r7's sole-writer +
+  key-set-mirror pair proves the two screen maps cannot disagree, which is
+  stronger than binding each lookup behind a fixture — and a fixture that seeds
+  them divergently now describes a state production cannot reach. F5 ordering:
+  r7 moved the row to first and derives the order from `CompileConfig`, which
+  makes the claim true and bound rather than merely dropped.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 9 — accept fold6894b's `939405da3` and record MY OWN
+  verification of it, rather than its self-report. It is a clean descendant of
+  `fdc19cab2` (`git merge-base --is-ancestor` confirms), so there is no union
+  merge and no conflict to resolve; this entry adds the checks the merging lane
+  owes.
+  **_Log.md STRUCTURAL CHECK (the one that silently ate 66 lines on their
+  side).** Compared the file at `fdc19cab2` against `939405da3`: 70812 -> 70883
+  lines, delta +71, and the older file is an EXACT PREFIX of the newer
+  (`b.startswith(a)`). Nothing of the r8 entry was dropped. Line-count growth
+  alone is NOT sufficient — a union that both adds and silently drops can still
+  grow — so the prefix property is what was checked. Worth keeping as the test:
+  in a rebase `--theirs` means your OWN commit, not upstream, which is how a
+  union loses the side it was supposed to preserve.
+  **PRODUCIBILITY CHECK on the fixture widening — mine to run, not theirs to
+  assert.** I declined `PolicyScheduleRuleSlots` in r6 because `compiler.go`
+  appends only under `if pol.SchedulerName != ""` and no probe policy set it, so
+  the column would compare nil to nil. Their commit removes that premise by
+  giving `p-single` a `SchedulerName`. Verified the widening actually REACHES
+  the writer rather than assuming it: the column now yields ONE real slot,
+  `PolicySetID=0 RuleIndex=2 RuleID=2 PolicyName="p-single"
+  SchedulerName="sched-6894"`. Only with that confirmed is the column
+  non-vacuous, so the addition is accepted.
+  **THE SIX INFO SITES — the runtime regression this round exists for.**
+  `isValidationPass` gating expands from 9 to 20 non-test occurrences. The six
+  named sites (flow timeouts compiled / source NAT off rule / persistent NAT
+  pool registered / source NAT v6 rule / static NAT rule / static NAT
+  compilation complete) are all gated, plus nptv6 and two `count > 0 &&`
+  summaries. The defect was introduced BY THIS PR's own pre-pass: every commit
+  double-logged all six, and a config the pre-pass then REJECTED still logged
+  "persistent NAT pool registered" and "static NAT compilation complete" for
+  work that never happened. `TestPrePassLogsNoSuccessForWorkItDidNotDo_4960`
+  binds it and `TestRealPassStillLogsItsSuccesses_4960` is the over-reach arm —
+  both retained, because without the second a gate widened to suppress BOTH
+  passes would pass the first.
+  **BOTH ID-DRIVER TREATMENTS KEPT, not either.** Their derivation (the compared
+  key set derived from `compileIDsOnce`'s return map) is what stops the r8
+  defect recurring — a parallel list you must remember to edit fell out of sync
+  exactly once already. My per-column mutation proof is what shows it currently
+  binds. RE-RUN on the merged result, `go vet` rc=0 on every cell: `PolicyNames
+  differs`, `AppNames differs`, `PolicySets differs`, and now
+  `PolicyScheduleRuleSlots differs`. Four columns, four independent reds. The
+  two lanes were running DIFFERENT experiments, not disagreeing: one mutation
+  can only move the columns it touches, which is why their single-seed probe
+  moved two of three.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean.
+- **File(s)**: _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6894 r9 — fold the Codex MERGE-BLOCK at `cf79adff3`. F1 (BLOCKING):
+  the pre-pass ACCEPTS an NPTv6 config the Rust helper REJECTS post-mutation.
+  F2/F3 (MINOR): the log gate's over-reach arm and the ID probe's aliasing hole.
+
+  **F1 — chose (i) make the pre-pass reject what Rust rejects, NOT (ii) make the
+  Go snapshot builder drop the malformed rule, NOT (iii) narrow the claim.**
+  The reasoning is the load-bearing part:
+  - **(ii) is a security regression.** The Go side dropping the rule is exactly
+    the fail-open #2240 closed. `compileNPTv6` calls `DeleteStaleNPTv6(written)`
+    over only the VALID subset, so editing one previously-good rule into an
+    invalid one TEARS DOWN its working translation with no replacement. The
+    Rust whole-snapshot rejection is what makes the apply preflight keep the
+    previous live state — and `validateNPTv6Strict`'s own lenient warning text
+    PROMISES exactly that ("the helper rejects the whole NPTv6 snapshot and the
+    previous state is kept"). Dropping in Go falsifies that promise.
+  - **(iii) is unnecessary**, because (i) does not brick. Verified firsthand:
+    `configstore.Store.Load` (store_persist.go) and `Store.SyncApply` (store.go)
+    both compile through `s.compileTreeLenient` — `pkg/config`, not
+    `pkg/dataplane`. Neither reaches `CompileConfig`, so a pre-pass rejection
+    cannot fail a boot or an HA peer sync. What it fails is the dataplane apply,
+    which ALREADY fails today at `publishSnapshotFailClosedLocked` — just after
+    `compileZones` created VLANs and reconciled addresses. (i) moves an
+    already-certain failure ahead of the mutation; it creates no new one.
+  - **Over-rejection was the real hazard and is gated.** A rule the snapshot
+    builder DROPS (#5818 unsupported match scope) never reaches the helper, so
+    today's apply SUCCEEDS without it; hard-erroring on it would break a working
+    tolerant-load config. `config.NPTv6ScopeUnsupported` (new,
+    `pkg/config/nptv6_scope.go`) is now the SSOT both `buildNptv6Snapshots` and
+    `compileNPTv6` read, so the two cannot drift.
+  - Added the **#4519 host-bits check** the Go compiler lacked: it truncates to
+    the prefix BYTES (silently masking), the helper's `parse_prefix` fails
+    CLOSED. Without it the fix would close the class Codex demonstrated and
+    leave an identical one one string away.
+  - **RESIDUAL, named in the code**: the helper also rejects overlapping
+    prefixes (#2241) partitioned by zone scope (#5176). Not replicated —
+    `validateNPTv6Strict`'s overlap check does NOT partition, so reusing it
+    would reject configs the helper ACCEPTS. An overlap still lands
+    post-mutation.
+
+  **Mutation cells, `go vet` rc=0 before each, verbatim assertion captured:**
+  - F1 revert (restore the four `slog.Warn; continue` arms, drop the host-bits
+    block): `TestNPTv6UnparseablePrefixRejectedBeforeHostMutation_4960` RED with
+    *"compileZones RAN before the failing phase was caught (1 SetZoneConfig
+    calls) — the host was mutated before a later phase failed, which is #4960"*.
+    Host-bits and length-mismatch tests RED the same way. **Over-reach guards
+    stayed GREEN** under that revert: the five scope-excluded sub-cases and the
+    valid-NPTv6 control.
+  - Builder inline-copy divergence (drop `MatchDestinationPort` from a
+    re-inlined predicate): `TestNptv6BuilderDropSetMatchesScopePredicate_4960`
+    RED naming the disagreeing rule.
+  - Rust half verified firsthand, non-zero match: `cargo test --release --bin
+    xpf-userspace-dp -- invalid_snapshot_rejected_fail_closed
+    host_bits_snapshot_rejected_fail_closed parse_prefix_rejects_host_bits` →
+    3 passed, 4250 filtered. The `"not-a-prefix"` / `"2001:db8:9::/48"` pair is
+    literally the `bad-parse` fixture over there.
+
+  **F2 — the gate is complete; its two-way grid was not.** MEASURED the
+  pre-pass's reachable set rather than reasoning: of 19 `!isValidationPass(dp)`
+  sites, 17 are reachable and 2 are NOT (`SNAT egress IP set` — the pre-pass's
+  `newValidationResult` has an empty ifCache so the branch soft-skips;
+  `persistent NAT pool registered` — the shim's typed-nil `GetPersistentNAT`
+  skips the block). Both are stated in the test, not papered over. The
+  over-reach arm went from 13 named records to 17 + 2 separately bound:
+  `logProbeConfig` now reaches the source-NAT-off, persistent-NAT and
+  no-address-SNAT paths, the real-pass driver seeds the egress ifCache and a
+  live persistent-NAT table, `successLogLines` returns FULL records so the two
+  `default policy compiled` arms are distinguishable, and
+  `TestOverReachArmCoversEveryReachableGate_4960` derives the gate COUNT by AST
+  so a newly gated site cannot be added unaccounted.
+  Cells: screen gate suppress-both → RED (the exact case Codex measured GREEN);
+  SNAT-egress suppress-both → RED; gated WARN removed → negative arm RED;
+  deny-all gate removed → ONLY the `default-deny` subtest RED (`default-permit`
+  stayed green — the arms are separately bound); a new gated record added → the
+  completeness test RED at 20 vs 19.
+
+  **F3 — aliasing hole closed with an A/B, not an assertion.** `first` is now
+  rendered to strings BEFORE the second compile. Proof: simulated the exact
+  regression class (a column served from process-global storage, drifting on the
+  second call) — WITH the pre-second snapshot the test REDs *"ZoneIDs differs
+  between pass 1 and pass 2"*; with the snapshot moved AFTER the second compile
+  (the r8 shape) the SAME regression is GREEN. Added a mechanical universal
+  floor (`columnIsEmpty` over every column — an always-empty column REDs), and
+  tightened the four loose floors to match the file's own "specific entry, not
+  merely non-empty" claim: ZoneIDs and AppIDs name entries, AppNames is DERIVED
+  from AppIDs (reverse-index agreement), PolicySets is exact, PoolIDs names all
+  four pools, NextPoolID is derived as max+1. Production cells: a
+  `result.PolicySets++` double-increment → RED at "PolicySets is 2, want exactly
+  1" (the old `!= 0` accepted it); a `result.NextPoolID++` over-advance → RED at
+  "NextPoolID is 5 but the highest assigned pool id is 3" (the old `> nat64ID`
+  accepted it).
+
+  Every mutated file restored from a byte-level backup and verified by sha256 /
+  `git diff HEAD` being empty. No `git checkout` used to undo a probe.
+- **File(s)**: pkg/config/nptv6_scope.go (new),
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/userspace/nat_nptv6.go,
+  pkg/dataplane/compiler_validate_4960.go, pkg/dataplane/README.md,
+  pkg/dataplane/compiler_nptv6_prepass_4960_test.go (new),
+  pkg/dataplane/userspace/nat_nptv6_scope_parity_4960_test.go (new),
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6894 r9b — COMMENT-ONLY. Restate the #4960 pre-pass's no-brick
+  argument as an IMPORT CLOSURE instead of a call trace, and carry a positive
+  control with it. No production behaviour, no test, no fixture changed; the
+  only non-comment edit in the commit is this log entry.
+
+  The r9 comment said configstore's `Load` / `SyncApply` "compile through
+  `pkg/config.compileTreeLenient` and never reach `CompileConfig`". True, but
+  it is a statement about today's call sites: one new call site makes it
+  silently false, and false in the direction that matters, because the next
+  reader trusts it and skips the check. The durable form is that
+  `pkg/dataplane` is not in `pkg/configstore`'s dependency CLOSURE — not merely
+  un-imported, but unreachable through any intermediate package — so the path
+  cannot be created without a visible new dependency edge.
+
+  Measured firsthand at `ba3aa2c40`, including the `-test` variant (a
+  `_test.go` import is a real edge for this purpose):
+
+      go list -deps       ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane -> 0
+      go list -deps -test ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane -> 0
+      go list -deps       ./pkg/daemon      | grep -c psaab/xpf/pkg/dataplane -> non-zero (CONTROL)
+
+  **The control is the load-bearing part and it is why this edit was worth
+  making at all.** A bare `grep -c ... = 0` is indistinguishable from a broken
+  query — wrong module path, wrong flag, a swallowed build failure all print 0.
+  The `pkg/daemon` leg proves the query can find a real edge, which is what
+  converts "0" from an absence of OUTPUT into an absence of DEPENDENCY. Its
+  four edges were listed to confirm the control is not itself a coincidence:
+  `pkg/dataplane`, `.../runtime`, `.../userspace`, `.../userspace/format`. The
+  comment records the control COMMAND and the required NON-ZERO property but
+  deliberately does NOT pin the count — this file already carries one lesson
+  about a stated number going stale (the "ONE such error" note in
+  `validationPhases`), and the value is not what makes the query trustworthy.
+
+  Scope held deliberately tight: nothing else in the file was touched, so the
+  diff is trivially verifiable as comment-only at re-gate time.
+  GATES: `gofmt -l` clean; `go vet ./pkg/dataplane/...` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config/... -count=1` rc=0.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md
 ## 2026-08-07 — #5798 fold: bind the fragment-authority ZONE OVERRIDE at its production wiring
 
 - **Timestamp**: 2026-08-07
@@ -83839,6 +86234,23 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
   pkg/daemon/reth_prepare_abort_recovery_5103_test.go, _Log.md
 - **Timestamp**: 2026-08-12
+- **Action**: #6211 review fold — correct two false claims in the source-NAT
+  release/rollback sweep comment. MINOR 1: the comment called the swept body
+  "a cold teardown path"; it is not. `rollback_source_nat_allocation` has five
+  non-test call sites, all on the packet path in
+  `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472, :2634, :4902), and
+  :2374 is the admission-refusal arm — the flood regime. The comment now
+  states the per-refused-flow cost (K allocator locks instead of
+  owning-index + 1) as a mechanism, explicitly noting no throughput
+  measurement was taken, and gives the correctness argument that justifies
+  paying it. MINOR 2: "at most one allocator could ever hold a given flow"
+  was stated unconditionally; it held only against an UNCHANGED `rules`,
+  because `parse_source_nat_rules_with_previous` carries allocators over
+  keyed on `allocator_key()` alone. The comment now scopes the invariant and
+  says #6211 does not create the hazard, it makes it reachable with no config
+  edit at all. Comments only — no behaviour change; `cargo build --release`
+  rc 0.
+- **File(s)**: userspace-dp/src/nat/source.rs, _Log.md
 - **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
   only in tests that injected their own budget), plus an S3 doc sentence.
   Every behavioural test in `tests_aggregate_budget.rs` drives
@@ -89326,6 +91738,288 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
 
+## 2026-08-13 — #6304 round 3: bind the batch accounting triple + the lookup byte argument
+
+- **Timestamp**: 2026-08-13
+- **Action**: Close four unbound accounting sites at the flow-cache-hit call
+  site; correct the scope claimed for the `BindingLiveState` layout guard.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
+Four sites in `stage_flow_cache_hit` ran on every forwarded packet and were
+read by nothing. Three are `BatchCounters` fields the harness itself hid:
+`run_stage` built a `BatchCounters::default()` and dropped it, so `StageRun`
+had nowhere to report them from. The fourth is an ARGUMENT rather than a
+counter — `lookup_counted(.., meta.pkt_len)` — unbound in the
+reaches-past-the-adapter shape, since the only other callers invoke the callee
+directly with a literal.
+
+Retention alone would not have closed the NAT pair. Their guards read
+`cached_decision.nat.rewrite_src`/`rewrite_dst`, and every fixture in the
+module carried `NatDecision::default()`, so both lines were unreachable as well
+as unread. `nat_translated_entry` supplies a cached decision AND a matching
+descriptor, with the checksum deltas derived from the same
+`compute_*_csum_delta` helpers the seed path uses so the fixture cannot drift
+from the constructor; the cell asserts the translated addresses on the staged
+TX bytes, so the counters cannot claim a translation the wire never carried.
+
+MUTATION PROOF, four cells, each a full `cargo test --bins` invocation
+(`--skip wg::engine::engine_internal_tests`, a known load artefact) so the RED
+and the greens it is contrasted against share one run. Baseline 4268 passed /
+0 failed; every cell 4267 passed / 1 failed, so no cell has a collapsed
+denominator.
+
+| mutation (production line) | RED test | assertion line |
+|---|---|---|
+| delete `telemetry.counters.forward_candidate_packets += 1` (`flow_cache_hit.rs:333`) | `..._accounts_forward_and_nat_packets_6304` | `:2044` (left 0, right 1) |
+| delete `telemetry.counters.snat_packets += 1` (`:347`) | same test | `:2050` (left 0, right 1) |
+| delete `telemetry.counters.dnat_packets += 1` (`:350`) | same test | `:2055` (left 0, right 1) |
+| `meta.pkt_len` -> `0` (`:108`) | `..._counts_observed_bytes_on_the_hit_6304` | `:2126` (`Some(0)` vs `Some(58)`) |
+
+The three counter mutations red THREE DIFFERENT assertions, which is the
+property that matters: had deleting the snat line red the dnat assertion, the
+two would not be independently bound. Each counter mutation also leaves the
+observed-bytes cell green and vice versa.
+
+LAYOUT-GUARD SCOPE, corrected. The four un-gated `const _: [(); N]` asserts at
+`binding_state/mod.rs:752-755` (verified: four of them, module scope, no `cfg`
+attribute) are a TRIPWIRE for one hazard, not a layout fingerprint. Size,
+alignment and two offsets do not determine where the other fields sit, so a
+perturbation moving only UNPINNED fields satisfies all four literals in both
+build configurations. They are also toolchain- and target-specific:
+`BindingLiveState` is `repr(Rust)` and the crate pins neither a `rust-version`
+nor a toolchain file. That failure direction is safe — a changed value is a
+compile ERROR carrying the actual number, never a silent accept — so the
+response to a trip is to re-measure, not to widen. The earlier prose said an
+instrument "that perturbed the layout could satisfy at most one" build; the
+honest bound is "that moved ANY OF THESE FOUR VALUES". The un-gated const also
+means the runtime mirror cell can never FAIL, since the build breaks before the
+test binary exists; it is a readable mirror, not an independent check.
+
+The original prescription — un-gated const asserts, after a size-only guard
+missed an offset change — narrows here rather than being overturned. It is
+still stricter than a test. It is not proof of whole-struct equality.
+
+MISATTRIBUTED FINDINGS, recorded so the next round does not chase them. The
+round-3 dispatch also carried a block about constant-ambiguous `Drop` fixtures
+(`read_rx_drop_…`, `read_complete_drop_…`, `write_tx_drop_…`,
+`write_fill_drop_…`), a `[0,2,2]` distinct-NONZERO const-assert hole, and seven
+stale-prose citations. None of it belongs to this PR. `xsk_ffi_tests.rs` here
+is 265 lines and contains none of those fixtures or prose;
+`forwarding_build/tests.rs` is 5587 lines, so the cited `:5601` does not exist;
+`zone_counters.rs` here is byte-identical to master. Every one of those
+citations resolves EXACTLY at the head of the #5716 AF_XDP-API-hardening branch
+(`xsk_ffi_tests.rs:352/673/777/787/857/858/937`,
+`forwarding_build/tests.rs:5601`, `forwarding_build/mod.rs:266`, `_Log.md:226`),
+which is where that review was actually written. Routed there rather than
+folded here.
+
+## 2026-08-13 — #6304 round 4 (B1): aggregate the accounting rows so independence is observable
+
+- **Timestamp**: 2026-08-13
+- **Action**: replace the three sequential counter assertions in
+  `live_flow_cache_callsite_accounts_forward_and_nat_packets_6304` with a
+  six-row non-panicking aggregation asserted once at the end; state the property
+  claimed; re-measure the mutation matrix
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+
+WHAT WAS WRONG WITH THE ROUND-3 MATRIX, which is recorded above this entry and
+is superseded by it. The three counter assertions lived in ONE test and it
+panicked on the first failure, so in every cell the later assertions never ran:
+deleting the forward increment red at `:2044` and the SNAT and DNAT assertions
+were never reached; deleting SNAT red at `:2050` and DNAT was never reached.
+Three distinct failure LINES prove the three assertions read three distinct
+FIELDS. They cannot prove same-run independence, because the rows whose silence
+was being read as "still green" had not executed. Separately, the round-3 claim
+that each mutation reds exactly one assertion was not supported even in
+principle: deleting the forward increment also falsifies the untranslated
+forward assertion at `:2069`, which simply never got the chance to fire.
+
+Codex called this BLOCKING at round 4 and the classification is right for this
+PR specifically. The deliverable here IS the accounting bindings, so a finding
+that the bindings do not demonstrate what they claim lands on the deliverable
+rather than beside it; the usual "test plumbing, fold and merge" disposition
+does not apply.
+
+THE FIX. All six discriminators are evaluated into an `observed` array and
+reported by a SINGLE assertion, so every row runs in every cell and the failure
+message is the complete set of rows that moved. The untranslated run is staged
+next to the translated one, before the first row is read, so both runs have
+completed before anything is judged. The positive controls stay panicking and
+are relabelled PRECONDITIONS: a run that did not forward, or did not really
+translate the frame, can say nothing about the counters, and aborting is more
+honest than reporting six meaningless rows. That split is what lets a mutation
+matrix distinguish a broken FIXTURE from a result.
+
+THE PROPERTY CLAIMED, decided rather than left implicit. It is NOT "exactly one
+row reds". It is: deleting production increment X reds every row ABOUT X and no
+row about either other increment. Two rows are about the forward increment
+deliberately — `nat/forward` binds the increment, `plain/forward` binds its
+POSITION outside both `is_some()` NAT guards, since an increment moved inside
+them still satisfies the translated run — so the forward cell reds two rows and
+both name forward. The duplicate forward dependency is therefore KEPT, with the
+claim narrowed to match it, rather than deleted to rescue a stronger-sounding
+claim that was about the test's own redundancy instead of the production code.
+
+RE-MEASURED, tree `/var/tmp/f6882r3` at `37d22ac39` + this change,
+`cargo test --bin xpf-userspace-dp <test>`, each cell mutated from a clean
+production file and restored after. Every cell reached the aggregate assertion,
+so in all five the preconditions held and the red is an assertion about
+production code, never an expired precondition:
+
+| mutation | rc | rows evaluated | rows diverged | failure kind | duration |
+|---|---|---|---|---|---|
+| baseline, unmutated | 0 | 6 | none | — | 0.01s |
+| delete `forward_candidate_packets += 1` (`flow_cache_hit.rs:333`) | 101 | 6 of 6 | `nat/forward` + `plain/forward` (2) | assertion | 0.01s |
+| delete `snat_packets += 1` (`:347`) | 101 | 6 of 6 | `nat/snat` only (1) | assertion | 0.01s |
+| delete `dnat_packets += 1` (`:350`) | 101 | 6 of 6 | `nat/dnat` only (1) | assertion | 0.01s |
+| `rewrite_src.is_some()` -> `true` (`:346`) | 101 | 6 of 6 | `plain/snat` only (1) | assertion | 0.04s |
+| `rewrite_dst.is_some()` -> `true` (`:349`) | 101 | 6 of 6 | `plain/dnat` only (1) | assertion | 0.02s |
+
+The forward cell is the one the old matrix could not read: it now shows the two
+NAT rows EXECUTING and HOLDING while both forward rows move. The two guard cells
+were not in the round-4 brief; they were measured because the test's own prose
+claims each guard is bound and reds "no other" row, and a claim in prose that
+can be measured should not be argued. Durations are uniform and near zero here —
+these are pure unit cells with no polling, so no red in this matrix can be a
+precondition timeout, and the assertion-vs-precondition column is established by
+the panic SITE (all five at the aggregate assertion, none at a control).
+
+## 2026-08-13 — #6304 round 4 (B2+B3): the tripwire is unpinned, and every claim narrowed to the four measured values
+
+- **Timestamp**: 2026-08-13
+- **Action**: record that nothing pins the four `const _` layout asserts, with
+  the cost of deleting them measured; narrow every statement of "layout
+  neutrality" to "none of the four pinned values moved"
+- **File(s)**: `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`
+
+B2 — THE TRIPWIRE IS ITSELF UNPINNED. Measured on tree `/var/tmp/f6882r3` at
+`37d22ac39`, `cargo test --bin xpf-userspace-dp admission_attempt_instrument`,
+each cell mutated from a clean file and restored:
+
+| cell | rc | outcome |
+|---|---|---|
+| delete ALL FOUR `const _` (mod.rs:752-755) | 0 | test binary compiles, mirrored runtime cell PASSES |
+| delete only :752 (size) | 0 | same |
+| delete only :753 (align) | 0 | same |
+| delete only :754 (`pending_tx_admitted`) | 0 | same |
+| delete only :755 (`delta_loss_pending`) | 0 | same |
+| RED CONTROL: `const` literal 2304 -> 2305 | 101 | E0308 at compile time |
+| RED CONTROL: runtime cell literal 2304 -> 2305 | 101 | assertion `left == right` |
+
+The two RED controls ran in the SAME invocation as the green cells, so the
+greens are credible rather than a filter that matched nothing: the asserts are
+live while present, and the runtime cell does exercise its assertions.
+
+DECISION: documented as unpinned, NOT given a canary. The only shapes available
+for guarding a source construct are a match on its NAME or its TEXT. Both are
+proxies satisfiable by a differently-spelled equivalent, both red on a harmless
+rename while staying green on a semantic gutting, and this repo has been bitten
+by that shape repeatedly (#6871, #6743, #6676 among them). A guard that is itself
+a `const` would be exactly as deletable as what it guards, and guarding IT is the
+same problem one level up. No runtime witness is possible either: what the four
+lines assert is a statement about the PRODUCTION configuration, and a test binary
+is by construction the test configuration.
+
+WHAT DELETION COSTS, measured rather than asserted, with a `cfg(test)` `AtomicU64`
+declared ahead of `pending_tx_admitted` (the hazard's own shape):
+
+| cell | production `cargo build` | test build / run |
+|---|---|---|
+| H1 asserts present, literals untouched | rc=0 | rc=101, reports 2152 -> 2160 AND 2280 -> 2288 |
+| H2 asserts present, literals re-measured to 2160/2288 | rc=101, reports 2160 -> 2152 and 2288 -> 2280 | rc=0 |
+| H3 asserts DELETED, runtime cell re-measured to 2160/2288 | rc=0 | rc=0 — perturbation accepted in SILENCE |
+
+H2 is the "could satisfy at most one of the two builds" claim, previously argued
+and now measured: the guard cannot be made green by re-measuring in whichever
+configuration is in front of you. H3 is what deleting the four lines costs, and
+it is the difference between them and the runtime cell — the runtime cell CAN be
+re-measured green and they cannot. That pair is written into the file beside the
+asserts, so a future deleter reads what they are giving up in numbers instead of
+a plea not to.
+
+H1 also fills in a cell the round-3 table recorded as "not measured": the
+FIELD-ahead shape moves `delta_loss_pending` 2280 -> 2288 as well as
+`pending_tx_admitted` 2152 -> 2160. The docs table now carries the measured value.
+
+B3 — PROSE NARROWED. The honest claim is that NONE OF THE FOUR PINNED VALUES
+MOVED, which is a real result and a narrower one. Every statement of it now says
+that:
+  - `docs/userspace-dataplane-gaps.md` "Layout neutrality is MEASURED" ->
+    "Four layout values are MEASURED", with the scope paragraph named as part of
+    the claim rather than a caveat on it.
+  - same doc, "(1) The thread-local moves nothing" -> "moves none of those four
+    values", stating explicitly that a perturbation confined to the other ~90
+    fields would not show up.
+  - `binding_state/mod.rs` heading "LAYOUT NEUTRALITY of ..." -> "FOUR PINNED
+    LAYOUT VALUES, tripping if ... moves any of them"; and "the instrument is no
+    longer layout-neutral" -> "has moved one of these four values".
+  - `binding_state/tx_inbox.rs` "Both halves of that are MEASURED" -> "What is
+    MEASURED ... is four values", with the unpinned ~90 named.
+  - `binding_state/tests/tx_inbox.rs` doc headline "does not perturb
+    `BindingLiveState`" -> "moves none of FOUR PINNED ... layout values", and the
+    test RENAMED
+    `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
+    -> `..._leaves_four_pinned_layout_values_unchanged_6304`, since the name was
+    itself a statement of the overclaim. The reference at `_Log.md:622` is a
+    historical round-3 entry and is left as written; this entry supersedes it.
+  - `poll_descriptor/flow_cache_hit_tests.rs` carried the STRONGEST form of the
+    overclaim, and it was introduced by this PR: "A thread-local is
+    layout-neutral (that struct is BYTE-IDENTICAL with and without it)". That is
+    a whole-struct equality claim which the corrected scope paragraph elsewhere
+    in the same PR flatly contradicts. Replaced with the four-value statement,
+    as was the second instance further down the same file.
+
+Not touched, deliberately: the parts Codex confirmed accurate — the
+whole-struct-fingerprint disclaimer, the `repr(Rust)`/unpinned-toolchain note,
+and the remeasure-don't-widen prescription. Also left alone is
+`binding_state/mod.rs:11`, whose "byte-identical" is about code MOTION of moved
+items in an earlier PR and is not in this PR's diff.
+
+## 2026-08-13 — #6304 round 4 (B1 addendum): the row count is pinned by the array type
+
+- **Timestamp**: 2026-08-13
+- **Action**: record the measured type-level pin on the aggregated row set
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+
+The obvious objection to replacing six `assert_eq!`s with one aggregated
+assertion is that a row could then be dropped from the array and the test would
+still pass with less coverage — the same silent-loss exposure a deleted
+`assert_eq!` has. It does not apply here, and the reason is measured rather than
+argued: `observed` is annotated `[(&str, u64, u64, &str); 6]`, so deleting the
+`plain/dnat_packets` row fails the test build with E0308 (rc=101, tree
+`/var/tmp/f6882r3`, `cargo test --no-run --bin xpf-userspace-dp`).
+
+This is worth stating next to the B2 entry above because it is the pin B2 could
+NOT have. It is a TYPE-level constraint, so it cannot be satisfied by a
+differently-spelled equivalent — unlike a canary matching a NAME or the TEXT of
+an assertion, which is the proxy shape this tree keeps being bitten by. Where
+such a pin is available it should be taken; the four `const _` layout asserts
+are unpinned because no equivalent exists for them, not because pinning was
+judged unnecessary.
+
+FULL SUITE, tree `/var/tmp/f6882r3` at `01728e1c5`:
+`cargo test --bin xpf-userspace-dp` -> rc=0, 4292 passed, 0 failed, 2 ignored,
+34.37s. An earlier invocation of the same command returned rc=101 and that was
+NOT an assertion: the log carries 0 `FAILED` lines, 0 panics and 4289 `... ok`,
+and ends in `signal: 15, SIGTERM` with three `afxdp::wg::engine` concurrency
+tests still running past 60s on a box at load average ~25 with 11 sibling cargo
+runs. The exit code reported a termination, not a result; the clean re-run is
+the measurement.
+
+`cargo fmt --check` is not a gate in this crate (hundreds of pre-existing
+diffs). The relevant check is that this round added none: the file it wrote new
+code in, `flow_cache_hit_tests.rs`, has exactly the same ten rustfmt diff sites
+at `37d22ac39` and at this head — 35/570/753/948/1055/1094/1240 unchanged, and
+the last three shifted 1496/1563/1612 -> 1501/1568/1617 by the five lines the
+prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-13
 - **Action**: #6871 round 9 — close a BLOCKING heartbeat-lifecycle defect the
   round-8 self-reap introduced, build the guard round 8's own comment claimed
@@ -92676,3 +95370,256 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   zone rows stay green under both, which is why the flood rows were needed:
   they read `zone_counter_store` and never look at the flood store.
 - **File(s)**: `userspace-dp/src/afxdp/forwarding_build/tests.rs`
+- **Timestamp**: 2026-08-21
+- **Action**: #6894 drive-to-merge pass at `6eb35c749`. Merged `origin/master`
+  (234 commits, MERGE not rebase; only `_Log.md` conflicted — union-resolved,
+  structural check 3141 = 2991 base + 19 ours + 131 theirs, anchored marker
+  sweep clean). Rebuilt the GENERATED `docs/refactoring-audit-current.txt`.
+
+  **The Codex MERGE-BLOCK at `cf79adff3` does NOT reproduce at this head.**
+  Verified firsthand with a from-scratch fixture (own zone + VLAN
+  sub-interface) driven through production `CompileConfig`, NOT by trusting
+  the `ba3aa2c40` fold: all seven malformed NPTv6 classes — including Codex's
+  verbatim `2001:db8:9::/48` / `not-a-prefix` — are rejected by the pre-pass's
+  `nptv6` row with `zoneConfigCalls=0 vlanIfaceInfoCall=0 ifaceSetupCalls=0`,
+  and the valid control still compiles.
+
+  Ran the fidelity question as a **differential** rather than on hand-picked
+  cases: 21 candidate prefix strings through Go's `net.ParseCIDR` + the
+  length/family/host-bits gates, and a verbatim `rustc`-compiled copy of Rust's
+  `parse_prefix`. **No string is Go-accept / Rust-reject** — the property the
+  review said was false holds. Exactly one diverges the other way (F1).
+
+  **Hostile runtime pass (Go, apply/rollback ordering) — all held:**
+  - Nil-deref through `discardingDataPlane`'s nil embedded interface: audited
+    all 55 non-test `dp.<Method>(` call sites in `pkg/dataplane` mapped to
+    enclosing functions. The 16 un-overridden methods live ONLY in
+    `compileZones`/`mapZoneInterface`/`programZoneMaps`/`applyTunnelHostInbound`,
+    `compileFirewallFilters`, `compilePortMirroring` and `CompileConfig` — none
+    is a `validationPhases` row. Grep is complete: every `DataPlane`-typed
+    param in non-test `pkg/dataplane` is named `dp` (32/32).
+  - Over-rejection from the pre-pass's empty `ifCache`: every `return
+    fmt.Errorf` in `compileNAT` is config-shaped or a `dp` error; none is gated
+    on `hasV4`/`hasV6`/`ifCache`.
+  - Typed-nil `GetPersistentNAT`: both call sites nil-check; neither `pnat`
+    path returns an error.
+  - Double-compile side effects on `cfg`: none. `compilePolicies`' `rule` is a
+    LOCAL `PolicyRule` literal; `assignZoneIDs` is pure.
+
+  **Findings filed, not folded** (campaign bar: non-runtime / pre-existing do
+  not block):
+  - **#7077** — the ONE PR-introduced behaviour change. Rust's `parse_prefix`
+    accepts a `+`-prefixed mask (`u8::from_str`) that Go's `net.ParseCIDR`
+    refuses, so `nptv6-prefix fd00:9::/+48` applied SUCCESSFULLY before this PR
+    and now hard-fails. Reachability measured end-to-end through
+    `ParseSetCommand` + `SetPath` + `CompileConfigLenient` (rule RETAINED with
+    the #1960 warning). Filed rather than folded because the correct fix is on
+    the Rust side and would make a Go-only PR owe a cluster smoke.
+  - **#7078** — pre-existing residual, same shape as the block that was closed:
+    the pre-pass does not replicate the helper's zone-partitioned NPTv6 overlap
+    rejection (#2241/#5176). Measured: `validateBeforeMutate` -> nil,
+    `CompileConfig` -> tripwire with `zoneConfigCalls=1` (mutation phase
+    entered). Identical on master. Records why reusing `validateNPTv6Strict`'s
+    overlap check is WRONG (it does not partition by zone).
+  - **#7079** — pre-existing: `(*Manager).Compile` `os.Remove`s every
+    `/sys/fs/bpf/xpf/links/xdp_*` pin, and `CompileUserspaceShim` runs two more
+    bpffs cleanups, ALL before `CompileConfig` — so host state is mutated ahead
+    of the pre-pass. Bounded (`m.xdpLinks` holds the fd, running attach
+    survives); costs pin survival across a daemon restart.
+
+  Validation, real `$?` written to a file (no piped gate): `go build ./...`
+  rc=0; `go vet ./...` rc=0; `go test -count=1 ./pkg/dataplane/...
+  ./pkg/config/... ./pkg/configstore/...` rc=0; `go test -count=1 ./...` rc=0
+  (62 packages ok, zero FAIL, #6743 `.dpCell` canary included). Diff is
+  **Go-only** — nothing under `userspace-dp/`, `userspace-xdp/`, `bpf/` — so
+  **no cluster smoke is owed**. `Closes #4960` deliberately ABSENT: the body
+  says "Advances #4960 (bounded increment)" and #7078 is a measured residual.
+  Verdict: **MERGE-READY**.
+- **File(s)**: _Log.md, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6894 r10 — fold the parent's override on #7077. The r9 NPTv6
+  hard error was a no-brick REGRESSION for one class, and the fix is a
+  NARROWING, not a revert.
+
+  **The literal instruction could not be implemented and would have re-opened
+  the block.** The brief was "hard-error when strict, warn-and-skip when
+  lenient". Two problems, the second decisive:
+  - `pkg/dataplane` has NO strict/lenient signal. `CompileConfig` receives a
+    `*config.Config` with no provenance; the distinction lives entirely in
+    `pkg/config`'s `compileOpts.lenientNPTv6`.
+  - It is not a DISCRIMINATOR, because it does not vary. MEASURED through the
+    production `ParseSetCommand` + `SetPath` path: `validateNPTv6Strict`
+    REJECTs all five malformed classes (unparseable, `+`-mask, host-bits,
+    length-mismatch, /56) and lenient RETAINS all five with the #1960 warning.
+    So a malformed rule can only ever reach `compileNPTv6` from the lenient
+    path, and "warn when lenient" == "warn always" == a full revert of the r9
+    #4960 fix, re-opening the Codex half-applied shape.
+
+  **The correct discriminator is whether the HELPER installs the rule.** Rust's
+  `parse_prefix` parses the mask with `u8::from_str` (takes a leading `+`);
+  Go's `net.ParseCIDR` is digits-only. So `fd00:9::/+48` is a Go parse ERROR
+  and a helper ACCEPT — the apply SUCCEEDS today. Every class r9 closed is one
+  the helper REFUSES, so all of them still hard-error.
+  `nptv6HelperWouldInstall` (new,
+  `pkg/dataplane/compiler_nptv6_helper_grammar.go`) mirrors `parse_prefix` plus
+  its per-rule length gate; `compileNPTv6`'s reject closure now warns-and-skips
+  when `!installed || helperInstalls`.
+
+  Skipping costs nothing observable — `compileNPTv6` writes the RETIRED eBPF
+  map surface while `buildNptv6Snapshots` copies Match/Then out of the config
+  INDEPENDENTLY, so a skipped rule still reaches the helper and is still
+  installed. Bound in `pkg/dataplane/userspace` (not asserted in prose) with a
+  #5818 scope-drop control so the assertion is not satisfied by a builder that
+  emits unconditionally.
+
+  **Mutation cells, `go vet` rc=0 on EVERY cell (no build break masked an
+  assertion), tree restored from byte-level backups + sha256 verified — no
+  `git checkout` used:**
+  - **M1 (the fix reverted, `helperInstalls := false`)**:
+    `TestHelperAcceptedNPTv6PrefixIsSkippedNotRejected_7077` +
+    `TestStrictCommitStillRejectsHelperAcceptedMalformedPrefix_7077` RED with
+    *"the apply was REJECTED for an NPTv6 rule the helper ACCEPTS, so a config
+    whose apply SUCCEEDS today now fails"*. The over-reach control and ALL
+    THREE r9 #4960 NPTv6 tests stayed GREEN — the two arms are separately
+    bound.
+  - **M2 (over-reach control, `helperInstalls := true` = full revert)**: all
+    EIGHT sub-cases of `TestHelperRefusedNPTv6PrefixStillHardErrors_7077` RED
+    plus the three r9 tests, verbatim *"compileZones RAN before the failing
+    phase was caught (1 SetZoneConfig calls)"* — i.e. it demonstrably
+    re-opens #4960. The r10 behavioural test stayed green.
+  - **M3 (drift: `+` arm dropped from the mirror)**: the parity table RED
+    naming `"2001:db8::/+48"`, AND the behavioural test RED — the drift guard
+    has a real consequence, not just a table.
+  - **M4 (constant word count, `case 64: words = 3`)**: parity table RED on the
+    /64 rows AND the over-reach control RED — a yes/no-only table would have
+    missed it, which is why word counts are asserted.
+
+  Drift for the second copy of a Rust grammar is bound, not hoped for: the
+  parity table's expected column was produced by compiling `parse_prefix`
+  VERBATIM with rustc (40 rows, 11 accepted / 29 refused, with a non-vacuity
+  guard so a one-sided table fails rather than passing under a constant
+  implementation), covering both signs, leading zeros, `_` separators,
+  non-ASCII digits, u8 overflow at 256, zones, v4-mapped literals and host
+  bits.
+
+  Docs updated as part of the contract: the "FOURTH class" paragraph in
+  `compiler_validate_4960.go` now says THREE properties keep it from
+  over-rejecting and names the grammar one, and `pkg/dataplane/README.md`'s r9
+  bullet is narrowed from "the parse class" to "the parse class the helper
+  REFUSES".
+
+  #7077 retitled and re-scoped to the Rust half (tighten `parse_prefix`'s mask
+  token to digits-only), with the three-step retirement plan for the Go mirror
+  recorded so it is not read as closed by this PR.
+
+  Validation at `f1191d1ba`+: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./...` rc=0 (62 packages ok, ZERO FAIL — no ddns flake this
+  run). Diff still Go-only; no cluster smoke owed.
+- **File(s)**: pkg/dataplane/compiler_nptv6_helper_grammar.go (new),
+  pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go (new),
+  pkg/dataplane/userspace/nat_nptv6_helper_accepted_7077_test.go (new),
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-21 — drive #6882 to merge-ready: independent 13-cell mutation matrix, #6722 fixture repair
+
+- **Timestamp**: 2026-08-21
+- **Action**: Independent drive/verification pass over PR #6882 (#6304, bind the
+  LIVE mirror call site in `stage_flow_cache_hit`). The PR is a TEST-BINDING PR,
+  so the deliverable IS the binding: a finding that the binding does not bind
+  what it claims goes at the deliverable and blocks. Everything below is a
+  firsthand measurement in a private worktree, tree restored byte-clean
+  (`git status --porcelain` empty) after every cell.
+
+  **Merged master twice** (234 commits, then a further 112). `_Log.md` was the
+  only conflict both times: union-resolved and structurally checked — round 1
+  sections 1596+1656-1587=1665 observed 1665, `Timestamp` 3014+3137-3005=3146
+  observed 3146; round 2 sections 1665+1689-1656=1698 observed 1698, `Timestamp`
+  3146+3201-3137=3210 observed 3210; zero conflict markers; nothing dropped from
+  master either time. Round 2's single ours-side line delta is master's own edit
+  of a line this branch never touched (our side is byte-identical to the merge
+  base there), not a union artefact. No code file was union-resolved.
+  `docs/refactoring-audit-current.txt` regenerated after each merge via
+  `scripts/refactoring-audit.sh` (rc=0, no diff — already current).
+
+  **A RUNTIME-CLASS RED FOUND IN THE MERGE and fixed.**
+  `live_flow_cache_callsite_accounts_per_zone_traffic_6304` passes at the
+  pre-merge head `8dbd9e0c8` (rc=0) and FAILS at the merge commit (rc=101, in
+  isolation, `flow_cache_hit_tests.rs:1876`) — the untrust row was absent from
+  the snapshot entirely. Cause: #6722 rewrote
+  `ForwardingState::egress_zone_id` from a read of `egress[i].zone_id` into a
+  single read of the new `ifindex_unambiguous_zone_id` ledger.
+  `with_zone_accounting` seeded only `forwarding.egress`, which that resolver no
+  longer consults. Production is correct; the fixture had gone stale. Fixed by
+  seeding the ledger with the same ifindex -> zone the fixture already writes
+  into `egress` — which is what `populate_egress` does in production, so the
+  fixture still models a state the builder can produce. Stale half of the doc
+  comment corrected to name the map that is actually read.
+
+  **Mutation matrix, 13 cells at `e8a7dd9f5`.** Every cell: `cargo check
+  --tests --bins` rc=0 FIRST (0 `^error` lines), so every red is an assertion
+  and not a build break; then a full `cargo test --bins --no-fail-fast --
+  --test-threads=1` over all 4358 tests; reds listed are the COMPLETE tree-wide
+  failure set.
+
+  | cell | mutation at the LIVE call site | tree-wide reds |
+  |---|---|---|
+  | BASE | none | 0 among #6304 (1 unrelated wg flake, see below) |
+  | M1 | `config.rate` -> `1` (sampler dropped) | **6** #6304 cells |
+  | M2 | reserve-before-sample, open-coded | **2**: delegation canary + attempt count |
+  | M2b | same, via a RENAMED import | **2**: canary (first arm) + attempt count |
+  | M2c | reserve FIRST via renamed import, delegation KEPT | **1**: attempt count only |
+  | M3 | `Sampled(Ok(_)) => None` | **3** |
+  | M4 | commit the counter except on `Sampled(Err)` | **1**: `selected_full_queue_advances_sampler` |
+  | M5 | capture the clone AFTER the rewrite (code motion) | **1**: `selected_admitted_clone_reaches_target` |
+  | M6a | delete `forward_candidate_packets += 1` | **1** (2 of 6 ROWS, both forward) |
+  | M6b | delete `snat_packets += 1` | **1** (1 of 6 rows, `nat/snat`) |
+  | M6c | delete `dnat_packets += 1` | **1** (1 of 6 rows, `nat/dnat`) |
+  | M7 | `meta.pkt_len` -> `0` at `lookup_counted` | **1**: `counts_observed_bytes_on_the_hit` |
+  | M8 | delete the `record_zone_traffic` call | **1**: `accounts_per_zone_traffic` |
+
+  **M2c is the decisive cell.** Both arms of the source-text canary stay
+  satisfied — `sample_then_admit_mirror_clone(` is still present and
+  `admit_mirror_clone_to_live(` never appears, because the reservation is
+  reached through `use ... as reserve` — so the canary is GREEN and only the
+  runtime attempt count reds (`left: 1, right: 0`). That measures the PR's
+  central claim: the attempt-count instrument catches reserve-first in a
+  spelling source text cannot see. M2b shows why M2c was needed — M2b removes
+  the delegating call, so the canary's FIRST arm fires and the cell cannot
+  isolate.
+
+  **The last review's blocking finding (Codex @ `37d22ac39`: sequential
+  assertions cannot show independence) is CLOSED, re-measured here rather than
+  taken on the fold's word.** Every M6 cell panics at the single aggregate
+  assertion (`flow_cache_hit_tests.rs:2168`) reporting `N of 6 accounting rows
+  diverged. ALL 6 were evaluated`: M6a reds 2 rows, both naming the forward
+  increment, with BOTH NAT rows held in the same run; M6b reds only
+  `nat/snat_packets`; M6c reds only `nat/dnat_packets`. That is exactly the
+  property the fold claims — deleting increment X reds every row about X and no
+  row about either other increment.
+
+  **Reachability of the mutated site** (a red at a site production never reaches
+  measures nothing): `stage_flow_cache_hit` carries no `cfg` gate and is called
+  from the poll loop at `poll_descriptor/mod.rs:321`; the mirror block sits
+  behind the plain runtime `is_self_target && owned_packet_frame.is_none()`
+  condition, not behind a `cfg`. Every mutation cell's `cargo check --tests
+  --bins` includes the non-test `--bins` configuration and compiled the mutated
+  code, so the edits are in the shipped configuration and not `cfg(test)`
+  scaffolding.
+
+  **Production surface of this PR: none.** Everything it adds to a production
+  build is four un-gated `const _: [(); N]` layout assertions in
+  `binding_state/mod.rs` (compile-time only, fail-loud) plus comments; the
+  instrument bump, the thread-local, the `policy.rs` byte accessor, the module
+  hook and the re-export are all `#[cfg(test)]`. Test-only diff, so NO cluster
+  smoke is owed.
+
+  **Environment flake, not this PR**: `afxdp::wg::tests::framed_handshake::
+  concurrent_consume_response_and_reinitiation_is_sound` failed the BASE cell
+  with `no handshake completed — the race path was not exercised` (a PRECONDITION,
+  not the asserted property) while three other lanes were running full cargo
+  suites (load average 55 on 16 cores). It passed in the immediately preceding
+  full run on the same tree and in all 12 other cells. Filed separately.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs,
+  _Log.md

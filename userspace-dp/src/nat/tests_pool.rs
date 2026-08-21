@@ -4121,7 +4121,7 @@ fn synced_session_reserves_nat_pool_port_4388() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
 
     // The reservation is visible as an occupied translated tuple.
     assert!(
@@ -4244,7 +4244,7 @@ fn synced_deterministic_reservation_not_recycled_5178() {
         rewrite_src_port: Some(3584),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&det_rules, &det_key, det_nat, false);
+    reserve_synced_source_nat_allocation(&det_rules, &det_key, det_nat, false, None);
     assert!(
         det_rules[0].pool_allocator.debug_is_port_occupied(0, 3584),
         "synced deterministic reservation must occupy its pool port"
@@ -4288,7 +4288,7 @@ fn synced_deterministic_reservation_not_recycled_5178() {
         rewrite_src_port: Some(10000),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false);
+    reserve_synced_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, None);
     release_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, 2_000);
     // Unchanged by the fix: a round-robin reservation recycles on release so the
     // freed port is reused oldest-first (#3011). This must stay GREEN both before
@@ -4324,7 +4324,7 @@ fn synced_session_without_nat_reserves_nothing_4388() {
 
     let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     // No translation carried on the synced decision.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, NatDecision::default(), false);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, NatDecision::default(), false, None);
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4357,7 +4357,7 @@ fn synced_session_foreign_pool_addr_skips_reserve_4388() {
         rewrite_src_port: Some(10000),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false, None);
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4391,7 +4391,7 @@ fn synced_reverse_entry_reserves_nothing_4388() {
         ..NatDecision::default()
     };
     // is_reverse = true: the reserve is a no-op.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true, None);
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4431,7 +4431,7 @@ fn synced_address_only_session_reserves_reverse_identity_token_5338() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
 
     // THE FAIL-ON-REVERT ASSERTION (mint): the standby minted the reverse-
     // identity token for the synced flow. On revert the map is empty.
@@ -4497,6 +4497,662 @@ fn synced_address_only_session_reserves_reverse_identity_token_5338() {
         rules[0].pool_allocator.debug_address_only_owners().len(),
         0,
         "releasing the synced session must free its address-only token (no leak)"
+    );
+}
+
+// === #6211: synced source-NAT rule identity under OVERLAPPING pool addresses ===
+
+/// #6211 fixture: two pool-mode source-NAT rules that carry the SAME public
+/// pool address in SEPARATE allocators.
+///
+/// The allocator is shared per `allocator_key` (pool name + addresses + port
+/// range — see `SourceNatRule::allocator_key`), so DISTINCT `pool_name`s with
+/// the same member address give two rules one address across two independent
+/// `PortAllocator`s. That is the pathological shape #6211 is about: the
+/// pre-fix "first rule whose pool CONTAINS `rewrite_src`" selection cannot
+/// tell them apart, while the ACTIVE node picked between them by zone.
+///
+/// Rule order is deliberate: the `dmz->wan` rule is FIRST, so a session the
+/// active translated under the `lan->wan` rule hits the wrong allocator first
+/// on the pre-fix path.
+fn overlapping_pool_rules_6211() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-dmz".to_string(),
+            from_zone: "dmz".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-dmz".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-lan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-lan".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ])
+}
+
+// #6211 FAIL-ON-REVERT (port-bearing / PAT arm): with two source-NAT rules
+// carrying OVERLAPPING pool addresses in SEPARATE allocators, a peer-synced
+// reservation must land in the allocator belonging to the rule the ACTIVE node
+// matched by ZONE — not in the first rule whose pool merely CONTAINS the
+// translated address.
+//
+// Before the fix `reserve_synced_source_nat_allocation` scanned rules in
+// snapshot order and reserved on the first pool-owner, which here is the
+// `dmz->wan` rule; the active had translated a `lan->wan` flow under the
+// `lan->wan` rule. The standby's collision guard therefore sat in the WRONG
+// allocator, so after a failover a fresh local `lan->wan` flow allocated the
+// SAME (pool address, port) the still-live synced session owns — two sessions
+// on one public source tuple, the reverse-path ambiguity the reservation
+// exists to prevent.
+//
+// Reverting the #6211 pass-1 block in `reserve_synced_source_nat_allocation`
+// (leaving only the pre-#6211 first-pool-match) makes the "lan rule holds the
+// reservation" and "post-failover local flow must not get 20000" assertions
+// RED.
+#[test]
+fn synced_reservation_follows_active_zone_match_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    // The active matched its rule by zone: this session came in on `lan` and
+    // left via `wan`, so it was translated under rules[1] (`snat-lan`).
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+
+    assert!(
+        rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the lan->wan rule's allocator (the one the ACTIVE used) must hold the reservation"
+    );
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the dmz->wan rule's allocator must NOT hold the reservation (#6211: it is \
+         merely the first pool that contains the address)"
+    );
+
+    // The consequence the reservation exists to prevent: a post-failover local
+    // `lan->wan` flow allocates from the SAME allocator the active used. It
+    // must skip the reserved 20000. On revert it gets 20000 and collides with
+    // the still-live synced session.
+    let addrs = rules[1].pool_addresses_v4.clone();
+    let new_flow = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.51".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40001,
+        dst_port: 443,
+    };
+    let translated = rules[1]
+        .pool_allocator
+        .allocate_translation(
+            new_flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+        )
+        .expect("the lan pool must have a free port");
+    assert_eq!(
+        translated.port, 20001,
+        "a post-failover local flow under the SAME rule the active used must not \
+         reuse the synced session's reserved port 20000"
+    );
+
+    // The standard teardown still frees it — the reservation went in through
+    // the shared `reserve_synced_on_first_pool_owner` body, so
+    // `release_source_nat_allocation`'s own first-pool-owner scan finds it.
+    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "releasing the synced session must free the reservation it took"
+    );
+}
+
+// #6211 FAIL-ON-REVERT (address-only arm, #5338/#6210): the same divergence
+// applies to a `port no-translation` synced session, whose reverse-identity
+// token must be minted in the allocator the ACTIVE used. A token in the wrong
+// allocator is exactly the "reverse index cannot disambiguate the promoted
+// session" hazard #5338 closes — the #6210 mirror inherited it.
+//
+// Reverting the #6211 pass-1 block mints the token on the `dmz->wan` rule and
+// turns both assertions RED.
+#[test]
+fn synced_address_only_token_follows_active_zone_match_6211() {
+    let rules = parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-dmz".to_string(),
+            from_zone: "dmz".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-dmz".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            pool_no_translation: true,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-lan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-lan".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            pool_no_translation: true,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ]);
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    // Address-only: a pool address but NO translated port (the wire keeps the
+    // packet's own source port).
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: None,
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+
+    assert_eq!(
+        rules[1].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "the lan->wan rule's allocator (the one the ACTIVE used) must own the \
+         address-only reverse-identity token"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "the dmz->wan rule's allocator must mint no token (#6211)"
+    );
+}
+
+// #6211 FAIL-ON-REVERT (leak): a session re-upserted under a DIFFERENT
+// `synced_zones` outcome lands in a SECOND allocator, and the teardown must
+// free BOTH.
+//
+// The two-pass selection is not a pure function of `rules`: pass 1 and pass 2
+// can pick different rules for the same session at different times. A zone
+// delete/renumber flips `synced_source_nat_zone_pair` to `None`; a rule-set
+// `from zone` / `match` edit moves pass 1's candidate set. Every live session
+// re-upserts on HA session-sync reconnect (and on a post-delete-journal-overflow
+// resync), and `upsert_synced_with_origin` removes + re-inserts, so
+// `handle_upsert_synced` re-runs the reserve. The two rules' allocators are
+// independent, so the second reserve SUCCEEDS rather than short-circuiting on
+// `reserve_flow`'s idempotence.
+//
+// With the pre-fix first-hit `break` in `release_source_nat_allocation` the
+// teardown freed `pool-dmz` and stopped, leaving `pool-lan` holding port 20000
+// forever — a permanent standby pool leak that also counts against
+// `max_tracked_flows`. Restoring that `break` makes the "both freed" assertion
+// RED.
+#[test]
+fn synced_reservation_double_upsert_across_zone_outcomes_frees_both_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    // Upsert #1: the zone pair resolves -> pass 1 -> the `lan->wan` rule.
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+    // Upsert #2 (same live session re-synced) AFTER a zone delete/renumber, so
+    // the pair no longer resolves -> pass 2 -> the `dmz->wan` rule.
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20000)
+            && rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "precondition: the re-upsert reserved the SAME session in a SECOND \
+         allocator (they are independent, so idempotence does not apply)"
+    );
+
+    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "teardown must free the dmz-rule reservation"
+    );
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "#6211 LEAK: teardown must ALSO free the lan-rule reservation — a \
+         first-hit `break` in release_source_nat_allocation strands it forever"
+    );
+}
+
+// #6211 CONTROL for the release sweep: dropping the first-hit `break` must not
+// over-free. A DIFFERENT flow holding a reservation in another rule's allocator
+// is untouched by this flow's teardown — `release_flow` returns false unless
+// the stored translated tuple matches.
+#[test]
+fn synced_release_sweep_does_not_free_an_unrelated_flow_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let mine = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let mine_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+    let other = session_key_from_src("10.0.61.99", 40099, "8.8.8.8", 443);
+    let other_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20050),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(&rules, &mine, mine_nat, false, Some(("lan", "wan")));
+    reserve_synced_source_nat_allocation(&rules, &other, other_nat, false, None);
+    assert!(rules[1].pool_allocator.debug_is_port_occupied(0, 20000));
+    assert!(rules[0].pool_allocator.debug_is_port_occupied(0, 20050));
+
+    release_source_nat_allocation(&rules, &mine, mine_nat, false, 2_000);
+
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "this flow's own reservation is freed"
+    );
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20050),
+        "the sweep must NOT free an UNRELATED flow's reservation in another \
+         rule's allocator"
+    );
+}
+
+// #6211 NEGATIVE CONTROL (mixed-version / unresolvable zone): with NO zone pair
+// available — an old peer that carried neither a zone id nor a resolvable zone
+// name, or config drift — the reservation falls back to the pre-#6211
+// first-pool-match. It must NOT be dropped: a missing reservation is strictly
+// worse than one in a debatable allocator, and this is byte-identical to what
+// shipped.
+//
+// This is the direction stated in the `reserve_synced_source_nat_allocation`
+// doc comment; deleting the pass-2 fallback leaves both allocators empty and
+// turns this RED.
+#[test]
+fn synced_reservation_without_zone_pair_falls_back_to_first_pool_match_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "with no zone pair the reservation must still be taken, on the pre-#6211 \
+         first pool that contains the address"
+    );
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the fallback must not reserve on both rules"
+    );
+}
+
+// #6211 NEGATIVE CONTROL (zone pair matches NO rule): the active translated
+// under a rule this node cannot confirm — e.g. NAT config drift between the HA
+// nodes, so no local rule matches the synced zone pair. The reservation must
+// still be taken via the pass-2 fallback rather than silently skipped.
+#[test]
+fn synced_reservation_unmatched_zone_pair_still_reserves_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    // No local rule is scoped `mgmt -> wan`.
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("mgmt", "wan")),
+    );
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "an unmatched zone pair must fall back to the pre-#6211 first-pool-match, \
+         never drop the reservation"
+    );
+}
+
+// #6211 NEGATIVE CONTROL (single rule): the one-rule config — the overwhelming
+// majority — must be byte-identical with and without a zone pair. There is
+// nothing to disambiguate, so pass 1 and pass 2 land on the same allocator.
+#[test]
+fn synced_reservation_single_rule_is_zone_pair_invariant_6211() {
+    let snapshot = [SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10005,
+        ..SourceNATRuleSnapshot::default()
+    }];
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.1".parse().unwrap()),
+        rewrite_src_port: Some(10000),
+        ..NatDecision::default()
+    };
+
+    for zones in [None, Some(("lan", "wan"))] {
+        let rules = parse_source_nat_rules(&snapshot);
+        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones);
+        assert!(
+            rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+            "single-rule reservation must be identical for zones = {zones:?}"
+        );
+        assert_eq!(
+            rules[0].pool_allocator.debug_occupied_count(),
+            1,
+            "exactly one port reserved for zones = {zones:?}"
+        );
+    }
+}
+
+// #6211 NEGATIVE CONTROL (non-overlapping pools): when only ONE rule's pool
+// owns the translated address there is nothing to disambiguate, so the
+// selection must be identical with and without a zone pair — including when
+// the owning rule is NOT first in snapshot order.
+#[test]
+fn synced_reservation_non_overlapping_pools_is_zone_pair_invariant_6211() {
+    let snapshot = [
+        SourceNATRuleSnapshot {
+            name: "snat-dmz".to_string(),
+            from_zone: "dmz".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-dmz".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-lan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-lan".to_string(),
+            // DISJOINT from the dmz pool.
+            pool_addresses: vec!["203.0.113.20/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ];
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.20".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    for zones in [None, Some(("lan", "wan"))] {
+        let rules = parse_source_nat_rules(&snapshot);
+        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones);
+        assert!(
+            rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+            "the only pool owning 203.0.113.20 must hold it for zones = {zones:?}"
+        );
+        assert_eq!(
+            rules[0].pool_allocator.debug_occupied_count(),
+            0,
+            "the disjoint pool must stay untouched for zones = {zones:?}"
+        );
+    }
+}
+
+// #6211 GUARD on the scope decision: the standby matcher deliberately IGNORES
+// the #3096 interface / routing-instance scope axis, because that axis is
+// derived from node-local ifindex maps the standby cannot reproduce for the
+// ACTIVE node's ingress/egress.
+//
+// Here the rule the active used carries `from interface ge-0/0/1` and comes
+// FIRST; a second, unscoped rule with an overlapping pool follows. Matching
+// with the full `matches` predicate under an empty scope context would REJECT
+// the scoped rule (its `from_interface` cannot equal "") and push the
+// reservation onto the later rule — worse than the pre-#6211 first-pool-match,
+// which at least landed on the right one. Swapping `matches_ignoring_scope`
+// for `matches` in `reserve_synced_source_nat_allocation` turns this RED.
+#[test]
+fn synced_reservation_ignores_unconfirmable_interface_scope_6211() {
+    let rules = parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-lan-if".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            // #3096 scope: node-local, and NOT carried on the sync wire.
+            from_interface: "ge-0/0/1.0".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-if".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-lan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-lan".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ]);
+    assert_eq!(
+        rules[0].from_interface, "ge-0/0/1.0",
+        "precondition: the first rule carries an interface scope"
+    );
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "an interface-scoped rule must stay a CANDIDATE — the standby cannot \
+         confirm or refute the #3096 scope, so it must not narrow on it"
+    );
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the reservation must not skip past the scoped rule onto a later one"
+    );
+}
+
+// #6211 GUARD on the L4 axis: the zone pair alone does not disambiguate. Two
+// rules with the SAME zone pair and overlapping pools, separated only by
+// `match destination-port`, must still resolve to the rule the active matched
+// — the standby feeds the synced 5-tuple through the same `l4_matches` the
+// active used.
+//
+// Dropping `l4_matches` from `matches_ignoring_scope` makes both rules
+// candidates, the first wins, and this turns RED.
+#[test]
+fn synced_reservation_narrows_on_l4_match_6211() {
+    let rules = parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-web".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            match_destination_ports: vec![NatPortRangeWire { low: 80, high: 80 }],
+            pool_name: "pool-web".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-tls".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            match_destination_ports: vec![NatPortRangeWire {
+                low: 443,
+                high: 443,
+            }],
+            pool_name: "pool-tls".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ]);
+    // The synced session is to port 443 — the active matched `snat-tls`.
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+
+    assert!(
+        rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the dst-port 443 rule (the one the ACTIVE matched) must hold the reservation"
+    );
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the dst-port 80 rule must not hold it"
+    );
+}
+
+// #6211 GUARD on the destination axis being POST-DNAT: the active matches
+// source NAT against the post-DNAT destination (`nat_match_flow =
+// flow.with_destination(effective_resolution_target)` in `poll_descriptor`),
+// and `reserve_synced_source_nat_allocation` builds its flow key the same way
+// (`nat.rewrite_dst.unwrap_or(key.dst_ip)`). So a synced session that also
+// carries a DNAT must be narrowed on the TRANSLATED destination, not the
+// original one.
+//
+// Feeding `key.dst_ip` instead of `flow.dst_ip` into the pass-1 predicate picks
+// the wrong rule and turns this RED.
+//
+// NB the key here carries the PRE-DNAT destination with `rewrite_dst` set. In
+// production the installed forward key IS `nat_match_flow.forward_key`, whose
+// destination is ALREADY post-DNAT, so `nat.rewrite_dst.unwrap_or(key.dst_ip)`
+// is idempotent and both shapes yield the same `flow.dst_ip`. This shape is
+// used deliberately because it is the one that DISTINGUISHES the two: with a
+// production-shaped key the mutation would be invisible.
+#[test]
+fn synced_reservation_narrows_on_post_dnat_destination_6211() {
+    let rules = parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-orig-dst".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            // Matches the ORIGINAL (pre-DNAT) destination.
+            destination_addresses: vec!["198.51.100.7/32".to_string()],
+            pool_name: "pool-orig".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-xlated-dst".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            // Matches the POST-DNAT destination — what the active matched on.
+            destination_addresses: vec!["10.10.10.7/32".to_string()],
+            pool_name: "pool-xlated".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ]);
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "198.51.100.7", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        // Pre-routing DNAT rewrote the destination before the SNAT match ran.
+        rewrite_dst: Some("10.10.10.7".parse().unwrap()),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+
+    assert!(
+        rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the rule matching the POST-DNAT destination must hold the reservation"
+    );
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "the rule matching the pre-DNAT destination must not hold it"
     );
 }
 

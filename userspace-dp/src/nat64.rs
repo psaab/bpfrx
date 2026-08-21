@@ -1416,8 +1416,29 @@ impl Nat64State {
 /// EXACTLY as `Nat64State::allocate_source` built it — `dst_ip` is the
 /// translated IPv4 destination (`nat.rewrite_dst`), NOT the synthetic v6
 /// destination stored on the session key — so the same-key `release_flow` /
-/// `rollback_flow` frees the port the forward flow reserved. Every prefix's
-/// allocator is tried; the one that owns the flow frees it and the loop breaks.
+/// `rollback_flow` frees the port the forward flow reserved.
+///
+/// #6876: EVERY prefix holding this exact `(flow, translated)` is freed — the
+/// loop does NOT stop at the first one that frees it. This mirrors the
+/// source-NAT sibling (`release_source_nat_allocation_with_mode`) and for the
+/// same reason: `reserve_synced_nat64_allocation` takes the first prefix whose
+/// allocator ACCEPTS, so selection is OCCUPANCY-dependent, not a pure function
+/// of the prefix list. A prefix whose port is transiently held by an unrelated
+/// local flow is skipped and the reservation lands on a later prefix; when the
+/// earlier one frees and the synced session REFRESHES — every HA session-sync
+/// reconnect and every periodic re-upsert re-runs the reserve — the SAME flow
+/// becomes held in BOTH. A first-hit `break` then freed one and left the other
+/// holding its `(pool_addr, port)` forever: nothing else removes a
+/// `live_by_flow` entry (`release_flow` / `rollback_flow` / the stale-tuple
+/// replace in `reserve_flow` are the only removers, and `gc_expired_chunked`
+/// sweeps persistent LEASES, not live flows).
+///
+/// Sweeping every prefix cannot over-free: `release_flow` / `rollback_flow`
+/// return false unless `live_by_flow[flow].translated` equals THIS `translated`
+/// tuple, so a prefix holding a different flow — or the same flow under a
+/// different translation — is untouched. For the single-reservation case the
+/// outcome is bit-identical; only the early exit is gone. Pinned by
+/// `nat64_6876_release_frees_every_prefix_holding_the_flow`.
 fn release_nat64_allocation_with_mode(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
@@ -1442,10 +1463,11 @@ fn release_nat64_allocation_with_mode(
         src_port: key.src_port,
         dst_port: key.dst_port,
     };
+    // #6876: no first-hit `break` — see the doc comment above. A flow can be
+    // held in more than one prefix's allocator, and a prefix that does not hold
+    // it is a cheap no-op (`release_flow` returns false on a tuple mismatch).
     for prefix in &nat64.prefixes {
-        if release_nat64_pool_port(&prefix.port_allocator, flow, snat_v4, port, now_ns, rollback) {
-            break;
-        }
+        release_nat64_pool_port(&prefix.port_allocator, flow, snat_v4, port, now_ns, rollback);
     }
 }
 
