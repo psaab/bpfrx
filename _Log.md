@@ -1,3 +1,47 @@
+## 2026-08-21 — #6688: source-NAT `port range` discarded every token past the grammar
+
+- **Timestamp**: 2026-08-21 (fix/6688-natsrc-port-range-tail)
+- **Action**: Gave `parseSourcePoolPortRange` a FIXED arity per shape and made
+  an unconsumed token fail closed. `#5457` validated the endpoints the grammar
+  consumed but never bounded how many tokens it consumed: the legacy shape
+  matched at `len(toks) >= 4` and the Junos shape at `len(toks) >= 3`, and the
+  remainder was dropped. `port range 1000 2000` therefore parsed as the bare
+  single-port shape and compiled `PortLow == PortHigh == 1000` — a pool the
+  operator sized at 1001 ports provided ONE, committed clean, and exhausted
+  under the first real translation load. The second slot was never parsed at
+  all, so `[ 1000 99999 ]` and `[ 1000 notaport ]` also committed clean.
+
+  `port range` is NOT a value list: it is a compound value TAIL. Accepting
+  `["1000","2000"]` as `[1000,2000]` was rejected as the fix because the lexer
+  strips brackets before the compiler sees anything — that reading would invent
+  a two-token `range <low> <high>` grammar Junos does not have AND silently
+  redefine the mistyped bare form. Failing closed routes the authored spec
+  through the existing `PortRangeInvalidSpec` channel instead: strict commit
+  hard-rejects naming the spec, the tolerant load / peer-sync path marks the
+  pool unusable.
+
+  The `security nat source pool <*> port range` row is removed from
+  `knownSpellingInconsistencies` in the same change, as the #2419
+  spelling-differential gate requires. Measured after the fix: the site is still
+  ENUMERATED and COMPARED (A/C/D/E carry verdicts, B is inert) and all four now
+  agree — the row went stale because the defect is fixed, not because coverage
+  dropped.
+
+  Validation: `go test -count=1 ./pkg/config/ ./pkg/dataplane/...` exit 0.
+  Mutation proof: reverting the arity hunk alone leaves `go build ./...` and
+  `go vet ./pkg/config/` at exit 0 and reds
+  `TestParseSourcePoolPortRangeUnconsumedTail_6688`,
+  `TestSourceNATPoolPortRangeTailFailsClosed_6688` and
+  `TestSourceNATPoolPortRangeSpellingsAgree_6688` as ASSERTIONS, plus the gate
+  itself with an unexpected-inconsistency hit; the over-reject control
+  `TestSourceNATPoolPortRangeValidUnaffected_6688` stays green. Go-only, in
+  `pkg/config` — nothing reaches the Rust helper binary
+  (`PortRangeInvalidSpec` is `json:"-"`), so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_nat_source_pool_port_6688_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  docs/config-schema.md, docs/userspace-dataplane-gaps.md, _Log.md
+
 ## 2026-08-21 — #7114: a factory boot of the appliance image claimed no NIC, so no bake could sign
 
 - **Timestamp**: 2026-08-21 (fix/7114-appliance-factory-bootstrap)

@@ -154,10 +154,6 @@ var knownSpellingInconsistencies = map[string]string{
 	"system services ssh key-exchange":                "#6692",
 	"system services web-management api-auth api-key": "#6692",
 	"system dataplane shared-umem interface":          "#6692",
-
-	// #6688 — source-NAT port range compiles a one-port pool.
-	"security nat source pool <*> port range": "#6688",
-
 }
 
 // ---------------------------------------------------------------------------
