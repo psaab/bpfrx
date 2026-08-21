@@ -60,25 +60,56 @@
   (cell O), with a control that renames the member `reth1` -> `ge-0/0/1` and
   changing nothing else, which must resolve `lan`.
 
-  **MUTATION PROOF, POST vs PRE.** Each mutation was applied to a copy and the
-  package suite run twice: once as-is, once with the two 6722 test files
-  reverted to `f7c8ce7bb`. A green PRE with a red POST is what shows the NEW
-  cell is what binds the line.
+  **MUTATION PROOF, POST vs PRE, WITH A WITNESS.** Each mutation was applied to
+  a copy and the package suite run twice: once as-is, once with the two 6722
+  test files restored to `f7c8ce7bb` BY CONTENT COPY (`git show REF:path >
+  file`, never `git checkout REF -- path`, which cannot restore an untracked
+  file, cannot remove a file the ref lacks, and reverts unstaged work). A green
+  PRE with a red POST is what shows the NEW cell, and not something already in
+  the tree, is what binds the line.
+
+  Every cell also installs a canary test in the same package that always fails,
+  and runs the WHOLE package with `-count=1` and NO `-run` filter. A green is
+  otherwise not evidence: "the test passed" and "the test never executed" print
+  the same thing. The canary's named RED in the same invocation is what
+  certifies the binary built and ran, so the surrounding greens mean something —
+  which is why FULL_RC is 1 in every row below and the VERDICT column, not the
+  exit code, carries the result. Verdict precedence VOID > BUILD-BREAK > RED >
+  GREEN; a cell whose canary does not appear in the FAIL list is VOID.
 
   ```text
-  M1  rule-2 conflict arm picks the last-sorting authored zone
-        POST FULL_RC=1  RED  TestTwoAuthoredZonesOnOneCoherentNetdevFailClosed_6722
-        PRE  FULL_RC=0  SURVIVOR
-  M2  egressMemberIsBarePort drops the reth-prefix conjunct
-        POST FULL_RC=1  RED  TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722
-        PRE  FULL_RC=0  SURVIVOR
+  cell                                                     POST        PRE
+  M0  NO MUTATION (baseline control)                       SURVIVOR    SURVIVOR
+  M1  rule-2 conflict arm picks last-sorting zone          RED (B1)    SURVIVOR
+  M2  egressMemberIsBarePort drops the reth prefix         RED (B2)    SURVIVOR
+  M5  unit-0 fold drops linuxUnit==parentLinux             SURVIVOR    SURVIVOR
+  M6  unit-0 fold drops unitNum==0                         RED         RED
+  M7  arm sites run only CONFIG-CONDITIONAL gates          RED (N5)    SURVIVOR
+  M9  drop the re-ask/second-look block                    RED (N5)    SURVIVOR
+  M10 drop owners[0]==owners[1]                            SURVIVOR    SURVIVOR
+  M11 authoredZoneRefs becomes LAST-write-wins             SURVIVOR    SURVIVOR
+  M12 egress_zone gains omitempty                          SURVIVOR    SURVIVOR
   ```
 
-  Verbatim assertions:
+  M0 is what makes the SURVIVOR rows readable: on an unmutated tree the canary
+  is the ONLY red, so a SURVIVOR row means "the suite ran and nothing but the
+  canary failed", not "the suite may not have run". M6 is red on BOTH sides,
+  which is correct and is the reason it is not evidence for this round: that
+  conjunct was already bound by
+  `TestContestedNetdevOwnershipFailsClosed_6722/two-tunnel-units-on-one-device`
+  before round 11 touched anything.
+
+  Tests reddened, verbatim:
 
   ```text
-  egress_zone_identity_6722_test.go:637: egress zone of ifindex 24 = "wan", want ""
-  egress_zone_identity_6722_test.go:723: egress zone of ifindex 24 = "lan", want ""
+  M1  --- FAIL: TestTwoAuthoredZonesOnOneCoherentNetdevFailClosed_6722
+      egress_zone_identity_6722_test.go:637: egress zone of ifindex 24 = "wan", want ""
+  M2  --- FAIL: TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722
+      egress_zone_identity_6722_test.go:723: egress zone of ifindex 24 = "lan", want ""
+  M7  --- FAIL: TestEgressZoneProtocolGatesBothArmPaths_6722/explicit-operator-arm
+      --- FAIL: TestEgressZoneProtocolGatesBothArmPaths_6722/ha-reconcile-tick
+  M9  --- FAIL: TestEgressZoneProtocolGatesBothArmPaths_6722/stale-lastStatus-re-asks-the-helper
+  M6  --- FAIL: TestContestedNetdevOwnershipFailsClosed_6722/two-tunnel-units-on-one-device
   ```
 
   **N5 — the two arm-site comments assert the opposite of measured behaviour,
@@ -197,8 +228,14 @@
                    what makes "the builder decided no zone" and "this key was
                    never written" the same value ON PURPOSE, which is only safe
                    while the version gate refuses a mismatched helper.
-  zones.go       `if _, exists := out[iface]; !exists` (first-write-wins,
-                 authoredZoneRefs) — see the M11 note below.
+  zones.go:84    `if _, exists := out[iface]; !exists` in authoredZoneRefs
+                   M11 SURVIVOR (witnessed). Reachable only for a ref claimed by
+                   TWO zones; buildInterfaceZoneMap applies the same
+                   first-write-wins over the same sorted zone names to decide
+                   the row's own Zone, so both maps pick the same winner and no
+                   cell can see the difference. Kept because DROPPING it makes
+                   the two maps disagree for that ref, which is the one thing
+                   authoredZoneRefs' doc promises not to do.
   Rust           forwarding_build/interfaces.rs:79 / :420 / :485-490,
                    tunnel.rs:655 — provably inert; only gre/ip6gre reach that
                    loop and both always have an egress row.
@@ -211,9 +248,12 @@
   `buildInterfaceZoneMap` (zones.go:133). The mutation was never applied, so
   the "survivor" was an unmutated tree passing its own suite: a harness that
   fails silently INVERTS its result, because "nothing broke" and "nothing was
-  changed" produce identical output. Re-measured with a line-anchored patch
-  targeting zones.go:84 only, and with a witness canary (below) certifying the
-  binary executed. The verdict is recorded from the second run, not the first.
+  changed" produce identical output. Re-measured with a patch that locates the
+  hit by ENCLOSING FUNCTION NAME rather than by string, refuses to run unless
+  exactly one hit lies inside `authoredZoneRefs`, and prints the line it
+  patched (`APPLIED M11 ... (zones.go:84)`); the verdict above is from that
+  run, not the first. Every applier in the matrix now raises on an anchor-count
+  mismatch under `set -e`, so a mis-anchored cell aborts instead of scoring.
 
   **WITNESSED GREENS.** Every cell in this round's matrix was re-run with a
   canary test in the same package that always fails. A green is otherwise not
@@ -228,6 +268,35 @@
   holds — the mutation reduces to unmutated behaviour and produces a FALSE
   survivor. `next_back()` reds
   `conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722`.
+
+- **Validation** (measured at `5fb0d553c`, the committed head, not on a
+  mutation copy):
+
+  ```text
+  go build ./...                                     rc 0
+  go vet ./pkg/dataplane/userspace/                  rc 0
+  go test -count=1 ./...                             rc 0 — 62 ok, 4 no-test,
+                                                       0 FAIL
+    pkg/dataplane/userspace                          ok  26.4s
+    pkg/refactoraudit                                ok  41.8s
+  cargo test --bins -- --skip wg::engine::engine_internal_tests
+                                                     rc 0 — 4277 passed,
+                                                       0 failed, 2 ignored,
+                                                       24 filtered out
+  ```
+
+  A correction to the FIRST commit of this round, whose message reported the
+  cargo leg as "4275 passed": that figure came off the N6 mutation copy, where
+  2 of the 4277 were reddened by the mutation under test. At the clean head the
+  count is 4277 / 0 failed. The Go figure in that message ("62 packages") was
+  likewise measured on the M5c copy; it is confirmed above at the real head.
+  The `--skip` is the known #7001-adjacent hang in `wg::engine::engine_internal_tests`,
+  which is what the 24 filtered-out tests are.
+
+  NOT run, and owed before merge: the loss userspace cluster smoke. This round
+  changed no `.o` and no wire format beyond what round 10 already carried, but
+  round 10's protocol bump 4 -> 5 stands, and a protocol bump owes a cluster
+  smoke even with no shim movement.
 
 ## 2026-08-13 — #6722 round 10: the ENUMERATION was the defect; the egress-zone answer moves to Go
 
