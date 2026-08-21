@@ -338,7 +338,7 @@ func (b *cliClearBatchV4) deleteAll(c *CLI, agg *sessionClearErrors) (deleted, r
 // (IterateSessionsFrom from a live anchor, one O(N) pass, deferred anchor
 // delete); bounded fresh-rescan fallback for a cursor-less dataplane (#4886).
 func clearFilteredV4Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
-	iterDP, ok := c.dp.(cliSessionCursor)
+	iterDP, ok := c.dpProbe().(cliSessionCursor)
 	if !ok {
 		return clearFilteredV4Rescan(c, f, agg)
 	}
@@ -476,7 +476,7 @@ func (b *cliClearBatchV6) deleteAll(c *CLI, agg *sessionClearErrors) (deleted, r
 }
 
 func clearFilteredV6Bounded(c *CLI, f *sessionFilter, agg *sessionClearErrors) int {
-	iterDP, ok := c.dp.(cliSessionCursor)
+	iterDP, ok := c.dpProbe().(cliSessionCursor)
 	if !ok {
 		return clearFilteredV6Rescan(c, f, agg)
 	}
@@ -750,12 +750,19 @@ func (c *CLI) handleClearDHCP(args []string) error {
 }
 
 func (c *CLI) clearPersistentNAT() error {
-	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
+	// #2114/#6743-F2: one resolution, then operate on the local. Each
+	// GetPersistentNAT() is a separate cell load under the daemon's live
+	// indirection, so re-reading after the nil-check can hand back nil.
+	var table *dataplane.PersistentNATTable
+	if c.dp != nil {
+		table = c.dp.GetPersistentNAT()
+	}
+	if table == nil {
 		fmt.Println("Persistent NAT table not available")
 		return nil
 	}
-	count := c.dp.GetPersistentNAT().Len()
-	c.dp.GetPersistentNAT().Clear()
+	count := table.Len()
+	table.Clear()
 	fmt.Printf("Cleared %d persistent NAT bindings\n", count)
 	return nil
 }

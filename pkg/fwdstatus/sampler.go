@@ -42,19 +42,30 @@ type Sampler struct {
 	head  int    // next write index, wraps 0..ringSize-1
 	count uint64 // monotonic count of samples ever taken (no wrap)
 
-	dp   DataPlaneAccessor
+	dp   CachedStatusProvider
 	proc ProcReader
 
 	// Snapshot of the last successfully-read worker telemetry.
-	// On a failed Status() call the sampler reuses these values so
-	// the counter series stays monotonic (see plan §Error handling).
+	// On a failed CachedStatus() probe the sampler reuses these values
+	// so the counter series stays monotonic (see plan §Error handling).
 	lastWorkerThread uint64
 	lastWorkerWall   uint64
 }
 
+// CachedStatusProvider is the narrowed dataplane surface the sampler
+// needs (#2114): exactly one control-socket-free read of the last
+// captured userspace-dp ProcessStatus. It is deliberately NOT
+// DataPlaneAccessor: Build keys backend identity on Status() presence
+// (builder.go), so a provider that only carries CachedStatus can never
+// be misrouted into a Build path, and the daemon-side adapter is free
+// to re-probe the currently published dataplane on every tick.
+type CachedStatusProvider interface {
+	CachedStatus() (userspace.ProcessStatus, bool)
+}
+
 // NewSampler constructs a Sampler.  The sampler is not running
 // until Start() is called.
-func NewSampler(dp DataPlaneAccessor, proc ProcReader) *Sampler {
+func NewSampler(dp CachedStatusProvider, proc ProcReader) *Sampler {
 	return &Sampler{dp: dp, proc: proc}
 }
 
@@ -107,20 +118,17 @@ func (s *Sampler) sample(now time.Time) {
 	// MUST NOT touch the control socket; on a miss (helper not yet
 	// polled) the worker counters hold at their previous values,
 	// preserving series monotonicity exactly as the old Status()
-	// error path did.
+	// error path did. #2114: the provider IS a CachedStatusProvider
+	// now — the per-tick type assertion is gone.
 	workerThread, workerWall := s.lastWorkerThread, s.lastWorkerWall
 	if s.dp != nil {
-		if us, ok := s.dp.(interface {
-			CachedStatus() (userspace.ProcessStatus, bool)
-		}); ok {
-			if st, ok := us.CachedStatus(); ok {
-				var tc, w uint64
-				for _, wr := range st.WorkerRuntime {
-					tc += wr.ThreadCPUNS
-					w += wr.WallNS
-				}
-				workerThread, workerWall = tc, w
+		if st, ok := s.dp.CachedStatus(); ok {
+			var tc, w uint64
+			for _, wr := range st.WorkerRuntime {
+				tc += wr.ThreadCPUNS
+				w += wr.WallNS
 			}
+			workerThread, workerWall = tc, w
 		}
 	}
 

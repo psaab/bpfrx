@@ -107,17 +107,20 @@ func (d *Daemon) shellCommitConfirmedFn() func(context.Context, int) (*config.Co
 // Extracted verbatim from Run()'s PHASE 5 (#4662 Increment 2); the leaf
 // startup block carries no ordering dependency (same code, same call point).
 func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer, fwdSampler *fwdstatus.Sampler) {
-	// d.dp asserted against the local grpcDataPlane probe
-	// (runtime_probes.go) — structurally identical to
-	// pkg/grpcapi's package-private grpcRuntime
-	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
-	// assignment to grpcapi.Config.DP at this site; signature
-	// drift surfaces as a compile error here.
+	// #2114 (r4): wire the LIVE indirection, not a startup snapshot of the
+	// published backend. grpcapi.Server keeps its Config.DP for the daemon's
+	// lifetime (pkg/grpcapi/server.go NewServer), so handing it the interface
+	// value here made every later setDataplane(nil) invisible to gRPC — the
+	// server kept dispatching `show`/`clear` into a backend the daemon had
+	// disowned. liveDataPlane re-reads the cell per call (daemon_dp_live.go).
+	// It satisfies the local grpcDataPlane probe (runtime_probes.go) —
+	// structurally identical to pkg/grpcapi's package-private grpcRuntime
+	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the assignment to
+	// grpcapi.Config.DP at this site; signature drift surfaces as a compile
+	// error here and at the daemon_dp_live.go assertions.
 	var grpcDP grpcDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(grpcDataPlane); ok {
-			grpcDP = probe
-		}
+	if live, ok := d.liveDataplane(); ok {
+		grpcDP = live
 	}
 	grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 		Store:      d.store,
@@ -246,16 +249,16 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 // no ordering dependency (same code, same call point, still guarded by the
 // d.opts.APIAddr check in Run).
 func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer) {
-	// d.dp asserted against the local apiDataPlane probe
-	// (runtime_probes.go) — structurally identical to pkg/api's
-	// package-private apiRuntimeDataPlane. Go duck-types the
-	// assignment to api.Config.DP at this site; signature drift
-	// surfaces as a compile error here.
+	// #2114 (r4): the LIVE indirection, for the same reason as gRPC above —
+	// api.Server keeps Config.DP for the daemon's lifetime, so a startup
+	// snapshot outlived every setDataplane(nil). liveDataPlane satisfies the
+	// local apiDataPlane probe (runtime_probes.go) — structurally identical
+	// to pkg/api's package-private apiRuntimeDataPlane. Go duck-types the
+	// assignment to api.Config.DP at this site; signature drift surfaces as a
+	// compile error here and at the daemon_dp_live.go assertions.
 	var apiDP apiDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(apiDataPlane); ok {
-			apiDP = probe
-		}
+	if live, ok := d.liveDataplane(); ok {
+		apiDP = live
 	}
 	apiCfg := api.Config{
 		Addr:     d.opts.APIAddr,
@@ -406,10 +409,13 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// matching the dataplane's nil-state behavior rather than certifying
 		// an as-if-active verdict it is skipping.
 		PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
-			if d.dp == nil {
+			// #2114: one dataplane snapshot per request (plan §5.3
+			// rule 7).
+			rt := d.dataplane()
+			if rt == nil {
 				return nil, false
 			}
-			p, ok := d.dp.(interface {
+			p, ok := rt.(interface {
 				PolicySchedulerActiveState() map[string]bool
 			})
 			if !ok {
