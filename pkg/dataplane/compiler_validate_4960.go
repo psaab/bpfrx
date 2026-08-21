@@ -259,13 +259,21 @@ func (discardingDataPlane) GetPersistentNAT() *PersistentNATTable {
 // and closing it needs the interface-resolution soft skips addressed first
 //
 // One more site sits outside BOTH the table and the exclusion prose above:
-// `dp.BumpFIBGeneration()` (compiler.go), which returns an error the caller
-// deliberately discards under the fire-and-forget contract documented at
-// dataplane.go. It is listed here only so a reader auditing coverage does not
-// have to rediscover that it is neither covered nor an omission -- it cannot
-// produce a returned CompileConfig error, so it is out of scope by construction
-// rather than by choice
+// the post-recompile FIB generation bump (compiler.go ->
+// bumpFIBGenerationAfterRecompile, compiler_fibgen.go). It is listed here only
+// so a reader auditing coverage does not have to rediscover that it is neither
+// covered nor an omission -- it cannot produce a returned CompileConfig error,
+// so it is out of scope by construction rather than by choice
 // (#6893).
+//
+// Do not read that as "so the error does not matter" -- an earlier revision of
+// this paragraph said the caller "deliberately discards" it under a
+// fire-and-forget contract, and that was the justification for a real defect
+// (#7149). Out of scope FOR THE PRE-PASS is not the same as harmless: the bump
+// is the only compiler dataplane call that is not a shim no-op on the live
+// userspace path, and a silent failure publishes a snapshot carrying the
+// previous FIB generation. It is now reported at the call site; what stays true
+// here is only that the pre-pass cannot and need not cover it.
 //
 // The double compile is safe with respect to ID assignment:
 // TestPrePassDoesNotPerturbIDAssignment_4960 measures that two passes with a

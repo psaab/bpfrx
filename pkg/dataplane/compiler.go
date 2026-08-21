@@ -373,8 +373,15 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	// bpf_fib_lookup with potentially changed interface indices or MAC
 	// addresses. BPF checks session.fib_gen != fib_gen_map[0] and
 	// treats cached entries as stale — no session write-back needed.
+	//
+	// #7149 (split from #4960): this was a bare `dp.BumpFIBGeneration()`,
+	// dropping both results. On the live userspace path it is the only
+	// compiler dataplane call that is NOT a shim no-op, so it is the only one
+	// that can really fail, and a failure silently leaves the snapshot the
+	// helper is about to receive on the previous generation. See
+	// compiler_fibgen.go for why the error is reported rather than returned.
 	if isRecompile {
-		dp.BumpFIBGeneration()
+		bumpFIBGenerationAfterRecompile(dp)
 	}
 
 	slog.Info("config compiled to dataplane",
