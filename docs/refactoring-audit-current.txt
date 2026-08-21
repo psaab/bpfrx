@@ -44,5 +44,6 @@
 [WATCH]      1567  pkg/dataplane/compiler_iface.go
 [WATCH]      1535  userspace-dp/src/afxdp/tx/cos_classify.rs
 [WATCH]      1523  userspace-dp/src/afxdp/session_glue/mod.rs
+[WATCH]      1515  pkg/daemon/daemon_ha_sync.go
 [WATCH]      1512  userspace-xdp/src/lib.rs
 [WATCH]      1502  pkg/config/types_security.go
