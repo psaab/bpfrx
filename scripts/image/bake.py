@@ -232,7 +232,7 @@ PINNED_BASE_RELEASE = "26.04"
 PINNED_BASE_SHA256 = {
     # ubuntu-26.04-server-cloudimg-amd64.img — Canonical-GPG-verified
     # (UEC signing key D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81).
-    "26.04": "3ee4f67f322abb2d1d1f0fffc957f7411404ad6635dd35b026c8ff05ac6e534c",
+    "26.04": "9dc7c5363c0146a08ba0c9aa834d82c2c6dfbb1c471ad9a2f0aba1189e21be05",
 }
 
 

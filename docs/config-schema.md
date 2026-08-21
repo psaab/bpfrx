@@ -928,6 +928,30 @@ Keys=[protocol tcp udp icmp]   IsLeaf=true   (no children)
   `20000`/`to`/`20003` is a sibling keyword), matching the hierarchical
   `Keys=[destination-port 20000 to 20003]`.
 
+**A nested BLOCK is a third shape, and it is not the flat-set chain (#6689).**
+The two shapes above are the ones the bracket-list contract is about. A leaf can
+also be authored as a brace block — `from { protocol { bgp; ospf; static; } }` —
+which leaves the node itself with `Keys=["protocol"]` and files one leaf child
+per value as SIBLINGS. A reader that descends `Children[0]` at each level is
+correct for the flat-set CHAIN (one child deep at every level) and reaches
+exactly one value of a block (N children wide at one level). That was the
+`collectProtocolList` defect: a routing-policy term written to filter three
+protocols compiled to one, and with `then reject` the two dropped protocols were
+silently ACCEPTED and installed — a fail-OPEN route-acceptance widening whose
+authored config renders back intact. Descend EVERY child, not the first, and the
+chain and the block are both covered.
+
+Note this leaf has no per-value option keyword, so every token below the node is
+a value and the full descent carries no promotion hazard. That is a property of
+the leaf, not of the descent — see the `system ntp server` case under
+"A widened read must not PROMOTE a token the old reader discarded" for a leaf
+where it does not hold. The routing-policy `from protocol` value domain is
+UNVALIDATED at commit in every spelling (unlike the firewall-filter leaf of the
+same name, which `filterProtocolResolvable` checks): widening the read makes the
+block spelling behave like the four that already reach `pkg/frr`
+`match source-protocol`, rather than adding a new exposure, but the absent gate
+is tracked separately.
+
 **Compiler contract for multi-value leaves.** Because both shapes now deliver
 the values on `child.Keys[1:]` (with the hierarchical-block-with-children
 shape still possible for nested forms), a compiler reading a multi-value leaf
@@ -949,6 +973,25 @@ shape by `TestFlatSetBracketListMatchesHierarchical` in
 allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
+
+**A leaf whose flat-set bracket list lands on a CHILD's Keys needs more than
+`firewallMatchValues` (#6694).** The SSOT helper reads `Keys[1:]` of the node
+plus `Keys[0]` of each child, which covers every leaf whose flat-set path
+absorbs the list onto the node itself. `interfaces fab0 fabric-options
+member-interfaces` does not: its schema node is a plain `children: nil` leaf
+with no `args` and no `multi`, so `SetPath` files the whole bracket list as ONE
+child carrying every name on that child's Keys — and `firewallMatchValues`
+would keep only the first. `fabricMemberValues` (`compiler_interfaces.go`)
+therefore descends the subtree and takes EVERY key. The same read is now driven
+through `FindChildren("member-interfaces")` rather than `FindChild`, because
+repeated hierarchical statements land as sibling nodes. Before the fold the
+hierarchical bracket spelling and the plain single-value spelling
+(`member-interfaces ge-0/0/7;`) both compiled to an EMPTY fabric member list —
+a chassis-cluster fabric that cannot form, silent at commit. Widening the read
+also ARMS the existing fab0/fab1 shared-member overlap check in
+`compiler_validate_warn.go`, which previously saw nothing to compare for
+bracket-authored fabrics; that check emits a warning, not a rejection, so no
+config that committed before is rejected now.
 
 **Widening a multi-value READ requires widening its VALIDATOR in the same
 change (#6659).** Adopting the accumulating reader at a site changes what a
@@ -1121,6 +1164,35 @@ readers now follow: **CHILDREN WIN — when the node has children they are the
 whole value list and the node's own tail is ignored, verbatim master behaviour;
 the tail is read only when there are no children, which is the shape master
 compiled nothing from.**
+
+**CHILDREN WIN is a rule for leaves whose tail is an IDENTIFIER, not a rule for
+every leaf (#6690).** The two `event-options` arms adopt it because in
+`<leaf> <identifier> { <value>; }` the tail names the statement and the children
+are the values, so reading the tail promotes a name into the value list.
+`system ntp server` is the opposite arrangement: the tail is the VALUE (the
+server address) and a child is a per-server OPTION. `server 1.1.1.1 { prefer; }`
+under CHILDREN WIN would compile `prefer` as the NTP server and discard
+`1.1.1.1`. `ntpServerValues` (`compiler_system.go`) therefore reads both sides
+and discriminates by TOKEN NAME instead of by side, skipping the four Junos
+per-server option keywords — `prefer`, `key`, `version`, `routing-instance` —
+together with their argument tokens, and carrying that skip count across the
+`Keys` -> `Children` boundary.
+
+Name-based discrimination is unavoidable for this leaf rather than a stylistic
+choice. Once the lexer has stripped the brackets, `server 1.1.1.1 prefer;` and
+`server [ 1.1.1.1 2.2.2.2 ];` are the SAME AST shape, so no structural rule can
+separate an option from a second server. The schema cannot separate them either:
+the leaf is `args: 1, multi: true`, which makes both `SetPath` and the block
+parser absorb trailing tokens silently, and `prefer` is a syntactically valid
+hostname that `ValidateNTPServer` accepts. Promoting it would render `prefer`
+verbatim into a chrony `server` directive — the injection surface #4902 typed
+the value to close.
+
+Before this fold the nested-block spelling `ntp { server { a; b; } }` compiled
+ZERO servers (the reader tested `len(Keys) >= 2`, which that shape never
+satisfies) and the bracket spelling kept only the first — a green commit with no
+time sync, whose symptoms (certificate validity windows, IPsec rekey scheduling,
+cross-node log correlation) surface far from the cause.
 
 #### The token boundary is a property of the GROUP, not of the tail (#6673)
 

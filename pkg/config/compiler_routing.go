@@ -792,20 +792,47 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 //     command lands its own leaf (Keys = ["protocol", "<X>"]) as a sibling
 //     under the term's "from" block. The caller iterates those siblings and
 //     calls this helper once per node, which then returns the single protocol.
+//   - block parse, nested block: `from { protocol { bgp; ospf; static; } }`
+//     leaves the node itself with Keys = ["protocol"] and files one LEAF
+//     CHILD PER PROTOCOL as SIBLINGS (#6689).
 //
-// All three shapes (and arbitrarily long lists) are handled by taking
-// Keys[1:] of the protocol node, then appending every key of each descendant
-// in the single-child chain.
+// The fourth shape is why the descent walks every child rather than
+// Children[0]. Following the single-child chain reached only the first
+// sibling, so a term written to filter three protocols compiled to one — and
+// with `then reject`, the two it dropped were silently ACCEPTED and installed.
+// A nested block is not the flat-set chain wearing a different shape; the
+// chain is one child deep at each level, the block is N children wide at one
+// level, and only a full descent covers both.
+//
+// Every token below a protocol node is a protocol name: Junos has no
+// per-protocol option keyword on this leaf, so unlike `system ntp server`
+// (#6690) there is no trailing-token ambiguity and no promotion hazard from
+// reading the whole subtree. Blank tokens are skipped — an empty slot is not
+// a protocol, and every value this helper returns is installed as a
+// `match source-protocol` line.
 func collectProtocolList(protoNode *Node) []string {
+	if protoNode == nil {
+		return nil
+	}
 	var protocols []string
+	add := func(tokens []string) {
+		for _, tok := range tokens {
+			if tok != "" {
+				protocols = append(protocols, tok)
+			}
+		}
+	}
 	if len(protoNode.Keys) >= 2 {
-		protocols = append(protocols, protoNode.Keys[1:]...)
+		add(protoNode.Keys[1:])
 	}
-	for n := protoNode; len(n.Children) > 0; {
-		child := n.Children[0]
-		protocols = append(protocols, child.Keys...)
-		n = child
+	var walk func(*Node)
+	walk = func(parent *Node) {
+		for _, child := range parent.Children {
+			add(child.Keys)
+			walk(child)
+		}
 	}
+	walk(protoNode)
 	return protocols
 }
 

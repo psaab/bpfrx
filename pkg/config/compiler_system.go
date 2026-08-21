@@ -64,10 +64,23 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			// shapes.
 			sys.NameServers = append(sys.NameServers, firewallMatchValues(child)...)
 		case "ntp":
+			// #6690: read EVERY server a `server` node carries, not just
+			// Keys[1]. `system { ntp { server { a; b; } } }` puts one leaf
+			// child per server and leaves the node itself with Keys=["server"]
+			// only, so the old `len(Keys) >= 2` read compiled ZERO servers from
+			// it — a green commit with no time sync at all. The bracketed
+			// spelling `server [ a b ]` collapses onto Keys[1:] (#2419) and
+			// kept only the first.
+			//
+			// This is NOT firewallMatchValues: a `server` node's trailing
+			// tokens are ambiguous. `server 1.1.1.1 prefer;` and
+			// `server [ 1.1.1.1 2.2.2.2 ];` are structurally identical after
+			// the lexer strips the brackets, so the per-server OPTION keywords
+			// have to be recognised by name or `prefer` would be compiled as a
+			// second NTP server and rendered verbatim into a chrony directive
+			// (#4902 types the value for exactly that reason).
 			for _, ntpChild := range child.FindChildren("server") {
-				if len(ntpChild.Keys) >= 2 {
-					sys.NTPServers = append(sys.NTPServers, ntpChild.Keys[1])
-				}
+				sys.NTPServers = append(sys.NTPServers, ntpServerValues(ntpChild)...)
 			}
 			if thNode := child.FindChild("threshold"); thNode != nil {
 				if v := nodeVal(thNode); v != "" {
@@ -2636,4 +2649,73 @@ func validateBackupRouterDst(cfg *Config, lenient bool) ([]string, error) {
 		return append(warnings, msg+" (ignored: backup-router default route not installed until corrected)"), nil
 	}
 	return nil, fmt.Errorf("%s", msg)
+}
+
+// ntpServerOptionArgs maps each Junos per-server option keyword that may
+// follow `system ntp server <address>` to the number of argument tokens it
+// consumes. These are the tokens that can legally appear AFTER the server
+// address on the same statement, so they must never be mistaken for a second
+// server address.
+//
+// The schema types `system ntp server` as a single-argument multi:true leaf
+// (schema_system.go), which means SetPath and the block parser both absorb any
+// trailing tokens onto the node's Keys without complaint — `prefer` is even a
+// syntactically valid hostname, so ValidateNTPServer accepts it. The compiler
+// is therefore the only place the distinction can be drawn.
+var ntpServerOptionArgs = map[string]int{
+	"prefer":           0,
+	"key":              1,
+	"version":          1,
+	"routing-instance": 1,
+}
+
+// ntpServerValues returns every NTP server address carried by one `server`
+// node, across all five spellings the parser can produce (#6690):
+//
+//   - hierarchical block, one leaf child per server
+//     `ntp { server { a; b; } }`  → Keys=["server"], children ["a"], ["b"]
+//   - hierarchical bracket list
+//     `ntp { server [ a b ]; }`   → Keys=["server","a","b"], no children
+//   - hierarchical repeated leaf
+//     `ntp { server a; server b; }` → two sibling nodes, one address each
+//     (the caller's FindChildren("server") loop visits both)
+//   - flat-set repeated leaf       → same as above
+//   - flat-set bracket list
+//     `set system ntp server [ a b ]` → Keys=["server","a","b"]
+//
+// and skips the per-server option tokens in ntpServerOptionArgs together with
+// their arguments, so `server 1.1.1.1 prefer;`, `server 1.1.1.1 key 5;` and
+// `server 1.1.1.1 { prefer; }` still compile to exactly one server.
+//
+// The option skip counter deliberately carries across the Keys→Children
+// boundary: an option whose argument was split onto a child node must not
+// leak that argument into the server list.
+func ntpServerValues(n *Node) []string {
+	if n == nil {
+		return nil
+	}
+	var servers []string
+	skip := 0
+	consume := func(tokens []string) {
+		for _, tok := range tokens {
+			if skip > 0 {
+				skip--
+				continue
+			}
+			if nargs, isOption := ntpServerOptionArgs[tok]; isOption {
+				skip = nargs
+				continue
+			}
+			if tok != "" {
+				servers = append(servers, tok)
+			}
+		}
+	}
+	if len(n.Keys) > 1 {
+		consume(n.Keys[1:])
+	}
+	for _, child := range n.Children {
+		consume(child.Keys)
+	}
+	return servers
 }
