@@ -892,25 +892,16 @@ func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
 	// NATMatch / NATThen / NATPool later joins the sweep with no edit here, and
 	// a column this fixture holds constant must be REGISTERED rather than
 	// silently skipped.
-	charges := productionChargeByPool6812(t, cfg)
-	var slots []any
-	for _, rule := range cfg.Security.NAT.Source[0].Rules {
-		pool := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
-		ch, ok := charges[rule.Then.PoolName]
-		if !ok {
-			t.Fatalf("rule %s references pool %q, which the production charge walk did not "+
-				"charge; the derived columns below READ that charge rather than recomputing "+
-				"it, so an uncharged pool has no value to expose", rule.Name, rule.Then.PoolName)
-		}
-		slots = append(slots, ruleAxisSlot6812{
-			Rule:          rule,
-			Pool:          pool,
-			ChargeAddrs:   ch.addrs,
-			ChargePortCap: ch.portCap,
-		})
-	}
+	//
+	// The slots come from ruleAxisSlots6812 — the SINGLE builder shared with
+	// walkWitness6812 and with TestDerivedChargeColumnsComeFromProduction_6812,
+	// which asserts over THIS function's output (#6812 round 13). Round 12 built
+	// the slot here and a second one inside the guard, so a wrong formula HERE
+	// was invisible to the guard that exists to catch exactly that.
+	slots := ruleAxisSlots6812(t, "charged rule", cfg, cfg.Security.NAT.Source[0].Rules)
 	sweepAxes6812(t, "charged rule",
-		[]axisGroup6812{{label: "rule-set RS", slots: slots}}, walkRuleAxisExemptions6812)
+		[]axisGroup6812{{label: "rule-set RS", slots: axisAnySlots6812(slots)}},
+		walkRuleAxisExemptions6812)
 
 	// The sequences each candidate sort would produce, for the failure text —
 	// so a red names WHICH sort the walk started behaving like.
@@ -1177,8 +1168,160 @@ func assertNoTierDeclaredNameAscending6812(t *testing.T, tiers []int, names []st
 	}
 }
 
-// TestDerivedChargeColumnsComeFromProduction_6812 is the round-12 guard on the
-// round-11 wrapper.
+// derivedChargeRival6812 is one WRONG way to compute a slot's derived charge
+// column — a formula someone could plausibly write instead of reading the
+// production value — together with the reason it is wrong.
+//
+// The table is the falsifiability half of
+// TestDerivedChargeColumnsComeFromProduction_6812: for the claim "the swept
+// slots carry the production charge" to have content, the FIXTURE has to be
+// able to tell the production charge apart from each rival. A rival no fixture
+// pool distinguishes is a formula this test would silently accept.
+type derivedChargeRival6812 struct {
+	name string
+	why  string
+	// column names the slot field this rival would fill wrongly, for the red.
+	column string
+	// rival computes the rival's value for one pool; production reads the value
+	// the charge walk produced for the same pool.
+	rival      func(t *testing.T, pool *NATPool) uint64
+	production func(ch sourceNATAggregatePoolCharge) uint64
+}
+
+// sourceNATPoolMemberHostSum6812 is the host expansion the PRODUCTION charge
+// sums. It exists here only so the rivals below can be written as "production
+// with ONE substitution", which is what makes each one a plausible mistake
+// rather than a strawman.
+func sourceNATPoolMemberHostSum6812(pool *NATPool) uint64 {
+	var hosts uint64
+	for _, m := range SourceNATPoolMembers(pool) {
+		hosts += sourceNATPoolMemberHostCount(m)
+	}
+	return hosts
+}
+
+// derivedChargeRivals6812 enumerates the formulas a round has actually shipped
+// or been caught re-deriving, in the MEMBERS-versus-EXPANDED-HOSTS confusion
+// that produced the round-12 defect. Both columns are covered: round 12 checked
+// only ChargePortCap, so a builder that filled ChargeAddrs with `len(members)`
+// had no rival to be caught by.
+func derivedChargeRivals6812() []derivedChargeRival6812 {
+	return []derivedChargeRival6812{
+		{
+			name:   "len(members) × width",
+			column: "ChargePortCap",
+			why: "round 11 shipped this. It counts MEMBERS where production counts " +
+				"EXPANDED HOSTS, so it under-charges any pool with a prefix member. " +
+				"Distinguished by a pool carrying a /30.",
+			rival: func(t *testing.T, pool *NATPool) uint64 {
+				t.Helper()
+				lo, hi, ok := SourceNATPoolPortRange(pool)
+				if !ok {
+					t.Fatalf("pool %q has an unusable port range", pool.Name)
+				}
+				return uint64(len(SourceNATPoolMembers(pool))) * (uint64(hi-lo) + 1)
+			},
+			production: func(ch sourceNATAggregatePoolCharge) uint64 { return ch.portCap },
+		},
+		{
+			name:   "len(members)",
+			column: "ChargeAddrs",
+			why: "the same members-for-hosts substitution on the OTHER derived column. " +
+				"Round 12's guard checked ChargePortCap only, so this one had no rival " +
+				"at all. Distinguished by the same /30 pool: two members, five hosts.",
+			rival: func(t *testing.T, pool *NATPool) uint64 {
+				t.Helper()
+				return uint64(len(SourceNATPoolMembers(pool)))
+			},
+			production: func(ch sourceNATAggregatePoolCharge) uint64 { return ch.addrs },
+		},
+	}
+}
+
+// TestRawPortFieldsAreNotAThirdFormula_6812 settles a rival the round-13 review
+// raised and MEASUREMENT refutes, and pins the fact the refutation rests on.
+//
+// The candidate: `Σ host-count × (PortHigh − PortLow + 1)` read from the RAW
+// NATPool fields instead of consulting SourceNATPoolPortRange. It is the
+// re-derive-instead-of-consult shape round 3's F2 removed, and it agrees with
+// production on every fixture pool — which the review read as a third
+// undistinguished formula needing a witness pool with no `port` leaf ("raw
+// width 1 vs production 64512").
+//
+// It does not need one, because the divergence is UNREACHABLE through the
+// compiler. compileNATSource stamps the 1024/65535 default into PortLow/PortHigh
+// itself (compiler_nat_source.go, the `if pool.PortLow == 0` tail of the pool
+// loop), so a compiled no-port-leaf pool already carries raw 1024/65535 —
+// measured, not argued: qe below has no `port` leaf and raw width 64512. And a
+// pool whose EXPLICIT range was rejected (#5457 PortRangeInvalidSpec) is
+// unusable, so sourceNATAggregateReferencedCharges never charges it and no slot
+// is built for it at all. Every pool a slot can exist for therefore has raw
+// width == resolved width.
+//
+// That makes the raw-field formula extensionally EQUAL to production on this
+// domain — not a drift risk, and not something a fixture can witness. Claiming
+// a witness for it would be the fixture-coincidence error in reverse: inventing
+// discrimination that does not exist.
+//
+// What is worth binding is the PREMISE. If compileNATSource ever stops
+// pre-defaulting — or another path builds a referenced NATPool with a zero
+// endpoint — the two formulas separate and the rival becomes live. This test
+// reds then, which is the signal to move it into derivedChargeRivals6812.
+func TestRawPortFieldsAreNotAThirdFormula_6812(t *testing.T) {
+	cfg, _, _ := aggregateChargeOrderFixtureConfig6812(t)
+	charges := productionChargeByPool6812(t, cfg)
+
+	defaulted := 0
+	for _, rule := range cfg.Security.NAT.Source[0].Rules {
+		name := rule.Then.PoolName
+		pool := cfg.Security.NAT.SourcePools[name]
+		ch, ok := charges[name]
+		if !ok {
+			t.Fatalf("pool %q was not charged", name)
+		}
+		if pool.PortLow <= 0 || pool.PortHigh <= 0 {
+			t.Fatalf("pool %q reached the charge walk with a ZERO port endpoint "+
+				"(PortLow=%d PortHigh=%d). The compiler's own default no longer covers "+
+				"every charged pool, so `Σ host-count × (PortHigh − PortLow + 1)` read "+
+				"from the raw fields is now a DISTINCT formula from the production "+
+				"charge. Move it into derivedChargeRivals6812 — this pool is its witness.",
+				name, pool.PortLow, pool.PortHigh)
+		}
+		raw := sourceNATPoolMemberHostSum6812(pool) * (uint64(pool.PortHigh-pool.PortLow) + 1)
+		if raw != ch.portCap {
+			t.Fatalf("pool %q: the raw-field formula gives %d, production charges %d. "+
+				"They have separated; the raw-field formula is a real rival now and "+
+				"belongs in derivedChargeRivals6812.", name, raw, ch.portCap)
+		}
+		if !sourceNATPoolHasExplicitPortLeaf6812(pool) {
+			defaulted++
+		}
+	}
+	if defaulted == 0 {
+		t.Fatal("every pool in this fixture carries an EXPLICIT `port range` leaf, so the " +
+			"agreement above never exercises the compiler default that makes it hold. " +
+			"Keep a pool with no `port` leaf in the fixture — otherwise this test would " +
+			"stay green even if the default were removed, which is the one change it " +
+			"exists to catch.")
+	}
+}
+
+// sourceNATPoolHasExplicitPortLeaf6812 reports whether the operator wrote a
+// `port range` leaf, as opposed to inheriting the compiler's 1024-65535
+// default. There is no field recording this directly — a valid explicit
+// `1024 to 65535` is indistinguishable from the default post-compile — so it
+// asks the FIXTURE's declaration table, which is where the distinction lives.
+func sourceNATPoolHasExplicitPortLeaf6812(pool *NATPool) bool {
+	for _, d := range aggregateChargeFixtureDecl6812() {
+		if d.pool == pool.Name {
+			return d.lo != 0 || d.hi != 0
+		}
+	}
+	return true
+}
+
+// TestDerivedChargeColumnsComeFromProduction_6812 is the guard on the round-11
+// wrapper.
 //
 // The wrapper exists because reflection cannot reach a key DERIVED from fields.
 // Round 11 filled it by recomputing one — `len(members) × width` — and that is
@@ -1191,47 +1334,63 @@ func assertNoTierDeclaredNameAscending6812(t *testing.T, tiers []int, names []st
 //
 // Two halves, and the second is the one that keeps working:
 //
-//  1. the wrapper's columns EQUAL the production charge, because they are read
-//     from it rather than recomputed;
-//  2. the fixture can TELL THE TWO FORMULAS APART. A pool carrying a /30
-//     member has four hosts and one member, so the naive product differs from
-//     the charge. Without this the first half is unfalsifiable — every value
-//     would agree with every formula.
+//  1. the SWEPT slots carry the production charge. Round 13: "swept" is
+//     load-bearing. Round 12 asserted this about a slot it built HERE, which is
+//     `x := T{F: v}; if x.F != v` — true of any struct, and blind to the slot
+//     the sweep actually consumed. The subject is now ruleAxisSlots6812's
+//     output, the single builder every sweep site goes through, so replacing
+//     the formula there reds this test.
+//  2. the fixture can TELL PRODUCTION APART FROM EVERY RIVAL FORMULA in
+//     derivedChargeRivals6812. Without this the first half is unfalsifiable —
+//     every value would agree with every formula. Round 12 checked one rival;
+//     a second (raw PortLow/PortHigh instead of SourceNATPoolPortRange) also
+//     agreed on all four pools, so "there is no second implementation left to
+//     drift" was not established. Each rival now needs its own witness pool.
 func TestDerivedChargeColumnsComeFromProduction_6812(t *testing.T) {
 	cfg, _, _ := aggregateChargeOrderFixtureConfig6812(t)
 	charges := productionChargeByPool6812(t, cfg)
+	rules := cfg.Security.NAT.Source[0].Rules
 
-	discriminating := 0
-	for _, rule := range cfg.Security.NAT.Source[0].Rules {
-		name := rule.Then.PoolName
-		pool := cfg.Security.NAT.SourcePools[name]
+	// THE SUBJECT: what the sweep sites consume, not a literal built here.
+	slots := ruleAxisSlots6812(t, "derived-charge guard", cfg, rules)
+	if len(slots) != len(rules) {
+		t.Fatalf("the shared slot builder returned %d slots for %d rules", len(slots), len(rules))
+	}
+
+	rivals := derivedChargeRivals6812()
+	discriminating := make([]int, len(rivals))
+	for i, slot := range slots {
+		name := rules[i].Then.PoolName
+		if slot.Rule != rules[i] {
+			t.Fatalf("slot %d carries rule %v, want the rule-set's rule %s",
+				i, slot.Rule, rules[i].Name)
+		}
 		ch, ok := charges[name]
 		if !ok {
 			t.Fatalf("pool %q was not charged", name)
 		}
-		lo, hi, ok := SourceNATPoolPortRange(pool)
-		if !ok {
-			t.Fatalf("pool %q has an unusable port range", name)
-		}
-		width := uint64(hi-lo) + 1
-		naive := uint64(len(SourceNATPoolMembers(pool))) * width
-		if naive != ch.portCap {
-			discriminating++
-		}
-		// The wrapper must carry the PRODUCTION value, whichever that is.
-		slot := ruleAxisSlot6812{Rule: rule, Pool: pool, ChargeAddrs: ch.addrs, ChargePortCap: ch.portCap}
 		if slot.ChargePortCap != ch.portCap || slot.ChargeAddrs != ch.addrs {
-			t.Fatalf("pool %q: the swept slot does not carry the production charge "+
-				"(addrs %d/%d, portCap %d/%d)", name,
+			t.Fatalf("pool %q: the SWEPT slot does not carry the production charge "+
+				"(addrs %d, want %d; portCap %d, want %d). ruleAxisSlots6812 must READ "+
+				"sourceNATAggregateReferencedCharges, never recompute it — a wrapper column "+
+				"asserting a derived key is a second implementation of that key, and second "+
+				"implementations drift.", name,
 				slot.ChargeAddrs, ch.addrs, slot.ChargePortCap, ch.portCap)
 		}
+		for r, rival := range rivals {
+			if rival.rival(t, slot.Pool) != rival.production(ch) {
+				discriminating[r]++
+			}
+		}
 	}
-	if discriminating == 0 {
-		t.Fatalf("no pool in this fixture distinguishes `len(members) × width` from the " +
-			"production charge `Σ host-count × range` — every member is a bare host, so a " +
-			"wrapper that recomputed the naive product would agree with production here and " +
-			"the round-12 finding would be invisible again. Give a pool a prefix or range " +
-			"member.")
+	for r, rival := range rivals {
+		if discriminating[r] == 0 {
+			t.Fatalf("no pool in this fixture distinguishes the rival formula `%s` (for "+
+				"%s) from the production charge, so a builder that recomputed it would "+
+				"agree with production HERE and the defect would be invisible again.\n"+
+				"Why the rival is wrong: %s\nAdd a fixture pool that distinguishes it.",
+				rival.name, rival.column, rival.why)
+		}
 	}
 }
 
@@ -1239,26 +1398,52 @@ func TestDerivedChargeColumnsComeFromProduction_6812(t *testing.T) {
 // TestDerivedChargeColumnsComeFromProduction_6812 so both read ONE input.
 // It also returns the DECLARED rule and pool sequences, so the order assertions
 // compare against the table rather than re-deriving it.
-func aggregateChargeOrderFixtureConfig6812(t *testing.T) (*Config, []string, []string) {
-	t.Helper()
-	decl := []struct {
+// aggregateChargeFixtureDecl6812 is the fixture's DECLARATION table, lifted out
+// of aggregateChargeOrderFixtureConfig6812 so the derived-charge tests can ask
+// it which pools carry an explicit `port range` leaf — a distinction the
+// compiled *Config cannot answer, because a valid explicit `1024 to 65535` is
+// byte-identical to the default post-compile (#6812 round 13).
+//
+// EVERY column here is permuted on purpose. assertDeclarationOrderIsNotSortedBy6812
+// and the struct sweep both require declaration order to be non-monotone in
+// BOTH directions on every axis, so a row cannot be appended without checking
+// that it keeps each column unsorted.
+func aggregateChargeFixtureDecl6812() []struct {
+	rule, pool, match, poolAddr string
+	// #6812 round 10: two more columns, each of which round 9's four helper
+	// calls could not see because the FIXTURE held it constant while
+	// production varies it. Every pool used to carry exactly one member at
+	// the default 1024-65535 range, so a sort by len(Addresses), by the
+	// port-range width, or by the allocator charge this very walk computes
+	// was a no-op here and not in general. Extra members ride on `extra`;
+	// the FIRST member stays as it was so the Addresses[0] permutation is
+	// untouched.
+	extra  []string
+	lo, hi int
+} {
+	type row = struct {
 		rule, pool, match, poolAddr string
-		// #6812 round 10: two more columns, each of which round 9's four helper
-		// calls could not see because the FIXTURE held it constant while
-		// production varies it. Every pool used to carry exactly one member at
-		// the default 1024-65535 range, so a sort by len(Addresses), by the
-		// port-range width, or by the allocator charge this very walk computes
-		// was a no-op here and not in general. Extra members ride on `extra`;
-		// the FIRST member stays as it was so the Addresses[0] permutation is
-		// untouched.
-		extra  []string
-		lo, hi int
-	}{
+		extra                       []string
+		lo, hi                      int
+	}
+	return []row{
 		{"r07", "qb", "10.0.3.0/24", "203.0.113.2", []string{"198.51.100.8/30"}, 3000, 3999},
 		{"r02", "qd", "10.0.0.0/24", "203.0.113.3", nil, 1200, 9200},
 		{"r09", "qa", "10.0.2.0/24", "203.0.113.1", []string{"198.51.100.9", "198.51.100.19"}, 5000, 5099},
 		{"r05", "qc", "10.0.1.0/24", "203.0.113.4", nil, 2000, 8000},
+		// #6812 round 13: NO `port` leaf (lo == hi == 0). This pool inherits the
+		// compiler's 1024-65535 default, which is what makes
+		// TestRawPortFieldsAreNotAThirdFormula_6812's agreement exercise the
+		// defaulting instead of trivially holding on explicit ranges. Its
+		// charge (1 host x 64512) also keeps the ChargePortCap column
+		// non-monotone: 5000, 8001, 300, 6001, 64512.
+		{"r04", "qe", "10.0.4.0/24", "203.0.113.5", nil, 0, 0},
 	}
+}
+
+func aggregateChargeOrderFixtureConfig6812(t *testing.T) (*Config, []string, []string) {
+	t.Helper()
+	decl := aggregateChargeFixtureDecl6812()
 	cmds := []string{"set security nat source rule-set RS from zone trust"}
 	for _, d := range decl {
 		cmds = append(cmds,
@@ -1266,8 +1451,14 @@ func aggregateChargeOrderFixtureConfig6812(t *testing.T) (*Config, []string, []s
 		for _, a := range d.extra {
 			cmds = append(cmds, fmt.Sprintf("set security nat source pool %s address %s", d.pool, a))
 		}
+		// lo == 0 && hi == 0 means NO `port` leaf: the pool inherits the
+		// compiler's 1024-65535 default (#6812 round 13, see
+		// TestRawPortFieldsAreNotAThirdFormula_6812).
+		if d.lo != 0 || d.hi != 0 {
+			cmds = append(cmds,
+				fmt.Sprintf("set security nat source pool %s port range %d to %d", d.pool, d.lo, d.hi))
+		}
 		cmds = append(cmds,
-			fmt.Sprintf("set security nat source pool %s port range %d to %d", d.pool, d.lo, d.hi),
 			fmt.Sprintf("set security nat source rule-set RS rule %s match source-address %s", d.rule, d.match),
 			fmt.Sprintf("set security nat source rule-set RS rule %s then source-nat pool %s", d.rule, d.pool),
 		)

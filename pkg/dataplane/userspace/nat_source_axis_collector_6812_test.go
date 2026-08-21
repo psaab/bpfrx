@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -138,6 +139,145 @@ func TestCollectorSeesMapContents_6812(t *testing.T) {
 	empty := collectAxisColumns6812(t, probe{M: map[key]string{}})
 	if _, ok := empty["M{key}.N"]; !ok {
 		t.Fatalf("an EMPTY map emitted no key-schema column (got %v)", keysOf6812(empty))
+	}
+}
+
+// TestCollectorEnumeratesAPopulatedMapsSchema_6812 is the round-13 half of the
+// test above, and the reason it exists is that the test above is the shape of
+// blindness this collector keeps reproducing: it asked about the EMPTY map,
+// which was the case round 11 repaired, and never about the POPULATED one.
+//
+// A populated map used to return before emitting `{key}` / `{value}`, so a
+// field added to a populated map's value type produced NO column — the SILENTLY
+// SKIPPED outcome the file header claims round 11 removed, surviving in the one
+// shape nobody probed. Latent: no map is swept by a NAT fixture today.
+//
+// Two properties, and the second is the one the round-12 "closure at FIELD
+// granularity, by construction" sentence actually needs:
+//
+//  1. the column SET is a function of the TYPE, not of the value. Otherwise a
+//     fixture mixing an empty and a populated map of one type emits the schema
+//     columns for the empty slot only, the sweep back-fills the missing slot
+//     with "", and the resulting column VARIES across slots — reading as
+//     guarded when nothing was compared;
+//  2. adding a field to the value type of a POPULATED map produces a new
+//     column, exactly as it does for a slice.
+func TestCollectorEnumeratesAPopulatedMapsSchema_6812(t *testing.T) {
+	type key struct{ N int }
+	type val struct{ A string }
+	type probe struct{ M map[key]val }
+
+	empty := collectAxisColumns6812(t, probe{M: map[key]val{}})
+	full := collectAxisColumns6812(t, probe{M: map[key]val{{N: 1}: {A: "x"}}})
+
+	for _, want := range []string{"M{key}.N", "M{value}.A"} {
+		if _, ok := full[want]; !ok {
+			t.Fatalf("a POPULATED map emitted no %q column (got %v). A field added to the "+
+				"value type of a populated map would then change nothing at all — silently "+
+				"skipped, which is the outcome this collector claims not to have.",
+				want, keysOf6812(full))
+		}
+	}
+	if len(empty) != len(full) {
+		t.Fatalf("the map column SET depends on the VALUE, not the type: empty map emits "+
+			"%d columns %v, populated map emits %d %v. A fixture holding both then "+
+			"manufactures a column that varies across slots without anything being "+
+			"compared.", len(empty), keysOf6812(empty), len(full), keysOf6812(full))
+	}
+	for c := range empty {
+		if _, ok := full[c]; !ok {
+			t.Fatalf("column %q exists for an empty map and not for a populated one", c)
+		}
+	}
+	// The schema keys stay ABSENT even when populated: a map has no canonical
+	// first entry to project, unlike a slice's [0]. Content coverage is
+	// `.entries`, which is total.
+	if got := full["M{value}.A"]; got != axisAbsentKey6812 {
+		t.Fatalf("populated map value-schema key = %q, want the absent marker %q — "+
+			"projecting SOME entry would depend on map iteration order", got, axisAbsentKey6812)
+	}
+
+	// (2), measured rather than argued: widening the value type adds a column.
+	type valWide struct {
+		A string
+		B string
+	}
+	type probeWide struct{ M map[key]valWide }
+	wide := collectAxisColumns6812(t, probeWide{M: map[key]valWide{{N: 1}: {A: "x"}}})
+	if _, ok := wide["M{value}.B"]; !ok {
+		t.Fatalf("adding field B to a POPULATED map's value type produced no M{value}.B "+
+			"column (got %v)", keysOf6812(wide))
+	}
+	if len(wide) != len(full)+1 {
+		t.Fatalf("widening the value type by one field changed the column count by %d, "+
+			"want 1: %v -> %v", len(wide)-len(full), keysOf6812(full), keysOf6812(wide))
+	}
+}
+
+// TestAxisEncodingIsInjective_6812 measures the property `.all` and `.entries`
+// are SOLD on: that they are total over contents, so no difference in a
+// sequence can be invisible to a caller that embeds them.
+//
+// It was false until round 13. axisEncodeValue6812 joined columns as
+// `name=key\x1e` with the key written RAW, so a string field carrying the
+// record separator plus a forged `NAME=\x01` boundary re-partitioned the
+// record. The counterexample below is the reviewer's, verbatim: two DIFFERENT
+// one-element slices whose `.all` keys were byte-identical.
+//
+// SCOPE, because it is the difference between a live bug and a latent one:
+// single-column element types ([]string, []byte) were already injective — one
+// column, length-prefixed by axisEncodeSeq6812 — and the only multi-column
+// swept slice elements are fixture-constant, so no NAT config reaches this
+// today. The claim was still false as written, and a claim that holds only
+// because today's fixtures do not reach it is the shape this collector has
+// been caught on repeatedly.
+func TestAxisEncodingIsInjective_6812(t *testing.T) {
+	type elem struct{ A, B string }
+	type probe struct{ S []elem }
+
+	// Forged so that, unescaped, the two flatten to the same byte string:
+	//   A=\x01x\x1eB=\x01y\x1e  +  B=\x01z\x1e
+	//   A=\x01x\x1e             +  B=\x01y\x1eB=\x01z\x1e
+	left := collectAxisColumns6812(t, probe{S: []elem{{A: "x\x1eB=\x01y", B: "z"}}})
+	right := collectAxisColumns6812(t, probe{S: []elem{{A: "x", B: "y\x1eB=\x01z"}}})
+	if left["S[0].A"] == right["S[0].A"] {
+		t.Fatal("probe is malformed: the two elements must actually differ")
+	}
+	if left["S.all"] == right["S.all"] {
+		t.Fatalf("two DIFFERENT slices produced the same S.all key %q. `.all` is not "+
+			"injective, so a change to the slice can be invisible to any column that "+
+			"embeds it — which is the whole reason `.all` exists.", left["S.all"])
+	}
+
+	// The same forgery through a map entry: the \x1f between an entry's key and
+	// value encoding is only unambiguous while neither side can contain one.
+	type mprobe struct{ M map[elem]elem }
+	ml := collectAxisColumns6812(t, mprobe{M: map[elem]elem{{A: "p\x1fq"}: {A: "r"}}})
+	mr := collectAxisColumns6812(t, mprobe{M: map[elem]elem{{A: "p"}: {A: "q\x1fr"}}})
+	if ml["M.entries"] == mr["M.entries"] {
+		t.Fatalf("two DIFFERENT maps produced the same M.entries key %q — the unit "+
+			"separator inside an entry is ambiguous", ml["M.entries"])
+	}
+
+	// The escape must be reversible in principle, i.e. it must not itself
+	// collide: a literal escape byte and an escaped separator are different.
+	esc := collectAxisColumns6812(t, probe{S: []elem{{A: "\x1c" + "R"}}})
+	sep := collectAxisColumns6812(t, probe{S: []elem{{A: "\x1e"}}})
+	if esc["S.all"] == sep["S.all"] {
+		t.Fatalf("a literal %q and an escaped separator encode identically (%q) — the "+
+			"escape byte is not itself escaped, so decoding is ambiguous",
+			"\x1cR", esc["S.all"])
+	}
+
+	// A value with no structural byte must be untouched, so the escape cannot
+	// churn keys for the ordinary case.
+	plain := collectAxisColumns6812(t, probe{S: []elem{{A: "plain", B: "value"}}})
+	if got, want := plain["S[0].A"], axisPresentTag6812+"plain"; got != want {
+		t.Fatalf("leaf key = %q, want %q — leaf columns are compared whole, never joined, "+
+			"so they must not be escaped", got, want)
+	}
+	if !strings.Contains(plain["S.all"], "plain") {
+		t.Fatalf("S.all = %q does not contain the unescaped ordinary value", plain["S.all"])
 	}
 }
 

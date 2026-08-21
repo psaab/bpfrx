@@ -80157,3 +80157,58 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
   pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
   docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6812/#6815 round 13 — the round-12 guard was a tautology, and two
+  "total" columns were not injective. B1 (blocking): `ruleAxisSlot6812` had
+  THREE construction sites from the same inputs — the sweep at
+  compiler_nat_source_pool_aggregate_6812_test.go, `walkWitness6812`, and the
+  round-12 guard — and the guard built its own literal and then asserted about
+  that literal (`x := T{F: v}; if x.F != v`), binding only the site no sweep
+  consumes. Confirmed by measurement: replacing the SWEEP-site formula with
+  round 11's `len(members) x width` left pkg/config green. Fixed by
+  single-sourcing — `ruleAxisSlots6812(t, what, cfg, rules)` is the only
+  constructor, all three sites call it, and the guard asserts over its OUTPUT;
+  three constructions of one slot from one config have no legitimate reason to
+  differ, so collapse makes divergence unrepresentable rather than merely
+  detectable. Guard widened to the other derived column (round 12 checked
+  ChargePortCap only). Matrix: C0 pristine rc=0, S0 always-failing sentinel
+  rc=1, M1 portCap-naive guard RED / sweeps GREEN, M2 addrs-naive guard RED /
+  sweeps GREEN, C1 restored rc=0 — the green sweep column IS the finding.
+  B2 (blocking): `.all`/`.entries` were not injective. axisEncodeValue6812
+  joined `name=key<RS>` with the key raw, so an element field carrying the
+  record separator plus a forged present-tag boundary re-partitioned the record
+  and two different slices encoded identically; nested containers hit it with no
+  adversarial string, since an `.all` key is itself a composite. Fixed with
+  axisEscapeKey6812 applied ONCE at the join — leaf and composite keys take the
+  same path, so depth N is escaped N times; escaping at the leaf would leave
+  composites unescaped at the level embedding them. Column names are not escaped
+  and need not be. B3 (blocking, latent): a POPULATED map returned before
+  emitting its {key}/{value} schema columns, so a field added to a populated
+  map's value type produced no column — the SILENTLY SKIPPED outcome round 11
+  claims to have removed, and it made the map column SET depend on the VALUE not
+  the TYPE (a fixture mixing empty and populated back-fills "" and manufactures
+  a phantom varying column). Fixed by always emitting the schema columns, keys
+  ABSENT — a map has no canonical entry to project, unlike a slice's [0].
+  Measured MUT-B2 and MUT-B3 both RED on the new tests while the OLD prober
+  stayed GREEN in both cells: previously invisible. N1 REFUTED by measurement:
+  the reviewer's third formula (raw PortLow/PortHigh instead of
+  SourceNATPoolPortRange) has no fixture witness because compileNATSource stamps
+  the 1024/65535 default itself, so a compiled no-port-leaf pool carries raw
+  1024/65535 (measured: raw width 64512 == effective width) and a
+  rejected-range pool is never charged at all. Bound the PREMISE instead —
+  TestRawPortFieldsAreNotAThirdFormula_6812 asserts the agreement, rejects any
+  charged pool with a zero endpoint, and requires a no-port-leaf pool in the
+  fixture so the agreement exercises the default. Added pool `qe` for that role.
+  Twin golden gained 8 rows and lost none (3 from B3, 5 from a new SliceSep
+  probe field carrying a separator, so the behavioural half of the twins
+  agreement can see an escaping divergence); every pre-existing row byte-
+  identical, so the key format did not change.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  pkg/config/nat_source_axis_twins_6812_test.go,
+  pkg/config/testdata/axis_collector_twins_6812.golden,
+  pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_twins_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md

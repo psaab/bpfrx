@@ -260,10 +260,14 @@ const axisKeyMaxDepth6812 = 8
 //	(a) contribute an ORDER-PRESERVING column for its own value;
 //	(b) contribute a TOTAL column over its contents (`.all`, `.entries`) — a
 //	    column no change to those contents can be invisible to;
-//	(c) enumerate the contained TYPE's schema with ABSENT keys, when the value
-//	    is missing (a nil pointer, an empty list/map). The columns still exist,
-//	    so a field added to the contained type still produces one and still has
-//	    to be registered;
+//	(c) enumerate the contained TYPE's schema with ABSENT keys. The columns
+//	    still exist, so a field added to the contained type still produces one
+//	    and still has to be registered. For a pointer this happens when the
+//	    value is missing (a nil pointee); for a MAP it happens ALWAYS, populated
+//	    or not — round 13, because returning early on a populated map made this
+//	    outcome degrade into "silently skipped" exactly where nobody was
+//	    looking, and made the column SET depend on the value instead of the
+//	    type;
 //	(d) declare itself UNENCODABLE by emitting a `…-UNENCODED` column, which the
 //	    registry then forces someone to justify in writing;
 //	(e) STOP the test.
@@ -283,7 +287,12 @@ const axisKeyMaxDepth6812 = 8
 //
 //  2. A SEQUENCE'S CONTENT IS TOTAL; ITS PER-INDEX ORDERING IS NOT. `.all` and
 //     `.entries` are injective over contents, so no change to a slice tail or a
-//     map entry can be invisible. But the only per-element column is `[0]`:
+//     map entry can be invisible. That injectivity is CONDITIONAL on
+//     axisEscapeKey6812 and was false without it (#6812 round 13): the joins
+//     wrote keys raw, so an element field carrying the record separator could
+//     re-partition the record and two different slices encoded identically.
+//     TestAxisEncodingIsInjective_6812 is the measurement, on the exact
+//     counterexample. But the only per-element column is `[0]`:
 //     there is no `[1]`, and no per-entry column at all. A comparator keying
 //     specifically on `x[1]`, or on one map entry, therefore has no column of
 //     its own — neither asserted non-monotone nor registered. Live today for
@@ -305,10 +314,89 @@ const axisKeyMaxDepth6812 = 8
 // preserves order among present keys — so a column that is absent in some slots
 // and present in others is comparable, and "absent" can never collide with a
 // legitimately empty string.
+//
+// Keys are also ESCAPED where they are JOINED (#6812 round 13). The three
+// structural bytes below delimit the composite encodings, and until round 13 a
+// key was written into them raw — so a value CARRYING a structural byte could
+// re-partition the record and two different values could encode identically:
+//
+//	[]elem{{A: "x\x1eB=\x01y", B: "z"}}  and  []elem{{A: "x", B: "y\x1eB=\x01z"}}
+//
+// both flattened to `A=\x01x\x1eB=\x01y\x1eB=\x01z\x1e`, so `.all` — the column
+// whose whole job is to be TOTAL over contents — was not injective and a
+// difference in the slice could be invisible after all. Nested containers hit
+// the same hole without any adversarial string: a `.all` key is itself a
+// composite full of \x1e, and embedding it raw one level up re-partitions the
+// outer record.
+//
+// axisEscapeKey6812 at the join closes both. See its comment for why escaping
+// there — rather than at each leaf — is what makes every nesting level exactly
+// once-escaped.
 const (
 	axisAbsentKey6812  = "\x00"
 	axisPresentTag6812 = "\x01"
+	// axisEscByte6812 introduces a two-byte escape; the other three are the
+	// structural delimiters of the composite encodings (record / group / unit).
+	axisEscByte6812   = '\x1c'
+	axisRecordSep6812 = '\x1e'
+	axisGroupSep6812  = '\x1d'
+	axisUnitSep6812   = '\x1f'
 )
+
+// axisEscapeKey6812 makes a key safe to embed in a composite encoding: after
+// it, the only \x1c / \x1d / \x1e / \x1f bytes in the result are the delimiters
+// the ENCODER wrote, so every composite splits back one way only.
+//
+// The mapping is a two-byte escape with a distinct printable tag per byte, so
+// decoding is unambiguous and the escape byte itself is escaped:
+//
+//	\x1c -> \x1cE   \x1d -> \x1cG   \x1e -> \x1cR   \x1f -> \x1cU
+//
+// WHERE IT IS APPLIED, and why that is the whole fix: at the JOIN in
+// axisEncodeValue6812, to the key of every column, once. A leaf key and a
+// composite key (`.all`, `.entries`) go through the same call, so a container
+// nested N deep is escaped exactly N times on the way up and the outer stream
+// can never see an inner delimiter. Escaping at each LEAF instead would leave
+// composite keys — which are built from already-escaped pieces — unescaped at
+// the level that embeds them.
+//
+// It is NOT applied to column NAMES. Names are Go field names plus the fixed
+// suffixes this collector appends (`.nil`, `.len`, `.all`, `.entries`, `[0]`,
+// `{key}`, `{value}`, `.dynamic-type`, `.dynamic-UNENCODED`), none of which can
+// contain a structural byte or an `=`; so splitting a record at its FIRST `=`
+// recovers the name and the key uniquely, and a key containing `=` is harmless.
+//
+// The two length-prefixed joins (axisEncodeSeq6812, axisEncodeMap6812) were
+// already unambiguous at their own delimiter — `%08d:` pins each element's
+// extent — but the \x1f split INSIDE a map entry was not, and is now: an
+// escaped key contains no \x1f, and neither do column names, so the one \x1f in
+// an entry is the one the encoder wrote.
+//
+// The present/absent TAGS are deliberately not escaped: they are a one-byte
+// prefix on the whole key, never a delimiter inside it, so "\x01"+key stays
+// injective in key with no help.
+func axisEscapeKey6812(s string) string {
+	if !strings.ContainsAny(s, "\x1c\x1d\x1e\x1f") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case axisEscByte6812:
+			b.WriteString("\x1cE")
+		case axisGroupSep6812:
+			b.WriteString("\x1cG")
+		case axisRecordSep6812:
+			b.WriteString("\x1cR")
+		case axisUnitSep6812:
+			b.WriteString("\x1cU")
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
 
 func axisLeaf6812(present bool, key string) string {
 	if !present {
@@ -419,9 +507,30 @@ func collectAxisKeys6812(t *testing.T, path string, v reflect.Value, present boo
 		// contents alone. This is what makes {N:2}, {N:0}, {N:1} three distinct
 		// keys instead of three identical `.len=1`s.
 		add(path+".entries", axisLeaf6812(present && v.Len() > 0, axisEncodeMap6812(t, v, depth+1)))
-		if present && v.Len() > 0 {
-			return
-		}
+		// (c) The key/value SCHEMA columns, ALWAYS — #6812 round 13.
+		//
+		// Until round 13 these were emitted only for an empty or nil map: a
+		// populated one returned here. That reinstated the THIRD OUTCOME this
+		// collector claims to have removed, in the one shape nobody checked. A
+		// field added to a POPULATED map's value type produced no new column
+		// at all, so it was silently skipped rather than registered — measured:
+		//
+		//	populated map, before adding field B:  [M.entries M.len M.nil]
+		//	populated map,  after adding field B:  [M.entries M.len M.nil]
+		//	the slice analogue gains S[0].B
+		//
+		// It also made the map column SET a function of the VALUE rather than
+		// the TYPE, which is worse than it sounds: a fixture holding one empty
+		// map and one populated map of the same type emitted the schema columns
+		// for the empty slot only, and the sweep back-filled the missing slot
+		// with "" — manufacturing a column that VARIES across slots and so reads
+		// as guarded, when nothing about either map was being compared.
+		//
+		// The keys stay ABSENT even when the map is populated, which is the
+		// honest encoding: unlike a slice's `[0]`, a map has no canonical first
+		// entry to project. Content coverage is `.entries`, which is total; the
+		// schema columns exist to keep a new field from vanishing, and a
+		// constant column is a REGISTERED blind spot rather than an unknown one.
 		collectAxisKeys6812(t, path+"{key}", reflect.Zero(v.Type().Key()), false, depth+1, add)
 		collectAxisKeys6812(t, path+"{value}", reflect.Zero(v.Type().Elem()), false, depth+1, add)
 	default:
@@ -437,6 +546,11 @@ func collectAxisKeys6812(t *testing.T, path string, v reflect.Value, present boo
 // axisEncodeValue6812 renders ONE value as a single total string: every column
 // it would emit, sorted by column name and joined. Injective over the value, so
 // nothing about it can be invisible to a caller that embeds this.
+//
+// The injectivity rests on axisEscapeKey6812 (#6812 round 13). Before it, the
+// claim was false for any value able to carry a \x1e — see the counterexample
+// on the const block — and TestAxisEncodingIsInjective_6812 is the measurement
+// that the repaired form separates it.
 func axisEncodeValue6812(t *testing.T, v reflect.Value, depth int) string {
 	t.Helper()
 	cols := map[string]string{}
@@ -450,7 +564,7 @@ func axisEncodeValue6812(t *testing.T, v reflect.Value, depth int) string {
 	sort.Strings(names)
 	var b strings.Builder
 	for _, c := range names {
-		fmt.Fprintf(&b, "%s=%s\x1e", c, cols[c])
+		fmt.Fprintf(&b, "%s=%s\x1e", c, axisEscapeKey6812(cols[c]))
 	}
 	return b.String()
 }

@@ -1316,6 +1316,11 @@ So a field added to `SourceNATRuleSnapshot`, `NATRule`, `NATMatch`, `NATThen` or
 `NATPool` later joins the sweep with no edit to any fixture. That is closure at
 FIELD granularity, by construction.
 
+**Round 13 correction.** "By construction" was false for one shape until round
+13: a POPULATED map returned before emitting its `{key}` / `{value}` schema
+columns, so a field added to a populated map's value type produced no column at
+all. See "Round 13" below.
+
 A constant column is no longer skipped. It must be REGISTERED, and the
 registration records which of the two kinds it is — `fixtureConstantAxes6812`
 (an admitted blind spot) or `productionConstantAxes6812` (invariant for every
@@ -1709,7 +1714,9 @@ before it runs.
    hence a registered blind spot. Only the first is a closure claim.
 2. **A sequence's content is total; its per-index ordering is not.** `.all` and
    `.entries` are injective over contents, so no slice-tail or map-entry change
-   is invisible. But the only per-element column is `[0]` — there is no `[1]`
+   is invisible. That injectivity was CONDITIONAL on an escape the
+   encoder did not have until round 13; as written for rounds 11-12 the claim
+   was false. See "Round 13" below. But the only per-element column is `[0]` — there is no `[1]`
    (measured, for PoolAddresses / Pool.Addresses) and no per-entry column at
    all. A comparator keying specifically on `x[1]` has no column of its own.
    Narrower than "the tail is unswept": the tail is visible, its ordering is not.
@@ -1720,3 +1727,185 @@ before it runs.
    load-bearing. The residual: any other type whose in-memory representation is
    not order-isomorphic to its semantic order takes the generic walk. None is
    swept today.
+
+## Round 13 — the guard was a tautology, and two "total" columns were not
+
+Round 12 answered "does the swept slot carry the production charge?" with a
+test that built its own slot and then asked about that slot. Three findings,
+all confirmed by measurement in this worktree.
+
+### B1 — the round-12 guard asserted `x := T{F: v}; if x.F != v`
+
+`ruleAxisSlot6812` had THREE independent construction sites from the same
+inputs: the sweep in
+`TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812`, the
+production-constant witness `walkWitness6812`, and the guard
+`TestDerivedChargeColumnsComeFromProduction_6812`. The guard bound only the
+third — the one no sweep consumes — so replacing the SWEEP-site formula with
+round 11's `len(members) x width` left `pkg/config` entirely green. The naive
+values (`[2,1,3,1]` addresses, `[2000,8001,300,6001]` capacities) are neither
+constant nor monotone, so the sweep's own anti-coincidence assertions could not
+see them either.
+
+**Fix: single-source, not cross-check.** `ruleAxisSlots6812(t, what, cfg,
+rules)` is now the only constructor and all three sites call it; the guard
+asserts over its OUTPUT. Three constructions of one slot from one config have
+no legitimate reason to differ, so a divergence is always a bug — collapse
+makes it unrepresentable, where an agreement test would only make it
+detectable.
+
+The guard also gained the OTHER derived column. Round 12 checked
+`ChargePortCap` only, so a builder filling `ChargeAddrs` with `len(members)`
+had no rival at all.
+
+| cell | subject | result |
+|---|---|---|
+| C0 | pristine guard / sweeps | rc=0 / rc=0 |
+| S0 | always-failing sentinel | rc=1 (the harness can see a red) |
+| M1 | `ChargePortCap := len(members) x width` in the shared builder | guard **rc=1 RED** (`portCap 2000, want 5000`); sweeps rc=0 GREEN |
+| M2 | `ChargeAddrs := len(members)` in the shared builder | guard **rc=1 RED** (`addrs 2, want 5`); sweeps rc=0 GREEN |
+| C1 | restored | rc=0 / rc=0 |
+
+The GREEN sweep column in M1/M2 is the finding: the sweep is structurally
+unable to see a wrong derived formula, which is why the guard has to.
+
+### B2 — `.all` / `.entries` were not injective
+
+`axisEncodeValue6812` joined columns as `name=key<RS>` with the key written
+RAW, so a string field carrying the record separator plus a forged
+`NAME=<PRESENT>` boundary re-partitioned the record. With `<RS>` for `\x1e` and
+`<P>` for the present tag `\x01`:
+
+```
+[]elem{{A: "x<RS>B=<P>y", B: "z"}}   and   []elem{{A: "x", B: "y<RS>B=<P>z"}}
+    -> identical .all key   A=<P>x<RS>B=<P>y<RS>B=<P>z<RS>
+```
+
+Nested containers hit the same hole with no adversarial string at all: an
+`.all` key is itself a composite full of `<RS>`, and embedding it raw one level
+up re-partitions the outer record.
+
+**Scope, and it was narrow.** Single-column element types (`[]string`,
+`[]byte`) were already injective — one column, length-prefixed per element —
+and the only multi-column swept slice elements
+(`Snapshot.MatchApplications[0]`, `Snapshot.MatchDestinationPorts[0]`) are
+fixture-constant, so no NAT config reached it. The claim was still false as
+written, which is the failure mode this PR keeps being caught on.
+
+**Fix: escape at the JOIN, not at the leaf.** `axisEscapeKey6812` maps the
+escape byte and the three structural delimiters to two-byte sequences
+(`\x1c`, `\x1d`, `\x1e`, `\x1f` -> `\x1c`+`E`/`G`/`R`/`U`) and is applied once
+to every column key in `axisEncodeValue6812`. Leaf keys and composite keys go
+through the same call, so a container nested N deep is escaped exactly N times
+on the way up. Escaping at each leaf instead would leave composite keys — built
+from already-escaped pieces — unescaped at the level that embeds them. Column
+NAMES are not escaped and do not need to be: they are Go field names plus this
+collector's fixed suffixes, none of which can contain a structural byte or an
+`=`, so splitting a record at its first `=` recovers name and key uniquely.
+
+The unit-separator split inside a map entry is fixed by the same change: an
+escaped key contains no unit separator, so the one in an entry is the one the
+encoder wrote.
+
+**No key-format churn.** The escape is the identity on any value without a
+structural byte, so every pre-existing golden row is byte-identical.
+
+### B3 — the "third outcome" survived for POPULATED maps
+
+Round 11 claims every kind does exactly one of (a) order-preserving column,
+(b) total content column, (c) type-schema with absent keys, (d) `-UNENCODED`
+declaration, (e) stop the test — no SILENTLY SKIPPED. For a populated map the
+`{key}` / `{value}` schema columns were not emitted:
+
+```
+populated map, before adding field B:  [M.entries M.len M.nil]
+populated map,  after adding field B:  [M.entries M.len M.nil]   identical
+the slice analogue gains S[0].B
+```
+
+Latent — no map is swept by a NAT fixture today — but it made the file-level
+"closure at FIELD granularity, by construction" sentence and option (c)'s own
+rationale false. It also made the map column SET a function of the VALUE rather
+than the TYPE, which is the worse half: a fixture holding one empty and one
+populated map of the same type emitted the schema columns for the empty slot
+only, the sweep back-filled the missing slot with `""`, and the result was a
+column that VARIES across slots — reading as guarded when nothing was compared.
+
+**Fix:** emit the schema columns ALWAYS. The keys stay ABSENT even when the map
+is populated, which is the honest encoding: unlike a slice's `[0]`, a map has
+no canonical first entry to project. Content coverage is `.entries`, which is
+total; the schema columns exist so a new field cannot vanish, and a constant
+column is a REGISTERED blind spot rather than an unknown one.
+
+**Why the existing prober missed it.** `TestCollectorSeesMapContents_6812`
+asserted `M{key}.N` exists for an EMPTY map — the case round 11 had just
+repaired — and never asked the populated one. The probe was keyed to the fix,
+not to the property.
+
+| cell | subject | result |
+|---|---|---|
+| C0 | pristine (new B2 test / new B3 test / old prober / twins golden) | rc=0 x4 |
+| S0 | always-failing sentinel | rc=1 |
+| MUT-B2 | write the key RAW at the join | new injectivity test **rc=1 RED** on the exact collision; **old prober rc=0 GREEN** |
+| MUT-B3 | restore the populated-map early return | new schema test **rc=1 RED** (`got [M.nil M.len M.entries]`); **old map prober rc=0 GREEN** |
+| C1 | restored, all `6812` both packages | rc=0 / rc=0 |
+
+The GREEN old-prober cells are the "previously invisible" half: both defects
+were reachable with the pre-round-13 test set fully passing.
+
+### The twin golden, and why it moved
+
+`testdata/axis_collector_twins_6812.golden` gained EIGHT rows and lost none —
+every pre-existing row is byte-identical, so the key FORMAT did not change:
+
+- three from B3 (`MapFull{key}.Count`, `MapFull{key}.Label`, `MapFull{value}`,
+  all absent-keyed);
+- five from a new `SliceSep` probe field carrying a record separator inside a
+  multi-column element, added so the BEHAVIOURAL half of the twins agreement
+  can see an escaping divergence. The textual-identity half already covers it,
+  but the behavioural half is probe-bounded and a probe-bounded test cannot see
+  what the probe does not reach. `SliceSep.all` now shows the escaped form;
+  `SliceSep[0].Label` shows the raw separator, because leaf columns are
+  compared whole and are never joined.
+
+Regenerating with the reason recorded is the workflow the twins test itself
+prescribes.
+
+### N1 — the review's third formula, refuted by measurement
+
+The review reported a THIRD formula agreeing with production on all four
+fixture pools — `Sum host-count x (PortHigh - PortLow + 1)` read from the raw
+`NATPool` fields instead of consulting `SourceNATPoolPortRange` — and asked for
+a fixture pool with no `port` leaf to distinguish it ("raw width 1 vs
+production 64512").
+
+**That witness does not exist, because the divergence is unreachable through
+the compiler.** `compileNATSource` stamps the 1024/65535 default into
+`PortLow`/`PortHigh` itself (the `if pool.PortLow == 0` tail of the pool loop
+in `pkg/config/compiler_nat_source.go`), so a compiled no-port-leaf pool
+already carries raw 1024/65535. Measured directly:
+
+```
+NO-PORT-LEAF POOL: raw PortLow=1024 PortHigh=65535 | effective lo=1024 hi=65535 ok=true
+raw width = 64512   eff width = 64512
+```
+
+And a pool whose EXPLICIT range was rejected (#5457 `PortRangeInvalidSpec`) is
+unusable, so `sourceNATAggregateReferencedCharges` never charges it and no slot
+exists for it. Every pool a slot can exist for therefore has raw width ==
+resolved width: the raw-field formula is extensionally EQUAL to production on
+this domain, not a rival. Claiming a witness for it would be the
+fixture-coincidence error inverted — inventing discrimination that does not
+exist.
+
+**What is bindable is the PREMISE**, and it now is.
+`TestRawPortFieldsAreNotAThirdFormula_6812` asserts the agreement AND that no
+charged pool reaches the walk with a zero endpoint, and REQUIRES the fixture to
+contain a pool with no `port` leaf so the agreement actually exercises the
+default. If `compileNATSource` stops pre-defaulting, or another path builds a
+referenced pool with a zero endpoint, it reds and names the pool as the rival's
+witness.
+
+The no-port-leaf pool `qe` was added for that role. It also keeps the
+`ChargePortCap` column non-monotone (5000, 8001, 300, 6001, 64512), which every
+axis in the declaration table has to be.

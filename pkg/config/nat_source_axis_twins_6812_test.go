@@ -54,7 +54,14 @@ type axisTwinProbe6812 struct {
 	MapNil     map[axisTwinNested6812]string
 	MapEmpty   map[axisTwinNested6812]string
 	MapFull    map[axisTwinNested6812]string
-	When       time.Time
+	// SliceSep carries the RECORD SEPARATOR inside a multi-column element,
+	// so the golden binds axisEscapeKey6812 across the two copies too
+	// (#6812 round 13). Without it the behavioural half of the twins
+	// agreement is blind to an escaping divergence — the probe reaches no
+	// value carrying a structural byte, and a probe-bounded test cannot see
+	// what the probe does not reach.
+	SliceSep []axisTwinNested6812
+	When     time.Time
 }
 
 // axisTwinProbeValue6812 must be byte-identical in both packages: the golden is
@@ -78,7 +85,8 @@ func axisTwinProbeValue6812() axisTwinProbe6812 {
 			{Label: "k1", Count: 1}: "v1",
 			{Label: "k2", Count: 2}: "v2",
 		},
-		When: time.Unix(1700000000, 0).UTC(),
+		SliceSep: []axisTwinNested6812{{Label: "x\x1eB=\x01y", Count: 8}},
+		When:     time.Unix(1700000000, 0).UTC(),
 	}
 }
 
