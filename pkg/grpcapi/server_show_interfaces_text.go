@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
@@ -359,25 +360,33 @@ func (s *Server) showInterfacesQueue(req *pb.ShowTextRequest, buf *strings.Build
 // [type <dscp|ieee-802.1>]` (#4228 Gap 7). Topic form is "cos-classifier" or
 // "cos-classifier:name=<n>,type=<t>".
 func (s *Server) showCoSClassifier(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
-	nameFilter, typeFilter := "", ""
-	params := strings.TrimPrefix(req.Topic, "cos-classifier")
-	params = strings.TrimPrefix(params, ":")
-	for _, kv := range strings.Split(params, ",") {
-		kv = strings.TrimSpace(kv)
-		if kv == "" {
-			continue
-		}
-		if k, v, ok := strings.Cut(kv, "="); ok {
-			switch k {
-			case "name":
-				nameFilter = v
-			case "type":
-				typeFilter = v
-			}
-		}
-	}
+	nameFilter, typeFilter := parseCoSTopicNameType(req.Topic, "cos-classifier")
 	buf.WriteString(dpformat.FormatCoSClassifiers(cfg, nameFilter, typeFilter))
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// showCoSRewriteRule renders `show class-of-service rewrite-rule [name <n>]
+// [type <dscp|ieee-802.1|inet-precedence|exp>]` (#6848). Topic form is
+// "cos-rewrite-rule" or "cos-rewrite-rule:name=<n>,type=<t>" — the same
+// encoding showCoSClassifier uses, so the two siblings share
+// parseCoSTopicNameType.
+func (s *Server) showCoSRewriteRule(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	nameFilter, typeFilter := parseCoSTopicNameType(req.Topic, "cos-rewrite-rule")
+	buf.WriteString(dpformat.FormatCoSRewriteRules(cfg, nameFilter, typeFilter))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// parseCoSTopicNameType extracts the `name=` / `type=` params from a
+// "<prefix>[:k=v,k=v]" ShowText topic, shared by the CoS classifier and
+// rewrite-rule handlers (#6848).
+//
+// #6858: the decode is cmdtree's, and it is the exact inverse of the encode the
+// remote `cli` binary runs (cmdtree.CoSNameTypeTopic). Keeping the two halves
+// of one wire format in one package is what lets a filter value containing the
+// separator — `rewrite-rules dscp "rw,x"` commits — round-trip instead of
+// truncating at the comma and rendering a different rule.
+func parseCoSTopicNameType(topic, prefix string) (nameFilter, typeFilter string) {
+	return cmdtree.ParseCoSNameTypeTopic(topic, prefix)
 }
 
 // showCoSSchedulerMap renders `show class-of-service scheduler-map [<name>]`

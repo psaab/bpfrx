@@ -34,9 +34,9 @@
 [WATCH]      1764  userspace-dp/src/screen/scan.rs
 [WATCH]      1752  pkg/config/types_system.go
 [WATCH]      1680  pkg/api/server.go
+[WATCH]      1652  pkg/cmdtree/tree.go
 [WATCH]      1639  pkg/api/sessions.go
 [WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
-[WATCH]      1606  pkg/cmdtree/tree.go
 [WATCH]      1603  userspace-dp/src/afxdp/poll_descriptor/filter.rs
 [WATCH]      1595  pkg/cluster/heartbeat.go
 [WATCH]      1581  pkg/routing/rules.go
