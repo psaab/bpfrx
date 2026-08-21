@@ -121,28 +121,33 @@ self-contained on one incus host: the appliance is the L3 gateway, the
 LAN/WAN segments are pure L2 bridges, and interface SNAT means the WAN
 endpoint needs no route back.
 
-> **VENUE WARNING (re-confirmed 2026-06-17 live — #1955's "resolved"
-> claim was wrong; #1961).** The AF_XDP userspace dataplane does NOT
-> forward L3 transit over **virtio** NICs in a plain incus VM. The
-> #1927/#1929 fixes did clear the *earlier* failure mode (the `libxdp
-> private bind: Device or resource busy` rebind loop), so the bind now
-> succeeds — but a deeper gap remains: the XDP shim attaches native and
-> redirects, yet the helper's XSK **receives 0 frames** (`show security
-> flow statistics` → `Packets received: 0`, `Sessions created: 0`).
-> Everything up to the control plane works — boot, day-0 install/commit,
-> interface bring-up, and the gateway is pingable (host-inbound) — but
-> **L3 transit forwarding yields 0 sessions**. This was verified on clean
-> master (xpfd `4f453c98`, helper `cb83da9f`) against a virtio
-> trust→untrust path on TWO kernels (6.17 / Ubuntu 25.10 and 6.18 /
-> Debian 13), with BOTH `AUTO` (flags=0) and forced `COPY` bind flags,
-> and with BOTH `busy-poll` and `interrupt` poll modes — none deliver to
-> the XSK. The #1928/#1929 "AUTO bind + HA-gate fix forwards 5000 pps on
-> virtio" claim did NOT reproduce here. Run the *forwarding* assertions
-> only on a venue with a real AF_XDP NIC: **mlx5 SR-IOV VFs** (the loss
-> userspace cluster, proven daily) or **i40e PF passthrough** (the
-> standalone test VM's WAN). On incus/virtio, treat Tier 2 as a
-> **control-plane + day-0 + interface-bring-up** check (steps through
-> "confirm the interface map" below), not a forwarding proof.
+> **VENUE NOTE (measured 2026-08-21 from a baked image; #1926).** Plain
+> **virtio** in an ordinary incus VM IS a valid venue for the Tier-2
+> *functional* forwarding assertions below. The earlier "virtio delivers
+> 0 frames to the XSK" warning here is retired — see
+> "Recorded Tier-2 result" for the run that replaces it.
+>
+> The claim it rested on (#1961) was root-caused to a Go↔Rust snapshot
+> **wire-type** bug for DSCP/code-point lists, fixed in **PR #1976** plus
+> the `NUM_WIDTH` siblings in **#1978**. Its "sustained virtio stall"
+> follow-on was retracted by its own author as a test-environment defect:
+> three firewall VMs were answering the same gateway IPs on the same
+> bridges, so the client's gateway ARP flipped mid-flow. The warning text
+> was written one day BEFORE #1976 landed and was never revisited, so it
+> outlived its evidence by two months.
+>
+> What virtio does NOT give you is a **line-rate** number: the ceiling
+> below is a few Gbit/s on a single flow, an order of magnitude under a
+> real AF_XDP NIC. Performance claims still belong on **mlx5 SR-IOV VFs**
+> (the loss userspace cluster) or **i40e PF passthrough** (the standalone
+> test VM's WAN). Tier 2 does not ask for one — it asks whether the
+> appliance routes and NATs at all.
+>
+> **The one trap to avoid** is the one that caused the #1961
+> misdiagnosis: make sure no other firewall VM answers the same gateway
+> IPs on the same bridges. Run `incus list` first. The private
+> `10.66.1.0/24` / `10.66.2.0/24` segments below exist precisely to keep
+> this run isolated.
 
 ### Topology
 
@@ -162,11 +167,10 @@ endpoint needs no route back.
 NIC order = interface name (positional contract). Names are shown in
 config/CLI slash form (`ge-0/0/0`); the Linux link name is the dash form
 (`ge-0-0-0`) that `assignName()` produces — the config layer translates
-between them. NOTE (per the venue warning above, #1961): on incus/virtio
-the AF_XDP dataplane binds but does NOT deliver to the XSK (transit yields
-0 sessions), so this topology validates control-plane + day-0 + interface
-bring-up, NOT transit forwarding. Run the forwarding assertions on
-mlx5-VF / i40e-PF.
+between them. This topology on plain incus/virtio validates the full
+Tier-2 set: control-plane + day-0 + interface bring-up AND transit
+forwarding/NAT (measured, #1926 — see "Recorded Tier-2 result"). Only
+line-rate numbers need mlx5-VF / i40e-PF.
 
 ### Host networks
 
@@ -259,6 +263,68 @@ incus exec wanhost -- timeout 6 tcpdump -ni eth0 -c3 'src fd66:2::1'    # v6 SNA
 - `show security flow session` shows the forwarded flows with interface SNAT.
 - `wanhost` sees traffic sourced from `10.66.2.1` (v4) AND `fd66:2::1` (v6) — SNAT confirmed for both families, not bridged.
 
+### Recorded Tier-2 result (2026-08-21, #1926)
+
+First recorded pass. Run on ordinary **incus/virtio** on a dev host — no
+SR-IOV, no PF passthrough, no shared-cluster lock.
+
+| | |
+|---|---|
+| Image | `xpf-userspace-forwarding-ok-20260402-bfb00432-10859-gf93215641.qcow2` |
+| `git_commit` | `f93215641` (master `e344c9df5` + the three bake fixes below) |
+| Base | Ubuntu 26.04 cloud image, `9dc7c536…`, Canonical-GPG-verified |
+| Guest kernel | `7.0.0-30-generic` |
+| Venue | incus VM, 3× virtio NIC, `xpf-rtr-{mgmt,lan,wan}` |
+
+Deployed from the baked qcow2 via `xpf-deploy.py` with the day-0 drive —
+**not** pushed binaries. Results:
+
+- **v4 ping** 10.66.1.10 → 10.66.2.10: replies, 0.35–0.43 ms.
+- **v6 ping** fd66:1::10 → fd66:2::10: replies, 0.31–0.33 ms.
+  (The *first* echo of a cold flow is lost in both families while the
+  session installs — `icmp_seq=1` missing, `seq=2,3` fine. A warm flow is
+  0% loss; see the discriminator below.)
+- **iperf3 v4** 2.98 Gbit/s (5 s), **4.29 Gbit/s** sustained over 30 s.
+- **iperf3 v6** 3.94 Gbit/s (5 s), **3.02 Gbit/s** sustained over 30 s.
+- **`show security flow session`**: LAN→WAN flows with interface SNAT —
+  `In: 10.66.1.10 --> 10.66.2.10;icmp / Out: 10.66.2.10 --> 10.66.2.1;icmp`
+  and the `fd66:` equivalent translating to `fd66:2::1`.
+- **`show security flow statistics`**: `Packets received: 3033032`,
+  `Packets dropped: 0` — the direct refutation of the retired warning's
+  `Packets received: 0`.
+- **wanhost tcpdump**: ICMP *and* TCP sourced from `10.66.2.1` /
+  `fd66:2::1`; the LAN host's own address never appears on the WAN
+  segment. SNAT confirmed for both families and both protocols.
+
+**Discriminator — this is the xpf dataplane, not the guest kernel.**
+Interface SNAT alone already rules the kernel out (`nft list ruleset`
+shows no NAT table — only xpf's own RST-suppression and host-inbound
+counters). Made explicit anyway, matching the method that settled #1961:
+with `net.ipv4.ip_forward=0` **and** `net.ipv6.conf.all.forwarding=0` set
+on the appliance, ping stayed at **0% loss** and iperf3 still moved
+**4.29 Gbit/s (v4)** and **3.02 Gbit/s (v6)** over 30 s. Kernel forwarding
+disabled, traffic still crossing: the AF_XDP userspace dataplane carried
+it.
+
+**Not proven by this run**, and deliberately not claimed:
+line rate (virtio ceilings at a few Gbit/s on one flow — use mlx5-VF or
+i40e-PF for a performance number), and Tier 3 / HA from an image.
+
+Two defects observed during the run, tracked separately — neither affects
+the result above:
+
+- Tier-1 scenario **a** fails on this image: on a factory boot with no
+  config drive, nothing brings the NIC up (the bake purges cloud-init and
+  netplan), so xpfd's bootstrap lifeline finds no default route, declines
+  to identify a management NIC, and leaves the port down and unrenamed —
+  no `fxp0`, no DHCP. Tier 2 is unaffected because it supplies a day-0
+  config, which takes xpfd out of bootstrap and into full interface
+  takeover.
+- `show security flow session` lists the ICMP sessions but omits TCP ones,
+  while `show security flow statistics` counts them (`Current sessions:
+  10` against a rendered `Total sessions: 2`). A display-path gap, not a
+  forwarding one — the TCP flows demonstrably forward and SNAT.
+
 ### Cleanup
 ```bash
 incus delete -f xpf-rtr lanhost wanhost
@@ -323,25 +389,28 @@ Delete `fw0`/`fw1` and the five `xpf-ha-*` networks.
 
 ## Honest scope
 
-- **virtio is NOT a forwarding venue (#1961, re-confirmed 2026-06-17).**
-  #1927/#1929 cleared the earlier `Device or resource busy` bind loop, so
-  the helper now binds virtio multi-queue cleanly — but it still does NOT
-  forward transit: the XDP shim attaches native and redirects, yet the
-  helper's XSK receives 0 frames (`Packets received: 0`, `Sessions
-  created: 0`). Re-verified on clean master against a virtio trust→untrust
-  path on kernels 6.17 and 6.18, with both `AUTO` and `COPY` bind flags
-  and both `busy-poll` and `interrupt` poll modes; the #1928/#1929 "AUTO
-  bind forwards 5000 pps on virtio" claim did not reproduce. So Tiers 2–3
-  on virtio validate only boot + day-0 + interface bring-up + control-plane
-  reachability — NOT transit forwarding/NAT/HA. Functional forwarding (and
-  line-rate numbers) require a real AF_XDP NIC: the loss userspace
-  cluster's mlx5 SR-IOV VFs, or i40e PF passthrough on the standalone test
-  VM. The loss SR-IOV smoke matrix (`docs/`) tests the *deployed binaries*;
-  an image-based forwarding test needs the image booted on one of those NIC
-  venues. Tracked in #1961 (reopened from the #1928 "resolved" claim).
-- The image is hardware-agnostic for the control-plane tiers, but transit
-  forwarding is NOT venue-agnostic: `verify-dataplane` and forwarding
-  exercise the real userspace AF_XDP path, which does not deliver on
-  virtio. Local KVM/virtio is a faithful *control-plane* venue only.
+- **virtio IS a functional forwarding venue; it is not a performance one
+  (measured 2026-08-21, #1926).** Tier 2 passes end-to-end on ordinary
+  incus/virtio — v4+v6 ping, iperf3 both families, interface SNAT
+  confirmed on the wire — from a booted baked image, with the guest's own
+  `ip_forward` disabled to prove the AF_XDP dataplane carried it. See
+  "Recorded Tier-2 result". What virtio cannot give you is a line-rate
+  number: it ceilings at a few Gbit/s on a single flow, so performance
+  claims still need the loss cluster's mlx5 SR-IOV VFs or i40e PF
+  passthrough.
+
+  This bullet previously asserted the opposite, on #1961's "XSK receives
+  0 frames" finding. That finding was a Go↔Rust snapshot wire-type bug
+  (fixed in #1976/#1978), and its "sustained stall" follow-on was
+  retracted by its author as a gateway-IP/ARP collision between three
+  firewall VMs. The text was written the day before the fix landed and
+  went unrevisited for two months; treat the dated "re-confirmed" note it
+  carried as a caution about re-confirming against a moving tree, not as
+  evidence.
+- The **image vs. deployed binaries** distinction still matters. The loss
+  SR-IOV smoke matrix exercises binaries pushed onto already-running VMs;
+  it never boots the baked qcow2. The recorded Tier-2 result above is an
+  image-based proof and is the thing that closes that gap — on virtio. An
+  image-based proof *on an SR-IOV venue* is still unrun.
 - None of these tiers touch the shared `loss` cluster; Tier-1 and the
   functional tiers use dedicated throwaway instances + networks.
