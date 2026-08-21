@@ -63,11 +63,19 @@ class PinnedConstantTests(_EnvGuard):
                          "the pinned base digest must be a bare sha256 hex.")
 
     def test_2604_pin_matches_canonical_gpg_verified_value(self):
-        # The 26.04 pin was authored by verifying Canonical's SHA256SUMS.gpg
+        # The 26.04 pin is authored by verifying Canonical's SHA256SUMS.gpg
         # against the UEC signing key D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81.
+        # Current value is Canonical's 2026-08 respin (bumped in bake.py by
+        # 5fb53d7a1); re-verified here independently:
+        #   gpg: Signature made Tue 04 Aug 2026 01:46:14 PM PDT
+        #   gpg:                using RSA key D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
+        #   gpg: Good signature from "UEC Image Automatic Signing Key <cdimage@ubuntu.com>"
+        # The constant is duplicated here ON PURPOSE: the trust anchor must not
+        # be able to move without a reviewer seeing it in a diff. Both places
+        # move together, or this test is what says so.
         self.assertEqual(
             bake.PINNED_BASE_SHA256.get("26.04"),
-            "3ee4f67f322abb2d1d1f0fffc957f7411404ad6635dd35b026c8ff05ac6e534c")
+            "9dc7c5363c0146a08ba0c9aa834d82c2c6dfbb1c471ad9a2f0aba1189e21be05")
 
 
 class ResolveBasePinTests(_EnvGuard):
