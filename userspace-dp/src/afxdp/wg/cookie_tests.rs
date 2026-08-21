@@ -579,3 +579,65 @@ fn initiator_ignores_cookie_reply_before_any_initiation() {
     );
     assert!(!ic.has_cookie_for_test());
 }
+
+/// #6422: the responder's under-load detector is consulted on EVERY
+/// inbound initiation. `.lock().unwrap()` on `load` meant one poisoning
+/// panic turned the cookie/DoS gate itself into the denial of service —
+/// every later initiation panicked the thread that classified it.
+/// Recovery is safe: `LoadState` is a fixed-window counter mutated by
+/// infallible integer arithmetic, so the recovered value is always a
+/// real committed window.
+#[test]
+fn note_initiation_recovers_poisoned_load_lock_6422() {
+    use crate::afxdp::wg::poison_tests::poison_mutex;
+    let cc = CookieChecker::new(&[0x11u8; 32]);
+    // Seed a window so recovery has committed state to preserve.
+    for _ in 0..3 {
+        assert!(!cc.note_initiation(1_000));
+    }
+    let counted_before = cc.load.lock().unwrap().count;
+    assert_eq!(counted_before, 3, "precondition: three arrivals recorded");
+
+    poison_mutex(&cc.load);
+
+    assert!(
+        !cc.note_initiation(1_000),
+        "the load gate must still answer after poison recovery"
+    );
+    assert_eq!(
+        cc.load.lock().unwrap_or_else(|e| e.into_inner()).count,
+        4,
+        "recovery must extend the COMMITTED window, not restart it"
+    );
+}
+
+/// #6422: the rotating cookie secret. `secrets()` is on the path of
+/// every cookie-reply build and every MAC2 verification; panicking there
+/// forever would disable MAC2 for the tunnel. Recovery cannot weaken the
+/// #4094 BUG-2 fail-closed posture, because `secure` is only ever set to
+/// `true` AFTER a fresh secret has been written.
+#[test]
+fn secrets_recovers_poisoned_secret_lock_6422() {
+    use crate::afxdp::wg::poison_tests::poison_mutex;
+    let our_pub = [0x22u8; 32];
+    let cc = CookieChecker::new(&our_pub);
+    let (first, _) = cc.secrets(10_000).expect("a secure secret is available");
+
+    poison_mutex(&cc.secret);
+
+    let (after, _) = cc
+        .secrets(10_000)
+        .expect("secrets() must still resolve through a poisoned lock");
+    assert_eq!(
+        first, after,
+        "recovery must return the SAME committed secret — a fresh one \
+         would invalidate every cookie already handed out"
+    );
+    let init = valid_mac1_init(&our_pub, 0x1234);
+    let mut out = [0u8; 128];
+    assert!(
+        cc.build_cookie_reply(&init, src(51820), 10_000, &mut out)
+            .is_ok(),
+        "the cookie-reply path must still function after recovery"
+    );
+}
