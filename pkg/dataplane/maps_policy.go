@@ -17,8 +17,11 @@ import (
 
 // SetZoneConfig writes a zone configuration entry.
 func (m *Manager) SetZoneConfig(zoneID uint16, cfg ZoneConfig) error {
-	zm, ok := m.maps["zone_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("zone_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: zone_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("zone_configs map not found")
 	}
 	return zm.Update(uint32(zoneID), cfg, ebpf.UpdateAny)
@@ -28,8 +31,11 @@ func (m *Manager) SetZoneConfig(zoneID uint16, cfg ZoneConfig) error {
 // The zone_pair_policies map is an ARRAY keyed by flat index:
 // from_zone * MaxZones + to_zone.
 func (m *Manager) SetZonePairPolicy(fromZone, toZone uint16, ps PolicySet) error {
-	zm, ok := m.maps["zone_pair_policies"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("zone_pair_policies")
+	if st == registryFresh {
+		return fmt.Errorf("%w: zone_pair_policies", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("zone_pair_policies map not found")
 	}
 	key := uint32(fromZone)*MaxZones + uint32(toZone)
@@ -38,8 +44,11 @@ func (m *Manager) SetZonePairPolicy(fromZone, toZone uint16, ps PolicySet) error
 
 // SetPolicyRule writes a policy rule at the computed flat index.
 func (m *Manager) SetPolicyRule(policySetID uint32, ruleIndex uint32, rule PolicyRule) error {
-	zm, ok := m.maps["policy_rules"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("policy_rules")
+	if st == registryFresh {
+		return fmt.Errorf("%w: policy_rules", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("policy_rules map not found")
 	}
 	idx := policySetID*MaxRulesPerPolicy + ruleIndex
@@ -57,8 +66,11 @@ func (m *Manager) SetAddressBookEntry(cidr string, addressID uint32) error {
 	ones, _ := ipNet.Mask.Size()
 
 	if ip4 := ipNet.IP.To4(); ip4 != nil {
-		zm, ok := m.maps["address_book_v4"]
-		if !ok {
+		zm, present, st := m.lookupMapLocked("address_book_v4")
+		if st == registryFresh {
+			return fmt.Errorf("%w: address_book_v4", ErrDataplaneNotArmed)
+		}
+		if !present {
 			return fmt.Errorf("address_book_v4 map not found")
 		}
 		key := LPMKeyV4{
@@ -70,8 +82,11 @@ func (m *Manager) SetAddressBookEntry(cidr string, addressID uint32) error {
 	}
 
 	// IPv6
-	zm, ok := m.maps["address_book_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("address_book_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: address_book_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("address_book_v6 map not found")
 	}
 	key := LPMKeyV6{
@@ -86,8 +101,11 @@ func (m *Manager) SetAddressBookEntry(cidr string, addressID uint32) error {
 // This maps (resolvedID, setID) -> 1, indicating that resolvedID
 // is a member of the address-set identified by setID.
 func (m *Manager) SetAddressMembership(resolvedID, setID uint32) error {
-	zm, ok := m.maps["address_membership"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("address_membership")
+	if st == registryFresh {
+		return fmt.Errorf("%w: address_membership", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("address_membership map not found")
 	}
 	key := AddrMembershipKey{IP: resolvedID, AddressID: setID}
@@ -97,8 +115,11 @@ func (m *Manager) SetAddressMembership(resolvedID, setID uint32) error {
 
 // ClearAddressBookV4 removes all entries from the address_book_v4 LPM trie.
 func (m *Manager) ClearAddressBookV4() error {
-	zm, ok := m.maps["address_book_v4"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("address_book_v4")
+	if st == registryFresh {
+		return fmt.Errorf("%w: address_book_v4", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("address_book_v4 map not found")
 	}
 	var key LPMKeyV4
@@ -116,8 +137,11 @@ func (m *Manager) ClearAddressBookV4() error {
 
 // ClearAddressBookV6 removes all entries from the address_book_v6 LPM trie.
 func (m *Manager) ClearAddressBookV6() error {
-	zm, ok := m.maps["address_book_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("address_book_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: address_book_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("address_book_v6 map not found")
 	}
 	var key LPMKeyV6
@@ -135,8 +159,11 @@ func (m *Manager) ClearAddressBookV6() error {
 
 // ClearAddressMembership removes all entries from the address_membership map.
 func (m *Manager) ClearAddressMembership() error {
-	zm, ok := m.maps["address_membership"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("address_membership")
+	if st == registryFresh {
+		return fmt.Errorf("%w: address_membership", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("address_membership map not found")
 	}
 	var key AddrMembershipKey
@@ -154,8 +181,11 @@ func (m *Manager) ClearAddressMembership() error {
 
 // SetApplication writes an application map entry.
 func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, timeout uint32, algType uint8, srcPortLow, srcPortHigh uint16) error {
-	zm, ok := m.maps["applications"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("applications")
+	if st == registryFresh {
+		return fmt.Errorf("%w: applications", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("applications map not found")
 	}
 	key := AppKey{
@@ -174,8 +204,11 @@ func (m *Manager) SetApplication(protocol uint8, dstPort uint16, appID uint32, t
 
 // SetAppRange writes a range-based application entry at the given index.
 func (m *Manager) SetAppRange(index uint32, entry AppRangeEntry) error {
-	zm, ok := m.maps["app_ranges"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("app_ranges")
+	if st == registryFresh {
+		return fmt.Errorf("%w: app_ranges", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("app_ranges map not found")
 	}
 	return zm.Update(index, entry, ebpf.UpdateAny)
@@ -183,8 +216,11 @@ func (m *Manager) SetAppRange(index uint32, entry AppRangeEntry) error {
 
 // ClearAppRanges zeros all app_ranges entries.
 func (m *Manager) ClearAppRanges() error {
-	zm, ok := m.maps["app_ranges"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("app_ranges")
+	if st == registryFresh {
+		return fmt.Errorf("%w: app_ranges", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("app_ranges map not found")
 	}
 	zero := AppRangeEntry{}
@@ -197,8 +233,11 @@ func (m *Manager) ClearAppRanges() error {
 // ClearZonePairPolicies zeros all zone-pair policy entries.
 // The map is an ARRAY so entries cannot be deleted — zero means "no policy".
 func (m *Manager) ClearZonePairPolicies() error {
-	zm, ok := m.maps["zone_pair_policies"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("zone_pair_policies")
+	if st == registryFresh {
+		return fmt.Errorf("%w: zone_pair_policies", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("zone_pair_policies map not found")
 	}
 	zeroPS := PolicySet{}
@@ -215,8 +254,11 @@ func (m *Manager) ClearZonePairPolicies() error {
 
 // ClearApplications deletes all application map entries.
 func (m *Manager) ClearApplications() error {
-	zm, ok := m.maps["applications"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("applications")
+	if st == registryFresh {
+		return fmt.Errorf("%w: applications", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("applications map not found")
 	}
 	var key AppKey
@@ -234,8 +276,11 @@ func (m *Manager) ClearApplications() error {
 
 // SetDefaultPolicy writes the global default policy action (0=deny, 1=permit).
 func (m *Manager) SetDefaultPolicy(action uint8) error {
-	zm, ok := m.maps["default_policy"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("default_policy")
+	if st == registryFresh {
+		return fmt.Errorf("%w: default_policy", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("default_policy map not found")
 	}
 	return zm.Update(uint32(0), action, ebpf.UpdateAny)
@@ -250,8 +295,10 @@ func (m *Manager) SetDefaultPolicy(action uint8) error {
 // runs at runtime. It always reports success (nil) so the daemon's
 // scheduler self-heal never spins on a dead path.
 func (m *Manager) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) error {
-	zm, ok := m.maps["policy_rules"]
-	if !ok {
+	// #2114 A3 class 2: the #3780 deliberate nil is the fresh AND absent
+	// outcome — the scheduler self-heal never spins on this path.
+	zm, present, _ := m.lookupMapLocked("policy_rules")
+	if !present {
 		return nil
 	}
 	result := m.LastCompileResult()
@@ -289,8 +336,11 @@ func (m *Manager) UpdatePolicyScheduleState(_ *config.Config, activeState map[st
 
 // ReadPolicyCounters reads the per-CPU policy counter values and sums them.
 func (m *Manager) ReadPolicyCounters(policyID uint32) (CounterValue, error) {
-	zm, ok := m.maps["policy_counters"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("policy_counters")
+	if st == registryFresh {
+		return CounterValue{}, fmt.Errorf("%w: policy_counters", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return CounterValue{}, fmt.Errorf("policy_counters map not found")
 	}
 	var perCPU []CounterValue
@@ -307,14 +357,65 @@ func (m *Manager) ReadPolicyCounters(policyID uint32) (CounterValue, error) {
 
 // ClearPolicyCounters zeroes all policy counter entries.
 func (m *Manager) ClearPolicyCounters() error {
-	zm, ok := m.maps["policy_counters"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("policy_counters")
+	if st == registryFresh {
+		return fmt.Errorf("%w: policy_counters", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("policy_counters map not found")
 	}
+	return clearPolicyCountersIn(zm)
+}
+
+// clearPolicyCountersRaw is the UNGATED ClearAllCounters composition leg
+// (#2114 A3 nested-call rule — see clearInterfaceCountersRaw).
+func (m *Manager) clearPolicyCountersRaw() error {
+	zm, present, _ := m.lookupMapLocked("policy_counters")
+	if !present {
+		return fmt.Errorf("policy_counters map not found")
+	}
+	return clearPolicyCountersIn(zm)
+}
+
+// counterMapUpdater is the *ebpf.Map subset the blind-write counter-clear
+// loops use. It exists as a seam (#2114, Codex PR #6743 r4-F2): creating
+// a real BPF map needs privileges the unit lane does not have, so the
+// error-propagation contract below is otherwise untestable and would ship
+// on a comment alone. *ebpf.Map satisfies it as declared.
+type counterMapUpdater interface {
+	Update(key, value any, flags ebpf.MapUpdateFlags) error
+}
+
+// clearPolicyCountersIn zeroes every policy_counters slot.
+//
+// #2114 (Codex PR #6743 r4-F2): the Update error is PROPAGATED. It used
+// to be discarded, so `clear security policies statistics` reported
+// success even when not one slot was actually zeroed — the operator's
+// only feedback that the clear landed was a message that could not
+// fail. The bound is exact: policy_counters is a PERCPU_ARRAY of
+// MAX_POLICIES == 4096 entries (bpf/headers/xpf_maps.h,
+// bpf/headers/xpf_common.h:151), so every index below is in range on an
+// armed map and this cannot turn a working clear into an error. Matches
+// clearInterfaceCountersIn, which already returned its Update error.
+//
+// RESIDUAL — error propagation does NOT close the detached-backend false
+// success (Codex PR #6743 r5/r6-F5). Teardown() does not close the map
+// FDs: loader.go's teardown closes only the link handles and Cleanup
+// merely unpins, so a RETAINED, torn-down Manager still holds a live
+// FD-backed map object. cilium's Map.Update through that FD SUCCEEDS, and
+// a successful write is indistinguishable from a correct one at this
+// layer — so a `clear` issued against a disowned generation still reports
+// success while the live generation keeps its counters. Detecting it
+// needs a generation tag or lease on the handle itself, which is #6741's
+// scope, NOT this wrapper's; do not read the paragraph above as closing
+// that case.
+func clearPolicyCountersIn(zm counterMapUpdater) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
 	for i := uint32(0); i < 4096; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
+		if err := zm.Update(i, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear policy_counters %d: %w", i, err)
+		}
 	}
 	return nil
 }

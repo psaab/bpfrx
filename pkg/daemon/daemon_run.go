@@ -210,7 +210,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// ===== PHASE 5: Background-service starts + HTTP/gRPC API =====
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
-	if d.dp != nil {
+	if rt := d.dataplane(); rt != nil {
 		// StartFIBSync is a no-op on every in-tree backend: eBPF
 		// resolves FIB queries via bpf_fib_lookup in-kernel and the
 		// userspace AF_XDP runtime wraps that no-op through the
@@ -221,11 +221,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// (kernel bpf_fib_lookup handles FIB resolution); the probe
 		// is retained for forward compatibility (a future backend
 		// may need a userspace route populator).
-		if starter, ok := d.dp.(fibSyncStarter); ok {
+		if starter, ok := rt.(fibSyncStarter); ok {
 			starter.StartFIBSync(ctx)
 		}
 
-		gc := d.newConntrackGC(10 * time.Second)
+		gc := d.newConntrackGC(rt, 10*time.Second)
 		d.gc = gc
 
 		// When the userspace dataplane is active, skip BPF session map
@@ -236,7 +236,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// The helper still mirrors sessions to BPF conntrack for display
 		// and periodically refreshes last_seen (~10s) so IterateSessions
 		// callers see accurate idle times.  See #333.
-		if _, ok := d.dp.(userspaceSessionDeltaDrainer); ok {
+		if _, ok := rt.(userspaceSessionDeltaDrainer); ok {
 			gc.SkipSweep = func() bool { return true }
 		}
 
@@ -268,7 +268,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			gc.Run(ctx)
 		}()
 
-		evSrc, evErr := d.dp.Telemetry().NewEventSource()
+		evSrc, evErr := rt.Telemetry().NewEventSource()
 		if evErr != nil {
 			slog.Warn("failed to create event source", "err", evErr)
 		}
@@ -301,6 +301,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 					if len(raw) < 56 {
 						return
 					}
+					// #2114: one dataplane snapshot per event (plan §5.3
+					// rule 7) — the closure runs on the event-reader
+					// goroutine long after this block published it.
+					rt := d.dataplane()
+					if rt == nil {
+						return
+					}
 					proto := raw[53]
 					af := raw[55]
 					if af == dataplane.AFInet6 {
@@ -310,7 +317,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
-						if val, err := d.dp.Sessions().GetV6(key); err == nil && val.IsReverse == 0 {
+						if val, err := rt.Sessions().GetV6(key); err == nil && val.IsReverse == 0 {
 							if ss.ShouldSyncZone(val.IngressZone) {
 								ss.QueueSessionV6(key, val)
 							}
@@ -322,7 +329,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
-						if val, err := d.dp.Sessions().GetV4(key); err == nil && val.IsReverse == 0 {
+						if val, err := rt.Sessions().GetV4(key); err == nil && val.IsReverse == 0 {
 							if ss.ShouldSyncZone(val.IngressZone) {
 								ss.QueueSessionV4(key, val)
 							}
@@ -352,7 +359,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 		if er == nil {
-			if _, ok := d.dp.(userspaceEventStreamProvider); ok {
+			if _, ok := rt.(userspaceEventStreamProvider); ok {
 				er = logging.NewEventReader(nil, eventBuf)
 				d.eventReader = er
 				if cfg := d.store.ActiveConfig(); cfg != nil {
@@ -363,7 +370,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 
-		if _, ok := d.dp.(userspaceEventStreamProvider); ok && d.cluster == nil {
+		if _, ok := rt.(userspaceEventStreamProvider); ok && d.cluster == nil {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -372,8 +379,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 
 		// #2079: start the NAT source pool-utilization-alarm monitor HERE —
-		// after d.dp and d.eventReader are both fully assigned above — so the
-		// monitor goroutine's sampler (reads d.dp) and emitter (reads
+		// after the dataplane cell and d.eventReader are both fully assigned above — so the
+		// monitor goroutine's sampler (reads the cell) and emitter (reads
 		// d.eventReader) never race with their initialization. Slow (10s) loop
 		// over the helper's last-applied NAT pool snapshot; raises/clears
 		// `show security alarms` entries with hysteresis and emits one
@@ -382,8 +389,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		//
 		// #2114: route through maybeStartNATPoolAlarm, which gates on
 		// !inBootstrap() in addition to a constructed dataplane. In bootstrap
-		// mode the dataplane object exists (d.dp != nil) but is not armed, and
-		// the bootstrap-exit path may write d.dp = nil on an arm failure;
+		// mode the dataplane object exists (published) but is not armed, and
+		// the bootstrap-exit path may clear the cell on an arm failure;
 		// launching the sampler here would race that write. The monitor is
 		// instead started in runBootstrapExitStartup once the dataplane is
 		// armed. On a normal (non-bootstrap) boot the gate passes and the
@@ -603,16 +610,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
-		// d.dp asserted against the local cliDataPlane probe
+		// #2114 (r4): the LIVE indirection — cli.New stores dp on the CLI for
+		// the console session's lifetime, so a startup snapshot outlived every
+		// setDataplane(nil) and the console kept clearing counters on a
+		// disowned backend. liveDataPlane (daemon_dp_live.go) re-reads the cell
+		// per call and satisfies the local cliDataPlane probe
 		// (runtime_probes.go) — structurally identical to pkg/cli's
-		// package-private cliRuntime (pkg/cli/runtime.go, #1517).
-		// Go duck-types the assignment to cli.New's dp parameter at
-		// this site; signature drift surfaces as a compile error.
+		// package-private cliRuntime (pkg/cli/runtime.go, #1517). Go duck-types
+		// the assignment to cli.New's dp parameter at this site; signature
+		// drift surfaces as a compile error.
 		var cliDP cliDataPlane
-		if d.dp != nil {
-			if probe, ok := d.dp.(cliDataPlane); ok {
-				cliDP = probe
-			}
+		if live, ok := d.liveDataplane(); ok {
+			cliDP = live
 		}
 		shell := cli.New(d.store, cliDP, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)

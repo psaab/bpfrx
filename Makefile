@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust test-race-dp audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
 
 all: generate build build-ctl
 
@@ -79,7 +79,7 @@ install: build build-ctl
 test: test-go test-rust
 
 # Go suite. Invocation preserved exactly from the pre-#4006 `test` target.
-test-go:
+test-go: test-race-dp
 	# go vet gate scoped to pkg/flowexport (#2224): catches the
 	# atomic.Uint64-copy regression class (ExportConfig embeds the live
 	# 1-in-N sampleCounter and must never be copied by value). NOT
@@ -88,6 +88,28 @@ test-go:
 	# code); widen to ./... once those are resolved.
 	$(GO) vet ./pkg/flowexport/...
 	$(GO) test ./...
+
+# #2114 scoped race gate: the dataplane-cell publication races
+# (bootstrap-exit clear vs sampler/watcher/confirm-timer readers) and the
+# A3 armed-gate registry races are only visible under -race — a plain
+# `go test ./...` has no race teeth, and a full-repo -race run stays out
+# of scope. The named patterns cover the daemon cell tests (incl. the
+# #2116 NAT pool-alarm regressions and the forwarding-status adapter) and
+# the pkg/dataplane armed-gate legs.
+#
+# #6743 r2-N3: the pkg/daemon pattern used to be just
+# 'DataplaneCell|NATPoolAlarm|ForwardingStatus|BootstrapExit', which matched
+# 19 of 1118 tests and EXCLUDED every test that runs a loop goroutine
+# against a concurrently emptied cell — the event-stream binders, the
+# capability probes, the escape binders. A -run filter is a NAME predicate
+# over a PROPERTY-defined set, so widening it once is not the whole fix:
+# pkg/daemon's TestRaceGateCoversTheConcurrencyBinders parses THIS recipe
+# and fails if any test in the declared concurrency-binder files stops
+# matching. Keep the `-run '<pattern>'` single-quoted spelling — that canary
+# reads it.
+test-race-dp:
+	$(GO) test -race ./pkg/daemon/ -run 'DataplaneCell|NATPoolAlarm|ForwardingStatus|BootstrapExit|RuntimeDataplaneNeverBareRootManager|EventStreamFallbackLoop|RunUserspaceEventStream|LiveDataPlane_|GRPCShowBuffers_|SystemAction_|GRPCServer_|RESTServer_|ManagementProbe|ConsoleCLIProbeWiring|FullResync|ReconcilePassUsesOneDataplaneSnapshot|ReconcileBlackholeWrappersStillReloadPerCall' -count=2
+	$(GO) test -race ./pkg/dataplane/ -run 'ArmedGate|PreArm' -count=2
 
 # Rust userspace-dp correctness suite (#4006). userspace-dp is a
 # binary-only crate (no [lib] target), so its unit tests live in the bin
