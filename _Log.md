@@ -97280,3 +97280,33 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/wireguard_multiport_warning_1434_test.go,
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added the missing fail-on-revert test for the #5212 session-id
+  adoption on the reverse-materialize path (#6313). `materialize_shared_session_hit`
+  (`userspace-dp/src/afxdp/session_glue/mod.rs`) reinstalls a shared-map hit
+  into the worker-local table with `session_id: replica.session_id`, so a
+  reverse-direction packet that lands on a peer-synced entry keeps the
+  originating node's RT_FLOW correlation id. Reverting that argument to
+  `session_id: 0` reddened NO test: all 48 `session_id` occurrences in
+  `session_glue/tests.rs` were `session_id: 0,` compile-fills (census, not an
+  empty grep).
+
+  The new `reverse_materialized_shared_hit_adopts_replica_session_id_6313`
+  publishes a peer-synced REVERSE companion (`is_reverse: true`) carrying a
+  worker-9 peer id into the shared session map, pins the local table to worker
+  4, drives `resolve_flow_session_decision` with the reverse 5-tuple under an
+  ACTIVE owner RG (so the hit materializes rather than staying transient), and
+  asserts the materialized entry carries the peer id verbatim. A paired
+  negative control (a legacy peer sending id 0) asserts the fallback is a
+  fresh, non-zero, worker-4-namespaced local id.
+
+  Mutation-verified, exit codes read from `$?`, never through a pipe: reverting
+  the production line to `session_id: 0,` -> `cargo check --all-targets` rc=0
+  (an ASSERTION red, not a build break) and the new test rc=101, panicking on
+  the property assertion with left=0x0004000000000001 (a fresh worker-4 alloc)
+  vs right=the worker-9 peer id. Restored -> rc=0.
+
+  Test-only: no production source changed, so no helper binary movement and no
+  cluster smoke owed.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/tests.rs, _Log.md
