@@ -1,3 +1,46 @@
+## 2026-08-21 — #5192 item 1: `WorkerUmemInner` unmapped the UMEM before deleting it
+
+- **Timestamp**: 2026-08-21 (fix/5192-umem-drop-order)
+- **Action**: Swapped the `umem` / `area` field declarations in
+  `WorkerUmemInner` so the libxdp UMEM object is destroyed before the mmap
+  region backing it, and pinned the ordering with a test.
+
+  `xsk_ffi::Umem::new` is `unsafe` on one stated precondition — the caller's
+  `area` must "outlive this Umem". `WorkerUmemInner` owns both halves of that
+  pair and declared `area` first, so Rust's declaration-order field destruction
+  ran `munmap` and only then `xsk_umem__delete`: the pages were released while
+  the UMEM object was still registered against them. Latent rather than a live
+  UAF, because `bridge_xsk_umem_delete` -> `xsk_umem__delete` does not read the
+  user area and the kernel pins UMEM pages while the fd is open — but that
+  mitigation is an unpinned external library's implementation detail, and this
+  box now links libxdp 1.6.3 where the original refutation was written against
+  1.6.0. The fix costs two lines and removes the dependence entirely.
+
+  Rust has NO compile-time drop-order assertion — there is no `const` fact to
+  hang a `const _: () = assert!(..)` on — so inventing one would have been
+  fragile. The order is pinned by OBSERVATION instead: a `cfg(test)`-only
+  `crate::drop_order_probe` that both `Drop` impls append to, and
+  `umem/tests/drop_order.rs` asserting the sequence on the REAL
+  `WorkerUmemInner` (via `WorkerUmem::new_for_test`) and on the
+  `WorkerUmemPool` wrapper production actually builds. The probe is
+  allocation-free (fixed thread-local array, `try_with`) because it runs inside
+  `Drop` and this crate installs a counting global allocator under `cfg(test)`
+  that other tests assert against; a `Vec` push would charge an allocation to
+  whatever hot-path test happened to drop a UMEM inside its window.
+
+  Validation: the test was written BEFORE the swap and observed the defect
+  directly — both cases red at `a77d5568c` with `left: [MmapArea, Umem]`,
+  i.e. munmap first. Green after the swap with `[Umem, MmapArea]`. Full
+  `make test-rust` green. No shim, no Go, no compiled-artifact movement, so no
+  cluster smoke is owed. #5192's second item (the XDP shim's aligned metadata
+  store) is NOT in this change — see below.
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/mmap.rs,
+  userspace-dp/src/afxdp/umem/tests/mod.rs,
+  userspace-dp/src/afxdp/umem/tests/drop_order.rs,
+  userspace-dp/src/afxdp/umem/README.md, userspace-dp/src/drop_order_probe.rs,
+  userspace-dp/src/main.rs, userspace-dp/src/xsk_ffi.rs, _Log.md
+
 ## 2026-08-21 — #6697: the CoS `code-points` BLOCK spelling lost the whole classifier
 
 - **Timestamp**: 2026-08-21 (fix/6697-cos-code-points-spellings)
