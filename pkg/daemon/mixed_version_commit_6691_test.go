@@ -90,12 +90,16 @@ func TestMixedVersionHelperRefusalFailsTheCommit_6691(t *testing.T) {
 
 			dp := &runtimeOnlyApplyTestDP{applyErr: injected}
 			d := &Daemon{
-				dp:       dp,
 				networkd: networkd.NewInDir(t.TempDir()),
 				store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 				vrrpMgr:  vrrp.NewManager(),
 				opts:     Options{NoDataplane: true},
 			}
+			// #2114 (master, #6743): the runtime dataplane is published
+			// through an atomic cell, not a struct field. Setting `dp:` in
+			// the literal no longer compiles, and — more to the point — would
+			// not be visible to the readers applyConfigLocked goes through.
+			d.setDataplane(dp)
 
 			cfg := &config.Config{}
 			cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
