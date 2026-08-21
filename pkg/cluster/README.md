@@ -142,6 +142,51 @@ The primary consumer of the `Manager.Events()` channel is
 publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
 state-handler method, not the event-channel consumer.
 
+## Takeover readiness gate and hold (#103)
+
+Election gates promotion on `RedundancyGroupState.IsReadyForTakeover(holdTime)`
+(`manager.go`), which is TWO conditions: `Ready` is true AND it has been true
+for at least `takeoverHoldTime`. `Ready` is pushed in from the daemon reconcile
+pass — `Daemon.takeoverReadinessForRG` (`pkg/daemon/daemon_ha_userspace_readiness.go`)
+ANDs four inputs and calls `SetRGReady`:
+
+| Input | Source | Not-ready when |
+|-------|--------|----------------|
+| interfaces | `Monitor.RGInterfaceReady` (`monitor.go`) | a LOCAL required interface is missing or down. An interface whose FPC slot maps to the peer node is skipped — it cannot exist locally. |
+| VRRP | `vrrp.Manager.RGVRRPReady` | a desired RETH instance is in `unbuiltDesired` (#5641), or the RG has RETH interfaces and no instance at all. `checkNoRethTakeoverReadiness` replaces this in no-RETH-VRRP mode. |
+| fabric | `d.fabricPopulated` | the fabric forwarding path is unpopulated. Forced ready when the peer is not alive. |
+| userspace dataplane | `TakeoverReady()` on the published runtime | fail-closed: config says userspace but no dataplane is published. |
+
+`SetRGReady` (`readiness.go`) stamps `ReadySince` on the not-ready -> ready edge
+and arms a `holdTimer` to re-run the election when the hold expires; the
+ready -> not-ready edge clears `ReadySince` and stops the timer, so a readiness
+flap restarts the hold rather than accumulating credit.
+
+**`Ready` and takeover-ELIGIBLE are different properties**, and the status
+render must not conflate them: inside the hold window an RG is `Ready` while
+every election gate still declines to promote it. `FormatStatus` /
+`FormatInformation` therefore key their "Takeover ready:" line on
+`TakeoverHoldRemaining` and report `no (takeover hold: X of Y remaining)`, and
+`FormatInformation` prints the configured `Takeover hold time:` line. Note
+`pkg/upgrade`'s pre-demotion precheck parses the first token after
+`Takeover ready:` and treats `no` as a blocker, which is the intended reading —
+a holding RG genuinely cannot take over yet.
+
+`DefaultTakeoverHoldTime` is **0**: with `set chassis cluster
+takeover-hold-time` unset the gate is readiness-only and both renders are
+byte-identical to their pre-#103 form. It shipped at 3s in `91a57cf` and was
+changed to 0 in `cd4dbe9`, a bodyless commit with no recorded rationale.
+
+Two things the gate deliberately does NOT do, both still open:
+
+- **`electSingleNode` bypasses the gate when the peer is not alive**
+  (`election.go`) — a lone node promotes on `Weight > 0` regardless of
+  readiness. This is fail-open on purpose: a survivor that refuses to take over
+  is a total outage. It does mean #103's "peer-loss event does not force
+  takeover when readiness is false" is not satisfied, and a cold boot with no
+  peer ever seen promotes an RG whose interfaces are still missing.
+- **Session-sync readiness is not an input** to the gate — that is #110.
+
 ## Peer-liveness cold-boot grace (#4386)
 
 `heartbeatReceiver.checkTimeout` (`heartbeat.go`) makes both peer-liveness
@@ -240,6 +285,49 @@ slot. Two changes close it:
   mutates cluster state before admission is one edit away from being live
   again. There is now no path by which an unadmitted connection executes
   anything.
+
+### Degenerate handshake nonces are refused (partial #5078)
+
+Separate from the dual-accept bypass above, `performSyncHandshake` calls
+`syncCheckPeerNonce` before it computes a proof, and drops the connection when
+the peer's challenge nonce is either **equal to our own** or **all zero**.
+
+The equal case is the live one. `syncAuthProof` is `HMAC(key, tag ‖ challenge)`
+— no role, no node identity, no transcript — and the accept test is
+`hmac.Equal(peerProof, syncAuthProof(key, localNonce))`. So a PSK-less attacker
+that ECHOES every byte back authenticates: our HELLO returns as the peer HELLO
+with `peerNonce == localNonce`, we compute and send `HMAC(key, tag ‖
+localNonce)` first, and the attacker replays that value as the peer proof.
+Measured on `a77d5568c` a pure byte-mirror negotiated
+`syncAuthAuthenticated` with a derived frame key. Because
+`syncDeriveFrameKey` sorts the two nonces canonically, the resulting key is
+UNDIRECTED, so the attacker could also reflect our own sealed frames back into
+our `receiveLoop` and have them verify.
+
+The all-zero case is hygiene: it is not an entropy test (entropy is
+unmeasurable from one sample), only a refusal of the single value a peer with
+an unseeded CSPRNG emits.
+
+**This is NECESSARY, NOT SUFFICIENT, and #5078 stays open for the rest.** The
+two-connection variant uses a SECOND keyed connection as a proof oracle — a
+proof computed over connection α's local nonce is relayed onto connection β —
+and there the nonces on each connection differ, so nothing here fires. Since
+both nodes share ONE PSK, that oracle can be the PEER node, which no
+per-node nonce bookkeeping could see either. Closing it requires the proof to
+be bound to role + identity + transcript, i.e. a new proof construction and a
+keyed↔keyed wire flag-day. Do not read the guard, or its tests, as closing the
+reflection issue.
+
+Both comparisons are variable-time on purpose: challenge nonces travel in
+cleartext in the HELLO, so there is no secret for a timing side channel to
+leak, and `hmac.Equal` here would imply one exists.
+
+Why this needed **no migration window**, unlike everything else in #5078: it
+adds no field, bumps no version, and changes not one emitted byte. It only
+NARROWS what is accepted, and the values it refuses are ones two honest
+`crypto/rand` peers hit with probability ~2^-256. An old-build node and a
+new-build node interoperate exactly as before, in both directions, so there is
+no state in which a keyed pair cannot converge.
 
 **No relaxation knob, deliberately** — but read the rollout constraint below
 before concluding that is easy.
@@ -1481,7 +1569,11 @@ connection is authenticated, then seals every subsequent frame.
   advertising a fresh 32-byte challenge nonce; when BOTH peers are keyed
   each proves possession with `syncMsgAuthProof` (type 28) =
   `HMAC-SHA256(key, tag ‖ peer-nonce)` (mutual challenge-response). Fresh
-  per-connection nonces make the proof replay-safe at setup. HELLO/PROOF
+  per-connection nonces make the proof replay-safe at setup. A peer nonce that
+  is EQUAL TO OUR OWN or ALL ZERO is refused before any proof is emitted
+  (`syncCheckPeerNonce`) — that kills the byte-echo reflection attack but NOT
+  the two-connection proof-oracle variant; see "Degenerate handshake nonces are
+  refused (partial #5078)" above. HELLO/PROOF
   are written CONCURRENTLY with reading the peer's frame so the handshake
   does not deadlock on a fully-synchronous transport (`net.Pipe` in tests /
   a strict write-then-read on two symmetric peers). Types 27/28 sit above

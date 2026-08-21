@@ -469,6 +469,12 @@ impl Umem {
 
 impl Drop for Umem {
     fn drop(&mut self) {
+        // #5192: record BEFORE the null check — the ordering fact under
+        // test is when this destructor runs relative to the backing
+        // `MmapArea`'s, and the hermetic `new_for_test` Umem carries a
+        // null `inner`.
+        #[cfg(test)]
+        crate::drop_order_probe::record(crate::drop_order_probe::DropTag::Umem);
         if !self.inner.is_null() {
             unsafe { bridge_xsk_umem_delete(self.inner) };
         }
