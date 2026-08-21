@@ -97543,3 +97543,38 @@ prose edit above them added. No diff falls in the new test body.
   Both fire on the wrap-accept assertion itself (Repeat vs Accept). Full Rust
   suite `cargo test -p userspace-dp -- --test-threads=1` exit 0.
 - **File(s)**: userspace-dp/src/afxdp/wg/session.rs, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed #6371 — a FAILED `rg_active` clear no longer reports the HA
+  fence as actuated. On a peer-requested transfer-out the demotion branch of
+  `watchClusterEvents` called `d.signalFailoverActuated(ev.GroupID)`
+  unconditionally: the `SetRGActive` error path only logged a WARN and fell
+  through to the same close, so `waitFailoverActuated` released the applied-ack
+  and the peer promoted while this node may still have been forwarding for the
+  RG — the exact two-owner window #5640 was written to close.
+
+  The fence barrier now carries a VERDICT rather than bare completion: a new
+  `failoverActuation{done, resolved, err}` replaces the plain `chan struct{}`;
+  the demotion branch records the `SetRGActive` error and resolves via
+  `signalFailoverActuationFailed` instead of `signalFailoverActuated`;
+  `waitFailoverActuated` returns that verdict, so `handleRemoteFailover`
+  downgrades the ack to `failoverAckFailed` and the peer HOLDS. Resolving with
+  a failure (rather than staying silent) also avoids parking the waiter for its
+  full timeout on a fence already known not to have landed. The resolved
+  barrier is left in the map for the waiter to consume — deleting it at
+  resolution time, as the old success-only path did, would make a failure that
+  lands before the waiter arrives read as "never armed", i.e. success.
+
+  The per-event body of `watchClusterEvents` was split out as
+  `handleClusterEvent(ctx, ev, vrrpTimer) *time.Timer` (pure movement; the
+  debounce timer is threaded through the return value) because
+  `cluster.Manager` only exposes a receive-only `Events()`, so the demotion
+  branch was unreachable from a test. Four daemon tests now drive that real
+  path plus one cluster test pinning the verdict's transport.
+
+  Validation: `go test -count=1 ./pkg/daemon/ ./pkg/cluster/` exit 0; `go vet`
+  and `go build ./...` exit 0. HA/failover code — `make test-failover` is owed
+  before merge (not run here: the loss cluster is shared and lock-protected).
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ha_actuation_6371_test.go,
+  pkg/cluster/sync_failover_fence_verdict_6371_test.go,
+  docs/session-sync-architecture.md, _Log.md
