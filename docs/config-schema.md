@@ -1109,6 +1109,57 @@ bundled, because each needs its own value-domain gate widened in the same change
 | `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
 | nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
 
+### The list above is now enforced by a gate, not maintained by hand
+
+`TestSchemaSpellingDifferentialGate` (`pkg/config/schema_spelling_differential_gate_test.go`)
+walks `setSchema`, authors a two-element list at every value-bearing leaf in all
+five spellings the grammar admits — hierarchical bracket / block / repeated, and
+flat-set bracket / repeated — and fails the build when a leaf compiles
+differently depending on which one the operator used. Its primitive is
+deliberately behavioural rather than syntactic:
+
+```
+dropped(spelling) := compile(spelling, [v1]) == compile(spelling, [v1 v2])
+```
+
+**Why a gate and not a lint.** There is no single correct reader to lint FOR:
+this package now has at least six accumulating readers, one of which
+(`ntpServerValues`) must additionally skip per-value option KEYWORDS. A rule
+matching "reads `Keys[1]`" would flag compliant code, and would miss the #7126
+sites entirely — both of those read `Keys[1:]` AND `Children` exactly as this
+document instructs, and still drop, because reading `Children` is not the same as
+reading every KEY of each child. A differential asks whether the compiler
+disagrees with ITSELF, which is the actual defect.
+
+**When the gate fails, there are exactly two correct responses**, and picking the
+wrong one is how this rots:
+
+1. The leaf IS a value list -> fix the compiler's read. Do not add a row.
+2. The leaf is NOT a value list (a named container, a bare flag, an action with
+   one optional argument) -> add it to `notAValueList` **with the reason, having
+   verified where the extra tokens actually land**. Several such leaves park
+   trailing tokens in the `UnknownLeaves` / `UnknownActions` diagnostic buckets,
+   which looks exactly like a value list from the outside.
+
+A third response — adding a row to `knownSpellingInconsistencies` — is only for a
+defect that is real, tracked, and deferred, and each row is keyed by the ISSUE
+NUMBER that owns it. A row whose site has stopped disagreeing is a HARD FAILURE,
+so the row is removed by whoever fixes the defect and closes the issue, rather
+than being deleted quietly to get green.
+
+**A green run is not a swept schema, and the gate says so in its own output.**
+It compares 624 of the 1020 sites it enumerates; the other 396 go inert under
+synthetic parent paths the compiler rejects and carry no verdict in either
+direction. It also sees ONE DIRECTION — a compiler DROPPING a value. The opposite
+defect, a reader PROMOTING a per-value modifier keyword into the value list (the
+hazard `ntpServerValues` exists to avoid), is not detectable by any differential,
+because the lexer strips brackets before anything can observe them:
+`route 10.9.0.0/16 discard;` and `route [ 10.9.0.0/16 discard ];` compile
+byte-identically. Separating those two needs knowledge of the leaf's Junos
+grammar, which exists today only where `setSchema` models a leaf's modifiers as
+children — and `system ntp server` does not, which is why that leaf needed a
+hand-written option table instead of a schema lookup.
+
 `multiLeafAuthoredValues` exists to make one invariant TOTAL:
 `multiLeafAuthoredValues(n)[0] == nodeVal(n)` for every node shape — including a
 node carrying no value slot at all (`export [ ];`, whose brackets the lexer
