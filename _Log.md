@@ -97280,3 +97280,28 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/wireguard_multiport_warning_1434_test.go,
   pkg/dataplane/userspace/wireguard_steering_advisory_1434_test.go,
   docs/wireguard-interop.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added `wrap_accept_after_forward_clear` to the #5168 WireGuard
+  replay tests (#6118). One ring slot+bit is shared by every counter congruent
+  modulo the ring capacity (RING_BLOCKS * BLOCK_BITS = 8192), so a fresh
+  `X + 8192` is decided off the very bit `X` set; it decides correctly only
+  because the forward-clear sweep zeroed `X`'s block as the high-water advanced
+  over it. The pre-existing 14 tests covered the security direction (the bit
+  SURVIVES a forward clear) but not this availability twin, where a false
+  Repeat silently drops authentic traffic after a large counter advance.
+
+  The test seeds X=100, advances to X+8192+64 — far enough that the sweep's
+  `diff` saturates at RING_BLOCKS and wraps back over X's block, near enough
+  that X+8192 is still inside the 8128 window and so takes the bitmap arm — and
+  requires X+8192 to Accept, then its own replay to Repeat. Slot aliasing and
+  the in-window precondition are asserted, not assumed.
+
+  Test-only: no production file touched, helper binary unchanged, no smoke owed.
+  Mutation-verified RED two ways, `cargo check` exit 0 for both so each red is
+  an assertion failure and not a build break, and each leaving the other 13
+  replay tests GREEN: (1) forward-clear sweep body neutered; (2) sweep bound
+  narrowed one block, `current + diff` -> `(current + diff).saturating_sub(1)`.
+  Both fire on the wrap-accept assertion itself (Repeat vs Accept). Full Rust
+  suite `cargo test -p userspace-dp -- --test-threads=1` exit 0.
+- **File(s)**: userspace-dp/src/afxdp/wg/session.rs, _Log.md
