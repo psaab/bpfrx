@@ -2053,16 +2053,20 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 		for _, child := range pInst.node.Children {
 			switch child.Name() {
 			case "events":
-				// Hierarchical: events [ evt1 evt2 ]; → Keys = ["events", "evt1", "evt2"]
-				// Hierarchical: events evt1;          → Keys = ["events", "evt1"]
-				// Brackets are stripped by the lexer, so just take Keys[1:]
-				for i := 1; i < len(child.Keys); i++ {
-					ep.Events = append(ep.Events, child.Keys[i])
-				}
-				// Flat set format: children are individual event name nodes
-				for _, evtChild := range child.Children {
-					ep.Events = append(ep.Events, evtChild.Name())
-				}
+				// `events` is the trigger set of the policy, so a lost value is
+				// the fail-SILENT direction: the automation the operator
+				// configured never runs for part of what they asked for.
+				//
+				// The old read covered both sides of the AST — Keys[1:] for the
+				// hierarchical bracket and packed spellings, one value per child
+				// for the block and flat-set-repeated ones — exactly as
+				// CLAUDE.md prescribes, and STILL dropped (#7126). `events` is
+				// not marked `multi: true` in setSchema, so SetPath files
+				// `set … events [ ev_one ev_two ]` as ONE child whose Keys hold
+				// BOTH names; evtChild.Name() is Keys[0] and returned only
+				// ev_one. Reading Children is not reading every KEY of each
+				// child. plainListValues reads both sides AND every key.
+				ep.Events = append(ep.Events, plainListValues(child)...)
 			case "within":
 				w := &EventWithin{}
 				if v := nodeVal(child); v != "" {

@@ -1378,28 +1378,14 @@ func compileInterfaceDynamicDNS(afNode *Node) *InterfaceDynamicDNSConfig {
 // `member-interfaces` has no per-member option keywords in Junos, so unlike
 // the NTP server list there is no trailing-token ambiguity to resolve — every
 // non-empty token below the node is a member name.
+//
+// #7126: the mechanism is not specific to this leaf — `routing-options
+// rib-groups <g> import-rib` and `event-options policy <p> events` are the same
+// plain value list read the same way, and had the same flat-set-bracket drop.
+// The implementation therefore lives in ast.go as plainListValues and is shared
+// by all three; a divergence between them would always be a bug, so there is
+// one body rather than three copies. This wrapper keeps the leaf-specific
+// argument above attached to the leaf it argues about.
 func fabricMemberValues(n *Node) []string {
-	if n == nil {
-		return nil
-	}
-	var members []string
-	add := func(tokens []string) {
-		for _, tok := range tokens {
-			if tok != "" {
-				members = append(members, tok)
-			}
-		}
-	}
-	if len(n.Keys) > 1 {
-		add(n.Keys[1:])
-	}
-	var walk func(*Node)
-	walk = func(parent *Node) {
-		for _, c := range parent.Children {
-			add(c.Keys)
-			walk(c)
-		}
-	}
-	walk(n)
-	return members
+	return plainListValues(n)
 }

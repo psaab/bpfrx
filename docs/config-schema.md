@@ -993,6 +993,59 @@ also ARMS the existing fab0/fab1 shared-member overlap check in
 bracket-authored fabrics; that check emits a warning, not a rejection, so no
 config that committed before is rejected now.
 
+**That leaf shape is a PREDICATE, not three special cases (#7126).** The
+discriminator is mechanical and worth stating as a rule, because the sites it
+catches all LOOK compliant:
+
+> A leaf declared `children: nil` and **NOT** `multi: true` in `setSchema`, read
+> by a compiler that takes `Keys[0]` / `Name()` of each child, drops every value
+> past the first when the operator authors a bracket list through the flat-set
+> path (`set`, `load set`, the CLI).
+
+`SetPath` files a bracket list differently depending on the flag:
+
+| schema | `set … <leaf> [ v1 v2 ]` becomes |
+|---|---|
+| `multi: true, children: nil` | `Keys=["<leaf>","v1","v2"]`, no children — the tail absorber runs |
+| **`multi: false, children: nil`** | `Keys=["<leaf>"]` with **ONE child** `Keys=["v1","v2"]` |
+
+In the second row every value sits on one child's Keys, so `child.Name()`
+returns `v1` and discards the rest — which is why a reader can obey the
+"`Keys[1:]` AND `Children`" rule above to the letter and still drop. **Reading
+`Children` is not the same as reading every KEY of each child.** The
+hierarchical parser is unaffected (it puts the list on the node's own tail), so
+these sites survive every brace-authored test and bite only the `set` path.
+
+`fabricMemberValues` was the first instance; #7126 found two more —
+`routing-options rib-groups <g> import-rib` and `event-options policy <p>
+events` — so the body now lives once, in `ast.go` as **`plainListValues`**, and
+`fabricMemberValues` is a wrapper that keeps its leaf-specific argument attached
+to its leaf. A divergence between the three would always be a bug, so there is
+one implementation rather than three copies. Use it only where every non-empty
+token below the node is a value: NOT for a leaf with per-value option keywords
+(`ntp server <ip> prefer`, `source-prefix-list <name> except`, `route <prefix>
+discard` — promoting a modifier into the value list is the #6690 hazard), and
+NOT where an EMPTY authored value must survive (`multiLeafAuthoredValues`).
+
+Both new sites also needed `FindChildren`, not `FindChild`: repeated
+hierarchical statements land as SIBLING nodes, and reading only the first drops
+that spelling too even where the flat-set repeated spelling — the same
+configuration, filed as CHILDREN of one node — accumulated correctly. And the
+`import-rib` drop was a GATE ESCAPE as well as a value drop: the #2226
+cross-reference check iterates `ImportRibs`, so an undefined rib named in slot 1
+committed CLEAN while the identical name in slot 0 was rejected. The newly
+visible entries land on #2226's existing tolerant-path downgrade
+(`lenientRibGroupRefs`), so no already-persisted config is turned into a boot
+failure.
+
+The two `import-rib` read sites were byte-identical duplicates in two arms of
+`compileRoutingOptions`, which is the hazard #7126 names: a fix landing in one
+arm leaves the other spelling broken and nothing says so. They now share
+`compileRibGroup`. (Measured: the named-instance arm is INERT at HEAD — it
+selects with `FindChildren("")`, which matches only a child whose first key is
+the empty string, and no parse produces one. The duplication was latent, which
+is precisely why no test could have caught a divergence.)
+
 **Widening a multi-value READ requires widening its VALIDATOR in the same
 change (#6659).** Adopting the accumulating reader at a site changes what a
 malformed value DOES. Before, a bad value in slot 2 was discarded at compile and
@@ -1125,10 +1178,11 @@ dropped(spelling) := compile(spelling, [v1]) == compile(spelling, [v1 v2])
 **Why a gate and not a lint.** There is no single correct reader to lint FOR:
 this package now has at least six accumulating readers, one of which
 (`ntpServerValues`) must additionally skip per-value option KEYWORDS. A rule
-matching "reads `Keys[1]`" would flag compliant code, and would miss the #7126
-sites entirely — both of those read `Keys[1:]` AND `Children` exactly as this
-document instructs, and still drop, because reading `Children` is not the same as
-reading every KEY of each child. A differential asks whether the compiler
+matching "reads `Keys[1]`" would flag compliant code, and would have missed the
+#7126 sites entirely — both of those read `Keys[1:]` AND `Children` exactly as
+this document instructs, and still dropped, because reading `Children` is not the
+same as reading every KEY of each child (both are fixed and their allowlist rows
+removed; the predicate is stated above). A differential asks whether the compiler
 disagrees with ITSELF, which is the actual defect.
 
 **When the gate fails, there are exactly two correct responses**, and picking the

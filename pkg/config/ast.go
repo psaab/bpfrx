@@ -362,6 +362,76 @@ func multiLeafAuthoredValues(n *Node) []string {
 	return vals
 }
 
+// plainListValues returns every value carried by a PLAIN VALUE-LIST leaf — one
+// whose members are bare tokens with no per-value modifier keyword — across all
+// five spellings the Junos grammar admits.
+//
+// The values reach the compiler on the node's own Keys, on its children's Keys,
+// or both, depending on how the config was authored (#6694, #7126 — the #2419
+// multi-value-leaf class):
+//
+//   - hierarchical bracket    `leaf [ a b ];`   → Keys=["leaf","a","b"], no children
+//   - hierarchical block      `leaf { a; b; }`  → Keys=["leaf"], one leaf child per value
+//   - hierarchical single     `leaf a;`         → Keys=["leaf","a"], no children
+//   - flat-set repeated       `set … leaf a` ×2 → Keys=["leaf"], one leaf child per value
+//   - flat-set bracket        `set … leaf [ a b ]`
+//     → Keys=["leaf"], ONE child whose Keys hold EVERY value
+//
+// THE LAST SHAPE IS WHY firewallMatchValues IS NOT ENOUGH, and it is the whole
+// of #7126: firewallMatchValues reads Keys[1:] AND Children — exactly what
+// CLAUDE.md and docs/config-schema.md prescribe — yet still keeps only the
+// first value here, because it takes Keys[0] of each child. Reading Children is
+// not the same as reading every KEY of each child. The shape is produced by
+// SetPath for any leaf setSchema does NOT mark `multi: true`: a multi leaf
+// absorbs the bracket tail onto the node's own Keys (which is why
+// multiLeafAuthoredValues suffices there), a non-multi leaf files it under one
+// child. The hierarchical parser never produces it, which is why these sites
+// survive every brace-authored test and bite only the `set` / `load set` / CLI
+// path.
+//
+// WHEN THIS IS THE WRONG READER. It takes EVERY non-empty token below the node,
+// so it must only be used where every such token is a value:
+//
+//   - NOT for a leaf with per-value option keywords — `ntp server <ip> prefer`,
+//     `source-prefix-list <name> except`, `route <prefix> discard`. Promoting a
+//     modifier into the value list is the hazard #6690 had to avoid; those
+//     leaves keep their own readers.
+//   - NOT for a leaf that must preserve an EMPTY authored value, where a scalar
+//     selects one value and a list only validates it (multiLeafAuthoredValues,
+//     see its comment) — empty tokens are dropped here.
+//
+// The descent reaches grandchildren, which no authorable spelling produces (all
+// five above are depth 1, verified against the parsed ASTs). It is inherited
+// unchanged from #6694's fabricMemberValues rather than narrowed here, so
+// single-sourcing the three call sites changes nothing for the fabric leaf: a
+// hand-written malformed nesting such as `leaf { a { b; } }` contributes `b`
+// today and still does.
+func plainListValues(n *Node) []string {
+	if n == nil {
+		return nil
+	}
+	var vals []string
+	add := func(tokens []string) {
+		for _, tok := range tokens {
+			if tok != "" {
+				vals = append(vals, tok)
+			}
+		}
+	}
+	if len(n.Keys) > 1 {
+		add(n.Keys[1:])
+	}
+	var walk func(*Node)
+	walk = func(parent *Node) {
+		for _, c := range parent.Children {
+			add(c.Keys)
+			walk(c)
+		}
+	}
+	walk(n)
+	return vals
+}
+
 // nonEmptyValues returns the entries of vals that are not empty. Cardinality
 // gates over a multiLeafAuthoredValues list use it so an empty selection slot is
 // not miscounted as an additional authored policy/prefix.
