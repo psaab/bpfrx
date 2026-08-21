@@ -6387,6 +6387,10 @@ reserved for whole-dataplane selection where a rewrite shim
     new validator: bare IPv6 literal, IPv4 rejected). The RDNSS option
     (RFC 8106) is IPv6-only; the sender skipped unparseable strings but
     did NOT family-gate, so a valid IPv4 literal reached the wire.
+    Because the leaf is `multi: true` with `children == nil`,
+    `validateMultiValueLeaf` runs this validator over EVERY authored
+    slot — `Keys[1:]` and every block-child — which is what made #6695
+    safe to widen without an unwidened validator behind it.
   - `link-mtu` — floor raised to `ValidateIntegerMin(1280)` (RFC 8200 §5
     IPv6 minimum link MTU); a smaller value was advertised verbatim and
     blackholes hosts that honor it.
@@ -6395,6 +6399,28 @@ reserved for whole-dataplane selection where a rewrite shim
   configs). New validators `ValidateIPv6Address` / `ValidatePREF64CIDR`
   live in `schema_validators.go`. Regression coverage:
   `pkg/config/schema_validate_2497_test.go`.
+- **#6695 (router-advertisement `dns-server-address` multi-value read):**
+  the leaf is `multi: true`, but `compileRouterAdvertisement` read it with
+  `nodeVal` — `Keys[1]` alone. Measured across all five spellings before
+  fixing: A hier-bracket `drop`, B hier-block **inert** (no `Keys[1]` exists
+  in that shape, so the block spelling compiled NOTHING), C hier-repeat
+  `keep`, D set-bracket `drop`, E set-repeat `keep`. Hosts on the link
+  therefore learned ONE RDNSS server while `show configuration` rendered
+  both, and the missing redundancy stayed invisible until the primary
+  resolver failed. The reader is now `firewallMatchValues` (every value it
+  returns is installed into one RFC 8106 `RecursiveDNSServer` option, so an
+  empty token legitimately means absence). The
+  `protocols router-advertisement interface <*> dns-server-address` row was
+  removed from `knownSpellingInconsistencies` in the same change; after the
+  fix all FIVE spellings are compared and all report `keep`, so gate coverage
+  of this site went UP — the previously inert block spelling now carries a
+  verdict. Fail-on-revert:
+  `pkg/config/compiler_ra_dns_server_6695_test.go` (compiled slice contents
+  per spelling, a three-address case, and the every-slot validator guard) and
+  `pkg/ra/sender_marshal_rdnss_6695_test.go`, which drives the real Junos text
+  through `CompileConfig` into `buildRA` and re-parses the marshalled option —
+  a dropped address is invisible in the option COUNT (the sender emits one
+  option holding every server) and shows only in its `Servers` list.
 - **#4307 (router-advertisement reachable-time / retransmit-timer,
   fable-review-167 I-2):** the RFC 4861 §4.2 Reachable Time and Retrans
   Timer RA header fields had no schema leaf, no `RAInterfaceConfig`

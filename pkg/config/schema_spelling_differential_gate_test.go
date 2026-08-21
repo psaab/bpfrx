@@ -145,9 +145,6 @@ var knownSpellingInconsistencies = map[string]string{
 	"class-of-service classifiers inet-precedence <*> forwarding-class <*> loss-priority <*> code-points": "#6697",
 	"class-of-service rewrite-rules dscp <*> forwarding-class <*> loss-priority <*> code-points":          "#6697",
 	"class-of-service rewrite-rules ieee-802.1 <*> forwarding-class <*> loss-priority <*> code-points":    "#6697",
-
-	// #6695 — RA dns-server-address drops every RDNSS server past the first.
-	"protocols router-advertisement interface <*> dns-server-address": "#6695",
 }
 
 // ---------------------------------------------------------------------------

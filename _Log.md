@@ -1,3 +1,47 @@
+## 2026-08-21 — #6695: RA dns-server-address dropped every RDNSS server past the first
+
+- **Timestamp**: 2026-08-21 (fix/6695-ra-dns-server-multivalue)
+- **Action**: `compileRouterAdvertisement` read the `multi: true`
+  `dns-server-address` leaf with `nodeVal` — `Keys[1]` alone. Reproduced across
+  all five spellings before changing anything: A hier-bracket `drop`,
+  B hier-block **inert**, C hier-repeat `keep`, D set-bracket `drop`,
+  E set-repeat `keep`, identical for all eight of the gate's value pairs. The
+  block spelling measured inert because that shape has no `Keys[1]` at all, so
+  `dns-server-address { a; b; }` compiled NOTHING — a strictly worse failure
+  than the truncation the issue described.
+
+  Hosts on the link learn one RDNSS server while `show configuration` renders
+  both, so the missing redundancy is invisible until the primary resolver
+  fails. xpf sends RAs from its own embedded sender (`pkg/ra`), so nothing
+  downstream re-reads the config and behaves correctly.
+
+  Reader is now `firewallMatchValues`: every value it returns is installed into
+  ONE RFC 8106 `RecursiveDNSServer` option, so an empty token legitimately
+  means absence. Widening is safe on the validation axis because the leaf
+  declares a schema `validator` (`ValidateIPv6Address`, #2497) and
+  `validateMultiValueLeaf` runs it over `Keys[1:]` AND every block-child —
+  pinned by a rejection in a NON-ZERO slot plus an over-reject control.
+
+  The `protocols router-advertisement interface <*> dns-server-address` row is
+  removed from `knownSpellingInconsistencies` in the same PR. Measured after
+  the fix: all FIVE spellings COMPARED and all `keep` — the previously inert
+  block spelling now carries a verdict, so gate coverage of this site went up.
+
+  Validation: `go test -count=1 ./pkg/config/ ./pkg/ra/ ./pkg/daemon/` exit 0;
+  `go build ./...` and `go vet ./pkg/config/ ./pkg/ra/` exit 0. Mutation proof:
+  reverting the one read leaves build+vet at exit 0 and reds
+  `TestRADNSServerMultiValue_6695`, `TestRADNSServerThreeAddresses_6695` and
+  `TestBuildRA_6695_EveryRDNSSServerOnWire` (three of its four subtests — the
+  repeated spelling is the control that always worked) as ASSERTIONS, plus the
+  gate itself; `TestRADNSServerValidatorCoversEverySlot_6695` stays green
+  because it guards the validator, not the read. Go-only in `pkg/config`
+  (plus a `pkg/ra` test); nothing reaches the Rust helper binary, so no cluster
+  smoke is owed.
+- **File(s)**: pkg/config/compiler_protocols.go,
+  pkg/config/compiler_ra_dns_server_6695_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/ra/sender_marshal_rdnss_6695_test.go,
+  docs/config-schema.md, docs/embedded-radvd.md, _Log.md
 ## 2026-08-21 — #6692: four system-stanza multi-value leaves dropped everything past slot 0
 
 - **Timestamp**: 2026-08-21 (fix/6692-system-multivalue-leaves)
