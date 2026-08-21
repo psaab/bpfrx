@@ -96247,3 +96247,31 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: _Log.md, pkg/dataplane/types.go,
   pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/README.md,
   userspace-dp/src/session/README.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 — fixed a gofmt regression this branch DID cause, and
+  corrected an earlier round's claim about it.
+
+  Round 5 recorded `pkg/dataplane/bpf_session_value_test.go` and
+  `pkg/dataplane/constants.go` as "gofmt-dirty at the PR head already and
+  confirmed unmodified in this diff", and left both. Re-derived against
+  `git show origin/master:` rather than inherited:
+
+  - `constants.go` — dirty on master AND here, and untouched by this branch.
+    Claim holds. Deliberately left; formatting it would widen the diff into an
+    unrelated file.
+  - `bpf_session_value_test.go` — **CLEAN on master**. The branch caused the
+    dirtiness, so that half of the claim was wrong. Mechanism: this PR inserts
+    a comment block between `FibGen: 99,` and the new `IngressIfindex` /
+    `IngressVlanID` fields, and a comment line BREAKS a gofmt alignment group.
+    The fields above it therefore stopped being padded to the width of
+    `IngressIfindex` (14) and gofmt wanted them at `IngressZone`/`NATSrcPort`
+    width (11). `gofmt -w`; the result is 29 insertions / 29 deletions, all
+    whitespace, confined to that one struct literal.
+
+  General shape worth keeping: inserting a comment INTO a keyed struct literal
+  re-partitions gofmt's alignment groups, so a comment-only insertion can make
+  a file gofmt-dirty in lines the author never edited — and it reads as
+  pre-existing dirt if you check only `gofmt -l` and not `git show
+  origin/master:<path>`.
+- **File(s)**: _Log.md, pkg/dataplane/bpf_session_value_test.go
