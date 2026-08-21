@@ -98141,3 +98141,42 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #304 live half. The AF_XDP shim diverted every ESP packet and
+  every non-native GRE packet to the kernel on a PROTOCOL-ONLY test with no
+  destination predicate (`userspace-xdp/src/lib.rs`, the two `cpumap_or_pass`
+  returns ahead of the WireGuard branch), so TRANSIT ESP and transit non-native
+  GRE — addressed to a host beyond the firewall — reached the kernel forwarding
+  path with no zone policy evaluated (`ip_forward=1`, every nft chain
+  `policy accept`, no `hook forward` rule, no tc/clsact). The sibling WireGuard
+  branch has a destination gate its own comment calls MANDATORY, and the
+  DEGRADED path (`is_degraded_local_or_control`) already gates ESP on
+  `is_interface_nat_destination` and GRE on native-GRE + inner PASS_TO_KERNEL
+  and drops other transit — so the healthy path was the weaker of the two.
+  Deleted both protocol-only returns; ESP and non-native GRE now fall into the
+  ordinary session-miss classification, whose `is_local_destination` arm already
+  cpumaps a locally-terminated tunnel. Added the one case that arm cannot see:
+  a tunnel endpoint on an address interface-mode SNAT owns, which
+  `is_local_destination` deliberately reports false for — handled by reusing the
+  existing `is_interface_nat_destination` call rather than adding a second
+  lookup. A remote destination now reaches the worker and is adjudicated by the
+  table-scoped #5620 `owns_configured_ip` gate. Not the obvious
+  `is_local_destination` predicate at the original site (global maps; #5620
+  rules it out).
+
+  Validation: pinned toolchain nightly-2026-05-23 + bpf-linker 0.10.2, kernel
+  verifier gate PASS. Baseline rebuild reproduced byte-identically at 773,966
+  insns / 22.60% headroom; candidate 777,901 insns / 22.21% headroom — +3,935
+  insns, −0.39pp, well inside the #4555 floor. (A first shape that added an
+  explicit `is_interface_nat_destination || is_local_destination` conjunct at
+  the original site also verified but cost 810,906 insns / 18.91% — −3.69pp —
+  and was discarded for the reuse form.) `go build ./...` exit 0, `go vet
+  ./pkg/dataplane/...` exit 0, `go test -count=1 ./pkg/dataplane/...` exit 0
+  (manifest/facts gate green). The shim crate is `no_std` for
+  `bpfel-unknown-none` with no host test harness and its predicates read BPF
+  maps, so there is no host-side red for this property; the `.o` moved, so a
+  cluster smoke on the loss userspace cluster is owed and was NOT run by this
+  lane.
+- **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/userspace-dataplane-architecture.md, _Log.md
