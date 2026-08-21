@@ -32,6 +32,13 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"cmd/shimverify/main.go":                      "#1864 build-time verifier gate: thin wrapper over dataplane.VerifyUserspaceShimObject (verify-only, no production load path)",
 	"cmd/shim-manifest/main.go":                   "#4977 build-time freshness gate: thin wrapper over dataplane.WriteUserspaceXDPManifest (regenerates the source→object manifest during make generate; no production load path)",
 	"cmd/xpfd/main.go":                            "cleanup entry point (backend registration removed in #1527)",
+	"pkg/api/metrics_userspace.go":                "#2114 r6-F1: the userspace Status() probe resolves through dataplane.Unwrap so the daemon's live indirection does not erase the capability; probe-routing only, no legacy enforcement path",
+	"pkg/cli/cli_show_chassis.go":                 "#2114 r2-B7: `show chassis forwarding` binds dataplane.Unwrap(dp) to a local so an empty cell yields a nil fwdstatus accessor; the old `dp == nil` gate is permanently false under the live indirection, and falling past it produced BufferKnown=true with BufferPercent=0 (peer of pkg/grpcapi/server_show_forwarding.go); render-only, no legacy enforcement path",
+	"pkg/cli/cli_show_security_wireguard.go":      "#2114 r2-B4: the WireGuard renders bind dataplane.Unwrap(dp) to a local so an empty cell reports \"Dataplane not loaded\" instead of naming a backend KIND for a daemon with no backend (peer of pkg/grpcapi/server_show_security_text.go); render-only, no legacy enforcement path",
+	"pkg/cli/cli_show_system.go":                  "#2114 r6-F3: `show system buffers` binds dataplane.Unwrap(dp) to a local instead of asking `dp != nil`, so an empty cell reports \"Dataplane not loaded\" rather than a claim about a loaded backend's maps, and ONE resolution feeds both the publication check and the capability probe (r7); render-only, no legacy enforcement path",
+	"pkg/grpcapi/server_diag_system_action.go":    "#2114 r6-F2/F3: clear-persistent-nat binds dataplane.PersistentNATTable to a LOCAL (one resolution per operation) and dataplaneActionError maps dataplane.ErrNotPublished to codes.Unavailable; control-plane only, no legacy enforcement path",
+	"pkg/grpcapi/server_show_forwarding.go":       "#2114 r2-B7: `show chassis forwarding` binds dataplane.Unwrap(dp) to a local so an empty cell yields a nil fwdstatus accessor; the old `dp == nil` gate is permanently false under the live indirection, and falling past it made fwdstatus.Build set BufferKnown=true with BufferPercent=0 — a zero every downstream consumer is told to trust (peer of pkg/cli/cli_show_chassis.go); render-only, no legacy enforcement path",
+	"pkg/grpcapi/server_show_system.go":           "#2114 r6-F3: `show system buffers` binds dataplane.Unwrap(dp) to a local instead of asking `dp != nil`, with ONE resolution feeding both decisions (r7) (peer of pkg/cli/cli_show_system.go); render-only, no legacy enforcement path",
 	"pkg/api/api.go":                              "shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: apiRuntimeDataPlane interface, applyResult adapter)",
 	"pkg/api/metrics.go":                          "Prometheus telemetry still reads legacy counters and metadata",
 	"pkg/api/metrics_counters.go":                 "Prometheus map-counter collectors still call legacy dataplane reads (#1540 metrics split)",
@@ -80,6 +87,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/daemon/daemon_run_naming.go":             "#5661 pure-motion split of daemon_run.go: interface naming reads dataplane.EffectiveType/TypeUserspace",
 	"pkg/daemon/daemon_run_routehelpers.go":       "#5661 pure-motion split of daemon_run.go: applied-tunnel/route helpers read dataplane.EffectiveType/TypeUserspace",
 	"pkg/daemon/runtime_probes.go":                "#1519 daemon-local typed probes (apiDataPlane/grpcDataPlane/cliDataPlane/...) mirror downstream package-private interfaces; still name root dataplane types (SessionKey, CounterValue, etc.) until those move to a domain package",
+	"pkg/daemon/daemon_dp_live.go":                "#2114 r4 live management-surface indirection: forwards the UNION of the runtime_probes.go probes, so it names the same root dataplane types those probes do (SessionKey, CounterValue, ...) and moves with them",
 	"pkg/logging/ringbuf.go":                      "#3057: RT_FLOW policy-name resolution references the shared wire-contract constants dataplane.DefaultPolicySentinelID + dataplane.DefaultPolicyName (the implicit default-policy sentinel ID, kept in lockstep with userspace-dp/src/policy.rs); display-only, no legacy enforcement path",
 	"pkg/nftables/netlink_lo0.go":                 "#6387 PR-2: the additive netlink lo0-filter builder resolves DSCP names through the dataplane.DSCPValues SSOT to emit numeric nft-equivalent matches (mirrors daemon_nft.go's #3436 lo0/host-inbound DSCP resolution); ruleset-generation-only, no legacy enforcement path",
 	"pkg/policymatch/zone_detail_summary.go":      "#3684: the shared `show security zones detail` policy-summary presenter renders the same wire-contract constants dataplane.DefaultPolicyName + dataplane.DefaultPolicySentinelID on the default-policy catch-all row (M13); display-only, no legacy enforcement path (peer of pkg/logging/ringbuf.go)",
@@ -3314,38 +3322,165 @@ func hasDaemonRuntimeConstructorCall(t *testing.T, path, name string) bool {
 func assertDaemonDPFieldIsRuntimeDataPlane(t *testing.T) {
 	t.Helper()
 
+	if err := checkDaemonDPFieldShape(filepath.Join("..", "daemon", "daemon.go")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkDaemonDPFieldShape verifies the #2114 dataplane-publication shape:
+// the Daemon struct carries the runtime dataplane ONLY as the
+// `dpCell atomic.Pointer[dpSlot]` publication cell, and the `dpSlot`
+// payload struct's `v` field is a `dataplane.RuntimeDataPlane`. The
+// pre-#2114 raw `dp dataplane.RuntimeDataPlane` field raced the
+// bootstrap-exit writer against the sampler/HA-watcher readers, so its
+// reappearance (or a dpSlot payload of any other type) fails here.
+func checkDaemonDPFieldShape(path string) error {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join("..", "daemon", "daemon.go"), nil, 0)
+	file, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {
-		t.Fatalf("parse daemon.go: %v", err)
+		return fmt.Errorf("parse %s: %v", path, err)
 	}
 
-	var found bool
+	var foundCell, foundSlot bool
+	var inspectErr error
 	ast.Inspect(file, func(n ast.Node) bool {
 		typeSpec, ok := n.(*ast.TypeSpec)
-		if !ok || typeSpec.Name.Name != "Daemon" {
+		if !ok {
 			return true
 		}
 		st, ok := typeSpec.Type.(*ast.StructType)
 		if !ok {
-			t.Fatalf("Daemon is %T, want struct", typeSpec.Type)
+			return true
 		}
-		for _, field := range st.Fields.List {
-			for _, name := range field.Names {
-				if name.Name != "dp" {
-					continue
+		switch typeSpec.Name.Name {
+		case "Daemon":
+			for _, field := range st.Fields.List {
+				fieldType := canaryExprString(field.Type)
+				for _, name := range field.Names {
+					if name.Name == "dpCell" {
+						foundCell = true
+						if fieldType != "atomic.Pointer[dpSlot]" {
+							inspectErr = fmt.Errorf("Daemon.dpCell = %s, want atomic.Pointer[dpSlot]", fieldType)
+						}
+						continue
+					}
+					// Codex PR #6743 r3-6: reject the raw interface field
+					// under ANY name — a renamed `fallback dataplane.
+					// RuntimeDataPlane` recreates the exact unsynchronized
+					// publication path this shape pins.
+					if fieldType == "dataplane.RuntimeDataPlane" {
+						inspectErr = fmt.Errorf("Daemon.%s is a raw dataplane.RuntimeDataPlane field; #2114 publishes the dataplane through dpCell (atomic.Pointer[dpSlot])", name.Name)
+					}
 				}
-				found = true
-				if got := canaryExprString(field.Type); got != "dataplane.RuntimeDataPlane" {
-					t.Fatalf("Daemon.dp = %s, want dataplane.RuntimeDataPlane", got)
+			}
+		case "dpSlot":
+			for _, field := range st.Fields.List {
+				for _, name := range field.Names {
+					if name.Name != "v" {
+						continue
+					}
+					foundSlot = true
+					if got := canaryExprString(field.Type); got != "dataplane.RuntimeDataPlane" {
+						inspectErr = fmt.Errorf("dpSlot.v = %s, want dataplane.RuntimeDataPlane", got)
+					}
 				}
 			}
 		}
-		return false
+		return true
 	})
+	if inspectErr != nil {
+		return inspectErr
+	}
+	if !foundCell {
+		return fmt.Errorf("Daemon.dpCell field not found (want dpCell atomic.Pointer[dpSlot])")
+	}
+	if !foundSlot {
+		return fmt.Errorf("dpSlot struct with a v dataplane.RuntimeDataPlane field not found")
+	}
+	return nil
+}
 
-	if !found {
-		t.Fatal("Daemon.dp field not found")
+// TestDaemonDPFieldShapeSelfTest feeds synthetic fixtures through
+// checkDaemonDPFieldShape in BOTH directions (#2114): the redesign must
+// reject the pre-#2114 raw field shape and accept the cell shape, so a
+// revert trips the boundary canary above.
+func TestDaemonDPFieldShapeSelfTest(t *testing.T) {
+	t.Parallel()
+
+	good := `package daemon
+
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
+type Daemon struct {
+	dpCell atomic.Pointer[dpSlot]
+}
+`
+	rawField := `package daemon
+
+type Daemon struct {
+	dp dataplane.RuntimeDataPlane
+}
+`
+	wrongCellType := `package daemon
+
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
+type Daemon struct {
+	dpCell atomic.Pointer[int]
+}
+`
+	missingSlot := `package daemon
+
+type Daemon struct {
+	dpCell atomic.Pointer[dpSlot]
+}
+`
+	wrongSlotPayload := `package daemon
+
+type dpSlot struct{ v int }
+
+type Daemon struct {
+	dpCell atomic.Pointer[dpSlot]
+}
+`
+	renamedRaw := `package daemon
+
+type dpSlot struct{ v dataplane.RuntimeDataPlane }
+
+type Daemon struct {
+	dpCell   atomic.Pointer[dpSlot]
+	fallback dataplane.RuntimeDataPlane
+}
+`
+
+	cases := []struct {
+		name    string
+		src     string
+		wantErr bool
+	}{
+		{"cell shape accepted", good, false},
+		{"raw field rejected", rawField, true},
+		{"wrong cell type rejected", wrongCellType, true},
+		{"missing dpSlot rejected", missingSlot, true},
+		{"wrong slot payload rejected", wrongSlotPayload, true},
+		// Codex PR #6743 r3-6: the raw field under a DIFFERENT name must
+		// fail too — the name-literal check used to pass it.
+		{"renamed raw field rejected", renamedRaw, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.go")
+			if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			err := checkDaemonDPFieldShape(path)
+			if tc.wantErr && err == nil {
+				t.Fatal("checkDaemonDPFieldShape accepted a bad shape")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("checkDaemonDPFieldShape rejected the cell shape: %v", err)
+			}
+		})
 	}
 }
 
@@ -3359,6 +3494,16 @@ func canaryExprString(expr ast.Expr) string {
 		return "*" + canaryExprString(e.X)
 	case *ast.BasicLit:
 		return e.Value
+	case *ast.IndexExpr:
+		// Generic instantiation with one type argument, e.g.
+		// atomic.Pointer[dpSlot] (#2114).
+		return canaryExprString(e.X) + "[" + canaryExprString(e.Index) + "]"
+	case *ast.IndexListExpr:
+		parts := make([]string, 0, len(e.Indices))
+		for _, idx := range e.Indices {
+			parts = append(parts, canaryExprString(idx))
+		}
+		return canaryExprString(e.X) + "[" + strings.Join(parts, ", ") + "]"
 	default:
 		return ""
 	}

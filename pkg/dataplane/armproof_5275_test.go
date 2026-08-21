@@ -160,7 +160,7 @@ func TestArmProofGenericModeSurvivesASecondCompile(t *testing.T) {
 	)
 
 	m := New()
-	m.loaded = true
+	m.loaded.Store(true) // #2114 A3: loaded is atomic.Bool
 	m.SelectUserspaceXDPShimEntryProgram()
 	m.programs[m.XDPEntryProgram()] = nil
 	// What compile #1 left behind after its native->generic fallback.
@@ -206,7 +206,7 @@ func TestArmProofNativeSurfaceIsNotReportedGeneric(t *testing.T) {
 	)
 
 	m := New()
-	m.loaded = true
+	m.loaded.Store(true) // #2114 A3: loaded is atomic.Bool
 	m.xdpLinks[5] = nil
 
 	rep := m.ProveArmCoverage(newProofResult([]int{5}))
@@ -1188,7 +1188,7 @@ func TestArmProofReportsTheReadbackInstanceWithoutVerifyingIt(t *testing.T) {
 	)
 
 	m := New()
-	m.loaded = true
+	m.loaded.Store(true) // #2114 A3: loaded is atomic.Bool
 	m.SelectUserspaceXDPShimEntryProgram()
 	// The Manager holds NO shim program to compare against — AttachXDP's own
 	// source of truth is absent — and the surface still classifies covered.

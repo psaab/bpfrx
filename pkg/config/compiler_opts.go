@@ -1312,6 +1312,42 @@ type compileOpts struct {
 	// legitimate dynamic-interface reference (the #4191 over-rejection class).
 	// Same doctrine as lenientZoneInterfaceMembership.
 	lenientZoneInterfaceDefined bool
+	// lenientZoneInterfacesNonEmpty (#6525) downgrades the zone-interfaces
+	// NON-EMPTY gate (validateZoneInterfacesNonEmptyStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `security zones security-zone <z> interfaces` stanza that
+	// carries content yet contributes ZERO members — the shape the hierarchical
+	// compact-leaf spelling `interfaces ge-0/0/1.0;` used to produce, where the
+	// member name sat on the stanza's own Keys tail that compileZones never
+	// read. Such a zone binds no interface: the dataplane leaves the interface
+	// with Zone == "" (UserspaceBoundLinuxInterfaces skips it, so it is never
+	// AF_XDP-bound) and every policy naming the zone applies to nothing, while
+	// the two gates above pass VACUOUSLY over the empty member set. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick) —
+	// on that path behavior is unchanged (the stanza contributed no members
+	// before this gate existed and still contributes none), just with an
+	// operator-visible warning. Same doctrine as lenientZoneInterfaceDefined.
+	lenientZoneInterfacesNonEmpty bool
+	// lenientZoneInterfacePackedTail (#6735) downgrades the zone-interfaces
+	// PACKED-TAIL gate (validateZoneInterfacePackedTailStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a `security zones security-zone <z> interfaces` stanza
+	// in which `host-inbound-traffic` appears on a member's Keys with further
+	// tokens AFTER it. The lexer strips brackets (#2419), so the bracket member
+	// list `[ a host-inbound-traffic b ]` and the packed body
+	// `a host-inbound-traffic system-services ssh` are structurally identical by
+	// the time the compiler sees them, and their readings disagree about zone
+	// membership: the truncator keeps only the names BEFORE the keyword, so the
+	// first loses member `b` (left with Zone == "", never dataplane-bound, no
+	// policy naming the zone applies to it) and the second loses the whole
+	// override. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// BOOTS (#1960 no-brick) — on that path behavior is unchanged (the trailing
+	// tokens were dropped before this gate existed and still are), just with an
+	// operator-visible warning naming what was lost. Same doctrine as
+	// lenientZoneInterfacesNonEmpty.
+	lenientZoneInterfacePackedTail bool
 	// lenientHostInboundTokens (#3200) downgrades the host-inbound-traffic
 	// token gate (validateHostInboundTokensStrict) from a hard compile error
 	// to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1986,19 +2022,32 @@ type compileOpts struct {
 	// (validateNATTerminalActionCardinalityStrict) from a hard compile error to
 	// a cfg.Warnings entry. A NAT rule whose complete `then {}` block carries
 	// ZERO terminal actions (actionless — the snapshot builder installs no
-	// translation, so an intended `off` exemption silently disappears and a
-	// later broader rule is revealed) or TWO+ mutually-exclusive actions inside
-	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
-	// picks one by packed-key / child order, so an exemption can publish as a
-	// translation) was previously accepted. The strict commit / commit-check
+	// translation and the rule does not stop evaluation, so an intended `off`
+	// exemption silently disappears and the traffic falls through: translated by
+	// a later broader rule if one matches, otherwise left untranslated) or TWO+
+	// mutually-exclusive actions inside
+	// one block (`off` + `pool`, `interface` + `pool` — before #5628 the compiler
+	// picked one by packed-key / child order; it now records every field and the
+	// DATAPLANE resolves the rule by a fixed precedence, so all but one authored
+	// action is silently discarded) was previously accepted. The strict commit /
+	// commit-check
 	// path hard-rejects so the malformed rule is operator-visible; the tolerant
 	// load / peer-sync paths downgrade to a warning so an already-persisted or
 	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
-	// closed-on-load class) — a leniently-loaded actionless rule is inert, and a
-	// contradictory one now records BOTH fields (the else-if→if setter change),
-	// so the Rust dataplane's off-precedence governs its resolution (off wins →
-	// exempt), unifying the hierarchical path with the pre-existing flat-set
-	// both-fields behavior rather than the old Go single-field child-order pick.
+	// closed-on-load class) — a leniently-loaded actionless rule is NOT inert
+	// (see the ZERO-actions wording above), though HOW it fails to be inert
+	// differs by kind: source NAT EMITS the rule and the Rust matcher's `else`
+	// arm continues past it, destination NAT SKIPS it in the builder. Either way
+	// the traffic falls through rather than being exempted. A contradictory rule
+	// records EVERY authored field (the else-if→if setter change) — two of them,
+	// or three for `interface` + `off` + `pool` — unifying the hierarchical path
+	// with the pre-existing flat-set behavior rather than the old Go
+	// single-field child-order pick. Resolution is then by a FIXED precedence,
+	// which is off-precedence only when the contradiction CONTAINS `off`:
+	// `interface` + `pool` carries none, and interface mode wins there while the
+	// authored pool is discarded (#6820 round 3 — the earlier "off-precedence
+	// governs" wording was quantified over all contradictions and is false for
+	// that pair).
 	// Only a malformed rule reaches this — the strict commit path rejects it.
 	// Duplicate `then` CONTAINERS remain #3850 last-wins (the gate counts the
 	// winning block only). Same doctrine as lenientNATMixedScope.
@@ -2226,6 +2275,8 @@ func lenientCompileOpts() compileOpts {
 		lenientAddressBookNameCollision:        true,
 		lenientZoneInterfaceMembership:         true,
 		lenientZoneInterfaceDefined:            true,
+		lenientZoneInterfacesNonEmpty:          true,
+		lenientZoneInterfacePackedTail:         true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,
 		lenientClusterAuthKey:                  true,

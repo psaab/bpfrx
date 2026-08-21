@@ -11,14 +11,21 @@ import (
 // manager's AppliedNATView reads m.lastStatus (refreshed by the 1 Hz status
 // loop) and m.appliedSnapshot (captured at each successful apply_snapshot).
 //
-// When d.dp is not the userspace adapter (e.g. NoDataplane), the sampler
+// When the published dataplane is not the userspace adapter (e.g. NoDataplane), the sampler
 // reports Available:false so the monitor HOLDs (makes no decision).
 func (d *Daemon) natPoolAlarmSampler() natpoolalarm.Sampler {
 	return func() natpoolalarm.View {
-		if d == nil || d.dp == nil {
+		if d == nil {
 			return natpoolalarm.View{Available: false}
 		}
-		adapter, ok := d.dp.(interface {
+		// #2114: one dataplane snapshot per sampler tick (plan §5.3
+		// rule 1) — the monitor goroutine runs concurrently with the
+		// bootstrap-exit writer.
+		rt := d.dataplane()
+		if rt == nil {
+			return natpoolalarm.View{Available: false}
+		}
+		adapter, ok := rt.(interface {
 			Manager() *dpuserspace.Manager
 		})
 		if !ok {
@@ -95,10 +102,10 @@ func (d *Daemon) natPoolAlarms() []natpoolalarm.ActiveAlarm {
 // (bootstrap exit), so two concurrent constructions cannot interleave; the
 // Load()!=nil short-circuit plus the atomic Store are belt-and-suspenders.
 //
-// The d.dp==nil guard keeps the helper self-contained: bootstrap suppresses
+// The unpublished-dataplane guard keeps the helper self-contained: bootstrap suppresses
 // the start, and a torn-down/never-armed dataplane has nothing to sample.
 func (d *Daemon) maybeStartNATPoolAlarm() {
-	if d.opts.NoDataplane || d.inBootstrap() || d.dp == nil {
+	if d.opts.NoDataplane || d.inBootstrap() || d.dataplane() == nil {
 		return
 	}
 	if d.natPoolAlarm.Load() != nil {
@@ -106,7 +113,7 @@ func (d *Daemon) maybeStartNATPoolAlarm() {
 	}
 	m := natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
 	// Test seam: drive the sampler at a fast tick so the #2114 race tests can
-	// exercise the sampler-vs-d.dp overlap deterministically. Zero in
+	// exercise the sampler-vs-dataplane-cell overlap deterministically. Zero in
 	// production (default 10s cadence). Must be applied before Start().
 	if d.natPoolAlarmTestTick > 0 {
 		m.SetTickForTest(d.natPoolAlarmTestTick)

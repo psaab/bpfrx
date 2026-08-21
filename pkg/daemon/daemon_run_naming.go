@@ -227,25 +227,53 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 
 	// Arm the dataplane (AF_XDP attach) — the backend object was
 	// constructed at boot (C1) but never started in bootstrap mode.
-	if d.dp != nil {
-		if err := d.dp.Start(d.daemonCtx); err != nil {
-			slog.Warn("bootstrap exit: failed to start dataplane, running in config-only mode",
-				"err", err)
-			d.dp = nil
-		} else {
-			if seeder, ok := d.dp.(natSeeder); ok {
-				seeder.SeedNATPortCounters()
-				seeder.SeedSessionIDCounter(nodeID)
-			}
-			// #2114: start the NAT pool-alarm monitor now that the dataplane
-			// is armed and d.dp is stable. It was suppressed at boot in
-			// bootstrap mode; exitBootstrapMode already flipped
-			// bootstrapMode=false in applyConfigLocked before calling this,
-			// so maybeStartNATPoolAlarm's !inBootstrap() gate passes. Runs
-			// under the apply caller's d.applySem, so the monitor's first
-			// sampler read cannot overlap a concurrent d.dp write. Idempotent.
-			d.maybeStartNATPoolAlarm()
-		}
-	}
+	d.armBootstrapExitDataplane(nodeID)
 	slog.Info("bootstrap exit: startup takeover complete; applying first config")
+}
+
+// armBootstrapExitDataplane arms the runtime dataplane on bootstrap exit:
+// the backend object was constructed at boot (C1) but never started in
+// bootstrap mode. Split from runBootstrapExitStartup (#2114) so the
+// dataplane-cell race tests can drive the REAL arm/nil-on-failure writer
+// without the netlink/sysctl takeover steps. On success the NAT
+// port/session seeds run and the #2079 pool-alarm monitor starts.
+//
+// On a Start failure the cell is cleared, so nothing can ACQUIRE the
+// unarmed backend afterwards and the daemon forwards nothing. That is
+// "config-only" for the forwarding path and for every consumer that
+// re-reads the cell — which, since #6743 r4, includes gRPC, REST and the
+// console CLI (they hold liveDataPlane, so the clear makes their
+// dataplane surface report unavailable immediately). It is NOT a claim
+// that every consumer is severed: the conntrack GC and cluster
+// SessionSync were wired from DECOMPOSED domain handles taken before this
+// point and keep them (daemon_dp_live.go documents why), so their loops
+// run until their own contexts end. Codex PR #6743 r7: the userspace
+// event-stream loop is NO LONGER in that list — it re-resolves the
+// provider, the stream and the session-delta drainer from the cell on
+// every tick, so this clear stops it draining within one tick.
+func (d *Daemon) armBootstrapExitDataplane(nodeID int) {
+	// #2114: ONE snapshot feeds the nil-check, Start, and the seeder
+	// (plan §5.3 rule 3); the cell is cleared only on the failure branch.
+	rt := d.dataplane()
+	if rt == nil {
+		return
+	}
+	if err := rt.Start(d.daemonCtx); err != nil {
+		slog.Warn("bootstrap exit: failed to start dataplane, running in config-only mode",
+			"err", err)
+		d.setDataplane(nil)
+		return
+	}
+	if seeder, ok := rt.(natSeeder); ok {
+		seeder.SeedNATPortCounters()
+		seeder.SeedSessionIDCounter(nodeID)
+	}
+	// #2114: start the NAT pool-alarm monitor now that the dataplane
+	// is armed and the published dataplane is stable. It was suppressed
+	// at boot in bootstrap mode; exitBootstrapMode already flipped
+	// bootstrapMode=false in applyConfigLocked before calling this,
+	// so maybeStartNATPoolAlarm's !inBootstrap() gate passes. Runs
+	// under the apply caller's d.applySem; the monitor sampler reads the
+	// dataplane through the atomic dataplane() accessor. Idempotent.
+	d.maybeStartNATPoolAlarm()
 }
