@@ -131,6 +131,51 @@ The primary consumer of the `Manager.Events()` channel is
 publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
 state-handler method, not the event-channel consumer.
 
+## Takeover readiness gate and hold (#103)
+
+Election gates promotion on `RedundancyGroupState.IsReadyForTakeover(holdTime)`
+(`manager.go`), which is TWO conditions: `Ready` is true AND it has been true
+for at least `takeoverHoldTime`. `Ready` is pushed in from the daemon reconcile
+pass — `Daemon.takeoverReadinessForRG` (`pkg/daemon/daemon_ha_userspace_readiness.go`)
+ANDs four inputs and calls `SetRGReady`:
+
+| Input | Source | Not-ready when |
+|-------|--------|----------------|
+| interfaces | `Monitor.RGInterfaceReady` (`monitor.go`) | a LOCAL required interface is missing or down. An interface whose FPC slot maps to the peer node is skipped — it cannot exist locally. |
+| VRRP | `vrrp.Manager.RGVRRPReady` | a desired RETH instance is in `unbuiltDesired` (#5641), or the RG has RETH interfaces and no instance at all. `checkNoRethTakeoverReadiness` replaces this in no-RETH-VRRP mode. |
+| fabric | `d.fabricPopulated` | the fabric forwarding path is unpopulated. Forced ready when the peer is not alive. |
+| userspace dataplane | `TakeoverReady()` on the published runtime | fail-closed: config says userspace but no dataplane is published. |
+
+`SetRGReady` (`readiness.go`) stamps `ReadySince` on the not-ready -> ready edge
+and arms a `holdTimer` to re-run the election when the hold expires; the
+ready -> not-ready edge clears `ReadySince` and stops the timer, so a readiness
+flap restarts the hold rather than accumulating credit.
+
+**`Ready` and takeover-ELIGIBLE are different properties**, and the status
+render must not conflate them: inside the hold window an RG is `Ready` while
+every election gate still declines to promote it. `FormatStatus` /
+`FormatInformation` therefore key their "Takeover ready:" line on
+`TakeoverHoldRemaining` and report `no (takeover hold: X of Y remaining)`, and
+`FormatInformation` prints the configured `Takeover hold time:` line. Note
+`pkg/upgrade`'s pre-demotion precheck parses the first token after
+`Takeover ready:` and treats `no` as a blocker, which is the intended reading —
+a holding RG genuinely cannot take over yet.
+
+`DefaultTakeoverHoldTime` is **0**: with `set chassis cluster
+takeover-hold-time` unset the gate is readiness-only and both renders are
+byte-identical to their pre-#103 form. It shipped at 3s in `91a57cf` and was
+changed to 0 in `cd4dbe9`, a bodyless commit with no recorded rationale.
+
+Two things the gate deliberately does NOT do, both still open:
+
+- **`electSingleNode` bypasses the gate when the peer is not alive**
+  (`election.go`) — a lone node promotes on `Weight > 0` regardless of
+  readiness. This is fail-open on purpose: a survivor that refuses to take over
+  is a total outage. It does mean #103's "peer-loss event does not force
+  takeover when readiness is false" is not satisfied, and a cold boot with no
+  peer ever seen promotes an RG whose interfaces are still missing.
+- **Session-sync readiness is not an input** to the gate — that is #110.
+
 ## Peer-liveness cold-boot grace (#4386)
 
 `heartbeatReceiver.checkTimeout` (`heartbeat.go`) makes both peer-liveness

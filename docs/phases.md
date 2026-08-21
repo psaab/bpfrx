@@ -2626,12 +2626,16 @@ Secondary fix: NAT64 source pool auto-assignment. Named pools defined in source 
 
 ### Fix #103: Per-RG readiness gate for startup takeover (FIXED `91a57cf`)
 - Per-RG readiness contract: interfaces exist+up AND VRRP instances running
-- Election blocks promotion until readiness sustained for `takeover-hold-time` (default 3s)
+- Election blocks promotion until readiness sustained for `takeover-hold-time` (**default 0** — shipped at 3s in `91a57cf`, changed to 0 in the bodyless `cd4dbe9`)
 - Monitor's `RGInterfaceReady()` treats missing interfaces as not-ready (was silently skipped)
 - VRRP manager's `RGVRRPReady()` checks per-RG instance existence
 - Daemon reconcile loop wires readiness into cluster manager
 - Already-primary nodes never demoted by readiness gate
-- Status display shows readiness state and reasons
+- Status display shows readiness state, reasons, and (when a hold is
+  configured) the remaining takeover hold
+- NOT covered by this fix, see #103 / #110: session-sync readiness is not part
+  of the takeover gate, and `electSingleNode` deliberately BYPASSES the gate
+  when the peer is not alive
 - **Files:** `pkg/cluster/cluster.go`, `pkg/cluster/election.go`, `pkg/cluster/monitor.go`, `pkg/vrrp/manager.go`, `pkg/daemon/daemon.go`, `pkg/config/`
 
 ## Issue #104: HA Same-L2 Strict Single-Owner VIP Mode

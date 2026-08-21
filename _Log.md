@@ -97954,3 +97954,36 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_slot_escape_gate_test.go,
   pkg/config/schema_slot_escape_fixtures_test.go, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #103 — report the takeover HOLD in cluster status, and correct
+  two stale docs claims about its default. Walking #103's five enumerated
+  sub-conditions against `Daemon.takeoverReadinessForRG` showed items 1a, 1b,
+  2, 3 (peer-alive path) and 4 covered, item 1c covered only for fabric
+  (session-sync is #110), and item 5 covered only for the readiness REASONS —
+  the hold timer was surfaced nowhere. That is not merely missing information:
+  `IsReadyForTakeover` is `Ready` AND `ReadySince+holdTime` elapsed, so inside
+  the hold window `FormatStatus` printed `Takeover ready: yes` while every
+  election gate was actively declining to promote the RG. Verified with a
+  throwaway probe before fixing: with `takeover-hold-time 5000` and a fresh
+  `SetRGReady(0, true, nil)`, `electSingleNode` left the RG `secondary` and the
+  render said `Takeover ready: yes`.
+
+  Added `RedundancyGroupState.TakeoverHoldRemaining` + `Manager.TakeoverHoldTime`
+  and keyed both renders on them. At the default `DefaultTakeoverHoldTime = 0`
+  both renders are byte-identical to before, which bounds the change onto
+  clusters that configured a hold — including `pkg/upgrade`'s precheck, which
+  parses the first token after `Takeover ready:`. Corrected docs/bugs.md and
+  docs/phases.md, which both claimed the default was 3s: it shipped at 3s in
+  `91a57cf` and was changed to 0 in `cd4dbe9`, a bodyless commit.
+
+  Validation: `go test -count=1 ./pkg/cluster/ ./pkg/upgrade/ ./pkg/daemon/
+  ./pkg/cli/ ./pkg/grpcapi/ ./pkg/vrrp/` exit 0. Five single-line mutations,
+  each reding a distinct cell (exit 1 each): FormatStatus hold branch,
+  FormatInformation hold branch, hold-time config line made unconditional,
+  `TakeoverHoldRemaining` losing its `!rg.Ready` guard, and FormatStatus
+  dropping the readiness reasons. Render-only Go control-plane change — no
+  dataplane binary or shim artifact moves.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/manager.go,
+  pkg/cluster/status_takeover_hold_103_test.go, pkg/cluster/README.md,
+  docs/bugs.md, docs/phases.md, _Log.md
