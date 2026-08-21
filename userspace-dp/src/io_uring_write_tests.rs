@@ -163,7 +163,7 @@ impl RingPort for FakeRing {
         // The cancel op is only SUBMITTED — and its completion only reapable — by
         // a later SUCCESSFUL wait. Queue it as pending rather than making it
         // immediately ready, so a fatal ring (every wait errors) never surfaces
-        // it (invariant 4: the parked buffer is retained, not released).
+        // it (the parked buffer is retained, not released).
         self.pending_cqes.push_back(Completion {
             user_data,
             result: 0,
@@ -593,7 +593,7 @@ fn write_all_fails_closed_when_id_space_exhausted() {
 }
 
 // ---------------------------------------------------------------------------
-// #5800 — teardown drain + cancellation (invariant 2/4)
+// #5800 — teardown drain + cancellation (the synchronous proof path)
 // ---------------------------------------------------------------------------
 
 /// #5800: `drain_for_teardown` submits an AsyncCancel for each deferred write id
@@ -678,10 +678,13 @@ fn drain_waits_for_target_cqe_not_just_cancel() {
     assert_eq!(ring.cancel_calls, 1, "the drain cancelled the deferred write");
 }
 
-/// #5800 (invariant 4): a FATAL ring cannot be drained (every wait returns the
-/// permanent error), so `drain_for_teardown` RETAINS the buffer — it is never
-/// freed early. The straggler is freed only when the registry itself drops
-/// (after the ring fd closes).
+/// #5800: a FATAL ring cannot be drained (every wait returns the permanent
+/// error), so `drain_for_teardown` RETAINS the buffer — it is never freed early.
+/// The straggler is freed only when the registry itself drops, which
+/// `RingWriter`'s field order puts after the ring fd close (#6168: a best-effort
+/// narrowing of the window, not a proof the kernel is done). What THIS test
+/// binds is the retain: a fatal ring must never release a buffer it cannot
+/// prove terminal.
 #[test]
 fn fatal_ring_drain_retains_buffer() {
     let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EBADF);
@@ -695,7 +698,7 @@ fn fatal_ring_drain_retains_buffer() {
     assert_eq!(
         reg.inflight_len(),
         1,
-        "invariant 4: the buffer is retained until teardown/registry-drop, never freed early"
+        "the buffer is retained until teardown/registry-drop, never freed early"
     );
 }
 

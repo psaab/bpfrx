@@ -453,13 +453,21 @@ also used by the state writer. Its `WriteMode` (`IoUring(RingWriter)` |
   preserves the heap address the SQE points at) and stays owned there. It is
   never freed while an SQE may still reference it. A deferred buffer is released
   only when ONE terminal state is observed: its matching write CQE is reaped
-  (opportunistically at the top of the next write), a teardown drain cancels the
-  op AND observes both the cancel's completion and the target write's terminal
-  CQE, or the ring fd closes (`RingWriter` field order drops the ring — kernel
-  cancel+wait — before the registry frees buffers). The old code returned at the
-  ceiling and let the caller free the buffer with the SQE possibly still in
-  flight (a UAF-class disclosure/corruption); the fix moves ownership instead of
-  weakening lifetime.
+  (opportunistically at the top of the next write), or a teardown drain cancels
+  the op AND observes both the cancel's completion and the target write's
+  terminal CQE. That drain is the SYNCHRONOUS proof and covers every realistic
+  teardown. A straggler it cannot prove terminal — its `MAX_WAIT_RETRIES`
+  ceiling was hit, or the ring is fatally dead — is retained and freed only when
+  the registry drops, which `RingWriter`'s field order puts AFTER the ring fd
+  close. That ordering is a best-effort narrowing of the window, **not** a
+  barrier: closing the fd runs `io_uring_release`, which kills the ctx reference
+  and QUEUES the kernel's `io_ring_exit_work`; the cancel-and-wait happens in
+  that work item, asynchronously, so `close()` does not block on the io-wq drain
+  (#6168). The residual is accepted and bounded: it needs a pathological
+  ceiling-during-teardown storm, and is strictly better than the pre-#5800
+  behaviour. The old code returned at the ceiling and let the caller free the
+  buffer with the SQE possibly still in flight (a UAF-class
+  disclosure/corruption); the fix moves ownership instead of weakening lifetime.
 - **Per-call fallback (#2477).** An io_uring failure that put NOTHING on the TUN
   (`WriteResult::NothingWritten`) hands the owned buffer back and is rescued by a
   synchronous write of the SAME packet — the frame is still deliverable. A
@@ -471,12 +479,12 @@ also used by the state writer. Its `WriteMode` (`IoUring(RingWriter)` |
 - **Runtime demotion (#5172, mirrors state_writer #2958).** A structured
   per-write outcome separates packet-transfer certainty from RING HEALTH. A
   `Deferred { fatal_ring: true }` — the ring fd itself is dead — retires the ring
-  ONCE: dropping the `RingWriter` runs a bounded teardown drain and closes the
-  ring fd (which frees any parked buffer safely), then `WriteMode` flips to
-  `SyncFallback` and reports `mode = "sync"`. Every later packet then takes the
-  sync branch directly instead of retrying the broken ring (which otherwise
-  degrades BGP/OSPF/mgmt/local traffic). The demotion is PERMANENT (no cooldown
-  re-promotion — avoids flapping).
+  ONCE: dropping the `RingWriter` runs a bounded teardown drain (which frees
+  each parked buffer whose terminal CQE it observes) and closes the ring fd,
+  then `WriteMode` flips to `SyncFallback` and reports `mode = "sync"`. Every
+  later packet then takes the sync branch directly instead of retrying the
+  broken ring (which otherwise degrades BGP/OSPF/mgmt/local traffic). The
+  demotion is PERMANENT (no cooldown re-promotion — avoids flapping).
 - **Transient does NOT demote.** A `NothingWritten` the sync fallback rescued, or
   a bare retry-ceiling `Deferred { fatal_ring: false }` (an EINTR storm), keeps
   io_uring live — a momentary blip must not abandon the ring; the parked buffer
