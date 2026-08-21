@@ -673,7 +673,15 @@ handle itself — **#6741**, not this wrapper.
     host-bits-set prefix while `Nptv6State::try_from_snapshots` rejects the
     WHOLE snapshot over it (`userspace-dp/src/nptv6.rs`, #2240/#4519). It now
     returns an error for those, so the same certain failure happens BEFORE the
-    mutation. The error is scoped to rules that actually reach the helper:
+    mutation. The error is scoped to rules the helper actually REFUSES, which is
+    not the same as "Go cannot parse it" (#7077): Rust's `parse_prefix` takes a
+    leading `+` on the mask (`u8::from_str`) where Go's `net.ParseCIDR` does not,
+    so `fd00:9::/+48` is a Go parse error and a helper ACCEPT whose apply
+    succeeds today. `nptv6HelperWouldInstall` mirrors the helper's grammar (drift
+    is bound by a rustc-measured parity table) so that class keeps warn-and-skip;
+    a skipped rule still reaches the helper because `buildNptv6Snapshots` copies
+    the config strings independently. The error is also scoped to rules that
+    actually reach the helper at all:
     `config.NPTv6ScopeUnsupported` is the shared predicate the snapshot builder
     uses to DROP a rule (#5818), and a dropped rule keeps the warn-and-skip
     disposition because today's apply succeeds without it. **Residual:** the

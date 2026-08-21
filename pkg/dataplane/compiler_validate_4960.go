@@ -73,15 +73,30 @@ package dataplane
 // "not-a-prefix"` is retained by lenient validation with a warning, warned-and-
 // skipped by compileNPTv6, copied verbatim into the snapshot, and then rejected
 // WHOLE by Nptv6State::try_from_snapshots (userspace-dp/src/nptv6.rs,
-// #2240/#4519). compileNPTv6 now returns an error for the parse class instead,
-// so the same certain failure happens before the mutation rather than after it.
-// Two properties keep that from over-rejecting, and both matter:
+// #2240/#4519). compileNPTv6 now returns an error for the parse class the
+// HELPER REFUSES, so the same certain failure happens before the mutation
+// rather than after it. THREE properties keep that from over-rejecting, and
+// all three matter:
 //
 //   - It fires only for rules that actually REACH the helper. The snapshot
 //     builder drops a rule carrying an unsupported match scope (#5818), and
 //     today's apply succeeds without it, so those keep warn-and-skip.
 //     `config.NPTv6ScopeUnsupported` is the shared predicate; the builder and
 //     this compiler read the same answer.
+//
+//   - It fires only for rules the helper actually REFUSES, which is NOT the
+//     same as "Go cannot parse it" and cost a regression to learn (#7077).
+//     Rust's parse_prefix parses the mask with u8::from_str, which takes a
+//     leading `+`; Go's net.ParseCIDR does not. So `fd00:9::/+48` is a Go parse
+//     error and a helper ACCEPT -- today's apply succeeds and installs the
+//     translation -- and hard-erroring on it failed an apply that works, on the
+//     tolerant-load / peer-sync path #1960 exists to keep booting.
+//     `nptv6HelperWouldInstall` (compiler_nptv6_helper_grammar.go) mirrors the
+//     helper's grammar so that class keeps warn-and-skip. Note this could NOT
+//     have been discriminated as "strict vs lenient" instead: validateNPTv6Strict
+//     rejects EVERY malformed class at commit, so a malformed rule only ever
+//     arrives here from the lenient path and "warn when lenient" would be a
+//     full revert.
 //   - It cannot brick a boot or a peer sync, and the reason is STRUCTURAL
 //     rather than a property of today's call sites. pkg/dataplane is not in
 //     pkg/configstore's dependency closure at all -- not merely un-imported

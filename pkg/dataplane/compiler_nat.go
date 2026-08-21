@@ -1139,8 +1139,32 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			// installed. It keeps the warn-and-skip disposition, because erroring
 			// on it would fail an apply that works today.
 			installed := !config.NPTv6ScopeUnsupported(rs, rule)
+			// #7077 (#6894 r10): the SAME argument applies a second time, and
+			// missing it turned this fix into a regression. "The helper rejects
+			// this" was inferred from Go's own parse failing, but the two
+			// grammars are not identical: Rust's `parse_prefix` parses the mask
+			// with `u8::from_str`, which takes a leading `+`, while Go's
+			// net.ParseCIDR mask parser does not. So `nptv6-prefix fd00:9::/+48`
+			// is a Go parse ERROR and a helper ACCEPT -- today's apply succeeds
+			// and installs the translation. Hard-erroring on it failed an apply
+			// that works, reached on the tolerant-load / HA-peer-sync path #1960
+			// exists to keep booting.
+			//
+			// Note this cannot be discriminated by strict-vs-lenient instead:
+			// validateNPTv6Strict rejects EVERY malformed class at commit, so a
+			// malformed rule only ever arrives here from the lenient path, and
+			// "warn when lenient" would be a full revert. See
+			// compiler_nptv6_helper_grammar.go for the measurement.
+			//
+			// So a rule the helper would INSTALL keeps warn-and-skip for the
+			// same reason a DROPPED rule does: erroring fails an apply that
+			// succeeds today. Skipping costs nothing observable -- this function
+			// writes the retired eBPF map surface, while buildNptv6Snapshots
+			// copies Match/Then out of the config independently, so the rule
+			// still reaches the helper and is still installed.
+			helperInstalls := nptv6HelperWouldInstall(rule.Match, rule.Then)
 			reject := func(reason string, attrs ...any) error {
-				if !installed {
+				if !installed || helperInstalls {
 					slog.Warn("nptv6: "+reason, attrs...)
 					return nil
 				}
