@@ -1,3 +1,32 @@
+## 2026-08-21 — #5278: per-principal authorization on the primary gRPC listener
+
+- **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
+- **Action**: Added a login-class authorization gate to the primary (loopback)
+  gRPC listener. A `stats.Handler` resolves the connection's peer UID from the
+  kernel socket table at connection setup; unary + stream interceptors evaluate
+  the caller's `system login user <name> class` through the shared `pkg/authz`
+  decision (#5561) against a method -> permission table derived from
+  `pkg/cli/permissions.go` `requiredPermission`. An unmapped method costs
+  `PermAll` (super-user only) and the miss is logged at Error; the completeness
+  guard enumerates the GENERATED service descriptor and the `SystemAction`
+  handler's own switch labels, so neither table can silently go stale. The
+  fabric listener is untouched and keeps its #4107/#4122 chain.
+
+  Firsthand corrections to the research plan: the in-process console CLI does
+  NOT self-dial the local listener (all three `NewBpfrxServiceClient` sites go
+  through `dialPeer()` to the PEER's fabric address), and the plan's rejection
+  of a loopback peer lookup as TOCTOU described a socket-inode -> `/proc/<pid>`
+  mechanism that `pkg/authz` does not use. No transport change, no new config
+  knob, no client migration.
+
+- **File(s)**: `pkg/grpcapi/authz.go` (new), `pkg/grpcapi/authz_methods.go`
+  (new), `pkg/grpcapi/principal_authz_5278_test.go` (new),
+  `pkg/grpcapi/authz_method_table_5278_test.go` (new),
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_shutdown_monitor_4910_test.go`,
+  `pkg/grpcapi/README.md`, `pkg/api/README.md`, `pkg/api/authz.go`,
+  `pkg/authz/authz.go`, `pkg/config/login_perms.go`, `cmd/cli/main.go`,
+  `docs/system-login.md`, `CLAUDE.md`
+
 ## 2026-08-21 — #5192 item 1: `WorkerUmemInner` unmapped the UMEM before deleting it
 
 - **Timestamp**: 2026-08-21 (fix/5192-umem-drop-order)

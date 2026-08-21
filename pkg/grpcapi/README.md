@@ -19,14 +19,26 @@ tab completion. The wire schema is `proto/xpf/v1`.
   supervision is internal (#5047).
 - Tab completion: `Complete` RPC, backed by `pkg/cmdtree`.
 
-## Trust boundary (loopback-only, #5035)
+## Trust boundary (loopback-only, #5035 + per-principal, #5278)
 
-The primary listener started by `Run` installs **no** authentication or
-TLS — only the connection-scoped config-lock lifecycle owner
-(`configLockStatsHandler`, a gRPC `stats.Handler`; #5849) — so every RPC
-(including destructive `SystemAction` zeroize/reboot/halt/power-off and
-Commit/Delete/Rollback) is inherently trusted. That trust holds only if
-the listener is loopback-bound.
+The primary listener started by `Run` is loopback-bound **and** authorizes
+every RPC against the caller's Junos login class. Before #5278 it did only
+the first, and the first is a **location, not an identity**: the daemon
+provisions every `system login user` a real shell account
+(`useradd -m -s /bin/bash`), so a `read-only` or `operator` class holder
+could log in, dial `127.0.0.1:50051` with three lines of insecure gRPC
+client and invoke `SystemAction{zeroize,reboot,power-off}`, `Commit`,
+`Delete` and `Rollback` — executed by a root daemon. `pkg/cli`'s
+`checkPermission` runs in the CLI **process**, on the caller's side of the
+boundary, so it constrained only callers who chose to use the CLI; the
+remote `cli` binary carried no login class at all and never ran it. The
+#5209 config-lock holder check answers *which connection* holds the lock,
+not *who is on it*.
+
+See **Server-side authorization** below. The loopback clamp is unchanged
+and still wanted: identity here comes from the kernel's socket table, an
+answer that exists only for a caller on this host, so a non-loopback bind
+would publish a listener that can only refuse.
 
 **Config-session identity (#5849).** The config lock / candidate DB is a
 per-CLIENT-CONNECTION resource. Each config RPC keys its session by
@@ -48,6 +60,116 @@ auth mode that unlocks a non-loopback bind here: the intentionally
 network-exposed gRPC surface is the **separate** fabric listener
 (`RunFabricListener`), which authenticates (#4107) and allowlists (#4122)
 every call.
+
+## Server-side authorization (#5278)
+
+Every RPC on the primary listener — read, mutation and stream alike — is
+gated on a **server-derived principal** before it reaches its handler.
+`authz.go` owns the mechanism, `authz_methods.go` the tables, and the
+decision itself is `pkg/authz`'s, shared with the REST leg (#5561) so the
+two control planes cannot disagree about what a class permits.
+
+**How the caller is identified.** The owning UID of the peer's socket is
+read out of the kernel's own socket table (`/proc/net/tcp{,6}`, matched on
+the full 4-tuple, `TCP_ESTABLISHED` only), resolved to an account name via
+`/etc/passwd` (`pkg/osident`) and then to a class via
+`system login user <name> class`. The caller supplies no part of the
+answer. `SO_PEERCRED` would answer the same question, but only for
+`AF_UNIX`; this is an `AF_INET` listener. The three properties that make
+that lookup sound — full-address match, the `TCP_ESTABLISHED` requirement,
+and resolution at accept — are argued with their mutation proofs in
+[`pkg/api/README.md`](../api/README.md) and `pkg/authz/peer.go`.
+
+**Where this leg differs from the REST leg, and why.**
+
+| | REST (#5561) | gRPC (#5278) |
+|---|---|---|
+| Identities | peer UID **or** an `api-auth` credential | peer UID only |
+| Precedence rule | four rows, one of which admits on a negative | none — anything not an attributed UID is denied |
+| Gated surface | mutations only | every RPC, reads included |
+| Lookup timing | goroutine at `ConnContext`, bounded pool, request waits | inline in `TagConn` |
+| `SystemAction` | one route, folded to `PermMaint` | priced per verb |
+
+- **No credential row** makes this leg strictly stricter. There is nothing
+  weaker to fall through to, so `PeerIdentity.Local` is not consulted at
+  all: "local but unattributable" and "not on this host" both deny, and
+  `authz.PeerCouldBeLocalNow` (which exists to narrow the credential row)
+  has nothing to narrow.
+- **Reads are gated** because this surface has no scraper population —
+  nothing polls `GetSessions` on a timer, and `show configuration` here is
+  exactly the render `config-viewer` exists to scope. The REST leg left its
+  read surface open for `/metrics` and health probes; that divergence is
+  deliberate and is recorded on both sides.
+- **The lookup runs inline** because `grpc-go` calls `TagConn` on the
+  connection's OWN goroutine (`Server.Serve` → `go handleRawConn` →
+  `serveStreams` → `TagConn`), not in its accept loop. `http.Server` calls
+  `ConnContext` serially in the accept loop, which is why the REST leg has
+  a goroutine, a bounded pool, a per-connection deadline and a request-side
+  waiter. None of that machinery is needed here, and none of its failure
+  modes are inherited. What remains bounded is bounded in `pkg/authz`: the
+  socket-table read is single-flighted with a capped queue whose saturation
+  answers with an error, which denies.
+- **`SystemAction` is priced per verb.** It multiplexes three permission
+  tiers (`reboot`/`zeroize` at `maintenance`, `clear-arp`/`clear system
+  config-lock` at `clear`, `request dhcp renew`/`bgp-clear` at `control`),
+  and a unary gRPC interceptor is handed the DECODED request, so the verb
+  is available without buffering anything the caller controls. Folding the
+  method up to its floor — which the REST middleware must do, because it
+  deliberately never reads a body — would have taken the `clear` family
+  away from the `operator` class that holds it today.
+
+**Fail closed, and how that is proven.** A method absent from the table
+costs `PermAll`, which only `super-user` holds, and the miss is logged at
+`Error`. That is the weak half. The strong half is
+`TestEveryServiceMethodHasAPermission_5278`, which enumerates the
+**generated service descriptor** and fails the build in both directions —
+an RPC with no entry, and an entry naming no RPC. Enumerating the
+descriptor rather than a list a human typed is the whole point: a guard
+that compares hand-written literals against a hand-written count cannot
+fire. `TestEverySystemActionVerbHasAPermission_5278` does the same for the
+verb table, reading the case labels out of the handler's own `switch`.
+
+**Behaviour changes an operator will see.**
+
+- A `read-only`/`config-viewer`/`operator` class holder running `cli` is now
+  refused the RPCs its class does not hold, with a message naming the
+  `system login user <name> class <class>` stanza to change.
+- A local account that is **not** a `system login user` gets nothing.
+  Previously it got everything. "Not in the RBAC model" is a reason to deny,
+  not a reason to pick a default class.
+- **uid 0 is authorized unconditionally**, without consulting `/etc/passwd`
+  or the config (`authz.PrincipalForUID`). Root owns the config DB and the
+  daemon process, so a denial would be theater, and depending on a config
+  snapshot would refuse the operator on a box that has not finished booting.
+  The in-daemon rolling/kernel upgrade driver (`pkg/upgrade`, which dials
+  `127.0.0.1:50051`) runs as root and is unaffected.
+- The `unauthorized` class holds no permissions, so it now loses `cli`
+  entirely — including the startup `GetStatus` probe. That is what the class
+  means.
+
+**What is NOT gated.**
+
+- The **fabric listener** keeps its own, different chain: `#4107` PSK
+  authentication plus the `#4122` RPC allowlist. A cluster peer is a NODE,
+  not a login user — it has no uid on this host, so the principal gate would
+  deny every cross-node proxy. The two chains are built in separate
+  functions (`buildPrimaryServer` / `buildFabricServer`) and share no
+  interceptor; `TestPrimaryAndFabricChainsAreDistinct_5278` pins that
+  structurally and `TestFabricListenerDoesNotApplyThePrincipalGate_5278`
+  behaviourally. Every peer dial in the tree
+  (`pkg/grpcapi/server_diag.go`, `pkg/cli/peer.go`,
+  `pkg/daemon/daemon_ha_sync.go`) targets a peer's **fabric** address, never
+  a loopback one, so HA is untouched.
+- **In-process calls.** `pkg/api` invokes `ClearSessions`/`GetSessions`/
+  `GetSessionSummary` on the live `*grpcapi.Server` directly (`#3423`), with
+  no connection and therefore no interceptor. That path is gated by the REST
+  leg's own #5561 middleware before it gets here. The in-process console CLI
+  never dials this listener at all — its three `NewBpfrxServiceClient` call
+  sites all go through `dialPeer()` to the PEER's fabric address.
+- A **non-TCP** peer (a Unix socket, a `bufconn`) cannot be attributed by
+  `authz.LookupPeer` and is therefore denied. That is correct for a listener
+  that only ever binds TCP; a test serving over `bufconn` must inject
+  `Config.PeerLookupFn`.
 
 ### Fabric-listener supervision (#5047)
 
