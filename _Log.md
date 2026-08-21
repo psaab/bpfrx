@@ -1,3 +1,72 @@
+## 2026-08-20 — #5716 gate: independent re-gate at the round-7 head, master merged
+
+- **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 re-gate)
+- **Action**: The round-7 re-gate dispatched at `62c7938a2` never returned, so
+  this round IS that gate. No production line changed. Work done: (a) merged
+  `origin/master` (`1dd8db158`, carrying #6743's atomic `Daemon.dp` cell and
+  #6735) with a union resolve of `_Log.md` — heading count checked
+  structurally, base 1587 + ours 9 + theirs 19 = 1615, exact; (b) an
+  independent runtime pass over both deliverables; (c) two non-runtime doc
+  findings filed as #7040 and #7042 rather than folded, per the campaign bar.
+- **Runtime pass, ring guards**: walked each of the four guards' state machines
+  by hand across a terminal op, at both cursor origins. `libxdp` masks every
+  ring index (`xsk_ring_prod__fill_addr` / `__tx_desc` / `xsk_ring_cons__rx_desc`
+  / `__comp_addr` all index `[idx & ring->mask]`, via `csrc/xsk_bridge.c`), and
+  the ring size is a power of two, so a `wrapping_add` base cursor crossing
+  `u32::MAX` lands on the correct slot. Cursor arithmetic checked for
+  underflow: `peeked -= read_count` and `peeked - read_count` in `Drop` are
+  both safe because `read()` refuses at `read_count >= peeked`. Post-release
+  reads are kernel-safe: the remaining peeked entries sit in
+  `[*consumer, cached_prod)` after the release advances `*consumer`, and the
+  kernel produces at `>= cached_prod`.
+- **Runtime pass, live-path delta**: verified the single-use path is
+  bit-identical, per guard. For `WriteTx` / `WriteFill` / `ReadComplete` the
+  only new statement is a `base_idx` advance, and `base_idx` is read solely by
+  `insert()` / `read()` — never executed again on a `commit`/`release`-then-drop
+  caller. For `ReadRx` the sticky `released` flag also went away, but after a
+  release `read_count == 0`, so `Drop`'s branch is not taken under either
+  condition, and `Drop`'s `peeked - read_count` is unchanged because the
+  advance decrements `peeked` by exactly what it zeroes from `read_count`.
+  All ten production guard sites re-audited FIRSTHAND (`bind.rs:343,399`,
+  `tx/rings.rs:35,120`, `tx/transmit/mod.rs:314`, `tx/transmit/write.rs:25`,
+  `cos/queue_service/service.rs:118,296,483,650`, `poll_descriptor/mod.rs:140`
+  with its terminal op at `:5191-5192`) — every one is
+  create -> insert/read* -> commit/release -> drop in a single scope. The
+  "no current caller crosses a terminal op" claim holds.
+- **Runtime pass, zone-counter split**: enumerated every `ForwardingState`
+  publish site (`coordinator/mod.rs:715` default-reset on teardown,
+  `reconcile/snapshot.rs:610`, `snapshot_refresh.rs:380`); the two that publish
+  a BUILT state both call `commit_zone_counter_prune` at their commit point, so
+  no live apply path inherits the additive half without the destructive one at
+  this head. Confirmed nothing inside `build_fallible_forwarding_state` reads
+  `state.zone_counter_slot_map` / `zone_counter_store` (the split would
+  otherwise hand a later step the defaults). Confirmed the prune is idempotent
+  (`retain` over the configured set), so a retried apply cannot double-prune,
+  and a REJECTED BUILD now touches the store not at all — strictly better than
+  `origin/master`, which pruned it before every belt could reject. Checked the
+  one direction the deferral could regress — a removed zone's block surviving a
+  failed bring-up and later being inherited by a different zone reusing its id
+  — and it is unreachable: `config.StableZoneID(name)` derives the id from the
+  zone NAME (`pkg/dataplane/compiler.go:221`), so id reuse means name reuse,
+  which is the carry-forward semantics #3075 intends.
+- **Findings**: zero runtime defects. Two non-runtime doc findings filed:
+  #7040 (the gaps doc says the slot map creates a block "per configured zone"
+  where the code and its own three corrected code comments say slot-assigned
+  SUBSET) and #7042 (the gaps doc's belt enumeration is stale — the `#3402`
+  policy-only residue row added in r7 fits neither half of its stated
+  partition).
+- **Validation at the final head**: `go build ./...` rc 0; `go vet ./...` rc 0
+  (vet type-checks `_test.go` too, which is what would have caught the #6743
+  clean-merge-but-broken-build hazard a sibling lane hit); `go test -count=1`
+  test-binary compile over `pkg/daemon`, `pkg/dataplane`, `pkg/api`, `pkg/cli`,
+  `pkg/grpcapi` rc 0; `cargo test --release --bins --tests -- --test-threads=1`
+  (the `make test-rust` invocation) rc 0, 4413 passed, 0 failed, 2 ignored.
+  This branch touches no Go file and no compiled artifact, so no smoke
+  obligation is added; the batch cluster smoke for the Rust change is the
+  parent's.
+- **File(s)**: `_Log.md` (union resolve + this entry). No production file
+  changed in this round.
+
 ## 2026-08-20 — #5716 (10/10): two predicates that could not disagree, and the deletion sweep nobody had run
 
 - **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 review fold r7)
