@@ -950,6 +950,25 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**A leaf whose flat-set bracket list lands on a CHILD's Keys needs more than
+`firewallMatchValues` (#6694).** The SSOT helper reads `Keys[1:]` of the node
+plus `Keys[0]` of each child, which covers every leaf whose flat-set path
+absorbs the list onto the node itself. `interfaces fab0 fabric-options
+member-interfaces` does not: its schema node is a plain `children: nil` leaf
+with no `args` and no `multi`, so `SetPath` files the whole bracket list as ONE
+child carrying every name on that child's Keys — and `firewallMatchValues`
+would keep only the first. `fabricMemberValues` (`compiler_interfaces.go`)
+therefore descends the subtree and takes EVERY key. The same read is now driven
+through `FindChildren("member-interfaces")` rather than `FindChild`, because
+repeated hierarchical statements land as sibling nodes. Before the fold the
+hierarchical bracket spelling and the plain single-value spelling
+(`member-interfaces ge-0/0/7;`) both compiled to an EMPTY fabric member list —
+a chassis-cluster fabric that cannot form, silent at commit. Widening the read
+also ARMS the existing fab0/fab1 shared-member overlap check in
+`compiler_validate_warn.go`, which previously saw nothing to compare for
+bracket-authored fabrics; that check emits a warning, not a rejection, so no
+config that committed before is rejected now.
+
 **Widening a multi-value READ requires widening its VALIDATOR in the same
 change (#6659).** Adopting the accumulating reader at a site changes what a
 malformed value DOES. Before, a bad value in slot 2 was discarded at compile and
