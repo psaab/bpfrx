@@ -1,3 +1,168 @@
+## 2026-08-21 — #6211/#6876 drive round: all seven Codex findings re-verified at a moved head; zero attributable runtime defects
+
+- **Timestamp**: 2026-08-21 (fix/6211-synced-snat-rule-identity, PR #6876)
+- **Action**: Drive-lane merge-gate pass on a head that had moved 234 commits
+  behind master. Merged `origin/master` (NOT rebased — #6981 is stacked on
+  this branch), union-resolved `_Log.md` (3 hunks, `##` count 1588 + 1656 -
+  1587 = 1657 measured exactly, zero unique lines lost from either side), and
+  regenerated `docs/refactoring-audit-current.txt`, which this branch had never
+  refreshed after growing `nat/source.rs`.
+
+  RE-CLASSIFIED the seven Codex DO-NOT-MERGE findings against `origin/master`
+  rather than against the PR's own diff, because the F1 precedent showed at
+  least one had been mis-attributed. Result: F1, F2, F3, F4, F5, F6 and F7b all
+  reproduce IDENTICALLY on master and none of their production sites is in this
+  PR's file list — `nat/allocator.rs`, `ha/session_import.rs`,
+  `session_glue/commands/install.rs` and `reconcile/snapshot.rs` are untouched;
+  `allocator_key()` is untouched (its three appearances in the diff are all
+  comment text); and `reserve_synced_nat64_allocation` — F7b's selection site —
+  is untouched, the only nat64.rs production change being the release sweep.
+  F7a is the one fixed here. So the PR leaves no runtime defect of its own.
+
+  MUTATION MATRIX RE-MEASURED AT THIS HEAD rather than carried forward from
+  `6d881ebf8`: master's #6812 landed in `nat/source.rs` between the two, so the
+  tree the earlier matrix was measured against no longer exists. Four
+  discriminating cells, each required to redden a NAMED subset of the thirteen
+  `*6211*` tests (control: 13/13 green):
+
+    M1  disable pass 1 entirely            -> 8 RED / 5 GREEN (the 5 survivors
+                                              are the invariance + fallback
+                                              tests, which must stay green)
+    M6  drop the zone axis from
+        `matches_ignoring_scope`           -> 6 RED — and NOT the l4 / post-DNAT
+                                              cells, which that axis does not
+                                              feed
+    S1  restore the first-hit `break` in
+        the SNAT release sweep             -> exactly 2 RED, both named for the
+                                              sweep property
+    S2  restore the first-hit `break` in
+        the NAT64 release sweep            -> exactly 1 RED,
+                                              `nat64_6876_release_frees_every_prefix_holding_the_flow`
+
+  HOSTILE PASS, NAT + HA session-sync, entered expecting a runtime bug. The
+  new one hunted was the interaction with #6812, which master gained the same
+  day: `resolve_pool_allocators` leaves a budget-refused rule with
+  `pool_mode == true`, a fully expanded address vector and the DEFAULT
+  `PortAllocator`, and the standby's reservation loop gates on `pool_mode`
+  alone — so pass 1 can offer a reservation to a rule with no allocator behind
+  it, and because pass 1 returns on first success it would then SKIP the pass-2
+  fallback. It does not fire: `PortAllocator::default()` carries
+  `occupancy: Vec::new()` and `max_tracked_flows: 0`, so `reserve_flow` fails
+  closed on `addr_index >= occupancy.len()` and `reserve_address_only` fails
+  closed on `live_by_flow.len() >= max_tracked_flows`. Both verified by reading
+  the code, not inferred. The dependence is unbound, though — flipping that
+  default's `max_tracked_flows` to 1 reddens exactly ONE test in the whole
+  4477-test suite, and it is a #6812 status assertion — so it was FILED as
+  #7076 rather than folded (it is pre-existing on master's single-pass loop
+  too). Where the refused rule is the FIRST pool owner but not the active's
+  match, pass 1 is an improvement over master: master reserved on the dead
+  allocator, pass 1 skips to the rule the active matched.
+
+  Also attacked and held: wrong-rule reservation cannot leak (the sweep visits
+  every pool-mode rule and both `release_flow`/`rollback_flow` are guarded on
+  `live_by_flow[flow].translated == translated`, so it can neither over-free
+  nor under-free while the rule set is stable); cardinality is unchanged at one
+  reservation per call (both passes return on first success and pass 2 runs
+  only when pass 1 took none); pass 1's candidate set is a strict subset of
+  pass 2's and both take first-accepting, so no configuration can end with
+  FEWER reservations than master; a hostile peer's zone ids buy no new
+  authority, since the reservation still requires the rule's pool to OWN
+  `rewrite_src` and the peer already controls `rewrite_src` outright; and
+  `matches_ignoring_scope` is still `matches` minus `scope_matches` after the
+  merge — master's only addition inside `impl SourceNatRule` is
+  `allocator_key_for`, no new match axis. Confirmed firsthand that the active
+  stamps the SAME `from_zone_id`/`to_zone_id` into `SessionMetadata` that it
+  resolved its `from_zone`/`to_zone` NAMES from, and that
+  `handle_upsert_synced`'s #326 local re-resolution mutates only
+  `decision.resolution` and `owner_rg_id` — never the zone fields — so the pair
+  fed to pass 1 is the ACTIVE's.
+- **Validation**: `cargo build --release` rc 0;
+  `cargo test --manifest-path userspace-dp/Cargo.toml -- --test-threads=1`
+  rc 0 (4477 passed, 0 failed, 2 ignored); `go build ./...` rc 0;
+  `go vet ./...` rc 0; `make audit-check` rc 0;
+  `go test -count=1 ./pkg/refactoraudit/...` rc 0. A cluster smoke is OWED —
+  the diff moves `userspace-dp/` production code — and was NOT run by this
+  lane.
+- **File(s)**: _Log.md, docs/refactoring-audit-current.txt
+
+## 2026-08-13 — #6211/#6876 PR1 part 1: the NAT64 release kept the first-hit break this PR removed from source NAT
+
+- **Timestamp**: 2026-08-13 (fix/6211-synced-snat-rule-identity)
+- **Action**: Folded three of the four PR1 items from the Codex DO-NOT-MERGE
+  review. F2 (the per-worker reservation refcount) is NOT in this commit — it
+  is blocked on a design question reported to the lead (see below).
+
+  **F7a — the NAT64 release stopped at the first prefix that freed the flow.**
+  `release_nat64_allocation_with_mode` swept `nat64.prefixes` but `break`ed on
+  the first allocator that returned true. That is the SAME first-hit break this
+  PR REMOVED from `release_source_nat_allocation_with_mode`, left in place in
+  the parallel path — while the source-NAT comment explains at length why the
+  break is wrong and calls the resulting retention permanent. The PR fixed one
+  of two parallel paths and left the other contradicting its own reasoning.
+
+  Two prefixes come to hold ONE flow with no config edit, because the reserve
+  is occupancy-dependent: `reserve_synced_nat64_allocation` takes the first
+  prefix whose allocator ACCEPTS. A prefix whose port is transiently held by an
+  unrelated local flow is skipped and the reservation lands on a later prefix;
+  when the earlier one frees and the synced session refreshes (every HA
+  session-sync reconnect and every periodic re-upsert re-runs the reserve), the
+  same flow is held in both. One release then freed one and stranded the other
+  forever — nothing else removes a `live_by_flow` entry.
+
+  **The "at most one allocator" invariant was rewritten, not re-scoped.** The
+  sweep's stated justification was "Before #6211 the reserve was a pure function
+  of `rules`", scoping the invariant to an UNCHANGED rule set. That premise is
+  false on master, and master documents that it is false: its reserve loop has
+  the same per-rule fall-through and its own comment says a collision "leaves
+  the rule untouched and tries the next". Selection has ALWAYS been
+  occupancy-dependent, so a flow could already be held in two allocators with
+  the rule set untouched. The comment now says that, and the trailing
+  "(every pre-#6211 config)" parenthetical — which the rewrite falsified — was
+  corrected rather than left standing.
+
+  **Two stale citations** in the release-sweep rationale: the
+  `rollback_source_nat_allocation` sites are `:2644`/`:4912`, not `:2634`/`:4902`
+  (those are ordinary comment lines ten above). The other three were correct.
+
+- **File(s)**: `userspace-dp/src/nat64.rs`, `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat64_tests.rs`
+
+- **RED shown, not claimed.** `nat64_6876_release_frees_every_prefix_holding_the_flow`
+  reaches the two-prefix state through the production path (a squatting local
+  flow makes prefix A refuse, the reservation lands in B, the squatter retires,
+  the synced session refreshes into A) and then issues ONE release. Against the
+  unfixed code it fails as an ASSERTION, not a build break:
+
+      panicked at src/nat64_tests.rs:5567:5:
+      prefix B still owns the released flow's port: the NAT64 release stopped
+      at the FIRST prefix that freed it ...
+
+  Prefix A's assertion PASSES in the same run, so the guard discriminates
+  rather than merely failing. With the break removed: guard `ok`, and the full
+  suite is `CARGO_RC=0`, 4288 passed / 0 failed in the main suite (7 suites,
+  zero failures). `go build ./...` rc=0 (no Go changed). Exit codes captured
+  unpiped. No `cargo fmt` was run: the diff is three files, and the only
+  non-comment change is the removed `break`.
+
+  The observable is `reserve_nat64_pool_port`'s bool rather than "which port a
+  fresh allocation hands out" — a freed port goes on the recycle queue and is
+  not reissued immediately, which `nat64_4381_release_frees_the_port`'s
+  `assert_ne!` already pins.
+
+- **F2 (per-worker refcount) DEFERRED within PR1, reported to the lead.** The
+  agreed design was a holder-set bitmask keyed by `worker_id`, with the width
+  made structurally impossible to exceed. Verification found that assumption
+  false: `records: BTreeMap<u32, WorkerRuntimeRecord>` and
+  `coordinator/worker_manager.rs:70-79` documents that worker ids are SPARSE —
+  unregister handlers can remove the bindings carrying the low ids while a
+  high-id worker survives — so a sparse id >= 64 sets no bit with only two live
+  workers. There is no constant to assert against either: `MAX_WORKERS_SCRATCH
+  = 32` was removed and a test now exercises 40 slots. A bare counter is worse
+  still, and not only on worker exit: `reserve_flow` early-returns on a
+  same-tuple re-reserve, the path every refresh takes from the same worker, so
+  a counter incremented there inflates without bound and never drains.
+  Awaiting the lead's decision between bounding ids where they are assigned and
+  moving the peer-synced reservation to a single coordinator-owned take/release.
 ## 2026-08-21 — #5619 PR2 drive: merge master, repair a self-declaring premise
 
 - **Timestamp**: 2026-08-21 (fix/5619-ipsec-plaintext-warn, PR #6698)
@@ -79114,6 +79279,111 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 13:12
+- **Action**: #6211 — the HA STANDBY's synced source-NAT reservation picked its
+  rule by "first rule whose pool CONTAINS the translated address", while the
+  ACTIVE node picked by zone/policy match. Two source-NAT rules can carry the
+  SAME public pool address in SEPARATE allocators (the allocator is shared per
+  `SourceNatRule::allocator_key` = pool name + addresses + port range, so
+  distinct `pool_name`s with a common member address give one address two
+  independent `PortAllocator`s), and under that config the standby's
+  reservation landed in a DIFFERENT allocator than the active used for the same
+  session — so after a failover a new local flow matching the OTHER rule missed
+  the collision guard, reintroducing the reverse-path ambiguity the token
+  exists to prevent. Pre-existing: byte-identical to the shipped port-bearing
+  arm (#4388/#5336); #6210 mirrored it for the address-only case (#5338)
+  without introducing it. Fixed LOCALLY, with NO wire change: every input the
+  active's rule match consumes is already synced — the zone pair rides as
+  `ingress_zone_id`/`egress_zone_id` (`SessionSyncRequest` →
+  `SessionMetadata::ingress_zone`/`egress_zone`, legacy name strings as the
+  old-peer fallback; Go sender `buildSessionSyncRequestV4/V6` in
+  `manager_ha.go`) and the 5-tuple IS the session key. So rather than inventing
+  a second rule-identity scheme (the `PolicyCounterStore` stable-`rule_id`
+  precedent applies only if the identity must ride the wire, which it need
+  not), `reserve_synced_source_nat_allocation` re-runs the active's OWN
+  predicate: `SourceNatRule::matches` was split into shared `zone_matches` /
+  `l4_matches` / `address_matches` axes plus a new `matches_ignoring_scope`,
+  and the flow key it already built is byte-identical to the active's
+  SNAT-match tuple (original source, POST-DNAT destination, original ports —
+  `nat_match_flow.forward_key` in `poll_descriptor`). The #3096 interface /
+  routing-instance scope is the one axis the standby cannot confirm
+  (`NatScopeCtx` derives from LOCAL ifindex maps keyed on the ACTIVE's
+  ifindices), so it is treated as UNCONSTRAINED, not as a mismatch — rejecting
+  an interface-scoped rule would push the selection PAST the rule the active
+  used. Both passes share one `reserve_synced_on_first_pool_owner` body so the
+  reservation semantics cannot drift; the pre-#6211 first-pool-match remains an
+  unconditional pass-2 fallback (unresolvable zone pair, no confirmable match,
+  or every candidate refusing), so no config ends up with FEWER reservations
+  than before. Validation: a RED probe on the parent (`ad9591177`) proved the
+  divergence (reservation landed in the `dmz->wan` allocator for a `lan->wan`
+  session, cargo exit 101) before any fix; 9 new tests (2 fail-on-revert, 4
+  negative controls, 3 axis guards) + a 6-mutation matrix (disable-pass-1,
+  scope-checked `matches`, no-fallback, drop-l4-axis, pre-DNAT dst,
+  drop-zone-axis) proving each guard fires.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+  (`docs/refactoring-audit-current.txt` NOT regenerated: source.rs grows
+  1765 -> 1896 lines but stays in the same `[WATCH]` tier (1500-1999), and
+  the canary compares tier by path, so `go test ./pkg/refactoraudit/` passes
+  clean — verified, exit 0.)
+- **Timestamp**: 2026-08-05 21:05
+- **Action**: #6211 fold r1 — the rev6876 gate found a MAJOR that the PR itself
+  INTRODUCED, plus an unbound production call site. (1) LEAK: the two-pass
+  selection is not a pure function of `rules`, so a session re-upserted after
+  the selection outcome changes (zone delete/renumber -> `synced_zones` becomes
+  `None`; a rule-set `from zone`/`match` edit moves pass 1's candidate set)
+  reserves a SECOND time in a different, independent allocator —
+  `reserve_flow`'s idempotence is per-allocator and does not short-circuit —
+  and every live session re-upserts on HA session-sync reconnect and on a
+  post-delete-journal-overflow resync. `release_source_nat_allocation` stopped
+  at the FIRST allocator reporting released, stranding the other reservation
+  permanently; nothing reaps it (`live_by_flow` is removed only by
+  `release_flow`/`rollback_flow`/the stale-tuple replace, and
+  `gc_expired_chunked` sweeps LEASES not live flows), a config edit does not
+  rebuild the allocator (carryover keyed on `allocator_key()` alone), and the
+  orphan counts against `max_tracked_flows` to eventual `AllocatorExhausted`.
+  Fixed by dropping the first-hit `break` so release frees from EVERY pool-mode
+  rule; that cannot over-free because `release_flow`/`rollback_flow` return
+  false unless the stored translated tuple matches. The session_glue README had
+  asserted the OPPOSITE ("it locates the reservation wherever the reserve put
+  it") — true for one reservation, and this change is what made two possible;
+  corrected. (2) The only production call site was completely unbound: all nine
+  tests called `reserve_synced_source_nat_allocation` directly with a literal
+  `Some(("lan","wan"))`, so passing `None` at the call site or inverting
+  ingress/egress inside `synced_source_nat_zone_pair` both kept the suite green.
+  Added a `handle_upsert_synced` test driving the real entry point. Also bounded
+  the scope in code + docs (#5144 hard-rejects the motivating config at strict
+  commit — the live surface is pre-#5144 persisted configs and the tolerant
+  load / peer-sync path only), corrected the heatmap line count to 1896, and
+  used the unit-qualified `ge-0/0/1.0` the Go snapshot builder actually ships.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-05 22:40
+- **Action**: #6211 fold r2 — bind the delete-sync teardown END TO END. A
+  call-site deletion matrix over all four `release_source_nat_allocation`
+  call sites found TWO unbound: `handle_delete_synced` (exit 101 but ONLY the
+  known-flaky `shared_cos_lease` / `wg::engine` families failed, so not
+  attributable to the mutation — the full suite at head had zero failures) and
+  the GC reap in `worker/loop_body/mod.rs` (exit 0, zero failures). The r1 leak
+  test called `release_source_nat_allocation` DIRECTLY, binding the function and
+  leaving the wiring deletable. Added
+  `delete_synced_frees_both_allocators_end_to_end_6211`, which drives the whole
+  story through the REAL entry points: `handle_upsert_synced` twice (the second
+  against a snapshot that shares the allocators via the Arc-backed
+  `PortAllocator` clone but has lost `zone_id_to_name`, i.e. a zone
+  delete/renumber) to reach the two-allocator state, then
+  `handle_delete_synced`. Its `(1, 1)` precondition proves the leak state is
+  reachable through the real import path, not only via the direct call. The GC
+  reap gap is PRE-EXISTING and unrelated to #6211, so it was FILED as #6901
+  rather than folded in.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/tests.rs, _Log.md
 - **Timestamp**: 2026-08-05
   **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
   **[SUPERSEDED by the two entries below]**: the "fold to view-only" clause
@@ -85643,6 +85913,23 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
   pkg/daemon/reth_prepare_abort_recovery_5103_test.go, _Log.md
 - **Timestamp**: 2026-08-12
+- **Action**: #6211 review fold — correct two false claims in the source-NAT
+  release/rollback sweep comment. MINOR 1: the comment called the swept body
+  "a cold teardown path"; it is not. `rollback_source_nat_allocation` has five
+  non-test call sites, all on the packet path in
+  `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472, :2634, :4902), and
+  :2374 is the admission-refusal arm — the flood regime. The comment now
+  states the per-refused-flow cost (K allocator locks instead of
+  owning-index + 1) as a mechanism, explicitly noting no throughput
+  measurement was taken, and gives the correctness argument that justifies
+  paying it. MINOR 2: "at most one allocator could ever hold a given flow"
+  was stated unconditionally; it held only against an UNCHANGED `rules`,
+  because `parse_source_nat_rules_with_previous` carries allocators over
+  keyed on `allocator_key()` alone. The comment now scopes the invariant and
+  says #6211 does not create the hazard, it makes it reachable with no config
+  edit at all. Comments only — no behaviour change; `cargo build --release`
+  rc 0.
+- **File(s)**: userspace-dp/src/nat/source.rs, _Log.md
 - **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
   only in tests that injected their own budget), plus an S3 doc sentence.
   Every behavioural test in `tests_aggregate_budget.rs` drives
