@@ -3257,7 +3257,29 @@ rule `off` > `interface` > `pool`. For destination NAT the COMPILER resolves
 looks the pool up, and publishes `PoolAddress: ""`, so "every action is
 published" is false for a DNAT rule; the dataplane's `off` > `pool` branch then
 covers any entry that arrives carrying both. Either way all but one authored
-action is discarded, and the survivor is not chosen by configuration order.
+action is discarded, and *within that block* the survivor is decided by the
+fixed precedence rather than by the order the actions were written.
+
+Scope that to the block and no further (#7035). Across duplicate `then`
+CONTAINERS configuration order DOES decide: `compileNATSource` /
+`compileNATDestination` reset `rule.Then` at the top of every container, so the
+LAST one supplies the fields that get counted — swap
+`then { source-nat { off; pool P; } }` with
+`then { source-nat { interface; pool P; } }` and the surviving action changes
+from `interface` to `off` while the rejection text is identical. Both rows are
+pinned by `TestNATTerminalActionContainerOrderPicksSurvivor_7035`.
+
+And the gate counts RESOLVED FIELDS, not authored tokens, which bounds what it
+can see (#7034). The packed branch of those compilers reads a single key
+(`switch t.Keys[1]`), so a contradiction whose tokens sit on ONE node —
+`then { source-nat off pool P; }`, `then { source-nat pool P off; }`,
+`then { source-nat { pool P off; } }`, or the flat
+`set … then source-nat pool P off` — lowers to a single field, counts as one
+action and COMMITS under strict, with the dropped action silently gone. The
+same holds for `destination-nat`. That is the behaviour gap #7033; the
+rejection message names it rather than claiming the block-level case is
+covered. `TestNATTerminalActionPackedContradictionCommits_7034` pins each
+spelling, so closing #7033 has to update this text too.
 
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land

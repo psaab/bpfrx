@@ -342,6 +342,14 @@ func testStoreWithSetConfig(t *testing.T, lines []string) *configstore.Store {
 	return store
 }
 
+// TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady pins that in
+// no-reth-vrrp mode the RG takeover gate does NOT consult cluster sync
+// readiness. Together with the private-rg-election sibling below it is the
+// binding for cluster.Manager.SetSyncReady's doc comment, which used to assert
+// the opposite (#7102): the gate that read IsSyncReady() here was deleted in
+// 0781f7a60 and takeover readiness is now VIP ownership alone. #110 tracks
+// whether it should return — if it does, this test and its sibling red, which
+// is the point.
 func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
@@ -384,6 +392,78 @@ func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 	for _, reason := range state.ReadinessReasons {
 		if strings.Contains(reason, "session sync not ready") {
 			t.Fatalf("unexpected session sync gating reason: %v", state.ReadinessReasons)
+		}
+	}
+}
+
+// TestTakeoverReadinessForRG_PrivateRGElectionIgnoresClusterSyncReady_7102 is
+// the same property reached through the OTHER spelling of the branch.
+//
+// The sibling above authors `no-reth-vrrp`, and because private-rg-election is
+// the compiler default (compiler_system.go sets PrivateRGElection unless
+// `no-private-rg-election` is present) that fixture has BOTH flags set — so it
+// cannot tell you which one selected the no-RETH takeover path. The comment
+// this binds names private-rg-election specifically, so this fixture sets
+// private-rg-election with NoRethVRRP left FALSE: the branch at
+// daemon_ha.go (`cc.NoRethVRRP || cc.PrivateRGElection`) is then taken solely
+// on the private-rg-election term, and the RG still reaches Ready with session
+// sync NOT ready and no "session sync not ready" reason.
+func TestTakeoverReadinessForRG_PrivateRGElectionIgnoresClusterSyncReady_7102(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster authentication-key test-cluster-psk-7102",
+		"set chassis cluster node 0",
+		"set chassis cluster private-rg-election",
+		"set chassis cluster redundancy-group 0 node 0 priority 200",
+		"set interfaces reth0 redundant-ether-options redundancy-group 0",
+		"set interfaces reth0 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
+	})
+
+	cc := store.ActiveConfig().Chassis.Cluster
+	if cc == nil || !cc.PrivateRGElection {
+		t.Fatalf("fixture must compile to PrivateRGElection=true, got %+v", cc)
+	}
+	if cc.NoRethVRRP {
+		t.Fatal("fixture must leave NoRethVRRP false so private-rg-election is the " +
+			"only term selecting the no-RETH takeover path")
+	}
+
+	cm := cluster.NewManager(0, 1)
+	cm.UpdateConfig(cc)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cm.Start(ctx)
+
+	d := &Daemon{
+		rgStates:     make(map[int]*rgStateMachine),
+		cluster:      cm,
+		store:        store,
+		vrrpMgr:      vrrp.NewManager(),
+		linkByNameFn: mockLinkByName(map[string]*testLink{"ge-0-0-0": newTestLink("ge-0-0-0", true)}),
+	}
+
+	if d.cluster.IsSyncReady() {
+		t.Fatal("sync must start NOT ready for this test to mean anything")
+	}
+
+	d.reconcileRGState()
+
+	state := d.cluster.GroupState(0)
+	if state == nil {
+		t.Fatal("expected RG 0 state")
+	}
+	if !state.Ready {
+		t.Fatalf("RG 0 not ready with session sync not ready: %v — promotion in "+
+			"private-rg-election mode is NOT sync-gated at HEAD (the gate was deleted "+
+			"in 0781f7a60). If this now reds because #110 restored the gate, update "+
+			"cluster.SetSyncReady's doc comment, the Manager.syncReady field comment "+
+			"and the daemon_run_bringup.go note with it", state.ReadinessReasons)
+	}
+	for _, reason := range state.ReadinessReasons {
+		if strings.Contains(reason, "session sync not ready") {
+			t.Fatalf("takeover readiness reported a sync reason %q; the readiness "+
+				"conjunction has no sync term (#7102)", state.ReadinessReasons)
 		}
 	}
 }
