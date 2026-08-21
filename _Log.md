@@ -81139,3 +81139,74 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/egress_zone_identity_6722_test.go,
   pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/protocol.go,
   _Log.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6722 final gate at `451c0b8bc` — TWO measured egress-zone
+  REGRESSIONS against origin/master fixed, both silent transit blackholes under
+  `default-policy deny-all`, i.e. the same class as #6713 itself for interface
+  classes the round did not cover.
+  **R1 — a BARE `security-zone <z> interfaces <ifc>` reference stopped reaching
+  the interface's own-netdev units.** `buildInterfaceZoneMap` fans a bare
+  reference DOWN onto every configured unit — that is what the spelling means in
+  xpf, and the ingress half has always enforced it — but `authoredZoneRefs`
+  deliberately recorded only the literal reference. A unit that lands on its own
+  netdev (any VLAN unit; any non-zero unit) then has only its own row on that
+  ifindex, so rule 2 sees no authored reference naming it and rule 3 is skipped
+  precisely because a unit row IS on the ifindex. Measured through the real
+  builder: `ge-0/0/1 vlan-tagging` + `unit 100` + `security-zone lan interfaces
+  ge-0/0/1` gives ifindex 25 `Zone="lan"` and `EgressZone=""` — ingress answers
+  `lan`, egress answers the 0 sentinel, master answered `lan` both ways. Same on
+  a plain interface's `unit 1` and on a bare `interfaces { reth1; }` (the
+  spelling `docs/ha-cluster-userspace.conf` ships) once the reth carries a VLAN
+  unit. FIX: `authoredZoneRefs` mirrors buildInterfaceZoneMap's fan-DOWN exactly
+  (same unit set, same sorted-zone first-write-wins); the fan-UP stays excluded,
+  because that is the direction that manufactures a claim about a sibling
+  identity.
+  **R2 — two units of ONE interface on one netdev failed closed even when they
+  AGREE.** `TunnelNameMap` maps every unit of an interface-level tunnel onto the
+  tunnel device, so `gr-0/0/0`, `gr-0/0/0.0` and `gr-0/0/0.1` are one ifindex and
+  two egress identities; `egressIdentitiesCohere` refuses a same-owner pair
+  outright. Measured: both units in `sfmix` gives `EgressZone=""` where master
+  gives `sfmix`. FIX: `egressOneOwnerUnitsAgree` narrows the refusal to what it
+  is about — DISAGREEMENT — and only for a device no foreign interface claims:
+  every identity must belong to one configured interface AND every logical-unit
+  row on the ifindex must carry the same authored zone. An unauthored unit
+  contributes "" and still breaks unanimity, which is what preserves
+  `TestContestedNetdevOwnershipFailsClosed_6722/two-tunnel-units-on-one-device`
+  (`wg0.1` zoned beside a deliberately unzoned `wg0.0`).
+  **Oracle**: master's own answer, replayed from the rows this builder still
+  emits (`masterEgressZoneOfIfindex6722` — last row on the ifindex that passes
+  `populate_egress`'s `src_mac` gate, taking its own `Zone`), not a hand-picked
+  constant. Both cells FATAL if master resolved no zone either, so neither can
+  pass vacuously.
+  **Fail-on-revert, each hunk reverted ALONE against a sha256-verified pristine
+  tree, control rc=0 first**: drop the fan-down -> rc=1, all 3 cells of
+  `TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722` plus
+  `TestBareRefFanDownAgreesWithTheDerivedMap_6722`; drop the
+  `egressOneOwnerUnitsAgree` arm -> rc=1,
+  `TestOneOwnersAgreeingUnitsStillResolveOneZone_6722/agreeing`; drop the
+  single-OWNER test -> rc=1, 3 of 5 cells of
+  `TestContestedNetdevOwnershipFailsClosed_6722` plus three more existing cells.
+  One MEASURED SURVIVOR recorded rather than papered over: the `z != ""` test on
+  the agreed value cannot fire while the fan-down exists (it needs every unit row
+  unauthored, and the only spelling that authors a base row also authors its
+  units) — structural reason on the function.
+  **No shipped config moves.** Every `.conf` in `docs/` and `test/incus/` was run
+  through the real parser + strict `CompileConfig` + `buildInterfaceSnapshots`
+  and the per-ifindex egress zone compared against master's rule: 62 ifindex rows
+  across 9 configs, ZERO deltas at `451c0b8bc` and ZERO after these fixes, and no
+  config is rejected by the new `validateRethMemberStrict`. So the smoke at
+  `f7c8ce7bb` still describes these paths — verified separately that every
+  `f7c8ce7bb..451c0b8bc` non-test edit is comment-only by diffing
+  comment-stripped forms.
+  **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test -count=1
+  ./pkg/dataplane/userspace/... ./pkg/config/...` rc=0; cargo `--release --bins
+  --tests --no-fail-fast -- --test-threads=1` rc=0.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/egress_zone_master_parity_6722_test.go (new),
+  docs/userspace-dataplane-architecture.md,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs (comment corrections only),
+  _Log.md

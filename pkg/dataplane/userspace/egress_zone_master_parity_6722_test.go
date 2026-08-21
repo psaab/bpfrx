@@ -5,12 +5,12 @@ import (
 	"testing"
 )
 
-// #6722, FINAL-GATE regression guards. The cells below were MEASURED failing at
-// 451c0b8bc and are shapes on which that head lost an egress zone origin/master
-// resolved. Neither is a fail-open: they are silent transit blackholes under
-// `default-policy deny-all`, which is the same class of defect as #6713 itself —
-// a to-zone of 0 matches no rule, so no operator permit can apply and the drop
-// is attributed to the default policy.
+// #6722, FINAL-GATE regression guards. Both cells below were MEASURED failing
+// at 451c0b8bc and are the two shapes on which that head lost an egress zone
+// origin/master resolved. Neither is a fail-open: both are silent transit
+// blackholes under `default-policy deny-all`, which is the same class of defect
+// as #6713 itself — a to-zone of 0 matches no rule, so no operator permit can
+// apply and the drop is attributed to the default policy.
 //
 // The oracle both cells use is MASTER'S OWN ANSWER, not a hand-picked constant.
 // Before this PR, `populate_egress` sourced `EgressInterface::zone_id` from the
@@ -26,6 +26,23 @@ import (
 //	drop the bare-ref fan-down in authoredZoneRefs (zones.go)
 //	  -> RED: TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722, all 3 cells
 //	  -> GREEN: TestOneOwnersAgreeingUnitsStillResolveOneZone_6722 (dotted refs)
+//	drop the egressOneOwnerUnitsAgree arm (interfaces.go, rule 1)
+//	  -> RED: TestOneOwnersAgreeingUnitsStillResolveOneZone_6722/agreeing
+//	  -> GREEN: TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722
+//	let egressOneOwnerUnitsAgree ignore the OWNER test (accept identities of two
+//	  different interfaces)
+//	  -> RED: TestContestedNetdevOwnershipFailsClosed_6722 (3 of 5 cells),
+//	     TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722,
+//	     TestNilUnitSlotOnARethMemberIsNotAnL3Identity_6722,
+//	     TestBarePortOfADifferentRethDoesNotDeferToThisOne_6722
+//
+// One clause of egressOneOwnerUnitsAgree is a MEASURED SURVIVOR — the `z != ""`
+// test on the agreed value — and the structural reason it cannot fire is
+// recorded on the function itself rather than papered over with a fixture. The
+// `unitRefs` recording of "" for an unauthored unit row is NOT a survivor: it is
+// what makes /one-unit-unzoned and the E5 cell of
+// TestContestedNetdevOwnershipFailsClosed_6722 fail closed, since it takes the
+// set to size two.
 
 // masterEgressZoneOfIfindex6722 replays origin/master's egress-zone answer for
 // one ifindex from the rows this builder emits: the LAST row on that ifindex
@@ -183,6 +200,63 @@ func TestBareInterfaceZoneRefReachesItsOwnNetdevUnits_6722(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Q: two logical units of ONE interface on ONE netdev that AGREE on a zone
+// still resolve it; one that leaves a sibling unzoned still fails closed.
+//
+// `TunnelNameMap` maps every unit of an interface-level tunnel onto the tunnel
+// device, so `gr-0/0/0`, `gr-0/0/0.0` and `gr-0/0/0.1` are one ifindex and two
+// egress identities. Rule 1 refuses a multi-identity ifindex, which is right
+// when the identities disagree (that refusal is
+// TestContestedNetdevOwnershipFailsClosed_6722/two-tunnel-units-on-one-device,
+// a measured fail-open otherwise) and wrong when every claimant on the device
+// names the SAME zone — there is nothing to be ambiguous about, and refusing
+// costs the tunnel every transit flow it has.
+//
+// The two sub-cells differ in ONE line: whether unit 1 is put in the same zone
+// or left out of every zone. That is the discriminator, so neither cell can be
+// passing for a fixture reason.
+func TestOneOwnersAgreeingUnitsStillResolveOneZone_6722(t *testing.T) {
+	base := []string{
+		"set interfaces gr-0/0/0 tunnel source 10.0.61.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.0.61.2",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.255.1.1/30",
+		"set interfaces gr-0/0/0 unit 1 family inet address 10.255.2.1/30",
+		"set security zones security-zone sfmix interfaces gr-0/0/0.0",
+	}
+	links := map[string]int{"gr-0-0-0": 30}
+
+	t.Run("agreeing", func(t *testing.T) {
+		lines := append(append([]string{}, base...),
+			"set security zones security-zone sfmix interfaces gr-0/0/0.1")
+		_, snaps := buildSnapshotsFromSet6722(t, lines, links, nil)
+		assertNoEgressZoneLostVsMaster6722(t, snaps, 30,
+			"both units of the tunnel are in sfmix, so the device identifies "+
+				"exactly one zone and there is nothing to fail closed about")
+		assertEgressZone6722(t, snaps, 30, "sfmix",
+			"every identity on the netdev names sfmix")
+	})
+
+	t.Run("one-unit-unzoned", func(t *testing.T) {
+		// The control, and the fail-closed this must not trade away: the
+		// operator zoned unit 0 and left unit 1 out. The two units share one
+		// kernel device, so honouring unit 0's zone would adjudicate unit 1's
+		// transit under a policy written for its sibling.
+		_, snaps := buildSnapshotsFromSet6722(t, base, links, nil)
+		zoned := false
+		for _, s := range snaps {
+			if s.Ifindex == 30 && s.Zone != "" {
+				zoned = true
+			}
+		}
+		if !zoned {
+			t.Fatalf("precondition: no row on ifindex 30 carries a zone, so a " +
+				"\"\" answer proves nothing")
+		}
+		assertEgressZone6722(t, snaps, 30, "",
+			"gr-0/0/0.1 was left out of every zone and that omission is a statement")
+	})
 }
 
 // R: authoredZoneRefs' fan-down must not introduce a SECOND OPINION about a

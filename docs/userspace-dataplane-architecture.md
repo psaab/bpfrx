@@ -975,6 +975,17 @@ Scope of the fallback:
      legitimate for exactly one relation — a reth and the bare member port that
      names it (`egressRethMemberOf` / `egressMemberIsBarePort`) — and a fiction
      otherwise.
+
+     ONE narrowing (`egressOneOwnerUnitsAgree`): when every identity on the
+     ifindex belongs to the SAME configured interface — an interface-level
+     tunnel maps every unit onto the tunnel netdev, so `gr-0/0/0.0` and
+     `gr-0/0/0.1` are two identities on one device — the refusal applies only
+     when they DISAGREE. If every logical-unit row on the ifindex carries the
+     same authored zone there is nothing to be ambiguous about, and refusing
+     costs the tunnel every transit flow it has (`origin/master` resolved it). If
+     any unit row is unauthored the omission is a statement and the ifindex still
+     fails closed, which is what keeps `wg0.1` zoned beside a deliberately
+     unzoned `wg0.0` from adjudicating under its sibling's policy.
   2. **Authored → that zone.** Every literal binding, resolved to an ifindex by
      the row whose name it uses. Exactly one distinct zone wins; two or more is
      a real conflict about a real device and resolves to no zone.

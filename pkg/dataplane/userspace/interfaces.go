@@ -623,6 +623,7 @@ func stampEgressZones(cfg *config.Config, out []InterfaceSnapshot, idents []egre
 	type ifxState struct {
 		identities  map[string]string // identity -> owner
 		authored    map[string]bool
+		unitRefs    map[string]bool // authored zone of each UNIT row ("" = none)
 		hasUnitRow  bool
 		rowsByIndex []int
 	}
@@ -635,13 +636,22 @@ func stampEgressZones(cfg *config.Config, out []InterfaceSnapshot, idents []egre
 		}
 		st := states[ifx]
 		if st == nil {
-			st = &ifxState{identities: map[string]string{}, authored: map[string]bool{}}
+			st = &ifxState{
+				identities: map[string]string{},
+				authored:   map[string]bool{},
+				unitRefs:   map[string]bool{},
+			}
 			states[ifx] = st
 			order = append(order, ifx)
 		}
 		st.identities[idents[i].identity] = idents[i].owner
 		if idents[i].isUnit {
 			st.hasUnitRow = true
+			// Rule 1's escape hatch (see egressOneOwnerUnitsAgree): the
+			// authored zone of THIS unit row, "" when the operator authored
+			// none. "" is recorded on purpose — a unit left out of every zone
+			// is a statement, and it must break unanimity.
+			st.unitRefs[authored[out[i].Name]] = true
 		}
 		st.rowsByIndex = append(st.rowsByIndex, i)
 		// Rule 2's input: an authored reference NAMING THIS ROW. Keyed by the
@@ -656,7 +666,8 @@ func stampEgressZones(cfg *config.Config, out []InterfaceSnapshot, idents []egre
 		st := states[ifx]
 		zone := ""
 		switch {
-		case !egressIdentitiesCohere(cfg, st.identities):
+		case !egressIdentitiesCohere(cfg, st.identities) &&
+			!egressOneOwnerUnitsAgree(st.identities, st.unitRefs):
 			zone = ""
 		case len(st.authored) == 1:
 			for z := range st.authored {
@@ -671,6 +682,71 @@ func stampEgressZones(cfg *config.Config, out []InterfaceSnapshot, idents []egre
 			out[i].EgressZone = zone
 		}
 	}
+}
+
+// egressOneOwnerUnitsAgree is the one narrow case in which several egress
+// identities on ONE ifindex still identify a single zone (#6722).
+//
+// egressIdentitiesCohere refuses every multi-identity ifindex whose identities
+// belong to a single configured interface, on the ground that the operator
+// described two logical interfaces and the kernel gave them one device. That is
+// the right answer when the two disagree — a MEASURED fail-open otherwise, see
+// TestContestedNetdevOwnershipFailsClosed_6722/two-tunnel-units-on-one-device,
+// where `wg0.1` is zoned and `wg0.0` deliberately is not. It is the WRONG answer
+// when they agree: an interface-level tunnel maps EVERY unit onto the tunnel
+// netdev (`TunnelNameMap`), so `gr-0/0/0.0` and `gr-0/0/0.1` both in `sfmix` is
+// one device on which every claimant names the same zone. origin/master
+// resolved `sfmix` there; refusing it drops every transit flow out of the tunnel
+// to the default policy for no safety gained.
+//
+// So the refusal is narrowed to what it is actually about — DISAGREEMENT — and
+// only for a device no foreign interface claims:
+//
+//   - every identity on the ifindex must belong to the SAME configured
+//     interface. One owner means there is no independent claimant to defer to
+//     or to be misattributed; the reth/member relation and every cross-interface
+//     collision keep going through egressIdentitiesCohere unchanged.
+//   - every LOGICAL UNIT row on the ifindex must carry the SAME authored zone.
+//     An unauthored unit contributes "" and breaks unanimity, which is what
+//     preserves the fail-closed above.
+//
+// Base rows are not required to be authored: a bare `security-zone <z>
+// interfaces <ifc>` reference does author them (authoredZoneRefs fans it down),
+// but a per-unit reference legitimately leaves the base row unauthored, and rule
+// 2 then reads the units' agreed zone off their own rows.
+//
+// MEASURED SURVIVOR: the `z != ""` test on the single agreed value. Removing it
+// leaves the whole Go suite green, and the reason is structural rather than a
+// missing fixture. It fires only when EVERY unit row on the ifindex is
+// unauthored, i.e. `unitRefs == {""}`; the caller then reaches rule 2 with an
+// `authored` set that can only have been filled by a BASE row, and a bare
+// reference — the only spelling that authors a base row — is fanned down onto
+// every configured unit, so it would have authored those unit rows too. The set
+// is therefore empty, rule 2 does not fire, rule 3 is skipped because a unit row
+// IS on the ifindex, and the answer is "" either way. It is kept because it
+// states the rule the function is about ("the units agree on a ZONE", not "the
+// units agree"), and because the fan-down is what makes it unreachable — a
+// future change that narrows the fan-down would make this the difference between
+// honouring a base-only zone on units the operator declined to zone and refusing
+// it.
+func egressOneOwnerUnitsAgree(identities map[string]string, unitRefs map[string]bool) bool {
+	if len(identities) < 2 || len(unitRefs) != 1 {
+		return false
+	}
+	owner := ""
+	for _, o := range identities {
+		if owner == "" {
+			owner = o
+			continue
+		}
+		if o != owner {
+			return false
+		}
+	}
+	for z := range unitRefs {
+		return z != ""
+	}
+	return false
 }
 
 // egressIdentitiesCohere reports whether the egress identities sharing one

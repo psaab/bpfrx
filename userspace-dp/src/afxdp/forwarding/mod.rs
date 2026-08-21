@@ -90,8 +90,11 @@ pub(super) fn zone_pair_ids_for_flow_with_override(
         .or_else(|| forwarding.ifindex_to_zone_id.get(&ingress_ifindex).copied())
         .unwrap_or(0);
     // #6713: the to-zone comes from `ForwardingState::egress_zone_id`, which
-    // falls back to `ifindex_unambiguous_zone_id` when the interface has no
-    // `egress` row. NOT `ifindex_to_zone_id` — that map is the from-zone source
+    // reads `ifindex_unambiguous_zone_id` — the ONLY map it reads; the `egress`
+    // arm this comment once described was removed once `populate_egress` began
+    // sourcing `EgressInterface::zone_id` from that same ledger, so the two arms
+    // had become the same number (see that function's doc, "WHY THERE IS NO
+    // LONGER AN `egress` ARM"). NOT `ifindex_to_zone_id` — that map is the from-zone source
     // and carries the LAST zoned row on an ifindex plus the child->parent
     // propagation, so reading it as the to-zone hands an interface a zone the
     // operator never configured on it (#6722). An IPsec secure tunnel (xfrmi) NEVER has one — it is
