@@ -8,8 +8,10 @@
 // output filter, the non-routing-instance variants (filter PBR rejects),
 // the log-match diagnostic, and the routing-instance overrides. Also holds
 // the precheck `interface_filter_affects_route_lookup` because it is paired
-// with `evaluate_interface_filter_routing_instance_event_counted` at the
-// only external call site (afxdp/forwarding/mod.rs:929/:936).
+// with `evaluate_interface_filter_routing_instance_event_counted` at its
+// external call sites. #6927 r2: there is no longer a single one — the
+// pairing now occurs on the session-miss, fragment-association-HIT and
+// flowless-miss arms alike (poll_descriptor/mod.rs).
 
 use super::super::*;
 use super::matching::{term_matches, term_matches_v4, term_matches_v6};
@@ -1124,7 +1126,9 @@ pub(crate) fn evaluate_interface_output_filter_counted(
 /// Whether the per-interface input filter for the given family carries terms
 /// that override the route lookup with a routing-instance pointer. This is
 /// the precheck paired with `evaluate_interface_filter_routing_instance_event_counted`
-/// at the only external call site (afxdp/forwarding/mod.rs:929 + :936); it
+/// at each of its external call sites — the session-miss, fragment-association
+/// HIT and flowless-miss arms (poll_descriptor/mod.rs), no longer a single one
+/// (#6927 r2); it
 /// lives next to the routing-instance evaluator rather than in
 /// cache_sensitive.rs because it is not a cache-coherency predicate.
 pub(crate) fn interface_filter_affects_route_lookup(

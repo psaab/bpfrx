@@ -1,3 +1,1340 @@
+## 2026-08-06 — #5798 round 2: three things an association HIT was still inheriting
+
+- **Timestamp**: 2026-08-06 (fix/5798-nat64-frag-scope, PR #6835)
+- **Action**: Hostile re-gate at `a91628bdd` returned DO-NOT-MERGE. #5798
+  established the principle — an association hit inherits the STATEFUL decision
+  (zone permit, NAT, egress) and nothing else — and then applied it to exactly
+  one gate. Three more were still being inherited, and one "fail-closed" claim
+  turned out to be enforced by a test fixture rather than by any code.
+  - **(1) BLOCKING: a configured PBR drop was ACCEPTED, and its counter stayed
+    at zero.** The hit arm called only `evaluate_non_pbr_input_filter`. That
+    evaluator returns `FilterResult::default()` the moment a matching term
+    carries a non-empty `routing_instance` — BEFORE recording its counter and
+    BEFORE applying its action — and `FilterResult::default().action` is
+    `Accept` (`filter/mod.rs`). Meanwhile the PBR contract requires
+    `routing-instance` + `discard`/`reject` to yield `RouteOverride::Drop`
+    (`forwarding/pbr.rs`). So `from { is-fragment; } then { routing-instance
+    scrub; discard; count X; }` translated and forwarded the fragment with `X`
+    still zero: a reachable configured drop guard that could not fire, and no
+    counter to notice it by.
+    - FIX: the hit arm now also calls `ingress_route_table_override` — the same
+      call, same sink-less flowless contract, as the miss arm — and honours
+      `RouteOverride::Drop`. A non-drop routing-instance STEER is deliberately
+      NOT applied: the association exists to reuse the first fragment's egress
+      for the whole datagram, and re-steering only the non-first fragments would
+      split one datagram across two egresses and defeat reassembly. What is not
+      inherited is ENFORCEMENT, which is why the drop applies.
+    - COUNTER OWNERSHIP INVERTED. `routing_eval_follows` was `false` on this arm
+      because nothing followed; with `ingress_route_table_override` following it
+      must be `true`, or every matched term counts twice (the routing walk
+      counts every matched term unconditionally). MEASURED, not reasoned:
+      flipping it back reads 3 for a 2-fragment datagram, not 4 — only the
+      second fragment double-counts, since the first takes the miss arm whose
+      value is untouched. The existing #5798 counter test keeps its assertion
+      and gets a corrected rationale; its declared revert now catches the
+      double-count instead of the under-count.
+    - Why the existing test could not see it: its PBR term is scoped to UDP
+      while the fragments are TCP, so it never reaches the arm at all.
+  - **(2) The owner-RG guard could not fire on a hit.** After an RG transition
+    the old owner still hit a same-generation association, refreshed its
+    lifetime and returned the cached `ForwardCandidate`.
+    `enforce_ha_resolution_snapshot` — the guard that demotes an inactive owner
+    to `HAInactive` — sat only on the miss path's freshly-resolved decision.
+    Because every hit re-stamps the entry's deadline, the stale ownership was
+    indefinitely renewable. The hit arm now runs the guard on the cached
+    resolution; the shared HAInactive safety net already below it then
+    fabric-redirects, exactly as it does for a demoted session.
+  - **(3) A MISS was not guaranteed to drop, and the FIXTURE WAS HIDING IT.**
+    `nat64_consult_forward_fragment_assoc` returns `None` on a miss, which only
+    means "no association" — the packet then resolved like any other IPv6
+    destination and, with `::/0` in the FIB, FORWARDED: untranslated, still
+    addressed to the synthetic Pref64 destination, still carrying the client's
+    real IPv6 source. `nat64_frag_snapshot` DELETED the v6 default route, with a
+    comment justifying it as "the synthetic prefix is never v6-routable in
+    production". Every firewall has a default route. The subtraction removed the
+    only condition under which the #4617 claim could be tested, and four
+    existing #5798/#5146 tests passed because of it.
+    - FIX: a Pref64-destination gate on the flowless arm — a packet reaching
+      that arm whose destination lies inside a configured Pref64 is refused,
+      because a Pref64 is a translation namespace and nothing downstream can
+      deliver it as native IPv6. It reads the destination from the FRAME, not
+      from `l3_ctx`: `l3_ctx` is built from `meta.flow_{src,dst}_addr` and is
+      `None` for exactly the fragments the gate exists to stop (a first draft
+      gated on it and left the leak open on most of them — caught by the four
+      pre-existing tests staying red).
+    - The route deletion is gone and a `debug_assert` now refuses a fixture
+      without it. Restoring it turned those four tests from vacuous into
+      binding: removing the new gate reds all four plus the new one.
+  - **Docs corrected, all three previously FALSE.** `docs/feature-coverage.md`
+    said a miss was unconditionally fail-closed; `nat64.rs` called the HA state
+    "transient, sub-second" and "bounded" when the TTL is an IDLE timeout
+    refreshed on every hit (true of an idle entry, false of a busy one — and the
+    difference is what let an association outlive an RG transition); and
+    `frag_assoc.rs`'s #6122 comment asserted "its own consult already drops
+    fail-closed on a miss", which was not true of any code. Each now names what
+    enforces the claim rather than just restating it.
+  - **Revert probes**, each in a throwaway `git archive` extract restored by
+    re-extraction, each an ASSERTION failure, `cargo test` exit **101**:
+    remove the hit-arm `ingress_route_table_override` -> "a matching PBR
+    `routing-instance + discard` term must DROP the fragment on an association
+    hit" (left 1, right 0); remove `enforce_ha_resolution_snapshot` -> "after an
+    RG transition the old owner must NOT keep serving association hits" (left 1,
+    right 0); remove the Pref64 gate -> the new miss test plus
+    `nat64_cross_domain_nonfirst_fragment_does_not_inherit_5798`,
+    `nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`,
+    `nat64_third_fragment_from_another_domain_refused_after_a_same_domain_hit_5798`
+    and `nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146`, five red.
+  - **NOT folded, and disclosed rather than quietly skipped**: no cluster smoke.
+    The dataplane forwarding change (a new drop gate + two new enforcement calls
+    on the fragment path) is the kind that normally owes one; this lane was
+    instructed not to run cluster tooling, so it is owed before merge.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/frag_assoc.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #6835 fold r1 SALVAGE: independent re-verification
+
+- **Timestamp**: 2026-08-06 (fold/6835-r1 @ 19c905e6e, uncommitted work
+  recovered after the authoring lane died mid-verification)
+- **Action**: The r1 fold below was left UNCOMMITTED in its worktree when its
+  lane died. Recovered and independently re-verified rather than
+  re-implemented. **One real defect found in the recovered state**: a live
+  mutation probe was still applied to production —
+  `Nat64FragAssoc::lookup` opened with `if std::hint::black_box(true) { return
+  None; }`, forcing every association consult to MISS. The lane died between
+  applying that probe and restoring it, so committing the worktree as found
+  would have shipped a dataplane in which non-first fragments never inherit
+  (every one taking the #4617 fail-closed drop). Removed; a repo-wide
+  `black_box` grep now returns nothing. With it gone the `nat64.rs` diff is
+  comment-only. Also removed a stray double blank line in tests_fragment.rs
+  and corrected the `ingress_route_table_override` flowless-miss line cited
+  below (:3331 -> :3345, verified against the miss `else` arm that opens at
+  :3159).
+- **Completeness**: enumerated the fragment-association surface by grepping
+  the shape rather than trusting the diff's file list. Production has exactly
+  four key/install/consult sites — `nat64_install_forward_fragment_assoc`
+  (mod.rs:2566) and `nat_install_forward_fragment_assoc` (:2574), both keyed
+  by `nat64_first_fragment_key` under one `frag_ingress_authority` resolved at
+  :2561; `nat64_consult_forward_fragment_assoc` (:3068) and
+  `nat_consult_forward_fragment_assoc` (:3084), both keyed by
+  `nat64_nonfirst_fragment_key` under one resolution at :3063. All four carry
+  the authority. Both `Nat64FragKey { .. }` literals live inside the single
+  funnel `nat64_fragment_fields`, which REQUIRES `authority: FragAuthority`,
+  so an unscoped key is a compile error rather than a silent default. No
+  missed site.
+- **Validation** (all builds exit 0 before each mutation, so every RED is an
+  assertion and not a build break; files restored and `cmp`-verified
+  byte-identical):
+  - Baseline: build exit 0; full suite exit 101 with 4243 passed / 1 failed.
+  - The single failure is
+    `afxdp::ha::tests::current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`,
+    PROVEN pre-existing by running the full suite at the pristine base SHA
+    ad9591177 in a detached worktree: exit 101, 4233 passed / 1 failed, the
+    SAME test. It passes in isolation (exit 0) and is already fixed on
+    origin/master by e80db2eae (#6819), which post-dates this PR's base.
+    Net effect of the branch: +10 tests, all green.
+  - MUTATION 1 (the fold's only production code change): restore
+    `routing_eval_follows = true` on the association-hit filter call. RED,
+    assertion: "the association HIT is the SOLE counter owner for its fragment
+    and must count on the Accept exit — RED on revert
+    (`routing_eval_follows = true`) leaves this at 1, the count deferred to a
+    routing evaluator that never runs on a hit", left: 1, right: 2. Exactly
+    ONE test failed; the other five #5798 tests stayed GREEN (over-reach
+    guards).
+  - MUTATION 2 (negative control for the test-strength claim): force
+    `Nat64FragAssoc::lookup` to always miss. The two key-level guards fail at
+    their NEW positive controls (nat64_tests.rs:5629 and :5733). Swapping in
+    the HEAD version of `nat64_tests.rs` under the SAME mutation, both tests
+    PASS — proving the recovered positive controls are load-bearing and that
+    the two guards really were vacuous before this fold.
+- **File(s)**: `_Log.md`, `userspace-dp/src/nat64.rs`,
+  `userspace-dp/src/afxdp/tests_fragment.rs`
+
+## 2026-08-05 — #6835 fold r1: the association hit owns its filter counters
+
+- **Timestamp**: 2026-08-05 (fold/6835-r1 off fix/5798-nat64-frag-scope @
+  19c905e6e)
+- **Action**: Folded a MERGE-NEEDS-MINOR review. ONE runtime defect, four
+  test-strength gaps, six stale comments. **Runtime**: the association-hit
+  input-filter call passed `routing_eval_follows = true`. That flag picks the
+  #2620 counter-ownership policy and asserts "an Accept verdict here proceeds
+  to `ingress_route_table_override`, which counts these same terms" — true on
+  the session-MISS arm, FALSE on the hit arm, which returns the cached
+  decision and never reaches it (`ingress_route_table_override` has exactly
+  three call sites: the flow-backed miss at mod.rs:1328, the flowless miss at
+  :3345, and the PBR helper itself — none reachable from the hit arm). So for
+  any route-lookup-affecting input filter the hit path selected
+  `OnlyTerminalNonAccept` and deferred every accepted fragment's `then count`
+  to an evaluator that never ran: a datagram whose FIRST fragment counted
+  correctly had all its remaining fragments silently uncounted. The
+  session-HIT re-eval one function away
+  (`evaluate_dscp_sensitive_input_filter_on_session_hit`) already passes
+  `false` for exactly this reason. **Tests**: (a) two key-level guards passed
+  against a cache that never returns a hit — "no association" is the correct
+  answer often enough here that a broken lookup is indistinguishable from a
+  discriminating one — so both gained a positive control ordered BEFORE the
+  negative assertion plus a still-live check after; (b) the e2e cross-domain
+  test moved ifindex+VLAN+zone in one step, so a new test perturbs ONE
+  dimension per case and proves the single-dimension claim through the
+  production resolver rather than the meta literals (varying interface
+  without zone needed a second `lan` interface in the fixture; zone alone
+  cannot be moved through the production path — one logical ifindex maps to
+  one zone — so it stays pinned at the key level and the test says so);
+  (c) the hit-filter test only exercised the NAT64 consult, so it stayed
+  green if the shared `{ hit }` arm's filter were gated to NAT64 — a new
+  interface-SNAT case covers the #5689 same-family consult; (d) no test
+  submitted three fragments, so a new one runs first-A -> middle-A hit ->
+  last-B refused -> last-A replay. **Comments**: corrected, not deleted —
+  the `(family, src, dst, ip_id)` tuple in nat64.rs and both frag_assoc.rs
+  install sites predates #5798's widening; the Element-2 test claimed a
+  "consult reorder" that did not happen (the fix ADDS a hit-arm evaluation);
+  feature-coverage.md called the fragment ID 32-bit when IPv4 Identification
+  is 16; and `FragAuthority::ingress_zone` was described as the effective
+  post-override zone when it is deliberately the RAW pre-#6458-gate stamp.
+  Writing that last one honestly surfaced a bounded residual now stated in
+  the type's own doc: the owner-RG gate is runtime HA state, so
+  `build_generation` (a CONFIG fence) does not invalidate an association
+  across an RG transition — remaining fragments can inherit for up to the
+  ~2s TTL.
+- **Validation**: MUTATION-PROVEN (see the fold report). `cargo build` clean
+  before every mutation so every RED is an assertion, not a build break.
+  Files snapshotted byte-for-byte, restored verbatim, `touch`ed, and
+  md5-verified after each restore.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/frag_assoc.rs`,
+  `userspace-dp/src/nat64.rs`, `userspace-dp/src/nat64_tests.rs`,
+  `userspace-dp/src/afxdp/tests_nat64_tunnel.rs`,
+  `userspace-dp/src/afxdp/tests_fragment.rs`,
+  `docs/feature-coverage.md`, `_Log.md`
+
+## 2026-08-05 — #5798: authority-scope the shared fragment-association cache
+
+- **Timestamp**: 2026-08-05 (fix/5798-nat64-frag-scope)
+- **Action**: STEP-0 against current `origin/master` (ad9591177) confirmed the
+  defect LIVE and WIDER than the issue body says. `Nat64FragKey` was still
+  exactly `{addr_family, src, dst, ident}` (`userspace-dp/src/nat64.rs`), and
+  the consult still sat in an `else if let Some(hit) { hit } else
+  { <input filter / PBR / zone policy> }` arm, so a hit returned the first
+  fragment's whole `SessionDecision` before any enforcement. Three corrections
+  to the issue's framing: (1) PR #6095 merged 2026-07-18, so the bypass now
+  covers ordinary SNAT/DNAT/static-NAT/NPTv6, not just NAT64; (2) every issue
+  #5798 lists as adjacent (#5689, #5146, #5447, #5624, #5467, #2562) is CLOSED,
+  so #5798 is the sole owner; (3) required-fix #1's modularization is already
+  half-done — `poll_descriptor/frag_assoc.rs` exists (#6386). Implemented the
+  PLAN-READY Path A+ from `research/5798-frag-assoc-authority`, both elements:
+  **Element 1** puts the upper-layer protocol AND a new `FragAuthority`
+  (effective logical ingress ifindex + VLAN, effective ingress zone after
+  override, routing instance) in the key, resolved by one SSOT helper
+  (`frag_ingress_authority`) that mirrors `prerouting_ingress_scope` field for
+  field so "same key <=> same enforcement domain" holds by construction. The
+  protocol is read from L3 only (IPv4 byte 9 / the IPv6 Fragment Header's Next
+  Header) — both present in every fragment, so no payload byte is read as L4.
+  The authority uses the RAW pre-RG-gate fabric stamp on BOTH sides: the gated
+  value is a function of the resolution, which the consult cannot know because
+  resolving is exactly what a hit short-circuits. The shard index deliberately
+  stays coarse. **Element 2** runs the per-packet non-PBR input filter on the
+  HIT path, not just the miss branch — the authority key alone leaves a
+  same-domain `from is-fragment then discard` term bypassed. Screen is not
+  repeated (`stage_screen_check` already runs earlier for every packet).
+- **Validation**: four mutations, each with `cargo build` at 0 errors FIRST so
+  every RED is an assertion. M1 constant authority -> 3 key-level tests RED
+  (protocol test correctly stays green). M2 protocol dropped -> the 2 protocol
+  tests RED (authority tests correctly stay green) — each mutation hits only
+  its own dimension. M3 neutralized `frag_ingress_authority` in PRODUCTION ->
+  the end-to-end cross-domain test RED, proving the authority is threaded at
+  the real call sites and not merely present in the key type. M4 neutralized
+  the hit-arm filter drop -> the Element-2 test RED. Restored + `touch`ed after
+  each; GREEN every time. Two honest corrections made during the work: my first
+  end-to-end test asserted the cross-domain drop was the #4617
+  `nat64_frag_dropped` path — measurement showed it is not (this fixture removes
+  the inet6 routes, so a missed fragment dies on no-route), so the claim was
+  replaced with the differential property the test actually proves; and the
+  Element-2 test initially passed VACUOUSLY because the shared NAT64 fixture
+  leaves `flow_{src,dst}_addr` zeroed, which makes `l3_session_flow_from_meta`
+  return None and skips the filter block entirely — caught by probing rather
+  than by trusting the green. Full `cargo test -- --test-threads=1`: 4240
+  passed, 0 failed, exit 0. The concurrent run's single failure is #6819's
+  documented victim (`current_generation_install_and_delete_still_apply_on_
+  poisoned_shared_mutex`), which is red ~60% of runs on pristine ad9591177 and
+  passes here both in isolation and serialized. NOTE: `cargo fmt` reformats 320
+  files on this tree — master is NOT rustfmt-clean — so it must not be run
+  crate-wide; that churn was reverted and only the five touched files kept.
+- **File(s)**: `userspace-dp/src/nat64.rs`,
+  `userspace-dp/src/nat64_tests.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/frag_assoc.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+  `userspace-dp/src/afxdp/tests_nat64_tunnel.rs`,
+  `docs/feature-coverage.md`, `_Log.md`
+## 2026-08-20 — #5716 gate: independent re-gate at the round-7 head, master merged
+
+- **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 re-gate)
+- **Action**: The round-7 re-gate dispatched at `62c7938a2` never returned, so
+  this round IS that gate. No production line changed. Work done: (a) merged
+  `origin/master` (`1dd8db158`, carrying #6743's atomic `Daemon.dp` cell and
+  #6735) with a union resolve of `_Log.md` — heading count checked
+  structurally, base 1587 + ours 9 + theirs 19 = 1615, exact; (b) an
+  independent runtime pass over both deliverables; (c) two non-runtime doc
+  findings filed as #7040 and #7042 rather than folded, per the campaign bar.
+- **Runtime pass, ring guards**: walked each of the four guards' state machines
+  by hand across a terminal op, at both cursor origins. `libxdp` masks every
+  ring index (`xsk_ring_prod__fill_addr` / `__tx_desc` / `xsk_ring_cons__rx_desc`
+  / `__comp_addr` all index `[idx & ring->mask]`, via `csrc/xsk_bridge.c`), and
+  the ring size is a power of two, so a `wrapping_add` base cursor crossing
+  `u32::MAX` lands on the correct slot. Cursor arithmetic checked for
+  underflow: `peeked -= read_count` and `peeked - read_count` in `Drop` are
+  both safe because `read()` refuses at `read_count >= peeked`. Post-release
+  reads are kernel-safe: the remaining peeked entries sit in
+  `[*consumer, cached_prod)` after the release advances `*consumer`, and the
+  kernel produces at `>= cached_prod`.
+- **Runtime pass, live-path delta**: verified the single-use path is
+  bit-identical, per guard. For `WriteTx` / `WriteFill` / `ReadComplete` the
+  only new statement is a `base_idx` advance, and `base_idx` is read solely by
+  `insert()` / `read()` — never executed again on a `commit`/`release`-then-drop
+  caller. For `ReadRx` the sticky `released` flag also went away, but after a
+  release `read_count == 0`, so `Drop`'s branch is not taken under either
+  condition, and `Drop`'s `peeked - read_count` is unchanged because the
+  advance decrements `peeked` by exactly what it zeroes from `read_count`.
+  All ten production guard sites re-audited FIRSTHAND (`bind.rs:343,399`,
+  `tx/rings.rs:35,120`, `tx/transmit/mod.rs:314`, `tx/transmit/write.rs:25`,
+  `cos/queue_service/service.rs:118,296,483,650`, `poll_descriptor/mod.rs:140`
+  with its terminal op at `:5191-5192`) — every one is
+  create -> insert/read* -> commit/release -> drop in a single scope. The
+  "no current caller crosses a terminal op" claim holds.
+- **Runtime pass, zone-counter split**: enumerated every `ForwardingState`
+  publish site (`coordinator/mod.rs:715` default-reset on teardown,
+  `reconcile/snapshot.rs:610`, `snapshot_refresh.rs:380`); the two that publish
+  a BUILT state both call `commit_zone_counter_prune` at their commit point, so
+  no live apply path inherits the additive half without the destructive one at
+  this head. Confirmed nothing inside `build_fallible_forwarding_state` reads
+  `state.zone_counter_slot_map` / `zone_counter_store` (the split would
+  otherwise hand a later step the defaults). Confirmed the prune is idempotent
+  (`retain` over the configured set), so a retried apply cannot double-prune,
+  and a REJECTED BUILD now touches the store not at all — strictly better than
+  `origin/master`, which pruned it before every belt could reject. Checked the
+  one direction the deferral could regress — a removed zone's block surviving a
+  failed bring-up and later being inherited by a different zone reusing its id
+  — and it is unreachable: `config.StableZoneID(name)` derives the id from the
+  zone NAME (`pkg/dataplane/compiler.go:221`), so id reuse means name reuse,
+  which is the carry-forward semantics #3075 intends.
+- **Findings**: zero runtime defects. Two non-runtime doc findings filed:
+  #7040 (the gaps doc says the slot map creates a block "per configured zone"
+  where the code and its own three corrected code comments say slot-assigned
+  SUBSET) and #7042 (the gaps doc's belt enumeration is stale — the `#3402`
+  policy-only residue row added in r7 fits neither half of its stated
+  partition).
+- **Validation at the final head**: `go build ./...` rc 0; `go vet ./...` rc 0
+  (vet type-checks `_test.go` too, which is what would have caught the #6743
+  clean-merge-but-broken-build hazard a sibling lane hit); `go test -count=1`
+  test-binary compile over `pkg/daemon`, `pkg/dataplane`, `pkg/api`, `pkg/cli`,
+  `pkg/grpcapi` rc 0; `cargo test --release --bins --tests -- --test-threads=1`
+  (the `make test-rust` invocation) rc 0, 4413 passed, 0 failed, 2 ignored.
+  This branch touches no Go file and no compiled artifact, so no smoke
+  obligation is added; the batch cluster smoke for the Rust change is the
+  parent's.
+- **File(s)**: `_Log.md` (union resolve + this entry). No production file
+  changed in this round.
+
+## 2026-08-20 — #5716 (10/10): two predicates that could not disagree, and the deletion sweep nobody had run
+
+- **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 review fold r7)
+- **Action**: One test defect where two assertions shared an expression they had
+  no row to distinguish, one stale quantifier, and the deletion sweep this PR
+  had never been subjected to.
+
+  **M1 — two residue predicates, one expression, no row that could tell them
+  apart.** In `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`,
+  `rejected_above_the_nat_parse` and `rejected_above_the_policy_parse` were both
+  `label.starts_with("#3719")`. They name facts about two DIFFERENT builder call
+  sites — the policy parse (`forwarding_build/mod.rs:423`) and the source-NAT
+  parse (`:484`), about sixty lines apart. Every one of the four shared rejection
+  rows sits either above both parses (#3719) or below both (NPTv6 / filter /
+  CoS), so the shared expression was correct only by coincidence of the current
+  builder layout. A belt relocated into the region BETWEEN the two parses would
+  have made one of the two assertions silently wrong, with no row able to notice.
+
+  Fixed by adding the missing row rather than by re-deriving the predicates. The
+  derivation had no honest independent source: the only observable that
+  distinguishes "the policy parse ran" from "the NAT parse ran" IS the residue
+  the test asserts, so deriving each expectation from its own parse position
+  would have been circular. `#3402 UnresolvableZoneReference` supplies the
+  missing quadrant — it rejects INSIDE the policy parse's rule loop
+  (`policy.rs:2228`), downstream of the per-rule `rule_hit_counter` at
+  `policy.rs:2173` and upstream of the source-NAT parse, so it is the one row
+  with policy residue PRESENT and NAT residue ABSENT. It is chained into this
+  test locally rather than folded into `zone_counter_rejection_rows()`, whose
+  four rows are argued by SPAN over the fallible region; a fifth row chosen for
+  a different reason would blur that argument. The test now inserts its probe
+  rule at index 0 instead of assigning over `snapshot.policies`, so the row's
+  defect rule survives and stays after the probe.
+
+  Comparative mutation proof, both legs at this head, mutation = hoist the
+  source-NAT parse above the policy parse: with the PRE-r7 tests.rs the mutation
+  is INVISIBLE (rc 0, 4290 passed, 0 failed) — that is the measurement showing
+  the shared predicate was unfalsifiable. With the r7 tests.rs the same mutation
+  reds exactly one test, reported against the new row's label:
+  `left: [4242, 7777], right: [7777]`.
+
+  **N1 — a quantifier stale against an arity-general loop.** Four fixture
+  preconditions said "the TWO explicit releases/commits" while the loop they
+  guard iterates `EXPLICIT_BATCHES` generally; two in-loop comments carried the
+  same arity-2 phrasing, so six sites, not four. All six now state the
+  quantifier over `EXPLICIT_BATCHES` and name the arity-2 sum as the coupling.
+  Measured rather than asserted: growing `EXPLICIT_BATCHES` to arity 3 without
+  touching the sums reds all four Drop fixtures AT these four preconditions
+  (`xsk_ffi_tests.rs:803, 949, 1050, 1142`, left 7 right 4), so the message text
+  claims exactly what was observed.
+
+  **P4 — the deletion sweep, run for the first time on this PR.** Predicate for
+  the probed set: every line this diff ADDS, in a file containing production
+  code, that is a complete independently-deletable statement — excluding doc and
+  line comments (no build can see a comment), signatures / `use` / closing braces
+  / `Ok(state)` whose deletion is a parse or type error rather than a behaviour
+  probe, and the two `if` conditions the diff NARROWED (deleting a condition is a
+  revert, already covered by the r5/r6 grid). Under that predicate the population
+  is 13, and the sweep is a floor with that stated basis, not an unbounded claim.
+
+  Result: **13 of 13 RED, zero survivors.** `xsk_ffi.rs` — the three
+  `ReadRx::release` statements (986/987/988), the `WriteTx::commit` and
+  `WriteFill::commit` base_idx advances (1065/1132), the `ReadComplete::release`
+  advance (1188), and the `push_comp_for_test` helper (688-701). Deleting 988
+  (`self.read_count = 0`) does not merely fail an assertion: `Drop`'s
+  `self.peeked - self.read_count` then underflows and the test binary ABORTS
+  ("attempt to subtract with overflow" at `xsk_ffi.rs:1007`), taking dozens of
+  unrelated AF_XDP tests with it — which is why that cell reports no `failures:`
+  block. Deleting `push_comp_for_test` is a compile error (E0599 at
+  `xsk_ffi_tests.rs:603`). `forwarding_build/mod.rs` — the `attach_zone_counters`
+  call (259), the slot-map and store assignments (300/301) and the prune's
+  `reconcile` (355). Both commit-point call sites — `reconcile/mod.rs:417` and
+  `snapshot_refresh.rs:388` — red at
+  `committed_reconcile_prunes_zone_counters_...` and
+  `committed_refresh_prunes_zone_counters_for...` respectively.
+
+  **Harness.** `cargo test --tests --no-fail-fast -- --test-threads=1`. The
+  single-threaded flag is not a convenience: the default parallel harness WEDGED
+  this crate — 4347 tests passed, then three `afxdp::wg::engine` tests sat in
+  `futex_do_wait` with a measured utime/stime delta of exactly zero over 10 s,
+  killed after 953 s. That is the deadlock `wg/engine_tests.rs:20` documents as
+  #6157, and the same comment notes `make test-rust` already forces
+  `--test-threads=1` (`Makefile:114`). Every cell restored by content copy from
+  git-HEAD-derived pristine copies under `trap ... EXIT INT TERM`; the tree was
+  verified byte-clean against HEAD between phases.
+
+  **P3 is NOT addressed here** — analysed and reported to the review, not
+  implemented, because it would be new production mechanism at round 7.
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/xsk_ffi_tests.rs, _Log.md
+
+- **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 review fold r6b)
+- **Action**: One test defect that undercuts the r5 test I was most pleased
+  with, one design cost written down next to the code, and one measurement I
+  owed rather than argued.
+
+  **F4 — `live_policy` was a bare `default()`.** The r5 row
+  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`
+  exists precisely because proving the zone guarantee against EMPTY sibling
+  stores proves it for a configuration that never occurs. I then seeded only
+  `live_nat` and left `live_policy` unseeded and unasserted — so the policy
+  half of that row was still exactly the empty neighbour the row was written to
+  eliminate. The insight was right and I applied it to one of the two stores.
+
+  The chargeable part is the claim, not the omission:
+  `docs/userspace-dataplane-gaps.md` said residue in "`PolicyCounterStore` AND
+  `NatCounterStore`" is now asserted "so a later fix to #6995 reds it". True for
+  NAT; a policy-side fix reds nothing.
+
+  Fixed on both axes. The policy store is seeded through the PRODUCTION path —
+  a clean build, which get-or-creates the reserved default-policy counter —
+  rather than by poking the registry, so what it holds is what a running
+  coordinator's holds. The candidate snapshot now carries a `probe-rule` policy
+  so the residue is DISTINGUISHABLE from the seed the way `4242` is from
+  `7777`; without it the rejected build's policy residue equals the seed and no
+  assertion could tell a #6995 policy-side fix from the status quo. Both halves
+  are asserted belt-by-belt: the dup-zone belt sits above both parses and
+  leaves neither, the other three sit below and leave both.
+
+  This needed a new accessor. `PolicyCounterStore` had NO reader for its
+  registry — `PolicyState::counter_snapshots` reads the PUBLISHED state's
+  rules, not the store, which is exactly why #6995 records the policy residue
+  as invisible to operators. It was invisible to tests for the same reason.
+  `tracked_rule_ids_for_test` mirrors `NatCounterStore::snapshots()` in
+  emitting an entry per stored id regardless of value, which is the property
+  that lets a test distinguish "block never created" from "store empty".
+
+  **The design cost of the r5 split, written where the code is.** Moving the
+  prune out of the build traded a STRUCTURAL guarantee for a PER-CALL-SITE
+  OBLIGATION. While the prune rode inside the builder there was no way to add
+  an apply path that forgot it. Now a third apply path inherits the additive
+  half automatically and the prune only if its author remembers — nothing
+  enforces it, not a type, not a compile-time check, not a test that fails for
+  the mere existence of an unpruned path. Symptom if forgotten: a zone deleted
+  and later re-added RESURRECTS its pre-deletion totals, because its block was
+  never dropped and the store is keyed by stable zone id. Recorded on
+  `commit_zone_counter_prune` along with the fact that the two named tests bind
+  the sites that EXIST and cannot bind one that does not exist yet.
+
+  **The r5 cells re-measured under `--no-fail-fast`, because I was asked to
+  confirm and had only an argument.** Cargo's default fail-fast stops after a
+  failing target, so a cell's denominator can be silently truncated while the
+  cell still shows a correct red — and the r5 mutually-exclusive-cells result
+  is the load-bearing evidence for the whole zone-prune split. My reasoning
+  (two bin targets, the 60-test one green in every cell, all reds in the
+  second) turned out to be right, but it was reasoning:
+
+  | cell | r5, default fail-fast | re-measured `--no-fail-fast` | targets run |
+  |---|---|---|---|
+  | CONTROL | 4266 / 0 | 4266 / 0 | 2 |
+  | MUT-B2a | 4264 / 2 | 4264 / 2, same 2 REDs | 2 |
+  | MUT-B2b | 4265 / 1 | 4265 / 1, same RED | 2 |
+  | MUT-B2c | 4265 / 1 | 4265 / 1, same RED | 2 |
+  | CONTROL2 | — | 4266 / 0 | 2 |
+
+  `targets=2` in every cell is the part that settles it: both bin targets ran,
+  so nothing was truncated and the mutual exclusivity is a claim over the
+  complete population.
+
+- **File(s)**: `userspace-dp/src/policy.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
+## 2026-08-14 — #5716 (8/8): a guard that quantifies over the array, not the loop
+
+- **Timestamp**: 2026-08-14 (fix/5716-afxdp-api-hardening, PR #6832 review fold r6)
+- **Action**: Two guard-completeness holes, both in the XSK fixture layer, both
+  in guards this branch itself added, and both reproduced here before being
+  acted on. The production zone-prune split from r5 was verified clean by the
+  review and is untouched.
+
+  **F1 — "no constant survives" was false for the CANCEL half.** Hardcoding
+  ONLY the `Drop` cancel argument to `1` in all four impls left the suite at
+  **4266 passed, 0 failed** — bit-identical to baseline. The r5 `>= 3` floor
+  made the submit/release count distinct from the cancel count and left the
+  cancel count INVARIANT at 1 in every fixture and at both cursor origins.
+
+  The methodological error is worth naming exactly, because the measurement was
+  sound and the generalisation was not. Showing that constants `1` and `2` fail
+  at *different* assertions proves those two JOINT substitutions fail. It says
+  nothing about either POSITION independently. To generalise to "no constant
+  survives", every substituted position must VARY across the drive set — and
+  the cancel position never varied, so the evidence certified exactly the half
+  that was already working.
+
+  **F2 — `[1, 1, 3]` satisfies every r5 guard and restores vacuity.** It
+  compiles, passes 17/17, and greens all four Drop fixtures under a constant
+  `base_idx` advance that reds 4 of 4 at `[1, 3, 3]` (measured both ways). The
+  distinctness disjunction is satisfied via `B[1] != B[2]`, while the Drop
+  fixtures' explicit loop runs only `B[0]` and `B[1]` — both 1.
+
+  Same shape as re-keying a colliding key: the constraint MOVED rather than
+  closed, and a neighbouring triple took the dead one's place. `[0, 2, 2]` was
+  closed in r5; `[1, 1, 3]` walked into the gap. A fifth conjunct would move it
+  again.
+
+  **The fix is one rule, applied to both: a self-check must quantify over the
+  same values its fixture drives.** So the consts ARE the loops' iterands:
+
+  - `EXPLICIT_BATCHES` = the two batches each Drop fixture runs to an explicit
+    terminal op. The fixtures iterate it and guard (3) asserts over it, so
+    "the guard names something the loop never executes" is unstateable rather
+    than merely currently-false. Guard (3) is `EXPLICIT_BATCHES[0] !=
+    EXPLICIT_BATCHES[1]` — which `[1, 1, 3]` fails.
+  - `DROP_PARTIALS = [1, 2]` — each entry is one drive, so `Drop` runs at
+    `(terminal, cancel) = (p, B[2] - p)`. Two distinct partials make the
+    terminal count vary AND the cancel count vary INVERSELY, so whatever value
+    a constant picks is right for at most one drive. That is what binds the
+    cancel position, which no single pinned partial could.
+
+  The `REUSE_BATCHES[2] >= 3` floor is now DERIVED rather than asserted: two
+  distinct partials both inside `1..B[2]` cannot exist below 3. A floor that
+  follows from the property it serves cannot drift away from it — which is
+  exactly how the r5 floor came to be true-but-insufficient.
+
+  **F3 — the `previous = None` safety rationale described pre-r5 behaviour.**
+  The worst of the stale sites, because a rationale that describes the old
+  behaviour is what someone cites when undoing the fix. Rewritten at
+  `reconcile/snapshot.rs`: the conclusion survives but the REASON changed. The
+  prune-the-live-store harm is gone (the prune moved to
+  `commit_zone_counter_prune`, which validation never calls); what remains is
+  the ADDITIVE half — every validation build would leave a zero-valued block
+  per candidate-only zone in the live map, the #6995 residue class. So
+  `previous = None` stays load-bearing, and the comment now says explicitly:
+  do not relax it *on the grounds that the prune moved*.
+
+- **Mutation matrix.** Every cell over the whole bin suite with
+  `--no-fail-fast`, so "exactly these four red" is a claim over the complete
+  population rather than over whatever ran before cargo stopped.
+
+  | cell | mutation | before r6 | at this tree |
+  |---|---|---|---|
+  | CONTROL | none | — | rc=0, **4266 pass, 0 fail** |
+  | CANCEL-ONLY-1 | only the 4 cancel args := `1` | **4266 pass, 0 fail (SURVIVED)** | rc=101, 4262 pass, **4 fail** |
+  | CANCEL-ONLY-2 | only the 4 cancel args := `2` | not run | rc=101, 4262 pass, **4 fail** |
+  | TERMINAL-ONLY-1 | only the 4 terminal args := `1` | not run | rc=101, 4262 pass, **4 fail** |
+  | TERMINAL-ONLY-2 | only the 4 terminal args := `2` | not run | rc=101, 4262 pass, **4 fail** |
+  | BOTH-1 | both args := `1` | 4 fail | rc=101, 4262 pass, **4 fail** |
+  | TRIPLE-1-1-3 | `REUSE_BATCHES = [1, 1, 3]` | **compiled, 17/17, 0 of 4 Drop fixtures red under constant advance** | **E0080** on guard (3) |
+  | TRIPLE-0-2-2 | `REUSE_BATCHES = [0, 2, 2]` | E0080 (r5) | **E0080** ×2 |
+  | TRIPLE-1-3-2 | `REUSE_BATCHES = [1, 3, 2]` | E0080 (r5 floor) | **E0080** on the DERIVED partial-range guard |
+
+  The two rows that matter are the ones that changed state: CANCEL-ONLY-1 went
+  from a silent survivor to a 4-way red, and TRIPLE-1-1-3 from a clean compile
+  to a build failure. Terminal and cancel are now bound INDEPENDENTLY — each
+  position reds on its own substitution, which is the property r5 claimed and
+  did not have.
+
+- **Harness note.** The first matrix run was killed mid-cell (I was still
+  editing while it ran, which would have contaminated every later cell) and it
+  stranded the CANCEL-ONLY-1 mutation in `xsk_ffi.rs`. Caught immediately by a
+  CONTENT diff against a backup copy rather than by `git status` — the same
+  failure this file recorded one round ago, now with the better primitive:
+  back up and restore by content, and assert the files MATCH THE BACKUP before
+  every cell.
+
+- **File(s)**: `userspace-dp/src/xsk_ffi_tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`, `_Log.md`
+
+## 2026-08-13 — #5716 (7/7): the build succeeding is not the apply committing
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r5)
+- **Action**: One RUNTIME fix with a real operator-visible harm, one test-guard
+  fix that was a live hole in a guard this branch itself added, four Drop
+  fixtures made discriminating, and five prose corrections. Raised by the
+  hostile review at c2845c041 (MERGE-NEEDS-MAJOR). Every finding was
+  re-measured here before being acted on; the one that did not survive
+  re-measurement as framed is recorded below as a non-defect rather than
+  quietly fixed.
+
+  **B2 (BLOCKING, RUNTIME) — a rejected APPLY still destroyed a removed zone's
+  totals.** r2 moved the per-zone counter binding out of the fallible builder so
+  a snapshot rejected by an INTEGRITY belt could not touch the live store. That
+  holds. What it does not cover is the rest of the rejection surface: a build
+  can succeed and the apply still be rejected afterwards, by a worker-thread
+  spawn failure (#4952) or an incomplete queue bind (#5143). Reproduced with
+  live zones `{100,200}` carrying folded traffic, candidate `{100,300}`, and
+  `force_worker_spawn_fail = 1`:
+
+  ```
+  PROBE-B2 before rows=[100, 200] tracked=[100, 200]
+  PROBE-B2 reconcile is_err=true variant=WorkerSpawn
+  PROBE-B2 after  rows=[100]      tracked=[100, 300]
+  ```
+
+  Zone 200's cumulative totals are gone, for a configuration that never brought
+  up a single worker. The `WorkerSpawn` arm is what makes this operator-visible
+  rather than merely internal, and the two arms are NOT equivalent — documented
+  at `reconcile/bringup.rs:7-8`, `WorkerBindIncomplete` calls `stop_inner(false)`
+  (which defaults `coord.forwarding`, so the coordinator's own view goes empty)
+  while `WorkerSpawn` returns WITHOUT it, leaving the candidate state published.
+  So on the spawn arm `show security zones` keeps reporting, from a store whose
+  history for the removed zone has already been destroyed. Measured on the bind
+  arm too: `after rows=[] tracked=[]` for `coord.forwarding`, but an independent
+  handle on the original `Arc` shows the same `tracked=[100,300]`.
+
+  Fix: split the two mutations by WHEN they may run, not by where they sit.
+  `attach_zone_counters` is now ADDITIVE ONLY — it resolves the slot map's
+  per-zone `Arc`s and assigns the store. The destructive prune moved to
+  `forwarding_build::commit_zone_counter_prune`, which each apply path calls at
+  ITS OWN commit point: the reconcile only when `bring_up_workers` returned
+  `Ok`, the same-plan refresh at its `self.forwarding` swap (nothing fallible
+  follows it — the refresh keeps its live workers). Deferring costs nothing on
+  the success path and is exactly what preserves the totals for the retry or the
+  revert on the failure path. The additive get-or-create stays where it is: the
+  slot map must cache real handles at build time, so a candidate-only block for
+  a rejected apply is unavoidable — bounded at one per rejected apply, invisible
+  to the sparse snapshot, evicted by the next committed prune, and the same
+  class as the #6995 residue.
+
+  **B1 (raised BLOCKING) — REFUTED AS A DEFECT OF THIS PR, and measured.** The
+  report is that a rejected SNAT+NPTv6 apply leaves a candidate-only row in
+  `Coordinator::nat_rule_counters()`. It does, and the probe confirms it:
+
+  ```
+  PROBE-B1 err          = Nptv6UnparseableRule { rule_name: "bad-parse", ... }
+  PROBE-B1 nat_residue  = [4242]
+  PROBE-B1 zone_residue = [100, 200]
+  ```
+
+  But this is not new information at this head and it is not unscoped. It is
+  pre-existing, is already filed as **#6995** (which contains this same probe),
+  and is already documented in three places on this branch — the builder's doc
+  comment, `docs/userspace-dataplane-gaps.md:222`, and the PR body's "Scope,
+  stated exactly" paragraph, which states in as many words that the absolute
+  claim is NOT made. Folding a fix would be re-scoping #6995 into this PR.
+
+  What WAS missing is a binding. Both rejected-build tests passed a FRESH
+  `NatCounterStore` and `PolicyCounterStore` into every row, so the zone
+  guarantee was only ever proved against EMPTY siblings — a configuration that
+  never occurs in production, where all three arrive live off one coordinator.
+  Added `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`:
+  the same four belts, all three stores live and pre-populated, asserting the
+  zone half still holds AND asserting the #6995 boundary explicitly, so a later
+  fix to #6995 reds this test instead of leaving three stale documents behind.
+  The boundary assertion is row-dependent and that dependence is itself a bind:
+  the NAT parse sits mid-builder, so #3719 dup-zone (the FIRST fallible step)
+  rejects above it and leaves `[7777]` while the other three leave
+  `[4242, 7777]` — moving the NAT parse above `reject_duplicate_zone_ids` reds it.
+
+  **B3 — four Drop fixtures could not tell the intended values from a constant.**
+  r3 added three sibling Drop fixtures (plus r2's `ReadRx` one) to bind the half
+  of `Drop` that no fixture executed. With `REUSE_BATCHES = [1, 3, 2]` the final
+  batch is 2, so the drop always releases/submits exactly 1 AND cancels exactly
+  1. Neither cursor origin changes those values. Measured: with all four `Drop`
+  bodies' bridge arguments replaced by the literal `1`, **all 17 XSK tests
+  passed**. The preceding 1/3 operations were checked only as an aggregate 4,
+  which a constant 2 also satisfies.
+
+  Fixed on both axes. `REUSE_BATCHES` is now `[1, 3, 3]`, so the drop must
+  submit/release 2 and cancel 1 — distinct, so no single constant satisfies
+  both — and each explicit terminal op now has its own cursor checkpoint instead
+  of one aggregate. Comparative proof, same mutation, same crate, same
+  invocation:
+
+  | mutation | before r5 | after r5 |
+  |---|---|---|
+  | all four `Drop` bridge args := `1` | 17 pass, 0 fail | 13 pass, **4 fail** (`left: 5, right: 6`, terminal assertion) |
+  | all four `Drop` bridge args := `2` | not run | 13 pass, **4 fail** (`left: 5, right: 6`, cancel assertion) |
+
+  The two constants fail at DIFFERENT assertions, which is the point: 1 is
+  caught by the terminal count, 2 by the cancel.
+
+  **B4 — the self-check I added in r4 had a hole, and its stated reason was
+  false.** Two separate defects in one guard.
+
+  (a) `[0, 2, 2]` satisfies all three r4 self-checks — measured: it compiled and
+  all 17 tests passed — because a zero batch executes no terminal operation, so
+  the sizes actually driven are 2 and 2 and a constant-2 advance is invisible.
+  Distinct ARRAY ELEMENTS was the wrong property; the guard needs distinct
+  NON-ZERO executed sizes. Added the non-zero conjunct; `[0, 2, 2]` now fails to
+  compile.
+
+  (b) The `>= 2` guard's comment claimed `[1, 3, 1]` would make the drop
+  fixtures "pass VACUOUSLY". Checked, and false. With the guard present
+  `[1, 3, 1]` fails to compile (E0080 at `xsk_ffi_tests.rs:360`, as claimed);
+  with the guard ALSO removed it compiles and runs, and 13 pass while exactly
+  the four Drop fixtures FAIL — at their runtime `dropped_read > 0` fixture
+  precondition, before `Drop` executes. So the guard centralises that failure at
+  compile time where it cannot be forgotten on a fifth fixture; it is not what
+  prevents a silent vacuous pass. The floor is now `>= 3` (B3's distinctness
+  requirement, which is strictly stronger) with the rationale rewritten to what
+  was measured.
+
+  **Prose (five sites).** Each cite resolved against the tree before editing.
+  `xsk_ffi_tests.rs` batch-1 vacuity claim — false, rewritten (B4b).
+  "a drop that does either wrongly is observable" — was false at r3's sizes,
+  now true and annotated as true only because of the `>= 3` floor.
+  "every previous fixture commits its whole reservation … `reserved == 0` and
+  the body does nothing" — false in its second half and contradicting a correct
+  block 90 lines above: `commit()` zeroes `written` and subtracts it from
+  `reserved`, so `write_tx_two_inserts_append_not_overwrite` (reserves 4,
+  inserts 3) and `write_tx_single_insert_writes_base` (reserves 4, inserts 2)
+  drop with `written == 0` but `reserved` at 1 and 2, so the CANCEL half DOES
+  run there — unobserved, not unexecuted.
+  `forwarding_build/tests.rs` "the prune is now the last statement before
+  `Ok(state)`" — stale since r2 and now doubly so; rewritten with both moves.
+  "one block per configured zone" — imprecise at four sites
+  (`zone_counters.rs`, `forwarding_build/mod.rs`, `reconcile/snapshot.rs`,
+  `forwarding_build/tests.rs`): `ZoneCounterSlotMap::build` skips zone id 0 and
+  stops at `ZONE_COUNTER_ASSIGNABLE_SLOTS`, so it is a strict SUBSET. The one
+  site that already stated the exceptions was left alone.
+
+  `_Log.md`'s S5 sentence credited cells "M7/M8" that do not exist — the matrix
+  runs M1-M4 and the paragraph below it says the four further cells were only
+  QUEUED. Corrected in place: the indirect binding of S5 is left standing as an
+  assertion about the file's assertions, no longer credited to evidence that was
+  never produced.
+
+- **Mutation matrix.** Each cell run over the whole bin suite (minus the
+  three `wg::engine::engine_internal_tests` cells that hang under load), so
+  every RED is named against a live green denominator in the SAME invocation.
+
+  | cell | mutation | result |
+  |---|---|---|
+  | MUT-B2a | prune hoisted back into `attach_zone_counters` (pre-r5 shape) | 4264 pass, **2 fail**: `rejected_apply_does_not_prune_live_zone_counters_6832`, `accepted_build_defers_the_prune_to_the_commit_point` |
+  | MUT-B2b | reconcile commit-point call DELETED | 4265 pass, **1 fail**: `committed_reconcile_prunes_zone_counters_for_removed_zones_6832` |
+  | MUT-B2c | refresh commit-point call DELETED | 4265 pass, **1 fail**: `committed_refresh_prunes_zone_counters_for_removed_zones_6832` |
+  | MUT-B3 | four `Drop` bridge args := `1` | 13 pass, **4 fail** (was 17/17 GREEN before this round) |
+  | MUT-B3b | four `Drop` bridge args := `2` | 13 pass, **4 fail** |
+  | MUT-B4a | `REUSE_BATCHES = [0, 2, 2]` | **E0080** on the new non-zero conjunct (compiled + 17/17 green before) |
+  | MUT-B4b | `REUSE_BATCHES = [1, 3, 1]`, `>= 2` guard removed | 13 pass, **4 fail** at the fixture precondition — NOT a vacuous pass |
+
+  The three B2 cells are mutually exclusive: no cell reds another cell's test,
+  so each production line is bound by exactly one assertion and the reconcile
+  and refresh call sites are bound separately. `force_worker_healthy_stub`
+  (#6242) is what makes the committed-reconcile direction reachable at all in
+  process — without it every unit reconcile fails at `WorkerBindIncomplete`
+  (UMEM create is EPERM unprivileged) and the positive direction would be
+  untestable.
+
+- **Control**: `cargo test --bins -- --skip wg::engine::engine_internal_tests`
+  → **4266 passed; 0 failed; 2 ignored; 24 filtered out**, FULL_RC=0. No Go file
+  is touched by this round. `cargo fmt --check` reports diffs for 2510 files
+  across the crate including untouched ones — a pre-existing repo-wide
+  toolchain mismatch, and none of the diff hunks land on lines added here
+  (checked).
+
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/mod.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
+
+## 2026-08-13 — #5716 (6/6): the round about overshooting corrections overshot one
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r4)
+- **Action**: No production behaviour changes. Six claim corrections, one
+  compile-time fixture guard, and a full PR-body replacement, all raised by the
+  hostile review at 5fda3744d (verdict MERGE-NEEDS-MINOR, zero blocking, 14
+  measured mutation cells). Every item was re-verified against the tree at
+  5fda3744d before being edited; the one that was already right is called out
+  as such below rather than edited to match the report.
+
+  **F1 — r3's correction overshot, in the round whose subject was corrections
+  that overshoot.** r3 replaced a false "EVERY fallible belt" claim with a span
+  argument, and in doing so asserted at three sites that the dup-zone row
+  "REJECTS before ANY relocated block could run, so it stays GREEN under a
+  relocation — the CoS row is what reds". MEASURED AND REFUTED. Relocating
+  `attach_zone_counters` to the TOP of `build_fallible_forwarding_state`, above
+  the first `?`, reds BOTH zone tests ON THE DUP-ZONE ROW:
+
+  | test | reported row | observed |
+  |---|---|---|
+  | `rejected_build_does_not_prune_live_zone_counters` | `#3719 duplicate zone id (first fallible step)` | `left: 1, right: 2` |
+  | `rejected_build_does_not_create_zone_blocks_in_the_live_store` | same row | `left: [100, 300], right: [100, 200]` |
+
+  Both are assertion failures, not build breaks (cargo exit 101; the second was
+  run under its own name because the first pass's `zone_counter` filter does
+  not match it). The row is green only for relocations strictly BELOW it —
+  which are precisely the ones the CoS row catches. So the r3 sentence
+  UNDERSTATES what the dup-zone row buys: it is not a passive marker of where
+  the fallible region begins, it reds on a hoist above it.
+
+  Corrected at the two in-tree sites that carried the clause verbatim — the
+  dup_zone inline comment in `forwarding_build/tests.rs` and
+  `docs/userspace-dataplane-gaps.md` — plus the builder doc comment in
+  `forwarding_build/mod.rs`. The third site named in the report is the r3
+  COMMIT MESSAGE, which is immutable; its in-tree copy, the r3 `_Log.md` entry
+  below, turned out NOT to carry the false clause (it says only that the row
+  makes "the last belt" a checkable bracket, which is true), so that entry
+  gains the reds-under-hoist fact rather than a correction.
+
+  Sub-item, folded rather than left: the span argument is a STRAIGHT-LINE
+  position argument, and it was universally quantified over "positions". A
+  relocation INTO a conditionally-evaluated sub-expression that a given row's
+  snapshot never enters — the `session_opening_overrides` `filter_map` closure,
+  which runs only for a snapshot configuring a screen with a non-zero
+  `syn-flood timeout` — would escape that row. Contrived for a refactor of this
+  shape, but not excluded by the argument. The quantifier is now narrowed to
+  straight-line statement positions at all three sites, with the escape stated
+  in the builder doc comment rather than assumed away.
+
+  **F2 — a claim this PR introduced contradicted its own sibling comment.**
+  `coordinator/reconcile/snapshot.rs`, rewritten by this PR, said
+  `attach_zone_counters` "ends with `state.zone_counter_store.reconcile(&configured)`
+  ... AFTER get-or-creating a block per configured zone in that same map". The
+  real order is the reverse — `reconcile(&configured)` first, then
+  `ZoneCounterSlotMap::build` get-or-creates, then the assignment — which is
+  what `attach_zone_counters`'s own doc says ("prune-then-resolve rather than
+  the reverse ... pruning first means the map never transiently holds the
+  union"). Two comments in one PR gave opposite orders. Only the order sentence
+  is changed; the paragraph's CONCLUSION (`previous = None` stays load-bearing)
+  is correct, unaffected, and untouched.
+
+  **F3 — citation rot inside the shipping commit.** The r3 `_Log.md` entry
+  cited the ten `?` sites as `mod.rs` 288, 293, 305, 306, 317, 321, 330, 423,
+  473, 478 with the body running to 683. Those are the PARENT commit's numbers:
+  the same commit's doc-comment edit pushed the function down 21 lines, so at
+  5fda3744d they were 309, 314, 326, 327, 338, 342, 351, 444, 494, 499 with the
+  body ending at 704. Re-derived at head rather than by adding 21, and the
+  count re-verified: still exactly TEN try-operator sites, first
+  `reject_duplicate_zone_ids`, last `build_cos_state`, nothing fallible after
+  it. The entry now cites the belts BY NAME, because a name does not rot;
+  the numbers follow as a convenience, at the r4 tree (323, 328, 340, 341, 352,
+  356, 365, 458, 508, 513; body ends 718).
+
+  **F4 — a false absolute in the sentence whose stated job was precision.**
+  "the cancel half DOES run in `write_tx_two_inserts_append_not_overwrite` and
+  `write_tx_single_insert_writes_base` ... but neither asserts anything after
+  the guard drops" is literally false: the first has three `assert_eq!` after
+  the guard's scope closes, the second two, and the `write_fill` twins the
+  same. The TRUE claim is that none of them asserts anything that can OBSERVE
+  the drop — every post-drop assertion reads ring slot contents written during
+  `insert`, none reads `cached_prod` or `*producer`. Measured, not inferred:
+  with BOTH producer cancel halves severed
+  (`WriteTx::drop` and `WriteFill::drop`), all four fixtures RAN and stayed
+  GREEN — `test result: ok. 4 passed; 0 failed; ...; 4283 filtered out`, the
+  count asserted so a zero-test false green cannot be mistaken for a pass.
+  Reworded at the source comment and in the r3 `_Log.md` entry below.
+
+  **F5 — a vacuity hazard in r3's own fixtures.** The three
+  terminal-op-then-`Drop` fixtures compute `REUSE_BATCHES[2] - 1`, which needs
+  `REUSE_BATCHES[2] >= 2`, and NOTHING pinned it: the two `const _` self-checks
+  pin only "at least two distinct sizes" and "total <= capacity", both of which
+  `[1, 3, 1]` satisfies. Under `[1, 3, 1]`, `read_complete_drop_*` and
+  `write_tx_drop_*` fail loudly on their runtime `assert!(dropped > 0 && ...)`,
+  but `write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit` OMITS
+  that assert and would pass VACUOUSLY — a drop with nothing to submit. Under
+  `[_, _, 0]` the subtraction underflows. Fixed with a third `const _` self-check
+  (`REUSE_BATCHES[2] >= 2`) rather than a per-fixture runtime assert: it fails
+  at COMPILE time, covers all three fixtures at once, and cannot be forgotten
+  on a fourth. The fill twin also gains the runtime assert its two siblings
+  carry — redundant under the const, but the ASYMMETRY is what let the hole
+  exist, and a future reader should not have to decide whether its absence
+  meant something.
+
+  **F6 — the PR body described a shape r2 replaced.** It still said "the prune
+  is now the last statement before `Ok(state)`", which is exactly what r2
+  rejected as insufficient; its red-on-revert table was the r1 six-cell matrix
+  with nothing from r2/r3; the docs paragraph described a "prune-ordering
+  contract" the gaps doc no longer states; and the "the wrap-origin loop needs
+  one more serial release pass before merge" caveat read as outstanding though
+  r3 discharged it. All r2/r3 evidence lived only in PR comments. The body is
+  REPLACED, not appended to — the body is what a merger reads.
+
+  **F7 — nit.** A ragged mid-sentence wrap in the builder doc ("The / first row
+  is what / makes ..."), fixed as part of the F1 rewrite of that paragraph.
+
+- **Validation**: full `cargo test --release` and full `go test ./...`, each
+  with a completion sentinel echoed after the suite — a killed run whose output
+  still holds earlier "test result: ok" blocks reads as success to a naive
+  grep, which is the trap the reviewer hit. Results in the round's commit
+  message. Mutation cells run in an isolated `/dev/shm` worktree; the review
+  tree was never mutated, and the mutation tree was restored to clean after
+  each cell. No shim object changed, so no cluster smoke is owed.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `docs/userspace-dataplane-gaps.md`,
+  `_Log.md`
+
+## 2026-08-13 — #5716 (5/5): three false claims, and the sibling guards the r2 Drop fix skipped
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r3)
+- **Action**: No production behaviour changes this round. Three claim
+  corrections and one coverage sweep, all raised by the hostile review at
+  256416f7f (verdict MERGE-NEEDS-MINOR, zero blocking).
+
+  **(1) "having touched NO live shared state" is false.**
+  `build_fallible_forwarding_state`'s doc comment claimed a rejected build
+  touches no live shared state. It touches two other `Arc`-shared stores
+  before the last three belts can reject: `PolicyCounterStore::rule_hit_counter`
+  GET-OR-CREATES a block per policy rule plus one for the reserved
+  default-policy id (store at `policy.rs:730`, callers at `policy.rs:1858`
+  and `:2158`, reached from `mod.rs`'s `parse_policy_state_with_counters`),
+  and `NatCounterStore::rule_counter` GET-OR-INSERTS one per NAT rule
+  (`nat/mod.rs:261`, callers in `static_nat.rs` and its siblings). Both run
+  ahead of the NPTv6 / filter / CoS `?`s, so a rejected build leaves
+  candidate-only rows in each. The comment is now scoped to the ZONE-counter
+  store, which is what #6832 actually fixed, and names the residue explicitly.
+  Pre-existing, not introduced or fixed here; filed as **#6995** and
+  cross-referenced from the comment and from `docs/userspace-dataplane-gaps.md`.
+
+  **(2) "EVERY fallible belt" is false in four places, and the guard is still
+  sound.** `build_fallible_forwarding_state` has TEN `?` sites. Cited by NAME
+  because line numbers rot and this citation did — see the r4 entry's F3 — in
+  source order: `reject_duplicate_zone_ids`, `populate_tunnel_endpoints`,
+  `populate_interfaces`, `populate_egress`, `populate_routes`,
+  `populate_neighbors`, `parse_policy_state_with_counters`,
+  `Nptv6State::try_from_snapshots`, `parse_filter_state_with_three_color_preserving`,
+  `build_cos_state`. At the r4 tree those are `mod.rs` 323, 328, 340, 341, 352,
+  356, 365, 458, 508, 513, with the body ending at 718; the names are the
+  authoritative citation, the numbers are a convenience valid as of this round.
+  The rejection table drives FOUR — `reject_duplicate_zone_ids`, NPTv6, filter
+  state, CoS. The POSITIONAL claims around it are true:
+  `reject_duplicate_zone_ids` is the first `?`, `build_cos_state` the last, and
+  the rest of the body carries no `?` after it — so this is a false claim that
+  does NOT imply a coverage hole, and no belt rows were added. What the four
+  rows actually buy, stated exactly in each of the corrected sites: every
+  straight-line statement position `attach_zone_counters` could be relocated to
+  and still be a DEFECT is a position with a `?` below it, and every such
+  position lies above the LAST belt — so the CoS row observes the relocation
+  wherever it lands. That is the row that binds the ordering. The dup-zone row
+  makes "the last belt" a checkable bracket rather than an arbitrary pick — and
+  it reds under a hoist ABOVE it, which the sentence this entry originally
+  carried denied; corrected in r4 F1. Six more rows would only widen the
+  second, weaker class (one BELT moved below the binding, caught by that belt's
+  own row and no other).
+  Corrected at `forwarding_build/mod.rs`, `forwarding_build/tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, and in the r2 `_Log.md` entry below,
+  which carried the same sentence.
+
+  **(3) The r2 Drop fix closed one guard and left three siblings standing.**
+  r2 found `ReadRx`'s `read -> release -> read -> drop` shape unbound and bound
+  it, without asking whether `WriteTx`, `WriteFill` or `ReadComplete` had the
+  same hole. They did. Sweep predicate: "a guard shape that exists for one ring
+  guard but not its siblings", over all four guards. One row came back
+  asymmetric, and it is that one — see the grid below. Three new fixtures close
+  it, one per remaining guard, each the same shape as the r2 `ReadRx` one: run
+  the first two batches to the terminal op explicitly, leave the third PARTLY
+  done, let `Drop` finish. That gives `Drop` both halves of its job at once, so
+  a wrong submit/release AND a wrong cancel are each observable.
+
+  Stated precisely, because "the Drop body never ran" would itself be a false
+  absolute: the submit/release half (`if self.written > 0` /
+  `if self.read_count > 0`) never executed at all for those three guards, since
+  every pre-existing fixture commits or releases everything before the guard
+  leaves scope. The cancel half DOES run in
+  `write_tx_two_inserts_append_not_overwrite`,
+  `write_tx_single_insert_writes_base` and their `write_fill` twins — but none
+  of them asserts anything that can OBSERVE the drop, so it ran unobserved.
+  (Each of the four DOES assert after the guard's scope closes — three
+  `assert_eq!` in the two-insert fixtures, two in the single-insert ones — but
+  only on ring slot contents written during `insert` and untouched by the drop;
+  none reads `cached_prod` or `*producer` post-drop. The r3 draft of this
+  sentence said "none of them asserts anything after the guard drops", which is
+  literally false; corrected in r4 F4.) In the reuse fixtures the reservation
+  is fully consumed, which makes their post-drop `cached_prod == *producer`
+  pair a check on a `Drop` that did nothing.
+
+- **Sweep**: four guards x eight shapes. BOUND cells included deliberately — a
+  sweep reported as failures only cannot be told apart from one that ran out of
+  patience.
+
+  | # | shape | WriteTx | WriteFill | ReadRx | ReadComplete |
+  |---|---|---|---|---|---|
+  | S1 | second op within one reservation appends / reads in order | BOUND | BOUND | BOUND | BOUND |
+  | S2 | op cannot exceed the remaining window | BOUND | BOUND | BOUND | BOUND |
+  | S3 | terminal op advances the base cursor by its own count, per op | BOUND | BOUND | BOUND | BOUND |
+  | S4 | terminal op reaches the shared kernel pointer, per op | BOUND | BOUND | BOUND | BOUND |
+  | S5 | terminal op shrinks the window (`reserved`/`peeked`) | BOUND | BOUND | BOUND | BOUND |
+  | S6 | **Drop finishes work left after an explicit terminal op** | **was UNBOUND** | **was UNBOUND** | BOUND (r2) | **was UNBOUND** |
+  | S7 | **Drop's cancel covers exactly the unused/unread remainder** | **ran, UNOBSERVED** | **ran, UNOBSERVED** | BOUND (r2) | **never ran** |
+  | S8 | `u32` wrap cursor origin | BOUND | BOUND | BOUND | BOUND |
+
+  S6 and S7 are now BOUND in every column. Nothing is left recorded as
+  known-unbound: the sweep found exactly one asymmetric row (S6) plus one row
+  (S7) that was weak in all four columns, and both are closed by the three new
+  fixtures. S5 for the two consumers is bound INDIRECTLY — through the terminal
+  exhaustion check plus the post-drop `cached_cons` equality, rather than a
+  named assertion on `peeked`.
+
+  **Correction (r5).** The sentence above previously ended "…which cells M7/M8
+  below confirm is sufficient". No such cells exist. The matrix below runs
+  M1-M4, and the paragraph after it says in as many words that the four further
+  cells — including the two `release`-side `peeked` shrinks that would have
+  been M7/M8 — were QUEUED and are not part of the entry. The indirect binding
+  of S5 is therefore ASSERTED here, not measured; it is left standing as a
+  claim about the assertions in the file, which is checkable by reading them,
+  and it is no longer credited to evidence that was never produced.
+
+- **Mutation matrix.** Eight production lines in `xsk_ffi.rs`, each reverted on
+  its own, in an ISOLATED worktree copy so no mutation could reach the tree
+  under review (checked: the copy did hold a live mutation when an earlier pass
+  was killed mid-cell, and it was restored). Edits are made IN PLACE, never by
+  an mtime-preserving copy, and each cell additionally asserts a
+  `Compiling xpf-userspace-dp` line naming the copy's path — so a stale artifact
+  fails loudly instead of scoring silently. The control is a separate full
+  `cargo test --release` on the final tree, not a cell of this matrix.
+
+  M1-M3 are the comparative proof for the three new fixtures: each reverts the
+  one production line its fixture should hold, and in every case ONLY that
+  fixture reds while every pre-existing `xsk_ffi` test stays green.
+
+  | cell | reverted line | result | assertion |
+  |---|---|---|---|
+  | M1 | `ReadComplete::drop` release half | ONLY `read_complete_drop_releases_a_batch_read_after_an_explicit_release` RED | `left: 4, right: 5` — consumer not at 4+1 |
+  | M2 | `WriteTx::drop` submit half | ONLY `write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit` RED | `left: 4, right: 5` — producer not at 4+1 |
+  | M3 | `WriteFill::drop` submit half | ONLY `write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit` RED | `left: 4, right: 5` — producer not at 4+1 |
+  | M4 | `ReadComplete::drop` cancel half | ONLY `read_complete_drop_releases_a_batch_read_after_an_explicit_release` RED | `cached_cons` off the kernel consumer |
+
+  Every RED above is an ASSERTION failure, not a build break — zero `error[`
+  in any cell log; the only `error:` line is cargo's trailing "test failed".
+
+  M4 is the S7 confirmation for `ReadComplete`, and it lands exactly where the
+  grid predicts: severing the drop-time cancel reds the NEW fixture while
+  `read_complete_read_after_release_does_not_re_reap_released_entries` stays
+  green, because that one reaches drop with nothing left to cancel. Four more
+  confirmatory cells were queued and are NOT part of this entry — `WriteTx` /
+  `WriteFill` cancel halves (S7) and the two `release`-side `peeked` shrinks
+  (S5) — all of them against rows this table already records as BOUND. They
+  would add confirmation, not coverage, and no claim above depends on them.
+
+  One measured flake worth recording, because it would otherwise read as a
+  regression: the first M1 run was full-suite and additionally showed
+  `afxdp::wg::engine::engine_internal_tests::install_session_serializes_with_reconcile_removal`
+  RED at `engine_tests.rs:872` — "reconcile loop must have completed at least
+  one full add/remove cycle". That is a VACUITY guard on a concurrency loop in
+  an untouched subsystem, not the property its name suggests, and it fires under
+  machine load. It passes in the full control run and in the scoped M1 re-run.
+
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `docs/userspace-dataplane-gaps.md`,
+  `_Log.md`
+
+## 2026-08-13 — #5716 (4/4): a REJECTED build still mutated the live zone-counter store
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r2)
+- **Action**: (2/2) fixed only half the hazard and then claimed the whole of
+  it. Its deferred prune is correct, but the prune is one of TWO mutations the
+  build makes to the carried-forward (`Arc`-shared, LIVE) `ZoneCounterStore`.
+  The other is `ZoneCounterSlotMap::build`, which GET-OR-CREATES an atomic
+  block per configured zone out of the store it is handed — and it still ran
+  ahead of the fallible `filter_state` and `cos` steps. Traced and reproduced:
+  live `{100, 200}`, candidate `{100, 300}` plus an out-of-range CoS queue id;
+  the build creates zone 300's block, CoS rejects, the prune is skipped, and
+  the live map keeps a zero-valued block for a zone that was never configured.
+  `ZoneCounterStore::snapshot` omits all-zero rows, so operator-visible counts
+  stay correct and nothing looks wrong — the map just grows by one orphaned
+  block per rejected commit that adds or renumbers a zone, raising the cost of
+  every snapshot, clear and reconcile. Reachable from ordinary config churn.
+
+  Fixed STRUCTURALLY rather than by moving another statement.
+  `build_forwarding_state_with_policy_counters_and_previous` is now a thin
+  wrapper over a private `build_fallible_forwarding_state` (every `?` step,
+  touching no live shared state) plus a private, infallible
+  `attach_zone_counters` that runs only after the `?`. A fallible step added
+  anywhere in the inner builder is above the `?` by construction, so it cannot
+  be the "step below the prune" that reintroduces the bug. Within
+  `attach_zone_counters` the order is prune-then-resolve: `reconcile` retains
+  exactly `configured` and `build` get-or-creates a subset of it, so the two
+  orders reach the same map, but pruning first means the map never transiently
+  holds the union. A surviving zone keeps its SAME atomic block either way,
+  which is what stops the #5163 lock-free per-slot fold resetting or
+  double-counting across a slot renumber.
+
+  Why structural and not a fifth comment: (2/2)'s claim that
+  "`rejected_build_does_not_prune_live_zone_counters` is the guard" against a
+  fallible step below the prune was FALSE, and measurably so. Moving the NPTv6
+  step below the prune left 4280 of 4281 Rust tests passing — i.e. every
+  pre-existing test, the single failure being this round's new zone-block
+  assertion, which reports the B1 defect and not the relocated step. A single-belt fixture cannot bind an
+  ordering invariant: it stays green whenever a DIFFERENT belt moves.
+
+  Also in this round, from the same review leg:
+
+  - The producer submission count was asserted only in aggregate. Three
+    submits of a constant 2 reach the same total as the correct 1/3/2, so the
+    end-state check could not see a commit handing the kernel the wrong NUMBER
+    of slots. Both producer fixtures now assert `*producer` after every commit.
+  - The changed `ReadRx::Drop` condition (`!released && read_count > 0` ->
+    `read_count > 0`) had no fixture: the existing reuse test releases
+    everything it reads, so it reaches drop with `read_count == 0` and never
+    enters the branch.
+  - `xsk_ffi_tests.rs`'s two `const _: () = assert!` blocks are assertions over
+    TEST CONSTANTS only — no production edit can fail either — and were being
+    read as coverage. Relabelled explicitly as fixture self-checks; the
+    pairwise-distinct one is relaxed to "at least two distinct", which is what
+    the fixtures actually need.
+  - Nine assertion messages diagnosed a specific CAUSE from a general equality
+    mismatch. Reworded to state the observation and name the guarded shape.
+  - Claim corrections in `mod.rs`, `snapshot.rs`,
+    `docs/userspace-dataplane-gaps.md` and three earlier `_Log.md` entries —
+    see the CORRECTED notes in (1/2), (2/2) and (3/3) below.
+
+- **Tests**: `rejected_build_does_not_prune_live_zone_counters` and the new
+  `rejected_build_does_not_create_zone_blocks_in_the_live_store` are now
+  table-driven over FOUR of the inner builder's ten fallible integrity belts,
+  chosen by position (this sentence said "EVERY fallible integrity belt
+  reachable in the builder" when written; corrected in the r3 entry above) —
+  #3719 duplicate zone id (the first fallible step), #2240 NPTv6, #3367 filter
+  tcp-flags, #2410 CoS queue id (the last) — and each row asserts it rejected
+  through the belt it names, so a row that starts failing early stops silently
+  passing. The create half needs a new
+  `ZoneCounterStore::tracked_zone_ids_for_test`, because the operator-facing
+  `snapshot()` is deliberately sparse and cannot see a zero-valued block.
+  `accepted_build_still_prunes_zone_counters_for_removed_zones` remains the
+  anti-over-fix control.
+
+  Reverts, each observed RED:
+
+  | fix | revert edit | observed |
+  |---|---|---|
+  | B1 zone-block create | (before fix) run the new test at PR head | `left: [100, 200, 300]`, `right: [100, 200]` |
+  | B1/B4 structural | call `attach_zone_counters` inside the fallible builder at its old position | both tests RED — prune `left: 1, right: 2`; create `left: [100, 300]`, `right: [100, 200]`, failing on the #3367 FILTER row, a belt the single-belt fixture never covered |
+  | B2 per-commit submit | `WriteTx::commit` submits a constant `2` | `write_tx_insert_after_commit_...` RED at the new checkpoint, `left: 2, right: 1`; with that one assertion removed the SAME mutation is GREEN, which is the finding |
+  | B3 drop release | `ReadRx::Drop` skips its release | `read_rx_drop_releases_a_batch_read_after_an_explicit_release` RED, `left: 4, right: 5`; the pre-existing `read_rx_read_after_release_stays_releasable` stayed GREEN, which is the finding |
+
+  Every RED is an assertion failure, not a build break.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `docs/userspace-dataplane-gaps.md`,
+  `_Log.md`
+
+## 2026-08-05 — #5716 (3/3): ring-guard fixtures could not reject a constant advance
+
+- **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening, PR #6832 review fold)
+- **Action**: The four reuse fixtures added in (1/2) drove only one- and
+  two-slot batches through their guards, and two batch sizes cannot separate
+  "advance by the committed count" from "advance by a constant":
+  `base_idx += 1` is correct for every one-slot batch and `base_idx += 2` for
+  every two-slot batch. Measured — each of the four advance sites in
+  `xsk_ffi.rs` mutated to a constant, against the ORIGINAL fixtures:
+
+  | advance site | `+= 1` | `+= 2` |
+  |---|---|---|
+  | `WriteTx::commit` (:1057) | GREEN | RED |
+  | `WriteFill::commit` (:1124) | GREEN | RED |
+  | `ReadRx::release` (:986) | RED | GREEN |
+  | `ReadComplete::release` (:1180) | RED | GREEN |
+
+  A perfect diagonal: every fixture admitted exactly one of the two constants,
+  so each pinned only that SOMETHING happens on the terminal op, not that the
+  cursor moves by the size of the batch the kernel just took.
+
+  Each fixture now drives three DISTINCT batch sizes (`REUSE_BATCHES =
+  [1, 3, 2]`) and asserts the base cursor after EVERY terminal op, not only at
+  the end.
+
+  **CORRECTED by (4/4):** only the second half is load-bearing. "Three sizes
+  are needed because two cannot discriminate" is FALSE — it is true of the
+  ORIGINAL end-state-only fixtures, but once a checkpoint runs after every
+  terminal op, two distinct sizes already reject every constant (a batch of 1
+  rejects every constant but 1; a following batch of 3 rejects 1, at
+  cumulative 4 against 2). Three sizes are what these fixtures happen to use.
+  What IS load-bearing is the intermediate checkpoint: three applications of
+  `+= 2` land on the same FINAL cursor as the correct advance (2+2+2 == 1+3+2),
+  so a constant is invisible to an end-state-only check. The "assert after
+  every terminal op, INCLUDING the last" claim is also overstated — the final
+  checkpoint is redundant, since the first two have already rejected every
+  constant by the time it runs. A `const _: () = assert!` pins the sizes as
+  not-all-equal; it is a fixture self-check over test constants, not coverage,
+  and (4/4) relabels it as such.
+
+  The batch sizes are producible through the production path: every insert
+  site passes a variable-length slice (`scratch_prepared_tx.len()`,
+  `scratch_fill.len()`, `offsets.len()` plus an arbitrary retry suffix) and
+  every release releases whatever its read loop consumed, so a three-slot
+  batch is an ordinary shape. The REUSE itself is not producible today — that
+  is precisely the forward-looking contract (1/2) states, so the fixture tests
+  the stated contract rather than inventing a shape. Both points are now in
+  the section header comment, since a reader will ask.
+
+  Two `None` assertions previously stood on the reader's failure default.
+  `ReadRx::read` / `ReadComplete::read` have no error path — the only `None`
+  is the `read_count >= peeked` bounds check — so the sole alternative cause
+  of an early `None` is a short peek. Both fixtures now assert
+  `peeked == REUSE_TOTAL` at the peek, which makes the terminal `None` mean
+  exhaustion with exactly one possible cause instead of leaving the reader to
+  assume it.
+
+  Also corrected a false claim in the (1/2) entry below — see the CORRECTION
+  note there.
+
+- **Tests**: the same four fixtures, reshaped. Mutation matrix after the
+  change — all eight cells RED:
+
+  | advance site | `+= 1` | `+= 2` |
+  |---|---|---|
+  | `WriteTx::commit` | RED | RED |
+  | `WriteFill::commit` | RED | RED |
+  | `ReadRx::release` | RED | RED |
+  | `ReadComplete::release` | RED | RED |
+
+  Every RED is an ASSERTION failure at an intermediate base checkpoint, not a
+  build break: `+= 1` dies after batch 2 (`left: 2, right: 4`) and `+= 2` dies
+  after batch 1 (`left: 2, right: 1`), each naming the guard in its message.
+  Mutations are applied BY LINE INDEX, never text substitution — the four
+  advance sites are pairwise byte-identical (`:1057`/`:1124` and
+  `:986`/`:1180`), so a substitution would silently hit the wrong site and
+  measure something other than what it reported. Every leg rebuilds the file
+  from a sha256-pinned pristine snapshot (so mutations cannot compound), and
+  the restore is sha256-verified. The four guard families are exercised by
+  DISJOINT test sets, which is what lets one combined run attribute per site;
+  spot-checked against three independent single-site legs, which agreed
+  cell-for-cell.
+- **File(s)**: `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
+
+## 2026-08-05 — #5716 (2/2): rejected forwarding build pruned live zone counters
+
+- **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening)
+- **Action**: codex-review-182 cohort C-RUST row `Z3-C01`, verified still live on
+  current origin/master (ad959117748) — not a stale fixed-not-closed row.
+  `ZoneCounterStore` is `Arc<Mutex<..>>`-backed, so the carry-forward `clone()`
+  in `build_forwarding_state_with_policy_counters_and_previous` is a handle on
+  the LIVE map. The destructive `reconcile()` (a `retain` to the incoming
+  snapshot's zone set) ran mid-builder, AHEAD of the fallible `filter_state`
+  and `cos` steps. Both preflights (`build_reconcile_forwarding`,
+  `refresh_runtime_snapshot`) pass `Some(&self.forwarding)` and on `Err`
+  discard the build "keeping previous forwarding state" — but the live store
+  had already lost the removed zones' cumulative totals, so `show security
+  zones` traffic counters reset on a commit that never applied. The prune is
+  now the last statement before `Ok(state)`, with the retained zone set carried
+  in a local; every `?` above it returns without pruning the store.
+
+  **CORRECTED by (4/4):** "every `?` above it returns with the store
+  UNTOUCHED" was false as written. The prune is only one of the store's two
+  mutations; `ZoneCounterSlotMap::build`, still above the fallible steps,
+  GET-OR-CREATES a block per configured zone in that same live map, so a
+  rejected candidate carrying a new zone left a zero-valued block behind. The
+  true claim for this entry's shape is the narrower "does not PRUNE existing
+  totals". (4/4) moves both mutations below the fallible builder, at which
+  point "untouched" becomes accurate and is bound by a test.
+
+  This is the RESIDUAL of #5171 rev-5605, not a duplicate: that fold saw the
+  same Arc-shared-store hazard but fixed only the VALIDATION build
+  (`validate_forwarding_buildable` passes `previous = None`). The REAL
+  reconcile/refresh builds must pass `Some(&coord.forwarding)` for WG-engine
+  and NAT-allocator carry-over, so their reject path stayed exposed.
+  `validate_forwarding_buildable`'s doc comment described the old mid-build
+  prune and is updated: #5716 narrows the hazard to ACCEPTED builds but does
+  not remove it, so `previous = None` there is still load-bearing.
+
+- **Tests**: `rejected_build_does_not_prune_live_zone_counters` (RED on revert:
+  moving the prune back into the early block →
+  `left: 1, right: 2`, "a REJECTED build pruned the live zone-counter store")
+  and its anti-over-fix control
+  `accepted_build_still_prunes_zone_counters_for_removed_zones` (RED on
+  deleting the prune → `left: 2, right: 1`). Both reds are ASSERTION failures,
+  not build breaks.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
+## 2026-08-05 — #5716 (1/2): AF_XDP ring guards advance their base cursor
+
+- **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening)
+- **Action**: codex-review-182 cohort C-RUST row `A1-b03-C01`, verified still
+  live on current origin/master (ad959117748). All four AF_XDP ring guards
+  stayed usable after `commit()`/`release()` while `base_idx` stood still, so a
+  reused guard aliased the slots it had just handed the kernel:
+  `WriteTx`/`WriteFill` restarted at `base_idx + 0` and OVERWROTE
+  just-submitted descriptors / fill offsets; `ReadComplete` restarted at
+  `base_idx + 0` and RE-READ completion addresses it had already reaped (one
+  UMEM frame recycled into the fill ring twice); `ReadRx` kept its positional
+  cursor but sealed itself with a sticky `released` flag, so post-release reads
+  could never be released and `Drop`'s `cancel(peeked - read_count)`
+  under-counted, leaving `cached_cons` permanently ahead of `*consumer` — RX
+  ring slots leaked for the life of the socket. Each terminal op now advances
+  `base_idx`; `ReadRx` drops the sticky flag for the advance-and-reset shape
+  `ReadComplete` already used. Every production call site is
+  `create -> insert/read* -> commit/release -> drop` (audited: bind.rs
+  prime_fill_ring, tx/rings.rs reap+refill, tx/transmit, cos/queue_service x4,
+  poll_descriptor), so nothing crosses a terminal op today — this is API
+  hardening, and the single-use path is observably equivalent (the guards' own
+  fields differ — `base_idx` now advances and `ReadRx` no longer carries the
+  `released` flag — so "bit-identical", as this entry originally read, was
+  wrong; what is unchanged is every effect on the rings and the kernel-facing
+  pointers).
+
+- **Tests**: `write_tx_insert_after_commit_appends_past_the_committed_slots`,
+  `write_fill_insert_after_commit_appends_past_the_committed_slots`,
+  `read_complete_read_after_release_does_not_re_reap_released_entries`,
+  `read_rx_read_after_release_stays_releasable`, plus a new
+  `DeviceQueue::push_comp_for_test` hermetic harness helper. The class has
+  exactly four members and each is mutated INDEPENDENTLY — a full enumeration,
+  not a sample. Each test runs at both `CURSOR_ORIGINS = [0, u32::MAX - 1]`:
+  at the second origin the reservation straddles the `u32` wrap, so the
+  terminal op's `wrapping_add` advance crosses `u32::MAX` mid-guard (libxdp
+  masks the index, so a real cursor legitimately wraps). Every test also
+  asserts `cached_prod == *producer` / `cached_cons == *consumer` after drop.
+  CORRECTION (see the 3/3 entry above): that last pair does NOT catch an
+  off-by-one in the base-cursor advance, as this entry originally claimed —
+  measured, `WriteTx::commit` mutated to a constant `+= 1` left both
+  equalities intact and the whole suite GREEN. What they bind is the terminal
+  op's window bookkeeping (`reserved -= written` / `peeked -= read_count`),
+  because `Drop` cancels `reserved - written`: a terminal op that moved the
+  cursor but left the window unshrunk cancels slots the kernel already owns.
+  The cursor advance itself is bound by the per-batch checkpoints added in
+  3/3. (The bookkeeping half is derived from `Drop`'s arithmetic, not
+  separately mutation-proven — the in-loop `reserved` assertion fires first.)
+- **File(s)**: `userspace-dp/src/xsk_ffi.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
 ## 2026-08-21 — #6871 round 17: merge master's #6743 dataplane cell; runtime re-gate
 
 - **Timestamp**: 2026-08-21 (fix/5103-reth-worker-join)
@@ -80169,6 +81506,43 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
 
+## 2026-08-06 — #5798: the RG-transition residual's bound is IDLE, not absolute
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct the disclosed window on a security residual (comment-only)
+- **File(s)**: `userspace-dp/src/nat64.rs`
+
+The hostile gate found the residual paragraph this PR added understates its own
+window. It said a post-RG-transition fragment can inherit a stale permit "for up
+to the ~2s association TTL", "bounded here by a far shorter lifetime" than the
+session table's equivalent.
+
+`Nat64FragAssoc::lookup` re-stamps `deadline_ns` on every hit, so 2s is an IDLE
+timeout. A stream of non-first fragments sharing the same
+(src, dst, ident, protocol, authority) spaced under 2s renews the association
+indefinitely — and the Fragment Identification is attacker-chosen, so producing
+such a stream is trivial. The real window is "as long as fragments of that
+datagram keep arriving". For a legitimate sender, which uses a fresh
+Identification per datagram, it genuinely is ~2s, which is presumably where the
+figure came from.
+
+Refresh-on-hit is PRE-EXISTING (verified on `origin/master`, from #2562/#5624).
+This PR did not introduce the behaviour — it introduced the sentence that
+mis-bounds it. That distinction is why this is a doc fix and not a runtime one.
+
+The gate also confirmed nothing else bounds it: `build_generation` does not move
+on an RG transition (it is a CONFIG fence and the residual is about runtime HA
+state), eviction lives in `install` so a pure-consult stream never triggers it,
+`retain` only prunes already-expired entries, and the input filter this PR runs
+on a hit is the INTERFACE filter — it does not re-apply zone policy or the
+owner-RG gate. All four are now stated at the site.
+
+This matters more than a typical comment fix: the residual was disclosed
+precisely so a later reader could judge the risk, and the stated ceiling
+understated it by however long an attacker chooses to keep sending.
+
+Comment-only: every changed line is `///` or blank, verified by stripping the
+diff markers and filtering. `cargo check` exit 0.
 ## 2026-08-05 — #6290 activeClusterTransport epoch guard
 
 - **Timestamp**: 2026-08-05
@@ -81956,6 +83330,66 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 ## 2026-08-06 — #4800 new-flow-ceiling instrumentation + harness
 
 - **Timestamp**: 2026-08-06
+- **Action**: #6835 round 2 — fold the Codex verdict at `e8c2403a5`. No runtime
+  defect and no guard unable to fire; the diff is comment text, test assertion
+  messages and one test LABEL. Verified: no non-comment production line changed.
+  **THE MATERIAL QUESTION ANSWERED: the B2 re-enforcement test is SOUND.** The
+  doc claimed "the SAME cached association" replayed under two HA runtimes, but
+  the two legs pass DIFFERENT fragment identifiers (`0x6927_0002` /
+  `0x6927_0003`) and therefore mint two distinct entries. That could have made
+  the test vacuous — if the inactive leg MISSED, its `tx == 0` would come from
+  the flowless drop rather than the hit arm. It does not. The closure installs
+  from a first fragment under `&active` in BOTH legs and asserts `dbg1.tx == 1`,
+  so the association exists; and measured directly, deleting
+  `enforce_ha_resolution_snapshot` from the hit arm makes the inactive leg
+  forward (`left: 1, right: 0`). The differing idents are BETTER isolation than
+  a shared entry, which would let the active leg's consult re-stamp the deadline
+  before the inactive leg ran. Comment corrected to say what the fixture does;
+  the fixture is untouched.
+  **F-A, the fabricated input.** `FragAuthority.routing_table` is INERT in
+  production: the only two assignments are literal zero, the XDP writer
+  (`userspace-xdp/src/lib.rs`) and the Default impl (`afxdp/types/mod.rs`), so
+  no real packet carries a non-zero value into `frag_ingress_authority`. The E2E
+  case fabricates `routing_table: 1`, so it demonstrates that the field
+  participates in key equality — NOT that a routing instance reaches the key.
+  The case is relabelled to say exactly that.
+  The more interesting half: real VRF discrimination IS covered, by a different
+  field. Routing-instance membership is per-INTERFACE
+  (`config.RoutingInstanceConfig.Interfaces []string`), so two fragments in
+  different instances necessarily arrive on different interfaces and already
+  differ in `ingress_ifindex` — which is the FIRST dimension in the same table.
+  The field is kept (the key is then ready if the shim ever stamps it) with a
+  note to relabel and drive from a real ingress if it is made live.
+  **Ten further comment corrections, each measured at this head rather than
+  inferred.** Two of them were mutually contradictory in the same file:
+  `nat64.rs` module header said the hit arm re-runs
+  `enforce_ha_resolution_snapshot` every packet (true), while the
+  `ingress_zone` doc said the hit "does not re-apply zone policy or the owner-RG
+  gate" (false for the owner-RG half). Corrected, and the residual paragraph
+  narrowed: what genuinely remains is the ZONE-POLICY half, since a hit inherits
+  the permit and re-runs only the INTERFACE filter.
+  The rest: "No routing evaluator follows" (one does now); the counter
+  assertion message, which named `true` as the revert when `true` is what ships
+  and predicted 1 when the measured revert value is 3; `filter.rs`
+  "`routing_eval_follows` is true ONLY on the session-MISS path" (there is now a
+  `true` HIT site); `eval.rs` "the only external call site", twice (three
+  pairings now); two fixture comments claiming no v6 route / that the fixture
+  removes inet6 routes, when it deliberately RETAINS `::/0` — that deletion was
+  what hid the #6927 leak, so the drop is the Pref64 gate, not an absent route;
+  and two blanket fail-closed claims (`nat64.rs` and
+  `docs/feature-coverage.md`) narrowed to the `ForwardCandidate` disposition the
+  gate is actually scoped to, since NoRoute / MissingNeighbor / HAInactive /
+  LocalDelivery reach their own arms.
+  TEST RUN. `cargo test --release`, fresh target dir. One run showed a single
+  failure in `afxdp::types::shared_cos_lease::tests::
+  v8_epoch_seqlock_snapshot_never_tears_tag_grace` — a CoS seqlock test in a
+  subsystem this diff does not touch. It did NOT reproduce: 5/5 CLEAN at this
+  head and 5/5 CLEAN at unmodified `e8c2403a5`. Recorded as a load-sensitive
+  flake, not attributed to this change and not claimed as proven-pre-existing on
+  one sighting.
+- **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs,
+  userspace-dp/src/nat64.rs, userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/filter/engine/eval.rs, docs/feature-coverage.md, _Log.md
 - **Action**: Add per-site contention accounting for the three cross-worker
   synchronization points on the new-flow install path — the SNAT pool
   allocator's residual `live` map mutex, `publish_shared_session`, and the
@@ -82194,6 +83628,59 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+## 2026-08-07 — #5798 fold: bind the fragment-authority ZONE OVERRIDE at its production wiring
+
+- **Timestamp**: 2026-08-07
+- **Action**: Add `frag_assoc_authority_binds_the_fabric_zone_stamp_5798` and
+  correct an overclaiming coverage comment. The `ingress_zone` dimension of
+  `FragAuthority` was bound only at the STRUCT level; its production wiring —
+  the `frag_authority_zone_override` argument the install site passes and the
+  `ingress_zone_override` the consult site passes to `frag_ingress_authority`
+  (poll_descriptor/mod.rs) — had no test. Production was CORRECT; what was
+  missing was any test that would notice a later edit severing it.
+- **Why the existing coverage could not see it**:
+  `frag_assoc_every_authority_dimension_is_load_bearing` (nat64_tests.rs) hands
+  `FragAuthority` STRUCT LITERALS to the key builders, so it binds the key's
+  equality being zone-sensitive and never calls `frag_ingress_authority`.
+  `nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`
+  (tests_nat64_tunnel.rs) drives the production resolver but passes `None` for
+  the override — its fixture has no fabric ingress, so the zone can only move
+  by moving the interface. PR #6835's own M3 mutation neutralized the HELPER,
+  which perturbs all four dimensions at once and is caught by the ifindex/VLAN
+  cases; severing only the two zone-override ARGUMENTS is invisible to it.
+- **What the new test does**: drives `poll_binding_process_descriptor` (via
+  `txn_run_descriptor`) with fragments of ONE IPv4/UDP datagram arriving on the
+  fabric link — identical ingress ifindex (21), VLAN (0) and routing table (0)
+  — differing ONLY in the zone-encoded src-MAC stamp. A `lan`-stamped first
+  fragment is admitted under the split-RG placement, interface-SNAT'd, and
+  publishes one association; `dmz`- and `mgmt`-stamped non-first fragments must
+  not inherit it, with a home-domain positive control between them so a refusal
+  can never be explained by "the entry was gone". Preconditions assert all three
+  stamps are HONORED at stage 9 (else the refusals would prove only that an
+  INVALID stamp is ignored) and that the two ingresses differ in exactly the
+  zone dimension, resolved through the production authority builder.
+- **Validation**: three mutation cells, each `cargo build --bins --release` with
+  0 errors first (a valid cell, not a build break), each RED on an ASSERTION.
+  (a) BOTH argument sites -> `None`: RED at tests_fabric_zone_stamp.rs:685,
+  "a non-first fragment stamped dmz — same ifindex, same VLAN, same routing
+  table, DIFFERENT security domain — must not inherit the lan flow's permit +
+  egress, left: 1, right: 0" (the foreign fragment inherited). (b) install site
+  ONLY -> `None` and (c) consult site ONLY -> `None`: both RED at :710,
+  "control after dmz: the SAME-domain non-first fragment must still inherit and
+  forward, left: 0, right: 1" — install and consult stop agreeing, so the
+  LEGITIMATE fragment misses. The one-site cells red only through the positive
+  control, which is why it is not optional. Full suite 4265 passed / 0 failed
+  (base was 4264); severed, 4264 passed / 1 failed.
+- **Pre-existing flake, proven at the base SHA**: the full parallel suite
+  intermittently wedges on three `afxdp::wg::engine::engine_internal_tests`
+  (`install_session_serializes_with_reconcile_removal`,
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load`,
+  `wg_engine_test_serial_grants_exclusive_access`). Measured at 40344ab05 with
+  this change absent: 1 wedge in 6 full runs, the other 5 giving 4264 passed;
+  the module alone is green 6/6 in 0.4s. Not caused by this change, which
+  touches no `wg` code.
+- **File(s)**: userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs, _Log.md
 ## 2026-08-12 — #6871 F3/F4/F5: three claim/test corrections (F2 harness separate)
 
 - **Timestamp**: 2026-08-12

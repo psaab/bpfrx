@@ -4683,6 +4683,210 @@ fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
     );
 }
 
+// ── #6832 fold r5: the prune's commit point is the APPLY, not the build ──
+//
+// The r2 restructuring moved the per-zone counter binding out of the fallible
+// builder so a snapshot rejected by an INTEGRITY belt could not touch the live
+// store. That is necessary and it holds — but it is not the whole rejection
+// surface. A build can succeed and the apply still be rejected AFTERWARDS, by a
+// worker-thread spawn failure (#4952) or an incomplete queue bind (#5143).
+// Measured on the branch before this fold, with live zones {100,200} carrying
+// folded traffic, candidate {100,300}, and `force_worker_spawn_fail = 1`:
+//
+//   visible rows  [100, 200] -> [100]
+//   tracked ids   [100, 200] -> [100, 300]
+//
+// Zone 200's cumulative totals were destroyed by a configuration that never
+// brought up a single worker. The `WorkerSpawn` arm is the one that makes this
+// operator-visible rather than merely internal: unlike `WorkerBindIncomplete`
+// (which calls `stop_inner` and defaults `coord.forwarding`), it returns with
+// the candidate state still PUBLISHED, so `show security zones` keeps reporting
+// from the store it just pruned.
+//
+// The destructive prune therefore moved to `forwarding_build::
+// commit_zone_counter_prune`, called by each apply path at ITS commit point.
+// The three tests below are one per direction, and they are not
+// interchangeable: the first binds that the prune is NOT at build time, the
+// second and third bind that each production call site still performs it.
+
+/// Seed `coord.forwarding` with zones 100 and 200 and fold traffic into both,
+/// then hand back the snapshot that produced it. The store is `Arc`-shared, so
+/// what this seeds is what an apply would mutate in place.
+fn zone_counter_live_coordinator(coord: &mut Coordinator) {
+    use crate::afxdp::zone_counters::{flush_recorded_zone_counters, record_zone_traffic};
+    let mut baseline = mandatory_ok_snapshot(5);
+    baseline.zones = zone_counter_zones(&[100, 200]);
+    coord.forwarding =
+        crate::afxdp::forwarding_build::build_forwarding_state_with_policy_counters_and_previous(
+            &baseline,
+            &coord.policy_counters,
+            &coord.nat_counters,
+            None,
+        )
+        .expect("the baseline zone snapshot must build");
+    record_zone_traffic(&coord.forwarding.zone_counter_slot_map, 100, 200, 64);
+    record_zone_traffic(&coord.forwarding.zone_counter_slot_map, 200, 100, 64);
+    flush_recorded_zone_counters(
+        &coord.forwarding.zone_counter_store,
+        &coord.forwarding.zone_counter_slot_map,
+    );
+    assert_eq!(
+        zone_counter_rows(coord),
+        vec![100, 200],
+        "fixture: both zones must be counting before the apply under test"
+    );
+}
+
+fn zone_counter_zones(ids: &[u16]) -> Vec<crate::protocol::snapshot::ZoneSnapshot> {
+    ids.iter()
+        .map(|&id| crate::protocol::snapshot::ZoneSnapshot {
+            name: format!("zone{id}"),
+            id,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Operator-visible rows, sorted — what `show security zones` reports.
+fn zone_counter_rows(coord: &Coordinator) -> Vec<u16> {
+    let mut rows: Vec<u16> = coord
+        .zone_traffic_counters()
+        .iter()
+        .map(|r| r.zone_id)
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+fn zone_counter_binding() -> Vec<BindingStatus> {
+    vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }]
+}
+
+#[test]
+fn rejected_apply_does_not_prune_live_zone_counters_6832() {
+    // The NEGATIVE direction. A build that succeeded but whose workers failed
+    // to spawn is a rejected apply: zone 200's totals must survive it, ready
+    // for the retry or the operator's revert.
+    //
+    // Reds if `commit_zone_counter_prune` is hoisted back into
+    // `attach_zone_counters` (or inlined into the builder as the pre-r5 shape
+    // had it) — that is the whole point of the split, and no assertion in
+    // `forwarding_build/tests.rs` can see it, because those drive the builder
+    // directly and never reach a worker.
+    let mut coordinator = Coordinator::new();
+    zone_counter_live_coordinator(&mut coordinator);
+    let live_store = coordinator.forwarding.zone_counter_store.clone();
+
+    let mut bindings = zone_counter_binding();
+    let mut candidate = mandatory_ok_snapshot(6);
+    candidate.zones = zone_counter_zones(&[100, 300]);
+    coordinator.force_worker_spawn_fail = 1;
+    let result = coordinator.reconcile(Some(&candidate), &mut bindings, 64);
+
+    assert!(
+        matches!(result, Err(ReconcileError::WorkerSpawn(_))),
+        "fixture: this apply must be rejected by the worker SPAWN arm — the arm \
+         that leaves the candidate state published — got {result:?}"
+    );
+    let mut surviving: Vec<u16> = live_store.snapshot().iter().map(|r| r.zone_id).collect();
+    surviving.sort_unstable();
+    assert_eq!(
+        surviving,
+        vec![100, 200],
+        "a REJECTED apply pruned zone 200's cumulative totals out of the live, \
+         Arc-shared store. The config never brought up a worker, and the \
+         WorkerSpawn arm leaves it published — so `show security zones` reports \
+         from this store with the removed zone's history already destroyed"
+    );
+    assert_eq!(
+        zone_counter_rows(&coordinator),
+        vec![100],
+        "fixture: zone 200 is correctly no longer PUBLISHED (the candidate does \
+         not configure it) — this test is about its totals surviving in the \
+         store, not about republishing an unconfigured zone"
+    );
+}
+
+#[test]
+fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832() {
+    // POSITIVE direction, reconcile call site. Anti-over-fix: deferring the
+    // prune must not DELETE it. Same zone move, but the workers come up, so the
+    // apply commits and zone 200 is dropped.
+    //
+    // `force_worker_healthy_stub` (#6242) is what makes this reachable in a
+    // unit test — a real XSK bind is impossible in-process, and without the
+    // stub every reconcile here fails at `WorkerBindIncomplete` and this
+    // direction would be untestable. Reds if the `bringup_result.is_ok()`
+    // call in `coordinator/reconcile/mod.rs` is deleted.
+    let mut coordinator = Coordinator::new();
+    zone_counter_live_coordinator(&mut coordinator);
+    let live_store = coordinator.forwarding.zone_counter_store.clone();
+
+    let mut bindings = zone_counter_binding();
+    let mut candidate = mandatory_ok_snapshot(6);
+    candidate.zones = zone_counter_zones(&[100, 300]);
+    coordinator.force_worker_healthy_stub = true;
+    let result = coordinator.reconcile(Some(&candidate), &mut bindings, 64);
+    assert!(
+        result.is_ok(),
+        "fixture: this apply must COMMIT (workers up) — got {result:?}"
+    );
+
+    let mut surviving: Vec<u16> = live_store.snapshot().iter().map(|r| r.zone_id).collect();
+    surviving.sort_unstable();
+    assert_eq!(
+        surviving,
+        vec![100],
+        "a COMMITTED reconcile must still drop the removed zone's totals; \
+         deferring the prune past worker bring-up must not delete it"
+    );
+    let survivor = live_store
+        .snapshot()
+        .into_iter()
+        .find(|r| r.zone_id == 100)
+        .expect("zone 100 is configured by both generations");
+    assert!(
+        survivor.ingress_packets > 0,
+        "the surviving zone must keep its CARRIED-FORWARD totals across the \
+         commit, not restart from zero"
+    );
+    coordinator.stop();
+}
+
+#[test]
+fn committed_refresh_prunes_zone_counters_for_removed_zones_6832() {
+    // POSITIVE direction, refresh call site. The same-plan refresh keeps its
+    // live workers, so nothing fallible follows the `self.forwarding` swap and
+    // the swap IS the commit. Reds if the `commit_zone_counter_prune` call in
+    // `coordinator/snapshot_refresh.rs` is deleted — the reconcile test above
+    // cannot see that deletion, and vice versa.
+    let mut coordinator = Coordinator::new();
+    zone_counter_live_coordinator(&mut coordinator);
+    let live_store = coordinator.forwarding.zone_counter_store.clone();
+
+    let mut candidate = mandatory_ok_snapshot(6);
+    candidate.zones = zone_counter_zones(&[100, 300]);
+    coordinator
+        .refresh_runtime_snapshot(&candidate)
+        .expect("fixture: the candidate must refresh cleanly");
+
+    let mut surviving: Vec<u16> = live_store.snapshot().iter().map(|r| r.zone_id).collect();
+    surviving.sort_unstable();
+    assert_eq!(
+        surviving,
+        vec![100],
+        "a COMMITTED same-plan refresh must drop the removed zone's totals"
+    );
+}
+
 #[test]
 fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
     // #6843 (Codex gate): drive the PRODUCTION publication accessor,

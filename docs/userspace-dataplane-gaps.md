@@ -169,6 +169,94 @@ counters (see below).
   [`docs/research/3643-dead-counters/plan.md`](research/3643-dead-counters/plan.md)
   §5A.
 
+  **Rejected-build safety (#5716).** The store is `Arc`-backed, so the
+  carry-forward `clone()` in
+  `build_forwarding_state_with_policy_counters_and_previous` is a handle on the
+  LIVE map, not a copy. Binding a candidate to it mutates it **two** ways:
+  `ZoneCounterSlotMap::build` GET-OR-CREATES a block per configured zone, and
+  `reconcile` DROPS the blocks for zones the candidate no longer configures. A
+  snapshot the reconcile/refresh preflight REJECTS ("keeping previous forwarding
+  state") must do neither — the prune would zero an operator's
+  `show security zones` totals for a commit that never applied, and the
+  get-or-create would leave a zero-valued block behind for a candidate-only
+  zone (invisible to the sparse status snapshot, but accumulating one block per
+  rejected commit under ordinary config churn).
+
+  Both mutations therefore live in `attach_zone_counters`, which the public
+  entry point calls **after** the fallible `build_fallible_forwarding_state`
+  has returned `Ok`. That makes the ordering STRUCTURAL: a fallible step added
+  anywhere in the inner builder is above the `?` by construction. The earlier
+  shape put the prune last inside one big function and relied on a source-order
+  comment, which is not a guard — moving the NPTv6 `?` step below the prune left
+  the entire pre-existing Rust suite green (measured, #6832 fold r2: 4280 of
+  4281, the one failure being this round's new zone-block assertion, a different
+  defect).
+
+  Guards, in `userspace-dp/src/afxdp/forwarding_build/tests.rs`:
+  `rejected_build_does_not_prune_live_zone_counters` and
+  `rejected_build_does_not_create_zone_blocks_in_the_live_store` each drive
+  FOUR of the inner builder's ten fallible integrity belts, chosen by POSITION
+  rather than exhaustively — #3719 duplicate zone id (the first `?`) and #2410
+  CoS queue id (the last, with nothing fallible after it), via #2240 NPTv6 and
+  #3367 filter — so hoisting the binding back into the fallible region reds
+  them. Span, not count: every STRAIGHT-LINE statement position the binding
+  could be relocated to and still be a defect has a `?` below it, hence lies
+  above the LAST belt, so the CoS row sees all of them. (A hoist below the last
+  `?` stays green, correctly — nothing after it can reject. A relocation into a
+  conditionally-evaluated closure a row's snapshot never enters is outside the
+  quantifier, and is stated in the builder's doc comment rather than assumed
+  away.) The dup-zone row pins where the fallible region BEGINS, which is what
+  makes "the last belt" a checkable bracket rather than one arbitrary belt. It
+  stays green only for a relocation strictly BELOW it — it rejects first, so
+  the relocated block never runs — and those are exactly the ones the CoS row
+  catches; a hoist ABOVE it, to the top of the fallible region, reds the
+  dup-zone row of both zone tests (measured, #6832 fold r4).
+  A single-belt fixture binds neither: it stays green when a *different* belt
+  moves. `accepted_build_defers_the_prune_to_the_commit_point` is the
+  anti-over-fix control. The create half is only observable through
+  `ZoneCounterStore::tracked_zone_ids_for_test`, since the operator-facing
+  `snapshot()` omits all-zero rows by design.
+
+  **The rejection surface is wider than the integrity belts (#6832 fold r5).**
+  Everything above concerns a snapshot the BUILDER rejects. A build can also
+  succeed and the apply still be rejected afterwards, by a worker-thread spawn
+  failure (#4952) or an incomplete queue bind (#5143) — and the destructive
+  prune used to have already run by then, so a removed zone's cumulative totals
+  were destroyed for a configuration that never brought up a worker (measured:
+  live `{100,200}`, candidate `{100,300}`, forced spawn failure → visible rows
+  `[100]`). The two bring-up failure arms are not equivalent:
+  `WorkerBindIncomplete` calls `stop_inner`, which defaults `coord.forwarding`;
+  `WorkerSpawn` does not, so the candidate state stays PUBLISHED and
+  `show security zones` keeps reporting from the store it just pruned.
+
+  The prune therefore now lives in `forwarding_build::commit_zone_counter_prune`
+  and each apply path calls it at its own commit point — the full reconcile only
+  after `bring_up_workers` returns `Ok`, the same-plan refresh at its
+  `self.forwarding` swap (nothing fallible follows it). The build keeps only the
+  ADDITIVE get-or-create, which cannot be deferred: the slot map caches real
+  per-zone `Arc`s at build time. Bound by
+  `rejected_apply_does_not_prune_live_zone_counters_6832` (negative) plus
+  `committed_reconcile_…` / `committed_refresh_…` (one per call site).
+
+  Scope note: this is the ZONE-counter store only. The same rejected build
+  still leaves get-or-create residue in the shared `PolicyCounterStore` and
+  `NatCounterStore` — pre-existing, untouched by #6832, tracked as **#6995**,
+  and now asserted rather than only described, by
+  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`: it
+  drives the four belts with all three stores LIVE (the other rejection tests
+  pass fresh siblings, so they prove the zone guarantee only against empty
+  neighbours) and pins the residue in BOTH sibling stores, so a later fix to
+  either half of #6995 reds it instead of leaving this note stale.
+
+  "Both" is load-bearing and was not true when first written: the row seeded
+  only the NAT store and left the policy store a bare `default()`, so the
+  policy half was still the empty neighbour the row exists to stop relying on.
+  It now seeds the policy store through the production path (a clean build,
+  which get-or-creates the reserved default-policy counter), carries a
+  candidate-only `probe-rule` so the residue is distinguishable from the seed,
+  and asserts both halves belt-by-belt — the dup-zone belt sits above both
+  parses and leaves neither, the other three sit below and leave both.
+
 - **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting (the screen module holds per-zone
   rate-limiter state, not cumulative per-zone flood-event counters), and per the
