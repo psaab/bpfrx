@@ -39,7 +39,28 @@ import (
 // text that describes it. It is not a proxy for the message's correctness: it
 // is the same kind of fact the message asserts.
 //
-// SCOPE, measured rather than asserted (#6928). This pins WHO calls
+// #6743 ADDED A LEVEL OF INDIRECTION and it matters to what this walk can
+// prove. `Manager.Teardown` no longer calls `Cleanup()`; it calls
+// `teardownCleanupFn()`, a package-level var whose production value is
+// `Cleanup` (a test seam, so a unit test can drive the real Teardown without
+// os.RemoveAll-ing the machine's /sys/fs/bpf/xpf). Two consequences:
+//
+//   - A CALL-ONLY walk goes blind to that edge and reports it as "Teardown no
+//     longer reaches Cleanup" — a false alarm pointing at the operator text in
+//     the direction of a claim that is NOT true. The walk therefore records
+//     function-VALUE references too, and tags each entry `(call)` or
+//     `(value)`, so an indirection is visible as an indirection rather than as
+//     a deletion.
+//   - The value handoff alone no longer proves Teardown reaches Cleanup:
+//     deleting `err := teardownCleanupFn()` leaves the var, its initializer,
+//     and this entire caller set unchanged. That half is bound behaviourally
+//     by TestTeardownInvokesTheCleanupSeam_6928 at the bottom of this file.
+//     Both halves were measured, not argued: severing the invocation reds the
+//     behavioural test and leaves this walk GREEN; rewriting the initializer
+//     reds this walk and leaves the behavioural test green (it substitutes the
+//     seam itself). Neither guard subsumes the other.
+//
+// SCOPE, measured rather than asserted (#6928). This pins WHO can name
 // `Cleanup()`. It does NOT pin mode PLACEMENT — that a call sits in the
 // non-hitless arm specifically, or that anything reaches it at all. That half
 // is bound behaviourally, in
@@ -64,14 +85,84 @@ import (
 // is labelled as such there; it cannot tell a true remediation from a false
 // one that avoids those words.
 
-// cleanupCaller is one production call to dataplane.Cleanup(), identified by
-// the package-relative file and the enclosing function.
+// cleanupRefKind distinguishes the two ways production source can reach
+// dataplane.Cleanup(). Both are real edges and the walk must see both:
+// #6743 turned the Teardown edge from a CALL into a function VALUE
+// (`var teardownCleanupFn = Cleanup`, invoked indirectly by Teardown), and a
+// call-only walk reported that as "Teardown no longer reaches Cleanup" — a
+// false alarm in the direction that would have invited someone to "correct"
+// the operator text to a claim that is not true.
+type cleanupRefKind string
+
+const (
+	cleanupRefCall  cleanupRefKind = "call"  // Cleanup(...)
+	cleanupRefValue cleanupRefKind = "value" // Cleanup used as a func value
+)
+
+// cleanupCaller is one production reference to dataplane.Cleanup(),
+// identified by the package-relative file, the enclosing declaration, and
+// whether it is a call or a function-value handoff.
 type cleanupCaller struct {
 	file string // repo-relative, slash-separated
 	fn   string
+	kind cleanupRefKind
 }
 
-func (c cleanupCaller) String() string { return c.file + ":" + c.fn }
+func (c cleanupCaller) String() string {
+	return c.file + ":" + c.fn + " (" + string(c.kind) + ")"
+}
+
+// namesCleanup reports whether e names THIS package's Cleanup under the
+// import binding the enclosing file established.
+func namesCleanup(e ast.Expr, bareIsOurs bool, qualifier string) bool {
+	switch x := e.(type) {
+	case *ast.Ident:
+		return bareIsOurs && x.Name == "Cleanup"
+	case *ast.SelectorExpr:
+		pkg, ok := x.X.(*ast.Ident)
+		return ok && qualifier != "" && pkg.Name == qualifier && x.Sel.Name == "Cleanup"
+	}
+	return false
+}
+
+// appendCleanupRefs records every reference to dataplane.Cleanup inside root,
+// attributed to enclosing, tagging each as a call or a function value.
+func appendCleanupRefs(found *[]cleanupCaller, root ast.Node, rel, enclosing string, bareIsOurs bool, qualifier string) {
+	callees := map[ast.Expr]bool{}
+	ast.Inspect(root, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			callees[call.Fun] = true
+		}
+		return true
+	})
+	record := func(e ast.Expr) {
+		kind := cleanupRefValue
+		if callees[e] {
+			kind = cleanupRefCall
+		}
+		*found = append(*found, cleanupCaller{rel, enclosing, kind})
+	}
+	ast.Inspect(root, func(n ast.Node) bool {
+		switch e := n.(type) {
+		case *ast.SelectorExpr:
+			if namesCleanup(e, bareIsOurs, qualifier) {
+				record(e)
+			}
+			// Never descend into a selector. e.Sel is an Ident literally
+			// named "Cleanup", so descending double-counts a qualified
+			// reference — and inside package dataplane it would also count
+			// an unrelated METHOD call `x.Cleanup()` as this package's
+			// function.
+			return false
+		case *ast.Ident:
+			if bareIsOurs && e.Name == "Cleanup" {
+				record(e)
+			}
+			return false
+		}
+		return true
+	})
+}
 
 // dataplaneImportPath is the package whose Cleanup() this test tracks.
 const dataplaneImportPath = "github.com/psaab/xpf/pkg/dataplane"
@@ -165,28 +256,32 @@ func findCleanupCallers(t *testing.T, root string) []cleanupCaller {
 		}
 
 		for _, decl := range f.Decls {
-			fd, ok := decl.(*ast.FuncDecl)
-			if !ok || fd.Body == nil {
-				continue
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Body == nil {
+					continue
+				}
+				appendCleanupRefs(&found, d.Body, rel, d.Name.Name, bareIsOurs, qualifier)
+			case *ast.GenDecl:
+				// #6743 put the Teardown edge in a package-level var
+				// initializer (`var teardownCleanupFn = Cleanup`), which has
+				// no enclosing FuncDecl at all. A walk that only descends
+				// into function bodies cannot see that edge, and reported its
+				// disappearance as a call-graph change.
+				if d.Tok != token.VAR && d.Tok != token.CONST {
+					continue
+				}
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					enclosing := strings.ToLower(d.Tok.String()) + " " + vs.Names[0].Name
+					for _, v := range vs.Values {
+						appendCleanupRefs(&found, v, rel, enclosing, bareIsOurs, qualifier)
+					}
+				}
 			}
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				switch fun := call.Fun.(type) {
-				case *ast.Ident: // bare: Cleanup()
-					if bareIsOurs && fun.Name == "Cleanup" {
-						found = append(found, cleanupCaller{rel, fd.Name.Name})
-					}
-				case *ast.SelectorExpr: // qualified: <local>.Cleanup()
-					pkg, ok := fun.X.(*ast.Ident)
-					if ok && qualifier != "" && pkg.Name == qualifier && fun.Sel.Name == "Cleanup" {
-						found = append(found, cleanupCaller{rel, fd.Name.Name})
-					}
-				}
-				return true
-			})
 		}
 		return nil
 	})
@@ -227,8 +322,14 @@ func TestCleanupProductionCallersMatchRemediation_6928(t *testing.T) {
 	}
 
 	want := []string{
-		"cmd/xpfd/main.go:main",            // the `xpfd cleanup` subcommand
-		"pkg/dataplane/loader.go:Teardown", // non-hitless shutdown path
+		// the `xpfd cleanup` subcommand
+		"cmd/xpfd/main.go:main (call)",
+		// the non-hitless shutdown path. #6743 moved this edge behind the
+		// `teardownCleanupFn` test seam, so what the source now holds is a
+		// function VALUE that Manager.Teardown invokes indirectly. That the
+		// invocation still happens is not a syntactic fact and is bound
+		// behaviourally by TestTeardownInvokesTheCleanupSeam_6928 below.
+		"pkg/dataplane/loader.go:var teardownCleanupFn (value)",
 	}
 	gotStr := make([]string, 0, len(got))
 	for _, c := range got {
@@ -271,3 +372,70 @@ func TestCleanupProductionCallersMatchRemediation_6928(t *testing.T) {
 // pinned dataplane state of whatever machine runs the suite. Substituting the
 // `RuntimeDataPlane` interface at the daemon's call site avoids that entirely:
 // the fake records the call and touches no bpffs.
+
+// TestTeardownInvokesTheCleanupSeam_6928 binds the half of the reachability
+// claim the AST walk above structurally CANNOT bind after #6743.
+//
+// Before #6743 `Manager.Teardown` called `Cleanup()` directly, so "Teardown
+// reaches Cleanup" was a syntactic fact and the walk was the whole proof.
+// #6743 replaced the call with `teardownCleanupFn()`, a package-level var
+// whose production value is `Cleanup`. The walk can still see the VALUE
+// handoff — that is what the "(value)" entry in the want set is — but a
+// function value sitting in a var proves nothing about whether anything
+// invokes it. Deleting `err := teardownCleanupFn()` from Teardown leaves the
+// var, its initializer, and therefore the entire caller set unchanged.
+//
+// So the two halves are split deliberately:
+//   - the walk pins WHICH production sites can name Cleanup at all (and would
+//     fire if a third appeared, or if the Teardown handoff were deleted);
+//   - this test pins that Teardown actually INVOKES the seam, which is the
+//     fact "a non-hitless shutdown unpins everything, so a restart is enough"
+//     rests on;
+//   - TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) pins that the
+//     non-hitless arm is the one that calls Teardown.
+//
+// Fail-on-revert, observed: dropping the `teardownCleanupFn()` call from
+// Teardown leaves `go test -run 6928 ./pkg/dataplane/` RED here and GREEN in
+// the walk above — which is exactly why this test exists and the walk alone
+// is no longer sufficient.
+//
+// The real Cleanup is never invoked: it does os.RemoveAll("/sys/fs/bpf/xpf")
+// and would destroy the pinned dataplane state of whatever machine runs the
+// suite. The seam is restored unconditionally on return.
+func TestTeardownInvokesTheCleanupSeam_6928(t *testing.T) {
+	// NOT t.Parallel(): this mutates a package-level var that the production
+	// Teardown reads, and a sibling test doing the same would interleave.
+	defer func(fn func() error) { teardownCleanupFn = fn }(teardownCleanupFn)
+
+	called := 0
+	teardownCleanupFn = func() error { called++; return nil }
+
+	m := New()
+	if err := m.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("Manager.Teardown invoked the pinned-state sweep %d times, want 1.\n\n"+
+			"userspaceShimStalePinRemediation and the types.go:sessions notes tell an "+
+			"operator that a NON-hitless shutdown unpins the maps, so a plain restart "+
+			"clears a stale pin. That sentence is true only while Teardown actually "+
+			"runs the sweep. The caller-set walk in this file cannot see this: it "+
+			"reports the `var teardownCleanupFn = Cleanup` handoff, which survives "+
+			"unchanged when the invocation is deleted (#6928/#6743).", called)
+	}
+
+	// Polarity control: Close is the HITLESS path and must NOT run the sweep,
+	// because the pins are deliberately left for the next daemon. Without this
+	// arm the test above stays green if BOTH lifecycle methods swept, which
+	// would make the mode-dependent wording wrong in the other direction.
+	called = 0
+	m2 := New()
+	if err := m2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if called != 0 {
+		t.Fatalf("Manager.Close invoked the pinned-state sweep %d times, want 0 — a "+
+			"hitless shutdown must PRESERVE the pins, and if it does not then "+
+			"\"a hitless restart hits the identical refusal\" is false (#6928)", called)
+	}
+}

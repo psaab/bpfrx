@@ -96167,3 +96167,55 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: _Log.md, pkg/daemon/shutdown_dataplane_mode_6928_test.go,
   userspace-dp/src/afxdp/poll_descriptor/filter.rs,
   userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 post-merge repair — the `Cleanup()` reachability guard
+  went RED against master and the RED was TRUE about the source while FALSE
+  about the behaviour, which is the dangerous polarity.
+
+  **What happened.** #6743 introduced a test seam: `Manager.Teardown` no longer
+  calls `Cleanup()`, it calls `teardownCleanupFn()`, a package-level var whose
+  production value is `Cleanup`. `TestCleanupProductionCallersMatchRemediation_6928`
+  walks the AST for CALL expressions only, so the edge vanished from its census
+  and it reported `got: cmd/xpfd/main.go:main` against a two-entry `want`. Read
+  naively that says "a non-hitless shutdown no longer unpins the maps", which
+  would have sent the next round to REWRITE the operator-facing stale-pin
+  remediation to a claim that is not true. Production still reaches `Cleanup`;
+  only the syntax moved.
+
+  **Repair, in two parts, because the guard could no longer prove what it
+  claimed with one.**
+
+  1. The walk now records function-VALUE references as well as calls, tagging
+     each entry `(call)` or `(value)`, and descends into package-level
+     `var`/`const` initializers — `var teardownCleanupFn = Cleanup` has no
+     enclosing `FuncDecl` at all, so a body-only walk cannot see it. Selector
+     expressions are matched at the selector and NOT descended into, because
+     `e.Sel` is an `Ident` literally named `Cleanup` (double-count) and inside
+     package `dataplane` an unrelated method call `x.Cleanup()` would otherwise
+     be counted as this package's function.
+  2. New `TestTeardownInvokesTheCleanupSeam_6928` binds the half the walk
+     structurally CANNOT: a function value sitting in a var proves nothing
+     about whether anything invokes it. It substitutes the seam, drives the
+     real `Manager.Teardown`, and asserts one invocation — plus the polarity
+     control that `Manager.Close` invokes it ZERO times, without which the test
+     stays green if BOTH lifecycle methods swept and the mode-dependent wording
+     becomes wrong in the other direction.
+
+  **Two-cell measurement proving neither guard subsumes the other** (anchor
+  uniqueness asserted at 1 per cell; `pkg/dataplane/loader.go` restored and
+  `git diff --quiet`-verified after each):
+
+  | cell | mutation | behavioural | walk |
+  |---|---|---|---|
+  | B | delete `err := teardownCleanupFn()` from `Teardown` | **RED** ("invoked the pinned-state sweep 0 times, want 1") | GREEN |
+  | C | `var teardownCleanupFn = func() error { return nil }` | GREEN (it substitutes the seam itself) | **RED**, naming the missing `(value)` entry |
+
+  Cell B is the whole justification for part 2: the mutation that most directly
+  falsifies the operator sentence is invisible to the call-graph instrument.
+
+  **No operator-facing claim was falsified by the merge.** `types.go:130-160`,
+  its v6 twin, `loader_userspace_shim.go:37-55` and `pkg/dataplane/README.md`
+  all say `Manager.Teardown` unpins on a non-hitless shutdown; that remains
+  true through the seam. No prose was changed.
+- **File(s)**: _Log.md, pkg/dataplane/cleanup_reachability_6928_test.go
