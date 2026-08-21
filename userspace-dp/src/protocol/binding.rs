@@ -1233,5 +1233,23 @@ pub(crate) struct SessionDeltaInfo {
     pub log_session_init: bool,
     #[serde(rename = "log_session_close", default)]
     pub log_session_close: bool,
+    /// #6312: the ORIGINATING node's STABLE RT_FLOW session id, mirrored from
+    /// `SessionDelta.session_id` — the same value the binary open frame carries
+    /// in its trailing u64 (#5212, `event_stream/codec/session_sync.rs`) — onto
+    /// the JSON RPC-fallback delta. Without it a session recovered through the
+    /// JSON leg (`drain_session_deltas` polling while the event stream is down,
+    /// and the owner-RG resync export) imported id 0 and the peer minted a fresh
+    /// local id, so its SESSION_CLOSE no longer correlated with the originating
+    /// node's SESSION_CREATE.
+    ///
+    /// The Go consumer field already existed for the binary leg
+    /// (`SessionDeltaInfo.RTFlowSessionID`, `json:"rt_flow_session_id"`); the
+    /// rename below MUST match that tag. Additive and rolling-upgrade safe in
+    /// both directions: an old helper omits the key and `default` decodes 0, an
+    /// old daemon ignores a key it does not know, and 0 is the pre-existing
+    /// "no id carried" sentinel that falls back to a fresh local id — i.e. the
+    /// exact pre-#6312 behaviour of this leg.
+    #[serde(rename = "rt_flow_session_id", default)]
+    pub rt_flow_session_id: u64,
 }
 

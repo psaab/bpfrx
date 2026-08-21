@@ -1479,7 +1479,11 @@ closed on the standby after a failover carried different ids on the two nodes.
 #5212 carries the originating node's id on the HA session-sync wire as a
 length-gated trailing field (both sides, mirroring the #4565/#5274 discipline):
 `SessionDelta.session_id` → the MSG_SESSION_OPEN frame's trailing `session_id`
-u64 (`encode_session_open`) → Go `SessionDeltaInfo.RTFlowSessionID` →
+u64 (`encode_session_open`) — and, since #6312, the JSON RPC-fallback delta's
+`rt_flow_session_id` key (`afxdp::session_delta_info`), so a session recovered
+through the `drain_session_deltas` polling leg or the owner-RG resync export
+carries the id at parity with the binary frame instead of importing 0 →
+Go `SessionDeltaInfo.RTFlowSessionID` →
 `SessionValue{,V6}.RTFlowSessionID` → the cluster sync wire (a length-gated
 trailing u64 in `encodeSessionV{4,6}Payload`, after the #5274 `ConfigEpoch`) →
 `SessionSyncRequest.session_id` → `build_synced_session_entry`. On import,

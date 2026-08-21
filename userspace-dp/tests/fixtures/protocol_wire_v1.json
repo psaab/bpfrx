@@ -1044,6 +1044,7 @@
     "owner_rg_id": 0,
     "protocol": 0,
     "queue_id": 0,
+    "rt_flow_session_id": 0,
     "slot": 0,
     "src_ip": "",
     "src_mac": "",

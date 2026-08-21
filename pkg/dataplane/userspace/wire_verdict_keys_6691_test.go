@@ -21,7 +21,17 @@ import (
 func rustSnapshotSerdeRename(t *testing.T, rustField string) string {
 	t.Helper()
 	// Test cwd is pkg/dataplane/userspace.
-	path := filepath.Join("..", "..", "..", "userspace-dp", "src", "protocol", "snapshot.rs")
+	return rustSerdeRenameIn(t,
+		filepath.Join("..", "..", "..", "userspace-dp", "src", "protocol", "snapshot.rs"),
+		rustField)
+}
+
+// rustSerdeRenameIn is rustSnapshotSerdeRename against an arbitrary Rust wire
+// module, so a sibling key-agreement guard over another protocol struct
+// (session_delta_rt_flow_session_id_key_6312_test.go) parses the declaration
+// with the SAME regex instead of writing a second one that could drift.
+func rustSerdeRenameIn(t *testing.T, path, rustField string) string {
+	t.Helper()
 	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v (the Go/Rust wire-key lockstep guard cannot run)", path, err)
