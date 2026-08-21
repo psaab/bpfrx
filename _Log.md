@@ -97997,3 +97997,32 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_slot_escape_gate_test.go,
   pkg/config/schema_slot_escape_fixtures_test.go, docs/config-schema.md,
   _Log.md
+
+## 2026-08-21 — #7149 dataplane: recompile FIB generation bump error no longer discarded
+
+- **Timestamp**: 2026-08-21
+- **Action**: Split #7149 out of #4960 and fixed it. `CompileConfig` ended a
+  recompile with a bare `dp.BumpFIBGeneration()`, dropping both results.
+  Diffing every `dp.<Method>` the compiler calls against
+  `userspaceShimCompileDataplane`'s override set shows only three are NOT
+  overridden as no-ops — `IsLoaded` and `GetPersistentNAT` (pre-mutation, no
+  error) and `BumpFIBGeneration`, which promotes to the embedded `*Manager` and
+  performs a real bpffs map write. Driving the production shim returns
+  `dataplane not armed: fib_gen_map`, and `(*Manager).BumpFIBGeneration`'s
+  not-armed branch logs nothing. `userspace/manager_compile.go` then builds the
+  snapshot with `m.readFIBGeneration()` off that same map, so a failed bump
+  publishes the PREVIOUS generation and established flows keep a cached
+  next-hop the recompile may have invalidated, apply reporting success.
+  Reported rather than returned: the site is post-`compileZones`, so
+  propagating would manufacture the #4960 half-applied shape.
+
+  Validation: `go test -count=1 ./pkg/dataplane/...` exit 0, `go vet
+  ./pkg/dataplane/...` exit 0. Mutation matrix, one mutation per cell, exit
+  codes captured from `$?`: revert the call site to the bare call → exit 1,
+  source walk only; gut the helper to `_, _ =` → exit 1, both guards; warn
+  unconditionally → exit 1, success control only; delete the only production
+  call → exit 1 on the floor. Go-only diff, no shim `.o` or protocol movement,
+  so no cluster smoke is owed.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
+  pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
+  _Log.md
