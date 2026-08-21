@@ -157,9 +157,6 @@ var knownSpellingInconsistencies = map[string]string{
 	"system services web-management api-auth api-key": "#6692",
 	"system dataplane shared-umem interface":          "#6692",
 
-	// #6688 — source-NAT port range compiles a one-port pool.
-	"security nat source pool <*> port range": "#6688",
-
 	// #7126 — the flat-set bracket list lands on a CHILD's Keys for any leaf
 	// setSchema does not mark multi, so a reader taking Keys[0] of each child
 	// keeps only the first value even though it reads both sides.

@@ -4079,6 +4079,39 @@ PAT-translating over a range the operator did not configure. Fail-on-revert:
 `TestSourceNATSnapshotInvalidPortRangeUnusable_5457`
 (`pkg/dataplane/userspace/nat_source_pool_port_5457_test.go`).
 
+**Source-NAT pool `port range` has a FIXED arity, and `port range` is not a
+value list (#6688).** `#5457` validated the endpoints the grammar consumed; it
+did not bound how many tokens the grammar consumed. `parseSourcePoolPortRange`
+matched `low <lo> high <hi>` at `len(toks) >= 4` and `<low> to <high>` at
+`len(toks) >= 3`, discarding the remainder — so `port range 1000 2000` parsed as
+the bare single-port shape `<low>` and compiled `PortLow == PortHigh == 1000`. A
+pool the operator sized at 1001 ports provided ONE, committed clean, and
+exhausted under the first real translation load; the second slot was never
+parsed, so `port range [ 1000 99999 ]` and `port range [ 1000 notaport ]`
+committed clean as well.
+
+The lexer strips `[`/`]` before the compiler observes anything (see "Multi-value
+leaves and bracketed lists"), so the bracketed spelling and the mistyped bare
+spelling arrive as the SAME token slice. Reading `["1000","2000"]` as
+`[1000,2000]` was therefore rejected as the fix: it would invent a two-token
+`range <low> <high>` grammar Junos does not have AND silently redefine the
+mistyped bare form. Both shapes now match at an EXACT arity and any unconsumed
+token fails closed through the existing `PortRangeInvalidSpec` channel — strict
+commit hard-rejects naming the offending spec, the tolerant path marks the pool
+unusable. Fail-on-revert:
+`TestParseSourcePoolPortRangeUnconsumedTail_6688` /
+`TestSourceNATPoolPortRangeTailFailsClosed_6688` /
+`TestSourceNATPoolPortRangeValidUnaffected_6688` (the over-reject control)
+(`pkg/config/compiler_nat_source_pool_port_6688_test.go`).
+
+This also retired the `security nat source pool <*> port range` row from
+`knownSpellingInconsistencies` (the #2419 spelling-differential gate): with the
+tail rejected rather than discarded, every compared spelling of a two-token tail
+now reaches the same verdict. The site is still ENUMERATED and COMPARED by the
+gate (4 of 5 spellings carry a verdict) — it was not moved to `notAValueList`,
+because the agreement is now a real property of the compiler rather than a
+meaningless verdict.
+
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via
 `firewallMatchValues`. Both are `multi:true`; before the second #2419 fold
