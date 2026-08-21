@@ -98065,3 +98065,31 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #5081 non-auth half. `transferCommitGracePeriodLocked` sized the
+  manual-transfer grace from the DESIRED heartbeat timing
+  (`m.hbThreshold`/`m.hbInterval`, rewritten by `UpdateConfig` on every commit)
+  while dead-peer detection runs on the receiver's snapshot taken at
+  `StartHeartbeat` — and nothing restarts the heartbeat for a timing change, so
+  after `set chassis cluster heartbeat-interval` the two disagree. A commit that
+  SHORTENS the timing under-runs the grace (desired 3x100ms → the 10s floor,
+  while the running receiver still declares death at 5x1000ms = 5s), so the
+  suppression window can lapse mid-transfer and the transfer takes a spurious
+  peer-death failover. Added `liveHeartbeatTimingLocked` (live receiver values,
+  falling back to desired when no heartbeat runs) and sourced both the grace and
+  `FormatInformation` from it; status now names the committed-but-unapplied
+  values on a `Heartbeat pending restart:` line and is byte-identical when they
+  agree. Applying a committed change to live comms is the remaining half (auth
+  posture + timing in the restart key) and is filed separately.
+
+  Validation: `go build ./...` exit 0, `go vet ./pkg/cluster/ ./pkg/dataplane/...`
+  exit 0, `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0. Mutation
+  matrix, one mutation per cell, exit codes from `$?`: revert the grace to
+  `m.hbInterval, m.hbThreshold` → exit 1 (`grace = 10s, want 15s`); revert the
+  status read to `m.hbInterval, m.hbThreshold` → exit 1 (all four render
+  assertions). Restored → exit 0. Go-only diff, no shim `.o` or protocol
+  movement; the change is on the manual-transfer path, so `make test-failover`
+  is owed and was NOT run by this lane.
+- **File(s)**: pkg/cluster/failover.go, pkg/cluster/status.go,
+  pkg/cluster/README.md, pkg/cluster/transfer_grace_live_timing_5081_test.go,
+  _Log.md

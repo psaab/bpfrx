@@ -55,13 +55,50 @@ locating any symbol below is now a matter of opening the named file.
   (`applyPeerTransferOutOverrideLocked`,
   `clearPeerTransferOutOverrideLocked`,
   `restorePeerTransferOutOverrideLocked`,
-  `transferCommitGracePeriodLocked`,
+  `transferCommitGracePeriodLocked` — sized from
+  `liveHeartbeatTimingLocked`, see "Live vs desired heartbeat
+  timing" below,
   `suppressPeerTimeoutForTransferCommitLocked`,
   `applyTransferCommitOverridesOnPeerStateLocked`) — `failover.go`.
   Co-locating the entire manual-failover locking domain in one
   file keeps the "committed-failover-suppresses-stale-heartbeat"
   invariant answerable by reading one file end-to-end.
 - Readiness gate (`SetRGReady`) — `readiness.go`.
+
+### Live vs desired heartbeat timing (#5081)
+
+`Manager.hbInterval` / `Manager.hbThreshold` are the **desired**
+(committed) values: `UpdateConfig` rewrites them on every commit.
+`StartHeartbeat` snapshots them into the sender and the receiver, and
+nothing restarts the heartbeat when only the timing changes — the
+restart trigger keys on endpoint fields (`clusterTransportKey`,
+`pkg/daemon/daemon_ha_sync.go`), and `RestartHeartbeat` is reached only
+from the VRF-rebind path. So after `set chassis cluster
+heartbeat-interval` the wire keeps the old cadence and
+`heartbeatReceiver.checkTimeout` keeps declaring the peer dead at the
+old `threshold * interval` until something else rebuilds the heartbeat.
+
+`liveHeartbeatTimingLocked` (`failover.go`) returns what the RUNNING
+receiver is using, falling back to the desired values when no heartbeat
+is running. Anything whose correctness depends on covering dead-peer
+detection MUST size from it, not from `m.hbInterval` /
+`m.hbThreshold` directly:
+
+- `transferCommitGracePeriodLocked` — sizing this from the desired
+  values under-runs the window whenever a commit SHORTENS the
+  configured timing (desired `3 x 100ms` yields the 10s floor while the
+  running receiver still declares death at `5 x 1000ms`), so the grace
+  can expire before the timeout it exists to suppress and a manual
+  transfer takes a spurious peer-death failover.
+- `FormatInformation` (`status.go`) renders the live values and names
+  the committed-but-unapplied ones on a separate
+  `Heartbeat pending restart:` line; when they agree the render is
+  byte-identical to pre-#5081.
+
+Applying a committed timing change to the live heartbeat (rather than
+only reporting the divergence) is the remaining half and is tracked
+separately — it belongs with the control-link auth posture in the
+comms restart key.
 - Group-state accessors (`UpdateConfig`, `GroupStates`,
   `DataGroupIDs`, `GroupState`, `IsLocalPrimary`,
   `IsLocalPrimaryAny`, `LocalPriorities`) — `group_state.go`.

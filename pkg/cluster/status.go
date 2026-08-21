@@ -116,8 +116,15 @@ func (m *Manager) FormatInformation() string {
 	peerVersion := m.peerSoftwareVersion
 	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
-	interval := m.hbInterval
-	threshold := m.hbThreshold
+	// #5081: report what the heartbeat is ACTUALLY running with. The
+	// committed interval/threshold are not applied to a running heartbeat
+	// (nothing restarts it for a timing change), so rendering the desired
+	// values told the operator the new timing was in effect when the wire
+	// was still on the old one. When they differ the pending values are
+	// named on their own line instead of silently replacing the live ones.
+	interval, threshold := m.liveHeartbeatTimingLocked()
+	desiredInterval := m.hbInterval
+	desiredThreshold := m.hbThreshold
 	controlIface := m.controlInterface
 	configSyncFailing := m.configSyncFailing   // #6387
 	configSyncReason := m.configSyncFailReason // #6387
@@ -152,6 +159,10 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Node ID: %d\n", m.nodeID)
 	fmt.Fprintf(&b, "  Heartbeat interval: %d ms\n", interval.Milliseconds())
 	fmt.Fprintf(&b, "  Heartbeat threshold: %d\n", threshold)
+	if desiredInterval != interval || desiredThreshold != threshold {
+		fmt.Fprintf(&b, "  Heartbeat pending restart: configured interval %d ms, threshold %d (not applied to the running heartbeat)\n",
+			desiredInterval.Milliseconds(), desiredThreshold)
+	}
 	if controlIface != "" {
 		fmt.Fprintf(&b, "  Control interface: %s\n", controlIface)
 	}
