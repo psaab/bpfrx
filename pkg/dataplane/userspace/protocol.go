@@ -304,13 +304,25 @@ type InterfaceSnapshot struct {
 	// ifindex named. That is the whole of the helper-side check: there is no row
 	// classification left for a config shape to disagree with.
 	//
-	// Emitted UNCONDITIONALLY (no omitempty). At ProtocolVersion 5 the field is
-	// part of the contract in both directions: the Rust side decodes it as a
-	// plain `String` (userspace-dp/src/protocol/snapshot.rs), so "" is a
+	// Emitted UNCONDITIONALLY (no omitempty), so a "" answer is on the wire as a
 	// DECISION — this Go binary determined the ifindex identifies no zone — and
 	// resolves the 0 sentinel. There is no "the field was absent" arm to fall
 	// back to; the compatibility arm that used to exist was deleted with the
 	// row-unanimity rule it restored.
+	//
+	// THAT IS A DESIGN STATEMENT, NOT A BEHAVIOURAL GUARD, and the difference is
+	// worth stating because it reads like one. The Rust side declares
+	// `#[serde(rename = "egress_zone", default)]` (snapshot.rs), so an ABSENT
+	// key and an emitted "" decode identically: both give `String::new()`, which
+	// `EgressZoneClaim::Decided("")` resolves to `None` and the 0 sentinel.
+	// Adding `omitempty` here would therefore change no answer the helper gives,
+	// and no test can red on it — the one Go wire pin,
+	// TestEgressZoneCrossesTheWireAndTheQuarantine_6722, asserts the NONEMPTY
+	// case, which omitempty does not touch. The tag is kept because "the builder
+	// always states its answer" is the property this field is FOR, and because a
+	// future `deny_unknown_fields` or a non-defaulting decoder would make the
+	// two spellings diverge; it is not kept because something would catch its
+	// removal today.
 	//
 	// MIXED VERSION IS REFUSED, NOT TOLERATED. ProtocolVersion moved 4 -> 5 in
 	// this change (see the constant above), and ensureEgressZoneProtocolLocked

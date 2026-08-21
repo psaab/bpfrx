@@ -966,6 +966,30 @@ Scope of the fallback:
      children all live on their own `<dev>.<vlan>` devices. It takes the zone its
      units unanimously name — which is what keeps the reference cluster's
      `reth0` base (ifindex 25) zoned `wan`, matching `origin/master`.
+     Unanimity is over the units that actually SAY something: an unzoned unit
+     and a present-but-nil unit slot (the tolerant-load / HA config-sync shape of
+     #3494/#5068) are skipped rather than counted as dissent, and units naming
+     DIFFERENT zones resolve no zone at all.
+
+  Two properties hold across all three rules and are load-bearing rather than
+  incidental, so each has a binder in
+  `pkg/dataplane/userspace/egress_zone_identity_6722_test.go` (#6722 round 12):
+
+  - **The two zone maps must not disagree.** `authoredZoneRefs` and
+    `buildInterfaceZoneMap` are built by separate code for separate consumers,
+    but they read the same operator sentences through the same canonicalizer and
+    pick a winner the same way — zone names sorted, first write wins. Rule 2
+    resolves from the first while the helper's corroboration check reads rows
+    stamped from the second, so a divergence about a reference BOTH maps hold is
+    a claim the helper will honour under a zone the operator did not write for
+    that identity. They are free to diverge in future — a move to Junos per-unit
+    zoning would want one to stop fanning up to the base — but not silently.
+  - **Every answer must be order-stable.** Nothing here may depend on Go's
+    randomized map iteration. An egress zone that varies with the map seed is a
+    to-zone that changes across daemon restarts on an unchanged config, and a
+    "fail closed" that holds in only some iteration orders is not failing closed.
+    The fail-closed cells therefore rebuild and re-assert rather than sampling
+    one order.
 
   Measured through the full `buildSnapshot` on `docs/ha-cluster-userspace.conf`
   (node 0 — the topology `test/incus/loss-userspace-cluster.env` points every HA

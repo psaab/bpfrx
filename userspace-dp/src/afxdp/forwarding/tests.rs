@@ -6176,9 +6176,31 @@ fn uncorroborated_egress_zone_claim_is_refused_6722() {
 
 /// Rows on ONE ifindex carrying DIFFERENT claims fail closed. The builder
 /// stamps them identically, so a disagreement is version drift.
+///
+/// THE FIXTURE IS THE CELL (round 12). The obvious fixture —
+/// `reth_member_unzoned_row_snapshot_6722`, whose LAN rows carry only `lan` and
+/// `""` — cannot see the mechanism this cell names. Injecting a second claim of
+/// `wan` there is refused by CORROBORATION, because no row on that ifindex
+/// carries `wan`, and the merge is never consulted. MEASURED at 6e62cd01d:
+/// replacing `EgressZoneClaim::merge`'s agreeing arm with last-write-wins
+/// (`Self::Decided(_have) => Self::Decided(egress_zone.to_string())`) left the
+/// whole cargo suite green — 4400 passed, rc=0 — including that spelling of this
+/// cell run on its own. It named the merge and bound the corroboration.
+///
+/// So it runs on `reth_member_explicitly_zoned_snapshot_6722`, where the member
+/// row carries `wan` and the two RETH rows carry `lan`: BOTH claimed values are
+/// literally on the ifindex, so corroboration cannot refuse either one and the
+/// merge is the only thing left that can. The precondition below asserts exactly
+/// that, so the cell cannot silently drift back into vacuity if the fixture's
+/// zones change.
+///
+/// FAIL-ON-REVERT: either spelling of a last-write-wins merge — replacing the
+/// agreeing arm, or replacing the `_ => Self::Conflicting` arm so `Conflicting`
+/// stops being sticky — resolves `wan` for the LAN ifindex, and a drifted or
+/// hostile snapshot then makes WAN->LAN transit a same-zone flow.
 #[test]
 fn conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722() {
-    let mut snapshot = reth_member_unzoned_row_snapshot_6722();
+    let mut snapshot = reth_member_explicitly_zoned_snapshot_6722();
     let mut first = true;
     for iface in &mut snapshot.interfaces {
         if iface.ifindex == LAN_IFINDEX_6722 {
@@ -6186,8 +6208,32 @@ fn conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722() {
             first = false;
         }
     }
+    // ANTI-VACUITY PRECONDITION. Both claimed values must be CORROBORATED —
+    // carried as some row's own `zone` on this ifindex — or `resolve`'s
+    // corroboration check refuses the claim before the merge's answer matters,
+    // and a green here says nothing about the merge.
+    let carried: std::collections::BTreeSet<String> = snapshot
+        .interfaces
+        .iter()
+        .filter(|i| i.ifindex == LAN_IFINDEX_6722)
+        .map(|i| i.zone.clone())
+        .collect();
+    for claimed in ["lan", "wan"] {
+        assert!(
+            carried.contains(claimed),
+            "precondition: no row on ifindex {LAN_IFINDEX_6722} carries {claimed:?} \
+             (rows carry {carried:?}), so corroboration would refuse that claim on \
+             its own and this cell would bind the corroboration, not the merge"
+        );
+    }
+
     let state = build_forwarding_state(&snapshot);
 
+    assert!(
+        state.zone_name_to_id.contains_key("wan"),
+        "precondition: `wan` is a REAL configured zone with a nonzero id, so a 0 \
+         answer below is the drift refusal and not a missing zone-table entry"
+    );
     assert!(
         !state
             .ifindex_unambiguous_zone_id
@@ -6196,7 +6242,12 @@ fn conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722() {
     );
     let (_, to_id, _) =
         adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
-    assert_eq!(to_id, 0, "a conflicting claim resolves the 0 sentinel");
+    assert_eq!(
+        to_id, 0,
+        "a conflicting claim resolves the 0 sentinel; adopting the last writer's \
+         `wan` — which IS corroborated on this ifindex — would make WAN->LAN \
+         transit a same-zone flow"
+    );
 }
 
 // RETIRED in the same round that introduced it:

@@ -81073,3 +81073,69 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/reth_member_projection_6722_test.go,
   pkg/config/compiler_validate_strict_reth_member.go,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6722 round 12 — close the three blocking findings from the
+  hostile MERGE-BLOCK at `6e62cd01d`, then re-run the guard predicate over the
+  WHOLE of the change rather than the hunks the file was built around.
+  **F1 (BLOCKING)**: `conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722`
+  named `EgressZoneClaim::merge` and bound the corroboration instead. Confirmed
+  firsthand: with the agreeing arm replaced by last-write-wins the whole cargo
+  suite stayed green (rc=0, 4400 passed) including that cell run alone, because
+  its fixture `reth_member_unzoned_row_snapshot_6722` carries only `lan` and `""`
+  on the LAN ifindex, so the injected `wan` is refused by `resolve`'s
+  corroboration check before the merge's answer matters. Repointed at
+  `reth_member_explicitly_zoned_snapshot_6722`, where the member row carries
+  `wan` and the RETH rows carry `lan` so both claimed values are corroborated,
+  and added an anti-vacuity precondition asserting exactly that. Both
+  last-write-wins spellings — the agreeing arm and the `_ => Conflicting` arm —
+  now red it (rc=101 each). **F2 (BLOCKING)**: round 11 recorded M11
+  (`authoredZoneRefs` last-write-wins) as benign because "buildInterfaceZoneMap
+  applies the same first-write-wins"; the two agree BECAUSE of the deleted line.
+  The agreement is now bound directly (cell P, a 6-shape corpus asserting the two
+  maps never disagree about a ref both hold) and its dangerous outcome
+  separately (cell Q: a member in `aaa`+`zzz` with its reth in `zzz` fails
+  closed; under M11 both refs resolve `zzz`, rule 2 sees a singleton, and the
+  rows carry `zzz` so the Rust corroboration honours it). Bound as an AGREEMENT
+  rather than by collapsing the two builders, which may legitimately diverge.
+  **F3 (BLOCKING)**: the reviewer's six were a floor. Mutating every conditional
+  the change introduces or alters in `interfaces.go`/`zones.go` — sixteen cells,
+  one at a time — found SEVEN survivors and one binder that fired in 1 run of 8.
+  Bound: g8 (`CanonicalInterfaceUnitRef` dropped from the authored map — an
+  ordinary strict commit spelling `.01` loses the zone on BOTH ifindexes),
+  g5 (unzoned units counted as dissent), g6/g7 (present-but-nil #3494/#5068 unit
+  slots), and two the review did not name — x2 (`egressRethMemberOf` without the
+  `redundant-parent` match: any bare port sharing a netdev with a reth is taken
+  for its member) and x5 (`unanimousUnitZone` without the disagreement arm: an
+  ordinary two-VLAN trunk in two zones takes one of them by map order).
+  `egressIdentitiesCohere`'s `len(identities) > 2` refusal was FLAKILY bound —
+  measured 1 red in 8 whole-suite runs, because with the clause gone the
+  function reads `owners[0]`/`owners[1]` out of a map — so cell E now rebuilds
+  128 times and asserts "" on every build; 6 of 6 red after. Five clauses stay
+  unbound with a structural reason recorded in the file instead of a fixture
+  (the ifindex<=0 skip is redundant with `populate_interfaces`'s own; four
+  nil-guards cannot fire because a nil `InterfaceConfig` emits no row and so
+  names no owner; the `len(out) != len(idents)` assert is a construction
+  invariant; `firstConfiguredUnit`'s lowest-selection is dead because the int
+  return has no consumer; the empty-ref skip is unreachable from the parser).
+  **MINORs**: N1 M5's comment now argues from the bucket property
+  (`egressIdentitiesCohere` reads OWNERS, which the fold never alters) instead of
+  enumerating one shape, with a firsthand 18-shape / 36-ifindex-row differential
+  dump that is byte-identical with and without the clause; N2 cell O's control
+  now runs through the SAME lenient compile with the same empty MAC table, so
+  "changing nothing else" is true as written (it previously varied compile
+  strictness and MAC as well — all four combinations answer `lan`, so the
+  conclusion held, but the claim did not); N3 M10 is dead because
+  `egressRethMemberOf(X, X)` is a contradiction on the name alone, not because
+  of the parent match; N4 `protocol.go` no longer implies the missing `omitempty`
+  is a behavioural guard — `snapshot.rs` declares `default`, so absent and ""
+  decode identically and nothing can red on its removal today.
+  **Validation**: Go `-count=1 ./pkg/dataplane/userspace/... ./pkg/config/...`
+  rc=0; cargo `--release --bins --tests --no-fail-fast --skip engine_internal`
+  rc=0; every green above witnessed by an always-failing sentinel in the same
+  invocation shape. Production Go/Rust logic is unchanged this round — the only
+  non-test edits are comments.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/tests.rs,
+  pkg/dataplane/userspace/egress_zone_identity_6722_test.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/protocol.go,
+  _Log.md

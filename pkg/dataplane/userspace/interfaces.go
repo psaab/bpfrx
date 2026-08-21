@@ -363,14 +363,27 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			//	  logical interfaces; folding `wg0.1` onto `wg0` collapses the two
 			//	  identities into one, the ifindex coheres, and the zone authored
 			//	  on `wg0.1` decides for the deliberately unzoned `wg0.0`.
-			//	drop `linuxUnit == parentLinux` -> SURVIVOR. The whole Go suite
-			//	  stays green, and no producible config was found in which it
-			//	  changes the answer. The reason is structural: the clause can
-			//	  only differ for a unit that lands on a netdev OTHER than its
-			//	  base — a VLAN unit 0 on `<dev>.<vlan>` — and such a unit is on a
-			//	  DIFFERENT IFINDEX from the base row, so its identity string
-			//	  never shares a bucket with the base row's and the fold can
-			//	  neither merge two identities nor displace an owner.
+			//	drop `linuxUnit == parentLinux` -> SURVIVOR, and inert for a
+			//	  reason that does not depend on enumerating shapes. The clause
+			//	  can only CHANGE an identity string for a unit whose netdev is
+			//	  not its base's; such a unit is on a different IFINDEX from the
+			//	  base row, so it lands in a different bucket in stampEgressZones
+			//	  and its identity never meets the base row's. And the only reader
+			//	  of the identity strings, egressIdentitiesCohere, decides from
+			//	  the OWNERS in a bucket, which this clause never alters. So the
+			//	  fold can matter only by merging two identity KEYS inside ONE
+			//	  bucket, and a differing netdev name is precisely what puts them
+			//	  in two. More than one config produces such a unit — a VLAN
+			//	  unit 0 on `<dev>.<vlan>`, and a RETH whose unit 0 carries a
+			//	  per-unit tunnel — which is why the argument is stated as the
+			//	  bucket property rather than as a list: a list is what #6722's
+			//	  four earlier spellings were, and each was holed by the next
+			//	  shape. Measured rather than argued: a differential dump of
+			//	  per-ifindex EgressZone over 18 config shapes — every shape this
+			//	  file's cells use, plus a VLAN unit 0 on its own netdev, which is
+			//	  the only kind of unit the clause can reach — is byte-identical
+			//	  with and without it, 36 ifindex rows unchanged, and the whole Go
+			//	  suite stays green.
 			//
 			// It is kept as an explicit statement of the rule ("unit 0 that lands
 			// on its base's netdev IS the interface"), not as a guard that
@@ -704,16 +717,22 @@ func egressIdentitiesCohere(cfg *config.Config, identities map[string]string) bo
 		// interfaces; the kernel gives them one device. Nothing designates
 		// either as the other's port, so the device identifies no single zone.
 		//
-		// MEASURED SURVIVOR (#6722 round 11): deleting this branch alone leaves
-		// the Go suite green, because a same-owner pair is refused a second time
-		// downstream — `egressRethMemberOf` requires the member to name the reth
-		// as its `redundant-parent`, and `egressMemberIsBarePort` refuses a
-		// `reth*` name outright, so a self-referential pair fails both ways. It
-		// is kept because it states the rule at the level the rule is about
-		// (identity vs. interface), and because the downstream refusals are
-		// keyed on NAMES: a future relaxation of either would silently re-admit
-		// this shape. Recorded as a survivor rather than deleted or claimed to
-		// be load-bearing.
+		// MEASURED SURVIVOR (#6722 round 11), and dead for a stronger reason
+		// than that round recorded. A same-owner pair puts the SAME name in both
+		// argument positions, and `egressRethMemberOf(X, X)` is a contradiction
+		// on the name alone: the `reth` position demands
+		// `strings.HasPrefix(X, "reth")` and the `member` position is handed to
+		// `egressMemberIsBarePort`, which refuses exactly that prefix. No config
+		// satisfies both, so the fall-through cannot admit a same-owner pair
+		// whatever the `redundant-parent` says — the round-11 note read the
+		// refusal as contingent on the parent match, and it is not.
+		//
+		// Kept because it states the rule at the level the rule is about
+		// (identity vs. interface) rather than as a name-shape accident, and
+		// because that accident is exactly the kind of thing a later change
+		// unpicks: relaxing either prefix test would silently re-admit this
+		// shape through a branch nobody was watching. Recorded as a survivor
+		// rather than deleted or claimed to be load-bearing.
 		return false
 	}
 	return egressRethMemberOf(cfg, owners[0], owners[1]) ||
