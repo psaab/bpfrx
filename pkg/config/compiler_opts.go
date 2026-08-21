@@ -1991,12 +1991,9 @@ type compileOpts struct {
 	// a later broader rule if one matches, otherwise left untranslated) or TWO+
 	// mutually-exclusive actions inside
 	// one block (`off` + `pool`, `interface` + `pool` — before #5628 the compiler
-	// picked one by child order and, until #6820 B1, still picked one by PACKED-KEY
-	// order for a packed leaf such as `source-nat off pool P`, whose dropped action
-	// left no trace for this gate to count; it now records every field from BOTH
-	// shapes and the DATAPLANE resolves the rule by a fixed precedence, so all but
-	// one authored action is silently discarded) was previously accepted. The
-	// strict commit /
+	// picked one by packed-key / child order; it now records every field and the
+	// DATAPLANE resolves the rule by a fixed precedence, so all but one authored
+	// action is silently discarded) was previously accepted. The strict commit /
 	// commit-check
 	// path hard-rejects so the malformed rule is operator-visible; the tolerant
 	// load / peer-sync paths downgrade to a warning so an already-persisted or

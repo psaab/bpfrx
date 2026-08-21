@@ -24,19 +24,11 @@ import (
 // the standby, where a FIXED precedence picks the survivor and the other
 // authored action is discarded.
 //
-// Not "whatever was authored second" — the order of the actions WITHIN a block
-// is irrelevant to the precedence, and in this fixture the second-authored
-// action (`off`, from the node1 group) is the one that WINS over the top-level
-// `pool P`. An order-flavoured description would be doubly wrong: wrong about
-// the mechanism, and wrong about this very case.
-//
-// Keep that "within a block" qualifier (#6820 round 5). Unqualified, the claim
-// is FALSE: `compileNATSource` resets `rule.Then` per `then` CONTAINER (#3850
-// last-wins), so a rule with duplicate containers has its surviving actions
-// chosen by configuration order BEFORE any precedence runs. It does not apply
-// to THIS fixture — apply-groups merges the two actions into one block — which
-// is exactly why the loose form survived three reviews here. Measured both
-// directions by TestNATDuplicateContainerLastWinsChoosesSurvivor_6820.
+// Not "whatever was authored second" — author order is irrelevant to the
+// precedence, and in this fixture the second-authored action (`off`, from the
+// node1 group) is the one that WINS over the top-level `pool P`. An
+// order-flavoured description would be doubly wrong: wrong about the mechanism,
+// and wrong about this very case.
 //
 // Set-command construction per CLAUDE.md: ParseSetCommand + tree.SetPath via
 // buildTreeFromSet, never NewParser (which merges newline-separated set lines

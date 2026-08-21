@@ -1,149 +1,3 @@
-## 2026-08-20 — #5717 round 5: the round-4 sentence was FALSE and the gate it defends had a packed-key hole
-
-- **Timestamp**: 2026-08-20 (fix/5717-config-parity, PR #6820)
-- **Action**: Folded a Codex MERGE-BLOCK taken at 918b4ccba. Two prior reviews and
-  a parent re-verification all returned zero runtime findings on this PR. All
-  three checked the wrong thing: the PR exists to reject contradictory NAT
-  terminal actions, and both its central claim and its gate were wrong.
-
-  **B1 — RUNTIME. A packed contradiction bypassed the gate and committed under
-  STRICT.** `compileNATDestination` read the packed action tail as `t.Keys[1]`
-  alone (`compiler_nat_destination.go`), and `compileNATSource` did the same
-  (`compiler_nat_source.go`). `parseKeys` retains every token (`parser.go`) and
-  schema validation deliberately ignores leftover container keys
-  (`schema_walk.go`), so the dropped action left no trace anywhere for
-  `natThenTerminalActionCount` to count. Measured before any fix, five packed
-  contradictions ALL committed strictly:
-
-  | authored | resolved | dropped |
-  |---|---|---|
-  | `destination-nat off pool p1` | `Off=true` | `pool p1` |
-  | `destination-nat pool p1 off` | `Pool="p1"` | `off` — the EXEMPTION |
-  | `source-nat off pool p1` | `Off=true` | `pool p1` |
-  | `source-nat pool p1 off` | `Pool="p1"` | `off` |
-  | `source-nat interface pool p1` | `Interface=true` | `pool p1` |
-
-  One malformed statement, two opposite dispositions, decided by nothing but
-  which token the operator wrote first — and no error on the path whose whole
-  purpose is to produce one. Row 2 is the sharp one: an authored `off` exemption
-  silently commits as a TRANSLATION.
-
-  This is the #2419 multi-value-leaf family, which this codebase has been bitten
-  by before, and `docs/reviews/archive/codex-review-182.md:14550` had already
-  documented this exact lossy packed path — filed, never tracked, and the #5628
-  work that followed did not close it. Worth recording that the review archive
-  holds live findings: a reader who greps it will find real defects, not history.
-
-  Fixed by `applyNATThenActions` (`compiler_nat_helpers.go`), shared by both NAT
-  kinds, which reads `Keys[1:]` AND the node's children and ACCUMULATES —
-  the shape `docs/config-schema.md` prescribes for a packed leaf and that
-  `firewallMatchValues` already uses. `pool` consumes exactly one value token, so
-  a pool legitimately named `off` stays one action. A well-formed single-action
-  node is bit-identical.
-
-  **B2 — the round-4 sentence was FALSE.** It read "the survivor is not chosen by
-  configuration order". `compileNATSource`/`compileNATDestination` RESET
-  `rule.Then` for every outer `then` container (#3850 last-wins), and the parser
-  retains authored order, so the LAST container supplies the fields the gate
-  counts. Reproduced firsthand, both directions:
-
-  | container order | tolerant survivor |
-  |---|---|
-  | `off+pool`, then `interface+pool` | **Interface** |
-  | `interface+pool`, then `off+pool` | **Off** |
-
-  Both emitted the sentence claiming order does not choose, while order chose.
-
-  Two routes were open: (a) make the sentence true, or (b) make the gate treat
-  duplicate `then` containers as a contradiction. Chose **(a)**, and the reason
-  is not economy. B2 is not a silent-drop escape at strict commit — every
-  contradictory-container row ALREADY rejects; the defect is purely the false
-  sentence. Route (b) would reverse #3850's documented, tested last-wins merge,
-  which this gate's own comment explicitly carves out, and would reject the
-  ordinary override shape `then { source-nat off; }` … `then { source-nat pool
-  P; }` — a normal config-language last-wins. That is a behaviour change owning
-  its own issue, not a round-5 fold. The corrected text scopes the precedence
-  claim to WITHIN the block and then states the container rule explicitly, which
-  is true of every row above.
-
-  **B3 — the binder pinned BYTES, not meaning, and the round-4 proof checked the
-  wrong property.** The assertion was a case-sensitive `strings.Contains` on one
-  bare clause. This passes it verbatim:
-
-  > The statement "the survivor is not chosen by configuration order" is false;
-  > configuration order chooses it.
-
-  The round-4 mutation ("restore round 3's paraphrase → rc=1") was true and
-  useless: a paraphrase reds because it DELETES the substring. It proved the pin
-  detects rewording, never that it detects the claim going false. A bare-clause
-  `Contains` cannot see polarity at all.
-
-  Fixed by making the claim CHECKABLE rather than quoted. The behavioural half is
-  now measured — `TestNATSurvivorIsOrderInvariantWithinBlock_6820` authors each
-  contradiction in both within-block orders and asserts the resolved `NATThen` is
-  identical (and that strict commit rejects both), and
-  `TestNATDuplicateContainerLastWinsChoosesSurvivor_6820` asserts the two
-  container orders resolve to DIFFERENT survivors, so a message claiming order is
-  irrelevant is contradicted by a measurement in the same package. The residue
-  that can only be text goes through `natCardinalityMessageDefects6820`, which
-  pins each kind's mechanism sentence CONCATENATED with the claim tail as one
-  contiguous run and rejects a refutation frame anywhere in the message. It is a
-  function over a string precisely so the test can feed it the negation above and
-  prove it fires — measured, 3 markers.
-
-  **B4 — coverage escape, closed by the same run pin.** Deleting `"and never
-  looking the pool up, and the dataplane applies the same "+` from the DNAT
-  mechanism left a semantically damaged message that every clause-level pin still
-  accepted. The contiguous run makes an interior deletion visible;
-  `TestNATCardinalityMessageCheckerRejectsNegation_6820` performs that exact
-  deletion and asserts the checker reports it.
-
-  Also corrected the two stale generalizations that survived into round 4 —
-  `compiler_opts.go` and `compiler_uniformgates_firewall_nat2.go` both claimed
-  every field is recorded and the dataplane resolves it, which was true of the
-  CHILD shape after #5628 and false for packed tails until now — plus
-  `docs/config-schema.md`, `natThenTerminalActionCount`, and the
-  `validateNATTerminalActionCardinalityStrict` bullet that carried the
-  unqualified "not by anything the operator wrote".
-
-  **Mutation matrix.** Per-test verdicts, pristine control, always-failing
-  sentinel in EVERY invocation so a green cell cannot be a suite that never ran.
-
-  | cell | Survivor (B1) | LastWins (B2) | MsgContent | CheckerNeg (B3/B4) | ValidSingle | sentinel |
-  |---|---|---|---|---|---|---|
-  | CONTROL (pristine) | PASS | PASS | PASS | PASS | PASS | FAIL |
-  | M1a packed → `Keys[1]` only | **FAIL** | PASS | PASS | PASS | PASS | FAIL |
-  | M1b children → first-match | **FAIL** | PASS | **FAIL** | **FAIL** | PASS | FAIL |
-  | M2 drop per-container reset | PASS | **FAIL** | PASS | PASS | PASS | FAIL |
-  | M3 restore round-4 claim | PASS | PASS | **FAIL** | **FAIL** | PASS | FAIL |
-  | M4 delete the B4 fragment | PASS | PASS | **FAIL** | **FAIL** | PASS | FAIL |
-
-  M1a is the load-bearing cell: reverting ONLY the packed-tail read reds ONLY the
-  new behavioural test, and only its packed subtests — the hierarchical ones stay
-  green. Nothing in the pre-existing suite covered the packed path, which is why
-  three reviews passed over it.
-
-  **Residual, NOT fixed here.** The other half of the archive-182 finding is
-  still live and was measured at this head: repeated SAME-MODE leaves
-  (`destination-nat { pool PD; pool PD2; }`, and the packed
-  `destination-nat pool PD pool PD2`) still collapse to the last pool and commit,
-  because `NATThen.PoolName` is a scalar and the counter counts MODES, not
-  authored occurrences. Closing it needs occurrence state the typed struct does
-  not carry, so it is a separate change, not a widening of this one.
-
-  Also observed adjacent and PRE-EXISTING (unchanged by this round, fail-closed):
-  the fully-compact `then source-nat off;` form — every token packed onto the
-  `then` node itself — compiles to ZERO actions and is rejected by the
-  zero-action arm, because both compilers look for a `source-nat` CHILD of
-  `then`. Flat-set authoring is unaffected (`SetPath` builds the child).
-
-- **File(s)**: `pkg/config/compiler_nat_helpers.go`,
-  `pkg/config/compiler_nat_source.go`, `pkg/config/compiler_nat_destination.go`,
-  `pkg/config/compiler_validate_strict_nat.go`, `pkg/config/compiler_opts.go`,
-  `pkg/config/compiler_uniformgates_firewall_nat2.go`,
-  `pkg/config/compiler_nat_terminal_action_5628_test.go`,
-  `docs/config-schema.md`, `_Log.md`
-
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
@@ -79760,23 +79614,6 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   **Mutation.** Restoring round 3's paraphrase reds
   `compiler_nat_terminal_action_5628_test.go:108` — FULL_RC=1, the only failure.
 
-  > **CORRECTION (round 5, 2026-08-20).** Both claims in this entry are refuted;
-  > see the round-5 entry at the head of this file. (1) The wording adopted here
-  > — "the survivor is not chosen by configuration order" — is itself FALSE, not
-  > merely "the precise form". `compileNATSource`/`compileNATDestination` reset
-  > `rule.Then` per `then` CONTAINER (#3850 last-wins), so with duplicate
-  > containers the LAST one supplies the counted fields and configuration order
-  > DOES choose the survivor; measured both directions. The claim is true only
-  > when scoped to the order WITHIN one block. (2) The mutation above proves less
-  > than it claims. Restoring a PARAPHRASE reds because it deletes the pinned
-  > substring; it shows the pin detects rewording, not that it detects the claim
-  > going false. A NEGATION that embeds the substring verbatim — `The statement
-  > "the survivor is not chosen by configuration order" is false; configuration
-  > order chooses it.` — passed that binder. Round 5 replaced the quoted claim
-  > with behavioural measurement plus a polarity-gated checker, and this entry is
-  > left standing rather than rewritten because the failure mode it records (a
-  > green mutation that checks the wrong property) is the point.
-
   **Validation.** `go build ./...` rc 0; `go test -count=1 ./...` FULL_RC=0; `cargo test`
   (full userspace-dp) FULL_RC=0; gofmt clean. Gates re-run at this tree, not carried —
   the edit is the same operator-facing string literal, so the binary moves again, which
@@ -79785,119 +79622,61 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_nat_terminal_action_5628_test.go, _Log.md
 
 - **Timestamp**: 2026-08-20
-- **Action**: #6820 round 6 — extend the NAT terminal-action scan to the two AST
-  shapes round 5 still missed, stop the accepting-direction regression round 5
-  introduced, and narrow the message-polarity claim to what a keyword list can
-  actually deliver. Hostile review returned MERGE-BLOCK with four blocking
-  findings at `a0f5b81f1`.
+- **Action**: #6820 round 7 — REVERT rounds 5 and 6; reduce the PR to its
+  measured-safe deliverable and FILE the pre-existing packed-token escape
 
-  **B1 — the accumulation covered ONE of THREE shapes.** A contradictory
-  `then` block reaches the compiler in three structurally different shapes, and
-  which one an operator gets is decided by the SYNTAX they used:
+  Rounds 5 (`a0f5b81f1`) and 6 (`48a2ef50d`) each tried to close a packed-token
+  escape a reviewer found, and each introduced a NEW commit-reachable
+  regression in the ACCEPTING direction while doing it. Reverted both. The tree
+  is now byte-identical to `918b4ccba` (round 4).
 
-  ```
-  then { source-nat off pool P; }      Keys=[source-nat off pool P]     packed on the container
-  then { source-nat { off pool P; } }  [source-nat] / [off pool P]      packed on a CHILD
-  set … then source-nat off pool P     [source-nat] / [off] / [pool P]  a GRANDCHILD chain
-  ```
+  **The escape being folded is PRE-EXISTING.** Measured through the public
+  `CompileConfig` pipeline at `origin/master` (1dd8db158): `set … then
+  source-nat pool P off` commits STRICTLY as `{PoolName:"P"}` — the authored
+  `off` EXEMPTION is dropped and a TRANSLATION is published in its place. Same
+  at `918b4ccba`. Under the campaign bar a defect that reproduces identically
+  on master does not block and must be FILED, not folded on a PR about
+  claim-binding.
 
-  Round 5 read the container's `Keys[1:]` plus each child's `Name()` /
-  `nodeVal()`, so it saw the first shape only. Measured base `918b4ccba` → head
-  `a0f5b81f1` → this round, over a 3-shape × 6-row matrix: at head, 12 rows
-  still resolved to ONE action and strict-committed. Ten of them had
-  `SchemaValidate` returning nil, because the source-NAT `then` subtree is
-  deliberately open-world (#4313) — nothing else was ever going to stop them.
-  The worst row is `set … then source-nat pool P off`, which resolved
-  `{PoolName:"P", Off:false}`: the `off` EXEMPTION dropped, a translation
-  published in its place.
+  **What round 6 introduced.** `applyNATThenActionNode`'s descent into
+  `n.Children` was unconditional, so a node whose own leading token was already
+  judged "not an action" still had its entire subtree scanned. Measured
+  REJECT -> ACCEPT at `48a2ef50d` vs master, on the real operator commit path
+  (source-NAT `then` is deliberately open-world per #4313, so `SchemaValidate`
+  passes):
 
-  **Attribution.** These rows behave IDENTICALLY at `918b4ccba`, so the escape
-  is PRE-EXISTING, not introduced by round 5. What round 5 got wrong is the
-  claim that it was closed. The round-5 fix itself is real and stands — 6
-  container-packed rows go ACCEPT → REJECT base→head.
+      then { source-nat { frobnicate { off; } } }       -> ACCEPT {Off:true}
+      then { source-nat { frobnicate { interface; } } } -> ACCEPT {Interface:true}
+      then { source-nat { frobnicate { bar { off; } } } } -> ACCEPT {Off:true}
+      then { source-nat { persistent-nat { off; } } }   -> ACCEPT {Off:true}
+      then { destination-nat { frobnicate { off; } } }  -> ACCEPT {Off:true}
 
-  **Why it was invisible: the guard built every fixture with `NewParser`.**
-  CLAUDE.md: "Testing flat set syntax: ALWAYS use `ParseSetCommand()` +
-  `tree.SetPath()` loop, NEVER `NewParser()`". Only `SetPath` builds the chain,
-  so a `NewParser`-only table cannot see the chained read however many rows it
-  has. `TestNATSurvivorIsOrderInvariantWithinBlock_6820` now runs every row
-  through FOUR shapes (flat-set via `ParseSetCommand`+`SetPath`, container-packed,
-  child-packed, sibling-children) and additionally asserts all four resolve
-  IDENTICALLY — the property an operator depends on, that one config typed two
-  ways means one thing.
+  A typo in a container name FABRICATES a NAT exemption the operator never
+  authored, and it commits under strict with no error. That is a fail-open, and
+  it is introduced by this PR.
 
-  `applyNATThenActions` now walks the whole `then` subtree as one action-token
-  stream (`applyNATThenActionNode`), so ONE scan body and ONE `allowInterface`
-  decision serve every shape.
+  **What round 5 introduced.** `then { destination-nat interface pool PD; }`
+  went REJECT -> ACCEPT `{PoolName:"PD"}` (repaired in round 6), and
+  `then { source-nat pool P pool Q; }` moved its survivor `P` -> `Q`, silently
+  retargeting a translation across an upgrade (NOT repaired in round 6).
 
-  **B3 — round 5 introduced an accepting-direction regression.**
-  `then { destination-nat interface pool PD; }`: base REJECT (zero-action) →
-  head ACCEPT `{Type:NATDestination, PoolName:"PD"}`. `allowInterface=false`
-  made the scan SKIP `interface` and read `pool PD` — a DNAT rule carrying an
-  invalid keyword silently committing as a pool translation, on the PR whose
-  purpose is to stop exactly that. The review scoped this to `interface`; it is
-  wider. The same SKIP applied to ANY unrecognized token, on BOTH kinds:
-  `then { destination-nat frobnicate pool PD; }` and
-  `then { source-nat frobnicate pool P; }` both went base REJECT → head ACCEPT
-  as pool translations. Fixed at the token, not at `interface`: within one
-  node's token tail the scan STOPS at the first unrecognized token, so a LEADING
-  unrecognized token lowers nothing — exactly what the pre-#6820 `Keys[1]`-only
-  read did when `Keys[1]` was neither `off` nor `pool`. Trailing non-action
-  grammar is still ignored, which is what keeps the #4313 rule-level
-  `pool P persistent-nat permit any-remote-host` shape committing.
+  **Why revert rather than repair.** Rounds 1-4 change no compiler code path at
+  all: `compiler_nat_source.go` / `compiler_nat_destination.go` are untouched
+  vs master, and the diff is comments, two operator-facing rejection strings,
+  docs, and tests. A 21-row differential resolved through `CompileConfig` at
+  master, `918b4ccba`, `a0f5b81f1` and `48a2ef50d` shows master and `918b4ccba`
+  are IDENTICAL on every row, while the two later heads each move rows in the
+  accepting direction. The deliverable in the PR title — binding the #5628
+  gate's tolerant-path safety claim — is carried entirely by rounds 1-4.
 
-  **B2 — the polarity gate pinned its test fixture, not polarity.** Nine
-  rewrites that are FLATLY FALSE about the compiler scored 0 defects, including
-  `The above is untrue.` — which denies the claim and carries no marker, against
-  the checker's own doc claiming "a message that quotes the claim in order to
-  deny it necessarily carries one". DECISION: do not extend the list (that pins
-  ten fixtures instead of one). Instead (a) NARROW the claim — the checker is
-  documented as a FLOOR over a specific refutation vocabulary, not a polarity
-  oracle; (b) normalise before matching (case, whitespace, hyphen-vs-space), so
-  `packed key order` and `packed-key order` are one token — that closes 1 of the
-  9 by itself; and (c) express the property the round-5 text WANTED with a guard
-  that can carry it: the whole operator-facing message pinned by EQUALITY
-  (`natCardinalitySourceMessage6820` / `natCardinalityDestMessage6820`).
-  Equality has no vocabulary and no polarity model, so an appended denial, a
-  prepended disclaimer, a reworded clause and an interior deletion are all just
-  mismatches. `natCardinalityMessageRewrites6820` runs all nine plus the round-5
-  fixture through both guards and RECORDS the vocabulary's verdict per row, so
-  the eight it cannot see stay visible in the file instead of being papered over.
-
-  **B4 — three of six mutations of the new helper left `pkg/config` green.**
-  Now bound: `TestNATThenPoolNamedLikeAnActionKeyword_6820` (a pool legitimately
-  named `off`/`interface`/`pool`, in all four shapes) binds the value-token
-  consumption; `TestNATThenUnrecognizedLeadingTokenIsNotSkipped_6820` binds both
-  the `allowInterface` decision and the stop-at-unrecognized rule.
-
-  **MINOR.** The message ended "(This rejects contradictory actions inside one
-  block; it does not reject duplicate containers.)" — which misleads exactly the
-  operator most likely to hit it, because in `set` syntax duplicate containers
-  cannot be authored: repeated `set … then …` commands MERGE into one node and
-  ARE rejected here. Both halves measured and bound by
-  `TestNATDuplicateThenSetCommandsMergeAndAreRejected_6820` (set syntax → 1
-  container, REJECT; brace syntax → 2 containers, ACCEPT per #3850 last-wins).
-
-  **Known residual, unchanged and pre-existing:** `then { destination-nat pool
-  PD interface; }` still ACCEPTs as `{PoolName:"PD"}` at every revision
-  including base — `interface` there is TRAILING garbage after a complete
-  action, which the old code ignored too. Closing it needs the closed-world DNAT
-  `then` schema flip, which the flat-set form of that row already gets
-  (`SchemaValidate` REJECTs it); out of scope for a round whose brief is to stop
-  changing accepting decisions.
-
-  **Validation.** `go build ./...` FULL_RC=0; `go vet ./pkg/config/` FULL_RC=0;
-  `go test -count=1 ./pkg/config/...` FULL_RC=0 (0 `--- FAIL`);
-  `go test -count=1 ./pkg/dataplane/...` FULL_RC=0; `cargo test nat`
-  (userspace-dp) FULL_RC=0. Mutation matrix, 8 cells + sentinel, run in a
-  `git archive` copy with content-copy restore and a pristine control before AND
-  after: M1 revert-to-round-5-scan RED, M2 drop-child-descent RED, M3
-  drop-pool-token-consume RED, M4 drop-allowInterface RED, M5
-  skip-unrecognized RED, M6 drop-pool-name-from-child RED, M7 message-reword
-  RED, M8 restore-misleading-sentence RED, SENTINEL RED, control rc 0 both ends.
-  Go + docs only: no `.o`, no `userspace-xdp/`, no protocol or wire file.
+  **Validation.** Differential probe re-run on the reverted tree: 21/21 rows
+  identical to `origin/master`. `go build ./...`, `go vet`, `go test -count=1`
+  on the touched packages, and the `userspace-dp` cargo suite re-run at this
+  tree; exit codes recorded on the PR.
 - **File(s)**: pkg/config/compiler_nat_helpers.go,
-  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_validate_strict_nat.go, pkg/config/compiler_opts.go,
   pkg/config/compiler_uniformgates_firewall_nat2.go,
-  pkg/config/compiler_nat_terminal_action_5628_test.go, docs/config-schema.md,
-  _Log.md
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/config/compiler_peer_effective_nat_terminal_action_6820_test.go,
+  docs/config-schema.md, _Log.md

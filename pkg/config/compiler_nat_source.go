@@ -910,23 +910,46 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				rule.Then = NATThen{}
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
-						// #5628: read EVERY terminal action the node carries, not
-						// the first one only (the former `else if` chain silently
-						// picked interface > off > pool by child order). #6820 B1
-						// extends that from the hierarchical CHILDREN to the PACKED
-						// Keys tail, which was still read as Keys[1] alone: a packed
-						// `source-nat off pool P` lowered ONE field and dropped the
-						// rest, so the cardinality gate counted n == 1 and the
-						// contradiction strictly COMMITTED as whichever action the
-						// operator wrote first. A well-formed single-action node —
-						// packed or hierarchical — is bit-identical under the
-						// accumulating scan; a CONTRADICTORY one now sets every
-						// authored field, so the resolved NATThen faithfully carries
-						// two terminal actions and
-						// validateNATTerminalActionCardinalityStrict rejects it
-						// (strict commit) / warns (tolerant load) instead of silently
-						// reinterpreting it. See applyNATThenActions.
-						applyNATThenActions(t, &rule.Then, NATSource, true)
+						if len(t.Keys) >= 2 {
+							switch t.Keys[1] {
+							case "interface":
+								rule.Then.Type = NATSource
+								rule.Then.Interface = true
+							case "off":
+								rule.Then.Type = NATSource
+								rule.Then.Off = true
+							case "pool":
+								rule.Then.Type = NATSource
+								if len(t.Keys) >= 3 {
+									rule.Then.PoolName = t.Keys[2]
+								}
+							}
+						} else {
+							// #5628: read EVERY hierarchical terminal child, not
+							// the first one only (the former `else if` chain
+							// silently picked interface > off > pool by child
+							// order). A well-formed `source-nat { pool P; }` still
+							// sets exactly one field, so this is bit-identical for
+							// a valid single-child block. A CONTRADICTORY
+							// single-node block such as `source-nat { interface;
+							// pool P; }` now sets BOTH fields, so the resolved
+							// NATThen faithfully carries two terminal actions and
+							// validateNATTerminalActionCardinalityStrict rejects it
+							// (strict commit) / warns (tolerant load) instead of
+							// silently reinterpreting it.
+							if t.FindChild("interface") != nil {
+								rule.Then.Type = NATSource
+								rule.Then.Interface = true
+							}
+							if t.FindChild("off") != nil {
+								rule.Then.Type = NATSource
+								rule.Then.Off = true
+							}
+							if poolNode := t.FindChild("pool"); poolNode != nil {
+								rule.Then.Type = NATSource
+								rule.Then.PoolName = nodeVal(poolNode)
+							}
+						}
 					}
 				}
 			}

@@ -208,19 +208,10 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// with TWO+ mutually-exclusive actions inside one block let the compiler
 	// silently pick one by packed-key/child order (an exemption COULD then
 	// publish as a translation — the inverse of the authored action). Both
-	// clauses are past tense on purpose, and the tenses were earned in stages:
-	// #5628 stopped the sibling-CHILD-order pick; #6820 round 5 stopped the pick
-	// on the CONTAINER's own packed Keys tail; #6820 round 6 stopped the two
-	// shapes that were still live after that — a tail packed onto a CHILD
-	// (`then { source-nat { pool P off; } }`) and the GRANDCHILD chain every
-	// flat-set command builds (`set … then source-nat pool P off` →
-	// [source-nat] / [pool P] / [off]). Each was invisible for the same reason:
-	// the dropped action never reached NATThen for the gate to count.
-	// applyNATThenActions now walks the whole `then` subtree, so the compiler
-	// records every authored field and the dataplane resolves them by a fixed
-	// precedence — the present-tense form of this sentence is false for every
-	// shape. See the corrected rejection text on
-	// validateNATTerminalActionCardinalityStrict (#6820).
+	// clauses are past tense on purpose: since #5628 the compiler records every
+	// field and the dataplane resolves them by a fixed precedence, so the
+	// present-tense form of this sentence is false — see the corrected
+	// rejection text on validateNATTerminalActionCardinalityStrict (#6820).
 	// Strict on commit /
 	// commit-check (hard reject so the malformed rule is operator-visible);
 	// lenient on load / peer-sync (warn — #1960 no-brick). What happens on that
