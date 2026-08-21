@@ -520,6 +520,14 @@ pub(crate) enum SnapshotIntegrityError {
     /// 7 — a DIFFERENT traffic class — with no apply failure. Same fail-closed
     /// rationale as `CosDscpCodePointOutOfRange`.
     CosIeee8021CodePointOutOfRange { classifier: String, pcp: u8 },
+    /// #6847: a CoS inet-precedence classifier entry carried a code-point
+    /// outside the 3-bit IP-precedence domain (0..=7). The Go commit-time gate
+    /// (`collectCoSINetPrecedenceCodePoints`) is the primary defense; this is
+    /// the helper-boundary backstop against version/snapshot drift. Fail the
+    /// snapshot closed rather than masking the index with `& 0x7`, which would
+    /// install the classifier for a DIFFERENT traffic class (9 -> 1). Same
+    /// fail-closed rationale as `CosIeee8021CodePointOutOfRange`.
+    CosInetPrecedenceCodePointOutOfRange { classifier: String, precedence: u8 },
     /// #2458: a CoS scheduler snapshot carried a NON-EMPTY
     /// `equal_flow_target_policy` wire string that is not one of the known
     /// values (`slowest` / `mean` / `ideal-share`). The pre-fix
@@ -897,6 +905,14 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos ieee-802.1 classifier {:?} has code-point {} outside the 0..=7 PCP range — refusing to clamp it with .min(7) (which would install the classifier for a different traffic class)",
                 classifier, pcp
+            ),
+            Self::CosInetPrecedenceCodePointOutOfRange {
+                classifier,
+                precedence,
+            } => write!(
+                f,
+                "cos inet-precedence classifier {:?} has code-point {} outside the 0..=7 IP-precedence range — refusing to mask it with & 0x7 (which would install the classifier for a different traffic class)",
+                classifier, precedence
             ),
             Self::CosUnknownEqualFlowTargetPolicy {
                 forwarding_class,

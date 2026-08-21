@@ -47,6 +47,19 @@ func runUniformGatesCoSPlatform(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #6847 dscp + inet-precedence same-unit conflict. Strict on commit (the
+	// operator must pick one — the two read the same TOS byte and the loser
+	// would be silently dead). Lenient on load / peer-sync so an
+	// already-persisted config still boots (#1960); DSCP wins on that boot.
+	if err := validateCoSUnitClassifierConflict(cfg.ClassOfService); err != nil {
+		if opts.lenientCoSUnitClassifierConflict {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("class-of-service unit classifiers (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #4594 class-of-service forwarding-class queue-range gate. Strict on
 	// commit / commit-check (hard-reject a queue outside 0..255, which the
 	// userspace helper deserializes via a checked u8::try_from and

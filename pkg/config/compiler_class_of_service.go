@@ -314,10 +314,58 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 				cos.IEEE8021Classifiers[classifier.Name] = classifier
 			}
 		}
-		// #4316 (fable-167 F-3b): inet-precedence classifiers are accepted
-		// but inert; record their names for the commit advisory.
+		// #6847: inet-precedence classifiers are now COMPILED and enforced.
+		// #4316 recorded only their names (for the accepted-but-inert
+		// advisory) because nothing consumed the map and the unit schema had
+		// no binding site. The name list is still populated for the
+		// undefined-reference check; the entries drive the dataplane.
 		for _, inst := range namedInstances(classifiersNode.FindChildren("inet-precedence")) {
 			cos.INetPrecedenceClassifiers = append(cos.INetPrecedenceClassifiers, inst.name)
+			classifier := &CoSINetPrecedenceClassifier{Name: inst.name}
+			for _, fcNode := range inst.node.FindChildren("forwarding-class") {
+				className := ""
+				if len(fcNode.Keys) >= 2 {
+					className = fcNode.Keys[1]
+				}
+				if className == "" {
+					continue
+				}
+				for _, lpNode := range fcNode.FindChildren("loss-priority") {
+					lossPriority := ""
+					if len(lpNode.Keys) >= 2 {
+						lossPriority = lpNode.Keys[1]
+					}
+					if lossPriority == "" {
+						lossPriority = nodeVal(lpNode)
+					}
+					codePoints, err := collectCoSINetPrecedenceCodePoints(lpNode)
+					if err != nil {
+						if opts.lenientCoSNumericCodePoint && isDowngradableCoSCodePointError(err) {
+							if warnings != nil {
+								*warnings = append(*warnings, fmt.Sprintf(
+									"class-of-service classifiers inet-precedence %q (downgraded to warning on tolerant path): %v",
+									classifier.Name, err))
+							}
+							continue
+						}
+						return fmt.Errorf("class-of-service classifiers inet-precedence %q: %w", classifier.Name, err)
+					}
+					if len(codePoints) == 0 {
+						continue
+					}
+					classifier.Entries = append(classifier.Entries, &CoSINetPrecedenceClassifierEntry{
+						ForwardingClass: className,
+						LossPriority:    lossPriority,
+						Precedences:     codePoints,
+					})
+				}
+			}
+			if len(classifier.Entries) > 0 {
+				if cos.INetPrecedenceClassifierDefs == nil {
+					cos.INetPrecedenceClassifierDefs = make(map[string]*CoSINetPrecedenceClassifier)
+				}
+				cos.INetPrecedenceClassifierDefs[classifier.Name] = classifier
+			}
 		}
 	}
 
@@ -697,6 +745,14 @@ func parseCoSInterfaceUnitBody(node *Node, unit *CoSInterfaceUnit) {
 		if ieeeNode := classifiersNode.FindChild("ieee-802.1"); ieeeNode != nil {
 			unit.IEEE8021Classifier = nodeVal(ieeeNode)
 		}
+		// #6847: the inet-precedence unit binding — before this there was no
+		// binding site at all, so the classifier was definable but not
+		// bindable. A conflict with `dscp` on the same unit is rejected by
+		// validateCoSUnitClassifierConflict rather than resolved here; the
+		// compiler records what the operator wrote.
+		if precNode := classifiersNode.FindChild("inet-precedence"); precNode != nil {
+			unit.INetPrecedenceClassifier = nodeVal(precNode)
+		}
 	}
 	if rewriteRulesNode := node.FindChild("rewrite-rules"); rewriteRulesNode != nil {
 		if dscpNode := rewriteRulesNode.FindChild("dscp"); dscpNode != nil {
@@ -771,8 +827,15 @@ func coSInterfaceUnitHasBinding(unit *CoSInterfaceUnit) bool {
 	if unit == nil {
 		return false
 	}
+	// #6847: INetPrecedenceClassifier belongs in this set. A unit that binds
+	// ONLY an inet-precedence classifier has a real binding; omitting it here
+	// made parseCoSInterfaceUnitBody record the binding and then DISCARD the
+	// whole unit (and, if it was the interface's only unit, the CoS interface
+	// with it), so nothing reached the snapshot and the dataplane arm was
+	// unreachable for the plain single-classifier config.
 	return unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
 		unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
+		unit.INetPrecedenceClassifier != "" ||
 		unit.DSCPRewriteRule != "" || unit.IEEE8021RewriteRule != "" ||
 		unit.OversubscriptionPolicy != "" ||
 		unit.PriorityLowMinShareBytes > 0 || unit.OutputTrafficControlProfile != ""
@@ -853,6 +916,11 @@ func mergeCoSInterfaceLevelInto(unit, level *CoSInterfaceUnit) {
 	}
 	if unit.IEEE8021Classifier == "" {
 		unit.IEEE8021Classifier = level.IEEE8021Classifier
+	}
+	// #6847: inherit the interface-level inet-precedence binding, mirroring the
+	// dscp / 802.1p fallbacks above.
+	if unit.INetPrecedenceClassifier == "" {
+		unit.INetPrecedenceClassifier = level.INetPrecedenceClassifier
 	}
 	if unit.DSCPRewriteRule == "" {
 		unit.DSCPRewriteRule = level.DSCPRewriteRule
@@ -1164,6 +1232,61 @@ func collectCoSDSCPCodePoints(node *Node) ([]uint8, error) {
 	// Inline leaf spelling (#1809): "loss-priority low code-points ef;"
 	// packs the code points into the loss-priority node's own Keys after
 	// the "code-points" token (bracketed lists arrive bracket-stripped).
+	for i := 2; i < len(node.Keys); i++ {
+		if node.Keys[i] == "code-points" {
+			for _, raw := range node.Keys[i+1:] {
+				if err := add(raw); err != nil {
+					return nil, err
+				}
+			}
+			break
+		}
+	}
+	return values, nil
+}
+
+// collectCoSINetPrecedenceCodePoints collects the `code-points` values of an
+// inet-precedence classifier entry (#6847). IP precedence is the top 3 bits of
+// the IPv4 TOS byte, domain 0..7 — the same width as an 802.1p PCP but a
+// different field, so it gets its own message wording rather than borrowing the
+// 802.1p collector's. Out-of-range and non-numeric tokens are REJECTED at
+// commit (warn-and-drop on the tolerant path via the shared downgradable-error
+// classification) rather than silently skipped: a dropped code point installs a
+// classifier that quietly does not cover the traffic the operator named.
+func collectCoSINetPrecedenceCodePoints(node *Node) ([]uint8, error) {
+	var values []uint8
+	seen := make(map[uint8]struct{})
+	add := func(raw string) error {
+		raw = strings.TrimSpace(strings.ToLower(raw))
+		if raw == "" {
+			return nil
+		}
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			return newUnknownCodePointTokenError(
+				"class-of-service inet-precedence classifier code-point %q is not a valid 0..7 value", raw)
+		}
+		if v < 0 || v > 7 {
+			return newCodePointRangeError(
+				"class-of-service inet-precedence classifier code-point %d is out of range (must be 0..7)",
+				v)
+		}
+		value := uint8(v)
+		if _, ok := seen[value]; ok {
+			return nil
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+		return nil
+	}
+	for _, child := range node.FindChildren("code-points") {
+		for _, raw := range child.Keys[1:] {
+			if err := add(raw); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Inline leaf spelling (#1809), as for the dscp / 802.1p collectors.
 	for i := 2; i < len(node.Keys); i++ {
 		if node.Keys[i] == "code-points" {
 			for _, raw := range node.Keys[i+1:] {

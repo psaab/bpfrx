@@ -2758,6 +2758,32 @@ Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
   `userspace-dp/`, `userspace-xdp/` or any compiled artifact.
 - **File(s)**: docs/refactoring-audit-current.txt, _Log.md
 
+## 2026-08-21 — #6877 drive: inet-precedence loss-priority typo gate
+
+- **Timestamp**: 2026-08-21 (fix/6847-rust, PR #6877)
+- **Action**: First-pass hostile review of PR #6877 found one runtime hole and
+  fixed it. #6847 made the inet-precedence classifier's `loss-priority` LIVE
+  (`inet_precedence_lp_by_prec` feeds the egress rewrite), but
+  `validateClassOfServiceLossPriorityStrict` still covered only the dscp /
+  ieee-802.1 classifiers and the two rewrite-rule directions. MEASURED: `set
+  class-of-service classifiers inet-precedence p1 forwarding-class ef
+  loss-priority hgih code-points 5` committed CLEAN with no error and no
+  warning, carried `loss_priority: "hgih"` to the wire, and the helper's
+  `cos_loss_priority_index(&entry.loss_priority).unwrap_or(0)` silently
+  applied the LOW rewrite row. The identical typo on a `dscp` classifier is
+  rejected at commit. Added the inet-precedence arm to the shared gate; strict
+  on commit, downgraded to a warning on the tolerant Load / SyncApply path via
+  the existing `lenientCoSLossPriority` call site (#1960 no-brick).
+- **Validation**: 3 new guards (typo rejected, all four valid drop precedences
+  still accepted, tolerant path downgrades). Mutation-proved by emptying the
+  new loop's population (`for _, name := range []string(nil)`): the typo guard
+  and the tolerant-downgrade guard both RED, the valid-values control stayed
+  GREEN; restored from a byte snapshot and re-ran green. Full `go test
+  -count=1 ./pkg/config/` green.
+- **File(s)**: `pkg/config/compiler_validate_strict_cos.go`,
+  `pkg/config/cos_inet_precedence_classifier_6847_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
 
 - **Timestamp**: 2026-08-20 (fix/6848-cos-show-rewrite-rule, PR #6858)
@@ -7297,6 +7323,83 @@ tier through one shared definition (`config.SourceNATScopeTier`).
   pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go,
   userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
   userspace-dp/src/server/README.md, _Log.md
+## 2026-08-05 — #6847: enforce the inet-precedence classifier end to end
+
+- **Timestamp**: 2026-08-05 (fix/6847-rust) — completes the WIP below.
+- **Action**: wired the `inet-precedence` classifier through the wire and the
+  dataplane so the binding site the Go half added actually does something.
+  Wire: `inet_precedence_classifiers` on the CoS snapshot and
+  `cos_inet_precedence_classifier` on the interface snapshot, additive on both
+  sides. Dataplane: an 8-entry `inet_precedence_queue_by_prec` table beside
+  `dscp_queue_by_dscp`, a `resolve_cos_inet_precedence_classifier_queue_id` arm
+  reading `(dscp >> 3) & 0x7`, inserted after the DSCP arm and before 802.1p at
+  all five call sites. Retracted the classifier half of the accepted-but-inert
+  advisory; the rewrite-rules half stays.
+- **Three gaps found while building on the inherited half**, each of which
+  would have left the feature dead in the common case:
+  1. `coSInterfaceUnitHasBinding` did not list `INetPrecedenceClassifier`, so a
+     unit binding ONLY that classifier was parsed and then DISCARDED, taking
+     the whole CoS interface with it. Nothing reached the snapshot.
+  2. The `useful_cos_state` gate (#1183) had no inet-precedence arm, so an
+     interface with no shaping-rate and no scheduler-map was skipped even once
+     the binding survived.
+  3. The `ba_reclassify` gate had no inet-precedence arm, so a flow's queue
+     would freeze on its seed packet's marking.
+  Also wired the entry's `loss-priority` into `resolve_cos_loss_priority`;
+  without it `loss-priority high` would compile and silently apply the LOW
+  egress rewrite — the same accepted-but-inert shape inside the fix.
+- **Validation**: 14 guards mutation-proved, each reverted individually and
+  observed RED with an ASSERTION (not a build break) — 7 Rust, 7 Go; harness
+  snapshots each file's bytes, restores verbatim, and verifies the restore.
+  MEASURED and recorded: the out-of-range bounds check exists at two sites
+  whose key sets are always identical, so mutating either alone leaves the test
+  GREEN; the fail-closed property binds only when both are mutated, and the
+  test comment states that scope rather than claiming each site is independently
+  load-bearing. Full Rust cargo suite and full `go test ./...` green;
+  `go test ./pkg/refactoraudit/` green. `protocol_wire_v1.json` regenerated —
+  diff is exactly three additive keys, 0 removed, 0 changed.
+- **File(s)**: `userspace-dp/src/protocol/cos.rs`,
+  `userspace-dp/src/protocol/snapshot.rs`, `userspace-dp/src/protocol/tests.rs`,
+  `userspace-dp/src/policy_snapshot_error.rs`,
+  `userspace-dp/src/afxdp/types/cos.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/cos.rs`,
+  `userspace-dp/src/afxdp/tx/cos_classify.rs`,
+  `userspace-dp/src/afxdp/tx/test_support.rs`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/protocol_cos.go`,
+  `pkg/dataplane/userspace/cos.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/schema_cos.go`,
+  `docs/config-schema.md`, `docs/cos-traffic-shaping.md`, plus the new tests
+  and the struct-literal updates across the Rust test tree, `_Log.md`
+
+## 2026-08-05 — #6847 WIP: inet-precedence classifier, Go config half
+
+- **Timestamp**: 2026-08-05 (fix/6847-inet-precedence-classifier) — **INCOMPLETE**
+- **Action**: Go config half of enforcing the `inet-precedence` classifier.
+  Scope finding first: the issue described this as "accepted but inert", but the
+  unit-level `classifiers` schema had NO `inet-precedence` child at all, so the
+  classifier was definable at the top level and NOT BINDABLE — the bind line was
+  rejected by the schema. So the work is five layers, not three. Landed here:
+  typed entries (`CoSINetPrecedenceClassifier` + `...Entry`), the keyed
+  `INetPrecedenceClassifierDefs` map, the unit binding field, the unit-level
+  schema binding site, a 0..7 code-point collector, the classifier compile
+  mirroring dscp, interface->unit inheritance, and a dscp+inet-precedence
+  same-unit conflict gate (strict at commit, `lenientCoSUnitClassifierConflict`
+  downgrade on the tolerant Load/SyncApply path per #1960). Golden 4406
+  regenerated after verifying the diff was EXCLUSIVELY the new struct field —
+  18 keys added, 0 removed, 0 changed, all `INetPrecedenceClassifierDefs` — so
+  the regen masks no behavior change.
+- **NOT DONE — this branch must NOT merge as-is**: the wire fields and the Rust
+  classify arm are absent, so the binding site now EXISTS but does NOTHING. That
+  is worse than master, where the bind line is at least rejected outright. See
+  the commit body for the remaining work list.
+- **Validation**: `go test ./pkg/config/` green (real exit 0). No PR opened.
+- **File(s)**: `pkg/config/types_cos.go`, `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_strict_cos.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cos_platform.go`,
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)

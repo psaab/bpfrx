@@ -212,6 +212,8 @@ fn build_cos_owner_worker_by_queue_prefers_lowest_worker_with_tx_binding() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -304,6 +306,8 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -383,6 +387,8 @@ fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -444,6 +450,8 @@ fn build_cos_owner_worker_by_queue_falls_back_when_no_ready_workers_exist() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -566,6 +574,7 @@ fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
         dscp_classifiers: vec![],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
+        inet_precedence_classifiers: vec![],
     });
 
     coordinator.refresh_runtime_snapshot(&snapshot).expect("refresh_runtime_snapshot must succeed");
@@ -643,6 +652,7 @@ fn refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding() {
         dscp_classifiers: vec![],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
+        inet_precedence_classifiers: vec![],
     });
 
     coordinator
@@ -899,6 +909,8 @@ fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -972,6 +984,8 @@ fn build_shared_cos_root_leases_reuses_existing_matching_lease_arc() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 1usize)]);
@@ -1021,6 +1035,8 @@ fn build_shared_cos_queue_leases_reuses_existing_matching_lease_arc() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -1076,6 +1092,8 @@ fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_mode_toggles() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -1145,6 +1163,8 @@ fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_target_policy_changes(
             oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
             oversubscription_guarantee_fraction: 0.0,
             priority_low_min_share_bytes: 0,
+            inet_precedence_classifier: String::new(),
+            inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -1227,6 +1247,8 @@ fn exact_queue_forwarding_fixture() -> ForwardingState {
             oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
             oversubscription_guarantee_fraction: 0.0,
             priority_low_min_share_bytes: 0,
+            inet_precedence_classifier: String::new(),
+            inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding
@@ -1392,6 +1414,8 @@ fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unc
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     coordinator.forwarding.egress.insert(

@@ -2224,6 +2224,7 @@ fn token_allowed_reject_enqueues_with_classify_verdict_5569() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };

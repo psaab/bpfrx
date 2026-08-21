@@ -58,6 +58,8 @@ fn build_cos_interface_runtime_propagates_surplus_sharing() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
         1_000_000_000,
     );
@@ -113,6 +115,8 @@ fn build_cos_interface_runtime_starts_exact_queue_with_zero_local_tokens() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
         1_000_000_000,
     );
@@ -206,6 +210,8 @@ fn build_cos_interface_runtime_zero_shaping_rate_starts_with_full_root_tokens() 
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
         1_000_000_000,
     );
@@ -252,6 +258,8 @@ fn build_cos_interface_runtime_zero_queue_rate_starts_with_full_queue_tokens() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
         1_000_000_000,
     );

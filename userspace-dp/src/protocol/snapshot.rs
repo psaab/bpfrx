@@ -167,6 +167,15 @@ pub(crate) struct InterfaceSnapshot {
     pub cos_dscp_classifier: String,
     #[serde(rename = "cos_ieee8021_classifier", default)]
     pub cos_ieee8021_classifier: String,
+    /// #6847: the unit's `classifiers inet-precedence <name>` binding. Empty
+    /// (the additive default) for every snapshot a pre-#6847 control plane
+    /// publishes, so an older config decodes to "no inet-precedence
+    /// classifier" and the BA chain is unchanged. Mutually exclusive with
+    /// `cos_dscp_classifier` — both read the same DS field, so the Go commit
+    /// gate rejects binding both; if a tolerant-path snapshot carries both
+    /// anyway, DSCP is consulted first and wins.
+    #[serde(rename = "cos_inet_precedence_classifier", default)]
+    pub cos_inet_precedence_classifier: String,
     #[serde(rename = "cos_dscp_rewrite_rule", default)]
     pub cos_dscp_rewrite_rule: String,
     /// #1614 A1: operator-selectable oversubscription policy.

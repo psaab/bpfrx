@@ -1669,6 +1669,8 @@ fn wire_invariant_default_specimens() {
     s.insert("cos_forwarding_class_snapshot".into(), dump(&CoSForwardingClassSnapshot::default()));
     s.insert("cos_ieee8021_classifier_entry_snapshot".into(), dump(&CoSIEEE8021ClassifierEntrySnapshot::default()));
     s.insert("cos_ieee8021_classifier_snapshot".into(), dump(&CoSIEEE8021ClassifierSnapshot::default()));
+    s.insert("cos_inet_precedence_classifier_entry_snapshot".into(), dump(&CoSINetPrecedenceClassifierEntrySnapshot::default()));
+    s.insert("cos_inet_precedence_classifier_snapshot".into(), dump(&CoSINetPrecedenceClassifierSnapshot::default()));
     s.insert("cos_interface_status".into(), dump(&CoSInterfaceStatus::default()));
     s.insert("cos_queue_status".into(), dump(&CoSQueueStatus::default()));
     s.insert("cos_scheduler_map_entry_snapshot".into(), dump(&CoSSchedulerMapEntrySnapshot::default()));
