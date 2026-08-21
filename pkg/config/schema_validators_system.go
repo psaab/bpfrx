@@ -365,6 +365,65 @@ var zoneNameSegmentRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_+-]*$`)
 // that still rejects an absurdly long traversal string.
 const maxTimeZoneLen = 64
 
+// maxUnixSocketPathLen bounds a helper socket path. AF_UNIX sun_path is a
+// 108-byte array that must hold a NUL terminator, so 107 octets is the longest
+// path the kernel can bind — a longer one fails at bind() with EINVAL, which
+// surfaces as an opaque dataplane bring-up failure rather than a commit error.
+const maxUnixSocketPathLen = 107
+
+// ValidateUnixSocketPath accepts a `system dataplane control-socket` value: the
+// filesystem path the Rust helper binds its control listener on and the daemon
+// dials (pkg/dataplane/userspace/process.go, process_control.go).
+//
+// It must be an ABSOLUTE, traversal-free path that names a file, because:
+//
+//   - the daemon and the helper are separate processes, so a relative path is
+//     resolved against whatever working directory each happens to hold;
+//   - the path is handed to the stale-socket unlink at every bring-up, so a
+//     `..` component lets a stored config aim that unlink outside the runtime
+//     directory it appears to name (#5839);
+//   - a trailing slash or a bare `/` names no socket at all;
+//   - a path over sun_path's 107 usable octets can never bind.
+//
+// Strict at commit-check (SchemaValidate) only. The tolerant load / peer-sync
+// path keeps booting on a stale value (#1960 no-brick: pkg/configstore
+// compileTreeLenient warns and continues), and the runtime is not relying on
+// this gate — removeStaleUnixSocket re-judges the path defensively at every
+// bring-up, which is what protects a value that never passed through a strict
+// commit at all. Rejecting `.`/`..` here removes the traversal spelling most
+// likely to be written by hand; it does NOT make the runtime path
+// alias-proof — a symlinked parent still aliases (#7139).
+func ValidateUnixSocketPath(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing value (expected an absolute socket path, e.g. /run/xpf/userspace-dp.sock)")
+	}
+	if !strings.HasPrefix(raw, "/") {
+		return fmt.Errorf("socket path %q must be absolute (start with '/'): the daemon and the "+
+			"dataplane helper are separate processes and resolve a relative path against "+
+			"their own working directories", raw)
+	}
+	if len(raw) > maxUnixSocketPathLen {
+		return fmt.Errorf("socket path %q is %d octets, over the %d-octet AF_UNIX sun_path limit",
+			raw, len(raw), maxUnixSocketPathLen)
+	}
+	if strings.HasSuffix(raw, "/") {
+		return fmt.Errorf("socket path %q must name a socket file, not a directory (no trailing '/')", raw)
+	}
+	for _, seg := range strings.Split(raw, "/")[1:] {
+		switch seg {
+		case "":
+			return fmt.Errorf("socket path %q must not contain an empty component (doubled '/')", raw)
+		case ".", "..":
+			return fmt.Errorf("socket path %q must not contain a %q component: the path is unlinked "+
+				"at every dataplane bring-up and must not be able to leave the directory it names", raw, seg)
+		}
+		if strings.IndexFunc(seg, func(r rune) bool { return r < 0x20 }) >= 0 {
+			return fmt.Errorf("socket path %q must not contain control characters (including NUL)", raw)
+		}
+	}
+	return nil
+}
+
 // ValidateTimeZone accepts a `system time-zone` value: an IANA tz-database /
 // zoneinfo name such as `UTC`, `America/Los_Angeles`, or `Etc/GMT+5`. The value
 // is rendered into the /etc/localtime symlink target
