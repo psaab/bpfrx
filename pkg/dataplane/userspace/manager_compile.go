@@ -31,6 +31,32 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 // the multi-zone SHAPE rather than the action so it covers both directions.
 var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-global zone-set snapshot protocol incompatible")
 
+// ErrEgressZoneProtocolIncompatible is the #6722 required-protocol gate
+// sentinel: the RUNNING helper advertises a ConfigSnapshotProtocolVersion that
+// is not this binary's, so the two do not agree on what the interface rows mean.
+//
+// Unlike its siblings this gate is not keyed on a config SHAPE, because the
+// change it fences is not optional for any config: every InterfaceSnapshot now
+// carries the Go-decided EgressZone, and the v4 `reth_projection` field it
+// replaced is gone. A field DELETION cannot ride an unchanged version — two
+// binaries either side of it both advertise their number and read the same
+// bytes differently.
+//
+// It is keyed on EQUALITY, not `>=`. The helper's own apply_snapshot and
+// bump_fib_generation gates are exact-equality, so a helper at ANY other
+// version refuses the snapshot outright; a `>=` gate would additionally stay
+// green at exactly the colliding value, which is the shape this gate exists to
+// catch.
+//
+// MEASURED, so the severity is not a guess: feeding the v4 Go builder's rows to
+// the v5 helper on the reference cluster resolves egress zone 0 for BOTH
+// ifindex 24 and ifindex 25, where origin/master and the matched v5 pair
+// resolve `lan` and `wan`. Ifindex 25 loses a zone even the pre-#6722 helper
+// resolved, so a mixed pairing is strictly worse than either endpoint rather
+// than an intermediate state — a silent transit outage under `default-policy
+// deny-all`, carrying a version number both sides agree on.
+var ErrEgressZoneProtocolIncompatible = errors.New("userspace egress-zone snapshot protocol incompatible")
+
 // requiredProtocolGateSentinels enumerates every "this config cannot be
 // committed against the helper's current ConfigSnapshotProtocolVersion"
 // sentinel produced by ensureRequiredSnapshotProtocolLocked. ApplyConfig
@@ -66,6 +92,7 @@ var requiredProtocolGateSentinels = []error{
 	ErrPolicySchedulerProtocolIncompatible,
 	ErrPersistentSourceNATProtocolIncompatible,
 	ErrScopedGlobalZoneSetProtocolIncompatible,
+	ErrEgressZoneProtocolIncompatible,
 }
 
 // IsRequiredProtocolGateError reports whether err is (or wraps) any
@@ -814,7 +841,63 @@ func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error
 	if err := m.ensurePersistentSourceNATProtocolLocked(cfg); err != nil {
 		return err
 	}
-	return m.ensureScopedGlobalZoneSetProtocolLocked(cfg)
+	if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); err != nil {
+		return err
+	}
+	return m.ensureEgressZoneProtocolLocked()
+}
+
+// ensureEgressZoneProtocolLocked refuses to commit against a running helper
+// that does not speak this binary's snapshot contract (#6722).
+//
+// Takes no config: every snapshot carries EgressZone, so unlike the sibling
+// gates there is no shape to test. What it IS conditional on is having actually
+// OBSERVED a helper version. That conditioning is load-bearing for #1960
+// no-brick: `lastStatus` is zero before the first handshake, and a gate that
+// fired on "version unknown" would abort every commit made while the helper is
+// down or still starting — a brick, not a fence. When no version can be learned
+// this returns nil and the pre-existing behaviour stands (the helper's own
+// exact-equality gate refuses the snapshot and the apply surfaces that error).
+//
+// The comparison is EQUALITY. `>=` would pass a helper NEWER than this binary,
+// whose own gate would then refuse our snapshot anyway, and — the reason the
+// shape matters — a `> N` spelling stays green at exactly the version that
+// collides.
+func (m *Manager) ensureEgressZoneProtocolLocked() error {
+	observed := m.lastStatus.ConfigSnapshotProtocolVersion
+	if observed == ProtocolVersion {
+		return nil
+	}
+	// Re-ask before failing: `lastStatus` may predate a helper restart onto a
+	// matching build, and the sibling gates take the same second look.
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		observed = status.ConfigSnapshotProtocolVersion
+		if observed == ProtocolVersion {
+			return nil
+		}
+	}
+	if observed <= 0 {
+		// No helper has told us a version. Not evidence of a mismatch.
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d != required %d. The "+
+			"interface rows changed shape in #6722: the egress security zone is "+
+			"now decided by the control plane and carried in `egress_zone`, and "+
+			"the `reth_projection` field the older contract carried is gone. A "+
+			"helper on the other side of that change resolves NO egress zone for "+
+			"an interface described by several rows — measured, both RETH "+
+			"ifindexes of the reference cluster — so every transit flow out of "+
+			"them falls to the default policy. Restart the userspace dataplane "+
+			"helper onto the build that ships with this xpfd (they are pushed "+
+			"together by `make cluster-deploy` / `make test-deploy`), then commit "+
+			"again",
+		ErrEgressZoneProtocolIncompatible,
+		observed,
+		ProtocolVersion,
+	)
 }
 
 // disarmSnapshotProtocolFailClosedLocked is the shared fail-closed action for a
