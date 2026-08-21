@@ -237,6 +237,7 @@
     "dscp_rewrite_rules": [],
     "forwarding_classes": [],
     "ieee8021_classifiers": [],
+    "inet_precedence_classifiers": [],
     "scheduler_maps": [],
     "schedulers": []
   },
@@ -371,6 +372,15 @@
     "loss_priority": ""
   },
   "cos_ieee8021_classifier_snapshot": {
+    "entries": [],
+    "name": ""
+  },
+  "cos_inet_precedence_classifier_entry_snapshot": {
+    "forwarding_class": "",
+    "loss_priority": "",
+    "precedences": []
+  },
+  "cos_inet_precedence_classifier_snapshot": {
     "entries": [],
     "name": ""
   },
@@ -670,6 +680,7 @@
     "cos_dscp_classifier": "",
     "cos_dscp_rewrite_rule": "",
     "cos_ieee8021_classifier": "",
+    "cos_inet_precedence_classifier": "",
     "cos_oversubscription_guarantee_fraction": 0.0,
     "cos_oversubscription_policy": "",
     "cos_priority_low_min_share_bytes": 0,
@@ -949,6 +960,7 @@
     "worker_heartbeats": [],
     "worker_runtime": [],
     "workers": 0,
+    "zone_flood_counters": [],
     "zone_traffic_counters": []
   },
   "queue_control_request": {
@@ -1251,6 +1263,12 @@
     "window_ns": 0,
     "work_loops": 0,
     "worker_id": 0
+  },
+  "zone_flood_counter_status": {
+    "icmp_flood_events": 0,
+    "syn_flood_events": 0,
+    "udp_flood_events": 0,
+    "zone_id": 0
   },
   "zone_snapshot": {
     "host_inbound_configured": false,

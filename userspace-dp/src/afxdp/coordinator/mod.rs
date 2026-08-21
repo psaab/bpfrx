@@ -1129,6 +1129,79 @@ impl Coordinator {
         self.forwarding.zone_counter_store.clear();
     }
 
+    /// #3651: per-zone SYN/ICMP/UDP flood-EVENT snapshot for
+    /// `ProcessStatus.zone_flood_counters`.
+    ///
+    /// Same two filters as `zone_traffic_counters`, for the same reasons: a row
+    /// publishes only when its zone is BOTH currently configured AND holding a
+    /// live slot. The slot filter is the load-bearing one — the store outlives
+    /// the slot map, so a zone pushed past capacity by a later config keeps its
+    /// retained flood counts while no longer being counted, and publishing that
+    /// row would mirror a FROZEN total that under-reports every subsequent
+    /// attack while looking alive. The configured filter is defence in depth
+    /// (apply-time `reconcile` already prunes unconfigured zones).
+    ///
+    /// NOTE: this is only half the fix. The Go status loop must REPLACE its
+    /// offset map from each snapshot rather than merge into it, or a row that
+    /// stops being published leaves a stale offset behind
+    /// (`Manager.ReplaceFloodCounterOffsets`).
+    pub fn zone_flood_counters(&self) -> Vec<crate::protocol::ZoneFloodCounterStatus> {
+        let configured = &self.forwarding.zone_id_to_name;
+        crate::afxdp::flood_counters::publishable_flood_rows(
+            &self.forwarding.flood_counter_store,
+            &self.forwarding.flood_counter_slot_map,
+            |zone_id| configured.contains_key(&zone_id),
+        )
+    }
+
+    /// #3651: true when the configured zone count exceeded the flood-counter
+    /// slot capacity, so some zones' flood events go uncounted (surfaced on the
+    /// wire as `flood_counter_overflow_active`).
+    pub fn flood_counter_overflow_active(&self) -> bool {
+        self.forwarding.flood_counter_slot_map.overflow_active
+    }
+
+    /// #3651: the flood-counter wire layout version this helper emits.
+    pub fn flood_counter_layout_version(&self) -> u32 {
+        crate::afxdp::flood_counters::FLOOD_COUNTER_LAYOUT_VERSION
+    }
+
+    /// #3651: operator clear of per-zone flood counters. Resets the helper's
+    /// cumulative store so the pre-clear total is not snapped back on the next
+    /// 1 s status poll (the load-bearing half of the operator clear — clearing
+    /// only the Go offset map would be undone within a second).
+    ///
+    /// A cleared zone then reads as NOT POPULATED rather than as zero:
+    /// `FloodCounterStore::snapshot` omits all-zero rows, so a just-cleared zone
+    /// produces no row, and the Go side replaces its offset map from that
+    /// snapshot (`ReplaceFloodCounterOffsets`) rather than overwriting row by
+    /// row — so the offset is dropped, not set to 0.
+    pub fn clear_flood_counters(&self) {
+        self.forwarding.flood_counter_store.clear();
+    }
+
+    /// TEST SCAFFOLDING (#6938): seed one zone with a recorded flood event,
+    /// exactly as a worker leaves it after `record_zone_flood_drop` + a flush.
+    ///
+    /// It exists because the binding that matters lives OUTSIDE this package:
+    /// `server::helpers::status::refresh_status` publishing these rows, and the
+    /// `clear_flood_counters` handler arm clearing them. Those call sites were
+    /// unbound precisely because every existing test reached past them into
+    /// `crate::afxdp`, which `pkg`-external tests cannot do — so the seam had to
+    /// be opened deliberately rather than by moving the tests inward, which
+    /// would have measured the coordinator again instead of its callers.
+    #[cfg(test)]
+    pub(crate) fn seed_flood_counter_for_test(&mut self, zone: u16, name: &str) {
+        use crate::afxdp::flood_counters::{
+            flush_recorded_flood_counters, record_zone_flood_drop, FloodCounterSlotMap,
+        };
+        let map = FloodCounterSlotMap::build(&[zone], &self.forwarding.flood_counter_store);
+        record_zone_flood_drop(&map, zone, "syn-flood");
+        flush_recorded_flood_counters(&self.forwarding.flood_counter_store, &map);
+        self.forwarding.flood_counter_slot_map = std::sync::Arc::new(map);
+        self.forwarding.zone_id_to_name.insert(zone, name.to_string());
+    }
+
     /// Current in-memory FIB generation (the value flow-cache lookups
     /// validate against). Read by the `bump_fib_generation` control handler
     /// to build a rollback-rejection error and by tests.

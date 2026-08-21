@@ -338,6 +338,7 @@ fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
                 },
             ],
         }],
+        inet_precedence_classifiers: vec![],
     });
 
     let forwarding = build_forwarding_state(&snapshot);
@@ -656,6 +657,7 @@ fn txn_flow_cache_hit_reclassifies_ba_pcp_per_packet_4422() {
                 },
             ],
         }],
+        inet_precedence_classifiers: vec![],
     });
 
     let forwarding = build_forwarding_state(&snapshot);

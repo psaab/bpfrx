@@ -15,6 +15,13 @@ pub(crate) struct ClassOfServiceSnapshot {
     pub dscp_classifiers: Vec<CoSDSCPClassifierSnapshot>,
     #[serde(rename = "ieee8021_classifiers", default)]
     pub ieee8021_classifiers: Vec<CoSIEEE8021ClassifierSnapshot>,
+    /// #6847: `class-of-service classifiers inet-precedence <name>`. Additive
+    /// — an older helper ignores the key, and a newer helper reading an older
+    /// snapshot gets the empty default (no inet-precedence binding is
+    /// publishable by a control plane that does not emit this list, because
+    /// the per-interface `cos_inet_precedence_classifier` is additive too).
+    #[serde(rename = "inet_precedence_classifiers", default)]
+    pub inet_precedence_classifiers: Vec<CoSINetPrecedenceClassifierSnapshot>,
     #[serde(rename = "dscp_rewrite_rules", default)]
     pub dscp_rewrite_rules: Vec<CoSDSCPRewriteRuleSnapshot>,
     #[serde(rename = "schedulers", default)]
@@ -62,6 +69,33 @@ pub(crate) struct CoSIEEE8021ClassifierEntrySnapshot {
     pub loss_priority: String,
     #[serde(rename = "code_points", default)]
     pub code_points: Vec<u8>,
+}
+
+/// #6847: an IP-precedence behavior-aggregate classifier. IP precedence is the
+/// top 3 bits of the SAME IPv4 TOS byte / IPv6 traffic-class field the DSCP
+/// classifier reads, so a unit binds at most one of `dscp` and
+/// `inet-precedence` (the Go commit gate `validateCoSUnitClassifierConflict`
+/// rejects the combination; the tolerant load path downgrades to a warning and
+/// DSCP wins on that boot, matching the resolution order in
+/// `tx/cos_classify.rs`).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSINetPrecedenceClassifierSnapshot {
+    pub name: String,
+    #[serde(default)]
+    pub entries: Vec<CoSINetPrecedenceClassifierEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSINetPrecedenceClassifierEntrySnapshot {
+    #[serde(rename = "forwarding_class", default)]
+    pub forwarding_class: String,
+    #[serde(rename = "loss_priority", default)]
+    pub loss_priority: String,
+    /// IP-precedence code-points (0..=7). Out-of-range values fail the
+    /// snapshot CLOSED at build time rather than being masked into a valid
+    /// index — see `CosInetPrecedenceCodePointOutOfRange`.
+    #[serde(rename = "precedences", default)]
+    pub precedences: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

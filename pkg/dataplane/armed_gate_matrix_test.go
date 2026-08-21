@@ -160,11 +160,18 @@ var managerMethodClasses = map[string]string{
 	// m.mu-protected zoneCounterOffsets map wholesale (the plural sibling
 	// of SetZoneCounterOffset); ProveArmCoverage (armproof.go) reads only
 	// m.attachedInstance.
-	"ReplaceZoneCounterOffsets":  "catG",
-	"ProveArmCoverage":           "catG",
-	"ClearZoneCounterOffsets":    "catG",
-	"ReadFloodCounters":          "catG",
-	"SetFloodCounterOffset":      "catG",
+	"ReplaceZoneCounterOffsets": "catG",
+	"ProveArmCoverage":          "catG",
+	"ClearZoneCounterOffsets":   "catG",
+	"ReadFloodCounters":         "catG",
+	"SetFloodCounterOffset":     "catG",
+	// #3651 flood half: the plural sibling of SetFloodCounterOffset, and the
+	// only production writer of the flood offset map. Same shape as
+	// ReplaceZoneCounterOffsets above — it takes m.mu, rebuilds the
+	// m.mu-protected floodCounterOffsets map from the caller's rows (nil on an
+	// empty set) and returns; it touches neither m.maps nor m.programs, so its
+	// behaviour is identical fresh, armed, and retained.
+	"ReplaceFloodCounterOffsets": "catG",
 	"ClearFloodCounterOffsets":   "catG",
 	"ReadNATRuleCounter":         "catG",
 	"SetNATRuleCounterOffset":    "catG",
@@ -229,8 +236,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 159 {
-		t.Fatalf("exported *Manager method inventory = %d, want 159 (the plan census 157 + the two #6743 r4 additions); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 160 {
+		t.Fatalf("exported *Manager method inventory = %d, want 160 (the plan census 157 + the two #6743 r4 additions + ReplaceFloodCounterOffsets, #3651); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {

@@ -334,6 +334,16 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     } else {
         state.afxdp.zone_counter_layout_version()
     };
+    // #3651: and the pre-summed per-zone FLOOD-event block, same convention.
+    state.status.zone_flood_counters = state.afxdp.zone_flood_counters();
+    state.status.flood_counter_overflow_active = state.afxdp.flood_counter_overflow_active();
+    state.status.flood_counter_layout_version = if state.status.zone_flood_counters.is_empty()
+        && !state.status.flood_counter_overflow_active
+    {
+        0
+    } else {
+        state.afxdp.flood_counter_layout_version()
+    };
     state.status.three_color_policer_counters = state.afxdp.three_color_policer_counters();
     state.status.source_nat_pools = state.afxdp.source_nat_pool_statuses();
     let (flow_worker_map, flow_worker_map_truncated) = state.afxdp.flow_worker_map();

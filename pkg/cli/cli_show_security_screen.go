@@ -378,16 +378,23 @@ func (c *CLI) showScreenStatistics(zoneName string) error {
 		screenProfile = z.ScreenProfile
 	}
 	if errors.Is(err, dataplane.ErrCounterNotPopulated) {
-		// #3643 HIDE: per-zone flood-event counters are not sourced by the
-		// userspace dataplane. Say so explicitly rather than printing a
-		// misleading 0. Global/aggregate screen drop visibility remains via
+		// #3651: the userspace dataplane DOES source per-zone flood counters
+		// now, but this zone has none published. Say so explicitly rather than
+		// printing a misleading 0 -- ErrCounterNotPopulated covers a helper
+		// with no per-zone flood accounting, a zone past the dataplane's
+		// hot-path slot capacity (its flood events really are uncounted), and a
+		// zone that has simply never tripped a flood check. Naming "not
+		// implemented" was accurate under the #3643 HIDE and is now actively
+		// misleading. Global/aggregate screen drop visibility remains via
 		// `show security screen` and the #3343 per-reason counters.
 		fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
 		if screenProfile != "" {
 			fmt.Printf("  Screen profile: %s\n", screenProfile)
 		}
 		fmt.Println("  Per-zone flood counters: not available " +
-			"(per-zone flood accounting not implemented in the userspace dataplane)")
+			"(no per-zone flood counts published for this zone: helper predates " +
+			"per-zone flood accounting, the zone exceeded the dataplane's " +
+			"hot-path slot capacity, or the zone has recorded no flood events)")
 		fmt.Print(c.screenSYNCookieCounterRows())
 		return nil
 	}
@@ -442,16 +449,19 @@ func (c *CLI) showScreenStatisticsAll() error {
 			screenProfile = z.ScreenProfile
 		}
 		if errors.Is(err, dataplane.ErrCounterNotPopulated) {
-			// #3643 HIDE: per-zone flood counters are not sourced by the
-			// userspace dataplane. This is NOT a read failure -- do not set
-			// readErr (no false #3408 warning) and do not print a misleading 0;
-			// render an explicit "not available" row for the zone.
+			// #3651: per-zone flood counters ARE sourced now; this zone has
+			// none published (see the single-zone branch above for the three
+			// causes). NOT a read failure -- do not set readErr (no false #3408
+			// warning) and do not print a misleading 0; render an explicit
+			// "not available" row for the zone.
 			fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
 			if screenProfile != "" {
 				fmt.Printf("  Screen profile: %s\n", screenProfile)
 			}
 			fmt.Println("  Per-zone flood counters: not available " +
-				"(per-zone flood accounting not implemented in the userspace dataplane)")
+				"(no per-zone flood counts published for this zone: helper predates " +
+				"per-zone flood accounting, the zone exceeded the dataplane's " +
+				"hot-path slot capacity, or the zone has recorded no flood events)")
 			fmt.Println()
 			continue
 		}

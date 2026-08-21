@@ -268,6 +268,22 @@ type ZoneTrafficCounterStatus struct {
 	EgressBytes    uint64 `json:"egress_bytes,omitempty"`
 }
 
+// ZoneFloodCounterStatus is one per-zone flood-EVENT row reported by the
+// userspace dataplane inside ProcessStatus.ZoneFloodCounters (#3651) -- the
+// sibling of ZoneTrafficCounterStatus for the other per-zone counter family.
+// ZoneID is the stable name-hash zone id (StableZoneID / ZoneSnapshot.id); the
+// three counts are cumulative screen DROPS attributed to that zone for the
+// syn-flood, icmp-flood, and udp-flood checks, since helper start (or the last
+// clear_flood_counters IPC). syncBPFCountersLocked maps them onto
+// dataplane.FloodState SynCount/ICMPCount/UDPCount. The Rust struct is
+// ZoneFloodCounterStatus (protocol/control.rs) with matching serde rename tags.
+type ZoneFloodCounterStatus struct {
+	ZoneID          uint16 `json:"zone_id,omitempty"`
+	SynFloodEvents  uint64 `json:"syn_flood_events,omitempty"`
+	ICMPFloodEvents uint64 `json:"icmp_flood_events,omitempty"`
+	UDPFloodEvents  uint64 `json:"udp_flood_events,omitempty"`
+}
+
 type CoSActiveFlowCountStatus struct {
 	Ifindex         int    `json:"ifindex,omitempty"`
 	QueueID         uint8  `json:"queue_id,omitempty"`

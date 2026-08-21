@@ -25,11 +25,13 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				}},
 			}},
 		}},
-		// #4316 (fable-167 F-3b): IP-precedence classifier. Accepted for
-		// Junos compatibility (completion + ? help) but INERT — the userspace
-		// dataplane classifies only on dscp / ieee-802.1. A commit advisory
-		// surfaces the inertness.
-		"inet-precedence": {desc: "IP-precedence classifier (accepted for Junos compatibility; NOT enforced — the dataplane classifies on dscp / ieee-802.1 only)", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
+		// IP-precedence classifier. Added inert for Junos compatibility in
+		// #4316 (fable-167 F-3b); ENFORCED since #6847 — the entries compile,
+		// cross the wire as inet_precedence_classifiers, and the dataplane
+		// classifies on the top 3 bits of the DS field. The matching
+		// accepted-but-inert commit advisory was retracted with it. The
+		// `rewrite-rules inet-precedence` direction below is still inert.
+		"inet-precedence": {desc: "IP-precedence classifier (classify on the 3-bit IP precedence field)", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
 			"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
 				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
 					"code-points": {desc: "IP-precedence code points to match (0..7)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
@@ -241,8 +243,15 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 	"interfaces": {desc: "Apply CoS to an interface", args: 1, multi: true, placeholder: "<interface-name>", children: map[string]*schemaNode{
 		"unit": {desc: "Logical unit number", args: 1, multi: true, placeholder: "<unit-number>", children: map[string]*schemaNode{
 			"classifiers": {desc: "Classifiers applied to traffic arriving on this unit", children: map[string]*schemaNode{
-				"dscp":       {desc: "DSCP classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
-				"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
+				"dscp": {desc: "DSCP classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
+				// #6847: before this the unit had NO inet-precedence binding
+				// site, so an inet-precedence classifier was definable at the
+				// top level but not bindable — the bind line was rejected by
+				// the schema. Mutually exclusive with `dscp` (both read the
+				// same IPv4 TOS byte); the conflict is rejected at commit
+				// rather than resolved by a silent precedence order.
+				"inet-precedence": {desc: "IP-precedence classifier to apply (cannot be combined with dscp on the same unit)", args: 1, placeholder: "<classifier-name>", children: nil},
+				"ieee-802.1":      {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 			}},
 			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
 				"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},

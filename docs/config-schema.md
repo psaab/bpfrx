@@ -9812,14 +9812,47 @@ under `firewall family {inet,inet6} filter <name>`; captured on
 a single shared counter rather than a per-interface instance — with a commit
 advisory (`validateFirewallInterfaceSpecificWarnings`).
 
-**F-3b — CoS `inet-precedence` + `exp` (#4316).** Added
-`classifiers inet-precedence`, `rewrite-rules inet-precedence`, and
-`rewrite-rules exp` to `schemaClassOfService` (completion + `?` help). They
-are **accepted-but-inert** — the userspace dataplane classifies / rewrites on
-`dscp` / `ieee-802.1` only. Their names are recorded on
-`ClassOfServiceConfig` (`INetPrecedenceClassifiers` /
-`INetPrecedenceRewriteRules` / `EXPRewriteRules`) solely to drive a commit
-advisory; no runtime structure is built.
+**F-3b — CoS `inet-precedence` + `exp` (#4316, classifier half ENFORCED in
+#6847).** Added `classifiers inet-precedence`, `rewrite-rules inet-precedence`,
+and `rewrite-rules exp` to `schemaClassOfService` (completion + `?` help).
+
+The two REWRITE directions remain **accepted-but-inert** — the userspace
+dataplane rewrites `dscp` on egress only. Their names are recorded on
+`ClassOfServiceConfig` (`INetPrecedenceRewriteRules` / `EXPRewriteRules`)
+solely to drive a commit advisory; no runtime structure is built.
+
+The `classifiers inet-precedence` half is **enforced since #6847**. #4316
+recorded only the classifier NAMES, and the unit-level `classifiers` schema
+node had no `inet-precedence` child at all — so the classifier was definable
+but NOT bindable, and `set class-of-service interfaces <if> unit <n>
+classifiers inet-precedence <name>` was rejected by the schema (an imported
+vSRX config failed at the bind line). #6847 added the unit binding site,
+compiled the code-point entries into `INetPrecedenceClassifierDefs`
+(`CoSINetPrecedenceClassifier` / `...Entry`), published them on the wire as
+`inet_precedence_classifiers` + the per-interface
+`cos_inet_precedence_classifier`, and made the dataplane classify on the top
+3 bits of the DS field (`resolve_cos_inet_precedence_classifier_queue_id`,
+`(dscp >> 3) & 0x7`). The entry's `loss-priority` drives the egress rewrite
+like the dscp / 802.1p classifiers. The matching accepted-but-inert advisory
+was retracted with it.
+
+Because that `loss-priority` is now LIVE it is covered by
+`validateClassOfServiceLossPriorityStrict` alongside the dscp / ieee-802.1
+classifiers and both rewrite-rule directions: an unrecognized value (an
+operator typo such as `hgih`) is hard-rejected at commit, and downgraded to a
+warning on the tolerant `Load` / `SyncApply` path. Without that arm the helper
+maps the unknown string with `cos_loss_priority_index(...).unwrap_or(0)` and
+silently applies the LOW rewrite row — the accepted-but-silently-substituted
+drop precedence the classifier's loss-priority arm exists to remove.
+
+A unit may bind **at most one** of `classifiers dscp` and `classifiers
+inet-precedence`: IP precedence is the top 3 bits of the same DS field DSCP
+reads, so the two are alternative interpretations of one field rather than
+composable classifiers. `validateCoSUnitClassifierConflict` hard-rejects the
+combination at commit; the tolerant `Load` / `SyncApply` path downgrades it to
+a warning (`lenientCoSUnitClassifierConflict`) so an already-persisted or
+peer-synced config still boots (#1960), and DSCP wins on that boot because the
+BA chain consults it first.
 
 **Gap 4 — CoS `rewrite-rules ieee-802.1` (802.1p PCP egress rewrite,
 #4228).** Added `rewrite-rules ieee-802.1 <name> { forwarding-class <fc> {

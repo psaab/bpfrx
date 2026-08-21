@@ -472,7 +472,13 @@ type InterfaceSnapshot struct {
 	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
 	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
 	CoSIEEE8021Classifier     string                     `json:"cos_ieee8021_classifier,omitempty"`
-	CoSDSCPRewriteRule        string                     `json:"cos_dscp_rewrite_rule,omitempty"`
+	// CoSINetPrecedenceClassifier (#6847) is the unit's `classifiers
+	// inet-precedence <name>` binding. Mutually exclusive with
+	// CoSDSCPClassifier — both classify the same DS field, so the commit gate
+	// rejects binding both; on the tolerant load path (warn) the dataplane
+	// consults DSCP first, so DSCP wins.
+	CoSINetPrecedenceClassifier string `json:"cos_inet_precedence_classifier,omitempty"`
+	CoSDSCPRewriteRule          string `json:"cos_dscp_rewrite_rule,omitempty"`
 	// #1614 A1: operator-selectable oversubscription policy. "" or
 	// "proportional" (default) preserves current scheduler bit-for-
 	// bit (when CoSPriorityLowMinShareBytes is also 0). "guarantee-

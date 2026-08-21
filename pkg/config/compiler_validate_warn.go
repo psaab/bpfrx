@@ -1333,14 +1333,18 @@ func ValidateConfig(cfg *Config) []string {
 				warnShapingPercentInert(unit, iface.Name)
 			}
 		}
-		// #4316 (fable-167 F-3b): inet-precedence classifiers/rewrite and exp
-		// rewrite are accepted for Junos compatibility but INERT — the
-		// userspace dataplane classifies/rewrites on dscp / ieee-802.1 only.
-		// Warn once per category so the operator is not misled.
-		if len(cos.INetPrecedenceClassifiers) > 0 {
-			warnings = append(warnings,
-				"class-of-service classifiers inet-precedence is accepted for compatibility but inert: the userspace dataplane classifies on dscp / ieee-802.1 only, so IP-precedence classification has no runtime effect")
-		}
+		// #4316 (fable-167 F-3b): inet-precedence rewrite and exp rewrite are
+		// accepted for Junos compatibility but INERT — the userspace dataplane
+		// rewrites on dscp only. Warn once per category so the operator is not
+		// misled.
+		//
+		// #6847 RETRACTED the CLASSIFIER half of this advisory: an
+		// inet-precedence classifier bound to a unit is now compiled, published
+		// on the wire (cos_inet_precedence_classifier +
+		// inet_precedence_classifiers) and enforced by the dataplane
+		// (resolve_cos_inet_precedence_classifier_queue_id). Keeping the
+		// "inert" warning would be actively wrong. The REWRITE direction below
+		// is still inert and its advisory stays.
 		if len(cos.INetPrecedenceRewriteRules) > 0 {
 			warnings = append(warnings,
 				"class-of-service rewrite-rules inet-precedence is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only, so IP-precedence rewrite has no runtime effect")
