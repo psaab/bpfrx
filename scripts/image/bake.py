@@ -370,6 +370,26 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", "chmod 0755 /usr/lib/systemd/incus-agent-setup",
         "--write", f"/etc/sysctl.d/99-xpf.conf:{SYSCTL_CONF}",
         "--run-command", "mkdir -p /etc/xpf && chmod 0750 /etc/xpf",
+        # #7114: the appliance-image marker. xpfd's #1922 bootstrap lifeline
+        # refuses to rename or bring up ANY NIC when it cannot identify a
+        # management interface from an active default route — the right call on
+        # a foreign host, where xpf is a guest and the operator's own network
+        # configuration is the lifeline. This image has no such configuration:
+        # cloud-init is purged and every netplan / interfaces.d file is deleted
+        # below, so on a factory boot (no day-0 drive) there is no route, no
+        # address, and nothing to preserve. Without this marker that boot leaves
+        # every port DOWN and unrenamed — console-only, no fxp0, no DHCP.
+        # Its presence, AND-ed in the daemon with "never committed", re-enables
+        # the image's vNIC#1 -> fxp0 factory contract on THIS artifact only. The
+        # .deb postinst must never write it.
+        "--write",
+        "/etc/xpf/appliance:"
+        "# xpf (#7114) appliance-image marker — written by scripts/image/bake.py.\n"
+        "# Presence means: this root filesystem IS the xpf appliance, so xpfd owns\n"
+        "# every NIC on it. On a FACTORY boot (nothing ever committed) the daemon\n"
+        "# claims the first enumerated NIC as fxp0 and DHCPs it, instead of the\n"
+        "# console-only bootstrap refusal it applies to foreign-host installs.\n"
+        "# Delete it to get the foreign-host posture on this box.\n",
         "--run-command", f"export DEBIAN_FRONTEND=noninteractive && {APT_UPDATE}",
         "--run-command", f"export DEBIAN_FRONTEND=noninteractive && "
                          f"apt-get install -y -qq -o Acquire::Retries=5 {pkgs}",

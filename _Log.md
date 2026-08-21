@@ -1,3 +1,61 @@
+## 2026-08-21 — #7114: a factory boot of the appliance image claimed no NIC, so no bake could sign
+
+- **Timestamp**: 2026-08-21 (fix/7114-appliance-factory-bootstrap)
+- **Action**: Fixed the last known blocker to a clean appliance bake. Tier-1
+  scenario `a` (factory boot, no day-0 drive) failed on every baked image:
+  the NIC stayed DOWN and unrenamed — no `fxp0`, no DHCP — and because that
+  gate is fatal the bake wrote artifacts but never signed them.
+
+  Reproduced firsthand at `70d2d819f` against the previously baked
+  `xpf-userspace-forwarding-ok-…-gf93215641` qcow2 (`validate.py a --keep`):
+  `FAIL: fxp0 has no IPv4 DHCP address after 90s`; in the kept guest
+  `ip -br link` showed `enp5s0 DOWN`, `/etc/systemd/network/` EMPTY,
+  `/etc/netplan` absent, no default route, and the journal's
+  `bootstrap lifeline: no IPv4/IPv6 default route found` warning.
+
+  **Which of scenario-vs-code is wrong — decided (b), the CODE.** The
+  scenario is not stale: PR #1906 (the image PR, merged 2026-06-13) recorded
+  `==> Scenario A PASS (fxp0 10.199.99.183/24)` on a real baked image, states
+  the shipped contract as "invalid/missing medium -> loud journal log +
+  factory bootstrap (fxp0 DHCP)", and says in as many words that "the no-config
+  boot is the existing, proven fxp0-DHCP bootstrap. M1b remains the right fix
+  for foreign-host installs (M1a deb), **not for the appliance image**". Issue
+  #1922 (M1b) says the same: the appliance image "relies on the existing
+  fxp0-DHCP factory bootstrap" and the PCI-keyed lifeline is "needed for
+  foreign-host installs, not the pinned image". #1922 nevertheless replaced
+  the unconditional `writeBootstrapFxp0Network()` with a default-route-gated
+  lifeline (`79941ada7`, 2026-06-16) and regressed exactly the case it
+  promised not to touch. Three docs still assert the pre-#1922 behaviour
+  (`docs/install-images.md` vSRX-parity table, `docs/image-validation.md`
+  scenario a, `CLAUDE.md`).
+
+  **Fix**: one missing discriminator. `scripts/image/bake.py` writes
+  `/etc/xpf/appliance`; the daemon falls back to the FIRST ENUMERATED NIC only
+  when that marker is present AND `EverCommitted()` is false. Both halves are
+  load-bearing — the marker keeps the #1922 console-only refusal for
+  foreign-host `.deb` installs (the postinst never writes it), and
+  `!everCommitted` keeps it for the #1960 fail-closed boot, where a
+  previously-configured box (possibly with a `chassis device-map` that wants
+  no auto-`fxp0`) is in bootstrap because its config stopped compiling.
+  #1956 §9.6 is untouched: device-map mode needs `DeviceMap.Active()`, hence a
+  committed config, so it can never be in force on this boot.
+
+  **Mutation-verified, three separate one-line mutations, each localised**:
+  dropping the chooser's appliance branch reds
+  `TestChooseBootstrapLifeline/appliance_factory_boot,_no_route` AND the wiring
+  test; dropping the `!everCommitted` half reds only
+  `TestIsApplianceFactoryBoot/marker_but_already_committed`; severing the
+  production call site (`applianceFactory := false`) reds only the wiring test
+  — so the mutation lands at a site the production path actually reaches, not
+  merely at the pure helper.
+
+  **Gates**: `go build ./...` 0; `go test -count=1 ./pkg/daemon/` 0;
+  `scripts/run-selftests.sh` 0 (50 passed / 0 skipped / 0 failed).
+- **File(s)**: pkg/daemon/bootstrap.go,
+  pkg/daemon/bootstrap_appliance_factory_7114_test.go,
+  scripts/image/bake.py, scripts/image/validate.py, pkg/daemon/README.md,
+  docs/install-images.md, docs/image-validation.md, CLAUDE.md, _Log.md
+
 ## 2026-08-21 — #6981 drive-to-merge: master merge + first hostile gate; the holder mask does NOT close #6522
 
 - **Timestamp**: 2026-08-21 (fix/6876-f2-holders, PR #6981)

@@ -91,6 +91,70 @@ const lifelineRecordFile = "/etc/xpf/lifeline-interface"
 // valve).
 const defaultMgmtInterface = "fxp0"
 
+// applianceMarkerFile marks a host that was PROVISIONED FROM THE XPF APPLIANCE
+// IMAGE. `scripts/image/bake.py` writes it into the baked root filesystem; the
+// .deb postinst NEVER does, so a foreign host that merely has the package
+// installed can never carry it, and neither can a `xpf-deploy` push.
+//
+// It is the discriminator the #1922 bootstrap lifeline was missing (#7114).
+// The lifeline refuses to touch any NIC when it cannot identify a management
+// interface, and on a FOREIGN host that refusal is right: xpf is a guest there
+// and the operator's own network configuration is the thing keeping the box
+// reachable. On the appliance image xpf is the ONLY network manager — the bake
+// purges cloud-init and deletes every netplan / interfaces.d file — so at a
+// factory boot there is no default route, no address, and no `.network` file
+// anywhere: there is nothing to preserve, and refusing leaves every NIC down
+// and unrenamed, reachable only from the hypervisor console. The image's
+// vNIC#1 -> fxp0 factory contract (docs/install-images.md; PR #1906) makes
+// mgmt-is-enumeration-index-0 a property of the ARTIFACT, so on this host —
+// and only on this host — the first enumerated NIC is a safe lifeline.
+//
+// A var, not a const, so tests can repoint the probe at a scratch tree.
+var applianceMarkerFile = "/etc/xpf/appliance"
+
+// Lifeline provenance strings, used for logging and as the chooser's verdict
+// discriminator.
+const (
+	lifelineSourceDefaultRoute     = "default-route"
+	lifelineSourceApplianceFactory = "appliance-factory-boot"
+)
+
+// isApplianceFactoryBoot is the pure gate for the #7114 appliance factory
+// bootstrap. BOTH conditions are load-bearing:
+//
+//   - markerPresent: the host was provisioned from the xpf appliance image, so
+//     xpf owns every NIC on it (see applianceMarkerFile). Without this a
+//     foreign-host .deb install would claim the operator's NICs — the exact
+//     lockout #1922 closed.
+//   - !everCommitted: this is a genuinely FACTORY box — no configuration has
+//     ever been committed on it. A box that HAS been configured can also be in
+//     bootstrap mode, via the #1960 fail-closed path (a committed config that
+//     no longer compiles). There the operator's intended interface bindings are
+//     unknown-but-real — possibly a device-map that never wants an auto-fxp0 —
+//     and claiming NIC 0 as fxp0 would be precisely the mis-binding #1960
+//     refuses to perform. The Item-1b first-commit rollback leaves
+//     everCommitted false, which is correct: that box is factory-equivalent.
+func isApplianceFactoryBoot(markerPresent, everCommitted bool) bool {
+	return markerPresent && !everCommitted
+}
+
+// chooseBootstrapLifeline is the pure NIC-selection core of
+// setupBootstrapLifeline (#7114). The default route wins whenever one exists —
+// including on the appliance, where a committed-then-rolled-back box may still
+// carry addressing — because it is the direct evidence of where the operator
+// actually reaches the box. The appliance factory fallback applies only when
+// there is no default route at all. Anything else selects nothing, which is
+// the #1922 console-only refusal.
+func chooseBootstrapLifeline(routeIface, firstNIC string, applianceFactory bool) (name, source string, ok bool) {
+	if routeIface != "" {
+		return routeIface, lifelineSourceDefaultRoute, true
+	}
+	if applianceFactory && firstNIC != "" {
+		return firstNIC, lifelineSourceApplianceFactory, true
+	}
+	return "", "", false
+}
+
 // userspaceShimLinkPinDir carries the pinned XDP links that survive a daemon
 // restart. Pins are a CHEAP PRE-FILTER ONLY (#1993 review): their presence
 // proves "an XDP link is attached", NOT "forwarding is live". On a graceful
@@ -692,6 +756,27 @@ func readLifelineRecordAt(path string) (lifelineRecord, bool) {
 // once a config exists; the genuinely-fresh box has no leaf yet, so the
 // default-route signal is the only config-independent option.
 //
+// detectLifelineInterfaceFn / enumeratePCINICsFn are injectable seams for the
+// world-reading half of setupBootstrapLifeline, so the #7114 selection wiring
+// is testable without a live netlink/sysfs stack. Production leaves them
+// pointing at the real detectors.
+var (
+	detectLifelineInterfaceFn = detectLifelineInterface
+	enumeratePCINICsFn        = enumeratePCINICs
+)
+
+// applianceFactoryBoot reports whether this bootstrap boot is a FACTORY boot of
+// an xpf appliance image: the bake-written marker is present AND nothing has
+// ever been committed on this box. See isApplianceFactoryBoot for why both
+// halves are required. Called only from the bootstrap naming path, after
+// Store.Load has resolved, so EverCommitted() is stable.
+func (d *Daemon) applianceFactoryBoot() bool {
+	if _, err := os.Stat(applianceMarkerFile); err != nil {
+		return false
+	}
+	return d.store != nil && isApplianceFactoryBoot(true, d.store.EverCommitted())
+}
+
 // Returns the current kernel name of the lifeline NIC and ok=false when no
 // default route exists.
 func detectLifelineInterface() (name string, ok bool) {
@@ -840,13 +925,43 @@ func protectedInterfacesWith(mgmtLeaf, lifeline string) map[string]bool {
 //     re-wire or set `system management-interface` + commit.
 //
 // No other NIC is renamed, cycled, or reconfigured in bootstrap mode.
+//
+// #7114 amends step 1: when there is no default route AND this host is a
+// factory boot of the xpf appliance image (isApplianceFactoryBoot), the first
+// enumerated NIC is selected instead of refusing. Steps 2-4 are unchanged and
+// run identically for either provenance.
 func (d *Daemon) setupBootstrapLifeline() {
-	lifeline, ok := detectLifelineInterface()
+	routeIface, _ := detectLifelineInterfaceFn()
+
+	// #7114: the appliance image's factory boot has no default route to find —
+	// the bake purges cloud-init and netplan, so nothing but xpfd ever brings a
+	// NIC up. Enumerate a fallback there, and ONLY there.
+	firstNIC := ""
+	applianceFactory := routeIface == "" && d.applianceFactoryBoot()
+	if applianceFactory {
+		nics, err := enumeratePCINICsFn()
+		if err != nil {
+			slog.Warn("bootstrap lifeline: appliance factory boot, but NIC enumeration "+
+				"failed; no interface claimed", "err", err)
+			applianceFactory = false
+		} else if len(nics) > 0 {
+			firstNIC = nics[0].name
+		}
+	}
+
+	lifeline, source, ok := chooseBootstrapLifeline(routeIface, firstNIC, applianceFactory)
 	if !ok {
 		slog.Warn("bootstrap lifeline: no IPv4/IPv6 default route found; cannot identify a " +
 			"management NIC. Staying in bootstrap with NO interface changes — reach the box " +
 			"via its hypervisor/physical console and 'commit confirmed' a config.")
 		return
+	}
+	if source == lifelineSourceApplianceFactory {
+		slog.Info("bootstrap lifeline: no default route, but this host carries the xpf "+
+			"appliance-image marker and has never committed a configuration; claiming the "+
+			"first enumerated NIC as the fxp0 factory management interface (DHCP), per the "+
+			"image's vNIC#1 -> fxp0 contract",
+			"interface", lifeline, "marker", applianceMarkerFile)
 	}
 
 	// Record PCI identity (keyed by PCI, MAC tiebreaker) so the protected
@@ -867,7 +982,7 @@ func (d *Daemon) setupBootstrapLifeline() {
 	// Determine the enumeration index of the lifeline NIC. Only index 0
 	// becomes fxp0; renaming a higher-index NIC would not match the mgmt
 	// convention and risks cutting off management.
-	nics, err := enumeratePCINICs()
+	nics, err := enumeratePCINICsFn()
 	if err != nil {
 		slog.Warn("bootstrap lifeline: NIC enumeration failed; no rename performed", "err", err)
 		return
@@ -899,14 +1014,14 @@ func (d *Daemon) setupBootstrapLifeline() {
 	original := recoverOriginalName(lifeline)
 	_ = writeLinkFile(defaultMgmtInterface, original)
 	if lifeline != defaultMgmtInterface {
-		if err := renameInterface(lifeline, defaultMgmtInterface); err != nil {
+		if err := renameInterfaceFn(lifeline, defaultMgmtInterface); err != nil {
 			slog.Warn("bootstrap lifeline: rename to fxp0 failed; mgmt stays on original name",
 				"from", lifeline, "err", err)
 		} else {
 			slog.Info("bootstrap lifeline: renamed management NIC to fxp0", "from", lifeline)
 		}
 	}
-	if err := networkctlReload(); err != nil {
+	if err := networkctlReloadFn(); err != nil {
 		slog.Warn("bootstrap lifeline: networkctl reload failed", "err", err)
 	}
 }

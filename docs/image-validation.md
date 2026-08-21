@@ -104,7 +104,7 @@ Scenarios:
 
 | Scenario | Proves |
 |---|---|
-| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp |
+| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp |
 | **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 | **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
@@ -313,13 +313,16 @@ i40e-PF for a performance number), and Tier 3 / HA from an image.
 Two defects observed during the run, tracked separately — neither affects
 the result above:
 
-- Tier-1 scenario **a** fails on this image: on a factory boot with no
-  config drive, nothing brings the NIC up (the bake purges cloud-init and
-  netplan), so xpfd's bootstrap lifeline finds no default route, declines
-  to identify a management NIC, and leaves the port down and unrenamed —
-  no `fxp0`, no DHCP. Tier 2 is unaffected because it supplies a day-0
-  config, which takes xpfd out of bootstrap and into full interface
-  takeover.
+- Tier-1 scenario **a** failed on this image (#7114, FIXED): on a factory
+  boot with no config drive, nothing brought the NIC up (the bake purges
+  cloud-init and netplan), so xpfd's bootstrap lifeline found no default
+  route, declined to identify a management NIC, and left the port down and
+  unrenamed — no `fxp0`, no DHCP. Tier 2 was unaffected because it supplies
+  a day-0 config, which takes xpfd out of bootstrap and into full interface
+  takeover. The fix adds the bake-written `/etc/xpf/appliance` marker, which
+  (AND-ed with "nothing ever committed") lets the lifeline claim the first
+  enumerated NIC on this artifact while keeping the console-only refusal for
+  foreign-host installs — see `docs/install-images.md`.
 - `show security flow session` lists the ICMP sessions but omits TCP ones,
   while `show security flow statistics` counts them (`Current sessions:
   10` against a rendered `Total sessions: 2`). A display-path gap, not a
