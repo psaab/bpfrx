@@ -1734,6 +1734,24 @@ type compileOpts struct {
 	// peer-synced config that predates this gate still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientRethVRRPGroupID.
 	lenientIfNameCollision bool
+	// lenientRethMember (#6722) downgrades the redundant-ethernet membership
+	// coherence gate (validateRethMemberStrict) from a hard compile error to a
+	// cfg.Warnings entry. A reth member is an L2 port whose L3 identity — units,
+	// addresses, tunnel, zone — lives on the reth; the egress-zone answer
+	// (stampEgressZones, pkg/dataplane/userspace/interfaces.go) treats a reth and
+	// its member as ONE device on exactly that basis. A member that names itself,
+	// names an unconfigured parent, carries its own logical units, or carries its
+	// own tunnel breaks the premise, and the last two fail OPEN (an
+	// independently addressed member unit, or an independently routed tunnel
+	// endpoint, silently inherits the reth's zone). The strict commit /
+	// commit-check path hard-rejects so the incoherence is operator-visible; the
+	// tolerant load / peer-sync paths warn so an already-persisted or peer-synced
+	// config that predates this gate still BOOTS (#1960 no-brick). Bounded on the
+	// lenient path by the SAME rule the gate states: a member that is not a bare
+	// port is not a member, so the shared device has two independent claimants
+	// and its ifindex identifies no zone (fail-closed).
+	// Same doctrine as lenientIfNameCollision.
+	lenientRethMember bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2151,6 +2169,21 @@ type compileOpts struct {
 	// (#5829); this closes the residual #5829 deferred to #5933.
 	lenientInterfaceUnitRef bool
 
+	// lenientLoginClassDeny (#5831) downgrades the custom-login-class
+	// restrictive-regex gate (deny-commands / deny-configuration, which xpf's
+	// coarse RBAC does not enforce) from a hard compile error to a
+	// cfg.Warnings entry PLUS a restrictive fold of the affected class's mapped
+	// permissions. Set ONLY on the tolerant load / peer-sync paths so a config
+	// persisted before this gate existed — or synced from a peer running older
+	// code — still BOOTS (#1960 no-brick). Unlike most lenient flags this one
+	// is not warn-and-continue-unchanged: leaving the permission set intact
+	// would preserve exactly the fail-open the strict gate rejects, so the
+	// tolerant path resolves the un-enforceable restriction in the RESTRICTIVE
+	// direction instead — bounded by a repair floor, because a class the
+	// console operator is bound to must keep the access that deletes the
+	// statement. See foldLoginClassDenyToRepairableFloor.
+	lenientLoginClassDeny bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2287,6 +2320,7 @@ func lenientCompileOpts() compileOpts {
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
+		lenientRethMember:                      true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -2309,5 +2343,6 @@ func lenientCompileOpts() compileOpts {
 		lenientCoSNumericCodePoint:             true,
 		lenientNonNumericUnit:                  true,
 		lenientInterfaceUnitRef:                true,
+		lenientLoginClassDeny:                  true,
 	}
 }

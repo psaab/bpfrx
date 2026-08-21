@@ -64,10 +64,81 @@ pub(crate) struct InterfaceSnapshot {
     pub local_fabric_member: String,
     #[serde(rename = "redundancy_group", default)]
     pub redundancy_group: i32,
+    /// #6722: the security zone this row's IFINDEX egresses into, or "" for
+    /// none. Decided by the Go builder (`stampEgressZones`,
+    /// `pkg/dataplane/userspace/interfaces.go`); every row sharing an ifindex
+    /// carries the SAME value.
+    ///
+    /// It is NOT `zone` under another name. `zone` is this row's own zone and
+    /// feeds the INGRESS attribution (`ifindex_to_zone_id`, #921/#3618).
+    /// `egress_zone` answers "does this ifindex identify exactly one zone",
+    /// which is the only question the egress half may safely ask once several
+    /// configured identities share one netdev — `snapshotLinuxName` collapses a
+    /// non-VLAN unit 0 onto its base, a RETH onto its member, and every unit of
+    /// an interface-level tunnel onto the tunnel device.
+    ///
+    /// Deciding it in Go is what closed this class. `zone` is the OUTCOME of
+    /// `buildInterfaceZoneMap`'s fan-up/fan-down derivation, and the provenance
+    /// that outcome discards — did the operator zone THIS identity, or did it
+    /// inherit another's words — is not recoverable from the rows. #6722 tried
+    /// four times to reconstruct it here by classifying rows and each spelling
+    /// was holed by an unenumerated config shape.
+    ///
+    /// A plain `String`, not an `Option`, because ABSENT and EMPTY are the same
+    /// state at protocol v5: an absent key decodes to `""` via
+    /// `#[serde(default)]`, which is also what the builder stamps when it
+    /// decides the ifindex identifies no zone, and both answer the 0 sentinel.
+    /// Telling them apart would only matter for a snapshot from a control plane
+    /// that predates the field, and `apply_snapshot`'s exact-equality version
+    /// gate refuses that snapshot before it reaches the builder.
+    ///
+    /// Read by `forwarding_build::interfaces::populate_interfaces`:
+    ///
+    /// - nonempty — honoured, but only if some row on the ifindex literally
+    ///   carries that zone NAME. A drifted or hostile snapshot can therefore
+    ///   never conjure a zone no row on the ifindex named.
+    /// - empty — the ifindex resolves the 0 sentinel: no zone pair matches and
+    ///   the default policy decides.
+    /// - rows on one ifindex disagreeing — drift; fails closed.
+    #[serde(rename = "egress_zone", default)]
+    pub egress_zone: String,
     #[serde(rename = "unit_count", default)]
     pub unit_count: usize,
     #[serde(default)]
     pub tunnel: bool,
+    /// #6691: the Go control plane resolved that this row's netdev IS a
+    /// route-based IPsec tunnel device, so this plane must not bind it.
+    ///
+    /// Two oracles, one claim (`snapshotSecureTunnel`, round 8): some
+    /// `security ipsec vpn <name> bind-interface` NAMES the row's device
+    /// (`Config.SecureTunnelNetdevForRef`), OR the netdev the row resolves to
+    /// has kernel link kind `xfrm`. The second half sees a live xfrmi the
+    /// config no longer describes — a failed `LinkDel` retains one while the
+    /// apply proceeds on a deferred error, and a daemon restart leaves an
+    /// untracked one — which every config-keyed predicate is blind to. The
+    /// wire meaning, type and tag are unchanged, so no protocol bump is owed
+    /// for the second half; only the evidence the control plane accepts.
+    ///
+    /// OWNERSHIP or DEVICE KIND, never name shape. Nothing reserves the `st`
+    /// prefix, so a wildcard-authored `st5` with no VPN is an ordinary data
+    /// interface, is not an xfrm device, and this stays false. Classifying by
+    /// shape here used to strip such an interface of its AF_XDP binding — a
+    /// traffic outage on a working NIC.
+    ///
+    /// Absent from an older Go control plane's snapshot, in which case serde
+    /// defaults it to false and an xfrmi would receive a binding it cannot
+    /// use. That is the #5619 gap, which both planes' comments rank as less
+    /// bad than the outage the shape test caused.
+    ///
+    /// Serialized only when TRUE, mirroring the Go side's `omitempty`, so a
+    /// snapshot with no secure tunnels is byte-identical to the pre-#6691
+    /// wire format (`protocol_wire_v1.json`).
+    #[serde(
+        rename = "secure_tunnel",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub secure_tunnel: bool,
     #[serde(default)]
     pub mtu: i32,
     #[serde(rename = "hardware_addr", default)]
@@ -451,6 +522,21 @@ pub(crate) struct FabricSnapshot {
     pub parent_linux_name: String,
     #[serde(rename = "parent_ifindex", default)]
     pub parent_ifindex: i32,
+    /// #6691 round 10: the device-level verdict for the parent netdev — the
+    /// dataplane must never bind an AF_XDP socket to it.
+    ///
+    /// A fabric MEMBER needs no interface stanza, so the parent netdev usually
+    /// has no `InterfaceSnapshot` in this snapshot at all, and
+    /// `snapshot_refuses_parent_netdev`'s unanimity tally over an empty owner
+    /// set answers "not refused". This field is that missing owner's vote. It
+    /// is computed Go-side because half its evidence is a kernel RTM_GETLINK
+    /// dump (link kind `xfrm`) this process does not take.
+    ///
+    /// `default` decodes an absent field to `false` = bindable, which is the
+    /// pre-round-10 behaviour; the protocol version moved to 7 so a control
+    /// plane that relies on the flag never meets a helper that ignores it.
+    #[serde(rename = "parent_unbindable", default)]
+    pub parent_unbindable: bool,
     #[serde(rename = "overlay_linux_name", default)]
     pub overlay_linux_name: String,
     #[serde(rename = "overlay_ifindex", default)]

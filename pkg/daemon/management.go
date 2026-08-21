@@ -447,10 +447,25 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		}
 	}
 
-	// HTTPS leg: enable / disable / rebind ONLY if the HTTPS bind or TLS flag
-	// changed. api.Server.ReconcileHTTPS never touches the live HTTP listener, so
-	// a TLS enable can no longer collide with the retained HTTP socket.
-	if next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr {
+	// HTTPS leg: enable / disable / rebind if the HTTPS bind or TLS flag changed
+	// — or if the leg this reconciler RECORDED as converged is no longer serving
+	// (#6827 round 6). api.Server.ReconcileHTTPS never touches the live HTTP
+	// listener, so a TLS enable can no longer collide with the retained HTTP
+	// socket.
+	//
+	// The fingerprint records what the last SUCCESSFUL reconcile bound; it is not
+	// evidence that the socket is still up. An unexpected serve-loop exit marks
+	// the leg dead and leaves it INSTALLED (api.listenerLeg.dead — it cannot be
+	// removed under lifeMu without deadlocking a shutdown that races the exit),
+	// so on every later commit the fingerprint test above matched, ReconcileHTTPS
+	// was never called, and HTTPS stayed down until a restart even though the
+	// operator's configuration never changed. Worse, nothing could clear it: the
+	// stale-cert delivery below can only settle its debt against a served
+	// certificate, so the diagnosis stayed permanently owed too. Asking the
+	// server what is actually serving is the same question startTo asks after the
+	// boot bind (#5561 round 14, MAJOR 5); this is that check applied to the
+	// steady state rather than only to boot.
+	if next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr || (next.TLS && !m.srv.HTTPSServing()) {
 		if err := m.srv.ReconcileHTTPS(next.TLS, next.HTTPSAddr); err != nil {
 			errs = append(errs, err)
 		} else {
@@ -531,6 +546,174 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		endpointOf(next).summary(), joined)
 }
 
+// renameHostNotingStaleMgmtCert moves the kernel host name AND records that the
+// management-TLS staleness diagnostic is owed, as one indivisible step (#6827
+// round 7). It returns the Sethostname error, if any; on failure the ledger is
+// untouched, because a rename that did not happen has no staleness to diagnose.
+//
+// The single hold of staleCertMu is the whole point of the function, and it is
+// what makes the emitted host name provably CURRENT rather than merely likely.
+// deliverStaleMgmtCertDiagnosis samples the generation, reads the kernel name
+// unlocked, then takes staleCertMu across the re-validation, the certificate
+// inspection and the warning. While the bump lived outside this hold — the
+// pre-round-7 shape, where applyHostname called Sethostname and the ledger was
+// advanced only afterwards — there was a window in which the kernel name had
+// already moved and no generation had yet recorded the move, so a delivery
+// could re-validate successfully and warn under the name the box had just left.
+//
+// Fencing the syscall and the bump together orders the two critical sections,
+// and both orders are correct:
+//
+//   - the delivery acquires first: Sethostname cannot run until it lets go, so
+//     the name being reported is still the kernel's at the moment it is emitted;
+//   - this acquires first: the generation has already advanced by the time the
+//     delivery re-validates, so the older delivery abandons without emitting.
+//
+// There is no lock-order inversion. staleCertMu is a LEAF here — the only thing
+// inside the hold is the syscall seam, which acquires nothing — whereas the
+// delivery path takes it at the TOP of two SEPARATE edges: staleCertMu →
+// managementReconciler.mu, and staleCertMu → api.Server.lifeMu. They are not a
+// nested three-lock chain (#6827 round 8 corrected that, which was conservative
+// but inaccurate): warnStaleCertForHostName takes m.mu only to read m.srv and
+// RELEASES it before calling into the server, so mgmt.mu and lifeMu are never
+// held at the same time. Nothing takes staleCertMu while already holding
+// either.
+//
+// Do not split the hold. Releasing after the syscall and re-taking for the
+// ledger write re-opens the window at a narrower width — the name has moved and
+// the generation has not — and no test can catch it: the gap is a few
+// instructions, and the probe in
+// TestRenameAndGenerationBumpAreOneCriticalSection_6827 loses the race to the
+// re-acquire (measured GREEN on that mutant). The single deferred unlock over a
+// body with no intermediate release is the guard.
+//
+// What this does NOT cover, and it is the only residual: a privileged process
+// OUTSIDE xpfd can call sethostname(2) directly. That moves the kernel name with
+// no generation movement at all, so a delivery sitting in its unlocked window
+// can still report the name it read a moment earlier. Every rename the daemon
+// itself performs is fenced.
+//
+// The caller must attempt the delivery — applyHostname does, as its last act.
+// Marking and attempting stay ONE path for the reason round 1 established: the
+// previous shape branched on `d.mgmt == nil` outside staleCertMu while
+// startHTTPServer published d.mgmt and drained separately, so a rename landing
+// in that window neither refreshed the parked state nor got diagnosed.
+//
+// This is deliberately NOT part of reconcile(): reconcile runs early in the
+// apply, before applyHostname, so it can only ever observe the OLD kernel name.
+func (d *Daemon) renameHostNotingStaleMgmtCert(name string) error {
+	d.staleCertMu.Lock()
+	defer d.staleCertMu.Unlock()
+	if err := sethostname([]byte(name)); err != nil {
+		return err
+	}
+	d.staleCertPending = true
+	d.staleCertGen++
+	return nil
+}
+
+// deliverStaleMgmtCertDiagnosis delivers a pending host-name staleness
+// diagnosis if one is owed and a management certificate is actually being
+// served, clearing the debt ONLY on success (#6827).
+//
+// Called from three places. The rename itself is the INITIAL attempt; the boot
+// management start and every web-management reconcile are RETRY points, so a
+// debt incurred while nothing was serving (HTTPS off, its bind failed, or the
+// reconciler did not exist yet) settles on the commit that brings a certificate
+// up rather than being lost.
+//
+// The host name is read from the kernel HERE, not stored at rename time. That
+// removes the "replayed a rename from arbitrarily far back" hazard at its
+// root: a deferred diagnosis never describes a name captured at some earlier
+// commit.
+//
+// GENERATION FENCE (#6827 round 5, tightened in rounds 6 and 7). The kernel
+// read runs unlocked, so a rename can land after it. The rest of the delivery —
+// the re-validation, the certificate inspection, and the clear — therefore runs
+// under staleCertMu in ONE hold, and a delivery whose generation has been
+// superseded abandons WITHOUT emitting anything:
+//
+//   - it must not clear, because settling a newer rename's debt with an older
+//     delivery's evidence loses that diagnosis permanently;
+//   - it must not WARN either, because the name it read is no longer the one the
+//     box has. Round 5 checked the generation only after the warning was already
+//     out, so a rename landing in the window made the appliance log a diagnosis
+//     naming the PREVIOUS host name — a line the fence could not retract. Losing
+//     nothing: the newer rename's own applyHostname calls this function itself,
+//     so the newest name is diagnosed by the newest delivery.
+//
+// The re-validation tests BOTH ledger fields, not the generation alone (#6827
+// round 7). Two deliveries can legitimately be in flight for ONE rename — the
+// boot delivery from startHTTPServer racing the rename's own attempt, or a
+// reconcile retry racing either — and they sample the same generation, so a
+// generation-only re-check passes for both. The first warns and clears; the
+// second then finds a settled debt, an unmoved generation, and warns again.
+// One rename, two identical WARN lines.
+//
+// Holding the mutex across warnStaleCertForHostName is deadlock-free: the edges
+// are always staleCertMu → managementReconciler.mu and staleCertMu →
+// api.Server.lifeMu — never both at once, since m.mu is released before the
+// server call — and nothing under either re-enters the Daemon.
+//
+// The emitted name IS the kernel's current one, for every rename this daemon
+// performs (#6827 round 7). Rounds 5 and 6 claimed otherwise — that Sethostname
+// moves the kernel name before the generation is recorded, so no
+// generation-based fence could close the gap. That was a property of where the
+// lock was taken, not of the mechanism: renameHostNotingStaleMgmtCert now holds
+// staleCertMu ACROSS both the syscall and the bump, so the generation exists
+// before the window can open and the two critical sections are ordered either
+// way round (see its doc). The residual is a privileged rename from OUTSIDE the
+// daemon, which no in-process fence can observe.
+func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
+	if d == nil {
+		return
+	}
+	d.staleCertMu.Lock()
+	pending, gen, mgmt := d.staleCertPending, d.staleCertGen, d.mgmt
+	d.staleCertMu.Unlock()
+	if !pending || mgmt == nil {
+		return
+	}
+	hostName, err := osHostname()
+	if err != nil || hostName == "" {
+		// Cannot describe the current identity, so there is no identity to judge
+		// the certificate against: stay in debt. Delivering with an empty name
+		// would reach a certificate, report the question ANSWERED, and clear the
+		// debt on the strength of nothing — warnStaleHostName declines an empty
+		// name, so the operator would get silence and no retry.
+		return
+	}
+	d.staleCertMu.Lock()
+	defer d.staleCertMu.Unlock()
+	if !d.staleCertPending {
+		// A sibling delivery for the SAME generation already settled it while
+		// this one was reading the kernel name. The debt is discharged and the
+		// operator has the line; warning again would just duplicate it (#6827
+		// round 7).
+		return
+	}
+	if d.staleCertGen != gen {
+		return // a newer rename owns the diagnosis now; it runs its own delivery
+	}
+	if !mgmt.warnStaleCertForHostName(hostName) {
+		return // nothing serving a certificate yet; the debt stands
+	}
+	d.staleCertPending = false
+}
+
+// warnStaleCertForHostName forwards to the live api.Server under mu so it cannot
+// race a concurrent startTo/reconcileTo swapping the server pointer. It reports
+// whether a served certificate was actually reached.
+func (m *managementReconciler) warnStaleCertForHostName(hostName string) bool {
+	m.mu.Lock()
+	srv := m.srv
+	m.mu.Unlock()
+	if srv == nil {
+		return false
+	}
+	return srv.WarnStaleMgmtCertForHostName(hostName)
+}
+
 // publishNilDirectionLocked publishes the remove-all-api-auth (nil) direction
 // against the addresses the LIVE listeners are on RIGHT NOW (m.cur). Caller
 // holds mu.
@@ -573,7 +756,7 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 // Without this publish the pin captures the credential the operator DELETED, and
 // retirement is asynchronous: the socket keeps accepting until the serve
 // goroutine reaches Shutdown, and connections already accepted are served for the
-// whole bounded drain. Guarded by
+// whole drain. Guarded by
 // TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561 — the only case in
 // the package whose nil-direction rebind converges.
 //
@@ -605,7 +788,7 @@ func mgmtAddrIsLoopback(addr string) bool {
 
 // wait blocks until every serve goroutine (live + retiring legs) has drained.
 // Called on daemon shutdown after the root ctx is cancelled (which triggers each
-// leg's bounded graceful drain inside api.Server).
+// leg's graceful drain inside api.Server).
 func (m *managementReconciler) wait() {
 	m.mu.Lock()
 	srv := m.srv
@@ -630,5 +813,10 @@ func (d *Daemon) reconcileWebManagement(cfg *config.Config) error {
 	if d.mgmt == nil {
 		return nil
 	}
-	return d.mgmt.reconcile(cfg)
+	err := d.mgmt.reconcile(cfg)
+	// #6827: a reconcile may have just brought HTTPS up (enable, or a retried
+	// bind). If a host-name staleness diagnosis is still owed from a window
+	// when nothing was serving, settle it now rather than losing it.
+	d.deliverStaleMgmtCertDiagnosis()
+	return err
 }

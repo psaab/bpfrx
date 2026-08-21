@@ -187,11 +187,28 @@ class):
 - `lo0` — the always-present loopback, a reserved Junos interface a zone may
   reference (host-inbound self-traffic) with no explicit `set interfaces lo0`;
 - every secure-tunnel base derived from an IPsec `bind-interface`
-  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — `bind-interface st0.0`
-  materializes the st0 xfrmi device at apply time (`daemon_apply` →
+  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — a `bind-interface`
+  materializes an xfrmi device at apply time (`daemon_apply` →
   `routing.ApplyXfrmi`) even with no explicit `set interfaces st0 unit 0`. The
   base is the bind string with any `.unit` stripped, so every unit of a bound
   secure tunnel is admitted.
+
+  The device is named after the AUTHORED bind string, not after the unit ref:
+  `bind-interface st0.0` creates a netdev literally named `st0.0`, while
+  `bind-interface st0` creates one named `st0` — and the unit ref is `st0.0` in
+  both cases, so the name cannot be derived from the ref. This line previously
+  read "`bind-interface st0.0` materializes the st0 xfrmi device", which is the
+  exact conflation #5619 exists to correct.
+
+  The bind string is taken VERBATIM; nothing canonicalizes the index. `st5`,
+  `st05` and `st+5` are three different device names that happen to derive one
+  XFRM if_id, and each admits only its own spelling as a zone-referenceable
+  base. Commit accepts all three (`ValidateSecureTunnelBindInterface` only
+  requires a nonzero if_id), and rejecting the unusual spellings was considered
+  and declined in #6691 — a new commit-time rejection would brick a persisted
+  or peer-synced config that already carries one (#1960 no-brick). Ownership is
+  therefore matched on the spelling, so `bind-interface st05` does not claim an
+  interface named `st5`.
 
 The tolerant load / peer-sync path downgrades to a warning
 (`opts.lenientZoneInterfaceDefined`) so an already-persisted or peer-synced
@@ -9703,10 +9720,25 @@ blocking the whole config. This is accept-with-advisory now:
 - **advisory** — `loginClassAdvisoryWarnings` emits one `cfg.Warnings` entry
   per custom class naming the mapped permissions. `allow-commands` /
   `allow-configuration` / `idle-timeout` are named as accepted-but-not-enforced
-  (neutral). `deny-commands` / `deny-configuration` get an explicit `WARNING`
-  that, because they are unenforced blacklists, the class is **more permissive
-  than the Junos config** (the denied verbs stay allowed) — a weaker posture,
-  not merely "unenforced". Full per-command deny enforcement is a follow-up.
+  (neutral) — ignoring an ADDITIVE grant can only under-grant, so it is
+  fail-closed. The advisory says nothing about `deny-commands` /
+  `deny-configuration`; the pre-#5831 "MORE PERMISSIVE" advisory for those two
+  is **gone**, not reworded.
+- **restrictive-regex gate (#5831)** — `deny-commands` / `deny-configuration`
+  are RESTRICTIVE, so ignoring them over-grants. `validateLoginClassDenyStrict`
+  hard-**rejects** them at commit / commit-check (keyed on leaf PRESENCE, so
+  `deny-commands ""` and a valueless `deny-commands` are caught too — an empty
+  POSIX regex denies *everything*). On the tolerant load / peer-sync path
+  (#1960 no-brick) `foldLoginClassDenyToRepairableFloor` **folds** the class to
+  `{view, configure} ∩ what it already held` and warns. That is a blast-radius
+  reduction, **not** enforcement: `clear` / `control` / `maintenance` / `all`
+  are dropped, but the two RETAINED buckets are levels at which the statement
+  does nothing — `deny-configuration` targets `configure`, and a
+  `deny-commands` naming `show` / `ping` / `traceroute` / `monitor` targets
+  `view`. Both are retained because they are what an operator needs to delete
+  the statement. The warning is generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim can never be wider than the
+  behaviour. Full per-command deny enforcement is a follow-up on #5831.
 - **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
   built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
   custom-class user is enforced against the mapped permissions instead of

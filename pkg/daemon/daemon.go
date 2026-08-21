@@ -313,8 +313,46 @@ type Daemon struct {
 	// listener + authentication snapshot against the committed web-management
 	// config (make-before-break rebind on an endpoint change; live auth swap on
 	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
-	mgmt      *managementReconciler
-	snmpAgent *snmp.Agent
+	mgmt *managementReconciler
+	// staleCertMu guards staleCertPending and staleCertGen, and publishes the
+	// mgmt pointer the stale-cert delivery path reads (#6827 round 5) — so that
+	// read is memory-model safe rather than a benign-looking data race.
+	//
+	// ONLY that read. `mgmt` is still read unguarded elsewhere (daemon_run_servers.go
+	// and reconcileWebManagement), exactly as it was before #6827 — the publish
+	// was unsynchronised on every path then, and this PR narrowed the problem to
+	// the path it touched rather than solving it. Do not read this as "mgmt is
+	// guarded"; it is not, and the remaining readers are tracked separately.
+	staleCertMu sync.Mutex
+	// staleCertPending records that a `set system host-name` moved the kernel
+	// name and the management-TLS staleness diagnostic has NOT yet been
+	// delivered (#6827). It is a FLAG, not a stored name: the host name is read
+	// from the kernel at delivery time, so a deferred diagnosis can never
+	// report a name that is no longer current.
+	//
+	// It stays set until a delivery actually reaches a served certificate. The
+	// boot config apply runs in startup phase 4 while startHTTPServer builds
+	// mgmt much later in Run, and HTTPS may be off or fail to bind for far
+	// longer than that — but the certificate is DURABLE on disk, so the
+	// staleness outlives every one of those gaps. Clearing the flag on a
+	// delivery that reached nothing would lose the diagnosis permanently: the
+	// next boot's applyHostname sees the name already applied and returns
+	// early, and the load path's inferred heuristic declines cross-shape drift
+	// by design (see hostNameLikelyAccessIdentity's residual note).
+	//
+	// It is process-local: a debt still owed when the daemon stops is
+	// discarded, which is one of the two states that residual note covers.
+	//
+	// Guarded by staleCertMu.
+	staleCertPending bool
+	// staleCertGen advances on every rename. A delivery claims a generation and
+	// clears the debt only if it is still current, so a rename landing while an
+	// in-flight delivery is unlocked is not settled by that older delivery
+	// (#6827 round 5).
+	//
+	// Guarded by staleCertMu.
+	staleCertGen uint64
+	snmpAgent    *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in

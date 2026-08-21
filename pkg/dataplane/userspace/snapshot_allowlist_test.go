@@ -4,6 +4,7 @@ package userspace
 
 import (
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -193,7 +194,25 @@ func TestUserspaceBindTargetNetdev_Contract(t *testing.T) {
 // This proves the allowlist routes through the SSOT helper (and therefore agrees
 // with the Rust planner) rather than carrying an independent, drift-prone rule.
 // No allowlist entry may be a VLAN-suffixed unit netdev.
+//
+// #6691 round 9: the derivation below now applies the REFUSED-NETDEV index too,
+// because production does. Round 8 added that filter to the allowlist and left
+// this `want` re-deriving the pre-round-8 rule, which made the test encode an
+// invariant production no longer holds in general — it stayed green only
+// because this fixture contains no refused row, and its failure message
+// ("allowlist diverges from the bind-target SSOT") would have named the wrong
+// culprit on any fixture that did. The re-derivation is deliberately built from
+// the same three helpers production composes, not from a fourth restatement of
+// the rule: that is what makes a divergence between them detectable here.
 func TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT(t *testing.T) {
+	// The `st10` rows are here so the refusal filter is LOAD-BEARING rather
+	// than a line the fixture never reaches. A live xfrm netdev makes the base
+	// row a secure tunnel (so it is skipped on its own merits) while its VLAN
+	// sibling is NOT one and redirects its bind target onto `st10` — the only
+	// class that reaches the refusal at this call site. Drop the filter from
+	// the derivation below and `want` gains "st10" while production does not.
+	defer stubXfrmNetdevs(t, "st10")()
+
 	cfg := &config.Config{}
 	cfg.System.DataplaneType = "userspace"
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -202,23 +221,36 @@ func TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT(t *testing.T) {
 			50: {Number: 50, VlanID: 50},
 			80: {Number: 80, VlanID: 80},
 		}},
+		"st10": {Name: "st10", Units: map[int]*config.InterfaceUnit{
+			5: {Number: 5, VlanID: 100},
+		}},
 	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
-		"trust":   {Name: "trust", Interfaces: []string{"ge-0/0/1"}},
+		"trust":   {Name: "trust", Interfaces: []string{"ge-0/0/1", "st10.5"}},
 		"untrust": {Name: "untrust", Interfaces: []string{"ge-0/0/2.50", "ge-0/0/2.80"}},
 	}
 
 	got := UserspaceBoundLinuxInterfaces(cfg)
+	if slices.Contains(got, "st10") {
+		t.Fatalf("premise broken: the allowlist %v contains the refused xfrmi — then "+
+			"the derivation below cannot discriminate", got)
+	}
 
 	// Independently derive the expected set by applying the SSOT helper to every
-	// non-skipped zoned snapshot row, exactly as UserspaceBoundLinuxInterfaces
-	// must.
+	// non-skipped zoned snapshot row whose bind target is not a refused netdev,
+	// exactly as UserspaceBoundLinuxInterfaces must.
+	rows := buildInterfaceSnapshots(cfg)
+	refused := buildUserspaceRefusedNetdevs(&ConfigSnapshot{Interfaces: rows})
 	seen := map[string]struct{}{}
-	for _, iface := range buildInterfaceSnapshots(cfg) {
+	for _, iface := range rows {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
-		seen[userspaceBindTargetNetdev(iface)] = struct{}{}
+		bindTarget := userspaceBindTargetNetdev(iface)
+		if refused.refusesName(bindTarget) {
+			continue
+		}
+		seen[bindTarget] = struct{}{}
 	}
 	want := make([]string, 0, len(seen))
 	for name := range seen {
