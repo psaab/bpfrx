@@ -148,12 +148,6 @@ var knownSpellingInconsistencies = map[string]string{
 
 	// #6695 — RA dns-server-address drops every RDNSS server past the first.
 	"protocols router-advertisement interface <*> dns-server-address": "#6695",
-
-	// #6692 — five system-stanza multi-value leaves drop everything past slot 0.
-	"system archival configuration archive-sites":     "#6692",
-	"system services ssh key-exchange":                "#6692",
-	"system services web-management api-auth api-key": "#6692",
-	"system dataplane shared-umem interface":          "#6692",
 }
 
 // ---------------------------------------------------------------------------
