@@ -37,7 +37,8 @@ type RAInterfaceConfig struct {
     MaxAdvInterval     int         // seconds (0 = default 600)
     MinAdvInterval     int         // seconds (0 = default 200)
     Prefixes           []*RAPrefix
-    DNSServers         []string    // RDNSS addresses
+    DNSServers         []string    // RDNSS addresses (EVERY authored address,
+                                   //   all five spellings — #6695)
     NAT64Prefix        string      // PREF64 prefix
     NAT64PrefixLife    int         // PREF64 lifetime seconds
     LinkMTU            int         // advertised MTU (0 = omit)

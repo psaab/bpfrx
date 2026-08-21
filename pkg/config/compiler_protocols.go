@@ -914,9 +914,26 @@ func compileRouterAdvertisement(node *Node, proto *ProtocolsConfig) error {
 					}
 				}
 			case "dns-server-address":
-				if len(prop.Keys) >= 2 {
-					ra.DNSServers = append(ra.DNSServers, nodeVal(prop))
-				}
+				// #6695: `dns-server-address` is `multi: true`, so a bracketed
+				// list (`dns-server-address [ 2001:db8::53 2001:db8::54 ]`)
+				// collapses onto ONE node's Keys and the hierarchical BLOCK
+				// spelling puts every address in Children. The pre-fix read
+				// took Keys[1] alone — it kept the first bracket entry and
+				// compiled NOTHING at all from the block spelling — so hosts
+				// on the link learned one RDNSS server while `show
+				// configuration` displayed both. The redundancy was invisible
+				// until the primary resolver failed, which is exactly when the
+				// fallback was supposed to matter.
+				//
+				// firewallMatchValues reads BOTH sides and skips empty tokens;
+				// every value it returns is installed into a single RFC 8106
+				// RecursiveDNSServer option by the sender (pkg/ra), so
+				// "absent" is the right reading of an empty token. Widening is
+				// safe on the validation axis because validateMultiValueLeaf
+				// (schema_walk.go) runs the leaf's ValidateIPv6Address over
+				// EVERY token of Keys[1:] and every block-child, not just the
+				// first (#2497).
+				ra.DNSServers = append(ra.DNSServers, firewallMatchValues(prop)...)
 			case "preference":
 				ra.Preference = nodeVal(prop)
 			case "nat64prefix", "nat-prefix":

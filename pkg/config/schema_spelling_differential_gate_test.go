@@ -148,9 +148,6 @@ var knownSpellingInconsistencies = map[string]string{
 	// #6687 — vlan-id-list validated/read at slot 0 only.
 	"bridge-domains <*> vlan-id-list": "#6687",
 
-	// #6695 — RA dns-server-address drops every RDNSS server past the first.
-	"protocols router-advertisement interface <*> dns-server-address": "#6695",
-
 	// #6692 — five system-stanza multi-value leaves drop everything past slot 0.
 	"system archival configuration archive-sites":     "#6692",
 	"system services ssh key-exchange":                "#6692",
