@@ -1,3 +1,53 @@
+## 2026-08-20 — #6858 round 3: `Enforced: yes` for a binding on an interface that does not exist
+
+- **Timestamp**: 2026-08-20 (fix/6848-cos-show-rewrite-rule, PR #6858)
+- **Action**: Drive-lane hostile pass, scoped to the dangerous direction the
+  command exists to close: can it report a rewrite rule as ENFORCED when the
+  dataplane is not applying it. It could, and round 2 did not close it.
+  `cosBoundDSCPRewriteRules` walked `cfg.ClassOfService.Interfaces` — the CoS
+  stanza — while `buildInterfaceSnapshots` (pkg/dataplane/userspace/
+  interfaces.go) walks `cfg.Interfaces.Interfaces` and reads the CoS unit off
+  each REAL logical unit. A `class-of-service interfaces ge-9-9-9 unit 0
+  rewrite-rules dscp rw` stanza with no `interfaces ge-9-9-9` anywhere COMMITS,
+  and the command answered `Enforced: yes` for a rewrite the helper can never
+  see. (A first draft of this entry claimed the commit was silent. It is not —
+  `compiler_validate_warn.go:1586`/`:1599` warn "class-of-service interface %s
+  is bound but not configured under [interfaces]". That was an enumeration read
+  as a census: a grep for `rewrite-rule` plus a read starting at :1600 missed two
+  warnings that sit above it and say "shaping/classifiers". The advisory fires
+  ONCE at commit and scrolls past, which is the exact signal this command exists
+  to replace with a standing view, so the finding stands and only the claim was
+  wrong. Issue #7064, filed on the false claim, is closed as invalid with the
+  correction.) Same
+  for a UNIT mismatch (CoS binds unit 0, the interface declares only unit 100).
+  Both measured through the real compile path, not reasoned about. The
+  predicate now mirrors the snapshot builder, and an operator who DID write a
+  binding is told WHERE the dead reference is rather than a bare "not bound",
+  which reads as "you forgot to bind it" and sends them to the wrong place.
+  Two fixtures were pinning the defect: the grpcapi `newCoSRewriteRuleServer`
+  and `TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858` both bound to
+  `ge-0-0-1` with no `interfaces` stanza, so both went RED on the fix and both
+  now author the logical unit. The empty-named-rule guard test would have gone
+  VACUOUS under the new walk (its unit is no longer reached), so its
+  precondition was moved onto the real-unit path and re-checked by deleting the
+  fixture line — it fires. Mutation cells: reverting the walk to the pre-fix
+  shape and deleting the dangling reason each RED the new pin, build clean, with
+  byte-identical restores verified by sha256. Three non-runtime findings filed
+  rather than folded: #7063 (enforcement cannot see the helper's own
+  `useful_cos_state` / queue-materialization gate, so a rule whose
+  forwarding-classes miss the interface's queues still reads enforced) and #7065
+  (`show class-of-service` renders such a phantom interface identically to a live
+  one, pre-existing since #4228 Gap 7). #7064 was filed and then closed as
+  invalid — see the correction above. Also merged origin/master: `_Log.md` union-resolved (section and
+  Timestamp counts equal ours+theirs-base, and every heading/timestamp from both
+  sides present set-wise) and `docs/refactoring-audit-current.txt` REBUILT with
+  `scripts/refactoring-audit.sh` rather than hand-resolved — it had gone stale on
+  `pkg/cmdtree/tree.go` (1606 -> 1652).
+- **File(s)**: pkg/dataplane/userspace/format/cos_show.go,
+  pkg/dataplane/userspace/format/cos_rewrite_rule_inert_6858_test.go,
+  pkg/grpcapi/server_show_cos_rewrite_rule_6848_test.go,
+  docs/cos-validation-notes.md, docs/refactoring-audit-current.txt, _Log.md
+
 ## 2026-08-05 — #6858 fold: `Enforced: yes` for an UNBOUND dscp rewrite rule
 
 - **Timestamp**: 2026-08-05 (fix/6848-cos-show-rewrite-rule, PR #6858)

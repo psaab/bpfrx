@@ -45,6 +45,13 @@ func newCoSRewriteRuleServer(t *testing.T) *Server {
 		// rule is configured-but-unbound and must not report as enforced. The
 		// original fixture omitted the binding and still asserted
 		// "Enforced: yes" -- it pinned the defect, not the contract.
+		// #6858 round 3: the binding must land on a logical unit that EXISTS.
+		// buildInterfaceSnapshots walks cfg.Interfaces.Interfaces and reads the
+		// CoS unit off each real unit, so a class-of-service stanza naming an
+		// interface with no `interfaces` counterpart is never read and the rule
+		// is not enforced. Binding without this line asserted "Enforced: yes"
+		// for a rewrite the dataplane could never apply.
+		"interfaces ge-0-0-1 unit 0 family inet address 10.9.0.1/24",
 		"class-of-service interfaces ge-0-0-1 unit 0 rewrite-rules dscp rw-dscp",
 	} {
 		if err := store.SetFromInput(cmd); err != nil {

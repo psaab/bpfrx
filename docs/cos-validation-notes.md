@@ -156,6 +156,51 @@ committable family by
 silently — before #6858, deleting the ieee-802.1 advisory reddened exactly
 one test, in `pkg/config`, and the formatter stayed green.
 
+`Enforced:` has THREE states, not two. For a `dscp` rule the answer also
+depends on whether anything **the dataplane will read** binds it:
+
+- **`yes`** — some CONFIGURED logical interface unit references the rule.
+- **`no (not bound — no interface unit references this rule)`** — the rule
+  is configured and nothing binds it. An unbound rule rewrites nothing:
+  the runtime table is populated only for the rule an interface
+  references (`tables.dscp_rewrite_rules.get(&iface.
+  cos_dscp_rewrite_rule)`, `forwarding_build/cos.rs`).
+- **`no (not bound — class-of-service interfaces <if> unit <n> is not a
+  configured logical interface unit)`** — the operator DID write a
+  binding, but against an interface or unit that has no `interfaces`
+  stanza (#6858 round 3).
+
+That third state is not hypothetical. `set class-of-service interfaces
+ge-9-9-9 unit 0 rewrite-rules dscp rw` COMMITS with no `interfaces
+ge-9-9-9` anywhere — one typo in an interface name, or a unit number that
+does not match the logical unit, is enough. The commit does warn
+(`compiler_validate_warn.go:1586` / `:1599`, "class-of-service interface
+%s is bound but not configured under [interfaces]"), and that advisory is
+precisely the "scrolls past once" signal this whole command exists to
+replace with a standing operational view. A warning at commit time is not
+a licence for the show command to answer the question wrongly six months
+later.
+
+**The predicate must mirror `buildInterfaceSnapshots`**
+(`pkg/dataplane/userspace/interfaces.go`). That builder walks
+`cfg.Interfaces.Interfaces` and, for each REAL logical unit, reads
+`cfg.ClassOfService.Interfaces[name].Units[unitNum]` to stamp
+`CoSDSCPRewriteRule` onto the snapshot — so `cosBoundDSCPRewriteRules`
+walks from the same side. Walking `cos.Interfaces` instead (the shape it
+had before round 3) reported `Enforced: yes` for a binding the helper can
+never see, which is the dangerous direction: it converts an unanswered
+question into a confidently wrong "DSCP remarking is happening". The
+reason names the dead reference, because an operator who did write the
+binding reads a bare "not bound" as "you forgot to bind it" and looks in
+the wrong place. `TestFormatCoSRewriteRulesDanglingInterfaceBindingIsNotEnforced6858` pins both dangling shapes plus the bound positive control.
+
+The command still answers from CONFIG, not from the live snapshot, so
+`yes` means "the dataplane is given this rule for this unit", not "this
+packet was remarked". Conditions that live only in the helper's own
+admission gate — a rewrite rule whose forwarding-classes do not intersect
+the queues the interface materializes, for instance — are out of its
+reach; see #7063.
+
 Renderers live in `pkg/dataplane/userspace/format/cos_show.go` (the
 shared SSOT used by both the local CLI in `pkg/cli` and the gRPC
 `ShowText` path in `pkg/grpcapi`); the operational-tree entries and

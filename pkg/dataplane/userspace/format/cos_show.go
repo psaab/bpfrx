@@ -239,30 +239,80 @@ func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) str
 var CoSRewriteRuleTypes = []string{"dscp", "ieee-802.1", "inet-precedence", "exp"}
 
 // cosBoundDSCPRewriteRules returns the set of dscp rewrite-rule NAMES that at
-// least one logical unit actually binds (#6858 fold).
+// least one logical unit actually binds (#6858 fold), and the set of names that
+// are referenced ONLY from a `class-of-service interfaces` stanza naming an
+// interface/unit that does not exist under `interfaces` (#6858 round 3).
 //
-// Scanning Units alone is sufficient and is not an oversight: the compiler
+// The traversal deliberately MIRRORS buildInterfaceSnapshots
+// (pkg/dataplane/userspace/interfaces.go): that builder walks
+// cfg.Interfaces.Interfaces, and for each REAL logical unit looks up
+// cfg.ClassOfService.Interfaces[name].Units[unitNum] to stamp
+// CoSDSCPRewriteRule onto the snapshot. A class-of-service stanza whose
+// interface or unit has no counterpart there is never read, so its binding
+// cannot reach the helper.
+//
+// Walking cos.Interfaces alone — which is what this did before — reported
+// "Enforced: yes" for exactly that config, and it commits clean: `set
+// class-of-service interfaces ge-9-9-9 unit 0 rewrite-rules dscp rw` with no
+// `interfaces ge-9-9-9` stanza produces no warning and no error. A typo in the
+// interface name, or a unit number that does not match the logical unit, then
+// yields a confidently wrong "this rewrite is being applied" — the dangerous
+// direction, and the same failure class the unbound pin above exists to
+// prevent, one level in.
+//
+// Scanning Units and not CoSInterface.Level is still correct: the compiler
 // folds an interface-level binding into every configured unit
-// (applyCoSInterfaceLevelBindings), which `CoSInterface.Level` documents —
-// "the dataplane snapshot and `show class-of-service` — which both iterate
-// Units — need no interface-level awareness".
-func cosBoundDSCPRewriteRules(cfg *config.Config) map[string]bool {
-	bound := map[string]bool{}
+// (applyCoSInterfaceLevelBindings), and its own doc records that an interface
+// with an interface-level binding but NO configured logical unit contributes no
+// unit — which is precisely the case that must not report as enforced.
+func cosBoundDSCPRewriteRules(cfg *config.Config) (bound map[string]bool, danglingRef map[string]string) {
+	bound, danglingRef = map[string]bool{}, map[string]string{}
 	if cfg == nil || cfg.ClassOfService == nil {
-		return bound
+		return bound, danglingRef
 	}
-	for _, iface := range cfg.ClassOfService.Interfaces {
+	for name, iface := range cfg.Interfaces.Interfaces {
 		if iface == nil {
 			continue
 		}
-		for _, unit := range iface.Units {
-			if unit == nil || unit.DSCPRewriteRule == "" {
+		cosIface := cfg.ClassOfService.Interfaces[name]
+		if cosIface == nil {
+			continue
+		}
+		for unitNum, unit := range iface.Units {
+			if unit == nil {
 				continue
 			}
-			bound[unit.DSCPRewriteRule] = true
+			cosUnit := cosIface.Units[unitNum]
+			if cosUnit == nil || cosUnit.DSCPRewriteRule == "" {
+				continue
+			}
+			bound[cosUnit.DSCPRewriteRule] = true
 		}
 	}
-	return bound
+	// Second pass: every CoS reference the snapshot builder will NOT read.
+	// Recorded so the operator is told WHERE the dead binding is rather than
+	// being told the rule is simply unbound, which reads as "you forgot to
+	// bind it" when they did bind it — to a name that does not exist.
+	for _, name := range sortedMapKeys(cfg.ClassOfService.Interfaces) {
+		cosIface := cfg.ClassOfService.Interfaces[name]
+		if cosIface == nil {
+			continue
+		}
+		iface := cfg.Interfaces.Interfaces[name]
+		for _, unitNum := range sortedIntKeys(cosIface.Units) {
+			cosUnit := cosIface.Units[unitNum]
+			if cosUnit == nil || cosUnit.DSCPRewriteRule == "" {
+				continue
+			}
+			if iface != nil && iface.Units[unitNum] != nil {
+				continue // a real logical unit: counted above
+			}
+			if _, ok := danglingRef[cosUnit.DSCPRewriteRule]; !ok {
+				danglingRef[cosUnit.DSCPRewriteRule] = fmt.Sprintf("%s unit %d", name, unitNum)
+			}
+		}
+	}
+	return bound, danglingRef
 }
 
 // cosRewriteRuleEnforcement renders the `Enforced:` value for one rewrite rule.
@@ -271,10 +321,15 @@ func cosBoundDSCPRewriteRules(cfg *config.Config) map[string]bool {
 // "enforced" is the defect this function exists to prevent (#6858 gate MAJOR):
 //
 //  1. `dscp` AND bound by some unit — actually applied on egress.
-//  2. `dscp` and bound by NOTHING — configured, but no runtime effect. The
-//     rewrite table is populated only for the rule an interface references
-//     (`tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`,
-//     forwarding_build/cos.rs), so an unbound rule rewrites nothing.
+//  2. `dscp` and bound by NOTHING the dataplane will read — configured, but no
+//     runtime effect. The rewrite table is populated only for the rule an
+//     interface references (`tables.dscp_rewrite_rules.get(&iface.
+//     cos_dscp_rewrite_rule)`, forwarding_build/cos.rs), so an unbound rule
+//     rewrites nothing. A binding written against an interface or unit that
+//     does not exist under `interfaces` is in this state too — it commits
+//     clean and the snapshot builder never reads it — and is reported with the
+//     reference named, because "not bound" alone reads as "you forgot to bind
+//     it" to an operator who did bind it, just to a name with a typo in it.
 //  3. Any other code-point type — the dataplane rewrites dscp only. Each
 //     carries an accepted-but-inert commit advisory
 //     (compiler_validate_warn.go: ieee-802.1 :1360, inet-precedence :1346,
@@ -298,14 +353,18 @@ func cosBoundDSCPRewriteRules(cfg *config.Config) map[string]bool {
 // accepted-but-inert advisory if and only if this function returns the
 // unsupported-TYPE reason. Deleting an advisory without flipping this function
 // reds, and flipping this function without dropping the advisory reds too.
-func cosRewriteRuleEnforcement(cpType string, bound bool) string {
+func cosRewriteRuleEnforcement(cpType string, bound bool, danglingRef string) string {
 	if cpType != "dscp" {
 		return "no (accepted for Junos compatibility; the dataplane rewrites dscp only)"
 	}
-	if !bound {
-		return "no (not bound — no interface unit references this rule)"
+	if bound {
+		return "yes"
 	}
-	return "yes"
+	if danglingRef != "" {
+		return fmt.Sprintf("no (not bound — class-of-service interfaces %s is not a "+
+			"configured logical interface unit)", danglingRef)
+	}
+	return "no (not bound — no interface unit references this rule)"
 }
 
 // FormatCoSRewriteRules renders `show class-of-service rewrite-rule [name <n>]
@@ -414,7 +473,7 @@ func FormatCoSRewriteRules(cfg *config.Config, nameFilter, typeFilter string) st
 		return "No class-of-service rewrite-rules configured\n"
 	}
 
-	boundDSCP := cosBoundDSCPRewriteRules(cfg)
+	boundDSCP, danglingDSCP := cosBoundDSCPRewriteRules(cfg)
 
 	var b strings.Builder
 	for idx, blk := range blocks {
@@ -423,7 +482,7 @@ func FormatCoSRewriteRules(cfg *config.Config, nameFilter, typeFilter string) st
 		}
 		// Say what the operator loses, not just that a flag is off. This line
 		// is the whole point of the command: it answers "will this rule act?".
-		enforced := cosRewriteRuleEnforcement(blk.cpType, boundDSCP[blk.name])
+		enforced := cosRewriteRuleEnforcement(blk.cpType, boundDSCP[blk.name], danglingDSCP[blk.name])
 		fmt.Fprintf(&b, "Rewrite rule: %s, Code point type: %s, Enforced: %s\n",
 			blk.name, blk.cpType, enforced)
 		if !blk.modeled {
@@ -588,6 +647,17 @@ func lossPriorityOrDefault(lp string) string {
 		return "low"
 	}
 	return lp
+}
+
+// sortedIntKeys returns the keys of an int-keyed map in ascending order, so a
+// dangling-reference report names the same unit on every run.
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 // sortedMapKeys returns the keys of a string-keyed map in sorted order.

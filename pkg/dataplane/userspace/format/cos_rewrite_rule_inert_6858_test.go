@@ -92,7 +92,16 @@ func TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858(t *testing.T) {
 	families := cosRewriteFamilies6858(t)
 	bindable := cosUnitBindableFamilies6858(t, iface, unit)
 
-	cmds := []string{"set class-of-service forwarding-classes queue 0 best-effort"}
+	cmds := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		// #6858 round 3: the CoS binding below must land on a logical unit that
+		// EXISTS under `interfaces`. buildInterfaceSnapshots walks
+		// cfg.Interfaces.Interfaces and reads the CoS unit off each real unit,
+		// so a class-of-service stanza with no counterpart there is never read
+		// and its rule is not enforced. Without this line the positive control
+		// asserts "Enforced: yes" for a binding the dataplane cannot see.
+		"set interfaces " + iface + " unit " + unit + " family inet address 10.9.0.1/24",
+	}
 	for _, fam := range families {
 		name := cosRuleName6858(fam)
 		cmds = append(cmds, "set class-of-service rewrite-rules "+fam+" "+name+
@@ -301,25 +310,37 @@ func TestFormatCoSRewriteRulesEmptyNamedRuleIsNotEnforced6858(t *testing.T) {
 		// A unit with a classifier binding and NO dscp rewrite-rule binding, so
 		// unit.DSCPRewriteRule is "".
 		"set class-of-service interfaces ge-0-0-1 unit 0 classifiers dscp c1",
+		// #6858 round 3: cosBoundDSCPRewriteRules now walks the REAL logical
+		// units (mirroring buildInterfaceSnapshots), so without a configured
+		// ge-0-0-1 unit 0 the empty-string guard below is never reached and
+		// this test passes vacuously.
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.9.0.1/24",
 	)
 	if _, ok := cfg.ClassOfService.DSCPRewriteRules[""]; !ok {
 		t.Fatalf("fixture precondition: an empty-named dscp rewrite rule must reach the "+
 			"compiled config, got keys %v", cfg.ClassOfService.DSCPRewriteRules)
 	}
+	// The guard lives on the path that walks REAL logical units, so the
+	// precondition has to be checked there too: a CoS unit with an empty
+	// DSCPRewriteRule whose interface AND unit exist under `interfaces`.
+	// Checking only cos.Interfaces would let the interface stanza be deleted
+	// and leave this test green over a guard nothing reaches.
 	sawEmptyBinding := false
-	for _, iface := range cfg.ClassOfService.Interfaces {
-		if iface == nil {
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		cosIface := cfg.ClassOfService.Interfaces[name]
+		if ifc == nil || cosIface == nil {
 			continue
 		}
-		for _, u := range iface.Units {
-			if u != nil && u.DSCPRewriteRule == "" {
+		for unitNum, u := range ifc.Units {
+			cosUnit := cosIface.Units[unitNum]
+			if u != nil && cosUnit != nil && cosUnit.DSCPRewriteRule == "" {
 				sawEmptyBinding = true
 			}
 		}
 	}
 	if !sawEmptyBinding {
-		t.Fatal("fixture precondition: a unit with an empty DSCPRewriteRule must exist, " +
-			"or the guard under test is never reached")
+		t.Fatal("fixture precondition: a CoS unit with an empty DSCPRewriteRule must exist " +
+			"on a CONFIGURED logical interface unit, or the guard under test is never reached")
 	}
 
 	line := ruleHeaderLine(t, FormatCoSRewriteRules(cfg, "", "dscp"), "")
@@ -330,5 +351,103 @@ func TestFormatCoSRewriteRulesEmptyNamedRuleIsNotEnforced6858(t *testing.T) {
 	}
 	if !strings.Contains(line, "not bound") {
 		t.Errorf("the empty-named rule must report as unbound:\n%s", line)
+	}
+}
+
+// TestFormatCoSRewriteRulesDanglingInterfaceBindingIsNotEnforced6858 pins the
+// #6858 round-3 runtime finding: a dscp rewrite rule bound from a
+// `class-of-service interfaces` stanza whose interface — or unit — does not
+// exist under `interfaces` must NOT report as enforced.
+//
+// Reachability, measured through the real compile path rather than assumed:
+// both fixtures below COMMIT — a single typo in an interface name, or a unit
+// number that does not match the logical unit, is enough to reach this state on
+// a production box. The commit does emit an advisory
+// (compiler_validate_warn.go:1586 / :1599, "class-of-service interface %s is
+// bound but not configured under [interfaces]"), which is exactly the
+// fires-once-and-scrolls-past signal this command exists to replace with a
+// standing view; it is not a reason for the view to answer wrongly.
+//
+// Why it is wrong: buildInterfaceSnapshots (pkg/dataplane/userspace/
+// interfaces.go) walks cfg.Interfaces.Interfaces and, for each REAL logical
+// unit, reads cfg.ClassOfService.Interfaces[name].Units[unitNum] to stamp
+// CoSDSCPRewriteRule onto the snapshot. A CoS stanza with no counterpart there
+// is never read, so the helper never learns the rule and rewrites nothing.
+//
+// FAIL-ON-REVERT: walk cos.Interfaces instead of cfg.Interfaces.Interfaces in
+// cosBoundDSCPRewriteRules (the pre-round-3 shape) and both dangling cases
+// report "Enforced: yes".
+func TestFormatCoSRewriteRulesDanglingInterfaceBindingIsNotEnforced6858(t *testing.T) {
+	const rule = "rw-dscp"
+	base := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service rewrite-rules dscp " + rule +
+			" forwarding-class best-effort loss-priority low code-point be",
+	}
+
+	cases := []struct {
+		name    string
+		extra   []string
+		wantRef string
+	}{{
+		name: "interface not configured at all",
+		extra: []string{
+			"set class-of-service interfaces ge-9-9-9 unit 0 rewrite-rules dscp " + rule,
+		},
+		wantRef: "ge-9-9-9 unit 0",
+	}, {
+		name: "interface configured but the bound UNIT is not",
+		extra: []string{
+			"set interfaces ge-0-0-1 unit 100 family inet address 10.9.0.1/24",
+			"set class-of-service interfaces ge-0-0-1 unit 0 rewrite-rules dscp " + rule,
+		},
+		wantRef: "ge-0-0-1 unit 0",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := compileCoSRewriteSet6858(t, append(append([]string(nil), base...), tc.extra...)...)
+			// Precondition: the binding really is present in the CoS tree, so a
+			// green here cannot come from the rule never being bound at all.
+			bound := false
+			for _, ci := range cfg.ClassOfService.Interfaces {
+				if ci == nil {
+					continue
+				}
+				for _, u := range ci.Units {
+					if u != nil && u.DSCPRewriteRule == rule {
+						bound = true
+					}
+				}
+			}
+			if !bound {
+				t.Fatalf("fixture precondition: the class-of-service stanza must bind %q", rule)
+			}
+
+			line := ruleHeaderLine(t, FormatCoSRewriteRules(cfg, rule, "dscp"), rule)
+			if strings.Contains(line, "Enforced: yes") {
+				t.Errorf("a dscp rewrite rule bound only to a NON-EXISTENT logical interface "+
+					"unit reported as enforced. The dataplane snapshot walks the configured "+
+					"interfaces, so this binding never reaches the helper:\n%s", line)
+			}
+			if !strings.Contains(line, tc.wantRef) {
+				t.Errorf("the reason must NAME the dead reference (%q) — an operator who did "+
+					"bind the rule reads a bare \"not bound\" as \"you forgot to bind it\" and "+
+					"looks in the wrong place:\n%s", tc.wantRef, line)
+			}
+		})
+	}
+
+	// Positive control: the SAME config with the logical unit actually
+	// configured reports enforced. Without it, "never says yes" would satisfy
+	// both cases above.
+	cfg := compileCoSRewriteSet6858(t, append(append([]string(nil), base...),
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.9.0.1/24",
+		"set class-of-service interfaces ge-0-0-1 unit 0 rewrite-rules dscp "+rule,
+	)...)
+	line := ruleHeaderLine(t, FormatCoSRewriteRules(cfg, rule, "dscp"), rule)
+	if !strings.Contains(line, "Enforced: yes") {
+		t.Errorf("positive control: a rule bound to a CONFIGURED logical unit must report "+
+			"as enforced:\n%s", line)
 	}
 }
