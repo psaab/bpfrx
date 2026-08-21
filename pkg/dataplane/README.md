@@ -348,8 +348,12 @@ Guard layers (`build-userspace-xdp.sh`):
    `xpfd cleanup` also clears it, but it is a much broader hammer: it
    removes EVERY pinned dataplane map (sessions, DNAT, all compatibility
    state) and clears the FRR managed routes. Name the targeted unlink first.
-   `TestCleanupProductionCallersMatchRemediation_6928` binds the caller set
-   this paragraph describes, so it cannot drift again without a red test.
+   `TestCleanupProductionCallersMatchRemediation_6928` binds the reference set
+   this paragraph describes, so it cannot drift again without a red test. Since
+   #6743 `Manager.Teardown` reaches `Cleanup` INDIRECTLY, through the
+   `teardownCleanupFn` seam var, so that test reports the var rather than
+   `Teardown` and `TestTeardownInvokesTheCleanupSeam_6928` binds the half a
+   function-value reference cannot: that Teardown still invokes it.
 
    **CPUMAP MaxEntries is CPU-sized, not a stale-pin signal (#5364):**
    `userspace_cpumap` is a `BPF_MAP_TYPE_CPUMAP`. The shim declares it as

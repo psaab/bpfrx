@@ -139,12 +139,17 @@ type SessionValue struct {
 	// restart leaves the old-size pin in place and the pre-flight refuses
 	// again; a NON-hitless HA shutdown calls Manager.Teardown, which unpins
 	// everything, so there a restart is enough. dataplane.Cleanup() therefore
-	// has TWO production callers — the `xpfd cleanup` subcommand
-	// (cmd/xpfd/main.go) and Manager.Teardown (loader.go) — not one.
-	// TestCleanupProductionCallersMatchRemediation_6928 binds that set, and
+	// has TWO production reference sites — the `xpfd cleanup` subcommand
+	// (cmd/xpfd/main.go, a direct call) and `var teardownCleanupFn = Cleanup`
+	// (loader.go), the #6743 test seam Manager.Teardown invokes — not one.
+	// Teardown's reach became INDIRECT in #6743; it did not go away.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that reference
+	// set, TestTeardownInvokesTheCleanupSeam_6928 binds that Teardown actually
+	// invokes the seam (a func value sitting in a var proves nothing on its
+	// own — deleting the invocation leaves the set unchanged), and
 	// TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) binds WHICH
-	// shutdown arm calls Teardown versus Close. Neither binds this comment's
-	// wording — no test can; read it against those two.
+	// shutdown arm calls Teardown versus Close. None binds this comment's
+	// wording — no test can; read it against those three.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
@@ -430,12 +435,17 @@ type SessionValueV6 struct {
 	// restart leaves the old-size pin in place and the pre-flight refuses
 	// again; a NON-hitless HA shutdown calls Manager.Teardown, which unpins
 	// everything, so there a restart is enough. dataplane.Cleanup() therefore
-	// has TWO production callers — the `xpfd cleanup` subcommand
-	// (cmd/xpfd/main.go) and Manager.Teardown (loader.go) — not one.
-	// TestCleanupProductionCallersMatchRemediation_6928 binds that set, and
+	// has TWO production reference sites — the `xpfd cleanup` subcommand
+	// (cmd/xpfd/main.go, a direct call) and `var teardownCleanupFn = Cleanup`
+	// (loader.go), the #6743 test seam Manager.Teardown invokes — not one.
+	// Teardown's reach became INDIRECT in #6743; it did not go away.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that reference
+	// set, TestTeardownInvokesTheCleanupSeam_6928 binds that Teardown actually
+	// invokes the seam (a func value sitting in a var proves nothing on its
+	// own — deleting the invocation leaves the set unchanged), and
 	// TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) binds WHICH
-	// shutdown arm calls Teardown versus Close. Neither binds this comment's
-	// wording — no test can; read it against those two.
+	// shutdown arm calls Teardown versus Close. None binds this comment's
+	// wording — no test can; read it against those three.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".

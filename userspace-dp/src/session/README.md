@@ -1230,11 +1230,16 @@ refusal, but a NON-hitless HA shutdown calls `Manager.Teardown` →
 already suffices.
 
 Two facts underneath that sentence are pinned, and one thing is NOT (#6928).
-`Cleanup()` has TWO production callers, not one, and
+`Cleanup()` has TWO production reference sites, not one, and
 `pkg/dataplane/cleanup_reachability_6928_test.go` pins that set — resolving
-each call through the file's IMPORT bindings, so an aliased
+each reference through the file's IMPORT bindings, so an aliased
 `dp.Cleanup()` counts and an unrelated `Cleanup()` in some other package does
-not. Which shutdown arm calls which lifecycle method is pinned behaviourally
+not. Since #6743 the Teardown site is a function VALUE
+(`var teardownCleanupFn = Cleanup`) that `Manager.Teardown` invokes rather
+than a direct call, so the walk records it as `(value)` and
+`TestTeardownInvokesTheCleanupSeam_6928` binds the part a value reference
+cannot prove — that Teardown still invokes it, with a polarity control that
+`Manager.Close` does not. Which shutdown arm calls which lifecycle method is pinned behaviourally
 by `TestShutdownModeChoosesCloseOrTeardown6928`
 (`pkg/daemon/shutdown_dataplane_mode_6928_test.go`), which drives the real
 `runShutdownSequence` against a substituted dataplane.

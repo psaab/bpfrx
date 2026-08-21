@@ -39,8 +39,9 @@ const (
 	// which never releases a pin at all. r5 replaced that with the opposite
 	// categorical claim — that restarting NEVER releases it and only `xpfd
 	// cleanup` does — and that is also false: `Cleanup()` (loader.go) does
-	// `os.RemoveAll(bpfPinPath)` and has TWO production callers, the `xpfd
-	// cleanup` subcommand AND `Manager.Teardown`. `daemon_run_shutdown.go`
+	// `os.RemoveAll(bpfPinPath)` and has TWO production reference sites, the
+	// `xpfd cleanup` subcommand AND `Manager.Teardown` (indirectly since
+	// #6743, through the `teardownCleanupFn` seam var). `daemon_run_shutdown.go`
 	// calls `Teardown` on every NON-hitless shutdown ("HA shutdown: tearing
 	// down BPF state"), so on that path the pins are already gone and a plain
 	// restart is sufficient. Only a HITLESS shutdown takes `Manager.Close`,

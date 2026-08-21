@@ -96219,3 +96219,31 @@ prose edit above them added. No diff falls in the new test body.
   all say `Manager.Teardown` unpins on a non-hitless shutdown; that remains
   true through the seam. No prose was changed.
 - **File(s)**: _Log.md, pkg/dataplane/cleanup_reachability_6928_test.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: PR #6928 — reconciled the four prose sites that describe the
+  `Cleanup()` reachability guard with what the guard now reports, after #6743
+  made `Manager.Teardown`'s reach INDIRECT.
+
+  The substantive operator claim did not change and no site was false: a
+  non-hitless shutdown still unpins, so a restart still suffices there. What
+  changed is that the guard's `want` set now names
+  `pkg/dataplane/loader.go:var teardownCleanupFn (value)` instead of
+  `pkg/dataplane/loader.go:Teardown`, and four places told a reader to read the
+  claim against that test. A reader following the pointer would have found a
+  set that does not mention `Teardown` and concluded the doc had drifted —
+  which is the exact failure mode this PR exists to remove. Updated
+  `pkg/dataplane/types.go` (v4 + v6 twins), `loader_userspace_shim.go`,
+  `pkg/dataplane/README.md` and `userspace-dp/src/session/README.md`, each
+  naming the seam, the indirection, and the second guard.
+
+  **Swept tree-wide rather than working a list** (`Teardown` co-occurring with
+  `Cleanup` across `.go`/`.rs`/`.md`/`.h`). Nine further sites mention both;
+  every one is still TRUE under the indirection (`Teardown -> Cleanup unpins
+  everything`, `Teardown (= Close + Cleanup)`), so they were deliberately left
+  rather than annotated. The four edited are exactly the ones that point a
+  reader at the guard's reported set; adding "(indirectly)" to a sentence that
+  is already true buys nothing and dilutes the four that needed it.
+- **File(s)**: _Log.md, pkg/dataplane/types.go,
+  pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/README.md,
+  userspace-dp/src/session/README.md
