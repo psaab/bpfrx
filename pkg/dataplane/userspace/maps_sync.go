@@ -1623,7 +1623,14 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 			// out of the ingress map with no READY binding —
 			// drop_degraded_transit (BINDING_MISSING) — the invariant round 8
 			// was holding up and this preserves.
-			if refused.refusesIfindex(iface.ParentIfindex) {
+			// BOTH KEYS (#6691 round 16, refusesNetdev): the parent's refusal
+			// can hold on the NAME alone — the parent's own base row is a
+			// separate buildLinkSnapshot from this unit row's parent lookup, so
+			// a base row that missed names the netdev without contributing an
+			// ifindex bucket. Rust's binding_target_is_refused asks by name and
+			// drops the child outright, so an ifindex-only reader here left
+			// both the child and the parent key adjudicated with no binding.
+			if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
 				if !userspaceOwnsItsNetdev(iface) {
 					continue
 				}
@@ -1672,7 +1679,12 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 		// Measured: ingress came back [20 21] with 20 the refused member. See
 		// UserspaceBoundLinuxInterfaces for why this is transparent to an
 		// ordinary fabric.
-		if refused.refusesIfindex(fab.ParentIfindex) {
+		// BOTH KEYS (#6691 round 16, refusesNetdev): the fabric row and the
+		// interface rows are separate netlink samples — SyncFabricState
+		// refreshes the fabric rows alone — so an owning, unbindable row that
+		// missed names this netdev while the fabric row carries its live
+		// ifindex. The RSS allowlist's own fabric guard already asked by name.
+		if refused.refusesNetdev(fab.ParentLinuxName, fab.ParentIfindex) {
 			continue
 		}
 		key := uint32(fab.ParentIfindex)
@@ -1740,7 +1752,11 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		// reachable today and is guarded anyway — the reachability analysis,
 		// per exclusion class, is in userspaceRefusedNetdevs
 		// (ingress_exclusions.go), which owns the contract.
-		if refused.refusesIfindex(iface.ParentIfindex) {
+		// BOTH KEYS (#6691 round 16, refusesNetdev) — same sampling skew as the
+		// ingress loop above. An alias installed for a name-refused parent tells
+		// the shim to treat the child's frames as arriving on a netdev nothing
+		// ever binds.
+		if refused.refusesNetdev(iface.ParentLinuxName, iface.ParentIfindex) {
 			continue
 		}
 		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)

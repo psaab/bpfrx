@@ -234,7 +234,13 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		// one the dataplane may never bind — where the honest outcome is that
 		// the fabric gets no AF_XDP binding, not that it gets one onto an
 		// unbindable device.
-		if refused.refusesName(fab.ParentLinuxName) {
+		// BOTH KEYS (#6691 round 16): this reader has the fabric row's ifindex
+		// too, and refusesNetdev is the one predicate every two-identity caller
+		// asks, so this list and the ingress map cannot land on opposite sides
+		// of one netdev again. It was already name-keyed, so this only ever
+		// refuses MORE — which is this list's standing bias (an entry here is
+		// permission to reshape a NIC's RSS table).
+		if refused.refusesNetdev(fab.ParentLinuxName, fab.ParentIfindex) {
 			continue
 		}
 		add(fab.ParentLinuxName)

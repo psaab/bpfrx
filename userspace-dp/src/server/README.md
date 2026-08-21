@@ -477,11 +477,52 @@ of band as an `xfrm` device is both refused and a legal fabric member, so EVERY
 Go loop that plans a binding from a snapshot row or a fabric row asks the refused
 index. That predicate is the claim; a count is not, and this paragraph carried a
 wrong one for several rounds — it said "four" while the tree held three (round 8)
-and then five. As of this writing the sites are `interfaces.go` (bind target,
-fabric parent — name-keyed) and `maps_sync.go` (ingress row, fabric parent,
-binding alias — ifindex-keyed). Regenerate that list rather than trusting it:
+and then five. As of this writing the sites are `interfaces.go` (bind target —
+`refusesName`; fabric parent — `refusesNetdev`) and `maps_sync.go` (ingress row,
+fabric parent, binding alias — all `refusesNetdev`). Regenerate that list rather
+than trusting it:
 `grep -rn 'refused\.refuses' pkg/dataplane/userspace/ --include='*.go' | grep -v '_test\.go'`. To bound a laundering question,
 enumerate every CONTRIBUTOR to the set, not every caller of the predicate.
+
+**Ask with BOTH identities, because the two keys are sampled apart (#6691 round
+16).** Until this round the Go readers split on which key they asked — the
+`interfaces.go` pair by NAME, the `maps_sync.go` trio by IFINDEX — and an
+earlier revision of the sentence above recorded that split as a neutral fact.
+It was a defect. `buildUserspaceRefusedNetdevs` gives a netdev a NAME bucket
+from any counted vote that carries a name, but an IFINDEX bucket only from a
+vote whose own `buildLinkSnapshot` resolved (`vote.ifindex > 0`,
+`snapshotNetdevVotes`) — and **a snapshot is not one netlink sample**.
+`buildInterfaceSnapshots` takes one per base row and a second per unit row for
+that unit's parent; `buildFabricSnapshotsFrom` takes its own; and
+`SyncFabricState` refreshes the fabric rows ALONE and persists them back into
+`m.lastSnapshot` beside interface rows that were never re-sampled
+(`persistResolvedFabricsLocked`). One netdev can therefore be named by a row
+whose lookup MISSED — no ifindex bucket — while a sibling row or a fabric row
+carries its live ifindex.
+
+This plane asks by NAME with no ifindex filter, in both
+`snapshot_refuses_parent_netdev`'s owner walk and the
+`binding_target_is_refused` a VLAN child's bind target routes through. So on a
+skewed snapshot every name-keyed reader refused the netdev and planned no
+binding, while the ifindex-keyed readers admitted its ifindex to the
+ingress-adjudication map — and an ifindex there with no READY binding is
+`drop_degraded_transit` (BINDING_MISSING). Measured at `76045dfae`:
+
+| snapshot | Go ingress | Rust plan |
+|---|---|---|
+| rows `{gr-0-0-3 ifindex 0, tunnel}` + fabric `{gr-0-0-3, parent ifindex 20}` | `[20]` | `{}` |
+| rows `{ge-0-0-5 ifindex 0, tunnel}` + `{ge-0-0-5.100 ifindex 12, parent 11}` | `[11 12]`, alias `12→11` | `{}` |
+
+`userspaceRefusedNetdevs.refusesNetdev(name, ifindex)` is now the single
+predicate every caller holding both identities asks, so the divergence cannot be
+re-introduced one site at a time. A caller holding only a name — the bind-target
+arm of `UserspaceBoundLinuxInterfaces`, name-keyed by contract because `ethtool`
+consumes names — still asks `refusesName`. The Go guards are
+`TestSkewedFabricSampleKeepsIngressAndAllowlistAgreed` and
+`TestSkewedParentSampleKeepsTheChildOutOfAdjudication`
+(`fabric_sample_skew_6691_test.go`), each with a per-site fail-on-revert; the
+Rust half — that an owning row at ifindex 0 still refuses — is pinned by
+`zero_ifindex_owner_row_still_refuses_the_fabric_parent` (`main_tests.rs`).
 
 It does **not** enter the **egress map**. `populate_egress` needs a source MAC
 and takes it from the interface's own `hardware_addr`, else the parent's MAC,

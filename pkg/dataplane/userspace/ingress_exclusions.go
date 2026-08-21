@@ -785,6 +785,55 @@ func (r userspaceRefusedNetdevs) refusesIfindex(ifindex int) bool {
 	return refused
 }
 
+// refusesNetdev answers the refusal question for a netdev a caller knows BOTH
+// identities of, and it is the form every such caller must use (#6691 round 16).
+//
+// THE TWO KEYS ARE NOT POPULATED FROM THE SAME EVIDENCE. buildUserspaceRefusedNetdevs
+// gives a netdev a NAME bucket from any counted vote that carries a name, but an
+// IFINDEX bucket only from a vote whose own `buildLinkSnapshot` resolved
+// (`vote.ifindex > 0`, snapshotNetdevVotes). A snapshot is not one netlink
+// sample: buildInterfaceSnapshots takes one per base row AND a second per unit
+// row for that unit's parent (interfaces.go), buildFabricSnapshotsFrom takes its
+// own (fabric.go), and SyncFabricState refreshes the fabric rows ALONE and
+// persists them back into m.lastSnapshot beside interface rows that were never
+// re-sampled (persistResolvedFabricsLocked, manager_ha.go). So one netdev can be
+// named by a row whose lookup MISSED — no ifindex bucket — while a sibling row
+// or fabric row carries its LIVE ifindex.
+//
+// A DIVERGENCE BETWEEN THE TWO KEYS IS ALWAYS A BUG, which is why this is one
+// predicate and not a convention. The refusal decides two things that must
+// agree: whether a netdev enters the ingress-adjudication map (Go) and whether
+// the AF_XDP planner binds it (Rust). The Rust side asks by NAME with no ifindex
+// filter — snapshot_refuses_parent_netdev walks owning rows on the name, and
+// binding_target_is_refused routes a VLAN child's bind target through it
+// (server/helpers/planning.rs) — and so does UserspaceBoundLinuxInterfaces, the
+// RSS allowlist. An ifindex-only reader therefore admitted a netdev to
+// adjudication that every name-keyed reader had refused, and an ifindex in the
+// ingress map with NO READY binding is drop_degraded_transit (BINDING_MISSING):
+// transit on that netdev drops.
+//
+// Measured at 76045dfae, before this round, on a snapshot whose fabric row had
+// been refreshed past its interface row:
+//
+//	rows  : {gr-0-0-3, ifindex 0, tunnel}  fabric: {gr-0-0-3, parent ifindex 20}
+//	Go    : ingress [20]        Rust: planned bindings {}
+//
+// and on one whose VLAN child's parent lookup outran its base row's:
+//
+//	rows  : {ge-0-0-5, ifindex 0, tunnel}, {ge-0-0-5.100, ifindex 12, parent 11}
+//	Go    : ingress [11 12], alias 12->11   Rust: planned bindings {}
+//
+// Adding the name key is a strict tightening AT THESE SITES: it can only stop a
+// loop from ADDING a key, never remove one another reader put there, and what it
+// stops adding is exactly the set the binding planner already refuses.
+//
+// A caller holding only a name (UserspaceBoundLinuxInterfaces' bind-target arm,
+// which is name-keyed by contract because `ethtool` consumes names) still asks
+// refusesName directly — there is no ifindex to bring.
+func (r userspaceRefusedNetdevs) refusesNetdev(name string, ifindex int) bool {
+	return r.refusesIfindex(ifindex) || r.refusesName(name)
+}
+
 func (r userspaceRefusedNetdevs) refusesName(name string) bool {
 	if name == "" {
 		return false

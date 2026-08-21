@@ -81120,3 +81120,69 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
   pkg/dataplane/userspace/fabric_verdict_scope_6691_test.go,
   userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21 (round 16, drive-to-merge lane)
+- **Action**: #6691 round 16 — CONFIRMED both Codex runtime blockers firsthand at
+  `76045dfae`, fixed the one that is this PR's to fix, and generalized it to two
+  further sites the review had not reached.
+  **B2 (fixed here) — the refusal index has TWO keys populated from DIFFERENTLY
+  SAMPLED evidence, and the Go readers split on which one they asked.**
+  `buildUserspaceRefusedNetdevs` gives a netdev a NAME bucket from any counted
+  vote carrying a name, but an IFINDEX bucket only from a vote whose own
+  `buildLinkSnapshot` resolved (`vote.ifindex > 0`). A snapshot is not one
+  netlink sample: `buildInterfaceSnapshots` takes one per base row AND a second
+  per unit row for that unit's parent, `buildFabricSnapshotsFrom` takes its own,
+  and `SyncFabricState` refreshes the fabric rows ALONE and persists them back
+  into `m.lastSnapshot` (`persistResolvedFabricsLocked`) beside interface rows
+  never re-sampled. So a netdev can be NAMED by a row whose lookup missed — no
+  ifindex bucket — while a sibling row or fabric row carries its live ifindex.
+  Both name-keyed readers (the Rust planner's `snapshot_refuses_parent_netdev` /
+  `binding_target_is_refused`, and the RSS allowlist) then refuse the netdev and
+  plan NO binding, while the three ifindex-keyed readers in `maps_sync.go`
+  admitted its ifindex to the ingress-adjudication map — and an ifindex there
+  with no READY binding is `drop_degraded_transit` (BINDING_MISSING), i.e.
+  transit on that netdev drops. MEASURED at `76045dfae`, both planes, firsthand:
+  rows `{gr-0-0-3 ifindex 0, tunnel}` + fabric `{gr-0-0-3, parent ifindex 20}` →
+  Go ingress `[20]`, Rust planned `{}`; rows `{ge-0-0-5 ifindex 0, tunnel}` +
+  `{ge-0-0-5.100 ifindex 12, parent 11}` → Go ingress `[11 12]` + alias `12→11`,
+  Rust planned `{}`. The second shape needs no fabric refresh at all. FIX:
+  single-sourced the question as `userspaceRefusedNetdevs.refusesNetdev(name,
+  ifindex)` and routed every caller holding both identities through it — three
+  sites in `maps_sync.go` plus the fabric guard in `interfaces.go`. A divergence
+  between the two keys for one netdev is ALWAYS a bug, so this is a predicate,
+  not a convention. The bind-target arm of `UserspaceBoundLinuxInterfaces` keeps
+  `refusesName` — it has no ifindex to bring. Strict tightening at each site: it
+  can only stop a loop ADDING a key, and what it stops adding is exactly the set
+  the binding planner already refuses. Transparent to the reference cluster,
+  whose `fab0 member-interfaces ge-0/0/0` is ownerless and bindable (checked in
+  `docs/ha-cluster-userspace.conf`: no `ge-0/0/0` stanza) — pinned by an
+  anti-vacuity arm in each new test.
+  **B1 (NOT fixed here, confirmed real, merge-ORDER item)** — a dotted
+  `bind-interface st0.0` moves from kernel-reinjected to policy-DENIED. Measured
+  end to end in Rust at `76045dfae`: `disposition=MissingNeighbor
+  egress_ifindex=42`, no `state.egress` row for 42, zone pair `(1, 0)`, and an
+  explicit `trust → vpn permit` evaluates `Deny` on the default policy
+  (`policy_id=4294967295`). `MissingNeighbor` converts a deny to `PolicyDenied`
+  before the reinject gate, and `PolicyDenied` is not slow-path eligible. Root
+  cause is the pre-existing MAC-less-xfrmi egress (#6713, live on master for bare
+  `st0`) and the fix is open PR **#6722**, which rewrites the two Rust files this
+  branch does not touch. The naive local fix — extending `populate_egress`'s
+  `src_mac` fallback to `secure_tunnel` — is explicitly rejected by #6722's own
+  design (it would put an all-zero source MAC on an AF_XDP TX to a
+  link-layer-less device), so it is NOT fixed here. **#6722 must merge before
+  #6691.** That sequencing was already recorded on the PR on 2026-08-02 and is
+  now backed by a firsthand measurement.
+  **Validation** at the round head: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./pkg/dataplane/...` rc=0, full `cargo test --
+  --test-threads=1` rc=0. Per-site mutation matrix: reverting each of the three
+  `maps_sync.go` sites to `refusesIfindex` reds its OWN assertion and only its
+  own (A → the two ingress assertions, B → the alias assertion, C → the fabric
+  assertion); reverting the Rust owner walk to skip `ifindex <= 0` reds
+  `zero_ifindex_owner_row_still_refuses_the_fabric_parent`.
+  **Smoke:** owed — the diff moves Rust (`main_tests.rs` only, tests) and Go
+  production forwarding-set builders. Protocol stays at 7 on both planes; no
+  wire, `.o` or `userspace-xdp/` change.
+- **File(s)**: pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/fabric_sample_skew_6691_test.go,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md, _Log.md

@@ -5055,3 +5055,95 @@ fn apply_snapshot_rejects_a_newer_protocol_version_too() {
         .expect("handler thread")
         .expect("handler result");
 }
+
+/// #6691 round 16: `snapshot_refuses_parent_netdev` counts an owning row BY
+/// NAME with no ifindex filter, so a row whose own link lookup missed
+/// (`ifindex: 0`) still speaks for the netdev — and the Go control plane's
+/// ingress-adjudication map must reach the same verdict from the same evidence.
+///
+/// WHY A ROW CAN CARRY IFINDEX 0 WHILE THE FABRIC ROW CARRIES A LIVE ONE: the
+/// two are sampled at different instants. `buildInterfaceSnapshots`
+/// (interfaces.go) and `buildFabricSnapshotsFrom` (fabric.go) each take their
+/// own `buildLinkSnapshot`, and `SyncFabricState` (manager_ha.go) refreshes the
+/// fabric rows ALONE and persists them back into `m.lastSnapshot` beside
+/// interface rows that were never re-sampled.
+///
+/// THE FIXTURE'S POINT IS `parent_unbindable: false`. It isolates the ifindex-0
+/// interface row as the ONLY refusal evidence in the snapshot: the fabric arm of
+/// `snapshot_refuses_parent_netdev` runs only at `owners == 0`, so if this side
+/// ever gained an `ifindex > 0` filter on the owner walk the row would stop
+/// counting, the fabric arm would vote bindable, and this plane would plan a
+/// binding for a netdev Go's NAME-keyed readers (the RSS allowlist and, since
+/// round 16, the ingress map) refuse. That is the split in the other direction —
+/// a binding with no ingress entry takes `cpumap_or_pass` and leaves the
+/// adjudicated path.
+///
+/// FAIL-ON-REVERT: add `|| p.ifindex <= 0` to the `continue` in
+/// `snapshot_refuses_parent_netdev`'s owner walk and this reds — `gr-0-0-3`
+/// appears in the planned set.
+#[test]
+fn zero_ifindex_owner_row_still_refuses_the_fabric_parent() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("gr-0-0-3", 1);
+    set_rx_queue_count_override("ge-0-0-3", 6);
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/3".to_string(),
+                linux_name: "ge-0-0-3".to_string(),
+                zone: "trust".to_string(),
+                ifindex: 21,
+                rx_queues: 6,
+                ..Default::default()
+            },
+            // The stale half: owns `gr-0-0-3` (its bind target is its own
+            // netdev) and is unbindable (the `tunnel` exclusion class), but its
+            // own link lookup missed.
+            InterfaceSnapshot {
+                name: "gr-0/0/3".to_string(),
+                linux_name: "gr-0-0-3".to_string(),
+                zone: "vpn".to_string(),
+                ifindex: 0,
+                tunnel: true,
+                ..Default::default()
+            },
+        ],
+        // The fresh half, deliberately voting BINDABLE — see the doc above.
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "gr-0-0-3".to_string(),
+            parent_ifindex: 20,
+            parent_unbindable: false,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("gr-0-0-3"),
+        "an owning row at ifindex 0 must still refuse the netdev: the Go plane's \
+         name-keyed readers refuse it, so a binding here is a plan/ingress split. \
+         Planned: {planned:?}"
+    );
+    // ANTI-VACUITY: the LAN row must still be planned, so the assertion above is
+    // not passing because the planner produced nothing at all.
+    assert!(
+        planned.contains("ge-0-0-3"),
+        "premise broken: the unrefused LAN netdev must still be planned. Planned: {planned:?}"
+    );
+
+    clear_rx_queue_count_override();
+}
+
