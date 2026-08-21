@@ -945,6 +945,24 @@ never lock an operator out of a remote box it manages.
   PCI, survives rename/restart/rollback), and — only if that NIC is
   enumeration index 0 — renames just it to fxp0 and snapshots its addressing
   into the bootstrap `.network`.
+  - **Appliance factory boot (#7114).** The default-route signal does not
+    exist on the appliance image: `scripts/image/bake.py` purges cloud-init
+    and deletes every netplan / `interfaces.d` file, so a factory boot (no
+    day-0 drive) has no route, no address, and no `.network` anywhere — and
+    the refusal above left every port DOWN and unrenamed, console-only, which
+    contradicts the image's shipped vNIC#1 → fxp0 factory contract
+    (`docs/install-images.md`, PR #1906). One discriminator resolves it: the
+    bake writes `/etc/xpf/appliance`, and the daemon (`isApplianceFactoryBoot`)
+    falls back to the FIRST ENUMERATED NIC only when that marker is present
+    **and** `EverCommitted()` is false. Selection itself is the pure
+    `chooseBootstrapLifeline` — a default route always wins; the fallback
+    applies only when there is no route at all. Both halves of the gate are
+    load-bearing: the marker keeps the #1922 refusal intact for foreign-host
+    `.deb` installs (the postinst never writes it), and `!everCommitted` keeps
+    it intact for the #1960 fail-closed boot, where a box that HAS been
+    configured (possibly with a device-map that wants no auto-fxp0) is in
+    bootstrap because its committed config stopped compiling. Steps 2-4 above
+    are unchanged and run identically for either provenance.
 - **Protected set** (`resolveProtectedInterfaces` →
   `dataplane.SetProtectedInterfaceResolver`): fxp0 + the lifeline NIC + an
   explicit `system management-interface` leaf are NEVER marked Unmanaged /

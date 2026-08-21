@@ -284,7 +284,19 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
   - `KeepConfiguration=static` on RETH interfaces preserves VRRP VIPs across `networkctl reload`
 - Stale files are auto-removed; `networkctl reload` called only when files actually change
 - **DHCP interfaces**: daemon's DHCP client manages the address; address reconciliation is skipped
-- **Bootstrap**: daemon's `enumerateAndRenameInterfaces()` runs at startup, writes `.link` files + bootstrap fxp0 DHCP `.network`
+- **Bootstrap (#1922 lifeline, #7114 appliance gate)**: on a NORMAL boot the
+  daemon's `enumerateAndRenameInterfaces()` runs at startup and writes the
+  `.link` files. On a BOOTSTRAP boot (nothing ever committed) the full rename
+  loop is suppressed: `setupBootstrapLifeline` identifies the mgmt NIC by the
+  active default route and, only if that NIC is enumeration index 0, renames
+  just it to fxp0 and writes the bootstrap fxp0 DHCP `.network`. With no default
+  route it claims NOTHING (console-only) — that guard keeps a foreign host
+  reachable on its own config. The appliance image has no such config (the bake
+  purges cloud-init/netplan), so `scripts/image/bake.py` writes
+  `/etc/xpf/appliance`; with that marker present AND `EverCommitted()` false the
+  lifeline falls back to the first enumerated NIC, restoring the image's
+  vNIC#1 -> fxp0 factory contract on that artifact only (`isApplianceFactoryBoot`
+  / `chooseBootstrapLifeline`, `docs/install-images.md`)
 - DHCP-learned default routes get admin distance 200 in FRR (lower priority than static routes)
 - **Device-map mode (#1956, bare metal)**: an opt-in `set chassis device-map`
   stanza replaces positional naming with a STABLE-IDENTITY managed allowlist.

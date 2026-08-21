@@ -258,7 +258,7 @@ each VM its own copy-on-write overlay. Put the verified image there with
 | vSRX | xpf image |
 |---|---|
 | First vNIC is fxp0 (OOB mgmt), rest map to ge-0/0/N in attach order | Identical: `enumerateAndRenameInterfaces()` assigns fxp0 / em0 (cluster) / ge-X-0-N by PCI bus order |
-| Factory default: fxp0 DHCP, root console login, no password | Identical: fxp0 DHCP bootstrap; root login on the hypervisor console with empty password; sshd refuses empty/root-password auth |
+| Factory default: fxp0 DHCP, root console login, no password | Identical: fxp0 DHCP bootstrap (gated on the `/etc/xpf/appliance` marker — see below); root login on the hypervisor console with empty password; sshd refuses empty/root-password auth |
 | Day-0 config: ISO with `juniper.conf` at the root, attached as CD-ROM | ISO (or any volume labeled `xpf-config`) with `xpf.conf` at the root — `juniper.conf` accepted as an alias; optional `node-id` file (`0`/`1`) for cluster members |
 | Bad day-0 config: boots factory-default | Identical, but stricter: the config is validated with the REAL commit-check gate (`xpfd check-config`) BEFORE install; a REJECT logs loudly and the system stays factory-default |
 | Day-0 applied once | Applied at most once: stamped after success; never clobbers an existing config (a COMMITTED `.configdb/active.json` or a preseeded `xpf.conf`). A REJECTED medium does not stamp — fix the config and reboot to retry while the system is still factory-default |
@@ -285,6 +285,38 @@ Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
   make a box that booted once (empty `.configdb` present) permanently
   skip the probe, killing the fix-and-reboot retry above. A box in
   factory bootstrap has no `active.json`, so the loader re-probes.
+
+### The `/etc/xpf/appliance` marker (#7114)
+
+The bake writes `/etc/xpf/appliance` into the image. It is what makes the
+factory `fxp0` DHCP bootstrap above happen at all.
+
+xpfd's #1922 bootstrap lifeline identifies the management NIC by the ACTIVE
+DEFAULT ROUTE, and refuses to rename or bring up anything when it cannot find
+one — the right call on a **foreign host** where xpf was installed from the
+`.deb` and the operator's own network configuration is the lifeline. The
+appliance has no such configuration: the bake purges cloud-init and deletes
+every netplan / `interfaces.d` file, so a factory boot with no day-0 drive has
+no route, no address, and nothing to preserve. Without the marker that boot
+leaves every port DOWN and unrenamed — reachable only from the hypervisor
+console.
+
+With the marker present AND nothing ever committed on the box, xpfd claims the
+first enumerated NIC as `fxp0` and DHCPs it, which is the image's vNIC#1 →
+fxp0 contract. Both conditions are required:
+
+- The `.deb` postinst never writes the marker, so a foreign-host install keeps
+  the console-only refusal.
+- A box that HAS been configured is excluded even when it boots into bootstrap
+  mode via the #1960 fail-closed path (a committed config that no longer
+  compiles): its intended interface bindings are real and unknown — possibly a
+  `chassis device-map` that wants no auto-`fxp0` at all — so claiming NIC 0
+  there would be exactly the mis-binding #1960 refuses to perform.
+
+Deleting the marker on a running appliance gives that box the foreign-host
+posture. A factory reset does not remove it (the reset erases an exact,
+xpf-owned allowlist of config artifacts), so a zeroized appliance comes back up
+in the factory `fxp0`-DHCP posture — which is the vSRX behaviour.
 
 Build a config drive:
 
