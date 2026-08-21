@@ -1099,6 +1099,30 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 					"host", host.Address, "facility", raw, "using", "local0")
 			}
 			facility = f
+
+			// #5797: a selector naming a facility OTHER than the one this
+			// client stamps can never match a record it sends, so it no longer
+			// contributes to the threshold (syslogHostMinSeverity). That is the
+			// correct semantics, and it is also a silent no-op the operator has
+			// no way to see — they asked for `authorization critical` and get
+			// neither the records nor a complaint. Say so, once per apply.
+			//
+			// This is not the unmapped-name warning above: the name may be
+			// perfectly well-formed (`kern`, `auth`) and still be inapplicable,
+			// because a client carries ONE facility. Honoring several needs a
+			// source facility on the event envelope, which is the successor
+			// issue's architecture.
+			for _, sel := range host.Facilities {
+				if logging.FacilityIsWildcard(sel.Facility) ||
+					logging.ParseFacility(sel.Facility) == facility {
+					continue
+				}
+				slog.Warn("system syslog: selector names a facility this host's client does not "+
+					"emit, so it selects nothing — every record to this host carries the "+
+					"stamped facility (#5797)",
+					"host", host.Address, "selector", sel.Facility,
+					"severity", sel.Severity, "stamped", facility)
+			}
 		}
 
 		c, err := logging.NewSyslogClientWithSource(host.Address, port, host.SourceAddress)

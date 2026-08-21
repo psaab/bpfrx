@@ -45,6 +45,17 @@
     exit=1, `TestSyslogSelector_ExactWinsOverWildcard` red in BOTH directions,
     so it is not satisfiable by always taking the permissive threshold.
 
+  Follow-on in the same change: the correct semantics make an inapplicable
+  selector a SILENT no-op — the operator asked for `authorization critical` and
+  now gets neither the records nor a complaint — so `applySystemSyslog` warns
+  once per apply for every selector that names a facility this host's client
+  does not stamp. This is not the existing unmapped-NAME warning: `kern` is
+  perfectly well-formed and still inapplicable on a daemon-stamping host.
+  Mutations: deleting the warn call reds the positive subtest (exit=1);
+  widening it to every selector reds BOTH controls, `stamped_facility_stays_quiet`
+  and `wildcard_stays_quiet` (exit=1), so it cannot be satisfied by warning
+  unconditionally.
+
   Control at HEAD: `go test -count=1 ./pkg/daemon/ ./pkg/logging/` exit=0.
   `go vet ./pkg/daemon/` clean. Go-only change; no dataplane binary moves, so no
   cluster smoke is owed.

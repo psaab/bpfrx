@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -165,4 +167,61 @@ func TestSyslogSelector_UnmappedNameSharingLocal0Applies(t *testing.T) {
 		t.Errorf("unmapped `authorization critical` on a local0-stamping client = %d, want %d: "+
 			"the selector and the emitted record share local0 on the wire", got, logging.SyslogCritical)
 	}
+}
+
+// TestApplySystemSyslogWarnsOnInapplicableSelector_5797 binds the operator
+// signal for the residual. A selector naming a facility this host's client does
+// not stamp now selects nothing — correct, and invisible. The operator asked
+// for `authorization critical` and gets neither the records nor a complaint, so
+// applySystemSyslog says so once per apply.
+//
+// The negative control matters more than the positive one here: the wildcard
+// and the stamped facility are BOTH applicable and must stay quiet, or a
+// correct single-selector config warns on every commit.
+//
+// RED-on-revert: delete the warn loop in applySystemSyslog and the positive
+// subtest fails; widen it to every selector and the two controls fail.
+func TestApplySystemSyslogWarnsOnInapplicableSelector_5797(t *testing.T) {
+	apply := func(t *testing.T, sel []config.SyslogFacility) string {
+		t.Helper()
+		buf := captureRenderedWarnings(t)
+		d := &Daemon{slogHandler: logging.NewSyslogSlogHandler(slog.Default().Handler())}
+		t.Cleanup(func() { d.slogHandler.SetClients(nil) })
+		cfg := &config.Config{}
+		cfg.System.Syslog = &config.SystemSyslogConfig{
+			Hosts: []*config.SyslogHostConfig{{Address: "192.0.2.10", Facilities: sel}},
+		}
+		d.applySystemSyslog(cfg)
+		return buf.String()
+	}
+
+	const marker = "selects nothing"
+
+	t.Run("foreign facility warns", func(t *testing.T) {
+		got := apply(t, []config.SyslogFacility{
+			{Facility: "daemon", Severity: "info"},
+			{Facility: "kern", Severity: "critical"},
+		})
+		if !strings.Contains(got, marker) {
+			t.Errorf("a `kern critical` selector on a daemon-stamping host selects nothing and "+
+				"said so nowhere; the operator sees neither the records nor a complaint. captured:\n%s", got)
+		}
+		if !strings.Contains(got, "kern") {
+			t.Errorf("the warning must name the inapplicable selector. captured:\n%s", got)
+		}
+	})
+
+	t.Run("stamped facility stays quiet", func(t *testing.T) {
+		if got := apply(t, []config.SyslogFacility{{Facility: "daemon", Severity: "info"}}); strings.Contains(got, marker) {
+			t.Errorf("the selector that supplies the stamped facility IS applicable and must not "+
+				"warn — a correct config would complain on every commit. captured:\n%s", got)
+		}
+	})
+
+	t.Run("wildcard stays quiet", func(t *testing.T) {
+		if got := apply(t, []config.SyslogFacility{{Facility: "any", Severity: "info"}}); strings.Contains(got, marker) {
+			t.Errorf("`any` matches every record and is always applicable; warning about it is a "+
+				"false alarm on the repo's own canonical fixture. captured:\n%s", got)
+		}
+	})
 }
