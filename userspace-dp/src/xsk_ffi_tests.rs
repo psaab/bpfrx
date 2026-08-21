@@ -869,11 +869,22 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
 // at the batch sizes r3 chose it was FALSE. With a final batch of 2 the drop's
 // two counts were both 1, so a `Drop` hardcoding its bridge arguments to the
 // literal 1 produced byte-identical ring state — measured: all 17 XSK tests
-// passed under exactly that mutation. The claim is true at the CURRENT sizes
-// and only because of them: `REUSE_BATCHES[2] == 3` makes the drop submit 2 and
-// cancel 1, and the `>= 3` self-check above is what holds that apart. The
-// explicit batches are now checked per-operation rather than as one aggregate,
-// for the same reason — 1+3 and 2+2 reach the same total.
+// passed under exactly that mutation. r5's `>= 3` floor separated the two
+// counts and left the CANCEL count invariant at 1 across every fixture, so a
+// cancel-only constant still survived — measured again: 4266 passed, 0 failed.
+//
+// What makes the claim true now is not a size but a QUANTIFIER: each fixture
+// drives `DROP_PARTIALS`, so `Drop` runs at `(terminal, cancel) = (p, B[2] - p)`
+// for more than one `p`, and both coordinates take more than one value. A
+// constant is right for at most one drive whichever position it occupies.
+// Guards (4) and (5) hold that; the `>= 3` floor they replaced is now a
+// consequence rather than a separate assertion, so do not cite it here.
+//
+// This paragraph deliberately names no literal counts. r6 found that the
+// version which did had gone stale against its own round's change — it cited a
+// self-check that had just been derived away, and a fixed submit-2/cancel-1
+// that the partials had just made variable. A comment that restates values the
+// consts already carry is a third copy of the invariant with no guard on it.
 //
 // Each is comparative: reverting its production line reds it while the
 // pre-existing tests in this file stay green (see `_Log.md` for the matrix).
