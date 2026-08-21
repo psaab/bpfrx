@@ -224,85 +224,28 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					}
 				}
 				for _, asNode := range cfgNode.FindChildren("archive-sites") {
-					// Flat-set form (`set ... archive-sites <url>
-					// [password <s>]`): schema consumes the URL as a
-					// trailing key, so asNode.Keys = ["archive-sites",
-					// URL]. Password lands either in subsequent keys
-					// (leaf form) or as a child leaf (Keys=["password",
-					// "$9$..."]).
-					//
-					// #6692 / #6659 — READ THIS BEFORE WIDENING THE READ
-					// BELOW. This branch takes slot 1 and then `continue`s, so
-					// a BRACKETED LIST (`archive-sites [ "scp://a/b"
-					// "-oProxyCommand=id" ]`, which the lexer collapses onto
-					// Keys[1:]) drops every member past the first — and because
-					// the leading-dash check runs on `url` alone, that dropped
-					// member also ESCAPES the #4589 A7 F-02 gate and commits
-					// CLEAN. Measured: the bracket form ACCEPTS where the same
-					// token authored alone, or in the hierarchical block form
-					// below, REJECTS.
-					//
-					// Today the escape is inert — the value is dropped, so
-					// nothing reaches scp. It STOPS being inert the moment
-					// anyone widens this to accumulate Keys[2:]. Widen the
-					// leading-dash check in the SAME change, over EVERY authored
-					// value. Widening the read alone ships a live CWE-88
-					// argument injection: the second member would land in
-					// ArchiveSites and be handed to `scp <src> <dest>` as an
-					// option. Note also that Keys[2:] is where `password` rides,
-					// so a widening reader must separate values from that
-					// modifier rather than treating the whole tail as URLs.
-					if len(asNode.Keys) >= 2 {
-						url := asNode.Keys[1]
+					// #6692: archiveSiteEntries reads EVERY authored site
+					// across all four AST shapes, so a bracketed list is no
+					// longer truncated to its first member. The two things the
+					// pre-#6692 warning in this spot demanded of a widening
+					// reader are both satisfied here: the `password <secret>`
+					// modifier is separated from the URL stream by
+					// archiveSiteEntries (it is never promoted to a site), and
+					// the #4589 leading-dash gate below now runs over EVERY
+					// site rather than slot 1 alone — so widening the read
+					// closes the gate escape instead of arming it.
+					for _, site := range archiveSiteEntries(asNode) {
 						// #4589 A7 F-02: reject a leading-dash archive-site at
 						// commit. Runtime archival shells out to `scp <src> <dest>`;
 						// a `-`-prefixed URL is never a valid scp destination and,
 						// pre-`--`-separator, was parsed as an scp option (CWE-88).
-						if strings.HasPrefix(url, "-") {
-							return fmt.Errorf("system archival archive-sites %q: an archive-site URL must not begin with '-' (it is passed to scp as a destination, not an option)", url)
+						if strings.HasPrefix(site.url, "-") {
+							return fmt.Errorf("system archival archive-sites %q: an archive-site URL must not begin with '-' (it is passed to scp as a destination, not an option)", site.url)
 						}
-						sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, url)
-						for i := 2; i+1 < len(asNode.Keys); i++ {
-							if asNode.Keys[i] == "password" {
-								sys.Archival.ArchiveSitesWithPassword = append(
-									sys.Archival.ArchiveSitesWithPassword, url)
-								break
-							}
-						}
-						for _, child := range asNode.Children {
-							if child.IsLeaf && len(child.Keys) >= 1 && child.Keys[0] == "password" {
-								sys.Archival.ArchiveSitesWithPassword = append(
-									sys.Archival.ArchiveSitesWithPassword, url)
-								break
-							}
-						}
-						continue
-					}
-					// Hierarchical form (archive-sites { <url> { password
-					// "$9$..."; } } or archive-sites { <url> password
-					// "$9$..."; }): each site is a child node whose first
-					// key is the URL.
-					for _, site := range asNode.Children {
-						if len(site.Keys) >= 1 {
-							url := site.Keys[0]
-							// #4589 A7 F-02: reject a leading-dash archive-site at
-							// commit (hierarchical form). See the flat-set twin above.
-							if strings.HasPrefix(url, "-") {
-								return fmt.Errorf("system archival archive-sites %q: an archive-site URL must not begin with '-' (it is passed to scp as a destination, not an option)", url)
-							}
-							sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, url)
-							if site.FindChild("password") != nil {
-								sys.Archival.ArchiveSitesWithPassword = append(
-									sys.Archival.ArchiveSitesWithPassword, url)
-							} else {
-								for i := 1; i+1 < len(site.Keys); i++ {
-									if site.Keys[i] == "password" {
-										sys.Archival.ArchiveSitesWithPassword = append(
-											sys.Archival.ArchiveSitesWithPassword, url)
-										break
-									}
-								}
-							}
+						sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, site.url)
+						if site.hasPassword {
+							sys.Archival.ArchiveSitesWithPassword = append(
+								sys.Archival.ArchiveSitesWithPassword, site.url)
 						}
 					}
 				}
@@ -460,10 +403,18 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			if rl := sshNode.FindChild("root-login"); rl != nil && len(rl.Keys) >= 2 {
 				sys.Services.SSH.RootLogin = rl.Keys[1]
 			}
+			// #6692: key-exchange is `multi: true` and the operator lists
+			// methods in PREFERENCE order, so a bracketed list truncated to
+			// slot 0 pinned sshd to the FIRST (often the weaker legacy) method
+			// and silently discarded the modern one the operator added — a
+			// hardening change that appears applied and is not. Read every
+			// value via firewallMatchValues, exactly as the ciphers/macs
+			// siblings below already do. Widening is safe on the injection axis
+			// because validateMultiValueLeaf (schema_walk.go) runs the leaf's
+			// ValidateSSHAlgorithm over EVERY token of Keys[1:] and every
+			// block-child, not just the first (#4902).
 			for _, kx := range sshNode.FindChildren("key-exchange") {
-				if v := nodeVal(kx); v != "" {
-					sys.Services.SSH.KeyExchange = append(sys.Services.SSH.KeyExchange, v)
-				}
+				sys.Services.SSH.KeyExchange = append(sys.Services.SSH.KeyExchange, firewallMatchValues(kx)...)
 			}
 			// #4305 S-4: SSH hardening knobs. ciphers/macs are repeatable
 			// (bracketed list or one-per-child); read every value via
@@ -536,8 +487,25 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 						})
 					}
 				}
+				// #6692: api-key is `multi: true`, so a bracketed list
+				// collapses onto ONE node's Keys and the pre-fix nodeVal read
+				// kept slot 0 alone — a second provisioned key silently did not
+				// authenticate, and key rotation (add new, then remove old)
+				// silently failed to add the new key.
+				//
+				// multiLeafAuthoredValues rather than firewallMatchValues:
+				// this leaf's EMPTY values are load-bearing. A quoted-empty
+				// `api-key ""` must still reach APIKeys so
+				// validateAPIAuthNoEmptySecretsStrict hard-rejects it and
+				// apiAuthHasUsableCredential does not count it (#5636);
+				// dropping empties here would turn that operator-visible
+				// rejection into a silent disappearance. The
+				// multiLeafAuthoredValues(n)[0] == nodeVal(n) invariant is what
+				// makes slot 0 byte-identical to the pre-fix read.
 				for _, ch := range authNode.FindChildren("api-key") {
-					auth.APIKeys = append(auth.APIKeys, Secret(nodeVal(ch)))
+					for _, key := range multiLeafAuthoredValues(ch) {
+						auth.APIKeys = append(auth.APIKeys, Secret(key))
+					}
 				}
 				sys.Services.WebManagement.APIAuth = auth
 			}
@@ -1119,7 +1087,14 @@ func compileSharedUMEMConfig(node *Node) *SharedUMEMConfig {
 		case "mode":
 			cfg.Mode = nodeVal(child)
 		case "interface":
-			if v := nodeVal(child); v != "" {
+			// #6692: `interface` is `multi: true` — a bracketed list
+			// (`shared-umem { interface [ eth1 eth2 ]; }`) collapses onto ONE
+			// node's Keys, so the pre-fix nodeVal read kept eth1 alone and the
+			// dataplane's shared-UMEM memory topology differed from what the
+			// operator authored. firewallMatchValues reads both sides of the
+			// AST and skips empty tokens, matching the previous `v != ""`
+			// guard.
+			for _, v := range firewallMatchValues(child) {
 				cfg.Interfaces = append(cfg.Interfaces, LinuxIfName(v))
 			}
 		case "phase0-artifact-file", "artifact-file":
@@ -2718,4 +2693,86 @@ func ntpServerValues(n *Node) []string {
 		consume(child.Keys)
 	}
 	return servers
+}
+
+// archiveSite is one authored `system archival configuration archive-sites`
+// entry: the destination URL, plus whether the operator attached a `password`
+// modifier to it.
+type archiveSite struct {
+	url         string
+	hasPassword bool
+}
+
+// archiveSiteEntries returns EVERY archive site an `archive-sites` node carries,
+// across all four AST shapes the parsers produce (#6692, the #2419 dual-shape
+// class). Measured shapes:
+//
+//	archive-sites [ a b ];                → Keys=["archive-sites","a","b"]
+//	archive-sites a password S;           → Keys=["archive-sites","a","password","S"]
+//	archive-sites a { password S; }       → Keys=["archive-sites","a"], child ["password","S"]
+//	archive-sites { a password S; b; }    → Keys=["archive-sites"], one child per site
+//	archive-sites { a { password S; } }   → Keys=["archive-sites"], child "a" with a password child
+//
+// The pre-#6692 reader took Keys[1] and stopped, so a bracketed list compiled
+// its FIRST member only — and because the #4589 leading-dash gate ran on that
+// one member, every dropped member also ESCAPED the gate and committed clean.
+// The escape was inert while the value was dropped; it stops being inert the
+// moment the read widens, which is why the caller now runs the leading-dash
+// check over every entry this function returns.
+//
+// `password` is a MODIFIER, not a value (#6673: a widened read must not PROMOTE
+// a token the old reader discarded). It binds to the site immediately preceding
+// it and its secret operand is consumed with it, so neither the keyword nor the
+// secret can ever land in ArchiveSites and be handed to `scp` as a destination.
+// A trailing `password` with no operand still marks the preceding site rather
+// than becoming one.
+//
+// An EMPTY value token is preserved as an entry: the pre-#6692 reader appended
+// Keys[1] unconditionally, so `archive-sites ""` compiled one empty site, and
+// silently dropping it here would change behaviour on an axis this change is
+// not about.
+func archiveSiteEntries(n *Node) []archiveSite {
+	if n == nil {
+		return nil
+	}
+	// parseTail walks a token stream whose entries are `<url> [password
+	// <secret>]` groups. toks excludes the leaf keyword.
+	parseTail := func(toks []string) []archiveSite {
+		var out []archiveSite
+		for i := 0; i < len(toks); i++ {
+			if toks[i] == "password" {
+				if len(out) > 0 {
+					out[len(out)-1].hasPassword = true
+				}
+				i++ // consume the secret operand, if one was authored
+				continue
+			}
+			out = append(out, archiveSite{url: toks[i]})
+		}
+		return out
+	}
+	markLast := func(sites []archiveSite, node *Node) {
+		if len(sites) > 0 && node.FindChild("password") != nil {
+			sites[len(sites)-1].hasPassword = true
+		}
+	}
+
+	// Value-on-Keys shapes: the sites ride this node's own tail. Any CHILD here
+	// is a modifier block for the last authored site (`archive-sites a {
+	// password S; }`), never an additional site.
+	if len(n.Keys) > 1 {
+		sites := parseTail(n.Keys[1:])
+		markLast(sites, n)
+		return sites
+	}
+
+	// Block shape: one child per site, each child's own Keys carrying that
+	// site's `<url> [password <secret>]` tail.
+	var out []archiveSite
+	for _, child := range n.Children {
+		sites := parseTail(child.Keys)
+		markLast(sites, child)
+		out = append(out, sites...)
+	}
+	return out
 }

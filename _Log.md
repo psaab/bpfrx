@@ -54,6 +54,206 @@
   peer,tai64n,timers}.rs, userspace-dp/src/afxdp/wg/poison_tests.rs (new),
   userspace-dp/src/afxdp/wg/{mod,tests,cookie_tests,tai64n_tests}.rs,
   docs/engineering-style.md, _Log.md
+## 2026-08-21 — #6697: the CoS `code-points` BLOCK spelling lost the whole classifier
+
+- **Timestamp**: 2026-08-21 (fix/6697-cos-code-points-spellings)
+- **Action**: Widened all five CoS code-point readers onto a shared
+  `coSCodePointTokens` helper that returns the leaf node's tail, EVERY key of
+  each of its children, and the inline `loss-priority low code-points ef;`
+  tail. Measured the five families across the five spellings BEFORE fixing;
+  the matrix corrected the issue twice over. With domain-valid values the
+  bracket / repeated / flat-set spellings already kept both code points — the
+  defect was the hierarchical BLOCK form, which compiled to NOTHING for all
+  five families (the compiler stores a classifier only with >= 1 entry, so the
+  whole classifier went missing, not a truncated list). The two rewrite
+  readers additionally missed the inline spelling Junos itself emits, so
+  `loss-priority low code-point ef;` compiled to nothing at all.
+
+  Because each reader's per-value domain check runs on the tokens it reads,
+  the unread shape was a GATE ESCAPE, not just a value drop: `code-points {
+  totally-bogus; }` committed CLEAN where `code-points [ totally-bogus ]` was
+  rejected. Every widened path keeps the check.
+
+  The spelling-differential gate also had to be corrected before it could
+  prove any of this. `cfg.Warnings` was marshalled into the compared output,
+  so a value the leaf REJECTS moved the output off the no-value baseline and
+  defeated the trap-(3) guard; combined with the readers' fail-fast on the
+  first bad token, `[v1]` and `[v1 v2]` produced the identical single warning
+  and every pair OUTSIDE the leaf's domain read as a uniform drop. That is why
+  all five sites were allowlisted while the one in-domain pair reported them
+  clean at the same commit. `gateMarshal` now clears Warnings, and a `pcp`
+  (3/5) value pair was added so the ieee-802.1 / inet-precedence leaves get a
+  verdict at all instead of going inert.
+
+  Three of the five allowlist rows are removed as FIXED (verified compared,
+  not merely uncovered). The two `rewrite-rules` rows moved to
+  `notAValueList`: a rewrite entry writes exactly ONE code point, and
+  `code-points` there is a documented alias of the scalar `code-point`.
+
+  The mutation matrix then falsified the assumption the row removal was
+  supposed to rest on. Reverting ALL FIVE reads left the gate GREEN: it had
+  no sensitivity to this defect at all, because "inert" (the first value not
+  moving the output either) removes a spelling from the comparison, so a
+  reader that ignores a shape ENTIRELY is indistinguishable from a leaf that
+  is unreachable in that shape. A third class was added — a spelling that is
+  READ beside one that is INERT, restricted to `multi: true` leaves where the
+  block form is legal Junos. Unrestricted that rule fires at 119 sites (almost
+  all scalar leaves where `leaf { v; }` is not a spelling); restricted it
+  fires at 2, both already owned by an allowlist row (#6695, #6688). With it
+  the full revert REDs and the row removal is real proof.
+
+  Merging master (which landed #6687, #6688, #6692, #6695, #7126 in the
+  interim) left `knownSpellingInconsistencies` EMPTY, and the new class then
+  found one residual at `security nat source pool <*> port range`: #6688 fixed
+  the value drop but the block spelling still reads nothing. That one is
+  classified, not fixed — `parseSourcePoolPortRange` states in its own doc
+  comment that `port range` "is not a value list — it is a compound value
+  TAIL", both its grammars have fixed arity, and since #6688 an unconsumed
+  token stamps PortRangeInvalidSpec, so a two-element "list" changes the output
+  only by recording an invalid spec. It goes to notAValueList with that
+  reason.
+
+  Validation: `go test -count=1 ./pkg/config/...` exit 0 with the rows gone;
+  `go vet ./pkg/config/` and `go build ./...` exit 0. Go-only — nothing
+  reaches the Rust helper binary or the wire format, so no smoke is owed.
+- **File(s)**: pkg/config/compiler_class_of_service.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/config/cos_code_points_spellings_6697_test.go,
+  docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
+
+## 2026-08-21 — #6695: RA dns-server-address dropped every RDNSS server past the first
+
+- **Timestamp**: 2026-08-21 (fix/6695-ra-dns-server-multivalue)
+- **Action**: `compileRouterAdvertisement` read the `multi: true`
+  `dns-server-address` leaf with `nodeVal` — `Keys[1]` alone. Reproduced across
+  all five spellings before changing anything: A hier-bracket `drop`,
+  B hier-block **inert**, C hier-repeat `keep`, D set-bracket `drop`,
+  E set-repeat `keep`, identical for all eight of the gate's value pairs. The
+  block spelling measured inert because that shape has no `Keys[1]` at all, so
+  `dns-server-address { a; b; }` compiled NOTHING — a strictly worse failure
+  than the truncation the issue described.
+
+  Hosts on the link learn one RDNSS server while `show configuration` renders
+  both, so the missing redundancy is invisible until the primary resolver
+  fails. xpf sends RAs from its own embedded sender (`pkg/ra`), so nothing
+  downstream re-reads the config and behaves correctly.
+
+  Reader is now `firewallMatchValues`: every value it returns is installed into
+  ONE RFC 8106 `RecursiveDNSServer` option, so an empty token legitimately
+  means absence. Widening is safe on the validation axis because the leaf
+  declares a schema `validator` (`ValidateIPv6Address`, #2497) and
+  `validateMultiValueLeaf` runs it over `Keys[1:]` AND every block-child —
+  pinned by a rejection in a NON-ZERO slot plus an over-reject control.
+
+  The `protocols router-advertisement interface <*> dns-server-address` row is
+  removed from `knownSpellingInconsistencies` in the same PR. Measured after
+  the fix: all FIVE spellings COMPARED and all `keep` — the previously inert
+  block spelling now carries a verdict, so gate coverage of this site went up.
+
+  Validation: `go test -count=1 ./pkg/config/ ./pkg/ra/ ./pkg/daemon/` exit 0;
+  `go build ./...` and `go vet ./pkg/config/ ./pkg/ra/` exit 0. Mutation proof:
+  reverting the one read leaves build+vet at exit 0 and reds
+  `TestRADNSServerMultiValue_6695`, `TestRADNSServerThreeAddresses_6695` and
+  `TestBuildRA_6695_EveryRDNSSServerOnWire` (three of its four subtests — the
+  repeated spelling is the control that always worked) as ASSERTIONS, plus the
+  gate itself; `TestRADNSServerValidatorCoversEverySlot_6695` stays green
+  because it guards the validator, not the read. Go-only in `pkg/config`
+  (plus a `pkg/ra` test); nothing reaches the Rust helper binary, so no cluster
+  smoke is owed.
+- **File(s)**: pkg/config/compiler_protocols.go,
+  pkg/config/compiler_ra_dns_server_6695_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/ra/sender_marshal_rdnss_6695_test.go,
+  docs/config-schema.md, docs/embedded-radvd.md, _Log.md
+## 2026-08-21 — #6692: four system-stanza multi-value leaves dropped everything past slot 0
+
+- **Timestamp**: 2026-08-21 (fix/6692-system-multivalue-leaves)
+- **Action**: Widened four `multi: true` `system` leaves that a single-value
+  accessor truncated to their first bracket member: `archival configuration
+  archive-sites`, `services ssh key-exchange`, `services web-management
+  api-auth api-key`, and `dataplane shared-umem interface`.
+
+  Reproduced first across all five spellings with the differential gate's own
+  `spellingVerdicts`. `archive-sites` measured A=drop B=keep C=keep D=drop
+  E=keep; the other three measured A=drop B=drop C=keep D=drop E=keep —
+  identical for all eight value pairs, so the drop is shape-driven, not
+  domain-driven.
+
+  Three of the four shared a fix and the fourth did NOT, which is the point of
+  auditing rather than assuming: `key-exchange` and `shared-umem interface`
+  take `firewallMatchValues` (every value installs, empty means absent);
+  `api-key` takes `multiLeafAuthoredValues` because an EMPTY value is
+  load-bearing there — a quoted-empty key must still reach
+  `validateAPIAuthNoEmptySecretsStrict` (#5636), and an empty-skipping reader
+  would silently withdraw that rejection; `archive-sites` takes a new GROUPING
+  reader `archiveSiteEntries`, because its tail interleaves a `password
+  <secret>` MODIFIER with the URLs and accumulating it wholesale would promote
+  the keyword and the secret into `ArchiveSites`, which runtime archival hands
+  to `scp <src> <dest>` (#6673's symmetric hazard, named at that read site).
+
+  The #4589 leading-dash gate was widened in the SAME change, as the pre-fix
+  comment demanded: it now runs over every entry rather than slot 1, so the
+  bracket-form gate escape closed in the commit that could otherwise have armed
+  a live CWE-88 argv injection.
+
+  The four `knownSpellingInconsistencies` rows are removed in the same PR.
+  Measured after the fix: all five spellings COMPARED and all `keep` at every
+  site — coverage went up, not down.
+
+  Validation: `go test -count=1 ./pkg/config/ ./pkg/daemon/ ./pkg/api/
+  ./pkg/configstore/ ./pkg/dataplane/...` exit 0; `go build ./...` and
+  `go vet ./pkg/config/` exit 0. Mutation proof: six SINGLE-site mutations,
+  each localising to its own assertion with build+vet at exit 0 — including one
+  narrowing ONLY the leading-dash gate (read left widened) and one swapping
+  `api-key` to the empty-skipping reader. Go-only in `pkg/config`; nothing
+  reaches the Rust helper binary, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_system.go,
+  pkg/config/compiler_system_multivalue_6692_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  docs/config-schema.md, _Log.md
+## 2026-08-21 — #6688: source-NAT `port range` discarded every token past the grammar
+
+- **Timestamp**: 2026-08-21 (fix/6688-natsrc-port-range-tail)
+- **Action**: Gave `parseSourcePoolPortRange` a FIXED arity per shape and made
+  an unconsumed token fail closed. `#5457` validated the endpoints the grammar
+  consumed but never bounded how many tokens it consumed: the legacy shape
+  matched at `len(toks) >= 4` and the Junos shape at `len(toks) >= 3`, and the
+  remainder was dropped. `port range 1000 2000` therefore parsed as the bare
+  single-port shape and compiled `PortLow == PortHigh == 1000` — a pool the
+  operator sized at 1001 ports provided ONE, committed clean, and exhausted
+  under the first real translation load. The second slot was never parsed at
+  all, so `[ 1000 99999 ]` and `[ 1000 notaport ]` also committed clean.
+
+  `port range` is NOT a value list: it is a compound value TAIL. Accepting
+  `["1000","2000"]` as `[1000,2000]` was rejected as the fix because the lexer
+  strips brackets before the compiler sees anything — that reading would invent
+  a two-token `range <low> <high>` grammar Junos does not have AND silently
+  redefine the mistyped bare form. Failing closed routes the authored spec
+  through the existing `PortRangeInvalidSpec` channel instead: strict commit
+  hard-rejects naming the spec, the tolerant load / peer-sync path marks the
+  pool unusable.
+
+  The `security nat source pool <*> port range` row is removed from
+  `knownSpellingInconsistencies` in the same change, as the #2419
+  spelling-differential gate requires. Measured after the fix: the site is still
+  ENUMERATED and COMPARED (A/C/D/E carry verdicts, B is inert) and all four now
+  agree — the row went stale because the defect is fixed, not because coverage
+  dropped.
+
+  Validation: `go test -count=1 ./pkg/config/ ./pkg/dataplane/...` exit 0.
+  Mutation proof: reverting the arity hunk alone leaves `go build ./...` and
+  `go vet ./pkg/config/` at exit 0 and reds
+  `TestParseSourcePoolPortRangeUnconsumedTail_6688`,
+  `TestSourceNATPoolPortRangeTailFailsClosed_6688` and
+  `TestSourceNATPoolPortRangeSpellingsAgree_6688` as ASSERTIONS, plus the gate
+  itself with an unexpected-inconsistency hit; the over-reject control
+  `TestSourceNATPoolPortRangeValidUnaffected_6688` stays green. Go-only, in
+  `pkg/config` — nothing reaches the Rust helper binary
+  (`PortRangeInvalidSpec` is `json:"-"`), so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_nat_source_pool_port_6688_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go,
+  docs/config-schema.md, docs/userspace-dataplane-gaps.md, _Log.md
 
 ## 2026-08-21 — #7114: a factory boot of the appliance image claimed no NIC, so no bake could sign
 
