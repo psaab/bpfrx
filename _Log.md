@@ -1,3 +1,54 @@
+## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
+
+- **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
+- **Action**: Keyed `syslogHostMinSeverity` on the facility code the host's
+  `SyslogClient` actually stamps, so a `<facility> <severity>` selector naming a
+  different facility no longer sets that client's threshold.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/syslog_selector_5797_test.go` (new),
+  `pkg/daemon/syslog_severity_5314_test.go`, `pkg/logging/README.md`
+
+  Junos evaluates a host's selectors independently: `daemon info;
+  authorization critical` forwards daemon records at info-or-higher and
+  authorization records at critical-or-higher. xpf folded every selector with
+  `MoreRestrictiveMinSeverity`, so that config filtered the WHOLE destination at
+  critical and dropped the daemon notice/info records the operator had asked for
+  by name. `daemon info; authorization none` was the same defect at full
+  magnitude: `none` outranks everything in `minSeverityRestrictRank`, so one
+  selector naming a facility this client can never emit silenced the destination
+  outright, emergency included.
+
+  The key is the numeric facility CODE, not the authored name, because the code
+  is what appears in the wire PRI. Unmapped Junos names all resolve to local0,
+  so a host that really does stamp local0 stays constrained by them — the
+  selector and the emitted record share a facility on the wire, and pretending
+  otherwise would drop a real restriction. `any` is the wildcard and applies to
+  everything; an exact selector for the stamped facility displaces it
+  (Junos more-specific-wins). Two selectors naming the same facility are a
+  genuine conflict and still fold most-restrictive, which is what
+  `TestSyslogHostMinSeverity_Merge` should have been testing all along — it was
+  asserting the cross-facility fold, i.e. the defect, so it is retargeted rather
+  than deleted.
+
+  Not fixed here, and deliberately: a client carries one facility, so a host
+  naming two mappable facilities can still honor only the one it stamps, and
+  which one that is depends on selector order. Honoring both needs a source
+  facility on the event envelope and per-facility routing.
+
+  Mutation proof, both at production-reachable sites in
+  `syslogHostMinSeverity`:
+  - fold every non-wildcard selector (`case ... == stampedFacility:` ->
+    `default:`, restoring the blind fold) — `go test -count=1 ./pkg/daemon/
+    -run TestSyslogSelector` exit=1, three assertions red including
+    `min severity = SeverityNone: ... silenced the whole destination`;
+  - drop more-specific-wins (`if exactSet {` -> `if exactSet && !wildSet {`) —
+    exit=1, `TestSyslogSelector_ExactWinsOverWildcard` red in BOTH directions,
+    so it is not satisfiable by always taking the permissive threshold.
+
+  Control at HEAD: `go test -count=1 ./pkg/daemon/ ./pkg/logging/` exit=0.
+  `go vet ./pkg/daemon/` clean. Go-only change; no dataplane binary moves, so no
+  cluster smoke is owed.
+
 ## 2026-08-21 — #5192 item 1: `WorkerUmemInner` unmapped the UMEM before deleting it
 
 - **Timestamp**: 2026-08-21 (fix/5192-umem-drop-order)
