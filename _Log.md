@@ -33,7 +33,12 @@
   omits the field), #7070 ("eight log fields" is four), #7071 (the publish
   bool is discarded while both siblings gate on theirs), #7072
   (`stopClusterComms` leaves the field naming a dead transport, pre-existing),
-  #7073 (a fabric1-only change logs four identical pairs, pre-existing).
+  #7073 (a fabric1-only change logs four identical pairs, pre-existing), and
+  #7075 (`pkg/daemon` `-race` is flaky because the test-local
+  `capturingHandler` is installed as the GLOBAL slog default and races a
+  `configstore.persistRetryLoop` goroutine leaked by an earlier test —
+  reproduced on unmodified `origin/master` at 09767cb76, 1 RED in 3 runs,
+  while this head was 3/3 green in the same probe).
 - **Validation**: `go build ./...` 0, `go vet ./...` 0 (empty output),
   `go test -count=1 ./pkg/... ./cmd/...` 0, `go test -race -count=2
   ./pkg/daemon/ ./pkg/cluster/` 0 with zero `DATA RACE` reports,
