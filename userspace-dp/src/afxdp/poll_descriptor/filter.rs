@@ -205,7 +205,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
     // #2620: pick the counter-ownership policy. `routing_eval_follows` is true
-    // ONLY on the session-MISS path, where the caller proceeds to
+    // on every path whose caller proceeds to
     // `ingress_route_table_override` after an Accept verdict from this precheck.
     // When that path is taken AND the filter is route-lookup-affecting, the
     // routing-instance evaluator runs on the Accept/defer exit and counts the
