@@ -75221,6 +75221,110 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
+  **[SUPERSEDED by the two entries below]**: the "fold to view-only" clause
+  never shipped. The #6838 review found it strands `configure` on a
+  configured-root class, so the tolerant path folds to a REPAIR FLOOR
+  ({view,configure} ∩ what the class already held) instead. Annotated in place
+  rather than rewritten — this log is append-only history, not current state.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/types_system.go, pkg/config/compiler_system.go, pkg/config/compiler_opts.go, pkg/config/compiler_tailgates.go, pkg/config/login_class_deny_5831_test.go, pkg/config/login_custom_class_4304_test.go, docs/system-login.md
+- **Timestamp**: 2026-08-05
+  **Action**: #6838 review fold — the tolerant view-only collapse stranded
+  `configure`, so it now folds to a REPAIR FLOOR ({view,configure} ∩ what the
+  class already held). `daemon_run.go` binds the configured class to any
+  matching OS user including root, so a configured-root class lost the only
+  access that could delete the offending statement while the strict gate
+  rejected every commit. Also corrected four comment/doc claims that still
+  described pre-PR behaviour.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_opts.go, pkg/config/compiler_system.go, pkg/config/compiler_tailgates.go, pkg/config/schema_system.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
+- **Timestamp**: 2026-08-05
+  **Action**: #6838 review fold r2 — the repair floor retains {view,configure},
+  so a deny AIMED AT A RETAINED BUCKET is unenforceable AND unrestricted, but
+  the warning carved out CONFIGURATION only. `deny-commands "show interfaces"`
+  targets PermView, also retained, and was silently described as restricted.
+  The warning is now generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim cannot be wider than the
+  behaviour, and states plainly that the fold reduces blast radius rather than
+  enforcing anything. Also converted permission expectations to rendered
+  strings — `PermView` is the iota ZERO value, so slice expectations could be
+  satisfied by an uninitialised element.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
+- **Timestamp**: 2026-08-13
+  **Action**: #6838 review fold r3 — the tolerant fold resolved the class to
+  mutate by NAME through a last-wins map, but pkg/cli's `resolveClassPerms`
+  returns the FIRST match, so a config spelling `class limited` twice folded an
+  object the runtime never reads. Measured through the real peer-sync ingress
+  (SyncApply -> ActiveConfig -> checkPermission): PermAll live, `request system
+  zeroize` allowed, secrets in cleartext, and a warning claiming a reduction
+  that had not happened. BOTH orderings failed open, and the pointer fix alone
+  closes only one — with the deny on the SECOND block, folding exactly the
+  offender is correct by identity and useless in effect, because the runtime
+  reads the first block. So the fold now carries the *LoginClass pointers AND
+  narrows the whole same-named cohort, making the outcome independent of the
+  reader's tie-break rule rather than matching it (matching would be a proxy
+  that rots the day resolveClassPerms changes its pick). Each half is bound by
+  its own subtest and reds on its own revert. Also: repaired the two #6662
+  packed-gate tests the master merge left RED — their fixtures carried deny
+  leaves the new strict gate refuses, and one asserted the MORE PERMISSIVE
+  advisory this PR deleted; the deny carry-through they were buying moved to a
+  new both-AST-shapes test rather than being dropped. Bound the previously
+  unguarded `range lc.MappedPermissions` advisory line. Replaced the per-leaf
+  `case` arm that recorded DenyLeavesPresent with a loginClassLeafRestrictive
+  classification table the compiler consults, plus a two-direction
+  schema-drift canary, so a restrictive leaf added to the schema cannot
+  silently default to unrestricted. Corrected two further stale references to
+  the deleted MORE PERMISSIVE advisory.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_system.go, pkg/config/compiler_system_login_gates.go, pkg/config/types_system.go, pkg/config/login_class_deny_5831_test.go, pkg/config/compiler_system_login_packed_6662_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
+- **Timestamp**: 2026-08-13
+  **Action**: #6838 review fold r4 — the tolerant fold shipped a NEW
+  operator-facing claim that was false for a class NAME shadowing a
+  system-defined one. `class super-user { permissions all; deny-commands
+  "request system zeroize"; }` warned "The class is folded from {super-user} to
+  {configure,view}" while the RBAC evaluator consulted the built-in table
+  first, so the runtime returned PermAll: zeroize allowed, secrets in
+  cleartext. Reproduced firsthand through the real peer-sync ingress on this
+  head AND on origin/master (edefb7570) — the SAME probe allows zeroize and
+  renders cleartext on both, so the runtime delta is zero and this is a message
+  defect, not a regression. Fixed as a message defect: the fold now skips a
+  name in `LoginClassPermissions`, per NAME, so the whole cohort is skipped
+  together. That also repairs a knock-on the fold had introduced — the #4304
+  advisory is the second and only other production reader of
+  `MappedPermissions` (the other being `config.ResolveClassPermissions`), and
+  folding a shadowing class had turned its "mapped to
+  {super-user}" (true, the built-in grants everything) into "mapped to
+  {configure,view}", which is the precise sentence the #6701 warning beside it
+  calls out as untrue. Both claims are now back to what #6701 found. Nothing is
+  added in their place: #6701 already states the truth for this shape in the
+  same warning list, and whether an inert definition deserves more than a
+  warning is #6701's question. Also bound three message-rendering lines this
+  round's cohort fold had added or made load-bearing, each removable with the
+  full pkg/config + pkg/cli suites green — the `seen` leaf-name dedup (only
+  reachable once the cohort's leaves were concatenated), `sort.Strings(leaves)`,
+  and `unionPerms`' dedup scan — with ONE two-block fixture whose leaves
+  duplicate across blocks, arrive out of sorted order, and whose permission
+  sets overlap, so all three degrade the same rendered string on different
+  clauses. And pinned the strict gate's report-one CHOICE, which is
+  first-appearance-of-NAME rather than of the offending BLOCK: only an
+  alpha/beta/alpha straddle distinguishes the two rules, and the choice is an
+  operator-facing message no test constrained.
+  **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  rc=0 (whole tree, 62 packages ok, zero FAIL) on the merge result. Five
+  independent revert proofs, each observed RED: removing the shadowing guard
+  reds three separate assertions (narrowed MappedPermissions, the false fold
+  claim, the narrowed advisory); removing `sort.Strings(leaves)`, the `seen`
+  dedup, or `unionPerms`' dedup each reds the rendered-message comparison; and
+  reporting `rejections[len-1]` instead of `rejections[0]` reds the ordering
+  pin with `beta`. After merging origin/master (edefb7570) every citation in
+  this round's new comments was re-checked and corrected: #5561 moved the
+  built-in-first lookup out of `pkg/cli resolveClassPerms` into
+  `config.ResolveClassPermissions`, now shared by the CLI adapter and the REST
+  surface's `pkg/authz` gate. Precedence is unchanged, so the fix's premise
+  holds on both surfaces — and it is asserted rather than assumed: the new test
+  fails with "premise changed" if a built-in ever stops answering for a
+  shadowing name. All five revert proofs were re-run on the merge result and
+  each still reds.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-08-01 16:40
 - **Action**: #6713 — a MAC-less IPsec secure tunnel (`st0`, an xfrmi) is
   skipped by `forwarding_build::populate_egress` (its `src_mac` gate is
