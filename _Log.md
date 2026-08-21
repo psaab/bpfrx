@@ -98141,3 +98141,57 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: Closed the #2419 multi-value-leaf trackers. #6659's fourteen
+  compiler arms were walked against HEAD and every one is fixed; each is also
+  COMPARED by the behavioural spelling gate (verified per-site with a
+  throwaway enumerator over `enumerateGateLeaves`, not inferred from the green
+  run), so the class is now build-enforced rather than tracked. Two adjacent
+  sites the gate reports as carrying no verdict were checked by hand and are
+  not defects: `class-of-service rewrite-rules {exp,inet-precedence}` record
+  only the rule NAME (#4316, accepted-but-inert) and `system syslog file <f>
+  archive` is a recognized-but-uncompiled modifier (#4303 S-1), so their
+  `code-points` / `archive-sites` leaves are unread in EVERY spelling.
+
+  #6714's three arms were all live at HEAD and are fixed here, plus the fourth
+  site compiler_routing.go carried as a named #6714 blind spot.
+  `firewallMatchValues` now reads every KEY of each child rather than `Keys[0]`
+  — the node's own tail was already read in full, so the identical token
+  sequence read differently depending on which side of the AST the parser put
+  it on (`flag { basic-datapath session; }` kept one flag, and
+  `then { community { add cA; } }` lost the whole action because
+  applyCommunityAction needs two tokens). `event-options … then
+  change-configuration commands` and `routing-options forwarding-table` moved
+  from `FindChild` to `FindChildren`: the parser keeps a repeated same-keyed
+  statement as a SIBLING, so the brace-authored file dropped every statement
+  after the first while the flat-set spelling — the one CLAUDE.md tells you to
+  test with — already worked.
+
+  Proxy-ARP was decided the other way and the reasoning is in
+  docs/config-schema.md: a list mixing discrete addresses with a range is not
+  authorable Junos, and #6673 pinned the fallback to master's measured install
+  set. Widening it would invent a grammar AND make an upgraded appliance answer
+  ARP for addresses it did not answer for before. The statement is now stamped
+  into `ProxyARPEntry.MalformedRangeSpecs` (`json:"-"`, mirroring
+  `NATPool.PortRangeInvalidSpec`); strict rejects at commit, tolerant warns and
+  installs exactly what it installed before. #6673's parity corpus keeps every
+  `want`/`wantInstalled` byte-identical and gains a `wantStrictReject` axis.
+
+  Validation: `go test -count=1 ./...` exit 0, `go vet ./...` exit 0. Mutation
+  matrix, one mutation per cell, exit codes captured from `$?`: revert the
+  child read to `Keys[0]` → exit 1 at the agreement assertion and both
+  end-to-end cells; `FindChildren`→`FindChild` for `commands` → exit 1;
+  ditto for `forwarding-table` → exit 1; drop the malformed-range stamp → exit
+  1 in both the new test and #6673's amended axis; stamp unconditionally →
+  exit 1 at the CONTROL rows; widen `proxyARPAddressValues` → exit 1 at
+  #6673's install-parity rows (proving the parity pin still bites after the
+  test moved to the tolerant compile). Go-only, `pkg/config`; nothing reaches
+  the Rust helper (the new field is `json:"-"` and `ReconcileProxyARP` reads
+  only `Addresses`), so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_firewall.go, pkg/config/compiler_services.go,
+  pkg/config/compiler_routing.go, pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_validate_strict_nat.go, pkg/config/types_security.go,
+  pkg/config/compiler_multivalue_leaf_6714_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md,
+  _Log.md
