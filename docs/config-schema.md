@@ -1122,6 +1122,35 @@ whole value list and the node's own tail is ignored, verbatim master behaviour;
 the tail is read only when there are no children, which is the shape master
 compiled nothing from.**
 
+**CHILDREN WIN is a rule for leaves whose tail is an IDENTIFIER, not a rule for
+every leaf (#6690).** The two `event-options` arms adopt it because in
+`<leaf> <identifier> { <value>; }` the tail names the statement and the children
+are the values, so reading the tail promotes a name into the value list.
+`system ntp server` is the opposite arrangement: the tail is the VALUE (the
+server address) and a child is a per-server OPTION. `server 1.1.1.1 { prefer; }`
+under CHILDREN WIN would compile `prefer` as the NTP server and discard
+`1.1.1.1`. `ntpServerValues` (`compiler_system.go`) therefore reads both sides
+and discriminates by TOKEN NAME instead of by side, skipping the four Junos
+per-server option keywords — `prefer`, `key`, `version`, `routing-instance` —
+together with their argument tokens, and carrying that skip count across the
+`Keys` -> `Children` boundary.
+
+Name-based discrimination is unavoidable for this leaf rather than a stylistic
+choice. Once the lexer has stripped the brackets, `server 1.1.1.1 prefer;` and
+`server [ 1.1.1.1 2.2.2.2 ];` are the SAME AST shape, so no structural rule can
+separate an option from a second server. The schema cannot separate them either:
+the leaf is `args: 1, multi: true`, which makes both `SetPath` and the block
+parser absorb trailing tokens silently, and `prefer` is a syntactically valid
+hostname that `ValidateNTPServer` accepts. Promoting it would render `prefer`
+verbatim into a chrony `server` directive — the injection surface #4902 typed
+the value to close.
+
+Before this fold the nested-block spelling `ntp { server { a; b; } }` compiled
+ZERO servers (the reader tested `len(Keys) >= 2`, which that shape never
+satisfies) and the bracket spelling kept only the first — a green commit with no
+time sync, whose symptoms (certificate validity windows, IPsec rekey scheduling,
+cross-node log correlation) surface far from the cause.
+
 #### The token boundary is a property of the GROUP, not of the tail (#6673)
 
 When a leaf's value is itself a MULTI-WORD string, "how many values does this
