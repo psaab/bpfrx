@@ -98141,3 +98141,54 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Closed the #5698 Go-side interleaving window (bounded half; the
+  full Rust pair-transaction goes to a successor). `mirrorSessionPairV4` /
+  `mirrorSessionPairV6` built the forward+reverse pair under ONE `m.mu` hold
+  (#5007) and then transmitted through `syncSessionRequestsLocked`, which drops
+  `m.mu` once but LOOPS calling `requestSessionSync` — and that took and
+  released `m.sessionMu` per request. So `m.sessionMu` was free between the
+  forward's reply and the reverse's dial: a concurrent operator clear / policy
+  invalidation / GC delete / stale-session reconcile could land INSIDE the pair,
+  and a generation-0 forward delete there removes both halves in the helper,
+  after which the pair's already-built explicit reverse re-creates a standalone
+  reverse-only permit. `syncSessionRequestsLocked`'s doc asserted the opposite
+  ("Sending both requests under a single unlock also keeps the pair's transmit
+  contiguous") — a single `m.mu` unlock says nothing about `m.sessionMu`
+  ordering; that sentence is deleted and replaced with what the unlock actually
+  buys.
+
+  Implementation: `requestSessionSync` splits into the per-request locking
+  wrapper plus `requestSessionSyncLocked` (unlocked inner, caller holds
+  `sessionMu`) with dial timeout, round-trip deadline and
+  `errSessionHelperUnreachable` wrapping unchanged. New `syncSessionPairLocked`
+  drops `m.mu` as before, takes `m.sessionMu` ONCE, drives the group through the
+  inner, releases, reacquires `m.mu`. The #5380 transport fast-fail is preserved
+  by factoring the loop into one shared `sendSessionSyncBatch` used by both
+  transmit paths. Only the two pair mirrors are repointed: the bulk delete
+  chunks (up to `sessionHelperDeleteChunk` = 256) and the authoritative
+  clear-all keep per-request locking, and a `sessionPairMaxRequests` = 2 cap
+  makes that structural — an over-cap group logs and falls back rather than
+  holding `sessionMu` across a chunk large enough to starve live installs.
+
+  Validation: `go build ./...` exit 0, `go vet ./pkg/dataplane/...` exit 0,
+  `go test -count=1 ./pkg/dataplane/userspace/...` exit 0,
+  `go test -count=1 -race -run Session ./pkg/dataplane/userspace/...` exit 0.
+  New test drives the real mirrors against a fake session socket with three
+  competing `requestSessionSync` goroutines and a 2ms per-reply hold; the hold
+  and the >1 competitor count are load-bearing (Go's mutex clears its starving
+  bit on a hand-off to the LAST waiter, so a single competitor lets the unfixed
+  loop barge and the test false-greens — the first draft did exactly that).
+  Mutation matrix, one mutation per cell, exit code read from `$?`: repoint
+  `mirrorSessionPairV4` back to `syncSessionRequestsLocked` → exit 1, V4 cell
+  only; same for `mirrorSessionPairV6` → exit 1, V6 cell only; make the over-cap
+  branch return an error instead of falling back → exit 1 on the received count.
+  Base RED reproduced 5/5, fixed GREEN 5/5. Go-only diff, no shim `.o` and no
+  protocol movement, so no cluster smoke is owed on artifact grounds; an HA
+  session-sync smoke is still the prudent lane since the changed code is on the
+  local session install path.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/session_pair_transmit_5698_test.go,
+  docs/session-sync-architecture.md, _Log.md
