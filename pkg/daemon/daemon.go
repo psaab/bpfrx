@@ -946,8 +946,10 @@ type Daemon struct {
 	// carries a verdict, not just a completion: a demotion whose rg_active
 	// clear was REJECTED by the dataplane resolves with that error so the ack
 	// is downgraded rather than reported applied (#6371).
-	failoverActuateMu   sync.Mutex
-	failoverActuateWait map[int]*failoverActuation
+	failoverActuateMu sync.Mutex
+	// The map is keyed by (RG, peer request id) so a stale request's disarm
+	// or expired wait can never evict a newer request's barrier (#6177).
+	failoverActuateWait map[failoverActuationKey]*failoverActuation
 	// failoverActuateTimeout bounds waitFailoverActuated so a demotion event
 	// that is never actuated (superseded reset, event-channel drop) downgrades
 	// the ack to failed instead of hanging the peer's failover request.
@@ -1260,7 +1262,7 @@ func New(opts Options) (*Daemon, error) {
 		localFailoverCommitReady:   make(map[int]bool),
 		localFailoverCommitTimeout: 3 * time.Second,
 		localFailoverCommitDelay:   200 * time.Millisecond,
-		failoverActuateWait:        make(map[int]*failoverActuation),
+		failoverActuateWait:        make(map[failoverActuationKey]*failoverActuation),
 		failoverActuateTimeout:     3 * time.Second,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 		applySem:                   semaphore.NewWeighted(1),

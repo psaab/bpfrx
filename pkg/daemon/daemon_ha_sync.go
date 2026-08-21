@@ -1017,9 +1017,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				// enqueues the async demotion event, so watchClusterEvents
 				// cannot actuate-and-forget before WaitFailoverApplied observes
 				// it. The applied-ack (sync layer) then waits on this barrier.
-				d.armFailoverActuation(rgID)
+				barrier := d.armFailoverActuation(rgID, reqID)
 				if err := d.cluster.ManualFailover(rgID); err != nil {
-					d.disarmFailoverActuation(rgID)
+					d.disarmFailoverActuation(rgID, reqID, barrier)
 					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
 					return err
 				}
@@ -1040,12 +1040,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs, "req_id", reqID)
 				// #5640: arm every member's fence barrier before the batch
 				// demotion enqueues its per-RG events.
+				barriers := make(map[int]*failoverActuation, len(rgIDs))
 				for _, rgID := range rgIDs {
-					d.armFailoverActuation(rgID)
+					barriers[rgID] = d.armFailoverActuation(rgID, reqID)
 				}
 				if err := d.cluster.ManualFailoverBatch(rgIDs); err != nil {
 					for _, rgID := range rgIDs {
-						d.disarmFailoverActuation(rgID)
+						d.disarmFailoverActuation(rgID, reqID, barriers[rgID])
 					}
 					slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
 					return err

@@ -14,6 +14,11 @@ import (
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
+// actuationReqID is the peer request id these tests transfer RG1 under. The
+// barrier is keyed by (RG, request), so arm and wait must name the same one
+// (#6177).
+const actuationReqID uint64 = 42
+
 // errRGActiveRejected models the dataplane refusing an rg_active write — the
 // helper is down, the control socket errored, the RG is unknown.
 var errRGActiveRejected = errors.New("helper rejected rg_active write")
@@ -95,7 +100,7 @@ func newActuationDaemon(t *testing.T, ha *actuationHA) *Daemon {
 		cluster:                    cm,
 		vrrpMgr:                    vrrp.NewManager(),
 		rgStates:                   make(map[int]*rgStateMachine),
-		failoverActuateWait:        make(map[int]*failoverActuation),
+		failoverActuateWait:        make(map[failoverActuationKey]*failoverActuation),
 		failoverActuateTimeout:     2 * time.Second,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
@@ -165,7 +170,7 @@ func TestFailoverActuation_FailedRGActiveClearDoesNotAck(t *testing.T) {
 	d := newActuationDaemon(t, ha)
 	primeRG1Primary(t, d)
 
-	d.armFailoverActuation(1)
+	d.armFailoverActuation(1, actuationReqID)
 	demoteRG1(t, d)
 
 	// Positive control: the demotion really reached the rg_active write with
@@ -177,7 +182,7 @@ func TestFailoverActuation_FailedRGActiveClearDoesNotAck(t *testing.T) {
 		t.Fatalf("SetRGActive wrote active=%v, want false (a demotion clears rg_active)", active)
 	}
 
-	err := d.waitFailoverActuated(1)
+	err := d.waitFailoverActuated(1, actuationReqID)
 	if err == nil {
 		t.Fatal("waitFailoverActuated returned nil after a FAILED rg_active clear: " +
 			"the applied-ack would tell the peer to promote while this node may still forward (#6371)")
@@ -200,13 +205,13 @@ func TestFailoverActuation_SucceededRGActiveClearAcks(t *testing.T) {
 	d := newActuationDaemon(t, ha)
 	primeRG1Primary(t, d)
 
-	d.armFailoverActuation(1)
+	d.armFailoverActuation(1, actuationReqID)
 	demoteRG1(t, d)
 
 	if got := ha.writeCount(); got != 1 {
 		t.Fatalf("SetRGActive call count = %d, want 1", got)
 	}
-	if err := d.waitFailoverActuated(1); err != nil {
+	if err := d.waitFailoverActuated(1, actuationReqID); err != nil {
 		t.Fatalf("waitFailoverActuated = %v, want nil after a successful clear", err)
 	}
 }
@@ -220,9 +225,9 @@ func TestFailoverActuation_ParkedWaiterSeesFailure(t *testing.T) {
 	d := newActuationDaemon(t, ha)
 	primeRG1Primary(t, d)
 
-	d.armFailoverActuation(1)
+	d.armFailoverActuation(1, actuationReqID)
 	errCh := make(chan error, 1)
-	go func() { errCh <- d.waitFailoverActuated(1) }()
+	go func() { errCh <- d.waitFailoverActuated(1, actuationReqID) }()
 	// Give the waiter time to park on the barrier. The assertion holds for
 	// either ordering — a waiter that has not parked yet takes the
 	// consume-after-resolution path and reads the same verdict.
@@ -254,7 +259,7 @@ func TestFailoverActuation_UnarmedRGIsNoop(t *testing.T) {
 	// No armFailoverActuation: this is an ordinary local demotion.
 	demoteRG1(t, d)
 
-	if err := d.waitFailoverActuated(1); err != nil {
+	if err := d.waitFailoverActuated(1, actuationReqID); err != nil {
 		t.Fatalf("waitFailoverActuated on an unarmed RG = %v, want nil", err)
 	}
 }
