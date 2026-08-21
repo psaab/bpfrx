@@ -79949,3 +79949,68 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
   pkg/daemon/daemon_run_servers.go, pkg/daemon/hostname_stale_cert_6827_test.go,
   pkg/daemon/management_nilpublish_5561_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-08-20
+- **Action**: #6827 round 10 — bind the `dead`-before-drain ORDER (BLOCKING F1), make
+  `serveBound` run the real drain (F5), add `x/net/http2/h2c` to the hijacker map and
+  record how that map was DERIVED (F3), stop `assertSevered` reading through a poisoned
+  chunked body (F4), and correct the refuted `legDrainTimeout` sentence that was still
+  living inside its own guard (F2).
+  **F1 was a total survivor.** Moving `leg.dead.Store(true)` below `drainLeg(srv)` in
+  serveLegLocked's serve-exit arm left `go test -count=1 ./pkg/api/` AND `./pkg/daemon/`
+  at rc 0. Nothing could see it: every existing dead-leg cell
+  (`TestUnexpectedServeExitLeavesADeadInstalledLeg_6827`,
+  `TestReconcileHTTPSReplacesADeadLeg_6827`) kills a leg with NO connection, so its drain
+  returns in microseconds and both statement orders look identical there. With ONE stream
+  held open the window is the whole drain, which has no wall-clock ceiling — and for its
+  width a same-address `ReconcileHTTPS` takes the `serving()` no-op arm and returns nil
+  (so an operator commit cannot rebuild the dead leg), `reconcileTo`'s
+  `next.TLS && !HTTPSServing()` recovery term is false, and
+  `WarnStaleMgmtCertForHostName` diagnoses a certificate no socket is presenting.
+  `TestServingFlipsDuringTheDrainNotAfterIt_6827` asserts the flip within 750ms AND that
+  `drained` is still unset when it happens — the second half is what stops it passing on
+  a leg that merely finished draining, which is where the mutant also ends up.
+  **F5**: `serveBound` still held the exact shape `drainLeg` exists to fix — a bare
+  `Shutdown` under a 5s context, no `Close`. Round 9 edited its doc ("bounded 5s drain" ->
+  "5s-deadline drain") without touching the behaviour, which made README.md's
+  package-wide drain invariant FALSE about it. Fixed rather than narrowed: it is test-only
+  (`Server.Run` has no production caller), so the change is cheap, and narrowing would
+  have left the copy-hazard in the tree. `drainLeg` now RETURNS the Shutdown error so
+  serveBound reports exactly what it reported before; the two leg call sites discard it
+  explicitly. Consequence: the two servers used to share ONE 5s context; each now gets its
+  own `legDrainTimeout`.
+  **F3**: the import map said "the ones reachable from this module today" and was missing
+  `golang.org/x/net/http2/h2c` — same direct dependency (`x/net v0.48.0`), hijacks at
+  h2c.go:136/:171. A census of that module returns exactly two hijacking files
+  (`websocket/server.go`, `http2/h2c/h2c.go`), so the map CAN be complete for the current
+  dependency set; what it now records is the grep and the version it was run against,
+  which the next reader can re-run and which goes visibly stale on a bump. The outer
+  "tripwire, not a gate" claim is unchanged.
+  **F4**: `assertSevered` read through `http.Response.Body` while claiming a timeout was
+  "a reason to keep waiting". For a chunked body it cannot be — `internal/chunked`
+  stores the first error and guards its loop with `for cr.err == nil`. Measured firsthand
+  on a connection whose peer HAD closed it 2.4s earlier: the round-9 loop spun
+  **6,611,020 reads, 0 bytes, 6,611,020 timeouts** in its 3s bound and reported the
+  connection OPEN; the raw-connection loop detected EOF in **3 reads / 600.5ms**, the
+  instant the peer closed. Never a false GREEN — the three drain mutations all redded —
+  but a false RED plus a burned core. It now reads the raw conn (crypto/tls does not make
+  a deadline sticky: `readRecordOrCCS` calls `setErrorLocked` only for a non-temporary
+  `net.Error`) and the two-state label is gone, replaced by what is actually measured.
+  Also re-wrapped the three added comment lines over 100 columns.
+  Validation at the committed head: `go build ./...` rc 0; `go test -count=1 ./pkg/api/`
+  rc 0 (42.2s); `go test -count=1 ./pkg/daemon/` rc 0 (16.9s); `go test -count=1 -race
+  -run _6827 ./pkg/api/ ./pkg/daemon/` rc 0. Mutation matrix, each cell run over the WHOLE
+  package with an always-failing sentinel so a survivor cannot be confused with a suite
+  that never ran: MUT-1 (`dead.Store` moved below `drainLeg`) rc 1 — the only non-sentinel
+  failure out of 445 top-level cells is `TestServingFlipsDuringTheDrainNotAfterIt_6827`
+  ("HTTPSServing() was STILL true 750.1ms after the listening socket died, drained=false"),
+  which confirms the survivor claim firsthand: 444 other cells stay green. MUT-2
+  (serveBound reverted to a shared-context bare `Shutdown`) rc 1 — the only non-sentinel
+  failure is `TestServeBoundSeversInFlightResponses_6827` ("still OPEN 3s later, 1395
+  reads, 35240 bytes, 0 read timeouts, bytes arrived during the wait"), so the stream was
+  genuinely still being delivered rather than merely quiet. Pristine control: both cells
+  PASS, sentinel FAILS. Production files restored byte-for-byte (sha256 verified) after
+  each cell. No `.o`, no `userspace-xdp/`, no protocol/wire file touched.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/api/drain_scope_6827_test.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go

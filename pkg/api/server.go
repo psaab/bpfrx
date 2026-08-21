@@ -848,7 +848,8 @@ func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
 // The swap reaches every LIVE leg at once (they read s.auth through their slots)
 // and reaches each RETIRING leg only as a TIGHTENING (#5561 round 14). A leg
 // that a reconcile replaced is still accepting and serving for the width of its
-// drain (whose width is not a fixed bound — see legDrainTimeout), and the address it is serving is one the committed config asked
+// drain (whose width is not a fixed bound — see legDrainTimeout), and the
+// address it is serving is one the committed config asked
 // to leave: a revocation must still land there, a grant must not, and a nil must
 // not — the clamp that licenses a nil was evaluated against the address the
 // commit BOUND, not the one it retired.
@@ -986,9 +987,23 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, 
 }
 
 // serveBound serves already-bound listeners until ctx is cancelled or a listener
-// terminates with an error, then shuts BOTH down under a 5s-deadline drain and
-// joins both serve goroutines before returning (#5058 lifecycle, extracted for
-// the #5866 Start/Run split).
+// terminates with an error, then DRAINS both (drainLeg: graceful Shutdown, then
+// force-close what the deadline did not finish) and joins both serve goroutines
+// before returning (#5058 lifecycle, extracted for the #5866 Start/Run split).
+//
+// It goes through drainLeg rather than calling Shutdown itself (#6827 round 10).
+// It used to hold the exact shape drainLeg exists to fix — a bare Shutdown that
+// returns at its deadline and LEAVES an in-flight response streaming — which
+// made pkg/api/README.md's package-wide drain invariant false about this
+// function and left the shape here for the next reader to copy. This path is
+// test-only today (Server.Run has no production caller; the daemon uses
+// NewServer + Start), so the change is cheap, but "no caller today" is not a
+// reason to ship the defect.
+//
+// One behavioural consequence worth stating: the two servers previously shared
+// ONE 5s context, so 5s was the budget for BOTH. Each now gets its own
+// legDrainTimeout, matching every other drain in the package and making the
+// worst case additive. legDrainTimeout is also the knob a test can shorten.
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.
@@ -1024,16 +1039,16 @@ func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) e
 	case <-ctx.Done():
 	}
 
-	// Shut down BOTH servers regardless of which path woke us. Shutdown closes
-	// the listener and unblocks the matching Serve goroutine with
-	// http.ErrServerClosed; join both so no goroutine outlives Run.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Drain BOTH servers regardless of which path woke us. Shutdown closes the
+	// listener and unblocks the matching Serve goroutine with
+	// http.ErrServerClosed; join both so no goroutine outlives Run. The
+	// Shutdown error is still what gets reported — a drain that had to sever is
+	// visible as a deadline error here, exactly as before.
 	var shutErr error
 	if s.httpsServer != nil {
-		shutErr = s.httpsServer.Shutdown(shutdownCtx)
+		shutErr = drainLeg(s.httpsServer)
 	}
-	if err := s.httpServer.Shutdown(shutdownCtx); err != nil && shutErr == nil {
+	if err := drainLeg(s.httpServer); err != nil && shutErr == nil {
 		shutErr = err
 	}
 	wg.Wait()

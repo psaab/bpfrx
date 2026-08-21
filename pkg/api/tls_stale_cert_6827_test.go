@@ -902,12 +902,15 @@ func TestDeadLegConnectionCannotOutliveRevocation_6827(t *testing.T) {
 // a fixture whose handler returns leaves nothing for the force-close to do and
 // passes with `Close` deleted — vacuously. The handler here keeps writing until
 // its connection dies, which is what makes Shutdown WAIT and then give up.
+// The fixture keeps the raw CONNECTION and not the response body: the body is a
+// chunked reader, and a chunked reader is permanently poisoned by the first read
+// deadline — see assertConnSevered (#6827 round 10). The body is still read once
+// at construction, where no deadline is in play, to establish the precondition.
 type streamFixture struct {
 	s    *Server
 	leg  *listenerLeg
 	kln  *killableLn
 	conn net.Conn
-	body io.ReadCloser
 }
 
 // newStreamFixture starts an HTTPS leg on a real loopback socket, opens one
@@ -987,14 +990,15 @@ func newStreamFixture(t *testing.T, ctx context.Context) *streamFixture {
 			"connection is ACTIVE rather than idle and the drain has something to wait on; "+
 			"first chunk read failed: %v", err)
 	}
-	return &streamFixture{s: s, leg: leg, kln: kln, conn: conn, body: resp.Body}
+	return &streamFixture{s: s, leg: leg, kln: kln, conn: conn}
 }
 
-// assertSevered drains the stream until the connection is CLOSED, and it
-// distinguishes that from "nothing arrived recently" — which is the whole
-// difficulty (#6827 round 9).
+// assertConnSevered blocks until the peer has CLOSED c, and distinguishes that
+// from "nothing arrived recently" — which is the whole difficulty (#6827
+// round 9). what names the property being asserted; it is prefixed to the
+// failure so one helper can serve several cells.
 //
-// Two ways to get this wrong, both of which this cell shipped at some point:
+// Three ways to get this wrong, all of which this helper shipped at some point:
 //
 //   - trusting ONE read. After the server closes a connection the client still
 //     returns bytes that were already buffered — measured: three reads and 19
@@ -1005,21 +1009,39 @@ func newStreamFixture(t *testing.T, ctx context.Context) *streamFixture {
 //     any kind, including the 250ms read deadline it sets itself. A stream that
 //     is merely PAUSED — open, tracked, and free to resume — passes that. The
 //     assertion has to be "the peer closed it", not "it went quiet".
+//   - reading through the RESPONSE BODY, which round 9 did while claiming a
+//     timeout was "a reason to keep waiting" (#6827 round 10). For a chunked
+//     body it cannot be: internal/chunked.chunkedReader STORES the first error
+//     and guards its loop with `for cr.err == nil`, so every later Read returns
+//     that same timeout instantly without touching the socket. Replayed against
+//     a connection the server really HAD closed, the round-9 loop spun
+//     3,066,552 times in its 3s bound, read 0 bytes, counted 3,066,552
+//     timeouts, and reported the connection open. It burned a core to reach a
+//     false RED.
 //
-// So a timeout error is not an answer, it is a reason to keep waiting; only a
-// non-timeout error (EOF, reset, use-of-closed) proves closure. If the overall
-// bound expires the cell reports WHICH of the two states it was in, because
-// "still delivering" and "open but silent" are different bugs.
-func (f *streamFixture) assertSevered(t *testing.T) {
+// So it reads the RAW connection. crypto/tls is explicit that a deadline is not
+// sticky — readRecordOrCCS calls setErrorLocked only when the error is not a
+// temporary net.Error, and a deadline is both (conn.go, go1.26) — so a timeout
+// here really is recoverable and really does mean "ask again". Only a
+// non-timeout error (EOF, reset, use-of-closed) proves closure.
+//
+// If the overall bound expires the failure reports what was MEASURED — reads,
+// bytes, timeouts, and whether any bytes arrived during the wait — and nothing
+// more. Round 9 labelled the outcome "STILL STREAMING" or "OPEN BUT SILENT"
+// from bytes-read-since-loop-start, which is a function of WHEN the loop
+// started rather than of the connection's state, so one state could earn either
+// label. The two are not distinguishable from this side and the helper no
+// longer claims to distinguish them.
+func assertConnSevered(t *testing.T, c net.Conn, what string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	buf := make([]byte, 512)
 	var total, reads, timeouts int
 	for {
-		if err := f.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
 			t.Fatalf("set read deadline: %v", err)
 		}
-		n, err := f.body.Read(buf)
+		n, err := c.Read(buf)
 		total += n
 		reads++
 		var ne net.Error
@@ -1033,17 +1055,22 @@ func (f *streamFixture) assertSevered(t *testing.T) {
 			return // the peer closed it, which is the assertion
 		}
 		if time.Now().After(deadline) {
-			state := "STILL STREAMING"
-			if timeouts > 0 && total == 0 {
-				state = "OPEN BUT SILENT (no bytes, and never closed)"
+			arrival := "no bytes arrived during the wait"
+			if total > 0 {
+				arrival = "bytes arrived during the wait"
 			}
-			t.Fatalf("the response was %s %v after the leg finished draining (%d reads, %d "+
-				"bytes, %d read timeouts): Shutdown waits for an in-flight response and gives "+
-				"up on it at the deadline, so without the force-close a leg reports drained "+
-				"while a client can still be attached to it under a policy nothing will ever "+
-				"tighten (#6827 round 8)", state, 3*time.Second, reads, total, timeouts)
+			t.Fatalf("%s: the connection was still OPEN %v later (%d reads, %d bytes, %d read "+
+				"timeouts; %s)", what, 3*time.Second, reads, total, timeouts, arrival)
 		}
 	}
+}
+
+// assertSevered is assertConnSevered aimed at this fixture's one held stream.
+func (f *streamFixture) assertSevered(t *testing.T) {
+	t.Helper()
+	assertConnSevered(t, f.conn, "Shutdown waits for an in-flight response and gives up on it "+
+		"at the deadline, so without the force-close a leg reports drained while a client can "+
+		"still be attached to it under a policy nothing will ever tighten (#6827 round 8)")
 }
 
 // TestInFlightResponseIsSeveredOnEveryLegExit_6827 is the FAIL-ON-REVERT guard
@@ -1068,11 +1095,16 @@ func (f *streamFixture) assertSevered(t *testing.T) {
 // SCOPE, because the shape of this cell suggests more than it proves: the
 // fixture holds exactly ONE connection. assertSevered's bounded wait is sound
 // for that, and it is NOT evidence of a per-leg wall-clock bound. There is no
-// such bound — legDrainTimeout caps the Shutdown, while the sever that follows
-// closes connections serially with a five-second TLS close_notify deadline
-// EACH, so the real worst case grows with connection count (see
-// legDrainTimeout). What this cell binds is that the deadline arm severs rather
-// than abandons, which is a property of the arm and holds at any N.
+// such bound, and legDrainTimeout does not supply one for EITHER phase — it is
+// a POLL deadline, and both phases put serial per-connection closes in front of
+// it: Shutdown reaches its `select { case <-ctx.Done() }` only when
+// closeIdleConns() returns false, and closeIdleConns walks the connection set
+// one at a time; the Close that follows takes no context at all and walks it
+// serially too. On an HTTPS leg each of those closes is a *tls.Conn sending
+// close_notify under a five-second write deadline of its OWN, so the real worst
+// case grows with connection count in both phases (see legDrainTimeout). What
+// this cell binds is that the deadline arm severs rather than abandons, which
+// is a property of the arm and holds at any N.
 func TestInFlightResponseIsSeveredOnEveryLegExit_6827(t *testing.T) {
 	// The deadline arm is what these cases exercise, and reaching it costs the
 	// timeout. ONE case pays the production 5s so the shipped value is exercised
@@ -1129,4 +1161,184 @@ func TestInFlightResponseIsSeveredOnEveryLegExit_6827(t *testing.T) {
 			f.assertSevered(t)
 		})
 	}
+}
+
+// TestServingFlipsDuringTheDrainNotAfterIt_6827 is the FAIL-ON-REVERT guard for
+// the ORDER of the two statements in serveLegLocked's unexpected-serve-exit arm:
+// `leg.dead.Store(true)` BEFORE `drainLeg(srv)`, not after.
+//
+// The order is load-bearing and, until round 10, entirely unbound — moving the
+// store below the drain left `go test ./pkg/api/` AND `./pkg/daemon/` green
+// (#6827 round 10). Nothing existing could see it: every other dead-leg cell
+// (TestUnexpectedServeExitLeavesADeadInstalledLeg_6827,
+// TestReconcileHTTPSReplacesADeadLeg_6827) kills a leg that has NO connection,
+// so its drain returns in microseconds and both orders look identical. The
+// window only opens when there is something to drain — which is the case this
+// whole change exists for.
+//
+// What the window costs, measured: pristine flips serving() false in ~220ns;
+// with the store moved, HTTPSServing() is still true a second later, and the
+// real width is the whole drain, which has no wall-clock ceiling (see
+// legDrainTimeout). Throughout it:
+//
+//   - ReconcileHTTPS(true, sameAddr) takes the serving() no-op arm and returns
+//     nil, so an operator commit does NOT rebuild the leg whose socket is gone;
+//   - reconcileTo's `next.TLS && !m.srv.HTTPSServing()` recovery term is false,
+//     so the reconciler above it does not even reach that call;
+//   - WarnStaleMgmtCertForHostName diagnoses a certificate no socket is
+//     presenting — the exact false positive serving() exists to prevent.
+//
+// The cell asserts BOTH halves, and the second is what stops it going vacuous:
+// serving() must go false quickly, AND it must do so while `drained` is still
+// unset. Without that, a cell could pass on a leg that simply finished draining,
+// which is the state the mutation reaches too, just later.
+func TestServingFlipsDuringTheDrainNotAfterIt_6827(t *testing.T) {
+	// Long enough that "during the drain" is unambiguous against the poll bound
+	// below, short enough that the join at the end is not a 5s tax. What the
+	// order DOES is a property of the arm, not of the number; the shipped value
+	// is pinned by TestLegDrainTimeoutDefault_6827.
+	restore := legDrainTimeout
+	t.Cleanup(func() { legDrainTimeout = restore })
+	legDrainTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newStreamFixture(t, ctx)
+	if !f.s.HTTPSServing() {
+		t.Fatal("precondition: the fixture's leg is bound and streaming, so it must report serving")
+	}
+
+	// Kill the LISTENING socket only. The held stream stays up, so the drain
+	// that follows has something to wait on and runs for the full deadline.
+	start := time.Now()
+	f.kln.kill()
+
+	const flipBound = 750 * time.Millisecond
+	for f.s.HTTPSServing() {
+		if elapsed := time.Since(start); elapsed > flipBound {
+			t.Fatalf("HTTPSServing() was STILL true %v after the listening socket died (drained=%v). "+
+				"`dead` must be stored BEFORE drainLeg, not after: the drain has no wall-clock "+
+				"ceiling, and for its whole width a same-address ReconcileHTTPS takes the "+
+				"serving() no-op arm and returns nil — so an operator commit cannot rebuild the "+
+				"leg — while WarnStaleMgmtCertForHostName diagnoses a certificate no socket is "+
+				"presenting (#6827 round 10)", elapsed, f.leg.drained.Load())
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	flip := time.Since(start)
+
+	// The observation has to be DURING the drain or it proves nothing about the
+	// order — after the drain both versions agree.
+	if f.leg.drained.Load() {
+		t.Fatalf("serving() went false after %v, but the leg had ALREADY finished draining, so "+
+			"this observation cannot tell the two statement orders apart. The fixture holds an "+
+			"endless stream and legDrainTimeout is %v, so the drain must still have been running "+
+			"here; if it was not, the fixture stopped modelling an in-flight response and this "+
+			"cell has gone vacuous (#6827 round 10)", flip, legDrainTimeout)
+	}
+
+	f.s.Wait() // join the leg goroutine so the drain does not outlive the test
+	if !f.leg.drained.Load() {
+		t.Fatal("precondition: after the serve goroutine returned the leg must report drained")
+	}
+}
+
+// TestServeBoundSeversInFlightResponses_6827 is the FAIL-ON-REVERT guard for
+// Server.serveBound's drain (#6827 round 10).
+//
+// serveBound kept the exact shape drainLeg exists to fix long after drainLeg
+// existed: a bare Shutdown under a deadline, with no Close, so an in-flight
+// response survived the shutdown that was supposed to end it. Round 9 edited its
+// doc ("bounded 5s drain" -> "5s-deadline drain") without touching the
+// behaviour, which left pkg/api/README.md's package-wide drain invariant FALSE
+// about this function and left the shape in the tree for the next reader to
+// copy.
+//
+// It is test-only today — Server.Run has no production caller, the daemon uses
+// NewServer + Start — and that is a reason it was cheap to fix, not a reason to
+// have shipped it.
+//
+// RED on revert: replace the two drainLeg calls in serveBound with
+// `s.httpServer.Shutdown(ctx)` / `s.httpsServer.Shutdown(ctx)` under a shared
+// context and the held stream outlives the call.
+func TestServeBoundSeversInFlightResponses_6827(t *testing.T) {
+	restore := legDrainTimeout
+	t.Cleanup(func() { legDrainTimeout = restore })
+	legDrainTimeout = 150 * time.Millisecond // reach the deadline arm cheaply
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind loopback listener: %v", err)
+	}
+	addr := ln.Addr().String()
+
+	// Endless, for the same reason streamFixture's handler is: Shutdown closes
+	// an IDLE connection outright, so a handler that returns leaves the
+	// force-close nothing to do and the cell passes vacuously.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	s := &Server{httpServer: &http.Server{
+		Addr: addr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			f, ok := w.(http.Flusher)
+			if !ok {
+				return
+			}
+			f.Flush()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := io.WriteString(w, "tick\n"); err != nil {
+					return // the connection went away: severed, or the test ended
+				}
+				f.Flush()
+				time.Sleep(2 * time.Millisecond)
+			}
+		}),
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.serveBound(ctx, ln, nil) }() // httpsLn is unread while httpsServer is nil
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, "GET /stream HTTP/1.1\r\nHost: "+addr+"\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response headers: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	if _, err := resp.Body.Read(make([]byte, 8)); err != nil {
+		t.Fatalf("precondition: the response must be IN FLIGHT before the shutdown, so the "+
+			"connection is ACTIVE rather than idle and the drain has something to wait on; "+
+			"first chunk read failed: %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		t.Logf("serveBound returned %v", err) // a severed drain reports its deadline; not asserted
+	case <-time.After(30 * time.Second):
+		t.Fatal("serveBound did not return after ctx cancellation")
+	}
+
+	assertConnSevered(t, conn, "serveBound returned with an in-flight response still being "+
+		"delivered: Shutdown WAITS for it and abandons it at the deadline, so without the "+
+		"force-close pkg/api/README.md's package-wide drain invariant is false about this "+
+		"function and the shape stays in the tree to be copied (#6827 round 10)")
 }

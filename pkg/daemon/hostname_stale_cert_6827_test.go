@@ -495,7 +495,8 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 // switches to STARVATION mode after a waiter has been blocked ~1ms and then
 // hands ownership directly to that waiter. So the window is improbable to
 // observe, not impossible, and B2c's GREEN is "did not observe it", not "cannot
-// be observed". The guard against that shape is structural instead: the fenced function holds the mutex with a
+// be observed". The guard against that shape is structural instead: the fenced
+// function holds the mutex with a
 // single `defer`ed unlock over a body with no intermediate release, which is
 // visible on inspection in a way an interleaving is not. The two ORDERINGS
 // inside the hold are bound behaviourally — ledger-after-syscall by

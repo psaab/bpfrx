@@ -1079,6 +1079,29 @@ under the daemon's errgroup. Nothing else imports this package.
       `TestInFlightResponseIsSeveredOnEveryLegExit_6827` across all three exits;
       deleting the `Close`, or reverting the retirement/root arm to a bare
       `Shutdown`, reds it — before round 8 both edits left the package green.
+      **`Server.serveBound` runs the same drain** (#6827 round 10). It had kept
+      the exact shape `drainLeg` exists to fix — a bare `Shutdown` under a
+      deadline with no `Close` — which made this invariant, stated package-wide,
+      FALSE about it; round 9 edited its doc ("bounded 5s drain" → "5s-deadline
+      drain") without touching the behaviour. It is test-only (`Server.Run` has
+      no production caller; the daemon uses `NewServer` + `Start`), which made
+      fixing it cheap rather than optional: narrowing the invariant instead would
+      have left the shape in the tree for the next reader to copy. Bound by
+      `TestServeBoundSeversInFlightResponses_6827`. One behavioural consequence:
+      the two servers used to share ONE 5s context, so 5s was the budget for
+      both; each now gets its own `legDrainTimeout`.
+      **On the unexpected-serve-exit arm, `dead` is stored BEFORE the drain, and
+      the ORDER is load-bearing** (#6827 round 10). `serving()` has to flip the
+      instant the socket dies, because for the whole width of the drain — which
+      has no wall-clock ceiling, see below — a same-address `ReconcileHTTPS`
+      takes the `serving()` no-op arm and returns nil, `reconcileTo`'s
+      `next.TLS && !HTTPSServing()` recovery term is false, and
+      `WarnStaleMgmtCertForHostName` diagnoses a certificate no socket is
+      presenting. Moving the store below `drainLeg` left both `pkg/api` and
+      `pkg/daemon` green until round 10: every other dead-leg cell kills a leg
+      with NO connection, whose drain returns in microseconds, so both orders
+      look identical there. `TestServingFlipsDuringTheDrainNotAfterIt_6827` holds
+      a stream open and asserts the flip happens WHILE `drained` is still unset.
       **`legDrainTimeout` bounds NEITHER the drain nor the `Shutdown` in
       wall-clock terms** — round 8 said "the Shutdown" and that was the second
       wrong version of the sentence (#6827 round 9). It is a POLL deadline
@@ -1112,7 +1135,16 @@ under the daemon's errgroup. Nothing else imports this package.
       defeated by a dependency this module ALREADY has:
       `golang.org/x/net/websocket`'s `Server` hijacks inside its own handler, so
       `mux.Handle("/ws", websocket.Handler(h))` would add the case with nothing
-      in this package's syntax to match. Reverse proxies, upgrade helpers,
+      in this package's syntax to match. That import list is DERIVED, not
+      asserted (#6827 round 10): round 9 called it "the ones reachable from this
+      module today" and it was missing `golang.org/x/net/http2/h2c`, which lives
+      in the SAME direct dependency and hijacks in `NewHandler` — mounting a real
+      `h2c.NewHandler` in a production file left the test PASSING. The map now
+      records the grep that produced it and the dependency version it was run
+      against (`golang.org/x/net v0.48.0`, which yields exactly `websocket` and
+      `http2/h2c`), so the next reader can re-run it and a version bump makes it
+      visibly stale — where an assertion of completeness just stops them looking,
+      which is what happened twice. Reverse proxies, upgrade helpers,
       aliases and reflection escape even the import check. Read a pass as "none
       of the three known forms is present". It is an AST scan rather than a text
       scan so that this documentation, and `drainLeg`'s, do not trip it — a guard

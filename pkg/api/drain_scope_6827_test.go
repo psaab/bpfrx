@@ -72,10 +72,29 @@ func TestNoHijackerInThisPackage_6827(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read package dir: %v", err)
 	}
-	// Packages whose handlers hijack internally. Not exhaustive and cannot be —
-	// see the doc above — but these are the ones reachable from this module today.
+	// Packages whose handlers hijack internally. This list is NOT exhaustive and
+	// cannot be — see the doc above — so what is recorded here is HOW it was
+	// derived, not a claim about what it covers (#6827 round 10). Round 9 wrote
+	// "the ones reachable from this module today" and that assertion was false:
+	// golang.org/x/net/http2/h2c hijacks at h2c.go:136 and :171, lives in the
+	// same direct dependency as the websocket entry below, and was missing —
+	// mounting a real h2c.NewHandler in a production file left this test PASSING.
+	// That is the second time an assertion of completeness here stopped the next
+	// reader from looking (websocket.Handler was the first).
+	//
+	// Derivation, re-runnable and visibly stale the moment a dependency moves:
+	//
+	//	grep -rl 'Hijacker\|\.Hijack()' $(go env GOMODCACHE)/golang.org/x/net@v0.48.0 \
+	//	  --include=*.go | grep -v _test.go
+	//
+	// against golang.org/x/net v0.48.0 (go.mod), which returns exactly the two
+	// files mapped below; net/http/httputil is from the standard library and is
+	// listed because ReverseProxy is the shape most likely to be reached for.
+	// Re-run it — and widen it to the other direct dependencies — before
+	// trusting the list; a version bump can add a file it never saw.
 	hijackingImports := map[string]string{
 		"golang.org/x/net/websocket": "its Server calls w.(http.Hijacker).Hijack() internally",
+		"golang.org/x/net/http2/h2c": "NewHandler hijacks for h2c upgrade and prior-knowledge",
 		"net/http/httputil":          "ReverseProxy and DumpRequest hijack for upgrades",
 	}
 	fset := token.NewFileSet()

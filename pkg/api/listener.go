@@ -161,7 +161,8 @@ func (l *listenerLeg) serving() bool {
 // close_notify under a five-second write deadline of its OWN (crypto/tls
 // conn.go closeNotify), so a peer that stalls its receive window costs up to
 // five seconds EACH, one after another, in both phases. The worst case grows
-// with the number of such connections and has no fixed ceiling. The knock-on is worth knowing before someone rediscovers it as a
+// with the number of such connections and has no fixed ceiling. The knock-on is
+// worth knowing before someone rediscovers it as a
 // hang: Server.Wait holds lifeMu across the drain, and
 // WarnStaleMgmtCertForHostName holds staleCertMu while waiting for lifeMu, so a
 // `set system host-name` racing daemon shutdown waits for whatever the drain
@@ -246,16 +247,22 @@ var legDrainTimeout = 5 * time.Second
 // you the net.Conn) and close those conns itself; otherwise the invariant here,
 // at listenerLeg.drained and in pkg/api/README.md must be narrowed to exclude
 // that endpoint.
-func drainLeg(srv *http.Server) {
+// It returns the Shutdown error so a caller that reports one can keep doing so
+// (Server.serveBound). The leg paths discard it deliberately: a leg's exit is
+// not something anybody returns, and a drain that reached its deadline and
+// severed is not a failure to report — the connections are gone either way.
+func drainLeg(srv *http.Server) error {
 	ctx, cancel := context.WithTimeout(context.Background(), legDrainTimeout)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	err := srv.Shutdown(ctx)
+	if err != nil {
 		// Deadline (or a listener-close error): stop asking and sever. NOT
 		// optional and NOT redundant — see above, and
 		// TestInFlightResponseIsSeveredOnEveryLegExit_6827, which reds if this
 		// line goes.
 		_ = srv.Close()
 	}
+	return err
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
@@ -326,13 +333,13 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 			// `drained` — set by the defer immediately below — told
 			// pruneRetiredLocked there was nothing left for a ReplaceAuth to
 			// tighten (#6827 round 7).
-			drainLeg(srv)
+			_ = drainLeg(srv)
 			return
 		case <-leg.stopCh:
 		case <-rootDone:
 		}
 		leg.stopping.Store(true)
-		drainLeg(srv)
+		_ = drainLeg(srv)
 		<-serveErr // join the Serve goroutine before the leg is considered drained
 	}()
 	return leg
