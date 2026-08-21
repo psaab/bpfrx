@@ -1734,6 +1734,24 @@ type compileOpts struct {
 	// peer-synced config that predates this gate still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientRethVRRPGroupID.
 	lenientIfNameCollision bool
+	// lenientRethMember (#6722) downgrades the redundant-ethernet membership
+	// coherence gate (validateRethMemberStrict) from a hard compile error to a
+	// cfg.Warnings entry. A reth member is an L2 port whose L3 identity — units,
+	// addresses, tunnel, zone — lives on the reth; the egress-zone answer
+	// (stampEgressZones, pkg/dataplane/userspace/interfaces.go) treats a reth and
+	// its member as ONE device on exactly that basis. A member that names itself,
+	// names an unconfigured parent, carries its own logical units, or carries its
+	// own tunnel breaks the premise, and the last two fail OPEN (an
+	// independently addressed member unit, or an independently routed tunnel
+	// endpoint, silently inherits the reth's zone). The strict commit /
+	// commit-check path hard-rejects so the incoherence is operator-visible; the
+	// tolerant load / peer-sync paths warn so an already-persisted or peer-synced
+	// config that predates this gate still BOOTS (#1960 no-brick). Bounded on the
+	// lenient path by the SAME rule the gate states: a member that is not a bare
+	// port is not a member, so the shared device has two independent claimants
+	// and its ifindex identifies no zone (fail-closed).
+	// Same doctrine as lenientIfNameCollision.
+	lenientRethMember bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2302,6 +2320,7 @@ func lenientCompileOpts() compileOpts {
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
+		lenientRethMember:                      true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,

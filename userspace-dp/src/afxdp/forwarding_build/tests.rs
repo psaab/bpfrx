@@ -2745,6 +2745,10 @@ fn egress_interface_zone_id_set_from_snapshot() {
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/1".into(),
             zone: "wan".into(),
+            // #6722: the EGRESS zone is decided by the Go builder and carried
+            // here; the helper does not re-derive it from `zone`. A snapshot
+            // that omits it is one the v5 contract cannot carry.
+            egress_zone: "wan".into(),
             ifindex: 99,
             hardware_addr: "02:00:00:00:00:99".into(),
             ..Default::default()

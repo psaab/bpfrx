@@ -38,7 +38,21 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// zones dropped from the scope. A compatibility extension that changes
 /// deny/reject COVERAGE must not be silently ignorable under an unchanged
 /// protocol version.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 4;
+///
+/// v5 (#6722): the per-interface EGRESS zone is decided by the Go builder and
+/// carried in `InterfaceSnapshot::egress_zone`; the `reth_projection` field the
+/// v4 contract carried is GONE. A DELETION cannot ride an unchanged version the
+/// way an additive field can: at v4 two binaries built either side of the change
+/// both advertise 4 and read the same bytes differently.
+///
+/// MEASURED rather than argued — the v4 Go builder's rows fed to the v5 helper
+/// on the reference cluster (`docs/ha-cluster-userspace.conf`, node 0) resolve
+/// egress zone 0 for BOTH ifindex 24 and ifindex 25, where origin/master and the
+/// v5 pair resolve `lan` and `wan`. Ifindex 25 loses a zone even the pre-#6722
+/// helper resolved, so the mixed pairing is strictly worse than either endpoint.
+/// Under `default-policy deny-all` that is a silent transit outage carrying a
+/// version number both sides agree on.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 5;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level
