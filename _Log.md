@@ -93531,3 +93531,88 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   says "Advances #4960 (bounded increment)" and #7078 is a measured residual.
   Verdict: **MERGE-READY**.
 - **File(s)**: _Log.md, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6894 r10 — fold the parent's override on #7077. The r9 NPTv6
+  hard error was a no-brick REGRESSION for one class, and the fix is a
+  NARROWING, not a revert.
+
+  **The literal instruction could not be implemented and would have re-opened
+  the block.** The brief was "hard-error when strict, warn-and-skip when
+  lenient". Two problems, the second decisive:
+  - `pkg/dataplane` has NO strict/lenient signal. `CompileConfig` receives a
+    `*config.Config` with no provenance; the distinction lives entirely in
+    `pkg/config`'s `compileOpts.lenientNPTv6`.
+  - It is not a DISCRIMINATOR, because it does not vary. MEASURED through the
+    production `ParseSetCommand` + `SetPath` path: `validateNPTv6Strict`
+    REJECTs all five malformed classes (unparseable, `+`-mask, host-bits,
+    length-mismatch, /56) and lenient RETAINS all five with the #1960 warning.
+    So a malformed rule can only ever reach `compileNPTv6` from the lenient
+    path, and "warn when lenient" == "warn always" == a full revert of the r9
+    #4960 fix, re-opening the Codex half-applied shape.
+
+  **The correct discriminator is whether the HELPER installs the rule.** Rust's
+  `parse_prefix` parses the mask with `u8::from_str` (takes a leading `+`);
+  Go's `net.ParseCIDR` is digits-only. So `fd00:9::/+48` is a Go parse ERROR
+  and a helper ACCEPT — the apply SUCCEEDS today. Every class r9 closed is one
+  the helper REFUSES, so all of them still hard-error.
+  `nptv6HelperWouldInstall` (new,
+  `pkg/dataplane/compiler_nptv6_helper_grammar.go`) mirrors `parse_prefix` plus
+  its per-rule length gate; `compileNPTv6`'s reject closure now warns-and-skips
+  when `!installed || helperInstalls`.
+
+  Skipping costs nothing observable — `compileNPTv6` writes the RETIRED eBPF
+  map surface while `buildNptv6Snapshots` copies Match/Then out of the config
+  INDEPENDENTLY, so a skipped rule still reaches the helper and is still
+  installed. Bound in `pkg/dataplane/userspace` (not asserted in prose) with a
+  #5818 scope-drop control so the assertion is not satisfied by a builder that
+  emits unconditionally.
+
+  **Mutation cells, `go vet` rc=0 on EVERY cell (no build break masked an
+  assertion), tree restored from byte-level backups + sha256 verified — no
+  `git checkout` used:**
+  - **M1 (the fix reverted, `helperInstalls := false`)**:
+    `TestHelperAcceptedNPTv6PrefixIsSkippedNotRejected_7077` +
+    `TestStrictCommitStillRejectsHelperAcceptedMalformedPrefix_7077` RED with
+    *"the apply was REJECTED for an NPTv6 rule the helper ACCEPTS, so a config
+    whose apply SUCCEEDS today now fails"*. The over-reach control and ALL
+    THREE r9 #4960 NPTv6 tests stayed GREEN — the two arms are separately
+    bound.
+  - **M2 (over-reach control, `helperInstalls := true` = full revert)**: all
+    EIGHT sub-cases of `TestHelperRefusedNPTv6PrefixStillHardErrors_7077` RED
+    plus the three r9 tests, verbatim *"compileZones RAN before the failing
+    phase was caught (1 SetZoneConfig calls)"* — i.e. it demonstrably
+    re-opens #4960. The r10 behavioural test stayed green.
+  - **M3 (drift: `+` arm dropped from the mirror)**: the parity table RED
+    naming `"2001:db8::/+48"`, AND the behavioural test RED — the drift guard
+    has a real consequence, not just a table.
+  - **M4 (constant word count, `case 64: words = 3`)**: parity table RED on the
+    /64 rows AND the over-reach control RED — a yes/no-only table would have
+    missed it, which is why word counts are asserted.
+
+  Drift for the second copy of a Rust grammar is bound, not hoped for: the
+  parity table's expected column was produced by compiling `parse_prefix`
+  VERBATIM with rustc (40 rows, 11 accepted / 29 refused, with a non-vacuity
+  guard so a one-sided table fails rather than passing under a constant
+  implementation), covering both signs, leading zeros, `_` separators,
+  non-ASCII digits, u8 overflow at 256, zones, v4-mapped literals and host
+  bits.
+
+  Docs updated as part of the contract: the "FOURTH class" paragraph in
+  `compiler_validate_4960.go` now says THREE properties keep it from
+  over-rejecting and names the grammar one, and `pkg/dataplane/README.md`'s r9
+  bullet is narrowed from "the parse class" to "the parse class the helper
+  REFUSES".
+
+  #7077 retitled and re-scoped to the Rust half (tighten `parse_prefix`'s mask
+  token to digits-only), with the three-step retirement plan for the Go mirror
+  recorded so it is not read as closed by this PR.
+
+  Validation at `f1191d1ba`+: `go build ./...` rc=0, `go vet ./...` rc=0,
+  `go test -count=1 ./...` rc=0 (62 packages ok, ZERO FAIL — no ddns flake this
+  run). Diff still Go-only; no cluster smoke owed.
+- **File(s)**: pkg/dataplane/compiler_nptv6_helper_grammar.go (new),
+  pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go (new),
+  pkg/dataplane/userspace/nat_nptv6_helper_accepted_7077_test.go (new),
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/README.md, _Log.md
