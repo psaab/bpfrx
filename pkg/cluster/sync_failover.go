@@ -441,7 +441,7 @@ func (s *SessionSync) handleRemoteFailover(conn net.Conn, rgID int, reqID uint64
 	// actuate within the bounded timeout, downgrade to failed so the peer
 	// holds rather than joining a split-brain.
 	if s.WaitFailoverApplied != nil {
-		if err := s.WaitFailoverApplied(rgID); err != nil {
+		if err := s.WaitFailoverApplied(rgID, reqID); err != nil {
 			slog.Warn("cluster sync: remote failover fence barrier failed", "rg", rgID, "req_id", reqID, "err", err)
 			s.sendFailoverResult(conn, syncMsgFailoverAck, rgID, reqID, failoverAckFailed, err.Error())
 			return
@@ -466,7 +466,7 @@ func (s *SessionSync) handleRemoteFailoverBatch(conn net.Conn, rgIDs []int, reqI
 	// handleRemoteFailover for the two-owner rationale — a batch handoff that
 	// acks before actuation opens the same window across the whole set.
 	if s.WaitFailoverAppliedBatch != nil {
-		if err := s.WaitFailoverAppliedBatch(rgIDs); err != nil {
+		if err := s.WaitFailoverAppliedBatch(rgIDs, reqID); err != nil {
 			slog.Warn("cluster sync: remote batch failover fence barrier failed", "rgs", rgIDs, "req_id", reqID, "err", err)
 			s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, failoverAckFailed, err.Error())
 			return

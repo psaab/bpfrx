@@ -97880,6 +97880,61 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/sync_failover_fence_verdict_6371_test.go,
   docs/session-sync-architecture.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: Fixed #6177 items 2 and 3 — the HA failover fence barrier is now
+  keyed by the peer's REQUEST id, not by the redundancy group alone, and its
+  arm/disarm/wait/timeout lifecycle has direct tests. Item 1 (the RETH VIP
+  removal window) stays OPEN: it is a VRRP state-machine design change, not a
+  barrier fix, and the issue keeps it.
+
+  Item 2. `disarmFailoverActuation` deleted `failoverActuateWait[rgID]` by KEY,
+  with no check that the entry was still the barrier the caller armed, and
+  `waitFailoverActuated`'s expiry called it. The responder handles every
+  `syncMsgFailover` on its own goroutine (`go s.handleRemoteFailover`, sync_conn_read.go),
+  so two transfer-out cycles for one RG can overlap: an older request's expiry
+  then deleted the slot a newer request had just armed, the newer wait found
+  nothing, `waitFailoverActuated` returned nil — "actuated" — and the node
+  replied `failoverAckApplied` for a demotion it had not performed. That is the
+  two-owner window #5640 exists to close, reached through the bookkeeping
+  instead of through the ack.
+
+  The map is now keyed by `failoverActuationKey{rgID, reqID}`;
+  `armFailoverActuation(rgID, reqID)` returns the barrier it stored and
+  `disarmFailoverActuation(rgID, reqID, b)` removes the entry only while it is
+  still that barrier, so a superseded handle — a duplicate request message
+  re-using one request id — cannot evict a live one either. reqID reaches the
+  wait through `SessionSync.WaitFailoverApplied`/`WaitFailoverAppliedBatch`,
+  whose signatures gain the request id that `OnRemoteFailover` already received
+  (no wire change; the id is already on the wire). The demotion event carries no
+  request id — it reports that this node finished demoting the RG — so
+  `resolveFailoverActuation` fans its verdict out over every request in flight
+  for that RG.
+
+  Item 3. `daemon_ha_actuation_6371_test.go` (added by #7118) covers the verdict
+  legs — success, dataplane rejection, a parked waiter, an unarmed RG — but
+  nothing covered the barrier's own lifecycle. Seven new tests in
+  `daemon_ha_actuation_barrier_6177_test.go` drive arm/disarm/wait/timeout
+  directly: the bounded-wait expiry returns a failure and drops the stranded
+  barrier, an expired request leaves a concurrent request armed, a stale handle
+  cannot disarm a re-armed request, the verdict fans out across requests, a
+  disarmed request returns immediately, the batch wait takes the first failure,
+  and concurrent resolves never double-close.
+
+  Validation: `go test -count=1 ./pkg/daemon/ ./pkg/cluster/` exit 0;
+  `go test -count=1 -race -run FailoverActuation ./pkg/daemon/` exit 0;
+  `go vet ./...` and `go build ./...` exit 0. Mutation matrix, 7/7 RED on the
+  intended assertion: key by RG only; disarm without the identity check; wait
+  returning nil on timeout; timeout leaving the barrier stranded; resolve
+  stopping at the first request; and both fence hooks called with reqID 0.
+  HA/failover code — `make test-failover` is owed before merge (not run here:
+  the loss cluster is shared and lock-protected).
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ha_sync.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_failover.go, pkg/cluster/sync_test.go,
+  pkg/cluster/sync_failover_fence_verdict_6371_test.go,
+  pkg/daemon/daemon_ha_actuation_6371_test.go,
+  pkg/daemon/daemon_ha_actuation_barrier_6177_test.go,
+  docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-21
 - **Action**: #5839 — harden the userspace helper control-socket stale-socket
   removal and type the `control-socket` leaf. The control-socket half of helper
   bring-up still did a bare `_ = os.Remove(cfg.ControlSocket)`: the path is

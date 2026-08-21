@@ -139,7 +139,7 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 	}
 }
 
-// failoverActuation is the per-RG fence-completion barrier armed before a
+// failoverActuation is the fence-completion barrier armed before a
 // remote-requested transfer-out. done is closed exactly once, when the local
 // demotion has been RESOLVED; err is the verdict (nil = the demotion actually
 // actuated, non-nil = it did not) and is written under failoverActuateMu before
@@ -150,29 +150,59 @@ type failoverActuation struct {
 	err      error
 }
 
-// armFailoverActuation registers a fence-completion barrier for rgID before a
-// remote-requested transfer-out enqueues its async demotion event. It MUST be
-// called before cluster.ManualFailover so the demotion actuation
-// (watchClusterEvents → signalFailoverActuated) cannot close-and-forget the
-// barrier before waitFailoverActuated observes it. Concurrent same-RG remote
-// failovers are excluded upstream (cluster.failoverInProgress + the sync-layer
-// failover waiters), so a single channel per RG is sufficient (#5640).
-func (d *Daemon) armFailoverActuation(rgID int) {
+// failoverActuationKey identifies ONE transfer-out request: the redundancy
+// group plus the request id the peer minted for it (SessionSync.failoverSeq).
+// Keying the barrier map on the REQUEST rather than on the RG alone is what
+// makes a stale cycle harmless — an older request's disarm, or the disarm its
+// expired wait performs, can only ever remove its own entry and never the
+// barrier a newer request for the same RG is about to block on (#6177).
+// A peer that sends no request id supplies 0, which degrades to exactly the
+// pre-#6177 one-slot-per-RG behaviour rather than failing.
+type failoverActuationKey struct {
+	rgID  int
+	reqID uint64
+}
+
+// armFailoverActuation registers a fence-completion barrier for (rgID, reqID)
+// before a remote-requested transfer-out enqueues its async demotion event. It
+// MUST be called before cluster.ManualFailover so the demotion actuation
+// (watchClusterEvents -> signalFailoverActuated) cannot close-and-forget the
+// barrier before waitFailoverActuated observes it. It returns the barrier so
+// the caller can hand the same instance back to disarmFailoverActuation: the
+// map slot is the request's, but the identity check is what keeps a superseded
+// handle from evicting a live one (#6177).
+func (d *Daemon) armFailoverActuation(rgID int, reqID uint64) *failoverActuation {
+	b := &failoverActuation{done: make(chan struct{})}
 	d.failoverActuateMu.Lock()
 	if d.failoverActuateWait == nil {
-		d.failoverActuateWait = make(map[int]*failoverActuation)
+		d.failoverActuateWait = make(map[failoverActuationKey]*failoverActuation)
 	}
-	d.failoverActuateWait[rgID] = &failoverActuation{done: make(chan struct{})}
+	d.failoverActuateWait[failoverActuationKey{rgID: rgID, reqID: reqID}] = b
 	d.failoverActuateMu.Unlock()
+	return b
 }
 
 // disarmFailoverActuation drops a barrier that will never be actuated — used
-// when ManualFailover fails to enqueue the demotion (no event will ever fire).
-// It does NOT close the channel: no waiter can be blocked on it because the
-// applied-ack path is not reached on a ManualFailover error.
-func (d *Daemon) disarmFailoverActuation(rgID int) {
+// when ManualFailover fails to enqueue the demotion (no event will ever fire),
+// and by waitFailoverActuated when its bounded wait expires. It does NOT close
+// the channel: on the ManualFailover-error path no waiter can be blocked on it
+// because the applied-ack path is not reached, and on the timeout path the
+// waiter has already given up.
+//
+// b is the barrier the caller armed. The entry is removed only when it is
+// still THAT barrier: a handle that has already been superseded by a re-arm
+// must not evict the live one, which would leave the newer request's wait
+// reading an empty slot and reporting the fence as actuated when it was not
+// (#6177). A nil handle disarms nothing.
+func (d *Daemon) disarmFailoverActuation(rgID int, reqID uint64, b *failoverActuation) {
+	if b == nil {
+		return
+	}
+	key := failoverActuationKey{rgID: rgID, reqID: reqID}
 	d.failoverActuateMu.Lock()
-	delete(d.failoverActuateWait, rgID)
+	if d.failoverActuateWait[key] == b {
+		delete(d.failoverActuateWait, key)
+	}
 	d.failoverActuateMu.Unlock()
 }
 
@@ -197,41 +227,48 @@ func (d *Daemon) signalFailoverActuationFailed(rgID int, cause error) {
 	d.resolveFailoverActuation(rgID, cause)
 }
 
-// resolveFailoverActuation completes rgID's barrier exactly once with verdict
-// cause (nil = actuated). It is idempotent: the resolved flag is set under the
-// lock, so a second demotion event for the same RG is a no-op and never
+// resolveFailoverActuation completes every armed barrier for rgID exactly once
+// with verdict cause (nil = actuated). The demotion event carries no request
+// id, and the fact it reports — this node finished demoting rgID — answers the
+// question every in-flight request for that RG is asking, so the verdict fans
+// out across the RG's entries. It is idempotent: the resolved flag is set under
+// the lock, so a second demotion event for the same RG is a no-op and never
 // double-closes. The verdict is written BEFORE the close, so any goroutine that
 // observes the close also observes the verdict.
 //
-// The barrier is left in the map rather than deleted — waitFailoverActuated
+// A resolved barrier is left in the map rather than deleted — waitFailoverActuated
 // consumes it. Deleting here would make a resolution that lands before the
 // waiter arrives read as "never armed", i.e. success, which would throw away
-// exactly the failure verdict this path exists to deliver (#6371). A re-arm
-// replaces the entry, so the map stays bounded by the RG count.
+// exactly the failure verdict this path exists to deliver (#6371).
 func (d *Daemon) resolveFailoverActuation(rgID int, cause error) {
 	d.failoverActuateMu.Lock()
-	b := d.failoverActuateWait[rgID]
-	if b == nil || b.resolved {
-		d.failoverActuateMu.Unlock()
-		return
+	var resolved []*failoverActuation
+	for key, b := range d.failoverActuateWait {
+		if key.rgID != rgID || b == nil || b.resolved {
+			continue
+		}
+		b.resolved = true
+		b.err = cause
+		resolved = append(resolved, b)
 	}
-	b.resolved = true
-	b.err = cause
 	d.failoverActuateMu.Unlock()
-	close(b.done)
+	for _, b := range resolved {
+		close(b.done)
+	}
 }
 
-// waitFailoverActuated blocks until the local demotion for rgID has been
-// resolved (barrier closed by signalFailoverActuated / -Failed) or the bounded
-// timeout elapses. A nil barrier means the RG was never armed (or an earlier
-// waiter already consumed the verdict) — return immediately. It returns nil
-// only when the demotion actually actuated: a failed actuation surfaces its
-// cause (#6371) and a barrier that never resolves surfaces a timeout. This
-// gates the remote-failover applied-ack so the peer never promotes into a
-// two-owner window (#5640).
-func (d *Daemon) waitFailoverActuated(rgID int) error {
+// waitFailoverActuated blocks until the local demotion for the (rgID, reqID)
+// transfer-out has been resolved (barrier closed by signalFailoverActuated /
+// -Failed) or the bounded timeout elapses. A nil barrier means the request was
+// never armed (or an earlier waiter already consumed the verdict) — return
+// immediately. It returns nil only when the demotion actually actuated: a
+// failed actuation surfaces its cause (#6371) and a barrier that never resolves
+// surfaces a timeout. This gates the remote-failover applied-ack so the peer
+// never promotes into a two-owner window (#5640).
+func (d *Daemon) waitFailoverActuated(rgID int, reqID uint64) error {
+	key := failoverActuationKey{rgID: rgID, reqID: reqID}
 	d.failoverActuateMu.Lock()
-	b := d.failoverActuateWait[rgID]
+	b := d.failoverActuateWait[key]
 	d.failoverActuateMu.Unlock()
 	if b == nil {
 		return nil
@@ -248,24 +285,25 @@ func (d *Daemon) waitFailoverActuated(rgID int) error {
 		// leaving it behind would let a later wait re-read a stale one.
 		d.failoverActuateMu.Lock()
 		err := b.err
-		if d.failoverActuateWait[rgID] == b {
-			delete(d.failoverActuateWait, rgID)
+		if d.failoverActuateWait[key] == b {
+			delete(d.failoverActuateWait, key)
 		}
 		d.failoverActuateMu.Unlock()
 		return err
 	case <-timer.C:
 		// Drop the stranded barrier so a later actuation event does not
-		// close an orphaned channel that no one reads.
-		d.disarmFailoverActuation(rgID)
+		// close an orphaned channel that no one reads. Identity-checked, so
+		// this expiry cannot disturb another request's live barrier (#6177).
+		d.disarmFailoverActuation(rgID, reqID, b)
 		return fmt.Errorf("timed out waiting for local fence actuation of redundancy group %d", rgID)
 	}
 }
 
-// waitFailoverActuatedBatch blocks until every RG in the batch has been fenced,
-// or returns the first RG's timeout (#5640).
-func (d *Daemon) waitFailoverActuatedBatch(rgIDs []int) error {
+// waitFailoverActuatedBatch blocks until every RG in the batch transfer-out
+// reqID has been fenced, or returns the first RG's failure verdict (#5640).
+func (d *Daemon) waitFailoverActuatedBatch(rgIDs []int, reqID uint64) error {
 	for _, rgID := range rgIDs {
-		if err := d.waitFailoverActuated(rgID); err != nil {
+		if err := d.waitFailoverActuated(rgID, reqID); err != nil {
 			return err
 		}
 	}
