@@ -5902,13 +5902,48 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
     for (label, snapshot, expected) in zone_counter_rejection_rows() {
         let prev = zone_counter_prev_state();
         // Live siblings, pre-populated the way a running coordinator's are.
+        // BOTH of them: r5 seeded only the NAT store and left `live_policy` a
+        // bare `default()`, so the policy half of this row was still exactly
+        // the empty neighbour the test exists to stop relying on, and the
+        // gaps-doc claim that residue in BOTH stores is asserted was true of
+        // one. The policy store is seeded through the PRODUCTION path — a
+        // clean build, which get-or-creates the reserved default-policy
+        // counter — rather than by poking the registry, so what it holds is
+        // what a running coordinator's holds.
         let live_policy = PolicyCounterStore::default();
         let live_nat = crate::nat::NatCounterStore::default();
         let _ = live_nat.rule_counter(7777);
+        build_forwarding_state_with_policy_counters_and_previous(
+            &ConfigSnapshot::default(),
+            &live_policy,
+            &live_nat,
+            None,
+        )
+        .expect("the empty seed snapshot must build");
+        let policy_seed = live_policy.tracked_rule_ids_for_test();
+        assert!(
+            !policy_seed.is_empty(),
+            "{label}: fixture precondition — the policy store must be LIVE \
+             (non-empty) before the rejected build, or this row proves the \
+             zone guarantee against an empty neighbour again"
+        );
         let mut snapshot = snapshot;
         snapshot.source_nat_rules = vec![crate::protocol::SourceNATRuleSnapshot {
             name: "candidate-snat".into(),
             counter_id: 4242,
+            ..Default::default()
+        }];
+        // A candidate-only POLICY rule, so the policy residue is
+        // distinguishable from the seed the way `4242` is distinguishable from
+        // `7777` on the NAT side. Without it the rejected build's policy
+        // residue equals the seed (both just the reserved default-policy
+        // counter) and no assertion here could tell a #6995 policy-side fix
+        // from the status quo.
+        snapshot.policies = vec![crate::protocol::PolicyRuleSnapshot {
+            name: "probe-rule".into(),
+            from_zone: "zone100".into(),
+            to_zone: "zone300".into(),
+            action: "permit".into(),
             ..Default::default()
         }];
 
@@ -5947,6 +5982,11 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // belt and the NAT parse as well as the residue itself — move the NAT
         // parse above `reject_duplicate_zone_ids` and this reds.
         let rejected_above_the_nat_parse = label.starts_with("#3719");
+        // The policy parse and the NAT parse are both mid-builder, and the
+        // dup-zone belt is above both, so one predicate serves both halves —
+        // but they are named separately because they are separate facts about
+        // separate call sites, and a future reorder could separate them.
+        let rejected_above_the_policy_parse = label.starts_with("#3719");
         let mut nat_ids: Vec<u32> = live_nat.snapshots().iter().map(|s| s.counter_id).collect();
         nat_ids.sort_unstable();
         let expected_nat_ids: Vec<u32> = if rejected_above_the_nat_parse {
@@ -5954,6 +5994,28 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         } else {
             vec![4242, 7777]
         };
+        let policy_ids = live_policy.tracked_rule_ids_for_test();
+        assert!(
+            policy_seed.iter().all(|id| policy_ids.contains(id)),
+            "{label}: the rejected build EVICTED a live policy counter. The \
+             #6995 residue is additive; losing a seeded id would be the \
+             DESTRUCTIVE class, which is #7010, not this one. \
+             seed={policy_seed:?} after={policy_ids:?}"
+        );
+        // The policy half of the #6995 boundary, asserted the same way as the
+        // NAT half: the candidate-only rule's counter IS left behind, and a
+        // later fix that stops leaving it reds here instead of leaving the
+        // gaps-doc claim stale. Belt-dependent for the same reason the NAT one
+        // is — the policy parse sits mid-builder, above NPTv6/filter/CoS and
+        // below the dup-zone belt.
+        let policy_residue_expected = !rejected_above_the_policy_parse;
+        assert_eq!(
+            policy_ids.iter().any(|id| id.contains("probe-rule")),
+            policy_residue_expected,
+            "{label}: the documented #6995 policy-side boundary moved. A belt \
+             BELOW the policy parse leaves the candidate rule's counter in the \
+             live store and a belt ABOVE it does not. after={policy_ids:?}"
+        );
         assert_eq!(
             nat_ids, expected_nat_ids,
             "{label}: the documented #6995 scope boundary moved. A belt BELOW \

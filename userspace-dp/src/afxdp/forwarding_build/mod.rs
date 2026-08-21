@@ -324,6 +324,29 @@ fn attach_zone_counters(
 /// `rejected_apply_does_not_prune_live_zone_counters` (`coordinator/tests.rs`)
 /// drives the worker-spawn arm and reds when this call is hoisted back into
 /// [`attach_zone_counters`].
+///
+/// # The bill for this split, stated where the code is rather than in a review
+///
+/// Moving the prune out of the build traded a STRUCTURAL guarantee for a
+/// PER-CALL-SITE OBLIGATION. While the prune rode inside the builder, every
+/// apply path got it for free by construction: there was no way to add an apply
+/// path that forgot it. Now a third apply path inherits the additive half
+/// automatically — it falls out of `attach_zone_counters`, which the build
+/// always runs — and inherits the prune ONLY if its author remembers to call
+/// this function at their commit point. Nothing enforces that: no type, no
+/// compile-time check, and no test that fails for the mere existence of an
+/// unpruned path.
+///
+/// The symptom, if it is ever forgotten: a zone deleted and later re-added
+/// RESURRECTS its pre-deletion totals, because its block was never dropped and
+/// the store is keyed by stable zone id. Operator-visible as a counter that
+/// jumps rather than starting from zero.
+///
+/// What guards it today is exactly two named tests —
+/// `committed_reconcile_prunes_zone_counters_for_removed_zones_6832` and
+/// `committed_refresh_prunes_zone_counters_for_removed_zones_6832`, one per
+/// existing call site. They bind the sites that EXIST; they cannot bind a site
+/// that does not exist yet. If you add an apply path, add its row.
 pub(in crate::afxdp) fn commit_zone_counter_prune(
     state: &ForwardingState,
     snapshot: &ConfigSnapshot,

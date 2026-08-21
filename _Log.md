@@ -1,3 +1,78 @@
+## 2026-08-20 — #5716 (9/9): the live-sibling insight, applied to only one of two siblings
+
+- **Timestamp**: 2026-08-20 (fix/5716-afxdp-api-hardening, PR #6832 review fold r6b)
+- **Action**: One test defect that undercuts the r5 test I was most pleased
+  with, one design cost written down next to the code, and one measurement I
+  owed rather than argued.
+
+  **F4 — `live_policy` was a bare `default()`.** The r5 row
+  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`
+  exists precisely because proving the zone guarantee against EMPTY sibling
+  stores proves it for a configuration that never occurs. I then seeded only
+  `live_nat` and left `live_policy` unseeded and unasserted — so the policy
+  half of that row was still exactly the empty neighbour the row was written to
+  eliminate. The insight was right and I applied it to one of the two stores.
+
+  The chargeable part is the claim, not the omission:
+  `docs/userspace-dataplane-gaps.md` said residue in "`PolicyCounterStore` AND
+  `NatCounterStore`" is now asserted "so a later fix to #6995 reds it". True for
+  NAT; a policy-side fix reds nothing.
+
+  Fixed on both axes. The policy store is seeded through the PRODUCTION path —
+  a clean build, which get-or-creates the reserved default-policy counter —
+  rather than by poking the registry, so what it holds is what a running
+  coordinator's holds. The candidate snapshot now carries a `probe-rule` policy
+  so the residue is DISTINGUISHABLE from the seed the way `4242` is from
+  `7777`; without it the rejected build's policy residue equals the seed and no
+  assertion could tell a #6995 policy-side fix from the status quo. Both halves
+  are asserted belt-by-belt: the dup-zone belt sits above both parses and
+  leaves neither, the other three sit below and leave both.
+
+  This needed a new accessor. `PolicyCounterStore` had NO reader for its
+  registry — `PolicyState::counter_snapshots` reads the PUBLISHED state's
+  rules, not the store, which is exactly why #6995 records the policy residue
+  as invisible to operators. It was invisible to tests for the same reason.
+  `tracked_rule_ids_for_test` mirrors `NatCounterStore::snapshots()` in
+  emitting an entry per stored id regardless of value, which is the property
+  that lets a test distinguish "block never created" from "store empty".
+
+  **The design cost of the r5 split, written where the code is.** Moving the
+  prune out of the build traded a STRUCTURAL guarantee for a PER-CALL-SITE
+  OBLIGATION. While the prune rode inside the builder there was no way to add
+  an apply path that forgot it. Now a third apply path inherits the additive
+  half automatically and the prune only if its author remembers — nothing
+  enforces it, not a type, not a compile-time check, not a test that fails for
+  the mere existence of an unpruned path. Symptom if forgotten: a zone deleted
+  and later re-added RESURRECTS its pre-deletion totals, because its block was
+  never dropped and the store is keyed by stable zone id. Recorded on
+  `commit_zone_counter_prune` along with the fact that the two named tests bind
+  the sites that EXIST and cannot bind one that does not exist yet.
+
+  **The r5 cells re-measured under `--no-fail-fast`, because I was asked to
+  confirm and had only an argument.** Cargo's default fail-fast stops after a
+  failing target, so a cell's denominator can be silently truncated while the
+  cell still shows a correct red — and the r5 mutually-exclusive-cells result
+  is the load-bearing evidence for the whole zone-prune split. My reasoning
+  (two bin targets, the 60-test one green in every cell, all reds in the
+  second) turned out to be right, but it was reasoning:
+
+  | cell | r5, default fail-fast | re-measured `--no-fail-fast` | targets run |
+  |---|---|---|---|
+  | CONTROL | 4266 / 0 | 4266 / 0 | 2 |
+  | MUT-B2a | 4264 / 2 | 4264 / 2, same 2 REDs | 2 |
+  | MUT-B2b | 4265 / 1 | 4265 / 1, same RED | 2 |
+  | MUT-B2c | 4265 / 1 | 4265 / 1, same RED | 2 |
+  | CONTROL2 | — | 4266 / 0 | 2 |
+
+  `targets=2` in every cell is the part that settles it: both bin targets ran,
+  so nothing was truncated and the mutual exclusivity is a claim over the
+  complete population.
+
+- **File(s)**: `userspace-dp/src/policy.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
 ## 2026-08-14 — #5716 (8/8): a guard that quantifies over the array, not the loop
 
 - **Timestamp**: 2026-08-14 (fix/5716-afxdp-api-hardening, PR #6832 review fold r6)

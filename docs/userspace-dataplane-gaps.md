@@ -245,8 +245,17 @@ counters (see below).
   `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`: it
   drives the four belts with all three stores LIVE (the other rejection tests
   pass fresh siblings, so they prove the zone guarantee only against empty
-  neighbours) and pins the residue, so a later fix to #6995 reds it instead of
-  leaving this note stale.
+  neighbours) and pins the residue in BOTH sibling stores, so a later fix to
+  either half of #6995 reds it instead of leaving this note stale.
+
+  "Both" is load-bearing and was not true when first written: the row seeded
+  only the NAT store and left the policy store a bare `default()`, so the
+  policy half was still the empty neighbour the row exists to stop relying on.
+  It now seeds the policy store through the production path (a clean build,
+  which get-or-creates the reserved default-policy counter), carries a
+  candidate-only `probe-rule` so the residue is distinguishable from the seed,
+  and asserts both halves belt-by-belt — the dup-zone belt sits above both
+  parses and leaves neither, the other three sit below and leave both.
 
 - **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting (the screen module holds per-zone
