@@ -137,8 +137,40 @@ type Capabilities struct {
 
 type LinkController interface {
 	SetDeferWorkers(bool)
-	PrepareLinkCycle()
-	NotifyLinkCycle()
+	// PrepareLinkCycle joins the AF_XDP workers so no thread touches UMEM
+	// during a link DOWN/UP. It returns an error when the join could not be
+	// completed or verified; the caller MUST NOT cycle the link in that case
+	// (#5103). A void return made a failed join indistinguishable from a
+	// successful one, so the link cycled with workers still live.
+	PrepareLinkCycle() error
+	// NotifyLinkCycle sends the "rebind" that recreates the AF_XDP workers
+	// PrepareLinkCycle joined. It is the documented inverse of "stop_workers",
+	// and the daemon uses it both to finish a cycle and to unwind an aborted
+	// one. It returns an error when the rebind did not land (#6871): a void
+	// return made a total forwarding outage — every worker stopped, ctrl off,
+	// nothing to re-arm them — indistinguishable from a clean rebind to the
+	// caller that reports the commit.
+	NotifyLinkCycle() error
+	// RenewLinkCycle extends a link-cycle lease that is already held, and does
+	// nothing when none is. The daemon calls it once per RETH member it walks
+	// so the lease's TTL bounds ONE loop iteration rather than the whole loop —
+	// there is no constant that bounds the latter, since the member count is
+	// operator-configurable up to 128 (#6871). It is part of this interface,
+	// not an optional type assertion, so a new implementation has to answer for
+	// it at compile time instead of silently no-opping the renewal.
+	RenewLinkCycle()
+	// AbandonLinkCycle drops a link-cycle lease that is still held, WITHOUT
+	// rebinding, and reports whether one was. The daemon defers it over the
+	// whole apply so a lease can never outlive the apply that took it — which
+	// is what makes the #6871 round-8 self-renewing lease safe: a heartbeat
+	// keeps a live lease alive indefinitely, so the leak case needs a
+	// guaranteed release rather than a wall-clock backstop that is also
+	// capable of expiring a cycle that is still running.
+	//
+	// Interface member, not an optional assertion, for the same reason
+	// RenewLinkCycle is: a backend that silently no-ops it would turn a leaked
+	// lease into a permanently suppressed reconcile loop.
+	AbandonLinkCycle() bool
 }
 
 type FabricID uint8
@@ -296,12 +328,28 @@ type dataPlaneLinkController struct {
 
 func (c dataPlaneLinkController) SetDeferWorkers(bool) {}
 
-func (c dataPlaneLinkController) PrepareLinkCycle() {}
+func (c dataPlaneLinkController) PrepareLinkCycle() error { return nil }
 
-func (c dataPlaneLinkController) NotifyLinkCycle() {
+// RenewLinkCycle on the eBPF-backed controller is a no-op for the same reason
+// PrepareLinkCycle is: this controller never takes a link-cycle lease, so there
+// is never one to extend.
+func (c dataPlaneLinkController) RenewLinkCycle() {}
+
+// AbandonLinkCycle on the eBPF-backed controller reports "nothing was held" for
+// the same reason: no lease is ever taken here, so there is never one to
+// abandon. The daemon's deferred call is a no-op on this backend.
+func (c dataPlaneLinkController) AbandonLinkCycle() bool { return false }
+
+// NotifyLinkCycle on the eBPF-backed controller is always a success: the
+// DataPlane-level NotifyLinkCycle it forwards to is a no-op for the eBPF
+// dataplane (eBPF programs survive a link cycle, so there is nothing to rebind
+// and nothing that can fail), and a nil dp means no dataplane is wired at all.
+// The error exists for the userspace controller, which does the real rebind.
+func (c dataPlaneLinkController) NotifyLinkCycle() error {
 	if c.dp != nil {
 		c.dp.NotifyLinkCycle()
 	}
+	return nil
 }
 
 func NewDataPlaneHAController(dp DataPlane) HAController {

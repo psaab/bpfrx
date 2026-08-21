@@ -240,15 +240,20 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// is non-zero) and the new config differs.
 	if d.cluster != nil && d.daemonCtx != nil {
 		newTransport := clusterTransportFromConfig(cfg)
-		if d.activeClusterTransport != (clusterTransportKey{}) && newTransport != d.activeClusterTransport {
+		// #6290: ONE guarded snapshot. The boot startClusterComms writes this
+		// field holding neither applySem nor clusterCommsMu, and a DHCP
+		// lease-change callback re-enters this step on a goroutine started
+		// before that write — see setActiveTransport for the full ordering.
+		active := d.activeTransport()
+		if active != (clusterTransportKey{}) && newTransport != active {
 			slog.Info("cluster: transport config changed, restarting comms",
-				"old_control", d.activeClusterTransport.ControlInterface,
+				"old_control", active.ControlInterface,
 				"new_control", newTransport.ControlInterface,
-				"old_peer", d.activeClusterTransport.PeerAddress,
+				"old_peer", active.PeerAddress,
 				"new_peer", newTransport.PeerAddress,
-				"old_fabric", d.activeClusterTransport.FabricInterface,
+				"old_fabric", active.FabricInterface,
 				"new_fabric", newTransport.FabricInterface,
-				"old_fabric_peer", d.activeClusterTransport.FabricPeerAddress,
+				"old_fabric_peer", active.FabricPeerAddress,
 				"new_fabric_peer", newTransport.FabricPeerAddress)
 			d.stopClusterComms()
 			d.startClusterComms(d.daemonCtx)

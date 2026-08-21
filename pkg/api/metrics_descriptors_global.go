@@ -1,6 +1,10 @@
 package api
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+)
 
 func (c *xpfCollector) initGlobalDescriptors() {
 	c.packetsTotal = prometheus.NewDesc(
@@ -65,6 +69,31 @@ func (c *xpfCollector) initGlobalDescriptors() {
 		"xpf_screen_drops_by_reason_total",
 		"Total packets dropped by screen/IDS checks, by reason.",
 		[]string{"reason"}, nil,
+	)
+	// #5806: 1 per zone whose configured `screen ids-option` profile does NOT
+	// resolve to a defined profile. Strict commit rejects a dangling reference,
+	// but tolerant startup/recovery, HA config-sync from a schema-skewed peer,
+	// and rolling-upgrade intervals all downgrade it to a warning — and the
+	// dataplane then applies NONE of that zone's screen checks (LAND, fragment,
+	// source-route, SYN/ICMP/UDP flood, scan/sweep, session-limit) while the
+	// active config still claims a screen is attached.
+	//
+	// The current enforcement disposition rides in the HELP text, NOT in a label.
+	// It is a global statement about the implementation — identical for every
+	// zone — so a label would carry no information, and a prose label value would
+	// hand us unbounded cardinality the day it starts to vary. The label set is
+	// exactly {zone, profile}: the two things that actually differ per series.
+	//
+	// Config-derived (no dataplane dependency), emitted BEFORE the dataplane gate
+	// in Collect. The series is present ONLY while a reference is unresolved
+	// (absent = every configured screen resolves), so `max_over_time(...)` alerts
+	// on any zone that was ever left unscreened.
+	c.screenUnresolvedProfileZones = prometheus.NewDesc(
+		"xpf_screen_unresolved_profile_zones",
+		"1 while a security zone references a screen ids-option profile that is "+
+			"not defined, labeled by zone and the referenced profile name. "+
+			"Disposition: "+dpuserspace.ScreenUnresolvedDisposition+".",
+		[]string{"zone", "profile"}, nil,
 	)
 	c.policyDeniesTotal = prometheus.NewDesc(
 		"xpf_policy_denies_total",

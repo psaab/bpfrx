@@ -25,7 +25,32 @@ func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
 		es := m.eventStream.Status()
 		status.EventStream = &es
 	}
-	m.lastStatus = *status
+	m.setLastStatusLocked(*status)
+}
+
+// setLastStatusLocked stores a helper status AND the fact that one has been
+// observed, so no caller can record the first without the second (#6691 round
+// 10).
+//
+// The pair is what lets a required-protocol gate distinguish "a helper reported
+// a version too old for this snapshot" from "no helper has reported at all" —
+// two states that both leave ConfigSnapshotProtocolVersion at a value below
+// ProtocolVersion, and only one of which is an incompatibility. Keeping them in
+// one function is deliberate: a bool maintained separately at seven assignment
+// sites is a bool that drifts, and a drifted one here silently re-arms the gate
+// on absence.
+func (m *Manager) setLastStatusLocked(status ProcessStatus) {
+	m.lastStatus = status
+	m.helperStatusObserved = true
+}
+
+// clearLastStatusLocked forgets the helper status and the observation together.
+// It is called where the helper is gone (stopLocked, a restart): a version read
+// from a process that no longer exists is not an observation about the one that
+// replaces it.
+func (m *Manager) clearLastStatusLocked() {
+	m.lastStatus = ProcessStatus{}
+	m.helperStatusObserved = false
 }
 
 func (m *Manager) Status() (ProcessStatus, error) {
@@ -75,12 +100,58 @@ func (m *Manager) CachedStatus() (ProcessStatus, bool) {
 	return m.lastStatus, true
 }
 
+// errLinkCycleInFlight refuses an operator worker-affecting verb while a RETH
+// MAC link cycle owns the dataplane (#6871).
+//
+// The three verbs below — `request chassis cluster data-plane userspace
+// forwarding|queue|binding ...` via the CLI (cli_request_chassis.go) and via
+// gRPC SystemAction (server_diag_system_action.go) — are the SIXTH producer of
+// the worker-respawn class, and the only one reachable from outside the daemon.
+// Each ends in a helper handler that calls reconcile_status_bindings
+// (handlers/forwarding.rs unconditionally on a set_forwarding_state;
+// handlers/binding.rs and handlers/queue.rs when registration_changed), which
+// reaches afxdp.reconcile and SPAWNS WORKER THREADS. Neither call site is
+// serialized on the daemon's applySem — there is no applySem use anywhere in
+// pkg/cli or pkg/grpcapi — so an operator or an automation can issue one in the
+// window PrepareLinkCycle opens: the workers are joined, and the daemon has not
+// reached setDown yet (up to externalCommandTimeout of `ethtool` per RETH
+// member). Respawned workers then meet a NIC unmapping its UMEM pages, which is
+// the use-after-unmap #5103 exists to prevent.
+//
+// The ctrl gate in applyHelperStatusLocked does NOT cover this. It correctly
+// holds ctrl.Enabled=0, but the spawn happens INSIDE the helper, before the
+// response this manager applies — so the gate cannot un-spawn what the request
+// already started.
+//
+// Scoped at the verbs rather than centrally in requestLocked deliberately:
+// requestLocked is also the transport for the link cycle's OWN "stop_workers",
+// which PrepareLinkCycle sends AFTER it takes the lease, so a central gate would
+// have to exempt exactly the requests that take and release the lease — an
+// exemption list that is silently wrong the first time a request type is added.
+//
+// Both directions are refused, not only the arming one. A disarm/deregister does
+// not spawn, but it still drives afxdp.reconcile's teardown arm across AF_XDP
+// socket state that PrepareLinkCycle has just quiesced, and whether a given
+// (registered, armed) pair reconciles at all is a per-verb helper-side detail
+// (binding.rs and queue.rs reconcile only on registration_changed, forwarding.rs
+// always). Excluding the whole window is simpler than tracking that. Nothing
+// internal is blocked by the broader scope: unlike the #5648 protocol gate
+// below — which is scoped to armed==true precisely because the daemon's own
+// disarm paths must never be refused — these three verbs have NO caller inside
+// the daemon. They are operator-interactive, and the cycle is seconds long.
+var errLinkCycleInFlight = errors.New(
+	"userspace: a RETH MAC link cycle is in flight (workers are joined and the " +
+		"NIC is cycling); retry once the cycle completes")
+
 func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	if m.linkCycleInFlight() {
+		return m.lastStatus, errLinkCycleInFlight
 	}
 	if armed && !m.lastStatus.Capabilities.ForwardingSupported {
 		if len(m.lastStatus.Capabilities.UnsupportedReasons) == 0 {
@@ -102,14 +173,32 @@ func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	// without re-checking it would re-arm the STALE accepted image and forward
 	// on a config the helper cannot represent — the fail-OPEN this closes.
 	//
-	// The gate is scoped, not a blanket refuse: ensureRequiredSnapshotProtocolLocked
-	// is a no-op unless the last-applied config requires the protocol, and it
-	// re-polls the helper first so a helper that has since upgraded (accepted a
-	// current image) still arms normally. Only armed==true is gated — the
-	// disarm paths (shutdown, disarmSnapshotProtocolFailureLocked) must never be
-	// blocked, and this mirrors the ForwardingSupported guard above.
+	// The gate is scoped, not a blanket refuse — but READ THE SCOPE CAREFULLY,
+	// because #6722 widened it. ensureRequiredSnapshotProtocolLocked is a chain
+	// of four. The first three (schedulers, persistent source NAT, scoped global
+	// zone sets) are no-ops unless the last-applied config USES the feature they
+	// name. The fourth, ensureEgressZoneProtocolLocked, takes no config at all:
+	// every snapshot carries EgressZone, so it fires for ANY last-applied
+	// config, an empty one included. What still scopes it is the OBSERVED helper
+	// version — it returns nil when no handshake has yet reported one, which is
+	// what keeps a down or still-starting helper from bricking commits (#1960).
+	//
+	// So since #6722 this call refuses an arm against a version-mismatched
+	// helper regardless of what the config contains. That is deliberate: a
+	// helper on the other side of the v5 contract cannot decode the snapshot at
+	// all, so arming it forwards on whatever stale image it holds. It does not
+	// endanger a rolling HA upgrade — each node talks only to its own helper,
+	// and both halves move together (`make cluster-deploy` / `make
+	// test-deploy`). Measured at both sites by
+	// TestEgressZoneProtocolGatesBothArmPaths_6722, which drives an EMPTY
+	// config.Config{} precisely so no sibling gate can be what answers.
+	//
+	// The chain re-polls the helper first, so one that has since upgraded
+	// (accepted a current image) still arms normally. Only armed==true is gated
+	// — the disarm paths (shutdown, disarmSnapshotProtocolFailureLocked) must
+	// never be blocked, and this mirrors the ForwardingSupported guard above.
 	if armed && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
-		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return m.lastStatus, err
 		}
 	}
@@ -136,6 +225,9 @@ func (m *Manager) SetQueueState(queueID uint32, registered, armed bool) (Process
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
 	}
+	if m.linkCycleInFlight() {
+		return m.lastStatus, errLinkCycleInFlight
+	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "set_queue_state",
@@ -160,6 +252,9 @@ func (m *Manager) SetBindingState(slot uint32, registered, armed bool) (ProcessS
 
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	if m.linkCycleInFlight() {
+		return m.lastStatus, errLinkCycleInFlight
 	}
 	var status ProcessStatus
 	req := ControlRequest{

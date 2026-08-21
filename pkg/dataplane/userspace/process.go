@@ -21,7 +21,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		var status ProcessStatus
 		if err := m.requestLocked(ControlRequest{Type: "ping"}, &status); err == nil {
 			if status.PID != 0 || status.ConfigSnapshotProtocolVersion != 0 {
-				m.lastStatus = status
+				m.setLastStatusLocked(status)
 			}
 			return nil
 		}
@@ -31,7 +31,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	if m.proc != nil {
 		m.stopLocked()
 	}
-	m.lastStatus = ProcessStatus{}
+	m.clearLastStatusLocked()
 	binary, err := findBinary(cfg.Binary)
 	if err != nil {
 		return err
@@ -119,7 +119,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 			var status ProcessStatus
 			if err := m.requestLocked(ControlRequest{Type: "ping"}, &status); err == nil {
 				if status.PID != 0 || status.ConfigSnapshotProtocolVersion != 0 {
-					m.lastStatus = status
+					m.setLastStatusLocked(status)
 				}
 				slog.Info("userspace dataplane helper started", "pid", cmd.Process.Pid, "socket", cfg.ControlSocket)
 				return nil
@@ -208,7 +208,7 @@ func (m *Manager) stopLocked() {
 		m.syncCancel = nil
 	}
 	if m.proc == nil {
-		m.lastStatus = ProcessStatus{}
+		m.clearLastStatusLocked()
 		m.bindingsBusySince = time.Time{}
 		m.lastBindingsAutoRebind = time.Time{}
 		m.sessionMirrorFailed = false
@@ -244,7 +244,7 @@ func (m *Manager) stopLocked() {
 		}
 	}
 	m.proc = nil
-	m.lastStatus = ProcessStatus{}
+	m.clearLastStatusLocked()
 	m.neighborsPrewarmed = false
 	m.ctrlEnableAt = time.Time{}
 	m.xskLivenessProven = false

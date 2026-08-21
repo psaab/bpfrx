@@ -443,28 +443,75 @@ func (d *Daemon) stopAggregator() {
 	}
 }
 
+// sethostname and hostnamePath are the kernel/disk seams of applyHostname,
+// injectable so a unit test can exercise the post-rename management-TLS
+// diagnostic (#6827) without CAP_SYS_ADMIN and without rewriting the test host's
+// /etc/hostname.
+var (
+	sethostname  = syscall.Sethostname
+	hostnamePath = "/etc/hostname"
+	// osHostname reads the CURRENT kernel host name. The stale-cert diagnostic
+	// reads it at delivery rather than storing a name at rename time (#6827).
+	osHostname = os.Hostname
+)
+
 // applyHostname sets the system hostname from system { host-name } config.
 func (d *Daemon) applyHostname(cfg *config.Config) {
 	if cfg.System.HostName == "" {
 		return
 	}
 
-	current, _ := os.Hostname()
+	// Read through the seam, not os.Hostname directly. This early return is
+	// LOAD-BEARING since #6827: the fenced rename below is reachable
+	// only past it, so without it every commit carrying an unchanged
+	// `system host-name` re-fires the debt and its delivery — and a box with a
+	// genuinely stale durable cert would emit the "does not cover the current
+	// host-name" WARN on EVERY commit. That is the diagnostic-muting failure
+	// mode hostNameLikelyAccessIdentity's own doc block exists to avoid.
+	//
+	// It also has to use osHostname so a test can present a kernel name that
+	// differs from the configured one. Reading os.Hostname here while the rest
+	// of the function reads the seam made the guard untestable and let a
+	// fixture describe a kernel state production cannot reach (#6827 r3).
+	current, _ := osHostname()
 	if current == cfg.System.HostName {
 		return
 	}
 
-	if err := syscall.Sethostname([]byte(cfg.System.HostName)); err != nil {
+	// The rename and the staleness ledger move together, under ONE hold of
+	// staleCertMu (#6827 round 7). Calling sethostname here and recording the
+	// generation afterwards left a window in which the kernel had already been
+	// renamed and nothing had recorded it, so a delivery running concurrently
+	// re-validated against an unmoved generation and emitted a diagnosis naming
+	// the host name the box had just left — the residual rounds 5 and 6 declared
+	// unclosable. It is closable: make the generation exist before the window can
+	// open. See renameHostNotingStaleMgmtCert.
+	if err := d.renameHostNotingStaleMgmtCert(cfg.System.HostName); err != nil {
 		slog.Warn("failed to set hostname", "err", err)
 		return
 	}
 
 	// Persist to /etc/hostname (DurableState: node identity must survive
 	// a power cut so the box keeps its configured name across reboot).
-	if err := fsatomic.WriteFileDurable("/etc/hostname", []byte(cfg.System.HostName+"\n"), 0644); err != nil {
+	if err := fsatomic.WriteFileDurable(hostnamePath, []byte(cfg.System.HostName+"\n"), 0644); err != nil {
 		slog.Warn("failed to write /etc/hostname", "err", err)
 	}
 	slog.Info("hostname set", "hostname", cfg.System.HostName)
+
+	// The kernel host name is one of the two identities baked into the DURABLE
+	// management TLS cert (#1916 D6), and the cert is never re-minted, so the
+	// rename above may have just made it stale. Deliver the diagnosis HERE,
+	// inline with the successful rename, rather than anywhere earlier in the
+	// apply: the management reconcile that could reload a cert runs EARLY in
+	// applyConfigLocked (before the dataplane apply, so a credential revocation
+	// survives an aborting commit) and would therefore see the OLD name. This
+	// call site is both the only one a plain host-name commit reaches and the
+	// only one where the new name is already the truth (#6827).
+	//
+	// It runs OUTSIDE the fence's hold because the delivery takes staleCertMu
+	// itself; recording and attempting stay one path because this is the sole
+	// caller of renameHostNotingStaleMgmtCert and it attempts unconditionally.
+	d.deliverStaleMgmtCertDiagnosis()
 }
 
 // isProcessDisabled checks if a Junos process name is in the disabled list.

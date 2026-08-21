@@ -49,15 +49,209 @@ userspace status) — with no dataplane change:
   transmit rate, priority, buffer, and exact flag plus the mapped queue.
 - `show class-of-service forwarding-class` — the forwarding-class to
   queue table (ID == queue, per the FC<->queue bijection).
+- `show class-of-service rewrite-rule [name <n>] [type <dscp|ieee-802.1|
+  inet-precedence|exp>]` (#6848) — the configured egress rewrite rules.
+  Added after the four above; see the next section for why it is not just
+  a fifth table.
 
 `clear class-of-service statistics` is deferred (#4228 Gap 7 note): the
 userspace CoS queue counters have no stat-reset RPC — they reset only on
 config change — so a reset path is a separate follow-up.
 
+## `show class-of-service rewrite-rule` and the inert-rule problem (#6848)
+
+The rewrite-rule view is the one Junos CoS show command the Gap 7 pass
+did not land, and it matters more now than it did then. When #4228 was
+written `rewrite-rules` held only `dscp`. Since then the config models
+three more families — `ieee-802.1` (#4228 Gap 4), `inet-precedence` and
+`exp` (#4316) — and **all three are accepted-but-inert**: they commit
+clean and have no runtime effect, because the userspace dataplane
+rewrites DSCP on egress only.
+
+That left an operator able to configure four kinds of rewrite rule,
+three of which do nothing, with no operational command to display any of
+them. The only signal was a commit-time advisory that scrolls past once
+(`pkg/config/compiler_validate_warn.go`: `ieee-802.1` at :1360,
+`inet-precedence` at :1346, `exp` at :1350).
+
+So the renderer reports **enforcement as a column**, not a footnote — with
+**three** states, not two:
+
+1. **`dscp` and bound** by some unit — actually applied on egress.
+2. **`dscp` and bound by nothing** — configured, no runtime effect. The
+   dataplane builds the rewrite table only for the rule an interface
+   references (`tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`,
+   `forwarding_build/cos.rs`), so an unbound rule rewrites nothing.
+3. **Any other code-point type** — the dataplane rewrites dscp only.
+
+State 2 was originally collapsed into state 1: `Enforced` was computed from the
+code-point TYPE alone, so an unbound dscp rule printed `Enforced: yes`. That is
+the accepted-but-inert failure class one level in — reproduced inside the
+command written to expose it — and worse than having no command, because it
+turns an unanswered question into a confidently wrong answer. Both fixtures
+omitted the interface binding and asserted `Enforced: yes`, so the tests pinned
+the defect rather than the contract; `Enforced: yes` must be **earned** by a
+real binding.
+
+Scanning `CoSInterface.Units` alone is sufficient for the bound-rule set: the
+compiler folds an interface-level binding into every configured unit
+(`applyCoSInterfaceLevelBindings`), which is why the snapshot builder iterates
+Units too.
+
+So the renderer reports **enforcement as a column**, not a footnote:
+
+```
+Rewrite rule: rw-dscp, Code point type: dscp, Enforced: yes
+  Forwarding class  Loss priority  Code point
+  best-effort       low            000000
+  premium           low            101110
+
+Rewrite rule: rw-pcp, Code point type: ieee-802.1, Enforced: no (accepted
+for Junos compatibility; the dataplane rewrites dscp only)
+  Forwarding class  Loss priority  Code point
+  premium           high           101
+```
+
+Two implementation facts worth knowing before changing this:
+
+- **The four families do not carry equal data.** `dscp` and `ieee-802.1`
+  compile to full entry lists (forwarding-class, loss-priority,
+  code-point). `inet-precedence` and `exp` record only rule NAMES
+  (`ClassOfServiceConfig.INetPrecedenceRewriteRules` / `EXPRewriteRules`)
+  — the compiler builds no runtime structure because nothing consumes
+  one. Those two render a `Code points not modeled` line rather than an
+  empty table, which would imply a fidelity the config does not have.
+  `TestShowTextCoSRewriteRuleNameOnlyFamiliesAreProducible6848` authors a
+  rule *with* a code point in real set syntax and asserts it does not
+  surface, so this stays honest if the compiler ever starts modeling
+  them.
+- **The family list lives in THREE places, and the config schema is the
+  authority.** They are `format.CoSRewriteRuleTypes`, the cmdtree `type`
+  completion children, and the renderer's own hardcoded per-family
+  branches in `FormatCoSRewriteRules`. Adding a family means editing all
+  three. Until #6858 the note here said "editing one list; the test fails
+  if the other is not updated" — that was false in the direction that
+  matters: the test compared the first two, nothing but that test read
+  `CoSRewriteRuleTypes`, and deleting `appendNameOnly("exp", …)` from the
+  renderer left the whole suite green.
+
+  Both checks now measure against `schemaClassOfService["rewrite-rules"]`
+  (`pkg/config/schema_cos.go`) — the families an operator can actually
+  commit — and both live in `pkg/cmdtree`, the only package that can see
+  the schema, the renderer and the tree at once (`pkg/config` cannot
+  import `format`, because `format` imports `config`):
+  `TestCoSRewriteRuleTypeChildrenMatchRenderer` for the two lists, and
+  `TestCoSRewriteRuleRendererCoversEverySchemaFamily`, which commits a
+  rule of every schema family and renders it, for the branches. A fifth
+  family added to the schema fails all three until it is handled.
+
+`cosRewriteRuleEnforcement` (`pkg/dataplane/userspace/format/cos_show.go`)
+is the enforced/inert mapping; it returns the rendered `Enforced:` string,
+not a bool. **A family that starts being enforced must flip there in the
+same change that drops its commit advisory**, or this command will report
+a working rewrite as inert. That biconditional is asserted over every
+committable family by
+`TestCoSInertAdvisoryAgreesWithRenderedEnforcement6858`
+(`pkg/dataplane/userspace/format`), so the two halves cannot move apart
+silently — before #6858, deleting the ieee-802.1 advisory reddened exactly
+one test, in `pkg/config`, and the formatter stayed green.
+
+`Enforced:` has THREE states, not two. For a `dscp` rule the answer also
+depends on whether anything **the dataplane will read** binds it:
+
+- **`yes`** — some CONFIGURED logical interface unit references the rule.
+- **`no (not bound — no interface unit references this rule)`** — the rule
+  is configured and nothing binds it. An unbound rule rewrites nothing:
+  the runtime table is populated only for the rule an interface
+  references (`tables.dscp_rewrite_rules.get(&iface.
+  cos_dscp_rewrite_rule)`, `forwarding_build/cos.rs`).
+- **`no (not bound — class-of-service interfaces <if> unit <n> is not a
+  configured logical interface unit)`** — the operator DID write a
+  binding, but against an interface or unit that has no `interfaces`
+  stanza (#6858 round 3).
+
+That third state is not hypothetical. `set class-of-service interfaces
+ge-9-9-9 unit 0 rewrite-rules dscp rw` COMMITS with no `interfaces
+ge-9-9-9` anywhere — one typo in an interface name, or a unit number that
+does not match the logical unit, is enough. The commit does warn
+(`compiler_validate_warn.go:1586` / `:1599`, "class-of-service interface
+%s is bound but not configured under [interfaces]"), and that advisory is
+precisely the "scrolls past once" signal this whole command exists to
+replace with a standing operational view. A warning at commit time is not
+a licence for the show command to answer the question wrongly six months
+later.
+
+**The predicate must mirror `buildInterfaceSnapshots`**
+(`pkg/dataplane/userspace/interfaces.go`). That builder walks
+`cfg.Interfaces.Interfaces` and, for each REAL logical unit, reads
+`cfg.ClassOfService.Interfaces[name].Units[unitNum]` to stamp
+`CoSDSCPRewriteRule` onto the snapshot — so `cosBoundDSCPRewriteRules`
+walks from the same side. Walking `cos.Interfaces` instead (the shape it
+had before round 3) reported `Enforced: yes` for a binding the helper can
+never see, which is the dangerous direction: it converts an unanswered
+question into a confidently wrong "DSCP remarking is happening". The
+reason names the dead reference, because an operator who did write the
+binding reads a bare "not bound" as "you forgot to bind it" and looks in
+the wrong place. `TestFormatCoSRewriteRulesDanglingInterfaceBindingIsNotEnforced6858` pins both dangling shapes plus the bound positive control.
+
+The command still answers from CONFIG, not from the live snapshot, so
+`yes` means "the dataplane is given this rule for this unit", not "this
+packet was remarked". Conditions that live only in the helper's own
+admission gate — a rewrite rule whose forwarding-classes do not intersect
+the queues the interface materializes, for instance — are out of its
+reach; see #7063.
+
 Renderers live in `pkg/dataplane/userspace/format/cos_show.go` (the
 shared SSOT used by both the local CLI in `pkg/cli` and the gRPC
 `ShowText` path in `pkg/grpcapi`); the operational-tree entries and
 tab-completion are in `pkg/cmdtree/tree.go`.
+
+### The `name` / `type` filter grammar is single-sourced (#6858)
+
+`show class-of-service classifier` and `show class-of-service
+rewrite-rule` take the same optional `name <n>` / `type <t>` filters, and
+also accept a **leading bare token** as the name (that is what completion
+offers under the command, so it is what an operator submits after
+tab-completing). All three surfaces call the same functions in
+`pkg/cmdtree/cos_filter_topic.go`:
+
+| surface | calls |
+|---|---|
+| local CLI (`pkg/cli`) | `ParseCoSNameTypeArgs` |
+| remote CLI (`cmd/cli`) | `ParseCoSNameTypeArgs` then `CoSNameTypeTopic` |
+| gRPC server (`pkg/grpcapi`) | `ParseCoSNameTypeTopic` |
+
+Before #6858 the grammar was written three times, and the two arg parsers
+had already drifted — `pkg/cli` honored a trailing `name` keyword over a
+leading bare token and `cmd/cli` did not — under a comment asking editors
+to keep the mirrored test tables in step.
+
+The topic encoding also lost data. It joined params with `,` and split on
+`,`, but a rule or classifier NAME may contain a comma: `set
+class-of-service rewrite-rules dscp "rw,x"` commits and reads back as
+`rw,x`. Remotely the name truncated at the comma, so the server rendered
+the rule named `rw` — a *different* rule — or, where `rw` named nothing,
+reported that the operator's rule did not exist. The flaw was pre-existing
+(`cos-classifier` carried it since #4228) and both commands share the one
+decoder, so #6858 fixed both.
+
+Values are now percent-escaped for `% , = :` and space, and unescaping is
+tolerant of a bare `%` that is not a valid escape. A name containing none
+of those encodes byte-identically to the old form, so ordinary topics are
+unchanged on the wire. Mixed-version behaviour for a comma-bearing name
+degrades to "no match" rather than the wrong rule — visibly wrong instead
+of confidently wrong; `cli` and `xpfd` ship together anyway.
+
+Parity is therefore one property, not a pair of mirrored tables:
+`ParseCoSNameTypeTopic` inverts `CoSNameTypeTopic`
+(`TestCoSNameTypeTopicRoundTrip6858`). The per-surface tests assert
+*wiring* — that each surface routes through these functions —
+rather than restating the grammar:
+`TestLocalCoSRewriteRuleFilterWiring6858` (`pkg/cli`, drives the real
+dispatcher), `TestCoSNameTypeTopic6848` (`cmd/cli`), and
+`TestCoSRewriteRuleLocalRemoteParity6858` (`pkg/grpcapi`), which renders
+the same operator tokens through both paths and requires identical output
+for both commands.
 
 ## How to read admission drop counters live
 

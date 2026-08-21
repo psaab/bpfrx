@@ -201,15 +201,33 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 
 	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
 	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
-	// rule with ZERO actions installs no translation (an intended `off`
-	// exemption silently disappears, revealing a later broader rule); a rule
+	// rule with ZERO actions installs no translation and is NOT terminal (an
+	// intended `off` exemption silently disappears and the traffic falls
+	// through — translated by a later broader rule if one matches, otherwise
+	// untranslated); a rule
 	// with TWO+ mutually-exclusive actions inside one block let the compiler
-	// silently pick one by packed-key/child order (an exemption can publish as a
-	// translation — the inverse of the authored action). Strict on commit /
+	// silently pick one by packed-key/child order (an exemption COULD then
+	// publish as a translation — the inverse of the authored action). Both
+	// clauses are past tense on purpose: since #5628 the compiler records every
+	// field and the dataplane resolves them by a fixed precedence, so the
+	// present-tense form of this sentence is false — see the corrected
+	// rejection text on validateNATTerminalActionCardinalityStrict (#6820).
+	// Strict on commit /
 	// commit-check (hard reject so the malformed rule is operator-visible);
-	// lenient on load / peer-sync (warn — #1960 no-brick; the dataplane is no
-	// worse than before the gate). Preserves #3850 duplicate-`then`-CONTAINER
-	// last-wins (the count reflects the winning block only).
+	// lenient on load / peer-sync (warn — #1960 no-brick). What happens on that
+	// tolerant path differs per shape: a contradiction CONTAINING `off`
+	// resolves to the EXEMPTION via `off` precedence; a contradiction WITHOUT
+	// `off` (source-NAT `interface` + `pool`) gives INTERFACE MODE precedence,
+	// producing interface translation when a suitable same-family egress
+	// address exists and a fail-closed `Unavailable` otherwise, silently
+	// discarding the pool either way; an actionless rule FALLS THROUGH — to a
+	// later broader rule if one matches, otherwise off the end of the rule list
+	// untranslated. All three are spelled out and test-cited
+	// on validateNATTerminalActionCardinalityStrict (#5717). Do not restate
+	// them as "inert", and do not compress them to "a contradiction resolves to
+	// the exemption" — that is true only for the `off`-bearing case. Preserves #3850
+	// duplicate-`then`-CONTAINER last-wins (the count reflects the winning block
+	// only).
 	if err := validateNATTerminalActionCardinalityStrict(cfg); err != nil {
 		if opts.lenientNATTerminalAction {
 			cfg.Warnings = append(cfg.Warnings,

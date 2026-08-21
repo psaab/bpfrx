@@ -707,7 +707,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// address) drops its publish instead of clobbering this epoch's state
 	// (#4958).
 	commsCtx, commsGen := d.beginClusterCommsEpoch(ctx)
-	d.activeClusterTransport = clusterTransportFromConfig(cfg)
+	d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg))
 
 	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
 	// Check mgmtVRFInterfaces first, then fall back to probing the control
@@ -1456,4 +1456,60 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 		Fabric1Interface:   cc.Fabric1Interface,
 		Fabric1PeerAddress: cc.Fabric1PeerAddress,
 	}
+}
+
+// setActiveTransport publishes the transport key of the comms epoch that
+// startClusterComms is bringing up, and activeTransport reads it back — both
+// under clusterCommsMu (#6290).
+//
+// The lock is required, not decorative. The field is written by
+// startClusterComms, which runs on the boot path (daemon_run.go) holding
+// NEITHER applySem NOR this mutex, and read by applyTailReconciles step 20,
+// which runs under applySem. A semaphore only excludes participants that take
+// it, so applySem orders the readers against each other and not against the
+// boot writer.
+//
+// The boot ordering does not close the gap either. The boot applyConfig
+// (daemon_run_bringup.go) starts the DHCP clients via reconcileDHCPClients
+// (daemon_apply_routing.go) with onDHCPAddressChange already wired
+// (daemon_run_bringup.go), and that callback re-enters applyConfig — hence
+// step 20 — on its own goroutine. Those goroutines are created BEFORE the boot
+// startClusterComms write, so goroutine creation orders them the wrong way and
+// establishes no happens-before from the write to their reads. A lease
+// arriving in that window is an unsynchronized concurrent read/write of a
+// six-string struct: a real Go data race, not a theoretical one. The same
+// hazard on mgmtVRFInterfaces (#5113, see daemon.go) has the mirror shape —
+// written under applySem, read by the same callback without it — and was fixed
+// the same way.
+//
+// activeTransport also returns ONE snapshot, so step 20's comparison and the
+// eight fields it logs all describe a single epoch rather than up to six
+// separate reads that a concurrent restart could interleave.
+//
+// setActiveTransportIfCurrent is epoch-gated rather than a bare locked store,
+// mirroring publishSessionSyncIfCurrent. The same window that makes the race
+// reachable also admits two concurrent startClusterComms calls (the boot one
+// and a DHCP-callback-driven restart from step 20). Both would bump the epoch
+// and both would publish; with an ungated store the LOSER of that ordering can
+// land last, leaving the transport key describing a superseded epoch while
+// clusterCommsGen names the live one. Step 20 would then compare the next
+// commit against the wrong baseline and either skip a needed comms restart or
+// perform a spurious one. Gating on gen makes a superseded publish drop
+// instead, exactly as the #4958 fields do.
+func (d *Daemon) setActiveTransportIfCurrent(gen uint64, k clusterTransportKey) bool {
+	d.clusterCommsMu.Lock()
+	defer d.clusterCommsMu.Unlock()
+	if gen != d.clusterCommsGen {
+		slog.Debug("cluster: dropping stale transport publish (comms epoch superseded)",
+			"publish_gen", gen, "current_gen", d.clusterCommsGen)
+		return false
+	}
+	d.activeClusterTransport = k
+	return true
+}
+
+func (d *Daemon) activeTransport() clusterTransportKey {
+	d.clusterCommsMu.Lock()
+	defer d.clusterCommsMu.Unlock()
+	return d.activeClusterTransport
 }

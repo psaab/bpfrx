@@ -1734,6 +1734,24 @@ type compileOpts struct {
 	// peer-synced config that predates this gate still BOOTS (#1960 no-brick).
 	// Same doctrine as lenientRethVRRPGroupID.
 	lenientIfNameCollision bool
+	// lenientRethMember (#6722) downgrades the redundant-ethernet membership
+	// coherence gate (validateRethMemberStrict) from a hard compile error to a
+	// cfg.Warnings entry. A reth member is an L2 port whose L3 identity — units,
+	// addresses, tunnel, zone — lives on the reth; the egress-zone answer
+	// (stampEgressZones, pkg/dataplane/userspace/interfaces.go) treats a reth and
+	// its member as ONE device on exactly that basis. A member that names itself,
+	// names an unconfigured parent, carries its own logical units, or carries its
+	// own tunnel breaks the premise, and the last two fail OPEN (an
+	// independently addressed member unit, or an independently routed tunnel
+	// endpoint, silently inherits the reth's zone). The strict commit /
+	// commit-check path hard-rejects so the incoherence is operator-visible; the
+	// tolerant load / peer-sync paths warn so an already-persisted or peer-synced
+	// config that predates this gate still BOOTS (#1960 no-brick). Bounded on the
+	// lenient path by the SAME rule the gate states: a member that is not a bare
+	// port is not a member, so the shared device has two independent claimants
+	// and its ifindex identifies no zone (fail-closed).
+	// Same doctrine as lenientIfNameCollision.
+	lenientRethMember bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2022,19 +2040,32 @@ type compileOpts struct {
 	// (validateNATTerminalActionCardinalityStrict) from a hard compile error to
 	// a cfg.Warnings entry. A NAT rule whose complete `then {}` block carries
 	// ZERO terminal actions (actionless — the snapshot builder installs no
-	// translation, so an intended `off` exemption silently disappears and a
-	// later broader rule is revealed) or TWO+ mutually-exclusive actions inside
-	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
-	// picks one by packed-key / child order, so an exemption can publish as a
-	// translation) was previously accepted. The strict commit / commit-check
+	// translation and the rule does not stop evaluation, so an intended `off`
+	// exemption silently disappears and the traffic falls through: translated by
+	// a later broader rule if one matches, otherwise left untranslated) or TWO+
+	// mutually-exclusive actions inside
+	// one block (`off` + `pool`, `interface` + `pool` — before #5628 the compiler
+	// picked one by packed-key / child order; it now records every field and the
+	// DATAPLANE resolves the rule by a fixed precedence, so all but one authored
+	// action is silently discarded) was previously accepted. The strict commit /
+	// commit-check
 	// path hard-rejects so the malformed rule is operator-visible; the tolerant
 	// load / peer-sync paths downgrade to a warning so an already-persisted or
 	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
-	// closed-on-load class) — a leniently-loaded actionless rule is inert, and a
-	// contradictory one now records BOTH fields (the else-if→if setter change),
-	// so the Rust dataplane's off-precedence governs its resolution (off wins →
-	// exempt), unifying the hierarchical path with the pre-existing flat-set
-	// both-fields behavior rather than the old Go single-field child-order pick.
+	// closed-on-load class) — a leniently-loaded actionless rule is NOT inert
+	// (see the ZERO-actions wording above), though HOW it fails to be inert
+	// differs by kind: source NAT EMITS the rule and the Rust matcher's `else`
+	// arm continues past it, destination NAT SKIPS it in the builder. Either way
+	// the traffic falls through rather than being exempted. A contradictory rule
+	// records EVERY authored field (the else-if→if setter change) — two of them,
+	// or three for `interface` + `off` + `pool` — unifying the hierarchical path
+	// with the pre-existing flat-set behavior rather than the old Go
+	// single-field child-order pick. Resolution is then by a FIXED precedence,
+	// which is off-precedence only when the contradiction CONTAINS `off`:
+	// `interface` + `pool` carries none, and interface mode wins there while the
+	// authored pool is discarded (#6820 round 3 — the earlier "off-precedence
+	// governs" wording was quantified over all contradictions and is false for
+	// that pair).
 	// Only a malformed rule reaches this — the strict commit path rejects it.
 	// Duplicate `then` CONTAINERS remain #3850 last-wins (the gate counts the
 	// winning block only). Same doctrine as lenientNATMixedScope.
@@ -2137,6 +2168,21 @@ type compileOpts struct {
 	// with a deterministic warning. Same doctrine as lenientNonNumericUnit
 	// (#5829); this closes the residual #5829 deferred to #5933.
 	lenientInterfaceUnitRef bool
+
+	// lenientLoginClassDeny (#5831) downgrades the custom-login-class
+	// restrictive-regex gate (deny-commands / deny-configuration, which xpf's
+	// coarse RBAC does not enforce) from a hard compile error to a
+	// cfg.Warnings entry PLUS a restrictive fold of the affected class's mapped
+	// permissions. Set ONLY on the tolerant load / peer-sync paths so a config
+	// persisted before this gate existed — or synced from a peer running older
+	// code — still BOOTS (#1960 no-brick). Unlike most lenient flags this one
+	// is not warn-and-continue-unchanged: leaving the permission set intact
+	// would preserve exactly the fail-open the strict gate rejects, so the
+	// tolerant path resolves the un-enforceable restriction in the RESTRICTIVE
+	// direction instead — bounded by a repair floor, because a class the
+	// console operator is bound to must keep the access that deletes the
+	// statement. See foldLoginClassDenyToRepairableFloor.
+	lenientLoginClassDeny bool
 
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
@@ -2274,6 +2320,7 @@ func lenientCompileOpts() compileOpts {
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
+		lenientRethMember:                      true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -2296,5 +2343,6 @@ func lenientCompileOpts() compileOpts {
 		lenientCoSNumericCodePoint:             true,
 		lenientNonNumericUnit:                  true,
 		lenientInterfaceUnitRef:                true,
+		lenientLoginClassDeny:                  true,
 	}
 }

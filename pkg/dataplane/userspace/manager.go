@@ -103,8 +103,19 @@ type Manager struct {
 	neighborReplaceGen uint64
 	syncCancel         context.CancelFunc
 	lastStatus         ProcessStatus
-	lastSnapshot       *ConfigSnapshot
-	lastApply          *dataplane.ApplyResult
+	// helperStatusObserved records that a helper status has been decoded at
+	// least once in this Manager's life — i.e. that lastStatus describes a
+	// helper we actually heard from rather than a zero value (#6691 round 10).
+	//
+	// It exists because a required-protocol gate must arm on an OBSERVED
+	// too-old version and never on the ABSENCE of one, and
+	// lastStatus.ConfigSnapshotProtocolVersion == 0 cannot tell those apart: it
+	// is equally "no helper has ever answered" and "a helper answered without
+	// the field". Both are < ProtocolVersion, and only the second is an
+	// incompatibility. Guarded by m.mu, like lastStatus itself.
+	helperStatusObserved bool
+	lastSnapshot         *ConfigSnapshot
+	lastApply            *dataplane.ApplyResult
 	// lastSnapshotRejectReasons holds the #3261 diagnostic: the reasons the
 	// most recently built snapshot carries unrepresentable policy content that
 	// the helper integrity preflight rejects (previous-good retained, or
@@ -262,6 +273,33 @@ type Manager struct {
 	lastRGActivateTime time.Time     // wall clock of last update_ha_state; statusLoop skips HA sync for 2s
 
 	rgTransitionInFlight atomic.Bool // set before syncHAStateLocked, cleared on completion
+
+	// linkCycleLeaseUntil is the #6871 link-cycle lease: the deadline until
+	// which an in-flight RETH MAC link DOWN/UP owns the dataplane, or 0 when no
+	// cycle is in flight. The unit is MONOTONIC nanoseconds since
+	// linkCycleLeaseEpoch, not UnixNano — a wall-clock deadline would let an NTP
+	// step expire a live lease or strand a dead one (#6871 round 6). See the lease
+	// block in process_linkcycle.go for what it suppresses, why a deadline
+	// rather than a bare flag, and why the daemon renews it per RETH member.
+	//
+	// atomic, and for exactly the reason rgTransitionInFlight above is: the
+	// guard has to survive m.mu being RELEASED. PrepareLinkCycle joins the
+	// workers and returns, dropping m.mu while the daemon takes the NIC down —
+	// and every other holder of m.mu is free to run in that window, including
+	// the 1 Hz status tick, which has four independent ways to undo the join
+	// before the link comes back up.
+	linkCycleLeaseUntil atomic.Int64
+
+	// linkCycleHB owns the #6871 round-8 lease heartbeat: the goroutine that
+	// renews a live lease on a FIXED period, so the interval the TTL has to
+	// cover is a constant instead of a function of operator-controlled
+	// cardinality. See linkCycleLeaseHeartbeat in process_linkcycle.go.
+	//
+	// Its own mutex, not m.mu: acquire/release run under m.mu in production but
+	// not in tests, and the heartbeat goroutine must never need m.mu (it calls
+	// RenewLinkCycle, which is pure atomics) or stopping it from under m.mu
+	// would deadlock.
+	linkCycleHB linkCycleHeartbeat
 
 	// neighborPrewarmInFlight is the #5104 singleflight guard for the async
 	// neighbor-resolve prewarm scan spawned by the status loop. The loop kicks

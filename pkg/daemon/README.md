@@ -451,7 +451,7 @@ credential revocation is enforced even on an apply that returns early
       `m.cur` is loopback so the committed nil is what publishes, and
       `api.authSlot.tighten` drops a nil `next` by design. Without the
       pre-rebind publish the pin captures the credential the operator DELETED,
-      and it keeps authenticating on the routable address for the whole bounded
+      and it keeps authenticating on the routable address for the whole
       drain plus every keep-alive connection already accepted. Pinned by
       `TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561`, which is the
       only case in the package where this nil-direction rebind converges — every
@@ -502,6 +502,22 @@ credential revocation is enforced even on an apply that returns early
     `ReconcileHTTPS` was never called again. `startTo` now adopts the server
     whether or not the bind succeeded, and asks `api.Server.HTTPSServing()`
     rather than inferring convergence from a nil error.
+  - **A converged fingerprint is not a live listener** (#6827 round 6). The
+    same inference failed in the STEADY state, not just at boot: an HTTPS serve
+    loop that terminates unexpectedly marks its leg `dead` and leaves it
+    INSTALLED (it cannot be unlinked there without taking `lifeMu`, which
+    deadlocks a shutdown racing the exit). The fingerprint still matched the
+    committed endpoint, so `reconcileTo`'s leg-changed test was false on every
+    later commit and `ReconcileHTTPS` was never called; and had it been called,
+    its same-address arm returned `nil` on a non-nil pointer. HTTPS was
+    therefore unrecoverable on an UNCHANGED configuration for the life of the
+    process — and with it any stale-cert diagnosis, which can only be
+    discharged against a served certificate. The HTTPS arm now also fires when
+    `next.TLS && !m.srv.HTTPSServing()`, and the api-side no-op tests
+    `listenerLeg.serving()` instead of the pointer. Pinned by
+    `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` (daemon, end to end from
+    `reconcileWebManagement`) and `TestReconcileHTTPSReplacesADeadLeg_6827`
+    (`pkg/api`).
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),
@@ -521,6 +537,83 @@ credential revocation is enforced even on an apply that returns early
   intermediate exits), and `pkg/api/listener_retiredauth_5561_test.go` (a
   retired leg gains no grant and is never dropped to no-auth, while a live leg
   still follows the snapshot).
+
+#### Stale management-TLS-certificate diagnosis on rename (#6827)
+
+The auto-generated management HTTPS certificate is DURABLE on disk and is NOT
+re-minted by a later `set system host-name`, so its SANs go stale and clients
+verifying by host name start failing. `pkg/api`'s own load-path diagnostic
+cannot see a plain rename — the HTTPS leg is rebuilt only when the TLS flag or
+the HTTPS bind address changes, so a rename on an unchanged endpoint reloads
+nothing. `Daemon.renameHostNotingStaleMgmtCert` closes that gap from the apply
+side. `applyHostname` calls it in place of a bare `Sethostname` — it performs
+the rename AND records the debt under ONE hold of `staleCertMu` (#6827 round 7,
+see the fence bullet below) — and then delivers the diagnosis as its last act.
+The delivery is deliberately NOT part of `reconcile()`, which runs early in the
+apply and can only ever see the old name.
+
+Marking and delivering are ONE path (`deliverStaleMgmtCertDiagnosis`), because
+at BOOT the hook runs before its own dependency exists — the first config apply
+is startup phase 4 while `startHTTPServer` publishes `d.mgmt` later in `Run`.
+Three properties carry the mechanism:
+
+- **A debt, not a one-shot.** `staleCertPending` clears only when a delivery
+  actually REACHED a served certificate (`WarnStaleMgmtCertForHostName` reports
+  that). Clearing it whenever the delivery merely RAN loses the diagnosis
+  permanently when HTTPS is off or its bind failed: the next boot's
+  `applyHostname` sees the name already applied and returns early, and the load
+  path's inferred heuristic declines a CROSS-SHAPE rename by design (a
+  shape-preserving one it would still catch, but only at the next certificate
+  load — a restart or an HTTPS rebind, not the commit). Delivery is attempted at
+  the rename itself and RETRIED at the boot management start and on every
+  web-management reconcile (so a later `web-management https` enable — or the
+  rebuild of an HTTPS leg whose serve loop died — settles an old debt). The
+  two DEFERRED retry points are bound at their own call site by
+  `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on deliberately different
+  observables: the `reconcileWebManagement` one on the debt FLAG, because the
+  reconcile that brings HTTPS up makes `pkg/api`'s LOAD path emit the same
+  warning text (a text assertion there passes with the retry deleted); the
+  `startHTTPServer` one on the kernel-name read, which sits past the
+  nil-reconciler guard, because that call site cannot be handed a serving HTTPS
+  leg in-process — it constructs the `api.Server` itself and the cert-dir test
+  seam exists only afterwards.
+- **The name is read from the kernel at DELIVERY**, never stored at rename time,
+  so a deferred diagnosis is never the replay of a name captured at some earlier
+  commit. It IS the kernel's current name for every rename the daemon performs
+  (#6827 round 7). Rounds 5 and 6 claimed otherwise — that `Sethostname` moves
+  the name before the generation is recorded, so no fence could close the gap —
+  but that was a property of where the lock was taken.
+  `renameHostNotingStaleMgmtCert` holds `staleCertMu` ACROSS both the syscall
+  and the bump, so the generation exists before the window can open: a delivery
+  either warns while
+  the rename is still blocked on the mutex (name still current) or finds the
+  generation already moved and abandons. The residual is a privileged
+  `sethostname(2)` from OUTSIDE the daemon, which no in-process fence can see.
+  Bound by `TestRenameAndGenerationBumpAreOneCriticalSection_6827`, which
+  observes from inside the syscall seam that the mutex is held.
+- **The delivery is generation-fenced, before it speaks.** The kernel read runs
+  unlocked; `staleCertGen` is sampled before it and RE-VALIDATED after it, under
+  `staleCertMu` held across the certificate inspection and the clear. A delivery
+  whose generation has been superseded abandons without warning and without
+  clearing — it must not settle a newer rename's debt with older evidence, and
+  must not emit a diagnosis naming a host name that a recorded rename has
+  already replaced (round 5 checked only on the clear side, after the warning
+  was already out). The re-validation tests `staleCertPending` as well as the
+  generation (#6827 round 7): two deliveries for ONE rename — the boot delivery
+  racing the rename's own attempt, say — sample the same generation, so a
+  generation-only re-check lets the second one duplicate the line the first has
+  already emitted. Nothing is lost by either arm: the newer rename's own
+  `applyHostname` runs its own delivery. The race is reachable
+  because the boot delivery runs on the `Run` goroutine outside `applySem` while
+  cluster comms — started right after the mutating startup phases, before
+  `startHTTPServer` — can drive a peer `SyncApply` into `applyHostname`. Pinned
+  by `TestDebtClearIsGenerationSafe_6827`: one subtest supplies the competing
+  rename itself, one drives it through the production note path (so the
+  `staleCertGen++` is bound, not just the comparison), one is the negative
+  control where an unraced delivery MUST settle, one overlaps two
+  same-generation deliveries so the second must stay silent, and one pins the
+  unreadable-kernel-name guard that would otherwise discharge the debt with no
+  identity behind it.
 
 #### Effective-listener snapshot for `show system services` (#6385/#6401)
 
@@ -586,10 +679,10 @@ data-race failure modes:
 
 The lifecycle is now **epoch-guarded** by `clusterCommsMu` + a `clusterCommsGen`
 generation counter (all comms-epoch fields — `sessionSync`,
-`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel` — are read/written only under
-that lock; every reader goes through `getSessionSync()` /
-`snapshotFabricRefreshChans()` / `getClusterCommsCtx()`, capturing the pointer
-once):
+`fabricRefreshCh{,1}`, `clusterCommsCtx`/`Cancel`, `activeClusterTransport` —
+are read/written only under that lock; every reader goes through
+`getSessionSync()` / `snapshotFabricRefreshChans()` / `getClusterCommsCtx()` /
+`activeTransport()`, capturing the value once):
 
 - `beginClusterCommsEpoch` bumps the generation and installs the fresh
   sub-context; `startClusterComms` hands the post-bump generation to the
@@ -609,9 +702,26 @@ once):
   sync. The join runs outside the lock (the constructor's publish path also
   takes it), so there is no deadlock.
 
+- `activeClusterTransport` joined the epoch in **#6290** and publishes the same
+  way, via `setActiveTransportIfCurrent(gen, key)`. It had been written by
+  `startClusterComms` holding neither `clusterCommsMu` nor `applySem`, and read
+  by `applyTailReconciles` step 20 under `applySem` — and a semaphore only
+  excludes participants that take it. The issue judged that benign because the
+  boot `startClusterComms` precedes the gRPC/HTTP servers, but those are not the
+  only appliers: the boot `applyConfig` starts the DHCP clients
+  (`reconcileDHCPClients`) with `onDHCPAddressChange` already wired, and that
+  callback re-enters `applyConfig` — hence step 20 — on a goroutine created
+  BEFORE the write. Goroutine creation therefore orders them the wrong way and
+  supplies no happens-before, so a lease landing in that window was a real data
+  race, the mirror of #5113 on `mgmtVRFInterfaces`. Step 20 now takes ONE
+  `activeTransport()` snapshot for both its comparison and its eight log
+  fields.
+
 `make test-failover` is the required smoke for this path. The guard is covered
 by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
-`-race` concurrency).
+`-race` concurrency) and, for the transport key, by
+`cluster_transport_race_6290_test.go` (production writer vs production reader
+under `-race`, plus a deterministic stale-epoch drop).
 
 ### Per-RG Router-Advertisement reconcile (#5861)
 

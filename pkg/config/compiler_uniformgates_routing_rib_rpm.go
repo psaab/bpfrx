@@ -243,5 +243,27 @@ func runUniformGatesRoutingRibRPM(tree *ConfigTree, cfg *Config, opts compileOpt
 		}
 	}
 
+	// #6722: redundant-ethernet membership coherence. A reth member is an L2
+	// port; the reth owns the units, addresses, tunnel and security zone of the
+	// shared device, and `ResolveReth` collapses the reth's rows onto the
+	// member's netdev on exactly that basis. A member that names itself, names an
+	// unconfigured parent, carries its own logical units, or carries its own
+	// tunnel breaks the premise the egress-zone answer rests on — the last two
+	// fail OPEN, because an independently addressed member unit or an
+	// independently routed tunnel endpoint lives on the shared ifindex while only
+	// the reth's row names a zone. Strict on commit / commit-check (hard reject
+	// so the incoherence is operator-visible before it mis-zones traffic);
+	// lenient on load / peer-sync (warn — #1960), where the runtime states the
+	// SAME rule (`egressMemberIsBarePort`, pkg/dataplane/userspace/interfaces.go)
+	// and leaves the contested ifindex with no zone, i.e. fail-closed.
+	if err := validateRethMemberStrict(cfg); err != nil {
+		if opts.lenientRethMember {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reth member (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	return nil
 }
