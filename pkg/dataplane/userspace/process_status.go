@@ -149,8 +149,16 @@ func (m *Manager) ensureStatusLoopLocked() {
 	go m.statusLoop(ctx)
 }
 
+// statusLoopInterval is the reconcile-tick period. It is a package var, not a
+// literal, purely so a concurrency test can drive many real ticks against a real
+// link cycle in a fraction of a second instead of one tick per wall-clock second
+// (#6871). Production never reassigns it; the value is the 1s the control-socket
+// contention budget in CLAUDE.md is written against. Mirrors the
+// linkCycleRebindSleep seam in process_linkcycle.go.
+var statusLoopInterval = time.Second
+
 func (m *Manager) statusLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(statusLoopInterval)
 	defer ticker.Stop()
 	startTime := time.Now()
 
@@ -163,6 +171,34 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			if m.proc == nil {
 				m.mu.Unlock()
 				return
+			}
+			// #6871: a RETH MAC link cycle owns the dataplane between
+			// PrepareLinkCycle and NotifyLinkCycle, and this tick is the busiest
+			// producer in that window. Skip the WHOLE body, not one publish:
+			// four separate paths below restart the workers PrepareLinkCycle
+			// just joined, and a fifth re-enables ctrl on XSK sockets whose
+			// queues the cycle is destroying —
+			//
+			//   - syncSnapshotLocked's plan-key branch stopLocked()s and
+			//     respawns the helper PROCESS;
+			//   - retryDeferredWorkerArmLocked republishes DeferWorkers=false;
+			//   - maybeAutoRebindBusyBindingsLocked sends "rebind" directly;
+			//   - verifyBindingsMapLocked repopulates the very binding rows a
+			//     fail-closed ctrl disable may have just cleared;
+			//   - applyHelperStatusLocked writes the ctrl gate.
+			//
+			// Nothing is lost by skipping: every action in this body is
+			// LEVEL-triggered on persistent manager state (publishedSnapshot vs
+			// lastSnapshot.Generation, pendingWorkerArm, pendingHAStateClear,
+			// lastStatus.ForwardingArmed vs desired), so the next tick after the
+			// lease ends re-evaluates the same conditions and services whatever
+			// is still outstanding. The one per-tick value, prevActiveSig, is
+			// only ever consulted alongside helperActiveSig, which is read fresh
+			// from the helper's own status.
+			if m.linkCycleInFlight() {
+				m.mu.Unlock()
+				slog.Debug("userspace: status tick skipped; RETH MAC link cycle in flight")
+				continue
 			}
 			prevActiveSig := activeHAGroupSignature(m.haGroups)
 			var status ProcessStatus

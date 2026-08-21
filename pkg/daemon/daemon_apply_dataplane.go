@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -42,6 +43,25 @@ import (
 // (nil) before the networkd / apply phases assign them. Runs in the same slot,
 // after the fabric-IPVLAN reconcile and before the routing rules.
 func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config) (commitOverlay []config.RouteOverlayEntry, networkdErr error, applyErr error, err error) {
+	// #6871 (round 8): a link-cycle lease cannot outlive this function.
+	//
+	// This is the extent that contains BOTH ends of the cycle — step 2.6's
+	// rethToPhys loop takes the lease (via programRethMACWithWorkerJoin ->
+	// PrepareLinkCycle) and step 2.6b2 releases it (NotifyLinkCycle) — so a
+	// defer here is a guarantee no arrangement of the code between them can
+	// break: it runs on a panic and on any early return a later change adds.
+	//
+	// It is what makes the self-renewing lease safe. The lease now re-arms its
+	// own deadline on a fixed period (linkCycleLeaseHeartbeat), which is what
+	// lets its TTL bound a CONSTANT instead of an interval that scales with
+	// reth-count, child-netdev count and netlink latency — but a lease that
+	// renews itself is a lease that a leak would suppress the 1 Hz reconcile
+	// with FOREVER. The wall-clock backstop cannot fix that without also being
+	// able to expire a cycle that is still running; a guaranteed release can.
+	//
+	// On the normal path this is a no-op: NotifyLinkCycle already released.
+	defer d.abandonLinkCycleLease()
+
 	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
 	// If yes, tell the userspace DP to skip initial worker startup during
 	// ApplyConfig(). Workers will be started by NotifyLinkCycle() after MAC
@@ -254,9 +274,18 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		cc := cfg.Chassis.Cluster
 		rethToPhys := cfg.RethToPhysical()
 
-		// PrepareLinkCycle is called on-demand after programRethMAC reports
-		// an actual link DOWN/UP cycle. Most drivers (mlx5, virtio) support
-		// IFF_LIVE_ADDR_CHANGE so no cycle is needed and workers keep running.
+		// #5103: the AF_XDP worker join is handed to programRethMAC as a
+		// beforeCycle hook rather than run after it returns. Whether a cycle
+		// is needed is only knowable by attempting the live MAC set, so the
+		// hook is the only place that both KNOWS a cycle is coming and still
+		// runs before the link is touched. On the cluster's own NICs (mlx5,
+		// virtio) the kernel almost always accepts the live set, so the hook
+		// does not fire and the workers keep running — the cost is paid only
+		// when it is refused. #6871: "almost always", not "always", and not
+		// keyed on IFF_LIVE_ADDR_CHANGE — dev_set_mac_address also refuses a
+		// live set on a BUSY device, so these same VFs can take the fallback
+		// transiently. programRethMACWithWorkerJoin owns the hook and the
+		// rollback of a prepare whose cycle then aborted.
 
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -282,74 +311,9 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			ensureRethLinkOriginalName(linuxName)
 			setRethIPv6Knobs(linuxName)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-			linkCycled, err := programRethMAC(linuxName, mac)
-			if err != nil {
-				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
-			}
-			if linkCycled && !needLinkCycleRecovery {
-				// First link cycle — stop workers NOW (they may have
-				// been accessing UMEM during the DOWN/UP). The rebind
-				// in NotifyLinkCycle will restart them.
-				if rt := d.dataplane(); rt != nil {
-					slog.Info("userspace: stopping workers after RETH MAC link cycle")
-					rt.Link().PrepareLinkCycle()
-				}
-			}
-			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
-			clearDadFailed(linuxName)
-			removeAutoLinkLocal(linuxName)
-			// Re-add link-local if this parent interface has IPv6 on unit 0.
-			// NDP Neighbor Solicitation requires a link-local source address.
-			if rethUnitHasIPv6(rethCfg, 0) {
-				ensureRethLinkLocal(linuxName)
-			}
-
-			// Re-disable VLAN RX offload after MAC programming.
-			// The iavf VF driver resets ethtool features (including
-			// rx-vlan-offload) during the link down/up cycle that
-			// programRethMAC requires. Without this, XDP cannot see
-			// VLAN tags in the packet data and drops VLAN traffic.
-			if out, err := runCommandTimeout("ethtool", "-K", linuxName, "rxvlan", "off"); err != nil {
-				slog.Warn("failed to re-disable rxvlan after RETH MAC",
-					"interface", linuxName, "err", err, "output", strings.TrimSpace(string(out)))
-			} else {
-				slog.Info("re-disabled VLAN RX offload after RETH MAC", "interface", linuxName)
-			}
-
-			// Propagate MAC change to VLAN sub-interfaces.
-			// Linux VLAN sub-interfaces don't always inherit the
-			// parent's MAC change after link down/up.
-			if parentLink, err := netlink.LinkByName(linuxName); err == nil {
-				parentIdx := parentLink.Attrs().Index
-				links, _ := netlink.LinkList()
-				for _, l := range links {
-					if l.Attrs().ParentIndex != parentIdx {
-						continue
-					}
-					subName := l.Attrs().Name
-					// Suppress auto link-local on VLAN sub-interfaces too.
-					setVLANSubAddrGenMode(subName)
-					if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
-						if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
-							slog.Warn("failed to propagate MAC to VLAN sub-interface",
-								"iface", subName, "err", err)
-						} else {
-							slog.Info("propagated RETH MAC to VLAN sub-interface",
-								"iface", subName, "mac", mac)
-						}
-					}
-					// Strip any stale auto link-local, then re-add a stable one
-					// if this VLAN sub-interface carries IPv6. The kernel suffix
-					// is the unit's vlan-id (e.g. "ge-7-0-1.180"), which may
-					// differ from the logical unit number rethCfg.Units is keyed
-					// by (`unit 80 vlan-id 180`); the repair resolves the vlan-id
-					// back to its unit(s) before checking for IPv6 — indexing
-					// Units[vid] directly silently skipped the repair (#5107).
-					// The whole decision+action lives in rethSubIfaceLinkLocalRepair
-					// (spy-tested); this loop only enumerates the child netdevs.
-					rethSubIfaceLinkLocalRepair(rethCfg, subName)
-				}
-			}
+			networkdErr, needLinkCycleRecovery = d.programRethMemberMAC(
+				linuxName, mac, networkdErr, needLinkCycleRecovery)
+			d.finishRethMemberLinkTail(linuxName, mac, rethCfg)
 		}
 	}
 
@@ -357,30 +321,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// programming. Only needed when programRethMAC had to bring the
 	// interface DOWN/UP (link cycle), which removes all addresses
 	// including VRRP VIPs and stable link-locals.
-	if needLinkCycleRecovery && d.isNoRethVRRP() {
-		// Direct mode: re-add VIPs + stable link-locals for each RG
-		// where we are primary.
-		if d.cluster != nil {
-			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-				if d.cluster.IsLocalPrimary(rg.ID) {
-					d.directAddVIPs(rg.ID)
-					d.addStableRethLinkLocal(rg.ID)
-					d.scheduleDirectAnnounce(rg.ID, "link-cycle-recovery")
-				}
-			}
-		}
-	} else if needLinkCycleRecovery && d.vrrpMgr != nil {
-		d.vrrpMgr.ReconcileVIPs()
-		// Re-add stable link-locals for active RGs after MAC bounce.
-		if d.cluster != nil && cfg.Chassis.Cluster != nil {
-			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-				s := d.getOrCreateRGState(rg.ID)
-				if s.IsActive() {
-					d.addStableRethLinkLocal(rg.ID)
-				}
-			}
-		}
-	}
+	d.reconcileAfterRethLinkCycle(cfg, needLinkCycleRecovery)
 
 	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
 	// Only needed when PrepareLinkCycle was called (macChangeNeeded=true
@@ -390,7 +331,19 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	if rt := d.dataplane(); rt != nil && needLinkCycleRecovery {
 		// Actual link DOWN/UP occurred — old XSK sockets are dead.
 		// Rebind to create fresh sockets on the reinitialized queues.
-		rt.Link().NotifyLinkCycle()
+		//
+		// #6871: fold a failed rebind into the commit. Every member that cycled
+		// had its workers joined by PrepareLinkCycle and its ctrl disabled; this
+		// is the only call that undoes that. A rebind that does not land leaves
+		// the node forwarding nothing, and reporting the commit successful over
+		// it is a silent total outage. Same errRethPrepareLinkCycle class as a
+		// failed join — the observable state is identical.
+		if err := rt.Link().NotifyLinkCycle(); err != nil {
+			slog.Error("failed to rebind AF_XDP sockets after the RETH MAC link cycle; "+
+				"workers stay stopped", "err", err)
+			networkdErr = errors.Join(networkdErr,
+				fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err))
+		}
 		if d.ra != nil {
 			d.ra.ResendBurst()
 		}
@@ -449,6 +402,471 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	}
 
 	return commitOverlay, networkdErr, applyErr, nil
+}
+
+// errRethPrepareLinkCycle classifies a programRethMAC failure that the #5103
+// AF_XDP worker-join hook had already RUN for. It exists so the caller can fail
+// the commit closed on exactly that class: an ordinary netlink MAC-set failure
+// has always been warn-only and stays so, because it disturbs nothing but the
+// member's MAC. Once the hook has run, the member is not merely on the wrong
+// MAC — ctrl is being driven to 0 and the workers may already be joined, so it
+// is not forwarding.
+//
+// #6871 (round 6): the message says the HOOK RAN, not "after the worker join", and the
+// difference is exactly why this sentinel keys on joinRan. PrepareLinkCycle can
+// fail on the DIAL or the WRITE, before the helper ever reaches its stop_workers
+// handler, so on that path the workers were NOT joined — and an earlier revision
+// of this string asserted they were. What the daemon CAN know is that the hook
+// ran, which is what makes the outcome unknown and the fail-closed escalation
+// correct. The runtime behaviour was already right; only the diagnosis was
+// overstated.
+var errRethPrepareLinkCycle = errors.New("reth mac: link cycle failed after the af_xdp worker-join hook ran")
+
+// programRethMemberMAC programs ONE RETH member's virtual MAC through the
+// #5103 worker-join wrapper and folds that member's outcome into the two
+// accumulators step 2.6 carries across its loop: the commit error (networkdErr,
+// the tail-commit channel the device-map teardown (#5309) and the management-VRF
+// rebind (#5700) also use) and needLinkCycleRecovery (step 2.6b2's rebind gate).
+// It returns both, updated.
+//
+// Only the class where the worker-join HOOK RAN produces a commit error; an
+// ordinary MAC-set failure stays warn-only, as it always has. (#6871: an earlier
+// revision said "the failed-worker-join class", which was narrower than the code
+// — programRethMACWithWorkerJoin also classifies a post-join setDown, cycled
+// MAC-write or link-UP failure as commit-fatal, and deliberately so: the hook has
+// already stopped the workers by then. The gate is "the hook ran", and this
+// sentence now says the same thing the wrapper does.) errors.Join, not assignment: an
+// error already accumulated by an earlier step or an earlier member must not be
+// clobbered by this one. The recovery gate is ORed, not assigned: a member that
+// needs no cycle must not clear a gate an earlier member armed.
+//
+// This is a function rather than three inline statements so the fail-closed
+// plumbing is BEHAVIOURALLY testable (reth_commit_fold_5103_test.go). Inline it
+// was reachable only through applyDataplaneAndHACore, which needs a live cluster
+// manager, a wired dataplane, a networkd writer and real netlink members, so the
+// only available guard was a structural canary over the AST — and a structural
+// canary is satisfied by an assignment that is unreachable, shadowed, or jumped
+// over. Here the fold runs against the same fake link seam and fake dataplane the
+// wrapper's own tests use.
+func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
+	commitErr error, needLinkCycleRecovery bool) (error, bool) {
+	linkCycled, prepareErr := d.programRethMACWithWorkerJoin(ifName, mac)
+	if prepareErr != nil {
+		commitErr = errors.Join(commitErr, prepareErr)
+	}
+	// #6871 (round 6): renew the link-cycle lease on EVERY member's turn,
+	// whether or not this one cycled.
+	//
+	// Without it the lease's TTL would have to cover the whole of step 2.6's
+	// loop, and no constant does. Only a member that actually cycles re-arms the
+	// lease (PrepareLinkCycle takes it), so the exposure is the tail of members
+	// visited AFTER the last cycling one — while `reth-count` is
+	// operator-settable to 128 (pkg/config/schema_chassis.go) and the dominant
+	// per-member cost, the `ethtool -K rxvlan off` finishRethMemberLinkTail runs
+	// right after this call, has a 20s hard ceiling (externalCommandTimeout + the
+	// 5s WaitDelay, exec_timeout.go). Four wedging members in that tail already
+	// exceed a 60s TTL. Worse, rethToPhys is a Go MAP, so that tail is a
+	// different set on every run: the same config would pass or fail at random,
+	// which is the failure shape hardest to reproduce and the one a bigger
+	// constant hides rather than fixes.
+	//
+	// This renewal covers the MAC SET, and only that. It is deliberately NOT the
+	// only one, and an earlier revision of this comment claimed otherwise —
+	// "renewing here makes the TTL bound the interval between two consecutive
+	// members" was false, because this call lands BEFORE that member's ethtool
+	// and child-netdev work, so the interval between two consecutive renewals
+	// spanned member N's whole tail plus member N+1's MAC set. #6871 round 7
+	// added the other two renewal points that make the per-interval claim true:
+	// finishRethMemberLinkTail (after the ethtool + child loop) and
+	// reconcileAfterRethLinkCycle (after the VIP/link-local reconcile, the span
+	// that used to run all the way into NotifyLinkCycle unrenewed). What each
+	// interval does and does not bound is stated at linkCycleLeaseTTL
+	// (pkg/dataplane/userspace/process_linkcycle.go) rather than restated here.
+	//
+	// It cannot CREATE a lease: RenewLinkCycle refuses unless one is already
+	// live. So the overwhelmingly common apply — every member's MAC set live, no
+	// cycle anywhere — is completely unaffected, and this cannot become a way to
+	// suppress the 1 Hz reconcile with nothing obliged to release it.
+	d.renewLinkCycleLease()
+	return commitErr, needLinkCycleRecovery || linkCycled
+}
+
+// renewLinkCycleLease extends a link-cycle lease that is already held. It is the
+// single place step 2.6 touches the lease, so every renewal point below reads
+// identically and a new one cannot silently skip the nil guard.
+//
+// It cannot CREATE a lease (Manager.RenewLinkCycle refuses unless one is live),
+// so calling it on an apply that cycled nothing — the overwhelming majority — is
+// a no-op, and it can never become a way to suppress the 1 Hz reconcile with
+// nothing obliged to release it.
+func (d *Daemon) renewLinkCycleLease() {
+	rt := d.dataplane()
+	if rt == nil {
+		return
+	}
+	rt.Link().RenewLinkCycle()
+}
+
+// abandonLinkCycleLease drops a link-cycle lease the apply is leaving behind. It
+// is deferred over the whole of applyDataplaneAndHACore, so it is the one
+// release that no control-flow arrangement can skip (#6871 round 8).
+//
+// A true return is a BUG REPORT, not a routine outcome: every path that takes a
+// lease reaches NotifyLinkCycle (the cycle completes and step 2.6b2 rebinds, or
+// it aborts and programRethMACWithWorkerJoin rolls back with the same call), so
+// reaching here with one still held means a path was added that does neither.
+// Log it at Error with what it implies about the dataplane, because dropping the
+// lease resumes the 1 Hz reconcile but does NOT rebind — the reconcile has to
+// re-arm the workers itself, which is exactly master's pre-#6871 behaviour.
+func (d *Daemon) abandonLinkCycleLease() {
+	rt := d.dataplane()
+	if rt == nil {
+		return
+	}
+	if rt.Link().AbandonLinkCycle() {
+		slog.Error("userspace: the config apply is leaving with a RETH link-cycle lease " +
+			"still held; dropping it so the reconcile loop resumes. The AF_XDP workers " +
+			"may still be joined and ctrl disabled — the 1 Hz reconcile is now what has " +
+			"to re-arm them. Some path between PrepareLinkCycle and NotifyLinkCycle " +
+			"returned or panicked without completing the cycle")
+	}
+}
+
+// finishRethMemberLinkTail runs the per-member work that follows the MAC set:
+// DAD/link-local repair, the ethtool VLAN-RX-offload re-disable, and the MAC
+// propagation to this member's VLAN sub-interfaces. It renews the link-cycle
+// lease when it is done.
+//
+// #6871 (round 7): this is an EXTRACTION whose purpose is that renewal, and the
+// reason it is a function rather than an inline call is the same reason
+// programRethMemberMAC is one — inline, the only reachable guard would have been
+// a structural canary over the AST, and a structural canary is satisfied by a
+// statement that is unreachable, shadowed, or jumped over.
+//
+// Why the tail needs its own renewal. programRethMemberMAC renews at the end of
+// the MAC set, which is BEFORE any of this: the `ethtool -K rxvlan off` below has
+// a 20s hard ceiling (externalCommandTimeout 15s plus the 5s WaitDelay in
+// exec_timeout.go), and the child-netdev loop is cardinality-dependent — one
+// netlink round trip per VLAN sub-interface of this member, with no bound on how
+// many an operator configures. Renewing only at the MAC set therefore left every
+// member's tail, plus the next member's whole MAC set, inside ONE TTL window.
+// Renewing here splits that in two, so each window holds at most one 20s-ceiling
+// command. See linkCycleLeaseTTL (pkg/dataplane/userspace/process_linkcycle.go)
+// for what that does and does not let the TTL claim.
+//
+// The renewal is unconditional on this member's outcome, exactly as
+// programRethMemberMAC's is: a member that needed no cycle still spends the
+// ethtool ceiling, and the lease it is burning down may have been taken by an
+// EARLIER member.
+func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr, rethCfg *config.InterfaceConfig) {
+	clearDadFailed(linuxName)
+	removeAutoLinkLocal(linuxName)
+	// Re-add link-local if this parent interface has IPv6 on unit 0.
+	// NDP Neighbor Solicitation requires a link-local source address.
+	if rethUnitHasIPv6(rethCfg, 0) {
+		ensureRethLinkLocal(linuxName)
+	}
+
+	// Re-disable VLAN RX offload after MAC programming.
+	// The iavf VF driver resets ethtool features (including
+	// rx-vlan-offload) during the link down/up cycle that
+	// programRethMAC requires. Without this, XDP cannot see
+	// VLAN tags in the packet data and drops VLAN traffic.
+	if out, err := runCommandTimeout("ethtool", "-K", linuxName, "rxvlan", "off"); err != nil {
+		slog.Warn("failed to re-disable rxvlan after RETH MAC",
+			"interface", linuxName, "err", err, "output", strings.TrimSpace(string(out)))
+	} else {
+		slog.Info("re-disabled VLAN RX offload after RETH MAC", "interface", linuxName)
+	}
+
+	// Propagate MAC change to VLAN sub-interfaces.
+	// Linux VLAN sub-interfaces don't always inherit the
+	// parent's MAC change after link down/up.
+	if parentLink, err := netlink.LinkByName(linuxName); err == nil {
+		parentIdx := parentLink.Attrs().Index
+		links, _ := netlink.LinkList()
+		for _, l := range links {
+			if l.Attrs().ParentIndex != parentIdx {
+				continue
+			}
+			subName := l.Attrs().Name
+			// Suppress auto link-local on VLAN sub-interfaces too.
+			setVLANSubAddrGenMode(subName)
+			if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
+				if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
+					slog.Warn("failed to propagate MAC to VLAN sub-interface",
+						"iface", subName, "err", err)
+				} else {
+					slog.Info("propagated RETH MAC to VLAN sub-interface",
+						"iface", subName, "mac", mac)
+				}
+			}
+			// Strip any stale auto link-local, then re-add a stable one
+			// if this VLAN sub-interface carries IPv6. The kernel suffix
+			// is the unit's vlan-id (e.g. "ge-7-0-1.180"), which may
+			// differ from the logical unit number rethCfg.Units is keyed
+			// by (`unit 80 vlan-id 180`); the repair resolves the vlan-id
+			// back to its unit(s) before checking for IPv6 — indexing
+			// Units[vid] directly silently skipped the repair (#5107).
+			// The whole decision+action lives in rethSubIfaceLinkLocalRepair
+			// (spy-tested); this loop only enumerates the child netdevs.
+			rethSubIfaceLinkLocalRepair(rethCfg, subName)
+		}
+	}
+	d.renewLinkCycleLease()
+}
+
+// reconcileAfterRethLinkCycle re-adds the VRRP VIPs and stable link-locals that
+// a RETH MAC link cycle removed (the DOWN/UP drops every kernel address on the
+// member), then renews the link-cycle lease.
+//
+// #6871 (round 7): this renewal covers the LAST unrenewed span, and it was the
+// worst one. The final member's tail is followed by this reconcile — netlink,
+// once per redundancy group — and then by step 2.6b2's NotifyLinkCycle, which is
+// what RELEASES the lease. Before this renewal existed, everything from the last
+// member's MAC set through this reconcile and into NotifyLinkCycle's own 1s NIC
+// settle had to fit in one TTL, with no renewal anywhere in it. After it, the
+// span from here to the release contains only that 1s sleep and one control
+// round trip.
+//
+// Renewing unconditionally is safe: RenewLinkCycle cannot create a lease, so an
+// apply that cycled nothing is unaffected.
+//
+// It is not, however, load-bearing, and an earlier revision claimed it was
+// (#6871 round 15). That revision said gating on needLinkCycleRecovery "would
+// skip exactly the abort path — where the cycle DID take a lease and then
+// returned linkCycled=false". The abort path has no lease left to renew by the
+// time this runs: programRethMACWithWorkerJoin's rollback calls NotifyLinkCycle,
+// whose FIRST act is releaseLinkCycleLease, and that happens inside the
+// per-member loop above — so the word is already 0 here and RenewLinkCycle
+// refuses to renew from the 0 sentinel. Whenever a lease IS still held at this
+// line, needLinkCycleRecovery is true (the only way to take one and return
+// linkCycled=false is to fail after the join, which routes through that same
+// rollback), so the gate the ungating was defending against would have been
+// equivalent. Ungated is still the right shape — it does not depend on an
+// accumulator staying in sync with the lease — but the reason is "no gate is
+// needed", not "the gate would lose the abort path".
+func (d *Daemon) reconcileAfterRethLinkCycle(cfg *config.Config, needLinkCycleRecovery bool) {
+	if needLinkCycleRecovery && d.isNoRethVRRP() {
+		// Direct mode: re-add VIPs + stable link-locals for each RG
+		// where we are primary.
+		if d.cluster != nil {
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				if d.cluster.IsLocalPrimary(rg.ID) {
+					d.directAddVIPs(rg.ID)
+					d.addStableRethLinkLocal(rg.ID)
+					d.scheduleDirectAnnounce(rg.ID, "link-cycle-recovery")
+				}
+			}
+		}
+	} else if needLinkCycleRecovery && d.vrrpMgr != nil {
+		d.vrrpMgr.ReconcileVIPs()
+		// Re-add stable link-locals for active RGs after MAC bounce.
+		if d.cluster != nil && cfg.Chassis.Cluster != nil {
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				s := d.getOrCreateRGState(rg.ID)
+				if s.IsActive() {
+					d.addStableRethLinkLocal(rg.ID)
+				}
+			}
+		}
+	}
+	d.renewLinkCycleLease()
+}
+
+// programRethMACWithWorkerJoin programs a RETH member's virtual MAC with the
+// #5103 worker-join hook, and unwinds that join when the rest of the cycle then
+// failed. It returns whether the link was cycled and a COMMIT error, non-nil
+// only for the class where the hook had already run.
+//
+// The hook runs only when a cycle is actually required — programRethMAC calls it
+// after the live MAC set has been rejected and before setDown, the first
+// mutation. The ordinary paths (the live set succeeds, or the member lookup
+// fails) never reach it and stay warn-only exactly as they always have. Aborting
+// AT the hook leaves the LINK exactly as it was found and the member on its
+// previous MAC, which the next apply retries.
+//
+// The DATAPLANE is not left as it was found, and that is true from the moment
+// the hook RUNS, not from the moment it fails. PrepareLinkCycle disables ctrl
+// (and attempts to clear the binding rows if that disable could not be verified
+// — #6871: clearAllBindingRowsLocked is best-effort, it discards each map Update
+// error and no-ops entirely when the bindings map is not loaded, so "cleared" is
+// the intent, not a guarantee; the guarantee is that ctrl is being driven to 0)
+// before it can fail on stop_workers, so a failed join leaves "the outcome is unknown" —
+// but a SUCCEEDED join leaves the workers deliberately stopped, which is the
+// same forwarding state. After it returns nil, setDown and the cycled
+// setHardwareAddr are both still fallible and both yield linkCycled=false. So
+// the gate is "did the hook RUN", not "did the hook FAIL": keying on the hook's
+// own error let those two escape with a nil commit error and no rebind, i.e. a
+// half-applied prepare under a green commit.
+//
+// A half-applied prepare has no other owner:
+//
+//   - the post-cycle rebind (step 2.6b2) is gated on linkCycled, which every
+//     aborted cycle makes false; and
+//   - reapplyAfterDeferredMAC is gated on rethMACPending, which is computed
+//     BEFORE networkd.Apply — so it is false for an apply whose only member
+//     needing a MAC was renamed into its config name by that same networkd.Apply.
+//     (rethMACPending is one bool for the whole apply, not per member: a
+//     multi-RETH apply where a DIFFERENT member was already present with the
+//     wrong MAC does set it, and that apply does re-apply.)
+//
+// Before #5103 that triple self-healed for the wrong reason: the cycle ran
+// whether or not the workers had been joined, so linkCycled was true and
+// NotifyLinkCycle rebound the sockets. Aborting the cycle is the correct
+// behaviour, but it must keep the recovery. "rebind" is the documented inverse of
+// "stop_workers" (userspace-dp/src/server/handlers/stop_workers.rs: "The
+// subsequent rebind request ... recreates workers with fresh sockets"), and
+// NotifyLinkCycle is what sends it — so the rollback is that same call, driven by
+// the abort instead of by a cycle that never happened. Its 1s NIC-settle sleep is
+// paid only here.
+//
+// A cycle that COMPLETED and then failed only on link-up (linkCycled=true) is the
+// one member of the class that fails the commit WITHOUT rolling back here: step
+// 2.6b2 already rebinds off linkCycled, so firing NotifyLinkCycle too would be
+// the double rebind that call site's own comment warns gets EBUSY on mlx5
+// zero-copy queues.
+//
+// Reachability is narrower than the common case but NOT confined to exotic
+// drivers, and an earlier revision of this note said it was. Entering the class
+// takes any refused live MAC set plus a control-socket or netlink failure in the
+// same window. The first term is not "a driver without IFF_LIVE_ADDR_CHANGE":
+// programRethMAC falls back on EVERY error from setHardwareAddr, and
+// dev_set_mac_address fails the same way for a busy or absent device or a
+// notifier rejection — so a transient refusal on the cluster's own mlx5 VFs
+// enters this abort/rollback class too. What stays true is the direction:
+// fail-CLOSED throughout, ctrl is off, so transit is dropped, never passed.
+func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAddr) (linkCycled bool, commitErr error) {
+	// joinRan, not joinFailed: set AFTER the nil-dataplane guard, so it means
+	// exactly "the hook ran, and the dataplane may be half torn down". A nil
+	// dataplane leaves it false, which keeps the joined.Link() deref below
+	// unreachable.
+	//
+	// #6743: the dataplane is read through d.dataplane() (the atomic cell), not
+	// a plain field, so a bootstrap-exit publish can swap or clear it between
+	// the join and the rollback below. joined pins the EXACT instance whose
+	// workers this hook stopped, so the rollback rebinds the dataplane it
+	// actually tore down rather than whichever one is published later.
+	joinRan := false
+	var joined dataplane.RuntimeDataPlane
+	beforeCycle := func() error {
+		rt := d.dataplane()
+		if rt == nil {
+			return nil
+		}
+		joined = rt
+		joinRan = true
+		slog.Info("userspace: stopping workers before RETH MAC link cycle", "iface", ifName)
+		return rt.Link().PrepareLinkCycle()
+	}
+	linkCycled, err := programRethMAC(ifName, mac, beforeCycle)
+	if err != nil {
+		slog.Warn("failed to set RETH MAC", "iface", ifName, "mac", mac, "err", err)
+	}
+	if err == nil || !joinRan {
+		return linkCycled, nil
+	}
+	if linkCycled {
+		// The cycle completed and only link-up failed. Fail the commit — the
+		// member is administratively down, and NOTHING repairs it: the MAC
+		// write succeeded, so every later apply early-returns on
+		// bytes.Equal(current, mac) and never attempts setUp again, and the
+		// only other nlLinkSetUp on a RETH member runs at daemon start. It
+		// stays down until a restart while step 2.6b2 rebinds AF_XDP sockets
+		// onto it.
+		//
+		// Leave the rebind to step 2.6b2, which owns it for every cycled
+		// member. Note that suppression is per-MEMBER while 2.6b2's gate
+		// (needLinkCycleRecovery) is a per-APPLY accumulator, so an apply that
+		// mixes a cycled member with an aborted one pays BOTH the aborted
+		// member's rollback rebind and 2.6b2's.
+		//
+		// Which of those two arms the 500ms zero-copy quiesce depends on the
+		// order the members are visited in, and that order is a Go map range
+		// (rethToPhys, step 2.6) — so state both. tear_down samples
+		// had_live_workers = !coord.workers.records.is_empty()
+		// (coordinator/reconcile/teardown.rs), and a stop_workers that REACHES
+		// ITS HANDLER empties records (handlers/stop_workers.rs -> afxdp.stop()
+		// -> stop_inner -> WorkerManager::stop_and_clear, which joins each
+		// worker thread and then records.clear()s).
+		//
+		// "REACHES ITS HANDLER" is load-bearing and an earlier revision of this
+		// comment said "every stop_workers" without it (#6871 F3). The prepare
+		// can fail on the DIAL or the WRITE, before the helper ever runs the
+		// handler — which is precisely the failure class this whole block
+		// exists for. In that case records are NOT cleared and stay live, so
+		// the had_live_workers sample below is true rather than false and the
+		// quiesce is PAID rather than skipped. The two orders below therefore
+		// describe the handler-ran case; a pre-handler failure costs an extra
+		// 500ms and nothing else. Behaviour is unaffected either way — the
+		// rebind is correct with live records or without them — but the
+		// sentence was not universally true as written. So:
+		//
+		//   - aborted member FIRST: its rollback rebind sees an empty records
+		//     (its own stop_workers just cleared it) and skips the quiesce, then
+		//     recreates the workers. The cycled member's stop_workers then joins
+		//     and clears them AGAIN, so 2.6b2's rebind ALSO sees false and ALSO
+		//     skips it.
+		//   - cycled member FIRST: its stop_workers clears records and nothing
+		//     recreates them before the aborted member's own stop_workers, so
+		//     the rollback rebind skips the quiesce and recreates the workers —
+		//     and 2.6b2's rebind, with nothing clearing them in between, sees
+		//     had_live_workers TRUE and DOES arm it.
+		//
+		// Both are safe, and not because of the quiesce: the quiesce (#1921)
+		// covers a rebind that rebuilds the same queue set IMMEDIATELY after a
+		// teardown it did not itself wait on. Here every rebind is preceded by a
+		// stop_workers that JOINED the worker threads synchronously before
+		// returning, and NotifyLinkCycle pays an unconditional 1s NIC settle
+		// (pkg/dataplane/userspace/process_linkcycle.go) before it sends the
+		// rebind at all — twice the 500ms it may skip.
+		return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err)
+	}
+	slog.Warn("userspace: RETH MAC link cycle did not complete after the worker join; "+
+		"rebinding AF_XDP sockets so the prepare is not left half-applied",
+		"iface", ifName, "err", err)
+	// AND THE ADDRESS GAP IS DELIBERATE (#6871 F4). One member of THIS class —
+	// join OK, setDown OK, the CYCLED MAC write refused — has already taken the
+	// link DOWN and back UP by the time it arrives here (programRethMAC's
+	// set-mac failure path does a best-effort setUp), and the kernel flushes an
+	// interface's addresses on the way down. It nonetheless returns
+	// linkCycled=false, so it contributes nothing to needLinkCycleRecovery, and
+	// step 2.6b's VIP reconcile is gated on exactly that: it is SKIPPED, and the
+	// member comes back without its VRRP VIPs until some later apply cycles it.
+	// Verified against origin/master: the pre-#5103 code returns false on that
+	// same path, so the gap predates this change and is unchanged by it.
+	//
+	// It was attached to the WRONG BRANCH until round 11 — it sat in the
+	// linkCycled==true arm above, where needLinkCycleRecovery is necessarily
+	// true and the reconcile therefore DOES run, so the caveat contradicted the
+	// code it was written against. docs/reth-mac.md's outcome table has always
+	// had it on the right row ("join OK, cycled MAC write failed"), which is why
+	// that doc is the reference for the full table; the shipping artifact still
+	// has to carry the operative fact, which is why it is also here.
+
+	// NotifyLinkCycle opens with a 1s NIC-settle sleep before it takes the
+	// manager lock, and this call site is INSIDE the per-member RETH loop —
+	// step 2.6b2 pays that second at most once, outside it. Worst case here is
+	// N extra seconds of d.applySem hold when every member aborts (N = RETH
+	// count; 2 on the loss cluster). Bounded, and only on a path where this
+	// node's forwarding is already down — but do not widen this loop, or move
+	// another sleeping call into it, without re-checking that budget.
+	//
+	// #6871: the rollback's own failure is now visible. NotifyLinkCycle was void
+	// and swallowed a failed rebind into a slog.Warn, so "this path owns its own
+	// rollback" was a claim the mechanism could not keep — an abort whose recovery
+	// ALSO failed produced exactly the same (false) evidence as one that recovered.
+	// The commit already fails on this branch either way; the rollback error is
+	// JOINED onto the abort cause rather than replacing it, because the abort is
+	// the more actionable of the two and must not be lost.
+	if rebindErr := joined.Link().NotifyLinkCycle(); rebindErr != nil {
+		slog.Error("userspace: the RETH MAC rollback rebind ALSO failed; this node's "+
+			"AF_XDP workers are stopped with nothing left to re-arm them",
+			"iface", ifName, "err", rebindErr)
+		return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle,
+			errors.Join(err, rebindErr))
+	}
+	return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err)
 }
 
 func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {

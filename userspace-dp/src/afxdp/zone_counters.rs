@@ -204,7 +204,12 @@ pub(in crate::afxdp) fn publishable_zone_rows(
 }
 
 /// #5163: shared cumulative per-zone traffic totals as four `Relaxed` atomics.
-/// One block per configured zone id; the per-batch worker fold `fetch_add`s
+/// One block per SLOT-ASSIGNED zone id — not per configured zone.
+/// [`ZoneCounterSlotMap::build`] skips zone id 0 and stops once
+/// [`ZONE_COUNTER_ASSIGNABLE_SLOTS`] are taken, so a config carrying zone 0 or
+/// more than that many zones resolves a block for a strict SUBSET of what it
+/// configures; the rest get slot 0 and go uncounted (`overflow_active`). The
+/// per-batch worker fold `fetch_add`s
 /// into it lock-free (the same lock-free shared-counter shape as
 /// `PolicyRuleCounter`), and the ≤ 1 s status/clear path reads/zeroes it under
 /// the store mutex. Cache-line sharing between workers `fetch_add`ing the same
@@ -371,6 +376,24 @@ impl ZoneCounterStore {
             totals.add_ingress(ip, ib);
             totals.add_egress(ep, eb);
         }
+    }
+
+    /// Test-only: every zone id the store currently holds a block for,
+    /// INCLUDING zones whose four totals are all zero.
+    ///
+    /// #5716: [`Self::snapshot`] is deliberately SPARSE — it omits all-zero
+    /// rows — so it cannot see a block that was get-or-created and never
+    /// counted into. That is exactly the residue a rejected config build
+    /// leaves behind if it resolves the candidate's zone blocks out of the
+    /// carried-forward (Arc-shared, LIVE) store, so a fixture asserting "a
+    /// rejected build did not mutate the live store" has to look HERE rather
+    /// than at the operator-visible snapshot.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn tracked_zone_ids_for_test(&self) -> Vec<u16> {
+        let totals = self.totals.lock().expect("zone counter store poisoned");
+        let mut ids: Vec<u16> = totals.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Test-only handle to the map mutex, so a test can hold the shared store

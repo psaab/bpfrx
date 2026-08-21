@@ -1045,3 +1045,147 @@ fn build_forwarding_state_threads_default_policy_log_flags() {
     assert!(!quiet.policy.default_log_session_close);
 }
 
+// #5798 FAIL-ON-REVERT, NON-NAT64 arm: an ORDINARY same-family NAT association
+// HIT must also be subject to the per-packet interface INPUT FILTER.
+//
+// The hit-arm filter block lives on the shared `{ hit }` arm, which serves BOTH
+// consults — the NAT64 (cross-family) one and the #5689 same-family SNAT / DNAT
+// / static-NAT / NPTv6 one. `nat64_association_hit_still_runs_interface_input_filter_5798`
+// (tests_nat64_tunnel.rs) exercises only the NAT64 consult, so it would stay
+// green if the filter were gated to NAT64 associations, leaving every ordinary
+// NAT association hit unfiltered. This test closes that: an interface-SNAT
+// lan->wan datagram, whose non-first fragment inherits via
+// `nat_consult_forward_fragment_assoc`.
+//
+// Why the filter can install AND still catch the non-first fragment (no cache
+// seeding needed here): term 1 matches `destination-port 443`, which only the
+// FIRST fragment carries — a non-first fragment is flowless, so the hit arm
+// evaluates it with `l3_session_flow_from_meta`'s zero ports and `l4_present`
+// false. So the first fragment terminates on the accept term and installs the
+// association; the non-first fragment falls through to term 2's
+// `from is-fragment then discard`.
+//
+// The `nat_frag_untranslated_dropped == 0` assertion is what stops this passing
+// for the wrong reason: it proves the fragment was dropped by the FILTER on the
+// hit path, not by the #6122 fail-closed drop that a consult MISS would take.
+//
+// RED on revert: delete the input-filter block from the `{ hit }` arm in
+// poll_descriptor (or gate it on `decision.nat.nat64`) and the discarded case
+// forwards + SNATs.
+#[test]
+fn nat_ordinary_association_hit_still_runs_interface_input_filter_5798() {
+    // Returns (forward, nat_applied_snat, nat_frag_untranslated_dropped) for the
+    // NON-first fragment.
+    let run = |second_term_action: &str| -> (u64, u64, u64) {
+        let mut snapshot = policy_deny_snapshot();
+        snapshot.default_policy = "permit".to_string();
+        snapshot.policies.clear();
+        snapshot.neighbors = vec![frag_transit_wan_neighbor()];
+        snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+            name: "snat-lan-wan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            interface_mode: true,
+            ..Default::default()
+        }];
+        snapshot.interfaces[0].filter_input_v4 = "frag-gate".to_string();
+        snapshot.filters = vec![FirewallFilterSnapshot {
+            name: "frag-gate".to_string(),
+            family: "inet".to_string(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "allow-first".to_string(),
+                    destination_ports: vec!["443".to_string()],
+                    action: "accept".to_string(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "fragments".to_string(),
+                    is_fragment: true,
+                    action: second_term_action.to_string(),
+                    ..Default::default()
+                },
+            ],
+        }];
+        let forwarding = build_forwarding_state(&snapshot);
+
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+        binding.interface = Arc::<str>::from("reth1.0");
+        let mut sessions = SessionTable::new();
+        let ha_state = BTreeMap::new();
+
+        // FIRST fragment: terminates on the `destination-port 443` accept term,
+        // is interface-SNAT'd, and installs the ordinary-NAT association.
+        let first = udp_frag_frame_5689(0x2000, 0xf00d);
+        let (_b1, dbg1) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &first,
+            udp_frag_meta_5689(),
+        );
+        assert_eq!(
+            dbg1.nat_applied_snat, 1,
+            "the SNAT'd first fragment must translate and install the association"
+        );
+        assert_eq!(
+            forwarding.nat64.frag_assoc.len(),
+            1,
+            "the first fragment must install exactly one ordinary-NAT association"
+        );
+
+        // NON-first fragment: association HIT, then the per-packet filter.
+        let non_first = udp_frag_frame_5689(0x0001, 0xf00d);
+        let (batch, dbg2) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &non_first,
+            udp_frag_meta_5689(),
+        );
+        (
+            dbg2.forward,
+            dbg2.nat_applied_snat,
+            batch.nat_frag_untranslated_dropped,
+        )
+    };
+
+    // Control: with the fragment term set to `accept`, the ordinary-NAT
+    // association hit forwards and inherits the SNAT translation. This proves
+    // the seeded hit is real, so the discard case below cannot pass for an
+    // unrelated reason.
+    let (fwd_open, snat_open, miss_drop_open) = run("accept");
+    assert_eq!(
+        fwd_open, 1,
+        "#5798 control: with an accepting fragment term the ordinary-NAT hit must forward"
+    );
+    assert_eq!(
+        snat_open, 1,
+        "#5798 control: the inherited fragment must be SNAT-translated"
+    );
+    assert_eq!(
+        miss_drop_open, 0,
+        "#5798 control: it was an association HIT, not a #6122 fail-closed miss"
+    );
+
+    // The guard.
+    let (fwd_filtered, snat_filtered, miss_drop_filtered) = run("discard");
+    assert_eq!(
+        fwd_filtered, 0,
+        "#5798: a NON-NAT64 (ordinary SNAT) association HIT must still be subject to the \
+         per-packet interface input filter — `from is-fragment then discard` must drop it"
+    );
+    assert_eq!(
+        snat_filtered, 0,
+        "#5798: the filtered fragment must not be SNAT-translated and forwarded"
+    );
+    assert_eq!(
+        miss_drop_filtered, 0,
+        "#5798: the drop must come from the INPUT FILTER on the hit path, not from the #6122 \
+         fail-closed association-miss drop (which would mean the association never hit and \
+         this test proved nothing about the hit arm)"
+    );
+}
