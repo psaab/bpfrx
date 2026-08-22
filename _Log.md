@@ -103606,3 +103606,15 @@ prose edit above them added. No diff falls in the new test body.
   `userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs`,
   `pkg/dataplane/userspace_xdp_bpfel.o`, `pkg/dataplane/userspace_xdp_manifest.json`,
   `pkg/dataplane/README.md`
+
+## 2026-08-22 — #6702 blocker 2 heartbeat zero-init bound
+- **Action**: Zero-init bound for `userspace_heartbeat` changed from a
+  worker-derived prefix to the Array's own capacity (slots are indexed by
+  BINDING slot, which is not a function of `cfg.Workers`); three existing
+  tests retargeted rather than left vacuous.
+- **File(s)**: `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/heartbeat_zero_bound_covers_bindings_6702_test.go` (new),
+  `pkg/dataplane/userspace/maps_sync_heartbeat_slots_4572_test.go`,
+  `pkg/dataplane/userspace/heartbeat_slots_narrowing_5718_test.go`,
+  `pkg/dataplane/userspace/worker_count_single_source_5718_test.go`,
+  `docs/config-schema.md`
