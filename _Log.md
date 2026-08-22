@@ -98303,6 +98303,49 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/scoped_global_zoneset_failclosed_5488_test.go,
   pkg/dataplane/README.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: #5275 (transit half) — made kernel transit forwarding
+  conditional on the dataplane being ARMED. A successful compile followed by
+  an `rt.Start`/`LoadUserspaceShim` failure cleared the dataplane cell, logged
+  "config-only mode", and fell through to `applyConfig`, while
+  `enableForwarding` (bring-up) and `applyKernelTuning` (EVERY apply tail)
+  both wrote `ip_forward=1` / `ipv6.conf.all.forwarding=1` unconditionally.
+  With no shim attached and zero `hook forward` chains in the repo, the kernel
+  routed transit under no policy. New `Daemon.dataplaneArmed atomic.Bool`
+  (accessor `DataplaneArmed()`) is set true only after `rt.Start()` returns
+  nil and false on every path landing in `setDataplane(nil)` — boot arm
+  failure, bootstrap-exit arm failure, both retired-backend arms — plus
+  bootstrap / `--no-dataplane`, which never arm (suppression is not closure:
+  the sysctls outlive the process, so a restart inherited `ip_forward=1`),
+  and the first-commit-confirmed rollback, whose teardown DETACHES an armed
+  dataplane without passing through either arm writer.
+  `applyKernelTuning` now writes the armed state, so a later commit cannot
+  re-open the hole. The bootstrap-exit arm restores `1`; there is NO re-arm
+  path after a non-bootstrap boot arm failure (`rt.Start` has exactly two call
+  sites), so that node needs an xpfd restart — documented. Armed behaviour is
+  byte-identical (desired value `1`). FRR/VRRP/RG-ownership relinquishment is
+  deliberately out of scope (HA-coupled, owes `test-failover`).
+
+  Validation: `go build ./...` exit 0, `go vet ./pkg/daemon/...` exit 0,
+  `go test -count=1 ./pkg/daemon/...` exit 0, `./pkg/dataplane/...
+  ./pkg/cluster/... ./pkg/fsatomic/...` exit 0. Mutation matrix, one mutation
+  per cell, `$?` read directly: M1 boot-arm-failure close removed → exit 1
+  (`TestBootArmFailureClosesTransit5275`); M2 `applyKernelTuning` back to an
+  unconditional `1` → exit 1 (`TestApplyKernelTuningHonoursArmGate5275` +
+  `TestArmFailureSurvivesApplyTail5275`); M3 bootstrap-exit restore removed →
+  exit 1 (`TestRearmAfterArmFailureRestoresTransit5275`); M4 bootstrap-exit
+  close removed → exit 1 (`TestBootstrapExitArmFailureClosesTransit5275`); M5
+  boot-arm-success enable removed → exit 1 (`TestBootArmSuccessKeepsTransit5275`,
+  the negative control); M6 boot policy back to suppress-only → exit 1
+  (`TestBootTransitPolicyClosesWhenNeverArming5275`); M7 rollback un-arm
+  removed → exit 1 (`TestBootstrapRollbackClosesTransit5275`). Go-only diff, no shim
+  `.o` and no protocol movement, but the change alters real forwarding
+  behaviour on the box, so a cluster smoke IS owed before merge.
+- **File(s)**: pkg/daemon/daemon_transit_gate.go (new),
+  pkg/daemon/transit_forwarding_failclosed_5275_test.go (new),
+  pkg/daemon/daemon.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/daemon_run_naming.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/bootstrap.go, pkg/daemon/README.md, pkg/config/README.md,
+  pkg/fsatomic/canary_test.go, _Log.md
 - **Action**: Correct four in-tree "deferred follow-up" claims that went stale
   when the issues they pointed at were plan-killed. Claims-only round, but two
   of the sentences are OPERATOR-FACING commit warnings, so this moves `.text`
