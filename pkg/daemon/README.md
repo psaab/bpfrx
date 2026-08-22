@@ -773,6 +773,68 @@ reconcile passes: an edge pass whose apply fails, a no-transition pass that
 must re-drive it, and a third that must NOT) and
 `TestClaimApplyRetryOnlyAfterAFailedApply`, in
 `dhcp_apply_converger_6535_test.go`.
+
+### Cluster DHCP member scoping: node-local vs RG-scoped (#6520)
+
+`filterDHCPConfigForMasterRGs` decides which members of each
+`dhcp-local-server` / `dhcpv6-local-server` group this node serves. Two
+properties, both wrong before #6520.
+
+**Mastership scopes only RG-scoped members.** The keep-set used to be built
+exclusively from `rethInterfacesForRG` over the currently-MASTER RGs, and that
+function only ever yields members of `reth*` interfaces. Every interface that
+is *not* part of a redundancy group — the `fxp0` management lifeline, and any
+plain node-local data interface — was therefore removed from every group on
+BOTH nodes, and a group made only of such members vanished entirely. Clustering
+a box silently killed the DHCP service its operator had configured on a
+node-local segment. Redundancy-group mastership answers "which node answers for
+this REDUNDANT interface"; it says nothing about an interface with no redundant
+peer, and Junos clusters likewise run `fxp0` services per node. So:
+
+- a member that belongs to NO redundancy group is **node-local** and is kept
+  unconditionally, on both nodes;
+- a member that IS redundancy-group-scoped is kept only while this node masters
+  that RG (unchanged).
+
+Both sets come from ONE walker, `rethInterfacesMatchingRG`, of which
+`rethInterfacesForRG` is now a predicate wrapper. That is deliberate rather than
+stylistic: a divergence between "RG-scoped" and "mastered" is always a bug,
+because the keep rule is exactly *RG-scoped implies mastered*. If one set
+resolved a RETH member to a different name than the other, a node-local
+interface would read as an unmastered RG member (service dropped) or an RG
+member as node-local (both nodes serving DHCP on one redundant segment).
+
+**A narrowed group must not keep Kea's per-subnet interface selector.**
+`config.DHCPServerGroup` carries independent `Interfaces` and `Pools` arrays
+with no semantic edge — nothing records which pool belongs to which member. So
+once this filter removes a member, "the group has exactly one interface" no
+longer implies "every pool in the group is served on that interface", which is
+the inference `dhcpserver.subnetInterface` makes when it emits Kea's per-subnet
+`interface` selector (#1778). A mixed `[fxp0.0, reth0.80]` group narrowed to the
+surviving RETH member would bind the fxp0 pool's subnet to the RETH member.
+
+The filter therefore sets `DHCPServerGroup.MembersFiltered` whenever it actually
+shrinks a group, and `subnetInterface` omits the selector for such a group —
+falling back to Kea address-based subnet selection, the same mechanism every
+multi-interface group already uses. This never changes WHICH subnets are served,
+only how Kea selects among them. `MembersFiltered` is a runtime marker, excluded
+from every marshal (`json:"-"`, `yaml:"-"`) so it cannot reach the
+compiled-config dump, the golden compile baseline, or the peer over cluster
+config-sync.
+
+Dropping the whole group instead was considered and rejected: for a mixed-RG
+group in active/active (say `reth0.80` in RG1 and `reth1.0` in RG2) BOTH nodes
+would drop it and DHCP would stop everywhere.
+
+Guards: `pkg/daemon/dhcp_rg_filter_6520_test.go` (node-local member kept beside
+a mastered RETH member; node-local-only group survives on a node mastering
+nothing; an RG-scoped member of a BACKUP RG is still removed; the flag is set
+exactly when the group shrank) and
+`pkg/dhcpserver/kea_filtered_group_selector_6520_test.go` (the renderer emits no
+per-subnet selector for a narrowed group, and still emits one for an authored
+singleton). The two files name their own side of the agreement so a failure says
+which half broke.
+
 ### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
 
 `rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an

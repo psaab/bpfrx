@@ -52,6 +52,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 
 # Signed-distribution helpers (#1924) live under scripts/dist.
 sys.path.insert(0, os.path.join(ROOT, "scripts", "dist"))
+import image_inventory  # noqa: E402  (#6500 inventory format)
 import sign  # noqa: E402
 
 # Runtime dependency set installed explicitly into the image. This is the
@@ -615,6 +616,15 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
         "--run-command", "passwd -d root",
+        # #6500: record what this image actually SHIPS — the guest kernel and
+        # the full installed package set — INSIDE the image, as the last step
+        # so the enumeration is the final one (after every install, purge and
+        # autoremove above). bake.py reads it back out offline with virt-cat
+        # and emits it as the signed xpf-<ver>.pkgs sidecar; the in-image copy
+        # stays so an operator on the box can answer the same CVE-triage
+        # question without the dist tree. The fragment FAILS THE BAKE on an
+        # empty enumeration rather than shipping a hollow record.
+        "--run-command", image_inventory.WRITE_CMD,
         "--run-command", "/usr/local/sbin/xpfd version",
     ]
     run(argv)
@@ -693,7 +703,7 @@ def finalize_artifacts(*, validate_step, sign_step):
 
 def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
                         base_pinned, validated, bake_date, kernel,
-                        proto_lines=""):
+                        guest_kernel, proto_lines=""):
     """Assemble the xpf-<ver>.manifest sidecar text (key: value lines).
 
     Pure + unit-testable so the supply-chain PROVENANCE fields are asserted
@@ -705,6 +715,13 @@ def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
       - `base_image_pinned` (#4904 B): whether the Ubuntu base was authenticated
         against the repo-pinned trust-anchor digest (bound alongside the base
         digest + source URL already recorded here).
+      - `guest_kernel` (#6500): the kernel the IMAGE ships — the exact artifact
+        the #1930 LANE-1 channel promotes. `kernel` above is the BUILD HOST's
+        (`os.uname().release`, honestly named `bake_host_kernel`) and answers a
+        different question entirely. It is a REQUIRED keyword, not a defaulted
+        one, so a caller cannot silently omit the field the publish gate
+        requires. The full package inventory is too large for this sidecar and
+        rides in xpf-<ver>.pkgs, covered by the same signed SHA256SUMS.
 
     The sidecar is covered by the signed xpf-<ver>.SHA256SUMS (#5042), so these
     fields are authenticated once the manifest signature verifies.
@@ -719,6 +736,7 @@ def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
         f"validated: {'true' if validated else 'false'}\n"
         f"bake_date: {bake_date}\n"
         f"bake_host_kernel: {kernel}\n"
+        f"guest_kernel: {guest_kernel}\n"
         + proto_lines
     )
 
@@ -743,6 +761,7 @@ def main():
                     ("virt-sysprep", "apt-get install libguestfs-tools"),
                     ("virt-sparsify", "apt-get install libguestfs-tools"),
                     ("virt-filesystems", "apt-get install libguestfs-tools"),
+                    ("virt-cat", "apt-get install libguestfs-tools"),
                     ("curl", "apt-get install curl")]:
         require(t, hint)
     if not (os.access("/dev/kvm", os.R_OK) and os.access("/dev/kvm", os.W_OK)):
@@ -822,6 +841,23 @@ def main():
         # 4. customize
         info("customizing image offline (packages, kernel >= 6.18, xpf install)...")
         virt_customize(work_qcow, xpf_deb)
+
+        # 4b. read the #6500 inventory back OUT of the image, offline.
+        # virt-cat, not a boot: the whole point is that the record is
+        # extractable without running the appliance. A parse failure ABORTS the
+        # bake — an image whose traceability record is missing or hollow is not
+        # publishable anyway (publish.py's gate refuses it), so failing here
+        # gives the operator the real cause instead of a refusal three steps
+        # later against an artifact that already exists.
+        info("reading the image inventory (guest kernel + installed packages)...")
+        inventory_text = out_text(
+            ["virt-cat", "-a", work_qcow, image_inventory.INVENTORY_GUEST_PATH])
+        try:
+            guest_kernel, inventory_pkgs = image_inventory.parse(inventory_text)
+        except image_inventory.InventoryError as e:
+            die(f"the baked image carries no usable inventory at "
+                f"{image_inventory.INVENTORY_GUEST_PATH}: {e}")
+        info(f"guest kernel {guest_kernel}, {len(inventory_pkgs)} packages recorded")
 
         # 5. seal
         info("sealing image (virt-sysprep)...")
@@ -913,7 +949,8 @@ def main():
                 rel=rel, base_sha=base_sha, base_pinned=base_pinned,
                 validated=not a.skip_validate,
                 bake_date=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                kernel=os.uname().release, proto_lines=proto_lines))
+                kernel=os.uname().release, guest_kernel=guest_kernel,
+                proto_lines=proto_lines))
         info(f"manifest: {manifest}")
 
         # Per-version, version-named checksum manifest (#1924 §5.1): each bake
@@ -925,8 +962,19 @@ def main():
         # `xpf-deploy image-roll` verifies it against this SHA256SUMS before
         # parsing the ha-protocol / session-sync fields. The .minisig over this
         # manifest is produced only AFTER the validation gate (finalize_artifacts).
+        # #6500: the package inventory sidecar. Its own file rather than more
+        # manifest lines — a full dpkg list is hundreds of entries and the
+        # .manifest is parsed line-by-line by the deployer's mixed-base gate.
+        # It joins the signed SHA256SUMS below, so it is authenticated exactly
+        # like the .manifest sidecar is (#5042).
+        pkgs_out = os.path.join(a.out, image_inventory.sidecar_name(ver))
+        with open(pkgs_out, "w") as f:
+            f.write(inventory_text if inventory_text.endswith("\n")
+                    else inventory_text + "\n")
+        info(f"inventory: {pkgs_out}")
+
         sums = os.path.join(a.out, f"xpf-{ver}.SHA256SUMS")
-        sign.write_manifest(sums, [qcow_out, meta_out, manifest])
+        sign.write_manifest(sums, [qcow_out, meta_out, manifest, pkgs_out])
         info("checksums:")
         print(open(sums).read(), end="")
 

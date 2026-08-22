@@ -775,7 +775,20 @@ func parseLeaseCSVFileInto(path string, now time.Time, acc *leaseCSVAccum) error
 // pre-#1778 renderer silently bound only the first interface,
 // breaking the others. All group interfaces are always listed in
 // interfaces-config, so Kea listens on every one either way.
+//
+// #6520: the single-interface inference is only sound for a group whose member
+// list is what the operator AUTHORED. A group narrowed at runtime by the
+// chassis-cluster master-RG filter can arrive here as a singleton while still
+// carrying the pools of the members that were removed, and binding those pools
+// to the survivor cross-binds a foreign network onto it. There is no
+// pool→member edge in the config model to filter the pools by, so a narrowed
+// group falls back to address-based selection — the same mechanism every
+// multi-interface group already uses, and correct for the pools that DO belong
+// to the survivor.
 func subnetInterface(group *config.DHCPServerGroup) string {
+	if group.MembersFiltered {
+		return ""
+	}
 	if len(group.Interfaces) == 1 {
 		return group.Interfaces[0]
 	}
