@@ -337,6 +337,52 @@ func rg0ConfigSyncAuthority(cl *cluster.Manager) bool {
 	return cl != nil && cl.IsLocalPrimary(0)
 }
 
+// peerSyncPolicy is what a COMMITTER wants done about the cluster peer. It is
+// deliberately not a bool, because the two false-ish answers a bool conflates
+// are the whole of #5962:
+//
+//   - peerSyncNever — "this commit must never reach the peer". The autonomous
+//     event-options engine means this: each node fires its own remediation from
+//     its own RPM events, and pushing that node-local state would overwrite the
+//     peer's. It is a POLICY, and it is true whatever this node owns.
+//   - peerSyncIfRG0Authority — "push it if this node is the RG0 config
+//     authority". That is a fact about the CURRENT cluster state, and it can
+//     change under the committer's feet.
+//
+// #5054 collapsed both into a bool by evaluating rg0ConfigSyncAuthority in
+// commitAndApplyOperator, at ATTEMPT time — before store.Commit's
+// ensureWritableLocked. A node promoted to RG0 primary between those two points
+// committed successfully and then skipped the push, because the attempt-time
+// answer had already been frozen into `false`. The pre-#5058 gRPC path did not
+// have that window: it passed an unconditional true and let the push site
+// decide. Carrying the POLICY rather than its resolved value restores that —
+// wantsPush is evaluated once, after the commit succeeded, at the point the
+// push is actually made.
+//
+// peerSyncAlways exists for tests and for a caller that has already established
+// authority; production has no such caller today.
+type peerSyncPolicy uint8
+
+const (
+	peerSyncNever peerSyncPolicy = iota
+	peerSyncAlways
+	peerSyncIfRG0Authority
+)
+
+// wantsPush resolves the policy against the cluster state AT THE MOMENT OF
+// ASKING. Call it at the push decision point, never earlier: an
+// authority-gated policy resolved early is exactly the #5962 TOCTOU.
+func (p peerSyncPolicy) wantsPush(cl *cluster.Manager) bool {
+	switch p {
+	case peerSyncAlways:
+		return true
+	case peerSyncIfRG0Authority:
+		return rg0ConfigSyncAuthority(cl)
+	default:
+		return false
+	}
+}
+
 // syncConfigToPeer sends the active config to the cluster peer if this node is
 // the RG0 config-sync authority and config sync is enabled.
 func (d *Daemon) syncConfigToPeer() {

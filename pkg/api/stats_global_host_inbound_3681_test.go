@@ -55,11 +55,11 @@ func decodeGlobalStats(t *testing.T, rr *httptest.ResponseRecorder) GlobalStats 
 func TestGlobalStatsReportsKernelDeniesWhenDataplaneUnloaded(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	defer func() { readHostInboundDenyCounters = orig }()
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
 		return []xnft.HostInboundDenyCount{
 			{Zone: "wan", Family: "ip", Packets: 7, Bytes: 700},
 			{Zone: "wan", Family: "ip6", Packets: 3, Bytes: 300},
-		}, nil
+		}, xnft.HostInboundTableCounted, nil
 	}
 
 	s := &Server{} // dp intentionally nil — degraded / config-only boot.
@@ -105,8 +105,8 @@ func TestGlobalStatsReportsKernelDeniesWhenDataplaneUnloaded(t *testing.T) {
 func TestGlobalStatsKernelDenyReadErrorMarksUnavailableUnloaded(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	defer func() { readHostInboundDenyCounters = orig }()
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
-		return nil, errNftRead
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
+		return nil, xnft.HostInboundTableAbsent, errNftRead
 	}
 
 	s := &Server{} // dp nil — degraded boot AND nft read error.
@@ -136,8 +136,8 @@ func TestGlobalStatsKernelDenyReadErrorMarksUnavailableUnloaded(t *testing.T) {
 func TestGlobalStatsKernelDenyReadErrorMarksUnavailableLoaded(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	defer func() { readHostInboundDenyCounters = orig }()
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
-		return nil, errNftRead
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
+		return nil, xnft.HostInboundTableAbsent, errNftRead
 	}
 
 	s := &Server{dp: &idxValueAPIDP{Manager: dataplane.New()}}
@@ -171,8 +171,8 @@ func TestGlobalStatsKernelDenyReadErrorMarksUnavailableLoaded(t *testing.T) {
 func TestGlobalStatsKernelDenyCleanReadNoMarker(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	defer func() { readHostInboundDenyCounters = orig }()
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
-		return nil, nil
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
+		return nil, xnft.HostInboundTableAbsent, nil
 	}
 
 	s := &Server{dp: &idxValueAPIDP{Manager: dataplane.New()}}

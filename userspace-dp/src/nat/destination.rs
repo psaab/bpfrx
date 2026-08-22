@@ -445,7 +445,19 @@ impl DnatTable {
                                 source_v6.push(PrefixV6::from_net(net));
                             }
                         }
-                        Err(_) => {}
+                        // #5190: an entry that is neither a CIDR prefix nor a
+                        // bare host IP is DROPPED from the parsed list. The
+                        // rule keeps `source_constrained`, so `source_matches`
+                        // still fails CLOSED (#2394) — but before #5190 the
+                        // drop was also SILENT, so an operator whose DNAT rule
+                        // stopped matching had no signal that its only source
+                        // entry never reached the dataplane. Fail-closed is
+                        // the right behaviour; being quiet about it is not.
+                        Err(_) => nat_counters.record_parse_error(&format!(
+                            "DNAT rule {:?}: unparseable match source-address {:?} \
+                             (entry dropped; rule stays source-scoped and fails closed)",
+                            snap.name, prefix
+                        )),
                     },
                 }
             }

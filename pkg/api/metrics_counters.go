@@ -59,9 +59,24 @@ var readHostInboundAcceptCounters = xnft.ReadHostInboundAcceptCounters
 // emitted last in Collect by emitCounterReadErrors (#3462); the bump here
 // accumulates on the collector and is reflected in the same scrape's emitted
 // value when the dataplane is loaded.)
+//
+// #5719: a COUNTERLESS table gets the same treatment as a read failure. The
+// #5644 cold-boot fail-closed fence installs the table with catch-all DROPs and
+// deliberately NO named counters, so the kernel can be actively dropping
+// host-bound traffic with nothing to scrape. There is no series to emit in that
+// state either way; bumping xpf_counter_read_errors_total is what keeps this
+// surface consistent with the REST host_inbound_kernel_denies_unavailable marker
+// (stats.go), so an operator alerting on either one sees the fence. A table that
+// is merely ABSENT keeps the silent, error-free skip: no enforcement really is
+// no denies. See xnft.HostInboundTableCounterless for why a real generation
+// (which always declares the #4759 accept counters) can never land here.
 func (c *xpfCollector) collectHostInboundKernelDenies(ch chan<- prometheus.Metric) {
-	counts, err := readHostInboundDenyCounters()
+	counts, state, err := readHostInboundDenyCounters()
 	if err != nil {
+		c.counterReadErrors.Add(1)
+		return
+	}
+	if state == xnft.HostInboundTableCounterless {
 		c.counterReadErrors.Add(1)
 		return
 	}

@@ -3,7 +3,7 @@
 
 use super::super::helpers::{
     forwarding_unsupported_error, reconcile_status_bindings, refresh_status,
-    set_bindings_forwarding_armed, wait_for_binding_settle,
+    set_bindings_forwarding_armed,
 };
 use super::super::ServerState;
 use crate::{ControlResponse, ForwardingControlRequest};
@@ -14,6 +14,12 @@ pub(super) fn set(
     forwarding: Option<ForwardingControlRequest>,
     response: &mut ControlResponse,
     persist_state: &mut bool,
+    // #5862: where the caller records that a binding-settle wait is owed. The
+    // wait itself runs in handlers::handle_request AFTER the global ServerState
+    // lock is dropped — the same locked-kick / unlocked-wait split #2962 and
+    // #4054 use. Holding the lock across a 2 s settle stalled every HA
+    // `sync_session` on the "dedicated" session socket, which shares this mutex.
+    settle_wait: &mut Option<Duration>,
 ) {
     let Some(forwarding_req) = forwarding else {
         response.ok = false;
@@ -51,7 +57,7 @@ pub(super) fn set(
         return;
     }
     if forwarding_req.armed {
-        wait_for_binding_settle(guard, Duration::from_secs(2));
+        *settle_wait = Some(Duration::from_secs(2));
     }
     refresh_status(guard);
     *persist_state = true;

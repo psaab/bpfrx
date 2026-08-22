@@ -413,27 +413,37 @@ pub(super) fn screen_parse_error_info(
 /// #3064: flowless variant of `screen_parse_error_info`. The non-first
 /// fragment path has no `SessionFlow` (it is deliberately left flowless
 /// by #2344 so the fragment payload is never parsed as L4 ports), so
-/// there is no 5-tuple to log. Build the same minimal `ScreenPacketInfo`
-/// for the fail-closed drop event with unspecified addresses/ports —
-/// the verdict is already DROP, so the fragment/TCP fields are never
-/// consulted for a decision; only `addr_family`/`protocol`/`pkt_len`
-/// carry useful context.
+/// there are no L4 PORTS to log. Everything the upstream metadata parser
+/// already resolved IS logged: `addr_family`, `protocol` and `pkt_len`
+/// come from the authoritative `UserspaceDpMeta`, and the L3 addresses
+/// come from the caller's `flowless_l3_addrs` read of the IP header (a
+/// non-first fragment / ICMP control message carries a full IP header;
+/// that helper already returns the family-correct UNSPECIFIED placeholder
+/// when the header is too short to read, so a wholly unreadable frame
+/// degrades exactly as it did before).
+///
+/// #5190 (A1-b1-F5): `protocol`, `pkt_len` and both L3 addresses used to
+/// be hard-coded 0 / UNSPECIFIED here while the authoritative values sat
+/// unused at the single call site, so EVERY flowless malformed-packet
+/// screen drop reported `protocol=0` and `0.0.0.0`/`::` to
+/// syslog/NetFlow. Taking `&UserspaceDpMeta` plus the derived addresses
+/// rather than a bare `addr_family` makes the omission unrepresentable.
+/// `addr_family`/`protocol`/`src_ip`/`dst_ip` reach the wire through
+/// `emit_screen_drop_event`; `pkt_len` is not part of that event payload
+/// but is populated so the struct is not silently untruthful to any
+/// future reader. Ports and the fragment/TCP fields stay at their
+/// conservative defaults; the verdict is already DROP, so they are never
+/// consulted for a screen decision (the per-reason drop counter is keyed
+/// by the reason STRING, not by anything in this struct).
 #[inline]
-pub(super) fn screen_parse_error_info_flowless(addr_family: u8) -> ScreenPacketInfo {
-    let (src_ip, dst_ip) = if addr_family == libc::AF_INET6 as u8 {
-        (
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        )
-    } else {
-        (
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        )
-    };
+pub(super) fn screen_parse_error_info_flowless(
+    meta: &UserspaceDpMeta,
+    src_ip: std::net::IpAddr,
+    dst_ip: std::net::IpAddr,
+) -> ScreenPacketInfo {
     ScreenPacketInfo {
-        addr_family,
-        protocol: 0,
+        addr_family: meta.addr_family,
+        protocol: meta.protocol,
         tcp_flags: 0,
         src_ip,
         dst_ip,
@@ -442,7 +452,7 @@ pub(super) fn screen_parse_error_info_flowless(addr_family: u8) -> ScreenPacketI
         tcp_seq: 0,
         tcp_ack: 0,
         tcp_mss: 0,
-        pkt_len: 0,
+        pkt_len: meta.pkt_len,
         is_fragment: false,
         is_first_fragment: false,
         ip_ihl: 5,
