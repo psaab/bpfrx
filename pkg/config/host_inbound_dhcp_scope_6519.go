@@ -143,6 +143,7 @@ func validateHostInboundZoneLevelDHCPWarnings(cfg *Config) []string {
 		return nil
 	}
 	lifelines := HostInboundLifelineSet(cfg)
+	serverRefs := hostInboundDHCPServerRefs(cfg)
 	names := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
 		names = append(names, name)
@@ -169,6 +170,7 @@ func validateHostInboundZoneLevelDHCPWarnings(cfg *Config) []string {
 		}
 		sort.Strings(refs)
 		var reached []string
+		var anyClient, anyIdle bool
 		for _, ref := range refs {
 			if HostInboundLifelineInterface(ref, lifelines) {
 				continue
@@ -178,7 +180,15 @@ func validateHostInboundZoneLevelDHCPWarnings(cfg *Config) []string {
 			for _, tok := range hostInboundDHCPExceptionServices {
 				if hostInboundSetAdmitsService(effSvc, tok) &&
 					!hostInboundSetAdmitsService(ownSvc, tok) {
-					reached = append(reached, ref)
+					// #6519 stage 1.5: name WHY the token is load-bearing here.
+					// The role is the discriminator the deferred enforcement
+					// flip turns on, so the advisory computes it rather than
+					// leaving every reader to work it out per interface.
+					roles := hostInboundDHCPRolesFor(cfg, serverRefs, ref)
+					anyClient = anyClient || roles.client
+					anyIdle = anyIdle || (!roles.client && !roles.server)
+					reached = append(reached,
+						fmt.Sprintf("%s (%s)", ref, hostInboundDHCPRoleLabel(roles)))
 					break
 				}
 			}
@@ -186,7 +196,7 @@ func validateHostInboundZoneLevelDHCPWarnings(cfg *Config) []string {
 		if len(reached) == 0 {
 			continue
 		}
-		warnings = append(warnings, fmt.Sprintf(
+		msg := fmt.Sprintf(
 			"zone %q host-inbound-traffic: system-services %s %s configured at the "+
 				"ZONE level, which Junos does not allow — DHCP and BOOTP are the "+
 				"host-inbound services Junos accepts only per interface, because the "+
@@ -194,10 +204,27 @@ func validateHostInboundZoneLevelDHCPWarnings(cfg *Config) []string {
 				"zone-level token authorizes DHCP/BOOTP on %s, which Junos would "+
 				"require you to admit interface by interface. Move the token to "+
 				"`interfaces <if> host-inbound-traffic system-services ...` on the "+
-				"interfaces that need it (#6519 parity deviation; xpf still enforces "+
-				"the zone-level authorization today).",
+				"interfaces that need it — and note a per-interface stanza REPLACES "+
+				"the zone stanza (#6515), so restate the zone's other tokens there or "+
+				"they stop being admitted on that interface.",
 			name, strings.Join(toks, ", "), pluralIsAre(len(toks)),
-			strings.Join(reached, ", ")))
+			strings.Join(reached, ", "))
+		if anyIdle {
+			msg += " An interface marked `no DHCP configured` runs neither a DHCP " +
+				"server/relay nor the firewall's own DHCP client, so the zone-level " +
+				"token opens udp/67-68 there for nothing — removing it narrows nothing " +
+				"in use."
+		}
+		if anyClient {
+			msg += " An interface marked `DHCP client` runs the firewall's OWN client, " +
+				"which needs udp/68 for its unicast renewals. The vendor rule quoted " +
+				"above is about a DHCP SERVER knowing its incoming interface and does " +
+				"not speak to the client, so on that interface the token is holding up " +
+				"the interface's ADDRESS, not merely a service — move it, do not drop it."
+		}
+		msg += " (#6519 parity deviation; xpf still enforces the zone-level " +
+			"authorization today.)"
+		warnings = append(warnings, msg)
 	}
 	return warnings
 }
@@ -208,4 +235,127 @@ func pluralIsAre(n int) string {
 		return "is"
 	}
 	return "are"
+}
+
+// hostInboundDHCPRoles records WHY an interface would need udp/67-68 admitted.
+// The two halves are independent booleans rather than an enum because an
+// interface can legitimately be both (a relay member that also runs the
+// firewall's own client), and picking a winner would invent a precedence the
+// config does not state.
+type hostInboundDHCPRoles struct {
+	server bool // dhcp-local-server / dhcpv6-local-server / dhcp-relay member
+	client bool // family inet { dhcp; } — the firewall's OWN DHCP client
+}
+
+// hostInboundSameInterface reports whether two interface refs name the same
+// interface for DHCP-role purposes. A bare physical ref and a unit ref under it
+// are the same interface (`reth1` vs `reth1.0`) — the #3720 physical/unit
+// relationship — but two DIFFERENT units are not (`reth1.0` vs `reth1.50`).
+// Basing both sides on the physical would collapse those two, over-matching a
+// sibling unit's DHCP role onto an interface that has none.
+func hostInboundSameInterface(a, b string) bool {
+	if a == b {
+		return true
+	}
+	aBase, _, aUnit := strings.Cut(a, ".")
+	bBase, _, bUnit := strings.Cut(b, ".")
+	if aBase != bBase {
+		return false
+	}
+	// Equal bases: same interface only when exactly one side is the bare
+	// physical. Two distinct units are distinct interfaces.
+	return aUnit != bUnit
+}
+
+// hostInboundDHCPServerRefs collects every interface ref that receives DHCP on
+// the firewall's behalf as a SERVER: dhcp-local-server and dhcpv6-local-server
+// group members, and dhcp-relay group members. A relay counts because it too
+// receives client DISCOVER on udp/67 and is the case the vendor rationale
+// describes — the incoming interface must be known to send the reply back.
+func hostInboundDHCPServerRefs(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var refs []string
+	for _, srv := range []*DHCPLocalServerConfig{
+		cfg.System.DHCPServer.DHCPLocalServer,
+		cfg.System.DHCPServer.DHCPv6LocalServer,
+	} {
+		if srv == nil {
+			continue
+		}
+		for _, g := range srv.Groups {
+			if g != nil {
+				refs = append(refs, g.Interfaces...)
+			}
+		}
+	}
+	if cfg.ForwardingOptions.DHCPRelay != nil {
+		for _, g := range cfg.ForwardingOptions.DHCPRelay.Groups {
+			if g != nil {
+				refs = append(refs, g.Interfaces...)
+			}
+		}
+	}
+	return refs
+}
+
+// hostInboundIsDHCPClient reports whether ref runs the firewall's OWN DHCPv4
+// client (`family inet { dhcp; }`). Only v4 is consulted: the tokens this
+// advisory is about (`dhcp` / `bootp`) open udp/67-68, and `dhcpv6` is
+// deliberately out of the vendor sentence's scope (see the file header).
+//
+// A bare physical ref answers for ANY unit beneath it, because the zone
+// membership names the physical while the client is configured on a unit.
+func hostInboundIsDHCPClient(cfg *Config, ref string) bool {
+	if cfg == nil || ref == "" {
+		return false
+	}
+	base, unitStr, hasUnit := strings.Cut(ref, ".")
+	ifc := cfg.Interfaces.Interfaces[base]
+	if ifc == nil {
+		return false
+	}
+	for n, u := range ifc.Units {
+		if u == nil || !u.DHCP {
+			continue
+		}
+		if !hasUnit {
+			return true
+		}
+		if fmt.Sprintf("%d", n) == unitStr {
+			return true
+		}
+	}
+	return false
+}
+
+// hostInboundDHCPRolesFor classifies one interface ref.
+func hostInboundDHCPRolesFor(cfg *Config, serverRefs []string, ref string) hostInboundDHCPRoles {
+	var r hostInboundDHCPRoles
+	for _, s := range serverRefs {
+		if hostInboundSameInterface(s, ref) {
+			r.server = true
+			break
+		}
+	}
+	r.client = hostInboundIsDHCPClient(cfg, ref)
+	return r
+}
+
+// hostInboundDHCPRoleLabel is the parenthetical the advisory appends to an
+// interface name, naming which DHCP role makes the zone-level token load-bearing
+// there. "no DHCP configured" is the operationally most useful of the three: it
+// says the token authorizes udp/67-68 for nothing.
+func hostInboundDHCPRoleLabel(r hostInboundDHCPRoles) string {
+	switch {
+	case r.server && r.client:
+		return "DHCP server and client"
+	case r.server:
+		return "DHCP server"
+	case r.client:
+		return "DHCP client"
+	default:
+		return "no DHCP configured"
+	}
 }
