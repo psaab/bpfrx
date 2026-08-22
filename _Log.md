@@ -102390,6 +102390,20 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/upgrade/flip.go, pkg/upgrade/kernel.go,
   pkg/upgrade/kernel_arm_restamp_6639_test.go (new), _Log.md
 
+## 2026-08-22 — #7395 control-char secret leak: the other three cells
+- **Timestamp**: 2026-08-22
+- **Action**: #6625's merged fix (PR #7387, another lane) covered ONE of four
+  cells. Measured at master: {strict,lenient} x {flat,hierarchical} → only
+  strict/flat redacted. `isSecretLeaf` reads `keys[0]`, which is the keyword in
+  the flat shape and the VALUE in the hierarchical one, so the hierarchical
+  shape defeated it entirely; the lenient sanitizer was never fixed at all and
+  is the worse surface (its caller LOGS every path, on Store.Load at boot and
+  Store.SyncApply per HA peer-sync). Routed both validators through a
+  FLATTENED-path resolution that is shape-independent, taking the UNION of the
+  tree's two secret-leaf lists so neither can under-redact, and bound the two
+  lists to agree.
+- **File(s)**: pkg/config/freetext.go,
+  pkg/config/control_char_secret_shapes_7395_test.go (new), _Log.md
 - **Timestamp**: 2026-08-22
   - **Action**: #6641 — surfaced SHARED_SESSION_POISON_RECOVERIES (#2402) as
     xpf_userspace_shared_session_poison_recoveries_total, mirroring #1807 end to
