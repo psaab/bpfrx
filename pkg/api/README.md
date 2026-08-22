@@ -1017,6 +1017,41 @@ under the daemon's errgroup. Nothing else imports this package.
 `authz`, `config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`,
 `ipsec`, `logging`, `routing`, `vrrp`.
 
+## NAT show views delegate to `pkg/natshow` (#6565)
+
+`show-text?topic=nat-static` and `topic=nat-nptv6` call
+`natshow.RenderStatic` / `natshow.RenderNPTv6` — the SAME renderers the CLI
+(`cli_show_nat.go`) and gRPC (`server_show_nat.go`) call. They must never be
+reimplemented here.
+
+REST used to reimplement both, printing every rule straight from config. That
+third copy made the fail-closed NOT-INSTALLED annotations a per-surface
+lottery: #5323 taught two surfaces to annotate a rule the userspace snapshot
+builder drops, #6534 taught two surfaces a further set of exclusion reasons,
+and each time REST kept rendering the dropped rule as live. CLI and gRPC each
+had a byte-equality test against the shared renderer (#1687); REST did not, and
+REST is the copy that drifted.
+
+`show_nat_shared_test.go` is the third leg of that invariant. Two things about
+its fixture are load-bearing and were both learned by a mutation cell failing
+to red:
+
+- **It is staged through the TOLERANT ingress (`Store.SyncApply`), not a
+  commit.** Every exclusion `staticRuleNotInstalledReason` reports is also
+  hard-rejected by a strict commit gate (`then static-nat inet` by #5859, the
+  NPTv6 scope forms by #5818), so an excluded rule cannot reach `ActiveConfig`
+  through a commit at all. A commit-staged fixture contains no exclusion, both
+  renderers agree byte-for-byte, and the test passes on the UNFIXED code. The
+  tolerant ingress — a persisted config at boot, or an HA peer sync — is where
+  those gates downgrade to warnings (#1960) and therefore the only path on
+  which REST was lying.
+- **It carries an excluded rule in EACH view.** With only a static-NAT
+  exclusion the `nptv6` subtest compares two renderings that agree trivially
+  and passes on the unfixed code.
+
+The test guards both premises explicitly, so a fixture that stops exercising
+the drop fails loudly instead of going quietly vacuous.
+
 ## Gotchas
 
 - **Management-plane DoS hardening (#4150).** Both `http.Server` literals in

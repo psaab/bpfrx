@@ -101275,3 +101275,17 @@ prose edit above them added. No diff falls in the new test body.
   TOUCHES VRRP — owes `make test-failover`.
 - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
   pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
+
+## 2026-08-21 — #6565: REST NAT show views delegate to the shared renderer
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/api/show_text.go` reimplemented `nat-static` / `nat-nptv6`,
+  printing every rule straight from config — a THIRD independently-written copy
+  alongside CLI and gRPC, which both delegate to `pkg/natshow`. #5323 and
+  #6534 each taught a strict subset of the copies to annotate a rule the
+  snapshot builder drops, leaving REST rendering it as live. Routed REST
+  through `natshow.RenderStatic`/`RenderNPTv6` and added the third leg of the
+  #1687 byte-equality invariant (`show_nat_shared_test.go`). Fixture is staged
+  via the TOLERANT ingress and carries an exclusion in EACH view — both facts
+  were forced by mutation cells that failed to red.
+- **File(s)**: pkg/api/show_text.go, pkg/api/show_nat_shared_test.go (new),
+  pkg/api/README.md, _Log.md
