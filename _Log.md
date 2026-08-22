@@ -98838,3 +98838,60 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/sessions_policy_id_zero_4626_test.go, pkg/dataplane/types.go,
   userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6987 — a session's recorded ingress `{ifindex, VLAN}` is stamped
+  at INSTALL, while the `{ifindex, VLAN} -> interface name` table is rebuilt
+  from the CURRENT config and the CURRENT kernel ifindexes on EVERY query. A
+  kernel ifindex is RECYCLED — a tunnel, VLAN unit or XFRM interface is
+  destroyed and its number handed to a different interface later — so a stale
+  ifindex does not merely MISS the rebuilt table: it HITS it and names an
+  interface the session never arrived on. Nothing in the output distinguished
+  that from a correct answer.
+
+  REPRODUCED FIRST on top of the #6960 branch: `gr-0/0/0` (zone vpn) held
+  ifindex 42 when the session installed; the tunnel was torn down and `ge-0/0/2`
+  (zone trust) took 42. `resolveIngressIfaces(42, 0, vpn)` returned
+  `[ge-0/0/2]` — one confident name in the WRONG zone — and
+  `show security flow session interface ge-0/0/2` selected the row.
+
+  The row carries one other identity recorded at the same instant: its ingress
+  ZONE, whose id is name-derived and STABLE across commits (`assignZoneIDs`).
+  An identity hit is now corroborated against it. A disagreement is a MISS on
+  the FILTER (`clear security flow session interface <name>` runs through the
+  same predicate, so selecting on an untrustworthy name would DELETE sessions
+  that never touched the named interface; the row stays reachable through its
+  recorded zone and its egress arm), and prints NOTHING on the reported column
+  — even where the zone binds exactly one interface, because the row carries
+  positive evidence of inconsistency rather than mere absence.
+
+  The reported column also stops naming one member of a MULTI-interface zone on
+  behalf of its siblings. `pkg/cli` built a second, display-only
+  `map[uint16]string` of each zone's first interface, deliberately separate
+  from the filter's widened map; that map is deleted and both columns now read
+  the one map `populateIfaceMaps` builds. The same rule lands on `pkg/grpcapi`
+  and `pkg/api` in the same change, or the console and the remote `cli` would
+  report different interfaces for one session. Where a zone binds exactly ONE
+  interface the approximation has exactly one answer and is still printed, so
+  the #4983 never-blank property holds: peer-synced and reverse-direction rows
+  keep an ingress column (the zone name where the zone cannot narrow).
+
+  Residual, measured and deliberately NOT closed: a recycle WITHIN one zone
+  corroborates and still names the wrong sibling. Separating it needs an
+  install-time generation carried on the session row, which is a dataplane wire
+  change. Filed as #7239, with the uncorroborated EGRESS side as #7240.
+
+  VALIDATION: 6 mutations, each one line on a clean tree, all RED with `go vet`
+  clean (assertion reds, not build breaks) — corroboration forced true (cli),
+  the disputed-display arm removed (cli + gRPC), and the sole-member display
+  rule widened to "first of any" (cli + gRPC + REST). `go test -count=1` green
+  for pkg/cli, pkg/grpcapi, pkg/api, pkg/dataplane; `go build ./...` and
+  `go vet ./...` clean. Rust diff is doc comments only; nothing reaches the
+  helper binary, so no cluster smoke is owed.
+- **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/session_ingress_identity_stale_6987_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/session_iface_identity_6960_test.go, pkg/api/sessions.go,
+  pkg/api/session_iface_identity_6960_test.go, pkg/dataplane/types.go,
+  userspace-dp/src/session/README.md, _Log.md

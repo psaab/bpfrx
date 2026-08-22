@@ -284,17 +284,29 @@ func TestSessionEntryIngressInterfaceNotZoneFirst6960(t *testing.T) {
 	})
 
 	// An HA peer-synced row carries no ingress identity (#6928 imports it as 0;
-	// #7095 tracks syncing it), so it still reports the zone-derived
-	// approximation. Narrowing what the column may CLAIM when the identity is
-	// unavailable is #6987 — a separate, operator-visible change that has to
-	// land on all three session surfaces together. This assertion pins the
-	// UNCHANGED behaviour so the scope of this change is explicit.
-	t.Run("no identity still reports the zone approximation", func(t *testing.T) {
+	// #7095 tracks syncing it). With a multi-interface ingress zone there is no
+	// defensible interface name, so the zone is reported (#6987).
+	t.Run("no identity in a multi-interface zone reports the zone", func(t *testing.T) {
 		se := sessionEntryV4(key, dataplane.SessionValue{
 			IngressZone: ifaceIdentity6960Trust, EgressZone: ifaceIdentity6960Untrust,
 		}, 0, f.zoneNames, nil, f.zoneIfaces, f.egressIfaces, true)
-		if se.IngressInterface != "ge-0/0/0.0" {
-			t.Errorf("ingress_interface = %q, want the unchanged zone approximation %q", se.IngressInterface, "ge-0/0/0.0")
+		if se.IngressInterface == "ge-0/0/0.0" {
+			t.Errorf("ingress_interface = %q: the zone's FIRST interface reported as fact for a session with no recorded identity (#6987)", se.IngressInterface)
+		}
+		if se.IngressInterface != "trust" {
+			t.Errorf("ingress_interface = %q, want the zone name %q", se.IngressInterface, "trust")
+		}
+	})
+
+	// Over-reach control: with a SINGLE bound interface the zone approximation
+	// has exactly one answer, so the column still names it. Without this,
+	// blanking the column unconditionally would pass.
+	t.Run("no identity in a single-interface zone still names it", func(t *testing.T) {
+		se := sessionEntryV4(key, dataplane.SessionValue{
+			IngressZone: ifaceIdentity6960Untrust, EgressZone: ifaceIdentity6960Trust,
+		}, 0, f.zoneNames, nil, f.zoneIfaces, f.egressIfaces, true)
+		if se.IngressInterface != "ge-0/0/1.0" {
+			t.Errorf("ingress_interface = %q, want ge-0/0/1.0", se.IngressInterface)
 		}
 	})
 }
@@ -351,8 +363,8 @@ func TestRecycledIfindexIsNotReportedAsFact6960(t *testing.T) {
 	if se.IngressInterface == "ge-0/0/3.80" {
 		t.Errorf("ingress_interface = %q: a recycled ifindex reported as fact for a session whose recorded zone does not bind it (#6987)", se.IngressInterface)
 	}
-	if se.IngressInterface != "ge-0/0/1.0" {
-		t.Errorf("ingress_interface = %q, want the untrust zone's own interface %q", se.IngressInterface, "ge-0/0/1.0")
+	if se.IngressInterface != "untrust" {
+		t.Errorf("ingress_interface = %q, want the zone name %q: a DISPUTED hit reports no interface even though the untrust zone binds exactly one (#6987)", se.IngressInterface, "untrust")
 	}
 
 	// The FILTER treats the disputed hit as a MISS. It feeds `clear`, so

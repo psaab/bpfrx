@@ -1977,9 +1977,10 @@ func zoneBindsIface(zoneMembers []string, ifName string) bool {
 // egress arm and by zone.
 //
 // Residual, deliberately not closed here: a recycle WITHIN one zone
-// corroborates and still names the wrong sibling. Separating those needs an
-// install-time generation carried on the session row itself — a dataplane
-// wire change, out of scope for a control-plane fix.
+// corroborates and still names the wrong sibling (#7239). Separating those
+// needs an install-time generation carried on the session row itself — a
+// dataplane wire change, out of scope for a control-plane fix. The EGRESS
+// resolution below carries the same hazard uncorroborated (#7240).
 func sessionIngressIfaceIdentity(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) (string, bool) {
 	if ingressIfindex == 0 {
 		return "", false
@@ -2049,10 +2050,13 @@ func sessionIngressIfaceDisplay(ingressIfindex uint32, ingressVlanID uint16, ing
 	if corroborated {
 		return ifName
 	}
-	// An UNCORROBORATED hit is not reported: the row carries positive evidence
-	// that the interface table and its own recorded ingress zone disagree, so
-	// the name is as likely to belong to a RECYCLED ifindex as to the session
-	// (#6987). Report what a session with no identity at all reports.
+	// An UNCORROBORATED hit reports nothing, even when the zone binds exactly
+	// one interface: the row carries positive evidence that the interface
+	// table and its own recorded ingress zone disagree, which is the one case
+	// where a confident name is most likely to be the wrong one (#6987).
+	if ifName != "" {
+		return ""
+	}
 	return zoneDisplayIface(zoneIfaces[ingressZone])
 }
 
@@ -2069,17 +2073,15 @@ func sessionEgressIfaceDisplay(fibIfindex uint32, fibVlanID uint16, egressZone u
 }
 
 // zoneDisplayIface is the zone-derived interface name to report when a session
-// carries no usable ingress identity: the zone's FIRST bound interface, the
-// long-standing approximation, else "" so the caller reports the zone.
+// carries no usable identity: the zone's interface when it binds exactly ONE,
+// else "" so the caller reports the zone.
 //
-// With two or more members this names one interface for all of its siblings,
-// which is the reporting counterpart of the #6960 filter defect. It is left
-// as-is here deliberately: this change is scoped to which sessions an
-// interface filter SELECTS, and narrowing what the column may CLAIM is a
-// separate, operator-visible behaviour change (#6987) that must land on all
-// three session surfaces at once or the console and the remote `cli` disagree.
+// With one member the zone approximation has exactly one answer, so it is not
+// an approximation. With two or more, naming the first is one interface
+// answering for all of its siblings — the reporting counterpart of the #6960
+// filter defect, and a claim the row does not support (#6987).
 func zoneDisplayIface(zoneMembers []string) string {
-	if len(zoneMembers) > 0 {
+	if len(zoneMembers) == 1 {
 		return zoneMembers[0]
 	}
 	return ""

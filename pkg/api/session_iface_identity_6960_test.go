@@ -161,13 +161,24 @@ func TestRESTSessionEntryIngressInterfaceNotZoneFirst6960(t *testing.T) {
 		t.Errorf("ingress_interface = %q, want ge-0/0/3.80", se.IngressInterface)
 	}
 
-	// No recorded identity (HA peer-synced row / reverse companion) still
-	// reports the zone-derived approximation; narrowing that claim is #6987.
+	// No recorded identity (HA peer-synced row / reverse companion) in a
+	// multi-interface zone: report the zone, not a confident wrong sibling.
 	noID := sessionEntryV4(key, dataplane.SessionValue{
 		IngressZone: restIface6960Trust, EgressZone: restIface6960Untrust,
 	}, 0, v)
-	if noID.IngressInterface != "ge-0/0/0.0" {
-		t.Errorf("ingress_interface = %q, want the unchanged zone approximation %q", noID.IngressInterface, "ge-0/0/0.0")
+	if noID.IngressInterface == "ge-0/0/0.0" {
+		t.Errorf("ingress_interface = %q: the zone's FIRST interface reported as fact (#6987)", noID.IngressInterface)
+	}
+	if noID.IngressInterface != "trust" {
+		t.Errorf("ingress_interface = %q, want the zone name %q", noID.IngressInterface, "trust")
+	}
+
+	// Over-reach control: a single-interface zone still names its one member.
+	sole := sessionEntryV4(key, dataplane.SessionValue{
+		IngressZone: restIface6960Untrust, EgressZone: restIface6960Trust,
+	}, 0, v)
+	if sole.IngressInterface != "ge-0/0/1.0" {
+		t.Errorf("ingress_interface = %q, want ge-0/0/1.0", sole.IngressInterface)
 	}
 }
 
@@ -207,8 +218,8 @@ func TestRESTRecycledIfindexIsNotReportedAsFact6960(t *testing.T) {
 	if se.IngressInterface == "ge-0/0/3.80" {
 		t.Errorf("ingress_interface = %q: a recycled ifindex reported as fact (#6987)", se.IngressInterface)
 	}
-	if se.IngressInterface != "ge-0/0/1.0" {
-		t.Errorf("ingress_interface = %q, want the untrust zone's own interface %q", se.IngressInterface, "ge-0/0/1.0")
+	if se.IngressInterface != "untrust" {
+		t.Errorf("ingress_interface = %q, want the zone name %q: a DISPUTED hit reports no interface even though the untrust zone binds exactly one (#6987)", se.IngressInterface, "untrust")
 	}
 
 	// The filter treats the disputed hit as a MISS — see the gRPC mirror for
