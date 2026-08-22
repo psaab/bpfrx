@@ -103074,3 +103074,14 @@ prose edit above them added. No diff falls in the new test body.
     rule matching zone 0) was already closed by #3110 and was false when filed.
   - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
     docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6682 follow-through — corrected the operator-facing advisory
+    caveat and its four doc/comment copies, which asserted that a wildcard rule
+    matches zone-pair (0,0). That was false when written (#3110) and doubly so
+    after the deny. Conclusion preserved, mechanism corrected.
+  - **File(s)**: pkg/config/compiler_tunnel_plaintext_advisory.go,
+    pkg/config/compiler_wireguard_plaintext_warn.go,
+    pkg/config/compiler_ipsec_plaintext_warn.go,
+    pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
+    docs/userspace-dataplane-gaps.md
