@@ -99501,3 +99501,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/filter_counters_metrics_test.go,
   pkg/api/zone_counters_metrics_test.go, pkg/api/README.md,
   pkg/daemon/README.md, _Log.md
+
+## 2026-08-22 — #7233 two comments claimed the shim fails OPEN on a missing heartbeat
+
+- **Timestamp**: 2026-08-22T01:xx UTC
+- **Action**: Delete the never-wired `HEARTBEAT_GRACE_PERIOD_NS` constant
+  (`#[allow(dead_code)]`, one grep hit — its own declaration) whose doc comment
+  claimed "the XDP shim sees no heartbeat -> XDP_PASS -> kernel forwards
+  packets", and correct a second block in `server/helpers/status.rs` that said
+  un-bootstrapped queues "get XDP_PASS" and described the old deadlock as
+  "ctrl=0 -> XDP_PASS". Both are false at HEAD: every such path reaches
+  `drop_degraded_transit` -> `XDP_DROP`, and only `pass_local_control` admits
+  proven local/control traffic. Added a two-test doc guard that scans both
+  dataplane crates, fails non-vacuously if a source root yields no files, and
+  carries a narrow greppable escape (`#7233-ok`, `not/rather than/instead of
+  XDP_PASS`) so correcting prose is still writable.
+- **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
+  `userspace-dp/src/server/helpers/status.rs`,
+  `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
