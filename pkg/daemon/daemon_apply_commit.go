@@ -672,8 +672,23 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 		// clean up the takeover artifacts (networkd files, FRR managed
 		// section, dataplane attach) the failed first commit created, except
 		// the management lifeline. Runs under d.applySem (held above).
-		slog.Warn("commit confirmed (first commit) timed out; rolling back to BOOTSTRAP mode " +
-			"(removing interface/FRR/dataplane takeover, keeping the management lifeline)")
+		//
+		// #6538: a nil prevCfg has a SECOND provenance — a window recovered by
+		// recoverPendingConfirmLocked whose rollback target failed even the
+		// lenient compile (so confirmPrevCfg was nil at re-arm time). The
+		// runtime action is deliberately the SAME, and not branched: with no
+		// compiled config to apply, the bootstrap/lifeline safe state is
+		// exactly what #1960 prescribes for a present-but-uncompilable
+		// committed config, and the next boot re-derives it from disk through
+		// the main Load path. What DOES differ is the persistence, and the
+		// store now decides that from the recorded confirmPrevFirst flag
+		// rather than from this nil: the second provenance persists the target
+		// as COMMITTED, so the box is not durably re-classified into
+		// bootstrap. The log below therefore names both cases.
+		slog.Warn("commit confirmed timed out with no compiled rollback target (first commit " +
+			"on a fresh store, or a recovered rollback target that no longer compiles); " +
+			"rolling back to BOOTSTRAP mode (removing interface/FRR/dataplane takeover, " +
+			"keeping the management lifeline)")
 		// #5868: enterBootstrapMode now attempts every teardown step best-effort
 		// but returns an aggregated error (and has already logged each failed
 		// step + the DEGRADED summary at ERROR) if any step did not converge.

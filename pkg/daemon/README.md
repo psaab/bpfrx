@@ -1022,6 +1022,21 @@ never lock an operator out of a remote box it manages.
   in-band. A daemon hard-exit is deliberately NOT used (it would also strand
   mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1, which IS a fatal exit
   because the bytes themselves cannot be read).
+  - **The boot commit-confirmed recovery reaches the same guard (#6538).** A
+    `commit confirmed` window that expired while the daemon was down is
+    resolved inside `Store.Load` by `recoverPendingConfirmLocked`, which
+    reverts to the record's `PrevTree`. That tree is a previously-committed
+    config, but `Load`'s tree repairs (`rewriteRetiredDataplaneType`,
+    `SanitizeTreeControlChars`) run only on `active.json`, never on the
+    `PrevTree` inside `confirm.json` — so a target committed on an older build
+    (`system dataplane-type ebpf` is the concrete case) can fail even the
+    lenient compile. That branch used to warn, assign the nil into
+    `s.compiled`, set `everCommitted = true`, and let `Load` return SUCCESS —
+    reconstructing the exact dangerous tuple above and bypassing this guard.
+    It now returns an `ErrConfigCompile`-tagged error, so the recovery lands in
+    `loadCompileFailed` like any other uncompilable committed config. The
+    rollback itself still completes first: the unconfirmed config must not
+    stand, and the reverted tree has to stay reachable for in-band recovery.
   - **Why mgmt stays reachable — freeze in last-known-good, not a wipe.** This
     path does NOT run the `enterBootstrapMode()` teardown (which removes the
     `10-xpf-*` `.network`/`.link` files, clears the FRR managed section, and

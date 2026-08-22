@@ -969,6 +969,24 @@ evidence, not as active eBPF source-removal blockers.
   reassigned VIP. The add path is also best-effort: a mid-add `NeighSet` failure
   no longer nils out the remembered set, so a later removal can still tear down
   what was installed.
+- Teardown is driven by CONFIG REMOVAL, never by a resolution failure (#6536).
+  The teardown diff above reads one signal -- an interface's absence from the
+  freshly-enabled `(iface -> families)` set -- and its action is a destructive
+  `proxy_arp`/`proxy_ndp` write to `0`. Before #6536 an interface also fell out
+  of that set when its *kernel identity* would not resolve (`net.InterfaceByName`
+  in `proxyARPIfaceMap`, or `netlink.LinkByIndex` inside `ReconcileProxyARP`),
+  which is a transient condition -- an `ENOBUFS`/`EMFILE` netlink hiccup, or a
+  VLAN netdev mid-recreate -- and says nothing about the config. The responder
+  was then disabled on a still-configured interface AND forgotten, so no later
+  reconcile could tear it down either (losing the #4955 sweep with it). Now:
+  `proxyARPIfaceMap` also hands back the ifindex -> Linux-netdev-name mapping,
+  which `ReconcileProxyARP` uses as the fallback key for the responder sysctl
+  when `LinkByIndex` fails (so the sysctl is still re-asserted); and the names it
+  could not resolve at all are returned as debt, whose prior `(iface -> families)`
+  state the daemon carries forward into the enabled set before the diff runs.
+  The retention is debt, not a leak: the next reconcile that resolves the
+  interface either re-asserts it (still configured) or tears it down through the
+  normal diff once it really leaves the config.
 - Breadth tradeoff (IPv4): with the default `medium_id=0`, `proxy_arp=1` makes the
   kernel answer ARP on that interface for ANY target routed out a different
   interface -- broader than Junos `proxy-arp`, which proxies only the listed
