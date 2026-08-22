@@ -46,6 +46,13 @@ pub(crate) use cos_state::SharedCoSState;
 pub(crate) use cos_state::PrePublishSiblings;
 pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
+/// #7413: re-exported so `main_tests.rs` — the one `neigh-monitor` spawner
+/// outside `coordinator/tests.rs` — can take the same guard. `mod
+/// neighbor_manager` is private, and `mod coordinator` is private in
+/// `afxdp/mod.rs`, so the guard needs a re-export at each level to be reachable
+/// crate-wide; see `afxdp/mod.rs` for the second one.
+#[cfg(test)]
+pub(crate) use neighbor_manager::neigh_monitor_test_serial;
 pub(crate) use neighbor_manager::WarmItem;
 pub(in crate::afxdp) use neighbor_manager::{
     WARM_GC_INTERVAL_NS, WARM_GC_MAX_AGE_NS, WARM_PER_KEY_RATE_LIMIT_NS, WARM_QUEUE_DEPTH,

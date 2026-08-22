@@ -103238,3 +103238,22 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
     pkg/config/compiler_firewall.go,
     pkg/config/compact_tail_6684_6685_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #7413 — three tests read process-global state and failed under a
+    parallel `cargo test`. Two independent resources, each with a single
+    mechanism, measured rather than inferred: `DETERMINISTIC_V6_DOWNGRADE_COUNT`
+    (2 asserters, 6/6 fail at --test-threads=2, `left: 2 right: 1`) and the
+    process-wide `neigh-monitor` thread count (10 spawners across 2 modules,
+    4/8 fail running ONLY the two asserters, `before=0 during=2`). Both take a
+    poison-tolerant serial guard. Corrected my own issue text: the nat64
+    counter is PRODUCTION state, so the `thread_local!` pattern does not apply
+    — it would break the product. Population enumerated by running all 4549
+    tests alone and watching each observable's own log line, which also proved
+    no spawner leaks. Guard on the two asserters is BOUND (5/8 red); the guard
+    on the other eight is precautionary and reported as such — it does not red
+    even paired one-to-one, and the `before == 0` precondition is the anti-rot
+    diagnostic that makes a future collision name the missing lock.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/{neighbor_manager.rs,mod.rs,
+    tests.rs}, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/main_tests.rs,
+    userspace-dp/src/nat64_tests.rs, docs/engineering-style.md
