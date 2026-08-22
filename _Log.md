@@ -30,6 +30,34 @@
   pkg/grpcapi/nat_walk_admission_6553_helper_test.go,
   pkg/config/nat_pool_ports.go, pkg/api/nat.go, pkg/api/metrics_nat.go,
   pkg/cli/cli_show_nat.go, pkg/api/README.md
+## 2026-08-21 — #6556 resumed cut re-takes the config-DB snapshot
+
+- **Timestamp**: 2026-08-21
+- **Action**: A resumed upgrade cut reused the config-DB snapshot taken
+  at the ORIGINAL preflight, so a later auto-rollback silently reverted
+  every commit made in the interruption window. Extracted
+  `snapshotConfigDB` from `preflight` and called it from a new resume arm
+  on the preflight gate, FLOORED at `StateStopped`: from STOPPED the
+  daemon is down (nothing to re-capture) and at FLIPPED a re-snapshot
+  would capture POST-upgrade DB state and defeat rollback outright, so
+  the exposed span is exactly {PREFLIGHT, COPIED, VERIFIED}. The
+  extracted writer also re-classifies the DB dir (a DB deleted during the
+  window clears the fields AND removes the stale snapshot) and reorders
+  the write so the replacement is durable in `.partial` before the old
+  snapshot gives way.
+  Mutation matrix: Q1 (remove the resume arm — the pre-fix gate) → all
+  three live-state cells red; Q2 (drop the STOPPED floor) → the
+  past-STOPPED inverse test reds; Q3 (drop the stale-snapshot cleanup)
+  → the DB-removed test reds; Q4 (restore the destroy-before-copy
+  ordering) → the mid-copy-failure test reds; Q5 (drop the post-
+  re-snapshot `saveJournal`) → GREEN and disclosed: the next state
+  transition persists anyway, so binding it would need a crash seam.
+  Attribution correction: the sibling DB-snapshot clearing came from
+  #1967 (`0dc51d983`), not #1981 (`f35cc4d61`, which deepened the rewind
+  to StateInit and added the SourceGeneration clear).
+- **File(s)**: pkg/upgrade/cutover.go,
+  pkg/upgrade/resume_dbsnapshot_6556_test.go, docs/in-place-upgrade.md
+
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
 - **Timestamp**: 2026-08-22
