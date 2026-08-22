@@ -4,9 +4,9 @@ package config
 // RBAC enforcement point shares (#5561).
 //
 // The mapping used to live only in pkg/cli (resolveClassPerms), which was fine
-// while the CLI was the only place that enforced it. It is not fine now that
-// the REST control surface enforces the same boundary server-side, and it will
-// be less fine when the gRPC surface follows (#5278): three copies of "which
+// while the CLI was the only place that enforced it. It stopped being fine when
+// the REST control surface began enforcing the same boundary server-side
+// (#5561) and again when the gRPC listener did (#5278): three copies of "which
 // permissions does class X hold" drift, and a drift here is a silent
 // authorization difference between control planes, not a cosmetic one. Keeping
 // the evaluator next to the data it reads (LoginClassPermissions and

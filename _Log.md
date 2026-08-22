@@ -1,3 +1,63 @@
+## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
+
+- **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
+- **Action**: Corrected the `ShowText` entry in the #5278 method table. It was
+  `PermView` with the comment "every topic is a `show ...`", which is FALSE:
+  three of its ~127 topics (`test-policy:`, `test-routing:`, `test-zone:`) are
+  emitted by the top-level word `test`, which pkg/cli charges at `PermControl`
+  — so a `read-only` class could run policy reconnaissance over gRPC. `ShowText`
+  is now priced from the decoded request's TOPIC, exactly as `SystemAction` is
+  priced from its verb, with an unknown topic costing the strictest tier and the
+  name-level entry demoted to a `PermControl` FLOOR for a request whose topic
+  cannot be read.
+
+  Nothing caught it because `TestEveryServiceMethodHasAPermission_5278`
+  enumerates the service DESCRIPTOR — i.e. methods. Topic pricing is a
+  different property, so a complete method table is a VACUOUS pass for it: a
+  guard proves the property it enumerates and nothing adjacent to it. Added the
+  sibling guard `TestEveryShowTextTopicHasAPermission_5278`, which parses every
+  literal compared against `req.Topic` in `server_show.go` (HasPrefix, `==`,
+  and `switch` case labels) and checks the tables in both directions.
+
+  Also removed the root `t.Skip` from
+  `TestProductionServerEnforcesRealPeerIdentity_5278`: it went vacuous in
+  exactly the environment CI usually runs in. Both arms now assert the kernel
+  attributed the connection, and the root arm additionally drives the
+  class-decision path, so no arm of the policy goes unasserted. Verified by
+  running the whole `5278` set under `sudo go test` (rc=0, root arm logged).
+
+- **File(s)**: `pkg/grpcapi/authz_methods.go`,
+  `pkg/grpcapi/authz_method_table_5278_test.go`,
+  `pkg/grpcapi/principal_authz_5278_test.go`, `pkg/grpcapi/README.md`
+
+## 2026-08-21 — #5278: per-principal authorization on the primary gRPC listener
+
+- **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
+- **Action**: Added a login-class authorization gate to the primary (loopback)
+  gRPC listener. A `stats.Handler` resolves the connection's peer UID from the
+  kernel socket table at connection setup; unary + stream interceptors evaluate
+  the caller's `system login user <name> class` through the shared `pkg/authz`
+  decision (#5561) against a method -> permission table derived from
+  `pkg/cli/permissions.go` `requiredPermission`. An unmapped method costs
+  `PermAll` (super-user only) and the miss is logged at Error; the completeness
+  guard enumerates the GENERATED service descriptor and the `SystemAction`
+  handler's own switch labels, so neither table can silently go stale. The
+  fabric listener is untouched and keeps its #4107/#4122 chain.
+
+  Firsthand corrections to the research plan: the in-process console CLI does
+  NOT self-dial the local listener (all three `NewBpfrxServiceClient` sites go
+  through `dialPeer()` to the PEER's fabric address), and the plan's rejection
+  of a loopback peer lookup as TOCTOU described a socket-inode -> `/proc/<pid>`
+  mechanism that `pkg/authz` does not use. No transport change, no new config
+  knob, no client migration.
+
+- **File(s)**: `pkg/grpcapi/authz.go` (new), `pkg/grpcapi/authz_methods.go`
+  (new), `pkg/grpcapi/principal_authz_5278_test.go` (new),
+  `pkg/grpcapi/authz_method_table_5278_test.go` (new),
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_shutdown_monitor_4910_test.go`,
+  `pkg/grpcapi/README.md`, `pkg/api/README.md`, `pkg/api/authz.go`,
+  `pkg/authz/authz.go`, `pkg/config/login_perms.go`, `cmd/cli/main.go`,
+  `docs/system-login.md`, `CLAUDE.md`
 ## 2026-08-21 — #5804: gre-performance-acceleration was reported as enabled while doing nothing
 
 - **Timestamp**: 2026-08-21 (fix/5804-gre-acceleration-advisory)
@@ -99484,3 +99544,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/configstore/nat_dnat_match_mask_boot_7215_test.go,
   pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go,
   docs/config-schema.md, docs/userspace-dnat-plan.md, _Log.md
+
+## 2026-08-22 — #7233 two comments claimed the shim fails OPEN on a missing heartbeat
+
+- **Timestamp**: 2026-08-22T01:xx UTC
+- **Action**: Delete the never-wired `HEARTBEAT_GRACE_PERIOD_NS` constant
+  (`#[allow(dead_code)]`, one grep hit — its own declaration) whose doc comment
+  claimed "the XDP shim sees no heartbeat -> XDP_PASS -> kernel forwards
+  packets", and correct a second block in `server/helpers/status.rs` that said
+  un-bootstrapped queues "get XDP_PASS" and described the old deadlock as
+  "ctrl=0 -> XDP_PASS". Both are false at HEAD: every such path reaches
+  `drop_degraded_transit` -> `XDP_DROP`, and only `pass_local_control` admits
+  proven local/control traffic. Added a two-test doc guard that scans both
+  dataplane crates, fails non-vacuously if a source root yields no files, and
+  carries a narrow greppable escape (`#7233-ok`, `not/rather than/instead of
+  XDP_PASS`) so correcting prose is still writable.
+- **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
+  `userspace-dp/src/server/helpers/status.rs`,
+  `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
