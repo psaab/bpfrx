@@ -101,14 +101,45 @@ which — an operator told the wrong reason reaches for the wrong remedy:
 
 | Family | Why the zone token does not bound it |
 |---|---|
-| DHCPv4 (`dhcp`) | xpf renders Kea's `Dhcp4` with **no** `dhcp-socket-type` key (`pkg/dhcpserver/dhcpserver.go` emits `interfaces-config` with an `interfaces` list and nothing else), so Kea's default `raw` applies. The server receives on an **AF_PACKET** socket, which is delivered **before** the netfilter input hook — the `xpf_hostinbound` chain never sees the request at all. |
+| DHCPv4 (`dhcp`) | **Two planes, both bypassed (#7489).** (1) A client addresses its DISCOVER/REQUEST to the **255.255.255.255 broadcast**, and `should_fallback_early` (`userspace-xdp/src/lib.rs`) hands `dst_v4 == 0xffff_ffff` straight to the kernel — the request never enters the AF_XDP userspace dataplane or its host-inbound gate. (2) xpf renders Kea's `Dhcp4` with **no** `dhcp-socket-type` key (`pkg/dhcpserver/dhcpserver.go` emits `interfaces-config` with an `interfaces` list and nothing else), so Kea's default `raw` applies and the server receives on an **AF_PACKET** socket, delivered **before** the netfilter input hook. |
 | DHCPv6 (`dhcpv6`) | Kea's `Dhcp6` has no raw mode, but a client addresses the server at the **ff02::1:2** multicast group. Every per-zone host-inbound rule — the accepts AND the #3361 catch-all deny — is scoped `<fam> daddr <zone unicast addrs>` (`pkg/nftables/netlink_hostinbound.go`, `emitHostInboundZoneNetlink`), so a multicast destination matches neither and falls through the base chain's `policy accept` (`pkg/nftables/netlink_installer.go`). This is the same fall-through the routing-multicast gap above rides. |
 
 The remedy in the message deliberately leads with **removing the interface from
 the group**, not with adding the token: adding the token cannot enforce anything
-on the v4 path (the AF_PACKET tap is upstream of netfilter), so presenting it as
-*the fix* would restate the same false signal in a new place. The token is
+on the DHCP server's request path (both planes above are bypassed), so presenting
+it as *the fix* would restate the same false signal in a new place. The token is
 offered only as a way to record that the segment is meant to be served.
+
+### Scope of the bypass argument — do not generalise it (#7489)
+
+"The AF_PACKET tap is upstream of netfilter" is an argument about **one** plane,
+and it does **not** establish that a host-inbound token is inert for v4 traffic
+at large. The AF_XDP userspace dataplane enforces host-inbound itself,
+**fail-closed**, on the local-delivery path (`host_inbound_gated_lo0_action`,
+`userspace-dp/src/afxdp/poll_descriptor/filter.rs`), and a packet dropped there
+never reaches the kernel on any device — so an AF_PACKET tap cannot see it.
+
+**Measured** on the loss userspace cluster: 20 unicast datagrams to an
+interface-mode-SNAT address, on a port the arrival zone did not admit, produced
+**+22 host-inbound denies and ZERO packets on `tcpdump -ni any`**, with a
+same-host ping (which the zone *does* admit) answering normally.
+
+What decides which plane applies is the **destination**, not the port. On a
+session miss the shim steers on address alone — `should_fallback_early`, then
+`is_local_destination`, which deliberately returns false for an address in
+`USERSPACE_INTERFACE_NAT_V4` ("the common WAN case"). So:
+
+| v4 destination | plane | host-inbound token |
+|---|---|---|
+| `255.255.255.255` (DHCP DISCOVER) | kernel, via the shim's early fallback | inert — this advisory's subject |
+| ordinary local unicast | kernel, via `is_local_destination` | inert on the userspace plane |
+| unicast to an **interface-mode-SNAT** address | **redirected to the AF_XDP dataplane** | **load-bearing, fail-closed** |
+
+The third row is not this advisory's subject, but the sentence above was being
+read as covering it. A DHCP **client** on such an interface receives its
+RENEWING-state ACK as a unicast to that address; whether that specific frame
+loses its lease when the token is absent was **not** measured and is not claimed
+here.
 
 Zone attribution and effective-admission resolution reuse the same two SSOTs
 Component B uses (`zoneIfaceLogicalKeys`, `ZoneConfig.InterfaceHostInboundEffective`),
