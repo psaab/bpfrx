@@ -103096,3 +103096,11 @@ prose edit above them added. No diff falls in the new test body.
     owner's authoritative session family under latest-generation-wins.
   - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
     pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
+
+## 2026-08-22 — #6675 hermetic ip-rule enumeration in userspace tests
+- **Timestamp**: 2026-08-22
+- **Action**: Install the hermetic `ruleListFn` stub as the package default via
+  TestMain so the 36 `snap, _ := buildSnapshot(...)` sites cannot nil-deref in a
+  sandbox that cannot dump `ip rule`; bind the wiring and keep #3772's
+  fail-closed contract.
+- **File(s)**: pkg/dataplane/userspace/hermetic_rulelist_6675_test.go
