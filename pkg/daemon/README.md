@@ -47,7 +47,19 @@ usable. Two consequences the code makes explicit:
   for the drainer, which stayed captured at loop entry and kept draining a
   disowned backend at 10 Hz on the fast fallback branch) and re-installs
   its callbacks when a rollback + corrected re-arm replaces the stream
-  instance. `handleEventStreamFullResync` likewise resolves its session
+  instance. #7017: that last clause was true of the CLUSTERED loop only.
+  `runUserspaceEventStream`'s standalone (no-cluster) arm called
+  `wireUserspaceEventStreamCallbacks` and RETURNED with it, so it never ran
+  the `es != wired` re-install and a replacement stream on a standalone
+  daemon got no callbacks at all — its dataplane events accumulated in the
+  callback-not-ready queue, and RT_FLOW records stopped reaching `show
+  log`, syslog and the flow exporter until the daemon restarted. That arm
+  now runs `watchUserspaceEventStreamCallbacks`: the same 500 ms cadence
+  and the same first-wire behaviour, but it never returns and applies the
+  same instance-identity re-install every tick. It is registered on the run
+  WaitGroup, and `runShutdownSequence` calls `stop()` before `wg.Wait()`,
+  so it joins within one tick of shutdown.
+  `handleEventStreamFullResync` likewise resolves its session
   exporter from the cell on every call, so a full resync after a rollback
   + corrected re-arm exports from the CURRENT backend rather than the
   torn-down one (#6743 r2-B8, bound by
@@ -56,7 +68,9 @@ usable. Two consequences the code makes explicit:
   (REST); `daemon_ha_userspace_stream_live_test.go` drives the event-stream
   loop across a `setDataplane(nil)`, across a stream replacement, and —
   on the reconcile-cadence branch, which needs its own connected-stream
-  fixture — across a backend republication (#6743 r2-B3).
+  fixture — across a backend republication (#6743 r2-B3);
+  `daemon_standalone_stream_rewire_7017_test.go` is the standalone twin of
+  the stream-replacement case plus the shutdown join.
 
   The console-CLI site has TWO halves, and neither covers it alone
   (corrected in #6743 r2 — an earlier revision of this paragraph said the
