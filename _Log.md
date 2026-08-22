@@ -32,6 +32,36 @@
   suite shows, not `-run 6635`.
 - **File(s)**: `pkg/ddns/backend_http.go`,
   `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
+## 2026-08-22 — #6584 command-output + swanctl termsafe guards
+
+- **Timestamp**: 2026-08-22
+- **Action**: Block-sanitized `journalctl`/`tail` on BOTH renderers plus
+  `journalctl --boot` (structurally identical, not named in the issue),
+  and guarded every fork in the multi-fork gRPC functions
+  (`GetSystemInfo` ×4, `showNTP` ×4) so no guarded arm vouches for a raw
+  sibling. CORRECTED the issue's framing for site B: swanctl stdout never
+  reaches a terminal — the PARSED fields do — so it is the #6579
+  parsed-row class and is guarded once at INGEST (`sanitizeSAStatus` in
+  `GetSAStatus`) rather than at ~24 render sites across two renderers.
+  Added the mechanism the research showed was missing entirely: a
+  both-directions tripwire requiring every fork-containing function to
+  apply >= as many termsafe calls as forks, or be allowlisted with a
+  reason.
+  Mutation matrix 6/6 RED after two real fixture defects the matrix
+  itself exposed: (1) the tripwire's first version asked only whether a
+  function "references termsafe", which let one guarded arm vouch for
+  its siblings — four cells that removed a real guard stayed GREEN;
+  (2) after switching to a count, package-scope forks had an EMPTY body
+  so `0 >= 0` waved them through silently — the control run caught that.
+  Both now conservative. Successor #7389 filed for the streaming sites
+  (tcpdump renders attacker packet bytes; traceroute resolves PTR) which
+  need a line-wise writer, plus the low-taint remainder.
+- **File(s)**: pkg/cli/cli_show_system.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go,
+  pkg/ipsec/ike.go, pkg/ipsec/manager.go,
+  pkg/cli/command_output_termsafe_6584_test.go,
+  pkg/ipsec/sa_status_termsafe_6584_test.go, pkg/cli/README.md
+
 ## 2026-08-22 — #6612 destination-scoped junos-host permit: the missing advisory clause
 
 - **Timestamp**: 2026-08-22
