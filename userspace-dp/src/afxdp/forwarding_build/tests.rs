@@ -3551,6 +3551,163 @@ fn tunnel_ttl_out_of_range_fails_closed() {
     }
 }
 
+/// #5193 (A1-b7-F1): two tunnel-endpoint rows sharing one nonzero id fail the
+/// snapshot CLOSED via `TunnelEndpointDuplicateId`. Pre-fix, `tunnel_endpoints`
+/// (keyed by id) kept only the LAST row while `tunnel_endpoint_by_ifindex`
+/// pointed BOTH interfaces at that id — so traffic on the losing interface
+/// encapsulated with the winner's outer source/destination/key.
+///
+/// FAIL-ON-REVERT: drop the preflight and the build succeeds with exactly one
+/// endpoint and two aliasing ifindex rows, making this `expect_err` red.
+#[test]
+fn tunnel_duplicate_endpoint_id_fails_closed_5193() {
+    let dup = |ifindex: i32, dest: &str| crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id: 21,
+        interface: format!("gr-0/0/{ifindex}"),
+        ifindex,
+        mode: "gre".into(),
+        source: "203.0.113.1".into(),
+        destination: dest.into(),
+        ttl: 64,
+        ..Default::default()
+    };
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![dup(60, "198.51.100.1"), dup(61, "198.51.100.2")],
+        ..Default::default()
+    };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("two endpoints sharing id 21 must fail the snapshot closed, not alias");
+    match err {
+        crate::policy::SnapshotIntegrityError::TunnelEndpointDuplicateId { tunnel_id, ifindex } => {
+            assert_eq!(tunnel_id, 21);
+            assert_eq!(ifindex, 61, "the error names the SECOND row's ifindex");
+        }
+        other => panic!("expected TunnelEndpointDuplicateId, got {other:?}"),
+    }
+}
+
+/// #5193 anti-over-reject: distinct ids still build, and an id of 0 (the
+/// skipped placeholder row) does not count as a duplicate no matter how often
+/// it appears.
+#[test]
+fn tunnel_distinct_and_zero_endpoint_ids_still_build_5193() {
+    let ep = |id: u16, ifindex: i32| crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id,
+        interface: format!("gr-0/0/{ifindex}"),
+        ifindex,
+        mode: "gre".into(),
+        source: "203.0.113.1".into(),
+        destination: "198.51.100.1".into(),
+        ttl: 64,
+        ..Default::default()
+    };
+    let snapshot = ConfigSnapshot {
+        tunnel_endpoints: vec![ep(22, 62), ep(23, 63), ep(0, 64), ep(0, 65)],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(state.tunnel_endpoints.contains_key(&22));
+    assert!(state.tunnel_endpoints.contains_key(&23));
+    assert_eq!(state.tunnel_endpoint_by_ifindex.get(&62).copied(), Some(22));
+    assert_eq!(state.tunnel_endpoint_by_ifindex.get(&63).copied(), Some(23));
+}
+
+/// #5193 (A1-b7-F7): a CoS DSCP REWRITE-RULE code-point outside the 6-bit DSCP
+/// domain fails the snapshot CLOSED via `CosDscpRewriteCodePointOutOfRange`.
+/// The classifier builders have failed closed since #2447, but the rewrite
+/// ingest stored the value unchecked and the transmit path masks it
+/// (`dscp & 0x3f`), so a rule written as 110 marked egress packets DSCP 46 —
+/// a different PHB than configured.
+///
+/// FAIL-ON-REVERT: remove the bound check and the build succeeds, installing
+/// the rule that the TX mask turns into DSCP 46.
+#[test]
+fn cos_dscp_rewrite_out_of_range_code_point_fails_closed_5193() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 81,
+            cos_shaping_rate_bytes_per_sec: 1,
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "voice".into(),
+                queue: 0,
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![crate::CoSDSCPRewriteRuleSnapshot {
+                name: "wan-rewrite".into(),
+                entries: vec![crate::CoSDSCPRewriteRuleEntrySnapshot {
+                    forwarding_class: "voice".into(),
+                    loss_priority: "low".into(),
+                    dscp_value: 110, // > 63 — the TX mask turns this into 46
+                }],
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+            inet_precedence_classifiers: vec![],
+        }),
+        ..Default::default()
+    };
+    let err = super::cos::build_cos_state(&snapshot)
+        .expect_err("an out-of-range rewrite code-point must fail closed, not mask to DSCP 46");
+    match err {
+        crate::policy::SnapshotIntegrityError::CosDscpRewriteCodePointOutOfRange {
+            rule,
+            forwarding_class,
+            dscp,
+        } => {
+            assert_eq!(rule, "wan-rewrite");
+            assert_eq!(forwarding_class, "voice");
+            assert_eq!(dscp, 110);
+        }
+        other => panic!("expected CosDscpRewriteCodePointOutOfRange, got {other:?}"),
+    }
+}
+
+/// #5193 anti-over-reject: the top of the legal DSCP range (63) still builds,
+/// so the new bound cannot be a blanket rejection.
+#[test]
+fn cos_dscp_rewrite_max_code_point_still_builds_5193() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 82,
+            cos_shaping_rate_bytes_per_sec: 1,
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "voice".into(),
+                queue: 0,
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![crate::CoSDSCPRewriteRuleSnapshot {
+                name: "wan-rewrite".into(),
+                entries: vec![crate::CoSDSCPRewriteRuleEntrySnapshot {
+                    forwarding_class: "voice".into(),
+                    loss_priority: "low".into(),
+                    dscp_value: 63,
+                }],
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+            inet_precedence_classifiers: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = super::cos::build_cos_state(&snapshot)
+        .expect("an in-range rewrite code-point must build");
+    assert!(
+        state.dscp_rewrite_rules.contains_key("wan-rewrite"),
+        "the in-range rewrite rule must still be installed"
+    );
+}
+
 /// #2410 anti-over-reject: an in-range TTL still builds exactly.
 #[test]
 fn tunnel_ttl_in_range_builds_exactly() {

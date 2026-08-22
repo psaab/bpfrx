@@ -838,13 +838,33 @@ the event-stream stream can drop frames under load, it can never delimit an
 authoritative snapshot: reconciling against an incomplete set would DELETE live
 peer-owned sessions merely dropped in transit. The override is therefore no
 longer wired in production (`startClusterComms`); `doBulkSync` always ends with
-`BulkSync()`, whose direct writes under `writeMu` are lossless and complete.
-`BulkSync` sources sessions from the shim `sessions`/`sessions_v6` BPF mirror
-maps (owner-RG-filtered by `ShouldSyncZone`); a table-truth source
-(`ExportOwnerRGSessions`) that removes the mirror-drift residual is tracked as a
-follow-up. `BulkSyncOverride` is retained only as a test/extension seam and is
-regression-proof: the trailing `BulkSync()` runs unconditionally, so an override
-can never re-send empty markers.
+a lossless direct-write window under `writeMu`. `BulkSyncOverride` is retained
+only as a test/extension seam and is regression-proof: the trailing window is
+framed unconditionally, so an override can never re-send empty markers.
+
+#### Table-truth window source (#6031)
+
+The window's session SOURCE is no longer the shim `sessions`/`sessions_v6` BPF
+maps. Under the userspace dataplane those are a best-effort **display mirror**:
+the helper publishes a conntrack row only on the host-inbound install, the
+missing-neighbor seed, and the reverse-companion repair, so a **transit** session
+— which is what an HA firewall is actually protecting — has no row there at all.
+Combined with the authoritative reconcile above (absent from the window ⇒
+DELETED), framing the window from that mirror deleted the standby's live
+peer-owned transit sessions on every cold prime, survivor re-drive, and forced
+resync.
+
+`doBulkSync` now prefers `SessionSync.BulkSnapshotSource`, wired by the daemon to
+`ExportOwnerRGSessions(rgIDs, 0)` — the helper's in-process `SessionTable`,
+owner-RG-filtered, synchronous, and UNBOUNDED (a cap would truncate the window
+and the peer would delete the remainder). The snapshot is converted by the SAME
+walk and filter the incremental delta stream uses, so both admit one set, and it
+is framed verbatim (no second `ShouldSyncZone` pass — that could drop an entry
+the incremental path admits, which the receiver would then delete). If the source
+errors, `doBulkSync` fails CLOSED and frames NO window rather than falling back
+to the mirror: an incomplete authoritative window destroys live sessions, while
+framing none only defers the reconcile to the next armed retry. `BulkSync()`'s
+store walk remains for callers with no snapshot source wired.
 
 #### Survivor-fabric cold-start bulk re-drive (#4090)
 

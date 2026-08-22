@@ -1,3 +1,142 @@
+## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
+
+- **Timestamp**: 2026-08-22
+- **Action**: Repo-wide sweep correcting the RFC 6052 section cited for the
+  NAT64 non-global embedded-IPv4 rule. 17 occurrences across 11 files said
+  §2.2; §2.2 is the IPv4-Embedded IPv6 Address *Format* section and states no
+  such rule. The normative "MUST NOT translate / MUST drop" language is §3.1
+  (Restrictions on the use of the Well-Known Prefix).
+- **File(s)**: docs/feature-coverage.md, pkg/dataplane/userspace/format/
+  status_test.go, pkg/dataplane/userspace/protocol_binding.go,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/protocol/binding.rs
+- **Note**: the 2026-07-24 #6475 heading above carries the original mis-citation
+  and is deliberately left as written. This log is append-only and records what
+  was believed at the time; rewriting a past entry would falsify the record.
+  This entry is the correction.
+
+## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
+
+- **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
+- **Action**: Converted every production lock acquisition under
+  `userspace-dp/src/afxdp/wg/` from `.unwrap()` to the tree-wide
+  poison-tolerant idiom `unwrap_or_else(|e| e.into_inner())`.
+
+  Measured at `5e0aa38aa`: **68 lock-guard `.unwrap()` sites** in the six
+  production files (cookie.rs 7, engine.rs 21, handshake_session.rs 19,
+  peer.rs 10, tai64n.rs 3, timers.rs 8) — 29 `Mutex::lock()` plus 39
+  `RwLock::read()/write()`. A single-line grep reports 64; four sites wrap
+  `.lock()`/`.read()` and `.unwrap()` across source lines and need a
+  newline-tolerant match. **60 were converted; 8 `#[cfg(test)]` accessors
+  were left panicking on purpose** — they are compiled out of the shipped
+  helper so they cannot cause the production failure, and in a test build
+  a poisoned lock is evidence of a panic the test should surface.
+
+  Adoption of the existing remedy in `wg/` was ZERO before this: the only
+  `into_inner` under `wg/` was `engine_tests.rs`'s own #6157 harness lock.
+  `worker_queue::lock_recover` (#1807) and `shared_ops::lock_shared_recover`
+  (#2402) were deliberately NOT reused — each stamps a subsystem-specific
+  journald line and bumps a subsystem-specific recovery counter that a WG
+  cookie or replay-window recovery would falsify, and neither takes an
+  `RwLock`, which is 39 of the 68 sites.
+
+  Why recovery is correct at each site, not merely convenient: the guarded
+  state is either a map holding the committed prefix of every completed
+  insert (`pending`, `pending_by_peer`, `sessions_by_local_index`, the
+  per-peer keypair slots — discarding it is the #2402 defect), or a value
+  mutated only by infallible integer/array arithmetic with no panic site in
+  the critical section (`ReplayState::check_and_update`, the two TAI64N
+  high-water marks, the cookie load/budget windows), so `into_inner()`
+  always yields a well-formed committed value. For the anti-replay marks
+  recovery is strictly SAFER than panicking: a supervisor restart loop
+  risks the mark coming back reset, which accepts the replays it exists to
+  reject. `reconcile_lock` is the one lock that guards a cross-map
+  invariant rather than data of its own — recovering does not repair a
+  half-done reconcile, but neither does panicking, and panicking also
+  guarantees the idempotent `reconcile_peers` pass that COULD repair it
+  never runs again.
+
+  **Validation**: 10 new poison regressions (7 in a new
+  `wg/poison_tests.rs`, 2 in cookie_tests.rs, 1 in tai64n_tests.rs) poison
+  a real engine lock and assert the production entry point still
+  completes. Full Rust suite green under `--test-threads=1`.
+  Mutation-proved: reverting a single converted site to `.unwrap()` reds
+  its pinning test while `cargo check --all-targets` stays clean (an
+  assertion/panic red, not a build break) — matrix in the PR body.
+
+  **Smoke is OWED**: this changes the `xpf-userspace-dp` helper binary, so
+  a loss-userspace cluster smoke is required before merge. Not run here —
+  the cluster is shared and lock-protected.
+- **File(s)**: userspace-dp/src/afxdp/wg/{cookie,engine,handshake_session,
+  peer,tai64n,timers}.rs, userspace-dp/src/afxdp/wg/poison_tests.rs (new),
+  userspace-dp/src/afxdp/wg/{mod,tests,cookie_tests,tai64n_tests}.rs,
+  docs/engineering-style.md, _Log.md
+## 2026-08-21 — #6429: applyHelperStatusLocked split into per-domain apply steps
+
+- **Timestamp**: 2026-08-21 (refactor/6429-apply-helper-status)
+- **Action**: Split the 481-line `applyHelperStatusLocked` god-function into 12
+  per-domain steps in a new `helper_status_apply.go`, leaving an 84-line driver
+  in `maps_sync.go`. PURE CODE MOTION: 21 of 24 moved blocks are byte-identical
+  modulo leading tabs, verified mechanically by searching the produced files for
+  the left-stripped original ranges (`check.py`), not by eye. The only 8
+  differing lines are the two mechanical adaptations a function boundary forces:
+  the two `goto ctrlReady` jumps became `return` (the label sat immediately
+  after the block they escaped and that block was the last statement in the
+  chain, so the jump and the return land on the same statement — the label is
+  now dead and removed), and the six `return m.failClosedUserspaceCtrlLocked(…)`
+  in the two binding-row loops gained the `newBindingIndices` accumulator as a
+  first result.
+
+  Steps extracted: `helperCtrlFlagsLocked`, `resolveCtrlEnableLocked`,
+  `ensureCtrlEnablePrewarmLocked`, `bindingReadinessLocked`,
+  `observeXSKReceiveLivenessLocked`, `applyXSKLivenessGateLocked`,
+  `advanceXSKLivenessLocked`, `resolveXSKLivenessProbeTimeoutLocked`,
+  `flushStaleBPFStateOnCtrlEnableLocked`, `applyRuntimeModeLocked`,
+  `applyPrimaryBindingRowsLocked`, `applyAliasBindingRowsLocked`.
+
+  The path runs under `m.mu` at ~1/s per helper, so the two rules that govern it
+  were checked rather than asserted. Allocation: `go build -gcflags=-m` over the
+  before/after regions gives an IDENTICAL heap-fact set — 50 distinct, 109 total
+  — with zero facts present after that were absent before. Every new message is
+  a `does not escape` annotation for a newly-introduced parameter; notably
+  `ctrl` is taken by pointer in five places and escape analysis still reports
+  `ctrl does not escape` for all five, and `newBindingIndexSet` keeps its
+  pre-existing `make(map[uint32]struct {}) does not escape`. Logging: all 15
+  `slog` sites diff clean on level AND message text; nothing was promoted from
+  Debug.
+
+  Early-return map (unchanged by the split): R1/R2 (`ctrlMap`/`bindingsMap` nil)
+  skip everything; R3 (ctrl-disable write fails) returns BEFORE
+  `m.ctrlWasEnabled = false` / `m.ctrlDisabledAt` are updated and skips both
+  binding loops, `clearStaleBindingRowsLocked`, the three map syncs,
+  `syncBPFCountersLocked`, the ctrl-enable write and `recordHelperStatusLocked`;
+  R4-R6 (primary loop) and R7-R9 (alias loop) fail ctrl closed and skip
+  everything from `clearStaleBindingRowsLocked` onward, leaving
+  `m.lastBindingIndices` untouched; R10-R12 (the three syncs) skip the syncs
+  below them plus counters/enable/record; R13 (ctrl-enable write) skips only
+  `recordHelperStatusLocked`. The two former `goto`s are not returns — they skip
+  only the liveness-failure tail and leave `ctrl.Enabled = 1` standing.
+
+  `pkg/dataplane/userspace/maps_sync.go` moves 2046 [REFACTOR] -> 1655 [WATCH]
+  in the modularity heatmap; the new file is 567 lines, below the audit floor.
+  Doc pointers into the moved code updated in `docs/reth-mac.md` (the ctrl-write
+  gate is now consulted in `resolveCtrlEnableLocked`; the predicate
+  `ctrlMustStayDisabledLocked` stays in `maps_sync.go`) and
+  `docs/afxdp-packet-processing.md` (the #4894/#814 write-side dimension guards
+  moved with the apply path; the watchdog copies stayed).
+
+  A cluster smoke is OWED and was NOT run — this is the helper status-apply
+  path. Deliberately out of scope: the five repeated
+  `UsingUserspaceXDPShimEntryProgram`/`SwapTo…` blocks were NOT deduplicated,
+  because that is a rewrite, not code motion.
+
+- **File(s)**: `pkg/dataplane/userspace/helper_status_apply.go` (new),
+  `pkg/dataplane/userspace/maps_sync.go`, `docs/reth-mac.md`,
+  `docs/afxdp-packet-processing.md`, `docs/refactoring-audit-current.txt`,
+  `_Log.md`
+
 ## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
 
 - **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
@@ -99120,6 +99259,56 @@ prose edit above them added. No diff falls in the new test body.
   smoke is owed.
 - **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
 
+- **Timestamp**: 2026-08-21 18:40 PDT
+- **Action**: #7016 — an UNPUBLISHED policy counter is no data, not a failure
+
+  `#6743` activated the #3965 bulk policy-counter path on all seven
+  observability call sites for the first time (before it, the daemon published
+  `LegacyDataPlaneAdapter`, whose method set the bulk probe missed, and the
+  fallback promoted to the retired eBPF shim array the userspace runtime never
+  increments — every daemon-wired surface reported hit counts of ZERO). The
+  residual is the ERROR SIGNAL: the bulk reader returns
+  `ErrPolicyCounterUnpublished` for a rule the helper has not published, and
+  every surface folded that into its degraded-read channel, so ONE unpublished
+  rule discarded the WHOLE response — REST 500, gRPC `codes.Internal`, a
+  "policy counter read failed" warning naming a fault that does not exist, and
+  a `xpf_counter_read_errors_total` bump that is the #3643 false-alert class.
+  Reachable before the first 1 Hz status poll lands (`IsLoaded()` only means
+  the shim is loaded) and under #5679 config skew.
+
+  Fix: flag the ITEM, serve the response — the disposition the ZONE half of
+  `pkg/api/security.go` already used for `dataplane.ErrCounterNotPopulated`
+  (#6843). REST sets the existing `hit_counters_unavailable` (#5580); gRPC gets
+  an additive `PolicyRule.hit_counters_unavailable` (field 23); the CLI/gRPC
+  text tables render `n/a` plus a distinct "not yet published" note; the
+  collector counts the rule into a new
+  `xpf_policy_counters_unpublished_rules` gauge instead of bumping the error
+  counter. A GENUINE read failure keeps every fail-loud behaviour (#3345/#3408).
+
+  Validation: reproduced firsthand at master `314fbe17a` — the real Manager +
+  real LegacyDataPlaneAdapter in warm-up return an EMPTY snapshot with a nil
+  error and `policiesHandler` answered
+  `500 {"error":"policy counter read failed: policy counter not published"}`.
+  Mutation matrix 21/21 RED (one mutation per changed disposition, `go vet`
+  clean at each, non-zero exit captured); the first run exposed a FIXTURE gap —
+  both CLI global-rule cells came back GREEN because the shared CLI store has
+  no global policy, so the 7016 CLI binder now builds its own. Full
+  `go test -count=1 ./...` exit 0. Go + `.proto`/`.pb.go` only; nothing under
+  `userspace-dp/` or `userspace-xdp/`, so no cluster smoke is owed.
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/api/metrics.go,
+  pkg/api/metrics_counters.go, pkg/api/metrics_descriptors_policy.go,
+  pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  cmd/cli/show_security.go, pkg/api/README.md, pkg/grpcapi/README.md,
+  pkg/api/security_policy_counter_unpublished_7016_test.go,
+  pkg/cli/cli_show_policies_unpublished_7016_test.go,
+  pkg/grpcapi/server_policies_counter_unpublished_7016_test.go,
+  pkg/dataplane/userspace/policycounters_warmup_7016_test.go,
+  cmd/cli/show_policies_unpublished_7016_test.go, pkg/api/metrics_test.go,
+  pkg/api/metrics_scoped_global_3286_test.go,
+  pkg/api/security_screen_nil_3476_test.go,
+  pkg/api/zones_policies_counter_error_test.go, _Log.md
 ## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
 
 - **Timestamp**: 2026-08-21
@@ -99501,6 +99690,102 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/filter_counters_metrics_test.go,
   pkg/api/zone_counters_metrics_test.go, pkg/api/README.md,
   pkg/daemon/README.md, _Log.md
+- **Action**: #7216 — reject a static-NAT rule whose selected `match
+  destination-address` is empty.
+## 2026-08-21 — userspace-dp LOW cohorts (#5191/#5193): three bounded residuals
+
+  Reproduced firsthand at `7230dcdcd` over the #7145 base config. Of the six
+  (NAT kind x match leaf) slots, static-NAT `match destination-address` was the
+  only one that accepted a quoted `""`: it lowered `Match=""`,
+  `MatchAddresses=[""]`, which `buildStaticNATSnapshots` carries as
+  `ExternalIP=""`, on which the Rust `parse_nat_prefix` returns None and
+  `from_snapshots` drops the WHOLE mapping.
+
+  Established what the empty value means before rejecting it. #6673's
+  empty-slot meaning is a COUNTING rule — an empty slot is a SELECTION marker,
+  not a second prefix, so the cardinality gate counts only non-empty values. It
+  says nothing about whether a blank SELECTION is shippable, and #6673's own
+  `rule.Match == ""` arm already rejects the blank selection where it can see
+  it (inside `len(addrs) > 1`). The new gate reads `rule.Match`, the SELECTION,
+  never the slot count, so `[ 192.0.2.1/32 "" ]` still commits.
+
+  Scope is the SELECTION, not the keystrokes. Measured four authoring shapes
+  reaching a surviving rule with `Match == ""` — quoted `""`, the valueless
+  leaf, a prefix followed by a blank that re-selects, and no `match
+  destination-address` at all — all committing clean and all dropped
+  identically. The gate covers all four; the message distinguishes the two
+  remedies. Exempts NPTv6 and `then static-nat inet`, each MEASURED to be
+  already refused by its own gate.
+
+  Three #6673 tests changed contract, deliberately: they asserted a blanked
+  prefix COMMITS, which was the residue of the cardinality gate being the only
+  observer. Their real property is re-bound more sharply — the rejection must
+  be #7216's and must NOT be the cardinality gate's "declares N prefixes" — and
+  the drift invariant (Match always in MatchAddresses) moved to the tolerant
+  path, where every fixture still compiles. The `nat static match
+  source-address` slot-escape fixture gained a valid `match
+  destination-address` so its control commits.
+
+  Mutation-proved five ways, `go vet` clean on each: removing the gate call ->
+  exit 1 at "committed CLEAN" and at the `Store.Load` warning assertion; keying
+  on any empty SLOT instead of the selection -> exit 1 in the #6673
+  preservation cell AND in the original #6673 tests; dropping the NPTv6/inet
+  exemption -> exit 1 at the wrong-message assertion; collapsing the two
+  remedies -> exit 1 at the remedy assertion; running the gate BEFORE the
+  cardinality gate -> exit 1 at the #6659-message cell. Restored by file copy,
+  byte-identical.
+
+  Go-only, `pkg/config` plus a `pkg/configstore` test; nothing reaches the Rust
+  helper or the wire protocol, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/nat_static_blank_external_prefix_7216_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/config/schema_slot_escape_fixtures_test.go,
+  pkg/configstore/nat_static_blank_prefix_boot_7216_test.go,
+- **Action**: #7215 — make the destination-NAT `match destination-address`
+  commit gate use its own builder's parse predicate.
+
+  Reproduced firsthand at `353f09592` over the #7145 base config. Of the six
+  (NAT kind x match leaf) slots, destination-NAT `match destination-address`
+  was the only one that still accepted an out-of-range mask: `10.0.0.0/33`
+  lowered to `Match.DestinationAddresses = ["10.0.0.0/33"]` and committed
+  clean, as did `2001:db8::/129`, `10.0.0.0/abc`, `10.0.0.0/`, `1.2.3.4/-1`
+  and `10.0.0.1/255.255.255.0`. #7145 did not reach the slot because its probe
+  (`999.1.1.1/24`) is malformed in the ADDRESS half, which the old predicate
+  did see.
+
+  `validateDestinationNATAddressesStrict` (#2396(c)/#3228) split the token at
+  the first `/` and ran `net.ParseIP` on the address half only, while its own
+  consumer `dnatDestinationParts` calls `net.ParseCIDR` and returns
+  `ok == false`. The gate's doc comment promised the two matched exactly; they
+  did not. Predicate is now `natMatchPrefixParses`, extensionally equal to the
+  builder's `ok`, and the equality is bound by a cross-package differential
+  rather than by the comment.
+
+  Strictly a narrowing; every newly-refused value is one the builder already
+  discarded, and the over-rejection guard pins `0.0.0.0/0`, `::/0`, a bare
+  host, a host-bits CIDR and `1.2.3.4/024` still committing. Lenient needed no
+  new plumbing — the slot's existing `lenientDestNATAddresses` flag downgrades
+  it and KEEPS the value (pruning would clear the Rust
+  `destination_constrained` flag and collapse the rule to MATCH-ANY).
+
+  Mutation-proved three ways, `go vet` clean on each so the red is an assertion
+  and not a build break: reverting the gate predicate -> exit 1 at "committed
+  CLEAN" in the census and at the warning assertion in `Store.Load`; drifting
+  `natMatchPrefixParses` back to the mask-stripping form -> exit 1 at
+  "DIVERGENCE on 10.0.0.0/33" in the builder-agreement differential; swapping it
+  to `netip.ParsePrefix` -> exit 1 at the `1.2.3.4/024` over-rejection cell in
+  BOTH the guard and the differential. Restored by file copy, byte-identical.
+
+  Go-only, `pkg/config` plus two test packages; nothing reaches the Rust helper
+  or the wire protocol, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_helpers.go,
+  pkg/config/nat_dnat_match_destination_mask_7215_test.go,
+  pkg/configstore/nat_dnat_match_mask_boot_7215_test.go,
+  pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go,
+  docs/config-schema.md, docs/userspace-dnat-plan.md, _Log.md
 
 ## 2026-08-22 — #7233 two comments claimed the shim fails OPEN on a missing heartbeat
 
@@ -99519,6 +99804,413 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
   `userspace-dp/src/server/helpers/status.rs`,
   `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
+
+- **Timestamp**: 2026-08-21 18:52 PDT
+- **Action**: #7017 — standalone daemon re-installs event-stream callbacks on
+  a replaced stream
+
+  On a STANDALONE (no-cluster) daemon the userspace event-stream callbacks were
+  installed once and never re-installed when the helper's `EventStream`
+  instance was REPLACED. The clustered path got the `es != wired` re-install in
+  #6743 r6-F4; `runUserspaceEventStream`'s standalone arm called
+  `wireUserspaceEventStreamCallbacks` — which RETURNS as soon as it installs —
+  and returned with it, never running `eventStreamFallbackLoop`. Stated in-tree
+  as a KNOWN GAP (#6743 r2-N5) and reproduces identically on origin/master, so
+  pre-existing rather than introduced.
+
+  Symptom: a commit-confirmed rollback tears the armed backend's stream down
+  while KEEPING the backend object, and the corrected re-arm constructs a new
+  one; that instance has no `SetOnEvent`/`SetOnFullResync`/dataplane-event
+  callback, so every helper event lands in the callback-not-ready queue and
+  RT_FLOW session records stop reaching `show log`, syslog and the flow
+  exporter for the rest of the process lifetime. Only a restart recovers.
+
+  Fix: `watchUserspaceEventStreamCallbacks` — same 500 ms cadence and
+  first-wire behaviour, but it never returns and applies the fallback loop's
+  instance-IDENTITY re-install every tick. The arm now blocks for the life of
+  ctx where it used to return, and its goroutine is on the run WaitGroup;
+  `runShutdownSequence` calls `stop()` before `wg.Wait()`, so it joins within
+  one tick — that ordering is load-bearing and has its own binder.
+  `wireUserspaceEventStreamCallbacks` is unchanged and still used by
+  `daemon_ha_sync.go`.
+
+  Validation: reproduced firsthand at origin/master `aa3780666` — with
+  callbacks on stream A and the backend then publishing stream B, no ACK ever
+  came back on B (FAIL at the wiring deadline, 85.20s); with the loop the ACK
+  lands on the next tick, 0.50s PASS. Mutation 3/3 RED (revert the arm to
+  wire-once; weaken `es != wired` to `wired == nil`; drop the `ctx.Done()`
+  select arm), `go vet` clean at each with a non-zero exit captured.
+  `go test -count=1 ./pkg/daemon/` exit 0; the two new tests exit 0 under
+  `-race`. Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no
+  cluster smoke is owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_standalone_stream_rewire_7017_test.go,
+  pkg/daemon/README.md, _Log.md
+## 2026-08-21 — #5838 follow-up: a pending crash restart survived an intentional stop
+
+- **Timestamp**: 2026-08-21
+- **Action**: The #7228 helper supervisor arms a bounded-backoff restart after an
+  unexpected helper exit and fences the attempt on `(m.procGen != gen ||
+  m.proc != nil || !m.helperCrash.Crashed)`. An intentional teardown satisfied
+  none of those: `stopLocked` cleared `m.proc` and `m.procSup` but never
+  advanced `m.procGen` and never cleared `m.helperCrash`. And the stop that
+  FOLLOWS a crash takes `stopLocked`'s `m.proc == nil` early return — the crash
+  path already nil'd `m.proc` — so it reached none of the teardown below it
+  either. A crash whose backoff was still pending when the daemon shut down
+  therefore spawned a helper for a Manager that had been torn down, and the
+  restart chain kept re-arming afterwards; after `Close()` that child outlives
+  xpfd holding the NIC queues, which is the EBUSY-on-zero-copy-queues collision
+  the next start hits. Fix: retire the generation (`m.procGen++`) at the TOP of
+  `stopLocked`, above the early return. Deliberately NOT clearing
+  `m.helperCrash` there: `ensureProcessLocked` calls `stopLocked` when a spawn
+  misses its readiness wait, and the crash record is the retry debt that path
+  depends on — clearing it made a failed restart forget it was retrying and
+  turned `TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838` RED, which is
+  how the narrower fix was found. Mutation-proven: dropping the bump reds the
+  new marker assertion (a helper is spawned after the stop); anti-over-reject
+  cell asserts the ordinary crash->restart path still spawns. `go vet` clean,
+  `pkg/dataplane/userspace` and `pkg/daemon` suites green at `-count=1`, and the
+  new cells green under `-race`. Go-only diff, no shim `.o` or protocol
+  movement, so no cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/helper_restart_after_stop_5838_test.go, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed three bounded items across two userspace-dp LOW cohorts.
+  #5191 A1-b9-F5: the transport-data and CookieReply parsers now compare the
+  full little-endian 32-bit type word via the handshake parser's
+  `is_canonical_type`, closing a parser differential against kernel WG /
+  wireguard-go (both previously accepted nonzero RESERVED bytes that every
+  other implementation drops). #5193 A1-b7-F1: `populate_tunnel_endpoints`
+  preflights endpoint-id uniqueness BEFORE mutating state (typed
+  `TunnelEndpointDuplicateId`), so a duplicate id can no longer install the
+  last row under that id while both interfaces' ifindexes alias it; a
+  duplicate ifindex keeps the first row and logs instead of silently
+  overwriting. #5193 A1-b7-F7: the CoS DSCP rewrite-rule ingest bounds every
+  code-point to 0..=63 (`CosDscpRewriteCodePointOutOfRange`), so a value the
+  TX path would mask into a different PHB fails the snapshot closed like the
+  classifier builders have since #2447.
+  THREE items this work originally carried were DROPPED before merge because
+  other lanes landed the same fixes first, and taking a second implementation
+  of a landed fix is how a guard gets silently lost: #5189 A1-b10-F4 (keepalive
+  vs `WRITE_BACKLOG_MAX_BYTES`) went to PR #7199, whose version also declines
+  to re-arm `last_write` on suppression; #5190 A1-b1-F7 (`rx_over_1514`
+  rename), A1-b12-F3 (bench merge-gate claims) and A1-b8-F6
+  (`zero_unbound_slot` completeness) all went to PR #7226, whose census test
+  drives the real `refresh_bindings` unbound branch rather than calling
+  `zero_unbound_slot` directly. Each was reverted here in full — production,
+  test and doc — rather than hand-merged, and #7199's non-re-arm guard was
+  mutation-verified to still bite in a scratch tree holding both branches.
+  4-cell mutation matrix green/red/green, zero unsound cells; `cargo check
+  --tests` clean first; full `cargo test --release --bins --tests --
+  --test-threads=1` green. Rust diff moves the helper binary, so a cluster
+  smoke is OWED (not run here).
+- **File(s)**: userspace-dp/src/afxdp/wg/{framing,cookie,handshake,cookie_tests}.rs,
+  userspace-dp/src/afxdp/forwarding_build/{cos,tunnels,tests}.rs,
+  userspace-dp/src/policy_snapshot_error.rs, docs/config-schema.md,
+  docs/wireguard-interop.md, docs/userspace-dataplane-architecture.md, _Log.md
+- **Action**: #6960/#6975 — the gRPC and REST session-interface filters resolved
+  a session's INGRESS interface as `zone.Interfaces[0]`, a value that does not
+  depend on the session at all. The remote `cli` routes both `show` and `clear`
+  through the gRPC filter, and a console clear propagates the operator's filter
+  to the HA peer over the same RPC, so
+  `clear security flow session interface <the zone's first interface>` DELETED
+  every session in that zone, including flows received on a sibling interface.
+
+  REPRODUCED FIRST at 849576b94, driving the real RPC: a trust zone bound to
+  `[ge-0/0/0.0, ge-0/0/3.50, ge-0/0/3.80]` collapsed to
+  `zoneIfaces = {trust: "ge-0/0/0.0"}`, `matchV4` returned true for a session
+  whose recorded ingress binding was `ge-0/0/3.80`, and
+  `ClearSessions{Interface: "ge-0/0/0"}` returned `ipv4_cleared=1` after
+  deleting it.
+
+  Both surfaces now widen `zoneIfaces` to `map[uint16][]string` (the #4792 form
+  pkg/cli has carried since #4983) and resolve the ingress arm through
+  `resolveSessionIngressIfaces`: the single interface the recorded
+  `{IngressIfindex, IngressVlanID}` identity names, else EVERY interface bound
+  to the ingress zone. The zone fallback deliberately WIDENS — a filter that
+  drops a candidate hides a live session from `show` and leaves it behind on
+  `clear` — so peer-synced rows, reverse companions and the host-outbound GRE
+  path stay reachable.
+
+  An identity hit is CORROBORATED against the row's own recorded ingress zone
+  before it is reported as fact: the name map is rebuilt per query from the
+  current config and current kernel ifindexes while the row's ifindex was
+  recorded at install, so a RECYCLED ifindex can hit and name an interface the
+  session never arrived on (#6987, the same mechanism in pkg/cli). On a
+  disagreement is treated as a MISS and the zone answers instead — the same
+  answer these surfaces gave before they read the identity at all. A rezoned
+  interface produces the identical disagreement and the row cannot tell the two
+  apart, so the tie breaks toward not ACTING on the name: this filter feeds
+  `clear`, and selecting on an untrustworthy name would delete sessions that
+  never touched the named interface. The row stays reachable through its
+  recorded ingress zone and its egress arm.
+
+  SCOPE: what the reported column may CLAIM when no identity is available is
+  deliberately UNCHANGED here — it is still the ingress zone's first bound
+  interface. Narrowing that is operator-visible and has to land on all three
+  session surfaces at once, or the console and the remote `cli` disagree; it is
+  #6987.
+
+  VALIDATION: 6 mutations, each one line on a clean tree, all RED with
+  `go vet` clean (assertion reds, not build breaks) — zone collapse restored
+  (gRPC + REST), ingress arm restored to the zone (gRPC + REST), and
+  corroboration forced true (gRPC + REST).
+  `go test -count=1 ./pkg/grpcapi/ ./pkg/api/ ./pkg/cli/ ./pkg/daemon/` green;
+  `go build ./...` and `go vet ./...` clean. The Rust diff is doc comments
+  only (`session/entry.rs`, `session/README.md` claims that named these two
+  surfaces as retaining the zone form); no executable Rust code changed, so no
+  cluster smoke is owed.
+- **File(s)**: pkg/grpcapi/server_sessions.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/session_iface_identity_6960_test.go,
+  pkg/grpcapi/session_egress_drift_4650_test.go,
+  pkg/grpcapi/pagination_test.go, pkg/grpcapi/server_sessions_test.go,
+  pkg/grpcapi/server_sessions_policy_id_zero_4626_test.go,
+  pkg/api/sessions.go, pkg/api/server.go,
+  pkg/api/session_iface_identity_6960_test.go,
+  pkg/api/sessions_policy_id_zero_4626_test.go, pkg/dataplane/types.go,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6987 — a session's recorded ingress `{ifindex, VLAN}` is stamped
+  at INSTALL, while the `{ifindex, VLAN} -> interface name` table is rebuilt
+  from the CURRENT config and the CURRENT kernel ifindexes on EVERY query. A
+  kernel ifindex is RECYCLED — a tunnel, VLAN unit or XFRM interface is
+  destroyed and its number handed to a different interface later — so a stale
+  ifindex does not merely MISS the rebuilt table: it HITS it and names an
+  interface the session never arrived on. Nothing in the output distinguished
+  that from a correct answer.
+
+  REPRODUCED FIRST on top of the #6960 branch: `gr-0/0/0` (zone vpn) held
+  ifindex 42 when the session installed; the tunnel was torn down and `ge-0/0/2`
+  (zone trust) took 42. `resolveIngressIfaces(42, 0, vpn)` returned
+  `[ge-0/0/2]` — one confident name in the WRONG zone — and
+  `show security flow session interface ge-0/0/2` selected the row.
+
+  The row carries one other identity recorded at the same instant: its ingress
+  ZONE, whose id is name-derived and STABLE across commits (`assignZoneIDs`).
+  An identity hit is now corroborated against it. A disagreement is a MISS on
+  the FILTER (`clear security flow session interface <name>` runs through the
+  same predicate, so selecting on an untrustworthy name would DELETE sessions
+  that never touched the named interface; the row stays reachable through its
+  recorded zone and its egress arm), and prints NOTHING on the reported column
+  — even where the zone binds exactly one interface, because the row carries
+  positive evidence of inconsistency rather than mere absence.
+
+  The reported column also stops naming one member of a MULTI-interface zone on
+  behalf of its siblings. `pkg/cli` built a second, display-only
+  `map[uint16]string` of each zone's first interface, deliberately separate
+  from the filter's widened map; that map is deleted and both columns now read
+  the one map `populateIfaceMaps` builds. The same rule lands on `pkg/grpcapi`
+  and `pkg/api` in the same change, or the console and the remote `cli` would
+  report different interfaces for one session. Where a zone binds exactly ONE
+  interface the approximation has exactly one answer and is still printed, so
+  the #4983 never-blank property holds: peer-synced and reverse-direction rows
+  keep an ingress column (the zone name where the zone cannot narrow).
+
+  Residual, measured and deliberately NOT closed: a recycle WITHIN one zone
+  corroborates and still names the wrong sibling. Separating it needs an
+  install-time generation carried on the session row, which is a dataplane wire
+  change. Filed as #7239, with the uncorroborated EGRESS side as #7240.
+
+  VALIDATION: 6 mutations, each one line on a clean tree, all RED with `go vet`
+  clean (assertion reds, not build breaks) — corroboration forced true (cli),
+  the disputed-display arm removed (cli + gRPC), and the sole-member display
+  rule widened to "first of any" (cli + gRPC + REST). `go test -count=1` green
+  for pkg/cli, pkg/grpcapi, pkg/api, pkg/dataplane; `go build ./...` and
+  `go vet ./...` clean. Rust diff is doc comments only; nothing reaches the
+  helper binary, so no cluster smoke is owed.
+- **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/session_ingress_identity_stale_6987_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/session_iface_identity_6960_test.go, pkg/api/sessions.go,
+  pkg/api/session_iface_identity_6960_test.go, pkg/dataplane/types.go,
+  userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-21 — #6368: config-epoch guard check→write made non-racy
+
+- **Timestamp**: 2026-08-21
+- **Action**: `configEpochStale` and `PutClusterSynced*` were not one critical
+  section: the check reads max(applyingConfigGen, lastAppliedConfigGen) and the
+  write lands several statements later on the receiveLoop while configApplyLoop
+  runs independently, so a descheduled receiveLoop could pass the check against
+  the pre-fence threshold and land its write after the deleted-policy sweep —
+  leaving a stale PERMIT nothing re-examines until the next config apply. The
+  issue called the window "a few instructions"; it is actually the whole of
+  OnConfigReceived (compile + promote + sweep), which is why this was worth
+  closing. Fix: re-read the threshold AFTER a successful write and roll the
+  session back via DeleteWithCompanions* (reason cluster-stale) when it has gone
+  stale, deliberately NOT recording the per-key generation so the peer's next
+  re-sync is admitted. Act-then-verify rather than a lock — serializing check
+  and write would hold a mutex across dataplane I/O on the bulk-install hot
+  path, which the #2198 F3 note refuses; the re-read costs one atomic load per
+  install. Four cells: v4 and v6 rollback (the apply lands INSIDE the write via
+  a new mockSweepDP onSetV4/onSetV6 hook), plus two anti-over-reject cells (an
+  uncontended install survives; an apply that is not newer than the session's
+  epoch leaves it alone). Mutation-proven against the VERBATIM pre-fix bytes
+  from origin/master. go vet clean, pkg/cluster green at -count=1, the
+  6368/5274/6284 cells green under -race. **Cluster/session-sync code: a
+  failover smoke is OWED.**
+- **File(s)**: pkg/cluster/sync_conn_gen.go,
+  pkg/cluster/sync_config_epoch_install_race_6368_test.go,
+  pkg/cluster/sync_test.go, docs/session-sync-architecture.md, _Log.md
+
+## 2026-08-21 — #6345: WG transit-egress dispatch follows the selected peer on both branches
+
+- **Timestamp**: 2026-08-21
+- **Action**: `resolve_forward_target_ifindex` early-returned
+  `decision.resolution.tx_ifindex` whenever it was > 0, so #6308's peer-route
+  SSOT applied only to the `tx_ifindex == 0` branch. For a WG transit-egress
+  flow whose transport table carries a DEFAULT route, tx_ifindex is the
+  default-route parent while `wg_encap_frame` builds the outer L2/VLAN/src
+  against the SELECTED PEER's more-specific route (#6306) — identical with one
+  underlay, divergent with several, where the frame left one NIC carrying
+  another segment's source MAC and VLAN. Fix: consult
+  `wg_transit_egress_physical_egress_ifindex` FIRST on both branches and fall
+  back to tx_ifindex only when it does not resolve, so dispatch and bytes agree
+  by construction; a peer NIC with no XSK binding now drops rather than emitting
+  a mismatched frame on the wrong underlay. The non-tunnel fast path is still
+  one integer compare (`tunnel_endpoint_id == 0` -> None). Two cells: a
+  multi-underlay flow must dispatch to the peer's parent and not to tx_ifindex,
+  plus an anti-over-reject cell pinning the non-tunnel fast path. Mutation-proven
+  against the verbatim pre-fix ordering. Rust diff moves the helper binary, so a
+  cluster smoke is OWED.
+- **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
+
+## 2026-08-21 — #6440 CoS-apply CLI-transcript gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Diagnosed #6440 (`apply-cos-config.sh` exits 6). Root cause: the
+  piped-stdin CLI is a REPL that prints `error: ...` for a failed command,
+  continues, and exits 0 — so the phase-1/phase-2 exit-status gates could
+  never fire, and a silently-failed `load merge` committed a deletes-only
+  candidate (a CoS wipe) that surfaced only as the phase-3 "no shaper
+  binding" grep. Replaced the exit-status gates with CLI success-marker
+  verification, made every rollback verified, and added a daemon-readiness
+  wait.
+- **File(s)**: `test/incus/cos-apply-lib.sh` (new),
+  `test/incus/cos-apply-lib-selftest.sh` (new),
+  `cmd/cli/cos_apply_markers_6440_test.go` (new),
+  `test/incus/apply-cos-config.sh`, `Makefile`, `CLAUDE.md`,
+  `docs/cos-validation-notes.md`
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
+  return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
+  (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
+  degraded arm; document the idle regulation in the worker README.
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`
+
+## 2026-08-21 — #6177 item 1: fence the remote-failover ack on RETH VIP release
+- **Timestamp**: 2026-08-21
+- **Action**: Close the RETH VIP-removal sub-ms two-owner residual. `vrrp.ResignRG`
+  now returns a `*ResignBarrier` armed on every targeted instance before
+  `triggerResign`; instances report to it from the sites that actually complete a
+  VIP release (`becomeBackup` with the `removeVIPs` verdict, the MASTER-arm
+  shutdown removal, a new BACKUP-arm `resignCh` consumer, and `stop()`).
+  `handleClusterEvent` defers the demotion fence verdict to
+  `awaitRethVIPRelease`, which resolves `signalFailoverActuated` /
+  `signalFailoverActuationFailed` from the release itself, on its own goroutine.
+- **File(s)**: pkg/vrrp/resign_barrier.go (new), pkg/vrrp/instance.go,
+  pkg/vrrp/manager.go, pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go,
+  pkg/vrrp/resign_barrier_6177_test.go (new),
+  pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
+  docs/session-sync-architecture.md
+
+## 2026-08-21 — #6427: split manager_ha.go into seven responsibility-scoped files
+
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/dataplane/userspace/manager_ha.go` (2,299 LOC, the `[REFACTOR]`
+  tier of the modularity audit) fused seven unrelated responsibilities behind
+  one HA-shaped filename: the HA state machine, fabric-state publish, helper
+  counter bridging, session-table mutation verbs, session-sync request
+  construction, session-sync transmit/lock discipline, and the NAPI bootstrap
+  probe interface list. Split by responsibility into `manager_ha.go` (873),
+  `manager_sessions.go` (569), `manager_sessionsync_request.go` (327),
+  `manager_counters.go` (267), `manager_sessionsync_transmit.go` (187),
+  `manager_fabric_sync.go` (102) and `napi_probe_interfaces.go` (57). PURE CODE
+  MOTION: every declaration was copied by exact source line range, so no body,
+  signature, receiver, visibility, lock scope or defer ordering changed and no
+  new exported surface was created (everything stays in package `userspace`).
+  Two INDEPENDENT mechanical proofs, not eyeballing: (1) a regex block parser
+  compared all 80 top-level declarations before/after and found 80 byte-identical
+  including indentation, 0 dropped, 0 added, with each declaration's leading
+  comment run compared separately so a doc comment landing on the wrong
+  neighbour would fail; (2) a `go/parser` + `go/printer` dump keyed by
+  declaration name, emitting each decl's `ast.Doc` text and printed source,
+  diffed to zero across the seven post-split files. Also refreshed the six
+  now-stale `manager_ha.go` path pointers in docs/Rust comments that name a
+  moved symbol, and regenerated the refactor audit — manager_ha.go leaves the
+  `[REFACTOR]` tier and no new file enters the >=1500 LOC audit at all.
+  `go build ./...`, `go vet ./pkg/dataplane/...`, `go test -count=1
+  ./pkg/dataplane/...`, `go test -count=1 -race -run 'Session|HA'
+  ./pkg/dataplane/userspace/...`, `go test -count=1 ./pkg/refactoraudit/...` and
+  `go test -count=1 ./...` all rc=0, with the `_5007` / `_5698` / `_5305` /
+  `_5380` / `_5881` cells unchanged. **HA/session-sync code: `make test-failover`
+  is OWED and was NOT run (shared loss cluster not touched).**
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/manager_sessionsync_request.go,
+  pkg/dataplane/userspace/manager_sessionsync_transmit.go,
+  pkg/dataplane/userspace/manager_counters.go,
+  pkg/dataplane/userspace/manager_fabric_sync.go,
+  pkg/dataplane/userspace/napi_probe_interfaces.go,
+  docs/refactoring-audit-current.txt, docs/config-schema.md,
+  docs/fabric-cross-chassis-fwd.md, docs/snapshot-publish-redesign.md,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/ha/session_import.rs, userspace-dp/src/main_tests.rs,
+  _Log.md
+
+## 2026-08-21 — #7259: bind the BulkSnapshotSource production wiring
+- **Timestamp**: 2026-08-21
+- **Action**: Add a test that drives the real `startClusterComms` and INVOKES the
+  `BulkSnapshotSource` it published, asserting the exported session round-trips.
+  Deleting `ss.BulkSnapshotSource = d.userspaceBulkSnapshot` left all five
+  existing #6031 tests green while silently reverting the fix.
+- **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
+
+## 2026-08-21 — #6527 single-RG transfer-commit rollback
+- **Timestamp**: 2026-08-21
+- **Action**: Roll back `peerTransferOutOverride` when
+  `commitRequestedPeerFailover` loses the election, mirroring the batch path;
+  agreement-binding regression test across both request paths.
+- **File(s)**: `pkg/cluster/failover.go`,
+  `pkg/cluster/failover_commit_rollback_6527_test.go`,
+  `pkg/cluster/README.md`
+## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: `compileNAT` / `compileStaticNAT` / `compileNAT64` built
+  `SNATValue`, `SNATValueV6`, `SNATEgressValue`, `NATPoolConfig`, `DNATValue`,
+  static-NAT and `NAT64Config` records and handed them to `SetSNATRule` /
+  `SetDNATEntry` / `SetNATPoolConfig` / the stale-NAT deleters. Every one of
+  those writes landed nowhere: the only production compile path is
+  `Manager.CompileUserspaceShim`, whose `userspaceShimCompileDataplane`
+  implements each as `return nil` (loader.go); the real `(*Manager)` writers in
+  `maps_nat.go` are reachable only through `Manager.Compile`, which no
+  production caller reaches because no backend registers a non-userspace type
+  and `LegacyDataPlaneAdapter` shadows `Compile`/`ApplyConfig` with the
+  userspace ones. Deleted the construction; kept every value that escapes —
+  `result.PoolIDs` / `NextPoolID`, `result.NATCounterIDs`, the implicit
+  `_snat_match_<cidr>` entries in `result.AddrIDs`, the persistent-NAT table
+  (`GetPersistentNAT`, the file's one non-no-op dataplane call), and every
+  compile-failing rejection. `compileNPTv6` is untouched: it still writes
+  `nptv6_rules`, and retiring that plus the `maps_nat.go` writers is the
+  sibling cleanup. New `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms
+  every retired writer to FAIL and requires a clean validate on both marker
+  arms, so a reintroduced write reds by error propagation rather than by a
+  counter. 594 lines removed from compiler_nat.go (1428 -> 1066).
+- **File(s)**: pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
 
 ## 2026-08-21 — #6311: node discriminator in the session-id namespace
 - **Timestamp**: 2026-08-21

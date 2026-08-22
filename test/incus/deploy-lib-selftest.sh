@@ -32,23 +32,45 @@ bad()  { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 FAKE_VM=""
 FAKE_MAINPID="0"
 FAKE_EXECSTART="/usr/local/sbin/xpfd"
+# #6493: verdict the fake `xpfd verify-dataplane` probe returns, and an ordered
+# log of every incus call the lib made. The log is what lets a test assert what
+# did NOT happen (no stop, no push to /usr/local/sbin) on the REJECT path — the
+# ordering invariant the pre-flight exists to hold.
+FAKE_VERIFY_RC=0
+# A FILE, not an array: every call under test runs in a subshell (die() exits,
+# so the rc has to be caught), and an array mutated in a subshell is discarded
+# on return. A file survives, so "what did NOT happen" is still assertable
+# after the abort.
+FAKE_CALL_LOG=""
 
 setup_fake_vm() {
 	FAKE_VM=$(mktemp -d)
 	FAKE_MAINPID="0"
 	FAKE_EXECSTART="/usr/local/sbin/xpfd"
+	FAKE_VERIFY_RC=0
+	FAKE_CALL_LOG=$(mktemp)
 	mkdir -p "$FAKE_VM/usr/local/sbin" "$FAKE_VM/etc/systemd/system"
+}
+
+# fake_calls_contain <extended-regex> — did any recorded incus call match?
+fake_calls_contain() {
+	[[ -n "$FAKE_CALL_LOG" ]] && grep -qE "$1" "$FAKE_CALL_LOG" 2>/dev/null
 }
 
 teardown_fake_vm() {
 	[[ -n "$FAKE_VM" && -d "$FAKE_VM" ]] && rm -rf "$FAKE_VM"
 	FAKE_VM=""
+	[[ -n "$FAKE_CALL_LOG" ]] && rm -f "$FAKE_CALL_LOG"
+	FAKE_CALL_LOG=""
 }
 
 # incus mock: supports `incus exec <inst> -- <cmd...>` and
 # `incus file push <local> <inst>/<path> [--mode m]`. <inst> is ignored
 # (single fake VM). All paths resolve under $FAKE_VM.
 incus() {
+	# Record BEFORE dispatch so a call that dies/returns non-zero is still in
+	# the log (the REJECT path's assertions read it).
+	[[ -n "$FAKE_CALL_LOG" ]] && printf '%s\n' "$*" >> "$FAKE_CALL_LOG"
 	local verb="$1"; shift
 	case "$verb" in
 	exec)
@@ -145,6 +167,14 @@ _fake_exec() {
 # _fake_remote_bash interprets the specific bash -c bodies the lib sends.
 _fake_remote_bash() {
 	local body="$1"
+	# #6493 pre-flight probe: the body execs `<staged> verify-dataplane`.
+	# Answer with the configured verdict. Checked FIRST so the generic
+	# fall-through `return 0` at the bottom can never launder a REJECT into a
+	# pass (a mock that silently returns 0 for an unrecognized body inverts the
+	# result of every REJECT test in this file).
+	if [[ "$body" == *"verify-dataplane"* ]]; then
+		return "$FAKE_VERIFY_RC"
+	fi
 	# deploy_verify_running_xpfd: effective ExecStart query (systemctl show
 	# ExecStart | sed path=). Emit the modeled ExecStart through the same sed
 	# the lib applies, so the extraction path is exercised end-to-end.
@@ -349,6 +379,158 @@ test_verify_running_stale_binary_hardfails() {
 	rm -f "$lb"; teardown_fake_vm
 }
 
+# ── #1864 verify-dataplane pre-flight (#6493) ────────────────────────
+# The gate the standalone deploy was missing. Three properties:
+#   1. a REJECT hard-fails (rc != 0) AND touches nothing on the box — no
+#      systemctl stop, no push into /usr/local/sbin. That is the whole point:
+#      the old daemon keeps forwarding while the operator rebuilds.
+#   2. a PASS returns 0 so the deploy proceeds.
+#   3. the staged /tmp/xpfd.preflight is removed on BOTH paths.
+# RED on revert: drop the die() and (1) flips; drop the cleanup call from
+# either path and (3) flips; hoist the call below the stop in setup.sh and the
+# ORDERING test below flips.
+
+test_preflight_pass_proceeds() {
+	setup_fake_vm
+	local lb; lb=$(mktemp); make_local_bin "$lb" "GOOD-SHIM"
+	FAKE_VERIFY_RC=0
+	if ( deploy_verify_dataplane_preflight vm "$lb" ) >/dev/null 2>&1; then
+		ok "preflight: verifier PASS lets the deploy proceed (rc 0)"
+	else
+		bad "preflight: verifier PASS must not abort the deploy"
+	fi
+	rm -f "$lb"; teardown_fake_vm
+}
+
+test_preflight_reject_hardfails() {
+	setup_fake_vm
+	local lb; lb=$(mktemp); make_local_bin "$lb" "BAD-SHIM"
+	FAKE_VERIFY_RC=1
+	if ( deploy_verify_dataplane_preflight vm "$lb" ) >/dev/null 2>&1; then
+		bad "preflight: verifier REJECT MUST hard-fail (this is the #1864 mode)"
+	else
+		ok "preflight: verifier REJECT hard-fails (rc!=0, deploy aborts)"
+	fi
+	rm -f "$lb"; teardown_fake_vm
+}
+
+test_preflight_reject_touches_nothing() {
+	setup_fake_vm
+	local lb; lb=$(mktemp); make_local_bin "$lb" "BAD-SHIM"
+	# The VM is running the OLD binary; a REJECT must leave it exactly there.
+	make_local_bin "$FAKE_VM/usr/local/sbin/xpfd" "OLD-RUNNING"
+	FAKE_VERIFY_RC=1
+	# Subshell for the rc (die() exits); the call log is a file so it survives.
+	local rc=0
+	( deploy_verify_dataplane_preflight vm "$lb" ) >/dev/null 2>&1 || rc=$?
+	if [[ $rc -eq 0 ]]; then
+		bad "preflight: REJECT must not return 0"
+		rm -f "$lb"; teardown_fake_vm; return
+	fi
+	if fake_calls_contain "systemctl stop"; then
+		bad "preflight: REJECT stopped the daemon — the box was taken down to learn the binary is bad"
+	elif fake_calls_contain "vm/usr/local/sbin/xpfd"; then
+		bad "preflight: REJECT pushed into /usr/local/sbin — the bad binary replaced the good one"
+	elif [[ "$(cat "$FAKE_VM/usr/local/sbin/xpfd")" != "OLD-RUNNING" ]]; then
+		bad "preflight: REJECT overwrote the running binary"
+	else
+		ok "preflight: REJECT leaves the old daemon untouched (no stop, no sbin push)"
+	fi
+	rm -f "$lb"; teardown_fake_vm
+}
+
+test_preflight_cleans_up_on_pass() {
+	setup_fake_vm
+	local lb; lb=$(mktemp); make_local_bin "$lb" "GOOD-SHIM"
+	FAKE_VERIFY_RC=0
+	( deploy_verify_dataplane_preflight vm "$lb" ) >/dev/null 2>&1
+	if [[ -e "$FAKE_VM/tmp/xpfd.preflight" ]]; then
+		bad "preflight: staged candidate left behind after PASS"
+	else
+		ok "preflight: staged /tmp/xpfd.preflight removed after PASS"
+	fi
+	rm -f "$lb"; teardown_fake_vm
+}
+
+test_preflight_cleans_up_on_reject() {
+	setup_fake_vm
+	local lb; lb=$(mktemp); make_local_bin "$lb" "BAD-SHIM"
+	FAKE_VERIFY_RC=1
+	( deploy_verify_dataplane_preflight vm "$lb" ) >/dev/null 2>&1
+	if [[ -e "$FAKE_VM/tmp/xpfd.preflight" ]]; then
+		bad "preflight: staged candidate left behind after REJECT (poisons the next probe's diagnosis)"
+	else
+		ok "preflight: staged /tmp/xpfd.preflight removed after REJECT"
+	fi
+	rm -f "$lb"; teardown_fake_vm
+}
+
+test_preflight_missing_local_binary_hardfails() {
+	setup_fake_vm
+	FAKE_VERIFY_RC=0
+	# No local build at all: must fail loudly rather than push nothing and
+	# "pass" a probe of a binary that does not exist.
+	if ( deploy_verify_dataplane_preflight vm /nonexistent/xpfd ) >/dev/null 2>&1; then
+		bad "preflight: absent local xpfd MUST hard-fail"
+	else
+		ok "preflight: absent local xpfd hard-fails before any remote work"
+	fi
+	teardown_fake_vm
+}
+
+# ── ORDERING: the call site position, not the function ───────────────
+# The function can be perfect and the gate still useless if a caller runs it
+# after `systemctl stop xpfd`. These read the real deploy scripts and assert the
+# pre-flight call precedes every destructive step in the same function. Purely
+# textual (no incus), and RED the moment either call is hoisted or removed.
+# _first_line_matching <file> <grep-ere> -> line number of the first matching
+# NON-COMMENT line, or empty.
+#
+# The comment filter is load-bearing, not tidiness: the pre-flight call sites
+# are documented with prose that NAMES the destructive steps ("...runs before
+# `systemctl stop xpfd`..."), so an unanchored sweep matches the explanation of
+# the invariant instead of the code that breaks it — and reports the gate as
+# mis-ordered while it is in fact correct. Caught by this very test on its
+# first run.
+_first_line_matching() {
+	grep -nE "$2" "$1" 2>/dev/null \
+		| awk -F: '{ line = $0; sub(/^[0-9]+:/, "", line); if (line !~ /^[[:space:]]*#/) { print $1; exit } }'
+}
+
+test_preflight_precedes_destructive_steps_standalone() {
+	local f="${SCRIPT_DIR}/setup.sh"
+	local pre stop push
+	pre=$(_first_line_matching "$f" '^[[:space:]]*deploy_verify_dataplane_preflight ')
+	stop=$(_first_line_matching "$f" 'systemctl stop xpfd')
+	push=$(_first_line_matching "$f" 'incus file push .*/usr/local/sbin/xpfd')
+	if [[ -z "$pre" ]]; then
+		bad "ordering(setup.sh): no deploy_verify_dataplane_preflight call — the standalone deploy has NO verifier gate (#6493)"
+	elif [[ -z "$stop" || -z "$push" ]]; then
+		bad "ordering(setup.sh): could not locate the stop/push anchors — test is stale, fix the pattern"
+	elif (( pre < stop && pre < push )); then
+		ok "ordering(setup.sh): pre-flight at :$pre precedes stop(:$stop) and sbin push(:$push)"
+	else
+		bad "ordering(setup.sh): pre-flight at :$pre runs AFTER stop(:$stop)/push(:$push) — the box is already down when the gate fires"
+	fi
+}
+
+test_preflight_precedes_destructive_steps_cluster() {
+	local f="${SCRIPT_DIR}/cluster-setup.sh"
+	local pre stop push
+	pre=$(_first_line_matching "$f" '^[[:space:]]*deploy_verify_dataplane_preflight ')
+	stop=$(_first_line_matching "$f" 'systemctl stop bpfrxd')
+	push=$(_first_line_matching "$f" 'incus file push .*/usr/local/sbin/xpfd')
+	if [[ -z "$pre" ]]; then
+		bad "ordering(cluster-setup.sh): no deploy_verify_dataplane_preflight call — the #1869 gate was lost"
+	elif [[ -z "$stop" || -z "$push" ]]; then
+		bad "ordering(cluster-setup.sh): could not locate the stop/push anchors — test is stale, fix the pattern"
+	elif (( pre < stop && pre < push )); then
+		ok "ordering(cluster-setup.sh): pre-flight at :$pre precedes migration stop(:$stop) and sbin push(:$push)"
+	else
+		bad "ordering(cluster-setup.sh): pre-flight at :$pre runs AFTER stop(:$stop)/push(:$push)"
+	fi
+}
+
 # ── Rolling-deploy node ordering (#4009) ─────────────────────────────
 # Captured `cli -c "show chassis cluster status"` samples (FormatStatus,
 # pkg/cluster/status.go). deploy_rolling_secondary_node must echo the RG0
@@ -479,6 +661,14 @@ test_reconcile_dangling_sbin_keeps_valid
 test_verify_running_match
 test_verify_running_stale_pin_hardfails
 test_verify_running_stale_binary_hardfails
+test_preflight_pass_proceeds
+test_preflight_reject_hardfails
+test_preflight_reject_touches_nothing
+test_preflight_cleans_up_on_pass
+test_preflight_cleans_up_on_reject
+test_preflight_missing_local_binary_hardfails
+test_preflight_precedes_destructive_steps_standalone
+test_preflight_precedes_destructive_steps_cluster
 
 echo "----------------------------------------"
 echo "deploy-lib selftest: $PASS passed, $FAIL failed"

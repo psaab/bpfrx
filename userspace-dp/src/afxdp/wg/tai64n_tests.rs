@@ -187,3 +187,25 @@ fn high_water_round_trips() {
     clk.seed_high_water(encode(0, 0));
     assert_eq!(clk.high_water(), Some(n));
 }
+
+/// #6422: the initiator's monotonic TAI64N clock. Every outbound
+/// handshake initiation calls `now()`; with `.lock().unwrap()` a single
+/// poisoning panic stopped the tunnel from ever initiating again.
+/// Recovery preserves the high-water mark, so strict monotonicity — the
+/// property the clock exists for — survives the panic.
+#[test]
+fn clock_now_recovers_poisoned_lock_6422() {
+    use crate::afxdp::wg::poison_tests::poison_mutex;
+    let clock = Tai64nClock::new();
+    let first = clock.now();
+
+    poison_mutex(&clock.last);
+
+    let second = clock.now();
+    assert!(
+        second > first,
+        "recovery must keep the committed high-water mark so `now()` \
+         stays strictly monotonic (got {second:?} after {first:?})"
+    );
+    assert_eq!(clock.high_water(), Some(second));
+}

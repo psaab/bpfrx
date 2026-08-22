@@ -1216,6 +1216,22 @@ Four categories, and the non-uniformity is deliberate:
 | VALIDATED LIST (a downstream checker rejects a malformed entry) | `event-options … attributes-match` | `eventAttributesMatchExprs` | KEPT |
 | REPORTED LIST (nothing rejects it; the list IS the compiled policy) | `event-options … then change-configuration commands` | `eventChangeConfigCommands` | KEPT |
 
+**KEPT is about the LIST, not about the SELECTION (#7216).** The SELECTION row
+says the empty value stays in `MatchAddresses`, and it still does — that is what
+keeps `Match` present in the list so every validator and diagnostic describes
+the rule actually in effect. It never meant that a rule whose SELECTION is the
+blank is a shippable config. For `security nat static … match
+destination-address` it is not: `rule.Match` lowers to
+`StaticNATRuleSnapshot.ExternalIP`, the Rust `parse_nat_prefix` returns `None` on
+`""`, and `from_snapshots` drops the WHOLE mapping — the operator authored a
+rule that does not exist at runtime. #6673 already said as much in the one place
+it could see the case (its `rule.Match == ""` arm of the cardinality gate, which
+fires only when two or more prefixes are also listed);
+`validateStaticNATSelectedMatchAddressStrict` (#7216) completes it. The two
+properties are independent and both are now asserted: the cardinality gate must
+not COUNT an empty slot, and the blank SELECTION must not COMMIT. See "#7216"
+below.
+
 The last two rows look like one category and are not. `attributes-match` really
 is validated — `ValidateEventAttributesMatchStrict` hard-rejects a `""` expression at
 strict commit. `commands` is not: `eventengine.classifyPlan` trims and SKIPS an
@@ -8462,7 +8478,7 @@ scope committed against a pre-`4` helper disarms it and aborts the commit
 The rest of the config still loads (#1960 no-brick).
 The id→name reverse maps resolve a colliding id to the survivor deterministically
 (`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,
-`pkg/dataplane/userspace/manager_ha.go:zoneNameByID`) rather than to whichever
+`pkg/dataplane/userspace/manager_sessionsync_request.go:zoneNameByID`) rather than to whichever
 name won a map-iteration race. The quarantine is surfaced to the operator as a
 loud one-shot `slog.Error` naming both zones, on `ProcessStatus.ZoneIDCollisions`
 (`show`), and as the `xpf_userspace_zone_id_collision` 0/1 gauge, so an operator
@@ -9354,6 +9370,113 @@ at the REAL ingresses — `Store.Load` and `Store.SyncApply` — plus a
 `slotEscapeUngated` (`schema_slot_escape_fixtures_test.go`), so their #7143
 slot-escape rows now run the full slot-1 comparison instead of skipping.
 
+**#7216 — a static-NAT rule with NO external prefix.** #7145 and #3228/#3206
+cover a `match destination-address` the dataplane cannot PARSE. They say nothing
+about one that is not there. Measured at `7230dcdcd` over the same base config,
+an explicitly quoted empty value committed clean on static-NAT `match
+destination-address` — the only one of the six (kind x leaf) slots that took it:
+**#7215 — an out-of-range MASK on the one slot #7145 did not reach.** After
+#7145 the six (kind x leaf) slots agreed on a malformed ADDRESS. They still
+disagreed on a malformed MASK. Measured at `353f09592` over the same base
+config, `10.0.0.0/33` — and `2001:db8::/129`, `10.0.0.0/abc`, `10.0.0.0/`,
+`1.2.3.4/-1`, `10.0.0.1/255.255.255.0`, so this is not one arithmetic check
+inside Go's mask parser — was refused on five slots and ACCEPTED on
+destination-NAT `match destination-address`:
+
+| kind | `match source-address` | `match destination-address` |
+|---|---|---|
+| `security nat source` | rejected (#7145) | rejected (#7145) |
+| `security nat destination` | rejected (#7145) | rejected (#3228) |
+| `security nat static` | rejected (#7145) | accepted -> **rejected (#7216)** |
+
+`compileNATStatic` selects `rule.Match` from the authored value, so a quoted
+blank makes it `""`; `buildStaticNATSnapshots` lowers that as
+`StaticNATRuleSnapshot.ExternalIP`, and the Rust `parse_nat_prefix`
+(`userspace-dp/src/nat/static_nat.rs`) returns `None` on it, so `from_snapshots`
+`continue`s and drops the WHOLE mapping, recorded only as a bounded NAT
+parse-error counter (#4718). The operator authored a rule that does not exist at
+runtime, with no commit error and no warning.
+
+**What the empty value means here, established before rejecting it.** #6673's
+empty-slot meaning is a COUNTING rule and is untouched — see "KEPT is about the
+LIST, not about the SELECTION" above. This gate reads `rule.Match`, the
+SELECTION, and never the slot count, so `destination-address [ 192.0.2.1/32 "" ]`
+(blank slot, prefix selected) still commits exactly as it did.
+
+**Scope is the SELECTION, not the keystrokes.** Four authoring shapes reach a
+surviving rule with `rule.Match == ""` and all four were measured committing
+clean and being dropped identically: a quoted `""`, the leaf with no value at
+all, a valid prefix followed by a blank that re-selects, and no `match
+destination-address` statement at all. The issue names only the first; the gate
+covers all four, because a gate that refused the quoted blank and passed the
+omitted statement would bind the authoring shape rather than the defect. The
+message distinguishes the two remedies (fill the blank vs add the statement).
+
+**Exemptions, each verified covered by its own gate rather than assumed.** NPTv6
+(`then static-nat nptv6-prefix`) lowers through `buildNptv6Snapshots`, not the
+`static_nat` table, and already rejects an empty or absent match with a
+family-specific message; `then static-nat inet` is already rejected outright by
+`validateStaticNATInetTargetStrict` (#5859). Both are asserted to STILL reject —
+an exemption whose sibling gate has gone away is a hole, not a scope decision.
+
+The gate runs AFTER `validateStaticNATMatchAddressesStrict` so the
+two-or-more-prefix blank-selection shape keeps that gate's richer message, which
+can name the prefixes being passed over.
+
+Strict on commit / commit-check; lenient on load / peer-sync (warn, sharing
+`lenientFirewallRefs` with the sibling static-NAT gates — #1960 no-brick). The
+tolerant path leaves `rule.Match` ALONE: the dataplane already drops the rule, so
+a leniently-loaded config behaves exactly as it did before this gate, and
+substituting anything for the blank would change what installs on a box that is
+only being warned at.
+
+Regression coverage: `pkg/config/nat_static_blank_external_prefix_7216_test.go`
+(the 3x2 census; all four authoring shapes with their remedies; a #6673
+preservation cell; the two exemptions asserted to keep their own messages; an
+over-rejection guard; tolerant warn-and-keep) and
+`pkg/configstore/nat_static_blank_prefix_boot_7216_test.go` (the no-brick
+property at `Store.Load` and `Store.SyncApply`, with a GOOD rule beside the
+blank one so the tolerated load is shown to keep translating it, plus a
+`CommitCheck` over-reach guard). The `nat static match source-address`
+slot-escape fixture gained a valid `match destination-address`
+(`slotEscNatStaticSrc`) so its CONTROL still commits.
+| `security nat destination` | rejected (#7145) | accepted -> **rejected (#7215)** |
+| `security nat static` | rejected (#7145) | rejected (#3206) |
+
+#7145 did not reach it because its probe (`999.1.1.1/24`) is malformed in the
+ADDRESS half, which that slot's gate did see. `validateDestinationNAT
+AddressesStrict` (#2396(c)/#3228) split the token at the first `/`
+(`natCIDRIPPart`) and ran `net.ParseIP` on the address half ONLY, so
+`10.0.0.0/33` read as the perfectly good `10.0.0.0`. Its own consumer,
+`dnatDestinationParts` (`pkg/dataplane/userspace/nat_destination.go`), calls
+`net.ParseCIDR` on any token carrying a `/` and returns `ok == false` — the
+entry is SKIPPED and never reaches the wire. The gate's doc comment claimed the
+two matched exactly; they did not, and a comment cannot fail.
+
+The gate now calls the same `natMatchPrefixParses` the other four slots use,
+which is extensionally EQUAL to `dnatDestinationParts`'s `ok` (a maskless token
+falls through `net.ParseCIDR` to the same `net.ParseIP`; a masked token can
+never satisfy `net.ParseIP`, so it reduces to the same `net.ParseCIDR`). That
+equality is now bound by a cross-package differential,
+`pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go`, which fails
+on a disagreement in EITHER direction: `gate accepts / builder drops` is #7215,
+`gate refuses / builder installs` is the #1960 brick.
+
+The change is strictly a NARROWING, and every value it newly refuses is one the
+builder already discarded. It refuses nothing the dataplane installs —
+`0.0.0.0/0`, `::/0`, a bare host, a host-bits CIDR and `1.2.3.4/024` all still
+commit, which is why the mirror stays `net.ParseCIDR` and not
+`netip.ParsePrefix`. Lenient (`Store.Load` / peer-sync) needed no new plumbing:
+the slot's existing `lenientDestNATAddresses` flag downgrades it to a warning
+and KEEPS the value.
+
+Regression coverage: `pkg/config/nat_dnat_match_destination_mask_7215_test.go`
+(the full 3x2 census at strict with the five unchanged slots as controls;
+tolerant warn-and-KEEP with the malformed value authored SECOND so the gate is
+pinned to walk the whole bracket list; an over-rejection guard) and
+`pkg/configstore/nat_dnat_match_mask_boot_7215_test.go` (the no-brick property
+at `Store.Load` and `Store.SyncApply`, plus a `CommitCheck` over-reach guard).
+
 Regression coverage: `pkg/config/compiler_nat_host_mask_test.go` (bare/​/32/​/128
 accept; v4 + v6 non-host match/prefix reject with asserted message; NPTv6 and
 `inet` exemptions; NAT64 source-pool host vs non-host; strict-reject /
@@ -10141,7 +10264,15 @@ The Rust forwarding-build is the second trust boundary: an out-of-range
 code-point reaching `build_cos_dscp_queue_table` / `build_cos_ieee8021_queue_table`
 fails the snapshot CLOSED (`SnapshotIntegrityError::CosDscpCodePointOutOfRange`
 / `CosIeee8021CodePointOutOfRange`) — the apply preflight keeps the previous
-live CoS state rather than building a classifier for the wrong class. This is
+live CoS state rather than building a classifier for the wrong class. Since
+#5193 the DSCP **rewrite-rule** ingest carries the same bound
+(`SnapshotIntegrityError::CosDscpRewriteCodePointOutOfRange`, naming rule /
+forwarding-class / value): it stores no table to index, so it compares against
+`COS_MAX_DSCP_CODE_POINT` (63) directly, and the whole rule is validated before
+any entry is inserted so a bad entry cannot install a partial rule. Without it
+the classifier side failed closed while the rewrite side accepted 110 and the
+transmit helper masked it to DSCP 46 — remarking egress packets into a
+different PHB than configured. This is
 the same fail-closed posture as #2410/#2696/#2713 (queue id, scheduler-map
 class, interface MTU). Runtime packet-field masking is retained where it
 belongs: `resolve_cos_dscp_classifier_queue_id` / `resolve_cos_ieee8021_classifier_queue_id`

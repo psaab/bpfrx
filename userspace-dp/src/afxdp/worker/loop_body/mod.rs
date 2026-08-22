@@ -44,6 +44,11 @@ mod setup;
 #[cfg(feature = "debug-log")]
 mod debug_report;
 
+// #6431: classification of the Interrupt-mode idle-regulation `poll(2)`
+// return. Idle path only — it does not sit on the per-tick hot path the
+// no-call-boundary note above constrains.
+mod idle_poll;
+
 /// #6592: refresh the worker's per-tick `(validation, forwarding)` view from
 /// ONE `ArcSwap` load, so the two halves can never come from different
 /// generations.
@@ -288,6 +293,11 @@ pub(crate) fn worker_loop(
     }
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
     let mut idle_iters = 0u32;
+    // #6431: one-shot latch for the degraded-idle-poll log. The condition that
+    // sets it (a hard errno, or a fault-only revents set) repeats every pass,
+    // so an unlatched log would itself become the flood the backoff exists to
+    // prevent.
+    let mut idle_poll_degraded = false;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
     // #5468: per-drain-cycle aggregate lossless-wedge latch. `flush_session_deltas`
@@ -1457,12 +1467,51 @@ pub(crate) fn worker_loop(
                     for pfd in &mut interrupt_poll_fds {
                         pfd.revents = 0;
                     }
-                    unsafe {
+                    let rc = unsafe {
                         libc::poll(
                             interrupt_poll_fds.as_mut_ptr(),
                             interrupt_poll_fds.len() as libc::nfds_t,
                             INTERRUPT_POLL_TIMEOUT_MS,
-                        );
+                        )
+                    };
+                    // #6431: this blocking poll is the ONLY backoff Interrupt
+                    // mode has past the spin window, so discarding its return
+                    // is not a cosmetic omission — a return that came back
+                    // IMMEDIATELY (a hard errno, or a revents set carrying
+                    // only POLLNVAL/POLLERR/POLLHUP) repeats at syscall rate
+                    // and turns the idle wait into a hot spin on a pinned
+                    // core. Capture errno BEFORE anything else can clobber it.
+                    let errno = if rc < 0 {
+                        std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    match idle_poll::classify(rc, errno, &interrupt_poll_fds) {
+                        // Timeout or a readable queue: the wait waited.
+                        idle_poll::IdlePoll::Waited => {}
+                        // EINTR: retry. The next loop pass re-enters the poll,
+                        // so the retry costs one work scan and no sleep.
+                        idle_poll::IdlePoll::Interrupted => {}
+                        idle_poll::IdlePoll::Degraded => {
+                            if !idle_poll_degraded {
+                                idle_poll_degraded = true;
+                                let faults = idle_poll::fault_summary(&interrupt_poll_fds);
+                                eprintln!(
+                                    "xpf-dp: w{worker_id}: idle poll degraded \
+(rc={rc} errno={errno}{}{}) — substituting a {INTERRUPT_POLL_TIMEOUT_MS}ms sleep \
+so the idle path cannot spin; RX is unaffected (the rings are still swept every \
+pass). Logged once per worker.",
+                                    if faults.is_empty() { "" } else { " " },
+                                    faults,
+                                );
+                            }
+                            // Restore the duty cycle the healthy path has.
+                            thread::sleep(Duration::from_millis(
+                                INTERRUPT_POLL_TIMEOUT_MS as u64,
+                            ));
+                        }
                     }
                 } else {
                     wr_state = WorkerRuntimeState::IdleBlock;

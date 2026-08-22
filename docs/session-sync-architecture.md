@@ -237,16 +237,86 @@ the new bulk is sent.
 
 ### Send Side
 
-`BulkSync()`:
+`doBulkSync()` frames one authoritative window. The window's SESSION SOURCE is
+chosen once, up front:
+
+- **table truth (production, #6031)** — when `SessionSync.BulkSnapshotSource` is
+  wired, `BulkSyncSnapshot()` frames the caller-supplied snapshot;
+- **the backend session store** — otherwise, `BulkSync()` walks
+  `sessions` / `sessions_v6`.
+
+Both then run the SAME lossless send core (`bulkSyncWindow`):
 
 1. allocates a new monotonically increasing epoch
 2. sends `BulkStart(epoch)`
-3. iterates `sessions_v4` / `sessions_v6`
-4. skips reverse entries
-5. skips sessions not owned by this node for the ingress zone
-6. sends forward entries only
-7. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
-8. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
+3. walks the chosen source
+4. stamps the install generation + config epoch on each entry
+5. sends forward entries only
+6. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
+7. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
+
+The store walk (and only the store walk) additionally skips reverse entries and
+sessions whose ingress zone this node does not own. A caller-supplied snapshot is
+framed VERBATIM — see "Why the window is not framed from the BPF mirror" below.
+
+#### Why the window is not framed from the BPF mirror (#6031)
+
+`BulkSync()`'s `ForEachV4/V6` walk reads the pinned `sessions` / `sessions_v6`
+BPF **conntrack** maps. Under the userspace dataplane those maps are a
+best-effort **display mirror**, not the authoritative session set. The Rust
+helper publishes a conntrack row (`publish_bpf_conntrack_entry`) from only three
+sites in `afxdp/poll_descriptor`: the host-inbound (LocalMiss) install, the
+missing-neighbor seed, and the reverse-companion repair. The ordinary **transit**
+forward install — the site labelled "#4800: the single place a locally learned
+transit forward flow is installed" — writes only the shim steering map
+(`publish_live_session_entry`) and the shared session tables. **A transit session
+therefore has no conntrack row at all**, and the store walk cannot see it.
+
+The standby's copy of that same session IS in its mirror, because the Go receive
+path writes it (`userspace.Manager.SetClusterSyncedSessionV4` →
+`bpfShim.SetSessionV4`), and `reconcileStaleSessions` scans exactly that map.
+Since #5085 removed the empty-bulk skip, an eligible session absent from the
+window is DELETED. Framing cold prime from the mirror therefore deleted the
+standby's live peer-owned **transit** sessions — the ones failover depends on —
+on every cold prime, survivor-fabric re-drive, and forced resync. Measured with
+the `pumpBulk` harness at base: the window carried only the host-inbound row and
+the receiver logged `reconcile stale sessions applied stale_v4=1 deleted_v4=1`.
+
+`BulkSnapshotSource` is wired in `startClusterComms` to
+`Daemon.userspaceBulkSnapshot`, which gathers the owner-RG-filtered live set from
+the helper's in-process `SessionTable` via `ExportOwnerRGSessions(rgIDs, 0)`.
+That control request is synchronous — the helper enqueues the export to every
+worker, waits for their acks, and returns the drained delta set in the response
+(`afxdp/ha/export.rs`, `OwnerRgExportWait::wait_and_collect`). `max = 0` requests
+the UNBOUNDED set: a capped export would truncate the window and the peer would
+delete the remainder.
+
+Two invariants hold this together:
+
+- **One admission filter.** The snapshot is built by `walkUserspaceSessionDeltas`
+  — the SAME walk and the SAME `shouldSyncUserspaceDelta` filter the incremental
+  delta stream uses, with a different sink. The standby must end up holding the
+  same set whichever path delivered it, and the window DELETES whatever it omits,
+  so a divergence between the two filters is always a bug. Single-sourcing the
+  walk makes that divergence unrepresentable. This is also why the snapshot is
+  framed verbatim: re-applying the coarser `ShouldSyncZone` filter on top of the
+  owner-RG one could drop an entry the incremental path admits (a fabric-redirect
+  wire alias, or a session whose owner RG this node holds but whose ingress zone
+  maps elsewhere), and that entry would then be deleted on the receiver.
+- **Fail CLOSED.** If the snapshot source errors, `doBulkSync` returns the error
+  and frames **no window at all** rather than falling back to the mirror walk. An
+  incomplete authoritative window destroys live sessions; framing none merely
+  defers the reconcile, and every `doBulkSync` caller leaves its cold-prime /
+  resync obligation armed for the next attempt. For the same reason a failed
+  export is never degraded into an EMPTY snapshot — an empty window is an
+  assertion that this node owns nothing, which the peer acts on by deleting every
+  session it holds for our RGs.
+
+A close delta drained alongside the export retracts its key from the snapshot
+(`snapshotDeltaSink.deleteV4/V6`): the export drains the same per-binding delta
+buffers the incremental path reads, so an open and a later close for one key can
+arrive in a single batch, and framing the already-closed session would resurrect
+it on the peer.
 
 The sender now treats outbound bulk acknowledgement as first-class state. A
 bulk transfer is not considered fully primed until the peer returns `BulkAck`
@@ -387,6 +457,30 @@ Ordering and correctness:
 - **Bulk re-prime.** `resetRecvGen` clears the fence alongside the high-water so
   a rebooted peer's lower-generation re-prime is accepted (the same
   accept-everything reset the high-water already performs).
+
+**The check and the write are not one critical section (#6368).** The fence
+above makes the *verdict* correct; it does not make the *evaluation* atomic
+with the install it governs. `configEpochStale` reads the threshold and
+`PutClusterSynced*` lands several statements later, on the `receiveLoop`
+goroutine, while `configApplyLoop` runs on its own. A receiveLoop descheduled
+across that gap — a GC pause is enough, and the window it has to miss is the
+whole of `OnConfigReceived` (compile + promote + sweep), not a handful of
+instructions — can pass the check against the pre-fence threshold and land its
+write AFTER the sweep. What survives is a stale PERMIT no later sweep
+re-examines: it lives until the next config apply, which on a quiet box may be
+never, and on a standby it is precisely what that node forwards on after a
+failover.
+
+The install therefore re-reads the threshold AFTER a successful write and rolls
+the session back (`DeleteWithCompanions*`, reason `cluster-stale`) when it has
+gone stale. Act-then-verify rather than a lock: serializing the check with the
+write would hold a mutex across dataplane I/O on the bulk-install hot path,
+which the #2198 F3 note deliberately refuses, whereas the re-read costs one
+atomic load per install. The rollback applies the guard's OWN verdict a moment
+later rather than a fresh judgement — `configEpochStale` never consults policy,
+it refuses on epoch alone — and deliberately does NOT record the per-key
+generation, so the peer's next re-sync of that key is admitted rather than
+refused as stale.
 
 **Item 1 (deferred, documented residual).** The guard still covers only the
 config-authority → peer direction (the primary that admits the session is also
@@ -721,9 +815,13 @@ self-heals via `forceResync` / the #4090 survivor re-drive / the next reconnect.
 disconnect-edge triggered — `installConn` on a reconnect, `handleDisconnect` on
 a survivor fabric. A cold-prime bulk that fails WITHOUT dropping the connection
 therefore left the obligation armed with no consumer for the life of that
-connection. `BulkSync`'s own preconditions produce exactly that shape: it
-returns `session store not ready` (nil `s.sessions`) or `no peer connection`
-before it writes a byte, so no `handleDisconnect` follows. The startup window is
+connection. `doBulkSync`'s own preconditions produce exactly that shape: it
+returns `session store not ready` (nil `s.sessions`), `no peer connection`, or
+(#6031) a `bulk sync table-truth snapshot` error before it writes a byte, so no
+`handleDisconnect` follows. The #6031 fail-closed path deliberately joins this
+set: a snapshot source that cannot reach the helper leaves the obligation armed
+for the connected sweep to re-drive, rather than shipping a mirror-sourced
+window that would delete live sessions. The startup window is
 the real trigger — `startClusterComms` used to call `ss.Start()` (which spawns
 the accept/dial goroutines) and only then `ss.SetRuntime(rt)`, so a peer that
 connected in between drove the cold prime against a nil session store.
@@ -1542,15 +1640,22 @@ a surviving stale entry harmless:
   when it applies the same config snapshot, and idle GC reaps the entry on its
   inactivity timeout regardless.
 
-A full owner-RG re-export would **not** recover an undelivered close anyway. The
-userspace cold-sync delivers sessions as **incremental `Open`s** through the
-event stream and then sends **empty** `BulkStart`/`BulkEnd` markers
-(`pkg/cluster/sync_bulk.go` `doBulkSync` → `BulkSyncOverride`); the peer's
-`reconcileStaleSessions` (`pkg/cluster/sync.go`) short-circuits on an empty bulk
-("skipped (empty bulk)"). Re-emitting `Open`s therefore cannot convey a delete —
-only a non-empty **bracketed** bulk drives the stale-session prune, which the
-event-stream path never produces. A disconnected stream also triggers a fresh
-resync on reconnect (#2874) independently.
+**Historical premise, corrected (#5085, #6031).** This section originally argued
+that a full owner-RG re-export could **not** recover an undelivered close: the
+userspace cold-sync delivered sessions as incremental `Open`s through the event
+stream and then sent **empty** `BulkStart`/`BulkEnd` markers (`doBulkSync` →
+`BulkSyncOverride`), and `reconcileStaleSessions` short-circuited on an empty
+bulk ("skipped (empty bulk)"), so re-emitting `Open`s conveyed no delete.
+
+That premise no longer holds at HEAD. #5085 removed both the empty-marker path
+and the empty-bulk skip — `doBulkSync` always frames a real bracketed window —
+and #6031 sources that window from table truth, so a bulk re-drive DOES now
+prune a session the primary has closed. The conclusion below is unchanged, but it
+rests on a different reason: a bulk re-drive is a much later convergence point
+(the next cold prime, survivor re-drive, or forced resync), so an undelivered
+close must still be surfaced rather than swallowed on the assumption that some
+future bulk will mop it up. A disconnected stream also triggers a fresh resync on
+reconnect (#2874) independently.
 
 So the fix is the minimal honest change: stop silently swallowing the
 `push_delta_lossless` error. `push_purge_close_deltas` records each undelivered
@@ -1668,10 +1773,12 @@ by the daemon's `watchClusterEvents` consumer, not synchronously inside
 On the RETH-VRRP path `ResignRG` itself is only half-synchronous: it drops the
 instance priority to 0 under the instance lock and then does a **non-blocking**
 send on `resignCh`. The priority-0 adverts and the `becomeBackup` VIP removal
-run on the VRRP instance's own loop, so "resigned" below means *resignation
-signalled and priority driven to 0*, not *VIPs off the wire* (#6177 item 1).
+run on the VRRP instance's own loop, so `ResignRG` *returning* means
+*resignation signalled and priority driven to 0*, not *VIPs off the wire*.
 Direct-VIP mode (`no-reth-vrrp`) has no such gap — `reconcileDirectVIPOwnership`
-removes the addresses inline on the event goroutine.
+removes the addresses inline on the event goroutine. `ResignRG` therefore
+returns a `vrrp.ResignBarrier`, and the fence waits on it rather than on the
+call returning (step 5 below, #6177 item 1).
 
 `handleRemoteFailover` (`pkg/cluster/sync_failover.go`) therefore must **not**
 reply `failoverAckApplied` the instant `OnRemoteFailover` returns: the sender
@@ -1715,7 +1822,25 @@ The fix gates the applied-ack on a fence-completion barrier:
    left in the map for `waitFailoverActuated` to consume (a re-arm replaces it):
    deleting it at resolution time would make a failure that lands before the
    waiter arrives read as "never armed", i.e. success.
-5. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
+5. On the RETH-VRRP path the verdict is deferred to the **VIP release itself**
+   (#6177 item 1). `ResignRG` returns a `vrrp.ResignBarrier` armed on every
+   targeted instance BEFORE `triggerResign`; each instance reports to it from
+   the site that actually completes a release — `becomeBackup` (with the
+   `removeVIPs` outcome), the MASTER-arm shutdown removal, the BACKUP arm of the
+   run loop consuming a resign token for an instance that was already BACKUP,
+   and `stop()` for a retired instance. `handleClusterEvent` hands the barrier to
+   `awaitRethVIPRelease` **on its own goroutine** — `watchClusterEvents`
+   serialises every cluster event, so blocking there would stall unrelated RGs
+   behind one VIP removal — and that resolves the fence: `signalFailoverActuated`
+   on a clean release, `signalFailoverActuationFailed` when `removeVIPs` failed
+   (a stale VIP is still answering ARP, so it is not a two-owner-safe
+   resignation) or when the release does not report within
+   `rethVIPReleaseTimeout` (500 ms default — far below the 3 s
+   `failoverActuateTimeout` so the verdict NAMES the un-released addresses, and
+   far below the initiator's 20 s ack timeout so the ack is a decision, not a
+   hang). Already-BACKUP and no-instance RGs resolve promptly rather than
+   stalling, so a clean failover is not downgraded to a hold.
+6. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
    never actuates (superseded reset, event-channel drop) downgrades the ack to
    `failoverAckFailed` so the peer **holds** rather than promoting into the
    two-owner window — safety over latency in the race. On the normal path the
@@ -1726,18 +1851,17 @@ The batch path (`handleRemoteFailoverBatch` / `WaitFailoverAppliedBatch`) applie
 the same barrier across the whole set, all members armed under the one batch
 request id; the first non-nil verdict fails the batch ack.
 
-**Residual (#6177 item 1, open).** On the RETH-VRRP path the barrier releases
-once resignation has been *signalled* (priority 0 set synchronously) and
-`rg_active` is cleared — not once `becomeBackup` has physically removed the
-VIPs. A sub-millisecond window therefore remains in which the peer may promote
-while the old owner's VIPs are still on the interface. It is safe-direction
-rather than benign-by-luck: priority-0 is set synchronously so the resigning
-node cannot win a re-election, and the demotion preflight
+**Closed (#6177 item 1).** The RETH-VRRP path used to release the barrier once
+resignation had been *signalled* (priority 0 set synchronously) and `rg_active`
+was cleared — not once `becomeBackup` had physically removed the VIPs — leaving
+a sub-millisecond window in which the peer could promote while the old owner's
+VIPs were still on the interface. Step 5 above closes it by gating the release
+on a `becomeBackup` completion signal out of the VRRP instance loop. The
+pre-existing mitigations still stand behind it: priority-0 is set synchronously
+so the resigning node cannot win a re-election, and the demotion preflight
 (`tryPrepareUserspaceRGDemotion`) has already shifted the flow cache to
 `FabricRedirect`, so transit traffic reaching the old owner is forwarded over
-the fabric rather than dropped. Closing it means gating the barrier release on a
-`becomeBackup` completion signal from the VRRP instance loop, which is a change
-to the VRRP state machine rather than to this barrier.
+the fabric rather than dropped.
 
 Once the RG is marked standby, each worker processes a
 `WorkerCommand::DemoteOwnerRGS` on its packet thread

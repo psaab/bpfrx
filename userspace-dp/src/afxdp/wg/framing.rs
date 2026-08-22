@@ -80,12 +80,16 @@ pub(crate) fn parse_data_header(buf: &[u8]) -> Option<ParsedDataHeader<'_>> {
     if buf.len() < WG_DATA_HEADER_LEN {
         return None;
     }
-    if buf[0] != WG_TYPE_DATA {
+    // #5191 (A1-b9-F5): the WG `message_type` is a 32-bit little-endian word,
+    // and kernel WG / wireguard-go compare all four bytes. Checking only
+    // `buf[0]` made xpf accept transport-data records with nonzero RESERVED
+    // bytes that every other implementation drops — a parser differential
+    // usable to slip a record past one parser and not the other. Shares the
+    // handshake parser's canonical-type check rather than repeating it, so the
+    // two cannot drift again.
+    if !super::handshake::is_canonical_type(buf, WG_TYPE_DATA) {
         return None;
     }
-    // Bytes 1..4 are reserved and transmitted as zero by
-    // `encode_data_header`. We accept non-zero values here for
-    // interoperability robustness.
     let receiver_index = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let counter = u64::from_le_bytes([
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
@@ -137,15 +141,37 @@ mod framing_tests {
         assert_eq!(&buf[9..16], &[0u8; 7]);
     }
 
+    /// #5191 (A1-b9-F5): a transport-data record whose RESERVED bytes are
+    /// nonzero is NOT canonical — kernel WG and wireguard-go compare the full
+    /// little-endian `message_type` u32 and drop it. This test previously
+    /// asserted the opposite ("accepts non-zero reserved bytes for
+    /// robustness"), which is precisely the parser differential: a record xpf
+    /// would decrypt and a kernel peer would discard.
+    ///
+    /// FAIL-ON-REVERT: compare only `buf[0]` again and each nonzero-reserved
+    /// case below parses successfully.
     #[test]
-    fn ignores_reserved_bytes_on_parse() {
-        // Parse accepts non-zero reserved bytes for robustness.
-        let mut buf = [0u8; WG_DATA_HEADER_LEN];
-        buf[0] = 4;
-        buf[1] = 0xaa;
-        buf[2] = 0xbb;
-        buf[3] = 0xcc;
-        buf[4..8].copy_from_slice(&7u32.to_le_bytes());
-        assert!(parse_data_header(&buf).is_some());
+    fn rejects_noncanonical_reserved_bytes_on_parse_5191() {
+        let mut canonical = [0u8; WG_DATA_HEADER_LEN];
+        canonical[0] = WG_TYPE_DATA;
+        canonical[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert!(
+            parse_data_header(&canonical).is_some(),
+            "a canonical type-4 header must still parse"
+        );
+
+        for byte in 1..4usize {
+            let mut buf = canonical;
+            buf[byte] = 0xaa;
+            assert!(
+                parse_data_header(&buf).is_none(),
+                "reserved byte {byte} = 0xaa was accepted — the type word is not being compared as a full u32"
+            );
+        }
+
+        // The low byte still gates on its own.
+        let mut wrong_type = canonical;
+        wrong_type[0] = WG_TYPE_DATA + 1;
+        assert!(parse_data_header(&wrong_type).is_none());
     }
 }

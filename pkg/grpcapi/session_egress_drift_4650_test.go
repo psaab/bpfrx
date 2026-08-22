@@ -8,21 +8,22 @@ import (
 )
 
 // restEgressOracle reproduces, independently of the shared
-// resolveSessionEgressIface helper, exactly how the REST path
+// sessionEgressIfaceDisplay helper, exactly how the REST path
 // (pkg/api/sessions.go sessionEntryV4/V6) resolves a session's egress
-// interface: the FibIfindex!=0-guarded egressIfaces lookup, then the
-// egress zone's first interface, then the zone's display name. Used as a
-// parity oracle so a revert of the gRPC entry paths back to the
-// unconditional egressIfaces[{FibIfindex,FibVlanID}] lookup (the A9-F3
-// drift) makes the assertions below go RED.
-func restEgressOracle(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneNames, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string) string {
+// interface: the FibIfindex!=0-guarded egressIfaces lookup, then the egress
+// zone's first bound interface, then the zone's display name. Used as a
+// parity oracle so a revert of the
+// gRPC entry paths back to the unconditional
+// egressIfaces[{FibIfindex,FibVlanID}] lookup (the A9-F3 drift) makes the
+// assertions below go RED.
+func restEgressOracle(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneNames map[uint16]string, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) string {
 	if fibIfindex != 0 {
 		if name, ok := egressIfaces[sessionEgressKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && name != "" {
 			return name
 		}
 	}
-	if name := zoneIfaces[egressZone]; name != "" {
-		return name
+	if members := zoneIfaces[egressZone]; len(members) > 0 {
+		return members[0]
 	}
 	return zoneNames[egressZone]
 }
@@ -41,7 +42,7 @@ func TestSessionEntryEgressIfaceParity_4650(t *testing.T) {
 		vlanID      uint16 = 50
 	)
 	zoneNames := map[uint16]string{ingressZone: "trust", egressZone: "untrust"}
-	zoneIfaces := map[uint16]string{ingressZone: "ge-0-0-1", egressZone: "ge-0-0-2"}
+	zoneIfaces := map[uint16][]string{ingressZone: {"ge-0-0-1"}, egressZone: {"ge-0-0-2"}}
 
 	// A stale {ifindex:0, vlanID:50} entry — the exact shape that a
 	// FibIfindex==0 session used to mis-resolve to under the unconditional

@@ -37,7 +37,7 @@ func entryV4_4626(t *testing.T, policyID uint32) *pbSessionEntryShim {
 		200,
 		map[uint16]string{1: "trust", 2: "untrust"},
 		policyNames4626(),
-		map[uint16]string{},
+		map[uint16][]string{},
 		map[sessionEgressKey]string{},
 		true,
 	)
@@ -77,7 +77,7 @@ func TestSessionEntryV6PolicyIDZeroNotFirstPolicy_4626(t *testing.T) {
 		200,
 		map[uint16]string{1: "trust", 2: "untrust"},
 		names,
-		map[uint16]string{},
+		map[uint16][]string{},
 		map[sessionEgressKey]string{},
 		true,
 	)
@@ -110,7 +110,7 @@ func TestSessionEntryRealPolicyStillResolves_4626(t *testing.T) {
 		dataplane.SessionKeyV6{Protocol: 6},
 		dataplane.SessionValueV6{State: 1, PolicyID: 1, Created: 100, LastSeen: 100},
 		200,
-		map[uint16]string{}, names, map[uint16]string{},
+		map[uint16]string{}, names, map[uint16][]string{},
 		map[sessionEgressKey]string{}, true,
 	)
 	if se6.PolicyName != names[1] {

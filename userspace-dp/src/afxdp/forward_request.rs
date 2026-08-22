@@ -54,9 +54,26 @@ pub(super) fn should_install_local_reverse_session(
 /// underlay egress against the SAME selected-peer route #5292 uses for the frame
 /// bytes so dispatch and bytes agree on the physical NIC; non-WG /
 /// unresolvable-peer paths keep the logical fallback (fail-closed identical to
-/// before). The peer-route resolution runs ONLY on the `tx_ifindex == 0` path
-/// (the previously-dropped case), so default-route WG traffic and every non-WG
-/// forward keep the zero-extra-work fast path above.
+/// before).
+///
+/// #6345: the peer-route resolution is consulted FIRST, not only on the
+/// `tx_ifindex == 0` path. #6308 left the `tx_ifindex > 0` branch taking the
+/// stored resolution verbatim, and for a WG transit-egress flow whose transport
+/// table DOES carry a default route that value is the DEFAULT-route parent —
+/// while `wg_encap_frame` builds the outer L2/VLAN/src against the SELECTED
+/// PEER's more-specific route (#6306). With one underlay the two agree and
+/// nothing changes. With SEVERAL (a peer reachable over a different NIC than the
+/// default route's) dispatch targeted one NIC while the bytes carried another
+/// egress's L2 — a frame emitted on the wrong wire, carrying a source MAC and
+/// VLAN that belong to a different segment. Following the peer route on BOTH
+/// branches makes dispatch and bytes agree by construction; if that NIC has no
+/// XSK binding the dispatcher drops, which is the correct fail-closed posture
+/// against emitting a mismatched frame onto the wrong underlay.
+///
+/// The non-tunnel fast path is still one integer compare: the resolver's first
+/// act is `decision.resolution.tunnel_endpoint_id == 0 -> None`, so a plain
+/// forward pays a single field test and then takes `tx_ifindex` verbatim
+/// exactly as before.
 #[inline]
 pub(in crate::afxdp) fn resolve_forward_target_ifindex(
     decision: &SessionDecision,
@@ -65,18 +82,22 @@ pub(in crate::afxdp) fn resolve_forward_target_ifindex(
     frame_addr_family: u8,
     frame_l3_offset_hint: u16,
 ) -> i32 {
-    if decision.resolution.tx_ifindex > 0 {
-        return decision.resolution.tx_ifindex;
-    }
-    let egress_ifindex = crate::afxdp::frame::wg_transit_egress_physical_egress_ifindex(
+    // #6345: the SELECTED-PEER physical egress is the SSOT for BOTH the frame
+    // bytes and the dispatch NIC, so it wins over the stored resolution
+    // whenever it resolves — including when `tx_ifindex > 0`.
+    if let Some(peer_egress) = crate::afxdp::frame::wg_transit_egress_physical_egress_ifindex(
         decision,
         forwarding,
         frame,
         frame_addr_family,
         frame_l3_offset_hint,
-    )
-    .unwrap_or(decision.resolution.egress_ifindex);
-    resolve_tx_binding_ifindex(forwarding, egress_ifindex)
+    ) {
+        return resolve_tx_binding_ifindex(forwarding, peer_egress);
+    }
+    if decision.resolution.tx_ifindex > 0 {
+        return decision.resolution.tx_ifindex;
+    }
+    resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -147,11 +168,12 @@ pub(super) fn build_live_forward_request_from_frame(
     nat64_reverse: Option<Nat64ReverseInfo>,
 ) -> Option<PendingForwardRequest> {
     let hints = hints.unwrap_or_default();
-    // #6308: `resolve_forward_target_ifindex` keeps the `tx_ifindex > 0` fast
-    // path for every normal / default-route flow, and for a WG transit-egress
-    // flow with a specific peer route + NO default route resolves the physical
-    // underlay egress against the selected peer route (matching #5292's frame
-    // bytes) instead of the logical wgN fallback that has no XSK binding.
+    // #6308/#6345: `resolve_forward_target_ifindex` keeps the `tx_ifindex`
+    // fast path for every normal forward, and for a WG transit-egress flow
+    // resolves the physical underlay egress against the SELECTED PEER route —
+    // the same route #5292 builds the frame bytes against — whether or not the
+    // transport table carries a default route. Dispatch NIC and frame L2 are
+    // therefore the same NIC by construction.
     let target_ifindex = resolve_forward_target_ifindex(
         decision,
         forwarding,
