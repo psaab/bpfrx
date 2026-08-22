@@ -1733,6 +1733,30 @@ type DHCPServerGroup struct {
 	Name       string
 	Interfaces []string
 	Pools      []*DHCPPool
+	// MembersFiltered marks a group whose Interfaces list is a RUNTIME-narrowed
+	// subset of what the operator authored — today only the chassis-cluster
+	// master-RG filter (daemon.filterDHCPConfigForMasterRGs) sets it. It is
+	// never set by the config compiler and never appears in a committed config.
+	//
+	// It exists because Interfaces and Pools are independent arrays with NO
+	// semantic edge: nothing records which pool belongs to which member. So once
+	// members are removed, "this group has exactly one interface" no longer
+	// implies "every pool in this group is served on that interface" — the
+	// inference dhcpserver.subnetInterface makes when it emits Kea's per-subnet
+	// interface selector. A mixed `[fxp0.0, reth0.80]` group narrowed to the
+	// surviving RETH member would otherwise bind the fxp0 pool's subnet to the
+	// RETH member (#6520). With this set the renderer omits the selector and
+	// Kea falls back to address-based subnet selection, which is correct for
+	// every group — just less robust than an explicit binding, which is why the
+	// selector is emitted at all.
+	//
+	// It is excluded from every marshal (`json:"-"`, `yaml:"-"`): it describes
+	// this PROCESS's current mastership view, not the operator's configuration,
+	// so it must not appear in the compiled-config dump (GET /api/v1/config),
+	// in the golden compile baseline, or in anything the cluster config-sync
+	// carries to the peer — where it would be read as a committed value the
+	// peer's own filter should not inherit.
+	MembersFiltered bool `json:"-" yaml:"-"`
 }
 
 // DHCPPool defines an address pool for DHCP leases.
