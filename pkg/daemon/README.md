@@ -737,6 +737,42 @@ by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
 `cluster_transport_race_6290_test.go` (production writer vs production reader
 under `-race`, plus a deterministic stale-epoch drop).
 
+### Periodic converger for the Kea applier (#6535)
+
+RA and Kea are the two per-RG services `applyRethServicesForRG` /
+`clearRethServicesForRG` own. RA has had a per-pass converger since #5861
+(`reconcileClusterRAServices`); Kea had none. Every Kea driver was an EDGE —
+those two functions run only under `if tr.Changed`, `applyDirectVIPOwnership`
+only on an ownership change, and the commit path only when an operator
+commits — and `dhcpserver`'s async worker logs an apply error and drops it
+rather than retrying.
+
+So a failover whose Kea apply failed left the wrong node serving: persistent
+dual-DHCP (the demoting node's stop failed, both Kea instances up) or no-DHCP
+(the promoting node's start failed, neither up), until the next RG transition
+or commit. Neither of those happens on its own.
+
+`reconcileClusterDHCPServices` is the missing converger, called from
+`reconcileRGState` beside `reconcileClusterRAServices` and following the same
+rule that section states: the applied marker advances only on a verified
+success, so a transient error is retried on a later pass rather than latched
+as converged. It re-drives ONLY when `dhcpserver.Manager.ClaimApplyRetry`
+reports the last COMPLETED attempt failed, and the manager spaces retries
+(30s) — a permanently broken Kea must not be held in a continuous
+15s-bounded systemctl restart loop by a 2s tick.
+
+**Single-sourced desired state.** `desiredClusterDHCPConfig` is the one place
+that derives the Kea desired state from (active config, current master-RG
+set); the commit path, both transition edges, and the converger all call it.
+This is single-sourced rather than bound with an agreement test because a
+divergence between the converger and an edge is ALWAYS a bug — the converger
+runs every pass and would fight the edge indefinitely.
+
+Guards: `TestFailedKeaApplyIsRetriedByReconcileConverger` (three real
+reconcile passes: an edge pass whose apply fails, a no-transition pass that
+must re-drive it, and a third that must NOT) and
+`TestClaimApplyRetryOnlyAfterAFailedApply`, in
+`dhcp_apply_converger_6535_test.go`.
 ### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
 
 `rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an
