@@ -103983,3 +103983,30 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/mod.rs,
   userspace-dp/src/afxdp/tests_gre_outer_bound_6748.rs (new),
   docs/userspace-native-gre-plan.md
+
+## 2026-08-22 — #6749 binding-plan expansion no longer disables the dataplane
+- **Action**: Re-derived the issue's rotted cites by SYMBOL at master
+  `ac4f5dce1` and confirmed the claim holds end to end.
+  `replan_bindings_from_candidates` rebuilds the binding vector BY SLOT, so a
+  slot that did not exist before comes from `BindingStatus::default()` with
+  `armed = false`; `refresh_status` computes
+  `enabled = forwarding_armed && ... && all(registered && armed)`, so one
+  unarmed slot makes `enabled` false for EVERY binding, and Go's
+  `resolveCtrlEnableLocked` keys ctrl-enable on that flag — ctrl 0, all transit
+  dropped. It does not self-heal: the only other writer of per-binding `armed`
+  is `set_bindings_forwarding_armed`, reached only from `set_forwarding_state`,
+  and Go suppresses that RPC when the arm state has not CHANGED
+  (`if m.lastStatus.ForwardingArmed == desired { return nil }`) — the global
+  flag is still true across an expansion, so nothing re-arms the new slot.
+  Fix: a newly registered slot INHERITS the global arm state (the issue's own
+  first fix direction). Inheriting rather than hardcoding true is load-bearing —
+  hardcoding would arm an HA secondary or a box mid-shutdown, a forwarding
+  fail-OPEN worse than the outage.
+- **NOTE**: a converged 45-round research plan (v8.41, PLAN-READY) exists on
+  `research/6749-armed-state` covering a much larger design (stable-identity
+  preservation, Go-side convergence check, config epochs, MAC debt, wire
+  changes). This change implements only the narrow first fix direction; the plan
+  is reported to the coordinator rather than executed unilaterally.
+- **File(s)**: userspace-dp/src/server/helpers/planning.rs,
+  userspace-dp/src/server/handlers/snapshot.rs,
+  userspace-dp/src/main_tests.rs

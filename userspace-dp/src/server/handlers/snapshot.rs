@@ -346,6 +346,9 @@ pub(super) fn apply(
             guard.snapshot.as_ref(),
             guard.status.workers,
             &existing_bindings,
+            // #6749: new slots inherit the box's current arm state rather than
+            // coming up unarmed and disabling every other binding with them.
+            guard.status.forwarding_armed,
         );
         guard.status.bindings = replanned;
         if defer_workers {
