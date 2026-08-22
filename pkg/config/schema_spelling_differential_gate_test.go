@@ -233,10 +233,34 @@ var notAValueList = map[string]string{
 	"firewall family inet6 filter <*> term <*> then reject": "action plus ONE optional reason token; extras land in UnknownActions",
 
 	"security screen ids-option <*> alarm-without-drop": "bare flag; trailing tokens land in UnknownLeaves",
-	"security screen ids-option <*> ip ip-sweep":        "container with sub-knobs (`ip-sweep { threshold N; }`)",
-	"security screen ids-option <*> tcp port-scan":      "container with sub-knobs",
-	"security screen ids-option <*> tcp syn-flood":      "container with sub-knobs",
-	"security screen ids-option <*> udp":                "container with sub-knobs",
+
+	// #6683: the screen check flags are modelled in setSchema so the packed
+	// stanza body can be expanded (compact_tail.go). They are BARE FLAGS, so a
+	// "two-element value list" is not a shape they have; what diverges is only
+	// WHICH garbage token gets named. In flat-set a trailing token parks as a
+	// CHILD and recordChildExtras names Keys[0] of each child; hierarchically it
+	// stays on Keys and recordKeyExtras names every one.
+	//
+	// That difference does NOT reach the commit decision, which is what this
+	// gate is protecting. Verified rather than assumed:
+	// TestScreenBareFlagTrailingTokenRejectsInBothSpellings compiles trailing
+	// garbage on every one of these ten in BOTH spellings and asserts both are
+	// REJECTED. If that ever stops holding, these entries are hiding a
+	// fail-open and that test reds rather than this allowlist growing quietly.
+	"security screen ids-option <*> icmp fragment":          "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> icmp ping-death":        "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> ip source-route-option": "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> ip tear-drop":           "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> tcp fin-no-ack":         "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> tcp land":               "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> tcp no-flag":            "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> tcp syn-fin":            "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> tcp syn-frag":           "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> tcp winnuke":            "bare flag; trailing tokens land in UnknownLeaves (#6683)",
+	"security screen ids-option <*> ip ip-sweep":            "container with sub-knobs (`ip-sweep { threshold N; }`)",
+	"security screen ids-option <*> tcp port-scan":          "container with sub-knobs",
+	"security screen ids-option <*> tcp syn-flood":          "container with sub-knobs",
+	"security screen ids-option <*> udp":                    "container with sub-knobs",
 
 	// #6688 fixed the value drop here and its own reader states the
 	// classification in as many words: "`port range` is not a value list — it
