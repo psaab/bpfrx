@@ -229,6 +229,26 @@ var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
 // (its own 5s), inside the unit's TimeoutStopSec=20.
 const bootEpochStopJoinBudget = 2 * time.Second
 
+// bootEpochPersistRetryInterval is how often the #6724 trigger re-attempts a
+// persist that a previous refine pass could not complete.
+//
+// 30s is chosen against what the retry is racing, not against the fault: a peer
+// that latched a raise this node emitted but could not persist refuses a
+// concurrent incarnation until the value reaches the file. The pre-#6724 bound
+// on that was "until the next heartbeat (re)start", which is event-driven and
+// unbounded — a daemon can run for days without one. Anything in the tens of
+// seconds converts an unbounded wait into a bounded one; shorter buys nothing,
+// because the faults that make a persist fail (a full or read-only filesystem,
+// a wedged store) do not clear in milliseconds, and each attempt takes the
+// epoch file lock.
+//
+// A var, not a const, for the same reason bootEpochPath and epochFlock are:
+// the WIRING test drives a real heartbeatSender loop, and at the production
+// interval the retry cadence is 150 ticks — thirty seconds of wall clock the
+// test would have to spend to observe one retry. Never reassigned in
+// production.
+var bootEpochPersistRetryInterval = 30 * time.Second
+
 // epochFlock is the lock withEpochFileLock takes. A var for the same reason
 // epochNowNanos is one: the SECOND of its two failure branches is otherwise
 // unreachable from a test. Failing the open is easy (point the lock path
@@ -504,8 +524,11 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 // (Manager.refreshBootEpoch), so the stranded incarnation raises itself above
 // the file again at its next heartbeat (re)start instead of being pinned below
 // the floor for the life of the process by a one-shot sync.Once. Between the
-// mis-ordering and that next start this node IS refused, and there is no
-// periodic re-check — tracked as #6724. See
+// mis-ordering and that next start this node IS refused. #6724 closed the
+// half of that gap which was a MISSING TRIGGER rather than missing state —
+// Manager.retryOwedBootEpochPersist re-runs refinement from the sender loop
+// when, and only when, a pass could not persist — and the mis-ordering itself
+// is tracked as #7501. See
 // TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669.
 //
 // THAT RECOVERY CARRIES TWO CONDITIONS, and stating it flat overstates it. The
@@ -535,13 +558,18 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 // "a predecessor wrote it after a backward clock step" needs a writer identity
 // or a lifetime-held liveness lock, which is where the leapfrog lives.
 //
-// CONDITION 1 needs neither. It needs A to RETRY ITS FAILED PERSIST, and the
-// code already does the right thing on a retry: A's published value is already
-// b+1, so `next := prev+1` is not > epoch, nothing ratchets, and the
-// WriteFileDurable is simply re-attempted. Once b+1 reaches the file, B's next
-// refreshBootEpoch reads it, raises to b+2 and is admitted. What is missing is
-// only a TRIGGER for that retry — the "no periodic re-check" half of #6724 —
-// which is a materially smaller change than a writer identity.
+// CONDITION 1 needs neither, and is CLOSED (#6724). It needed A to RETRY ITS
+// FAILED PERSIST, and the code already did the right thing on a retry: A's
+// published value is already b+1, so `next := prev+1` is not > epoch, nothing
+// ratchets, and the WriteFileDurable is simply re-attempted. Once b+1 reaches
+// the file, B's next refreshBootEpoch reads it, raises to b+2 and is admitted.
+// What was missing was only a TRIGGER for that retry, which is a materially
+// smaller change than a writer identity: refineBootEpochReporting now reports
+// whether a persist is OWED, and Manager.retryOwedBootEpochPersist re-runs
+// refinement from the heartbeat sender loop while one is. The gate is
+// load-bearing in the other direction too — an UNCONDITIONAL periodic refine
+// would make the leapfrog below continuous, so both nodes would be refused for
+// part of every period instead of one being refused until its next restart.
 //
 // Fails CLOSED: if the lock cannot be taken, the read-modify-write is SKIPPED
 // rather than run unlocked. A lock whose failure path executes the critical
@@ -1108,7 +1136,12 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 			}
 		}()
 		for {
-			m.bootEpochWrote.Store(refineBootEpoch(path, &m.bootEpoch, m.bootEpochWrote.Load()))
+			gotWrote, owed := refineBootEpochReporting(path, &m.bootEpoch, m.bootEpochWrote.Load())
+			m.bootEpochWrote.Store(gotWrote)
+			// #6724: record the retry trigger AFTER the watermark, so an
+			// observer that sees the flag also sees the watermark the pass
+			// produced.
+			m.bootEpochPersistOwed.Store(owed)
 			if ready != nil && !signalled {
 				signalled = true
 				close(ready)
@@ -1119,6 +1152,54 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 			}
 		}
 	}()
+}
+
+// bootEpochPersistRetryTicks is how many heartbeat sender ticks pass between
+// two #6724 persist retries, derived from the send interval so the RATE is
+// what is configured, not the tick count.
+//
+// A TICK COUNT, not a deadline. Every clock this package could compare against
+// is the wall clock, and a backward step in it is the exact fault the boot
+// epoch exists to survive — a deadline would suspend retries for the duration
+// of the very step that makes them matter. Ticks are monotonic by
+// construction. The counter lives on the sender, so it resets on a heartbeat
+// restart, which is harmless: a restart already runs a full refine.
+func bootEpochPersistRetryTicks(interval time.Duration) int {
+	if interval <= 0 {
+		return 1
+	}
+	if n := int(bootEpochPersistRetryInterval / interval); n > 1 {
+		return n
+	}
+	return 1
+}
+
+// retryOwedBootEpochPersist re-runs refinement when, and ONLY when, a previous
+// pass left a persist owed (#6724).
+//
+// THE GATE IS THE WHOLE DESIGN, and an unconditional periodic refine — the
+// obvious simpler thing — is worse rather than merely more expensive. While two
+// incarnations overlap, each refine pass raises above the other and rewrites
+// the file, so they leapfrog; running that on a timer would make the leapfrog
+// CONTINUOUS, and each node would be refused by the peer for part of every
+// period instead of one node being refused until its next heartbeat restart.
+// Alternating refusal is worse for HA than a stable one: it is what makes a
+// peer fail over repeatedly. Gating on an owed persist makes this a no-op in
+// exactly that case — two healthy incarnations both persist successfully, so
+// neither ever owes anything — while still closing the case the trigger exists
+// for, where a pass could not write at all.
+//
+// It cannot fix the mis-ordering itself. Separating "a concurrent newer
+// incarnation wrote it" from "a predecessor wrote it after a backward clock
+// step" needs a writer identity or a lifetime-held liveness lock, which is
+// larger than the epoch — see withEpochFileLock and #7501.
+func (m *Manager) retryOwedBootEpochPersist() {
+	if !m.bootEpochPersistOwed.Load() {
+		return
+	}
+	// refreshBootEpoch coalesces onto a running worker and never blocks, so
+	// this cannot stall the send loop it is called from.
+	m.refreshBootEpoch()
 }
 
 // refineBootEpoch is the off-path half of heartbeatBootEpoch: consult the
@@ -1144,14 +1225,46 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 // post-rename directory-fsync failure as a typed *PostRenameSyncError, and at
 // that point the new content is already VISIBLE (#5185); only its durability is
 // unknown. That pass DID move the file, so it returns the value it wrote.
+// refineBootEpoch is the value-only form, kept because it is what the epoch
+// tests drive. Production uses refineBootEpochReporting, which additionally
+// reports whether a persist is still OWED — see that function.
 func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (wrote uint64) {
+	wrote, _ = refineBootEpochReporting(path, published, lastWrote)
+	return wrote
+}
+
+// refineBootEpochReporting is refineBootEpoch plus the #6724 retry signal.
+//
+// persistOwed is true when this pass ended with the published epoch NOT known
+// to be on disk because something FAILED or was SKIPPED — the directory create,
+// the lock, the read, or the write. It is deliberately false for every pass
+// that DECLINED to write on purpose (the #6711 preserve branch, the heal
+// branch, and the `prev == lastWrote` no-op), because those are decisions, not
+// faults, and retrying them forever would be a busy loop over a file this node
+// has already decided not to touch.
+//
+// WHY THE SIGNAL CANNOT BE DERIVED FROM published != wrote AT THE CALL SITE,
+// which is the obvious cheaper thing: the #6711 preserve branch also ends with
+// published (this incarnation's wall-clock seed) != wrote (0, nothing written),
+// and it ends that way FOREVER by design. A caller comparing those two would
+// retry a preserved file on every period for the life of the process, which is
+// exactly the state #7499 created on purpose. Only this function knows which
+// branch it took.
+func refineBootEpochReporting(path string, published *atomic.Uint64, lastWrote uint64) (wrote uint64, persistOwed bool) {
 	wrote = lastWrote
 	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755); err != nil {
 		slog.Warn("cluster: HA boot-epoch state dir create failed; this incarnation's epoch is NOT durable "+
 			"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
-		return wrote
+		return wrote, true
 	}
+	// `ran` distinguishes "the lock could not be taken, so the critical section
+	// never executed" from "it ran and decided not to write" (#6724).
+	// withEpochFileLock reports nothing itself, and giving it a return value
+	// would churn every one of its callers for a fact the caller can observe
+	// here for free.
+	ran := false
 	withEpochFileLock(path, func() {
+		ran = true
 		var prev uint64
 		if data, err := os.ReadFile(path); err == nil {
 			// ONE clock sample, taken AFTER the read RETURNS and shared by the
@@ -1292,6 +1405,8 @@ func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (w
 			// overwriting unknown state is not a safe way to fail.
 			slog.Warn("cluster: HA boot-epoch state read error; keeping the wall-clock epoch "+
 				"and NOT overwriting the persisted value", "path", path, "err", err)
+			// #6724: unknown state, not a decision — worth re-reading later.
+			persistOwed = true
 			return
 		}
 
@@ -1333,9 +1448,18 @@ func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (w
 			}
 			slog.Warn("cluster: HA boot-epoch state persist failed; this incarnation's epoch is NOT durable "+
 				"(a backward clock step across the next restart could regress it)", "path", path, "err", err)
+			// #6724: the raise this pass published (if any) is on the wire but
+			// not on disk. Until it lands, a peer that latched it can refuse a
+			// concurrent incarnation that has no other way to learn of it.
+			persistOwed = true
 			return
 		}
 		wrote = epoch
 	})
-	return wrote
+	if !ran {
+		// The lock was unavailable, so the read-modify-write was skipped
+		// entirely (withEpochFileLock fails CLOSED). Nothing was decided.
+		persistOwed = true
+	}
+	return wrote, persistOwed
 }

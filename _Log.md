@@ -103698,3 +103698,82 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/management_start_race_6719_test.go` (new),
   `pkg/daemon/daemon_dp_escape_rest_test.go`,
   `pkg/daemon/hostname_stale_cert_6827_test.go`, `pkg/daemon/README.md`
+
+## 2026-08-22 — #6733 redact credential-bearing URL fields on marshal
+- **Timestamp**: 2026-08-22
+- **Action**: The config redaction pass is name-keyed; several fields are
+  sensitive by CONTENT (URLs/endpoints named for what they are). Added
+  RedactURL coverage to SystemConfig.LicenseAutoUpdate, ArchivalConfig
+  archive-site lists, FeedServer.Hostname, FeedEntry.Path, RPMTest.Target and
+  WgPeerConfig.Endpoint, plus a reflective census gate that fails when a new
+  URL-shaped field renders a planted credential verbatim.
+- **File(s)**: pkg/config/types_system.go, pkg/config/types_security.go,
+  pkg/config/types_routing.go,
+  pkg/config/url_field_redaction_census_6733_test.go
+
+## 2026-08-22 — #6725 closed-world doc claim
+- **Action**: Corrected the one residual false claim in the open-world branch
+  ("the default for every production subtree"; unscoped "byte-identical").
+  Two of the issue's three claims were already fixed by f37fdf19b (2026-08-05),
+  four days after the issue was filed.
+- **File(s)**: `pkg/config/schema_walk.go`
+
+## 2026-08-22 — #6723 the policy-rematch half is not deferred; correct the claim
+- **Action**: `deletedPolicyRuntimeIDs`' header — the FIRST comment a reader hits
+  when tracing commit-time session invalidation — called the modified-policy
+  (policy-rematch) half "the deferred #4234 ... half, intentionally out of
+  scope". It is not deferred: `changedPolicyRuntimeIDs` /
+  `clearSessionsForModifiedPolicies` ship in the same file and
+  `clearSessionsForPolicyChanges` runs both on every commit. Following the stale
+  pointer to a now-closed issue leads a reader to conclude a shipped,
+  security-relevant behaviour is missing. Corrected both sites (the second was
+  the same phrasing in `clearSessionsForDeletedPolicies`), keeping the
+  stable-key rationale for why THIS function does not report changed policies.
+  Guarded by a WIRING bind rather than a phrase sweep: a phrase sweep is
+  defeated by paraphrase and would red on the corrections themselves, which
+  quote the old wording so the change is visible.
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/policy_rematch_shipped_6723_test.go (new)
+
+## 2026-08-22 — #6710 measured: the dead-host cache drops permitted LAN->tunnel traffic
+- **Action**: #6710 was filed as an OPEN QUESTION, read from source with the
+  worker loop never executed. MEASURED it: a LAN->xfrmi egress resolves
+  `MissingNeighbor` with a `next_hop` and `tunnel_endpoint_id == 0` — the last
+  is the discriminator against #1912, which excludes tunnel-MARKED decisions
+  from `pending_neigh` and therefore from the cache; an xfrmi is a connected
+  route to an ordinary ifindex, so it takes the buffered path and the cache CAN
+  arm. Once armed the fast-fail recycles the frame before the fall-through to
+  the slow-path reinject, and that reinject is the only way LAN->tunnel traffic
+  reaches the kernel XFRM stack (an xfrmi gets no AF_XDP binding). Because an
+  xfrmi has no lladdr, resolved-neighbor-wins can never evict, so it is a
+  permanent drop cycle rather than the 3s the issue estimated. Fix:
+  `ForwardingState.lladdrless_egress`, built from the ALREADY-SHIPPED
+  `InterfaceSnapshot.secure_tunnel` flag (no wire change, no Go change),
+  suppresses the ARMING for those ifindexes only; the negative control asserts
+  an ordinary egress still arms, so #1651's storm defense is intact.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/userspace-dataplane-architecture.md,
+  docs/userspace-cold-start-resolution.md
+
+## 2026-08-22 — #6718 + #6720: the management reconcile follows the promotion
+- **Action**: Added `reconcileManagementAfterPromotion` and called it from the
+  three paths that promote a config to active and then return BEFORE
+  `applyConfigLocked` (its only caller): the first-commit-confirmed rollback's
+  `prevCfg == nil` branch (#6718), and `syncAndApply`'s topology and identity
+  backstops (#6720). Each left a superseded api-auth credential authenticating
+  against the live listener. Enforcement of the backstops is unchanged.
+- **File(s)**: `pkg/daemon/management.go`, `pkg/daemon/daemon_apply_commit.go`,
+  `pkg/daemon/promote_reconcile_6718_6720_test.go` (new),
+  `pkg/daemon/README.md`
+
+## 2026-08-22 — #6724 boot-epoch persist-retry trigger
+- **Action**: `refineBootEpochReporting` now reports whether a persist is OWED
+  (fault, not a deliberate decline); `Manager.retryOwedBootEpochPersist` re-runs
+  refinement from the heartbeat sender loop while one is. The mis-ordering half
+  is split to #7501.
+- **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
+  `pkg/cluster/manager.go`,
+  `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)

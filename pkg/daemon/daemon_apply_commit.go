@@ -401,6 +401,13 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		slog.Error("cluster: refusing to apply a peer-synced standalone<->cluster "+
 			"topology transition live; a restart is required to (de)construct the "+
 			"HA runtime", "err", terr)
+		// #6720: SyncApply has already promoted this config, so the AUTHORIZATION
+		// it carries is live policy even though the dataplane must not be armed
+		// under it. The backstop's constraint is boot-only HA runtime
+		// construction; reconcileWebManagement has no such constraint, and
+		// skipping it leaves the listener honouring a credential the now-active
+		// config revoked.
+		d.reconcileManagementAfterPromotion(compiled, "peer-synced topology transition refused")
 		return nil, terr
 	}
 
@@ -418,6 +425,10 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		slog.Error("cluster: refusing to apply a peer-synced node-id/cluster-id "+
 			"identity change live; a restart is required to re-key the HA manager",
 			"err", ierr)
+		// #6720: same reasoning as the topology backstop above — the promoted
+		// config's authorization is live policy regardless of the HA re-key
+		// constraint that stops the apply.
+		d.reconcileManagementAfterPromotion(compiled, "peer-synced identity change refused")
 		return nil, ierr
 	}
 
@@ -721,6 +732,16 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 				"teardown did not fully converge (see the teardown step errors above); "+
 				"config-driven takeover state may remain partially live", "err", err)
 		}
+		// #6718: the store has promoted the empty tree to active, but this
+		// branch returns without ever entering applyConfigLocked — the only
+		// caller of reconcileWebManagement. Without this the listener stays
+		// bound where the ABANDONED commit put it and its api-auth credential
+		// keeps authenticating, authorised by a config the box has formally
+		// abandoned. The empty active resolves to the --api-addr flag default
+		// (loopback, no credential), which is exactly the endpoint the reverted
+		// config implies.
+		d.reconcileManagementAfterPromotion(d.store.ActiveConfig(),
+			"first commit-confirmed timeout reverted to bootstrap")
 		// #3868: no peer re-sync here. This branch reverts a FIRST commit on a
 		// fresh store to the empty tree + bootstrap mode; the reverted active
 		// carries no chassis-cluster/config-sync stanza, so syncConfigToPeer ->

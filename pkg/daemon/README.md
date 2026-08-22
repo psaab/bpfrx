@@ -399,6 +399,36 @@ mirrors `reconcileSNMP`: `reconcileWebManagement` runs EARLY in
 credential revocation is enforced even on an apply that returns early
 (`store.Commit` has already promoted the config). Reconcile discipline:
 
+**The reconcile follows the PROMOTION, not the apply (#6718, #6720).**
+`reconcileWebManagement` runs early in `applyConfigLocked` so a committed auth
+revocation survives an apply that *aborts partway*. That contract had an
+unstated precondition: `applyConfigLocked` is its only caller, so a path that
+returns **before entering the apply** never reaches it. Two do, and both leave a
+superseded credential authenticating against the live listener:
+
+- `executeConfirmedRollback`'s `prevCfg == nil` branch — a first
+  `commit confirmed` on a fresh store times out, the store reverts to the empty
+  tree, `enterBootstrapMode` runs and the function returns. The abandoned
+  commit's off-box bind and api-auth credential stayed live.
+- `syncAndApply`'s topology (#5840) and identity (#6192) backstops — `SyncApply`
+  has already promoted the peer config, then the backstop returns. The listener
+  kept honouring a credential the now-active config revoked.
+
+Both now call `reconcileManagementAfterPromotion`. The reconcile is the GENERIC
+one in every case, including the bootstrap one: with the empty tree active there
+is no web-management stanza, so the desired state IS the `--api-addr` flag
+default with no credential — which is exactly "revert to the flag-default
+endpoint and drop the abandoned credential". Keeping the management LIFELINE,
+which is why that branch skips the apply, is not the same as keeping the
+abandoned commit's off-box bind and secret.
+
+The backstops keep returning their error and keep refusing to arm the dataplane.
+Their constraint is the boot-only HA runtime; the authorization reconcile has no
+such constraint. Hoisting those checks ABOVE the `SyncApply` promotion would also
+close the divergence, but it changes the tolerant path from "converge with the
+peer, refuse to arm" to "refuse the config" — a deliberate #1960 behaviour choice
+that does not belong in a bug fix.
+
 **Startup ordering and publication (#6719).** `d.mgmt` is an
 `atomic.Pointer[managementReconciler]`, not a plain field, and the type is doing
 real work rather than being defensive. `startClusterComms` runs at
