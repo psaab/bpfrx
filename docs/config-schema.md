@@ -56,11 +56,34 @@ A tail that leaves the modelled grammar is returned UNEXPANDED rather than
 guessed — the helper exists to stop configuration being silently dropped, and
 inventing a shape the schema does not describe is another way of doing that.
 
-**A stanza whose leaves are not modelled in `setSchema` cannot be fixed this
-way.** `security screen ids-option <p> icmp` models only `fragment`, so the
-screen checks are absent from the schema and the packed screen body (#6683)
-cannot be expanded until they are added — which is also why those leaves get no
-`?` completion and no `SchemaValidate` typed-leaf checking.
+**A stanza whose leaves are not modelled in `setSchema` cannot be expanded**,
+because an unmodelled keyword cannot be resolved and the expander declines
+rather than guessing. That was the blocker on #6683: `security screen ids-option
+<p> icmp` modelled only `fragment`. The screen subtree is now modelled in full
+(#6683/#7460) — every check flag plus every sub-knob — which also gives those
+leaves `?` completion and `SchemaValidate` reach that they never had.
+
+Modelling a subtree is not free, and the screen case is the worked example of
+what else has to move with it:
+
+- **Sub-knob children are load-bearing, not decoration.** `flood` modelled as a
+  bare flag makes the expander stop at `[flood]` and silently DROP a trailing
+  `threshold 500` — the same silent weakening the issues are about. Model the
+  value, or do not model the parent.
+- **Modelling changes flat-set token grouping.** `ast_edit.go` keys on
+  `args`/`children`/`compoundKey`/`multi`, so a value that used to collapse onto
+  `Keys` now parks as a CHILD. Any compiler reading a fixed `Keys` index for
+  that value breaks on a path that worked. `flood` read `Keys[2]` while its
+  siblings read `Children`; single-sourcing all four onto the child shape is
+  what made the change safe (#7460).
+- **It moves trailing-garbage detection from `Keys` to `Children`.** A modelled
+  childless leaf parks flat-set trailing tokens as children, so a compiler
+  calling only `recordKeyExtras` stops seeing them and the #3332/#3318 gate goes
+  quiet. Arm `recordChildExtras` on every leaf you model.
+- **It can add entries to the #2419 spelling-differential gate.** Ten bare flags
+  legitimately name a different garbage token per spelling. Allowlisting that is
+  a CLAIM, so it is paired with a test asserting the commit decision is REJECT
+  in BOTH spellings — otherwise the allowlist would hide a fail-open.
 
 ### Where it is NOT done
 

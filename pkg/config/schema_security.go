@@ -318,18 +318,52 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				// opt-in; schema_walk.go), so `icmp framgent` is not caught
 				// here. Unknown-screen-leaf rejection is the separate #3318.
 				"fragment": {desc: "Drop fragmented ICMP/ICMPv6 packets", children: nil},
-				// ping-death, flood -> leaf
+				// #6683/#7460: every check and every sub-knob is modelled so
+				// the schema-driven expander (compact_tail.go) can normalise
+				// the PACKED spellings into the nested shape. An unmodelled
+				// keyword cannot be resolved, and the body was silently
+				// dropped -- the check compiled DISABLED (#6683) or armed at a
+				// default instead of the configured threshold (#7460).
+				//
+				// The sub-knob children are load-bearing, not decoration: as a
+				// bare flag the expander would stop at `[flood]` and DROP a
+				// trailing `threshold 500`, which is the same silent weakening
+				// these issues are about.
+				"ping-death": {desc: "Drop oversized ICMP (ping of death)", children: nil},
+				"flood": {desc: "ICMP flood protection", children: map[string]*schemaNode{
+					"threshold": {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+				}},
 			}},
 			"tcp": {desc: "TCP screening", children: map[string]*schemaNode{
-				"syn-flood": {desc: "SYN flood protection", children: nil},
-				"port-scan": {desc: "Port scan protection", children: nil},
-				// land, winnuke, syn-frag -> leaf
+				"syn-flood": {desc: "SYN flood protection", children: map[string]*schemaNode{
+					"alarm-threshold":       {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+					"attack-threshold":      {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+					"source-threshold":      {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+					"destination-threshold": {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+					"timeout":               {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+				}},
+				"port-scan": {desc: "Port scan protection", children: map[string]*schemaNode{
+					"threshold": {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+				}},
+				"land":       {desc: "Drop LAND attack (src == dst)", children: nil},
+				"winnuke":    {desc: "Drop WinNuke (OOB to NetBIOS)", children: nil},
+				"syn-frag":   {desc: "Drop fragmented SYN", children: nil},
+				"syn-fin":    {desc: "Drop SYN+FIN", children: nil},
+				"no-flag":    {desc: "Drop TCP with no flags set", children: nil},
+				"fin-no-ack": {desc: "Drop FIN without ACK", children: nil},
 			}},
 			"ip": {desc: "IP screening", children: map[string]*schemaNode{
-				"ip-sweep": {desc: "IP sweep protection", children: nil},
-				// source-route-option, tear-drop -> leaf
+				"ip-sweep": {desc: "IP sweep protection", children: map[string]*schemaNode{
+					"threshold": {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+				}},
+				"source-route-option": {desc: "Drop IP source-route option", children: nil},
+				"tear-drop":           {desc: "Drop teardrop (overlapping fragments)", children: nil},
 			}},
-			"udp": {desc: "UDP screening", children: nil},
+			"udp": {desc: "UDP screening", children: map[string]*schemaNode{
+				"flood": {desc: "UDP flood protection", children: map[string]*schemaNode{
+					"threshold": {desc: "Detection threshold", args: 1, placeholder: "<number>", children: nil},
+				}},
+			}},
 			"limit-session": {desc: "Session limits", children: map[string]*schemaNode{
 				"source-ip-based":      {desc: "Source IP based limit", args: 1, placeholder: "<number>", children: nil},
 				"destination-ip-based": {desc: "Destination IP based limit", args: 1, placeholder: "<number>", children: nil},
