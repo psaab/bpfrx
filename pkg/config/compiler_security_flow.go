@@ -397,6 +397,37 @@ var tcpMSSKinds = []string{"ipsec-vpn", "gre-in", "gre-out", "all-tcp"}
 // value an older binary accepted) must still boot, exactly like the VRRP
 // lenient gate. Runs on the group-expanded tree so apply-groups-inherited
 // MSS values are covered.
+// tcpMSSOptionNodes returns the per-kind option nodes under a `tcp-mss` node,
+// in EITHER AST shape (#6564).
+//
+// A `;`-terminated statement is packed onto ONE node with no children, so the
+// four spellings differ structurally:
+//
+//	flow { tcp-mss { all-tcp { mss 1350; } } }  -> tcp-mss > all-tcp > [mss 1350]
+//	flow { tcp-mss { all-tcp mss 1350; } }      -> tcp-mss > [all-tcp mss 1350]
+//	flow { tcp-mss all-tcp 1350; }              -> ONE leaf [tcp-mss all-tcp 1350]
+//	set security flow tcp-mss all-tcp 1350      -> tcp-mss > [all-tcp 1350]
+//
+// The compiler and validateTCPMSSRanges both walked mssNode.Children, so the
+// fully-packed leaf presented an EMPTY slice: the range validator iterated
+// nothing and passed VACUOUSLY while the compiler assigned nothing. MSS
+// clamping silently did not happen on a config that committed clean.
+//
+// The packed leaf's trailing keys are surfaced as a synthetic option node so
+// BOTH readers see the same thing — one source of truth for the shape, rather
+// than two loops that would drift. The synthetic node deliberately carries the
+// tokens VERBATIM: `tcp-mss all-tcp mss 1350` therefore yields
+// Keys=["all-tcp","mss","1350"] and inherits the SAME rejection the
+// half-packed form already gives (selectMSSToken picks the literal "mss"),
+// because `mss` is the hierarchical keyword and is a typo when inline.
+func tcpMSSOptionNodes(mssNode *Node) []*Node {
+	out := mssNode.Children
+	if len(mssNode.Keys) > 1 {
+		out = append(append([]*Node{}, out...), &Node{Keys: mssNode.Keys[1:], IsLeaf: true})
+	}
+	return out
+}
+
 func validateTCPMSSRanges(nodes []*Node, prefix string, lenient bool) ([]string, error) {
 	var warnings []string
 	for _, n := range nodes {
@@ -406,8 +437,12 @@ func validateTCPMSSRanges(nodes []*Node, prefix string, lenient bool) ([]string,
 				flowPath := joinNodePath(nodePath, []string{"flow"})
 				for _, mss := range flow.FindChildren("tcp-mss") {
 					mssPath := joinNodePath(flowPath, []string{"tcp-mss"})
+					opts := tcpMSSOptionNodes(mss)
 					for _, kind := range tcpMSSKinds {
-						for _, kn := range mss.FindChildren(kind) {
+						for _, kn := range opts {
+							if kn.Name() != kind {
+								continue
+							}
 							kindPath := joinNodePath(mssPath, []string{kind})
 							// #2486: `tcp-mss ipsec-vpn` is rejected at
 							// commit. There is no IPsec context in the
@@ -585,7 +620,7 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 	// TCP MSS clamping
 	mssNode := node.FindChild("tcp-mss")
 	if mssNode != nil {
-		for _, opt := range mssNode.Children {
+		for _, opt := range tcpMSSOptionNodes(mssNode) {
 			switch opt.Name() {
 			case "ipsec-vpn":
 				// #2486: strict commit rejects this via

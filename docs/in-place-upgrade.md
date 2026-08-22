@@ -931,6 +931,36 @@ candidate boot, `xpf-kernel-promote.service` runs the kernel-space
 `/var/lib/xpf/kernel-upgrade.state` makes the trial crash-safe and
 idempotent across the reboot.
 
+The forward beacon (Gate 4) is the ONLY gate that asserts packets actually
+move — Gate 3's `verify-dataplane` is structural, proving the candidate
+kernel's BPF verifier accepts the shim and nothing more. Gate 4 requires
+all three of: `xpfd` active, the dataplane helper reporting
+`enabled && forwarding-armed` over its control socket, and a ping to
+`BeaconTarget` (default: the IPv4 default gateway) succeeding within the
+deadline.
+
+The helper condition was added in #6607. Before it, the second condition
+was `systemctl is-active xpfd-userspace-dp` — a unit that exists nowhere
+in the repository and never has: the helper is a CHILD PROCESS xpfd
+spawns, not a systemd unit. That probe could never report active, and
+OR'd with the `xpfd` probe it could contribute neither a pass nor a fail,
+so the guard silently degenerated to "xpfd is active". That is the
+pre-#5286 mistake exactly: a `Type=simple` xpfd reports active
+immediately while its helper is down, stale or crash-looping and NOT
+forwarding — and an AF_XDP shim / verifier / driver mismatch against a
+new kernel is the single most likely cause of that state, which is the
+whole reason Gate 4 exists. The fail direction was PERMISSIVE, so a bad
+kernel was more likely to be promoted than rolled back.
+
+The probe reuses the binary channel's primitives rather than inventing
+IPC: `userspace.ProbeStatus` over the control socket, adapted through
+`upgrade.HelperStatusFunc` and injected by `cmd/xpfd` so `pkg/upgrade`
+need not import (and cannot cycle with) `pkg/dataplane/userspace`. A nil
+probe means the caller has no dataplane to ask (a non-xpfd embedder or a
+test) and falls back to the `xpfd`-liveness check alone — "no
+information" is not "unhealthy", and failing closed on it would revert
+every such caller's promotion.
+
 ### Operator visibility (#6495)
 
 During a roll the channel is legible from the CLI the operator already has,

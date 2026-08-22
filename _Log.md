@@ -101700,6 +101700,23 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/api/show_text.go, pkg/api/show_nat_shared_test.go (new),
   pkg/api/README.md, _Log.md
 
+## 2026-08-22 — #6607 kernel promote Gate 4 forward beacon
+- **Timestamp**: 2026-08-22
+- **Action**: Gate 4's second condition probed `systemctl is-active
+  xpfd-userspace-dp`, a unit that exists nowhere in the repo (the helper is a
+  child process xpfd spawns). OR'd with the xpfd probe it could contribute
+  neither pass nor fail, so the guard degenerated to "xpfd is active" — the
+  pre-#5286 mistake, failing PERMISSIVE on the one gate that proves the
+  candidate kernel forwards. Replaced with the control-socket
+  enabled+forwarding-armed probe, injected from cmd/xpfd via the existing
+  HelperStatusFunc seam. Made both preconditions and the ping/gateway calls
+  injectable — without a ping seam every "the beacon rejects X" assertion was
+  decided by the ping instead (two mutation cells initially passed vacuously).
+- **File(s)**: pkg/upgrade/kernel_linux.go,
+  pkg/upgrade/kernel_forward_beacon_6607_test.go (new),
+  cmd/xpfd/upgrade_kernel.go,
+  cmd/xpfd/upgrade_kernel_beacon_6607_test.go (new),
+  docs/in-place-upgrade.md, _Log.md
 ## 2026-08-22 — #6609 RedactURL credential slots
 - **Timestamp**: 2026-08-22
 - **Action**: `config.RedactURL` leaked a credential in three slots, all three
@@ -101724,3 +101741,35 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/daemon_ha_comms_wiring.go, docs/session-sync-architecture.md,
     pkg/cluster/sync_config_apply_nack_7328_test.go,
     pkg/daemon/configsync_rearm_7328_test.go
+
+## 2026-08-21 — #6568: Rust-dataplane cohort, provable subset
+- **Timestamp**: 2026-08-21
+- **Action**: Swept all 8 rows individually. Member 1 was filed as a
+  low-materiality residual with "no traffic fail-open" — measured, both halves
+  are wrong: `ipnet` requires a prefix length and the config compiler validates
+  nothing, so `route 10.0.0.1 discard`, `route 2001:db8::1 discard` and
+  `route default discard` all commit, ship, and VANISH in the helper; for a
+  discard route that is a fail-OPEN (packet matches a less-specific route and is
+  forwarded). Fixed at the Go chokepoint (`routeDestinationForWire` normalises a
+  bare host to /32 or /128, drops anything unusable with a WARN) plus a Rust
+  fail-closed `RouteDestinationUnparseable`. Member 3 doc-parity (per-worker
+  screen rate multiplier). Member 4 Err-arm `refresh_status` (latent —
+  `update_ha_state` returns Ok on every path today). Member 6 poisoned-lock
+  panic amplification on the NAT path. Member 7 does NOT reproduce (has a
+  live `debug_log!` caller). Members 2/5/8 split to #7359/#7360/#7361.
+- **File(s)**: pkg/dataplane/userspace/routes.go,
+  pkg/dataplane/userspace/route_dest_unparseable_6568_test.go (new),
+  userspace-dp/src/afxdp/forwarding_build/fib.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/policy_snapshot_error.rs,
+  userspace-dp/src/server/handlers/ha.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_counter.rs,
+  docs/syn-cookie-flood-protection.md, docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (shape family) — fixed the four compact-leaf members whose
+    operand was dropped before a strict gate read it: ALG disable, prefix-list,
+    static next-hop (inverse shape), tcp-mss. Single-sourced the tcp-mss reader.
+  - **File(s)**: pkg/config/compiler_security_alg.go, pkg/config/compiler_routing.go,
+    pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
+    docs/config-schema.md

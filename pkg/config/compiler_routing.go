@@ -318,10 +318,24 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					}
 					addrs = append(addrs, prop.Keys[j])
 				}
-				// Child interface (hierarchical + flat-set container shapes).
+				// Child interface (hierarchical + flat-set container shapes),
+				// and #6564: the INVERSE shape, where the gateway itself is a
+				// CHILD rather than a trailing key —
+				// `next-hop { 192.168.1.1; }`. The pre-#6564 loop recognised
+				// only the `interface` modifier here, so that block compiled to
+				// ZERO next-hops. staticRouteDispositionConflict rejects only
+				// TWO or more dispositions, never zero, so the route committed
+				// clean and then rendered nothing into FRR — a silently missing
+				// route rather than a refused config.
 				for _, child := range prop.Children {
 					if child.Name() == "interface" {
 						iface = nodeVal(child)
+						continue
+					}
+					for _, k := range child.Keys {
+						if k != "" {
+							addrs = append(addrs, k)
+						}
 					}
 				}
 				if len(addrs) == 0 && iface != "" {
@@ -619,6 +633,18 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		// just the FIRST prefix of a bracketed list and silently dropped the
 		// rest → an under-populated prefix-list (route-filter / firewall-filter /
 		// dynamic address group matched a partial prefix set) (#3996).
+		// #6564: the COMPACT-LEAF spelling `prefix-list PL 10.0.0.0/8;` is a
+		// single leaf, Keys=["prefix-list","PL","10.0.0.0/8"], with NO children
+		// at all — namedInstances takes Keys[1] as the name and hands back the
+		// same node, so the Children loop below saw nothing and the list
+		// compiled NAMED but EMPTY. A filter term scoped by it then silently
+		// stopped matching, on a config that committed clean. Read the
+		// instance node's own trailing keys as well as its children.
+		for _, p := range inst.node.Keys[2:] {
+			if p != "" {
+				pl.Prefixes = append(pl.Prefixes, p)
+			}
+		}
 		for _, entry := range inst.node.Children {
 			for _, p := range entry.Keys {
 				if p != "" {

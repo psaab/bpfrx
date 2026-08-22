@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"sort"
@@ -37,6 +38,38 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 	out := make([]RouteSnapshot, 0)
 	seen := make(map[string]struct{})
 	addSnapshot := func(snap RouteSnapshot) {
+		// #6568 (member 1): the destination must reach the wire as something
+		// the Rust FIB can PARSE. `populate_routes` (forwarding_build/fib.rs)
+		// tries `Ipv4Net` then `Ipv6Net` and, before this, fell off the end of
+		// the loop body when both failed — no Err, no counter, no log — at a
+		// boundary whose whole #2409/#2410/#3771 contract is "no silent skips".
+		//
+		// That is a traffic FAIL-OPEN for a discard/blackhole route, not the
+		// low-materiality residual it was filed as. `ipnet`'s parsers REQUIRE a
+		// prefix length, and nothing in the config compiler validates the
+		// destination, so measured: `route 10.0.0.1 discard`,
+		// `route 2001:db8::1 discard` and `route default discard` all commit,
+		// all ship, and all vanish in the helper — traffic then longest-prefix
+		// matches a LESS-SPECIFIC route (typically the default) and is
+		// FORWARDED where the operator asked for it to be dropped.
+		//
+		// A bare host address is normalised to its /32 or /128 host prefix,
+		// which is what the operator meant and what the kernel/FRR path already
+		// does with it. Anything still unparseable is dropped HERE, loudly, so
+		// it never reaches the helper: the operator gets a diagnostic naming
+		// the route instead of a silent forwarding hole. The Rust side now
+		// fails the snapshot closed on the same condition as defence in depth.
+		if dest, ok := routeDestinationForWire(snap.Destination); ok {
+			snap.Destination = dest
+		} else {
+			slog.Warn("dropping route with an unusable destination from the "+
+				"helper FIB: it is neither a CIDR prefix nor a bare IP "+
+				"address, so the userspace dataplane cannot install it "+
+				"(#6568). Traffic to it will follow a less-specific route",
+				"destination", snap.Destination, "table", snap.Table,
+				"family", snap.Family, "discard", snap.Discard)
+			return
+		}
 		// #3770 (H8): the dedupe key MUST include Discard and Preference.
 		// A discard (blackhole) route and a normal route to the same prefix
 		// are DISTINCT forwarding decisions — omitting Discard let one
@@ -447,6 +480,41 @@ func overlayTableFamily(entry config.RouteOverlayEntry) (string, string) {
 // injected into the FIB verbatim as a garbage prefix. Previously the
 // function returned the raw string, contradicting this contract and its
 // own doc comment, and let a malformed overlay destination through.
+// routeDestinationForWire returns the destination in the form the Rust FIB can
+// parse, and whether it is usable at all (#6568).
+//
+//   - a valid CIDR prefix passes through UNCHANGED. It is deliberately not
+//     re-canonicalised: masking a host-bearing prefix such as 10.0.0.5/24 down
+//     to 10.0.0.0/24 would change both the installed prefix and the
+//     addSnapshot dedupe key, which is a behaviour change this fix has no
+//     business making.
+//   - a BARE IP address gains its host prefix (/32 or /128). `ipnet`'s
+//     Ipv4Net/Ipv6Net parsers require a prefix length, so a bare address is
+//     exactly the plausible operator input that vanished silently.
+//   - anything else (a typo, or the Junos `default` keyword, which the config
+//     compiler accepts verbatim) is unusable and reports false.
+func routeDestinationForWire(dest string) (string, bool) {
+	if _, _, err := net.ParseCIDR(dest); err == nil {
+		return dest, true
+	}
+	if ip := net.ParseIP(dest); ip != nil {
+		// The family test is the TEXT, not ip.To4(): net.IP.To4() folds an
+		// IPv4-MAPPED IPv6 address (::ffff:10.0.0.1) to its 4-byte form, so
+		// keying on it would emit "::ffff:10.0.0.1/32" — a v6 literal carrying
+		// a v4 prefix length, which parses as neither. Colon-means-v6 is the
+		// same discriminator normalizeRouteSnapshotFamily already uses on this
+		// exact field, so the two cannot disagree about a route's family.
+		if strings.Contains(dest, ":") {
+			return dest + "/128", true
+		}
+		if ip.To4() != nil {
+			return dest + "/32", true
+		}
+		return "", false
+	}
+	return "", false
+}
+
 func canonicalRoutePrefix(s string) string {
 	_, n, err := net.ParseCIDR(s)
 	if err != nil || n == nil {
