@@ -103676,3 +103676,15 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/management_start_race_6719_test.go` (new),
   `pkg/daemon/daemon_dp_escape_rest_test.go`,
   `pkg/daemon/hostname_stale_cert_6827_test.go`, `pkg/daemon/README.md`
+
+## 2026-08-22 — #6733 redact credential-bearing URL fields on marshal
+- **Timestamp**: 2026-08-22
+- **Action**: The config redaction pass is name-keyed; several fields are
+  sensitive by CONTENT (URLs/endpoints named for what they are). Added
+  RedactURL coverage to SystemConfig.LicenseAutoUpdate, ArchivalConfig
+  archive-site lists, FeedServer.Hostname, FeedEntry.Path, RPMTest.Target and
+  WgPeerConfig.Endpoint, plus a reflective census gate that fails when a new
+  URL-shaped field renders a planted credential verbatim.
+- **File(s)**: pkg/config/types_system.go, pkg/config/types_security.go,
+  pkg/config/types_routing.go,
+  pkg/config/url_field_redaction_census_6733_test.go

@@ -227,6 +227,97 @@ type ArchivalConfig struct {
 	ArchiveSitesWithPassword []string
 }
 
+// MarshalJSON redacts a credential embedded in an RPM test TARGET (#6733).
+//
+// An `http-get` probe's target is a URL, and a monitored endpoint routinely
+// carries an auth token in it. For the icmp-ping / tcp-ping probe types the
+// target is a bare IP or hostname, which RedactURL returns unchanged
+// (measured, including v6 literals), so this is a no-op for them rather than a
+// probe-type conditional that could drift from the type list.
+//
+// The receiver is a VALUE for robustness rather than necessity: RPMProbe holds
+// `Tests map[string]*RPMTest`, so a pointer receiver would be reached today. A
+// value receiver is reached through BOTH a *RPMTest and an RPMTest, so it keeps
+// working if the container is ever changed to hold values — a redaction that
+// silently stops applying when a field's container changes shape is the failure
+// this whole change is about.
+//
+// The alias type sheds this method to avoid recursion while preserving every
+// field, so a field added to RPMTest later is still marshalled.
+func (t RPMTest) MarshalJSON() ([]byte, error) {
+	type alias RPMTest
+	v := alias(t)
+	v.Target = RedactURL(v.Target)
+	return json.Marshal(v)
+}
+
+// MarshalJSON redacts the license auto-update URL (#6733).
+//
+// `system license autoupdate url <url>` is a fetch endpoint, and a licence
+// server URL routinely carries the entitlement token inline or as a query
+// parameter. The field is named for what it is, so the name-keyed redaction
+// pass never reached it and the authenticated REST GET returned it verbatim.
+//
+// The receiver is a VALUE, not a pointer, deliberately: Config holds
+// `System SystemConfig` by value, and encoding/json only promotes to a
+// pointer method when the value is addressable. A pointer receiver here would
+// work when a *Config is marshalled and silently do NOTHING when a Config is
+// marshalled by value — a redaction that depends on the caller's syntax is
+// worse than none, because it tests green on whichever form the test happens
+// to use.
+//
+// The alias type sheds this method to avoid recursion while preserving every
+// field, so a field added to SystemConfig later is still marshalled.
+func (s SystemConfig) MarshalJSON() ([]byte, error) {
+	type alias SystemConfig
+	v := alias(s)
+	v.LicenseAutoUpdate = RedactURL(v.LicenseAutoUpdate)
+	return json.Marshal(v)
+}
+
+// MarshalJSON redacts the credential-bearing URL slots on an ArchivalConfig
+// (#6733).
+//
+// `system archival configuration archive-sites <url>` takes a transfer URL, and
+// the Junos idiom puts the credential inline — `scp://user:pw@host:/dir` or an
+// ftp URL with a password. Both lists hold that URL verbatim:
+// ArchiveSitesWithPassword exists precisely BECAUSE a site carried an inline
+// `password`, so it is the highest-value list on this struct and was returned
+// in full by the authenticated REST GET.
+//
+// The redaction pass is keyed on field NAMES that look secret; these are named
+// for what they are (sites), so no name-keyed rule reaches them. RedactURL
+// leaves a credential-free URL untouched, so an ordinary config renders
+// identically.
+//
+// The alias type sheds this method to avoid recursion while preserving every
+// field, so a field added to ArchivalConfig later is still marshalled.
+func (a *ArchivalConfig) MarshalJSON() ([]byte, error) {
+	if a == nil {
+		return []byte("null"), nil
+	}
+	type alias ArchivalConfig
+	v := alias(*a)
+	v.ArchiveSites = redactURLSlice(v.ArchiveSites)
+	v.ArchiveSitesWithPassword = redactURLSlice(v.ArchiveSitesWithPassword)
+	return json.Marshal(v)
+}
+
+// redactURLSlice returns a redacted COPY of a URL list, leaving the caller's
+// slice untouched. Copying matters: these marshallers run on an alias of a
+// live *Config, and the backing array is shared with it — redacting in place
+// would mutate the running configuration as a side effect of serving a GET.
+func redactURLSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = RedactURL(s)
+	}
+	return out
+}
+
 // InternetOptionsConfig holds internet-options settings.
 type InternetOptionsConfig struct {
 	NoIPv6RejectZeroHopLimit bool
