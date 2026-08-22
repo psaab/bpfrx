@@ -102202,3 +102202,11 @@ prose edit above them added. No diff falls in the new test body.
     docs/pr/1864-toolchain-pin/reviewer-ids.md,
     userspace-dp/src/afxdp/coordinator/status.rs,
     userspace-dp/src/afxdp/types/shared_cos_lease/{epoch.rs,rotate_epoch_v8.rs}
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6625 — the #1798 control-character gate rendered a credential
+    leaf's VALUE into its error (twice: path + quoted value). Now reports the
+    byte class and offset instead, for credential leaves only. `community` is
+    path-qualified (secret under snmp, a BGP route-target name elsewhere).
+  - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
+    pkg/config/secret_in_error_6625_test.go
