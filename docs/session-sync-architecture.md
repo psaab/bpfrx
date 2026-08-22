@@ -1498,6 +1498,40 @@ buffer would trim over it, and no subsequent gap would fire — so the standby
 diverged with no recovery. `handleSessionDecodeFailure` forces a full resync
 from table truth.
 
+**#6558 — the same pathology, reached through the PENDING-APPLY QUEUE.** The
+paragraph above is the sibling case, and it stayed live in a second form until
+#6558. The normal path is strictly receive → apply → ACK (`markFrameApplied`
+runs only after `onEvent` returns true), and a callback returning false enqueues
+the frame WITHOUT marking it — the withhold-ACK contract, pinned by
+`TestEventStreamSessionCallbackFalseWithholdsAck` and its FullResync/dataplane
+twins. But `dispatchOrQueue*` returns TRUE after a successful enqueue, so the
+reader keeps reading with frames still queued unapplied, and every REFUSAL path
+advanced `lastAppliedSeq` with no pending-queue check:
+`markDroppedFrameApplied` (telemetry type/payload mismatch, decode failure,
+unknown frame type — #1394), `handleSessionDecodeFailure` (#5483/#6130) and
+`handleOversizedFrame` (#6132/#6160, which additionally FLUSHES the ACK
+immediately). Enqueue delta N unapplied, receive refused frame N+1, and the
+cumulative ACK names N+1: the helper trims on `front.seq <= acked`
+(`event_stream/control.rs`) and the daemon calls `clearPendingCallbackFrames`
+on the next accept, so delta N is gone from both sides. The oversized path did
+both in one shot.
+
+Each of the three refusal fixes reasoned correctly about the REFUSED FRAME
+ITSELF; none reasoned about frames still queued BEHIND it, because the pending
+queue did not exist when the first was written.
+
+The repair keeps every loop-break intact — `prevSeq` and `lastRecvSeq` still
+advance immediately, so nothing re-fires the gap detector and the helper is
+never asked to replay a frame that would only be refused again (the #6130
+wedge). Only the ACK watermark is held back: `applyRefusedFrameInOrder`
+enqueues a **dropped marker** when the pending queue is non-empty, and the
+flush releases it in FIFO order like any applied frame. With an EMPTY queue the
+advance is immediate, exactly as before. `markFrameApplied` is also monotonic
+now: it was a bare `Store`, so a later in-order flush could REWIND the watermark
+below a value a drop path had jumped it to — and a rewound `lastAppliedSeq` is
+silently swallowed by `sendAckIfNeeded`'s `applied <= acked` guard and can
+regress `SendDrainRequest`'s fence.
+
 **#6130 — how a decode failure terminates (it does NOT mirror the #2874 gap
 self-heal).** The first #5483 fix reused the gap mechanics verbatim: force the
 resync, withhold the ACK, and drop the connection. That WEDGED the stream on a
