@@ -101745,3 +101745,12 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/compiler_security_alg.go, pkg/config/compiler_routing.go,
     pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
     docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (strict-reject family, members 2/5/6) — malformed
+    autonomous-system, chained zone `screen` statement, and malformed OSPF area
+    id now REJECT at strict commit and WARN on the tolerant load/peer-sync path
+    (#1960 no-brick, via the #1319 SchemaValidate split). Added ValidateOSPFArea.
+  - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_security.go,
+    pkg/config/schema_validators_network.go,
+    pkg/config/silent_drop_strict_6564_test.go, docs/config-schema.md

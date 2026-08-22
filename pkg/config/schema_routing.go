@@ -149,7 +149,7 @@ var schemaRoutingOptions = &schemaNode{desc: "Routing options", children: map[st
 			"route": staticRouteNode(),
 		}},
 	}},
-	"autonomous-system": {desc: "Autonomous system number", args: 1, placeholder: "<as-number>", children: nil},
+	"autonomous-system": {desc: "Autonomous system number", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 	"forwarding-table": {desc: "Forwarding table", children: map[string]*schemaNode{
 		"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy>", children: nil},
 	}},
@@ -295,7 +295,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"reference-bandwidth": {desc: "Reference bandwidth", args: 1, placeholder: "<bandwidth>", children: nil},
 		"passive":             {desc: "Passive mode", children: nil},
 		"export":              {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
-		"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", children: map[string]*schemaNode{
+		"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 				"passive":             {desc: "Passive interface", children: nil},
 				"no-passive":          {desc: "Non-passive interface", children: nil},
@@ -332,7 +332,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 	"ospf3": {desc: "OSPFv3 configuration", children: map[string]*schemaNode{
 		"router-id": {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
 		"export":    {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
-		"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", children: map[string]*schemaNode{
+		"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 				"passive":             {desc: "Passive interface", children: nil},
 				"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
@@ -760,7 +760,7 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 		"ospf": {desc: "OSPF configuration", children: map[string]*schemaNode{
 			"reference-bandwidth": {desc: "Reference bandwidth", args: 1, placeholder: "<bandwidth>", children: nil},
 			"passive":             {desc: "Passive mode", children: nil},
-			"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", children: map[string]*schemaNode{
+			"area": {desc: "OSPF area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 					"passive":             {desc: "Passive interface", children: nil},
 					"no-passive":          {desc: "Non-passive interface", children: nil},
@@ -797,7 +797,7 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 		"ospf3": {desc: "OSPFv3 configuration", children: map[string]*schemaNode{
 			"router-id": {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
 			"export":    {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
-			"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", children: map[string]*schemaNode{
+			"area": {desc: "OSPFv3 area", args: 1, placeholder: "<area-id>", keyValidator: ValidateOSPFArea, children: map[string]*schemaNode{
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 					"passive":             {desc: "Passive interface", children: nil},
 					"cost":                {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
