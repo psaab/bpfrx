@@ -2176,6 +2176,52 @@ still the boot path and the peer-sync path. The #6735 packed-tail shape is a
 different matter: it IS reachable from the ordinary `set` CLI, in both the
 Keys-collapsed and keyword-descended arrangements shown above.
 
+### Four more members of the same family (#6564)
+
+The #6525 zone-membership case above is one instance of a recurring shape. Four
+further sites read the operand from ONE side only, and each dropped it BEFORE an
+otherwise-correct strict gate read it, so the gate iterated an empty slice and
+passed VACUOUSLY. In every case the config committed clean and the control was
+simply not in force.
+
+| Statement | Read before #6564 | Silent consequence |
+|---|---|---|
+| `security alg { dns disable; }` | `FindChild("disable")` — Children only | ALG stayed **ENABLED**; the #4232 unsupported-proto advisory does not fire either, because `dns` IS wired |
+| `policy-options { prefix-list PL 10.0.0.0/8; }` | `inst.node.Children` only | list compiled **NAMED but EMPTY**; a filter term scoped by it silently stopped matching |
+| `route R { next-hop { 192.168.1.1; } }` | `prop.Keys` only; Children matched just the `interface` modifier | route carried **ZERO** dispositions — `staticRouteDispositionConflict` rejects only >= 2, never zero — and rendered nothing into FRR |
+| `security flow { tcp-mss all-tcp 1350; }` | `mssNode.Children` in BOTH the compiler and `validateTCPMSSRanges` | MSS clamping silently off; the range validator passed vacuously |
+
+The static-route case is the INVERSE of the usual direction — the operand is in
+the Children and the reader took it from the Keys — which is worth naming
+explicitly, because "read Keys as well as Children" is the wrong generalisation.
+The property is *read the side the operand is actually on*, and a fix that only
+ever adds a Keys read will miss this one.
+
+**One reader, not two (`tcpMSSOptionNodes`).** `tcp-mss` had two independent
+Children walks — the compiler's and the range validator's — which is precisely
+how the two halves drift. The packed leaf is now surfaced as a synthetic option
+node by a single helper both call, so a future shape is handled once or not at
+all, never half.
+
+**Widening the grammar is a failure mode too.** `mss` is the HIERARCHICAL
+keyword (`all-tcp { mss 1350; }`); inline it is a typo, and the half-packed
+`tcp-mss { all-tcp mss 1350; }` already hard-rejects it (`selectMSSToken` picks
+the literal `mss`). The synthetic node therefore carries the tokens VERBATIM so
+the fully-packed leaf inherits the same rejection. Teaching it to strip `mss`
+would have made the two shapes disagree in the opposite direction — accepting a
+spelling one level up refuses. The acceptance criterion is "identical in both
+shapes OR rejected at commit", and for that token the answer is rejected.
+
+Covered by `pkg/config/compact_leaf_cohort_6564_test.go`, which asserts the
+brace and flat-set spellings AGREE with the compact one rather than asserting
+the compact one alone — a test that pinned only the compact shape would not
+notice the two drifting apart again.
+
+REACHABILITY (honest bound): as with #6525, these compact spellings are
+hierarchical text ingest only — `load override` / `load merge` / the persisted
+config file / HA `SyncApply`. `set` cannot produce them and `display set`
+round-trips safely. Those are still the boot path and the peer-sync path.
+
 **A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
 node it is authored on, never by that node's CHILDREN (#6391).** The
 `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP only — it recurses
