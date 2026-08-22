@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
@@ -498,6 +499,16 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "core-dumps":
 		s.showCoreDumps(cfg, &buf)
+
+	case "bootstrap-import":
+		// #6496: the day-0 config-import verdict, in-band. Renders through the
+		// shared bootstrapshow package so this and the in-process CLI cannot
+		// disagree about the same recorded fact.
+		snap := bootstrapshow.Snapshot{}
+		if s.bootstrapImportFn != nil {
+			snap = s.bootstrapImportFn()
+		}
+		bootstrapshow.Render(&buf, snap)
 
 	case "task":
 		s.showTask(cfg, &buf)
