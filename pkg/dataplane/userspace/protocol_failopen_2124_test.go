@@ -119,7 +119,7 @@ func TestBuildOneRuleSnapshotEmitsUnsupportedSentinel(t *testing.T) {
 	// sentinel term (so Rust fails the whole snapshot closed), NEVER nil (which
 	// Rust would read as genuine match-any — the publish-window fail-open).
 	cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
 	}
@@ -136,7 +136,7 @@ func TestBuildOneRuleSnapshotNoSentinelForSupportedApp(t *testing.T) {
 	// A supported named protocol must NOT trigger the sentinel; the rule carries
 	// a normal canonicalized term.
 	cfg := twoZonePolicyCfg(&config.Application{Name: "esp-only", Protocol: "esp"}, "esp-only")
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	terms := snap.Policies[0].ApplicationTerms
 	if len(terms) != 1 || terms[0].Protocol != "50" {
 		t.Fatalf("ApplicationTerms = %+v, want one esp term canonicalized to \"50\"", terms)

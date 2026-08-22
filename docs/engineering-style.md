@@ -496,6 +496,21 @@ they repeatedly bite:
   check passes on any machine that HAS the capability, which is every
   laptop and most CI runners, so it would never notice the stub being
   deleted.
+  **Follow-through (#7446):** hermeticity stops the ENVIRONMENT causing
+  that crash; it does not stop a bad fixture causing it. The 44 call sites
+  that discarded the error now go through `mustBuildSnapshot` /
+  `mustBuildSnapshotWithSchedulerState`, which make the safe form the SHORT
+  form — a call site gets shorter by adopting them, which is what keeps the
+  population from growing back. An AST guard
+  (`TestNoDiscardedSnapshotBuildErrors_7446`) fails if the discarding shape
+  returns. Scope such a guard to the builders that return a POINTER: a nil
+  slice or map reads back safely, so sweeping those in would flag call sites
+  that cannot exhibit the defect — the guard carries a negative-control cell
+  proving it does not.
+  And when a package-wide default is introduced, compare the PASS SET before
+  and after, not just "still green": still-green and unchanged are different
+  claims, and only the second rules out a test that was passing because the
+  real dependency happened to return real data.
 
 - **Smoke tests run ONLY on the loss userspace cluster.** The smoke
   target is `loss:xpf-userspace-fw0` / `loss:xpf-userspace-fw1`,

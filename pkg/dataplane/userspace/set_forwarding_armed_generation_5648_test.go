@@ -73,7 +73,7 @@ func TestSetForwardingArmedRefusesStaleProtocolMismatch(t *testing.T) {
 	m.lastStatus.ConfigSnapshotProtocolVersion = MinProtocolPolicyScheduler - 1
 	// Last-applied config carries scheduler-driven policy, so it REQUIRES at
 	// least MinProtocolPolicyScheduler.
-	m.lastSnapshot, _ = buildSnapshot(scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
 
 	_, err := m.SetForwardingArmed(true)
 	if !errors.Is(err, ErrPolicySchedulerProtocolIncompatible) {
@@ -111,7 +111,7 @@ func TestSetForwardingArmedArmsWhenProtocolMatches(t *testing.T) {
 	// Helper's accepted image is CURRENT — satisfies the required protocol.
 	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
 	// Same protocol-requiring config as the mismatch test.
-	m.lastSnapshot, _ = buildSnapshot(scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
 
 	// applyHelperStatusLocked touches a BPF map absent in a unit test, so the
 	// call may return that local-bookkeeping error AFTER the wire arm request

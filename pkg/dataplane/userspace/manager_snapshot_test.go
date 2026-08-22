@@ -86,7 +86,7 @@ func TestBuildSnapshotSummary(t *testing.T) {
 		},
 	}
 
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 11, 5)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 11, 5)
 	if snap.Generation != 11 {
 		t.Fatalf("Generation = %d, want 11", snap.Generation)
 	}
@@ -255,8 +255,8 @@ func TestSnapshotContentHashIgnoresVolatileFields(t *testing.T) {
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust": {Name: "trust"},
 	}
-	snap1, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 1, 10)
-	snap2, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 99, 50)
+	snap1 := mustBuildSnapshot(t, cfg, config.UserspaceConfig{Workers: 1}, 1, 10)
+	snap2 := mustBuildSnapshot(t, cfg, config.UserspaceConfig{Workers: 1}, 99, 50)
 
 	h1, ok1 := snapshotContentHash(snap1)
 	h2, ok2 := snapshotContentHash(snap2)
@@ -279,8 +279,8 @@ func TestSnapshotContentHashDiffersOnForwardingChange(t *testing.T) {
 		"untrust": {Name: "untrust"},
 	}
 
-	snap1, _ := buildSnapshot(cfg1, config.UserspaceConfig{Workers: 1}, 1, 1)
-	snap2, _ := buildSnapshot(cfg2, config.UserspaceConfig{Workers: 1}, 1, 1)
+	snap1 := mustBuildSnapshot(t, cfg1, config.UserspaceConfig{Workers: 1}, 1, 1)
+	snap2 := mustBuildSnapshot(t, cfg2, config.UserspaceConfig{Workers: 1}, 1, 1)
 
 	h1, ok1 := snapshotContentHash(snap1)
 	h2, ok2 := snapshotContentHash(snap2)

@@ -194,7 +194,7 @@ func TestBuildSnapshotIncludesUnitInterfaces(t *testing.T) {
 		"wan": {Name: "wan", Interfaces: []string{"reth0.50"}},
 	}
 
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{Workers: 2, RingEntries: 2048}, 1, 0)
 	got := map[string]InterfaceSnapshot{}
 	for _, iface := range snap.Interfaces {
 		got[iface.Name] = iface
