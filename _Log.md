@@ -103280,3 +103280,13 @@ prose edit above them added. No diff falls in the new test body.
     pkg/configstore/bounded_read_6753_test.go (new),
     pkg/cli/load_bounded_read_6753_test.go (new), pkg/cli/cli_config.go,
     cmd/cli/main.go, cmd/xpfd/main.go, pkg/configstore/README.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6683/#7460 — modelled the whole screen subtree in setSchema and
+    routed the screen compiler through the packed-body expander at both the
+    ids-option and family-option levels. Single-sourced the four sub-knob
+    readers onto the child shape (flood was the odd one out) and armed
+    recordChildExtras on every modelled leaf.
+  - **File(s)**: pkg/config/schema_security.go,
+    pkg/config/compiler_security_screen.go,
+    pkg/config/screen_packed_body_6683_test.go,
+    pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
