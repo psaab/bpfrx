@@ -2291,6 +2291,57 @@ Gated end-to-end on `set chassis cluster dhcp-lease-synchronization`
 (`config.ClusterConfig.DHCPLeaseSync`); standalone / knob-off renders the Kea
 config bit-identical to pre-#2239 (no control-socket, no hook).
 
+## A clamped monitor weight is visible to the operator (#6589)
+
+An out-of-range `interface-monitor ... weight` is bounded to `[0,255]` by
+`ClampInterfaceMonitorWeight`. That clamp is reachable ONLY from a
+persisted config or an HA config-sync push — the strict commit gate
+rejects an out-of-range weight outright — which is exactly the
+population an operator cannot see by re-reading what they typed.
+
+**The clamp direction is settled and is not the defect.** 0 is retained
+(not 255) because it is an already-legal, operator-reachable state: an
+`interface-monitor` with no `weight` token compiles to exactly 0,
+meaning "monitor this, contribute no debt". Clamping invalid input onto
+an existing semantic is less surprising than clamping it onto
+"maximally fatal", and under clamp-to-255 a typo'd `-100` arriving over
+config-sync would make the RECEIVING node resign its redundancy group
+the moment that link flaps — turning config-sync into a remote HA
+denial of service.
+
+What was wrong is that the clamp was INVISIBLE, and in a specific way:
+every renderer already called the clamp and discarded the signal —
+`w, _ := ...` — so it printed a plausible 0 or 255 indistinguishable
+from an operator-authored one. A diagnostic that fails to a value that
+looks healthy. A monitor clamped to 0 owes no election debt, so its RG
+does not demote when that link fails and the operator finds out during
+a failover that does not happen.
+
+`InterfaceMonitorInfo` (and `routing.InterfaceMonitorStatus`, which
+carries the LIVE path both renderers take — annotating only the
+config-only fallback would have left the common case silent) now carry
+`ConfiguredWeight` + `Clamped`, and `show chassis cluster interfaces`
+renders `N (cfg M)` plus a note stating the consequence. Zero values
+mean "not clamped", so a producer that does not set them renders
+exactly as before.
+
+**The ip-monitoring half was worse than filed.** The interface-monitor
+class at least reaches journald once per config apply
+(`reconcileMonitorDebtsLocked`). The IP class reached NOTHING:
+`ipTargetWeight` and the global-threshold aggregate both discarded the
+signal and no site anywhere logged it, so an out-of-range ip-monitoring
+weight was invisible including in the log. `Monitor.ClampedIPMonitorWeights`
+reports it and `FormatIPMonitoringStatus` renders it. An unset per-target
+weight is deliberately NOT reported: it inherits the global one, which is
+reported on its own line, and reporting it twice would show a per-target
+clamp the operator never configured.
+
+Note on the `SetMonitorWeight` chokepoint: its own clamp-and-warn is
+documented as effectively unreachable, because every producer bounds the
+weight before it gets there. That is deliberate defense-in-depth and the
+code says so — but it does mean a missing warning there must never be
+read as "no out-of-range weight was configured".
+
 ## Interface-monitor link-state detection
 
 `Monitor` (`monitor.go`) is the live carrier-detection loop: a 1-second

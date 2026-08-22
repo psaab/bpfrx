@@ -1,3 +1,168 @@
+## 2026-08-22 — #6703: URL-bearing config leaves leaked on every config-read surface
+
+- **Timestamp**: 2026-08-22
+- **Action**: Measured the defect before designing, and the measurement moved
+  the fix. The framing in the issue (and in the brief) was that `RedactURL`
+  has a gap; the live defect was that the config-READ surfaces call **no
+  redactor at all**. Proof: `GET /api/v1/config` leaked a *userinfo*
+  credential — a case `RedactURL` has stripped since #2781 and
+  `DDNSProvider.String()` has applied all along — which is only possible if
+  neither is on the path. Confirmed on all three routes named in the
+  acceptance criteria. A fix aimed at `RedactURL` would have been invisible to
+  every one of them.
+  Fixed at the two render boundaries instead: `MarshalJSON` on `DDNSProvider`
+  and `FeedServer` (alias-copy so a field added later is still marshalled and
+  cannot be silently dropped), and a TRANSFORM pass in `redactNodes` for the
+  AST display path. URL leaves are transformed rather than masked because a
+  credential-free URL must render unchanged and the host must stay visible —
+  both explicit acceptance criteria, and a placeholder would violate both.
+  Keyed the AST rule on the LEAF NAME rather than a list of locations, so a
+  future `url` leaf inherits redaction; that also caught two leaves the issue
+  never listed — `system license autoupdate url` and `services rpm probe ...
+  target url` — both measured leaking. Gated `server`/`update-server` on a
+  `dynamic-dns` ancestor since `server` is also an NTP leaf; the gate is
+  pinned by a direct unit test because a render-level test cannot discriminate
+  (RedactURL is a no-op on a bare NTP address, so a wrongly-ungated `server`
+  would still render unchanged and pass for the wrong reason).
+  Added the symmetric commit-ingest guard the redaction creates a need for: a
+  redacted URL still LOOKS valid, so re-applying a redacted export would
+  silently install a broken endpoint instead of failing at commit. Verified it
+  is display-only — `ExportJSON` has zero non-test callers, persistence
+  marshals the AST tree (untouched), and `redactNodes` runs only from
+  `RedactedClone`.
+  Deliberately did NOT change `RedactURL`: 18 call sites across 6 packages, 9
+  of which need the host in their output (the three `show security
+  dynamic-address` surfaces, the commit warnings that name the offending
+  value, the feed-fetch logs that say which server is down).
+  Mutation matrix M1-M6 all RED with real assertions, vet clean at every
+  mutated state, RUN=17 at every cell matching the control.
+- **File(s)**: `pkg/config/ast_redact.go`, `pkg/config/types_system.go`,
+  `pkg/config/types_security.go`, `pkg/config/url_redaction_6703_test.go` (new),
+  `pkg/api/config_url_redaction_6703_test.go` (new),
+  `docs/junos-config-display-reference.md`
+
+## 2026-08-22 — #6709/#7009: the pkg/ddns full-package flake, both mechanisms
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced the flake before touching anything (2/30 full-package
+  runs, ~7%, a DIFFERENT test each time) and established that it is TWO
+  mechanisms sharing ONE root resource — the ephemeral port — rather than the
+  single port race #7009 describes. Killed the obvious third hypothesis first:
+  `slog.SetDefault` is process-global and would produce the identical
+  empty-log symptom under parallelism, but the package has ZERO `t.Parallel()`
+  calls, so tests run sequentially and SetDefault can never be clobbered.
+  (a) `unsignedUpdateWarned` is a process-global `sync.Map` keyed by server
+  host:port that is never reset; ephemeral ports are recycled within one test
+  binary (measured with a standalone probe: 1 reuse per 552 binds), so a test
+  can draw a port an earlier test already warned for and observe zero warns.
+  Proved this causally rather than by inference — a probe that pre-poisons the
+  key reproduces `warns=0 log=""`, byte-identical to the reported symptom.
+  (b) `newFakeDNSServer` bound UDP on :0 then assumed that port number was also
+  free for TCP; the same probe measured the UDP-assigned port already held for
+  TCP host-wide at 1/552, which is ~8% per run and matches the observed rate.
+  Fixed (a) by having the asserting test seed-then-clear its own key, and (b)
+  with a bounded RESAMPLE (`listenDNSPair`) that redraws a fresh port on
+  conflict — explicitly not the retry-the-same-port loop #7009 rejects.
+  Validated against #7009's own binder: six concurrent instances of the package,
+  OLD 6/30 instances failed vs NEW 0/30, then 0/60 at parallelism 10 (120 clean
+  post-fix runs total). Mutation matrix M1/M2/M4/M5 all RED with real
+  assertions; M3 (the negative-assertion vacuity guard) GREEN and kept as
+  defence in depth after a separate cell proved that subtest DOES detect a real
+  regression, so the guard removes a ~8%/run blind spot rather than decorating.
+  Caught and DELETED one test of my own that could not red: it re-implemented
+  `realDNSPairAttempt` instead of calling it, and removing that function's
+  `pc.Close()` left it green with vet clean. Also corrected two rows of the
+  brief's `RedactURL` table by measuring it: a bracketed `[SECRET]` authority
+  survives as an IPv6 literal (not "unparseable"), and a secret in the PATH is a
+  fifth verbatim row nobody had listed.
+- **File(s)**: `pkg/ddns/backend_rfc2136_test.go`,
+  `pkg/ddns/fake_dns_portpair_6709_test.go` (new), `pkg/ddns/README.md`
+## 2026-08-22 — #7368 failover smoke names which failure it hit
+
+- **Timestamp**: 2026-08-22
+- **Action**: Cross-referenced the two independent checks
+  `test-failover.sh` already performed. Primacy is read from a
+  self-reported field; the session count is a real measurement; they
+  were never compared, so #6656's ownership divergence surfaced as a
+  session-count shortfall blamed on the change under test. Added the
+  pure, selftested `failover_ownership_verdict` (ok / diverged /
+  nostream) and split the exit codes: `FATAL[PRECONDITION]` 2,
+  `FATAL[DIVERGENCE]` 3. Replaced the preflight's unscoped
+  `grep -q "node0.*primary"` with the per-RG
+  `deploy_reassert_node0_primary_ok` from #6591 — measured: `secondary`
+  does NOT contain `primary`, so the grep was not loose in the way it
+  looks; it was UNSCOPED, and accepted node0 secondary for RG0 while
+  primary for RG1.
+  Mutation matrix 6/6 RED after fixing the wiring cells: V4 and V6 were
+  GREEN because my wiring greps matched the COMMENTS that mention the
+  function names — the guard was reading its own documentation. Now
+  strips whole-line comments first.
+  NOT run on the cluster (shared; lead serializes).
+- **File(s)**: test/incus/test-failover.sh, test/incus/deploy-lib.sh,
+  test/incus/deploy-lib-selftest.sh, docs/testing.md
+
+## 2026-08-22 — #6587 prefix-length validators + provenance-aware RA floor
+
+- **Timestamp**: 2026-08-22
+- **Action**: Part A: typed `ValidateInteger(0, 128)` on
+  `preferred-prefix-length` and `sub-prefix-length` (both were untyped
+  placeholders behind an Atoi whose error is discarded). CORRECTION to
+  the issue: the impact is NOT symmetric — `sub-prefix-length` is
+  incidentally fail-closed, but `preferred-prefix-length > 128` makes
+  `net.CIDRMask` return nil and the IA_PD hint EGRESSES with wire
+  prefix-length 0.
+  Part B: added `config.RAPrefix.Delegated`, set only by
+  `buildRAConfigs` on the PD path, and a `buildRA` floor refusing
+  `Delegated && Bits()==0`. That supplies the PROVENANCE #6531 said was
+  missing, so an operator-authored `::/0` is untouched. Also added the
+  field to `pkg/ra`'s `configEqual` — it gates whether the PIO is emitted
+  at all, so it is wire-affecting (#4307's lesson).
+  Regenerated `golden_4406.json`: the diff is exclusively
+  `"Delegated": false` additions, verified before regenerating.
+  Repurposed `TestBuildRA_6531_ZeroPrefixWouldBeAdvertised` — its stated
+  premise ("indistinguishable from operator-authored") is no longer true,
+  so it is renamed to `TestBuildRA_6587_ConfiguredZeroPrefixStillAdvertised`
+  and now serves as the over-reach guard.
+  Mutation matrix 8/8 RED after fixing two cells: B4 (daemon stops
+  stamping) was GREEN — the WIRING was unbound, since every pkg/ra test
+  sets the flag itself; B5 was a BAD CELL that neutered PreferredLife
+  instead of Delegated.
+- **File(s)**: pkg/config/schema_interfaces.go, pkg/config/types_routing.go,
+  pkg/config/testdata/golden_4406.json, pkg/daemon/daemon_ra.go,
+  pkg/ra/sender.go, pkg/ra/ra.go,
+  pkg/config/dhcpv6_prefixlen_schema_6587_test.go,
+  pkg/ra/sender_delegated_prefixlen_6587_test.go,
+  pkg/ra/sender_prefixlen_6531_test.go,
+  pkg/daemon/ra_pd_prefixlen_6531_test.go, pkg/dhcp/README.md
+
+## 2026-08-22 — #6589 clamped monitor weights visible to the operator
+
+- **Timestamp**: 2026-08-22
+- **Action**: Carried the clamp signal (`ConfiguredWeight` + `Clamped`)
+  through `InterfaceMonitorInfo` AND `routing.InterfaceMonitorStatus` —
+  the latter is the LIVE path both renderers take, so annotating only
+  the config-only fallback would have left the common case silent — and
+  rendered `N (cfg M)` plus a consequence note in
+  `show chassis cluster interfaces`. Added
+  `Monitor.ClampedIPMonitorWeights` + a render in
+  `FormatIPMonitoringStatus`.
+  CONFIRMED the lead's clamp-precedes-the-gate hypothesis in a sharper
+  form: the clamp happens AT THE RENDER SITE and its boolean is
+  discarded (`w, _ :=`), so the surface prints a plausible 0/255. Also
+  found the ip-monitoring half is WORSE than filed — it reached no
+  surface at all, not even journald.
+  Mutation matrix 7/7 RED after closing three green cells: C4 (the IP
+  RENDER was unbound — the tests called the reporter directly), C5
+  (needed an in-range control), C7 (the first tripwire keyed on the
+  `w, _ :=` SPELLING, but a producer can capture the boolean and still
+  omit it from the struct — re-cut to count `Clamped:` against
+  `InterfaceMonitorInfo{` literals).
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/monitor.go,
+  pkg/routing/monitor.go, pkg/cli/cli_helpers.go,
+  pkg/grpcapi/server_cluster.go,
+  pkg/cluster/clamped_weight_visibility_6589_test.go,
+  pkg/cluster/README.md
+
 ## 2026-08-22 — #6619 + #6564 member 8: VRF-enslaved iifname scope, and coverage vs existence
 
 - **Timestamp**: 2026-08-22

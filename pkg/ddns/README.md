@@ -787,6 +787,46 @@ no change in those packages:
 | `NewProductionManager(parser, nodeID)` | `NewProductionDDNSManager(nodeID)` (wires `keaLeaseParser`) |
 | `NewManagerForTesting(...)` | `NewDDNSManagerForTesting(...)` (wires `keaLeaseParser`) |
 
+## Test fixture discipline — the in-process DNS server (#6709/#7009)
+
+`newFakeDNSServer` binds a real miekg/dns server on 127.0.0.1 for both UDP and
+TCP. Two properties of that fixture are load-bearing, and both were sources of a
+package-wide flake that failed ~7% of full-package runs (20% with six concurrent
+instances) on a DIFFERENT, randomly-chosen test each time.
+
+**One port, two namespaces — resample, never assume.** The server must answer on
+ONE host:port for both protocols, because the updater is configured with a
+single address and the truncation -> TCP-retry path has to reach the same
+server. UDP and TCP are INDEPENDENT port namespaces: a port the kernel hands out
+as a free UDP port says nothing about whether that number is free for TCP, where
+any other process on the host may hold it. Binding UDP once and asserting the
+TCP bind succeeds is therefore wrong, and failed with `bind: address already in
+use`.
+
+`listenDNSPair` draws a candidate port, tries to complete the pair, and DRAWS
+AGAIN on conflict (bounded by `dnsPairAttempts`). Each attempt uses a fresh
+port, so attempts are independent — this is not a retry against a contended
+port, which would convert a fast deterministic failure into a slow flaky one.
+`dnsPairAttempt` is an injectable seam so the resample is pinned by a
+deterministic test (`Test...ResamplesPastAConflictingPort_6709`) instead of by
+occupying a slice of the host's real ephemeral range, which would manufacture
+this very flake for every other test process on the box.
+
+**Process-global warn dedup must be reset by the test that asserts on it.**
+`unsignedUpdateWarned` (`backend_rfc2136.go`) dedups the #4483 unsigned-UPDATE
+warning per update server, keyed by host:port, and it is never reset for the
+life of the process. Ephemeral ports ARE recycled inside a single test binary
+(measured: ~1 reuse per 550 binds), so a test asserting on that warning could
+draw a port an EARLIER test had already warned for, observe zero warnings
+against an empty log, and fail — while passing in isolation.
+
+Any test that asserts on this warning must clear its own key first. The
+positive assertion seeds the poisoned state explicitly and then clears it, so
+dropping the reset fails every run rather than rarely. The NEGATIVE assertion
+("a TSIG-signed updater does not warn") clears it too: a stale key would silence
+the warning and make that test pass VACUOUSLY — green even if the TSIG gate
+regressed.
+
 ## Invariants preserved (do not weaken)
 
 - **Never delete a record xpf did not create** — the state store is the sole

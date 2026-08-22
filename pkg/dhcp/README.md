@@ -323,6 +323,35 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   `/0`); `pkg/ra/sender_prefixlen_6531_test.go` covers `config.RAPrefix` →
   `buildRA` → `ndp.MarshalMessage` and asserts on the RE-PARSED wire bytes,
   pinning the blast radius from the consumer side.
+
+  **#6587 added the defense-in-depth layer #6531 deliberately deferred, and
+  two commit-time range validators.** The decoder remains the primary
+  guard; what changed is that `pkg/ra` can now apply a floor of its own
+  without breaking legitimate configuration. #6531's reasoning for NOT
+  filtering there was that at that point a delegated `/0` is
+  "indistinguishable from an operator-authored
+  `set interfaces <if> ipv6 router-advertisement prefix ::/0`" — so #6587
+  supplied the missing PROVENANCE rather than a blanket floor.
+  `config.RAPrefix.Delegated` is set only by `buildRAConfigs` on the PD
+  path; the compiler leaves it false, so operator-authored prefixes are
+  false BY CONSTRUCTION and no compiler change was needed. `buildRA` then
+  refuses exactly `Delegated && Bits() == 0`. Because that flag decides
+  whether the PIO is emitted at all it is wire-affecting, so it is also
+  compared in `pkg/ra`'s `configEqual` change detector — the #4307 comment
+  there records what omitting a wire-affecting field from that list cost
+  last time.
+
+  Separately, `preferred-prefix-length` and `sub-prefix-length` are now
+  typed `ValidateInteger(0, 128)` leaves. Both were untyped placeholders
+  parsed with an unbounded `strconv.Atoi` whose error is DISCARDED. The
+  impact was NOT symmetric, contrary to the "fail-closed" framing:
+  `sub-prefix-length` was incidentally fail-closed (an invalid
+  `netip.Prefix` is caught by `daemon_ra.go`'s `IsValid()`), but
+  `preferred-prefix-length` was not — `net.CIDRMask(999, 128)` returns
+  nil and `OptIAPrefix.ToBytes` then writes length 0, so the IA_PD hint
+  EGRESSES malformed to the upstream server. Either way the guard was
+  incidental: it depended on a downstream check noticing rather than on
+  the value being rejected where the operator typed it.
 - **RFC 3442 classless static routes (option 121 / legacy 249, #4118).**
   `leaseFromACKv4` parses option 121 (the standard `ClasslessStaticRoute`
   accessor) and falls back to the legacy Microsoft option 249 (raw

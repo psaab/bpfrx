@@ -1138,6 +1138,38 @@ save`; to restore, load from that archive/rescue or re-enter the secret in
 cleartext. (The cleartext SSOT still backs HA config sync, the DR archive and
 on-disk persistence — only the display surfaces redact.)
 
+**xpf URL redaction (#6703):** a URL is secret-*bearing* without being a
+secret — the credential lives in the userinfo, query or fragment, while the
+scheme, host and path are the diagnostic payload an operator needs. So
+URL-bearing leaves are **transformed**, not masked: `config.RedactURL` strips
+userinfo, query and fragment (and an authority that cannot be a `host:port`,
+#6609) and leaves everything else intact. A URL with no credential-bearing
+component renders **unchanged**.
+
+This applies on the typed-struct render (`GET /api/v1/config`, via
+`MarshalJSON` on `DDNSProvider` and `FeedServer`) and on the raw-AST display
+surfaces (`show` / `export`, via `urlLeafIndices` in `ast_redact.go`). Before
+#6703 neither surface reached any redactor at all, so these leaves rendered
+verbatim — including a `user:pass@` credential that `RedactURL` has stripped
+since #2781.
+
+The AST rule is keyed on the **leaf name**, so a `url` leaf inherits redaction
+in every context and a future one needs no extra step. `url-template` and
+`checkip-url` are distinctive enough to match unqualified; `server` and
+`update-server` are gated on a `dynamic-dns` ancestor because `server` is also
+an NTP leaf.
+
+A redacted URL still looks like a valid URL, so re-applying a redacted export
+would silently install a broken endpoint rather than failing loudly. xpf
+therefore **rejects a URL leaf containing `<redacted>` on commit-ingest**, the
+same way it rejects `##SECRET-DATA##`.
+
+**Not covered:** a credential embedded in the URL's *hostname* or *path*
+(`https://SECRET.dyn.example.com/upd`) is indistinguishable from an ordinary
+hostname, so no string rule can redact it without redacting every host. Put
+credentials in the userinfo or the query, where they are redacted. Tracked in
+#7406.
+
 ### 7.2 `{ ... }` Collapse in max-depth
 
 When `display max-depth` truncates children, it uses `{ ... }` notation.

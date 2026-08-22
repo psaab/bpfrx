@@ -867,6 +867,126 @@ test_reassert_is_wired_into_both_deploy_paths() {
 	ok "wiring: reassert routed through the lib at :$lib and called from $n deploy paths"
 }
 
+# ── #7368 ownership-vs-forwarding cross-reference ────────────────────
+# test-failover.sh asserted primacy with a grep over `show chassis cluster
+# status` — a field the node reports about ITSELF — and separately asserted
+# that the same node carries sessions, which is a real measurement. The two
+# were never compared.
+#
+# #6656 is what that costs: node0 reported primary for every RG with 1 session
+# while node1 carried 33. The session assertion DID fail, but reported a
+# session-count shortfall, so the run read as "the streams did not establish"
+# — attributed to whatever change was under test — when the actual failure was
+# that ownership and forwarding disagreed.
+#
+# So the property is not "add an oracle"; the oracle was already there. It is
+# "decide WHICH failure this is, and say so distinctly".
+
+test_ownership_verdict_ok() {
+	local got; got=$(failover_ownership_verdict 25 24 4)
+	if [[ "$got" == "ok" ]]; then
+		ok "ownership: primary carries the traffic -> ok"
+	else
+		bad "ownership: healthy run -> expected 'ok', got '$got'"
+	fi
+}
+
+test_ownership_verdict_diverged() {
+	# The #6656 shape exactly.
+	local got; got=$(failover_ownership_verdict 1 33 4)
+	if [[ "$got" == "diverged" ]]; then
+		ok "ownership: reported-primary carries 1, peer carries 33 -> diverged"
+	else
+		bad "ownership: the #6656 divergence -> expected 'diverged', got '$got' (it would be reported as a session-count shortfall and blamed on the change under test)"
+	fi
+}
+
+test_ownership_verdict_nostream() {
+	# Neither node carries traffic: a real establishment failure, and a
+	# DIFFERENT bug with a different fix. Reporting it as a divergence would
+	# be the same conflation in the other direction.
+	local got; got=$(failover_ownership_verdict 0 0 4)
+	if [[ "$got" == "nostream" ]]; then
+		ok "ownership: neither node carries traffic -> nostream (not a divergence)"
+	else
+		bad "ownership: no traffic anywhere -> expected 'nostream', got '$got'"
+	fi
+}
+
+test_ownership_verdict_boundary_is_inclusive() {
+	# Exactly at the minimum is HEALTHY. An exclusive boundary would report a
+	# cluster meeting the documented threshold as diverged.
+	local got; got=$(failover_ownership_verdict 4 4 4)
+	if [[ "$got" == "ok" ]]; then
+		ok "ownership: primary exactly at MIN_SESSIONS -> ok (inclusive)"
+	else
+		bad "ownership: primary at the minimum -> expected 'ok', got '$got'"
+	fi
+}
+
+test_ownership_verdict_peer_below_min_is_not_divergence() {
+	# The peer carrying a FEW synced sessions while the primary carries none is
+	# still an establishment failure — session sync means the peer legitimately
+	# holds sessions, so "peer has some" cannot be the discriminator.
+	local got; got=$(failover_ownership_verdict 0 2 4)
+	if [[ "$got" == "nostream" ]]; then
+		ok "ownership: peer below the minimum -> nostream, not diverged"
+	else
+		bad "ownership: peer with 2 sessions -> expected 'nostream', got '$got' (session sync means the peer always holds some; 'peer has any' is not a divergence signal)"
+	fi
+}
+
+# The WIRING. Every cell above calls the verdict directly, so all of them stay
+# green if test-failover.sh stops consulting it — and the script is the only
+# caller. Also asserts the three failure paths carry DISTINCT exit codes: a
+# gate that exits 2 for a precondition abort, a failover regression AND a
+# divergence teaches people to re-run it instead of reading it.
+test_failover_script_wires_the_crossref() {
+	local f="${SCRIPT_DIR}/test-failover.sh"
+	local missing=() code
+	# CODE ONLY. A first version grepped the raw file and both wiring cells
+	# stayed GREEN under mutation, because the names it searched for also
+	# appear in the COMMENTS explaining them — the guard was reading its own
+	# documentation. Strip whole-line comments before matching.
+	code=$(grep -v '^[[:space:]]*#' "$f")
+	grep -q 'failover_ownership_verdict' <<<"$code" || missing+=("failover_ownership_verdict call")
+	grep -q 'deploy_reassert_node0_primary_ok' <<<"$code" || missing+=("per-RG primacy predicate")
+	grep -q 'die_divergence' <<<"$code" || missing+=("die_divergence")
+	grep -q 'exit 3' <<<"$code" || missing+=("distinct divergence exit code")
+	grep -q 'source .*deploy-lib.sh' <<<"$code" || missing+=("deploy-lib.sh source")
+	if (( ${#missing[@]} == 0 )); then
+		ok "wiring: test-failover.sh sources the lib, uses the per-RG predicate, cross-references, and exits distinctly"
+	else
+		bad "wiring: test-failover.sh is missing: ${missing[*]} — the verdict is selftested but nothing calls it (#7368)"
+	fi
+}
+
+# The primacy predicate must be SCOPED per redundancy group. The retired grep
+# was `node0.*primary` over the whole status output: `secondary` does not
+# contain `primary`, so that part was sound, but the match is not scoped to an
+# RG — a cluster with node0 SECONDARY for RG0 and primary for RG1 satisfied it.
+test_primacy_predicate_is_scoped_per_rg() {
+	local mixed="Redundancy group: 0 , Failover count: 0
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+
+Redundancy group: 1 , Failover count: 0
+node0   200       primary        no       no       None
+node1   100       secondary      no       no       None
+"
+	if printf '%s' "$mixed" | grep -q "node0.*primary"; then
+		: # the retired grep DOES match this -- that is the point
+	else
+		bad "primacy: fixture no longer reproduces the retired grep's false accept"
+		return
+	fi
+	if printf '%s' "$mixed" | deploy_reassert_node0_primary_ok; then
+		bad "primacy: node0 is SECONDARY for RG0 and the predicate accepted it — the preflight would run a failover test against a cluster that is not in the asserted state (#7368)"
+	else
+		ok "primacy: node0 secondary for RG0 -> rejected (the retired whole-output grep accepted it)"
+	fi
+}
+
 # ── Run ───────────────────────────────────────────────────────────────
 test_rolling_secondary_node0_primary
 test_rolling_secondary_node0_secondary
@@ -896,6 +1016,13 @@ test_reassert_dies_when_role_not_achieved
 test_reassert_issues_reset_transfer_reset_per_rg
 test_reassert_transfer_rc_is_not_the_verdict
 test_reassert_is_wired_into_both_deploy_paths
+test_ownership_verdict_ok
+test_ownership_verdict_diverged
+test_ownership_verdict_nostream
+test_ownership_verdict_boundary_is_inclusive
+test_ownership_verdict_peer_below_min_is_not_divergence
+test_failover_script_wires_the_crossref
+test_primacy_predicate_is_scoped_per_rg
 test_preflight_pass_proceeds
 test_preflight_reject_hardfails
 test_preflight_reject_touches_nothing

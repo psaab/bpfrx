@@ -254,6 +254,41 @@ deploy_reassert_node0_primary_ok() {
 	'
 }
 
+# failover_ownership_verdict cross-references the two independent checks
+# test-failover.sh already performs, and is the #7368 half of the #6591 fix.
+#
+# The smoke asserts primacy by reading `show chassis cluster status` — a field
+# the node reports about ITSELF — and separately asserts that the same node
+# carries established sessions, which is a real measurement. The two are never
+# compared. #6656 showed what that costs: node0 reported primary for every RG
+# with 1 session while node1 carried 33, and the smoke's session assertion
+# caught it only INCIDENTALLY, reporting a session-count shortfall on a run
+# whose actual failure was ownership/forwarding divergence.
+#
+# Arguments: sessions on the node REPORTED primary, sessions on its peer, and
+# the minimum a healthy primary must carry. Echoes one of:
+#
+#   ok        the reported primary carries the traffic
+#   diverged  the reported primary carries almost nothing while the PEER does
+#             — ownership and forwarding disagree
+#   nostream  neither node carries traffic — the iperf streams did not
+#             establish, which is a different failure with a different fix
+#
+# Split out here so deploy-lib-selftest.sh can drive every combination without
+# a cluster; the caller only formats the message.
+failover_ownership_verdict() {
+	local primary_sessions="$1" peer_sessions="$2" min_sessions="$3"
+	if [[ "$primary_sessions" -ge "$min_sessions" ]]; then
+		printf 'ok\n'
+		return 0
+	fi
+	if [[ "$peer_sessions" -ge "$min_sessions" ]]; then
+		printf 'diverged\n'
+		return 0
+	fi
+	printf 'nostream\n'
+}
+
 # Bounded retries for the two reads. Overridable so the self-test does not
 # sleep. The status read needs them because the daemon is still coming up right
 # after a deploy: the measured failure was a reassert issued ~20s post-deploy

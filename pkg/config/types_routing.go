@@ -405,6 +405,20 @@ type RAPrefix struct {
 	Autonomous    bool   // SLAAC autonomous flag (default true)
 	ValidLifetime int    // seconds, 0 = default (2592000 = 30 days)
 	PreferredLife int    // seconds, 0 = default (604800 = 7 days)
+	// Delegated marks a prefix DERIVED from a DHCPv6 IA_PD delegation rather
+	// than authored by the operator (#6587).
+	//
+	// It exists because pkg/ra cannot otherwise tell the two apart, and the
+	// right answer differs: a delegated /0 is upstream garbage and must never
+	// be advertised on-link + autonomous to the LAN, while an operator-authored
+	// `::/0` is a legitimate configuration a blanket floor would silently
+	// break. #6581 fixed the same class at the DHCPv6 DECODER for exactly this
+	// reason — by the time a prefix reaches pkg/ra the provenance was gone.
+	//
+	// Set ONLY by buildRAConfigs (pkg/daemon) on the PD path. The compiler
+	// leaves it at the zero value, so operator-authored prefixes stay false by
+	// construction and no compiler change is needed.
+	Delegated bool
 }
 
 // OSPFConfig holds OSPF routing configuration.
