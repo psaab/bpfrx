@@ -75,8 +75,9 @@ each routing-instance) against each interface's zone's effective
 explicit. Zone attribution reuses the dataplane's `buildInterfaceZoneMap`
 semantics (`zoneIfaceLogicalKeys`: a bare zone member `reth0` claims every
 configured unit `reth0.10`), and the effective admission set reuses
-`ZoneConfig.InterfaceHostInboundEffective` (zone-level ∪ per-interface override
-with #3720 physical-parent inheritance for logical units, `all`-expanded) — so
+`ZoneConfig.InterfaceHostInboundEffective` (the per-interface override where one
+is declared — it REPLACES the zone-level set, #6515 — with #3720 physical-parent
+inheritance for logical units, `all`-expanded) — so
 the advisory matches runtime enforcement exactly (no missed or false warnings
 on unit interfaces). Same WARN-only,
 zero-dataplane-surface doctrine (the Component A per-zone `iifname` DROP

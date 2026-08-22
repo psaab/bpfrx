@@ -716,8 +716,11 @@ From zone: guest, To zone: lan
     the zone) AND the interface level (`set security zones security-zone <z>
     interfaces <if> host-inbound-traffic ...`, applies only to that interface).
     xpf now supports the interface-level stanza; the EFFECTIVE admission set for
-    an interface is the UNION of the zone-level set and its interface-level
-    override (Junos additive semantics). A zone is host-inbound-ENFORCING when it
+    an interface is its interface-level stanza when it declares one, otherwise
+    the zone-level set — the interface stanza REPLACES the zone stanza (#6515;
+    Junos: "Interface configuration overrides that of the zone"), and an
+    explicitly EMPTY interface stanza is a deny-all override, not a fallback.
+    A zone is host-inbound-ENFORCING when it
     declares a zone-level stanza OR any interface-level override — so an operator
     can expose a service (e.g. `ssh`) on one interface of a zone while denying it
     on the others by setting the override only on the exposed interface and
@@ -1059,7 +1062,8 @@ and report on the FIRST admitting view, so it certified a zone-wide
 DENIES — a false-admission diagnosis. Two changes remove it:
 
 - `ingress-interface <if>` scopes the host-inbound classification to ONE
-  interface's EFFECTIVE view (zone-level ∪ that interface's override), so the
+  interface's EFFECTIVE view (that interface's override where declared, which
+  REPLACES the zone-level set — #6515 — else the zone-level set), so the
   reported admission is that interface's TRUE posture (admit vs deny), not a
   zone-wide fold. The ref must name an interface assigned to `from-zone`; an
   unknown, zone-mismatched, or management/cluster lifeline (fxp0/em0/fab*) ref is

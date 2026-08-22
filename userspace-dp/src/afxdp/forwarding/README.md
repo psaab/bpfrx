@@ -432,9 +432,10 @@ validated zone id and stores it in `ForwardingState::zone_host_inbound`.
 
 **Per-interface override (#3362).** Junos also models `host-inbound-traffic`
 at the INTERFACE level (`security zones <z> interfaces <if>
-host-inbound-traffic { ... }`); the effective admission set for an interface
-is the UNION of the zone-level set and its interface-level override. The Go
-control plane computes that effective union and carries it on
+host-inbound-traffic { ... }`); the effective admission set for an interface is
+its interface-level stanza when it declares one, which REPLACES the zone-level
+set (#6515), otherwise the zone-level set. The Go
+control plane computes that effective set and carries it on
 `InterfaceSnapshot` (`host_inbound_configured` +
 `host_inbound_system_services` / `host_inbound_protocols`), populated only for
 an interface that declared an interface-level stanza and is not a
