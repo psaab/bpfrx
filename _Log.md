@@ -1,3 +1,25 @@
+## 2026-08-22 — #6499 boot-firmware self-tests + lint-list drift guard
+
+- **Timestamp**: 2026-08-22
+- **Action**: Added 17 hermetic functional tests driving the real
+  `xpf-uefi-slots` under `/bin/sh` with a mock efibootmgr that models
+  NVRAM as state files, covering the four destructive classes
+  (wrong-loader-path deletion, duplicate dedup, promoted-slot BootOrder
+  preservation, empty-BootOrder no-write). Added a coverage guard over
+  `SH_SCRIPTS` catching drift in both directions — a shipped
+  `scripts/image/xpf-*` missing from the lint list, and a listed path
+  that no longer exists (which `:103`'s `|| continue` would drop
+  silently). Two of the issue's three acceptance criteria were already
+  satisfied at master (`xpf-kernel-promote` is in SH_SCRIPTS as of
+  de74cc2db, and its rc contract is covered by
+  test_kernel_promote_explicit_path.py); confirmed rather than
+  re-implemented. Tests are Python so the `run-selftests.sh:139` glob
+  discovers them — a shell self-test would not be run (#7296).
+- **File(s)**: scripts/image/xpf-uefi-slots,
+  scripts/image/test_uefi_slots_6499.py,
+  scripts/test_selftest_lint_coverage_6499.py,
+  docs/install-images.md
+
 ## 2026-08-22 — #6498 Tier-1 A/B substrate + kernel-hold assertions
 
 - **Timestamp**: 2026-08-22
