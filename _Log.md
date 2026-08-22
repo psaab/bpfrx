@@ -1,3 +1,38 @@
+## 2026-08-22 — #6678: device-map OriginalName= no longer falls back to the logical name
+
+- **Timestamp**: 2026-08-22
+- **Action**: `deviceMapOriginalNameFor` returned the NIC's CURRENT name when
+  the sysfs derivation came back empty; in the recovery branch that matters
+  (`current == logical`) that is the LOGICAL name, which udev never presents,
+  so the written `.link` could never match and boot persistence failed
+  silently. Changed the contract to `(string, bool)` and made the apply path
+  decline to write a `.link` at all when no udev-matchable name exists,
+  reporting it on the same #5842 channel as a `.link` that failed to land.
+  Tracing the call graph found a SECOND manufacturing site the issue does not
+  mention: the write site has its own fallback, `recoverOriginalName`, which
+  also returns the current name when no `.link` records it — so a fix confined
+  to `deviceMapOriginalNameFor` would have been defeated there and looked
+  correct. Both are covered; the end-to-end test would still fail if only the
+  first were fixed.
+  Rejected `original == final` as the discriminator even though it needs no
+  plumbing: it is unsound for a NIC whose real kernel name legitimately equals
+  its logical name, which would then be skipped wrongly. Carried an explicit
+  NUL-prefixed sentinel as a map VALUE instead — `breakNameCollisions` re-keys
+  only KEYS, so the value survives the temp rename with no signature change to
+  a helper the positional path shares.
+  The full package caught what the filter could not:
+  `TestEnumerateAndRenameMapped_BootRecheckAllowsSafeMap_5490` was green ONLY
+  because of this defect — it never stubbed the derivation, so it read the real
+  `/sys` of whatever host ran it, found no `fxp0`, and relied on the fallback.
+  Repaired the fixture to pin its derivation; verified under mutation M5 that
+  the repair made it independent rather than newly dependent.
+  Mutation matrix M1-M4 all RED with real assertions, vet clean at each,
+  RUN=4 matching the control; M5 re-ran the FULL package under M1.
+- **File(s)**: `pkg/daemon/device_map.go`,
+  `pkg/daemon/device_map_original_name_6678_test.go` (new),
+  `pkg/daemon/device_map_test.go`,
+  `pkg/daemon/device_map_preflight_failclosed_5490_test.go`,
+  `docs/bare-metal-device-map.md`
 ## 2026-08-22 — #6677: derive the pre-rename kernel name from the kernel, not from PCI arithmetic
 
 - **Timestamp**: 2026-08-22

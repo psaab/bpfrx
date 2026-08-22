@@ -260,7 +260,10 @@ func TestDeviceMapOriginalNameForFreshKernelName(t *testing.T) {
 	deriveKernelNameFn = func(string) string { called = true; return "enp0s3" }
 	t.Cleanup(func() { deriveKernelNameFn = old })
 
-	got := deviceMapOriginalNameFor("ens3", "ge-0-0-3")
+	got, ok := deviceMapOriginalNameFor("ens3", "ge-0-0-3")
+	if !ok {
+		t.Fatal("a real kernel name is udev-matchable; ok must be true")
+	}
 	if got != "ens3" {
 		t.Fatalf("fresh-box OriginalName must be the real kernel name ens3, got %q", got)
 	}
@@ -277,7 +280,10 @@ func TestDeviceMapOriginalNameForDerivesWhenWearingLogicalName(t *testing.T) {
 	deriveKernelNameFn = func(string) string { return "enp9s0" }
 	t.Cleanup(func() { deriveKernelNameFn = old })
 
-	got := deviceMapOriginalNameFor("ge-0-0-3", "ge-0-0-3")
+	got, ok := deviceMapOriginalNameFor("ge-0-0-3", "ge-0-0-3")
+	if !ok {
+		t.Fatal("a successful derivation is udev-matchable; ok must be true")
+	}
 	if got != "enp9s0" {
 		t.Fatalf("when wearing the logical name, OriginalName must derive the kernel name, got %q", got)
 	}

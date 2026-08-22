@@ -136,6 +136,34 @@ immediately on commit.
   spellings in its error. Only BOUND entries are counted: a duplicate whose
   second entry matches no present NIC is unambiguous and still binds.
 
+### `OriginalName=` must be a name udev will present (#6678)
+
+Each mapped NIC's `.link` records `OriginalName=` — the NIC's **pre-rename
+kernel name** — so systemd can find it again on the next boot and re-apply the
+logical name. That key is load-bearing for RETH members in particular: their MAC
+alternates between physical (at boot) and virtual (once the daemon programs the
+RETH virtual MAC), so `MACAddress=` is unreliable for them and `OriginalName=`
+is the only stable match.
+
+xpf derives that name in one of three ways, in order:
+
+1. an existing `.link` chain already records the true original — use it;
+2. the NIC still wears its own kernel name (`current != logical`, a fresh first
+   map) — that name **is** the original;
+3. the NIC already wears its logical name and its `.link` was lost — derive the
+   kernel name from sysfs.
+
+If (3) comes back empty, xpf **declines to write a `.link` at all** and reports
+it as a rename/reload failure. It does **not** fall back to the NIC's current
+name, because in that branch the current name IS the logical name, which udev
+will never present — the resulting `.link` could not match, so boot-time
+persistence would fail *silently*: the file exists, the name looks plausible,
+and nothing matches on the next boot.
+
+Leaving the NIC under its kernel name is the better failure. It is a state the
+rest of the daemon already understands and reports, and it surfaces at apply
+time rather than hours later on a machine nobody is watching.
+
 ## `unmapped-interface-policy`
 
 - **`leave-alone` (default in device-map mode):** NICs with no entry are
