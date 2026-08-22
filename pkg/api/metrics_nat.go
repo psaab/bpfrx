@@ -28,7 +28,7 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))) // #6553
 		ch <- prometheus.MustNewConstMetric(c.natPoolTotalPorts, prometheus.GaugeValue,
 			float64(totalPorts), name)
 
