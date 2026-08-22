@@ -100792,3 +100792,19 @@ prose edit above them added. No diff falls in the new test body.
     rejection pin (previously a vacuous green).
   - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
     docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go
+
+## 2026-08-21 — #6543: redundancy-group ids folded by canonical value
+- **Timestamp**: 2026-08-21
+- **Action**: `compileChassis` appended one `*RedundancyGroup` per AST
+  instance, so `redundancy-group 1` + `redundancy-group 01` (and a repeated
+  hierarchical block) committed TWO records with `ID=1` — one with an empty
+  `NodePriorities`. `cluster.Manager.UpdateConfig`'s id-keyed last-wins loop
+  then overwrote `LocalPriority` with the map-miss zero and the #4880 gate
+  passed vacuously on the empty record. Instances are now folded by canonical
+  int id and each body is replayed into the single record through the same
+  statement dispatch table (leaf-level last-wins, Junos `set` semantics);
+  first-appearance order preserved.
+- **File(s)**: pkg/config/compiler_system.go,
+  pkg/config/compiler_chassis_rg_id_canonical_6543_test.go (new),
+  pkg/cluster/rg_id_canonical_6543_test.go (new), docs/config-schema.md,
+  pkg/cluster/README.md, _Log.md

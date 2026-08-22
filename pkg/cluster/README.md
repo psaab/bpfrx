@@ -83,6 +83,30 @@ locating any symbol below is now a matter of opening the named file.
   invariant answerable by reading one file end-to-end.
 - Readiness gate (`SetRGReady`) — `readiness.go`.
 
+### `UpdateConfig` is id-keyed and last-wins (#6543)
+
+`UpdateConfig` walks `cfg.RedundancyGroups` — a SLICE — into `m.groups`, a
+`map[int]*RedundancyGroupState` keyed by `rg.ID`, doing
+`existing.LocalPriority = rg.NodePriorities[m.nodeID]` on every visit. Two
+compiled records sharing one id are therefore a silent overwrite by whichever
+came last, and a `NodePriorities` MAP MISS is indistinguishable from a
+configured priority of 0.
+
+That was reachable from config: `redundancy-group 1 node 0 priority 200` plus
+`redundancy-group 01 preempt` compiled to two `ID=1` records, one with an empty
+priority map, so node 0 ran RG 1 at priority **0** instead of 200 and lost an
+election it was configured to win. The fix is upstream — `compileChassis` now
+folds redundancy-group instances by CANONICAL int id, so the compiler cannot
+hand `UpdateConfig` two records for one group (see `docs/config-schema.md`,
+"A redundancy-group is folded by CANONICAL ID"). The runtime half of that
+property is pinned in `rg_id_canonical_6543_test.go`, which drives real set
+lines through the real compiler into a real `Manager`.
+
+The last-wins loop itself is unchanged and is still the contract: ONE compiled
+record per redundancy-group id. A future caller that synthesizes
+`ClusterConfig` records directly (peer sync, tests) owes that same invariant —
+`UpdateConfig` does not enforce it.
+
 ### Live vs desired heartbeat timing (#5081)
 
 `Manager.hbInterval` / `Manager.hbThreshold` are the **desired**

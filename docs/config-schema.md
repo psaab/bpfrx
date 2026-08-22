@@ -2776,6 +2776,49 @@ which key the sample is filed under. The test now requires each sample to begin
 with its own statement keyword AND instruments the dispatch table so a case that
 never reaches the handler it is filed under fails.
 
+**A redundancy-group is folded by CANONICAL ID, not by the spelling
+(#6543).** `namedInstances` yields one entry per AST node and
+`compileChassis` parses the instance name with `strconv.Atoi`, which maps `1`,
+`01`, `001` and `+1` to the SAME int. Appending one `*RedundancyGroup` per
+instance therefore committed **two** records sharing `ID=1`:
+
+```
+set chassis cluster redundancy-group 1 node 0 priority 200   # record A: NodePriorities{0:200}
+set chassis cluster redundancy-group 01 preempt              # record B: NodePriorities{} Preempt
+```
+
+The repeated hierarchical block hits the same split for a different reason —
+`SetPath` merges same-name flat-set children, but the hierarchical parser
+leaves `redundancy-group 1 { ... } redundancy-group 1 { ... }` as two nodes.
+
+Everything downstream keys redundancy groups by the **int** id.
+`cluster.Manager.UpdateConfig` (`pkg/cluster/group_state.go`) walks the slice
+into an id-keyed map and does `existing.LocalPriority = rg.NodePriorities[m.nodeID]`,
+so whichever record it visited last won: the empty-map record overwrote the
+configured 200 with the **map-miss zero** and node 0 ran RG 1 at priority 0 —
+it loses an election it was configured to win. The #4880 node-priority range
+gate could not catch it either; it iterated the empty-map record and passed
+**vacuously**, having nothing to range-check. Two silent-failure shapes
+intersecting: an overloaded zero (map-miss `0` indistinguishable from a
+configured `0`) behind a vacuous gate.
+
+`compileChassis` now folds instances into one record per canonical id and
+replays each instance's body into it through the same `redundancyGroupStatements`
+dispatch table, so the merge is **leaf-level last-wins** — ordinary Junos `set`
+semantics — rather than one whole record silently displacing another.
+First-appearance order of the ids is preserved so the compiled slice, and every
+first-error message derived from it, stays deterministic. Merging rather than
+rejecting is deliberate: the repeated-hierarchical-block spelling is legal
+Junos that merges, so a hard reject would newly refuse a config an operator can
+legitimately write.
+
+Covered by `pkg/config/compiler_chassis_rg_id_canonical_6543_test.go` (the
+compile half, including a distinct-ids negative control and the #4880 gate now
+seeing the merged record) and `pkg/cluster/rg_id_canonical_6543_test.go` (the
+runtime half — real set lines through the real compiler into the real
+`Manager`, asserting `LocalPriority` is the configured 200 and is insensitive
+to which spelling came first).
+
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
 bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
