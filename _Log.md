@@ -101381,3 +101381,27 @@ prose edit above them added. No diff falls in the new test body.
   were forced by mutation cells that failed to red.
 - **File(s)**: pkg/api/show_text.go, pkg/api/show_nat_shared_test.go (new),
   pkg/api/README.md, _Log.md
+
+## 2026-08-21 — #6568: Rust-dataplane cohort, provable subset
+- **Timestamp**: 2026-08-21
+- **Action**: Swept all 8 rows individually. Member 1 was filed as a
+  low-materiality residual with "no traffic fail-open" — measured, both halves
+  are wrong: `ipnet` requires a prefix length and the config compiler validates
+  nothing, so `route 10.0.0.1 discard`, `route 2001:db8::1 discard` and
+  `route default discard` all commit, ship, and VANISH in the helper; for a
+  discard route that is a fail-OPEN (packet matches a less-specific route and is
+  forwarded). Fixed at the Go chokepoint (`routeDestinationForWire` normalises a
+  bare host to /32 or /128, drops anything unusable with a WARN) plus a Rust
+  fail-closed `RouteDestinationUnparseable`. Member 3 doc-parity (per-worker
+  screen rate multiplier). Member 4 Err-arm `refresh_status` (latent —
+  `update_ha_state` returns Ok on every path today). Member 6 poisoned-lock
+  panic amplification on the NAT path. Member 7 does NOT reproduce (has a
+  live `debug_log!` caller). Members 2/5/8 split to #7359/#7360/#7361.
+- **File(s)**: pkg/dataplane/userspace/routes.go,
+  pkg/dataplane/userspace/route_dest_unparseable_6568_test.go (new),
+  userspace-dp/src/afxdp/forwarding_build/fib.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/policy_snapshot_error.rs,
+  userspace-dp/src/server/handlers/ha.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_counter.rs,
+  docs/syn-cookie-flood-protection.md, docs/feature-gaps.md, _Log.md
