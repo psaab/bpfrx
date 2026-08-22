@@ -102938,3 +102938,12 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
   pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md
+
+## 2026-08-22 — #6672 packed chassis cluster body
+- **Timestamp**: 2026-08-22
+- **Action**: Split a packed `chassis cluster` body into statements before BOTH
+  the compiler and the schema walker, so all five spellings compile identically
+  and the packed spelling cannot escape the typed-leaf range gates.
+- **File(s)**: pkg/config/compiler_chassis_cluster_packed.go (new),
+  pkg/config/compiler_system.go, pkg/config/schema_walk.go,
+  pkg/config/packed_chassis_cluster_6672_test.go, docs/config-schema.md
