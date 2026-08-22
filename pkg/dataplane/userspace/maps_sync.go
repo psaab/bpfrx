@@ -195,12 +195,16 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	// XDP shim correctly refuses to redirect until userspace begins updating.
 	{
 		var zeroHB uint64
-		// The bound comes from the SAME derivation the ctrl fields above were
-		// built from (#5718 fold F3): heartbeatZeroSlots clamps the worker
-		// count low to 1 and high to the Array's real capacity, so neither a
-		// negative nor an absurd cfg.Workers can make this loop wrap uint32 or
-		// index past the map (#4572). Re-deriving it here from the raw
-		// cfg.Workers is what let the two descriptions diverge.
+		// The bound is the Array's OWN capacity (#6702 blocker 2), not a
+		// worker-derived prefix: heartbeat slots are indexed by BINDING slot,
+		// and the binding count is not a function of cfg.Workers, so a
+		// worker-derived prefix left the tail slots holding the previous
+		// load's timestamps — which read as FRESH and mask a helper that has
+		// stopped. It still comes from the SAME plan the ctrl fields above
+		// were built from (#5718 fold F3), so there is one derivation and no
+		// second description to diverge from; and because it no longer reads
+		// cfg.Workers, neither a negative nor an absurd value can make this
+		// loop wrap uint32 or index past the map (#4572).
 		//
 		// #5718 fold r3: read plan.HeartbeatSlots INLINE in the loop condition
 		// rather than through a local. An intermediate `slots := ...` leaves a
@@ -1587,47 +1591,58 @@ func pickInterfaceSnapshotV6(iface InterfaceSnapshot) net.IP {
 
 // heartbeatSlotsPerWorker is the number of userspace_heartbeat Array
 // slots reserved per dataplane worker (2 directions x up to 16 queues).
-// programBootstrapMapsLocked zero-inits workers*heartbeatSlotsPerWorker
-// slots on every apply.
+//
+// It is NOT the zero-init loop's bound any more (#6702 blocker 2 — see
+// heartbeatZeroSlotBound); it survives as the divisor `effectiveWorkers` uses
+// to cap the worker count REPORTED to the shim at what the Array can carry
+// slots for.
 const heartbeatSlotsPerWorker = 2 * 16
 
-// heartbeatZeroSlots returns how many leading userspace_heartbeat Array
-// slots programBootstrapMapsLocked must zero-init for a configured worker
-// count. It clamps the worker count into [1, mapCap/heartbeatSlotsPerWorker]
-// so the returned slot count can never wrap uint32 or exceed the fixed-size
-// Array, regardless of what cfg.Workers carries.
+// heartbeatZeroSlotBound returns how many userspace_heartbeat Array slots
+// programBootstrapMapsLocked must zero-init: ALL of them.
 //
-// The low clamp mirrors the QueueCount / disabled-ctrl coercions
-// (workers<=0 -> 1). The negative-workers case is already defended by
-// deriveUserspaceConfig (capabilities.go), so the load-bearing guard is
-// the HIGH clamp: `workers` is a min-only schema leaf (ValidateIntegerMin(1))
-// with no upper bound in deriveUserspaceConfig, so a large positive value
-// (e.g. 999999999) reaches this function and a raw
-// uint32(workers)*heartbeatSlotsPerWorker wraps uint32 to ~1.9B loop
-// iterations that hang the apply for hours (#4572). Clamping the worker
-// count to mapCap/heartbeatSlotsPerWorker before the multiply keeps the
-// returned slot count <= mapCap and never wraps.
-// #5718 A6-b01-C1: BOTH clamps run in int space, BEFORE the uint32 cast.
-// Casting first (the pre-#5718 shape, `w := uint32(maxInt(workers, 1))`) let a
-// worker count above the uint32 range narrow into the clamp's blind spot and
-// defeat the very bounds this function exists to enforce: `workers` is an int
-// from a min-only schema leaf, so `1<<32` narrows to 0 — under maxW, so the
-// high clamp passes it through — and the function returns 0 slots, zeroing
-// NOTHING and leaving stale heartbeat entries live for every worker. `1<<32+5`
-// narrows to 5 and silently zeroes 5 workers' slots no matter how large maxW
-// is. Clamping in int space keeps the low clamp (>=1) and the high clamp
-// (<=maxW) both binding for every int input, and the cast then happens on a
-// value already proven to be within [1, maxW].
-func heartbeatZeroSlots(workers int, mapCap uint32) uint32 {
-	slots := uint32(effectiveWorkers(workers, mapCap)) * heartbeatSlotsPerWorker
-	if slots > mapCap {
-		// Degenerate: an Array too small to hold even one worker's slots
-		// (mapCap < heartbeatSlotsPerWorker). effectiveWorkers keeps its floor
-		// of 1 because "zero workers" is not a thing to report to the shim;
-		// the loop bound still may not leave the Array.
-		slots = mapCap
-	}
-	return slots
+// #6702 blocker 2 — WHY THIS IS NOT DERIVED FROM THE WORKER COUNT ANY MORE.
+// It used to return `effectiveWorkers(workers) * heartbeatSlotsPerWorker`, and
+// that bound was measuring the wrong quantity. A heartbeat slot is indexed by
+// the BINDING SLOT — the XDP shim reads `USERSPACE_HEARTBEAT.get(binding.slot)`
+// (userspace-xdp/src/lib.rs) and the helper writes `update_heartbeat_slot(fd,
+// slot, ..)` (userspace-dp/src/afxdp/bpf_map/ha.rs) — and the binding count is
+// `min(rx_queues) * interfaces`, which has never been a function of
+// `cfg.Workers`. With the default `Workers: 1` (capabilities.go) the loop
+// zeroed 32 slots, so ANY box whose binding count exceeds that — six dataplane
+// interfaces at 6 queues, or three at 16 — left its tail slots holding the
+// PREVIOUS load's timestamps.
+//
+// That fails in the direction the heartbeat exists to prevent. A zeroed slot
+// reads as stale (`bpf_ktime_get_ns() >> 0`) and the shim correctly refuses to
+// redirect until userspace starts updating it; a slot still holding a
+// timestamp from inside the heartbeat timeout reads as FRESH, which masks a
+// helper that has STOPPED for up to one timeout — on precisely the slots
+// nobody zeroed.
+//
+// The sibling map settles what the right bound is. `userspace_xsk_map` is the
+// other 4096-entry map indexed by the SAME binding slot, and it is already
+// cleared over its FULL range on helper start ("Old entries point to dead
+// socket fds", process.go). Two maps with one index and two different clearing
+// domains: the XSK one was right.
+//
+// Zeroing the whole Array is safe on the path that reaches it even though that
+// path is NOT bootstrap-only: programBootstrapMapsLocked runs on every
+// non-same-plan apply, but it calls clearAllBindingRowsLocked() ~25 lines
+// earlier — zeroing every binding row the manager wrote — and the shim gates on
+// the binding row BEFORE reading the heartbeat. So a packet a zeroed heartbeat
+// could blackhole is already blackholed by the zeroed binding row in the same
+// function; this widens no window that call does not already open. (The binding
+// half of that hazard is separately acknowledged and repaired by
+// verifyBindingsMapLocked.)
+//
+// Taking the Array's own capacity also closes #4572 and #5718-A6-b01-C1 BY
+// CONSTRUCTION rather than by a clamp — the bound no longer reads `workers` at
+// all, so no value of it (negative, zero, 1<<32, max int) can wrap the loop
+// counter or push it past the Array. `effectiveWorkers` still clamps the count
+// REPORTED to the shim, which is a different question and keeps its own guard.
+func heartbeatZeroSlotBound(heartbeatMapCap uint32) uint32 {
+	return heartbeatMapCap
 }
 
 // userspaceWorkerPlan carries every representation of the bootstrap's worker
@@ -1638,9 +1653,11 @@ type userspaceWorkerPlan struct {
 	// Workers is the count reported to the shim in userspaceCtrlValue's
 	// Workers AND QueueCount fields.
 	Workers uint32
-	// HeartbeatSlots is how many leading userspace_heartbeat Array slots the
-	// zero-init loop must write — Workers * heartbeatSlotsPerWorker, capped at
-	// the Array's capacity.
+	// HeartbeatSlots is how many userspace_heartbeat Array slots the zero-init
+	// loop must write: the Array's whole capacity (#6702 blocker 2). It is
+	// deliberately NOT derived from Workers — a heartbeat slot is indexed by
+	// BINDING slot, and the binding count is not a function of the worker
+	// count. See heartbeatZeroSlotBound.
 	HeartbeatSlots uint32
 }
 
@@ -1650,7 +1667,7 @@ func planUserspaceWorkers(workers int, heartbeatMapCap uint32) userspaceWorkerPl
 	w := effectiveWorkers(workers, heartbeatMapCap)
 	return userspaceWorkerPlan{
 		Workers:        uint32(w),
-		HeartbeatSlots: heartbeatZeroSlots(w, heartbeatMapCap),
+		HeartbeatSlots: heartbeatZeroSlotBound(heartbeatMapCap),
 	}
 }
 
