@@ -66,6 +66,21 @@ func (m *Manager) SetKernelUpgradeHold() {
 	}
 }
 
+// KernelUpgradeHoldReason is the operator-facing explanation rendered wherever
+// a node is held SECONDARY by the kernel-candidate promotion gate (#6495).
+//
+// ONE string, used by `show chassis cluster status`, `show chassis cluster
+// information` and `show system kernel-upgrade`. An operator comparing those
+// during a kernel roll must not have to decide whether two phrasings mean the
+// same hold — and a node parked SECONDARY here is otherwise indistinguishable
+// from one demoted by a monitor failure or a manual failover.
+//
+// It lives HERE, next to the flag it explains, rather than in pkg/upgrade:
+// pkg/cluster owns the hold (the flag, the election gate, the status
+// annotation), pkg/upgrade only records what was armed. The daemon carries the
+// string across when it assembles the kernel-upgrade status.
+const KernelUpgradeHoldReason = "kernel-candidate promotion gate (held until the promotion marker confirms the running kernel)"
+
 // KernelUpgradeHeld reports whether the kernel-upgrade election hold is set.
 // Used by the daemon's reconcile loop to release the hold against the durable
 // promotion marker: the promotion gate runs in a SEPARATE process

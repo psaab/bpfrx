@@ -7,6 +7,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -498,6 +499,16 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "core-dumps":
 		s.showCoreDumps(cfg, &buf)
+
+	case "kernel-upgrade":
+		// #6495: the LANE-1 kernel channel, in-band. Rendered through
+		// pkg/upgrade so this and the in-process CLI cannot disagree about a
+		// node mid-roll.
+		st := upgrade.ChannelStatus{}
+		if s.kernelUpgradeStatusFn != nil {
+			st = s.kernelUpgradeStatusFn()
+		}
+		upgrade.RenderChannelStatus(&buf, st)
 
 	case "task":
 		s.showTask(cfg, &buf)

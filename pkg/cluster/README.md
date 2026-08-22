@@ -209,6 +209,34 @@ every election gate still declines to promote it. `FormatStatus` /
 `Takeover ready:` and treats `no` as a blocker, which is the intended reading —
 a holding RG genuinely cannot take over yet.
 
+**The kernel-upgrade election hold is annotated too (#6495).** On a #1930
+candidate trial boot the daemon sets `kernelUpgradeHold`, which unconditionally
+holds the node SECONDARY until the promotion marker confirms the running
+kernel. Until #6495 nothing rendered it, so a node parked SECONDARY by the
+*expected gate* was indistinguishable from one demoted by a monitor failure or
+a manual failover — during exactly the maintenance window where an operator is
+deciding whether what they see is normal. `FormatStatus` and
+`FormatInformation` now emit a `Held secondary: <reason>` line keyed on the
+flag, using the shared `KernelUpgradeHoldReason` constant (defined next to the
+flag in `kernel_selfrecover.go`) that `show system kernel-upgrade` also renders.
+
+Two properties of that line are load-bearing rather than cosmetic:
+
+- It is **node-scoped and rendered once**, in the node header rather than
+  inside the per-RG loop. The hold holds the whole node regardless of how many
+  redundancy groups exist, and a node with no RGs configured yet would render
+  nothing at all from inside the loop.
+- It sits **above every `Redundancy group:` header** and its first field is
+  `Held`, not a node token. `deploy_rolling_secondary_node`
+  (`test/incus/deploy-lib.sh`) picks the RG0 secondary by awk-matching
+  `$1 == "node0"` inside an RG block, and a rolling cluster deploy uses that
+  answer to decide which node to restart first — a line it misread would
+  restart the PRIMARY first and cause a spurious mid-deploy failover (#4009).
+
+The hold does **not** degrade `Local node:` health. The node is healthy; it is
+deliberately not eligible. Folding it into health would tell the operator
+something false and send them chasing a fault that does not exist.
+
 `DefaultTakeoverHoldTime` is **0**: with `set chassis cluster
 takeover-hold-time` unset the gate is readiness-only and both renders are
 byte-identical to their pre-#103 form. It shipped at 3s in `91a57cf` and was

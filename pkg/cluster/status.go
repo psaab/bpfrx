@@ -19,6 +19,7 @@ func (m *Manager) FormatStatus() string {
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	configSyncFailing := m.configSyncFailing // #6387: node-global CF annotation
 	takeoverHold := m.takeoverHoldTime       // #103: hold is part of eligibility
+	kernelHold := m.kernelUpgradeHold        // #6495: kernel-candidate trial hold
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -32,7 +33,29 @@ func (m *Manager) FormatStatus() string {
 	fmt.Fprintln(&b, "    CF  Config Sync monitoring")
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "Cluster ID: %d\n", m.clusterID)
-	fmt.Fprintf(&b, "Node name: node%d\n\n", m.nodeID)
+	fmt.Fprintf(&b, "Node name: node%d\n", m.nodeID)
+	// #6495: a node parked SECONDARY by the kernel-candidate promotion gate is
+	// otherwise INDISTINGUISHABLE from one demoted by a monitor failure or a
+	// manual failover. That is the wrong ambiguity to leave during a kernel
+	// roll, which is exactly when an operator is deciding whether what they
+	// are looking at is the expected gate or a real problem.
+	//
+	// NODE-scoped, so it is rendered ONCE here and not per-RG: the hold holds
+	// the whole node SECONDARY regardless of how many redundancy groups exist,
+	// and a node with no RGs configured yet would show nothing at all from
+	// inside the per-RG loop.
+	//
+	// Position is load-bearing. deploy_rolling_secondary_node
+	// (test/incus/deploy-lib.sh) picks the RG0 secondary by awk-matching
+	// $1 == "node0" INSIDE a "Redundancy group: N" block. This line sits above
+	// every such header (so no RG is in scope when awk reads it) and its first
+	// field is "Held", not a node token — a line that could be read as a node
+	// row would steer a rolling cluster deploy into restarting the PRIMARY
+	// first (#4009).
+	if kernelHold {
+		fmt.Fprintf(&b, "Held secondary: %s\n", KernelUpgradeHoldReason)
+	}
+	fmt.Fprintln(&b)
 	if localVersion != "" {
 		fmt.Fprintf(&b, "Software version: %s\n", localVersion)
 	}
@@ -140,6 +163,7 @@ func (m *Manager) FormatInformation() string {
 	configSyncFailing := m.configSyncFailing   // #6387
 	configSyncReason := m.configSyncFailReason // #6387
 	takeoverHold := m.takeoverHoldTime         // #103
+	kernelHold := m.kernelUpgradeHold          // #6495
 	m.mu.RUnlock()
 
 	states := m.GroupStates()
@@ -218,6 +242,13 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintln(&b, "Node health:")
 	fmt.Fprintf(&b, "  Local node: %s\n", localHealth)
 	fmt.Fprintf(&b, "  Remote node: %s\n", remoteHealth)
+	// #6495: name the kernel-upgrade election hold here too. It does NOT
+	// degrade node health — the node is fine, it is deliberately not eligible —
+	// so it is its own line rather than folded into localHealth, which would
+	// tell the operator something false about the node.
+	if kernelHold {
+		fmt.Fprintf(&b, "  Held secondary: %s\n", KernelUpgradeHoldReason)
+	}
 	fmt.Fprintln(&b)
 
 	// Per-RG details with event history.

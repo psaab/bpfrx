@@ -133,6 +133,10 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		Cluster:    d.cluster,
 		DHCP:       d.dhcp,
 		DHCPServer: d.dhcpServer,
+		// #6495: the #1930 kernel-channel state for `show system
+		// kernel-upgrade`. Same assembly the in-process CLI reads
+		// (daemon_run.go SetKernelUpgradeStatusFn).
+		KernelUpgradeStatusFn: d.kernelUpgradeStatus,
 		RPMResultsFn: func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()

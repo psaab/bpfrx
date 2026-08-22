@@ -135,6 +135,10 @@ func (c *ctl) handleShowSystem(args []string) error {
 		return c.showSystemInfo("boot-messages")
 	case "core-dumps":
 		return c.showText("core-dumps")
+	case "kernel-upgrade":
+		// #6495: the #1930 kernel-channel state, rendered daemon-side through
+		// pkg/upgrade — the same implementation the console CLI uses.
+		return c.showText("kernel-upgrade")
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}

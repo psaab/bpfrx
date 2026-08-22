@@ -42,6 +42,7 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -130,6 +131,12 @@ type Config struct {
 	// unit-test / no-daemon build, where showSystemServices falls back to the
 	// documented loopback defaults.
 	ListenersFn func() sysservices.Listeners
+	// KernelUpgradeStatusFn returns the #1930 kernel-channel state for
+	// `show system kernel-upgrade` (#6495). Wired by the daemon, which reads
+	// the durable journal + promotion marker + last-roll record and supplies
+	// the cluster hold reason it alone knows. nil in a unit-test / no-daemon
+	// build, where the topic reports an idle channel.
+	KernelUpgradeStatusFn func() upgrade.ChannelStatus
 	// PeerLookupFn overrides how the primary listener's #5278 authorization
 	// gate learns which local account owns a connection. Production leaves it
 	// nil and the gate calls authz.LookupPeer, which reads the kernel's socket
@@ -179,6 +186,9 @@ type Server struct {
 	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
 	// no-daemon unit-test build.
 	listenersFn func() sysservices.Listeners
+	// kernelUpgradeStatusFn backs the `kernel-upgrade` ShowText topic (#6495).
+	// Wired from Config.KernelUpgradeStatusFn; nil in a no-daemon unit build.
+	kernelUpgradeStatusFn func() upgrade.ChannelStatus
 	// requestedAddr is the primary gRPC bind requested at construction
 	// (--grpc-addr). Immutable, so it is read without effMu; it is the fallback
 	// address reported while pre-bind and on a bind failure (#6385/#6401).
@@ -315,6 +325,7 @@ func NewServer(addr string, cfg Config) *Server {
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
 		listenersFn:           cfg.ListenersFn,
+		kernelUpgradeStatusFn: cfg.KernelUpgradeStatusFn,
 		peerLookupFn:          cfg.PeerLookupFn,
 	}
 }

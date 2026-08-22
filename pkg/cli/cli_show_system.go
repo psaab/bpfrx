@@ -14,6 +14,7 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"golang.org/x/sys/unix"
 )
 
@@ -232,6 +233,23 @@ func (c *CLI) showCoreDumps() error {
 	if !found {
 		fmt.Println("No core dumps found")
 	}
+	return nil
+}
+
+// showKernelUpgrade renders the #1930 LANE-1 kernel-channel state (#6495):
+// the armed candidate, the durable promotion marker, the last completed roll
+// and its reason, and whether this node is being held SECONDARY by the
+// promotion gate.
+//
+// Renders through pkg/upgrade, the same implementation the gRPC ShowText path
+// uses, so the console and the remote `cli` cannot tell an operator two
+// different things about one node mid-roll.
+func (c *CLI) showKernelUpgrade() error {
+	st := upgrade.ChannelStatus{}
+	if c.kernelUpgradeStatusFn != nil {
+		st = c.kernelUpgradeStatusFn()
+	}
+	upgrade.RenderChannelStatus(os.Stdout, st)
 	return nil
 }
 
@@ -1074,6 +1092,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 
 	case "core-dumps":
 		return c.showCoreDumps()
+
+	case "kernel-upgrade":
+		return c.showKernelUpgrade()
 
 	case "license":
 		fmt.Println("License: open-source (no license required)")

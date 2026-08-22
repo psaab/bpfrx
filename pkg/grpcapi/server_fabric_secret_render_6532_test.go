@@ -128,6 +128,7 @@ var showTextAuditTopics = []string{
 	"firewall", "flow-monitoring", "flow-monitoring-statistics",
 	"flow-statistics", "flow-timeouts", "flow-traceoptions", "forwarding-options",
 	"forwarding-options-port-mirroring", "ike", "interfaces-detail",
+	"kernel-upgrade",
 	"interfaces-extensive", "interfaces-statistics", "internet-options",
 	"ipsec-statistics", "ipv6-router-advertisement", "lldp", "lldp-neighbors",
 	"log", "login", "nat64", "nat-dest-rule-detail", "nat-nptv6",

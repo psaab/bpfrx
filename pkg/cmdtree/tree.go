@@ -692,6 +692,7 @@ var OperationalTree = map[string]*Node{
 				"detail": {Desc: "Show detailed per-map statistics"},
 			}},
 			"internet-options": {Desc: "Show internet options"},
+			"kernel-upgrade":   {Desc: "Show kernel-upgrade channel state (armed candidate, promotion marker, last roll)"},
 			"license":          {Desc: "Show system license"},
 			"login":            {Desc: "Show login configuration"},
 			"memory":           {Desc: "Show system memory usage"},
