@@ -1702,13 +1702,55 @@ emits nothing and every one of its policies keeps the warning — never a deny
 widened past the permit's destination scope.
 
 **Un-representable remainder (keeps the commit warning below):** feed-tainted
-source **or destination**, multi-term / ALG application, an application scoped
-to an IPsec/ident exempt tuple, a **destination-scoped `permit`**, a
-scheduler-gated policy, a `tcp-rst` ingress zone (silent drop would diverge from
-Junos's RST verdict class), `reject`, and the "deny non-permitted" half of a
-source-restricted `permit` (the reject and source-restricted-permit slices are
-tracked follow-ups using the identical machinery). No partial/coarsened kernel
-rule is ever emitted for the remainder.
+source **or destination**, a **MIXED direct+term** or ALG-bearing application, an
+application scoped to an IPsec/ident exempt tuple, a **destination-scoped or
+destination-excluded `permit`**, a scheduler-gated policy, a `tcp-rst` ingress
+zone (silent drop would diverge from Junos's RST verdict class), `reject`, and
+the "deny non-permitted" half of a source-restricted `permit` (the reject and
+source-restricted-permit slices are tracked follow-ups using the identical
+machinery). No partial/coarsened kernel rule is ever emitted for the remainder.
+
+A **pure multi-term** application is NOT in that remainder, contrary to earlier
+revisions of this paragraph. A `term`-bearing application with no direct match
+body compiles to an implicit application-SET — the parent struct is discarded and
+each term is stored as its own application (`compiler_applications.go`) — so
+`junosHostResolveApplications` takes the application-set branch and OR-expands
+every term into its own L4 fragment, exactly as the representable subset above
+describes for application-sets. The deny IS enforced, so the hazard on this row
+is the inverse of the one previously documented: a PARTIAL expansion would render
+a kernel deny **silently narrower** than authored. Only a MIXED direct+term
+application is un-representable (`MixedDirectTermApps`), and the strict structure
+gate hard-rejects that at commit before it can reach the projection.
+
+**Each member of this remainder owes BOTH halves.** "No kernel rule is rendered"
+AND "the #4168 warning fires naming the policy" — either alone is satisfiable by
+a bug, and a policy that renders nothing while saying nothing is the silent
+failure this projection exists to avoid.
+`pkg/dataplane/userspace/junos_host_residual_6612_test.go` asserts both halves per
+class, and gives every row a FLIP (the same fixture with the residual attribute
+neutralised) so a row cannot pass because the fixture was broken in some other
+way. Covered today: scheduler-gated deny, feed-bound source, feed-bound
+destination, `reject`, `tcp-rst` zone, ALG application, IKE-exempt-tuple
+application, source-restricted permit.
+
+**Open: a destination-scoped `permit` renders nothing AND warns nothing (#6612).**
+Measured, such a policy produces zero warnings of any kind at commit. The
+projection correctly refuses to render it
+(`junosHostProjectTerm`: `p.Action != PolicyDeny && (junosHostAddrScoped(dest) ||
+DestinationAddressExcluded)`), but `junosHostPolicyStricterThanCoarseGate`
+(`pkg/config/compiler_validate_warn_host_inbound.go`) admits a permit as
+stricter-than-coarse only through `junosHostPolicySourceScoped`, which inspects
+the SOURCE dimension alone — so the two halves disagree: the projection knows it
+cannot enforce the policy and the warning never says so. The fix is one clause
+keying the warning on the SAME expression the projection uses, so they cannot
+drift. Until it lands, the rendered-nothing half is locked by
+`TestJunosHostDestinationScopedPermitRendersNothing6612` and the missing half is
+named there.
+
+The third dimension, an APPLICATION-scoped permit, has the same silent shape and
+is tracked separately in #7374: it needs a comparison against the zone's
+EFFECTIVE admit set rather than a token test, because a syntactic
+"application != any" rule would warn on configs that have no gap at all.
 
 ### Commit-time warning (direction c — shipped; now suppressed on render)
 
