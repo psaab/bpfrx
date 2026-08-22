@@ -1,3 +1,32 @@
+## 2026-08-21 — #6591 post-deploy primary reassert is fail-closed
+
+- **Timestamp**: 2026-08-21
+- **Action**: The issue text was STALE — the transfer step it asks for
+  (`failover redundancy-group $rg node 0`) already exists. The live
+  defect is that the reassert FAILS OPEN: an unreadable
+  `show chassis cluster status` right after a deploy makes it iterate
+  zero RGs, warn, and return SUCCESS, so `DEPLOY_RC=0` with the cluster
+  inverted (node0 pri 200 secondary behind node1 pri 100 under
+  preempt=no). It also never verified the resulting role. Observed twice
+  firsthand on the shared gate as `FO_RC=2` at test-failover's preflight.
+  Moved the body into `deploy-lib.sh` so the existing mocked-incus
+  selftest can drive it; added a bounded retry on the status read (the
+  measured discriminator was settle time), a per-RG trailing reset, and
+  a fail-closed VERIFY that dies unless node0 reads `primary` for EVERY
+  RG. The verifier rejects an empty status — that is the fail-open cell.
+  Extended the selftest mock with `cli -c` (scripted status queue +
+  command log); the read index is FILE-backed because
+  `status=$(incus exec ...)` is a subshell and a variable increment
+  there is discarded.
+  Mutation matrix 7/7 RED: W1 fail-open restore, W2 no verification,
+  W3 empty status accepted, W4 some-RG-not-every-RG, W5 no transfer
+  (the original report), W6 no settle retry, W7 wiring reverted.
+  W6 initially GREEN because the first cell mutated a DEFAULT the
+  fixture overrides — re-cut against the loop itself.
+  NOT run on the cluster (shared; lead serializes).
+- **File(s)**: test/incus/deploy-lib.sh, test/incus/cluster-setup.sh,
+  test/incus/deploy-lib-selftest.sh, docs/testing.md
+
 ## 2026-08-21 — #6534 port-mirroring: dropped instances stop rendering as armed
 
 - **Timestamp**: 2026-08-21
