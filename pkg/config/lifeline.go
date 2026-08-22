@@ -36,12 +36,15 @@ func LifelineBaseName(name string) string {
 //     a configured `control-interface fxp1` SUBJECT to host-inbound deny scoping
 //     -> potential heartbeat drop -> HA split-brain.
 //
-// em0 (the canonical cluster-control default name) and the fabric prefix fab*
-// stay matched unconditionally in HostInboundLifelineInterface so the canonical
-// default-named configs remain byte-identical (#3070/#3172/#3224 behavior is
-// preserved). A standalone config (no chassis-cluster stanza) contributes no
-// extra names here, so its only lifeline is fxp0 (em0/fab* are no-ops because
-// such interfaces are not present) — #1960.
+// em0 (the canonical cluster-control default name) and the fabric device names
+// fab<N> stay matched unconditionally in HostInboundLifelineInterface so the
+// canonical default-named configs remain byte-identical (#3070/#3172/#3224
+// behavior is preserved). #5250 narrowed that second arm from the `fab` PREFIX
+// to `fab` + digits; a fabric interface under any other name must be DECLARED
+// (`fabric-interface` / `fabric1-interface`) to reach this set, which is the
+// #3277 path and is unaffected. A standalone config (no chassis-cluster stanza)
+// contributes no extra names here, so its only lifeline is fxp0 (em0/fab<N> are
+// no-ops because such interfaces are not present) — #1960.
 func HostInboundLifelineSet(cfg *Config) map[string]bool {
 	set := map[string]bool{"fxp0": true}
 	if cfg != nil && cfg.Chassis.Cluster != nil {
@@ -64,13 +67,23 @@ func HostInboundLifelineSet(cfg *Config) map[string]bool {
 // traffic on these would strand management or break HA. The base name (before
 // the unit suffix) is matched so "fxp0.0" / "em0.0" are caught too.
 //
-// #3682 design note (follow-up): the em0/fab* match is base-name-prefix based,
-// so a broader interface literally named "fab-foo" would also be exempted, and
-// a standalone config that merely happens to name an interface em0/fabX gets a
-// silent exception with no configured management/cluster role. Whether this
-// should be an EXACT / role-gated match rather than a prefix bypass is tracked
-// as a design question on the issue; #3682 changes VISIBILITY only, not the
-// matching semantics.
+// #5250 (A3-b2 F3): the unconditional fabric match is EXACT-SHAPED, not a bare
+// prefix. `strings.HasPrefix(base, "fab")` admitted every name that merely
+// STARTS with "fab" — "fab-foo", "fabric-guest", "fabX" — and admission here is
+// not cosmetic: junosHostNonLifelineRefs (junos_host_deny.go:308) and
+// JunosHostZoneIngressNetdevs (:1147) both SKIP a lifeline, so a host-inbound
+// `deny` policy naming such an interface produced no kernel rule at all. The
+// only fabric devices the daemon ever creates are `fab0` and `fab1`
+// (CleanupFabricIPVLANs, pkg/daemon/daemon_ha_fabric.go:153), and the config
+// form is an interface literally named `fab<N>` carrying `fabric-options
+// member-interfaces` (compiler_derivations.go:131), so `fab` + digits is the
+// whole legitimate population. Anything else is now an ordinary interface and
+// is subject to host-inbound deny like any other.
+//
+// The #3682 design note this replaces recorded the over-broad prefix as an open
+// design question; it is answered here rather than left open. The em0 arm was
+// already exact and is unchanged — a standalone config that names an interface
+// em0 still gets the historical exception (#3070/#3172/#3224 byte-identical).
 func HostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
 	base := LifelineBaseName(name)
 	if base == "" {
@@ -79,5 +92,23 @@ func HostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
 	if lifelines[base] {
 		return true
 	}
-	return base == "em0" || strings.HasPrefix(base, "fab")
+	return base == "em0" || isFabricDeviceName(base)
+}
+
+// isFabricDeviceName reports whether base is a fabric device name in the only
+// shape the daemon creates or the compiler derives: the literal "fab" followed
+// by one or more DIGITS and nothing else ("fab0", "fab1", "fab10"). Written as
+// a scan rather than a regexp so it stays allocation-free on the config-compile
+// path and cannot be defeated by a regexp missing its anchors.
+func isFabricDeviceName(base string) bool {
+	const prefix = "fab"
+	if len(base) <= len(prefix) || base[:len(prefix)] != prefix {
+		return false
+	}
+	for i := len(prefix); i < len(base); i++ {
+		if base[i] < '0' || base[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -2583,7 +2583,7 @@ The two spellings disagree — exactly what splitting the packed line exists to
 prevent. It is not fixed, because the stolen token must sit in entry-NAME
 position and no legal Junos interface name or IP address collides with a
 registered keyword (`ge-*`/`xe-*`/`et-*`, `reth*`, `fxp*`, `em*`, `lo0`, `st0`,
-`ae*`, `fab*`, `irb`, `vlan`), so it is unreachable from a real config rather
+`ae*`, `fab<N>`, `irb`, `vlan`), so it is unreachable from a real config rather
 than merely unlikely. There is deliberately no test pinning the divergence —
 that would assert the wrong answer is correct — and none asserting "keyword is
 not an interface name" either, because the project has no canonical
@@ -3247,7 +3247,7 @@ address OR VRRP VIP — is host-inbound-reachable from more than one **distinct
 effective host-inbound token set**. It keys on *differing* sets (via the shared
 `config.CanonicalHostInboundTokenSig`), NOT merely ">1 zone", so a deliberate
 duplicate with **identical** service sets across its zones is allowed (no false
-positive), and management/cluster-control lifeline interfaces (fxp0 / em0 / fab*)
+positive), and management/cluster-control lifeline interfaces (fxp0 / em0 / fab<N>)
 are excluded. Lenient downgrade to a `cfg.Warnings` entry on the tolerant load /
 peer-sync path (`lenientDuplicateHostLocalAddress`, #1960 no-brick); the runtime
 `dpuserspace.AmbiguousHostInboundAddresses` reporter + the

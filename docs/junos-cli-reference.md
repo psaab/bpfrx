@@ -427,13 +427,13 @@ From zone: guest, To zone: lan
     enforcement surfaces flip together: the kernel-nft chain scopes a catch-all
     DROP to the zone's addresses, and the Rust AF_XDP classifier inserts the
     zone with an empty admission set. The lifeline interfaces (fxp0 / em0 /
-    fab*) are excluded from the deny address sets and the global ICMP / IPv6 ND
+    fab<N>) are excluded from the deny address sets and the global ICMP / IPv6 ND
     / PMTUD / established-session accepts precede every deny, so the default-deny
     cannot strand management or break HA. (All shipped reference configs already
     declare a `host-inbound-traffic` stanza per zone, so they are unaffected.)
   - **Lifeline-exemption visibility (#3682):** the lifeline exclusion above is
     an IMPLICIT policy exception — a zone-assigned interface whose base name is a
-    lifeline (`fxp0` / `em0` / `fab*`, plus a configured chassis-cluster
+    lifeline (`fxp0` / `em0` / `fab<N>`, plus a configured chassis-cluster
     `control-interface` / `fabric-interface` / secondary fabric) is EXCLUDED from
     that zone's host-inbound deny scoping and always admits host-bound traffic
     regardless of the zone's admission set. Before #3682 no rendered zone view
@@ -448,10 +448,16 @@ From zone: guest, To zone: lan
     (`pkg/config/lifeline.go`), shared by the dataplane deny-scoping path and the
     display presenter so enforcement and audit can never drift. This is a
     VISIBILITY change only — the exemption semantics are unchanged. (Design
-    follow-up: the `em0`/`fab*` match is a base-name PREFIX, so a broader
-    interface literally named `fab-foo`, or a standalone config that merely names
-    an interface `em0`/`fabX` with no configured cluster role, is exempted too;
-    whether this should be an EXACT / role-gated match is tracked on #3682.)
+    follow-up, ANSWERED in #5250: the unconditional fabric match was a base-name
+    PREFIX, so an interface literally named `fab-foo` / `fabric` / `fabX` was
+    exempted with no configured cluster role. It is now `fab` followed by
+    DIGITS — `fab0`, `fab1`, `fab<N>` — which is the only shape the daemon
+    creates (`CleanupFabricIPVLANs`) or the compiler derives. A fabric interface
+    under any other name must be DECLARED as `fabric-interface` /
+    `fabric1-interface` / `control-interface` to stay exempt, which is the #3277
+    config-derived path and is unchanged. The `em0` arm was already EXACT and is
+    unchanged, so a standalone config that names an interface `em0` still gets
+    the historical exception.)
   - **Host-inbound deny accounting (#3326):** a host-bound packet dropped by
     the `host-inbound-traffic` admission gate (a service/protocol not in the
     ingress zone's set) now increments the host-inbound deny counter, surfaced
@@ -703,7 +709,7 @@ From zone: guest, To zone: lan
     Resolving the VIPs from config scopes the deny identically on both nodes
     regardless of mastership; on the master the live address dedups so the rule
     set is byte-identical. Management/cluster-control lifeline interfaces
-    (fxp0/em0/fab*) are still excluded — a VIP on em0 is never scoped — and
+    (fxp0/em0/fab<N>) are still excluded — a VIP on em0 is never scoped — and
     standalone (no-VRRP) zones are unchanged.
   - **Per-interface host-inbound override (#3362):** Junos models
     `host-inbound-traffic` at BOTH the zone level (`set security zones
@@ -757,15 +763,15 @@ From zone: guest, To zone: lan
     (`HostInboundView.Render`), it propagates to all six #3654 surfaces.
   - **Lifeline set derived from cluster config (#3277):** the lifeline
     interfaces excluded from host-inbound deny scoping are no longer a fixed
-    fxp0/em0/fab* hardcode. The set is now `fxp0` (always-mgmt) UNION the
+    fxp0/em0/fab<N> hardcode. The set is now `fxp0` (always-mgmt) UNION the
     configured chassis-cluster `control-interface` and `fabric-interface` /
     `fabric1-interface` names, UNION the backward-compatible defaults em0 and
-    fab*. So a deployment whose control/heartbeat link rides a non-default name
+    fab<N>. So a deployment whose control/heartbeat link rides a non-default name
     (e.g. `set chassis cluster control-interface fxp1`) has that interface
     correctly excluded — its address is never subjected to a host-inbound deny,
     closing a latent HA split-brain (heartbeat drop) gap that would surface once
     the control zone's host-inbound set is scoped rather than full-admit.
-    Canonical em0/fab*-named configs are byte-identical (the defaults still
+    Canonical em0/fab<N>-named configs are byte-identical (the defaults still
     match unconditionally); a standalone config with no chassis-cluster stanza
     keeps fxp0 as its only lifeline (#1960).
   - **Lifeline fail-safe:** enforcement is strictly MATCH-DRIVEN. If NO
@@ -1057,7 +1063,7 @@ DENIES — a false-admission diagnosis. Two changes remove it:
   interface's EFFECTIVE view (zone-level ∪ that interface's override), so the
   reported admission is that interface's TRUE posture (admit vs deny), not a
   zone-wide fold. The ref must name an interface assigned to `from-zone`; an
-  unknown, zone-mismatched, or management/cluster lifeline (fxp0/em0/fab*) ref is
+  unknown, zone-mismatched, or management/cluster lifeline (fxp0/em0/fab<N>) ref is
   rejected fail-closed (the lifeline is served unconditionally, so a
   per-interface verdict would itself be false). Example: `show security
   match-policies from-zone trust to-zone junos-host protocol tcp destination-port
