@@ -419,7 +419,27 @@ func redirectHost(u *url.URL) string {
 // bounding the map to current config under binding churn.
 type httpClientCache struct {
 	mu      sync.Mutex
-	clients map[string]*http.Client
+	clients map[string]*cachedBoundClient
+}
+
+// cachedBoundClient is a cached client plus the RESOLVED binding it was built
+// with (#6754).
+//
+// The cache key stays the raw config leaves so the #2956 reap stays consistent,
+// but the value a client is actually bound to is resolved — bindDevice comes
+// from config.ResolveKernelIfName, whose output is a function of the WHOLE
+// committed config (reth→physical member, the tunnel name map, the IRB→bridge
+// map, SecureTunnelUnitNetdev, unit-vs-vlan-id). So the resolved device can
+// change while all three key leaves stay byte-identical: move reth0's active
+// member and `destination-interface reth0.50` keeps its key and silently keeps
+// SO_BINDTODEVICE on the OLD physical device.
+//
+// Holding the resolved binding alongside the client lets a hit verify that the
+// resolution still matches before reusing the pool, which is the check the raw
+// key structurally cannot make.
+type cachedBoundClient struct {
+	client *http.Client
+	bind   bindConfig
 }
 
 // closeIdleConns is the seam reap uses to drop a superseded client's keep-alive
@@ -430,7 +450,7 @@ var closeIdleConns = func(cl *http.Client) { cl.CloseIdleConnections() }
 
 // newHTTPClientCache builds an empty per-binding client cache.
 func newHTTPClientCache() *httpClientCache {
-	return &httpClientCache{clients: map[string]*http.Client{}}
+	return &httpClientCache{clients: map[string]*cachedBoundClient{}}
 }
 
 // bindCacheKey is the stable cache key for a provider's source binding. It is
@@ -468,11 +488,20 @@ func (c *httpClientCache) clientFor(p *config.DDNSProvider, resolveIf ...func(st
 	key := bindCacheKey(p)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cl, ok := c.clients[key]; ok {
-		return cl, nil
+	if ent, ok := c.clients[key]; ok {
+		if ent.bind == b {
+			return ent.client, nil
+		}
+		// #6754: same raw leaves, DIFFERENT resolved binding. The old client's
+		// SO_BINDTODEVICE points at a device this provider no longer egresses
+		// from, so reusing it would keep publishing from the wrong interface
+		// with no error anywhere. Release its idle pool — the reap keys on the
+		// binding leaves, which have NOT changed, so it would never collect
+		// this transport — and rebuild.
+		closeIdleConns(ent.client)
 	}
 	cl := newHTTPClientBound(b)
-	c.clients[key] = cl
+	c.clients[key] = &cachedBoundClient{client: cl, bind: b}
 	return cl, nil
 }
 
@@ -492,11 +521,11 @@ func (c *httpClientCache) reap(live map[string]struct{}) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for key, cl := range c.clients {
+	for key, ent := range c.clients {
 		if _, ok := live[key]; ok {
 			continue
 		}
-		closeIdleConns(cl)
+		closeIdleConns(ent.client)
 		delete(c.clients, key)
 	}
 }

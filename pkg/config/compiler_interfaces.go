@@ -369,7 +369,27 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 					afNodes = append(afNodes, familyNode.Children...)
 				}
 				for _, afNode := range afNodes {
-					afName := afNode.Keys[0]
+					// #7522: Name() rather than Keys[0]. It returns "" for an
+					// empty Keys slice, where Keys[0] panics with index out of
+					// range. afNodes is either familyNode itself (len(Keys) >= 2
+					// by the branch above, so safe) or familyNode.Children —
+					// and a CHILD's Keys are not structurally guaranteed
+					// non-empty once the tree can come from anywhere but the
+					// parser.
+					//
+					// The live parser and SetPath paths do guarantee
+					// len(Keys) >= 1, so this only bites a malformed persisted
+					// AST — pkg/configstore/db.go's plain json.Unmarshal has no
+					// Node validator — or a handcrafted tree. A bad persisted
+					// state must ERROR on load, never panic (#1960
+					// fail-closed-on-load). Same fix and same reasoning as
+					// #4827 applied to the sibling firewall family walkers.
+					//
+					// An empty afName matches no address family below and the
+					// unit is compiled without one, which is the same outcome as
+					// an unrecognised family name — it does not silently adopt a
+					// neighbour's family.
+					afName := afNode.Name()
 					if len(afNode.Keys) >= 2 {
 						afName = afNode.Keys[1]
 					}

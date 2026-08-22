@@ -1071,8 +1071,11 @@ func resolveIPMonitoringInterfaceNextHop(cfg *Config, polName string, pr *Prefer
 		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q is not a valid IP address or DHCP interface unit (interface units use the configured Junos name, e.g. ge-0/0/3.0)",
 			polName, pr.Destination, val)
 	}
-	if strings.HasPrefix(ifdName, "fxp") || strings.HasPrefix(ifdName, "em") ||
-		strings.HasPrefix(ifdName, "fab") {
+	// #7515: IsManagementIfName is the SSOT this must agree with. This refusal is
+	// only truthful while it matches the class the daemon actually binds to
+	// vrf-mgmt — that binding is WHY the lease is excluded from FRR, which is
+	// what makes it unusable as a preferred-route next-hop.
+	if IsManagementIfName(ifdName) {
 		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q names a management interface; management leases cannot back an ip-monitoring preferred route",
 			polName, pr.Destination, val)
 	}

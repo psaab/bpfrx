@@ -95,3 +95,37 @@ func IsTunnelOrLoopbackIfName(base string) bool {
 	}
 	return false
 }
+
+// IsManagementIfName reports whether name is in the MANAGEMENT interface class —
+// the names the daemon binds to `vrf-mgmt`.
+//
+// It is the SSOT for a rule that was previously restated verbatim at three
+// sites, where a divergence is always a bug rather than a legitimate difference:
+//
+//   - `pkg/daemon/daemon_apply_interfaces.go` builds the management-VRF
+//     interface set, which decides which leases `collectDHCPRoutes` EXCLUDES
+//     from FRR (their routes go into table 999 by netlink instead);
+//   - `pkg/dataplane/compiler_iface.go` emits `VRF=vrf-mgmt` into the
+//     interface's `.network` file so `networkctl reconfigure` preserves that
+//     binding;
+//   - `pkg/config/compiler_services.go` refuses such an interface as an
+//     ip-monitoring preferred-route next-hop, precisely BECAUSE its lease is
+//     excluded from FRR.
+//
+// The third only tells the truth while it agrees with the first two. Three
+// copies of a prefix list cannot be kept in agreement by convention.
+//
+// DELIBERATELY LOOSER THAN isCanonicalFabricName (lifeline.go), and the two must
+// not be merged. That predicate answers "is this one of the daemon-CREATED
+// fabric devices" for host-inbound lifeline exemption, and it excludes
+// `fabric0`. This one answers "does the daemon bind this to vrf-mgmt", and today
+// it DOES bind `fabric0` — so an ip-monitoring next-hop on `fabric0` is refused
+// truthfully, not spuriously. Narrowing this class to match would change which
+// interfaces land in the management VRF and therefore which DHCP routes FRR
+// owns: a behaviour decision, tracked separately, and one this SSOT reduces to a
+// single edit.
+func IsManagementIfName(name string) bool {
+	return strings.HasPrefix(name, "fxp") ||
+		strings.HasPrefix(name, "fab") ||
+		strings.HasPrefix(name, "em")
+}

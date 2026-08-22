@@ -627,22 +627,18 @@ func (m *Manager) readDegradedPathStatsLocked() map[string]uint64 {
 // Note: VLAN sub-interfaces are skipped during userspace-shim swaps and may
 // retain the parent's program; they are excluded from this map.
 func (m *Manager) entryProgramsLocked() map[int]string {
-	links := m.bpfShim.XDPLinks()
-	if len(links) == 0 {
-		return nil
-	}
-	progName := m.bpfShim.XDPEntryProgram()
-	result := make(map[int]string, len(links))
-	for ifindex := range links {
-		if m.bpfShim.VlanSubInterfaces[ifindex] {
-			continue // VLAN sub-interfaces use parent's XDP program
-		}
-		result[ifindex] = progName
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
+	// #6740: ONE guarded accessor rather than three unsynchronised reads.
+	//
+	// This ran at 1 Hz and used to range the shim's LIVE xdpLinks map, index
+	// its exported VlanSubInterfaces map and read the entry-program name
+	// separately — while CompileUserspaceShim / AttachXDP / DetachXDP mutated
+	// those maps underneath. A concurrent Go map read+write is a fatal
+	// runtime.throw, so the status poll could kill the daemon outright.
+	//
+	// XDPEntryPrograms takes the shim's m.mu once and applies the VLAN skip
+	// against the same instant it read the link set, so this path no longer
+	// touches the manager's maps at all.
+	return m.bpfShim.XDPEntryPrograms()
 }
 
 // syncIngressIfaceMapLocked reconciles userspace_ingress_ifaces to the ingress

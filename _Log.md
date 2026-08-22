@@ -21752,7 +21752,11 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   scoped signature. Build/vet clean; `pkg/dataplane` (minus pre-existing
   unrelated `TestUserspaceManagerDoesNotImportReflectOrUnsafe`) + full
   `pkg/dataplane/userspace` GREEN under `-race`.
-- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
+- **Split**: the new accessor family pushed loader.go 1413 -> 1607, crossing the
+  1500 [WATCH] floor, so it moved to pkg/dataplane/link_maps.go (183 lines,
+  verbatim, md5 42e1227f2ffd). loader.go 1607 -> 1422, below where it started.
+- **File(s)**: pkg/dataplane/link_maps.go (new), pkg/dataplane/loader.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
 ## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
 - **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
 - **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
@@ -103878,3 +103882,120 @@ prose edit above them added. No diff falls in the new test body.
   deletes only when the closing session was the last holder.
 - **File(s)**: `userspace-dp/src/afxdp/checksum.rs`,
   `userspace-dp/src/afxdp/tests_decap_dnat_table.rs`
+## 2026-08-22 — #6740 guard the 1 Hz status-path link-map reads
+- **Timestamp**: 2026-08-22
+- **Action**: The 1 Hz userspace status path ranged the root Manager's LIVE
+  xdpLinks map and indexed the exported VlanSubInterfaces map while
+  CompileUserspaceShim/AttachXDP/DetachXDP mutated them — a concurrent Go map
+  read+write is a fatal runtime.throw, so the status poll could kill xpfd.
+  Unexported vlanSubInterfaces; made XDPLinks/TCLinks return SNAPSHOTS (handing
+  out the live map is what put the caller's range loop outside any lock the
+  accessor could take); added XDPEntryPrograms (one m.mu hold for all three
+  reads) and converted the status path to it; single-sourced the duplicated
+  vlanSubInterfaces writer into markVLANSubInterfaces; routed every remaining
+  raw map access through guarded per-entry helpers; snapshot-then-syscall in
+  swapXDPEntryProg and Close so no lock spans a netlink/BPF call.
+- **Self-inflicted bug caught by the new test**: the mechanical replacement that
+  routed raw accesses through helpers also rewrote the helper BODIES, making
+  setXDPLink/deleteXDPLink/setTCLink/deleteTCLink call themselves. Build, vet
+  and the whole pkg/dataplane suite passed with that in place; only the
+  concurrent test deadlocked and exposed it. Added a self-call audit.
+- **No control-socket traffic added** — this is a Go-side mutex only.
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go,
+  pkg/dataplane/armproof.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/xdplinks_status_race_6740_test.go (new),
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/userspace/attach_before_publish_5485_test.go
+
+## 2026-08-22 — #6744 kimi-review-003 cohort split
+- **Action**: Landed the stranded research plan as a record (review loop
+  unresumable — source report and per-round artifacts gone from /tmp), with a
+  measured staleness header; split the retained root causes into individual
+  issues.
+- **File(s)**: `docs/research/6744-kimi-review-003/plan.md`
+
+## 2026-08-22 — #6754 DDNS client cache validates the resolved bind device
+- **Timestamp**: 2026-08-22
+- **Action**: httpClientCache keyed on the raw binding leaves while the bound
+  device is resolved from the whole committed config, so a reth member move
+  left SO_BINDTODEVICE on the old device with the key unchanged. Cache entries
+  now carry the resolved bindConfig and a hit rebuilds when it differs,
+  releasing the superseded transport the #2956 reap could never collect.
+- **File(s)**: pkg/ddns/backend_http.go,
+  pkg/ddns/httpcache_resolved_bind_6754_test.go
+
+## 2026-08-22 — #7515 single-source the management-interface class
+- **Action**: `config.IsManagementIfName` is now the SSOT for the fxp/fab/em
+  class, previously restated VERBATIM at three sites: the daemon's management-VRF
+  set (`managementVRFIfaceSet`, extracted for testability), the networkd `VRF=`
+  emitter, and the ip-monitoring next-hop validator. Semantics preserved exactly
+  — no behaviour change. `isCanonicalFabricName` now calls the shared
+  `ifNameNumericSuffix` instead of carrying a second copy of the same formula.
+  Corrected the issue's premise: `emu0` IS management today (the daemon binds it
+  to vrf-mgmt via the same prefix), so the ip-monitoring refusal was truthful;
+  narrowing the class is a behaviour decision, filed separately.
+- **File(s)**: `pkg/config/ifname_class_6731.go`, `pkg/config/lifeline.go`,
+  `pkg/config/compiler_services.go`, `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/dataplane/compiler_iface.go`,
+  `pkg/config/mgmt_ifname_ssot_7515_test.go` (new),
+  `pkg/daemon/mgmt_vrf_ifaceset_ssot_7515_test.go` (new),
+  `pkg/dataplane/mgmt_vrf_networkd_ssot_7515_test.go` (new), `docs/multi-wan.md`
+
+## 2026-08-22 — #7532 vipWarnedIfaces gets its own mutex
+- **Timestamp**: 2026-08-22
+- **Action**: The field was reset on the apply path (applySem) and lazily
+  created/read/assigned/deleted on the VRRP reconcile path under no shared
+  lock — a reset between the nil-check and the assignment panics, two
+  reconcile writers are a fatal throw. Gave it a dedicated mutex and three
+  accessors; the check-and-record is now one critical section.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/vip_warn_sync_7532_test.go
+
+## 2026-08-22 — #6747 IKE exchange table: O(1) LRU eviction
+- **Action**: `IkeExchangeTable::seed` chose its eviction victim with
+  `entries.iter().min_by_key(seen)` — a full traversal of all 4096 entries plus
+  empty hashbrown slots, plus a key clone and a second hash lookup, all under a
+  lock `matches` takes on the hot admission path for every Responder-SPI IKE
+  packet, on a table Arc-shared by every packet worker. Replaced the
+  `Mutex<FastMap<Key,u64>>` with an intrusive LRU over a fixed slab (index ->
+  slot, prev/next u32 links, free list): touch unlinks and re-appends at the
+  tail, eviction pops the head. SEMANTICS UNCHANGED — `min_by_key(seen)` with
+  `matches` refreshing `seen` already was LRU, just computed by scanning — so
+  the existing availability reasoning holds verbatim. FIFO was rejected: it
+  removes the scan equally well but evicts a DPD-refreshed long-lived exchange
+  in favour of a brand-new forged initiation, worse under the flood the cap
+  exists for. Added the eviction counter the issue notes was missing.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/ipsec.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+
+## 2026-08-22 — #6748 GRE decap bounded by the outer IP datagram
+- **Action**: Native GRE decap capped the inner extent at `frame.len() -
+  inner_offset` with no cross-check against the outer IPv4 Total Length / IPv6
+  Payload Length, so a peer that appended a trailer past the outer datagram AND
+  inflated the inner IP Total Length to cover it had those out-of-datagram bytes
+  promoted into the decapsulated packet. NOT the mechanism the title implies —
+  `packet_trimmed_len` already kept the inner inside the frame and already
+  trimmed Ethernet padding, so bounding by the frame length would have fixed
+  nothing. Extracted `outer_datagram_end` from `gre_checksum_region` (which
+  already applied exactly this bound, to the checksum only — the asymmetry that
+  made this an oversight) and ran the GRE option-field skips and the inner
+  extraction on `frame[..outer_end]`. An over-declaring outer header is refused
+  rather than clamped. Negative control asserts an HONEST inner under ordinary
+  trailing padding still decaps byte-identically, so the fix is not a blanket
+  rejection of trailers. Checked the issue's "the same pattern is used by the
+  WireGuard decap path": the only other `packet_trimmed_len` callers are ENCAP
+  paths (gre.rs's outer builder and frame/wg.rs's), where no outer datagram
+  exists yet, so nothing to bound there.
+- **File(s)**: userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_gre_outer_bound_6748.rs (new),
+  docs/userspace-native-gre-plan.md
+
+## 2026-08-22 — #7522 malformed address-family node no longer panics
+- **Timestamp**: 2026-08-22
+- **Action**: compileInterfaces indexed afNode.Keys[0] with no bounds check; a
+  family child with empty Keys (reachable from a malformed persisted AST, which
+  configstore unmarshals with no Node validator) panicked. Switched to the
+  nil-safe Name(), matching #4827's fix on the sibling firewall walkers. Swept
+  pkg/config for the same shape: no other unguarded site.
+- **File(s)**: pkg/config/compiler_interfaces.go,
+  pkg/config/compiler_interfaces_malformed_af_7522_test.go
