@@ -99889,3 +99889,31 @@ prose edit above them added. No diff falls in the new test body.
   pkg/grpcapi/session_iface_identity_6960_test.go, pkg/api/sessions.go,
   pkg/api/session_iface_identity_6960_test.go, pkg/dataplane/types.go,
   userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-21 — #6368: config-epoch guard check→write made non-racy
+
+- **Timestamp**: 2026-08-21
+- **Action**: `configEpochStale` and `PutClusterSynced*` were not one critical
+  section: the check reads max(applyingConfigGen, lastAppliedConfigGen) and the
+  write lands several statements later on the receiveLoop while configApplyLoop
+  runs independently, so a descheduled receiveLoop could pass the check against
+  the pre-fence threshold and land its write after the deleted-policy sweep —
+  leaving a stale PERMIT nothing re-examines until the next config apply. The
+  issue called the window "a few instructions"; it is actually the whole of
+  OnConfigReceived (compile + promote + sweep), which is why this was worth
+  closing. Fix: re-read the threshold AFTER a successful write and roll the
+  session back via DeleteWithCompanions* (reason cluster-stale) when it has gone
+  stale, deliberately NOT recording the per-key generation so the peer's next
+  re-sync is admitted. Act-then-verify rather than a lock — serializing check
+  and write would hold a mutex across dataplane I/O on the bulk-install hot
+  path, which the #2198 F3 note refuses; the re-read costs one atomic load per
+  install. Four cells: v4 and v6 rollback (the apply lands INSIDE the write via
+  a new mockSweepDP onSetV4/onSetV6 hook), plus two anti-over-reject cells (an
+  uncontended install survives; an apply that is not newer than the session's
+  epoch leaves it alone). Mutation-proven against the VERBATIM pre-fix bytes
+  from origin/master. go vet clean, pkg/cluster green at -count=1, the
+  6368/5274/6284 cells green under -race. **Cluster/session-sync code: a
+  failover smoke is OWED.**
+- **File(s)**: pkg/cluster/sync_conn_gen.go,
+  pkg/cluster/sync_config_epoch_install_race_6368_test.go,
+  pkg/cluster/sync_test.go, docs/session-sync-architecture.md, _Log.md
