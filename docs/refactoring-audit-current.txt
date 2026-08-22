@@ -19,7 +19,6 @@
 [REFACTOR]   2092  userspace-dp/src/afxdp/frame/mod.rs
 [REFACTOR]   2074  pkg/dhcprelay/relay.go
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
-[REFACTOR]   2046  pkg/dataplane/userspace/maps_sync.go
 [REFACTOR]   2005  pkg/daemon/daemon_ha.go
 [WATCH]      1995  pkg/dataplane/compiler.go
 [WATCH]      1953  pkg/api/metrics_userspace.go
@@ -34,6 +33,7 @@
 [WATCH]      1776  pkg/config/types_system.go
 [WATCH]      1764  userspace-dp/src/screen/scan.rs
 [WATCH]      1685  pkg/api/server.go
+[WATCH]      1655  pkg/dataplane/userspace/maps_sync.go
 [WATCH]      1654  pkg/dataplane/compiler_iface.go
 [WATCH]      1652  pkg/cmdtree/tree.go
 [WATCH]      1608  userspace-dp/src/afxdp/poll_descriptor/filter.rs

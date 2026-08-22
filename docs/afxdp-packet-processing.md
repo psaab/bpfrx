@@ -34,7 +34,8 @@ The shim checks several conditions before redirecting a packet to userspace:
    `bpf/headers`, which only carries `MAX_INTERFACES`). Because the stride is
    fixed, BOTH sides bound the queue dimension:
    - **Write side.** The control plane
-     (`pkg/dataplane/userspace/maps_sync.go`) fails closed on two dimension
+     (`pkg/dataplane/userspace/helper_status_apply.go` for the apply path,
+     `maps_sync.go` for the watchdog) fails closed on two dimension
      overflows before writing any slot: a `queue_id >= 16` would alias the
      queue-0 slot of the adjacent ifindex (`ifindex*16 + 16 == (ifindex+1)*16`,
      #4894), and an `ifindex >= MAX_INTERFACES` would overflow the array cap

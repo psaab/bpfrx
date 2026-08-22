@@ -818,6 +818,27 @@ snap`, and there are two of them — one per acceptance path).
   book, applications, policies, NAT, static NAT, NAT64 prefixes, NPTv6,
   screen profiles, default policy, flow timeouts, firewall filters, flow
   config, port mirroring.
+  - **The NAT phases no longer build eBPF NAT map records (#6420).**
+    `compileNAT` / `compileStaticNAT` / `compileNAT64` (`compiler_nat.go`)
+    used to construct `SNATValue`, `SNATValueV6`, `SNATEgressValue`,
+    `NATPoolConfig`, `DNATValue`, static-NAT and `NAT64Config` records and
+    hand them to `SetSNATRule` / `SetDNATEntry` / `SetNATPoolConfig` / the
+    stale-NAT deleters. Every one of those writes landed nowhere: the only
+    production compile path is `Manager.CompileUserspaceShim`, whose
+    `userspaceShimCompileDataplane` implements each of them as `return nil`
+    (`loader.go`), and the AF_XDP helper receives NAT policy through the
+    config snapshot. The record construction was deleted; what the phases
+    still produce is what OUTLIVES the compile — `result.PoolIDs` /
+    `result.NextPoolID`, `result.NATCounterIDs`, the implicit
+    `_snat_match_<cidr>` entries in `result.AddrIDs`, the persistent-NAT
+    table (`GetPersistentNAT`, the one non-no-op dataplane call in the file),
+    and the compile-failing rejections (unknown zone/pool, a DNAT
+    match/pool address that is a prefix rather than a host, a mixed-family
+    static-NAT rule, a non-/96 NAT64 prefix, an empty NAT64 source pool).
+    `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms every retired writer
+    to FAIL and requires a clean validate, so a reintroduced write reds.
+    `compileNPTv6` still writes `nptv6_rules`; retiring that surface and the
+    `maps_nat.go` writers themselves is the sibling cleanup.
   - The pre-pass (`compiler_validate_4960.go`, #4960) re-runs the fallible
     HOST-PURE phases against a discarding dataplane BEFORE the zones phase
     performs the first destructive host netlink mutation, so a config that
