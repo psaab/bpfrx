@@ -366,6 +366,18 @@ func (g gateLeaf) site() string {
 	return strings.Join(append(append([]string{}, g.path...), g.leaf), " ")
 }
 
+// parentKey renders the leaf's PARENT path with synthetic names normalised, so
+// a gateParentPrereq row survives schema growth exactly as an allowlist row does.
+func (g gateLeaf) parentKey() string {
+	toks := append([]string{}, g.path...)
+	for i, t := range toks {
+		if isSyntheticName(t) {
+			toks[i] = "<*>"
+		}
+	}
+	return strings.Join(toks, " ")
+}
+
 func (g gateLeaf) siteKey() string {
 	toks := append(append([]string{}, g.path...), g.leaf)
 	for i, t := range toks {
@@ -553,45 +565,121 @@ var gateSpellingsScalar = []string{"A-hier-bracket", "B-hier-block", "D-set-brac
 //	"unstable" compiling identical input twice produced different output, so no
 //	           comparison here is trustworthy — excluded rather than risked
 //	"err"      a spelling failed to parse or compile
+//
+// ---------------------------------------------------------------------------
+// PARENT PREREQUISITES (#7492).
+//
+// The harness authors a leaf ALONE inside its synthetic parent path. Some
+// compilers refuse to build the container until a required sibling is present,
+// and then the leaf never reaches the compiler at all: every spelling compiles
+// to the same thing, the differential calls them all "inert", and the leaf drops
+// out of coverage entirely. #7484 measured 228 leaves in that state.
+//
+// A row here names the statement(s) that make the container materialise. It is
+// NOT an allowlist: it asserts nothing about the leaf, claims no defect, and
+// cannot hide one. The same text is injected into the zero-, one- and two-value
+// configs alike, so it cancels out of every comparison — it only decides whether
+// there is a comparison to make.
+//
+// SCOPE, MEASURED. A general mechanism was tried first and refuted: scaffolding
+// each parent with its own other childless leaves (values picked from the gate's
+// candidate pool) recovered 2 of 228. Per-parent recipes were then probed
+// directly, and most plausible ones do NOT work — `system syslog host <*>` with
+// `any any`, `interfaces <*> unit <*> tunnel` with source+destination,
+// `vrrp-group` with a virtual-address, and `dhcp-local-server ... interface`
+// with an `upto` sibling all still lose the value. Only rows verified end to end
+// belong here; the rest of the 228 is not a parent-path problem and is tracked
+// on #7492 rather than guessed at.
+//
+// Keyed by parentKey() (synthetic names normalised to <*>). Values are brace
+// statements; the set-spelling equivalent is derived by stripping the ";".
+// ---------------------------------------------------------------------------
+var gateParentPrereq = map[string]string{
+	// A BGP group with no neighbor is discarded wholesale by compileBGP, so
+	// every group-level leaf (description, authentication-key, hold-time, ...)
+	// looked inert. One neighbor is enough to make the group materialise.
+	// Verified: 13 leaves under `protocols bgp group <*>` move from no-verdict
+	// to compared.
+	"protocols bgp group <*>": "neighbor 10.211.199.1;",
+}
+
+// gateLeafPrereq returns the parent prerequisite for this leaf as a brace body
+// and as set-command tails. It is suppressed when the prerequisite would name
+// the very leaf under test, so a row can never author the value it is meant to
+// make observable.
+func gateLeafPrereq(g gateLeaf) (string, []string) {
+	body := gateParentPrereq[g.parentKey()]
+	if body == "" {
+		return "", nil
+	}
+	var sets []string
+	for _, stmt := range strings.Split(body, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if fields := strings.Fields(stmt); len(fields) > 0 && fields[0] == g.leaf {
+			// The row would author the leaf under test. Refuse the whole row
+			// rather than half of it: a partial prerequisite is a different
+			// experiment from the one the row was verified for.
+			return "", nil
+		}
+		sets = append(sets, "set "+strings.Join(g.path, " ")+" "+stmt)
+	}
+	return body, sets
+}
+
 func spellingVerdicts(g gateLeaf, v1, v2 string) map[string]string {
 	flat := "set " + strings.Join(append(append([]string{}, g.path...), g.leaf), " ")
+	// #7492: prepend the parent prerequisite, identically in every form, so it
+	// cancels out of the comparison and only decides whether a comparison exists.
+	preBody, preSets := gateLeafPrereq(g)
+	brace := func(stmt string) (string, error) {
+		if preBody != "" {
+			stmt = preBody + " " + stmt
+		}
+		return gateCompileBrace(gateBraceConfig(g.path, stmt))
+	}
+	sets := func(cmds ...string) (string, error) {
+		return gateCompileSet(append(append([]string{}, preSets...), cmds...))
+	}
 	forms := map[string][3]func() (string, error){
 		"A-hier-bracket": {
-			func() (string, error) { return gateCompileBrace(gateBraceConfig(g.path, g.leaf+";")) },
+			func() (string, error) { return brace(g.leaf + ";") },
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s [ %s ];", g.leaf, v1)))
+				return brace(fmt.Sprintf("%s [ %s ];", g.leaf, v1))
 			},
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s [ %s %s ];", g.leaf, v1, v2)))
+				return brace(fmt.Sprintf("%s [ %s %s ];", g.leaf, v1, v2))
 			},
 		},
 		"B-hier-block": {
-			func() (string, error) { return gateCompileBrace(gateBraceConfig(g.path, g.leaf+" { }")) },
+			func() (string, error) { return brace(g.leaf + " { }") },
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s { %s; }", g.leaf, v1)))
+				return brace(fmt.Sprintf("%s { %s; }", g.leaf, v1))
 			},
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s { %s; %s; }", g.leaf, v1, v2)))
+				return brace(fmt.Sprintf("%s { %s; %s; }", g.leaf, v1, v2))
 			},
 		},
 		"C-hier-repeat": {
-			func() (string, error) { return gateCompileBrace(gateBraceConfig(g.path, g.leaf+";")) },
+			func() (string, error) { return brace(g.leaf + ";") },
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s %s;", g.leaf, v1)))
+				return brace(fmt.Sprintf("%s %s;", g.leaf, v1))
 			},
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s %s; %s %s;", g.leaf, v1, g.leaf, v2)))
+				return brace(fmt.Sprintf("%s %s; %s %s;", g.leaf, v1, g.leaf, v2))
 			},
 		},
 		"D-set-bracket": {
-			func() (string, error) { return gateCompileSet([]string{flat}) },
-			func() (string, error) { return gateCompileSet([]string{fmt.Sprintf("%s [ %s ]", flat, v1)}) },
-			func() (string, error) { return gateCompileSet([]string{fmt.Sprintf("%s [ %s %s ]", flat, v1, v2)}) },
+			func() (string, error) { return sets(flat) },
+			func() (string, error) { return sets(fmt.Sprintf("%s [ %s ]", flat, v1)) },
+			func() (string, error) { return sets(fmt.Sprintf("%s [ %s %s ]", flat, v1, v2)) },
 		},
 		"E-set-repeat": {
-			func() (string, error) { return gateCompileSet([]string{flat}) },
-			func() (string, error) { return gateCompileSet([]string{flat + " " + v1}) },
-			func() (string, error) { return gateCompileSet([]string{flat + " " + v1, flat + " " + v2}) },
+			func() (string, error) { return sets(flat) },
+			func() (string, error) { return sets(flat + " " + v1) },
+			func() (string, error) { return sets(flat+" "+v1, flat+" "+v2) },
 		},
 		// #6693: a value in the IDENTIFIER slot beside a block. It is the only
 		// spelling that puts values in BOTH AST slots of one node — Keys[1:]
@@ -611,12 +699,12 @@ func spellingVerdicts(g gateLeaf, v1, v2 string) map[string]string {
 		// only feeds the inert-leaf check, which asks whether the FIRST value
 		// changed anything.
 		"F-hier-mixed": {
-			func() (string, error) { return gateCompileBrace(gateBraceConfig(g.path, g.leaf+" { }")) },
+			func() (string, error) { return brace(g.leaf + " { }") },
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s %s;", g.leaf, v1)))
+				return brace(fmt.Sprintf("%s %s;", g.leaf, v1))
 			},
 			func() (string, error) {
-				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s %s { %s; }", g.leaf, v1, v2)))
+				return brace(fmt.Sprintf("%s %s { %s; }", g.leaf, v1, v2))
 			},
 		},
 	}

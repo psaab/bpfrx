@@ -103596,6 +103596,24 @@ prose edit above them added. No diff falls in the new test body.
   pkg/grpcapi/fabric_auth.go, pkg/grpcapi/server.go,
   pkg/grpcapi/server_show_cluster_text.go, docs/architecture.md
 
+## 2026-08-22 — #7492 parent prerequisites for the spelling gate
+- **Timestamp**: 2026-08-22
+- **Action**: Added gateParentPrereq — a per-parent table of statements that make
+  a container materialise, injected identically into the zero/one/two configs in
+  BOTH brace and set spellings so it cancels out of every comparison. Refused
+  outright when a row would author the leaf under test. Coverage 619 -> 629;
+  unreachable 228 -> 215 (13 leaves moved: 10 became compared, 3 were revealed to
+  be flags once their container materialised, so the flag ceiling RISES 158 ->
+  161 — a blind-spot count going up after a fix is the fix working).
+- **Correcting my own #7492 premise**: the 228 are NOT mostly a parent-path
+  problem. A general sibling-scaffold recovered 2/228 (refuted); most plausible
+  per-parent recipes fail too (syslog host + `any any`, tunnel + source/dest,
+  vrrp + virtual-address, dhcp-local-server + upto all still lose the value).
+  Only BGP group + neighbor worked, and it is the one shipped row. The remaining
+  215 need a different diagnosis, recorded on the issue.
+- **File(s)**: pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/config/schema_spelling_gate_coverage_7484_test.go, docs/config-schema.md
+
 ## 2026-08-22 — #6704 shim IPv6 non-first-fragment sighting
 - **Action**: Taught the shim's IPv6 ext-header walk to report a NON-FIRST
   fragment sighting and made userspace-dp's executable parity corpus compare
