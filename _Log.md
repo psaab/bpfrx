@@ -101892,6 +101892,28 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
     docs/config-schema.md
 
+## 2026-08-22 — #6600 HA import reserves the NAT port before publishing
+- **Timestamp**: 2026-08-22
+- **Action**: `upsert_synced_session` published the shared session entry before
+  enqueueing the worker commands, and the NAT reservation happened only inside
+  the worker-local upsert — so in that window a local flow could claim the port,
+  `reserve_flow` refused to steal it, and the refusal was returned/counted/logged
+  by nothing. Moved the reservation to the coordinator, BEFORE the publish, and
+  refuse the import on failure (counted as `synced_import_reserve_refused`).
+  Made the reserve chains return their verdict (the bool was already computed
+  and discarded). Untracked holder so worker reserves are absorbed; skipped with
+  zero workers; source-NAT rolled back if NAT64 refuses. Zone pair resolved
+  through the SAME helper the worker uses.
+  **MOVES THE userspace-dp HELPER BINARY — cluster smoke owed.**
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/commands/mod.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, docs/sync-protocol.md, _Log.md
 ## 2026-08-22 — #6610 snat_allocator bench flow-key overflow
 - **Timestamp**: 2026-08-22
 - **Action**: Determined READING 1 (benign) with evidence, not assumption: the

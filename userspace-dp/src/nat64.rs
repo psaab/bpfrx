@@ -1715,14 +1715,19 @@ pub(crate) fn rollback_nat64_allocation_for_worker(
 /// BUILD FAILURE in the non-test profile rather than a silent single-holder
 /// release of a reservation every worker holds. Production uses the
 /// `_for_worker` twin.
-#[cfg(test)]
+///
+/// #6600: no longer test-only. The COORDINATOR takes an untracked reservation
+/// before publishing a peer-synced import, and the per-worker reservations that
+/// follow are absorbed by `reserve_flow`'s idempotent early return, so the
+/// release semantics the comment above warns about are unchanged — the last
+/// worker still frees.
 pub(crate) fn reserve_synced_nat64_allocation(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
     now_ns: u64,
-) {
+) -> bool {
     reserve_synced_nat64_allocation_with_holder(
         nat64,
         key,
@@ -1730,7 +1735,7 @@ pub(crate) fn reserve_synced_nat64_allocation(
         is_reverse,
         now_ns,
         crate::nat::NatHolder::Untracked,
-    );
+    )
 }
 
 /// #6211 F2: reserve a synced NAT64 translation and record `worker_id` as a
@@ -1747,7 +1752,7 @@ pub(crate) fn reserve_synced_nat64_allocation_for_worker(
     // expiry off a real clock.
     now_ns: u64,
     worker_id: u32,
-) {
+) -> bool {
     reserve_synced_nat64_allocation_with_holder(
         nat64,
         key,
@@ -1755,7 +1760,7 @@ pub(crate) fn reserve_synced_nat64_allocation_for_worker(
         is_reverse,
         now_ns,
         crate::nat::NatHolder::Worker(worker_id),
-    );
+    )
 }
 
 fn reserve_synced_nat64_allocation_with_holder(
@@ -1765,15 +1770,20 @@ fn reserve_synced_nat64_allocation_with_holder(
     is_reverse: bool,
     now_ns: u64,
     holder: crate::nat::NatHolder,
-) {
+) -> bool {
+    // #6600: returns whether the translation is RESERVED — true when a prefix
+    // took it, and true when there was nothing to reserve. `false` means every
+    // pool prefix REFUSED, i.e. a different live allocation already owns the
+    // (pool v4, port). The bool `reserve_nat64_pool_port` already computed was
+    // discarded before #6600.
     if is_reverse || !nat.nat64 {
-        return;
+        return true;
     }
     let Some(IpAddr::V4(snat_v4)) = nat.rewrite_src else {
-        return;
+        return true;
     };
     let Some(port) = nat.rewrite_src_port else {
-        return;
+        return true;
     };
     let flow = SourceNatFlowKey {
         protocol: key.protocol,
@@ -1805,9 +1815,14 @@ fn reserve_synced_nat64_allocation_with_holder(
             now_ns,
             holder,
         ) {
-            break;
+            return true;
         }
     }
+    // No prefix owned the address, or every owner refused. Not distinguished on
+    // purpose: from the coordinator's point of view both mean "this node does
+    // not own the translation this session names", and publishing a session for
+    // either is the thing #6600 fixes.
+    false
 }
 
 // ---------------------------------------------------------------------------
