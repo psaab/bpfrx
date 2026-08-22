@@ -99,7 +99,7 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `https` / `webapi-ssl` | tcp 443 | tcp 443 | dual | Web-management HTTPS. Admit port = `webmgmt.HTTPSPort` = 443 = the listener bind (#5715, was 8443). Same contract as `http` above. |
 | `ping` | icmp/icmpv6 echo-request | ICMP type 8 (v4) / 128 (v6) | dual | Echo-request only; ICMP errors are global-accepted (see below). |
 | `dns` | udp 53, tcp 53 | udp 53, tcp 53 | dual | |
-| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). |
+| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). **Junos accepts these two per INTERFACE only** — see [DHCP and BOOTP are per-interface only in Junos (#6519)](#dhcp-and-bootp-are-per-interface-only-in-junos-6519). |
 | `dhcpv6` | udp {546, 547} | udp 546, 547 | **ip6** | DHCPv6; v6-only (#3225). |
 | `ntp` | udp 123 | udp 123 | dual | |
 | `snmp` | udp 161 | udp 161 | dual | |
@@ -1111,6 +1111,65 @@ address is never dropped from the deny scope.
 `validateDuplicateHostLocalAddressStrict`, `pkg/config/dup_host_local_address.go`)
 mirrors the same additive resolution and quarantine, so the
 `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
+
+## DHCP and BOOTP are per-interface only in Junos (#6519)
+
+Juniper, [Security Zones](https://www.juniper.net/documentation/us/en/software/junos/security-policies/topics/topic-map/security-zone-configuration.html):
+
+> "All services (except DHCP and BOOTP) can be configured either per zone or per
+> interface. A DHCP server is configured only per interface because the incoming
+> interface must be known by the server to be able to send out DHCP replies."
+
+`dhcp` and `bootp` are therefore the two `system-services` tokens Junos does NOT
+accept at the zone level. xpf accepts them there, and a zone-level token
+authorizes udp/67-68 on the firewall-local addresses of every member interface —
+an over-authorization relative to Junos, which would make the operator admit the
+service interface by interface.
+
+**Status: WARN-only parity deviation. Enforcement is unchanged.**
+`validateHostInboundZoneLevelDHCPWarnings`
+(`pkg/config/host_inbound_dhcp_scope_6519.go`) emits one commit-time advisory per
+zone, naming the token and the member interfaces the zone-level authorization
+actually reaches, with the remedy: move it to
+`interfaces <if> host-inbound-traffic system-services dhcp`.
+
+Three details that matter:
+
+- **A zone-level `all` counts.** `all` expands to the named-service union, which
+  contains `dhcp` and `bootp` (`HostInboundAllExpansionServices`), so a zone-level
+  `all` authorizes them on every member exactly as a named token would. The
+  advisory reports that case explicitly, marked "via `all`", because the edit that
+  fixes it is a different edit. An advisory that reported only the named token
+  would have left the `all` case as a silent deviation.
+- **`dhcpv6` is deliberately NOT covered.** The vendor sentence names DHCP and
+  BOOTP. Extending it to the v6 token would be an inference, not a citation.
+- **An interface that authorized the service ITSELF is not named.** The advisory
+  fires for an interface whose EFFECTIVE set admits the token while its OWN
+  interface-level stanza does not — i.e. the zone-level token is the authorizer.
+  Stating the predicate that way keeps it correct both while the two levels union
+  and after #6515 makes the interface level replace the zone level, without
+  asserting which rule is in force.
+
+### Why the enforcement flip is staged separately
+
+Withdrawing the zone-level authorization is a NARROWING with a real population,
+unlike #6515:
+
+- Configs **in this repo** author zone-level `dhcp` today —
+  `test/incus/xpf-cluster-fw{0,1}.conf`, `docs/ha-cluster.conf`,
+  `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`. The
+  `ha-cluster-userspace` `lan` zone even carries a comment explaining that it
+  MUST admit dhcp or client DISCOVER to the firewall is denied. The advisory
+  fires on exactly that zone (`reth1`) and on nothing else in those files — the
+  `mgmt` and `control` zones' members are lifelines, which are excluded from
+  host-inbound deny scoping and so are skipped.
+- The traffic it would stop is not only a DHCP *server*'s. The firewall's own
+  DHCP **client** on a zoned, non-lifeline interface needs udp/68 admitted for
+  its unicast renewals, so a flip costs that interface its ADDRESS rather than
+  merely refusing a service — and the vendor rationale quoted above ("the server
+  must know the incoming interface") does not speak to the client case at all.
+- #6519 is filed as an enhancement and asks for the staged treatment: advisory,
+  then an all-planes flip in its own release with the shipped configs migrated.
 
 ## Multi-member bracket body applies to every member (#6391) — UPGRADE NOTE
 
