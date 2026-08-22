@@ -117,8 +117,7 @@ bare SYN (SYN set, ACK clear) starts in the OPENING (half-open) state
 (`SessionEntry.established == false`) and is reaped on the short
 `SessionTimeouts.tcp_opening_ns` window (20 s, the Junos
 `tcp-initial-timeout` default) instead of the full 300 s established
-timeout. It is promoted to ESTABLISHED — and the established / per-app
-idle window then applies — only on a genuine reverse SYN-ACK
+timeout. It is promoted to ESTABLISHED only on a genuine reverse SYN-ACK
 (**#4109**, tightened from "any ACK-bearing segment"): the server's
 handshake response is a SYN-ACK on the REVERSE half of the flow, so ONLY a
 SYN-ACK (`is_syn_ack`, not merely `has_ack`) on the reverse companion
@@ -129,6 +128,30 @@ any ACK did, so a bare SYN followed by a bare ACK pinned a 300 s
 established entry with no peer ever replying, a 2-packet bypass of the
 #3152 half-open reap (a real vSRX with the syn-check default does not mark
 a session ESTABLISHED on a client ACK that precedes the server's SYN-ACK).
+
+**The established idle window applies only once the handshake COMPLETES
+(#6752),** which is a strictly later moment than the promotion above.
+Promotion is on the SYN-ACK, so a SYN-ACK the client never ACKs used to put
+BOTH halves on the 300 s window: the reverse half was re-stamped to 300 s
+immediately, and the #4380 companion probe — protocol- and
+handshake-agnostic — then re-stamped the forward half off it at the forward
+half's 20 s deadline. #4109 had explicitly declined to extend the forward
+half's expiry "so a handshake the client never completes still reaps on the
+short opening window"; #4380 landed three days later and falsified that
+without either change being wrong on its own. `SessionEntry.handshake_pending`
+closes the gap: it is set on both halves by the SYN-ACK and cleared by the
+handshake-completing forward segment. The idle-window selection then treats
+`established && !handshake_pending` as the established class, which is what
+closes the ~300 s hold — with it, both halves reap at ~20 s on their own.
+`companion_keeps_alive` additionally refuses to extend a half whose companion
+is still pending; that closes a smaller, separate leak, where a server
+retransmitting its SYN-ACK slides the reverse half's window forward and the
+handshake-agnostic probe re-stamps the forward half off it for as long as the
+retransmissions continue. A completed handshake is unaffected — the forward segment that
+completes it is guaranteed to reach the slow path, because `packet_eligible`
+admits a TCP packet to the flow cache only when `is_ack_only` and
+`should_cache` uses the same predicate, so neither the SYN nor the SYN-ACK
+ever seeds an entry and the final ACK is a cache miss.
 Requiring the SYN bit (not just `has_ack` on the reverse tuple) also closes
 the residual where a server-spoofed bare reverse ACK could promote — in a
 legitimate 3-way handshake (and simultaneous open) the server's only

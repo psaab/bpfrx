@@ -32,6 +32,9 @@ struct TcpStatePropagation {
     /// A reverse SYN-ACK promoted the matched (reverse) entry (F16): promote the
     /// forward companion too, so ESTABLISHED requires real handshake evidence.
     established: bool,
+    /// #6752: the companion's `handshake_pending` must clear with this half's,
+    /// or the companion probe keeps refusing to extend a flow that IS complete.
+    handshake_completed: bool,
 }
 
 impl SessionTable {
@@ -146,6 +149,25 @@ impl SessionTable {
             let promote_from_reverse = is_tcp && is_syn_ack(tcp_flags) && entry.metadata.is_reverse;
             if promote_from_reverse {
                 entry.established = true;
+                // #6752: promotion is on the SYN-ACK, which is NOT handshake
+                // completion. Mark the gap so the idle window below stays on the
+                // OPENING class until the completing forward segment arrives.
+                entry.handshake_pending = true;
+            }
+            // #6752: the handshake-completing forward segment. Any FORWARD-
+            // direction TCP segment ends the gap — the final ACK normally, and a
+            // data segment implies it too.
+            //
+            // This is reachable, which the fix depends on: `packet_eligible`
+            // (afxdp/flow_cache.rs) admits a TCP packet to the flow cache only
+            // when `is_ack_only`, and `should_cache` uses the same predicate, so
+            // neither the SYN nor the SYN-ACK ever seeds an entry. The final ACK
+            // is therefore a cache MISS and falls through to this slow path,
+            // where it both completes the handshake and seeds the cache for the
+            // data that follows.
+            let handshake_completed = is_tcp && entry.handshake_pending && !entry.metadata.is_reverse;
+            if handshake_completed {
+                entry.handshake_pending = false;
             }
             entry.last_seen_ns = now_ns;
             entry.expires_after_ns = if is_tcp && entry.closing {
@@ -163,7 +185,11 @@ impl SessionTable {
                 session_timeout_ns(
                     key.protocol,
                     tcp_flags,
-                    entry.established,
+                    // #6752: the EFFECTIVE established class. A flow promoted by
+                    // the SYN-ACK but not yet completed stays on the opening
+                    // window, so a handshake the client never finishes reaps at
+                    // ~20s instead of holding 300s.
+                    entry.established && !entry.handshake_pending,
                     &timeouts,
                     entry.metadata.inactivity_timeout_ns,
                     // #3527: per-zone half-open override resolved above.
@@ -175,6 +201,7 @@ impl SessionTable {
                 close: do_close,
                 reset: is_tcp && has_rst(tcp_flags),
                 established: promote_from_reverse,
+                handshake_completed,
             };
             (
                 (
@@ -201,7 +228,7 @@ impl SessionTable {
         // from the matched CANONICAL key (`actual_key`, not the alias lookup
         // `key`) + its own nat, exactly as `account_packet` hops reverse→forward.
         // Skipped entirely when there is nothing to propagate.
-        if propagate.close || propagate.established {
+        if propagate.close || propagate.established || propagate.handshake_completed {
             self.propagate_tcp_state_to_companion(
                 &actual_key,
                 propagate.nat,
@@ -209,6 +236,7 @@ impl SessionTable {
                 propagate.close,
                 propagate.reset,
                 propagate.established,
+                propagate.handshake_completed,
             );
         }
         // Push the canonical key (NOT the alias lookup `key`) into
