@@ -102,6 +102,41 @@
 - **File(s)**: pkg/routing/rules.go, pkg/routing/rules_6467_test.go,
   pkg/routing/README.md
 
+## 2026-08-21 — #6634 ddns: provider RESPONSE TEXT is bounded and shape-filtered
+
+- **Timestamp**: 2026-08-21
+- **Action**: Four backends rendered text from the PROVIDER'S response BODY
+  straight into a returned error the daemon logs and retains as `lastErr`:
+  Cloudflare `Errors[].Message`, Route 53 decoded `Code`/`Message`, and the
+  unrecognized first response line on dyndns2 and DuckDNS — plus three
+  Cloudflare `json.Unmarshal` sites rendering the decoder error with `%w`.
+  No hostile transport is needed, only an API that echoes the request back;
+  DuckDNS carries its token in the QUERY STRING, so the echo IS the credential.
+  MEASURED FIRST, and it changed the fix: two thirds of the issue's surface was
+  already closed elsewhere. `termsafe.SanitizeForDisplay` covers both `show
+  services ddns` surfaces (#6468) and the daemon's `slog.TextHandler`
+  `strconv.Quote`s any non-printable byte, so control-character forgery cannot
+  split a journal line. What neither closes is a CREDENTIAL in the bytes or
+  64 KiB of them. So the fix is a bound plus a URL/userinfo shape filter, NOT
+  an escape.
+  `scrubProviderText` is total on LENGTH (`maxProviderTextBytes`, plus a COUNT
+  bound on the Cloudflare envelope — a per-message cap is not a bound when the
+  provider picks the array length) and partial on SHAPE, and says so: a
+  credential echoed as bare prose is indistinguishable from a word. Filter
+  BEFORE bounding, since the other order splits a URL at the cap and leaves
+  `https://user:PA` rendered. Route 53's returned code/message are NOT scrubbed
+  — `r53DeleteAlreadyGone` classifies delete-idempotency on the raw text, so
+  scrubbing the value would change a control decision; only the render goes
+  through the scrubber.
+  The class gate gained `json.Unmarshal`, FILE-SCOPED: it decodes a provider
+  body in `backend_*.go` and this daemon's own state file in `state.go`. The
+  scope is a predicate, not a site list, so a new backend file is covered
+  automatically.
+- **File(s)**: `pkg/ddns/backend_http.go`, `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_route53.go`, `pkg/ddns/backend_dyndns2.go`,
+  `pkg/ddns/backend_duckdns.go`,
+  `pkg/ddns/provider_response_text_6634_test.go` (new),
+  `pkg/ddns/url_render_class_6545_test.go`, `pkg/ddns/README.md`
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
