@@ -103498,3 +103498,16 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/cluster/sync.go`, `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_bulk.go`,
   `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
   `pkg/cluster/status.go`, `docs/sync-protocol.md`
+
+## 2026-08-22 — #6716 background applies re-read the active config
+- **Timestamp**: 2026-08-22
+- **Action**: Background apply callbacks (DHCP lease change, dynamic feed,
+  boot-time apply) captured store.ActiveConfig() BEFORE waiting on applySem and
+  then applied that snapshot, silently reverting a commit that landed during the
+  wait. Added applyActiveConfig / applyActiveConfigResult, which re-read under
+  the semaphore; removed the now-dead applyConfigResult so the pre-capturing
+  entry point cannot be reached again.
+- **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_dhcp.go,
+  pkg/daemon/daemon_feeds.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/apply_active_reread_6716_test.go,
+  pkg/daemon/cluster_transport_race_6290_test.go

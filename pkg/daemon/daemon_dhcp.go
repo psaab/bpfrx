@@ -85,9 +85,20 @@ func (d *Daemon) onDHCPAddressChange() {
 	if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
 		if d.dhcpLeaseChangeRequiresRecompile(activeCfg) {
 			slog.Info("DHCP address changed, recompiling dataplane")
-			// applyConfig runs reconcileDNSLocked, so DNS is
+			// applyActiveConfig runs reconcileDNSLocked, so DNS is
 			// reconciled with the new lease set on this path.
-			d.applyConfig(activeCfg)
+			//
+			// #6716: it re-reads the active config under applySem instead of
+			// applying activeCfg, which was captured BEFORE the semaphore wait.
+			// A commit landing during that wait was otherwise reverted by this
+			// callback. activeCfg above still drives the recompile DECISION —
+			// that only chooses how much work to do, and choosing "full apply"
+			// from a slightly stale read is safe because the apply itself now
+			// reconciles whatever is current.
+			if d.preApplyHookForTest != nil {
+				d.preApplyHookForTest()
+			}
+			d.applyActiveConfig()
 		} else {
 			slog.Info("DHCP address changed on management-only interface, refreshing management routes")
 			// #5867: no commit to fail on this DHCP-callback path (it is a
