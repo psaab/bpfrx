@@ -1,3 +1,45 @@
+## 2026-08-21 — #6612 junos-host residual: audited the claim, found it false, locked what holds
+
+- **Timestamp**: 2026-08-21
+- **Action**: Audited #6612's closing claim — "each affected policy
+  emits the #4168 commit warning naming itself" — against the real
+  compile+validate path rather than the prose. It is FALSE for one
+  member: a `to-zone junos-host` permit narrowed on DESTINATION (or
+  carrying `destination-address-excluded`) renders no kernel rule AND
+  emits ZERO warnings of any kind, so the commit is clean and nothing
+  enforces. The projection already marks it un-representable
+  (`junosHostProjectTerm`), but the warning's
+  `junosHostPolicyStricterThanCoarseGate` admits a permit only through
+  `junosHostPolicySourceScoped`, which inspects the SOURCE dimension
+  alone; the two halves disagree. The one-clause fix (key the warning on
+  the same `junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded` expression the projection uses) lands in
+  pkg/config, outside this lane's file surface, so it is handed over
+  rather than applied here and #6612 stays open for it. Also corrected a
+  second error shared by the issue and the module doc: a PURE multi-term
+  application is NOT un-representable — it compiles to an implicit
+  application-SET and is fully OR-expanded, so the deny IS enforced and
+  the real hazard is the inverse (a partial expansion renders a kernel
+  deny silently narrower than authored); only a MIXED direct+term
+  application is un-representable, and the strict structure gate rejects
+  that at commit. Shipped a residual coverage lock: one row per class,
+  each asserting BOTH halves and each carrying a FLIP (the same fixture
+  with the residual attribute neutralised) so no row can pass because a
+  fixture was broken some other way. Four one-line mutations against the
+  production gates, each `go vet` clean and each reddening only its own
+  row: scheduler gate, ALG gate, application-set expansion truncated to
+  its first member, and the destination-scoped-permit gate. The fourth
+  found a defect in this lane's own first draft — a lone
+  destination-scoped permit renders nothing whether or not the gate
+  exists, so the test as first written was mutation-INSENSITIVE; it was
+  rebuilt around a permit ahead of a DENY, which is the only shape in
+  which the gate changes a packet verdict, and now reds. Filed #7374 for
+  the third dimension (an APPLICATION-scoped permit, same silent shape),
+  deliberately not folded in because it needs a comparison against the
+  zone's effective admit set rather than a token test.
+- **File(s)**: `pkg/dataplane/userspace/junos_host_residual_6612_test.go`
+  (new), `docs/host-inbound-service-matrix.md`
+
 ## 2026-08-21 — #6585 syslog wire sanitized at the Send boundary
 
 - **Timestamp**: 2026-08-21
@@ -102,6 +144,65 @@
   `pkg/upgrade/kernel_verify_no_inference_6620_test.go` (new),
   `docs/in-place-upgrade.md`, `_Log.md`
 
+## 2026-08-21 — #6583 next-table window drawn down v4-first structurally
+
+- **Timestamp**: 2026-08-21
+- **Action**: The v4-before-v6 next-table draw-down order was set entirely
+  by two `append` lines in `pkg/daemon/daemon_apply_routing.go` and bound
+  by nothing on either side. Fixed STRUCTURALLY rather than by asserting
+  on the caller: `nextTableManager.Apply` now stable-partitions the slice
+  v4-first (`nextTableFamilyOrdered`), so the kernel agrees with the FIB
+  (`addRoutes("inet.0")` before `addRoutes("inet6.0")`) by construction
+  and no caller can get it wrong. Also closed the fixture gap the
+  kernel-side #6467 guard had — every case generated `10.%d.%d.0/24`
+  only, so its `count(AF_INET)+count(AF_INET6)` totals always carried a
+  zero v6 term and could not see a family reordering at all.
+  Mutation matrix: X1 (no ordering — the pre-fix state) and X2 (v6 first)
+  RED; X3 (unstable within family) initially GREEN — the stability claim
+  was unbound, so a per-slot destination assertion was added and it now
+  reds. X4 (swap the daemon appends) is GREEN **by design**: the whole
+  point is that the swap is now a no-op. That deviates from the issue's
+  acceptance criterion 1, which asked for the swap to turn a test RED;
+  making it harmless is strictly stronger, and adding an assertion on a
+  condition that can no longer vary would be a guard on a dead branch.
+- **File(s)**: pkg/routing/rules.go, pkg/routing/rules_6467_test.go,
+  pkg/routing/README.md
+
+## 2026-08-21 — #6634 ddns: provider RESPONSE TEXT is bounded and shape-filtered
+
+- **Timestamp**: 2026-08-21
+- **Action**: Four backends rendered text from the PROVIDER'S response BODY
+  straight into a returned error the daemon logs and retains as `lastErr`:
+  Cloudflare `Errors[].Message`, Route 53 decoded `Code`/`Message`, and the
+  unrecognized first response line on dyndns2 and DuckDNS — plus three
+  Cloudflare `json.Unmarshal` sites rendering the decoder error with `%w`.
+  No hostile transport is needed, only an API that echoes the request back;
+  DuckDNS carries its token in the QUERY STRING, so the echo IS the credential.
+  MEASURED FIRST, and it changed the fix: two thirds of the issue's surface was
+  already closed elsewhere. `termsafe.SanitizeForDisplay` covers both `show
+  services ddns` surfaces (#6468) and the daemon's `slog.TextHandler`
+  `strconv.Quote`s any non-printable byte, so control-character forgery cannot
+  split a journal line. What neither closes is a CREDENTIAL in the bytes or
+  64 KiB of them. So the fix is a bound plus a URL/userinfo shape filter, NOT
+  an escape.
+  `scrubProviderText` is total on LENGTH (`maxProviderTextBytes`, plus a COUNT
+  bound on the Cloudflare envelope — a per-message cap is not a bound when the
+  provider picks the array length) and partial on SHAPE, and says so: a
+  credential echoed as bare prose is indistinguishable from a word. Filter
+  BEFORE bounding, since the other order splits a URL at the cap and leaves
+  `https://user:PA` rendered. Route 53's returned code/message are NOT scrubbed
+  — `r53DeleteAlreadyGone` classifies delete-idempotency on the raw text, so
+  scrubbing the value would change a control decision; only the render goes
+  through the scrubber.
+  The class gate gained `json.Unmarshal`, FILE-SCOPED: it decodes a provider
+  body in `backend_*.go` and this daemon's own state file in `state.go`. The
+  scope is a predicate, not a site list, so a new backend file is covered
+  automatically.
+- **File(s)**: `pkg/ddns/backend_http.go`, `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_route53.go`, `pkg/ddns/backend_dyndns2.go`,
+  `pkg/ddns/backend_duckdns.go`,
+  `pkg/ddns/provider_response_text_6634_test.go` (new),
+  `pkg/ddns/url_render_class_6545_test.go`, `pkg/ddns/README.md`
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
