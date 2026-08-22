@@ -104198,3 +104198,13 @@ prose edit above them added. No diff falls in the new test body.
   pkg/upgrade/kernel_bootnext_disarm_6758_test.go (new),
   docs/in-place-upgrade.md
 
+
+## 2026-08-22 — #6767 apply-groups work budget covers the merge fan-out
+- **Timestamp**: 2026-08-22
+- **Action**: Work was charged once per `apply-groups <name>` reference, while
+  mergeNodes — which clones and merges — took no budget. A wildcard container
+  merges into EVERY matching destination, so the cost is the product. Threaded
+  the budget through mergeNodes, charging per merged node and per clone before
+  materialising it.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/group_expand_budget_6767_test.go

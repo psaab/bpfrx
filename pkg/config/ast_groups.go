@@ -30,6 +30,37 @@ type groupExpandBudget struct {
 	work int // group expansions performed so far
 }
 
+// charge accounts n units of expansion work and reports when the budget is
+// exhausted (#6767).
+//
+// Before this, work was charged ONCE per `apply-groups <name>` reference
+// resolved, and mergeNodes — which does the actual cloning and merging — took
+// no budget at all. A wildcard group container is merged into EVERY matching
+// destination container, so the real cost is the (wildcard node x matching
+// container) product, and a config with a handful of apply-groups references
+// could build a quadratic AST while charging a handful of units.
+func (b *groupExpandBudget) charge(n int) error {
+	b.work += n
+	if b.work > maxGroupExpandWork {
+		return fmt.Errorf("apply-groups expansion exceeds maximum work budget of %d (possible generated or pathological config)", maxGroupExpandWork)
+	}
+	return nil
+}
+
+// countNodes is the size of a subtree forest, used to charge the budget for a
+// clone BEFORE performing it — so a pathological fan-out is refused rather than
+// materialised and then noticed.
+func countNodes(nodes []*Node) int {
+	n := 0
+	for _, x := range nodes {
+		if x == nil {
+			continue
+		}
+		n += 1 + countNodes(x.Children)
+	}
+	return n
+}
+
 // ExpandGroups resolves all "apply-groups" references in the tree.
 // It collects group definitions from the "groups" stanza, then for each
 // "apply-groups <name>" node, clones the referenced group's children and
@@ -246,7 +277,14 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 		memoKey := name + "\x00" + ancestorPathKey(ancestorPath)
 		if cached, hit := memo[memoKey]; hit {
 			if cached != nil {
-				mergeNodes(nodes, cloneNodes(cached), ancestorPath)
+				// #6767: a memo HIT still clones and merges the whole cached
+				// subtree, so it costs the same as a miss and must be charged.
+				if err := budget.charge(countNodes(cached)); err != nil {
+					return err
+				}
+				if err := mergeNodes(nodes, cloneNodes(cached), ancestorPath, budget); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -296,7 +334,9 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 		// merge a SEPARATE clone into the parent so the cache is never mutated.
 		memo[memoKey] = cloneNodes(expanded)
 		if expanded != nil {
-			mergeNodes(nodes, expanded, ancestorPath)
+			if err := mergeNodes(nodes, expanded, ancestorPath, budget); err != nil {
+				return err
+			}
 		}
 
 		delete(seen, name)
@@ -351,8 +391,14 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 // block+block UNIONED — so an inline `match application junos-http` that
 // inherited a group's `match application junos-https` silently DROPPED
 // junos-https (fable-164 L-8), narrowing a `then deny` to junos-http only.
-func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
+func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *groupExpandBudget) error {
 	for _, s := range src {
+		// #6767: one unit per source node MERGED, so a deep group subtree is
+		// bounded by its own size rather than by the single reference that
+		// pulled it in.
+		if err := budget.charge(1); err != nil {
+			return err
+		}
 		if s.IsLeaf {
 			key := ""
 			if len(s.Keys) > 0 {
@@ -379,8 +425,17 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 			// Wildcard merge: apply to all matching containers in dst.
 			for _, d := range *dst {
 				if !d.IsLeaf && keysMatchWildcard(d.Keys, s.Keys) {
+					// #6767: THIS is the fan-out. One wildcard source is cloned
+					// into every matching destination container, so the cost is
+					// the product, not the reference count. Charge the clone's
+					// size BEFORE materialising it.
+					if err := budget.charge(countNodes(s.Children)); err != nil {
+						return err
+					}
 					cloned := cloneNodes(s.Children)
-					mergeNodes(&d.Children, cloned, appendPath(ancestorPath, d.Keys))
+					if err := mergeNodes(&d.Children, cloned, appendPath(ancestorPath, d.Keys), budget); err != nil {
+						return err
+					}
 				}
 			}
 			continue
@@ -410,7 +465,9 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 		for _, d := range *dst {
 			if !d.IsLeaf && keysEqual(d.Keys, s.Keys) {
 				// Merge children recursively.
-				mergeNodes(&d.Children, s.Children, appendPath(ancestorPath, d.Keys))
+				if err := mergeNodes(&d.Children, s.Children, appendPath(ancestorPath, d.Keys), budget); err != nil {
+					return err
+				}
 				found = true
 				break
 			}
@@ -425,9 +482,19 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 			if len(s.Keys) == 1 && hasMatchingLeaf(*dst, s.Keys) {
 				continue
 			}
+			// #6767: adopting a container WHOLESALE adds its entire subtree to
+			// the AST without recursing into it, so the per-node charge above
+			// never sees those nodes — a group carrying a million-node subtree
+			// merged into a non-matching parent cost ONE unit. Charge the
+			// subtree it actually adds. (The node itself was charged on entry,
+			// hence -1.)
+			if err := budget.charge(countNodes([]*Node{s}) - 1); err != nil {
+				return err
+			}
 			*dst = append(*dst, s)
 		}
 	}
+	return nil
 }
 
 // appendPath returns a fresh copy of base with keys appended, so recursive
