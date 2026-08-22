@@ -88,6 +88,15 @@ func redactNodes(nodes []*Node, base []string) {
 				n.Keys[idx-len(base)] = SecretDataPlaceholder
 			}
 		}
+		// #6703: URL-bearing leaves are TRANSFORMED, not masked — see
+		// urlLeafIndices. RedactURL strips userinfo/query/fragment (and an
+		// implausible authority, #6609) while keeping scheme/host/path, so a
+		// credential-free URL renders unchanged.
+		for _, idx := range urlLeafIndices(full) {
+			if idx >= len(base) && idx < len(full) {
+				n.Keys[idx-len(base)] = RedactURL(n.Keys[idx-len(base)])
+			}
+		}
 		if !n.IsLeaf {
 			redactNodes(n.Children, full)
 		}
@@ -151,6 +160,46 @@ func secretIndices(fp []string) []int {
 	return out
 }
 
+// urlLeafIndices returns the indices into the flattened key path fp that hold a
+// URL-BEARING leaf value. These are redacted by TRANSFORM (RedactURL) rather
+// than by replacement with SecretDataPlaceholder, because a URL is
+// secret-BEARING without being a secret (#6703): the credential lives in the
+// userinfo, query or fragment, while the scheme/host/path are the diagnostic
+// payload an operator needs to keep seeing. Masking the whole token would make
+// a credential-free URL — the overwhelmingly common case — unreadable.
+//
+// KEYED ON THE LEAF NAME, not on a list of config locations. `url` is matched
+// in EVERY context, so a future url-bearing leaf inherits redaction with no
+// extra step; that is deliberate, and it is why this does not repeat the
+// hand-scoped mistake that produced #6703 in the first place. Applying
+// RedactURL universally is safe precisely because it is a no-op on a URL with
+// no credential-bearing component.
+//
+// The two DDNS leaves that are URLs without being named `url`
+// (`url-template`, `checkip-url`) are distinctive enough to match unqualified.
+// `server` and `update-server` are NOT — `server` is also an NTP leaf
+// (schema_system.go) — so both are gated on a `dynamic-dns` ancestor, the same
+// context-gate doctrine secretIndices uses for the generic `password` keyword.
+func urlLeafIndices(fp []string) []int {
+	var out []int
+	for i, k := range fp {
+		switch k {
+		case "url", "url-template", "checkip-url":
+			for j := i + 1; j < len(fp); j++ {
+				out = append(out, j)
+			}
+		case "server", "update-server":
+			// Generic keywords — a URL only under a DDNS provider.
+			if containsAnyOf(fp[:i], "dynamic-dns") {
+				for j := i + 1; j < len(fp); j++ {
+					out = append(out, j)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // containsAnyOf reports whether seq contains any of names.
 func containsAnyOf(seq []string, names ...string) bool {
 	for _, s := range seq {
@@ -185,6 +234,20 @@ var errRedactionPlaceholderIngest = errors.New(
 		"restorable config; restore from the DR archive (request system " +
 		"configuration rescue) or re-enter the secret in cleartext")
 
+// errRedactedURLIngest is the URL-leaf sibling of errRedactionPlaceholderIngest
+// (#6703). RedactURL rewrites a credential-bearing URL leaf to contain the
+// typed sentinel ("<redacted>") on the display paths, and unlike the secret
+// placeholder the result still LOOKS like a valid URL — so re-committing a
+// redacted export would silently install a broken endpoint (a DDNS provider
+// publishing to "https://host/upd?<redacted>", a feed fetched from a mangled
+// URL) instead of failing loudly. That is a worse failure than the secret case,
+// which is why the ingest guard is symmetric rather than optional.
+var errRedactedURLIngest = errors.New(
+	"config contains a redacted URL value (" + SecretRedacted + ") — this is a " +
+		"redacted export (REST show/export / gRPC ShowConfig), not a restorable " +
+		"config; restore from the DR archive (request system configuration " +
+		"rescue) or re-enter the URL in cleartext")
+
 // checkRedactionPlaceholder rejects a tree whose SECRET leaf value is exactly
 // SecretDataPlaceholder ("##SECRET-DATA##"). It is invoked by the commit-ingest
 // schema gate (SchemaValidateWithDefinitions), so on the strict operator commit
@@ -205,7 +268,36 @@ func checkRedactionPlaceholder(t *ConfigTree) error {
 	if path := findRedactionPlaceholder(t.Children, nil); path != "" {
 		return fmt.Errorf("%w (at %q)", errRedactionPlaceholderIngest, path)
 	}
+	if path := findRedactedURL(t.Children, nil); path != "" {
+		return fmt.Errorf("%w (at %q)", errRedactedURLIngest, path)
+	}
 	return nil
+}
+
+// findRedactedURL is the URL-leaf mirror of findRedactionPlaceholder (#6703).
+// Its scope is exactly what redactNodes TRANSFORMS — the same urlLeafIndices
+// set is used to detect the sentinel that produced it — so detection stays
+// symmetric with masking under either AST shape.
+//
+// It tests CONTAINS rather than equals: RedactURL embeds the sentinel inside an
+// otherwise-intact URL ("https://host/upd?<redacted>"), so an equality test
+// would miss every real case. A non-URL leaf carrying that literal is not
+// inspected at all, mirroring the placeholder guard's deliberate narrowness.
+func findRedactedURL(nodes []*Node, base []string) string {
+	for _, n := range nodes {
+		full := append(append([]string(nil), base...), n.Keys...)
+		for _, idx := range urlLeafIndices(full) {
+			if idx >= len(base) && idx < len(full) && strings.Contains(n.Keys[idx-len(base)], SecretRedacted) {
+				return strings.Join(full[:idx+1], " ")
+			}
+		}
+		if !n.IsLeaf {
+			if hit := findRedactedURL(n.Children, full); hit != "" {
+				return hit
+			}
+		}
+	}
+	return ""
 }
 
 // findRedactionPlaceholder walks nodes maintaining the flattened key path of all

@@ -166,6 +166,19 @@ var (
 // This id stays NODE-LOCAL by design: the cross-node correlatable id is the
 // separate RTFlowSessionID (#5212), which rides its own wire field and is
 // adopted verbatim by the peer helper. See docs/session-sync-architecture.md.
+// adoptedOrLocalSyncedSessionID returns the id to stamp into the BPF conntrack
+// mirror for a peer-synced session (#6666).
+//
+// The peer's stable cross-node id when it sent one; a fresh node-local id
+// otherwise. The fallback is what makes this rolling-upgrade safe: a mixed-base
+// peer sends 0, and that path is byte-identical to pre-#6666.
+func adoptedOrLocalSyncedSessionID(rtFlowSessionID uint64) uint64 {
+	if rtFlowSessionID != 0 {
+		return rtFlowSessionID
+	}
+	return nextUserspaceSyncedSessionID()
+}
+
 func nextUserspaceSyncedSessionID() uint64 {
 	userspaceSyncedSessionIDOnce.Do(func() {
 		userspaceSyncedSessionIDs.Store(userspaceSyncedSessionIDSeed(daemonMonotonicNanos()))
@@ -331,10 +344,35 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValue{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id: node-local, and unique per
-		// converted session since #6198 (the previous now<<16|Slot composition
-		// collapsed every session converted in the same second onto one id).
-		SessionID: nextUserspaceSyncedSessionID(),
+		// SessionID is the BPF-ABI conntrack id the session VIEWS render --
+		// `show security flow session`, the REST session views, the gRPC session
+		// RPCs. #6666: when the peer sent its stable cross-node id, ADOPT it
+		// here instead of minting a node-local one.
+		//
+		// TWO WRITERS reach this one field. The control plane writes it on every
+		// conversion; the helper writes the entry's own stable id whenever a
+		// frame drives a local publish for the same key. They minted from
+		// disjoint namespaces, so the displayed id FLIPPED depending on which
+		// wrote last -- at promotion, and (worse, and not in the issue) at every
+		// bulk resync, because the control-plane id is distinct per CONVERSION
+		// rather than per session. Adopting makes both writers agree.
+		//
+		// It also makes #5213's stated invariant true. cli_show_flow.go promises
+		// the displayed id is IDENTICAL to the id RT_FLOW emits for the same
+		// session; for a peer-synced session it was not, because RT_FLOW carries
+		// the adopted id while the mirror carried the local one.
+		//
+		// SAFE BY CONSTRUCTION, not by bookkeeping. #6311 gave every id a node
+		// discriminator bit, so an adopted id carries the ORIGINATING node's bit
+		// and cannot collide with anything this node mints -- pinned by
+		// adopted_peer_id_cannot_collide_with_a_local_id_6311. And nothing keys
+		// on it: pkg/dataplane/types.go states it is "never a lookup key", and a
+		// sweep of every non-test SessionID reference finds no map key, index,
+		// dedup or generation guard. The blast radius is display-only.
+		//
+		// 0 means a legacy or rolling-upgrade peer that sent no id; mint as
+		// before, which keeps every #6198 mint test exercising the same path.
+		SessionID: adoptedOrLocalSyncedSessionID(delta.RTFlowSessionID),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (distinct from
 		// SessionID above). Carried across the cluster sync wire so a peer-synced
 		// session adopts it and its SESSION_CREATE/CLOSE records correlate across
@@ -438,9 +476,9 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	now := daemonMonotonicSeconds()
 	val := dataplane.SessionValueV6{
 		State: 4, // SESS_STATE_ESTABLISHED
-		// SessionID is the BPF-ABI conntrack id: node-local, and unique per
-		// converted session since #6198 (see the V4 converter).
-		SessionID: nextUserspaceSyncedSessionID(),
+		// SessionID: adopted from the peer when it sent one, else minted
+		// node-local (#6666 -- see the V4 converter for the full reasoning).
+		SessionID: adoptedOrLocalSyncedSessionID(delta.RTFlowSessionID),
 		// #5212: the ORIGINATING node's stable RT_FLOW session id (see V4) —
 		// adopted by a peer-synced session so its RT_FLOW records correlate
 		// across HA nodes; 0 on a legacy helper => fresh local id on import.
