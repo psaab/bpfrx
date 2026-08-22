@@ -23,23 +23,38 @@ func (d *Daemon) ensureFeedManager() {
 	if d.feeds != nil {
 		return
 	}
-	d.feeds = feeds.New(func() error {
-		slog.Info("dynamic-address feed updated, recompiling dataplane")
-		activeCfg := d.store.ActiveConfig()
-		if activeCfg == nil {
-			// No active config to apply the feed content against yet (pre-boot
-			// window). Treat as a vacuous success — there is no policy enforcing
-			// this feed, and the normal commit path re-reads the live feed
-			// snapshot when a config is committed. Returning nil lets the feed
-			// manager record the content as published so it does not spin.
-			return nil
-		}
-		// #5646: return the apply RESULT to the feed manager. A rejected apply
-		// (preflight reject, compile failure, control-socket error) must NOT be
-		// recorded as published, so the next identical feed refetch retries the
-		// apply instead of silently dropping the good content (publication debt).
-		return d.applyConfigResult(activeCfg)
-	})
+	d.feeds = feeds.New(d.onFeedUpdate)
+}
+
+// onFeedUpdate is the dynamic-address feed manager's publication callback.
+//
+// It is a named method rather than an inline closure so a test can drive the
+// REAL callback. The property that matters here is WHICH entry point this site
+// calls: a test that invokes applyActiveConfigResult directly binds the
+// function while leaving the wiring free to regress back to a pre-captured
+// config (#6716).
+func (d *Daemon) onFeedUpdate() error {
+	slog.Info("dynamic-address feed updated, recompiling dataplane")
+	if d.store == nil || d.store.ActiveConfig() == nil {
+		// No active config to apply the feed content against yet (pre-boot
+		// window). Treat as a vacuous success — there is no policy enforcing
+		// this feed, and the normal commit path re-reads the live feed
+		// snapshot when a config is committed. Returning nil lets the feed
+		// manager record the content as published so it does not spin.
+		return nil
+	}
+	// #5646: return the apply RESULT to the feed manager. A rejected apply
+	// (preflight reject, compile failure, control-socket error) must NOT be
+	// recorded as published, so the next identical feed refetch retries the
+	// apply instead of silently dropping the good content (publication debt).
+	//
+	// #6716: applyActiveConfigResult re-reads the active config under applySem.
+	// The nil check above is only the pre-boot guard — a config read out here
+	// and applied would revert a commit that landed during the semaphore wait.
+	if d.preApplyHookForTest != nil {
+		d.preApplyHookForTest()
+	}
+	return d.applyActiveConfigResult()
 }
 
 // feedsConfigHash returns a stable hash over the feed-SERVER configuration that

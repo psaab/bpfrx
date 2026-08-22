@@ -50,7 +50,7 @@ Junos, where host-bound routing multicast is admitted per-zone via
 
 ## Commit-time advisory (shipped)
 
-`ValidateConfig` (`pkg/config/compiler_validate_warn.go`,
+`ValidateConfig` (`pkg/config/compiler_validate_warn_host_inbound.go`,
 `validateHostInboundMulticastWarnings`) emits a **WARN-only** commit-time
 advisory for each zone-level `host-inbound-traffic` stanza AND each per-interface
 override (#3362) whose `protocols` set admits a multicast routing protocol. The
