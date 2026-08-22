@@ -1655,6 +1655,44 @@ never lock an operator out of a remote box it manages.
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
   `firewall_address_literal_3433_test.go`.
 
+  **A MALFORMED address token fails the install CLOSED (#6512).** #3433 dropped
+  a malformed token silently, so an ALL-malformed positive list reached
+  "constrained + empty -> match nothing". That resolution is wrong for the two
+  shapes #6512 filed. A PARTIALLY malformed positive list installed a NARROWED
+  rule — a `discard`/`reject` term enforcing a smaller address set than the
+  operator wrote, with the dropped range falling through to the implicit accept
+  (fail-OPEN). And an EXCEPT list narrowed to empty takes the "empty except ->
+  match ALL" arm above, so the direction becomes UNCONSTRAINED (fail-OPEN in the
+  other direction) — which is why "skip the bad entry" can never be the fix
+  here. Both builders now refuse: `nftFamilyAddrs` (oracle) keeps the token
+  VERBATIM so `nft -f -` rejects the whole ruleset, and `filterFamilyAddrs`
+  (`pkg/nftables/netlink_lo0.go`, the production builder) returns an error that
+  fails the plan and aborts the install — the same posture both already had for
+  an unrepresentable port / DSCP token (#6405). Wrong-family and `any`/empty
+  tokens are unaffected: those are legitimate drops that match the userspace
+  matcher.
+
+  Fail-closed here does not mean fail-to-boot (#1960): the install error makes
+  `applyLo0Filter` install the #6476 cold-boot fail-closed fence (lifelines
+  exempt, mandatory L3 / return traffic admitted) and the boot apply logs and
+  discards the error, so an already-persisted config still loads — it just does
+  not get a kernel filter that differs from what the operator wrote. On the
+  strict COMMIT path the commit now fails with the malformed token named,
+  instead of silently installing the narrowed filter.
+
+  Detection is on the TOKEN, not on the #6463 `AddressUnrepresentable` marker,
+  because that marker is derived from `term.UnknownAddresses` — malformed
+  LITERAL `from source-address` / `destination-address` tokens only. A malformed
+  entry inside a referenced `policy-options prefix-list` reaches this lowering
+  through `ResolveFilterPrefixListAddrs` with the marker unset, and is not
+  rejected at strict commit either (`validateFirewallPrefixListReferencesStrict`
+  validates that the REFERENCE resolves, not that its entries parse). Pinned by
+  `pkg/nftables/netlink_lo0_addrs_6512_test.go` (builder fails closed; wrong-family
+  and placeholder tokens still lower) and
+  `pkg/daemon/lo0_addr_failclosed_6512_test.go` (the token reaches the builder
+  from a prefix-list on the ordinary commit path; a failed build fences and
+  surfaces the error).
+
   **ICMP type/code lowering mirrors userspace (#3483):** `nftRulesFromTerm`
   renders `icmp-type` and `icmp-code` as INDEPENDENT predicates, each gated
   only on its own value list — `icmp[v6] type <set>` when `len(ICMPTypes) > 0`

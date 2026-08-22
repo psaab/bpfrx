@@ -55,11 +55,22 @@ func buildLo0FilterNetlink(p *nlPlan, spec Lo0FilterSpec) {
 func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 	// Resolve the address predicates first: a positive scope that resolves to no
 	// prefix of this family is a Junos match-nothing term (skip entirely).
-	srcAddrs, srcSkip := lo0AddrScope(f, t.SrcAddrs, t.SrcExcept, t.SrcConstrained)
+	// #6512: a malformed token in either direction fails the plan CLOSED. Never
+	// install a rule built from a narrowed (or, on an except list, widened)
+	// subset of what the operator authored.
+	srcAddrs, srcSkip, srcErr := lo0AddrScope(f, t.SrcAddrs, t.SrcExcept, t.SrcConstrained)
+	if srcErr != nil {
+		p.fail(fmt.Errorf("lo0 filter term %q source-address (except=%t): %w", t.Name, t.SrcExcept, srcErr))
+		return
+	}
 	if srcSkip {
 		return
 	}
-	dstAddrs, dstSkip := lo0AddrScope(f, t.DstAddrs, t.DstExcept, t.DstConstrained)
+	dstAddrs, dstSkip, dstErr := lo0AddrScope(f, t.DstAddrs, t.DstExcept, t.DstConstrained)
+	if dstErr != nil {
+		p.fail(fmt.Errorf("lo0 filter term %q destination-address (except=%t): %w", t.Name, t.DstExcept, dstErr))
+		return
+	}
 	if dstSkip {
 		return
 	}
@@ -204,27 +215,70 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 
 // lo0AddrScope mirrors nftFamilyAddrs + nftAddrPredicate's family-filter and
 // match-nothing decision. It returns the family-filtered address list to feed
-// the address match, and skip==true when the term matches nothing (a positive
-// scope constrained to no prefix of this family) — the caller drops the rule.
-func lo0AddrScope(f nlFamily, addrs []string, except, constrained bool) (out []string, skip bool) {
+// the address match, skip==true when the term matches nothing (a positive scope
+// constrained to no prefix of this family) — the caller drops the rule — and a
+// non-nil error when any token was MALFORMED, which fails the plan closed.
+func lo0AddrScope(f nlFamily, addrs []string, except, constrained bool) (out []string, skip bool, err error) {
 	if !constrained {
-		return nil, false
+		return nil, false, nil
 	}
-	fam := filterFamilyAddrs(f, addrs)
+	fam, err := filterFamilyAddrs(f, addrs)
+	if err != nil {
+		return nil, false, err
+	}
 	if len(fam) == 0 {
 		if except {
 			// Empty except set -> match ALL -> no predicate.
-			return nil, false
+			return nil, false, nil
 		}
 		// Empty positive set -> match NOTHING -> skip the rule.
-		return nil, true
+		return nil, true, nil
 	}
-	return fam, false
+	return fam, false, nil
 }
 
-// filterFamilyAddrs mirrors nftFamilyAddrs: keep only this family's literals,
-// dropping empty/"any"/malformed and wrong-family tokens, canonicalizing each.
-func filterFamilyAddrs(f nlFamily, addrs []string) []string {
+// filterFamilyAddrs keeps only this family's literals, dropping empty/"any" and
+// WRONG-FAMILY tokens and canonicalizing each. A MALFORMED token — one that is
+// neither a valid address nor a valid prefix — returns an error so the caller
+// FAILS THE PLAN CLOSED (#6512).
+//
+// Dropping a malformed token per-token and installing the surviving subset is
+// the fail-open this closes. It is wrong in BOTH directions and the direction
+// depends on data the lowering cannot see:
+//
+//   - a POSITIVE list narrows — a `discard`/`reject` term then enforces a
+//     smaller address set than the operator wrote, and a host in the dropped
+//     range is accepted by fall-through;
+//   - an EXCEPT list WIDENS, and if every token is malformed the list empties
+//     and lo0AddrScope's empty-except arm drops the predicate entirely, so the
+//     direction becomes UNCONSTRAINED and the rule matches every address. That
+//     is the "empty means match everything" shape, so skipping a bad entry can
+//     never be the fix here.
+//
+// Failing closed instead is the same posture parsePortTokens / lo0DSCPs take in
+// this file for an unrepresentable port / DSCP token (#6405), and it is what
+// the exec-`nft` oracle does for those: emit the raw token, `nft -f -` rejects
+// the whole ruleset, the prior ruleset is retained. nftFamilyAddrs in
+// pkg/daemon/daemon_nft.go now keeps a malformed address token verbatim for the
+// same reason, so the two builders still agree.
+//
+// Fail-closed here does NOT mean fail-to-boot (#1960). The install error makes
+// applyLo0Filter warn and, with no real filter loaded, install the cold-boot
+// fail-closed fence — which admits the mandatory L3 / return traffic and never
+// touches a lifeline interface — and the boot apply logs and discards the
+// error. A config that used to load still loads; it just does not get a kernel
+// filter that differs from what the operator wrote.
+//
+// Malformedness is detected HERE rather than read off the #6463
+// AddressUnrepresentable marker because that marker is derived from
+// term.UnknownAddresses, which records only malformed LITERAL `from
+// source-address` / `destination-address` tokens. A malformed entry inside a
+// referenced `policy-options prefix-list` reaches this builder through
+// ResolveFilterPrefixListAddrs with the marker unset — and, unlike a bad
+// literal, it is not rejected by the strict commit gate either (see
+// validateFirewallPrefixListReferencesStrict, which validates the reference,
+// not the entries). Detecting the token itself covers both provenances.
+func filterFamilyAddrs(f nlFamily, addrs []string) ([]string, error) {
 	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
 		if a == "" || a == "any" {
@@ -242,8 +296,9 @@ func filterFamilyAddrs(f nlFamily, addrs []string) []string {
 			}
 			continue
 		}
+		return nil, fmt.Errorf("malformed address %q (neither an IP nor a CIDR prefix)", a)
 	}
-	return out
+	return out, nil
 }
 
 // lo0Protocols mirrors the #3436 numeric protocol lowering: resolve each Junos
