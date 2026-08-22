@@ -85,6 +85,23 @@ func (d *Daemon) BootstrapImportSnapshot() BootstrapImport {
 	}
 }
 
+// bootstrapShowSnapshot converts the recorded outcome into the operator-facing
+// shape (#6496). It exists as a named method rather than as a closure at each
+// wiring site because there are TWO sites — the gRPC server config
+// (daemon_run_servers.go) and the in-process CLI hook (daemon_run.go) — and a
+// field silently dropped from one of two hand-copied conversions is exactly the
+// divergence the shared renderer was introduced to prevent. One conversion,
+// directly testable.
+func (d *Daemon) bootstrapShowSnapshot() bootstrapshow.Snapshot {
+	b := d.BootstrapImportSnapshot()
+	return bootstrapshow.Snapshot{
+		Status:  b.Status,
+		Error:   b.Error,
+		UnixSec: b.UnixSec,
+		Failed:  b.Failed,
+	}
+}
+
 // recordCompileFailure tracks a dataplane compile failure and emits an
 // escalating log (#758). The first failure remains a single WARN;
 // every Nth repeat re-emits at ERROR level so an operator tailing the

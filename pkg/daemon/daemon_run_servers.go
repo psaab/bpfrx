@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/psaab/xpf/pkg/api"
-	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/eventengine"
 	"github.com/psaab/xpf/pkg/feeds"
@@ -142,15 +141,7 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// authenticated, and the failure REASON is the entire point of the
 		// command (#5031 withholds it from /health because that endpoint is
 		// unauthenticated, which is a different question from privilege).
-		BootstrapImportFn: func() bootstrapshow.Snapshot {
-			b := d.BootstrapImportSnapshot()
-			return bootstrapshow.Snapshot{
-				Status:  b.Status,
-				Error:   b.Error,
-				UnixSec: b.UnixSec,
-				Failed:  b.Failed,
-			}
-		},
+		BootstrapImportFn: d.bootstrapShowSnapshot,
 		RPMResultsFn: func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()

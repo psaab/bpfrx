@@ -63,3 +63,34 @@ func TestFailedFlagTracksTheFailedStatusOnly(t *testing.T) {
 		t.Errorf("Error = %q, want the recorded detail", got.Error)
 	}
 }
+
+// bootstrapShowSnapshot is the ONE conversion both wiring sites use (the gRPC
+// server config and the in-process CLI hook). Every field must survive it: a
+// dropped Error is a box that reports import-failed with no reason, and a
+// dropped Failed is one that reports the failure without the remediation
+// block. RED on revert: drop any field from the conversion.
+func TestBootstrapShowSnapshotCarriesEveryField(t *testing.T) {
+	d := &Daemon{}
+	d.recordBootstrapImport(bootstrapImportFailed, "day-0 config REJECTED: bad stanza")
+
+	want := d.BootstrapImportSnapshot()
+	got := d.bootstrapShowSnapshot()
+
+	if got.Status != want.Status {
+		t.Errorf("Status = %q, want %q", got.Status, want.Status)
+	}
+	if got.Error != want.Error {
+		t.Errorf("Error = %q, want %q — an import-failed with no reason is the "+
+			"state this command exists to avoid", got.Error, want.Error)
+	}
+	if got.UnixSec != want.UnixSec {
+		t.Errorf("UnixSec = %d, want %d", got.UnixSec, want.UnixSec)
+	}
+	if got.Failed != want.Failed {
+		t.Errorf("Failed = %v, want %v", got.Failed, want.Failed)
+	}
+	if got.UnixSec == 0 {
+		t.Error("recordBootstrapImport did not stamp a time; the conversion " +
+			"assertion above would pass vacuously")
+	}
+}

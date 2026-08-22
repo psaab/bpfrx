@@ -18,16 +18,18 @@ import (
 // case and handleShowSystem returns "unknown show system target".
 func TestHandleShowSystemDispatchesBootstrapImport(t *testing.T) {
 	const detail = `day-0 config REJECTED: unknown statement "dataplane-type"`
-	c := &CLI{
-		bootstrapImportFn: func() bootstrapshow.Snapshot {
-			return bootstrapshow.Snapshot{
-				Status:  bootstrapshow.StatusFailed,
-				Error:   detail,
-				UnixSec: 1755792000,
-				Failed:  true,
-			}
-		},
-	}
+	// Wired through SetBootstrapImportFn, NOT by assigning the private field:
+	// the setter is the seam the daemon actually uses, and a test that writes
+	// the field directly stays green with the setter's body emptied.
+	c := &CLI{}
+	c.SetBootstrapImportFn(func() bootstrapshow.Snapshot {
+		return bootstrapshow.Snapshot{
+			Status:  bootstrapshow.StatusFailed,
+			Error:   detail,
+			UnixSec: 1755792000,
+			Failed:  true,
+		}
+	})
 	var err error
 	out := captureStdout(t, func() { err = c.handleShowSystem([]string{"bootstrap-import"}) })
 	if err != nil {
@@ -54,7 +56,8 @@ func TestConsoleBootstrapImportMatchesTheSharedRenderer(t *testing.T) {
 		{Status: bootstrapshow.StatusFailed, Error: "boom", UnixSec: 1755792000, Failed: true},
 		{},
 	} {
-		c := &CLI{bootstrapImportFn: func() bootstrapshow.Snapshot { return snap }}
+		c := &CLI{}
+		c.SetBootstrapImportFn(func() bootstrapshow.Snapshot { return snap })
 		out := captureStdout(t, func() { _ = c.handleShowSystem([]string{"bootstrap-import"}) })
 		var want bytes.Buffer
 		bootstrapshow.Render(&want, snap)

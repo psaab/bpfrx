@@ -26,9 +26,14 @@ import (
 // healthy default for a failed box.
 func TestShowTextBootstrapImportRendersTheWiredSnapshot(t *testing.T) {
 	const detail = `day-0 config REJECTED: unknown statement "dataplane-type"`
-	s := &Server{
-		store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
-		bootstrapImportFn: func() bootstrapshow.Snapshot {
+	// Constructed through NewServer, NOT as a bare &Server{...}: the wiring
+	// under test is Config.BootstrapImportFn -> server.bootstrapImportFn, and a
+	// test that sets the private field directly stays GREEN with that assignment
+	// deleted. It did, on the first draft — the mutation that removed the
+	// NewServer line left this file passing, which is what sent the tests back.
+	s := NewServer("127.0.0.1:0", Config{
+		Store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
+		BootstrapImportFn: func() bootstrapshow.Snapshot {
 			return bootstrapshow.Snapshot{
 				Status:  bootstrapshow.StatusFailed,
 				Error:   detail,
@@ -36,7 +41,7 @@ func TestShowTextBootstrapImportRendersTheWiredSnapshot(t *testing.T) {
 				Failed:  true,
 			}
 		},
-	}
+	})
 	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "bootstrap-import"})
 	if err != nil {
 		t.Fatalf("ShowText(bootstrap-import) error = %v", err)
@@ -62,10 +67,10 @@ func TestShowTextBootstrapImportMatchesTheSharedRenderer(t *testing.T) {
 		{Status: bootstrapshow.StatusFailed, Error: "boom", UnixSec: 1755792000, Failed: true},
 		{},
 	} {
-		s := &Server{
-			store:             newConfigStore(t, t.TempDir()+"/xpf.conf"),
-			bootstrapImportFn: func() bootstrapshow.Snapshot { return snap },
-		}
+		s := NewServer("127.0.0.1:0", Config{
+			Store:             newConfigStore(t, t.TempDir()+"/xpf.conf"),
+			BootstrapImportFn: func() bootstrapshow.Snapshot { return snap },
+		})
 		resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "bootstrap-import"})
 		if err != nil {
 			t.Fatalf("ShowText(%q) error = %v", snap.Status, err)
@@ -84,7 +89,9 @@ func TestShowTextBootstrapImportMatchesTheSharedRenderer(t *testing.T) {
 // unit build) must still get a rendered answer, not an empty body an operator
 // would read as "nothing wrong".
 func TestShowTextBootstrapImportWithNoHookStillRenders(t *testing.T) {
-	s := &Server{store: newConfigStore(t, t.TempDir()+"/xpf.conf")}
+	s := NewServer("127.0.0.1:0", Config{
+		Store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
+	})
 	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "bootstrap-import"})
 	if err != nil {
 		t.Fatalf("ShowText(bootstrap-import) with nil hook error = %v", err)
