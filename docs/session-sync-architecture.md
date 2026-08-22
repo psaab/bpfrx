@@ -218,6 +218,55 @@ deterministic side initiates per fabric. `TCP_NODELAY` is enabled.
 | 15 | BulkAck | Secondary -> Primary | Bulk acknowledgement |
 | 30 | ConfigKeyExchange | Bidirectional | Ephemeral X25519 public key for config-payload encryption (#6629) |
 | 31 | ConfigEncrypted | Primary -> Secondary | Type 8's payload, sealed (#6629) |
+| 32 | AuthUpgradeHello | Bidirectional | In-place authentication upgrade: challenge (#6628) |
+| 33 | AuthUpgradeProof | Bidirectional | In-place authentication upgrade: proof (#6628) |
+| 34 | AuthUpgradeAck | Bidirectional | In-place authentication upgrade: responder switch marker (#6628) |
+
+### In-Place Authentication Upgrade (#6628)
+
+A connection's authentication was fixed at setup: `performSyncHandshake` runs
+only when a local key is configured, and committing a key does not restart
+cluster comms (`clusterTransportKey` excludes it, pinned by
+`TestAuthKeyChangeDoesNotRestartClusterComms_5078`). So an established stream
+stayed unauthenticated indefinitely after the key was committed, and a rotation
+never rekeyed a live connection.
+
+`ReconcileConnectionAuth` runs from the apply tail on every commit and starts an
+upgrade on any connection whose recorded PSK differs from the live one. It is a
+**mid-stream key switch**, so the frame key is held per direction
+(`authConn.readKey` / `writeKey`) and each side switches at the boundary the
+peer switched at — TCP's per-direction ordering makes a frame an unambiguous
+boundary:
+
+```
+I (initiator)                          R (responder)
+-- Hello{nI} ------------------->
+                                       <-- Proof{proof_R(nI), nR} --   (no switch)
+verifies proof over nI  ⇒ key equality proven
+-- Proof{proof_I(nR), nI} ------>      then I sets writeKey
+                                       verifies, sets readKey (this frame
+                                       IS the boundary)
+                                       <-- Ack --                     then R sets writeKey
+receives Ack, sets readKey
+```
+
+The fourth frame is not ceremony. In the obvious three-frame version R switches
+its write direction right after sending its Proof, having proven nothing; if the
+two nodes hold **different** keys — a botched rotation — I's verification fails,
+I never switches, and R's next sealed frame reaches a reader not expecting a
+trailer. Frame desync, connection dropped, by the mechanism whose premise is
+that it never drops. Deferring R's switch until it has verified I's proof means
+neither side switches until key equality is mutually proven.
+
+Simultaneous initiation needs no tie-break message: both ends know both nonces,
+and the smaller nonce initiates. `syncCheckPeerNonce` (the #5078 reflection
+guard) applies unchanged. `writeKey` is installed under `writeMu` inside the
+same critical section as the frame that precedes it.
+
+**Not closed:** a hostile stream admitted before the commit declines the upgrade
+by staying silent, and a decliner is indistinguishable from a legitimate
+not-yet-keyed peer. Closing that needs a bounded drop window — the mechanism
+#5078 shipped and removed.
 
 (Types 16-29 are listed in `pkg/cluster/sync.go`; the two above are called out
 here because they change how type 8 travels.)

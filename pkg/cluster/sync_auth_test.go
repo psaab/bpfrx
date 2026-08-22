@@ -79,8 +79,8 @@ func TestSyncAuthHandshakeBothKeyedAuthenticates(t *testing.T) {
 
 	// A sealed session frame must round-trip: seal on A's authConn, verify on
 	// B's authConn (their frame keys are equal).
-	sender := &authConn{Conn: ca, key: ar.key}
-	receiver := &authConn{Conn: cb, key: br.key}
+	sender := &authConn{Conn: ca, readKey: ar.key, writeKey: ar.key}
+	receiver := &authConn{Conn: cb, readKey: br.key, writeKey: br.key}
 	frame := encodeRawMessage(syncMsgSessionV4, []byte("session-payload"))
 	sealed := sender.sealFrame(frame)
 
@@ -406,8 +406,8 @@ func TestSyncAuthDisabledNoHandshake(t *testing.T) {
 // rejected. RED on revert: sealFrame/verifyFrame do not exist.
 func TestSyncFrameSealVerifyRoundTripAndReplay(t *testing.T) {
 	key := []byte("per-connection-frame-key-abc")
-	send := &authConn{key: key}
-	recv := &authConn{key: key}
+	send := &authConn{readKey: key, writeKey: key}
+	recv := &authConn{readKey: key, writeKey: key}
 
 	split := func(sealed []byte) (header, payload, trailer []byte) {
 		header = sealed[:syncHeaderSize]
@@ -441,7 +441,7 @@ func TestSyncFrameSealVerifyRoundTripAndReplay(t *testing.T) {
 	}
 
 	// Tampered payload must fail the HMAC on a fresh receiver.
-	recv2 := &authConn{key: key}
+	recv2 := &authConn{readKey: key, writeKey: key}
 	tampered := append([]byte(nil), p2...)
 	tampered[0] ^= 0xFF
 	if err := recv2.verifyFrame(h2, tampered, tr2); err != errSyncFrameAuth {
@@ -449,7 +449,7 @@ func TestSyncFrameSealVerifyRoundTripAndReplay(t *testing.T) {
 	}
 
 	// Wrong key must fail the HMAC.
-	recv3 := &authConn{key: []byte("wrong-key")}
+	recv3 := &authConn{readKey: []byte("wrong-key"), writeKey: []byte("wrong-key")}
 	if err := recv3.verifyFrame(h1, p1, tr1); err != errSyncFrameAuth {
 		t.Fatalf("wrong-key frame must fail HMAC, got %v", err)
 	}

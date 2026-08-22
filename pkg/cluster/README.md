@@ -1993,19 +1993,31 @@ Dual-accept made the forward direction non-disruptive:
 3. **Restart `xpfd` on both nodes**, one at a time, waiting for the cluster
    to re-form in between.
 
-Step 3 is not optional. **Session sync fixes a connection's authentication
-state when the TCP connection is established** (`performSyncHandshake` →
-`wrapSyncConn`), and committing the key does **not** restart cluster comms —
-the restart decision compares only `clusterTransportKey`
-(`daemon_apply_tail.go` / `daemon_ha_sync.go`), which does not include the
-auth key. So an already-established session-sync stream stays
-**unauthenticated indefinitely** after the key is committed: a hostile stream
-admitted before the commit keeps injecting frames, and legitimate traffic
-stays unsigned until an incidental disconnect or a restart. The heartbeat and
-the fabric gRPC listener DO pick the key up immediately (both read the live
-key per frame / per RPC); only session sync is connection-scoped. Tracked as
-**#6628** — until it is fixed, the restart is the operator's part of the
-contract.
+Step 3 is **no longer required for the legitimate peer** (#6628), and the
+reason it used to be is worth keeping in view.
+
+Session sync fixed a connection's authentication state when the TCP connection
+was established (`performSyncHandshake` → `wrapSyncConn`), and committing the
+key does **not** restart cluster comms — the restart decision compares only
+`clusterTransportKey` (`daemon_apply_tail.go` / `daemon_ha_sync.go`), which
+excludes the auth key, deliberately, because that connection is what carries
+the key to a read-only secondary. So an already-established stream stayed
+unauthenticated indefinitely. The heartbeat and the fabric gRPC listener always
+picked the key up immediately (both read the live key per frame / per RPC);
+only session sync was connection-scoped.
+
+A commit now triggers an **in-place upgrade** over the established connection
+(`sync_auth_upgrade.go`): a four-frame exchange promotes it to authenticated,
+and re-derives its frame key on a rotation, with no reconnect. It only ever
+promotes and never drops, so a peer that cannot participate is left exactly as
+it was.
+
+**What is still open, and it is the reason to keep reading:** a HOSTILE stream
+admitted before the commit declines the upgrade by staying silent, and a
+decliner is indistinguishable from a legitimate peer that is not keyed yet —
+which is the rolling-upgrade case the mechanism must not break. Restarting
+`xpfd` remains the only thing that evicts such a stream. If you have reason to
+believe the control segment was hostile before you keyed it, restart.
 
 Confirm the posture with `show chassis cluster statistics`, whose
 `Authentication:` line (`controlLinkAuthStatus`) reads
