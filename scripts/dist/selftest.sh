@@ -681,6 +681,60 @@ else
     bad "publish MUST pass a complete inventory set but FAILED (#6500 control)"
 fi
 
+# ── 8k. #6504: the signed channel pointer has a CONSUMER ───────────────────
+# publish.py has always produced, signed and gated latest.json, and
+# docs/distribution.md named "our scripts" as its consumers — while no script
+# read it. This leg closes the loop END TO END with the real tools: publish.py
+# writes and signs the pointer, then `xpf-deploy.py fetch` with NO --version
+# resolves it, verifies it against the pinned pubkey, and fetches + verifies
+# the artifacts it names. A drift between the producer's JSON and the
+# consumer's parse fails here rather than at a customer's first fetch.
+info "8k. xpf-deploy fetch consumes the signed latest.json pointer (#6504)"
+FT="$WORK/fetch-src"; FD="$WORK/fetch-dst"; mkdir -p "$FT" "$FD"
+cp "$QCOW" "$META" "$SIDECAR" "$PKGS" "$MANIFEST" "$MANIFEST.minisig" "$FT/"
+XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
+    --channel stable --version "$VER" --dist "$FT" >/dev/null 2>&1
+# XDG_STATE_HOME is redirected: `fetch` advances an anti-rollback watermark and
+# a self-test must never touch the operator's real state.
+fetch_stable() {
+    XPF_IMAGE_PUBKEY="$WORK/img.pub" XDG_STATE_HOME="$WORK/state" \
+        $PY "$ROOT/scripts/deploy/xpf-deploy.py" fetch \
+            --image-url "file://$FT" --channel stable --out "$1" --no-import
+}
+rm -rf "$FD"; mkdir -p "$FD"
+if out=$(fetch_stable "$FD" 2>&1); then
+    if [ -f "$FD/xpf-$VER.qcow2" ] && [ -f "$FD/xpf-$VER.incus-metadata.tar.gz" ]; then
+        ok "fetch with no --version resolved the channel and verified the artifacts (#6504)"
+    else
+        bad "fetch resolved the channel but did not land the artifacts (#6504)"
+    fi
+else
+    bad "fetch MUST resolve stable/latest.json with no --version but FAILED (#6504): $out"
+fi
+
+# A TAMPERED pointer must be refused. The signature stays put and only the
+# bytes change — the stale-mirror / swapped-object case, which is the whole
+# reason the pointer is signed.
+#
+# The tamper edits the DATE, deliberately NOT the version. Rewriting the
+# version to something unpublished also makes the fetch fail, but for the
+# WRONG reason — the artifacts it names are simply absent — so that leg would
+# have passed with the signature check ripped out entirely. (Confirmed: it
+# did, until this fixture changed.) Editing a field the fetch never uses
+# leaves the signature as the ONLY thing that can refuse it.
+rm -rf "$FD"; mkdir -p "$FD"
+sed 's/"date": "[^"]*"/"date": "1999-01-01T00:00:00Z"/' \
+    "$FT/stable/latest.json" > "$FT/stable/latest.json.new"
+if cmp -s "$FT/stable/latest.json" "$FT/stable/latest.json.new"; then
+    bad "8k tamper fixture changed NOTHING — the leg would pass vacuously (#6504)"
+fi
+mv "$FT/stable/latest.json.new" "$FT/stable/latest.json"
+if fetch_stable "$FD" >/dev/null 2>&1; then
+    bad "fetch MUST refuse a tampered latest.json but PASSED (#6504)"
+else
+    ok "fetch refuses a tampered latest.json (#6504)"
+fi
+
 # ── 9. install.sh H-16: validate-before-mutate + cleanup-on-failure ─────────
 info "9. install.sh validate-before-mutate + cleanup-on-failure (H-16)"
 H16="$WORK/h16"; mkdir -p "$H16/bin" "$H16/keyrings" "$H16/sources"

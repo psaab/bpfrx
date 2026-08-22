@@ -521,13 +521,13 @@ func ValidateConfig(cfg *Config) []string {
 			}
 		}
 		// #3226 fold: every advisory below reasons about the EFFECTIVE token
-		// set — the zone-level list UNION the per-interface override, via the
-		// shared UnionHostInboundTokens — because that is what enforcement acts
-		// on (Junos host-inbound is additive across the two levels). Reasoning
-		// per RAW STANZA made the advisories contradict enforcement AND each
-		// other: a zone `any-service` with a per-interface `rpm` warned that rpm
-		// was DENIED when the union full-admits it. Sharing the union removes
-		// the whole class rather than special-casing each pair.
+		// set — via the shared EffectiveHostInboundTokens — because that is what
+		// enforcement acts on. Reasoning per RAW STANZA made the advisories
+		// contradict enforcement AND each other: a zone `any-service` with a
+		// per-interface `rpm` warned that rpm was DENIED when the effective set
+		// admits everything. Sharing the resolver removes the whole class rather
+		// than special-casing each pair. Post-#6515 that resolver REPLACES the
+		// zone level with a declared interface stanza rather than unioning them.
 		var zoneSvcs []string
 		if zone.HostInboundTraffic != nil {
 			zoneSvcs = zone.HostInboundTraffic.SystemServices
@@ -544,15 +544,20 @@ func ValidateConfig(cfg *Config) []string {
 			}
 			return false
 		}
-		// The zone-level stanza governs every interface that does NOT override.
-		// If EVERY interface in the zone overrides with a full-admit, the
-		// zone-level narrowing is unobservable and its advisories are moot too.
+		// The zone-level stanza governs every interface that does NOT declare its
+		// own host-inbound-traffic stanza. #6515: an interface that declares one
+		// REPLACES the zone set, so if EVERY interface in the zone declares one,
+		// the zone-level tokens reach nothing and their advisories are moot.
+		// (Before #6515 the levels unioned, so only a full-admit override could
+		// make the zone-level narrowing unobservable — a strictly narrower
+		// condition.) The lookup is the exact ref, so a unit that merely INHERITS
+		// a physical-parent override is not counted here and the advisory is still
+		// emitted: erring toward showing an advisory, never toward hiding one.
 		zoneObservable := !effectiveFullAdmits(zoneSvcs)
 		if zoneObservable && len(zone.Interfaces) > 0 {
 			allCovered := true
 			for _, ifRef := range zone.Interfaces {
-				hi := zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)]
-				if hi == nil || !effectiveFullAdmits(hi.SystemServices) {
+				if zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)] == nil {
 					allCovered = false
 					break
 				}
@@ -579,8 +584,9 @@ func ValidateConfig(cfg *Config) []string {
 			}
 			where := fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef)
 			// The EFFECTIVE set for this interface, exactly as the dataplane
-			// enforcement view builder computes it.
-			effective := UnionHostInboundTokens(zoneSvcs, hi.SystemServices)
+			// enforcement view builder computes it — post-#6515 the override
+			// REPLACES the zone-level set rather than adding to it.
+			effective := EffectiveHostInboundTokens(zoneSvcs, hi.SystemServices, true)
 			// The full-admit notice stays keyed on the OVERRIDE's own tokens: it
 			// reports what this stanza declares, and a zone-level `any-service`
 			// already drew its own notice at the zone level.
@@ -1869,6 +1875,12 @@ func ValidateConfig(cfg *Config) []string {
 	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
 	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
 
+	// #6544: 802.3ad link aggregation is schema-advertised and commits
+	// clean while being entirely inert. Accepted-only advisory so the
+	// operator is not told the aggregate exists by three layers at once
+	// and handed nothing.
+	warnings = append(warnings, validateLinkAggregationWarnings(cfg)...)
+
 	// #4788 + #4785 half 1: `tunnel mode ipip` is now HARD-REJECTED at commit
 	// (validateIpipTunnelUnimplementedStrict, compiler_tailgates.go), but the
 	// advisory MUST stay registered here. The alarm surfaces — `show system
@@ -1888,6 +1900,7 @@ func ValidateConfig(cfg *Config) []string {
 	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress
 	// interface). Surface that Junos-parity/hardening gap at commit; the per-zone
 	// iifname enforcement remains deferred.
+	warnings = append(warnings, validateHostInboundOverrideReplaceWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundMulticastWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundManagedRoutingMismatch(cfg)...)
 

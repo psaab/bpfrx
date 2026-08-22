@@ -26,7 +26,8 @@ import (
 type ZoneHostInboundView struct {
 	Zone string
 	// Interfaces lists the interface refs whose EFFECTIVE host-inbound token
-	// set (zone-level ∪ interface-level override, #3362) equals this view's
+	// set (the interface-level override when one is declared, else the
+	// zone-level set — #6515 replace semantics, #3362) equals this view's
 	// SystemServices/Protocols. A zone with no per-interface override yields a
 	// single view per zone covering all its interfaces (pre-#3362 shape); a zone
 	// with an override yields one view per distinct effective token set, each
@@ -92,8 +93,9 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	// traffic is never denied (#3277).
 	lifelines := hostInboundLifelineSet(cfg)
 	// #3362: per-interface host-inbound override lookup (ref → override, with
-	// physical→unit expansion). The EFFECTIVE token set for an interface is the
-	// UNION of its zone-level set and this override; interfaces in the same zone
+	// physical→unit expansion). An interface that declares an override is
+	// described ENTIRELY by it — the zone-level set is REPLACED, not unioned
+	// (#6515); interfaces in the same zone
 	// with the SAME effective set share one view (one nft address set), so a zone
 	// with NO override produces exactly one view per zone (pre-#3362 shape).
 	overrideByIface := buildInterfaceHostInboundMap(cfg)
@@ -192,7 +194,7 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 		if !configured(zone) {
 			continue
 		}
-		svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, nil)
+		svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, nil)
 		getGroup(name, svc, proto, "")
 	}
 
@@ -236,7 +238,7 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 		if !configured(zone) {
 			continue
 		}
-		svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, overrideByIface[snap.Name])
+		svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, overrideByIface[snap.Name])
 		var g *group
 		for _, a := range snap.Addresses {
 			host := hostIPFromCIDR(a.Address)
@@ -298,7 +300,7 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 			if !configured(zone) {
 				continue
 			}
-			svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, overrideByIface[unitName])
+			svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, overrideByIface[unitName])
 			vgKeys := make([]string, 0, len(unit.VRRPGroups))
 			for k := range unit.VRRPGroups {
 				vgKeys = append(vgKeys, k)
