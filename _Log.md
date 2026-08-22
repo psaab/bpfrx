@@ -101602,3 +101602,11 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/daemon_ha_comms_wiring.go, docs/session-sync-architecture.md,
     pkg/cluster/sync_config_apply_nack_7328_test.go,
     pkg/daemon/configsync_rearm_7328_test.go
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (shape family) — fixed the four compact-leaf members whose
+    operand was dropped before a strict gate read it: ALG disable, prefix-list,
+    static next-hop (inverse shape), tcp-mss. Single-sourced the tcp-mss reader.
+  - **File(s)**: pkg/config/compiler_security_alg.go, pkg/config/compiler_routing.go,
+    pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
+    docs/config-schema.md
