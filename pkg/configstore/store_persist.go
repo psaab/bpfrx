@@ -110,8 +110,10 @@ func (s *Store) Load() error {
 	s.active = tree
 	s.compiled = compiled
 	s.loadRollbackHistory()
-	s.recoverPendingConfirmLocked()
-	return nil
+	// #6538: the recovery can leave the store with a nil compiled config (its
+	// rollback target failed even the lenient compile). Load MUST NOT report
+	// success in that state — see recoverPendingConfirmLocked.
+	return s.recoverPendingConfirmLocked()
 }
 
 // recoverPendingConfirmLocked restores a commit-confirmed window that was
@@ -133,18 +135,33 @@ func (s *Store) Load() error {
 //   - deadline still in the future -> re-arm the timer for the REMAINING
 //     duration so the original auto-rollback still fires; a clean restart
 //     inside the window therefore also keeps the hatch.
-func (s *Store) recoverPendingConfirmLocked() {
+//
+// #6538: it returns an error so Load can FAIL CLOSED when the recovery leaves
+// no compiled config. The rollback target here is a previously-committed
+// config, and Load repairs the tree it reads from active.json
+// (rewriteRetiredDataplaneType, SanitizeTreeControlChars) but never the
+// PrevTree carried inside confirm.json — so a target committed on an older
+// build can fail even the LENIENT compile. Warning and continuing assigned the
+// nil into s.compiled while marking everCommitted, which the daemon resolves
+// to a NORMAL boot with NO policy: positional claim-all interface naming on a
+// box with no compiled configuration. The returned error is tagged
+// ErrConfigCompile so classifyLoadError routes it to the same #1922
+// bootstrap/lifeline safe state the #1960 main-path compile failure gets. The
+// rollback itself still runs to completion first — reverting the unconfirmed
+// config is the safety property, and the operator needs the reverted tree
+// reachable to fix it from the CLI.
+func (s *Store) recoverPendingConfirmLocked() error {
 	if s.db == nil {
-		return
+		return nil
 	}
 	rec, err := s.db.ReadConfirm()
 	if err != nil {
 		slog.Warn("failed to read persisted commit-confirmed state; cannot restore the "+
 			"pending auto-rollback window", "err", err, "issue", "#4577")
-		return
+		return nil
 	}
 	if rec == nil {
-		return
+		return nil
 	}
 	// #5835: a stale record must not resurrect a rollback of an unrelated,
 	// already-confirmed generation. GuardedHash binds the record to the
@@ -161,7 +178,7 @@ func (s *Store) recoverPendingConfirmLocked() {
 			"that is no longer active (a later commit/confirm superseded it); not resurrecting its "+
 			"rollback", "issue", "#5835")
 		s.resolveConfirmRemovalLocked("stale_confirm_recovery")
-		return
+		return nil
 	}
 	prevTree := rec.PrevTree
 	if prevTree == nil {
@@ -174,6 +191,10 @@ func (s *Store) recoverPendingConfirmLocked() {
 		// with the same persistence semantics as PromoteRollback.
 		s.active = prevTree
 		var perr error
+		// recoverErr is the #6538 fail-closed signal, returned at the end of
+		// this branch so the rollback's persistence/journal/record-removal all
+		// still run first.
+		var recoverErr error
 		if rec.FirstCommit {
 			// #1922 Item 1b: the rollback target is the empty bootstrap tree;
 			// persist committed=0 and clear everCommitted so a later restart
@@ -185,8 +206,22 @@ func (s *Store) recoverPendingConfirmLocked() {
 		} else {
 			compiled, cerr := s.compileTreeLenient(prevTree)
 			if cerr != nil {
-				slog.Warn("recovered commit-confirmed rollback target failed to compile; "+
-					"continuing with the reverted tree", "err", cerr, "issue", "#4577")
+				// #6538: s.compiled is about to become nil while everCommitted
+				// stays true — the exact (ActiveConfig()==nil, everCommitted)
+				// shape #1960 fails closed on. Record it so Load returns an
+				// ErrConfigCompile-tagged error at the end of this branch
+				// instead of reporting success; the daemon then enters the
+				// #1922 bootstrap/lifeline safe state rather than a NORMAL
+				// boot with no policy. The rollback below still completes:
+				// reverting the unconfirmed config is the safety property, and
+				// the reverted tree must stay reachable so the operator can
+				// fix it from the CLI.
+				slog.Error("recovered commit-confirmed rollback target failed to compile; "+
+					"reverting to it anyway and refusing config-driven takeover — fix the "+
+					"configuration from the CLI or roll back",
+					"err", cerr, "issue", "#6538")
+				recoverErr = fmt.Errorf("compile commit-confirmed rollback target: %w: %w",
+					ErrConfigCompile, cerr)
 			}
 			s.compiled = compiled
 			s.persistMarkerCommitted = true
@@ -225,7 +260,7 @@ func (s *Store) recoverPendingConfirmLocked() {
 		})
 		slog.Warn("commit-confirmed window expired while the daemon was down; configuration "+
 			"rolled back to the pre-confirm state on boot", "issue", "#4577")
-		return
+		return recoverErr
 	}
 
 	// Still within the window: re-arm the timer for the remaining duration so
@@ -236,13 +271,26 @@ func (s *Store) recoverPendingConfirmLocked() {
 	// is resolved.
 	remaining := time.Until(rec.Deadline)
 	s.confirmPrevTree = prevTree
+	// #6538: first-commit-ness comes from the PERSISTED record, which is the
+	// only authority on whether PrevTree is the empty bootstrap tree. It must
+	// NOT be re-derived from confirmPrevCfg below, which goes nil on a compile
+	// failure too.
+	s.confirmPrevFirst = rec.FirstCommit
 	if rec.FirstCommit {
 		s.confirmPrevCfg = nil
 	} else {
 		compiled, cerr := s.compileTreeLenient(prevTree)
 		if cerr != nil {
-			slog.Warn("recovered commit-confirmed rollback target failed to compile; the "+
-				"pending auto-rollback will revert store state only", "err", cerr, "issue", "#4577")
+			// The window's rollback can still revert store state and the
+			// on-disk tree, but there is no compiled config to re-apply, so
+			// the daemon will fall back to the bootstrap/lifeline safe state
+			// if the timer fires. confirmPrevFirst stays false, so the
+			// rollback persists the target as COMMITTED (#6538) rather than
+			// writing the never-committed marker over a real config.
+			slog.Error("recovered commit-confirmed rollback target failed to compile; the "+
+				"pending auto-rollback will revert store state and disk only, and the "+
+				"daemon will drop to the bootstrap/lifeline safe state if it fires",
+				"err", cerr, "issue", "#6538")
 		}
 		s.confirmPrevCfg = compiled
 	}
@@ -253,6 +301,7 @@ func (s *Store) recoverPendingConfirmLocked() {
 	})
 	slog.Info("restored pending commit-confirmed window after restart; auto-rollback re-armed",
 		"remaining", remaining.String(), "issue", "#4577")
+	return nil
 }
 
 // Save persists the active configuration to disk.

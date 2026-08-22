@@ -100200,6 +100200,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
 
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 — fence-only drop scope (`BuildFenceAddrSets`): withhold
+    lifeline-shared addresses (Finding A), cover every firewall-local address
+    including on a zone-less router (Finding B); wire both fence call sites.
+  - **File(s)**: pkg/dataplane/userspace/zones_host_inbound.go,
+    pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+    pkg/daemon/host_inbound_fence_scope_6492_test.go,
+    pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+    docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 Finding C — add the sticky-re-render subsumption proof
+    (the #6489 whole-table re-render never fences a lifeline-shared address on
+    ANY render, and still picks up an address that appears mid-degradation).
+  - **File(s)**: pkg/daemon/host_inbound_fence_scope_6492_test.go
 ## 2026-08-21 — #6427: split manager_ha.go into seven responsibility-scoped files
 
 - **Timestamp**: 2026-08-21
@@ -100252,6 +100267,14 @@ prose edit above them added. No diff falls in the new test body.
   existing #6031 tests green while silently reverting the fix.
 - **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
 
+- **Timestamp**: 2026-08-21
+  - **Action**: #6512 — lo0 kernel mirror fails CLOSED on a malformed address
+    token instead of installing a narrowed/widened rule; oracle keeps the token
+    verbatim so `nft -f -` rejects; #3433 H09 sub-case re-pinned.
+  - **File(s)**: pkg/nftables/netlink_lo0.go, pkg/daemon/daemon_nft.go,
+    pkg/nftables/netlink_lo0_addrs_6512_test.go,
+    pkg/daemon/lo0_addr_failclosed_6512_test.go, pkg/daemon/lo0_filter_test.go,
+    pkg/daemon/README.md, pkg/nftables/README.md
 ## 2026-08-21 — #6535 periodic converger for the Kea applier
 - **Timestamp**: 2026-08-21
 - **Action**: Track whether a Kea apply converged (`applyFailed` +
@@ -100451,6 +100474,41 @@ prose edit above them added. No diff falls in the new test body.
   encoding the duplicate's own (in one case destructive) contract.
 - **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
   pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)
+
+- **Action**: #6536 — proxy-ARP teardown must be driven by config removal, not
+  by a failed interface resolution. `ReconcileProxyARP` takes the caller's
+  ifindex -> Linux-netdev-name mapping and uses it as the fallback key for the
+  responder sysctl when `netlink.LinkByIndex` fails; `proxyARPIfaceMap` returns
+  the names it could not resolve at all, and `reconcileProxyARP` carries their
+  prior `(iface -> families)` state forward into the enabled set before the
+  #2475 teardown diff runs. Adds `linkByIndexSeam` so the transient can be
+  injected. Fail-on-revert table test localises: the still-configured row reds,
+  the genuinely-removed row stays green.
+- **File(s)**: pkg/dataplane/proxyarp.go,
+  pkg/dataplane/proxyarp_unresolved_6536_test.go,
+  pkg/dataplane/proxyarp_test.go, pkg/dataplane/proxyarp_orphan_4955_test.go,
+  pkg/daemon/daemon_proxyarp.go,
+  pkg/daemon/daemon_proxyarp_unresolved_6536_test.go,
+  pkg/daemon/daemon_proxyarp_test.go,
+  pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
+  `Store.confirmPrevFirst` records first-commit-ness where it is known (arm
+  site: pre-promotion `s.compiled`; recovery site: the persisted
+  `rec.FirstCommit`), and both consumers — `PromoteRollback`'s
+  `firstCommitRollback` and the `firstCommit` bit `writeConfirmState`
+  persists — read the flag instead of re-deriving it, so a rollback target
+  that failed the lenient compile no longer persists `committed=0` over a real
+  config. Separately, the expired-during-downtime recovery branch now returns
+  an `ErrConfigCompile`-tagged error (propagated by `Load`) instead of warning
+  and shipping a nil compiled config with `everCommitted=true`, so the daemon
+  fails closed into the #1922 bootstrap/lifeline state rather than a NORMAL
+  boot with no policy. Four one-at-a-time mutations each red exactly one test.
+- **File(s)**: pkg/configstore/store.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_persist.go,
+  pkg/configstore/confirm_recovery_uncompilable_target_6538_test.go,
+  pkg/daemon/daemon_apply_commit.go, pkg/configstore/README.md,
+  pkg/daemon/README.md, _Log.md
 
 ## 2026-08-21 — #7268 scope 1: retire compileNPTv6's eBPF nptv6_rules writes
 - **Timestamp**: 2026-08-21
