@@ -84,6 +84,44 @@ zero-dataplane-surface doctrine (the Component A per-zone `iifname` DROP
 enforcement stays deferred/PLAN-KILLed). BGP/LDP (unicast) and PIM (unmanaged)
 are out of scope.
 
+## The DHCP-server sibling (#6460)
+
+The same "the host-inbound stanza reads as enforced and is not" shape reaches the
+**DHCP server**, and neither advisory above can see it — both cross-check
+*routing protocols* against FRR, and the DHCP server is neither a routing
+protocol nor rendered into FRR. A third advisory
+(`validateDHCPServerHostInboundBypassWarnings`,
+`pkg/config/compiler_validate_warn_dhcp_hostinbound.go`) covers it: it WARNs when
+a `system services dhcp-local-server` / `dhcpv6-local-server` group binds an
+interface whose zone's effective `host-inbound-traffic system-services` set omits
+`dhcp` / `dhcpv6`.
+
+The two families are unenforced for **different** reasons, and the message says
+which — an operator told the wrong reason reaches for the wrong remedy:
+
+| Family | Why the zone token does not bound it |
+|---|---|
+| DHCPv4 (`dhcp`) | xpf renders Kea's `Dhcp4` with **no** `dhcp-socket-type` key (`pkg/dhcpserver/dhcpserver.go` emits `interfaces-config` with an `interfaces` list and nothing else), so Kea's default `raw` applies. The server receives on an **AF_PACKET** socket, which is delivered **before** the netfilter input hook — the `xpf_hostinbound` chain never sees the request at all. |
+| DHCPv6 (`dhcpv6`) | Kea's `Dhcp6` has no raw mode, but a client addresses the server at the **ff02::1:2** multicast group. Every per-zone host-inbound rule — the accepts AND the #3361 catch-all deny — is scoped `<fam> daddr <zone unicast addrs>` (`pkg/nftables/netlink_hostinbound.go`, `emitHostInboundZoneNetlink`), so a multicast destination matches neither and falls through the base chain's `policy accept` (`pkg/nftables/netlink_installer.go`). This is the same fall-through the routing-multicast gap above rides. |
+
+The remedy in the message deliberately leads with **removing the interface from
+the group**, not with adding the token: adding the token cannot enforce anything
+on the v4 path (the AF_PACKET tap is upstream of netfilter), so presenting it as
+*the fix* would restate the same false signal in a new place. The token is
+offered only as a way to record that the segment is meant to be served.
+
+Zone attribution and effective-admission resolution reuse the same two SSOTs
+Component B uses (`zoneIfaceLogicalKeys`, `ZoneConfig.InterfaceHostInboundEffective`),
+so the three advisories cannot drift in which interfaces they can see.
+WARN-only, zero dataplane surface, no error return and no `lenient` flag — the
+#1960 no-brick property is structural, matching the #5619 doctrine.
+
+**Enforcement is not planned.** The v6 leg needs the same per-zone `iifname`
+class gate Component A was PLAN-KILLed for. The v4 leg cannot be closed by
+netfilter at all — it would need Kea moved to `dhcp-socket-type: udp`, which
+breaks address-less clients that require raw broadcast reach, so it is a
+behaviour choice rather than a bug fix and is tracked separately.
+
 ## Protocol → multicast-group catalog
 
 The single source of truth is `hostInboundMulticastCatalog` in
@@ -146,3 +184,7 @@ is the only operator-visible surface.
   that `all` stopped admitting packet-wide).
 - `pkg/config/host_inbound_tokens.go` — the recognized-token allowlist, family
   maps, and per-tuple L4 match SSOT.
+- `pkg/config/compiler_validate_warn_dhcp_hostinbound.go` — the #6460
+  DHCP-server sibling advisory described above.
+- `pkg/dhcpserver/README.md` — the Kea render, including the AF_PACKET
+  socket-type default that leg turns on.

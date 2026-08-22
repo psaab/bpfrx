@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/nat"
@@ -300,10 +301,9 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		totalPorts := 0
-		if portHigh >= portLow {
-			totalPorts = (portHigh - portLow + 1) * addrCount
-		}
+		// #6553: one shared formula across all four surfaces (this guard used
+		// to exist only here).
+		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, addrCount))
 
 		avail := totalPorts - used
 		if avail < 0 {
