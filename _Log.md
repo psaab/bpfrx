@@ -103257,3 +103257,12 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: userspace-dp/src/afxdp/coordinator/{neighbor_manager.rs,mod.rs,
     tests.rs}, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/main_tests.rs,
     userspace-dp/src/nat64_tests.rs, docs/engineering-style.md
+
+## 2026-08-22 — #6992 duplicate system login user blocks
+- **Timestamp**: 2026-08-22
+- **Action**: Fold a duplicated `system login user` name into ONE compiled entry
+  (per-leaf last-authored-wins, matching the flat spelling) so no reader can
+  pick a different block, and register the container in the #5180 duplicate
+  gate so the silent drop is rejected at commit.
+- **File(s)**: pkg/config/compiler_system.go, pkg/config/dup_named_blocks.go,
+  pkg/config/duplicate_login_user_6992_test.go, docs/config-schema.md

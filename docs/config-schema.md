@@ -615,6 +615,60 @@ peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.
 
+### Duplicate `system login user` name (#6992)
+
+The same `user` name authored in two `system login` blocks was WORSE than the
+last-writer-wins drop the #5180 gate covers: both blocks survived in
+`Login.Users`, and two readers picked DIFFERENT ones.
+
+| reader | picks |
+|---|---|
+| `configuredClass` (`pkg/cli/identity.go`) | the FIRST block with a non-empty class |
+| `applySystemLogin` (`pkg/daemon/daemon_system.go`) | iterates every block in order, so the account state that lands comes from the LAST |
+
+Measured on a config that committed CLEAN at strict:
+
+```
+user alice { uid 2001; class admins; authentication { ssh-rsa "K1"; } }
+user alice { uid 2002; class ops;    authentication { ssh-rsa "K2"; } }
+```
+
+`applySystemLogin` rewrites `authorized_keys` per entry with
+`WriteFileDurable`, so **K2** — the key the operator wrote under the VIEW-only
+block — is the one on disk, while `configuredClass` answered **admins**. The
+credential that authenticates and the class that authorizes it came from
+different blocks, in the permissive direction. This is the third instance of the
+class in this area: #6861 keyed an advisory on a name the runtime resolved
+differently, #6838 keyed a fold on a class name the runtime picked differently.
+
+**The fix is a fold, not a matched tie-break.** `compileSystemLogin` collapses a
+duplicated name into ONE entry with per-LEAF last-authored-wins — which is what
+the FLAT spelling already produces, because `SetPath` merges `set system login
+user alice …` written twice onto one node and replaces each leaf. That makes the
+two AST shapes agree (the #5180 dual-AST-equivalence property) rather than
+inventing a third answer, and it is stronger than teaching one reader the
+other's tie-break: after the fold there is no tie to break. #6838 records why the
+weaker form is wrong — matching a tie-break is a proxy that rots the day the
+other reader changes.
+
+Per-LEAF, not per-block: a second block authoring only a `class` must leave the
+first block's `uid` in place, because that is what the flat spelling gives.
+Folding to the last BLOCK would silently zero it.
+
+The `authentication` section is the one exception — a later block's section
+replaces the earlier block's key set wholesale rather than merging into it. That
+is chosen so the fold preserves the PROVISIONED state exactly: `authorized_keys`
+is already rewritten per entry, so the last entry's keys are already the ones on
+disk.
+
+`system login user` is also registered in the #5180 duplicate-named-block gate,
+because a fold is still a silent drop of the earlier block's uid / class / keys.
+Strict rejects; the tolerant load / peer-sync path warns and boots (#1960).
+
+Deliberately NOT applied to `system login class`: #6838 already made the class
+cohort reader-independent by folding permissions across the whole same-named
+set, and a merge here would fight that design.
+
 ### Duplicate NAT rule name (#5649, C181-M18)
 
 NAT rule-sets are ordered, first-match tables keyed by rule name, so a rule's
