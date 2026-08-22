@@ -48,7 +48,7 @@ func TestLeaseTeardownSuppressedBySurfaceACoowner_5748(t *testing.T) {
 	// WireRRClaim the lease guard consults (exactly what SurfaceAManager.WireRRClaims
 	// returns in production).
 	m.surfaceACoowners = func() []WireRRClaim {
-		return []WireRRClaim{wireRRClaim("host-a.example.com", "A", "10.0.0.10")}
+		return []WireRRClaim{wireRRClaim("host-a.example.com", "A", "10.0.0.10", "")}
 	}
 
 	// Phase 1: publish + own the lease record.
@@ -92,7 +92,7 @@ func TestLeaseTeardownNoCoownerStillDeletes_5748(t *testing.T) {
 	pol := enabledPolicy()
 	// A Surface A record exists, but for a DIFFERENT name/address — not a co-owner.
 	m.surfaceACoowners = func() []WireRRClaim {
-		return []WireRRClaim{wireRRClaim("other.example.com", "A", "10.9.9.9")}
+		return []WireRRClaim{wireRRClaim("other.example.com", "A", "10.9.9.9", "")}
 	}
 
 	if err := runReconcile(t, m, pol, []Lease{leaseV4("10.0.0.10", "mac:aa", "host-a")}); err != nil {
@@ -161,7 +161,7 @@ func TestSurfaceATeardownDefersToLeaseCoowner_5748_6015(t *testing.T) {
 	// side); the injected accessor presents the normalized WireRRClaim (exactly what
 	// Manager.WireRRClaims returns in production).
 	m.SetLeaseCoownerSource(func() []WireRRClaim {
-		return []WireRRClaim{wireRRClaim("wan.example.net", "A", "203.0.113.5")}
+		return []WireRRClaim{wireRRClaim("wan.example.net", "A", "203.0.113.5", "")}
 	})
 
 	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
@@ -233,7 +233,7 @@ func TestCrossSurfaceMutualTeardownNotOrphaned_6015(t *testing.T) {
 	// Surface A's PRE-REBUILD snapshot still lists the co-owned RR (frozen to model
 	// the overlapping-pass race: B reads A's snapshot before A rebuilds it).
 	b.surfaceACoowners = func() []WireRRClaim {
-		return []WireRRClaim{wireRRClaim(fqdn, "A", rdata)}
+		return []WireRRClaim{wireRRClaim(fqdn, "A", rdata, "")}
 	}
 
 	// ---- Surface A: the SurfaceAManager ----
@@ -243,7 +243,7 @@ func TestCrossSurfaceMutualTeardownNotOrphaned_6015(t *testing.T) {
 	// Surface B's PRE-REBUILD snapshot still lists the co-owned RR (the symmetric
 	// frozen snapshot: A reads B's snapshot before B rebuilds it).
 	a.SetLeaseCoownerSource(func() []WireRRClaim {
-		return []WireRRClaim{wireRRClaim(fqdn, "A", rdata)}
+		return []WireRRClaim{wireRRClaim(fqdn, "A", rdata, "")}
 	})
 
 	// Phase 1 — both surfaces publish + own the SAME RR. The lease host is the
@@ -334,7 +334,7 @@ func TestSurfaceATeardownNoLeaseCoownerStillDeletes_5748(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
 	m.SetLeaseCoownerSource(func() []WireRRClaim {
-		return []WireRRClaim{wireRRClaim("other.example.net", "A", "198.51.100.7")}
+		return []WireRRClaim{wireRRClaim("other.example.net", "A", "198.51.100.7", "")}
 	})
 
 	sc := surfaceAScope("wan.example.net", FamilyV4, 0)

@@ -1545,7 +1545,9 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 		// ONE surface ever deletes a cross-surface co-owned RR — mutual suppression can
 		// never orphan it, and A never clobbers B's still-owned record. The
 		// leaseCoowners read is LOCK-FREE (no Manager.mu), so this is safe under m.mu.
-		if m.leaseWireRRCoowner(owned.FQDN, owned.ForwardType, a.String()) {
+		// #6755: pass THIS record's publish-time authority so a lease claim at a
+		// DIFFERENT DNS endpoint no longer suppresses the delete.
+		if m.leaseWireRRCoowner(owned.FQDN, owned.ForwardType, a.String(), owned.BackendFingerprint) {
 			deferredCoowned++
 			m.deleteCoowned++
 			// Re-assert the RR (self-heal): re-UPSERT the exact owned RR so a leaked
@@ -1705,7 +1707,11 @@ func (m *SurfaceAManager) rebuildWireRRClaimsLocked() {
 		if rdata == "" {
 			continue
 		}
-		claims = append(claims, wireRRClaim(r.FQDN, r.ForwardType, rdata))
+		// #6755: the record's own publish-time endpoint fingerprint. Stored on
+		// the durable record since #3735 for the withdraw path, so no catalog
+		// lookup is needed here and the authority is the one this record was
+		// ACTUALLY published to, not whatever the catalog says today.
+		claims = append(claims, wireRRClaim(r.FQDN, r.ForwardType, rdata, r.BackendFingerprint))
 	}
 	m.wireRRClaims.Store(&claims)
 }
@@ -1715,13 +1721,13 @@ func (m *SurfaceAManager) rebuildWireRRClaimsLocked() {
 // about to delete (#5748). It reads the injected lease-claim snapshot LOCK-FREE
 // (no Manager.mu), so it is safe to call while holding m.mu. Nil accessor ⇒ no
 // cross-surface co-owner (pre-#5748 behavior). Caller holds m.mu.
-func (m *SurfaceAManager) leaseWireRRCoowner(fqdn, forwardType, rdata string) bool {
+func (m *SurfaceAManager) leaseWireRRCoowner(fqdn, forwardType, rdata, authority string) bool {
 	if m.leaseCoowners == nil {
 		return false
 	}
-	want := wireRRClaim(fqdn, forwardType, rdata)
+	want := wireRRClaim(fqdn, forwardType, rdata, authority)
 	for _, c := range m.leaseCoowners() {
-		if c == want {
+		if c.coOwns(want) {
 			return true
 		}
 	}
@@ -1797,20 +1803,71 @@ func backendFingerprint(p *config.DDNSProvider) string {
 	if backend == "" {
 		backend = "rfc2136" // resolveSurfaceABackend's default
 	}
-	// Length-prefixed, order-fixed, credential-free tuple so no pair of adjacent
-	// fields can alias across the boundary (a value cannot inject the separator).
+	return authorityFingerprint(
+		backend,
+		p.UpdateServer, // rfc2136 target
+		p.Server,       // dyndns2 endpoint override
+		p.Zone,         // cloudflare zone
+		p.HostedZoneID, // route53 hosted zone
+		p.AWSRegion,    // route53 region
+		p.URLTemplate,  // generic endpoint template (%u/%p are placeholders, not live creds)
+	)
+}
+
+// authorityFingerprint is the SHARED format behind every DDNS authority
+// identity in this package (#6755). Both ownership surfaces derive their
+// identity through it, so the two can never drift into hashing the same
+// endpoint differently — a divergence here would silently make two records at
+// one authority look like two authorities, which reverts #5748's cross-surface
+// clobber protection.
+//
+// Length-prefixed, order-fixed and credential-free, so no pair of adjacent
+// fields can alias across the boundary (a value cannot inject the separator)
+// and no secret material participates.
+//
+// The Surface A provider catalog and the DHCP lease policy populate DIFFERENT
+// subsets of these slots, and that is deliberate rather than a gap: `Zone`,
+// `HostedZoneID`, `AWSRegion` and `URLTemplate` are backend-specific fields
+// (Zone is documented as the CLOUDFLARE zone and is read only by
+// backend_cloudflare.go), so an rfc2136 provider leaves them empty on BOTH
+// sides. rfc2136 is the one backend the two surfaces share, and for it each
+// side populates exactly `backend` + `updateServer` — so the same server hashes
+// identically across surfaces, and a genuinely different backend or endpoint
+// does not.
+func authorityFingerprint(backend, updateServer, server, zone, hostedZoneID, awsRegion, urlTemplate string) string {
 	var sb strings.Builder
 	writeField := func(s string) { fmt.Fprintf(&sb, "%d:%s|", len(s), s) }
 	writeField(backend)
-	writeField(p.UpdateServer) // rfc2136 target
-	writeField(p.Server)       // dyndns2 endpoint override
-	writeField(p.Zone)         // cloudflare zone
-	writeField(p.HostedZoneID) // route53 hosted zone
-	writeField(p.AWSRegion)    // route53 region
-	writeField(p.URLTemplate)  // generic endpoint template (%u/%p are placeholders, not live creds)
+	writeField(updateServer)
+	writeField(server)
+	writeField(zone)
+	writeField(hostedZoneID)
+	writeField(awsRegion)
+	writeField(urlTemplate)
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(sb.String()))
 	return fmt.Sprintf("fp1-%016x", h.Sum64())
+}
+
+// leaseAuthorityFingerprint is the DHCP lease surface's authority identity,
+// built through the same shared format so it is comparable with a Surface A
+// record's stored BackendFingerprint (#6755).
+//
+// DHCPDynamicDNSConfig carries Backend and UpdateServer (documented as the
+// rfc2136 host:port target) and no other endpoint-identifying field, so the
+// remaining slots are empty — which is exactly what an rfc2136 Surface A
+// provider produces. The TSIG material is deliberately NOT included: it is
+// credential material, and two policies differing only in key would still be
+// the same authority.
+func leaseAuthorityFingerprint(c *config.DHCPDynamicDNSConfig) string {
+	if c == nil {
+		return ""
+	}
+	backend := c.Backend
+	if backend == "" {
+		backend = "rfc2136" // the lease surface's default, matching Surface A's
+	}
+	return authorityFingerprint(backend, c.UpdateServer, "", "", "", "", "")
 }
 
 // ownedBackendStatus classifies whether an owned record's ORIGINAL publish

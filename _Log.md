@@ -104050,3 +104050,15 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/server/handlers/binding.rs,
   userspace-dp/src/server/handlers/queue.rs,
   userspace-dp/src/server/tests.rs
+
+## 2026-08-22 — #6755 DDNS wire-RR claims carry their DNS authority
+- **Timestamp**: 2026-08-22
+- **Action**: WireRRClaim was {FQDN,type,rdata} with no authority, so two
+  surfaces publishing the same RR to DIFFERENT servers compared equal and the
+  teardown suppressed its own DELETE, leaving the record published forever.
+  Added Authority (credential-free endpoint fingerprint) + a coOwns predicate
+  treating an empty authority as UNKNOWN rather than different. Single-sourced
+  the fingerprint format so the two surfaces cannot drift.
+- **File(s)**: pkg/ddns/state.go, pkg/ddns/surface_a.go, pkg/ddns/manager.go,
+  pkg/ddns/cross_surface_authority_6755_test.go,
+  pkg/ddns/cross_surface_clobber_5748_test.go
