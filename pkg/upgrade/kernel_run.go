@@ -88,6 +88,14 @@ func (r *KernelRunner) ktransition(j *KernelJournal, s KernelState) error {
 // the process dies right after SetBootNext, the firmware clears BootNext on the
 // next boot, so at worst the candidate is tried once and falls back.
 func (r *KernelRunner) Arm(candidateVersion string) error {
+	// FIRST, before the candidate is even looked at (#6631). A journal the boot
+	// gate does not read makes this arm unpromotable no matter what is armed,
+	// so it outranks every per-invocation complaint below: telling an operator
+	// their version string is malformed, when the command could not have worked
+	// with a perfect one, sends them to fix the wrong thing.
+	if err := r.checkArmJournalPromotable(); err != nil {
+		return fmt.Errorf("kernel-upgrade arm: %w", err)
+	}
 	if candidateVersion == "" {
 		return fmt.Errorf("kernel-upgrade: candidate version is required")
 	}

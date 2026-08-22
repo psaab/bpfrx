@@ -113,6 +113,24 @@ _fake_exec() {
 	#   systemctl show -p ExecStart --value xpfd  (via bash -c "... sed ...")
 	#   sha256sum <path>
 	case "$1" in
+	cli)
+		# #6591: `cli -c "<command>"`. Every invocation is appended to
+		# $CLI_LOG so a test can assert the ISSUED SEQUENCE (reset ->
+		# transfer -> reset), and `show chassis cluster status` is answered
+		# from $CLI_STATUS_QUEUE — one line-delimited response per read, the
+		# last one repeating. That models the real failure: the first reads
+		# after a deploy fail while the daemon settles, later ones succeed.
+		shift
+		[[ "$1" == "-c" ]] && shift
+		local cmd="$1"
+		printf '%s\n' "$cmd" >>"$CLI_LOG"
+		if [[ "$cmd" == "show chassis cluster status" ]]; then
+			_fake_cli_status
+			return $?
+		fi
+		# request ... : succeed silently unless a test says otherwise.
+		return "${CLI_REQUEST_RC:-0}"
+		;;
 	test)
 		shift
 		# test -f <path>  /  used by deploy_reconcile_stale_pin
@@ -214,6 +232,46 @@ _fake_remote_bash() {
 		return 0
 	fi
 	return 0
+}
+
+# ── #6591 cli mock state ──────────────────────────────────────────────
+# CLI_STATUS_RESPONSES is an array of status payloads consumed one per
+# `show chassis cluster status`; the LAST entry repeats once exhausted.
+# An empty string models an unreadable status (daemon still starting).
+# The read index is FILE-BACKED, not a shell variable. `status=$(incus exec
+# ...)` is a command substitution, i.e. a subshell, so a variable increment
+# inside it is discarded — the counter would stick at 0 and every read would
+# return the same response. That would have made the retry test below
+# unfailable in one direction and permanently red in the other; it is exactly
+# the kind of fixture defect that produces a confident wrong answer.
+CLI_LOG=""
+CLI_IDX_FILE=""
+CLI_REQUEST_RC=0
+declare -a CLI_STATUS_RESPONSES=()
+
+_fake_cli_status() {
+	local n=${#CLI_STATUS_RESPONSES[@]}
+	(( n == 0 )) && return 1
+	local i
+	i=$(<"$CLI_IDX_FILE")
+	printf '%s' "$(( i + 1 ))" >"$CLI_IDX_FILE"
+	(( i >= n )) && i=$(( n - 1 ))
+	local body="${CLI_STATUS_RESPONSES[$i]}"
+	[[ -z "$body" ]] && return 1
+	printf '%s\n' "$body"
+}
+
+reset_cli_mock() {
+	CLI_LOG=$(mktemp)
+	CLI_IDX_FILE=$(mktemp)
+	printf '0' >"$CLI_IDX_FILE"
+	CLI_REQUEST_RC=0
+	CLI_STATUS_RESPONSES=()
+	# No sleeping in the self-test; the retry COUNTS are what is under test.
+	DEPLOY_REASSERT_READ_DELAY=0
+	DEPLOY_REASSERT_VERIFY_DELAY=0
+	DEPLOY_REASSERT_READ_TRIES=3
+	DEPLOY_REASSERT_VERIFY_TRIES=3
 }
 
 # ── Fixtures ──────────────────────────────────────────────────────────
@@ -642,6 +700,173 @@ test_rolling_rg_ids() {
 	fi
 }
 
+# ── #6591 post-deploy reassert: fail-closed ──────────────────────────
+# The pre-fix reassert read `show chassis cluster status`, and if the read
+# failed it iterated ZERO redundancy groups, warned, and returned SUCCESS. The
+# deploy then reported DEPLOY_RC=0 with the cluster left inverted relative to
+# its configured priorities (node0 at priority 200 sitting secondary behind
+# node1 at 100 — preempt=no means nothing corrects it), and the next HA smoke
+# died in its own preflight where the natural first hypothesis is that the
+# change under test broke HA. Measured twice on the shared gate.
+#
+# It also never verified the resulting role, so even a status read that
+# SUCCEEDED could leave the cluster un-reasserted and still report success.
+
+STATUS_BOTH_RG_NODE0_PRIMARY="Redundancy group: 0 , Failover count: 0
+node0   200       primary        no       no       None
+node1   100       secondary      no       no       None
+
+Redundancy group: 1 , Failover count: 0
+node0   200       primary        no       no       None
+node1   100       secondary      no       no       None
+"
+
+# The state the lead actually observed after a deploy that reported success.
+STATUS_INVERTED_RG0="Redundancy group: 0 , Failover count: 0
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+"
+
+# The partial case a per-RG loop can produce and a `grep node0.*primary`
+# cannot see: RG0 reasserted, RG1 still inverted.
+STATUS_RG0_OK_RG1_INVERTED="Redundancy group: 0 , Failover count: 0
+node0   200       primary        no       no       None
+node1   100       secondary      no       no       None
+
+Redundancy group: 1 , Failover count: 0
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+"
+
+test_reassert_verifier_accepts_all_primary() {
+	if printf '%s' "$STATUS_BOTH_RG_NODE0_PRIMARY" | deploy_reassert_node0_primary_ok; then
+		ok "reassert verify: node0 primary for every RG -> accept"
+	else
+		bad "reassert verify: rejected a fully reasserted cluster"
+	fi
+}
+
+test_reassert_verifier_rejects_inverted() {
+	if printf '%s' "$STATUS_INVERTED_RG0" | deploy_reassert_node0_primary_ok; then
+		bad "reassert verify: accepted node0=secondary/node1=primary — the exact state a deploy reported success on"
+	else
+		ok "reassert verify: inverted RG0 -> reject"
+	fi
+}
+
+test_reassert_verifier_rejects_partial() {
+	if printf '%s' "$STATUS_RG0_OK_RG1_INVERTED" | deploy_reassert_node0_primary_ok; then
+		bad "reassert verify: accepted RG0-ok/RG1-inverted — the property is EVERY RG, which a per-line grep cannot express"
+	else
+		ok "reassert verify: partial reassert (RG1 inverted) -> reject"
+	fi
+}
+
+test_reassert_verifier_rejects_empty() {
+	# THE FAIL-OPEN CELL. An unreadable status must not read as "nothing to
+	# check, therefore fine".
+	if printf '%s' "" | deploy_reassert_node0_primary_ok; then
+		bad "reassert verify: accepted an EMPTY status — an unreadable cluster status must FAIL, not pass vacuously (#6591)"
+	else
+		ok "reassert verify: empty/unreadable status -> reject"
+	fi
+}
+
+test_reassert_dies_when_status_never_readable() {
+	reset_cli_mock
+	CLI_STATUS_RESPONSES=("")   # every read fails, for all retries
+	local rc=0
+	( deploy_reassert_primary_node0 "fake:vm0" ) >/dev/null 2>&1 || rc=$?
+	if (( rc != 0 )); then
+		ok "reassert: unreadable status -> DIES (rc=$rc), deploy cannot report success"
+	else
+		bad "reassert: unreadable status returned SUCCESS — this is the #6591 fail-open that cost two gate cycles"
+	fi
+}
+
+test_reassert_retries_status_read_until_settled() {
+	reset_cli_mock
+	# Two failed reads (daemon still settling ~20s post-deploy), then good.
+	CLI_STATUS_RESPONSES=("" "$STATUS_BOTH_RG_NODE0_PRIMARY" "$STATUS_BOTH_RG_NODE0_PRIMARY")
+	local rc=0
+	( deploy_reassert_primary_node0 "fake:vm0" ) >/dev/null 2>&1 || rc=$?
+	if (( rc == 0 )); then
+		ok "reassert: retries the status read across the post-deploy settle window"
+	else
+		bad "reassert: gave up on a transient unreadable status (rc=$rc) — the measured failure was a read that succeeded moments later"
+	fi
+}
+
+test_reassert_dies_when_role_not_achieved() {
+	reset_cli_mock
+	# Status is readable throughout, but node0 never becomes primary: the
+	# transfer was accepted and did not land. Only a verify can tell these
+	# apart, which is why the exit code of the request is not the verdict.
+	CLI_STATUS_RESPONSES=("$STATUS_INVERTED_RG0")
+	local rc=0
+	( deploy_reassert_primary_node0 "fake:vm0" ) >/dev/null 2>&1 || rc=$?
+	if (( rc != 0 )); then
+		ok "reassert: role not achieved -> DIES (rc=$rc) instead of handing the next smoke an inverted cluster"
+	else
+		bad "reassert: reported success while node0 stayed SECONDARY for RG0"
+	fi
+}
+
+test_reassert_issues_reset_transfer_reset_per_rg() {
+	reset_cli_mock
+	CLI_STATUS_RESPONSES=("$STATUS_BOTH_RG_NODE0_PRIMARY")
+	( deploy_reassert_primary_node0 "fake:vm0" ) >/dev/null 2>&1 || true
+	local seq
+	seq=$(grep -v '^show chassis cluster status$' "$CLI_LOG" | tr '\n' '|')
+	local want="request chassis cluster failover reset redundancy-group 0|request chassis cluster failover redundancy-group 0 node 0|request chassis cluster failover reset redundancy-group 0|request chassis cluster failover reset redundancy-group 1|request chassis cluster failover redundancy-group 1 node 0|request chassis cluster failover reset redundancy-group 1|"
+	if [[ "$seq" == "$want" ]]; then
+		ok "reassert: issues reset -> TRANSFER -> reset for every RG"
+	else
+		bad "reassert: wrong command sequence.
+  got:  $seq
+  want: $want
+(the original #6591 report was that only 'failover reset' was issued — that clears the manual flag and never MOVES ownership)"
+	fi
+}
+
+test_reassert_transfer_rc_is_not_the_verdict() {
+	reset_cli_mock
+	# Every request returns non-zero, but the cluster ends up correct. The
+	# verdict is the OBSERVED ROLE, so this must succeed — otherwise a noisy
+	# but harmless CLI rc would fail an otherwise good deploy.
+	CLI_REQUEST_RC=1
+	CLI_STATUS_RESPONSES=("$STATUS_BOTH_RG_NODE0_PRIMARY")
+	local rc=0
+	( deploy_reassert_primary_node0 "fake:vm0" ) >/dev/null 2>&1 || rc=$?
+	if (( rc == 0 )); then
+		ok "reassert: a failing request rc with the correct end state still passes (role is the verdict)"
+	else
+		bad "reassert: failed on a request rc despite node0 being primary everywhere (rc=$rc)"
+	fi
+}
+
+# The WIRING. Every test above drives deploy_reassert_primary_node0 directly,
+# so all of them stay green if cluster-setup.sh stops calling it — which is the
+# mutation that actually matters, because the function only ever runs from
+# there. It is also asserted to run after BOTH deploy paths (rolling and
+# rolling-deb), since a reassert wired into one of them leaves the other
+# handing the next smoke an un-reasserted cluster.
+test_reassert_is_wired_into_both_deploy_paths() {
+	local f="${SCRIPT_DIR}/cluster-setup.sh"
+	local lib call n
+	lib=$(_first_line_matching "$f" '^[[:space:]]*deploy_reassert_primary_node0 ')
+	n=$(grep -c '^[[:space:]]*reassert_primary_node0$' "$f" || true)
+	if [[ -z "$lib" ]]; then
+		bad "wiring: cluster-setup.sh never calls deploy_reassert_primary_node0 — the fail-closed reassert exists but nothing invokes it, so a deploy reasserts nothing and still reports success (#6591)"
+		return
+	fi
+	if (( n < 2 )); then
+		bad "wiring: reassert_primary_node0 is called $n time(s); expected both deploy paths (deploy_rolling and deploy_rolling_deb)"
+		return
+	fi
+	ok "wiring: reassert routed through the lib at :$lib and called from $n deploy paths"
+}
+
 # ── Run ───────────────────────────────────────────────────────────────
 test_rolling_secondary_node0_primary
 test_rolling_secondary_node0_secondary
@@ -661,6 +886,16 @@ test_reconcile_dangling_sbin_keeps_valid
 test_verify_running_match
 test_verify_running_stale_pin_hardfails
 test_verify_running_stale_binary_hardfails
+test_reassert_verifier_accepts_all_primary
+test_reassert_verifier_rejects_inverted
+test_reassert_verifier_rejects_partial
+test_reassert_verifier_rejects_empty
+test_reassert_dies_when_status_never_readable
+test_reassert_retries_status_read_until_settled
+test_reassert_dies_when_role_not_achieved
+test_reassert_issues_reset_transfer_reset_per_rg
+test_reassert_transfer_rc_is_not_the_verdict
+test_reassert_is_wired_into_both_deploy_paths
 test_preflight_pass_proceeds
 test_preflight_reject_hardfails
 test_preflight_reject_touches_nothing

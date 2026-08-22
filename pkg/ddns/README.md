@@ -496,6 +496,87 @@ refuse every keyed endpoint. Its userinfo cases are what make it a real guard
 (`url.Parse` rejects `<redacted>@host` with "invalid userinfo"); a query-only
 case would be vacuous, since `?<redacted>` parses fine as a raw query.
 
+#### The other direction: provider RESPONSE TEXT (#6634)
+
+Everything above bounds error VALUES that carry a REQUEST URL. #6634 is the
+opposite flow: text the **provider** put in its response BODY, which four
+backends rendered straight into a returned error the daemon logs and retains as
+the provider's `lastErr` — Cloudflare's `Errors[].Message`, Route 53's decoded
+`Code`/`Message`, and the unrecognized first response line on dyndns2 and
+DuckDNS, plus three Cloudflare `json.Unmarshal` sites that rendered the decoder
+error with `%w` (Go's decoder quotes the offending input back).
+
+The provider is the untrusted party, and **no hostile transport is needed** —
+only an API that answers "your request was invalid: `<the request>`" and echoes
+our own update URL back. DuckDNS makes that concrete: its token travels in the
+QUERY STRING of the update URL, so the echo IS the credential.
+
+**Two thirds of the surface was already closed, elsewhere, and the fix does not
+duplicate it.** Control-character forgery at the terminal is closed by
+`termsafe.SanitizeForDisplay` on both `show services ddns` surfaces (#6468,
+whose own source comment names these exact sites); control characters in the
+journal are closed by the daemon's `slog.TextHandler`, which `strconv.Quote`s
+any value carrying a byte outside printable ASCII, so an embedded newline cannot
+split a log line. What NEITHER closes is a credential in the bytes, or 64 KiB of
+them (`readCappedBody` admits `httpMaxResponseBody`), logged on every reconcile
+tick of a persistent failure.
+
+So `scrubProviderText` bounds two things and is explicit about the third:
+
+1. **LENGTH — a proof.** Nothing provider-chosen exceeds `maxProviderTextBytes`
+   plus a fixed `[truncated]` marker. The Cloudflare envelope additionally
+   bounds the error COUNT: a per-message cap is not a bound when the provider
+   picks how many messages the array carries.
+2. **URL AND USERINFO SHAPES.** A whitespace-delimited token carrying `://`, a
+   userinfo-shaped `user:pass@host`, or a `%XX` escape is replaced whole. A bare
+   `user@host` is NOT withheld — no secret in it, and withholding it would eat
+   `contact support@example.com` from a legitimate message.
+3. **NOT a proof against a provider that WANTS to leak.** A credential echoed as
+   bare prose ("your token abc123 is invalid") is indistinguishable from a word,
+   and no filter recovers it. That residual is accepted rather than papered
+   over: withholding provider text wholesale, as the transport path does for its
+   own errors, costs the operator their single most useful diagnostic ("token
+   invalid", "zone not found", "rate limited") and does not actually close a
+   provider deliberately exfiltrating a credential it was already given.
+
+The order matters: **filter, then bound**. The other order splits a URL at the
+cap and leaves its prefix — `https://user:PA` — rendered.
+
+**Why not the code-mapping option** the issue leaned toward: mapping known
+provider error codes onto our own constants gives a closed output, but only for
+codes we already know, and the unmapped case is exactly the one an operator is
+debugging. Route 53 also classifies delete-idempotency on the RAW message text
+(`r53DeleteAlreadyGone` matches "but it was not found"), so the VALUE must keep
+flowing to the classifier untouched — only the RENDER goes through the scrubber.
+The Cloudflare decode sites are the exception and follow the Route 53 XML
+precedent instead: a decoder's own text has no diagnostic worth preserving, so
+it is withheld outright via `scrubInnerError`.
+
+The class gate gained `json.Unmarshal`, **file-scoped** via `producerFileScope`.
+That call decodes two different things here: in a `backend_*.go` file it decodes
+a provider response body, so the decoder quotes bytes an untrusted party chose;
+in `state.go` it decodes the ownership state file this daemon wrote itself, at a
+root-owned path, where the decoder's detail is the whole diagnostic for
+repairing a corrupt store. The scope is a PREDICATE, not a list of sites, so any
+new backend file is covered automatically — the direction a scope has to fail.
+It is a scope, not an exemption: it says where a call can carry foreign input,
+not that a known-unsafe site is tolerated.
+`TestProviderDecodeScopeIsLoadBearing_6634` pins both halves, and re-walks
+`state.go` under a lied-about filename to prove the scope actually excludes a
+site that would otherwise fail the gate.
+
+Gates: `provider_response_text_6634_test.go`. Every cell drives the REAL backend
+through a real `httptest` server and asserts the request was SERVED before
+asserting anything about the message — a unit test on the scrubber alone would
+pass whether or not any backend called it, and "the credential is absent" is
+satisfied just as well by an input that never arrived. Three axes per backend:
+the leak (what the message BECAME, a `[url withheld]` marker, not merely absence),
+the NEGATIVE CONTROL (ordinary prose must survive, or the fix is blanket
+suppression), and the BOUND. The bound cells size their payload to fit UNDER
+`readCappedBody` deliberately: a message at the full 64 KiB makes the enclosing
+JSON/XML exceed the read cap, the body arrives truncated, the decode fails, and
+the cell never reaches the render site it exists to test.
+
 ### Withdraw (DeleteLease) semantics per backend (#2772)
 
 A withdraw is triggered when a Surface A scope shrinks, a binding is removed, or

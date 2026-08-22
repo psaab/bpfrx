@@ -636,8 +636,11 @@ same_file() {
 # directory), so the gate finds neither and takes the quiet branch. That is a
 # real trap, but a DIFFERENT one -- the boot unit hardcodes this script with no
 # way to pass a journal path, so a non-default --journal is structurally
-# unpromotable, exactly as it was before this gate existed. It is tracked
-# separately; do not cite it as the motivation for the check below.
+# unpromotable, exactly as it was before this gate existed. Nothing about THIS
+# gate changed: it is closed at the other end, where the ambiguity actually is.
+# `KernelRunner.Arm` REFUSES a non-default journal path outright (#6631,
+# ErrKernelJournalUnpromotable), so the state is no longer reachable from a
+# supported operation. Do not cite it as the motivation for the check below.
 #
 # In the desyncs that ARE reachable, a candidate is armed, the gate silently
 # does not run, the candidate is never promoted, and the next reboot reverts it

@@ -54,7 +54,8 @@ is loud.
 one: Go derives the sidecar from the journal's directory, so that flag moves
 BOTH files together and the gate finds neither. It is a real trap — the boot
 unit hardcodes this script with no way to pass a journal path, so such a
-candidate is structurally unpromotable — but a pre-existing and separate one.)
+candidate is structurally unpromotable — but a separate one, closed at the ARM
+end by #6631 rather than here.)
 
 FAIL-ON-REVERT: restore `command -v xpfd` / bare `xpfd upgrade kernel promote`,
 reintroduce a compiled-default fallback, remove the arm-record check, or make
@@ -1593,9 +1594,10 @@ class TestArmedWithoutARecordIsNotLaundered(_GateBase):
 
     Explicitly NOT one of those: `arm --journal <elsewhere>`. Go derives the
     sidecar from the journal's directory, so that flag moves both files together
-    and the gate finds neither, taking the quiet branch. It is a separate,
-    pre-existing trap (the boot unit hardcodes the script with no journal
-    argument, so such a candidate can never be promoted at all) and must not be
+    and the gate finds neither, taking the quiet branch. It is a separate trap
+    (the boot unit hardcodes the script with no journal argument, so such a
+    candidate can never be promoted at all), closed at the ARM end by #6631 —
+    `KernelRunner.Arm` refuses a non-default journal path — and it must not be
     cited as this check's motivation.
 
     Not promoting is the SAFE direction, so this is availability and honesty
