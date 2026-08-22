@@ -199,7 +199,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
   via `.network` files, and brings down unconfigured interfaces.
 
 ### APIs
-- **gRPC** on 127.0.0.1:50051 — 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP, cluster)
+- **gRPC** on 127.0.0.1:50051 — 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP, cluster). Per-principal authorized server-side since #5278: a `stats.Handler` resolves the connection's peer UID at connection setup and unary+stream interceptors evaluate the caller's `system login` class (shared `pkg/authz` decision) before any handler runs. Unmapped method = deny; the fabric listener keeps its own #4107/#4122 chain
 - **HTTP REST** on 127.0.0.1:8080 — health, Prometheus metrics, config endpoints
 - **CLI** — Interactive Junos-style with tab completion, `?` help, `| match` pipe
 - **Remote CLI** — `cli` binary connects via gRPC

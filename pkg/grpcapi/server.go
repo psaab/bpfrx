@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"github.com/psaab/xpf/pkg/authz"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/clusterfailover"
 	"github.com/psaab/xpf/pkg/config"
@@ -129,6 +130,15 @@ type Config struct {
 	// unit-test / no-daemon build, where showSystemServices falls back to the
 	// documented loopback defaults.
 	ListenersFn func() sysservices.Listeners
+	// PeerLookupFn overrides how the primary listener's #5278 authorization
+	// gate learns which local account owns a connection. Production leaves it
+	// nil and the gate calls authz.LookupPeer, which reads the kernel's socket
+	// table. A test wires it so a case can state WHICH principal is calling
+	// instead of testing whichever account runs the suite; the kernel lookup
+	// itself is covered against live sockets in pkg/authz, and
+	// TestProductionServerEnforcesRealPeerIdentity_5278 closes the loop here
+	// with no injection at all.
+	PeerLookupFn func(client, server net.Addr) authz.PeerIdentity
 }
 
 // Server implements the BpfrxService gRPC service.
@@ -196,6 +206,10 @@ type Server struct {
 	// drive the peer_status classification (OK / UNREACHABLE / NOT_APPLICABLE)
 	// without a live peer.
 	peerSessionSummaryFn func(ctx context.Context) (*pb.GetSessionSummaryResponse, error)
+	// peerLookupFn resolves a connection's peer identity for the #5278
+	// authorization gate on the PRIMARY listener. Production leaves it nil and
+	// lookupPeer falls back to authz.LookupPeer; wired from Config.PeerLookupFn.
+	peerLookupFn func(client, server net.Addr) authz.PeerIdentity
 	// fabricAuthKeyFn is a test seam for the #4107 fabric-listener PSK auth.
 	// Production leaves it nil and fabricAuthKey() reads the live control-link
 	// key from the cluster manager; a unit test wires it to inject a key
@@ -248,13 +262,17 @@ func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
 }
 
 // NewServer creates a new gRPC server.
-// NOTE: gRPC is local-only (127.0.0.1) so all RPCs are inherently trusted.
-// Run enforces that trust boundary: a non-loopback bind address is clamped
-// back to loopback (clampGRPCBindToLoopback, #5035) because this listener has
-// no authentication. Login class RBAC enforcement could be added here via
-// per-RPC interceptors if gRPC is ever intentionally exposed on non-loopback
-// addresses; until then, cross-node access uses the authenticated fabric
-// listener (RunFabricListener), not this one.
+//
+// The primary listener is loopback-only AND per-principal authorized (#5278).
+// Loopback is a location, not an identity: the daemon provisions every `system
+// login user` a real shell account, so a `read-only` class holder can dial
+// 127.0.0.1:50051 directly, and pkg/cli's RBAC check runs in the CLI process
+// where such a caller simply does not run it. Run therefore does BOTH — it
+// clamps a non-loopback bind back to loopback (clampGRPCBindToLoopback, #5035)
+// AND installs the login-class authorization chain (authz.go) that derives the
+// caller's account from the kernel's socket table and denies any RPC the
+// caller's class does not hold. Cross-node access still uses the separately
+// authenticated fabric listener (RunFabricListener), not this one.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
 		store:                 cfg.Store,
@@ -292,6 +310,7 @@ func NewServer(addr string, cfg Config) *Server {
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
 		listenersFn:           cfg.ListenersFn,
+		peerLookupFn:          cfg.PeerLookupFn,
 	}
 }
 
@@ -394,15 +413,23 @@ func grpcHostIsLoopback(host string) bool {
 }
 
 // clampGRPCBindToLoopback pulls a non-loopback PRIMARY gRPC bind back to a
-// loopback of the same address family (#5035). The primary gRPC listener
-// (Run) installs only configLockInterceptor — no TLS, no authentication — so
-// NewServer's documented contract is that gRPC is loopback-only and every RPC
-// is inherently trusted (SystemAction zeroize/reboot/halt/power-off,
-// Commit/Delete/Rollback, the whole config surface). A non-loopback
-// `--grpc-addr` (`0.0.0.0`, a routable address) would therefore expose the
-// full unauthenticated control plane to the network. Unlike the
-// web-management clamp there is NO auth mode that unlocks a non-loopback bind
-// here: the intentionally network-exposed gRPC surface is the SEPARATE fabric
+// loopback of the same address family (#5035). The primary listener carries no
+// TLS and no network-facing authentication: since #5278 it authorizes each
+// caller by the LOCAL account that owns the peer socket, which is an answer the
+// kernel can only give for a caller on this host. A non-loopback `--grpc-addr`
+// (`0.0.0.0`, a routable address) would therefore expose the destructive
+// surface (SystemAction zeroize/reboot/halt/power-off, Commit/Delete/Rollback,
+// the whole config surface) to callers the gate can attribute to nobody.
+//
+// #5278 changes what that costs rather than making the clamp optional. Such a
+// caller now has no socket row on this host, so authz.LookupPeer reports it
+// unattributed and every RPC is DENIED — the exposure would be a reachable
+// listener answering PermissionDenied, not an open control plane. The clamp
+// stays because a listener that can only refuse is still a listener worth not
+// publishing, and because the availability direction is the one that bites: a
+// legitimate remote administrator cannot be served here at all. Unlike the
+// web-management clamp there is NO auth mode that unlocks a non-loopback bind:
+// the intentionally network-exposed gRPC surface is the SEPARATE fabric
 // listener (RunFabricListener), which authenticates (#4107) and allowlists
 // (#4122) every call. A genuine loopback bind (127.0.0.0/8, ::1, "localhost")
 // is returned unchanged; a bind whose host part fails to split (no port to
@@ -422,14 +449,15 @@ func clampGRPCBindToLoopback(addr string) (string, bool) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	// Fail-safe loopback clamp (#5035): the primary gRPC listener is
-	// unauthenticated, so a non-loopback bind would expose destructive RPCs to
-	// the network. Pull it back to a loopback of the same family and WARN; the
-	// daemon still boots and gRPC stays reachable on loopback (the console/SSH
-	// remain the lifeline). Cross-node access uses the authenticated fabric
-	// listener, not this one.
+	// Fail-safe loopback clamp (#5035): the primary gRPC listener authorizes by
+	// LOCAL peer credentials (#5278), which the kernel can only supply for a
+	// caller on this host, so a non-loopback bind would publish the destructive
+	// RPC surface to callers it can only refuse. Pull it back to a loopback of
+	// the same family and WARN; the daemon still boots and gRPC stays reachable
+	// on loopback (the console/SSH remain the lifeline). Cross-node access uses
+	// the authenticated fabric listener, not this one.
 	if clamped, ok := clampGRPCBindToLoopback(s.addr); ok {
-		slog.Warn("gRPC bind is non-loopback but the primary gRPC listener is unauthenticated (loopback-only trust boundary); clamping to loopback — use the authenticated cluster fabric listener for cross-node access — #5035",
+		slog.Warn("gRPC bind is non-loopback but the primary gRPC listener authorizes by local peer credentials (loopback-only trust boundary); clamping to loopback — use the authenticated cluster fabric listener for cross-node access — #5035/#5278",
 			"requested", s.addr, "clamped", clamped)
 		s.addr = clamped
 	}
@@ -447,22 +475,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// (e.g. a ":50051" wildcard clamp resolves to a concrete host:port).
 	s.setListenState(lis.Addr().String(), grpcListening)
 
-	loopbackUnary, loopbackStream := loopbackServerInterceptors()
-	srv := grpc.NewServer(
-		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		// #5883: no cluster peer ever dials this listener, so an inbound
-		// x-peer-forwarded / xpf-no-peer marker here is forged by definition.
-		// Strip both and promote NOTHING, so every handler on this listener
-		// sees the markers absent and does the peer work it is supposed to do.
-		// The chain is built by loopbackServerInterceptors so the WIRING is
-		// testable, not just the interceptor.
-		grpc.ChainUnaryInterceptor(loopbackUnary...),
-		grpc.ChainStreamInterceptor(loopbackStream...),
-		// #5849: the config-lock lifecycle is owned by a connection-scoped
-		// stats.Handler (releases on ConnEnd), NOT a per-RPC interceptor that
-		// tore the session down on any per-RPC cancellation.
-		grpc.StatsHandler(&configLockStatsHandler{s: s}),
-	)
+	srv := s.buildPrimaryServer()
 	slog.Info("gRPC server listening", "addr", s.addr)
 	// serveUntilDone returns when the serve loop exits (ctx cancel on a clean
 	// shutdown, or a Serve error). Either way the listener is no longer serving,
@@ -473,6 +486,51 @@ func (s *Server) Run(ctx context.Context) error {
 	runErr := s.serveUntilDone(ctx, srv, lis)
 	s.setListenState("", grpcFailed)
 	return runErr
+}
+
+// buildPrimaryServer constructs the primary (loopback) gRPC server with the
+// #5278 login-class authorization chain. serveUntilDone registers the service,
+// so this only builds the server — mirroring buildFabricServer, whose chain is
+// deliberately DIFFERENT and must stay so:
+//
+//	primary (Run)                fabric (RunFabricListener)
+//	principalUnary/Stream        fabricAuth* then fabricAllowlist*
+//	  who is the local ACCOUNT     is this the peer NODE, and may it proxy this RPC
+//
+// A fabric peer has no uid on this host, so the principal gate would deny every
+// cross-node call; a local login user holds no control-link PSK, so the fabric
+// gate would deny every console call. Neither chain is a superset of the other
+// and neither may be installed on the other listener.
+func (s *Server) buildPrimaryServer() *grpc.Server {
+	// #5883: no cluster peer ever dials this listener, so an inbound
+	// x-peer-forwarded / xpf-no-peer marker here is forged by definition. Strip
+	// both and promote NOTHING, so every handler on this listener sees the
+	// markers absent and does the peer work it is supposed to do. The chain is
+	// built by loopbackServerInterceptors so the WIRING is testable, not just
+	// the interceptor.
+	loopbackUnary, loopbackStream := loopbackServerInterceptors()
+	// ORDER: the #5278 principal gate runs FIRST, so a caller whose login class
+	// does not hold this RPC is refused before any request sanitisation runs on
+	// its behalf. It mirrors the fabric chain's convention (authenticate, THEN
+	// touch the markers) and is safe in the other direction too: the gate reads
+	// the connection's accept-time identity, the method and the decoded
+	// request — never metadata — so #5883's strip cannot change its verdict.
+	unary := append([]grpc.UnaryServerInterceptor{s.principalUnaryInterceptor}, loopbackUnary...)
+	stream := append([]grpc.StreamServerInterceptor{s.principalStreamInterceptor}, loopbackStream...)
+	return grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		// #5278: resolve the caller's identity ONCE per connection, at
+		// connection setup, and authorize every RPC against it. TagConn runs on
+		// grpc-go's per-connection goroutine, not its accept loop, so the
+		// lookup is inline; see authz.go for why that differs from pkg/api.
+		grpc.StatsHandler(&peerAuthStatsHandler{s: s}),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
+		// #5849: the config-lock lifecycle is owned by a connection-scoped
+		// stats.Handler (releases on ConnEnd), NOT a per-RPC interceptor that
+		// tore the session down on any per-RPC cancellation.
+		grpc.StatsHandler(&configLockStatsHandler{s: s}),
+	)
 }
 
 // serveUntilDone registers the service on srv, serves lis, and on ctx
@@ -547,8 +605,9 @@ type fabricSupervisorConfig struct {
 //
 // #4122 + #4107: the fabric listener is the ONLY network-exposed gRPC surface
 // (the loopback Run() listener binds 127.0.0.1). Two interceptor layers protect
-// it, both absent from the loopback listener (127.0.0.1 is the trusted local
-// surface, full service):
+// it, both absent from the loopback listener, which runs the DIFFERENT #5278
+// login-class chain instead (a fabric peer is a node, not a local login user —
+// see buildPrimaryServer):
 //  1. fabricAuth* (#4107) AUTHENTICATES the caller with the control-link PSK
 //     (HMAC token in metadata) so an unauthenticated host on the shared control
 //     segment cannot invoke ANY fabric RPC. Runs FIRST.

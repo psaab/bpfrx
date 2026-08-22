@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/psaab/xpf/pkg/authz"
 	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
@@ -40,15 +41,22 @@ func TestServeUntilDoneBoundedByStuckMonitorStream_4910(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	s := &Server{store: store, addr: "bufnet"}
+	// The PRODUCTION primary-listener construction, not a hand-rolled copy of
+	// it: #5849's connection-scoped config-lock lifecycle AND the #5278
+	// login-class chain. The peer resolver is injected to report uid 0 because
+	// this runs over a bufconn, which authz.LookupPeer correctly refuses to
+	// attribute (it is not a TCP peer) — and a denied MonitorInterface would
+	// leave no open stream, quietly removing the very thing this test bounds.
+	s := &Server{
+		store: store,
+		addr:  "bufnet",
+		peerLookupFn: func(net.Addr, net.Addr) authz.PeerIdentity {
+			return authz.PeerIdentity{UID: 0, OK: true, Local: true}
+		},
+	}
 
 	lis := bufconn.Listen(1 << 20)
-	srv := grpc.NewServer(
-		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		// #5849: mirror the production loopback server — connection-scoped
-		// config-lock lifecycle via a stats.Handler, no per-RPC interceptor.
-		grpc.StatsHandler(&configLockStatsHandler{s: s}),
-	)
+	srv := s.buildPrimaryServer()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
