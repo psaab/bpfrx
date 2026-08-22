@@ -223,7 +223,33 @@ pub(super) fn retry_pending_neigh(
                 .pending_neigh
                 .remove(&key)
                 .expect("key from this map");
-            neg_neigh_record(&mut binding.neg_neigh_cache, key, now_ns);
+            // #6710: do NOT arm the dead-host cache against an egress that has
+            // no link-layer address by construction (an IPsec xfrmi).
+            //
+            // The cache exists to stop packets to a host that is NOT ANSWERING
+            // from re-buffering every window, and its escape hatch is
+            // resolved-neighbor-wins: the entry is evicted the moment the host
+            // answers. An xfrmi has nothing to answer with, so that escape can
+            // never fire and the arm/expire cycle repeats for as long as the
+            // tunnel carries traffic.
+            //
+            // That is not a 3 s penalty, it is a permanent one, because the
+            // fast-fail recycles the frame at the top of the MissingNeighbor
+            // arm and so skips the fall-through to the slow-path reinject —
+            // and the reinject is the ONLY way a LAN→tunnel packet reaches the
+            // kernel XFRM stack, since an xfrmi gets no AF_XDP binding
+            // (`userspace_unbindable_netdev`). Every armed window drops
+            // permitted, policy-evaluated traffic on a healthy tunnel.
+            //
+            // Skipping the arming costs nothing the cache was buying. Its
+            // stated purpose is protecting the BOUNDED pending_neigh map from
+            // a multi-hop scan, and post-#1771 §2.2 that map holds ONE
+            // representative packet per (egress_ifindex, next_hop) — so an
+            // xfrmi hop pins exactly one entry whether or not it is cached.
+            // The probe and resolver enqueue are separately rate-limited.
+            if !forwarding.lladdrless_egress.contains(&key.0) {
+                neg_neigh_record(&mut binding.neg_neigh_cache, key, now_ns);
+            }
             // #1772: count the never-resolved timeout drop.
             if let Some(resolver) = neighbor_resolver {
                 resolver.record_pending_timeout_drop();
@@ -911,6 +937,13 @@ mod mirror_tests {
             "timed-out dst must be negatively cached",
         );
     }
+
+    // #6710 lives in its own file (neighbor_dispatch/mirror_tests/) so
+    // appending it does not push this one past the 1500 LOC [WATCH] modularity
+    // floor (pkg/refactoraudit). A child module can see this module's private
+    // helpers, so `push_pending`, `resolved_neighbor_decision` and friends are
+    // reachable unchanged via `use super::*`.
+    mod xfrmi_6710_tests;
 
     /// #1772: build a worker-facing `NeighborResolver` handle wired to a
     /// fresh latency-telemetry set, so a test can pass it into

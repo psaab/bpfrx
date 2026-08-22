@@ -125,6 +125,15 @@ pub(super) fn populate_interfaces(
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
         }
+        // #6710: an xfrmi has no link-layer address, so an egress to it can
+        // never resolve a neighbor. Record the ifindex so the dead-host
+        // negative cache is not armed against a device that has nothing to
+        // answer with — see ForwardingState::lladdrless_egress. The flag is
+        // read, never re-derived: `secure_tunnel` is the same authoritative
+        // bit `userspace_unbindable_netdev` uses for binding planning.
+        if iface.secure_tunnel {
+            state.lladdrless_egress.insert(iface.ifindex);
+        }
         // #921: resolve zone NAME → u16 once at config build, so every read on
         // the hot path is one HashMap lookup (ifindex → u16). An unzoned row
         // resolves to 0, the "no zone" sentinel.

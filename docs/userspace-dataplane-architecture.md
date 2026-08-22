@@ -426,6 +426,23 @@ in `neighbor_dispatch.rs`). A hop that never resolves within the pending
 timeout is negatively cached for 3 s (`neg_neigh.rs`), and subsequent
 cold packets to it fast-fail at the buffer site.
 
+**Except for an egress that can never have a neighbor (#6710).** An IPsec
+`xfrmi` has no link-layer address, so `lookup_neighbor_entry` can never hit
+and a LAN→tunnel packet resolves `MissingNeighbor` forever. The cache's
+escape hatch is resolved-neighbor-wins — the entry is evicted the moment the
+host answers — and an xfrmi has nothing to answer with, so the arm/expire
+cycle would repeat for as long as the tunnel carried traffic. That is not a
+3 s penalty but a permanent one: the fast-fail recycles the frame at the top
+of the MissingNeighbor arm (`break 'missing_neighbor RecycleAndContinue`),
+which skips the fall-through to the slow-path reinject — and that reinject is
+the only way a LAN→tunnel packet reaches the kernel XFRM stack at all, since
+an xfrmi gets no AF_XDP binding. `ForwardingState.lladdrless_egress`, built
+from the already-shipped `InterfaceSnapshot.secure_tunnel` flag, suppresses
+the ARMING for those ifindexes only. Nothing else changes: the timeout still
+drops the representative packet, and the #1651 protection is untouched
+everywhere else (a hop pins ≤1 `pending_neigh` entry post-#1771 §2.2, so the
+cache was buying nothing here).
+
 `pending_neigh_admission` returns one of three outcomes, each counted
 separately so an operator can tell normal cold-start coalescing from an
 exhaustion/attack mode (`record_pending_neigh_admission_drop`,

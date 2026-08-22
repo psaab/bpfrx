@@ -367,6 +367,28 @@ pub(in crate::afxdp) struct ForwardingState {
     /// Default) means "unset" — callers fall back to
     /// `PENDING_NEIGH_TIMEOUT_NS`.
     pub(in crate::afxdp) pending_neigh_timeout_ns: u64,
+    /// #6710: egress ifindexes that can NEVER resolve a link-layer neighbor,
+    /// because the netdev has no link-layer address by construction.
+    ///
+    /// Today this is exactly the IPsec `xfrmi` set, carried by the existing
+    /// authoritative `InterfaceSnapshot.secure_tunnel` flag — no wire change:
+    /// the Go control plane already computes it (`snapshotSecureTunnel`, the
+    /// union of "some `security ipsec vpn <n> bind-interface` names this
+    /// device" and "the netdev's kernel link kind is `xfrm`") and this plane
+    /// reads the one flag rather than re-deriving a name grammar, exactly as
+    /// `userspace_unbindable_netdev` already does for binding planning.
+    ///
+    /// WHY THE FORWARDING PLANE NEEDS IT. A connected route to such an ifindex
+    /// resolves `MissingNeighbor` forever: `lookup_neighbor_entry` can never
+    /// hit, so the packet takes the cold arm, is buffered in `pending_neigh`,
+    /// probes, times out — and the timeout is what ARMS the dead-host negative
+    /// cache. For a real dead host that cache is a 3 s penalty that ends when
+    /// the host answers; here the "host" is a device that has nothing to answer
+    /// with, so `neg_neigh_gate`'s resolved-neighbor-wins escape can never
+    /// fire and the arm/expire cycle repeats indefinitely. Every armed window
+    /// recycles the frame BEFORE the slow-path reinject that is the only way
+    /// LAN→tunnel traffic reaches the kernel XFRM stack at all.
+    pub(in crate::afxdp) lladdrless_egress: FastSet<i32>,
     /// #1635: direct `(from_zone_id, to_zone_id) → slot` map for the
     /// cold-path histogram, built at config apply from the configured
     /// policy zone-pairs. Replaces the splitmix64 16-slot hash. Shared

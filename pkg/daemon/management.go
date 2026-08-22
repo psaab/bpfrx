@@ -200,7 +200,31 @@ func (m *managementReconciler) desired(cfg *config.Config) api.Config {
 // start builds and starts the initial listener from the active config. A bind
 // failure is returned (the caller logs it non-fatally); the next commit retries.
 func (m *managementReconciler) start(ctx context.Context) error {
-	return m.startTo(ctx, m.desired(m.d.store.ActiveConfig()))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// #6719: derive the desired state from the store UNDER m.mu, not before
+	// taking it. The pre-#6719 shape read ActiveConfig() first and only then
+	// contended for the lock, which lost a promotion outright:
+	//
+	//  1. start reads active config A (credential A);
+	//  2. a peer sync promotes B, revoking A, and calls reconcile;
+	//  3. that reconcile wins the lock, finds m.srv == nil, and no-ops;
+	//  4. start finally takes the lock and installs the server built from A.
+	//
+	// Credential A then stayed accepted until some later reconcile or a restart
+	// — and the same window applied to the bind address and TLS.
+	//
+	// Reading under the lock removes the case entirely, because the two orders
+	// are now both correct rather than one being lossy. If the promotion landed
+	// BEFORE this line, ActiveConfig() returns B and we install B. If it lands
+	// while we hold the lock, its reconcile blocks here and runs afterwards
+	// against a server that now exists, so it converges to B itself. There is no
+	// interleaving left in which the newer snapshot is dropped.
+	//
+	// committedDesired (the reconcile path) reads the same store.ActiveConfig(),
+	// so the two derivations agree on their authority by construction rather
+	// than by convention.
+	return m.startLocked(ctx, m.desired(m.d.store.ActiveConfig()))
 }
 
 // startTo starts the initial listener for an explicit desired config. Split from
@@ -210,6 +234,14 @@ func (m *managementReconciler) start(ctx context.Context) error {
 func (m *managementReconciler) startTo(ctx context.Context, next api.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.startLocked(ctx, next)
+}
+
+// startLocked is the body of start/startTo. The caller MUST hold m.mu — that is
+// the whole point of the split (#6719): start derives its snapshot from the
+// store under the same lock the reconcile path contends for, so a promotion
+// racing startup is never dropped.
+func (m *managementReconciler) startLocked(ctx context.Context, next api.Config) error {
 	// Record the attempted HTTP bind BEFORE Start so a bind failure (curSet stays
 	// false) can report it as `(bind failed)` in `show system services` (#6401).
 	m.lastHTTPAttempt = next.Addr
@@ -669,8 +701,9 @@ func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 		return
 	}
 	d.staleCertMu.Lock()
-	pending, gen, mgmt := d.staleCertPending, d.staleCertGen, d.mgmt
+	pending, gen := d.staleCertPending, d.staleCertGen
 	d.staleCertMu.Unlock()
+	mgmt := d.mgmt.Load()
 	if !pending || mgmt == nil {
 		return
 	}
@@ -798,6 +831,46 @@ func (m *managementReconciler) wait() {
 	}
 }
 
+// reconcileManagementAfterPromotion runs the management reconcile for a config
+// the store has ALREADY promoted to active, on a path that deliberately does NOT
+// reach applyConfigLocked (#6718, #6720).
+//
+// reconcileWebManagement's own contract (below) is written for an apply that
+// ABORTS PARTWAY: "so a committed authentication tightening/revocation or bind
+// change is live even on an apply that returns early". That contract had an
+// unstated precondition — applyConfigLocked is its ONLY caller, so a path that
+// returns BEFORE entering the apply never reaches it at all, and two do:
+//
+//   - executeConfirmedRollback's prevCfg == nil branch (#6718): a first
+//     `commit confirmed` on a fresh store times out, PromoteRollback reverts to
+//     the empty tree, and enterBootstrapMode returns. The abandoned commit's
+//     off-box bind and its api-auth credential stayed live — authorised by a
+//     config the box has formally abandoned.
+//   - syncAndApply's topology / identity backstops (#6720): SyncApply has
+//     already promoted the peer config, then the backstop returns. The listener
+//     kept honouring a credential the now-active config revoked.
+//
+// The reconcile is deliberately the GENERIC one in both cases, including the
+// bootstrap case where #6718 wondered whether a special bootstrap-management
+// reconcile was needed. It is not: with the empty tree active, committedDesired
+// resolves to no web-management stanza, so desired() leaves Addr at the
+// --api-addr flag default (loopback) and Auth nil — which IS "revert to the
+// flag-default endpoint and drop the abandoned credential". Keeping the
+// management LIFELINE, which is why that branch skipped the reconcile, is not
+// the same thing as keeping the abandoned commit's off-box bind and secret.
+//
+// Failure is logged, never propagated: both callers are already returning (an
+// error, or from a fire-and-forget timer), and a bind failure here must not
+// change what they return. This mirrors reconcileWebManagement's own
+// warn-and-retry posture.
+func (d *Daemon) reconcileManagementAfterPromotion(cfg *config.Config, why string) {
+	if err := d.reconcileWebManagement(cfg); err != nil {
+		slog.Error("management reconcile after a promotion that skipped the apply did not "+
+			"converge; the listener may still honour a superseded endpoint or credential",
+			"reason", why, "err", err)
+	}
+}
+
 // reconcileWebManagement is the applyConfigLocked entry point (#5866). It
 // mirrors reconcileSNMP: it runs EARLY in the apply — before the dataplane apply
 // that can abort on a protocol-gate error — so a committed authentication
@@ -810,10 +883,11 @@ func (m *managementReconciler) wait() {
 // logged (retry debt), mirroring reconcileSNMP's warn-and-retry posture rather
 // than bricking an otherwise-successful commit.
 func (d *Daemon) reconcileWebManagement(cfg *config.Config) error {
-	if d.mgmt == nil {
+	mgmt := d.mgmt.Load()
+	if mgmt == nil {
 		return nil
 	}
-	err := d.mgmt.reconcile(cfg)
+	err := mgmt.reconcile(cfg)
 	// #6827: a reconcile may have just brought HTTPS up (enable, or a retried
 	// bind). If a host-name staleness diagnosis is still owed from a window
 	// when nothing was serving, settle it now rather than losing it.
