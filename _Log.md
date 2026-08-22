@@ -1,3 +1,34 @@
+## 2026-08-21 — #6533 applied/published/converged marker rule: audited, PLAN-KILLED
+
+- **Timestamp**: 2026-08-21
+- **Action**: Audited the proposed `analysistest` rule requiring
+  applied/published/converged marker assignments to be dominated by a
+  nil-error check. Measured at `f4a5297be`: the population is 43
+  non-test assignment sites (61 with tests), not the 16 bug instances
+  the issue counts, and it is heterogeneous — copies, zero-resets (the
+  SAFE direction), appends, constructor inits and view read-outs, all of
+  which a dominance rule flags. Pulled the pre-fix code for three of the
+  twelve named instances: #5646 (`fs.hash` + a void callback), #5697
+  (`_ = bindingsMap.Update` + `m.lastBindingIndices`) and #5134 (no
+  marker field assigned at all). The rule fires on none of them, for a
+  systematic reason: the applied/published/converged vocabulary is the
+  REMEDY each fix introduced, so a rule keyed to it is blind to the
+  pre-fix code. It also flags the mechanisms the issue holds up as
+  correct (`rg_state.go` `MarkApplied`, correct via a caller contract
+  with no error in the function; `process_status.go`, correct via a
+  status readback) and its own flagship target, `dhcpserver.go:348`,
+  which #6535 already fixed and which DELIBERATELY advances the marker
+  on failure with convergence carried by `ClaimApplyRetry` — a path
+  bound end-to-end by `pkg/daemon/dhcp_apply_converger_6535_test.go`.
+  Both live targets are already fixed, so every remaining hit is a false
+  positive. Measured and rejected two alternative signals: discarded
+  errors (197 sites, mostly legitimate Close/SetDeadline) and void
+  publish-callback fields (10 sites, all notification hooks). Shipped
+  the measurement rather than a decorative lint; recorded the sound but
+  much larger alternative (a typed marker whose advance takes the error,
+  plus a driver registry — a 43-site migration).
+- **File(s)**: `docs/applied-marker-invariant.md` (new),
+  `docs/engineering-style.md`
 ## 2026-08-21 — #6534 CoS family: skipped classifier/scheduler entries annotated
 
 - **Timestamp**: 2026-08-21
