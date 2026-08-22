@@ -476,6 +476,14 @@ func (s *Store) commitConfirmedLocked(minutes int) (*config.Config, error) {
 		// Save current active state for potential rollback.
 		s.confirmPrevTree = s.active.Clone()
 		s.confirmPrevCfg = s.compiled
+		// #6538: record first-commit-ness HERE, where it is known, instead of
+		// re-deriving it later from confirmPrevCfg==nil. s.compiled is still
+		// the PRE-promotion compiled active config at this point, so a nil
+		// here means this store had no compiled active config before this
+		// commit — the #1922 Item 1b fresh-store case. A nil that shows up
+		// later for a different reason (a recovered rollback target that would
+		// not compile) must not be read as this.
+		s.confirmPrevFirst = s.compiled == nil
 	}
 
 	// Push current active to history
@@ -517,11 +525,14 @@ func (s *Store) commitConfirmedLocked(minutes int) (*config.Config, error) {
 	// successful writeActive+promote so a FAILED commit-confirmed never leaves
 	// a confirm.json (persist-before-promote already returned above on
 	// failure). PrevTree is confirmPrevTree — the ORIGINAL last-confirmed tree
-	// for a nested re-arm; firstCommit mirrors the confirmPrevCfg==nil #1922
-	// Item 1b path. A residual crash window remains between the writeActive
-	// syscall and this write (microseconds vs. the whole multi-minute window
-	// before this fix).
-	s.writeConfirmState(s.confirmPrevTree, deadline, s.confirmPrevCfg == nil)
+	// for a nested re-arm; firstCommit is the recorded confirmPrevFirst, NOT a
+	// re-derivation from confirmPrevCfg==nil (#6538: a nested arm preserves a
+	// recovered rollback target, so that nil can mean "the target failed to
+	// compile" and persisting it as firstCommit durably mislabels a real config
+	// as the empty bootstrap tree). A residual crash window remains between the
+	// writeActive syscall and this write (microseconds vs. the whole
+	// multi-minute window before this fix).
+	s.writeConfirmState(s.confirmPrevTree, deadline, s.confirmPrevFirst)
 
 	slog.Info("commit confirmed started", "timeout_minutes", minutes)
 	return compiled, nil
@@ -723,6 +734,7 @@ func (s *Store) cancelPendingConfirmTimerLocked() bool {
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
 	s.confirmPrevCfg = nil
+	s.confirmPrevFirst = false
 	return true
 }
 
@@ -881,7 +893,13 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	// back via enterBootstrapMode rather than applying an empty config.
 	prevCfg = s.confirmPrevCfg
 	s.confirmPrevCfg = nil
-	firstCommitRollback := prevCfg == nil
+	// #6538: the recorded flag, not `prevCfg == nil`. A nil prevCfg ALSO
+	// happens when recoverPendingConfirmLocked could not compile the recovered
+	// rollback target, and treating that as a first commit persists
+	// committed=0 over a real config — which durably re-classifies the next
+	// boot into bootstrap.
+	firstCommitRollback := s.confirmPrevFirst
+	s.confirmPrevFirst = false
 
 	// Persist reverted config to disk. Option B (#1799): the rollback
 	// ALWAYS proceeds in memory — reverting the running config is the
