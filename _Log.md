@@ -101750,6 +101750,20 @@ prose edit above them added. No diff falls in the new test body.
     pkg/cluster/sync_config_apply_nack_7328_test.go,
     pkg/daemon/configsync_rearm_7328_test.go
 
+## 2026-08-22 — #6606 dyndns2 raw server render
+- **Timestamp**: 2026-08-22
+- **Action**: `resolveDyndns2Endpoint` interpolated the raw `server` at FOUR
+  sites (the issue named two; its review comment warned that fixing only the
+  cited ones leaves the other half open). Applied the #6594 parse-first split:
+  on a parse failure render NO part of the input plus `urlParseCause`; on the
+  branches where the URL parsed, `config.RedactURL` is provably sound. Verified
+  empirically that dropping only the `%w` still leaks — `invalid port %q after
+  host` and `invalid host: ParseAddr(...)` are unbounded inner causes — so the
+  mutation that keeps a redacted render on the parse branch reds. Removed the
+  self-expiring `issue6606Exemption` from the source gate, which fired on cue.
+- **File(s)**: pkg/ddns/backend_dyndns2.go,
+  pkg/ddns/dyndns2_server_leak_6606_test.go (new),
+  pkg/ddns/url_render_class_6545_test.go, pkg/ddns/README.md, _Log.md
 ## 2026-08-21 — #6568: Rust-dataplane cohort, provable subset
 - **Timestamp**: 2026-08-21
 - **Action**: Swept all 8 rows individually. Member 1 was filed as a
