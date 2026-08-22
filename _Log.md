@@ -98491,3 +98491,36 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Bound the push-time RG0 authority gate in `syncConfigToPeer`
+  (#5962's push-time half). Measured at `8d7190b4a`: deleting
+  `if !rg0ConfigSyncAuthority(d.cluster) { return }` from `syncConfigToPeer`
+  left `go vet ./pkg/daemon/` clean and `go test -count=1 ./pkg/daemon/`
+  GREEN — exit 0, zero failures. The gate was entirely unbound, and it is the
+  only thing that makes #5962's DEMOTION direction safe: production leaves
+  `d.syncPeerForTest` nil, so the single commit-path push route is
+  `applyAndSyncCommitted` -> `pushCommittedConfigToPeer` -> `syncConfigToPeer`,
+  and a node demoted between the attempt-time gate and the push would otherwise
+  overwrite the config of the node that now owns RG0. The new cells drive that
+  production route rather than the `syncPeerForTest` seam, which short-circuits
+  `pushCommittedConfigToPeer` and never reaches the gate at all; the observable
+  is the #5863 reconcile marker, which `pushConfigToPeer` stamps only after it
+  has committed to pushing. A zero-value `cluster.SessionSync` clears the
+  transport-presence guards without a socket (`QueueConfig` no-ops with no
+  active conn).
+
+  Test-only. No behavior change, so no operator-facing doc changes; the
+  invariant is documented at the gate's own doc comment and expanded in the
+  test file header.
+
+  Validation: `go vet ./pkg/daemon/` exit 0; `go test -count=1 ./pkg/daemon/`
+  exit 0 (full package, with the new file). Mutation, one mutation, exit code
+  captured from `$?`: delete the `rg0ConfigSyncAuthority` re-check from
+  `syncConfigToPeer` -> exit 1, `--- FAIL` on
+  `non-authority:_must_not_reach_the_push` while
+  `authority:_reaches_the_push_(control)` stays PASS — the red localises to the
+  asserted cell and the control proves the fixture reaches the push body.
+  Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no cluster
+  smoke is owed.
+- **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
