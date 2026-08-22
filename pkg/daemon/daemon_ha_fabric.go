@@ -13,6 +13,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/linuxsock"
 )
 
@@ -285,8 +286,7 @@ func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerI
 	}
 	neighs, _ := d.fabricNeighList(link.Attrs().Index, neighFamily)
 	for _, n := range neighs {
-		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+		if n.IP.Equal(peerIP) && dpuserspace.FabricNeighUsable(n) {
 			return // Entry exists, no probe needed.
 		}
 	}
@@ -411,12 +411,6 @@ func (d *Daemon) fabricNeighList(ifindex, family int) ([]netlink.Neigh, error) {
 	return netlink.NeighList(ifindex, family)
 }
 
-// fabricNeighValidStates is the NUD mask of neighbour states whose hardware
-// address is usable for forwarding. INCOMPLETE/FAILED/NONE carry no (or a
-// stale-zero) MAC and are excluded.
-const fabricNeighValidStates = netlink.NUD_REACHABLE | netlink.NUD_STALE |
-	netlink.NUD_PERMANENT | netlink.NUD_DELAY | netlink.NUD_PROBE
-
 // fabricPeerMACHint returns the last address-matched peer MAC observed for the
 // given fabric slot, or nil if the peer's fabric address has never resolved
 // since this daemon started (or since the configured peer last changed).
@@ -509,7 +503,7 @@ func selectFabricPeerLinkLocalMAC(
 	var eligible []candidate
 	seen := make(map[string]struct{}, len(neighs))
 	for _, n := range neighs {
-		if len(n.HardwareAddr) != 6 || (n.State&fabricNeighValidStates) == 0 {
+		if !dpuserspace.FabricNeighUsable(n) {
 			continue
 		}
 		if !n.IP.IsLinkLocalUnicast() {
@@ -635,8 +629,6 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 		neighFamily = netlink.FAMILY_V6
 	}
 
-	validState := fabricNeighValidStates
-
 	neighs, err := d.fabricNeighList(neighLink.Attrs().Index, neighFamily)
 	if err != nil {
 		d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (neighbor list)",
@@ -646,8 +638,7 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 	}
 	var peerMAC net.HardwareAddr
 	for _, n := range neighs {
-		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-			(n.State&validState) != 0 {
+		if n.IP.Equal(peerIP) && dpuserspace.FabricNeighUsable(n) {
 			peerMAC = n.HardwareAddr
 			break
 		}
@@ -671,8 +662,7 @@ func (d *Daemon) refreshFabricFwd(ctx context.Context, fabIface, overlay string,
 		// Check parent IPv4 neighbors for the peer IP.
 		parentNeighs, _ := d.fabricNeighList(parentIdx, neighFamily)
 		for _, n := range parentNeighs {
-			if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-				(n.State&validState) != 0 {
+			if n.IP.Equal(peerIP) && dpuserspace.FabricNeighUsable(n) {
 				peerMAC = n.HardwareAddr
 				// Still address-matched — same identity binding as above.
 				d.rememberFabricPeerMAC(0, peerMAC)
@@ -909,8 +899,7 @@ func (d *Daemon) refreshFabricFwd1(ctx context.Context, fabIface, overlay string
 	}
 	var peerMAC net.HardwareAddr
 	for _, n := range neighs {
-		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-			(n.State&fabricNeighValidStates) != 0 {
+		if n.IP.Equal(peerIP) && dpuserspace.FabricNeighUsable(n) {
 			peerMAC = n.HardwareAddr
 			break
 		}

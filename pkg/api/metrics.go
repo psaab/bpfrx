@@ -525,6 +525,18 @@ type xpfCollector struct {
 	// LAG_THRESHOLD diagnostic.
 	bindingVMinThrottles                *prometheus.Desc
 	bindingVMinThrottleHardCapOverrides *prometheus.Desc
+	// #7409: per-binding slow-path reinject counters, split by the
+	// disposition that sent the frame to the kernel. Already on the
+	// BindingStatus wire since the counters were added; unexported until
+	// now, which meant a rising reinject rate reached no alerting and was
+	// visible only in `show`-style status output — the symptom of a policy
+	// bypass was unobservable in production even once you knew to look.
+	// no_route is the #7409 signal itself: every frame counted there was
+	// forwarded by the kernel with no zone policy, session, NAT or screen.
+	bindingSlowPathNoRoutePackets         *prometheus.Desc
+	bindingSlowPathNextTablePackets       *prometheus.Desc
+	bindingSlowPathLocalDeliveryPackets   *prometheus.Desc
+	bindingSlowPathMissingNeighborPackets *prometheus.Desc
 	// #1248: class-specific active flow distribution by egress CoS
 	// queue. This is the production/mixed-workload {a_i} source.
 	cosActiveFlowCount *prometheus.Desc
@@ -894,6 +906,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.bindingTXCompletionRingAvailableMax
 	ch <- c.bindingVMinThrottles
 	ch <- c.bindingVMinThrottleHardCapOverrides
+	ch <- c.bindingSlowPathNoRoutePackets
+	ch <- c.bindingSlowPathNextTablePackets
+	ch <- c.bindingSlowPathLocalDeliveryPackets
+	ch <- c.bindingSlowPathMissingNeighborPackets
 	ch <- c.cosActiveFlowCount
 	ch <- c.fairnessCstruct
 	ch <- c.fairnessActiveWorkers

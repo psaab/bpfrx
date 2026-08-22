@@ -7,7 +7,8 @@ for weight-based failover.
 
 This package owns netlink object lifecycles. FRR (`pkg/frr`) owns the
 kernel route table; this package owns the *interfaces* routes hang off
-of.
+of — and, since #7409, it also **reads** the kernel route table back for
+the userspace dataplane FIB (see "Kernel-learned route import" below).
 
 ## Structure (#1698 domain split)
 
@@ -858,3 +859,69 @@ which paths a prefix load-balances over.
   and "rib-group" leaking modes go through `ip rule` (here), not FRR.
 - RPM probes that need VRF binding use `SO_BINDTODEVICE` on the VRF
   device, not on the destination interface.
+
+
+## Kernel-learned route import (#7409)
+
+`fibimport.go` reads the kernel FIB and hands the *learned* routes to the
+userspace dataplane's snapshot builder
+(`pkg/dataplane/userspace` `buildRouteSnapshots`).
+
+### Why it exists
+
+The helper FIB was built from config-derived sources only: config statics,
+connected prefixes, the ip-rule leak mirror and the ip-monitoring overlay.
+Nothing read the kernel. But FRR installs BGP/OSPF/IS-IS/RIP routes, and
+DHCP leases on **non-management** interfaces contribute an AD-200 default plus
+RFC 3442 classless routes, all into the kernel's main table. A transit packet
+toward such a destination therefore either:
+
+- resolved `NoRoute`, which is slow-path eligible, and was **reinjected to the
+  kernel** — which forwarded it with no zone policy, no session, no NAT and no
+  screen, and with no nftables `hook forward` chain behind it; or
+- matched a *less-specific* config route (typically a static default) and was
+  forwarded to **that** next-hop instead of the learned one — adjudicated, but
+  down the wrong path.
+
+### What is imported
+
+`ImportLearnedRoutes(tableIDs)` dumps each named table per family with
+`RouteListFiltered` and adopts a route only if **all** of:
+
+| predicate | why |
+|---|---|
+| `Type == RTN_UNICAST` | the importer may only ever ADD a forwarding path — it can never publish a discard/blackhole/unreachable route and so can never turn forwarding into a drop. Also excludes the HA inactive-RG blackholes (`RTN_BLACKHOLE`, priority 4242) by construction |
+| protocol in `learnedRouteProtocols` | keyed on the same RTPROT constants `rtProtoName` maps, including FRR's `RTPROT_ZSTATIC` (196). `RTPROT_REDIRECT` is deliberately excluded |
+| has a next-hop gateway | a gateway-less route is directly connected and already reaches the FIB from the interface snapshot; requiring one also keeps clear of the Rust side's bare-gateway ifindex inference |
+| every ECMP leg has a gateway | an ECMP set is imported **whole or not at all** — a half-imported set is the same defect class as an ECMP half-override |
+
+A `nil` `Dst` is normalised to `0.0.0.0/0` / `::/0` — that is how a default
+route can arrive, and it is the route the import most exists to capture.
+
+The table set is **bounded** by `LearnedRouteTableIDs`: main plus each
+configured routing instance. The management VRF (999) is hard-excluded — it is
+not reachable from a packet reinjected on `xpf-usp0`, and importing it would
+hand the transit fast path a route to the management gateway.
+
+A netlink failure **fails the import closed** with no partial result, mirroring
+the ip-rule enumeration's contract. This is the opposite of the display path's
+partial-result behaviour in `routes.go`, deliberately: a missing `show route`
+row misleads a human, a missing FIB entry misdirects a packet.
+
+### Consumer-side rule
+
+The snapshot builder applies the import as **gap-fill only** — an imported
+route is discarded whenever the config-derived set already covers the same
+`(table, family, prefix)`, compared on the *canonical* prefix. The operator's
+route always wins, and every existing precedence contract keeps operating on
+exactly the routes it did before.
+
+### Known limitation
+
+This **narrows** the divergence window; it does not close it. The snapshot is
+republished on operator commit and on ip-monitoring actuation only — there is
+no `RouteSubscribe` anywhere in this repo — so a route the kernel learns
+between two pushes is still missing from the helper FIB until the next one.
+For that reason `NoRoute` must **stay** slow-path eligible: dropping it instead
+would black-hole every learned destination for the width of that window.
+`xpf_userspace_binding_slow_path_no_route_packets_total` is the signal.

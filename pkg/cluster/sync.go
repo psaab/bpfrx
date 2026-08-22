@@ -151,6 +151,37 @@ const (
 	// would make the #1930 INC-3 mixed-base gate falsely refuse SESSION sync
 	// across the very rolling upgrade this must survive.
 	syncMsgConfigEncrypted = 31
+
+	// syncMsgAuthUpgradeHello / syncMsgAuthUpgradeProof carry the #6628
+	// IN-PLACE authentication upgrade over an ESTABLISHED connection.
+	//
+	// Distinct from syncMsgAuthHello (27) / syncMsgAuthProof (28), which are
+	// PRE-INSTALL handshake frames read by readSyncFrameRaw before the
+	// connection is wired up. Those numbers are already reused post-install
+	// (27 is syncMsgConfigApplyNack), so the upgrade cannot borrow them: a
+	// post-install frame of type 27 means the nack, and a receiver has no way
+	// to tell the two apart.
+	//
+	// Hello payload: {version: u8, nonce: [32]byte}
+	// Proof payload: {version: u8, proof: [32]byte, nonce: [32]byte}
+	//
+	// ADDITIVE and version-bump-free on the #2239/#6650 precedent: the receive
+	// switch has no default arm, so a peer that predates them ignores the
+	// frames, never answers, and is left un-upgraded — which is exactly the
+	// intended mixed-version behaviour, not a failure. Bumping
+	// SessionSyncWireVersion would make the #1930 INC-3 mixed-base gate refuse
+	// SESSION sync across the rolling upgrade this exists to serve.
+	syncMsgAuthUpgradeHello = 32
+	syncMsgAuthUpgradeProof = 33
+
+	// syncMsgAuthUpgradeAck is the fourth frame of the #6628 exchange. It
+	// exists so the RESPONDER does not switch its write direction until it has
+	// verified the initiator's proof — without it, two nodes holding different
+	// keys desync the stream and the "never drops" property is lost. See the
+	// four-frame rationale in sync_auth_upgrade.go.
+	//
+	// Payload: {version: u8}
+	syncMsgAuthUpgradeAck = 34
 )
 
 // syncHeader is the wire header for each sync message.

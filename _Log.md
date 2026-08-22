@@ -1,3 +1,35 @@
+## 2026-08-22 — #6912: an external reload discharged a postcondition it cannot perform
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced at master before fixing: first Apply runs its tail
+  (`[reconfigure trust0]`, rp_filter 0), then a SUCCESSFUL external
+  BeginReload/NoteReloadResult, then a byte-identical Apply -> reconfigure
+  calls 1 -> 1 and rp_filter still 2. The tail never ran.
+  Fixed by arming a process-scoped `tailPending` in `NoteReloadResult` on
+  success and adding it to Apply's gate; only a completed tail clears it.
+  Process-scoped for the same reason the reload debt is: pkg/daemon reloads
+  from several sites and a Manager-scoped flag could not record what they did.
+  TWO MUTATIONS CAME BACK GREEN AND BOTH WERE FINDINGS, not gaps:
+  (a) arming on the SHARED `noteReloadSucceeded` instead of the external entry
+  point is unobservable, because Apply's own tail clears the flag in the same
+  pass. My doc comment had claimed it "would make every Apply owe a tail to
+  the next one" — that claim was FALSE and is now corrected to say the choice
+  is about the flag's meaning, not about preventing a defect.
+  (b) arming on the external FAILURE branch too is redundant: noteReloadFailed
+  already sets the reload debt, so debtOwed already forces the next Apply
+  through the tail.
+  (a) also exposed a test of mine that passed for the wrong reason —
+  `TestApplyOwnReloadDoesNotOweItselfATail_6912` was named for the arming site
+  but passes under that mutation. Restated as
+  `TestApplyLeavesNoTailDebtOutstanding_6912`, which is the invariant it
+  actually checks and the one that really prevents an unchanged Apply
+  reconfiguring forever.
+  M1-M3 RED (drop the gate term, stop arming, never clear) at RUN=51 matching
+  the control, vet clean at each.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/external_reload_tail_6912_test.go` (new),
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`
+
 ## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
 
 - **Timestamp**: 2026-08-22
@@ -102938,6 +102970,194 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
   pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md
+
+## 2026-08-22 — #6668 display-set container bracket round-trip
+- **Timestamp**: 2026-08-22
+- **Action**: Carry authored `[ ... ]` bracket grouping through `display set`
+  render and flat replay so a bracket authored at a CONTAINER position survives
+  the round trip; fixes the `load merge <hierarchical-file>` ingest corruption
+  and the two Reject→Accept commit-gate laundering cases.
+- **File(s)**: pkg/config/lexer.go, pkg/config/parser.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/ast_format.go, pkg/config/inactive.go,
+  pkg/configstore/store_command.go,
+  pkg/config/formatset_container_bracket_6668_test.go,
+  pkg/configstore/loadmerge_bracket_container_6668_test.go,
+  pkg/config/dual_ast_differential_test.go,
+  pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+  docs/config-schema.md, docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6598 — brought the LIVE fabric peer-MAC resolver up to the
+    same bar as refreshFabricFwd (NUD state + 6-byte lladdr) and gave the
+    predicate ONE definition consumed by all five daemon sites, including an
+    inline mask expansion no search for the const name would have found.
+  - **File(s)**: pkg/dataplane/userspace/fabric.go, pkg/daemon/daemon_ha_fabric.go,
+    pkg/dataplane/userspace/fabric_peer_mac_6598_test.go,
+    pkg/daemon/fabric_neigh_single_source_6598_test.go,
+    docs/fabric-cross-chassis-fwd.md
+
+## 2026-08-22
+
+- **Timestamp**: 2026-08-22
+- **Action**: #7409 — kernel-learned routes now reach the userspace dataplane
+  FIB. The helper FIB was built from config-derived sources only (config
+  statics, connected prefixes, the ip-rule leak mirror, the ip-monitoring
+  overlay), so FRR-installed BGP/OSPF/IS-IS/RIP routes and non-management
+  DHCP-learned routes (AD-200 default + RFC 3442 classless) were invisible to
+  it while the kernel routed them. A transit packet toward such a destination
+  either resolved `NoRoute` — slow-path eligible, so REINJECTED and forwarded
+  by the kernel with no zone policy, session, NAT or screen, and no nftables
+  `hook forward` chain behind it — or matched a less-specific config default
+  and went to the WRONG next-hop. Added `pkg/routing/fibimport.go`
+  (`ImportLearnedRoutes`) reusing the existing `rtProtoName` RTPROT mapping as
+  the route-source signal, wired into `buildRouteSnapshots` as a fifth source
+  under a GAP-FILL rule (an imported route is dropped whenever the
+  config-derived set already covers the same canonical
+  `(table, family, prefix)`), so no existing precedence contract changes.
+  Import is unicast-only + gateway-bearing + whole-ECMP-or-nothing, table set
+  bounded to main plus configured instances, mgmt VRF 999 hard-excluded, and
+  fails closed on netlink error.
+  REJECTED the alternative acceptance branch (refuse to arm when a dynamic
+  routing protocol is configured) and recorded why in `capabilities.go`: zero
+  of 23 shipped configs configure a dynamic protocol so it closes nothing,
+  extending it to DHCP would disarm 20 of 23 including the whole HA/smoke
+  substrate (and #5275 drives `ip_forward` to 0 on disarm, so such a box
+  forwards nothing), and it is unsound in principle because FRR runs operator
+  content outside the managed markers that `cfg.Protocols` cannot see.
+  Corrected the FALSE `"NoRoute drops anyway"` comment in
+  `poll_descriptor/mod.rs` — it does not drop, it is reinjected; being false
+  in the SAFE direction is why the gap went unexamined. Strengthened
+  `tests_fragment.rs` to assert the packet DOES reach the slow path
+  (`slow_path_drops == 1`) rather than the drop its comment imagined;
+  asserting the reverse would be false today and after this fix, since the
+  fixture builds an empty `scrub` table by construction. Exported the four
+  `slow_path_{no_route,next_table,local_delivery,missing_neighbor}_packets`
+  counters to Prometheus — already on the wire and delta-tracked in
+  `pkg/monitoriface`, but unexported, which is what made a rising reinject
+  rate unalertable and the bypass unobservable in production.
+  KNOWN LIMITATION, stated in code and docs: this NARROWS the window, it does
+  not close it. There is no `RouteSubscribe` in this repo, so the FIB
+  refreshes only on commit and ip-monitoring actuation and a route learned
+  between pushes still takes the reinject. `NoRoute` must therefore STAY
+  slow-path eligible; dropping it would black-hole every learned destination
+  for the width of that window. Follow-up filed for the route-event listener.
+  Validation: 11 new importer tests, 9 snapshot-wiring tests (incl. the
+  gap-fill, per-table middle state, fail-closed and determinism cases), 3
+  metric tests, `pkg/api`/`pkg/routing`/`pkg/dataplane/userspace` suites green,
+  Rust fragment test green. 8-cell mutation matrix run with an
+  apply-verifying harness: 7 RED, 1 correctly GREEN (import-vs-overlay
+  ordering is genuinely order-independent — the comment claiming otherwise was
+  corrected rather than the test strengthened). The mutation work also found a
+  real defect: the gap-fill key was not canonicalising the prefix, so a config
+  static written `10.20.30.1/24` would not have matched an imported
+  `10.20.30.0/24` and would have emitted a duplicate.
+- **File(s)**: pkg/routing/fibimport.go (new),
+  pkg/routing/fibimport_7409_test.go (new), pkg/routing/README.md,
+  pkg/dataplane/userspace/routes.go,
+  pkg/dataplane/userspace/routes_learned_7409_test.go (new),
+  pkg/dataplane/userspace/capabilities.go, pkg/dataplane/userspace/manager.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors_binding.go,
+  pkg/api/metrics_userspace.go,
+  pkg/api/metrics_userspace_slowpath.go (new — the emitter is in its own file
+  because appending it to metrics_userspace.go crossed the 2000-LOC
+  modularity floor; split rather than excepted),
+  pkg/api/metrics_slowpath_reinject_7409_test.go (new),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
+  docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
+## 2026-08-22 — #7443 bind the live fabric peer-MAC resolver
+
+- **Timestamp**: 2026-08-22 (fix/7443-fabric-peer-mac-binding)
+- **Action**: Bind `buildFabricPeerMAC` — the LIVE fabric peer-MAC resolver —
+  with a test that actually executes it. #6598 hardened the selection but its
+  coverage was a table over the extracted helper `selectFabricPeerMAC` plus an
+  AST scan of `pkg/daemon/daemon_ha_fabric.go`; neither ran
+  `buildFabricPeerMAC`, so restoring that function's body to the pre-#6598
+  inline loop (the exact shipped defect: any address-matched entry with a
+  non-nil `HardwareAddr`, no NUD state test, no length test) passed `go vet`
+  and both full suites. `selectFabricPeerMAC` went dead under the revert, but
+  Go does not error on an unused package-level func and this repo runs no
+  `unused`/staticcheck gate, so nothing caught it. Added the
+  `fabricNeighListFn` seam (mirroring `ruleListFn` in routes.go, which is bound
+  by 20+ existing tests, and the `d.linkByNameFn`/`d.neighListFn` seams #6554
+  added for the same purpose) and drove the real resolver against a synthetic
+  neighbour table. Secondary, at the coordinator's direction: cross-reference
+  comments at BOTH NUD masks (`FabricNeighValidStates` and
+  `usableNUD`), each naming the other and the question it answers, so a future
+  single-sourcing pass cannot mistake the divergence for drift. Also corrected
+  `FabricNeighValidStates`'s exclusion list, which named only
+  INCOMPLETE/FAILED/NONE and so read as though NUD_NOARP were accepted.
+  Mutation matrix (4 cells x with/without the new fixture, `go vet` rc=0 in
+  every cell): restoring the pre-#6598 selection reds on
+  `buildFabricPeerMAC = "02:bf:72:cc:00:01", want ""` with the fixture and goes
+  GREEN without it — the escape reproduced, then closed. Bypassing the seam
+  also reds only with the fixture. The length and state halves red in both
+  columns (#6598/#6554 already own those), reported as redundancy rather than
+  claimed as new coverage.
+- **File(s)**: pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/fabric_peer_mac_binding_7443_test.go (new),
+  pkg/daemon/daemon_neighbor_listener.go, docs/fabric-cross-chassis-fwd.md,
+  _Log.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6628 — session-sync authentication was fixed per connection at
+    handshake time and a key commit does not restart comms, so an established
+    stream stayed unauthenticated forever and a rotation never rekeyed it.
+    Added an IN-PLACE upgrade: a four-frame exchange over the live connection
+    that only ever promotes and never drops. Required splitting authConn's
+    single `key` into readKey/writeKey — one field gates BOTH
+    `sync_conn_read.go` (require a trailer) and `sync_protocol.go` (seal), so a
+    naive promotion desyncs the stream and drops the connection. Fourth frame
+    (Ack) exists so the RESPONDER does not switch until it has verified the
+    initiator's proof; a three-frame version drops the connection whenever the
+    two nodes hold different keys. SPLIT: the hostile-stream residual is #7441
+    with #5078's three constraints verbatim. Matrix 9/9 RED — U4b caught that
+    the authPSK STAMP in wrapSyncConn was unbound while its comparison was
+    (hand-built fixture); rebuilt the fixture through wrapSyncConn.
+  - **File(s)**: pkg/cluster/{sync_auth_upgrade.go,
+    sync_auth_upgrade_6628_test.go,sync_auth.go,sync.go,sync_conn_read.go,
+    sync_protocol.go,sync_auth_test.go,sync_capabilities_6650_test.go,
+    sync_config_crypto_6629_test.go,README.md},
+    pkg/daemon/{daemon_apply_tail.go,cluster_auth_upgrade_wiring_6628_test.go},
+    docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6599 — fenced the session-sync delta filter's fabric-redirect
+    carve-out on INGRESS-side RG ownership. It admitted every fabric-redirect
+    delta unconditionally, which is the emission channel the transient-purge
+    re-entry class rides: a node that owns neither side of a flow could push an
+    identity-less Open (plus its forward-wire alias) that overwrote the RG
+    owner's authoritative session family under latest-generation-wins.
+  - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+    pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6675 — made pkg/dataplane/userspace hermetic w.r.t. the kernel
+    ip-rule table via TestMain, so an EPERM dump can no longer nil-deref a
+    snapshot and SIGSEGV the whole test binary. Chose stubbing over skipping so
+    the package keeps coverage in reduced-capability sandboxes.
+  - **File(s)**: pkg/dataplane/userspace/hermetic_iprules_6675_test.go,
+    docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6682 — an unzoned INGRESS (zone id 0) no longer falls through to
+    the implicit default policy, where `default-policy permit-all` forwarded it
+    with screens already skipped. Now an explicit deny counted on
+    UNZONED_INGRESS_DENIED. The issue's reported mechanism (a from-any/to-any
+    rule matching zone 0) was already closed by #3110 and was false when filed.
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+    docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6682 follow-through — corrected the operator-facing advisory
+    caveat and its four doc/comment copies, which asserted that a wildcard rule
+    matches zone-pair (0,0). That was false when written (#3110) and doubly so
+    after the deny. Conclusion preserved, mechanism corrected.
+  - **File(s)**: pkg/config/compiler_tunnel_plaintext_advisory.go,
+    pkg/config/compiler_wireguard_plaintext_warn.go,
+    pkg/config/compiler_ipsec_plaintext_warn.go,
+    pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
+    docs/userspace-dataplane-gaps.md
 
 ## 2026-08-22 — #6672 packed chassis cluster body
 - **Timestamp**: 2026-08-22
