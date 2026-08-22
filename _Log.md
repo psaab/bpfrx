@@ -99982,3 +99982,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/vrrp/resign_barrier_6177_test.go (new),
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
+
+## 2026-08-21 — #6535 periodic converger for the Kea applier
+- **Timestamp**: 2026-08-21
+- **Action**: Track whether a Kea apply converged (`applyFailed` +
+  `ClaimApplyRetry`, on their own mutex); add `reconcileClusterDHCPServices`
+  to `reconcileRGState`; single-source the desired state as
+  `desiredClusterDHCPConfig`.
+- **File(s)**: `pkg/dhcpserver/dhcpserver.go`, `pkg/dhcpserver/test_seams.go`,
+  `pkg/dhcpserver/README.md`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/daemon_apply_routing.go`,
+  `pkg/daemon/dhcp_apply_converger_6535_test.go`, `pkg/daemon/README.md`

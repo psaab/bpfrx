@@ -160,6 +160,35 @@ type Manager struct {
 	// (observable by tests; useful telemetry if exported later).
 	staleApplySkips atomic.Uint64
 
+	// applyFailed records whether the most recently COMPLETED apply
+	// attempt returned an error. #6535: in cluster mode the only trigger
+	// for a Kea apply is the RG-transition EDGE (applyRethServicesForRG /
+	// clearRethServicesForRG, both gated on tr.Changed) or an operator
+	// commit — there is no periodic converger — so a failed apply is
+	// simply lost. The node that should be serving stays dark, or the node
+	// that should have stopped keeps serving, until the next transition or
+	// commit: persistent dual-DHCP (or no-DHCP) after a failover. This flag
+	// is the debt a converger can consume; it is advanced ONLY on a
+	// completed attempt and cleared only by a successful one.
+	//
+	// A SUPERSEDED apply (gen <= lastAppliedGen) deliberately leaves it
+	// alone: that request never ran, and the newer state that displaced it
+	// owns the outcome.
+	//
+	// Guarded by retryMu, NOT mu. mu is held for the whole apply body,
+	// which shells out to systemctl under a 15 s bound; a converger
+	// running on the daemon's 2 s reconcile tick must be able to ask
+	// "did the last attempt fail?" without blocking behind a restart
+	// that is still running. Lock order is mu -> retryMu (only the tail
+	// of apply takes both); ClaimApplyRetry takes retryMu alone.
+	applyFailed bool
+	// lastRetryClaim is when a converger last CLAIMED a retry, used to
+	// space out retries. Kea applies shell out to systemctl with a 15 s
+	// bound, so a permanently broken Kea must not be re-driven on every
+	// 2 s reconcile tick. Guarded by retryMu.
+	lastRetryClaim time.Time
+	retryMu        sync.Mutex
+
 	// ApplyAsync mailbox (#1835 F2): a mutex-guarded 1-slot pending
 	// pointer plus a cap-1 wake channel, consumed by a single lazily
 	// started worker goroutine, so VRRP transition callbacks never
@@ -317,7 +346,55 @@ func (m *Manager) apply(gen uint64, cfg *config.DHCPServerConfig, restartInactiv
 	}
 
 	m.lastAppliedGen = gen
-	return errors.Join(errs...)
+	err := errors.Join(errs...)
+	// #6535: remember whether this attempt actually converged, so a
+	// converger can re-drive it. lastAppliedGen deliberately still advances
+	// on failure (see its doc comment) — a retry allocates a FRESH gen from
+	// applyGen, so it is never blocked by the superseded guard, and leaving
+	// the ordering invariant untouched keeps the #1835 coalescing reasoning
+	// intact.
+	m.noteApplyOutcome(err)
+	return err
+}
+
+// noteApplyOutcome records whether a completed apply converged. Separate from
+// apply's body so the retry state lives under retryMu rather than mu.
+func (m *Manager) noteApplyOutcome(err error) {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	m.applyFailed = err != nil
+}
+
+// applyRetryInterval is the minimum spacing between converger-driven retries
+// of a failed apply. A Kea apply regenerates config and shells out to
+// systemctl under a 15 s bound; the reconcile loop that drives the retry ticks
+// every 2 s, so retrying on every tick would keep a permanently broken Kea
+// (missing binary, bad unit) in a continuous restart shell-out. 30 s heals a
+// transient fault well inside an operator's notice without that.
+const applyRetryInterval = 30 * time.Second
+
+// ClaimApplyRetry reports whether a converger should re-drive the desired
+// state because the last completed apply attempt failed, and CLAIMS the retry
+// window when it says yes (#6535).
+//
+// It is a claim rather than a plain predicate for the same reason
+// rgStateMachine.ShouldLogRetry is: the caller acts on the answer, and two
+// passes must not both act. A caller that claims and then does not enqueue
+// only loses one window — the next one re-claims, so it cannot wedge.
+//
+// The flag is cleared by the next SUCCESSFUL apply, not by the claim, so a
+// retry that fails again stays claimable.
+func (m *Manager) ClaimApplyRetry(now time.Time) bool {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	if !m.applyFailed {
+		return false
+	}
+	if !m.lastRetryClaim.IsZero() && now.Sub(m.lastRetryClaim) < applyRetryInterval {
+		return false
+	}
+	m.lastRetryClaim = now
+	return true
 }
 
 // ApplyAsync enqueues an authoritative Apply for cfg and returns
