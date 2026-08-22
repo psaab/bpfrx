@@ -21752,7 +21752,11 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   scoped signature. Build/vet clean; `pkg/dataplane` (minus pre-existing
   unrelated `TestUserspaceManagerDoesNotImportReflectOrUnsafe`) + full
   `pkg/dataplane/userspace` GREEN under `-race`.
-- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
+- **Split**: the new accessor family pushed loader.go 1413 -> 1607, crossing the
+  1500 [WATCH] floor, so it moved to pkg/dataplane/link_maps.go (183 lines,
+  verbatim, md5 42e1227f2ffd). loader.go 1607 -> 1422, below where it started.
+- **File(s)**: pkg/dataplane/link_maps.go (new), pkg/dataplane/loader.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
 ## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
 - **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
 - **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
