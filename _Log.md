@@ -100725,3 +100725,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
+
+## 2026-08-21 — #6546: device-map duplicate logical name refused
+- **Timestamp**: 2026-08-21
+- **Action**: `devicemap.Resolve`'s post-pass guarded two entries → ONE NIC but
+  not two entries → ONE LOGICAL NAME, so a duplicate name bound both entries
+  and the daemon renamed a nondeterministically-chosen NIC, durably via
+  `.link`. Added the symmetric guard with its own `BindRefusedDupName` status
+  (distinct remedy), keyed on the RESOLVED Linux name — which also closes a
+  strict-path hole: `ge-0/0/3` + `ge-0-0-3` are one interface and the raw-string
+  compare in `validateDeviceMapStrict` accepted them. Strict gate now
+  canonicalises; the commit pre-flight hard-stops via `Status.Refused()`.
+- **File(s)**: pkg/devicemap/devicemap.go, pkg/config/compiler_chassis.go,
+  pkg/daemon/device_map.go, pkg/devicemap/dup_logical_name_6546_test.go (new),
+  pkg/config/compiler_device_map_dup_name_6546_test.go (new),
+  pkg/daemon/device_map_dup_name_6546_test.go (new),
+  docs/bare-metal-device-map.md, _Log.md
