@@ -2340,7 +2340,7 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
 /// and this assertion fails.
 #[test]
 fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
-    let mut coordinator = gre1881_coordinator_with_worker();
+    let mut coordinator = StoppedCoordinator::wrap(gre1881_coordinator_with_worker()); // #6637
     assert!(
         !coordinator.workers.records.is_empty(),
         "precondition: had_live_workers == true"
@@ -4067,7 +4067,7 @@ fn reconcile_missing_session_pin_keeps_prior_generation_published() {
 /// fixtures; here we only assert the publish happened.
 #[test]
 fn reconcile_all_mandatory_maps_open_advances_published_generation() {
-    let mut coordinator = Coordinator::new();
+    let mut coordinator = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
         config_generation: 1,
@@ -5328,7 +5328,7 @@ fn zone_flood_counters_drops_a_zone_that_lost_its_slot_3651() {
 /// preflight-zone-source fix prevents.
 #[test]
 fn reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402() {
-    let mut coordinator = Coordinator::new();
+    let mut coordinator = StoppedCoordinator::new(); // #6637
     // Fresh coordinator: the live forwarding zone table is EMPTY (the bug
     // condition — the snapshot carries the zones, the live table does not yet).
     assert!(
@@ -5741,7 +5741,7 @@ fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
 /// failure).
 #[test]
 fn reconcile_empty_optional_pins_advance_published_generation() {
-    let mut coordinator = Coordinator::new();
+    let mut coordinator = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
         config_generation: 50,
@@ -5776,7 +5776,7 @@ fn reconcile_empty_optional_pins_advance_published_generation() {
 /// healthy configured map).
 #[test]
 fn reconcile_present_optional_pins_open_ok_advance_generation() {
-    let mut coordinator = Coordinator::new();
+    let mut coordinator = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
         config_generation: 60,
@@ -6171,7 +6171,7 @@ fn both_paths_open_full_seven_pin_bundle_before_ok_6243() {
 
     // Activated: reconcile advances the published generation (opened + retained
     // all seven FDs and proceeded past the preflight).
-    let mut coord = Coordinator::new();
+    let mut coord = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
         config_generation: 70,
@@ -6510,5 +6510,185 @@ fn zero_unbound_slot_clears_every_copied_field_5190() {
         "#5190: zero_unbound_slot left these fields stale on an unbound \
          slot (copy_live_snapshot writes them, the reset half must clear \
          them): {stale:?}"
+    );
+}
+
+// --- #6637: the neighbor-monitor thread leak -------------------------------
+
+/// `StoppedCoordinator` is a `Coordinator` that tears itself down on drop.
+///
+/// THE LEAK. A successful reconcile ends in `bring_up_workers` ->
+/// `start_post_readiness_neighbor_services`, which spawns the `neigh-monitor`
+/// thread and stores its stop flag + join handle on the coordinator. There is no
+/// `impl Drop for Coordinator`, so a test that builds one, reconciles, and lets
+/// it fall out of scope stops nothing. Measured across the suite before this
+/// change: 8 spawned, 1 stopped, **7 leaked**.
+///
+/// WHY ONLY THIS THREAD. Its two siblings self-terminate: `neigh-warmer` and
+/// `neigh-resolver` both exit on `RecvTimeoutError::Disconnected`, and dropping
+/// the coordinator drops the channel producers they are watching.
+/// `neigh_monitor_thread` has no channel — only an `Arc<AtomicBool>` whose other
+/// clone it holds itself — so it can never learn its owner is gone. It keeps a
+/// netlink socket subscribed to `RTMGRP_NEIGH`, wakes twice a second on its
+/// 500ms `SO_RCVTIMEO`, and parses every ARP/NDP event on the host into a map
+/// nobody reads, for the life of the test binary.
+///
+/// PRODUCTION IS NOT AFFECTED and needs no change: every reconcile tears down
+/// first (`reconcile/teardown.rs` -> `stop_inner`), the respawn is gated on
+/// `monitor_stop.is_none()`, and the daemon's exit path and `shutdown` verb both
+/// join it. The machinery is complete and correct — the tests simply never
+/// pulled it.
+///
+/// RAII rather than a `stop()` at the end of each test, deliberately. 28 test
+/// functions in this file call `reconcile`; most fail preflight before bringup
+/// today, so any one of them that later starts passing preflight would join the
+/// leak set silently. A guard makes the correct construction the default one.
+struct StoppedCoordinator(Coordinator);
+
+impl StoppedCoordinator {
+    fn new() -> Self {
+        Self(Coordinator::new())
+    }
+
+    /// Wrap a coordinator a fixture helper already built.
+    fn wrap(inner: Coordinator) -> Self {
+        Self(inner)
+    }
+}
+
+impl std::ops::Deref for StoppedCoordinator {
+    type Target = Coordinator;
+    fn deref(&self) -> &Coordinator {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StoppedCoordinator {
+    fn deref_mut(&mut self) -> &mut Coordinator {
+        &mut self.0
+    }
+}
+
+impl Drop for StoppedCoordinator {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+/// neigh_monitor_thread_count reads this process's own thread names and counts
+/// the live `neigh-monitor` threads.
+///
+/// `/proc/self/task/*/comm` is the same surface the wedged-process dump in the
+/// issue was read from, so the gate below measures exactly what was reported
+/// rather than a proxy for it.
+fn neigh_monitor_thread_count() -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            std::fs::read_to_string(e.path().join("comm"))
+                .map(|c| c.trim() == "neigh-monitor")
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// await_neigh_monitor_count waits (bounded) for the live `neigh-monitor` count
+/// to reach `want`, returning the last value it saw.
+///
+/// An instant sample after `reconcile` returns is RACY and fails
+/// intermittently: `std::thread::Builder::name` is applied by the CHILD at
+/// startup, so the thread can exist while `/proc/self/task/<tid>/comm` still
+/// holds the parent's name. The first version of this gate sampled immediately
+/// and reported `during=0` while the monitor was demonstrably running.
+///
+/// The teardown direction does not need this — `stop()` JOINS — but it polls
+/// through the same helper so both directions read one implementation.
+fn await_neigh_monitor_count(want: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = neigh_monitor_thread_count();
+        if got == want || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// #6637 fail-on-revert gate: a coordinator bringup must not leave a
+/// `neigh-monitor` thread behind.
+///
+/// It asserts BOTH directions, and the second is what stops the fix degenerating
+/// into "do not start the monitor at all":
+///
+///   - after a successful reconcile the count must RISE by exactly one, and
+///   - after teardown it must return to where it started.
+///
+/// Removing `stop_and_join_monitor()` from `stop_inner` reds the second.
+/// Preventing the spawn reds the first.
+#[test]
+fn coordinator_bringup_does_not_leak_a_neigh_monitor_thread_6637() {
+    let before = neigh_monitor_thread_count();
+
+    let mut coordinator = Coordinator::new();
+    zone_counter_live_coordinator(&mut coordinator);
+    let mut bindings = zone_counter_binding();
+    let mut candidate = mandatory_ok_snapshot(6);
+    candidate.zones = zone_counter_zones(&[100, 300]);
+    coordinator.force_worker_healthy_stub = true;
+    let _ = coordinator.reconcile(Some(&candidate), &mut bindings, 64);
+
+    let during = await_neigh_monitor_count(before + 1);
+    if during != before + 1 {
+        // Not a silent skip: if bringup stopped spawning the monitor, the
+        // teardown assertion below would pass vacuously and this gate would
+        // certify a fix that simply disabled the feature.
+        coordinator.stop();
+        panic!(
+            "expected a reconcile to spawn exactly one neigh-monitor thread \
+             (before={before} during={during}); the teardown half of this gate \
+             is meaningless unless the spawn actually happened"
+        );
+    }
+
+    coordinator.stop();
+
+    let after = await_neigh_monitor_count(before);
+    assert_eq!(
+        after, before,
+        "a neigh-monitor thread survived teardown (before={before} during={during} \
+         after={after}); it holds a netlink socket subscribed to RTMGRP_NEIGH and \
+         keeps parsing every host neighbor event into a map nobody reads, for the \
+         life of the process"
+    );
+}
+
+/// #6637: the RAII guard must actually stop the monitor on drop, which is what
+/// the converted tests rely on.
+///
+/// Deleting the `Drop` impl reds this.
+#[test]
+fn stopped_coordinator_guard_joins_the_neigh_monitor_on_drop_6637() {
+    let before = neigh_monitor_thread_count();
+    {
+        let mut coordinator = StoppedCoordinator::new();
+        zone_counter_live_coordinator(&mut coordinator);
+        let mut bindings = zone_counter_binding();
+        let mut candidate = mandatory_ok_snapshot(6);
+        candidate.zones = zone_counter_zones(&[100, 300]);
+        coordinator.force_worker_healthy_stub = true;
+        let _ = coordinator.reconcile(Some(&candidate), &mut bindings, 64);
+        assert_eq!(
+            await_neigh_monitor_count(before + 1),
+            before + 1,
+            "the guard must not suppress the spawn — it must clean up AFTER one"
+        );
+    }
+    assert_eq!(
+        await_neigh_monitor_count(before),
+        before,
+        "StoppedCoordinator dropped without joining the neigh-monitor thread"
     );
 }
