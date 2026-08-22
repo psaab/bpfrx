@@ -690,6 +690,55 @@ arrival from the `muAcquireProbeHook` pre-lock seam (a signal before
 the contended call can pass the silence window without the goroutine
 ever reaching the mutex).
 
+## Obsolete registry generations are COUNTED, not prevented (#6741 Increment 1)
+
+`Teardown` runs `Cleanup`, which destroys the pinned kernel objects — but it
+deliberately does **not** clear `m.maps` / `m.programs`, and the A3 rule above
+deliberately lets a retained-state method **proceed**. So between a
+Teardown-retain and the next publish, a registry lookup hands back a handle to an
+obsolete forwarding generation and the caller mutates it: a mutation that
+succeeds and reaches nothing. Both recurrence paths do this —
+`bootstrap.go`'s `enterBootstrapMode`, and the standalone first-commit timeout in
+`daemon_apply_commit.go`.
+
+`registryGeneration` is bumped inside `publishShimRegistryLocked`'s existing
+`m.mu` hold, so it and the registry contents can never be read out of step.
+`Teardown` records the superseded boundary in `registryObsoleteFrom`. The two
+lookup helpers — the uniform funnel every registry access already goes through —
+count a lookup that SERVES a handle while the registry is superseded, and log
+once per obsolete epoch naming the map. `ObsoleteRegistryAccesses()` reads the
+total.
+
+**Read the counter correctly.** A zero means *"no lookup OBSERVED a superseded
+generation"*, never *"no obsolete mutation occurred"*:
+
+- it is a **lookup-time** observation. `lookupMapLocked` returns the `*ebpf.Map`
+  by reference and then **releases `m.mu`**, so a republish landing after the
+  lookup returns is invisible to it. A caller holding an escaped handle across a
+  republish is counted **zero** times.
+- it changes **no behaviour**. Every caller proceeds exactly as before. Making
+  retained mutations fail is a behaviour change at 135 call sites and is the
+  deferred half of #6741.
+
+**Why the stronger guarantee is not just a tighter lock.** Checking the
+generation at *mutation* time means threading a token through those 135 sites, or
+converting them to `withMap(name, func(*ebpf.Map) error)` callbacks — and the
+callback form puts a BPF syscall inside `m.mu`, which #6740 established must not
+happen (the 1 Hz status path needs that lock). #6740 and #6741's first acceptance
+criterion therefore pull in opposite directions, and closing the escape window
+needs a mechanism that is neither: a generation-tagged handle wrapper, a per-map
+lock separate from `m.mu`, or an accepted narrowing of the guarantee. That is
+recorded on #6741 rather than decided here.
+
+What this increment buys the redesign is the thing it lacked: **evidence about
+frequency**. A counter that never moves on the two recurrence paths changes what
+the redesign should be; one that moves often gives it a reproducible trigger.
+
+The counter is currently readable through `ObsoleteRegistryAccesses()` and the
+per-epoch log. It is **not** wired to Prometheus: the API collector reaches the
+dataplane through the narrow `apiRuntimeDataPlane` interface (47 references plus
+several test fakes), and widening that is a separable change with its own review.
+
 ## Live-indirection primitives (#2114 / #6743 r6)
 
 `live.go` carries the three things the daemon's `liveDataPlane` adapter
