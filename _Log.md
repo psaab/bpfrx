@@ -104051,6 +104051,35 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/server/handlers/queue.rs,
   userspace-dp/src/server/tests.rs
 
+## 2026-08-22 — #6741 Increment 1: count obsolete registry generations
+- **Timestamp**: 2026-08-22
+- **Action**: Split #6741 and shipped the observability half only. Added
+  registryGeneration (bumped inside publishShimRegistryLocked's existing m.mu
+  hold), registryObsoleteFrom (recorded by Teardown, NOT Close — Close keeps its
+  pinned handles live for hitless restart), and a counter incremented at the two
+  lookup choke points when a lookup SERVES a handle from a superseded
+  generation, with a once-per-epoch warn naming the map. No behaviour change at
+  any of the 135 call sites.
+- **Deliberately NOT closed**: the escape window. lookupMapLocked returns the
+  handle by reference then releases m.mu, so a republish after the lookup is
+  invisible; a zero counter means "no lookup observed a superseded generation",
+  not "no obsolete mutation occurred". Said so in the source, the README and on
+  the issue — a metric implying a guard it lacks is worse than no metric.
+- **Design tension recorded on #6741**: #6740 forbids a BPF syscall under m.mu;
+  a mutation-time generation check requires exactly that (or a token threaded
+  through 135 sites). The two fixes pull in opposite directions and someone must
+  decide deliberately.
+- **Not wired to Prometheus**: the collector reaches the dataplane through the
+  narrow apiRuntimeDataPlane interface (47 references + test fakes); widening it
+  is a separable change. Counter is readable via ObsoleteRegistryAccesses().
+- **Also filed**: #7547 (AttachXDP/DetachXDP read-modify-write sequences have no
+  concurrent coverage; their atomicity rests on an untested applySem claim) —
+  kept OUT of #6741 so a concrete gap does not get buried in a design item.
+- **File(s)**: pkg/dataplane/armed_gate.go, pkg/dataplane/loader.go,
+  pkg/dataplane/registry_generation_6741_test.go (new),
+  pkg/dataplane/armed_gate_matrix_test.go, pkg/dataplane/README.md
+
+
 ## 2026-08-22 — #6755 DDNS wire-RR claims carry their DNS authority
 - **Timestamp**: 2026-08-22
 - **Action**: WireRRClaim was {FQDN,type,rdata} with no authority, so two
