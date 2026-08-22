@@ -1,3 +1,30 @@
+## 2026-08-21 — #6550 cluster monitor poll/UpdateGroups map race
+
+- **Timestamp**: 2026-08-21
+- **Action**: Took `mon.mu` around the poll goroutine's mutations of
+  `ifaceState`, `ipState`, `ipDebts` and `ipThresholdState`, which
+  `UpdateGroups` deletes from under that same lock on every cluster
+  config apply — a Go runtime FATAL (`concurrent map read and map
+  write`) reachable from a routine commit, and via config-sync on both
+  nodes. Not one lock around the apply phase: the order is
+  `m.mu -> mon.mu` (`Manager.UpdateConfig` holds `m.mu` and calls
+  `UpdateGroups`), and the poll path calls `SetMonitorWeight`, which
+  takes `m.mu` — holding `mon.mu` across that inverts the order and
+  deadlocks. `reconcileRGIPDebts` now computes its whole diff under the
+  lock into a `[]ipDebtAction` and replays the manager callbacks after
+  releasing it, preserving the removals-then-installs emission order.
+  Added a race probe, a deterministic lock-order probe (new
+  `beforeManagerApplyHook` seam), and a Makefile canary; added the
+  missing `./pkg/cluster/` leg to `test-race-dp` — no make target raced
+  this package at all, so #6550 and #7257 were races CI had no PATH to.
+  Mutation matrix: M1/M2/M3 (each site's lock removed, verbatim pre-fix
+  form) → 5/5/7 DATA RACEs; M4 (lock held across the manager callback)
+  → the lock-order probe reds on timeout; W1 (delete the Makefile leg)
+  and W2 (drop a probe name from its pattern) → the canary reds.
+- **File(s)**: pkg/cluster/monitor.go,
+  pkg/cluster/monitor_poll_update_race_6550_test.go,
+  pkg/cluster/README.md, Makefile
+
 ## 2026-08-22 — #6499 boot-firmware self-tests + lint-list drift guard
 
 - **Timestamp**: 2026-08-22

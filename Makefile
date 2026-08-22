@@ -107,9 +107,21 @@ test-go: test-race-dp
 # and fails if any test in the declared concurrency-binder files stops
 # matching. Keep the `-run '<pattern>'` single-quoted spelling — that canary
 # reads it.
+#
+# #6550: the pkg/cluster leg. Before it, NO make target ran ./pkg/cluster
+# under -race at all, so the cluster Monitor's concurrent-map fatal (poll
+# goroutine vs UpdateGroups) and the #7257 heartbeat start/stop race were
+# not races CI had failed to catch — they were races CI had no path to
+# observe. The selection is the two packages' race PROBES only (they are
+# ~2s combined at -count=2); pkg/cluster's non-race tests stay on the
+# plain `go test ./...` leg. Keep the `-run '<pattern>'` single-quoted
+# spelling here too: pkg/cluster's TestRaceGateCoversTheClusterProbes6550
+# parses this line, and pkg/daemon's canary reads the FIRST -run line in
+# this recipe, so this leg must stay BELOW the pkg/daemon one.
 test-race-dp:
 	$(GO) test -race ./pkg/daemon/ -run 'DataplaneCell|NATPoolAlarm|ForwardingStatus|BootstrapExit|RuntimeDataplaneNeverBareRootManager|EventStreamFallbackLoop|RunUserspaceEventStream|LiveDataPlane_|GRPCShowBuffers_|SystemAction_|GRPCServer_|RESTServer_|ManagementProbe|ConsoleCLIProbeWiring|FullResync|ReconcilePassUsesOneDataplaneSnapshot|ReconcileBlackholeWrappersStillReloadPerCall' -count=2
 	$(GO) test -race ./pkg/dataplane/ -run 'ArmedGate|PreArm' -count=2
+	$(GO) test -race ./pkg/cluster/ -run 'DoesNotRaceUpdateGroups6550|DoesNotHoldMuAcrossManagerCallback6550|DoesNotRaceStopHeartbeat7257|HeartbeatStartSuperseded' -count=2
 
 # Rust userspace-dp correctness suite (#4006). userspace-dp is a
 # binary-only crate (no [lib] target), so its unit tests live in the bin
