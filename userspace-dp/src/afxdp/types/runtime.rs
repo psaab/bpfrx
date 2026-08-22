@@ -497,7 +497,14 @@ pub(in crate::afxdp) struct DebugPollCounters {
     pub(in crate::afxdp) tx_tcp_rst: u64,
     pub(in crate::afxdp) rx_bytes_total: u64,
     pub(in crate::afxdp) tx_bytes_total: u64,
-    pub(in crate::afxdp) rx_oversized: u64,
+    /// Count of RX descriptors longer than 1514 bytes (#5190 A1-b1-F7).
+    /// This is a FIXED 1514-byte census line, NOT an MTU violation: the
+    /// threshold is the untagged Ethernet+1500 MTU frame size and knows
+    /// nothing about the binding's configured MTU, jumbo frames, or an
+    /// in-band VLAN tag the NIC did not strip — all of which produce
+    /// legitimate longer frames. Named for what it counts so an operator
+    /// reading the debug report does not read it as an anomaly counter.
+    pub(in crate::afxdp) rx_over_1514: u64,
     pub(in crate::afxdp) rx_max_frame: u32,
     pub(in crate::afxdp) tx_max_frame: u32,
     pub(in crate::afxdp) seg_needed_but_none: u64,

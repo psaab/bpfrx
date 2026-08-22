@@ -29,12 +29,21 @@
 //     Codex round-4 finding #5).
 //   - owner_rg_export: collect Vec<Key> for a given owner-RG.
 //
-// Pass criterion: slab shape must NOT regress on the dominant
-// slow-path lookups (reverse_nat, alias). Small regressions on
-// `lookup_forward` (<10ns, due to slab indirection) and
-// `owner_rg_export` (~2×, on a rare HA-failover path) are
-// accepted in exchange for the secondary-index payload
-// reduction (50-byte Key → 4-byte u32).
+// EXPLORATORY — this bench emits NO pass/fail verdict (#5190 A1-b12-F3).
+// It is a criterion comparison whose numbers a human reads; there is no
+// threshold comparison and no nonzero exit, so a severe regression still
+// exits 0, and no Makefile target or CI job runs it (`make test-rust`
+// deliberately excludes benches). The only threshold-enforcing benches in
+// this crate are `prefix_set_lookup` and `runtime_view_refresh`, which own
+// their `main()` and `std::process::exit(1)` on a breach — copy that shape
+// if this comparison is ever promoted to a gate.
+//
+// Reading criterion (the criterion it was designed against): the slab shape
+// should not regress the dominant slow-path lookups (reverse_nat, alias).
+// Small regressions on `lookup_forward` (<10ns, due to slab indirection) and
+// `owner_rg_export` (~2×, on a rare HA-failover path) were accepted in
+// exchange for the secondary-index payload reduction (50-byte Key → 4-byte
+// u32).
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rustc_hash::{FxHashMap, FxHashSet};

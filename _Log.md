@@ -98065,3 +98065,49 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+
+## 2026-08-21 — userspace-dp LOW cohorts (#5190/#5191/#5193): five bounded residuals
+
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed five bounded items across three userspace-dp LOW cohorts.
+  The #5189 A1-b10-F4 keepalive-cap item this work also carried was DROPPED
+  before merge: PR #7199 fixes the same defect in the same region of
+  `event_stream/connection.rs`, and its implementation was chosen because it
+  additionally declines to re-arm `last_write` on suppression (its own guard
+  cell, `suppressed_idle_keepalive_does_not_rearm_the_interval_5189`). Taking
+  this branch's version instead would have silently lost that second guard, so
+  the whole A1-b10-F4 change — the `has_cap_headroom` predicate, its drain
+  call site, the connection.rs gate, its test and its doc paragraph — is
+  reverted here rather than hand-merged.
+  #5190 A1-b8-F6: `zero_unbound_slot` now clears the four `shared_umem_*`
+  strings and the `martian_dropped` / `ipv6_ext_header_dropped` counters that
+  `copy_live_snapshot` writes, with a serialized-form completeness test that
+  fails on ANY future copy/reset drift rather than pinning the six by name.
+  #5190 A1-b1-F7: `rx_oversized` renamed to `rx_over_1514` and documented as a
+  fixed 1514-byte census, not an MTU-violation counter (jumbo / in-band-VLAN
+  frames legitimately count). #5190 A1-b12-F3: three benches that advertised
+  merge gates but emit no verdict are relabelled EXPLORATORY, naming
+  `prefix_set_lookup` / `runtime_view_refresh` as the only threshold-enforcing
+  benches; the Makefile note is corrected too. #5191 A1-b9-F5: the
+  transport-data and CookieReply parsers now compare the full little-endian
+  32-bit type word via the handshake parser's `is_canonical_type`, closing a
+  parser differential against kernel WG / wireguard-go. #5193 A1-b7-F1:
+  `populate_tunnel_endpoints` preflights endpoint-id uniqueness before mutating
+  state (typed `TunnelEndpointDuplicateId`), and a duplicate ifindex keeps the
+  first row instead of silently aliasing. #5193 A1-b7-F7: the CoS DSCP
+  rewrite-rule ingest bounds every code-point to 0..=63
+  (`CosDscpRewriteCodePointOutOfRange`), so a value the TX path would mask to a
+  different PHB fails the snapshot closed like the classifier builders already
+  do. 6-cell mutation matrix green/red/green, zero unsound cells; full
+  `cargo test --release --bins --tests -- --test-threads=1` green (4458+ tests).
+  Rust diff moves the helper binary, so a cluster smoke is OWED (not run here).
+- **File(s)**: userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/poll_descriptor/rx_telemetry.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/worker/loop_body/debug_report.rs,
+  userspace-dp/src/afxdp/wg/{framing,cookie,handshake,cookie_tests}.rs,
+  userspace-dp/src/afxdp/forwarding_build/{cos,tunnels,tests}.rs,
+  userspace-dp/src/policy_snapshot_error.rs,
+  userspace-dp/benches/{session_table,snat_allocator,tx_kick_latency}.rs,
+  Makefile, docs/config-schema.md, docs/wireguard-interop.md,
+  docs/userspace-dataplane-architecture.md, _Log.md

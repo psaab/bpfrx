@@ -20,7 +20,10 @@
 // `live_by_flow` map insert/remove. The global tracked-flow cap becomes
 // one `AtomicUsize` (fetch_add-reserve / fetch_sub-rollback, plan F4).
 //
-// This bench is the REQUIRED merge gate: it answers the PLAN-KILL
+// This bench is an EXPLORATORY decision-support measurement, NOT an
+// enforced gate (#5190 A1-b12-F3): it prints a comparison table and exits
+// 0 whatever the numbers say, and nothing in the Makefile or CI runs it.
+// It answered the PLAN-KILL
 // question "is the global mutex a measurable bottleneck at the loss
 // cluster's 6-worker scale?" by re-implementing BOTH shapes side by
 // side (the production allocator is `pub(crate)` in a bin crate, so we

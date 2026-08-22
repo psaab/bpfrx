@@ -21,10 +21,16 @@
 // `umem.rs::tx_kick_latency_*` which exercise the real production
 // functions.
 //
-// Gate: p99 per-call overhead ≤ 60 ns on the userspace cluster VM
-// (VDSO-confirmed monotonic_nanos path). Plan §3.10 R1 correction
-// — the earlier 25 ns gate only covered the atomic fast-path; 45 ns
-// derivation + 15 ns jitter headroom ≈ 60 ns.
+// EXPLORATORY — this bench emits NO pass/fail verdict (#5190 A1-b12-F3).
+// It runs under criterion, prints timings, and exits 0 regardless; nothing
+// in the Makefile or CI runs it. The design target it was written against
+// was p99 per-call overhead ≤ 60 ns on the userspace cluster VM
+// (VDSO-confirmed monotonic_nanos path; plan §3.10 R1 correction — the
+// earlier 25 ns figure only covered the atomic fast-path; 45 ns derivation
+// + 15 ns jitter headroom ≈ 60 ns) — a number a human compares against the
+// printed p99, NOT an enforced gate. To make it one, follow
+// `benches/prefix_set_lookup.rs`: own `main()`, sample directly, and
+// `std::process::exit(1)` on a breach.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};

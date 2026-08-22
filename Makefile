@@ -119,10 +119,13 @@ test-race-dp:
 #
 #   --bins --tests         select the correctness suite. Benches are
 #                          deliberately excluded: they are performance
-#                          gates run via `cargo bench`, and criterion's
-#                          harness (harness = false) rejects libtest's
-#                          --test-threads flag, so running them here would
-#                          break the run.
+#                          measurements run by hand via `cargo bench`, and
+#                          criterion's harness (harness = false) rejects
+#                          libtest's --test-threads flag, so running them
+#                          here would break the run. Only prefix_set_lookup
+#                          and runtime_view_refresh enforce a threshold
+#                          (own main + exit 1); the rest are exploratory and
+#                          exit 0 whatever they measure (#5190).
 #   -- --test-threads=1    serialize the harness. Some dataplane socket
 #                          tests can wedge in __skb_wait_for_more_packets
 #                          when run concurrently; single-threaded execution
