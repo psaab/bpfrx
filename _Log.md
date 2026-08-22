@@ -100758,3 +100758,11 @@ prose edit above them added. No diff falls in the new test body.
   Debt discharges when the SA is no longer live, so it cannot latch.
 - **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
   pkg/ipsec/terminate_debt_6542_test.go (new), pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6419 — evaluated and closed the "reuse the authority's config-gen
+    namespace" shortcut for the active/active reverse direction; recorded the
+    structural reason in code + docs and armed the RG0-primary config-sync
+    rejection pin (previously a vacuous green).
+  - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
+    docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go
