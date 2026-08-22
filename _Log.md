@@ -103348,3 +103348,15 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/mirror_exclusion_reason.go,
   pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
   docs/junos-cli-reference.md
+
+## 2026-08-22 — #6705 junos-host unenforced-deny advisory suppression
+- **Timestamp**: 2026-08-22
+- **Action**: Gate the #4168 advisory suppression on ACTUAL rule emission, not
+  on representability. Reproduced the issue's five spellings first: the omitted
+  and valueless forms are already rejected at strict commit (#3044 / #6526), so
+  the issue's stated vector is closed; the reachable vector is an
+  application-any permit for every source, which commits cleanly with zero
+  warnings and leaves the DROP program empty while the deny still counts as
+  rendered.
+- **File(s)**: pkg/config/junos_host_deny.go,
+  pkg/config/junos_host_deny_unenforced_6705_test.go
