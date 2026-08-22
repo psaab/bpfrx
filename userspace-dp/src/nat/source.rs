@@ -1544,6 +1544,7 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     is_reverse: bool,
     // #6211: see `SyncedNatZones`.
     synced_zones: SyncedNatZones<'_>,
+    now_ns: u64,
 ) {
     reserve_synced_source_nat_allocation_with_holder(
         rules,
@@ -1551,6 +1552,7 @@ pub(crate) fn reserve_synced_source_nat_allocation(
         nat,
         is_reverse,
         synced_zones,
+        now_ns,
         NatHolder::Untracked,
     );
 }
@@ -1569,6 +1571,10 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
     nat: NatDecision,
     is_reverse: bool,
     synced_zones: SyncedNatZones<'_>,
+    // #6528: the stale-tuple eviction inside `reserve_flow` retires the
+    // incumbent with release semantics, which re-arms a persistent lease's idle
+    // expiry off a real clock.
+    now_ns: u64,
     worker_id: u32,
 ) {
     reserve_synced_source_nat_allocation_with_holder(
@@ -1577,6 +1583,7 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
         nat,
         is_reverse,
         synced_zones,
+        now_ns,
         NatHolder::Worker(worker_id),
     );
 }
@@ -1588,6 +1595,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
     is_reverse: bool,
     // #6211: see `SyncedNatZones`.
     synced_zones: SyncedNatZones<'_>,
+    now_ns: u64,
     holder: NatHolder,
 ) {
     if is_reverse {
@@ -1631,6 +1639,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
             flow,
             rewrite_src,
             nat.rewrite_src_port,
+            now_ns,
             holder,
         )
     {
@@ -1653,6 +1662,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
         flow,
         rewrite_src,
         nat.rewrite_src_port,
+        now_ns,
         holder,
     );
 }
@@ -1668,6 +1678,8 @@ fn reserve_synced_on_first_pool_owner<'a>(
     flow: SourceNatFlowKey,
     rewrite_src: IpAddr,
     rewrite_src_port: Option<u16>,
+    // #6528: threaded to `reserve_flow` for its stale-tuple eviction.
+    now_ns: u64,
     // #6211 F2: the worker taking this reservation, so a fan-out to N workers
     // records N holders on ONE allocator record.
     holder: NatHolder,
@@ -1729,6 +1741,7 @@ fn reserve_synced_on_first_pool_owner<'a>(
             },
             addr_index,
             rule.deterministic_v4.is_some(),
+            now_ns,
             holder,
         ) {
             return true;
@@ -1864,6 +1877,8 @@ pub(crate) fn reserve_nat64_pool_port(
     port: u16,
     addr_index: usize,
     deterministic: bool,
+    // #6528: threaded to `reserve_flow` for its stale-tuple eviction.
+    now_ns: u64,
     // #6211 F2: the worker taking this reservation. The synced NAT64 entry is
     // fanned out to every worker against ONE shared allocator, exactly like the
     // pool-mode SNAT reservation.
@@ -1873,7 +1888,7 @@ pub(crate) fn reserve_nat64_pool_port(
         ip: IpAddr::V4(snat_v4),
         port,
     };
-    allocator.reserve_flow(flow, translated, addr_index, deterministic, holder)
+    allocator.reserve_flow(flow, translated, addr_index, deterministic, now_ns, holder)
 }
 
 pub(crate) fn match_source_nat(

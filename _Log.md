@@ -23,6 +23,44 @@
   scripts/image/test_bake_base_pin.py, docs/install-images.md,
   docs/distribution.md
 
+## 2026-08-22 — #6499 boot-firmware self-tests + lint-list drift guard
+
+- **Timestamp**: 2026-08-22
+- **Action**: Added 17 hermetic functional tests driving the real
+  `xpf-uefi-slots` under `/bin/sh` with a mock efibootmgr that models
+  NVRAM as state files, covering the four destructive classes
+  (wrong-loader-path deletion, duplicate dedup, promoted-slot BootOrder
+  preservation, empty-BootOrder no-write). Added a coverage guard over
+  `SH_SCRIPTS` catching drift in both directions — a shipped
+  `scripts/image/xpf-*` missing from the lint list, and a listed path
+  that no longer exists (which `:103`'s `|| continue` would drop
+  silently). Two of the issue's three acceptance criteria were already
+  satisfied at master (`xpf-kernel-promote` is in SH_SCRIPTS as of
+  de74cc2db, and its rc contract is covered by
+  test_kernel_promote_explicit_path.py); confirmed rather than
+  re-implemented. Tests are Python so the `run-selftests.sh:139` glob
+  discovers them — a shell self-test would not be run (#7296).
+- **File(s)**: scripts/image/xpf-uefi-slots,
+  scripts/image/test_uefi_slots_6499.py,
+  scripts/test_selftest_lint_coverage_6499.py,
+  docs/install-images.md
+
+## 2026-08-22 — #6498 Tier-1 A/B substrate + kernel-hold assertions
+
+- **Timestamp**: 2026-08-22
+- **Action**: Added two pure verdict helpers to the Tier-1 image gate —
+  `_ab_slot_esp_verdict` (both slot ESP dirs staged; each `xpf.selector`
+  names the running kernel) and `_kernel_hold_verdict` (every kernel
+  package the bake holds appears in `apt-mark showhold`), wired into
+  scenario A with the ESP check ordered BEFORE the NVRAM check.
+  AC4 as written ("every installed `linux-*` package is held") is
+  unreachable — `linux-base` is a hard dependency of
+  `linux-image-*-generic` — so the gate asserts the bake's own kernel
+  enumeration plus a drift canary binding the two lists, and a
+  non-vacuity guard so an empty enumeration cannot pass trivially.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_ab_substrate_6498.py,
+  docs/image-validation.md
 ## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
 
 - **Timestamp**: 2026-08-22
@@ -100595,6 +100633,31 @@ prose edit above them added. No diff falls in the new test body.
   (deleted), pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
   pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go,
   pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/README.md
+- **Action**: #6528 — `PortAllocator::reserve_flow`'s stale-tuple eviction
+  applied an unconditional PAT-shaped teardown
+  (`free_translated_port(addr_index, translated.port, !deterministic)`) to an
+  incumbent of ANY allocation mode. For an ADDRESS-ONLY record that cleared a
+  bit it never owned — pool address 0 at the offset of the PRESERVED internal
+  source port, which is a live PAT flow's bit whenever a `port no-translation`
+  rule shares the allocator (`allocator_key()` omits `no_translation`) — and
+  recycled it, while leaking the `address_only_owners` token. For a PERSISTENT
+  record it freed a port the LEASE still claimed and never dropped
+  `active_flows`, so the lease was never idle and no GC path could reclaim it.
+  Fix: all three retiring paths now share `unlink_live_allocation_locked`, and
+  `release_flow` + the eviction share `complete_persistent_lease_locked`;
+  `rollback_flow` keeps its own lease arm (it undoes an activation). The
+  eviction takes RELEASE semantics, which is why `reserve_flow` and the synced
+  reserve chain now carry `now_ns`. Five property cells + a fixture guard + an
+  anti-over-reach cell pinning the one mode the old code got right. Verbatim
+  pre-fix restore reds four of five; two finer single-line mutations localise
+  the lease arm and the address-only port guard to one cell each. Rust diff
+  moves the helper binary, so a cluster smoke is OWED.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
+  docs/session-sync-architecture.md, _Log.md
 
 ## 2026-08-21 — #7257: heartbeat start/stop lifecycle tenure
 - **Timestamp**: 2026-08-21
@@ -100607,3 +100670,21 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
   pkg/daemon/daemon_ha_sync.go,
   pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md
+
+## 2026-08-21 — #6520: cluster DHCP RG filter drops node-local members
+- **Timestamp**: 2026-08-21
+- **Action**: `filterDHCPConfigForMasterRGs` built its keep-set only from RETH
+  members of MASTER RGs, so every interface with no redundancy group (the `fxp0`
+  lifeline, any node-local data interface) was removed from every
+  `dhcp-local-server` group on BOTH nodes and a node-local-only group vanished.
+  Mastership now scopes only RG-scoped members; a member in no RG is node-local
+  and always kept. Both sets come from one walker, `rethInterfacesMatchingRG`.
+  Second half: a group the filter SHRANK still carries the removed member's
+  pools, so `dhcpserver.subnetInterface` cross-bound them onto the survivor;
+  the filter now records `DHCPServerGroup.MembersFiltered` (runtime-only,
+  `json:"-"`) and the renderer omits Kea's per-subnet interface selector for
+  such a group, falling back to address-based subnet selection.
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/config/types_system.go,
+  pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
+  pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
+  pkg/daemon/README.md

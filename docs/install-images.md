@@ -535,9 +535,36 @@ external tool is missing SKIPs rather than fails, so the runner is green
 on a minimal host and only goes RED on a genuine regression. It covers:
 
 - shell parse-check (`sh`/`bash -n`) + `shellcheck` over the image/dist
-  shell scripts (`xpf-day0-config`, `xpf-grow-root`, `selftest.sh`, …);
+  shell scripts (`xpf-day0-config`, `xpf-grow-root`, `xpf-uefi-slots`,
+  `xpf-kernel-promote`, `selftest.sh`, …). That list is a HAND enumeration,
+  so `scripts/test_selftest_lint_coverage_6499.py` guards it both ways:
+  every shipped `scripts/image/xpf-*` shell script must be listed (a
+  shipped production script with no parse check at all — #6499), and
+  every listed path must still exist (`run-selftests.sh:103` skips a
+  missing path silently, so a rename deletes a lint leg without a word
+  in the output);
 - `scripts/image/test-grow-root.sh` — grow-root device resolution + stamp
   discipline (#1925);
+- `scripts/image/test_uefi_slots_6499.py` — the **boot-firmware**
+  registrar's destructive paths (#6499). `xpf-uefi-slots` mutates firmware
+  NVRAM on every boot of every shipped appliance — it deletes boot
+  entries, dedups them, and rewrites BootOrder — and `sh -n` +
+  `shellcheck` cannot see that a logic change wipes a customer box's
+  PXE/recovery entries or undoes a promoted kernel slot. The real script
+  runs under a real `/bin/sh` with a mock `efibootmgr` modelling NVRAM as
+  state files, so the four classes a reviewer caught during #1930 are
+  regression fixtures: wrong-loader-path deletion, duplicate dedup,
+  promoted-slot BootOrder preservation, and the empty-BootOrder no-write
+  guard (a reseed built from an unreadable BootOrder would emit
+  `--bootorder <A>,<B>` and wipe everything else). `[ -b "$ESP_DISK" ]` is
+  not relaxed by a test hook — the mock names a partition of a real host
+  block device — and only two path roots are overridable
+  (`XPF_UEFI_SLOTS_EFIVARS`, `XPF_UEFI_SLOTS_ESP`), the same pattern
+  `xpf-grow-root` uses;
+- `scripts/image/test_kernel_promote_explicit_path.py` — the promotion
+  gate's authority model AND its rc contract (`0` → continue, `3` →
+  reboot to known-good and still exit 0, `1`/other → infra error, do NOT
+  reboot into a bounce loop);
 - `scripts/image/test_bake_sign_ordering.py` — VALIDATE-before-SIGN
   ordering (#4017) + frr-pythontools presence;
 - `scripts/image/test_validate_scenarios.py` — the `validate.py` scenario

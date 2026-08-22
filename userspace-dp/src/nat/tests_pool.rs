@@ -4144,7 +4144,7 @@ fn synced_session_reserves_nat_pool_port_4388() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
 
     // The reservation is visible as an occupied translated tuple.
     assert!(
@@ -4269,7 +4269,7 @@ fn synced_deterministic_reservation_not_recycled_5178() {
         rewrite_src_port: Some(3584),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&det_rules, &det_key, det_nat, false, None);
+    reserve_synced_source_nat_allocation(&det_rules, &det_key, det_nat, false, None, 0);
     assert!(
         det_rules[0].pool_allocator.debug_is_port_occupied(0, 3584),
         "synced deterministic reservation must occupy its pool port"
@@ -4313,7 +4313,7 @@ fn synced_deterministic_reservation_not_recycled_5178() {
         rewrite_src_port: Some(10000),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, None);
+    reserve_synced_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, None, 0);
     release_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, 2_000);
     // Unchanged by the fix: a round-robin reservation recycles on release so the
     // freed port is reused oldest-first (#3011). This must stay GREEN both before
@@ -4349,7 +4349,14 @@ fn synced_session_without_nat_reserves_nothing_4388() {
 
     let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     // No translation carried on the synced decision.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, NatDecision::default(), false, None);
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        NatDecision::default(),
+        false,
+        None,
+        0,
+    );
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4382,7 +4389,7 @@ fn synced_session_foreign_pool_addr_skips_reserve_4388() {
         rewrite_src_port: Some(10000),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false, None);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false, None, 0);
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4416,7 +4423,7 @@ fn synced_reverse_entry_reserves_nothing_4388() {
         ..NatDecision::default()
     };
     // is_reverse = true: the reserve is a no-op.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true, None);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true, None, 0);
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4456,7 +4463,7 @@ fn synced_address_only_session_reserves_reverse_identity_token_5338() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
 
     // THE FAIL-ON-REVERT ASSERTION (mint): the standby minted the reverse-
     // identity token for the synced flow. On revert the map is empty.
@@ -4604,6 +4611,7 @@ fn synced_reservation_follows_active_zone_match_6211() {
         synced_nat,
         false,
         Some(("lan", "wan")),
+        0,
     );
 
     assert!(
@@ -4705,6 +4713,7 @@ fn synced_address_only_token_follows_active_zone_match_6211() {
         synced_nat,
         false,
         Some(("lan", "wan")),
+        0,
     );
 
     assert_eq!(
@@ -4756,10 +4765,11 @@ fn synced_reservation_double_upsert_across_zone_outcomes_frees_both_6211() {
         synced_nat,
         false,
         Some(("lan", "wan")),
+        0,
     );
     // Upsert #2 (same live session re-synced) AFTER a zone delete/renumber, so
     // the pair no longer resolves -> pass 2 -> the `dmz->wan` rule.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
 
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, 20000)
@@ -4801,8 +4811,8 @@ fn synced_release_sweep_does_not_free_an_unrelated_flow_6211() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &mine, mine_nat, false, Some(("lan", "wan")));
-    reserve_synced_source_nat_allocation(&rules, &other, other_nat, false, None);
+    reserve_synced_source_nat_allocation(&rules, &mine, mine_nat, false, Some(("lan", "wan")), 0);
+    reserve_synced_source_nat_allocation(&rules, &other, other_nat, false, None, 0);
     assert!(rules[1].pool_allocator.debug_is_port_occupied(0, 20000));
     assert!(rules[0].pool_allocator.debug_is_port_occupied(0, 20050));
 
@@ -4839,7 +4849,7 @@ fn synced_reservation_without_zone_pair_falls_back_to_first_pool_match_6211() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
 
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
@@ -4873,6 +4883,7 @@ fn synced_reservation_unmatched_zone_pair_still_reserves_6211() {
         synced_nat,
         false,
         Some(("mgmt", "wan")),
+        0,
     );
 
     assert!(
@@ -4907,7 +4918,7 @@ fn synced_reservation_single_rule_is_zone_pair_invariant_6211() {
 
     for zones in [None, Some(("lan", "wan"))] {
         let rules = parse_source_nat_rules(&snapshot);
-        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones);
+        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones, 0);
         assert!(
             rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
             "single-rule reservation must be identical for zones = {zones:?}"
@@ -4960,7 +4971,7 @@ fn synced_reservation_non_overlapping_pools_is_zone_pair_invariant_6211() {
 
     for zones in [None, Some(("lan", "wan"))] {
         let rules = parse_source_nat_rules(&snapshot);
-        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones);
+        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones, 0);
         assert!(
             rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
             "the only pool owning 203.0.113.20 must hold it for zones = {zones:?}"
@@ -5030,6 +5041,7 @@ fn synced_reservation_ignores_unconfirmable_interface_scope_6211() {
         synced_nat,
         false,
         Some(("lan", "wan")),
+        0,
     );
 
     assert!(
@@ -5096,6 +5108,7 @@ fn synced_reservation_narrows_on_l4_match_6211() {
         synced_nat,
         false,
         Some(("lan", "wan")),
+        0,
     );
 
     assert!(
@@ -5170,6 +5183,7 @@ fn synced_reservation_narrows_on_post_dnat_destination_6211() {
         synced_nat,
         false,
         Some(("lan", "wan")),
+        0,
     );
 
     assert!(
@@ -6599,8 +6613,24 @@ fn synced_reservation_survives_first_worker_retire_6211_f2() {
     let synced_nat = holder_synced_nat_6211_f2();
 
     // The same synced entry installed on two workers — what the fan-out does.
-    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 0);
-    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 1);
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+        0,
+    );
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+        1,
+    );
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
         "precondition: both workers reserved the synced port"
@@ -6631,8 +6661,24 @@ fn synced_reservation_frees_on_last_worker_retire_6211_f2() {
     let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     let synced_nat = holder_synced_nat_6211_f2();
 
-    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 0);
-    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 1);
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+        0,
+    );
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+        1,
+    );
 
     release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
     release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_001, 1);
@@ -6669,6 +6715,7 @@ fn synced_reservation_refresh_by_one_worker_does_not_accumulate_holders_6211_f2(
             synced_nat,
             false,
             None,
+            0,
             3,
         );
     }
@@ -6717,8 +6764,24 @@ fn synced_address_only_token_survives_first_worker_retire_6211_f2() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 0);
-    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 1);
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+        0,
+    );
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+        1,
+    );
     assert_eq!(
         rules[0].pool_allocator.debug_address_only_owners().len(),
         1,
@@ -6893,7 +6956,7 @@ fn local_allocation_survives_sibling_replica_reaps_6522() {
     // SIBLING worker (never worker 0 — `peer_worker_commands` excludes self).
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, sibling,
+            &rules, &key, decision, false, None, 1_000, sibling,
         );
     }
 
@@ -6925,7 +6988,7 @@ fn local_allocation_frees_when_the_owning_worker_reaps_6522() {
 
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, sibling,
+            &rules, &key, decision, false, None, 1_000, sibling,
         );
         release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
     }
@@ -7001,7 +7064,7 @@ fn local_address_only_token_survives_sibling_replica_reaps_6522() {
     let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, sibling,
+            &rules, &key, decision, false, None, 1_000, sibling,
         );
     }
     for sibling in 1..6u32 {
@@ -7013,5 +7076,358 @@ fn local_address_only_token_survives_sibling_replica_reaps_6522() {
         1,
         "#6522: worker 0 still owns this address-only flow, so its sibling \
          replicas' age-reap must NOT drop the reverse-identity token"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// #6528 — `reserve_flow`'s stale-tuple eviction must use a MODE-CORRECT teardown
+// ---------------------------------------------------------------------------
+//
+// When a synced upsert re-decides a live flow onto a DIFFERENT translated tuple,
+// `reserve_flow` evicts the incumbent `live_by_flow` record. That eviction used
+// to be an unconditional `free_translated_port(existing.addr_index,
+// existing.translated.port, !existing.deterministic)` — correct for exactly ONE
+// of the three allocation modes, and for the other two it mutates state that
+// belongs to an UNRELATED flow:
+//
+//   - ADDRESS-ONLY (#5269/#6041): owns no occupancy bit. `addr_index` is a
+//     hardcoded 0 and `translated.port` is the PRESERVED internal source port,
+//     so the call cleared whatever bit pool address 0 held at that offset. A
+//     `port no-translation` rule and a PAT rule SHARE an allocator when their
+//     pool name, addresses and port range agree (`allocator_key()` does not
+//     include `no_translation`), so that bit is a live PAT flow's — and
+//     `free_recycle` then queues the port for reuse. Meanwhile the incumbent's
+//     `address_only_owners` token was never cleared, denying that public
+//     reverse identity forever.
+//   - PERSISTENT: the port belongs to the LEASE, not the flow, so the call freed
+//     a port the lease still claimed AND left the lease's `active_flows`
+//     refcount incremented. A leaked refcount is never idle, so the lease never
+//     enters `lease_expirations` and no GC path can reclaim it.
+//
+// `release_flow` (`:1585`) and `rollback_flow` had both modes right; only this
+// fourth teardown diverged. The eviction now shares `release_flow`'s
+// `unlink_live_allocation_locked` + `complete_persistent_lease_locked`, so a
+// fifth cannot diverge either.
+//
+// Reachability: `reserve_synced_source_nat_allocation_for_worker` runs on every
+// peer-synced forward upsert. Every cell below drives that real entry point.
+
+/// Two rules over ONE pool name / addresses / port range — rule 0 `port
+/// no-translation` (mints ADDRESS-ONLY reservations), rule 1 ordinary PAT.
+/// `allocator_key()` matches, so they share one `PortAllocator`.
+fn shared_notrans_pat_rules_6528(port_low: u16, port_high: u16) -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "notrans".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "shared-pool".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low,
+            port_high,
+            pool_no_translation: true,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "pat".to_string(),
+            from_zone: "lan2".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "shared-pool".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low,
+            port_high,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ])
+}
+
+fn snat_lookup_6528(
+    rules: &[SourceNatRule],
+    from_zone: &str,
+    src_ip: &str,
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+) -> SourceNatLookup {
+    let mut counter = None;
+    match_source_nat_result_for_tuple(
+        rules,
+        &NatScopeCtx::default(),
+        from_zone,
+        "wan",
+        src_ip.parse().unwrap(),
+        dst_ip.parse().unwrap(),
+        Some(PROTO_TCP),
+        src_port,
+        dst_port,
+        None,
+        None,
+        NS_PER_SEC,
+        false,
+        false,
+        NatHolder::Untracked,
+        &mut counter,
+    )
+}
+
+fn synced_pat_decision_6528(port: u16) -> NatDecision {
+    NatDecision {
+        rewrite_src: Some("203.0.113.1".parse().unwrap()),
+        rewrite_src_port: Some(port),
+        ..NatDecision::default()
+    }
+}
+
+// FIXTURE GUARD, not a property: the two rules really do share one allocator, so
+// the cross-flow cell below is testing the collision it claims to. If
+// `allocator_key()` ever starts discriminating on `no_translation` this cell
+// fails first and says why, instead of the collision cell silently going vacuous.
+#[test]
+fn notrans_and_pat_rules_share_one_allocator_6528() {
+    let rules = shared_notrans_pat_rules_6528(40000, 40009);
+    assert_eq!(
+        rules[0].pool_allocator.debug_shared_identity(),
+        rules[1].pool_allocator.debug_shared_identity(),
+        "#6528 fixture: `port no-translation` and PAT rules over the same pool \
+         name / addresses / port range must share ONE allocator — that sharing \
+         is what makes the address-only eviction reach a PAT flow's bit"
+    );
+}
+
+// #6528 FAIL-ON-REVERT (the headline). An address-only incumbent's eviction must
+// not clear — or recycle — a LIVE PAT flow's occupancy bit.
+//
+// The pool is deliberately 2 ports wide so the consequence is observable end to
+// end: `claim()` spends the fresh cursor first and only then drains the FIFO
+// recycle queue, so once the cursor is spent the wrongly-recycled port is handed
+// straight to the next flow while its real owner is still forwarding.
+#[test]
+fn synced_eviction_of_address_only_keeps_unrelated_pat_port_6528() {
+    let rules = shared_notrans_pat_rules_6528(40000, 40001);
+    // A PAT flow through rule 1 claims a real occupancy bit.
+    let pat = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan2", "10.0.2.50", 55555, "8.8.8.8", 443,
+    ));
+    let pat_port = pat.rewrite_src_port.expect("PAT allocates a port");
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, pat_port),
+        "precondition: the PAT flow owns its bit"
+    );
+
+    // An ADDRESS-ONLY flow through rule 0 whose PRESERVED source port equals the
+    // PAT flow's translated port. It claims NO occupancy bit.
+    let ao = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", pat_port, "9.9.9.9", 443,
+    ));
+    assert_eq!(
+        ao.rewrite_src_port, None,
+        "precondition: `port no-translation` preserves the source port"
+    );
+
+    // The active re-decides that flow as PAT and syncs it: same flow key,
+    // different translated tuple -> `reserve_flow` evicts the incumbent.
+    let key = session_key_from_src("10.0.1.50", pat_port, "9.9.9.9", 443);
+    let other_port = if pat_port == 40000 { 40001 } else { 40000 };
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &key,
+        synced_pat_decision_6528(other_port),
+        false,
+        None,
+        NS_PER_SEC,
+        0,
+    );
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, pat_port),
+        "#6528: the evicted entry was ADDRESS-ONLY and owned no port bit, so \
+         freeing (203.0.113.1, {pat_port}) clears a LIVE PAT flow's occupancy bit"
+    );
+    // ...and the damage that follows from clearing it.
+    let fresh = snat_lookup_6528(&rules, "lan2", "10.0.2.51", 55556, "8.8.8.8", 443);
+    let fresh_port = match fresh {
+        SourceNatLookup::Matched(d) => d.rewrite_src_port,
+        // The pool really is full — the correct outcome here.
+        SourceNatLookup::Unavailable(_) | SourceNatLookup::NoMatch => None,
+    };
+    assert_ne!(
+        fresh_port,
+        Some(pat_port),
+        "#6528: the wrongly-freed port is recycled, so the next flow is handed \
+         a translated tuple another flow is still forwarding on"
+    );
+}
+
+// #6528: an address-only incumbent's reverse-identity token must be cleared by
+// the eviction. `release_flow` clears it and `rollback_flow` clears it;
+// `reserve_flow` cleared it nowhere, so the token outlived the record that owned
+// it and permanently denied that public identity.
+#[test]
+fn synced_eviction_of_address_only_clears_its_token_6528() {
+    let rules = shared_notrans_pat_rules_6528(40000, 40009);
+    let ao = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.50", 40005, "9.9.9.9", 443,
+    ));
+    assert_eq!(ao.rewrite_src_port, None);
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "precondition: the address-only flow minted one reverse-identity token"
+    );
+
+    let key = session_key_from_src("10.0.1.50", 40005, "9.9.9.9", 443);
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &key,
+        synced_pat_decision_6528(40009),
+        false,
+        None,
+        NS_PER_SEC,
+        0,
+    );
+
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "#6528: the evicted address-only record no longer exists, so its \
+         `address_only_owners` token must go with it — a leaked token denies \
+         that public reverse identity for the life of the allocator"
+    );
+}
+
+// #6528: a PERSISTENT incumbent's eviction must drop the lease refcount. This is
+// the piece with NO reclamation path: `gc_expired_chunked` sweeps leases that are
+// IDLE, and a lease whose `active_flows` never returns to zero is never idle, so
+// it never enters `lease_expirations` at all.
+#[test]
+fn synced_eviction_drops_the_persistent_lease_refcount_6528() {
+    let rules = notrans_persistent_rules(vec!["203.0.113.1/32"], "any-remote-host", 300, false);
+    let now = NS_PER_SEC;
+    let a = expect_snat_decision(notrans_persistent_lookup(
+        &rules, "10.0.1.100", 40000, "8.8.8.8", 443, PROTO_TCP, now,
+    ));
+    assert_eq!(a.rewrite_src_port, None);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source
+                .values()
+                .next()
+                .expect("precondition: one lease")
+                .active_flows,
+            1,
+            "precondition: the lease has one active flow"
+        );
+    }
+
+    let key = session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443);
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &key,
+        synced_pat_decision_6528(40009),
+        false,
+        None,
+        now,
+        0,
+    );
+
+    let live = rules[0].pool_allocator.debug_live();
+    assert_eq!(
+        live.persistent_by_source
+            .values()
+            .next()
+            .map(|l| l.active_flows),
+        Some(0),
+        "#6528: the evicted flow must drop its lease refcount — a leaked \
+         refcount is never idle, so the lease never enters `lease_expirations` \
+         and NO GC path can reclaim it"
+    );
+}
+
+// #6528: a PERSISTENT PAT incumbent's port belongs to the LEASE. `release_flow`
+// deliberately does not free it (the lease keeps the port/address until the
+// lease itself is torn down) — and neither may the eviction, or the lease's port
+// is handed out while the lease still claims it.
+#[test]
+fn synced_eviction_keeps_a_persistent_pat_lease_port_6528() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pat-persist".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "pp-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 40000,
+        port_high: 40009,
+        persistent_nat: true,
+        persistent_nat_permit: "any-remote-host".to_string(),
+        persistent_nat_inactivity_timeout: 300,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let d = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan", "10.0.1.100", 40000, "8.8.8.8", 443,
+    ));
+    let port = d.rewrite_src_port.expect("persistent PAT allocates a port");
+    assert!(rules[0].pool_allocator.debug_is_port_occupied(0, port));
+
+    let key = session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443);
+    let synced_port = if port == 40009 { 40008 } else { 40009 };
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &key,
+        synced_pat_decision_6528(synced_port),
+        false,
+        None,
+        NS_PER_SEC,
+        0,
+    );
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "#6528: a persistent flow's port belongs to the lease, so the eviction \
+         must not free it while the lease still holds the address"
+    );
+}
+
+// #6528 ANTI-OVER-REACH GUARD: the ONE mode the pre-fix eviction got right must
+// keep working. A plain non-persistent PAT incumbent DOES own its port outright,
+// so the eviction must still free and recycle it. A "fix" that simply deleted
+// the `free_translated_port` call would satisfy every cell above while leaking a
+// pool port on every re-decided PAT flow.
+//
+// GREEN both before and after the fix: it constrains the SHAPE of the fix.
+#[test]
+fn synced_eviction_still_frees_a_plain_pat_port_6528() {
+    let rules = shared_notrans_pat_rules_6528(40000, 40009);
+    let pat = expect_snat_decision(snat_lookup_6528(
+        &rules, "lan2", "10.0.2.50", 55555, "8.8.8.8", 443,
+    ));
+    let port = pat.rewrite_src_port.expect("PAT allocates a port");
+    assert!(rules[0].pool_allocator.debug_is_port_occupied(0, port));
+
+    let key = session_key_from_src("10.0.2.50", 55555, "8.8.8.8", 443);
+    let synced_port = if port == 40009 { 40008 } else { 40009 };
+    reserve_synced_source_nat_allocation_for_worker(
+        &rules,
+        &key,
+        synced_pat_decision_6528(synced_port),
+        false,
+        None,
+        NS_PER_SEC,
+        0,
+    );
+
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "#6528 must not stop freeing a PLAIN PAT port on eviction — that flow \
+         owns its bit outright and nothing else will ever release it"
+    );
+    assert!(
+        rules[0].pool_allocator.debug_recycled_ports(0).contains(&port),
+        "#6528: and it is still RECYCLED (non-deterministic), so the pool does \
+         not shrink by one port per re-decided flow"
     );
 }

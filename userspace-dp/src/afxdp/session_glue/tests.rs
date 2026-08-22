@@ -6566,6 +6566,7 @@ fn delete_terminal_filtered_session_releases_companion_and_allocator_5622() {
             fwd_nat,
             false,
             None,
+            0,
         );
         assert_eq!(
             crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
@@ -6721,6 +6722,7 @@ fn purge_translated_synced_hit_releases_source_nat_reservation_5295() {
         nat,
         false,
         None,
+        0,
     );
     assert_eq!(
         crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
@@ -6817,7 +6819,7 @@ fn purge_translated_synced_hit_releases_nat64_reservation_5295() {
     let metadata = test_metadata();
 
     // Reserve the NAT64 port under the wire key, mirroring `handle_upsert_synced`.
-    crate::nat64::reserve_synced_nat64_allocation(&forwarding.nat64, &wire_key, nat, false);
+    crate::nat64::reserve_synced_nat64_allocation(&forwarding.nat64, &wire_key, nat, false, 0);
 
     let mut sessions = SessionTable::new();
     assert!(sessions.install_with_protocol_with_origin(
@@ -6914,6 +6916,7 @@ fn purge_translated_synced_hit_reverse_entry_releases_nothing_5295() {
         fwd_nat,
         false,
         None,
+        0,
     );
     assert_eq!(
         crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
