@@ -286,10 +286,19 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			flow := cfg.Security.Flow
 			buf.WriteString("Flow session timeouts:\n")
 			if flow.TCPSession != nil {
-				fmt.Fprintf(&buf, "  TCP established:      %ds\n", flow.TCPSession.EstablishedTimeout)
-				fmt.Fprintf(&buf, "  TCP initial:          %ds\n", flow.TCPSession.InitialTimeout)
-				fmt.Fprintf(&buf, "  TCP closing:          %ds\n", flow.TCPSession.ClosingTimeout)
-				fmt.Fprintf(&buf, "  TCP time-wait:        %ds\n", flow.TCPSession.TimeWaitTimeout)
+				// #6539: only established-timeout has a dataplane wire
+				// carrier; the other three never leave the control plane and
+				// must not be printed in the same shape as the enforced one.
+				// The annotation comes from config.AnnotateTCPSessionTimeout,
+				// shared with the CLI/gRPC surfaces and the commit advisory.
+				tcpRow := func(label, leaf string, secs int) {
+					fmt.Fprintf(&buf, "  %-21s %s\n", label+":",
+						config.AnnotateTCPSessionTimeout(leaf, fmt.Sprintf("%ds", secs)))
+				}
+				tcpRow("TCP established", config.TCPSessionEstablishedTimeoutLeaf, flow.TCPSession.EstablishedTimeout)
+				tcpRow("TCP initial", config.TCPSessionInitialTimeoutLeaf, flow.TCPSession.InitialTimeout)
+				tcpRow("TCP closing", config.TCPSessionClosingTimeoutLeaf, flow.TCPSession.ClosingTimeout)
+				tcpRow("TCP time-wait", config.TCPSessionTimeWaitTimeoutLeaf, flow.TCPSession.TimeWaitTimeout)
 			}
 			fmt.Fprintf(&buf, "  UDP session:          %ds\n", flow.UDPSessionTimeout)
 			fmt.Fprintf(&buf, "  ICMP session:         %ds\n", flow.ICMPSessionTimeout)

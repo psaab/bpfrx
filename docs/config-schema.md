@@ -9105,8 +9105,8 @@ the value sits in a single typed slot:
     (`buildFlowExportSnapshot` reads `fm.Version9` only).
   - `security flow tcp-session` expanded to a container: `established-timeout`
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
-    `time-wait-timeout` (config-only, not wire-reaching) all
-    `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
+    `time-wait-timeout` (config-only, not wire-reaching — see **#6539** below)
+    all `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
     NOT u64-max. This is the operator-facing reject; it stays in lockstep with
     the runtime saturation backstop `SessionTimeouts::from_seconds` (#2441),
     which converts `secs → ns` with `checked_mul` and saturates at
@@ -9119,12 +9119,40 @@ the value sits in a single typed slot:
     presence-only for completion parity. The presence flags compile into
     `TCPSessionConfig` (NoSynCheck / NoSynCheckInTunnel / RstInvalidateSession
     / NoSequenceCheck) but are typed-config only — the userspace dataplane does
-    not read them. The session table is a pure 5-tuple flow entry with no TCP
-    state machine and no sequence/window tracking, so there is nothing for any
-    of these knobs to enforce or skip. **#2078:** setting any of them emits a
+    not read them. The session table is a 5-tuple flow entry with no
+    sequence/window tracking, so there is nothing for any of these knobs to
+    enforce or skip. **#2078:** setting any of them emits a
     single accepted-only commit advisory (`pkg/config/compiler.go`,
     `security flow tcp-session ... accepted-only`) so an operator is not
     silently misled; research #2078 converged PLAN-KILL on enforcement.
+    (**#6539** narrowed that sentence: it used to say the dataplane has no TCP
+    state machine, which #3152 — OPENING vs established — and #3046 — RST vs
+    FIN close — have since made false. Those states are precisely why the
+    TIMEOUT leaves need a differently-worded advisory.)
+
+    **#6539 — the three unenforced timeout leaves.** `initial-timeout`,
+    `closing-timeout` and `time-wait-timeout` are committable but have no wire
+    carrier and no consumer, while REST, CLI and gRPC all printed them in the
+    same shape as `established-timeout`, which IS carried. That is worse than a
+    plainly unimplemented feature: the surface an operator checks after
+    committing confirmed the false belief, and `initial-timeout` is the
+    half-open / SYN-flood bounding control. `pkg/config/flow_tcp_timeouts_6539.go`
+    is now the single authority for the enforced/unenforced split — the commit
+    advisory and all three render surfaces read it, so they cannot disagree, and
+    a leaf that later gains a carrier loses its annotation everywhere at once.
+    The fixed windows the dataplane applies instead (20s half-open, 30s FIN
+    close, 2s RST abort, 300s established fallback) are quoted in operator-facing
+    text, so a test re-reads them from `userspace-dp/src/session/mod.rs` and
+    fails on drift; another in `pkg/dataplane/userspace` fails if any of the
+    three starts reaching the wire snapshot without the table being updated. A
+    fourth guard walks `setSchema` and fails if a new `*-timeout` leaf is
+    declared under `tcp-session` without an entry in the table — otherwise the
+    new leaf would render unannotated and reproduce #6539 for itself.
+    Enforcing the three is a separate, larger job: `initial-timeout` maps 1:1
+    onto `SessionTimeouts.tcp_opening_ns` and could be carried additively, but
+    `time-wait-timeout` has no state to attach to (`session_timeout_ns` splits a
+    close only into RST vs FIN), so it needs a close-state split in the Rust
+    session machine — and a wire bump owes a cluster smoke.
     The RST design rationale (suppress RST→CLOSED for ESTABLISHED, keep
     `rst-invalidate-session` as the opt-in override) is in
     `docs/active-active-new-connections.md`. The dead legacy `flow_config_map`
