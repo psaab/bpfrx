@@ -1,3 +1,116 @@
+## 2026-08-21 — #5858: tightening an interface input filter reported clean while established sessions kept forwarding
+
+- **Timestamp**: 2026-08-21 (fix/5858-filter-change-advisory)
+- **Action**: Added a commit-time advisory when a commit attaches or tightens an
+  interface INPUT filter that can deny, and bound it to the existing policy
+  invalidation through one entry point so a commit path cannot wire one without
+  the other.
+- **File(s)**: `pkg/daemon/daemon_filter_invalidate_5858.go` (new),
+  `pkg/daemon/daemon_filter_invalidate_5858_test.go` (new),
+  `pkg/daemon/daemon_apply_commit.go`, `docs/sync-protocol.md`,
+  `docs/feature-gaps.md`
+
+  The session-hit fast path re-evaluates an input filter only when its match
+  semantics genuinely vary per packet (DSCP / per-packet L4). A purely static
+  address/protocol/port `then discard` added after a session exists is never
+  rechecked, so that flow forwards until it idles out.
+
+  The asymmetry is what makes it a defect rather than a known limitation:
+  tightening a POLICY revokes established sessions at commit
+  (clearSessionsForPolicyChanges — the #4234 deletion clear, the modified-policy
+  re-eval, the #4342 default-policy clear), and tightening an interface FILTER
+  does not, though the exposure is the same class. An operator who has watched a
+  policy tightening take effect immediately has every reason to expect the same.
+
+  NOT the policy-style clear, deliberately. Two rounds of hostile plan review on
+  #5858 killed it and both reasons re-verify: the policy clear drops sessions
+  ATTRIBUTED to the changed policy, while an interface clear would drop every
+  session INGRESSING that interface — on a WAN, all transit traffic, for a filter
+  change that may deny none of it; and dropping permitted flows is not free,
+  because the non-persistent PAT allocator hands out a fresh monotonic-cursor
+  port before draining the recycle FIFO, so a purged-then-recreated permitted
+  SNAT flow reinstalls on a DIFFERENT translated port and breaks. Revoking
+  authorization the operator removed is correct; breaking flows they did not
+  touch is not. The correct fix is per-tuple revalidation in the Rust dataplane
+  and is tracked separately.
+
+  The advisory rides `newCfg.Warnings`, which CommitResponse,
+  CommitConfirmedResponse and the REST commit response all carry — so it lands
+  on the operator's terminal at commit, not only in the journal. It appends
+  AFTER applyConfigLocked has logged cfg.Warnings, so there is no double log.
+
+  Noise discipline is load-bearing: a filter with no discard/reject term cannot
+  revoke anything, a detach is strictly loosening, and an unchanged filter was
+  already in force — all three stay silent, because a commit warning an operator
+  cannot act on is one they learn to ignore. filterCanDeny reads BOTH `Action`
+  and `TerminalActions`: Action is last-write-wins, so a term with
+  `then discard` followed by `then accept` would otherwise be misread as
+  harmless.
+
+  Mutation proof, four:
+  - name-only comparison (drop the DeepEqual on the definition) — exit=1,
+    editing an already-attached filter goes unreported, which is the common case;
+  - read `Action` only — exit=1, the mixed-terminal-actions term is misclassified;
+  - drop the can-deny gate — exit=1, the accept-only control fires a false alarm;
+  - drop the call from reportSessionAuthorizationChanges — exit=1 on the WIRING
+    test alone, while every direct-call test still passes. That mutation is why
+    the entry point exists.
+
+  Control: `go test -count=1 ./pkg/daemon/` exit=0, `go vet` clean. Go-only; no
+  dataplane binary moves, so no cluster smoke is owed.
+## 2026-08-21 — #5842: positional interface naming reported success on a boot that renamed nothing
+
+- **Timestamp**: 2026-08-21 (fix/5842-positional-rename-errors)
+- **Action**: Gave the positional naming path an error channel — `.link` write,
+  rename, and `networkctl reload` failures now aggregate and propagate out of
+  `enumerateAndRenameInterfaces`, mirroring the device-map path's #4956
+  `renameErrs`.
+- **File(s)**: `pkg/daemon/linksetup.go`, `pkg/daemon/device_map.go`,
+  `pkg/daemon/bootstrap.go`,
+  `pkg/daemon/linksetup_rename_err_5842_test.go` (new),
+  `pkg/daemon/README.md`, plus mechanical signature updates in three test files.
+
+  `enumerateAndRenameInterfaces` returned nil unconditionally. Three sites
+  laundered: `renamePositional` returned only a `changed bool` and swallowed
+  every rename error into a WARN; `writeLinkFile` / `writeBootstrapFxp0Network`
+  returned `false` for BOTH "unchanged" and "write failed" — opposite facts
+  under one value, so no caller could have reported the second even if it
+  wanted to; and the `networkctl reload` error was logged and dropped.
+
+  The consequence is not a logging nit. `maybeReapplyConfigArrivalNaming`
+  consumes the one-shot `emptyHANamingPending` marker only when
+  `applyStartupNamingForConfig` returns nil, and positional mode always
+  returned nil — so a #4179 config-less HA node whose renames all failed burned
+  its single retry and stayed on standalone names until a restart. That is
+  precisely the failure #4956 fixed for the MAPPED path, left open on the
+  DEFAULT one.
+
+  The pass still completes on a failure rather than abandoning midway: a
+  half-renamed NIC set is worse than a finished-and-reported one. RSS
+  indirection still runs unconditionally — it is best-effort tuning, and
+  skipping it on a naming error would turn a naming fault into a throughput
+  fault.
+
+  `enumerateAndRenameInterfaces` now reaches its NIC inventory, rename, and
+  reload through the existing injectable seams (`enumeratePCINICsFn`,
+  `renameInterfaceFn`, `networkctlReloadFn`) that the device-map path already
+  used, so the error channel is testable end to end rather than per-helper.
+
+  Mutation proof, three, each one line:
+  - launder the aggregate back to `return nil` — exit=1, three tests red
+    including "the one-shot retry marker was consumed even though naming did
+    not converge";
+  - drop only the rename error inside `renamePositional` — exit=1, so the
+    aggregate is not satisfied by the reload error alone;
+  - make a failed `writeLinkFile` return a nil error — exit=1, "indistinguishable
+    from 'unchanged'".
+  Controls in the same file: a clean pass must return nil, and the marker MUST
+  be consumed on success, so the fix is not satisfiable by always erroring or
+  by never consuming.
+
+  Control: `go test -count=1 ./pkg/daemon/` exit=0, `go vet ./pkg/daemon/`
+  clean, `go build ./...` clean. Go-only; no dataplane binary moves, so no
+  cluster smoke is owed.
 ## 2026-08-21 — #5883: peer hop markers were caller-settable headers
 
 - **Timestamp**: 2026-08-21 (fix/5883-peer-marker-capability)
