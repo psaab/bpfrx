@@ -533,20 +533,12 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		}},
 		"dns": {desc: "DNS service", children: nil},
 		"dhcp-local-server": {desc: "DHCP local server", children: map[string]*schemaNode{
-			"group": {desc: "DHCP group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
-				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: map[string]*schemaNode{
-					"static-binding": dhcpStaticBindingSchema(),
-				}},
-			}},
+			"group":                     dhcpLocalServerGroupSchema("DHCP"),
 			"dynamic-dns":               dhcpDynamicDNSSchema(),
 			"expired-leases-processing": dhcpExpiredLeasesSchema(),
 		}},
 		"dhcpv6-local-server": {desc: "DHCPv6 local server", children: map[string]*schemaNode{
-			"group": {desc: "DHCPv6 group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
-				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: map[string]*schemaNode{
-					"static-binding": dhcpStaticBindingSchema(),
-				}},
-			}},
+			"group":                     dhcpLocalServerGroupSchema("DHCPv6"),
 			"dynamic-dns":               dhcpDynamicDNSSchema(),
 			"expired-leases-processing": dhcpExpiredLeasesSchema(),
 		}},
@@ -995,6 +987,111 @@ func dhcpExpiredLeasesSchema() *schemaNode {
 			children:      nil,
 		},
 	}}
+}
+
+// dhcpLocalServerGroupSchema returns the `group <name>` subtree shared by
+// `system services dhcp-local-server` and `system services
+// dhcpv6-local-server`, fresh per call so the two families do not alias a
+// mutable map (same pattern as dhcpDynamicDNSSchema /
+// dhcpStaticBindingSchema). fam is "DHCP" / "DHCPv6", used only in the
+// completion descriptions.
+//
+// SINGLE-SOURCED ON PURPOSE (#6696). The two families previously carried
+// two independent literal copies of this subtree, and a divergence between
+// them is always a bug: `interface` and `pool dns-server` mean the same
+// thing in both, and the compiler (compileDHCPLocalServer) is ONE function
+// that runs for both with an isV6 flag. One definition makes drift
+// unrepresentable rather than merely tested-against.
+//
+// #6696 — WHY `interface` AND `dns-server` ARE MODELLED AT ALL. Both were
+// unmodelled, so the grammar said nothing about how many tokens they take
+// and the compiler read one value with nodeVal. A bracketed list —
+// `interface [ ge-0/0/0.0 ge-0/0/1.0 ]`, the ordinary way to write a
+// multi-segment group — collapses onto ONE leaf's Keys (the #2419
+// contract), so everything past slot 0 was silently DROPPED: the group
+// served only its first interface and the second segment got no leases at
+// all, and a pool offered one resolver where two were configured. It
+// reproduces identically on the strict commit path and the tolerant load
+// path — the failing axis is BRACKETED-vs-repeated-leaf, not
+// strict-vs-tolerant.
+//
+//   - `multi: true` states that the trailing tokens are VALUES, which is
+//     what lets the compiler read the whole tail instead of guessing.
+//   - `valueList: true` on `interface` is the #3872 static-route `next-hop`
+//     precedent, and it is load-bearing: it absorbs a trailing token that is
+//     neither a sibling NOR a known child (the bracket list) while STILL
+//     descending into the container when the next token names a known child
+//     (a per-interface MODIFIER). Without it the modifier keyword would be
+//     absorbed as an interface NAME and shipped to Kea's
+//     interfaces-config.interfaces, where a name no device answers to takes
+//     the whole DHCP server down.
+//   - the per-interface modifier keywords are therefore modelled — not
+//     because xpf implements them (it does not, and did not before this
+//     change either: the token was silently dropped by the single-value
+//     read) but because the grammar has to be able to PARK them somewhere
+//     other than the value list. They are parsed and ignored, exactly as
+//     before.
+//   - the typed validators (ValidateInterfaceName / ValidateIPAddress) are
+//     the "widened read needs a widened validator" half: every element of a
+//     widened list is now checked, not just slot 0. They run on the strict
+//     commit / commit-check path only (schemaValidateExpandedTreeForNode,
+//     pkg/configstore), so an already-persisted config still boots (#1960).
+func dhcpLocalServerGroupSchema(fam string) *schemaNode {
+	return &schemaNode{
+		desc:        fam + " group",
+		args:        1,
+		placeholder: "<group-name>",
+		children: map[string]*schemaNode{
+			"interface": {
+				desc:             "Interface this group serves (repeatable; accepts a bracketed list)",
+				args:             1,
+				multi:            true,
+				valueList:        true,
+				placeholder:      "<interface>",
+				keyValueDesc:     "Interface name, optionally unit-qualified",
+				keyValueExamples: []string{"ge-0/0/1.0", "reth0.80"},
+				// keyValidator, NOT validator: this node declares CHILDREN
+				// (the per-interface modifiers), so its values ride on the
+				// identity KEY slot, and the #5726 valueList+keyValidator arm
+				// of the schema walk is what validates EVERY packed value
+				// rather than only the first — the same arm the static-route
+				// `next-hop [ gw1 gw2 ]` list relies on. A plain `validator`
+				// is only consulted for a childless leaf and would have left
+				// every element of a widened list unchecked.
+				keyValidator: ValidateInterfaceName,
+				// Junos per-interface options. xpf parses and IGNORES every
+				// one of them; they are modelled so valueList can descend
+				// into them instead of absorbing the keyword as an interface
+				// name. See the function comment.
+				children: map[string]*schemaNode{
+					"access-profile":        {desc: "Per-interface access profile (parsed, not implemented)", args: 1, placeholder: "<profile>", children: nil},
+					"client-discover-match": {desc: "Client discover match option (parsed, not implemented)", args: 1, placeholder: "<match>", children: nil},
+					"dynamic-profile":       {desc: "Per-interface dynamic profile (parsed, not implemented)", args: 1, placeholder: "<profile>", children: nil},
+					"exclude":               {desc: "Exclude this interface from the group (parsed, not implemented)", children: nil},
+					"overrides":             {desc: "Per-interface overrides (parsed, not implemented)", children: nil},
+					"service-profile":       {desc: "Per-interface service profile (parsed, not implemented)", args: 1, placeholder: "<profile>", children: nil},
+					"short-cycle-protection-lockout-max-time": {desc: "Short-cycle lockout max time (parsed, not implemented)", args: 1, placeholder: "<seconds>", children: nil},
+					"short-cycle-protection-lockout-min-time": {desc: "Short-cycle lockout min time (parsed, not implemented)", args: 1, placeholder: "<seconds>", children: nil},
+					"trace":          {desc: "Per-interface tracing (parsed, not implemented)", children: nil},
+					"upgrade-server": {desc: "Per-interface upgrade server (parsed, not implemented)", args: 1, placeholder: "<address>", children: nil},
+				},
+			},
+			"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: map[string]*schemaNode{
+				"dns-server": {
+					desc:          "DNS resolver offered to clients of this pool (repeatable; accepts a bracketed list)",
+					args:          1,
+					multi:         true,
+					placeholder:   "<address>",
+					valueType:     ValueIPAddress,
+					valueDesc:     "Resolver IP address",
+					valueExamples: []string{"192.0.2.53", "2001:db8::53"},
+					validator:     ValidateIPAddress,
+					children:      nil,
+				},
+				"static-binding": dhcpStaticBindingSchema(),
+			}},
+		},
+	}
 }
 
 // dhcpStaticBindingSchema returns the typed-leaf schema for a #2243

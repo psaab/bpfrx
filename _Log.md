@@ -103324,6 +103324,27 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/frr/policy_render.go`,
   `pkg/config/compiler_as_path_multitoken_6686_test.go` (new),
   `pkg/frr/policy_aspath_regex_6686_test.go` (new), `docs/config-schema.md`
+## 2026-08-22 — #6693 NAT match arms read both AST slots
+- **Timestamp**: 2026-08-22
+- **Action**: Replace the either/or reader at five NAT match-address arms with
+  an accumulate-both reader that preserves authored empties and synthesizes
+  nothing; add the mixed spelling to the schema spelling differential gate.
+- **File(s)**: pkg/config/compiler_nat_match_values.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/nat_match_mixed_shape_6693_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6693 follow-up on the rescued commit — widened the coverage to
+    all five arms on BOTH compile paths (strict + tolerant, asserted to agree),
+    per-arm malformed-tail gate reachability with a tolerant-accept no-brick leg,
+    the spelling-equivalence test extended from one arm to five, and a new
+    persistence round-trip test (Format / FormatSet re-readings must agree with
+    the authored tree). Completed the static-NAT fixture with a valid `match
+    destination-address` so the #7216 gate cannot fire first and mask the gate
+    under test.
+  - **File(s)**: pkg/config/nat_match_mixed_shape_6693_test.go,
+    docs/config-schema.md
 
 ## 2026-08-22 — #6534 closure: third port-mirroring renderer + cross-surface gate
 - **Action**: Closed #6534 by fixing the one live instance the three landed
@@ -103348,6 +103369,65 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/mirror_exclusion_reason.go,
   pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
   docs/junos-cli-reference.md
+
+## 2026-08-22 — #6705 junos-host unenforced-deny advisory suppression
+- **Timestamp**: 2026-08-22
+- **Action**: Gate the #4168 advisory suppression on ACTUAL rule emission, not
+  on representability. Reproduced the issue's five spellings first: the omitted
+  and valueless forms are already rejected at strict commit (#3044 / #6526), so
+  the issue's stated vector is closed; the reachable vector is an
+  application-any permit for every source, which commits cleanly with zero
+  warnings and leaves the DROP program empty while the deny still counts as
+  rendered.
+- **File(s)**: pkg/config/junos_host_deny.go,
+  pkg/config/junos_host_deny_unenforced_6705_test.go
+
+## 2026-08-22 — #6696 dhcp-local-server group interface / pool dns-server
+- **Action**: Both arms now read every element of a bracketed list; modelled
+  the two leaves (and both families' shared `group` subtree) in `setSchema`
+  with per-element validators; `interface` keeps its per-interface modifiers
+  out of the value list via `valueList` + modelled modifier children.
+- **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
+  `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
+  `docs/config-schema.md`
+
+## 2026-08-22 — #6664 NextTableUnsupported fails closed + single-door admit
+- **Action**: Removed `NextTableUnsupported` from `is_slow_path_eligible`, so an
+  inter-VRF next-table chain the helper cannot resolve (over-deep or cyclic) is
+  DROPPED instead of reinjected to the kernel FIB, which forwarded it with no
+  zone policy, session, NAT or screen. Collapsed the two refusal points (the
+  filtered `maybe_reinject_slow_path` wrapper and the `poll_descriptor`
+  chokepoint) into one `slow_path_admit` function so the predicate and the
+  fail-closed accounting cannot disagree, and added
+  `next_table_unsupported_drops` — exported as
+  `xpf_userspace_binding_next_table_unsupported_drops_total` — because the deny
+  freezes the accept-path counter the signal used to live on. Corrected two
+  stale enumerations of the unfiltered-reinject caller set (the code said ONE,
+  the architecture doc said TWO and named the wrong pair) and added a source
+  guard that reds if a second production caller of the predicate appears — the
+  `poll_descriptor` chokepoint is not reachable by any behavioural test in the
+  crate, which is how the pre-#6664 duplicated accounting survived a mutation.
+  NoRoute and LocalDelivery — the attacker-steerable legs — are filed as #7480.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/tx/dispatch/slow_path.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/binding_state/snapshot.rs,
+  userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/tests_slow_path_disposition.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/tests/slow_path_admit_single_site_6664.rs (new),
+  pkg/api/metrics.go, pkg/api/metrics_descriptors_binding.go,
+  pkg/api/metrics_userspace_slowpath.go,
+  pkg/api/metrics_slowpath_reinject_7409_test.go,
+  pkg/dataplane/userspace/protocol_binding.go,
+  docs/userspace-dataplane-architecture.md
 
 ## 2026-08-22 — #5084 peer boot incarnation on the config-sync wire
 - **Action**: Stamped every queued `configApplyItem` with the peer BOOT

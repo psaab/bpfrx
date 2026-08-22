@@ -5455,7 +5455,7 @@ pub(super) fn poll_binding_process_descriptor(
                     // already counted by record_forwarding_disposition
                     // above and recycled by the recycle_now epilogue
                     // below — no leak, no double-count.
-                    if decision.resolution.disposition.is_slow_path_eligible() {
+                    if slow_path_admit(&binding.live, decision.resolution.disposition) {
                         maybe_reinject_slow_path_from_frame(
                             &worker_ctx.ident,
                             &binding.live,

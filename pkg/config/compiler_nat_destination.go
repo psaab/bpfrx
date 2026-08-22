@@ -114,13 +114,16 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 					switch m.Name() {
 					case "destination-address":
 						// Support bracket lists: destination-address [ addr1 addr2 ... ]
-						if len(m.Keys) >= 2 {
-							rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, m.Keys[1:]...)
-						} else if len(m.Children) > 0 {
-							for _, child := range m.Children {
-								rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, child.Name())
-							}
-						}
+						// #6693: read BOTH slots through the natMatchAddressValues
+						// SSOT. The either/or form below read Keys[1:] OR the
+						// children, never both, so the MIXED shape
+						// `destination-address <v1> { <v2>; }` — a value in the
+						// identifier slot beside a block — silently dropped the
+						// child tail. It is the #4121 defect (fixed for
+						// `security policies ... match`) at five NAT sites; the
+						// four sibling arms in this same switch already use this
+						// reader.
+						rule.Match.DestinationAddresses = append(rule.Match.DestinationAddresses, natMatchAddressValues(m)...)
 						if len(rule.Match.DestinationAddresses) > 0 {
 							rule.Match.DestinationAddress = rule.Match.DestinationAddresses[0]
 						} else {
@@ -144,13 +147,16 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						}
 					case "source-address":
 						// Support bracket lists: source-address [ addr1 addr2 ... ]
-						if len(m.Keys) >= 2 {
-							rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, m.Keys[1:]...)
-						} else if len(m.Children) > 0 {
-							for _, child := range m.Children {
-								rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, child.Name())
-							}
-						}
+						// #6693: read BOTH slots through the natMatchAddressValues
+						// SSOT. The either/or form below read Keys[1:] OR the
+						// children, never both, so the MIXED shape
+						// `source-address <v1> { <v2>; }` — a value in the
+						// identifier slot beside a block — silently dropped the
+						// child tail. It is the #4121 defect (fixed for
+						// `security policies ... match`) at five NAT sites; the
+						// four sibling arms in this same switch already use this
+						// reader.
+						rule.Match.SourceAddresses = append(rule.Match.SourceAddresses, natMatchAddressValues(m)...)
 						if len(rule.Match.SourceAddresses) > 0 {
 							rule.Match.SourceAddress = rule.Match.SourceAddresses[0]
 						}

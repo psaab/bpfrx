@@ -1655,6 +1655,36 @@ helper never sees it, so a helper crash cannot lock management out).
   suppression. The distinction is exactly `len(Unscopable) > 0` — the zone HAD
   candidates and could not use them all.
 
+- **Representable is not enforced — a deny that projects NO rule keeps its
+  warning (#6705).** The suppression asks whether the kernel gate enforces the
+  deny, so it gates on the deny having actually EMITTED a rule, not on the
+  program having been representable. A deny term can pass every representability
+  check and still project nothing:
+
+  - an application-any permit for **every** source ahead of it — `junosHostBuildRule`'s
+    `permitAll` arm drops the deny because nothing is left to drop;
+  - its application resolves entirely to the OTHER family (an ICMPv6 app on the
+    inet chain);
+  - its address match is the #5828 degenerate `any` + `*-excluded` empty set.
+
+  Before #6705 all three produced an empty DROP program whose deny still counted
+  as rendered, so the operator got neither the enforcement nor the diagnostic —
+  the same failure shape as the l3mdev case above, reached without any scoping
+  problem at all. `junosHostProjectProgram` now reports which term keys
+  contributed at least one rule, and a deny that contributed none blocks its own
+  suppression exactly as an un-representable program does. The two families are
+  recorded per family (v4 and v6 separately), so an IPv6-only deny is rendered on
+  its own.
+
+  **What #6705 is NOT.** It was filed as a valueless-or-omitted `match` dimension
+  erasing the program through a clean strict commit. Measured against the real
+  compiler, that vector does not exist: an omitted dimension is rejected by the
+  #3044 required-match gate, a valueless one by the #6526 no-operand gate (both
+  in the zone-pair and global-policy spellings), and an unresolvable address-set
+  by #3149. The reachable input is a fully authored `source-address any` permit —
+  legitimate configuration, which is precisely why it carried no flag. Tests pin
+  both rejections so relaxing either gate cannot silently re-open the path.
+
   **Only an OWN netdev counts toward the gap.** A VLAN subunit contributes its
   physical parent as an extra candidate for the bondless-RETH case where frames
   may ride the member. On a plain 802.1Q trunk the parent is never where the

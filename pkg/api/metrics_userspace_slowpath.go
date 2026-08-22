@@ -18,7 +18,19 @@ import (
 // reinject counters, split by the disposition that sent the frame to the
 // kernel (#7409).
 //
-// All four have been on the BindingStatus wire since the helper gained them
+// #6664 added a FIFTH series that is not a reinject: NextTableUnsupported left
+// the slow-path allow-list, so it is now dropped fail-closed and counted as
+// `next_table_unsupported_drops`. It is emitted here, beside the four, because
+// it is the same question — what did the slow-path allow-list do with this
+// frame — on the same label set, and because it is the REPLACEMENT signal for
+// `slow_path_next_table_packets`, which is frozen from #6664 onward. Splitting
+// it into its own emitter would put the before and after of one migration in
+// two places. The function keeps its historical `Reinject` name; that name is
+// now a slight over-narrowing rather than a description, and is left alone only
+// because renaming it ripples into a #7409-named test file for no behavioural
+// gain. Naming it here so the drift is recorded rather than silent.
+//
+// The four reinject counters have been on the BindingStatus wire since the helper gained them
 // and are already aggregated with deltas in pkg/monitoriface, but nothing
 // exported them to Prometheus — so a rising reinject rate was visible only in
 // `show`-style status output and reached no alerting. That is what made the
@@ -42,6 +54,7 @@ func (c *xpfCollector) emitBindingSlowPathReinjectCounters(ch chan<- prometheus.
 		}{
 			{c.bindingSlowPathNoRoutePackets, b.SlowPathNoRoutePackets},
 			{c.bindingSlowPathNextTablePackets, b.SlowPathNextTablePackets},
+			{c.bindingNextTableUnsupportedDrops, b.NextTableUnsupportedDrops},
 			{c.bindingSlowPathLocalDeliveryPackets, b.SlowPathLocalDeliveryPackets},
 			{c.bindingSlowPathMissingNeighborPackets, b.SlowPathMissingNeighborPackets},
 		} {
