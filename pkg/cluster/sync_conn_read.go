@@ -72,7 +72,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 		// per-connection sequence + HMAC trailer. Read and verify it before the
 		// message is trusted; a bad HMAC (forgery/tamper) or a non-increasing
 		// sequence (replay/regression) drops the connection.
-		if ac, ok := conn.(*authConn); ok && ac.authed() {
+		if ac, ok := conn.(*authConn); ok && ac.readAuthed() {
 			trailer := make([]byte, syncAuthFrameTrailerSize)
 			if _, err := io.ReadFull(conn, trailer); err != nil {
 				if ctx.Err() != nil {
@@ -363,6 +363,14 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.handleConfigPayload(plaintext)
 	case syncMsgConfigKeyExchange:
 		s.handleConfigKeyExchange(conn, payload)
+	case syncMsgAuthUpgradeHello:
+		// #6628: the peer committed a key and is offering to authenticate this
+		// established connection in place. Never drops it.
+		s.handleAuthUpgradeHello(conn, payload)
+	case syncMsgAuthUpgradeProof:
+		s.handleAuthUpgradeProof(conn, payload)
+	case syncMsgAuthUpgradeAck:
+		s.handleAuthUpgradeAck(conn, payload)
 	case syncMsgIPsecSA:
 		s.stats.IPsecSAReceived.Add(1)
 		// #5706: split off the (incarnation, seq) ordering trailer and admit

@@ -57,7 +57,7 @@ func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
 // assigned sequence order equals the on-wire order. Frames on an
 // unauthenticated (dual-accept) connection are written unchanged.
 func writeFull(conn net.Conn, buf []byte) error {
-	if ac, ok := conn.(*authConn); ok && ac.authed() {
+	if ac, ok := conn.(*authConn); ok && ac.writeAuthed() {
 		buf = ac.sealFrame(buf)
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(syncWriteDeadline)); err != nil {
