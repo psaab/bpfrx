@@ -27,6 +27,15 @@ mod tcp_flags;
 #[allow(dead_code)]
 mod xsk_ffi;
 
+// #5192: test-only drop-order probe. `WorkerUmemInner` must destroy
+// its `Umem` (xsk_umem__delete) before the `MmapArea` that backs it
+// (munmap); Rust has no compile-time drop-order assertion, so the two
+// `Drop` impls record here under `cfg(test)` and a umem test asserts
+// the sequence. Production builds compile neither the probe nor the
+// recording calls.
+#[cfg(test)]
+mod drop_order_probe;
+
 // #4971: test-only counting global allocator. Lets the TX hot-path
 // regression tests assert that an expected TX backpressure retry
 // performs ZERO heap allocations per drain pass. Compiled only under

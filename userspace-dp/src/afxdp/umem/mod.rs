@@ -3,9 +3,25 @@ use super::*;
 mod mmap;
 pub(in crate::afxdp) use mmap::MmapArea;
 
+/// The UMEM region plus the libxdp UMEM object registered against it.
+///
+/// **Field order is load-bearing (#5192).** `xsk_ffi::Umem::new` is
+/// `unsafe` on the precondition that the mmap'd `area` "outlives this
+/// Umem", and Rust destroys struct fields in DECLARATION order — so
+/// `umem` (which calls `xsk_umem__delete`) MUST be declared before
+/// `area` (which calls `munmap`). Reversed, the pages are unmapped
+/// while the UMEM object is still registered against them: a latent
+/// use-after-free whose only defence is that the linked libxdp's
+/// `xsk_umem__delete` happens not to read the user area — an external
+/// library's implementation detail, not an invariant this repo owns.
+///
+/// Rust offers no compile-time drop-order assertion, so the order is
+/// pinned by observation instead: `afxdp::umem::tests::drop_order`
+/// watches both destructors through `crate::drop_order_probe` and reds
+/// if these two lines are ever swapped back.
 pub(super) struct WorkerUmemInner {
-    area: MmapArea,
     umem: Umem,
+    area: MmapArea,
     total_frames: u32,
 }
 
@@ -35,8 +51,8 @@ impl WorkerUmem {
             .map_err(|e| format!("create umem: {e}"))?;
         Ok(Self {
             inner: Rc::new(WorkerUmemInner {
-                area,
                 umem,
+                area,
                 total_frames,
             }),
         })
@@ -58,8 +74,8 @@ impl WorkerUmem {
         let umem = Umem::new_for_test(umem_cfg, area.as_nonnull_slice());
         Ok(Self {
             inner: Rc::new(WorkerUmemInner {
-                area,
                 umem,
+                area,
                 total_frames,
             }),
         })

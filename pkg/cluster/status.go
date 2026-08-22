@@ -18,6 +18,7 @@ func (m *Manager) FormatStatus() string {
 	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	configSyncFailing := m.configSyncFailing // #6387: node-global CF annotation
+	takeoverHold := m.takeoverHoldTime       // #103: hold is part of eligibility
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -74,12 +75,22 @@ func (m *Manager) FormatStatus() string {
 				monFails += ", CF"
 			}
 		}
+		// #103 item 5: report the property ELECTION gates on
+		// (IsReadyForTakeover), not the weaker rg.Ready. Inside the
+		// takeover-hold window the RG is Ready but every election gate still
+		// declines to promote it, so a bare "yes" here would contradict the
+		// election with nothing naming the hold. With takeover-hold-time
+		// unset (the default 0) this branch never fires and the line is
+		// unchanged.
 		readyStr := "yes"
 		if !rg.Ready {
 			readyStr = "no"
 			if len(rg.ReadinessReasons) > 0 {
 				readyStr = "no (" + strings.Join(rg.ReadinessReasons, ", ") + ")"
 			}
+		} else if hold := rg.TakeoverHoldRemaining(takeoverHold); hold > 0 {
+			readyStr = fmt.Sprintf("no (takeover hold: %s of %s remaining)",
+				hold.Round(time.Millisecond), takeoverHold)
 		}
 		transferReadyStr := "yes"
 		if !rg.TransferReady {
@@ -116,11 +127,19 @@ func (m *Manager) FormatInformation() string {
 	peerVersion := m.peerSoftwareVersion
 	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
-	interval := m.hbInterval
-	threshold := m.hbThreshold
+	// #5081: report what the heartbeat is ACTUALLY running with. The
+	// committed interval/threshold are not applied to a running heartbeat
+	// (nothing restarts it for a timing change), so rendering the desired
+	// values told the operator the new timing was in effect when the wire
+	// was still on the old one. When they differ the pending values are
+	// named on their own line instead of silently replacing the live ones.
+	interval, threshold := m.liveHeartbeatTimingLocked()
+	desiredInterval := m.hbInterval
+	desiredThreshold := m.hbThreshold
 	controlIface := m.controlInterface
 	configSyncFailing := m.configSyncFailing   // #6387
 	configSyncReason := m.configSyncFailReason // #6387
+	takeoverHold := m.takeoverHoldTime         // #103
 	m.mu.RUnlock()
 
 	states := m.GroupStates()
@@ -152,6 +171,15 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Node ID: %d\n", m.nodeID)
 	fmt.Fprintf(&b, "  Heartbeat interval: %d ms\n", interval.Milliseconds())
 	fmt.Fprintf(&b, "  Heartbeat threshold: %d\n", threshold)
+	if desiredInterval != interval || desiredThreshold != threshold {
+		fmt.Fprintf(&b, "  Heartbeat pending restart: configured interval %d ms, threshold %d (not applied to the running heartbeat)\n",
+			desiredInterval.Milliseconds(), desiredThreshold)
+	}
+	if takeoverHold > 0 {
+		// #103 item 5: an operator cannot reason about a hold they cannot see.
+		// Omitted at the default 0, where the hold contributes nothing.
+		fmt.Fprintf(&b, "  Takeover hold time: %s\n", takeoverHold)
+	}
 	if controlIface != "" {
 		fmt.Fprintf(&b, "  Control interface: %s\n", controlIface)
 	}
@@ -206,7 +234,13 @@ func (m *Manager) FormatInformation() string {
 		}
 		fmt.Fprintf(&b, "  Preempt: %s\n", preempt)
 		fmt.Fprintf(&b, "  Failover count: %d\n", rg.FailoverCount)
-		if rg.Ready {
+		if hold := rg.TakeoverHoldRemaining(takeoverHold); hold > 0 {
+			// Ready, but election still declines: name the hold and how much
+			// of it is left rather than reporting a "yes" the election
+			// contradicts (#103 item 5).
+			fmt.Fprintf(&b, "  Takeover ready: no (takeover hold: %s of %s remaining, ready since %s)\n",
+				hold.Round(time.Millisecond), takeoverHold, rg.ReadySince.Format("15:04:05"))
+		} else if rg.Ready {
 			fmt.Fprintf(&b, "  Takeover ready: yes (since %s)\n", rg.ReadySince.Format("15:04:05"))
 		} else {
 			reasons := "none"
