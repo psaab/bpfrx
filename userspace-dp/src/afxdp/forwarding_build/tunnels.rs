@@ -13,6 +13,32 @@ pub(super) fn populate_tunnel_endpoints(
     snapshot: &ConfigSnapshot,
     state: &mut ForwardingState,
 ) -> Result<(), crate::policy::SnapshotIntegrityError> {
+    // #5193 (A1-b7-F1): duplicate endpoint ids are rejected BEFORE any state is
+    // mutated. Both indexes below are keyed independently — `tunnel_endpoints`
+    // by id, `tunnel_endpoint_by_ifindex` by ifindex — so a duplicate id used
+    // to install the LAST row under that id while BOTH interfaces' ifindexes
+    // resolved to it, silently encapsulating one tunnel's traffic with the
+    // other's outer source/destination/key. The Go producer already drops an id
+    // collision (`usedIDs`, #1873); this is the snapshot-boundary backstop, and
+    // running it as a preflight (rather than mid-loop) is what keeps a rejected
+    // snapshot from leaving a half-populated forwarding state behind.
+    {
+        let mut seen_ids: std::collections::HashSet<u16> =
+            std::collections::HashSet::with_capacity(snapshot.tunnel_endpoints.len());
+        for endpoint in &snapshot.tunnel_endpoints {
+            if endpoint.id == 0 || endpoint.ifindex <= 0 {
+                continue;
+            }
+            if !seen_ids.insert(endpoint.id) {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::TunnelEndpointDuplicateId {
+                        tunnel_id: endpoint.id,
+                        ifindex: endpoint.ifindex,
+                    },
+                );
+            }
+        }
+    }
     for endpoint in &snapshot.tunnel_endpoints {
         if endpoint.id == 0 || endpoint.ifindex <= 0 {
             continue;
@@ -115,9 +141,20 @@ pub(super) fn populate_tunnel_endpoints(
                 wg_peers,
             },
         );
-        state
-            .tunnel_endpoint_by_ifindex
-            .insert(endpoint.ifindex, endpoint.id);
+        // #5193 (A1-b7-F1): ids are unique by the preflight above, but two rows
+        // can still name one ifindex (two logical names resolved to the same
+        // link). Keep the FIRST — silently overwriting made the decap/connected
+        // -route lookups resolve to whichever row happened to sort last.
+        if let Some(existing) = state.tunnel_endpoint_by_ifindex.get(&endpoint.ifindex) {
+            eprintln!(
+                "xpf-userspace-dp: tunnel endpoints {} and {} both claim ifindex {}; keeping {} for the ifindex index (#5193)",
+                existing, endpoint.id, endpoint.ifindex, existing
+            );
+        } else {
+            state
+                .tunnel_endpoint_by_ifindex
+                .insert(endpoint.ifindex, endpoint.id);
+        }
         // #2327: kind-segregated decap index — only GRE-mode endpoints
         // are indexed for the GRE (proto-47) decap fast path. A
         // WireGuard or any non-GRE row is intentionally NOT indexed, so

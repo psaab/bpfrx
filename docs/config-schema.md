@@ -10264,7 +10264,15 @@ The Rust forwarding-build is the second trust boundary: an out-of-range
 code-point reaching `build_cos_dscp_queue_table` / `build_cos_ieee8021_queue_table`
 fails the snapshot CLOSED (`SnapshotIntegrityError::CosDscpCodePointOutOfRange`
 / `CosIeee8021CodePointOutOfRange`) — the apply preflight keeps the previous
-live CoS state rather than building a classifier for the wrong class. This is
+live CoS state rather than building a classifier for the wrong class. Since
+#5193 the DSCP **rewrite-rule** ingest carries the same bound
+(`SnapshotIntegrityError::CosDscpRewriteCodePointOutOfRange`, naming rule /
+forwarding-class / value): it stores no table to index, so it compares against
+`COS_MAX_DSCP_CODE_POINT` (63) directly, and the whole rule is validated before
+any entry is inserted so a bad entry cannot install a partial rule. Without it
+the classifier side failed closed while the rewrite side accepted 110 and the
+transmit helper masked it to DSCP 46 — remarking egress packets into a
+different PHB than configured. This is
 the same fail-closed posture as #2410/#2696/#2713 (queue id, scheduler-map
 class, interface MTU). Runtime packet-field masking is retained where it
 belongs: `resolve_cos_dscp_classifier_queue_id` / `resolve_cos_ieee8021_classifier_queue_id`
