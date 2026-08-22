@@ -55,6 +55,23 @@ import (
 // fed to the parser.
 const maxRecvMsgSize = 16 << 20 // 16 MiB
 
+// maxConcurrentStreams caps how many RPCs one HTTP/2 connection may have in
+// flight (#6552). grpc-go's SERVER default is unlimited, so before this a
+// single connection could open an unbounded number of concurrent streams —
+// which is the multiplier that turns a per-request cost into an amplification.
+// It is the transport-level companion to the diagnostic semaphore in
+// exec_timeout.go: the semaphore bounds how many forks run at once, this
+// bounds how many requests can be queued behind it holding handler goroutines
+// and stream state.
+//
+// 256 is far above any real operator load — the local CLI, the remote CLI, the
+// Prometheus scrape and the peer's fabric calls together sit in the low tens,
+// and long-lived streams (MonitorInterface) are single-digit — so it is a
+// runaway ceiling, not a throttle. Applied to BOTH servers: the loopback one
+// is not administrator-only (per open #5278), and
+// the fabric one is reachable by anything on the fabric segment.
+const maxConcurrentStreams = 256
+
 // Config configures the gRPC server.
 type Config struct {
 	Store         *configstore.Store
@@ -548,6 +565,7 @@ func (s *Server) buildPrimaryServer() *grpc.Server {
 	stream := append([]grpc.StreamServerInterceptor{s.principalStreamInterceptor}, loopbackStream...)
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.MaxConcurrentStreams(maxConcurrentStreams), // #6552
 		// #5278: resolve the caller's identity ONCE per connection, at
 		// connection setup, and authorize every RPC against it. TagConn runs on
 		// grpc-go's per-connection goroutine, not its accept loop, so the
@@ -677,6 +695,7 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 func (s *Server) buildFabricServer() *grpc.Server {
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.MaxConcurrentStreams(maxConcurrentStreams), // #6552
 		// #5883: peerMarker runs LAST in the chain on purpose —
 		// ChainUnaryInterceptor invokes in order, so #4107 auth and the #4122
 		// allowlist have both already accepted the call before the hop markers

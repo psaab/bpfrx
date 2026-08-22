@@ -41,7 +41,13 @@ import (
 
 // CLI is the interactive command-line interface.
 type CLI struct {
-	rl              *readline.Instance
+	rl *readline.Instance
+	// readLineFn overrides rl.Readline for the multi-line terminal-input
+	// paths. It is a TEST SEAM, nil in production: the `load ... terminal`
+	// read loop is a security-relevant control flow (a Ctrl-C-aborted paste
+	// must not be applied, #6548) and it was unguarded for exactly as long as
+	// it had no injectable input. See readLine below.
+	readLineFn      func() (string, error)
 	store           *configstore.Store
 	dp              cliRuntime
 	eventBuf        *logging.EventBuffer

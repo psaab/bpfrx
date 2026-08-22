@@ -112,6 +112,29 @@ immediately on commit.
 - **RETH members are PCI-only.** A RETH member's MAC alternates
   physical↔virtual, so its entry must be PCI-keyed (`key mac` is rejected at
   commit). It keeps `.link` `OriginalName=` matching as before.
+- **Duplicate-logical-name refusal (#6546).** Two entries claiming ONE logical
+  name are **REFUSED — both of them**, and `show` marks each `REFUSED (logical
+  name claimed by more than one device-map entry)`. Binding either would rename
+  a nondeterministically-chosen NIC to that name and persist the choice in a
+  `.link` file, so the same config could bind differently across boots — on
+  bare metal that can strand management or place a NIC in the wrong zone. The
+  resolver already refused the mirror-image case (two entries landing on ONE
+  NIC); this is the missing symmetric guard, in the same post-pass.
+
+  It is a **distinct** status from the topology-change refusal because the
+  remedy is the opposite one: nothing is wrong with the hardware and re-pinning
+  an identity fixes nothing — the map has two entries claiming one interface
+  name and one of them must go.
+
+  The refusal counts on the **resolved Linux name**, not the raw spelling. The
+  Junos slash form and the kernel dash form are two spellings of one interface
+  (`ge-0/0/3` and `ge-0-0-3` both resolve to `ge-0-0-3`), and the strict commit
+  gate's raw-string comparison accepted that pair — so the duplicate was
+  reachable on the STRICT commit path, not only on the tolerant load /
+  peer-sync path where the gate is downgraded to a warning.
+  `validateDeviceMapStrict` now canonicalises before comparing and names both
+  spellings in its error. Only BOUND entries are counted: a duplicate whose
+  second entry matches no present NIC is unambiguous and still binds.
 
 ## `unmapped-interface-policy`
 
@@ -165,7 +188,12 @@ discipline.
 A commit that changes the device-map runs a **node-local pre-flight** against
 the present hardware while you are still connected:
 
-- A `REFUSED` (topology-changed) entry is rejected.
+- A `REFUSED` entry is rejected, for EITHER reason — topology-changed, or a
+  logical name claimed by more than one entry (#6546). The two carry different
+  remedies, so the pre-flight reports them separately: "re-pin the entry" for a
+  card swap, "remove the duplicate entry" for a duplicate name. The check tests
+  `BindStatus.Refused()` rather than one sentinel value, so a future refusal
+  reason cannot slip past this hard stop and be treated as a clean result.
 - A map that would move the live management NIC's name onto a different port
   (or steal the management name) is rejected.
 - `commit confirmed` validates BOTH the candidate AND the rollback target

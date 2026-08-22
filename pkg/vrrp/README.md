@@ -661,6 +661,64 @@ DOWN → set MAC → UP flushes ALL kernel addresses; networkd
 `KeepConfiguration=static` restores them, but with a 30 ms–1 s window
 against the next 30 ms advert), plus a DAD-failed link-local re-add.
 
+#### Self-frame filtering does not depend on the address snapshot (#6560)
+
+The address re-resolution above narrows the stale-source window but
+cannot close it, because `reresolveLocalAddrs` legitimately stores
+**nil** when the interface has no non-VIP address of the family — which
+is exactly what the flush window produces. Every self-check on the
+receive path is written `lip != nil && src.Equal(lip)`, so **a nil
+snapshot means ACCEPT**. Combined with the delivery paths below, a
+MASTER could process its OWN advertisement, land on
+`resolveEqualPriorityMaster`'s equal-priority branch, hit the
+`localCmp == nil` arm, and `becomeBackup` — the "stepping down" log line
+whose comment justifies the step-down by assuming the advert came from a
+peer. In this case the "actively advertising equal-priority peer" is the
+node itself.
+
+Self-adverts really are delivered, by two independent mechanisms, and
+neither was suppressed:
+
+- **The AF_PACKET tap (primary path).** The capture socket is
+  `ETH_P_ALL` — what tcpdump uses, and why tcpdump shows egress
+  traffic. `dev_queue_xmit_nit` clones every outbound frame to each
+  `ptype_all` tap with `skb->pkt_type = PACKET_OUTGOING`, and
+  `packet_rcv` drops only `PACKET_LOOPBACK`. Adverts leave on the raw
+  AF_INET/AF_INET6 sockets, but they egress the very netdev this socket
+  is bound to. The cBPF filter cannot help: every instruction matches
+  ethertype or IP protocol, there is no `SKF_AD_PKTTYPE` ancillary
+  load, and a self-advert satisfies it exactly.
+- **IP multicast loopback (fallback path).** The raw `ip4:112` /
+  `ip6:112` sockets both send and `JoinGroup` 224.0.0.18 / ff02::12,
+  and `IP_MULTICAST_LOOP` defaults to 1 — so the kernel cloned every
+  advert we transmitted back into the socket that sent it.
+
+Three fixes, none of which touch the state machine:
+
+1. `PACKET_IGNORE_OUTGOING` on the AF_PACKET receiver, set **before**
+   bind (an `ETH_P_ALL` socket is already capturing at creation, so
+   setting it after bind would leave a window). Best-effort: it is
+   Linux >= 4.20 and an older kernel logs and continues.
+2. `receiverAfPacket` now keeps the `sockaddr_ll` that `Recvfrom`
+   returns — it used to discard it as `_`, which made `sll_pkttype`
+   structurally unavailable — and drops `PACKET_OUTGOING`. This is the
+   belt that still holds on a kernel without (1).
+3. `IP_MULTICAST_LOOP` / `IPV6_MULTICAST_LOOP` disabled on the fallback
+   raw sockets. Both are per-SENDING-socket, so they suppress only the
+   loopback of our own transmissions; a peer's advert arriving from the
+   wire is unaffected.
+
+An unclassifiable sockaddr **fails open** (treated as not-outgoing).
+Dropping a frame we cannot classify would be a self-inflicted
+master-down, which is strictly worse than the bug being fixed.
+
+**Not addressed here.** `resolveLocalIPv4` selects ONE address (the
+lowest non-VIP), not the interface's address SET, so a self-advert sent
+from address A also bypasses the comparison once the selected source has
+become B. That residual is narrower than it looks now that the two
+delivery paths above are suppressed, and it is tracked separately rather
+than folded in.
+
 The manager now runs a singleton ADDRESS-watcher (`addrwatch.go`,
 `runAddrWatcher`) subscribed via `netlink.AddrSubscribe`. On any address
 add/del whose `LinkIndex` matches an instance's bound `iface.Index`, it

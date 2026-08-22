@@ -86,6 +86,10 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 				fmt.Fprintf(w, "      Application:           %s\n", strings.Join(apps, " "))
 			}
 			fmt.Fprintf(w, "    Action:                  %s\n", action)
+			// #6534: buildDestinationNATSnapshotsWithFeeds publishes NO entry
+			// for these rules, so the pool address/port printed below is config
+			// the dataplane never installed.
+			noteNotInstalled(w, config.DestinationNATRuleExcludedReason(dnat, rule))
 
 			if rule.Then.PoolName != "" && dnat.Pools != nil {
 				if pool, ok := dnat.Pools[rule.Then.PoolName]; ok {

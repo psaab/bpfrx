@@ -1900,9 +1900,21 @@ func ValidateConfig(cfg *Config) []string {
 	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress
 	// interface). Surface that Junos-parity/hardening gap at commit; the per-zone
 	// iifname enforcement remains deferred.
+	warnings = append(warnings, validateHostInboundZoneLevelDHCPWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundOverrideReplaceWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundMulticastWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundManagedRoutingMismatch(cfg)...)
+
+	// #6460: a configured DHCP server answers on every interface its
+	// `dhcp-local-server` / `dhcpv6-local-server` group binds, REGARDLESS of the
+	// zone's `host-inbound-traffic system-services` set — DHCPv4 because Kea
+	// receives on an AF_PACKET raw socket that is delivered before the netfilter
+	// input hook, DHCPv6 because the ff02::1:2 request matches no per-zone
+	// unicast `daddr` rule and falls through the input chain's accept policy.
+	// Neither #4455 arm can see this (they cross-check routing protocols against
+	// FRR), so this shape produced no advisory at all before #6460. WARN-only;
+	// the per-zone enforcement is PLAN-KILLed with #4455 Component A.
+	warnings = append(warnings, validateDHCPServerHostInboundBypassWarnings(cfg)...)
 
 	// #5837 (Track-1 mitigation): a destination-NAT / static-NAT rule whose
 	// public (matched / external) destination address equals a configured

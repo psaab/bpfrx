@@ -509,7 +509,10 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 				// away from DHCP) is the absence definitive → withdraw. Reading the
 				// committed config flag is race-free (unlike probing the live client
 				// registry, which has a stop→start window during a restart).
-				dhcpConfigured := unit != nil && ((af4 && unit.DHCP) || (!af4 && unit.DHCPv6))
+				// Shared with the #6555 `interface`-source guard via
+				// unitRunsDHCPForFamily: the two sources ask the SAME question, and
+				// a divergence between them would always be a bug.
+				dhcpConfigured := unitRunsDHCPForFamily(unit, af4)
 				if dhcpConfigured {
 					return ddns.AddressObservation{}, false
 				}
@@ -587,7 +590,9 @@ var (
 //     WITHDRAWS any previously-published record.
 //   - (zero, false) — the interface could NOT be read this cycle (a transient
 //     LinkByName / AddrList netlink failure: interface absent during a rename,
-//     reth/HA churn, a netlink hiccup). The engine leaves the scope UNTOUCHED
+//     reth/HA churn, a netlink hiccup), OR the family has NO address at all on a
+//     unit the committed config still runs DHCP for (#6555 — the DHCP client's
+//     stop/restart flush window). The engine leaves the scope UNTOUCHED
 //     (no publish, no withdraw; retry next pass) — the never-blackhole rule.
 //
 // The configured static address is a fallback ONLY on the present-but-addressless
@@ -628,9 +633,58 @@ func (d *Daemon) observeInterfaceAddr(linuxName string, af4 bool, unit *config.I
 	if a, ok := staticUnitAddr(unit, af4); ok {
 		return a, true
 	}
+	// #6555: the unit is STILL DHCP-configured for this family and the kernel
+	// reports NO address of that family at all — that is the DHCP client's
+	// stop/restart flush window, not a definitive loss. The DHCP manager stops
+	// and restarts the client on any option change (dhcp.Manager.Reconcile),
+	// and finishClient removes the leased address for the whole DORA re-acquire
+	// window; the removal then fires onDHCPAddressChange -> a Surface A nudge
+	// about 2s later, landing a pass squarely INSIDE that window. Treating it as
+	// definitive WITHDRAWS the public A/AAAA record on every benign DHCP option
+	// change and republishes seconds later — an externally-visible blackhole
+	// flap on the DEFAULT address source, from routine operation with no
+	// attacker.
+	//
+	// This is the same guard the `dhcp` source already carries (#4423 M10,
+	// surfaceAObserver's dhcp arm): both read the COMMITTED config flag rather
+	// than probing the live client registry, which has a stop->start window of
+	// its own and would race the very restart being detected. Returning
+	// (zero, false) marks the observation TRANSIENT: the engine leaves the scope
+	// untouched and retries — never withdraw on transient.
+	//
+	// Deliberately gated on len(addrs) == 0, NOT on "selectInterfaceAddr found
+	// nothing usable". Those are different states, and only the first is the
+	// restart window. If the family HAS an address that was rejected as
+	// non-public/tentative/deprecated, the observation stays DEFINITIVE exactly
+	// as it is today — which also matches the dhcp source, where a non-public
+	// lease is a definitive withdraw rather than a transient. Widening this to
+	// the rejected-candidate case would be a separate behaviour choice about
+	// CGNAT/tentative addresses, not this fix.
+	if len(addrs) == 0 && unitRunsDHCPForFamily(unit, af4) {
+		return netip.Addr{}, false
+	}
 	// Interface is up but has no address of this family and no usable static:
 	// definitively none → the engine withdraws.
 	return netip.Addr{}, true
+}
+
+// unitRunsDHCPForFamily reports whether the COMMITTED config still has this unit
+// running a DHCP client for the requested family. It is the shared predicate
+// behind both #4423 M10 (the `dhcp` address source) and #6555 (the `interface`
+// source): a missing address/lease means "transient, retry" while this is true
+// and "definitive, withdraw" once the unit has been reconfigured away from DHCP.
+//
+// Reading the committed flag is race-free in a way that probing the live client
+// registry is not — the registry has a stop->start gap during exactly the
+// restart these callers must not mistake for a loss.
+func unitRunsDHCPForFamily(unit *config.InterfaceUnit, af4 bool) bool {
+	if unit == nil {
+		return false
+	}
+	if af4 {
+		return unit.DHCP
+	}
+	return unit.DHCPv6
 }
 
 // selectInterfaceAddr chooses the address to publish from a kernel interface's
