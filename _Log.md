@@ -104157,3 +104157,13 @@ prose edit above them added. No diff falls in the new test body.
   make_config_drive.py and xpf-deploy.py; kept the post-chmod as a belt.
 - **File(s)**: scripts/image/make_config_drive.py, scripts/deploy/xpf-deploy.py,
   scripts/image/test_config_drive_creation_umask_6764.py
+
+## 2026-08-22 — #6767 apply-groups work budget covers the merge fan-out
+- **Timestamp**: 2026-08-22
+- **Action**: Work was charged once per `apply-groups <name>` reference, while
+  mergeNodes — which clones and merges — took no budget. A wildcard container
+  merges into EVERY matching destination, so the cost is the product. Threaded
+  the budget through mergeNodes, charging per merged node and per clone before
+  materialising it.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/group_expand_budget_6767_test.go
