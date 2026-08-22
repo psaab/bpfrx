@@ -1996,6 +1996,23 @@ type compileOpts struct {
 	// community VALUE (e.g. 65000:100), not a list reference, and is not
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
+	// lenientPolicyASPathRegex (#6686) downgrades the as-path regex gate
+	// (validatePolicyASPathRegexStrict) from a hard compile error to a
+	// cfg.Warnings entry. xpf renders one `bgp as-path access-list <name>
+	// permit <regex>` line per `policy-options as-path` definition; an EMPTY
+	// regex is an incomplete FRR command and a malformed one fails FRR's
+	// regcomp, and either is a CMD_WARNING_CONFIG_FAILED that exits the whole
+	// vtysh add-batch non-zero — failing the ENTIRE frr-reload, not just this
+	// list, and leaving every dynamic routing change stale. The strict commit
+	// / commit-check path hard-rejects so the operator sees it (naming the
+	// as-path and the line that would be rendered); the tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config still BOOTS (#1960 fail-closed-on-load class), with
+	// pkg/frr's ValidASPathRegex belt keeping the unrenderable definition out
+	// of frr.conf on that path so the reload survives. Runs on the
+	// fully-compiled *Config so the as-path map is populated regardless of
+	// authoring order. Same doctrine as lenientPolicyCommunityRef.
+	lenientPolicyASPathRegex bool
 	// lenientPolicyReservedRedistName (#5116) downgrades the reserved
 	// route-map-suffix gate (validatePolicyReservedRedistNameStrict) from a
 	// hard compile error to a cfg.Warnings entry. An operator policy-statement
@@ -2395,6 +2412,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyValuelessMatch:            true,
 		lenientPolicyCommunityRef:              true,
+		lenientPolicyASPathRegex:               true,
 		lenientPolicyReservedRedistName:        true,
 		lenientPolicyReservedChainName:         true,
 		lenientVRRPVirtualAddress:              true,
