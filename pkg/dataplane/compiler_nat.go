@@ -747,48 +747,23 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 	return nil
 }
 
-// nptv6Adjustment computes the RFC 6296 ones'-complement adjustment
-// from two /48 prefixes. The adjustment is stored in native byte order
-// to match how BPF reads 16-bit words from memory via pointer cast.
+// compileNPTv6 VALIDATES the NPTv6 rules in cfg. Since #7268 it writes nothing:
+// the eBPF `nptv6_rules` map surface it used to fill is retired, and the AF_XDP
+// helper builds its own NPTv6 state from the config snapshot
+// (buildNptv6Snapshots copies Match/Then out independently) and computes its own
+// RFC 6296 adjustment (userspace-dp/src/nptv6.rs `compute_adjustment`).
 //
-// Ones'-complement arithmetic is endian-independent, so the computation
-// can use either byte order as long as it's consistent. We use native
-// (little-endian on x86) since BPF reads `__u16 *w = (__u16 *)addr`
-// in native order.
-// nptv6Adjustment computes the ones'-complement adjustment for NPTv6
-// prefix translation.  prefixBytes is 6 for /48 or 8 for /64.
-func nptv6Adjustment(internal, external []byte) uint16 {
-	// Read prefix words in native byte order (same as BPF __u16* cast).
-	readWord := func(b []byte) uint16 {
-		return uint16(b[1])<<8 | uint16(b[0])
-	}
-
-	words := len(internal) / 2
-
-	var sumInt uint32
-	for i := 0; i < words; i++ {
-		sumInt += uint32(readWord(internal[i*2 : i*2+2]))
-	}
-	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
-	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
-
-	var sumExt uint32
-	for i := 0; i < words; i++ {
-		sumExt += uint32(readWord(external[i*2 : i*2+2]))
-	}
-	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
-	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
-
-	// adjustment = S_int - S_ext = ~S_ext +' S_int
-	adj := uint32(^uint16(sumExt)) + uint32(uint16(sumInt))
-	adj = (adj & 0xFFFF) + (adj >> 16)
-	adj = (adj & 0xFFFF) + (adj >> 16)
-
-	return uint16(adj)
-}
-
+// What remains is load-bearing and is the reason this is still a compile PHASE
+// rather than a deleted function: it is the #4960 validate-before-mutate
+// pre-pass deciding whether an apply can succeed, carrying the #6894 r9 / #7077
+// reject-vs-warn split. A rule the helper would REFUSE is a hard error here, so
+// the failure lands before compileZones mutates the host; a rule the helper
+// would DROP or would INSTALL keeps warn-and-skip, because erroring on those
+// would fail an apply that succeeds today.
+//
+// dp is still taken so the phase keeps the shared row signature, and it is still
+// READ — isValidationPass(dp) gates the log records so the pre-pass stays quiet.
 func compileNPTv6(dp DataPlane, cfg *config.Config) error {
-	written := make(map[NPTv6Key]bool)
 	count := 0
 
 	for _, rs := range cfg.Security.NAT.Static {
@@ -919,35 +894,17 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 				continue
 			}
 
-			// Prefix byte count: 6 for /48, 8 for /64
-			prefixBytes := extOnes / 8         // 6 or 8
-			prefixWords := uint8(extOnes / 16) // 3 or 4
-
-			// Extract prefix bytes and compute adjustment
-			extSlice := ext16[:prefixBytes]
-			intSlice := int16[:prefixBytes]
-			adj := nptv6Adjustment(intSlice, extSlice)
-
-			// Build keys/values with zero-padded [8]byte prefix
-			var extPrefix, intPrefix [8]byte
-			copy(extPrefix[:], extSlice)
-			copy(intPrefix[:], intSlice)
-
-			// Inbound entry: external prefix → internal prefix (rewrite dst)
-			inKey := NPTv6Key{Prefix: extPrefix, Direction: NPTv6Inbound, PrefixLen: uint8(extOnes)}
-			inVal := NPTv6Value{XlatPrefix: intPrefix, Adjustment: adj, PrefixWords: prefixWords}
-			if err := dp.SetNPTv6Rule(inKey, inVal); err != nil {
-				return fmt.Errorf("set nptv6 inbound %s: %w", rule.Name, err)
-			}
-			written[inKey] = true
-
-			// Outbound entry: internal prefix → external prefix (rewrite src)
-			outKey := NPTv6Key{Prefix: intPrefix, Direction: NPTv6Outbound, PrefixLen: uint8(extOnes)}
-			outVal := NPTv6Value{XlatPrefix: extPrefix, Adjustment: adj, PrefixWords: prefixWords}
-			if err := dp.SetNPTv6Rule(outKey, outVal); err != nil {
-				return fmt.Errorf("set nptv6 outbound %s: %w", rule.Name, err)
-			}
-			written[outKey] = true
+			// #7268: the eBPF nptv6_rules writes that used to close this
+			// branch are gone. What remains — every parse and disposition
+			// decision above — is NOT dead: it is the #4960
+			// validate-before-mutate pre-pass deciding whether an apply can
+			// succeed, and the #6894 r9 / #7077 reject-vs-warn split that
+			// decides which faults are hard errors. The helper builds its own
+			// NPTv6 state from the config (buildNptv6Snapshots copies
+			// Match/Then out independently) and computes its own adjustment
+			// (userspace-dp/src/nptv6.rs compute_adjustment), so the rule still
+			// reaches the enforcement plane; only this compiler's write of the
+			// retired map surface is removed.
 
 			count++
 			if !isValidationPass(dp) {
@@ -963,7 +920,6 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 		slog.Info("nptv6 compilation complete", "rules", count)
 	}
 
-	dp.DeleteStaleNPTv6(written)
 	return nil
 }
 

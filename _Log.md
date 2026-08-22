@@ -100509,3 +100509,18 @@ prose edit above them added. No diff falls in the new test body.
   pkg/configstore/confirm_recovery_uncompilable_target_6538_test.go,
   pkg/daemon/daemon_apply_commit.go, pkg/configstore/README.md,
   pkg/daemon/README.md, _Log.md
+
+## 2026-08-21 — #7268 scope 1: retire compileNPTv6's eBPF nptv6_rules writes
+- **Timestamp**: 2026-08-21
+- **Action**: Deleted the `SetNPTv6Rule` / `DeleteStaleNPTv6` calls and the
+  now-callerless `nptv6Adjustment` (+ its RFC 6296 vector tests). `compileNPTv6`
+  is now a pure validator; every parse and the #6894 r9 / #7077 reject-vs-warn
+  disposition is unchanged. Rebound the two guards that observed the write: the
+  #4960 `nptv6` row now binds NAME->BODY through a config-shaped hard error, and
+  the #7077 write-count assertions are replaced by the #6420 tripwire with
+  NPTv6 armed. Scopes 2-4 (the `DataPlane` NAT interface surface, `maps_nat.go`
+  writers, shim overrides, orphaned map helpers) deliberately held out.
+- **File(s)**: pkg/dataplane/compiler_nat.go, pkg/dataplane/nptv6_test.go
+  (deleted), pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go,
+  pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/README.md
