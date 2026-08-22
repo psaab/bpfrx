@@ -342,6 +342,37 @@ func (a *LegacyDataPlaneAdapter) ClearZoneCounters() error {
 	return m.ClearZoneCounters()
 }
 
+// ClearPolicyCounters routes the operator per-policy hit-count clear through
+// the userspace Manager override rather than the embedded bpfShim method
+// (#6566 member 2).
+//
+// Without this method the embedded dataplane.DataPlane (= bpfShim) is PROMOTED
+// here, and its ClearPolicyCounters zeroes the retired-eBPF `policy_counters`
+// per-CPU array — 4096 slots that nothing has incremented since the eBPF
+// dataplane was retired (#1373/#1476). It returns nil, so both operator
+// surfaces print "policy hit counters cleared" while the counters the display
+// actually READS — the helper's live PolicyCounterStore, via the
+// ReadAllPolicyCounters override — are untouched.
+//
+// The operator-visible symptom is an asymmetry on one box: `clear security
+// counters` DOES reset policy hit counts (it routes through the ClearAllCounters
+// override, which reaches clearHelperPolicyCountersLocked), while `clear
+// security policies hit-count` does NOT. Same counters, two commands, opposite
+// outcomes, both reporting success — which also silently breaks the
+// clear-and-watch baseline an operator relies on during incident response.
+//
+// This is the same defect #3651 fixed for ClearZoneCounters and #2218 for
+// ClearAllCounters; natcounters.go names it outright ("Clearing requires TWO
+// actions, exactly mirroring ClearPolicyCounters") while the mirror was never
+// installed on the adapter.
+func (a *LegacyDataPlaneAdapter) ClearPolicyCounters() error {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return err
+	}
+	return m.ClearPolicyCounters()
+}
+
 // ClearAllCounters routes the operator clear-all through the userspace Manager
 // override (#2218) so the helper NAT translation hit store is reset alongside
 // the BPF maps; otherwise the per-rule NAT totals snap back on the next poll.
