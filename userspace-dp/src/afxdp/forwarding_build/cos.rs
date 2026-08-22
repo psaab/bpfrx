@@ -57,6 +57,11 @@ fn materialized_queue_or_default(
     }
 }
 
+/// Largest valid DSCP code point: the DS field is 6 bits (#2447/#5193). The
+/// classifier builders enforce it via the 64-entry table bound; the rewrite
+/// ingest has no table to index, so it compares against this constant.
+const COS_MAX_DSCP_CODE_POINT: u8 = 63;
+
 fn build_cos_dscp_queue_table(
     classifier_name: &str,
     classifiers: &FastMap<String, CoSDSCPClassifierConfig>,
@@ -535,6 +540,29 @@ pub(super) fn build_cos_classifier_tables(
             // wildcard (no explicit loss-priority) one regardless of config
             // order.
             let mut dscp_by_fc_lp: FastMap<(String, u8), u8> = FastMap::default();
+            // #5193 (A1-b7-F7): every stored code-point is bounded to the
+            // 6-bit DSCP domain FIRST. The classifier builders above have
+            // failed closed on an out-of-range code-point since #2447, but the
+            // rewrite ingest stored `entry.dscp_value` unchecked while the
+            // transmit path masks it (`dscp & 0x3f`, frame/mod.rs) — so a rule
+            // carrying 110 marked egress packets DSCP 46, a different PHB than
+            // configured, with no apply failure anywhere. Validating the whole
+            // rule up front (rather than per insert) keeps the two passes below
+            // unchanged and means a bad entry cannot install a PARTIAL rule.
+            for entry in &rewrite_rule.entries {
+                if entry.forwarding_class.is_empty() {
+                    continue;
+                }
+                if entry.dscp_value > COS_MAX_DSCP_CODE_POINT {
+                    return Err(
+                        crate::policy::SnapshotIntegrityError::CosDscpRewriteCodePointOutOfRange {
+                            rule: rewrite_rule.name.clone(),
+                            forwarding_class: entry.forwarding_class.clone(),
+                            dscp: entry.dscp_value,
+                        },
+                    );
+                }
+            }
             // Pass 1: entries WITH an explicit loss-priority.
             for entry in &rewrite_rule.entries {
                 if entry.forwarding_class.is_empty() {
@@ -561,12 +589,12 @@ pub(super) fn build_cos_classifier_tables(
                     }
                 }
             }
-            (
+            Ok((
                 rewrite_rule.name.clone(),
                 CoSDSCPRewriteRuleConfig { dscp_by_fc_lp },
-            )
+            ))
         })
-        .collect::<FastMap<_, _>>();
+        .collect::<Result<FastMap<_, _>, crate::policy::SnapshotIntegrityError>>()?;
     let schedulers = cos
         .schedulers
         .iter()

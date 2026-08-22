@@ -288,6 +288,22 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	// (#1960 no-brick).
 	plaintextWarnings := warnSecureTunnelPlaintextUnadjudicatedAST(tree.Children)
 
+	// #5618 WireGuard plaintext advisory. The XDP shim steers inbound WireGuard
+	// transport to the kernel (#5582) and the helper's WG control thread writes
+	// the decapsulated inner packet straight to the wgN TUN, where Linux routing
+	// forwards it — xpf adjudicates none of it: no zone policy, no session, no
+	// NAT, no screen. The interface row is Tunnel=true, so
+	// userspaceSkipsIngressInterface excludes it from the ingress-adjudication
+	// map and the AF_XDP binding plan. A zone on `wg0.0` nevertheless commits
+	// cleanly and READS as enforced. This states the truth at commit.
+	//
+	// WARNING ONLY, on EVERY path — same structural no-brick posture as the
+	// #5619 arm above: no lenient flag and no error return, because WireGuard is
+	// a supported shipped feature (#1432 S2a) and rejecting it would be a
+	// feature removal that also blocks an unrelated commit on a box with a
+	// working tunnel (#1960 no-brick).
+	wgPlaintextWarnings := warnWireGuardPlaintextUnadjudicatedAST(tree.Children)
+
 	// #4098 IPsec traffic-selector injection gate. `security ipsec vpn
 	// <name> traffic-selector <ts> local-ip / remote-ip` are free-form 1-arg
 	// strings the IPsec renderer interpolates into the swanctl.conf
@@ -556,6 +572,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, fwFilterFamilyAnyWarnings...)
 	warnings = append(warnings, bindIfaceWarnings...)
 	warnings = append(warnings, plaintextWarnings...)
+	warnings = append(warnings, wgPlaintextWarnings...)
 	warnings = append(warnings, ipsecTSWarnings...)
 	warnings = append(warnings, reservedProposalNameWarnings...)
 	warnings = append(warnings, policyMatchWarnings...)

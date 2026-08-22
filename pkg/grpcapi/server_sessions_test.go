@@ -29,7 +29,7 @@ func TestSessionEntryV4PreservesBothNatLegs(t *testing.T) {
 		0,
 		map[uint16]string{},
 		map[uint32]string{},
-		map[uint16]string{},
+		map[uint16][]string{},
 		map[sessionEgressKey]string{},
 		true,
 	)
@@ -70,7 +70,7 @@ func TestSessionEntryV6PreservesBothNatLegs(t *testing.T) {
 		0,
 		map[uint16]string{},
 		map[uint32]string{},
-		map[uint16]string{},
+		map[uint16][]string{},
 		map[sessionEgressKey]string{},
 		true,
 	)

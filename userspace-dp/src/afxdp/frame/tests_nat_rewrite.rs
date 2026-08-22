@@ -1328,3 +1328,212 @@ fn rewrite_forwarded_frame_in_place_dnat_preserves_icmpv4_identifier() {
     );
 }
 
+
+
+// #5191 FAIL-ON-REVERT (RFC 792 / RFC 1624): the metadata ICMP-identifier
+// restore in `restore_l4_tuple_from_meta` must repair the ICMPv4 checksum for
+// the bytes it changes. IPv4 ICMP has no arm in `recompute_l4_checksum_ipv4`
+// (only TCP and UDP), so before #5191 the restore rewrote [l4+4, l4+6) and the
+// message left the box with the PRE-change checksum — every receiver
+// (RFC 1122 §3.2.2 requires the check) discards it.
+//
+// The expected checksum here is computed INDEPENDENTLY, from the bytes the
+// message must end up carrying, with the general `checksum16` routine — not
+// read back from whatever the incremental adjuster produced. Reverting the
+// `checksum16_adjust` write in `write_icmp_identifier` fails BOTH the
+// independent-value assertion and the `checksum16(icmp) == 0` validity
+// assertion.
+#[test]
+fn restore_icmpv4_identifier_repairs_the_icmp_checksum_5191() {
+    let host = Ipv4Addr::new(10, 0, 1, 100);
+    let target = Ipv4Addr::new(8, 8, 8, 8);
+    let on_wire_id: u16 = 0x1111;
+    let session_id: u16 = 0x2222;
+
+    // The frame carries `on_wire_id`; the session metadata says the flow's
+    // identifier is `session_id`, so the restore has a real repair to make.
+    let frame = build_icmp_frame_v4(host, target, 64, 8, on_wire_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        flow_src_port: session_id,
+        ..UserspaceDpMeta::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(NatDecision::default()),
+        false,
+        None,
+    )
+    .expect("in-place icmpv4 forward");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("rewritten frame");
+
+    // eth 14 + ip 20 => ICMP at 34; type@34, checksum@36..38, ident@38..40.
+    assert_eq!(out[34], 8, "still an echo request");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        session_id,
+        "identifier restored from the session metadata",
+    );
+
+    // Independent expectation: the ICMPv4 checksum of the message the frame
+    // must now carry, computed from scratch over a locally-built copy with the
+    // checksum field zeroed. Nothing here reads the emitted checksum.
+    let expected_msg = [
+        8u8,
+        0,
+        0,
+        0,
+        (session_id >> 8) as u8,
+        session_id as u8,
+        0x00,
+        0x01,
+    ];
+    let expected_csum = checksum16(&expected_msg);
+    assert_eq!(
+        u16::from_be_bytes([out[36], out[37]]),
+        expected_csum,
+        "ICMPv4 checksum equals the independently computed value",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "ICMPv4 checksum verifies over the emitted message",
+    );
+}
+
+
+// #5191 FAIL-ON-REVERT (RFC 792 §Redirect): the metadata identifier restore is
+// gated on the identifier-bearing ICMP QUERY types. For an error/control
+// message the [l4+4, l4+6) bytes are a gateway address / next-hop MTU / pointer
+// / reserved field, never an identifier — and the metadata pseudo-port for such
+// a packet is 0 (`parse_flow_ports` declines every non-query type, so the
+// GRE-decap inner-meta synthesis in `gre.rs` falls back to `unwrap_or_default`).
+// Before #5191 the ungated restore therefore ZEROED the top half of a forwarded
+// Redirect's Gateway Internet Address. Reverting the `icmp_identifier_bearing`
+// gate in `write_icmp_identifier` turns the gateway assertion RED.
+#[test]
+fn restore_icmpv4_identifier_skips_a_non_query_type_5191() {
+    let router = Ipv4Addr::new(10, 0, 1, 1);
+    let host = Ipv4Addr::new(10, 0, 1, 100);
+    // ICMP Redirect (type 5). The builder's "id" argument lands on [l4+4,
+    // l4+6), which for a Redirect is the HIGH half of the Gateway Internet
+    // Address — 192.0 of gateway 192.0.0.1.
+    let gateway_high: u16 = 0xc000;
+
+    let frame = build_icmp_frame_v4(router, host, 64, 5, gateway_high);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        // What the GRE-decap meta synthesis produces for a non-query ICMP.
+        flow_src_port: 0,
+        ..UserspaceDpMeta::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(NatDecision::default()),
+        false,
+        None,
+    )
+    .expect("in-place icmpv4 redirect forward");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("rewritten frame");
+
+    assert_eq!(out[34], 5, "still a Redirect");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        gateway_high,
+        "Redirect gateway address must not be overwritten with a pseudo-port",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "an untouched Redirect keeps its original valid checksum",
+    );
+}
+
+
+// #5191 FAIL-ON-REVERT, IPv6 half of the query-type gate. The v6 path DOES have
+// an ICMPv6 arm in `recompute_l4_checksum_ipv6`, so before #5191 the corrupted
+// message was re-checksummed and left the box VERIFYING — the receiver accepts
+// a message whose Maximum Response Delay has been silently zeroed, which is a
+// worse outcome than the v4 drop. Reverting the `icmp_identifier_bearing` gate
+// turns the delay assertion RED.
+#[test]
+fn restore_icmpv6_identifier_skips_a_non_query_type_5191() {
+    let router: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let group: Ipv6Addr = "ff02::1".parse().unwrap();
+    // MLD Query (type 130). [l4+4, l4+6) is the Maximum Response Delay.
+    let max_response_delay: u16 = 10_000;
+
+    let frame = build_icmpv6_echo_frame(router, group, 64, 130, max_response_delay);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        flow_src_port: 0,
+        ..UserspaceDpMeta::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(NatDecision::default()),
+        false,
+        None,
+    )
+    .expect("in-place icmpv6 mld forward");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("rewritten frame");
+
+    // eth 14 + ipv6 40 => ICMPv6 at 54; delay@58..60.
+    assert_eq!(out[54], 130, "still an MLD Query");
+    assert_eq!(
+        u16::from_be_bytes([out[58], out[59]]),
+        max_response_delay,
+        "MLD Maximum Response Delay must not be overwritten with a pseudo-port",
+    );
+}
