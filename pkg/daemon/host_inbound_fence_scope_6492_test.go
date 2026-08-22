@@ -158,3 +158,85 @@ func viewsContainAddr(views []dpuserspace.ZoneHostInboundView, addr string) bool
 	}
 	return false
 }
+
+// TestStickyReRenderNeverFencesLifelineShared6492 answers #6492 Finding C.
+//
+// C is the #6489 whole-table RE-RENDER at installLo0ColdBootFence: while no real
+// filter is loaded, EVERY failed install re-renders the fence from a fresh
+// snapshot. That is not a defect — it is the #6489 fix, and it is what covers an
+// address that appears after an earlier fence. What C does is AMPLIFY Finding A:
+// a lockout of a lifeline-shared management address would not be a brief window,
+// it would last for as long as the box stays degraded.
+//
+// This test pins that the amplification has nothing left to amplify, and pins it
+// structurally rather than by inspection. The withholding lives inside
+// BuildFenceAddrSets, which applyLo0Filter calls FRESH on each fence install, so
+// stickiness cannot outlive or escape it: the shared address is absent from EVERY
+// render, not just the first.
+//
+// The second half is what stops the first half passing vacuously. A "fix" that
+// neutered the re-render — stopping after one fence, or fencing nothing — would
+// also keep the shared address out of every spec. So the test also asserts that
+// the re-render really happens (one fence per failed install) and that an address
+// appearing BETWEEN renders is picked up by the later one, which is exactly the
+// #6489 property C exists to provide.
+func TestStickyReRenderNeverFencesLifelineShared6492(t *testing.T) {
+	cfg := lo0FenceTestConfig()
+	// 172.16.50.8 / 2001:db8:50::8 live on both the wan zone's reth0.50 and the
+	// fxp0 lifeline — the Finding A topology.
+	cfg.Interfaces.Interfaces["fxp0"].Units[0] = &config.InterfaceUnit{
+		Number:    0,
+		Addresses: []string{"172.16.50.8/24", "2001:db8:50::8/64"},
+	}
+
+	injected := errors.New("nftables: persistent lo0 install failure (degraded boot)")
+	var specs []xnft.FenceSpec
+	orig := nftInstaller
+	nftInstaller = &fakeNftInstaller{
+		lo0:              func(xnft.Lo0FilterSpec) error { return injected },
+		lo0ColdBootFence: func(s xnft.FenceSpec) error { specs = append(specs, s); return nil },
+	}
+	defer func() { nftInstaller = orig }()
+
+	d := &Daemon{}
+	const rounds = 4
+	for i := 0; i < rounds; i++ {
+		if i == 2 {
+			// A new firewall-local address appears mid-degradation, on a
+			// non-lifeline interface. The #6489 re-render must pick it up.
+			cfg.Interfaces.Interfaces["reth1"].Units[0].Addresses = append(
+				cfg.Interfaces.Interfaces["reth1"].Units[0].Addresses, "10.0.62.7/24")
+		}
+		if err := d.applyLo0Filter(cfg); err == nil {
+			t.Fatalf("round %d: the real install failed; applyLo0Filter must surface an error", i)
+		}
+	}
+
+	// The re-render really happened — one fence per failed install. Without this
+	// the "absent from every spec" assertion below could pass on an inert fence.
+	if len(specs) != rounds {
+		t.Fatalf("#6489 re-render: want one fence install per failed real install (%d), got %d",
+			rounds, len(specs))
+	}
+	// Finding C amplifies Finding A and A is gone: the lifeline-shared address is
+	// absent from EVERY render, not merely the first.
+	for i, spec := range specs {
+		if got := fenceViewAddrs(spec, false); sliceContains(got, "172.16.50.8") {
+			t.Fatalf("render %d fenced the lifeline-shared address 172.16.50.8; a sticky fence "+
+				"would make that lockout last the whole degraded period. Fenced v4 = %v", i, got)
+		}
+		if got := fenceViewAddrs(spec, true); sliceContains(got, "2001:db8:50::8") {
+			t.Fatalf("render %d fenced the lifeline-shared v6 address; Fenced v6 = %v", i, got)
+		}
+	}
+	// And the re-render still does its #6489 job: the address that appeared at
+	// round 2 is covered from round 2 onward, and was not covered before it
+	// existed. A fence that had gone inert would fail this.
+	if got := fenceViewAddrs(specs[0], false); sliceContains(got, "10.0.62.7") {
+		t.Fatalf("render 0 predates the address; it must not be fenced. Fenced v4 = %v", got)
+	}
+	if got := fenceViewAddrs(specs[rounds-1], false); !sliceContains(got, "10.0.62.7") {
+		t.Fatalf("the #6489 re-render must pick up an address that appeared mid-degradation; "+
+			"final fenced v4 = %v", got)
+	}
+}

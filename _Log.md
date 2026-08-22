@@ -99992,3 +99992,9 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/host_inbound_fence_scope_6492_test.go,
     pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
     docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 Finding C — add the sticky-re-render subsumption proof
+    (the #6489 whole-table re-render never fences a lifeline-shared address on
+    ANY render, and still picks up an address that appears mid-degradation).
+  - **File(s)**: pkg/daemon/host_inbound_fence_scope_6492_test.go
