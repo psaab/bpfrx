@@ -185,6 +185,13 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if len(payload) >= 8 {
 			epoch = binary.LittleEndian.Uint64(payload[:8])
 		}
+		// #5084: the peer's boot incarnation, when it sent one. Recorded on the
+		// CONNECTION so every config payload arriving on it is stamped with the
+		// incarnation that primed it, and compared against the receiver-wide
+		// current incarnation to decide a namespace switch.
+		inc := parseBootIncarnation(payload)
+		s.noteConnBootIncarnation(conn, inc)
+		switched := s.notePeerBootIncarnation(inc)
 		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
 		s.stats.BulkSyncEndTime.Store(0)
 		s.stats.BulkSyncSessions.Store(0)
@@ -201,7 +208,16 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
 		s.bulkZoneSnapshot = zoneSnap
 		s.bulkMu.Unlock()
-		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch, "local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn))
+		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch,
+			"peer_boot_incarnation", inc.String(), "incarnation_switched", switched,
+			"local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn))
+		// #5084: a peer that primes without an incarnation gets today's
+		// generation-only ordering (fail open). Warn ONCE per connection, not
+		// per frame — a silent fallback is how a half-upgraded cluster hides,
+		// and the CLAUDE.md logging rule forbids the per-frame version.
+		if !inc.known() {
+			s.warnUnincarnatedPrimeOnce(conn)
+		}
 	case syncMsgBulkEnd:
 		var epoch uint64
 		if len(payload) >= 8 {
@@ -323,7 +339,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// speak for the current one. See noteHeartbeatAck (sync_conn.go).
 		s.noteHeartbeatAck(conn)
 	case syncMsgConfig:
-		s.handleConfigPayload(payload)
+		s.handleConfigPayload(conn, payload)
 	case syncMsgConfigEncrypted:
 		// #6629: same payload, sealed under this connection's ephemeral key.
 		// Decrypt, then hand the plaintext to the SAME handler — the two arms
@@ -360,7 +376,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				"err", err, "remote", connRemoteAddrString(conn))
 			return
 		}
-		s.handleConfigPayload(plaintext)
+		s.handleConfigPayload(conn, plaintext)
 	case syncMsgConfigKeyExchange:
 		s.handleConfigKeyExchange(conn, payload)
 	case syncMsgAuthUpgradeHello:
@@ -586,7 +602,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 // generation high-water accounting and the apply-queue admission must be
 // identical for the two — a divergence between them is always a bug, so the
 // behaviour is single-sourced rather than duplicated and kept in agreement.
-func (s *SessionSync) handleConfigPayload(payload []byte) {
+// The conn parameter is #5084: the payload is stamped with the boot incarnation
+// the CONNECTION primed under, so a payload queued from a peer's prior boot can
+// be dropped at apply time rather than applying across a reset and stranding
+// the high-water.
+func (s *SessionSync) handleConfigPayload(conn net.Conn, payload []byte) {
 	s.stats.ConfigsReceived.Add(1)
 	s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())
 	configText, gen := decodeConfigPayload(payload)
@@ -613,7 +633,11 @@ func (s *SessionSync) handleConfigPayload(payload []byte) {
 	// heartbeats on this connection.
 	if s.configApplyCh != nil {
 		select {
-		case s.configApplyCh <- configApplyItem{gen: gen, text: configText}:
+		case s.configApplyCh <- configApplyItem{
+			gen:         gen,
+			text:        configText,
+			incarnation: s.connBootIncarnation(conn),
+		}:
 		default:
 			// Ordered apply queue full — practically impossible (commits
 			// are seconds apart, apply is sub-second). Drop with an alarm;

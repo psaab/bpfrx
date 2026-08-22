@@ -469,6 +469,24 @@ func (m *Manager) FormatInformation() string {
 		if syncStats.ConfigsApplyFailed > 0 {
 			fmt.Fprintf(&b, "  Configs apply-failed:  %d\n", syncStats.ConfigsApplyFailed)
 		}
+		// #5084: the peer boot incarnation, rendered ALWAYS rather than only
+		// when non-empty. "none" is the operationally interesting value — it
+		// means the fence is in its fail-open state against this peer — and a
+		// line that disappears in exactly that case would hide it.
+		//
+		// A status line plus counters, deliberately NOT a health annotation: an
+		// un-incarnated peer is the expected steady state of a rolling upgrade,
+		// not a fault, and raising cluster health for it would make every
+		// upgrade look degraded. #6387 set the precedent in the other direction
+		// by making a config-sync APPLY FAILURE diagnostic-only so it never
+		// gates failover; a less severe condition must not be louder.
+		fmt.Fprintf(&b, "  Peer boot incarnation: %s\n", syncStats.PeerBootIncarnation)
+		if syncStats.BulkPrimesWithoutIncarnation > 0 {
+			fmt.Fprintf(&b, "  Primes without incarnation: %d\n", syncStats.BulkPrimesWithoutIncarnation)
+		}
+		if syncStats.ConfigsDeadIncarnationDropped > 0 {
+			fmt.Fprintf(&b, "  Configs dead-incarnation-dropped: %d\n", syncStats.ConfigsDeadIncarnationDropped)
+		}
 	} else {
 		fmt.Fprintln(&b, "  Not configured")
 	}
