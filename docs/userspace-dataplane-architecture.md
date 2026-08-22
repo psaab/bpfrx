@@ -1171,7 +1171,10 @@ Scope of the fallback:
   from-any, to-any, both-any or `junos-global` — so a DENY the operator wrote for
   that zone pair is skipped along with everything else and the permissive default
   decides. Refusing to guess a zone is therefore not universally "the safe
-  answer"; it is safe exactly to the extent the default policy is. This is
+  answer"; it is safe exactly to the extent the default policy is. (#6682 closed
+  the INGRESS half of that: `from_id == 0` no longer reaches the default at all,
+  it is an explicit counted deny. A zero EGRESS zone still falls through, so the
+  observation above still holds on that side and this paragraph is still live.) This is
   consistent with the pre-existing #3110 decision to treat zone 0 as
   unmatchable rather than as a wildcard, and it is why #6722 B2 is a blocker
   rather than a cosmetic correctness fix: on a deny-all cluster the ambiguity
@@ -1500,9 +1503,38 @@ snapshot closed via `InterfaceUnknownZone` rather than collapsing to 0.)
 evaluates zone-pair rules AND `junos-global` rules only when
 `from_id != 0 && to_id != 0`. A flow whose ingress OR egress zone is unknown
 does not belong to any *defined* zone pair, so it is ineligible for both
-zone-scoped and global policies and falls straight through to the default
-action (deny, per #3065). This prevents a configured permit-global from leaking
-transit on an unzoned ingress/egress interface. The `junos-global` sentinel
+zone-scoped and global policies.
+
+**Ingress side (#6682): an unzoned INGRESS is now an explicit deny, not a
+fall-through.** Being ineligible for every rule tier is only half of safe. The
+flow still landed on the implicit default policy, and under `default-policy
+permit-all` that default is a PERMIT — so transit on an interface the operator
+never put in a zone was forwarded, with screen/IDS checks already skipped (an
+unresolvable ingress zone returns `ScreenCheckOutcome::Pass`, there being no
+per-zone screen profile to apply). An operator asking for permit-all is saying
+what to do with traffic that matched no policy, not asking to forward traffic
+that had no zone to be adjudicated in; Junos does not pass transit on an unzoned
+interface at all. `from_id == 0` therefore returns `Deny` directly and counts it
+on `UNZONED_INGRESS_DENIED`, kept separate from `default_counter` so the two
+causes stay distinguishable — a rising default-deny means policy is working as
+configured, a rising unzoned count means an interface fell out of its zone.
+
+The two guards are complementary and ORDERED, not redundant: #3110 stops the
+rule tiers from matching (deleting it lets a `from-zone any to-zone any permit`
+match a zone-0 flow before the #6682 deny is ever reached), and #6682 stops the
+fall-through. `both_any_tier_already_refused_zone_zero_before_6682` pins the
+first independently so the newer deny cannot silently take over its job.
+
+Scoped to the ingress side deliberately: a zero EGRESS zone has historically
+meant a bug elsewhere rather than genuine unzoned-ness (#6713 — an xfrmi tunnel
+egress resolved to 0 because `populate_egress` needed a link-layer address a
+MAC-less interface does not have), so denying on `to_id` would risk
+black-holing a correctly configured path. A zero egress zone still falls through
+to the default action.
+
+Together these prevent a configured permit-global from leaking transit on an
+unzoned ingress/egress interface, and prevent a permissive DEFAULT from doing
+the same on an unzoned ingress. The `junos-global` sentinel
 zone-id (`u16::MAX`) is a *defined* global zone, distinct from `0` (unknown),
 and is unaffected by the guard — global policies still apply to every defined
 zone pair. The #3090 wildcard-zone tiers (from-any / to-any / both-any) live

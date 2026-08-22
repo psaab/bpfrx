@@ -103065,3 +103065,12 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
   docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6682 — an unzoned INGRESS (zone id 0) no longer falls through to
+    the implicit default policy, where `default-policy permit-all` forwarded it
+    with screens already skipped. Now an explicit deny counted on
+    UNZONED_INGRESS_DENIED. The issue's reported mechanism (a from-any/to-any
+    rule matching zone 0) was already closed by #3110 and was false when filed.
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+    docs/userspace-dataplane-architecture.md
