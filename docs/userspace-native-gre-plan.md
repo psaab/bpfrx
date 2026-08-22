@@ -321,6 +321,31 @@ decapsulated inner. The inner is first trimmed to its IP-declared total
 length (`packet_trimmed_len`), so an inner whose declared length ends
 before its L4 header survives to the parse.
 
+**That trim is bounded by the OUTER datagram, not by the frame (#6748).**
+`packet_trimmed_len` keeps the inner extent inside the slice it is given,
+and until #6748 that slice ran to the end of the FRAME — so a peer that
+appended a trailer past the outer IP datagram AND inflated the inner IP
+Total Length to cover it had those out-of-datagram bytes promoted into
+the decapsulated packet. The frame length is not a bound worth having
+here: `raw_frame` is the AF_XDP descriptor length, `classify_metadata`
+performs no length validation at all, and the XDP shim declares
+`tot_len`/`payload_len` in its header structs but never reads either.
+`outer_datagram_end` now computes the authoritative end once — IPv4 Total
+Length, or 40 + IPv6 Payload Length, refused rather than clamped when it
+exceeds the capture — and the GRE option-field skips and the inner
+extraction both run on `frame[..outer_end]`. An inner header that reaches
+past it is refused, not trimmed: it is lying about the datagram it
+arrived in. An HONEST inner under ordinary trailing padding still decaps
+byte-identically, which is the negative control that separates this from
+rejecting padded frames outright.
+
+The bound was not new — `gre_checksum_region` already applied it, and
+said why (item 2 of the flag-handling list below). It was applied to the
+checksum only, so checksummed GRE got an incidental outer-length sanity
+check that non-checksummed GRE did not; that asymmetry is what made #6748
+an oversight rather than a design choice. Both now share one computation
+rather than two possibly-divergent notions of "outer end".
+
 Inner TCP was always length-validated (the IHL + 20-byte TCP-header
 check). UDP, ICMP, and ICMPv6, however, advanced the payload offset by 8
 unconditionally — with NO check that the inner actually contained the

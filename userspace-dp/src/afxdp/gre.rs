@@ -64,13 +64,27 @@ fn parse_outer_addresses(frame: &[u8], meta: UserspaceDpMeta) -> Option<(IpAddr,
 /// the outer header is truncated or its declared length lies outside the
 /// captured frame (fail-closed — a truncated/lying header must not
 /// over-read or pass an unvalidated frame).
-fn gre_checksum_region<'a>(
-    frame: &'a [u8],
-    meta: UserspaceDpMeta,
-    gre_offset: usize,
-) -> Option<&'a [u8]> {
+/// #6748: the authoritative end of the OUTER IP datagram, in frame offsets.
+///
+/// IPv4 Total Length, or 40 + IPv6 Payload Length, both relative to
+/// `meta.l3_offset`, and refused when the declaration runs past what was
+/// actually captured. Nothing earlier in the path establishes this: `raw_frame`
+/// is the AF_XDP descriptor length, `classify_metadata` validates
+/// snapshot/config-gen/fib-gen/addr-family and performs no length validation at
+/// all, and the XDP shim declares `tot_len`/`payload_len` in its header structs
+/// but never reads either.
+///
+/// This computation used to live inside `gre_checksum_region` and be applied to
+/// the CHECKSUM only. Its docstring said why — "so trailing Ethernet min-frame
+/// padding is excluded" — while payload promotion was bounded by
+/// `frame.len() - inner_offset` instead. The asymmetry is what made #6748 an
+/// oversight rather than a design choice: checksummed GRE got an incidental
+/// outer-length sanity check that non-checksummed GRE did not. Extracted here so
+/// there is ONE notion of "outer end" for the checksum, the option-field skips
+/// and the inner extraction, rather than a second, possibly divergent one.
+pub(in crate::afxdp) fn outer_datagram_end(frame: &[u8], meta: UserspaceDpMeta) -> Option<usize> {
     let l3 = meta.l3_offset as usize;
-    let gre_region_end = match meta.addr_family as i32 {
+    let end = match meta.addr_family as i32 {
         libc::AF_INET => {
             let total = u16::from_be_bytes([*frame.get(l3 + 2)?, *frame.get(l3 + 3)?]) as usize;
             l3.checked_add(total)?
@@ -82,9 +96,23 @@ fn gre_checksum_region<'a>(
         }
         _ => return None,
     };
-    // The declared region must start at/after the GRE header and fit
-    // within what we actually captured.
-    if gre_region_end < gre_offset || gre_region_end > frame.len() {
+    // A declaration longer than what we captured is refused rather than
+    // clamped: clamping would silently accept a header that lies about its own
+    // datagram, which is the same class of trust this function exists to remove.
+    if end > frame.len() {
+        return None;
+    }
+    Some(end)
+}
+
+fn gre_checksum_region<'a>(
+    frame: &'a [u8],
+    meta: UserspaceDpMeta,
+    gre_offset: usize,
+) -> Option<&'a [u8]> {
+    let gre_region_end = outer_datagram_end(frame, meta)?;
+    // The declared region must start at/after the GRE header.
+    if gre_region_end < gre_offset {
         return None;
     }
     frame.get(gre_offset..gre_region_end)
@@ -627,7 +655,24 @@ pub(super) fn try_native_gre_decap_from_frame(
         return None;
     }
     let gre_offset = meta.l4_offset as usize;
-    let base = frame.get(gre_offset..gre_offset + 4)?;
+    // #6748: everything below reads through `outer`, never `frame`. The outer
+    // IP header's own declared length is the authoritative end of this
+    // datagram; bytes after it are a trailer the sender appended, not part of
+    // the packet the tunnel carries.
+    //
+    // Bounding by the FRAME length — which is what implementing this from its
+    // title alone would produce — fixes nothing: `packet_trimmed_len` below
+    // already keeps the inner extent inside the frame, and Ethernet min-frame
+    // padding is already trimmed. The missing bound was against the outer
+    // DATAGRAM. A peer that appends a trailer past it AND inflates the inner IP
+    // Total Length to cover it had those out-of-datagram bytes promoted into
+    // the decapsulated packet.
+    let outer_end = outer_datagram_end(frame, meta)?;
+    if outer_end < gre_offset {
+        return None;
+    }
+    let outer = frame.get(..outer_end)?;
+    let base = outer.get(gre_offset..gre_offset + 4)?;
     let flags_version = u16::from_be_bytes([base[0], base[1]]);
     if (flags_version & GRE_VERSION_MASK) != 0 {
         return None;
@@ -663,21 +708,23 @@ pub(super) fn try_native_gre_decap_from_frame(
             return None;
         }
         // Past the checksum/reserved field; bounds-check before advance.
-        frame.get(inner_offset..inner_offset + 4)?;
+        // #6748: bounded by the outer datagram, so an option field that would
+        // only fit in a trailer is refused rather than parsed.
+        outer.get(inner_offset..inner_offset + 4)?;
         inner_offset += 4;
     }
     let mut key = 0u32;
     if key_present {
         key = u32::from_be_bytes(
-            <[u8; 4]>::try_from(frame.get(inner_offset..inner_offset + 4)?).ok()?,
+            <[u8; 4]>::try_from(outer.get(inner_offset..inner_offset + 4)?).ok()?,
         );
         inner_offset += 4;
     }
     if sequence_present {
-        frame.get(inner_offset..inner_offset + 4)?;
+        outer.get(inner_offset..inner_offset + 4)?;
         inner_offset += 4;
     }
-    let inner_packet = frame.get(inner_offset..)?;
+    let inner_packet = outer.get(inner_offset..)?;
     let inner_len = packet_trimmed_len(inner_packet, inner_family)?;
     let inner_packet = &inner_packet[..inner_len];
 
