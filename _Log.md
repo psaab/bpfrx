@@ -100492,6 +100492,16 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_proxyarp_test.go,
   pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: #6537 — record the `userspace_ingress_ifaces` delete inventory on
+  EVERY exit from `syncIngressIfaceMapLocked`, not only the all-succeeded path.
+  Both early returns now retain `prior ∪ installed-this-pass` via
+  `mergeIngressInventory`, so a row installed by a pass that later failed is
+  still reachable to a subsequent reap. Fail-on-revert coverage as a table plus
+  an end-to-end reap test; the rows localise (dropping the update-path debt
+  greens the delete-path row and vice versa). BPF-map fixtures SKIP unprivileged.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_ingress_partial_6537_test.go,
+  docs/afxdp-packet-processing.md, _Log.md
 - **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
   `Store.confirmPrevFirst` records first-commit-ness where it is known (arm
   site: pre-promotion `s.compiled`; recovery site: the persisted
