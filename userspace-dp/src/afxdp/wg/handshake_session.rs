@@ -66,6 +66,37 @@ impl From<FramingError> for HandshakeError {
     }
 }
 
+/// #6227 item 5: WireGuard handshake-session mutex (`reconcile_lock` /
+/// `cookie_gen`) poison recoveries, summed across every site in this file.
+/// Mirrors the crate-wide poison-recovery policy established by
+/// `worker_queue::lock_recover` (#1807) and `shared_ops::lock_shared_recover`
+/// (#2402): a panic that poisoned the lock already happened and was
+/// contained by the control-thread supervisor, so the correct recovery is
+/// `clear_poison` + keep using the guarded state, not `.unwrap()` panicking
+/// this thread too.
+pub(in crate::afxdp::wg) static WG_HANDSHAKE_LOCK_POISON_RECOVERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Lock a WireGuard handshake-session mutex, RECOVERING from poison instead
+/// of panicking (#6227 item 5). Every caller in this file is control-thread
+/// only (never the AF_XDP poll worker, see the module doc), so a blocking
+/// `lock()` — rather than `worker_queue`'s `try_lock` — is the right shape
+/// here; only the poison policy is shared.
+#[inline]
+fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            m.clear_poison();
+            WG_HANDSHAKE_LOCK_POISON_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "xpf-wg: handshake-session mutex poisoned by a prior panic; recovering and clearing poison"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// A handshake in progress: the snow `HandshakeState` plus the metadata
 /// needed to promote it to a live session once the exchange completes.
 ///
@@ -135,7 +166,7 @@ impl WgEngine {
         state: Option<HandshakeState>,
         role: SessionRole,
     ) -> Result<u32, HandshakeError> {
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = lock_recover(&self.reconcile_lock);
         self.reserve_pending_locked(peer_pubkey, state, role)
     }
 
@@ -232,7 +263,7 @@ impl WgEngine {
         peer_pubkey: [u8; WG_KEY_LEN],
         role: SessionRole,
     ) -> Result<u32, HandshakeError> {
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = lock_recover(&self.reconcile_lock);
         self.reserve_pending_locked(peer_pubkey, None, role)
     }
 
@@ -242,7 +273,7 @@ impl WgEngine {
     /// `pending` (never in the live-session demux map), so there is nothing
     /// to undo in `sessions_by_local_index`. Idempotent.
     fn release_pending(&self, local_index: u32) {
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = lock_recover(&self.reconcile_lock);
         let mut pending = self.pending.write().unwrap();
         if let Some(ph) = pending.remove(&local_index) {
             let mut by_peer = self.pending_by_peer.write().unwrap();
@@ -339,7 +370,7 @@ impl WgEngine {
     /// `create_initiation_inner` after `build_initiation` has written MAC1
     /// and zeroed MAC2. Slow path (control thread only).
     fn add_initiator_macs(&self, peer_pubkey: &[u8; WG_KEY_LEN], out: &mut [u8], now_ns: u64) {
-        let mut cg = self.cookie_gen.lock().unwrap();
+        let mut cg = lock_recover(&self.cookie_gen);
         let entry = cg
             .entry(*peer_pubkey)
             .or_insert_with(super::cookie::InitiatorCookie::new);
@@ -383,7 +414,7 @@ impl WgEngine {
         let Some(peer_pubkey) = self.peer_for_pending_index(recv_index) else {
             return false;
         };
-        let mut cg = self.cookie_gen.lock().unwrap();
+        let mut cg = lock_recover(&self.cookie_gen);
         let entry = cg
             .entry(peer_pubkey)
             .or_insert_with(super::cookie::InitiatorCookie::new);
@@ -442,7 +473,7 @@ impl WgEngine {
         // Hold reconcile_lock across the whole completion so the reservation
         // cannot be aborted out from under us and the index never disappears
         // from both maps.
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = lock_recover(&self.reconcile_lock);
 
         // Validate + take the snow state. The entry stays in `pending`
         // (state = None) so the index remains reserved.
@@ -599,7 +630,7 @@ impl WgEngine {
         // reserve and install (Codex round-2 race). The responder completes
         // synchronously in this single call, so the pending entry is a bare
         // reservation marker (state = None).
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = lock_recover(&self.reconcile_lock);
         let local_index =
             self.reserve_pending_locked(peer_pubkey, None, SessionRole::Responder)?;
 

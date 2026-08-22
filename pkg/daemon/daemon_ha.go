@@ -102,6 +102,17 @@ func recordRGActiveAppliedIfCurrentOrStable(s *rgStateMachine, tr rgTransition, 
 	return true
 }
 
+// #5250 (A7-b1 F4): every wait here is ABORTABLE on daemon stop. It used to
+// bare-`time.Sleep` up to localFailoverCommitTimeout (1s) plus the dwell delay
+// with no cancellation, so a `systemctl stop xpfd` landing mid-transfer held
+// shutdown for the rest of that window. The signal is d.applyCancelCtx(), the
+// DAEMON-STOP context (#2926) the archive timer also waits on — NOT d.daemonCtx,
+// which is context.Background in production and never cancelled. Taking it here
+// rather than threading a ctx through SetLocalTransferCommitReadyHook leaves
+// pkg/cluster untouched. A cancelled wait returns an ERROR, the fail-closed
+// direction: cluster.requestPeerFailover responds to non-nil by calling
+// abortRequestedPeerFailover and sending no commit, so the peer stays
+// un-promoted rather than committing a transfer this node can no longer verify.
 func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 	if len(rgIDs) == 0 {
 		return nil
@@ -111,6 +122,26 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 		timeout = time.Second
 	}
 	delay := d.localFailoverCommitDelay
+	stop := d.applyCancelCtx().Done()
+	// One timer, reset per wait, so a full 1 s of 10 ms polls does not allocate
+	// a hundred of them on the failover path.
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	wait := func(dur time.Duration) error {
+		timer.Reset(dur)
+		select {
+		case <-stop:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("daemon stopping while waiting for local failover activation settle for redundancy groups %v", rgIDs)
+		case <-timer.C:
+			return nil
+		}
+	}
 	deadline := time.Now().Add(timeout)
 	dwelled := false
 	for {
@@ -127,7 +158,9 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 		if ready {
 			if !dwelled && delay > 0 {
 				dwelled = true
-				time.Sleep(delay)
+				if err := wait(delay); err != nil {
+					return err
+				}
 				continue
 			}
 			return nil
@@ -135,7 +168,9 @@ func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for local failover activation settle for redundancy groups %v", rgIDs)
 		}
-		time.Sleep(10 * time.Millisecond)
+		if err := wait(10 * time.Millisecond); err != nil {
+			return err
+		}
 	}
 }
 
@@ -524,13 +559,38 @@ func (d *Daemon) handleClusterEvent(ctx context.Context, ev cluster.ClusterEvent
 		if vrrpTimer != nil {
 			vrrpTimer.Stop()
 		}
+		// #5250 (A7-b1 F4): the debounce closure CAPTURES the managers it uses
+		// and checks the stop signal before touching them. It used to read
+		// d.store / d.cluster / d.vrrpMgr through the receiver at FIRE time,
+		// 500ms after arming, and the only thing stopping it is
+		// watchClusterEvents' deferred vrrpTimer.Stop() — which for an AfterFunc
+		// timer does not wait for a body that has already begun. So the
+		// last-armed update could run during or after the shutdown that stopped
+		// it, re-reading fields the teardown was tearing down.
+		//
+		// The stop signal is d.applyCancelCtx(), NOT this function's ctx: the
+		// watcher runs as watchClusterEvents(d.daemonCtx) and daemonCtx is
+		// context.Background() in production (see its field comment), so gating
+		// on ctx would be a branch that can never be taken. The channel is read
+		// on the watcher goroutine at ARM time so the field read cannot race
+		// the timer.
+		stopCh := d.applyCancelCtx().Done()
+		clusterRef, storeRef, vrrpRef := d.cluster, d.store, d.vrrpMgr
 		vrrpTimer = time.AfterFunc(500*time.Millisecond, func() {
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				localPri := d.cluster.LocalPriorities()
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			if clusterRef == nil || storeRef == nil || vrrpRef == nil {
+				return
+			}
+			if cfg := storeRef.ActiveConfig(); cfg != nil {
+				localPri := clusterRef.LocalPriorities()
 				var all []*vrrp.Instance
 				all = append(all, vrrp.CollectInstances(cfg)...)
 				all = append(all, vrrp.CollectRethInstances(cfg, localPri)...)
-				if err := d.vrrpMgr.UpdateInstances(all); err != nil {
+				if err := vrrpRef.UpdateInstances(all); err != nil {
 					slog.Warn("cluster: failed to update VRRP instances", "err", err)
 				}
 			}

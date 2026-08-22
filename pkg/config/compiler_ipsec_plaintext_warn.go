@@ -1,8 +1,6 @@
 package config
 
 import (
-	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -84,13 +82,8 @@ import (
 func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 	zoneByIfID := collectZoneInterfaceRefsAST(nodes)
 
-	type finding struct {
-		vpn       string
-		bindIface string
-		zone      string
-	}
 	seen := map[string]struct{}{}
-	var findings []finding
+	var findings []plaintextTunnelFinding
 
 	// #3562 shape: iterate EVERY top-level `security` node and EVERY `ipsec`
 	// sibling. parseStatements APPENDS a repeated top-level block rather than
@@ -136,74 +129,32 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 					continue
 				}
 				seen[key] = struct{}{}
-				findings = append(findings, finding{
-					vpn:       inst.name,
-					bindIface: bindIface,
-					zone:      zoneByIfID[ifID],
+				findings = append(findings, plaintextTunnelFinding{
+					ref:    bindIface,
+					detail: "security ipsec vpn " + inst.name,
+					zone:   zoneByIfID[ifID],
 				})
 			}
 			return nil
 		})
 	})
 
-	sort.Slice(findings, func(i, j int) bool {
-		if findings[i].bindIface != findings[j].bindIface {
-			return findings[i].bindIface < findings[j].bindIface
-		}
-		return findings[i].vpn < findings[j].vpn
+	// ONE aggregated advisory per commit, the zoned/unzoned partition, the sort,
+	// the group headings and the #6682 unzoned caveat are the SHARED shape
+	// (renderPlaintextUnadjudicatedAdvisory, compiler_tunnel_plaintext_advisory.go)
+	// — the #5618 WireGuard advisory renders through the same function, so the
+	// two accounts of one mechanism cannot diverge in structure. Only the
+	// protocol-specific sentences live here.
+	return renderPlaintextUnadjudicatedAdvisory(findings, plaintextAdvisoryWording{
+		lead: "security ipsec: decrypted traffic on route-based IPsec secure tunnels is " +
+			"NOT evaluated against xpf security policies (#5619).",
+		zonedSuffix: "but that zone does NOT govern its decrypted traffic",
+		mechanism: "Route-based IPsec decrypts in the kernel XFRM stack and the plaintext is " +
+			"forwarded by Linux routing, which xpf does not adjudicate: no zone policy, no " +
+			"session, no NAT and no screen are applied to it.",
+		remedy: "Restrict what the tunnel can reach with routing or with the peer's own " +
+			"policy until this is enforced.",
 	})
-	if len(findings) == 0 {
-		return nil
-	}
-
-	// ONE aggregated advisory per commit, not one per tunnel. An advisory that
-	// fires N times on every commit gets filtered out, and then it protects
-	// nobody — the same reason compiler_system.go folds several inert knobs
-	// into a single message.
-	//
-	// The two groups are stated separately and worded differently on purpose.
-	// A ZONED tunnel is the acute case: the operator has been told something
-	// specific and untrue, because the zone commits cleanly and is programmed
-	// and so the posture READS as enforced. An unzoned tunnel is a plain gap.
-	var zoned, unzoned []finding
-	for _, f := range findings {
-		if f.zone != "" {
-			zoned = append(zoned, f)
-		} else {
-			unzoned = append(unzoned, f)
-		}
-	}
-
-	var b strings.Builder
-	b.WriteString("security ipsec: decrypted traffic on route-based IPsec secure tunnels is " +
-		"NOT evaluated against xpf security policies (#5619).")
-	if len(zoned) > 0 {
-		b.WriteString("\n  ASSIGNED A ZONE THAT IS NOT ENFORCED — this reads as protected and is not:")
-		for _, f := range zoned {
-			fmt.Fprintf(&b, "\n    %s (security ipsec vpn %s) is assigned to security-zone %q, "+
-				"but that zone does NOT govern its decrypted traffic",
-				f.bindIface, f.vpn, f.zone)
-		}
-	}
-	if len(unzoned) > 0 {
-		b.WriteString("\n  NOT ZONE-ADJUDICATED:")
-		for _, f := range unzoned {
-			fmt.Fprintf(&b, "\n    %s (security ipsec vpn %s)", f.bindIface, f.vpn)
-		}
-	}
-	b.WriteString("\n  Route-based IPsec decrypts in the kernel XFRM stack and the plaintext is " +
-		"forwarded by Linux routing, which xpf does not adjudicate: no zone policy, no " +
-		"session, no NAT and no screen are applied to it.")
-	if len(unzoned) > 0 {
-		// Leaving a tunnel out of a zone is not a mitigation, and an operator
-		// reading only the zoned paragraph could conclude that it is.
-		b.WriteString(" An UNZONED tunnel is not safer: an interface in no zone resolves to " +
-			"zone id 0, which a `from-zone any to-zone any permit` rule matches (#6682).")
-	}
-	b.WriteString(" Restrict what the tunnel can reach with routing or with the peer's own " +
-		"policy until this is enforced.")
-
-	return []string{b.String()}
 }
 
 // collectZoneInterfaceRefsAST maps each `security zones security-zone <z>
@@ -219,44 +170,26 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 // spelling-mismatch class as the #5619 netdev-name bug, so it is keyed the same
 // way: join on if_id, with XFRMIfNameAndID as the single source of truth.
 //
-// Membership is read through zoneInterfaceMembers, the shared flattener the
-// real zone compiler uses (#5248/#2419): a bracketed list
+// Membership is read through forEachZoneInterfaceMemberAST, which reads the
+// stanza with the compiler's own flattener (#5248/#2419): a bracketed list
 // `interfaces [ st0.0 st0.1 ]` arrives bracket-stripped and NESTED under the
 // first member, so reading only iface.Name() would see just the first and
-// silently miss the rest.
+// silently miss the rest. The #5618 WireGuard advisory enumerates membership
+// through the SAME walker — a divergence in which members the two advisories
+// can see would always be a bug.
 func collectZoneInterfaceRefsAST(nodes []*Node) map[uint32]string {
 	out := map[uint32]string{}
-	_ = forEachChild(nodes, "security", func(security *Node) error {
-		return forEachChild(security.Children, "zones", func(zones *Node) error {
-			for _, inst := range namedInstances(zones.FindChildren("security-zone")) {
-				if inst.name == "" {
-					continue
-				}
-				for _, prop := range inst.node.Children {
-					if prop.Name() != "interfaces" {
-						continue
-					}
-					for _, iface := range prop.Children {
-						for _, member := range zoneInterfaceMembers(iface) {
-							if member == "" {
-								continue
-							}
-							_, ifID := XFRMIfNameAndID(member)
-							if ifID == 0 {
-								// Not a secure tunnel; irrelevant here.
-								continue
-							}
-							// First zone wins; a duplicate assignment is a
-							// separate concern with its own gate.
-							if _, exists := out[ifID]; !exists {
-								out[ifID] = inst.name
-							}
-						}
-					}
-				}
-			}
-			return nil
-		})
+	forEachZoneInterfaceMemberAST(nodes, func(zone, member string) {
+		_, ifID := XFRMIfNameAndID(member)
+		if ifID == 0 {
+			// Not a secure tunnel; irrelevant here.
+			return
+		}
+		// First zone wins; a duplicate assignment is a separate concern with
+		// its own gate.
+		if _, exists := out[ifID]; !exists {
+			out[ifID] = zone
+		}
 	})
 	return out
 }

@@ -104,24 +104,26 @@ pub(super) fn record_rx_descriptor_telemetry(
     if desc.len > telemetry.dbg.rx_max_frame {
         telemetry.dbg.rx_max_frame = desc.len;
     }
-    // #5190 (A1-b1-F7): a FIXED 1514-byte census, deliberately named for the
-    // constant it compares against. It is NOT an MTU-violation counter — this
-    // path has no per-binding L2 frame limit, so a configured jumbo frame or a
-    // 1500-byte payload carrying an in-band VLAN tag the NIC did not strip is
-    // counted here while being perfectly valid. Renamed from `rx_oversized`,
-    // which read as an anomaly.
+    // #5190 (A1-b1-F7): a FIXED 1514-byte comparison, not an MTU test. The
+    // per-interface MTU / jumbo configuration is not available here (this runs
+    // before the shim metadata is parsed, so even the 802.1Q tag presence is
+    // unknown), so a valid in-band VLAN-tagged full-MTU frame (1518) and every
+    // jumbo frame trip it. The counter is named for what it measures so it is
+    // not read as an anomaly signal; see `DebugPollCounters::rx_over_1514`.
     if desc.len > 1514 {
         telemetry.dbg.rx_over_1514 += 1;
         if cfg!(feature = "debug-log") {
             thread_local! {
-                static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                static RX_OVER_1514_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
-            OVERSIZED_RX_LOG.with(|c| {
+            RX_OVER_1514_LOG.with(|c| {
                 let n = c.get();
                 if n < 20 {
                     c.set(n + 1);
                     eprintln!(
-                        "DBG RX_OVER_1514[{}]: if={} q={} desc.len={} (>1514B; valid for jumbo/VLAN-tagged frames)",
+                        "DBG RX_OVER_1514[{}]: if={} q={} desc.len={} \
+                         (over the FIXED 1514 size — a valid VLAN-tagged or \
+                         jumbo frame lands here too; not an MTU test)",
                         n, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len,
                     );
                 }

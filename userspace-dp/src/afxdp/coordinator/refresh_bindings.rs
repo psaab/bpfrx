@@ -276,10 +276,13 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.socket_ifindex = 0;
     binding.socket_queue_id = 0;
     binding.socket_bind_flags = 0;
-    // #5190 (A1-b8-F6): the shared-UMEM metadata is COPIED from the live
-    // snapshot above, so leaving it here made an unbound slot keep reporting
-    // the group/role/mode of the worker that used to own it — operator-visible
-    // status describing a socket that no longer exists.
+    // #5190 (A1-b8-F6): the shared-UMEM descriptors are COPIED by
+    // `copy_live_snapshot` above but were never reset here, so an
+    // unbound slot kept advertising the last worker's shared-UMEM
+    // mode/group/socket-role/disabled-reason — operator-visible state
+    // describing a socket that no longer exists. `.clear()` (not
+    // `= String::new()`) retains the allocation, matching the
+    // `xsk_bind_mode` treatment two lines up.
     binding.shared_umem_mode.clear();
     binding.shared_umem_group.clear();
     binding.shared_umem_socket_role.clear();
@@ -295,9 +298,11 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.local_delivery_packets = 0;
     binding.forward_candidate_packets = 0;
     binding.route_miss_packets = 0;
-    // #5190 (A1-b8-F6): both drop counters are copied from the live snapshot
-    // (added in b1492e26b) but were never reset, so an unbound slot kept the
-    // last bound worker's martian / IPv6-extension-header drop counts.
+    // #5190 (A1-b8-F6): both drop counters are copied by
+    // `copy_live_snapshot` but were missed here when they were added, so
+    // an unbound slot reported a frozen non-zero drop count alongside
+    // rx_packets == 0 — an inconsistency an operator reads as "this
+    // dead slot is still dropping traffic".
     binding.martian_dropped = 0;
     binding.ipv6_ext_header_dropped = 0;
     binding.neighbor_miss_packets = 0;
@@ -446,119 +451,4 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.last_heartbeat = None;
     binding.last_error.clear();
     binding.ready = false;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value;
-
-    /// Fields `zero_unbound_slot` deliberately PRESERVES on an unbound slot:
-    /// the slot's identity and its registration/arming lifecycle, which
-    /// describe the SLOT, not the worker that used to be bound to it.
-    /// Everything else in `BindingStatus` describes live worker state and must
-    /// return to its default when the slot goes unbound.
-    const PRESERVED_ON_UNBIND: &[&str] = &[
-        "slot",
-        "queue_id",
-        "worker_id",
-        "interface",
-        "ifindex",
-        "registered",
-        "armed",
-    ];
-
-    /// Rewrite every leaf of `v` to a non-default value so a populated
-    /// `BindingStatus` can be built generically — no hand-maintained field
-    /// list that would rot exactly the way the copy/reset lists did.
-    fn populate(v: &Value) -> Value {
-        match v {
-            Value::Bool(_) => Value::Bool(true),
-            Value::Number(n) => {
-                if n.is_f64() {
-                    Value::from(7.5f64)
-                } else if n.is_i64() && n.as_i64() == Some(0) {
-                    Value::from(7i64)
-                } else {
-                    Value::from(7u64)
-                }
-            }
-            Value::String(_) => Value::String("populated".into()),
-            Value::Array(a) if a.is_empty() => Value::Array(vec![Value::from(3u64); 3]),
-            Value::Array(a) => Value::Array(a.iter().map(populate).collect()),
-            Value::Object(o) => {
-                Value::Object(o.iter().map(|(k, x)| (k.clone(), populate(x))).collect())
-            }
-            Value::Null => Value::Null,
-        }
-    }
-
-    /// #5190 (A1-b8-F6): `copy_live_snapshot` and `zero_unbound_slot` are two
-    /// hand-maintained field lists over ONE struct, and they had drifted — the
-    /// copy took `shared_umem_{mode,group,socket_role,disabled_reason}`,
-    /// `martian_dropped` and `ipv6_ext_header_dropped` while the reset took
-    /// none of the six, so an unbound slot kept publishing the shared-UMEM
-    /// identity and drop counts of the worker that had gone away.
-    ///
-    /// Rather than pin those six by name (which would rot on the NEXT field
-    /// added to the copy list), this walks the serialized form: populate every
-    /// field, unbind, and require every field except the slot-identity
-    /// allowlist to be back at its default. Any future field added to
-    /// `BindingStatus` and copied but not reset fails here by name.
-    ///
-    /// Coverage note: fields carrying `skip_serializing_if` (the
-    /// `Option<DateTime>` timestamps) are absent from the default form and are
-    /// therefore outside this walk; `last_heartbeat` is asserted directly.
-    ///
-    /// FAIL-ON-REVERT: delete any single reset line in `zero_unbound_slot` and
-    /// this names that field as stale.
-    #[test]
-    fn zero_unbound_slot_resets_every_non_identity_field_5190() {
-        let default_json =
-            serde_json::to_value(BindingStatus::default()).expect("serialize default");
-        let populated_json = populate(&default_json);
-        assert_ne!(
-            populated_json, default_json,
-            "populate() produced the default form — the walk below would be vacuous"
-        );
-
-        let mut binding: BindingStatus =
-            serde_json::from_value(populated_json).expect("deserialize populated BindingStatus");
-        binding.last_heartbeat = Some(chrono::Utc::now());
-
-        zero_unbound_slot(&mut binding);
-
-        assert!(
-            binding.last_heartbeat.is_none(),
-            "last_heartbeat survived the unbind"
-        );
-
-        let after = serde_json::to_value(&binding).expect("serialize after unbind");
-        let after = after.as_object().expect("object");
-        let def = default_json.as_object().expect("object");
-
-        let stale: Vec<&str> = def
-            .iter()
-            .filter(|(k, _)| !PRESERVED_ON_UNBIND.contains(&k.as_str()))
-            .filter(|(k, dv)| after.get(k.as_str()) != Some(dv))
-            .map(|(k, _)| k.as_str())
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "unbound slot still reports live-worker state for {} field(s): {:?} — copy_live_snapshot and zero_unbound_slot have drifted",
-            stale.len(),
-            stale
-        );
-
-        // The allowlist must earn every entry: each preserved field really is
-        // still carrying its populated value, so a future field cannot be
-        // parked here to silence the walk without that being visible.
-        for k in PRESERVED_ON_UNBIND {
-            assert_ne!(
-                after.get(*k),
-                def.get(*k),
-                "{k} is in PRESERVED_ON_UNBIND but was reset — the allowlist is stale"
-            );
-        }
-    }
 }

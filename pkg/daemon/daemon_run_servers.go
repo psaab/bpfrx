@@ -58,7 +58,7 @@ func (d *Daemon) effectiveListeners() sysservices.Listeners {
 //
 // These closures were inlined at each transport's construction site, so no test
 // could exercise the wiring: reverting one transport back to
-// commitAndApply(ctx, comment, false) left every test green (#5961). They are
+// commitAndApply(ctx, comment, peerSyncNever) left every test green (#5961). They are
 // extracted here as three named per-transport seams — one method pair per
 // transport — so each transport's wiring is independently reachable from a test
 // and independently fail-on-revert covered (configsync_transport_5054_test.go).

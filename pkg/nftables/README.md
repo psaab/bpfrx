@@ -98,6 +98,31 @@ host path. Three test layers pin this:
 scrape the named counter objects back via netlink for the Prometheus
 surface. The installer's `CounterObj`s are read by these unchanged.
 
+`ReadHostInboundDenyCounters` additionally returns a `HostInboundTableState`
+(#5719), because an empty row set alone cannot tell three kernel states apart:
+
+| state | `inet xpf_hostinbound` | named counter objects | is a `0` authoritative? |
+|---|---|---|---|
+| `HostInboundTableAbsent` | absent | — | YES — no enforcement, no denies |
+| `HostInboundTableCounterless` | **present, DROPping** | **none** | **NO** — the #5644 cold-boot fence |
+| `HostInboundTableCounted` | present | >=1 | YES — including counters that read 0 |
+
+The `Counterless` state is the #5644 M37 cold-boot fail-closed fence, which
+`InstallColdBootFence` renders with catch-all DROPs and deliberately NO named
+counters (see the invariant note on `buildHostInboundFenceNetlink`): the kernel
+can be actively dropping host-bound traffic with nothing to scrape, so the
+caller must mark that zero non-authoritative instead of publishing it
+(`pkg/api` sets `host_inbound_kernel_denies_unavailable` and bumps
+`xpf_counter_read_errors_total`). The discriminator is "the table carries no
+named counter OBJECT", not "no DENY counter": a real generation always declares
+the three #4759 ICMP/ND accept counters, so a legitimate junos-host
+program-only ruleset (which installs no per-zone catch-all DROP, hence no deny
+counter) still reads `Counted`. On a non-nil error the state is the zero value
+and carries no meaning — check the error first. `classifyHostInboundDenyObjects`
+is the pure object-walk seam that makes the present-table half of this testable
+without a kernel; `TestFenceTableReadsCounterless` proves all three states
+against the real kernel under `CAP_NET_ADMIN`.
+
 ## Callers
 
 `pkg/daemon` (installer/probe wiring lands in PR-3), `pkg/api`

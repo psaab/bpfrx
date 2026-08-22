@@ -21,16 +21,31 @@
 // `umem.rs::tx_kick_latency_*` which exercise the real production
 // functions.
 //
-// EXPLORATORY — this bench emits NO pass/fail verdict (#5190 A1-b12-F3).
-// It runs under criterion, prints timings, and exits 0 regardless; nothing
-// in the Makefile or CI runs it. The design target it was written against
-// was p99 per-call overhead ≤ 60 ns on the userspace cluster VM
-// (VDSO-confirmed monotonic_nanos path; plan §3.10 R1 correction — the
-// earlier 25 ns figure only covered the atomic fast-path; 45 ns derivation
-// + 15 ns jitter headroom ≈ 60 ns) — a number a human compares against the
-// printed p99, NOT an enforced gate. To make it one, follow
-// `benches/prefix_set_lookup.rs`: own `main()`, sample directly, and
-// `std::process::exit(1)` on a breach.
+// Target (READ BY A HUMAN, not enforced — see the #5190 banner
+// below): p99 per-call overhead ≤ 60 ns on the userspace cluster VM
+// (VDSO-confirmed monotonic_nanos path). Plan §3.10 R1 correction
+// — the earlier 25 ns figure only covered the atomic fast-path; 45 ns
+// derivation + 15 ns jitter headroom ≈ 60 ns. Criterion prints the
+// distribution; nothing in this file compares it to 60 ns.
+//
+// ---------------------------------------------------------------------------
+// #5190 (A1-b12-F3) VERDICT STATUS: THIS BENCH IS EXPLORATORY — IT DOES NOT
+// GATE. It measures and PRINTS; it compares nothing against a threshold and
+// never exits non-zero. A severe regression here still exits 0, so a wrapper
+// that reads only the exit status learns NOTHING from running it. Read the
+// printed numbers.
+//
+// The benches in this crate that DO gate are `prefix_set_lookup.rs` and
+// `runtime_view_refresh.rs`: both compare a measured percentile against a
+// named threshold and call `std::process::exit(1)` on breach. Copy that shape
+// if this target is ever promoted to a real gate.
+//
+// Nothing in CI or the Makefile runs `cargo bench` — `make test-rust` builds
+// `--bins --tests` and deliberately EXCLUDES benches — so no automated gate is
+// currently reporting a false green from this file. The hazard this banner
+// closes is a human running it on the strength of the wording below and
+// reading exit 0 as a pass.
+// ---------------------------------------------------------------------------
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -118,14 +118,15 @@ test-race-dp:
 # shared rather than rebuilt.
 #
 #   --bins --tests         select the correctness suite. Benches are
-#                          deliberately excluded: they are performance
-#                          measurements run by hand via `cargo bench`, and
-#                          criterion's harness (harness = false) rejects
-#                          libtest's --test-threads flag, so running them
-#                          here would break the run. Only prefix_set_lookup
-#                          and runtime_view_refresh enforce a threshold
-#                          (own main + exit 1); the rest are exploratory and
-#                          exit 0 whatever they measure (#5190).
+#                          deliberately excluded: criterion's harness
+#                          (harness = false) rejects libtest's
+#                          --test-threads flag, so running them here would
+#                          break the run. #5190: benches are NOT run by any
+#                          make target or CI job, and only two of them
+#                          (prefix_set_lookup, runtime_view_refresh) even
+#                          emit a failing verdict — the rest print numbers
+#                          for a human and always exit 0. Do not treat a
+#                          `cargo bench` exit status as a perf gate.
 #   -- --test-threads=1    serialize the harness. Some dataplane socket
 #                          tests can wedge in __skb_wait_for_more_packets
 #                          when run concurrently; single-threaded execution

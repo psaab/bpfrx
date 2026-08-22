@@ -1941,6 +1941,20 @@ CPU 7: main thread + io_uring + kernel
 | Cached resolution | ~0.8% CPU | Reuse forwarding decision from session entry |
 | NAPI busy polling | Latency | `SO_BUSY_POLL` reduces interrupt-to-userspace latency |
 
+**Busy-poll setup is best-effort and now says so (#5190).** After each AF_XDP
+bind the worker sets `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and
+`SO_BUSY_POLL_BUDGET`. Any of the three can legitimately be refused on a
+production box — `SO_PREFER_BUSY_POLL` requires `CAP_NET_ADMIN`,
+`SO_BUSY_POLL_BUDGET` requires it above the sysctl default, and all three are
+absent on old kernels — so a refusal is deliberately NOT fatal to the bind. It
+does, however, mean the worker runs on the kernel's default NAPI/poll semantics
+rather than the configured ones, which shows up as latency, not as an error.
+All three returns used to be discarded (`let _ =`) and the bind logged an
+unqualified "OK". `set_busy_poll_opts` now returns a `BusyPollSetup` report and
+`bind.rs` emits a `WARNING ... busy-poll DEGRADED` line beside the OK line
+naming each refused option and its errno. If a node is inexplicably latency-slow
+after a kernel or capability change, grep the journal for that line first.
+
 ### Throughput Profile (23 Gbps, 12 streams)
 
 | Component | CPU% | Notes |
