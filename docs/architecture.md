@@ -159,7 +159,20 @@ editing cmdtree.
   peer observability/role control with `Unauthenticated` once the guard
   armed. This closes the gap where any host on the shared control segment
   could invoke the allowlisted
-  read/monitor/`ClearSessions`/cross-node-failover RPCs with no credential. Dual-accept (mirroring the heartbeat, `fabricAuthDecision`):
+  read/monitor/`ClearSessions`/cross-node-failover RPCs with no credential.
+  **Wall-clock skew past the accept band is DIAGNOSED, not tolerated
+  (#6708).** Because the token is time-windowed, more than ~60–90 s of skew
+  makes every cross-node fabric RPC fail `Unauthenticated` — permanently,
+  since skew does not self-correct without NTP — while VRRP, forwarding and
+  failover keep working, so the cluster looks healthy and every cross-node
+  query returns LOCAL-ONLY. The accept band is deliberately NOT widened (it
+  is the replay horizon for `ClearSessions` and cross-node failover). Instead
+  a bounded, throttled scan on the reject path measures the offset from a
+  token that verifies under an accepted key at another window — an
+  authenticated measurement, since only a key holder can produce one — so the
+  rejection names the clock and the remedy, and `show chassis cluster status`
+  carries the skew. A forged token or a genuine PSK mismatch reports no skew,
+  so an authentication fault is never mislabelled as a clock fault. Dual-accept (mirroring the heartbeat, `fabricAuthDecision`):
   a node with no key configured accepts everything; once enforcement is
   armed the peer must keep signing (a tokenless call is then a downgrade
   attack and is rejected `Unauthenticated`); a tokenless call before
