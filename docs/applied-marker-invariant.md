@@ -51,6 +51,13 @@ grep -rnE '^\s*[A-Za-z_][A-Za-z0-9_.]*\.(last|prev|Last|Prev)?([Aa]pplied|[Pp]ub
 in the issue counts *bug instances*, not the sites a rule must adjudicate — the
 false-positive denominator was never measured.
 
+> **Reusable lesson.** An issue proposing a lint must state its **inspection
+> population** — the sites the rule will adjudicate — not its **defect
+> population** — the bugs that motivated it. Only the first bounds the
+> false-positive rate, and only the first tells you whether the rule is
+> affordable. Here the two differ by 43 to 16, and they are not even the same
+> *kind* of thing: not one of the 16 is a member of the 43.
+
 The majority of the 43 are structurally not "stamp a marker before a fallible
 action":
 
@@ -78,7 +85,17 @@ issue names:
 The reason is systematic, not luck. **The applied/published/converged vocabulary
 is the remedy — each fix introduced it.** The defect's signature is the *absence*
 of the concept. A rule keyed to the fix's vocabulary is structurally blind to the
-pre-fix code: it tests the repair, not the property.
+pre-fix code.
+
+> **This is "a probe keyed to the FIX tests the repair, not the property" in
+> lint form**, and it generalises past this issue to every proposal of the shape
+> *"lint for the pattern our fixes introduced."* That shape is self-defeating by
+> construction: the pattern our fixes introduced is, by definition, absent from
+> the code the fixes were needed for. The vocabulary a fix adds marks where
+> someone already understood the problem — which is precisely where the bug is
+> not. Before proposing such a rule, take two or three of the real pre-fix
+> commits and check the rule reds on them. If it cannot, the rule is measuring
+> the remedy's spelling.
 
 ## Measurement 3 — the rule false-positives the mechanisms held up as correct
 
