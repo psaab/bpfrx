@@ -3679,3 +3679,139 @@ fn flood_fold_guard_does_not_accept_the_sibling_fold_6938() {
          nothing, ever"
     );
 }
+
+
+/// #5189 (A1-b8-F5): the ~1 s report tick must not build its diagnostics
+/// string in a RELEASE build.
+///
+/// STRUCTURAL, and for the same reason the #6938 fold pin above is: `worker_loop`
+/// takes five heavyweight parameters and is spawned only from
+/// `coordinator/reconcile/bringup.rs` against real AF_XDP sockets, so no test can
+/// drive it. And the property is itself syntactic — "this work is compiled out
+/// unless the feature is on" — with no black-box observation available: the
+/// summary is a `String` nobody reads and two `getsockopt`s whose results are
+/// discarded, so a release build behaves identically apart from cost.
+///
+/// What went wrong: #1776 moved the report tick's `eprintln!` into the
+/// `#[cfg(feature = "debug-log")]` module `debug_report`, but deliberately left
+/// the `binding_summary` BUILD inline in `mod.rs`, ungated. Release builds
+/// therefore paid, per worker per second: a heap `String` plus every `write!`
+/// that grows it, one `statistics_v2()` (`XDP_STATISTICS` `getsockopt`) per
+/// binding, and one `SO_ERROR` `getsockopt` per binding — for a value whose only
+/// consumer (`emit_periodic_report`) was compiled out.
+///
+/// The binder pins the exact post-fix shape: the build is a call into the gated
+/// module, and the call itself carries the cfg attribute. Reverting the block
+/// inline drops the call line → RED. Dropping the cfg attribute → RED (and, as a
+/// second line of defence, a hard compile error in the default build, because
+/// `debug_report` does not exist without the feature).
+#[test]
+fn report_tick_summary_is_not_built_in_release_5189() {
+    let src = include_str!("../afxdp/worker/loop_body/mod.rs");
+    assert!(
+        report_tick_summary_build_is_gated(src),
+        "the ~1s report tick's `binding_summary` build is no longer a cfg-gated \
+         call into `debug_report`. Release builds are back to allocating a \
+         String and issuing a statistics_v2 + SO_ERROR getsockopt per binding \
+         per second for a value nothing reads (#5189 A1-b8-F5)"
+    );
+
+    // The syscalls must have MOVED into the gated module, not been deleted:
+    // under `--features debug-log` the summary still has to carry them.
+    let gated = include_str!("../afxdp/worker/loop_body/debug_report.rs");
+    assert!(
+        gated.contains("pub(super) fn build_binding_summary("),
+        "debug_report.rs no longer owns the binding-summary build"
+    );
+    for needle in ["statistics_v2()", "libc::SO_ERROR", "FRAME_LEAK"] {
+        assert!(
+            gated.contains(needle),
+            "`{needle}` vanished from the gated summary build — the release-build \
+             cost was removed by DELETING the diagnostic rather than by gating \
+             it, so `--features debug-log` lost coverage it used to have"
+        );
+    }
+}
+
+/// The binder's matching logic, factored out so the control below can run it
+/// against a synthetic pre-fix body without re-implementing it (a re-implemented
+/// matcher is a second binder, not a control).
+///
+/// True iff the file binds `binding_summary` exactly once, from a call into the
+/// gated `debug_report` module, on a line whose immediately preceding
+/// non-blank line is the `debug-log` cfg attribute.
+fn report_tick_summary_build_is_gated(src: &str) -> bool {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut bindings = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with("let ") && l.contains("binding_summary"));
+    let Some((idx, line)) = bindings.next() else {
+        return false;
+    };
+    if bindings.next().is_some() {
+        return false;
+    }
+    if !line.contains("debug_report::build_binding_summary(") {
+        return false;
+    }
+    lines[..idx]
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|prev| prev.trim() == r#"#[cfg(feature = "debug-log")]"#)
+}
+
+/// OVER-REACH / VACUITY CONTROL for `report_tick_summary_is_not_built_in_release_5189`.
+///
+/// Its own test body deliberately: a control sharing a body with its binder
+/// never runs once the binder fails, so it would be silent in exactly the
+/// situation it exists to describe.
+///
+/// It runs the binder's OWN matcher against the pre-fix source shape — the
+/// ungated `let mut binding_summary = String::new();` #1776 left inline — and
+/// requires it to REJECT. Without this, a matcher that returned `true` for
+/// everything (or that searched for a needle present in both shapes) would keep
+/// the binder green with the defect fully restored. The converse case pins that
+/// the matcher is not simply always-false.
+#[test]
+fn report_tick_summary_guard_rejects_the_pre_fix_shape_5189() {
+    const PRE_FIX: &str = r#"
+                #[cfg(feature = "debug-log")]
+                let session_count = sessions.len();
+                let mut binding_summary = String::new();
+                for (i, b) in bindings.iter().enumerate() {
+                    let xsk_stats = b.xsk.device.statistics_v2().ok();
+                }
+"#;
+    assert!(
+        !report_tick_summary_build_is_gated(PRE_FIX),
+        "the guard accepts the PRE-FIX shape — an ungated `String::new()` build \
+         sitting under an unrelated cfg-gated `let session_count` line. It would \
+         stay green with the release-build cost fully restored (#5189 A1-b8-F5)"
+    );
+
+    // A cfg attribute on the WRONG statement must not launder the build either:
+    // the attribute has to sit on the binding_summary line itself.
+    const CFG_ON_NEIGHBOUR: &str = r#"
+                #[cfg(feature = "debug-log")]
+                let session_count = sessions.len();
+                let binding_summary = debug_report::build_binding_summary(&bindings, &mut dbg);
+"#;
+    assert!(
+        !report_tick_summary_build_is_gated(CFG_ON_NEIGHBOUR),
+        "the guard accepts a build whose cfg attribute is attached to the \
+         PRECEDING statement, which does not gate the build at all"
+    );
+
+    // Converse, so the control cannot pass by rejecting everything.
+    const POST_FIX: &str = r#"
+                #[cfg(feature = "debug-log")]
+                let binding_summary = debug_report::build_binding_summary(&bindings, &mut dbg);
+"#;
+    assert!(
+        report_tick_summary_build_is_gated(POST_FIX),
+        "the guard rejects even the shape the fix installs — it matches nothing, \
+         ever, and would pin no property"
+    );
+}

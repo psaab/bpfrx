@@ -30,10 +30,43 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
     // on that same external interface, so gate on THIS packet's ingress zone
     // (the inbound-direction zone per the #5176 invariant). A wildcard rule
     // (empty `from_zone`) still matches regardless.
+    //
+    // #6227 item 6: resolve the LOGICAL (parent, vlan) -> unit ifindex before
+    // the zone lookup, per the same-SSOT rule in `afxdp/README.md` ("every
+    // per-ingress map keyed by the logical unit ifindex must resolve through
+    // `resolve_ingress_logical_ifindex` — not pass the raw
+    // `meta.ingress_ifindex`"). `ifindex_to_zone_id` is keyed by the logical
+    // unit (`forwarding_build/interfaces.rs`); the physical parent ifindex
+    // only ever inherits its FIRST sub-interface's zone, so on a VLAN trunk
+    // carrying multiple units in distinct zones this reverse lookup evaluated
+    // the wrong zone for every unit but the first. `unwrap_or` falls back to
+    // the physical ifindex, a no-op on a non-VLAN port (logical == physical).
+    // Mirrors the #3021/#3022/#3026 sibling sites (forwarding zone-pair,
+    // screen/SYN-cookie, generated ICMP) and `reject_reply.rs`'s identical
+    // fallback shape.
+    //
+    // Scope note: this affects ONLY the ICMP-embedded-error REVERSE lookup in
+    // this file. It does NOT affect policy/screen zone resolution on the
+    // forward transit path (those sites already resolve the logical ifindex
+    // via the same `resolve_ingress_logical_ifindex` SSOT, per #3021/#3022/
+    // #3026) and does not gate any policy/permit decision — the consequence
+    // of the pre-fix bug was that an ICMP error (e.g. Packet-Too-Big) arriving
+    // on a VLAN trunk unit other than the trunk's first-configured unit was
+    // attributed to that FIRST unit's zone instead of its own, so a
+    // zone-scoped NPTv6 rule for its real zone never matched, the embedded
+    // source stayed untranslated, and (absent an unrelated forward-NAT session
+    // alias) the reverse lookup failed outright — PMTUD black-holing for that
+    // flow rather than a security/policy-bypass effect.
+    let logical_ingress_ifindex = resolve_ingress_logical_ifindex(
+        ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
     let ingress_zone = ctx
         .forwarding
         .ifindex_to_zone_id
-        .get(&(meta.ingress_ifindex as i32))
+        .get(&logical_ingress_ifindex)
         .and_then(|id| ctx.forwarding.zone_id_to_name.get(id))
         .map(|s| s.as_str())
         .unwrap_or("");

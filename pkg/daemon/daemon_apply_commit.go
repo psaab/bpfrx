@@ -267,7 +267,10 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	// and still syncs to the peer, but the operator sees the failure and can
 	// re-commit). Matches how applyErr's non-fatal best-effort subsystem errors
 	// are surfaced here rather than aborting the commit.
-	clearErr := d.clearSessionsForPolicyChanges(oldActive, compiled)
+	// #5858: one entry point for both halves — the policy clear that revokes,
+	// and the input-filter advisory for the tightening that cannot be revoked
+	// today. Bound together so a commit path cannot wire one without the other.
+	clearErr := d.reportSessionAuthorizationChanges(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
@@ -455,7 +458,10 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		// policy deletion/tightening that could not fully drop this node's synced
 		// sessions is not silently swallowed. A non-fatal partial clear does not
 		// abort the (already-promoted) sync — it is joined into the return only.
-		clearErr := d.clearSessionsForPolicyChanges(oldActive, compiled)
+		// #5858: one entry point for both halves — the policy clear that revokes,
+		// and the input-filter advisory for the tightening that cannot be revoked
+		// today. Bound together so a commit path cannot wire one without the other.
+		clearErr := d.reportSessionAuthorizationChanges(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -711,7 +717,7 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	// being lost. The helper now RETURNS the error so the two returning call
 	// sites (commit + peer-sync) join it into their result; here the log is the
 	// only available surface.
-	if err := d.clearSessionsForPolicyChanges(oldActive, prevCfg); err != nil {
+	if err := d.reportSessionAuthorizationChanges(oldActive, prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback: policy session invalidation was PARTIAL; "+
 			"some rolled-back-policy sessions may keep forwarding under stale authorization", "err", err)
 	}

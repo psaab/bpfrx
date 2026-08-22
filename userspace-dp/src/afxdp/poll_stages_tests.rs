@@ -2080,6 +2080,21 @@ fn run_stage_screen(
     meta: UserspaceDpMeta,
     flow: Option<&SessionFlow>,
 ) -> (bool, u64) {
+    let (dropped, drops, _events) = run_stage_screen_capture(screen, frame, meta, flow);
+    (dropped, drops)
+}
+
+/// #5190: same live drive as `run_stage_screen`, but also DRAINS the
+/// worker event stream so a test can assert on the emitted screen-drop
+/// event frame (not just the counter). Needed to bind the
+/// `screen_parse_error_info_flowless` call site inside the real
+/// `stage_screen_check`, not just the constructor in isolation.
+fn run_stage_screen_capture(
+    screen: &mut ScreenState,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: Option<&SessionFlow>,
+) -> (bool, u64, Vec<crate::event_stream::codec::DataplaneEventPayload>) {
     let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
     let ident = BindingIdentity {
         slot: 0,
@@ -2103,7 +2118,7 @@ fn run_stage_screen(
     let peer_worker_commands = Vec::new();
     let dnat_fds = DnatTableFds::default();
     let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
-    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
         8,
         DataplaneEventRateLimitConfig {
             events_per_second: 0,
@@ -2145,9 +2160,18 @@ fn run_stage_screen(
         &mut counters,
         &worker_ctx,
     );
+    let events: Vec<crate::event_stream::codec::DataplaneEventPayload> = std::iter::from_fn(|| {
+        event_rx
+            .try_recv()
+            .ok()
+            .map(|frame| frame.decode_dataplane_event())
+    })
+    .flatten()
+    .collect();
     (
         matches!(outcome, StageOutcome::RecycleAndContinue),
         counters.screen_drops,
+        events,
     )
 }
 
@@ -2191,6 +2215,70 @@ fn flowless_ping_of_death_fragment_dropped_3064() {
         dropped && drops == 1,
         "ping-of-death non-first fragment (offset*8 + total > 65535) \
          must be DROPPED by the flowless screen path (#3064)"
+    );
+}
+
+/// #5190 (A1-b1-F5) fail-on-revert: the fail-closed screen drop emitted
+/// from the FLOWLESS branch of the live `stage_screen_check` must carry
+/// the authoritative `meta.protocol` and the real L3 addresses, not the
+/// hard-coded `protocol: 0` + UNSPECIFIED placeholder that
+/// `screen_parse_error_info_flowless` used to mint from `addr_family`
+/// alone.
+///
+/// Fixture: a NON-FIRST IPv4 fragment (offset 10 units -> flowless per
+/// #2344) whose IHL claims a 60-byte header while only the fixed 20
+/// bytes plus 4 payload bytes were captured. `extract_screen_info`
+/// therefore fails CLOSED (`TruncatedIpv4Header` -> reason
+/// `ip-malformed`, #4167), while the 20 fixed bytes ARE present so
+/// `flowless_l3_addrs` reads the REAL source/destination — which is
+/// exactly what makes the pre-#5190 placeholder observable.
+///
+/// Reverting the constructor to `protocol: 0` / the UNSPECIFIED
+/// addresses, or reverting the call site to stop threading `meta` and
+/// the derived addresses, turns the protocol and address assertions RED.
+#[test]
+fn flowless_parse_error_drop_event_carries_meta_protocol_and_addrs_5190() {
+    let mut frame = ipv4_fragment_frame(0x000A, FRAG_PROTO_UDP, 4);
+    // IHL = 15 (60-byte header) but only 24 bytes captured past l3 ->
+    // l3_offset + ihl*4 > frame.len() -> #4167 fail-closed parse error.
+    frame[14] = 0x4F;
+    let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+    assert!(
+        parse_session_flow_from_bytes(&frame, meta).is_none(),
+        "a non-first fragment must be flowless (#2344) so the live screen \
+         stage takes the #3064 flowless branch"
+    );
+    let mut screen = fragment_screen();
+    let (dropped, drops, events) = run_stage_screen_capture(&mut screen, &frame, meta, None);
+    assert!(
+        dropped && drops == 1,
+        "an IPv4 header whose IHL runs past the captured frame must be \
+         DROPPED fail-closed (#4167) on the flowless path"
+    );
+    let event = events
+        .iter()
+        .find(|e| e.kind == DataplaneEventKind::ScreenDrop)
+        .expect("fail-closed flowless screen drop must emit a ScreenDrop event");
+    assert_eq!(
+        event.protocol, FRAG_PROTO_UDP,
+        "#5190: the flowless malformed-packet screen drop must report the \
+         authoritative meta.protocol, not the hard-coded 0"
+    );
+    assert_eq!(
+        event.addr_family,
+        libc::AF_INET as u8,
+        "#5190: address family must survive to the event"
+    );
+    assert_eq!(
+        event.src_ip,
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        "#5190: the flowless screen drop must report the REAL source read \
+         from the IP header, not the UNSPECIFIED placeholder"
+    );
+    assert_eq!(
+        event.dst_ip,
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        "#5190: the flowless screen drop must report the REAL destination"
     );
 }
 

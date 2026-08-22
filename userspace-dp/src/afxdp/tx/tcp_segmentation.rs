@@ -157,6 +157,7 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
     let mut total_bytes = 0u64;
     let mut max_frame = 0u32;
     let mut data_offset = 0usize;
+    let mut segment_index = 0u16;
     while data_offset < data.len() {
         let chunk_len = (data.len() - data_offset).min(segment_payload_max);
         let is_last = data_offset + chunk_len == data.len();
@@ -205,12 +206,17 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
                     .get_mut(ip_header_len + tcp_header_len..total_ip_len)?
                     .copy_from_slice(data.get(data_offset..data_offset + chunk_len)?);
 
-                let tcp = packet.get_mut(tcp_offset..)?;
-                let seq = original_seq.wrapping_add(data_offset as u32);
-                tcp.get_mut(4..8)?.copy_from_slice(&seq.to_be_bytes());
-                if !is_last {
-                    tcp[13] &= !TCP_FLAG_PSH;
-                }
+                // #5191: seq / PSH / CWR / URG+urgent-pointer / IPv4 ID,
+                // shared with the frame/tcp_segmentation.rs copy-path twin.
+                finalize_tcp_segment_headers(
+                    packet,
+                    meta.addr_family,
+                    tcp_offset,
+                    original_seq,
+                    data_offset,
+                    segment_index,
+                    is_last,
+                )?;
             }
 
             match meta.addr_family as i32 {
@@ -325,6 +331,7 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
         total_bytes += frame_len as u64;
         max_frame = max_frame.max(frame_len as u32);
         data_offset += chunk_len;
+        segment_index = segment_index.saturating_add(1);
     }
 
     for req in prepared {
