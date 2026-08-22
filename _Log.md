@@ -100886,6 +100886,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
 
+## 2026-08-21 — #6519: zone-level DHCP/BOOTP host-inbound parity advisory
+- **Timestamp**: 2026-08-21
+- **Action**: Junos accepts `dhcp`/`bootp` host-inbound only per INTERFACE ("All
+  services (except DHCP and BOOTP) can be configured either per zone or per
+  interface"). xpf accepts them at the zone level, where they authorize every
+  member interface. Added `validateHostInboundZoneLevelDHCPWarnings`, a
+  commit-time WARN naming the token (including the `all` case, since `all`
+  expands to a union containing dhcp/bootp) and the member interfaces the
+  zone-level authorization reaches, skipping lifelines and any interface that
+  authorized the service through its own stanza. Added
+  `ZoneConfig.InterfaceHostInboundOverride` as the interface-level half of the
+  effective-set resolution, bound to `InterfaceHostInboundEffective` by test.
+  Enforcement is NOT changed: the flip has a real population (the shipped
+  cluster configs) and would cost a zoned DHCP-client interface its address.
+- **File(s)**: pkg/config/host_inbound_dhcp_scope_6519.go (new),
+  pkg/config/host_inbound_dhcp_scope_6519_test.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/testdata/golden_4406.json (regenerated — 12 added warning lines,
+  one per case cell, no config-shape change),
+  docs/host-inbound-service-matrix.md
 ## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
 - **Timestamp**: 2026-08-21
 - **Action**: `terminateRemovedConns` was fire-and-forget while
