@@ -129,6 +129,11 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
                 // address. `None` (old peer / unknown zone) keeps the
                 // pre-#6211 first-pool-match.
                 synced_source_nat_zone_pair(forwarding, &metadata),
+                // #6528: the stale-tuple eviction inside `reserve_flow` retires
+                // the incumbent with release semantics; a persistent lease that
+                // falls to zero active flows re-arms its idle expiry off this
+                // clock.
+                now_ns,
                 // #6211 F2: record this worker as a HOLDER. Every worker
                 // reserves the same `(flow, translated)` against ONE shared
                 // allocator; without the holder bit the first worker to reap or
@@ -148,6 +153,8 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
                 &key,
                 entry.decision.nat,
                 metadata.is_reverse,
+                // #6528: same clock, same reason as the source-NAT reserve.
+                now_ns,
                 worker_id,
             );
         }
