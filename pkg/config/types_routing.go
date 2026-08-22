@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
@@ -589,6 +590,26 @@ type WgPeerConfig struct {
 	Endpoint        string   // optional peer endpoint IP:port (initiator role)
 	KeepaliveSecs   uint16   // optional persistent-keepalive seconds (0 = off)
 	PresharedKeyHex Secret   // optional per-peer PSK (hex, 64 chars); "" = zero PSK (#1434 B2); redacted on marshal
+}
+
+// MarshalJSON redacts a credential embedded in a WireGuard peer ENDPOINT
+// (#6733).
+//
+// A peer endpoint is a host:port, which RedactURL returns unchanged (measured,
+// including bare IPv4/IPv6 literals), so this is defence in depth rather than a
+// live leak: it costs nothing for every real configuration and removes the need
+// to assert, in a census row nobody re-checks, that this field can never hold a
+// credential. The #6733 census fails on any URL-shaped field that renders a
+// planted credential verbatim, and an empty census is a stronger end state than
+// a justified one.
+//
+// The alias type sheds this method to avoid recursion while preserving every
+// field, so a field added to WgPeerConfig later is still marshalled.
+func (w WgPeerConfig) MarshalJSON() ([]byte, error) {
+	type alias WgPeerConfig
+	v := alias(w)
+	v.Endpoint = RedactURL(v.Endpoint)
+	return json.Marshal(v)
 }
 
 // String redacts WgLocalPrivkeyHex AND every per-peer PresharedKeyHex so
