@@ -379,6 +379,58 @@
   pkg/cli/show_services_ddns.go, pkg/cli/cli_residual_escape_6468_test.go,
   _Log.md
 
+## 2026-08-21 — #5189 A1-b8-F5 + A1-b10-F4: two ungated warmed-path costs
+
+- **Timestamp**: 2026-08-21 (fix/5189-cohort)
+- **Action**: Gated the worker report tick's diagnostics build behind
+  `debug-log`, and made the event-stream idle keepalive obey
+  `WRITE_BACKLOG_MAX_BYTES`. Swept all six items of the #5189 cohort
+  firsthand first; all six are LIVE, four are deferred to a successor
+  issue because they need design decisions.
+
+  **A1-b8-F5.** #1776 moved the ~1 s report tick's `eprintln!` into the
+  `#[cfg(feature = "debug-log")]` module `debug_report` but deliberately
+  left the `binding_summary` BUILD inline and ungated — its own module
+  header documented that partition. So a release build paid, per worker
+  per second: a heap `String` plus every `write!` that grows it, one
+  `statistics_v2()` (`XDP_STATISTICS` `getsockopt`) per binding, and one
+  `getsockopt(SO_ERROR)` per binding, for a value whose only consumer was
+  compiled out. The build is now `debug_report::build_binding_summary`,
+  called from a `#[cfg(feature = "debug-log")]` binding — so the module
+  gate makes it a COMPILE-TIME guarantee, not a runtime branch. The
+  report tick's always-on half is untouched: the `BindingLiveState`
+  publish loop still stores the ring-pressure counters, its own
+  `rx_fill_ring_empty_descs` sample, `outstanding_tx` and
+  `umem_inflight_frames` as fixed scalar atomics (#802/#878) — those are
+  what operators actually read.
+
+  **A1-b10-F4.** #2883 routed the idle keepalive through `write_buf` so a
+  `WouldBlock` is backpressure rather than a fatal reconnect. That made
+  the keepalive a PRODUCER into the backlog, and it was the only producer
+  that did not check `WRITE_BACKLOG_MAX_BYTES` — the cap lived solely in
+  `drain_channel_into_write_buf`. The two conditions compose: a
+  live-but-non-reading consumer stalls the drain AT the cap, which keeps
+  `drained_any == false` forever, which is exactly what arms the idle
+  keepalive; and the socket write returns `WouldBlock` forever, so
+  `advance` never reclaims. The backlog grew by one frame header per
+  keepalive interval, monotonically and without bound. The RATE is slow
+  (8 B / 10 s), so this was never a near-term OOM — but it is unbounded,
+  and it falsified the README's stated `cap + one max EventFrame` ceiling
+  and its bolded "a stuck consumer degrades telemetry, nothing else"
+  invariant. `append_idle_keepalive_if_due` now declines while
+  `pending_len() >= WRITE_BACKLOG_MAX_BYTES`, and deliberately does NOT
+  re-arm `last_write` when it declines, so the keepalive fires on the
+  first cycle after the backlog drains rather than waiting out another
+  interval.
+
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/debug_report.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`,
+  `userspace-dp/src/event_stream/connection.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `userspace-dp/src/event_stream/tests/backpressure.rs`,
+  `userspace-dp/src/server/tests.rs`
+
 ## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
 
 - **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
@@ -98863,6 +98915,9 @@ prose edit above them added. No diff falls in the new test body.
   only the rule NAME (#4316, accepted-but-inert) and `system syslog file <f>
   archive` is a recognized-but-uncompiled modifier (#4303 S-1), so their
   `code-points` / `archive-sites` leaves are unread in EVERY spelling.
+- **Timestamp**: 2026-08-21
+- **Action**: Verified all 8 items of audit cohort #6227 (claude-spark-review-002)
+  against current master and fixed the three confirmed LIVE + TRIVIAL survivors.
 
   #6714's three arms were all live at HEAD and are fixed here, plus the fourth
   site compiler_routing.go carried as a named #6714 blind spot.
@@ -99035,3 +99090,273 @@ prose edit above them added. No diff falls in the new test body.
   Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no cluster
   smoke is owed.
 - **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
+
+## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
+
+- **Timestamp**: 2026-08-21
+- **Action**: Add the #5618 commit-time advisory that a WireGuard tunnel's
+  decapsulated plaintext is NOT evaluated against xpf security policies, and
+  record BOTH tunnel-plaintext adjudication gaps (#5618 WireGuard, #5619
+  IPsec) in `docs/userspace-dataplane-gaps.md`.
+
+  Reason: the XDP shim steers inbound WireGuard transport to the kernel
+  (#5582) and the helper's WG control thread writes the decrypted inner
+  packet straight to the `wgN` TUN
+  (`slowpath::write_packet_nonblocking`, wg_control/dispatch.rs), where
+  Linux routing forwards it — no zone policy, no session, no NAT, no
+  screen. `set security zones security-zone vpn interfaces wg0.0` commits
+  cleanly and READS as enforced. `allowed-ips` is a cryptographic
+  inner-source ownership gate, not a policy.
+
+  Implementation: `warnWireGuardPlaintextUnadjudicatedAST` is an AST
+  pre-walk run from compileExpanded (group-expanded, inactive-pruned), so
+  it fires on strict commit, lenient restart/peer-sync, and both HA node
+  views. It CANNOT reject — no error return, no `lenient` flag — so the
+  #1960 no-brick property is structural. ONE aggregated advisory per
+  commit, split into a ZONED (escalated) group and an unzoned group, with
+  the #6682 "unzoning is not a mitigation" caveat emitted only when an
+  unzoned tunnel exists. Keyed on the tunnel MODE
+  (`astTunnelModeWireguard`, the compiler's own extraction), never on the
+  `wg` name shape; GRE is deliberately NOT warned about because gre.rs
+  decaps inside the worker pipeline and rebinds ingress_ifindex/zone.
+  Coupling to the dataplane exclusion measured firsthand: rows wg0.0, wg1
+  and wg1.0 all report exclusion class "Tunnel" and
+  userspaceSkipsIngressInterface=true.
+
+  Shared with the #5619 IPsec advisory in
+  `compiler_tunnel_plaintext_advisory.go`, on one rule — share where a
+  divergence would ALWAYS be a bug: `forEachZoneInterfaceMemberAST`
+  (zone-membership enumeration through the compiler's own flattener, so
+  the #2419/#5248 bracket collapse cannot be re-derived differently by two
+  readers) and `renderPlaintextUnadjudicatedAdvisory` (one advisory per
+  commit, stable total sort, zoned/unzoned partition, group headings,
+  #6682 caveat). The finding walk and every protocol-specific sentence
+  stay separate. The IPsec advisory's rendered text is byte-identical.
+
+  Validation: `go build ./...` exit 0; `go vet ./pkg/config/...` exit 0;
+  `go test -count=1 ./pkg/config/...` exit 0 (39.7s), plus
+  `./pkg/configstore/... ./pkg/dataplane/... ./pkg/policymatch/...
+  ./pkg/cli/...` exit 0. Mutation matrix, one mutation per cell, exit
+  codes read from `$?` directly: (1) neutralize the advisory at its only
+  call site in compileExpanded → exit 1, "want exactly 1 #5618 advisory,
+  got 0" across every positive cell while both negative controls stayed
+  green; (2) read only the FIRST zone member in the shared walker,
+  reproducing the #2419 bracket collapse → exit 1 with "a bracketed zone
+  member lost its zone clause (1 of 2 present)" on the WG bracket test and
+  the matching #5619 assertion on the IPsec one. Restore control green.
+
+  Go-only diff: `git diff --stat origin/master` touches no `.rs` file and
+  no compiled artifact, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_tunnel_plaintext_advisory.go,
+  pkg/config/compiler_wireguard_plaintext_warn.go,
+  pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
+  pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_prewalk.go, docs/userspace-dataplane-gaps.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #5190 userspace-dp observability/telemetry cohort — swept all six
+  enumerated rows plus the cross-linked NAT comment against origin/master and
+  fixed six of seven. Verdicts: A1-b1-F5 LIVE (flowless malformed-packet screen
+  drop hard-coded `protocol: 0` / `pkt_len: 0` / UNSPECIFIED addresses while the
+  authoritative `meta` and the already-derived L3 addresses sat unused at the
+  single call site — telemetry-only, confirmed: `record_screen_drop` and
+  `record_zone_flood_drop` key on the reason STRING, so no drop-counter index,
+  rate bucket or sketch key ever saw the 0). A1-b1-F6 LIVE (`lookup_counted`
+  commits `hits += 1` before the caller's neighbor-MAC/HA validation, so a
+  REJECTED candidate published as a served hit — inflation correlated with VRRP
+  failover / NIC swap / RG transition, i.e. exactly when the hit rate is read;
+  telemetry-only, `flow_cache_hits` reaches `BindingStatus` and Prometheus, no
+  decision). A1-b1-F7 LIVE (fixed 1514 ceiling, debug-build-only counter; an
+  in-band VLAN-tagged full-MTU frame is 1518 so the loss cluster's WAN path
+  counts ordinary traffic). A1-b8-F6 LIVE (four shared-UMEM strings +
+  `martian_dropped` + `ipv6_ext_header_dropped` copied but never reset — a
+  field-set diff of the two halves confirms exactly those six and nothing else).
+  A1-b12-F2 LIVE (three `setsockopt` returns discarded, bind logs unqualified
+  OK). A1-b12-F3 LIVE-as-claims (no make target or CI job runs `cargo bench`;
+  `make test-rust` deliberately excludes benches, so nothing automated was
+  reporting a false green — the false claim lived in three bench headers plus
+  the Makefile/testing-procedures prose). Cross-linked #5727 NAT row LIVE (DNAT
+  + static-NAT `match source-address` parse failure fails closed correctly but
+  silently).
+
+  Fixes: `screen_parse_error_info_flowless` now takes `&UserspaceDpMeta` + the
+  caller's derived L3 addresses (the omission is unrepresentable, not merely
+  fixed); `FlowCache::reclassify_hit_as_miss` at the reject branch only (the
+  steady-state fast path is untouched); `rx_oversized` renamed `rx_over_1514`
+  and documented as a fixed-constant test, not an MTU test; the six missing
+  `zero_unbound_slot` resets; `set_busy_poll_opts` returns a `BusyPollSetup`
+  report and the caller emits a `busy-poll DEGRADED` warning naming each refused
+  option + errno; `record_parse_error` on both NAT source-constraint arms; the
+  three bench headers relabelled EXPLORATORY with a banner naming the two
+  benches that do gate.
+
+  NOT fixed, reported as remainder: a real threshold verdict for the three
+  benches (needs chosen numbers + a criterion-to-verdict harness — a design
+  call), and an MTU/jumbo-aware `rx_over_1514` (the per-interface MTU is not
+  available before metadata parse).
+
+  Validation: `cargo check --bins --tests` rc 0, also rc 0 with
+  `--features debug-log` (the renamed counter's only reader is behind it);
+  `cargo check --benches` rc 0; full `cargo test --release --bins --tests --
+  --test-threads=1` rc 0, 4585 passed / 0 failed. Six single-line mutations,
+  each reverted alone and restored: protocol -> 0 RED 101; call-site addresses
+  -> UNSPECIFIED RED 101; `martian_dropped` reset deleted RED 101;
+  `shared_umem_socket_role` reset deleted RED 101; `SO_BUSY_POLL` return
+  re-discarded RED 101; `reclassify_hit_as_miss` call deleted RED 101; DNAT and
+  static-NAT `record_parse_error` arms each reverted RED 101. No Go touched.
+  `cargo clippy` is RED at origin/master too (`clippy::mut_from_ref` in
+  `afxdp/umem/mmap.rs`, untouched here) — pre-existing, not a regression. The
+  helper binary MOVES, so a cluster smoke on the loss userspace cluster is OWED
+  and was NOT run by this lane.
+- **File(s)**: userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/rx_telemetry.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/worker/loop_body/debug_report.rs,
+  userspace-dp/src/afxdp/bind.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/nat/destination.rs, userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests_destination.rs,
+  userspace-dp/src/nat/tests_static.rs,
+  userspace-dp/src/event_stream/README.md,
+  userspace-dp/benches/session_table.rs,
+  userspace-dp/benches/snat_allocator.rs,
+  userspace-dp/benches/tx_kick_latency.rs, Makefile,
+  docs/testing-procedures.md, docs/userspace-dataplane-architecture.md,
+  docs/userspace-dataplane-gaps.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  **Action**: #5191 A1-b2-F7 — route the metadata ICMP-identifier restore through the
+    shared `write_icmp_identifier` writer (query-type gate + incremental checksum repair);
+    add three fail-on-revert tests; document the fourth metadata consumer in the frame README.
+  **File(s)**: userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests_nat_rewrite.rs,
+    userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-08-21
+  **Action**: #5191 A1-b2-F6 — one shared `finalize_tcp_segment_headers` for both TCP
+    segmentation twins: CWR on the first segment only, per-segment IPv4 Identification when
+    DF is clear, urgent pointer rebased to the absolute urgent octet. Four fail-on-revert
+    tests; TSO proptest expectations extended and its flag generator widened to sample
+    CWR|ACK / URG|ACK.
+  **File(s)**: userspace-dp/src/tcp_flags.rs, userspace-dp/src/afxdp/mod.rs,
+    userspace-dp/src/afxdp/frame/tcp_segmentation.rs, userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/tx/tcp_segmentation.rs,
+    userspace-dp/src/afxdp/frame/tests_segment_tcp.rs,
+    userspace-dp/src/afxdp/frame/prop_tests/segment.rs,
+    userspace-dp/src/afxdp/frame/prop_tests/strategies.rs,
+    userspace-dp/src/afxdp/frame/README.md
+
+  1. Deterministic-CGNAT silent downgrade (`nat64.rs`): `build_deterministic_v6`
+     falling back to round-robin on ANY build failure (including a `host_count`
+     `u32` overflow) for a rule that DID request deterministic mapping was
+     unobservable. Added `DETERMINISTIC_V6_DOWNGRADE_COUNT` + a paired
+     `eprintln!`, both gated on `!snap.deterministic_host_base_v6.is_empty()`
+     so the ordinary non-deterministic case stays silent. New test
+     `napt64_deterministic_v6_host_count_overflow_warns_operator` (70,000-entry
+     pool forces the u32 overflow); extended the existing
+     `napt64_deterministic_v6_unsupported_prefix_len_falls_back` with the same
+     assertion.
+  5. WireGuard handshake-session `lock().unwrap()` (`afxdp/wg/
+     handshake_session.rs`): 7 sites across `reconcile_lock`/`cookie_gen`
+     panicked the control thread on an unrelated prior panic's poison instead
+     of recovering per the established #1790/#1807/#2402 crate policy. Added
+     a generic `lock_recover<T>` + `WG_HANDSHAKE_LOCK_POISON_RECOVERIES` and
+     converted all 7 sites. New test
+     `reserve_pending_recovers_from_a_poisoned_reconcile_lock` poisons the real
+     lock from a spawned thread and asserts recovery.
+  6. NPTv6 embedded-ICMP reverse lookup (`icmp_embed/nat_match_v6.rs`): keyed
+     `ifindex_to_zone_id` on the raw physical `meta.ingress_ifindex` instead of
+     resolving the logical VLAN unit first — the 4th instance of the
+     #3021/#3022/#3026 class (filed as #7198, since the symptom — PMTUD
+     black-holing on VLAN-trunked NPTv6 flows — is independently rediscoverable
+     and deserves to outlive the cohort). Fixed via
+     `resolve_ingress_logical_ifindex`, matching the 9 already-correct sibling
+     sites. New test
+     `icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_physical_parent`
+     builds a two-zone VLAN-trunk fixture with `NatDecision::default()`
+     (no recorded rewrite) specifically to avoid the masking discovered in the
+     pre-existing sibling test `icmpv6_te_nptv6_reverse_lookup_restores_
+     internal_client`, which — confirmed firsthand via instrumented tracing —
+     resolves via `lookup_forward_nat_across_scopes`'s `reverse_translated_index`
+     alias and passes regardless of whether the zone lookup is correct, so it
+     exercised none of this bug. The new fixture's `external_client` is derived
+     from `internal_client` via a live `translate_outbound` call (not
+     hand-picked) so the RFC 6296 checksum-neutral word adjustment round-trips
+     correctly regardless of the specific prefix pair chosen.
+
+  Items verified and left unchanged: #2 (NPTv6 zone-only scoping) confirmed
+  DISPOSITIONED — terminal fail-closed reject, PR #7192/#6043 plan-kill; #3
+  (static-NAT block `external_ips()` base-only) confirmed LIVE but sized
+  BOUNDED/LARGE (a real port of `destination.rs`'s bounded host-expansion +
+  exempt-host shadowing machinery), filed as a successor issue rather than
+  fixed inline; #4 (NAT64 pool CIDR ergonomics) confirmed WONTFIX-by-design
+  per the existing issue-thread ruling; #7 (event-stream budget double-
+  release) traced every acquire/release call site and found the accounting
+  provably balanced (one `try_acquire`, two disjoint release paths), backed
+  by an existing production underflow tripwire
+  (`DATAPLANE_EVENT_BUDGET_UNDERFLOWS`) and PR #4608's independent prior
+  investigation of the same defect class — not live, no change; #8
+  (host-inbound cold-boot zone-0 admit) confirmed REFUTED — `classify_metadata`
+  (`forwarding/fib.rs`) dispositions every packet `NoSnapshot` while
+  `!validation.snapshot_installed`, and the host-inbound admit path is
+  reachable only from inside the `PacketDisposition::Valid` branch, so the
+  early-boot window the issue worried about is unreachable; tracked
+  independently as #6873 (deliberately outside this cohort).
+
+  Docs updated per the module-documentation convention: `docs/deterministic-
+  nat-cgnat.md` (names the new counter/eprintln for item 1's downgrade path),
+  `userspace-dp/src/afxdp/README.md` (a new "WireGuard handshake-session
+  poison policy (#6227 item 5)" section mirroring the existing worker-queue /
+  shared-session poison-policy sections, and a new 10th enumerated site under
+  the existing "Same SSOT for zone / screen / generated-ICMP keying" list for
+  item 6).
+
+  Validation: `cargo check` and `cargo check --tests` clean (exit 0).
+  `cargo test -- --test-threads=1` full-crate run (parallel deadlocks this
+  crate). Mutation-proved each of the three fixes on a confirmed-COMPILING
+  tree (an earlier round's item-6 mutation attempt was invalidated by a test-
+  fixture bug of my own making — a hand-picked external/internal address pair
+  that did not actually round-trip through NPTv6's checksum-neutral
+  adjustment — caught and fixed by deriving the external address from
+  `translate_outbound` instead of hand-picking both values; all three mutation
+  reds below were re-captured afterward against a clean `cargo check --tests`
+  exit-0 tree):
+    - Item 1: `if false && deterministic_v6.is_none() && ...` (one line) ->
+      both `napt64_deterministic_v6_host_count_overflow_warns_operator` and
+      `napt64_deterministic_v6_unsupported_prefix_len_falls_back` FAILED
+      (assert_eq panics at nat64_tests.rs:241 and :201); 1 unrelated test in
+      the same filter still passed. Restored -> exit 0.
+    - Item 5: reverted exactly ONE of the seven `lock_recover` call sites
+      (`try_reserve_pending_for_test`, handshake_session.rs:266) back to
+      `.lock().unwrap()` -> `reserve_pending_recovers_from_a_poisoned_
+      reconcile_lock` FAILED (panicked at handshake_session.rs:266:49); the
+      other 193 `afxdp::wg::` tests (exercising the other six sites) stayed
+      GREEN, localizing the mutation to the one reverted call site. Restored
+      -> exit 0.
+    - Item 6: reverted the `.get(&logical_ingress_ifindex)` line back to
+      `.get(&(meta.ingress_ifindex as i32))` -> the new
+      `icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_
+      physical_parent` FAILED (`.expect(...)` panic at
+      tests_icmp_reject_reversal.rs:1540), while the pre-existing sibling
+      `icmpv6_te_nptv6_reverse_lookup_restores_internal_client` stayed GREEN —
+      the vacuous-coverage proof: the sibling cannot see this class of bug.
+      Restored -> exit 0.
+
+  Rust dataplane change: moves the userspace-dp helper binary and OWES a
+  cluster smoke test on the shared loss userspace cluster. NOT run here — the
+  cluster is lock-held by a concurrent batch smoke gate; this PR states the
+  obligation and stops.
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/wg/handshake_session.rs,
+  userspace-dp/src/afxdp/wg/tests.rs,
+  userspace-dp/src/afxdp/icmp_embed/nat_match_v6.rs,
+  userspace-dp/src/afxdp/tests_icmp_reject_reversal.rs,
+  docs/deterministic-nat-cgnat.md, userspace-dp/src/afxdp/README.md, _Log.md

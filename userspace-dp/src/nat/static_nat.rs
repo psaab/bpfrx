@@ -28,7 +28,14 @@ impl SourceConstraint {
     /// prefix or a bare host IP (-> /32 / /128). `IpNet::from_str` rejects a
     /// bare IP, so fall back to `IpAddr` for that. An unparseable entry is
     /// skipped but still leaves `constrained = true` (fail-closed semantics).
-    fn from_list(list: &[String]) -> Self {
+    ///
+    /// #5190: the skip is no longer SILENT. Fail-closed is correct — a
+    /// scoped rule whose only entry is malformed must match nothing — but
+    /// with no telemetry an operator sees a static-NAT rule that simply
+    /// stopped matching and has nothing to look at. `nat_counters` +
+    /// `rule_name` exist solely to name the offending rule in that
+    /// diagnostic; they do not affect the parsed result.
+    fn from_list(list: &[String], nat_counters: &NatCounterStore, rule_name: &str) -> Self {
         let constrained = !list.is_empty();
         let mut v4: Vec<PrefixV4> = Vec::new();
         let mut v6: Vec<PrefixV6> = Vec::new();
@@ -47,7 +54,10 @@ impl SourceConstraint {
                             v6.push(PrefixV6::from_net(net));
                         }
                     }
-                    Err(_) => {}
+                    Err(_) => nat_counters.record_parse_error(&format!(
+                        "static-NAT rule {rule_name:?}: unparseable match source-address \
+                         {prefix:?} (entry dropped; rule stays source-scoped and fails closed)"
+                    )),
                 },
             }
         }
@@ -436,7 +446,11 @@ impl StaticNatTable {
                     from_zone: snap.from_zone.clone(),
                     from_interface: snap.from_interface.clone(),
                     from_routing_instance: snap.from_routing_instance.clone(),
-                    source: SourceConstraint::from_list(&snap.source_addresses),
+                    source: SourceConstraint::from_list(
+                        &snap.source_addresses,
+                        nat_counters,
+                        &snap.name,
+                    ),
                     hit_counter: nat_counters.rule_counter(snap.counter_id),
                 });
                 continue;
@@ -463,7 +477,11 @@ impl StaticNatTable {
                 from_routing_instance: snap.from_routing_instance.clone(),
                 match_dst_port,
                 mapped_port,
-                source: SourceConstraint::from_list(&snap.source_addresses),
+                source: SourceConstraint::from_list(
+                    &snap.source_addresses,
+                    nat_counters,
+                    &snap.name,
+                ),
                 hit_counter: nat_counters.rule_counter(snap.counter_id),
             };
             // DNAT keyed by the external (pre-translation) destination port.

@@ -11,11 +11,18 @@
 // path risk by construction.
 //
 // The ALWAYS-ON release parts of the original report block stay
-// inline in mod.rs (Codex r2-3 partition): the per-report-tick
-// `binding_summary` diagnostics build (statistics_v2 + SO_ERROR
-// getsockopt syscalls), the per-second `BindingLiveState`
-// publish/reset loop, and the always-on `dbg_last_report_ns`
-// report-cadence timestamp.
+// inline in mod.rs (Codex r2-3 partition): the per-second
+// `BindingLiveState` publish/reset loop and the always-on
+// `dbg_last_report_ns` report-cadence timestamp.
+//
+// #5189 (A1-b8-F5) narrowed that partition: the per-report-tick
+// `binding_summary` diagnostics build (a heap String plus a
+// `statistics_v2()` and an `SO_ERROR` getsockopt per binding) was NOT
+// an always-on release part at all — nothing reads it unless
+// `emit_periodic_report` is compiled in — so it moved here as
+// `build_binding_summary`. Only the `BindingLiveState` publish loop,
+// which stores fixed scalar atomics operators actually read
+// (#802/#878), stays inline.
 //
 // PERSISTENT debug state (plan v3.1 AGY CORRECTNESS-1): the report
 // timestamp `dbg_last_report_ns` and the cross-interval stall
@@ -33,8 +40,8 @@ use super::*;
 /// 40-line manual `dbg_* = 0` reset, which was a forget-a-counter
 /// hazard). Accumulated from `DebugPollCounters` once per loop tick
 /// by [`DbgCounters::accumulate`]; `tx_tcp_rst` is additionally fed
-/// from per-binding `WorkerTelemetry` inside the binding_summary
-/// build in mod.rs.
+/// from per-binding `WorkerTelemetry` inside [`build_binding_summary`]
+/// (#5189 moved that build out of mod.rs into this module).
 ///
 /// Field order mirrors the original `dbg_*` local declaration order.
 #[derive(Default)]
@@ -82,7 +89,7 @@ pub(super) struct DbgCounters {
     pub(super) fwd_tcp_zero_window: u64,
     pub(super) rx_bytes_total: u64,
     pub(super) tx_bytes_total: u64,
-    pub(super) rx_oversized: u64,
+    pub(super) rx_over_1514: u64,
     pub(super) rx_max_frame: u32,
     pub(super) tx_max_frame: u32,
     pub(super) seg_needed_but_none: u64,
@@ -132,7 +139,7 @@ impl DbgCounters {
         self.fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
         self.rx_bytes_total += dbg_poll.rx_bytes_total;
         self.tx_bytes_total += dbg_poll.tx_bytes_total;
-        self.rx_oversized += dbg_poll.rx_oversized;
+        self.rx_over_1514 += dbg_poll.rx_over_1514;
         if dbg_poll.rx_max_frame > self.rx_max_frame {
             self.rx_max_frame = dbg_poll.rx_max_frame;
         }
@@ -163,7 +170,7 @@ pub(super) fn emit_periodic_report(
          no_route={} miss_neigh={} neg_ff={} pol_deny={} hib_deny={} ha_inact={} no_egress={} build_fail={} \
          tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
          DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
-         SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} \
+         SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over_1514={}/seg_miss={} \
          TCP_RX:fin={}/synack={}/zwin={} TCP_FWD:fin={}/rst={}/zwin={} \
          CSUM:verified={}/bad_ip={}/bad_l4={} \
          SESS_BPF:verify_ok={}/verify_fail={}/bpf_entries={} bindings:{}",
@@ -214,7 +221,7 @@ pub(super) fn emit_periodic_report(
             0
         },
         dbg.tx_max_frame,
-        dbg.rx_oversized,
+        dbg.rx_over_1514,
         dbg.seg_needed_but_none,
         dbg.rx_tcp_fin,
         dbg.rx_tcp_synack,
@@ -367,4 +374,159 @@ pub(super) fn check_and_dump_stall(
         *stall_reported = false;
     }
     *stall_prev_fwd = prev_fwd_total;
+}
+
+/// #5189 (A1-b8-F5): the per-report-tick per-binding diagnostics string.
+///
+/// #1776 moved only the `eprintln!` half of the ~1 s report tick into this
+/// `cfg(debug-log)`-only module and deliberately left this build INLINE in
+/// `mod.rs` ("the ALWAYS-ON release parts stay inline", Codex r2-3 partition)
+/// to keep that code-motion PR free of release-path risk. The consequence is
+/// that a RELEASE build — where nothing ever reads the result — still paid, per
+/// worker per second: a heap `String` plus every `write!` that grows it, one
+/// `statistics_v2()` (an `XDP_STATISTICS` `getsockopt`) per binding, and one
+/// `SO_ERROR` `getsockopt` per binding. Building the whole thing here makes the
+/// cost structural: the module is `#[cfg(feature = "debug-log")]`-gated at its
+/// `mod` declaration, so release builds compile none of it.
+///
+/// Release health does NOT come from this string: the always-on publish loop
+/// that follows the report tick in `mod.rs` stores the ring-pressure counters,
+/// its own `statistics_v2()` `rx_fill_ring_empty_descs` sample, the
+/// `outstanding_tx` gauge and the `umem_inflight_frames` gauge into
+/// `BindingLiveState` as fixed scalar atomics (#802/#878), which is what
+/// `show chassis forwarding` and the Prometheus surface read.
+///
+/// `dbg.tx_tcp_rst` is accumulated here (it is fed from per-binding
+/// `WorkerTelemetry`, not from `DebugPollCounters`), so the caller passes
+/// `&mut DbgCounters`. Otherwise this is verbatim the block that was inline.
+pub(super) fn build_binding_summary(
+    bindings: &[BindingWorker],
+    dbg: &mut DbgCounters,
+) -> String {
+    let mut binding_summary = String::new();
+    for (i, b) in bindings.iter().enumerate() {
+        use std::fmt::Write;
+        let fill_pending = b.xsk.device.pending();
+        let rx_avail = b.xsk.rx.available_relaxed();
+        let xsk_stats = b.xsk.device.statistics_v2().ok();
+        let inflight_recycles = b.tx_pipeline.in_flight_prepared_recycles.len() as u32;
+        let scratch_recycle_len = b.scratch.scratch_recycle.len() as u32;
+        let ptx_prepared = b.tx_pipeline.pending_tx_prepared.len() as u32;
+        let ptx_local = b.tx_pipeline.pending_tx_local.len() as u32;
+        let total_accounted = b.tx_pipeline.pending_fill_frames.len() as u32
+            + fill_pending
+            + rx_avail
+            + b.tx_pipeline.free_tx_frames.len() as u32
+            + b.tx_pipeline.outstanding_tx
+            + inflight_recycles
+            + scratch_recycle_len
+            + ptx_prepared; // prepared TX holds UMEM frames
+        let expected_total = b.umem.total_frames();
+        let _ = write!(
+            binding_summary,
+            " [{}:if{}q{} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} scr={} ptxp={} ptxl={} total={}/{} fill_ok={} polls={} bp={} rx_empty={} wake={}",
+            i,
+            b.ifindex,
+            b.queue_id,
+            b.tx_pipeline.pending_fill_frames.len(),
+            fill_pending,
+            rx_avail,
+            b.tx_pipeline.free_tx_frames.len(),
+            b.tx_pipeline.outstanding_tx,
+            inflight_recycles,
+            scratch_recycle_len,
+            ptx_prepared,
+            ptx_local,
+            total_accounted,
+            expected_total,
+            b.telemetry.dbg_fill_submitted,
+            b.telemetry.dbg_poll_cycles,
+            b.telemetry.dbg_backpressure,
+            b.telemetry.dbg_rx_empty,
+            b.telemetry.dbg_rx_wakeups,
+        );
+        // TX pipeline debug counters
+        #[cfg(feature = "debug-log")]
+        {
+            dbg.tx_tcp_rst += b.telemetry.dbg_tx_tcp_rst;
+        }
+        let _ = write!(
+            binding_summary,
+            " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/bp_overflow={}/cos_overflow={}",
+            b.telemetry.dbg_tx_ring_submitted,
+            b.telemetry.dbg_tx_ring_full,
+            b.telemetry.dbg_completions_reaped,
+            b.telemetry.dbg_sendto_calls,
+            b.telemetry.dbg_sendto_err,
+            b.telemetry.dbg_sendto_eagain,
+            b.telemetry.dbg_sendto_enobufs,
+            b.telemetry.dbg_bound_pending_overflow,
+            b.telemetry.dbg_cos_queue_overflow,
+        );
+        #[cfg(feature = "debug-log")]
+        let _ = write!(binding_summary, "/rst={}", b.telemetry.dbg_tx_tcp_rst);
+        if let Some(s) = xsk_stats {
+            let _ = write!(
+                binding_summary,
+                " xsk:drop={}/inv={}/rfull={}/fempty={}/tinv={}/tempty={}",
+                s.rx_dropped,
+                s.rx_invalid_descs,
+                s.rx_ring_full,
+                s.rx_fill_ring_empty_descs,
+                s.tx_invalid_descs,
+                s.tx_ring_empty_descs,
+            );
+        }
+        // Socket error check (SO_ERROR) — detect kernel-side errors
+        {
+            let fd = b.xsk.rx.as_raw_fd();
+            let mut so_err: c_int = 0;
+            let mut so_err_len: libc::socklen_t = core::mem::size_of::<c_int>() as _;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut so_err as *mut c_int as *mut c_void,
+                    &mut so_err_len,
+                )
+            };
+            if rc == 0 && so_err != 0 {
+                let _ = write!(binding_summary, " SO_ERR={so_err}");
+            }
+        }
+        // Ring diagnostics from xsk_ffi API
+        if cfg!(feature = "debug-log") {
+            let _ = write!(
+                binding_summary,
+                " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
+                b.telemetry.dbg_rx_avail_nonzero,
+                b.telemetry.dbg_rx_avail_max,
+                b.telemetry.dbg_fill_pending,
+                b.telemetry.dbg_device_avail,
+                b.telemetry.dbg_rx_wake_sendto_ok,
+                b.telemetry.dbg_rx_wake_sendto_err,
+                b.telemetry.dbg_rx_wake_sendto_errno,
+            );
+            // Direct mmap diagnosis: read raw ring producer/consumer
+            if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
+                diagnose_raw_ring_state(b.xsk.rx.as_raw_fd())
+            {
+                let _ = write!(
+                    binding_summary,
+                    " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
+                );
+            }
+        }
+        // Frame leak detection
+        if total_accounted != expected_total {
+            let _ = write!(
+                binding_summary,
+                " FRAME_LEAK:{}",
+                expected_total as i64 - total_accounted as i64,
+            );
+        }
+        binding_summary.push(']');
+    }
+    binding_summary
 }
