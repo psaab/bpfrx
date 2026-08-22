@@ -103871,3 +103871,10 @@ prose edit above them added. No diff falls in the new test body.
   RG + barrier wait, then stopClusterComms) ahead of the teardown.
 - **File(s)**: pkg/daemon/bootstrap.go,
   pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
+
+## 2026-08-22 — #6744 kimi-review-003 cohort split
+- **Action**: Landed the stranded research plan as a record (review loop
+  unresumable — source report and per-round artifacts gone from /tmp), with a
+  measured staleness header; split the retained root causes into individual
+  issues.
+- **File(s)**: `docs/research/6744-kimi-review-003/plan.md`
