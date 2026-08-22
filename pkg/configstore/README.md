@@ -1285,3 +1285,29 @@ owned by the `journal/` subpackage.
   `applyConfig()` under a single semaphore. Bypassing the daemon (e.g.
   using `Store` directly) loses that serialization, so concurrent CLI +
   HTTP commits can race.
+
+## Bounded config reads (#4909, #6753)
+
+`MaxConfigSize` (16 MiB) is the ceiling on any configuration payload the store
+accepts. Historically it was enforced **only after the payload was resident**:
+`checkConfigSize` takes an already-materialised string, so it bounds what the
+store will *accept*, never what a caller will *allocate*. A caller doing
+`os.ReadFile` then handing the result over read a multi-gigabyte file in full
+and only then had it refused (#6753).
+
+Read configuration files through **`ReadBoundedConfigFile`** (or
+`ReadBoundedFile` / `ReadBounded` for a different ceiling). They bound the read
+itself:
+
+- `io.LimitReader(max+1)` caps the allocation by the *limit*, not by what
+  `Stat` claimed — closing the #4909 TOCTOU where a FUSE-backed or racing file
+  under-reports its size and then streams an unbounded body.
+- The open uses `O_NONBLOCK` and the path is rejected unless it is a **regular
+  file**. Opening a FIFO for reading blocks until a writer appears, so a plain
+  `os.Open` hangs before any size check can run. That is a distinct defect from
+  the size cap and a size-only fix does not address it.
+
+Both CLI surfaces (`pkg/cli` local, `cmd/cli` remote) and `cmd/xpfd` call the
+same implementation. They previously did not, and #4883-D records the cost of
+that shape at a neighbouring site: the local and remote CLI diverged, and the
+divergence itself is what produced the bug.

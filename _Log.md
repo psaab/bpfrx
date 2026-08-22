@@ -103266,3 +103266,17 @@ prose edit above them added. No diff falls in the new test body.
   gate so the silent drop is rejected at commit.
 - **File(s)**: pkg/config/compiler_system.go, pkg/config/dup_named_blocks.go,
   pkg/config/duplicate_login_user_6992_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22 11:15 UTC
+  - **Action**: #6753 — bound the CLI config-file read instead of checking size
+    after materialising it. Moved the #4909 bounded reader into pkg/configstore
+    (which owns MaxConfigSize) as ReadBounded/ReadBoundedFile/
+    ReadBoundedConfigFile; cmd/xpfd now delegates to it so the logic is
+    single-sourced rather than copied; both CLI load paths call it. Added
+    O_NONBLOCK to the open so a writerless FIFO is classified and refused
+    instead of hanging the process — the "or blocks" half of the issue, which
+    the size cap alone does not address.
+  - **File(s)**: pkg/configstore/bounded_read.go (new),
+    pkg/configstore/bounded_read_6753_test.go (new),
+    pkg/cli/load_bounded_read_6753_test.go (new), pkg/cli/cli_config.go,
+    cmd/cli/main.go, cmd/xpfd/main.go, pkg/configstore/README.md

@@ -137,23 +137,7 @@ func classifyCommand(argv []string) xpfdCommand {
 // and reaching the (max+1)-th byte proves the file is over-cap. A non-regular
 // file (dir/device/FIFO) is refused up front.
 func readBoundedFile(path string, max int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: not a regular file", path)
-	}
-	data, err := readBounded(f, max)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return data, nil
+	return configstore.ReadBoundedFile(path, max)
 }
 
 // readBounded reads at most max+1 bytes from r and rejects a source that
@@ -164,14 +148,7 @@ func readBoundedFile(path string, max int64) ([]byte, error) {
 // balloon memory. io.LimitReader(max+1) caps the read; reaching the (max+1)-th
 // byte proves the source is over-cap.
 func readBounded(r io.Reader, max int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, max+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > max {
-		return nil, fmt.Errorf("exceeds %d byte limit", max)
-	}
-	return data, nil
+	return configstore.ReadBounded(r, max)
 }
 
 func main() {
