@@ -103065,3 +103065,11 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
   docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6675 — made pkg/dataplane/userspace hermetic w.r.t. the kernel
+    ip-rule table via TestMain, so an EPERM dump can no longer nil-deref a
+    snapshot and SIGSEGV the whole test binary. Chose stubbing over skipping so
+    the package keeps coverage in reduced-capability sandboxes.
+  - **File(s)**: pkg/dataplane/userspace/hermetic_iprules_6675_test.go,
+    docs/engineering-style.md
