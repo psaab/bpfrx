@@ -78,10 +78,11 @@ func startEscapeTestREST(t *testing.T, d *Daemon) string {
 		cancel()
 		wg.Wait()
 	})
-	if d.mgmt == nil || d.mgmt.srv == nil {
+	mgmt := d.mgmt.Load()
+	if mgmt == nil || mgmt.srv == nil {
 		t.Fatal("startHTTPServer did not converge a management listener")
 	}
-	addr := d.mgmt.srv.EffectiveHTTPAddr()
+	addr := mgmt.srv.EffectiveHTTPAddr()
 	if addr == "" {
 		t.Fatal("management listener reported no effective HTTP address")
 	}
