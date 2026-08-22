@@ -151,9 +151,37 @@ func natMatchEmptyAppSetError(natKind, ruleSet, ruleName, name string) error {
 // This is the #2396(c) silent-drop. Surfacing it at commit / commit-check turns
 // a fat-fingered "the only destination is a typo" into a visible error.
 //
-// Acceptance MUST match the builder's exactly: a token is "good" iff, after
-// stripping a trailing `/mask`, the remainder parses with net.ParseIP. A rule
-// with NO destination match at all is out of scope (it never reaches the
+// Acceptance MUST match the builder's exactly. #7215: it did not. This gate
+// used to strip everything after the first `/` (natCIDRIPPart) and parse only
+// the address part with net.ParseIP, so `10.0.0.0/33` read as the perfectly
+// good `10.0.0.0` and committed clean — while dnatDestinationParts, the gate's
+// OWN consumer, calls net.ParseCIDR on any token carrying a `/` and returns
+// ok == false, dropping the entry before it reaches the wire. A validator that
+// accepts what its builder discards is the #2396(c) silent drop this gate was
+// created to close, reached through the mask text instead of the address text.
+// The predicate is now natMatchPrefixParses (#7145) — net.ParseCIDR then
+// net.ParseIP — which is extensionally EQUAL to dnatDestinationParts's ok, so
+// the two cannot diverge again:
+//
+//	token has no `/`: builder = net.ParseIP != nil; natMatchPrefixParses's
+//	                  net.ParseCIDR fails on a maskless string, so it falls
+//	                  through to the same net.ParseIP.
+//	token has a `/`:  builder = net.ParseCIDR ok; net.ParseIP can never
+//	                  succeed on a string containing `/`, so
+//	                  natMatchPrefixParses reduces to the same net.ParseCIDR.
+//
+// The change is strictly a NARROWING, and every value it newly refuses is one
+// the builder already discarded: `10.0.0.0/33`, `10.0.0.0/129`, `2001:db8::/129`
+// (mask out of range), `10.0.0.0/abc`, `10.0.0.0/`, `1.2.3.4/-1`, `1.2.3.4/+24`
+// (mask not a bare unsigned number), `1.2.3.4/24/25` (two masks), and
+// `10.0.0.1/255.255.255.0` (the dotted-netmask spelling, which Go's
+// net.ParseCIDR and Rust's IpNet::from_str both refuse). It refuses NOTHING the
+// dataplane installs — `0.0.0.0/0`, `::/0`, a bare host, a host-bits CIDR and
+// the zero-padded `1.2.3.4/024` all still commit (#1960 no-brick); that is why
+// the mirror is net.ParseCIDR and not netip.ParsePrefix, which rejects the
+// padding Rust's u8::from_str accepts. See natMatchPrefixParses.
+//
+// A rule with NO destination match at all is out of scope (it never reaches the
 // builder's per-destination loop). A rule with at least one good destination is
 // fine even if others are malformed (the builder emits entries for the good
 // ones and skips the rest — partial, but not a silent total no-op).
@@ -200,13 +228,17 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 			// table. A mixed list such as `[ 192.0.2.1 web-server ]` would
 			// otherwise commit clean (the old anyGood break) while
 			// `web-server` never translates. Mirror the builder's exact skip
-			// predicate (CIDR strip via natCIDRIPPart, then empty/ParseIP
-			// check) so the validator rejects precisely what the builder
+			// predicate so the validator rejects precisely what the builder
 			// would drop: validator and dataplane view agree, and an
 			// all-valid list still compiles byte-identical.
+			//
+			// #7215: that predicate is natMatchPrefixParses, not the old
+			// natCIDRIPPart + net.ParseIP pair. The old one discarded the
+			// mask text before parsing, so an out-of-range or non-numeric
+			// mask (`10.0.0.0/33`) passed the gate and was then dropped by
+			// dnatDestinationParts — the divergence documented above.
 			for _, raw := range destAddrs {
-				ipPart := natCIDRIPPart(raw)
-				if ipPart == "" || net.ParseIP(ipPart) == nil {
+				if !natMatchPrefixParses(raw) {
 					return fmt.Errorf(
 						"destination-nat rule-set %q rule %q: match destination-address "+
 							"%q is not a valid IP/CIDR; the rule would commit but the "+

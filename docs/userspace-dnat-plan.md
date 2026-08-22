@@ -502,9 +502,9 @@ silent break into a fail-OPEN one.
 Known residuals, measured, NOT closed by #7145 (they are a different value
 class from the issue's malformed CIDR):
 
-- **#7215** — an out-of-range mask (`10.0.0.0/33`) is still accepted on
-  destination-NAT `match destination-address`. That slot's own gate (#3228)
-  strips the mask and parses only the address part, while its Go builder
+- **#7215** — CLOSED. An out-of-range mask (`10.0.0.0/33`) was still accepted on
+  destination-NAT `match destination-address`: that slot's own gate (#3228)
+  stripped the mask and parsed only the address part, while its Go builder
   (`dnatDestinationParts`) uses `net.ParseCIDR` and skips the entry — a
   validator/builder divergence in the OLDER gate.
 - **#7216** — CLOSED. An explicitly quoted empty value (`match
@@ -519,6 +519,11 @@ class from the issue's malformed CIDR):
   FOUR authoring shapes that reach `rule.Match == ""`, including the omitted
   statement, and exempts NPTv6 and `then static-nat inet`, each already refused
   by its own gate. See `docs/config-schema.md` "#7216".
+  validator/builder divergence in the OLDER gate. See §11.2.
+- **#7216** — an explicitly quoted empty value (`match destination-address ""`)
+  is still accepted on static-NAT `match destination-address`, where an empty
+  slot carries the deliberate #6673 "authored blank selection" meaning, so
+  closing it needs to separate a machinery-produced blank from a typed one.
 
 ### Static-NAT invalid `match destination-port` fails closed (#5101)
 
@@ -602,15 +607,67 @@ silently dropped from the installed DNAT table — traffic to it was never
 translated, a partial, silent drop of a forwarding-relevant config (#3228).
 
 The gate now rejects the rule if ANY listed destination-address fails to parse,
-mirroring the builder's exact skip predicate (`natCIDRIPPart` CIDR strip, then
-empty / `net.ParseIP` check). Validator and dataplane view agree: anything the
-builder would drop, the validator rejects, naming the offending entry. An
+mirroring the builder's exact skip predicate. Validator and dataplane view
+agree: anything the builder would drop, the validator rejects, naming the
+offending entry. An
 all-valid list still compiles byte-identical and installs every entry (the
 multi-destination behavior above is unchanged). On the tolerant load / peer-sync
 path the rejection is downgraded to a `destination-nat address` warning (#1960
 no-brick), consistent with the all-malformed (#2396(c)) gate that shares this
 validator. (The multi-host-prefix reject — #3029 — was removed by #3164, which
 implements prefix matching; see §12.)
+
+### 11.2 The predicate is the builder's, bound by a test (#7215)
+
+"Mirrors the builder's exact skip predicate" was, for two years, a COMMENT. The
+gate re-derived the predicate as `natCIDRIPPart` (strip everything after the
+first `/`) then `net.ParseIP` on what was left, while `dnatDestinationParts`
+(`pkg/dataplane/userspace/nat_destination.go`) calls `net.ParseCIDR` on any
+token carrying a `/`. The two agree on the ADDRESS text and disagree on the MASK
+text, so `10.0.0.0/33` read as the perfectly good `10.0.0.0`, committed clean,
+and was then discarded by the builder — the #2396(c) silent drop reached through
+a mask instead of a typo. Measured at `353f09592`, this was the ONE slot of six
+that still took such a value; #7145 did not reach it because its probe
+(`999.1.1.1/24`) is malformed in the address half, which the old predicate did
+see.
+
+The gate now calls `natMatchPrefixParses` (`compiler_nat_helpers.go`, #7145) —
+`net.ParseCIDR` then `net.ParseIP` — which is extensionally EQUAL to
+`dnatDestinationParts`'s `ok`:
+
+- a token with no `/`: the builder runs `net.ParseIP`; `net.ParseCIDR` cannot
+  succeed on a maskless string, so `natMatchPrefixParses` falls through to the
+  same `net.ParseIP`.
+- a token with a `/`: the builder runs `net.ParseCIDR`; `net.ParseIP` cannot
+  succeed on a string containing `/`, so `natMatchPrefixParses` reduces to the
+  same `net.ParseCIDR`.
+
+That equality is asserted, not asserted-in-prose:
+`pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go` runs both
+predicates over a corpus that straddles the boundary and fails on ANY
+disagreement, in either direction — `gate accepts / builder drops` is #7215,
+`gate refuses / builder installs` is the #1960 brick.
+
+The change is strictly a NARROWING and every value it newly refuses is one the
+builder already discarded: `10.0.0.0/33`, `10.0.0.0/129`, `2001:db8::/129`
+(mask out of range), `10.0.0.0/abc`, `10.0.0.0/`, `1.2.3.4/-1`, `1.2.3.4/+24`
+(mask not a bare unsigned number), `1.2.3.4/24/25` (two masks), and
+`10.0.0.1/255.255.255.0` (the dotted-netmask spelling, which `net.ParseCIDR` and
+Rust's `IpNet::from_str` both refuse). It refuses NOTHING the dataplane
+installs: `0.0.0.0/0`, `::/0`, a bare host, a host-bits CIDR and the zero-padded
+`1.2.3.4/024` all still commit — which is why the mirror is `net.ParseCIDR` and
+not `netip.ParsePrefix`.
+
+Lenient (`Store.Load` / HA peer-sync) is unchanged and already in place: the
+shared `lenientDestNATAddresses` flag downgrades this to a warning and KEEPS the
+value, because the Rust `destination_constrained` flag is keyed on the snapshot
+list being non-empty — pruning it Go-side would collapse an all-malformed rule
+to MATCH-ANY. Regression coverage:
+`pkg/config/nat_dnat_match_destination_mask_7215_test.go` (the full 3x2 census
+at strict, tolerant warn-and-KEEP, and an over-rejection guard) and
+`pkg/configstore/nat_dnat_match_mask_boot_7215_test.go` (the no-brick property
+at the REAL ingresses — `Store.Load` and `Store.SyncApply` — plus a
+`CommitCheck` over-reach guard).
 
 ## 12. Multi-host-prefix destination matching (#3164)
 
