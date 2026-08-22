@@ -177,6 +177,22 @@ type Store struct {
 	confirmTimer    *time.Timer
 	confirmPrevTree *config.ConfigTree // active tree before confirmed commit
 	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
+	// confirmPrevFirst records whether confirmPrevTree is the EMPTY BOOTSTRAP
+	// TREE — i.e. the pending commit-confirmed was the first commit on a fresh
+	// store, so its rollback must re-enter never-committed state (#1922 Item
+	// 1b: committed=0 marker, everCommitted cleared).
+	//
+	// #6538: this used to be DERIVED from `confirmPrevCfg == nil` at each
+	// consumer. That nil carries two unrelated meanings — "there was no
+	// compiled config to stash because this genuinely is the first commit" and
+	// "the recovered rollback target failed even the lenient compile"
+	// (recoverPendingConfirmLocked) — and the action taken on the first is
+	// destructive for the second: committed=0 persisted over a REAL config, so
+	// the next restart re-classifies the box into bootstrap (day-0 /
+	// claim-all). Recording the fact at the moment it is known, instead of
+	// inferring it later from a value that means two things, is what makes the
+	// two states distinguishable to every consumer.
+	confirmPrevFirst bool
 
 	// rollbackExecutor is the daemon-registered transaction that owns
 	// the WHOLE commit-confirmed timeout rollback (#1922 Item 1a). When
