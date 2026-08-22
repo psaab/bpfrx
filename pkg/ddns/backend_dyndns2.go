@@ -272,6 +272,13 @@ func parseDyndns2Response(body, name string) error {
 	case "nohost", "notfqdn", "numhost", "nofqdn", "badagent":
 		return fmt.Errorf("ddns dyndns2: %s: response %q (hostname/request rejected)", name, keyword)
 	default:
-		return fmt.Errorf("ddns dyndns2: %s: unrecognized response %q", name, first)
+		// SECURITY (#6634): `first` is the provider's own first response line,
+		// up to httpMaxResponseBody (64 KiB) of provider-chosen bytes, rendered
+		// into an error the daemon logs every reconcile tick of a persistent
+		// failure and retains as the provider's lastErr. %q already neutralizes
+		// control characters; what it does not neutralize is a credential — the
+		// dyndns2 `server` leaf can carry userinfo, so an endpoint that echoes
+		// the request back echoes the credential — or 64 KiB of anything.
+		return fmt.Errorf("ddns dyndns2: %s: unrecognized response %q", name, scrubProviderText(first))
 	}
 }
