@@ -205,6 +205,7 @@ func (f kernelStatusFakeSys) WriteSlotSelector(string, string) error        { re
 func (f kernelStatusFakeSys) ReadSlotSelector(string) (string, error)       { return "", nil }
 func (f kernelStatusFakeSys) SetBootNext(string) error                      { return nil }
 func (f kernelStatusFakeSys) GetBootNext() (string, error)                  { return "", nil }
+func (f kernelStatusFakeSys) ClearBootNext() error                          { return nil }
 func (f kernelStatusFakeSys) ArmWatchdog() error                            { return nil }
 func (f kernelStatusFakeSys) Reboot() error                                 { return nil }
 func (f kernelStatusFakeSys) WritePromotionMarker(string) error             { return nil }

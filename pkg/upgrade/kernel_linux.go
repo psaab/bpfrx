@@ -415,6 +415,16 @@ func (s *realKernelSystem) SetBootNext(bootID string) error {
 	return runCmd("efibootmgr", "--bootnext", bootID)
 }
 
+// ClearBootNext deletes the one-shot BootNext variable (#6758).
+//
+// efibootmgr treats deleting an absent BootNext as success, which is what the
+// arm's failure path needs: it clears unconditionally rather than reading first,
+// so there is no read-then-delete window and no special case for "the firmware
+// silently dropped it already".
+func (s *realKernelSystem) ClearBootNext() error {
+	return runCmd("efibootmgr", "--delete-bootnext")
+}
+
 // GetBootNext parses the one-shot BootNext id out of efibootmgr's output (the
 // "BootNext: XXXX" line), or returns "" if no one-shot is armed (#5847). The
 // two-phase arm reads this back to POSITIVELY CONFIRM the firmware accepted the
