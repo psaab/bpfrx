@@ -741,6 +741,97 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
     assert!(n >= 1, "reader thread observed no snapshots");
 }
 
+/// #6633: drive remove/re-add churn until `stop`, completing at least ONE full
+/// cycle FIRST (do-while) — the same shape, and for the same reason, as the
+/// `#3457` do-while in the reader thread of
+/// `reconcile_peers_snapshot_is_atomic_under_concurrent_load` above.
+///
+/// The bounded installer thread it races is finite. Under CPU oversubscription
+/// (a loaded machine, or a parallel `cargo test`) the installer can complete
+/// all of its attempts, and the main thread can then set `stop`, before this
+/// thread is scheduled even once. A leading `while !stop` would then return
+/// ZERO cycles and trip the "made progress on both sides" precondition its
+/// caller asserts — a scheduler artifact, not a regression in the lock the
+/// test exists to pin.
+///
+/// The fix is the loop SHAPE rather than the rendezvous #6633 proposed (the
+/// reconciler publishing a cycle count the installer blocks on). A rendezvous
+/// makes the bounded thread WAIT on the unbounded one, adding a blocking
+/// dependency between two test threads in a module whose other open defect is
+/// a futex wedge; trading a false red for a possible hang is the wrong trade.
+/// The do-while establishes the same precondition with no new blocking edge,
+/// and — unlike a rendezvous — it holds by CONSTRUCTION, which is what lets
+/// `reconcile_churn_completes_a_cycle_even_when_already_stopped_6633` bind it
+/// deterministically.
+fn reconcile_churn_until(
+    engine: &WgEngine,
+    cfg: &[WgPeerConfig],
+    stop: &std::sync::atomic::AtomicBool,
+) -> u32 {
+    let mut iters = 0u32;
+    loop {
+        engine.reconcile_peers(&[]);
+        engine.reconcile_peers(cfg);
+        iters += 1;
+        if stop.load(Ordering::Relaxed) {
+            return iters;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// #6633 fail-on-revert for `reconcile_churn_until`'s do-while shape.
+///
+/// Calling it with `stop` ALREADY set is the deterministic model of the
+/// starvation that flaked `install_session_serializes_with_reconcile_removal`:
+/// the reconciler thread is scheduled only after the installer finished and
+/// the main thread stored `stop`. The contract is that it still completes one
+/// full remove/re-add cycle, so its caller's `reconcile_iters >= 1` holds by
+/// construction. Reverting the do-while to a leading `while !stop` returns 0
+/// here and reds — with no dependence on the scheduler, which is precisely
+/// what the original assertion lacked.
+///
+/// It takes no `wg_engine_test_serial()` guard on purpose: it is
+/// single-threaded and spawns nothing, so it is not one of the heavy
+/// busy-spin bodies #6157 serializes.
+#[test]
+fn reconcile_churn_completes_a_cycle_even_when_already_stopped_6633() {
+    use std::sync::atomic::AtomicBool;
+    let (init_priv, _init_pub) = keypair();
+    let (_peer_priv, peer_pub) = keypair();
+    let cfg = vec![WgPeerConfig {
+        pubkey: peer_pub,
+        endpoint: None,
+        persistent_keepalive: 0,
+        allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+        preshared_key: [0u8; 32].into(),
+    }];
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv.into(),
+        listen_port: 51820,
+        peers: cfg.clone(),
+    });
+    let stop = AtomicBool::new(true);
+    let iters = reconcile_churn_until(&engine, &cfg, &stop);
+    assert_eq!(
+        iters, 1,
+        "reconcile_churn_until must complete one full remove/re-add cycle even \
+         when stop is already set (#6633); a leading `while !stop` returns 0 and \
+         leaves install_session_serializes_with_reconcile_removal asserting a \
+         scheduling outcome its harness never arranged"
+    );
+    // The cycle really ran: the churn ends on the re-add, so the peer is
+    // published. Without this the assertion above would pass on a helper that
+    // merely counted without touching the engine.
+    assert!(
+        engine
+            .table_for_test()
+            .peer_index_by_pubkey
+            .contains_key(&peer_pub),
+        "the completed cycle must have re-added the peer"
+    );
+}
+
 /// r6 regression: `install_session` and `reconcile_peers` must
 /// serialize so a removed peer cannot orphan a freshly-installed
 /// demux entry.
@@ -849,22 +940,17 @@ fn install_session_serializes_with_reconcile_removal() {
         let engine = engine.clone();
         let stop = stop.clone();
         let cfg = cfg_with_peer.clone();
-        thread::spawn(move || {
-            let mut iters = 0u32;
-            while !stop.load(AOrd::Relaxed) {
-                engine.reconcile_peers(&[]);
-                engine.reconcile_peers(&cfg);
-                iters += 1;
-                thread::yield_now();
-            }
-            iters
-        })
+        thread::spawn(move || reconcile_churn_until(&engine, &cfg, &stop))
     };
     let (ok, unknown, collision) = installer.join().unwrap();
     stop.store(true, AOrd::Relaxed);
     let reconcile_iters = reconciler.join().unwrap();
     // We made progress on both sides — otherwise the test is
-    // not actually exercising the race window.
+    // not actually exercising the race window. #6633: the
+    // reconciler side is now ESTABLISHED by
+    // `reconcile_churn_until`'s do-while rather than hoped for,
+    // so the `reconcile_iters >= 1` assertion below can no
+    // longer trip as a scheduler artifact on a loaded machine.
     assert!(
         ok + unknown + collision == iterations,
         "every install attempt accounted for"

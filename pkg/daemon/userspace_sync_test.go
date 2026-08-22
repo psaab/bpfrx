@@ -207,11 +207,15 @@ func TestUserspaceSessionFromDeltaCarriesRTFlowSessionID5212(t *testing.T) {
 	if valV4.RTFlowSessionID != wantID {
 		t.Fatalf("v4 RTFlowSessionID = %#x, want %#x", valV4.RTFlowSessionID, wantID)
 	}
-	// The BPF-ABI SessionID stays a distinct node-local value (#6198: minted by
-	// nextUserspaceSyncedSessionID in its own 0xFFFF<<48 namespace, which the
-	// dataplane's worker-namespaced RTFlowSessionID can never occupy).
-	if valV4.SessionID == wantID {
-		t.Fatal("RTFlowSessionID must be distinct from the BPF-ABI SessionID")
+	// #6666 REVERSED THIS ASSERTION, and the reversal is the decision rather
+	// than a concession. It used to require the BPF-ABI SessionID be DISTINCT
+	// from the cross-node id -- which is exactly the divergence that made the
+	// displayed id flip between the control plane's value and the helper's, and
+	// made #5213's "identical to the id RT_FLOW emits" promise false for every
+	// peer-synced session. The mirror now ADOPTS the peer's id when it sent one.
+	if valV4.SessionID != wantID {
+		t.Fatalf("v4 SessionID = %#x, want the ADOPTED cross-node id %#x — the session views "+
+			"and RT_FLOW must render one id for one session (#6666)", valV4.SessionID, wantID)
 	}
 
 	deltaV6 := dpuserspace.SessionDeltaInfo{

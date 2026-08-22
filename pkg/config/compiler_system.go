@@ -2280,19 +2280,98 @@ func monitorWeightTokens(entry *Node) []string {
 // exist — properties are siblings, so nothing is lost either way (unlike a
 // monitored entry, where children are that entry's attributes).
 func packedStatementProps(cfgNode *Node, skip int, isProp func(string) bool) []*Node {
+	return packedStatementPropsArity(cfgNode, skip, isProp, nil)
+}
+
+// packedStatementPropsArity is packedStatementProps with a VALUE-SLOT contract
+// (#6665).
+//
+// THE DEFECT. The plain splitter applies isProp to every token in the tail with
+// no positional state at all, so a registered keyword opens a new statement
+// WHEREVER it appears — including where a value is expected. An interface whose
+// name spells a statement keyword is therefore consumed as that statement:
+//
+//	packed:    redundancy-group 1 interface-monitor ip-monitoring weight 255;
+//	             -> InterfaceMonitors=[]  IPMonitoring=&{}
+//	container: redundancy-group 1 { interface-monitor ip-monitoring weight 255; }
+//	             -> InterfaceMonitors=[{ip-monitoring 255}]  IPMonitoring=nil
+//
+// The monitor is dropped AND an unrelated statement is fabricated, and the two
+// spellings of one config compile differently. `pkg/cluster` then ranges an
+// empty InterfaceMonitors, so the redundancy group accrues no link-down debt and
+// never demotes — the failure `assertSingleMonitor` exists to name.
+//
+// It is sticky: configstore persists the TREE and re-emits a packed leaf as the
+// same packed line, so it survives `show configuration`, reboot and HA peer
+// sync. Authored once, wrong forever.
+//
+// THE FIX IS #6658'S OWN SHAPE, one level up. monitorEntryNodes already reserves
+// a value slot — "`weight` consumes exactly one following token even when that
+// token spells a name" — for exactly this class. `arity` lifts that contract to
+// the statement splitter: a keyword that takes an argument consumes the next
+// token unconditionally, so the token in its value slot cannot re-arm the
+// splitter.
+//
+// A nil arity is the pre-#6665 behaviour, kept for the ip-monitoring caller
+// whose sub-keywords have no name-shaped value slot.
+//
+// WHAT IT DOES NOT RESOLVE, stated rather than implied: `interface-monitor` is
+// variadic, so only its FIRST token is protected. `interface-monitor ge-0/0/0
+// preempt;` still reads `preempt` as a statement — which is also what the
+// container form does, so the two spellings agree, which is the property under
+// repair. There is no local information that distinguishes "a second monitor
+// named preempt" from "no more monitors, then preempt", and inventing one would
+// break the multi-statement packing #6588 pins.
+func packedStatementPropsArity(
+	cfgNode *Node,
+	skip int,
+	isProp func(string) bool,
+	arity func(string) int,
+) []*Node {
 	var props []*Node
 	if len(cfgNode.Keys) > skip {
 		var cur *Node
+		pending := 0 // value tokens the open statement must still absorb
 		for _, tok := range cfgNode.Keys[skip:] {
+			if pending > 0 {
+				pending--
+				cur.Keys = append(cur.Keys, tok)
+				continue
+			}
 			if cur == nil || isProp(tok) {
 				cur = &Node{Keys: []string{tok}, Line: cfgNode.Line, Column: cfgNode.Column}
 				props = append(props, cur)
+				if arity != nil {
+					pending = arity(tok)
+				}
 				continue
 			}
 			cur.Keys = append(cur.Keys, tok)
 		}
 	}
 	return append(props, cfgNode.Children...)
+}
+
+// redundancyGroupStatementArity is how many tokens a redundancy-group statement
+// consumes as its VALUE before the splitter may open another statement (#6665).
+//
+// Derived from the grammar the compilers actually read, and deliberately only
+// for the statements whose value slot can hold a free-form identifier or a
+// number. `preempt` and `strict-vip-ownership` take nothing, so the token after
+// them genuinely does open a statement.
+func redundancyGroupStatementArity(tok string) int {
+	switch tok {
+	case "interface-monitor":
+		// `<ifname>` — the one free-form identifier slot in the whole stanza,
+		// and therefore the only slot a keyword can be stolen out of.
+		return 1
+	case "node", "gratuitous-arp-count":
+		// `<node-id>` / `<count>` — numeric, so a keyword here is already
+		// rejected by the #5694 identity gate rather than silently stolen; the
+		// reservation makes that a parse-time fact instead of a downstream one.
+		return 1
+	}
+	return 0
 }
 
 // redundancyGroupBody returns the body statements of one `redundancy-group`
@@ -2348,7 +2427,8 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 	if rgNode.Name() == "redundancy-group" {
 		skip = 2
 	}
-	return packedStatementProps(rgNode, skip, isRedundancyGroupStatement)
+	return packedStatementPropsArity(
+		rgNode, skip, isRedundancyGroupStatement, redundancyGroupStatementArity)
 }
 
 // redundancyGroupStatements is the SINGLE SOURCE OF TRUTH for what a
@@ -2416,28 +2496,37 @@ func redundancyGroupBody(rgNode *Node) []*Node {
 // a stale "measured" claim is how the next reader concludes the analysis was
 // already done and stops checking.)
 //
-// NOT fixed here. The stolen token has to sit in entry-NAME position, and no
-// legal Junos interface name or IP address collides with any keyword registered
-// below — names are ge-*/xe-*/et-*, reth*, fxp*, em*, lo0, st0, ae*, fab*, irb,
-// vlan. So the input is unreachable from a real config, and the runtime
-// materiality is nil.
+// FIXED in #6665, by exactly the move the paragraph that used to sit here said
+// would be needed: the splitter is now position-aware. A statement that takes an
+// argument reserves its value slot (redundancyGroupStatementArity), so the token
+// in that slot cannot re-arm the splitter — the same "reserve the value slot"
+// contract monitorEntryNodes already applied one level down for `weight`.
 //
-// Note what is and is not guarded, since the paragraph above is the kind of
-// claim that rots. There is deliberately NO test asserting the divergence: it
-// would pin the wrong answer as correct and would have to be deleted by whoever
-// fixes this. There is also no test asserting "keyword is not a legal interface
-// name" — the project has no canonical interface-name predicate, so such a test
-// would have to invent the grammar, and inventing a model of something that
-// lives nowhere in code is the same mistake as the source-parsing drift guard
-// this table replaced. What IS guarded is the EDIT that would make the route
-// reachable: registering a statement here trips the completeness check in
-// TestRedundancyGroupStatementsSurvivePackedLine_6588, which fails until a human
-// adds a sample for the new keyword. That is the moment to ask whether the new
-// keyword can also spell an entry name.
+// Two claims that used to live here were wrong and are corrected rather than
+// deleted, because both were load-bearing for the decision to defer:
 //
-// Fixing it properly means splitting position-aware — a keyword opens a
-// statement only where a statement may begin — which changes the splitter
-// contract and does not belong in a fix for the drop bug.
+//   - "no legal Junos interface name collides with any keyword". The reachability
+//     argument was "no operator would do this", not "the system prevents it" —
+//     and the system does NOT prevent it. `chassis device-map interface
+//     <logical-name>` is gated by ValidateDeviceMapLogicalName
+//     (schema_validators_devicemap.go), which accepts any non-empty,
+//     whitespace-free, dot-free [a-zA-Z0-9-/] string. All six registered
+//     keywords pass it. The predicate the old comment said did not exist does.
+//
+//   - "there is deliberately NO test asserting the divergence: it would pin the
+//     wrong answer as correct". True while the divergence stood; the test that
+//     belongs here asserts the packed and container spellings AGREE, using the
+//     container form as the oracle, which pins the RIGHT answer without
+//     hand-writing an expectation. That is
+//     TestPackedRGDoesNotStealAKeywordFromTheValueSlot_6665.
+//
+// The residual, stated rather than implied: `interface-monitor` is variadic, so
+// only its FIRST token is protected. `interface-monitor ge-0/0/0 preempt;` still
+// reads `preempt` as a statement — and so does the container form, so the two
+// spellings agree, which is the property under repair. No local information
+// distinguishes "a second monitor named preempt" from "no more monitors, then
+// preempt", and inventing one would break the multi-statement packing
+// TestRedundancyGroupStatementsSurvivePackedLine_6588 pins.
 var redundancyGroupStatements = map[string]func(rg *RedundancyGroup, child *Node){
 	"node":                 compileRGNodePriority,
 	"gratuitous-arp-count": compileRGGratuitousARPCount,

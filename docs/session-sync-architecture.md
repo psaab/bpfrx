@@ -847,6 +847,46 @@ This id stays deliberately node-local; the cross-node correlatable id is the
 separate `RTFlowSessionID` above. Regression coverage:
 `TestUserspaceSyncedSessionID*6198` in `pkg/daemon`.
 
+### #6666: the mirror now ADOPTS the cross-node id
+
+The section above describes the two ids as independent, and until #6666 they
+were. That independence was the defect, not the design.
+
+**Two writers reach one field.** The control plane writes
+`SessionValue{,V6}.SessionID` on every conversion; the helper writes the entry's
+own stable id whenever a frame drives a local publish for the same key
+(`publish_conntrack.rs`, #5213). They minted from disjoint namespaces, so the id
+an operator saw FLIPPED depending on which wrote last.
+
+**It was not only at promotion.** Because the control-plane id is distinct per
+CONVERSION rather than per session (stated above), every bulk resync re-stamped
+every live synced session with a fresh id. The issue described promotion; the
+churn is wider than that.
+
+**It also made #5213's invariant false.** `cli_show_flow.go` promises the
+displayed id is IDENTICAL to the id RT_FLOW emits for the same session. For a
+peer-synced session it was not: RT_FLOW carried the adopted peer id, the mirror
+carried a local one.
+
+So the mirror adopts the peer's id when it sent one, and mints a node-local id
+only when it did not (a legacy or mid-rolling-upgrade peer). Both surfaces now
+render one id for one session.
+
+**Safe by construction rather than by bookkeeping.** #6311 gave every id a node
+discriminator bit, so an adopted id carries the ORIGINATING node's bit and cannot
+collide with anything this node mints — pinned by
+`adopted_peer_id_cannot_collide_with_a_local_id_6311`. And nothing keys on the
+id: `pkg/dataplane/types.go` states it is "never a lookup key", and a sweep of
+every non-test `SessionID` reference finds no map key, index, dedup or generation
+guard. The blast radius is display-only.
+
+**What it does NOT close**, so the claim is not over-stated: synthesized reverse
+companions still carry `session_id: 0` (they are not displayed — the CLI skips
+reverse rows), and #6965 means an ordinary TRANSIT session has no conntrack row
+at all, so the population this improves is the peer-synced, host-inbound and
+neighbor-seed sets. If #6965 is ever closed, the transit population lands in the
+mirror with helper-minted ids and this two-writer surface widens sharply.
+
 ## Sync Readiness and Bulk Priming
 
 This is the biggest place where older descriptions are wrong or incomplete.

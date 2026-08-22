@@ -2816,8 +2816,7 @@ outside the monitor loop:
   guard still covers only the config-authority → peer direction; the reverse
   active/active direction stays a documented fail-OPEN residual on #6284 (item 1,
   needs a bidirectional config-gen namespace #5274 scoped out).
-- **RT_FLOW session id (#5212)**: distinct from BOTH the synthesized BPF-ABI
-  `SessionID` (`now<<16|slot`, node-local) AND the per-key install generation,
+- **RT_FLOW session id (#5212)**: distinct from the per-key install generation,
   every session install carries the ORIGINATING node's stable RT_FLOW session id
   (`SessionValue{,V6}.RTFlowSessionID`, the dataplane's
   `SessionTable::alloc_session_id` value) as a length-gated trailing `uint64` on
@@ -2846,6 +2845,14 @@ outside the monitor loop:
   transition and prevents spurious failover churn. A nil receiver / unset seam
   reports not-fresh, so the no-receiver call paths behave exactly as before the
   re-check existed.
+
+  **#6198/#6666 correction:** the BPF-ABI `SessionID` was described here as
+  `now<<16|slot` — a composition #6198 removed (it collapsed every session
+  converted in the same second onto one id). Since #6666 the mirror ADOPTS this
+  RT_FLOW id when the peer sent one, so the two are no longer distinct for a
+  peer-synced session; a node-local id is minted only for a legacy peer that
+  sent none. That is what makes `show security flow session` and RT_FLOW render
+  one id for one session.
 
 - **The peer heartbeat-ack capability is peer-INCARNATION scoped, not
   process-sticky (#5718 C01a).** `SessionSync.peerHeartbeatAckEver` latches
