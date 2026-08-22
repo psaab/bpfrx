@@ -815,6 +815,20 @@ type Daemon struct {
 	// vipWarnedIfaces tracks interfaces that already emitted a
 	// "directAddVIPs: interface not found" warning to avoid log spam
 	// from the reconcile ticker. Reset on config commit.
+	//
+	// #7532: guarded by its OWN mutex, and reachable only through
+	// resetVIPWarnings / shouldWarnVIPIface / clearVIPWarning. The reset runs
+	// on the apply path under applySem while the lazy-init, read, assign and
+	// delete run on the VRRP reconcile path, which holds no such lock — so the
+	// two used unrelated synchronization. A reset landing between the reconcile
+	// path's nil-check and its assignment is `assignment to entry in nil map`,
+	// and two reconcile writers are a fatal `concurrent map writes` throw.
+	//
+	// A dedicated lock rather than widening applySem: this is warning
+	// suppression, it has no ordering relationship with an apply, and putting
+	// the reconcile ticker behind the apply semaphore would couple a log-spam
+	// guard to the heavy apply pipeline.
+	vipWarnedMu     sync.Mutex
 	vipWarnedIfaces map[string]bool
 
 	// syncPeerAddr is the primary peer address used for gRPC peer dialing

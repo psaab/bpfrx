@@ -103872,6 +103872,67 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/daemon/bootstrap.go,
   pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
 
+## 2026-08-22 — #6744 kimi-review-003 cohort split
+- **Action**: Landed the stranded research plan as a record (review loop
+  unresumable — source report and per-round artifacts gone from /tmp), with a
+  measured staleness header; split the retained root causes into individual
+  issues.
+- **File(s)**: `docs/research/6744-kimi-review-003/plan.md`
+
+## 2026-08-22 — #6754 DDNS client cache validates the resolved bind device
+- **Timestamp**: 2026-08-22
+- **Action**: httpClientCache keyed on the raw binding leaves while the bound
+  device is resolved from the whole committed config, so a reth member move
+  left SO_BINDTODEVICE on the old device with the key unchanged. Cache entries
+  now carry the resolved bindConfig and a hit rebuilds when it differs,
+  releasing the superseded transport the #2956 reap could never collect.
+- **File(s)**: pkg/ddns/backend_http.go,
+  pkg/ddns/httpcache_resolved_bind_6754_test.go
+
+## 2026-08-22 — #7515 single-source the management-interface class
+- **Action**: `config.IsManagementIfName` is now the SSOT for the fxp/fab/em
+  class, previously restated VERBATIM at three sites: the daemon's management-VRF
+  set (`managementVRFIfaceSet`, extracted for testability), the networkd `VRF=`
+  emitter, and the ip-monitoring next-hop validator. Semantics preserved exactly
+  — no behaviour change. `isCanonicalFabricName` now calls the shared
+  `ifNameNumericSuffix` instead of carrying a second copy of the same formula.
+  Corrected the issue's premise: `emu0` IS management today (the daemon binds it
+  to vrf-mgmt via the same prefix), so the ip-monitoring refusal was truthful;
+  narrowing the class is a behaviour decision, filed separately.
+- **File(s)**: `pkg/config/ifname_class_6731.go`, `pkg/config/lifeline.go`,
+  `pkg/config/compiler_services.go`, `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/dataplane/compiler_iface.go`,
+  `pkg/config/mgmt_ifname_ssot_7515_test.go` (new),
+  `pkg/daemon/mgmt_vrf_ifaceset_ssot_7515_test.go` (new),
+  `pkg/dataplane/mgmt_vrf_networkd_ssot_7515_test.go` (new), `docs/multi-wan.md`
+
+## 2026-08-22 — #7532 vipWarnedIfaces gets its own mutex
+- **Timestamp**: 2026-08-22
+- **Action**: The field was reset on the apply path (applySem) and lazily
+  created/read/assigned/deleted on the VRRP reconcile path under no shared
+  lock — a reset between the nil-check and the assignment panics, two
+  reconcile writers are a fatal throw. Gave it a dedicated mutex and three
+  accessors; the check-and-record is now one critical section.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/vip_warn_sync_7532_test.go
+
+## 2026-08-22 — #6747 IKE exchange table: O(1) LRU eviction
+- **Action**: `IkeExchangeTable::seed` chose its eviction victim with
+  `entries.iter().min_by_key(seen)` — a full traversal of all 4096 entries plus
+  empty hashbrown slots, plus a key clone and a second hash lookup, all under a
+  lock `matches` takes on the hot admission path for every Responder-SPI IKE
+  packet, on a table Arc-shared by every packet worker. Replaced the
+  `Mutex<FastMap<Key,u64>>` with an intrusive LRU over a fixed slab (index ->
+  slot, prev/next u32 links, free list): touch unlinks and re-appends at the
+  tail, eviction pops the head. SEMANTICS UNCHANGED — `min_by_key(seen)` with
+  `matches` refreshing `seen` already was LRU, just computed by scanning — so
+  the existing availability reasoning holds verbatim. FIFO was rejected: it
+  removes the scan equally well but evicts a DPD-refreshed long-lived exchange
+  in favour of a brand-new forged initiation, worse under the flood the cap
+  exists for. Added the eviction counter the issue notes was missing.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/ipsec.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+
 ## 2026-08-22 — #6748 GRE decap bounded by the outer IP datagram
 - **Action**: Native GRE decap capped the inner extent at `frame.len() -
   inner_offset` with no cross-check against the outer IPv4 Total Length / IPv6

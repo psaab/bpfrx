@@ -92,14 +92,8 @@ func HostInboundLifelineInterface(name string, lifelines map[string]bool) bool {
 // "fabric0" are NOT canonical: a configured fabric interface with such a name
 // reaches the lifeline set through HostInboundLifelineSet instead.
 func isCanonicalFabricName(base string) bool {
-	rest, ok := strings.CutPrefix(base, "fab")
-	if !ok || rest == "" {
-		return false
-	}
-	for i := 0; i < len(rest); i++ {
-		if rest[i] < '0' || rest[i] > '9' {
-			return false
-		}
-	}
-	return true
+	// #7515: one formula, not two. ifNameNumericSuffix (ifname_class_6731.go) is
+	// the same "prefix followed by digits and nothing else" rule this needed, and
+	// the two drifting apart would be a bug in either direction.
+	return ifNameNumericSuffix(base, "fab")
 }

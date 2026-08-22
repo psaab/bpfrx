@@ -1211,7 +1211,11 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 				// Management interfaces (fxp*, fab*) are bound to vrf-mgmt.
 				// Include VRF= in .network so networkctl reconfigure preserves binding.
 				vrfName := ""
-				if strings.HasPrefix(ifName, "fxp") || strings.HasPrefix(ifName, "fab") || strings.HasPrefix(ifName, "em") {
+				// #7515: config.IsManagementIfName is the SSOT. If this drifts
+				// from the daemon's management-VRF set, networkctl reconfigure
+				// strips a binding the daemon just made (or preserves one it
+				// never made).
+				if config.IsManagementIfName(ifName) {
 					vrfName = "vrf-mgmt"
 				}
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
