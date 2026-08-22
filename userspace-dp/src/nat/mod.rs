@@ -276,7 +276,21 @@ impl NatCounterStore {
         if counter_id == 0 {
             return None;
         }
-        let mut counters = self.counters.lock().expect("nat counter store poisoned");
+        // #6568 (member 6): a poisoned lock must not PANIC here. This runs on
+        // the NAT translation path, so `.expect` turned one unrelated panic
+        // (whatever poisoned the mutex) into a panic on every subsequent
+        // packet that consults a rule counter — panic amplification that
+        // converts a single worker fault into a forwarding outage.
+        //
+        // A counter is DIAGNOSTIC state: losing an increment is a reporting
+        // gap, never a forwarding decision. Recover the guard and carry on —
+        // `PoisonError::into_inner` yields the map, which is structurally
+        // intact (the poisoning thread panicked, it did not corrupt the
+        // BTreeMap), so the counters keep working through the incident.
+        let mut counters = match self.counters.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Some(counter) = counters.get(&counter_id) {
             return Some(counter.clone());
         }

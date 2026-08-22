@@ -29,6 +29,11 @@ type fakeClusterSessionService struct {
 	zpCalled      bool
 	zpReq         *pb.GetZonePairSummaryRequest
 	zpResp        *pb.GetZonePairSummaryResponse
+
+	// #5968 peer-only delegation.
+	peerGetCalled     bool
+	peerSummaryCalled bool
+	peerZPCalled      bool
 }
 
 func (f *fakeClusterSessionService) ClearSessions(_ context.Context, req *pb.ClearSessionsRequest) (*pb.ClearSessionsResponse, error) {
@@ -52,6 +57,28 @@ func (f *fakeClusterSessionService) GetSessionSummary(_ context.Context, req *pb
 func (f *fakeClusterSessionService) GetZonePairSummary(_ context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error) {
 	f.zpCalled = true
 	f.zpReq = req
+	return f.zpResp, nil
+}
+
+// #5968: the peer-ONLY entry points the REST handlers now delegate to. They
+// return the SAME fixtures as their full-view siblings — the REST contract
+// under test is "the peer view reaches the response", which did not change —
+// and set their own *called* flags so a test can tell WHICH method the handler
+// used. That distinction is the point: the old methods walked the local table a
+// second time and had their local result discarded.
+func (f *fakeClusterSessionService) PeerSessions(_ context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
+	f.peerGetCalled = true
+	f.getReq = req
+	return f.getResp, nil
+}
+
+func (f *fakeClusterSessionService) PeerSessionSummary(_ context.Context) (*pb.GetSessionSummaryResponse, error) {
+	f.peerSummaryCalled = true
+	return f.summaryResp, nil
+}
+
+func (f *fakeClusterSessionService) PeerZonePairSummary(_ context.Context) (*pb.GetZonePairSummaryResponse, error) {
+	f.peerZPCalled = true
 	return f.zpResp, nil
 }
 
@@ -201,7 +228,7 @@ func TestRESTSessionListNodeIDAndPeer(t *testing.T) {
 	if resp.Peer != nil {
 		t.Fatal("peer set without include_peer")
 	}
-	if fake.getCalled {
+	if fake.peerGetCalled || fake.getCalled {
 		t.Fatal("peer fetched without include_peer")
 	}
 
@@ -215,7 +242,10 @@ func TestRESTSessionListNodeIDAndPeer(t *testing.T) {
 	if len(resp.Sessions) != 1 {
 		t.Fatalf("local sessions = %d, want 1", len(resp.Sessions))
 	}
-	if !fake.getCalled || fake.getReq == nil || !fake.getReq.GetIncludePeer() {
+	// #5968: the delegate is PeerSessions now — peer view only, no redundant
+	// local walk. The property is unchanged: the handler fetched the peer
+	// through the HA-aware service and asked for the peer view.
+	if !fake.peerGetCalled || fake.getReq == nil || !fake.getReq.GetIncludePeer() {
 		t.Fatal("include_peer=true did not fetch peer sessions via the HA-aware service")
 	}
 	if resp.Peer == nil {
@@ -271,7 +301,9 @@ func TestRESTSessionSummaryNodeIDAndPeer(t *testing.T) {
 		t.Fatalf("include_peer status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
 	sum = decodeSummary(t, rr.Body.Bytes())
-	if !fake.summaryCalled || fake.summaryReq == nil || !fake.summaryReq.GetIncludePeer() {
+	// #5968: delegated to PeerSessionSummary, which takes no request — the
+	// peer view is all it returns, so there is no IncludePeer flag to assert.
+	if !fake.peerSummaryCalled {
 		t.Fatal("include_peer=true did not fetch the peer summary via the HA-aware service")
 	}
 	if sum.Peer == nil {
@@ -319,7 +351,7 @@ func TestRESTSessionListPeerOnlyOnFirstPage(t *testing.T) {
 	if resp := decodeSessions(t, rr.Body.Bytes()); resp.Peer == nil {
 		t.Fatal("offset=0 (first page) did not attach the peer list")
 	}
-	if !fake.getCalled {
+	if !fake.peerGetCalled {
 		t.Fatal("offset=0 did not fetch the peer")
 	}
 
@@ -334,7 +366,7 @@ func TestRESTSessionListPeerOnlyOnFirstPage(t *testing.T) {
 	if resp := decodeSessions(t, rr.Body.Bytes()); resp.Peer != nil {
 		t.Fatal("offset=10 (later page) re-attached the peer table — over-counts the peer across offset pages")
 	}
-	if fake.getCalled {
+	if fake.peerGetCalled || fake.getCalled {
 		t.Fatal("offset=10 fetched the peer table on a non-first page")
 	}
 }
@@ -383,7 +415,7 @@ func TestRESTSessionListPeerHonorsPageSize(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
-	if !fake.getCalled || fake.getReq == nil {
+	if !fake.peerGetCalled || fake.getReq == nil {
 		t.Fatal("include_peer=true did not fetch peer sessions via the HA-aware service")
 	}
 	if got := fake.getReq.GetPageSize(); got != 1000 {

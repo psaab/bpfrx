@@ -74,6 +74,33 @@ const (
 	// the version then.
 	syncMsgDHCPLeaseV4 = 25
 	syncMsgDHCPLeaseV6 = 26
+	// #7328 config-apply NACK. The RECEIVER sends this after an apply that did
+	// NOT take effect, carrying the generation it failed on (u64 LE). It exists
+	// because the sender has no other way to learn the outcome: QueueConfig is
+	// fire-and-forget, the heartbeat carries no config state, and
+	// configSyncFailing never leaves the node it is raised on.
+	//
+	// Without it, #5863's (epoch x generation) push dedupe silently defeats
+	// #4151's re-push contract. #4151 deliberately pins lastAppliedConfigGen on
+	// a failed apply so the SAME generation stays eligible for a re-push, and
+	// errConfigSyncRejectedPrimary's doc says the dual-active window "must heal
+	// via the peer's re-push" — but the reconciler claims its marker BEFORE
+	// sending and nothing ever clears it, so no trigger on the live connection
+	// ever pushes that generation again. #6387's own comment records the same
+	// mechanism from the other side ("the sender pushes a generation at most
+	// once per connection, so a stable connection with a persistent apply
+	// failure would otherwise never re-enter this edge") and answered it with an
+	// alarm rather than convergence.
+	//
+	// ADDITIVE and length-gated on the #2239 precedent above: a peer predating
+	// the feature hits the default receive case and ignores it, and a receiver
+	// tolerates a short/absent payload. Deliberately NO CurrentHAProtocolVersion
+	// / SessionSyncWireVersion bump — nothing about the existing messages
+	// changes, and bumping would make the #1930 INC-3 mixed-base gate falsely
+	// refuse session sync across a mixed pair. A mixed pair simply keeps
+	// today's behaviour: the old side never nacks, so the marker is never
+	// re-armed and convergence still waits for a commit or a reconnect.
+	syncMsgConfigApplyNack = 27
 )
 
 // syncHeader is the wire header for each sync message.
@@ -117,8 +144,15 @@ type SyncStats struct {
 	// prior config (M-2/#4151). A persistently-nonzero value means a standby is
 	// repeatedly failing to apply the peer's config — investigate divergence.
 	ConfigsApplyFailed atomic.Uint64
-	IPsecSASent        atomic.Uint64
-	IPsecSAReceived    atomic.Uint64
+	// ConfigApplyNacksReceived counts #7328 config-apply nacks accepted from the
+	// peer — one per generation this node pushed that the peer refused or failed
+	// to apply. A nack for a superseded generation is ignored and not counted.
+	// A persistently-nonzero, climbing value means the peer is repeatedly
+	// failing to apply what this node sends; pair it with the peer's own
+	// ConfigsApplyFailed to see why.
+	ConfigApplyNacksReceived atomic.Uint64
+	IPsecSASent              atomic.Uint64
+	IPsecSAReceived          atomic.Uint64
 	// IPsecSAStaleIgnored counts IPsec SA full-sets dropped by the #5706
 	// ordering guard: an incoming (incarnation, seq) that was NOT strictly
 	// newer than the last-applied pair — a full-set reordered across the
@@ -411,6 +445,24 @@ type SessionSync struct {
 	// degraded health instead of only the terse `Transfer ready: no` string.
 	// Diagnostic only — it NEVER gates failover.
 	OnConfigApplyHealth func(failing bool, reason string)
+	// OnPeerConfigApplyFailed reports that the PEER refused or failed to apply
+	// the config generation this node most recently sent (#7328). It fires on
+	// the sender when a syncMsgConfigApplyNack arrives whose generation matches
+	// lastSentConfigGen — a nack for any other generation is a straggler for a
+	// push this node has already superseded and is ignored.
+	//
+	// The daemon wires this to invalidate the #5863 (epoch x generation) push
+	// marker, which is the ONLY thing standing between the standby and the
+	// re-push #4151 leaves it eligible for. The handler deliberately does NOT
+	// push inline: it clears the marker and lets the ordinary reconcile tick
+	// re-push, so a failure that recurs instantly cannot become a
+	// push/fail/nack tight loop. That bounds the retry to the reconciler's
+	// cadence, which is the same rate #5863's marker exists to protect.
+	//
+	// It fires ONLY on a failed apply. A successful apply sends no nack, so the
+	// marker stands and a healthy connection still pushes a generation exactly
+	// once — the #5863 no-storm property is preserved.
+	OnPeerConfigApplyFailed func(gen uint64)
 	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
 	OnIPsecSAReceived func(connectionNames []string)
 	// OnDHCPLeasesReceived is called when a DHCP-server lease set arrives from
@@ -685,6 +737,11 @@ type SessionSync struct {
 	// whose monotonic counter restarts lower — is accepted instead of refused
 	// as stale (the #2198 F2 inverse-of-stale-RETAIN reasoning, applied to
 	// config).
+	// #7328: the config generation this node most recently PUT ON THE WIRE
+	// (QueueConfig). Distinct from configGenCounter, which is the next value to
+	// draw: a nack naming an older generation is a straggler for a push already
+	// superseded and must not re-arm the marker for the current one.
+	lastSentConfigGen    atomic.Uint64
 	configGenCounter     atomic.Uint64
 	lastAppliedConfigGen atomic.Uint64
 	// applyingConfigGen is the apply-in-progress config fence (#6284, item 2).

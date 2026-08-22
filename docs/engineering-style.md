@@ -194,6 +194,20 @@ the mechanics, so this section is sequencing only.
 - A `#[test]` that asserts `CONST >= N` runs only on `cargo test`.
   A `const _: () = assert!` runs on every `cargo build`. Prefer
   the latter for values that must not drift.
+- **Prefer a compile-time guard — but measure before assuming one
+  exists.** A guard that cannot catch the bugs that motivated it is
+  decoration, and a lint whose false positives get suppressed is worse
+  than no lint: a suppressed lint reads as a checked property. Before
+  proposing a `go vet` / `analysistest` rule for a recurring defect,
+  pull two or three of the real historical instances out of git history
+  and check the rule reds on them. A rule keyed to the vocabulary a FIX
+  introduced is structurally blind to the pre-fix code — it tests the
+  repair, not the property. `docs/applied-marker-invariant.md` is the
+  worked example: the applied/published/converged marker rule proposed
+  in #6533 missed 3 of 3 sampled historical defects and flagged the
+  correct mechanisms, including its own flagship target, because
+  correct markers are correct via caller contracts and readbacks that
+  no intra-function dominance rule can see.
 
 ## API shape discipline
 

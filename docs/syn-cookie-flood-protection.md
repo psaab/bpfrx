@@ -480,6 +480,25 @@ xpf_screen_syncookie_total{type="bypass"}    # Validated sources bypassing chall
 
 ## Limitations
 
+- **Every screen RATE threshold is PER-WORKER, so the effective rate is
+  `N_workers x configured` (#6568 member 3).** Each worker owns its
+  `ScreenState` by value (`userspace-dp/src/afxdp/worker/loop_body/setup.rs`
+  creates one per worker loop), so the token buckets behind `syn-flood`
+  (attack-threshold, alarm-threshold, source-threshold, destination-threshold),
+  `icmp` and `udp` flood, `port-scan`, `ip-sweep`, and the cookie-OFF bucket
+  are counted independently per RX queue. On the 6-worker loss VFs a
+  configured `attack-threshold 1024` admits up to ~6144/s before every worker
+  is over its own threshold.
+
+  This is consistent with the rest of the per-worker dataplane and is NOT a
+  global rate. **Size each configured value as a per-worker ceiling**, i.e.
+  divide the intended aggregate rate by the RX-queue count.
+
+  The sibling `limit-session source-ip-based` / `destination-ip-based` leaves
+  carry exactly this multiplier and have documented it since #2186
+  (`docs/feature-gaps.md`); the flood/scan leaves have the same behaviour and
+  did not say so, which is the gap this entry closes. It is a documentation
+  fix, not a behaviour change — nothing about the enforcement moved.
 - **syn-proxy mode** (stateful proxying with full TCP handshake completion) is not
   implemented. Only syn-cookie mode is supported.
 - The `validated_clients` LRU map has a fixed size of 65536 entries. Under

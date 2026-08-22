@@ -2176,6 +2176,52 @@ still the boot path and the peer-sync path. The #6735 packed-tail shape is a
 different matter: it IS reachable from the ordinary `set` CLI, in both the
 Keys-collapsed and keyword-descended arrangements shown above.
 
+### Four more members of the same family (#6564)
+
+The #6525 zone-membership case above is one instance of a recurring shape. Four
+further sites read the operand from ONE side only, and each dropped it BEFORE an
+otherwise-correct strict gate read it, so the gate iterated an empty slice and
+passed VACUOUSLY. In every case the config committed clean and the control was
+simply not in force.
+
+| Statement | Read before #6564 | Silent consequence |
+|---|---|---|
+| `security alg { dns disable; }` | `FindChild("disable")` — Children only | ALG stayed **ENABLED**; the #4232 unsupported-proto advisory does not fire either, because `dns` IS wired |
+| `policy-options { prefix-list PL 10.0.0.0/8; }` | `inst.node.Children` only | list compiled **NAMED but EMPTY**; a filter term scoped by it silently stopped matching |
+| `route R { next-hop { 192.168.1.1; } }` | `prop.Keys` only; Children matched just the `interface` modifier | route carried **ZERO** dispositions — `staticRouteDispositionConflict` rejects only >= 2, never zero — and rendered nothing into FRR |
+| `security flow { tcp-mss all-tcp 1350; }` | `mssNode.Children` in BOTH the compiler and `validateTCPMSSRanges` | MSS clamping silently off; the range validator passed vacuously |
+
+The static-route case is the INVERSE of the usual direction — the operand is in
+the Children and the reader took it from the Keys — which is worth naming
+explicitly, because "read Keys as well as Children" is the wrong generalisation.
+The property is *read the side the operand is actually on*, and a fix that only
+ever adds a Keys read will miss this one.
+
+**One reader, not two (`tcpMSSOptionNodes`).** `tcp-mss` had two independent
+Children walks — the compiler's and the range validator's — which is precisely
+how the two halves drift. The packed leaf is now surfaced as a synthetic option
+node by a single helper both call, so a future shape is handled once or not at
+all, never half.
+
+**Widening the grammar is a failure mode too.** `mss` is the HIERARCHICAL
+keyword (`all-tcp { mss 1350; }`); inline it is a typo, and the half-packed
+`tcp-mss { all-tcp mss 1350; }` already hard-rejects it (`selectMSSToken` picks
+the literal `mss`). The synthetic node therefore carries the tokens VERBATIM so
+the fully-packed leaf inherits the same rejection. Teaching it to strip `mss`
+would have made the two shapes disagree in the opposite direction — accepting a
+spelling one level up refuses. The acceptance criterion is "identical in both
+shapes OR rejected at commit", and for that token the answer is rejected.
+
+Covered by `pkg/config/compact_leaf_cohort_6564_test.go`, which asserts the
+brace and flat-set spellings AGREE with the compact one rather than asserting
+the compact one alone — a test that pinned only the compact shape would not
+notice the two drifting apart again.
+
+REACHABILITY (honest bound): as with #6525, these compact spellings are
+hierarchical text ingest only — `load override` / `load merge` / the persisted
+config file / HA `SyncApply`. `set` cannot produce them and `display set`
+round-trips safely. Those are still the boot path and the peer-sync path.
+
 **A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
 node it is authored on, never by that node's CHILDREN (#6391).** The
 `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP only — it recurses
@@ -7649,6 +7695,16 @@ reserved for whole-dataplane selection where a rewrite shim
     validating so they stay byte-for-byte in lockstep (a leading-whitespace
     template must not warn while the runtime trims+accepts it). The malformed
     template is `RedactURL`'d in the warning message (it may carry a credential).
+    `RedactURL` itself was only sound for a WELL-FORMED URL until #6609: it
+    located userinfo by finding `@` inside the authority, so the commonest
+    credentialed typo — omitting the `@`, as in
+    `http://user:s3cr3t.example/` — matched nothing and was returned in full,
+    on the very branch that exists to report a malformed template. It now also
+    redacts the whole authority when the host part carries a colon whose suffix
+    is not a port (a bracketed IPv6 literal is recognised, so a well-formed
+    `[2001:db8::1]:8443` is still printed), starts the authority correctly for
+    a scheme-relative `//user:pass@host/`, and drops the fragment — which a
+    query already dropped as a side effect, so only the no-query case leaked.
     Without the commit-time check the typo committed silently and the runtime
     fetch then masqueraded forever as a transient observation failure,
     suppressing publishing indefinitely. The runtime `ddns.CheckIP` gate
@@ -9105,8 +9161,8 @@ the value sits in a single typed slot:
     (`buildFlowExportSnapshot` reads `fm.Version9` only).
   - `security flow tcp-session` expanded to a container: `established-timeout`
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
-    `time-wait-timeout` (config-only, not wire-reaching) all
-    `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
+    `time-wait-timeout` (config-only, not wire-reaching — see **#6539** below)
+    all `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
     NOT u64-max. This is the operator-facing reject; it stays in lockstep with
     the runtime saturation backstop `SessionTimeouts::from_seconds` (#2441),
     which converts `secs → ns` with `checked_mul` and saturates at
@@ -9119,12 +9175,40 @@ the value sits in a single typed slot:
     presence-only for completion parity. The presence flags compile into
     `TCPSessionConfig` (NoSynCheck / NoSynCheckInTunnel / RstInvalidateSession
     / NoSequenceCheck) but are typed-config only — the userspace dataplane does
-    not read them. The session table is a pure 5-tuple flow entry with no TCP
-    state machine and no sequence/window tracking, so there is nothing for any
-    of these knobs to enforce or skip. **#2078:** setting any of them emits a
+    not read them. The session table is a 5-tuple flow entry with no
+    sequence/window tracking, so there is nothing for any of these knobs to
+    enforce or skip. **#2078:** setting any of them emits a
     single accepted-only commit advisory (`pkg/config/compiler.go`,
     `security flow tcp-session ... accepted-only`) so an operator is not
     silently misled; research #2078 converged PLAN-KILL on enforcement.
+    (**#6539** narrowed that sentence: it used to say the dataplane has no TCP
+    state machine, which #3152 — OPENING vs established — and #3046 — RST vs
+    FIN close — have since made false. Those states are precisely why the
+    TIMEOUT leaves need a differently-worded advisory.)
+
+    **#6539 — the three unenforced timeout leaves.** `initial-timeout`,
+    `closing-timeout` and `time-wait-timeout` are committable but have no wire
+    carrier and no consumer, while REST, CLI and gRPC all printed them in the
+    same shape as `established-timeout`, which IS carried. That is worse than a
+    plainly unimplemented feature: the surface an operator checks after
+    committing confirmed the false belief, and `initial-timeout` is the
+    half-open / SYN-flood bounding control. `pkg/config/flow_tcp_timeouts_6539.go`
+    is now the single authority for the enforced/unenforced split — the commit
+    advisory and all three render surfaces read it, so they cannot disagree, and
+    a leaf that later gains a carrier loses its annotation everywhere at once.
+    The fixed windows the dataplane applies instead (20s half-open, 30s FIN
+    close, 2s RST abort, 300s established fallback) are quoted in operator-facing
+    text, so a test re-reads them from `userspace-dp/src/session/mod.rs` and
+    fails on drift; another in `pkg/dataplane/userspace` fails if any of the
+    three starts reaching the wire snapshot without the table being updated. A
+    fourth guard walks `setSchema` and fails if a new `*-timeout` leaf is
+    declared under `tcp-session` without an entry in the table — otherwise the
+    new leaf would render unannotated and reproduce #6539 for itself.
+    Enforcing the three is a separate, larger job: `initial-timeout` maps 1:1
+    onto `SessionTimeouts.tcp_opening_ns` and could be carried additively, but
+    `time-wait-timeout` has no state to attach to (`session_timeout_ns` splits a
+    close only into RST vs FIN), so it needs a close-state split in the Rust
+    session machine — and a wire bump owes a cluster smoke.
     The RST design rationale (suppress RST→CLOSED for ESTABLISHED, keep
     `rst-invalidate-session` as the opt-in override) is in
     `docs/active-active-new-connections.md`. The dead legacy `flow_config_map`

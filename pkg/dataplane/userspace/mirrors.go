@@ -48,15 +48,19 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 		if inst == nil {
 			continue
 		}
-		if inst.Output == "" {
-			slog.Warn("port-mirroring instance has no output interface", "name", name)
-			continue
-		}
-		if inst.InputRate < 0 {
-			// A negative rate would wrap in uint32(inst.InputRate) below. Drop
-			// only this instance; the commit gate rejects it up front.
-			slog.Warn("port-mirroring: skipping instance with negative input rate",
-				"name", name, "rate", inst.InputRate)
+		// Config-decidable drops: no output interface, or a negative rate that
+		// would wrap in uint32(inst.InputRate) below. Drop only this instance;
+		// the commit gate (validateSamplingInputRateStrict) rejects it up
+		// front, so this is the lenient load / peer-sync backstop.
+		//
+		// #6534: the verdict is config.PortMirroringInstanceExcludedReason so
+		// this builder and BOTH port-mirroring show surfaces cannot disagree
+		// about which instances are armed. The two interface-resolution drops
+		// below are NOT in that predicate — they depend on the runtime ifindex
+		// table, which a config-only renderer cannot reach.
+		if reason := config.PortMirroringInstanceExcludedReason(inst); reason != "" {
+			slog.Warn("port-mirroring: skipping instance (fail-closed)",
+				"name", name, "reason", reason, "rate", inst.InputRate, "output", inst.Output)
 			continue
 		}
 		outputIfindex := ifindexByName[inst.Output]

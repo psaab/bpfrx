@@ -1383,6 +1383,64 @@ its logging/inversion intent (#3684):
 
 ---
 
+## Class-of-service entries the dataplane does not install (#6534)
+
+A classifier, rewrite-rule or scheduler-map entry naming a
+forwarding-class that `class-of-service forwarding-classes` does not
+define is SKIPPED by the snapshot builder. The object still installs,
+but PARTIALLY: those code points do not classify, and shaping for that
+class degrades to best-effort. `show class-of-service classifiers`,
+`... rewrite-rules` and `... scheduler-map` annotate the loss:
+
+```
+Classifier: cls, Code point type: dscp
+  Code point  Forwarding class  Loss priority
+  001010      real              low
+  010100      ghost             low
+  NOT INSTALLED: entries for forwarding-class ghost are skipped (no such class under `class-of-service forwarding-classes`)
+```
+
+Unlike the NAT exclusions below, this one is reachable through an
+ordinary `commit`: an undefined forwarding-class reference is only a
+commit-time WARNING, never a strict rejection, so it is a supported
+config shape rather than a lenient-path-only artifact.
+
+Two deliberate non-annotations:
+
+- A scheduler-map entry naming an undefined SCHEDULER is a different
+  edge with the opposite disposition — the entry is KEPT on the wire so
+  the class's queue still materializes — so it is not annotated.
+- `ieee-802.1` rewrite-rules are not published to the dataplane at all,
+  which is a wholesale gap rather than a per-entry skip, so their
+  entries are not annotated as skipped either.
+
+## Port-mirroring instances the dataplane does not install (#6534)
+
+`show forwarding-options` (gRPC) and the CLI `show forwarding-options
+port-mirroring` render instances from configuration. An instance the
+snapshot builder DROPS carries a `NOT INSTALLED` line naming why:
+
+```
+Instance: span1
+  Input rate: all packets
+  Input interfaces: ge-0/0/1.0
+  Output interface: ge-0/0/9.0
+  NOT INSTALLED: negative input rate
+```
+
+The negative-rate case is the one to know about. Both renderers print
+`Input rate: all packets` whenever the rate is not greater than zero, so
+before this annotation a dropped instance advertised the most permissive
+mirror possible while mirroring nothing at all.
+
+Coverage is deliberately partial. The annotation covers the drops
+decidable from configuration — no output interface, and a negative input
+rate. The builder drops an instance for two further reasons that depend
+on the runtime interface table and are NOT annotated: an output interface
+that does not resolve to an ifindex, and an ingress interface already
+claimed by a lower-sorted instance (one output per ingress ifindex).
+Annotating those needs the resolved ifindex map threaded to the surface.
+
 ## Security: NAT rules the dataplane does not install (#6534)
 
 Every `show security nat ...` topic renders rules from the committed

@@ -427,6 +427,43 @@ pub(crate) enum SnapshotIntegrityError {
         direction: String,
         filter: String,
     },
+    /// #6540: a firewall-filter term's `then policer <name>` named a policer
+    /// that the snapshot defines NEITHER as `firewall policer <name>` NOR as
+    /// `firewall three-color-policer <name>`. The pre-fix compiler resolved the
+    /// reference with a bare `.get(...)` yielding `None`, and
+    /// `apply_term_three_color_policer` then no-opped the meter — so a
+    /// configured rate limit (a DoS-mitigation policer, say) forwarded
+    /// UNPOLICED with no `Err`, no warning and no counter.
+    ///
+    /// Policer was the odd one out of three sibling reference mechanisms:
+    /// filters raise `MissingFilterRef` (six `return Err` sites in
+    /// `filter/compiler.rs`) and screen reports `ScreenMissingProfileRef`, but
+    /// `grep MissingPolicerRef` over this tree returned zero. It over-permits
+    /// BANDWIDTH rather than admitting traffic a policy would deny, which is
+    /// why it is the Medium of that family rather than a High.
+    ///
+    /// The Go STRICT commit gate (#2217 Finding A,
+    /// `compiler_validate_strict_filter.go`) is the primary defense and asks
+    /// the SAME question — defined under `firewall policer` or `firewall
+    /// three-color-policer` — so a freshly committed config can never carry a
+    /// dangling reference. This arm guards the lenient `Store.Load` /
+    /// `Store.SyncApply` path (`opts.lenientFirewallRefs`, #1960 no-brick),
+    /// where that gate is downgraded to a warning and nothing else was left.
+    ///
+    /// The predicate is DEFINEDNESS, deliberately NOT presence in the compiled
+    /// `three_color_policer_by_name` map. Those two differ, and the difference
+    /// matters: `lower_single_rate_policer_runtimes` (#4514) SKIPS a degenerate
+    /// zero-rate METER-ONLY policer because it has no action to enforce, so
+    /// such a policer is defined, absent from the map, and must NOT be
+    /// rejected. Keying this on the map would refuse a config that boots today.
+    /// An EMPTY reference (no policer on the term) is the legitimate
+    /// "unpoliced" case and is NOT an error.
+    MissingPolicerRef {
+        family: String,
+        filter: String,
+        term: String,
+        policer: String,
+    },
     /// #2391: an interface snapshot named a NON-EMPTY security zone that is not
     /// present in the zone table (`zone_name_to_id`). The pre-fix code resolved
     /// the missing name to `zone_id == 0` (`unwrap_or(0)`), silently collapsing
@@ -652,6 +689,30 @@ pub(crate) enum SnapshotIntegrityError {
         destination: String,
         family: String,
     },
+    /// #6568 (member 1): a `RouteSnapshot` carried a `destination` that parses
+    /// as NEITHER `Ipv4Net` NOR `Ipv6Net`, so no FIB can hold it.
+    ///
+    /// `populate_routes` used to fall off the end of the loop body here — no
+    /// `Err`, no counter, no log — at a boundary whose entire #2409/#2410/#3771
+    /// contract is "no silent skips". It was filed as a low-materiality
+    /// residual with "no traffic fail-open"; that is wrong. `ipnet`'s parsers
+    /// REQUIRE a prefix length and nothing in the config compiler validated the
+    /// destination, so a bare host address (`10.0.0.1`, `2001:db8::1`) or the
+    /// Junos `default` keyword committed cleanly, shipped, and VANISHED here.
+    ///
+    /// For a `discard`/`reject` route that is a fail-OPEN: the blackhole entry
+    /// is absent, the packet longest-prefix matches a LESS-SPECIFIC route
+    /// (typically the default) and is FORWARDED where the operator asked for it
+    /// to be dropped — and it presents as a routing mystery, because the
+    /// control plane, FRR and the kernel all show the route as configured.
+    ///
+    /// The Go producer now normalises a bare address to its /32 or /128 host
+    /// prefix and drops anything still unusable with a WARN naming the route
+    /// (`routeDestinationForWire`, pkg/dataplane/userspace/routes.go), so a
+    /// clean snapshot never trips this. It is the helper-boundary backstop for
+    /// a corrupt / hand-built / version-drifted snapshot, consistent with the
+    /// #2410/#2409 fail-closed family.
+    RouteDestinationUnparseable { table: String, destination: String },
     /// #3771 (L1): a `RouteSnapshot` carried a NEGATIVE `preference`. Junos route
     /// preference is a non-negative administrative distance (default 5; lower =
     /// more preferred); the FIB tie-breaks same-prefix routes by ASCENDING
@@ -881,6 +942,16 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 "interface {:?} family {:?} filter {} references undefined filter {:?} — refusing to fail open by leaving the hook unarmed (which would forward unfiltered, equivalent to no filter)",
                 interface, family, direction, filter
             ),
+            Self::MissingPolicerRef {
+                family,
+                filter,
+                term,
+                policer,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} references undefined policer {:?} — refusing to fail open by leaving the rate limit unmetered (which would forward unpoliced, equivalent to no policer)",
+                family, filter, term, policer
+            ),
             Self::InterfaceUnknownZone { interface, zone } => write!(
                 f,
                 "interface {:?} references zone {:?} that is not in the zone table — refusing to fail open by collapsing it to the \"unknown\" zone 0 (which would bypass every zone-pair policy)",
@@ -988,6 +1059,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "route {:?} in table {:?} declares family {:?} that does not match the address family of its destination prefix — refusing to install it into the prefix-parsed FIB while the family metadata claims the other",
                 destination, table, family
+            ),
+            Self::RouteDestinationUnparseable { table, destination } => write!(
+                f,
+                "route {:?} in table {:?} has a destination that parses as neither an IPv4 nor an IPv6 prefix — refusing to skip it silently, because a dropped discard/reject route falls through to a less-specific route and FORWARDS traffic the operator asked to blackhole (a bare host address needs its /32 or /128)",
+                destination, table
             ),
             Self::RoutePreferenceOutOfRange {
                 table,
