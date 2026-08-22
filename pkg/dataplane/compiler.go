@@ -529,11 +529,7 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 	// Record VLAN sub-interfaces so userspace-shim swaps can skip them.
 	// The shim on VLAN sub-interfaces breaks NDP because generic XDP
 	// + XDP_PASS doesn't deliver properly to kernel NDP on VLAN devices.
-	for ifidx := range result.genericXDPIfindexes {
-		if !result.tunnelIfindexes[ifidx] {
-			m.VlanSubInterfaces[ifidx] = true
-		}
-	}
+	m.markVLANSubInterfaces(result)
 	m.lastCompile = result
 	m.recordApplyResult(ApplyResultFromCompileResult(result))
 	return result, nil

@@ -879,7 +879,9 @@ var xdpLinkProgramID = func(l link.Link) (progID uint32, ok bool) {
 // anything this compile recorded, because the mode persists across compiles and
 // the per-compile record does not.
 func (m *Manager) attachedInstance(ifidx int) (progID uint32, generic bool, ok bool) {
-	l, exists := m.xdpLinks[ifidx]
+	// #6740: guarded read. xdpLinkModeGeneric / xdpLinkProgramID below issue
+	// netlink+BPF queries, so the lock is released before them.
+	l, exists := m.xdpLinkFor(ifidx)
 	if !exists {
 		return 0, false, false
 	}
