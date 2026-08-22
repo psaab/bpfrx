@@ -103662,3 +103662,10 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
+
+## 2026-08-22 — #6725 closed-world doc claim
+- **Action**: Corrected the one residual false claim in the open-world branch
+  ("the default for every production subtree"; unscoped "byte-identical").
+  Two of the issue's three claims were already fixed by f37fdf19b (2026-08-05),
+  four days after the issue was filed.
+- **File(s)**: `pkg/config/schema_walk.go`

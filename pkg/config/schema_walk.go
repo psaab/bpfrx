@@ -353,9 +353,26 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		if closed {
 			return typedLeafErrorf(path, "unknown configuration keyword %q under closed-world subtree", keyword)
 		}
-		// Open-world (the default for every production subtree): unknown
-		// keywords are not our concern — the gate is opt-in; leave reporting
-		// to the compiler. Behaviour here is byte-identical to pre-#4313.
+		// Open-world — the default for a subtree that has NOT opted in, which
+		// is most of them and emphatically not all. Unknown keywords are not
+		// our concern here; the gate is opt-in, so leave reporting to the
+		// compiler.
+		//
+		// "BYTE-IDENTICAL TO PRE-#4313" IS TRUE OF THIS BRANCH AND OF NOTHING
+		// WIDER, and saying which is the whole correction. The FUNCTION's
+		// behaviour did change: a typo'd leaf under an armed subtree is
+		// rejected at commit where it used to commit clean and be silently
+		// dropped. The unscoped form of this sentence was read as a claim
+		// about the MECHANISM — #6725 quoted it to conclude the gate was inert
+		// — which is the same misreading the keyword-resolution gate above was
+		// corrected for, surviving here because that correction did not reach
+		// this branch. A scope-free "behaviour is unchanged" sitting next to
+		// an opt-in gate always reads as the wider claim.
+		//
+		// Bound, not merely asserted: each schema_closedworld_*_4313_test.go
+		// commits a typo under one armed subtree and requires a REJECT, so if
+		// open-world ever did become universal they would red rather than this
+		// prose quietly becoming true again.
 		return nil
 	}
 
