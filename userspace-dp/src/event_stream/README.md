@@ -152,6 +152,19 @@ periodic ACK from the daemon.
   `emit_screen_alarm_event`) deliberately keep 0: the screen parse-error
   fail-closed path (#2146) and the L4-less screen drops legitimately lack a
   resolvable 5-tuple, so fabricating an AppID there would be wrong.
+  #5190: "lacks a resolvable 5-tuple" is not the same as "lacks everything".
+  The FLOWLESS fail-closed screen drop (`screen_parse_error_info_flowless`,
+  taken by a non-first fragment / ICMP control message whose L3 chain will
+  not parse) now carries the authoritative `protocol` from the shim
+  metadata and the real source/destination read out of the IP header, and
+  only the L4 PORTS stay 0. It used to hard-code `protocol: 0` and an
+  UNSPECIFIED address pair while both authoritative values sat unused at
+  its single call site, so every such drop reached syslog/NetFlow as
+  `protocol=0` from `0.0.0.0`. The helper takes `&UserspaceDpMeta` plus the
+  caller-derived addresses precisely so that omission is unrepresentable;
+  when the header is too short to read at all, the caller's
+  `flowless_l3_addrs` still hands over the family-correct UNSPECIFIED pair,
+  so a wholly unreadable frame degrades exactly as before.
   `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 152-byte payload
   with the event-type byte set to RT_FLOW SESSION_CLOSE (2), plus the
   #3056 admitting policy ID in the trailing [136:140] slot and the #2749

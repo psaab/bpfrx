@@ -98180,3 +98180,81 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
   pkg/dataplane/userspace_xdp_manifest.json,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #5190 userspace-dp observability/telemetry cohort — swept all six
+  enumerated rows plus the cross-linked NAT comment against origin/master and
+  fixed six of seven. Verdicts: A1-b1-F5 LIVE (flowless malformed-packet screen
+  drop hard-coded `protocol: 0` / `pkt_len: 0` / UNSPECIFIED addresses while the
+  authoritative `meta` and the already-derived L3 addresses sat unused at the
+  single call site — telemetry-only, confirmed: `record_screen_drop` and
+  `record_zone_flood_drop` key on the reason STRING, so no drop-counter index,
+  rate bucket or sketch key ever saw the 0). A1-b1-F6 LIVE (`lookup_counted`
+  commits `hits += 1` before the caller's neighbor-MAC/HA validation, so a
+  REJECTED candidate published as a served hit — inflation correlated with VRRP
+  failover / NIC swap / RG transition, i.e. exactly when the hit rate is read;
+  telemetry-only, `flow_cache_hits` reaches `BindingStatus` and Prometheus, no
+  decision). A1-b1-F7 LIVE (fixed 1514 ceiling, debug-build-only counter; an
+  in-band VLAN-tagged full-MTU frame is 1518 so the loss cluster's WAN path
+  counts ordinary traffic). A1-b8-F6 LIVE (four shared-UMEM strings +
+  `martian_dropped` + `ipv6_ext_header_dropped` copied but never reset — a
+  field-set diff of the two halves confirms exactly those six and nothing else).
+  A1-b12-F2 LIVE (three `setsockopt` returns discarded, bind logs unqualified
+  OK). A1-b12-F3 LIVE-as-claims (no make target or CI job runs `cargo bench`;
+  `make test-rust` deliberately excludes benches, so nothing automated was
+  reporting a false green — the false claim lived in three bench headers plus
+  the Makefile/testing-procedures prose). Cross-linked #5727 NAT row LIVE (DNAT
+  + static-NAT `match source-address` parse failure fails closed correctly but
+  silently).
+
+  Fixes: `screen_parse_error_info_flowless` now takes `&UserspaceDpMeta` + the
+  caller's derived L3 addresses (the omission is unrepresentable, not merely
+  fixed); `FlowCache::reclassify_hit_as_miss` at the reject branch only (the
+  steady-state fast path is untouched); `rx_oversized` renamed `rx_over_1514`
+  and documented as a fixed-constant test, not an MTU test; the six missing
+  `zero_unbound_slot` resets; `set_busy_poll_opts` returns a `BusyPollSetup`
+  report and the caller emits a `busy-poll DEGRADED` warning naming each refused
+  option + errno; `record_parse_error` on both NAT source-constraint arms; the
+  three bench headers relabelled EXPLORATORY with a banner naming the two
+  benches that do gate.
+
+  NOT fixed, reported as remainder: a real threshold verdict for the three
+  benches (needs chosen numbers + a criterion-to-verdict harness — a design
+  call), and an MTU/jumbo-aware `rx_over_1514` (the per-interface MTU is not
+  available before metadata parse).
+
+  Validation: `cargo check --bins --tests` rc 0, also rc 0 with
+  `--features debug-log` (the renamed counter's only reader is behind it);
+  `cargo check --benches` rc 0; full `cargo test --release --bins --tests --
+  --test-threads=1` rc 0, 4585 passed / 0 failed. Six single-line mutations,
+  each reverted alone and restored: protocol -> 0 RED 101; call-site addresses
+  -> UNSPECIFIED RED 101; `martian_dropped` reset deleted RED 101;
+  `shared_umem_socket_role` reset deleted RED 101; `SO_BUSY_POLL` return
+  re-discarded RED 101; `reclassify_hit_as_miss` call deleted RED 101; DNAT and
+  static-NAT `record_parse_error` arms each reverted RED 101. No Go touched.
+  `cargo clippy` is RED at origin/master too (`clippy::mut_from_ref` in
+  `afxdp/umem/mmap.rs`, untouched here) — pre-existing, not a regression. The
+  helper binary MOVES, so a cluster smoke on the loss userspace cluster is OWED
+  and was NOT run by this lane.
+- **File(s)**: userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_stages_tests.rs,
+  userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/rx_telemetry.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/worker/loop_body/debug_report.rs,
+  userspace-dp/src/afxdp/bind.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md,
+  userspace-dp/src/nat/destination.rs, userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests_destination.rs,
+  userspace-dp/src/nat/tests_static.rs,
+  userspace-dp/src/event_stream/README.md,
+  userspace-dp/benches/session_table.rs,
+  userspace-dp/benches/snat_allocator.rs,
+  userspace-dp/benches/tx_kick_latency.rs, Makefile,
+  docs/testing-procedures.md, docs/userspace-dataplane-architecture.md,
+  docs/userspace-dataplane-gaps.md, _Log.md

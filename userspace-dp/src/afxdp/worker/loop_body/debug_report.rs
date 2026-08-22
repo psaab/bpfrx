@@ -82,7 +82,7 @@ pub(super) struct DbgCounters {
     pub(super) fwd_tcp_zero_window: u64,
     pub(super) rx_bytes_total: u64,
     pub(super) tx_bytes_total: u64,
-    pub(super) rx_oversized: u64,
+    pub(super) rx_over_1514: u64,
     pub(super) rx_max_frame: u32,
     pub(super) tx_max_frame: u32,
     pub(super) seg_needed_but_none: u64,
@@ -132,7 +132,7 @@ impl DbgCounters {
         self.fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
         self.rx_bytes_total += dbg_poll.rx_bytes_total;
         self.tx_bytes_total += dbg_poll.tx_bytes_total;
-        self.rx_oversized += dbg_poll.rx_oversized;
+        self.rx_over_1514 += dbg_poll.rx_over_1514;
         if dbg_poll.rx_max_frame > self.rx_max_frame {
             self.rx_max_frame = dbg_poll.rx_max_frame;
         }
@@ -163,7 +163,7 @@ pub(super) fn emit_periodic_report(
          no_route={} miss_neigh={} neg_ff={} pol_deny={} hib_deny={} ha_inact={} no_egress={} build_fail={} \
          tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
          DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
-         SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} \
+         SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over_1514={}/seg_miss={} \
          TCP_RX:fin={}/synack={}/zwin={} TCP_FWD:fin={}/rst={}/zwin={} \
          CSUM:verified={}/bad_ip={}/bad_l4={} \
          SESS_BPF:verify_ok={}/verify_fail={}/bpf_entries={} bindings:{}",
@@ -214,7 +214,7 @@ pub(super) fn emit_periodic_report(
             0
         },
         dbg.tx_max_frame,
-        dbg.rx_oversized,
+        dbg.rx_over_1514,
         dbg.seg_needed_but_none,
         dbg.rx_tcp_fin,
         dbg.rx_tcp_synack,
