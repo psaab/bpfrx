@@ -89,6 +89,10 @@ pub(super) struct DbgCounters {
     pub(super) fwd_tcp_zero_window: u64,
     pub(super) rx_bytes_total: u64,
     pub(super) tx_bytes_total: u64,
+    /// Mirror of the binding counter. See `afxdp::types::runtime` for what
+    /// this counts and what it does NOT mean: it is a fixed >1514-byte frame
+    /// census, not an MTU-violation count, so tagged full-MTU and jumbo
+    /// frames land in it as ordinary traffic (#5190 A1-b1-F7).
     pub(super) rx_over_1514: u64,
     pub(super) rx_max_frame: u32,
     pub(super) tx_max_frame: u32,
