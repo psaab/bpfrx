@@ -100007,3 +100007,25 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/daemon/daemon_ha_sync.go,
   pkg/daemon/daemon_ha_comms_wiring.go, pkg/daemon/README.md,
   docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 follow-up in the same PR — measured whether the wiring the
+  decomposition relocates is bound by any test. It was not: `go tool cover
+  -func` over `./pkg/daemon/` reports 0.0% statement coverage for all ten
+  builders inside the sync-constructor goroutine, and nilling ALL 30 wiring
+  assignments at once left `./pkg/daemon/` and `./pkg/cluster/` green — the
+  tests that call `startClusterComms` deliberately configure it to early-return
+  before the goroutine. Added `cluster_comms_wiring_bound_6428_test.go` binding
+  the 17 observable sites (15 `ss.*` handles + `d.syncPeerAddr{,1}`) by calling
+  each builder directly and asserting the installation, not the behaviour. The
+  first draft was VACUOUS: collecting func fields into a table of `any` boxes a
+  typed nil into a non-nil interface, so 14 of 17 unwire mutations stayed green;
+  rewritten with direct `== nil` comparisons and re-proven 17/17 RED, each
+  naming the dropped field. Remaining 13 sites (the `d.cluster.Set*` hooks plus
+  `ss.SetAuthProvider`/`SetSyncTransport`) have no getter on `cluster.Manager`
+  and stay unbound — reported, not silently relocated. Also recorded the
+  goroutine-lifecycle finding: `clusterCommsWG.Add(1)` occurs exactly once, so
+  only the constructor goroutine is joined and the other ten (including
+  `startHeartbeatWithRetry`) are cancel-only — the structural reason #7257 is
+  reachable. #7257 is NOT fixed here; it needs a lifecycle change, not a move.
+- **File(s)**: pkg/daemon/cluster_comms_wiring_bound_6428_test.go (new),
+  pkg/daemon/README.md, _Log.md
