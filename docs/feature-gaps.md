@@ -734,6 +734,7 @@ follow-up before this logging signal can be produced.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
+| **Filter change does not revoke established sessions** | `interfaces <if> unit <u> family inet filter input <name>` | Junos firewall filters are stateless and evaluated on EVERY packet, so a newly attached or tightened input filter applies to established flows immediately | Medium | Partial (#5858): the session-hit fast path re-evaluates an input filter only when its match semantics vary per packet (DSCP / per-packet L4 — `interface_input_filter_varies_per_packet`), so a purely STATIC address/protocol/port `then discard` added after a session exists is never rechecked and that flow forwards until it idles out. Note the asymmetry with policies: tightening a POLICY does revoke established sessions at commit (`clearSessionsForPolicyChanges`). The symmetric fix is not safe — an interface-keyed clear would drop every session ingressing the interface, and a purged permitted SNAT flow reinstalls on a different translated port (the PAT allocator hands out a fresh monotonic-cursor port before draining the recycle FIFO) — so the correct fix is per-tuple revalidation that drops only NEWLY-denied sessions, tracked as a dataplane feature. Until then commit emits an advisory naming the affected units and the `clear security flow session interface <name>` remedy. |
 | **Filter loss-priority action** | `firewall filter ... term ... then loss-priority <level>` | Mark a packet's packet-loss-priority for downstream drop-profile / congestion behavior | Low | Partial (#2507): parsed and stored, but NOT wired to the snapshot wire and inert in the userspace dataplane (no per-packet loss-priority consumer; three-color policer meters at green only). Commit emits a WARN naming the filter/term that the action is accepted-but-inert. |
 | **Pre-ID default-policy logging** | `security pre-id-default-policy then log session-init session-close` | Log sessions admitted under the pre-identification default policy (before app-id resolves) | Medium | Partial (#2509): parsed and stored, but NOT wired to the dataplane and inert in userspace — there is no pre-identification session-admit path (no session to stamp the log mode onto, unlike per-policy #2508). Commit emits a WARN that the action is accepted-but-inert. |
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed. **#4514: single-rate `then policer` is now ENFORCED on the userspace dataplane** — a `then discard` policer is lowered at compile into the metered three-color srTCM runtime (committed bucket = the token bucket, CIR=bandwidth-limit bits/sec, CBS=burst-size-limit), so traffic above the rate is discarded with metering + drop counters + flow-cache re-metering. Before #4514 the single-rate policer was parsed into a `state.policers` map that nothing consumed, so `then policer X` was a silent fail-open of the rate limit. A single-rate policer with a non-discard action (`then loss-priority` / `then forwarding-class`) is metered but its marking is inert. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |
@@ -1263,7 +1264,17 @@ drift) closed in `fix/2008-quickwins-batch1`:
   packet/forwarding path (the field is still `#[allow(dead_code)]`). The
   consumer — GRE key/call-id extraction into the session tuple — is the deferred
   feature, and this is the seam it would read; it is not part of this
-  config-truth fix.
+  config-truth fix. **#5804 correction:** "DONE (threaded)" describes config
+  truth only, and the operator surfaces used to overstate it — `show security
+  flow` rendered a bare `gre-performance-acceleration: enabled` and commit said
+  nothing at all, so an operator read a tunnel-aware session identity into a
+  box that keys GRE on the bare 5-tuple. Both `show` surfaces now qualify it
+  (`configured (accepted-only; GRE sessions remain 5-tuple keyed)`) and commit
+  emits the #2078/#4231 accepted-only advisory, naming the consequence: two
+  GRE/PPTP tunnels between the SAME outer endpoints share one session and its
+  policy/NAT/counter/timeout state. The dataplane feature — an RFC 2890 tunnel
+  discriminator in `SessionKey` — is #7188, which retires both the advisory and
+  the qualifier when it lands.
 - **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
   the schema child (`pkg/config/schema_security.go`), the
   `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),

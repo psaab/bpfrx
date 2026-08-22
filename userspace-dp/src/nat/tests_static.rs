@@ -1273,3 +1273,51 @@ fn static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address() {
 
 // --- DNAT table tests ---
 
+
+// #5190 FAIL-ON-REVERT (cross-linked from #5727): a static-NAT rule whose
+// `match source-address` entry parses as neither a CIDR prefix nor a bare
+// host IP fails CLOSED — `constrained` stays true with an empty prefix list,
+// so the rule matches NOTHING. That half is correct and stays asserted here.
+// What was missing is TELEMETRY: the drop was a silent `Err(_) => {}`, so an
+// operator saw a static-NAT rule that simply stopped matching with nothing to
+// look at. Reverting `record_parse_error` back to the empty arm leaves
+// `parse_errors() == 0` → the surfacing assertion goes RED while the
+// fail-closed assertions stay green (proving the two are independent).
+#[test]
+fn static_nat_unparseable_source_constraint_surfaces_and_still_fails_closed_5190() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "scoped-bad-source".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            source_addresses: vec!["not-an-ip-or-prefix".to_string()],
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    // (1) Fail-closed preserved: the rule IS source-scoped, no entry parsed,
+    // so no peer satisfies it — the inbound match must miss.
+    assert!(
+        table
+            .match_dnat_with_counter_scoped(
+                "203.0.113.10".parse().unwrap(),
+                0,
+                Some("198.51.100.7".parse().unwrap()),
+                "untrust",
+                "",
+                "",
+            )
+            .is_none(),
+        "#3435 fail-closed: a source-scoped rule whose only source entry is \
+         unparseable must match NOTHING"
+    );
+    // (2) ...and the drop is now SURFACED instead of silently swallowed.
+    assert_eq!(
+        counters.parse_errors(),
+        1,
+        "#5190: an unparseable static-NAT match source-address must be \
+         recorded as a NAT reconcile parse error, not silently dropped"
+    );
+}

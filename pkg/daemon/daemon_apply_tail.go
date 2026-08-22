@@ -457,7 +457,7 @@ func (d *Daemon) initEventEngine() {
 		return
 	}
 	d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
-		return d.commitAndApply(ctx, comment, false)
+		return d.commitAndApply(ctx, comment, peerSyncNever)
 	})
 	if d.rpm != nil {
 		d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
