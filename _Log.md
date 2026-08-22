@@ -103688,3 +103688,10 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/types_system.go, pkg/config/types_security.go,
   pkg/config/types_routing.go,
   pkg/config/url_field_redaction_census_6733_test.go
+
+## 2026-08-22 — #6725 closed-world doc claim
+- **Action**: Corrected the one residual false claim in the open-world branch
+  ("the default for every production subtree"; unscoped "byte-identical").
+  Two of the issue's three claims were already fixed by f37fdf19b (2026-08-05),
+  four days after the issue was filed.
+- **File(s)**: `pkg/config/schema_walk.go`
