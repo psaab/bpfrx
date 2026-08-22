@@ -482,6 +482,20 @@ contract.
   for a dataplane without the bulk snapshot, so the rendered values are
   identical. A static canary in the test package forbids a direct per-rule
   `ReadPolicyCounters` call in these files.
+  #7016: an UNPUBLISHED per-rule counter — the reader's
+  `ErrPolicyCounterUnpublished`, meaning the helper has not published that
+  stable rule id yet (the window before the first 1 Hz status poll lands, or
+  config skew after a non-abort-class apply failure, #5679) — is NOT a read
+  failure. `GetPolicies` used to answer it with `codes.Internal`, discarding
+  the whole inventory for one unpublished rule; it now sets the additive
+  per-rule `hit_counters_unavailable` (field 23) and succeeds, the same
+  flag-the-item disposition `GetZones` already uses for
+  `dataplane.ErrCounterNotPopulated`. The text renderers print `n/a` cells
+  plus a trailing `note: N policy counter(s) not yet published by the
+  dataplane` (detail prints `Session statistics: not available`) instead of
+  `warning: policy counter read failed`. A GENUINE read failure keeps
+  `codes.Internal` / the warning (#3408). See `pkg/api/README.md` for the
+  cross-surface disposition table.
 - `GetZones` enumerates security zones (`ZoneInfo`). The host-inbound
   admission set is surfaced distinctly (#3328): `host_inbound_configured`
   is the dataplane posture bit (mirrors `ZoneSnapshot.HostInboundConfigured`,
