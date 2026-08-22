@@ -7649,6 +7649,16 @@ reserved for whole-dataplane selection where a rewrite shim
     validating so they stay byte-for-byte in lockstep (a leading-whitespace
     template must not warn while the runtime trims+accepts it). The malformed
     template is `RedactURL`'d in the warning message (it may carry a credential).
+    `RedactURL` itself was only sound for a WELL-FORMED URL until #6609: it
+    located userinfo by finding `@` inside the authority, so the commonest
+    credentialed typo — omitting the `@`, as in
+    `http://user:s3cr3t.example/` — matched nothing and was returned in full,
+    on the very branch that exists to report a malformed template. It now also
+    redacts the whole authority when the host part carries a colon whose suffix
+    is not a port (a bracketed IPv6 literal is recognised, so a well-formed
+    `[2001:db8::1]:8443` is still printed), starts the authority correctly for
+    a scheme-relative `//user:pass@host/`, and drops the fragment — which a
+    query already dropped as a side effect, so only the no-query case leaked.
     Without the commit-time check the typo committed silently and the runtime
     fetch then masqueraded forever as a transient observation failure,
     suppressing publishing indefinitely. The runtime `ddns.CheckIP` gate

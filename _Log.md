@@ -101381,3 +101381,17 @@ prose edit above them added. No diff falls in the new test body.
   were forced by mutation cells that failed to red.
 - **File(s)**: pkg/api/show_text.go, pkg/api/show_nat_shared_test.go (new),
   pkg/api/README.md, _Log.md
+
+## 2026-08-22 — #6609 RedactURL credential slots
+- **Timestamp**: 2026-08-22
+- **Action**: `config.RedactURL` leaked a credential in three slots, all three
+  reproduced first-hand before any edit: a missing `@` puts the credential in
+  the host:port slot and nothing matched; a scheme-relative `//user:pw@host/`
+  had authStart=0 so the authority scanned as EMPTY; and the fragment was never
+  redacted (only ever dropped as a side effect of the query rule truncating the
+  tail, so only the no-query case leaked). Added `urlAuthorityStart` (RFC 3986
+  scheme rule + the `//` case) and `urlHostPortPlausible` (bracketed-IPv6 aware,
+  empty port valid). A non-port colon now redacts the WHOLE authority — with a
+  malformed authority there is no way to tell host from secret.
+- **File(s)**: pkg/config/secret.go,
+  pkg/config/redact_url_slots_6609_test.go (new), docs/config-schema.md, _Log.md
