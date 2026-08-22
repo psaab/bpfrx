@@ -103158,3 +103158,12 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_ipsec_plaintext_warn.go,
     pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
     docs/userspace-dataplane-gaps.md
+
+## 2026-08-22 — #6672 packed chassis cluster body
+- **Timestamp**: 2026-08-22
+- **Action**: Split a packed `chassis cluster` body into statements before BOTH
+  the compiler and the schema walker, so all five spellings compile identically
+  and the packed spelling cannot escape the typed-leaf range gates.
+- **File(s)**: pkg/config/compiler_chassis_cluster_packed.go (new),
+  pkg/config/compiler_system.go, pkg/config/schema_walk.go,
+  pkg/config/packed_chassis_cluster_6672_test.go, docs/config-schema.md
