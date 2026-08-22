@@ -67,6 +67,7 @@ pub(super) struct WorkerLoopSetup {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn worker_loop_setup(
     worker_id: u32,
+    node_id: u8,
     binding_plans: Vec<BindingPlan>,
     shared_runtime: &RuntimeViewReader,
     shared_cos_owner_worker_by_queue: &ArcSwap<BTreeMap<(i32, u8), u32>>,
@@ -136,10 +137,13 @@ pub(super) fn worker_loop_setup(
     let cos_shared_queue_vtime_floors = shared_cos_queue_vtime_floors.load_full();
     let mirror_targets = shared_mirror_targets.load_full();
     let mut sessions = SessionTable::new();
-    // #4915: namespace this worker's session ids so the STABLE session id
-    // (`SessionEntry.session_id`, encoded on the RT_FLOW SESSION_CREATE/CLOSE
-    // wire) is unique across the node's shared-nothing per-worker session tables.
-    sessions.set_worker_id(worker_id);
+    // #4915 + #6311: namespace this worker's session ids so the STABLE session
+    // id (`SessionEntry.session_id`, encoded on the RT_FLOW SESSION_CREATE/CLOSE
+    // wire) is unique across the node's shared-nothing per-worker session tables
+    // AND across the two cluster nodes. The node half is what keeps a peer id
+    // adopted verbatim on import (#5212) from colliding with a local id — both
+    // nodes run the same worker set with counters that both start at 1.
+    sessions.set_session_id_namespace(node_id, worker_id);
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
     // #3082: thread the references-missing-profile set so the screen None

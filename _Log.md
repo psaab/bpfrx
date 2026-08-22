@@ -100219,3 +100219,38 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_prepass_logging_4960_test.go,
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+
+## 2026-08-21 — #6311: node discriminator in the session-id namespace
+- **Timestamp**: 2026-08-21
+- **Action**: Fold a chassis-cluster node bit into the userspace session-id
+  namespace so an id adopted verbatim from the peer (#5212) can never collide
+  with a locally-minted one. `SessionTable::set_worker_id` becomes
+  `set_session_id_namespace(node_id, worker_id)` — namespace is
+  `node_bit << 15 | worker_id` in the high 16 bits — with the #6198 control-plane
+  reservation now guarding the COMBINED namespace and a new assert refusing a
+  worker id that would carry into the node bit. `node_id` is plumbed
+  Go config -> `ConfigSnapshot.node_id` -> `bring_up_workers` -> `spawn_workers`
+  -> `WorkerLaunchPlan` -> `worker_loop_setup`. Additive wire field, no protocol
+  version bump.
+- **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/worker/launch.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/setup.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/snapshot_node_id_6311_test.go,
+  pkg/daemon/daemon_ha_userspace_convert.go, docs/sync-protocol.md
+
+## 2026-08-21 — #6311: de-vacuum the adoption-collision test
+- **Timestamp**: 2026-08-21
+- **Action**: The mutation matrix showed
+  `adopted_peer_id_cannot_collide_with_a_local_id_6311` passing under the
+  node-bit-removal cell. It built the peer id as a hardcoded literal, so it
+  named a value the un-bitted allocator never produces — a probe keyed to the
+  fix, not to the property. Rewrote it to MINT the peer id from a real node-1
+  `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
+  It now reds under that cell (4 failures, was 3).
+- **File(s)**: userspace-dp/src/session/tests.rs
