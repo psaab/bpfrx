@@ -1266,12 +1266,27 @@ func (s *heartbeatSender) run() {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 
+	// #6724: the boot-epoch persist-retry trigger rides this loop rather than
+	// owning a goroutine. This package's start/stop discipline is where its
+	// hazards live (superseded starts, leaked loops whose stopCh is never
+	// closed), so a retry that needs no new lifecycle is the cheaper thing to
+	// get right. The per-tick cost when nothing is owed is one atomic load —
+	// and it is only paid once every retryEvery ticks, so the 200ms send path
+	// is untouched in the ordinary case.
+	retryEvery := bootEpochPersistRetryTicks(s.interval)
+	ticks := 0
+
 	for {
 		select {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
 			s.send()
+			ticks++
+			if ticks >= retryEvery {
+				ticks = 0
+				s.mgr.retryOwedBootEpochPersist()
+			}
 		}
 	}
 }

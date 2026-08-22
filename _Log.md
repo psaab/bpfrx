@@ -103746,3 +103746,12 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/management.go`, `pkg/daemon/daemon_apply_commit.go`,
   `pkg/daemon/promote_reconcile_6718_6720_test.go` (new),
   `pkg/daemon/README.md`
+
+## 2026-08-22 — #6724 boot-epoch persist-retry trigger
+- **Action**: `refineBootEpochReporting` now reports whether a persist is OWED
+  (fault, not a deliberate decline); `Manager.retryOwedBootEpochPersist` re-runs
+  refinement from the heartbeat sender loop while one is. The mis-ordering half
+  is split to #7501.
+- **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
+  `pkg/cluster/manager.go`,
+  `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)
