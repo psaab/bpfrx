@@ -602,7 +602,11 @@ pub(super) fn stage_screen_check(
                 let reason = err.screen_reason();
                 emit_screen_drop_event(
                     worker_ctx.event_stream,
-                    &screen_parse_error_info_flowless(meta.addr_family),
+                    // #5190: carry the authoritative protocol/pkt_len from
+                    // `meta` and the L3 addresses already derived above, so a
+                    // flowless malformed-packet drop no longer reports
+                    // protocol=0 / pkt_len=0 / 0.0.0.0.
+                    &screen_parse_error_info_flowless(&meta, screen_src, screen_dst),
                     meta,
                     zone_id,
                     reason,

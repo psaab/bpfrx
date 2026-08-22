@@ -64,8 +64,8 @@ func TestRenamePositionalEnumerationShiftNoCorruption(t *testing.T) {
 
 	// Prior boot recorded the rename database: A -> fxp0 (OriginalName=enpA),
 	// B -> ge-0-0-0 (OriginalName=enpB).
-	writeLinkFile("fxp0", "enpA")
-	writeLinkFile("ge-0-0-0", "enpB")
+	_, _ = writeLinkFile("fxp0", "enpA")
+	_, _ = writeLinkFile("ge-0-0-0", "enpB")
 
 	// Live state on THIS boot after udev applied those .link files, plus the
 	// new NIC C at its kernel name.
@@ -82,7 +82,7 @@ func TestRenamePositionalEnumerationShiftNoCorruption(t *testing.T) {
 		{name: "ge-0-0-0"},
 	}
 
-	if changed := renamePositional(nics, 0, false, fab.rename); !changed {
+	if changed, _ := renamePositional(nics, 0, false, fab.rename); !changed {
 		t.Fatal("expected changed=true on an enumeration shift")
 	}
 
@@ -133,7 +133,7 @@ func TestRenamePositionalFirstBootNoTempRenames(t *testing.T) {
 	}}
 	nics := []pciNIC{{name: "enp5s0"}, {name: "enp6s0"}, {name: "enp7s0"}}
 
-	if changed := renamePositional(nics, 0, false, fab.rename); !changed {
+	if changed, _ := renamePositional(nics, 0, false, fab.rename); !changed {
 		t.Fatal("first boot must report changed")
 	}
 	// No xpf-tmp-* name ever appears (no collisions on a fresh box).
@@ -156,14 +156,14 @@ func TestRenamePositionalFirstBootNoTempRenames(t *testing.T) {
 // by the collision-safe discipline.
 func TestRenamePositionalSteadyStateNoChurn(t *testing.T) {
 	withTempLinkDir(t)
-	writeLinkFile("fxp0", "enp5s0")
-	writeLinkFile("ge-0-0-0", "enp6s0")
+	_, _ = writeLinkFile("fxp0", "enp5s0")
+	_, _ = writeLinkFile("ge-0-0-0", "enp6s0")
 
 	renames := 0
 	rename := func(from, to string) error { renames++; return nil }
 	nics := []pciNIC{{name: "fxp0"}, {name: "ge-0-0-0"}}
 
-	if changed := renamePositional(nics, 0, false, rename); changed {
+	if changed, _ := renamePositional(nics, 0, false, rename); changed {
 		t.Fatal("steady state must report unchanged (no churn)")
 	}
 	if renames != 0 {
