@@ -831,6 +831,46 @@ func (m *managementReconciler) wait() {
 	}
 }
 
+// reconcileManagementAfterPromotion runs the management reconcile for a config
+// the store has ALREADY promoted to active, on a path that deliberately does NOT
+// reach applyConfigLocked (#6718, #6720).
+//
+// reconcileWebManagement's own contract (below) is written for an apply that
+// ABORTS PARTWAY: "so a committed authentication tightening/revocation or bind
+// change is live even on an apply that returns early". That contract had an
+// unstated precondition — applyConfigLocked is its ONLY caller, so a path that
+// returns BEFORE entering the apply never reaches it at all, and two do:
+//
+//   - executeConfirmedRollback's prevCfg == nil branch (#6718): a first
+//     `commit confirmed` on a fresh store times out, PromoteRollback reverts to
+//     the empty tree, and enterBootstrapMode returns. The abandoned commit's
+//     off-box bind and its api-auth credential stayed live — authorised by a
+//     config the box has formally abandoned.
+//   - syncAndApply's topology / identity backstops (#6720): SyncApply has
+//     already promoted the peer config, then the backstop returns. The listener
+//     kept honouring a credential the now-active config revoked.
+//
+// The reconcile is deliberately the GENERIC one in both cases, including the
+// bootstrap case where #6718 wondered whether a special bootstrap-management
+// reconcile was needed. It is not: with the empty tree active, committedDesired
+// resolves to no web-management stanza, so desired() leaves Addr at the
+// --api-addr flag default (loopback) and Auth nil — which IS "revert to the
+// flag-default endpoint and drop the abandoned credential". Keeping the
+// management LIFELINE, which is why that branch skipped the reconcile, is not
+// the same thing as keeping the abandoned commit's off-box bind and secret.
+//
+// Failure is logged, never propagated: both callers are already returning (an
+// error, or from a fire-and-forget timer), and a bind failure here must not
+// change what they return. This mirrors reconcileWebManagement's own
+// warn-and-retry posture.
+func (d *Daemon) reconcileManagementAfterPromotion(cfg *config.Config, why string) {
+	if err := d.reconcileWebManagement(cfg); err != nil {
+		slog.Error("management reconcile after a promotion that skipped the apply did not "+
+			"converge; the listener may still honour a superseded endpoint or credential",
+			"reason", why, "err", err)
+	}
+}
+
 // reconcileWebManagement is the applyConfigLocked entry point (#5866). It
 // mirrors reconcileSNMP: it runs EARLY in the apply — before the dataplane apply
 // that can abort on a protocol-gate error — so a committed authentication

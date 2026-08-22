@@ -103676,3 +103676,14 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/management_start_race_6719_test.go` (new),
   `pkg/daemon/daemon_dp_escape_rest_test.go`,
   `pkg/daemon/hostname_stale_cert_6827_test.go`, `pkg/daemon/README.md`
+
+## 2026-08-22 — #6718 + #6720: the management reconcile follows the promotion
+- **Action**: Added `reconcileManagementAfterPromotion` and called it from the
+  three paths that promote a config to active and then return BEFORE
+  `applyConfigLocked` (its only caller): the first-commit-confirmed rollback's
+  `prevCfg == nil` branch (#6718), and `syncAndApply`'s topology and identity
+  backstops (#6720). Each left a superseded api-auth credential authenticating
+  against the live listener. Enforcement of the backstops is unchanged.
+- **File(s)**: `pkg/daemon/management.go`, `pkg/daemon/daemon_apply_commit.go`,
+  `pkg/daemon/promote_reconcile_6718_6720_test.go` (new),
+  `pkg/daemon/README.md`
