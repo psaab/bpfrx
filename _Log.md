@@ -99966,3 +99966,19 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
   `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
   `userspace-dp/src/afxdp/worker/README.md`
+
+## 2026-08-21 — #6177 item 1: fence the remote-failover ack on RETH VIP release
+- **Timestamp**: 2026-08-21
+- **Action**: Close the RETH VIP-removal sub-ms two-owner residual. `vrrp.ResignRG`
+  now returns a `*ResignBarrier` armed on every targeted instance before
+  `triggerResign`; instances report to it from the sites that actually complete a
+  VIP release (`becomeBackup` with the `removeVIPs` verdict, the MASTER-arm
+  shutdown removal, a new BACKUP-arm `resignCh` consumer, and `stop()`).
+  `handleClusterEvent` defers the demotion fence verdict to
+  `awaitRethVIPRelease`, which resolves `signalFailoverActuated` /
+  `signalFailoverActuationFailed` from the release itself, on its own goroutine.
+- **File(s)**: pkg/vrrp/resign_barrier.go (new), pkg/vrrp/instance.go,
+  pkg/vrrp/manager.go, pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go,
+  pkg/vrrp/resign_barrier_6177_test.go (new),
+  pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
+  docs/session-sync-architecture.md
