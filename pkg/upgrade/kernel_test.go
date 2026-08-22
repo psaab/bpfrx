@@ -34,6 +34,7 @@ type fakeKernelSystem struct {
 	bootCurrent       string
 	bootCurrentErr    error
 	getBootNextErr    error  // #5847: force a readback error (stay ARMING)
+	clearBootNextErr  error  // #6758: force the un-undoable case (NVRAM stays armed)
 	getBootNextRet    string // #5847: override readback (firmware "lied"); "" => mirror bootNext
 	runningErr        error
 	armWatchdogErr    error
@@ -126,6 +127,19 @@ func (f *fakeKernelSystem) ReadSlotSelector(slot string) (string, error) {
 func (f *fakeKernelSystem) SetBootNext(id string) error {
 	f.log("bootnext:" + id)
 	f.bootNext = id
+	return nil
+}
+
+// ClearBootNext mirrors efibootmgr --delete-bootnext (#6758): it drops the
+// one-shot unconditionally, so clearing an already-absent BootNext succeeds.
+// clearBootNextErr injects the un-undoable case — NVRAM stays armed while the
+// journal records ARMING, which is the divergence the arm must report loudly.
+func (f *fakeKernelSystem) ClearBootNext() error {
+	f.log("bootnext-clear")
+	if f.clearBootNextErr != nil {
+		return f.clearBootNextErr
+	}
+	f.bootNext = ""
 	return nil
 }
 

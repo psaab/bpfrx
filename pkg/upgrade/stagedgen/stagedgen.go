@@ -321,7 +321,47 @@ func (c Config) GC(protected map[string]bool) error {
 	for g := range protected {
 		extraProtected[g] = true
 	}
-	if cur, rerr := c.ResolveCurrent(); rerr == nil && cur != "" {
+	// #6763: an UNRESOLVABLE current generation aborts the GC. This used to
+	// read `if cur, rerr := c.ResolveCurrent(); rerr == nil && cur != ""`,
+	// which DISCARDED rerr — so when current-gen could not be resolved the
+	// live generation simply was not added to the protection set, and the
+	// destructive loop below then deleted it as soon as it fell outside the
+	// retention window.
+	//
+	// Every one of ResolveCurrent's error paths means "I cannot establish
+	// which generation is live", and each is reachable: a readlink failure
+	// (I/O, permissions), a hand-edited symlink with path components that
+	// would escape the staged-gen root, a target that is not a valid genid,
+	// and a DANGLING current-gen whose directory is missing. The last is the
+	// sharpest — a corrupt layout is exactly when the live generation most
+	// needs protecting, and it was exactly when protection silently vanished.
+	//
+	// ResolveCurrent already distinguishes the one benign case: NO current-gen
+	// link at all returns ("", nil), not an error, so a fresh root that has
+	// never published still GCs normally. Absence is determinate; failure is
+	// not.
+	//
+	// Aborting is the established response, not a new policy: publish-
+	// generation applies the same rule to the OTHER half of the protection set
+	// (#4876) — "if the journal is present but unreadable or malformed, we
+	// cannot see which generation a crashed cut pins, so GC is SKIPPED rather
+	// than run with an empty protection set", and "skipping is safe — the
+	// extra staged generations are harmless and the next publish reclaims
+	// them". current-gen was the half that never got the rule. All three
+	// callers already treat a GC error as a warning, never fatal, so this
+	// degrades to "GC skipped" and cannot block a publish, a seed or a cut.
+	//
+	// sweepPartials above stays: a `.partial` directory is never a generation
+	// (ValidGenID cannot match a name carrying partialSuffix, so current-gen
+	// can never resolve to one), so removing them cannot destroy the live
+	// generation and is not gated on identifying it.
+	cur, rerr := c.ResolveCurrent()
+	if rerr != nil {
+		return fmt.Errorf("stagedgen: gc REFUSED, no generation deleted: the current "+
+			"generation could not be resolved, so it cannot be protected from "+
+			"deletion: %w", rerr)
+	}
+	if cur != "" {
 		extraProtected[cur] = true
 	}
 
