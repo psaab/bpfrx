@@ -86,6 +86,18 @@ func (r *KernelRunner) recordPromoteBinary(j *KernelJournal) error {
 		return fmt.Errorf("%w: persist arm record %s: %v",
 			ErrKernelPromoteBinaryUnresolvable, path, err)
 	}
+	// A refusal from a PRIOR candidate must not be read as a verdict on this
+	// one (#6622). Cleared here, at the point the new arm record is written,
+	// rather than at the top of Arm: an arm that fails preflight leaves the
+	// previous refusal intact, which is what an operator diagnosing that
+	// failure needs on screen.
+	//
+	// Best-effort. Failing to remove a diagnostic must not refuse an arm that
+	// has already passed preflight and installed a candidate — the fail-closed
+	// rule above is about the arm RECORD, whose absence would strand the
+	// candidate unverifiable, and a stale refusal costs only a confusing line
+	// that carries its own timestamp and boot id.
+	_ = r.clearRefusalRecord()
 	return nil
 }
 

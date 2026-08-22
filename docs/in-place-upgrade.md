@@ -1066,12 +1066,34 @@ build against the candidate kernel. Both hops resolve explicitly:
   systemd's *default* `PATH` ranks the operator-writable
   `/usr/local/sbin` and `/usr/local/bin` first.
 - *Inner hop* — `realKernelSystem.VerifyDataplane`
-  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) prefers
-  `os.Executable()` — the running process IS `xpfd upgrade kernel
-  promote`, and on Linux `/proc/self/exe` resolves the
+  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) resolves
+  `os.Executable()` and **nothing else**. The running process IS `xpfd
+  upgrade kernel promote`, and on Linux `/proc/self/exe` resolves the
   sbin→`current`→`versions/<ver>/xpfd` chain down to the concrete
-  versioned artifact — then `<SbinDir>/xpfd`, then
-  `<VersionsDir>/current/xpfd`.
+  versioned artifact — so this is the kernel's answer for the running
+  process, not an inference. If it cannot be resolved and validated
+  (absolute, existing, regular, executable), the inner hop **refuses**.
+
+  **Authority order, stated for both hops together (#6620).** The outer
+  hop is `/proc/<MainPID>/exe` → strictly-parsed `ExecStart` → loud
+  refusal; the inner hop is `os.Executable()` → refusal. Neither has a
+  filesystem fallback, and they refuse for the same reason: `--sbin-dir`
+  and `--versions-dir` relocate *independently* and neither relocation
+  removes what it left behind, so a leftover at a compiled-in default is
+  byte-for-byte indistinguishable from a live install. That includes the
+  both-roots-relocated shape, where the surviving default symlink still
+  points at the surviving default runtime and the two candidates are ONE
+  INODE — exactly like a healthy layout.
+
+  The inner hop used to fall back to `<SbinDir>/xpfd` and then
+  `<VersionsDir>/current/xpfd`, ranked in that order because `flip` step
+  6b repoints the sbin entry on every cut. A better-ranked guess is still
+  a guess: on a relocated box the surviving default sbin symlink resolves
+  perfectly and names a *stale* runtime, so the ranking preferred the
+  stale build with full confidence. Refusing is not a lesser outcome — a
+  Gate-3 error routes to `revert()` (restore the known-good `BootOrder`,
+  reboot to the known-good slot), which is a correct terminal outcome,
+  strictly better than a promotion authorized by the wrong dataplane.
 
 **The arming records which xpfd must verify the candidate (#6601).**
 Six revisions tried to answer *which xpfd is live?* on the candidate boot
@@ -1152,15 +1174,41 @@ candidate `ARMED`? — and:
 **`--journal` is not one of those cases**, and must not be cited as this
 check's motivation. Go derives the sidecar from the journal's *directory*,
 so `xpfd upgrade kernel arm --journal <elsewhere>` moves **both** files
-together: the gate finds neither and takes the quiet branch. That is a
-real trap — the boot unit hardcodes
-`ExecStart=/usr/local/sbin/xpf-kernel-promote` with no way to pass a
-journal path, so a candidate armed against a non-default journal is
-*structurally* unpromotable — but it is pre-existing (before this gate
-existed, `xpfd upgrade kernel promote` read the default journal, found
-nothing and no-op'd identically) and orthogonal. **For the kernel
-channel, `--journal` is diagnostic-only**; the arm-time refusal is
-tracked separately as #6632.
+together: the gate would find neither and take the quiet branch, not the
+loud ARMED-without-record branch above. That is a different defect, and
+it is closed at the other end.
+
+**Arming refuses a non-default journal path (#6631).** The boot gate
+cannot be told where to look, and this is worth stating as *unreachable*
+rather than *awkward* — all three channels that could carry a path are
+absent:
+
+| channel | why it does not exist |
+|---|---|
+| argument | `xpf-kernel-promote.service` is `ExecStart=/usr/local/sbin/xpf-kernel-promote` with no operands, and the script parses no argv of its own — no `$1`, no `$@`, no `getopts`. An operator drop-in overriding `ExecStart` has nothing to pass *to*. |
+| environment | neither promote unit mentions a journal in any form; the only `Environment=` is the pinned `PATH`. |
+| the inner exec | the gate runs `"$XPFD" upgrade kernel promote` with **no** `--journal`, so the Go half reads the compiled-in default regardless of what armed the candidate. |
+
+So a candidate armed elsewhere would boot, run **unverified**, never be
+promoted, and revert on the next plain reboot — the safe direction, but
+silent, which is exactly the benign-skip laundering this gate otherwise
+works to eliminate. `KernelRunner.Arm` therefore refuses up front with
+`ErrKernelJournalUnpromotable`, before the candidate version is even
+validated and before any system call: arming is a preflight and is
+retryable, a candidate kernel booting unverified is not. The refusal
+names the path the gate reads, so it is actionable.
+
+The sentinel is deliberately **not** `ErrKernelChannelUnavailable`: that
+one means *use LANE 2 instead* and exits 2, which the kernel-roll
+orchestrator proceeds past. A mistyped flag is exit 1 — fix the command.
+
+**For the kernel channel, `--journal` is therefore accepted only on the
+verbs that cannot strand a candidate** (`status` and the crash-recovery
+verbs). It remains fully usable on the non-kernel `xpfd upgrade` verbs,
+which journal to `/var/lib/xpf/upgrade.state` and have no boot-time gate
+reading a fixed path. The scoping is pinned by
+`TestArmJournalGuardIsScopedToTheKernelArmPath_6631`, which requires the
+guard to have exactly one caller and for that caller to be `Arm`.
 
 `ARMED` **specifically**, not `ARMING`: `ARMING` is prepared intent
 recorded before the firmware one-shot is read back, which is exactly the
@@ -1296,10 +1344,77 @@ window, whereas an un-promoted candidate is already safe — the firmware
 cleared `BootNext`, so the next plain reboot falls back to the known-good
 slot.
 
-**The refusal carries the facts, not just the policy.** Because `exit 0`
-keeps the unit `active` — `systemctl status xpf-kernel-promote` reads
-SUCCESS — that journal line is the *only* operator-visible signal, so it
-echoes what systemd actually returned (`LoadState=[…] MainPID=[…]
+**A refusal leaves a durable record (#6622).** `exit 0` keeps the unit
+`active` and `systemctl status xpf-kernel-promote` reads SUCCESS, so
+before this the journal line was the only signal — and journal rotation
+takes it away. An operator who armed a candidate, rebooted and came back
+later saw a box running the old kernel and a promote unit reporting
+success, with nothing saying the gate had declined or why.
+
+That mattered more after the refusal became a real outcome rather than a
+theoretical one: this gate used to fall back to a compiled default and
+would usually run *something*. **A state that is now reachable needs to
+be observable.**
+
+The gate therefore writes `/var/lib/xpf/kernel-promote-refusal`, beside
+the journal and the arm record and sharing their lifetime — it is
+removed with the journal and rewritten by the next arm, so a refusal can
+never be read as a verdict on a candidate that is no longer in flight.
+`show system kernel-upgrade`, the console CLI and the remote `cli` all
+render it through `upgrade.RenderChannelStatus`, and the status RPC
+reads it through `upgrade.ReadChannelStatus`.
+
+- **The unit still exits 0 and still does not trip `OnFailure=`.** That
+  was deliberately avoided as the fix, and a test asserts it rather than
+  assuming it.
+- **Written only where the gate never ran `xpfd` at all**: every
+  `refuse()`, plus the indeterminate-journal `WARNING`. Including the
+  second is what makes the record's *absence* meaningful — if only
+  `refuse()` wrote one, "no record" could not distinguish a clean boot
+  from a boot the gate skipped for the other reason. It is **not**
+  written by the quiet `nothing to promote` branch (that is the ordinary
+  boot, and a file rewritten every boot buries the signal it carries) nor
+  by the post-exec `rc` paths (there the gate *did* run `xpfd`, and the
+  Go half owns the journal, the promotion marker and the last-roll
+  record for those — a second writer would be a second source).
+- **It carries the resolution facts** — the `LoadState`, `MainPID`,
+  `ControlGroup` and raw `ExecStart` from the discovery snapshot the
+  decision was made on, plus the journal bit, the cause, the
+  branch-specific advice, a timestamp and the boot id. The status
+  surface renders the snapshot rather than re-querying systemd: a
+  re-query days later would describe a different system.
+- **The boot id earns its place** because an early-boot clock can be
+  wrong — no RTC, no NTP yet — so the timestamp alone cannot answer *was
+  this THIS boot?*.
+- **It does not duplicate the candidate version**, and that is a design
+  choice rather than a gap. The gate is POSIX `sh` and the journal is
+  JSON, so it reads that file for **one bit and never for a value**. The
+  candidate is joined in by `ReadChannelStatus`, which has already
+  parsed the journal in Go — and it is still accurate, because a refusal
+  never transitions the journal, so the record and the `ARMED` candidate
+  it declined are read from one consistent state.
+- **Best-effort, always.** Every step of the write is suppressed and the
+  writer always returns success. This runs on a candidate boot whose
+  whole problem may be that the filesystem is not what the gate expected,
+  and a gate that changed its exit path because it could not write a
+  *diagnostic* would convert an observability gap into an availability
+  one. A test plants a directory where the record goes and asserts the
+  exit path is unchanged.
+- **One line per field, `key=value`.** POSIX `sh` writes it and Go reads
+  it, so the same *a value may legally contain the delimiter* hazard as
+  the `ExecStart` parse applies in reverse: a systemd rendering can
+  legally contain newlines (multiple entries render one per line), and an
+  unflattened value would forge extra fields. Values are flattened; Go
+  splits on the **first** `=` so a value containing one survives; unknown
+  keys are ignored so a newer gate can add fields. A record present but
+  carrying no *recognised* field is an **error**, never a silent "no
+  refusal" — the same rule `ReadArmRecord` applies, for the same reason:
+  "absent" is acted on as a positive statement. The path is pinned
+  against Go by `TestPromoteScriptRefusalRecordPathMatchesGo_6622`.
+
+**The refusal message carries the facts too, not just the policy.** The
+journal line remains the immediate signal, so it echoes what systemd
+actually returned (`LoadState=[…] MainPID=[…]
 ControlGroup=[…] ExecStart=[…]`) and branches its advice on which cause
 fired — `systemctl` unreachable, unit not-found, or unit known — because
 telling an operator to fix `ExecStart` when `systemctl` could not be

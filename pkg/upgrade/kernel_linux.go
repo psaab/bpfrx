@@ -543,8 +543,11 @@ func (s *realKernelSystem) BootCurrent() (string, error) {
 // THREE callers, across two files, and they do NOT want the same thing from it
 // (#6601):
 //
-//   - resolveVerifyGateBin (here) — first preference for the INNER hop's
-//     verify-dataplane exec; falls through to the configured roots below.
+//   - resolveVerifyGateBin (here) — the SOLE source for the INNER hop's
+//     verify-dataplane exec. It fails CLOSED: since #6620 there are no
+//     configured-root fallbacks, because a leftover at a compiled-in default is
+//     indistinguishable from a live install once a root has been relocated, and
+//     a Gate-3 error routes to revert() — a correct terminal outcome.
 //   - resolveArmingBinary (kernel_arm_record.go) — the AUTHORITY. The arming
 //     process IS an xpfd, so this names the live binary by construction. It
 //     fails CLOSED: an error refuses the arm, because arming is retryable and
@@ -560,34 +563,6 @@ func (s *realKernelSystem) BootCurrent() (string, error) {
 // contract.
 var osExecutable = os.Executable
 
-// gateSbinDir and gateVersionsDir are the two configured-layout roots
-// resolveVerifyGateBin falls back to, in that order. Package vars so a test can
-// point them at a temp tree.
-//
-// RELOCATION: `--versions-dir` and `--sbin-dir` are both real operator options
-// (cmd/xpfd/upgrade.go), and KernelConfig carries neither to thread through, so
-// these are the compiled-in defaults. That is why the ORDER of the fallbacks
-// matters: <SbinDir>/xpfd is the pointer the cut maintains — flip step 6b
-// repoints it to <VersionsDir>/current/<bin> on every cut (flip.go) — so
-// following it stays correct when the runtime root moved, whereas
-// <VersionsDir>/current/xpfd is right only on a default-rooted box AND is not
-// removed when the operator relocates, so consulting it first would select a
-// STALE build.
-//
-// A box that relocated BOTH roots matches neither default. That case is handled
-// where it has to be — at the OUTER hop, scripts/image/xpf-kernel-promote, which
-// asks systemd for xpfd.service's ExecStart (the concrete absolute path the cut
-// templates in flip step 6c) before falling back to these defaults. By the time
-// this function runs, the outer hop has already exec'd the right binary, so
-// candidate (1) below — os.Executable, which needs no configured root at all —
-// is that binary. These two fallbacks only matter when /proc is unreadable,
-// where a wrong pick still cannot be silent: nothing validating fails CLOSED
-// into revert().
-var (
-	gateSbinDir     = DefaultSbinDir
-	gateVersionsDir = DefaultVersionsDir
-)
-
 // verifyGateBin is the basename of the daemon artifact the promotion gate
 // execs. It matches the versions/<ver>/xpfd basename the cut writes (flip.go,
 // cutover.go) and manifest's SSOT entry.
@@ -595,94 +570,106 @@ const verifyGateBin = "xpfd"
 
 // resolveVerifyGateBin returns an EXPLICIT path to the xpfd artifact the kernel
 // promotion gate execs for `verify-dataplane`. It NEVER PATH-resolves a bare
-// name (#6541).
+// name (#6541), and since #6620 it NEVER INFERS ONE FROM THE FILESYSTEM either.
 //
 // Why it matters here specifically: this gate runs as root on a candidate boot
 // and its exit status decides promote-vs-rollback (KernelRunner.verifyAndPromote,
 // Gate 3). A PATH entry ordered ahead of the real location would therefore get
 // to author that decision — and even absent an attacker, a stale xpfd left in
-// some other PATH directory would verify the WRONG build against the candidate
+// some other directory would verify the WRONG build against the candidate
 // kernel. Every sibling xpfd invocation in this package already builds an
 // explicit path (realSystem.VerifyDataplane / BinaryVersion take an explicit
 // `bin`; cutover.go, flip.go, and runtime/seed.go all filepath.Join it out of
 // the version dir); this was the one site that did not.
 //
-// Resolution order — both candidates are explicit AND version-multiplexed:
+// THERE IS EXACTLY ONE SOURCE, AND NO FALLBACK: os.Executable().
 //
-//  1. os.Executable(). The gate IS an xpfd subcommand (`xpfd upgrade kernel
-//     promote`, cmd/xpfd/upgrade_kernel.go), so the running process is by
-//     construction the installed, live xpfd. On Linux this reads
-//     /proc/self/exe, which resolves the /usr/local/sbin/xpfd ->
-//     versions/current -> versions/<ver>/xpfd chain down to the concrete
-//     versioned artifact — the same version-multiplexed path
-//     realSystem.VerifyDataplane is handed. It is also the CLOSEST available
-//     handle on the running build: it names the path the kernel loaded this
-//     process from. Note it is a PATH, not the inode — an overwrite of that
-//     path (a #2176-shape raw deploy) would leave it stat'ing to a NEWER file
-//     while this process still runs the old one. The `upgrade kernel promote`
-//     lock (cmd/xpfd/upgrade_kernel.go) serializes this against a binary cut,
-//     and either way the exec target stays explicit, which is the property
-//     this function exists to guarantee.
-//  2. <SbinDir>/xpfd — the managed entry point the cut maintains. flip step 6b
-//     repoints <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
-//     (flip.go), so this ONE pointer tracks the live version even when the
-//     operator relocated the runtime with `--versions-dir`. Reached when (1) is
-//     unavailable: os.Executable errored (no /proc), or it returned a path that
-//     no longer resolves. The latter is how an UNLINKED running binary lands
-//     here, and it is worth being precise about the mechanism: Go TRIMS the
-//     " (deleted)" suffix Readlink appends and returns the original path with a
-//     nil error (src/os/executable_procfs.go), so the fallback is driven by
-//     os.Stat returning ENOENT on that path — never by inspecting a suffix.
-//     Code or tests keying on a "(deleted)" string would be testing an input
-//     the API cannot produce.
-//  3. <VersionsDir>/current/xpfd — the #1917 runtime pointer, LAST because it
-//     is correct only on a default-rooted box. Relocating with `--versions-dir`
-//     does not remove an older /var/lib/xpf/versions/current, so consulting it
-//     before (2) would select a STALE build on a relocated install. It earns
-//     its place only for a box whose sbin entry is missing or dangling (#2176),
-//     which is precisely when (2) fails.
+// The gate IS an xpfd subcommand (`xpfd upgrade kernel promote`,
+// cmd/xpfd/upgrade_kernel.go), so the running process is BY CONSTRUCTION the
+// installed, live xpfd — an answer the kernel gives, not one inferred from
+// ambient state. On Linux this reads /proc/self/exe, which resolves the
+// /usr/local/sbin/xpfd -> versions/current -> versions/<ver>/xpfd chain down to
+// the concrete versioned artifact, i.e. the same version-multiplexed path
+// realSystem.VerifyDataplane is handed.
 //
-// A hardcoded /usr/local/sbin/xpfd is deliberately NOT the primary: it is a
-// PATH directory itself and, more importantly, pinning the gate to a fixed
-// literal would defeat the A/B version multiplexing this channel exists to
-// serve. /usr/local/sbin is reached implicitly and correctly through (1), since
-// /proc/self/exe resolves the sbin symlink to its versioned target.
+// Note it is a PATH, not the inode — an overwrite of that path (a #2176-shape
+// raw deploy) would leave it stat'ing to a NEWER file while this process still
+// runs the old one. The `upgrade kernel promote` lock (cmd/xpfd/upgrade_kernel.go)
+// serializes this against a binary cut, and either way the exec target stays
+// explicit, which is the property this function exists to guarantee.
 //
-// FAILURE IS FAIL-CLOSED, NOT A PATH FALLBACK. If neither candidate validates
-// (absolute, existing, regular, executable) this returns an error, VerifyDataplane
-// propagates it, and the caller — KernelRunner.verifyAndPromote in kernel_run.go —
-// turns any Gate-3 error into revert(): restore the known-good BootOrder and
-// reboot to the known-good slot. On an A/B kernel promote that is the safe
-// direction; falling back to PATH to "keep the promote working" would
-// reintroduce exactly the bug this closes.
+// WHY THE TWO CONFIGURED-ROOT FALLBACKS ARE GONE (#6620). This used to fall
+// through to <SbinDir>/xpfd and then <VersionsDir>/current/xpfd. That is the
+// same defect class the OUTER hop (scripts/image/xpf-kernel-promote) eliminated
+// in #6601 r5, and it is worth naming precisely rather than by analogy:
+// `--sbin-dir` and `--versions-dir` relocate INDEPENDENTLY, and NEITHER
+// relocation removes what it left behind, so a leftover at a compiled-in
+// default is byte-for-byte indistinguishable from a healthy install —
+//
+//	BOTH roots relocated : the old default sbin symlink AND the old default
+//	                       versions/current both survive, and that symlink
+//	                       still points at that runtime, so the two
+//	                       "candidates" are ONE INODE, exactly like a healthy
+//	                       default layout. A same-inode test calls that
+//	                       unambiguous; it is a STALE build.
+//	ONE root relocated   : exactly one default survives, so "the only usable
+//	                       default" IS the stale leftover.
+//	NEITHER relocated    : healthy — and os.Executable answers, so no fallback
+//	                       was ever needed here in the first place.
+//
+// The question a defaults fallback tries to answer — WHICH of these files is
+// the live xpfd — is not answerable from the filesystem at all once a root has
+// been relocated. The outer hop's authority order is now
+// /proc/<MainPID>/exe -> strictly-parsed ExecStart -> loud refusal; this is the
+// inner hop's counterpart, with one authority and the same refusal.
+//
+// The old ORDER argument (sbin before versions/current, because flip step 6b
+// repoints <SbinDir>/<bin> on every cut) was a correct ranking of two guesses.
+// A better-ranked guess is still a guess: on a both-roots-relocated box the
+// surviving default sbin symlink resolves perfectly and names a stale runtime,
+// so the ranking preferred the stale build with full confidence.
+//
+// FAILURE IS FAIL-CLOSED, NOT A PATH FALLBACK AND NOT A GUESS. If the running
+// binary cannot be identified and validated (absolute, existing, regular,
+// executable) this returns an error, VerifyDataplane propagates it, and the
+// caller — KernelRunner.verifyAndPromote in kernel_run.go — turns any Gate-3
+// error into revert(): restore the known-good BootOrder and reboot to the
+// known-good slot. On an A/B kernel promote that is the SAFE direction, and it
+// is strictly better than executing a stale verifier, whose PASS would
+// authorize a permanent promotion of a kernel nothing actually validated.
+//
+// The cost of refusing is bounded and recoverable: the operator's candidate is
+// not promoted and the box comes back on the kernel it was already running.
+// The cost of guessing is a promotion justified by the wrong dataplane.
+//
+// Reachability: the error paths need os.Executable to fail (no /proc) or its
+// path to no longer resolve. The latter is how an UNLINKED running binary lands
+// here, and it is worth being precise about the mechanism: Go TRIMS the
+// " (deleted)" suffix Readlink appends and returns the original path with a nil
+// error (src/os/executable_procfs.go), so this is driven by os.Stat returning
+// ENOENT on that path — never by inspecting a suffix. Code or tests keying on a
+// "(deleted)" string would be testing an input the API cannot produce
+// (TestOsExecutableTrimsDeletedSuffix pins that toolchain behaviour).
 func resolveVerifyGateBin() (string, error) {
-	var errs []string
-
 	self, err := osExecutable()
 	if err != nil {
-		errs = append(errs, fmt.Sprintf("os.Executable: %v", err))
-	} else if verr := validateGateBin(self); verr != nil {
-		errs = append(errs, fmt.Sprintf("running binary %q: %v", self, verr))
-	} else {
-		return self, nil
+		return "", fmt.Errorf("cannot identify the running xpfd (os.Executable: %v); "+
+			"refusing to infer one from <sbin-dir>/%s or <versions-dir>/%s/%s — a "+
+			"leftover from a relocated runtime is indistinguishable from a live one "+
+			"and would verify this candidate kernel against the wrong dataplane "+
+			"(#6620) — and refusing to PATH-resolve a bare %q (#6541)",
+			err, verifyGateBin, currentLink, verifyGateBin, verifyGateBin)
 	}
-
-	sbin := filepath.Join(gateSbinDir, verifyGateBin)
-	if verr := validateGateBin(sbin); verr != nil {
-		errs = append(errs, fmt.Sprintf("managed sbin entry %q: %v", sbin, verr))
-	} else {
-		return sbin, nil
+	if verr := validateGateBin(self); verr != nil {
+		return "", fmt.Errorf("the running xpfd %q is not usable as the promotion "+
+			"gate's exec target (%v); refusing to infer a replacement from "+
+			"<sbin-dir>/%s or <versions-dir>/%s/%s — a leftover from a relocated "+
+			"runtime is indistinguishable from a live one and would verify this "+
+			"candidate kernel against the wrong dataplane (#6620) — and refusing "+
+			"to PATH-resolve a bare %q (#6541)",
+			self, verr, verifyGateBin, currentLink, verifyGateBin, verifyGateBin)
 	}
-
-	current := filepath.Join(gateVersionsDir, currentLink, verifyGateBin)
-	if verr := validateGateBin(current); verr != nil {
-		errs = append(errs, fmt.Sprintf("versioned runtime %q: %v", current, verr))
-	} else {
-		return current, nil
-	}
-
-	return "", fmt.Errorf("no explicit %s path resolved (refusing to PATH-resolve a bare %q, #6541): %s",
-		verifyGateBin, verifyGateBin, strings.Join(errs, "; "))
+	return self, nil
 }
 
 // validateGateBin reports whether p is usable as the gate's exec target: an

@@ -289,6 +289,13 @@ impl super::Coordinator {
         self.sessions.import_cap_drops.load(Ordering::Relaxed)
     }
 
+    /// #6600: peer-synced imports refused because this node could not reserve
+    /// the translated NAT port the session names. See
+    /// `SessionManager::import_reserve_refused` for what a nonzero value means.
+    pub fn synced_import_reserve_refused_total(&self) -> u64 {
+        self.sessions.import_reserve_refused.load(Ordering::Relaxed)
+    }
+
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
     /// `publish_shared_session` insert into `shared_nat_sessions`
     /// displaced a DIFFERENT forward session's entry at the same reverse
