@@ -101838,3 +101838,12 @@ prose edit above them added. No diff falls in the new test body.
   asserts, so the compile-only gate is meaningful for this class.
 - **File(s)**: userspace-dp/benches/snat_allocator.rs, Makefile,
   docs/research/2852-portalloc/microbench-results.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (strict-reject family, members 2/5/6) — malformed
+    autonomous-system, chained zone `screen` statement, and malformed OSPF area
+    id now REJECT at strict commit and WARN on the tolerant load/peer-sync path
+    (#1960 no-brick, via the #1319 SchemaValidate split). Added ValidateOSPFArea.
+  - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_security.go,
+    pkg/config/schema_validators_network.go,
+    pkg/config/silent_drop_strict_6564_test.go, docs/config-schema.md

@@ -2217,6 +2217,45 @@ brace and flat-set spellings AGREE with the compact one rather than asserting
 the compact one alone — a test that pinned only the compact shape would not
 notice the two drifting apart again.
 
+### The strict-reject members of the same cohort (#6564)
+
+Three further #6564 members are NOT shape defects and must not be fixed as if
+they were. The statement is structurally readable; its VALUE is malformed, or
+its trailing token is unreachable, and the compiler silently coerced or
+discarded it. There is no correct value to infer, so the only honest repair is
+to refuse it.
+
+| Statement | Silent behaviour before | Repair |
+|---|---|---|
+| `routing-options autonomous-system <bad>` | `strconv.ParseUint`'s error was discarded with no `else` and no record, so `AutonomousSystem` stayed 0, `resolveBGPAutonomousSystem` left `LocalAS` 0, and `pkg/frr` gates `router bgp` on `LocalAS > 0` — **one bad token silently disabled BGP entirely** | `valueType` + `validator`, matching its `local-as` / `peer-as` siblings, which already had both |
+| `security-zone <z> screen <p> <trailing>` | the zone compiler reads `Keys[1]` via `nodeVal` and never the node's children, so a chained statement after the profile name is dropped | `scalar: true`, so the existing `validateScalarValueLeaf` arity gate sees it |
+| `protocols ospf area <bad>` (×4 sites) | no key validator at all, so a malformed id was written **verbatim** into `frr.conf` | `keyValidator: ValidateOSPFArea` |
+
+**Member 2 is a swallowed error, not a Keys-vs-Children defect** — `nodeVal`
+already reads both shapes. A shape-family fix applied there would have looked
+right and changed nothing, which is precisely why each member of a cohort has
+to be diagnosed rather than pattern-matched to the family.
+
+**The posture is asymmetric, and that is the point (#1960 no-brick).** All three
+repairs are schema-level, so they inherit the #1319 PR 2 split for free:
+`SchemaValidate` is STRICT on the operator commit / commit-check path
+(`Store.compileTree`) and DOWNGRADED TO A WARNING on the tolerant
+`Store.Load` / `Store.SyncApply` path (`Store.compileTreeLenient`). A new
+operator edit is refused loudly; a config an older binary already accepted still
+BOOTS after an upgrade. Refusing on both paths would blackout-boot a node or
+alarm-loop HA config sync at the worst possible moment — during an upgrade,
+possibly on the standby of an HA pair mid-ISSU.
+
+`pkg/config/silent_drop_strict_6564_test.go` asserts BOTH directions: the strict
+gate must reject, AND the compiler must still produce a config so the lenient
+wrapper has something to continue with. A strict-only matrix would pass a fix
+that bricks the boot path.
+
+Two further guards worth keeping when this area is edited: the OSPF area
+validator must accept **area 0** (the backbone has no `>= 1` floor, unlike a BGP
+cluster-id), and the `autonomous-system` range must stay `1..4294967295` — a
+mutation loosening either is a silent over-acceptance, and both are pinned.
+
 REACHABILITY (honest bound): as with #6525, these compact spellings are
 hierarchical text ingest only — `load override` / `load merge` / the persisted
 config file / HA `SyncApply`. `set` cannot produce them and `display set`
