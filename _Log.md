@@ -32,6 +32,42 @@
   pkg/grpcapi/server_diag_system_action.go,
   pkg/grpcapi/server_diag_zeroize.go,
   pkg/grpcapi/diag_fork_limiter_6552_test.go, pkg/grpcapi/README.md
+## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The Tier-1 gate asserted the day-0 config was installed
+  (`test -s`) but never its MODE, so a credential-permission regression
+  shipped green. Added `_conf_mode_verdict` pinning the installed file
+  as root-owned, a REGULAR FILE, mode exactly 0600, asserted from all
+  three scenarios that install a config (B, C's retry leg, E) since
+  they share one `install` call. The probe deliberately omits `stat -L`:
+  a symlink's own mode is always 0777 on Linux, so an unfollowed stat
+  reports `777 symbolic link` and fails, while following the link would
+  report the TARGET's `600 regular file` and PASS for a path an attacker
+  controls. File type is part of the verdict and a test asserts the
+  probe carries no `-L`. Also corrected image-validation.md:108, whose
+  sentence ("asserts it exists and is non-empty, not the mode") was true
+  and became false with this change.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_day0_perms_6503.py,
+  docs/image-validation.md
+
+## 2026-08-22 — #6502 day-0 loader probe order (labeled-first contract)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The day-0 config loader concatenated its labeled-volume
+  and iso9660 probe passes and piped them through `sort -u`, which
+  ALPHABETIZES — so with two valid-but-different media attached the ISO
+  on /dev/sda beat the labeled volume on /dev/sdb, the exact opposite
+  of the labeled-first contract the surrounding comment states.
+  Replaced with `awk 'NF && !seen[$0]++'` over the concatenated stream,
+  which preserves first-appearance order AND dedups ACROSS passes — a
+  medium that is both labeled and iso9660 appears once, in its LABELED
+  position. The self-correcting cases are preserved: a REJECTED labeled
+  volume and an EMPTY labeled volume both still fall through to the
+  ISO, so the fix does not become "labeled or nothing".
+- **File(s)**: scripts/image/xpf-day0-config,
+  scripts/image/test_day0_probe_order_6502.py
 
 ## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
 

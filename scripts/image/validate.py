@@ -548,6 +548,73 @@ def _oneshot_clean_verdict(name, exec_main_status, active_state, result):
     return True, f"{name} ran clean (ExecMainStatus=0)"
 
 
+# ── day-0 config permissions (#6503) ──────────────────────────────────
+# The day-0 loader installs /etc/xpf/xpf.conf mode 0600 because it "may carry
+# credential material (root-authentication encrypted-password, IKE PSKs)"
+# (scripts/image/xpf-day0-config). Scenario B asserted the file EXISTS and is
+# non-empty (`test -s`) and nothing about the mode — docs/image-validation.md
+# said so in as many words — so a regression to 0644 would ship
+# world-readable IKE PSKs and password hashes in a signed image and pass the
+# Tier-1 gate.
+#
+# The probe reads three fields from ONE `stat`, because a mode check alone has
+# a hole: `stat` follows a symlink only with -L, so without it a symlinked
+# xpf.conf reports the LINK's 0777 — but a naive check that ran `stat -L`
+# would report the TARGET's mode while the file an attacker controls is the
+# link. A credential file must be a regular file, owned by root, mode exactly
+# 0600.
+_DAY0_CONF = "/etc/xpf/xpf.conf"
+_DAY0_CONF_STAT = f"stat -c '%a %U:%G %F' {_DAY0_CONF} 2>/dev/null"
+
+
+def _conf_mode_verdict(stat_out, want_mode=0o600, want_owner="root:root"):
+    """Pure verdict over `stat -c '%a %U:%G %F'` for the installed day-0
+    config: is it a root-owned regular file with exactly mode 0600?
+    Returns (ok, reason).
+
+    The mode is compared as an OCTAL VALUE, not as a string. This is
+    ROBUSTNESS, not a caught bug: GNU `stat -c %a` emits "600" unpadded, so a
+    string compare against "600" rejects "4600" (a setuid bit) just as an int
+    compare does. What the value compare buys is independence from the
+    RENDERING — a zero-padded "0600" from a non-GNU stat is the same mode and
+    must not be a false red, while every extra bit is still rejected because
+    0o4600 != 0o600. Said plainly because the reverse claim (that a string
+    compare would let 4600 through) is FALSE and was in an earlier draft of
+    this comment; the mutation matrix caught it.
+
+    Unreadable / absent output is a FAIL, not a pass. A gate that cannot
+    observe the property it exists to assert has not asserted it.
+    """
+    fields = (stat_out or "").strip().split(None, 2)
+    if len(fields) < 3:
+        return False, (
+            f"could not stat {_DAY0_CONF} in the guest (got {stat_out!r}) — "
+            "the day-0 config is missing, or the probe failed; either way the "
+            "permission is unobserved, which is not the same as satisfied")
+    mode_s, owner, ftype = fields
+    try:
+        mode = int(mode_s, 8)
+    except ValueError:
+        return False, f"{_DAY0_CONF}: unparseable mode {mode_s!r}"
+
+    problems = []
+    if ftype != "regular file":
+        problems.append(
+            f"is a {ftype!r}, not a regular file — a symlinked config puts the "
+            "bytes xpfd reads outside the mode this gate checks")
+    if mode != want_mode:
+        problems.append(
+            f"has mode {mode_s} (0o{mode:o}), not {want_mode:04o} — a day-0 "
+            "config may carry root-authentication encrypted-password and IKE "
+            "PSKs, so any extra bit makes them readable to every local user "
+            "on the appliance")
+    if owner != want_owner:
+        problems.append(f"is owned by {owner}, not {want_owner}")
+    if problems:
+        return False, f"{_DAY0_CONF} " + "; ".join(problems)
+    return True, f"{_DAY0_CONF} is a root:root regular file, mode {mode_s}"
+
+
 def _find_first(candidates):
     for p in candidates:
         if os.path.isfile(p):
@@ -881,6 +948,31 @@ class Harness:
             fail("#1930 INC-0 kernel hold assertion FAILED: " + reason)
         info(f"kernel hold: {reason}")
 
+    def assert_day0_conf_perms(self, inst):
+        """Assert the installed day-0 config's credential posture (#6503).
+
+        Called from every scenario where the loader actually INSTALLS a config
+        — B (valid drive), C's retry leg (fix + reboot applies), and E
+        (node-id drive) — because they all reach the same `install -o root -g
+        root -m 0600` and a regression there would ship in a signed image from
+        any of them.
+
+        Deliberately NOT asserted: /etc/xpf's own directory mode. The loader
+        sets it best-effort (`chmod 0750 ... || true`) and the directory comes
+        from the .deb on a real appliance, so it is not the loader's contract
+        to pin here.
+        """
+        out = guest(inst, "sh", "-c", _DAY0_CONF_STAT,
+                    check=False, capture=True).stdout
+        ok, reason = _conf_mode_verdict(out)
+        if not ok:
+            fail("day-0 config permission assertion FAILED: " + reason +
+                 "\n  The loader installs it 0600 precisely because it may "
+                 "carry credential material (scripts/image/xpf-day0-config); "
+                 "the Tier-1 gate has to pin that, exactly as scenario A pins "
+                 "the sshd posture.")
+        info(f"day-0 config perms: {reason}")
+
     def assert_secure_boot(self, inst):
         """Assert the guest actually booted under UEFI Secure Boot (#6497).
 
@@ -1027,6 +1119,7 @@ class Harness:
             fail("day-0 stamp missing")
         if guest(b, "test", "-s", "/etc/xpf/xpf.conf", check=False).returncode != 0:
             fail("/etc/xpf/xpf.conf missing")
+        self.assert_day0_conf_perms(b)
         if not guest_sh(b,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "day-0 config installed"'):
             fail("day-0 loader did not log the install")
@@ -1103,6 +1196,7 @@ class Harness:
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q '
                         '"day-0 config installed"'):
             fail("retry: day-0 loader did not install the fixed config on reboot")
+        self.assert_day0_conf_perms(c)
         self._wait(c,
                    lambda: guest_sh(c, '[ "$(hostname)" = xpf-day0-c-fixed ]'),
                    20, 3, "retry: fixed hostname xpf-day0-c-fixed not applied")
@@ -1250,6 +1344,7 @@ class Harness:
         if nid != "1":
             fail(f"/etc/xpf/node-id is '{nid}', expected '1' — node-id not "
                  "persisted from the day-0 drive")
+        self.assert_day0_conf_perms(e)
         # Cluster-mode naming: node 1 uses FPC 7. em0 is assigned only in
         # cluster mode (position 2); ge-7/0/0 proves the node-1 FPC branch.
         if not guest_sh(e, 'ip link show em0 >/dev/null 2>&1'):
