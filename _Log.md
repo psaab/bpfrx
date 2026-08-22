@@ -100945,3 +100945,16 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_device_map_dup_name_6546_test.go (new),
   pkg/daemon/device_map_dup_name_6546_test.go (new),
   docs/bare-metal-device-map.md, _Log.md
+
+## 2026-08-21 — #6555 ddns default interface source DHCP-restart guard
+- **Timestamp**: 2026-08-21
+- **Action**: The #4423 M10 guard existed only on the `dhcp` address source. The
+  DEFAULT source (`interface`, what an unset `address-source` resolves to) still
+  read a DHCP client-restart address-gone window as a DEFINITIVE loss and
+  withdrew the public A/AAAA record. Added the symmetric guard to
+  `observeInterfaceAddr`, gated on an EMPTY family address list (the restart
+  window) rather than on selection failure (tentative/non-public stays
+  definitive, matching the dhcp source). Single-sourced both sources' predicate
+  as `unitRunsDHCPForFamily`.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
