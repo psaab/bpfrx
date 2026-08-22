@@ -60,6 +60,7 @@ fn pool_snat_single_address_rewrites_src_and_port() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     ));
     assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
@@ -112,6 +113,7 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter,
         ));
         assert_eq!(
@@ -202,6 +204,7 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             false,
             // #4088: an identifier-bearing ICMP echo query.
             true,
+            NatHolder::Untracked,
             &mut counter,
         ));
         let db = expect_snat_decision(match_source_nat_result_for_tuple(
@@ -220,6 +223,7 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             false,
             // #4088: an identifier-bearing ICMP echo query.
             true,
+            NatHolder::Untracked,
             &mut counter,
         ));
         // Both hosts land on the single pool address (overload) ...
@@ -329,6 +333,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             false,
             // #4088: identifier-bearing echo query — even though id==0.
             true,
+            NatHolder::Untracked,
             &mut counter,
         ));
         let db = expect_snat_decision(match_source_nat_result_for_tuple(
@@ -346,6 +351,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             0,
             false,
             true,
+            NatHolder::Untracked,
             &mut counter,
         ));
         let expected_pool: IpAddr = if proto == PROTO_ICMP {
@@ -392,6 +398,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter2,
         ));
         assert_eq!(
@@ -442,6 +449,7 @@ fn pool_snat_icmp_without_query_id_is_address_only() {
         false,
         // #4088: no identifier-bearing query → address-only.
         false,
+        NatHolder::Untracked,
         &mut counter,
     ));
     assert_eq!(d.rewrite_src, Some("203.0.113.1".parse().unwrap()));
@@ -495,6 +503,7 @@ fn pool_snat_no_translation_preserves_source_port() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     ));
     assert_eq!(
@@ -556,6 +565,7 @@ fn addr_only_lookup(
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     )
 }
@@ -1158,6 +1168,7 @@ fn notrans_persistent_lookup(
         now_ns,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     )
 }
@@ -1821,6 +1832,7 @@ fn tuple_snat_lookup_from_src(
         now_ns,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     )
 }
@@ -2380,6 +2392,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         1,
         false,
         false,
+        NatHolder::Untracked,
         &mut None,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
@@ -2399,6 +2412,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         2,
         false,
         false,
+        NatHolder::Untracked,
         &mut None,
     );
     assert_eq!(
@@ -2461,6 +2475,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         1,
         false,
         false,
+        NatHolder::Untracked,
         &mut None,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
@@ -2480,6 +2495,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         2,
         false,
         false,
+        NatHolder::Untracked,
         &mut None,
     );
     assert_eq!(
@@ -3519,6 +3535,7 @@ fn pool_snat_address_persistent_userspace_v2_selects_pool_addresses() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut None,
         ));
 
@@ -3842,6 +3859,7 @@ fn pool_snat_sequential_collision_probes_next_free_port() {
         PersistentNatPermit::TargetHostPort,
         0,
         1_000,
+        NatHolder::Untracked,
     );
     let translated = result.expect("collision must not exhaust an otherwise-free range");
     assert_eq!(translated.ip, IpAddr::V4(pool_ip));
@@ -3889,6 +3907,7 @@ fn pool_snat_recycled_collision_retains_port() {
         PersistentNatPermit::TargetHostPort,
         0,
         1_000,
+        NatHolder::Untracked,
     );
     let translated = result.expect("free recycled port must be allocated");
     assert_eq!(translated.port, 1024, "must hand out the free recycled port");
@@ -3919,6 +3938,7 @@ fn pool_snat_recycled_collision_retains_port() {
         PersistentNatPermit::TargetHostPort,
         0,
         1_000,
+        NatHolder::Untracked,
     );
     let translated2 = result2.expect("retained recycled port must be reusable after owner clears");
     assert_eq!(
@@ -3961,6 +3981,7 @@ fn pool_snat_recycle_order_is_fifo_not_lifo() {
                 PersistentNatPermit::TargetHostPort,
                 0,
                 1_000,
+                NatHolder::Untracked,
             )
             .expect("sequential allocation must succeed within range")
     };
@@ -4049,6 +4070,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         1,
         true,
         false,
+        NatHolder::Untracked,
         &mut None,
     );
     match frag {
@@ -4074,6 +4096,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         1,
         false,
         false,
+        NatHolder::Untracked,
         &mut None,
     );
     assert!(
@@ -4151,6 +4174,7 @@ fn synced_session_reserves_nat_pool_port_4388() {
             PersistentNatPermit::TargetHostPort,
             0,
             1_000,
+            NatHolder::Untracked,
         )
         .expect("the second pool port must be available");
     assert_eq!(
@@ -4188,6 +4212,7 @@ fn synced_session_reserves_nat_pool_port_4388() {
             PersistentNatPermit::TargetHostPort,
             0,
             3_000,
+            NatHolder::Untracked,
         )
         .expect("the freed port must be reusable after release");
     assert_eq!(
@@ -4614,6 +4639,7 @@ fn synced_reservation_follows_active_zone_match_6211() {
             PersistentNatPermit::TargetHostPort,
             0,
             1_000,
+            NatHolder::Untracked,
         )
         .expect("the lan pool must have a free port");
     assert_eq!(
@@ -5235,6 +5261,7 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter,
         ));
         let ip = match d.rewrite_src.expect("rewrite_src") {
@@ -5545,6 +5572,7 @@ fn deterministic_cgnat_absent_leaves_round_robin_pool_unchanged() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     ));
     // Round-robin allocator hands out the cursor-start port (port_low), which is
@@ -5597,7 +5625,13 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
             dst_port: 443,
         };
         let t = alloc
-            .allocate_deterministic_v6(flow, &pool, det, src.parse().expect("src"))
+            .allocate_deterministic_v6(
+                flow,
+                &pool,
+                det,
+                src.parse().expect("src"),
+                NatHolder::Untracked,
+            )
             .expect("deterministic v6 allocation");
         match t.ip {
             IpAddr::V4(v4) => (v4, t.port),
@@ -5660,7 +5694,13 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
     };
     assert!(
         alloc
-            .allocate_deterministic_v6(over, &pool, det, "2001:db8:0:1f8::".parse().unwrap())
+            .allocate_deterministic_v6(
+                over,
+                &pool,
+                det,
+                "2001:db8:0:1f8::".parse().unwrap(),
+                NatHolder::Untracked,
+            )
             .is_err(),
         "a subscriber beyond host_count must fail closed, not round-robin"
     );
@@ -5756,7 +5796,8 @@ fn deterministic_napt64_v6_rejects_out_of_prefix_shared_word() {
                 flow_for("2001:db9:0:5::"),
                 &pool,
                 det,
-                "2001:db9:0:5::".parse().unwrap()
+                "2001:db9:0:5::".parse().unwrap(),
+                NatHolder::Untracked,
             )
             .is_err(),
         "the out-of-prefix source must not be translated into subscriber 5's block"
@@ -5767,6 +5808,7 @@ fn deterministic_napt64_v6_rejects_out_of_prefix_shared_word() {
             &pool,
             det,
             "2001:db8:0:5::".parse().unwrap(),
+            NatHolder::Untracked,
         )
         .expect("the in-prefix source still allocates");
     let ext_ip = match ok.ip {
@@ -5954,6 +5996,7 @@ fn pool_snat_lockfree_concurrent_fill_is_exact_and_collision_free() {
                     PersistentNatPermit::TargetHostPort,
                     0,
                     1_000,
+                    NatHolder::Untracked,
                 ) {
                     local.push((t.ip, t.port));
                 }
@@ -6040,6 +6083,7 @@ fn pool_snat_lockfree_concurrent_churn_no_double_alloc_no_leak() {
                     PersistentNatPermit::TargetHostPort,
                     0,
                     1_000,
+                    NatHolder::Untracked,
                 ) {
                     Ok(t) => {
                         // No two live flows may hold the same translated tuple:
@@ -6104,6 +6148,7 @@ fn pool_snat_release_frees_bit_and_port_is_reusable() {
             PersistentNatPermit::TargetHostPort,
             0,
             1_000,
+            NatHolder::Untracked,
         )
     };
 
@@ -6162,6 +6207,7 @@ fn pool_snat_fills_to_exact_capacity_then_exhausts() {
                 PersistentNatPermit::TargetHostPort,
                 0,
                 1_000,
+                NatHolder::Untracked,
             )
             .expect("must allocate up to exact capacity without false exhaustion");
         assert!(
@@ -6190,6 +6236,7 @@ fn pool_snat_fills_to_exact_capacity_then_exhausts() {
                 PersistentNatPermit::TargetHostPort,
                 0,
                 1_000,
+                NatHolder::Untracked,
             )
             .is_err(),
         "one flow beyond exact capacity must exhaust"
@@ -6454,6 +6501,7 @@ fn pool_snat_gc_chunked_concurrent_alloc_release_stays_consistent() {
                         PersistentNatPermit::AnyRemoteHost,
                         NS_PER_SEC,
                         now_ns,
+                        NatHolder::Untracked,
                     ) {
                         assert!(
                             alloc.release_flow(flow, translated, now_ns + 1, NatHolder::Untracked),
@@ -6687,17 +6735,24 @@ fn synced_address_only_token_survives_first_worker_retire_6211_f2() {
     );
 }
 
-// #6211 F2 OVER-REACH GUARD: a LOCAL allocation is untouched by the holder set.
+// #6211 F2 OVER-REACH GUARD, re-scoped by #6522: an UNTRACKED allocation is
+// untouched by the holder set.
 //
-// RSS steers a 5-tuple to exactly one worker, so a locally allocated translation
-// has a single holder by construction and its record carries `holders == 0`. The
-// first release must free it — the pre-#6211-F2 contract — no matter which
-// worker id the release carries. A fix that made EVERY release refcounted would
-// leak every local NAT port; this cell is what separates the two.
+// `NatHolder::Untracked` records no bit, so such a record carries
+// `holders == 0` and the FIRST release frees it — the pre-#6211-F2 contract —
+// no matter which worker id the release carries. A fix that made EVERY release
+// refcounted would leak every port allocated through an untracked entry point;
+// this cell is what separates the two.
 //
-// Stays GREEN under the revert.
+// #6522 narrowed WHO passes `Untracked`: the production packet path now names
+// its own worker (`NatHolder::Worker(worker_id)`, see the #6522 cells below),
+// so the remaining untracked callers are the test entry points and the
+// read-only non-first-fragment probe (which mints nothing). This cell pins the
+// `Untracked` contract those callers depend on, not a claim about local flows.
+//
+// Stays GREEN under both reverts.
 #[test]
-fn local_allocation_still_frees_on_first_release_6211_f2() {
+fn untracked_allocation_still_frees_on_first_release_6211_f2() {
     let rules = holder_pool_rules_6211_f2();
     let addrs = rules[0].pool_addresses_v4.clone();
     let local_flow = SourceNatFlowKey {
@@ -6718,6 +6773,7 @@ fn local_allocation_still_frees_on_first_release_6211_f2() {
             PersistentNatPermit::TargetHostPort,
             0,
             1_000,
+            NatHolder::Untracked,
         )
         .expect("a fresh pool port must be available");
     assert!(
@@ -6738,7 +6794,224 @@ fn local_allocation_still_frees_on_first_release_6211_f2() {
         !rules[0]
             .pool_allocator
             .debug_is_port_occupied(0, translated.port),
-        "#6211 F2 must not make LOCAL allocations refcounted — a local record \
-         carries no holder bits and frees on the first release"
+        "#6211 F2 must not make UNTRACKED allocations refcounted — a record \
+         minted through `NatHolder::Untracked` carries no holder bits and \
+         frees on the first release"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// #6522 — the ALLOCATING worker is a holder of its own allocation
+// ---------------------------------------------------------------------------
+//
+// #6211 F2 gave an HA-SYNCED reservation a holder bit per worker, because
+// `handle_upsert_synced` runs on every worker against one shared allocator. It
+// left the LOCAL allocation path untracked on the stated ground that "RSS
+// steers a 5-tuple to exactly one worker, so a local allocation has a single
+// holder by construction".
+//
+// That ground does not hold. A locally-born forward session is REPLICATED to
+// every sibling worker: `poll_descriptor` calls `replicate_session_upsert`,
+// which fans a `WorkerLocalImport`-origin `UpsertSynced` to
+// `peer_worker_commands` — the queue list built in
+// `coordinator/reconcile/bringup.rs` by `.filter(|(id, _)| **id != worker_id)`,
+// i.e. every worker EXCEPT the allocating one. `SessionOrigin::is_peer_synced()`
+// returns TRUE for `WorkerLocalImport`, so each sibling's `handle_upsert_synced`
+// calls `reserve_synced_source_nat_allocation_for_worker` and takes a holder
+// bit on the record the allocating worker created.
+//
+// So with an untracked local allocation the holder mask ends up naming every
+// worker EXCEPT the one actually forwarding. The sibling replicas see no
+// traffic (flow-hash steering pins the flow's packets to one worker) and are
+// never refreshed, so they all age out; when the LAST of them reaps,
+// `drop_holder_locked` empties the mask and frees a `(pool_addr, port)` the
+// owning worker is still forwarding through — mid-flow pool-port reuse.
+//
+// The second reaching path needs no reserve at all:
+// `session_glue::materialize_shared_session_hit` installs a `WorkerLocalImport`
+// replica on a worker off the SHARED map WITHOUT reserving, and
+// `reap_expired_sessions` then releases for it unconditionally — a worker that
+// never held the allocation freeing it outright.
+//
+// A single-worker fixture cannot express any of this: it is green before and
+// after. Every cell below has the allocation made by one worker and released or
+// reserved by another.
+
+/// Allocate through the REAL packet-path SNAT decision function, as
+/// `source_nat_decision_for_flow` does, recording `worker` as the holder.
+fn local_pool_allocation_6522(
+    rules: &[SourceNatRule],
+    src_ip: &str,
+    src_port: u16,
+    holder: NatHolder,
+) -> NatDecision {
+    let mut counter = None;
+    expect_snat_decision(match_source_nat_result_for_tuple(
+        rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src_ip.parse().expect("src"),
+        "8.8.8.8".parse().expect("dst"),
+        Some(PROTO_TCP),
+        src_port,
+        443,
+        None,
+        None,
+        1_000,
+        false,
+        false,
+        holder,
+        &mut counter,
+    ))
+}
+
+// #6522 FAIL-ON-REVERT (the binder). Worker 0 allocates locally and keeps
+// forwarding; its five sibling replicas each reserve and then age-reap. The
+// port must still be held.
+//
+// Reverting the fix — restoring `holders: 0` at `allocate_translation`'s
+// `live_by_flow.insert` — makes this assertion RED: the mask becomes
+// {1,2,3,4,5}, worker 5's reap empties it, and the port is freed under worker 0.
+//
+// Kept in its own body so the leak guard below still runs when this fires.
+#[test]
+fn local_allocation_survives_sibling_replica_reaps_6522() {
+    let rules = holder_pool_rules_6211_f2();
+    let decision = local_pool_allocation_6522(&rules, "10.0.61.50", 40000, NatHolder::Worker(0));
+    let port = decision
+        .rewrite_src_port
+        .expect("a pool-mode TCP flow allocates a translated port");
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "precondition: worker 0's local allocation holds its pool port"
+    );
+
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    // What `replicate_session_upsert` -> `handle_upsert_synced` does on each
+    // SIBLING worker (never worker 0 — `peer_worker_commands` excludes self).
+    for sibling in 1..6u32 {
+        reserve_synced_source_nat_allocation_for_worker(
+            &rules, &key, decision, false, None, sibling,
+        );
+    }
+
+    // Every replica ages out with nothing refreshing it and reaps.
+    for sibling in 1..6u32 {
+        release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
+    }
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "#6522: worker 0 is still forwarding this flow, so the sibling \
+         replicas' age-reap must NOT free its (203.0.113.1, {port}) — freeing \
+         it hands a live flow's NAT source tuple to the next local flow"
+    );
+}
+
+// #6522 LEAK GUARD, in its own body: once the OWNING worker releases, the port
+// really is freed. Without this a "never free a local allocation" implementation
+// would satisfy the binder above while leaking every pool port.
+//
+// Stays GREEN under the revert (pre-fix the first sibling reap already freed it),
+// so it constrains the fix rather than restating it.
+#[test]
+fn local_allocation_frees_when_the_owning_worker_reaps_6522() {
+    let rules = holder_pool_rules_6211_f2();
+    let decision = local_pool_allocation_6522(&rules, "10.0.61.50", 40000, NatHolder::Worker(0));
+    let port = decision.rewrite_src_port.expect("translated port");
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+
+    for sibling in 1..6u32 {
+        reserve_synced_source_nat_allocation_for_worker(
+            &rules, &key, decision, false, None, sibling,
+        );
+        release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
+    }
+    release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_001, 0);
+
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "#6522: the owning worker's release is the LAST holder's release — \
+         holding the port past it is a permanent pool leak that counts against \
+         max_tracked_flows"
+    );
+}
+
+// #6522 the tight property, and the `materialize_shared_session_hit` path: a
+// worker that NEVER reserved must not free another worker's allocation. That
+// path installs a `WorkerLocalImport` replica off the shared map without
+// reserving, and `reap_expired_sessions` releases for every expired entry with
+// no origin or holder filter — so the release below is exactly what production
+// issues, with no reserve preceding it.
+//
+// RED on revert: with `holders == 0` the release frees on first call regardless
+// of which worker id it carries.
+#[test]
+fn foreign_worker_release_does_not_free_a_local_allocation_6522() {
+    let rules = holder_pool_rules_6211_f2();
+    let decision = local_pool_allocation_6522(&rules, "10.0.61.50", 40000, NatHolder::Worker(0));
+    let port = decision.rewrite_src_port.expect("translated port");
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+
+    release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, 3);
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, port),
+        "#6522: worker 3 never held this allocation — reaping its \
+         materialized replica must not free worker 0's live pool port"
+    );
+}
+
+// #6522 for the ADDRESS-ONLY (#5269/#6226) local arm. It mints no port bit, so
+// the observable is the reverse-identity token in `address_only_owners`, and it
+// reaches a DIFFERENT allocator entry point
+// (`reserve_address_only_roundrobin`) than the PAT cells above — its own
+// `holders:` literal, its own revert.
+//
+// RED on revert for the same reason as the PAT binder.
+#[test]
+fn local_address_only_token_survives_sibling_replica_reaps_6522() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat-addr-only".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10001,
+        // `port no-translation`: the wire keeps the packet's own source port and
+        // the flow claims a reverse-identity token instead of a pool port bit.
+        pool_no_translation: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let decision = local_pool_allocation_6522(&rules, "10.0.61.50", 40000, NatHolder::Worker(0));
+    assert_eq!(
+        decision.rewrite_src_port, None,
+        "precondition: `port no-translation` preserves the source port"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "precondition: worker 0's local flow minted one reverse-identity token"
+    );
+
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    for sibling in 1..6u32 {
+        reserve_synced_source_nat_allocation_for_worker(
+            &rules, &key, decision, false, None, sibling,
+        );
+    }
+    for sibling in 1..6u32 {
+        release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
+    }
+
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "#6522: worker 0 still owns this address-only flow, so its sibling \
+         replicas' age-reap must NOT drop the reverse-identity token"
     );
 }

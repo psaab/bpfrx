@@ -1756,6 +1756,8 @@ pub(crate) fn allocate_nat64_pool_port(
     flow: SourceNatFlowKey,
     pool_v4: &[Ipv4Addr],
     now_ns: u64,
+    // #6522: the allocating worker — see `match_source_nat_result_for_tuple`.
+    holder: NatHolder,
 ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
     let translated = allocator.allocate_translation(
         flow,
@@ -1766,6 +1768,7 @@ pub(crate) fn allocate_nat64_pool_port(
         PersistentNatPermit::default(),
         0, // persistent_nat_timeout_ns — unused when persistent_nat is false
         now_ns,
+        holder,
     )?;
     match translated.ip {
         IpAddr::V4(v4) => Ok((v4, translated.port)),
@@ -1788,8 +1791,11 @@ pub(crate) fn allocate_nat64_pool_port_deterministic_v6(
     pool_v4: &[Ipv4Addr],
     params: DeterministicV6,
     src_v6: Ipv6Addr,
+    // #6522: the allocating worker — see `match_source_nat_result_for_tuple`.
+    holder: NatHolder,
 ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
-    let translated = allocator.allocate_deterministic_v6(flow, pool_v4, params, src_v6)?;
+    let translated =
+        allocator.allocate_deterministic_v6(flow, pool_v4, params, src_v6, holder)?;
     match translated.ip {
         IpAddr::V4(v4) => Ok((v4, translated.port)),
         IpAddr::V6(_) => Err(SourceNatFailureReason::WrongAddressFamily),
@@ -1919,6 +1925,10 @@ pub(crate) fn match_source_nat_result(
         // #4088: the address-only wrapper never carries an ICMP query id
         // (the tuple is unknown), so there is no identifier to preserve.
         false,
+        // #6522: this wrapper has no worker context (its only callers are the
+        // `#[cfg_attr(not(test), allow(dead_code))]` helpers in
+        // `afxdp/forwarding/nat.rs`), so it keeps the untracked contract.
+        NatHolder::Untracked,
         &mut counter,
     )
 }
@@ -1975,6 +1985,13 @@ pub(crate) fn match_source_nat_result_for_tuple(
     // address on the reverse tuple (pool_addr, 0). The synthetic /
     // address-only (`protocol == 0`) callers pass `false`.
     icmp_identifier_present: bool,
+    // #6522: the worker whose packet path is making this allocation. The record
+    // this call inserts names its own holder, so a sibling worker's replica of
+    // the resulting session cannot free a `(pool_addr, port)` this worker is
+    // still forwarding through (see `NatHolder` / `LiveAllocation::holders`).
+    // `NatHolder::Untracked` keeps the pre-#6522 single-holder contract for the
+    // test entry points and the read-only fragment probe.
+    holder: NatHolder,
     matched_counter: &mut Option<Arc<NatRuleCounter>>,
 ) -> SourceNatLookup {
     // #5687: decode the out-of-band protocol. `None` is the tuple-unknown
@@ -2227,6 +2244,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                         &rule.pool_addresses_v4,
                         det,
                         src_v4,
+                        holder,
                     ) {
                         Ok(translated) => translated,
                         Err(reason) => {
@@ -2304,6 +2322,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             rule.persistent_nat_permit,
                             rule.persistent_nat_timeout_ns,
                             now_ns,
+                            holder,
                         )
                     } else {
                         // #6226: probe the WHOLE pool from the round-robin start
@@ -2320,6 +2339,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             0,
                             addr_idx,
                             rule.address_persistent,
+                            holder,
                         )
                     };
                     match reserved {
@@ -2348,6 +2368,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     rule.persistent_nat_permit,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
+                    holder,
                 ) {
                     Ok(translated) => translated,
                     Err(reason) => {
@@ -2415,6 +2436,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             rule.persistent_nat_permit,
                             rule.persistent_nat_timeout_ns,
                             now_ns,
+                            holder,
                         )
                     } else {
                         // #6226: probe the WHOLE pool from the round-robin start
@@ -2429,6 +2451,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             v6_offset,
                             addr_idx,
                             rule.address_persistent,
+                            holder,
                         )
                     };
                     match reserved {
@@ -2457,6 +2480,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     rule.persistent_nat_permit,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
+                    holder,
                 ) {
                     Ok(translated) => translated,
                     Err(reason) => {
