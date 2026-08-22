@@ -35,6 +35,7 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -100,11 +101,17 @@ type CLI struct {
 	// gRPC ShowText path read. Nil in a `cli` spawned outside the daemon,
 	// where the command reports that no outcome has been recorded.
 	bootstrapImportFn func() bootstrapshow.Snapshot
-	hostname          string
-	username          string
-	userClass         string
-	version           string
-	startTime         time.Time
+	// kernelUpgradeStatusFn returns the #1930 kernel-channel state for
+	// `show system kernel-upgrade` (#6495). The daemon wires the same reader
+	// the gRPC path uses, so the console and the remote `cli` cannot disagree
+	// about a node mid-roll. Nil outside the daemon, where the command reports
+	// an idle channel.
+	kernelUpgradeStatusFn func() upgrade.ChannelStatus
+	hostname              string
+	username              string
+	userClass             string
+	version               string
+	startTime             time.Time
 
 	vrrpMgr *vrrp.Manager
 
@@ -300,6 +307,15 @@ func (c *CLI) SetListenersFn(fn func() sysservices.Listeners) {
 // leaves the command reporting an unrecorded outcome (offline / unit test).
 func (c *CLI) SetBootstrapImportFn(fn func() bootstrapshow.Snapshot) {
 	c.bootstrapImportFn = fn
+}
+
+// SetKernelUpgradeStatusFn wires the #1930 kernel-channel state for
+// `show system kernel-upgrade` (#6495). Before this, the only readout of an
+// in-flight kernel roll was a root shell running `xpfd upgrade kernel status`
+// or journald — automation had a path (the xpf-deploy orchestrator polls that
+// verb over node_exec) and the human operator did not.
+func (c *CLI) SetKernelUpgradeStatusFn(fn func() upgrade.ChannelStatus) {
+	c.kernelUpgradeStatusFn = fn
 }
 
 // SetDDNSOwnedRecordsFn sets a callback for retrieving the DHCP

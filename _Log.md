@@ -100332,6 +100332,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
 
 - **Timestamp**: 2026-08-21
+  - **Action**: #6492 claim fix — correct the false "lifeline-excluded ⇒ can
+    never strand management" safety claims at 9 sites (6 Go comments, 2 docs,
+    1 README section). Lifeline exclusion is by INTERFACE, not by address value.
+    Comment/doc only; raw .text byte-identical.
+  - **File(s)**: pkg/daemon/daemon_nft.go,
+    pkg/daemon/host_inbound_conntrack_flush.go, pkg/daemon/README.md,
+    pkg/dataplane/userspace/zones_host_inbound.go,
+    docs/host-inbound-service-matrix.md
   - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
     lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
     so the #6476 cold-boot fence is no longer suppressed.
@@ -100492,6 +100500,16 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_proxyarp_test.go,
   pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: #6537 — record the `userspace_ingress_ifaces` delete inventory on
+  EVERY exit from `syncIngressIfaceMapLocked`, not only the all-succeeded path.
+  Both early returns now retain `prior ∪ installed-this-pass` via
+  `mergeIngressInventory`, so a row installed by a pass that later failed is
+  still reachable to a subsequent reap. Fail-on-revert coverage as a table plus
+  an end-to-end reap test; the rows localise (dropping the update-path debt
+  greens the delete-path row and vice versa). BPF-map fixtures SKIP unprivileged.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_ingress_partial_6537_test.go,
+  docs/afxdp-packet-processing.md, _Log.md
 - **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
   `Store.confirmPrevFirst` records first-commit-ness where it is known (arm
   site: pre-promotion `s.compiled`; recovery site: the persisted
@@ -100549,3 +100567,15 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/session_glue/tests.rs,
   userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
   docs/session-sync-architecture.md, _Log.md
+
+## 2026-08-21 — #7257: heartbeat start/stop lifecycle tenure
+- **Timestamp**: 2026-08-21
+- **Action**: `StartHeartbeat` published the sender/receiver under `m.mu`, released
+  the lock, then dereferenced the fields it had just written while `StopHeartbeat`
+  nilled them under the lock. Publish + start now happen in one critical section
+  against locals, and a new `hbEpoch` tenure counter makes a start that a teardown
+  overtook return `ErrHeartbeatStartSuperseded` instead of installing a pair
+  nothing can stop. `startHeartbeatWithRetry` treats the sentinel as terminal.
+- **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/daemon/daemon_ha_sync.go,
+  pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md

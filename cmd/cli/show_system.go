@@ -135,6 +135,10 @@ func (c *ctl) handleShowSystem(args []string) error {
 		return c.showSystemInfo("boot-messages")
 	case "core-dumps":
 		return c.showText("core-dumps")
+	case "kernel-upgrade":
+		// #6495: the #1930 kernel-channel state, rendered daemon-side through
+		// pkg/upgrade — the same implementation the console CLI uses.
+		return c.showText("kernel-upgrade")
 	case "bootstrap-import":
 		// #6496: the day-0 config-import verdict. Rendered daemon-side through
 		// pkg/bootstrapshow — the same implementation the in-process console

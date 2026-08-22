@@ -559,6 +559,12 @@ func (r *KernelRunner) verifyAndPromote(j *KernelJournal, candID, running string
 	if err := sys.WritePromotionMarker(running); err != nil {
 		r.logf("kernel-upgrade promote: WARNING write promotion marker: %v", err)
 	}
+	// #6495: durable last-roll outcome, alongside the marker and for the same
+	// reason — the journal is about to be cleared. The marker answers the HA
+	// orchestrator's "did THIS node promote version X"; this answers the
+	// operator's "what happened to the last roll", which on a REVERT the marker
+	// cannot answer at all (it is not written, and is cleared).
+	r.recordRollOutcome(j, RollOutcomePromoted, "")
 	// The candidate slot is now the active/known-good slot; the OTHER slot
 	// (the former active) becomes the rollback target and keeps its kernel.
 	if err := r.ktransition(j, KernelStatePromoted); err != nil {
@@ -590,6 +596,15 @@ func (r *KernelRunner) recoverIndeterminate(j *KernelJournal, why error) error {
 // to the known-good slot. The boot-LOOP is already closed by firmware (BootNext
 // was consumed), so the reboot lands on the known-good slot.
 func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
+	// #6495: record the outcome FIRST, before anything that can return early.
+	// revert() has three exits — journal-unwritable, attempt-cap give-up, and
+	// the normal reboot path — and the two early ones are precisely the states
+	// an operator most needs explained (a read-only root, or a candidate that
+	// failed three times). Recording at the top means every one of them leaves
+	// a durable answer. Best-effort: a failed history write never changes what
+	// the revert DOES.
+	r.recordRollOutcome(j, RollOutcomeReverted, fmt.Sprintf("%v", reason))
+
 	// Boot-attempt guard (r1 AGY catastrophic): if the journal cannot be
 	// CLEARED (e.g. read-only root after a kernel oops), a naive revert would
 	// loop forever — each boot re-reads ARMED, reverts, exits 3, reboots. Bound

@@ -379,6 +379,7 @@ var showTextViewTopics = map[string]bool{
 	"internet-options":                         true,
 	"ipsec-statistics":                         true,
 	"ipv6-router-advertisement":                true,
+	"kernel-upgrade":                           true,
 	"lldp":                                     true,
 	"lldp-neighbors":                           true,
 	"log":                                      true,

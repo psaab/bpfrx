@@ -78,7 +78,11 @@ func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 		// exactly as a definitively-armed candidate would. reconcileKernelUpgradeHold
 		// self-heals this hold on a later successful read (see below), so a
 		// transient read error does not strand the node SECONDARY forever.
-		d.cluster.SetKernelUpgradeHold()
+		// #6495: hold with the reason that is actually TRUE here. This node
+		// does NOT know a candidate is armed — that is the whole point of the
+		// fail-closed branch — so it must not tell the operator it is waiting
+		// on a promotion marker that may never be written.
+		d.cluster.SetKernelUpgradeHold(cluster.KernelUpgradeHoldUnreadableJournal)
 		d.kernelUpgradeHoldFailClosed = true
 		slog.Warn("kernel-upgrade journal unreadable, holding election fail-closed "+
 			"(SECONDARY) until the state can be re-read", "err", err)
@@ -87,7 +91,7 @@ func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 	if !armed {
 		return
 	}
-	d.cluster.SetKernelUpgradeHold()
+	d.cluster.SetKernelUpgradeHold(cluster.KernelUpgradeHoldCandidate)
 	d.kernelUpgradeHoldFailClosed = false
 	slog.Info("kernel-candidate boot: holding SECONDARY (election hold) until promotion "+
 		"verifies the dataplane", "candidate", j.CandidateVersion)
@@ -160,6 +164,13 @@ func (d *Daemon) reconcileKernelUpgradeHold() {
 			// A genuine candidate is armed after all — this is now an ordinary
 			// armed hold; the promotion-marker gate below governs its release.
 			d.kernelUpgradeHoldFailClosed = false
+			// #6495: the RENDERED reason must follow the state across this
+			// transition. Without this the status keeps saying "journal
+			// unreadable" on a node whose journal is now readable and whose
+			// hold is now an ordinary candidate hold — sending the operator to
+			// fix a filesystem that is fine. Re-setting is idempotent: the flag
+			// is already true and no group is primary to demote.
+			d.cluster.SetKernelUpgradeHold(cluster.KernelUpgradeHoldCandidate)
 		default:
 			// Definitively not armed on a clean read: the boot-time read failure
 			// was transient and no kernel upgrade is pending. Release the hold.

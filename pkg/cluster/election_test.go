@@ -174,7 +174,7 @@ func TestElection_SplitBrain_HigherNodeLoses(t *testing.T) {
 // ForceSecondary fix missed (peerAlive=false at boot made it a no-op).
 func TestElection_KernelUpgradeHold_IsolatedStaysSecondary(t *testing.T) {
 	m := NewManager(0, 1)
-	m.SetKernelUpgradeHold() // candidate boot, before the cluster starts electing
+	m.SetKernelUpgradeHold(KernelUpgradeHoldCandidate) // candidate boot, before the cluster starts electing
 	if !m.KernelUpgradeHeld() {
 		t.Fatal("SetKernelUpgradeHold must make KernelUpgradeHeld report true")
 	}
@@ -217,7 +217,7 @@ func TestElection_KernelUpgradeHold_DemotesAlreadyPrimary(t *testing.T) {
 	}
 	drainEvents(m, 4)
 
-	m.SetKernelUpgradeHold()
+	m.SetKernelUpgradeHold(KernelUpgradeHoldCandidate)
 	if m.IsLocalPrimary(0) {
 		t.Fatal("SetKernelUpgradeHold must DEMOTE an already-primary group")
 	}
@@ -235,7 +235,7 @@ func TestElection_KernelUpgradeHold_DemotesAlreadyPrimary(t *testing.T) {
 // still held secondary (both secondary, no primary).
 func TestResetFailover_ClearsKernelUpgradeHold(t *testing.T) {
 	m := NewManager(0, 1)
-	m.SetKernelUpgradeHold()
+	m.SetKernelUpgradeHold(KernelUpgradeHoldCandidate)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
 	m.UpdateConfig(cfg)
 	if m.IsLocalPrimary(0) {
