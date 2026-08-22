@@ -648,7 +648,17 @@ routing, and only on double fault).
 
   The named unit must be configured with `family inet dhcp` (Junos
   configured name, `<ifd>.<unit>`; v4 destinations only; management
-  interfaces rejected). Tunnel and loopback interfaces are rejected too
+  interfaces rejected). "Management interface" is
+  `config.IsManagementIfName` (#7515) — the SAME predicate the daemon uses
+  to build the `vrf-mgmt` interface set and the networkd `VRF=` emitter
+  uses to write the stanza. That agreement is the whole basis of the
+  refusal: the lease is excluded from FRR by `collectDHCPRoutes` precisely
+  BECAUSE the interface is in that set, so a next-hop through it could
+  never resolve. The rule was previously restated verbatim at all three
+  sites; it is a bare `fxp`/`fab`/`em` prefix today, so `fabric0` and
+  `emu0` ARE management interfaces and are refused truthfully. Narrowing
+  the class would change which DHCP routes FRR owns and is a deliberate
+  behaviour decision, now a single edit in one place. Tunnel and loopback interfaces are rejected too
   — a DHCP client can never acquire a lease on one, so accepting it
   would only manufacture a permanently-unresolvable route. That test is
   a NAME CLASS, `IsTunnelOrLoopbackIfName`, not a raw prefix match

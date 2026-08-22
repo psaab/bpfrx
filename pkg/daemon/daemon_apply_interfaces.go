@@ -167,12 +167,7 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) (ctx
 	// the godoc on routing.ReconcileVRFs for the current contract.)
 	const mgmtVRFName = "mgmt"
 	const mgmtTableID = 999
-	mgmtIfaces := make(map[string]bool)
-	for name := range cfg.Interfaces.Interfaces {
-		if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") || strings.HasPrefix(name, "em") {
-			mgmtIfaces[config.LinuxIfName(name)] = true
-		}
-	}
+	mgmtIfaces := managementVRFIfaceSet(cfg)
 
 	if d.routing != nil {
 		var desired []routing.VRFSpec
@@ -376,4 +371,27 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// managementVRFIfaceSet is the set of Linux interface names the daemon binds to
+// vrf-mgmt, keyed the way the DHCP-callback readers look them up
+// (config.LinuxIfName). Extracted from the apply path so the class rule has a
+// callable, testable entry point rather than living inline in a long reconcile.
+//
+// #7515: the class comes from config.IsManagementIfName, the SSOT shared with
+// the networkd `VRF=` emitter and the ip-monitoring next-hop validator. Those
+// three answer the same question, and a divergence between them is always a bug:
+// the daemon would bind a VRF networkd strips, or the validator would refuse a
+// next-hop whose lease FRR actually owns.
+func managementVRFIfaceSet(cfg *config.Config) map[string]bool {
+	out := make(map[string]bool)
+	if cfg == nil {
+		return out
+	}
+	for name := range cfg.Interfaces.Interfaces {
+		if config.IsManagementIfName(name) {
+			out[config.LinuxIfName(name)] = true
+		}
+	}
+	return out
 }

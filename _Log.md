@@ -103879,6 +103879,33 @@ prose edit above them added. No diff falls in the new test body.
   issues.
 - **File(s)**: `docs/research/6744-kimi-review-003/plan.md`
 
+## 2026-08-22 — #6754 DDNS client cache validates the resolved bind device
+- **Timestamp**: 2026-08-22
+- **Action**: httpClientCache keyed on the raw binding leaves while the bound
+  device is resolved from the whole committed config, so a reth member move
+  left SO_BINDTODEVICE on the old device with the key unchanged. Cache entries
+  now carry the resolved bindConfig and a hit rebuilds when it differs,
+  releasing the superseded transport the #2956 reap could never collect.
+- **File(s)**: pkg/ddns/backend_http.go,
+  pkg/ddns/httpcache_resolved_bind_6754_test.go
+
+## 2026-08-22 — #7515 single-source the management-interface class
+- **Action**: `config.IsManagementIfName` is now the SSOT for the fxp/fab/em
+  class, previously restated VERBATIM at three sites: the daemon's management-VRF
+  set (`managementVRFIfaceSet`, extracted for testability), the networkd `VRF=`
+  emitter, and the ip-monitoring next-hop validator. Semantics preserved exactly
+  — no behaviour change. `isCanonicalFabricName` now calls the shared
+  `ifNameNumericSuffix` instead of carrying a second copy of the same formula.
+  Corrected the issue's premise: `emu0` IS management today (the daemon binds it
+  to vrf-mgmt via the same prefix), so the ip-monitoring refusal was truthful;
+  narrowing the class is a behaviour decision, filed separately.
+- **File(s)**: `pkg/config/ifname_class_6731.go`, `pkg/config/lifeline.go`,
+  `pkg/config/compiler_services.go`, `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/dataplane/compiler_iface.go`,
+  `pkg/config/mgmt_ifname_ssot_7515_test.go` (new),
+  `pkg/daemon/mgmt_vrf_ifaceset_ssot_7515_test.go` (new),
+  `pkg/dataplane/mgmt_vrf_networkd_ssot_7515_test.go` (new), `docs/multi-wan.md`
+
 ## 2026-08-22 — #7532 vipWarnedIfaces gets its own mutex
 - **Timestamp**: 2026-08-22
 - **Action**: The field was reset on the apply path (applySem) and lazily
