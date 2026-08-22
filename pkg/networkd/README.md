@@ -58,6 +58,39 @@ Standard library only.
   classifies family by `addressIsIPv6` (colon test on the CIDR string).
 - VRF and tunnel interfaces created elsewhere are excluded from the
   unmanaged-interface scan via the `daemonOwned` map.
+- **The activation tail's `networkctl reconfigure` argv is asserted in
+  full, and the fixture must VARY every axis it claims to cover
+  (#6914).** The tail selects `!Unmanaged && !Disable && BondMaster == ""`
+  and accumulates names in slice order. An argv assertion can only catch a
+  regression along an axis the fixture varies: with a single eligible
+  interface, `[reconfigure trust0]` is also what a hardcoded literal, a
+  deleted `Unmanaged` predicate, a deleted `Disable` predicate and a
+  reversed accumulation all produce — all four were measured green against
+  the one-interface fixture. `activationTailIfaces()` therefore carries two
+  INCLUDED interfaces on either side of the three excluded ones (bond
+  member, unmanaged, disabled), so accumulation and order are both
+  observable. Its expectation (`wantActivationTailArgv`) is spelled out
+  rather than derived by filtering the fixture with the production
+  predicate — deriving it would let the same predicate decide both the
+  behaviour and the expectation, so deleting an arm would change them
+  together and the test could never red.
+- **The activation tail is owed whenever ANYONE reloads, not only when
+  `Apply` does (#6912).** `pkg/daemon` runs `networkctl reload` from
+  several sites of its own and reports the result through
+  `BeginReload`/`NoteReloadResult`. A SUCCESSFUL external reload genuinely
+  discharges the reload obligation — the kernel really did re-read the
+  directory — but performs none of the tail, which is the per-interface
+  `networkctl reconfigure` that applies bond/VLAN addresses plus
+  `restoreSlowPathRPFilter`. Only `Apply` can run those. Before #6912 the
+  next unchanged `Apply` saw `changed==false`, no reload debt (correctly
+  cleared), no reconfigure debt and no `activationPending`, skipped the
+  whole block and returned nil — leaving addresses unreconfigured and the
+  slow-path TUN's `rp_filter` at networkd's default, which silently drops
+  locally-originated traffic. This is distinct from #5718, which covers a
+  FAILED `Apply` whose debt a later external success clears; here nothing
+  fails at any point, so the debt mechanism has nothing to carry.
+  `NoteReloadResult` therefore arms a separate process-scoped `tailPending`
+  on success, and only a completed tail clears it.
 - **`Apply` is fail-closed on write errors (#2987).** `writeIfChanged`
   returns `(changed, err)`; `Apply` aggregates per-file write failures
   (still attempting every generated file), reloads whatever did change,

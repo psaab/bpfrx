@@ -73,18 +73,24 @@ func (m *Manager) GetRIPRoutes() ([]RIPRouteEntry, error) {
 // (RFC 5301, `hostname dynamic` — on by default) for the dotted system ID
 // whenever that mapping is known, so the first column of `show isis neighbor`
 // is whatever the neighbour called itself. Every OTHER field inherits the same
-// taint: GetISISAdjacency splits the row with strings.Fields, so a hostname
-// containing a SPACE shifts Interface/Level/State/HoldTime one column right and
-// puts peer bytes in each of them. Display sites must sanitize the WHOLE row —
-// see termsafe.SanitizeRowForDisplay.
+// taint in the sense that it is peer-authored text and display sites must
+// sanitize the WHOLE row — see termsafe.SanitizeRowForDisplay.
 //
-// Sanitizing does NOT repair that shift. It keeps the row safe to print; the
-// VALUES remain positionally derived from peer-controlled text, so a shifted
-// row can display a State the peer chose and no display guard can detect it.
-// Fixing that needs this parse to change — FRR's IS-IS JSON output, or
-// right-anchored columns with malformed rows reported rather than rendered.
-// Tracked as #6590. Do not cite the display guard as making this struct
-// trustworthy.
+// The COLUMN SHIFT is fixed (#6590). GetISISAdjacency used to split the row
+// left-to-right with strings.Fields, so a hostname containing a SPACE moved
+// Interface/Level/State/HoldTime one column right and put peer bytes in each
+// of them — and sanitizing could not repair that, because it keeps a row safe
+// to print while preserving plausible printable text, so a shifted row could
+// display a State the peer chose with no display guard able to detect it. The
+// parse is now RIGHT-ANCHORED against a header-derived trailing width: only
+// this first column can contain a space, so the trailing columns are taken
+// from the end and the hostname absorbs the surplus. A row too short to carry
+// every trailing column, or a table with no header to derive the width from,
+// is dropped rather than guessed at.
+//
+// So SystemID remains peer-controlled text that must be sanitized before
+// display, but Interface/Level/State/HoldTime are now FRR's values rather than
+// whatever the peer's hostname spelled.
 type ISISAdjacency struct {
 	SystemID  string
 	Interface string
@@ -105,29 +111,58 @@ func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 		return nil, err
 	}
 	var adjs []ISISAdjacency
+	// #6590: trailing-column count, learned from the header row. Only the
+	// FIRST column can contain a space (it is the peer's advertised dynamic
+	// hostname); every other column is FRR-generated and space-free. So the
+	// row is parsed RIGHT-ANCHORED and the hostname absorbs the surplus,
+	// instead of assigning tokens left-to-right and letting a space in the
+	// hostname shift every later column one place right.
+	//
+	// Zero until the header is seen. A table with no header is not parsed:
+	// without it the trailing width is unknown, and guessing is exactly the
+	// failure this fixes.
+	trailing := 0
 	lines := strings.Split(output, "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) == 0 || strings.HasPrefix(line, "Area") {
 			continue
 		}
-		if fields[0] == "System" || strings.HasPrefix(line, "Area") {
+		// Header: "System Id  Interface  L  State  Holdtime  SNPA". Note
+		// "System Id" is ONE column spelled with a space, so the trailing
+		// width is the field count minus those two tokens — derived rather
+		// than hardcoded, so an FRR release that adds or drops a trailing
+		// column is followed rather than silently mis-parsed.
+		if fields[0] == "System" && len(fields) >= 2 && fields[1] == "Id" {
+			trailing = len(fields) - 2
 			continue
 		}
+		if trailing <= 0 {
+			continue
+		}
+		// A row must carry every trailing column plus at least one token of
+		// hostname. Anything shorter is malformed; skipping it is the
+		// "reported rather than rendered" half — a partial row would put
+		// peer-chosen text under the wrong heading, which is the defect.
+		if len(fields) < trailing+1 {
+			continue
+		}
+		split := len(fields) - trailing
 		adj := ISISAdjacency{
-			SystemID: fields[0],
+			SystemID: strings.Join(fields[:split], " "),
 		}
-		if len(fields) >= 2 {
-			adj.Interface = fields[1]
+		rest := fields[split:]
+		if len(rest) >= 1 {
+			adj.Interface = rest[0]
 		}
-		if len(fields) >= 3 {
-			adj.Level = fields[2]
+		if len(rest) >= 2 {
+			adj.Level = rest[1]
 		}
-		if len(fields) >= 4 {
-			adj.State = fields[3]
+		if len(rest) >= 3 {
+			adj.State = rest[2]
 		}
-		if len(fields) >= 5 {
-			adj.HoldTime = fields[4]
+		if len(rest) >= 4 {
+			adj.HoldTime = rest[3]
 		}
 		adjs = append(adjs, adj)
 	}

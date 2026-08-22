@@ -1048,7 +1048,7 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 			// matching. More reliable than MACAddress= because the MAC
 			// alternates between physical (boot) and virtual (daemon sets it).
 			if originalName == "" {
-				originalName = getOriginalKernelName(physIface.Name, result)
+				originalName = originalKernelNameFn(physIface.Name, result)
 				if originalName == "" {
 					originalName = readOriginalNameFromLink(linuxName)
 				}

@@ -1989,6 +1989,13 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			ch.Cluster.ControlLinkAuthKey = Secret(v)
 		}
 	}
+	// #6630: the additional ACCEPTED key that makes a rotation rolling. Same
+	// Secret treatment; never signed with, only verified against.
+	if n := clusterNode.FindChild("additional-authentication-key"); n != nil {
+		if v := nodeVal(n); v != "" {
+			ch.Cluster.ControlLinkAuthKeyAlt = Secret(v)
+		}
+	}
 	if n := clusterNode.FindChild("control-interface"); n != nil {
 		if v := nodeVal(n); v != "" {
 			ch.Cluster.ControlInterface = v

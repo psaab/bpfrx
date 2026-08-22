@@ -295,10 +295,13 @@ security {
 // re-opening the #6389 leak.
 //
 // The multi-key shape is reachable only from a hierarchical parse — `load
-// override` or a hand-authored config file. It survives Format()->NewParser
-// (local persistence) and HA config sync byte-for-byte. It does NOT survive a
-// `show | display set` round-trip, which mangles it into an uncompilable leaf —
-// that is a separate pre-existing defect tracked as #6668, NOT introduced here.
+// override`, `load merge`, or a hand-authored config file. It survives
+// Format()->NewParser (local persistence) and HA config sync byte-for-byte, and
+// since #6668 it also survives a `show | display set` round-trip: FormatSet
+// re-emits the authored bracket group and the flat replay (ParseSetVerbGrouped
+// + SetPathQuotedGrouped) reconstructs the same container. Before that it was
+// mangled into an uncompilable leaf, and `load merge` of a hierarchical file
+// hit the same replay INSIDE the daemon.
 func TestHostInbound6391HierarchicalBracketBodyFansToAllMembers(t *testing.T) {
 	tree := parseHierarchical(t, `
 security {

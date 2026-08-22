@@ -6,8 +6,8 @@ package dataplane
 //   - MAX_INTERFACES in bpf/headers/xpf_common.h
 //   - BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs
 //     (from which userspace-xdp/src/lib.rs derives
-//      BINDING_ARRAY_MAX_ENTRIES = MAX_INTERFACES *
-//      BINDING_QUEUES_PER_IFACE via env!("MAX_INTERFACES"))
+//     BINDING_ARRAY_MAX_ENTRIES = MAX_INTERFACES *
+//     BINDING_QUEUES_PER_IFACE via env!("MAX_INTERFACES"))
 //
 // Drift between these and the BPF objects is the exact recurrence #814
 // was filed for (fab0 at ifindex 2561 overflowing tx_ports sized at 2048

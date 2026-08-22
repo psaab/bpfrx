@@ -338,7 +338,39 @@ Every peer-MAC resolution that reaches the dataplane is keyed on the
 
 - `FabricSnapshot.peer_mac` comes from `buildFabricPeerMAC`
   (`pkg/dataplane/userspace/fabric.go`) — an address-matched neighbour
-  lookup on the overlay, then the parent.
+  lookup on the overlay, then the parent. It applies the same validity
+  predicate as `refreshFabricFwd`, `FabricNeighUsable`: a 6-byte Ethernet
+  address in a NUD state the kernel believes. Until #6598 it applied
+  NEITHER check and took any address-matched entry with a non-nil
+  `HardwareAddr`, so the LIVE resolver was laxer than the one #6554
+  hardened — and an entry that had gone `NUD_FAILED` while retaining the
+  peer's old lladdr, exactly what the `programRethMAC` link
+  DOWN → set-MAC → link UP sequence produces, was accepted as the
+  cross-chassis redirect destination.
+
+  When nothing qualifies it returns empty, and empty is a deliberate
+  degrade rather than a gap: the dataplane treats an empty `peer_mac` as
+  UNRESOLVED and falls back to its own neighbour table, which is
+  NUD-allowlisted at insert (#3771 M12) — a STRICTER resolver than the
+  stale entry that used to be returned, not a laxer one. If that cannot
+  answer either, the link is skipped as
+  `FabricSkipReason::UnresolvedPeerMac`, which is counted and recorded by
+  name. Both beat forwarding to a MAC the peer no longer owns, which is
+  silent and looks like a working fabric.
+
+  The predicate has ONE definition, in the package that owns the live
+  resolver, and `pkg/daemon` consumes it at all five of its fabric
+  neighbour decisions (the ARP/NDP probe gate, the link-local candidate
+  filter, fab0's overlay and parent legs, fab1's leg). Both packages
+  answer the same question, so a disagreement between them is a defect by
+  construction rather than a difference of policy — hence one definition
+  rather than two that agree. `TestFabricNeighPredicateHasOneDefinition_6598`
+  walks the AST of `daemon_ha_fabric.go` and fails both if a `NUD_*`
+  constant is named there again and if the delegating call count changes,
+  so re-duplicating the mask AND deleting a check outright are both
+  caught. Note that `usableNUD` in `daemon_neighbor_listener.go` is a
+  DIFFERENT set (it admits `NUD_NOARP` and is a publish-time filter for
+  the neighbour snapshot) and is deliberately not folded in.
 - The Rust redirect's own late resolution
   (`resolve_fabric_links_from_snapshots`) looks the peer up in
   `dynamic_neighbors` keyed on `(ifindex, peer_addr)`.
@@ -404,7 +436,10 @@ does **not** read it — `resolve_fabric_redirect_from_list` takes
 **address-matched** neighbour lookup (`buildFabricPeerMAC`, which matches
 on `neigh.IP.Equal(peer)` and has no link-local fallback). So a
 mis-identified peer accepted here never becomes an L2 destination for
-cross-chassis frames. The damage is exactly the three effects listed
+cross-chassis frames. That argument designates `buildFabricPeerMAC` as
+the trustworthy path, and when it was written that path was the LAXER of
+the two — it checked neither NUD state nor address length. #6598 closed
+that gap, so the designation now holds. The damage is exactly the three effects listed
 above — false readiness, a truncated fast-retry probe loop, and a
 misleading `peer_mac` log line during an HA incident.
 

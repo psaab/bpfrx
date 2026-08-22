@@ -1418,9 +1418,36 @@ func (r *heartbeatReceiver) admitFrame(frame []byte, pkt *HeartbeatPacket) bool 
 	// liveness (lastSeen) or drive election (handlePeerHeartbeat).
 	// Dual-accept keeps a mixed-version / not-yet-keyed cluster from
 	// splitting — see heartbeatAuthDecision. The key is never logged.
-	key := r.mgr.controlLinkAuthKey()
+	// #6630: verify against EVERY accepted key, not just the signing key. A
+	// rotation is otherwise a planned outage: while the two nodes hold
+	// different keys each receives a present-but-invalid HMAC from the other,
+	// this gate rejects it WITHOUT refreshing lastSeen, and after
+	// heartbeat-interval x threshold (~1s at shipped settings) BOTH nodes
+	// declare the peer dead and BOTH take over their redundancy groups —
+	// dual-master with duplicate VIPs for the whole window between the two
+	// commits. Accepting the other key of the rotation for an
+	// operator-bounded window is what makes the rollout node-by-node, and
+	// with no in-band coordination channel it is the only mechanism that can:
+	// there is nothing for the two nodes to agree a cutover instant with.
+	//
+	// verifiedKey, not a bool: the epoch read below re-derives from the signed
+	// body and MUST use the key that actually verified. Using the signing key
+	// there while a frame verified under the additional one would read the
+	// epoch as garbage, drop it below the floor, and reject the frame the gate
+	// just accepted — reintroducing the outage inside the fix for it.
+	keys := r.mgr.controlLinkAcceptedKeys()
 	session, counter, present := heartbeatAuthTrailer(frame)
-	macOK := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
+	var verifiedKey []byte
+	if present {
+		for _, k := range keys {
+			if verifyHeartbeatMAC(frame, k) {
+				verifiedKey = k
+				break
+			}
+		}
+	}
+	key := verifiedKey
+	macOK := verifiedKey != nil
 	// #6169: the boot epoch is read ONLY from a MAC-verified frame — only a
 	// verified frame authorises treating len-52 as the end of the signed
 	// body — and the epoch floor is applied BEFORE the session ring, so a
@@ -1442,7 +1469,11 @@ func (r *heartbeatReceiver) admitFrame(frame []byte, pkt *HeartbeatPacket) bool 
 	if macOK {
 		nonceFresh, epochReason = r.auth.admitAuthed(hasEpoch, epoch, session, counter)
 	}
-	accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
+	// keyConfigured asks "can this node verify at all", so it is the ACCEPTED
+	// SET being non-empty — not `len(key) > 0`, which since #6630 is nil
+	// whenever verification failed and would collapse a keyed node's rejection
+	// into the unkeyed dual-accept arm.
+	accept, reason := heartbeatAuthDecision(len(keys) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
 	if !accept {
 		r.recvErrors.Add(1)
 		// #6669: prefer the epoch gate's own reason when it has one.
@@ -1478,6 +1509,12 @@ func (r *heartbeatReceiver) admitFrame(frame []byte, pkt *HeartbeatPacket) bool 
 		// arms the gRPC fabric listener's downgrade-guard (via
 		// Manager.HeartbeatPeerAuthSeen).
 		r.auth.notePeerAuthenticated()
+		// #6630: record WHICH accepted key the peer is signing with, so
+		// `show chassis cluster statistics` can answer the one question a
+		// rotation raises and nothing else could — "has the peer moved to the
+		// new key, i.e. is it safe to finalize?". The stored value is a short
+		// derived IDENTIFIER, never the key; see controlLinkKeyID.
+		r.mgr.notePeerControlKeyID(controlLinkKeyID(verifiedKey))
 	}
 
 	r.received.Add(1)

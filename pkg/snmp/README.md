@@ -401,6 +401,60 @@ swaps both under `Lock`, so a request never observes a half-applied config
 swapped. A `nil` cfg (the whole `snmp` stanza removed) disables the agent's
 authorization surface: every request is dropped because no community matches.
 
+## Successor lookup: binary search over a per-PDU ordered MIB view (#6597)
+
+`findNextOIDSnap` resolves each GETNEXT/GETBULK successor by **binary-searching**
+`ifSnapshot.mibOIDs()` — the whole MIB view for that PDU (staticOIDs, then every
+ifTable cell, then every ifXTable cell) built once on first use.
+
+It used to LINEAR-SCAN that view for every varbind — `O(static + interfaces x
+columns)` per lookup, multiplied by every varbind an operation emits. The agent
+runs on a **single serial goroutine**, so that per-lookup cost is the floor on
+requests/second for every operation at once, and it grows with interface count.
+A max-size plain GETNEXT of 239 deep `ifXTable` OIDs measured **~33 ms** (~30
+req/s for that shape) while fixing #6551.
+
+Measured per-lookup cost, worst-case probe (`-benchtime=2000x`):
+
+| interfaces | linear (before) | binary (after) |
+|---|---|---|
+| 1 | 2,010 ns | 77 ns |
+| 8 | 12,897 ns | 148 ns |
+| 64 | 103,060 ns | 201 ns |
+| 256 | 677,284 ns | 158 ns |
+
+The shape is the point, not the ratio: the old cost grows **linearly** with
+interface count while the new cost stays flat. `BenchmarkFindNextOIDByInterfaceCount`
+pins it so a regression to linear is visible.
+
+**The equivalence obligation is bound by a differential test, not spot checks.**
+`TestFindNextOIDMatchesLinearReference` keeps the pre-fix algorithm as a
+reference oracle and asserts identical successors across an exhaustive probe set
+(every MIB OID, each ±1 in its last sub-identifier, every bare column prefix,
+and the boundaries above/below each table — 2,175 probes across five interface
+counts). `TestFullWalkMatchesLinearReference` additionally walks the entire MIB
+with both and asserts the emitted sequences are byte-identical.
+
+**A correctness bug fell out of this, and it is more serious than the
+performance one.** The linear scan's lexicographic correctness silently depended
+on `ifDataFn` returning IfIndex-ascending data, and nothing enforces that — the
+production provider (`buildSNMPIfData`, `pkg/daemon/daemon_snmp_reconcile.go`)
+appends in netlink `LinkList` order with no sort. Given an out-of-order provider
+the old scan still emitted **ascending** OIDs, because it returned the first
+candidate sorting after the cursor — but it **skipped** every interface whose
+index sorted below one already emitted in that column. Measured on a
+4-interface out-of-order fixture: **40 of 87 MIB rows never appear in the walk**,
+so a manager silently never sees those interfaces.
+
+An ascending-only assertion passes on that broken behaviour; **completeness is
+what discriminates**, which is why `TestUnsortedProviderWalksEveryRowInOrder`
+asserts the full expected row set. `mibOIDs` sorts by IfIndex, so the walk is
+now correct regardless of provider order.
+
+`TestMIBOIDViewIsSorted` pins the precondition the binary search requires —
+`sort.Search` on an unsorted slice returns silently wrong answers, so that guard
+is load-bearing rather than stylistic.
+
 ## Entry points
 
 - `Agent` — `agent.go`.

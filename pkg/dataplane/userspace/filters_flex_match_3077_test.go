@@ -184,12 +184,12 @@ func TestFilterSnapshotFlexMatchCeilByteLength(t *testing.T) {
 		bits    uint8
 		wantLen uint8
 	}{
-		{8, 1},   // byte-aligned, unchanged
-		{12, 2},  // non-multiple-of-8 -> ceil to 2 bytes (was truncated to 1)
-		{16, 2},  // byte-aligned, unchanged
-		{24, 3},  // byte-aligned, unchanged (was truncated to 2 only if non-mult)
-		{20, 3},  // non-multiple-of-8 -> ceil to 3 bytes
-		{32, 4},  // byte-aligned, unchanged
+		{8, 1},  // byte-aligned, unchanged
+		{12, 2}, // non-multiple-of-8 -> ceil to 2 bytes (was truncated to 1)
+		{16, 2}, // byte-aligned, unchanged
+		{24, 3}, // byte-aligned, unchanged (was truncated to 2 only if non-mult)
+		{20, 3}, // non-multiple-of-8 -> ceil to 3 bytes
+		{32, 4}, // byte-aligned, unchanged
 	}
 	for _, tc := range cases {
 		cfg := &config.Config{}

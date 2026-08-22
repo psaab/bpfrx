@@ -340,6 +340,24 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 	// fixing a malformed redundancy-group should not be handed the auth message
 	// first. Runs on the fully-compiled *Config (ControlLinkAuthKey populated by
 	// compileChassis).
+	// #6630: a rotation overlap that is not one is rejected on the same
+	// strict path as an absent key, and BEFORE it — an operator who set the
+	// additional key to the same value has a config-shaped mistake, and the
+	// absence message would not describe it.
+	//
+	// It honours the SAME lenient downgrade (#1960 no-brick): a config already
+	// on disk, or pushed from a peer, must still boot. A degenerate overlap is
+	// no more dangerous at runtime than not setting the leaf at all — it
+	// accepts one key either way — so refusing to load one would brick a node
+	// over a cosmetic mistake.
+	if err := validateClusterAuthKeyOverlapStrict(cfg); err != nil {
+		if opts.lenientClusterAuthKey {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("cluster authentication (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
 	if err := validateClusterAuthKeyStrict(cfg); err != nil {
 		if opts.lenientClusterAuthKey {
 			cfg.Warnings = append(cfg.Warnings,

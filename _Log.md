@@ -1,3 +1,172 @@
+## 2026-08-22 — #6912: an external reload discharged a postcondition it cannot perform
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced at master before fixing: first Apply runs its tail
+  (`[reconfigure trust0]`, rp_filter 0), then a SUCCESSFUL external
+  BeginReload/NoteReloadResult, then a byte-identical Apply -> reconfigure
+  calls 1 -> 1 and rp_filter still 2. The tail never ran.
+  Fixed by arming a process-scoped `tailPending` in `NoteReloadResult` on
+  success and adding it to Apply's gate; only a completed tail clears it.
+  Process-scoped for the same reason the reload debt is: pkg/daemon reloads
+  from several sites and a Manager-scoped flag could not record what they did.
+  TWO MUTATIONS CAME BACK GREEN AND BOTH WERE FINDINGS, not gaps:
+  (a) arming on the SHARED `noteReloadSucceeded` instead of the external entry
+  point is unobservable, because Apply's own tail clears the flag in the same
+  pass. My doc comment had claimed it "would make every Apply owe a tail to
+  the next one" — that claim was FALSE and is now corrected to say the choice
+  is about the flag's meaning, not about preventing a defect.
+  (b) arming on the external FAILURE branch too is redundant: noteReloadFailed
+  already sets the reload debt, so debtOwed already forces the next Apply
+  through the tail.
+  (a) also exposed a test of mine that passed for the wrong reason —
+  `TestApplyOwnReloadDoesNotOweItselfATail_6912` was named for the arming site
+  but passes under that mutation. Restated as
+  `TestApplyLeavesNoTailDebtOutstanding_6912`, which is the invariant it
+  actually checks and the one that really prevents an unchanged Apply
+  reconfiguring forever.
+  M1-M3 RED (drop the gate term, stop arming, never clear) at RUN=51 matching
+  the control, vet clean at each.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/external_reload_tail_6912_test.go` (new),
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`
+
+## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
+
+- **Timestamp**: 2026-08-22
+- **Action**: The tail's `networkctl reconfigure` argv was asserted in full,
+  but `activationTailIfaces()` had exactly one ELIGIBLE interface, so
+  `[reconfigure trust0]` was also the output of a hardcoded literal, a deleted
+  `Unmanaged` predicate, a deleted `Disable` predicate and a reversed
+  accumulation. Confirmed rather than assumed: all four were run against the
+  BASE fixture and all four exited 0.
+  Extended the fixture to five interfaces covering every arm — two included
+  (`trust0`, `dmz0`) sitting on either side of three excluded (bond member,
+  unmanaged, disabled) — so accumulation and ORDER are both observable, which
+  one eligible interface can never make so.
+  Spelled the expectation out as `wantActivationTailArgv` rather than deriving
+  it by filtering the fixture with the production predicate: deriving it would
+  make the assertion true by construction, since the same predicate would
+  decide both the behaviour and the expectation and deleting an arm would move
+  them together.
+  Left `debtTestIfaces()` untouched — it is deliberately minimal for the
+  reload-debt tests that share it, and the richer fixture is local to the
+  activation-tail file.
+  Mutation matrix M1-M5 all RED at RUN=48 matching the control, vet clean at
+  each; and the same four mutations verified GREEN against the base fixture,
+  which is what shows the fixture change is what closed them.
+- **File(s)**: `pkg/networkd/activation_tail_5718_test.go`,
+  `pkg/networkd/README.md`
+## 2026-08-22 — #6897: the failover gate could emit no throughput cell, and had
+
+- **Timestamp**: 2026-08-22
+- **Action**: Answered the "has it already bitten us" question with data
+  instead of leaving it open. Swept every local failover log: 71 runs at
+  `14 passed, 0 failed`, one at `12 passed, 2 failed` (12+2 = 14, all cells
+  emitted), and ONE at `13 passed, 0 failed`. That odd run
+  (`jobs/22249260/tmp/failover.log`) emits 13 cells and `grep -c "iperf3
+  throughput"` returns 0 — the cell is ABSENT, not failed, and
+  `PASS iperf3 completed successfully` fired just before it, so the run looked
+  healthy to the summary. 13 assertions plus one silent absence, reported as a
+  clean green.
+  Root cause: the parse matched only `Gbits`, so a sub-Gbit `[SUM]` line set
+  the throughput to the literal `"0"` and then matched neither the pass branch
+  nor the fail branch — there was no else. Sub-Gbit is exactly what a
+  throughput regression or a CoS-shaped class looks like, so the gate went
+  silent in the case it exists to catch.
+  Fixed by extracting the parse and the verdict into
+  `test/incus/iperf-throughput-lib.sh`: the unit is normalised (K/M/G), and
+  the verdict is TOTAL — absent, unparseable, too-low and healthy each yield
+  exactly one cell. The caller maps the verdict with a catch-all default so an
+  unknown status still emits one. Demonstrated old-vs-new on the exact
+  incident input: OLD emits 0 cells, NEW emits 1 carrying the real 0.0860 Gbps.
+  Extraction was the point, not tidiness: it makes the GATE'S OWN fix testable
+  without a cluster, which is what lets this change be reviewed on its own
+  terms. New hermetic `make test-iperf-throughput-lib` (18 cells).
+  The self-test also binds the WIRING, not just the lib — deleting the call
+  from `test-failover.sh` would otherwise leave it green, which is the shape
+  that has produced repeated false confidence. Mutation M1 is exactly that
+  deletion and it reds.
+  Defect 2 of the issue (the established-session floor) is OBSOLETE: #4052
+  already added the 20 x 0.5s poll the issue asks for, and #7368 already added
+  the fw0/fw1 cross-reference that names an ownership/forwarding divergence
+  instead of blaming establishment — which is precisely the inconsistency the
+  issue observed.
+  Mutation matrix M1-M5 all RED, `bash -n` clean at every mutated state, PASS
+  cell counts compared against the control (18) rather than merely non-zero.
+- **File(s)**: `test/incus/iperf-throughput-lib.sh` (new),
+  `test/incus/iperf-throughput-selftest.sh` (new),
+  `test/incus/test-failover.sh`, `Makefile`, `CLAUDE.md`
+
+## 2026-08-22 — #6678: device-map OriginalName= no longer falls back to the logical name
+
+- **Timestamp**: 2026-08-22
+- **Action**: `deviceMapOriginalNameFor` returned the NIC's CURRENT name when
+  the sysfs derivation came back empty; in the recovery branch that matters
+  (`current == logical`) that is the LOGICAL name, which udev never presents,
+  so the written `.link` could never match and boot persistence failed
+  silently. Changed the contract to `(string, bool)` and made the apply path
+  decline to write a `.link` at all when no udev-matchable name exists,
+  reporting it on the same #5842 channel as a `.link` that failed to land.
+  Tracing the call graph found a SECOND manufacturing site the issue does not
+  mention: the write site has its own fallback, `recoverOriginalName`, which
+  also returns the current name when no `.link` records it — so a fix confined
+  to `deviceMapOriginalNameFor` would have been defeated there and looked
+  correct. Both are covered; the end-to-end test would still fail if only the
+  first were fixed.
+  Rejected `original == final` as the discriminator even though it needs no
+  plumbing: it is unsound for a NIC whose real kernel name legitimately equals
+  its logical name, which would then be skipped wrongly. Carried an explicit
+  NUL-prefixed sentinel as a map VALUE instead — `breakNameCollisions` re-keys
+  only KEYS, so the value survives the temp rename with no signature change to
+  a helper the positional path shares.
+  The full package caught what the filter could not:
+  `TestEnumerateAndRenameMapped_BootRecheckAllowsSafeMap_5490` was green ONLY
+  because of this defect — it never stubbed the derivation, so it read the real
+  `/sys` of whatever host ran it, found no `fxp0`, and relied on the fallback.
+  Repaired the fixture to pin its derivation; verified under mutation M5 that
+  the repair made it independent rather than newly dependent.
+  Mutation matrix M1-M4 all RED with real assertions, vet clean at each,
+  RUN=4 matching the control; M5 re-ran the FULL package under M1.
+- **File(s)**: `pkg/daemon/device_map.go`,
+  `pkg/daemon/device_map_original_name_6678_test.go` (new),
+  `pkg/daemon/device_map_test.go`,
+  `pkg/daemon/device_map_preflight_failclosed_5490_test.go`,
+  `docs/bare-metal-device-map.md`
+## 2026-08-22 — #6677: derive the pre-rename kernel name from the kernel, not from PCI arithmetic
+
+- **Timestamp**: 2026-08-22
+- **Action**: Established the reference behaviour firsthand before writing
+  anything, on a host with 38 ARI-enabled netdevs, and it INVERTED the issue.
+  `udevadm test-builtin net_id` (systemd 261) shows systemd does NOT produce
+  an ARI-combined name for any netdev here: every ARI netdev is either at slot
+  0 (`slot<<3 == 0`, ARI a no-op) or an SR-IOV VF, where net_id's VF path
+  takes precedence and names it from the PHYSICAL function's address plus the
+  VF index (`0000:b7:02.0` -> `enp183s0f0v0`, physfn `0000:b7:00.0`). So the
+  issue named the one divergence I could not observe and missed two I could —
+  VF naming and the `npN` port suffix.
+  That killed the prescribed fix (`func += slot << 3`): implementing it would
+  have addressed the unobservable third of the problem while leaving the two
+  demonstrable ones, and closed the issue. Filed the ARI case as #7415 with
+  the hardware that would discriminate it, rather than guessing.
+  Then found the real answer in the kernel: altnames already carry every
+  candidate systemd computed (`eno5v0` carries `enp183s0f0v0`;
+  `ix0` carries `eno5np0`, `enp183s0f0np0`, `enx...`), they are stable across
+  renames, and `ensureRethLinkOriginalName` has used the mechanism in
+  production all along. `deriveKernelName` now asks for altnames first in
+  systemd's NamePolicy order and keeps the PCI derivation as a documented
+  best-effort fallback. Single-sourced the duplicated altname walk out of
+  `ensureRethLinkOriginalName` — a divergence between the two would always be
+  a bug — keeping `eth` as a last resort so that path's prior behaviour is
+  preserved rather than silently altered.
+  Rejected reading `ID_NET_NAME`/`INTERFACE` from the udev database after
+  measuring it: on an xpf-managed NIC those reflect xpf's own rename, so it
+  would return the LOGICAL name — the same defect as #6678.
+  Mutation matrix M1-M4 all RED with real assertions, vet clean at each,
+  RUN=10 matching the control; M5 re-ran the FULL package under M1.
+- **File(s)**: `pkg/daemon/daemon_reth.go`,
+  `pkg/daemon/derive_kernel_name_6677_test.go` (new),
+  `docs/critical-patterns.md`
+
 ## 2026-08-22 — #7406: operator note on where a credential may live in a URL
 
 - **Timestamp**: 2026-08-22
@@ -102668,6 +102837,164 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/mirror_session_id_adoption_6666_test.go (new),
   pkg/daemon/userspace_sync_test.go, proto/xpf/v1/xpf.proto,
   pkg/cluster/README.md, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6633 defect 1 — `install_session_serializes_with_reconcile_removal`
+    asserted `reconcile_iters >= 1`, a scheduling outcome its harness never
+    arranged: under CPU oversubscription the bounded installer can finish and
+    the main thread store `stop` before the unbounded `while !stop` reconciler
+    is scheduled even once. Extracted the reconciler body into
+    `reconcile_churn_until` with a do-while shape (the #3457 pattern the
+    sibling snapshot-atomicity reader already uses one function above), so the
+    precondition holds by CONSTRUCTION. Chose the loop shape over the
+    rendezvous #6633 proposed: a rendezvous makes the bounded thread block on
+    the unbounded one, which in a module whose other open defect is a futex
+    wedge trades a false red for a possible hang. Gate:
+    `reconcile_churn_completes_a_cycle_even_when_already_stopped_6633` calls
+    the helper with `stop` already set — the deterministic model of the
+    starvation — and reds on a revert to `while !stop`.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
+    docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6629 — config sync shipped the ACTIVE TREE unredacted, so the
+    control-link PSK crossed the fabric in cleartext on the very link it
+    authenticates, at the one moment that link is guaranteed unauthenticated
+    (session-sync auth is fixed per connection at handshake time and a key
+    commit does not restart comms, so the carrying connection is by
+    construction one handshaked while both ends were unkeyed). Sealed the
+    config payload under a per-connection ephemeral X25519 + HKDF-SHA256 +
+    AES-256-GCM key (`syncMsgConfigKeyExchange` 30 / `syncMsgConfigEncrypted`
+    31, both additive, no wire-version bump). Chose this over excluding the
+    leaf: `SyncApply` promotes the received tree wholesale under a LENIENT
+    compile, so a stripped leaf makes the standby lose its own key and revert
+    to fail-open — and a new primary would drive an old standby unkeyed on a
+    rolling upgrade, where encryption's fallback is only "no worse than today".
+    Mutation matrix 8/9 RED; C7 (the nil-key guard) GREEN BY DESIGN and
+    annotated in place — removing it is unobservable because openConfigPayload
+    fails closed on a nil key; the safety property is bound by C9.
+    Also recorded the three-way incompatibility (#6629 vs the #5078 no-restart
+    pin vs the read-only secondary) in pkg/cluster/README.md.
+  - **File(s)**: pkg/cluster/{sync_config_crypto.go,sync_config_crypto_6629_test.go,
+    sync.go,sync_conn.go,sync_conn_config.go,sync_conn_read.go,
+    sync_capabilities_6650_test.go,README.md},
+    docs/session-sync-architecture.md
+
+## 2026-08-22 — #6566 member 2: clear policy hit-counts reaches the helper
+- **Timestamp**: 2026-08-22
+- **Action**: `LegacyDataPlaneAdapter` had no `ClearPolicyCounters`, so the
+  operator clear promoted to the embedded bpfShim and zeroed the RETIRED eBPF
+  `policy_counters` array while the live helper `PolicyCounterStore` — the one
+  the display reads — was untouched, both surfaces printing success. Added the
+  6-line override mirroring `ClearZoneCounters` (#3651). The READ half of that
+  cohort row was already fixed by the `ReadAllPolicyCounters` override; only
+  the CLEAR half was live.
+- **File(s)**: pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/clear_policy_counters_6566_test.go (new), _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6590 — `show isis neighbor` was parsed left-to-right, so a
+    peer-advertised hostname containing spaces shifted every later column and let
+    the neighbour forge its own State/Level/Interface/HoldTime. Now right-anchored
+    against a header-derived trailing width; short/headerless rows dropped.
+  - **File(s)**: pkg/frr/status_parse.go,
+    pkg/frr/isis_positional_forgery_6590_test.go
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6593 — six of seven pre-publish siblings had no ordering guard and
+    the seventh had a hoist bypass. Added one PrePublishSiblings capture at the
+    store_runtime_view choke point covering all seven, with #6592-style
+    previous-view retention for hoist resistance. cfg(test) only.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/{cos_state.rs,mod.rs,tests.rs}
+
+## 2026-08-22 — #6597: SNMP successor lookup is binary search, not a linear scan
+- **Timestamp**: 2026-08-22
+- **Action**: `findNextOIDSnap` linear-scanned the MIB view per varbind on a
+  single serial goroutine. Now builds the ordered view once per PDU
+  (`ifSnapshot.mibOIDs`) and binary-searches it: 677us -> 158ns per lookup at
+  256 interfaces, and flat instead of linear in interface count. Equivalence
+  bound by a differential test against the pre-fix algorithm as a reference
+  oracle (2175 probes + a full-MIB walk, byte-identical). Found a correctness
+  bug while doing it: the linear scan depended on `ifDataFn` returning
+  IfIndex-ascending data, which the production provider does not guarantee —
+  out-of-order input made the walk ascending but INCOMPLETE (40 of 87 rows
+  skipped). `mibOIDs` sorts, so the walk is now correct regardless.
+- **File(s)**: pkg/snmp/agent.go,
+  pkg/snmp/findnext_binary_search_6597_test.go (new), pkg/snmp/README.md, _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6630 — PSK rotation was a planned outage: with one key, the
+    moment one node commits the new one each end receives a
+    present-but-invalid HMAC, `admitFrame` rejects without refreshing
+    `lastSeen`, and after ~1s BOTH nodes declare the peer dead and BOTH take
+    over their RGs. The documented workaround (clear both keys first) is
+    refused by #6611's validator. Added `additional-authentication-key`: a
+    second key a node ACCEPTS and never SIGNS with, so the two commits can be
+    separated in time. Heartbeat AND fabric gRPC widen together; session sync
+    does not (connection-scoped, #6628's territory). Finalize is an operator
+    commit (delete the leaf), never a timer. Declined the wire key-id #6630
+    prescribed — the PROPERTY it was for is "can the operator tell whether the
+    peer moved", answered by recording which accepted key last verified a peer
+    frame and rendering its derived id in `show chassis cluster statistics`,
+    with no new bytes on the heartbeat. Mutation matrix 8/8 RED. R4 (epoch read
+    must use the VERIFYING key) was GREEN until the rotation fixture was made
+    epoch-bearing — `samplePkt()` carries no epoch, so `heartbeatFrameEpoch`
+    returned hasEpoch=false whatever key it was handed and the cell measured
+    nothing.
+  - **File(s)**: pkg/cluster/{control_key_rotation.go,
+    control_key_rotation_6630_test.go,heartbeat.go,manager.go,group_state.go,
+    status.go,README.md}, pkg/config/{types_chassis.go,compiler_system.go,
+    schema_chassis.go,ast_redact.go,compiler_validate_strict_cluster_auth.go,
+    compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
+    pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
+    docs/config-schema.md
+
+## 2026-08-22 — #7426: single-source the predictable-name derivation
+- **Timestamp**: 2026-08-22
+- **Action**: Two live re-implementations wrong in OPPOSITE directions on the
+  same field — the daemon had NamePolicy ordering but never emitted `f0`
+  (`fn > 0`), the dataplane had #4795's multifunction fix but took the first
+  altname in kernel order. An agreement test could only pin one wrongness to the
+  other, so: new zero-import leaf `pkg/netname` (pkg/daemon imports
+  pkg/dataplane, so the resolver cannot live in pkg/daemon). Both call sites
+  rewired; the duplicated dataplane helpers deleted and #4795's test MOVED with
+  the code; `altNamePrefixOrder` aliased so the #6677 test keeps binding the
+  live order. Also found two divergences the issue did not name — no PCI domain
+  handling and a base-10 function parse in the dataplane copy — both latent on
+  this host (single domain, max function 7), verified rather than assumed.
+  Fixed the #6199 fixture vacuity: all rows were slot 0, where the ARI `slot<<3`
+  term is identically zero.
+- **File(s)**: pkg/netname/netname.go (new), pkg/netname/README.md (new),
+  pkg/netname/netname_7426_test.go (new),
+  pkg/netname/pci_function_suffix_4795_test.go (moved from pkg/dataplane),
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
+  pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md
+
+## 2026-08-22 — #6668 display-set container bracket round-trip
+- **Timestamp**: 2026-08-22
+- **Action**: Carry authored `[ ... ]` bracket grouping through `display set`
+  render and flat replay so a bracket authored at a CONTAINER position survives
+  the round trip; fixes the `load merge <hierarchical-file>` ingest corruption
+  and the two Reject→Accept commit-gate laundering cases.
+- **File(s)**: pkg/config/lexer.go, pkg/config/parser.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/ast_format.go, pkg/config/inactive.go,
+  pkg/configstore/store_command.go,
+  pkg/config/formatset_container_bracket_6668_test.go,
+  pkg/configstore/loadmerge_bracket_container_6668_test.go,
+  pkg/config/dual_ast_differential_test.go,
+  pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+  docs/config-schema.md, docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6598 — brought the LIVE fabric peer-MAC resolver up to the
+    same bar as refreshFabricFwd (NUD state + 6-byte lladdr) and gave the
+    predicate ONE definition consumed by all five daemon sites, including an
+    inline mask expansion no search for the const name would have found.
+  - **File(s)**: pkg/dataplane/userspace/fabric.go, pkg/daemon/daemon_ha_fabric.go,
+    pkg/dataplane/userspace/fabric_peer_mac_6598_test.go,
+    pkg/daemon/fabric_neigh_single_source_6598_test.go,
+    docs/fabric-cross-chassis-fwd.md
 
 ## 2026-08-22
 
