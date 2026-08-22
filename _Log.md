@@ -99372,3 +99372,19 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/userspace/nat.go, nat_source.go,
   nat_destination.go, pkg/daemon/daemon_ha.go, docs/userspace-dnat-plan.md,
   docs/refactoring-audit-current.txt, plus two new `*_5250_test.go` files.
+
+## 2026-08-21 — #5838 userspace helper crash supervision
+
+- **Timestamp**: 2026-08-21T23:xx UTC
+- **Action**: Add a generation-fenced supervisor that owns `cmd.Wait()` for each
+  spawned `xpf-userspace-dp` generation, fails the node closed on an unexpected
+  exit (disarm shim, drop `m.proc`, clear helper-derived status so
+  `TakeoverReady()` goes false), and schedules a bounded-backoff restart through
+  the ordinary bring-up path. Removed the second `cmd.Wait()` in `stopLocked`.
+  Documented that the post-crash forwarding posture was ALREADY fail-closed via
+  the shim's three degraded-path gates — the defect was the manager advertising
+  a dead helper as a valid HA takeover target.
+- **File(s)**: `pkg/dataplane/userspace/process_supervisor.go` (new),
+  `pkg/dataplane/userspace/process.go`, `pkg/dataplane/userspace/manager.go`,
+  `pkg/dataplane/userspace/helper_crash_supervisor_5838_test.go` (new),
+  `pkg/dataplane/README.md`
