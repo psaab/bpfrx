@@ -1335,7 +1335,11 @@ peer liveness (`lastSeen`) or drive election.
        value more than an hour ahead of `now`. The peer had latched the earlier,
        correct epoch, so it refuses the restarted node; a later NTP correction
        does NOT repair it, since the epoch is published once per incarnation and
-       the file has by then been overwritten with the lower value.
+       the file is NOT overwritten (#6711: `bootEpochPreserveMaxSkew` preserves
+       a persisted value that could be an intact predecessor), so correcting the
+       clock and restarting chains from it and clears the floor at once. Before
+       that fix the file held the lower value and recovery had to wait for wall
+       time to climb back past the old floor.
 
        **Recovery is narrower than "a restart on either node".** Restarting the
        SENDER does not help *while its published reading is still below the
