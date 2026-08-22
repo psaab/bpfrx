@@ -859,6 +859,26 @@ snap`, and there are two of them — one per acceptance path).
     sentence — the previous wording had the two the wrong way round. That file
     states what the pre-pass
     does and does not cover; the coverage table is not the whole compile.
+  - **An abort AFTER the mutation point is now REPORTED** (`compiler_hostmutation_4960.go`,
+    #4960). The pre-pass covers the config-shape classes, but three fallible
+    steps still run after the zones phase has mutated the host, and there is no
+    undo log anywhere: `CompileConfig`'s own later phases,
+    `preflightCheckIfindexCaps`, and — the reachable one —
+    `attachUserspaceShimXDP` on a driver that refuses the attach. When one of
+    them fails, `CompileUserspaceShim` returns before publishing and the Rust
+    dataplane keeps its PREVIOUS snapshot while the host has already moved.
+    The two loader steps are grouped into `runPostMutationSteps`, which names
+    that window and annotates the failure with which classes of host state
+    changed, so an operator does not read "attach failed" as "nothing happened"
+    and roll back a config on a box that keeps the new VLANs and addresses.
+    The flag is set only on a REAL change — `ensureVLANSubInterface` reports
+    whether it added a link, and `reconcileInterfaceAddresses` returns whether a
+    delete/add actually landed — so a converged re-apply annotates nothing and
+    the message stays worth reading. `planAddressReconcile` splits that
+    decision out as a pure function of (existing, desired), which is #4960's
+    "split pure planning from actuation" clause at this one site and is what
+    makes the converged case provable without root. This does NOT undo the
+    mutation; the apply transaction is a redesign and stays open on #4960.
   - **The pre-pass is only as good as the phases' own strictness** (#6894 r9,
     #4960). A row that ACCEPTS what the Rust helper later REJECTS puts the
     half-applied state back: the helper's rejection lands at

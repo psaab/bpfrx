@@ -102,11 +102,19 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 }
 
 // ensureVLANSubInterface creates a Linux VLAN sub-interface if it doesn't exist.
-// Returns the sub-interface's ifindex.
-func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
+// Returns the sub-interface's ifindex and whether this call CREATED it.
+//
+// #4960: the created bool is the host-mutation signal. This function runs in
+// compile Phase 2, and every later phase — plus preflightCheckIfindexCaps and
+// attachUserspaceShimXDP in CompileUserspaceShim — can still fail with no undo
+// path. An apply that fails after this point has already moved the host, and
+// the caller has to be able to say so. A flag that were merely "a VLAN was
+// configured" would be true on every apply of a VLAN config and would report
+// nothing; it is true only when this call actually added a link.
+func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 	parent, err := netlink.LinkByName(parentName)
 	if err != nil {
-		return 0, fmt.Errorf("parent interface %s: %w", parentName, err)
+		return 0, false, fmt.Errorf("parent interface %s: %w", parentName, err)
 	}
 
 	subName := fmt.Sprintf("%s.%d", parentName, vlanID)
@@ -118,7 +126,10 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
 		if existing.Attrs().OperState != netlink.OperUp {
 			netlink.LinkSetUp(existing)
 		}
-		return existing.Attrs().Index, nil
+		// Not counted as a creation: the link was already present. Bringing an
+		// existing link up is a state nudge the next apply repeats idempotently,
+		// not a new object the operator would have to remove by hand.
+		return existing.Attrs().Index, false, nil
 	}
 
 	// Create VLAN sub-interface
@@ -130,16 +141,20 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
 		VlanId: vlanID,
 	}
 	if err := netlink.LinkAdd(vlan); err != nil {
-		return 0, fmt.Errorf("create VLAN sub-interface %s: %w", subName, err)
+		return 0, false, fmt.Errorf("create VLAN sub-interface %s: %w", subName, err)
 	}
 
+	// Every return from here on reports created=true: the LinkAdd above
+	// SUCCEEDED, so the host carries a new link whether or not the follow-up
+	// steps do. Reporting false on a later failure would understate exactly the
+	// state #4960 is about.
 	// Bring it up
 	link, err := netlink.LinkByName(subName)
 	if err != nil {
-		return 0, fmt.Errorf("find created VLAN sub-interface %s: %w", subName, err)
+		return 0, true, fmt.Errorf("find created VLAN sub-interface %s: %w", subName, err)
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
-		return 0, fmt.Errorf("set VLAN sub-interface %s up: %w", subName, err)
+		return 0, true, fmt.Errorf("set VLAN sub-interface %s up: %w", subName, err)
 	}
 
 	// Disable RA acceptance — firewall uses its own configured routes.
@@ -152,7 +167,7 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, error) {
 		"name", subName, "parent", parentName, "vlan_id", vlanID,
 		"ifindex", link.Attrs().Index)
 
-	return link.Attrs().Index, nil
+	return link.Attrs().Index, true, nil
 }
 
 func isConfiguredVLANSubInterface(name string, cfg *config.Config) bool {
@@ -185,25 +200,24 @@ func isConfiguredVLANSubInterface(name string, cfg *config.Config) bool {
 // reconcileInterfaceAddresses ensures the interface has exactly the configured
 // addresses. Stale addresses are removed and missing ones are added.
 // Link-local (fe80::/10) addresses are left untouched since the kernel manages them.
-func reconcileInterfaceAddresses(ifaceName string, desired []string) {
+//
+// #4960: returns whether it actually CHANGED the host — a successful AddrDel or
+// AddrAdd. A converged interface (every desired address already present, nothing
+// stale) returns false, so the caller's host-mutation flag distinguishes an
+// apply that moved the host from one that found it already correct. Without
+// that distinction the flag would be true on essentially every apply and would
+// carry no information.
+//
+// A FAILED AddrDel/AddrAdd does not set it: the address list is unchanged in
+// that direction, and those failures already warn on their own line.
+func reconcileInterfaceAddresses(ifaceName string, desired []string) bool {
 	link, err := netlink.LinkByName(ifaceName)
 	if err != nil {
 		slog.Warn("cannot find interface for address reconciliation",
 			"name", ifaceName, "err", err)
-		return
+		return false
 	}
-
-	// Build desired set keyed by "ip/mask"
-	want := make(map[string]*netlink.Addr, len(desired))
-	for _, addrStr := range desired {
-		addr, err := netlink.ParseAddr(addrStr)
-		if err != nil {
-			slog.Warn("invalid address for interface",
-				"addr", addrStr, "name", ifaceName, "err", err)
-			continue
-		}
-		want[addr.IPNet.String()] = addr
-	}
+	changed := false
 
 	// List current kernel addresses (both v4 and v6)
 	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
@@ -214,7 +228,79 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 		existing = nil
 	}
 
-	// Remove stale addresses (skip link-local)
+	// #4960: the DECISION of what to delete and add is a pure function of
+	// (existing, desired) and is computed first, separately from the netlink
+	// calls that act on it. That is #4960's "split pure planning from
+	// actuation" clause at this one site — the full split across the compiler
+	// is a redesign — and it is what makes the converged case testable without
+	// root: an empty plan is the discriminator that keeps the host-mutation
+	// flag meaningful.
+	del, add := planAddressReconcile(existing, desired, ifaceName)
+
+	for _, addr := range del {
+		key := addr.IPNet.String()
+		if err := netlink.AddrDel(link, addr); err != nil {
+			slog.Warn("failed to remove stale address from interface",
+				"addr", key, "name", ifaceName, "err", err)
+		} else {
+			changed = true
+			slog.Info("removed stale address from interface",
+				"addr", key, "name", ifaceName)
+		}
+	}
+
+	for _, addr := range add {
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			if !strings.Contains(err.Error(), "exists") {
+				slog.Warn("failed to add address to interface",
+					"addr", addr.IPNet.String(), "name", ifaceName, "err", err)
+			}
+			// An "exists" error means the address was already there — the host
+			// did not move, so it is NOT a mutation.
+			continue
+		}
+		changed = true
+	}
+	return changed
+}
+
+// planAddressReconcile computes, purely, which addresses must be DELETED from
+// and ADDED to an interface to reach the desired set (#4960).
+//
+// It performs no I/O, so a converged interface (every desired address present,
+// nothing stale) is provably an EMPTY plan without a live host. That is the
+// property the host-mutation flag rests on: without it the flag would be set on
+// every apply of an addressed interface and would tell the operator nothing
+// about whether this apply actually moved anything.
+//
+// Link-local addresses are excluded from the delete set — the kernel manages
+// them, and removing one would be a real outage for a config that never asked
+// about it. An unparseable desired address is skipped with a warning rather
+// than aborting: it was already skipped before this extraction, and turning it
+// into a failure here would change apply behaviour for a defect this change
+// does not own.
+//
+// Both slices are ordered deterministically: deletes follow the kernel's list
+// order, adds follow the order the addresses were authored, so the netlink call
+// sequence does not vary run to run.
+func planAddressReconcile(existing []netlink.Addr, desired []string, ifaceName string) (del []*netlink.Addr, add []*netlink.Addr) {
+	// Desired set keyed by "ip/mask", plus the authored order for the adds.
+	want := make(map[string]*netlink.Addr, len(desired))
+	order := make([]string, 0, len(desired))
+	for _, addrStr := range desired {
+		addr, err := netlink.ParseAddr(addrStr)
+		if err != nil {
+			slog.Warn("invalid address for interface",
+				"addr", addrStr, "name", ifaceName, "err", err)
+			continue
+		}
+		key := addr.IPNet.String()
+		if _, dup := want[key]; !dup {
+			order = append(order, key)
+		}
+		want[key] = addr
+	}
+
 	for i := range existing {
 		addr := &existing[i]
 		if addr.IP.IsLinkLocalUnicast() || addr.IP.IsLinkLocalMulticast() {
@@ -222,29 +308,19 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) {
 		}
 		key := addr.IPNet.String()
 		if _, ok := want[key]; ok {
-			// Already present, no need to add
+			// Already present: neither deleted nor re-added.
 			delete(want, key)
-		} else {
-			// Stale — remove it
-			if err := netlink.AddrDel(link, addr); err != nil {
-				slog.Warn("failed to remove stale address from interface",
-					"addr", key, "name", ifaceName, "err", err)
-			} else {
-				slog.Info("removed stale address from interface",
-					"addr", key, "name", ifaceName)
-			}
+			continue
 		}
+		del = append(del, addr)
 	}
 
-	// Add missing addresses
-	for key, addr := range want {
-		if err := netlink.AddrAdd(link, addr); err != nil {
-			if !strings.Contains(err.Error(), "exists") {
-				slog.Warn("failed to add address to interface",
-					"addr", key, "name", ifaceName, "err", err)
-			}
+	for _, key := range order {
+		if addr, ok := want[key]; ok {
+			add = append(add, addr)
 		}
 	}
+	return del, add
 }
 
 // compileZones programs the zone/interface dataplane maps and derives the
@@ -507,7 +583,13 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 
 	if vlanID > 0 {
 		// VLAN sub-interface: create it, populate vlan_iface_map
-		subIfindex, err := ensureVLANSubInterface(physName, vlanID)
+		subIfindex, vlanCreated, err := ensureVLANSubInterface(physName, vlanID)
+		if vlanCreated {
+			// #4960: recorded BEFORE the error branch. LinkAdd succeeded even
+			// on the paths that fail afterwards, so the host carries the new
+			// link either way.
+			result.markHostMutated("created VLAN sub-interface")
+		}
 		if err != nil {
 			slog.Warn("VLAN sub-interface failed, skipping",
 				"parent", physName, "vlan_id", vlanID, "zone", name, "err", err)
@@ -544,7 +626,9 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			}
 		}
 		if !isDHCPSub && !isReth {
-			reconcileInterfaceAddresses(subName, addrs)
+			if reconcileInterfaceAddresses(subName, addrs) {
+				result.markHostMutated("reconciled VLAN sub-interface addresses")
+			}
 		}
 
 		// Apply unit-level MTU to VLAN sub-interface
@@ -771,7 +855,9 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			}
 		}
 		if !isDHCP && !isReth && !isFabricParent {
-			reconcileInterfaceAddresses(physName, addrs)
+			if reconcileInterfaceAddresses(physName, addrs) {
+				result.markHostMutated("reconciled interface addresses")
+			}
 		}
 		// Apply unit-level MTU (overrides interface-level MTU)
 		if unitMTU > 0 {
