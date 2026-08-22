@@ -100959,3 +100959,12 @@ prose edit above them added. No diff falls in the new test body.
   resolver admits. Behaviour-preserving; no advisory or enforcement change.
 - **File(s)**: pkg/config/host_inbound_view.go,
   pkg/config/host_inbound_dhcp_scope_6519.go
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #7304 follow-up — folded a post-merge hostile Codex review: closed
+    two vacuous-green holes in the #6419 assertions (errors.Is(nil,nil) sentinel
+    mutation; the production OnConfigReceived wiring was never bound), corrected
+    the backwards R1 comment, and recorded the tagged-epoch variant that refutes
+    the categorical #6419 close.
+  - **File(s)**: pkg/daemon/config_sync_test.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/sync_conn_gen.go, docs/session-sync-architecture.md
