@@ -103777,3 +103777,12 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
   `pkg/cluster/manager.go`,
   `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)
+
+## 2026-08-22 — #6729 + #6730 st-prefix predicate
+- **Action**: Replaced two raw `strings.HasPrefix(name, "st")` tests in
+  `compiler_iface.go` with the bounded predicate / shared resolver:
+  `resolveInterfaceRef` now reads the authored bind-interface via
+  `Config.SecureTunnelUnitNetdev`, and `buildInterfaceNetworkdModels` gates on
+  `config.IsSecureTunnelIfName`.
+- **File(s)**: `pkg/dataplane/compiler_iface.go`,
+  `pkg/dataplane/compiler_iface_st_prefix_6729_6730_test.go` (new)

@@ -70,10 +70,47 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 		physBase = phys
 	}
 
-	if strings.HasPrefix(configName, "st") && len(parts) == 2 {
-		physName = config.LinuxIfName(ref)
-		unitNum, _ = strconv.Atoi(parts[1])
-		return
+	// Secure-tunnel units resolve through the SHARED rule, not a third
+	// hand-copied instance of it (#6729).
+	//
+	// TWO DEFECTS LIVED IN THE `strings.HasPrefix(configName, "st")` TEST THIS
+	// REPLACES, and they are independent:
+	//
+	//  1. It RECONSTRUCTED the device name from the unit REF. The reconciler
+	//     creates the xfrmi under the AUTHORED bind-interface string verbatim
+	//     (pkg/routing/xfrm.go), and a bare `bind-interface st0` and an
+	//     explicit `bind-interface st0.0` derive the same if_id under
+	//     DIFFERENT device names — while the unit ref is `st0.0` in both
+	//     cases. So the device name is not a function of the ref and has to be
+	//     read back from the config. Under the bare spelling this returned
+	//     `st0.0`, `cachedInterfaceByName` failed, and mapZoneInterface logged
+	//     "interface not found, skipping": the tunnel was dropped from the
+	//     zone programming and from the SNAT egress-address walk.
+	//  2. `HasPrefix("st")` is not the secure-tunnel predicate. It also
+	//     matched an ordinary NIC whose name merely starts with those two
+	//     letters — `start0.0` resolved to `start0.0` instead of the base
+	//     netdev — which is the same raw-prefix mistake #6730 fixes in
+	//     buildInterfaceNetworkdModels below.
+	//
+	// Config.SecureTunnelUnitNetdev is the single resolver behind the rule
+	// (#6691, xfrmi.go); it declines for a name the xfrmi constructor would
+	// reject, so an ordinary interface falls through to the resolution below.
+	// The IsSecureTunnelIfName arm mirrors ResolveKernelIfName's own fallback:
+	// an in-range st<N> unit that no VPN binds keeps the verbatim ref, which
+	// is what this returned before. (An in-range st<N> PHYSICAL interface is a
+	// separate, deliberate question — #6737 — and is deliberately unchanged
+	// here.)
+	if len(parts) == 2 {
+		if dev, ok := cfg.SecureTunnelUnitNetdev(ref); ok {
+			physName = config.LinuxIfName(dev)
+			unitNum, _ = strconv.Atoi(parts[1])
+			return
+		}
+		if config.IsSecureTunnelIfName(configName) {
+			physName = config.LinuxIfName(ref)
+			unitNum, _ = strconv.Atoi(parts[1])
+			return
+		}
 	}
 
 	// Resolve fabric interface to local physical member for BPF attachment.
@@ -908,7 +945,20 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 		if ifCfg == nil {
 			continue
 		}
-		if strings.HasPrefix(ifName, "st") {
+		// #6730: the SECURE-TUNNEL predicate, not a raw two-letter prefix.
+		// This branch ends in an unconditional `continue`, so every name it
+		// claims is skipped by the physical-interface handling below — and
+		// `HasPrefix(ifName, "st")` claimed `start0`, `stx` and `st65536` too.
+		// For those, XFRMIfNameAndID returns ("", 0) for every unit, so each
+		// unit `continue`s and the trailing `continue` then drops the whole
+		// interface: no addresses, no MTU, no DHCP, no networkd model at all.
+		// Nothing downstream re-adds it — stripUnmanagedInterfaces runs
+		// against this same `seen` set, so the NIC is brought DOWN.
+		//
+		// IsSecureTunnelIfName is the bounded predicate the xfrmi constructor
+		// itself uses, so exactly the names that can become an xfrmi take this
+		// branch and everything else reaches the ordinary handling.
+		if config.IsSecureTunnelIfName(ifName) {
 			mtu := ifCfg.MTU
 			for unitNum, unit := range ifCfg.Units {
 				unitName, _ := config.XFRMIfNameAndID(fmt.Sprintf("%s.%d", ifName, unitNum))
