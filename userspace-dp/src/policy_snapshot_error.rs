@@ -427,6 +427,43 @@ pub(crate) enum SnapshotIntegrityError {
         direction: String,
         filter: String,
     },
+    /// #6540: a firewall-filter term's `then policer <name>` named a policer
+    /// that the snapshot defines NEITHER as `firewall policer <name>` NOR as
+    /// `firewall three-color-policer <name>`. The pre-fix compiler resolved the
+    /// reference with a bare `.get(...)` yielding `None`, and
+    /// `apply_term_three_color_policer` then no-opped the meter — so a
+    /// configured rate limit (a DoS-mitigation policer, say) forwarded
+    /// UNPOLICED with no `Err`, no warning and no counter.
+    ///
+    /// Policer was the odd one out of three sibling reference mechanisms:
+    /// filters raise `MissingFilterRef` (six `return Err` sites in
+    /// `filter/compiler.rs`) and screen reports `ScreenMissingProfileRef`, but
+    /// `grep MissingPolicerRef` over this tree returned zero. It over-permits
+    /// BANDWIDTH rather than admitting traffic a policy would deny, which is
+    /// why it is the Medium of that family rather than a High.
+    ///
+    /// The Go STRICT commit gate (#2217 Finding A,
+    /// `compiler_validate_strict_filter.go`) is the primary defense and asks
+    /// the SAME question — defined under `firewall policer` or `firewall
+    /// three-color-policer` — so a freshly committed config can never carry a
+    /// dangling reference. This arm guards the lenient `Store.Load` /
+    /// `Store.SyncApply` path (`opts.lenientFirewallRefs`, #1960 no-brick),
+    /// where that gate is downgraded to a warning and nothing else was left.
+    ///
+    /// The predicate is DEFINEDNESS, deliberately NOT presence in the compiled
+    /// `three_color_policer_by_name` map. Those two differ, and the difference
+    /// matters: `lower_single_rate_policer_runtimes` (#4514) SKIPS a degenerate
+    /// zero-rate METER-ONLY policer because it has no action to enforce, so
+    /// such a policer is defined, absent from the map, and must NOT be
+    /// rejected. Keying this on the map would refuse a config that boots today.
+    /// An EMPTY reference (no policer on the term) is the legitimate
+    /// "unpoliced" case and is NOT an error.
+    MissingPolicerRef {
+        family: String,
+        filter: String,
+        term: String,
+        policer: String,
+    },
     /// #2391: an interface snapshot named a NON-EMPTY security zone that is not
     /// present in the zone table (`zone_name_to_id`). The pre-fix code resolved
     /// the missing name to `zone_id == 0` (`unwrap_or(0)`), silently collapsing
@@ -880,6 +917,16 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "interface {:?} family {:?} filter {} references undefined filter {:?} — refusing to fail open by leaving the hook unarmed (which would forward unfiltered, equivalent to no filter)",
                 interface, family, direction, filter
+            ),
+            Self::MissingPolicerRef {
+                family,
+                filter,
+                term,
+                policer,
+            } => write!(
+                f,
+                "firewall family {:?} filter {:?} term {:?} references undefined policer {:?} — refusing to fail open by leaving the rate limit unmetered (which would forward unpoliced, equivalent to no policer)",
+                family, filter, term, policer
             ),
             Self::InterfaceUnknownZone { interface, zone } => write!(
                 f,
