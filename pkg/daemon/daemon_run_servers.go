@@ -43,7 +43,7 @@ func (d *Daemon) effectiveListeners() sysservices.Listeners {
 		// binds on loopback, so report the requested address as Listening.
 		ls.GRPC = sysservices.Listener{Addr: d.opts.GRPCAddr, State: sysservices.StateListening}
 	}
-	ls.HTTP = d.mgmt.effectiveHTTPListener()
+	ls.HTTP = d.mgmt.Load().effectiveHTTPListener()
 	return ls
 }
 
@@ -491,13 +491,18 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// swap on an unchanged bind. Before #5866 the server was constructed once
 	// here and never reconciled, so a committed bind/TLS/port/auth change (e.g.
 	// a revoked credential) sat inert until a daemon restart.
-	// #6827 round 5: publish d.mgmt under staleCertMu, the same mutex the
-	// stale-cert delivery path reads it through, so that read is memory-model
-	// safe rather than a benign-looking data race.
+	// #6719: publish the reconciler ATOMICALLY, and BEFORE start() runs. The
+	// readers are already live — startClusterComms is ~190 lines earlier in Run,
+	// so a peer sync can reach reconcileWebManagement before this line. The
+	// atomic makes that read safe; publishing before start() also means such a
+	// reconcile finds a non-nil reconciler and is merely no-opped by the
+	// `m.srv == nil` gate rather than dropped at the daemon level — and start()
+	// then derives its snapshot from the store UNDER m.mu, so the promotion that
+	// reconcile carried is picked up rather than lost. (#6827 round 5 published
+	// this under staleCertMu; the atomic supersedes that and covers every
+	// reader, not just the stale-cert path.)
 	mgmt := newManagementReconciler(d, apiCfg)
-	d.staleCertMu.Lock()
-	d.mgmt = mgmt
-	d.staleCertMu.Unlock()
+	d.mgmt.Store(mgmt)
 	if err := mgmt.start(ctx); err != nil {
 		// A boot bind failure is non-fatal (matches the pre-#5866 async
 		// srv.Run error log): the daemon keeps running and the next commit's
@@ -518,7 +523,7 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
-		d.mgmt.wait()
+		d.mgmt.Load().wait()
 	}()
 	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
 }
