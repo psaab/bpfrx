@@ -3312,7 +3312,7 @@ address OR VRRP VIP — is host-inbound-reachable from more than one **distinct
 effective host-inbound token set**. It keys on *differing* sets (via the shared
 `config.CanonicalHostInboundTokenSig`), NOT merely ">1 zone", so a deliberate
 duplicate with **identical** service sets across its zones is allowed (no false
-positive), and management/cluster-control lifeline interfaces (fxp0 / em0 / fab*)
+positive), and management/cluster-control lifeline interfaces (fxp0 / em0 / fab<N>, exact — #5250)
 are excluded. Lenient downgrade to a `cfg.Warnings` entry on the tolerant load /
 peer-sync path (`lenientDuplicateHostLocalAddress`, #1960 no-brick); the runtime
 `dpuserspace.AmbiguousHostInboundAddresses` reporter + the
