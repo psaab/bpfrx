@@ -103871,3 +103871,13 @@ prose edit above them added. No diff falls in the new test body.
   RG + barrier wait, then stopClusterComms) ahead of the teardown.
 - **File(s)**: pkg/daemon/bootstrap.go,
   pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
+
+## 2026-08-22 — #6754 DDNS client cache validates the resolved bind device
+- **Timestamp**: 2026-08-22
+- **Action**: httpClientCache keyed on the raw binding leaves while the bound
+  device is resolved from the whole committed config, so a reth member move
+  left SO_BINDTODEVICE on the old device with the key unchanged. Cache entries
+  now carry the resolved bindConfig and a hit rebuilds when it differs,
+  releasing the superseded transport the #2956 reap could never collect.
+- **File(s)**: pkg/ddns/backend_http.go,
+  pkg/ddns/httpcache_resolved_bind_6754_test.go
