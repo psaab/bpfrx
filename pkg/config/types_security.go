@@ -87,6 +87,33 @@ func (f *FeedServer) MarshalJSON() ([]byte, error) {
 	type alias FeedServer
 	v := alias(*f)
 	v.URL = RedactURL(v.URL)
+	// #6733: Hostname is the other credential-bearing slot on this struct. It
+	// is named for what it IS, not for what it may carry, so the name-keyed
+	// redaction pass never masked it — and an operator who writes
+	// `user:token@feeds.example` here leaks it through the authenticated REST
+	// GET. RedactURL leaves a bare hostname or host:port untouched (measured),
+	// so this narrows nothing for an ordinary config.
+	v.Hostname = RedactURL(v.Hostname)
+	return json.Marshal(v)
+}
+
+// MarshalJSON redacts a credential embedded in a feed entry's PATH (#6733).
+//
+// A feed path is ordinarily a bare path (`/feeds/list.txt`), which RedactURL
+// returns unchanged. It becomes credential-bearing when an operator writes a
+// full URL here — the compiler joins Hostname and Path, so both slots accept
+// one — and a `?token=SECRET` query is the common shape. Redacting the query
+// costs nothing for a plain path and closes that.
+//
+// The alias type sheds this method to avoid recursion while preserving every
+// field, so a field added to FeedEntry later is still marshalled.
+func (e *FeedEntry) MarshalJSON() ([]byte, error) {
+	if e == nil {
+		return []byte("null"), nil
+	}
+	type alias FeedEntry
+	v := alias(*e)
+	v.Path = RedactURL(v.Path)
 	return json.Marshal(v)
 }
 
