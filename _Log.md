@@ -102953,3 +102953,13 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/dual_ast_differential_test.go,
   pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
   docs/config-schema.md, docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6598 — brought the LIVE fabric peer-MAC resolver up to the
+    same bar as refreshFabricFwd (NUD state + 6-byte lladdr) and gave the
+    predicate ONE definition consumed by all five daemon sites, including an
+    inline mask expansion no search for the const name would have found.
+  - **File(s)**: pkg/dataplane/userspace/fabric.go, pkg/daemon/daemon_ha_fabric.go,
+    pkg/dataplane/userspace/fabric_peer_mac_6598_test.go,
+    pkg/daemon/fabric_neigh_single_source_6598_test.go,
+    docs/fabric-cross-chassis-fwd.md
