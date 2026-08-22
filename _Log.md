@@ -103344,3 +103344,69 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/zones_override.go,
   pkg/dataplane/userspace/host_inbound_shared_view_6640_test.go (new),
   docs/host-inbound-service-matrix.md
+## 2026-08-22 — #6693 NAT match arms read both AST slots
+- **Timestamp**: 2026-08-22
+- **Action**: Replace the either/or reader at five NAT match-address arms with
+  an accumulate-both reader that preserves authored empties and synthesizes
+  nothing; add the mixed spelling to the schema spelling differential gate.
+- **File(s)**: pkg/config/compiler_nat_match_values.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/nat_match_mixed_shape_6693_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6693 follow-up on the rescued commit — widened the coverage to
+    all five arms on BOTH compile paths (strict + tolerant, asserted to agree),
+    per-arm malformed-tail gate reachability with a tolerant-accept no-brick leg,
+    the spelling-equivalence test extended from one arm to five, and a new
+    persistence round-trip test (Format / FormatSet re-readings must agree with
+    the authored tree). Completed the static-NAT fixture with a valid `match
+    destination-address` so the #7216 gate cannot fire first and mask the gate
+    under test.
+  - **File(s)**: pkg/config/nat_match_mixed_shape_6693_test.go,
+    docs/config-schema.md
+
+## 2026-08-22 — #6534 closure: third port-mirroring renderer + cross-surface gate
+- **Action**: Closed #6534 by fixing the one live instance the three landed
+  family PRs missed and adding the mechanism that makes the class mechanically
+  enumerable. `cli.showForwardingOptions` is a THIRD port-mirroring renderer —
+  the only one printing full per-instance detail under `show
+  forwarding-options`, since the gRPC twin emits only a pointer line — and it
+  rendered an instance the snapshot builder DROPS as armed. New `pkg/showaudit`
+  registers the six builder-side `pkg/config` drop predicates across five
+  families and asserts (a) exact equality between the predicates the builder
+  calls and the registry, so a NEW fail-closed exclusion cannot land without
+  declaring its surfaces; (b) existence closure — some surface consults each
+  verdict; (c) guardedness closure — the census of render functions that do NOT
+  consult it, asserted EXACTLY in both directions so a deferral cannot decay
+  into an allowlist. Measured population: 6 predicates, 32 render functions
+  across 5 surface packages, 20 still unannotated (filed as #7473). Corrected
+  two stale enumeration claims that said "BOTH" of two port-mirroring surfaces.
+- **File(s)**: pkg/showaudit/doc.go (new),
+  pkg/showaudit/surface_gate_6534_test.go (new),
+  pkg/cli/cli_show_routing.go,
+  pkg/cli/mirror_exclusion_surfaces_6534_test.go (new),
+  pkg/config/mirror_exclusion_reason.go,
+  pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
+  docs/junos-cli-reference.md
+
+## 2026-08-22 — #6705 junos-host unenforced-deny advisory suppression
+- **Timestamp**: 2026-08-22
+- **Action**: Gate the #4168 advisory suppression on ACTUAL rule emission, not
+  on representability. Reproduced the issue's five spellings first: the omitted
+  and valueless forms are already rejected at strict commit (#3044 / #6526), so
+  the issue's stated vector is closed; the reachable vector is an
+  application-any permit for every source, which commits cleanly with zero
+  warnings and leaves the DROP program empty while the deny still counts as
+  rendered.
+- **File(s)**: pkg/config/junos_host_deny.go,
+  pkg/config/junos_host_deny_unenforced_6705_test.go
+
+## 2026-08-22 — #6696 dhcp-local-server group interface / pool dns-server
+- **Action**: Both arms now read every element of a bracketed list; modelled
+  the two leaves (and both families' shared `group` subtree) in `setSchema`
+  with per-element validators; `interface` keeps its per-interface modifiers
+  out of the value list via `valueList` + modelled modifier children.
+- **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
+  `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
+  `docs/config-schema.md`

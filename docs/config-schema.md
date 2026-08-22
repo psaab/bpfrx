@@ -1777,6 +1777,87 @@ single-site mutations were run, each localising to its own assertion with
 leading-dash gate (leaving the read widened) and one that swaps `api-key` to the
 empty-skipping reader.
 
+### #6696: the two dhcp-local-server list leaves, and why they take DIFFERENT readers
+
+`system services dhcp-local-server group <g> interface` and `... group <g> pool
+<p> dns-server` were read with `nodeVal`, so a bracketed list — which the lexer
+collapses onto ONE node's `Keys` — compiled its first member and dropped the
+rest. The group served only its first interface (the second segment got **no
+leases at all**, a failure that looks like a network problem rather than a config
+one) and a pool offered one resolver where two were configured, so the operator's
+redundancy was simply absent.
+
+**The failing axis is BRACKETED-vs-repeated-leaf, not strict-vs-tolerant.**
+Measured at `origin/master` before the fix:
+
+| spelling | strict | tolerant |
+|---|---|---|
+| `interface [ ge-0/0/0.0 ge-0/0/1.0 ]` | `["ge-0/0/0.0"]` | `["ge-0/0/0.0"]` |
+| two `set … interface <v>` lines | both | both |
+
+The issue that reported this named the tolerant path as the one that mattered. A
+reader who tested only that path would have found the drop there, concluded the
+strict commit path was safe, and been wrong. The strict-path result makes the HA
+argument STRONGER, not weaker: a bracket-authored group is narrowed at the
+ORIGINAL commit, so both cluster nodes agree — on the wrong value — and there is
+no divergence to notice. The tests therefore compile every case on BOTH paths and
+assert the two AGREE.
+
+**Both leaves are now modelled, and modelling is what made the fix decidable.**
+Neither leaf existed in `setSchema` at all, so the grammar said nothing about how
+many tokens they take. Both families' `group` subtrees are now ONE function,
+`dhcpLocalServerGroupSchema` — a divergence between v4 and v6 is always a bug
+(the compiler is one function with an `isV6` flag), so it is made
+unrepresentable rather than merely tested against.
+
+**They take different readers, and that is the point:**
+
+- `pool dns-server` is a plain value list (`multi: true`, `children: nil`,
+  `ValidateIPAddress`), read with `firewallMatchValues` — both sides, every key
+  of every child. Modelling it also brought it under the spelling-differential
+  gate, which immediately caught a `Keys`-only first attempt as class-C INERT in
+  spelling B (`dns-server { v1; v2; }`), a shape the old `nodeVal` fallback did
+  handle.
+- `group interface` is NOT a plain value list. It is the one leaf here carrying
+  per-interface Junos MODIFIERS (`interface ge-0/0/0.0 exclude`, `…
+  upgrade-server <addr>`), so it is `multi: true, valueList: true` with those
+  modifier keywords modelled as CHILDREN — the #3872 static-route `next-hop`
+  precedent, whose doc comment uses this exact `interface` modifier as its
+  example. `valueList` absorbs a trailing token that is neither a sibling nor a
+  known child (the bracket list) while still DESCENDING when the next token names
+  a known child (the modifier). xpf parses and ignores every one of those
+  modifiers — as it did before, where the single-value read dropped them — and
+  they are modelled so the grammar has somewhere to park them other than the
+  value list.
+
+  `dhcpGroupInterfaceValues` then reads `Keys[1:]` when the statement names an
+  interface on its own line (any child is then a modifier BODY), and every key of
+  every child only for a bare `interface { … }` value block, whose values have
+  nowhere else to live. Using `firewallMatchValues` here would PROMOTE `exclude`
+  into the interface list — the #6673 promotion class, but with an unusually
+  sharp consequence: `group.Interfaces` is handed to Kea verbatim as
+  `interfaces-config.interfaces`, and one name no device answers to takes the
+  WHOLE DHCP server down, not just that group. **The differential gate does not
+  state that direction** — it detects a DROPPED value, not a PROMOTED modifier.
+  Measured rather than assumed: swapping in `firewallMatchValues` DOES red the
+  gate, but only INDIRECTLY, at the modelled `interface <if> <modifier>` sub-leaf
+  sites — which exist only because the modifiers are modelled. Delete those
+  children and the gate goes green with the promotion still present, and only
+  `TestDHCPGroup6696PerInterfaceModifierIsNotAnInterface` reds. The property is
+  owned by that test, not by the gate.
+
+**A widened read needs a widened validator.** Before the fix only slot 0 could
+reach a consumer, so a malformed element past it was inert; now every element is
+installed. `dns-server` carries `ValidateIPAddress`; `interface` carries
+`keyValidator: ValidateInterfaceName` — keyValidator rather than validator
+because the node declares children, so its values ride the identity KEY slot and
+it is the #5726 `valueList`+`keyValidator` arm of the schema walk that checks
+EVERY packed value instead of only the first. Both run on the strict commit /
+commit-check path only (`schemaValidateExpandedTreeForNode`, `pkg/configstore`),
+so an already-persisted config still boots (#1960).
+
+Fail-on-revert covered by `pkg/config/compiler_dhcp_group_multivalue_6696_test.go`.
+
 ### A widened read must not PROMOTE a token the old reader discarded (#6673)
 
 Widening a one-sided reader has a failure mode symmetric to the one it fixes.
@@ -3792,6 +3873,91 @@ both AST shapes):
   the first port to the VRF and the rest stayed in the DEFAULT table — a VRF
   isolation break. Coverage: `compiler_routing_instance_interface_3904_test.go`
   (both AST shapes + single-value back-compat).
+
+**NAT match address arms read both slots (#6693) — the #4121 defect at five
+sites that were not swept.** Source-NAT `match source-address` /
+`match destination-address`, destination-NAT `match destination-address` /
+`match source-address`, and static-NAT `match source-address` all carried the
+same per-arm either/or (`if len(m.Keys) >= 2 { Keys[1:] } else { Children }`),
+while the four SIBLING arms in the same switch — `source-address-name`,
+`destination-address-name`, `protocol`, `application` — already read both slots.
+
+The reachable input is `match { source-address 10.0.0.0/8 { 192.0.2.0/24; } }`:
+`parseStatement`'s `case TokenLBrace` keeps every key token AND the block, so
+`Keys=["source-address","10.0.0.0/8"]` with `Children=[["192.0.2.0/24"]]`, the
+first branch fires, and the `else if` is structurally unreachable. It commits
+CLEAN — these leaves are untyped (`args: 1, multi: true, children: nil`, no
+validator) in an open-world subtree — and the second prefix never reaches the
+dataplane. Two consequences, and they are independent: the rule silently matches
+LESS traffic than authored (for source NAT that means untranslated egress, i.e.
+an internal source address on the wire), and the dropped value ESCAPES
+`validateNATMatchAddressLiteralsStrict` (#7145), which reasons from the compiled
+list — so a malformed prefix in the child slot committed clean.
+
+It is NOT reachable from flat-set: for a `multi` leaf with no children `SetPath`
+always emits a leaf at the same level and never descends, so a flat replay
+produces packed Keys or sibling leaves and never both slots. That is worth
+recording, because a prior investigation enumerated the flat and one-slot
+hierarchical spellings, found perfect agreement, and concluded the shape was
+unreachable and a fix would be unfalsifiable. The enumeration was sound; it was
+not exhaustive.
+
+The five arms now use `natMatchAddressValues`
+(`compiler_nat_match_values.go`), which accumulates both slots. It is
+deliberately NEITHER of the two existing readers, and both alternatives were
+measured rather than reasoned about:
+
+- **not `firewallMatchValues`** (what the siblings use): it DROPS empty tokens,
+  and here an authored empty is not absence. Switching these arms to it turned
+  five #7216 subtests from reject to commit-clean, because `match
+  source-address ""` no longer reached the compiled list that
+  `validateStaticNATSelectedMatchAddressStrict` reasons from. Fixing a
+  fail-closed drop by opening a fail-open hole is worse than the drop.
+- **not `multiLeafAuthoredValues`** (#6673, which does keep empties): it
+  synthesizes ONE empty value for a node with no value slot at all, to keep
+  `values[0] == nodeVal(n)` total for a SELECTION leaf. These arms have no such
+  scalar invariant, and a bare `source-address;` compiling to `[""]` would make
+  the Rust `source_constrained` flag true over a prefix that parses as nothing —
+  the rule then matches NOTHING instead of leaving the criterion absent.
+
+So: accumulate both slots, keep empties, synthesize nothing. It reads every KEY
+of each child rather than `child.Name()`, per #6714.
+
+**The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
+SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
+puts values in both AST slots of one node, which is exactly what an either/or
+reader cannot see. Across the whole schema it moved ONE site beyond the five it
+was added for, and that site is not a defect: `system archival configuration
+archive-sites` puts a per-site MODIFIER block under an authored value
+(`archive-sites a { password S; }`), so its child is not a member and dropping it
+is correct. That is recorded in a third category,
+`mixedChildIsAModifierBlock` — separate from `notAValueList` (the leaf is not a
+list in ANY spelling) and from `knownSpellingInconsistencies` (a tracked
+DEFECT), because neither of those is true here and using either would state
+something false.
+
+**The sharpest statement of the defect is a PERSISTENCE divergence.** The mixed
+shape round-trips two different ways and they used to disagree with each other.
+`ConfigTree.Format()` re-renders it verbatim (value in the identifier slot, tail
+in the block), while `FormatSet()` — the spelling the configstore persists and
+the CLI replays — renders it PACKED (`set … match source-address 10.0.0.0/8
+192.0.2.0/24`). Both re-parse to a ONE-SLOT shape the either/or reader handled
+correctly, so one config text had two meanings: as authored it matched only the
+first prefix, and after any save/load cycle through the set spelling it matched
+both. A rule silently WIDENS on the next reboot while `show | compare` reports no
+change. `TestMixedShapeAgreesWithItsOwnPersistedRendering_6693` asserts the three
+readings AGREE rather than pinning any one of them to a hand-written expectation.
+
+Coverage is per-arm on both compile paths. The five arms are each asserted under
+STRICT `CompileConfig` and tolerant `CompileConfigLenient`, agreeing with each
+other before either is compared to the authored pair, and each is separately
+shown to carry a malformed tail INTO its strict gate (three different gates cover
+the five arms) while the tolerant path still ACCEPTS it — the #1960 no-brick
+half, since a box can already hold a config whose tail never reached a gate. The
+static-NAT fixture carries a valid `match destination-address` sibling for the
+same reason the issue names: without it the #7216 "selected external prefix is
+MISSING" gate fires first and its rejection is indistinguishable from the gate
+under test firing on the tail.
 
 **Policy match source-/destination-address/application share the reader
 (#4121, divergence-elimination, NOT a fail-open).** `compilePolicy`

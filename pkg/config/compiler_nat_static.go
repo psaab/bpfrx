@@ -892,13 +892,16 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 						// m.Keys[1:] (flat-set) or m.Children (hierarchical).
 						// Reading only nodeVal dropped every prefix after the
 						// first. Mirror the source/destination-NAT loops above.
-						if len(m.Keys) >= 2 {
-							rule.SourceAddresses = append(rule.SourceAddresses, m.Keys[1:]...)
-						} else if len(m.Children) > 0 {
-							for _, child := range m.Children {
-								rule.SourceAddresses = append(rule.SourceAddresses, child.Name())
-							}
-						}
+						// #6693: read BOTH slots through the natMatchAddressValues
+						// SSOT. The either/or form below read Keys[1:] OR the
+						// children, never both, so the MIXED shape
+						// `source-address <v1> { <v2>; }` — a value in the
+						// identifier slot beside a block — silently dropped the
+						// child tail. It is the #4121 defect (fixed for
+						// `security policies ... match`) at five NAT sites; the
+						// four sibling arms in this same switch already use this
+						// reader.
+						rule.SourceAddresses = append(rule.SourceAddresses, natMatchAddressValues(m)...)
 						if len(rule.SourceAddresses) > 0 {
 							// Back-compat: first element stays in the singular
 							// field (NAT64 "::/0" tests, peer-sync).

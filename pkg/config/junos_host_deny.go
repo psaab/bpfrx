@@ -2,9 +2,7 @@ package config
 
 import (
 	"fmt"
-	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -262,13 +260,16 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			representable = false
 		}
 		var prog JunosHostDenyProgram
+		// emitted is the subset of this zone's term keys that actually produced
+		// >=1 rule; nil whenever no program was projected at all (#6705).
+		var emitted map[string]bool
 		if emitsRules && representable {
 			// A cross-dimension permit/deny overlap (a narrow-application or
 			// source-excluded permit ahead of a deny) cannot be cleanly rendered
 			// as a `saddr !=` subtraction — the whole program is un-representable
 			// (§5.1). junosHostProjectProgram reports this via ok=false.
 			var ok bool
-			prog, ok = junosHostProjectProgram(zoneName, ifaceRefs, terms)
+			prog, emitted, ok = junosHostProjectProgram(zoneName, ifaceRefs, terms)
 			if !ok {
 				representable = false
 			}
@@ -300,6 +301,26 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			}
 			appliesEnforceable[t.key]++
 			if !representable {
+				blockedByUnrep[t.key] = true
+				continue
+			}
+			// #6705: representable is not enforced. A deny term can survive every
+			// representability check and still project NO rule — an earlier
+			// application-any permit for every source shadows it, its application
+			// resolves entirely to the other family, or its address match is the
+			// #5828 degenerate empty set. Suppressing the #4168 warning on that
+			// key told the operator the deny was enforced by the kernel gate when
+			// the kernel gate had been handed nothing to enforce, so a config that
+			// commits cleanly with ZERO warnings produced an empty DROP program.
+			// Emission is the property the suppression actually claims, so gate on
+			// it directly rather than on the representability that implied it.
+			// No action guard here on purpose: the suppression loop below already
+			// restricts RenderedPolicyKeys to PolicyDeny, so blocking a permit's
+			// key is unobservable. A `t.action == PolicyDeny` condition here read
+			// as load-bearing while no test could distinguish it either way —
+			// mutating it away changed nothing — so it is stated once, where it
+			// is actually enforced, instead of twice.
+			if !emitted[t.key] {
 				blockedByUnrep[t.key] = true
 			}
 		}
@@ -447,12 +468,22 @@ func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[stri
 // cross-dimension permit/deny subtraction that cannot be cleanly rendered (a
 // narrow-application or source-excluded permit ahead of a deny) — the whole
 // program is then un-representable and the caller warns (§5.1).
-func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostTerm) (JunosHostDenyProgram, bool) {
+func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostTerm) (JunosHostDenyProgram, map[string]bool, bool) {
 	prog := JunosHostDenyProgram{
 		Zone:          zone,
 		InterfaceRefs: ifaceRefs,
 		Representable: true,
 	}
+	// emitted records the term keys that contributed AT LEAST ONE rule to this
+	// program. A deny term can be fully representable and still project nothing
+	// — an earlier application-any permit for every source shadows it
+	// (junosHostBuildRule's permitAll arm), its application resolves entirely to
+	// the other family, or its address match is the #5828 degenerate empty set.
+	// The caller needs that distinction because "representable" and "enforced"
+	// are different properties: without it a deny that emitted zero rules still
+	// counted as rendered and had its #4168 warning suppressed, so the operator
+	// got neither the enforcement nor the diagnostic (#6705).
+	emitted := map[string]bool{}
 	// Accumulated earlier-permit source sets (per family) that carve later
 	// denies via `saddr !=`. A permit that permits ALL sources shadows every
 	// later deny.
@@ -472,7 +503,7 @@ func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostT
 			// because it is a PERMIT, never suppressed).
 			if !t.appAny || t.srcExcluded {
 				if sawDeny {
-					return JunosHostDenyProgram{}, false
+					return JunosHostDenyProgram{}, nil, false
 				}
 				// No deny yet: a later deny would make this un-representable.
 				// Record a poison flag by shadowing nothing but forcing the check
@@ -496,22 +527,24 @@ func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostT
 		// action deny.
 		sawDeny = true
 		if junosHostHasPoison(permitV4) || junosHostHasPoison(permitV6) {
-			return JunosHostDenyProgram{}, false
+			return JunosHostDenyProgram{}, nil, false
 		}
 		if r, ok := junosHostBuildRule("ip", t, permitV4, permitAllV4); ok {
 			prog.RulesV4 = append(prog.RulesV4, r)
+			emitted[t.key] = true
 			if t.appAny {
 				prog.HasApplicationAnyDeny = true
 			}
 		}
 		if r, ok := junosHostBuildRule("ip6", t, permitV6, permitAllV6); ok {
 			prog.RulesV6 = append(prog.RulesV6, r)
+			emitted[t.key] = true
 			if t.appAny {
 				prog.HasApplicationAnyDeny = true
 			}
 		}
 	}
-	return prog, true
+	return prog, emitted, true
 }
 
 // junosHostPoison is a sentinel accumulated for a cross-dimension permit so a
@@ -632,345 +665,6 @@ func junosHostProjectAddrMatch(set []string, anyFam, excluded, emptyBothFamilies
 	default:
 		return false, false, append([]string(nil), set...), true
 	}
-}
-
-// junosHostFamilyL4 keeps the L4 fragments meaningful for a family (ICMP -> v4
-// only, ICMPv6 -> v6 only; TCP/UDP/bare-proto -> both).
-func junosHostFamilyL4(family string, l4 []JunosHostDenyL4) []JunosHostDenyL4 {
-	if len(l4) == 0 {
-		return nil
-	}
-	wantV6 := family == "ip6"
-	var out []JunosHostDenyL4
-	for _, f := range l4 {
-		switch f.Proto {
-		case HostInboundProtoICMP:
-			if wantV6 {
-				continue
-			}
-		case HostInboundProtoICMPv6:
-			if !wantV6 {
-				continue
-			}
-		}
-		out = append(out, f)
-	}
-	return out
-}
-
-// junosHostResolveAddrSet resolves a policy source/destination token list to
-// static per-family CIDR sets. ok=false when any token (or nested member) is
-// feed-tainted, resolves through a wildcard/dns-name/range address (Value ""),
-// or names an unknown book entry. any* is true when a wildcard token widens the
-// family to match-all.
-func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]bool) (v4, v6 []string, anyV4, anyV6, ok bool) {
-	ok = true
-	if len(tokens) == 0 {
-		return nil, nil, true, true, true
-	}
-	ab := cfg.Security.AddressBook
-	seen4 := map[string]bool{}
-	seen6 := map[string]bool{}
-	addCIDR := func(val string) {
-		val = strings.TrimSpace(val)
-		if val == "" {
-			ok = false
-			return
-		}
-		if val == "any" || val == "any-ipv4" || val == "any-ipv6" {
-			switch val {
-			case "any":
-				anyV4, anyV6 = true, true
-			case "any-ipv4":
-				anyV4 = true
-			case "any-ipv6":
-				anyV6 = true
-			}
-			return
-		}
-		pfx, perr := netip.ParsePrefix(val)
-		if perr != nil {
-			if a, aerr := netip.ParseAddr(val); aerr == nil {
-				pfx = netip.PrefixFrom(a, a.BitLen())
-			} else {
-				ok = false
-				return
-			}
-		}
-		s := pfx.Masked().String()
-		if pfx.Addr().Is6() {
-			if !seen6[s] {
-				seen6[s] = true
-				v6 = append(v6, s)
-			}
-		} else if !seen4[s] {
-			seen4[s] = true
-			v4 = append(v4, s)
-		}
-	}
-	for _, tok := range tokens {
-		switch tok {
-		case "", "any":
-			anyV4, anyV6 = true, true
-			continue
-		case "any-ipv4":
-			anyV4 = true
-			continue
-		case "any-ipv6":
-			anyV6 = true
-			continue
-		}
-		if junosHostNameFeedTainted(ab, feedBound, tok, map[string]bool{}) {
-			ok = false
-			continue
-		}
-		if ab != nil {
-			if a, found := ab.Addresses[tok]; found {
-				addCIDR(a.Value)
-				continue
-			}
-			if _, found := ab.AddressSets[tok]; found {
-				names, err := ExpandAddressSet(tok, ab)
-				if err != nil {
-					ok = false
-					continue
-				}
-				for _, n := range names {
-					if a, f := ab.Addresses[n]; f {
-						addCIDR(a.Value)
-					} else {
-						ok = false
-					}
-				}
-				continue
-			}
-		}
-		// Not a book name: try a literal prefix/IP.
-		addCIDR(tok)
-	}
-	return v4, v6, anyV4, anyV6, ok
-}
-
-// junosHostAddrScoped reports whether a token list names a concrete (non-any)
-// address scope.
-func junosHostAddrScoped(tokens []string) bool {
-	for _, t := range tokens {
-		switch t {
-		case "", "any", "any-ipv4", "any-ipv6":
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// junosHostNameFeedTainted reports whether an address token, or ANY nested
-// address-set member, is bound to a dynamic feed (so its resolved set is not
-// commit-stable and cannot be a static nft rule, §6.2). A name may be
-// SIMULTANEOUSLY static and feed-backed, so the whole closure is inspected.
-func junosHostNameFeedTainted(ab *AddressBook, feedBound map[string]bool, name string, visited map[string]bool) bool {
-	if feedBound[name] {
-		return true
-	}
-	if ab == nil || visited[name] {
-		return false
-	}
-	set, ok := ab.AddressSets[name]
-	if !ok {
-		return false
-	}
-	visited[name] = true
-	defer delete(visited, name)
-	for _, m := range set.Addresses {
-		if junosHostNameFeedTainted(ab, feedBound, m, visited) {
-			return true
-		}
-	}
-	for _, s := range set.AddressSets {
-		if junosHostNameFeedTainted(ab, feedBound, s, visited) {
-			return true
-		}
-	}
-	return false
-}
-
-// junosHostFeedBoundNames returns the set of address-names bound to any dynamic
-// feed (config-knowable membership; the live feed CONTENT is irrelevant to
-// representability — a feed-bound name is never commit-stable).
-func junosHostFeedBoundNames(cfg *Config) map[string]bool {
-	out := map[string]bool{}
-	for name := range cfg.Security.DynamicAddress.AddressBindings {
-		out[name] = true
-	}
-	return out
-}
-
-// junosHostResolveApplications reduces a policy `match application` token list to
-// OR-expanded L4 fragments. appAny is true for `any`/empty (match every
-// protocol). ok=false when any application is un-resolvable, multi-term, ALG,
-// protocol-less, has a non-numeric port, or is scoped to an IPsec/ident exempt
-// tuple (which the IPsec/ident path owns — §6.6).
-func junosHostResolveApplications(cfg *Config, tokens []string) (l4 []JunosHostDenyL4, appAny, ok bool) {
-	ok = true
-	if len(tokens) == 0 {
-		return nil, true, true
-	}
-	for _, tok := range tokens {
-		switch tok {
-		case "", "any":
-			appAny = true
-			continue
-		}
-		// #5677: resolve a user/predefined APPLICATION first, so a user
-		// application shadowing a same-named application-set keeps ITS OWN
-		// ports on this direct host-bound projection. Only OR-expand as an
-		// application-set when the token is NOT an application — mirroring the
-		// app-first precedence of resolveUserspaceApplicationNames and the
-		// #5629/#5664 policy-match / NAT / catalog fixes. Consulting the
-		// application-SET table first (the pre-#5677 bug) mis-resolved a
-		// shadowed user application to the set's members, so the kernel
-		// direct-host DENY projected the wrong ports.
-		_, isApp := ResolveApplication(tok, cfg.Applications.Applications)
-		if _, isSet := ResolveApplicationSet(tok, cfg.Applications.ApplicationSets); !isApp && isSet {
-			members, err := ExpandApplicationSet(tok, &cfg.Applications)
-			if err != nil {
-				ok = false
-				continue
-			}
-			for _, m := range members {
-				if frags, mok := junosHostReduceApp(cfg, m); mok {
-					l4 = append(l4, frags...)
-				} else {
-					ok = false
-				}
-			}
-			continue
-		}
-		if frags, aok := junosHostReduceApp(cfg, tok); aok {
-			l4 = append(l4, frags...)
-		} else {
-			ok = false
-		}
-	}
-	if appAny {
-		// `application any` present -> the whole match is all-protocols; drop any
-		// narrow fragments accumulated alongside it (any subsumes them).
-		return nil, true, ok
-	}
-	return l4, false, ok
-}
-
-// junosHostReduceApp reduces a single application to L4 fragments. Rejects
-// multi-term apps (MixedDirectTermApps), ALG-bearing apps, protocol-less apps,
-// non-numeric ports, and apps scoped to an IPsec/ident exempt tuple.
-func junosHostReduceApp(cfg *Config, name string) ([]JunosHostDenyL4, bool) {
-	for _, mixed := range cfg.Applications.MixedDirectTermApps {
-		if mixed == name {
-			return nil, false
-		}
-	}
-	app, ok := ResolveApplication(name, cfg.Applications.Applications)
-	if !ok || app == nil {
-		return nil, false
-	}
-	if app.ALG != "" {
-		return nil, false
-	}
-	proto := strings.ToLower(strings.TrimSpace(app.Protocol))
-	if proto == "" {
-		return nil, false
-	}
-	var frag JunosHostDenyL4
-	switch proto {
-	case "tcp":
-		frag.Proto = HostInboundProtoTCP
-	case "udp":
-		frag.Proto = HostInboundProtoUDP
-	case "icmp":
-		frag.Proto = HostInboundProtoICMP
-		frag.ICMPType, frag.ICMPCode = app.ICMPType, app.ICMPCode
-	case "icmp6", "icmpv6", "icmp-v6":
-		frag.Proto = HostInboundProtoICMPv6
-		frag.ICMPType, frag.ICMPCode = app.ICMPType, app.ICMPCode
-	default:
-		n, err := strconv.Atoi(proto)
-		if err != nil || n < 0 || n > 255 {
-			return nil, false
-		}
-		frag.Proto = uint8(n)
-	}
-	if frag.Proto == HostInboundProtoTCP || frag.Proto == HostInboundProtoUDP {
-		dp, dok := junosHostParsePorts(app.DestinationPort)
-		if !dok {
-			return nil, false
-		}
-		sp, sok := junosHostParsePorts(app.SourcePort)
-		if !sok {
-			return nil, false
-		}
-		frag.Ports, frag.SourcePorts = dp, sp
-	}
-	// A deny scoped to an IPsec/ident exempt tuple can't be faithfully modeled by
-	// the DENY slice (the IPsec passthrough / ident-reset path owns it, §6.6).
-	if junosHostFragIsExemptTuple(frag) {
-		return nil, false
-	}
-	return []JunosHostDenyL4{frag}, true
-}
-
-// junosHostFragIsExemptTuple reports whether an L4 fragment collides with a
-// pre-fine exempt class: raw ESP/AH (proto 50/51), IKE/NAT-T (udp 500/4500), or
-// ident (tcp 113).
-func junosHostFragIsExemptTuple(f JunosHostDenyL4) bool {
-	switch f.Proto {
-	case 50, 51:
-		return true
-	case HostInboundProtoUDP:
-		return junosHostPortsInclude(f.Ports, 500) || junosHostPortsInclude(f.Ports, 4500)
-	case HostInboundProtoTCP:
-		return junosHostPortsInclude(f.Ports, 113)
-	}
-	return false
-}
-
-func junosHostPortsInclude(ports []PortRange, p uint16) bool {
-	if len(ports) == 0 {
-		return true // no port constraint => all ports => includes p
-	}
-	for _, r := range ports {
-		if p >= r.Lo && p <= r.Hi {
-			return true
-		}
-	}
-	return false
-}
-
-// junosHostParsePorts parses a Junos port spec into PortRange(s). "" => nil (all
-// ports). Only numeric single ports and "lo-hi" ranges are representable; a
-// named alias returns ok=false.
-func junosHostParsePorts(spec string) ([]PortRange, bool) {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return nil, true
-	}
-	var out []PortRange
-	for _, part := range strings.Fields(spec) {
-		if lo, hi, found := strings.Cut(part, "-"); found {
-			l, lerr := strconv.Atoi(strings.TrimSpace(lo))
-			h, herr := strconv.Atoi(strings.TrimSpace(hi))
-			if lerr != nil || herr != nil || l < 0 || h > 65535 || l > h {
-				return nil, false
-			}
-			out = append(out, PortRange{Lo: uint16(l), Hi: uint16(h)})
-			continue
-		}
-		v, err := strconv.Atoi(part)
-		if err != nil || v < 0 || v > 65535 {
-			return nil, false
-		}
-		out = append(out, PortRange{Lo: uint16(v), Hi: uint16(v)})
-	}
-	return out, true
 }
 
 // junosHostSvcAdmitsIKE reports whether an EFFECTIVE per-interface host-inbound

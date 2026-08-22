@@ -17,10 +17,17 @@ import (
 // rendering a dropped mirror as armed.
 //
 // This file can only reach the gRPC copy (importing pkg/cli from here is not
-// how the tree is layered), so the CLI copy is bound by asserting the TEXT both
-// are required to produce, and the builder half lives in
-// pkg/dataplane/userspace/mirror_exclusion_6534_test.go. The three together are
-// what make the property hold; any one alone does not.
+// how the tree is layered), and the builder half lives in
+// pkg/dataplane/userspace/mirror_exclusion_6534_test.go.
+//
+// An earlier revision of this comment said the CLI copy was "bound by asserting
+// the TEXT both are required to produce". That was not a bind — this file never
+// executes a CLI renderer — and it was also counting wrong: there are THREE
+// port-mirroring renderers, and the third (cli.showForwardingOptions) was
+// unannotated at the time the sentence was written. The CLI surfaces are now
+// driven directly in pkg/cli/mirror_exclusion_surfaces_6534_test.go, and the
+// population itself is measured rather than asserted in prose, by
+// pkg/showaudit.
 
 func mirrorSurfaceConfig(output string, rate int) *config.Config {
 	cfg := &config.Config{}
