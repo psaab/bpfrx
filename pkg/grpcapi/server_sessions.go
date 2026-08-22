@@ -1186,12 +1186,13 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	defer release()
 
 	// Check if this is a forwarded request from a peer (prevent recursion).
-	forwarded := false
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get("x-peer-forwarded"); len(vals) > 0 {
-			forwarded = true
-		}
-	}
+	//
+	// #5883: via the unforgeable capability, not raw metadata. This site read
+	// the header directly rather than going through peerForwardedFromContext,
+	// so it needed its own edit — which is exactly why the reserved keys are
+	// also STRIPPED at both listeners: a site that reaches for the raw header
+	// now finds nothing rather than finding a caller-supplied value.
+	forwarded := peerForwardedFromContext(ctx)
 
 	// If no filters, clear all
 	if req.SourcePrefix == "" && req.DestinationPrefix == "" &&
