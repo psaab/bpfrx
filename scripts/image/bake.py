@@ -169,6 +169,53 @@ def require(tool, hint):
         die(f"{tool} not found — {hint}")
 
 
+# ── Image seal (#5283, #6547) ────────────────────────────────────────
+#
+# The seal is what stops the golden image shipping an identical PER-DEVICE
+# IDENTITY to every clone. These two tuples are the SINGLE SOURCE for it: the
+# virt-sysprep argv below is built from them, and the pre-sign validation gate
+# (scripts/image/validate.py) asserts the OUTCOME of each one on the exported
+# qcow2 before a signature is ever produced.
+#
+# #6547: before that gate existed the seal was performed but never verified.
+# The `--enable` list was a hand-maintained string literal and the purge was a
+# `rm -rf ... 2>/dev/null || true` whose failure is swallowed by construction,
+# so a member silently dropping out of either — or the step being refactored
+# away — would have shipped a SIGNED image with a fleet-wide shared SSH host
+# key, machine-id and SNMPv3 EngineID, and passed the publish gate green.
+# `scripts/image/test_validate_image_seal_6547.py` binds these tuples to the
+# gate's identity table, so dropping a member from either one reds.
+SYSPREP_ENABLE_OPS = (
+    "machine-id",
+    "ssh-hostkeys",
+    "ssh-userdir",
+    "logfiles",
+    "tmp-files",
+    "bash-history",
+    "package-manager-cache",
+    "backup-files",
+    "passwd-backups",
+    "utmp",
+)
+
+# Paths removed by the seal's --run-command. The xpf state entries make the
+# image a factory artifact (no committed config, no day-0 stamp); the SNMPv3
+# EngineID component and its engineBoots counter (#5283) and the systemd
+# random-seed are per-device identity — every clone must regenerate them on
+# first boot, or all of them derive byte-identical localized USM keys and
+# accept each other's authenticated SNMPv3 requests.
+SYSPREP_PURGE_PATHS = (
+    "/etc/xpf/.configdb",
+    "/etc/xpf/xpf.conf",
+    "/etc/xpf/.day0-config-applied",
+    "/etc/xpf/.root-grown",
+    "/var/lib/xpf/snmp-engine-id",
+    "/var/lib/xpf/snmp-engineboots",
+    "/var/lib/systemd/random-seed",
+    "/var/lib/apt/lists/*",
+)
+
+
 def run(argv, **kw):
     return subprocess.run(argv, check=True, **kw)
 
@@ -861,21 +908,10 @@ def main():
 
         # 5. seal
         info("sealing image (virt-sysprep)...")
-        run(["virt-sysprep", "-a", work_qcow, "--quiet", "--enable",
-             "machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,"
-             "package-manager-cache,backup-files,passwd-backups,utmp",
-             # #5283: strip the persisted per-device SNMPv3 EngineID component
-             # (and the engineBoots counter) so the golden image never ships an
-             # identical per-device identity across clones. Like /etc/machine-id
-             # (reset by the enabled virt-sysprep machine-id op above), each
-             # appliance regenerates a fresh EngineID component on first boot;
-             # otherwise every clone would derive byte-identical localized USM
-             # keys and accept each other's authenticated SNMPv3 requests.
-             "--run-command", "rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf "
-             "/etc/xpf/.day0-config-applied /etc/xpf/.root-grown "
-             "/var/lib/xpf/snmp-engine-id /var/lib/xpf/snmp-engineboots "
-             "/var/lib/systemd/random-seed "
-             "/var/lib/apt/lists/* 2>/dev/null || true"])
+        run(["virt-sysprep", "-a", work_qcow, "--quiet",
+             "--enable", ",".join(SYSPREP_ENABLE_OPS),
+             "--run-command",
+             "rm -rf " + " ".join(SYSPREP_PURGE_PATHS) + " 2>/dev/null || true"])
 
         # 6. export
         ver = a.version
