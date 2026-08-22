@@ -2206,6 +2206,76 @@ additive *in meaning* (an old reader that ignores it still enforces
 exactly what it enforced before) does not need a bump; a field that
 changes what a rule COVERS does.
 
+#### Per-feature protocol floors (#6648, #6649)
+
+The gates in `manager_compile.go` answer **two different questions**, and
+#6648 was the consequence of one comparison being asked to answer both.
+
+1. **"Can this helper REPRESENT this feature?"** — asked once per gated
+   feature, against an **immutable floor**: the version at which that
+   feature's wire representation landed. The floors live beside
+   `ProtocolVersion` in `pkg/dataplane/userspace/protocol.go`:
+
+   | feature | gate | floor | landed in |
+   |---|---|---|---|
+   | policy scheduler | `ensurePolicySchedulerProtocolLocked` | `MinProtocolPolicyScheduler` = 2 | `f7c4b125c` (#1396) |
+   | persistent source NAT | `ensurePersistentSourceNATProtocolLocked` | `MinProtocolPersistentSourceNAT` = 3 | `c0a047ea2` (#1377) |
+   | scoped-global zone set | `ensureScopedGlobalZoneSetProtocolLocked` | `MinProtocolMultiZoneScopedPolicy` = 4 | `8119bfe27` (#5488/#6644) |
+   | secure-tunnel refusal | `ensureSecureTunnelProtocolLocked` | `MinProtocolSecureTunnelRefusal` = 7 | `be8aec13e` v5, `8d0e09fb8` v6, `8c011681c` v7 (#5619/#6691) |
+
+   A floor is a **historical fact about the wire** and never moves. The
+   secure-tunnel floor is the LAST of the three bumps that built its
+   contract, because a helper below 7 misreads at least one part of it;
+   it moves only if a fourth change to that contract lands, never to
+   track the shared constant.
+
+2. **"Will this helper ACCEPT our snapshot at all?"** — asked ONCE, by
+   `ensureEgressZoneProtocolLocked` (#6722), unconditionally and on
+   **exact equality**, mirroring the helper's own contract
+   (`userspace-dp/src/server/handlers/snapshot.rs` compares `!=` and
+   returns before any mutation).
+
+Before #6648 all four per-feature gates compared against `ProtocolVersion`,
+which conflated the two: every bump for an unrelated feature retroactively
+re-armed all of them, and the operator got a misleading REASON — a helper
+running a scheduled-policy config was told "policy scheduler snapshots"
+required version 8, when scheduler state has been representable since v2.
+
+**What did NOT change is fail-closed coverage.** Since #6722 the
+unconditional equality gate refuses ANY version skew, so a helper between a
+feature's floor and `ProtocolVersion` still disarms and still aborts the
+commit — it now just gets the accurate general reason ("restart the helper
+onto the matching build") instead of a feature-specific one that was not
+true. `TestFeatureFlooredHelperStillFailsClosed6648` pins that composition
+in both directions, including the newer-helper direction.
+
+That newer-helper direction is **#6649**, which the same split resolves.
+The Go gates admitted `>=` while the helper requires `==`, so a helper
+AHEAD of the control plane passed every gate and then refused the snapshot,
+raising no sentinel. #6722's unconditional equality gate closed it; the
+per-feature floors keep it closed by construction, because the acceptance
+rule now has exactly ONE copy in Go rather than one per gate. The rule is
+single-sourced in the direction of the **helper**, which is the authority:
+the helper decides what it accepts, and the Go gate exists to predict that
+decision. `TestSnapshotProtocolVersionLockstepWithRust` parses the Rust
+constant so the two cannot drift.
+
+**#6647** — the ordering of that gate against the apply's irreversible work
+— is closed by two earlier changes rather than by a reorder. #5485 moved the
+interface DETACH (the only pre-gate step that could produce a policy bypass)
+after the acceptance points, and #5488 F7 added
+`disarmSnapshotProtocolFailClosedLocked`, which drives `userspace_ctrl` to
+`Enabled=0` when the disarm IPC itself fails on a path that already mutated
+the classifier maps in place. The surviving pre-gate work — XDP pin deletion
+and the shim ATTACH — is fail-closed in both `ctrl` states, and the bootstrap
+branch programs `Enabled: 0` before the gate runs, so the `mapsMutatedInPlace
+== false` arm needs no compensation. The compensation is pinned by
+`TestSnapshotProtocolDisarmFailureFailsClosed5488` and
+`TestProtocolGateSitesRouteThroughFailClosedHelper5488` — the latter a
+source-scanning guard which, until #6647 hardened `goFunctionSource` to
+return CODE rather than raw file text, could be satisfied by a comment
+quoting the call it demands.
+
 **Why it went to 4.** #4626 gave a scoped global policy a zone-SET scope in
 the plural `match_from_zones`/`match_to_zones` fields, made them
 authoritative, and left the singular `match_from_zone`/`match_to_zone`
@@ -2281,9 +2351,10 @@ may be an older process — which is the whole rolling-upgrade case.
 `ProtocolVersion`.** The question is "can the peer represent THIS shape", and
 that answer stopped changing at v4. Keying on the shared constant would make
 every future unrelated wire bump retroactively refuse multi-zone commits across
-any skew — the defect open **#6648** describes in the local gates. This is the
-first per-feature floor in the tree; #6648 tracks giving the local gates the
-same treatment.
+any skew — the defect **#6648** described in the local gates. This was the first
+per-feature floor in the tree; #6648 has since given the local gates the same
+treatment (see *Per-feature protocol floors* below), and the scoped-global gate
+now shares this very constant.
 
 **Why it is at 6.** #5619/#6691 added
 `InterfaceSnapshot.secure_tunnel`, and made it AUTHORITATIVE over AF_XDP
@@ -2316,7 +2387,8 @@ newly committed deny never installed. So the version bump is paired with
 in the same class as the policy-scheduler and persistent-source-NAT gates
 (#2138): when the committed config carries a policy whose scope holds
 more than one zone on a side and the running helper reports a
-`ConfigSnapshotProtocolVersion` below `ProtocolVersion`, the daemon
+`ConfigSnapshotProtocolVersion` below `MinProtocolMultiZoneScopedPolicy`
+(v4 — it was `ProtocolVersion` before #6648), the daemon
 DISARMS the helper (`set_forwarding_state{armed:false}`) and the commit
 ABORTS with `ErrScopedGlobalZoneSetProtocolIncompatible`, which is
 registered in `requiredProtocolGateSentinels`. The lenient-load doctrine

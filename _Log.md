@@ -103214,6 +103214,23 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/packed_chassis_cluster_6672_test.go, docs/config-schema.md
 
 - **Timestamp**: 2026-08-22
+  - **Action**: #6648 — gave each per-feature required-protocol gate an
+    immutable floor (the version its wire representation landed at) instead of
+    the shared ProtocolVersion, so an unrelated wire bump no longer retroactively
+    re-arms every gate and reports a false reason. #6649 and #6647 were measured
+    already-closed at master (by #6722's unconditional equality gate, and by
+    #5485 + #5488 F7 respectively) and are pinned rather than re-fixed: added the
+    composition cell for #6649, and hardened goFunctionSource to return CODE so
+    the #6647 compensator's source-scanning guard can no longer be satisfied by a
+    comment quoting the call it demands.
+  - **File(s)**: pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/manager_compile.go,
+    pkg/dataplane/userspace/protocol_feature_floors_6648_test.go (new),
+    pkg/dataplane/userspace/shim_loader_boundary_test.go,
+    pkg/dataplane/userspace/manager_capabilities_test.go,
+    pkg/dataplane/userspace/set_forwarding_armed_generation_5648_test.go,
+    pkg/dataplane/userspace/sync_desired_forwarding_generation_6165_test.go,
+    docs/userspace-dataplane-architecture.md
   - **Action**: #6684/#6685/#7457 — added a schema-driven expander for packed
     stanza bodies (compact_tail.go) and wired it into the syslog host, firewall
     filter term, and filter `from` compile sites. #6683 (screens) is blocked on
@@ -103221,6 +103238,34 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
     pkg/config/compiler_firewall.go,
     pkg/config/compact_tail_6684_6685_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #7413 — three tests read process-global state and failed under a
+    parallel `cargo test`. Two independent resources, each with a single
+    mechanism, measured rather than inferred: `DETERMINISTIC_V6_DOWNGRADE_COUNT`
+    (2 asserters, 6/6 fail at --test-threads=2, `left: 2 right: 1`) and the
+    process-wide `neigh-monitor` thread count (10 spawners across 2 modules,
+    4/8 fail running ONLY the two asserters, `before=0 during=2`). Both take a
+    poison-tolerant serial guard. Corrected my own issue text: the nat64
+    counter is PRODUCTION state, so the `thread_local!` pattern does not apply
+    — it would break the product. Population enumerated by running all 4549
+    tests alone and watching each observable's own log line, which also proved
+    no spawner leaks. Guard on the two asserters is BOUND (5/8 red); the guard
+    on the other eight is precautionary and reported as such — it does not red
+    even paired one-to-one, and the `before == 0` precondition is the anti-rot
+    diagnostic that makes a future collision name the missing lock.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/{neighbor_manager.rs,mod.rs,
+    tests.rs}, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/main_tests.rs,
+    userspace-dp/src/nat64_tests.rs, docs/engineering-style.md
+
+## 2026-08-22 — #6992 duplicate system login user blocks
+- **Timestamp**: 2026-08-22
+- **Action**: Fold a duplicated `system login user` name into ONE compiled entry
+  (per-leaf last-authored-wins, matching the flat spelling) so no reader can
+  pick a different block, and register the container in the #5180 duplicate
+  gate so the silent drop is rejected at commit.
+- **File(s)**: pkg/config/compiler_system.go, pkg/config/dup_named_blocks.go,
+  pkg/config/duplicate_login_user_6992_test.go, docs/config-schema.md
 
 - **Timestamp**: 2026-08-22
   - **Action**: #6683/#7460 — modelled the whole screen subtree in setSchema and

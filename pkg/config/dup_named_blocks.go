@@ -40,7 +40,7 @@ type dupBlock struct {
 // candidate authors the SAME named hierarchical block twice inside a container
 // whose compiler does whole-object last-writer-wins replacement — dropping the
 // earlier block's config silently (#5180, consolidating codex-177 A3-b2-F3 +
-// A3-b3-F1). Three containers are affected:
+// A3-b3-F1). Four containers are affected:
 //
 //   - groups { <name> { … } }  — expandGroups keeps only the last definition
 //     (ast_groups.go: groups[name] = g).
@@ -50,6 +50,12 @@ type dupBlock struct {
 //     Screen[profile.Name]; WITHIN one ids-option it also reads each
 //     icmp/ip/tcp/udp/limit-session family with FindChild (first sibling only),
 //     so a repeated family block is dropped too.
+//   - system { login { user <name> { … } } } — compileSystemLogin folds a
+//     duplicated name into ONE entry, per-leaf last-authored-wins (#6992), so
+//     the earlier block's uid / class / keys disappear. Before that fold the
+//     duplicate was WORSE than a drop: both blocks survived and two readers
+//     picked different ones, so an SSH key authored under a VIEW-only block
+//     could authenticate into a super-user CLI.
 //
 // This is a dual-AST-equivalence gate. Under flat `set` these statements MERGE:
 // tree.SetPath collapses `set interfaces ge-0/0/0 …` written twice onto ONE
@@ -194,6 +200,46 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 					} else {
 						famSeen[fn] = true
 					}
+				}
+			}
+		}
+	}
+
+	// 4. system { login { user <name> { … } } } — #6992. compileSystemLogin
+	// now folds a duplicated user name into ONE entry with per-leaf
+	// last-authored-wins (compiler_system.go), matching what the FLAT spelling
+	// already produces, so the container qualifies for this gate on the same
+	// terms as the three above: the earlier block's uid / class / keys
+	// disappear silently.
+	//
+	// Before that fold both blocks survived and two readers picked DIFFERENT
+	// ones — pkg/cli configuredClass takes the first block with a non-empty
+	// class, pkg/daemon applySystemLogin provisions from the last — so an SSH
+	// key authored under a VIEW-only block could authenticate into a
+	// super-user CLI. The fold removes the divergence; this gate is what stops
+	// the operator being silently held to whichever block the merge kept.
+	//
+	// Union across every top-level `system` stanza and every `login` block
+	// therein, matching the screen walk above.
+	seenUser := map[string]bool{}
+	reportedUser := map[string]bool{}
+	for _, child := range tree.Children {
+		if child.Name() != "system" {
+			continue
+		}
+		for _, login := range child.FindChildren("login") {
+			for _, inst := range namedInstances(login.FindChildren("user")) {
+				if inst.name == "" {
+					recordEmpty("login user")
+					continue
+				}
+				if seenUser[inst.name] {
+					if !reportedUser[inst.name] {
+						dups = append(dups, dupBlock{"login user", inst.name})
+						reportedUser[inst.name] = true
+					}
+				} else {
+					seenUser[inst.name] = true
 				}
 			}
 		}
