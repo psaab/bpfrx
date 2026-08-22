@@ -100264,3 +100264,43 @@ prose edit above them added. No diff falls in the new test body.
   `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
   It now reds under that cell (4 failures, was 3).
 - **File(s)**: userspace-dp/src/session/tests.rs
+
+## 2026-08-21 — #7253: split the modularity gate from the heatmap freshness gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: `TestHeatmapNotStale` fused two properties into one fatal
+  assertion — modularity ("a file is growing past the point where it should be
+  split", aimed at the author of the growth) and freshness ("the committed
+  global snapshot disagrees with the tree", aimed at whoever merges next). The
+  second could not stay true: the heatmap is a repo-GLOBAL snapshot, so any
+  file crossing 1500/2000 LOC anywhere flipped it for everyone. #7235, #7252
+  and #7254 each regenerated it inside one hour and #7252 was ALREADY STALE
+  when it merged; `pkg/dataplane/types.go` crossed the floor at exactly 1501
+  lines. Split per the issue's recorded decision (option 3). HARD half: new
+  `TestTouchedFileCrossedModularityThreshold` +
+  `scripts/refactoring-audit-touched.sh` — reds only when a file the BRANCH
+  TOUCHES crossed a floor, measured base-vs-worktree over
+  `git diff <merge-base(origin/master,HEAD)>` plus untracked files; it never
+  reads the artifact, is silent on master (empty changed set), and fails loudly
+  (exit 3) when the changed set is undeterminable rather than printing an empty
+  set. Escape hatch is a reasoned entry in
+  `docs/refactoring-audit-accepted.txt`. DEMOTED half:
+  `TestGlobalHeatmapFreshnessAdvisory` reports drift and never fails;
+  `scripts/refactoring-audit-refresh.sh` (`make audit-refresh`) regenerates and
+  commits it. `make audit-check` now exits 0 on every staleness and keeps exit 1
+  for a malformed artifact, so its verdict still agrees with the suite.
+  `$AUDIT_ROOTS_*` / `$AUDIT_FLOOR` / `audit_is_audited_path` moved into the
+  shared lib so the generator and the touched probe cannot drift; generator
+  output verified byte-identical after that refactor. Fail-on-revert for each
+  half, plus `TestTouchedGateIsNotASnapshotCompare` proving the hard half
+  disagrees with a repo-global snapshot compare in BOTH directions. Test tooling
+  only — no dataplane or control-plane code, so no cluster smoke is owed.
+- **File(s)**: pkg/refactoraudit/audit_touched_test.go (new),
+  pkg/refactoraudit/audit_jobs_test.go (new),
+  pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
+  scripts/refactoring-audit-touched.sh (new),
+  scripts/refactoring-audit-refresh.sh (new),
+  scripts/refactoring-audit-lib.sh, scripts/refactoring-audit.sh,
+  scripts/refactoring-audit-classify.sh,
+  docs/refactoring-audit-accepted.txt (new), docs/refactoring-audit.md,
+  docs/engineering-style.md, Makefile, _Log.md
