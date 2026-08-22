@@ -1900,6 +1900,7 @@ func ValidateConfig(cfg *Config) []string {
 	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress
 	// interface). Surface that Junos-parity/hardening gap at commit; the per-zone
 	// iifname enforcement remains deferred.
+	warnings = append(warnings, validateHostInboundZoneLevelDHCPWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundOverrideReplaceWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundMulticastWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundManagedRoutingMismatch(cfg)...)

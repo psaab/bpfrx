@@ -131,29 +131,23 @@ func (z *ZoneConfig) InterfaceHostInboundEffective(ref string) (svc, proto []str
 	if z == nil {
 		return UnionHostInboundTokens(zoneSvc, nil), UnionHostInboundTokens(zoneProto, nil), false
 	}
-	// #3720 (H05): the physical and the unit level are BOTH "interface level", so
-	// the override for a unit is the UNION of the two, exactly as the dataplane
-	// resolves it in buildInterfaceHostInboundMap. (#6515 replaces the ZONE level
-	// with this result; it does not change how the two interface-level statements
-	// combine with each other.) For a logical-unit ref (contains "."), a
-	// physical-interface-level override on its parent IN THIS ZONE also applies,
-	// so the diagnostic must UNION it. Before #3720 this read only the exact ref,
-	// so `show interfaces <unit>` reported "no override / default-deny" while the
-	// dataplane admitted the inherited physical override — the diagnostic gave the
-	// OPPOSITE answer to enforcement.
+	// The INTERFACE-level half comes from InterfaceHostInboundOverride, which owns
+	// the #3720 (H05) physical∪unit union: the physical and the unit level are
+	// BOTH "interface level", so the override for a unit is the UNION of the two,
+	// exactly as the dataplane resolves it in buildInterfaceHostInboundMap. (#6515
+	// replaces the ZONE level with that result; it does not change how the two
+	// interface-level statements combine with each other.) Before #3720 this read
+	// only the exact ref, so `show interfaces <unit>` reported "no override /
+	// default-deny" while the dataplane admitted the inherited physical override —
+	// the diagnostic gave the OPPOSITE answer to enforcement.
+	//
+	// It is a CALL and not a second copy of that walk because a divergence between
+	// the two would always be a bug: the #6519 advisory asks
+	// InterfaceHostInboundOverride "does the interface's own stanza authorize this
+	// service?" precisely to decide what the ZONE-level stanza is answerable for,
+	// and it has to be asking about the same set this resolver admits.
 	var ovSvc, ovProto []string
-	if base, unit, ok := strings.Cut(ref, "."); ok && unit != "" && base != "" {
-		if phys := z.InterfaceHostInbound[base]; phys != nil {
-			ovSvc = UnionHostInboundTokens(ovSvc, phys.SystemServices)
-			ovProto = UnionHostInboundTokens(ovProto, phys.Protocols)
-			overridden = true
-		}
-	}
-	if exact := z.InterfaceHostInbound[ref]; exact != nil {
-		ovSvc = UnionHostInboundTokens(ovSvc, exact.SystemServices)
-		ovProto = UnionHostInboundTokens(ovProto, exact.Protocols)
-		overridden = true
-	}
+	ovSvc, ovProto, overridden = z.InterfaceHostInboundOverride(ref)
 	if !overridden {
 		return UnionHostInboundTokens(zoneSvc, nil), UnionHostInboundTokens(zoneProto, nil), false
 	}

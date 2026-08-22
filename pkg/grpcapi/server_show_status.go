@@ -198,14 +198,14 @@ func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest
 	case "processes":
 		out, err := outputTimeout(ctx, "ps", "aux", "--sort=-rss")
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "running ps: %v", err)
+			return nil, diagExecError("running ps", err)
 		}
 		buf.Write(out)
 
 	case "storage":
 		out, err := outputTimeout(ctx, "df", "-h")
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "running df: %v", err)
+			return nil, diagExecError("running df", err)
 		}
 		buf.Write(out)
 
@@ -250,14 +250,14 @@ func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest
 	case "boot-messages":
 		out, err := outputTimeout(ctx, "journalctl", "--boot", "-n", "100", "--no-pager")
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "running journalctl: %v", err)
+			return nil, diagExecError("running journalctl", err)
 		}
 		buf.Write(out)
 
 	case "connections":
 		out, err := outputTimeout(ctx, "ss", "-tnp")
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "running ss: %v", err)
+			return nil, diagExecError("running ss", err)
 		}
 		buf.Write(out)
 

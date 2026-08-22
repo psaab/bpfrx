@@ -1,3 +1,35 @@
+## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
+
+- **Timestamp**: 2026-08-21
+- **Action**: Gated all six gRPC NAT full-table conntrack walks on the
+  shared `diagcmd.SessionWalkLimiter` the REST twin got in #6216:
+  `GetNATPoolStats` and `GetNATDestination` via `AcquireCtx` (with the
+  lease sampled inside `countNATSessions`' v4 and v6 callbacks), and the
+  four `ShowText` topics `persistent-nat`, `persistent-nat-detail`,
+  `nat-source-rule-detail`, `nat-dest-rule-detail` via the plain
+  `Acquire` ShowText precedent — those reach `pkg/natshow`, which is
+  shared with `pkg/cli` and takes no ctx, so the cancellation half is a
+  stated residual with a successor issue. Gate placement is inside the
+  dataplane-loaded branch, not at the handler top, so a config-only read
+  is never refused (a negative control pins that). Also centralised the
+  NAT pool port formula into `config.NATPoolTotalPorts` — five copies,
+  only REST carried the `portHigh >= portLow` guard.
+  Mutation matrix: P1/P2 (drop admission from each RPC) → that surface's
+  cell reds; P3 (ShowText gate neutered) → the four ShowText cells red;
+  P4 (drop ctx sampling) → the cancellation probe reds; P5 (hoist
+  admission to the handler top) → the no-dataplane negative control
+  reds; P6 (re-inline the port formula) → the SSOT guard reds.
+  NOTE: acceptance criterion 2 (a structural "every full-table-scan
+  surface declares an admission policy" test) is deliberately NOT
+  attempted — open #7294 owns it and records that the AST approach was
+  tried and abandoned as too brittle. #5968 is closed and its inventory
+  does not name these surfaces, so this is not a dup.
+- **File(s)**: pkg/grpcapi/server_nat.go, pkg/grpcapi/server_helpers.go,
+  pkg/grpcapi/server_show_nat.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/nat_walk_admission_6553_test.go,
+  pkg/grpcapi/nat_walk_admission_6553_helper_test.go,
+  pkg/config/nat_pool_ports.go, pkg/api/nat.go, pkg/api/metrics_nat.go,
+  pkg/cli/cli_show_nat.go, pkg/api/README.md
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
 - **Timestamp**: 2026-08-22
@@ -39,6 +71,40 @@
   pkg/dataplane/userspace/zones_host_inbound.go, cmd/cli, plus the
   eight fixtures that encoded the union semantics
 
+## 2026-08-21 — #6552 diagnostic-fork concurrency bound on ShowText/GetSystemInfo
+
+- **Timestamp**: 2026-08-21
+- **Action**: Made `outputTimeout`/`combinedOutputTimeout` acquire the
+  shared `diagcmd.DefaultLimiter` slot before forking, so the ten
+  read-only diagnostic fork sites in `ShowText` (journalctl, tail,
+  chronyc ×2, ntpq, timedatectl) and `GetSystemInfo` (ps, df,
+  journalctl, ss) draw from the same `MaxConcurrentDiagnostics=4` budget
+  ping/traceroute already use on both surfaces. Unbounded forms renamed
+  `*Unlimited`; three uses stay unbounded by design (power actions,
+  zeroize teardown, ip neigh flush) and are named in an allowlist a
+  source tripwire checks in BOTH directions. Errors map through
+  `diagExecError` so a refused admission is `ResourceExhausted`, not
+  `Internal`. Both `grpc.NewServer` builders now set
+  `MaxConcurrentStreams(256)` — grpc-go's server default is unlimited.
+  SECURITY DETERMINATION: no injection vector. Nine sites pass only
+  compile-time literals to `exec.CommandContext` (no shell); the tenth
+  (`tail -n N <logPath>`) is request-derived on both args and
+  constrained on both (clampTailLines [1,10000] re-emitted via Itoa;
+  SyslogLogFilePath enforces `filepath.Base` + the configured
+  `system syslog file` allowlist → `/var/log/<allowlisted-base>`).
+  Mutation matrix: N1/N2 (restore each helper's pre-fix unbounded body)
+  → the matching bound test + tripwire red; N3 (anchor site points at
+  the Unlimited helper) → tripwire names it; N4 (delete a
+  `MaxConcurrentStreams` line) → server test red; N5 (acquire at the
+  handler top instead of the fork) → the non-forking `users` negative
+  control reds; N6 (bogus exemption) → tripwire reds on the stale side.
+  Issue said six fork sites; there are ten, and the chronyc/ntpq chain
+  is in `ShowText{ntp}`, not `GetSystemInfo`.
+- **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show.go, pkg/grpcapi/server_show_status.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/diag_fork_limiter_6552_test.go, pkg/grpcapi/README.md
 ## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
 
 - **Timestamp**: 2026-08-22
@@ -100858,6 +100924,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
 
+## 2026-08-21 — #6519: zone-level DHCP/BOOTP host-inbound parity advisory
+- **Timestamp**: 2026-08-21
+- **Action**: Junos accepts `dhcp`/`bootp` host-inbound only per INTERFACE ("All
+  services (except DHCP and BOOTP) can be configured either per zone or per
+  interface"). xpf accepts them at the zone level, where they authorize every
+  member interface. Added `validateHostInboundZoneLevelDHCPWarnings`, a
+  commit-time WARN naming the token (including the `all` case, since `all`
+  expands to a union containing dhcp/bootp) and the member interfaces the
+  zone-level authorization reaches, skipping lifelines and any interface that
+  authorized the service through its own stanza. Added
+  `ZoneConfig.InterfaceHostInboundOverride` as the interface-level half of the
+  effective-set resolution, bound to `InterfaceHostInboundEffective` by test.
+  Enforcement is NOT changed: the flip has a real population (the shipped
+  cluster configs) and would cost a zoned DHCP-client interface its address.
+- **File(s)**: pkg/config/host_inbound_dhcp_scope_6519.go (new),
+  pkg/config/host_inbound_dhcp_scope_6519_test.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/testdata/golden_4406.json (regenerated — 12 added warning lines,
+  one per case cell, no config-shape change),
+  docs/host-inbound-service-matrix.md
 ## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
 - **Timestamp**: 2026-08-21
 - **Action**: `terminateRemovedConns` was fire-and-forget while
@@ -100909,6 +100995,61 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_validate_warn_lag_6544_test.go (new),
   docs/feature-gaps.md, docs/phases.md, docs/vsrx-gaps.md, _Log.md
+
+## 2026-08-21 — #6546: device-map duplicate logical name refused
+- **Timestamp**: 2026-08-21
+- **Action**: `devicemap.Resolve`'s post-pass guarded two entries → ONE NIC but
+  not two entries → ONE LOGICAL NAME, so a duplicate name bound both entries
+  and the daemon renamed a nondeterministically-chosen NIC, durably via
+  `.link`. Added the symmetric guard with its own `BindRefusedDupName` status
+  (distinct remedy), keyed on the RESOLVED Linux name — which also closes a
+  strict-path hole: `ge-0/0/3` + `ge-0-0-3` are one interface and the raw-string
+  compare in `validateDeviceMapStrict` accepted them. Strict gate now
+  canonicalises; the commit pre-flight hard-stops via `Status.Refused()`.
+- **File(s)**: pkg/devicemap/devicemap.go, pkg/config/compiler_chassis.go,
+  pkg/daemon/device_map.go, pkg/devicemap/dup_logical_name_6546_test.go (new),
+  pkg/config/compiler_device_map_dup_name_6546_test.go (new),
+  pkg/daemon/device_map_dup_name_6546_test.go (new),
+  docs/bare-metal-device-map.md, _Log.md
+
+## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
+- **Timestamp**: 2026-08-21
+- **Action**: #6515 and #6519 landed independently, each carrying its own copy of
+  the #3720 physical∪unit interface-level override walk —
+  `InterfaceHostInboundEffective` inline, and `InterfaceHostInboundOverride` in
+  the #6519 advisory. `InterfaceHostInboundEffective` now CALLS
+  `InterfaceHostInboundOverride`. Single-sourced rather than bound with an
+  agreement test because a divergence would ALWAYS be a bug: the #6519 advisory
+  asks "does the interface's own stanza authorize this?" to decide what the
+  zone-level stanza is answerable for, and must be asking about the set the
+  resolver admits. Behaviour-preserving; no advisory or enforcement change.
+- **File(s)**: pkg/config/host_inbound_view.go,
+  pkg/config/host_inbound_dhcp_scope_6519.go
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #7304 follow-up — folded a post-merge hostile Codex review: closed
+    two vacuous-green holes in the #6419 assertions (errors.Is(nil,nil) sentinel
+    mutation; the production OnConfigReceived wiring was never bound), corrected
+    the backwards R1 comment, and recorded the tagged-epoch variant that refutes
+    the categorical #6419 close.
+  - **File(s)**: pkg/daemon/config_sync_test.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/sync_conn_gen.go, docs/session-sync-architecture.md
+
+## 2026-08-21 — #6547: pre-sign gate now verifies the image seal
+- **Timestamp**: 2026-08-21
+- **Action**: `scripts/image/validate.py` — the gate that runs strictly before
+  `sign_step` — asserted nothing about image sealing, so a clone-identity
+  regression (shared SSH host key / machine-id / SNMPv3 EngineID) shipped
+  SIGNED. Added `_image_seal_verdict` + `Harness.assert_image_sealed`, which
+  reads the exported qcow2 OFFLINE with libguestfs (the only place the property
+  is observable — first boot regenerates all of it) and fails closed on an
+  unobserved check or a missing tool. `bake.py` grew `SYSPREP_ENABLE_OPS` /
+  `SYSPREP_PURGE_PATHS` as the single source for the seal; a hermetic test binds
+  the gate's identity table to them, so dropping an `--enable` member reds.
+  Calibrated end-to-end on purpose-built unsealed/sealed qcow2 fixtures.
+- **File(s)**: scripts/image/validate.py, scripts/image/bake.py,
+  scripts/image/test_validate_image_seal_6547.py (new),
+  docs/image-validation.md, docs/install-images.md, _Log.md
 
 ## 2026-08-21 — #6460 DHCP-server host-inbound bypass advisory
 - **Timestamp**: 2026-08-21

@@ -223,6 +223,14 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 				"(topology changed). Refusing to bind to avoid hijacking the wrong NIC; re-pin "+
 				"the device-map.",
 				"logical", b.Entry.LogicalName, "pci", b.Entry.PCIAddr, "mac", b.Entry.MAC)
+		case b.Status == devicemap.BindRefusedDupName:
+			// #6546: more than one entry claims this logical name. Binding
+			// either one would rename a nondeterministically-chosen NIC to it
+			// and persist that choice in a .link file, so BOTH are refused.
+			slog.Error("device-map: entry REFUSED — more than one device-map entry claims this "+
+				"logical name, so binding either would rename an arbitrary NIC to it. Refusing "+
+				"both; remove the duplicate entry.",
+				"logical", b.Entry.LogicalName, "pci", b.Entry.PCIAddr, "mac", b.Entry.MAC)
 		}
 	}
 
@@ -409,10 +417,19 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 
 	finalByCurrent := make(map[string]string)
 	for _, b := range bindings {
-		// A REFUSED binding on ANY entry is a hard stop: a card was swapped
-		// at a pinned identity, so the operator's intent no longer matches
-		// the hardware — refuse while they are still connected.
-		if b.Status == devicemap.BindRefusedAmbig {
+		// A REFUSED binding on ANY entry is a hard stop: the operator's intent
+		// cannot be realized, so refuse while they are still connected. The
+		// two refusal reasons carry OPPOSITE remedies, so each gets its own
+		// message — telling an operator who typed a duplicate name to "re-pin
+		// the entry" sends them to a fix that changes nothing (#6546). Tested
+		// through Status.Refused() rather than a single sentinel so a future
+		// refusal reason cannot slip past this hard stop as a clean result.
+		if b.Status == devicemap.BindRefusedDupName {
+			return fmt.Sprintf("device-map entry %q refuses to bind: more than one entry claims "+
+				"this logical name, so binding either would rename an arbitrary NIC to it. "+
+				"Remove the duplicate entry before committing.", b.Entry.LogicalName)
+		}
+		if b.Status.Refused() {
 			return fmt.Sprintf("device-map entry %q refuses to bind: a different card is present "+
 				"at its pinned identity (topology changed). Re-pin the entry before committing.",
 				b.Entry.LogicalName)

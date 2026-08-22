@@ -36,6 +36,12 @@ const (
 	BindBoundViaMAC                    // PCI missed, perm-MAC matched (PCI moved)
 	BindUnbound                        // no present NIC matches the identity
 	BindRefusedAmbig                   // PCI matched but perm-MAC mismatched, or ambiguous MAC
+	// BindRefusedDupName: two or more entries resolved to the SAME logical
+	// name (#6546). It is its own status rather than BindRefusedAmbig because
+	// the operator-facing remedy is the opposite one: nothing is wrong with
+	// the hardware and re-pinning an identity fixes nothing — the MAP has two
+	// entries claiming one interface name and one of them must go.
+	BindRefusedDupName
 )
 
 func (s BindStatus) String() string {
@@ -50,15 +56,27 @@ func (s BindStatus) String() string {
 		return "UNBOUND (no NIC at identity)"
 	case BindRefusedAmbig:
 		return "REFUSED (topology changed — card swapped at this identity)"
+	case BindRefusedDupName:
+		return "REFUSED (logical name claimed by more than one device-map entry)"
 	default:
 		return "unknown"
 	}
 }
 
 // Decisive reports whether the status is a final outcome (bound or refused),
-// vs an unbound result that should fall through to the next key.
+// vs an unbound result that should fall through to the next key. Both refusal
+// statuses are decisive: a refusal means the pinned identity WAS matched, it
+// just must not be acted on.
 func (s BindStatus) Decisive() bool {
 	return s != BindUnbound
+}
+
+// Refused reports whether the status is one of the refusal variants. Callers
+// that hard-stop on a refusal must use this rather than comparing against a
+// single sentinel, so a new refusal reason cannot slip past a `== BindRefusedAmbig`
+// check and be silently treated as a clean result (#6546).
+func (s BindStatus) Refused() bool {
+	return s == BindRefusedAmbig || s == BindRefusedDupName
 }
 
 // Bound reports whether the status is one of the three bound variants.
@@ -184,13 +202,39 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 	// onto the NIC. Detect the collision here and REFUSE every entry that
 	// landed on a multiply-claimed NIC, rather than silently dropping one.
 	claims := make(map[string]int)
+	// #6546: the SYMMETRIC collision. The NIC-claim pass above catches two
+	// entries landing on one NIC; nothing caught two entries landing on one
+	// LOGICAL NAME, so a map with a duplicate name bound BOTH entries and the
+	// daemon's rename loop (device_map.go, keyed by CurrentNIC) then renamed
+	// two different NICs to the same final name — whichever the map iteration
+	// reached last won, durably, via the `.link` files it writes. On bare
+	// metal that can strand management or put a NIC in the wrong zone, and the
+	// SAME config can bind differently across boots.
+	//
+	// The count keys on the RESOLVED Linux name, not Entry.LogicalName: the
+	// Junos slash form and the kernel dash form (`ge-0/0/3` / `ge-0-0-3`) are
+	// two spellings of one interface, and before the companion fix in
+	// validateDeviceMapStrict the raw-string compare let that pair through the
+	// strict commit gate as well as the tolerant one.
+	nameClaims := make(map[string]int)
 	for i := range out {
 		if out[i].Status.Bound() {
 			claims[out[i].CurrentNIC]++
+			nameClaims[out[i].Logical]++
 		}
 	}
 	for i := range out {
-		if out[i].Status.Bound() && claims[out[i].CurrentNIC] > 1 {
+		if !out[i].Status.Bound() {
+			continue
+		}
+		// Duplicate-name is checked FIRST so the more precise refusal wins
+		// when an entry is caught by both passes: "re-pin the identity" is
+		// the wrong instruction for a map that names one interface twice.
+		if nameClaims[out[i].Logical] > 1 {
+			out[i].Status, out[i].CurrentNIC, out[i].Logical = BindRefusedDupName, "", ""
+			continue
+		}
+		if claims[out[i].CurrentNIC] > 1 {
 			out[i].Status, out[i].CurrentNIC, out[i].Logical = BindRefusedAmbig, "", ""
 		}
 	}
