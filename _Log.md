@@ -99356,3 +99356,19 @@ prose edit above them added. No diff falls in the new test body.
   peerSyncPolicy migration), userspace-dp/src/server/helpers/planning.rs,
   userspace-dp/src/server/handlers/{mod,forwarding,queue,binding}.rs,
   userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21 (revised)
+- **Action**: #7207 — the two control-plane residuals split out of #5250 by
+  PR #7195. A concurrent lane fixed six of the ten #5250 rows and closed the
+  cohort while this lane was mid-flight; this branch was rebuilt on the new
+  master to carry ONLY the two rows #7207 tracks. A6-b2 F3: emit NAT app port
+  ranges directly instead of materializing up to ~65k ints per application.
+  A7-b1 F4: make waitLocalFailoverCommitReady abortable on daemon stop and
+  capture the VRRP debounce closure's manager references.
+  Validation: `go build ./...` exit 0; `go test -count=1` green on
+  pkg/daemon, pkg/dataplane/userspace, pkg/refactoraudit; per-row revert
+  mutations red. `pkg/daemon/daemon_ha.go` is HA/failover code — `make
+  test-failover` is OWED and was not run by this lane.
+- **File(s)**: pkg/dataplane/userspace/nat.go, nat_source.go,
+  nat_destination.go, pkg/daemon/daemon_ha.go, docs/userspace-dnat-plan.md,
+  docs/refactoring-audit-current.txt, plus two new `*_5250_test.go` files.
