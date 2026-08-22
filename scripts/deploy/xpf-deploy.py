@@ -83,6 +83,32 @@ HARDWARE_BACKINGS = {"sriov", "physical", "pci"}
 SYS_NET = "/sys/class/net"
 
 
+
+@contextlib.contextmanager
+def _owner_only_umask():
+    """Force a 0077 umask for the duration of the block (#6764).
+
+    The ISO tools create the output file themselves, so its mode comes from the
+    process umask at creation time — typically 0022, i.e. 0644 world-readable.
+    The chmod that follows the build only narrows it AFTERWARDS, and the file
+    already contains xpf.conf from the moment the tool writes it, so every
+    co-located UID has the whole build's duration to `isoinfo -x /xpf.conf` the
+    day-0 secrets out.
+
+    Setting the umask around the call closes the window at CREATION rather than
+    after it, and it survives the tool unlinking and recreating its output —
+    which a pre-created 0600 file would not. The chmod afterwards is kept as a
+    belt: it also fixes an output file that already existed with a wider mode.
+
+    umask is process-global and not thread-safe; these scripts are
+    single-threaded, and the block is a single subprocess call.
+    """
+    old = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
 def backing_sort_key(backing):
     """Guest enumeration sort key for a backing, mirroring the sk=0
     (virtio) / sk=1 (hardware) tiebreaker in enumeratePCINICs()
@@ -476,7 +502,8 @@ def build_config_drive(ap, runner):
                     "-J", "-r", "-o", iso, stage]
         else:
             argv = [mkiso, "-quiet", "-V", "xpf-config", "-J", "-r", "-o", iso, stage]
-        run_capture(argv)   # die with the mkiso error, not a bare traceback (H-21)
+        with _owner_only_umask():
+            run_capture(argv)   # die with the mkiso error, not a bare traceback (H-21)
         # The ISO embeds xpf.conf — the most secret-bearing day-0 artifact
         # (root-authentication hash, IKE PSK, SNMP community, DDNS tokens).
         # xorriso/genisoimage writes it under the process umask (~0022 ->
