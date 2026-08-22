@@ -102386,3 +102386,10 @@ prose edit above them added. No diff falls in the new test body.
     pkg/dataplane/userspace/{protocol_status.go,protocol_test.go},
     pkg/api/{metrics.go,metrics_userspace.go,metrics_descriptors_userspace_session.go,
     metrics_descriptor_coverage_test.go,metrics_test.go}
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6646 — the reconstruction the issue reported was already replaced
+    by single-sourcing on admitFrame (verified: readLoop calls it, and severing
+    controlLinkAuthKey now REDs). Residual closed: readLoop's CALL to admitFrame
+    was still unbound — severing it left every 5086 test green.
+  - **File(s)**: pkg/cluster/heartbeat_replay_restart_5086_test.go

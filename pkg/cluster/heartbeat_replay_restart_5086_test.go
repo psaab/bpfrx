@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -279,5 +281,84 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 	// Memory bound: one fixed ring per Manager regardless of restart count.
 	if got := len(m.hbAuth.replay.marks); got != heartbeatReplaySessions {
 		t.Errorf("replay ring = %d marks, want the fixed %d", got, heartbeatReplaySessions)
+	}
+}
+
+// TestReadLoopActuallyGatesEveryFrame_5086 binds readLoop's CALL to admitFrame,
+// which the tests above do not.
+//
+// Those tests drive `admitFrame` directly. That is the right shape for the
+// gate's LOGIC — it is the single implementation readLoop also uses, so the
+// accept-side consequences are production's rather than a copy. But it leaves
+// one thing unbound: whether readLoop still routes frames through it at all.
+//
+// Measured, not assumed. Replacing readLoop's
+//
+//	if !r.admitFrame(buf[:n], pkt) {
+//
+// with `if false {` — i.e. a receive path that authenticates nothing and admits
+// every datagram on the wire, i.e. the whole #4107/#5086 guard bypassed — left
+// every 5086 test GREEN, because none of them reaches readLoop.
+//
+// The check is a source scan because the alternative is worse here. Driving the
+// real loop needs a UDP socket plus the two goroutines start() spawns, and the
+// assertions would then be "did lastSeen move / not move" behind a settle
+// deadline — timing in a file that is otherwise fully deterministic. A flaky
+// gate on an anti-replay guard is a gate people learn to re-run.
+//
+// Comment lines are stripped before scanning. Here that is PRECAUTIONARY
+// rather than load-bearing, and the distinction is worth stating: the scan
+// reads heartbeat.go while the comment quoting the call lives in this test
+// file, so today no comment can satisfy it — verified by severing the call
+// with stripping disabled, which still failed. The #6641 gate scanned the same
+// file its own doc comment lived in and DID go green off its explanation, so
+// the habit is kept here against a future comment in heartbeat.go that quotes
+// the call.
+//
+// FAIL-ON-REVERT: delete or bypass the admitFrame call in readLoop.
+func TestReadLoopActuallyGatesEveryFrame_5086(t *testing.T) {
+	src, err := os.ReadFile("heartbeat.go")
+	if err != nil {
+		t.Fatalf("read heartbeat.go: %v", err)
+	}
+
+	var code []string
+	for _, line := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		code = append(code, line)
+	}
+
+	start := -1
+	for i, line := range code {
+		if strings.HasPrefix(line, "func (r *heartbeatReceiver) readLoop()") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatal("readLoop not found in heartbeat.go — this gate is bound to it by name " +
+			"and must be re-pointed if it is renamed")
+	}
+	end := len(code)
+	for i := start + 1; i < len(code); i++ {
+		if strings.HasPrefix(code[i], "func ") {
+			end = i
+			break
+		}
+	}
+	body := strings.Join(code[start:end], "\n")
+
+	if len(body) < 200 {
+		t.Fatalf("readLoop body scanned to only %d bytes — the scan has rotted and this gate "+
+			"would pass vacuously", len(body))
+	}
+	if !strings.Contains(body, "r.admitFrame(") {
+		t.Fatal("#5086/#6646: readLoop does not call r.admitFrame — every datagram on the wire " +
+			"would be admitted without authentication or replay checking, and the 5086 tests " +
+			"would NOT notice, because they drive admitFrame directly rather than through the " +
+			"receive loop.\n\nThe gate's logic and the gate's INSTALLATION are two properties; " +
+			"this test owns the second.")
 	}
 }
