@@ -149,7 +149,21 @@ test-race-dp:
 # A non-zero cargo exit propagates: this is a plain recipe line, so Make
 # fails the target on any command that exits non-zero (no `-` prefix / no
 # `|| true` swallows the failure).
+#
+# #6610: a `cargo check --benches` leg runs FIRST. Benches are still never
+# RUN here (criterion's harness = false rejects --test-threads, and the
+# numbers are for a human), but they must at least COMPILE, and compiling
+# them is what evaluates their `const _: () = assert!(...)` invariants.
+# That distinction is the whole point: #6610 was a runtime `attempt to add
+# with overflow` in benches/snat_allocator.rs that a compile-only check
+# could NOT have caught, so the fix made the invariant it violated a CONST
+# assert. A compile check now catches a reintroduction of that class,
+# rather than only catching a bench that stopped compiling.
+#
+# Cheap: cold ~2.5 min (shared with the --release artifacts below only
+# partially, since this is a dev-profile check), warm ~0s.
 test-rust:
+	$(CARGO) check --manifest-path userspace-dp/Cargo.toml --benches
 	$(CARGO) test --manifest-path userspace-dp/Cargo.toml --release \
 		--bins --tests -- --test-threads=1
 
