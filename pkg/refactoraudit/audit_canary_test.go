@@ -337,6 +337,33 @@ func TestHeatmapArtifactWellFormed(t *testing.T) {
 		}
 	}
 
+	// #6627: each path appears AT MOST ONCE.
+	//
+	// A duplicated row passed every other check here, which is why it needed
+	// its own. The staleness comparison builds a tierByPath map, so a second
+	// row for the same path collapses onto the first and compares equal; the
+	// order check below permits equal-adjacent rows, so a duplicate does not
+	// break ordering; and the band check above passes because the duplicate
+	// carries the same valid LOC and tier.
+	//
+	// This is the existence-vs-coverage shape: every check asked "is there a
+	// row for this path", none asked "how many". The generator cannot produce
+	// a duplicate, so this is a hand-edit detector — the same class the
+	// surrounding tests already cover for retagging, deletion, phantom rows
+	// and reordering, and the one gap in that set.
+	seenPath := make(map[string]int, len(rows))
+	for i, r := range rows {
+		if first, dup := seenPath[r.path]; dup {
+			t.Errorf("#6627: path %s appears twice in the committed heatmap (rows %d and %d) — "+
+				"a duplicate row is invisible to every other check here (tierByPath collapses it, "+
+				"equal-adjacent rows are validly ordered, and the band check sees the same valid "+
+				"LOC and tier), so it must be rejected explicitly",
+				r.path, first+1, i+1)
+			continue
+		}
+		seenPath[r.path] = i
+	}
+
 	// Generator order: LOC descending, path ascending on ties
 	// (LC_ALL=C sort -k2,2nr -k3,3 in scripts/refactoring-audit.sh).
 	for i := 1; i < len(rows); i++ {
@@ -528,5 +555,61 @@ func TestInlineTestBlockNotStripped(t *testing.T) {
 	if got != want {
 		t.Fatalf("audit_loc stripped or miscounted an inline-test fixture: got %q, want %q\n"+
 			"the measurement must count RAW LOC so a stripper cannot erase production code following a test block", got, want)
+	}
+}
+
+// TestMakefileRunsAuditPackageUncached binds the #6626 fix to the wiring that
+// makes it live.
+//
+// The hard gate measures the branch's own diff by shelling out to
+// scripts/refactoring-audit-touched.sh. Neither the working tree nor that
+// script is a `go test` cache input, so a REAL threshold crossing changes
+// nothing the cache hashes and a plain `go test ./...` returns "ok (cached)" —
+// the gate passes without running. Demonstrated on this package: a new
+// 2004-LOC production file (a genuine [REFACTOR] crossing) returned
+// "ok (cached)" and FAILED under -count=1.
+//
+// Nothing inside Go can detect that from within a cached run, so the fix lives
+// in the Makefile and this test guards the Makefile. Without it, deleting the
+// invocation silently restores a gate that can pass without running — and every
+// test in this package would still be green, because they would simply be
+// served from cache.
+//
+// FAIL-ON-REVERT: drop `-count=1` from the pkg/refactoraudit invocation in the
+// test-go target, or delete the invocation.
+func TestMakefileRunsAuditPackageUncached(t *testing.T) {
+	root := repoRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	mk := string(b)
+
+	// The invocation must exist AND carry -count=1. Matching the two together
+	// is the point: `go test ./pkg/refactoraudit/` without -count=1 is the
+	// cached-pass bug wearing the shape of a fix.
+	want := "$(GO) test -count=1 ./pkg/refactoraudit/"
+	if !strings.Contains(mk, want) {
+		t.Fatalf("#6626: the Makefile must run this package UNCACHED — expected a line "+
+			"containing %q in the test-go target.\n\nWithout it, a real threshold crossing "+
+			"returns \"ok (cached)\" on the path CI and developers actually take, so the "+
+			"modularity gate passes without ever running. Every test in this package stays "+
+			"green in that state, which is exactly why this has to be checked here.", want)
+	}
+
+	// And it must be reachable from test-go, not stranded in some unused target.
+	idx := strings.Index(mk, "test-go:")
+	if idx < 0 {
+		t.Fatal("#6626: no test-go target found in the Makefile — this guard is bound to it " +
+			"by name and must be re-pointed if the target is renamed")
+	}
+	rest := mk[idx:]
+	if end := strings.Index(rest, "\n\n"); end > 0 {
+		rest = rest[:end]
+	}
+	if !strings.Contains(rest, want) {
+		t.Errorf("#6626: the uncached pkg/refactoraudit invocation exists but is NOT inside the "+
+			"test-go target, so `make test-go` — the path CI and developers take — would still "+
+			"serve this package from cache.\n\ntest-go target body:\n%s", rest)
 	}
 }

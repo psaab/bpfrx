@@ -102192,3 +102192,10 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6626 + #6627 — the heatmap hard gate could return "ok (cached)"
+    on a real threshold crossing (working tree is not a go test cache input);
+    make test-go now runs pkg/refactoraudit uncached, guarded by a Makefile
+    wiring test. #6627: a duplicated heatmap row is now rejected explicitly.
+  - **File(s)**: Makefile, pkg/refactoraudit/audit_canary_test.go

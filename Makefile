@@ -88,6 +88,29 @@ test-go: test-race-dp
 	# code); widen to ./... once those are resolved.
 	$(GO) vet ./pkg/flowexport/...
 	$(GO) test ./...
+	# #6626: pkg/refactoraudit MUST run uncached.
+	#
+	# Its hard gate (TestTouchedFileCrossedModularityThreshold) measures the
+	# branch's own diff against its merge base by shelling out to
+	# scripts/refactoring-audit-touched.sh. Neither the working tree nor that
+	# script is a `go test` cache input, so a REAL threshold crossing changes
+	# nothing the cache hashes and `./...` above returns "ok (cached)" — the
+	# gate passes without running. Reproduced: a new 2004-LOC production file
+	# (a genuine [REFACTOR] crossing, exactly the event this gate exists to
+	# catch) returned "ok (cached)" and FAILED under -count=1.
+	#
+	# #6623 widened the window rather than creating it: under the old
+	# byte-exact artifact compare the tracked artifact churned constantly and
+	# busted the cache by accident, so a stale pass survived one commit instead
+	# of many.
+	#
+	# Scoped to this package, not the whole suite: measured at ~10.7s uncached
+	# against ~0.1s cached, which is noise on a suite that already runs
+	# minutes, whereas -count=1 on ./... would forfeit caching everywhere.
+	# Deliberately NOT narrowed further with -run: a name predicate silently
+	# stops covering the next tree-reading test added here, which is the
+	# #6743 r2-N3 lesson recorded in this package's own doc.go.
+	$(GO) test -count=1 ./pkg/refactoraudit/
 
 # #2114 scoped race gate: the dataplane-cell publication races
 # (bootstrap-exit clear vs sampler/watcher/confirm-timer readers) and the
