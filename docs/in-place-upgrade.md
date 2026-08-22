@@ -94,6 +94,39 @@ drain paths (#5845).
   DB, so a later rollback could not restore the config. A `dirSize`
   failure while sizing a PRESENT DB (e.g. EIO on a subfile) is likewise
   surfaced, never silently sized as 0.
+
+  **A RESUMED cut RE-TAKES this snapshot (#6556).** PREFLIGHT, COPY and
+  VERIFY are pure — the daemon stays LIVE and accepting commits across
+  all three — and the host-wide upgrade lock is NOT held across an
+  interruption, so the operator has no signal that a cut is pending. A
+  resume that reused the snapshot taken at the ORIGINAL preflight meant a
+  later auto-rollback silently reverted every commit made in the
+  interruption window. This is the same argument the VERIFY bullet below
+  already makes for its own sibling case (#1967/#1981), with a crash in
+  place of a verify failure.
+
+  The re-snapshot is FLOORED at STOPPED, and that floor is load-bearing
+  rather than cautious. From STOPPED the daemon is down, so no commit can
+  have landed and there is nothing to re-capture; and re-snapshotting at
+  FLIPPED would be actively WRONG — `versions/current` already points at
+  the new binary, which may have started and migrated the DB envelope, so
+  the "pre-upgrade" snapshot would capture POST-upgrade state and defeat
+  rollback entirely. The exposed span is exactly
+  `{PREFLIGHT, COPIED, VERIFIED}`.
+
+  The snapshot writer (`snapshotConfigDB`, extracted from `preflight` so
+  the resume path shares one implementation) also changed its ORDERING
+  for this: the replacement is made durable in `.partial` FIRST and only
+  then does the previous snapshot give way. The pre-#6556 code removed
+  the live snapshot before copying, which is harmless on a first
+  preflight (nothing to lose) and not harmless on a re-snapshot — a crash
+  mid-copy would leave the journal naming a directory that no longer
+  exists, so the rollback fails at restore time instead of falling back
+  on the older snapshot. It re-classifies the DB directory rather than
+  trusting the original preflight's verdict: a DB that is GONE by resume
+  time clears `DBSnapshotPath`/`AdvancedStateFloor` **and removes the
+  stale snapshot dir**, so a rollback cannot restore a config DB over a
+  root the operator deliberately emptied.
 - **COPY** — `staged/` → `.<ver>.partial/` + checksum + atomic rename to
   `versions/<ver>/`. A crash never leaves a half-populated version dir;
   stray `.partial` dirs are swept on re-run, and the sweep fsyncs the
