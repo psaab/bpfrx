@@ -73,7 +73,18 @@
   it applies two unconditional guards that are NOT the Junos knob —
   transit drops a bare RST/FIN while preserving mid-stream ACK pickup
   (`strict_syn_check_drops_new_flow`, #4400), and host-inbound seeds a
-  session only off a SYN (#4539). Re-swept after: the only remaining
+  session only off a SYN (#4539). The same sweep then found a THIRD
+  survivor in the adjacent No-SYN-Check row — same phrase, same claim
+  family — also corrected: the knob is inert, but "so this opt-out is
+  inert" overstated it, since mid-stream pickup is already the transit
+  default and host-inbound the opt-out cannot reach the `has_syn` gate
+  at all. NOT corrected, and flagged rather than guessed: the
+  No-SYN-Check in Tunnel row claims "no tunnel-decap session-create
+  signal exists on the userspace path", which
+  `userspace-dp/src/afxdp/tunnel.rs:653` ("Locally decapsulated tunnel
+  session") makes doubtful; establishing it needs a real pass over the
+  tunnel path, so it is left standing and called out rather than
+  rewritten on a guess. Re-swept after: the only remaining
   occurrences are in `_Log.md` and the generated
   `docs/issues/pr-history.md`, both append-only historical records of
   what was written at the time, not statements of current behaviour.
