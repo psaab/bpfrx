@@ -641,3 +641,44 @@ fn secrets_recovers_poisoned_secret_lock_6422() {
         "the cookie-reply path must still function after recovery"
     );
 }
+
+/// #5191 (A1-b9-F5): a CookieReply whose RESERVED bytes are nonzero is NOT
+/// canonical. WG transmits `message_type` as a little-endian u32 and kernel
+/// WG / wireguard-go compare all four bytes, so accepting a reply on the low
+/// byte alone was a parser differential: xpf would consume (and act on) a
+/// cookie challenge that every other implementation drops. The type-word check
+/// is shared with the handshake parser (`handshake::is_canonical_type`), so
+/// the two cannot drift.
+///
+/// FAIL-ON-REVERT: compare `reply[0] != WG_TYPE_COOKIE` again and each
+/// nonzero-reserved variant below decrypts successfully.
+#[test]
+fn cookie_reply_rejects_noncanonical_type_word_5191() {
+    let our_pub = [0x55u8; 32];
+    let cc = CookieChecker::new(&our_pub);
+    let now = 10_000_000_000;
+    let peer = src(51820);
+    let init = valid_mac1_init(&our_pub, 11);
+    let mut reply = [0u8; 64];
+    cc.build_cookie_reply(&init, peer, now, &mut reply).unwrap();
+    let aad = &init[M1_MAC1..M1_MAC2];
+
+    assert!(
+        CookieChecker::decrypt_cookie_reply(&reply, &our_pub, aad).is_some(),
+        "the canonical reply must still decrypt"
+    );
+
+    for byte in 1..4usize {
+        let mut tampered = reply;
+        tampered[byte] = 0x01;
+        assert!(
+            CookieChecker::decrypt_cookie_reply(&tampered, &our_pub, aad).is_none(),
+            "reserved byte {byte} = 0x01 was accepted — the type word is not compared as a full u32"
+        );
+    }
+
+    // The low byte still gates on its own.
+    let mut wrong_type = reply;
+    wrong_type[0] = WG_TYPE_COOKIE + 1;
+    assert!(CookieChecker::decrypt_cookie_reply(&wrong_type, &our_pub, aad).is_none());
+}

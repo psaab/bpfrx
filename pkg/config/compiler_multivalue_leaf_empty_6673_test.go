@@ -305,25 +305,71 @@ security { nat { static { rule-set rs1 { from zone untrust;
 			`set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.1/32`), "192.0.2.1/32"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, path := range []struct {
-				name    string
-				compile func(*ConfigTree) (*Config, error)
-			}{
-				{"strict", CompileConfig},
-				{"tolerant", CompileConfigLenient},
-			} {
-				cfg, err := path.compile(tc.tree)
+			// #7216 CONTRACT CHANGE, stated at the site it changes. A blank
+			// SELECTION (wantMatch == "") is now refused at strict commit: the
+			// rule lowers ExternalIP as "" and the Rust parse_nat_prefix drops
+			// the WHOLE mapping, so it was a rule that did not exist at runtime
+			// committing clean.
+			//
+			// What #6673 asserted here is NOT retired by that — it is bound
+			// more precisely. #6673's property is that an empty slot is a
+			// SELECTION and not a second prefix, i.e. that the CARDINALITY gate
+			// must not fire on these shapes. "Compiles with no error at all"
+			// was how that got expressed only because no other gate looked at
+			// the blank. So the strict assertion is now "rejected by #7216 and
+			// NOT by the cardinality gate", which is strictly sharper: it fails
+			// if the cardinality gate ever starts counting the blank.
+			//
+			// The DRIFT invariant this test exists for — Match must always
+			// appear in MatchAddresses — is asserted on the tolerant path,
+			// where every shape still compiles, so it stays bound on every
+			// fixture rather than only on the ones that still commit.
+			assertCardinalityGateSilent6673 := func(where string, err error) {
+				t.Helper()
+				if err == nil {
+					return
+				}
+				if strings.Contains(err.Error(), "declares") &&
+					strings.Contains(err.Error(), "prefixes") {
+					t.Fatalf("%s: the CARDINALITY gate fired on a shape that "+
+						"authors at most ONE prefix — an empty slot is a "+
+						"selection, not a second prefix (#6673):\n  %v", where, err)
+				}
+				if !strings.Contains(err.Error(), "#7216") {
+					t.Fatalf("%s: rejected by neither the #7216 blank-selection "+
+						"gate nor anything expected:\n  %v", where, err)
+				}
+			}
+			if _, err := CompileConfig(tc.tree); err != nil {
+				assertCardinalityGateSilent6673("strict", err)
+				if tc.wantMatch != "" {
+					t.Fatalf("strict compile rejected a shape whose SELECTED "+
+						"prefix is %q, not blank — #7216 must fire only on an "+
+						"empty selection:\n  %v", tc.wantMatch, err)
+				}
+			} else if tc.wantMatch == "" {
+				t.Fatalf("a rule whose selected `match destination-address` is "+
+					"EMPTY committed clean. It lowers ExternalIP as \"\" and the "+
+					"Rust parse_nat_prefix drops the WHOLE mapping, so the "+
+					"operator authored a rule that does not exist at runtime "+
+					"(#7216)")
+			}
+
+			{
+				const path = "tolerant"
+				cfg, err := CompileConfigLenient(tc.tree)
 				if err != nil {
-					t.Fatalf("%s compile: %v (none of these shapes authors two "+
-						"prefixes — an empty slot is a selection, not a second "+
-						"prefix — so the cardinality gate must not fire)",
-						path.name, err)
+					t.Fatalf("%s compile: %v (the tolerant path must keep BOOTING "+
+						"a config carrying a blanked prefix — #1960 no-brick — and "+
+						"the cardinality gate must not fire on it either, since an "+
+						"empty slot is a selection, not a second prefix)",
+						path, err)
 				}
 				rule := cfg.Security.NAT.Static[0].Rules[0]
 				if rule.Match != tc.wantMatch {
 					t.Fatalf("%s: Match = %q, want %q — this is the only value "+
 						"lowered to the dataplane (ExternalIP)",
-						path.name, rule.Match, tc.wantMatch)
+						path, rule.Match, tc.wantMatch)
 				}
 				if !containsValue6673(rule.MatchAddresses, rule.Match) {
 					t.Fatalf("%s: DRIFT — Match = %q is absent from "+
@@ -332,7 +378,7 @@ security { nat { static { rule-set rs1 { from zone untrust;
 						"so a list without the installed value makes the "+
 						"cardinality gate name a prefix that is not in effect "+
 						"and makes the prefix loops 'cover' a value never "+
-						"selected", path.name, rule.Match, rule.MatchAddresses)
+						"selected", path, rule.Match, rule.MatchAddresses)
 				}
 			}
 		})
@@ -340,18 +386,44 @@ security { nat { static { rule-set rs1 { from zone untrust;
 }
 
 // TestStaticNATMatch6673EmptySlotIsNotASecondPrefix pins that keeping empty
-// values in the list did not invent a rejection. The cardinality gate counts
-// only non-empty values, so a config that blanks a prefix still commits exactly
-// as it did before #6659 — while a genuine two-prefix list is still rejected.
+// values in the list did not make the CARDINALITY gate invent a rejection. That
+// gate counts only non-empty values, so a config that blanks a prefix must
+// never be reported as declaring two of them — while a genuine two-prefix list
+// is still rejected.
+//
+// #7216 CONTRACT CHANGE: a blanked prefix no longer COMMITS. It lowers
+// ExternalIP as "" and the Rust parse_nat_prefix drops the whole mapping, so it
+// is refused at strict commit by the blank-selection gate. #6673's property is
+// untouched and is now asserted directly rather than through the proxy of "no
+// error at all": the rejection must come from #7216 and must NOT be the
+// cardinality gate's "declares N prefixes". The tolerant path still compiles it
+// (#1960 no-brick), which is asserted here too so the shape keeps a live
+// compile on some path.
 func TestStaticNATMatch6673EmptySlotIsNotASecondPrefix(t *testing.T) {
 	blanked := setTree6659(t,
 		`set security nat static rule-set rs1 from zone untrust`,
 		`set security nat static rule-set rs1 rule r1 match destination-address 192.0.2.1/32`,
 		`set security nat static rule-set rs1 rule r1 match destination-address [ ]`,
 		`set security nat static rule-set rs1 rule r1 then static-nat prefix 10.0.0.1/32`)
-	if _, err := CompileConfig(blanked); err != nil {
-		t.Fatalf("strict compile rejected a BLANKED single prefix: %v — an "+
-			"empty slot is a selection, not a second authored prefix", err)
+	if _, err := CompileConfig(blanked); err == nil {
+		t.Fatal("strict compile ACCEPTED a rule whose selected `match " +
+			"destination-address` is blank; the dataplane drops the whole " +
+			"mapping, so the operator authored a rule that does not exist at " +
+			"runtime (#7216)")
+	} else {
+		if strings.Contains(err.Error(), "declares") && strings.Contains(err.Error(), "prefixes") {
+			t.Fatalf("the CARDINALITY gate fired on a BLANKED single prefix — an "+
+				"empty slot is a selection, not a second authored prefix "+
+				"(#6673):\n  %v", err)
+		}
+		if !strings.Contains(err.Error(), "#7216") {
+			t.Fatalf("a blanked single prefix must be refused by the #7216 "+
+				"blank-selection gate, not by something else:\n  %v", err)
+		}
+	}
+	if _, err := CompileConfigLenient(blanked); err != nil {
+		t.Fatalf("the TOLERANT path must still compile a blanked prefix — a "+
+			"config an older binary committed has to keep booting (#1960): %v", err)
 	}
 
 	twoReal := setTree6659(t,
@@ -1219,37 +1291,58 @@ func TestProxyARPAddresses6673MalformedRangeInstallsExactlyWhatMasterInstalled(t
 		// head's intended set, not a parity oracle — do not "restore" them to
 		// master's single address.
 		wantInstalled []string
+		// wantStrictReject is the #6714 axis added on top of #6673's parity
+		// corpus: TRUE for every row whose `to` survived both range branches.
+		//
+		// #6673 asserted that strict must ACCEPT every row here, and the reason
+		// it gave was specific: "the keyword must never reach
+		// validateProxyARPAddressesStrict, or the widened read invents a commit
+		// rejection master never made". That guarded against an ACCIDENTAL
+		// rejection — the `to` token materialising as the address "to/32" and
+		// failing netip.ParsePrefix. #6714 adds a DELIBERATE one at the
+		// STATEMENT level: the compiler installs the first value of such a
+		// statement and discards the rest, and until now said nothing about it
+		// on any surface. Both claims are asserted below and they are different
+		// claims — the row must reject for the STATEMENT reason, and no
+		// compiled address may be the bare keyword.
+		//
+		// The parity criterion this test exists for is untouched: every `want`
+		// and `wantInstalled` below is byte-identical to #6673's, and both are
+		// now asserted on the TOLERANT compile, which is the path an
+		// already-persisted config boots through (#1960 no-brick). What a box
+		// installs does not move; what an operator can commit does.
+		wantStrictReject bool
 	}{
 		{"bracket leading with the keyword", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; } } } }`,
-			nil, nil},
+			nil, nil, true},
 		{"block with a keyword-only child", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { to; 192.0.2.5; } } } } }`,
-			nil, nil},
+			nil, nil, true},
 		{"keyword-only block", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { to; } } } } }`,
-			nil, nil},
+			nil, nil, true},
 		{"bare keyword", `
 security { nat { proxy-arp { interface ge-0-0-0 { address to; } } } }`,
-			nil, nil},
+			nil, nil, true},
 		{"keyword ahead of a CIDR", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.0/30 ]; } } } }`,
-			nil, nil},
+			nil, nil, true},
 		{"keyword past the range slot", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 to 192.0.2.9 ]; } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"keyword further past the range slot", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 192.0.2.3 to 192.0.2.9 ]; } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"dangling trailing keyword still installs the low endpoint", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 to ]; } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"block address then dangling keyword still installs", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.5; to; } } } } }`,
-			[]string{"192.0.2.5/32"}, []string{"192.0.2.5/32"}},
+			[]string{"192.0.2.5/32"}, []string{"192.0.2.5/32"}, true},
 		{"well-formed sibling beside a malformed range", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; address 192.0.2.9; } } } }`,
-			[]string{"192.0.2.9/32"}, []string{"192.0.2.9/32"}},
+			[]string{"192.0.2.9/32"}, []string{"192.0.2.9/32"}, true},
 		// --- BLOCK-CHILD placements (round 7) -------------------------------
 		//
 		// In the hierarchical BLOCK form a range rides on a child's OWN Keys —
@@ -1262,13 +1355,13 @@ security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; addr
 		// origin/master through the installer's netip.ParsePrefix gate.
 		{"block child carries the range on its own Keys", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to 192.0.2.9; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"block child range with no high endpoint", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"two block-child ranges", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.2 to 192.0.2.9; 198.51.100.2 to 198.51.100.9; } } } } }`,
-			[]string{"192.0.2.2/32"}, []string{"192.0.2.2/32"}},
+			[]string{"192.0.2.2/32"}, []string{"192.0.2.2/32"}, true},
 		// The per-STATEMENT veto: 198.51.100.1 is well-formed but shares the
 		// statement with a broken range, so it is dropped with it — which is
 		// what master installs, and what the bracket form above already does.
@@ -1276,30 +1369,30 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.2 to 192.0.2
 		// ARP for.
 		{"block-child range beside well-formed siblings", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to 192.0.2.9; 198.51.100.1; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"IPv6 block-child range", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 2001:db8::1; 2001:db8::2 to 2001:db8::9; } } } } }`,
-			[]string{"2001:db8::1/32"}, []string{"2001:db8::1/32"}},
+			[]string{"2001:db8::1/32"}, []string{"2001:db8::1/32"}, true},
 		// The `to` at a child's THIRD key, and under a NESTED child — two more
 		// positions an enumeration would have to know about in advance. The
 		// detector walks the statement's whole token stream instead, so depth
 		// and index are irrelevant to it.
 		{"keyword at a block child's third key", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 192.0.2.2 to 192.0.2.9; 198.51.100.1; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"keyword nested one level below a block child", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 { to 192.0.2.9; } 198.51.100.1; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		{"keyword nested two levels below a block child", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 { 192.0.2.5 { to 192.0.2.9; } } 198.51.100.1; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		// Pre-existing on BOTH trees and deliberately left alone: a lone
 		// block-form range does not EXPAND. Master compiles the low endpoint
 		// only, and so does this tree — making it expand would be a change to
 		// range handling, not the install-parity fix this arm is.
 		{"lone block-child range does not expand (PRE-EXISTING, both trees)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 to 192.0.2.9; } } } } }`,
-			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
 		// CONTROL: a `to` leading a block child IS a well-formed set-syntax
 		// range (FindChild("to") consumes it), so the caller's second range
 		// branch expands it BEFORE the value reader runs. The veto must not
@@ -1307,30 +1400,61 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 to 192.0.2
 		{"block child leading with the keyword still expands (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; to 192.0.2.3; } } } } }`,
 			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"},
-			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}},
+			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}, false},
 		{"well-formed range still expands (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address 192.0.2.1 to 192.0.2.3; } } } }`,
 			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"},
-			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}},
+			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}, false},
 		{"plain list keeps the #6659 widening (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1 192.0.2.2 ]; } } } }`,
 			[]string{"192.0.2.1/32", "192.0.2.2/32"},
-			[]string{"192.0.2.1/32", "192.0.2.2/32"}},
+			[]string{"192.0.2.1/32", "192.0.2.2/32"}, false},
 		{"plain block keeps the #6659 widening (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2; } } } } }`,
 			[]string{"192.0.2.1/32", "192.0.2.2/32"},
-			[]string{"192.0.2.1/32", "192.0.2.2/32"}},
+			[]string{"192.0.2.1/32", "192.0.2.2/32"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// STRICT: the keyword must never reach
-			// validateProxyARPAddressesStrict, or the widened read invents a
-			// commit rejection master never made.
-			cfg, err := CompileConfig(hierTree6659(t, tc.cfg))
-			if err != nil {
+			// STRICT verdict. Two separate claims, both required:
+			//
+			//  1. #6714: a statement whose `to` neither range branch consumed
+			//     must be REJECTED at commit rather than silently installing
+			//     its first value. A CONTROL row must still be accepted, which
+			//     is what proves the gate fires on the fall-through and not on
+			//     "the config mentions a range".
+			//  2. #6673: the rejection must be the STATEMENT-level one, never
+			//     an address-parse failure on a materialised "to/32". The `to`
+			//     token is grammar, not an address; if it ever reaches
+			//     Addresses the message below changes and this row fails.
+			_, strictErr := CompileConfig(hierTree6659(t, tc.cfg))
+			switch {
+			case tc.wantStrictReject && strictErr == nil:
+				t.Fatalf("strict compile ACCEPTED a statement whose `to` fell " +
+					"through both range branches; the compiler installs only " +
+					"its first value, so accepting it is the silent drop #6714 " +
+					"exists to close")
+			case !tc.wantStrictReject && strictErr != nil:
 				t.Fatalf("strict compile rejected a config master accepted: %v\n"+
 					"the `to` token is grammar, not an address; letting it "+
 					"materialise as \"to/32\" makes the proxy-ARP validator "+
-					"reject it", err)
+					"reject it", strictErr)
+			case tc.wantStrictReject:
+				if msg := strictErr.Error(); !strings.Contains(msg, "is not a valid address statement") {
+					t.Fatalf("strict rejection came from the wrong gate: %v\n"+
+						"expected the #6714 STATEMENT-level message; an "+
+						"address-parse rejection here means the `to` keyword "+
+						"materialised as an address (the #6673 regression)", strictErr)
+				}
+			}
+
+			// The parity assertions run on the TOLERANT path — the one an
+			// already-persisted config boots through, and the one whose
+			// installed set #6673 measured against origin/master. The compile
+			// stage is shared, so these are the same compiled Addresses the
+			// strict path produced before this gate existed.
+			cfg, err := CompileConfigLenient(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("tolerant compile failed: %v", err)
 			}
 			var got []string
 			for _, e := range cfg.Security.NAT.ProxyARP {
@@ -1843,25 +1967,38 @@ security { nat { static { rule-set rs1 { from zone untrust;
 		// dup is the spelling under test; single is the same configuration with
 		// the repetition removed. Both must compile, to the SAME rule.
 		dup, single, then string
+		// tolerant routes the cell through CompileConfigLenient because its
+		// SELECTED prefix is an authored blank, which strict commit refuses
+		// since #7216. The dedupe property under test is unchanged; only the
+		// path on which it is observable is.
+		tolerant bool
 	}{
 		{"duplicate sibling statements",
 			`match { destination-address 192.0.2.1/32; destination-address 192.0.2.1/32; }`,
-			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32"},
+			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32", false},
 		{"duplicate inside one bracket",
 			`match { destination-address [ 192.0.2.1/32 192.0.2.1/32 ]; }`,
-			`match { destination-address [ 192.0.2.1/32 ]; }`, "10.0.0.1/32"},
+			`match { destination-address [ 192.0.2.1/32 ]; }`, "10.0.0.1/32", false},
 		{"duplicate across two match stanzas",
 			`match { destination-address 192.0.2.1/32; }
              match { destination-address 192.0.2.1/32; }`,
-			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32"},
+			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32", false},
 		{"triplicate",
 			`match { destination-address [ 192.0.2.1/32 192.0.2.1/32 192.0.2.1/32 ]; }`,
-			`match { destination-address [ 192.0.2.1/32 ]; }`, "10.0.0.1/32"},
+			`match { destination-address [ 192.0.2.1/32 ]; }`, "10.0.0.1/32", false},
+		// #7216: both spellings of this cell end on an authored blank, so the
+		// SELECTED prefix is empty and strict commit now refuses BOTH. The cell
+		// is not deleted — its axis is DUPLICATION, and dropping it would lose
+		// the only coverage of dedupe interacting with an empty slot. It moves
+		// to the tolerant path instead (tolerant: true below), where #7216
+		// warns and the config still compiles, so the dedupe assertion (Match
+		// and Then match the de-duplicated form) is still observed on exactly
+		// the shape it was written for.
 		{"duplicate beside an authored blank",
 			`match { destination-address 192.0.2.1/32; destination-address 192.0.2.1/32;
                      destination-address [ ]; }`,
 			`match { destination-address 192.0.2.1/32; destination-address [ ]; }`,
-			"10.0.0.1/32"},
+			"10.0.0.1/32", true},
 		// Exact-text dedupe alone would leave the rest rejected, which is the
 		// same invented rejection one spelling over: a bare address IS a host
 		// route, and the Rust parse_nat_prefix masks the base, so each pair
@@ -1869,28 +2006,50 @@ security { nat { static { rule-set rs1 { from zone untrust;
 		// canonical form.
 		{"bare address beside its own /32",
 			`match { destination-address 192.0.2.1; destination-address 192.0.2.1/32; }`,
-			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32"},
+			`match { destination-address 192.0.2.1/32; }`, "10.0.0.1/32", false},
 		{"IPv6 bare address beside its own /128",
 			`match { destination-address [ 2001:db8::1 2001:db8::1/128 ]; }`,
-			`match { destination-address [ 2001:db8::1 ]; }`, "2001:db8:1::1/128"},
+			`match { destination-address [ 2001:db8::1 ]; }`, "2001:db8:1::1/128", false},
 		// A block pair, so the host-route gate does not fire on either spelling.
 		{"two spellings of one masked block",
 			`match { destination-address [ 192.0.2.0/24 192.0.2.5/24 ]; }`,
-			`match { destination-address [ 192.0.2.0/24 ]; }`, "10.0.0.0/24"},
+			`match { destination-address [ 192.0.2.0/24 ]; }`, "10.0.0.0/24", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Premise: the de-duplicated spelling commits, so a failure below is
-			// the repetition and not some unrelated fault in the fixture.
-			ref := mustCompile6659(t, hierTree6659(t, fmt.Sprintf(wrap, tc.single, tc.then)))
-			refRule := ref.Security.NAT.Static[0].Rules[0]
+			compile := CompileConfig
+			pathName := "strict commit"
+			if tc.tolerant {
+				compile = CompileConfigLenient
+				pathName = "the tolerant path"
+			}
 
-			cfg, err := CompileConfig(hierTree6659(t, fmt.Sprintf(wrap, tc.dup, tc.then)))
+			// Premise: the de-duplicated spelling compiles on the same path, so
+			// a failure below is the repetition and not some unrelated fault in
+			// the fixture.
+			refCfg, refErr := compile(hierTree6659(t, fmt.Sprintf(wrap, tc.single, tc.then)))
+			if refErr != nil {
+				t.Fatalf("premise: %s rejected the DE-DUPLICATED spelling, so the "+
+					"comparison below would be vacuous:\n  %v", pathName, refErr)
+			}
+			refRule := refCfg.Security.NAT.Static[0].Rules[0]
+
+			cfg, err := compile(hierTree6659(t, fmt.Sprintf(wrap, tc.dup, tc.then)))
 			if err != nil {
-				t.Fatalf("strict commit REJECTED a repeated identical prefix that "+
-					"origin/master accepts and compiles identically — a repeat authors "+
-					"ONE external prefix, so the cardinality gate must count distinct "+
-					"values (dedupeValuesBy + staticNATMatchAddrKey), not raw slots:\n  %v",
-					err)
+				t.Fatalf("%s REJECTED a repeated identical prefix that origin/master "+
+					"accepts and compiles identically — a repeat authors ONE external "+
+					"prefix, so the cardinality gate must count distinct values "+
+					"(dedupeValuesBy + staticNATMatchAddrKey), not raw slots:\n  %v",
+					pathName, err)
+			}
+			// The cardinality gate must be silent on BOTH paths: on the
+			// tolerant one it downgrades to a warning rather than an error, so
+			// "no error" alone would not see it firing.
+			for _, w := range cfg.Warnings {
+				if strings.Contains(w, "declares") && strings.Contains(w, "prefixes") {
+					t.Fatalf("the CARDINALITY gate reported a repeated identical "+
+						"prefix as a multi-prefix rule; a repeat authors ONE external "+
+						"prefix:\n  %s", w)
+				}
 			}
 			// Parity on the fields that reach the dataplane. MatchAddresses is
 			// deliberately NOT compared: it records every authored slot for the

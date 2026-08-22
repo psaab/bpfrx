@@ -18,7 +18,7 @@ use super::*;
 //      `show interfaces` and the live status RPCs:
 //      `telemetry.counters.{touched, rx_packets, rx_bytes}` and
 //      `telemetry.dbg.{rx, rx_bytes_total, rx_max_frame}`;
-//   3. for desc.len > 1514, bump `telemetry.dbg.rx_oversized` and
+//   3. for desc.len > 1514, bump `telemetry.dbg.rx_over_1514` and
 //      (only under `cfg!(feature = "debug-log")`) eprint up to 20
 //      oversized-frame breadcrumbs;
 //   4. under `cfg!(feature = "debug-log")` only: RX-side TCP flag
@@ -104,18 +104,26 @@ pub(super) fn record_rx_descriptor_telemetry(
     if desc.len > telemetry.dbg.rx_max_frame {
         telemetry.dbg.rx_max_frame = desc.len;
     }
+    // #5190 (A1-b1-F7): a FIXED 1514-byte comparison, not an MTU test. The
+    // per-interface MTU / jumbo configuration is not available here (this runs
+    // before the shim metadata is parsed, so even the 802.1Q tag presence is
+    // unknown), so a valid in-band VLAN-tagged full-MTU frame (1518) and every
+    // jumbo frame trip it. The counter is named for what it measures so it is
+    // not read as an anomaly signal; see `DebugPollCounters::rx_over_1514`.
     if desc.len > 1514 {
-        telemetry.dbg.rx_oversized += 1;
+        telemetry.dbg.rx_over_1514 += 1;
         if cfg!(feature = "debug-log") {
             thread_local! {
-                static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+                static RX_OVER_1514_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
-            OVERSIZED_RX_LOG.with(|c| {
+            RX_OVER_1514_LOG.with(|c| {
                 let n = c.get();
                 if n < 20 {
                     c.set(n + 1);
                     eprintln!(
-                        "DBG OVERSIZED_RX[{}]: if={} q={} desc.len={} (exceeds ETH+MTU 1514)",
+                        "DBG RX_OVER_1514[{}]: if={} q={} desc.len={} \
+                         (over the FIXED 1514 size — a valid VLAN-tagged or \
+                         jumbo frame lands here too; not an MTU test)",
                         n, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len,
                     );
                 }

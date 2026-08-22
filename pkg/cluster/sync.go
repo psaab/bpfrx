@@ -433,19 +433,27 @@ type SessionSync struct {
 	// WaitFailoverApplied, if set, blocks until the local node has ACTUATED
 	// the transfer-out just requested via OnRemoteFailover for one RG — i.e.
 	// the async demotion event has been consumed and the old owner fenced
-	// (VRRP resigned to priority-0 / VIPs removed / rg_active cleared). It
-	// gates the failoverAckApplied reply so the peer cannot promote while this
-	// node still externally owns the RG. OnRemoteFailover only ENQUEUES the
-	// demotion event and returns; acking before this barrier opened a
-	// two-owner window (duplicate GARP / VIP ownership / traffic) — #5640. A
-	// non-nil error (fence not actuated within the daemon's bounded timeout)
-	// downgrades the ack to failoverAckFailed so the peer holds instead of
-	// promoting into the two-owner window.
-	WaitFailoverApplied func(rgID int) error
+	// (VRRP resignation signalled and priority driven to 0, or direct VIP
+	// ownership reconciled away, plus rg_active cleared). On the RETH-VRRP
+	// path the physical VIP removal runs on the VRRP instance's own loop and
+	// is NOT waited for here (#6177 item 1). It gates the failoverAckApplied
+	// reply so the peer cannot promote while this node still externally owns
+	// the RG. OnRemoteFailover only ENQUEUES the demotion event and returns;
+	// acking before this barrier opened a two-owner window (duplicate GARP /
+	// VIP ownership / traffic) — #5640. A non-nil error (fence not actuated
+	// within the daemon's bounded timeout) downgrades the ack to
+	// failoverAckFailed so the peer holds instead of promoting into the
+	// two-owner window.
+	//
+	// reqID is the same request identifier passed to OnRemoteFailover, so the
+	// daemon can wait on the barrier THAT request armed rather than on
+	// whatever barrier the RG happens to hold (#6177).
+	WaitFailoverApplied func(rgID int, reqID uint64) error
 	// WaitFailoverAppliedBatch is the multi-RG counterpart of
 	// WaitFailoverApplied: it blocks until every RG in the batch has been
-	// fenced before the batch failoverAckApplied reply is sent (#5640).
-	WaitFailoverAppliedBatch func(rgIDs []int) error
+	// fenced before the batch failoverAckApplied reply is sent (#5640). reqID
+	// identifies the batch request whose barriers are being waited on (#6177).
+	WaitFailoverAppliedBatch func(rgIDs []int, reqID uint64) error
 	// OnFenceReceived requests this node to disable all RGs.
 	OnFenceReceived func()
 	// OnPrepareActivation asks the peer to pre-warm neighbors for the given RG.
@@ -462,6 +470,34 @@ type SessionSync struct {
 	// always ends with the lossless BulkSync window, so an override can never
 	// reintroduce the empty-marker / skipped-reconcile regression.
 	BulkSyncOverride func() error
+	// BulkSnapshotSource, if set, supplies the authoritative cold-prime /
+	// re-drive snapshot doBulkSync frames, REPLACING the backend session-store
+	// walk BulkSync performs (#6031).
+	//
+	// BulkSync's ForEachV4/V6 walk reads the `sessions`/`sessions_v6` BPF
+	// conntrack maps, which under the userspace dataplane are a best-effort
+	// DISPLAY mirror, not the authoritative session set: the Rust helper's
+	// transit forward install publishes only the shim steering map and its
+	// shared session tables, never publish_bpf_conntrack_entry, so a TRANSIT
+	// session is structurally absent from that walk. Since #5085 made the
+	// receiver reconcile authoritatively against the delimited window, framing
+	// it from the mirror DELETES exactly the live peer-owned transit sessions
+	// the standby needs at failover. A table-truth source closes that.
+	//
+	// The supplied snapshot is framed VERBATIM: doBulkSync does NOT re-apply
+	// the ShouldSyncZone filter to it, because the caller already applies the
+	// strictly more precise owner-RG filter the incremental delta path uses
+	// (daemon shouldSyncUserspaceDelta). Re-filtering by zone could drop an
+	// entry the incremental path admits — e.g. a fabric-redirect wire alias —
+	// and every entry missing from the window is DELETED on the receiver. The
+	// two paths must admit the same set; a divergence is always a bug.
+	//
+	// A source that returns an error FAILS CLOSED: doBulkSync returns the
+	// error and frames NO window rather than falling back to the mirror walk.
+	// Sending a known-incomplete authoritative window destroys live sessions;
+	// sending none merely defers the reconcile, and every doBulkSync caller
+	// leaves its cold-prime/resync obligation armed for the next retry.
+	BulkSnapshotSource func() (BulkSnapshot, error)
 	// OnBulkSyncAckReceived fires when the peer acknowledges our outbound bulk sync.
 	OnBulkSyncAckReceived func()
 	// OnPeerConnected fires when a peer sync connection is established.

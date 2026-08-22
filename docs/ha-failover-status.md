@@ -302,6 +302,39 @@ node while the peer also became active for it (split-brain dual-active, the
 exact failure the fence exists to prevent). The handler is nil-safe in
 config-only mode (no published dataplane) and when the config has no cluster stanza.
 
+### Observing peer fencing (#72)
+
+`show chassis cluster information` renders a **Peer fencing:** block whenever
+`peer-fencing` is configured or a fence has ever fired on this node:
+
+```
+Peer fencing:
+  Action: disable-rg
+  Attempts:
+    Aug 21 09:14:02  Fence disable-rg sent to peer
+    Aug 21 09:31:47  Fence failed: peer not connected
+```
+
+`Action` is the CURRENTLY committed `set chassis cluster peer-fencing` value —
+`disabled` when the leaf is absent — which can differ from the action the listed
+attempts were recorded under, because the event history outlives a config
+change. Each attempt line is one `handlePeerTimeout` fence decision and its
+outcome: `sent to peer`, `Fence failed: <err>` (the sync channel was down — the
+node still takes over on the heartbeat timeout), or `Fence skipped: sync not
+available` (no session-sync peer-fence function was armed).
+
+The fence is **best-effort and unacknowledged**: `SessionSync.SendFence`
+(`pkg/cluster/sync_failover.go`) writes `syncMsgFence` and returns; there is no
+fence-ack message on the wire. A `sent to peer` line therefore means the write
+reached the socket, not that the peer disabled its redundancy groups. Local
+takeover is consequently NOT gated on the fence — `handlePeerTimeout` runs
+`electSingleNode()` before it attempts the fence, so a dead peer (fence
+unreachable) can never block the survivor from forwarding.
+
+Do not read this block as the **Install fence:** block that appears above it in
+the same output — that one reports the bulk-sync install barrier sequence
+(`LastFenceSeq`), an unrelated mechanism.
+
 ## What Was Eliminated
 
 These mechanisms existed before the simplification work and have been

@@ -401,7 +401,7 @@ func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermW
 		if a == nil {
 			return
 		}
-		ports := coalescePortRanges(appPortsFromSpec(a.DestinationPort))
+		ports := appPortRangesFromSpec(a.DestinationPort)
 		if a.DestinationPort != "" && len(ports) == 0 {
 			// #3429: the application carried a destination-port spec but none of
 			// it is representable (out of 1..65535) — fail CLOSED so the term
@@ -416,7 +416,7 @@ func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermW
 		// 1..65535) gets the never-match sentinel rather than widening to any
 		// source port. An app with NO source-port keeps SrcPorts empty (a
 		// legitimate source-port-unconstrained match — the common case).
-		srcPorts := coalescePortRanges(appPortsFromSpec(a.SourcePort))
+		srcPorts := appPortRangesFromSpec(a.SourcePort)
 		if a.SourcePort != "" && len(srcPorts) == 0 {
 			srcPorts = []NatPortRangeWire{natNeverMatchPortRange}
 		}

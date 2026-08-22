@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -217,7 +216,7 @@ func (es *EventStream) Start(ctx context.Context) error {
 			releaseEventStreamSocketLock(lockFile)
 		}
 	}()
-	if err := removeStaleEventStreamSocket(es.socketPath); err != nil {
+	if err := removeStaleUnixSocket(socketKindEventStream, es.socketPath); err != nil {
 		return err
 	}
 
@@ -257,51 +256,6 @@ func releaseEventStreamSocketLock(f *os.File) {
 	_ = f.Close()
 }
 
-// removeStaleEventStreamSocket removes only a proven stale Unix-stream socket.
-// The caller must hold the sidecar ownership lock. A live listener, a path of a
-// different type, or an inconclusive kernel-table read fails closed and is never
-// unlinked. Inspecting /proc/net/unix is deliberately non-invasive: dialing the
-// event socket as a liveness probe would make the old daemon accept the probe as
-// its new helper and disconnect the real helper.
-func removeStaleEventStreamSocket(socketPath string) error {
-	info, err := os.Lstat(socketPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect event stream socket %s: %w", socketPath, err)
-	}
-	if info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("event stream path %s exists and is not a Unix socket", socketPath)
-	}
-
-	active, err := eventStreamSocketActive(socketPath)
-	if err != nil {
-		return err
-	}
-	if active {
-		return fmt.Errorf("event stream socket %s already has a live listener", socketPath)
-	}
-	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale event stream socket %s: %w", socketPath, err)
-	}
-	return nil
-}
-
-func eventStreamSocketActive(socketPath string) (bool, error) {
-	data, err := os.ReadFile("/proc/net/unix")
-	if err != nil {
-		return false, fmt.Errorf("inspect kernel Unix socket table for %s: %w", socketPath, err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 8 && strings.Join(fields[7:], " ") == socketPath {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // ListenerBound reports whether the event-stream listener socket successfully
 // bound (net.Listen in Start() succeeded and Close() has not run). It is TRUE
 // as soon as the daemon can receive the local helper's session deltas,
@@ -330,7 +284,17 @@ func (es *EventStream) Close() {
 	es.connected.Store(false)
 	es.mu.Unlock()
 	if es.ownsSocket {
-		_ = os.Remove(es.socketPath)
+		// Exempt from removeStaleUnixSocket (#5839): ownsSocket is set only
+		// after THIS EventStream bound the path under the sidecar flock, so
+		// ownership is already established and the liveness probe would be
+		// meaningless — the listener it would find is the one just closed
+		// above. The failure is reported rather than discarded so a socket
+		// left behind is diagnosable at the next bring-up, which refuses to
+		// unlink what it cannot prove stale.
+		if err := os.Remove(es.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("event stream: removing own socket failed",
+				"path", es.socketPath, "err", err)
+		}
 		es.ownsSocket = false
 	}
 	releaseEventStreamSocketLock(es.socketLock)

@@ -457,6 +457,18 @@ func (m *Manager) handlePeerTimeout() {
 	m.electSingleNode()
 
 	// Attempt peer fencing if configured.
+	//
+	// Ordering note (#72): the election above runs BEFORE the fence, and the
+	// fence is never a precondition for ownership. That is deliberate and not
+	// currently changeable by reordering alone — SendFence
+	// (sync_failover.go) writes syncMsgFence and returns; there is no
+	// fence-ack message on the wire, so "fence acknowledged" is not an
+	// observable this code could gate on. Gating takeover on the send
+	// SUCCEEDING would be worse than useless: the send fails precisely when
+	// the peer is unreachable, which is the split-brain case fencing exists
+	// to cover, so it would convert a dead peer into a total outage.
+	// Every attempt and its result is recorded to the EventFence history and
+	// rendered by FormatInformation's "Peer fencing:" block.
 	if m.peerFencing == "disable-rg" {
 		fn := m.peerFenceFn
 		if fn != nil {

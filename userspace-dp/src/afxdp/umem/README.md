@@ -18,7 +18,7 @@ drop-in for xdpilone), and tracks frame budgets per binding.
 | `mod.rs` | `WorkerUmem` / `WorkerUmemInner` / `WorkerUmemPool` — Rc-shared UMEM handle held by the owner worker, plus the free-frame pool. |
 | `mmap.rs` | `MmapArea` — the raw `mmap` region. |
 | `mmap_tests.rs` | Co-located mmap unit tests. |
-| `tests/` | Co-located UMEM unit tests: `mod.rs` + `mmap_area.rs`. The binding-state concern tests moved to `../binding_state/tests/` in #6436 (the #4667 per-concern split maps 1:1 onto the new location). |
+| `tests/` | Co-located UMEM unit tests: `mod.rs` + `drop_order.rs` + `mmap_area.rs`. The binding-state concern tests moved to `../binding_state/tests/` in #6436 (the #4667 per-concern split maps 1:1 onto the new location). |
 
 ## Where it sits
 
@@ -34,6 +34,20 @@ drop-in for xdpilone), and tracks frame budgets per binding.
   descriptor sharing. This is the reason every "rebalance flows
   across workers" design has been plan-killed; see
   `docs/per-5-tuple/state.md` for the formal ceiling.
+- **`WorkerUmemInner` field order is load-bearing (#5192).** `umem`
+  is declared BEFORE `area` because Rust destroys struct fields in
+  declaration order, and `xsk_ffi::Umem::new` is `unsafe` on the
+  precondition that the mmap'd area outlives the `Umem`. Declared the
+  other way round, `munmap` runs while the libxdp UMEM object is still
+  registered against those pages — a latent use-after-free whose only
+  defence is that `xsk_umem__delete` in the linked libxdp happens not
+  to read the user area, which is an unpinned external library's
+  implementation detail rather than an invariant this repo controls.
+  Rust has no compile-time drop-order assertion, so the order is
+  pinned by observation: both destructors record into
+  `crate::drop_order_probe` under `cfg(test)` and
+  `tests/drop_order.rs` asserts `[Umem, MmapArea]`. Swapping the two
+  declarations back reds it.
 - `Rc<WorkerUmemInner>` (not `Arc`) is intentional — UMEM ownership
   doesn't cross thread boundaries within the worker. The cross-binding
   redirect path in `cos/cross_binding.rs` *copies* frames into the

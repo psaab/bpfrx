@@ -1357,6 +1357,194 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
     );
 }
 
+/// #6227 item 6, RED-on-revert: on a VLAN trunk carrying two logical units in
+/// TWO DIFFERENT zones, the NPTv6 reverse (inbound) lookup for an embedded
+/// ICMP error must gate on the packet's LOGICAL unit's zone, not the
+/// physical parent's inherited (first-unit) zone.
+///
+/// Fixture: physical ifindex 11 carries unit 12 (VLAN 50, "zone-a" — created
+/// first, so ifindex_to_zone_id[11] inherits "zone-a" per
+/// `forwarding_build/interfaces.rs`) and unit 13 (VLAN 80, "zone-b").
+/// The ICMPv6 Time-Exceeded error arrives on the PHYSICAL ifindex 11, VLAN 80
+/// (unit 13 / "zone-b"'s traffic). The NPTv6 rule is scoped `from_zone:
+/// "zone-b"` ONLY, so translation must be evaluated against "zone-b" — the
+/// logical unit's zone — not "zone-a", which the buggy physical-ifindex
+/// lookup would produce.
+///
+/// The installed session carries NO NAT decision (`NatDecision::default()`),
+/// deliberately: a recorded per-session `rewrite_src` would let
+/// `lookup_forward_nat_across_scopes`'s `reverse_translated_index` alias find
+/// the session by its OWN stored reverse mapping, masking this bug (as it
+/// does in `icmpv6_te_nptv6_reverse_lookup_restores_internal_client` above,
+/// which resolves via that alias regardless of the local zone lookup). Here
+/// the ONLY path to the session is the zone-gated `nptv6.translate_inbound`
+/// feeding `embedded_key`, so a wrong zone means NO session is found at all
+/// (`try_embedded_icmp_nat_match_from_frame` returns `None`) instead of
+/// merely returning the wrong `original_src`.
+///
+/// Reverting the `resolve_ingress_logical_ifindex` call in
+/// `icmp_embed/nat_match_v6.rs` (back to keying `ifindex_to_zone_id` on the
+/// raw `meta.ingress_ifindex`) turns this RED: the lookup evaluates
+/// "zone-a", the from-"zone-b" rule does not match, translation fails, and
+/// the `.expect(...)` below panics.
+#[test]
+fn icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_physical_parent() {
+    let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let internal_client: Ipv6Addr = "fd35:1940:27:100::102".parse().unwrap();
+    let server_ip: Ipv6Addr = "2607:f8b0:4005:814::200e".parse().unwrap();
+    let echo_id: u16 = 0x8235;
+
+    const PHYSICAL_IFINDEX: i32 = 11;
+    const UNIT_A_IFINDEX: i32 = 12; // VLAN 50, "zone-a" — the first unit, so
+                                     // the physical parent inherits ITS zone.
+    const UNIT_B_IFINDEX: i32 = 13; // VLAN 80, "zone-b" — the traffic's real
+                                     // unit; must NOT be shadowed by zone-a.
+    const ZONE_A_ID: u16 = 41;
+    const ZONE_B_ID: u16 = 42;
+
+    let nptv6 = Nptv6State::from_snapshots(&[crate::Nptv6RuleSnapshot {
+        name: "nptv6-zone-b".to_string(),
+        from_zone: "zone-b".to_string(),
+        internal_prefix: "fd35:1940:0027::/48".to_string(),
+        external_prefix: "2602:fd41:0070::/48".to_string(),
+    }]);
+    // Derive the on-wire external address from `internal_client` via the
+    // OUTBOUND direction rather than hand-picking both addresses: NPTv6's
+    // checksum-neutral adjustment (RFC 6296 §3.7) rewrites the word AFTER the
+    // prefix unless the prefix pair happens to be checksum-neutral, so a
+    // hand-picked (internal, external) pair is not guaranteed to be each
+    // other's actual translation — computing it here guarantees the inbound
+    // reverse (exercised below) is a true round trip.
+    let mut external_client = internal_client;
+    assert!(
+        nptv6.translate_outbound(&mut external_client, "zone-b"),
+        "test setup: internal_client must translate outbound under zone-b"
+    );
+
+    let frame = build_icmpv6_te_frame(
+        router_ip,
+        external_client,
+        server_ip,
+        echo_id,
+        0,
+        PROTO_ICMPV6,
+    );
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ingress_ifindex: PHYSICAL_IFINDEX as u32,
+        ingress_vlan_id: 80, // unit B's VLAN.
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut forwarding = ForwardingState::default();
+    // Unit A installed first: the physical parent inherits ITS zone.
+    forwarding
+        .ifindex_to_zone_id
+        .insert(UNIT_A_IFINDEX, ZONE_A_ID);
+    forwarding
+        .ifindex_to_zone_id
+        .insert(PHYSICAL_IFINDEX, ZONE_A_ID);
+    // Unit B installed second: per forwarding_build/interfaces.rs, the parent
+    // entry is NOT overwritten once set (first-unit-wins), so
+    // ifindex_to_zone_id[PHYSICAL_IFINDEX] stays "zone-a".
+    forwarding
+        .ifindex_to_zone_id
+        .insert(UNIT_B_IFINDEX, ZONE_B_ID);
+    forwarding
+        .zone_id_to_name
+        .insert(ZONE_A_ID, "zone-a".to_string());
+    forwarding
+        .zone_id_to_name
+        .insert(ZONE_B_ID, "zone-b".to_string());
+    forwarding
+        .ingress_logical_ifindex
+        .insert((PHYSICAL_IFINDEX, 50), UNIT_A_IFINDEX);
+    forwarding
+        .ingress_logical_ifindex
+        .insert((PHYSICAL_IFINDEX, 80), UNIT_B_IFINDEX);
+    forwarding.nptv6 = nptv6;
+
+    // No recorded NAT decision on the session: the ONLY way to find it is the
+    // zone-gated NPTv6 reverse translation feeding `embedded_key` (see the
+    // doc comment above for why a recorded `rewrite_src` would mask the bug
+    // via the `reverse_translated_index` alias).
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 24,
+            tx_ifindex: 24,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(internal_client)),
+            neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: ZONE_B_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        ingress_ifindex: UNIT_B_IFINDEX as u32,
+        ingress_vlan_id: 80,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    };
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_ICMPV6,
+            src_ip: IpAddr::V6(internal_client),
+            dst_ip: IpAddr::V6(server_ip),
+            src_port: echo_id,
+            dst_port: 0,
+        },
+        decision,
+        metadata,
+        1_000_000,
+        PROTO_ICMPV6,
+        0,
+    ));
+
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let icmp_match = try_embedded_icmp_nat_match_from_frame(
+        &frame,
+        meta,
+        &mut sessions,
+        &forwarding,
+        &neighbors,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        1_000_000,
+    )
+    .expect(
+        "must resolve the embedded ICMPv6 error via the LOGICAL vlan unit's \
+         zone (zone-b), not the physical parent's inherited zone-a",
+    );
+
+    assert_eq!(icmp_match.original_src, IpAddr::V6(internal_client));
+    assert_eq!(icmp_match.original_src_port, echo_id);
+}
 
 #[test]
 fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {

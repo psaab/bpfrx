@@ -335,13 +335,18 @@ type Server struct {
 	// A later bind change is NOT re-minted — a loaded cert whose SANs miss the
 	// new bind host is warned about (generateSelfSignedCertAt), not re-served
 	// silently.
-	sharedBase http.Handler
-	certGen    func(bindHost string) (tls.Certificate, error)
-	lifeMu     sync.Mutex      // guards httpLeg/httpsLeg/rootCtx across reconciles
-	rootCtx    context.Context // daemon lifetime; every leg drains on its cancel
-	wg         sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
-	httpLeg    *listenerLeg    // live HTTP listener leg (nil = not started / HTTP off)
-	httpsLeg   *listenerLeg    // live HTTPS listener leg (nil = HTTPS off)
+	// ifindexByName resolves a netdev name to its kernel ifindex when building
+	// the session {ifindex, VLAN} -> interface-name table. nil means the real
+	// kernel lookup; tests inject a fixed table so the session-identity paths
+	// are exercisable without real netdevs (mirrors grpcapi).
+	ifindexByName func(string) (int, error)
+	sharedBase    http.Handler
+	certGen       func(bindHost string) (tls.Certificate, error)
+	lifeMu        sync.Mutex      // guards httpLeg/httpsLeg/rootCtx across reconciles
+	rootCtx       context.Context // daemon lifetime; every leg drains on its cancel
+	wg            sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
+	httpLeg       *listenerLeg    // live HTTP listener leg (nil = not started / HTTP off)
+	httpsLeg      *listenerLeg    // live HTTPS listener leg (nil = HTTPS off)
 	// httpSlot / httpsSlot are the credential slots of the legs Start launches
 	// from the construction-time servers (#5561 round 14). Every leg gets one;
 	// a live slot follows s.auth, a retired one is pinned. See authSlot.

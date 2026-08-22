@@ -337,6 +337,52 @@ func rg0ConfigSyncAuthority(cl *cluster.Manager) bool {
 	return cl != nil && cl.IsLocalPrimary(0)
 }
 
+// peerSyncPolicy is what a COMMITTER wants done about the cluster peer. It is
+// deliberately not a bool, because the two false-ish answers a bool conflates
+// are the whole of #5962:
+//
+//   - peerSyncNever — "this commit must never reach the peer". The autonomous
+//     event-options engine means this: each node fires its own remediation from
+//     its own RPM events, and pushing that node-local state would overwrite the
+//     peer's. It is a POLICY, and it is true whatever this node owns.
+//   - peerSyncIfRG0Authority — "push it if this node is the RG0 config
+//     authority". That is a fact about the CURRENT cluster state, and it can
+//     change under the committer's feet.
+//
+// #5054 collapsed both into a bool by evaluating rg0ConfigSyncAuthority in
+// commitAndApplyOperator, at ATTEMPT time — before store.Commit's
+// ensureWritableLocked. A node promoted to RG0 primary between those two points
+// committed successfully and then skipped the push, because the attempt-time
+// answer had already been frozen into `false`. The pre-#5058 gRPC path did not
+// have that window: it passed an unconditional true and let the push site
+// decide. Carrying the POLICY rather than its resolved value restores that —
+// wantsPush is evaluated once, after the commit succeeded, at the point the
+// push is actually made.
+//
+// peerSyncAlways exists for tests and for a caller that has already established
+// authority; production has no such caller today.
+type peerSyncPolicy uint8
+
+const (
+	peerSyncNever peerSyncPolicy = iota
+	peerSyncAlways
+	peerSyncIfRG0Authority
+)
+
+// wantsPush resolves the policy against the cluster state AT THE MOMENT OF
+// ASKING. Call it at the push decision point, never earlier: an
+// authority-gated policy resolved early is exactly the #5962 TOCTOU.
+func (p peerSyncPolicy) wantsPush(cl *cluster.Manager) bool {
+	switch p {
+	case peerSyncAlways:
+		return true
+	case peerSyncIfRG0Authority:
+		return rg0ConfigSyncAuthority(cl)
+	default:
+		return false
+	}
+}
+
 // syncConfigToPeer sends the active config to the cluster peer if this node is
 // the RG0 config-sync authority and config sync is enabled.
 func (d *Daemon) syncConfigToPeer() {
@@ -991,10 +1037,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// reconciliation — a stale peer-owned session the standby held
 			// survived cold-prime. Cold-prime now uses the lossless BulkSync
 			// direct-write window (doBulkSync), which delimits a COMPLETE
-			// authoritative snapshot the receiver reconciles against. A
-			// table-truth, owner-RG-filtered snapshot via ExportOwnerRGSessions
-			// (eliminating the BulkSync mirror-map drift residual) is tracked as
-			// a follow-up.
+			// authoritative snapshot the receiver reconciles against.
+			//
+			// #6031: that window is now framed from TABLE TRUTH, not from the
+			// BPF `sessions`/`sessions_v6` conntrack maps BulkSync walks. Under
+			// the userspace dataplane those maps are a best-effort DISPLAY
+			// mirror — the helper's transit forward install never publishes a
+			// conntrack row — so the walk cannot see the transit sessions that
+			// dominate a forwarding node. Combined with #5085's authoritative
+			// reconcile (absent from the window => DELETED), framing cold prime
+			// from the mirror DELETED the standby's live peer-owned transit
+			// sessions. BulkSnapshotSource supplies the owner-RG-filtered live
+			// set from the helper's SessionTable via ExportOwnerRGSessions
+			// instead, and doBulkSync fails CLOSED if it errors rather than
+			// falling back to the destructive mirror walk.
+			ss.BulkSnapshotSource = d.userspaceBulkSnapshot
 
 			ss.OnPeerDisconnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
@@ -1017,9 +1074,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				// enqueues the async demotion event, so watchClusterEvents
 				// cannot actuate-and-forget before WaitFailoverApplied observes
 				// it. The applied-ack (sync layer) then waits on this barrier.
-				d.armFailoverActuation(rgID)
+				barrier := d.armFailoverActuation(rgID, reqID)
 				if err := d.cluster.ManualFailover(rgID); err != nil {
-					d.disarmFailoverActuation(rgID)
+					d.disarmFailoverActuation(rgID, reqID, barrier)
 					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
 					return err
 				}
@@ -1040,12 +1097,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs, "req_id", reqID)
 				// #5640: arm every member's fence barrier before the batch
 				// demotion enqueues its per-RG events.
+				barriers := make(map[int]*failoverActuation, len(rgIDs))
 				for _, rgID := range rgIDs {
-					d.armFailoverActuation(rgID)
+					barriers[rgID] = d.armFailoverActuation(rgID, reqID)
 				}
 				if err := d.cluster.ManualFailoverBatch(rgIDs); err != nil {
 					for _, rgID := range rgIDs {
-						d.disarmFailoverActuation(rgID)
+						d.disarmFailoverActuation(rgID, reqID, barriers[rgID])
 					}
 					slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
 					return err

@@ -28,7 +28,7 @@ func TestHandleRemoteFailoverFailedFenceDowngradesAck(t *testing.T) {
 
 	ss.OnRemoteFailover = func(int, uint64) error { return nil }
 	fenceErr := errors.New("redundancy group 7 rg_active=false not applied on demotion")
-	ss.WaitFailoverApplied = func(int) error { return fenceErr }
+	ss.WaitFailoverApplied = func(int, uint64) error { return fenceErr }
 
 	frames := make(chan syncFrame, 4)
 	readFramesInto(peer, frames)

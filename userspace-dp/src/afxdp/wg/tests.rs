@@ -2261,6 +2261,59 @@ mod framed_handshake {
         );
     }
 
+    /// #6227 item 5, RED-on-revert: a prior panic while holding
+    /// `reconcile_lock` poisons it. Before the fix every handshake-session
+    /// call site did `self.reconcile_lock.lock().unwrap()`, so the NEXT
+    /// caller — on the control thread, nothing to do with the panicking
+    /// thread — would panic too, tearing down the whole tunnel's handshake
+    /// path over one contained, unrelated panic. `lock_recover` (the #1807 /
+    /// #2402 poison-recovery policy) must instead clear the poison and
+    /// proceed. Reverting `lock_recover` back to `self.reconcile_lock.lock()
+    /// .unwrap()` turns this RED (the call below panics instead of
+    /// returning `Ok`).
+    #[test]
+    fn reserve_pending_recovers_from_a_poisoned_reconcile_lock() {
+        use crate::afxdp::wg::handshake_session::WG_HANDSHAKE_LOCK_POISON_RECOVERIES;
+        use crate::afxdp::wg::session::SessionRole;
+        use std::sync::atomic::Ordering as AOrd;
+        use std::sync::Arc as StdArc;
+
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        let init = StdArc::new(init);
+
+        // Poison reconcile_lock: a thread takes it and panics while holding
+        // it (the #1790/#1807 poisoning shape — a contained panic elsewhere,
+        // NOT a corrupted invariant under the lock: the guarded state is `()`
+        // for reconcile_lock, so there is nothing to corrupt).
+        let poisoner = init.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = poisoner.reconcile_lock.lock().unwrap();
+            panic!("simulated panic while holding reconcile_lock");
+        })
+        .join();
+        assert!(result.is_err(), "poisoning thread must panic");
+        assert!(init.reconcile_lock.is_poisoned(), "lock must be poisoned");
+
+        let before = WG_HANDSHAKE_LOCK_POISON_RECOVERIES.load(AOrd::Relaxed);
+
+        // Any handshake-session call that takes reconcile_lock must recover,
+        // not propagate the poison to this unrelated caller.
+        let idx = init
+            .try_reserve_pending_for_test(resp_pub, SessionRole::Initiator)
+            .expect("reserve_pending must recover from a poisoned reconcile_lock, not panic");
+        assert_eq!(init.pending_count(), 1);
+        let _ = idx;
+
+        assert!(
+            WG_HANDSHAKE_LOCK_POISON_RECOVERIES.load(AOrd::Relaxed) > before,
+            "a poisoned-lock recovery must bump the counter"
+        );
+        assert!(
+            !init.reconcile_lock.is_poisoned(),
+            "recovery must clear_poison so subsequent callers take the fast path"
+        );
+    }
+
     /// Liveness/soundness smoke: hammer full handshakes while a thread churns
     /// the peer in/out via reconcile_peers, exercising the lock serialization
     /// and the reconcile-drains-pending path. Must not panic/deadlock and a

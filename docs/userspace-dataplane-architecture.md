@@ -94,7 +94,10 @@ Packet arrives at NIC
   ├─ Non-IP (ARP, etc.) ──────────────────► kernel stack
   ├─ Multicast / broadcast ────────────────► cpumap → kernel stack
   ├─ Local destination ────────────────────► cpumap → kernel stack
-  ├─ GRE / ESP live exceptions ────────────► cpumap → kernel stack
+  ├─ ESP / non-native GRE to a LOCAL or ───► cpumap → kernel stack
+  │    interface-NAT destination                (kernel XFRM / GRE device)
+  ├─ ESP / non-native GRE to a REMOTE ─────► XDP_REDIRECT → XSK socket
+  │    destination (#304)                       (worker adjudicates)
   ├─ Degraded local/control cases ─────────► kernel stack
   ├─ Degraded transit cases ───────────────► XDP_DROP
   │
@@ -104,6 +107,24 @@ Packet arrives at NIC
   │
   └─ Binding/heartbeat failure on DP-managed interface ─► local/control pass or transit drop
 ```
+
+**#304 — ESP and non-native GRE are destination-qualified.** Until #304 the
+shim diverted *every* ESP packet and every non-native GRE packet to the kernel
+on a protocol-only test, with no destination predicate at all. That is correct
+for a tunnel this firewall terminates (ESP is decrypted by kernel XFRM, a
+non-native GRE tunnel is decapsulated by a kernel GRE device) and wrong for
+everything else: a TRANSIT ESP or GRE packet addressed to a host *beyond* the
+firewall was handed to the kernel forwarding path, where `ip_forward=1` and an
+all-accept nft ruleset forwarded it with no zone policy evaluated. The shim now
+lets both protocols fall into the ordinary session-miss classification, whose
+local-destination and interface-NAT arms are destination-qualified; a remote
+destination reaches the AF_XDP worker instead, where the #5620
+`owns_configured_ip` gate is table-scoped — local-destined IPsec is claimed and
+reinjected to the local stack, a remote destination is `NotClaimed` and
+continues into transit forwarding plus zone-policy evaluation. The degraded
+path (`is_degraded_local_or_control`) already demanded exactly this, so before
+#304 the degraded path was *safer* than the healthy one. Measured verifier
+cost: 773,966 → 777,901 processed insns (headroom 22.60% → 22.21%).
 
 **Key design decisions:**
 
@@ -1293,6 +1314,23 @@ list still collapses to `MatchAny` via `from_prefixes`, but a mixed
 hand-built / mixed-version-decode legacy path; a normal Go v3 snapshot never
 uses the legacy field.
 
+**Duplicate tunnel-endpoint-id fail-closed (#5193).** `populate_tunnel_endpoints`
+preflights endpoint-id uniqueness across the whole snapshot BEFORE it inserts
+anything, and returns `SnapshotIntegrityError::TunnelEndpointDuplicateId` on a
+repeat of a nonzero id. The function maintains two independent indexes —
+`tunnel_endpoints` keyed by id and `tunnel_endpoint_by_ifindex` keyed by ifindex
+— so a duplicate id used to keep only the LAST row under that id while BOTH
+interfaces' ifindexes resolved to it: traffic on the losing interface
+encapsulated with the winner's outer source/destination/key. Running the check
+as a preflight (rather than mid-loop) is what keeps a rejected snapshot from
+leaving a half-populated forwarding state behind, matching the #3713 pattern
+below. The Go producer drops an id collision at build time (`usedIDs`, #1873),
+so a clean commit never trips this; it is the helper-boundary backstop for a
+corrupt / mixed-version peer-sync snapshot, alongside the #2410 TTL bound in the
+same function. Two rows naming ONE ifindex (distinct ids) is not an integrity
+failure — the first row keeps the ifindex index and the collision is logged,
+rather than the later row silently overwriting it.
+
 **Duplicate rule-identity fail-closed (#3713).** `parse_policy_state_with_counters`
 preflights rule-identity uniqueness BEFORE it allocates any per-rule hit counter
 or builds a `PolicyRule` entry — the FIRST validation in the function, so no
@@ -1903,6 +1941,20 @@ CPU 7: main thread + io_uring + kernel
 | Cached resolution | ~0.8% CPU | Reuse forwarding decision from session entry |
 | NAPI busy polling | Latency | `SO_BUSY_POLL` reduces interrupt-to-userspace latency |
 
+**Busy-poll setup is best-effort and now says so (#5190).** After each AF_XDP
+bind the worker sets `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and
+`SO_BUSY_POLL_BUDGET`. Any of the three can legitimately be refused on a
+production box — `SO_PREFER_BUSY_POLL` requires `CAP_NET_ADMIN`,
+`SO_BUSY_POLL_BUDGET` requires it above the sysctl default, and all three are
+absent on old kernels — so a refusal is deliberately NOT fatal to the bind. It
+does, however, mean the worker runs on the kernel's default NAPI/poll semantics
+rather than the configured ones, which shows up as latency, not as an error.
+All three returns used to be discarded (`let _ =`) and the bind logged an
+unqualified "OK". `set_busy_poll_opts` now returns a `BusyPollSetup` report and
+`bind.rs` emits a `WARNING ... busy-poll DEGRADED` line beside the OK line
+naming each refused option and its errno. If a node is inexplicably latency-slow
+after a kernel or capability change, grep the journal for that line first.
+
 ### Throughput Profile (23 Gbps, 12 streams)
 
 | Component | CPU% | Notes |
@@ -1997,8 +2049,62 @@ system {
 | workers | 1 | Number of AF_XDP worker threads |
 | ring-entries | 1024 | RX/TX/fill/completion ring size per binding |
 | binary | — | Path to Rust binary |
-| control-socket | — | Unix socket for control protocol |
+| control-socket | — | Unix socket for control protocol (typed leaf: absolute, no `.`/`..` component, ≤107 octets — see below) |
 | state-file | — | JSON state persistence path |
+
+### Socket path handling (#5273, #5839)
+
+`control-socket` is operator-supplied and xpfd runs as root, so both helper
+sockets are treated as untrusted paths at every bring-up.
+
+**Commit check.** `control-socket` is a typed leaf
+(`ValueUnixSocketPath` / `ValidateUnixSocketPath`, `pkg/config`): it must be an
+absolute path with no `.`, `..`, or empty component, and must fit the 107-octet
+AF_UNIX `sun_path` limit. This is a STRICT-commit gate only — the tolerant
+load / peer-sync path warns and boots on a stale value (#1960), so the runtime
+never relies on it.
+
+**Runtime.** `removeStaleUnixSocket` (`pkg/dataplane/userspace/stale_socket.go`)
+is the single implementation of stale-socket removal for BOTH the control socket
+and the event socket. Before it unlinks anything it:
+
+1. `Lstat`s the path, tolerating "does not exist" (the normal first boot) and
+   judging a symlink on its own inode rather than following it;
+2. refuses any path that is not a Unix socket — a regular file, directory,
+   FIFO, device, or symlink is preserved, not deleted;
+3. refuses a socket the kernel Unix socket table still lists, i.e. one a LIVE
+   listener holds. Unlinking a live socket does not stop that listener; it makes
+   it unreachable (including to the #1993 boot armed-probe) while a second
+   helper binds a fresh socket at the same name and then fails to claim the
+   AF_XDP queues. An unreadable `/proc/net/unix` is inconclusive and fails
+   closed. The probe is non-invasive by design: DIALING the event socket would
+   make the daemon accept the probe as its new helper and drop the real one;
+4. surfaces an `os.Remove` failure instead of discarding it.
+
+**Known residual (#7139).** Those checks judge a path STRING, and the unlink is
+a separate syscall on that same string. A live socket reached through a
+different spelling of the same file — most plausibly a symlinked parent
+directory — is not matched in `/proc/net/unix` and so reads as stale, and the
+target or its parent can be swapped between the check and the unlink. Closing
+either needs the trusted-directory rework (`openat2` with `RESOLVE_BENEATH`, or
+an inode-keyed liveness decision) that #7139 tracks. The typed `control-socket`
+leaf removes the spelling most likely to be written by hand (a `.`/`..`
+component) from any strict commit, but does not close the alias.
+
+`EventStream.Start` additionally holds a sidecar `flock` across the call, which
+serializes daemon-side owners of the socket it binds. The control socket has no
+such lock because xpfd does not bind it — the Rust helper does
+(`remove_stale_socket` in `userspace-dp/src/server/lifecycle.rs`), and it does
+not participate in the flock protocol.
+
+**Ordering.** `ensureProcessLocked` stops generation N before it prepares
+generation N+1, so `preflightHelperPaths` runs the DETERMINISTIC path checks —
+control/event/state must name distinct paths, and neither socket path may
+already exist as a non-socket — BEFORE the running helper is torn down. A
+config that could never bring up a new generation therefore leaves the previous
+one, and its forwarding, running. The liveness check is deliberately NOT
+hoisted: the control socket is live precisely until the helper holding it is
+stopped.
 
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)

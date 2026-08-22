@@ -98,7 +98,22 @@ type Daemon struct {
 	// GC, cluster SessionSync, and the userspace event-stream loop stay
 	// deliberate capture-once consumers (rationale in daemon_dp_live.go
 	// and pkg/daemon/README.md).
-	dpCell   atomic.Pointer[dpSlot]
+	dpCell atomic.Pointer[dpSlot]
+
+	// dataplaneArmed is the #5275 arm state: true ONLY while the runtime
+	// dataplane has been proven to have STARTED (rt.Start /
+	// LoadUserspaceShim returned nil) in this daemon's lifetime. It is the
+	// predicate the kernel transit-forwarding gate keys off — see
+	// daemon_transit_gate.go for the full contract, the two knobs it owns,
+	// and why an unarmed node must not route transit.
+	//
+	// Deliberately SEPARATE from dpCell: the cell answers "is a backend
+	// published", which is not the same question. A backend is published
+	// before Start is attempted, and the commit-confirmed rollback keeps a
+	// torn-down backend published on purpose (#6741), so a non-nil cell is
+	// not proof of an armed forwarding path.
+	dataplaneArmed atomic.Bool
+
 	networkd *networkd.Manager
 	routing  *routing.Manager
 	frr      *frr.Manager
@@ -946,8 +961,10 @@ type Daemon struct {
 	// carries a verdict, not just a completion: a demotion whose rg_active
 	// clear was REJECTED by the dataplane resolves with that error so the ack
 	// is downgraded rather than reported applied (#6371).
-	failoverActuateMu   sync.Mutex
-	failoverActuateWait map[int]*failoverActuation
+	failoverActuateMu sync.Mutex
+	// The map is keyed by (RG, peer request id) so a stale request's disarm
+	// or expired wait can never evict a newer request's barrier (#6177).
+	failoverActuateWait map[failoverActuationKey]*failoverActuation
 	// failoverActuateTimeout bounds waitFailoverActuated so a demotion event
 	// that is never actuated (superseded reset, event-channel drop) downgrades
 	// the ack to failed instead of hanging the peer's failover request.
@@ -1260,7 +1277,7 @@ func New(opts Options) (*Daemon, error) {
 		localFailoverCommitReady:   make(map[int]bool),
 		localFailoverCommitTimeout: 3 * time.Second,
 		localFailoverCommitDelay:   200 * time.Millisecond,
-		failoverActuateWait:        make(map[int]*failoverActuation),
+		failoverActuateWait:        make(map[failoverActuationKey]*failoverActuation),
 		failoverActuateTimeout:     3 * time.Second,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 		applySem:                   semaphore.NewWeighted(1),

@@ -445,6 +445,86 @@ bracket/repeated lists lost every prefix after the first (M02).
   the non-scoped / test wrappers pass `None` (source gate skipped), the
   production scoped callers pass `Some(..)`.
 
+### Malformed literal match prefixes rejected at commit (#7145)
+
+Every mechanism above depends on the operator's literal `match source-address` /
+`match destination-address` values being parseable, because the Go snapshot
+builders copy them to the wire VERBATIM and the Rust consumers drop, per entry,
+whatever they cannot parse:
+
+| kind | Rust parse site |
+|---|---|
+| source NAT | `parse_match_prefix` (`nat/source.rs`) |
+| destination NAT | `DnatTable::from_snapshots` (`nat/destination.rs`) |
+| static NAT | `SourceConstraint::from_list` (`nat/static_nat.rs`) |
+
+All three try `IpNet::from_str`, fall back to `IpAddr::from_str` (bare host ->
+/32 / /128), and drop the entry otherwise while recording a bounded NAT
+parse-error counter (#4718). The `*_constrained` flag is keyed on the SNAPSHOT
+LIST being non-empty, not on how many entries parsed — that is what makes the
+all-malformed case fail CLOSED rather than collapse to match-any.
+
+Fail-closed at runtime was never the complaint. The complaint (#7145) was that
+the operator boundary was SILENT about it in four of the six (kind x match leaf)
+slots, while the other two rejected the identical value. Measured at
+`bf10c6b7c` with `999.1.1.1/24`:
+
+| kind | `match source-address` | `match destination-address` |
+|---|---|---|
+| source | accepted -> **rejected** | accepted -> **rejected** |
+| destination | accepted -> **rejected** | rejected (#3228) |
+| static | accepted -> **rejected** | rejected (#3206) |
+
+`validateNATMatchAddressLiteralsStrict`
+(`pkg/config/compiler_validate_strict_nat_match_addr.go`) closes the four. It
+walks ONLY the literal leaves — `match source-address-name` /
+`destination-address-name` are address-book references whose unresolvable raw
+token is appended to the same wire list ON PURPOSE (#2416, above), so a gate
+that walked the post-resolution list would reject the fail-closed backstop
+itself.
+
+The predicate is `net.ParseCIDR` then `net.ParseIP` (`natMatchPrefixParses`,
+`compiler_nat_helpers.go`), chosen over the `netip` equivalents because
+`netip.ParsePrefix` is STRICTER than Rust on the mask text — it rejects a
+zero-padded prefix length (`1.2.3.4/024`) that Rust's `u8::from_str` reads as
+24 and installs. Rejecting a value the dataplane installs is the one direction
+a widened validator must never take.
+
+Strict on commit / commit-check (hard reject naming the kind, rule-set, rule,
+leaf, and value); lenient on load / peer-sync (warn, flag
+`lenientNATMatchAddressLiterals`, #1960 no-brick — the value COMMITTED CLEAN on
+every build before this, so the population of boxes carrying one is non-empty by
+construction). **The tolerant path KEEPS the malformed value in the compiled
+config.** Dropping it Go-side would empty an all-malformed list, clear
+`*_constrained` and collapse the rule to MATCH-ANY — turning a fail-closed
+silent break into a fail-OPEN one.
+
+Known residuals, measured, NOT closed by #7145 (they are a different value
+class from the issue's malformed CIDR):
+
+- **#7215** — CLOSED. An out-of-range mask (`10.0.0.0/33`) was still accepted on
+  destination-NAT `match destination-address`: that slot's own gate (#3228)
+  stripped the mask and parsed only the address part, while its Go builder
+  (`dnatDestinationParts`) uses `net.ParseCIDR` and skips the entry — a
+  validator/builder divergence in the OLDER gate.
+- **#7216** — CLOSED. An explicitly quoted empty value (`match
+  destination-address ""`) was still accepted on static-NAT `match
+  destination-address`. The resolution did NOT need to separate a
+  machinery-produced blank from a typed one: #6673's empty-slot meaning turned
+  out to be a rule about COUNTING the list (an empty slot is not a second
+  prefix), not about whether a blank SELECTION is shippable — and #6673 already
+  rejected the blank selection in the one place it could see it. The new gate
+  (`validateStaticNATSelectedMatchAddressStrict`) reads `rule.Match`, the
+  SELECTION, so the empty SLOT keeps its #6673 meaning untouched. It covers all
+  FOUR authoring shapes that reach `rule.Match == ""`, including the omitted
+  statement, and exempts NPTv6 and `then static-nat inet`, each already refused
+  by its own gate. See `docs/config-schema.md` "#7216".
+  validator/builder divergence in the OLDER gate. See §11.2.
+- **#7216** — an explicitly quoted empty value (`match destination-address ""`)
+  is still accepted on static-NAT `match destination-address`, where an empty
+  slot carries the deliberate #6673 "authored blank selection" meaning, so
+  closing it needs to separate a machinery-produced blank from a typed one.
+
 ### Static-NAT invalid `match destination-port` fails closed (#5101)
 
 The static-NAT typed `match destination-port` / `mapped-port` leaves are
@@ -527,15 +607,67 @@ silently dropped from the installed DNAT table — traffic to it was never
 translated, a partial, silent drop of a forwarding-relevant config (#3228).
 
 The gate now rejects the rule if ANY listed destination-address fails to parse,
-mirroring the builder's exact skip predicate (`natCIDRIPPart` CIDR strip, then
-empty / `net.ParseIP` check). Validator and dataplane view agree: anything the
-builder would drop, the validator rejects, naming the offending entry. An
+mirroring the builder's exact skip predicate. Validator and dataplane view
+agree: anything the builder would drop, the validator rejects, naming the
+offending entry. An
 all-valid list still compiles byte-identical and installs every entry (the
 multi-destination behavior above is unchanged). On the tolerant load / peer-sync
 path the rejection is downgraded to a `destination-nat address` warning (#1960
 no-brick), consistent with the all-malformed (#2396(c)) gate that shares this
 validator. (The multi-host-prefix reject — #3029 — was removed by #3164, which
 implements prefix matching; see §12.)
+
+### 11.2 The predicate is the builder's, bound by a test (#7215)
+
+"Mirrors the builder's exact skip predicate" was, for two years, a COMMENT. The
+gate re-derived the predicate as `natCIDRIPPart` (strip everything after the
+first `/`) then `net.ParseIP` on what was left, while `dnatDestinationParts`
+(`pkg/dataplane/userspace/nat_destination.go`) calls `net.ParseCIDR` on any
+token carrying a `/`. The two agree on the ADDRESS text and disagree on the MASK
+text, so `10.0.0.0/33` read as the perfectly good `10.0.0.0`, committed clean,
+and was then discarded by the builder — the #2396(c) silent drop reached through
+a mask instead of a typo. Measured at `353f09592`, this was the ONE slot of six
+that still took such a value; #7145 did not reach it because its probe
+(`999.1.1.1/24`) is malformed in the address half, which the old predicate did
+see.
+
+The gate now calls `natMatchPrefixParses` (`compiler_nat_helpers.go`, #7145) —
+`net.ParseCIDR` then `net.ParseIP` — which is extensionally EQUAL to
+`dnatDestinationParts`'s `ok`:
+
+- a token with no `/`: the builder runs `net.ParseIP`; `net.ParseCIDR` cannot
+  succeed on a maskless string, so `natMatchPrefixParses` falls through to the
+  same `net.ParseIP`.
+- a token with a `/`: the builder runs `net.ParseCIDR`; `net.ParseIP` cannot
+  succeed on a string containing `/`, so `natMatchPrefixParses` reduces to the
+  same `net.ParseCIDR`.
+
+That equality is asserted, not asserted-in-prose:
+`pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go` runs both
+predicates over a corpus that straddles the boundary and fails on ANY
+disagreement, in either direction — `gate accepts / builder drops` is #7215,
+`gate refuses / builder installs` is the #1960 brick.
+
+The change is strictly a NARROWING and every value it newly refuses is one the
+builder already discarded: `10.0.0.0/33`, `10.0.0.0/129`, `2001:db8::/129`
+(mask out of range), `10.0.0.0/abc`, `10.0.0.0/`, `1.2.3.4/-1`, `1.2.3.4/+24`
+(mask not a bare unsigned number), `1.2.3.4/24/25` (two masks), and
+`10.0.0.1/255.255.255.0` (the dotted-netmask spelling, which `net.ParseCIDR` and
+Rust's `IpNet::from_str` both refuse). It refuses NOTHING the dataplane
+installs: `0.0.0.0/0`, `::/0`, a bare host, a host-bits CIDR and the zero-padded
+`1.2.3.4/024` all still commit — which is why the mirror is `net.ParseCIDR` and
+not `netip.ParsePrefix`.
+
+Lenient (`Store.Load` / HA peer-sync) is unchanged and already in place: the
+shared `lenientDestNATAddresses` flag downgrades this to a warning and KEEPS the
+value, because the Rust `destination_constrained` flag is keyed on the snapshot
+list being non-empty — pruning it Go-side would collapse an all-malformed rule
+to MATCH-ANY. Regression coverage:
+`pkg/config/nat_dnat_match_destination_mask_7215_test.go` (the full 3x2 census
+at strict, tolerant warn-and-KEEP, and an over-rejection guard) and
+`pkg/configstore/nat_dnat_match_mask_boot_7215_test.go` (the no-brick property
+at the REAL ingresses — `Store.Load` and `Store.SyncApply` — plus a
+`CommitCheck` over-reach guard).
 
 ## 12. Multi-host-prefix destination matching (#3164)
 
@@ -672,8 +804,27 @@ destination-port range the same way instead of expanding it:
   was already bounded — it parses endpoints with `ParseUint(..,16)`.)
 
 - **Builder compaction (`buildDestinationNATSnapshotsWithFeeds`).** Each term's
-  valid ports are coalesced with `coalescePortRanges` into inclusive `[Low,High]`
-  wire ranges. A single port (`Low==High`, including the `[0,0]` wildcard) keeps
+  valid ports are coalesced into inclusive `[Low,High]` wire ranges.
+
+  **#5250 (A6-b2 F3) — the intermediate per-port slice is gone.** The compaction
+  above bounded what reaches the WIRE, but the builder still built the expanded
+  `[]int` first: three sites read `coalescePortRanges(appPortsFromSpec(spec))`
+  and the DNAT `appTerm` carried the expanded slice all the way into the emit
+  loop, so `destination-port 1-65535` allocated ~65k ints per application and
+  again per application-set member — a commit-time allocation spike on the same
+  goroutine that services the control socket. `appPortRangesFromSpec` (nat.go)
+  emits the range directly: a port spec is a single value or ONE contiguous
+  range, so its coalesced form is always zero or one wire range and there is
+  nothing to merge. `appTerm` now carries `dstRanges []NatPortRangeWire` plus
+  `dstPortsPresent bool` — the latter preserving the one other thing the slice
+  was read for, whether the source list was non-empty BEFORE coalescing, which
+  the #3726/#3857 fail-closed test needs and a coalesced list cannot recover (a
+  spec of `"0"` is present but coalesces away). `appPortsFromSpec` is retained
+  and now shares `appPortSpecBounds` with the range emitter so the two cannot
+  drift; `TestAppPortRangesFromSpecMatchesCoalescedSlice` asserts they AGREE
+  across a spec corpus rather than checking a hand-written expectation table,
+  and `TestAppPortRangesFromSpecDoesNotMaterializeTheRange` reds on an
+  allocation count if the composition comes back. A single port (`Low==High`, including the `[0,0]` wildcard) keeps
   the exact-port `DnatKey` O(1) fast path (`destination_port` set,
   `match_destination_ports` empty — unchanged for the common single-port and
   IP-only rules). A multi-port range is emitted as ONE wildcard-port entry
@@ -987,8 +1138,29 @@ VIPs, so a VIP stays kernel-local and a DNAT/static match on it is still inert
 (still warns). The advisory now fires only when the address is genuinely
 kernel-local, not when it is interface-NAT-routed.
 
-**Track-2 (deferred): the full dataplane fix.** A dedicated intent map probed
+**Track-2 (NOT PLANNED): the full dataplane fix.** A dedicated intent map probed
 before the local classification (Option B) is a large, verifier-gated, HA-aware
-project deferred by the converged #5837 research plan
-(`docs/research/5837-xdp-dnat-before-local/plan.md` §0/§0a/§0b). Until it lands
-the commit warning is the honest mitigation.
+project. It was tracked as #6051 and is **plan-killed** — the commit warning is
+the terminal mitigation, not an interim one.
+
+The three reasons, all still true at HEAD:
+
+- **The verifier constraint is real and current.** `is_local_destination` lives
+  in `userspace-xdp/src/lib.rs` — the retained AF_XDP shim, which is a real eBPF
+  program under a real verifier. The eBPF *dataplane* retirement (#1373/#1476)
+  deleted `bpf/xdp/` and `bpf/tc/` but did not retire this shim, so the 1M-insn
+  cap and the tail-call ban still bind. The probe would have to live in the miss
+  arm and every degraded / binding-missing / heartbeat-stale branch and behind an
+  IPv6-AH guard, with no shimverify headroom metric to size it against.
+- **Two correctness dimensions are unsolved, not merely unimplemented**:
+  fail-closed behaviour on incomplete/failed intent-reconcile state, and
+  HA-failover generation-safety of the intent map across a primary swap.
+- **The affected population is small.** Per the interface-mode SNAT fold above,
+  the canonical masquerade + WAN-port-forward config is not affected at all. The
+  residual is a DNAT / static-NAT rule matching an interface address on an
+  interface whose zone is not the to-zone of any interface-mode source-NAT rule —
+  and it warns at commit with the workaround stated.
+
+The converged design survives on branch `research/5837-xdp-dnat-before-local`
+(`docs/research/5837-xdp-dnat-before-local/plan.md` §0b + §1-§13) if a measured
+operator report on that residual ever revives it.

@@ -15,6 +15,83 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// helperEventSocketPath resolves the event-socket path for a helper config: the
+// explicit `event-socket` when the operator set one, else the conventional name
+// beside the control socket. The pre-stop preflight and the listener setup both
+// resolve it through here, so they can never disagree about which path was
+// validated (#5839).
+func helperEventSocketPath(cfg config.UserspaceConfig) string {
+	if cfg.EventSocket != "" {
+		return cfg.EventSocket
+	}
+	return filepath.Join(filepath.Dir(cfg.ControlSocket), "userspace-dp-events.sock")
+}
+
+// preflightHelperPaths rejects a helper path set that bring-up would have to
+// refuse anyway, while the RUNNING generation can still be spared (#5839).
+//
+// ensureProcessLocked stops generation N before it prepares generation N+1, so
+// without a preflight every path fault is paid for with forwarding: the healthy
+// helper is killed, socket preparation then fails, and the node is left with no
+// dataplane at all. The two checks here are exactly the DETERMINISTIC faults —
+// an aliased path, and a path that exists as something other than a Unix socket
+// — neither of which stopping the helper can change. Everything conditional on
+// the running helper is deliberately left to removeStaleUnixSocket after the
+// stop; above all the liveness check, since the control socket is live PRECISELY
+// UNTIL we stop the helper that owns it.
+//
+// It fails only on a certain fault. An Lstat error other than "does not exist"
+// is inconclusive here and is left to the post-stop path rather than turned into
+// a new bring-up failure on a code path that used to have none.
+func preflightHelperPaths(cfg config.UserspaceConfig) error {
+	evtPath := helperEventSocketPath(cfg)
+	// The stale-socket primitive must never be pointed at the state file: a
+	// REGULAR FILE is expected there, so aliasing it onto a socket path would
+	// hand helper state to a socket unlink. Aliasing the two sockets onto each
+	// other is equally unworkable — the daemon's event listener would occupy
+	// the path the helper must bind.
+	for _, pair := range []struct{ aName, a, bName, b string }{
+		{"control-socket", cfg.ControlSocket, "event socket", evtPath},
+		{"control-socket", cfg.ControlSocket, "state-file", cfg.StateFile},
+		{"event socket", evtPath, "state-file", cfg.StateFile},
+	} {
+		if pair.a != "" && pair.a == pair.b {
+			return fmt.Errorf("userspace dataplane %s and %s must name distinct paths (both are %s)",
+				pair.aName, pair.bName, pair.a)
+		}
+	}
+	for _, sock := range []struct{ kind, path string }{
+		{socketKindControl, cfg.ControlSocket},
+		{socketKindEventStream, evtPath},
+	} {
+		if sock.path == "" {
+			continue
+		}
+		info, err := os.Lstat(sock.path)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("userspace dataplane %s %s is a %s, not a Unix socket",
+				sock.kind, sock.path, describeFileMode(info.Mode()))
+		}
+	}
+	return nil
+}
+
+// stopForNewGenerationLocked preflights the incoming path set and tears the
+// running helper down only once that preflight passes, so a config that cannot
+// bring up a new generation leaves the previous one — and its forwarding —
+// running (#5839).
+func (m *Manager) stopForNewGenerationLocked(cfg config.UserspaceConfig) error {
+	if err := preflightHelperPaths(cfg); err != nil {
+		return fmt.Errorf("refusing to restart userspace dataplane helper, "+
+			"previous generation left running: %w", err)
+	}
+	m.stopLocked()
+	return nil
+}
+
 func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	tuneSocketBuffers()
 	if m.proc != nil && m.proc.Process != nil && configEqual(m.cfg, cfg) {
@@ -26,10 +103,14 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 			return nil
 		}
 		slog.Warn("userspace dataplane helper unhealthy, restarting")
-		m.stopLocked()
+		if err := m.stopForNewGenerationLocked(cfg); err != nil {
+			return err
+		}
 	}
 	if m.proc != nil {
-		m.stopLocked()
+		if err := m.stopForNewGenerationLocked(cfg); err != nil {
+			return err
+		}
 	}
 	m.clearLastStatusLocked()
 	binary, err := findBinary(cfg.Binary)
@@ -42,13 +123,18 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	if err := os.MkdirAll(filepath.Dir(cfg.StateFile), 0755); err != nil {
 		return fmt.Errorf("mkdir state dir: %w", err)
 	}
-	_ = os.Remove(cfg.ControlSocket)
+	// The control socket is named by operator configuration and xpfd runs as
+	// root, so the stale-socket unlink is guarded rather than fire-and-forget:
+	// it refuses a path that is not a Unix socket, refuses one a live listener
+	// still holds, and surfaces a removal failure instead of discarding it
+	// (#5839). The helper has not been spawned yet, so failing here costs
+	// nothing beyond the generation that was already stopped.
+	if err := removeStaleUnixSocket(socketKindControl, cfg.ControlSocket); err != nil {
+		return err
+	}
 	// Start the event stream listener before spawning the helper so it
 	// can connect immediately.
-	evtPath := cfg.EventSocket
-	if evtPath == "" {
-		evtPath = filepath.Join(filepath.Dir(cfg.ControlSocket), "userspace-dp-events.sock")
-	}
+	evtPath := helperEventSocketPath(cfg)
 	es := NewEventStream(evtPath)
 	esCtx, esCancel := context.WithCancel(context.Background())
 	// The event socket is the primary push path for post-bootstrap session
@@ -98,6 +184,10 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	}
 	m.cfg = cfg
 	m.proc = cmd
+	// #5838: one waiter per generation, started here and nowhere else. Until
+	// this existed a helper that died AFTER reporting ready was never reaped,
+	// never noticed, and left every `m.proc == nil` liveness test reading TRUE.
+	m.startHelperSupervisorLocked(cmd)
 	// Bootstrap XSK fill ring on all queues: send broadcast pings
 	// 3 seconds after helper start. During this window, ctrl is disabled;
 	// the shim only passes proven local/control traffic and drops transit.
@@ -125,8 +215,25 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 				return nil
 			}
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			break
+		// #5838: ask the generation's WAITER whether the child is gone, not
+		// cmd.ProcessState. ProcessState is written by cmd.Wait(), which now
+		// runs on the supervisor goroutine, so reading it here would be a data
+		// race — and before a waiter existed it was simply always nil, which is
+		// why this early-out could never fire. The closed channel is the
+		// race-free happens-before edge for the same question.
+		if m.procSup != nil {
+			select {
+			case <-m.procSup.exited:
+				// Read the disposition BEFORE the teardown: stopLocked clears
+				// procSup, so reporting it afterwards would dereference nil.
+				disposition := m.procSup.describeExit()
+				slog.Error("userspace dataplane helper exited before becoming ready",
+					"disposition", disposition)
+				m.stopLocked()
+				return fmt.Errorf("userspace dataplane helper exited before becoming ready at %s: %s",
+					cfg.ControlSocket, disposition)
+			default:
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -195,6 +302,31 @@ func findBinary(explicit string) (string, error) {
 }
 
 func (m *Manager) stopLocked() {
+	// #5838 follow-up: retire this process generation FIRST — before the
+	// `m.proc == nil` early return below, which is exactly the branch an
+	// intentional stop takes when the helper has already crashed (the crash
+	// path nils `m.proc` itself, so a stop after a crash reached NONE of the
+	// teardown under that return).
+	//
+	// `restartHelperAfterCrash` fences its attempt on `m.procGen != gen`, and
+	// before this bump a stop satisfied none of its three fences: it cleared
+	// `m.proc` and `m.procSup` but left `m.procGen` and `m.helperCrash`
+	// untouched. A crash whose backoff was still pending when the daemon shut
+	// down therefore spawned a helper for a Manager that had been torn down —
+	// after `Close()` that child outlives xpfd holding the NIC queues, the
+	// EBUSY-on-zero-copy-queues collision the next start then hits — and the
+	// restart chain kept re-arming afterwards.
+	//
+	// Only the GENERATION is retired here. `m.helperCrash` is deliberately NOT
+	// cleared: `ensureProcessLocked` calls this same function when a spawn
+	// fails its readiness wait, and the crash record is the retry debt that
+	// path depends on (attempt count and backoff). Clearing it here would make
+	// a failed restart forget it was retrying — see
+	// TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838, which pins that
+	// debt. The bump is compatible with that path by construction: it already
+	// re-fences its next attempt on whatever `m.procGen` reads after the failed
+	// spawn.
+	m.procGen++
 	if m.eventStreamCancel != nil {
 		m.eventStreamCancel()
 		m.eventStreamCancel = nil
@@ -223,11 +355,14 @@ func (m *Manager) stopLocked() {
 	// before the helper shutdown below (#5486).
 	_ = m.disableCtrlBeforeTeardownLocked()
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
-	done := make(chan struct{})
-	go func(cmd *exec.Cmd) {
-		_ = cmd.Wait()
-		close(done)
-	}(m.proc)
+	// The waiter started at spawn owns this child's Wait. Waiting on ITS
+	// completion — rather than launching a second cmd.Wait() here, which is
+	// what this code used to do — is what makes "exactly one Wait per
+	// generation" true; two waiters race and one of them gets ECHILD.
+	//
+	// Blocking on it while holding m.mu is safe because superviseHelper closes
+	// exited BEFORE it acquires m.mu.
+	done := m.helperExitedChanLocked()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -244,6 +379,45 @@ func (m *Manager) stopLocked() {
 		}
 	}
 	m.proc = nil
+	m.procSup = nil
+	m.resetAfterHelperGoneLocked()
+}
+
+// helperExitedChanLocked returns the channel the current generation's waiter
+// closes when the child is reaped. A generation with no supervisor record
+// cannot happen for a running helper (startHelperSupervisorLocked runs under
+// the same lock as the m.proc assignment), but returning an already-closed
+// channel keeps a teardown from blocking forever if it ever did.
+func (m *Manager) helperExitedChanLocked() chan struct{} {
+	if m.procSup != nil {
+		return m.procSup.exited
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// resetAfterHelperGoneLocked clears every piece of manager state that describes
+// a helper which is no longer running.
+//
+// It is shared by the intentional teardown (stopLocked) and the crash path
+// (handleUnexpectedHelperExitLocked) precisely so the two cannot drift about
+// WHICH state a departed helper invalidates. A crash that cleared less than a
+// stop would leave exactly the stale readiness the issue is about; before this
+// existed the crash path cleared nothing at all.
+func (m *Manager) resetAfterHelperGoneLocked() {
+	if m.eventStreamCancel != nil {
+		m.eventStreamCancel()
+		m.eventStreamCancel = nil
+	}
+	if m.eventStream != nil {
+		m.eventStream.Close()
+		m.eventStream = nil
+	}
+	if m.syncCancel != nil {
+		m.syncCancel()
+		m.syncCancel = nil
+	}
 	m.clearLastStatusLocked()
 	m.neighborsPrewarmed = false
 	m.ctrlEnableAt = time.Time{}

@@ -71,6 +71,38 @@ func (rg *RedundancyGroupState) IsReadyForTakeover(holdTime time.Duration) bool 
 	return rg.Ready && !rg.ReadySince.IsZero() && time.Since(rg.ReadySince) >= holdTime
 }
 
+// TakeoverHoldRemaining returns how much of holdTime is still to run before
+// IsReadyForTakeover(holdTime) can return true, or 0 when the hold is not what
+// is holding this RG back — either it is not Ready at all (ReadinessReasons
+// carries the real cause) or the hold has already elapsed.
+//
+// This exists because Ready and takeover-ELIGIBLE are different properties and
+// the status render must not report the first as if it were the second (#103
+// item 5). Between SetRGReady(ready) and ReadySince+holdTime the election gates
+// at election.go/failover.go all refuse to promote, so an operator reading a
+// bare "Takeover ready: yes" would see a status line that contradicts an
+// election that is actively declining to promote, with nothing naming the hold.
+func (rg *RedundancyGroupState) TakeoverHoldRemaining(holdTime time.Duration) time.Duration {
+	if !rg.Ready || rg.ReadySince.IsZero() || holdTime <= 0 {
+		return 0
+	}
+	remaining := holdTime - time.Since(rg.ReadySince)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+// TakeoverHoldTime returns the configured minimum ready duration an RG must
+// sustain before election will promote it (`set chassis cluster
+// takeover-hold-time`). Zero — the default — means the hold adds nothing and
+// Ready alone decides.
+func (m *Manager) TakeoverHoldTime() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.takeoverHoldTime
+}
+
 // ClusterEvent signals a state change in the cluster.
 type ClusterEvent struct {
 	GroupID       int

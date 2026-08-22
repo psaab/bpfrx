@@ -647,7 +647,14 @@ impl CookieChecker {
         responder_static_pub: &[u8; WG_KEY_LEN],
         aad_mac1: &[u8],
     ) -> Option<[u8; WG_COOKIE_LEN]> {
-        if reply.len() != WG_MSG_COOKIE_LEN || reply[0] != WG_TYPE_COOKIE {
+        // #5191 (A1-b9-F5): full 32-bit little-endian type-word check, not a
+        // low-byte compare — a CookieReply with nonzero reserved bytes is
+        // rejected by kernel WG / wireguard-go, so accepting it here was a
+        // parser differential. Length is verified first: is_canonical_type
+        // indexes reply[0..4].
+        if reply.len() != WG_MSG_COOKIE_LEN
+            || !super::handshake::is_canonical_type(reply, WG_TYPE_COOKIE)
+        {
             return None;
         }
         let key = cookie_encryption_key(responder_static_pub);

@@ -24,7 +24,6 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
-	"google.golang.org/grpc/metadata"
 )
 
 // showChassisForwarding renders the Junos-style forwarding-daemon
@@ -32,8 +31,9 @@ import (
 // blocks; the `xpf-no-peer:1` gRPC metadata bypasses the peer dial
 // to prevent infinite recursion (#879).
 func (s *Server) showChassisForwarding(ctx context.Context, buf *strings.Builder) {
-	md, _ := metadata.FromIncomingContext(ctx)
-	isPeerCall := len(md.Get("xpf-no-peer")) > 0
+	// #5883: the no-peer hop marker is read from the unforgeable in-process
+	// capability, not from caller-supplied metadata.
+	isPeerCall := peerMarkersFromContext(ctx).noPeer
 
 	localBuf := s.buildLocalForwarding()
 

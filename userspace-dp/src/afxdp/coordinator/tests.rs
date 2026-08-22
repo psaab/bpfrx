@@ -6194,3 +6194,112 @@ fn refresh_runtime_snapshot_build_failure_is_atomic_noop_3766() {
         11
     );
 }
+
+/// #5190 (A1-b8-F6) fail-on-revert + structural CENSUS: every field
+/// `copy_live_snapshot` writes onto a BOUND slot must be cleared again by
+/// `zero_unbound_slot` when that slot loses its worker. The two halves had
+/// drifted: the copy half wrote `shared_umem_mode`/`shared_umem_group`/
+/// `shared_umem_socket_role`/`shared_umem_disabled_reason` (four Strings)
+/// and the `martian_dropped`/`ipv6_ext_header_dropped` drop counters, and
+/// the reset half cleared none of them — so an unbound slot kept
+/// advertising a dead socket's shared-UMEM role and a frozen drop count
+/// next to `rx_packets == 0`.
+///
+/// Rather than re-enumerate 150+ fields by hand (an enumeration is a
+/// FLOOR, not a census, and the next field added to the copy half would
+/// slip through it), this drives the real
+/// `Coordinator::refresh_bindings` unbound branch over a status whose
+/// EVERY serialized field has been poisoned with a sentinel, then asserts
+/// the result is field-for-field equal to `BindingStatus::default()`
+/// except for the registry-owned identity fields. A future field added to
+/// `copy_live_snapshot` but not to `zero_unbound_slot` fails this test
+/// with the offending key NAMED, without anyone having to remember to
+/// extend the test.
+#[test]
+fn zero_unbound_slot_clears_every_copied_field_5190() {
+    use serde_json::Value;
+
+    /// Replace every scalar in the tree with a sentinel that is NOT the
+    /// serde default, so a field the reset half forgets stays visibly
+    /// poisoned. `Null` stays null (a `None` Option carries no sentinel
+    /// to poison); empty arrays gain one element so a `.clear()` that
+    /// never runs is observable.
+    fn poison(v: &mut Value) {
+        match v {
+            Value::Null => {}
+            Value::Bool(b) => *b = true,
+            Value::Number(n) => *n = serde_json::Number::from(4242u64),
+            Value::String(s) => *s = "STALE-5190".to_string(),
+            Value::Array(a) => {
+                if a.is_empty() {
+                    a.push(Value::Number(serde_json::Number::from(4242u64)));
+                } else {
+                    for e in a.iter_mut() {
+                        poison(e);
+                    }
+                }
+            }
+            Value::Object(o) => {
+                for (_k, e) in o.iter_mut() {
+                    poison(e);
+                }
+            }
+        }
+    }
+
+    // Registry-owned identity: `refresh_bindings` must NOT clear these —
+    // they name the slot, not the (now absent) worker.
+    const IDENTITY_KEYS: &[&str] = &[
+        "slot",
+        "queue_id",
+        "worker_id",
+        "interface",
+        "ifindex",
+        "registered",
+        "armed",
+    ];
+
+    let default_json = serde_json::to_value(BindingStatus::default())
+        .expect("BindingStatus must serialize");
+    let mut poisoned_json = default_json.clone();
+    poison(&mut poisoned_json);
+    let poisoned: BindingStatus =
+        serde_json::from_value(poisoned_json).expect("poisoned BindingStatus must deserialize");
+    // Sanity: the poison actually took, otherwise this test is vacuous.
+    assert_eq!(
+        poisoned.shared_umem_mode, "STALE-5190",
+        "poison harness failed to populate shared_umem_mode — test would be vacuous"
+    );
+    assert_ne!(
+        poisoned.martian_dropped, 0,
+        "poison harness failed to populate martian_dropped — test would be vacuous"
+    );
+
+    let mut bindings = vec![poisoned];
+    // No live worker registered for this slot -> refresh_bindings takes
+    // the `zero_unbound_slot` branch (the production path).
+    let mut coordinator = Coordinator::new();
+    coordinator.refresh_bindings(&mut bindings);
+
+    let cleared = serde_json::to_value(&bindings[0]).expect("BindingStatus must serialize");
+    let (cleared_obj, default_obj) = match (&cleared, &default_json) {
+        (Value::Object(c), Value::Object(d)) => (c, d),
+        _ => panic!("BindingStatus must serialize as a JSON object"),
+    };
+    let mut stale: Vec<String> = Vec::new();
+    for (key, got) in cleared_obj.iter() {
+        if IDENTITY_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let want = default_obj.get(key).unwrap_or(&Value::Null);
+        if got != want {
+            stale.push(format!("{key}: got {got}, want {want}"));
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "#5190: zero_unbound_slot left these fields stale on an unbound \
+         slot (copy_live_snapshot writes them, the reset half must clear \
+         them): {stale:?}"
+    );
+}

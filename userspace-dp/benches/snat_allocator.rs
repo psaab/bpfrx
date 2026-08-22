@@ -20,9 +20,11 @@
 // `live_by_flow` map insert/remove. The global tracked-flow cap becomes
 // one `AtomicUsize` (fetch_add-reserve / fetch_sub-rollback, plan F4).
 //
-// This bench is the REQUIRED merge gate: it answers the PLAN-KILL
-// question "is the global mutex a measurable bottleneck at the loss
-// cluster's 6-worker scale?" by re-implementing BOTH shapes side by
+// This bench answers the #2852 PLAN-KILL question "is the global mutex
+// a measurable bottleneck at the loss cluster's 6-worker scale?" — a
+// question a HUMAN answers by reading its table. It was described as a
+// "REQUIRED merge gate", which it is not: see the #5190 banner below.
+// It re-implements BOTH shapes side by
 // side (the production allocator is `pub(crate)` in a bin crate, so we
 // re-implement the hot-path shapes here — same pattern as
 // benches/session_table.rs / benches/tx_kick_latency.rs) and driving
@@ -30,6 +32,25 @@
 // profiles: (a) uniform low occupancy, (b) 85-98% occupancy, (c) 80/20
 // source skew, (d) a narrow 64-port range.
 //
+// ---------------------------------------------------------------------------
+// #5190 (A1-b12-F3) VERDICT STATUS: THIS BENCH IS EXPLORATORY — IT DOES NOT
+// GATE. It measures and PRINTS its table; it compares nothing against a
+// threshold and never exits non-zero. A severe regression here still exits 0,
+// so a wrapper that reads only the exit status learns NOTHING from running it.
+// Read the printed table.
+//
+// The benches in this crate that DO gate are `prefix_set_lookup.rs` and
+// `runtime_view_refresh.rs`: both compare a measured percentile against a
+// named threshold and call `std::process::exit(1)` on breach. Copy that shape
+// if this target is ever promoted to a real gate.
+//
+// Nothing in CI or the Makefile runs `cargo bench` — `make test-rust` builds
+// `--bins --tests` and deliberately EXCLUDES benches — so no automated gate is
+// currently reporting a false green from this file. The hazard this banner
+// closes is a human running it on the strength of the wording above and
+// reading exit 0 as a pass.
+// ---------------------------------------------------------------------------
+
 // It is `harness = false` with its own `fn main()` (not criterion):
 // criterion times a single-threaded closure and cannot express M-thread
 // contention or cross-thread p99/p999 tail latency, which is the whole

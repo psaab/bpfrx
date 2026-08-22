@@ -146,7 +146,12 @@ func TestGetZonePairSummaryHonorsRecursionGuard(t *testing.T) {
 		return &pb.GetZonePairSummaryResponse{}, nil
 	}
 
-	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-peer-forwarded", "1"))
+	// #5883: the marker is only trusted when the FABRIC listener's interceptor
+	// promotes it to the in-process capability, so build the context the way
+	// production does. Before #5883 this was raw incoming metadata, which is
+	// exactly the forgeability the issue reported: the test constructed an
+	// ordinary client context and the predicate believed it.
+	ctx := fabricMarkerCtx(t, metadata.MD{peerForwardedMetadataKey: []string{"1"}})
 	resp, err := s.GetZonePairSummary(ctx, &pb.GetZonePairSummaryRequest{IncludePeer: true})
 	if err != nil {
 		t.Fatalf("GetZonePairSummary() error = %v", err)

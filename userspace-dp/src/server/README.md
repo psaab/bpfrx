@@ -99,6 +99,39 @@ this surface over a Unix socket using a newline-delimited text protocol.
     periodic write. `write_state_releases_lock_before_persist` is the
     fail-on-revert guard (a same-thread `try_lock` at the persist point, which
     a non-reentrant `Mutex` grants only if the guard was truly dropped).
+  - **`wait_for_binding_settle` releases the lock across every sleep
+    (#5862).** The three arms that reconcile bindings —
+    `set_forwarding_state`, `set_queue_state`, `set_binding_state` — end by
+    polling until bindings quiesce, up to 2 s at 50 ms. That poll used to run
+    inside the locked `match`, holding the whole server's mutex across its
+    sleeps.
+    That is not a latency nit, because of what shares the mutex. The HA
+    session socket is a SEPARATE socket accepted on a SEPARATE thread
+    (`lifecycle.rs`, #452), but its one verb — `sync_session` — dispatches
+    through the same `Arc<Mutex<ServerState>>`, so the socket split never
+    split the critical section. The Go side budgets 3 s for a session
+    round-trip (`sessionSyncRoundtripDeadline`,
+    `pkg/dataplane/userspace/process_control.go`) and #5380 aborts the REST
+    of a bulk batch on the first transport failure — so a settle overlapping
+    a mirror burst can DROP the remainder of a batch of up to 255 session
+    mirrors, during exactly the failover this path exists to serve.
+    The handlers now only RECORD that a settle is owed; `handle_request` runs
+    it after the guard drops and re-derives the response status under a fresh
+    short acquisition, the same locked-kick / unlocked-wait split #2962
+    (owner-RG export ack-wait) and #4054 (bulk export push) already use.
+    Interleaving between polls is the point, not a hazard: this is a
+    convergence wait, not a transaction, and the predicate is re-evaluated
+    from scratch each iteration.
+    Guarded by two fail-on-revert tests —
+    `wait_for_binding_settle_releases_state_lock_between_polls` (the helper)
+    and `sync_session_is_served_during_a_forwarding_settle_wait` (the handler
+    wiring, driven through the real dispatcher).
+    **Still under the lock, and NOT closed by this change** (see the tracking
+    issue): the 10 s worker-readiness barrier and the 500 ms mlx5 quiesce
+    reachable from `apply_snapshot` -> `Coordinator::reconcile`, the unbounded
+    worker `join()` in `stop_and_clear`, and the BPF pin-open syscalls in the
+    reconcile preflight. `ServerState` itself is still one mutex over four
+    fields.
 - `tests.rs` — colocated unit tests for the dispatcher, the per-verb
   handler error/gating arms, and the pure helper predicates (#1653
   §3.1). Handlers are driven through the real `handle_stream` call site

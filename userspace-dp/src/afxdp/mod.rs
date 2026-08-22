@@ -388,15 +388,15 @@ const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
 /// Prevents lost-wakeup stalls from the race: commit() → check needs_wakeup
 /// (clear) → kernel exhausts cache → sets needs_wakeup → userspace doesn't see it.
 const FILL_WAKE_SAFETY_INTERVAL_NS: u64 = 500_000; // 500µs
+/// How often a bound worker stamps its heartbeat slot, from the worker loop
+/// (`maybe_touch_heartbeat`, `afxdp/bpf_map/ha.rs`).
+///
+/// The shim reads that slot and treats it as STALE past
+/// `USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS` (5 s, `userspace-xdp/src/lib.rs`),
+/// so this cadence carries 20x headroom. A worker that stops stamping —
+/// because the helper died, or because the loop is wedged — therefore has its
+/// transit DROPPED by the shim within 5 s, not passed to the kernel.
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
-/// Grace period after binding before writing heartbeat. During this window
-/// the XDP shim sees no heartbeat → XDP_PASS → kernel forwards packets AND
-/// NAPI bootstraps the NIC's XSK receive queue from the fill ring. After
-/// this period, heartbeat is written and the XDP shim redirects to XSK.
-/// Must exceed the Go-side ctrl enable delay (3s) plus time for
-/// NAPI to bootstrap the XSK RQ from the fill ring (~2-3 seconds).
-#[allow(dead_code)] // reserved for heartbeat gating logic
-const HEARTBEAT_GRACE_PERIOD_NS: u64 = 6_000_000_000; // 6 seconds
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 /// #5468: upper bound on the worker-loop lossless session-delta send
@@ -437,8 +437,8 @@ use crate::ip_proto::{PROTO_AH, PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, 
 // visible to `super::*` consumers: event_emit, tx/tcp_segmentation,
 // frame/tcp_segmentation, frame/*) so the move is value-identical.
 use crate::tcp_flags::{
-    TCP_FIN as TCP_FLAG_FIN, TCP_PSH as TCP_FLAG_PSH, TCP_RST as TCP_FLAG_RST,
-    TCP_SYN as TCP_FLAG_SYN,
+    TCP_CWR as TCP_FLAG_CWR, TCP_FIN as TCP_FLAG_FIN, TCP_PSH as TCP_FLAG_PSH,
+    TCP_RST as TCP_FLAG_RST, TCP_SYN as TCP_FLAG_SYN, TCP_URG as TCP_FLAG_URG,
 };
 const TUNNEL_HA_STARTUP_GRACE_SECS: u64 = 10;
 const SOL_XDP: c_int = 283;

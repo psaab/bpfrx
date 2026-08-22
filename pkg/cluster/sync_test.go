@@ -802,6 +802,12 @@ type mockSweepDP struct {
 	deletedDNATV6  []dataplane.DNATKeyV6
 	failSetV4      map[dataplane.SessionKey]error
 	failSetV6      map[dataplane.SessionKeyV6]error
+	// onSetV4/onSetV6, when set, run INSIDE the session write. They exist so a
+	// test can land a concurrent event in the exact window between a caller's
+	// pre-write check and the write itself — the #6368 config-apply race. nil
+	// in every other test, so the write path is unchanged for them.
+	onSetV4 func()
+	onSetV6 func()
 }
 
 // Sessions implements clusterRuntime by wrapping the mock in the same
@@ -863,6 +869,9 @@ func (m *mockSweepDP) GetSessionV6(key dataplane.SessionKeyV6) (dataplane.Sessio
 }
 
 func (m *mockSweepDP) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	if m.onSetV4 != nil {
+		m.onSetV4()
+	}
 	if err, ok := m.failSetV4[key]; ok {
 		return err
 	}
@@ -874,6 +883,9 @@ func (m *mockSweepDP) SetSessionV4(key dataplane.SessionKey, val dataplane.Sessi
 }
 
 func (m *mockSweepDP) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	if m.onSetV6 != nil {
+		m.onSetV6()
+	}
 	if err, ok := m.failSetV6[key]; ok {
 		return err
 	}
@@ -3729,9 +3741,15 @@ func TestHandleRemoteFailoverWithholdsAckUntilFenced(t *testing.T) {
 	// watchClusterEvents actuates the demotion.
 	fenced := make(chan struct{})
 	waitEntered := make(chan struct{}, 1)
-	ss.WaitFailoverApplied = func(rgID int) error {
+	ss.WaitFailoverApplied = func(rgID int, reqID uint64) error {
 		if rgID != 7 {
 			return fmt.Errorf("unexpected rg %d", rgID)
+		}
+		// #6177: the fence must be waited on for the SAME request the
+		// handler armed. A mismatch would leave the wait reading a barrier
+		// that belongs to another cycle (or none at all).
+		if reqID != 42 {
+			return fmt.Errorf("fence waited on request %d, want 42", reqID)
 		}
 		select {
 		case waitEntered <- struct{}{}:
@@ -3803,7 +3821,14 @@ func TestHandleRemoteFailoverBatchWithholdsAckUntilFenced(t *testing.T) {
 
 	fenced := make(chan struct{})
 	waitEntered := make(chan struct{}, 1)
-	ss.WaitFailoverAppliedBatch = func([]int) error {
+	ss.WaitFailoverAppliedBatch = func(gotRGs []int, reqID uint64) error {
+		// #6177: same-request binding as the single-RG case above.
+		if reqID != 43 {
+			return fmt.Errorf("batch fence waited on request %d, want 43", reqID)
+		}
+		if len(gotRGs) != 2 {
+			return fmt.Errorf("batch fence waited on %v, want 2 RGs", gotRGs)
+		}
 		select {
 		case waitEntered <- struct{}{}:
 		default:

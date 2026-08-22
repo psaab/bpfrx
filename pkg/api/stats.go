@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	xnft "github.com/psaab/xpf/pkg/nftables"
 )
 
 func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
@@ -31,9 +32,23 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 	// #3681 (L03): keep the per-zone/family breakdown so the aggregate scalar's
 	// [zone, family] dimensions (WAN-v4 vs WAN-v6 vs unexpected-internal-zone —
 	// the incident-response signal) are not lost.
-	if kc, err := readHostInboundDenyCounters(); err != nil {
+	//
+	// #5719: the same marker covers a COUNTERLESS table. The #5644 cold-boot
+	// fail-closed fence installs `inet xpf_hostinbound` with catch-all DROPs and
+	// deliberately NO named counters, so while it enforces, the object walk
+	// returns an empty set from a table that is actively dropping host-bound
+	// traffic — publishing `host_inbound_kernel_denies: 0` with no marker would
+	// certify "no denies" during exactly the degraded window that most needs the
+	// signal. An ABSENT table stays an authoritative 0 (no enforcement really is
+	// no denies), and a table whose real deny counters merely READ zero also
+	// stays authoritative: those counter objects exist, so the read is Counted.
+	kc, nftState, err := readHostInboundDenyCounters()
+	switch {
+	case err != nil:
 		stats.HostInboundKernelDeniesUnavailable = true
-	} else {
+	case nftState == xnft.HostInboundTableCounterless:
+		stats.HostInboundKernelDeniesUnavailable = true
+	default:
 		for _, ctr := range kc {
 			stats.HostInboundKernelDenies += ctr.Packets
 			stats.HostInboundKernelDenyDetail = append(stats.HostInboundKernelDenyDetail,

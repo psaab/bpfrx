@@ -104,6 +104,14 @@ const (
 	// commits but silently carries no traffic; the name is rejected at
 	// commit check (#5297).
 	ValueSecureTunnelIf
+	// ValueUnixSocketPath is an absolute filesystem path a Unix-domain
+	// socket is bound at (`system dataplane control-socket`). Validated by
+	// ValidateUnixSocketPath: absolute, no `.`/`..`/empty component, within
+	// the 107-octet AF_UNIX sun_path limit. The path is handed to the
+	// dataplane's stale-socket unlink at every bring-up, so a traversal or a
+	// relative path is rejected at commit rather than resolved at runtime
+	// against a working directory the operator never named (#5839).
+	ValueUnixSocketPath
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -150,6 +158,8 @@ func (v ValueType) Placeholder() string {
 		return "<timezone>"
 	case ValueSecureTunnelIf:
 		return "<st-interface>"
+	case ValueUnixSocketPath:
+		return "<socket-path>"
 	}
 	return ""
 }

@@ -676,7 +676,11 @@ snapshot — so once the apply reaches its tail the standby is forwarding under 
 new policy set. The three session invalidators (`clearSessionsForPolicyChanges`:
 the #4234 deletion-clear, the modified-policy re-eval, and the #4342
 default-policy change) MUST therefore run to re-authorize surviving established
-sessions against the now-active config. They run from a deferred, guarded block
+sessions against the now-active config. They are reached through
+`reportSessionAuthorizationChanges` (#5858), the single commit-time entry point
+that also emits the interface-input-filter advisory — the two halves cover the
+same hazard on different objects, so binding them makes it impossible for a
+commit path to wire one without the other. They run from a deferred, guarded block
 so they ALWAYS fire once the config reached active+armed — including on a
 NON-FATAL best-effort tail failure (host-inbound/lo0 nft, networkd, ...) that
 `applyConfigLocked` joins and returns. Skipping them on such an error (the
@@ -818,13 +822,33 @@ the event-stream stream can drop frames under load, it can never delimit an
 authoritative snapshot: reconciling against an incomplete set would DELETE live
 peer-owned sessions merely dropped in transit. The override is therefore no
 longer wired in production (`startClusterComms`); `doBulkSync` always ends with
-`BulkSync()`, whose direct writes under `writeMu` are lossless and complete.
-`BulkSync` sources sessions from the shim `sessions`/`sessions_v6` BPF mirror
-maps (owner-RG-filtered by `ShouldSyncZone`); a table-truth source
-(`ExportOwnerRGSessions`) that removes the mirror-drift residual is tracked as a
-follow-up. `BulkSyncOverride` is retained only as a test/extension seam and is
-regression-proof: the trailing `BulkSync()` runs unconditionally, so an override
-can never re-send empty markers.
+a lossless direct-write window under `writeMu`. `BulkSyncOverride` is retained
+only as a test/extension seam and is regression-proof: the trailing window is
+framed unconditionally, so an override can never re-send empty markers.
+
+#### Table-truth window source (#6031)
+
+The window's session SOURCE is no longer the shim `sessions`/`sessions_v6` BPF
+maps. Under the userspace dataplane those are a best-effort **display mirror**:
+the helper publishes a conntrack row only on the host-inbound install, the
+missing-neighbor seed, and the reverse-companion repair, so a **transit** session
+— which is what an HA firewall is actually protecting — has no row there at all.
+Combined with the authoritative reconcile above (absent from the window ⇒
+DELETED), framing the window from that mirror deleted the standby's live
+peer-owned transit sessions on every cold prime, survivor re-drive, and forced
+resync.
+
+`doBulkSync` now prefers `SessionSync.BulkSnapshotSource`, wired by the daemon to
+`ExportOwnerRGSessions(rgIDs, 0)` — the helper's in-process `SessionTable`,
+owner-RG-filtered, synchronous, and UNBOUNDED (a cap would truncate the window
+and the peer would delete the remainder). The snapshot is converted by the SAME
+walk and filter the incremental delta stream uses, so both admit one set, and it
+is framed verbatim (no second `ShouldSyncZone` pass — that could drop an entry
+the incremental path admits, which the receiver would then delete). If the source
+errors, `doBulkSync` fails CLOSED and frames NO window rather than falling back
+to the mirror: an incomplete authoritative window destroys live sessions, while
+framing none only defers the reconcile to the next armed retry. `BulkSync()`'s
+store walk remains for callers with no snapshot source wired.
 
 #### Survivor-fabric cold-start bulk re-drive (#4090)
 
