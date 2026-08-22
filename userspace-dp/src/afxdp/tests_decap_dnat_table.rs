@@ -732,3 +732,168 @@ fn publish_dnat_table_entry_v6_attempts_publish() {
 // `docs/next-features/twice-nat.md`.
 // =====================================================================
 
+
+// #6745: the reverse-NAT steering row is SHARED and the close was not.
+//
+// `dnat_v4_key_bytes` builds the key from (protocol, SNAT source address, SNAT
+// source port) and nothing else — no remote endpoint. Under address-only SNAT
+// (`port no-translation`) and plain static SNAT, two flows from one internal
+// source to DIFFERENT remotes therefore land on ONE row, and the allocator
+// admits both deliberately: `AddressOnlyReverseKey` enforces uniqueness on a
+// key that DOES include dst_ip/dst_port. A per-session close then deleted that
+// row unconditionally.
+
+/// The two colliding sessions: one internal source, one SNAT identity, two
+/// different remotes. This is the shape the allocator admits on purpose.
+fn colliding_pair_6745() -> (crate::session::SessionKey, crate::session::SessionKey) {
+    let a = dnat_v4_key();
+    let mut b = a.clone();
+    b.dst_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 25));
+    (a, b)
+}
+
+#[test]
+fn colliding_sessions_share_one_steering_key_6745() {
+    // The premise. If this ever stops holding — because the key gained the
+    // remote endpoint — the holder set is no longer load-bearing and the
+    // tests below are measuring nothing, so it is asserted rather than
+    // assumed.
+    let (a, b) = colliding_pair_6745();
+    assert_ne!(a.dst_ip, b.dst_ip, "the fixtures must differ in the remote");
+    assert_eq!(
+        dnat_steering_key(&a, dnat_snat_decision()),
+        dnat_steering_key(&b, dnat_snat_decision()),
+        "two flows differing only in the remote must share one steering key -- \
+         that sharing is what #6745 is about"
+    );
+    // And the VALUES are identical too, which is why a read-before-delete
+    // value comparison cannot separate them: the value encodes the ORIGINAL
+    // source, and these two flows share it.
+    assert_eq!(a.src_ip, b.src_ip);
+    assert_eq!(a.src_port, b.src_port);
+}
+
+#[test]
+fn a_shared_steering_row_survives_the_first_close_6745() {
+    reset_dnat_steering_holders();
+    let (a, b) = colliding_pair_6745();
+    let nat = dnat_snat_decision();
+    // No fds: the accounting is what is under test, and a real BPF map cannot
+    // be created under `cargo test` (unprivileged_bpf_disabled).
+    let fds = DnatTableFds::default();
+
+    publish_dnat_table_entry(&fds, &a, nat);
+    publish_dnat_table_entry(&fds, &b, nat);
+    assert_eq!(dnat_steering_holder_count(&a, nat), 2, "both sessions must hold the row");
+
+    // A closes. The row is still B's only steering path.
+    assert!(
+        !release_dnat_steering_holder(&a, nat),
+        "closing the FIRST of two sessions sharing a steering row must NOT release it -- \
+         deleting it here blackholes the survivor's return traffic (#6745)"
+    );
+    assert_eq!(dnat_steering_holder_count(&a, nat), 1);
+
+    // B closes. Now it is nobody's, and leaving it would leak a map row.
+    assert!(
+        release_dnat_steering_holder(&b, nat),
+        "closing the LAST holder must release the row -- otherwise the fix trades a \
+         blackhole for an unbounded map leak"
+    );
+    assert_eq!(dnat_steering_holder_count(&b, nat), 0);
+}
+
+#[test]
+fn republishing_one_session_does_not_add_a_second_hold_6745() {
+    // Re-sync, reconcile replay and a second worker seeing the same flow all
+    // re-publish. If each added a hold, the row would outlive its last real
+    // user by however many times it was republished -- a leak that only shows
+    // up under map pressure.
+    reset_dnat_steering_holders();
+    let key = dnat_v4_key();
+    let nat = dnat_snat_decision();
+    let fds = DnatTableFds::default();
+
+    publish_dnat_table_entry(&fds, &key, nat);
+    publish_dnat_table_entry(&fds, &key, nat);
+    publish_dnat_table_entry(&fds, &key, nat);
+    assert_eq!(dnat_steering_holder_count(&key, nat), 1, "holds must be per SESSION, not per publish");
+
+    assert!(release_dnat_steering_holder(&key, nat), "one close must release a singly-held row");
+}
+
+#[test]
+fn an_unaccounted_row_is_still_deleted_6745() {
+    // The failure direction of an accounting gap. A row published by a path
+    // that did not account -- or by an older build across a helper restart --
+    // must delete exactly as it did before #6745, never leak. "Unchanged" is
+    // the right answer here; "the map fills up" is not.
+    reset_dnat_steering_holders();
+    let key = dnat_v4_key();
+    assert!(
+        release_dnat_steering_holder(&key, dnat_snat_decision()),
+        "a row with no recorded holder must still be deletable"
+    );
+}
+
+#[test]
+fn the_v6_steering_row_is_held_independently_6745() {
+    // The v6 key is a different width and a different map. A holder set that
+    // collapsed the two families would let a v4 close release a v6 row.
+    reset_dnat_steering_holders();
+    let v4 = dnat_v4_key();
+    let v6 = dnat_v6_key();
+    let fds = DnatTableFds::default();
+
+    publish_dnat_table_entry(&fds, &v4, dnat_snat_decision());
+    publish_dnat_table_entry(&fds, &v6, dnat_snat_decision_v6());
+    assert_eq!(dnat_steering_holder_count(&v4, dnat_snat_decision()), 1);
+    assert_eq!(dnat_steering_holder_count(&v6, dnat_snat_decision_v6()), 1);
+
+    assert!(release_dnat_steering_holder(&v4, dnat_snat_decision()));
+    assert_eq!(
+        dnat_steering_holder_count(&v6, dnat_snat_decision_v6()),
+        1,
+        "releasing the v4 row must not touch the v6 row"
+    );
+}
+
+#[test]
+fn every_publisher_accounts_because_the_callee_does_6745() {
+    // THE ASYMMETRY IS 3 PUBLISH SITES AND 2 DELETE SITES:
+    //   publish - poll_descriptor/mod.rs (x2, both worker poll paths) and
+    //             ha/session_import.rs (the synced install).
+    //   delete  - session_delta.rs (the Close arm) and ha/session_import.rs
+    //             (delete_synced_session_gen's teardown).
+    //
+    // A design that accounted at each CALL SITE would need five correct edits
+    // and would regress silently if one were missed -- and a test exercising
+    // one site would pass while another leaked or blackholed. The accounting
+    // lives in publish_dnat_table_entry / delete_dnat_table_entry instead, so
+    // every site inherits it by construction and there is no per-site variant
+    // to get wrong. This test pins that the FUNCTIONS account, which is the
+    // property the call sites rely on.
+    reset_dnat_steering_holders();
+    let key = dnat_v4_key();
+    let nat = dnat_snat_decision();
+    assert_eq!(dnat_steering_holder_count(&key, nat), 0);
+    publish_dnat_table_entry(&DnatTableFds::default(), &key, nat);
+    assert_eq!(
+        dnat_steering_holder_count(&key, nat),
+        1,
+        "publish_dnat_table_entry must record the hold itself -- if it does not, each of the \
+         three publish sites has to, and one of them will eventually not"
+    );
+}
+
+#[test]
+fn a_non_snat_session_holds_nothing_6745() {
+    // No source rewrite means no row was ever published, so nothing may be
+    // recorded and a close must stay the no-op it already was.
+    reset_dnat_steering_holders();
+    let key = dnat_v4_key();
+    let no_nat = NatDecision::default();
+    publish_dnat_table_entry(&DnatTableFds::default(), &key, no_nat);
+    assert_eq!(dnat_steering_holder_count(&key, no_nat), 0);
+    assert!(release_dnat_steering_holder(&key, no_nat));
+}
