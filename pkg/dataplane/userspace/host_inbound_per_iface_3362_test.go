@@ -75,11 +75,18 @@ func Test_3362_PerInterfaceViewsScopeOverride(t *testing.T) {
 	}
 }
 
-// Test_3362_UnionWithZoneLevel asserts the effective per-interface set is the
-// UNION of the zone-level set and the interface override (Junos additive
-// semantics): a zone-level `ping` plus an interface `ssh` yields {ping, ssh} on
-// the overridden interface and {ping} on the others.
-func Test_3362_UnionWithZoneLevel(t *testing.T) {
+// Test_3362_ReplaceZoneLevel asserts the effective per-interface set is the
+// interface override where one is declared and the zone-level set everywhere
+// else (#6515 Junos REPLACE semantics): a zone-level `ping` with an interface
+// `ssh` yields {ssh} on the overridden interface and {ping} on the others.
+//
+// Both halves matter. The second is what makes the first meaningful: replace
+// narrows ONE interface, it does not turn the zone-level stanza off. A test that
+// only asserted the overridden interface would still pass if the zone stanza
+// had stopped being applied at all.
+//
+// Before #6515 this asserted the union, {ping, ssh}.
+func Test_3362_ReplaceZoneLevel(t *testing.T) {
 	cfg := hostInboundCfg3362()
 	cfg.Security.Zones["wan"].HostInboundTraffic = &config.HostInboundTraffic{SystemServices: []string{"ping"}}
 
@@ -90,18 +97,21 @@ func Test_3362_UnionWithZoneLevel(t *testing.T) {
 			got[v.V4Addrs[0]] = v.SystemServices
 		}
 	}
-	if !eqStr(got["172.16.50.8"], []string{"ping", "ssh"}) {
-		t.Errorf("overridden iface services = %v, want [ping ssh] (union)", got["172.16.50.8"])
+	if !eqStr(got["172.16.50.8"], []string{"ssh"}) {
+		t.Errorf("overridden iface services = %v, want [ssh]: the interface stanza REPLACES "+
+			"the zone-level `ping` (#6515), it does not add to it", got["172.16.50.8"])
 	}
 	if !eqStr(got["10.0.61.1"], []string{"ping"}) {
-		t.Errorf("non-overridden iface services = %v, want [ping] (zone-level only)", got["10.0.61.1"])
+		t.Errorf("non-overridden iface services = %v, want [ping] (zone-level only) — replace "+
+			"must narrow only the interface that declares a stanza", got["10.0.61.1"])
 	}
 }
 
 // Test_3362_WireCarriesEffectiveOverride asserts the per-interface OVERRIDE
 // reaches the dataplane wire: the overridden unit's InterfaceSnapshot is marked
-// host-inbound-configured with the EFFECTIVE union token set, while the
-// non-overridden unit carries none (Rust falls back to the zone-keyed check).
+// host-inbound-configured with the EFFECTIVE token set — which post-#6515 is the
+// override alone — while the non-overridden unit carries none (Rust falls back to
+// the zone-keyed check).
 func Test_3362_WireCarriesEffectiveOverride(t *testing.T) {
 	cfg := hostInboundCfg3362()
 	cfg.Security.Zones["wan"].HostInboundTraffic = &config.HostInboundTraffic{SystemServices: []string{"ping"}}
@@ -116,8 +126,10 @@ func Test_3362_WireCarriesEffectiveOverride(t *testing.T) {
 	if !over.HostInboundConfigured {
 		t.Fatal("overridden interface reth0.50 must carry host_inbound_configured=true on the wire")
 	}
-	if !eqStr(over.HostInboundSystemServices, []string{"ping", "ssh"}) {
-		t.Errorf("wire effective services = %v, want [ping ssh] (zone ∪ interface)", over.HostInboundSystemServices)
+	if !eqStr(over.HostInboundSystemServices, []string{"ssh"}) {
+		t.Errorf("wire effective services = %v, want [ssh]: the interface stanza replaces the "+
+			"zone-level `ping` (#6515), and the wire must carry what enforcement uses",
+			over.HostInboundSystemServices)
 	}
 
 	plain := byName["reth1.0"]

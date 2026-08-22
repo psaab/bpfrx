@@ -145,7 +145,15 @@ func validateDeviceMapStrict(cfg *Config) error {
 		}
 	}
 
-	seenName := make(map[string]string) // logical name -> first identity
+	// #6546: keyed by the CANONICAL Linux name, not the raw spelling.
+	// `LinuxIfName` folds the Junos slash form onto the kernel dash form, so
+	// `ge-0/0/3` and `ge-0-0-3` are two spellings of ONE interface — and the
+	// raw-string comparison accepted both, letting a duplicate logical name
+	// through the STRICT commit gate (not merely the tolerant one). The value
+	// carries the raw first spelling alongside its identity so the error names
+	// what the operator actually typed.
+	type firstUse struct{ spelling, identity string }
+	seenName := make(map[string]firstUse) // canonical Linux name -> first use
 	seenPCI := make(map[string]string)  // pci addr -> first logical name
 	seenMAC := make(map[string]string)  // mac -> first logical name
 
@@ -154,12 +162,19 @@ func validateDeviceMapStrict(cfg *Config) error {
 			return fmt.Errorf("chassis device-map: entry with empty logical interface name")
 		}
 		// Duplicate logical name → FATAL (two NICs cannot both be ge-0/0/3).
-		if prev, ok := seenName[e.LogicalName]; ok {
-			return fmt.Errorf("chassis device-map: logical name %q is mapped twice "+
-				"(first to %s); each logical name binds exactly one NIC",
-				e.LogicalName, prev)
+		canonName := LinuxIfName(e.LogicalName)
+		if prev, ok := seenName[canonName]; ok {
+			if prev.spelling == e.LogicalName {
+				return fmt.Errorf("chassis device-map: logical name %q is mapped twice "+
+					"(first to %s); each logical name binds exactly one NIC",
+					e.LogicalName, prev.identity)
+			}
+			return fmt.Errorf("chassis device-map: logical names %q and %q are the same "+
+				"interface %q and are mapped twice (%q first to %s); each logical name "+
+				"binds exactly one NIC — use one spelling",
+				prev.spelling, e.LogicalName, canonName, prev.spelling, prev.identity)
 		}
-		seenName[e.LogicalName] = entryIdentityDesc(e)
+		seenName[canonName] = firstUse{spelling: e.LogicalName, identity: entryIdentityDesc(e)}
 
 		// An entry must carry at least one identity key.
 		if e.PCIAddr == "" && e.MAC == "" {

@@ -124,9 +124,24 @@ func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane
 	// table when it is queued has survived this node's own config-apply
 	// clearSessionsForDeletedPolicies sweep, so it is admitted under the
 	// current config; the receiver refuses it only once IT applies a strictly
-	// newer config (lastAppliedConfigGen advances past this epoch). configGen
-	// and lastAppliedConfigGen are the SAME sender→receiver namespace, so the
-	// comparison is meaningful across the HA boundary.
+	// newer config (lastAppliedConfigGen advances past this epoch).
+	//
+	// The namespace claim holds in ONE direction only. configGenCounter and the
+	// receiver's lastAppliedConfigGen are the same sender→receiver namespace
+	// when the SENDER is the RG0 config-sync authority — the authority mints the
+	// generation and the peer records the one it applied. In the reverse
+	// (non-authority → authority) direction, reachable only active/active, the
+	// stamp is the sender's frozen boot seed and the authority's high-water
+	// never advances, so the guard is inert: fail-OPEN, no false reject. That
+	// residual is deliberate (#5274 scope-out), regression-pinned by
+	// sync_config_epoch_active_active_6284_test.go, and #6419 closed it as
+	// not-cheaply-fixable — the "stamp lastAppliedConfigGen and threshold on
+	// configGenCounter" shortcut fails because each counter is FROZEN for
+	// exactly the tenure in which the shortcut needs it live (a node pushes
+	// config only while IsLocalPrimary(0), and handleConfigSync rejects every
+	// peer config while IsLocalPrimary(0)), and telling the two namespaces apart
+	// across an RG0 handover needs an authority tag that ConfigEpoch, a bare
+	// uint64 on the wire, does not carry. See docs/session-sync-architecture.md.
 	val.ConfigEpoch = s.configGenCounter.Load()
 	s.genSentMu.Lock()
 	if s.genSentV4 == nil {

@@ -148,7 +148,7 @@ type ZoneInfo struct {
 	// InterfaceHostInbound (#3328, #3362) carries per-interface host-inbound
 	// overrides. An entry exists only for an interface that declares its own
 	// `host-inbound-traffic` stanza; the effective admission set for that
-	// interface is the UNION of the zone-level set above and the override.
+	// interface IS the override — it REPLACES the zone-level set above (#6515).
 	// Omitted when no interface declares an override.
 	InterfaceHostInbound []ZoneInterfaceHostInbound `json:"interface_host_inbound,omitempty"`
 	IngressPackets       uint64                     `json:"ingress_packets"`

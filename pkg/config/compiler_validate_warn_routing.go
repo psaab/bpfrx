@@ -111,6 +111,100 @@ func validateInterfaceParityWarnings(cfg *Config) []string {
 	return warnings
 }
 
+// validateLinkAggregationWarnings emits the accepted-only advisory for
+// 802.3ad link aggregation (#6544).
+//
+// `interfaces ae0 aggregated-ether-options { lacp ...; minimum-links N; }` and
+// the member binding `interfaces ge-0/0/1 gigether-options 802.3ad ae0` are
+// schema-advertised (tab completion offers them), parse cleanly, and compile
+// into `AggregatedEtherOpts` / `LAGParent` on the typed config — and then stop.
+// NOTHING reads either field. Measured on the compiled config: an `ae0` with
+// `lacp active`, `periodic fast` and `minimum-links 2` plus two members bound
+// via `802.3ad ae0` commits with ZERO warnings and yields ZERO bond models
+// from `buildFabricBondModels` (pkg/dataplane/compiler_iface.go), so no
+// `.netdev` is written, no member gets `Bond=`, no bond device is created, no
+// member is enslaved, no LACP runs, and `minimum-links` is not honoured.
+//
+// The bond machinery itself is NOT missing — `pkg/networkd` generateNetdev
+// already emits `Mode=802.3ad` with `LACPTransmitRate` / `TransmitHashPolicy`
+// / `MinLinks`, and `pkg/routing/bond.go` reconciles kernel bonds. Both are
+// reached ONLY from `fabric-options member-interfaces`, which hard-codes
+// `active-backup`. Wiring `ae` into them is real feature work, tracked in the
+// parity matrix (`docs/vsrx-gaps.md`, "Interface Redundancy (LAG)").
+//
+// This advisory is the #2078/#4231/#5804 accepted-only doctrine applied to the
+// config grammar: an operator who configures a LAG for bandwidth or redundancy
+// is told the feature exists at three independent layers (schema completion, a
+// clean commit, and — before #6544 — the documentation) and receives nothing.
+// A hard reject was rejected as the posture: `ae` config is inert rather than
+// dangerous, and rejecting it would newly brick an already-persisted config
+// that carries it (the #1960 no-brick rule).
+//
+// The consequence gets its own advisory line rather than folding into
+// validateInterfaceParityWarnings' generic "typed and stored but not enforced"
+// list, following #5804: what the operator loses here is SPECIFIC — the whole
+// aggregate, not one knob on a working interface.
+func validateLinkAggregationWarnings(cfg *Config) []string {
+	if cfg.Interfaces.Interfaces == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// aeNames: interfaces carrying an aggregated-ether-options body.
+	// membersByAE: members bound to a parent via `gigether-options 802.3ad`.
+	// A member naming a parent that was never configured still counts — it is
+	// just as inert, and staying silent about it would leave the operator's
+	// typo invisible on top of the missing feature.
+	var aeNames []string
+	membersByAE := make(map[string][]string)
+	var aeParents []string
+	for _, name := range names {
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc == nil {
+			continue
+		}
+		if ifc.AggregatedEtherOpts != nil {
+			aeNames = append(aeNames, name)
+		}
+		if ifc.LAGParent != "" {
+			if _, ok := membersByAE[ifc.LAGParent]; !ok {
+				aeParents = append(aeParents, ifc.LAGParent)
+			}
+			membersByAE[ifc.LAGParent] = append(membersByAE[ifc.LAGParent], name)
+		}
+	}
+	if len(aeNames) == 0 && len(aeParents) == 0 {
+		return nil
+	}
+	sort.Strings(aeParents)
+
+	var warnings []string
+	if len(aeNames) > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"interfaces %s: aggregated-ether-options configured but accepted-only "+
+				"— xpf does not implement 802.3ad link aggregation: no bond device "+
+				"is created, no member interface is enslaved, no LACP is run, and "+
+				"minimum-links is not honoured, so the aggregate carries no traffic "+
+				"and provides no redundancy; use chassis-cluster reth interfaces for "+
+				"link redundancy (parity, #6544)",
+			strings.Join(aeNames, ", ")))
+	}
+	for _, parent := range aeParents {
+		warnings = append(warnings, fmt.Sprintf(
+			"interfaces %s: gigether-options 802.3ad %s configured but "+
+				"accepted-only — the member binding is stored and never acted on, "+
+				"so %s stays a standalone interface and is NOT enslaved to %s "+
+				"(parity, #6544)",
+			strings.Join(membersByAE[parent], ", "), parent,
+			strings.Join(membersByAE[parent], "/"), parent))
+	}
+	return warnings
+}
+
 // Note: the next-table / rib-group ip-rule WINDOW over-subscription check that
 // used to live here (validateRoutingRuleWindowWarnings, warn-only) moved to the
 // strict commit gate validateRoutingRuleWindowsStrict

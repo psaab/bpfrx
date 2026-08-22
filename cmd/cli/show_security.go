@@ -193,13 +193,18 @@ func zoneHostInboundView(z *pb.ZoneInfo) config.HostInboundView {
 		// host-inbound deny" line as the local and gRPC-text surfaces.
 		LifelineInterfaces: z.GetLifelineInterfaces(),
 	}
+	// #6515: an interface that declares a host-inbound-traffic stanza REPLACES the
+	// zone-level set, so the effective set for each of these rows is the row's own
+	// tokens. Every element of InterfaceHostInbound is by construction a ref that
+	// declares one (the server projects SortedInterfaceHostInboundRefs), which is
+	// why `overridden` is unconditionally true here.
 	for _, ih := range z.GetInterfaceHostInbound() {
 		v.Interfaces = append(v.Interfaces, config.InterfaceHostInboundView{
 			Interface:               ih.GetInterface(),
 			SystemServices:          ih.GetSystemServices(),
 			Protocols:               ih.GetProtocols(),
-			EffectiveSystemServices: config.UnionHostInboundTokens(z.GetHostInboundSystemServices(), ih.GetSystemServices()),
-			EffectiveProtocols:      config.UnionHostInboundTokens(z.GetHostInboundProtocols(), ih.GetProtocols()),
+			EffectiveSystemServices: config.EffectiveHostInboundTokens(z.GetHostInboundSystemServices(), ih.GetSystemServices(), true),
+			EffectiveProtocols:      config.EffectiveHostInboundTokens(z.GetHostInboundProtocols(), ih.GetProtocols(), true),
 		})
 	}
 	return v
