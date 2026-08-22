@@ -248,11 +248,20 @@ func TestStartClusterCommsWiresTableTruthBulkSource_6031(t *testing.T) {
 	// which selectClusterBindAddr matches against the 127.0.0.2 peer, so the
 	// sync constructor goroutine gets past its address retry loop and reaches
 	// the callback wiring.
+	//
+	// The endpoint is the FABRIC transport, not control-link, deliberately:
+	// startClusterComms only starts the heartbeat when control-interface AND
+	// peer-address are both set, and cluster.Manager.StartHeartbeat /
+	// StopHeartbeat race on the manager's heartbeat fields (heartbeat_manager.go
+	// :116 vs :163) — a PRE-EXISTING race this test has no business exposing.
+	// The sync constructor takes the fabric fall-back and reaches the same
+	// wiring block. TestActiveClusterTransportIsMutexGuarded_6290 avoids the
+	// same hazard the same way (it configures no sync endpoint at all).
 	for _, line := range []string{
 		"chassis cluster cluster-id 1",
 		"chassis cluster node 0",
-		"chassis cluster control-interface lo",
-		"chassis cluster peer-address 127.0.0.2",
+		"chassis cluster fabric-interface lo",
+		"chassis cluster fabric-peer-address 127.0.0.2",
 		"chassis cluster redundancy-group 0 node 0 priority 200",
 		"chassis cluster redundancy-group 0 node 1 priority 100",
 		"chassis cluster authentication-key test-cluster-psk-6031",
