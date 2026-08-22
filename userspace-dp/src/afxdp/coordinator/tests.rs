@@ -6692,3 +6692,172 @@ fn stopped_coordinator_guard_joins_the_neigh_monitor_on_drop_6637() {
         "StoppedCoordinator dropped without joining the neigh-monitor thread"
     );
 }
+
+/// #6593: EVERY pre-publish sibling must already be worker-visible when the
+/// runtime view goes out — not just the CoS owner map.
+///
+/// `refresh_runtime_snapshot` relies on a documented order. The runtime view is
+/// the single worker-visible gate and a worker reads it first, so any structure
+/// published AFTER it opens a window where a worker holds new forwarding paired
+/// with a stale sibling.
+///
+/// Seven structures are in that set: the six CoS maps published by
+/// `refresh_cos_runtime_maps` (owner-by-queue, owner-live, root leases, exact
+/// backlogs, queue leases, queue vtime floors) and `ha.fabrics`. Before this
+/// test exactly ONE of them had an ordering assertion —
+/// `refresh_runtime_snapshot_publishes_cos_owner_map_before_forwarding` — and
+/// that assertion had a hoist bypass. The other six had none.
+///
+/// The invariant is asserted uniformly and without knowing what changed: for
+/// each sibling, the `Arc` that was worker-visible at the capture instant must
+/// be the SAME allocation as the one visible after the refresh. Same means it
+/// was already published when the view went out. Different means it was
+/// published afterwards — the defect. A sibling this refresh did not republish
+/// compares equal, which is correct: there is nothing to order.
+///
+/// Hoist resistance comes from `previous_view` (the #6592 technique): the
+/// capture retains the still-visible view from the same instant and asserts it
+/// is NOT the post-publish view, so the capture proves its own position.
+/// Without it, moving the view store ABOVE the capture would make every
+/// `ptr_eq` above pass vacuously by reading already-published values — which is
+/// precisely the bypass the one pre-existing guard had.
+#[test]
+fn refresh_runtime_snapshot_publishes_every_sibling_before_the_view() {
+    let mut coordinator = Coordinator::new();
+    coordinator.workers.identities.insert(
+        1,
+        BindingIdentity {
+            slot: 1,
+            queue_id: 0,
+            worker_id: 2,
+            interface: "ge-0-0-2".into(),
+            ifindex: 12,
+        },
+    );
+
+    assert!(
+        coordinator.prepublish_siblings.is_none(),
+        "no snapshot applied yet",
+    );
+
+    // A snapshot that actually MOVES the CoS structures: a new shaped
+    // interface with a scheduler map creates queue (80, 0). A snapshot that
+    // changed nothing would make every ptr_eq trivially true and the test
+    // vacuous.
+    let mut snapshot = ConfigSnapshot::default();
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 80,
+        parent_ifindex: 12,
+        hardware_addr: "02:00:00:00:00:80".into(),
+        cos_shaping_rate_bytes_per_sec: 1_000_000,
+        cos_scheduler_map: "wan-map".into(),
+        ..Default::default()
+    });
+    snapshot.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "best-effort".into(),
+            queue: 0,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![CoSSchedulerMapEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                scheduler: String::new(),
+            }],
+        }],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+        inet_precedence_classifiers: vec![],
+    });
+
+    coordinator
+        .refresh_runtime_snapshot(&snapshot)
+        .expect("refresh_runtime_snapshot must succeed");
+
+    let captured = coordinator
+        .prepublish_siblings
+        .clone()
+        .expect("refresh must record the siblings at the view-publish point");
+
+    // Guard against a vacuous run: this snapshot must actually have moved the
+    // CoS owner map, or every assertion below would hold trivially.
+    assert_eq!(
+        captured.cos_owner_worker_by_queue.get(&(80, 0)),
+        Some(&2u32),
+        "setup: the CoS owner map must already own the new queue at publish time — \
+         if this snapshot did not move the CoS structures the ordering assertions \
+         below would pass vacuously",
+    );
+
+    // THE INVARIANT, part 1: every sibling visible at publish time is the same
+    // allocation a worker sees now.
+    for (name, same) in [
+        (
+            "cos.owner_worker_by_queue",
+            Arc::ptr_eq(
+                &captured.cos_owner_worker_by_queue,
+                &coordinator.cos.owner_worker_by_queue.load_full(),
+            ),
+        ),
+        (
+            "cos.owner_live_by_queue",
+            Arc::ptr_eq(
+                &captured.cos_owner_live_by_queue,
+                &coordinator.cos.owner_live_by_queue.load_full(),
+            ),
+        ),
+        (
+            "cos.root_leases",
+            Arc::ptr_eq(
+                &captured.cos_root_leases,
+                &coordinator.cos.root_leases.load_full(),
+            ),
+        ),
+        (
+            "cos.exact_backlogs",
+            Arc::ptr_eq(
+                &captured.cos_exact_backlogs,
+                &coordinator.cos.exact_backlogs.load_full(),
+            ),
+        ),
+        (
+            "cos.queue_leases",
+            Arc::ptr_eq(
+                &captured.cos_queue_leases,
+                &coordinator.cos.queue_leases.load_full(),
+            ),
+        ),
+        (
+            "cos.queue_vtime_floors",
+            Arc::ptr_eq(
+                &captured.cos_queue_vtime_floors,
+                &coordinator.cos.queue_vtime_floors.load_full(),
+            ),
+        ),
+        (
+            "ha.fabrics",
+            Arc::ptr_eq(&captured.ha_fabrics, &coordinator.ha.fabrics.load_full()),
+        ),
+    ] {
+        assert!(
+            same,
+            "#6593: {name} was published AFTER the runtime view. The view is the single \
+             worker-visible gate and a worker reads it first, so a worker can observe this \
+             refresh's forwarding paired with the PREVIOUS {name}. Publish it before \
+             `publish_runtime_view`.",
+        );
+    }
+
+    // THE INVARIANT, part 2 (hoist resistance): the capture sat BEFORE the
+    // view store, so the view it retained is not the one now published.
+    let published_view = coordinator.ha.runtime.load_full();
+    assert!(
+        !Arc::ptr_eq(&captured.previous_view, &published_view),
+        "#6593: the sibling capture ran at or after the view store, so every ptr_eq above \
+         passed vacuously by reading already-published values. Capture before the store — \
+         this is the same bypass the single pre-existing CoS-owner guard had.",
+    );
+}

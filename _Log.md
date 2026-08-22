@@ -102800,3 +102800,10 @@ prose edit above them added. No diff falls in the new test body.
     against a header-derived trailing width; short/headerless rows dropped.
   - **File(s)**: pkg/frr/status_parse.go,
     pkg/frr/isis_positional_forgery_6590_test.go
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6593 — six of seven pre-publish siblings had no ordering guard and
+    the seventh had a hoist bypass. Added one PrePublishSiblings capture at the
+    store_runtime_view choke point covering all seven, with #6592-style
+    previous-view retention for hoist resistance. cfg(test) only.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/{cos_state.rs,mod.rs,tests.rs}
