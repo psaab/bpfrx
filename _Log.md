@@ -100463,3 +100463,20 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/userspace/maps_sync.go,
   pkg/dataplane/userspace/maps_sync_ingress_partial_6537_test.go,
   docs/afxdp-packet-processing.md, _Log.md
+- **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
+  `Store.confirmPrevFirst` records first-commit-ness where it is known (arm
+  site: pre-promotion `s.compiled`; recovery site: the persisted
+  `rec.FirstCommit`), and both consumers — `PromoteRollback`'s
+  `firstCommitRollback` and the `firstCommit` bit `writeConfirmState`
+  persists — read the flag instead of re-deriving it, so a rollback target
+  that failed the lenient compile no longer persists `committed=0` over a real
+  config. Separately, the expired-during-downtime recovery branch now returns
+  an `ErrConfigCompile`-tagged error (propagated by `Load`) instead of warning
+  and shipping a nil compiled config with `everCommitted=true`, so the daemon
+  fails closed into the #1922 bootstrap/lifeline state rather than a NORMAL
+  boot with no policy. Four one-at-a-time mutations each red exactly one test.
+- **File(s)**: pkg/configstore/store.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_persist.go,
+  pkg/configstore/confirm_recovery_uncompilable_target_6538_test.go,
+  pkg/daemon/daemon_apply_commit.go, pkg/configstore/README.md,
+  pkg/daemon/README.md, _Log.md
