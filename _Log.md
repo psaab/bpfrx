@@ -100332,6 +100332,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
 
 - **Timestamp**: 2026-08-21
+  - **Action**: #6492 claim fix — correct the false "lifeline-excluded ⇒ can
+    never strand management" safety claims at 9 sites (6 Go comments, 2 docs,
+    1 README section). Lifeline exclusion is by INTERFACE, not by address value.
+    Comment/doc only; raw .text byte-identical.
+  - **File(s)**: pkg/daemon/daemon_nft.go,
+    pkg/daemon/host_inbound_conntrack_flush.go, pkg/daemon/README.md,
+    pkg/dataplane/userspace/zones_host_inbound.go,
+    docs/host-inbound-service-matrix.md
   - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
     lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
     so the #6476 cold-boot fence is no longer suppressed.
