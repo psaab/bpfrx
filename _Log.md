@@ -22,6 +22,40 @@
 - **File(s)**: pkg/routing/rules.go, pkg/routing/rules_6467_test.go,
   pkg/routing/README.md
 
+## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
+
+- **Timestamp**: 2026-08-21
+- **Action**: Dispositioned #6618 (xpf's `system-services any-service`
+  admits every IP protocol; Junos scopes it to the port range). Pulled
+  both Juniper statement pages verbatim: `any-service` is "All system
+  services on an entire port range including the system services that
+  are not defined" and `protocols all` is "Enable traffic from all
+  possible protocols available" over an enumerated 17-protocol list.
+  The `any-service` sentence is SILENT on IP protocols rather than
+  exclusionary, so the parity claim rests on structure (two disjoint
+  knobs), not on a quoted rationale that reaches the raw-protocol case.
+  Rejected Option 1 (narrow): Junos itself cannot admit an arbitrary IP
+  protocol number host-inbound, so narrowing leaves a zone terminating
+  SCTP/IPIP/L2TPv3 with no token at all — and an lo0 input filter
+  provably cannot rescue a host-inbound deny on either enforcement path
+  — while also retracting, one release after #3226, the `any-service`
+  migration that #3226's own advisory instructs operators to use. Kept
+  Option 2 (the shipped behaviour plus the advisory naming the exact
+  blast radius) and converted it from a comment into a contract: a new
+  verdict lock on the LIVE netlink build path (not the pkg/daemon text
+  oracle, which has had no non-test caller since #6387) asserts that the
+  one rule an `any-service` zone renders carries no L4 discriminator and
+  no drop behind it, so OSPF(89)/GRE(47)/VRRP(112)/PIM(103)/SCTP(132)
+  are all accepted, with a narrow-`ssh` control proving the harness sees
+  discrimination and the #3361 catch-all when the zone is not
+  full-admit. Three one-line mutations, each `go vet` clean and each
+  reddening the assertion it targets: narrowing the full admit to a
+  TCP port range (reds the no-discriminator assertion), re-arming
+  `hostInboundEmitsDrop` for a full-admit zone (reds the deny-counter
+  assertion), and leaking full-admit to every zone (reds the control
+  only). No dataplane change; the Rust helper binary is not reached.
+- **File(s)**: `pkg/nftables/host_inbound_any_service_verdict_6618_test.go`
+  (new), `docs/host-inbound-service-matrix.md`
 ## 2026-08-21 — #6656 transfer-out override cleared on peer loss
 
 - **Timestamp**: 2026-08-21
