@@ -102146,3 +102146,19 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+## 2026-08-22 — #6639 cut re-stamps the kernel arm record
+- **Timestamp**: 2026-08-22
+- **Action**: An in-place binary cut repoints `current`, the sbin links and the
+  unit ExecStart but left the kernel arm record naming the OLD binary, so a
+  candidate boot refused. The refusal fires in the POSIX-sh OUTER hop (before it
+  execs anything), so the SIDECAR is what had to move — a Go-only change could
+  not fix it. Added step 6d inside `flip()` (after 6c, so a crash leaves today's
+  safe refusing state), gated on an ARMED journal, writing sidecar + journal
+  field from one value with `fsatomic.WriteFileDurable`, fail-closed. Left
+  `VerifyPromoteBinaryMatchesRecord` and the shell untouched: relaxing the
+  comparison would re-admit the stale leftover #6601 exists to eliminate.
+  Consequence was worse than filed — the journal is never cleared, so the gate
+  re-refuses every boot and an HA node holds SECONDARY indefinitely.
+- **File(s)**: pkg/upgrade/flip.go, pkg/upgrade/kernel.go,
+  pkg/upgrade/kernel_arm_restamp_6639_test.go (new), _Log.md

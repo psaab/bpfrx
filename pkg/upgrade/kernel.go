@@ -179,9 +179,21 @@ type KernelJournal struct {
 	// os.Executable() names the live binary by construction, and it knows that
 	// at the moment it arms. Recording it converts the question from "which
 	// xpfd is live?" (unanswerable from ambient state) into "which xpfd armed
-	// this candidate?" (a fact). The record cannot drift from the arming
-	// because re-arming rewrites it and there is exactly one gate run per
-	// arming, and it is cleared with the journal on promote/revert.
+	// this candidate?" (a fact). It is cleared with the journal on
+	// promote/revert.
+	//
+	// EXACTLY TWO parties may write it, and both establish the value by
+	// CONSTRUCTION rather than by inference: `arm`, which resolves the binary
+	// executing it; and (#6639) an in-place binary cut, which re-stamps it
+	// because the cut CREATED the new xpfd and repointed `current`, the sbin
+	// link and the unit ExecStart at it. Before #6639 only the first existed,
+	// so a cut while a candidate was armed left the record naming a binary the
+	// unit no longer pointed at, and the outer hop refused the promotion on
+	// every subsequent boot.
+	//
+	// The verifying binary may therefore be a different BUILD from the arming
+	// one. That is deliberate: the property being protected is "the gate runs
+	// the LIVE xpfd, never a stale leftover", not "the same build throughout".
 	//
 	// The gate REFUSES when this is present but unusable, and never falls back
 	// to inference. See armRecordPath / the outer hop's sidecar.
