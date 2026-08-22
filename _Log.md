@@ -103932,3 +103932,25 @@ prose edit above them added. No diff falls in the new test body.
   exists for. Added the eviction counter the issue notes was missing.
 - **File(s)**: userspace-dp/src/afxdp/forwarding/ipsec.rs,
   userspace-dp/src/afxdp/forwarding/README.md
+
+## 2026-08-22 — #6748 GRE decap bounded by the outer IP datagram
+- **Action**: Native GRE decap capped the inner extent at `frame.len() -
+  inner_offset` with no cross-check against the outer IPv4 Total Length / IPv6
+  Payload Length, so a peer that appended a trailer past the outer datagram AND
+  inflated the inner IP Total Length to cover it had those out-of-datagram bytes
+  promoted into the decapsulated packet. NOT the mechanism the title implies —
+  `packet_trimmed_len` already kept the inner inside the frame and already
+  trimmed Ethernet padding, so bounding by the frame length would have fixed
+  nothing. Extracted `outer_datagram_end` from `gre_checksum_region` (which
+  already applied exactly this bound, to the checksum only — the asymmetry that
+  made this an oversight) and ran the GRE option-field skips and the inner
+  extraction on `frame[..outer_end]`. An over-declaring outer header is refused
+  rather than clamped. Negative control asserts an HONEST inner under ordinary
+  trailing padding still decaps byte-identically, so the fix is not a blanket
+  rejection of trailers. Checked the issue's "the same pattern is used by the
+  WireGuard decap path": the only other `packet_trimmed_len` callers are ENCAP
+  paths (gre.rs's outer builder and frame/wg.rs's), where no outer datagram
+  exists yet, so nothing to bound there.
+- **File(s)**: userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_gre_outer_bound_6748.rs (new),
+  docs/userspace-native-gre-plan.md
