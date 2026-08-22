@@ -216,9 +216,11 @@ The SAME pre-flight now runs on the **day-0 / bootstrap paths** (#4183):
 
 ## Day-0 import visibility
 
-A day-0 / bootstrap config-import outcome is recorded at boot and surfaced on
-`/health` (#4184) so "why didn't my config apply" has an in-band answer beyond
-a single journald line:
+A day-0 / bootstrap config-import outcome is recorded at boot and surfaced both
+in the CLI as `show system bootstrap-import` (#6496 — including the failure
+REASON, which `/health` cannot carry) and on `/health` (#4184), so "why didn't
+my config apply" has an in-band answer beyond a single journald line. The full
+day-0 triage walkthrough is in `docs/install-images.md`. The `/health` fields:
 
 - `bootstrap_import_status`: `ok` (imported + committed), `loaded-from-db`
   (an active config was already present), `no-config` (no text config present —
@@ -229,6 +231,14 @@ a single journald line:
   NOT force a 503 (the box is in the lifeline-safe bootstrap state — surfacing
   the cause is the goal, not pulling a still-reachable box from rotation). A
   failed import also emits a `BOOTSTRAP_IMPORT_FAILED` event.
+
+`show system bootstrap-import` renders the same recorded snapshot through
+`pkg/bootstrapshow`, shared by the in-process console CLI and the gRPC
+`ShowText` path the remote `cli` uses, so the console, the remote client and
+the health probe cannot disagree about whether a day-0 config applied. Unlike
+`/health` it prints the error detail: that endpoint is unauthenticated and an
+import error quotes the offending config, which can echo a submitted secret
+(#5031); the CLI path is authenticated.
 
 A factory boot with NO `/etc/xpf/xpf.conf` is the EXPECTED fresh state and is
 logged at Info ("no text config present"), not Warn (#4186) — so an operator
