@@ -477,6 +477,18 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if s.OnFenceReceived != nil {
 			s.OnFenceReceived()
 		}
+	case syncMsgPeerCapabilities:
+		// #6650. Length-gated with the #2170 trailing-field discipline: a
+		// SHORTER frame than we expect is a peer we cannot interpret, so it is
+		// ignored (leaving the 0 = incapable default) rather than partially
+		// decoded; a LONGER one is a newer peer with extra fields we skip.
+		if len(payload) < 2 {
+			slog.Warn("cluster sync: peer capabilities message too short", "len", len(payload))
+			return
+		}
+		peerProto := binary.LittleEndian.Uint16(payload[:2])
+		s.peerSnapshotProtocol.Store(uint32(peerProto))
+		slog.Info("cluster sync: peer advertised config-snapshot protocol version", "version", peerProto)
 	case syncMsgClockSync:
 		if len(payload) < 8 {
 			slog.Warn("cluster sync: clock sync message too short")

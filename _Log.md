@@ -1,3 +1,39 @@
+## 2026-08-21 — #6650 cross-chassis snapshot-protocol gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added a peer capability exchange + a COMMIT preflight so a
+  current primary refuses to push a multi-zone scoped policy to a peer
+  that would narrow it. `syncMsgPeerCapabilities` (additive, no version
+  bump — the #2239 DHCP-lease precedent; the receive switch has no
+  default arm) advertises the sender's config-snapshot protocol version
+  once per installed session-sync connection, beside the clock sync.
+  Chose the sync channel over the heartbeat: same connection as the
+  config push (one lifecycle), and the heartbeat's optional sections are
+  back-indexed from a fixed-size auth trailer (#6169 epoch at len-68)
+  AND require a PSK. Gate refuses in the commit PREFLIGHT, not at push:
+  skipping the push would trade a narrowing for a config divergence.
+  Floor is a new per-feature immutable `MinProtocolMultiZoneScopedPolicy
+  = 4`, deliberately NOT `ProtocolVersion` — keying on the shared
+  constant imports open #6648's defect into new code. Arming predicate is
+  an exported WRAPPER of the local gate's, not a copy.
+  Corrected a FALSE CLAIM in docs/userspace-dataplane-architecture.md
+  ("a multi-zone scope can never reach a reader that would narrow it") —
+  true only for the local skew.
+  Mutation matrix 8/8 RED: U1 unadvertised-reads-capable, U2 wiring
+  deleted from the preflight, U3 key on the shared version, U4
+  capability survives disconnect, U5 never advertise, U6 refuse when the
+  peer is down, U7 floor renumbered, U8 drop the receive store.
+  Issue citations were stale: the gate is at
+  `pkg/dataplane/userspace/manager_compile.go:857` (not
+  `pkg/daemon/manager_compile.go:750`), and `ProtocolVersion` is 8, not 4.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_capabilities_6650.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync_conn_read.go, pkg/cluster/sync_conn_write.go,
+  pkg/daemon/peer_snapshot_protocol_gate_6650.go,
+  pkg/daemon/daemon_apply_commit.go, pkg/daemon/daemon_ha_sync.go,
+  docs/userspace-dataplane-architecture.md
+
 ## 2026-08-21 — #6534 NAT fail-closed exclusions stop rendering as enforced
 
 - **Timestamp**: 2026-08-21

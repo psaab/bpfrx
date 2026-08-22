@@ -74,6 +74,26 @@ const (
 	// the version then.
 	syncMsgDHCPLeaseV4 = 25
 	syncMsgDHCPLeaseV6 = 26
+	// 27 and 28 are the auth handshake (syncMsgAuthHello / syncMsgAuthProof,
+	// sync_auth.go) -- declared there, listed here so the next author does not
+	// reuse them.
+
+	// syncMsgPeerCapabilities advertises the SENDER's config-snapshot protocol
+	// version so the receiver can refuse to push a config the peer cannot
+	// represent (#6650). Sent once per installed connection, right beside the
+	// clock sync.
+	//
+	// ADDITIVE and version-bump-free, following the #2239 DHCP-lease
+	// precedent documented above: the receive switch has no default arm, so a
+	// peer that predates this simply ignores the frame. Bumping
+	// CurrentHAProtocolVersion / SessionSyncWireVersion instead would make the
+	// #1930 INC-3 mixed-base gate falsely refuse SESSION sync across exactly
+	// the rolling upgrade this exists to make safe -- converting a narrowing
+	// bug into an outage, which is the blunt option #6650 weighed and rejected.
+	//
+	// Payload: {config_snapshot_protocol_version: u16 LE}, with the #2170
+	// trailing-field discipline so the record can grow.
+	syncMsgPeerCapabilities = 29
 )
 
 // syncHeader is the wire header for each sync message.
@@ -546,12 +566,29 @@ type SessionSync struct {
 	vrfDevice         string
 	peerClockOffset   atomic.Int64
 	clockSynced       atomic.Bool
-	zoneRGMu          sync.RWMutex
-	zoneRGMap         map[uint16]int
-	deleteJournalMu   sync.Mutex
-	deleteJournal     [][]byte
-	deleteJournalCap  int
-	lastPeerRxMono    atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+
+	// localSnapshotProtocol is this node's config-snapshot protocol version,
+	// advertised to the peer on every installed connection (#6650). Set by the
+	// daemon at bring-up (mirroring SetSoftwareVersion); 0 means "not wired",
+	// which suppresses the advertisement rather than advertising a false 0.
+	localSnapshotProtocol atomic.Uint32
+
+	// peerSnapshotProtocol is the peer's advertised config-snapshot protocol
+	// version, or 0 when the peer has not advertised one.
+	//
+	// 0 is NOT "unknown, assume compatible": a connected peer that advertises
+	// nothing is by definition running a build that predates #6650, so it also
+	// predates every snapshot version this gate could care about. It is cleared
+	// on full disconnect alongside clockSynced -- the capability belongs to the
+	// peer INCARNATION that proved it, and the peer that reconnects may be a
+	// different, older process.
+	peerSnapshotProtocol atomic.Uint32
+	zoneRGMu             sync.RWMutex
+	zoneRGMap            map[uint16]int
+	deleteJournalMu      sync.Mutex
+	deleteJournal        [][]byte
+	deleteJournalCap     int
+	lastPeerRxMono       atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
 	// peerHeartbeatAckEver latches when the CURRENTLY connected peer proves it
 	// understands syncMsgHeartbeat by replying syncMsgHeartbeatAck. It gates
 	// the two enforcement paths that would otherwise punish a legacy peer that
