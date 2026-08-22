@@ -76,13 +76,26 @@ func TestWorkerCountHasOneRepresentation_5718(t *testing.T) {
 					"the shim is told the dataplane has no workers and no queues", tc.workers)
 			}
 
-			// 2) The heartbeat zero-init bound describes the SAME count.
-			wantSlots := plan.Workers * perWorker
-			if plan.HeartbeatSlots != wantSlots {
-				t.Fatalf("configured workers=%d: the heartbeat loop is sized for %d slots "+
-					"but the ctrl fields report %d workers (%d slots) — the same quantity "+
-					"has two representations and they have drifted",
-					tc.workers, plan.HeartbeatSlots, plan.Workers, wantSlots)
+			// 2) #6702 blocker 2 INVERTED this assertion, so read the reason
+			//    before "restoring" it. It used to require the heartbeat bound
+			//    to describe the SAME count as the ctrl fields
+			//    (`plan.Workers * perWorker`). That agreement was the defect:
+			//    a heartbeat slot is indexed by BINDING slot, and the binding
+			//    count (`min(rx_queues) * interfaces`) is not a function of
+			//    the worker count, so tying the two made the loop zero a
+			//    prefix and leave every slot above it holding the previous
+			//    load's timestamps. The bound is now the Array's own capacity
+			//    and must NOT track the worker count.
+			if plan.HeartbeatSlots != mapCap {
+				t.Fatalf("configured workers=%d: the heartbeat zero-init bound is %d, want the "+
+					"Array capacity %d — a worker-derived bound leaves every slot above it "+
+					"holding the previous load's heartbeat (#6702)",
+					tc.workers, plan.HeartbeatSlots, mapCap)
+			}
+			if wantSlots := plan.Workers * perWorker; plan.HeartbeatSlots == wantSlots && wantSlots != mapCap {
+				t.Fatalf("configured workers=%d: the heartbeat bound (%d) equals the "+
+					"worker-derived prefix again — the #6702 coupling is back",
+					tc.workers, plan.HeartbeatSlots)
 			}
 
 			// 3) The invariants each side owes independently.
@@ -96,9 +109,9 @@ func TestWorkerCountHasOneRepresentation_5718(t *testing.T) {
 			if got := effectiveWorkers(tc.workers, mapCap); got != tc.want {
 				t.Fatalf("effectiveWorkers(%d, %d) = %d, want %d", tc.workers, mapCap, got, tc.want)
 			}
-			if got := heartbeatZeroSlots(tc.workers, mapCap); got != plan.HeartbeatSlots {
-				t.Fatalf("heartbeatZeroSlots(%d, %d) = %d but the plan says %d",
-					tc.workers, mapCap, got, plan.HeartbeatSlots)
+			if got := heartbeatZeroSlotBound(mapCap); got != plan.HeartbeatSlots {
+				t.Fatalf("heartbeatZeroSlotBound(%d) = %d but the plan says %d",
+					mapCap, got, plan.HeartbeatSlots)
 			}
 		})
 	}
@@ -338,30 +351,50 @@ func TestProgramBootstrapWorkerCountDataFlow_5718(t *testing.T) {
 	}
 }
 
-// TestHeartbeatZeroSlotsNeverLeavesTheArray_5718 keeps the degenerate
-// map-capacity boundary pinned across the fold F3 refactor: effectiveWorkers
-// floors the worker count at 1 so the ctrl fields never report zero workers,
-// which means heartbeatZeroSlots must cap the SLOT count itself when the Array
-// is too small to hold one worker's slots. An uncapped multiply would index
-// past the map.
-func TestHeartbeatZeroSlotsNeverLeavesTheArray_5718(t *testing.T) {
+// TestHeartbeatZeroSlotBoundIsTheArrayCapacity_6702 replaces
+// TestHeartbeatZeroSlotsNeverLeavesTheArray_5718, and the replacement is
+// deliberate rather than a rename.
+//
+// That test asserted `heartbeatZeroSlots(workers, mapCap) <= mapCap` across a
+// degenerate-capacity sweep. Once the bound IS `mapCap`, that assertion reads
+// `mapCap <= mapCap` — a tautology that would stay green under any edit,
+// including one that reintroduced a worker term and then clamped it. A test
+// that can no longer fail is decommissioned whether or not it still compiles,
+// so it is replaced by the two properties the new shape actually owes:
+//
+//  1. the bound EQUALS the Array capacity — every slot the shim can read
+//     (`USERSPACE_HEARTBEAT.get(binding.slot)`, 4096 entries) is zeroed, which
+//     is the #6702 fix; and
+//  2. the bound does NOT vary with the worker count — fed two different
+//     worker counts, including the values that used to narrow through a
+//     uint32 cast, it returns the same number. This is what makes "closed by
+//     construction" a claim that can fail.
+func TestHeartbeatZeroSlotBoundIsTheArrayCapacity_6702(t *testing.T) {
 	const perWorker = uint32(heartbeatSlotsPerWorker)
 	for _, mapCap := range []uint32{0, 1, perWorker - 1, perWorker, perWorker + 1, 4096} {
-		for _, workers := range []int{-1, 0, 1, 6, 1 << 32, int(^uint(0) >> 1)} {
-			got := heartbeatZeroSlots(workers, mapCap)
-			if got > mapCap {
-				t.Fatalf("heartbeatZeroSlots(%d, %d) = %d exceeds the Array capacity",
-					workers, mapCap, got)
+		if got := heartbeatZeroSlotBound(mapCap); got != mapCap {
+			t.Fatalf("heartbeatZeroSlotBound(%d) = %d, want the Array capacity %d — a bound "+
+				"short of the capacity leaves the slots above it holding the previous "+
+				"load's heartbeat (#6702)", mapCap, got, mapCap)
+		}
+		// Independence from the worker count, measured over pairs rather than
+		// asserted: every one of these must produce the SAME bound.
+		var first uint32
+		for i, workers := range []int{-1, 0, 1, 6, 200, 999_999_999, 1 << 32, int(^uint(0) >> 1)} {
+			got := planUserspaceWorkers(workers, mapCap).HeartbeatSlots
+			if i == 0 {
+				first = got
+				continue
 			}
-			if plan := planUserspaceWorkers(workers, mapCap); plan.HeartbeatSlots > mapCap {
-				t.Fatalf("planUserspaceWorkers(%d, %d).HeartbeatSlots = %d exceeds the Array capacity",
-					workers, mapCap, plan.HeartbeatSlots)
+			if got != first {
+				t.Fatalf("planUserspaceWorkers(%d, %d).HeartbeatSlots = %d but a different "+
+					"worker count gave %d — the zero-init bound is worker-derived again, "+
+					"which is the #6702 defect", workers, mapCap, got, first)
 			}
-			if mapCap >= perWorker && got == 0 {
-				t.Fatalf("heartbeatZeroSlots(%d, %d) = 0: the Array can hold at least one "+
-					"worker's slots, so nothing being zero-initialised leaves every "+
-					"worker starting on stale heartbeat data", workers, mapCap)
-			}
+		}
+		if first != mapCap {
+			t.Fatalf("the worker-independent bound at mapCap=%d is %d, want %d",
+				mapCap, first, mapCap)
 		}
 	}
 }

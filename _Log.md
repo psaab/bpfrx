@@ -103596,6 +103596,24 @@ prose edit above them added. No diff falls in the new test body.
   pkg/grpcapi/fabric_auth.go, pkg/grpcapi/server.go,
   pkg/grpcapi/server_show_cluster_text.go, docs/architecture.md
 
+## 2026-08-22 — #7492 parent prerequisites for the spelling gate
+- **Timestamp**: 2026-08-22
+- **Action**: Added gateParentPrereq — a per-parent table of statements that make
+  a container materialise, injected identically into the zero/one/two configs in
+  BOTH brace and set spellings so it cancels out of every comparison. Refused
+  outright when a row would author the leaf under test. Coverage 619 -> 629;
+  unreachable 228 -> 215 (13 leaves moved: 10 became compared, 3 were revealed to
+  be flags once their container materialised, so the flag ceiling RISES 158 ->
+  161 — a blind-spot count going up after a fix is the fix working).
+- **Correcting my own #7492 premise**: the 228 are NOT mostly a parent-path
+  problem. A general sibling-scaffold recovered 2/228 (refuted); most plausible
+  per-parent recipes fail too (syslog host + `any any`, tunnel + source/dest,
+  vrrp + virtual-address, dhcp-local-server + upto all still lose the value).
+  Only BGP group + neighbor worked, and it is the one shipped row. The remaining
+  215 need a different diagnosis, recorded on the issue.
+- **File(s)**: pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/config/schema_spelling_gate_coverage_7484_test.go, docs/config-schema.md
+
 ## 2026-08-22 — #6704 shim IPv6 non-first-fragment sighting
 - **Action**: Taught the shim's IPv6 ext-header walk to report a NON-FIRST
   fragment sighting and made userspace-dp's executable parity corpus compare
@@ -103606,6 +103624,44 @@ prose edit above them added. No diff falls in the new test body.
   `userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs`,
   `pkg/dataplane/userspace_xdp_bpfel.o`, `pkg/dataplane/userspace_xdp_manifest.json`,
   `pkg/dataplane/README.md`
+
+## 2026-08-22 — #6702 blocker 2 heartbeat zero-init bound
+- **Action**: Zero-init bound for `userspace_heartbeat` changed from a
+  worker-derived prefix to the Array's own capacity (slots are indexed by
+  BINDING slot, which is not a function of `cfg.Workers`); three existing
+  tests retargeted rather than left vacuous.
+- **File(s)**: `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/heartbeat_zero_bound_covers_bindings_6702_test.go` (new),
+  `pkg/dataplane/userspace/maps_sync_heartbeat_slots_4572_test.go`,
+  `pkg/dataplane/userspace/heartbeat_slots_narrowing_5718_test.go`,
+  `pkg/dataplane/userspace/worker_count_single_source_5718_test.go`,
+  `docs/config-schema.md`
+
+## 2026-08-22 — #6711 a backward clock step no longer destroys the boot epoch
+- **Action**: A single backward wall-clock step larger than `bootEpochMaxSkew`,
+  with persisted state intact, regressed the sender boot epoch AND durably
+  overwrote the higher persisted value with the lower one, so the peer refused
+  the node and every later boot re-published from the same bad clock — the
+  lockout outlived every restart. `refineBootEpoch` now SEPARATES "this value is
+  garbage" from "this value could be an intact predecessor our clock stepped
+  back behind": inside the new `bootEpochPreserveMaxSkew` (30 days) it still
+  declines to chain — chaining across a large step is the unrecoverable
+  direction — but no longer overwrites, so correcting the clock and restarting
+  chains from the preserved value and clears the peer's floor at once. Outside
+  the band (zero, year-2200+, unparseable) the file is still healed, so #6669's
+  self-healing property is intact. The published epoch is unchanged in every
+  case: nothing about what this node puts on the wire moves.
+  `TestArchivedEpochPoisonsAFreshFloor_6711` and the `6169`
+  `value_beyond_the_forward_bound` subtest both carried explicit notes saying
+  they pinned today's behaviour and were to be rewritten by a real #6711 fix;
+  both are rewritten against the new semantics, with a recovery leg added rather
+  than deleted. The three documentation sites #6711 cites were already corrected
+  in the tree; the remaining overwrite claims are updated here.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_admit.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
+  pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go
 
 ## 2026-08-22 — #6719 management reconciler startup race + unguarded publish
 - **Action**: `d.mgmt` became an `atomic.Pointer[managementReconciler]` (was a

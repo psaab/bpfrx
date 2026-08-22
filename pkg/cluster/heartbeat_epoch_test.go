@@ -599,20 +599,36 @@ func TestBootEpochMonotonic_6169(t *testing.T) {
 	// not free, it is not confined to a node that was already misconfigured, and
 	// it is not a one-command fix.
 	//
-	// The behavioural fix (carrying an intact persisted epoch across a larger
-	// backward step without reopening the unbounded-chain hazard) touches
-	// persistence semantics and is tracked separately as #6711. This subtest
-	// pins today's behaviour, not the desired one.
+	// UPDATED FOR THE #6711 FIX. The paragraph above used to end "This subtest
+	// pins today's behaviour, not the desired one", with the behavioural fix
+	// deferred to #6711. That fix has landed, so this pins the new semantics.
+	//
+	// Declining to CHAIN is unchanged and is still the important half: chaining
+	// from a value that far ahead strands this node above the range its peer
+	// will ever accept, which is the unrecoverable direction.
+	//
+	// What changed is that the file is no longer HEALED in this case. A value
+	// inside bootEpochPreserveMaxSkew is indistinguishable, from here, between
+	// "written by a clock that ran ahead" and "written correctly before OUR
+	// clock stepped back", and destroying it in the second case is what made a
+	// single backward step outlive every restart. Recovery is now by the clock
+	// advancing past the bound rather than by the file being flattened, which
+	// the pinned-clock leg below shows directly.
 	t.Run("value_beyond_the_forward_bound_is_not_chained_from", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 		farAhead := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3
 		if err := os.WriteFile(path, []byte(strconv.FormatUint(farAhead, 10)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got, ok := bootEpochIncarnation(path)
-		if !ok {
-			t.Fatal("persist failed")
-		}
+		// Driven through refineBootEpoch directly rather than through
+		// bootEpochIncarnation: that helper reports "persisted" as "the file
+		// ends up holding what we published", which is legitimately FALSE in
+		// the preserve case — the whole point is that the file keeps the OTHER
+		// value. Using it here would read a correct preserve as a failed write.
+		var pub atomic.Uint64
+		pub.Store(bootEpochSeed())
+		refineBootEpoch(path, &pub, 0)
+		got := pub.Load()
 		if got >= farAhead {
 			t.Fatalf("epoch = %d, chained from an out-of-range persisted value %d — "+
 				"this node could never come back down into its peer's accepted range", got, farAhead)
@@ -620,9 +636,23 @@ func TestBootEpochMonotonic_6169(t *testing.T) {
 		if !epochOrderable(got, time.Now().UnixNano()) {
 			t.Fatalf("reseeded epoch %d is itself out of range", got)
 		}
-		// The file was healed, so the next boot chains normally.
-		if next, _ := bootEpochIncarnation(path); next <= got {
-			t.Fatalf("after healing, the next epoch %d did not exceed %d", next, got)
+		// PRESERVED, not healed (#6711): the value may be an intact predecessor
+		// this node's clock has stepped back behind, and overwriting it is what
+		// makes the lockout survive restarts.
+		if onDisk := readEpochFile(t, path); onDisk != farAhead {
+			t.Fatalf("persisted %d, want the PRESERVED %d — a value inside "+
+				"bootEpochPreserveMaxSkew must survive a pass that declines to chain from it",
+				onDisk, farAhead)
+		}
+		// And once the clock catches up, chaining resumes from exactly that
+		// preserved value — the recovery the preservation exists for.
+		withPinnedEpochClock(t, int64(farAhead))
+		var caughtUp atomic.Uint64
+		caughtUp.Store(farAhead)
+		refineBootEpoch(path, &caughtUp, 0)
+		if next := caughtUp.Load(); next <= farAhead {
+			t.Fatalf("with the clock caught up, refinement published %d, want a value above the "+
+				"preserved %d — chaining must resume once the value is back in range", next, farAhead)
 		}
 	})
 
