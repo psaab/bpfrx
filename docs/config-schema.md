@@ -4,6 +4,71 @@ xpf has **two** command-tree sources of truth. Knowing which one to edit
 is the single most common mistake when adding CLI completion or config
 validation.
 
+
+## Compact (packed) stanza bodies
+
+A stanza body can be written NESTED or PACKED onto one line, and the two are the
+same configuration:
+
+```
+security { screen { ids-option s1 { icmp { ping-death; } } } }   nested
+security { screen { ids-option s1 icmp ping-death; } }           packed
+```
+
+The parser does not normalise them. A packed body arrives as extra tokens on the
+node's OWN `Keys`, with no `Children` at all:
+
+```
+nested   [ids-option s1] -> [icmp] -> [ping-death]
+packed   [ids-option s1 icmp ping-death]
+```
+
+A compiler that descends only `node.Children` therefore sees an EMPTY body. The
+instance NAME survives, which is what makes this class hard to notice: the
+profile/host/term exists, `show configuration` displays what the operator wrote,
+it binds to a zone or an interface normally — and it enforces nothing. Known
+instances all failed in the security-relevant direction: a syslog host with zero
+facilities ships nothing (#6684), a filter term with an empty action does not
+discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
+(#7457).
+
+**Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
+`node.Children` directly** when compiling a stanza that accepts a packed body.
+
+### Why it is schema-driven
+
+The packed tail does NOT expand uniformly, which is why a split on whitespace is
+wrong and why fixing one site by hand does not generalise:
+
+| packed | expands to | shape |
+|---|---|---|
+| `ids-option s1 icmp ping-death` | `[icmp]` -> `[ping-death]` | a chain |
+| `host 10.0.0.1 any any` | `[any any]` | ONE two-key leaf |
+| `term t1 then discard` | `[then]` -> `[discard]` | a chain |
+
+How many tokens each level swallows is a property of the grammar, and the
+grammar already has a single source of truth: `setSchema`, whose
+`schemaNode.args` is "extra tokens consumed as part of this node's key".
+The expander uses `consumeNodeKeys`, the same primitive `SchemaValidate` uses,
+so expansion cannot drift from validation.
+
+A tail that leaves the modelled grammar is returned UNEXPANDED rather than
+guessed — the helper exists to stop configuration being silently dropped, and
+inventing a shape the schema does not describe is another way of doing that.
+
+**A stanza whose leaves are not modelled in `setSchema` cannot be fixed this
+way.** `security screen ids-option <p> icmp` models only `fragment`, so the
+screen checks are absent from the schema and the packed screen body (#6683)
+cannot be expanded until they are added — which is also why those leaves get no
+`?` completion and no `SchemaValidate` typed-leaf checking.
+
+### Where it is NOT done
+
+Expansion is deliberately not done in the parser. `show configuration` renders
+from the AST, so normalising at parse time would rewrite the operator's packed
+one-liner into nested form on display — a round-trip fidelity change well beyond
+fixing the compile-time drops.
+
 ## Operational tree → `pkg/cmdtree`
 
 `run` / `show` / `clear` / `request` / `monitor` / `ping` / `traceroute`
