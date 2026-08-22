@@ -1414,6 +1414,33 @@ Two deliberate non-annotations:
   which is a wholesale gap rather than a per-entry skip, so their
   entries are not annotated as skipped either.
 
+## Port-mirroring instances the dataplane does not install (#6534)
+
+`show forwarding-options` (gRPC) and the CLI `show forwarding-options
+port-mirroring` render instances from configuration. An instance the
+snapshot builder DROPS carries a `NOT INSTALLED` line naming why:
+
+```
+Instance: span1
+  Input rate: all packets
+  Input interfaces: ge-0/0/1.0
+  Output interface: ge-0/0/9.0
+  NOT INSTALLED: negative input rate
+```
+
+The negative-rate case is the one to know about. Both renderers print
+`Input rate: all packets` whenever the rate is not greater than zero, so
+before this annotation a dropped instance advertised the most permissive
+mirror possible while mirroring nothing at all.
+
+Coverage is deliberately partial. The annotation covers the drops
+decidable from configuration — no output interface, and a negative input
+rate. The builder drops an instance for two further reasons that depend
+on the runtime interface table and are NOT annotated: an output interface
+that does not resolve to an ifindex, and an ingress interface already
+claimed by a lower-sorted instance (one output per ingress ifindex).
+Annotating those needs the resolved ifindex map threaded to the surface.
+
 ## Security: NAT rules the dataplane does not install (#6534)
 
 Every `show security nat ...` topic renders rules from the committed
