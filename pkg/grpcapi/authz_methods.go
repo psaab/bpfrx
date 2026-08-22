@@ -299,11 +299,7 @@ var showTextElevatedTopics = map[string]config.LoginClassPermission{
 }
 
 // showTextViewTopics is every OTHER topic the ShowText dispatcher serves — all
-// of them reached from a `show ...` command.
-//
-// #6495 note: "kernel-upgrade" sits here at PermView, matching the coarse model
-// every other `show` uses. It renders versions, slot labels and a revert
-// reason — operational state, no credential material. It is a hand-written list that is
+// of them reached from a `show ...` command. It is a hand-written list that is
 // machine-checked against production source in both directions
 // (TestEveryShowTextTopicHasAPermission_5278 parses server_show.go), which is
 // what makes it a coverage claim rather than an assertion of good intent. Keys
@@ -373,9 +369,9 @@ var showTextViewTopics = map[string]bool{
 	"interfaces-queue:":                        true,
 	"interfaces-statistics":                    true,
 	"internet-options":                         true,
-	"kernel-upgrade":                           true,
 	"ipsec-statistics":                         true,
 	"ipv6-router-advertisement":                true,
+	"kernel-upgrade":                           true,
 	"lldp":                                     true,
 	"lldp-neighbors":                           true,
 	"log":                                      true,
