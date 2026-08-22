@@ -597,15 +597,16 @@ func TestCollectPolicyCountersExposesSparseAndGlobalPolicyIDs(t *testing.T) {
 	store := newSchedulerCounterMetricsStore(t)
 	scheduledID := scheduledCounterPolicyID(t, store)
 	globalID := globalCounterPolicyID(t, store, "global-scheduled")
-	c := &xpfCollector{
-		srv: &Server{store: store},
-		policyHitsTotal: prometheus.NewDesc(
-			"xpf_policy_hits_total",
-			"policy hits",
-			[]string{"from_zone", "to_zone", "policy_name"},
-			nil,
-		),
-	}
+	// #7016: see TestCollectPolicyCountersNilSlotsNoPanic -- initialize the
+	// real descriptor set, then override the asserted one.
+	c := &xpfCollector{srv: &Server{store: store}}
+	c.initPolicyDescriptors()
+	c.policyHitsTotal = prometheus.NewDesc(
+		"xpf_policy_hits_total",
+		"policy hits",
+		[]string{"from_zone", "to_zone", "policy_name"},
+		nil,
+	)
 	dp := &schedulerCounterAPIDP{
 		Manager: dataplane.New(),
 		counters: map[uint32]dataplane.CounterValue{
@@ -652,15 +653,16 @@ func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
 		t.Fatal("test precondition: policy-stats must be disabled in this store")
 	}
 	scheduledID := scheduledCounterPolicyID(t, store)
-	c := &xpfCollector{
-		srv: &Server{store: store},
-		policyHitsTotal: prometheus.NewDesc(
-			"xpf_policy_hits_total",
-			"policy hits",
-			[]string{"from_zone", "to_zone", "policy_name"},
-			nil,
-		),
-	}
+	// #7016: see TestCollectPolicyCountersNilSlotsNoPanic -- initialize the
+	// real descriptor set, then override the asserted one.
+	c := &xpfCollector{srv: &Server{store: store}}
+	c.initPolicyDescriptors()
+	c.policyHitsTotal = prometheus.NewDesc(
+		"xpf_policy_hits_total",
+		"policy hits",
+		[]string{"from_zone", "to_zone", "policy_name"},
+		nil,
+	)
 	dp := &schedulerCounterAPIDP{
 		Manager: dataplane.New(),
 		counters: map[uint32]dataplane.CounterValue{
@@ -678,8 +680,17 @@ func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
 		close(ch)
 	}()
 	var got []prometheus.Metric
+	var hits int
 	for m := range ch {
 		got = append(got, m)
+		// #7016: count only xpf_policy_hits_total. collectPolicyCounters also
+		// emits the xpf_policy_counters_unpublished_rules gauge on EVERY path,
+		// so a bare len(got) no longer measures the M4 gate. The fqName is
+		// EXTRACTED, not substring-matched: Desc.String() embeds the HELP text,
+		// and that gauge's HELP cross-references xpf_policy_hits_total.
+		if descFQName(m.Desc().String()) == "xpf_policy_hits_total" {
+			hits++
+		}
 	}
 	// #3074: scheduled-allow (then count) is emitted even with the knob off.
 	assertCounterClose(t, got, c.policyHitsTotal, map[string]string{
@@ -688,9 +699,9 @@ func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
 		"policy_name": "scheduled-allow",
 	}, 17)
 	// M4 gate: plain-allow (no then count) must NOT be emitted with the
-	// knob off, so scheduled-allow is the ONLY metric.
-	if len(got) != 1 {
-		t.Fatalf("policy-stats off: want exactly 1 counter (scheduled-allow, then count), got %d", len(got))
+	// knob off, so scheduled-allow is the ONLY policy-hit sample.
+	if hits != 1 {
+		t.Fatalf("policy-stats off: want exactly 1 xpf_policy_hits_total sample (scheduled-allow, then count), got %d", hits)
 	}
 }
 

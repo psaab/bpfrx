@@ -99120,6 +99120,56 @@ prose edit above them added. No diff falls in the new test body.
   smoke is owed.
 - **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
 
+- **Timestamp**: 2026-08-21 18:40 PDT
+- **Action**: #7016 — an UNPUBLISHED policy counter is no data, not a failure
+
+  `#6743` activated the #3965 bulk policy-counter path on all seven
+  observability call sites for the first time (before it, the daemon published
+  `LegacyDataPlaneAdapter`, whose method set the bulk probe missed, and the
+  fallback promoted to the retired eBPF shim array the userspace runtime never
+  increments — every daemon-wired surface reported hit counts of ZERO). The
+  residual is the ERROR SIGNAL: the bulk reader returns
+  `ErrPolicyCounterUnpublished` for a rule the helper has not published, and
+  every surface folded that into its degraded-read channel, so ONE unpublished
+  rule discarded the WHOLE response — REST 500, gRPC `codes.Internal`, a
+  "policy counter read failed" warning naming a fault that does not exist, and
+  a `xpf_counter_read_errors_total` bump that is the #3643 false-alert class.
+  Reachable before the first 1 Hz status poll lands (`IsLoaded()` only means
+  the shim is loaded) and under #5679 config skew.
+
+  Fix: flag the ITEM, serve the response — the disposition the ZONE half of
+  `pkg/api/security.go` already used for `dataplane.ErrCounterNotPopulated`
+  (#6843). REST sets the existing `hit_counters_unavailable` (#5580); gRPC gets
+  an additive `PolicyRule.hit_counters_unavailable` (field 23); the CLI/gRPC
+  text tables render `n/a` plus a distinct "not yet published" note; the
+  collector counts the rule into a new
+  `xpf_policy_counters_unpublished_rules` gauge instead of bumping the error
+  counter. A GENUINE read failure keeps every fail-loud behaviour (#3345/#3408).
+
+  Validation: reproduced firsthand at master `314fbe17a` — the real Manager +
+  real LegacyDataPlaneAdapter in warm-up return an EMPTY snapshot with a nil
+  error and `policiesHandler` answered
+  `500 {"error":"policy counter read failed: policy counter not published"}`.
+  Mutation matrix 21/21 RED (one mutation per changed disposition, `go vet`
+  clean at each, non-zero exit captured); the first run exposed a FIXTURE gap —
+  both CLI global-rule cells came back GREEN because the shared CLI store has
+  no global policy, so the 7016 CLI binder now builds its own. Full
+  `go test -count=1 ./...` exit 0. Go + `.proto`/`.pb.go` only; nothing under
+  `userspace-dp/` or `userspace-xdp/`, so no cluster smoke is owed.
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/api/metrics.go,
+  pkg/api/metrics_counters.go, pkg/api/metrics_descriptors_policy.go,
+  pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  cmd/cli/show_security.go, pkg/api/README.md, pkg/grpcapi/README.md,
+  pkg/api/security_policy_counter_unpublished_7016_test.go,
+  pkg/cli/cli_show_policies_unpublished_7016_test.go,
+  pkg/grpcapi/server_policies_counter_unpublished_7016_test.go,
+  pkg/dataplane/userspace/policycounters_warmup_7016_test.go,
+  cmd/cli/show_policies_unpublished_7016_test.go, pkg/api/metrics_test.go,
+  pkg/api/metrics_scoped_global_3286_test.go,
+  pkg/api/security_screen_nil_3476_test.go,
+  pkg/api/zones_policies_counter_error_test.go, _Log.md
 ## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
 
 - **Timestamp**: 2026-08-21
@@ -99616,6 +99666,47 @@ prose edit above them added. No diff falls in the new test body.
   `userspace-dp/src/server/helpers/status.rs`,
   `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
 
+- **Timestamp**: 2026-08-21 18:52 PDT
+- **Action**: #7017 — standalone daemon re-installs event-stream callbacks on
+  a replaced stream
+
+  On a STANDALONE (no-cluster) daemon the userspace event-stream callbacks were
+  installed once and never re-installed when the helper's `EventStream`
+  instance was REPLACED. The clustered path got the `es != wired` re-install in
+  #6743 r6-F4; `runUserspaceEventStream`'s standalone arm called
+  `wireUserspaceEventStreamCallbacks` — which RETURNS as soon as it installs —
+  and returned with it, never running `eventStreamFallbackLoop`. Stated in-tree
+  as a KNOWN GAP (#6743 r2-N5) and reproduces identically on origin/master, so
+  pre-existing rather than introduced.
+
+  Symptom: a commit-confirmed rollback tears the armed backend's stream down
+  while KEEPING the backend object, and the corrected re-arm constructs a new
+  one; that instance has no `SetOnEvent`/`SetOnFullResync`/dataplane-event
+  callback, so every helper event lands in the callback-not-ready queue and
+  RT_FLOW session records stop reaching `show log`, syslog and the flow
+  exporter for the rest of the process lifetime. Only a restart recovers.
+
+  Fix: `watchUserspaceEventStreamCallbacks` — same 500 ms cadence and
+  first-wire behaviour, but it never returns and applies the fallback loop's
+  instance-IDENTITY re-install every tick. The arm now blocks for the life of
+  ctx where it used to return, and its goroutine is on the run WaitGroup;
+  `runShutdownSequence` calls `stop()` before `wg.Wait()`, so it joins within
+  one tick — that ordering is load-bearing and has its own binder.
+  `wireUserspaceEventStreamCallbacks` is unchanged and still used by
+  `daemon_ha_sync.go`.
+
+  Validation: reproduced firsthand at origin/master `aa3780666` — with
+  callbacks on stream A and the backend then publishing stream B, no ACK ever
+  came back on B (FAIL at the wiring deadline, 85.20s); with the loop the ACK
+  lands on the next tick, 0.50s PASS. Mutation 3/3 RED (revert the arm to
+  wire-once; weaken `es != wired` to `wired == nil`; drop the `ctx.Done()`
+  select arm), `go vet` clean at each with a non-zero exit captured.
+  `go test -count=1 ./pkg/daemon/` exit 0; the two new tests exit 0 under
+  `-race`. Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no
+  cluster smoke is owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_standalone_stream_rewire_7017_test.go,
+  pkg/daemon/README.md, _Log.md
 ## 2026-08-21 — #5838 follow-up: a pending crash restart survived an intentional stop
 
 - **Timestamp**: 2026-08-21
@@ -99798,6 +99889,74 @@ prose edit above them added. No diff falls in the new test body.
   pkg/grpcapi/session_iface_identity_6960_test.go, pkg/api/sessions.go,
   pkg/api/session_iface_identity_6960_test.go, pkg/dataplane/types.go,
   userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-21 — #6368: config-epoch guard check→write made non-racy
+
+- **Timestamp**: 2026-08-21
+- **Action**: `configEpochStale` and `PutClusterSynced*` were not one critical
+  section: the check reads max(applyingConfigGen, lastAppliedConfigGen) and the
+  write lands several statements later on the receiveLoop while configApplyLoop
+  runs independently, so a descheduled receiveLoop could pass the check against
+  the pre-fence threshold and land its write after the deleted-policy sweep —
+  leaving a stale PERMIT nothing re-examines until the next config apply. The
+  issue called the window "a few instructions"; it is actually the whole of
+  OnConfigReceived (compile + promote + sweep), which is why this was worth
+  closing. Fix: re-read the threshold AFTER a successful write and roll the
+  session back via DeleteWithCompanions* (reason cluster-stale) when it has gone
+  stale, deliberately NOT recording the per-key generation so the peer's next
+  re-sync is admitted. Act-then-verify rather than a lock — serializing check
+  and write would hold a mutex across dataplane I/O on the bulk-install hot
+  path, which the #2198 F3 note refuses; the re-read costs one atomic load per
+  install. Four cells: v4 and v6 rollback (the apply lands INSIDE the write via
+  a new mockSweepDP onSetV4/onSetV6 hook), plus two anti-over-reject cells (an
+  uncontended install survives; an apply that is not newer than the session's
+  epoch leaves it alone). Mutation-proven against the VERBATIM pre-fix bytes
+  from origin/master. go vet clean, pkg/cluster green at -count=1, the
+  6368/5274/6284 cells green under -race. **Cluster/session-sync code: a
+  failover smoke is OWED.**
+- **File(s)**: pkg/cluster/sync_conn_gen.go,
+  pkg/cluster/sync_config_epoch_install_race_6368_test.go,
+  pkg/cluster/sync_test.go, docs/session-sync-architecture.md, _Log.md
+
+## 2026-08-21 — #6345: WG transit-egress dispatch follows the selected peer on both branches
+
+- **Timestamp**: 2026-08-21
+- **Action**: `resolve_forward_target_ifindex` early-returned
+  `decision.resolution.tx_ifindex` whenever it was > 0, so #6308's peer-route
+  SSOT applied only to the `tx_ifindex == 0` branch. For a WG transit-egress
+  flow whose transport table carries a DEFAULT route, tx_ifindex is the
+  default-route parent while `wg_encap_frame` builds the outer L2/VLAN/src
+  against the SELECTED PEER's more-specific route (#6306) — identical with one
+  underlay, divergent with several, where the frame left one NIC carrying
+  another segment's source MAC and VLAN. Fix: consult
+  `wg_transit_egress_physical_egress_ifindex` FIRST on both branches and fall
+  back to tx_ifindex only when it does not resolve, so dispatch and bytes agree
+  by construction; a peer NIC with no XSK binding now drops rather than emitting
+  a mismatched frame on the wrong underlay. The non-tunnel fast path is still
+  one integer compare (`tunnel_endpoint_id == 0` -> None). Two cells: a
+  multi-underlay flow must dispatch to the peer's parent and not to tx_ifindex,
+  plus an anti-over-reject cell pinning the non-tunnel fast path. Mutation-proven
+  against the verbatim pre-fix ordering. Rust diff moves the helper binary, so a
+  cluster smoke is OWED.
+- **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
+
+## 2026-08-21 — #6440 CoS-apply CLI-transcript gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Diagnosed #6440 (`apply-cos-config.sh` exits 6). Root cause: the
+  piped-stdin CLI is a REPL that prints `error: ...` for a failed command,
+  continues, and exits 0 — so the phase-1/phase-2 exit-status gates could
+  never fire, and a silently-failed `load merge` committed a deletes-only
+  candidate (a CoS wipe) that surfaced only as the phase-3 "no shaper
+  binding" grep. Replaced the exit-status gates with CLI success-marker
+  verification, made every rollback verified, and added a daemon-readiness
+  wait.
+- **File(s)**: `test/incus/cos-apply-lib.sh` (new),
+  `test/incus/cos-apply-lib-selftest.sh` (new),
+  `cmd/cli/cos_apply_markers_6440_test.go` (new),
+  `test/incus/apply-cos-config.sh`, `Makefile`, `CLAUDE.md`,
+  `docs/cos-validation-notes.md`
 
 - **Timestamp**: 2026-08-21
 - **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`

@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -21,6 +23,18 @@ import (
 // ReadPolicyCounters (that stays the raw ordinal; see policyRuleIDForCounter).
 func runtimePolicyIndex(ids map[[2]uint32]uint32, policySetID, sliceIndex uint32) uint32 {
 	return dpuserspace.RuntimePolicyIndex(ids, policySetID, sliceIndex)
+}
+
+// policyCountCell renders one "Policy count" cell of the hit-count table.
+// A published counter renders as its decimal packet count, byte-identical to
+// the previous %d formatting. An UNPUBLISHED counter (#7016) renders "n/a"
+// rather than a "0" an operator would read as "this rule matched no traffic" --
+// the #3345 counter-unavailable-is-not-zero contract, applied per rule.
+func policyCountCell(count uint64, published bool) string {
+	if !published {
+		return "n/a"
+	}
+	return strconv.FormatUint(count, 10)
 }
 
 func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
@@ -56,6 +70,15 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	// #3408: surface a per-policy counter read failure as a warning AFTER
 	// all reads, rather than printing clean-zero hit counts.
 	var readErr error
+	// #7016: an UNPUBLISHED per-rule counter is NOT a read failure. The helper
+	// has simply published nothing for that rule id yet -- the window before
+	// the first 1 Hz status poll lands, or config skew after a non-abort-class
+	// apply failure (#5679). Rendering it as an authoritative "0" under a
+	// "policy counter read failed" warning sent the operator hunting a fault
+	// that does not exist, so it gets its own disposition: the count cell reads
+	// "n/a" and a trailing note says why. Same not-populated-vs-failed split
+	// `show security zones` makes for dataplane.ErrCounterNotPopulated (#6843).
+	var unpublished int
 	index := uint32(1)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
@@ -87,15 +110,24 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
+			published := true
 			if statsEnabled || pol.Count {
-				if counters, err := readPolicy(ruleID); err == nil {
+				counters, err := readPolicy(ruleID)
+				switch {
+				case err == nil:
 					count = counters.Packets
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					published = false
+					unpublished++
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			}
-			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
-				index, zpp.FromZone, zpp.ToZone, pol.Name, count, action)
+			fmt.Printf("%-8d%-17s%-18s%-24s%-14s%s\n",
+				index, zpp.FromZone, zpp.ToZone, pol.Name,
+				policyCountCell(count, published), action)
 			index++
 		}
 		policySetID++
@@ -125,11 +157,19 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
+			published := true
 			if statsEnabled || pol.Count {
-				if counters, err := readPolicy(ruleID); err == nil {
+				counters, err := readPolicy(ruleID)
+				switch {
+				case err == nil:
 					count = counters.Packets
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					published = false
+					unpublished++
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			}
 			// #3286/#4626: a scoped global (#3148) shows its zone SET in the
@@ -137,8 +177,9 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			// an unscoped global keeps junos-global/junos-global.
 			hcFrom := config.ScopeLabelOr(pol.Match.FromZones, "junos-global")
 			hcTo := config.ScopeLabelOr(pol.Match.ToZones, "junos-global")
-			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
-				index, hcFrom, hcTo, pol.Name, count, action)
+			fmt.Printf("%-8d%-17s%-18s%-24s%-14s%s\n",
+				index, hcFrom, hcTo, pol.Name,
+				policyCountCell(count, published), action)
 			index++
 		}
 	}
@@ -158,18 +199,31 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			defAction = "Reject"
 		}
 		var defCount uint64
+		defPublished := true
 		if statsEnabled {
-			if counters, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
+			counters, err := readPolicy(dataplane.DefaultPolicySentinelID)
+			switch {
+			case err == nil:
 				defCount = counters.Packets
-			} else if readErr == nil {
-				readErr = err
+			case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+				defPublished = false
+				unpublished++
+			default:
+				if readErr == nil {
+					readErr = err
+				}
 			}
 		}
-		fmt.Printf("%-8s%-17s%-18s%-24s%-14d%s\n",
-			"-", "-", "-", dataplane.DefaultPolicyName, defCount, defAction)
+		fmt.Printf("%-8s%-17s%-18s%-24s%-14s%s\n",
+			"-", "-", "-", dataplane.DefaultPolicyName,
+			policyCountCell(defCount, defPublished), defAction)
 	}
 	if readErr != nil {
 		fmt.Printf("warning: policy counter read failed (counts may be incomplete): %v\n", readErr)
+	}
+	if unpublished > 0 {
+		fmt.Printf("note: %d policy counter(s) not yet published by the dataplane "+
+			"(shown as n/a; the helper has not reported these rules yet)\n", unpublished)
 	}
 	return nil
 }
