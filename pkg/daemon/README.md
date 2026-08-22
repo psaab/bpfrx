@@ -798,6 +798,25 @@ based on PCI bus order plus the cluster node ID. RETH members match by
 between physical and virtual at boot, and `ensureRethLinkOriginalName()`
 auto-fixes stale `.link` files.
 
+It **returns an error when naming does not converge** (#5842). Every step
+that can fail — the `.link` write, the rename, and the `networkctl reload`
+— accumulates into one aggregate that `enumerateAndRenameInterfaces`
+joins and returns, mirroring the device-map path's `renameErrs` (#4956).
+The pass still COMPLETES on a failure rather than abandoning midway: a
+half-renamed NIC set is worse than a finished-and-reported one.
+
+`writeLinkFile` and `writeBootstrapFxp0Network` return `(changed, error)`
+for the same reason. A single `bool` made `false` mean BOTH "already
+correct, nothing to do" and "the write failed" — opposite facts under one
+value, so no caller could have distinguished them even if it wanted to.
+
+This matters beyond diagnostics: `maybeReapplyConfigArrivalNaming` consumes
+the one-shot `emptyHANamingPending` marker only when
+`applyStartupNamingForConfig` returns nil. Positional mode always returned
+nil, so a #4179 config-less HA node whose renames all failed burned its
+single retry and stayed on standalone names until a restart — the failure
+#4956 had already fixed for the mapped path, still open on the default one.
+
 `deriveKernelName()` synthesizes that predictable kernel name from a NIC's
 sysfs PCI address via `pciAddrToEnp()`, which mirrors systemd's
 `ID_NET_NAME_PATH` scheme (`systemd.net-naming-scheme(7)`):
@@ -1856,7 +1875,12 @@ never lock an operator out of a remote box it manages.
   path and is DISTINCT from the userspace-dp `xpf_host_inbound_denies_total`
   (`GlobalCtrHostInboundDeny`, #3326) — they are not double counts. Before #3361
   these kernel drops were uncounted and `host_inbound_denies` stayed 0 even while
-  the firewall was actively denying control-plane traffic.
+  the firewall was actively denying control-plane traffic. The #5644 cold-boot
+  fail-closed FENCE re-creates that blind spot on purpose (it renders catch-all
+  DROPs with NO named counters), so `ReadHostInboundDenyCounters` reports the
+  present-but-counterless table as `HostInboundTableCounterless` and the API
+  marks that zero non-authoritative rather than publishing it (#5719). Adding a
+  named counter to the fence would silently re-certify the zero.
 
 ## RPM + ip-monitoring wiring (#1827)
 

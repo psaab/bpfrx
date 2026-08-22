@@ -2165,3 +2165,56 @@ fn dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820() {
          rather than installed and the later broader rule won"
     );
 }
+
+// #5190 FAIL-ON-REVERT (cross-linked from #5727): a DNAT rule whose
+// `match source-address` entry parses as neither a CIDR prefix nor a bare
+// host IP fails CLOSED — `source_constrained` stays true with an empty prefix
+// list, so `source_matches` admits nobody. That half is correct and stays
+// asserted here. What was missing is TELEMETRY: the drop was a silent
+// `Err(_) => {}`, so an operator saw a DNAT rule that simply stopped matching
+// with nothing to look at. Reverting `record_parse_error` back to the empty
+// arm leaves `parse_errors() == 0` → the surfacing assertion goes RED while
+// the fail-closed assertion stays green (proving the two are independent).
+#[test]
+fn dnat_unparseable_source_constraint_surfaces_and_still_fails_closed_5190() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "scoped-bad-source".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            source_addresses: vec!["not-an-ip-or-prefix".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    // (1) Fail-closed preserved: the rule IS source-scoped and no entry
+    // parsed, so no packet source satisfies it — the lookup must miss.
+    assert!(
+        table
+            .lookup_with_counter_scoped(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                40000,
+                80,
+                "",
+                "",
+                "",
+                None,
+            )
+            .is_none(),
+        "#2394 fail-closed: a source-scoped DNAT rule whose only source entry \
+         is unparseable must match NOTHING"
+    );
+    // (2) ...and the drop is now SURFACED instead of silently swallowed.
+    assert_eq!(
+        counters.parse_errors(),
+        1,
+        "#5190: an unparseable DNAT match source-address must be recorded as \
+         a NAT reconcile parse error, not silently dropped"
+    );
+}
