@@ -1,3 +1,44 @@
+## 2026-08-22 — #6619 + #6564 member 8: VRF-enslaved iifname scope, and coverage vs existence
+
+- **Timestamp**: 2026-08-22
+- **Action**: Established the kernel fact firsthand before building
+  anything (private userns+netns, real nf_tables over netlink, inet base
+  chain at hook input priority 10 — the exact hook xpf_hostinbound
+  installs): for a packet arriving on a VRF-enslaved netdev, `meta
+  iifname` at LOCAL_IN is the VRF MASTER —
+  `c_slave(veth1)=0 c_master(vrf-t)=3 c_any=3`. The `c_any=3` row is
+  what closes the argument: the hook runs exactly once, so the zero is
+  "it does not happen" rather than "a second pass was missed". Then
+  verified — measured, not inferred, per the explicit ask — that the
+  #4168 suppression really does read the resolved netdev set: a zone
+  whose only candidate is cross-zone-ambiguous resolves to none and its
+  deny warns. The same measurement caught #6564 member 8 live in the
+  neighbouring zone: it had resolved SOME of its candidates, emitted a
+  rule scoped to the survivors, and suppressed its warning. Fixed both
+  in one change because the VRF filter ENLARGES the partially-resolved
+  population. Rejected the lead's suggested shape (make a partially
+  resolved zone non-enforceable) after enumerating the cost: it would
+  withdraw a kernel deny that works. Split the single `enforceable`
+  boolean instead — `emitsRules` (any candidate resolved) still gates
+  emission, `fullyScoped` (no OWN candidate unresolved) now gates
+  suppression — so NO packet changes verdict and the only behaviour
+  change is warnings that were previously suppressed. Refined the
+  coverage predicate after an existing test went red and turned out to
+  be RIGHT: a dropped PARENT superset candidate is not a coverage gap
+  (a plain 802.1Q subunit's frames are demuxed to its own netdev), and
+  counting it would have warned on every trunk with an untagged unit-0
+  in one zone and tagged subunits in others. Only an OWN netdev counts.
+  Three one-line mutations, each `go vet` clean at the mutated state,
+  each localising: recording no netdev as enslaved reds exactly the four
+  VRF rows; reverting the coverage predicate to existence semantics reds
+  exactly the three partial-coverage rows; counting a parent candidate
+  as own reds exactly the over-warning guard row AND the shipped
+  `TestJunosHostCrossZoneAmbiguousTrunkKeepsWarning`, two independent
+  tests agreeing on that line.
+- **File(s)**: `pkg/config/junos_host_deny.go`,
+  `pkg/dataplane/userspace/junos_host_vrf_scope_6619_test.go` (new),
+  `docs/host-inbound-service-matrix.md`
+
 ## 2026-08-21 — #6612 junos-host residual: audited the claim, found it false, locked what holds
 
 - **Timestamp**: 2026-08-21

@@ -1603,6 +1603,73 @@ helper never sees it, so a helper crash cannot lock management out).
   slice below); it never replaces it. Because the scope is the ingress netdev, a
   destination-scoped deny on a data zone can never suppress management ingress on
   a lifeline, whichever firewall address it names.
+- **An l3mdev VRF netdev cannot be an `iifname` scope (#6619).** The daemon
+  enslaves every interface member of every routing instance whose
+  `instance-type` is not `forwarding` to `vrf-<name>`
+  (`pkg/daemon/daemon_apply_interfaces.go` → `BindInterfaceToVRF` →
+  `LinkSetMaster`). At the netfilter LOCAL_IN hook the l3mdev receive handler has
+  already replaced `skb->dev` with the VRF device, so `meta iifname` names the
+  **master**, never the enslaved interface, and `iifname "ge-0-0-1" … drop`
+  matches nothing. Measured firsthand at the exact hook and priority
+  `xpf_hostinbound` installs (inet base chain, hook `input`, priority 10) on the
+  kernel floor this project targets: `c_slave(veth1)=0  c_master(vrf-t)=3
+  c_any=3` — and `c_any=3` for three packets proves the hook runs **exactly
+  once**, so the zero is "it does not happen", not "a second pass was missed".
+  Such a netdev is therefore dropped from the scope. Before #6619 it was kept:
+  the zone emitted a representable program whose rules never matched AND, being
+  representable, suppressed its own #4168 warning — config commits clean, rules
+  present in the ruleset, nothing enforced.
+
+  **Not the same finding as #4455 Component A**, which is PLAN-KILLed. That
+  proposed to ADD a first-ever `iifname` predicate for *multicast admission*, and
+  was killed on reachability plus three attribution fragilities —
+  RETH→physical-member resolution, guess-on-malformed input, an address-lazy
+  interface source. l3mdev/VRF is in none of them, and this is a gate that
+  already shipped (#4932/#4146) on a different feature.
+
+  **Do not "fix" this by scoping on the VRF master name instead.** That rule
+  would match every interface in the VRF, including unzoned ones and any lifeline
+  bound to the same VRF — management stranding of the #7284 shape, where lifeline
+  exclusion is by INTERFACE and not by address value. Making it safe would need
+  full VRF-membership attribution including tunnel interfaces bound through
+  `pkg/routing/tunnel.go`'s `tc.RoutingInstance`, which is the fragile-attribution
+  territory #4455 Component A died in. Enforcement under VRF, if ever wanted,
+  needs its own design with that as the acceptance gate.
+
+- **Scope resolution is a COVERAGE question, not an existence one (#6564
+  member 8).** Two decisions come out of the resolved scope and they are
+  deliberately not one boolean:
+
+  - **Emit rules** when at least one candidate resolved. Protection that works is
+    never withdrawn — a zone that resolved some of its ingress netdevs still gets
+    a kernel deny on those.
+  - **Suppress the #4168 warning** only when every OWN candidate resolved. A zone
+    that resolved *some* is not enforcing the policy on every ingress path, and
+    `len(netdevs) > 0` cannot tell that from full coverage — it reported such a
+    zone as fully enforced.
+
+  A zone with NO candidates at all (lifeline-only, or no interfaces) is a third
+  state and must stay distinct: there is nothing to enforce, so it must not block
+  suppression. The distinction is exactly `len(Unscopable) > 0` — the zone HAD
+  candidates and could not use them all.
+
+  **Only an OWN netdev counts toward the gap.** A VLAN subunit contributes its
+  physical parent as an extra candidate for the bondless-RETH case where frames
+  may ride the member. On a plain 802.1Q trunk the parent is never where the
+  subunit's frames arrive, so losing it costs that zone nothing. Counting a
+  dropped parent as a coverage gap would warn on every trunk carrying an untagged
+  unit-0 in one zone and tagged subunits in others — an ordinary correct config,
+  and an advisory that fires on those stops being read at all.
+  `TestJunosHostCrossZoneAmbiguousTrunkKeepsWarning` (pkg/config) and the
+  parent-superset row of
+  `pkg/dataplane/userspace/junos_host_vrf_scope_6619_test.go` both hold this
+  line.
+
+  **No packet changes verdict.** Dropping an enslaved netdev removes only rules
+  that provably never matched, and partially-resolved zones keep every rule they
+  had. The whole behaviour change is commit-time warnings that were previously
+  suppressed.
+
 - **Coarse-then-fine order (`pkg/daemon/daemon_nft.go`).** The fine DROP runs after
   ESP/AH accept + the firewall-originated reply-direction established accept, but
   BEFORE the ND/PMTUD accepts and the residual full established accept, so a denied
