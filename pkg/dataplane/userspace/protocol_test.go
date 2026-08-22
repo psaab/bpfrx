@@ -1504,6 +1504,48 @@ func TestProcessStatusWorkerCommandQueuePoisonRecoveriesRoundTrip(t *testing.T) 
 // userspace-dp/src/protocol/control.rs; a key rename on either side
 // silently decodes as zero, so pin every tag here and verify the
 // pre-Phase-3 (keys absent) payload defaults to zero.
+// #2402/#6641: wire pin for the shared-session poison-recovery counter.
+// A key rename on either side decodes silently as zero -- and for THIS
+// counter zero reads as "no worker panic ever touched HA session state",
+// which is exactly the reassuring value the missing-metric defect already
+// produced. Pin the tag and the absent-key default on both sides.
+func TestProcessStatusSharedSessionPoisonRecoveriesRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		SharedSessionPoisonRecoveries: 7,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	if _, ok := obj["shared_session_poison_recoveries"]; !ok {
+		t.Fatalf("wire key %q missing from ProcessStatus JSON: %s",
+			"shared_session_poison_recoveries", string(raw))
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.SharedSessionPoisonRecoveries != in.SharedSessionPoisonRecoveries {
+		t.Fatalf("SharedSessionPoisonRecoveries: got %d, want %d",
+			back.SharedSessionPoisonRecoveries, in.SharedSessionPoisonRecoveries)
+	}
+
+	// Pre-#6641 helper payload (key absent) must decode to zero.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if legacy.SharedSessionPoisonRecoveries != 0 {
+		t.Fatalf("legacy SharedSessionPoisonRecoveries: got %d, want 0",
+			legacy.SharedSessionPoisonRecoveries)
+	}
+}
+
 func TestProcessStatusNeighborPhase3CountersRoundTrip(t *testing.T) {
 	in := ProcessStatus{
 		NeighborResolverGetBackoffAttemptsTotal: 7,

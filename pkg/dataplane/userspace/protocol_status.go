@@ -353,6 +353,16 @@ type ProcessStatus struct {
 	// Omitempty-free on the Rust side (always serialized); plain decode
 	// here defaults to 0 for older helpers.
 	WorkerCommandQueuePoisonRecoveries uint64 `json:"worker_command_queue_poison_recoveries,omitempty"`
+	// #2402/#6641: shared-session mutex poison recoveries (a worker
+	// thread panicked while holding a shared-session or owner-RG-index
+	// mutex; the committed map was recovered and the poison cleared --
+	// afxdp/shared_ops.rs, mirroring the #1807 worker-queue policy).
+	// Nonzero means a worker panic happened and the HA session state
+	// survived it instead of being silently emptied at failover (the
+	// #2402 bug the recovery policy exists to prevent). Surfaced as
+	// xpf_userspace_shared_session_poison_recoveries_total. Decodes to 0
+	// for an older helper that does not send the key.
+	SharedSessionPoisonRecoveries uint64 `json:"shared_session_poison_recoveries,omitempty"`
 	// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side ECN
 	// combine because the outer header carried a CE mark over an inner
 	// packet that was Not-ECT (the illegal combination — a congested

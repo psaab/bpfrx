@@ -760,6 +760,17 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.WorkerCommandQueuePoisonRecoveries),
 	)
 
+	// #2402/#6641: shared-session poison recoveries. Emitted
+	// unconditionally for the same reason as its #1807 twin above: a 0 is
+	// a real "no worker panic touched HA session state" signal, and an
+	// absent series would be indistinguishable from a helper that never
+	// reports.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSharedSessionPoisonRecoveries,
+		prometheus.CounterValue,
+		float64(status.SharedSessionPoisonRecoveries),
+	)
+
 	// #2315: GRE-decap RFC 6040 4.2 illegal-combination drops (outer CE
 	// over a Not-ECT inner). Emitted unconditionally so a 0 is a real
 	// "no illegal combinations seen" signal rather than an absent series.

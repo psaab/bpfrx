@@ -172,22 +172,117 @@ func joinNodePath(prefix string, keys []string) string {
 	return prefix + " " + joined
 }
 
+// renderNodePathFlat builds the human-readable path from a FLATTENED key path,
+// masking every secret VALUE token (#7395).
+//
+// It resolves secrecy through secretIndices (ast_redact.go) — the SAME
+// resolution the raw-AST display paths use, and the only one in the tree that is
+// AST-SHAPE INDEPENDENT. That is the whole point: `authentication-key <PSK>`
+// arrives either as ONE node whose Keys are ["authentication-key", "<PSK>"]
+// (flat-set) or as TWO chained nodes (hierarchical parse), and a predicate that
+// reads keys[0] matches the keyword in the first shape and the VALUE in the
+// second. secretIndices sees the flattened path, so both shapes resolve
+// identically.
+func renderNodePathFlat(fp []string) string {
+	clean := make([]string, len(fp))
+	for i, k := range fp {
+		clean[i] = sanitizeControlChars(k)
+	}
+	for idx := range secretValueIndicesFlat(fp) {
+		if idx >= 0 && idx < len(clean) {
+			clean[idx] = SecretRedacted
+		}
+	}
+	return strings.Join(clean, " ")
+}
+
+// secretValueIndicesFlat returns the positions of the flattened key path that
+// hold a secret VALUE, as the UNION of the tree's two secret-leaf resolutions.
+//
+// There are two because #6625 added one (secretLeafKeywords / isSecretLeaf, in
+// secret.go) beside the one the raw-AST display paths already used
+// (secretIndices, in ast_redact.go), and they do not agree: `password` is
+// unconditional in the first and gated to `api-auth`/`dynamic-dns` in the
+// second, while the second additionally knows authentication-password,
+// privacy-password, simple-password, api-token, aws-secret-key,
+// `community` under snmp and `key` under `authentication md5`.
+//
+// Taking the union rather than picking one is deliberate. Each list is a claim
+// that something IS a credential; disagreement means one of them has a leaf the
+// other has not learned about yet, and in a redactor the safe resolution of
+// "one says secret" is secret. The cost of over-redacting is a lost diagnostic;
+// the cost of under-redacting is a published credential.
+//
+// It is evaluated over the FLATTENED path, which is what makes it independent
+// of AST shape: `authentication-key <PSK>` arrives either as ONE node whose Keys
+// are ["authentication-key", "<PSK>"] (flat-set) or as TWO chained nodes
+// (hierarchical parse). A predicate reading keys[0] matches the keyword in the
+// first and the VALUE in the second — which is why #6625's fix covered only the
+// flat shape (#7395).
+//
+// Both root-gated cases survive the union intact: a policy-options `community`
+// is a BGP route-target name and stays legible in BOTH resolutions, so #4097's
+// diagnostic is not broken.
+func secretValueIndicesFlat(fp []string) map[int]bool {
+	out := map[int]bool{}
+	for _, i := range secretIndices(fp) {
+		out[i] = true
+	}
+	for i, k := range fp {
+		if !IsSecretLeafKeyword(k) {
+			continue
+		}
+		// Every token after the keyword is its value (covers a multi-token or
+		// bracketed-list value), matching redactSecretKeys' keys[1:] rule.
+		for j := i + 1; j < len(fp); j++ {
+			out[j] = true
+		}
+	}
+	return out
+}
+
+// isSecretValueIndex reports whether position idx of the flattened key path is a
+// secret VALUE token.
+func isSecretValueIndex(fp []string, idx int) bool {
+	return secretValueIndicesFlat(fp)[idx]
+}
+
+// splitNodePathPrefix recovers the flattened key path from the joined string
+// form the exported entry points still accept. Empty prefix is the root.
+func splitNodePathPrefix(prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	return strings.Split(prefix, " ")
+}
+
 // validateNodesControlChars walks the (group-expanded) AST and returns
 // an error for the first value or annotation containing a control
 // character, or the first annotation containing a `*/`/`/*` comment
 // delimiter (#3900). Strict commit-path only — see the package comment
 // above.
 func validateNodesControlChars(nodes []*Node, prefix string) error {
+	return validateNodesControlCharsAt(nodes, splitNodePathPrefix(prefix))
+}
+
+// validateNodesControlCharsAt is the recursion, carrying the path as a SLICE.
+//
+// The slice is what makes shape-independent secrecy possible: secretIndices
+// resolves a keyword to the positions of its value tokens, so it needs the
+// components. Re-splitting the joined form per level would also split a string
+// built from SANITIZED components, and a sanitized token can contain the space
+// being split on — silently shifting every index after it.
+func validateNodesControlCharsAt(nodes []*Node, base []string) error {
 	for _, n := range nodes {
-		// #6625: a credential leaf must never have its VALUE rendered. The
-		// path is built from the REDACTED keys, because joinNodePath renders
-		// every key — including the value — so an un-redacted path published
-		// the secret a second time, alongside the quoted value below.
-		nodePath := joinNodePath(prefix, redactSecretKeys(prefix, n.Keys))
-		secretLeaf := isSecretLeaf(prefix, n.Keys)
-		for _, k := range n.Keys {
+		// #6625/#7395: a credential leaf must never have its VALUE rendered,
+		// and the path renders every key — so for `authentication-key <PSK>`
+		// an un-redacted path published the secret a SECOND time, alongside
+		// the quoted value below.
+		fp := append(append([]string(nil), base...), n.Keys...)
+		nodePath := renderNodePathFlat(fp)
+		for i, k := range n.Keys {
 			if hasControlChars(k) {
-				if secretLeaf {
+				if isSecretValueIndex(fp, len(base)+i) {
 					// Report WHERE and WHAT, never the value. The offset plus
 					// the byte is enough to fix the input — a leading tab from
 					// a password manager is offset 0, a trailing CR is the last
@@ -206,7 +301,7 @@ func validateNodesControlChars(nodes []*Node, prefix string) error {
 		if hasCommentDelim(n.Annotation) {
 			return fmt.Errorf("%s: annotation %q contains a comment delimiter (the sequences '*/' and '/*' are not allowed in annotations — they would close the comment and inject the remaining text as configuration on reload)", nodePath, n.Annotation)
 		}
-		if err := validateNodesControlChars(n.Children, nodePath); err != nil {
+		if err := validateNodesControlCharsAt(n.Children, fp); err != nil {
 			return err
 		}
 	}
@@ -219,6 +314,12 @@ func validateNodesControlChars(nodes []*Node, prefix string) error {
 // human-readable config path per modified node. Lenient-path
 // counterpart of validateNodesControlChars.
 func sanitizeNodesControlChars(nodes []*Node, prefix string) []string {
+	return sanitizeNodesControlCharsAt(nodes, splitNodePathPrefix(prefix))
+}
+
+// sanitizeNodesControlCharsAt is the lenient recursion, carrying the path as a
+// slice for the same reason its strict twin does.
+func sanitizeNodesControlCharsAt(nodes []*Node, base []string) []string {
 	var warnings []string
 	for _, n := range nodes {
 		changed := false
@@ -236,11 +337,17 @@ func sanitizeNodesControlChars(nodes []*Node, prefix string) []string {
 			n.Annotation = sanitizeCommentDelim(n.Annotation)
 			changed = true
 		}
-		nodePath := joinNodePath(prefix, n.Keys)
+		// #7395: the same masking, through the same resolution. The caller LOGS
+		// each path this returns, and this walker runs on Store.Load at BOOT and
+		// on Store.SyncApply for every HA peer-sync — so an already-persisted
+		// key with a stray tab was re-published to the daemon log on every
+		// single boot. The strict validator fires once, on a commit; this is the
+		// worse of the two surfaces, and #6625 fixed only the other one.
+		fp := append(append([]string(nil), base...), n.Keys...)
 		if changed {
-			warnings = append(warnings, nodePath)
+			warnings = append(warnings, renderNodePathFlat(fp))
 		}
-		warnings = append(warnings, sanitizeNodesControlChars(n.Children, nodePath)...)
+		warnings = append(warnings, sanitizeNodesControlCharsAt(n.Children, fp)...)
 	}
 	return warnings
 }
