@@ -625,6 +625,17 @@ Both raw deploy paths (`setup.sh deploy` and `cluster-setup.sh deploy`) now
 reconcile prior #1917 in-place-upgrade residue and HARD-verify the swap, so a
 deploy can no longer silently run OLD code:
 
+- **Verifier pre-flight (#1864 / #1869 / #6493).** BEFORE anything on the box is
+  disturbed, the new xpfd is staged at `/tmp/xpfd.preflight` and run as
+  `verify-dataplane` on the TARGET, so its embedded AF_XDP shim is proven to
+  load against THAT box's kernel. A REJECT aborts the deploy with the old
+  daemon still running and forwarding. This is the one check the other three
+  below cannot substitute for: they compare bytes and process identity, and all
+  pass for a binary whose shim loads nothing — the box then comes up in
+  config-only mode with no dataplane and the failure surfaces later as a
+  forwarding mystery. The walk runs at `nice -19` on the complement of the
+  AF_XDP worker cores (falling back to nice-only if that mask cannot be derived
+  or is unusable) so it does not stall a box that is still in service.
 - **Stale ExecStart pin.** A leftover `xpfd.service.d/10-xpf-version.conf` (from
   a `.deb` dogfood) pins systemd to a concrete versioned binary; a raw
   `incus file push` replaces `/usr/local/sbin/xpfd` but systemd keeps launching
@@ -647,3 +658,11 @@ deploy can no longer silently run OLD code:
 The reconcile/verify logic lives in `test/incus/deploy-lib.sh` (sourced by both
 scripts) and is covered by `test/incus/deploy-lib-selftest.sh`
 (`make test-deploy-lib`), which mocks `incus` against a fake VM rootfs.
+
+The pre-flight is `deploy_verify_dataplane_preflight` in the same file. Its
+correctness is half implementation and half POSITION: the self-test asserts both
+that a REJECT hard-fails without stopping the daemon or pushing into
+`/usr/local/sbin`, and — textually, against the real scripts — that the call in
+each deploy path precedes every destructive step in its function. Moving the
+call below `systemctl stop xpfd` keeps the function correct and makes the gate
+useless, so that ordering is asserted rather than commented.

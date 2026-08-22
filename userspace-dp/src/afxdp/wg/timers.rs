@@ -131,7 +131,7 @@ impl WgEngine {
     /// plan review, Codex r2 C1). Slow path.
     pub(crate) fn current_session_local_index(&self, pubkey: &[u8; 32]) -> Option<u32> {
         let peer = self.peer_arc(pubkey)?;
-        let cur = peer.current.read().unwrap();
+        let cur = peer.current.read().unwrap_or_else(|e| e.into_inner());
         cur.as_ref().map(|s| s.local_index)
     }
 
@@ -144,7 +144,7 @@ impl WgEngine {
         let Some(peer) = self.peer_arc(pubkey) else {
             return false;
         };
-        let cur = peer.current.read().unwrap();
+        let cur = peer.current.read().unwrap_or_else(|e| e.into_inner());
         matches!(
             cur.as_ref(),
             Some(s) if s.is_confirmed()
@@ -208,13 +208,13 @@ impl WgEngine {
     /// pinning a demux entry (#3882). Returns the number of sessions
     /// dropped; each bumps `sessions_expired`.
     pub(crate) fn expire_sessions(&self, now_ns: u64) -> usize {
-        let _guard = self.reconcile_lock.lock().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         let table = self.load_table();
         let mut dropped_indices: Vec<u32> = Vec::new();
         for entry in table.peers.iter() {
             let peer = &entry.peer;
             for slot in [&peer.current, &peer.previous, &peer.next] {
-                let mut guard = slot.write().unwrap();
+                let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(session) = guard.as_ref() {
                     if now_ns.saturating_sub(session.created_ns) >= REJECT_AFTER_TIME_NS {
                         dropped_indices.push(session.local_index);
@@ -227,7 +227,10 @@ impl WgEngine {
             return 0;
         }
         {
-            let mut by_index = self.sessions_by_local_index.write().unwrap();
+            let mut by_index = self
+                .sessions_by_local_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             for li in &dropped_indices {
                 by_index.remove(li);
             }
@@ -244,10 +247,10 @@ impl WgEngine {
     /// Under `reconcile_lock`, consistent with reserve/release. Bumps
     /// `pending_aborted_attempt_window` when a reservation existed.
     pub(crate) fn abort_pending_for_peer(&self, pubkey: &[u8; 32]) {
-        let _guard = self.reconcile_lock.lock().unwrap();
-        let mut by_peer = self.pending_by_peer.write().unwrap();
+        let _guard = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
         if let Some(reserved_idx) = by_peer.remove(pubkey) {
-            self.pending.write().unwrap().remove(&reserved_idx);
+            self.pending.write().unwrap_or_else(|e| e.into_inner()).remove(&reserved_idx);
             WgCounters::bump(&self.counters().pending_aborted_attempt_window);
         }
     }

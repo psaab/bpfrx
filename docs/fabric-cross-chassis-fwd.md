@@ -502,7 +502,7 @@ the resolved truth), not the restore source.
 
 The Rust-side persistence above (#3773/#3833) closed the *state-file*
 staleness, but the Go control plane had the mirror-image gap.
-`SyncFabricState` (`pkg/dataplane/userspace/manager_ha.go`) resolved the
+`SyncFabricState` (`pkg/dataplane/userspace/manager_fabric_sync.go`) resolved the
 peer/local MACs via `buildFabricSnapshots` and shipped them to the helper
 over `update_fabrics`, but it never wrote the resolved set back into Go's
 own `m.lastSnapshot.Fabrics`. The Go snapshot therefore kept the

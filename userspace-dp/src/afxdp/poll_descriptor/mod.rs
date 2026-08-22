@@ -1164,7 +1164,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         continue;
                                     }
                                     crate::nat64::Nat64Match::IneligibleDestination => {
-                                        // #6475: RFC 6052 §2.2 non-global
+                                        // #6475: RFC 6052 §3.1 non-global
                                         // embedded-destination drop. The extracted
                                         // v4 destination is 0.0.0.0/8, 127.0.0.0/8,
                                         // 169.254.0.0/16, 224.0.0.0/4, or

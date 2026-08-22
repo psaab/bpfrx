@@ -29,7 +29,7 @@ import (
 // attribute that happens to contain one of these words cannot produce a false
 // red.
 var prepassSuccessLogMarkers = []string{
-	"compiled", "complete", "registered", "auto-assigned", "IP set",
+	"compiled", "complete", "registered", "auto-assigned", "IP resolved",
 }
 
 // captureSlog redirects the default logger into a buffer for the duration of
@@ -187,13 +187,14 @@ func (d *persistentNATLoggingDP) GetPersistentNAT() *PersistentNATTable { return
 // NEGATIVE-ARM REACH, MEASURED rather than reasoned about (#6894 r9 F2).
 //
 // Driving the pre-pass's own rows with every gate neutralised shows which gated
-// records it can reach at all. Of the 19 `!isValidationPass(dp)` sites, 17 are
-// reachable and are bound below (16 in the base run, plus the deny-all default-
-// policy arm in its own run, plus the one gated WARN). TWO are NOT reachable on
-// the pre-pass, and neither is an oversight — both are properties of the shim
-// production actually uses:
+// records it can reach at all. Of the 18 `!isValidationPass(dp)` sites, 16 are
+// named in gatedRecordWants and bound by the base run; the other two — the
+// deny-all default-policy arm and the one gated WARN — are bound by their own
+// assertions in TestRealPassStillLogsItsSuccesses_4960. TWO of the eighteen are
+// NOT reachable on the pre-pass, and neither is an oversight — both are
+// properties of the shim production actually uses:
 //
-//   - `SNAT egress IP set` — compileNAT's interface-SNAT branch resolves its
+//   - `SNAT egress IP resolved` — compileNAT's interface-SNAT branch resolves its
 //     egress member through result.cachedInterfaceByName, and production's
 //     validateBeforeMutate builds a newValidationResult whose ifCache is EMPTY
 //     (only compileZones populates it). The branch soft-skips before the record.
@@ -273,10 +274,12 @@ func TestPrePassLogsNoSuccessForWorkItDidNotDo_4960(t *testing.T) {
 // message-only want binds whichever arm the fixture takes and leaves the other
 // free to be suppressed on both passes.
 var gatedRecordWants = []string{
-	"source NAT rule compiled",     // compileNAT, pool mode, v4
-	"source NAT v6 rule compiled",  // compileNAT, pool mode, v6
+	// #6420: the v4/v6 pair collapsed to ONE record when the per-address-family
+	// snat_rules / snat_rules_v6 writes were deleted — the compiler no longer
+	// has a per-family record to log, only the rule.
+	"source NAT rule compiled",     // compileNAT, pool + interface mode
 	"source NAT off rule compiled", // compileNAT, no-NAT exemption (#3844)
-	"SNAT egress IP set",           // compileNAT, interface mode, resolved egress
+	"SNAT egress IP resolved",      // compileNAT, interface mode, resolved egress
 	"persistent NAT pool registered",
 	"destination NAT rule compiled",
 	"static NAT rule compiled",
@@ -301,7 +304,7 @@ var gatedRecordWants = []string{
 // The rows are invoked directly because validateBeforeMutateWith refuses an
 // unmarked dp by design. `seededEgressResult` rather than `newValidationResult`
 // is what makes compileNAT's interface-SNAT branch resolve its egress member
-// instead of soft-skipping, which is the only way to reach `SNAT egress IP set`
+// instead of soft-skipping, which is the only way to reach `SNAT egress IP resolved`
 // without naming a live host link in a fixture (#6894 r3 F1 uses the same seed).
 func runRealPassPhases(t *testing.T, cfg *config.Config) *bytes.Buffer {
 	t.Helper()
