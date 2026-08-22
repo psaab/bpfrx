@@ -103065,3 +103065,37 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
   docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
+## 2026-08-22 — #7443 bind the live fabric peer-MAC resolver
+
+- **Timestamp**: 2026-08-22 (fix/7443-fabric-peer-mac-binding)
+- **Action**: Bind `buildFabricPeerMAC` — the LIVE fabric peer-MAC resolver —
+  with a test that actually executes it. #6598 hardened the selection but its
+  coverage was a table over the extracted helper `selectFabricPeerMAC` plus an
+  AST scan of `pkg/daemon/daemon_ha_fabric.go`; neither ran
+  `buildFabricPeerMAC`, so restoring that function's body to the pre-#6598
+  inline loop (the exact shipped defect: any address-matched entry with a
+  non-nil `HardwareAddr`, no NUD state test, no length test) passed `go vet`
+  and both full suites. `selectFabricPeerMAC` went dead under the revert, but
+  Go does not error on an unused package-level func and this repo runs no
+  `unused`/staticcheck gate, so nothing caught it. Added the
+  `fabricNeighListFn` seam (mirroring `ruleListFn` in routes.go, which is bound
+  by 20+ existing tests, and the `d.linkByNameFn`/`d.neighListFn` seams #6554
+  added for the same purpose) and drove the real resolver against a synthetic
+  neighbour table. Secondary, at the coordinator's direction: cross-reference
+  comments at BOTH NUD masks (`FabricNeighValidStates` and
+  `usableNUD`), each naming the other and the question it answers, so a future
+  single-sourcing pass cannot mistake the divergence for drift. Also corrected
+  `FabricNeighValidStates`'s exclusion list, which named only
+  INCOMPLETE/FAILED/NONE and so read as though NUD_NOARP were accepted.
+  Mutation matrix (4 cells x with/without the new fixture, `go vet` rc=0 in
+  every cell): restoring the pre-#6598 selection reds on
+  `buildFabricPeerMAC = "02:bf:72:cc:00:01", want ""` with the fixture and goes
+  GREEN without it — the escape reproduced, then closed. Bypassing the seam
+  also reds only with the fixture. The length and state halves red in both
+  columns (#6598/#6554 already own those), reported as redundancy rather than
+  claimed as new coverage.
+- **File(s)**: pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/fabric_peer_mac_binding_7443_test.go (new),
+  pkg/daemon/daemon_neighbor_listener.go, docs/fabric-cross-chassis-fwd.md,
+  _Log.md
