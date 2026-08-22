@@ -324,7 +324,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 func (s *Server) setSessionsTotal(resp *pb.GetSessionsResponse, f *sessionFilter) error {
 	if !f.hasFilters {
 		v4, v6 := s.dp.SessionCount()
-		resp.Total = int32(v4 + v6)
+		resp.Total = clampInt32(int64(v4) + int64(v6))
 		return nil
 	}
 	total := 0
@@ -344,7 +344,7 @@ func (s *Server) setSessionsTotal(resp *pb.GetSessionsResponse, f *sessionFilter
 	}); err != nil {
 		return status.Errorf(codes.Internal, "v6 session count: %v", err)
 	}
-	resp.Total = int32(total)
+	resp.Total = clampInt32(int64(total))
 	return nil
 }
 
@@ -1186,12 +1186,13 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	defer release()
 
 	// Check if this is a forwarded request from a peer (prevent recursion).
-	forwarded := false
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get("x-peer-forwarded"); len(vals) > 0 {
-			forwarded = true
-		}
-	}
+	//
+	// #5883: via the unforgeable capability, not raw metadata. This site read
+	// the header directly rather than going through peerForwardedFromContext,
+	// so it needed its own edit — which is exactly why the reserved keys are
+	// also STRIPPED at both listeners: a site that reaches for the raw header
+	// now finds nothing rather than finding a caller-supplied value.
+	forwarded := peerForwardedFromContext(ctx)
 
 	// If no filters, clear all
 	if req.SourcePrefix == "" && req.DestinationPrefix == "" &&

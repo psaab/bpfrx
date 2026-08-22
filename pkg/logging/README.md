@@ -181,8 +181,22 @@ connectionless and exempt:
   send-all sentinel and a security appliance forwarded substantially more
   syslog data than authorized — critical/notice/alert/emergency/debug/none
   all leaked as "no filter". A syslog host that lists several
-  `<facility> <severity>` pairs is folded to one client filter via
-  `MoreRestrictiveMinSeverity` (the most restrictive pair wins).
+  `<facility> <severity>` pairs resolves to one client filter, but only
+  the selectors that can MATCH a record this client emits take part
+  (#5797). A client stamps exactly one facility, so a selector naming a
+  different facility code matches nothing it will ever send and does not
+  constrain it. `daemon info; authorization critical` therefore filters
+  daemon records at **info**, not critical, and `daemon info;
+  authorization none` does not silence the destination — before #5797 a
+  blind `MoreRestrictiveMinSeverity` fold across every pair did both.
+  What still folds via `MoreRestrictiveMinSeverity` is two selectors
+  naming the SAME facility, which is a genuine conflict on one facility.
+  The Junos `any` wildcard matches every record and applies unless an
+  exact selector for the stamped facility is present (more-specific
+  wins). Residual, tracked separately: one client carries one facility,
+  so a host naming two mappable facilities can still honor only the one
+  it stamps, and which one that is depends on selector order — honoring
+  both needs a source facility on the event envelope.
 - **Unmapped facility names are reported, not silent (#5797).**
   `ParseFacility` returns `FacilityLocal0` for any name it does not know,
   which makes an authored `local0` indistinguishable from a name the
