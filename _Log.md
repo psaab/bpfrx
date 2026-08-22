@@ -1,3 +1,66 @@
+## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The Tier-1 gate asserted the day-0 config was installed
+  (`test -s`) but never its MODE, so a credential-permission regression
+  shipped green. Added `_conf_mode_verdict` pinning the installed file
+  as root-owned, a REGULAR FILE, mode exactly 0600, asserted from all
+  three scenarios that install a config (B, C's retry leg, E) since
+  they share one `install` call. The probe deliberately omits `stat -L`:
+  a symlink's own mode is always 0777 on Linux, so an unfollowed stat
+  reports `777 symbolic link` and fails, while following the link would
+  report the TARGET's `600 regular file` and PASS for a path an attacker
+  controls. File type is part of the verdict and a test asserts the
+  probe carries no `-L`. Also corrected image-validation.md:108, whose
+  sentence ("asserts it exists and is non-empty, not the mode") was true
+  and became false with this change.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_day0_perms_6503.py,
+  docs/image-validation.md
+
+## 2026-08-22 — #6502 day-0 loader probe order (labeled-first contract)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The day-0 config loader concatenated its labeled-volume
+  and iso9660 probe passes and piped them through `sort -u`, which
+  ALPHABETIZES — so with two valid-but-different media attached the ISO
+  on /dev/sda beat the labeled volume on /dev/sdb, the exact opposite
+  of the labeled-first contract the surrounding comment states.
+  Replaced with `awk 'NF && !seen[$0]++'` over the concatenated stream,
+  which preserves first-appearance order AND dedups ACROSS passes — a
+  medium that is both labeled and iso9660 appears once, in its LABELED
+  position. The self-correcting cases are preserved: a REJECTED labeled
+  volume and an EMPTY labeled volume both still fall through to the
+  ISO, so the fix does not become "labeled or nothing".
+- **File(s)**: scripts/image/xpf-day0-config,
+  scripts/image/test_day0_probe_order_6502.py
+
+## 2026-08-21 — #6550 cluster monitor poll/UpdateGroups map race
+
+- **Timestamp**: 2026-08-21
+- **Action**: Took `mon.mu` around the poll goroutine's mutations of
+  `ifaceState`, `ipState`, `ipDebts` and `ipThresholdState`, which
+  `UpdateGroups` deletes from under that same lock on every cluster
+  config apply — a Go runtime FATAL (`concurrent map read and map
+  write`) reachable from a routine commit, and via config-sync on both
+  nodes. Not one lock around the apply phase: the order is
+  `m.mu -> mon.mu` (`Manager.UpdateConfig` holds `m.mu` and calls
+  `UpdateGroups`), and the poll path calls `SetMonitorWeight`, which
+  takes `m.mu` — holding `mon.mu` across that inverts the order and
+  deadlocks. `reconcileRGIPDebts` now computes its whole diff under the
+  lock into a `[]ipDebtAction` and replays the manager callbacks after
+  releasing it, preserving the removals-then-installs emission order.
+  Added a race probe, a deterministic lock-order probe (new
+  `beforeManagerApplyHook` seam), and a Makefile canary; added the
+  missing `./pkg/cluster/` leg to `test-race-dp` — no make target raced
+  this package at all, so #6550 and #7257 were races CI had no PATH to.
+  Mutation matrix: M1/M2/M3 (each site's lock removed, verbatim pre-fix
+  form) → 5/5/7 DATA RACEs; M4 (lock held across the manager callback)
+  → the lock-order probe reds on timeout; W1 (delete the Makefile leg)
+  and W2 (drop a probe name from its pattern) → the canary reds.
+- **File(s)**: pkg/cluster/monitor.go,
+  pkg/cluster/monitor_poll_update_race_6550_test.go,
+  pkg/cluster/README.md, Makefile
 ## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
 
 - **Timestamp**: 2026-08-22
@@ -100708,6 +100771,43 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
+
+## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
+- **Timestamp**: 2026-08-21
+- **Action**: `terminateRemovedConns` was fire-and-forget while
+  `promoteConnNames` advanced `prevConnNames` first, so a failed
+  `swanctl --terminate` lost the teardown debt permanently and `Apply` still
+  returned nil — a deleted/unrenderable VPN kept forwarding under its stale
+  child SA. The failed subset is now carried in `pendingTerminate`, unioned
+  into the next apply's removed set (filtered by the loaded names so a
+  re-added VPN is never torn down), and returned as an `Apply`/`Clear` error.
+  Debt discharges when the SA is no longer live, so it cannot latch.
+- **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
+  pkg/ipsec/terminate_debt_6542_test.go (new), pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6419 — evaluated and closed the "reuse the authority's config-gen
+    namespace" shortcut for the active/active reverse direction; recorded the
+    structural reason in code + docs and armed the RG0-primary config-sync
+    rejection pin (previously a vacuous green).
+  - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
+    docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go
+
+## 2026-08-21 — #6543: redundancy-group ids folded by canonical value
+- **Timestamp**: 2026-08-21
+- **Action**: `compileChassis` appended one `*RedundancyGroup` per AST
+  instance, so `redundancy-group 1` + `redundancy-group 01` (and a repeated
+  hierarchical block) committed TWO records with `ID=1` — one with an empty
+  `NodePriorities`. `cluster.Manager.UpdateConfig`'s id-keyed last-wins loop
+  then overwrote `LocalPriority` with the map-miss zero and the #4880 gate
+  passed vacuously on the empty record. Instances are now folded by canonical
+  int id and each body is replayed into the single record through the same
+  statement dispatch table (leaf-level last-wins, Junos `set` semantics);
+  first-appearance order preserved.
+- **File(s)**: pkg/config/compiler_system.go,
+  pkg/config/compiler_chassis_rg_id_canonical_6543_test.go (new),
+  pkg/cluster/rg_id_canonical_6543_test.go (new), docs/config-schema.md,
+  pkg/cluster/README.md, _Log.md
 
 ## 2026-08-21 — #6544: LAG (ae/802.3ad) accepted-only advisory + doc correction
 - **Timestamp**: 2026-08-21
