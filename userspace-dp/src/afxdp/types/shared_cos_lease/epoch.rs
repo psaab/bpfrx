@@ -319,7 +319,7 @@ pub(super) struct V8State {
     /// between share/demand mismatch (workers asking beyond their
     /// share) and claim-sampling loss (workers not asking at all) —
     /// the registered Path-A Step-0 decision rule in
-    /// `docs/research/1863-realization-gap/plan.md` §5. Single
+    /// `docs/pr/1863-realization-gap/plan.md` §5. Single
     /// relaxed fetch_add per acquire on the caller's own slot, in a
     /// cache-line-aligned wrapper (`PaddedAtomicU64`) so per-worker
     /// slots never share a line — the same isolation rule
