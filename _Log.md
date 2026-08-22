@@ -1,3 +1,29 @@
+## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
+
+- **Timestamp**: 2026-08-22
+- **Action**: The tail's `networkctl reconfigure` argv was asserted in full,
+  but `activationTailIfaces()` had exactly one ELIGIBLE interface, so
+  `[reconfigure trust0]` was also the output of a hardcoded literal, a deleted
+  `Unmanaged` predicate, a deleted `Disable` predicate and a reversed
+  accumulation. Confirmed rather than assumed: all four were run against the
+  BASE fixture and all four exited 0.
+  Extended the fixture to five interfaces covering every arm — two included
+  (`trust0`, `dmz0`) sitting on either side of three excluded (bond member,
+  unmanaged, disabled) — so accumulation and ORDER are both observable, which
+  one eligible interface can never make so.
+  Spelled the expectation out as `wantActivationTailArgv` rather than deriving
+  it by filtering the fixture with the production predicate: deriving it would
+  make the assertion true by construction, since the same predicate would
+  decide both the behaviour and the expectation and deleting an arm would move
+  them together.
+  Left `debtTestIfaces()` untouched — it is deliberately minimal for the
+  reload-debt tests that share it, and the richer fixture is local to the
+  activation-tail file.
+  Mutation matrix M1-M5 all RED at RUN=48 matching the control, vet clean at
+  each; and the same four mutations verified GREEN against the base fixture,
+  which is what shows the fixture change is what closed them.
+- **File(s)**: `pkg/networkd/activation_tail_5718_test.go`,
+  `pkg/networkd/README.md`
 ## 2026-08-22 — #6897: the failover gate could emit no throughput cell, and had
 
 - **Timestamp**: 2026-08-22

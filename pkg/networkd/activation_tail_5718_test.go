@@ -8,13 +8,33 @@ import (
 	"testing"
 )
 
-// activationTailIfaces extends debtTestIfaces() with a bond MEMBER, which the
-// activation tail must EXCLUDE from `networkctl reconfigure` (reconfiguring a
-// member can eject it from its bond; its Bond= directive is picked up by the
-// reload instead). The shared debtTestIfaces() fixture has only one managed,
-// non-member interface, which cannot distinguish an intact exclusion from a
-// deleted one — both yield the same one-element argv. Kept local to this file
-// so the reload-debt tests that share debtTestIfaces() are unaffected.
+// activationTailIfaces extends debtTestIfaces() so that EVERY dimension of the
+// activation tail's `networkctl reconfigure` argv is observable (#6914).
+//
+// The tail selects interfaces with `!Unmanaged && !Disable && BondMaster == ""`
+// and accumulates their names in slice order. An argv assertion can only catch
+// a regression along an axis the fixture actually VARIES, so a fixture with one
+// eligible interface pins almost nothing: with `[reconfigure trust0]` as the
+// expectation, replacing the accumulated list with the literal "trust0",
+// deleting the Unmanaged predicate, deleting the Disable predicate, or
+// reversing the accumulation all still produce exactly that argv. Each of those
+// was proven to exit 0 against the old fixture.
+//
+// So this carries FIVE interfaces covering all four exclusion/inclusion arms:
+//
+//	trust0  managed, non-member          -> INCLUDED (first)
+//	lag0m   bond MEMBER                  -> excluded (reconfigure can eject it
+//	                                        from its bond; its Bond= directive
+//	                                        is picked up by the reload instead)
+//	ext0    Unmanaged                    -> excluded
+//	off0    Disable                      -> excluded
+//	dmz0    managed, non-member          -> INCLUDED (second)
+//
+// Two included interfaces on either side of the excluded ones make BOTH
+// accumulation and ORDER observable, which one eligible interface never can.
+//
+// Kept local to this file so the reload-debt tests that share debtTestIfaces()
+// are unaffected — that fixture is deliberately minimal for its own purpose.
 func activationTailIfaces() []InterfaceConfig {
 	return append(debtTestIfaces(),
 		InterfaceConfig{
@@ -22,8 +42,31 @@ func activationTailIfaces() []InterfaceConfig {
 			MACAddress: "52:54:00:aa:bb:dd",
 			BondMaster: "ae0",
 		},
+		InterfaceConfig{
+			Name:       "ext0",
+			MACAddress: "52:54:00:aa:bb:ee",
+			Unmanaged:  true,
+		},
+		InterfaceConfig{
+			Name:       "off0",
+			MACAddress: "52:54:00:aa:bb:ef",
+			Disable:    true,
+		},
+		InterfaceConfig{
+			Name:       "dmz0",
+			MACAddress: "52:54:00:aa:bb:f0",
+			Addresses:  []string{"10.0.30.10/24"},
+		},
 	)
 }
+
+// wantActivationTailArgv is the expected `networkctl reconfigure` argv for
+// activationTailIfaces(), SPELLED OUT rather than derived by filtering the
+// fixture with the production predicate. Deriving it would make the assertion
+// true by construction: the same predicate would decide both the expectation
+// and the behaviour, so deleting an arm would change them together and the test
+// could never red.
+var wantActivationTailArgv = []string{"reconfigure", "trust0", "dmz0"}
 
 // rpFilterFixture points procSysNetRoot at a temp tree with the slow-path TUN's
 // rp_filter pre-set to networkd's post-reload default, and returns a reader for
@@ -161,7 +204,7 @@ func TestApplyTailSurvivesExternalDebtDischarge_5718(t *testing.T) {
 	// with the production predicate would be circular. (Hardcoding is not the
 	// only non-circular option; `[]string{"reconfigure", ifaces[0].Name}` would
 	// also work. It is simply the clearest.)
-	wantArgs := []string{"reconfigure", "trust0"}
+	wantArgs := wantActivationTailArgv
 	if len(reconfigureArgs) != 1 || !slices.Equal(reconfigureArgs[0], wantArgs) {
 		t.Fatalf("the activation tail must run %v exactly once; got %v. An address "+
 			"application that names the wrong interfaces leaves the real ones unapplied "+
@@ -221,7 +264,7 @@ func TestApplyTailNotRepeatedOnceComplete_5718(t *testing.T) {
 	// test's subject is repetition, so the call COUNT is load-bearing here —
 	// but a count alone still cannot see a tail that runs the right number of
 	// times against the wrong interfaces.
-	if want := []string{"reconfigure", "trust0"}; !slices.Equal(reconfigureArgs[0], want) {
+	if want := wantActivationTailArgv; !slices.Equal(reconfigureArgs[0], want) {
 		t.Fatalf("first Apply ran %v, want %v", reconfigureArgs[0], want)
 	}
 
