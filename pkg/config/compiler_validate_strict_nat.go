@@ -2567,8 +2567,13 @@ func validateStaticNATInetTargetStrict(cfg *Config) error {
 // inventing rule-fanout semantics (which external prefix pairs with the single
 // `then static-nat prefix`?). Junos likewise takes one prefix here. Rejecting
 // makes the previously-silent collapse loud and fails CLOSED; the operator
-// writes one rule per external prefix. Widening static NAT to fan a rule across
-// several external prefixes is a separate semantic change, tracked as #6674.
+// writes one rule per external prefix.
+//
+// #6674 RATIFIED that as the permanent contract. The pairing question above has
+// no answer to find: a static-NAT rule is a 1:1 mapping, and `rule R1` /
+// `rule R2` already expresses N external prefixes exactly. The `multi: true` on
+// the schema leaf (schema_security.go) is an xpf over-advertisement of the
+// grammar, not a promise — see docs/config-schema.md.
 //
 // Strict on commit / commit-check (hard reject); the call site downgrades to a
 // warning on the tolerant load / peer-sync path (#1960 no-brick), where Match

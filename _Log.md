@@ -103096,3 +103096,17 @@ prose edit above them added. No diff falls in the new test body.
     owner's authoritative session family under latest-generation-wins.
   - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
     pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
+
+## 2026-08-22 — #6674 ratify both multi-value arms
+- **Timestamp**: 2026-08-22
+- **Action**: Ratify `forwarding-table export` and static-NAT
+  `match destination-address` as one-value leaves; measure and record that a
+  policy chain is NOT equivalent to its first member; clear six source sites
+  that promised a follow-up.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/types_security.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/multivalue_ratified_contract_6674_test.go,
+  pkg/frr/forwarding_export_chain_6674_test.go, docs/config-schema.md
