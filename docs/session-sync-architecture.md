@@ -458,6 +458,30 @@ Ordering and correctness:
   a rebooted peer's lower-generation re-prime is accepted (the same
   accept-everything reset the high-water already performs).
 
+**The check and the write are not one critical section (#6368).** The fence
+above makes the *verdict* correct; it does not make the *evaluation* atomic
+with the install it governs. `configEpochStale` reads the threshold and
+`PutClusterSynced*` lands several statements later, on the `receiveLoop`
+goroutine, while `configApplyLoop` runs on its own. A receiveLoop descheduled
+across that gap — a GC pause is enough, and the window it has to miss is the
+whole of `OnConfigReceived` (compile + promote + sweep), not a handful of
+instructions — can pass the check against the pre-fence threshold and land its
+write AFTER the sweep. What survives is a stale PERMIT no later sweep
+re-examines: it lives until the next config apply, which on a quiet box may be
+never, and on a standby it is precisely what that node forwards on after a
+failover.
+
+The install therefore re-reads the threshold AFTER a successful write and rolls
+the session back (`DeleteWithCompanions*`, reason `cluster-stale`) when it has
+gone stale. Act-then-verify rather than a lock: serializing the check with the
+write would hold a mutex across dataplane I/O on the bulk-install hot path,
+which the #2198 F3 note deliberately refuses, whereas the re-read costs one
+atomic load per install. The rollback applies the guard's OWN verdict a moment
+later rather than a fresh judgement — `configEpochStale` never consults policy,
+it refuses on epoch alone — and deliberately does NOT record the per-key
+generation, so the peer's next re-sync of that key is admitted rather than
+refused as stale.
+
 **Item 1 (deferred, documented residual).** The guard still covers only the
 config-authority → peer direction (the primary that admits the session is also
 the RG0 config-sync authority). A non-authority's sessions carry the

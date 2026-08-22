@@ -464,3 +464,16 @@ func natMatchPrefixParses(raw string) bool {
 	}
 	return net.ParseIP(raw) != nil
 }
+
+// NATMatchPrefixParses exposes natMatchPrefixParses so the userspace snapshot
+// builders can bind their own per-entry skip predicate to this one in a TEST
+// rather than by comment.
+//
+// #7215 is what that binding is for. validateDestinationNATAddressesStrict
+// carried a comment promising its acceptance "MUST match the builder's exactly"
+// and then drifted from dnatDestinationParts for six years' worth of mask
+// spellings — it stripped the mask text before parsing, so `10.0.0.0/33`
+// committed clean and the builder silently discarded it. A comment cannot fail;
+// a differential over both predicates can. See natMatchPrefixParses and
+// pkg/dataplane/userspace/nat_destination.go.
+func NATMatchPrefixParses(raw string) bool { return natMatchPrefixParses(raw) }

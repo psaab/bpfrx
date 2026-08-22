@@ -8,6 +8,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -272,6 +273,13 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			// #3408: surface a per-policy counter read failure as a warning
 			// AFTER all reads rather than rendering a clean "0" hits column.
 			var readErr error
+			// #7016: an UNPUBLISHED per-rule counter is not a read failure --
+			// the helper has published nothing for that rule id yet (warm-up
+			// before the first status poll, or config skew after a
+			// non-abort-class apply failure). Render it "n/a" and explain it in
+			// a trailing note instead of a "read failed" warning naming a fault
+			// that does not exist.
+			var unpublished int
 			// #4344: read the whole policy set from ONE snapshot (O(P+C), one
 			// brief dataplane lock) via the #3965 bulk reader instead of a
 			// per-policy ReadPolicyCounters loop. Built only when the dataplane
@@ -320,10 +328,17 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					// overwrite only on a successful gated read.
 					hits := "0"
 					if (statsEnabled || pol.Count) && readPolicy != nil {
-						if counters, err := readPolicy(ruleID); err == nil {
+						counters, err := readPolicy(ruleID)
+						switch {
+						case err == nil:
 							hits = fmt.Sprintf("%d", counters.Packets)
-						} else if readErr == nil {
-							readErr = err
+						case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+							hits = "n/a" // #7016
+							unpublished++
+						default:
+							if readErr == nil {
+								readErr = err
+							}
 						}
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
@@ -356,10 +371,17 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					// consistency reason as the zone-pair branch above.
 					hits := "0"
 					if (statsEnabled || pol.Count) && readPolicy != nil {
-						if counters, err := readPolicy(ruleID); err == nil {
+						counters, err := readPolicy(ruleID)
+						switch {
+						case err == nil:
 							hits = fmt.Sprintf("%d", counters.Packets)
-						} else if readErr == nil {
-							readErr = err
+						case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+							hits = "n/a" // #7016
+							unpublished++
+						default:
+							if readErr == nil {
+								readErr = err
+							}
 						}
 					}
 					// #3286/#4626: a scoped global (#3148) shows its zone SET
@@ -373,6 +395,10 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			}
 			if readErr != nil {
 				fmt.Printf("warning: policy counter read failed (hit counts may be incomplete): %v\n", readErr)
+			}
+			if unpublished > 0 {
+				fmt.Printf("note: %d policy counter(s) not yet published by the dataplane "+
+					"(shown as n/a; the helper has not reported these rules yet)\n", unpublished)
 			}
 			return nil
 		}

@@ -444,6 +444,60 @@ func (s *SessionSync) configEpochStale(epoch uint64) bool {
 	return epoch < barrier
 }
 
+// rollBackStaleConfigInstallV4 removes a synced session whose config epoch went
+// STALE between the pre-install check and the dataplane write (#6368).
+//
+// configEpochStale and PutClusterSynced* are not one critical section: the
+// check reads max(applyingConfigGen, lastAppliedConfigGen) and the Put lands
+// several statements later, on the receiveLoop goroutine, while configApplyLoop
+// runs on its own. If the receiveLoop is descheduled across that gap — a GC
+// pause or a loaded box is enough, and the window is the whole of
+// OnConfigReceived, which compiles and promotes a config and runs
+// clearSessionsForDeletedPolicies inside it, not "a few instructions" — the
+// install can pass the check against the OLD threshold and land its Put AFTER
+// the sweep that was supposed to invalidate it. The result is a stale PERMIT
+// that no later sweep re-examines: it survives until the next config apply,
+// which on a quiet box may be never, and a session installed on the standby is
+// exactly what that node forwards on after a failover.
+//
+// The fix is act-then-verify rather than a lock. Serializing the check with the
+// Put would hold a mutex across dataplane I/O on the bulk-install hot path,
+// which the #2198 F3 note deliberately refuses. Re-reading the threshold after
+// the Put costs one atomic load per install and detects precisely the case the
+// pre-check could not see; the rollback then applies the SAME verdict the guard
+// would have reached, just later. That introduces no new semantic:
+// configEpochStale never consults policy, it refuses on epoch alone, so a late
+// refusal is the guard's own decision rather than a fresh judgement about this
+// session.
+//
+// The generation is deliberately NOT recorded for a rolled-back install: the
+// per-key recv-gen high-water must stay where it was so the peer's next
+// re-sync of this key is admitted rather than refused as stale.
+func (s *SessionSync) rollBackStaleConfigInstallV4(key dataplane.SessionKey, epoch uint64) {
+	s.stats.SessionsStaleConfigIgnored.Add(1)
+	if err := s.sessions.DeleteWithCompanionsV4(key, dataplane.DeleteReasonClusterStale); err != nil {
+		slog.Warn("cluster sync: could not roll back a v4 install whose config epoch went stale during the dataplane write — a stale permit may survive until the next config apply",
+			"session_config_epoch", epoch, "applied_config_gen", s.lastAppliedConfigGen.Load(), "err", err)
+		return
+	}
+	slog.Debug("cluster sync: rolled back a v4 install whose config epoch went stale during the dataplane write (#6368)",
+		"session_config_epoch", epoch, "applied_config_gen", s.lastAppliedConfigGen.Load())
+}
+
+// rollBackStaleConfigInstallV6 is the v6 twin of
+// rollBackStaleConfigInstallV4; see there for why the check is re-run after
+// the write instead of being serialized with it.
+func (s *SessionSync) rollBackStaleConfigInstallV6(key dataplane.SessionKeyV6, epoch uint64) {
+	s.stats.SessionsStaleConfigIgnored.Add(1)
+	if err := s.sessions.DeleteWithCompanionsV6(key, dataplane.DeleteReasonClusterStale); err != nil {
+		slog.Warn("cluster sync: could not roll back a v6 install whose config epoch went stale during the dataplane write — a stale permit may survive until the next config apply",
+			"session_config_epoch", epoch, "applied_config_gen", s.lastAppliedConfigGen.Load(), "err", err)
+		return
+	}
+	slog.Debug("cluster sync: rolled back a v6 install whose config epoch went stale during the dataplane write (#6368)",
+		"session_config_epoch", epoch, "applied_config_gen", s.lastAppliedConfigGen.Load())
+}
+
 func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	if s.sessions == nil {
 		return
@@ -462,6 +516,14 @@ func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val datap
 		return
 	}
 	if err := s.sessions.PutClusterSyncedV4(key, val); err == nil {
+		// #6368: the check above and this write are not atomic. Re-read the
+		// threshold now — a config apply that raised the fence and ran its
+		// sweep while this install was in flight must not leave the session
+		// behind it.
+		if s.configEpochStale(val.ConfigEpoch) {
+			s.rollBackStaleConfigInstallV4(key, val.ConfigEpoch)
+			return
+		}
 		s.recordInstalledGenV4(key, record)
 		s.stats.SessionsInstalled.Add(1)
 		s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, nil)
@@ -491,6 +553,13 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 		return
 	}
 	if err := s.sessions.PutClusterSyncedV6(key, val); err == nil {
+		// #6368: see the v4 twin — re-read the threshold after the write so a
+		// config apply that completed its sweep during this install cannot
+		// leave the session behind it.
+		if s.configEpochStale(val.ConfigEpoch) {
+			s.rollBackStaleConfigInstallV6(key, val.ConfigEpoch)
+			return
+		}
 		s.recordInstalledGenV6(key, record)
 		s.stats.SessionsInstalled.Add(1)
 		s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, nil)

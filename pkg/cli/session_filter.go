@@ -425,9 +425,10 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 //
 // #4983: when the session carries a true ingress identity — the
 // {ifindex, VLAN} of the binding its first packet actually arrived on,
-// recorded once by the dataplane at install — this returns the single
-// interface that identity names, so a session on interface X no longer
-// matches a filter for a SIBLING interface Y of the same zone. That
+// recorded once by the dataplane at install — AND the row's own recorded
+// ingress zone corroborates it (#6987), this returns the single interface that
+// identity names, so a session on interface X no longer matches a filter for a
+// SIBLING interface Y of the same zone. That
 // cross-interface match is the defect #4792 could only narrow (it widened
 // the zone map to hold every bound interface, which is as precise as a
 // zone-derived answer can be) and this datum removes.
@@ -479,12 +480,138 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 // nothing", and never means "matches everything" either — it means
 // "answer from the zone, as before".
 func (f *sessionFilter) resolveIngressIfaces(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16) []string {
-	if ingressIfindex != 0 {
-		if ifName, ok := f.ifaceNamesByKey[sessionIfaceKey{ifindex: ingressIfindex, vlanID: ingressVlanID}]; ok && ifName != "" {
-			return []string{ifName}
-		}
+	if ifName, corroborated := f.ingressIfaceIdentity(ingressIfindex, ingressVlanID, ingressZone); corroborated {
+		return []string{ifName}
 	}
 	return f.zoneIfaces[ingressZone]
+}
+
+// ingressIfaceIdentity resolves the interface name a session's RECORDED
+// ingress identity names in the CURRENT interface table, and reports whether
+// the session's own recorded ingress ZONE corroborates it.
+//
+// The two halves of the lookup come from different points in time. The
+// {IngressIfindex, IngressVlanID} pair was stamped by the dataplane when the
+// session installed; `ifaceNamesByKey` is rebuilt on EVERY query from the
+// current config and the current kernel ifindexes. A kernel ifindex is
+// RECYCLED — a tunnel, VLAN unit or XFRM interface is destroyed and its number
+// handed to a different interface later — so a stale ifindex does not merely
+// MISS the rebuilt table: it can HIT and name an interface the session never
+// arrived on, rendering one confident WRONG name with nothing in the output to
+// distinguish it from a correct one (#6987).
+//
+// The zone is the one other identity the row carries, it was recorded at the
+// same instant, and its id is name-derived and STABLE across commits
+// (`assignZoneIDs`), so it can corroborate the ifindex. A hit naming an
+// interface the recorded ingress zone does not bind is therefore not reported
+// as fact.
+//
+// Corroboration cannot say WHICH half is stale. The same disagreement is
+// produced by an interface REZONED since the session installed, where the name
+// is right and the zone moved. The tie breaks toward not ACTING on the name: a
+// disagreement is a MISS, and the zone answers instead — the answer this
+// resolver gave before #4983 put the identity on the row. `clear security flow
+// session interface <name>` runs through this same predicate, so selecting on
+// an untrustworthy name would DELETE sessions that never touched the named
+// interface, which is strictly worse than a rezone losing one route in; the row
+// is still reachable through its recorded ingress zone and its egress arm.
+//
+// Residual, deliberately not closed here: a recycle WITHIN one zone
+// corroborates and still names the wrong sibling. Separating those needs an
+// install-time generation carried on the session row itself, which is a
+// dataplane wire change (#7239).
+func (f *sessionFilter) ingressIfaceIdentity(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16) (string, bool) {
+	if ingressIfindex == 0 {
+		return "", false
+	}
+	ifName := f.ifaceNamesByKey[sessionIfaceKey{ifindex: ingressIfindex, vlanID: ingressVlanID}]
+	if ifName == "" {
+		return "", false
+	}
+	return ifName, zoneBindsIface(f.zoneIfaces[ingressZone], ifName)
+}
+
+// ingressIfaceDisplay resolves the single interface name to REPORT for a
+// session's ingress, or "" when no name is defensible and the caller should
+// report the zone instead.
+//
+// Reporting is stricter than filtering. A filter that is too wide costs the
+// operator extra rows, and they can see the extra rows; a name in the `If:`
+// column is read as fact and becomes the input to an operational decision
+// during an incident — "which sessions came in on the tunnel" is exactly the
+// question asked when something is wrong. So a name is printed only when it is
+// one of:
+//
+//   - a CORROBORATED recorded identity — exact;
+//   - the ingress zone's single bound interface, when the row carries no
+//     identity at all: with one member the zone approximation has exactly one
+//     answer, so it is not an approximation.
+//
+// A DISPUTED hit prints nothing even when the zone has one member: the row
+// carries positive evidence that the interface table and its own recorded zone
+// disagree, which is precisely the case where a confident name is most likely
+// to be the wrong one.
+func (f *sessionFilter) ingressIfaceDisplay(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16) string {
+	ifName, corroborated := f.ingressIfaceIdentity(ingressIfindex, ingressVlanID, ingressZone)
+	if corroborated {
+		return ifName
+	}
+	if ifName != "" {
+		return ""
+	}
+	return soleZoneIface(f.zoneIfaces[ingressZone])
+}
+
+// egressIfaceDisplay is the egress counterpart: the FIB-resolved name when the
+// session carries one, else the egress zone's single bound interface, else "".
+//
+// The FIB hit is NOT corroborated against the recorded egress zone the way the
+// ingress hit is. A recycled FibIfindex is the same hazard on this side and is
+// tracked as #7239's sibling, #7240 — the egress zone's own value has to be
+// enumerated across the fabric/tunnel override paths before the symmetric check
+// is safe. The change here is the zone fallback, which must not claim one
+// interface for all of its siblings on either column of a row.
+func (f *sessionFilter) egressIfaceDisplay(fibIfindex uint32, fibVlanID uint16, egressZone uint16) string {
+	if fibIfindex != 0 {
+		if ifName, ok := f.ifaceNamesByKey[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+			return ifName
+		}
+	}
+	return soleZoneIface(f.zoneIfaces[egressZone])
+}
+
+// zoneBindsIface reports whether zoneMembers contains an entry naming the same
+// logical interface as ifName. The two come from different tables and spell a
+// unit differently — a zone binds "ge-0/0/0.0" while the {ifindex, VLAN} name
+// map renders unit 0 as the bare "ge-0/0/0" — and a zone may bind a PARENT to
+// cover all of its units. So the comparison is the same parent/unit
+// equivalence ifaceMatches uses, applied in both directions.
+func zoneBindsIface(zoneMembers []string, ifName string) bool {
+	if ifName == "" {
+		return false
+	}
+	for _, member := range zoneMembers {
+		if member == "" {
+			continue
+		}
+		if member == ifName ||
+			strings.HasPrefix(member, ifName+".") ||
+			strings.HasPrefix(ifName, member+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// soleZoneIface returns the zone's interface when it binds exactly one, else
+// "". With two or more members, naming the first is one interface answering
+// for all of its siblings — the reporting counterpart of the #6960 filter
+// defect, and a claim the row does not support.
+func soleZoneIface(zoneMembers []string) string {
+	if len(zoneMembers) == 1 {
+		return zoneMembers[0]
+	}
+	return ""
 }
 
 // resolveEgressIfaces resolves a session's candidate egress interface
