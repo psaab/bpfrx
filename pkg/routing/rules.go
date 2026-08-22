@@ -128,9 +128,33 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		errs = append(errs, clearErr)
 	}
 
+	// #6583: draw the priority window down IPv4-FIRST, independent of the
+	// caller's slice order.
+	//
+	// This loop advances ONE family-blind `prio` in slice order, so which
+	// leaks survive the maxNextTableRules cap was decided entirely by the two
+	// `append` lines in pkg/daemon/daemon_apply_routing.go — v4 statics before
+	// v6 statics. The userspace FIB mirrors the same cap but draws it down in
+	// its OWN order (routes.go: addRoutes("inet.0", ...) then
+	// addRoutes("inet6.0", ...)), so the two sides agreed only by convention
+	// across a package boundary, with nothing on either side binding it.
+	// Swapping those two appends would have installed 60 v6 + 40 v4 rules in
+	// the kernel against 60 v4 + 40 v6 in the FIB: 40 leaks in the kernel and
+	// not the FIB, 40 in the FIB and not the kernel — the #6467 kernel/FIB
+	// verdict split in a new shape, where a leak present only in the FIB
+	// resolves into the target VRF on the AF_XDP fast path while a slow-path
+	// packet for the same flow resolves in the main table.
+	//
+	// Ordering HERE rather than asserting on the caller makes the agreement
+	// structural: no caller can get it wrong, and the guard cannot rot into a
+	// check of one caller while a second caller is added elsewhere. The
+	// partition is STABLE, so within a family the caller's relative order —
+	// which is what the FIB's per-family pass also preserves — is untouched.
+	routes = nextTableFamilyOrdered(routes)
+
 	prio := nextTableRulePriority
 	for i, sr := range routes {
-		if sr.NextTable == "" {
+		if sr == nil || sr.NextTable == "" {
 			continue
 		}
 		tableID, ok := tableIDs[sr.NextTable]
@@ -217,6 +241,33 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 	// leak rule (or the orphaned-rule window) is observable rather than
 	// silently nil (#3731 / #2273).
 	return errors.Join(errs...)
+}
+
+// nextTableFamilyOrdered returns routes stably partitioned IPv4-first, so the
+// next-table priority window is drawn down in the same family order the
+// userspace FIB uses (#6583).
+//
+// A nil entry or an unparseable destination keeps its position in the FIRST
+// group: both are skipped by Apply's own eligibility checks, so grouping them
+// with v4 costs nothing and avoids inventing a third bucket whose ordering
+// would itself be unspecified. It also preserves the pre-#6583 property that
+// such an entry never consumes a window slot.
+func nextTableFamilyOrdered(routes []*config.StaticRoute) []*config.StaticRoute {
+	out := make([]*config.StaticRoute, 0, len(routes))
+	var v6 []*config.StaticRoute
+	for _, sr := range routes {
+		if sr == nil {
+			out = append(out, sr)
+			continue
+		}
+		_, dst, err := net.ParseCIDR(sr.Destination)
+		if err != nil || dst.IP.To4() != nil {
+			out = append(out, sr)
+			continue
+		}
+		v6 = append(v6, sr)
+	}
+	return append(out, v6...)
 }
 
 // clear removes all ip rules in the next-table priority range.

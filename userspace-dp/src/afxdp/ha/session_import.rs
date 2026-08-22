@@ -43,6 +43,55 @@ impl crate::afxdp::Coordinator {
             .saturating_mul(2)
     }
 
+    /// #6600: take this node's reservation on a peer-synced forward entry's
+    /// translated NAT identity. Returns false when the node cannot own it.
+    ///
+    /// The zone pair is resolved through the SAME helper the worker-side upsert
+    /// uses, so the coordinator and the workers cannot land on different
+    /// allocators — a coordinator that reserved elsewhere would report success
+    /// while the port the session actually names stayed free.
+    ///
+    /// The NAT64 twin is taken second and ROLLED BACK on failure of neither
+    /// half being enough on its own: a NAT64 decision carries both a v4 pool
+    /// source (source-NAT allocator) and a translated `(pool v4, port)` (the
+    /// per-prefix allocator), so a session can be admissible to one and not the
+    /// other. Leaving a half-taken reservation behind would be a leak no worker
+    /// ever releases, because no session gets published to reap.
+    fn reserve_synced_translation(&self, entry: &SyncedSessionEntry) -> bool {
+        let now_ns = monotonic_nanos();
+        let zones = crate::afxdp::session_glue::synced_source_nat_zone_pair(
+            &self.forwarding,
+            &entry.metadata,
+        );
+        if !crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &self.forwarding.source_nat_rules,
+            &entry.key,
+            entry.decision.nat,
+            entry.metadata.is_reverse,
+            zones,
+            now_ns,
+        ) {
+            return false;
+        }
+        if !crate::nat64::reserve_synced_nat64_allocation(
+            &self.forwarding.nat64,
+            &entry.key,
+            entry.decision.nat,
+            entry.metadata.is_reverse,
+            now_ns,
+        ) {
+            crate::nat::release_source_nat_allocation(
+                &self.forwarding.source_nat_rules,
+                &entry.key,
+                entry.decision.nat,
+                entry.metadata.is_reverse,
+                now_ns,
+            );
+            return false;
+        }
+        true
+    }
+
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
@@ -164,6 +213,47 @@ impl crate::afxdp::Coordinator {
         } else {
             None
         };
+        // #6600: RESERVE THE TRANSLATED NAT PORT BEFORE PUBLISHING.
+        //
+        // The publish below makes the entry visible on every packet-path lookup
+        // surface at once (`synced`, `nat`, `forward_wire`), and
+        // `materialize_shared_session_hit` forwards on `replica.decision`
+        // — including `decision.nat` — without reserving anything. The
+        // reservation used to happen ONLY inside the worker-local upsert, which
+        // is driven by a command enqueued AFTER this publish; a worker that
+        // sampled an empty queue just before that push proceeds straight into
+        // `poll_binding` with the entry already live. In that window a local
+        // flow can allocate the same port, and `reserve_flow` REFUSES to steal
+        // it — correctly — after which the imported session went on advertising
+        // a translation this node does not own, with the refusal returned by
+        // nothing and counted by nothing.
+        //
+        // Taking the reservation here closes the window at its source rather
+        // than trying to observe it afterwards. It is also the only thing that
+        // COULD make the refusal reachable by the import outcome at all: the
+        // worker-side reserve runs long after the control RPC has answered, so
+        // propagating from there was never possible.
+        //
+        // `Untracked` contributes no holder bit, so the per-worker reservations
+        // that follow are absorbed rather than doubled — `reserve_flow` finds
+        // the identical `(flow, translated)` already live and takes its
+        // idempotent early return, OR-ing each worker's bit in — and the last
+        // worker's release still empties the mask and frees the port.
+        //
+        // Skipped when NO worker is registered: nothing polls, so there is no
+        // racing local allocation to guard against, and an `Untracked`
+        // reservation that no worker ever adopts has no one to release it. Same
+        // shape as the zero-ceiling carve-out above, and for the same reason.
+        if entry.origin.is_peer_synced()
+            && !entry.metadata.is_reverse
+            && !self.workers.records.is_empty()
+            && !self.reserve_synced_translation(&entry)
+        {
+            self.sessions
+                .import_reserve_refused
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         publish_shared_session(
             &self.sessions.synced,
             &self.sessions.nat,

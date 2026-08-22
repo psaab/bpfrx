@@ -408,6 +408,19 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 		// UnknownTermLeaves (mirroring UnknownTimeouts / UnknownICMP); reject the
 		// first one so the silent match-widening becomes an operator-visible
 		// commit error.
+		// #6564 member 9: a RECOGNIZED value-taking leaf with NO value. Worded
+		// separately from UnknownTermLeaves above because the keyword IS
+		// supported — calling it an "unknown statement" would send the operator
+		// looking for a typo that is not there. The consequence is the same
+		// fail-open: the constraint is dropped and the term widens.
+		if len(app.IncompleteTermLeaves) > 0 {
+			return fmt.Errorf(
+				"application %q: `term` statement %q is missing its value; the "+
+					"statement is dropped along with the constraint it was meant to "+
+					"impose, widening the term to match more than intended (e.g. "+
+					"`protocol tcp destination-port` with no port matches EVERY TCP port)",
+				name, app.IncompleteTermLeaves[0])
+		}
 		if len(app.UnknownTermLeaves) > 0 {
 			return fmt.Errorf(
 				"application %q: unknown statement %q inside `term`; a custom "+

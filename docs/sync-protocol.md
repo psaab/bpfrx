@@ -310,6 +310,66 @@ V6}` (drives the real sender enqueue + receiver apply in wire order),
 `TestDeleteGenerationStrictlyGreaterThanInstall{V4,V6}` in
 `pkg/cluster/sync_gen_guard_test.go`.
 
+## NAT-Port Reservation on Import (#6600)
+
+A peer-synced session carries a pre-computed NAT decision, so the importing
+node must RESERVE the translated port it names — the standby never runs the
+allocation path that would otherwise claim it, and after failover a fresh local
+flow could reuse it, putting two flows on one NAT source tuple.
+
+That reservation used to happen ONLY inside the worker-local upsert, which is
+driven by a command enqueued **after** the shared session entry was published.
+`publish_shared_session` makes the entry visible on every packet-path lookup
+surface at once (`synced`, `nat`, `forward_wire`), and
+`materialize_shared_session_hit` forwards on `replica.decision` — including
+`decision.nat` — without reserving anything. A worker that sampled an empty
+command queue just before the coordinator's push proceeds straight into
+`poll_binding` with the entry already live.
+
+In that window a local flow can allocate the same port. `reserve_flow` then
+REFUSES to steal it, which is the right call — but the refusal was returned by
+nothing, counted by nothing and logged by nothing, so the imported session went
+on advertising a translation this node did not own.
+
+**The reservation is now taken by the coordinator, before the publish.** A
+refusal drops the import: no session beats a session naming someone else's
+port, and the peer re-syncs. It is counted as
+`synced_import_reserve_refused_total` — a silent drop would only trade one
+invisible failure for another. A nonzero value means a local flow held the
+translated port at import time, which on a healthy standby (owning RG passive)
+should not happen: look for overlapping pools, an active-active RG pair sharing
+one SNAT pool, or NAT config drift between the nodes.
+
+Three properties that are load-bearing and each pinned by a test:
+
+- **The coordinator's reservation is `Untracked`, so it is ABSORBED rather than
+  doubled.** It contributes no holder bit, so each worker's later reserve finds
+  the identical `(flow, translated)` already live, takes `reserve_flow`'s
+  idempotent early return and ORs its own bit in. The last worker's release
+  still empties the mask and frees the port. Had the coordinator's reservation
+  instead made the workers' REFUSE, no holder bit would ever be recorded and
+  the port would leak.
+- **Skipped when no worker is registered.** Nothing polls, so there is no racing
+  local allocation to guard against, and an `Untracked` reservation no worker
+  adopts has nobody to release it. Same carve-out as the zero-ceiling case.
+- **A half-taken reservation is rolled back.** A NAT64 decision carries both a
+  v4 pool source (source-NAT allocator) and a translated `(pool v4, port)` (the
+  per-prefix allocator), so a session can be admissible to one and not the
+  other. Without the rollback the source-NAT port taken moments before a NAT64
+  refusal is held by nobody — the import is not published, so there is no
+  session to reap.
+
+The zone pair is resolved through the SAME helper the worker-side upsert uses.
+If the two disagreed, the coordinator would reserve in one allocator while the
+workers reserve in another: its check would pass while the port the session
+actually names stayed free.
+
+**Note on the import outcome.** The control RPC's `ControlResponse.ok` is not
+yet driven by this refusal. The reservation now happens early enough that it
+COULD be — which was impossible before, since the worker-side reserve runs long
+after the RPC has answered — but wiring it through the handler, and the
+Prometheus counter for the new metric, are tracked separately.
+
 ## Config-Epoch Guard (#5274)
 
 Distinct from the per-key install generation (#2170), every **session** message

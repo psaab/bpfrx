@@ -503,6 +503,39 @@ make cluster-create  # launch xpf-fw0, xpf-fw1, cluster-lan-host
 make cluster-deploy  # build + push to both VMs
 ```
 
+**Post-deploy node0-primary reassert (#4009, fail-closed in #6591).** Every
+deploy path ends in `reassert_primary_node0`, which leaves node0 the primary
+for EVERY redundancy group so downstream smoke (`apply-cos-config.sh`,
+`test-failover`) starts from the documented steady state. It matters because
+the loss userspace cluster runs `preempt=no`: if node1 holds a group when the
+deploy finishes, nothing corrects it on its own, and node0 sits secondary at
+priority 200 behind node1 at 100.
+
+Per RG, on node0: **reset → transfer → reset**. `failover reset` alone clears
+the manual-failover flag and never MOVES ownership — only
+`request chassis cluster failover redundancy-group <rg> node 0` does. The
+trailing reset clears the flag the transfer itself sets, which would otherwise
+block the peer from electing during a later reboot leg.
+
+**It is fail-closed and dies rather than warning.** It retries the status read
+across the post-deploy settle window (the daemon is still coming up; a reassert
+issued ~20s after a deploy was measured not to take while the identical command
+later did), then VERIFIES that node0 reads `primary` for every group and aborts
+the deploy loudly if not. Before #6591 an unreadable status made it iterate
+zero groups, warn, and return SUCCESS — so `DEPLOY_RC=0` with the cluster left
+inverted, and the failure surfaced minutes later inside an unrelated smoke
+target's preflight (`FATAL: fw0 is not primary`), where the natural first
+hypothesis is that the change under test broke HA. That misdiagnosis cost two
+gate cycles.
+
+If a deploy aborts here, the cluster is left in whatever state the transfer
+produced: read `show chassis cluster status` on both nodes before re-running,
+and do NOT read the next smoke's failure as an HA regression.
+
+The logic lives in `deploy-lib.sh` (`deploy_reassert_primary_node0`,
+`deploy_reassert_node0_primary_ok`) so `make test-deploy-lib` covers it against
+a mocked incus — no cluster required.
+
 ### VRRP State Verification
 ```bash
 # Both nodes should agree: fw0=MASTER, fw1=BACKUP for all groups
