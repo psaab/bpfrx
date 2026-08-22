@@ -102807,3 +102807,18 @@ prose edit above them added. No diff falls in the new test body.
     store_runtime_view choke point covering all seven, with #6592-style
     previous-view retention for hoist resistance. cfg(test) only.
   - **File(s)**: userspace-dp/src/afxdp/coordinator/{cos_state.rs,mod.rs,tests.rs}
+
+## 2026-08-22 — #6597: SNMP successor lookup is binary search, not a linear scan
+- **Timestamp**: 2026-08-22
+- **Action**: `findNextOIDSnap` linear-scanned the MIB view per varbind on a
+  single serial goroutine. Now builds the ordered view once per PDU
+  (`ifSnapshot.mibOIDs`) and binary-searches it: 677us -> 158ns per lookup at
+  256 interfaces, and flat instead of linear in interface count. Equivalence
+  bound by a differential test against the pre-fix algorithm as a reference
+  oracle (2175 probes + a full-MIB walk, byte-identical). Found a correctness
+  bug while doing it: the linear scan depended on `ifDataFn` returning
+  IfIndex-ascending data, which the production provider does not guarantee —
+  out-of-order input made the walk ascending but INCOMPLETE (40 of 87 rows
+  skipped). `mibOIDs` sorts, so the walk is now correct regardless.
+- **File(s)**: pkg/snmp/agent.go,
+  pkg/snmp/findnext_binary_search_6597_test.go (new), pkg/snmp/README.md, _Log.md
