@@ -1,3 +1,42 @@
+## 2026-08-21 — #6539 tcp-session timeouts: stop printing uncarried values as enforced
+
+- **Timestamp**: 2026-08-21
+- **Action**: `security flow tcp-session initial/closing/time-wait-timeout`
+  are modeled, parsed and committable but have NO dataplane wire carrier
+  and no live consumer, while REST, CLI and gRPC all printed them in the
+  same shape as `established-timeout`, which IS carried. Chose the honest
+  render over enforcement: `initial-timeout` maps 1:1 onto the Rust
+  `SessionTimeouts.tcp_opening_ns`, but `time-wait-timeout` has no state
+  to attach to (`session_timeout_ns` splits a close only into RST vs FIN),
+  so an "enforce" PR is partial by construction and would owe a wire bump
+  plus a cluster smoke while still leaving the same follow-up. Added
+  `pkg/config/flow_tcp_timeouts_6539.go` as the single authority for the
+  enforced/unenforced split; the commit advisory and all three render
+  surfaces read it, so they cannot disagree and a leaf that later gains a
+  carrier loses its annotation everywhere at once. Also corrected two
+  false claims found in the same block: the CLI printed the Junos 1800s
+  default for an unset `established-timeout` when nothing in the Go path
+  fills that in (the helper idles the session out at 300s), and the #2078
+  advisory asserted the dataplane "has no TCP state machine", which #3152
+  and #3046 have since made false.
+  Mutation matrix: M1/M2/M3 (revert each surface to the unannotated
+  render) → that surface's cell reds; M4 (drop the advisory call) → the
+  four pkg/config advisory cells red; M5 (mark initial-timeout enforced
+  in the table) → the table, carrier and all three surface cells red;
+  M6 (drift the quoted half-open window) → the Rust-parity cell reds;
+  M7 (restore the Junos 1800s default) → the CLI defaults cell reds.
+- **File(s)**: `pkg/config/flow_tcp_timeouts_6539.go` (new),
+  `pkg/config/flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/types_security.go`,
+  `pkg/config/tcp_session_advisory_test.go`, `pkg/api/show_text.go`,
+  `pkg/api/show_text_tcp_timeouts_6539_test.go` (new),
+  `pkg/cli/cli_show_flow.go`,
+  `pkg/cli/cli_show_flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/grpcapi/server_show_flow.go`,
+  `pkg/grpcapi/show_flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/dataplane/userspace/flow_tcp_timeout_carrier_6539_test.go` (new),
+  `docs/feature-gaps.md`, `docs/config-schema.md`
+
 ## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
 
 - **Timestamp**: 2026-08-21
