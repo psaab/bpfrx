@@ -104051,6 +104051,15 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/server/handlers/queue.rs,
   userspace-dp/src/server/tests.rs
 
+## 2026-08-22 — #6751 PR1: attribute reverse-key collisions by source identity
+- **Action**: Added `nat_reverse_key_collisions_distinct_src` — the
+  DIFFERENT-SOURCE subset of the existing #1760 collision counter — plumbed to
+  the helper status wire and Prometheus. No forwarding change.
+- **File(s)**: `userspace-dp/src/session/mod.rs`, `session/tests.rs`,
+  `afxdp/worker_runtime.rs`, `afxdp/worker/loop_body/mod.rs`,
+  `afxdp/coordinator/status.rs`, `protocol/control.rs`, `protocol/binding.rs`,
+  `server/lifecycle.rs`, `afxdp/worker_runtime_tests.rs`,
+  `pkg/dataplane/userspace/protocol_status.go`, `pkg/api/metrics*.go`
 ## 2026-08-22 — #6741 Increment 1: count obsolete registry generations
 - **Timestamp**: 2026-08-22
 - **Action**: Split #6741 and shipped the observability half only. Added

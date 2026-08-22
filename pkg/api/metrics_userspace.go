@@ -650,6 +650,14 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		prometheus.CounterValue,
 		float64(status.NatReverseKeyCollisions),
 	)
+	// #6751: emitted unconditionally for the same reason — a published 0
+	// beside a nonzero aggregate is the informative reading (the observed
+	// collisions were same-source port reuse, not a cross-session leak).
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceNatReverseKeyCollisionsDistinctSrc,
+		prometheus.CounterValue,
+		float64(status.NatReverseKeyCollisionsDistinctSrc),
+	)
 
 	// #1861: install-refusal trio. Emitted unconditionally (cumulative
 	// CounterValue) so a 0 is a real "no refusals" signal rather than an
@@ -1279,6 +1287,8 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.GaugeValue, float64(w.MaxSessions), label)
 		ch <- prometheus.MustNewConstMetric(c.workerNatReverseKeyCollisions,
 			prometheus.CounterValue, float64(w.NatReverseKeyCollisions), label)
+		ch <- prometheus.MustNewConstMetric(c.workerNatReverseKeyCollisionsDistinctSrc,
+			prometheus.CounterValue, float64(w.NatReverseKeyCollisionsDistinctSrc), label)
 		// #1861: per-worker install-refusal trio.
 		ch <- prometheus.MustNewConstMetric(c.workerSessionCreateDrops,
 			prometheus.CounterValue, float64(w.SessionCreateDrops), label)

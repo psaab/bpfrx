@@ -7642,6 +7642,175 @@ fn close_delta_carries_observed_tos_and_tcp_flags() {
     );
 }
 
+// ── #6751: attribute a reverse-key collision to its CAUSE ────────────
+//
+// `nat_reverse_key_collisions` counts every reverse-key bucket growth, which
+// is at least three populations with three different remedies:
+//
+//   * two distinct internal hosts choosing the same source port to the same
+//     server under interface-mode SNAT — the cross-session return-traffic
+//     leak this issue is about, and the ONLY one PAT-on-collision fixes;
+//   * ONE host reusing an ephemeral port while its previous session is still
+//     resident — same bucket growth, no leak between hosts;
+//   * `port no-translation` / static SNAT pairs, which the allocator admits
+//     DELIBERATELY (#6745 governs their steering row instead).
+//
+// The aggregate reads 2 on the loss cluster today with ONE LAN host
+// configured, so what it is actually producing there is port reuse — which is
+// precisely why it cannot answer "does the two-host shape happen". These
+// tests pin that the new counter can.
+//
+// THE SMOKE CANNOT EXERCISE THIS. `make test-failover` drives iperf3 from a
+// single LAN host, so it cannot produce two distinct internal sources racing
+// for one port. A unit test is the only place the property is guaranteed to
+// occur, which is why the collision is constructed here rather than observed.
+
+#[test]
+fn distinct_source_collision_is_attributed_6751() {
+    // The #6751 shape: DIFFERENT internal hosts, same source port, same
+    // server, interface-mode SNAT (source-IP-only rewrite).
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let dec = iface_snat_decision(Ipv4Addr::new(203, 0, 113, 9));
+
+    let mut s1 = key_v4();
+    s1.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    s1.src_port = 5555;
+    let mut s2 = key_v4();
+    s2.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    s2.src_port = 5555;
+    assert_eq!(
+        reverse_wire_key(&s1, dec.nat),
+        reverse_wire_key(&s2, dec.nat),
+        "premise: the two flows must collide on one reverse wire key",
+    );
+
+    assert!(table.install_with_protocol(s1, dec, metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(
+        table.nat_reverse_key_collisions_distinct_src(),
+        0,
+        "one session cannot collide with itself",
+    );
+
+    assert!(table.install_with_protocol(s2, dec, metadata(), now, PROTO_TCP, 0x10));
+    assert!(
+        table.nat_reverse_key_collisions() > 0,
+        "premise: the aggregate must see this collision",
+    );
+    assert!(
+        table.nat_reverse_key_collisions_distinct_src() > 0,
+        "a collision between DIFFERENT internal sources is the #6751 \
+         cross-session leak and must be attributed as such -- this is the \
+         number that decides whether PAT-on-collision is worth its risk",
+    );
+}
+
+#[test]
+fn reverse_index_collision_is_not_attributed_6751() {
+    // THE DISCRIMINATING HALF. Without it the new counter could simply be an
+    // alias of the aggregate and the test above would still pass.
+    //
+    // The population chosen is the one that would actually corrupt the
+    // number: a collision on the REVERSE/alias index, where the indexed key's
+    // `src_ip` is the EXTERNAL SERVER rather than an internal host. Two such
+    // sessions with different servers look exactly like "two distinct
+    // sources" to a naive comparison, so attributing them would inflate the
+    // very number this counter exists to make trustworthy.
+    //
+    // An earlier revision tried SAME-SOURCE port reuse instead, and its
+    // premise check caught it as VACUOUS: two sessions from one host that
+    // share a reverse wire key must share (src_port, dst_ip, dst_port) too,
+    // which makes them the same session key, so the push dedups and no
+    // collision occurs at all. The assertion would have held for the wrong
+    // reason. That is also why the loss cluster's aggregate of 2 cannot be
+    // same-source forward reuse — it has to be one of the other index
+    // populations.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let dec = iface_snat_decision(Ipv4Addr::new(203, 0, 113, 9));
+    let mut meta = metadata();
+    meta.is_reverse = true;
+
+    let mut r1 = key_v4();
+    r1.src_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    let mut r2 = key_v4();
+    r2.src_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+
+    assert!(table.install_with_protocol(r1, dec, meta.clone(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(r2, dec, meta, now, PROTO_TCP, 0x10));
+
+    // THE FIXTURE MUST ACTUALLY COLLIDE, or the assertion below is vacuous.
+    assert!(
+        table.nat_reverse_key_collisions() > 0,
+        "premise: this reverse-index pair must produce a collision, otherwise \
+         the distinct-source assertion below proves nothing",
+    );
+    assert_eq!(
+        table.nat_reverse_key_collisions_distinct_src(),
+        0,
+        "a collision on the REVERSE/alias index must not be attributed: its \
+         key.src_ip is the external server, so counting it would report \
+         distinct SERVERS as distinct internal sources",
+    );
+}
+
+#[test]
+fn same_source_pat_collision_is_not_attributed_6751() {
+    // THE SECOND DISCRIMINATING HALF, and the one that binds the src_ip
+    // COMPARISON itself rather than the branch it runs in.
+    //
+    // Same internal host, two DIFFERENT forward sessions, one reverse wire
+    // key: session A is PAT'd from :5555 to :6000, session B natively uses
+    // :6000 and is translated address-only. Both collapse to
+    // (8.8.8.8:443 -> 203.0.113.9:6000). That is the same-host port-reuse
+    // population -- real, but NOT the #6751 cross-session leak, because one
+    // host cannot steal its own return traffic in a way that crosses a
+    // security boundary. It must move the aggregate and NOT the attributed
+    // counter.
+    //
+    // A previous attempt at this half used same-source/different-dst_port and
+    // its premise check caught it as VACUOUS: with one NAT decision, two
+    // sessions from one host sharing a reverse wire key must share
+    // (src_port, dst_ip, dst_port) too, so they are the same session key and
+    // the push dedups. Making the two NAT DECISIONS differ is what creates a
+    // genuine same-source collision.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let egress = Ipv4Addr::new(203, 0, 113, 9);
+
+    let mut pat = iface_snat_decision(egress);
+    pat.nat.rewrite_src_port = Some(6000);
+
+    let a = key_v4();
+    let mut b = key_v4();
+    b.src_port = 6000;
+    assert_eq!(a.src_ip, b.src_ip, "fixture: both sessions are the SAME host");
+
+    assert!(table.install_with_protocol(a, pat, metadata(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(
+        b,
+        iface_snat_decision(egress),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x10
+    ));
+
+    // THE FIXTURE MUST ACTUALLY COLLIDE, or the assertion below is vacuous.
+    assert!(
+        table.nat_reverse_key_collisions() > 0,
+        "premise: this same-source pair must produce a reverse-key collision, \
+         otherwise the distinct-source assertion below proves nothing",
+    );
+    assert_eq!(
+        table.nat_reverse_key_collisions_distinct_src(),
+        0,
+        "a collision between two sessions from the SAME internal host is \
+         port reuse, not the #6751 cross-source leak, and must not be \
+         attributed",
+    );
+}
+
 /// #6752: SYN → SYN-ACK → **no final ACK** must reap on the OPENING window,
 /// not hold both halves for the full established timeout.
 ///

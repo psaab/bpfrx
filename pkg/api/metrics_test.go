@@ -82,10 +82,11 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	// #1861 install-refusal trio (create drops + admission refused +
 	// install partial counters) = 32 +
 	// #4800 per-worker transit new-flow install counter = 33.
+	// #6751 distinct-source subset of the reverse-key collision counter = 34.
 	// Per-slot/per-bucket metrics need non-empty Vec fields which
 	// these test fixtures don't populate, so they're zero here.
-	if len(got) != 3*33 {
-		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*33, len(got))
+	if len(got) != 3*34 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*34, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -333,6 +334,9 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerSessionTableEntries:        mk("xpf_userspace_worker_session_table_entries"),
 		workerSessionTableCapacity:       mk("xpf_userspace_worker_session_table_capacity"),
 		workerNatReverseKeyCollisions:    mk("xpf_userspace_worker_session_nat_reverse_key_collisions_total"),
+		// #6751: the DIFFERENT-SOURCE subset of the collision counter above.
+		workerNatReverseKeyCollisionsDistinctSrc: mk(
+			"xpf_userspace_worker_session_nat_reverse_key_collisions_distinct_src_total"),
 		// #1861 install-refusal trio.
 		workerSessionCreateDrops:             mk("xpf_userspace_worker_session_create_drops_total"),
 		workerSessionInstallAdmissionRefused: mk("xpf_userspace_worker_session_install_admission_refused_total"),
@@ -400,12 +404,13 @@ func collectFromEmitWorkerRuntime(
 		c.workerCoSQueueLeaseAcquireV8Calls:        {},
 		c.workerCoSQueueLeaseAcquireV8GrantedBytes: {},
 		// #1782 Step-1 cold-start CoS instruments.
-		c.workerCoSWheelTicksAdvancedTotal: {},
-		c.workerCoSWheelTicksAdvancedMax:   {},
-		c.workerCoSQueueLeaseUndergrant:    {},
-		c.workerSessionTableEntries:        {},
-		c.workerSessionTableCapacity:       {},
-		c.workerNatReverseKeyCollisions:    {},
+		c.workerCoSWheelTicksAdvancedTotal:         {},
+		c.workerCoSWheelTicksAdvancedMax:           {},
+		c.workerCoSQueueLeaseUndergrant:            {},
+		c.workerSessionTableEntries:                {},
+		c.workerSessionTableCapacity:               {},
+		c.workerNatReverseKeyCollisions:            {},
+		c.workerNatReverseKeyCollisionsDistinctSrc: {},
 		// #1861 install-refusal trio.
 		c.workerSessionCreateDrops:             {},
 		c.workerSessionInstallAdmissionRefused: {},
@@ -889,6 +894,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #6751: the DIFFERENT-SOURCE subset of the counter above.
+		userspaceNatReverseKeyCollisionsDistinctSrc: prometheus.NewDesc(
+			"xpf_userspace_session_nat_reverse_key_collisions_distinct_src_total",
+			"nat reverse-key collisions with a distinct source",
+			nil,
+			nil,
+		),
 		userspaceSessionPublishErrors: prometheus.NewDesc(
 			"xpf_userspace_session_publish_errors_total",
 			"session publish errors",
@@ -1128,6 +1140,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		TimeExceededRateLimitedTotal: 11,
 		PacketTooBigRateLimitedTotal: 12,
 		RejectRateLimitedTotal:       13,
+		// #6751: distinct-source subset. Deliberately NON-ZERO while the
+		// aggregate stays 0 in this fixture, so an emit wired to the wrong
+		// field cannot satisfy the assertion below.
+		NatReverseKeyCollisionsDistinctSrc: 5,
 		// #1861: install-refusal trio emitted unconditionally.
 		SessionCreateDrops:             9,
 		SessionInstallAdmissionRefused: 8,
@@ -1200,9 +1216,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// replication upserts/enqueued/contended + replication queue depth
 	// high-water = 7, plus the depth SUM added when the lifetime max was
 	// demoted to operator context = 8) = 38 + the #2402/#6641
-	// shared-session poison-recovery counter = 39.
-	if len(got) != 39 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 39 metrics, got %d", len(got))
+	// shared-session poison-recovery counter = 39, plus the #6751
+	// distinct-source subset of the reverse-key collision counter = 40.
+	if len(got) != 40 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 40 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1210,6 +1227,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #1760: collision counter emitted unconditionally (0 with no
 	// collisions configured in this fixture).
 	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisions, nil, 0)
+	// #6751: the distinct-source subset is emitted unconditionally too, and
+	// carries its OWN value -- 5 here against an aggregate of 0.
+	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisionsDistinctSrc, nil, 5)
 	// #1789: publish-error counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionPublishErrors, nil, 6)
 	// #4800: every leg of the new-flow-install contention surface reaches
