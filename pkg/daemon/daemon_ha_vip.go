@@ -37,7 +37,6 @@ func (d *Daemon) checkNoRethTakeoverReadiness(rgID int) (bool, []string) {
 	return d.checkVIPReadiness(rgID)
 }
 
-
 // checkVIPReadinessForConfig verifies that RETH interfaces for the given RG
 // exist and have operational carrier. Pure function for testability.
 //
@@ -195,17 +194,13 @@ func (d *Daemon) directAddVIPs(rgID int) int {
 		}
 		link, err := linkByName(ifName)
 		if err != nil {
-			if d.vipWarnedIfaces == nil {
-				d.vipWarnedIfaces = make(map[string]bool)
-			}
-			if !d.vipWarnedIfaces[ifName] {
+			if d.shouldWarnVIPIface(ifName) {
 				slog.Warn("directAddVIPs: interface not found", "iface", ifName, "err", err)
-				d.vipWarnedIfaces[ifName] = true
 			}
 			continue
 		}
 		// Interface exists now — clear any previous warning suppression
-		delete(d.vipWarnedIfaces, ifName)
+		d.clearVIPWarning(ifName)
 		for _, cidr := range addrs {
 			addr, err := netlink.ParseAddr(cidr)
 			if err != nil {
@@ -654,4 +649,40 @@ func (d *Daemon) directSendGARPs(rgID int) {
 			}
 		}
 	}
+}
+
+// resetVIPWarnings drops the VIP warning-suppression set so a new config gets
+// fresh warnings (#7532). Safe to call concurrently with the reconcile path.
+func (d *Daemon) resetVIPWarnings() {
+	d.vipWarnedMu.Lock()
+	defer d.vipWarnedMu.Unlock()
+	d.vipWarnedIfaces = nil
+}
+
+// shouldWarnVIPIface reports whether this interface's "interface not found"
+// warning should be emitted now, and records that it was (#7532).
+//
+// The check and the record are ONE critical section on purpose. Splitting them —
+// as the open-coded version did — lets two reconcile passes both observe "not
+// yet warned" and both log, which is the spam the set exists to prevent, on top
+// of being a racy map write.
+func (d *Daemon) shouldWarnVIPIface(ifName string) bool {
+	d.vipWarnedMu.Lock()
+	defer d.vipWarnedMu.Unlock()
+	if d.vipWarnedIfaces == nil {
+		d.vipWarnedIfaces = make(map[string]bool)
+	}
+	if d.vipWarnedIfaces[ifName] {
+		return false
+	}
+	d.vipWarnedIfaces[ifName] = true
+	return true
+}
+
+// clearVIPWarning forgets this interface's suppression so a later disappearance
+// warns again (#7532). A nil map deletes nothing, which is the intended no-op.
+func (d *Daemon) clearVIPWarning(ifName string) {
+	d.vipWarnedMu.Lock()
+	defer d.vipWarnedMu.Unlock()
+	delete(d.vipWarnedIfaces, ifName)
 }

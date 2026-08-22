@@ -103878,3 +103878,13 @@ prose edit above them added. No diff falls in the new test body.
   measured staleness header; split the retained root causes into individual
   issues.
 - **File(s)**: `docs/research/6744-kimi-review-003/plan.md`
+
+## 2026-08-22 — #7532 vipWarnedIfaces gets its own mutex
+- **Timestamp**: 2026-08-22
+- **Action**: The field was reset on the apply path (applySem) and lazily
+  created/read/assigned/deleted on the VRRP reconcile path under no shared
+  lock — a reset between the nil-check and the assignment panics, two
+  reconcile writers are a fatal throw. Gave it a dedicated mutex and three
+  accessors; the check-and-record is now one critical section.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/vip_warn_sync_7532_test.go
