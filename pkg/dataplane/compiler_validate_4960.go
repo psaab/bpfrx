@@ -171,10 +171,22 @@ import (
 // static-NAT, NPTv6, NAT64, v6-pool/v6-SNAT and SNAT-egress writes -- were
 // called by no test in the package. Any one of them could be deleted with the
 // whole suite green, while an ordinary `security nat destination` stanza
-// nil-panicked the daemon on apply. The fixture now reaches 39; the 40th,
-// IsLoaded, is called by CompileConfig itself (compiler.go, CompileConfig's IsLoaded gate) above the
-// pre-pass and is bound by the CompileConfig-driving tests instead. Adding an
-// override without a config shape that REACHES it re-opens the same hole.
+// nil-panicked the daemon on apply. idProbeConfig was widened to close that,
+// and it is still what keeps this shim honest. Adding an override without a
+// config shape that REACHES it re-opens the same hole.
+//
+// #6420 changed WHICH of these overrides can still be reached, and the count is
+// deliberately not restated here because it is the part that rots. The NAT
+// record construction in compiler_nat.go was deleted -- every one of those
+// writes was a `return nil` on the production shim -- so the NAT setters and
+// stale-NAT deleters below are no longer called by any phase and their
+// overrides are now DEFENSIVE. They are kept, not deleted, because retiring the
+// DataPlane NAT interface surface itself (maps_nat.go and the two shims) is the
+// sibling cleanup, and a shim that stops overriding a method the interface
+// still declares would promote a future caller to the retired eBPF writer.
+// TestNATCompilerCallsNoDataplaneNATWriter_6420 is what asserts they stay
+// uncalled: it arms each one to FAIL and requires the pre-pass to validate
+// clean.
 type discardingDataPlane struct{ DataPlane }
 
 func (discardingDataPlane) IsLoaded() bool                                                { return true }
@@ -319,13 +331,13 @@ func validateBeforeMutateWith(dp DataPlane, cfg *config.Config) error {
 
 // validateBeforeMutateWithResult is validateBeforeMutateWith with the
 // CompileResult injectable as well. Production never calls it directly; the
-// extra seam exists because one covered write surface is not reachable from
-// cfg alone. compileNAT's interface-SNAT branch resolves the egress zone's
-// member through result.cachedInterfaceByName, so SetSNATEgressIP is called
-// only when that name exists on the host running the test. Seeding a synthetic
+// extra seam exists because one compileNAT BRANCH is not reachable from cfg
+// alone: the interface-SNAT branch resolves the egress zone's member through
+// result.cachedInterfaceByName and soft-skips when the lookup misses, so on a
+// host without that link the branch body never executes. Seeding a synthetic
 // result.ifCache entry reaches it without naming a live link in a fixture --
-// which is what TestPrePassShimCoversTheCalledSurface_4960 does, and is why
-// that test can cover 39 of the 40 overrides (#6894 r3 F1).
+// which is what TestPrePassShimCoversTheCalledSurface_4960 and
+// TestNATCompilerCallsNoDataplaneNATWriter_6420 both do (#6894 r3 F1, #6420).
 func validateBeforeMutateWithResult(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	if !isValidationPass(dp) {
 		return fmt.Errorf("validate pre-pass: dataplane %T does not carry the "+

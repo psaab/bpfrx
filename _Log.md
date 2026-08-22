@@ -1,3 +1,22 @@
+## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
+
+- **Timestamp**: 2026-08-22
+- **Action**: Repo-wide sweep correcting the RFC 6052 section cited for the
+  NAT64 non-global embedded-IPv4 rule. 17 occurrences across 11 files said
+  §2.2; §2.2 is the IPv4-Embedded IPv6 Address *Format* section and states no
+  such rule. The normative "MUST NOT translate / MUST drop" language is §3.1
+  (Restrictions on the use of the Well-Known Prefix).
+- **File(s)**: docs/feature-coverage.md, pkg/dataplane/userspace/format/
+  status_test.go, pkg/dataplane/userspace/protocol_binding.go,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/protocol/binding.rs
+- **Note**: the 2026-07-24 #6475 heading above carries the original mis-citation
+  and is deliberately left as written. This log is append-only and records what
+  was believed at the time; rewriting a past entry would falsify the record.
+  This entry is the correction.
+
 ## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
 
 - **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
@@ -54,6 +73,70 @@
   peer,tai64n,timers}.rs, userspace-dp/src/afxdp/wg/poison_tests.rs (new),
   userspace-dp/src/afxdp/wg/{mod,tests,cookie_tests,tai64n_tests}.rs,
   docs/engineering-style.md, _Log.md
+## 2026-08-21 — #6429: applyHelperStatusLocked split into per-domain apply steps
+
+- **Timestamp**: 2026-08-21 (refactor/6429-apply-helper-status)
+- **Action**: Split the 481-line `applyHelperStatusLocked` god-function into 12
+  per-domain steps in a new `helper_status_apply.go`, leaving an 84-line driver
+  in `maps_sync.go`. PURE CODE MOTION: 21 of 24 moved blocks are byte-identical
+  modulo leading tabs, verified mechanically by searching the produced files for
+  the left-stripped original ranges (`check.py`), not by eye. The only 8
+  differing lines are the two mechanical adaptations a function boundary forces:
+  the two `goto ctrlReady` jumps became `return` (the label sat immediately
+  after the block they escaped and that block was the last statement in the
+  chain, so the jump and the return land on the same statement — the label is
+  now dead and removed), and the six `return m.failClosedUserspaceCtrlLocked(…)`
+  in the two binding-row loops gained the `newBindingIndices` accumulator as a
+  first result.
+
+  Steps extracted: `helperCtrlFlagsLocked`, `resolveCtrlEnableLocked`,
+  `ensureCtrlEnablePrewarmLocked`, `bindingReadinessLocked`,
+  `observeXSKReceiveLivenessLocked`, `applyXSKLivenessGateLocked`,
+  `advanceXSKLivenessLocked`, `resolveXSKLivenessProbeTimeoutLocked`,
+  `flushStaleBPFStateOnCtrlEnableLocked`, `applyRuntimeModeLocked`,
+  `applyPrimaryBindingRowsLocked`, `applyAliasBindingRowsLocked`.
+
+  The path runs under `m.mu` at ~1/s per helper, so the two rules that govern it
+  were checked rather than asserted. Allocation: `go build -gcflags=-m` over the
+  before/after regions gives an IDENTICAL heap-fact set — 50 distinct, 109 total
+  — with zero facts present after that were absent before. Every new message is
+  a `does not escape` annotation for a newly-introduced parameter; notably
+  `ctrl` is taken by pointer in five places and escape analysis still reports
+  `ctrl does not escape` for all five, and `newBindingIndexSet` keeps its
+  pre-existing `make(map[uint32]struct {}) does not escape`. Logging: all 15
+  `slog` sites diff clean on level AND message text; nothing was promoted from
+  Debug.
+
+  Early-return map (unchanged by the split): R1/R2 (`ctrlMap`/`bindingsMap` nil)
+  skip everything; R3 (ctrl-disable write fails) returns BEFORE
+  `m.ctrlWasEnabled = false` / `m.ctrlDisabledAt` are updated and skips both
+  binding loops, `clearStaleBindingRowsLocked`, the three map syncs,
+  `syncBPFCountersLocked`, the ctrl-enable write and `recordHelperStatusLocked`;
+  R4-R6 (primary loop) and R7-R9 (alias loop) fail ctrl closed and skip
+  everything from `clearStaleBindingRowsLocked` onward, leaving
+  `m.lastBindingIndices` untouched; R10-R12 (the three syncs) skip the syncs
+  below them plus counters/enable/record; R13 (ctrl-enable write) skips only
+  `recordHelperStatusLocked`. The two former `goto`s are not returns — they skip
+  only the liveness-failure tail and leave `ctrl.Enabled = 1` standing.
+
+  `pkg/dataplane/userspace/maps_sync.go` moves 2046 [REFACTOR] -> 1655 [WATCH]
+  in the modularity heatmap; the new file is 567 lines, below the audit floor.
+  Doc pointers into the moved code updated in `docs/reth-mac.md` (the ctrl-write
+  gate is now consulted in `resolveCtrlEnableLocked`; the predicate
+  `ctrlMustStayDisabledLocked` stays in `maps_sync.go`) and
+  `docs/afxdp-packet-processing.md` (the #4894/#814 write-side dimension guards
+  moved with the apply path; the watchdog copies stayed).
+
+  A cluster smoke is OWED and was NOT run — this is the helper status-apply
+  path. Deliberately out of scope: the five repeated
+  `UsingUserspaceXDPShimEntryProgram`/`SwapTo…` blocks were NOT deduplicated,
+  because that is a rewrite, not code motion.
+
+- **File(s)**: `pkg/dataplane/userspace/helper_status_apply.go` (new),
+  `pkg/dataplane/userspace/maps_sync.go`, `docs/reth-mac.md`,
+  `docs/afxdp-packet-processing.md`, `docs/refactoring-audit-current.txt`,
+  `_Log.md`
+
 ## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
 
 - **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
@@ -100099,3 +100182,32 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha_sync.go`,
   `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_state_fence_rearm_6530_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: `compileNAT` / `compileStaticNAT` / `compileNAT64` built
+  `SNATValue`, `SNATValueV6`, `SNATEgressValue`, `NATPoolConfig`, `DNATValue`,
+  static-NAT and `NAT64Config` records and handed them to `SetSNATRule` /
+  `SetDNATEntry` / `SetNATPoolConfig` / the stale-NAT deleters. Every one of
+  those writes landed nowhere: the only production compile path is
+  `Manager.CompileUserspaceShim`, whose `userspaceShimCompileDataplane`
+  implements each as `return nil` (loader.go); the real `(*Manager)` writers in
+  `maps_nat.go` are reachable only through `Manager.Compile`, which no
+  production caller reaches because no backend registers a non-userspace type
+  and `LegacyDataPlaneAdapter` shadows `Compile`/`ApplyConfig` with the
+  userspace ones. Deleted the construction; kept every value that escapes —
+  `result.PoolIDs` / `NextPoolID`, `result.NATCounterIDs`, the implicit
+  `_snat_match_<cidr>` entries in `result.AddrIDs`, the persistent-NAT table
+  (`GetPersistentNAT`, the file's one non-no-op dataplane call), and every
+  compile-failing rejection. `compileNPTv6` is untouched: it still writes
+  `nptv6_rules`, and retiring that plus the `maps_nat.go` writers is the
+  sibling cleanup. New `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms
+  every retired writer to FAIL and requires a clean validate on both marker
+  arms, so a reintroduced write reds by error propagation rather than by a
+  counter. 594 lines removed from compiler_nat.go (1428 -> 1066).
+- **File(s)**: pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
