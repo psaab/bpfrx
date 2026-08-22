@@ -269,6 +269,10 @@ type Server struct {
 	// tokenless fabric RPC is rejected (a downgrade to cleartext once both
 	// nodes are keyed is an attack), not treated as a key-rollout grace case.
 	fabricPeerAuthSeen atomic.Bool
+	// fabricSkew holds the #6708 measured peer wall-clock skew: a token that
+	// verifies under an accepted key but at a window outside the accept band
+	// is an AUTHENTICATED statement of how far the peer's clock is out.
+	fabricSkew fabricSkewState
 	// fabricListenerMu guards fabricListenerUp (#5047). The fabric-listener
 	// supervisor records per-address up/down health so a status surface (or the
 	// caller) can observe whether the network-exposed peer-proxy gRPC surface is

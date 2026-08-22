@@ -103552,3 +103552,23 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/host_inbound_dhcp_role_6519_test.go` (new),
   `pkg/config/testdata/golden_4406.json`,
   `docs/host-inbound-service-matrix.md`
+
+## 2026-08-22 — #6708 fabric auth clock skew is measured and named
+- **Action**: >30s of wall-clock skew between peers kills every fabric RPC with
+  "invalid auth token" — permanently without NTP — while VRRP/forwarding/
+  failover keep working, so the cluster reads healthy and every cross-node query
+  returns LOCAL-ONLY. Measured on the loss cluster at 141s. Did NOT take the
+  issue's first option (widen the accept band): that band IS the replay horizon
+  for the allowlisted ClearSessions / cross-node-failover RPCs. Added a bounded
+  (±2h), throttled (5s) diagnostic scan on the REJECT path that reports the peer
+  offset only when the token verifies under an ACCEPTED KEY at another window —
+  an authenticated measurement no on-segment attacker can plant. The rejection
+  now names the clock and NTP, `show chassis cluster status` carries the skew,
+  and a one-shot transition warning fires. A forged token or a PSK mismatch
+  reports no skew, so an auth fault is never mislabelled as a clock fault.
+  Corrected the "accepted tradeoff rather than a bug" claim in the fabric_auth
+  header and documented the posture in docs/architecture.md.
+- **File(s)**: pkg/grpcapi/fabric_auth_skew_6708.go (new),
+  pkg/grpcapi/fabric_auth_skew_6708_test.go (new),
+  pkg/grpcapi/fabric_auth.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show_cluster_text.go, docs/architecture.md
