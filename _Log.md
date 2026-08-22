@@ -99957,3 +99957,12 @@ prose edit above them added. No diff falls in the new test body.
   `cmd/cli/cos_apply_markers_6440_test.go` (new),
   `test/incus/apply-cos-config.sh`, `Makefile`, `CLAUDE.md`,
   `docs/cos-validation-notes.md`
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
+  return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
+  (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
+  degraded arm; document the idle regulation in the worker README.
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`
