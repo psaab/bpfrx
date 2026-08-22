@@ -13,7 +13,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
-	"google.golang.org/grpc/metadata"
 )
 
 // Command trees are defined in pkg/cmdtree (single source of truth).
@@ -117,9 +116,13 @@ func (s *Server) telemetry() dataplane.Telemetry {
 
 type natRuleSetKey struct{ from, to string }
 
+// natSessionCounts accumulates active-translation counts in int64 so a
+// session table larger than MaxInt32 cannot wrap the counter NEGATIVE while
+// it is being built (#5250 A8-b2 F3). Every protobuf hand-off saturates
+// through clampInt32 (server_nat.go) instead of a bare int32 conversion.
 type natSessionCounts struct {
-	total           int32
-	ruleSetSessions map[natRuleSetKey]int32
+	total           int64
+	ruleSetSessions map[natRuleSetKey]int64
 }
 
 func (s *Server) countSNATSessions(zoneByID map[uint16]string) natSessionCounts {
@@ -132,7 +135,7 @@ func (s *Server) countDNATSessions(zoneByID map[uint16]string) natSessionCounts 
 
 func (s *Server) countNATSessions(flag uint16, zoneByID map[uint16]string) natSessionCounts {
 	counts := natSessionCounts{
-		ruleSetSessions: make(map[natRuleSetKey]int32),
+		ruleSetSessions: make(map[natRuleSetKey]int64),
 	}
 	if !s.dataplaneLoaded() {
 		return counts
@@ -371,10 +374,15 @@ func writeNeighSummary(buf *strings.Builder, neighbors []netlink.Neigh, stateFn 
 
 // --- SystemAction RPC ---
 
+// peerForwardedFromContext reports whether this request was forwarded by the
+// cluster peer.
+//
+// #5883: it reads the in-process capability (peer_marker_5883.go), NOT the
+// `x-peer-forwarded` header. Only the fabric listener's interceptor promotes
+// that header into the capability, and only after #4107 auth has accepted the
+// call; the loopback listener strips it and promotes nothing. A caller cannot
+// set a context value, so the marker is no longer forgeable by anyone who can
+// merely reach a listener.
 func peerForwardedFromContext(ctx context.Context) bool {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return false
-	}
-	return len(md.Get("x-peer-forwarded")) > 0
+	return peerMarkersFromContext(ctx).forwarded
 }

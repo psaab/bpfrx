@@ -447,8 +447,17 @@ func (s *Server) Run(ctx context.Context) error {
 	// (e.g. a ":50051" wildcard clamp resolves to a concrete host:port).
 	s.setListenState(lis.Addr().String(), grpcListening)
 
+	loopbackUnary, loopbackStream := loopbackServerInterceptors()
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		// #5883: no cluster peer ever dials this listener, so an inbound
+		// x-peer-forwarded / xpf-no-peer marker here is forged by definition.
+		// Strip both and promote NOTHING, so every handler on this listener
+		// sees the markers absent and does the peer work it is supposed to do.
+		// The chain is built by loopbackServerInterceptors so the WIRING is
+		// testable, not just the interceptor.
+		grpc.ChainUnaryInterceptor(loopbackUnary...),
+		grpc.ChainStreamInterceptor(loopbackStream...),
 		// #5849: the config-lock lifecycle is owned by a connection-scoped
 		// stats.Handler (releases on ConnEnd), NOT a per-RPC interceptor that
 		// tore the session down on any per-RPC cancellation.
@@ -580,8 +589,13 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 func (s *Server) buildFabricServer() *grpc.Server {
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor),
-		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor),
+		// #5883: peerMarker runs LAST in the chain on purpose —
+		// ChainUnaryInterceptor invokes in order, so #4107 auth and the #4122
+		// allowlist have both already accepted the call before the hop markers
+		// are promoted to the in-process capability. An unauthenticated caller
+		// on the fabric segment is rejected before anything is trusted.
+		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor, peerMarkerUnaryInterceptor(true)),
+		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor, peerMarkerStreamInterceptor(true)),
 		// #5849: same connection-scoped config-lock release contract as the
 		// loopback server (a no-op for the fabric allowlist, which never admits
 		// the config RPCs, but keeps the lifecycle uniform across both servers).
