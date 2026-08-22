@@ -100554,3 +100554,21 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
   pkg/daemon/daemon_ha_sync.go,
   pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md
+
+## 2026-08-21 — #6520: cluster DHCP RG filter drops node-local members
+- **Timestamp**: 2026-08-21
+- **Action**: `filterDHCPConfigForMasterRGs` built its keep-set only from RETH
+  members of MASTER RGs, so every interface with no redundancy group (the `fxp0`
+  lifeline, any node-local data interface) was removed from every
+  `dhcp-local-server` group on BOTH nodes and a node-local-only group vanished.
+  Mastership now scopes only RG-scoped members; a member in no RG is node-local
+  and always kept. Both sets come from one walker, `rethInterfacesMatchingRG`.
+  Second half: a group the filter SHRANK still carries the removed member's
+  pools, so `dhcpserver.subnetInterface` cross-bound them onto the survivor;
+  the filter now records `DHCPServerGroup.MembersFiltered` (runtime-only,
+  `json:"-"`) and the renderer omits Kea's per-subnet interface selector for
+  such a group, falling back to address-based subnet selection.
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/config/types_system.go,
+  pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
+  pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
+  pkg/daemon/README.md
