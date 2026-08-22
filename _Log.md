@@ -103065,3 +103065,12 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
   docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6684/#6685/#7457 — added a schema-driven expander for packed
+    stanza bodies (compact_tail.go) and wired it into the syslog host, firewall
+    filter term, and filter `from` compile sites. #6683 (screens) is blocked on
+    the screen check leaves being absent from setSchema.
+  - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
+    pkg/config/compiler_firewall.go,
+    pkg/config/compact_tail_6684_6685_test.go, docs/config-schema.md
