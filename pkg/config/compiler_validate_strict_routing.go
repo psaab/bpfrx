@@ -286,10 +286,25 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 // multi-policy chain silently collapsed to the first — the operator's remaining
 // policies had no effect on load-balancing and nothing said so.
 //
-// Rejecting makes that collapse loud and fails CLOSED. It is deliberately NOT a
-// renderer change: implementing a real policy chain means deciding how several
-// policies compose into one ecmpMaxPaths, which is a routing-semantics design
-// question rather than a multi-value-read fix. Tracked as #6674.
+// Rejecting makes that collapse loud and fails CLOSED, and #6674 RATIFIED it as
+// the permanent contract rather than a pending renderer change.
+//
+// The reason, stated because "Junos takes a chain here" is true and still does
+// not make a chain implementable: resolveECMP (pkg/frr/config_render.go) derives
+// exactly TWO booleans from the ONE named policy — any term with a load-balance
+// action sets ecmpMaxPaths to 64, any term with `consistent-hash` sets
+// fc.ConsistentHash — and evaluates no `from` match, no term order, and no
+// terminating action. Junos evaluates an export chain PER ROUTE and stops at the
+// first terminating action, so the only cheap composition (OR the flags across
+// the chain) is NOT Junos: a route accepted by the first policy never reaches
+// the second, yet the OR would apply the second's load-balance to it. Measured,
+// not assumed — the two readings differ whenever the first policy carries no
+// load-balance term and a later one does, which is pinned by
+// TestForwardingTableExportIsAGlobalToggleNotAChain_6674. The faithful reading
+// cannot be expressed at all: the value being derived is FRR's GLOBAL
+// `maximum-paths`, which has no per-route form. A chain therefore needs a
+// per-route forwarding-policy model xpf does not have — a feature, tracked
+// separately, not a defect in this gate.
 //
 // Strict on commit / commit-check (hard reject); the call site downgrades to a
 // warning on the tolerant load / peer-sync path (#1960 no-brick), where

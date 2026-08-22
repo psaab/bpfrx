@@ -98,7 +98,10 @@ func TestWGPlaintextWarningNamesTheContradictedZone(t *testing.T) {
 //
 // Leaving the tunnel out of a zone is not a mitigation — an interface in no
 // zone resolves to zone id 0 and a `from-zone any to-zone any permit` rule
-// matches zone-pair (0,0) with no zone guard (#6682) — so gating on zoning
+// never reaches zone policy at all, whether or not the interface is zoned
+// (#6682: the older "matches zone-pair (0,0) with no zone guard" claim was
+// wrong — #3110 fenced every tier against zone 0, and #6682 made an unzoned
+// ingress an explicit deny) — so gating on zoning
 // would tell exactly this operator nothing.
 func TestWGPlaintextWarningFiresForUnzonedTunnel(t *testing.T) {
 	cfg := compileWarn5618(t, wgTunnel5618("wg0", 0, 51820, wgKeyA, wgKeyB)...)

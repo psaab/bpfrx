@@ -81,6 +81,19 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	// no-op (no clone) when nothing is deactivated.
 	tree = tree.WithoutInactive()
 	defsSource = defsSource.WithoutInactive()
+	// #6672: expand a PACKED `chassis cluster` body into children before the
+	// walk. The walker descends `.Children`, so a statement packed onto the
+	// cluster (or chassis) line sits below every modeled depth and no typed-leaf
+	// validator fires on it. That was harmless while the packed spelling also
+	// compiled to nothing; now that it compiles, the same normalization must
+	// happen HERE or the packed spelling would reach the runtime with an ungated
+	// `cluster-id` (one byte of the RETH virtual MAC) and an ungated
+	// `reth-advertise-interval` (a 12-bit VRRP wire field) while the container
+	// spelling stays gated. One splitter, both consumers — the alternative is a
+	// second hand-written bounds table that drifts from the schema.
+	//
+	// No-op (no clone) when nothing is packed, like WithoutInactive above.
+	tree = normalizePackedChassisCluster(tree)
 	// #4060: reject the raw-AST redaction placeholder ("##SECRET-DATA##") on
 	// commit-ingest. This is the symmetric guard for the #4051 display
 	// redaction — re-applying a secret-redacted REST export must not silently
@@ -395,7 +408,21 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// Keys=["bogus"]), which the compiler never reads and silently drops.
 	// Only applies on an EXACT keyword match: a wildcard match means keyword
 	// is a dynamic instance NAME, not this leaf's value slot.
-	if childSchema.isScalarValueLeaf() && parent.children != nil && parent.children[keyword] == childSchema {
+	//
+	// exactMatch is computed ONCE and read by both rules that need it (#6834).
+	// It used to be open-coded here and nowhere else; the wildcard-identity
+	// gate below needs the same distinction, and two copies of "was this an
+	// exact match?" can only ever disagree by mistake — if they drifted, one
+	// rule would treat a match as a dynamic instance name and the other as a
+	// value slot.
+	//
+	// PRECONDITION, verified rather than assumed: no schema parent registers
+	// the same *schemaNode as both a named child AND its wildcard. Pointer
+	// equality would report "exact" for a wildcard match if one did, silently
+	// disabling the identity gate. TestNoSchemaNodeIsBothChildAndWildcard_6834
+	// walks the whole schema and keeps that true.
+	exactMatch := parent.children != nil && parent.children[keyword] == childSchema
+	if childSchema.isScalarValueLeaf() && exactMatch {
 		return validateScalarValueLeaf(node, childSchema, path)
 	}
 
@@ -430,6 +457,22 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// distinct grammar per position (prefix slot vs match-type slot).
 	if childSchema.keyValidatorPos != nil || childSchema.keyValidator != nil {
 		keyPath := append(append([]string(nil), path...), keyword)
+		// #6834: a WILDCARD's identity IS the keyword — Keys[0] — not an arg
+		// token. The declared-arg span below is Keys[1:1+args], and a wildcard
+		// declares no args, so that span is EMPTY and a wildcard's identity was
+		// never validated at all. Every keyValidator in the schema was on a
+		// `<keyword> <arg>` slot, so the gap had no instance until an interface
+		// name needed gating (the name is interpolated into the generated
+		// .network file's [Match] Name=, which systemd reads as a
+		// whitespace-separated glob list, so an unvalidated name can claim
+		// several devices).
+		//
+		// Validated as identity slot 0, which is what it is positionally.
+		if !exactMatch {
+			if err := validateKeySlot(childSchema, 0, keyword, vc); err != nil {
+				return typedLeafInvalidErrorf(path, keyword, err)
+			}
+		}
 		if childSchema.valueList && childSchema.keyValidator != nil {
 			// #5726: a VALUE-LIST container leaf (only the static-route
 			// `next-hop`: multi + valueList + keyValidator + an `interface`

@@ -161,8 +161,10 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 					"the ECMP render honours AT MOST ONE policy (the one the wrapped "+
 					"error names — none at all when the selected value is empty) and "+
 					"the rest have no "+
-					"effect on load-balancing; configure one export policy (support for the Junos "+
-					"export policy CHAIN is tracked in #6674). Downgraded to a warning on the "+
+					"effect on load-balancing; configure one export policy. xpf models "+
+					"forwarding-table export as a GLOBAL ECMP toggle derived from one "+
+					"policy, not as a per-route Junos policy chain, so a chain has no "+
+					"representable meaning here (#6674). Downgraded to a warning on the "+
 					"tolerant load / peer-sync path so an already-persisted config still boots: %v", err))
 		} else {
 			return err
