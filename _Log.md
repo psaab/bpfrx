@@ -100645,3 +100645,11 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
   pkg/daemon/daemon_ha_sync.go,
   pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6419 — evaluated and closed the "reuse the authority's config-gen
+    namespace" shortcut for the active/active reverse direction; recorded the
+    structural reason in code + docs and armed the RG0-primary config-sync
+    rejection pin (previously a vacuous green).
+  - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
+    docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go
