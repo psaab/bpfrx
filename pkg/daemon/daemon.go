@@ -969,6 +969,16 @@ type Daemon struct {
 	// that is never actuated (superseded reset, event-channel drop) downgrades
 	// the ack to failed instead of hanging the peer's failover request.
 	failoverActuateTimeout time.Duration
+	// rethVIPReleaseTimeout bounds awaitRethVIPRelease — the #6177 item 1 wait
+	// for the RETH VRRP instances to physically remove their virtual addresses
+	// before the remote-failover applied-ack releases. Zero ⇒ the package
+	// default (rethVIPReleaseTimeout); tests shorten it.
+	rethVIPReleaseTimeout time.Duration
+	// resignRethRGFn overrides the RETH VRRP resignation performed on a
+	// demotion (#6177 item 1). Production leaves it nil and the demotion calls
+	// vrrpMgr.ResignRG directly; unit tests inject a barrier they control so
+	// the deferred fence verdict is drivable without real VRRP instances.
+	resignRethRGFn func(rgID int) vipReleaseBarrier
 	// Test hooks for direct-mode VIP ownership reconciliation.
 	directAddVIPsFn        func(int) int
 	directRemoveVIPsFn     func(int) int
