@@ -2413,6 +2413,120 @@ fn set_forwarding_state_failed_reconcile_reports_error_6135() {
     );
 }
 
+// --- #5862: the binding-settle wait must not hold the ServerState lock -----
+
+/// A state whose bindings can never settle: one REGISTERED slot with no
+/// worker, so `bindings_settled` (registered => ready || last_error) is false
+/// on every poll and `wait_for_binding_settle` runs to its deadline.
+fn never_settling_state() -> Arc<Mutex<ServerState>> {
+    Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus {
+            forwarding_armed: true,
+            capabilities: forwarding_caps(),
+            bindings: vec![BindingStatus {
+                slot: 0,
+                registered: true,
+                ifindex: 10,
+                ..BindingStatus::default()
+            }],
+            ..ProcessStatus::default()
+        },
+        snapshot: None,
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }))
+}
+
+/// Fail-on-revert (#5862): `wait_for_binding_settle` must RELEASE the global
+/// `ServerState` lock across each 50 ms sleep.
+///
+/// The HA session socket is a separate socket on a separate thread
+/// (`lifecycle.rs`), but its one verb — `sync_session` — dispatches through the
+/// same `Arc<Mutex<ServerState>>` as every main-socket verb, so the socket split
+/// never split the critical section. A 2 s settle held under that lock is longer
+/// than the Go side's 3 s session round-trip budget once queuing is added, and
+/// #5380 makes the FIRST session timeout abort the rest of the bulk batch — so
+/// this is a dropped-mirror bug at failover, not only a latency tail.
+///
+/// The assertion is deliberately about the LOCK, not about a timing average: it
+/// takes the lock from another thread mid-wait and requires that acquisition to
+/// be prompt. Reverting the helper to hold one guard across the loop makes this
+/// block for the whole remaining deadline — RED.
+#[test]
+fn wait_for_binding_settle_releases_state_lock_between_polls() {
+    use std::time::{Duration, Instant};
+
+    let state = never_settling_state();
+    let waiter = {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            crate::server::helpers::wait_for_binding_settle(&state, Duration::from_millis(900));
+        })
+    };
+
+    // Let the waiter enter its poll loop.
+    std::thread::sleep(Duration::from_millis(120));
+
+    let t0 = Instant::now();
+    {
+        let guard = state.lock().expect("state lock");
+        assert_eq!(guard.status.bindings.len(), 1, "fixture lost its binding");
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "acquiring the ServerState lock took {elapsed:?} while a binding-settle \
+         wait was in flight — the wait is holding the lock across its sleep, so \
+         every HA sync_session on the dedicated session socket queues behind it \
+         (#5862)"
+    );
+
+    waiter.join().expect("settle waiter");
+}
+
+/// The end-to-end half: a `sync_session` request must be SERVED while a
+/// `set_forwarding_state` settle wait is in flight. This drives both through the
+/// real `handle_stream` dispatcher, which is what proves the handler wiring
+/// (locked arm records the owed settle; `handle_request` runs it after the guard
+/// drops) and not merely the helper in isolation.
+#[test]
+fn sync_session_is_served_during_a_forwarding_settle_wait() {
+    use std::time::{Duration, Instant};
+
+    let state = never_settling_state();
+
+    let settle_state = state.clone();
+    let settler = std::thread::spawn(move || {
+        let mut request = req("set_forwarding_state");
+        request.forwarding = Some(ForwardingControlRequest { armed: true });
+        run_request(settle_state, request)
+    });
+
+    // Let set_forwarding_state reach its settle wait.
+    std::thread::sleep(Duration::from_millis(150));
+
+    let t0 = Instant::now();
+    let resp = run_request(state.clone(), req("sync_session"));
+    let elapsed = t0.elapsed();
+    // The request is REJECTED (no payload) — irrelevant here. What is asserted
+    // is that it was DISPATCHED promptly rather than queued behind the settle.
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "a sync_session request waited {elapsed:?} behind a set_forwarding_state \
+         binding-settle wait; the settle is holding the global ServerState lock, \
+         which is exactly the contention the dedicated session socket was \
+         supposed to remove (#5862). error={}",
+        resp.error
+    );
+
+    let settle_resp = settler.join().expect("settle thread");
+    assert!(
+        settle_resp.ok,
+        "set_forwarding_state failed: {}",
+        settle_resp.error
+    );
+}
+
 #[test]
 fn stop_workers_clears_socket_fields_on_all_bindings() {
     // stop_workers must tear down per-binding socket state so the

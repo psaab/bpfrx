@@ -98901,6 +98901,23 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #5962 and the bounded half of #5862.
+  #5962: `commitAndApplyOperator` resolved `rg0ConfigSyncAuthority(d.cluster)`
+  into a bool BEFORE `store.Commit`, and carried that frozen answer to the push
+  site. A bool cannot distinguish "this commit must never reach the peer" (the
+  event-options engine's POLICY, true whatever this node owns) from "this node
+  is not the RG0 authority right now" (a FACT with a lifetime), so RG0
+  ownership moving in between produced a successful commit with the push
+  silently skipped. Replaced the bool with `peerSyncPolicy`
+  (`peerSyncNever` / `peerSyncAlways` / `peerSyncIfRG0Authority`) resolved once,
+  in `applyAndSyncCommitted`, at the point the push is made — after the commit
+  and after `ensureWritableLocked`, which is itself tied to RG0 ownership. Both
+  directions are now pinned: promotion in the window MUST push, demotion in the
+  window MUST NOT (the pre-#5962 code got the second wrong in the other
+  direction whenever the attempt-time answer was true). The type is the fix, not
+  just the moved call: re-evaluating authority for every caller would have
+  started replicating event-engine remediations to the peer.
 
 - **Timestamp**: 2026-08-21
 - **Action**: #7145 — reject a malformed literal in a NAT rule's `match
@@ -99300,3 +99317,42 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/icmp_embed/nat_match_v6.rs,
   userspace-dp/src/afxdp/tests_icmp_reject_reversal.rs,
   docs/deterministic-nat-cgnat.md, userspace-dp/src/afxdp/README.md, _Log.md
+
+  #5862: measured the current lock picture rather than trusting the issue text.
+  Three of its claims are STALE — the owner-RG export ack-wait (#2962), the bulk
+  export push (#4054) and the state-file serialize+fsync (#5469) already run
+  with the lock released. The core claim is LIVE: the "dedicated" session socket
+  is a separate socket on a separate thread but its one verb (`sync_session`)
+  dispatches through the same `Arc<Mutex<ServerState>>`. Landed the bounded
+  piece: `wait_for_binding_settle` (2 s at 50 ms, reached by
+  `set_forwarding_state` / `set_queue_state` / `set_binding_state`) now releases
+  the lock across each sleep, and the three handlers RECORD the owed settle so
+  `handle_request` runs it after the guard drops — the same locked-kick /
+  unlocked-wait split #2962 and #4054 use. The consequence this closes is not a
+  latency tail: the Go session round-trip budget is 3 s
+  (`sessionSyncRoundtripDeadline`) and #5380 aborts the rest of a bulk batch on
+  the first transport failure, so a settle overlapping a mirror burst could drop
+  the remainder of up to 255 session mirrors at failover. NOT closed, and split
+  out: `apply_snapshot` can still hold the lock across a 10 s worker-readiness
+  barrier, a 500 ms mlx5 quiesce, an unbounded worker `join()`, and BPF pin-open
+  syscalls; `ServerState` is still one mutex over four fields.
+
+  Validation: `go test -count=1 ./...` exit 0, `go vet ./...` exit 0.
+  #5962 mutation matrix, one mutation per cell, exit codes from `$?`: resolve
+  the authority at attempt time (pre-#5962 shape) → exit 1 on BOTH the
+  promotion and the demotion cell; collapse `peerSyncNever` into the authority
+  answer → exit 1 at the policy table AND at the existing #5054 event-engine
+  test. #5862 mutation matrix (`cargo test -- --test-threads=1`, never
+  parallel): helper holds one guard across the loop → exit 101 on both cells,
+  measured 818 ms lock acquisition and a 1.87 s `sync_session` wait; handler
+  waits inline under the lock with the helper unchanged → exit 101 on the
+  wiring cell ONLY, helper cell green — the two tests localise to different
+  halves. Rust helper changed (`userspace-dp`), and the change is on the HA
+  session-sync contention path, so `make test-failover` on the loss userspace
+  cluster is OWED and was NOT run by this lane.
+- **File(s)**: pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_apply_commit.go,
+  pkg/daemon/daemon_apply_tail.go, pkg/daemon/daemon_run_servers.go,
+  pkg/daemon/configsync_toctou_5962_test.go, pkg/daemon/*_test.go (mechanical
+  peerSyncPolicy migration), userspace-dp/src/server/helpers/planning.rs,
+  userspace-dp/src/server/handlers/{mod,forwarding,queue,binding}.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md
