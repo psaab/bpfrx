@@ -120,6 +120,65 @@
   `pkg/upgrade/kernel_verify_no_inference_6620_test.go` (new),
   `docs/in-place-upgrade.md`, `_Log.md`
 
+## 2026-08-21 — #6583 next-table window drawn down v4-first structurally
+
+- **Timestamp**: 2026-08-21
+- **Action**: The v4-before-v6 next-table draw-down order was set entirely
+  by two `append` lines in `pkg/daemon/daemon_apply_routing.go` and bound
+  by nothing on either side. Fixed STRUCTURALLY rather than by asserting
+  on the caller: `nextTableManager.Apply` now stable-partitions the slice
+  v4-first (`nextTableFamilyOrdered`), so the kernel agrees with the FIB
+  (`addRoutes("inet.0")` before `addRoutes("inet6.0")`) by construction
+  and no caller can get it wrong. Also closed the fixture gap the
+  kernel-side #6467 guard had — every case generated `10.%d.%d.0/24`
+  only, so its `count(AF_INET)+count(AF_INET6)` totals always carried a
+  zero v6 term and could not see a family reordering at all.
+  Mutation matrix: X1 (no ordering — the pre-fix state) and X2 (v6 first)
+  RED; X3 (unstable within family) initially GREEN — the stability claim
+  was unbound, so a per-slot destination assertion was added and it now
+  reds. X4 (swap the daemon appends) is GREEN **by design**: the whole
+  point is that the swap is now a no-op. That deviates from the issue's
+  acceptance criterion 1, which asked for the swap to turn a test RED;
+  making it harmless is strictly stronger, and adding an assertion on a
+  condition that can no longer vary would be a guard on a dead branch.
+- **File(s)**: pkg/routing/rules.go, pkg/routing/rules_6467_test.go,
+  pkg/routing/README.md
+
+## 2026-08-21 — #6634 ddns: provider RESPONSE TEXT is bounded and shape-filtered
+
+- **Timestamp**: 2026-08-21
+- **Action**: Four backends rendered text from the PROVIDER'S response BODY
+  straight into a returned error the daemon logs and retains as `lastErr`:
+  Cloudflare `Errors[].Message`, Route 53 decoded `Code`/`Message`, and the
+  unrecognized first response line on dyndns2 and DuckDNS — plus three
+  Cloudflare `json.Unmarshal` sites rendering the decoder error with `%w`.
+  No hostile transport is needed, only an API that echoes the request back;
+  DuckDNS carries its token in the QUERY STRING, so the echo IS the credential.
+  MEASURED FIRST, and it changed the fix: two thirds of the issue's surface was
+  already closed elsewhere. `termsafe.SanitizeForDisplay` covers both `show
+  services ddns` surfaces (#6468) and the daemon's `slog.TextHandler`
+  `strconv.Quote`s any non-printable byte, so control-character forgery cannot
+  split a journal line. What neither closes is a CREDENTIAL in the bytes or
+  64 KiB of them. So the fix is a bound plus a URL/userinfo shape filter, NOT
+  an escape.
+  `scrubProviderText` is total on LENGTH (`maxProviderTextBytes`, plus a COUNT
+  bound on the Cloudflare envelope — a per-message cap is not a bound when the
+  provider picks the array length) and partial on SHAPE, and says so: a
+  credential echoed as bare prose is indistinguishable from a word. Filter
+  BEFORE bounding, since the other order splits a URL at the cap and leaves
+  `https://user:PA` rendered. Route 53's returned code/message are NOT scrubbed
+  — `r53DeleteAlreadyGone` classifies delete-idempotency on the raw text, so
+  scrubbing the value would change a control decision; only the render goes
+  through the scrubber.
+  The class gate gained `json.Unmarshal`, FILE-SCOPED: it decodes a provider
+  body in `backend_*.go` and this daemon's own state file in `state.go`. The
+  scope is a predicate, not a site list, so a new backend file is covered
+  automatically.
+- **File(s)**: `pkg/ddns/backend_http.go`, `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_route53.go`, `pkg/ddns/backend_dyndns2.go`,
+  `pkg/ddns/backend_duckdns.go`,
+  `pkg/ddns/provider_response_text_6634_test.go` (new),
+  `pkg/ddns/url_render_class_6545_test.go`, `pkg/ddns/README.md`
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
@@ -154,6 +213,34 @@
   only). No dataplane change; the Rust helper binary is not reached.
 - **File(s)**: `pkg/nftables/host_inbound_any_service_verdict_6618_test.go`
   (new), `docs/host-inbound-service-matrix.md`
+## 2026-08-21 — #6591 post-deploy primary reassert is fail-closed
+
+- **Timestamp**: 2026-08-21
+- **Action**: The issue text was STALE — the transfer step it asks for
+  (`failover redundancy-group $rg node 0`) already exists. The live
+  defect is that the reassert FAILS OPEN: an unreadable
+  `show chassis cluster status` right after a deploy makes it iterate
+  zero RGs, warn, and return SUCCESS, so `DEPLOY_RC=0` with the cluster
+  inverted (node0 pri 200 secondary behind node1 pri 100 under
+  preempt=no). It also never verified the resulting role. Observed twice
+  firsthand on the shared gate as `FO_RC=2` at test-failover's preflight.
+  Moved the body into `deploy-lib.sh` so the existing mocked-incus
+  selftest can drive it; added a bounded retry on the status read (the
+  measured discriminator was settle time), a per-RG trailing reset, and
+  a fail-closed VERIFY that dies unless node0 reads `primary` for EVERY
+  RG. The verifier rejects an empty status — that is the fail-open cell.
+  Extended the selftest mock with `cli -c` (scripted status queue +
+  command log); the read index is FILE-backed because
+  `status=$(incus exec ...)` is a subshell and a variable increment
+  there is discarded.
+  Mutation matrix 7/7 RED: W1 fail-open restore, W2 no verification,
+  W3 empty status accepted, W4 some-RG-not-every-RG, W5 no transfer
+  (the original report), W6 no settle retry, W7 wiring reverted.
+  W6 initially GREEN because the first cell mutated a DEFAULT the
+  fixture overrides — re-cut against the loop itself.
+  NOT run on the cluster (shared; lead serializes).
+- **File(s)**: test/incus/deploy-lib.sh, test/incus/cluster-setup.sh,
+  test/incus/deploy-lib-selftest.sh, docs/testing.md
 ## 2026-08-21 — #6656 transfer-out override cleared on peer loss
 
 - **Timestamp**: 2026-08-21

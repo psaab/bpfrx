@@ -318,6 +318,27 @@ delegate to the owning domain. Exported types:
   crashed daemon never leaks pins.
 - `100–199`: next-table inter-VRF leaking (static routes with
   `next-table` directive). `nextTableRulePriority` in `rules.go`.
+  **The window is drawn down IPv4-FIRST, and that is enforced HERE
+  (#6583).** `nextTableManager.Apply` advances one family-blind `prio` in
+  slice order, so which leaks survive the `maxNextTableRules` cap used to
+  be decided entirely by two `append` lines in
+  `pkg/daemon/daemon_apply_routing.go` (v4 statics, then v6 statics) — a
+  cross-package convention with nothing on either side binding it. The
+  userspace FIB mirrors the same cap but draws it down in its own order
+  (`pkg/dataplane/userspace/routes.go`: `addRoutes("inet.0", …)` then
+  `addRoutes("inet6.0", …)`), so the two agreed only by coincidence.
+  Swapping those appends would have installed 60 v6 + 40 v4 in the kernel
+  against 60 v4 + 40 v6 in the FIB: 40 leaks in the kernel and not the
+  FIB, 40 the reverse — a leak present only in the FIB resolves into the
+  target VRF on the AF_XDP fast path while a slow-path packet for the same
+  flow resolves in the main table (#6467's verdict split in a new shape).
+  `nextTableFamilyOrdered` makes the agreement structural instead of
+  conventional: no caller can get it wrong, and the guard cannot rot into
+  a check of one caller while a second is added elsewhere. The partition
+  is STABLE, so within a family the caller's relative order — which the
+  FIB's per-family pass also preserves — is untouched; a correct grouping
+  that shuffled inside the group would match on counts and still install
+  a different SET.
 - `31000–31999`: PBR (firewall-filter `routing-instance` action).
   `pbrRulePriority` in `rules.go`. **Kernel FBF support matrix (#3730):**
   `BuildPBRRules` mirrors only the term `from` predicates an `ip rule` can
