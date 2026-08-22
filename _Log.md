@@ -103917,3 +103917,69 @@ prose edit above them added. No diff falls in the new test body.
   releasing the superseded transport the #2956 reap could never collect.
 - **File(s)**: pkg/ddns/backend_http.go,
   pkg/ddns/httpcache_resolved_bind_6754_test.go
+
+## 2026-08-22 — #7515 single-source the management-interface class
+- **Action**: `config.IsManagementIfName` is now the SSOT for the fxp/fab/em
+  class, previously restated VERBATIM at three sites: the daemon's management-VRF
+  set (`managementVRFIfaceSet`, extracted for testability), the networkd `VRF=`
+  emitter, and the ip-monitoring next-hop validator. Semantics preserved exactly
+  — no behaviour change. `isCanonicalFabricName` now calls the shared
+  `ifNameNumericSuffix` instead of carrying a second copy of the same formula.
+  Corrected the issue's premise: `emu0` IS management today (the daemon binds it
+  to vrf-mgmt via the same prefix), so the ip-monitoring refusal was truthful;
+  narrowing the class is a behaviour decision, filed separately.
+- **File(s)**: `pkg/config/ifname_class_6731.go`, `pkg/config/lifeline.go`,
+  `pkg/config/compiler_services.go`, `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/dataplane/compiler_iface.go`,
+  `pkg/config/mgmt_ifname_ssot_7515_test.go` (new),
+  `pkg/daemon/mgmt_vrf_ifaceset_ssot_7515_test.go` (new),
+  `pkg/dataplane/mgmt_vrf_networkd_ssot_7515_test.go` (new), `docs/multi-wan.md`
+
+## 2026-08-22 — #7532 vipWarnedIfaces gets its own mutex
+- **Timestamp**: 2026-08-22
+- **Action**: The field was reset on the apply path (applySem) and lazily
+  created/read/assigned/deleted on the VRRP reconcile path under no shared
+  lock — a reset between the nil-check and the assignment panics, two
+  reconcile writers are a fatal throw. Gave it a dedicated mutex and three
+  accessors; the check-and-record is now one critical section.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha_vip.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/vip_warn_sync_7532_test.go
+
+## 2026-08-22 — #6747 IKE exchange table: O(1) LRU eviction
+- **Action**: `IkeExchangeTable::seed` chose its eviction victim with
+  `entries.iter().min_by_key(seen)` — a full traversal of all 4096 entries plus
+  empty hashbrown slots, plus a key clone and a second hash lookup, all under a
+  lock `matches` takes on the hot admission path for every Responder-SPI IKE
+  packet, on a table Arc-shared by every packet worker. Replaced the
+  `Mutex<FastMap<Key,u64>>` with an intrusive LRU over a fixed slab (index ->
+  slot, prev/next u32 links, free list): touch unlinks and re-appends at the
+  tail, eviction pops the head. SEMANTICS UNCHANGED — `min_by_key(seen)` with
+  `matches` refreshing `seen` already was LRU, just computed by scanning — so
+  the existing availability reasoning holds verbatim. FIFO was rejected: it
+  removes the scan equally well but evicts a DPD-refreshed long-lived exchange
+  in favour of a brand-new forged initiation, worse under the flood the cap
+  exists for. Added the eviction counter the issue notes was missing.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/ipsec.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
+
+## 2026-08-22 — #6748 GRE decap bounded by the outer IP datagram
+- **Action**: Native GRE decap capped the inner extent at `frame.len() -
+  inner_offset` with no cross-check against the outer IPv4 Total Length / IPv6
+  Payload Length, so a peer that appended a trailer past the outer datagram AND
+  inflated the inner IP Total Length to cover it had those out-of-datagram bytes
+  promoted into the decapsulated packet. NOT the mechanism the title implies —
+  `packet_trimmed_len` already kept the inner inside the frame and already
+  trimmed Ethernet padding, so bounding by the frame length would have fixed
+  nothing. Extracted `outer_datagram_end` from `gre_checksum_region` (which
+  already applied exactly this bound, to the checksum only — the asymmetry that
+  made this an oversight) and ran the GRE option-field skips and the inner
+  extraction on `frame[..outer_end]`. An over-declaring outer header is refused
+  rather than clamped. Negative control asserts an HONEST inner under ordinary
+  trailing padding still decaps byte-identically, so the fix is not a blanket
+  rejection of trailers. Checked the issue's "the same pattern is used by the
+  WireGuard decap path": the only other `packet_trimmed_len` callers are ENCAP
+  paths (gre.rs's outer builder and frame/wg.rs's), where no outer datagram
+  exists yet, so nothing to bound there.
+- **File(s)**: userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tests_gre_outer_bound_6748.rs (new),
+  docs/userspace-native-gre-plan.md

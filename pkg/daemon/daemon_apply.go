@@ -201,6 +201,21 @@ func (d *Daemon) applyCancelCtx() context.Context {
 // DHCP / feed and confirmed-rollback callers pass a non-cancellable context so
 // their applies always complete (see applyConfig / executeConfirmedRollback).
 func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) error {
+	// Reset VIP warning suppression so the new config gets fresh warnings.
+	//
+	// #7532: through the accessor. This runs under applySem while the VRRP
+	// reconcile path mutates the same map under no such lock, so the field has
+	// its own mutex and no caller touches it directly.
+	//
+	// Placed BEFORE the applyBodyForTest seam return, for the same reason
+	// enterBootstrapMode places stopAndDiscardNATPoolAlarm there: the lifecycle
+	// is then exercised by the unit tests that stub the apply body, instead of
+	// living on the far side of an early return no test can cross. Moving it
+	// ahead of the pipeline is behaviour-preserving — the warnings it un--
+	// suppresses are emitted by directAddVIPs on the VRRP reconcile path, which
+	// is not driven from inside this function.
+	d.resetVIPWarnings()
+
 	if d.applyBodyForTest != nil {
 		d.applyBodyForTest(cfg)
 		return d.applyErrForTest
@@ -296,9 +311,6 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// the interfaces — to reconcile them to the node's cluster names. One-shot;
 	// a no-op on a standalone config or any later commit.
 	d.maybeReapplyConfigArrivalNaming(cfg)
-
-	// Reset VIP warning suppression so new config gets fresh warnings.
-	d.vipWarnedIfaces = nil
 
 	// Log config validation warnings
 	for _, w := range cfg.Warnings {
