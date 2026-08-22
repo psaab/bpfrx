@@ -856,13 +856,21 @@ func ValidateConfig(cfg *Config) []string {
 	// today. no-syn-check / no-syn-check-in-tunnel would gate the
 	// session-create SYN check; rst-invalidate-session would tear a session
 	// down on RST; no-sequence-check (#2008 M9) would skip sequence-window
-	// validation. The dataplane session table is a pure 5-tuple flow entry
-	// with no TCP state machine and no sequence/window tracking, so there is
-	// nothing for any of these knobs to enforce or skip. This is an
-	// intentional, reviewed parity gap (see #2008 M9 and the RST design
-	// rationale in docs/active-active-new-connections.md); research #2078
-	// converged PLAN-KILL on enforcement. Warn so an operator who sets one
-	// of these is not silently misled into believing it has runtime effect.
+	// validation. The dataplane session table is a 5-tuple flow entry with no
+	// sequence/window tracking, so there is nothing for any of these knobs to
+	// enforce or skip. This is an intentional, reviewed parity gap (see #2008
+	// M9 and the RST design rationale in docs/active-active-new-connections.md);
+	// research #2078 converged PLAN-KILL on enforcement. Warn so an operator
+	// who sets one of these is not silently misled into believing it has
+	// runtime effect.
+	//
+	// #6539: the message used to say the dataplane "has no TCP state machine",
+	// which stopped being true — #3152 added the OPENING-vs-established
+	// distinction and #3046 the RST-vs-FIN close split, and those very states
+	// are why the tcp-session TIMEOUT leaves need their own, differently-worded
+	// advisory below. What remains true for these four PRESENCE flags is the
+	// absence of sequence/window tracking, so the sentence now claims only
+	// that.
 	if ts := cfg.Security.Flow.TCPSession; ts != nil {
 		var unenforced []string
 		if ts.NoSynCheck {
@@ -879,8 +887,18 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		if len(unenforced) > 0 {
 			warnings = append(warnings, fmt.Sprintf(
-				"security flow tcp-session %s configured but accepted-only — the userspace dataplane has no TCP state machine and does not enforce these knobs (config-only parity, #2078)",
+				"security flow tcp-session %s configured but accepted-only — the userspace dataplane does not track TCP sequence/window state and does not enforce these knobs (config-only parity, #2078)",
 				strings.Join(unenforced, ", ")))
+		}
+		// #6539: the three tcp-session TIMEOUT leaves (initial / closing /
+		// time-wait) get their own line because their consequence is SPECIFIC
+		// rather than "no effect" (the #5804 rule): the dataplane DOES bound
+		// each of those session states, just on a fixed window the operator
+		// cannot move. Text and enforced/unenforced split both come from
+		// flow_tcp_timeouts_6539.go, the same authority the three `show`
+		// surfaces read.
+		if adv := tcpSessionTimeoutAdvisory(ts); adv != "" {
+			warnings = append(warnings, adv)
 		}
 	}
 

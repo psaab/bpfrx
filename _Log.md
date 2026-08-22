@@ -36,6 +36,45 @@
 - **File(s)**: userspace-dp/src/policy_snapshot_error.rs,
   userspace-dp/src/filter/compiler.rs, userspace-dp/src/filter/tests.rs,
   userspace-dp/src/filter/README.md, docs/feature-coverage.md, _Log.md
+## 2026-08-21 — #6539 tcp-session timeouts: stop printing uncarried values as enforced
+
+- **Timestamp**: 2026-08-21
+- **Action**: `security flow tcp-session initial/closing/time-wait-timeout`
+  are modeled, parsed and committable but have NO dataplane wire carrier
+  and no live consumer, while REST, CLI and gRPC all printed them in the
+  same shape as `established-timeout`, which IS carried. Chose the honest
+  render over enforcement: `initial-timeout` maps 1:1 onto the Rust
+  `SessionTimeouts.tcp_opening_ns`, but `time-wait-timeout` has no state
+  to attach to (`session_timeout_ns` splits a close only into RST vs FIN),
+  so an "enforce" PR is partial by construction and would owe a wire bump
+  plus a cluster smoke while still leaving the same follow-up. Added
+  `pkg/config/flow_tcp_timeouts_6539.go` as the single authority for the
+  enforced/unenforced split; the commit advisory and all three render
+  surfaces read it, so they cannot disagree and a leaf that later gains a
+  carrier loses its annotation everywhere at once. Also corrected two
+  false claims found in the same block: the CLI printed the Junos 1800s
+  default for an unset `established-timeout` when nothing in the Go path
+  fills that in (the helper idles the session out at 300s), and the #2078
+  advisory asserted the dataplane "has no TCP state machine", which #3152
+  and #3046 have since made false.
+  Mutation matrix: M1/M2/M3 (revert each surface to the unannotated
+  render) → that surface's cell reds; M4 (drop the advisory call) → the
+  four pkg/config advisory cells red; M5 (mark initial-timeout enforced
+  in the table) → the table, carrier and all three surface cells red;
+  M6 (drift the quoted half-open window) → the Rust-parity cell reds;
+  M7 (restore the Junos 1800s default) → the CLI defaults cell reds.
+- **File(s)**: `pkg/config/flow_tcp_timeouts_6539.go` (new),
+  `pkg/config/flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/types_security.go`,
+  `pkg/config/tcp_session_advisory_test.go`, `pkg/api/show_text.go`,
+  `pkg/api/show_text_tcp_timeouts_6539_test.go` (new),
+  `pkg/cli/cli_show_flow.go`,
+  `pkg/cli/cli_show_flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/grpcapi/server_show_flow.go`,
+  `pkg/grpcapi/show_flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/dataplane/userspace/flow_tcp_timeout_carrier_6539_test.go` (new),
+  `docs/feature-gaps.md`, `docs/config-schema.md`
+
 ## 2026-08-21 — #6534 NAT fail-closed exclusions stop rendering as enforced
 
 - **Timestamp**: 2026-08-21
@@ -101313,3 +101352,18 @@ prose edit above them added. No diff falls in the new test body.
   TOUCHES VRRP — owes `make test-failover`.
 - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
   pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
+
+## 2026-08-21 — #6563: inject-packet emit-on-wire validates the source
+- **Timestamp**: 2026-08-21
+- **Action**: `request inject-packet --emit-on-wire` ran FIB/HA/CoS then enqueued
+  TX with an operator-arbitrary `source_ip` — `inject.rs` had ZERO references to
+  policy or screen, so a local principal could emit spoofed-source ICMP/ICMPv6
+  bypassing the zone policy and screen that govern transit. Added
+  `is_firewall_local_address` (global `local_v4`/`local_v6` membership:
+  interface host addresses + static-NAT/DNAT externals) and gated
+  `validate_injected_packet_tuple` on it. The gate is LAST (structural faults
+  keep message precedence) and applies to the EMIT path only, so non-emit
+  classification keeps its full diagnostic range.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/inject.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md, _Log.md
