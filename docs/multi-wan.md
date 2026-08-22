@@ -648,7 +648,19 @@ routing, and only on double fault).
 
   The named unit must be configured with `family inet dhcp` (Junos
   configured name, `<ifd>.<unit>`; v4 destinations only; management
-  interfaces rejected). The injected route then tracks the unit's
+  interfaces rejected). Tunnel and loopback interfaces are rejected too
+  — a DHCP client can never acquire a lease on one, so accepting it
+  would only manufacture a permanently-unresolvable route. That test is
+  a NAME CLASS, `IsTunnelOrLoopbackIfName`, not a raw prefix match
+  (#6731): interface names are wildcard-authorable with no reservation
+  on these prefixes, so `lo`/`st`/`fti`/`gr-`/`ip-` as bare prefixes
+  also matched `login0`, `start0`, `ftime0` and `gr-eenwich` — ordinary
+  data interfaces an operator may legitimately name and run a DHCP
+  client on. Each namespace now uses the same rule the tree uses to
+  RESOLVE a device in it: `st<N>` defers to `IsSecureTunnelIfName`
+  (sharing its if_id range with `XFRMIfNameAndID`, so `st65536` — which
+  yields no xfrmi — is a data interface); `lo<N>`/`fti<N>` require
+  digits; `gr-`/`ip-` require a Junos port path. The injected route then tracks the unit's
   DHCP-learned gateway: the ipmon engine resolves it at every overlay
   computation, and lease events (first lease, gateway change on
   renewal, lease-record removal) re-actuate through the routes-only

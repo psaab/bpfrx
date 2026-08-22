@@ -92,7 +92,7 @@ func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
 		s.lifeMu.Unlock()
 		t.Fatalf("listen: %v", err)
 	}
-	s.httpLeg = s.serveLegLocked(s.httpServer, ln, false, s.httpSlot)
+	s.httpLeg = s.serveLegLocked(s.httpLegPlan(), ln, false)
 	retired := s.httpLeg
 	s.lifeMu.Unlock()
 
@@ -150,7 +150,7 @@ func TestRetiredLegIsNeverDroppedToNoAuth_5561(t *testing.T) {
 		s.lifeMu.Unlock()
 		t.Fatalf("listen: %v", err)
 	}
-	s.httpLeg = s.serveLegLocked(s.httpServer, ln, false, s.httpSlot)
+	s.httpLeg = s.serveLegLocked(s.httpLegPlan(), ln, false)
 	retired := s.httpLeg
 	s.lifeMu.Unlock()
 
@@ -198,7 +198,7 @@ func TestLiveLegFollowsTheServerSnapshot_5561(t *testing.T) {
 		s.lifeMu.Unlock()
 		t.Fatalf("listen: %v", err)
 	}
-	s.httpLeg = s.serveLegLocked(s.httpServer, ln, false, s.httpSlot)
+	s.httpLeg = s.serveLegLocked(s.httpLegPlan(), ln, false)
 	live := s.httpLeg
 	s.lifeMu.Unlock()
 

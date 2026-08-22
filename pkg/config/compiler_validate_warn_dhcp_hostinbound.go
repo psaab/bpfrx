@@ -23,15 +23,27 @@ import (
 // reasons, and the message says which, because an operator who is told the wrong
 // reason will reach for the wrong remedy.
 //
-//   - DHCPv4 (`system services dhcp-local-server`) — xpf renders Kea's Dhcp4
-//     with no `dhcp-socket-type` key (pkg/dhcpserver/dhcpserver.go builds
-//     `interfaces-config` with an `interfaces` list and nothing else), so Kea's
-//     default `raw` applies and the server receives on an AF_PACKET socket.
-//     AF_PACKET delivery happens BEFORE the netfilter input hook, so the
-//     `xpf_hostinbound` chain cannot gate it AT ALL. This is not a
-//     matched-the-wrong-rule case: the packet never reaches the chain. Adding
-//     the token does not change that; it only makes the config stop claiming
-//     otherwise.
+//   - DHCPv4 (`system services dhcp-local-server`) — TWO planes have to be
+//     accounted for, and #7489 corrected this entry because it originally named
+//     only one.
+//
+//     Plane 1, the XDP shim: a client's DISCOVER/REQUEST is addressed to the
+//     255.255.255.255 BROADCAST, and `should_fallback_early`
+//     (userspace-xdp/src/lib.rs) hands `dst_v4 == 0xffff_ffff` straight to the
+//     kernel. So the request never enters the AF_XDP userspace dataplane and
+//     never reaches its host-inbound gate.
+//
+//     Plane 2, netfilter: xpf renders Kea's Dhcp4 with no `dhcp-socket-type`
+//     key (pkg/dhcpserver/dhcpserver.go builds `interfaces-config` with an
+//     `interfaces` list and nothing else), so Kea's default `raw` applies and
+//     the server receives on an AF_PACKET socket. AF_PACKET delivery happens
+//     BEFORE the netfilter input hook, so the `xpf_hostinbound` chain cannot
+//     gate it either.
+//
+//     Both planes are bypassed, so the token really does gate nothing for THIS
+//     traffic — but the reason is the broadcast destination as much as the
+//     socket type, and the two are not interchangeable. See the scope note
+//     below before reusing this argument.
 //
 //   - DHCPv6 (`system services dhcpv6-local-server`) — Kea's Dhcp6 has no raw
 //     mode; it receives on UDP. But a client's Solicit/Request is addressed to
@@ -64,11 +76,30 @@ import (
 // token serves addresses, gateway and DNS to anything on that segment.
 //
 // THE REMEDY IS DELIBERATELY NOT "ADD THE TOKEN". Adding the token silences
-// nothing real on v4 — it cannot, the AF_PACKET tap is upstream of netfilter —
-// so telling the operator to add it as a FIX would be the same false signal in a
-// new place. The message names both moves and labels them: remove the interface
-// from the group (the move that actually stops serving that segment), or add the
-// token to record the intent that the segment IS served.
+// nothing real FOR THE DHCP SERVER'S REQUEST PATH — both planes above are
+// bypassed — so telling the operator to add it as a FIX would be the same false
+// signal in a new place. The message names both moves and labels them: remove
+// the interface from the group (the move that actually stops serving that
+// segment), or add the token to record the intent that the segment IS served.
+//
+// SCOPE, and do not generalise past it (#7489). "The AF_PACKET tap is upstream
+// of netfilter" is an argument about ONE plane and does NOT establish that a
+// host-inbound token is inert for v4 traffic at large. The AF_XDP userspace
+// dataplane enforces host-inbound itself, fail-closed, on the local-delivery
+// path (`host_inbound_gated_lo0_action`, userspace-dp poll_descriptor/filter.rs),
+// and a packet dropped there never reaches the kernel on any device — so
+// AF_PACKET cannot rescue it. MEASURED on the loss userspace cluster: 20
+// unicast datagrams to an interface-mode-SNAT address on a port the arrival
+// zone did not admit produced +22 host-inbound denies and ZERO packets on
+// `tcpdump -ni any`, with a same-host ping (admitted) answering normally.
+//
+// What decides which plane applies is the DESTINATION, not the port: on a
+// session miss the shim steers on address alone (`should_fallback_early`, then
+// `is_local_destination`, which deliberately returns false for an address in
+// `USERSPACE_INTERFACE_NAT_V4` — "the common WAN case"). A broadcast DISCOVER
+// goes to the kernel; a unicast to an interface-mode-SNAT address is redirected
+// into userspace and IS gated. That second case is not this advisory's subject,
+// but the sentence above was being read as covering it.
 //
 // SCOPE. Interfaces only; a group with no interfaces binds nothing. An interface
 // in no zone has no host-inbound dimension and is not reported (the zone lookup
@@ -101,9 +132,11 @@ func validateDHCPServerHostInboundBypassWarnings(cfg *Config) []string {
 			srv:    cfg.System.DHCPServer.DHCPLocalServer,
 			stanza: "dhcp-local-server",
 			token:  "dhcp",
-			whyOpen: "the DHCPv4 server (Kea) receives on an AF_PACKET raw socket, which is " +
-				"delivered BEFORE the netfilter input hook, so the host-inbound chain never " +
-				"sees the request",
+			whyOpen: "a DHCPv4 client addresses the server at the 255.255.255.255 broadcast, " +
+				"which the XDP shim hands to the kernel without entering the userspace " +
+				"dataplane, and Kea then receives it on an AF_PACKET raw socket delivered " +
+				"BEFORE the netfilter input hook — so neither host-inbound plane sees the " +
+				"request",
 		},
 		{
 			srv:    cfg.System.DHCPServer.DHCPv6LocalServer,
