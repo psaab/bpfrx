@@ -1085,10 +1085,12 @@ func resolveIPMonitoringInterfaceNextHop(cfg *Config, polName string, pr *Prefer
 		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q: interface %s has no unit %d",
 			polName, pr.Destination, val, ifdName, unitNum)
 	}
-	if ifc.Tunnel != nil || unit.Tunnel != nil ||
-		strings.HasPrefix(ifdName, "lo") || strings.HasPrefix(ifdName, "st") ||
-		strings.HasPrefix(ifdName, "gr-") || strings.HasPrefix(ifdName, "ip-") ||
-		strings.HasPrefix(ifdName, "fti") {
+	// #6731: the name test is IsTunnelOrLoopbackIfName, not raw prefixes.
+	// `strings.HasPrefix(ifdName, "lo")` also matched `login0`, `"st"` matched
+	// `start0`, `"fti"` matched `ftime0` and `"gr-"` matched `gr-eenwich` — all
+	// ordinary data interfaces an operator may name and run a DHCP client on,
+	// refused here with a message telling them they had named a tunnel.
+	if ifc.Tunnel != nil || unit.Tunnel != nil || IsTunnelOrLoopbackIfName(ifdName) {
 		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q names a tunnel or loopback interface; a DHCP-tracked next-hop requires a broadcast interface unit",
 			polName, pr.Destination, val)
 	}
