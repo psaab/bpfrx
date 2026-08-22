@@ -895,9 +895,10 @@ fn wg_transit_egress_dispatch_specific_peer_no_default_6308() {
 
     // Common case (no regression): a WG transport table WITH a default route
     // resolves tx_ifindex > 0 (the default egress bind ifindex = the physical
-    // WAN parent). The dispatcher takes that verbatim and never consults the
-    // peer-route resolution. Simulate the resolved decision and assert dispatch
-    // returns it unchanged.
+    // WAN parent). In a SINGLE-underlay config the peer route resolves to that
+    // same physical parent, so dispatch is unchanged (#6345 made the peer route
+    // authoritative on this branch too — same NIC, same answer). Simulate the
+    // resolved decision and assert dispatch returns it unchanged.
     let mut default_route_decision = decision;
     default_route_decision.resolution.tx_ifindex = expected_physical_bind;
     assert_eq!(
@@ -1409,3 +1410,85 @@ fn udp6_checksum_locked_value_for_known_frame() {
 /// fixture. Derived from the byte-identical scalar one's-complement
 /// reference; a change here means the on-wire checksum changed.
 const LOCKED_WG_UDP6_CHECKSUM: u16 = 0x3296;
+
+// === #6345: the `tx_ifindex > 0` dispatch branch must ALSO follow the selected
+// peer's physical egress. #6308 fixed only the `tx_ifindex == 0` branch, so a
+// WG transit-egress flow whose transport table DOES carry a default route kept
+// dispatching to the DEFAULT-route parent while `wg_encap_frame` built the
+// outer L2/VLAN/src against the SELECTED PEER's more-specific route (#6306).
+// With one underlay both are the same NIC; with several the frame went out one
+// NIC carrying another segment's source MAC and VLAN. ===
+
+#[test]
+fn wg_transit_egress_dispatch_follows_peer_route_over_tx_ifindex_6345() {
+    let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+    state
+        .wg_engines
+        .insert(1, Arc::new(established_initiator_engine(peer_ep, "10.123.0.0/24")));
+
+    let frame = inner_v4_frame(); // dst 10.123.0.9 ∈ AllowedIPs 10.123.0.0/24
+    let meta = inner_v4_meta();
+
+    // The peer's physical egress: reth0.80 (ifindex 12) → its parent NIC.
+    let peer_bind = state
+        .egress
+        .get(&12)
+        .map(|e| e.bind_ifindex)
+        .expect("reth0.80 egress row present");
+
+    // The multi-underlay shape: the WG transport table also has a DEFAULT route,
+    // and it resolves to a DIFFERENT physical NIC than the peer's specific
+    // route. That is exactly what the stored resolution carries as
+    // `tx_ifindex > 0`.
+    const OTHER_UNDERLAY_BIND: i32 = 77;
+    assert_ne!(
+        peer_bind, OTHER_UNDERLAY_BIND,
+        "premise: the two underlays must be distinguishable"
+    );
+    let mut decision = wg_tunnel_decision(400, 1);
+    decision.resolution.tx_ifindex = OTHER_UNDERLAY_BIND;
+
+    let target = crate::afxdp::forward_request::resolve_forward_target_ifindex(
+        &decision,
+        &state,
+        &frame,
+        meta.addr_family,
+        meta.l3_offset,
+    );
+    assert_eq!(
+        target, peer_bind,
+        "dispatch must target the SELECTED PEER's physical egress ({peer_bind}) —          the same NIC wg_encap_frame builds the outer L2/VLAN/src against"
+    );
+    assert_ne!(
+        target, OTHER_UNDERLAY_BIND,
+        "dispatch followed the DEFAULT-route parent ({OTHER_UNDERLAY_BIND}) while the          frame bytes carry the peer route's egress — the frame leaves one NIC          carrying another segment's source MAC and VLAN (#6345)"
+    );
+}
+
+#[test]
+fn non_wg_forward_keeps_the_tx_ifindex_fast_path_6345() {
+    // Anti-over-reject: #6345 must not change a plain (non-tunnel) forward. The
+    // resolver's first act is `tunnel_endpoint_id == 0 -> None`, so such a flow
+    // still takes `tx_ifindex` verbatim — asserting this pins the fast path a
+    // future refactor could quietly route through the peer resolution.
+    let state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    let frame = inner_v4_frame();
+    let meta = inner_v4_meta();
+
+    let mut decision = wg_tunnel_decision(400, 1);
+    decision.resolution.tunnel_endpoint_id = 0; // a plain forward
+    decision.resolution.tx_ifindex = 77;
+
+    assert_eq!(
+        crate::afxdp::forward_request::resolve_forward_target_ifindex(
+            &decision,
+            &state,
+            &frame,
+            meta.addr_family,
+            meta.l3_offset,
+        ),
+        77,
+        "a non-tunnel forward must take tx_ifindex verbatim"
+    );
+}

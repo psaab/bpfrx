@@ -91,29 +91,29 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 		// Standalone: no session sync, so nothing to poll or drain — but
 		// the helper's DATAPLANE events (RT_FLOW records into the event
 		// buffer) still arrive through these callbacks, so they must be
-		// installed. wireUserspaceEventStreamCallbacks re-reads the cell
-		// every 500 ms until a provider with a stream appears, so an empty
-		// cell here is a retry, not a latch.
+		// installed, and they must STAY installed across a stream
+		// replacement.
 		//
-		// KNOWN GAP (#6743 r2-N5), stated because the sentence above is
-		// true of the FIRST wiring only and reads as if the whole path were
-		// self-correcting. wireUserspaceEventStreamCallbacks RETURNS once
-		// it installs, and this arm returns with it. The re-install on a
-		// REPLACED stream instance — the `es != wired` block r6-F4 added —
-		// lives in eventStreamFallbackLoop, which this path never runs. So
-		// on a standalone (no-cluster) daemon, a commit-confirmed rollback
-		// that closes the armed backend's stream followed by a corrected
-		// re-arm that constructs a new one leaves the replacement stream
-		// with no callbacks: its dataplane events accumulate in the
-		// callback-not-ready queue instead of reaching the event buffer,
-		// until the daemon restarts.
+		// #7017: this arm used to call wireUserspaceEventStreamCallbacks
+		// and RETURN. That helper re-reads the #2114 cell every 500 ms
+		// until a provider with a stream appears, so an empty cell at entry
+		// was a retry rather than a latch — but it returns the moment it
+		// installs, and the arm returned with it. The re-install on a
+		// REPLACED stream instance (the `es != wired` block r6-F4 added)
+		// lived only in eventStreamFallbackLoop, which this path never
+		// runs. So on a standalone daemon, a commit-confirmed rollback that
+		// closes the armed backend's stream followed by a corrected re-arm
+		// that constructs a new one left the replacement with no callbacks:
+		// its dataplane events accumulated in the callback-not-ready queue
+		// instead of reaching the event buffer, and RT_FLOW records stopped
+		// reaching `show log`, syslog and the flow exporter for the rest of
+		// the process's life. Only a restart recovered.
 		//
-		// This is PRE-EXISTING in shape — the clustered path had the same
-		// hole before r6-F4 and this arm was never converted — and is left
-		// alone here rather than fixed blind: the fix is either to run a
-		// stream-watch loop on this path too or to hoist the re-install
-		// into the wiring helper, and both want their own binder.
-		d.wireUserspaceEventStreamCallbacks(ctx)
+		// watchUserspaceEventStreamCallbacks keeps the same 500 ms cadence
+		// and the same first-wire behaviour, but never returns: it applies
+		// the fallback loop's `es != wired` re-install on every tick, which
+		// is the asymmetry #7017 names.
+		d.watchUserspaceEventStreamCallbacks(ctx)
 		return
 	}
 
@@ -184,6 +184,47 @@ func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context) *dpusers
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// watchUserspaceEventStreamCallbacks keeps the callbacks installed on
+// WHATEVER stream instance the #2114 cell currently publishes, for as long as
+// ctx lives. It is the standalone (no-cluster) counterpart of the
+// eventStreamFallbackLoop re-install: same 500 ms cadence as
+// wireUserspaceEventStreamCallbacks, same `es != wired` predicate as the
+// clustered loop, minus the session-sync drain work there is nothing to do on
+// this path.
+//
+// #7017: the clustered path was fixed for a REPLACED stream in #6743 r6-F4
+// and this arm was never converted, so it wired once and returned. A
+// commit-confirmed rollback tears the armed backend's stream down
+// (pkg/dataplane/userspace/process.go) and the corrected re-arm constructs a
+// NEW one; without this loop that replacement never got SetOnEvent /
+// SetOnFullResync / the dataplane-event callback, and every helper event from
+// that point sat in the callback-not-ready queue.
+//
+// Installing is idempotent per instance: the guard is instance IDENTITY, so a
+// stream that has not been replaced is never re-wired and the callbacks are
+// not reinstalled on every tick.
+func (d *Daemon) watchUserspaceEventStreamCallbacks(ctx context.Context) {
+	var wired *dpuserspace.EventStream
+	for {
+		var es *dpuserspace.EventStream
+		if provider, ok := d.currentEventStreamProvider(); ok {
+			es = provider.EventStream()
+		}
+		if es != nil && es != wired {
+			d.installEventStreamCallbacks(es)
+			if wired != nil {
+				slog.Info("userspace: event stream replaced (rollback/re-arm), callbacks re-installed")
+			}
+			wired = es
+		}
+		select {
+		case <-ctx.Done():
+			return
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
