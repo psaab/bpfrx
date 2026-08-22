@@ -215,15 +215,36 @@ func (m *Manager) rebuildMonitoredIfindexes() {
 // entries (FAILED/INCOMPLETE/none). For force-probe target
 // collection we want only the entries the dataplane is actually
 // using, so we walk neighborIndex (publishable-only).
+// #5250 (A6-b2 F1): fn is invoked AFTER m.mu is released. The previous form
+// held the Manager lock across the callback, so a callback that re-entered any
+// Manager method self-deadlocked (m.mu is a plain sync.Mutex, not reentrant)
+// and any slow callback — the force-probe path issues netlink per target —
+// blocked every control-socket operation that needs m.mu for its whole
+// duration. Snapshotting first bounds the critical section to the map walk.
+//
+// The snapshot is a point-in-time copy: an entry evicted between the walk and
+// the callback is still delivered. That is the same staleness the caller
+// already tolerated (it acted on entries after the walk moved past them) and is
+// harmless for the force-probe consumer, whose worst case is one probe to a
+// neighbor that just left the table.
 func (m *Manager) ForEachSnapshotNeighbor(fn func(ifindex int, ip net.IP)) {
+	type neighborTarget struct {
+		ifindex int
+		ip      net.IP
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	targets := make([]neighborTarget, 0, len(m.neighborIndex))
 	for k, n := range m.neighborIndex {
 		ip := net.ParseIP(n.IP)
 		if ip == nil {
 			continue
 		}
-		fn(k.ifindex, ip)
+		targets = append(targets, neighborTarget{ifindex: k.ifindex, ip: ip})
+	}
+	m.mu.Unlock()
+
+	for _, t := range targets {
+		fn(t.ifindex, t.ip)
 	}
 }
 
