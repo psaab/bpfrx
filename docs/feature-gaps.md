@@ -455,7 +455,29 @@ xpf uses strongSwan for IPsec. Basic certificate-auth IKE generation exists, but
 
 ## 14. Routing Enhancements
 
-xpf has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet6.0` IPv6 static routes, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
+**`routing-options rib <name>` scoping (#7512).** Static routes are implemented
+in the IPv4 and IPv6 unicast tables only — bare `inet.0` / `inet6.0` at the top
+level, and `<instance>.inet.0` / `<instance>.inet6.0` inside a routing instance.
+A route scoped to any OTHER table is **not installed**, and the commit now says
+so: `validateUnhandledRibWarnings` emits a WARN naming the rib and how many
+routes were discarded.
+
+Before #7512 the compiler matched only the inet6 tables and every other rib name
+fell through with no branch and no `else`, so `rib inet.0 { static { route
+0.0.0.0/0 { next-hop ...; } } }` — the ordinary Junos way to scope IPv4 statics,
+and the natural thing to write beside a `rib inet6.0` block — compiled to
+NOTHING, committed clean and emitted no warning. An operator authoring the
+symmetric pair got their IPv6 default route and silently lost the IPv4 one, with
+`show configuration` rendering the stanza back verbatim.
+
+The warning is deliberately WARN and not reject: `rib inet.2` is valid Junos that
+xpf does not implement, and a box may already hold a committed config containing
+one, so rejecting at strict commit would fail the tolerant load / peer-sync of a
+config the running node itself accepted (#1960). A warning reaches both paths, so
+no `lenient*` opt is required. Only ribs that actually carried routes are
+reported — an empty `rib foo { }` loses nothing and stays silent.
+
+xpf has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet.0` / `rib <name>.inet6.0` static routes (both families; `inet.0` was silently discarded before #7512 — see below), and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
 
 **IPIP tunnels are NOT supported (#4785).** This section previously claimed
 "IPIP tunnels (IPv4+IPv6)"; that was never true of the forwarding path. The

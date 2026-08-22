@@ -298,3 +298,57 @@ func validateRibGroupLeakWarnings(cfg *Config) []string {
 	}
 	return warnings
 }
+
+// validateUnhandledRibWarnings reports every `routing-options rib <name>` whose
+// static routes the compiler discarded (#7512).
+//
+// Before #7512 the rib loop matched only the inet6 tables and every other name
+// fell through with no branch and no else, so `rib inet.0 { static { route
+// 0.0.0.0/0 { next-hop ...; } } }` compiled to nothing, committed clean and said
+// nothing. `inet.0` is now implemented; this warning covers the REST of the
+// class — `inet.2`, `inet.3`, a typo'd `ient.0`, any future table name — so an
+// unimplemented rib announces itself instead of blackholing.
+//
+// WARN, NOT REJECT, and the choice is the #1960 no-brick split rather than
+// timidity. `rib inet.2 { static { ... } }` is valid Junos that xpf does not
+// implement, and a box may already have committed one: rejecting it at strict
+// commit would fail the tolerant load / peer-sync of a config the running node
+// itself accepted. A warning reaches BOTH paths (ValidateConfig runs for each),
+// so no lenient* opt is required — the same reason the #3226 host-inbound parity
+// advisories are warnings.
+//
+// Only ribs that actually carried routes are recorded, so this cannot fire on an
+// empty `rib foo { }`.
+func validateUnhandledRibWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var out []string
+	report := func(scope string, ribs []UnhandledRib) {
+		for _, r := range ribs {
+			plural := "routes"
+			if r.Routes == 1 {
+				plural = "route"
+			}
+			out = append(out, fmt.Sprintf(
+				"%srouting-options rib %q: %d static %s DISCARDED — xpf implements static "+
+					"routes only in the inet.0 and inet6.0 tables, so nothing from this rib "+
+					"reaches the forwarding plane. The commit succeeds and `show configuration` "+
+					"renders the stanza back verbatim, so the loss is visible only here: move "+
+					"these routes to `rib inet.0` / `rib inet6.0` (or a bare `static` block) if "+
+					"they are meant to forward traffic.",
+				scope, r.Name, r.Routes, plural))
+		}
+	}
+	report("", cfg.RoutingOptions.UnhandledRibs)
+	// RoutingInstances is an ordered SLICE, so the report order is already
+	// deterministic and must not be re-sorted: the instances render in
+	// configured order everywhere else.
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		report(fmt.Sprintf("routing-instance %q ", ri.Name), ri.UnhandledRibs)
+	}
+	return out
+}
