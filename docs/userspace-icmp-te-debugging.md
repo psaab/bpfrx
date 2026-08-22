@@ -231,8 +231,12 @@ KEY writer MUST match:
   `maps_session.go` (`ClearAllSessions`), `pkg/grpcapi/server_sessions.go`,
   `pkg/cli/cli_clear.go` — routes through these builders so a delete finds
   what an install wrote.
-- **Go** static-DNAT config (`compiler_nat.go`) writes the already-host-order
+- **Go** static-DNAT config (`compiler_nat.go`) wrote the already-host-order
   `dstPort` raw (dropped the `htons()` that produced a network-order key).
+  That compiler-side `dnat_table` write is GONE as of #6420 — it was a
+  `return nil` on the production shim — so the session-derived builders in
+  `session_store.go` are now the only Go writers of a `dnat_table` key, and
+  they are what the parity test below binds.
 
 The KEY `DstIP` stays in network byte order (the shim reads it with
 `from_ne_bytes` against `octets()` — already-matching on both sides). The
