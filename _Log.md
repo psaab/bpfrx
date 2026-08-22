@@ -1,3 +1,22 @@
+## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
+
+- **Timestamp**: 2026-08-22
+- **Action**: `xpf-deploy.py fetch` with no `--version` now resolves
+  `<base>/<channel>/latest.json`, minisign-verifies it against the
+  pinned image pubkey, and flows the resolved version through the
+  EXISTING path (#5992 filename validation, watermark, per-file
+  verification, import) — an entry point, not a second trust path. The
+  pointer is AUTHENTICATED, not trusted: a signed pointer naming
+  `../../etc/cron.d/x` is still refused by the filename gate, and a
+  `stable` pointer mis-synced into `edge/` is refused on the channel
+  field (the same key signs every channel, so it verifies perfectly).
+  An ABSENT channel field is accepted — absence is not disagreement.
+  Also corrected docs/distribution.md, whose row stays false if only
+  the code lands, since validate.py is still not a consumer.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_channel_fetch_6504.py,
+  scripts/dist/selftest.sh, docs/distribution.md
+
 ## 2026-08-22 — #6515 host-inbound per-interface override REPLACES the zone stanza
 
 - **Timestamp**: 2026-08-22
