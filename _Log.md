@@ -103313,3 +103313,14 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/rollback_target_appliable_6707_test.go (new),
     pkg/daemon/daemon_apply_commit.go, pkg/daemon/README.md,
     docs/bare-metal-device-map.md
+
+## 2026-08-22 — #6686 as-path multi-token regex
+- **Action**: Fixed `policy-options as-path` reading only the first tail token
+  (unquoted `.* 65000 .*` compiled to `.*`), added the shared
+  `ValidASPathRegex` predicate + strict commit gate + FRR render belt.
+- **File(s)**: `pkg/config/aspath_regex.go` (new),
+  `pkg/config/compiler_routing.go`, `pkg/config/compiler_validate_strict_routing.go`,
+  `pkg/config/compiler_opts.go`, `pkg/config/compiler_uniformgates_log_feed_routing.go`,
+  `pkg/frr/policy_render.go`,
+  `pkg/config/compiler_as_path_multitoken_6686_test.go` (new),
+  `pkg/frr/policy_aspath_regex_6686_test.go` (new), `docs/config-schema.md`

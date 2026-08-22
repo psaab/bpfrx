@@ -249,6 +249,26 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 		sort.Strings(aspNames)
 		for _, name := range aspNames {
 			ap := po.ASPaths[name]
+			// #6686 render-side belt: an as-path whose regex is EMPTY or
+			// not a valid POSIX ERE renders a line FRR rejects — an
+			// incomplete command or a regcomp failure — and a single
+			// CMD_WARNING_CONFIG_FAILED exits the whole vtysh add-batch
+			// non-zero, failing the ENTIRE frr-reload and leaving every
+			// dynamic routing change stale. The strict commit gate
+			// (validatePolicyASPathRegexStrict, pkg/config) hard-rejects
+			// it, but the tolerant load / peer-sync paths only warn (#1960
+			// no-brick), so the renderer must keep a leniently-loaded
+			// definition out of frr.conf entirely. Omitting the list is
+			// strictly better than poisoning the reload: FRR resolves a
+			// `match as-path <name>` with no such list to NO MATCH, which
+			// confines the damage to the terms that reference it. Same
+			// predicate as the commit gate — ValidASPathRegex is shared so
+			// the two cannot drift. Mirrors validRouterID (render_validate.go).
+			if err := config.ValidASPathRegex(ap.Regex); err != nil {
+				slog.Warn("frr: omitting unrenderable as-path access-list",
+					"as_path", name, "reason", err)
+				continue
+			}
 			// #4097: sanitize the regex so an embedded newline cannot
 			// inject an extra frr.conf line — parity with the auth /
 			// description fields. FRR takes the regex as a rest-of-line
