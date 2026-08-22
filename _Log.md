@@ -101149,3 +101149,18 @@ prose edit above them added. No diff falls in the new test body.
   as `unitRunsDHCPForFamily`.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
+
+## 2026-08-21 — #6561 ip-monitoring probe-state wipe on an unrelated commit
+- **Timestamp**: 2026-08-21
+- **Action**: `rpm.Manager.Apply` rebuilt the whole results table from config,
+  seeding every key `LastStatus: "unknown"`, which ipmon reads as PASS — so at
+  the default hold-down of 0 an ACTIVE failover route was withdrawn. The
+  trigger is not an RPM edit: `reconcileRPM`'s hash covers
+  `cfg.RethToPhysical()`, so any RETH-member change reopens the gate. Preserved
+  the runtime half rather than skipping the reconcile: `Apply` snapshots the
+  prior results before `StopAll` and carries a verdict forward when the
+  RESOLVED measurement identity is unchanged. Corrected mid-implementation from
+  an fwmark-based discriminator (the mark is a positional index, not a path
+  identity — it does not move on a RETH remap).
+- **File(s)**: pkg/rpm/rpm.go, pkg/rpm/probe_verdict_carry_6561_test.go (new),
+  pkg/ipmon/README.md, pkg/rpm/README.md, _Log.md
