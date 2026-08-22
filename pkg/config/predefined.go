@@ -261,6 +261,22 @@ func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, e
 	if depth > 3 {
 		return nil, fmt.Errorf("application-set nesting too deep (max 3): %s", name)
 	}
+	// #5250 (A3-b3 F-03): a nil *ApplicationsConfig is substituted with an
+	// EMPTY one rather than rejected. Every production caller passes
+	// &cfg.Applications — the address of a struct field, never nil
+	// (policymatch.go:2021,2197, junos_host_deny.go:813, appid/runtime.go:95) —
+	// so this is defensive hardening, and the same shape as the #5179 /  #5671
+	// present-but-nil VALUE guards in lookupApplicationSet / memberIsNestedSet
+	// one level down. Substituting (rather than erroring) keeps the predefined
+	// Junos bundle table reachable, which is exactly what a caller with no
+	// user-defined applications wants; the three deref sites below
+	// (memberIsNestedSet's two, and lookupApplicationSet's) then see nil MAPS,
+	// which they already handle. Erroring here would instead make
+	// ExpandApplicationSet("junos-cifs", nil) fail on a name that needs no
+	// config at all.
+	if apps == nil {
+		apps = &ApplicationsConfig{}
+	}
 
 	as, ok := lookupApplicationSet(name, apps.ApplicationSets)
 	if !ok {
