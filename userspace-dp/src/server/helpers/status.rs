@@ -453,6 +453,71 @@ pub(crate) fn should_run_afxdp(status: &ProcessStatus) -> bool {
     status.forwarding_armed && status.capabilities.forwarding_supported
 }
 
+/// #6750: the arm / registration bits a control handler is about to overwrite,
+/// so a FAILED reconcile can put them back.
+///
+/// Three handlers — `set_forwarding_state`, `set_binding_state`,
+/// `set_queue_state` — commit the REQUESTED state into `guard.status` and only
+/// then call `reconcile_status_bindings`. #5621/#6135 made the failure honest to
+/// the CALLER (ok=false plus the error, no persist), but the committed state
+/// stayed committed: the helper went on reporting a posture its AF_XDP sockets
+/// had never been reconciled to.
+///
+/// That retention is what suppresses recovery, and the second half is on the Go
+/// side. `syncDesiredForwardingStateLocked` short-circuits on
+/// `if m.lastStatus.ForwardingArmed == desired { return nil }`, and the 1 Hz
+/// status poll feeds `m.lastStatus` straight from the helper
+/// (`applyHelperStatusLocked` -> `recordHelperStatusLocked`). So the poll adopts
+/// the retained "armed" the failed reconcile left behind, the equality then
+/// holds, and the retry that would have fixed it is never sent. The box stays in
+/// the un-reconciled state until something else moves the arm state.
+///
+/// Restoring makes the helper's report TRUE again, which is all automatic
+/// recovery needs: the poll sees the real (still-disarmed) state, the equality
+/// fails, and the next tick retries on its own. No new retry machinery, no
+/// persisted debt.
+pub(crate) struct BindingArmSnapshot {
+    forwarding_armed: bool,
+    /// (slot, registered, armed, last_change) — keyed by SLOT because that is
+    /// how all three handlers address bindings.
+    bindings: Vec<(u32, bool, bool, Option<chrono::DateTime<Utc>>)>,
+}
+
+/// Capture the bits `restore_binding_arm_state` can put back. Cheap: bounded by
+/// the binding count, and only ever called on a control-socket request.
+pub(crate) fn capture_binding_arm_state(status: &ProcessStatus) -> BindingArmSnapshot {
+    BindingArmSnapshot {
+        forwarding_armed: status.forwarding_armed,
+        bindings: status
+            .bindings
+            .iter()
+            .map(|b| (b.slot, b.registered, b.armed, b.last_change))
+            .collect(),
+    }
+}
+
+/// Put back exactly what `capture_binding_arm_state` recorded.
+///
+/// `last_change` is restored too, deliberately. Leaving it advanced would have
+/// the helper advertise a transition that was rolled back — an operator reading
+/// `show` would see a fresh timestamp on a binding whose state never moved, and
+/// the staleness heuristics keyed on it would be reasoning about an event that
+/// did not happen.
+///
+/// A slot that no longer exists is skipped rather than re-created: the
+/// reconcile may have replanned, and resurrecting a slot the current plan does
+/// not contain would be inventing state rather than restoring it.
+pub(crate) fn restore_binding_arm_state(status: &mut ProcessStatus, prior: BindingArmSnapshot) {
+    status.forwarding_armed = prior.forwarding_armed;
+    for (slot, registered, armed, last_change) in prior.bindings {
+        if let Some(binding) = status.bindings.iter_mut().find(|b| b.slot == slot) {
+            binding.registered = registered;
+            binding.armed = armed;
+            binding.last_change = last_change;
+        }
+    }
+}
+
 pub(crate) fn set_bindings_forwarding_armed(status: &mut ProcessStatus, armed: bool) {
     for binding in &mut status.bindings {
         binding.armed = armed && binding.registered;

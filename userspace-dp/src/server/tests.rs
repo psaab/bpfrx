@@ -3815,3 +3815,165 @@ fn report_tick_summary_guard_rejects_the_pre_fix_shape_5189() {
          ever, and would pin no property"
     );
 }
+
+/// #6750: a FAILED reconcile must not leave the requested state committed.
+///
+/// All three control handlers — `set_forwarding_state`, `set_binding_state`,
+/// `set_queue_state` — write the requested arm / registration bits into
+/// `guard.status` and only then call `reconcile_status_bindings`. #5621/#6135
+/// made the failure honest to the CALLER (the cells above assert ok=false plus
+/// the error), but the committed state stayed committed: the helper went on
+/// reporting a posture its AF_XDP sockets had never been reconciled to.
+///
+/// THAT RETENTION IS WHAT SUPPRESSES RECOVERY, and the second half is on the Go
+/// side. `syncDesiredForwardingStateLocked` short-circuits on
+/// `if m.lastStatus.ForwardingArmed == desired { return nil }`, and the 1 Hz
+/// status poll feeds `m.lastStatus` straight from the helper
+/// (`applyHelperStatusLocked` -> `recordHelperStatusLocked`, maps_sync.go). So
+/// the poll adopts the retained "armed" the failed reconcile left behind, the
+/// equality then holds, and the retry that would have fixed it is never sent.
+///
+/// Restoring is all automatic recovery needs: the helper reports the truth, the
+/// equality fails, the next tick retries. No new retry machinery, no persisted
+/// debt — which is why this is the narrow fix rather than the desired/applied
+/// split the issue also offers.
+///
+/// Each cell pairs the ok=false assertion with a STATE assertion, because the
+/// two are independent: #5621 already delivers the first, and it is exactly the
+/// combination "honest to the caller, dishonest in the status" that made this
+/// survive the earlier fix.
+#[test]
+fn failed_forwarding_reconcile_restores_the_prior_arm_state_6750() {
+    // Start DISARMED so the request is a real transition and the rollback is
+    // observable: a fixture that was already armed could not tell "restored"
+    // from "never changed".
+    let state = Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus {
+            forwarding_armed: false,
+            capabilities: forwarding_caps(),
+            bindings: vec![BindingStatus {
+                slot: 0,
+                registered: true,
+                armed: false,
+                ifindex: 10,
+                ..BindingStatus::default()
+            }],
+            ..ProcessStatus::default()
+        },
+        snapshot: Some(failing_reconcile_snapshot()),
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    let mut request = req("set_forwarding_state");
+    request.forwarding = Some(ForwardingControlRequest { armed: true });
+    let response = run_request(state.clone(), request);
+
+    assert!(!response.ok, "premise: the reconcile must have failed");
+    assert!(
+        response.error.contains("forwarding reconcile failed"),
+        "premise: unexpected error {}",
+        response.error
+    );
+
+    let guard = state.lock().expect("state");
+    assert!(
+        !guard.status.forwarding_armed,
+        "the helper still reports forwarding_armed=true after a reconcile that \
+         FAILED. Go's 1 Hz poll adopts that into m.lastStatus, its \
+         `lastStatus.ForwardingArmed == desired` short-circuit then holds, and \
+         the retry that would reconcile the sockets is never sent — the box \
+         stays un-reconciled indefinitely (#6750)",
+    );
+    assert!(
+        !guard.status.bindings[0].armed,
+        "the per-binding arm bit was left committed after a failed reconcile",
+    );
+}
+
+/// #6750 for `set_binding_state`: the registration bit must roll back too.
+#[test]
+fn failed_binding_reconcile_restores_the_prior_registration_6750() {
+    let state = armed_state_with_failing_reconcile(vec![BindingStatus {
+        slot: 0,
+        registered: false,
+        armed: false,
+        ifindex: 10,
+        ..BindingStatus::default()
+    }]);
+    let mut request = req("set_binding_state");
+    request.binding = Some(BindingControlRequest {
+        slot: 0,
+        registered: true,
+        armed: true,
+    });
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok, "premise: the reconcile must have failed");
+
+    let guard = state.lock().expect("state");
+    assert!(
+        !guard.status.bindings[0].registered,
+        "slot 0 still reports registered=true after a reconcile that FAILED — the \
+         helper is advertising a binding its sockets never took (#6750)",
+    );
+    assert!(!guard.status.bindings[0].armed, "the arm bit was left committed too");
+}
+
+/// #6750 for `set_queue_state`, which mutates EVERY binding on the queue — so
+/// the rollback has to be per-slot, not a single scalar.
+#[test]
+fn failed_queue_reconcile_restores_every_binding_on_the_queue_6750() {
+    let state = armed_state_with_failing_reconcile(vec![
+        BindingStatus {
+            slot: 0,
+            queue_id: 2,
+            registered: false,
+            armed: false,
+            ifindex: 10,
+            ..BindingStatus::default()
+        },
+        BindingStatus {
+            slot: 1,
+            queue_id: 2,
+            registered: false,
+            armed: false,
+            ifindex: 11,
+            ..BindingStatus::default()
+        },
+        // A binding on a DIFFERENT queue: untouched by the request, and it must
+        // stay untouched by the rollback. Without it, "restore what changed"
+        // and "stamp the whole table back to some baseline" look the same.
+        BindingStatus {
+            slot: 2,
+            queue_id: 7,
+            registered: true,
+            armed: true,
+            ifindex: 12,
+            ..BindingStatus::default()
+        },
+    ]);
+    let mut request = req("set_queue_state");
+    request.queue = Some(QueueControlRequest {
+        queue_id: 2,
+        registered: true,
+        armed: true,
+    });
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok, "premise: the reconcile must have failed");
+
+    let guard = state.lock().expect("state");
+    for slot in [0usize, 1] {
+        assert!(
+            !guard.status.bindings[slot].registered,
+            "slot {slot} on the requested queue still reports registered=true after \
+             a FAILED reconcile (#6750)",
+        );
+        assert!(!guard.status.bindings[slot].armed, "slot {slot} arm bit left committed");
+    }
+    assert!(
+        guard.status.bindings[2].registered && guard.status.bindings[2].armed,
+        "the binding on the UNTOUCHED queue was rolled back too — the restore \
+         must put back what THIS request changed, not stamp a baseline over the \
+         whole table",
+    );
+}
