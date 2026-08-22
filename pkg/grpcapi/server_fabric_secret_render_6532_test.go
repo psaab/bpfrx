@@ -114,7 +114,8 @@ var fabricSecretSentinels = []string{
 // Parameterized (prefix:) topics carry a representative argument.
 var showTextAuditTopics = []string{
 	"address-book", "alarms", "alg", "application-identification-status",
-	"applications", "backup-router", "bfd-peers", "buffers", "buffers-detail",
+	"applications", "backup-router", "bfd-peers", "bootstrap-import",
+	"buffers", "buffers-detail",
 	"chassis", "chassis-cluster", "chassis-cluster-control-plane-statistics",
 	"chassis-cluster-data-plane-fairness", "chassis-cluster-data-plane-flows",
 	"chassis-cluster-data-plane-interfaces", "chassis-cluster-data-plane-statistics",

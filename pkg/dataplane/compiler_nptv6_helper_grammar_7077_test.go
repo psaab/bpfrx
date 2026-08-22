@@ -162,19 +162,21 @@ func TestNPTv6HelperWouldInstallPairsLengths_7077(t *testing.T) {
 	}
 }
 
-// countingNPTv6DP embeds discardingDataPlane (keeping the xpfValidationPass
-// marker and the never-write override set) and counts the NPTv6 writes, so a
-// test can tell "the row ran and skipped the rule" from "the row ran and
-// installed it".
-type countingNPTv6DP struct {
-	discardingDataPlane
-	nptv6Writes int
-}
-
-func (c *countingNPTv6DP) SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error {
-	c.nptv6Writes++
-	return nil
-}
+// #7268 retired compileNPTv6's eBPF nptv6_rules writes, so the write COUNTER
+// this file used to carry (countingNPTv6DP.nptv6Writes) is gone.
+//
+// A counter can only observe a call that HAPPENS. Once the call is deleted a
+// count-based assertion is vacuous by construction, not merely weaker — and
+// `nptv6Writes != 0` would have kept passing for the wrong reason forever. The
+// replacement is the #6420 tripwire, natWriteTripwireDP, with SetNPTv6Rule and
+// DeleteStaleNPTv6 armed to ERROR: the assertion inverts to "a clean validate",
+// which a restored write reds by propagating its error out of the `nptv6` row.
+//
+// What the counter USED to distinguish — "the row ran and skipped the rule"
+// from "the row ran and installed it" — is no longer a distinction the compiler
+// makes: after #7268 the row only ever validates. The property that replaced it
+// is the DISPOSITION, which every test here already asserts directly: nil for a
+// rule the helper installs, a `validate nptv6: ` error for one it refuses.
 
 // nptv6GrammarConfig is a config carrying ONE NPTv6 rule with the given
 // prefixes, on a zone with a VLAN sub-interface so that -- absent an early
@@ -217,16 +219,17 @@ func TestHelperAcceptedNPTv6PrefixIsSkippedNotRejected_7077(t *testing.T) {
 
 	// It must be SKIPPED, not silently installed under a masked prefix: the Go
 	// compiler cannot parse the string at all, so there is nothing correct for
-	// it to write.
-	dp := &countingNPTv6DP{}
+	// it to write. Post-#7268 there is no write to count, so the tripwire says
+	// it from the other side — a reintroduced write ERRORS and the row fails.
+	dp := &natWriteTripwireDP{validationPass: true}
 	if err := validateBeforeMutateWith(dp, cfg); err != nil {
-		t.Fatalf("validateBeforeMutateWith disagreed with validateBeforeMutate: %v", err)
+		t.Fatalf("validateBeforeMutateWith disagreed with validateBeforeMutate, or a "+
+			"retired NPTv6 map write was reintroduced for a prefix Go cannot parse: %v", err)
 	}
-	if dp.nptv6Writes != 0 {
-		t.Errorf("compileNPTv6 wrote %d NPTv6 entries for a prefix Go cannot "+
-			"parse — the disposition is warn-and-SKIP; writing would install a "+
-			"rule derived from a string the compiler never decoded",
-			dp.nptv6Writes)
+	if len(dp.calls) != 0 {
+		t.Errorf("compileNPTv6 called %v for a prefix Go cannot parse — the "+
+			"disposition is warn-and-SKIP, and the eBPF nptv6_rules surface is "+
+			"retired (#7268)", dp.calls)
 	}
 
 	// And the whole compile must proceed into the mutation phase, i.e. the
@@ -286,15 +289,34 @@ func TestHelperRefusedNPTv6PrefixStillHardErrors_7077(t *testing.T) {
 // must be neither skipped nor rejected. Without it, both tests above are
 // satisfied by a compileNPTv6 that never writes anything.
 func TestValidNPTv6StillCompiles_7077(t *testing.T) {
-	dp := &countingNPTv6DP{}
+	dp := &natWriteTripwireDP{validationPass: true}
 	if err := validateBeforeMutateWith(dp, nptv6GrammarConfig("2602:fd41:70::/48", "fd00:beef::/48")); err != nil {
 		t.Fatalf("a valid NPTv6 rule must compile: %v", err)
 	}
-	// One inbound + one outbound entry.
-	if dp.nptv6Writes != 2 {
-		t.Errorf("a valid NPTv6 rule wrote %d entries, want 2 (inbound + "+
-			"outbound) — the fixture stopped reaching compileNPTv6's writer, so "+
-			"the skip assertions above prove nothing", dp.nptv6Writes)
+	if len(dp.calls) != 0 {
+		t.Errorf("a valid NPTv6 rule called %v — the eBPF nptv6_rules surface is "+
+			"retired (#7268); the helper builds its own NPTv6 state from the "+
+			"config and computes its own adjustment", dp.calls)
+	}
+
+	// FIXTURE REACHABILITY, which the deleted `nptv6Writes == 2` control used to
+	// provide. Without it every assertion in this file is satisfied by a
+	// nptv6GrammarConfig that stopped producing an NPTv6 rule at all — the row
+	// would find nothing to judge and return nil for the wrong reason.
+	//
+	// The same builder, one prefix changed to a class the helper REFUSES, must
+	// produce the row's hard error. That is only possible if the config reaches
+	// compileNPTv6's per-rule body, so it certifies the fixture for the accept
+	// case above — and unlike a write counter, it survives the writes going away.
+	refused := nptv6GrammarConfig("2602:fd41:70::/48", "not-a-prefix")
+	err := validateBeforeMutateWith(&natWriteTripwireDP{validationPass: true}, refused)
+	if err == nil {
+		t.Fatal("the fixture no longer reaches compileNPTv6's per-rule body: a prefix " +
+			"the helper refuses produced no error, so the accept assertions above " +
+			"prove nothing")
+	}
+	if !strings.Contains(err.Error(), "invalid nptv6-prefix") {
+		t.Errorf("want the reachability probe to fail in the nptv6 row, got: %v", err)
 	}
 }
 

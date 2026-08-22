@@ -64,25 +64,50 @@ var ifaceIndexByName = func(name string) (int, error) {
 // differ from the unit number), collapses unit 0 onto the bare parent, and
 // preserves the st<N>/IRB/tunnel special cases — strictly more correct than the
 // old RethToPhysical + LinuxIfName(base) path that dropped the unit suffix.
-// An unresolvable interface is logged and skipped (best-effort, matching the
-// reconcile's posture). Extracted so the resolution stays unit-testable
-// independently of the netlink install (regression guard against dropping the
-// per-netdev resolution in the apply-path extraction).
-func proxyARPIfaceMap(cfg *config.Config) map[string]int {
-	ifaceMap := make(map[string]int)
+// Extracted so the resolution stays unit-testable independently of the netlink
+// install (regression guard against dropping the per-netdev resolution in the
+// apply-path extraction).
+//
+// It returns three things:
+//   - byJunos: the Junos interface name → ifindex map the dataplane reconcile
+//     consumes;
+//   - names: the reverse ifindex → Linux netdev name mapping, handed to
+//     ReconcileProxyARP as the #6536 fallback for the responder-sysctl keys
+//     when netlink cannot resolve the ifindex back to a link;
+//   - unresolved: the Linux netdev names of CONFIGURED entries whose ifindex
+//     did not resolve at all.
+//
+// #6536: unresolved is the debt channel. A name in it is still configured for
+// proxy-arp — the reconcile simply could not find its kernel identity this
+// pass — so the caller must NOT let it fall out of the enabled set, where the
+// #2475 teardown diff would read the absence as "proxy-arp was removed from
+// this interface" and write the responder sysctl to 0 on a live interface.
+// Before #6536 the resolution failure was logged and dropped, and those two
+// conditions were indistinguishable to every downstream consumer.
+func proxyARPIfaceMap(cfg *config.Config) (byJunos map[string]int, names map[int]string, unresolved []string) {
+	byJunos = make(map[string]int)
+	names = make(map[int]string)
+	seenUnresolved := make(map[string]bool)
 	for _, entry := range cfg.Security.NAT.ProxyARP {
-		if _, ok := ifaceMap[entry.Interface]; ok {
+		if _, ok := byJunos[entry.Interface]; ok {
 			continue
 		}
 		linuxName := cfg.ResolveKernelIfName(entry.Interface)
 		idx, err := ifaceIndexByName(linuxName)
 		if err != nil {
-			slog.Warn("proxy-arp: interface not found", "iface", entry.Interface, "linux", linuxName, "err", err)
+			slog.Warn("proxy-arp: interface not found; retaining its responder state as debt "+
+				"for the next reconcile rather than tearing it down",
+				"iface", entry.Interface, "linux", linuxName, "err", err, "issue", "#6536")
+			if !seenUnresolved[linuxName] {
+				seenUnresolved[linuxName] = true
+				unresolved = append(unresolved, linuxName)
+			}
 			continue
 		}
-		ifaceMap[entry.Interface] = idx
+		byJunos[entry.Interface] = idx
+		names[idx] = linuxName
 	}
-	return ifaceMap
+	return byJunos, names, unresolved
 }
 
 // priorProxyARPIfaceMap resolves the interfaces proxy-arp was installed on by a
@@ -151,15 +176,17 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 
 	priorIfaceMap := priorProxyARPIfaceMap(priorNames)
 	ifaceMap := map[string]int{}
+	ifaceNames := map[int]string{}
+	var unresolved []string
 	if hasEntries {
-		ifaceMap = proxyARPIfaceMap(cfg)
+		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMap(cfg)
 	}
 
 	// Always run the reconcile: even with zero configured entries it sweeps the
 	// orphaned NTF_PROXY entries on the prior interfaces (desired is empty
 	// there, so every entry found is stale and deleted) and returns a non-nil
 	// enabled set so the diff below tears down the sysctl.
-	added, enabled, err := proxyARPApplyFn(cfg, ifaceMap, priorIfaceMap)
+	added, enabled, err := proxyARPApplyFn(cfg, ifaceMap, priorIfaceMap, ifaceNames)
 	if err != nil {
 		slog.Warn("failed to reconcile proxy ARP", "err", err)
 	}
@@ -170,7 +197,14 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	// proxy_ndp knob leaks on across the config removal until reboot. The diff
 	// is computed under proxyARPEnabledMu so the apply path and the always-on
 	// re-assert loop cannot race the remembered state.
+	//
+	// #6536: an interface whose kernel identity did not resolve this pass is
+	// still CONFIGURED, so it is carried forward into the enabled set BEFORE
+	// the diff. Without that carry-forward the absence reads as "proxy-arp was
+	// removed from this interface" and the diff disables a live responder —
+	// and the interface is forgotten, so the #4955 orphan sweep loses it too.
 	d.proxyARPEnabledMu.Lock()
+	enabled = retainUnresolvedProxyResponders(enabled, d.proxyARPEnabled, unresolved)
 	stale := diffProxyResponders(d.proxyARPEnabled, enabled)
 	d.proxyARPEnabled = enabled
 	d.proxyARPEnabledMu.Unlock()
@@ -188,6 +222,49 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 			}
 		}
 	}
+}
+
+// retainUnresolvedProxyResponders carries the PRIOR responder state of every
+// interface in unresolved forward into the freshly-enabled set (#6536).
+//
+// unresolved holds the Linux netdev names of interfaces that are STILL
+// configured for proxy-arp but whose ifindex did not resolve on this pass. The
+// reconcile therefore could not enable (or even name) their responder, so they
+// are absent from enabled — the same shape a removed interface has. Feeding
+// that absence to diffProxyResponders would disable the responder sysctl on an
+// interface the operator still has configured, and drop it from the remembered
+// state so no later pass could ever tear it down. Retaining the prior families
+// keeps the interface as debt: the next reconcile that CAN resolve it either
+// re-asserts it (still configured) or, once it really leaves the config, tears
+// it down through the normal diff.
+//
+// An unresolved interface with no prior state contributes nothing: there is no
+// responder to preserve and nothing was forgotten. enabled is returned
+// unmodified in that case, and is never aliased to prior.
+func retainUnresolvedProxyResponders(enabled, prior map[string]map[int]struct{}, unresolved []string) map[string]map[int]struct{} {
+	for _, iface := range unresolved {
+		priorFams := prior[iface]
+		if len(priorFams) == 0 {
+			continue
+		}
+		if _, ok := enabled[iface]; ok {
+			// Resolved after all through another config entry — the fresh
+			// state wins over the retained one.
+			continue
+		}
+		if enabled == nil {
+			enabled = make(map[string]map[int]struct{}, 1)
+		}
+		retained := make(map[int]struct{}, len(priorFams))
+		for family := range priorFams {
+			retained[family] = struct{}{}
+		}
+		enabled[iface] = retained
+		slog.Warn("proxy-arp: retaining the responder state of a still-configured interface "+
+			"whose ifindex did not resolve; not disabling it",
+			"iface", iface, "issue", "#6536")
+	}
+	return enabled
 }
 
 // diffProxyResponders returns the (interface name → families) entries that

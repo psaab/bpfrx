@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
@@ -232,6 +233,24 @@ func (c *CLI) showCoreDumps() error {
 	if !found {
 		fmt.Println("No core dumps found")
 	}
+	return nil
+}
+
+// showBootstrapImport renders the day-0 / bootstrap config-import outcome
+// (#4184) recorded at boot — the answer to "why didn't my day-0 config apply?"
+// (#6496).
+//
+// Before this the outcome existed only in the loopback /health JSON, so the
+// operator standing at a fresh box in this very CLI had to know to leave it
+// and curl 127.0.0.1:8080/health. It renders through pkg/bootstrapshow, the
+// same implementation the gRPC ShowText path uses, so the console and the
+// remote `cli` cannot disagree about the same recorded fact.
+func (c *CLI) showBootstrapImport() error {
+	snap := bootstrapshow.Snapshot{}
+	if c.bootstrapImportFn != nil {
+		snap = c.bootstrapImportFn()
+	}
+	bootstrapshow.Render(os.Stdout, snap)
 	return nil
 }
 
@@ -1074,6 +1093,9 @@ func (c *CLI) handleShowSystem(args []string) error {
 
 	case "core-dumps":
 		return c.showCoreDumps()
+
+	case "bootstrap-import":
+		return c.showBootstrapImport()
 
 	case "license":
 		fmt.Println("License: open-source (no license required)")

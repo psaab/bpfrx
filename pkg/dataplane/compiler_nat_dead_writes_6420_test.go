@@ -31,10 +31,14 @@ var errNATWriteTripwire = errors.New("retired eBPF NAT map writer was called (#6
 
 // natWriteTripwireDP is the pre-pass shim with every RETIRED NAT writer armed.
 //
-// SetNPTv6Rule / DeleteStaleNPTv6 are deliberately NOT armed: compileNPTv6
-// still writes the legacy nptv6_rules surface, and retiring it is the sibling
-// cleanup, not this one. Arming them here would red on live code and disguise
-// the property under test.
+// #7268 armed SetNPTv6Rule / DeleteStaleNPTv6 too. They were held out of #6420
+// because compileNPTv6 still wrote the legacy nptv6_rules surface, so arming
+// them would have red on live code. That write is gone, and arming them here is
+// what replaces the write-COUNT assertions the NPTv6 tests used to carry: a
+// count can only observe a call that happens, so once the call is deleted a
+// count-based guard is vacuous by construction rather than merely weaker. The
+// tripwire inverts it — a restored write propagates its error out of the phase
+// and reds, naming the method.
 //
 // GetPersistentNAT is likewise not armed: it is the one dataplane call in
 // compiler_nat.go that is NOT a shim no-op on the live userspace path (the
@@ -109,6 +113,14 @@ func (d *natWriteTripwireDP) SetNAT64Count(uint32) error { return d.trip("SetNAT
 // The stale-entry sweepers return nothing, so they cannot fail the compile.
 // They are recorded instead: a reintroduced sweep is still a record the
 // userspace runtime does not read, and `calls` is asserted EMPTY below.
+func (d *natWriteTripwireDP) SetNPTv6Rule(NPTv6Key, NPTv6Value) error {
+	return d.trip("SetNPTv6Rule")
+}
+
+func (d *natWriteTripwireDP) DeleteStaleNPTv6(map[NPTv6Key]bool) {
+	d.record("DeleteStaleNPTv6")
+}
+
 func (d *natWriteTripwireDP) DeleteStaleSNATRules(map[SNATKey]bool) {
 	d.record("DeleteStaleSNATRules")
 }

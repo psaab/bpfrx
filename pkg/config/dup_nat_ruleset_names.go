@@ -70,7 +70,9 @@ type dupNATRuleSet struct {
 // #1960) warns and keeps the historical two-table behavior.
 //
 // A duplicate authored ENTIRELY inside an applied group body is NOT caught here —
-// see the group-authored deferral note in dup_names_6455.go (#6455 Finding 1).
+// this gate is pre-expansion by design; it is caught by
+// validateDuplicateNamesExpandedAST (dup_names_expanded_6455.go, #6455
+// Finding 1), which re-runs THIS function on a group-expanded clone.
 func validateDuplicateNATRuleSetNamesAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	if tree == nil {
 		return nil, nil
