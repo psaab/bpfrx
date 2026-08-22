@@ -67,8 +67,8 @@ pub(in crate::afxdp) fn zone_host_inbound_from_snapshot(zone: &ZoneSnapshot) -> 
 /// Shared by the zone-level path ([`zone_host_inbound_from_snapshot`]) and the
 /// per-interface OVERRIDE path (`InterfaceSnapshot.host_inbound_*`), so the two
 /// classify identically. The interface-level token set carried on the wire is
-/// already the EFFECTIVE union (zone ∪ interface) computed in Go, so this just
-/// classifies it as-is.
+/// already the EFFECTIVE set computed in Go — the interface stanza REPLACES the
+/// zone one (#6515) — so this just classifies it as-is.
 pub(in crate::afxdp) fn zone_host_inbound_from_tokens(
     services: &[String],
     protocols: &[String],
@@ -719,7 +719,8 @@ pub(in crate::afxdp) fn host_inbound_admits(
 /// #3362: per-packet host-inbound admit keyed by INGRESS INTERFACE first. When
 /// the ingress interface carries a per-interface host-inbound OVERRIDE
 /// (`state.ifindex_host_inbound`), the packet is matched against that interface's
-/// EFFECTIVE admission set (zone ∪ interface, pre-unioned in Go); otherwise it
+/// EFFECTIVE admission set (resolved in Go: the interface stanza REPLACES the
+/// zone one, #6515); otherwise it
 /// falls back to the zone-keyed [`host_inbound_admits`]. The global
 /// ICMP/PMTUD/ND accept (#3171) is applied first in BOTH branches so error / ND
 /// delivery is never broken by a scoped override. This is the entry point the

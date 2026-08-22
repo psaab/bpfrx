@@ -100554,3 +100554,49 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
   pkg/daemon/daemon_ha_sync.go,
   pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md
+
+## 2026-08-21 — #6515: host-inbound interface stanza REPLACES the zone stanza
+- **Timestamp**: 2026-08-21
+- **Action**: The zone-level and per-interface `host-inbound-traffic` sets were
+  UNIONed and asserted in-tree as "Junos additive semantics", so an interface
+  stanza could only ever WIDEN admission. Junos replaces
+  ("Interface configuration overrides that of the zone"). Added
+  `config.EffectiveHostInboundTokens` as the SSOT for the zone↔interface choice
+  (presence of the stanza, not emptiness — an explicit empty stanza is a
+  deny-all override) and routed all four resolvers through it: the display view
+  (`InterfaceHostInboundEffective`), the dataplane/nft builder
+  (`effectiveHostInboundTokens`, renamed from `unionHostInboundTokens`), the
+  #3718 duplicate-address commit gate (`effectiveHostInboundSigLocal`), and the
+  remote CLI projection. `UnionHostInboundTokens` is retained for the
+  WITHIN-level merges (#3720 physical∪unit, #4544 repeated blocks). Added the
+  migration advisory `validateHostInboundOverrideReplaceWarnings` naming every
+  (zone, interface, lost token) triple at commit-check, and corrected every
+  in-tree comment/doc asserting the union, including the .proto (regenerated).
+- **File(s)**: pkg/config/host_inbound_view.go, pkg/config/types_security.go,
+  pkg/config/schema_security.go, pkg/config/dup_host_local_address.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_warn_host_inbound.go,
+  pkg/dataplane/userspace/zones_override.go,
+  pkg/dataplane/userspace/zones_host_inbound.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/protocol.go, pkg/cli/cli_show_interfaces.go,
+  pkg/api/types.go, pkg/api/README.md, pkg/policymatch/policymatch.go,
+  cmd/cli/show_security.go, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/xpf.pb.go (regenerated),
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound_tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  docs/host-inbound-service-matrix.md, docs/host-inbound-multicast.md,
+  docs/junos-cli-reference.md, docs/config-schema.md,
+  pkg/config/host_inbound_replace_6515_test.go (new),
+  pkg/dataplane/userspace/host_inbound_replace_6515_test.go (new),
+  cmd/cli/zone_hostinbound_replace_6515_test.go (new),
+  pkg/config/host_inbound_view_3654_test.go,
+  pkg/config/host_inbound_fulladmit_warn_3226_test.go,
+  pkg/dataplane/userspace/host_inbound_per_iface_3362_test.go,
+  pkg/dataplane/userspace/host_inbound_baseunit0_5699_test.go,
+  pkg/dataplane/userspace/host_inbound_view_grouping_3721_test.go,
+  pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go

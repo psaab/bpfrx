@@ -92,24 +92,38 @@ func Test_5579_IngressInterfaceScopesToTruePosture(t *testing.T) {
 	}
 }
 
-// Test_5579_IngressInterfaceUnionWithZoneLevel asserts the interface-scoped
-// classifier honors the zone-level ∪ per-interface UNION (Junos additive
-// semantics): a zone-level `ping` plus reth0.50's `ssh` override admits ssh on
-// reth0.50, while reth1.0 admits only the zone-level ping and denies ssh.
-func Test_5579_IngressInterfaceUnionWithZoneLevel(t *testing.T) {
+// Test_5579_IngressInterfaceReplacesZoneLevel asserts the interface-scoped
+// classifier resolves the zone↔interface levels the way enforcement does: a
+// zone-level `ping` with reth0.50's `ssh` override admits ssh and DENIES ping on
+// reth0.50, while reth1.0 — which declares no stanza — admits the zone-level ping
+// and denies ssh.
+//
+// #6515: this asserted the UNION before, and the ping-on-reth0.50 case was the
+// one it never sampled — the old body claimed in a comment that reth0.50 "admits
+// ssh AND ping" but only ever queried tcp/22 there. A fixture that varies the
+// right axis and samples only the passing point cannot discriminate the two
+// combination rules, so it passed unchanged when the semantics flipped under it.
+// All four (interface × service) cells are queried now.
+func Test_5579_IngressInterfaceReplacesZoneLevel(t *testing.T) {
 	cfg := hostInboundCfg3362()
 	cfg.Security.Zones["wan"].HostInboundTraffic = &config.HostInboundTraffic{SystemServices: []string{"ping"}}
 
-	// reth1.0 admits the zone-level ping (icmp echo type 8) but denies ssh.
+	// reth1.0 declares no stanza: it admits the zone-level ping (icmp echo
+	// type 8) and denies ssh.
 	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth1.0", uint8(1), true, 0, u8ptr(8), "ip"); a.Status != HostInboundTokenAdmit || a.Token != "ping" {
 		t.Errorf("reth1.0 icmp echo = %v/%q, want token-admit/ping (zone-level)", a.Status, a.Token)
 	}
 	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth1.0", hi5579TCP, true, 22, nil, "ip"); a.Status != HostInboundDenied {
 		t.Errorf("reth1.0 tcp/22 = %v, want denied (ssh only on reth0.50)", a.Status)
 	}
-	// reth0.50 admits ssh (override) AND ping (zone-level union).
+	// reth0.50 declares `ssh`: it admits ssh and NO LONGER inherits the zone's
+	// ping, because its stanza replaces the zone stanza (#6515).
 	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth0.50", hi5579TCP, true, 22, nil, "ip"); a.Status != HostInboundTokenAdmit || a.Token != "ssh" {
 		t.Errorf("reth0.50 tcp/22 = %v/%q, want token-admit/ssh", a.Status, a.Token)
+	}
+	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth0.50", uint8(1), true, 0, u8ptr(8), "ip"); a.Status != HostInboundDenied {
+		t.Errorf("reth0.50 icmp echo = %v/%q, want DENIED: the interface stanza lists only "+
+			"ssh and REPLACES the zone-level ping (#6515)", a.Status, a.Token)
 	}
 }
 

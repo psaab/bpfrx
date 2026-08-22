@@ -7194,9 +7194,10 @@ reserved for whole-dataplane selection where a rewrite shim
   the pre-#4544 read). Flat-set `SetPath` and `load merge` (FormatSet round-trip)
   both merge two same-key lines onto ONE node, so — like every entry in this
   cluster — the fail-open was reachable ONLY via the hierarchical `NewParser` /
-  `LoadOverride` shape. Distinct from the #3362/#3720 union, which merges
-  host-inbound authored at DIFFERENT granularities (zone ∪ physical ∪ unit);
-  #4544 merges repeated blocks at the SAME granularity. Regression coverage:
+  `LoadOverride` shape. Distinct from the #3362/#3720/#6515 resolution, which
+  combines host-inbound authored at DIFFERENT granularities (`physical ∪ unit`,
+  then REPLACING the zone level); #4544 merges repeated blocks at the SAME
+  granularity. Regression coverage:
   `pkg/config/host_inbound_dup_block_4544_test.go` (zone + interface two-block
   merge, cross-block dedup, single-block byte-identical guard — built with
   `NewParser` for the `LoadOverride` shape); operator doc:

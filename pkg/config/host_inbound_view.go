@@ -15,29 +15,28 @@ import (
 // (#3405). Routing all six through this one presenter keeps them from drifting
 // again and mirrors the structured REST/gRPC contract (#3328/#3405/#3653):
 // every configured zone is host-inbound ENFORCING, and the EFFECTIVE admission
-// set for an interface is the UNION of the zone-level set and its interface
-// override (Junos additive semantics).
+// set for an interface is its interface-level `host-inbound-traffic` stanza when
+// it declares one, otherwise the zone-level set (#6515 — Junos REPLACE
+// semantics; see EffectiveHostInboundTokens).
 
-// UnionHostInboundTokens returns the effective host-inbound token set for the
-// combination of a zone-level list and a per-interface override list: the
-// zone-level tokens first in their authored order, then any override-only
-// tokens, with empties skipped and exact-duplicate tokens collapsed. This is
-// the display-side peer of the dataplane's unionHostInboundTokens
-// (dataplane/userspace/zones_override.go); it preserves the authored token case
-// so the text surfaces show tokens exactly as the structured API does (the
-// dataplane path lower-cases for map keying, a concern that does not apply to
-// display — every membership predicate that consumes this, notably
-// HostInboundFullAdmitService, is case-insensitive).
+// UnionHostInboundTokens returns the order-preserving union of two host-inbound
+// token lists: a's tokens first in their authored order, then any of b's not
+// already present, with empties skipped and exact-duplicate tokens collapsed. It
+// preserves the authored token case so the text surfaces show tokens exactly as
+// the structured API does (the dataplane path lower-cases for map keying, a
+// concern that does not apply to display — every membership predicate that
+// consumes this, notably HostInboundFullAdmitService, is case-insensitive).
+// Called with a nil second argument it is a normalizer (trim + dedup).
 //
-// #3226 fold: the COMMIT-TIME ADVISORIES (compiler_validate_warn.go) also
-// consume this. Junos host-inbound is ADDITIVE across the zone and interface
-// levels, so this union — not the raw stanza — is the object enforcement acts
-// on, and an advisory that reasons about anything else will contradict it. It
-// did: a zone-level `any-service` with a per-interface `rpm` warned that rpm
-// traffic was DENIED even though the union full-admits it, and `any-service`
-// alongside `all` in one stanza emitted "everything is admitted" and "ports are
-// now denied" together. Those were symptoms of the two views diverging, so the
-// fix is to share the union rather than special-case each pair.
+// SCOPE (#6515). This unions tokens authored at the SAME level. It is NOT how
+// the zone level and the interface level combine: an interface stanza REPLACES
+// the zone stanza — see EffectiveHostInboundTokens, which every zone-to-interface
+// resolution must route through. Two live callers union within one level:
+//   - the #3720 physical→unit resolution in InterfaceHostInboundEffective and in
+//     the dataplane's buildInterfaceHostInboundMap, where a physical-interface
+//     override and a unit-level override on the same unit are both
+//     "interface-level" statements;
+//   - #4544 repeated `host-inbound-traffic { }` blocks under one stanza.
 func UnionHostInboundTokens(zone, iface []string) []string {
 	seen := make(map[string]bool, len(zone)+len(iface))
 	out := make([]string, 0, len(zone)+len(iface))
@@ -54,6 +53,48 @@ func UnionHostInboundTokens(zone, iface []string) []string {
 	add(zone)
 	add(iface)
 	return out
+}
+
+// EffectiveHostInboundTokens returns the EFFECTIVE host-inbound token set for one
+// interface, given the zone-level list, that interface's own list, and whether
+// the interface declares a `host-inbound-traffic` stanza at all. It is the SSOT
+// for the zone↔interface combination; every surface that resolves an interface's
+// admission — the kernel nft enforcement view builder, the per-interface
+// classifier, the commit-time advisories, the duplicate-host-address commit gate,
+// and all six display surfaces — must route through it or through a wrapper that
+// delegates to it, or they will describe different firewalls.
+//
+// REPLACE, not union (#6515). Junos: "You can configure these parameters at the
+// zone level, in which case they affect all interfaces of the zone, or at the
+// interface level. (Interface configuration overrides that of the zone.)"
+// — Security Zones, security-zone-configuration. So the zone-level stanza governs
+// exactly the interfaces that declare NO stanza of their own; an interface that
+// declares one is described entirely by it, and the zone's tokens do not reach it.
+//
+// The flag is presence, NOT emptiness: an explicit `host-inbound-traffic { }` on
+// an interface is a deny-all override and must not fall back to the zone set.
+// parseHostInboundNode already distinguishes the two (a present-but-empty stanza
+// compiles to a non-nil empty struct, an absent one to nil).
+//
+// GRANULARITY. The whole stanza replaces, not each leaf: an interface stanza that
+// declares only `protocols` also drops the zone's `system-services`. That is the
+// literal reading of the sentence above, and the community consensus states it
+// the same way ("if you configure anything under specific interface level, then
+// zone-specific configuration doesn't apply to this interface anymore"). No
+// vendor text was found describing a per-leaf inheritance, so none is invented
+// here — see docs/host-inbound-service-matrix.md.
+//
+// Before #6515 this combination was a UNION, asserted in-tree as "Junos additive
+// semantics". An interface stanza could then only WIDEN admission and never
+// narrow it: a zone admitting `protocols ospf` with an interface stanza admitting
+// only `ping` still admitted OSPF on that interface, where Junos denies it. The
+// migration this flip imposes on configs that relied on the union is named at
+// commit by validateHostInboundOverrideReplaceWarnings.
+func EffectiveHostInboundTokens(zone, iface []string, overridden bool) []string {
+	if overridden {
+		return UnionHostInboundTokens(iface, nil)
+	}
+	return UnionHostInboundTokens(zone, nil)
 }
 
 // HostInboundDenyReason returns the parenthetical explaining WHY a zone or
@@ -74,12 +115,13 @@ func HostInboundDenyReason(overridden, zoneConfigured bool) string {
 }
 
 // InterfaceHostInboundEffective returns the EFFECTIVE host-inbound admission set
-// for a single interface ref in the zone: the UNION of the zone-level set and
-// the per-interface override for ref (if any). overridden reports whether ref
-// declares its own host-inbound-traffic stanza (#3362). Used by the
-// interface-scoped surfaces (`show interfaces`, `test security-zone interface`,
-// gRPC interface diagnostic) which must show the effective set for ONE
-// interface rather than iterate the whole zone.
+// for a single interface ref in the zone: the per-interface override for ref when
+// ref declares one (#6515 replace semantics — see EffectiveHostInboundTokens),
+// otherwise the zone-level set. overridden reports whether ref declares its own
+// host-inbound-traffic stanza (#3362). Used by the interface-scoped surfaces
+// (`show interfaces`, `test security-zone interface`, gRPC interface diagnostic)
+// which must show the effective set for ONE interface rather than iterate the
+// whole zone.
 func (z *ZoneConfig) InterfaceHostInboundEffective(ref string) (svc, proto []string, overridden bool) {
 	var zoneSvc, zoneProto []string
 	if z != nil && z.HostInboundTraffic != nil {
@@ -89,9 +131,11 @@ func (z *ZoneConfig) InterfaceHostInboundEffective(ref string) (svc, proto []str
 	if z == nil {
 		return UnionHostInboundTokens(zoneSvc, nil), UnionHostInboundTokens(zoneProto, nil), false
 	}
-	// #3720 (H05): the per-interface override is ADDITIVE across the physical and
-	// the unit level, exactly as the dataplane resolves it in
-	// buildInterfaceHostInboundMap. For a logical-unit ref (contains "."), a
+	// #3720 (H05): the physical and the unit level are BOTH "interface level", so
+	// the override for a unit is the UNION of the two, exactly as the dataplane
+	// resolves it in buildInterfaceHostInboundMap. (#6515 replaces the ZONE level
+	// with this result; it does not change how the two interface-level statements
+	// combine with each other.) For a logical-unit ref (contains "."), a
 	// physical-interface-level override on its parent IN THIS ZONE also applies,
 	// so the diagnostic must UNION it. Before #3720 this read only the exact ref,
 	// so `show interfaces <unit>` reported "no override / default-deny" while the
@@ -113,13 +157,14 @@ func (z *ZoneConfig) InterfaceHostInboundEffective(ref string) (svc, proto []str
 	if !overridden {
 		return UnionHostInboundTokens(zoneSvc, nil), UnionHostInboundTokens(zoneProto, nil), false
 	}
-	return UnionHostInboundTokens(zoneSvc, ovSvc), UnionHostInboundTokens(zoneProto, ovProto), true
+	return EffectiveHostInboundTokens(zoneSvc, ovSvc, true),
+		EffectiveHostInboundTokens(zoneProto, ovProto, true), true
 }
 
 // InterfaceHostInboundView is a single per-interface host-inbound override
 // (#3362) projected for display: the interface-local override tokens plus the
-// EFFECTIVE (zone-level UNION override) admitted set that actually reaches the
-// host on that interface.
+// EFFECTIVE admitted set that actually reaches the host on that interface —
+// which post-#6515 IS the override, the zone-level set having been replaced.
 type InterfaceHostInboundView struct {
 	Interface               string
 	SystemServices          []string
@@ -203,8 +248,9 @@ func (z *ZoneConfig) hostInboundViewBase() HostInboundView {
 		}
 		// SystemServices/Protocols show the tokens authored on THIS ref; the
 		// effective set is resolved through InterfaceHostInboundEffective so a
-		// unit ref also folds in a physical-parent override (#3720 H05) — the
-		// same additive resolution the dataplane enforces.
+		// unit ref also folds in a physical-parent override (#3720 H05) and the
+		// zone level is then REPLACED by the result (#6515) — the same
+		// resolution the dataplane enforces.
 		effSvc, effProto, _ := z.InterfaceHostInboundEffective(ref)
 		v.Interfaces = append(v.Interfaces, InterfaceHostInboundView{
 			Interface:               ref,
@@ -221,8 +267,10 @@ func (z *ZoneConfig) hostInboundViewBase() HostInboundView {
 // ONE interface ref in the zone (#3654 H06/H08 — the per-interface admission
 // diagnostic), one line per slice element with NO trailing newline. It shows
 // the zone-level admitted set and, when ref declares its own
-// host-inbound-traffic override, both a marker and the EFFECTIVE (zone UNION
-// interface) admitted set for that interface. A default-deny posture line is
+// host-inbound-traffic override, both a marker and the EFFECTIVE admitted set for
+// that interface (post-#6515 the override REPLACES the zone-level set, so the
+// effective set can be NARROWER than the zone line printed above it). A
+// default-deny posture line is
 // emitted when the effective set is empty, so a blank section cannot be misread
 // as "not enforced".
 //
