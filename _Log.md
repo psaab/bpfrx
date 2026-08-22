@@ -1,3 +1,36 @@
+## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
+
+- **Timestamp**: 2026-08-22
+- **Action**: Wrote the validator and wired `keyValidator` onto the interfaces
+  wildcard — and the WIRING TEST FAILED, which is why it existed. `keyValidator`
+  never reached a wildcard identity slot at all: `walkSchemaNode` validates
+  `Keys[1:1+args]`, and a wildcard's identity is `Keys[0]` with args 0, so the
+  span was empty. No wildcard in the schema carried a keyValidator, so the gap
+  had no instance. Corrected my own earlier triage claim that "the mechanism
+  already exists" — true for `<keyword> <arg>` slots, false for wildcards.
+  Hoisted the exactness predicate that was open-coded for the scalar-value-leaf
+  rule into one `exactMatch` local read by both sites, rather than adding a
+  second copy that could drift.
+  Verified the pointer-equality precondition instead of assuming it: 0 schema
+  nodes register a child that IS their wildcard, across 1464 nodes. Kept as a
+  permanent tripwire — and then gave the tripwire a POSITIVE CONTROL after a
+  mutation showed it could not red (there is nothing to detect today, so
+  breaking its comparison changed nothing). The detector is now bound by a
+  planted alias.
+  Two harness lessons paid for in this issue. A mutation that reddened via
+  `declared and not used` with vet rc 1 was DISCARDED and re-run with the
+  variable kept live. And an uncommitted edit was EATEN by the harness's
+  `git checkout -- pkg/` restore; re-applied and committed before mutating,
+  which is the rule I already knew and did not follow.
+  Character class only, no length bound — the repo carries a 17-char fixture
+  and IFNAMSIZ applies to the DERIVED name.
+  M1-M5 + M7 RED with vet 0 at every mutated state; M1 deletes the CALL from
+  the production path and M5 is the reject-everything control.
+- **File(s)**: `pkg/config/schema_walk.go`, `pkg/config/schema_interfaces.go`,
+  `pkg/config/validate_interface_name.go` (new),
+  `pkg/config/validate_interface_name_6834_test.go` (new),
+  `docs/config-schema.md`
+
 ## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
 
 - **Timestamp**: 2026-08-22
