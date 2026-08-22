@@ -1,3 +1,45 @@
+## 2026-08-21 — #6612 junos-host residual: audited the claim, found it false, locked what holds
+
+- **Timestamp**: 2026-08-21
+- **Action**: Audited #6612's closing claim — "each affected policy
+  emits the #4168 commit warning naming itself" — against the real
+  compile+validate path rather than the prose. It is FALSE for one
+  member: a `to-zone junos-host` permit narrowed on DESTINATION (or
+  carrying `destination-address-excluded`) renders no kernel rule AND
+  emits ZERO warnings of any kind, so the commit is clean and nothing
+  enforces. The projection already marks it un-representable
+  (`junosHostProjectTerm`), but the warning's
+  `junosHostPolicyStricterThanCoarseGate` admits a permit only through
+  `junosHostPolicySourceScoped`, which inspects the SOURCE dimension
+  alone; the two halves disagree. The one-clause fix (key the warning on
+  the same `junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded` expression the projection uses) lands in
+  pkg/config, outside this lane's file surface, so it is handed over
+  rather than applied here and #6612 stays open for it. Also corrected a
+  second error shared by the issue and the module doc: a PURE multi-term
+  application is NOT un-representable — it compiles to an implicit
+  application-SET and is fully OR-expanded, so the deny IS enforced and
+  the real hazard is the inverse (a partial expansion renders a kernel
+  deny silently narrower than authored); only a MIXED direct+term
+  application is un-representable, and the strict structure gate rejects
+  that at commit. Shipped a residual coverage lock: one row per class,
+  each asserting BOTH halves and each carrying a FLIP (the same fixture
+  with the residual attribute neutralised) so no row can pass because a
+  fixture was broken some other way. Four one-line mutations against the
+  production gates, each `go vet` clean and each reddening only its own
+  row: scheduler gate, ALG gate, application-set expansion truncated to
+  its first member, and the destination-scoped-permit gate. The fourth
+  found a defect in this lane's own first draft — a lone
+  destination-scoped permit renders nothing whether or not the gate
+  exists, so the test as first written was mutation-INSENSITIVE; it was
+  rebuilt around a permit ahead of a DENY, which is the only shape in
+  which the gate changes a packet verdict, and now reds. Filed #7374 for
+  the third dimension (an APPLICATION-scoped permit, same silent shape),
+  deliberately not folded in because it needs a comparison against the
+  zone's effective admit set rather than a token test.
+- **File(s)**: `pkg/dataplane/userspace/junos_host_residual_6612_test.go`
+  (new), `docs/host-inbound-service-matrix.md`
+
 ## 2026-08-21 — #6656 transfer-out override cleared on peer loss
 
 - **Timestamp**: 2026-08-21
