@@ -193,9 +193,16 @@ func (s *SessionSync) bulkSyncWindow(walk *bulkWalk) error {
 		"queue_len", len(s.sendCh),
 		"queue_cap", cap(s.sendCh))
 
-	// Send bulk start marker with epoch.
+	// Send bulk start marker with epoch, plus this node's boot incarnation
+	// (#5084). The payload grows 8 -> 24 bytes as a length-gated trailing
+	// extension: an old receiver reads payload[:8] and ignores the tail, which
+	// is the same #2170 discipline the delete frames use. BulkStart is the
+	// carrier because the prime IS the claim event — the incarnation arrives in
+	// the frame that declares it current, so no connection is ever installed
+	// with an unknown incarnation.
+	startPayload := appendBootIncarnation(epochBuf[:], localBootIncarnation())
 	s.writeMu.Lock()
-	err := writeMsg(conn, syncMsgBulkStart, epochBuf[:])
+	err := writeMsg(conn, syncMsgBulkStart, startPayload)
 	s.writeMu.Unlock()
 	if err != nil {
 		s.pendingBulkAckEpoch.Store(0)

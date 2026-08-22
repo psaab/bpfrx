@@ -103428,3 +103428,24 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_slowpath_reinject_7409_test.go,
   pkg/dataplane/userspace/protocol_binding.go,
   docs/userspace-dataplane-architecture.md
+
+## 2026-08-22 — #5084 peer boot incarnation on the config-sync wire
+- **Action**: Stamped every queued `configApplyItem` with the peer BOOT
+  INCARNATION (`/proc/sys/kernel/random/boot_id`) carried as a length-gated
+  8→24 byte extension of the `syncMsgBulkStart` payload, and dropped a queued
+  payload whose incarnation a re-prime has replaced. Fixes a queued prior-boot
+  config applying after `resetRecvGen`, recording a dead incarnation's
+  generation as the high-water, and then refusing the rebooted peer's
+  lower-generation current config permanently. Compared for EQUALITY only (the
+  #6900 post-mortem: a ranking cannot express "same peer boot?"). Fails OPEN on
+  an absent incarnation, counts both halves, renders the incarnation + counters
+  in cluster status, and raises NO health/alarm state. The ~20s half-open-socket
+  residual is shipped bounded and documented, not closed. Two drop sites, neither
+  redundant: at RECEIVE (before recordRecvConfigGen, so a dead boot's high
+  generation cannot inflate the #5563 readiness mark and wedge the standby
+  config-stale) and at APPLY (the already-queued payload, the reported defect).
+- **File(s)**: `pkg/cluster/sync_boot_incarnation.go` (new),
+  `pkg/cluster/sync_boot_incarnation_5084_test.go` (new),
+  `pkg/cluster/sync.go`, `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_bulk.go`,
+  `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
+  `pkg/cluster/status.go`, `docs/sync-protocol.md`

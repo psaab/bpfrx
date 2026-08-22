@@ -38,7 +38,7 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 | 2    | SessionV6        | Primary→Secondary | length-gated        | Create/update IPv6 session |
 | 3    | DeleteV4         | Primary→Secondary | 16 or 24 bytes      | Delete IPv4 session |
 | 4    | DeleteV6         | Primary→Secondary | 40 or 48 bytes      | Delete IPv6 session |
-| 5    | BulkStart        | Primary→Secondary | 0                   | Marks start of bulk transfer |
+| 5    | BulkStart        | Primary→Secondary | 8 or 24 bytes       | Marks start of bulk transfer: 8B epoch, plus the sender's 16B boot incarnation (#5084) when it has one |
 | 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
 | 8    | Config           | Primary→Secondary | Variable (UTF-8) + 16B gen framing | Full config text + monotonic config generation (#3931) |
@@ -781,6 +781,155 @@ apply and the invalidators, completing the reconcile/finalization the tail error
 left unfinished — rather than the pre-#4957 behavior where the fast path returned
 nil and advanced the mark over a config the dataplane never finished applying.
 
+## Peer boot incarnation (#5084)
+
+Config generations are comparable **only within one sender boot**.
+`initGenState` seeds `configGenCounter` from `CLOCK_MONOTONIC` nanos, so a
+daemon restart within a boot produces a strictly HIGHER seed (still comparable)
+while an OS reboot restarts the clock and produces a LOWER one (not comparable).
+
+Before #5084 the ordered apply queue (`configApplyCh`, cap 64) held only
+`{gen, text}`. When the peer rebooted and re-primed, `resetRecvGen` zeroed the
+generation high-waters but did **not** drain items already queued from the prior
+boot. A queued prior-boot payload could then apply after the reset, record its
+(large, pre-reboot) generation as the high-water, and the rebooted peer's
+lower-generation CURRENT config was refused as stale from then on — persistent
+HA policy/routing divergence.
+
+**The guard is an EQUIVALENCE, never a ranking.** PR #6900 tried a floor over
+the per-connection `syncConnID` counter and failed across seven review rounds: a
+total order over connections cannot express "were these two payloads produced by
+the same peer boot?". A floor that never descends locks out a live
+same-incarnation sibling that merely connected earlier; a floor that descends
+re-admits departed older-incarnation connections. The full post-mortem is on
+#5084 and in `docs/peer-boot-incarnation-plan.md`.
+
+### The field
+
+`/proc/sys/kernel/random/boot_id` — a 128-bit UUID the kernel regenerates at
+each OS boot, stable for that boot, unchanged by a daemon restart. That is
+exactly the granularity at which `CLOCK_MONOTONIC` restarts, so it is forced by
+the generation seed, not chosen. It is **compared for equality only**; ordering
+two boot ids is the mistake #6900 made.
+
+It rides in the `syncMsgBulkStart` payload as a length-gated trailing extension
+(8 → 24 bytes), the same #2170 discipline the delete frames use. `BulkStart` is
+the carrier because the prime IS the claim event: the incarnation arrives in the
+frame that declares it current, so no connection is ever installed with an
+unknown incarnation. The auth `HELLO` was rejected as a carrier —
+`performSyncHandshake` returns immediately when the cluster is unkeyed, so a
+HELLO-carried incarnation would be silently absent on unkeyed clusters.
+
+### Receiver rules
+
+- A `BulkStart` whose incarnation **differs** from the current one switches the
+  namespace: the generation high-waters clear (`resetRecvGen`, which already
+  fired here) and the new incarnation is recorded.
+- A `BulkStart` carrying the **same** incarnation is a mid-connection re-prime
+  (the #5450 forced resync) and invalidates nothing — same boot, comparable
+  generations.
+- A config payload whose incarnation differs from the current one is dropped
+  **permanently** and is never re-admitted. Because membership is an
+  equivalence, the dropped payload's generation carries no information the
+  current high-water needs, so the drop cannot strand the mark the way #6900's
+  fence could.
+- A payload with **no** incarnation is never dropped on incarnation grounds.
+
+There are **two** drop sites and neither subsumes the other:
+
+- **At receive** (`handleConfigPayload`), before `recordRecvConfigGen`. The
+  received-config high-water is a monotone max that gates manual-failover
+  readiness (#5563 refuses promotion while `PeerConfigGen > AppliedConfigGen`),
+  and a dead incarnation's generation comes from the peer's PRE-reboot counter,
+  so it is higher than anything the live incarnation can produce. Letting it
+  raise the received mark would strand the standby reading config-stale with
+  nothing able to close the gap short of another re-prime.
+- **At apply** (`configApplyLoop`), before the generation gate. This is the one
+  that catches a payload already sitting in `configApplyCh` when the re-prime
+  landed — the reported defect, since `resetRecvGen` does not drain the queue.
+
+In the `BulkStart` handler the incarnation is recorded **before**
+`resetRecvGen`. Reversing them opens a window where the high-waters are already
+zeroed while the current incarnation is still the dead one, so a prior-boot
+payload dequeued in that window passes the fence and records its generation.
+
+### Fail-open across the mixed-version window
+
+`len(payload) < 24` ⇒ no incarnation ⇒ exactly today's generation-only
+ordering. This is the same legacy-sentinel convention the package already uses
+(`gen == 0`, `epoch == 0`, `incarnation == 0 || seq == 0`), and the fallback is
+`origin/master`'s behaviour rather than a weakened version of it. Failing
+**closed** would refuse ALL config from a not-yet-upgraded peer for the whole
+rolling-upgrade window, stranding the standby on stale config — strictly worse
+than the bug being fixed. It is not a security decision: the incarnation is not
+an authorisation token and grants nothing; the authentication boundary is the
+PSK handshake and the frame HMAC, both untouched.
+
+No capability negotiation exists, and that is the point — presence is decided
+per-frame by payload length, so there is no handshake round to get wrong.
+Upgrade order does not matter:
+
+| receiver | sender | outcome |
+|---|---|---|
+| old | old | today's behaviour |
+| old | new | 24-byte `BulkStart`; old receiver reads `payload[:8]`, ignores the tail |
+| new | old | 8-byte `BulkStart`; no incarnation; today's behaviour |
+| new | new | full #5084 guard |
+
+A node whose own `boot_id` is unreadable appends **nothing** rather than 16 zero
+bytes, so it presents as an un-incarnated (old-build) sender rather than as a
+distinct boot that changes on every read.
+
+**Contingency, recorded deliberately:** if a future requirement demands that an
+un-incarnated peer be REFUSED, that forces either a flag day or making the keyed
+handshake mandatory — an upgraded receiver cannot distinguish "old peer that
+cannot send the field" from "peer suppressing the field" without a negotiated
+capability, and a negotiated capability has nowhere to live on the unkeyed path.
+Both are decisions well outside #5084.
+
+### Observability — a status field and counters, NOT a health state
+
+A silent fail-open is how a half-upgraded cluster hides, so both halves are
+counted and rendered by `show chassis cluster information`:
+
+- `Peer boot incarnation: <hex>|none` — rendered **always**, including `none`,
+  because `none` is the operationally interesting value and a line that
+  disappears in exactly that case would hide it.
+- `Primes without incarnation: N` — the fail-open fallback is active.
+- `Configs dead-incarnation-dropped: N` — the fence did its job.
+
+Plus one `slog.Warn` per CONNECTION (not per frame) when a peer primes without
+an incarnation.
+
+This deliberately does **not** raise a cluster health annotation or alarm state.
+An un-incarnated peer is the expected steady state of a rolling upgrade, not a
+fault; raising health for it would make every upgrade look degraded, and a
+stale-incarnation discard is an expected event during a peer reboot. #6387 set
+the precedent in the other direction by making a config-sync APPLY FAILURE
+diagnostic-only so it never gates failover — a less severe condition must not be
+louder.
+
+### Known residual — shipped BOUNDED, not closed
+
+A pre-reboot socket that is half-open and has not yet errored can still hold a
+buffered `BulkStart` from the DEAD incarnation. If it lands after the new
+incarnation primed, the namespace switches BACK, and config from the live
+incarnation is dropped until the next prime re-switches it.
+
+The window is bounded by the receive loop rather than by luck: `receiveLoop`
+arms a 10s read deadline and gives up at `missedHeartbeats >= 2`, so such a
+socket self-evicts within **~20s** of silence — and an OS reboot, the only thing
+that changes an incarnation, outlasts that window, which makes the frame hard to
+produce at all. It is self-healing: the peer re-pushes its current config on the
+reconnect that follows, and every drop is counted in
+`ConfigsDeadIncarnationDropped` and rendered in status.
+
+Closing it rather than bounding it means a receiver-local strictly-increasing
+"namespace claim ordinal" bumped on each switch, with a switch refused from a
+connection whose slot is no longer installed. That is deliberately out of scope:
+it is the same add-an-ordering instinct that produced #6900, and it should be
+added against a demonstrated failure, not pre-emptively.
+
 ## Full-set state-sync ordering (#5706)
 
 IPsec SA sync (type 9) and DHCP-server lease sync (types 25/26) are **full-set
@@ -1154,6 +1303,8 @@ All counters are `atomic.Uint64` / `atomic.Bool`, lock-free:
 | ConfigsSent/Received | Config sync messages |
 | ConfigsStaleIgnored | Config messages dropped by the #3931 ordering guard (incoming generation not strictly newer than last-applied) |
 | ConfigsApplyFailed | Config messages admitted by the ordering guard but whose apply did NOT take effect (compile/promote failure or a transient RG0-primary rejection). The high-water is left unadvanced so the peer's re-push re-converges the standby (M-2/#4151) |
+| BulkPrimesWithoutIncarnation | `BulkStart` frames received carrying no boot incarnation (#5084) — a peer on a pre-#5084 build, or a peer whose own `boot_id` was unreadable. The incarnation fence is in its fail-open state against that peer; expected during a rolling upgrade, and NOT a health/alarm state |
+| ConfigsDeadIncarnationDropped | Config payloads dropped because the boot incarnation they arrived under has been replaced by a re-prime (#5084) — a queued prior-boot config that would otherwise apply across the reset and strand the generation high-water. Expected once per peer reboot that races a queued config; a persistently rising counter means the peer is flapping |
 | IPsecSASent/Received | IPsec SA list messages |
 | IPsecSAStaleIgnored | IPsec SA full-sets dropped by the #5706 ordering guard (incoming `(incarnation, seq)` not strictly newer — a reorder across the redundant fabric streams) |
 | DHCPLeasesSent/Received | DHCP-server full-set lease push messages (per family) |
