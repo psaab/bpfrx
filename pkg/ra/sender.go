@@ -882,6 +882,31 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 			prefLife = validLife
 		}
 
+		// #6587: refuse to advertise a DELEGATED /0.
+		//
+		// #6581 closed this at the DHCPv6 decoder, which is the right primary
+		// place — an IA_PD prefix-length of 0 or >128 is refused before it
+		// becomes a DelegatedPrefix. This is the defense-in-depth layer that
+		// PR deliberately did not add, and the reason it could not add it
+		// naively is recorded in its own test: at this point a delegated /0 is
+		// "indistinguishable from an operator-authored
+		// `set interfaces <if> ipv6 router-advertisement prefix ::/0`", which
+		// is legitimate configuration. RAPrefix.Delegated supplies the
+		// provenance that was missing, so the floor applies to exactly the
+		// population that can never be intentional.
+		//
+		// A /0 here would be advertised on-link AND autonomous to the LAN:
+		// every SLAAC host would treat the entire IPv6 address space as
+		// on-link and stop routing through this firewall.
+		//
+		// Only 0 is reachable: netip.ParsePrefix succeeded above, so Bits() is
+		// in [0,128] and the uint8 conversion below cannot wrap.
+		if pfx.Delegated && prefix.Bits() == 0 {
+			slog.Warn("ra: refusing to advertise a delegated /0 prefix",
+				"prefix", pfx.Prefix, "interface", s.cfg.Interface)
+			continue
+		}
+
 		ra.Options = append(ra.Options, &ndp.PrefixInformation{
 			PrefixLength:                   uint8(prefix.Bits()),
 			OnLink:                         pfx.OnLink,
