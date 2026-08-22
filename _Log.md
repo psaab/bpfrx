@@ -99982,3 +99982,47 @@ prose edit above them added. No diff falls in the new test body.
   pkg/vrrp/resign_barrier_6177_test.go (new),
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
+
+## 2026-08-21 — #6427: split manager_ha.go into seven responsibility-scoped files
+
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/dataplane/userspace/manager_ha.go` (2,299 LOC, the `[REFACTOR]`
+  tier of the modularity audit) fused seven unrelated responsibilities behind
+  one HA-shaped filename: the HA state machine, fabric-state publish, helper
+  counter bridging, session-table mutation verbs, session-sync request
+  construction, session-sync transmit/lock discipline, and the NAPI bootstrap
+  probe interface list. Split by responsibility into `manager_ha.go` (873),
+  `manager_sessions.go` (569), `manager_sessionsync_request.go` (327),
+  `manager_counters.go` (267), `manager_sessionsync_transmit.go` (187),
+  `manager_fabric_sync.go` (102) and `napi_probe_interfaces.go` (57). PURE CODE
+  MOTION: every declaration was copied by exact source line range, so no body,
+  signature, receiver, visibility, lock scope or defer ordering changed and no
+  new exported surface was created (everything stays in package `userspace`).
+  Two INDEPENDENT mechanical proofs, not eyeballing: (1) a regex block parser
+  compared all 80 top-level declarations before/after and found 80 byte-identical
+  including indentation, 0 dropped, 0 added, with each declaration's leading
+  comment run compared separately so a doc comment landing on the wrong
+  neighbour would fail; (2) a `go/parser` + `go/printer` dump keyed by
+  declaration name, emitting each decl's `ast.Doc` text and printed source,
+  diffed to zero across the seven post-split files. Also refreshed the six
+  now-stale `manager_ha.go` path pointers in docs/Rust comments that name a
+  moved symbol, and regenerated the refactor audit — manager_ha.go leaves the
+  `[REFACTOR]` tier and no new file enters the >=1500 LOC audit at all.
+  `go build ./...`, `go vet ./pkg/dataplane/...`, `go test -count=1
+  ./pkg/dataplane/...`, `go test -count=1 -race -run 'Session|HA'
+  ./pkg/dataplane/userspace/...`, `go test -count=1 ./pkg/refactoraudit/...` and
+  `go test -count=1 ./...` all rc=0, with the `_5007` / `_5698` / `_5305` /
+  `_5380` / `_5881` cells unchanged. **HA/session-sync code: `make test-failover`
+  is OWED and was NOT run (shared loss cluster not touched).**
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/manager_sessionsync_request.go,
+  pkg/dataplane/userspace/manager_sessionsync_transmit.go,
+  pkg/dataplane/userspace/manager_counters.go,
+  pkg/dataplane/userspace/manager_fabric_sync.go,
+  pkg/dataplane/userspace/napi_probe_interfaces.go,
+  docs/refactoring-audit-current.txt, docs/config-schema.md,
+  docs/fabric-cross-chassis-fwd.md, docs/snapshot-publish-redesign.md,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/ha/session_import.rs, userspace-dp/src/main_tests.rs,
+  _Log.md
