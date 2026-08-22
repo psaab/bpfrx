@@ -101040,6 +101040,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/device_map_dup_name_6546_test.go (new),
   docs/bare-metal-device-map.md, _Log.md
 
+## 2026-08-21 — #6515 (b): the narrowing advisory is guarded on the real commit paths
+- **Timestamp**: 2026-08-21
+- **Action**: The #6515 advisory warns that established sessions are FLUSHED at
+  commit (#5566), not merely that new connections are refused — but nothing
+  bound either that sentence or the claim that the advisory reaches an operator
+  who types `commit` without ever running `commit check`. MEASURED by driving
+  the real handlers rather than reading the wiring: the local CLI prints it on
+  `commit`, `commit check` and `commit confirmed`, and all three gRPC commit
+  RPCs return it in their `Warnings` field. No product change was needed; the
+  guards are new. Also renamed the new test functions to carry `_6515` — the
+  file name alone made `-run 6515` select ZERO tests and exit 0.
+- **File(s)**: pkg/cli/commit_advisory_surface_6515_test.go (new),
+  pkg/grpcapi/commit_advisory_warnings_6515_test.go (new)
 ## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
 - **Timestamp**: 2026-08-21
 - **Action**: #6515 and #6519 landed independently, each carrying its own copy of
