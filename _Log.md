@@ -98242,3 +98242,32 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: userspace-xdp/src/lib.rs, pkg/dataplane/userspace_xdp_bpfel.o,
   pkg/dataplane/userspace_xdp_manifest.json,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #5250 — sweep the ps-review-042 cohort row by row and fix all ten
+  live items. Each row was re-verified individually against `origin/master`
+  a829e7746 before any code was written; all ten were still live, so the
+  cohort's own "10 of 21" tally held. Ten commits, one per row, each with a
+  test that reds on that row's revert:
+  A9 F3 routeMaskCache Close; A9 F4 within-clause order-independent trigger-on
+  re-arm (a REAL order-dependent defect, not the semantics question the row
+  described); A6-b2 F1 neighbor callback outside the Manager lock; A6-b2 F3 NAT
+  app port ranges without the per-port slice; A7-b1 F1 ethtool -c scanner bound
+  + Err() check; A7-b1 F4 abortable failover commit-ready wait + captured VRRP
+  debounce refs; A7-b2 F2 RX-queue enumeration error distinguished from zero;
+  A8-b2 F3 session totals clamped; A3-b2 F3 host-inbound fabric lifeline
+  narrowed from the `fab` PREFIX to `fab<N>`; A3-b3 F-03 expandAppSet nil guard.
+  Validation: `go build ./...`, `go vet ./pkg/...`, `go test -count=1` over the
+  full Go tree, plus a per-row revert-mutation matrix (one mutation per run).
+  Zero Rust files touched, so the cargo leg is unaffected. `pkg/daemon/
+  daemon_ha.go` is HA/failover code — `make test-failover` is OWED and was not
+  run by this lane.
+- **File(s)**: pkg/config/lifeline.go, pkg/config/predefined.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_helpers.go,
+  pkg/grpcapi/server_nat.go, pkg/dataplane/userspace/manager_neighbor.go,
+  pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/nat_destination.go, pkg/daemon/coalescence.go,
+  pkg/daemon/rss_indirection.go, pkg/daemon/daemon_ha.go,
+  pkg/flowexport/routemask.go, pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/eventengine/engine.go, plus the ten new
+  `*_5250_test.go` files and the docs listed in each commit.
