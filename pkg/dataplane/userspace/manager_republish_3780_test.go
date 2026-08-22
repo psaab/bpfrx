@@ -46,7 +46,7 @@ func TestUpdatePolicyScheduleStateReturnsErrorOnPublishFailure(t *testing.T) {
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 	m.cfg.ControlSocket = controlSock
 	m.generation = 7
-	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
 	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
 
 	err := m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})
@@ -77,7 +77,7 @@ func TestUpdatePolicyScheduleStateNoHelperReportsConverged(t *testing.T) {
 	}
 
 	// Snapshot present but helper not running: still a no-op success.
-	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if err := m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false}); err != nil {
 		t.Fatalf("helperless republish must report converged (nil), got %v", err)
 	}

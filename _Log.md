@@ -103277,3 +103277,11 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_security_screen.go,
     pkg/config/screen_packed_body_6683_test.go,
     pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #7446 — converted the 44 pointer-returning buildSnapshot discard
+    sites (16 files) to must-helpers, added an AST guard against
+    re-introduction, and folded in the contributed #3772 propagation-link test.
+  - **File(s)**: pkg/dataplane/userspace/buildsnapshot_must_7446_test.go,
+    pkg/dataplane/userspace/buildsnapshot_discard_guard_7446_test.go,
+    16 converted *_test.go files, docs/engineering-style.md

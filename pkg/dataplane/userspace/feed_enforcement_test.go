@@ -226,8 +226,8 @@ func TestFeedContentChangeReshapesPublishedSnapshot(t *testing.T) {
 	overlayP1 := map[string][]string{"bad-actors": {"198.51.100.0/24"}}
 	overlayP2 := map[string][]string{"bad-actors": {"203.0.113.0/24"}}
 
-	s1, _ := buildSnapshotWithSchedulerState(cfg, ucfg, 1, 0, nil, nil, overlayP1)
-	s2, _ := buildSnapshotWithSchedulerState(cfg, ucfg, 1, 0, nil, nil, overlayP2)
+	s1 := mustBuildSnapshotWithSchedulerState(t, cfg, ucfg, 1, 0, nil, nil, overlayP1)
+	s2 := mustBuildSnapshotWithSchedulerState(t, cfg, ucfg, 1, 0, nil, nil, overlayP2)
 
 	// The published address-book row follows the new content.
 	row1 := findBookByName(s1.AddressBooks, "bad-actors")
@@ -254,7 +254,7 @@ func TestFeedContentChangeReshapesPublishedSnapshot(t *testing.T) {
 
 	// Conversely: identical overlay content yields an identical hash (the skip
 	// is correct — no wasted round-trip).
-	s1b, _ := buildSnapshotWithSchedulerState(cfg, ucfg, 9, 7, nil, nil, overlayP1)
+	s1b := mustBuildSnapshotWithSchedulerState(t, cfg, ucfg, 9, 7, nil, nil, overlayP1)
 	h1b, _ := snapshotContentHash(s1b)
 	if h1 != h1b {
 		t.Fatalf("identical feed content must yield identical content hash; %x != %x", h1, h1b)

@@ -47,7 +47,7 @@ func TestBuildSnapshotIncludesMirrorConfigsFromRealInterfaceSnapshot(t *testing.
 		},
 	}
 
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	var loIfindex int
 	for _, iface := range snap.Interfaces {
 		if iface.Name == "lo" {

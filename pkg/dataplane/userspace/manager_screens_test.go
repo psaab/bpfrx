@@ -334,13 +334,13 @@ func TestBuildScreenSnapshotsMarksSynCookieMode(t *testing.T) {
 	if !snaps[0].SYNCookie {
 		t.Fatalf("SYNCookie = false, want true: %+v", snaps[0])
 	}
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.SYNCookieMasterKey) != 32 {
 		t.Fatalf("SYNCookieMasterKey len = %d, want 32", len(snap.SYNCookieMasterKey))
 	}
 	cfg.System.RootAuthentication = nil
 	cfg.System.MasterPassword = "juniper-prf1"
-	snap, _ = buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap = mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if snap.SYNCookieMasterKey != "" {
 		t.Fatalf("SYNCookieMasterKey without root secret = %q, want empty", snap.SYNCookieMasterKey)
 	}
