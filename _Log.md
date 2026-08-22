@@ -1,3 +1,73 @@
+## 2026-08-21 — #6635 ddns: the error-tree bound follows a caller-supplied `As`
+
+- **Timestamp**: 2026-08-21
+- **Action**: `errTreeWithinBound` ran ONCE, at the two public scrubber entry
+  points, validating the `Unwrap` tree AS PRESENTED there — which is not the
+  tree the stdlib ends up walking. `errors.As` dispatches to an `As(any) bool`
+  method the CALLER defines, and that method returns a value of the caller's
+  choosing: an error with a one-node tree (guard passes) can install a fresh
+  `*url.Error` whose `Err` self-unwraps, and the next `errors.As` spins forever.
+  REPRODUCED AT MY HEAD before fixing: the entry guard returned true and
+  `scrubURLError` did not return in 5s.
+  The guard now runs at every entry to `scrubURLErrorAt` / `scrubInnerErrorAt`,
+  which is where a caller-supplied subtree can first appear; the public wrappers
+  become thin delegates. Cost is a re-walk per level, at most maxUnwrapDepth^2
+  Unwrap calls on an error path that runs once per reconcile tick.
+  NOT CLOSED, deliberately and stated: a caller-supplied `Error()`/`Unwrap()`
+  that BLOCKS. No placement of the guard fixes that — it needs a watchdog
+  goroutine per render — and the reason to decline is not only cost: a blocking
+  `Error()` hangs ANY fmt render of that error anywhere in the daemon, so
+  bounding it inside one package's scrubber buys nothing.
+  REACHABILITY, checked rather than assumed: caller-supplied, in-process only.
+  Production builds its own client; the only caller passing one is the Surface A
+  reconcile path passing its own. A provider chooses BYTES over the wire, not a
+  Go type. Robustness, NOT a live DoS, and the PR says so.
+  MATRIX FINDING, kept rather than tuned away: narrowing the `scrubURLErrorAt`
+  guard to `depth == 0` stays GREEN, because the only depth>0 caller hands over
+  a value `errors.As` already resolved to a `*url.Error`, matched at node 0
+  without walking. That is a reachability argument about a caller, which this
+  package does not build invariants on, so the guard stays unconditional and
+  the redundancy is documented instead of removed. Removing it ENTIRELY hangs
+  the pre-existing `TestSelfUnwrappingErrorTerminates` — a red only the FULL
+  suite shows, not `-run 6635`.
+- **File(s)**: `pkg/ddns/backend_http.go`,
+  `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
+## 2026-08-22 — #6612 destination-scoped junos-host permit: the missing advisory clause
+
+- **Timestamp**: 2026-08-22
+- **Action**: Landed the one clause the #6612 audit found missing. A
+  `to-zone junos-host` permit narrowed on DESTINATION (or carrying
+  `destination-address-excluded`) rendered no kernel rule AND produced
+  ZERO warnings of any kind: `junosHostProjectTerm` already refused to
+  render it, while `junosHostPolicyStricterThanCoarseGate` admitted a
+  permit as stricter-than-coarse only through
+  `junosHostPolicySourceScoped`, which inspects the source dimension
+  alone. The advisory now keys on the SAME expression the projection
+  applies (`junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded`) rather than a second copy — a divergence
+  between "the projection refuses to render it" and "the warning says
+  so" is always a bug, which is the discriminator for single-sourcing
+  over binding two copies with an agreement test. Restored the two table
+  rows so each asserts BOTH halves in one cell. Measured, rather than
+  assumed, that a fixture cannot make both halves gate-sensitive at
+  once: the rules half needs a CONCRETE permit source (with
+  `source-address any` the permit sets permitAllV4 and shadows every
+  later deny, so nothing renders with or without the projection gate),
+  while the warning half needs NO concrete source (or it warns through
+  the source predicate and says nothing about the destination
+  dimension). The class is therefore bound by a table row plus the
+  separate widening test, and the doc records why so neither is
+  "simplified" into the other later. Re-shaped the excluded row to
+  `destination-address any` + excluded so the two disjuncts localise
+  independently. Three one-line mutations, each `go vet` clean at the
+  mutated state, each reddening exactly one row: dropping the named
+  disjunct reds only `dst-permit`, dropping the excluded disjunct reds
+  only `dstx-permit`, and dropping the projection gate reds only the
+  widening test's two subtests and none of the table rows — the split
+  the doc describes, confirmed by measurement.
+- **File(s)**: `pkg/config/compiler_validate_warn_host_inbound.go`,
+  `pkg/dataplane/userspace/junos_host_residual_6612_test.go`,
+  `docs/host-inbound-service-matrix.md`
 ## 2026-08-21 — #6622 kernel promote gate: a refusal now leaves a durable record
 
 - **Timestamp**: 2026-08-21
@@ -102192,6 +102262,24 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6615 — repo-wide dangling doc-citation gate (pkg/docsref) with a
+    grandfathered ratchet baseline; corrected 4 provable research/->pr/ cite
+    relocations. Sweep found 53 dangling paths across live (non-archive) files.
+  - **File(s)**: pkg/docsref/{doc.go,docsref_test.go,testdata/known_dangling.txt},
+    docs/fairness-regimes.md, docs/pr/1863-realization-gap/plan.md,
+    docs/pr/1864-toolchain-pin/reviewer-ids.md,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/{epoch.rs,rotate_epoch_v8.rs}
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6625 — the #1798 control-character gate rendered a credential
+    leaf's VALUE into its error (twice: path + quoted value). Now reports the
+    byte class and offset instead, for credential leaves only. `community` is
+    path-qualified (secret under snmp, a BGP route-target name elsewhere).
+  - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
+    pkg/config/secret_in_error_6625_test.go
 
 - **Timestamp**: 2026-08-22
   - **Action**: #6626 + #6627 — the heatmap hard gate could return "ok (cached)"

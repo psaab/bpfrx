@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -325,4 +326,113 @@ func (s *Secret) UnmarshalYAML(value *yaml.Node) error {
 	}
 	*s = Secret(v)
 	return nil
+}
+
+// secretLeafKeywords is the set of config-grammar leaf keywords whose VALUE is
+// a credential (#6625).
+//
+// It exists because the control-character gate (validateNodesControlChars)
+// runs on the AST, BEFORE compilation, so the compiled `Secret` type is not
+// available to it — and that gate formats the offending value into its error,
+// which for a credential publishes the credential to commit output, the daemon
+// log and the audit journal.
+//
+// Keyed on the leaf KEYWORD (Keys[0]) rather than a full path, because a
+// credential leaf is spelled the same wherever it appears: `authentication-key`
+// is a secret under chassis cluster, VRRP, OSPF, RIP and IS-IS alike, and a
+// path-keyed set would have to enumerate all of them and would silently miss
+// the next one.
+//
+// ERR TOWARD INCLUSION for an UNAMBIGUOUS keyword. A false positive costs one
+// diagnostic detail — the operator is told the byte offset and class instead of
+// the value. A false negative publishes a credential.
+//
+// Membership is pinned against the schema by
+// TestSecretLeafKeywordsExistInSchema (no dead entries) and against the known
+// credential leaves by TestSecretLeafKeywordsCoverKnownCredentials.
+var secretLeafKeywords = map[string]bool{
+	"authentication-key": true,
+	"pre-shared-key":     true,
+	"preshared-key":      true,
+	"private-key":        true,
+	"encrypted-password": true,
+	"password":           true,
+	"tsig-secret":        true,
+	"api-key":            true,
+}
+
+// secretLeafKeywordsByRoot qualifies a DUAL-USE keyword by the top-level
+// stanza it appears under: secret in one place, an ordinary identifier in
+// another.
+//
+// `community` is the worked example and the reason this map exists. Under
+// `snmp` the community string IS the credential; under `policy-options` a
+// community is a BGP route-target name, and #4097's gate exists specifically to
+// show the operator WHICH community member carried a newline. Blanket-keying on
+// the keyword redacted the BGP one and broke that diagnostic — caught by
+// TestFRRPolicyValueControlCharsBlocked_4097, not by inspection.
+//
+// The lesson generalises: keyword-keying is right for a leaf spelled the same
+// wherever it appears, and wrong the moment a spelling is reused for something
+// that is not a credential. Add to THIS map, not the set above, whenever that
+// is true.
+var secretLeafKeywordsByRoot = map[string]map[string]bool{
+	"community": {"snmp": true},
+}
+
+// IsSecretLeafKeyword reports whether an UNAMBIGUOUS config leaf keyword
+// carries a credential as its value. Dual-use keywords are resolved by
+// isSecretLeaf, which also considers the stanza the leaf appears under.
+func IsSecretLeafKeyword(keyword string) bool {
+	return secretLeafKeywords[keyword]
+}
+
+// isSecretLeaf reports whether the leaf named by keys carries a credential,
+// given the path prefix it was found under.
+func isSecretLeaf(prefix string, keys []string) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	kw := keys[0]
+	if secretLeafKeywords[kw] {
+		return true
+	}
+	roots, dualUse := secretLeafKeywordsByRoot[kw]
+	if !dualUse {
+		return false
+	}
+	root := prefix
+	if i := strings.IndexByte(root, ' '); i >= 0 {
+		root = root[:i]
+	}
+	return roots[root]
+}
+
+// describeControlChar names the first control character in s by offset and
+// byte value, WITHOUT reproducing the surrounding value (#6625). That is
+// enough to locate and fix the input — a leading tab from a password manager
+// is offset 0, a trailing CR is the last offset — while disclosing nothing.
+func describeControlChar(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return fmt.Sprintf("a control character (0x%02x) at byte offset %d", s[i], i)
+		}
+	}
+	return "a control character"
+}
+
+// redactSecretKeys returns keys with every VALUE token replaced by the
+// redaction sentinel when the leaf keyword is a credential (#6625). Keys[0] is
+// the leaf name and is kept — the operator needs to know WHICH statement was
+// rejected.
+func redactSecretKeys(prefix string, keys []string) []string {
+	if !isSecretLeaf(prefix, keys) {
+		return keys
+	}
+	out := make([]string, len(keys))
+	out[0] = keys[0]
+	for i := 1; i < len(keys); i++ {
+		out[i] = SecretRedacted
+	}
+	return out
 }
