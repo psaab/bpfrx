@@ -101163,3 +101163,25 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cliterm/terminal.go (new), pkg/cliterm/terminal_test.go
   (new), pkg/cli/cli_config.go, pkg/cli/cli.go, cmd/cli/main.go,
   pkg/cli/load_terminal_abort_6548_test.go (new), pkg/cli/README.md, _Log.md
+
+## 2026-08-21 — #6559 proxy-arp prefix expansion
+- **Timestamp**: 2026-08-21
+- **Action**: `security nat proxy-arp ... address <prefix>` dropped the prefix
+  length: the compiler stored the authored string and the installer keyed on
+  `prefix.Addr()` alone, one neighbour per statement. `netip.ParsePrefix` does
+  not mask, so a CANONICAL prefix installed the NETWORK address — zero useful
+  entries with the `proxy_arp` sysctl still on. Added `expandProxyARPPrefix`
+  in the compiler (network/broadcast excluded, RFC 3021 /31 exception,
+  `Masked()` so a non-canonical spelling expands to the same block), capped at
+  256 to match the `address <low> to <high>` sibling under the same stanza.
+  Over-cap blocks are left authored and rejected by a new
+  `validateProxyARPAddressesStrict` arm (warned on the tolerant path, #1960).
+  Prerequisite: a bare IPv6 literal now compiles to /128, not the
+  unconditional /32.
+- **File(s)**: pkg/config/compiler_nat_proxyarp_prefix.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/proxy_arp_prefix_expand_6559_test.go (new),
+  pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/feature-gaps.md, docs/phases.md, _Log.md

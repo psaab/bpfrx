@@ -641,7 +641,18 @@ type NATConfig struct {
 // ProxyARPEntry configures proxy ARP responses for NAT addresses.
 type ProxyARPEntry struct {
 	Interface string
-	Addresses []string // /32 CIDRs (expanded from ranges)
+	// Addresses is the fully-expanded SINGLE-HOST prefix set the installer
+	// programs: /32 for IPv4, /128 for IPv6, one kernel NTF_PROXY neighbour
+	// each. A `address <low> to <high>` range and (since #6559) a multi-host
+	// `address <prefix>` are both expanded here, in the compiler, so this field
+	// and pkg/dataplane/proxyarp.go agree on what "an address" is.
+	//
+	// One exception, deliberately: a prefix whose host count exceeds
+	// proxyARPMaxExpandedHosts is left AUTHORED so
+	// validateProxyARPAddressesStrict can reject it (strict) or warn (tolerant,
+	// #1960). On that tolerant path the installed set is byte-identical to
+	// pre-#6559 — one entry for the address as authored.
+	Addresses []string
 	// MalformedRangeSpecs records every proxy-arp `address` STATEMENT on this
 	// interface whose token stream still carried the `to` range keyword after
 	// neither well-formed range shape consumed it (#6714). Two things reach it:

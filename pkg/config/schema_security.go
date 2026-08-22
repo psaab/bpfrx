@@ -632,7 +632,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"proxy-arp": {desc: "Proxy ARP for NAT pool addresses", children: map[string]*schemaNode{
 			"interface": {desc: "Interface to answer proxy ARP on", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-				"address": {desc: "Address or range to answer ARP for", args: 1, multi: true, placeholder: "<address>", children: nil},
+				"address": {desc: "Address, prefix or range to answer ARP for", args: 1, multi: true, placeholder: "<address>", children: nil},
 			}},
 		}},
 	}},

@@ -1370,9 +1370,16 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.2 to 192.0.2
 		{"block-child range beside well-formed siblings", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to 192.0.2.9; 198.51.100.1; } } } } }`,
 			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}, true},
+		// #6559: a BARE IPv6 literal now compiles to /128, not /32. The old
+		// unconditional "/32" produced a 32-bit prefix on a 128-bit address; the
+		// INSTALL was right by accident (netip.ParsePrefix keeps the full
+		// address and proxyarp.go keys on Addr()), but the compiled form was
+		// indistinguishable from an authored /32 v6 BLOCK, which the #6559
+		// expansion has to tell apart. Only the spelling of the expectation
+		// moves — the installed neighbour is the same address either way.
 		{"IPv6 block-child range", `
 security { nat { proxy-arp { interface ge-0-0-0 { address { 2001:db8::1; 2001:db8::2 to 2001:db8::9; } } } } }`,
-			[]string{"2001:db8::1/32"}, []string{"2001:db8::1/32"}, true},
+			[]string{"2001:db8::1/128"}, []string{"2001:db8::1/128"}, true},
 		// The `to` at a child's THIRD key, and under a NESTED child — two more
 		// positions an enumeration would have to know about in advance. The
 		// detector walks the statement's whole token stream instead, so depth
@@ -1550,11 +1557,20 @@ func TestProxyARP6673InstalledHelperModelsTheInstallerIdentity(t *testing.T) {
 	}{
 		{
 			// One address, two spellings: proxyarp.go creates ONE neighbour
-			// (both parse to 192.0.2.1) and enables the responder once.
+			// (both parse to 2001:db8::1) and enables the responder once.
+			//
+			// #6559 note: this fixture used to be `[ 192.0.2.1/24 192.0.2.1/32 ]`,
+			// which relied on the prefix LENGTH being discarded to make the /24 a
+			// second spelling of one host — the very defect #6559 fixed, so a /24
+			// is now 254 distinct neighbours. The property under test is
+			// unchanged (two spellings of ONE address dedupe to one neighbour),
+			// and so is the discriminator the comment above claims: these two
+			// strings differ TEXTUALLY but parse to the same netip.Addr, so a
+			// helper deduping on raw CIDR text still gets it wrong.
 			name: "two prefixes over one address are one neighbour",
 			cfg: `
-security { nat { proxy-arp { interface ge-0-0-0 { address [ 192.0.2.1/24 192.0.2.1/32 ]; } } } }`,
-			want: []string{"192.0.2.1/24"},
+security { nat { proxy-arp { interface ge-0-0-0 { address [ 2001:db8::1/128 2001:0DB8:0000::1/128 ]; } } } }`,
+			want: []string{"2001:db8::1/128"},
 		},
 		{
 			// Same address on two interfaces: two ifindexes, two neighbours.

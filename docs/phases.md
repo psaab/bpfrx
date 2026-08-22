@@ -2166,6 +2166,8 @@ New feature — auto-reply ARP for NAT pool addresses on same L2 segment.
 - **`pkg/daemon/daemon.go`** — Calls `ReconcileProxyARP()` after VRRP VIP reconciliation;
   sends GARPs for newly added entries
 - Config: `set security nat proxy-arp interface trust0 address 10.0.1.100/32`
+  (a multi-host prefix such as `address 10.0.1.0/29` is expanded to its
+  ARP-addressable hosts at compile time, capped at 256 -- #6559)
   or range `address 10.0.1.101/32 to 10.0.1.110/32`
 
 ### Feature 4: Per-IP Session Limiting (Screen)
