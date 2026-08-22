@@ -1837,10 +1837,14 @@ unrepresentable rather than merely tested against.
   into the interface list — the #6673 promotion class, but with an unusually
   sharp consequence: `group.Interfaces` is handed to Kea verbatim as
   `interfaces-config.interfaces`, and one name no device answers to takes the
-  WHOLE DHCP server down, not just that group. **The spelling-differential gate
-  cannot see this direction** — it detects a DROPPED value, never a PROMOTED
-  modifier — so it is asserted directly by
-  `TestDHCPGroup6696PerInterfaceModifierIsNotAnInterface`.
+  WHOLE DHCP server down, not just that group. **The differential gate does not
+  state that direction** — it detects a DROPPED value, not a PROMOTED modifier.
+  Measured rather than assumed: swapping in `firewallMatchValues` DOES red the
+  gate, but only INDIRECTLY, at the modelled `interface <if> <modifier>` sub-leaf
+  sites — which exist only because the modifiers are modelled. Delete those
+  children and the gate goes green with the promotion still present, and only
+  `TestDHCPGroup6696PerInterfaceModifierIsNotAnInterface` reds. The property is
+  owned by that test, not by the gate.
 
 **A widened read needs a widened validator.** Before the fix only slot 0 could
 reach a consumer, so a malformed element past it was inert; now every element is

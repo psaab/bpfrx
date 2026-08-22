@@ -231,8 +231,12 @@ func TestDHCPv6Group6696SpellingsAgree(t *testing.T) {
 // is handed to Kea as interfaces-config.interfaces and a name no device
 // answers to takes the WHOLE DHCP server down, not just that group.
 //
-// The spelling-differential gate cannot see this direction (it detects a
-// dropped value, never a promoted modifier), so it is asserted here.
+// The spelling-differential gate does not state this direction: it detects
+// a dropped value, not a promoted modifier. Measured — swapping in
+// firewallMatchValues does red that gate, but only indirectly, at the
+// modelled `interface <if> <modifier>` sub-leaf sites, which exist only
+// because the modifiers are modelled; removing those children leaves the
+// gate green with the promotion still present, and only this test red.
 //
 // FAIL-ON-REVERT: replacing dhcpGroupInterfaceValues with
 // firewallMatchValues — the union reader used for every other multi-value

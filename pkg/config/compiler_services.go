@@ -2267,9 +2267,14 @@ func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig, lenient bool, 
 // undo exactly that: it would promote `exclude` into the interface list,
 // and these names go straight into Kea's interfaces-config.interfaces,
 // where one Kea cannot bind takes the whole DHCP server down. The
-// spelling-differential gate cannot catch that direction — it detects a
-// DROPPED value, never a PROMOTED modifier — so the discrimination has to
-// be right here by construction.
+// spelling-differential gate does not state that direction — it detects a
+// DROPPED value, not a PROMOTED modifier. Measured, not assumed: swapping
+// in firewallMatchValues here DOES red that gate, but only INDIRECTLY, at
+// the modelled `interface <if> <modifier>` sub-leaf sites, which exist
+// only because the modifiers are modelled; delete those children and the
+// gate goes silent while the promotion is still there. So the
+// discrimination has to be right here by construction, and the property is
+// stated by a dedicated test.
 //
 // The two shapes are told apart by whether the statement names an
 // interface on its own line:
