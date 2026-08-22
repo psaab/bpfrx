@@ -31,6 +31,7 @@ fn snapshot_roundtrip() {
         session_table_entries: 77,
         max_sessions: 100,
         nat_reverse_key_collisions: 4242,
+        nat_reverse_key_collisions_distinct_src: 0,
         session_create_drops: 31,
         session_install_admission_refused: 17,
         session_install_partial: 1,

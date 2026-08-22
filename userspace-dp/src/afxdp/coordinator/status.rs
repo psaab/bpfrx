@@ -964,6 +964,8 @@ impl super::Coordinator {
                     session_table_entries: s.session_table_entries,
                     max_sessions: s.max_sessions,
                     nat_reverse_key_collisions: s.nat_reverse_key_collisions,
+                    nat_reverse_key_collisions_distinct_src: s
+                        .nat_reverse_key_collisions_distinct_src,
                     // #4800: per-worker transit new-flow installs.
                     new_flow_installs: s.new_flow_installs,
                     session_create_drops: s.session_create_drops,

@@ -24,6 +24,17 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"and is the structural-fix revisit trigger.",
 		nil, nil,
 	)
+	c.userspaceNatReverseKeyCollisionsDistinctSrc = prometheus.NewDesc(
+		"xpf_userspace_session_nat_reverse_key_collisions_distinct_src_total",
+		"#6751: the subset of the aggregate above where the colliding "+
+			"sessions came from DIFFERENT internal sources — the "+
+			"cross-session return-traffic leak, and the only population "+
+			"PAT-on-collision would fix. The aggregate also counts one host "+
+			"reusing an ephemeral port while its previous session is still "+
+			"resident. Read them together: a nonzero aggregate with zero "+
+			"here is same-source reuse, not a leak.",
+		nil, nil,
+	)
 	c.userspaceNatReverseKeySharedDisplacements = prometheus.NewDesc(
 		"xpf_userspace_session_nat_reverse_key_shared_displacements_total",
 		"Shared-map NAT reverse-key displacement events: a "+

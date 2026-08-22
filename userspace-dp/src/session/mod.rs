@@ -699,6 +699,41 @@ pub(crate) struct SessionTable {
     /// Worker-owned, single-threaded — plain u64, no atomics (mirrors
     /// `create_drops`).
     nat_reverse_key_collisions: u64,
+    /// #6751: the subset of `nat_reverse_key_collisions` where the colliding
+    /// sessions come from DIFFERENT internal sources.
+    ///
+    /// WHY THE SUBSET IS THE DECISION-GRADE NUMBER. The aggregate counts every
+    /// reverse-key bucket growth, which is at least three populations with
+    /// different fixes:
+    ///
+    ///   * two distinct internal hosts picking the same source port to the
+    ///     same server under interface-mode SNAT — the #6751 cross-session
+    ///     leak, and the ONLY one that PAT-on-collision fixes;
+    ///   * ONE host reusing an ephemeral port while its previous session is
+    ///     still resident — same bucket growth, no leak between hosts, and
+    ///     PAT would not be the remedy;
+    ///   * `port no-translation` / static SNAT pairs, which the allocator
+    ///     admits DELIBERATELY because `AddressOnlyReverseKey` includes
+    ///     dst_ip/dst_port (#6745 governs their steering row instead).
+    ///
+    /// The loss cluster reads 2 on the aggregate today with ONE LAN host
+    /// configured, so the population it is actually producing is port reuse —
+    /// which is exactly why the aggregate cannot answer "does the #6751 shape
+    /// happen". This counter can: it is nonzero only when the colliding
+    /// sessions have different `src_ip`.
+    ///
+    /// NOT a mode discriminator, and that is measured rather than deferred by
+    /// preference: `NatDecision` is documented as wire-serialized over the HA
+    /// fabric with "field shape and derive set must be preserved bit-for-bit",
+    /// and its equality drives both the reindex decision (`old_nat !=
+    /// decision.nat`) and whether NAT is applied to a packet at all (`nat !=
+    /// NatDecision::default()`), so a mode bit cannot go there. Threading one
+    /// through `install_with_protocol` instead would touch 120 call sites. So
+    /// interface-mode and address-only pool mode stay indistinguishable here;
+    /// distinct-source is the axis that is both free and decisive.
+    ///
+    /// Worker-owned, single-threaded — plain u64, no atomics, like its sibling.
+    nat_reverse_key_collisions_distinct_src: u64,
     /// #965: bucketed timer wheel that mirrors `entries`. Pop one
     /// bucket per tick (1 s) instead of scanning the whole HashMap.
     /// Wheel entries hold `(SessionKey, scheduled_tick)` — NOT the
@@ -804,6 +839,7 @@ impl SessionTable {
             delta_loss_pending: false,
             delta_drained: 0,
             nat_reverse_key_collisions: 0,
+            nat_reverse_key_collisions_distinct_src: 0,
             wheel: SessionWheel::new(),
             last_pop_stats: WheelPopStats::default(),
             session_limit_active: false,
@@ -1103,6 +1139,13 @@ impl SessionTable {
     /// `ProcessStatus.nat_reverse_key_collisions` for operators.
     pub fn nat_reverse_key_collisions(&self) -> u64 {
         self.nat_reverse_key_collisions
+    }
+
+    /// #6751: the DIFFERENT-SOURCE subset of `nat_reverse_key_collisions`.
+    /// Published on the same per-worker cadence and aggregated into
+    /// `ProcessStatus.nat_reverse_key_collisions_distinct_src`.
+    pub fn nat_reverse_key_collisions_distinct_src(&self) -> u64 {
+        self.nat_reverse_key_collisions_distinct_src
     }
 
     // ── #964 Step 1 internal helpers ─────────────────────────────
@@ -2036,9 +2079,19 @@ impl SessionTable {
                 // NAT64, interface-mode SNAT — the non-bijective classes) now
                 // coexist, so the earlier reverse session's inbound alias
                 // lookup is no longer stolen by the later install.
+                // #6751: NOT attributed. This is the REVERSE/alias index, so
+                // `key.src_ip` is the EXTERNAL server, not an internal source
+                // — two reverse sessions with different servers would look
+                // like "distinct sources" and inflate the one number this
+                // counter exists to make trustworthy. Attribution is confined
+                // to the forward branch below, where src_ip really is the
+                // internal host. The aggregate still counts this collision.
                 nat_index_bucket_push(
                     &mut self.reverse_translated_index,
                     &mut self.nat_reverse_key_collisions,
+                    &mut u64::default(),
+                    &self.entries,
+                    key.src_ip,
                     translated,
                     handle,
                 );
@@ -2055,6 +2108,9 @@ impl SessionTable {
             nat_index_bucket_push(
                 &mut self.nat_reverse_index,
                 &mut self.nat_reverse_key_collisions,
+                &mut self.nat_reverse_key_collisions_distinct_src,
+                &self.entries,
+                key.src_ip,
                 reverse_wire_key(key, nat),
                 handle,
             );
@@ -2063,6 +2119,9 @@ impl SessionTable {
                 nat_index_bucket_push(
                     &mut self.nat_reverse_index,
                     &mut self.nat_reverse_key_collisions,
+                    &mut self.nat_reverse_key_collisions_distinct_src,
+                    &self.entries,
+                    key.src_ip,
                     reverse_canonical,
                     handle,
                 );
@@ -2078,6 +2137,9 @@ impl SessionTable {
                 nat_index_bucket_push(
                     &mut self.forward_wire_index,
                     &mut self.nat_reverse_key_collisions,
+                    &mut self.nat_reverse_key_collisions_distinct_src,
+                    &self.entries,
+                    key.src_ip,
                     forward_wire,
                     handle,
                 );
@@ -2220,6 +2282,9 @@ fn remove_owner_rg_index_entry(
 fn nat_index_bucket_push(
     map: &mut HashMap<SessionKey, NatIndexBucket, FxSeededState>,
     collisions: &mut u64,
+    distinct_src_collisions: &mut u64,
+    entries: &slab::Slab<SessionRecord>,
+    forward_src: IpAddr,
     key: SessionKey,
     handle: u32,
 ) {
@@ -2230,9 +2295,29 @@ fn nat_index_bucket_push(
         return;
     }
     let collided = !bucket.is_empty();
+    // #6751: attribute the collision BEFORE the push, while the bucket still
+    // holds only the prior occupants. Resolving them after would compare the
+    // arriving session against itself.
+    //
+    // Cost is on the COLLISION path only — an empty bucket short-circuits, and
+    // buckets are tiny. Nothing here runs for the overwhelmingly common
+    // no-collision install.
+    //
+    // A handle that no longer resolves is skipped rather than counted: a stale
+    // bucket entry is not evidence of a distinct source, and guessing would
+    // inflate the one number this counter exists to make trustworthy.
+    let distinct_src = collided
+        && bucket.iter().any(|prior| {
+            entries
+                .get(*prior as usize)
+                .is_some_and(|record| record.key.src_ip != forward_src)
+        });
     bucket.push(handle);
     if collided {
         *collisions = collisions.saturating_add(1);
+        if distinct_src {
+            *distinct_src_collisions = distinct_src_collisions.saturating_add(1);
+        }
     }
 }
 

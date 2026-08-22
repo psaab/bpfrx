@@ -58,6 +58,11 @@ type ProcessStatus struct {
 	// structural-fix research; does NOT resolve #1760. omitempty for
 	// mixed Rust/Go daemon back-compat.
 	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
+	// NatReverseKeyCollisionsDistinctSrc is the DIFFERENT-SOURCE subset of the
+	// counter above (#6751). The aggregate cannot separate the cross-session
+	// leak from one host reusing an ephemeral port, and only the former is what
+	// PAT-on-collision would fix.
+	NatReverseKeyCollisionsDistinctSrc uint64 `json:"nat_reverse_key_collisions_distinct_src,omitempty"`
 	// #1861: aggregate at-cap install refusals (SessionTable create_drops,
 	// write-only/invisible before #1861), pair-admission preflight
 	// refusals (one per refused flow at the new-flow transaction
@@ -572,6 +577,11 @@ type WorkerRuntimeStatus struct {
 	// worker's SessionTable nat_reverse_index (#1758). omitempty for
 	// mixed-version back-compat.
 	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
+	// NatReverseKeyCollisionsDistinctSrc is the DIFFERENT-SOURCE subset of the
+	// counter above (#6751). The aggregate cannot separate the cross-session
+	// leak from one host reusing an ephemeral port, and only the former is what
+	// PAT-on-collision would fix.
+	NatReverseKeyCollisionsDistinctSrc uint64 `json:"nat_reverse_key_collisions_distinct_src,omitempty"`
 	// #1861: per-worker install-refusal trio (see the ProcessStatus
 	// aggregate fields for semantics). omitempty for back-compat.
 	SessionCreateDrops             uint64 `json:"session_create_drops,omitempty"`

@@ -95,6 +95,18 @@ func (c *xpfCollector) initWorkerDescriptors() {
 			"counted here — see the shared displacements counter.",
 		[]string{"worker_id"}, nil,
 	)
+	c.workerNatReverseKeyCollisionsDistinctSrc = prometheus.NewDesc(
+		"xpf_userspace_worker_session_nat_reverse_key_collisions_distinct_src_total",
+		"#6751: the subset of this worker's NAT reverse-key collisions where "+
+			"the colliding sessions came from DIFFERENT internal sources. The "+
+			"aggregate above also counts ONE host reusing an ephemeral port "+
+			"while its previous session is still resident, which is a "+
+			"different population with a different remedy; only the "+
+			"distinct-source subset is the cross-session leak that "+
+			"PAT-on-collision would fix. Zero here with a nonzero aggregate "+
+			"means the collisions observed are same-source reuse.",
+		[]string{"worker_id"}, nil,
+	)
 	c.workerSessionCreateDrops = prometheus.NewDesc(
 		"xpf_userspace_worker_session_create_drops_total",
 		"Cumulative session installs refused at the max_sessions cap on "+

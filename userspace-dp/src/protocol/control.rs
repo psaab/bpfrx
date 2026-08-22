@@ -270,6 +270,11 @@ pub(crate) struct ProcessStatus {
     /// counter does NOT resolve #1760.
     #[serde(rename = "nat_reverse_key_collisions", default)]
     pub nat_reverse_key_collisions: u64,
+    /// #6751: the DIFFERENT-SOURCE subset of the counter above. Additive and
+    /// `default`ed, so an older helper that does not send it deserializes to 0
+    /// rather than failing the status parse (#1961 additive-counter rule).
+    #[serde(rename = "nat_reverse_key_collisions_distinct_src", default)]
+    pub nat_reverse_key_collisions_distinct_src: u64,
     /// #1861: aggregate at-cap install refusals summed across the
     /// per-worker session tables (`SessionTable::create_drops` — was
     /// write-only/invisible before #1861). Additive: older helpers omit
