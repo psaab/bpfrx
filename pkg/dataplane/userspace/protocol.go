@@ -119,6 +119,46 @@ const (
 	// first per-feature floor in the tree; #6648 tracks giving the local gates
 	// the same treatment. Never renumber it: it names a historical wire fact.
 	MinProtocolMultiZoneScopedPolicy = 4
+
+	// The remaining per-feature floors (#6648). Each names the FIRST snapshot
+	// protocol version whose wire representation carries that feature, and each
+	// is IMMUTABLE: it is a historical fact about the wire, not a tracking
+	// alias for ProtocolVersion. Never renumber one; a new floor is added when
+	// a new feature's representation lands.
+	//
+	// Before #6648 the four gates in manager_compile.go all compared against
+	// ProtocolVersion, so every bump for an unrelated feature retroactively
+	// raised the bar for all of them and reported a misleading reason: a helper
+	// running a scheduled-policy config was told "policy scheduler snapshots"
+	// required version 8, when policy-scheduler snapshots have been
+	// representable since version 2.
+	//
+	// These floors answer ONLY "can this helper represent this feature?". The
+	// separate question "will this helper accept our snapshot at all?" is
+	// answered in exactly ONE place — ensureEgressZoneProtocolLocked's
+	// unconditional equality check — because the helper's own contract is exact
+	// equality (userspace-dp/src/server/handlers/snapshot.rs). Keeping the two
+	// questions apart is what stops the per-feature gates from being a second,
+	// divergent copy of the acceptance rule (#6649).
+
+	// MinProtocolPolicyScheduler: the policy-scheduler inactive-state fields
+	// landed in the v2 bump (f7c4b125c, #1396).
+	MinProtocolPolicyScheduler = 2
+
+	// MinProtocolPersistentSourceNAT: persistent SNAT pool leases landed in the
+	// v3 bump (c0a047ea2, #1377).
+	MinProtocolPersistentSourceNAT = 3
+
+	// MinProtocolSecureTunnelRefusal: the device-level AF_XDP binding refusal
+	// contract spans THREE bumps on the #5619/#6691 branch — v5 added
+	// InterfaceSnapshot.SecureTunnel (be8aec13e), v6 the every-owner refusal
+	// rule (8d0e09fb8), v7 the fabric parent's verdict
+	// (FabricSnapshot.ParentUnbindable, 8c011681c). The floor is the LAST of
+	// them: a helper below 7 misreads at least one part of the contract, so 7
+	// is the first version that reads all of it. (The subsequent 7 -> 8 bump
+	// was collision resolution against #6722's parallel v5, not a fourth change
+	// to this contract — see the ProtocolVersion comment above.)
+	MinProtocolSecureTunnelRefusal   = 7
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 

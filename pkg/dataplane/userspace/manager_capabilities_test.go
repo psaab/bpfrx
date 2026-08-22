@@ -253,7 +253,17 @@ func TestEnsureRequiredSnapshotProtocolRejectsOldHelperForPersistentSourceNAT(t 
 	}}
 
 	m := New()
-	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion - 1
+	// #6648: BELOW THE FEATURE'S FLOOR, not below ProtocolVersion. This used to
+	// say `ProtocolVersion - 1`, which asserted that a helper one version behind
+	// the shared constant cannot represent persistent source NAT. It can:
+	// persistent SNAT pool leases have been representable since v3
+	// (MinProtocolPersistentSourceNAT), so the sentinel this test names is the
+	// wrong answer for a v7 helper — the right one is the unconditional
+	// egress-zone gate, and pinning the feature sentinel there was pinning the
+	// coupling #6648 removes. Retargeted, not relaxed: the assertion is
+	// unchanged and now runs against a helper that genuinely cannot carry the
+	// feature.
+	m.lastStatus.ConfigSnapshotProtocolVersion = MinProtocolPersistentSourceNAT - 1
 	err := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg))
 	if !errors.Is(err, ErrPersistentSourceNATProtocolIncompatible) {
 		t.Fatalf("error = %v, want ErrPersistentSourceNATProtocolIncompatible", err)

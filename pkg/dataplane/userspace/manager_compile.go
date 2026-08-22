@@ -867,13 +867,13 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 	if !configHasMultiZoneScopedPolicy(cfg) {
 		return nil
 	}
-	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= MinProtocolMultiZoneScopedPolicy {
 		return nil
 	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
 		m.recordHelperStatusLocked(&status)
-		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		if status.ConfigSnapshotProtocolVersion >= MinProtocolMultiZoneScopedPolicy {
 			return nil
 		}
 	}
@@ -882,16 +882,27 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 			"(an older helper reads only the singular match from-zone/to-zone and would NARROW the scope)",
 		ErrScopedGlobalZoneSetProtocolIncompatible,
 		m.lastStatus.ConfigSnapshotProtocolVersion,
-		ProtocolVersion,
+		MinProtocolMultiZoneScopedPolicy,
 	)
 }
 
 // ensureSecureTunnelProtocolLocked is the fail-closed half of the #5619/#6691
 // protocol bumps — v5 (the SecureTunnel field), v6 (the every-owner refusal
-// rule) and v7 (the fabric parent's verdict), which is why it compares against
-// ProtocolVersion rather than a pinned number: each of the three changes what
-// an older helper does with the same snapshot, and the gate's job is the same
-// for all of them. The bump makes an older helper REFUSE the snapshot outright,
+// rule) and v7 (the fabric parent's verdict). It compares against
+// MinProtocolSecureTunnelRefusal, which is the LAST of those three (7): each of
+// the three changes what an older helper does with the same snapshot, so the
+// first version that reads the WHOLE contract is 7, and a helper below it
+// misreads at least one part.
+//
+// #6648 changed this from `ProtocolVersion` to that pinned floor. The old
+// spelling was not "the same number written differently": it made every future
+// bump for an UNRELATED wire feature retroactively re-arm this gate, and report
+// the secure-tunnel reason for a helper that reads the refusal contract
+// perfectly well. The pin must move only when a FOURTH change to the refusal
+// contract lands — never to track the shared constant. (The 7 -> 8 bump was
+// collision resolution against #6722's parallel v5, not a change to this
+// contract; ProtocolVersion's own comment carries that history.)
+// An older helper REFUSES the snapshot outright,
 // which stops it from planning a binding for the xfrmi — but a refused snapshot
 // leaves that helper ARMED on its previous-good image while the commit reports
 // success. This gate closes that window the way the sibling gates do: the
@@ -935,13 +946,13 @@ func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
 	if !snapshotRequiresRefusalProtocol(snap) {
 		return nil
 	}
-	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= MinProtocolSecureTunnelRefusal {
 		return nil
 	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
 		m.recordHelperStatusLocked(&status)
-		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		if status.ConfigSnapshotProtocolVersion >= MinProtocolSecureTunnelRefusal {
 			return nil
 		}
 	}
@@ -981,7 +992,7 @@ func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
 			"interface to one queue and one worker)",
 		ErrSecureTunnelProtocolIncompatible,
 		m.lastStatus.ConfigSnapshotProtocolVersion,
-		ProtocolVersion,
+		MinProtocolSecureTunnelRefusal,
 	)
 }
 
@@ -989,13 +1000,13 @@ func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error 
 	if !configHasScheduledPolicy(cfg) {
 		return nil
 	}
-	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= MinProtocolPolicyScheduler {
 		return nil
 	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
 		m.recordHelperStatusLocked(&status)
-		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		if status.ConfigSnapshotProtocolVersion >= MinProtocolPolicyScheduler {
 			return nil
 		}
 	}
@@ -1003,7 +1014,7 @@ func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error 
 		"%w: helper config snapshot protocol version %d < required %d for policy scheduler snapshots",
 		ErrPolicySchedulerProtocolIncompatible,
 		m.lastStatus.ConfigSnapshotProtocolVersion,
-		ProtocolVersion,
+		MinProtocolPolicyScheduler,
 	)
 }
 
@@ -1011,13 +1022,13 @@ func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) er
 	if !userspaceConfigUsesPersistentSourceNAT(cfg) {
 		return nil
 	}
-	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= MinProtocolPersistentSourceNAT {
 		return nil
 	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
 		m.recordHelperStatusLocked(&status)
-		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		if status.ConfigSnapshotProtocolVersion >= MinProtocolPersistentSourceNAT {
 			return nil
 		}
 	}
@@ -1025,7 +1036,7 @@ func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) er
 		"%w: helper config snapshot protocol version %d < required %d for persistent source NAT snapshots",
 		ErrPersistentSourceNATProtocolIncompatible,
 		m.lastStatus.ConfigSnapshotProtocolVersion,
-		ProtocolVersion,
+		MinProtocolPersistentSourceNAT,
 	)
 }
 
@@ -1062,9 +1073,12 @@ func (m *Manager) ensureRequiredSnapshotProtocolLocked(snap *ConfigSnapshot) err
 	if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); err != nil {
 		return err
 	}
-	// Secure-tunnel gate FIRST, then egress-zone. Both fence the same
-	// ProtocolVersion, so on a version mismatch both would fire; the order
-	// decides which sentinel the caller sees. The secure-tunnel gate is SCOPED
+	// Secure-tunnel gate FIRST, then egress-zone. Since #6648 they no longer
+	// fence the same number — the secure-tunnel gate asks "can this helper read
+	// the refusal contract?" (floor 7) and the egress-zone gate asks "will this
+	// helper accept our snapshot at all?" (exact equality with ProtocolVersion)
+	// — so both fire only for a helper below BOTH, and the order still decides
+	// which sentinel the caller sees there. The secure-tunnel gate is SCOPED
 	// (snapshotRequiresRefusalProtocol — it returns nil unless the snapshot
 	// actually carries a flagged row) while the egress-zone gate is
 	// UNCONDITIONAL, so asking the specific one first reports the narrower,
