@@ -98975,3 +98975,54 @@ prose edit above them added. No diff falls in the new test body.
   Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no cluster
   smoke is owed.
 - **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
+
+- **Timestamp**: 2026-08-21 18:40 PDT
+- **Action**: #7016 — an UNPUBLISHED policy counter is no data, not a failure
+
+  `#6743` activated the #3965 bulk policy-counter path on all seven
+  observability call sites for the first time (before it, the daemon published
+  `LegacyDataPlaneAdapter`, whose method set the bulk probe missed, and the
+  fallback promoted to the retired eBPF shim array the userspace runtime never
+  increments — every daemon-wired surface reported hit counts of ZERO). The
+  residual is the ERROR SIGNAL: the bulk reader returns
+  `ErrPolicyCounterUnpublished` for a rule the helper has not published, and
+  every surface folded that into its degraded-read channel, so ONE unpublished
+  rule discarded the WHOLE response — REST 500, gRPC `codes.Internal`, a
+  "policy counter read failed" warning naming a fault that does not exist, and
+  a `xpf_counter_read_errors_total` bump that is the #3643 false-alert class.
+  Reachable before the first 1 Hz status poll lands (`IsLoaded()` only means
+  the shim is loaded) and under #5679 config skew.
+
+  Fix: flag the ITEM, serve the response — the disposition the ZONE half of
+  `pkg/api/security.go` already used for `dataplane.ErrCounterNotPopulated`
+  (#6843). REST sets the existing `hit_counters_unavailable` (#5580); gRPC gets
+  an additive `PolicyRule.hit_counters_unavailable` (field 23); the CLI/gRPC
+  text tables render `n/a` plus a distinct "not yet published" note; the
+  collector counts the rule into a new
+  `xpf_policy_counters_unpublished_rules` gauge instead of bumping the error
+  counter. A GENUINE read failure keeps every fail-loud behaviour (#3345/#3408).
+
+  Validation: reproduced firsthand at master `314fbe17a` — the real Manager +
+  real LegacyDataPlaneAdapter in warm-up return an EMPTY snapshot with a nil
+  error and `policiesHandler` answered
+  `500 {"error":"policy counter read failed: policy counter not published"}`.
+  Mutation matrix 21/21 RED (one mutation per changed disposition, `go vet`
+  clean at each, non-zero exit captured); the first run exposed a FIXTURE gap —
+  both CLI global-rule cells came back GREEN because the shared CLI store has
+  no global policy, so the 7016 CLI binder now builds its own. Full
+  `go test -count=1 ./...` exit 0. Go + `.proto`/`.pb.go` only; nothing under
+  `userspace-dp/` or `userspace-xdp/`, so no cluster smoke is owed.
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/api/metrics.go,
+  pkg/api/metrics_counters.go, pkg/api/metrics_descriptors_policy.go,
+  pkg/grpcapi/server_show_zones.go, pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  cmd/cli/show_security.go, pkg/api/README.md, pkg/grpcapi/README.md,
+  pkg/api/security_policy_counter_unpublished_7016_test.go,
+  pkg/cli/cli_show_policies_unpublished_7016_test.go,
+  pkg/grpcapi/server_policies_counter_unpublished_7016_test.go,
+  pkg/dataplane/userspace/policycounters_warmup_7016_test.go,
+  cmd/cli/show_policies_unpublished_7016_test.go, pkg/api/metrics_test.go,
+  pkg/api/metrics_scoped_global_3286_test.go,
+  pkg/api/security_screen_nil_3476_test.go,
+  pkg/api/zones_policies_counter_error_test.go, _Log.md
