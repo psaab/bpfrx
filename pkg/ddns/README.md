@@ -72,6 +72,34 @@ diagnostics (#2781). A construction failure
 already fired) — fail-open, matching the rfc2136 posture. Live-provider verify
 is the deferred lab gate; the mock-server tests are the merge gate.
 
+### Where a credential may be placed in a URL (#7406)
+
+The two slots named above — the **userinfo** (`user:pass@host`) and the **query
+string** (`?token=...`) — are the slots `config.RedactURL` strips, along with
+the fragment and an authority that cannot be a `host:port` (#6609).
+
+A credential placed in the URL's **hostname** or **path** is rendered
+**verbatim** by every surface that redacts these leaves today — the package's
+own error and log lines, the commit-time warnings, the `show` output, and the
+REST config-read routes:
+
+    https://SECRET.dyn.example.com/nic/update     <-- rendered verbatim
+    https://example.com/nic/SECRET/update         <-- rendered verbatim
+
+This is not an oversight that a better redactor closes.
+`https://SECRET.dyn.example.com/upd` and `https://api.example.com/upd` are
+indistinguishable strings, so any rule that redacts the first redacts every
+host — which would remove the scheme/host/path that make a redacted URL worth
+printing at all.
+
+**Put credentials in the userinfo or the query string, where they are
+redacted.** Some providers do issue a token as a hostname label or a path
+segment; a provider configured that way has its token rendered in cleartext on
+the surfaces above.
+
+Tracked in #7406, which also records the two ways the residual could be closed
+(explicit operator marking of a leaf as secret, or accepting and documenting it).
+
 ### `server` / URL rendering in errors — parse first, then redact (#6545, #6606)
 
 Two rules, and the split between them is the whole discipline:
