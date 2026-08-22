@@ -103065,6 +103065,45 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
   docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6628 — session-sync authentication was fixed per connection at
+    handshake time and a key commit does not restart comms, so an established
+    stream stayed unauthenticated forever and a rotation never rekeyed it.
+    Added an IN-PLACE upgrade: a four-frame exchange over the live connection
+    that only ever promotes and never drops. Required splitting authConn's
+    single `key` into readKey/writeKey — one field gates BOTH
+    `sync_conn_read.go` (require a trailer) and `sync_protocol.go` (seal), so a
+    naive promotion desyncs the stream and drops the connection. Fourth frame
+    (Ack) exists so the RESPONDER does not switch until it has verified the
+    initiator's proof; a three-frame version drops the connection whenever the
+    two nodes hold different keys. SPLIT: the hostile-stream residual is #7441
+    with #5078's three constraints verbatim. Matrix 9/9 RED — U4b caught that
+    the authPSK STAMP in wrapSyncConn was unbound while its comparison was
+    (hand-built fixture); rebuilt the fixture through wrapSyncConn.
+  - **File(s)**: pkg/cluster/{sync_auth_upgrade.go,
+    sync_auth_upgrade_6628_test.go,sync_auth.go,sync.go,sync_conn_read.go,
+    sync_protocol.go,sync_auth_test.go,sync_capabilities_6650_test.go,
+    sync_config_crypto_6629_test.go,README.md},
+    pkg/daemon/{daemon_apply_tail.go,cluster_auth_upgrade_wiring_6628_test.go},
+    docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6599 — fenced the session-sync delta filter's fabric-redirect
+    carve-out on INGRESS-side RG ownership. It admitted every fabric-redirect
+    delta unconditionally, which is the emission channel the transient-purge
+    re-entry class rides: a node that owns neither side of a flow could push an
+    identity-less Open (plus its forward-wire alias) that overwrote the RG
+    owner's authoritative session family under latest-generation-wins.
+  - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+    pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6675 — made pkg/dataplane/userspace hermetic w.r.t. the kernel
+    ip-rule table via TestMain, so an EPERM dump can no longer nil-deref a
+    snapshot and SIGSEGV the whole test binary. Chose stubbing over skipping so
+    the package keeps coverage in reduced-capability sandboxes.
+  - **File(s)**: pkg/dataplane/userspace/hermetic_iprules_6675_test.go,
+    docs/engineering-style.md
 
 - **Timestamp**: 2026-08-22
   - **Action**: #6682 — an unzoned INGRESS (zone id 0) no longer falls through to
