@@ -103096,3 +103096,22 @@ prose edit above them added. No diff falls in the new test body.
     owner's authoritative session family under latest-generation-wins.
   - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
     pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6648 — gave each per-feature required-protocol gate an
+    immutable floor (the version its wire representation landed at) instead of
+    the shared ProtocolVersion, so an unrelated wire bump no longer retroactively
+    re-arms every gate and reports a false reason. #6649 and #6647 were measured
+    already-closed at master (by #6722's unconditional equality gate, and by
+    #5485 + #5488 F7 respectively) and are pinned rather than re-fixed: added the
+    composition cell for #6649, and hardened goFunctionSource to return CODE so
+    the #6647 compensator's source-scanning guard can no longer be satisfied by a
+    comment quoting the call it demands.
+  - **File(s)**: pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/manager_compile.go,
+    pkg/dataplane/userspace/protocol_feature_floors_6648_test.go (new),
+    pkg/dataplane/userspace/shim_loader_boundary_test.go,
+    pkg/dataplane/userspace/manager_capabilities_test.go,
+    pkg/dataplane/userspace/set_forwarding_armed_generation_5648_test.go,
+    pkg/dataplane/userspace/sync_desired_forwarding_generation_6165_test.go,
+    docs/userspace-dataplane-architecture.md
