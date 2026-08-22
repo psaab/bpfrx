@@ -101993,3 +101993,19 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+## 2026-08-22 — #6625 secret value rendered by the #1798 control-char validators
+- **Timestamp**: 2026-08-22
+- **Action**: The #1798 control-character validator rendered the offending
+  leaf's VALUE into its error, and for a Secret leaf the secret appeared TWICE
+  (quoted as the value, and as a component of the rendered path). Reproduced
+  byte-for-byte against master before editing. Fixed by masking through the
+  SHARED `secretIndices` set (ast_redact.go) rather than a second list, and
+  reporting the offending byte + offset instead of the value. The sweep the
+  issue demanded found a SECOND leaking surface: the lenient twin
+  `sanitizeNodesControlChars` returns the same value-bearing path for the caller
+  to log, on Store.Load at boot and Store.SyncApply on HA peer-sync — so a
+  persisted key was re-published every boot. Both fixed.
+- **File(s)**: pkg/config/freetext.go,
+  pkg/config/secret_value_in_validator_error_6625_test.go (new),
+  docs/config-schema.md, _Log.md

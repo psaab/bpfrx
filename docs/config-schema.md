@@ -9193,6 +9193,32 @@ CLAUDE.md dual-shape rule). The masked render is byte-identical to the
 cleartext render except at the secret tokens and stays structurally valid
 (the placeholder is quoted where needed).
 
+**The #1798 control-character validators use the SAME set (#6625).** They are
+not display paths, but they render a config path and, on the strict side, the
+offending VALUE — and for a secret leaf the value IS the secret, appearing
+twice: quoted as the value, and again as a component of the path that names it
+(`chassis cluster authentication-key <PSK>`). The trigger is routine rather than
+exotic: a PSK pasted from a password manager, a terminal or a file commonly
+carries a leading or trailing tab or CR, so the operator does the ordinary thing
+and the refusal publishes the key to commit output, the daemon log and the audit
+journal at once.
+
+Both surfaces now mask through `renderNodePath`, and the strict one reports the
+offending byte and its offset instead of the value — `contains a control
+character (0x09 at offset 0)`, which is enough to correct the input without
+disclosing it. That is the same trade `checkKey`
+(`compiler_validate_strict_routing.go`) already made for typed `Secret` fields,
+and the same one `urlParseCause` makes in `pkg/ddns`: name the reason, never the
+input. A NON-secret leaf still renders its value, because for a description or a
+hostname that value is exactly the diagnostic.
+
+Fixing only the strict validator would have been the failure this project keeps
+hitting — one of several symmetric surfaces repaired while its twin keeps
+leaking. The LENIENT twin (`sanitizeNodesControlChars`, used by `Store.Load` at
+boot and `Store.SyncApply` on HA peer-sync) returned the same value-bearing path
+for the caller to log, so an already-persisted key with a stray tab was
+re-published on every single boot. Both are fixed together.
+
 **Secret-leaf set = #2053's `config.Secret` field set** resolved to AST
 keyword signatures (verified against the compiler's `Secret(...)` sites):
 distinctive keywords `pre-shared-key` (keeps the `ascii-text`/`hexadecimal`

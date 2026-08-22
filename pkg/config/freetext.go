@@ -172,26 +172,118 @@ func joinNodePath(prefix string, keys []string) string {
 	return prefix + " " + joined
 }
 
+// renderNodePath builds the same human-readable path from a FLATTENED key path,
+// with every secret VALUE token masked (#6625).
+//
+// The path is where the first half of the leak lived: for a leaf like `chassis
+// cluster authentication-key <PSK>` the secret is not only the offending value,
+// it is also a component of the path that names it. Sanitizing control
+// characters made it printable; it did not make it safe.
+//
+// The secret set comes from secretIndices (ast_redact.go) — the SAME resolution
+// the raw-AST display paths use, not a second list. A validator that decided
+// for itself which leaves are secret would drift from the renderer the moment
+// either gained a keyword, and the drift would be silent in the direction that
+// matters.
+func renderNodePath(fp []string) string {
+	clean := make([]string, len(fp))
+	for i, k := range fp {
+		clean[i] = sanitizeControlChars(k)
+	}
+	for _, idx := range secretIndices(fp) {
+		if idx >= 0 && idx < len(clean) {
+			clean[idx] = SecretDataPlaceholder
+		}
+	}
+	return strings.Join(clean, " ")
+}
+
+// controlCharDetail describes the FIRST control character in s without echoing
+// any of it: the byte value and its offset (#6625).
+//
+// That is enough to fix the input — an operator who pasted a PSK with a
+// trailing tab is told "0x09 at offset 15" and can see it — without publishing
+// the value to commit output, the daemon log and the audit journal. It is the
+// same trade urlParseCause makes in pkg/ddns: name the reason, never the input.
+func controlCharDetail(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return fmt.Sprintf("0x%02x at offset %d", s[i], i)
+		}
+	}
+	return "none"
+}
+
+// isSecretIndex reports whether position idx of the flattened key path fp is a
+// secret VALUE token.
+func isSecretIndex(fp []string, idx int) bool {
+	for _, i := range secretIndices(fp) {
+		if i == idx {
+			return true
+		}
+	}
+	return false
+}
+
 // validateNodesControlChars walks the (group-expanded) AST and returns
 // an error for the first value or annotation containing a control
 // character, or the first annotation containing a `*/`/`/*` comment
 // delimiter (#3900). Strict commit-path only — see the package comment
 // above.
 func validateNodesControlChars(nodes []*Node, prefix string) error {
+	return validateNodesControlCharsAt(nodes, splitNodePathPrefix(prefix))
+}
+
+// splitNodePathPrefix recovers the flattened key path from the joined string
+// form the exported entry point still accepts. An empty prefix is the root.
+func splitNodePathPrefix(prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	return strings.Split(prefix, " ")
+}
+
+// validateNodesControlCharsAt is the recursion, carrying the path as a SLICE
+// rather than a joined string (#6625).
+//
+// The slice is what makes the secret masking possible at all: secretIndices
+// resolves a keyword to the positions of its value tokens, so it needs the
+// components, not a rendered line. Carrying the joined string and re-splitting
+// per level would also have worked, but it would re-split a string built from
+// sanitized components — and a sanitized token can contain the space that split
+// on, silently shifting every index after it.
+func validateNodesControlCharsAt(nodes []*Node, base []string) error {
 	for _, n := range nodes {
-		nodePath := joinNodePath(prefix, n.Keys)
-		for _, k := range n.Keys {
-			if hasControlChars(k) {
-				return fmt.Errorf("%s: value %q contains control characters (newlines and other control characters are not allowed in configuration values)", nodePath, k)
+		fp := append(append([]string(nil), base...), n.Keys...)
+		nodePath := renderNodePath(fp)
+		for i, k := range n.Keys {
+			if !hasControlChars(k) {
+				continue
 			}
+			// #6625: a SECRET leaf's value must not be echoed. The path (with
+			// the secret itself masked) plus the offending byte and its offset
+			// says everything an operator needs to correct the input.
+			//
+			// The trigger is not exotic: a PSK pasted from a password manager,
+			// a terminal or a file routinely carries a leading or trailing tab
+			// or CR. The operator does the ordinary thing, the commit is
+			// refused, and the refusal published the key they were setting —
+			// to the CLI, the daemon log and the audit journal at once.
+			if isSecretIndex(fp, len(base)+i) {
+				return fmt.Errorf("%s: value contains a control character (%s) — the value is withheld because this leaf is secret; remove the control character and re-enter it", nodePath, controlCharDetail(k))
+			}
+			return fmt.Errorf("%s: value %q contains control characters (newlines and other control characters are not allowed in configuration values)", nodePath, k)
 		}
+		// An annotation is operator prose attached to a node, never the secret
+		// value itself, so it keeps rendering — losing that diagnostic would be
+		// a real cost for no gain.
 		if hasControlChars(n.Annotation) {
 			return fmt.Errorf("%s: annotation %q contains control characters (newlines and other control characters are not allowed in annotations)", nodePath, n.Annotation)
 		}
 		if hasCommentDelim(n.Annotation) {
 			return fmt.Errorf("%s: annotation %q contains a comment delimiter (the sequences '*/' and '/*' are not allowed in annotations — they would close the comment and inject the remaining text as configuration on reload)", nodePath, n.Annotation)
 		}
-		if err := validateNodesControlChars(n.Children, nodePath); err != nil {
+		if err := validateNodesControlCharsAt(n.Children, fp); err != nil {
 			return err
 		}
 	}
@@ -204,6 +296,27 @@ func validateNodesControlChars(nodes []*Node, prefix string) error {
 // human-readable config path per modified node. Lenient-path
 // counterpart of validateNodesControlChars.
 func sanitizeNodesControlChars(nodes []*Node, prefix string) []string {
+	return sanitizeNodesControlCharsAt(nodes, splitNodePathPrefix(prefix))
+}
+
+// sanitizeNodesControlCharsAt is the recursion, carrying the path as a slice so
+// the returned warning path can mask secret VALUE tokens (#6625).
+//
+// This is the LENIENT twin of validateNodesControlCharsAt and it leaked the same
+// secret — the caller logs each returned path as
+// `sanitized control characters in configuration value at %q`, and the path is
+// built from n.Keys, which for `authentication-key <PSK>` INCLUDES the PSK.
+// Sanitizing the control characters made it printable, not safe.
+//
+// It is the worse of the two surfaces in one respect: the strict validator fires
+// once, on the operator's commit, while this runs on Store.Load at BOOT and on
+// Store.SyncApply for every HA peer-sync. An already-persisted key with a
+// stray tab was therefore re-published to the log on every single boot.
+//
+// Fixing only the strict side would have been the exact failure this project
+// keeps hitting — one of several symmetric surfaces repaired while its twin
+// keeps leaking.
+func sanitizeNodesControlCharsAt(nodes []*Node, base []string) []string {
 	var warnings []string
 	for _, n := range nodes {
 		changed := false
@@ -221,11 +334,14 @@ func sanitizeNodesControlChars(nodes []*Node, prefix string) []string {
 			n.Annotation = sanitizeCommentDelim(n.Annotation)
 			changed = true
 		}
-		nodePath := joinNodePath(prefix, n.Keys)
+		// The recursion carries the UNMASKED path so each level resolves
+		// secretIndices against the real keywords; masking happens only at
+		// render.
+		fp := append(append([]string(nil), base...), n.Keys...)
 		if changed {
-			warnings = append(warnings, nodePath)
+			warnings = append(warnings, renderNodePath(fp))
 		}
-		warnings = append(warnings, sanitizeNodesControlChars(n.Children, nodePath)...)
+		warnings = append(warnings, sanitizeNodesControlCharsAt(n.Children, fp)...)
 	}
 	return warnings
 }
