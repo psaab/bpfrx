@@ -15,7 +15,7 @@ Observed symptoms during OSPF/BGP convergence on an HA cluster:
 - **42-second barrier ack delays** during manual failover — peer barrier in
   `prepareUserspaceRGDemotionWithTimeout()` (`pkg/daemon/daemon_ha.go:1169`)
   waits for all queued session deltas to drain, but session installs from
-  `SetClusterSyncedSessionV4()` (`pkg/dataplane/userspace/manager_ha.go:542`)
+  `SetClusterSyncedSessionV4()` (`pkg/dataplane/userspace/manager_sessions.go`)
   are starved by continuous snapshot publishes
 - **Dozens of full snapshot rebuilds per second** during FRR route convergence —
   each `BumpFIBGeneration()` (`manager.go:378`) calls `buildSnapshot()` which

@@ -193,9 +193,9 @@ impl WgEngine {
         if self.peer_arc(&peer_pubkey).is_none() {
             return Err(HandshakeError::UnknownPeer);
         }
-        let by_index = self.sessions_by_local_index.read().unwrap();
-        let mut pending = self.pending.write().unwrap();
-        let mut by_peer = self.pending_by_peer.write().unwrap();
+        let by_index = self.sessions_by_local_index.read().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
+        let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
 
         // Abort any prior PENDING (not-yet-completed) handshake for this
         // peer (DoS bound: at most one pending reservation per peer). The
@@ -274,9 +274,9 @@ impl WgEngine {
     /// to undo in `sessions_by_local_index`. Idempotent.
     fn release_pending(&self, local_index: u32) {
         let _guard = lock_recover(&self.reconcile_lock);
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ph) = pending.remove(&local_index) {
-            let mut by_peer = self.pending_by_peer.write().unwrap();
+            let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
             // Only clear the peer→index map if it still points at us.
             if by_peer.get(&ph.peer_pubkey) == Some(&local_index) {
                 by_peer.remove(&ph.peer_pubkey);
@@ -352,7 +352,7 @@ impl WgEngine {
         // Stash the real (post-write) snow state into the pending entry so
         // `consume_response` can resume it.
         {
-            let mut pending = self.pending.write().unwrap();
+            let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
             if let Some(ph) = pending.get_mut(&local_index) {
                 ph.state = Some(state);
             } else {
@@ -429,7 +429,7 @@ impl WgEngine {
     fn peer_for_pending_index(&self, index: u32) -> Option<[u8; WG_KEY_LEN]> {
         self.pending
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&index)
             .map(|ph| ph.peer_pubkey)
     }
@@ -478,7 +478,7 @@ impl WgEngine {
         // Validate + take the snow state. The entry stays in `pending`
         // (state = None) so the index remains reserved.
         let (peer_pubkey, mut state) = {
-            let mut pending = self.pending.write().unwrap();
+            let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
             let ph = pending
                 .get_mut(&local_index)
                 .ok_or(HandshakeError::NoPendingHandshake)?;
@@ -496,7 +496,12 @@ impl WgEngine {
         // kill the pending handshake.
         let mut sink = [0u8; MSG_RESPONSE_NOISE_LEN];
         if state.read_message(parsed.noise_body, &mut sink).is_err() {
-            if let Some(ph) = self.pending.write().unwrap().get_mut(&local_index) {
+            if let Some(ph) = self
+                .pending
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&local_index)
+            {
                 ph.state = Some(state);
             }
             return Err(HandshakeError::Crypto);
@@ -540,9 +545,9 @@ impl WgEngine {
     /// Clear a reservation's `pending` entry and its `pending_by_peer` marker
     /// (if it still points at this index). Caller MUST hold `reconcile_lock`.
     fn clear_reservation_locked(&self, local_index: u32, peer_pubkey: &[u8; WG_KEY_LEN]) {
-        let mut pending = self.pending.write().unwrap();
+        let mut pending = self.pending.write().unwrap_or_else(|e| e.into_inner());
         pending.remove(&local_index);
-        let mut by_peer = self.pending_by_peer.write().unwrap();
+        let mut by_peer = self.pending_by_peer.write().unwrap_or_else(|e| e.into_inner());
         if by_peer.get(peer_pubkey) == Some(&local_index) {
             by_peer.remove(peer_pubkey);
         }
