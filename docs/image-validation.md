@@ -104,7 +104,7 @@ Scenarios:
 
 | Scenario | Proves |
 |---|---|
-| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path); **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
+| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path); **both slot ESP dirs fully staged with selectors seeded at the running kernel** and **every installed kernel package still held** (#6498); **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
 | **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 | **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
@@ -193,6 +193,61 @@ Both verdicts are pure functions over captured command output
 (`_efibootmgr_slot_verdict`, `_oneshot_clean_verdict`), unit-tested without a
 hypervisor in `scripts/image/test_validate_ab_slots_6494.py` (run by `make
 selftest`), in the same idiom as `_qemu_img_verdict`.
+
+### The rest of the first-boot substrate (#6498)
+
+Registration is not the whole LANE-1 contract. Two halves of it are invisible
+to the #6494 assertions, and scenario A now covers both.
+
+**The slot ESP dirs, and what each selector names.** A slot registers only if
+the bake staged its shim: `xpf-uefi-slots`' `register_slot()` returns 1 without
+ever calling `efibootmgr` when `/boot/efi/EFI/<slot>/shimx64.efi` is absent. So
+an unstaged slot LOOKS like a registration failure, pointing at the wrong half
+of the channel — which is why the ESP assertion runs BEFORE the NVRAM one and
+is diagnosed separately (a unit test pins that ordering). The selector is the
+half nothing else could see at all: a slot whose `xpf.selector` names a
+`vmlinuz`/`initrd` pair the image does not ship registers cleanly, boots
+cleanly, and exits 0 from both oneshots — and is a dead boot entry discovered
+only when the firmware actually falls through to it, i.e. during a rollback,
+the one moment the channel exists for. Scenario A asserts each selector names
+the RUNNING kernel, which is correct **because it is a factory boot**: the bake
+seeds both selectors at the single kernel it leaves in `/lib/modules` and
+scenario A re-asserts that count. After a promotion the two selectors
+legitimately differ, so this is deliberately a scenario-A assertion and not a
+general one.
+
+**The #1930 INC-0 kernel hold, on the booted image.** `bake.py` verifies the
+hold per-package — but inside `virt-customize`, before `virt-sysprep`, the
+sparsify/export, and the first boot. Nothing re-read it afterwards, so a hold
+that did not survive any of those steps shipped in a signed, `validated: true`
+image. The consequence is not cosmetic: an unattended apt run that moves the
+kernel can leave the appliance booting a kernel the verifier-gated shim `.o`
+was never verified against — no dataplane.
+
+> **The enumeration is the KERNEL package set, not the literal `linux-*`.**
+> #6498's acceptance criterion reads "every installed `linux-*` package appears
+> in `apt-mark showhold`". Asserted literally, that REDS every valid image:
+> `linux-base` is a hard dependency of `linux-image-*-generic`, and
+> `linux-libc-dev` / `linux-sysctl-defaults` / `linux-perf` are installed
+> alongside it. None are kernel packages and `bake.py` deliberately holds none
+> of them. The property the criterion reaches for is "the kernel cannot move",
+> so the gate enumerates exactly the four globs `bake.py` holds
+> (`linux-image-*`, `linux-headers-*`, `linux-modules-*`, `linux-generic`) with
+> the same `${db:Status-Status}` installed-only filter. A **drift canary** binds
+> the two enumerations: a gate asserting a different set than the bake protects
+> would either red on a good image or certify an unprotected one, so the
+> agreement itself is the property under test.
+
+An EMPTY enumeration FAILS rather than passing. "All zero of them are held" is
+the pass that would argue against anyone re-examining the property — and
+`bake.py`'s own hold fragment collapsed to an empty enumeration twice during
+#1926 (an unexpanded `${Package}`, then `dpkg-query -W` returning
+never-installed names).
+
+`_ab_slot_esp_verdict` and `_kernel_hold_verdict` are pure functions over
+captured command output, unit-tested (with the bake-agreement canaries and the
+call-site wiring assertions) in
+`scripts/image/test_validate_ab_substrate_6498.py`, run by `make selftest`.
 
 ---
 
