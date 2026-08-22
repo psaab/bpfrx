@@ -62,6 +62,13 @@ func hostileBody(shape string) string {
 	return strings.Replace(shape, "%ECHO%", providerProse+": "+providerEchoURL, 1)
 }
 
+// decodeSentinel is the leak vector for the DECODE sites, which is a different
+// shape from the render sites. Go's JSON decoder does not quote a mismatched
+// STRING back — it names the type — but it does quote a mismatched NUMBER in
+// full, and the number is provider-chosen and arbitrarily long. So the decode
+// cells plant a long digit run and assert none of it survives.
+const decodeSentinel = "9876543210123456789012345678901234567890"
+
 // serveOnce answers every request with the given status + body and records that
 // it was reached, so a cell cannot pass because nothing was requested.
 type recordingProvider struct {
@@ -452,5 +459,246 @@ func TestProviderDecodeScopeIsLoadBearing_6634(t *testing.T) {
 		t.Error("state.go no longer has an unscrubbed json.Unmarshal render, so the file scope " +
 			"excludes nothing and should be DELETED rather than left standing — a scope that " +
 			"covers no site silently exempts whatever moves into it next")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Staged providers: the SECOND surface of a two-call backend.
+//
+// A single always-fail fake reaches only the FIRST call a backend makes, and
+// this issue is precisely a one-of-N-surfaces class — Route 53 renders provider
+// text in listRRSet AND in change(), and Cloudflare decodes a provider body in
+// do(), resolveZoneID() AND listRecords(). A fake that answers everything with
+// an error never gets past listRRSet or past do(), so those later sites would
+// have been "covered" by a cell that never executed them.
+// ---------------------------------------------------------------------------
+
+// stagedProvider answers each request from a per-request script, so a cell can
+// let the first call succeed and fail the one it is actually testing. It records
+// how many requests were served, which the cells assert on: reaching the second
+// site requires TWO round trips, and a cell that saw only one never got there.
+type stagedProvider struct {
+	t      *testing.T
+	served int
+	// stages are consumed in order; the last one repeats.
+	stages []stagedResponse
+	srv    *httptest.Server
+}
+
+type stagedResponse struct {
+	status int
+	body   string
+}
+
+func newStagedProvider(t *testing.T, stages ...stagedResponse) *stagedProvider {
+	t.Helper()
+	p := &stagedProvider{t: t, stages: stages}
+	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := p.stages[len(p.stages)-1]
+		if p.served < len(p.stages) {
+			st = p.stages[p.served]
+		}
+		p.served++
+		w.WriteHeader(st.status)
+		_, _ = w.Write([]byte(st.body))
+	}))
+	t.Cleanup(p.srv.Close)
+	return p
+}
+
+// TestProviderResponseTextSecondSurfaces_6634 covers the render and decode sites
+// a single-response fake cannot reach. Each cell asserts the request COUNT, so
+// it fails loudly if the backend short-circuits before the site under test
+// rather than passing on an assertion that never ran.
+func TestProviderResponseTextSecondSurfaces_6634(t *testing.T) {
+	echo := providerProse + ": " + providerEchoURL
+
+	for _, tc := range []struct {
+		name string
+		// stages script the responses; the site under test is driven by the last.
+		stages []stagedResponse
+		run    func(t *testing.T, u string) error
+		// wantServed is how many round trips reaching the site requires.
+		wantServed int
+		// sentinel is what must not survive.
+		sentinel string
+	}{
+		{
+			// Route 53 change(): the GET rrset list must SUCCEED so UpsertLease
+			// proceeds to the POST, which is the site that renders Code/Message.
+			name: "route53_change_error_message",
+			stages: []stagedResponse{
+				{http.StatusOK, `<?xml version="1.0"?><ListResourceRecordSetsResponse>` +
+					`<ResourceRecordSets></ResourceRecordSets></ListResourceRecordSetsResponse>`},
+				{http.StatusBadRequest, `<?xml version="1.0"?><ErrorResponse><Error>` +
+					`<Code>InvalidChangeBatch</Code><Message>` + echo +
+					`</Message></Error></ErrorResponse>`},
+			},
+			run:        runRoute53,
+			wantServed: 2,
+			sentinel:   providerEchoSecret,
+		},
+		{
+			// Cloudflare resolveZoneID(): the envelope must decode so the flow
+			// reaches the SECOND json.Unmarshal, over env.Result.
+			name: "cloudflare_decode_zones",
+			stages: []stagedResponse{
+				{http.StatusOK, `{"success":true,"errors":[],"result":` + decodeSentinel + `}`},
+			},
+			run:        runCloudflare,
+			wantServed: 1,
+			sentinel:   decodeSentinel,
+		},
+		{
+			// Cloudflare listRecords(): zones must resolve first, so this needs
+			// two round trips to reach the THIRD json.Unmarshal.
+			name: "cloudflare_decode_records",
+			stages: []stagedResponse{
+				{http.StatusOK, `{"success":true,"errors":[],` +
+					`"result":[{"id":"ZONEID1","name":"example.net"}]}`},
+				{http.StatusOK, `{"success":true,"errors":[],"result":` + decodeSentinel + `}`},
+			},
+			run:        runCloudflare,
+			wantServed: 2,
+			sentinel:   decodeSentinel,
+		},
+		{
+			// Cloudflare do(): the envelope itself does not decode.
+			name: "cloudflare_decode_response",
+			stages: []stagedResponse{
+				{http.StatusOK, `{"success":true,"errors":[],"result":` + decodeSentinel},
+			},
+			run:        runCloudflare,
+			wantServed: 1,
+			sentinel:   decodeSentinel,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newStagedProvider(t, tc.stages...)
+			err := tc.run(t, p.srv.URL)
+
+			if p.served != tc.wantServed {
+				t.Fatalf("this cell needs %d round trips to REACH the site under test; the "+
+					"backend made %d. The assertions below would be measuring a different "+
+					"site, or none.", tc.wantServed, p.served)
+			}
+			if err == nil {
+				t.Fatal("the staged failure must produce a non-nil error; got nil, so every " +
+					"assertion below would be vacuous")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, tc.sentinel) {
+				t.Errorf("provider-chosen bytes reached the returned error:\n  error = %s\n"+
+					"Render provider text through scrubProviderText, and a decoder's own error "+
+					"through scrubInnerError.", msg)
+			}
+			if len(msg) > maxProviderTextBytes+256 {
+				t.Errorf("the error is %d bytes; a provider-chosen render must stay O(%d), "+
+					"not O(%d):\n  %s", len(msg), maxProviderTextBytes, httpMaxResponseBody, msg)
+			}
+			if !strings.Contains(msg, "ddns ") {
+				t.Errorf("the error must still name the backend; got:\n  %s", msg)
+			}
+		})
+	}
+}
+
+// TestScrubProviderTextRules_6634 is the per-RULE table. The end-to-end cells
+// above prove the BACKENDS call the scrubber; this proves each rule inside it
+// does its own work. Without it a mutation that disabled exactly one of the
+// three shapes would still be caught by a cell whose payload happens to trip
+// two of them, and the matrix would report a red that localises nothing.
+//
+// Each row therefore trips ONE rule and only one. The echo URL used end to end
+// carries both a scheme separator and userinfo, which is realistic but useless
+// for localisation.
+func TestScrubProviderTextRules_6634(t *testing.T) {
+	const secret = "S3CR3T-RULE-6634"
+
+	for _, tc := range []struct {
+		name string
+		in   string
+		// wantWithheld is true when the sentinel-bearing token must be replaced.
+		wantWithheld bool
+		// note says which rule the row exercises, so a failure names it.
+		note string
+	}{
+		{
+			name:         "scheme_separator_only",
+			in:           "invalid request https://prov.example/update?token=" + secret,
+			wantWithheld: true,
+			note:         `the "://" rule — a URL with no userinfo, which is the DuckDNS echo shape`,
+		},
+		{
+			name:         "userinfo_only_no_scheme",
+			in:           "rejected credentials user:" + secret + "@prov.example",
+			wantWithheld: true,
+			note:         "the userinfo rule — a ':' before an '@', with no scheme to trip the first rule",
+		},
+		{
+			name:         "percent_encoded_only",
+			in:           "bad target https%3A%2F%2Fuser%3A" + secret + "%40prov.example",
+			wantWithheld: true,
+			note:         "the %XX rule — the encoded form, which trips neither of the other two",
+		},
+		{
+			name:         "bare_email_survives",
+			in:           "quota exceeded, contact support@prov.example",
+			wantWithheld: false,
+			note:         "a bare user@host carries no secret; withholding it would eat legitimate prose",
+		},
+		{
+			name:         "percentage_survives",
+			in:           "you are at 80% of quota",
+			wantWithheld: false,
+			note:         "a '%' not followed by two hex digits is not an escape",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubProviderText(tc.in)
+
+			// NON-VACUITY: the input must have carried something to withhold, and
+			// the surrounding prose must survive either way — a row that passes
+			// because everything was withheld is not testing a rule.
+			firstWord := strings.Fields(tc.in)[0]
+			if !strings.Contains(got, firstWord) {
+				t.Fatalf("the leading prose %q must survive; scrubbing everything makes this "+
+					"row pass for the wrong reason.\n  in:  %q\n  got: %q", firstWord, tc.in, got)
+			}
+
+			if tc.wantWithheld {
+				if strings.Contains(got, secret) {
+					t.Errorf("%s: the credential-bearing token was rendered.\n  in:  %q\n  got: %q",
+						tc.note, tc.in, got)
+				}
+				if !strings.Contains(got, providerURLWithheld) {
+					t.Errorf("%s: the token must be REPLACED by %q, not merely dropped — the "+
+						"operator has to see that something was withheld.\n  got: %q",
+						tc.note, providerURLWithheld, got)
+				}
+				return
+			}
+			if got != tc.in {
+				t.Errorf("%s: this text carries no credential and must pass through unchanged.\n"+
+					"  in:  %q\n  got: %q", tc.note, tc.in, got)
+			}
+		})
+	}
+}
+
+// TestScrubProviderTextEmptyIsDistinguishable_6634 keeps "the provider said
+// nothing" separable from "the provider's text was withheld". They are different
+// diagnoses — one means an empty body, the other means the body was a URL — and
+// collapsing them would send an operator looking in the wrong place.
+func TestScrubProviderTextEmptyIsDistinguishable_6634(t *testing.T) {
+	if got := scrubProviderText(""); got != providerTextEmpty {
+		t.Errorf("empty provider text must render %q; got %q", providerTextEmpty, got)
+	}
+	if got := scrubProviderText("   \n\t "); got != providerTextEmpty {
+		t.Errorf("whitespace-only provider text must render %q; got %q", providerTextEmpty, got)
+	}
+	if got := scrubProviderText("https://user:pw@h/"); got == providerTextEmpty {
+		t.Errorf("a withheld URL must NOT render as %q — that reads as an empty response",
+			providerTextEmpty)
 	}
 }
