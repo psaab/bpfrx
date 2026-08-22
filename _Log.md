@@ -104158,6 +104158,47 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: scripts/image/make_config_drive.py, scripts/deploy/xpf-deploy.py,
   scripts/image/test_config_drive_creation_umask_6764.py
 
+## 2026-08-22 — #6763 staged-gen GC fails closed on an unresolvable current-gen
+- **Timestamp**: 2026-08-22
+- **Action**: GC read `if cur, rerr := c.ResolveCurrent(); rerr == nil && cur !=
+  ""` — the error was DISCARDED, so when current-gen could not be resolved the
+  live generation was never added to the protection set and the destructive loop
+  deleted it once outside the retention window. Every ResolveCurrent error path
+  means "cannot establish which generation is live", including a DANGLING
+  current-gen (corrupt layout — exactly when protection matters most). GC now
+  returns an error and deletes nothing. Absence stays benign: ResolveCurrent
+  returns ("", nil) with no link, so a never-published root still GCs.
+- **Not a new policy**: publish_generation.go already applies this rule to the
+  JOURNAL half of the protection set (#4876 — unknown protection set means skip
+  GC, "skipping is safe"). current-gen was the half that never got it. All three
+  callers treat a GC error as a warning, so the refusal cannot block a publish,
+  seed or cut.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go,
+  pkg/upgrade/stagedgen/stagedgen_test.go, docs/in-place-upgrade.md
+
+
+## 2026-08-22 — #6758 clear BootNext when the two-phase arm fails after SetBootNext
+- **Timestamp**: 2026-08-22
+- **Action**: The arm records ARMING, sets BootNext, reads it back, then advances
+  to ARMED. Every failure after SetBootNext SUCCEEDED returned an error and left
+  the journal at ARMING — while the firmware would still one-shot the candidate.
+  ARMING documents the opposite ("the firmware still boots the known-good
+  default"), which is what lets Arm re-arm and what stops self-recovery
+  suppressing failback, so a drained node could rejoin with an untested kernel
+  queued. Added KernelSystem.ClearBootNext (efibootmgr --delete-bootnext) and a
+  single-sourced disarmAfterArmFailure on all four post-SetBootNext failure
+  paths. A failed clear is reported loudly with the operator command rather than
+  escalated to a journal state (ARMED would assert a recorded promote binary
+  that may be exactly what is missing).
+- **Sharpest path**: recordPromoteBinary failing AFTER a confirmed readback left
+  a genuinely queued candidate with no xpfd designated to verify it — the thing
+  #6601 added that record to prevent.
+- **File(s)**: pkg/upgrade/kernel.go, pkg/upgrade/kernel_linux.go,
+  pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_test.go,
+  pkg/upgrade/kernel_bootnext_disarm_6758_test.go (new),
+  docs/in-place-upgrade.md
+
+
 ## 2026-08-22 — #6767 apply-groups work budget covers the merge fan-out
 - **Timestamp**: 2026-08-22
 - **Action**: Work was charged once per `apply-groups <name>` reference, while

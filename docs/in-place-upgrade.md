@@ -808,7 +808,22 @@ window for ALL FOUR managed binaries:
   the pinned generation is UNKNOWN, so publish-generation SKIPS the GC
   rather than run it with an empty protection set and reap the crashed
   cut's source (which would leave the resume unrecoverable). An absent
-  journal means no crashed cut, so GC proceeds normally.
+  journal means no crashed cut, so GC proceeds normally. **The SAME rule now covers
+  the other half of the protection set (#6763):** `current-gen` is
+  resolved explicitly, and that resolution can FAIL — a readlink error, a
+  hand-edited symlink carrying path components that would escape the
+  staged-gen root, a target that is not a valid `genid`, or a DANGLING
+  `current-gen` whose directory is missing. The error used to be
+  DISCARDED, so the live generation simply went unprotected and GC reaped
+  it as soon as it fell outside the retention window — with the dangling
+  case being the sharpest, since a corrupt layout is exactly when the live
+  generation most needs protecting. GC now REFUSES and deletes nothing
+  when `current-gen` cannot be resolved. The benign case stays benign:
+  `ResolveCurrent` returns `("", nil)` when there is no `current-gen` link
+  at all, so a never-published root still GCs normally — absence is
+  determinate, failure is not. All three GC callers already treat a GC
+  error as a warning, never fatal, so the refusal degrades to "GC
+  skipped" and cannot block a publish, a seed or a cut.
 - **Same-version replacement (B-P3b OPT1).** `versions/<ver>` carries a
   `.srcgen` stamp; the copy-skip is generation-aware. A same-version
   re-stage with NEW bytes (a new generation) RE-COPIES a stale, non-live
@@ -1527,6 +1542,26 @@ treats an unreadable observation as a definite safe state:
      the variable must NOT yield a verified-ARMED journal;
   4. only THEN durably transition `ARMING -> ARMED`, recording the
      confirmed `BootID` for boot-provenance.
+  5. **and on ANY failure after step 2, clear the one-shot (#6758).**
+     `SetBootNext` has already succeeded by then, so returning an error and
+     leaving the journal at `ARMING` used to leave the FIRMWARE armed while
+     every durable software gate said unarmed — the exact inverse of what
+     `ARMING` asserts below. Steps 3 and 4 both fail this way, as does the
+     `recordPromoteBinary` write between them, and that last one is the
+     sharpest: the readback had already CONFIRMED the one-shot, so the
+     candidate was genuinely queued while no xpfd was designated to verify
+     it — an armed candidate with nothing to run the promotion gate, which
+     #6601 added that record specifically to prevent. The undo is
+     single-sourced (`disarmAfterArmFailure`) because four failure paths
+     needing the identical cleanup is how one gets missed, and clearing an
+     absent BootNext is not an error so it is safe even where the firmware
+     dropped the variable itself. If the clear ITSELF fails the divergence
+     is real and cannot be undone in-process, so the error says so and names
+     `efibootmgr --delete-bootnext`; it is deliberately NOT escalated to a
+     journal state, because `ARMED` asserts a verified one-shot WITH a
+     recorded promote binary — precisely what may be missing on the
+     `recordPromoteBinary` path — so claiming it would substitute a
+     different false record for this one.
 
   `ARMING` sits BELOW `ARMED` in the journal order, so a journal stuck
   there (readback failed / never ran) lets `Arm` RE-ARM (the `>= ARMED`
