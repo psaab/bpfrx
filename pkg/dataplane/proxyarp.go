@@ -38,6 +38,11 @@ var (
 	neighListSeam = netlink.NeighList
 	neighSetSeam  = netlink.NeighSet
 	neighDelSeam  = netlink.NeighDel
+	// linkByIndexSeam resolves an ifindex to its link so the procfs name for
+	// the proxy responder sysctl can be derived. Wrapped as a package var so
+	// the #6536 test can inject a transient resolution failure without
+	// deleting a real netdev mid-test.
+	linkByIndexSeam = netlink.LinkByIndex
 )
 
 // proxyARPSysctlSeam wraps the per-interface procfs writes that toggle the
@@ -193,12 +198,32 @@ func toggleProxyResponders(ifaceFamilies map[string]map[int]struct{}, enable boo
 // set, every NTF_PROXY entry found on them is stale and NeighDel'd. Pass nil
 // when there is no prior state to sweep.
 //
+// ifaceNames maps each ifindex in ifaceMap to the Linux netdev name the
+// CALLER resolved it from. It is the fallback the enabled-set keys are built
+// on when netlink cannot resolve the ifindex back to a link (#6536).
+//
+// #6536 — WHY A FALLBACK NAME AND NOT A DROPPED ENTRY. The returned enabled
+// set is the daemon's memory of the interfaces whose responder sysctl it must
+// eventually tear down, and the ONLY input to that teardown diff: an interface
+// that drops out of the set is disabled (a destructive sysctl write) and
+// forgotten (so the #4955 NTF_PROXY sweep loses it too). Both are correct for
+// "no longer configured" and both are wrong for "still configured, but the
+// ifindex would not resolve this pass" — netlink can fail transiently
+// (ENOBUFS on a busy dump, EMFILE, a VLAN netdev being re-created), and a
+// pre-#6536 LinkByIndex error folded that case into "not configured" and
+// disabled a live responder. Every ifindex reaching the sysctl step came from
+// the config, so it is ALWAYS still configured; the caller already resolved
+// its name to obtain the ifindex, so passing that name down means a failed
+// netlink lookup degrades to "re-assert under the known name" instead of
+// "tear down". A nil/absent ifaceNames entry leaves the old behaviour (log and
+// drop) for callers that have no name to offer.
+//
 // On a partial NeighSet failure the add loop is best-effort (logs and
 // continues) and still returns the computed enabled set plus the first error,
 // rather than aborting with a nil enabled set — otherwise the daemon would
 // forget the interfaces it just tried to manage and never tear them down
 // (#4955 secondary).
-func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]int) ([]ProxyARPAdded, map[string]map[int]struct{}, error) {
+func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]int, ifaceNames map[int]string) ([]ProxyARPAdded, map[string]map[int]struct{}, error) {
 	type proxyKey struct {
 		ifindex int
 		ip      netip.Addr
@@ -362,8 +387,14 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]in
 			}
 			continue
 		}
+		// #6536 deliberately does NOT apply the ifaceNames fallback here: an
+		// unresolved name only costs this entry its gratuitous ARP (the caller
+		// skips the GARP on an empty Iface), which is transient and self-heals
+		// on the next reconcile. The enabled-set resolution above is the one
+		// whose failure is DESTRUCTIVE (a sysctl disable on a live responder),
+		// so the fallback is scoped to it.
 		ifaceName := ""
-		if link, err := netlink.LinkByIndex(key.ifindex); err == nil {
+		if link, err := linkByIndexSeam(key.ifindex); err == nil {
 			ifaceName = link.Attrs().Name
 		}
 		added = append(added, ProxyARPAdded{
@@ -403,13 +434,27 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]in
 	// install.
 	ifaceFamilies := make(map[string]map[int]struct{}, len(ifindexFamilies))
 	for ifindex, fams := range ifindexFamilies {
-		link, err := netlink.LinkByIndex(ifindex)
-		if err != nil {
+		name := ""
+		link, err := linkByIndexSeam(ifindex)
+		if err == nil {
+			name = link.Attrs().Name
+		} else if fallback, ok := ifaceNames[ifindex]; ok && fallback != "" {
+			// #6536: the ifindex is still CONFIGURED — it was just built from
+			// cfg above — so a netlink resolution failure must not be reported
+			// as "no longer configured". Re-assert under the name the caller
+			// resolved this ifindex from and keep the interface in the enabled
+			// set, so the teardown diff never disables a live responder and the
+			// #4955 sweep does not forget the interface.
+			slog.Warn("proxy-arp: ifindex did not resolve to a link; falling back to the "+
+				"caller-resolved interface name for the proxy responder sysctl",
+				"ifindex", ifindex, "iface", fallback, "err", err, "issue", "#6536")
+			name = fallback
+		} else {
 			slog.Warn("proxy-arp: cannot resolve interface name for proxy responder sysctl",
 				"ifindex", ifindex, "err", err)
 			continue
 		}
-		ifaceFamilies[link.Attrs().Name] = fams
+		ifaceFamilies[name] = fams
 	}
 	enableProxyResponders(ifaceFamilies)
 

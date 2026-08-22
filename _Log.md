@@ -100452,6 +100452,22 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
   pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)
 
+- **Action**: #6536 — proxy-ARP teardown must be driven by config removal, not
+  by a failed interface resolution. `ReconcileProxyARP` takes the caller's
+  ifindex -> Linux-netdev-name mapping and uses it as the fallback key for the
+  responder sysctl when `netlink.LinkByIndex` fails; `proxyARPIfaceMap` returns
+  the names it could not resolve at all, and `reconcileProxyARP` carries their
+  prior `(iface -> families)` state forward into the enabled set before the
+  #2475 teardown diff runs. Adds `linkByIndexSeam` so the transient can be
+  injected. Fail-on-revert table test localises: the still-configured row reds,
+  the genuinely-removed row stays green.
+- **File(s)**: pkg/dataplane/proxyarp.go,
+  pkg/dataplane/proxyarp_unresolved_6536_test.go,
+  pkg/dataplane/proxyarp_test.go, pkg/dataplane/proxyarp_orphan_4955_test.go,
+  pkg/daemon/daemon_proxyarp.go,
+  pkg/daemon/daemon_proxyarp_unresolved_6536_test.go,
+  pkg/daemon/daemon_proxyarp_test.go,
+  pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md, _Log.md
 - **Timestamp**: 2026-08-21
 - **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
   `Store.confirmPrevFirst` records first-commit-ness where it is known (arm
