@@ -212,6 +212,14 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer pe
 			if ierr := clusterIdentityCommitPreflight(d.cluster, cand); ierr != nil {
 				return ierr
 			}
+			// #6650: refuse a config the cluster PEER cannot represent, before
+			// the store promotes anything. Ordered last among the cluster
+			// preflights: the topology/identity gates above decide whether this
+			// node may be clustered at all, and this one only has meaning once
+			// that is settled.
+			if perr := d.peerSnapshotProtocolCommitPreflight(cand); perr != nil {
+				return perr
+			}
 			return d.deviceMapCommitPreflight(cand, nil)
 		},
 		func(gen uint64) (*config.Config, error) { return d.store.CommitWithDescriptionGen(comment, gen) },

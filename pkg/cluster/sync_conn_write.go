@@ -265,6 +265,34 @@ func (s *SessionSync) sendClockSync(conn net.Conn) {
 		slog.Warn("cluster sync: failed to send clock sync", "err", err)
 	}
 }
+
+// sendCapabilities advertises this node's config-snapshot protocol version to
+// the peer (#6650). Called once per installed connection.
+//
+// A node whose version was never wired (0) sends NOTHING rather than
+// advertising 0: the receiver reads a missing advertisement as "pre-#6650
+// peer", and a literal 0 would be indistinguishable from that while ALSO
+// looking like a deliberate claim. Silence is the honest encoding.
+//
+// A send failure is logged and NOT escalated to handleDisconnect: unlike the
+// clock sync this is advisory metadata, and dropping a live fabric because an
+// advisory frame did not fit would trade a narrowing risk for a sync outage.
+// The receiver's 0-means-incapable default already fails closed.
+func (s *SessionSync) sendCapabilities(conn net.Conn) {
+	v := s.localSnapshotProtocol.Load()
+	if v == 0 {
+		return
+	}
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], uint16(v))
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgPeerCapabilities, buf[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Warn("cluster sync: failed to advertise snapshot protocol version", "err", err)
+	}
+}
+
 func (s *SessionSync) sendLoop(ctx context.Context) {
 	sendOne := func(msg []byte) {
 		for {
