@@ -100184,6 +100184,14 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/dhcpserver/README.md`, `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/daemon_apply_routing.go`,
   `pkg/daemon/dhcp_apply_converger_6535_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6530 fence re-arms the rg_active reconcile retry
+- **Timestamp**: 2026-08-21
+- **Action**: Add `rgStateMachine.InvalidateApplied()` so an out-of-band
+  `rg_active` write re-arms `reconcileRGState`'s desired-vs-applied retry;
+  route the received-peer-fence path through it; lazily allocate `d.rgStates`.
+- **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha_sync.go`,
+  `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/rg_state_fence_rearm_6530_test.go`, `pkg/daemon/README.md`
 ## 2026-08-21 — #6527 single-RG transfer-commit rollback
 - **Timestamp**: 2026-08-21
 - **Action**: Roll back `peerTransferOutOverride` when

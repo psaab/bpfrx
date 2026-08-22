@@ -35,6 +35,13 @@ func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
 	if s, ok = d.rgStates[rgID]; ok {
 		return s
 	}
+	// New() always makes this map, but the fence path (#6530) now reaches
+	// here from a Daemon that minimal constructions build as a literal, and
+	// a nil-map write panics. Lazily allocating costs nothing on the hot
+	// read path (which never gets here) and removes the footgun.
+	if d.rgStates == nil {
+		d.rgStates = make(map[int]*rgStateMachine)
+	}
 	s = newRGStateMachine()
 	d.rgStates[rgID] = s
 	return s
