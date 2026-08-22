@@ -216,6 +216,76 @@ deterministic side initiates per fabric. `TCP_NODELAY` is enabled.
 | 13 | Barrier | Primary -> Secondary | Ordered demotion marker |
 | 14 | BarrierAck | Secondary -> Primary | Barrier acknowledgement |
 | 15 | BulkAck | Secondary -> Primary | Bulk acknowledgement |
+| 30 | ConfigKeyExchange | Bidirectional | Ephemeral X25519 public key for config-payload encryption (#6629) |
+| 31 | ConfigEncrypted | Primary -> Secondary | Type 8's payload, sealed (#6629) |
+
+(Types 16-29 are listed in `pkg/cluster/sync.go`; the two above are called out
+here because they change how type 8 travels.)
+
+### Config-Payload Confidentiality (#6629)
+
+The config text a primary pushes is the ACTIVE TREE rendered unredacted —
+`ShowActive()` goes through `ConfigTree.Format()`, which does not redact,
+deliberately, because the same render backs persistence, rollback, the DR
+archive and the on-box CLI, "none of which may lose the real secret"
+(`pkg/configstore/store_format.go`). So every `config.Secret` leaf crosses the
+fabric inside a type-8 payload, including `chassis cluster
+authentication-key` — the PSK that authenticates this very link.
+
+The exposure is circular. Session-sync authentication is fixed PER CONNECTION
+at handshake time, and committing a key does not restart cluster comms
+(`clusterTransportKey` excludes it, pinned by
+`TestAuthKeyChangeDoesNotRestartClusterComms_5078`), so the connection that
+carries the PSK to the peer is by construction the one handshaked while BOTH
+ends were unkeyed: neither authenticated nor confidential. A passive observer
+learns the key as it is introduced, and every subsequent HMAC on the link is
+then forgeable by them. The rollout defeats itself on first use.
+
+**Mechanism.** `installConn` generates a fresh ephemeral X25519 keypair per
+connection; `handleNewConnection` advertises the public half beside
+`sendCapabilities` (type 30). On receipt each end derives an AES-256 key with
+HKDF-SHA256 over the ECDH shared secret, salted with the two public keys in
+canonical order so neither end needs to know which dialled. `QueueConfig` then
+seals the type-8 payload — byte-identical plaintext, generation trailer
+included — and sends it as type 31. The receiver decrypts and hands the
+plaintext to the same `handleConfigPayload` the cleartext arm uses, so the two
+cannot diverge on ordering, generation accounting or apply admission.
+
+**Forward secrecy.** The keypair is per connection and `handleDisconnect`
+drops it, so a reconnect derives a different key and a key recovered later
+cannot open a capture taken on an earlier connection
+(`TestConfigCryptoReconnectDerivesFreshKey6629`).
+
+**What it does NOT close.** An ACTIVE man-in-the-middle. The ephemeral
+exchange on an unkeyed link is itself unauthenticated — there is nothing to
+authenticate it WITH, which is the bootstrap problem — so an attacker who can
+rewrite frames can substitute their own public keys and read the payload. That
+concedes nothing already conceded: on an unkeyed control segment an active
+attacker can already drive failover, call the allowlisted fabric RPCs and
+inject sessions, which is #6611's own rationale for requiring a key. This is
+not a confidential channel; it removes the passive-capture class from one
+message type.
+
+**Mixed version.** A peer that predates this never sends type 30, so no key is
+derived and the push falls back to cleartext type 8 — exactly today's
+behaviour — after a bounded wait that latches, so the cost is one wait per
+connection rather than one per push. The fallback logs a WARNING naming the
+exposure and whether a control-link key is configured (never the key). Both
+types are additive with NO `SessionSyncWireVersion` bump: the receive switch
+has no default arm, so an old peer ignores them, and bumping would make the
+#1930 INC-3 mixed-base gate refuse SESSION sync across the very rolling
+upgrade this must survive.
+
+**Why not exclude the leaf from the payload.** `Store.SyncApply` promotes the
+received tree WHOLESALE and its compile is lenient
+(`compileTreeLenient` -> `lenientClusterAuthKey`), so #6611's validator warns
+rather than rejects on that path: a payload with the leaf stripped makes the
+standby's active config LOSE its own key, and every control channel there
+silently reverts to fail-open dual-accept. On a rolling upgrade a new primary
+would drive an old standby unkeyed. Encryption's mixed-version fallback is "no
+worse than today" instead. Excluding the leaf and provisioning the PSK out of
+band remains the eventual posture, but it lands as ONE design with #6628 and
+#6630 — see "The three-way incompatibility" in `pkg/cluster/README.md`.
 
 ## Bulk Sync
 

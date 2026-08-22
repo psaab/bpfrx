@@ -2159,9 +2159,82 @@ unattended strict paths.
 The `authentication-key` leaf is `config.Secret`-typed and is redacted in the
 ordinary show/log/JSON render paths (`ast_redact.go`), so it is not exposed to
 routine operator output or diagnostics. That is not an absolute guarantee: a
-sufficiently privileged CLI class can still render cleartext configuration,
-and config-sync transmits it in the clear (#6629). Keep the authoritative copy
-in your own secret store.
+sufficiently privileged CLI class can still render cleartext configuration.
+Keep the authoritative copy in your own secret store.
+
+Config sync used to transmit it in the clear as well (#6629). It no longer
+does against a peer of the same vintage — see below — but the qualifier
+matters.
+
+### Config sync and the PSK (#6629)
+
+Config sync ships the ACTIVE TREE rendered unredacted, so the PSK travelled
+inside a `syncMsgConfig` payload, on the link it authenticates, at the one
+moment that link is guaranteed unauthenticated: session-sync auth is fixed per
+connection at handshake time, and committing a key does not restart cluster
+comms, so the carrying connection is by construction one handshaked while both
+ends were unkeyed. A passive observer learned the key as it was introduced and
+could forge every subsequent HMAC on the link. The rollout defeated itself on
+first use.
+
+The payload is now sealed under a key derived from a fresh ephemeral X25519
+exchange performed on every connection (`syncMsgConfigKeyExchange` /
+`syncMsgConfigEncrypted`; mechanism and wire format in
+`docs/session-sync-architecture.md` -> "Config-Payload Confidentiality").
+
+Read the scope literally:
+
+- It defeats a PASSIVE observer, including one holding a full historical
+  capture — the keypair is per connection, so there is forward secrecy across
+  reconnects.
+- It does NOT defeat an ACTIVE man-in-the-middle. The exchange on an unkeyed
+  link is unauthenticated because there is nothing yet to authenticate it
+  with. An active attacker on an unkeyed control segment can already drive
+  election, call the allowlisted fabric RPCs and inject sessions — that is the
+  argument for keying at all — so nothing new is conceded, but do not read
+  this as a confidential channel.
+- Against a peer that predates #6629 the push falls back to CLEARTEXT, with a
+  warning. During a mixed-version window the old behaviour applies in full.
+- **A capture taken before the upgrade is not retired by the upgrade.** Rotate
+  the PSK after both nodes are on a #6629-capable build, for the same reason
+  the #6169 note above gives: no code change invalidates frames an attacker
+  already holds.
+
+### The three-way incompatibility (#6628 / #6629 / #6630)
+
+Three shipped positions cannot all hold, and every fix in this area has to
+declare which one it moves:
+
+1. **#6629**: the PSK must not cross the control link in cleartext.
+2. **`TestAuthKeyChangeDoesNotRestartClusterComms_5078`** pins the exact
+   opposite of #6628's fix, and its failure message states the reason —
+   "committing it would restart cluster comms and drop the very connection
+   that must carry the key to the read-only secondary."
+3. **`sync_auth.go`'s `syncAuthDecision` comment**: an RG0 secondary whose
+   read-only gate is armed returns `ErrClusterReadOnly` from
+   `EnterConfigureSession`, so config-sync is that node's ONLY writer. In-band
+   carriage of the PSK is not incidental — it is the documented live-keying
+   procedure.
+
+Consequences to hold on to:
+
+- **#6628 landed alone bricks the live-keying rollout.** The instant the
+  primary commits the key the connection drops, re-handshakes, and
+  `syncAuthDecision(keyConfigured=true, peerKeyed=false)` REJECTS the
+  still-unkeyed secondary — which can then never be keyed at all, because it
+  is read-only. A self-inflicted permanent partition.
+- **The eventual posture** is that the PSK becomes provisioning-time
+  node-local state that config-sync neither carries nor overwrites (the
+  per-node day-0 config drive already provisions `xpf.conf` alongside
+  `node-id`, and `sync_auth.go` already recommends "keying at provisioning,
+  before either node seats as secondary"). #5078's pin is inverted as PART of
+  that change, never on its own.
+- **#6630's rotation is then FORCED, not preferred.** With no in-band
+  coordination channel left, accepting the previous key for a bounded overlap
+  window is the only rotation that keeps heartbeat liveness.
+- Payload encryption (#6629, above) deliberately does NOT untie this knot. It
+  closes the disclosure without touching carriage, so the three can be
+  resolved as one design later rather than under time pressure.
 
 ## IPsec SA sync
 
