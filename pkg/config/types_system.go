@@ -374,6 +374,34 @@ func (p *DDNSProvider) String() string {
 		p.AWSRegion, p.HostedZoneID, RedactURL(p.CheckIPURL), p.CheckIPAllowlist)
 }
 
+// MarshalJSON redacts the URL-bearing leaves on every JSON render of a
+// provider (#6703). The Secret-typed credentials (TSIGSecret, Password,
+// APIToken, AWSSecretAccessKey) are already handled by Secret.MarshalJSON, and
+// String() has redacted these same URL fields since #2781 — but the REST
+// config-read surface does neither: GET /api/v1/config json-encodes the
+// compiled *Config directly, so a plain string field marshalled VERBATIM. That
+// route leaked even a userinfo credential, which RedactURL has always stripped,
+// because nothing on the path ever called it.
+//
+// The alias type sheds this method (so json.Marshal does not recurse) while
+// keeping every field and tag identical, and the copy is redacted in place —
+// so a field added to DDNSProvider later is still marshalled, and only these
+// four are rewritten. A hand-built object literal would silently drop new
+// fields, which is the failure mode that makes hand-maintained render lists
+// unsafe.
+func (p *DDNSProvider) MarshalJSON() ([]byte, error) {
+	if p == nil {
+		return []byte("null"), nil
+	}
+	type alias DDNSProvider
+	v := alias(*p)
+	v.UpdateServer = RedactURL(v.UpdateServer)
+	v.Server = RedactURL(v.Server)
+	v.URLTemplate = RedactURL(v.URLTemplate)
+	v.CheckIPURL = RedactURL(v.CheckIPURL)
+	return json.Marshal(v)
+}
+
 // SSHServiceConfig holds SSH service settings.
 type SSHServiceConfig struct {
 	RootLogin   string   // "allow", "deny", "deny-password"
