@@ -1,3 +1,40 @@
+## 2026-08-22 — #6709/#7009: the pkg/ddns full-package flake, both mechanisms
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced the flake before touching anything (2/30 full-package
+  runs, ~7%, a DIFFERENT test each time) and established that it is TWO
+  mechanisms sharing ONE root resource — the ephemeral port — rather than the
+  single port race #7009 describes. Killed the obvious third hypothesis first:
+  `slog.SetDefault` is process-global and would produce the identical
+  empty-log symptom under parallelism, but the package has ZERO `t.Parallel()`
+  calls, so tests run sequentially and SetDefault can never be clobbered.
+  (a) `unsignedUpdateWarned` is a process-global `sync.Map` keyed by server
+  host:port that is never reset; ephemeral ports are recycled within one test
+  binary (measured with a standalone probe: 1 reuse per 552 binds), so a test
+  can draw a port an earlier test already warned for and observe zero warns.
+  Proved this causally rather than by inference — a probe that pre-poisons the
+  key reproduces `warns=0 log=""`, byte-identical to the reported symptom.
+  (b) `newFakeDNSServer` bound UDP on :0 then assumed that port number was also
+  free for TCP; the same probe measured the UDP-assigned port already held for
+  TCP host-wide at 1/552, which is ~8% per run and matches the observed rate.
+  Fixed (a) by having the asserting test seed-then-clear its own key, and (b)
+  with a bounded RESAMPLE (`listenDNSPair`) that redraws a fresh port on
+  conflict — explicitly not the retry-the-same-port loop #7009 rejects.
+  Validated against #7009's own binder: six concurrent instances of the package,
+  OLD 6/30 instances failed vs NEW 0/30, then 0/60 at parallelism 10 (120 clean
+  post-fix runs total). Mutation matrix M1/M2/M4/M5 all RED with real
+  assertions; M3 (the negative-assertion vacuity guard) GREEN and kept as
+  defence in depth after a separate cell proved that subtest DOES detect a real
+  regression, so the guard removes a ~8%/run blind spot rather than decorating.
+  Caught and DELETED one test of my own that could not red: it re-implemented
+  `realDNSPairAttempt` instead of calling it, and removing that function's
+  `pc.Close()` left it green with vet clean. Also corrected two rows of the
+  brief's `RedactURL` table by measuring it: a bracketed `[SECRET]` authority
+  survives as an IPv6 literal (not "unparseable"), and a secret in the PATH is a
+  fifth verbatim row nobody had listed.
+- **File(s)**: `pkg/ddns/backend_rfc2136_test.go`,
+  `pkg/ddns/fake_dns_portpair_6709_test.go` (new), `pkg/ddns/README.md`
+
 ## 2026-08-22 — #6619 + #6564 member 8: VRF-enslaved iifname scope, and coverage vs existence
 
 - **Timestamp**: 2026-08-22
