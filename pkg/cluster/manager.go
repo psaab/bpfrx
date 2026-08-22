@@ -342,14 +342,20 @@ type Manager struct {
 	// what keeps Stop's refuse-then-join ordering airtight; bootEpochStopped,
 	// under that mutex, refuses a spawn once Stop has begun.
 	// See Manager.joinBootEpochRefine.
-	bootEpochOnce     sync.Once
-	bootEpoch         atomic.Uint64
-	bootEpochReady    chan struct{}
-	bootEpochWrote    atomic.Uint64
-	bootEpochRefine   atomic.Uint32
-	bootEpochRefineMu sync.Mutex
-	bootEpochStopped  bool
-	bootEpochWorker   atomic.Pointer[bootEpochRefineWorker]
+	bootEpochOnce  sync.Once
+	bootEpoch      atomic.Uint64
+	bootEpochReady chan struct{}
+	bootEpochWrote atomic.Uint64
+	// bootEpochPersistOwed is set when a refine pass ended with the published
+	// epoch not known to be on disk because something FAILED or was SKIPPED
+	// (the dir create, the lock, the read, or the write) — never because a
+	// pass decided not to write. It is the #6724 retry trigger's only input;
+	// see Manager.retryOwedBootEpochPersist and refineBootEpochReporting.
+	bootEpochPersistOwed atomic.Bool
+	bootEpochRefine      atomic.Uint32
+	bootEpochRefineMu    sync.Mutex
+	bootEpochStopped     bool
+	bootEpochWorker      atomic.Pointer[bootEpochRefineWorker]
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable — a peer rolled back to a pre-#6169

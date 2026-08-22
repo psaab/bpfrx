@@ -103662,3 +103662,12 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
+
+## 2026-08-22 — #6724 boot-epoch persist-retry trigger
+- **Action**: `refineBootEpochReporting` now reports whether a persist is OWED
+  (fault, not a deliberate decline); `Manager.retryOwedBootEpochPersist` re-runs
+  refinement from the heartbeat sender loop while one is. The mis-ordering half
+  is split to #7501.
+- **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
+  `pkg/cluster/manager.go`,
+  `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)
