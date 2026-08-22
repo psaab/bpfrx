@@ -18,6 +18,7 @@ func resetReloadDebtForTest(t *testing.T) {
 		defer reloadDebt.mu.Unlock()
 		reloadDebt.pending = false
 		reloadDebt.epoch = 0
+		reloadDebt.tailPending = false
 	}
 	clear()
 	t.Cleanup(clear)

@@ -172,6 +172,19 @@ var reloadDebt struct {
 	mu      sync.Mutex
 	pending bool
 	epoch   uint64
+	// tailPending records that a reload run by an EXTERNAL owner SUCCEEDED
+	// (#6912). The kernel really did re-read the directory, so the reload
+	// obligation is genuinely discharged and `pending` is correctly false —
+	// but the activation TAIL was not run, and only Apply can run it. Without
+	// this the next unchanged Apply sees changed==false, no reload debt, no
+	// reconfigure debt and no activationPending, skips the whole block, and
+	// returns nil having silently left addresses unreconfigured and the
+	// slow-path TUN's rp_filter at networkd's default.
+	//
+	// Process-scoped for the same reason `pending` is: pkg/daemon runs
+	// `networkctl reload` from several sites of its own, and a Manager-scoped
+	// flag could not record what they did.
+	tailPending bool
 }
 
 // reloadDebtEpoch snapshots the debt epoch. Callers take it immediately BEFORE
@@ -187,6 +200,29 @@ func reloadDebtOutstanding() bool {
 	reloadDebt.mu.Lock()
 	defer reloadDebt.mu.Unlock()
 	return reloadDebt.pending
+}
+
+// noteExternalReloadRanWithoutTail records that an external owner's reload
+// succeeded, so the activation tail is owed even though no reload is (#6912).
+func noteExternalReloadRanWithoutTail() {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	reloadDebt.tailPending = true
+}
+
+// externalTailOutstanding reports whether an external reload has discharged a
+// reload obligation without the activation tail having run since.
+func externalTailOutstanding() bool {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	return reloadDebt.tailPending
+}
+
+// clearExternalTailDebt is called only after the tail has actually completed.
+func clearExternalTailDebt() {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	reloadDebt.tailPending = false
 }
 
 // noteReloadFailed records the activation debt and advances the epoch so any
@@ -226,6 +262,23 @@ func NoteReloadResult(epoch uint64, err error) {
 		return
 	}
 	noteReloadSucceeded(epoch)
+	// #6912: a SUCCESSFUL external reload discharges the reload obligation but
+	// performs none of the activation tail — the per-interface `networkctl
+	// reconfigure` that applies bond/VLAN addresses, and restoreSlowPathRPFilter.
+	// An external owner cannot run those, so record that they are owed.
+	//
+	// Armed at this EXTERNAL entry point (BeginReload/NoteReloadResult exist
+	// for reloads this package does not run itself) rather than in the shared
+	// noteReloadSucceeded. That choice is about keeping the flag's meaning true
+	// to its name, NOT about preventing a defect: arming on the shared path was
+	// measured equivalent, because Apply's own reload runs the tail in the same
+	// pass and clears the flag before returning. It would simply add a pointless
+	// write on every Apply.
+	//
+	// Likewise the failure branch above does not arm it, and does not need to:
+	// noteReloadFailed sets the reload debt, so debtOwed already forces the next
+	// Apply through the tail. Measured — arming there as well changes nothing.
+	noteExternalReloadRanWithoutTail()
 }
 
 // ReloadDebtOutstanding reports whether a `networkctl reload` activation is
@@ -456,7 +509,12 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 	// even when another reload owner discharged the global debt on our behalf.
 	// Without it, an external successful reload turns the next unchanged Apply
 	// into a no-op that skips postconditions only Apply can perform.
-	if needReload || reconfDebt || activationOwed {
+	// #6912: externalTailOutstanding() covers the case none of the others can —
+	// a successful EXTERNAL reload, no failed Apply anywhere, and byte-identical
+	// files. changed is false, the reload debt was correctly discharged, no
+	// reconfigure failed and this Manager never started a pass, so every other
+	// term is false while the tail has still never run.
+	if needReload || reconfDebt || activationOwed || externalTailOutstanding() {
 		// Mark the pass in flight BEFORE the reload can fail out, so an early
 		// return leaves the obligation recorded.
 		m.mu.Lock()
@@ -509,6 +567,10 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		m.mu.Lock()
 		m.activationPending = false
 		m.mu.Unlock()
+		// #6912: and the tail an external reload left owed has now been paid.
+		// Cleared at the same point and for the same reason — only a completed
+		// tail discharges it, so every early return above preserves it.
+		clearExternalTailDebt()
 	}
 
 	return nil

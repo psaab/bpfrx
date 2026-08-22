@@ -74,6 +74,23 @@ Standard library only.
   predicate — deriving it would let the same predicate decide both the
   behaviour and the expectation, so deleting an arm would change them
   together and the test could never red.
+- **The activation tail is owed whenever ANYONE reloads, not only when
+  `Apply` does (#6912).** `pkg/daemon` runs `networkctl reload` from
+  several sites of its own and reports the result through
+  `BeginReload`/`NoteReloadResult`. A SUCCESSFUL external reload genuinely
+  discharges the reload obligation — the kernel really did re-read the
+  directory — but performs none of the tail, which is the per-interface
+  `networkctl reconfigure` that applies bond/VLAN addresses plus
+  `restoreSlowPathRPFilter`. Only `Apply` can run those. Before #6912 the
+  next unchanged `Apply` saw `changed==false`, no reload debt (correctly
+  cleared), no reconfigure debt and no `activationPending`, skipped the
+  whole block and returned nil — leaving addresses unreconfigured and the
+  slow-path TUN's `rp_filter` at networkd's default, which silently drops
+  locally-originated traffic. This is distinct from #5718, which covers a
+  FAILED `Apply` whose debt a later external success clears; here nothing
+  fails at any point, so the debt mechanism has nothing to carry.
+  `NoteReloadResult` therefore arms a separate process-scoped `tailPending`
+  on success, and only a completed tail clears it.
 - **`Apply` is fail-closed on write errors (#2987).** `writeIfChanged`
   returns `(changed, err)`; `Apply` aggregates per-file write failures
   (still attempting every generated file), reloads whatever did change,
