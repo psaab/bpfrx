@@ -445,9 +445,17 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 // stanza: its firewall-local addresses get a catch-all DROP, denying every
 // host-bound service/protocol not explicitly permitted. Management /
 // cluster-control lifeline interfaces (fxp0 / em0 / fab*) are excluded from the
-// address sets by BuildZoneHostInboundViews, so a host-inbound deny can never
-// strand management or break HA. Established sessions and IPv6 ND / PMTUD
-// control messages are accepted before any deny.
+// address sets by BuildZoneHostInboundViews.
+//
+// That exclusion is by INTERFACE, not by address VALUE, so it does NOT
+// guarantee management survives (#7284). An address that is ALSO configured on
+// a zoned interface still enters the drop set through that interface, and the
+// deny carries no `iifname` — so a management IP shared onto a no-stanza zone
+// is denied by this table on an ordinary healthy commit, and the #5566
+// reconcile records it with an empty admit set and flushes its established
+// entries. Established sessions and IPv6 ND / PMTUD control messages are
+// accepted before any deny, which protects a live session only where the zone
+// admits the service at all.
 //
 // Fail-closed (#3333): both the apply and the teardown surface their failure as
 // a returned error instead of a swallowed WARN. applyConfigLocked joins this
