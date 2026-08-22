@@ -18,6 +18,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/netname"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/vishvananda/netlink"
 )
@@ -1911,6 +1912,14 @@ func readOriginalNameFromLink(ifName string) string {
 // getOriginalKernelName returns the predictable kernel name (e.g. enp9s0f0)
 // for a renamed interface. Tries altnames first, then derives from PCI sysfs.
 // Uses the compile-pass cache when available.
+// originalKernelNameFn is the seam for getOriginalKernelName. It exists so a
+// test can bind the PRODUCTION CALL SITE (compiler_iface.go's networkd
+// `.link` generation) rather than only the helper: a test that exercises the
+// helper while production bypasses it proves nothing, and #7420's own merge
+// gate used exactly this shape — bypassing the production call while leaving
+// the callee intact must RED (#7426).
+var originalKernelNameFn = getOriginalKernelName
+
 func getOriginalKernelName(ifName string, result *CompileResult) string {
 	var link netlink.Link
 	var err error
@@ -1922,11 +1931,16 @@ func getOriginalKernelName(ifName string, result *CompileResult) string {
 	if err != nil {
 		return ""
 	}
-	for _, alt := range link.Attrs().AltNames {
-		if strings.HasPrefix(alt, "enp") || strings.HasPrefix(alt, "eno") ||
-			strings.HasPrefix(alt, "ens") || strings.HasPrefix(alt, "eth") {
-			return alt
-		}
+	// #7426: the altname ORDER and the PCI derivation both come from
+	// pkg/netname now. This copy took the first altname matching any of four
+	// prefixes, in whatever order the kernel listed them — a coin flip on a NIC
+	// carrying several at once — and its PCI fallback had no domain handling
+	// and parsed the function base 10. The daemon copy had the ordering and the
+	// domain but under-emitted the `f0` suffix this copy got right in #4795.
+	// Two copies wrong in opposite directions on the same field is what makes
+	// this single-source rather than agreement-test material.
+	if name := netname.FromAltNames(link.Attrs().AltNames); name != "" {
+		return name
 	}
 	// Derive from PCI device path via sysfs.
 	// /sys/class/net/<name>/device -> .../0000:09:00.0
@@ -1935,68 +1949,5 @@ func getOriginalKernelName(ifName string, result *CompileResult) string {
 		return ""
 	}
 	pciAddr := devPath[strings.LastIndex(devPath, "/")+1:]
-	// Parse "domain:bus:slot.function" e.g. "0000:09:00.0"
-	parts := strings.SplitN(pciAddr, ":", 3)
-	if len(parts) != 3 {
-		return ""
-	}
-	bus, err := strconv.ParseUint(parts[1], 16, 16)
-	if err != nil {
-		return ""
-	}
-	sf := strings.SplitN(parts[2], ".", 2)
-	if len(sf) != 2 {
-		return ""
-	}
-	slot, err := strconv.ParseUint(sf[0], 16, 16)
-	if err != nil {
-		return ""
-	}
-	fn, err := strconv.ParseUint(sf[1], 10, 8)
-	if err != nil {
-		return ""
-	}
-	return fmt.Sprintf("enp%ds%d%s", bus, slot, pciFunctionSuffix(isPCIMultifunctionDevice(pciAddr), fn))
-}
-
-// pciFunctionSuffix returns the "f<function>" suffix systemd's
-// udev-builtin-net_id "path" naming scheme appends to a predictable PCI
-// interface name (enp<bus>s<slot>[f<function>]) — or "" when the suffix is
-// omitted. systemd's names_pci_slot() (src/udev/udev-builtin-net_id.c)
-// appends the suffix ONLY when the PCI function number is nonzero OR the
-// device is a genuine multi-function device (is_pci_multifunction(), which
-// tests the kernel's PCI_HEADER_TYPE multi-function bit in config space —
-// see isPCIMultifunctionDevice below). A single-function device at
-// function 0 (e.g. a standalone NIC at 0000:09:00.0) is therefore named
-// enp9s0, NOT enp9s0f0 — the #4795 bug: the pre-fix code appended "f%d"
-// unconditionally, producing a wrong .link OriginalName for every
-// single-function card. Kept pure/parameterized so the boundary logic is
-// unit-testable without sysfs.
-func pciFunctionSuffix(multifunction bool, fn uint64) string {
-	if fn == 0 && !multifunction {
-		return ""
-	}
-	return fmt.Sprintf("f%d", fn)
-}
-
-// isPCIMultifunctionDevice reports whether the PCI device at pciAddr
-// (domain:bus:slot.function, e.g. "0000:09:00.0") is a multi-function
-// device per the kernel's PCI_HEADER_TYPE config-space byte (offset 0x0E),
-// bit 0x80 ("Multi-Function Device"). This mirrors systemd's
-// is_pci_multifunction() (src/shared/pci-util.c small helper reading
-// <syspath>/config), the same signal names_pci_slot() uses to decide
-// whether to append the "f<function>" suffix. Any read failure (missing
-// sysfs, short read, permission) conservatively reports false — the same
-// fallback systemd uses on error, and the caller then falls back to the
-// "fn != 0" half of the test.
-func isPCIMultifunctionDevice(pciAddr string) bool {
-	const (
-		pciHeaderTypeOffset = 14 // PCI_HEADER_TYPE, config-space offset 0x0E
-		pciMultiFunctionBit = 0x80
-	)
-	data, err := os.ReadFile(fmt.Sprintf("/sys/bus/pci/devices/%s/config", pciAddr))
-	if err != nil || len(data) <= pciHeaderTypeOffset {
-		return false
-	}
-	return data[pciHeaderTypeOffset]&pciMultiFunctionBit != 0
+	return netname.FromPCIAddr(pciAddr, netname.Multifunction(pciAddr))
 }
