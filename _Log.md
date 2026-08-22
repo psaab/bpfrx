@@ -103852,3 +103852,12 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/config/compiler_validate_warn_dhcp_hostinbound.go`,
   `pkg/config/dhcp_hostinbound_plane_scope_7489_test.go` (new),
   `docs/host-inbound-multicast.md`
+
+## 2026-08-22 — #6729 + #6730 st-prefix predicate
+- **Action**: Replaced two raw `strings.HasPrefix(name, "st")` tests in
+  `compiler_iface.go` with the bounded predicate / shared resolver:
+  `resolveInterfaceRef` now reads the authored bind-interface via
+  `Config.SecureTunnelUnitNetdev`, and `buildInterfaceNetworkdModels` gates on
+  `config.IsSecureTunnelIfName`.
+- **File(s)**: `pkg/dataplane/compiler_iface.go`,
+  `pkg/dataplane/compiler_iface_st_prefix_6729_6730_test.go` (new)
