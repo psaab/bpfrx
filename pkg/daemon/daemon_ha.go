@@ -35,6 +35,13 @@ func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
 	if s, ok = d.rgStates[rgID]; ok {
 		return s
 	}
+	// New() always makes this map, but the fence path (#6530) now reaches
+	// here from a Daemon that minimal constructions build as a literal, and
+	// a nil-map write panics. Lazily allocating costs nothing on the hot
+	// read path (which never gets here) and removes the footgun.
+	if d.rgStates == nil {
+		d.rgStates = make(map[int]*rgStateMachine)
+	}
 	s = newRGStateMachine()
 	d.rgStates[rgID] = s
 	return s
@@ -1258,6 +1265,10 @@ func (d *Daemon) reconcileRGState() {
 	// owners every pass — hash-gated, so it is a no-op when the effective RA
 	// set did not move, and re-applies (via ra.Apply's safe diff) when it did.
 	d.reconcileClusterRAServices("reconcile")
+	// #6535: the same dropped-work safety net for the OTHER per-RG service.
+	// Unlike RA, Kea had no converger at all — a failed apply was simply
+	// lost until the next RG transition or operator commit.
+	d.reconcileClusterDHCPServices("reconcile")
 }
 
 // startupGoodbyeNeeded reports whether the cold-boot one-shot goodbye still
@@ -1504,8 +1515,11 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	// cannot race a concurrent commit/demotion; the state machine already
 	// marked rgID active before this call, so the snapshot includes it.
 	d.reconcileClusterRAServices(fmt.Sprintf("vrrp-master-rg%d", rgID))
-	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
-		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
+	if d.dhcpServer != nil {
+		// Same desired state as the commit path and the #6535 converger.
+		// The MASTER edge deliberately does NOT apply a nil desired state —
+		// clearing is the BACKUP edge's job — so the nil guard stays.
+		dhcpCfg := d.desiredClusterDHCPConfig(cfg)
 		if dhcpCfg != nil {
 			// #2239 Q3: pre-seed the held peer leases into the Kea
 			// memfile BEFORE the (re)start so Kea loads the in-use
@@ -1588,7 +1602,7 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 		if anyOtherMaster {
 			// Reapply DHCP with only the remaining master RGs'
 			// interfaces (nil when none match → clear).
-			d.dhcpServer.ApplyAsync(d.filterDHCPConfigForMasterRGs(cfg),
+			d.dhcpServer.ApplyAsync(d.desiredClusterDHCPConfig(cfg),
 				fmt.Sprintf("vrrp BACKUP rg%d (other RG still MASTER)", rgID))
 		} else {
 			d.dhcpServer.ApplyAsync(nil, fmt.Sprintf("vrrp BACKUP rg%d", rgID))
@@ -1629,6 +1643,63 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 // bound to their VLAN member.
 func stripUntaggedUnitSuffix(iface string) string {
 	return strings.TrimSuffix(iface, ".0")
+}
+
+// desiredClusterDHCPConfig is the single source of truth for the Kea desired
+// state in cluster mode: the master-RG-filtered DHCP config, or nil when this
+// node should serve nothing. Every driver — the commit path
+// (daemon_apply_routing.go), the RG-transition edge (applyRethServicesForRG /
+// clearRethServicesForRG), and the #6535 reconcile converger — derives its
+// desired state from here.
+//
+// It is single-sourced rather than duplicated because a divergence between the
+// converger and the edge is ALWAYS a bug: the converger runs every 2s and
+// would fight the edge forever, restarting Kea on every tick. Binding two
+// copies with a test would not be enough — there is no legitimate reason for
+// them to differ.
+func (d *Daemon) desiredClusterDHCPConfig(cfg *config.Config) *config.DHCPServerConfig {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil {
+		return nil
+	}
+	// filterDHCPConfigForMasterRGs copies the config and resolves RETH
+	// interface names internally. It returns nil when no group's interfaces
+	// belong to a currently-MASTER RG.
+	return d.filterDHCPConfigForMasterRGs(cfg)
+}
+
+// reconcileClusterDHCPServices is the periodic converger for the Kea applier
+// (#6535). Every other trigger is an EDGE: applyRethServicesForRG /
+// clearRethServicesForRG run only under `if tr.Changed`, and the commit path
+// runs only when an operator commits. So a Kea apply that FAILED had nowhere
+// to be retried from, and the failure survives: the node that should be
+// serving stays dark, or the node that should have stopped keeps serving —
+// persistent dual-DHCP (or no-DHCP) after a failover, not a transient blip.
+//
+// This mirrors reconcileClusterRAServices, the converger the RA half of the
+// same two services already has, including its central rule — the applied
+// marker advances only on a verified success, so a transient error is retried
+// on a later pass rather than latched as converged.
+//
+// It re-drives ONLY when the manager reports the last completed attempt
+// failed, and the manager spaces retries (applyRetryInterval). A converged Kea
+// costs one atomic-guarded bool read per pass.
+func (d *Daemon) reconcileClusterDHCPServices(reason string) {
+	if d.dhcpServer == nil || d.store == nil {
+		return
+	}
+	if !d.dhcpServer.ClaimApplyRetry(time.Now()) {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	desired := d.desiredClusterDHCPConfig(cfg)
+	slog.Info("reconcile: retrying failed DHCP server apply", "reason", reason)
+	d.dhcpServer.ApplyAsync(desired, "reconcile: "+reason)
 }
 
 // filterDHCPConfigForMasterRGs returns a DHCP config containing only groups

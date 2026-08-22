@@ -361,23 +361,128 @@ fn session_id_is_stable_across_open_and_close() {
     );
 }
 
-// #4915: the session id namespaces the worker in the high 16 bits so ids are
+// #4915: the session id namespaces the worker in the high bits so ids are
 // unique across the node's shared-nothing per-worker session tables; the low 48
-// bits are a per-worker counter starting at 1.
+// bits are a per-worker counter starting at 1. #6311 narrowed the worker half to
+// 15 bits and put the node discriminator above it — on node 0 the layout is
+// bit-identical to pre-#6311, which is what this pins.
 #[test]
 fn session_id_namespaces_worker_in_high_bits() {
     let mut table = SessionTable::new();
-    table.set_worker_id(3);
+    table.set_session_id_namespace(0, 3);
     let t0 = 1_000_000_000u64;
     assert!(table.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
     let opens = table.drain_deltas(8);
     assert_eq!(opens.len(), 1);
     let id = opens[0].session_id;
-    assert_eq!(id >> 48, 3, "worker id must occupy the high 16 bits");
+    assert_eq!(id >> 48, 3, "worker id must occupy the high bits");
     assert_eq!(
         id & 0x0000_FFFF_FFFF_FFFF,
         1,
         "the first session's per-worker counter starts at 1"
+    );
+}
+
+// #6311: the SAME worker index on the two cluster nodes must mint DISJOINT ids.
+// Both HA nodes run the same worker set (queue indices 0..N) and both per-worker
+// counters start at 1, so before the node discriminator a peer id adopted
+// verbatim on import (#5212) collided with the importing node's own id for that
+// worker — guaranteed in active/active early after boot.
+//
+// RED on revert: drop the node half from `set_session_id_namespace` (ignore
+// node_id, namespace = worker alone) and the two ids are equal.
+#[test]
+fn session_id_carries_the_node_discriminator_6311() {
+    let mut node0 = SessionTable::new();
+    let mut node1 = SessionTable::new();
+    node0.set_session_id_namespace(0, 3);
+    node1.set_session_id_namespace(1, 3);
+    let t0 = 1_000_000_000u64;
+    assert!(node0.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
+    assert!(node1.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let id0 = node0.drain_deltas(8)[0].session_id;
+    let id1 = node1.drain_deltas(8)[0].session_id;
+
+    assert_ne!(
+        id0, id1,
+        "#6311: the same worker index on the two cluster nodes minted the SAME session id — \
+         a standby that adopts a peer id would collide with its own"
+    );
+    // The ONLY difference is the node bit: the worker half and the counter are
+    // untouched, so cross-node correlation and per-worker debuggability survive.
+    assert_eq!(
+        id0 ^ id1,
+        1u64 << 63,
+        "the node discriminator must be exactly the top bit — the worker field and the \
+         counter must be unchanged by it"
+    );
+    assert_eq!(id0 >> 48, 3, "node 0 keeps the pre-#6311 layout");
+    assert_eq!(
+        id1 >> 48,
+        (1 << 15) | 3,
+        "node 1 sets the node bit above the worker field"
+    );
+}
+
+// #6311: the structural consequence, driven through the REAL adoption path —
+// an id ADOPTED from the peer can never be re-minted locally, so the pre-#5212
+// same-node uniqueness property is restored without any `next_session_id`
+// bookkeeping on the adoption path.
+//
+// The peer id is MINTED BY A NODE-1 TABLE, not written as a literal. An earlier
+// draft of this test hardcoded `((1<<15)|3)<<48 | 1`, and the mutation matrix
+// caught that as VACUOUS: a hardcoded peer id simply names a value the un-bitted
+// allocator never produces, so the assertion passed with the node discriminator
+// removed. It was a probe keyed to the fix rather than to the property. Deriving
+// the peer id from a real (node 1, worker 3) table is what puts the node bit
+// under test.
+#[test]
+fn adopted_peer_id_cannot_collide_with_a_local_id_6311() {
+    let t0 = 1_000_000_000u64;
+
+    // What the PEER actually mints for its first worker-3 session.
+    let mut peer = SessionTable::new();
+    peer.set_session_id_namespace(1, 3);
+    assert!(peer.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let peer_id = peer.drain_deltas(8)[0].session_id;
+    assert_ne!(peer_id, 0, "fixture: the peer must have minted a real id");
+
+    // This node runs the SAME worker index, and its counter also starts at 1 —
+    // the exact point where the pre-#6311 namespaces collided.
+    let mut local = SessionTable::new();
+    local.set_session_id_namespace(0, 3);
+
+    // Adopt the peer's id verbatim (#5212).
+    let imported = key_v6();
+    assert!(local.upsert_synced_with_origin(
+        SessionInstall {
+            key: imported.clone(),
+            decision: decision(),
+            metadata: metadata(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: t0,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+            session_id: peer_id,
+        },
+        false,
+    ));
+    assert_eq!(
+        local.session_id_for(&imported),
+        peer_id,
+        "precondition: the import must ADOPT the peer id, or this test proves nothing"
+    );
+
+    // Now mint locally. The adoption did NOT advance `next_session_id`, so this
+    // is counter 1 — which is precisely the value the peer used. It must still
+    // differ, and it can only differ because of the node bit.
+    let mine = key_v4();
+    assert!(local.install_with_protocol(mine.clone(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let local_id = local.session_id_for(&mine);
+    assert_ne!(
+        local_id, peer_id,
+        "#6311: this node's first worker-3 id equals the peer's first worker-3 id — the \
+         adopted import and a locally-minted session share one correlation stamp"
     );
 }
 
@@ -393,11 +498,32 @@ fn session_id_namespaces_worker_in_high_bits() {
 // both build `--release`, where a debug assertion is stripped and would guard
 // nothing. Worker setup is config time, where docs/engineering-style.md prefers
 // crash-start over running with a wrong invariant.
+//
+// #6311 re-partitioned these bits: `0xFFFF` is now node-bit-1 plus worker
+// `0x7FFF`, so reaching the reservation requires BOTH halves. That is why this
+// test names node 1 explicitly — a worker id of `0xFFFF` no longer reaches the
+// reservation assert at all (it trips the narrower worker-range assert first,
+// pinned separately below), and leaving it that way would have quietly turned
+// this guard into a test of a different assertion.
 #[test]
 #[should_panic(expected = "reserved for the Go control plane")]
 fn set_worker_id_rejects_the_control_plane_namespace_6198() {
     let mut table = SessionTable::new();
-    table.set_worker_id(CONTROL_PLANE_SESSION_ID_WORKER_HI as u32);
+    table.set_session_id_namespace(1, SESSION_ID_MAX_WORKER as u32);
+}
+
+// #6311: a worker id that does not fit the narrowed 15-bit worker half must be
+// REFUSED, not masked. Masking it (the pre-#6311 `& 0xFFFF` behaviour, applied
+// to the narrower field) would carry into the node bit and mint ids inside the
+// PEER node's namespace — a silent cross-node collision, strictly worse than the
+// counter aliasing the old mask prevented. Unreachable today (worker ids are
+// bounded by MAX_NAT_HOLDER_WORKERS = 128 where they are minted), which is
+// exactly why it needs a pin.
+#[test]
+#[should_panic(expected = "does not fit")]
+fn set_session_id_namespace_refuses_a_worker_id_that_would_reach_the_node_bit_6311() {
+    let mut table = SessionTable::new();
+    table.set_session_id_namespace(0, SESSION_ID_MAX_WORKER as u32 + 1);
 }
 
 // The paired NEGATIVE CONTROL: the highest worker id that is NOT reserved is
@@ -407,7 +533,10 @@ fn set_worker_id_rejects_the_control_plane_namespace_6198() {
 #[test]
 fn set_worker_id_accepts_the_value_below_the_reservation_6198() {
     let mut table = SessionTable::new();
-    table.set_worker_id(CONTROL_PLANE_SESSION_ID_WORKER_HI as u32 - 1);
+    // One below the reservation: node 1, worker 0x7FFE. Post-#6311 the
+    // reservation is a NAMESPACE value, so the neighbour has to be named as a
+    // (node, worker) pair too.
+    table.set_session_id_namespace(1, SESSION_ID_MAX_WORKER as u32 - 1);
     let t0 = 1_000_000_000u64;
     assert!(table.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
     let opens = table.drain_deltas(8);
@@ -415,7 +544,7 @@ fn set_worker_id_accepts_the_value_below_the_reservation_6198() {
     assert_eq!(
         opens[0].session_id >> 48,
         CONTROL_PLANE_SESSION_ID_WORKER_HI - 1,
-        "an unreserved worker id must still namespace normally"
+        "an unreserved namespace must still namespace normally"
     );
 }
 
@@ -433,14 +562,14 @@ fn set_worker_id_accepts_the_value_below_the_reservation_6198() {
 #[test]
 fn synced_import_adopts_peer_session_id_5212() {
     let mut table = SessionTable::new();
-    // Local allocations would land in this node's worker-2 id namespace.
-    table.set_worker_id(2);
+    // Local allocations would land in this node's (node 0, worker 2) namespace.
+    table.set_session_id_namespace(0, 2);
     let now = 1_000_000_000u64;
 
-    // A peer-originated id, adopted verbatim. Worker 3 (distinct from this
-    // node's local worker 2) only keeps the revert assertion unambiguous — the
-    // namespace has no node discriminator, so a same-worker peer id would
-    // collide with a local id (#6311).
+    // A peer-originated id, adopted verbatim. Since #6311 the namespace carries
+    // a NODE discriminator, so a peer id can no longer collide with a local one
+    // even at the same worker index; the distinct worker here only keeps the
+    // revert assertion unambiguous.
     let peer_id: u64 = (3u64 << 48) | 42;
     let key = key_v4();
     assert!(table.upsert_synced_with_origin(

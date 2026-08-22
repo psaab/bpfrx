@@ -294,6 +294,17 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	}
 	m.mu.Unlock()
 	if err := m.commitRequestedPeerFailover(rgID, reqID); err != nil {
+		// The commit applies peerTransferOutOverride BEFORE running the
+		// election, so an election that fails to promote us leaves the
+		// override armed. It has no expiry — applyTransferCommitOverrides-
+		// OnPeerStateLocked re-forces the peer to secondary-hold on EVERY
+		// subsequent heartbeat — so electRG's "Peer transfer out" arm
+		// self-promotes this node as soon as local weight recovers, giving a
+		// persistent dual-primary. Roll back exactly as the batch path does
+		// (#6527). The rollback is reqID-matched and a no-op on the two
+		// error returns that precede the override, so it is safe on every
+		// commit failure.
+		m.abortRequestedPeerFailover(rgID, reqID)
 		return err
 	}
 	if localCommitReadyFn != nil {
