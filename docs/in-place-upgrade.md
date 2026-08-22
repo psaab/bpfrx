@@ -573,6 +573,19 @@ state machines are untouched.
    post-promotion check (`make test-failover`) — a passive node structurally
    cannot forward, so it is never "verified while passive".
 
+   **#6557**: until that issue, this paragraph described the intent and the
+   code did not implement it. `runRollingWith` step 7 called a bare
+   `cl.ResetFailover()` and returned nil; `RejoinAndConfirm` — declared on
+   the `RollingCluster` interface in `rolling.go` itself — was wired only
+   into `kernel_drain.go`. `fakeCluster` had carried the `rejoinIncomplete`
+   / `rejoinErr` seams since #5138 and no rolling test ever set them, and
+   `TestRolling_HappyPath` asserted only that `ResetFailover` was *called*,
+   so nothing observed the difference between requesting a rejoin and
+   confirming one. Step 7 now calls `RejoinAndConfirm(cl, RejoinDeadline)`,
+   so the binary rolling cut and the LANE-1 kernel roll share ONE definition
+   of "rejoined". On failure the node is left secondary and the error tells
+   the driver explicitly not to advance to the peer.
+
 ### `--unit` and the cluster control endpoint (#1983)
 
 `--unit <name>` (default `xpfd`) selects the systemd unit the

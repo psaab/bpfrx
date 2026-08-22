@@ -1,3 +1,27 @@
+## 2026-08-21 — #6557 rolling step 7 confirms the rejoin per-RG
+
+- **Timestamp**: 2026-08-21
+- **Action**: `runRollingWith` step 7 called a bare `cl.ResetFailover()`
+  and reported "cut complete" without confirming it. Replaced with
+  `RejoinAndConfirm(cl, rc.RejoinDeadline)` — the #5138 per-RG readback
+  that was declared on the `RollingCluster` interface in `rolling.go`
+  itself but wired only into `kernel_drain.go`. Reusing it (rather than
+  open-coding a poll) keeps the binary rolling cut and the LANE-1 kernel
+  roll on one definition of "rejoined". The failure error now tells the
+  driver explicitly not to advance to the peer. Added a `rejoinChecks`
+  counter to `fakeCluster`: the pre-existing `TestRolling_HappyPath`
+  asserted only that `ResetFailover` was CALLED, which a step 7 that
+  never confirms satisfies just as well.
+  Mutation matrix: R1 (restore the shipped bare `ResetFailover`) → all
+  three tests red; R2 (confirm but log-and-continue) → both behavioural
+  tests red; R3 (drop the "MUST NOT advance to the peer" guidance) → the
+  incomplete-rejoin test reds.
+  NOTE: `docs/in-place-upgrade.md` already DESCRIBED this behaviour as
+  shipped — the doc was ahead of the code, and now says so.
+- **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/rolling_test.go,
+  pkg/upgrade/rolling_rejoin_confirm_6557_test.go,
+  docs/in-place-upgrade.md
+
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
 - **Timestamp**: 2026-08-22
