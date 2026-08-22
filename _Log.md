@@ -1,3 +1,49 @@
+## 2026-08-21 — #6631 kernel arm: refuse a journal path the boot gate cannot read
+
+- **Timestamp**: 2026-08-21
+- **Action**: `xpfd upgrade kernel arm --journal <non-default>` produced a
+  STRUCTURALLY UNPROMOTABLE candidate. Go honoured the flag — the journal went
+  to `<path>` and `ArmRecordPath` derived the sidecar from its directory, so
+  both files moved together — while the boot gate hardcodes both locations. It
+  found neither, took its benign "nothing to promote" branch, and exited quiet:
+  the candidate booted, ran UNVERIFIED, was never promoted, and reverted on the
+  next plain reboot behind a log line that reads like an ordinary boot.
+
+  Established the "can never be promoted" claim as UNREACHABLE rather than
+  merely awkward by closing all three channels that could carry a path:
+  `xpf-kernel-promote.service` is `ExecStart=/usr/local/sbin/xpf-kernel-promote`
+  with no operands AND the script parses no argv of its own (no `$1`, `$@` or
+  `getopts` — the only `$1`/`$2` in it are function parameters); neither
+  promote unit mentions a journal in any form; and the gate's inner exec is
+  `"$XPFD" upgrade kernel promote` with no `--journal`. So even an operator
+  drop-in overriding `ExecStart` has nothing to pass to.
+
+  `KernelRunner.Arm` therefore refuses up front with a new
+  `ErrKernelJournalUnpromotable`, before the candidate version is validated and
+  before any system call. Deliberately NOT `ErrKernelChannelUnavailable`: that
+  sentinel exits 2 and the kernel-roll orchestrator reads it as a legitimate
+  LANE-2 fallback, which an operator typo must not look like.
+
+  The seam is a package var `bootGateJournalPath`, so a test that arms against
+  a `t.TempDir()` journal states "this box's gate reads here" rather than
+  switching the check off. Unexported, so cmd/xpfd and pkg/daemon are
+  structurally incapable of relaxing it, and
+  `TestBootGateJournalPathIsTheProductionDefault_6631` pins the compiled-in
+  value so a leaked override cannot make the guard vacuous for the ~30 arm
+  tests that follow.
+
+  Corrected the operator-facing text that PROMISED this did not exist: the
+  `--journal` flag help said "DIAGNOSTIC-ONLY … can never be promoted" and its
+  comment pointed at #6632 ("until then the help text says so"); #6632 was
+  closed as a duplicate of #6631 on 2026-08-07 with no implementing PR.
+- **File(s)**: `pkg/upgrade/kernel_arm_journal_path.go` (new),
+  `pkg/upgrade/kernel_arm_journal_6631_test.go` (new),
+  `pkg/upgrade/kernel_run.go`, `pkg/upgrade/kernel_test.go`,
+  `cmd/xpfd/upgrade_kernel.go`, `docs/in-place-upgrade.md`,
+  `scripts/image/xpf-kernel-promote` (comment cross-reference),
+  `scripts/image/test_kernel_promote_explicit_path.py` (docstring
+  cross-references), `_Log.md`
+
 ## 2026-08-21 — #6656 transfer-out override cleared on peer loss
 
 - **Timestamp**: 2026-08-21
