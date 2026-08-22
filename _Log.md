@@ -1,3 +1,21 @@
+## 2026-08-22 — #7406: operator note on where a credential may live in a URL
+
+- **Timestamp**: 2026-08-22
+- **Action**: Documented the hostname/path residual in `pkg/ddns/README.md`,
+  placed directly after the paragraph that already enumerates userinfo and
+  query as the slots an operator may embed a credential in — so the reader
+  learns what IS stripped and what is NOT in one place.
+  Framed deliberately as CURRENT BEHAVIOUR ("is rendered verbatim by every
+  surface that redacts these leaves today") rather than as policy ("this is
+  the supported way to configure a credential"). The former stays true
+  whichever way #7406 is resolved; the latter would presume the
+  accept-and-document resolution over the explicit-secret-marking one, and
+  would have to be retracted if the grammar option lands. Does NOT close
+  #7406 — the grammar decision is still open and belongs to the config-schema
+  owner.
+  Docs-only; no code, no behaviour change.
+- **File(s)**: `pkg/ddns/README.md`
+
 ## 2026-08-22 — #6709/#7009: the pkg/ddns full-package flake, both mechanisms
 
 - **Timestamp**: 2026-08-22
