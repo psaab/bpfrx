@@ -1,6 +1,6 @@
 use super::*;
 
-mod commands;
+pub(in crate::afxdp) mod commands;
 mod promote;
 
 use promote::{
@@ -1545,3 +1545,8 @@ mod tests;
 #[cfg(test)]
 #[path = "newflow_contention_tests.rs"]
 mod newflow_contention_tests;
+
+// #6600: the coordinator's pre-publish NAT reservation resolves the synced zone
+// pair through the SAME helper the worker-side upsert uses, so the two cannot
+// land on different allocators.
+pub(in crate::afxdp) use commands::upsert_synced::synced_source_nat_zone_pair;

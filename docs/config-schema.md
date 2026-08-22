@@ -2256,6 +2256,50 @@ validator must accept **area 0** (the backbone has no `>= 1` floor, unlike a BGP
 cluster-id), and the `autonomous-system` range must stay `1..4294967295` — a
 mutation loosening either is a silent over-acceptance, and both are pinned.
 
+### The dangling-keyword member (#6564 member 9)
+
+`parseApplicationTerms` guards every value-taking arm with
+`if i+1 < len(keys)` and has no `else`, so a RECOGNIZED leaf keyword in the LAST
+position fell through recording nothing at all — and the `default:` arm that
+feeds `UnknownTermLeaves` is unreachable for a keyword the switch recognizes.
+
+The consequence is the exact fail-open the rest of that function exists to stop.
+`default:`'s own comment says it records the token "rather than silently
+dropping the constraint and widening the match", and #3348's says a dropped
+`icmp-type` "would leave the term UNCONSTRAINED ... a fail-open widening". A
+dangling keyword does precisely that: `term t1 protocol tcp destination-port`
+compiled to protocol-only, so an application written to match ONE port matched
+EVERY TCP port, and any policy permitting it widened with it.
+
+**Why the surrounding family missed it.** #3320 (malformed timeout), #3348
+(malformed icmp-type), #3352 (unrecognized leaf) and #6524 (trailing token on
+the application body) each instrument a MALFORMED VALUE. This shape has no value
+to be malformed — the defect is the ABSENCE of one — so none of their gates
+could see it. A cohort built around "instrument the bad value" has a blind spot
+at "there is no value", and that is worth checking for whenever a family of
+value-validators accumulates.
+
+**One guard, not eight `else` branches.** The check runs once before the switch,
+keyed on `valueTakingTermLeaves`. A per-arm `else` would have to be repeated for
+every future value-taking leaf, which is the duplication that drifts.
+
+**The set is pinned to the switch textually.** `valueTakingTermLeaves` is the
+arity contract, and a future leaf added to the switch WITHOUT being added to the
+set silently re-opens the fail-open — while every behavioural test still passes,
+because they can only exercise keywords someone remembered to list.
+`TestValueTakingTermLeavesCoversEveryConsumingArm6564` therefore scans the
+function's own source: every `case "<kw>":` arm whose body reads `keys[i+1]`
+must be a member, and the counts must match in both directions so the set cannot
+accumulate entries for leaves that no longer exist. It fails loudly if its own
+scan pattern stops matching, so it cannot rot into a vacuous pass. Same
+discipline as the #6588 no-arg statement registry.
+
+`IncompleteTermLeaves` is deliberately separate from `UnknownTermLeaves`: the
+keyword IS supported, so calling it an "unknown statement" would send the
+operator hunting a typo that is not there. Posture is the cohort's usual —
+strict on commit / commit-check, warn on the tolerant load / peer-sync path via
+the existing `lenientApplicationSpecs` (#2142) downgrade.
+
 REACHABILITY (honest bound): as with #6525, these compact spellings are
 hierarchical text ingest only — `load override` / `load merge` / the persisted
 config file / HA `SyncApply`. `set` cannot produce them and `display set`

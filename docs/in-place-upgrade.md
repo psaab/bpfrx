@@ -1066,12 +1066,34 @@ build against the candidate kernel. Both hops resolve explicitly:
   systemd's *default* `PATH` ranks the operator-writable
   `/usr/local/sbin` and `/usr/local/bin` first.
 - *Inner hop* — `realKernelSystem.VerifyDataplane`
-  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) prefers
-  `os.Executable()` — the running process IS `xpfd upgrade kernel
-  promote`, and on Linux `/proc/self/exe` resolves the
+  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) resolves
+  `os.Executable()` and **nothing else**. The running process IS `xpfd
+  upgrade kernel promote`, and on Linux `/proc/self/exe` resolves the
   sbin→`current`→`versions/<ver>/xpfd` chain down to the concrete
-  versioned artifact — then `<SbinDir>/xpfd`, then
-  `<VersionsDir>/current/xpfd`.
+  versioned artifact — so this is the kernel's answer for the running
+  process, not an inference. If it cannot be resolved and validated
+  (absolute, existing, regular, executable), the inner hop **refuses**.
+
+  **Authority order, stated for both hops together (#6620).** The outer
+  hop is `/proc/<MainPID>/exe` → strictly-parsed `ExecStart` → loud
+  refusal; the inner hop is `os.Executable()` → refusal. Neither has a
+  filesystem fallback, and they refuse for the same reason: `--sbin-dir`
+  and `--versions-dir` relocate *independently* and neither relocation
+  removes what it left behind, so a leftover at a compiled-in default is
+  byte-for-byte indistinguishable from a live install. That includes the
+  both-roots-relocated shape, where the surviving default symlink still
+  points at the surviving default runtime and the two candidates are ONE
+  INODE — exactly like a healthy layout.
+
+  The inner hop used to fall back to `<SbinDir>/xpfd` and then
+  `<VersionsDir>/current/xpfd`, ranked in that order because `flip` step
+  6b repoints the sbin entry on every cut. A better-ranked guess is still
+  a guess: on a relocated box the surviving default sbin symlink resolves
+  perfectly and names a *stale* runtime, so the ranking preferred the
+  stale build with full confidence. Refusing is not a lesser outcome — a
+  Gate-3 error routes to `revert()` (restore the known-good `BootOrder`,
+  reboot to the known-good slot), which is a correct terminal outcome,
+  strictly better than a promotion authorized by the wrong dataplane.
 
 **The arming records which xpfd must verify the candidate (#6601).**
 Six revisions tried to answer *which xpfd is live?* on the candidate boot
@@ -1152,15 +1174,41 @@ candidate `ARMED`? — and:
 **`--journal` is not one of those cases**, and must not be cited as this
 check's motivation. Go derives the sidecar from the journal's *directory*,
 so `xpfd upgrade kernel arm --journal <elsewhere>` moves **both** files
-together: the gate finds neither and takes the quiet branch. That is a
-real trap — the boot unit hardcodes
-`ExecStart=/usr/local/sbin/xpf-kernel-promote` with no way to pass a
-journal path, so a candidate armed against a non-default journal is
-*structurally* unpromotable — but it is pre-existing (before this gate
-existed, `xpfd upgrade kernel promote` read the default journal, found
-nothing and no-op'd identically) and orthogonal. **For the kernel
-channel, `--journal` is diagnostic-only**; the arm-time refusal is
-tracked separately as #6632.
+together: the gate would find neither and take the quiet branch, not the
+loud ARMED-without-record branch above. That is a different defect, and
+it is closed at the other end.
+
+**Arming refuses a non-default journal path (#6631).** The boot gate
+cannot be told where to look, and this is worth stating as *unreachable*
+rather than *awkward* — all three channels that could carry a path are
+absent:
+
+| channel | why it does not exist |
+|---|---|
+| argument | `xpf-kernel-promote.service` is `ExecStart=/usr/local/sbin/xpf-kernel-promote` with no operands, and the script parses no argv of its own — no `$1`, no `$@`, no `getopts`. An operator drop-in overriding `ExecStart` has nothing to pass *to*. |
+| environment | neither promote unit mentions a journal in any form; the only `Environment=` is the pinned `PATH`. |
+| the inner exec | the gate runs `"$XPFD" upgrade kernel promote` with **no** `--journal`, so the Go half reads the compiled-in default regardless of what armed the candidate. |
+
+So a candidate armed elsewhere would boot, run **unverified**, never be
+promoted, and revert on the next plain reboot — the safe direction, but
+silent, which is exactly the benign-skip laundering this gate otherwise
+works to eliminate. `KernelRunner.Arm` therefore refuses up front with
+`ErrKernelJournalUnpromotable`, before the candidate version is even
+validated and before any system call: arming is a preflight and is
+retryable, a candidate kernel booting unverified is not. The refusal
+names the path the gate reads, so it is actionable.
+
+The sentinel is deliberately **not** `ErrKernelChannelUnavailable`: that
+one means *use LANE 2 instead* and exits 2, which the kernel-roll
+orchestrator proceeds past. A mistyped flag is exit 1 — fix the command.
+
+**For the kernel channel, `--journal` is therefore accepted only on the
+verbs that cannot strand a candidate** (`status` and the crash-recovery
+verbs). It remains fully usable on the non-kernel `xpfd upgrade` verbs,
+which journal to `/var/lib/xpf/upgrade.state` and have no boot-time gate
+reading a fixed path. The scoping is pinned by
+`TestArmJournalGuardIsScopedToTheKernelArmPath_6631`, which requires the
+guard to have exactly one caller and for that caller to be `Arm`.
 
 `ARMED` **specifically**, not `ARMING`: `ARMING` is prepared intent
 recorded before the firmware one-shot is read back, which is exactly the

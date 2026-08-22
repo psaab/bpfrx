@@ -718,21 +718,16 @@ rolling_detect_secondary() {
 # after a rolling deploy, so downstream smoke (apply-cos-config, test-failover)
 # starts from the documented node0-primary steady state regardless of preempt
 # config — removing the force-node0-primary workaround the HA batch scripts
-# needed (#4009). Best-effort: a failed request is logged, never fatal.
+# needed (#4009).
+#
+# #6591: the body moved into deploy-lib.sh so the self-test can drive it
+# against the mocked incus, and it is FAIL-CLOSED — it dies rather than
+# warning. It used to swallow an unreadable status, do nothing, and return
+# success; the un-reasserted cluster was then discovered minutes later by an
+# unrelated smoke target's preflight, where the first hypothesis is that the
+# change under test broke HA.
 reassert_primary_node0() {
-	local status rg did=0
-	status=$(incus exec "$(r "$VM0")" -- cli -c "show chassis cluster status" 2>/dev/null || true)
-	while read -r rg; do
-		[[ -n "$rg" ]] || continue
-		incus exec "$(r "$VM0")" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
-		incus exec "$(r "$VM0")" -- cli -c "request chassis cluster failover redundancy-group $rg node 0" >/dev/null 2>&1 || true
-		did=1
-	done < <(printf '%s\n' "$status" | deploy_rolling_rg_ids)
-	if [[ "$did" == 1 ]]; then
-		info "Re-asserted node0 primary for all redundancy groups (post-deploy)."
-	else
-		warn "Post-deploy primary reassert skipped — could not read cluster status from node0."
-	fi
+	deploy_reassert_primary_node0 "$(r "$VM0")"
 }
 
 # deploy_rolling_deb sequences the deb cut across both nodes (secondary
