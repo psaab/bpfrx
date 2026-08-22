@@ -1,3 +1,38 @@
+## 2026-08-21 — #6534 CoS family: skipped classifier/scheduler entries annotated
+
+- **Timestamp**: 2026-08-21
+- **Action**: Extended the #6534 fix to the class-of-service family. All
+  five builder sites in `cos.go` skip an entry on the SAME condition — it
+  names a forwarding-class `class-of-service forwarding-classes` does not
+  define — so one shared predicate, `config.CoSForwardingClassUndefined`,
+  binds all of them, and the three renderers that display a filtered
+  collection now annotate the loss.
+  Of the five builder sites only FOUR have a lying surface: the
+  inet-precedence classifier is excluded by the builder but rendered by
+  no show surface at all, so it is not a #6534 instance. Worth recording
+  that the population of "fail-closed exclusions" and the population of
+  "exclusions with a lying renderer" are not the same set.
+  Two deliberate non-annotations, each pinned by a test: a scheduler-map
+  entry naming an undefined SCHEDULER is KEPT on the wire (different
+  edge, opposite disposition), and `ieee-802.1` rewrite-rules are never
+  published at all (a wholesale gap, not a per-entry skip — annotating
+  them would misreport a bigger gap as a smaller one).
+  The builder and renderer agreement is bound by TWO tests rather than
+  one, because `format` imports `userspace` and a single spanning test
+  would be an import cycle; they compose through the shared predicate.
+  Unlike the NAT exclusions, this one is reachable through an ordinary
+  `commit` — an undefined forwarding-class reference is only a
+  commit-time warning.
+  Validation: `go test -count=1` green on pkg/config, pkg/natshow,
+  pkg/dataplane/userspace, .../format, pkg/cli, pkg/grpcapi; `-run 6534`
+  binds 26 `=== RUN` lines; 6-cell mutation matrix all red with `go vet`
+  clean at every mutated state, control and restored green.
+- **File(s)**: pkg/config/cos_exclusion_reason.go,
+  pkg/dataplane/userspace/cos.go,
+  pkg/dataplane/userspace/cos_exclusion_6534_test.go,
+  pkg/dataplane/userspace/format/cos_show.go,
+  pkg/dataplane/userspace/format/cos_exclusion_6534_test.go,
+  docs/junos-cli-reference.md, _Log.md
 ## 2026-08-21 — #6540 dangling `then policer` stops forwarding unpoliced
 
 - **Timestamp**: 2026-08-21
