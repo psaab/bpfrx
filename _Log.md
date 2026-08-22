@@ -1,3 +1,41 @@
+## 2026-08-21 — #6534 port-mirroring: dropped instances stop rendering as armed
+
+- **Timestamp**: 2026-08-21
+- **Action**: Third family of #6534. A port-mirroring instance the
+  snapshot builder drops now carries a `NOT INSTALLED: <reason>` line on
+  both show surfaces. Sharpest case: both renderers print `Input rate:
+  all packets` whenever the rate is not > 0, so an instance with a
+  NEGATIVE rate — which the builder drops outright — advertised the most
+  permissive mirror possible while mirroring nothing.
+  BOTH surfaces are annotated because `cli.showPortMirroring` and
+  `Server.showForwardingOptionsPortMirroring` are byte-identical COPIES
+  with no shared formatter (unlike pkg/natshow and .../format, which were
+  extracted precisely to prevent this). Annotating one would have left
+  the other lying with the suite green, so the surfaces test asserts the
+  gRPC copy directly and the builder test pins the shared predicate.
+  COVERAGE IS DELIBERATELY PARTIAL, and this is the one place in the
+  audit where the issue's "give the renderer applied state" instinct has
+  real force: two of the four mirror drops depend on the runtime IFINDEX
+  TABLE (output interface unresolvable; ingress already claimed by a
+  lower-sorted instance), which a config-only renderer cannot reach.
+  Those are documented as uncovered rather than silently omitted.
+  Note the `no output interface` clause is redundant for the BUILDER — an
+  empty output name also fails the later ifindex lookup — but not for the
+  RENDERER, which has no ifindex table. It earns its place on the
+  renderer side only. The R1 mutation cell shows this directly: reverting
+  the builder drop reds only the negative-rate case.
+  Validation: `go test -count=1` green on pkg/config,
+  pkg/dataplane/userspace, pkg/cli, pkg/grpcapi; `go vet` clean on all
+  four; 5-cell mutation matrix all red with 29 `=== RUN` lines in every
+  cell, vet clean at each mutated state, control and restored green.
+- **File(s)**: pkg/config/mirror_exclusion_reason.go,
+  pkg/dataplane/userspace/mirrors.go,
+  pkg/dataplane/userspace/mirror_exclusion_6534_test.go,
+  pkg/cli/show_services_mirror.go,
+  pkg/grpcapi/server_show_forwarding.go,
+  pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
+  docs/junos-cli-reference.md, _Log.md
+
 ## 2026-08-21 — #6534 CoS family: skipped classifier/scheduler entries annotated
 
 - **Timestamp**: 2026-08-21

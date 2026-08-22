@@ -194,6 +194,13 @@ func (s *Server) showForwardingOptionsPortMirroring(cfg *config.Config, buf *str
 				if inst.Output != "" {
 					fmt.Fprintf(buf, "  Output interface: %s\n", inst.Output)
 				}
+				// #6534: mirror of the cli.showPortMirroring annotation. These
+				// two renderers are byte-identical copies with no shared
+				// formatter, so BOTH must carry it — annotating one leaves the
+				// other lying, which is why the agreement test asserts both.
+				if reason := config.PortMirroringInstanceExcludedReason(inst); reason != "" {
+					fmt.Fprintf(buf, "  NOT INSTALLED: %s\n", reason)
+				}
 				buf.WriteString("\n")
 			}
 		}
