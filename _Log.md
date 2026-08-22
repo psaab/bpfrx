@@ -100945,3 +100945,17 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_device_map_dup_name_6546_test.go (new),
   pkg/daemon/device_map_dup_name_6546_test.go (new),
   docs/bare-metal-device-map.md, _Log.md
+
+## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
+- **Timestamp**: 2026-08-21
+- **Action**: #6515 and #6519 landed independently, each carrying its own copy of
+  the #3720 physical∪unit interface-level override walk —
+  `InterfaceHostInboundEffective` inline, and `InterfaceHostInboundOverride` in
+  the #6519 advisory. `InterfaceHostInboundEffective` now CALLS
+  `InterfaceHostInboundOverride`. Single-sourced rather than bound with an
+  agreement test because a divergence would ALWAYS be a bug: the #6519 advisory
+  asks "does the interface's own stanza authorize this?" to decide what the
+  zone-level stanza is answerable for, and must be asking about the set the
+  resolver admits. Behaviour-preserving; no advisory or enforcement change.
+- **File(s)**: pkg/config/host_inbound_view.go,
+  pkg/config/host_inbound_dhcp_scope_6519.go
