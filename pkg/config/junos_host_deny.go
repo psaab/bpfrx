@@ -196,10 +196,14 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 	}
 	feedBound := junosHostFeedBoundNames(cfg)
 	lifelines := HostInboundLifelineSet(cfg)
-	// Per-zone kernel netdev iifname scope. A zone whose every non-lifeline
-	// netdev is cross-zone-ambiguous resolves to an EMPTY set here — it emits no
-	// kernel rule, so its denies must NOT be suppressed from the #4168 warning.
-	netdevsByZone := JunosHostZoneIngressNetdevs(cfg)
+	// Per-zone kernel netdev iifname scope, WITH what could not be scoped
+	// (#6564 member 8). A zone that resolved only SOME of its candidates still
+	// emits rules for the survivors — protection that works is never withdrawn —
+	// but the policy is not enforced on every ingress path of the zone, so its
+	// #4168 warning must not be suppressed. A non-empty check cannot tell that
+	// apart from full coverage, which is why the projection reads the coverage
+	// and not the netdev list.
+	coverageByZone := junosHostZoneNetdevCoverageMap(cfg)
 
 	// Per-policy-key bookkeeping to decide rendered-vs-warned (§3.3): a policy is
 	// rendered (warning suppressed) iff it is a DENY that applies to >=1
@@ -227,12 +231,23 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			continue
 		}
 		ifaceRefs := junosHostNonLifelineRefs(zone, lifelines)
-		netdevs := netdevsByZone[zoneName]
-		// A deny suppresses its #4168 warning ONLY if it produces a rendered
-		// kernel rule, which requires >=1 unambiguous non-lifeline netdev to scope
-		// the DROP by iifname — NOT merely a non-lifeline interface REF (a ref
-		// whose only netdev is a cross-zone-ambiguous shared parent emits nothing).
-		enforceable := len(netdevs) > 0
+		cov := coverageByZone[zoneName]
+		netdevs := cov.Scoped
+		// TWO decisions, deliberately not one boolean (#6564 member 8).
+		//
+		// emitsRules gates kernel emission: a DROP needs >=1 usable netdev to
+		// scope it by iifname. Unchanged.
+		//
+		// fullyScoped gates the #4168 warning SUPPRESSION, and it is a COVERAGE
+		// question, not an existence one. A zone that had candidates and could
+		// not use all of them is not enforcing the policy on every ingress path,
+		// whether it salvaged some of them or none. Note the two cases are not
+		// the same predicate: a zone with NO candidates at all (lifeline-only, or
+		// no interfaces) has nothing to enforce and must NOT block suppression —
+		// which is exactly what distinguishes it from a zone whose candidates all
+		// turned out to be unscopable.
+		emitsRules := len(netdevs) > 0
+		fullyScoped := len(cov.Unscopable) == 0
 		representable := true
 		for _, t := range terms {
 			if !t.representable {
@@ -247,7 +262,7 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			representable = false
 		}
 		var prog JunosHostDenyProgram
-		if enforceable && representable {
+		if emitsRules && representable {
 			// A cross-dimension permit/deny overlap (a narrow-application or
 			// source-excluded permit ahead of a deny) cannot be cleanly rendered
 			// as a `saddr !=` subtraction — the whole program is un-representable
@@ -272,16 +287,23 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 		}
 		// Bookkeeping for the warning.
 		for _, t := range terms {
-			if !enforceable {
+			actionByKey[t.key] = t.action
+			// A zone that tried to scope and could not use every candidate blocks
+			// suppression even when it emitted nothing at all — the policy is
+			// unenforced on that zone's ingress either way, and saying so is the
+			// whole job of the #4168 advisory.
+			if !fullyScoped {
+				blockedByUnrep[t.key] = true
+			}
+			if !emitsRules {
 				continue
 			}
 			appliesEnforceable[t.key]++
-			actionByKey[t.key] = t.action
 			if !representable {
 				blockedByUnrep[t.key] = true
 			}
 		}
-		if !enforceable || !representable {
+		if !emitsRules || !representable {
 			out.Programs = append(out.Programs, JunosHostDenyProgram{
 				Zone:          zoneName,
 				InterfaceRefs: ifaceRefs,
@@ -1103,38 +1125,159 @@ func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, 
 	return ikeNetdevs, identNetdevs
 }
 
+// Reasons a zone's candidate ingress netdev cannot be used as an iifname scope.
+const (
+	// junosHostNetdevAmbiguous: the netdev is claimed by MORE THAN ONE zone (a
+	// shared physical parent — a zone on a trunk's untagged unit-0 while the
+	// SAME parent carries another zone's tagged VLAN subunits). Scoping a deny
+	// by it would over-fire on the other zone's ingress.
+	junosHostNetdevAmbiguous = "cross-zone-ambiguous"
+	// junosHostNetdevVRFEnslaved (#6619): the netdev is enslaved to an l3mdev
+	// VRF master by the routing-instance bind in pkg/daemon
+	// (applyVRFReconcile -> BindInterfaceToVRF -> LinkSetMaster). At the
+	// netfilter LOCAL_IN hook the l3mdev rcv handler has already replaced
+	// skb->dev with the VRF device, so `meta iifname` reports the MASTER and an
+	// `iifname "<enslaved>"` rule matches nothing. Measured on the kernel floor
+	// this project targets, at the exact hook and priority xpf_hostinbound
+	// installs: 0 hits on the enslaved name, 3 on the master, and 3 on an
+	// unconditional counter — the hook runs exactly once, so there is no second
+	// pass carrying the enslaved name.
+	junosHostNetdevVRFEnslaved = "vrf-enslaved"
+)
+
+// junosHostUnscopableNetdev is one candidate ingress netdev that cannot serve as
+// an iifname scope, with the reason.
+type junosHostUnscopableNetdev struct {
+	Netdev string
+	Reason string
+}
+
+// junosHostZoneNetdevCoverage is one zone's iifname-scope resolution.
+//
+// The three states are NOT interchangeable and the projection reads them
+// differently (#6564 member 8):
+//
+//   - No candidates at all (both fields empty) — a lifeline-only zone, or one
+//     with no interfaces. There is NOTHING to enforce, so this must not block a
+//     policy's warning suppression.
+//   - Scoped non-empty, Unscopable empty — fully resolved. Rules are emitted and
+//     the policy is genuinely enforced on every ingress path of the zone.
+//   - Unscopable non-empty — the zone HAD candidates and at least one of its OWN
+//     ingress netdevs could not be used. Whatever survived is still emitted
+//     (never withdraw protection that works), but the policy is NOT enforced on
+//     every ingress path of the zone, so its warning must not be suppressed.
+//     This covers both "some resolved" and "none resolved"; the difference
+//     between them is only whether any rule is emitted, not whether the policy
+//     is fully enforced.
+//
+// Only an OWN netdev counts toward Unscopable. A dropped PARENT superset
+// candidate does not: a VLAN subunit contributes its physical parent as an extra
+// candidate for the bondless-RETH case, and on a plain 802.1Q trunk that parent
+// is never where the subunit's frames arrive, so its loss is not a gap. Counting
+// it would warn on every trunk carrying an untagged unit-0 in one zone and
+// tagged subunits in others — an ordinary correct config, and the population an
+// advisory must not fire on if operators are to keep reading it.
+type junosHostZoneNetdevCoverage struct {
+	Scoped     []string
+	Unscopable []junosHostUnscopableNetdev
+}
+
 // JunosHostZoneIngressNetdevs returns, per security zone, the sorted set of
 // kernel netdev names a host-bound packet on that zone arrives with — the
 // iifname scope for the zone's #4146 junos-host DROP rules. It EXCLUDES
-// lifelines and any netdev claimed by MORE THAN ONE zone (an ambiguous shared
+// lifelines, any netdev claimed by MORE THAN ONE zone (an ambiguous shared
 // physical parent — e.g. a zone on a trunk's untagged unit-0 while the SAME
-// parent carries other zones' tagged VLAN subunits), so a zone's deny can never
-// over-fire on another zone's ingress.
+// parent carries other zones' tagged VLAN subunits) so a zone's deny can never
+// over-fire on another zone's ingress, and any netdev enslaved to an l3mdev VRF
+// (#6619) because `iifname` at LOCAL_IN names the VRF master, not the enslaved
+// device, so such a rule matches nothing.
 //
 // It is the SSOT for the iifname scope: the dataplane BuildJunosHostPrograms
 // consumes JunosHostDenyProgram.IngressNetdevs (populated from this) for kernel
-// emission, AND BuildJunosHostDenyProjection gates a deny's warning-suppression
-// on a NON-EMPTY result here — so the #4168 warning can never be suppressed for
-// a deny that produced no kernel rule (the F1 fix; §8 inv-1/12). The
-// netdev-name resolution mirrors the dataplane interface-snapshot LinuxName
-// (userspace.snapshotLinuxName) exactly, pinned byte-for-byte by
-// TestJunosHostZoneNetdevsMatchSnapshot so the two planes cannot drift.
+// emission. Warning suppression is gated on the richer
+// junosHostZoneNetdevCoverage below, NOT on this result being non-empty: a zone
+// that resolved SOME of its candidates emits rules while still not enforcing the
+// policy on every ingress path, and a non-empty check cannot tell that from full
+// coverage (#6564 member 8). The netdev-name resolution mirrors the dataplane
+// interface-snapshot LinuxName (userspace.snapshotLinuxName) exactly, pinned
+// byte-for-byte by TestJunosHostZoneNetdevsMatchSnapshot so the two planes
+// cannot drift.
 func JunosHostZoneIngressNetdevs(cfg *Config) map[string][]string {
+	cov := junosHostZoneNetdevCoverageMap(cfg)
+	if len(cov) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for zone, c := range cov {
+		if len(c.Scoped) > 0 {
+			out[zone] = c.Scoped
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// junosHostVRFEnslavedNetdevs returns the set of kernel netdev names the daemon
+// binds to an l3mdev VRF master. It mirrors applyVRFReconcile
+// (pkg/daemon/daemon_apply_interfaces.go) exactly: every interface member of
+// every routing instance whose instance-type is not `forwarding` (a forwarding
+// instance creates no VRF device and enslaves nothing).
+//
+// Members are resolved through netdevByRef — the SAME ref->netdev map the
+// candidate walk builds — so a bare physical member (`ge-0/0/1`) and its
+// untagged unit-0, which share one netdev, are both covered by a single entry,
+// and a member naming no configured interface contributes nothing (it cannot be
+// a zone candidate either). A VLAN subunit is a distinct kernel device with its
+// own master, so enslaving the parent does NOT enslave the subunit — keying on
+// the netdev rather than the ref gets that right without a special case.
+func junosHostVRFEnslavedNetdevs(cfg *Config, netdevByRef map[string]string) map[string]bool {
+	out := map[string]bool{}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.InstanceType == "forwarding" {
+			continue
+		}
+		for _, member := range ri.Interfaces {
+			if member == "" {
+				continue
+			}
+			if nd := netdevByRef[CanonicalInterfaceUnitRef(member)]; nd != "" {
+				out[nd] = true
+			}
+		}
+	}
+	return out
+}
+
+// junosHostZoneNetdevCoverageMap resolves every zone's iifname scope and records
+// what it could NOT use, so the projection can distinguish "nothing to enforce"
+// from "could not fully enforce".
+func junosHostZoneNetdevCoverageMap(cfg *Config) map[string]junosHostZoneNetdevCoverage {
 	if cfg == nil || len(cfg.Security.Zones) == 0 || len(cfg.Interfaces.Interfaces) == 0 {
 		return nil
 	}
 	lifelines := HostInboundLifelineSet(cfg)
 	zoneByIface := junosHostZoneByInterface(cfg)
-	cand := map[string]map[string]bool{}   // zone -> netdev set
+	// cand[zone][netdev] records whether the netdev is the zone's OWN ingress
+	// device (true) or only a conservative PARENT superset candidate (false).
+	// The distinction decides whether losing it is a coverage GAP: a subunit's
+	// own netdev is where its frames actually arrive, whereas the physical
+	// parent is added for the bondless-RETH case where they may ride the member
+	// instead. Losing a parent candidate costs a plain 802.1Q zone nothing —
+	// tagged frames are demuxed to the subunit netdev — so treating it as a gap
+	// would warn on every trunk that carries an untagged unit-0 in one zone and
+	// tagged subunits in others, which is an ordinary correct config.
+	cand := map[string]map[string]bool{}   // zone -> netdev -> isOwn
 	claims := map[string]map[string]bool{} // netdev -> zone set
-	addCand := func(zone, nd string) {
+	addCand := func(zone, nd string, own bool) {
 		if zone == "" || nd == "" {
 			return
 		}
 		if cand[zone] == nil {
 			cand[zone] = map[string]bool{}
 		}
-		cand[zone][nd] = true
+		cand[zone][nd] = cand[zone][nd] || own
 		if claims[nd] == nil {
 			claims[nd] = map[string]bool{}
 		}
@@ -1151,9 +1294,9 @@ func JunosHostZoneIngressNetdevs(cfg *Config) map[string][]string {
 		if zone == "" {
 			return
 		}
-		addCand(zone, own)
+		addCand(zone, own, true)
 		if vlan != 0 && parent != "" {
-			addCand(zone, parent)
+			addCand(zone, parent, false)
 		}
 	}
 	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
@@ -1161,6 +1304,25 @@ func JunosHostZoneIngressNetdevs(cfg *Config) map[string][]string {
 		ifNames = append(ifNames, n)
 	}
 	sort.Strings(ifNames)
+	// Pass 1: ref -> netdev for every physical and unit row, so the VRF member
+	// list resolves through the SAME name rule the candidates use.
+	netdevByRef := map[string]string{}
+	for _, ifName := range ifNames {
+		iface := cfg.Interfaces.Interfaces[ifName]
+		if iface == nil {
+			continue
+		}
+		netdevByRef[ifName] = junosHostLinuxName(cfg, ifName, nil)
+		for un, unit := range iface.Units {
+			if unit == nil {
+				continue
+			}
+			netdevByRef[fmt.Sprintf("%s.%d", ifName, un)] = junosHostLinuxName(cfg, ifName, unit)
+		}
+	}
+	enslaved := junosHostVRFEnslavedNetdevs(cfg, netdevByRef)
+	// Pass 2: the candidate walk. One "row" per physical interface + one per
+	// unit, mirroring the dataplane interface snapshot.
 	for _, ifName := range ifNames {
 		iface := cfg.Interfaces.Interfaces[ifName]
 		if iface == nil {
@@ -1182,18 +1344,38 @@ func JunosHostZoneIngressNetdevs(cfg *Config) map[string][]string {
 				junosHostLinuxName(cfg, ifName, nil), unit.VlanID)
 		}
 	}
-	out := map[string][]string{}
+	out := map[string]junosHostZoneNetdevCoverage{}
 	for zone, nds := range cand {
-		var keep []string
+		var c junosHostZoneNetdevCoverage
+		names := make([]string, 0, len(nds))
 		for nd := range nds {
-			if len(claims[nd]) == 1 { // unambiguous: only this zone claims nd
-				keep = append(keep, nd)
+			names = append(names, nd)
+		}
+		sort.Strings(names)
+		for _, nd := range names {
+			reason := ""
+			switch {
+			// Ambiguity is reported first: it is the pre-existing reason and the
+			// one an operator resolves by re-zoning, whereas an enslaved netdev
+			// is not scopable by any zoning change.
+			case len(claims[nd]) != 1:
+				reason = junosHostNetdevAmbiguous
+			case enslaved[nd]:
+				reason = junosHostNetdevVRFEnslaved
+			}
+			if reason == "" {
+				c.Scoped = append(c.Scoped, nd)
+				continue
+			}
+			// Only an OWN netdev that could not be scoped is a coverage gap. A
+			// dropped PARENT superset candidate is not: the subunit's own netdev
+			// still covers where its frames arrive.
+			if nds[nd] {
+				c.Unscopable = append(c.Unscopable,
+					junosHostUnscopableNetdev{Netdev: nd, Reason: reason})
 			}
 		}
-		if len(keep) > 0 {
-			sort.Strings(keep)
-			out[zone] = keep
-		}
+		out[zone] = c
 	}
 	return out
 }

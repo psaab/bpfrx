@@ -17,6 +17,8 @@ import (
 	"github.com/psaab/xpf/pkg/sysservices"
 	"github.com/psaab/xpf/pkg/upgrade"
 	"golang.org/x/sys/unix"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // readLinkSpeed reads the link speed in Mbps from sysfs. Returns 0 on error.
@@ -567,10 +569,17 @@ func (c *CLI) showSystemUptime() error {
 // showSystemBootMessages shows recent boot messages via journalctl.
 
 func (c *CLI) showSystemBootMessages() error {
-	cmd := exec.Command("journalctl", "--boot", "-n", "100", "--no-pager")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	// #6584: this is the SAME journald text as `show log`, and it was not
+	// named in the issue — it was found by sweeping the predicate rather than
+	// the two cited sites. It has to be BUFFERED to be guarded at all: wiring
+	// cmd.Stdout straight to os.Stdout leaves no string to sanitize. The
+	// output is bounded at 100 lines, so buffering costs nothing.
+	out, err := exec.Command("journalctl", "--boot", "-n", "100", "--no-pager").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("journalctl --boot: %w", err)
+	}
+	fmt.Print(termsafe.SanitizeBlockForDisplay(string(out)))
+	return nil
 }
 
 // showSystemMemory shows memory usage (like Junos "show system memory").
@@ -928,7 +937,10 @@ func (c *CLI) showDaemonLog(args []string) error {
 			if err != nil {
 				return fmt.Errorf("read %s: %w", logPath, err)
 			}
-			fmt.Print(string(out))
+			// #6584: the syslog stream carries the very DHCP lease hostnames
+			// #6468 was filed about, so reading the LOG bypasses the sanitized
+			// lease table. Block variant: the line structure IS the output.
+			fmt.Print(termsafe.SanitizeBlockForDisplay(string(out)))
 			return nil
 		}
 	}
@@ -939,7 +951,9 @@ func (c *CLI) showDaemonLog(args []string) error {
 	if err != nil {
 		return fmt.Errorf("journalctl: %w", err)
 	}
-	fmt.Print(string(out))
+	// #6584: see the tail branch above — journald re-emits device-originated
+	// text (DHCP hostnames, IKE identities, LLDP) verbatim.
+	fmt.Print(termsafe.SanitizeBlockForDisplay(string(out)))
 	return nil
 }
 
