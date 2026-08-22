@@ -233,6 +233,53 @@ pub(super) fn write_all_backpressured(
     Ok(())
 }
 
+/// Append the idle keepalive frame when one is due AND the pending write
+/// backlog is still below `WRITE_BACKLOG_MAX_BYTES`. Returns true if bytes
+/// were appended.
+///
+/// #2883 routed the keepalive through `write_buf` so a `WouldBlock` on a full
+/// kernel send buffer is ordinary backpressure rather than a fatal reconnect.
+/// That made the keepalive a PRODUCER into the backlog — and it was the only
+/// producer that did not check the cap. `drain_channel_into_write_buf` halts at
+/// `WRITE_BACKLOG_MAX_BYTES` precisely so a live-but-non-reading consumer cannot
+/// migrate unbounded bytes into the heap-backed backlog; a consumer wedged there
+/// keeps `drained_any == false` forever, which is exactly the condition that
+/// arms the idle keepalive, so the keepalive appended past the cap on every
+/// interval with nothing to ever reclaim it (`advance` is never called because
+/// the socket write returns `WouldBlock`). The growth is slow — one
+/// `FRAME_HEADER_SIZE` frame per `KEEPALIVE_IDLE_INTERVAL` — but it is
+/// monotonic and unbounded, and it falsifies the documented
+/// `cap + one max EventFrame` ceiling (#5189 A1-b10-F4).
+///
+/// Suppressing the keepalive at the cap loses nothing: the backlog holds
+/// ≥ 16 MiB of unwritten frames, so pending DATA already supplies every bit of
+/// liveness the keepalive exists to signal, and a genuinely dead consumer is
+/// still detected by the normal socket-error / EOF path.
+///
+/// `last_write` is deliberately NOT re-armed when the append is suppressed: the
+/// keepalive stays due, so the first cycle after the backlog drains below the
+/// cap emits it immediately instead of waiting out another full interval.
+pub(super) fn append_idle_keepalive_if_due(
+    write_buf: &mut WriteBacklog,
+    last_write: &mut Instant,
+    keepalive_interval: Duration,
+) -> bool {
+    if last_write.elapsed() < keepalive_interval {
+        return false;
+    }
+    // #5189 (A1-b10-F4): measure UNWRITTEN bytes (`pending_len`), the same
+    // quantity the drain-loop cap and the pause/backpressure logic use (#4974);
+    // the raw backing-`Vec` length also counts the reclaimable written prefix.
+    if write_buf.pending_len() >= WRITE_BACKLOG_MAX_BYTES {
+        return false;
+    }
+    let mut ka = [0u8; FRAME_HEADER_SIZE];
+    ka[4] = MSG_KEEPALIVE;
+    write_buf.extend_from_slice(&ka);
+    *last_write = Instant::now();
+    true
+}
+
 /// Main connected loop. Returns true if we should reconnect, false if stopping.
 pub(super) fn run_connected_loop(
     rx: &mpsc::Receiver<EventFrame>,
@@ -338,12 +385,11 @@ pub(super) fn run_connected_loop(
                 // and a genuinely dead consumer is still detected by the normal
                 // socket-error / EOF path rather than by a false reconnect on
                 // transient fullness.
-                if last_write.elapsed() >= keepalive_interval {
-                    let mut ka = [0u8; FRAME_HEADER_SIZE];
-                    ka[4] = MSG_KEEPALIVE;
-                    write_buf.extend_from_slice(&ka);
-                    last_write = Instant::now();
-                }
+                //
+                // #5189 (A1-b10-F4): the keepalive append obeys the SAME
+                // `WRITE_BACKLOG_MAX_BYTES` ceiling the producer drain
+                // enforces — see `append_idle_keepalive_if_due`.
+                append_idle_keepalive_if_due(&mut write_buf, &mut last_write, keepalive_interval);
                 thread::sleep(Duration::from_millis(1));
             }
         }

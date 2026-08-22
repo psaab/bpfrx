@@ -133,6 +133,15 @@ pub(super) fn stage_flow_cache_hit(
             flow_state
                 .flow_cache
                 .invalidate_slot(&flow.forward_key, meta.ingress_ifindex as i32);
+            // #5190 (A1-b1-F6): `lookup_counted` above already counted this
+            // candidate as a served HIT — it commits the tally before it can
+            // hand out the borrow the validation below needs. The packet is
+            // NOT served from the cache; it falls through to full slow-path
+            // resolution. Move it to the miss/eviction tallies so the
+            // published `flow_cache_hits` counts packets the cache actually
+            // served, and a neighbor-MAC / HA churn event shows up as the
+            // hit-rate drop it is instead of hiding inside the hit count.
+            flow_state.flow_cache.reclassify_hit_as_miss();
             // Fall through to slow path for full HA resolution / re-resolve
             // the current neighbor MAC (#3048) / fabric redirect.
             return FlowCacheOutcome::FallThrough;

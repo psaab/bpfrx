@@ -85,12 +85,34 @@ func Boot() dataplane.RuntimeDataPlane {
 type Manager struct {
 	bpfShim *dataplane.Manager
 
-	mu         sync.Mutex
-	sessionMu  sync.Mutex // separate lock for session sync requests (Phase 3)
-	proc       *exec.Cmd
-	cfg        config.UserspaceConfig
-	clusterHA  bool
-	generation uint64
+	mu        sync.Mutex
+	sessionMu sync.Mutex // separate lock for session sync requests (Phase 3)
+	proc      *exec.Cmd
+	// procSup is the supervisor record for the CURRENTLY spawned helper
+	// generation: the single goroutine that owns cmd.Wait() for it, plus the
+	// channel that goroutine closes when the child is reaped (#5838).
+	//
+	// INVARIANT: procSup is non-nil exactly while proc is non-nil, and each
+	// spawn allocates a strictly greater procGen. Every asynchronous callback
+	// that can outlive a generation (the waiter itself, and the restart timer)
+	// re-checks its captured generation against procGen under m.mu before
+	// mutating anything, so a stale notification from generation N can never
+	// clear or restart generation N+1.
+	procSup *helperGeneration
+	// procGen counts helper PROCESS generations. Distinct from `generation`,
+	// which counts CONFIG snapshots: one config can outlive many helper
+	// processes across a crash-restart, and one helper can serve many configs.
+	procGen uint64
+	// helperCrash records the last UNEXPECTED helper exit for the operator and
+	// drives the restart backoff. Zero value means "no crash on record".
+	helperCrash helperCrashState
+	// restartTimerFn overrides how a crash restart is armed. Production leaves
+	// it nil (time.AfterFunc); a test injects a synchronous or recording timer.
+	// Per-Manager, not a package var — see scheduleRestartTimer.
+	restartTimerFn func(time.Duration, func())
+	cfg            config.UserspaceConfig
+	clusterHA      bool
+	generation     uint64
 	// neighborReplaceGen is a dedicated monotonic counter for the #6034
 	// manager-neighbor replace-generation envelope. Every authoritative
 	// update_neighbors replace (RegenerateNeighborSnapshot, BumpFIBGeneration)

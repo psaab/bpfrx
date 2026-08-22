@@ -921,6 +921,17 @@ fn parse_pool_v4(s: &str) -> Option<Ipv4Addr> {
     }
 }
 
+/// #6227 item 1: incremented whenever a NAT64 rule's snapshot requested
+/// deterministic NAPT64 mapping (a non-empty `deterministic_host_base_v6`) but
+/// [`build_deterministic_v6`] returned `None` — the rule silently downgrades to
+/// round-robin PAT and a subscriber's external mapping is no longer
+/// deterministic (a CGN compliance loss). A real deployment also sees the
+/// paired `eprintln!` at the call site; this counter gives tests (and, via
+/// future stats plumbing, operators) a signal that does not require scraping
+/// stderr.
+pub(crate) static DETERMINISTIC_V6_DOWNGRADE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// #4559: build the mode-2 (NAPT64) deterministic block-allocation params for a
 /// NAT64 prefix from its snapshot + the parsed pool size. Returns `None` (the
 /// pre-#4559 round-robin fallback) when the pool is not a deterministic NAPT64
@@ -1130,9 +1141,21 @@ impl Nat64State {
             // the NAT64 port range); `host_count` is pool-bounded, so it is
             // derived HERE from the parsed pool (`pool_v4.len() * blocks_per_ip`)
             // rather than trusted from the wire — the authoritative pool count is
-            // whatever survived `parse_pool_v4`. A malformed base or an
-            // unsupported prefix length leaves it `None` (round-robin fallback).
+            // whatever survived `parse_pool_v4`. A malformed base, an unsupported
+            // prefix length, degenerate block math, or a `host_count` `u32`
+            // overflow leaves it `None` (round-robin fallback) — #6227 item 1:
+            // when the rule DID request deterministic mapping (a non-empty
+            // `deterministic_host_base_v6`), that fallback is an operator-
+            // visible compliance loss (CGN mapping stops being deterministic),
+            // so it must not be silent.
             let deterministic_v6 = build_deterministic_v6(snap, pool_v4.len());
+            if deterministic_v6.is_none() && !snap.deterministic_host_base_v6.is_empty() {
+                DETERMINISTIC_V6_DOWNGRADE_COUNT.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "xpf nat64: rule {:?} requested deterministic NAPT64 mapping (host-base {:?}) but failed to build (bad base / unsupported prefix-len / degenerate block math / pool-size overflow) — falling back to round-robin PAT; subscriber mappings are no longer deterministic",
+                    snap.name, snap.deterministic_host_base_v6
+                );
+            }
             prefixes.push(Nat64Prefix {
                 prefix_bytes,
                 pool_v4,

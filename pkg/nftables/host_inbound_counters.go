@@ -124,33 +124,79 @@ type HostInboundDenyCount struct {
 	Bytes   uint64
 }
 
+// HostInboundTableState reports what the netlink read observed about the
+// `inet xpf_hostinbound` TABLE itself, so a caller can tell a CERTIFIED zero
+// from an uncertifiable one (#5719). The deny-counter slice alone cannot: an
+// empty slice is produced by three distinct kernel states, and only two of them
+// make "0 host-inbound kernel denies" a true statement about enforcement.
+type HostInboundTableState int
+
+const (
+	// HostInboundTableAbsent: no xpf_hostinbound table is installed — the daemon
+	// tore it down because nothing is enforceable, or none was ever loaded. No
+	// enforcement means no denies, so an aggregate 0 IS authoritative. This is
+	// also the zero value returned alongside a non-nil error, where it carries no
+	// meaning: callers MUST check the error first.
+	HostInboundTableAbsent HostInboundTableState = iota
+	// HostInboundTableCounterless: the table is INSTALLED but carries no named
+	// counter object at all. That is the signature of the #5644 M37 cold-boot
+	// fail-closed FENCE — buildHostInboundFencePayload (and its netlink twin
+	// buildHostInboundFenceNetlink) render the mandatory admits plus catch-all
+	// DROPs with "NO per-service accepts, NO named counters" — and of a zero-drop
+	// fence shell. The kernel can be ACTIVELY DROPPING host-bound traffic while
+	// exposing no counter to attribute those drops to, so an aggregate 0 is NOT
+	// authoritative: the caller must mark it unavailable (the #3345 /
+	// #3681-H05 "counter unavailable != zero" contract) rather than publish it.
+	//
+	// A REAL host-inbound generation is distinguishable and does NOT land here:
+	// it declares the three #4759 global ICMP/ND ACCEPT counters
+	// UNCONDITIONALLY (both buildHostInboundFilterPayload and the netlink
+	// buildHostInboundNetlink iterate HostInboundAcceptCounterTypes up front), so
+	// a real table always carries >=1 named counter object even in the one
+	// generation that installs no per-zone catch-all DROP (a junos-host
+	// program-only ruleset). That is precisely why the discriminator is "no
+	// counter OBJECTS in the table", not "no DENY counters" — the latter would
+	// false-alarm on that legitimate, fully-enforcing generation.
+	HostInboundTableCounterless
+	// HostInboundTableCounted: the table is installed and carries >=1 named
+	// counter object, so what the walk returned reflects real kernel objects.
+	// Deny counters that merely happen to read zero land HERE — the objects
+	// exist and come back with Packets: 0 — so their aggregate 0 IS
+	// authoritative and must stay so.
+	HostInboundTableCounted
+)
+
 // ReadHostInboundDenyCounters reads the per-zone/family named catch-all DROP
 // counters from the kernel `inet xpf_hostinbound` table via netlink (no nft
 // shell-out). It returns one entry per host-inbound deny counter currently
-// installed.
+// installed, plus the HostInboundTableState the entries were read from.
 //
 // When the table is absent (no host-inbound-traffic stanza is enforced, so the
-// daemon removed it) the function returns (nil, nil): no enforcement means no
-// denies, not an error. A genuine netlink failure is returned so the caller can
-// surface "counter unavailable" rather than a misleading zero (the #3345
-// missing-sample contract the Prometheus collector applies to dataplane
-// counters).
+// daemon removed it) the function returns (nil, HostInboundTableAbsent, nil): no
+// enforcement means no denies, not an error. When the table is PRESENT but
+// carries no named counter objects it returns (nil, HostInboundTableCounterless,
+// nil) — enforcement may well be live and uncounted (the #5644 cold-boot fence),
+// so the caller must NOT publish that 0 as authoritative (#5719). A genuine
+// netlink failure is returned so the caller can surface "counter unavailable"
+// rather than a misleading zero (the #3345 missing-sample contract the
+// Prometheus collector applies to dataplane counters); the state accompanying a
+// non-nil error is the zero value and is meaningless.
 //
 // Counters reset to zero whenever the daemon rebuilds the table (every commit
 // and every DHCP/DHCPv6 address change on a dataplane interface, which delete +
 // recreate the table); this matches the table lifecycle and is handled by
 // Prometheus rate() reset detection.
-func ReadHostInboundDenyCounters() ([]HostInboundDenyCount, error) {
+func ReadHostInboundDenyCounters() ([]HostInboundDenyCount, HostInboundTableState, error) {
 	c, err := nftables.New()
 	if err != nil {
-		return nil, fmt.Errorf("nftables conn: %w", err)
+		return nil, HostInboundTableAbsent, fmt.Errorf("nftables conn: %w", err)
 	}
 	tables, err := c.ListTablesOfFamily(nftables.TableFamilyINet)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return nil, nil
+			return nil, HostInboundTableAbsent, nil
 		}
-		return nil, fmt.Errorf("nftables list tables: %w", err)
+		return nil, HostInboundTableAbsent, fmt.Errorf("nftables list tables: %w", err)
 	}
 	var table *nftables.Table
 	for _, t := range tables {
@@ -161,21 +207,40 @@ func ReadHostInboundDenyCounters() ([]HostInboundDenyCount, error) {
 	}
 	if table == nil {
 		// No host-inbound enforcement installed -> no denies.
-		return nil, nil
+		return nil, HostInboundTableAbsent, nil
 	}
 	objs, err := c.GetObjects(table)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return nil, nil
+			// The table went away between the list and the object walk: same as
+			// never having been there.
+			return nil, HostInboundTableAbsent, nil
 		}
-		return nil, fmt.Errorf("nftables list objects %s: %w", HostInboundTableName, err)
+		return nil, HostInboundTableAbsent, fmt.Errorf("nftables list objects %s: %w", HostInboundTableName, err)
 	}
+	counts, state := classifyHostInboundDenyObjects(objs)
+	return counts, state, nil
+}
+
+// classifyHostInboundDenyObjects walks one table's objects into the deny-counter
+// slice and the present-table half of HostInboundTableState. It is split out of
+// the netlink read so the counterless-vs-counted discrimination — the #5719
+// property — is unit-testable without a live kernel or CAP_NET_ADMIN (the
+// absent-table half is decided by the caller before this runs).
+//
+// The state is keyed on whether the table carries ANY named counter object, not
+// on whether the returned deny slice is empty: see HostInboundTableCounterless
+// for why a real generation always carries the #4759 accept counters and so can
+// never be mistaken for a fence.
+func classifyHostInboundDenyObjects(objs []nftables.Obj) ([]HostInboundDenyCount, HostInboundTableState) {
 	var out []HostInboundDenyCount
+	namedCounters := 0
 	for _, o := range objs {
 		co, ok := o.(*nftables.CounterObj)
 		if !ok {
 			continue
 		}
+		namedCounters++
 		zone, family, ok := ParseHostInboundDenyCounterName(co.Name)
 		if !ok {
 			continue
@@ -187,5 +252,8 @@ func ReadHostInboundDenyCounters() ([]HostInboundDenyCount, error) {
 			Bytes:   co.Bytes,
 		})
 	}
-	return out, nil
+	if namedCounters == 0 {
+		return out, HostInboundTableCounterless
+	}
+	return out, HostInboundTableCounted
 }

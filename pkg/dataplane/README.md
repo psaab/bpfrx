@@ -530,6 +530,86 @@ input, so a linker-pin bump moves the manifest too), so commit the
 regenerated object and manifest together — the #4977 freshness gate
 then stays green.
 
+## Helper process supervision after a post-ready exit (#5838)
+
+`pkg/dataplane/userspace` owns the `xpf-userspace-dp` child process.
+Until #5838 it owned only its BIRTH: `ensureProcessLocked` spawned it,
+waited for control-socket readiness and returned, and the only
+`cmd.Wait()` in the package was created inside `stopLocked` — i.e. only
+for an INTENTIONAL stop. A helper that died AFTER reporting ready (OOM,
+assert, SIGKILL, panic) was therefore never reaped, and because
+`cmd.ProcessState` is not populated until `Wait`, nothing could detect
+it either. `m.proc` stayed non-nil, `m.lastStatus` stayed at its
+last-good values (the 1 Hz status poll's failure branch only logged),
+and the state persisted until some unrelated compile/sync path happened
+to call `ensureProcessLocked` — which, on a stable config and a stable
+FIB, nothing does.
+
+**This was not a forwarding hole, and the distinction matters.** The XDP
+shim is attached by xpfd, not by the helper, and it survives the
+helper's death. `userspace-xdp/src/lib.rs` drops transit through THREE
+independent degraded-path gates, any one of which is sufficient:
+
+| gate | trigger after a crash |
+|---|---|
+| binding missing / not `READY` | `drop_degraded_transit` |
+| heartbeat missing or STALE | dead helper stops writing `USERSPACE_HEARTBEAT`; stale after `USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS` = 5000 |
+| XSK redirect error | the kernel drops the dead socket from `XSKMAP`, so `redirect` fails |
+
+All three `pass_local_control` for proven local/control traffic and
+`XDP_DROP` transit, so a crashed node BLACKHOLES rather than routing
+unadjudicated packets. That is the safer failure, and it is the same
+direction #7189 (#5275) establishes for the never-armed case — but by a
+DIFFERENT mechanism: #7189 gates the `ip_forward` sysctls on the arm
+state, and a post-arm crash leaves the daemon armed, so those sysctls
+stay 1 and the shim's degraded gates are what hold the line.
+
+**What was actually broken is honesty, and that is the HA-relevant
+half.** `takeoverReadyLocked` gates on `m.proc == nil` and on
+`m.lastStatus`, and after a crash BOTH were stale, so `TakeoverReady()`
+returned true — with an empty reason list — for a node whose dataplane
+was dead. A chassis-cluster peer consults exactly that before moving an
+RG, so a crashed node advertised itself as a valid failover target and
+would blackhole every flow handed to it.
+
+`process_supervisor.go` closes that:
+
+- **One waiter per generation.** `startHelperSupervisorLocked` runs at
+  the single spawn site and is the only place a waiter is created.
+  `stopLocked` now blocks on THAT waiter instead of launching a second
+  `cmd.Wait()` (two waiters race, and the loser gets `ECHILD`). The
+  waiter closes `exited` BEFORE acquiring `m.mu`, which is what lets
+  `stopLocked` wait on it while holding the lock without deadlocking.
+- **Generation fencing.** Each spawn allocates a strictly greater
+  `procGen`; the waiter and the restart timer both re-check their
+  captured generation under `m.mu` before mutating anything, so a stale
+  notification from generation N cannot clear or restart generation
+  N+1. This single fence also distinguishes an expected exit from a
+  crash: an intentional teardown clears `procSup` under `m.mu` before
+  releasing it, so a stop is already `procSup != g` by the time the
+  waiter can run.
+- **Fail closed on an unexpected exit.** Disarm the shim first
+  (`disableCtrlBeforeTeardownLocked`, the same #5486 primitive the
+  intentional teardown uses, which clears every binding row if the
+  disable cannot be verified), then drop `m.proc` and run
+  `resetAfterHelperGoneLocked` — shared with `stopLocked` precisely so
+  the crash path and the stop path cannot drift about which state a
+  departed helper invalidates. `TakeoverReady()` goes false.
+- **Bounded restart.** Exponential backoff from
+  `helperRestartBackoffBase` to `helperRestartBackoffMax`, re-armed on
+  each failure so a helper that cannot start retries forever at a fixed
+  low rate instead of fork-storming. The restart calls the ORDINARY
+  `ensureProcessLocked` against the CURRENT `m.cfg`, not the dead
+  generation's argv, so a config replacement that landed while the
+  helper was down is what starts, and the binding / XSK-liveness /
+  capability / event-stream readiness gates all still run before
+  forwarding is re-armed.
+
+Not covered here, tracked separately: the operator-facing surface for
+the crash record (exit code/signal, restart count, backoff deadline and
+crash-loop reason are recorded in `helperCrashState` but not yet
+rendered by any `show` command), and a named crash-loop state.
+
 ## Armed-state admission contract (#2114 A3)
 
 `Manager.loaded` is an `atomic.Bool` admission bit, and every

@@ -143,7 +143,7 @@ func (d *Daemon) commitWithGenBinding(
 // cancellation after store.Commit is deliberately ignored (aborting a
 // promoted commit on a still-running daemon would diverge the store from the
 // dataplane). See applyCancelCtx for the full rationale.
-func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer peerSyncPolicy) (*config.Config, error) {
 	// #1922 Item 2 first-takeover gate (OQ-B, blunt resolution). In
 	// bootstrap mode a plain `commit` is refused: the first commit on a
 	// foreign/non-appliance host claims interfaces and can cut off
@@ -242,7 +242,7 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 // from a non-fatal subsystem error that must NOT. On a non-fatal error the
 // committed config is returned alongside the error so the operator sees the
 // failure while the standby still converges.
-func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncPeer peerSyncPolicy) (*config.Config, error) {
 	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
 	if applyErrSkipsPeerSync(applyErr) {
 		// Fatal (required-protocol-gate: dataplane disarmed / fail-closed) or a
@@ -267,11 +267,22 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	// and still syncs to the peer, but the operator sees the failure and can
 	// re-commit). Matches how applyErr's non-fatal best-effort subsystem errors
 	// are surfaced here rather than aborting the commit.
-	clearErr := d.clearSessionsForPolicyChanges(oldActive, compiled)
+	// #5858: one entry point for both halves — the policy clear that revokes,
+	// and the input-filter advisory for the tightening that cannot be revoked
+	// today. Bound together so a commit path cannot wire one without the other.
+	clearErr := d.reportSessionAuthorizationChanges(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
-	if syncPeer {
+	//
+	// #5962: the policy is RESOLVED HERE, not at the entry point. The commit
+	// has succeeded and the store's writability check (ensureWritableLocked,
+	// itself tied to RG0 ownership via applyRG0OwnershipTransition) has already
+	// run, so this reads the same ownership the commit was allowed under. The
+	// pre-#5962 code resolved rg0ConfigSyncAuthority in commitAndApplyOperator
+	// instead — before Commit — so a promotion landing between the two checks
+	// produced a successful commit with the push silently skipped.
+	if syncPeer.wantsPush(d.cluster) {
 		d.pushCommittedConfigToPeer()
 	}
 	joined := errors.Join(applyErr, clearErr)
@@ -447,7 +458,10 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		// policy deletion/tightening that could not fully drop this node's synced
 		// sessions is not silently swallowed. A non-fatal partial clear does not
 		// abort the (already-promoted) sync — it is joined into the return only.
-		clearErr := d.clearSessionsForPolicyChanges(oldActive, compiled)
+		// #5858: one entry point for both halves — the policy clear that revokes,
+		// and the input-filter advisory for the tightening that cannot be revoked
+		// today. Bound together so a commit path cannot wire one without the other.
+		clearErr := d.reportSessionAuthorizationChanges(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -524,7 +538,7 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 
 // commitConfirmedAndApply is the commit-confirmed analogue of
 // commitAndApply. Same atomicity guarantees.
-func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer peerSyncPolicy) (*config.Config, error) {
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -594,18 +608,18 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 // as gRPC always did.
 //
 // The autonomous event-options engine deliberately does NOT use this wrapper: it
-// commits with syncPeer=false (commitAndApply directly, see initEventEngine)
+// commits with peerSyncNever (commitAndApply directly, see initEventEngine)
 // because each node fires its remediation independently from that node's local
 // RPM events and must not push node-local state to the peer.
 func (d *Daemon) commitAndApplyOperator(ctx context.Context, comment string) (*config.Config, error) {
-	return d.commitAndApply(ctx, comment, rg0ConfigSyncAuthority(d.cluster))
+	return d.commitAndApply(ctx, comment, peerSyncIfRG0Authority)
 }
 
 // commitConfirmedAndApplyOperator is the commit-confirmed analogue of
 // commitAndApplyOperator: the same transport-independent RG0-ownership peer-sync
 // policy for an operator-initiated `commit confirmed` (#5054).
 func (d *Daemon) commitConfirmedAndApplyOperator(ctx context.Context, minutes int) (*config.Config, error) {
-	return d.commitConfirmedAndApply(ctx, minutes, rg0ConfigSyncAuthority(d.cluster))
+	return d.commitConfirmedAndApply(ctx, minutes, peerSyncIfRG0Authority)
 }
 
 // executeConfirmedRollback is the daemon-owned commit-confirmed timeout
@@ -703,7 +717,7 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	// being lost. The helper now RETURNS the error so the two returning call
 	// sites (commit + peer-sync) join it into their result; here the log is the
 	// only available surface.
-	if err := d.clearSessionsForPolicyChanges(oldActive, prevCfg); err != nil {
+	if err := d.reportSessionAuthorizationChanges(oldActive, prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback: policy session invalidation was PARTIAL; "+
 			"some rolled-back-policy sessions may keep forwarding under stale authorization", "err", err)
 	}

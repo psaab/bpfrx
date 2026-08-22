@@ -21,11 +21,11 @@ import (
 func TestHostInboundKernelDeniesEmittedWhenDataplaneUnloaded(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	defer func() { readHostInboundDenyCounters = orig }()
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
 		return []xnft.HostInboundDenyCount{
 			{Zone: "wan", Family: "ip", Packets: 7, Bytes: 700},
 			{Zone: "wan", Family: "ip6", Packets: 3, Bytes: 300},
-		}, nil
+		}, xnft.HostInboundTableCounted, nil
 	}
 
 	s := &Server{} // dp intentionally nil — degraded / config-only boot.
@@ -73,8 +73,8 @@ func TestHostInboundKernelDeniesEmittedWhenDataplaneUnloaded(t *testing.T) {
 func TestHostInboundKernelDeniesReadErrorOmitsSeries(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	defer func() { readHostInboundDenyCounters = orig }()
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
-		return nil, errors.New("netlink dial: permission denied")
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
+		return nil, xnft.HostInboundTableAbsent, errors.New("netlink dial: permission denied")
 	}
 
 	s := &Server{}

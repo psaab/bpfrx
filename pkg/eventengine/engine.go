@@ -1314,12 +1314,21 @@ func policyHasTriggerOn(pol *config.EventPolicy) bool {
 // "within N { trigger on M }" — fires when M events happen within N seconds.
 // "within N { trigger until M }" — fires until M events happen within N seconds, then stops.
 //
-// MULTIPLE within clauses are combined with AND (#4423 M3): the loop below
-// returns false the moment ANY clause is unsatisfied, so the policy fires only
-// when EVERY within clause passes for this event. A policy that wants
+// MULTIPLE within clauses are combined with AND (#4423 M3): the policy fires
+// only when EVERY within clause passes for this event. A policy that wants
 // OR-of-conditions must be written as separate policies. This AND semantics is
 // the documented contract (pkg/eventengine/README.md) and is covered by
 // TestWithinMultipleClausesAreANDed.
+//
+// The body is three passes over the clause list rather than one fused loop, so
+// no verdict depends on the order the operator wrote the clauses in — see the
+// #7223 note on pass 2. One deliberate ordering delta survives: a policy that
+// carries BOTH a structurally invalid clause (rejected by pass 1) and a
+// below-threshold trigger-on clause no longer clears the edge latch, where the
+// fused loop did if the below-threshold clause came first. Such a policy fails
+// closed on every event for as long as the invalid clause exists, so the
+// latch's value is unobservable until the config is corrected — after which the
+// next below-threshold event re-arms it through the normal path.
 func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, eventName string, now time.Time) bool {
 	if len(pol.WithinClauses) == 0 {
 		return true // no temporal filter
@@ -1327,69 +1336,98 @@ func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, event
 
 	timestamps := rt.windows[eventName]
 
+	// PASS 1 — structural validity, over every clause.
+	//
+	// #3751 defense-in-depth: a within clause with no USABLE positive
+	// threshold (both trigger on/until absent or <= 0) — or a non-positive
+	// window — must fail CLOSED, not always-fire. Commit-time validation
+	// (config.validateEventOptionsWithinAST) rejects such a clause outright,
+	// so this belt only fires on a config that slipped through a TOLERANT
+	// load / peer-sync path (an older binary silently coerced a within/
+	// trigger typo to 0). Falling through to `return true` here would treat
+	// that mis-arrived 0 as an unconditional match — turning a threshold-
+	// gated remediation into an ALWAYS-FIRE one, the original fail-open. A
+	// policy with NO within clauses at all is handled above (return true) —
+	// that legitimately means "no temporal filter"; this guard is only for
+	// a within clause that exists but gates nothing.
 	for _, wc := range pol.WithinClauses {
-		// #3751 defense-in-depth: a within clause with no USABLE positive
-		// threshold (both trigger on/until absent or <= 0) — or a non-positive
-		// window — must fail CLOSED, not always-fire. Commit-time validation
-		// (config.validateEventOptionsWithinAST) rejects such a clause outright,
-		// so this belt only fires on a config that slipped through a TOLERANT
-		// load / peer-sync path (an older binary silently coerced a within/
-		// trigger typo to 0). Falling through to `return true` here would treat
-		// that mis-arrived 0 as an unconditional match — turning a threshold-
-		// gated remediation into an ALWAYS-FIRE one, the original fail-open. A
-		// policy with NO within clauses at all is handled above (return true) —
-		// that legitimately means "no temporal filter"; this guard is only for
-		// a within clause that exists but gates nothing.
 		if wc.Seconds <= 0 || (wc.TriggerOn <= 0 && wc.TriggerUntil <= 0) {
 			return false
 		}
+	}
 
+	counts := make([]int, len(pol.WithinClauses))
+	for i, wc := range pol.WithinClauses {
 		window := time.Duration(wc.Seconds) * time.Second
-
-		// Count events within the window
-		count := 0
 		for _, ts := range timestamps {
 			if now.Sub(ts) <= window {
-				count++
+				counts[i]++
 			}
 		}
+	}
 
-		if wc.TriggerOn > 0 {
-			// "trigger on N" is EDGE-triggered (#3756 M1): it fires on the
-			// threshold CROSSING, not on every event while the level stays at
-			// or above N. Junos `trigger on` re-arms only after the count drops
-			// back below N; the 30s cooldown alone only THROTTLES a sustained
-			// level (re-remediating it every cooldown), which is harmful for a
-			// non-idempotent then-batch and spams commit/rollback history.
-			if count < wc.TriggerOn {
-				// Dropped below the threshold: re-arm so the next crossing
-				// fires again.
-				rt.onLatched[eventName] = false
-				return false
-			}
-			if rt.onLatched[eventName] {
-				// Level still at/above N and this crossing already fired:
-				// suppress until the count drops below N (re-arm above).
-				return false
-			}
-			// count >= N and not yet latched: this IS the crossing — pass.
-			// evaluateEvent sets the latch only AFTER the cooldown check
-			// passes, so a cooldown-suppressed crossing is not consumed.
+	// PASS 2 — the "trigger on N" edge latch, decided over EVERY trigger-on
+	// clause before anything returns.
+	//
+	// "trigger on N" is EDGE-triggered (#3756 M1): it fires on the threshold
+	// CROSSING, not on every event while the level stays at or above N. Junos
+	// `trigger on` re-arms only after the count drops back below N; the 30s
+	// cooldown alone only THROTTLES a sustained level (re-remediating it every
+	// cooldown), which is harmful for a non-idempotent then-batch and spams
+	// commit/rollback history.
+	//
+	// #7223: the re-arm and the latch check are two separate passes
+	// over the clause list, and that separation IS the fix. The single fused
+	// loop this replaces returned false from inside the walk, so with more
+	// than one `within { trigger on N }` clause the outcome depended on the
+	// order the operator wrote them in. Clauses are ANDed (below), so consider
+	// `within 600 { trigger on 10 }` written BEFORE `within 60 { trigger on 3 }`
+	// with the policy already latched: the 600s clause is still at/above 10, so
+	// it hit the latch check and returned — and the 60s clause, which had
+	// dropped below 3 and was the one that should have RE-ARMED the latch, was
+	// never reached. The AND became false and then true again (a real crossing)
+	// and the policy stayed silent until the long window decayed. Written in
+	// the other order the same config re-arms correctly. Deciding the re-arm
+	// across all clauses first makes the result independent of clause order:
+	// the latch clears exactly when the ANDed condition is false, which is
+	// exactly when any trigger-on clause is below its threshold.
+	belowTriggerOn := false
+	hasTriggerOn := false
+	for i, wc := range pol.WithinClauses {
+		if wc.TriggerOn <= 0 {
+			continue
 		}
+		hasTriggerOn = true
+		if counts[i] < wc.TriggerOn {
+			belowTriggerOn = true
+		}
+	}
+	if belowTriggerOn {
+		// Dropped below the threshold: re-arm so the next crossing fires again.
+		rt.onLatched[eventName] = false
+		return false
+	}
+	if hasTriggerOn && rt.onLatched[eventName] {
+		// Level still at/above N on every clause and this crossing already
+		// fired: suppress until some clause's count drops below its threshold
+		// (re-arm above). evaluateEvent sets the latch only AFTER the cooldown
+		// check passes, so a cooldown-suppressed crossing is not consumed.
+		return false
+	}
 
-		if wc.TriggerUntil > 0 {
-			// "trigger until N" fires through the INCLUSIVE N-th event, then
-			// stops (#3756 M2). Junos reads it as "trigger UNTIL the event has
-			// been received N times" — the N-th occurrence is the LAST that
-			// fires. The event is appended to the window BEFORE this check
-			// (evaluateEvent), so the N-th matching event already makes
-			// count==N; using `>=` here made count==N return false, so the N-th
-			// never fired and `until 1` (count==1 on the first event) could
-			// NEVER fire at all — a dead-config bug. `>` fires on 1..N and stops
-			// at N+1.
-			if count > wc.TriggerUntil {
-				return false
-			}
+	// PASS 3 — "trigger until N".
+	//
+	// "trigger until N" fires through the INCLUSIVE N-th event, then stops
+	// (#3756 M2). Junos reads it as "trigger UNTIL the event has been received
+	// N times" — the N-th occurrence is the LAST that fires. The event is
+	// appended to the window BEFORE this check (evaluateEvent), so the N-th
+	// matching event already makes count==N; using `>=` here made count==N
+	// return false, so the N-th never fired and `until 1` (count==1 on the
+	// first event) could NEVER fire at all — a dead-config bug. `>` fires on
+	// 1..N and stops at N+1.
+	for i, wc := range pol.WithinClauses {
+		if wc.TriggerUntil > 0 && counts[i] > wc.TriggerUntil {
+			return false
 		}
 	}
 
