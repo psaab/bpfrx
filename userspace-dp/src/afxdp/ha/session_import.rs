@@ -117,7 +117,7 @@ impl crate::afxdp::Coordinator {
         // #6413: that lone reverse does NOT arrive "off the wire from a peer" —
         // a peer-received reverse never reaches this function at all. Go's
         // `SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/
-        // manager_ha.go`) early-returns on `!shouldMirrorUserspaceSession(
+        // manager_sessions.go`) early-returns on `!shouldMirrorUserspaceSession(
         // val.IsReverse)` and writes ONLY the BPF mirror, so only FORWARD peer
         // imports transit the helper — which then synthesizes their reverse
         // companion locally (`synthesized_synced_reverse_entry`). The only

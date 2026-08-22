@@ -261,7 +261,7 @@ impl Peer {
     /// order equals numeric order.
     #[inline]
     pub(crate) fn check_and_update_tai64n(&self, ts: &[u8; TAI64N_LEN]) -> bool {
-        let mut hw = self.greatest_tai64n.lock().unwrap();
+        let mut hw = self.greatest_tai64n.lock().unwrap_or_else(|e| e.into_inner());
         if *ts > *hw {
             *hw = *ts;
             true
@@ -279,7 +279,7 @@ impl Peer {
     /// must be snapshotted and re-seeded per pubkey. Slow control-thread
     /// path only.
     pub(crate) fn greatest_tai64n(&self) -> [u8; TAI64N_LEN] {
-        *self.greatest_tai64n.lock().unwrap()
+        *self.greatest_tai64n.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// #4103: seed this peer's responder anti-replay high-water from a
@@ -289,7 +289,7 @@ impl Peer {
     /// that already advanced the fresh peer cannot be pulled backwards by
     /// a stale seed. Slow path / build-time only.
     pub(crate) fn seed_greatest_tai64n(&self, hw: [u8; TAI64N_LEN]) {
-        let mut cur = self.greatest_tai64n.lock().unwrap();
+        let mut cur = self.greatest_tai64n.lock().unwrap_or_else(|e| e.into_inner());
         if hw > *cur {
             *cur = hw;
         }
@@ -368,20 +368,26 @@ impl Peer {
         if matches!(new.role, SessionRole::Initiator) {
             // A pending unconfirmed responder keypair is superseded by
             // this confirmed initiator keypair — drop it.
-            if let Some(old_next) = self.next.write().unwrap().take() {
+            if let Some(old_next) = self.next.write().unwrap_or_else(|e| e.into_inner()).take() {
                 evicted.push(old_next);
             }
-            let old_current = self.current.write().unwrap().replace(new);
-            if let Some(old_prev) =
-                std::mem::replace(&mut *self.previous.write().unwrap(), old_current)
-            {
+            let old_current = self.current.write().unwrap_or_else(|e| e.into_inner()).replace(new);
+            if let Some(old_prev) = std::mem::replace(
+                &mut *self.previous.write().unwrap_or_else(|e| e.into_inner()),
+                old_current,
+            ) {
                 evicted.push(old_prev);
             }
         } else {
             // Responder: unconfirmed. Park in `next`; egress keeps using
             // the confirmed `current` until the first inbound data record
             // promotes it.
-            if let Some(old_next) = self.next.write().unwrap().replace(new) {
+            if let Some(old_next) = self
+                .next
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(new)
+            {
                 evicted.push(old_next);
             }
         }
@@ -396,14 +402,17 @@ impl Peer {
     /// it was already promoted). Caller holds `reconcile_lock`.
     pub(crate) fn promote_next(&self, expected: &Arc<WgSession>) -> Option<Arc<WgSession>> {
         let promoted = {
-            let mut next = self.next.write().unwrap();
+            let mut next = self.next.write().unwrap_or_else(|e| e.into_inner());
             match next.as_ref() {
                 Some(n) if Arc::ptr_eq(n, expected) => {}
                 _ => return None,
             }
             next.take().expect("next is Some (matched above)")
         };
-        let old_current = self.current.write().unwrap().replace(promoted);
-        std::mem::replace(&mut *self.previous.write().unwrap(), old_current)
+        let old_current = self.current.write().unwrap_or_else(|e| e.into_inner()).replace(promoted);
+        std::mem::replace(
+            &mut *self.previous.write().unwrap_or_else(|e| e.into_inner()),
+            old_current,
+        )
     }
 }
