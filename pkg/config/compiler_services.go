@@ -410,9 +410,30 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 		for _, prop := range groupInst.node.Children {
 			switch prop.Name() {
 			case "interface":
-				if v := nodeVal(prop); v != "" {
-					group.Interfaces = append(group.Interfaces, v)
-				}
+				// #6696: read EVERY interface, not slot 0. `interface`
+				// is an `args: 1, multi: true, valueList: true` leaf, so
+				// the bracketed spelling — `interface [ ge-0/0/0.0
+				// ge-0/0/1.0 ]`, the ordinary way to write a
+				// multi-segment group — collapses the whole list onto
+				// this ONE node's Keys (the #2419 contract) instead of
+				// producing one sibling node per interface. The prior
+				// nodeVal read kept Keys[1] alone, so the group served
+				// only its FIRST interface and every later segment got
+				// no leases at all — a failure that looks like a network
+				// problem rather than a config one. Identical on the
+				// strict commit path and the tolerant load path: the
+				// failing axis is bracketed-vs-repeated-leaf, so a
+				// bracket-authored group is narrowed at the ORIGINAL
+				// commit and both cluster nodes agree on the wrong value.
+				//
+				// The tail is read from Keys ONLY. A per-interface Junos
+				// MODIFIER (`interface ge-0/0/0.0 exclude`) is a modelled
+				// CHILD of this leaf, so it parks in Children and cannot
+				// be mistaken for an interface name here — which matters,
+				// because these names go straight into Kea's
+				// interfaces-config.interfaces and one Kea cannot bind
+				// takes the whole DHCP server down.
+				group.Interfaces = append(group.Interfaces, dhcpGroupInterfaceValues(prop)...)
 			case "pool":
 				poolName := nodeVal(prop)
 				if poolName != "" {
@@ -433,9 +454,19 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 						case "router":
 							pool.Router = nodeVal(pp)
 						case "dns-server":
-							if v := nodeVal(pp); v != "" {
-								pool.DNSServers = append(pool.DNSServers, v)
-							}
+							// #6696: read EVERY resolver, not slot 0.
+							// Same class as `group interface` above —
+							// `dns-server [ 192.0.2.53 198.51.100.53 ]`
+							// collapses onto this one node's Keys, and
+							// the prior nodeVal read handed clients ONE
+							// resolver where two were configured, so the
+							// redundancy the operator wrote was simply
+							// absent (the RA RDNSS shape). The leaf is
+							// modelled `multi: true` with
+							// ValidateIPAddress, so every element of the
+							// widened list is checked at commit rather
+							// than only the first.
+							pool.DNSServers = append(pool.DNSServers, firewallMatchValues(pp)...)
 						case "lease-time":
 							if v := nodeVal(pp); v != "" {
 								if n, err := strconv.Atoi(v); err == nil {
@@ -2222,4 +2253,56 @@ func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig, lenient bool, 
 		*bds = append(*bds, bd)
 	}
 	return nil
+}
+
+// dhcpGroupInterfaceValues extracts every interface a `system services
+// dhcp-local-server group <g> interface ...` statement names (#6696).
+//
+// It is NOT firewallMatchValues, and the difference is the whole point.
+// `interface` is the one leaf in this subtree that carries per-interface
+// Junos MODIFIERS — `interface ge-0/0/0.0 exclude`, `... upgrade-server
+// <addr>` — which the schema models as CHILDREN of the leaf so the
+// valueList absorber parks them there instead of swallowing the keyword as
+// an interface name. A reader that unions Keys[1:] with the children would
+// undo exactly that: it would promote `exclude` into the interface list,
+// and these names go straight into Kea's interfaces-config.interfaces,
+// where one Kea cannot bind takes the whole DHCP server down. The
+// spelling-differential gate cannot catch that direction — it detects a
+// DROPPED value, never a PROMOTED modifier — so the discrimination has to
+// be right here by construction.
+//
+// The two shapes are told apart by whether the statement names an
+// interface on its own line:
+//
+//	interface ge-0/0/0.0                     Keys=[interface ge-0/0/0.0]
+//	interface [ ge-0/0/0.0 ge-0/0/1.0 ]      Keys=[interface ge-0/0/0.0 ge-0/0/1.0]
+//	interface ge-0/0/0.0 { exclude; }        Keys=[interface ge-0/0/0.0]  Children=[exclude]
+//	interface { ge-0/0/0.0; ge-0/0/1.0; }    Keys=[interface]             Children=[ge-0/0/0.0, ge-0/0/1.0]
+//
+// With a name on the Keys tail, the tail IS the value list and any child is
+// a modifier body — read Keys[1:] and ignore the children, which is what
+// the pre-#6696 single-value read did for the modifier case too (it read
+// Keys[1] and dropped the rest of the tail; the modifier was never a
+// value). With NO name on the tail, the statement opened a bare value
+// block, so the children are values: read every KEY of every child, not
+// just each child's name — reading "the children" is not the same as
+// reading every key of each child (the #7126 lesson).
+func dhcpGroupInterfaceValues(prop *Node) []string {
+	var vals []string
+	if len(prop.Keys) >= 2 {
+		for _, v := range prop.Keys[1:] {
+			if v != "" {
+				vals = append(vals, v)
+			}
+		}
+		return vals
+	}
+	for _, child := range prop.Children {
+		for _, k := range child.Keys {
+			if k != "" {
+				vals = append(vals, k)
+			}
+		}
+	}
+	return vals
 }
