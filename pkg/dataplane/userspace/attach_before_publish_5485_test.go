@@ -92,8 +92,9 @@ func TestAttachmentsNotDetachedBeforePublish_5485(t *testing.T) {
 
 	xdpLink := &shimLink5485{}
 	tcLink := &shimLink5485{}
-	m.bpfShim.XDPLinks()[protectedIfindex5485] = xdpLink
-	m.bpfShim.TCLinks()[protectedIfindex5485] = tcLink
+	// #6740: XDPLinks/TCLinks now return SNAPSHOTS, so seeding through them
+	// would write to a throwaway copy and this test would assert nothing.
+	m.bpfShim.SetLinkForTest(protectedIfindex5485, xdpLink, tcLink)
 
 	m.mu.Lock()
 	m.lastSnapshot = retained

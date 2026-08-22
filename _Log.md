@@ -21752,7 +21752,11 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   scoped signature. Build/vet clean; `pkg/dataplane` (minus pre-existing
   unrelated `TestUserspaceManagerDoesNotImportReflectOrUnsafe`) + full
   `pkg/dataplane/userspace` GREEN under `-race`.
-- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
+- **Split**: the new accessor family pushed loader.go 1413 -> 1607, crossing the
+  1500 [WATCH] floor, so it moved to pkg/dataplane/link_maps.go (183 lines,
+  verbatim, md5 42e1227f2ffd). loader.go 1607 -> 1422, below where it started.
+- **File(s)**: pkg/dataplane/link_maps.go (new), pkg/dataplane/loader.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/constants_test.go, _Log.md
 ## 2026-07-16 — #5682 (security/HA): unreadable kernel-upgrade journal bypasses candidate election hold (codex-182 M24)
 - **Timestamp**: 2026-07-16 (fix/5682-upgrade-journal-failclosed)
 - **Action**: Fix #5682. `holdSecondaryIfKernelCandidateArmed`
@@ -103871,6 +103875,31 @@ prose edit above them added. No diff falls in the new test body.
   RG + barrier wait, then stopClusterComms) ahead of the teardown.
 - **File(s)**: pkg/daemon/bootstrap.go,
   pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
+
+## 2026-08-22 — #6740 guard the 1 Hz status-path link-map reads
+- **Timestamp**: 2026-08-22
+- **Action**: The 1 Hz userspace status path ranged the root Manager's LIVE
+  xdpLinks map and indexed the exported VlanSubInterfaces map while
+  CompileUserspaceShim/AttachXDP/DetachXDP mutated them — a concurrent Go map
+  read+write is a fatal runtime.throw, so the status poll could kill xpfd.
+  Unexported vlanSubInterfaces; made XDPLinks/TCLinks return SNAPSHOTS (handing
+  out the live map is what put the caller's range loop outside any lock the
+  accessor could take); added XDPEntryPrograms (one m.mu hold for all three
+  reads) and converted the status path to it; single-sourced the duplicated
+  vlanSubInterfaces writer into markVLANSubInterfaces; routed every remaining
+  raw map access through guarded per-entry helpers; snapshot-then-syscall in
+  swapXDPEntryProg and Close so no lock spans a netlink/BPF call.
+- **Self-inflicted bug caught by the new test**: the mechanical replacement that
+  routed raw accesses through helpers also rewrote the helper BODIES, making
+  setXDPLink/deleteXDPLink/setTCLink/deleteTCLink call themselves. Build, vet
+  and the whole pkg/dataplane suite passed with that in place; only the
+  concurrent test deadlocked and exposed it. Added a self-call audit.
+- **No control-socket traffic added** — this is a Go-side mutex only.
+- **File(s)**: pkg/dataplane/loader.go, pkg/dataplane/compiler.go,
+  pkg/dataplane/armproof.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/xdplinks_status_race_6740_test.go (new),
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/userspace/attach_before_publish_5485_test.go
 
 ## 2026-08-22 — #6744 kimi-review-003 cohort split
 - **Action**: Landed the stranded research plan as a record (review loop

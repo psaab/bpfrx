@@ -180,7 +180,14 @@ var managerMethodClasses = map[string]string{
 	"GetPersistentNAT":           "catG",
 	"XDPLinks":                   "catG",
 	"TCLinks":                    "catG",
-	"DetachTC":                   "catG", // reads only the construction link map
+	// #6740: the guarded siblings of XDPLinks/TCLinks — pure reads of link
+	// membership under m.mu, same class as the accessors they replace on the
+	// 1 Hz status path. SetLinkForTest is a test seam (see its doc comment) and
+	// touches no kernel state, so it classifies the same way.
+	"XDPEntryPrograms":   "catG",
+	"IsVLANSubInterface": "catG",
+	"SetLinkForTest":     "catG",
+	"DetachTC":           "catG", // reads only the construction link map
 	// DetachXDP's single label is category G (its direct access is the
 	// construction link map) with the class-3-LIKE delegation target
 	// setXDPAttachedFlag: scoped lookups, cleanup always runs, NO gate.
@@ -236,8 +243,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 160 {
-		t.Fatalf("exported *Manager method inventory = %d, want 160 (the plan census 157 + the two #6743 r4 additions + ReplaceFloodCounterOffsets, #3651); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 163 {
+		t.Fatalf("exported *Manager method inventory = %d, want 163 (the plan census 157 + the two #6743 r4 additions + ReplaceFloodCounterOffsets (#3651) + the three #6740 additions: XDPEntryPrograms, IsVLANSubInterface, SetLinkForTest); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {
