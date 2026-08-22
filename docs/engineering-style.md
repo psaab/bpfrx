@@ -481,7 +481,10 @@ they repeatedly bite:
   - **Never hand-roll binary deploys** (`incus file push` + restart
     loops) to the cluster — they bypass the lock AND the #1864/#1869
     verify-dataplane gate. Deploys go through `cluster-setup.sh
-    deploy` / `make cluster-deploy`.
+    deploy` / `make cluster-deploy`. The same gate now runs on the
+    standalone `setup.sh deploy` path too (#6493), so `make
+    test-deploy` is no longer the one binary-swap route that can put
+    a verifier-rejected shim on a box and report success.
   - **Destructive HA smoke self-locks (#4020).** A `test-failover`
     that reboots a node mid-iperf is FAR more disruptive than a
     deploy, so the reboot/force-stop/failover smoke scripts share the

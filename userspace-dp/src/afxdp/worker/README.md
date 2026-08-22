@@ -41,6 +41,41 @@ Each phase extracted one cluster of fields into a dedicated
 sub-struct so the parent struct stays cache-line-friendly and so
 each cluster has a clear ownership boundary.
 
+## Idle regulation
+
+A tick that did no work increments `idle_iters` and then backs off according
+to `poll_mode`. `BusyPoll` spins for `IDLE_SPIN_ITERS` (256) iterations and
+then sleeps `IDLE_SLEEP_US` (1 us). `Interrupt` spins for the same window —
+firewall-local TCP is ACK-latency-sensitive, so blocking on the first empty
+poll collapses cwnd — and then blocks in `libc::poll` on every binding's
+AF_XDP socket fd with an `INTERRUPT_POLL_TIMEOUT_MS` (1 ms) timeout. When the
+worker has no bindings there is no fd to block on, so it sleeps the same 1 ms
+instead.
+
+That blocking `poll` is the ONLY backoff `Interrupt` mode has past the spin
+window, which is why #6431 made its return a checked value rather than a
+discarded one. `loop_body/idle_poll::classify` splits the return into three
+cases:
+
+| return | classification | caller |
+|--------|----------------|--------|
+| `0` (timeout), or `> 0` with `POLLIN` set on some fd | `Waited` | resume — the wait waited |
+| `-1` with `EINTR` | `Interrupted` | retry; the next pass re-enters the poll, so this costs one work scan and no sleep |
+| `-1` with any other errno, or `> 0` with only `POLLNVAL`/`POLLERR`/`POLLHUP` | `Degraded` | substitute a `INTERRUPT_POLL_TIMEOUT_MS` sleep |
+
+The `Degraded` cases are the ones that matter: both return IMMEDIATELY and
+keep doing so, so without a substituted sleep the 1 ms floor disappears
+entirely and the idle path becomes a hot spin on a pinned core. Measured with
+the production 1 ms timeout: a healthy idle poll yields ~950 loops/s, the same
+loop over a closed fd ~2.96M loops/s — a ~3120x amplification held for as long
+as the condition lasts. `EINTR` is deliberately NOT a `Degraded` case: the
+helper installs a `ctrlc` handler (`server/lifecycle.rs`) and `poll(2)` is one
+of the calls `SA_RESTART` never restarts (signal(7)), so signal-interrupted
+waits are ordinary and must not each buy a sleep. The degraded log is latched
+to one line per worker, because the condition that produces it repeats every
+pass. RX is unaffected either way — the rings are swept on every loop pass;
+`poll` only regulates how long an idle worker waits between sweeps.
+
 ## Files
 
 | File | Purpose |
@@ -50,6 +85,7 @@ each cluster has a clear ownership boundary.
 | `launch.rs` | #6241 — the 5 typed worker-launch bundles (`WorkerLaunchPlan`, `WorkerSharedDataplane`, `WorkerControlChannels`, `WorkerCoSState`, `WorkerPublishedTelemetry`) + 2 nested (`WorkerNeighbors`, `WorkerSharedSessions`) that replace the old 38-parameter positional `worker_loop` protocol. `WorkerSharedDataplane::from_coord` / `WorkerCoSState::from_coord` (coordinator-published state) and the `::new` builders (per-worker slots) are the single named construction sites; `Arc::ptr_eq` wiring tests bind them (fail-on-revert for the session-map and heartbeat/export-ack silent-swap hazards). |
 | `loop_body/setup.rs` | #1776 — one-shot cold setup (`worker_loop_setup`): thread pin via `pin_current_thread` (defined in `afxdp/neighbor.rs`), TSC calibration, binding construction, BPF-map-FD cache; returns `WorkerLoopSetup`. #6245: binding construction now accumulates EXPLICIT per-slot terminal failures (`binding_failures`) + recovered shared-group fallbacks (`recovered_fallbacks`), sorted deterministically and carried through `WorkerLoopSetup` into `WorkerStartupReport` (the failed slot is no longer signalled only by OMISSION from `bindings`). See `coordinator/README.md` #6245. |
 | `loop_body/debug_report.rs` | #1776 — cfg(debug-log)-only `DbgCounters` + per-second verbose report (`emit_periodic_report`) + stall dump (`check_and_dump_stall`). #5189: also the per-binding diagnostics build (`build_binding_summary` — `String` + per-binding `statistics_v2()`/`SO_ERROR` `getsockopt`), which #1776 had left inline and ungated in `loop_body/mod.rs`. Compiled out of release builds. |
+| `loop_body/idle_poll.rs` | #6431 — classification of the Interrupt-mode idle-regulation `poll(2)` return (`classify` -> `Waited` / `Interrupted` / `Degraded`, plus `fault_summary` for the caller's one-shot log). Idle path only, so it is outside the per-tick no-call-boundary constraint. See "Idle regulation" below. |
 | `lifecycle.rs` | `poll_binding` — the per-poll RX/TX orchestrator. The "central function" extracted in Issue 73 step 2. |
 | `cos.rs` | Per-worker CoS runtime helpers + shared-exact threshold (the empirical sustained per-worker exact throughput ceiling — see comment block in the file for the evidence basis). |
 | `cos_state.rs` | `WorkerCos` (#959 Phase 3) — per-binding CoS-engine state. |

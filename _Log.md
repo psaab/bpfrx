@@ -100004,3 +100004,45 @@ prose edit above them added. No diff falls in the new test body.
   cluster smoke is OWED.
 - **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
   userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
+
+## 2026-08-21 — #6440 CoS-apply CLI-transcript gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Diagnosed #6440 (`apply-cos-config.sh` exits 6). Root cause: the
+  piped-stdin CLI is a REPL that prints `error: ...` for a failed command,
+  continues, and exits 0 — so the phase-1/phase-2 exit-status gates could
+  never fire, and a silently-failed `load merge` committed a deletes-only
+  candidate (a CoS wipe) that surfaced only as the phase-3 "no shaper
+  binding" grep. Replaced the exit-status gates with CLI success-marker
+  verification, made every rollback verified, and added a daemon-readiness
+  wait.
+- **File(s)**: `test/incus/cos-apply-lib.sh` (new),
+  `test/incus/cos-apply-lib-selftest.sh` (new),
+  `cmd/cli/cos_apply_markers_6440_test.go` (new),
+  `test/incus/apply-cos-config.sh`, `Makefile`, `CLAUDE.md`,
+  `docs/cos-validation-notes.md`
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
+  return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
+  (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
+  degraded arm; document the idle regulation in the worker README.
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`
+
+## 2026-08-21 — #6177 item 1: fence the remote-failover ack on RETH VIP release
+- **Timestamp**: 2026-08-21
+- **Action**: Close the RETH VIP-removal sub-ms two-owner residual. `vrrp.ResignRG`
+  now returns a `*ResignBarrier` armed on every targeted instance before
+  `triggerResign`; instances report to it from the sites that actually complete a
+  VIP release (`becomeBackup` with the `removeVIPs` verdict, the MASTER-arm
+  shutdown removal, a new BACKUP-arm `resignCh` consumer, and `stop()`).
+  `handleClusterEvent` defers the demotion fence verdict to
+  `awaitRethVIPRelease`, which resolves `signalFailoverActuated` /
+  `signalFailoverActuationFailed` from the release itself, on its own goroutine.
+- **File(s)**: pkg/vrrp/resign_barrier.go (new), pkg/vrrp/instance.go,
+  pkg/vrrp/manager.go, pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go,
+  pkg/vrrp/resign_barrier_6177_test.go (new),
+  pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
+  docs/session-sync-architecture.md

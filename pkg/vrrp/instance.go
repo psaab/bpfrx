@@ -2,6 +2,7 @@ package vrrp
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -271,6 +272,24 @@ type vrrpInstance struct {
 	// interface (#2528). Production leaves it nil and interfaceAddrs() queries
 	// vi.iface.Addrs() live on every resolve.
 	addrsFn func() ([]net.Addr, error)
+
+	// resignAckMu guards resignAcks: the set of #6177 ResignBarriers waiting
+	// for THIS instance to finish RELEASING its virtual addresses after a
+	// forced resignation. A barrier is armed by the manager BEFORE
+	// triggerResign, and reported to from the sites that actually complete a
+	// VIP release, so a waiter can never be told "released" by a code path
+	// that only signalled the resignation.
+	//
+	// Arming does NOT shortcut on state: reading "already BACKUP" and
+	// completing the barrier immediately would be wrong exactly when it
+	// matters, because becomeBackup publishes BACKUP (setState) BEFORE it
+	// runs removeVIPs — the VIP can still be on the wire while the state
+	// already reads BACKUP. Instead the BACKUP arm of the run loop consumes
+	// the resign token and reports there, so a genuinely already-resigned
+	// instance completes the barrier on the next loop hop rather than
+	// stalling it.
+	resignAckMu sync.Mutex
+	resignAcks  []*ResignBarrier
 }
 
 func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent, onEventDrop func()) *vrrpInstance {
@@ -377,6 +396,44 @@ func (vi *vrrpInstance) triggerResign() {
 	case vi.resignCh <- struct{}{}:
 	default:
 	}
+}
+
+// armResignAck registers b as a waiter for this instance's next VIP release.
+// The manager calls it BEFORE triggerResign so the run loop cannot complete the
+// release between the arm and the trigger and leave the waiter unreported.
+func (vi *vrrpInstance) armResignAck(b *ResignBarrier) {
+	if b == nil {
+		return
+	}
+	vi.resignAckMu.Lock()
+	vi.resignAcks = append(vi.resignAcks, b)
+	vi.resignAckMu.Unlock()
+}
+
+// notifyResigned reports outcome err to every barrier armed on this instance
+// and clears the list, so each registration is reported exactly once and a
+// later release cannot double-report an already-completed barrier. err is the
+// VIP-removal outcome: nil means the addresses are off the wire.
+func (vi *vrrpInstance) notifyResigned(err error) {
+	vi.resignAckMu.Lock()
+	waiters := vi.resignAcks
+	vi.resignAcks = nil
+	vi.resignAckMu.Unlock()
+	for _, b := range waiters {
+		b.report(err)
+	}
+}
+
+// staleVIPResignErr converts a lingering VIP divergence (#5482) into a resign
+// verdict. An instance that is already BACKUP has no VIP tenure to tear down —
+// unless a previous removal FAILED and its async reconcile has not yet cleared
+// the address, in which case this node may still be answering ARP for the VIP
+// and must not report a clean release to a two-owner fence (#6177 item 1).
+func (vi *vrrpInstance) staleVIPResignErr() error {
+	if vi.vipDiverged.Load() {
+		return fmt.Errorf("%w: instance %s", ErrStaleVIPOnBackup, vi.key())
+	}
+	return nil
 }
 
 // getPreempt reports the EFFECTIVE preempt mode. It is the configured
@@ -856,6 +913,20 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 			stopAndDrainTimer(masterDownTimer)
 			masterDownTimer.Reset(vi.masterDownInterval())
 		}
+	case <-vi.resignCh:
+		// #6177 item 1: a forced resignation arrived while this instance is
+		// ALREADY BACKUP — a cluster demotion for an RG whose VRRP tenure had
+		// already ended (peer preempted us, a link-down demotion landed first,
+		// a reconcile-driven re-resign). There is no MASTER tenure to tear
+		// down, so nothing more will remove VIPs on our behalf and the token
+		// would otherwise sit unread in resignCh forever, stalling the fence
+		// barrier until its timeout and downgrading a clean failover to a hold.
+		//
+		// Consume it here and report the honest verdict: a clean release
+		// unless a PREVIOUS removal failed and its #5482 reconcile has not yet
+		// cleared the address, in which case a VIP may still be answering ARP
+		// and this is not a two-owner-safe resignation.
+		vi.notifyResigned(vi.staleVIPResignErr())
 	case <-vi.configUpdatedCh:
 		// A config update landed (updateConfig) while this BACKUP select was
 		// running (#2900). If a preempt hold-time is armed, the new config may
@@ -996,10 +1067,15 @@ func (vi *vrrpInstance) run() {
 				}
 				// Best-effort at process exit: log a removal failure but do not
 				// schedule a reconcile (stopCh is closed, the run-loop is ending).
-				if err := vi.removeVIPs(); err != nil {
+				err := vi.removeVIPs()
+				if err != nil {
 					slog.Warn("vrrp: VIP removal failed during resignation shutdown",
 						"key", vi.key(), "err", err)
 				}
+				// #6177: the run loop is ending, so this is the last VIP
+				// release it will ever perform. Report it rather than
+				// stranding a barrier armed just before the shutdown.
+				vi.notifyResigned(err)
 				return
 			case pkt := <-vi.rxCh:
 				vi.handleMasterRx(pkt, masterDownTimer, advertTimer)
@@ -1366,7 +1442,8 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 	slog.Info("vrrp: transitioning to BACKUP",
 		"key", vi.key())
 	vi.setState(StateBackup)
-	vi.surfaceStaleVIP(vi.removeVIPs(), "becomeBackup")
+	removeErr := vi.removeVIPs()
+	vi.surfaceStaleVIP(removeErr, "becomeBackup")
 	advertTimer.Stop()
 	masterDownTimer.Reset(vi.masterDownInterval())
 	// A MASTER stepping down to a worthy higher/tie-break master begins a
@@ -1377,6 +1454,13 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 	vi.skipNextPreemptHold = false
 	vi.mu.Unlock()
 	vi.emitEvent()
+	// #6177 item 1: the VIPs are now physically off the interface (or
+	// removeErr says why they are not). Report to every resign barrier armed
+	// on this instance so a fenced remote failover releases its applied-ack on
+	// VIP REMOVAL, not merely on "resignation signalled + priority 0". This is
+	// the last statement in the function on purpose: a waiter that observes the
+	// completion must not be able to observe it before the removal ran.
+	vi.notifyResigned(removeErr)
 }
 
 // stop signals the instance goroutine to stop and waits for it to finish.
@@ -1389,4 +1473,11 @@ func (vi *vrrpInstance) stop() {
 	// vi.conn and receiverAfPacket()'s vi.afPacketFD reads.
 	vi.closeSocketDescriptors()
 	<-vi.stopped
+	// #6177: the run loop has exited. Anything armed after its final release
+	// (or armed against an instance that was never MASTER) will never be
+	// reported by the loop, so report it here rather than leaving the caller's
+	// fence to burn its timeout. The instance is retired: it holds no VIP
+	// tenure, so a clean verdict is honest unless a removal is known to have
+	// failed and not been reconciled.
+	vi.notifyResigned(vi.staleVIPResignErr())
 }
