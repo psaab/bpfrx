@@ -6,8 +6,11 @@ never the shared loss cluster) and proves the first-boot contract:
 
   a  no config drive  -> factory bootstrap: boots UNDER SECURE BOOT (the
      production posture, asserted not inherited — #6497), xpfd active,
-     fxp0 DHCP, sshd listening, AND in-guest `xpfd verify-dataplane`
-     PASSES against the image's own kernel (the bake gate).
+     fxp0 DHCP, sshd listening, in-guest `xpfd verify-dataplane` PASSES
+     against the image's own kernel (the bake gate), AND the #1930 LANE-1
+     A/B kernel channel actually came up in the guest (#6494): both slots
+     registered with their own signed shim and reachable in BootOrder, and
+     both first-boot oneshots ran clean.
   b  valid day-0 drive -> config validated + installed + committed at first
      boot (hostname applied); a reboot does NOT re-apply (stamp).
   c  invalid day-0 drive -> commit-check REJECT logged, nothing installed,
@@ -36,6 +39,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -231,6 +235,140 @@ def _qemu_img_verdict(imginfo, min_bytes):
         return False, (f"virtual-size {vsize} below the {min_bytes}-byte bake floor "
                        "— truncated / incomplete image")
     return True, f"qcow2, virtual-size {vsize / (1024 ** 3):.1f}GiB"
+
+
+# ── #1930 LANE-1 A/B slot registration (#6494) ────────────────────────
+# The bake STAGES /boot/efi/EFI/{xpf-A,xpf-B} and ENABLES xpf-uefi-slots.service
+# + xpf-kernel-promote.service, and hard-asserts the signed shim is there. What
+# it cannot assert offline is the half that only happens in-guest: UEFI Boot####
+# variables live in the target's firmware NVRAM, which virt-customize cannot
+# write, so registration is a first-boot oneshot on the real machine.
+#
+# That oneshot is deliberately NON-FATAL on every failure path ("degraded, not
+# bricked" — a read-only/no-efivars platform must still boot), and nothing
+# downstream re-read its outcome. So a regression in the ESP disk/part parse,
+# the loader-path match, or the efibootmgr write shipped a fully "validated"
+# image whose verify-gated kernel channel was silently unavailable, and the
+# operator discovered it only when `xpfd upgrade kernel arm` exited 2 with "A/B
+# slots not both registered ... the first-boot registration oneshot must run
+# first" (pkg/upgrade/kernel_run.go ErrKernelChannelUnavailable).
+#
+# A gate for a production appliance image should prove the upgrade substrate it
+# ships, not only the files that substrate is made of.
+#
+# The slots the #1930 channel requires. Both must exist; the channel refuses to
+# arm unless BOTH are registered, so one is as unavailable as none.
+_AB_SLOTS = ("xpf-A", "xpf-B")
+
+# An efibootmgr entry line is "BootXXXX[*]<space>LABEL<TAB>loader-path". The
+# label is followed by a TAB and the path, NOT line-end — anchoring at $ is the
+# miss that created duplicate slots live during #1930. Mirrors the shell regex
+# in scripts/image/xpf-uefi-slots register_slot() on purpose: the gate must
+# agree with the script about what "registered" means, or it certifies a state
+# the script would not accept.
+_EFIBOOT_ENTRY_RE = re.compile(
+    r"^Boot([0-9A-Fa-f]{4})\*?[ \t]+(?P<label>\S+)[ \t]+(?P<rest>.*)$")
+_BOOTORDER_RE = re.compile(r"^BootOrder:\s*(?P<order>\S*)\s*$", re.MULTILINE)
+
+
+def _efibootmgr_slot_verdict(out, slots=_AB_SLOTS):
+    """Pure verdict over `efibootmgr` (or `efibootmgr -v`) output: are BOTH
+    #1930 A/B slots registered exactly once, each pointing at its own signed
+    shim, and both reachable in BootOrder? Returns (ok, reason).
+
+    Split out from the scenario so the acceptance criterion is unit-testable
+    without a hypervisor, in the _qemu_img_verdict idiom (#4209 H-9).
+
+    Three separate properties, reported separately, because they have three
+    different causes:
+      - exactly once  -> a duplicate means the registration guard's label match
+                         missed (the #1930 live bug); a duplicate ALSO poisons
+                         BootNext, since which Boot#### the slot means is then
+                         ambiguous.
+      - loader path   -> an entry that merely shares the LABEL but points
+                         elsewhere chainloads the wrong loader.
+      - in BootOrder  -> a slot the firmware will never reach is registered but
+                         unusable, which is not "registered" in any sense the
+                         kernel channel can act on.
+    """
+    ids = {}          # slot -> [Boot#### ids with the RIGHT loader path]
+    wrong_path = {}   # slot -> [rendered lines whose path does not match]
+    for line in out.splitlines():
+        m = _EFIBOOT_ENTRY_RE.match(line.rstrip())
+        if not m:
+            continue
+        label = m.group("label")
+        if label not in slots:
+            continue
+        # efibootmgr prints "...File(\EFI\xpf-A\shimx64.efi)" or the bare
+        # "...\EFI\xpf-A\shimx64.efi". Match the slot's shim path with any
+        # separator between the components and case-insensitively, exactly as
+        # the shell guard does (grep -qiE "EFI.${slot}.shimx64\.efi").
+        want = re.compile(r"EFI.%s.shimx64\.efi" % re.escape(label), re.IGNORECASE)
+        if want.search(m.group("rest")):
+            ids.setdefault(label, []).append(m.group(1))
+        else:
+            wrong_path.setdefault(label, []).append(line.strip())
+
+    problems = []
+    for slot in slots:
+        got = ids.get(slot, [])
+        if not got:
+            bad = wrong_path.get(slot)
+            if bad:
+                problems.append(
+                    f"{slot}: registered but the loader path is NOT "
+                    f"\\EFI\\{slot}\\shimx64.efi ({bad!r}) — it would chainload "
+                    "the wrong loader")
+            else:
+                problems.append(
+                    f"{slot}: NOT registered — the first-boot xpf-uefi-slots "
+                    "oneshot did not create it (LANE-1 kernel channel "
+                    "unavailable on this image)")
+        elif len(got) > 1:
+            problems.append(
+                f"{slot}: registered {len(got)} times ({', '.join(got)}) — a "
+                "duplicated slot makes BootNext ambiguous")
+
+    mo = _BOOTORDER_RE.search(out)
+    if mo is None:
+        problems.append("efibootmgr reported no BootOrder line — cannot prove "
+                        "either slot is reachable by the firmware")
+    else:
+        order = [x for x in mo.group("order").split(",") if x]
+        for slot in slots:
+            got = ids.get(slot, [])
+            if got and not any(i.upper() in (o.upper() for o in order) for i in got):
+                problems.append(
+                    f"{slot}: registered ({got[0]}) but absent from BootOrder "
+                    f"({mo.group('order')!r}) — the firmware would never reach it")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, ("both A/B slots registered exactly once with the right shim "
+                  "loader and present in BootOrder")
+
+
+def _oneshot_clean_verdict(name, exec_main_status, active_state, result):
+    """Pure verdict over `systemctl show` fields for a first-boot oneshot:
+    did it RUN and exit 0? Returns (ok, reason).
+
+    A oneshot with RemainAfterExit=yes reports ActiveState=active after a clean
+    run. The distinction that matters is "did not run" vs "ran and failed":
+    inactive means a Condition skipped it (the unit was never enabled, or
+    ConditionPathExists=/boot/efi did not hold — an image with no ESP), which
+    is a DIFFERENT bake defect from a non-zero exit, so they are reported
+    separately rather than as one 'not clean'.
+    """
+    if active_state in ("inactive", "") and result in ("", "success"):
+        return False, (f"{name} never ran (ActiveState={active_state!r}) — the "
+                       "bake did not enable it, or its Condition did not hold "
+                       "on this image")
+    if result and result != "success":
+        return False, f"{name} failed (Result={result!r}, ExecMainStatus={exec_main_status!r})"
+    if exec_main_status not in ("0", 0):
+        return False, f"{name} exited {exec_main_status!r}, not 0"
+    return True, f"{name} ran clean (ExecMainStatus=0)"
 
 
 def _find_first(candidates):
@@ -527,6 +665,7 @@ class Harness:
             fail("sshd effective config does not refuse root password auth")
         if not guest_sh(a, '/usr/sbin/sshd -T | grep -qx "permitemptypasswords no"'):
             fail("sshd effective config does not pin PermitEmptyPasswords no")
+        self.assert_ab_kernel_channel(a)
         if guest(a, "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
             fail("unexpected /etc/xpf/xpf.conf")
         if guest(a, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
@@ -573,6 +712,84 @@ class Harness:
                  "SB-off validation run does not exercise the chain this image "
                  "ships.")
         info(f"Secure Boot: {reason}")
+    def _show_unit(self, inst, unit, prop):
+        """One `systemctl show -p <prop> --value <unit>` field from the guest."""
+        return guest(inst, "systemctl", "show", "-p", prop, "--value", unit,
+                     check=False, capture=True).stdout.strip()
+
+    def assert_ab_kernel_channel(self, inst):
+        """Assert the #1930 LANE-1 A/B kernel-channel substrate actually came
+        up IN THE GUEST (#6494) — not merely that the bake staged its files.
+
+        Three things, in the order their failures would be diagnosed:
+          1. the registration oneshot ran clean (it is non-fatal by design, so
+             its own exit is the only place a failure is recorded at all);
+          2. both slots are registered exactly once, with the right shim loader,
+             and reachable in BootOrder — the state `xpfd upgrade kernel arm`
+             refuses to proceed without;
+          3. the promotion gate ran clean on this ordinary boot.
+
+        On (3), note what is NOT asserted: the "promotion gate: clean" line.
+        That line is only emitted once the gate has exec'd xpfd to run the
+        promote verb. On a factory boot with nothing armed the script exits 0
+        much earlier, logging "no armed kernel candidate recorded", so requiring
+        the former here would fail every good image. What IS asserted is that
+        the unit ran and exited 0, plus the ordinary-boot line, which together
+        prove the gate EXECUTED rather than being skipped by a Condition — the
+        thing an operator is relying on when they arm a candidate later.
+        """
+        info("#1930 LANE-1: A/B slot registration + promotion gate...")
+
+        # Both oneshots are WantedBy=multi-user.target and are NOT ordered
+        # Before=xpfd (deliberately — a hanging efibootmgr must never block the
+        # #1922 mgmt lifeline), so xpfd being active does not imply they have
+        # finished. Wait for each to settle rather than racing it.
+        for unit in ("xpf-uefi-slots.service", "xpf-kernel-promote.service"):
+            self._wait(inst,
+                       lambda u=unit: self._show_unit(inst, u, "ActiveState")
+                       not in ("activating", "reloading"),
+                       40, 3, f"{unit} still activating after 120s")
+
+        ok, reason = _oneshot_clean_verdict(
+            "xpf-uefi-slots.service",
+            self._show_unit(inst, "xpf-uefi-slots.service", "ExecMainStatus"),
+            self._show_unit(inst, "xpf-uefi-slots.service", "ActiveState"),
+            self._show_unit(inst, "xpf-uefi-slots.service", "Result"))
+        if not ok:
+            jrn = guest(inst, "journalctl", "-u", "xpf-uefi-slots", "-b",
+                        "--no-pager", check=False, capture=True).stdout
+            fail(f"#1930 A/B slot registration: {reason}\n{jrn[-800:]}")
+
+        got = guest(inst, "efibootmgr", check=False, capture=True)
+        if got.returncode != 0:
+            fail("efibootmgr failed in the guest "
+                 f"(rc={got.returncode}: {(got.stderr or '').strip()!r}) — the "
+                 "#1930 A/B kernel channel needs it to register the slots, so "
+                 "an image where it is absent or cannot read NVRAM ships with "
+                 "LANE-1 permanently unavailable")
+        ok, reason = _efibootmgr_slot_verdict(got.stdout)
+        if not ok:
+            fail("#1930 A/B slot registration FAILED in-guest: " + reason +
+                 "\n--- efibootmgr ---\n" + got.stdout)
+        info(f"  slots OK: {reason}")
+
+        ok, reason = _oneshot_clean_verdict(
+            "xpf-kernel-promote.service",
+            self._show_unit(inst, "xpf-kernel-promote.service", "ExecMainStatus"),
+            self._show_unit(inst, "xpf-kernel-promote.service", "ActiveState"),
+            self._show_unit(inst, "xpf-kernel-promote.service", "Result"))
+        if not ok:
+            jrn = guest(inst, "journalctl", "-u", "xpf-kernel-promote", "-b",
+                        "--no-pager", check=False, capture=True).stdout
+            fail(f"#1930 promotion gate: {reason}\n{jrn[-800:]}")
+        if not guest_sh(inst,
+                        'journalctl -u xpf-kernel-promote -b --no-pager '
+                        '| grep -q "no armed kernel candidate recorded"'):
+            fail("#1930 promotion gate did not log the ordinary-boot path "
+                 "(\"no armed kernel candidate recorded\") — it exited 0 without "
+                 "reaching its decision, so an armed candidate would go "
+                 "unverified on a later boot")
+        info("  promotion gate ran clean on this ordinary boot")
 
     def scenario_b(self):
         info("── Scenario B: first boot WITH valid day-0 config drive ──")

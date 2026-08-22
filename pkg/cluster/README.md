@@ -21,6 +21,24 @@ locating any symbol below is now a matter of opening the named file.
   `buildHeartbeat`, `handlePeerHeartbeat`, `handlePeerTimeout`,
   `handlePeerNeverSeen`, `HeartbeatStats`,
   `vrfListenConfig` — `heartbeat_manager.go`.
+
+  **Start/stop lifecycle tenure (#7257).** `StartHeartbeat` publishes
+  `hbSender`/`hbReceiver` and *starts* them in ONE critical section, and refuses
+  to publish at all if a `StopHeartbeat` overtook it while its sockets were
+  being created. `Manager.hbEpoch` is the tenure counter: `StopHeartbeat` bumps
+  it under `mu`; `StartHeartbeat` captures it **after** its own #4033 idempotent
+  teardown (capturing at entry would compare against a value the call had itself
+  invalidated) and re-checks it under the publish lock, returning
+  `ErrHeartbeatStartSuperseded` if it moved. Callers must treat that sentinel as
+  terminal, not as a bind failure — retrying would resurrect a heartbeat the
+  teardown exists to remove; `startHeartbeatWithRetry` does.
+
+  This is the same shape `publishSessionSyncIfCurrent` uses for the session-sync
+  constructor, and for the same reason: the daemon's cluster-comms teardown
+  cancels a context and joins exactly one goroutine (`clusterCommsWG`), so every
+  OTHER comms-scoped goroutine that publishes shared state needs a generation
+  gate of its own. The heartbeat retry loop runs on a bare `go` and is not in
+  that WaitGroup.
 - `HeartbeatPacket`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, the #4107 control-channel auth
   (`MarshalHeartbeatAuth`, `marshalHeartbeatAuthEpoch`,
@@ -2399,6 +2417,30 @@ outside the monitor loop:
   the lease. reqID is threaded
   into `OnRemoteFailover`/`OnRemoteFailoverBatch`/`OnRemoteFailoverCommit`/
   `OnRemoteFailoverCommitBatch` (`sync.go`) to arm/clear it.
+- **Every requester-side failure after `applyPeerTransferOutOverrideLocked`
+  must roll the override back — including the commit's own election failure
+  (#6527).** `commitRequestedPeerFailover` /
+  `commitRequestedPeerFailoverBatch` arm the override BEFORE calling
+  `runElection`, then return an error if the local RG did not reach primary.
+  The batch caller already aborted on that error; the single-RG caller
+  returned it bare and leaked the override. There is no expiry for
+  `peerTransferOutOverride` — `applyTransferCommitOverridesOnPeerStateLocked`
+  re-forces the peer to `SecondaryHold` on EVERY subsequent heartbeat with no
+  time bound (unlike `peerTransferCommitGraceUntil`, which does expire) — so a
+  leaked entry makes `electRG` take its "Peer transfer out" arm forever and
+  self-promote this node as soon as whatever failed the election clears. Both
+  nodes then hold the RETH VIP and virtual MAC, persistently. The failure is
+  reachable without any fault injection: `RequestPeerFailover` releases `m.mu`
+  around the fabric round-trip, `commitRequestedPeerFailover`'s re-check is
+  `IsReadyForTakeover` (Ready/ReadySince only — it does NOT read weight), so an
+  interface-monitor debt landing in that window passes readiness and then loses
+  the election on the "Local weight 0" arm. The rollback is reqID-matched and a
+  no-op on the two error returns that precede the override, so calling it on
+  every commit error is safe. Invariant for future edits: the single-RG and
+  batch request paths must agree on rollback at every failure point;
+  `TestRequestPeerFailoverCommitFailureRollsBackOverrideOnBothPaths`
+  (`failover_commit_rollback_6527_test.go`) binds the agreement rather than
+  either copy.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).

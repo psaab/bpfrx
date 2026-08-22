@@ -19,18 +19,17 @@ import "fmt"
 // rejection). Each gate records it and rejects (strict) / warns (lenient).
 //
 // #6455 Finding 1 (group-authored duplicates — a duplicate authored ENTIRELY
-// inside an applied group body) is NOT addressed here. A pre-expansion per-group-
-// body scan false-rejects a legitimate apply-groups FRAGMENT config: fragments of
-// one named object authored across repeated group roots (e.g. two `interfaces`
-// roots each contributing a `ge-0/0/0` unit, or a screen profile split into an
-// ICMP fragment + a TCP fragment) COALESCE into one object under `mergeNodes`
-// during ExpandGroups, so a pre-expansion sibling-scan that cannot model that
-// same-pass coalescing rejects a config that compiles to a single object. The
-// correct detection point is AFTER ExpandGroups (the coalesced tree) but before
-// the #3096 Cartesian bracket-list expansion in compileExpanded — and, to stay
-// HA-symmetric like the sibling tunnel / zone / unit-alias gates, it must union
-// the node0 and node1 expansions rather than scan a single node's view. That is a
-// design pass tracked as the group-authored half of #6455, not shipped here.
+// inside an applied group body) is not addressed in THIS file, and cannot be: a
+// pre-expansion per-group-body scan false-rejects a legitimate apply-groups
+// FRAGMENT config, because fragments of one named object authored across
+// repeated group roots (e.g. two `interfaces` roots each contributing a
+// `ge-0/0/0` unit, or a screen profile split into an ICMP fragment + a TCP
+// fragment) COALESCE into one object under `mergeNodes` during ExpandGroups.
+//
+// It is closed instead by validateDuplicateNamesExpandedAST
+// (dup_names_expanded_6455.go), which re-runs these same three scanners on a
+// group-EXPANDED clone — where the coalescing has already happened — once per
+// cluster node so the verdict stays HA-symmetric.
 
 // emptyNameError builds the strict-path hard error for a quoted-empty name of the
 // given kind (e.g. "interface", "NAT source rule-set").

@@ -1,7 +1,6 @@
 package dataplane
 
 import (
-	"encoding/binary"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -215,13 +214,38 @@ func finalizeNATCounterIDs(result *CompileResult) {
 	}
 }
 
+// compileNAT resolves the source- and destination-NAT configuration into the
+// identifiers and runtime state that OUTLIVE the compile, and rejects the
+// configurations that cannot be enforced.
+//
+// What escapes this function, i.e. what it exists for after #6420:
+//
+//   - result.PoolIDs / result.NextPoolID — the source-NAT pool numbering the
+//     operator surfaces read back through ApplyResult (`show security nat
+//     source pool`, the REST/gRPC pool views, the Prometheus pool metrics) and
+//     that compileNAT64's auto-assign branch continues from.
+//   - result.NATCounterIDs — the per-rule translation hit counter IDs stamped
+//     onto the userspace config snapshot (buildSnapshotWithSchedulerStateAnd-
+//     NATCounters) and read back by every operator NAT surface.
+//   - result.AddrIDs / result.nextAddrID — the implicit "_snat_match_<cidr>"
+//     address-book entries resolveSNATMatchAddr synthesizes.
+//   - the persistent-NAT table (dp.GetPersistentNAT), which the conntrack GC
+//     and `show security nat source persistent-nat-table` read. This is the
+//     one dataplane call in this file that is NOT a shim no-op.
+//   - the errors: an unknown zone, an unknown pool, and a DNAT match/pool
+//     address that is a prefix rather than a host still fail the compile, and
+//     the #4960 validate-before-mutate pre-pass surfaces them ahead of the
+//     first host mutation.
+//
+// What it no longer does is BUILD eBPF NAT map records. The legacy
+// snat_rules / snat_rules_v6 / dnat_table / dnat_table_v6 / nat_pool_configs /
+// nat_pool_ips_v4 / nat_pool_ips_v6 / snat_egress_ips writes were retired with
+// the eBPF dataplane (#1373/#1476). The only production compile path is
+// Manager.CompileUserspaceShim, whose userspaceShimCompileDataplane implements
+// every NAT setter and every stale-NAT deleter as `return nil` (loader.go), and
+// the AF_XDP helper receives NAT policy through the config snapshot instead.
+// The record construction was therefore pure work whose product was discarded.
 func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
-	// Track written keys for populate-before-clear.
-	writtenSNAT := make(map[SNATKey]bool)
-	writtenSNATv6 := make(map[SNATKey]bool)
-	writtenDNAT := make(map[DNATKey]bool)
-	writtenDNATv6 := make(map[DNATKeyV6]bool)
-
 	// Clear stale persistent NAT pool configs before recompilation
 	if pnat := dp.GetPersistentNAT(); pnat != nil {
 		pnat.ClearPoolConfigs()
@@ -229,31 +253,18 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 
 	natCfg := &cfg.Security.NAT
 
-	// Clear stale SNAT egress IP map before repopulating.
-	dp.ClearSNATEgressIPs()
-
 	// Source NAT: allocate pool IDs and compile pools + rules
 	poolID := uint8(0)
 
-	// Track per-zone-pair v4/v6 rule indices for multiple SNAT rules
-	type zonePairIdx struct{ from, to uint16 }
-	v4RuleIdx := make(map[zonePairIdx]uint16)
-	v6RuleIdx := make(map[zonePairIdx]uint16)
-
-	// Cache compiled pool data to skip redundant parse+write when the same
-	// named pool is referenced by multiple SNAT rules.
-	type compiledPoolInfo struct {
-		hasV4, hasV6 bool
-	}
-	compiledPools := make(map[string]*compiledPoolInfo)
+	// Remember which named pools were already parsed so a pool referenced by
+	// several SNAT rules is registered — and logged — exactly once.
+	compiledPools := make(map[string]bool)
 
 	for _, rs := range natCfg.Source {
-		fromZone, ok := result.ZoneIDs[rs.FromZone]
-		if !ok {
+		if _, ok := result.ZoneIDs[rs.FromZone]; !ok {
 			return fmt.Errorf("source NAT from-zone %q not found", rs.FromZone)
 		}
-		toZone, ok := result.ZoneIDs[rs.ToZone]
-		if !ok {
+		if _, ok := result.ZoneIDs[rs.ToZone]; !ok {
 			return fmt.Errorf("source NAT to-zone %q not found", rs.ToZone)
 		}
 
@@ -264,7 +275,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				continue
 			}
 
-			// source-nat off: write exemption rule (no pool allocation)
+			// source-nat off: exemption rule (no pool allocation)
 			if rule.Then.Off {
 				// Resolve source addresses (supports bracket lists)
 				srcAddrs := rule.Match.SourceAddresses
@@ -278,7 +289,6 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					dstAddrs = []string{rule.Match.DestinationAddress}
 				}
 
-				zp := zonePairIdx{fromZone, toZone}
 				counterID := assignNATCounterID(result, NATCounterTypeSource, rs.Name, rule.Name)
 
 				for _, srcAddr := range srcAddrs {
@@ -294,44 +304,6 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 								rs.Name, rule.Name, dstAddr, err)
 						}
 
-						// Write v4 rule
-						val := SNATValue{
-							Mode:      SNATModeOff,
-							SrcAddrID: srcAddrID,
-							DstAddrID: dstAddrID,
-							// Vestigial: the legacy BPF snat_value carries a u16
-							// counter id, but the userspace runtime writes this
-							// struct through a no-op DataPlane and reads hits via
-							// the snapshot's u32 counter id instead (#2255).
-							CounterID: uint16(counterID),
-						}
-						ri := v4RuleIdx[zp]
-						if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
-							return fmt.Errorf("set snat off rule %s/%s: %w",
-								rs.Name, rule.Name, err)
-						}
-						writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-						v4RuleIdx[zp] = ri + 1
-
-						// Write v6 rule
-						val6 := SNATValueV6{
-							Mode:      SNATModeOff,
-							SrcAddrID: srcAddrID,
-							DstAddrID: dstAddrID,
-							// Vestigial: the legacy BPF snat_value carries a u16
-							// counter id, but the userspace runtime writes this
-							// struct through a no-op DataPlane and reads hits via
-							// the snapshot's u32 counter id instead (#2255).
-							CounterID: uint16(counterID),
-						}
-						ri6 := v6RuleIdx[zp]
-						if err := dp.SetSNATRuleV6(fromZone, toZone, ri6, val6); err != nil {
-							return fmt.Errorf("set snat_v6 off rule %s/%s: %w",
-								rs.Name, rule.Name, err)
-						}
-						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri6}] = true
-						v6RuleIdx[zp] = ri6 + 1
-
 						if !isValidationPass(dp) {
 							slog.Info("source NAT off rule compiled",
 								"rule-set", rs.Name, "rule", rule.Name,
@@ -346,11 +318,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			}
 
 			var curPoolID uint8
-			var hasV4, hasV6 bool
 
 			if rule.Then.Interface {
-				// Interface mode: populate snat_egress_ips with per-interface IPs
-				// so BPF picks the correct IP based on actual egress ifindex+vlan.
+				// Interface mode: resolve the egress zone's per-interface
+				// addresses. They no longer reach snat_egress_ips, but whether
+				// ANY of them resolves still decides whether this rule consumes
+				// a pool ID, so the resolution stays load-bearing.
 				toZoneCfg, ok := cfg.Security.Zones[rs.ToZone]
 				if !ok || len(toZoneCfg.Interfaces) == 0 {
 					slog.Warn("to-zone has no interfaces",
@@ -358,7 +331,6 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					continue
 				}
 
-				var poolCfg NATPoolConfig
 				var v4IPs []net.IP
 				var v6IPs []net.IP
 
@@ -409,29 +381,16 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						continue
 					}
 
-					// Populate snat_egress_ips for this (ifindex, vlan) pair
-					ekey := SNATEgressKey{
-						Ifindex: uint32(physIface.Index),
-						VlanID:  uint16(vlanID),
-					}
-					var eval SNATEgressValue
 					if unitV4 != nil {
-						eval.IPv4 = ipToUint32BE(unitV4)
 						v4IPs = append(v4IPs, unitV4)
 					}
 					if unitV6 != nil {
-						eval.IPv6 = ipTo16Bytes(unitV6)
 						v6IPs = append(v6IPs, unitV6)
 					}
-					if err := dp.SetSNATEgressIP(ekey, eval); err != nil {
-						slog.Warn("failed to set SNAT egress IP",
-							"interface", ifaceRef, "err", err)
-					} else {
-						if !isValidationPass(dp) {
-							slog.Info("SNAT egress IP set",
-								"interface", ifaceRef, "ifindex", physIface.Index,
-								"vlan", vlanID, "v4", unitV4, "v6", unitV6)
-						}
+					if !isValidationPass(dp) {
+						slog.Info("SNAT egress IP resolved",
+							"interface", ifaceRef, "ifindex", physIface.Index,
+							"vlan", vlanID, "v4", unitV4, "v6", unitV6)
 					}
 				}
 
@@ -443,39 +402,10 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					continue
 				}
 
-				poolCfg.InterfaceMode = 1
-				poolCfg.PortLow = 1024
-				poolCfg.PortHigh = 65535
+				// Interface pools are anonymous: they consume a pool ID but are
+				// never named in result.PoolIDs.
 				curPoolID = poolID
 				poolID++
-				hasV4 = len(v4IPs) > 0
-				hasV6 = len(v6IPs) > 0
-
-				// Write pool IPs + config (interface pools are unique per rule)
-				poolCfg.NumIPs = uint16(len(v4IPs))
-				poolCfg.NumIPsV6 = uint16(len(v6IPs))
-				for i, ip := range v4IPs {
-					if i >= int(MaxNATPoolIPsPerPool) {
-						break
-					}
-					if err := dp.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
-						return fmt.Errorf("set pool ip v4 %d/%d: %w", curPoolID, i, err)
-					}
-				}
-				for i, ip := range v6IPs {
-					if i >= int(MaxNATPoolIPsPerPool) {
-						break
-					}
-					if err := dp.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
-						return fmt.Errorf("set pool ip v6 %d/%d: %w", curPoolID, i, err)
-					}
-				}
-				if natCfg.AddressPersistent {
-					poolCfg.AddrPersistent = 1
-				}
-				if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
-					return fmt.Errorf("set pool config %d: %w", curPoolID, err)
-				}
 			} else {
 				// Pool mode: look up named pool
 				pool, ok := natCfg.SourcePools[rule.Then.PoolName]
@@ -484,13 +414,11 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						rule.Then.PoolName, rule.Name)
 				}
 
-				// Check if pool was already compiled — skip parse+write, reuse cached info.
-				if cp, cached := compiledPools[pool.Name]; cached {
+				// Check if pool was already compiled — skip the reparse.
+				if compiledPools[pool.Name] {
 					curPoolID = result.PoolIDs[pool.Name]
-					hasV4 = cp.hasV4
-					hasV6 = cp.hasV6
 				} else {
-					// First encounter: assign ID, parse addresses, write maps.
+					// First encounter: assign ID, parse addresses.
 					if existingID, exists := result.PoolIDs[pool.Name]; exists {
 						curPoolID = existingID
 					} else {
@@ -499,11 +427,10 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						poolID++
 					}
 
-					var poolCfg NATPoolConfig
+					// Parse pool addresses. They no longer reach nat_pool_ips_*,
+					// but the persistent-NAT table below is registered from them.
 					var v4IPs []net.IP
 					var v6IPs []net.IP
-
-					// Parse pool addresses
 					for _, addr := range pool.Addresses {
 						cidr := addr
 						if !strings.Contains(cidr, "/") {
@@ -523,71 +450,6 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						} else {
 							v6IPs = append(v6IPs, ip)
 						}
-					}
-
-					poolCfg.PortLow = uint16(pool.PortLow)
-					poolCfg.PortHigh = uint16(pool.PortHigh)
-					if poolCfg.PortLow == 0 {
-						poolCfg.PortLow = 1024
-					}
-					if poolCfg.PortHigh == 0 {
-						poolCfg.PortHigh = 65535
-					}
-
-					// Compile deterministic NAT fields
-					if pool.Deterministic != nil {
-						_, hostNet, err := net.ParseCIDR(pool.Deterministic.HostAddress)
-						if err == nil {
-							ones, bits := hostNet.Mask.Size()
-							portRange := int(poolCfg.PortHigh) - int(poolCfg.PortLow) + 1
-							poolCfg.BlockSize = uint16(pool.Deterministic.BlockSize)
-							poolCfg.BlocksPerIP = uint16(portRange / pool.Deterministic.BlockSize)
-
-							if bits == 128 {
-								// IPv6 host — deterministic mode 2
-								poolCfg.Deterministic = 2
-								poolCfg.HostPrefixLen = uint8(ones)
-								// Subscriber count capped by pool capacity
-								poolCfg.HostCount = uint32(len(v4IPs)) * uint32(poolCfg.BlocksPerIP)
-								ip16 := hostNet.IP.To16()
-								for i := 0; i < 4; i++ {
-									poolCfg.HostBaseV6[i] = binary.NativeEndian.Uint32(ip16[i*4 : (i+1)*4])
-								}
-							} else {
-								// IPv4 host — deterministic mode 1
-								hostCount := uint32(1) << uint(bits-ones)
-								poolCfg.Deterministic = 1
-								poolCfg.HostBase = ipToUint32BE(hostNet.IP.To4())
-								poolCfg.HostCount = hostCount
-							}
-						}
-					}
-
-					// Write pool IPs to maps
-					poolCfg.NumIPs = uint16(len(v4IPs))
-					poolCfg.NumIPsV6 = uint16(len(v6IPs))
-					for i, ip := range v4IPs {
-						if i >= int(MaxNATPoolIPsPerPool) {
-							break
-						}
-						if err := dp.SetNATPoolIPV4(uint32(curPoolID), uint32(i), ipToUint32BE(ip)); err != nil {
-							return fmt.Errorf("set pool ip v4 %d/%d: %w", curPoolID, i, err)
-						}
-					}
-					for i, ip := range v6IPs {
-						if i >= int(MaxNATPoolIPsPerPool) {
-							break
-						}
-						if err := dp.SetNATPoolIPV6(uint32(curPoolID), uint32(i), ipTo16Bytes(ip)); err != nil {
-							return fmt.Errorf("set pool ip v6 %d/%d: %w", curPoolID, i, err)
-						}
-					}
-
-					if natCfg.AddressPersistent {
-						poolCfg.AddrPersistent = 1
-					}
-					if err := dp.SetNATPoolConfig(uint32(curPoolID), poolCfg); err != nil {
-						return fmt.Errorf("set pool config %d: %w", curPoolID, err)
 					}
 
 					// Register persistent NAT pool config and IPs
@@ -627,14 +489,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						}
 					}
 
-					hasV4 = len(v4IPs) > 0
-					hasV6 = len(v6IPs) > 0
-					compiledPools[pool.Name] = &compiledPoolInfo{hasV4: hasV4, hasV6: hasV6}
+					compiledPools[pool.Name] = true
 				}
 			}
 
-			// Resolve SNAT match addresses (supports bracket lists).
-			// Creates one BPF rule per (src, dst) address pair (Cartesian product).
+			// Resolve SNAT match addresses (supports bracket lists). Each
+			// distinct CIDR gets an implicit address-book ID in result.AddrIDs.
 			srcAddrs := rule.Match.SourceAddresses
 			if len(srcAddrs) == 0 {
 				srcAddrs = []string{rule.Match.SourceAddress}
@@ -643,8 +503,6 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			if len(dstAddrs) == 0 {
 				dstAddrs = []string{rule.Match.DestinationAddress}
 			}
-
-			zp := zonePairIdx{fromZone, toZone}
 
 			// Assign NAT rule counter ID (shared across expanded address pairs)
 			counterID := assignNATCounterID(result, NATCounterTypeSource, rs.Name, rule.Name)
@@ -662,78 +520,25 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							rs.Name, rule.Name, dstAddr, err)
 					}
 
-					// Write SNAT rule (v4)
-					if hasV4 {
-						val := SNATValue{
-							Mode:      curPoolID,
-							SrcAddrID: srcAddrID,
-							DstAddrID: dstAddrID,
-							// Vestigial: the legacy BPF snat_value carries a u16
-							// counter id, but the userspace runtime writes this
-							// struct through a no-op DataPlane and reads hits via
-							// the snapshot's u32 counter id instead (#2255).
-							CounterID: uint16(counterID),
-						}
-						ri := v4RuleIdx[zp]
-						if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
-							return fmt.Errorf("set snat rule %s/%s: %w",
-								rs.Name, rule.Name, err)
-						}
-						writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-						v4RuleIdx[zp] = ri + 1
-						if !isValidationPass(dp) {
-							slog.Info("source NAT rule compiled",
-								"rule-set", rs.Name, "rule", rule.Name,
-								"from", rs.FromZone, "to", rs.ToZone,
-								"pool_id", curPoolID, "rule_idx", ri,
-								"counter_id", counterID,
-								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-								"src_addr", srcAddr, "dst_addr", dstAddr)
-						}
+					if !isValidationPass(dp) {
+						slog.Info("source NAT rule compiled",
+							"rule-set", rs.Name, "rule", rule.Name,
+							"from", rs.FromZone, "to", rs.ToZone,
+							"pool_id", curPoolID,
+							"counter_id", counterID,
+							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+							"src_addr", srcAddr, "dst_addr", dstAddr)
 					}
-
-					// Write SNAT rule (v6)
-					if hasV6 {
-						val := SNATValueV6{
-							Mode:      curPoolID,
-							SrcAddrID: srcAddrID,
-							DstAddrID: dstAddrID,
-							// Vestigial: the legacy BPF snat_value carries a u16
-							// counter id, but the userspace runtime writes this
-							// struct through a no-op DataPlane and reads hits via
-							// the snapshot's u32 counter id instead (#2255).
-							CounterID: uint16(counterID),
-						}
-						ri := v6RuleIdx[zp]
-						if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {
-							return fmt.Errorf("set snat_v6 rule %s/%s: %w",
-								rs.Name, rule.Name, err)
-						}
-						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
-						v6RuleIdx[zp] = ri + 1
-						if !isValidationPass(dp) {
-							slog.Info("source NAT v6 rule compiled",
-								"rule-set", rs.Name, "rule", rule.Name,
-								"from", rs.FromZone, "to", rs.ToZone,
-								"pool_id", curPoolID, "rule_idx", ri,
-								"counter_id", counterID,
-								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-								"src_addr", srcAddr, "dst_addr", dstAddr)
-						}
-					}
-				} // end dstAddr loop
-			} // end srcAddr loop
+				}
+			}
 		}
 	}
 
 	// Destination NAT
 	if natCfg.Destination != nil {
 		for _, rs := range natCfg.Destination.RuleSets {
-			var fromZone uint16
 			if rs.FromZone != "" {
-				var ok bool
-				fromZone, ok = result.ZoneIDs[rs.FromZone]
-				if !ok {
+				if _, ok := result.ZoneIDs[rs.FromZone]; !ok {
 					return fmt.Errorf("destination NAT from-zone %q not found", rs.FromZone)
 				}
 			}
@@ -813,131 +618,39 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					}
 				}
 
-				// Resolve application match to protocol+ports if specified.
-				// Supports single apps and multi-term application-sets.
-				type dnatAppTerm struct {
-					proto string
-					ports []int
-				}
-				var appTerms []dnatAppTerm
-
+				// Resolve the application match so an unresolvable application
+				// or application-set still warns. The protocol/port expansion
+				// this used to drive existed only to key dnat_table entries;
+				// the userspace snapshot carries the rule's own match instead.
 				if rule.Match.Application != "" {
 					userApps := cfg.Applications.Applications
-					// Try single application first
-					app, found := config.ResolveApplication(rule.Match.Application, userApps)
-					if found {
-						appTerms = append(appTerms, dnatAppTerm{proto: app.Protocol, ports: appPortsFromSpec(app.DestinationPort)})
-					} else if _, isSet := cfg.Applications.ApplicationSets[rule.Match.Application]; isSet {
-						// Expand application-set to individual terms
-						expanded, eerr := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
-						if eerr != nil {
-							slog.Warn("DNAT expand application-set failed",
-								"rule", rule.Name, "application", rule.Match.Application, "err", eerr)
-						} else {
-							for _, termName := range expanded {
-								tApp, ok := config.ResolveApplication(termName, userApps)
-								if !ok {
-									slog.Warn("DNAT application-set term not found",
-										"rule", rule.Name, "term", termName)
-									continue
-								}
-								appTerms = append(appTerms, dnatAppTerm{proto: tApp.Protocol, ports: appPortsFromSpec(tApp.DestinationPort)})
-							}
-						}
-					} else {
-						slog.Warn("DNAT application not found, ignoring",
-							"rule", rule.Name, "application", rule.Match.Application)
-					}
-				}
-
-				// If no application terms resolved, use explicit match values
-				if len(appTerms) == 0 {
-					appTerms = []dnatAppTerm{{proto: rule.Match.Protocol, ports: rule.Match.DestinationPorts}}
-				}
-
-				for _, term := range appTerms {
-					// Build list of destination ports for this term
-					var dstPorts []uint16
-					if len(term.ports) > 0 {
-						for _, p := range term.ports {
-							dstPorts = append(dstPorts, uint16(p))
-						}
-					} else if rule.Match.DestinationPort != 0 {
-						dstPorts = []uint16{uint16(rule.Match.DestinationPort)}
-					} else {
-						dstPorts = []uint16{0}
-					}
-
-					for _, dstPort := range dstPorts {
-						poolPort := dstPort
-						if pool.Port != 0 {
-							poolPort = uint16(pool.Port)
-						}
-
-						// Determine protocol(s) to insert DNAT entries for.
-						var protos []uint8
-						if term.proto != "" {
-							protos = []uint8{protocolNumber(term.proto)}
-						} else if dstPort != 0 {
-							protos = []uint8{6} // TCP default for port-based DNAT
-						} else {
-							protos = []uint8{6, 17} // both TCP and UDP for port-less DNAT
-						}
-
-						for _, proto := range protos {
-							// Route to v4 or v6 DNAT table based on match IP
-							if matchIP.To4() != nil {
-								dk := DNATKey{
-									Protocol: proto,
-									DstIP:    ipToUint32BE(matchIP),
-									// #2406: dnat_table KEY port is host-order
-									// numeric (the AF_XDP shim reader builds its
-									// lookup key from u16::from_be_bytes -> host
-									// order). dstPort is already host-order here,
-									// so store it raw (NOT htons).
-									DstPort:  dstPort,
-									FromZone: fromZone,
-								}
-								dv := DNATValue{
-									NewDstIP:   ipToUint32BE(poolIP),
-									NewDstPort: htons(poolPort),
-									Flags:      DNATFlagStatic,
-								}
-								if err := dp.SetDNATEntry(dk, dv); err != nil {
-									return fmt.Errorf("set dnat entry %s/%s proto %d: %w",
-										rs.Name, rule.Name, proto, err)
-								}
-								writtenDNAT[dk] = true
+					if _, found := config.ResolveApplication(rule.Match.Application, userApps); !found {
+						if _, isSet := cfg.Applications.ApplicationSets[rule.Match.Application]; isSet {
+							// Expand application-set to individual terms
+							expanded, eerr := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
+							if eerr != nil {
+								slog.Warn("DNAT expand application-set failed",
+									"rule", rule.Name, "application", rule.Match.Application, "err", eerr)
 							} else {
-								dk := DNATKeyV6{
-									Protocol: proto,
-									DstIP:    ipTo16Bytes(matchIP),
-									// #2406: host-order KEY port (see v4 above).
-									DstPort:  dstPort,
-									FromZone: fromZone,
+								for _, termName := range expanded {
+									if _, ok := config.ResolveApplication(termName, userApps); !ok {
+										slog.Warn("DNAT application-set term not found",
+											"rule", rule.Name, "term", termName)
+									}
 								}
-								dv := DNATValueV6{
-									NewDstIP:   ipTo16Bytes(poolIP),
-									NewDstPort: htons(poolPort),
-									Flags:      DNATFlagStatic,
-								}
-								if err := dp.SetDNATEntryV6(dk, dv); err != nil {
-									return fmt.Errorf("set dnat_v6 entry %s/%s proto %d: %w",
-										rs.Name, rule.Name, proto, err)
-								}
-								writtenDNATv6[dk] = true
 							}
-
-							if !isValidationPass(dp) {
-								slog.Info("destination NAT rule compiled",
-									"rule-set", rs.Name, "rule", rule.Name,
-									"match_ip", matchIP, "match_port", dstPort,
-									"proto", proto,
-									"pool", pool.Name, "pool_ip", poolIP,
-									"pool_port", poolPort)
-							}
+						} else {
+							slog.Warn("DNAT application not found, ignoring",
+								"rule", rule.Name, "application", rule.Match.Application)
 						}
 					}
+				}
+
+				if !isValidationPass(dp) {
+					slog.Info("destination NAT rule compiled",
+						"rule-set", rs.Name, "rule", rule.Name,
+						"match_ip", matchIP,
+						"pool", pool.Name, "pool_ip", poolIP)
 				}
 			}
 		}
@@ -946,21 +659,21 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Record highest pool ID so compileNAT64 can auto-assign additional pools.
 	result.NextPoolID = poolID
 
-	// Delete stale NAT entries and zero unused pool slots.
-	dp.DeleteStaleSNATRules(writtenSNAT)
-	dp.DeleteStaleSNATRulesV6(writtenSNATv6)
-	dp.DeleteStaleDNATStatic(writtenDNAT)
-	dp.DeleteStaleDNATStaticV6(writtenDNATv6)
-	dp.ZeroStaleNATPoolConfigs(uint32(poolID))
-
 	return nil
 }
 
+// compileStaticNAT validates the static-NAT rule-sets and assigns their
+// per-rule translation hit counter IDs.
+//
+// The bidirectional static_nat_v4 / static_nat_v6 map entries this used to
+// write went with the eBPF dataplane (#1373/#1476/#6420): SetStaticNATEntryV4
+// and SetStaticNATEntryV6 are `return nil` on the only production compile path
+// (userspaceShimCompileDataplane, loader.go), and the AF_XDP helper installs
+// static NAT from the config snapshot. What still escapes is
+// result.NATCounterIDs — the ID `show security nat static rule` reads hits
+// back through — and the mixed-address-family rejection, which the #4960
+// pre-pass surfaces before the first host mutation.
 func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
-	// Track written keys for populate-before-clear.
-	writtenV4 := make(map[StaticNATKeyV4]bool)
-	writtenV6 := make(map[StaticNATKeyV6]bool)
-
 	count := 0
 	for _, rs := range cfg.Security.NAT.Static {
 		for _, rule := range rs.Rules {
@@ -1018,33 +731,6 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			// this rule and `show security nat static rule` reports non-zero.
 			_ = assignNATCounterID(result, NATCounterTypeStatic, rs.Name, rule.Name)
 
-			// Insert DNAT entry (external -> internal) and SNAT entry (internal -> external)
-			if extIsV4 && intIsV4 {
-				extU32 := ipToUint32BE(extIP)
-				intU32 := ipToUint32BE(intIP)
-
-				if err := dp.SetStaticNATEntryV4(extU32, StaticNATDNAT, intU32); err != nil {
-					return fmt.Errorf("set static nat dnat v4 %s: %w", rule.Name, err)
-				}
-				writtenV4[StaticNATKeyV4{IP: extU32, Direction: StaticNATDNAT}] = true
-				if err := dp.SetStaticNATEntryV4(intU32, StaticNATSNAT, extU32); err != nil {
-					return fmt.Errorf("set static nat snat v4 %s: %w", rule.Name, err)
-				}
-				writtenV4[StaticNATKeyV4{IP: intU32, Direction: StaticNATSNAT}] = true
-			} else {
-				extBytes := ipTo16Bytes(extIP)
-				intBytes := ipTo16Bytes(intIP)
-
-				if err := dp.SetStaticNATEntryV6(extBytes, StaticNATDNAT, intBytes); err != nil {
-					return fmt.Errorf("set static nat dnat v6 %s: %w", rule.Name, err)
-				}
-				writtenV6[StaticNATKeyV6{IP: extBytes, Direction: StaticNATDNAT}] = true
-				if err := dp.SetStaticNATEntryV6(intBytes, StaticNATSNAT, extBytes); err != nil {
-					return fmt.Errorf("set static nat snat v6 %s: %w", rule.Name, err)
-				}
-				writtenV6[StaticNATKeyV6{IP: intBytes, Direction: StaticNATSNAT}] = true
-			}
-
 			count++
 			if !isValidationPass(dp) {
 				slog.Info("static NAT rule compiled",
@@ -1058,54 +744,26 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 		slog.Info("static NAT compilation complete", "entries", count)
 	}
 
-	// Delete stale static NAT entries.
-	dp.DeleteStaleStaticNAT(writtenV4, writtenV6)
-
 	return nil
 }
 
-// nptv6Adjustment computes the RFC 6296 ones'-complement adjustment
-// from two /48 prefixes. The adjustment is stored in native byte order
-// to match how BPF reads 16-bit words from memory via pointer cast.
+// compileNPTv6 VALIDATES the NPTv6 rules in cfg. Since #7268 it writes nothing:
+// the eBPF `nptv6_rules` map surface it used to fill is retired, and the AF_XDP
+// helper builds its own NPTv6 state from the config snapshot
+// (buildNptv6Snapshots copies Match/Then out independently) and computes its own
+// RFC 6296 adjustment (userspace-dp/src/nptv6.rs `compute_adjustment`).
 //
-// Ones'-complement arithmetic is endian-independent, so the computation
-// can use either byte order as long as it's consistent. We use native
-// (little-endian on x86) since BPF reads `__u16 *w = (__u16 *)addr`
-// in native order.
-// nptv6Adjustment computes the ones'-complement adjustment for NPTv6
-// prefix translation.  prefixBytes is 6 for /48 or 8 for /64.
-func nptv6Adjustment(internal, external []byte) uint16 {
-	// Read prefix words in native byte order (same as BPF __u16* cast).
-	readWord := func(b []byte) uint16 {
-		return uint16(b[1])<<8 | uint16(b[0])
-	}
-
-	words := len(internal) / 2
-
-	var sumInt uint32
-	for i := 0; i < words; i++ {
-		sumInt += uint32(readWord(internal[i*2 : i*2+2]))
-	}
-	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
-	sumInt = (sumInt & 0xFFFF) + (sumInt >> 16)
-
-	var sumExt uint32
-	for i := 0; i < words; i++ {
-		sumExt += uint32(readWord(external[i*2 : i*2+2]))
-	}
-	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
-	sumExt = (sumExt & 0xFFFF) + (sumExt >> 16)
-
-	// adjustment = S_int - S_ext = ~S_ext +' S_int
-	adj := uint32(^uint16(sumExt)) + uint32(uint16(sumInt))
-	adj = (adj & 0xFFFF) + (adj >> 16)
-	adj = (adj & 0xFFFF) + (adj >> 16)
-
-	return uint16(adj)
-}
-
+// What remains is load-bearing and is the reason this is still a compile PHASE
+// rather than a deleted function: it is the #4960 validate-before-mutate
+// pre-pass deciding whether an apply can succeed, carrying the #6894 r9 / #7077
+// reject-vs-warn split. A rule the helper would REFUSE is a hard error here, so
+// the failure lands before compileZones mutates the host; a rule the helper
+// would DROP or would INSTALL keeps warn-and-skip, because erroring on those
+// would fail an apply that succeeds today.
+//
+// dp is still taken so the phase keeps the shared row signature, and it is still
+// READ — isValidationPass(dp) gates the log records so the pre-pass stays quiet.
 func compileNPTv6(dp DataPlane, cfg *config.Config) error {
-	written := make(map[NPTv6Key]bool)
 	count := 0
 
 	for _, rs := range cfg.Security.NAT.Static {
@@ -1236,35 +894,17 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 				continue
 			}
 
-			// Prefix byte count: 6 for /48, 8 for /64
-			prefixBytes := extOnes / 8         // 6 or 8
-			prefixWords := uint8(extOnes / 16) // 3 or 4
-
-			// Extract prefix bytes and compute adjustment
-			extSlice := ext16[:prefixBytes]
-			intSlice := int16[:prefixBytes]
-			adj := nptv6Adjustment(intSlice, extSlice)
-
-			// Build keys/values with zero-padded [8]byte prefix
-			var extPrefix, intPrefix [8]byte
-			copy(extPrefix[:], extSlice)
-			copy(intPrefix[:], intSlice)
-
-			// Inbound entry: external prefix → internal prefix (rewrite dst)
-			inKey := NPTv6Key{Prefix: extPrefix, Direction: NPTv6Inbound, PrefixLen: uint8(extOnes)}
-			inVal := NPTv6Value{XlatPrefix: intPrefix, Adjustment: adj, PrefixWords: prefixWords}
-			if err := dp.SetNPTv6Rule(inKey, inVal); err != nil {
-				return fmt.Errorf("set nptv6 inbound %s: %w", rule.Name, err)
-			}
-			written[inKey] = true
-
-			// Outbound entry: internal prefix → external prefix (rewrite src)
-			outKey := NPTv6Key{Prefix: intPrefix, Direction: NPTv6Outbound, PrefixLen: uint8(extOnes)}
-			outVal := NPTv6Value{XlatPrefix: extPrefix, Adjustment: adj, PrefixWords: prefixWords}
-			if err := dp.SetNPTv6Rule(outKey, outVal); err != nil {
-				return fmt.Errorf("set nptv6 outbound %s: %w", rule.Name, err)
-			}
-			written[outKey] = true
+			// #7268: the eBPF nptv6_rules writes that used to close this
+			// branch are gone. What remains — every parse and disposition
+			// decision above — is NOT dead: it is the #4960
+			// validate-before-mutate pre-pass deciding whether an apply can
+			// succeed, and the #6894 r9 / #7077 reject-vs-warn split that
+			// decides which faults are hard errors. The helper builds its own
+			// NPTv6 state from the config (buildNptv6Snapshots copies
+			// Match/Then out independently) and computes its own adjustment
+			// (userspace-dp/src/nptv6.rs compute_adjustment), so the rule still
+			// reaches the enforcement plane; only this compiler's write of the
+			// retired map surface is removed.
 
 			count++
 			if !isValidationPass(dp) {
@@ -1280,21 +920,23 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 		slog.Info("nptv6 compilation complete", "rules", count)
 	}
 
-	dp.DeleteStaleNPTv6(written)
 	return nil
 }
 
+// compileNAT64 validates the NAT64 rule-sets and resolves each one's source
+// pool, auto-assigning a pool ID to a pool that no SNAT rule referenced.
+//
+// The nat64_configs / nat64_count / nat64_prefix_map and nat_pool_* writes
+// went with the eBPF dataplane (#1373/#1476/#6420) — SetNAT64Config,
+// SetNAT64Count, SetNATPoolIPV4/V6 and SetNATPoolConfig are `return nil` on the
+// only production compile path (userspaceShimCompileDataplane, loader.go), and
+// the AF_XDP helper builds its NAT64 state from the config snapshot. What still
+// escapes is result.PoolIDs / result.NextPoolID (the pool numbering the
+// operator surfaces read back) plus the prefix and source-pool rejections the
+// #4960 pre-pass surfaces before the first host mutation.
 func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error {
-	// Track written prefixes for populate-before-clear.
-	writtenPrefixes := make(map[NAT64PrefixKey]bool)
-
 	ruleSets := cfg.Security.NAT.NAT64
 	if len(ruleSets) == 0 {
-		// Clear stale NAT64 state when all rule-sets are removed.
-		if err := dp.SetNAT64Count(0); err != nil {
-			return fmt.Errorf("clear NAT64 count: %w", err)
-		}
-		dp.DeleteStaleNAT64(0, writtenPrefixes)
 		return nil
 	}
 
@@ -1314,19 +956,9 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		if ones != 96 {
 			return fmt.Errorf("NAT64 rule-set %q: prefix must be /96, got /%d", rs.Name, ones)
 		}
-
-		// Extract first 96 bits as 3 x uint32.
-		// BPF stores these as __be32 (raw network bytes). cilium/ebpf serializes
-		// Go uint32 using native endian, so use NativeEndian.Uint32 on the raw
-		// IP bytes to preserve the byte pattern (same as ipToUint32BE).
-		ip16 := ip.To16()
-		if ip16 == nil {
+		if ip.To16() == nil {
 			return fmt.Errorf("NAT64 rule-set %q: prefix is not IPv6", rs.Name)
 		}
-		var prefix [3]uint32
-		prefix[0] = binary.NativeEndian.Uint32(ip16[0:4])
-		prefix[1] = binary.NativeEndian.Uint32(ip16[4:8])
-		prefix[2] = binary.NativeEndian.Uint32(ip16[8:12])
 
 		// Look up the source pool ID. If the pool was defined in source NAT
 		// but not referenced by any SNAT rule (e.g. interface-mode rules), we
@@ -1343,16 +975,8 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			result.PoolIDs[pool.Name] = newID
 			poolID = newID
 
-			// Populate pool config and IPs.
-			var pcfg NATPoolConfig
-			pcfg.PortLow = uint16(pool.PortLow)
-			pcfg.PortHigh = uint16(pool.PortHigh)
-			if pcfg.PortLow == 0 {
-				pcfg.PortLow = 1024
-			}
-			if pcfg.PortHigh == 0 {
-				pcfg.PortHigh = 65535
-			}
+			// Count the pool's usable addresses. The addresses no longer reach
+			// nat_pool_ips_*, but an EMPTY pool is still a hard error.
 			var numV4, numV6 int
 			for _, addr := range pool.Addresses {
 				cidr := addr
@@ -1368,16 +992,8 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 					continue
 				}
 				if pip4 := pip.To4(); pip4 != nil && numV4 < int(MaxNATPoolIPsPerPool) {
-					if err := dp.SetNATPoolIPV4(uint32(newID), uint32(numV4), ipToUint32BE(pip4)); err != nil {
-						return fmt.Errorf("NAT64 rule-set %q: set pool IPv4 %d/%d: %w",
-							rs.Name, newID, numV4, err)
-					}
 					numV4++
 				} else if pip.To16() != nil && numV6 < int(MaxNATPoolIPsPerPool) {
-					if err := dp.SetNATPoolIPV6(uint32(newID), uint32(numV6), ipTo16Bytes(pip)); err != nil {
-						return fmt.Errorf("NAT64 rule-set %q: set pool IPv6 %d/%d: %w",
-							rs.Name, newID, numV6, err)
-					}
 					numV6++
 				}
 			}
@@ -1385,26 +1001,11 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				return fmt.Errorf("NAT64 rule-set %q: source pool %q has no valid addresses",
 					rs.Name, pool.Name)
 			}
-			pcfg.NumIPs = uint16(numV4)
-			pcfg.NumIPsV6 = uint16(numV6)
-			if err := dp.SetNATPoolConfig(uint32(newID), pcfg); err != nil {
-				return fmt.Errorf("NAT64 rule-set %q: set pool config %d: %w",
-					rs.Name, newID, err)
-			}
 			if !isValidationPass(dp) {
 				slog.Info("auto-assigned NAT64 source pool",
 					"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
 			}
 		}
-
-		nat64Cfg := NAT64Config{
-			Prefix:     prefix,
-			SNATPoolID: poolID,
-		}
-		if err := dp.SetNAT64Config(count, nat64Cfg); err != nil {
-			return fmt.Errorf("NAT64 rule-set %q: set config: %w", rs.Name, err)
-		}
-		writtenPrefixes[NAT64PrefixKey{Prefix: nat64Cfg.Prefix}] = true
 
 		if !isValidationPass(dp) {
 			slog.Info("compiled NAT64 prefix",
@@ -1413,13 +1014,6 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 		count++
 	}
-
-	if err := dp.SetNAT64Count(count); err != nil {
-		return fmt.Errorf("set NAT64 count: %w", err)
-	}
-
-	// Delete stale NAT64 entries.
-	dp.DeleteStaleNAT64(count, writtenPrefixes)
 
 	if !isValidationPass(dp) {
 		slog.Info("NAT64 compilation complete", "prefixes", count)

@@ -82,13 +82,18 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		return nil, err
 	}
 	snap := &ConfigSnapshot{
-		Version:         ProtocolVersion,
-		Generation:      generation,
-		FIBGeneration:   fibGeneration,
-		GeneratedAt:     time.Now().UTC(),
-		Capabilities:    caps,
-		MapPins:         userspaceMapPins(),
-		Userspace:       ucfg,
+		Version:       ProtocolVersion,
+		Generation:    generation,
+		FIBGeneration: fibGeneration,
+		GeneratedAt:   time.Now().UTC(),
+		Capabilities:  caps,
+		MapPins:       userspaceMapPins(),
+		Userspace:     ucfg,
+		// #6311: the chassis-cluster node id becomes the high bit of every
+		// worker's session-id namespace on the helper. Read from the compiled
+		// config's cluster stanza; absent/standalone leaves it 0, which is the
+		// pre-#6311 layout bit for bit.
+		NodeID:          clusterNodeID(cfg),
 		Zones:           buildZoneSnapshots(cfg),
 		Interfaces:      interfaces,
 		Fabrics:         buildFabricSnapshotsFrom(cfg, liveXfrm),
@@ -199,4 +204,23 @@ func userspaceMapPins() UserspaceMapPins {
 		DnatTableV6: dataplane.UserspaceDnatTableV6PinPath(),
 		Trace:       dataplane.UserspaceTracePinPath(),
 	}
+}
+
+// clusterNodeID reports the chassis-cluster node id from the compiled config,
+// or 0 when the node is standalone or has no cluster stanza (#6311).
+//
+// The id is bounded to 0..1 upstream — parseNodeIDFileContent rejects anything
+// else when reading /etc/xpf/node-id, the config compiler validates the `chassis
+// cluster node` leaf, and cluster.IsSupportedClusterNodeID pins the two-node
+// topology. Narrowing here is defence in depth for the wire field, not a policy
+// decision: the helper uses the value as a single discriminator BIT, so folding
+// an impossible third node onto 0 is what it would do anyway.
+func clusterNodeID(cfg *config.Config) uint8 {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return 0
+	}
+	if cfg.Chassis.Cluster.NodeID <= 0 {
+		return 0
+	}
+	return 1
 }

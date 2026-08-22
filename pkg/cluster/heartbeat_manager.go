@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -11,6 +12,14 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// ErrHeartbeatStartSuperseded reports that a StartHeartbeat was overtaken by a
+// StopHeartbeat while it was creating its sockets, so it declined to publish
+// (#7257). It is a lifecycle outcome, not a failure: the caller asked for a
+// heartbeat that the cluster has since torn down. A bind-retry loop must treat
+// it as terminal — retrying would race the same teardown again, and on success
+// would resurrect a heartbeat the teardown exists to remove.
+var ErrHeartbeatStartSuperseded = errors.New("cluster: heartbeat start superseded by teardown")
 
 // heartbeatUDPNetwork returns the UDP network string ("udp4" or "udp6") for a
 // literal control-link IP so the heartbeat sockets follow the configured
@@ -52,6 +61,26 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	// Stop any heartbeat that is already running before installing a new one.
 	// Safe to call unconditionally — it is a no-op when nothing is running.
 	m.StopHeartbeat()
+
+	// #7257: the lifecycle tenure this start belongs to.
+	//
+	// Captured HERE, deliberately — after the #4033 idempotent teardown above,
+	// not at function entry. That teardown is a StopHeartbeat, so it bumps
+	// hbEpoch too; an entry-time capture would compare against a value this
+	// call had itself invalidated and every start would refuse to publish.
+	// The window that actually needs guarding is exactly the one that opens
+	// now: socket creation is unbounded in time (two binds, possibly against a
+	// VRF that is still settling), and an EXTERNAL StopHeartbeat landing in it
+	// must supersede us.
+	m.mu.RLock()
+	startEpoch := m.hbEpoch
+	hook := m.hbStartInWindowHook
+	m.mu.RUnlock()
+	// Test seam: land a concurrent teardown inside the guarded window. nil in
+	// production. Called with no lock held — the hook takes m.mu itself.
+	if hook != nil {
+		hook()
+	}
 
 	m.mu.Lock()
 	interval := m.hbInterval
@@ -105,15 +134,38 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	sendConn := sendPkt.(*net.UDPConn)
 
 	m.mu.Lock()
-	m.hbSender = newHeartbeatSender(m, sendConn, peer, interval)
-	m.hbReceiver = newHeartbeatReceiver(m, recvConn, threshold, interval)
+	// #7257: refuse a start that a teardown superseded. StopHeartbeat bumps
+	// hbEpoch under this same lock, so comparing the entry epoch HERE — in the
+	// critical section that publishes — makes "was I superseded?" and "publish"
+	// atomic with respect to it. Socket creation above is unbounded in time (two
+	// binds, possibly against a VRF that is still settling), so a stop landing in
+	// that gap is not theoretical.
+	if m.hbEpoch != startEpoch {
+		m.mu.Unlock()
+		recvConn.Close()
+		sendConn.Close()
+		slog.Info("cluster: heartbeat start superseded by a teardown, not publishing",
+			"local", localAddr, "peer", peerAddr)
+		return ErrHeartbeatStartSuperseded
+	}
+	sender := newHeartbeatSender(m, sendConn, peer, interval)
+	receiver := newHeartbeatReceiver(m, recvConn, threshold, interval)
+	m.hbSender = sender
+	m.hbReceiver = receiver
 	m.hbLocalAddr = localAddr
 	m.hbPeerAddr = peerAddr
 	m.hbVRFDevice = vrfDevice
+	// Start the LOCALS, and start them INSIDE the critical section (#7257).
+	// Locals because the pre-#7257 code re-read m.hbReceiver/m.hbSender after
+	// unlocking, which raced StopHeartbeat nilling them — a nil-deref panic if
+	// the stop won. Inside because publishing and starting must be one step: a
+	// stop that interleaves between them would capture the handles and stop
+	// goroutines that had not been spawned yet, and the spawns would then run
+	// with nothing able to stop them. start() only spawns (`go run()` /
+	// `go readLoop()` + `go timeoutLoop()`), so it cannot block on this lock.
+	receiver.start()
+	sender.start()
 	m.mu.Unlock()
-
-	m.hbReceiver.start()
-	m.hbSender.start()
 
 	slog.Info("cluster: heartbeat started",
 		"local", localAddr, "peer", peerAddr,
@@ -162,6 +214,12 @@ func (m *Manager) StopHeartbeat() {
 	receiver := m.hbReceiver
 	m.hbSender = nil
 	m.hbReceiver = nil
+	// #7257: supersede any StartHeartbeat that is mid-flight. It captured the
+	// previous epoch on entry and compares it under this lock before publishing,
+	// so from here on it cannot install a pair this Stop would never see.
+	// RestartHeartbeat is unaffected: it stops first, and the StartHeartbeat it
+	// then calls captures the POST-bump epoch on its own entry.
+	m.hbEpoch++
 	m.mu.Unlock()
 
 	if sender != nil {

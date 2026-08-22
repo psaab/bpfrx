@@ -889,7 +889,7 @@ pub(crate) enum Nat64Match {
     /// untouched.
     IneligibleSource,
     /// #6475: the extracted embedded IPv4 DESTINATION is non-global per
-    /// RFC 6052 §2.2 — one of `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`,
+    /// RFC 6052 §3.1 — one of `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`,
     /// `224.0.0.0/4`, or `240.0.0.0/4` (which subsumes `255.255.255.255/32`).
     /// Pre-gate, `64:ff9b::127.0.0.1` classified `MatchReady(127.0.0.1)` and,
     /// with lo0 configured, resolved LocalDelivery to the localhost-only
@@ -1246,10 +1246,13 @@ impl Nat64State {
             .any(|prefix| octets[..12] == prefix.prefix_bytes)
     }
 
-    /// #6475: RFC 6052 §2.2 non-global embedded-IPv4 screen. A NAT64 prefix
-    /// (the Well-Known Prefix 64:ff9b::/96 MUST, and any configured Pref64 here
-    /// is held to the same bar) MUST NOT translate an embedded IPv4 address
-    /// that is not globally routable. Pre-gate, `match_ipv6_dest` extracted the
+    /// #6475: RFC 6052 §3.1 non-global embedded-IPv4 screen. §3.1 is normative
+    /// for the Well-Known Prefix 64:ff9b::/96 — an address translator "MUST NOT
+    /// translate packets in which an address is composed of the Well-Known
+    /// Prefix and a non-global IPv4 address; they MUST drop these packets".
+    /// Any configured Pref64 is held to the same bar here, which is stricter
+    /// than the RFC requires and is a deliberate hardening choice, not a
+    /// restatement of §3.1. Pre-gate, `match_ipv6_dest` extracted the
     /// low 32 bits unconditionally, so `64:ff9b::127.0.0.1` classified
     /// `MatchReady(127.0.0.1)` and — with lo0 configured, whose addresses land
     /// in `state.local_v4` (`afxdp/forwarding_build/interfaces.rs`) — resolved
@@ -1269,8 +1272,13 @@ impl Nat64State {
     ///                          `255.255.255.255/32` limited broadcast and the
     ///                          `<prefix>::ffff:ffff` upper boundary.
     ///
-    /// RFC 6052 §2.2 also names RFC 1918 private space as non-global; the issue
-    /// scopes that screening to OPTIONAL even for the WKP (an NSP deployment may
+    /// §3.1 does not enumerate the non-global ranges itself: it defines them by
+    /// reference, as "those defined in [RFC1918] or listed in Section 3 of
+    /// [RFC5735]". Every class screened above is an RFC 5735 §3 entry, cited to
+    /// its defining RFC rather than to the reference chain.
+    ///
+    /// That reference also reaches RFC 1918 private space; the issue scopes
+    /// screening it to OPTIONAL even for the WKP (an NSP deployment may
     /// legitimately translate to internal v4), so RFC 1918 / TEST-NET embedded
     /// destinations still translate — pinned by the global-control test.
     fn embedded_v4_is_non_global(v4: Ipv4Addr) -> bool {
@@ -1315,7 +1323,7 @@ impl Nat64State {
     /// so an ineligible source is rejected before translation.
     ///
     /// #6475: a prefix-matched destination whose extracted embedded IPv4 is
-    /// non-global per RFC 6052 §2.2 (see [`Self::embedded_v4_is_non_global`])
+    /// non-global per RFC 6052 §3.1 (see [`Self::embedded_v4_is_non_global`])
     /// now returns [`Nat64Match::IneligibleDestination`] — fail-closed with a
     /// distinct counter — BEFORE the pool check, so input validation precedes
     /// the capacity/config report and the packet never reaches route lookup,

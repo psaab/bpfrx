@@ -162,8 +162,14 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	// management-plane exposure on any zone the operator never locked down. The
 	// management / cluster-control lifeline interfaces (fxp0/em0/fab*) are
 	// excluded from the address sets below, and the established / ESP-AH / ND /
-	// PMTUD accepts precede every drop, so the default-deny can never strand
-	// management or break HA. A zone-level stanza or any per-interface override
+	// PMTUD accepts precede every drop, so an ESTABLISHED management session and HA
+	// control traffic survive. A NEW management connection is not covered by that
+	// argument: a management address shared onto a non-lifeline interface is in that
+	// zone's drop set, and only a zone that ADMITS the service puts an accept in
+	// front of it — a zone with no host-inbound-traffic stanza drops it. The
+	// exclusion above is by INTERFACE, not by address value; see
+	// docs/host-inbound-service-matrix.md, "Lifeline exclusion is by INTERFACE, not
+	// by address value". A zone-level stanza or any per-interface override
 	// (#3362) still further scopes what the zone admits.
 	configured := func(zone *config.ZoneConfig) bool {
 		return zone != nil
@@ -376,9 +382,18 @@ const UnzonedHostInboundZoneLabel = "junos-host"
 //   - Only meaningful when the operator uses the zone model at all (>= 1 zone):
 //     a zone-less bootstrap / degenerate config is left untouched (nil), so this
 //     never turns a no-zones box into deny-all host-inbound.
-//   - Management / cluster-control LIFELINE interfaces (fxp0 / em0 / fab*, plus
+//   - Management / cluster-control LIFELINE INTERFACES (fxp0 / em0 / fab*, plus
 //     the configured control / fabric links) are excluded exactly as the zone
-//     path excludes them, so the deny can never strand management or break HA.
+//     path excludes them. That is an INTERFACE exclusion, not an address-VALUE
+//     one: a management address ALSO configured on an unzoned interface is
+//     contributed by that interface's snapshot and lands in this set with an
+//     EMPTY admit set, so the real table drops NEW management connections to it
+//     (no service accept precedes an unzoned drop) and the #5566 reconcile
+//     flushes its ESTABLISHED entries. The drop is destination-address-only with
+//     no iifname (#3718), so arriving on the lifeline does not exempt it. A
+//     lifeline address not shared onto a non-lifeline interface is never in this
+//     set. See docs/host-inbound-service-matrix.md, "Lifeline exclusion is by
+//     INTERFACE, not by address value".
 //   - Addresses already scoped by a zone view are subtracted, so a (mis)config
 //     placing one firewall-local address on both a zoned and an unzoned
 //     interface never yields a duplicate / conflicting rule for the same daddr.
@@ -427,4 +442,182 @@ func BuildUnzonedHostInboundAddrs(cfg *config.Config) (v4, v6 []string) {
 	sort.Strings(v4)
 	sort.Strings(v6)
 	return v4, v6
+}
+
+// FenceAddrSets is the FENCE-ONLY drop scope of the cold-boot fail-closed fence
+// (#6492). It is deliberately NOT the real ruleset's scope: the fence is the
+// real table with every per-service ACCEPT removed, so the two scopes have
+// different safety obligations and BuildFenceAddrSets is the only place that
+// difference is expressed.
+//
+// Finding A (lifeline lockout). The real table can safely deny a firewall-local
+// address that is ALSO configured on a lifeline interface, because its
+// per-service accepts (the mgmt zone's `host-inbound-traffic system-services
+// ssh`) precede the catch-all DROP and still admit the management session. The
+// fence has no such accepts, and its drop rule carries no `iifname` qualifier —
+// it renders as a bare `ip daddr <addr> drop`. So an address shared between
+// e.g. `fxp0.0` and a zoned data interface (a topology xpf explicitly accepts,
+// pkg/config/dup_host_local_address_3718_test.go) would have every NEW
+// management connection to it dropped for the whole fence window. WithheldV4 /
+// WithheldV6 are exactly those shared addresses: they are removed from the
+// fence's drop set and reported so the operator sees what the fence did not
+// cover. The address stays denied by the REAL table's catch-all whenever the
+// real table loads; only the fence stands down for it.
+//
+// Finding B (zone-less fail-open). BuildZoneHostInboundViews and
+// BuildUnzonedHostInboundAddrs both return nothing when the config declares no
+// security zone, because the real host-inbound default-deny is a zone-model
+// construct. Host-inbound / lo0 filters are independently valid without zones
+// (pkg/config/compiler_filter_ref_3296_test.go), so on a zone-less-but-addressed
+// router a failed lo0 install produced a `policy accept` fence shell with ZERO
+// drops — fail-OPEN, defeating the fence. The fence's drop set is therefore
+// derived from the firewall-local ADDRESSES (every non-lifeline interface
+// address plus every configured VRRP virtual address), not from zone
+// membership. There is no "are there zones?" branch: the address walk is the
+// same in both cases and simply yields more than the zone views do when zones
+// are absent or incomplete.
+//
+// Views keeps the per-zone shape (one drop rule per zone per family, and the
+// zone counts the fence logs); UnzonedV4/UnzonedV6 carry every remaining
+// firewall-local address the views do not already scope — the #4420 HI-2
+// unzoned set plus the zone-less and VIP-on-unzoned-interface residue.
+type FenceAddrSets struct {
+	Views      []ZoneHostInboundView
+	UnzonedV4  []string
+	UnzonedV6  []string
+	WithheldV4 []string
+	WithheldV6 []string
+}
+
+// BuildFenceAddrSets derives the cold-boot fence's drop scope from cfg and the
+// zone views the real ruleset would use (#6492). See FenceAddrSets.
+//
+// The returned Views are COPIES: the caller's views still carry the shared
+// lifeline addresses, because the REAL table must keep denying them.
+func BuildFenceAddrSets(cfg *config.Config, views []ZoneHostInboundView) FenceAddrSets {
+	out := FenceAddrSets{Views: views}
+	if cfg == nil {
+		return out
+	}
+	lifelines := hostInboundLifelineSet(cfg)
+	onLifeline := map[string]bool{}
+	local := map[string]bool{}
+	note := func(ifName, cidr string) {
+		host := hostIPFromCIDR(cidr)
+		if host == "" {
+			return
+		}
+		if hostInboundLifelineInterface(ifName, lifelines) {
+			onLifeline[host] = true
+			return
+		}
+		local[host] = true
+	}
+	// Live + configured interface addresses, via the same snapshot builder that
+	// populates the dataplane (so DHCP/DHCPv6-learned addresses are included
+	// exactly like static ones — the #3224 argument).
+	for _, snap := range buildInterfaceSnapshots(cfg) {
+		for _, a := range snap.Addresses {
+			note(snap.Name, a.Address)
+		}
+	}
+	// Configured VRRP virtual addresses. A VIP is live on the kernel interface
+	// of the RG master only, so on the backup node the snapshot above misses it
+	// (#3172). Unlike BuildZoneHostInboundViews this walk is not restricted to
+	// ZONED units: a VIP on an unzoned interface is still a firewall-local
+	// address the fence must deny.
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for n := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, n)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		iface := cfg.Interfaces.Interfaces[ifName]
+		if iface == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			unitNums = append(unitNums, u)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := iface.Units[un]
+			if unit == nil || len(unit.VRRPGroups) == 0 {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", ifName, un)
+			vgKeys := make([]string, 0, len(unit.VRRPGroups))
+			for k := range unit.VRRPGroups {
+				vgKeys = append(vgKeys, k)
+			}
+			sort.Strings(vgKeys)
+			for _, k := range vgKeys {
+				vg := unit.VRRPGroups[k]
+				if vg == nil {
+					continue
+				}
+				for _, vip := range vg.VirtualAddresses {
+					note(unitName, vip)
+				}
+			}
+		}
+	}
+
+	// Finding A: withhold every address that ALSO lives on a lifeline
+	// interface, both from the per-zone views and from the residual set.
+	splitFams := func(addrs []string) (v4, v6 []string) {
+		for _, a := range addrs {
+			if strings.Contains(a, ":") {
+				v6 = append(v6, a)
+			} else {
+				v4 = append(v4, a)
+			}
+		}
+		return v4, v6
+	}
+	keep := func(addrs []string) []string {
+		if len(addrs) == 0 {
+			return addrs
+		}
+		kept := make([]string, 0, len(addrs))
+		for _, a := range addrs {
+			if !onLifeline[a] {
+				kept = append(kept, a)
+			}
+		}
+		return kept
+	}
+	covered := map[string]bool{}
+	fenceViews := make([]ZoneHostInboundView, 0, len(views))
+	for _, v := range views {
+		fv := v
+		fv.V4Addrs = keep(v.V4Addrs)
+		fv.V6Addrs = keep(v.V6Addrs)
+		for _, a := range fv.V4Addrs {
+			covered[a] = true
+		}
+		for _, a := range fv.V6Addrs {
+			covered[a] = true
+		}
+		fenceViews = append(fenceViews, fv)
+	}
+	out.Views = fenceViews
+
+	// Finding B: everything firewall-local the zone views did not scope.
+	rest := make([]string, 0, len(local))
+	withheld := make([]string, 0, len(local))
+	for a := range local {
+		switch {
+		case onLifeline[a]:
+			withheld = append(withheld, a)
+		case !covered[a]:
+			rest = append(rest, a)
+		}
+	}
+	sort.Strings(rest)
+	sort.Strings(withheld)
+	out.UnzonedV4, out.UnzonedV6 = splitFams(rest)
+	out.WithheldV4, out.WithheldV6 = splitFams(withheld)
+	return out
 }

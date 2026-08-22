@@ -35,6 +35,13 @@ func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
 	if s, ok = d.rgStates[rgID]; ok {
 		return s
 	}
+	// New() always makes this map, but the fence path (#6530) now reaches
+	// here from a Daemon that minimal constructions build as a literal, and
+	// a nil-map write panics. Lazily allocating costs nothing on the hot
+	// read path (which never gets here) and removes the footgun.
+	if d.rgStates == nil {
+		d.rgStates = make(map[int]*rgStateMachine)
+	}
 	s = newRGStateMachine()
 	d.rgStates[rgID] = s
 	return s
@@ -334,6 +341,88 @@ func (d *Daemon) waitFailoverActuated(rgID int, reqID uint64) error {
 	}
 }
 
+// vipReleaseBarrier is the completion surface awaitRethVIPRelease waits on:
+// *vrrp.ResignBarrier in production. Taking the interface rather than the
+// concrete type is what lets the deferred-verdict wiring be driven in a unit
+// test without real VRRP instances and live netlink.
+type vipReleaseBarrier interface {
+	// Done closes once every targeted VRRP instance has released its VIPs.
+	Done() <-chan struct{}
+	// Err is the release verdict, valid once Done has closed.
+	Err() error
+}
+
+// resignRethRG drives the RETH VRRP resignation for rgID and returns the
+// barrier that completes when the virtual addresses are actually off the
+// interface (#6177 item 1). A nil return means there is nothing to wait for and
+// the caller resolves its fence immediately — the pre-#6177 behaviour, which is
+// correct only when no RETH VIP tenure exists to release.
+//
+// resignRethRGFn is the unit-test seam; production leaves it nil.
+func (d *Daemon) resignRethRG(rgID int) vipReleaseBarrier {
+	if d.resignRethRGFn != nil {
+		return d.resignRethRGFn(rgID)
+	}
+	if d.vrrpMgr == nil {
+		return nil
+	}
+	return d.vrrpMgr.ResignRG(rgID)
+}
+
+// rethVIPReleaseTimeout bounds awaitRethVIPRelease. VIP removal is a handful of
+// netlink deletes on the VRRP instance goroutine — sub-millisecond in practice,
+// and the whole RETH failover budget is ~60ms — so anything approaching this
+// bound means the run loop is not making progress (wedged, or retired between
+// the arm and the release). It is deliberately far BELOW failoverActuateTimeout
+// (3s) so the peer-facing verdict names the VIP release as the thing that did
+// not happen instead of surfacing as a generic barrier timeout, and far below
+// the initiator's 20s ack timeout so the ack is a decision, not a hang.
+const rethVIPReleaseTimeout = 500 * time.Millisecond
+
+// awaitRethVIPRelease resolves rgID's fence barrier on the ACTUAL removal of the
+// RETH virtual addresses (#6177 item 1).
+//
+// #5640 withheld the remote-failover applied-ack until the local demotion was
+// actuated, but on the RETH-VRRP path "actuated" meant ResignRG had returned:
+// priority-0 written (synchronously — so the resigning node cannot win a
+// re-election) and a non-blocking resignCh send performed. The advert burst and
+// the becomeBackup VIP removal still ran afterwards on the instance goroutine,
+// so the peer could promote — add VIPs, GARP — while this node's addresses were
+// still on the interface. A sub-millisecond two-owner residual, but a real one,
+// and the reason this issue carries the security label. Direct-VIP mode
+// (no-reth-vrrp) never had the gap: reconcileDirectVIPOwnership removes the
+// addresses inline on this goroutine.
+//
+// A failed release, and an expiry, both resolve the barrier with a FAILURE
+// verdict: the sync layer downgrades the applied-ack to failed and the peer
+// HOLDS rather than promoting into a window where both nodes answer for the
+// VIP. That is the safe direction — a held failover is recoverable, a
+// duplicate-address window is not — and it is not the common case: a VRRP
+// instance that is already BACKUP consumes the resign token on its next loop
+// hop and reports a clean release, and an RG with no RETH instances at all
+// yields a barrier that is born complete.
+func (d *Daemon) awaitRethVIPRelease(rgID int, barrier vipReleaseBarrier) {
+	timeout := d.rethVIPReleaseTimeout
+	if timeout <= 0 {
+		timeout = rethVIPReleaseTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-barrier.Done():
+		if err := barrier.Err(); err != nil {
+			d.signalFailoverActuationFailed(rgID, fmt.Errorf(
+				"redundancy group %d RETH virtual addresses not released on demotion: %w", rgID, err))
+			return
+		}
+		d.signalFailoverActuated(rgID)
+	case <-timer.C:
+		d.signalFailoverActuationFailed(rgID, fmt.Errorf(
+			"timed out after %s waiting for redundancy group %d RETH virtual addresses to be released",
+			timeout, rgID))
+	}
+}
+
 // waitFailoverActuatedBatch blocks until every RG in the batch transfer-out
 // reqID has been fenced, or returns the first RG's failure verdict (#5640).
 func (d *Daemon) waitFailoverActuatedBatch(rgIDs []int, reqID uint64) error {
@@ -489,10 +578,14 @@ func (d *Daemon) handleClusterEvent(ctx context.Context, ev cluster.ClusterEvent
 		if clusterDemotionEdge && d.dataplane() != nil {
 			d.tryPrepareUserspaceRGDemotion(ev.GroupID)
 		}
+		// #6177 item 1: capture the RETH resign barrier so the fence verdict
+		// below can be released on the VIPs actually leaving the interface,
+		// not merely on the resignation having been signalled.
+		var rethResign vipReleaseBarrier
 		if !noRethVRRP {
 			if ev.OldState == cluster.StatePrimary &&
 				(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
-				d.vrrpMgr.ResignRG(ev.GroupID)
+				rethResign = d.resignRethRG(ev.GroupID)
 			}
 		}
 		// Deactivation: blackhole routes first (if transitioning
@@ -540,9 +633,20 @@ func (d *Daemon) handleClusterEvent(ctx context.Context, ev cluster.ClusterEvent
 		// promoting into a two-owner window. Reporting the failure (rather
 		// than staying silent) keeps the waiter from burning its full
 		// timeout on a fence that is already known not to have landed.
-		if actuateErr != nil {
+		//
+		// #6177 item 1: on the RETH-VRRP path the VIP removal runs on the VRRP
+		// instance goroutine, so at this point the resignation is only
+		// SIGNALLED (priority-0 is set synchronously, the addresses are not yet
+		// off the wire). Hand the verdict to awaitRethVIPRelease, which resolves
+		// the barrier from the release itself. It runs on its own goroutine
+		// because handleClusterEvent serialises every cluster event — blocking
+		// here would stall unrelated RGs' state changes behind one VIP removal.
+		switch {
+		case actuateErr != nil:
 			d.signalFailoverActuationFailed(ev.GroupID, actuateErr)
-		} else {
+		case rethResign != nil:
+			go d.awaitRethVIPRelease(ev.GroupID, rethResign)
+		default:
 			d.signalFailoverActuated(ev.GroupID)
 		}
 	}
@@ -1161,6 +1265,10 @@ func (d *Daemon) reconcileRGState() {
 	// owners every pass — hash-gated, so it is a no-op when the effective RA
 	// set did not move, and re-applies (via ra.Apply's safe diff) when it did.
 	d.reconcileClusterRAServices("reconcile")
+	// #6535: the same dropped-work safety net for the OTHER per-RG service.
+	// Unlike RA, Kea had no converger at all — a failed apply was simply
+	// lost until the next RG transition or operator commit.
+	d.reconcileClusterDHCPServices("reconcile")
 }
 
 // startupGoodbyeNeeded reports whether the cold-boot one-shot goodbye still
@@ -1407,8 +1515,11 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	// cannot race a concurrent commit/demotion; the state machine already
 	// marked rgID active before this call, so the snapshot includes it.
 	d.reconcileClusterRAServices(fmt.Sprintf("vrrp-master-rg%d", rgID))
-	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
-		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
+	if d.dhcpServer != nil {
+		// Same desired state as the commit path and the #6535 converger.
+		// The MASTER edge deliberately does NOT apply a nil desired state —
+		// clearing is the BACKUP edge's job — so the nil guard stays.
+		dhcpCfg := d.desiredClusterDHCPConfig(cfg)
 		if dhcpCfg != nil {
 			// #2239 Q3: pre-seed the held peer leases into the Kea
 			// memfile BEFORE the (re)start so Kea loads the in-use
@@ -1491,7 +1602,7 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 		if anyOtherMaster {
 			// Reapply DHCP with only the remaining master RGs'
 			// interfaces (nil when none match → clear).
-			d.dhcpServer.ApplyAsync(d.filterDHCPConfigForMasterRGs(cfg),
+			d.dhcpServer.ApplyAsync(d.desiredClusterDHCPConfig(cfg),
 				fmt.Sprintf("vrrp BACKUP rg%d (other RG still MASTER)", rgID))
 		} else {
 			d.dhcpServer.ApplyAsync(nil, fmt.Sprintf("vrrp BACKUP rg%d", rgID))
@@ -1532,6 +1643,63 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 // bound to their VLAN member.
 func stripUntaggedUnitSuffix(iface string) string {
 	return strings.TrimSuffix(iface, ".0")
+}
+
+// desiredClusterDHCPConfig is the single source of truth for the Kea desired
+// state in cluster mode: the master-RG-filtered DHCP config, or nil when this
+// node should serve nothing. Every driver — the commit path
+// (daemon_apply_routing.go), the RG-transition edge (applyRethServicesForRG /
+// clearRethServicesForRG), and the #6535 reconcile converger — derives its
+// desired state from here.
+//
+// It is single-sourced rather than duplicated because a divergence between the
+// converger and the edge is ALWAYS a bug: the converger runs every 2s and
+// would fight the edge forever, restarting Kea on every tick. Binding two
+// copies with a test would not be enough — there is no legitimate reason for
+// them to differ.
+func (d *Daemon) desiredClusterDHCPConfig(cfg *config.Config) *config.DHCPServerConfig {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil {
+		return nil
+	}
+	// filterDHCPConfigForMasterRGs copies the config and resolves RETH
+	// interface names internally. It returns nil when no group's interfaces
+	// belong to a currently-MASTER RG.
+	return d.filterDHCPConfigForMasterRGs(cfg)
+}
+
+// reconcileClusterDHCPServices is the periodic converger for the Kea applier
+// (#6535). Every other trigger is an EDGE: applyRethServicesForRG /
+// clearRethServicesForRG run only under `if tr.Changed`, and the commit path
+// runs only when an operator commits. So a Kea apply that FAILED had nowhere
+// to be retried from, and the failure survives: the node that should be
+// serving stays dark, or the node that should have stopped keeps serving —
+// persistent dual-DHCP (or no-DHCP) after a failover, not a transient blip.
+//
+// This mirrors reconcileClusterRAServices, the converger the RA half of the
+// same two services already has, including its central rule — the applied
+// marker advances only on a verified success, so a transient error is retried
+// on a later pass rather than latched as converged.
+//
+// It re-drives ONLY when the manager reports the last completed attempt
+// failed, and the manager spaces retries (applyRetryInterval). A converged Kea
+// costs one atomic-guarded bool read per pass.
+func (d *Daemon) reconcileClusterDHCPServices(reason string) {
+	if d.dhcpServer == nil || d.store == nil {
+		return
+	}
+	if !d.dhcpServer.ClaimApplyRetry(time.Now()) {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	desired := d.desiredClusterDHCPConfig(cfg)
+	slog.Info("reconcile: retrying failed DHCP server apply", "reason", reason)
+	d.dhcpServer.ApplyAsync(desired, "reconcile: "+reason)
 }
 
 // filterDHCPConfigForMasterRGs returns a DHCP config containing only groups

@@ -53,6 +53,12 @@ set -euo pipefail
 _LOCK_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=cluster-lock.sh
 source "${_LOCK_SCRIPT_DIR}/cluster-lock.sh"
+# #6440: CLI-transcript success-marker gate. The piped-stdin CLI is a REPL
+# that prints "error: ..." for a failed command, continues, and still exits
+# 0 — so every phase below must verify the CLI's own success markers rather
+# than the session's exit status.
+# shellcheck source=cos-apply-lib.sh
+source "${_LOCK_SCRIPT_DIR}/cos-apply-lib.sh"
 if ! xpf_cluster_lock_held; then
     exec "${_LOCK_SCRIPT_DIR}/with-cluster.sh" "apply-cos-config $*" \
         -- "${_LOCK_SCRIPT_DIR}/apply-cos-config.sh" "$@"
@@ -207,6 +213,16 @@ incus file push --mode 0644 "$SETS_TMP" "${TARGET}/${REMOTE_SETS}" >/dev/null
 # check` validates the candidate before apply; we invoke it first so a
 # syntactically-bad candidate is caught before anything live changes.
 
+# ---- Phase 0: daemon readiness ----
+# This script normally runs immediately after a deploy, which restarts xpfd.
+# #6440 recorded a run whose commit-check died with connection-refused because
+# the gRPC listener was not up yet. Wait for it before touching config.
+if ! cos_wait_daemon_ready "$TARGET" "${COS_READY_TIMEOUT:-60}"; then
+	echo "error: xpfd on $TARGET did not become reachable within ${COS_READY_TIMEOUT:-60}s" >&2
+	echo "no live state changed (nothing was committed)" >&2
+	exit 3
+fi
+
 # ---- Phase 1: commit check (dry-run validate) ----
 CHECK_OUT=$(mktemp)
 trap "rm -f '$SETS_TMP' '$CHECK_OUT'" EXIT
@@ -231,6 +247,16 @@ then
 	echo "---- cli output ----" >&2
 	cat "$CHECK_OUT" >&2
 	echo "---- end cli output ----" >&2
+	echo "no live state changed (commit check runs on the candidate only)" >&2
+	exit 4
+fi
+# #6440: the exit status above is NOT sufficient — the piped-stdin CLI exits 0
+# even when `load merge` or `commit check` failed. Require BOTH markers: a
+# silently-failed load leaves a candidate holding only this script's deletes,
+# which is a VALID candidate, so `commit check` would pass and phase 2 would
+# commit a CoS wipe.
+if ! cos_require_markers "commit check on $TARGET" "$CHECK_OUT" \
+	"$COS_MARKER_LOAD_MERGE" "$COS_MARKER_COMMIT_CHECK"; then
 	echo "no live state changed (commit check runs on the candidate only)" >&2
 	exit 4
 fi
@@ -270,13 +296,18 @@ then
 	# to roll forward onto the last good committed config — if the
 	# pre-apply state itself was wedged, this will repair it.
 	echo "attempting rollback 1 | commit to restore last-good state..." >&2
-	incus exec "$TARGET" -- /usr/local/sbin/cli <<'EOF' >&2 || true
-configure
-rollback 1
-commit
-exit
-quit
-EOF
+	cos_rollback_one "$TARGET" || true
+	exit 5
+fi
+# #6440: as in phase 1, the exit status alone proves nothing. Require the
+# markers for BOTH verbs that must have landed for CoS to be applied.
+if ! cos_require_markers "commit on $TARGET" "$APPLY_OUT" \
+	"$COS_MARKER_LOAD_MERGE" "$COS_MARKER_COMMIT"; then
+	echo "the CoS apply did NOT land; rolling forward to the last good state..." >&2
+	# `|| true` so a failed rollback does not let `set -e` pre-empt the
+	# phase-specific exit code below; cos_rollback_one has already reported
+	# MANUAL INTERVENTION REQUIRED on that path.
+	cos_rollback_one "$TARGET" || true
 	exit 5
 fi
 
@@ -288,8 +319,21 @@ fi
 # not runtime-live — roll back to the previous good state.
 VERIFY_OUT=$(mktemp)
 trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT'" EXIT
-incus exec "$TARGET" -- /usr/local/sbin/cli -c "show class-of-service interface" \
-	> "$VERIFY_OUT" 2>&1 || true
+# NOTE (#6440): do NOT `|| true` this one. Unlike the piped-stdin heredocs
+# above, `cli -c` DOES exit non-zero on a dispatch error or an unreachable
+# xpfd, so its status is meaningful. Swallowing it made an unreachable daemon
+# produce an error transcript that failed the shaper grep below and exited 6
+# blaming a "missing shaper binding" — the misdiagnosis #6440 was filed on.
+if ! incus exec "$TARGET" -- /usr/local/sbin/cli -c "show class-of-service interface" \
+	> "$VERIFY_OUT" 2>&1; then
+	echo "error: 'show class-of-service interface' FAILED on $TARGET (the CLI could not run it)" >&2
+	echo "---- cli output ----" >&2
+	cat "$VERIFY_OUT" >&2
+	echo "---- end cli output ----" >&2
+	echo "this is a CLI/daemon reachability failure, NOT a CoS binding failure" >&2
+	cos_rollback_one "$TARGET" || true
+	exit 6
+fi
 cat "$VERIFY_OUT"
 
 # Look for ANY shaper/scheduler signal. If the show output does not
@@ -298,21 +342,7 @@ cat "$VERIFY_OUT"
 if ! grep -iqE 'shaper|scheduler|traffic-control-profile|output.*traffic' "$VERIFY_OUT"; then
 	echo "error: post-commit verification FAILED — 'show class-of-service interface' output shows no shaper/scheduler binding" >&2
 	echo "rolling forward with 'rollback 1 | commit' to restore the last good state..." >&2
-	ROLLBACK_OUT=$(mktemp)
-	trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT' '$ROLLBACK_OUT'" EXIT
-	if incus exec "$TARGET" -- /usr/local/sbin/cli > "$ROLLBACK_OUT" 2>&1 <<'EOF'
-configure
-rollback 1
-commit
-exit
-quit
-EOF
-	then
-		echo "rollback 1 committed — live state reverted" >&2
-	else
-		echo "WARN: rollback commit also failed — MANUAL INTERVENTION REQUIRED" >&2
-		cat "$ROLLBACK_OUT" >&2
-	fi
+	cos_rollback_one "$TARGET" || true
 	exit 6
 fi
 
@@ -340,9 +370,14 @@ fi
 if grep -qE '^set .*oversubscription-policy' "$CONFIG_FILE"; then
 	OVERSUB_OUT=$(mktemp)
 	trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT' '$OVERSUB_OUT'" EXIT
-	incus exec "$TARGET" -- /usr/local/sbin/cli -c \
+	if ! incus exec "$TARGET" -- /usr/local/sbin/cli -c \
 		"show configuration class-of-service | display set" \
-		> "$OVERSUB_OUT" 2>&1 || true
+		> "$OVERSUB_OUT" 2>&1; then
+		echo "error: 'show configuration class-of-service | display set' FAILED on $TARGET" >&2
+		cat "$OVERSUB_OUT" >&2
+		cos_rollback_one "$TARGET" || true
+		exit 7
+	fi
 
 	MISSING=0
 	while IFS= read -r want; do
@@ -360,21 +395,7 @@ if grep -qE '^set .*oversubscription-policy' "$CONFIG_FILE"; then
 		cat "$OVERSUB_OUT" >&2
 		echo "---- end show output ----" >&2
 		echo "rolling forward with 'rollback 1 | commit' to restore the last good state..." >&2
-		ROLLBACK_OUT=$(mktemp)
-		trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT' '$OVERSUB_OUT' '$ROLLBACK_OUT'" EXIT
-		if incus exec "$TARGET" -- /usr/local/sbin/cli > "$ROLLBACK_OUT" 2>&1 <<'EOF'
-configure
-rollback 1
-commit
-exit
-quit
-EOF
-		then
-			echo "rollback 1 committed — live state reverted" >&2
-		else
-			echo "WARN: rollback commit also failed — MANUAL INTERVENTION REQUIRED" >&2
-			cat "$ROLLBACK_OUT" >&2
-		fi
+		cos_rollback_one "$TARGET" || true
 		exit 7
 	fi
 fi

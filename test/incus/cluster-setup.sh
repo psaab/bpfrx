@@ -813,64 +813,16 @@ deploy_vm() {
 
 	# #1864 pre-flight: verify the NEW binary's embedded shim object
 	# against the node's kernel verifier BEFORE touching the running
-	# daemon. ORDERING INVARIANT: no dataplane stop, cleanup, pkill,
-	# binary replacement, or legacy-name (bpfrxd) migration may run
-	# before this check — the 2026-06-10 incident was exactly a
-	# stop-then-load-fail that left the node in config-only mode. The
-	# check loads anonymous maps only (no pins, no attach), so the
-	# live dataplane is untouched.
+	# daemon. The full ORDERING INVARIANT, CPU contract and rationale live
+	# with the implementation in deploy-lib.sh; the invariant this call site
+	# owns is its POSITION: nothing below it here (bpfrxd migration, pin
+	# reconcile, systemctl stop, pkill, binary push) may be hoisted above it.
+	# The 2026-06-10 incident was exactly a stop-then-load-fail that left the
+	# node in config-only mode.
 	#
-	# CPU contract: the verify walk (~17s of one core on a REJECT)
-	# runs on the complement of the AF_XDP worker cores, derived from
-	# the live xpf-userspace-dp tasks' Cpus_allowed_list. If the
-	# complement is empty or derivation fails, fall back to nice -n 19
-	# on all CPUs (workers pin worker-i -> i-th allowed CPU, so a
-	# dedicated housekeeping core is not guaranteed).
-	info "Pre-flight: verifying new xpfd dataplane object on $vm..."
-	incus file push "$PROJECT_ROOT/xpfd" "${rinst}/tmp/xpfd.preflight" --mode 0755
-	if ! incus exec "$rinst" -- bash -c '
-		set -u
-		free_cpus() {
-			# Worker threads pin themselves to exactly one CPU each
-			# (userspace-dp pin_current_thread); collect the
-			# single-CPU Cpus_allowed_list values (unpinned control
-			# threads report full ranges and are not workers) and
-			# return the complement vs online CPUs.
-			# pidof, not pgrep -x: the process name is 16 chars,
-			# past the 15-char comm truncation pgrep -x matches on.
-			local pid used t v
-			pid=$(pidof -s xpf-userspace-dp 2>/dev/null)
-			[ -n "$pid" ] || return 1
-			used=""
-			for t in /proc/"$pid"/task/*/status; do
-				[ -r "$t" ] || continue
-				v=$(awk -F"\t" "/^Cpus_allowed_list/ {print \$2}" "$t")
-				[[ "$v" =~ ^[0-9]+$ ]] && used="$used $v"
-			done
-			[ -n "${used// /}" ] || return 1
-			seq 0 $(( $(nproc --all) - 1 )) | \
-				awk -v used="$used" "BEGIN{n=split(used,a,\" \"); for(i=1;i<=n;i++) u[a[i]]=1} !(\$0 in u)" | \
-				paste -sd, -
-		}
-		MASK=$(free_cpus 2>/dev/null || true)
-		# Probe the mask before trusting it: the complement is taken
-		# against `nproc --all` (configured CPUs), which can include
-		# offline CPUs — taskset then EINVALs and, because this exec
-		# chain treats any non-zero exit as a verifier REJECT, a bad
-		# mask would false-reject a good binary (observed live on
-		# fw1 during the #1864 deploy smoke). An unusable mask falls
-		# back to the un-pinned nice-only run.
-		if [ -n "$MASK" ] && taskset -c "$MASK" true 2>/dev/null; then
-			exec nice -n 19 taskset -c "$MASK" /tmp/xpfd.preflight verify-dataplane
-		fi
-		exec nice -n 19 /tmp/xpfd.preflight verify-dataplane
-	'; then
-		incus exec "$rinst" -- rm -f /tmp/xpfd.preflight 2>/dev/null || true
-		die "verify-dataplane REJECTED the new binary's embedded shim on $vm — deploy aborted, old daemon untouched.
-  This is the #1864 failure mode. Rebuild with the pinned toolchain (make generate) or restore the tracked object:
-    git checkout -- pkg/dataplane/userspace_xdp_bpfel.o && make build"
-	fi
-	incus exec "$rinst" -- rm -f /tmp/xpfd.preflight 2>/dev/null || true
+	# #6493: extracted from this function into deploy-lib.sh so the standalone
+	# test/incus deploy runs the SAME gate instead of a second hand copy.
+	deploy_verify_dataplane_preflight "$rinst" "$PROJECT_ROOT/xpfd"
 
 	# Migrate from old bpfrxd naming if present.
 	incus exec "$rinst" -- systemctl stop bpfrxd 2>/dev/null || true

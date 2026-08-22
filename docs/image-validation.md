@@ -104,7 +104,7 @@ Scenarios:
 
 | Scenario | Proves |
 |---|---|
-| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
+| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path); **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
 | **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 | **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
@@ -154,6 +154,45 @@ that chain was a one-time manual probe on a hand-staged stock VM
 (`find` is injected into the latter so the preference order is asserted
 independently of the test host's OVMF packages), unit-tested in
 `scripts/image/test_validate_secureboot_6497.py` and run by `make selftest`.
+### Why scenario A asserts the A/B kernel channel (#6494)
+
+The bake stages `/boot/efi/EFI/{xpf-A,xpf-B}` and enables the two #1930
+oneshots, and hard-asserts the signed shim is present. What it cannot assert
+offline is the half that only happens in-guest: UEFI `Boot####` variables live
+in the target's firmware NVRAM, which `virt-customize` cannot write, so
+registration is a first-boot oneshot on the real machine.
+
+That oneshot is deliberately non-fatal on every failure path — a read-only or
+no-efivars platform must still boot ("degraded, not bricked") — and until #6494
+nothing downstream re-read its outcome. So a regression in the ESP disk/part
+parse, the loader-path match, or the `efibootmgr` write shipped a fully
+`validated: true` image whose verify-gated kernel channel was silently
+unavailable. The operator found out when `xpfd upgrade kernel arm` exited 2
+with *"A/B slots not both registered ... the first-boot registration oneshot
+must run first"*.
+
+Note what scenario A does **not** assert about the promotion gate: the
+`promotion gate: clean` journal line. That line is emitted only once the gate
+has exec'd xpfd to run the promote verb. On a factory boot with nothing armed
+the script exits 0 much earlier, logging `no armed kernel candidate recorded`,
+so requiring the former would fail every good image. The gate asserts
+`ExecMainStatus=0` plus that ordinary-boot line, which together prove the unit
+**executed** rather than being skipped by a Condition.
+
+The three slot properties are checked separately because they have three
+different causes: registered *exactly once* (a duplicate makes `BootNext`
+ambiguous — the live #1930 bug, from a label guard anchored at `$`), pointing
+at *its own* `\EFI\<slot>\shimx64.efi` (a label-only match would chainload the
+wrong loader), and present in *BootOrder* (a slot the firmware never reaches is
+not registered in any sense the channel can act on). The verdict functions
+mirror `xpf-uefi-slots`' own shell regexes on purpose: a gate that disagreed
+with the script about what "registered" means would certify a state the script
+would not accept.
+
+Both verdicts are pure functions over captured command output
+(`_efibootmgr_slot_verdict`, `_oneshot_clean_verdict`), unit-tested without a
+hypervisor in `scripts/image/test_validate_ab_slots_6494.py` (run by `make
+selftest`), in the same idiom as `_qemu_img_verdict`.
 
 ---
 

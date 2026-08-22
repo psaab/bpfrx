@@ -433,6 +433,28 @@ pub(crate) struct ConfigSnapshot {
     pub config: serde_json::Value,
     #[serde(rename = "defer_workers", default)]
     pub defer_workers: bool,
+    /// #6311: the chassis-cluster node id this helper runs on (0 or 1; 0 when
+    /// the node is standalone or the field is absent). It becomes the high bit
+    /// of every worker's session-id namespace
+    /// (`SessionTable::set_session_id_namespace`), so a peer session id adopted
+    /// verbatim on import (#5212) can never collide with an id this node mints —
+    /// both nodes otherwise run the same worker set with counters that both
+    /// start at 1.
+    ///
+    /// ADDITIVE and `#[serde(default)]`, deliberately WITHOUT a
+    /// `CONFIG_SNAPSHOT_PROTOCOL_VERSION` bump: an older helper that ignores the
+    /// field behaves exactly as it does today (no node bit, the #6311 collision),
+    /// which is no worse than the state the field exists to improve. Bumping the
+    /// version would instead make a mixed-base pair refuse to apply a snapshot
+    /// at all. Go-side mirror: `pkg/dataplane/userspace/protocol.go`
+    /// `NodeID uint8 json:"node_id,omitempty"`.
+    ///
+    /// Consumed only at WORKER SPAWN. A same-plan re-apply does not respawn
+    /// workers, so a node id that changes at runtime takes effect on the next
+    /// plan change or restart — acceptable because `/etc/xpf/node-id` is read
+    /// once at daemon start and changing it is a reboot-level operation.
+    #[serde(rename = "node_id", default)]
+    pub node_id: u8,
     /// #1620: cold-path latency histogram sample mask. `Some(mask)`
     /// means an explicit operator setting; `None` means "use the
     /// built-in default 0xff" (1-in-256 sampling). The wire shape is

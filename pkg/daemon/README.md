@@ -737,6 +737,157 @@ by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
 `cluster_transport_race_6290_test.go` (production writer vs production reader
 under `-race`, plus a deterministic stale-epoch drop).
 
+### Periodic converger for the Kea applier (#6535)
+
+RA and Kea are the two per-RG services `applyRethServicesForRG` /
+`clearRethServicesForRG` own. RA has had a per-pass converger since #5861
+(`reconcileClusterRAServices`); Kea had none. Every Kea driver was an EDGE —
+those two functions run only under `if tr.Changed`, `applyDirectVIPOwnership`
+only on an ownership change, and the commit path only when an operator
+commits — and `dhcpserver`'s async worker logs an apply error and drops it
+rather than retrying.
+
+So a failover whose Kea apply failed left the wrong node serving: persistent
+dual-DHCP (the demoting node's stop failed, both Kea instances up) or no-DHCP
+(the promoting node's start failed, neither up), until the next RG transition
+or commit. Neither of those happens on its own.
+
+`reconcileClusterDHCPServices` is the missing converger, called from
+`reconcileRGState` beside `reconcileClusterRAServices` and following the same
+rule that section states: the applied marker advances only on a verified
+success, so a transient error is retried on a later pass rather than latched
+as converged. It re-drives ONLY when `dhcpserver.Manager.ClaimApplyRetry`
+reports the last COMPLETED attempt failed, and the manager spaces retries
+(30s) — a permanently broken Kea must not be held in a continuous
+15s-bounded systemctl restart loop by a 2s tick.
+
+**Single-sourced desired state.** `desiredClusterDHCPConfig` is the one place
+that derives the Kea desired state from (active config, current master-RG
+set); the commit path, both transition edges, and the converger all call it.
+This is single-sourced rather than bound with an agreement test because a
+divergence between the converger and an edge is ALWAYS a bug — the converger
+runs every pass and would fight the edge indefinitely.
+
+Guards: `TestFailedKeaApplyIsRetriedByReconcileConverger` (three real
+reconcile passes: an edge pass whose apply fails, a no-transition pass that
+must re-drive it, and a third that must NOT) and
+`TestClaimApplyRetryOnlyAfterAFailedApply`, in
+`dhcp_apply_converger_6535_test.go`.
+### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
+
+`rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an
+`applied` marker, and `reconcileRGState`'s retry predicate is
+`tr.Changed || s.NeedsApply()` — i.e. "the desired value moved, or the last
+apply did not converge". `applied`/`applyPending` are advanced only by
+`MarkApplied` and `ApplyIfCurrent`, and **neither has a path that SETS
+`applyPending`**: both only CLEAR it, when `applied == active`.
+
+That makes the retry structurally blind to any writer that changes `rg_active`
+in the dataplane WITHOUT going through the state machine's transition path.
+After such a write the machine still believes `desired == applied`, the
+reconcile pass does nothing, and nothing else re-arms it — so forwarding stays
+wherever the second writer left it, permanently. It is a blackhole with no
+retry, not a glitch the next 2 s tick repairs.
+
+`fenceAllRedundancyGroups` (`daemon_ha_sync.go`) is the instance that surfaced
+this. A received peer fence writes `SetRGActive(rg, false)` directly; before
+the fix a fenced primary never came back, because the reconcile pass that
+exists precisely to restore it could not see that anything had changed. (The
+fence itself is opt-in on the SENDING node — `set chassis cluster peer-fencing
+disable-rg`, `heartbeat_manager.go` — but the RECEIVING side is wired
+unconditionally, so a node with no fencing configured is still exposed to a
+peer that has it.)
+
+The fix is the class, not the call site: `rgStateMachine.InvalidateApplied()`
+re-arms the retry, and the fence calls it after each write. Rules for any
+future writer:
+
+- Call `InvalidateApplied()` **after** the write, so the reconcile pass that
+  observes the re-armed retry runs against settled dataplane state.
+- Call it on **failure as well as success**. A write that returned an error may
+  still have partially landed, so "not known to have converged" is the only
+  honest reading, and forcing a re-drive is the fail-closed one. It costs at
+  most one idempotent re-apply on the next tick.
+- `InvalidateApplied` sets `applied = !active` rather than only flipping
+  `applyPending`, preserving the invariant `reconcileLocked` relies on
+  (`applyPending` is true exactly when `applied != active`).
+- The one deliberate exception is `daemon_run_shutdown.go`'s
+  `SetRGActive(..., false)`: the daemon is exiting and there is no later
+  reconcile pass to arm.
+
+Bound honestly: ordering between two unsynchronised `rg_active` writers is not
+something the state machine can resolve — if a concurrent event-handler apply
+stamps `applied` after the fence's write, the retry is disarmed again. What
+`InvalidateApplied` guarantees is that the machine never *silently* believes a
+convergence it did not observe. Guards:
+`TestFenceRearmsReconcileRetry` (end-to-end through two real reconcile passes)
+and `TestInvalidateAppliedRearmsAnySecondWriter` /
+`TestInvalidateAppliedKeepsStructInvariant` (the generic second-writer
+contract), all in `rg_state_fence_rearm_6530_test.go`.
+
+**Where the wiring lives (#6428).** `startClusterComms` was a 602-line
+constructor; the sub-constructions were extracted verbatim into thirteen focused
+builders in **`daemon_ha_comms_wiring.go`** (VRF-device resolution, HA watchdog
+heartbeat, sync-transport selection, session-sync transport refs, fabric gRPC
+listeners, the config / peer-lifecycle / remote-failover callback groups, the
+cluster peer-failover hooks, fence wiring, event-stream wiring, the auxiliary
+comms loops, and the fabric-forwarding loops). What stays in
+`daemon_ha_sync.go` is the control-flow spine, because **the order is the
+contract** and it is documented on `startClusterComms` itself:
+
+- `beginClusterCommsEpoch` first — every goroutine below captures its
+  sub-context and every publish presents its generation;
+- `resolveClusterVRFDevice` before the heartbeat goroutine and the constructor
+  goroutine (both take `vrfDevice` by value);
+- `syncRGStrictVIPOwnershipMode` before the heartbeat goroutine, so `rg_active`
+  already follows VIP ownership once VRRP starts driving it;
+- `clusterCommsWG.Add(1)` on the caller's stack, never inside the goroutine, so
+  `stopClusterComms` cannot `Wait()` past an unregistered constructor;
+- inside the constructor: resolve → build `ss` → `publishSessionSyncIfCurrent`
+  → **all** wiring → `ss.Start`. Every `ss.On*` callback, cluster-Manager hook
+  and `SetVRFDevice` must be installed before `Start`, which spawns the
+  accept/connect goroutines whose first connection runs the authoritative
+  cold-prime bulk;
+- `wireUserspaceEventStreamForSync` before the `ss.Start` retry loop — its
+  result selects which drain loop that loop launches;
+- fabric refresh channels published before `startFabricForwardingLoops` hands
+  each loop its own channel by value.
+
+The five blocks that carry a `return` out of the constructor goroutine (address
+resolution, fab1 resolution, `ss` construction + publish, the `ss.Start` retry
+loop, the fabric-channel publish) were deliberately NOT extracted: turning those
+escapes into sentinel returns is exactly the rewrite that can change which
+later phases still run — the `ss.Start` loop must fall through to the auxiliary
+loops when all 30 attempts fail, but must NOT when the context was cancelled.
+
+**Goroutine lifecycle: only ONE of eleven is joined.** `clusterCommsWG.Add(1)`
+appears exactly once in the tree — it tracks the session-sync constructor
+goroutine, and `stopClusterComms` joins only that one. The other ten goroutines
+this path spawns (`startHeartbeatWithRetry`, the HA watchdog ticker, the gRPC
+fabric-listener poller and its inner listener, `eventStreamFallbackLoop` /
+`runUserspaceEventStream`, `syncIPsecSAPeriodic`, `configSyncReconcileLoop`,
+`populateFabricFwd{,1}`, `monitorFabricState`) are context-cancelled only,
+never joined. That asymmetry is the structural reason **#7257** is reachable:
+`stopClusterComms` cancels the context, joins only the constructor, and then
+calls `d.cluster.StopHeartbeat()` — which nils the heartbeat handles under
+`m.mu` while an unjoined `startHeartbeatWithRetry` goroutine may still be
+inside `StartHeartbeat` dereferencing them unlocked. #6428 did not move
+`startHeartbeatWithRetry` and did not change the lifecycle; #7257 needs a
+lifecycle fix, not a code move.
+
+**The wiring was unbound when #6428 measured it.** `go tool cover -func` over
+`./pkg/daemon/` reported **0.0% statement coverage** for all ten builders that
+live inside the constructor goroutine, and nilling all 30 wiring assignments at
+once left `./pkg/daemon/` and `./pkg/cluster/` fully green. The tests that do
+call `startClusterComms` deliberately configure it to early-return before the
+goroutine. `cluster_comms_wiring_bound_6428_test.go` now binds the 17
+observable sites — the 15 `ss.*` handles plus `d.syncPeerAddr{,1}` — by calling
+each builder directly and asserting the installation, each site mutation-proven
+(unwire it, the test reds naming that field). The remaining 13 sites are the
+`d.cluster.Set*()` hooks and `ss.SetAuthProvider`/`SetSyncTransport`;
+`cluster.Manager` exposes no getter for any of them, so binding those needs an
+observation seam in `pkg/cluster`.
+
 ### Per-RG Router-Advertisement reconcile (#5861)
 
 In cluster mode RA senders run ONLY on the RG that is the current active
@@ -871,6 +1022,21 @@ never lock an operator out of a remote box it manages.
   in-band. A daemon hard-exit is deliberately NOT used (it would also strand
   mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1, which IS a fatal exit
   because the bytes themselves cannot be read).
+  - **The boot commit-confirmed recovery reaches the same guard (#6538).** A
+    `commit confirmed` window that expired while the daemon was down is
+    resolved inside `Store.Load` by `recoverPendingConfirmLocked`, which
+    reverts to the record's `PrevTree`. That tree is a previously-committed
+    config, but `Load`'s tree repairs (`rewriteRetiredDataplaneType`,
+    `SanitizeTreeControlChars`) run only on `active.json`, never on the
+    `PrevTree` inside `confirm.json` — so a target committed on an older build
+    (`system dataplane-type ebpf` is the concrete case) can fail even the
+    lenient compile. That branch used to warn, assign the nil into
+    `s.compiled`, set `everCommitted = true`, and let `Load` return SUCCESS —
+    reconstructing the exact dangerous tuple above and bypassing this guard.
+    It now returns an `ErrConfigCompile`-tagged error, so the recovery lands in
+    `loadCompileFailed` like any other uncompilable committed config. The
+    rollback itself still completes first: the unconfirmed config must not
+    stand, and the reverted tree has to stay reachable for in-band recovery.
   - **Why mgmt stays reachable — freeze in last-known-good, not a wipe.** This
     path does NOT run the `enterBootstrapMode()` teardown (which removes the
     `10-xpf-*` `.network`/`.link` files, clears the FRR managed section, and
@@ -1655,6 +1821,44 @@ never lock an operator out of a remote box it manages.
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
   `firewall_address_literal_3433_test.go`.
 
+  **A MALFORMED address token fails the install CLOSED (#6512).** #3433 dropped
+  a malformed token silently, so an ALL-malformed positive list reached
+  "constrained + empty -> match nothing". That resolution is wrong for the two
+  shapes #6512 filed. A PARTIALLY malformed positive list installed a NARROWED
+  rule — a `discard`/`reject` term enforcing a smaller address set than the
+  operator wrote, with the dropped range falling through to the implicit accept
+  (fail-OPEN). And an EXCEPT list narrowed to empty takes the "empty except ->
+  match ALL" arm above, so the direction becomes UNCONSTRAINED (fail-OPEN in the
+  other direction) — which is why "skip the bad entry" can never be the fix
+  here. Both builders now refuse: `nftFamilyAddrs` (oracle) keeps the token
+  VERBATIM so `nft -f -` rejects the whole ruleset, and `filterFamilyAddrs`
+  (`pkg/nftables/netlink_lo0.go`, the production builder) returns an error that
+  fails the plan and aborts the install — the same posture both already had for
+  an unrepresentable port / DSCP token (#6405). Wrong-family and `any`/empty
+  tokens are unaffected: those are legitimate drops that match the userspace
+  matcher.
+
+  Fail-closed here does not mean fail-to-boot (#1960): the install error makes
+  `applyLo0Filter` install the #6476 cold-boot fail-closed fence (lifelines
+  exempt, mandatory L3 / return traffic admitted) and the boot apply logs and
+  discards the error, so an already-persisted config still loads — it just does
+  not get a kernel filter that differs from what the operator wrote. On the
+  strict COMMIT path the commit now fails with the malformed token named,
+  instead of silently installing the narrowed filter.
+
+  Detection is on the TOKEN, not on the #6463 `AddressUnrepresentable` marker,
+  because that marker is derived from `term.UnknownAddresses` — malformed
+  LITERAL `from source-address` / `destination-address` tokens only. A malformed
+  entry inside a referenced `policy-options prefix-list` reaches this lowering
+  through `ResolveFilterPrefixListAddrs` with the marker unset, and is not
+  rejected at strict commit either (`validateFirewallPrefixListReferencesStrict`
+  validates that the REFERENCE resolves, not that its entries parse). Pinned by
+  `pkg/nftables/netlink_lo0_addrs_6512_test.go` (builder fails closed; wrong-family
+  and placeholder tokens still lower) and
+  `pkg/daemon/lo0_addr_failclosed_6512_test.go` (the token reaches the builder
+  from a prefix-list on the ordinary commit path; a failed build fences and
+  surfaces the error).
+
   **ICMP type/code lowering mirrors userspace (#3483):** `nftRulesFromTerm`
   renders `icmp-type` and `icmp-code` as INDEPENDENT predicates, each gated
   only on its own value list — `icmp[v6] type <set>` when `len(ICMPTypes) > 0`
@@ -1759,12 +1963,22 @@ never lock an operator out of a remote box it manages.
   branch; a zoned NON-lifeline DHCP interface (e.g. a standalone `fxp1`) now forces
   the full recompile that builds its address-scoped host-inbound fence, closing the
   addressless→addressed gap where the broad class exempted it from that reapply.
-  **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  **Lifeline exclusion — by INTERFACE, not by address value:**
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
-  the address sets so a host-inbound deny can never strand management or break
-  HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages
-  are accepted before any deny; a configured zone that resolves to zero
-  recognized matches fails OPEN (no deny) rather than locking the zone out.
+  the address sets, so an address reachable ONLY through a lifeline is never
+  denied. A management address ALSO configured on a non-lifeline interface is NOT
+  subtracted: it is in that interface's drop set, and every host-inbound drop is
+  destination-address-only with no `iifname` (#3718), so arriving on the lifeline
+  does not exempt it. Only a zone that ADMITS the service puts an accept in front
+  of the drop — a zone with no stanza (#3405) or an unzoned interface (#4420)
+  drops NEW management connections to that address, and the #5566 conntrack
+  reconcile flushes its ESTABLISHED ones. `ct state established,related` and IPv6
+  ND + v4/v6 PMTUD control messages are accepted before any deny, which is what
+  preserves HA control traffic and an established session where the reconcile
+  does not flush it. See `docs/host-inbound-service-matrix.md`, "Lifeline
+  exclusion is by INTERFACE, not by address value". A configured zone that
+  resolves to zero recognized matches fails OPEN (no deny) rather than locking
+  the zone out.
   **Unzoned interfaces (#4420 HI-2):** an interface that carries an address but
   is assigned to NO security zone is not covered by any per-zone view above, so
   before #4420 its firewall-local addresses fell through the chain's
@@ -1773,9 +1987,11 @@ never lock an operator out of a remote box it manages.
   host-inbound traffic at all). `applyHostInboundFilter` now also scopes a
   catch-all DROP to those addresses (`userspace.BuildUnzonedHostInboundAddrs`,
   counted under the reserved `junos-host` sentinel label so the #3361 scraper
-  reports them as `zone="junos-host"`). Lifelines are excluded and zoned
-  addresses subtracted, so it can never strand management or conflict with a zone
-  rule; it is emitted only when the zone model is in use (>= 1 zone), so a
+  reports them as `zone="junos-host"`). Lifeline INTERFACES are excluded and
+  zoned addresses subtracted, so it never conflicts with a zone rule — but an
+  unzoned drop carries NO service accept, so a management address shared onto an
+  unzoned interface is denied outright here (see the lifeline note above); it is
+  emitted only when the zone model is in use (>= 1 zone), so a
   bootstrap / zoneless box is left untouched. Unzoned interfaces are not
   AF_XDP-bound, so the kernel nft deny is the sole and sufficient enforcement
   point (no userspace-dp change). **Known limitation (#4420 HI-1):** the chain
