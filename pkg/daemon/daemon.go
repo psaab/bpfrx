@@ -328,16 +328,20 @@ type Daemon struct {
 	// listener + authentication snapshot against the committed web-management
 	// config (make-before-break rebind on an endpoint change; live auth swap on
 	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
-	mgmt *managementReconciler
-	// staleCertMu guards staleCertPending and staleCertGen, and publishes the
-	// mgmt pointer the stale-cert delivery path reads (#6827 round 5) — so that
-	// read is memory-model safe rather than a benign-looking data race.
-	//
-	// ONLY that read. `mgmt` is still read unguarded elsewhere (daemon_run_servers.go
-	// and reconcileWebManagement), exactly as it was before #6827 — the publish
-	// was unsynchronised on every path then, and this PR narrowed the problem to
-	// the path it touched rather than solving it. Do not read this as "mgmt is
-	// guarded"; it is not, and the remaining readers are tracked separately.
+	// #6719: an atomic pointer, not a plain field. It is written once in
+	// startHTTPServer and read from goroutines that are already running by then
+	// — startClusterComms is ~190 lines EARLIER in Run, so the peer-sync apply
+	// path reaches reconcileWebManagement while this is still nil. A plain field
+	// write racing those reads is a data race on the pointer that gates the
+	// management auth reconcile, which is what #6827 round 5 narrowed to the
+	// stale-cert path and explicitly left open elsewhere ("Do not read this as
+	// 'mgmt is guarded'; it is not"). The type now enforces it: every access is
+	// a Load or a Store, so a future edit cannot reintroduce the plain read.
+	mgmt atomic.Pointer[managementReconciler]
+	// staleCertMu guards staleCertPending and staleCertGen. It no longer
+	// publishes the mgmt pointer — mgmt is atomic (above), so the stale-cert
+	// delivery path loads it like every other reader and does not need this
+	// mutex to make that read safe.
 	staleCertMu sync.Mutex
 	// staleCertPending records that a `set system host-name` moved the kernel
 	// name and the management-TLS staleness diagnostic has NOT yet been
