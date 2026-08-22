@@ -137,13 +137,18 @@ func TestScreenChecksNilReturnsNil(t *testing.T) {
 
 func TestCollectPolicyCountersNilSlotsNoPanic(t *testing.T) {
 	store := nilSlotStore(t)
-	c := &xpfCollector{
-		srv: &Server{store: store},
-		policyHitsTotal: prometheus.NewDesc(
-			"xpf_policy_hits_total", "policy hits",
-			[]string{"from_zone", "to_zone", "policy_name"}, nil,
-		),
-	}
+	// #7016: initialize the real policy descriptor set so every desc
+	// collectPolicyCounters emits UNCONDITIONALLY (the
+	// xpf_policy_counters_unpublished_rules gauge) is present, then override
+	// the one desc this test asserts custom labels on. A bare literal listing
+	// only policyHitsTotal nil-panics the moment the collector gains another
+	// always-emitted family.
+	c := &xpfCollector{srv: &Server{store: store}}
+	c.initPolicyDescriptors()
+	c.policyHitsTotal = prometheus.NewDesc(
+		"xpf_policy_hits_total", "policy hits",
+		[]string{"from_zone", "to_zone", "policy_name"}, nil,
+	)
 	dp := &schedulerCounterAPIDP{
 		Manager:  dataplane.New(),
 		counters: map[uint32]dataplane.CounterValue{},
