@@ -59,8 +59,15 @@ type rssExecutor interface {
 	// /sys/class/net/<iface>/device/driver), or "" if not a PCI NIC.
 	readDriver(iface string) string
 	// readQueueCount returns the number of RX queues for iface, as
-	// enumerated from /sys/class/net/<iface>/queues/rx-*.
-	readQueueCount(iface string) int
+	// enumerated from /sys/class/net/<iface>/queues/rx-*, plus the
+	// enumeration error if the directory could not be read at all.
+	//
+	// #5250 (A7-b2 F2): the error is part of the signature because a
+	// FAILED enumeration and a NIC that genuinely reports zero RX queues
+	// are different facts that used to arrive as the same value, 0. The
+	// caller logged the failure as `queues=0 reason="queue count unknown"`,
+	// which reads as a decision made about a real NIC.
+	readQueueCount(iface string) (int, error)
 	// listInterfaces returns the set of netdev names to consider (real
 	// sysfs: basenames of /sys/class/net). Injection point for tests so
 	// the top-level scan path is exercised without touching real netdevs.
@@ -86,10 +93,10 @@ func (realRSSExecutor) readDriver(iface string) string {
 	return filepath.Base(link)
 }
 
-func (realRSSExecutor) readQueueCount(iface string) int {
+func (realRSSExecutor) readQueueCount(iface string) (int, error) {
 	entries, err := os.ReadDir(filepath.Join("/sys/class/net", iface, "queues"))
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	n := 0
 	for _, e := range entries {
@@ -97,7 +104,7 @@ func (realRSSExecutor) readQueueCount(iface string) int {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
 func (realRSSExecutor) listInterfaces() []string {
@@ -253,7 +260,29 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 			"iface", iface, "driver", drv)
 		return
 	}
-	queues := execer.readQueueCount(iface)
+	queues, err := execer.readQueueCount(iface)
+	if err != nil {
+		// #5250 (A7-b2 F2): a failed RX-queue enumeration is NOT "this NIC
+		// has zero queues". Returning 0 for both made computeWeightVector
+		// emit `reason="queue count unknown"` at INFO next to `queues=0`,
+		// indistinguishable from a real answer, and then fall through the
+		// `queues > 1` guard so maybeRestoreDefault never ran either.
+		//
+		// No restore is attempted here, and that is deliberate rather than a
+		// gap: the only way ReadDir on /sys/class/net/<iface>/queues fails is
+		// that the netdev is gone (the per-iface driver re-check two lines up
+		// already passed, so the sysfs path existed a moment ago). A netdev
+		// that no longer exists has no indirection table to restore, and the
+		// `ethtool -X` a restore would run fails for the same reason. What was
+		// missing was the operator being able to SEE which of the two happened,
+		// so this logs the error and leaves the table alone.
+		//
+		// reapplyRSSIndirection runs on every config apply, so a transient
+		// failure self-heals on the next commit.
+		slog.Warn("linksetup: rss indirection skipped, cannot enumerate rx queues",
+			"iface", iface, "workers", workers, "err", err)
+		return
+	}
 	weights, reason := computeWeightVector(workers, queues)
 	if weights == nil {
 		slog.Info("linksetup: rss weight reshaping skipped", "iface", iface,
