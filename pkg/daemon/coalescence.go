@@ -189,6 +189,19 @@ func applyCoalescenceOne(iface string, adaptiveEnable bool, rxUsecs, txUsecs int
 // output at least resembled what we expect).
 func parseEthtoolCoalesce(out []byte) (rxUsecs, txUsecs int, adaptRX, adaptTX bool, parsed bool) {
 	scanner := bufio.NewScanner(bytes.NewReader(out))
+	// #5250 (A7-b1 F1): raise the line cap above bufio's 64 KiB default and, at
+	// the bottom, check Err(). A line longer than the cap makes Scan() stop
+	// early with ErrTooLong, which this parser could not see (it checked
+	// neither Err() nor how far it got) — so a truncated read looked like a
+	// complete one and returned parsed=true over a PREFIX of the real settings.
+	// The damage is not the diff-and-rewrite (an unparseable probe already
+	// writes blindly, so a rewrite happens either way) but what a
+	// falsely-complete parse is BELIEVED for: applyCoalescenceOne feeds it to
+	// capture.captureMlx5Coalesce as the operator's pre-xpfd baseline, which
+	// restore-on-disable later writes back to the NIC, and to the MIN1 drift
+	// comparison, which logs a drift warning against values that were never
+	// read.
+	scanner.Buffer(make([]byte, 0, 64*1024), ethtoolCoalesceMaxLine)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -228,8 +241,24 @@ func parseEthtoolCoalesce(out []byte) (rxUsecs, txUsecs int, adaptRX, adaptTX bo
 			parsed = true
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		// A scan error means the remainder of the output was never examined, so
+		// the values gathered so far describe an unknown prefix of the real
+		// settings. Report NOT-parsed, which is the existing "probe
+		// unparseable" contract: applyCoalescenceOne logs it, writes the
+		// declared config once, and — the point of this arm — records NO
+		// pre-xpfd baseline and raises NO drift warning from values it never
+		// finished reading.
+		return 0, 0, false, false, false
+	}
 	return rxUsecs, txUsecs, adaptRX, adaptTX, parsed
 }
+
+// ethtoolCoalesceMaxLine bounds a single `ethtool -c` output line. Real lines
+// are a label and a small integer (tens of bytes); 1 MiB is far above any
+// plausible driver's output yet still a hard ceiling, so a wedged/garbage
+// driver string cannot make the scanner allocate without bound.
+const ethtoolCoalesceMaxLine = 1 << 20
 
 // parseLabelledInt returns the integer value that follows label in
 // line, or (0, false) if the line doesn't start with label. Tolerates
@@ -269,4 +298,3 @@ func coalescenceMatches(wantAdaptive bool, wantRX, wantTX int,
 	}
 	return true
 }
-
