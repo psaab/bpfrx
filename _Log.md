@@ -101185,3 +101185,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   docs/feature-gaps.md, docs/phases.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #7328 — make a failed config-sync apply re-pushable. Receiver
+    sends syncMsgConfigApplyNack on a failed apply; sender re-arms the #5863
+    (epoch x generation) push marker for the generation it last sent. Preserves
+    dedupe on success (no storm); breaks it only on failure.
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go,
+    pkg/cluster/sync_conn_read.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/daemon/daemon_ha_comms_wiring.go, docs/session-sync-architecture.md,
+    pkg/cluster/sync_config_apply_nack_7328_test.go,
+    pkg/daemon/configsync_rearm_7328_test.go

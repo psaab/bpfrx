@@ -458,6 +458,57 @@ Ordering and correctness:
   a rebooted peer's lower-generation re-prime is accepted (the same
   accept-everything reset the high-water already performs).
 
+#### Making the re-push reachable — the config-apply NACK (#7328)
+
+Pinning the high-water on a failed apply only preserves *eligibility*. It does
+not cause a re-push, and until #7328 nothing did: `reconcileConfigSyncToPeer`
+claims its `(epoch × generation)` marker **before** sending and nothing ever
+cleared it, so once a generation had been pushed on a connection no trigger —
+the promotion hook, the periodic reconcile tick, or a repeat connect callback —
+would send it again. A standby that refused or failed that apply stayed on the
+previous config until a new commit changed the generation or a reconnect changed
+the epoch.
+
+Two shipped contracts said the opposite. M-2/#4151 above says the pin "keeps the
+standby eligible for the primary's re-push so it re-converges", and
+`errConfigSyncRejectedPrimary` says the dual-active window "must heal via the
+peer's re-push". #6387's own comment records the same mechanism from the
+receiver's side — "the sender pushes a generation at most once per connection,
+so a stable connection with a persistent apply failure would otherwise never
+re-enter this edge" — and answered it with a health alarm rather than
+convergence.
+
+The signal has to come from the receiver. The sender cannot infer the outcome:
+`QueueConfig` is fire-and-forget with no ack, the cluster heartbeat carries no
+config state (`HeartbeatPacket` is node/cluster id, per-RG group state,
+interface monitors, software and protocol version), and `configSyncFailing`
+never leaves the node it is raised on. So `configApplyLoop`'s failure branch
+sends `syncMsgConfigApplyNack` carrying the generation that did not take effect;
+the sender accepts it only when it names `lastSentConfigGen` — the generation it
+most recently put on the wire — and invalidates the push marker, so the next
+ordinary reconcile tick re-sends.
+
+Properties worth stating, because the asymmetry is the whole design:
+
+- **It fires only on failure.** A successful apply sends no nack, nothing
+  re-arms, and a healthy connection still pushes a generation exactly once. The
+  #5863 no-storm property is preserved unchanged.
+- **The retry is bounded to the reconciler's cadence.** The nack handler clears
+  the marker and returns; it deliberately does not push inline, so a failure
+  that recurs instantly cannot become a push/fail/nack tight loop on the shared
+  control path.
+- **A straggler cannot cause a spurious push.** A nack naming any generation
+  other than the last one sent is for a push already superseded and is dropped
+  (counted nowhere; `ConfigApplyNacksReceived` counts only accepted nacks).
+- **No silent-loss case.** The sync transport is TCP, so a nack is either
+  delivered or the connection is gone — and a lost connection bumps the epoch,
+  which re-pushes anyway.
+- **Mixed-base pairs keep today's behaviour.** The message is additive and
+  length-gated on the #2239 precedent with no `ProtocolVersion` bump: an old
+  peer never sends a nack, so the marker is never re-armed and convergence still
+  waits for a commit or a reconnect — exactly the pre-#7328 posture, and no
+  worse.
+
 **The check and the write are not one critical section (#6368).** The fence
 above makes the *verdict* correct; it does not make the *evaluation* atomic
 with the install it governs. `configEpochStale` reads the threshold and

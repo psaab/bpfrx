@@ -196,6 +196,17 @@ func (d *Daemon) wireSessionSyncConfigCallbacks(ss *cluster.SessionSync) {
 	ss.OnConfigApplyHealth = func(failing bool, reason string) {
 		d.cluster.SetConfigSyncHealth(failing, reason)
 	}
+
+	// #7328: the peer refused or failed to apply the generation we pushed.
+	// Re-arm the #5863 push marker so the next reconcile tick re-sends it —
+	// without this the marker suppresses every further push of that generation
+	// on the live connection and the standby stays stranded until a new commit
+	// or a reconnect, defeating the re-push eligibility M-2/#4151 preserves.
+	ss.OnPeerConfigApplyFailed = func(gen uint64) {
+		slog.Warn("cluster: peer did not apply our config generation — re-arming the config-sync push marker",
+			"gen", gen)
+		d.invalidateConfigSyncPushed()
+	}
 }
 
 // wireSessionSyncPeerCallbacks wires the peer-lifecycle callbacks: connect,
