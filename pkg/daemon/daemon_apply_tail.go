@@ -267,6 +267,28 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		// knob-unchanged commit is a no-op, a knob-ON commit (re)launches the
 		// loop against the live comms context, and a knob-OFF commit stops it.
 		d.ensureDHCPLeaseSyncLoop(d.dhcpLeaseSyncEnabled(cfg))
+
+		// #6628: reconcile the AUTHENTICATION posture of any established
+		// session-sync connection against the just-committed control-link key.
+		//
+		// This is the one thing the transport-key comparison above
+		// deliberately cannot do. clusterTransportKey EXCLUDES the auth key —
+		// pinned by TestAuthKeyChangeDoesNotRestartClusterComms_5078, because
+		// the established connection is what carries the key to a read-only
+		// secondary — so committing a key never reaches the restart branch and
+		// the stream stays unauthenticated indefinitely. ReconcileConnectionAuth
+		// upgrades it IN PLACE instead: it only ever promotes, and never closes
+		// a connection, so the #5078 rationale is untouched.
+		//
+		// Level-triggered and called on EVERY commit, not only a key change:
+		// the staleness test lives inside (the connection records the PSK it
+		// authenticated under), so an unrelated commit costs two pointer reads
+		// and a bytes.Equal per connection. An edge test here would have to
+		// duplicate that state and could miss the edge that matters — a commit
+		// that lands while the connection is mid-reconnect.
+		if ss := d.getSessionSync(); ss != nil {
+			ss.ReconcileConnectionAuth("config-apply")
+		}
 	}
 
 	// 21. Re-apply D3 RSS indirection on config change (#797 HIGH #2).
