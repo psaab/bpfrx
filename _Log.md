@@ -36,6 +36,37 @@
   pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
   docs/junos-cli-reference.md, _Log.md
 
+## 2026-08-21 — #6533 applied/published/converged marker rule: audited, PLAN-KILLED
+
+- **Timestamp**: 2026-08-21
+- **Action**: Audited the proposed `analysistest` rule requiring
+  applied/published/converged marker assignments to be dominated by a
+  nil-error check. Measured at `f4a5297be`: the population is 43
+  non-test assignment sites (61 with tests), not the 16 bug instances
+  the issue counts, and it is heterogeneous — copies, zero-resets (the
+  SAFE direction), appends, constructor inits and view read-outs, all of
+  which a dominance rule flags. Pulled the pre-fix code for three of the
+  twelve named instances: #5646 (`fs.hash` + a void callback), #5697
+  (`_ = bindingsMap.Update` + `m.lastBindingIndices`) and #5134 (no
+  marker field assigned at all). The rule fires on none of them, for a
+  systematic reason: the applied/published/converged vocabulary is the
+  REMEDY each fix introduced, so a rule keyed to it is blind to the
+  pre-fix code. It also flags the mechanisms the issue holds up as
+  correct (`rg_state.go` `MarkApplied`, correct via a caller contract
+  with no error in the function; `process_status.go`, correct via a
+  status readback) and its own flagship target, `dhcpserver.go:348`,
+  which #6535 already fixed and which DELIBERATELY advances the marker
+  on failure with convergence carried by `ClaimApplyRetry` — a path
+  bound end-to-end by `pkg/daemon/dhcp_apply_converger_6535_test.go`.
+  Both live targets are already fixed, so every remaining hit is a false
+  positive. Measured and rejected two alternative signals: discarded
+  errors (197 sites, mostly legitimate Close/SetDeadline) and void
+  publish-callback fields (10 sites, all notification hooks). Shipped
+  the measurement rather than a decorative lint; recorded the sound but
+  much larger alternative (a typed marker whose advance takes the error,
+  plus a driver registry — a 43-site migration).
+- **File(s)**: `docs/applied-marker-invariant.md` (new),
+  `docs/engineering-style.md`
 ## 2026-08-21 — #6534 CoS family: skipped classifier/scheduler entries annotated
 
 - **Timestamp**: 2026-08-21
@@ -136,6 +167,31 @@
   in the table) → the table, carrier and all three surface cells red;
   M6 (drift the quoted half-open window) → the Rust-parity cell reds;
   M7 (restore the Junos 1800s default) → the CLI defaults cell reds.
+  Wrap-insensitive sweep (normalise comment markers + collapse all
+  whitespace, then search) for the corrected claims found TWO survivors
+  a single-line grep had missed, both in `docs/feature-gaps.md`: the
+  Strict SYN Check row and the #2078 narrative still asserted "no TCP
+  state machine". The earlier grep was `--include=*.go`, so it never
+  looked at markdown. Both corrected, and the Strict SYN Check row was
+  additionally wrong to say the dataplane "does not enforce syn-check":
+  it applies two unconditional guards that are NOT the Junos knob —
+  transit drops a bare RST/FIN while preserving mid-stream ACK pickup
+  (`strict_syn_check_drops_new_flow`, #4400), and host-inbound seeds a
+  session only off a SYN (#4539). The same sweep then found a THIRD
+  survivor in the adjacent No-SYN-Check row — same phrase, same claim
+  family — also corrected: the knob is inert, but "so this opt-out is
+  inert" overstated it, since mid-stream pickup is already the transit
+  default and host-inbound the opt-out cannot reach the `has_syn` gate
+  at all. NOT corrected, and flagged rather than guessed: the
+  No-SYN-Check in Tunnel row claims "no tunnel-decap session-create
+  signal exists on the userspace path", which
+  `userspace-dp/src/afxdp/tunnel.rs:653` ("Locally decapsulated tunnel
+  session") makes doubtful; establishing it needs a real pass over the
+  tunnel path, so it is left standing and called out rather than
+  rewritten on a guess. Re-swept after: the only remaining
+  occurrences are in `_Log.md` and the generated
+  `docs/issues/pr-history.md`, both append-only historical records of
+  what was written at the time, not statements of current behaviour.
 - **File(s)**: `pkg/config/flow_tcp_timeouts_6539.go` (new),
   `pkg/config/flow_tcp_timeouts_6539_test.go` (new),
   `pkg/config/compiler_validate_warn.go`, `pkg/config/types_security.go`,
