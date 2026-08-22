@@ -530,6 +530,47 @@ func (r *Runner) Run(opts Options) (err error) {
 		if err := r.transition(j, StatePreflight); err != nil {
 			return err
 		}
+	} else if !j.State.atLeast(StateStopped) {
+		// #6556: a RESUMED cut must not carry the config-DB snapshot taken at
+		// the ORIGINAL preflight.
+		//
+		// PREFLIGHT, COPY and VERIFY are pure (state.go invariants): the daemon
+		// stays LIVE and accepting commits across them. So an interruption
+		// anywhere in that span opens a window in which the operator can commit
+		// -- and does not even know a cut is pending, since the upgrade lock is
+		// NOT held across the interruption (runner.go: "the journal is durable;
+		// the host-wide lock ... is NOT held across a crash"). Resuming on the
+		// old snapshot means a later auto-rollback restores the pre-interruption
+		// DB and SILENTLY reverts every commit made in that window.
+		//
+		// The code already documented this exact hazard for its sibling and
+		// closed it there only: cleanupFailedVerifyCopy rewinds a verify failure
+		// to INIT and clears DBSnapshotPath precisely because "the daemon stays
+		// LIVE across a verify failure (verify is pure), so an operator may
+		// change the config DB before the retry" (#1967, deepened by #1981).
+		// A resumed cut is the same argument with a crash in place of a verify
+		// failure.
+		//
+		// The STOPPED floor is load-bearing, not caution. From STOPPED onward
+		// the daemon is DOWN, so no commit can land and there is nothing to
+		// re-capture; and re-snapshotting at FLIPPED would be actively WRONG --
+		// versions/current already points at the new binary, which may have
+		// started and migrated the DB envelope, so the "pre-upgrade" snapshot
+		// would capture POST-upgrade state and defeat rollback entirely. The
+		// exposure is exactly State in {PREFLIGHT, COPIED, VERIFIED}.
+		if err := r.snapshotConfigDB(j); err != nil {
+			return fmt.Errorf("resume: re-snapshot config DB: %w", err)
+		}
+		// Persist immediately: DBSnapshotPath and AdvancedStateFloor can BOTH
+		// change here (a DB deleted during the window flips AdvancedStateFloor
+		// to false), and a crash between the re-snapshot and the next
+		// transition must not leave the journal describing the snapshot this
+		// call just replaced.
+		if err := r.saveJournal(j); err != nil {
+			return fmt.Errorf("resume: persist re-snapshotted journal: %w", err)
+		}
+		r.logf("upgrade: resumed at %s; re-took the config-DB snapshot so a later "+
+			"rollback cannot revert commits made during the interruption", j.State)
 	}
 
 	// ---- COPY (pure) ----
@@ -798,9 +839,7 @@ func (r *Runner) preflight(j *Journal) error {
 	// legitimate skip; ANY OTHER error -> abort the pure preflight before any
 	// live mutation.
 	var dbSize uint64
-	dbPresent := false
 	if _, serr := statConfigDBDir(r.cfg.ConfigDBDir); serr == nil {
-		dbPresent = true
 		// A present DB must be sized for the space check. A walk error here
 		// (EIO on a subfile, EACCES on a subdir) is a real storage fault and
 		// must be surfaced, never silently treated as size 0.
@@ -833,13 +872,47 @@ func (r *Runner) preflight(j *Journal) error {
 		}
 	}
 
-	// Take the pre-upgrade config-DB snapshot for binary+DB-atomic
-	// rollback. Snapshot the whole .configdb dir into a .partial then
-	// atomically rename so a crash never yields a torn snapshot.
+	// Take the pre-upgrade config-DB snapshot for binary+DB-atomic rollback.
+	return r.snapshotConfigDB(j)
+}
+
+// snapshotConfigDB takes (or RE-takes) the pre-upgrade config-DB snapshot and
+// stamps DBSnapshotPath / AdvancedStateFloor. Extracted from preflight in
+// #6556 because the resume path needs exactly this step and nothing else
+// around it.
+//
+// It re-classifies the config-DB directory itself rather than taking a
+// dbPresent argument: on a RE-snapshot the answer can legitimately have
+// changed since the original preflight, and a stale "present" would leave
+// DBSnapshotPath pointing at a snapshot this call did not write. The stat is
+// FAIL-CLOSED for the #5074 reason — a transient or permission error
+// (EACCES/EIO/stale mount) misread as "DB absent" would leave the cut with no
+// pre-upgrade DB to restore.
+//
+// ORDERING, changed from the pre-#6556 inline version. That code removed the
+// live snapshot BEFORE copying the replacement, which is harmless on a first
+// preflight (there is nothing to lose) and NOT harmless on a re-snapshot: a
+// crash mid-copy would leave the journal naming a snapshot directory that no
+// longer exists, and the later rollback fails at restore time instead of
+// simply using the older snapshot. The replacement is now made durable in
+// .partial FIRST, and only then does the old one give way — so the window in
+// which no snapshot exists is two adjacent metadata operations in one
+// directory. The cost is that peak disk briefly holds both copies; the config
+// DB is a handful of JSON files, and preflight's space check already budgets
+// a full dbSize.
+func (r *Runner) snapshotConfigDB(j *Journal) error {
+	dbPresent := false
+	if _, serr := statConfigDBDir(r.cfg.ConfigDBDir); serr == nil {
+		dbPresent = true
+	} else if !os.IsNotExist(serr) {
+		return fmt.Errorf("stat config DB %s: %w", r.cfg.ConfigDBDir, serr)
+	}
+
 	snapDir := filepath.Join(r.cfg.VersionsDir, "."+j.TargetVersion+".dbsnap")
 	snapPartial := snapDir + partialSuffix
 	_ = os.RemoveAll(snapPartial)
-	_ = os.RemoveAll(snapDir)
+	j.DBSnapshotPath = ""
+
 	if dbPresent {
 		if _, cerr := copyTree(r.cfg.ConfigDBDir, snapPartial); cerr != nil {
 			return fmt.Errorf("snapshot config DB: %w", cerr)
@@ -847,6 +920,7 @@ func (r *Runner) preflight(j *Journal) error {
 		if err := fsatomic.SyncDir(snapPartial); err != nil {
 			return fmt.Errorf("fsync db snapshot: %w", err)
 		}
+		_ = os.RemoveAll(snapDir)
 		if err := os.Rename(snapPartial, snapDir); err != nil {
 			return fmt.Errorf("commit db snapshot: %w", err)
 		}
@@ -855,6 +929,9 @@ func (r *Runner) preflight(j *Journal) error {
 		}
 		j.DBSnapshotPath = snapDir
 	} else {
+		// A DB that is absent NOW must not leave a stale snapshot behind: it
+		// would be restored over a deliberately-empty config root.
+		_ = os.RemoveAll(snapDir)
 		r.logf("upgrade: no config DB at %s; skipping DB snapshot", r.cfg.ConfigDBDir)
 	}
 
