@@ -354,6 +354,10 @@ type gateLeaf struct {
 	path  []string
 	leaf  string
 	multi bool
+	// args is the schema's declared value arity. #7484 reads it to prove that
+	// `args == 0` does NOT imply value-less, so nobody "optimises" the coverage
+	// classifier into excluding those leaves.
+	args int
 }
 
 // site renders the full dotted path; siteKey renders it with synthetic names
@@ -419,7 +423,7 @@ func enumerateGateLeaves() []gateLeaf {
 				if ch.midKeyword != "" || ch.args > 1 {
 					continue
 				}
-				g := gateLeaf{path: append([]string{}, path...), leaf: key, multi: ch.multi}
+				g := gateLeaf{path: append([]string{}, path...), leaf: key, multi: ch.multi, args: ch.args}
 				if _, skip := notAValueList[g.siteKey()]; skip {
 					continue
 				}

@@ -3923,6 +3923,83 @@ measured rather than reasoned about:
 So: accumulate both slots, keep empties, synthesize nothing. It reads every KEY
 of each child rather than `child.Name()`, per #6714.
 
+### The gate's own COVERAGE is gated too (#7484)
+
+The differential above can only fail a leaf it actually compared. It needs two
+spellings to return a usable `keep`/`drop` verdict; a leaf that does not reach
+that bar carries **no verdict at all** and cannot fail anything. At `6b47801de`
+that was **430 of 1049 enumerated leaves**, and the number lived only in a
+`t.Logf` — so 619-compared and 1049-compared both rendered as PASS.
+
+That is not hypothetical. `security log stream <*> transport protocol` and
+`… tls-profile` were among the 430, and **#6821 reports exactly that leaf as
+broken** (compact-leaf spelling drops the TLS profile, audit logs ship
+unprotected). The gate built to catch the #2419 class was reporting "no spelling
+inconsistencies" over a leaf where one was already filed.
+
+`TestSchemaSpellingGateCoverageIsGated_7484` makes coverage a **gated property**:
+
+- `gateCoverageFloor` is a FLOOR — coverage may rise freely, and a rise is a fix
+  working, never a regression. Falling below it fails the build.
+- each blind class carries a CEILING — a blind spot may shrink freely but not
+  grow, so a new schema leaf that lands COVERED costs nothing while one that
+  lands BLIND forces a deliberate decision.
+- an IMPROVEMENT also fails, with the measured numbers and an instruction to
+  tighten the constants. A ceiling nobody lowers rots into a rubber stamp.
+
+**The four blind classes are four different diagnoses**, and lumping them as
+"inert/unstable" hid that:
+
+| class | meaning | is it a gap? |
+|---|---|---|
+| `unreachable` | the leaf changed nothing at all — the synthetic parent compiled but the compiler discarded the container, so the leaf never reached it | **yes** — the real gap |
+| `flag` | the compiler READS the leaf but no value ever moves the output: a boolean | no — it has no value dimension to compare |
+| `err` | the synthetic parent/bare stanza does not compile | yes |
+| `valueMoves` | a value DOES move the output, yet fewer than two spellings produced a verdict | yes — the gate lost it some other way |
+
+**Why the classifier is behavioural and not `args == 0`.** The obvious shortcut
+is to drop leaves the schema declares value-less. It is wrong, and measurably:
+of the 232 `args == 0` leaves, **15 are compared today and are genuinely
+value-bearing lists** — `firewall … from source-prefix-list`,
+`interfaces <*> fabric-options member-interfaces`,
+`routing-options rib-groups <*> import-rib`, `event-options policy <*> events`,
+`security ike gateway <*> local-identity`. Those are **under-declared in
+setSchema**, not value-less. Excluding by `args` would have retired 15 live
+cells to make the number look better. The behavioural test cannot do that: a
+leaf that produces verdicts is already `compared` and never reaches the
+classifier.
+
+No leaf is allowlisted here. An allowlist row asserts a DEFECT exists and for
+these none has been demonstrated; #6693's `mixedChildIsAModifierBlock` is the
+precedent — where a verdict carries no information, drop the verdict rather than
+claim a defect.
+
+**A missing verdict used to read as a passing one.** `spellingVerdicts` builds
+its map by ranging `gateSpellingsMulti`, while a scalar leaf compares over
+`gateSpellingsScalar`. The two are consistent today and nothing enforced it, so
+`state[name]` for an unpopulated spelling yielded `""` — neither
+`err`/`unstable`/`inert` nor a real verdict, and it was counted as usable.
+Found by mutation: removing two entries from `gateSpellingsMulti` made coverage
+appear to RISE 619 → 1034, because every scalar leaf then scored two phantom
+verdicts. The helper now accepts only an explicit `keep`/`drop`, and
+`TestGateSpellingSetsAreConsistent_7484` pins the invariant.
+
+**The remaining gap, measured.** The 228 `unreachable` leaves spread across 46
+top-two-token parent prefixes — a long tail, not one bug. Largest:
+`interfaces <*>` (81), `system services` (28), `system syslog` (26),
+`protocols bgp` (25), `routing-instances <*>` (21), `security policies` (19).
+The cause is per-parent: the harness authors the leaf alone, and a compiler that
+requires a sibling discards the whole container. Confirmed on the #6821 leaf —
+`security { log { stream X { transport { protocol V; } } } }` is discarded,
+while adding a `host` sibling makes the value land. Recovering these means
+teaching the harness a per-parent prerequisite, which is why it is tracked
+separately rather than bundled here.
+
+**The #2419 cohort does NOT share this cause.** Measured against the eight open
+issues: only #6821 sits in the blind spot. `#6736`, `#6817`, `#6953`, `#6966`
+and `#7033` all have leaves the differential compares today, so their defects
+escaped for some other reason and closing them as one cohort would be wrong.
+
 **The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
 SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
 puts values in both AST slots of one node, which is exactly what an either/or

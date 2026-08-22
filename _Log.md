@@ -103498,3 +103498,27 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/cluster/sync.go`, `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_bulk.go`,
   `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
   `pkg/cluster/status.go`, `docs/sync-protocol.md`
+
+## 2026-08-22 — #7484 spelling-gate coverage is a gated property
+- **Timestamp**: 2026-08-22
+- **Action**: TestSchemaSpellingDifferentialGate passed green while 430/1049
+  enumerated leaves carried NO verdict, including the leaf #6821 reports broken.
+  Made coverage a ratchet (floor on compared, ceiling per blind class, and an
+  IMPROVEMENT also fails with the measured numbers so a ceiling cannot rot).
+  Replaced the "inert/unstable" lump with four measured classes — unreachable
+  228, flag 158, err 43, valueMoves 1 — using a BEHAVIOURAL classifier, not
+  `args == 0`: 15 of the 232 args==0 leaves are compared today and genuinely
+  value-bearing (schema under-declares), so excluding by args would have retired
+  live cells. Mutation found a latent hole: spellingVerdicts populates its map
+  over gateSpellingsMulti while scalar leaves compare over gateSpellingsScalar,
+  so a missing verdict read as a passing one — desyncing the lists made coverage
+  appear to RISE 619->1034. Fixed (explicit keep/drop only) and pinned by
+  TestGateSpellingSetsAreConsistent_7484.
+- **Measured for follow-up**: the 228 unreachable leaves span 46 parent prefixes
+  (interfaces 81, system services 28, system syslog 26, protocols bgp 25) — a
+  long tail needing per-parent prerequisites, not one bug. Cohort check: of the
+  eight open #2419 issues only #6821 is in the blind spot; #6736/#6817/#6953/
+  #6966/#7033 all carry verdicts today, so they are NOT one cohort.
+- **File(s)**: pkg/config/schema_spelling_gate_coverage_7484_test.go (new),
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+
