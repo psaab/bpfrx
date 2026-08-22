@@ -2187,7 +2187,20 @@ fn filter_result_modifiers_roundtrip_5444() {
                 ..Default::default()
             }],
         }],
-        &[],
+        // #6540: `p-lo` must be DEFINED. Before #6540 this fixture named a
+        // policer that existed nowhere, the compiler resolved it to `None`,
+        // and the meter silently no-opped — so this test asserted the policer
+        // NAME propagates into the accumulator while the rate limit it names
+        // was not being enforced at all. It was an unwitting demonstration of
+        // the bug. Meter-only (`discard_excess: false`) so the policer cannot
+        // drop the probe packet and change the assertions below; this fixture
+        // is about modifier propagation, not about metering.
+        &[PolicerSnapshot {
+            name: "p-lo".into(),
+            bandwidth_bps: 1_000_000,
+            burst_bytes: 125_000,
+            discard_excess: false,
+        }],
         &ifaces,
         "",
         "",
@@ -9793,4 +9806,168 @@ fn port_both_positive_and_except_positive_wins_3716() {
         "positive-wins: the except entry 443 is IGNORED; 443 is not in the positive \
          set {{22}} so the term does not match"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #6540: `then policer <name>` resolving to nothing must fail the snapshot
+// closed, not forward unpoliced.
+//
+// Policer was the odd one out of three sibling reference mechanisms: filters
+// raise MissingFilterRef, screen reports ScreenMissingProfileRef, and the
+// policer reference had NO backstop at all — `three_color_policers.get(...)`
+// yielded None and `apply_term_three_color_policer` no-opped the meter, with no
+// Err, no warning and no counter.
+//
+// Reachability: the Go STRICT commit gate (#2217 Finding A) rejects a dangling
+// policer reference, so these snapshots arrive only over the LENIENT path —
+// Store.Load at boot or Store.SyncApply on HA peer-sync
+// (opts.lenientFirewallRefs, #1960 no-brick), where that gate is downgraded to
+// a warning. That is exactly the route these cells drive: a snapshot handed
+// straight to the compiler without a strict commit in front of it.
+// ---------------------------------------------------------------------------
+
+/// Build a one-term filter whose `then policer` names `policer_name`, bound to
+/// an interface input hook so the term actually compiles.
+fn policer_ref_fixture_6540(policer_name: &str) -> (Vec<FirewallFilterSnapshot>, Vec<crate::InterfaceSnapshot>) {
+    (
+        vec![FirewallFilterSnapshot {
+            name: "rl".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "limit".into(),
+                action: "accept".into(),
+                policer: policer_name.into(),
+                ..Default::default()
+            }],
+        }],
+        vec![crate::InterfaceSnapshot {
+            name: "ge-0/0/0.0".into(),
+            ifindex: 11,
+            filter_input_v4: "rl".into(),
+            ..Default::default()
+        }],
+    )
+}
+
+/// RED-on-revert: delete `preflight_term_policer_ref` from `parse_term` and an
+/// undefined policer reference compiles cleanly again, leaving the rate limit
+/// unenforced. Asserts WHICH error fired and every field, so a different
+/// fail-closed guard tripping for an unrelated reason cannot pass this cell.
+#[test]
+fn missing_policer_ref_6540_rejects_rather_than_forwarding_unpoliced() {
+    let (filters, ifaces) = policer_ref_fixture_6540("no-such-policer");
+    let err = parse_filter_state(&filters, &[], &ifaces, "", "")
+        .expect_err("an undefined `then policer` reference must fail the snapshot closed");
+    match err {
+        SnapshotIntegrityError::MissingPolicerRef {
+            family,
+            filter,
+            term,
+            policer,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "rl");
+            assert_eq!(term, "limit");
+            assert_eq!(policer, "no-such-policer");
+        }
+        other => panic!("expected MissingPolicerRef, got {other:?}"),
+    }
+}
+
+/// Positive control: a reference satisfied by `firewall policer` compiles.
+#[test]
+fn defined_single_rate_policer_ref_6540_compiles() {
+    let (filters, ifaces) = policer_ref_fixture_6540("rl-1m");
+    let state = parse_filter_state(
+        &filters,
+        &[PolicerSnapshot {
+            name: "rl-1m".into(),
+            bandwidth_bps: 1_000_000,
+            burst_bytes: 125_000,
+            discard_excess: true,
+        }],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("a defined single-rate policer reference must compile");
+    assert!(
+        state.three_color_policer_by_name.contains_key("rl-1m"),
+        "the #4514 lowering must place a healthy single-rate policer in the runtime map"
+    );
+}
+
+/// Positive control: a reference satisfied by `firewall three-color-policer`
+/// compiles. The two stanzas are distinct config, and the preflight must accept
+/// a name defined in EITHER — reading only one collection would reject half of
+/// all valid configs.
+#[test]
+fn defined_three_color_policer_ref_6540_compiles() {
+    let (filters, ifaces) = policer_ref_fixture_6540("tcp-3c");
+    parse_filter_state_with_three_color(
+        &filters,
+        &[],
+        &[ThreeColorPolicerSnapshot {
+            name: "tcp-3c".into(),
+            committed_rate_bytes_per_sec: 125_000,
+            committed_burst_bytes: 12_500,
+            peak_or_excess_rate_bytes_per_sec: 250_000,
+            peak_or_excess_burst_bytes: 25_000,
+            ..Default::default()
+        }],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("a defined three-color policer reference must compile");
+}
+
+/// The cell that distinguishes this fix from the naive one.
+///
+/// #6540 as filed prescribes rejecting when the term's policer is absent from
+/// the compiled `three_color_policer_by_name` map. That predicate is WRONG:
+/// `lower_single_rate_policer_runtimes` (#4514) deliberately SKIPS a degenerate
+/// zero-rate METER-ONLY policer, on the stated grounds that it has no action to
+/// enforce. Such a policer IS defined and boots fine today, so keying the
+/// rejection on the map would refuse a working config — a brick, not a fix.
+///
+/// This asserts both halves of that distinction: the policer is genuinely
+/// ABSENT from the runtime map, AND the snapshot still compiles. Re-key the
+/// preflight to the map and this cell reds.
+#[test]
+fn degenerate_meter_only_policer_ref_6540_is_defined_and_must_not_be_rejected() {
+    let (filters, ifaces) = policer_ref_fixture_6540("meter-only");
+    let state = parse_filter_state(
+        &filters,
+        &[PolicerSnapshot {
+            name: "meter-only".into(),
+            bandwidth_bps: 0,
+            burst_bytes: 0,
+            discard_excess: false,
+        }],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect(
+        "a DEFINED but degenerate meter-only policer must not be rejected — \
+         #4514 skips it on purpose and this config boots today",
+    );
+    assert!(
+        !state.three_color_policer_by_name.contains_key("meter-only"),
+        "fixture no longer exercises the map/definedness distinction: #4514 is \
+         expected to SKIP this policer, so it must be absent from the runtime \
+         map. If it is present, this cell has gone vacuous and no longer \
+         guards against re-keying the preflight to the map."
+    );
+}
+
+/// An EMPTY `then policer` is the legitimate "unpoliced" case, not a dangling
+/// reference. A preflight that rejected the empty string would fail every term
+/// in every filter that does not police.
+#[test]
+fn empty_policer_ref_6540_is_unpoliced_not_an_error() {
+    let (filters, ifaces) = policer_ref_fixture_6540("");
+    parse_filter_state(&filters, &[], &ifaces, "", "")
+        .expect("a term with no policer must compile — empty means unpoliced");
 }

@@ -1,3 +1,42 @@
+## 2026-08-21 — #6540 dangling `then policer` stops forwarding unpoliced
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added `SnapshotIntegrityError::MissingPolicerRef` and a
+  `preflight_term_policer_ref` guard in the filter compiler, so a term
+  whose `then policer <name>` resolves to nothing rejects the snapshot
+  instead of silently no-opping the meter and forwarding unpoliced.
+  Policer was the one member of the strict-commit / lenient-boot /
+  Rust-backstop family with no backstop at all.
+  DESIGN CORRECTION vs the issue as filed: the predicate is DEFINEDNESS
+  (the name appears in the `policers` or `three_color_policers` snapshot
+  collection), NOT presence in the compiled `three_color_policer_by_name`
+  map that the issue prescribes. `lower_single_rate_policer_runtimes`
+  (#4514) deliberately skips a degenerate zero-rate meter-only policer
+  because it has no action to enforce, so that policer is defined, absent
+  from the map, and boots fine today — keying the rejection on the map
+  would refuse a working config. Definedness is also the exact question
+  the Go strict gate (#2217 Finding A) asks, so the two cannot disagree.
+  DEFERRED, with reason: the issue's "second site in the same change"
+  (the four CoS interface reference fields) is NOT included. Those have
+  no Go strict gate — only warnings at compiler_validate_warn.go:1668/
+  1686/1693/1700 — so a Rust hard-reject would let commit SUCCEED and
+  then have the helper refuse the whole snapshot. That is a brick and
+  strictly worse than today's QoS degradation. Filed as #7337 with the
+  required sequencing (Go strict gate first).
+  FIXTURE REPAIR: `filter_result_modifiers_roundtrip_5444` named policer
+  `p-lo` and never defined it. It asserted the policer NAME propagates
+  into the accumulator while the rate limit it named was not enforced at
+  all — a live demonstration of this bug inside the test suite. It now
+  defines a meter-only `p-lo`, which cannot alter its assertions.
+  Validation: full `cargo test --release --bins --tests --
+  --test-threads=1` green, 4522 passed / 0 failed (4517 baseline + 5 new
+  cells); pristine baseline re-run green beforehand. 4-cell mutation
+  matrix all red, each reddening a DIFFERENT named cell, control and
+  restored green.
+- **File(s)**: userspace-dp/src/policy_snapshot_error.rs,
+  userspace-dp/src/filter/compiler.rs, userspace-dp/src/filter/tests.rs,
+  userspace-dp/src/filter/README.md, docs/feature-coverage.md, _Log.md
+
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
 - **Timestamp**: 2026-08-22
