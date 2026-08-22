@@ -33,17 +33,25 @@ func runUpgradeKernelSubcommand(args []string) {
 	}
 	verb := args[0]
 	fs := flag.NewFlagSet("upgrade kernel "+verb, flag.ContinueOnError)
-	// DIAGNOSTIC-ONLY for `arm` (#6601 r8 / #6632). The boot-time promotion
-	// gate is a systemd oneshot with a hardcoded ExecStart and no way to be
-	// told a journal path, so it always reads the compiled-in default — as does
-	// the arm-record sidecar beside it. A candidate armed against a non-default
-	// journal is therefore structurally unpromotable: it boots, runs
-	// unverified, and the next reboot reverts it. #6632 tracks refusing that at
-	// arm time; until then the help text says so.
+	// REFUSED for `arm` since #6631; diagnostic-only for the other kernel verbs.
+	// The boot-time promotion gate is a systemd oneshot with a hardcoded
+	// ExecStart and no way to be told a journal path, so it always reads the
+	// compiled-in default — as does the arm-record sidecar beside it. A
+	// candidate armed against a non-default journal is therefore structurally
+	// unpromotable: it boots, runs unverified, and the next reboot reverts it,
+	// with the gate logging an ordinary boot.
+	//
+	// upgrade.KernelRunner.Arm now REFUSES that rather than accepting it
+	// (ErrKernelJournalUnpromotable), so the failure lands in the operator's
+	// terminal at the moment they ask instead of as a silent non-promotion one
+	// reboot later. The flag stays defined here because the read-only verbs
+	// (status) and the crash-recovery verbs legitimately take one, and because
+	// removing it would break the diagnostic use the tests rely on.
 	journalPath := fs.String("journal", upgrade.DefaultKernelJournalPath,
-		"crash-safe kernel-channel journal path (DIAGNOSTIC-ONLY for `arm`: the "+
-			"boot-time promotion gate always reads "+upgrade.DefaultKernelJournalPath+
-			", so a candidate armed against a different journal can never be promoted)")
+		"crash-safe kernel-channel journal path (`arm` REFUSES a non-default "+
+			"value: the boot-time promotion gate always reads "+
+			upgrade.DefaultKernelJournalPath+", so a candidate armed against a "+
+			"different journal could never be verified or promoted)")
 	strictWatchdog := fs.Bool("strict-watchdog", false,
 		"Path-D1: refuse to arm unless a verified-persistent watchdog is present "+
 			"(default Path-D2: BootNext still closes the boot-loop; an early hang "+

@@ -43,30 +43,24 @@ func fakeXpfd(t *testing.T, dir string, exitCode int) string {
 	return p
 }
 
-// withGateSeams points the resolver's three seams at test-controlled values and
-// restores them afterwards. selfPath == "" makes os.Executable report an error
-// (driving the fallback chain). sbinDir is pointed at a non-existent path so a
-// caller that only cares about candidates 1 and 3 gets candidate 2 out of the
-// way; withGateSeamsSbin sets it explicitly.
-func withGateSeams(t *testing.T, selfPath, versionsDir string) {
+// withRunningBinary points the resolver's ONE seam — os.Executable — at a
+// test-controlled value and restores it afterwards. selfPath == "" makes
+// os.Executable report an error.
+//
+// It used to take a sbin dir and a versions dir too, because the resolver fell
+// through to those configured roots. #6620 deleted both fallbacks, so this is
+// now the entire seam surface: there is nothing else left for a test to point
+// anywhere, and a test that still wanted to would be modelling a resolver
+// behaviour that no longer exists.
+func withRunningBinary(t *testing.T, selfPath string) {
 	t.Helper()
-	withGateSeamsSbin(t, selfPath, filepath.Join(t.TempDir(), "no-such-sbin"), versionsDir)
-}
-
-// withGateSeamsSbin is withGateSeams with the managed-sbin candidate (2) set.
-func withGateSeamsSbin(t *testing.T, selfPath, sbinDir, versionsDir string) {
-	t.Helper()
-	origExe, origSbin, origVer := osExecutable, gateSbinDir, gateVersionsDir
-	t.Cleanup(func() {
-		osExecutable, gateSbinDir, gateVersionsDir = origExe, origSbin, origVer
-	})
+	orig := osExecutable
+	t.Cleanup(func() { osExecutable = orig })
 	if selfPath == "" {
 		osExecutable = func() (string, error) { return "", os.ErrNotExist }
 	} else {
 		osExecutable = func() (string, error) { return selfPath, nil }
 	}
-	gateSbinDir = sbinDir
-	gateVersionsDir = versionsDir
 }
 
 // TestVerifyDataplaneCmdUsesExplicitResolvedPath is the core RED-on-revert: the
@@ -80,7 +74,7 @@ func withGateSeamsSbin(t *testing.T, selfPath, sbinDir, versionsDir string) {
 func TestVerifyDataplaneCmdUsesExplicitResolvedPath(t *testing.T) {
 	root := t.TempDir()
 	self := fakeXpfd(t, filepath.Join(root, "versions", "v1.2.3"), 0)
-	withGateSeams(t, self, filepath.Join(root, "versions"))
+	withRunningBinary(t, self)
 
 	sys := &realKernelSystem{}
 	cmd, err := sys.verifyDataplaneCmd()
@@ -129,7 +123,7 @@ func TestVerifyDataplaneRunsTheResolvedBinary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			self := fakeXpfd(t, filepath.Join(root, "versions", "v9"), tc.exitCode)
-			withGateSeams(t, self, filepath.Join(root, "versions"))
+			withRunningBinary(t, self)
 
 			ok, err := (&realKernelSystem{}).VerifyDataplane()
 			if err != nil {
@@ -142,153 +136,181 @@ func TestVerifyDataplaneRunsTheResolvedBinary(t *testing.T) {
 	}
 }
 
-// TestResolveVerifyGateBinPrefersRunningBinary: the running xpfd is the
-// primary. It is exactly the live build, needs no symlink to be intact, and on
-// Linux /proc/self/exe has already resolved sbin -> versions/<ver>/xpfd.
-func TestResolveVerifyGateBinPrefersRunningBinary(t *testing.T) {
+// TestResolveVerifyGateBinResolvesTheRunningBinary is the ANTI-OVER-REACH
+// guard for #6620: on a healthy box the resolver must still succeed.
+//
+// Refusing on a healthy box is its own outage — a Gate-3 error routes to
+// revert(), so an over-strict resolver would reboot every candidate trial back
+// to known-good and no kernel could ever be promoted. The refusal added by
+// #6620 is only correct because THIS case keeps working.
+//
+// This test previously also planted a rival binary under versions/current to
+// prove the running binary OUTRANKED it. That fixture is deliberately gone
+// rather than left in place: with the configured-root fallbacks deleted the
+// resolver cannot see such a file at all, so planting one would assert nothing
+// while reading like a priority test (a vacuous survivor of the rewrite).
+func TestResolveVerifyGateBinResolvesTheRunningBinary(t *testing.T) {
 	root := t.TempDir()
 	self := fakeXpfd(t, filepath.Join(root, "versions", "running"), 0)
-	// A DIFFERENT, also-valid candidate under versions/current — the running
-	// binary must win.
-	fakeXpfd(t, filepath.Join(root, "versions", "current"), 0)
-	withGateSeams(t, self, filepath.Join(root, "versions"))
+	withRunningBinary(t, self)
 
 	got, err := resolveVerifyGateBin()
 	if err != nil {
-		t.Fatalf("resolveVerifyGateBin: %v", err)
+		t.Fatalf("resolveVerifyGateBin on a healthy box: %v — refusing here "+
+			"reverts every candidate trial (#6620 over-reach)", err)
 	}
 	if got != self {
 		t.Fatalf("resolved %q, want the running binary %q", got, self)
 	}
 }
 
-// TestResolveVerifyGateBinFallsBackToVersionedRuntime: when os.Executable is
-// unusable (no /proc, or a deleted running binary) AND there is no managed sbin
-// entry, the resolver falls back to the #1917 version-multiplexed path — still
-// explicit, still never PATH.
-func TestResolveVerifyGateBinFallsBackToVersionedRuntime(t *testing.T) {
-	root := t.TempDir()
-	versions := filepath.Join(root, "versions")
-	want := fakeXpfd(t, filepath.Join(versions, "current"), 0)
-	withGateSeams(t, "", versions) // os.Executable fails, no sbin entry
-
-	got, err := resolveVerifyGateBin()
-	if err != nil {
-		t.Fatalf("resolveVerifyGateBin: %v", err)
-	}
-	if got != want {
-		t.Fatalf("resolved %q, want the versioned-runtime path %q", got, want)
-	}
-}
-
-// TestResolveVerifyGateBinPrefersSbinOverDefaultVersionsRoot is the
-// RELOCATED-INSTALL regression guard.
+// pre6620FallbackLabels are the substrings the DELETED fallback chain used to
+// put in its aggregated error when it had tried, and failed, to use a
+// configured root. They are named here for one purpose: a fail-on-revert that
+// does not depend on what happens to exist on the machine running the test.
 //
-// `--versions-dir` and `--sbin-dir` are real operator options, and flip step 6b
-// repoints <SbinDir>/<bin> -> <VersionsDir>/current/<bin> on every cut
-// (flip.go), so the sbin entry tracks the live version wherever the runtime
-// lives. Relocating does NOT remove an older /var/lib/xpf/versions/current, so a
-// resolver that consulted the hardcoded default root first would pick a STALE
-// build and verify the candidate kernel against the wrong dataplane.
+// A refusal test that only asserts `err != nil` is PROBE-BOUNDED. Restore the
+// fallbacks and, on a box that has a real /usr/local/sbin/xpfd, the resolver
+// returns that path — caught by the empty-path assertion. On a box that has
+// neither default, the reverted resolver still errors, and the assertion goes
+// green while the defect is fully present. Asserting the error does NOT carry
+// these labels closes that second branch: the reverted code emits them
+// whenever it reached for a root and could not use it, which is exactly the
+// case the empty-path assertion cannot see.
+var pre6620FallbackLabels = []string{"managed sbin entry", "versioned runtime"}
+
+// assertRefusedWithoutInference is the shared refusal assertion. Both halves
+// matter and they fail on DIFFERENT machines, so neither is redundant.
+func assertRefusedWithoutInference(t *testing.T, got string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("resolveVerifyGateBin returned %q with no identifiable running "+
+			"xpfd; since #6620 it must REFUSE rather than infer one from a "+
+			"configured root", got)
+	}
+	if got != "" {
+		t.Fatalf("resolveVerifyGateBin refused but still returned %q — a caller "+
+			"that ignores the error would exec an inferred binary", got)
+	}
+	for _, label := range pre6620FallbackLabels {
+		if strings.Contains(err.Error(), label) {
+			t.Fatalf("the refusal names %q, so the resolver still ATTEMPTED a "+
+				"configured-root fallback before giving up (#6620). Error: %v",
+				label, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "#6620") {
+		t.Errorf("refusal %q should cite #6620 so an operator reading the revert "+
+			"reason can tell this apart from a genuine verifier REJECT", err)
+	}
+}
+
+// TestResolveVerifyGateBinRefusesWhenTheRunningBinaryIsUnidentifiable is the
+// core #6620 fail-on-revert: os.Executable is the ONLY authority, and when it
+// cannot answer the resolver refuses.
 //
-// This models exactly that: a leftover default-root runtime AND a live sbin
-// entry pointing into a relocated root. The sbin entry must win.
-func TestResolveVerifyGateBinPrefersSbinOverDefaultVersionsRoot(t *testing.T) {
-	root := t.TempDir()
-
-	// The leftover, STALE default runtime.
-	staleDefault := fakeXpfd(t, filepath.Join(root, "default-versions", "current"), 0)
-
-	// The LIVE relocated runtime, with the managed sbin entry pointing at it
-	// the way flip 6b leaves it.
-	live := fakeXpfd(t, filepath.Join(root, "relocated", "versions", "v2"), 0)
-	sbinDir := filepath.Join(root, "sbin")
-	if err := os.MkdirAll(sbinDir, 0o755); err != nil {
-		t.Fatalf("mkdir sbin: %v", err)
-	}
-	sbinEntry := filepath.Join(sbinDir, verifyGateBin)
-	if err := os.Symlink(live, sbinEntry); err != nil {
-		t.Fatalf("symlink sbin entry: %v", err)
-	}
-
-	// os.Executable unusable, so the fallback ORDER is what decides.
-	withGateSeamsSbin(t, "", sbinDir, filepath.Join(root, "default-versions"))
+// Why refusing beats the old fallback, stated as the failure it prevents:
+// <SbinDir>/xpfd and <VersionsDir>/current/xpfd are compiled-in defaults, and
+// `--sbin-dir`/`--versions-dir` relocate INDEPENDENTLY without removing what
+// they leave behind. So on a relocated box a leftover at either default is
+// byte-for-byte indistinguishable from a live install — including the
+// both-roots-relocated shape where the surviving default symlink still points
+// at the surviving default runtime, making the two "candidates" ONE INODE
+// exactly like a healthy layout. Executing that leftover verifies the candidate
+// KERNEL against the wrong DATAPLANE and then authorizes a permanent promotion
+// on the result. Refusing routes to revert(), which is the safe direction.
+func TestResolveVerifyGateBinRefusesWhenTheRunningBinaryIsUnidentifiable_6620(t *testing.T) {
+	withRunningBinary(t, "") // no /proc: os.Executable errors
 
 	got, err := resolveVerifyGateBin()
-	if err != nil {
-		t.Fatalf("resolveVerifyGateBin: %v", err)
-	}
-	if got == staleDefault {
-		t.Fatalf("resolved the STALE default-root runtime %q on a relocated "+
-			"install; the managed sbin entry %q tracks the live version and must "+
-			"be consulted first (#6541 fold r2)", got, sbinEntry)
-	}
-	if got != sbinEntry {
-		t.Fatalf("resolved %q, want the managed sbin entry %q", got, sbinEntry)
-	}
+	assertRefusedWithoutInference(t, got, err)
 }
 
-// TestResolveVerifyGateBinSkipsDanglingSbinEntry: the sbin entry earns its
-// priority only while it resolves. A #2176 dangling symlink (points into a
-// removed versions dir) must NOT shadow the versioned-runtime fallback — that
-// is the whole reason candidate 3 still exists.
-func TestResolveVerifyGateBinSkipsDanglingSbinEntry(t *testing.T) {
-	root := t.TempDir()
-	versions := filepath.Join(root, "versions")
-	want := fakeXpfd(t, filepath.Join(versions, "current"), 0)
-
-	sbinDir := filepath.Join(root, "sbin")
-	if err := os.MkdirAll(sbinDir, 0o755); err != nil {
-		t.Fatalf("mkdir sbin: %v", err)
-	}
-	if err := os.Symlink(filepath.Join(root, "removed", "xpfd"),
-		filepath.Join(sbinDir, verifyGateBin)); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-
-	withGateSeamsSbin(t, "", sbinDir, versions)
-
-	got, err := resolveVerifyGateBin()
-	if err != nil {
-		t.Fatalf("resolveVerifyGateBin: %v", err)
-	}
-	if got != want {
-		t.Fatalf("resolved %q, want the versioned-runtime fallback %q (a dangling "+
-			"sbin symlink must not shadow it)", got, want)
-	}
-}
-
-// TestResolveVerifyGateBinFallsBackWhenRunningBinaryPathIsGone covers the
-// SECOND way candidate (1) can be unusable, distinct from the error branch
+// TestResolveVerifyGateBinRefusesWhenTheRunningBinaryPathIsGone covers the
+// SECOND way the sole authority can be unusable, distinct from the error branch
 // above: os.Executable SUCCEEDS and returns a plausible path, but that path no
-// longer resolves. This is what an unlinked running binary actually looks like.
+// longer resolves. This is what an UNLINKED running binary actually looks like,
+// and it is the branch most likely to be hit in production — a binary cut that
+// replaced the running artifact mid-flight.
 //
 // Be precise about the mechanism, because the obvious guess is wrong: Readlink
 // on /proc/self/exe appends " (deleted)" for an unlinked binary, but Go TRIMS
 // that suffix and returns the original path with a nil error
 // (src/os/executable_procfs.go). So there is no suffix to detect, and a test
 // seeding a "(deleted)"-suffixed string would be feeding the resolver an input
-// the real API cannot produce. The fallback is driven purely by os.Stat
+// the real API cannot produce. The refusal is driven purely by os.Stat
 // returning ENOENT — which is exactly what this seeds.
-func TestResolveVerifyGateBinFallsBackWhenRunningBinaryPathIsGone(t *testing.T) {
+//
+// This is also the case that makes #6620 more than housekeeping. Before the
+// fix, an unlinked running binary fell through to <SbinDir>/xpfd — which after
+// a cut is precisely the NEW build, not the one that armed the candidate. The
+// gate would then verify the candidate kernel against a dataplane the arming
+// never designated, and Gate 2b's arm-record cross-check could not catch it:
+// that check compares os.Executable against the record, and os.Executable here
+// still reports the OLD path.
+func TestResolveVerifyGateBinRefusesWhenTheRunningBinaryPathIsGone_6620(t *testing.T) {
 	root := t.TempDir()
-	versions := filepath.Join(root, "versions")
-	want := fakeXpfd(t, filepath.Join(versions, "current"), 0)
-
 	// A real-shaped path (versions/<ver>/xpfd) that was created and then
 	// unlinked — os.Executable would still report it verbatim.
-	unlinked := fakeXpfd(t, filepath.Join(versions, "v1.2.3"), 0)
+	unlinked := fakeXpfd(t, filepath.Join(root, "versions", "v1.2.3"), 0)
 	if err := os.Remove(unlinked); err != nil {
 		t.Fatalf("unlink %s: %v", unlinked, err)
 	}
-	withGateSeams(t, unlinked, versions)
+	// A perfectly usable rival at the shape the DELETED candidate 3 would have
+	// built. It is planted to document the case, not to be found: the resolver
+	// has no versions-dir seam any more, so nothing can point it here. The
+	// assertion that it is never returned is therefore carried by
+	// assertRefusedWithoutInference's empty-path check, not by this file.
+	fakeXpfd(t, filepath.Join(root, "versions", "current"), 0)
+
+	withRunningBinary(t, unlinked)
 
 	got, err := resolveVerifyGateBin()
-	if err != nil {
-		t.Fatalf("resolveVerifyGateBin: %v", err)
+	assertRefusedWithoutInference(t, got, err)
+}
+
+// TestVerifyDataplaneRefusesRatherThanVerifyingWithAnInferredBinary is the
+// caller-visible half: the refusal must reach Gate 3 as an ERROR, because that
+// is what routes to revert(). A resolver that refused but let VerifyDataplane
+// report PASS would be strictly worse than the fallback it replaced.
+func TestVerifyDataplaneRefusesRatherThanVerifyingWithAnInferredBinary_6620(t *testing.T) {
+	root := t.TempDir()
+	unlinked := fakeXpfd(t, filepath.Join(root, "versions", "v1"), 0)
+	if err := os.Remove(unlinked); err != nil {
+		t.Fatalf("unlink: %v", err)
 	}
-	if got != want {
-		t.Fatalf("resolved %q, want %q", got, want)
+	withRunningBinary(t, unlinked)
+
+	ok, err := (&realKernelSystem{}).VerifyDataplane()
+	if err == nil {
+		t.Fatalf("VerifyDataplane returned ok=%v with a nil error and no "+
+			"identifiable xpfd; Gate 3 turns only a NON-NIL error into revert() "+
+			"(#6620)", ok)
+	}
+	if ok {
+		t.Fatal("VerifyDataplane reported PASS without running any verifier (#6620)")
+	}
+	// WHICH layer rejected, not merely THAT one did. Without this the cell is
+	// not sensitive to the resolver accepting the path at all: hand
+	// exec.Command a path that does not exist and it fails at exec time with
+	// its own error, so `err != nil && !ok` holds either way and the assertion
+	// cannot tell "refused before exec" from "tried and could not exec".
+	//
+	// The distinction is the point of the branch. An unusable path happens to
+	// fail late as well, but a BARE name does not — exec.Command PATH-resolves
+	// it and a planted xpfd would report a clean verify (#6541). The two live
+	// in one branch, so the cell must observe the branch, not the outcome.
+	const resolverLayer = "resolve verify-dataplane gate binary"
+	if !strings.Contains(err.Error(), resolverLayer) {
+		t.Fatalf("VerifyDataplane failed with %q, which is not a %q refusal — "+
+			"the resolver ACCEPTED the unusable path and the failure came from "+
+			"exec instead (#6620)", err, resolverLayer)
+	}
+	for _, label := range pre6620FallbackLabels {
+		if strings.Contains(err.Error(), label) {
+			t.Fatalf("VerifyDataplane's error names %q — the configured-root "+
+				"fallback is back (#6620): %v", label, err)
+		}
 	}
 }
 
@@ -385,7 +407,7 @@ func TestResolveVerifyGateBinFailsClosed(t *testing.T) {
 	fakeXpfd(t, pathDir, 0)
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	withGateSeams(t, "", filepath.Join(root, "no-such-versions"))
+	withRunningBinary(t, "")
 
 	got, err := resolveVerifyGateBin()
 	if err == nil {
@@ -413,7 +435,7 @@ func TestVerifyDataplaneFailsClosedOnUnresolvableBinary(t *testing.T) {
 	fakeXpfd(t, pathDir, 0) // would PASS if the gate PATH-resolved
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	withGateSeams(t, "", filepath.Join(root, "no-such-versions"))
+	withRunningBinary(t, "")
 
 	ok, err := (&realKernelSystem{}).VerifyDataplane()
 	if err == nil {
@@ -466,22 +488,14 @@ func TestValidateGateBinRejectsNonExplicitTargets(t *testing.T) {
 	}
 }
 
-// TestGateResolutionDefaultsToProductionVersionsDir is the OVER-REACH GUARD
-// for the fallback candidate: the package default must be the real #1917
-// versioned-runtime root, so a normal promote on a real appliance resolves
-// through versions/current and not some test-only path. It must stay GREEN
-// under revert of the #6541 fix.
-func TestGateResolutionDefaultsToProductionVersionsDir(t *testing.T) {
-	if gateSbinDir != DefaultSbinDir {
-		t.Fatalf("gateSbinDir = %q, want DefaultSbinDir %q", gateSbinDir, DefaultSbinDir)
-	}
-	if gateVersionsDir != DefaultVersionsDir {
-		t.Fatalf("gateVersionsDir = %q, want DefaultVersionsDir %q", gateVersionsDir, DefaultVersionsDir)
-	}
-	if got := filepath.Join(DefaultSbinDir, verifyGateBin); got != "/usr/local/sbin/xpfd" {
-		t.Fatalf("candidate 2 = %q, want /usr/local/sbin/xpfd", got)
-	}
-	if got := filepath.Join(DefaultVersionsDir, currentLink, verifyGateBin); got != "/var/lib/xpf/versions/current/xpfd" {
-		t.Fatalf("candidate 3 = %q, want /var/lib/xpf/versions/current/xpfd", got)
-	}
-}
+// The pre-#6620 over-reach guard TestGateResolutionDefaultsToProductionVersionsDir
+// lived here. It asserted that the fallback package vars defaulted to the real
+// #1917 roots (so a normal promote resolved through versions/current rather
+// than a test-only path). Those vars no longer exist, so the test could only
+// have been kept by re-adding what #6620 deleted.
+//
+// Its PURPOSE — "the resolver must not over-reach into something test-only" —
+// is carried by TestResolveVerifyGateBinResolvesTheRunningBinary above, which
+// is the over-reach that is now possible: refusing a healthy box. DefaultSbinDir
+// and DefaultVersionsDir themselves remain covered where they are still USED,
+// by the flip/cutover tests that exercise the cut writing them.

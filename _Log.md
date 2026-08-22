@@ -40,6 +40,120 @@
 - **File(s)**: `pkg/dataplane/userspace/junos_host_residual_6612_test.go`
   (new), `docs/host-inbound-service-matrix.md`
 
+## 2026-08-21 — #6631 kernel arm: refuse a journal path the boot gate cannot read
+
+- **Timestamp**: 2026-08-21
+- **Action**: `xpfd upgrade kernel arm --journal <non-default>` produced a
+  STRUCTURALLY UNPROMOTABLE candidate. Go honoured the flag — the journal went
+  to `<path>` and `ArmRecordPath` derived the sidecar from its directory, so
+  both files moved together — while the boot gate hardcodes both locations. It
+  found neither, took its benign "nothing to promote" branch, and exited quiet:
+  the candidate booted, ran UNVERIFIED, was never promoted, and reverted on the
+  next plain reboot behind a log line that reads like an ordinary boot.
+
+  Established the "can never be promoted" claim as UNREACHABLE rather than
+  merely awkward by closing all three channels that could carry a path:
+  `xpf-kernel-promote.service` is `ExecStart=/usr/local/sbin/xpf-kernel-promote`
+  with no operands AND the script parses no argv of its own (no `$1`, `$@` or
+  `getopts` — the only `$1`/`$2` in it are function parameters); neither
+  promote unit mentions a journal in any form; and the gate's inner exec is
+  `"$XPFD" upgrade kernel promote` with no `--journal`. So even an operator
+  drop-in overriding `ExecStart` has nothing to pass to.
+
+  `KernelRunner.Arm` therefore refuses up front with a new
+  `ErrKernelJournalUnpromotable`, before the candidate version is validated and
+  before any system call. Deliberately NOT `ErrKernelChannelUnavailable`: that
+  sentinel exits 2 and the kernel-roll orchestrator reads it as a legitimate
+  LANE-2 fallback, which an operator typo must not look like.
+
+  The seam is a package var `bootGateJournalPath`, so a test that arms against
+  a `t.TempDir()` journal states "this box's gate reads here" rather than
+  switching the check off. Unexported, so cmd/xpfd and pkg/daemon are
+  structurally incapable of relaxing it, and
+  `TestBootGateJournalPathIsTheProductionDefault_6631` pins the compiled-in
+  value so a leaked override cannot make the guard vacuous for the ~30 arm
+  tests that follow.
+
+  Corrected the operator-facing text that PROMISED this did not exist: the
+  `--journal` flag help said "DIAGNOSTIC-ONLY … can never be promoted" and its
+  comment pointed at #6632 ("until then the help text says so"); #6632 was
+  closed as a duplicate of #6631 on 2026-08-07 with no implementing PR.
+- **File(s)**: `pkg/upgrade/kernel_arm_journal_path.go` (new),
+  `pkg/upgrade/kernel_arm_journal_6631_test.go` (new),
+  `pkg/upgrade/kernel_run.go`, `pkg/upgrade/kernel_test.go`,
+  `cmd/xpfd/upgrade_kernel.go`, `docs/in-place-upgrade.md`,
+  `scripts/image/xpf-kernel-promote` (comment cross-reference),
+  `scripts/image/test_kernel_promote_explicit_path.py` (docstring
+  cross-references), `_Log.md`
+
+## 2026-08-21 — #6620 inner promote hop: delete the filesystem-inference fallbacks
+
+- **Timestamp**: 2026-08-21
+- **Action**: `resolveVerifyGateBin` (the INNER hop of the #1930 A/B kernel
+  promote gate) fell back to `<SbinDir>/xpfd` and then
+  `<VersionsDir>/current/xpfd` when `os.Executable()` failed or its path no
+  longer resolved. That is the defect class #6601 r5 removed from the OUTER
+  shell hop: selecting a binary by inference from filesystem evidence, where a
+  leftover from a relocated runtime is indistinguishable from a healthy layout.
+  Deleted both candidates and the `gateSbinDir`/`gateVersionsDir` package vars
+  that made them reachable; `os.Executable()` is now the sole authority and an
+  unresolvable answer REFUSES. A Gate-3 error routes to `revert()` (restore the
+  known-good `BootOrder`, reboot known-good), so refusing is a correct terminal
+  outcome and strictly better than verifying the candidate kernel against a
+  stale dataplane.
+
+  Swept every fixture that set the deleted seams rather than leaving a vacuous
+  survivor: the four `FallsBack`/`PrefersSbin`/`SkipsDangling` tests are
+  inverted into refusals, the rival-binary plant in the priority test is
+  removed (the resolver can no longer see such a file, so it asserted nothing),
+  and `TestGateResolutionDefaultsToProductionVersionsDir` — which pinned the
+  now-deleted vars — is replaced by an anti-over-reach test for the over-reach
+  that IS now possible: refusing a healthy box.
+
+  Added a source-level guard because deleting the fallbacks also deleted the
+  seams a behavioural test needed: with no seam, a reverted resolver reaches for
+  the real `/usr/local/sbin/xpfd`, so whether a refusal test reds becomes a
+  property of the test HOST. `TestResolveVerifyGateBinHasNoFilesystemInference_6620`
+  walks the AST and is host-independent.
+- **File(s)**: `pkg/upgrade/kernel_linux.go`,
+  `pkg/upgrade/kernel_verify_explicit_path_6541_test.go`,
+  `pkg/upgrade/kernel_verify_no_inference_6620_test.go` (new),
+  `docs/in-place-upgrade.md`, `_Log.md`
+
+## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
+
+- **Timestamp**: 2026-08-21
+- **Action**: Dispositioned #6618 (xpf's `system-services any-service`
+  admits every IP protocol; Junos scopes it to the port range). Pulled
+  both Juniper statement pages verbatim: `any-service` is "All system
+  services on an entire port range including the system services that
+  are not defined" and `protocols all` is "Enable traffic from all
+  possible protocols available" over an enumerated 17-protocol list.
+  The `any-service` sentence is SILENT on IP protocols rather than
+  exclusionary, so the parity claim rests on structure (two disjoint
+  knobs), not on a quoted rationale that reaches the raw-protocol case.
+  Rejected Option 1 (narrow): Junos itself cannot admit an arbitrary IP
+  protocol number host-inbound, so narrowing leaves a zone terminating
+  SCTP/IPIP/L2TPv3 with no token at all — and an lo0 input filter
+  provably cannot rescue a host-inbound deny on either enforcement path
+  — while also retracting, one release after #3226, the `any-service`
+  migration that #3226's own advisory instructs operators to use. Kept
+  Option 2 (the shipped behaviour plus the advisory naming the exact
+  blast radius) and converted it from a comment into a contract: a new
+  verdict lock on the LIVE netlink build path (not the pkg/daemon text
+  oracle, which has had no non-test caller since #6387) asserts that the
+  one rule an `any-service` zone renders carries no L4 discriminator and
+  no drop behind it, so OSPF(89)/GRE(47)/VRRP(112)/PIM(103)/SCTP(132)
+  are all accepted, with a narrow-`ssh` control proving the harness sees
+  discrimination and the #3361 catch-all when the zone is not
+  full-admit. Three one-line mutations, each `go vet` clean and each
+  reddening the assertion it targets: narrowing the full admit to a
+  TCP port range (reds the no-discriminator assertion), re-arming
+  `hostInboundEmitsDrop` for a full-admit zone (reds the deny-counter
+  assertion), and leaking full-admit to every zone (reds the control
+  only). No dataplane change; the Rust helper binary is not reached.
+- **File(s)**: `pkg/nftables/host_inbound_any_service_verdict_6618_test.go`
+  (new), `docs/host-inbound-service-matrix.md`
 ## 2026-08-21 — #6656 transfer-out override cleared on peer loss
 
 - **Timestamp**: 2026-08-21
@@ -101866,6 +101980,28 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
     docs/config-schema.md
 
+## 2026-08-22 — #6600 HA import reserves the NAT port before publishing
+- **Timestamp**: 2026-08-22
+- **Action**: `upsert_synced_session` published the shared session entry before
+  enqueueing the worker commands, and the NAT reservation happened only inside
+  the worker-local upsert — so in that window a local flow could claim the port,
+  `reserve_flow` refused to steal it, and the refusal was returned/counted/logged
+  by nothing. Moved the reservation to the coordinator, BEFORE the publish, and
+  refuse the import on failure (counted as `synced_import_reserve_refused`).
+  Made the reserve chains return their verdict (the bool was already computed
+  and discarded). Untracked holder so worker reserves are absorbed; skipped with
+  zero workers; source-NAT rolled back if NAT64 refuses. Zone pair resolved
+  through the SAME helper the worker uses.
+  **MOVES THE userspace-dp HELPER BINARY — cluster smoke owed.**
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/commands/mod.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, docs/sync-protocol.md, _Log.md
 ## 2026-08-22 — #6610 snat_allocator bench flow-key overflow
 - **Timestamp**: 2026-08-22
 - **Action**: Determined READING 1 (benign) with evidence, not assumption: the
@@ -101889,3 +102025,13 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_security.go,
     pkg/config/schema_validators_network.go,
     pkg/config/silent_drop_strict_6564_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 member 9 — a recognized value-taking `term` keyword with no
+    value was silently dropped, widening the application match. Recorded as
+    IncompleteTermLeaves; strict gate rejects, tolerant path warns. Added a
+    source-scanning drift pin binding valueTakingTermLeaves to the switch.
+  - **File(s)**: pkg/config/compiler_applications.go, pkg/config/types_security.go,
+    pkg/config/compiler_validate_strict_application.go,
+    pkg/config/dangling_term_keyword_6564_test.go,
+    pkg/config/testdata/golden_4406.json, docs/config-schema.md

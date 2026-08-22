@@ -183,6 +183,67 @@ This mirrors exactly what #3199 did to the sibling `protocols all` (scoped to
 the routing-protocol set rather than a blanket accept), and reuses the same
 mechanism: an SSOT expansion list plus a load-bearing exclusion set.
 
+### `any-service` is a deliberate superset — narrowing it was rejected (#6618)
+
+**Decision: xpf KEEPS the packet-wide reading of `any-service`.** #6618 proposed
+narrowing it to the Junos reading (widen the TCP/UDP port range only; leave raw
+IP protocols to `protocols`). That was considered and rejected. This section
+records the decision so the question is not re-asked, and
+`pkg/nftables/host_inbound_any_service_verdict_6618_test.go` binds it: the
+single rule an `any-service` zone renders on the live netlink path carries no L4
+discriminator and no drop behind it, so a narrowing turns that test RED and has
+to be an explicit, reviewed flip rather than a quiet edit.
+
+**What the vendor actually says.** Two statement pages, quoted verbatim:
+
+| Statement | Juniper's words |
+|---|---|
+| `system-services any-service` | "All system services on an entire port range including the system services that are not defined." |
+| `protocols all` | "Enable traffic from all possible protocols available. Use the except option to disallow specific protocols." |
+
+Read carefully, the `any-service` sentence is **silent on IP protocols**, not
+contradictory: its subject is "system services" — a vocabulary that is entirely
+TCP/UDP/ICMP — and its widener is a *port* range. The claim that Junos DENIES
+OSPF under `any-service` is therefore an inference from structure, not a quoted
+rationale that reaches the case: Junos carries protocol traffic on a separate
+`protocols` knob, whose own blanket token means the enumerated protocol list
+(`bfd bgp dvmrp igmp ldp msdp nhrp ospf ospf3 pgm pim rip ripng
+router-discovery rsvp sap vrrp`), so a `system-services` token that admitted
+every protocol number would make the protocol-specific knob unreachable. The
+inference is sound, and the direction of xpf's divergence — over-admit on an
+opt-in token — is the fail-safe one. But it is an inference, and the disposition
+below does not need it to be more.
+
+**Why narrowing was rejected.**
+
+- **It removes the only remaining escape, and nothing replaces it.** Junos
+  itself has no way to admit an arbitrary IP protocol number host-inbound:
+  `protocols all` means that enumerated list, and neither knob reaches SCTP,
+  IPIP/6in4, L2TPv3, or a future protocol number. xpf already diverged
+  deliberately once for this reason (the xpf-only `gre` system-service, see the
+  two xpf-only carve-outs above) *because operator configs list it there*. Under
+  a narrowed `any-service`, a zone terminating any other raw protocol on the
+  firewall would have no token at all — and, as
+  [The only escape is `any-service`](#the-only-escape-is-any-service) proves, an
+  lo0 input filter cannot rescue a host-inbound deny on either enforcement path.
+  A hard, unremediable blackhole is a worse outcome than an announced superset.
+- **It retracts #3226's own migration path one release later.** The `all`
+  scoping advisory tells the operator, in as many words, to `use "any-service"
+  for the previous packet-wide admit`. Narrowing `any-service` next would break
+  the same population a second time, and the second time with no remedy left.
+- **The breadth is opt-in and already announced.** An operator must write the
+  token, and `fullAdmitAdvice` (`pkg/config/compiler_validate_warn.go`) emits a
+  commit-time advisory naming the stanza and the exact blast radius
+  ("EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) …
+  a superset of Junos's per-service union"). The surprise #6618 is concerned
+  with — an operator who reads the Junos page and expects port-range semantics —
+  is what that advisory exists to prevent.
+
+**What would reopen it.** A token (or an explicit `protocols` extension) that
+gives a raw IP protocol its own admission path. With one, narrowing `any-service`
+costs an operator nothing and should be revisited; without one, it only converts
+an announced over-admission into a silent, unfixable denial.
+
 ### The union must equal Juniper's defined-service set — both directions
 
 Scoping `all` to the recognized-token union is only Junos-correct if that union
