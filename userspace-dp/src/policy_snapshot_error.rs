@@ -463,6 +463,17 @@ pub(crate) enum SnapshotIntegrityError {
     /// wrapped to 44. Silently installing a wrapped TTL produces a tunnel that
     /// either blackholes (TTL 0) or has a surprising reach. Fail closed instead.
     TunnelTtlOutOfRange { tunnel_id: u16, ttl: i32 },
+    /// #5193 (A1-b7-F1): two tunnel-endpoint rows in one snapshot carried the
+    /// SAME nonzero endpoint id. `populate_tunnel_endpoints` keys
+    /// `tunnel_endpoints` by id and `tunnel_endpoint_by_ifindex` by ifindex,
+    /// so a duplicate id left the two indexes inconsistent — the last row won
+    /// the id while BOTH interfaces' ifindexes pointed at it, and packets on
+    /// the losing interface encapsulated with the winner's outer
+    /// source/destination/key. The Go producer drops an id collision at build
+    /// time (`usedIDs`, #1873), so this is the snapshot-boundary backstop for a
+    /// tolerant / mixed-version / corrupt snapshot, in the same fail-closed
+    /// family as the #2410 TTL gate a few lines above it.
+    TunnelEndpointDuplicateId { tunnel_id: u16, ifindex: i32 },
     /// #2410: a CoS forwarding-class snapshot's `queue` is outside the 0..=255
     /// range representable in the runtime `queue_id` (a u8). The pre-fix code
     /// SILENTLY DROPPED the class via a `filter_map` range check
@@ -528,6 +539,21 @@ pub(crate) enum SnapshotIntegrityError {
     /// install the classifier for a DIFFERENT traffic class (9 -> 1). Same
     /// fail-closed rationale as `CosIeee8021CodePointOutOfRange`.
     CosInetPrecedenceCodePointOutOfRange { classifier: String, precedence: u8 },
+    /// #5193 (A1-b7-F7): a CoS DSCP REWRITE-RULE entry carried a code-point
+    /// outside the 6-bit DSCP domain (0..=63). Unlike the classifier builders
+    /// (which have failed closed since #2447), the rewrite ingest stored the
+    /// value unchecked and the transmit helper masks it with `dscp & 0x3f`, so
+    /// a rule written as 110 silently marked packets DSCP 46 — a different
+    /// PHB than configured, on egress, where it is hardest to notice. The Go
+    /// commit-time gate (`collectCoSDSCPRewriteCodePoint`) is the primary
+    /// defense; this is the helper-boundary backstop against a tolerant /
+    /// mixed-version snapshot, consistent with the rest of the fail-closed
+    /// family.
+    CosDscpRewriteCodePointOutOfRange {
+        rule: String,
+        forwarding_class: String,
+        dscp: u8,
+    },
     /// #2458: a CoS scheduler snapshot carried a NON-EMPTY
     /// `equal_flow_target_policy` wire string that is not one of the known
     /// values (`slowest` / `mean` / `ideal-share`). The pre-fix
@@ -870,6 +896,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 "tunnel endpoint id={} has ttl {} outside the 0..=255 range — refusing to narrow it with an unchecked cast that would wrap (256→0 blackholes the tunnel)",
                 tunnel_id, ttl
             ),
+            Self::TunnelEndpointDuplicateId { tunnel_id, ifindex } => write!(
+                f,
+                "two tunnel endpoints share id {} (second row has ifindex {}) — refusing to install a snapshot whose endpoint id and ifindex indexes would disagree (the later row would win the id while both ifindexes alias it)",
+                tunnel_id, ifindex
+            ),
             Self::CosQueueIdOutOfRange {
                 forwarding_class,
                 queue,
@@ -913,6 +944,15 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "cos inet-precedence classifier {:?} has code-point {} outside the 0..=7 IP-precedence range — refusing to mask it with & 0x7 (which would install the classifier for a different traffic class)",
                 classifier, precedence
+            ),
+            Self::CosDscpRewriteCodePointOutOfRange {
+                rule,
+                forwarding_class,
+                dscp,
+            } => write!(
+                f,
+                "cos dscp rewrite-rule {:?} maps forwarding-class {:?} to code-point {} outside the 0..=63 DSCP range — refusing to let the transmit path mask it with & 0x3f (which would mark the packet with a different PHB than configured)",
+                rule, forwarding_class, dscp
             ),
             Self::CosUnknownEqualFlowTargetPolicy {
                 forwarding_class,
