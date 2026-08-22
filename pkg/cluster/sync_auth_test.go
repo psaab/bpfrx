@@ -522,3 +522,177 @@ func TestSyncAuthProofBindsToNonce(t *testing.T) {
 		t.Fatal("frame key derivation must be canonical/order-independent")
 	}
 }
+
+// TestSyncAuthHandshakeRejectsReflectedNonce_5078 drives the #5078 vector-A
+// reflection attack end-to-end against the real performSyncHandshake: a
+// PSK-less attacker that holds no key, computes no HMAC, and simply ECHOES
+// every frame the node sends straight back at it.
+//
+// Measured on origin/master a77d5568c BEFORE this guard existed, that echo
+// returned `mode=syncAuthAuthenticated, err=nil` with a full 32-byte frame key
+// derived — the node believed a byte-mirror was its keyed peer. That is the
+// entire exploit; there is nothing else the attacker has to do.
+//
+// Two properties of the fixture are load-bearing, and both were WRONG in the
+// first draft of this test:
+//
+//   - The attacker is a pure mirror (`writeMsg(cb, typ, payload)` on the bytes
+//     just read), not a hand-built HELLO carrying the node's nonce. A
+//     hand-built fixture would be keyed to the repair; the mirror is the
+//     attacker's actual capability, so this binds the PROPERTY (an echo cannot
+//     authenticate) rather than the mechanism that stops it.
+//   - The mirror runs to COMPLETION in a goroutine, echoing frames until the
+//     pipe closes. A fixture that echoed only the HELLO and then waited did
+//     red under mutation — but at 3.00s with "read pipe: i/o timeout", i.e. it
+//     proved only that the node stopped talking, never that the attack failed.
+//     With the loop, a mutated node completes the whole handshake and this
+//     test fails on the authentication itself.
+//
+// RED on revert: neuter the `bytes.Equal(peerNonce, localNonce)` arm of
+// syncCheckPeerNonce, or drop its call from performSyncHandshake, and the echo
+// authenticates again — failing on "a byte-echo attacker must NOT
+// authenticate", not on a timeout.
+//
+// Scope, stated so a green here is not over-read: this closes vector A only.
+// Vector B — a second keyed connection used as a proof oracle, where the two
+// nonces differ and nothing here fires — is NOT closed, and cannot be without
+// binding role/identity/transcript into the proof (a wire flag-day). #5078
+// stays open for exactly that.
+func TestSyncAuthHandshakeRejectsReflectedNonce_5078(t *testing.T) {
+	a := newAuthSync(t, []byte("shared-control-link-secret-key"))
+
+	ca, cb := net.Pipe()
+	defer ca.Close()
+	defer cb.Close()
+
+	ach := runHandshake(a, ca)
+
+	// The attacker's ENTIRE algorithm: read a frame, write it back verbatim,
+	// forever. It never touches a key and never parses a payload. net.Pipe is
+	// unbuffered, so each read unblocks the node's concurrent write before the
+	// echo goes out.
+	attackerDone := make(chan struct{})
+	go func() {
+		defer close(attackerDone)
+		for {
+			typ, payload, err := readSyncFrameRaw(cb)
+			if err != nil {
+				return
+			}
+			if err := writeMsg(cb, typ, payload); err != nil {
+				return
+			}
+		}
+	}()
+
+	ar := <-ach
+	cb.Close() // release the mirror, which is parked in a read
+	<-attackerDone
+
+	if ar.err == nil {
+		t.Fatalf("a byte-echo attacker must NOT authenticate (#5078 vector A): "+
+			"got mode=%d frameKey=%x", ar.mode, ar.key)
+	}
+	// Assert the REASON, not merely that some error occurred. Every failure
+	// path in performSyncHandshake returns (unauthenticated, nil, err) — a read
+	// timeout, a short HELLO and a write error are indistinguishable from
+	// `err != nil` alone. This assertion is what turned the first draft's
+	// dishonest 3-second timeout red into a real one.
+	if !strings.Contains(ar.err.Error(), "reflected handshake nonce") {
+		t.Fatalf("rejection must come from the reflected-nonce arm and name the cause; "+
+			"got %q, want it to contain %q", ar.err.Error(), "reflected handshake nonce")
+	}
+	if ar.key != nil {
+		t.Fatalf("a rejected handshake must yield no frame key, got %x", ar.key)
+	}
+	if ar.mode == syncAuthAuthenticated {
+		t.Fatalf("a rejected handshake must not report authenticated mode")
+	}
+}
+
+// TestSyncAuthHandshakeRejectsZeroNonce_5078 covers the OTHER degenerate nonce:
+// a peer that is valid in every other respect — it holds the PSK, advertises
+// keyed=1, and returns a correct proof over the node's nonce — but offers an
+// all-zero challenge. That is what a peer whose CSPRNG never seeded emits.
+//
+// The peer here is deliberately a FULL, key-holding participant rather than a
+// fixture that sends a HELLO and stops. With a passive fixture the mutation red
+// was "read pipe: i/o timeout" at the 3s handshake deadline: it showed the node
+// went quiet, not that a zero-nonce peer is refused. Playing the handshake out
+// means a node with the check removed AUTHENTICATES this peer, and the test
+// then fails on the admission itself.
+//
+// Read against TestSyncAuthHandshakeKeyedHelloPeerStillAuthenticates, which is
+// byte-identical apart from using a 0xA5 nonce and expecting success: the nonce
+// VALUE is the only variable between the two, so this pair localises the
+// rejection to the zero-nonce arm and simultaneously proves the arm does not
+// over-reach into ordinary keyed peers.
+//
+// Separate from the reflection test on purpose: the two arms are two
+// independent lines in syncCheckPeerNonce, and one fixture covering both could
+// not localise — a compound probe reds on whichever arm is bound and masks the
+// other. The zero nonce differs from the node's crypto/rand localNonce, so the
+// reflection arm cannot fire here.
+//
+// RED on revert: neuter the `bytes.Equal(peerNonce, syncAuthZeroNonce)` arm and
+// the zero-nonce peer authenticates. Claimed value is hygiene, not a live
+// bypass — this peer holds the PSK, so it was entitled to authenticate; what
+// the arm refuses is letting a predictable challenge into the transcript.
+func TestSyncAuthHandshakeRejectsZeroNonce_5078(t *testing.T) {
+	key := []byte("shared-control-link-secret-key")
+	a := newAuthSync(t, key)
+
+	ca, cb := net.Pipe()
+	defer ca.Close()
+	defer cb.Close()
+
+	ach := runHandshake(a, ca)
+
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		// t.Errorf, never t.Fatalf: this is not the test goroutine, and a
+		// Fatalf here would leave the handshake result unread.
+		typ, payload, err := readSyncFrameRaw(cb)
+		if err != nil {
+			t.Errorf("peer failed to read HELLO: %v", err)
+			return
+		}
+		if typ != syncMsgAuthHello || len(payload) < 2+syncAuthNonceSize {
+			t.Errorf("expected a well-formed server HELLO, got type=%d len=%d", typ, len(payload))
+			return
+		}
+		serverNonce := append([]byte(nil), payload[2:2+syncAuthNonceSize]...)
+
+		writeSyncAuthHello(t, cb, 1, make([]byte, syncAuthNonceSize))
+
+		// A node with the zero-nonce arm removed answers with its PROOF here;
+		// a correct node has already dropped the connection, so this read
+		// fails and the peer simply stops. Both outcomes are expected — the
+		// assertion lives on the handshake result, not in this goroutine.
+		if _, _, err := readSyncFrameRaw(cb); err != nil {
+			return
+		}
+		// Complete the exchange as an honest key-holder would, so that a
+		// mutated node has everything it needs to authenticate.
+		if err := writeMsg(cb, syncMsgAuthProof, syncAuthProof(key, serverNonce)); err != nil {
+			return
+		}
+	}()
+
+	ar := <-ach
+	cb.Close()
+	<-peerDone
+
+	if ar.err == nil {
+		t.Fatalf("an all-zero challenge nonce must be REJECTED (#5078) even from a "+
+			"key-holding peer: got mode=%d key=%x", ar.mode, ar.key)
+	}
+	if !strings.Contains(ar.err.Error(), "all-zero handshake nonce") {
+		t.Fatalf("rejection must come from the zero-nonce arm and name the cause; "+
+			"got %q, want it to contain %q", ar.err.Error(), "all-zero handshake nonce")
+	}
+	if ar.key != nil {
+		t.Fatalf("a rejected handshake must yield no frame key, got %x", ar.key)
+	}
+}

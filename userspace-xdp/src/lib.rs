@@ -564,15 +564,20 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     // state-pruning hazard as the heartbeat check above; identical
     // result for all inputs).
     let packet_len = if data_end > data { data_end - data } else { 0 };
-    // ESP still relies on the kernel XFRM path. Use cpumap_or_pass
-    // directly. cpumap_or_pass delivers to the kernel stack reliably.
-    if parsed.protocol == PROTO_ESP {
-        return Ok(cpumap_or_pass(ctrl));
-    }
-    // Non-native GRE also goes to kernel for tunnel decap.
-    if parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0 {
-        return Ok(cpumap_or_pass(ctrl));
-    }
+    // #304: ESP and non-native GRE used to be diverted to the kernel here
+    // on a PROTOCOL-ONLY test with no destination predicate, so TRANSIT
+    // ESP and transit non-native GRE — addressed to a host beyond this
+    // firewall — were handed to the kernel forwarding path, where
+    // ip_forward=1 and an all-accept nft ruleset forward them with no zone
+    // policy evaluated at all. The kernel-termination cases (XFRM for ESP,
+    // a kernel GRE device for non-native GRE) are preserved by the
+    // local-destination and interface-NAT arms of the session-miss path
+    // below, which are destination-qualified; a remote destination now
+    // continues to the AF_XDP redirect and is adjudicated by the worker.
+    // The DEGRADED path already demanded this (is_degraded_local_or_control
+    // gates ESP on is_interface_nat_destination and GRE on native-GRE plus
+    // an inner PASS_TO_KERNEL, and drops other transit), so the healthy
+    // path was the weaker of the two.
     // #1432 S2a: WireGuard. WG-to-firewall is local-destination UDP on
     // the configured listen port; steer it to the kernel (the userspace
     // control-thread UdpSocket reads it) via cpumap_or_pass — the same
@@ -663,6 +668,18 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 // so the helper's reverse-NAT repair path can handle
                 // reply packets for SNATed flows (#290).
                 if is_interface_nat_destination(&parsed) {
+                    // #304: ESP and non-native GRE terminate on the KERNEL
+                    // (XFRM / a kernel GRE device), and this arm is the only
+                    // one that recognises a tunnel endpoint sitting on an
+                    // address that interface-mode SNAT owns — the common
+                    // WAN case, which is_local_destination deliberately
+                    // reports false for. GRE reaching here is necessarily
+                    // NON-native (the native-GRE arm is the else branch), so
+                    // no native-GRE flow is affected. Everything else keeps
+                    // falling through to the XSK redirect.
+                    if parsed.protocol == PROTO_ESP || parsed.protocol == PROTO_GRE {
+                        return Ok(cpumap_or_pass(ctrl));
+                    }
                     incr_fallback_stat(USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION);
                     // Fall through to XSK redirect below.
                 }
@@ -1340,8 +1357,10 @@ fn wg_steer_to_kernel(ctrl: &UserspaceCtrl, pkt: &ParsedPacket) -> bool {
 }
 
 fn should_fallback_early(pkt: &ParsedPacket) -> bool {
-    // GRE and ESP are handled before this function — see the
-    // cpumap_or_pass call in try_xdp_userspace().
+    // #304: ESP and non-native GRE are no longer diverted to the kernel
+    // ahead of this function; they are classified here like any other
+    // protocol and reach the kernel only through the destination-qualified
+    // local-destination / interface-NAT arms of the session-miss path.
     match pkt.addr_family {
         AF_INET => {
             if pkt.dst_v4 == 0xffff_ffff

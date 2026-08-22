@@ -16,27 +16,41 @@ import (
 // preventing infinite peer-recursion when both nodes call each
 // other for cluster-mode rendering.
 //
-// We exercise this at the metadata-extraction level since the full
+// We exercise this at the marker-extraction level since the full
 // handler requires a Server with a live cluster manager + dataplane,
-// which is heavier than the test needs. The guard logic itself is
-// a one-liner: `len(md.Get("xpf-no-peer")) > 0`. If that contract
-// drifts (key renamed, comparison inverted, etc.), this test fails.
+// which is heavier than the test needs.
+//
+// #5883: this test used to RE-IMPLEMENT the predicate inline
+// (`len(md.Get("xpf-no-peer")) > 0`) rather than call the production
+// one, so it asserted its own copy and could not have noticed either
+// that the header was forgeable or that the real predicate changed.
+// It now runs the metadata through the production interceptor and
+// reads the production accessor, and carries a forged-on-loopback row
+// so the security property is part of the same table.
 func Test_PeerCallSkipsDialBack(t *testing.T) {
 	cases := []struct {
 		name         string
 		md           metadata.MD
+		fabric       bool
 		wantPeerCall bool
 	}{
-		{"empty metadata", metadata.MD{}, false},
-		{"no-peer key set to 1", metadata.MD{"xpf-no-peer": []string{"1"}}, true},
-		{"no-peer key set to true", metadata.MD{"xpf-no-peer": []string{"true"}}, true},
-		{"unrelated key", metadata.MD{"some-other-key": []string{"1"}}, false},
+		{"empty metadata", metadata.MD{}, true, false},
+		{"no-peer key set to 1", metadata.MD{"xpf-no-peer": []string{"1"}}, true, true},
+		{"no-peer key set to true", metadata.MD{"xpf-no-peer": []string{"true"}}, true, true},
+		{"unrelated key", metadata.MD{"some-other-key": []string{"1"}}, true, false},
+		// #5883: the same header arriving on the loopback listener, which no
+		// cluster peer dials, is forged and must not suppress the peer dial.
+		{"forged on loopback", metadata.MD{"xpf-no-peer": []string{"1"}}, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ctx := metadata.NewIncomingContext(context.Background(), c.md)
-			md, _ := metadata.FromIncomingContext(ctx)
-			isPeerCall := len(md.Get("xpf-no-peer")) > 0
+			var ctx context.Context
+			if c.fabric {
+				ctx = fabricMarkerCtx(t, c.md)
+			} else {
+				ctx = fabricMarkerCtxUntrusted(t, c.md)
+			}
+			isPeerCall := peerMarkersFromContext(ctx).noPeer
 			if isPeerCall != c.wantPeerCall {
 				t.Errorf("isPeerCall: got %v, want %v", isPeerCall, c.wantPeerCall)
 			}
