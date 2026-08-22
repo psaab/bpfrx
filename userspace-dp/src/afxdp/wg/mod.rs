@@ -17,6 +17,47 @@
 //! its security-critical paths without dragging in the dataplane's
 //! global type web. The integration PR will add a thin adapter
 //! layer that bridges the engine API to the dispatch/poll types.
+//!
+//! ### Lock poison policy (#6422)
+//!
+//! Every `Mutex` / `RwLock` in this module is acquired with
+//! `unwrap_or_else(|e| e.into_inner())`, never `.unwrap()`. `std` marks
+//! a lock POISONED once a thread panics while holding its exclusive
+//! guard, and every later acquisition then returns `Err` — so
+//! `.unwrap()` converts one contained panic (the #925 worker supervisor
+//! contains it) into a panic on EVERY subsequent acquisition. For an
+//! `Arc`-shared engine that is a permanent tunnel outage: the
+//! supervisor restarts the worker, the restarted worker touches the
+//! same lock, and panics again.
+//!
+//! Recovering is the correct policy for every lock here, not merely the
+//! convenient one. The guarded state is either (a) a map that holds the
+//! committed prefix of every completed insert (`pending`,
+//! `pending_by_peer`, `sessions_by_local_index`, the per-peer keypair
+//! slots) — where discarding it would drop live sessions, the exact
+//! defect #2402 fixed on the HA shared-session maps — or (b) a value
+//! mutated only by infallible integer/array arithmetic with no panic
+//! site inside the critical section (`ReplayState::check_and_update`,
+//! the TAI64N high-water marks, the cookie load/budget windows), so a
+//! recovered value is always a well-formed committed one. Panicking
+//! instead repairs nothing and is strictly worse for the security
+//! properties: a supervisor restart loop risks the anti-replay marks
+//! coming back reset.
+//!
+//! `worker_queue::lock_recover` and `shared_ops::lock_shared_recover`
+//! are NOT reused here. Both stamp a subsystem-specific journald line
+//! and bump a subsystem-specific recovery counter (#1807 worker-command
+//! queue, #2402 shared sessions) that a WG cookie or replay-window
+//! recovery would falsify, and neither covers `RwLock` — which is 39 of
+//! the 68 sites. The inline idiom is the tree-wide convention
+//! (`nat::allocator`, `event_stream`, `afxdp::sharded_neighbor`,
+//! `afxdp::icmp_ratelimit`, and ~10 more).
+//!
+//! The `#[cfg(test)]` accessors in this module deliberately keep
+//! `.unwrap()`: they are compiled out of the shipped helper, so they
+//! cannot cause the production failure, and in a test build a poisoned
+//! lock is EVIDENCE of a panic that the test should surface rather than
+//! paper over.
 
 // TODO(#1499 r4 / integration PR): tighten this to per-item
 // `#[allow(dead_code)]` once tx/dispatch.rs and poll_descriptor.rs
@@ -81,6 +122,14 @@ pub(crate) mod timers;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #6422: lock poison-recovery regressions. A sibling of `tests` (not a
+// child of any one production file) because the sites it pins are spread
+// across engine.rs, handshake_session.rs, peer.rs and timers.rs, and it
+// reuses `tests::established_pair`.
+#[cfg(test)]
+#[path = "poison_tests.rs"]
+mod poison_tests;
 
 pub(crate) use engine::{
     DecapError, DecapOutcome, EncapError, EncapOutcome, InitiationAction, InstallSessionError,
