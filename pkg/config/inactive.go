@@ -109,7 +109,12 @@ func stripInactiveNodes(nodes []*Node) []*Node {
 			// #6673: WithoutInactive runs on the cloned tree BEFORE compile, so
 			// this is the copy the compiler reads. Dropping the per-key quote
 			// provenance here would blind every reader downstream of it.
-			KeysQuoted:    append([]bool(nil), n.KeysQuoted...),
+			KeysQuoted: append([]bool(nil), n.KeysQuoted...),
+			// #6668: same reasoning for the bracket provenance — this clone is
+			// what SchemaValidate walks and what a re-render of the stripped
+			// tree would flatten, so dropping it here loses the one bit that
+			// says where a container's key group ends.
+			KeysBracketed: append([]bool(nil), n.KeysBracketed...),
 			Children:      stripInactiveNodes(n.Children),
 			IsLeaf:        n.IsLeaf,
 			Annotation:    n.Annotation,

@@ -134,6 +134,13 @@ func ParseSetCommandQuoted(input string) ([]string, []bool, error) {
 	return path, quoted, err
 }
 
+// ParseSetCommandGrouped is ParseSetCommandQuoted plus the per-token BRACKET
+// GROUPING SetPathQuotedGrouped needs (#6668). See ParseSetVerbGrouped.
+func ParseSetCommandGrouped(input string) (path []string, quoted, grouped []bool, err error) {
+	_, path, quoted, grouped, err = ParseSetVerbGrouped(input)
+	return path, quoted, grouped, err
+}
+
 // ParseSetVerb parses a single flat command into its verb and path. The
 // verb is one of "set", "delete", "deactivate", or "activate"; a line with
 // no recognized leading verb is reported as "set" with the whole line as
@@ -160,11 +167,40 @@ func ParseSetVerb(input string) (verb string, path []string, err error) {
 // command the operator never wrote. Callers that do not care keep using
 // ParseSetVerb / ParseSetCommand.
 func ParseSetVerbQuoted(input string) (verb string, path []string, quoted []bool, err error) {
+	verb, path, quoted, _, err = ParseSetVerbGrouped(input)
+	return verb, path, quoted, err
+}
+
+// ParseSetVerbGrouped is ParseSetVerbQuoted plus per-token BRACKET GROUPING:
+// grouped[i] reports whether path[i] was authored inside a `[ ... ]` list
+// (#6668).
+//
+// The flat-set language re-splits a line into nodes at each keyword's SCHEMA
+// ARITY, so it can express a container node carrying exactly `1 + args` keys
+// and nothing wider. A bracket list authored at a container position —
+//
+//	security zones security-zone trust {
+//	    interfaces {
+//	        [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { system-services ssh; } }
+//	    }
+//	}
+//
+// — parses to ONE container with Keys=["ge-0/0/0","ge-0/0/1"], which FormatSet
+// flattened to a bare token run. Replaying that run made `ge-0/0/0` the
+// container and demoted `ge-0/0/1` to the first key of a LEAF, with the whole
+// host-inbound body re-parented under it. The tokens all survived, so nothing
+// downstream could notice; the config simply meant something else. Carrying the
+// bracket restores the boundary the arity rule cannot infer.
+//
+// grouped is always the same length as path. A caller that does not need the
+// grouping keeps using ParseSetVerbQuoted / ParseSetVerb / ParseSetCommand,
+// which discard it — the pre-#6668 behaviour, unchanged.
+func ParseSetVerbGrouped(input string) (verb string, path []string, quoted, grouped []bool, err error) {
 	lexer := NewLexer(input)
 
 	tok := lexer.Next()
 	if tok.Type != TokenIdentifier {
-		return "", nil, nil, fmt.Errorf("expected identifier, got %s", tok.Type)
+		return "", nil, nil, nil, fmt.Errorf("expected identifier, got %s", tok.Type)
 	}
 
 	switch tok.Value {
@@ -177,6 +213,7 @@ func ParseSetVerbQuoted(input string) (verb string, path []string, quoted []bool
 		verb = verbSet
 		path = append(path, tok.Value)
 		quoted = append(quoted, false)
+		grouped = append(grouped, lexer.InBracket())
 	}
 
 	for {
@@ -194,7 +231,7 @@ func ParseSetVerbQuoted(input string) (verb string, path []string, quoted []bool
 			// success. Permit at most one terminating semicolon, then require EOF;
 			// reject any subsequent token with its line/column.
 			if next := lexer.Next(); next.Type != TokenEOF {
-				return "", nil, nil, fmt.Errorf(
+				return "", nil, nil, nil, fmt.Errorf(
 					"unexpected token %s after ';' at line %d, column %d (only one statement per line)",
 					next.Type, next.Line, next.Column)
 			}
@@ -203,16 +240,17 @@ func ParseSetVerbQuoted(input string) (verb string, path []string, quoted []bool
 		if tok.Type == TokenIdentifier || tok.Type == TokenString {
 			path = append(path, tok.Value)
 			quoted = append(quoted, tok.Type == TokenString)
+			grouped = append(grouped, lexer.InBracket())
 		} else {
-			return "", nil, nil, fmt.Errorf("unexpected token %s at line %d, column %d",
+			return "", nil, nil, nil, fmt.Errorf("unexpected token %s at line %d, column %d",
 				tok.Type, tok.Line, tok.Column)
 		}
 	}
 
 	if len(path) == 0 {
-		return "", nil, nil, fmt.Errorf("empty path")
+		return "", nil, nil, nil, fmt.Errorf("empty path")
 	}
-	return verb, path, quoted, nil
+	return verb, path, quoted, grouped, nil
 }
 
 // parseStatements parses zero or more statements until EOF or '}'.
@@ -334,7 +372,7 @@ var parserMarkers = []string{inactiveMarker}
 // and key matching, schema walks, and group merge keep working unmodified.
 func (p *Parser) parseStatement() *Node {
 	statementStart := p.lexer.Peek()
-	keys, kinds := p.parseKeys()
+	keys, kinds, bracketed := p.parseKeys()
 	if len(keys) == 0 {
 		// Recovery: skip unexpected token
 		tok := p.lexer.Next()
@@ -356,6 +394,7 @@ func (p *Parser) parseStatement() *Node {
 		inactive = true
 		keys = keys[1:]
 		kinds = kinds[1:]
+		bracketed = bracketed[1:]
 		if len(keys) == 0 {
 			p.addError(markerLine, markerCol,
 				"inactive: marker must be followed by a statement")
@@ -394,6 +433,7 @@ func (p *Parser) parseStatement() *Node {
 			// against keys, but a length mismatch the moment anything derives
 			// a per-key slice from it (#6673 quote provenance).
 			kinds = kinds[:i]
+			bracketed = bracketed[:i]
 			// The governed tokens were only on the key line of a leaf; a
 			// trailing `{ ... }` cannot follow an inline marker in valid
 			// Junos, so nothing more to consume here.
@@ -413,6 +453,15 @@ func (p *Parser) parseStatement() *Node {
 	for i := range keys {
 		if i < len(kinds) {
 			quoted[i] = kinds[i] == TokenString
+		}
+	}
+	// #6668: same lockstep discipline as `kinds` — both marker paths re-slice
+	// `bracketed` alongside `keys`, and the copy is range-checked so a future
+	// divergence degrades to "provenance unknown" rather than panicking.
+	brackets := make([]bool, len(keys))
+	for i := range keys {
+		if i < len(bracketed) {
+			brackets[i] = bracketed[i]
 		}
 	}
 
@@ -436,6 +485,7 @@ func (p *Parser) parseStatement() *Node {
 			Column:   col,
 		}
 		n.setKeysQuoted(quoted)
+		n.setKeysBracketed(brackets)
 		return n
 
 	case TokenSemicolon:
@@ -449,6 +499,7 @@ func (p *Parser) parseStatement() *Node {
 			Column:   col,
 		}
 		n.setKeysQuoted(quoted)
+		n.setKeysBracketed(brackets)
 		return n
 
 	default:
@@ -462,6 +513,7 @@ func (p *Parser) parseStatement() *Node {
 			Column:   col,
 		}
 		n.setKeysQuoted(quoted)
+		n.setKeysBracketed(brackets)
 		return n
 	}
 }
@@ -488,20 +540,25 @@ func (p *Parser) skipStatementBody() {
 // bare identifier `inactive:` (a deactivation marker) from a quoted
 // `"inactive:"` value that happens to equal the marker text (#4348) — the
 // []string alone flattens the two into an indistinguishable string.
-func (p *Parser) parseKeys() ([]string, []TokenType) {
+func (p *Parser) parseKeys() ([]string, []TokenType, []bool) {
 	var keys []string
 	var kinds []TokenType
+	var bracketed []bool
 	for {
 		tok := p.lexer.Peek()
 		if tok.Type == TokenIdentifier || tok.Type == TokenString {
 			p.lexer.Next()
 			keys = append(keys, tok.Value)
 			kinds = append(kinds, tok.Type)
+			// #6668: sampled AFTER Next, so it describes the token just
+			// consumed. Peek restores the lexer's bracket state, so the
+			// lookahead above cannot leak a '[' it stepped over into this bit.
+			bracketed = append(bracketed, p.lexer.InBracket())
 		} else {
 			break
 		}
 	}
-	return keys, kinds
+	return keys, kinds, bracketed
 }
 
 func (p *Parser) addError(line, col int, msg string) {

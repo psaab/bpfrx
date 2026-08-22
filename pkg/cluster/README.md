@@ -902,7 +902,10 @@ peer liveness (`lastSeen`) or drive election.
     **The rotation does NOT retire captures made after it, and an earlier
     revision of this section claimed it did.** A PSK rotation retires everything
     an attacker recorded BEFORE it; a frame recorded AFTER it, under the current
-    key, still verifies. Measured: rotate K1→K2, let the peer arm the latch
+    key, still verifies. **And since #6630 it retires nothing until FINALIZE**:
+    while an `additional-authentication-key` window is open the retired key is
+    still accepted, so the archive stays live for the whole rolling procedure.
+    Retirement is step 5, not step 3. Measured: rotate K1→K2, let the peer arm the latch
     under K2, roll it back under K2 to a build that signs but emits no epoch,
     record the frames this receiver refuses, then let the peer go silent and
     restart this daemon — **5/5 of those post-rotation captures are admitted**
@@ -1275,7 +1278,18 @@ peer liveness (`lastSeen`) or drive election.
         replay per restart sustains that indefinitely. Rotating the PSK first
         makes every archived frame fail MAC verification, so it never reaches
         the latch; the key is re-read per frame on both the send and receive
-        paths, so rotation itself needs no restart. This is pinned by
+        paths, so rotation itself needs no restart.
+
+        **Since #6630, "rotated" means rotated THROUGH FINALIZE.** While an
+        `additional-authentication-key` window is open the retired key is still
+        ACCEPTED, so an archived frame signed under it still verifies and still
+        reaches the latch. Run the rolling procedure to step 5 (`delete chassis
+        cluster additional-authentication-key` on both nodes) before treating
+        the archive as retired — or, for this recovery specifically, rotate
+        without opening a window at all and take the ~1 s liveness gap
+        knowingly, since the cluster is already in a refusing state.
+
+        This is pinned by
         `TestArchivedEpochReplayReArmsLatchAfterRestart_6169` and stated at the
         arming site in `admitAuthed`, which also records why a durable
         latch and a freshness test were both rejected.
@@ -2037,25 +2051,122 @@ split-brain described under rotation.
 
 ### Rotation
 
-There is no key-id, no previous/current overlap and no coordinated rekey, so
-rotation is a **planned-outage operation, not a rolling one**.
+Rotation is a **rolling operation** since #6630. It was a planned outage
+before, and the reason is worth keeping in view because it is what the
+mechanism below is shaped around.
 
-While the two nodes hold different keys, each receives a present-but-invalid
-HMAC from the other. `handleFrame` rejects those frames and `continue`s
-**without refreshing `lastSeen`** (`heartbeat.go`), so neither node refreshes
-peer liveness: after `heartbeat-interval × heartbeat-threshold` — 200 ms × 5 =
-**~1 s** at the SHIPPED cluster settings, 100 ms × 5 = **~500 ms** at the code
-defaults (`DefaultHeartbeatInterval`) — **both** nodes declare the peer dead and **both**
-take over their redundancy groups — dual-master with duplicate VIPs on the
-wire for the whole window between the two commits.
+With a single key, the moment one node is committed to the new one each end
+receives a present-but-invalid HMAC from the other. `admitFrame` rejects those
+frames **without refreshing `lastSeen`** (`heartbeat.go`), so neither node
+refreshes peer liveness: after `heartbeat-interval × heartbeat-threshold` —
+200 ms × 5 = **~1 s** at the SHIPPED cluster settings, 100 ms × 5 = **~500 ms**
+at the code defaults (`DefaultHeartbeatInterval`) — **both** nodes declare the
+peer dead and **both** take over their redundancy groups: dual-master with
+duplicate VIPs on the wire for the whole window between the two commits.
 
-Procedure:
+The workaround an earlier revision of this document gave — clear both keys,
+then set the new one — does not work either. `validateClusterAuthKeyStrict`
+(#6611) expressly refuses to commit a cluster with no key, so that path is
+rejected by the very gate that requires the key.
 
-1. Take a maintenance window.
-2. Commit the new key on both nodes back-to-back, keeping the gap as short as
-   possible — that gap is the dual-master window.
-3. Restart `xpfd` on both nodes (per #6628 above, and to clear the sticky
-   `peerAuthSeen`).
+#### The overlap
+
+```
+set chassis cluster additional-authentication-key <key>
+```
+
+A second key this node **ACCEPTS** and never **SIGNS** with. Because signing is
+unchanged, a rotation never has two signers, and the commits can therefore be
+separated in time. It does **not** satisfy #6611 on its own: a cluster whose
+only key is this one signs nothing and is refused at commit with a message
+saying so.
+
+An overlap is **forced, not preferred**. The two nodes have no channel to agree
+a cutover instant on that does not itself depend on the key being rotated, and
+under the eventual posture (see "The three-way incompatibility") there is not
+even a config-sync push to carry a coordinated plan. Accepting the other key
+for an operator-bounded window is the only rotation that keeps liveness.
+
+Both authenticated control surfaces widen together — the heartbeat
+(`admitFrame`) and the fabric gRPC listener (`checkFabricAuth`). Widening only
+one would turn a rotation from "no outage" into "no outage on the heartbeat,
+`Unauthenticated` on every peer-proxied RPC", which is worse for being harder
+to see. **Session sync does not widen**: its authentication is fixed per
+connection at handshake time, which is #6628's territory, not this one.
+
+#### Procedure — rotate A to B
+
+No maintenance window. Liveness is never lost at any step; each is a state the
+cluster can sit in indefinitely.
+
+1. **node0** — `set chassis cluster additional-authentication-key B`
+   *(signs A, accepts A+B)*
+2. **node1** — the same *(signs A, accepts A+B)*
+3. **node0** — `set chassis cluster authentication-key B` and
+   `set chassis cluster additional-authentication-key A`
+   *(signs B, accepts B+A)*
+4. **node1** — the same *(signs B, accepts B+A)*
+5. **both** — `delete chassis cluster additional-authentication-key`
+   *(signs B, accepts B — the retired key stops authenticating)*
+
+Step 3 is the only one where the two nodes hold different **signing** keys, and
+it is the one the overlap carries. Steps 1, 2 and 4 would survive without it;
+they exist to reach step 3 safely.
+
+Step 5 is the **finalize**, and it is an operator commit rather than a timer:
+the overlap ends when the operator says so and can never lapse into a second
+permanent key. `TestPSKRotationFinalizeRejectsTheRetiredKey6630` pins that the
+retired key stops authenticating.
+
+Do not skip step 2. Going straight from 1 to 3 puts node1 — which has not
+opened its window — in front of a B-signed frame it cannot verify, which is the
+outage this replaces.
+
+#### Knowing when it is safe to finalize
+
+```
+Authentication:             engaged (peer authenticated; unauthenticated frames rejected)
+Key rotation:               in progress (signing 4f2a9c31, also accepting 8b70de55);
+                            peer is signing 4f2a9c31 — safe to finalize:
+                            `delete chassis cluster additional-authentication-key`
+```
+
+The `Key rotation:` line appears in `show chassis cluster statistics` **only**
+while an additional key is configured. It renders short key **IDs**, never
+keys — an id is `HMAC-SHA256(key, domain tag)` truncated to 32 bits
+(`controlLinkKeyID`), derivable identically on both nodes with no exchange, so
+the operator can compare a `show` on each node.
+
+It reports three states, and the distinction matters because acting on the
+wrong one reopens the dual-master window:
+
+| Line says | Meaning |
+|---|---|
+| `peer is signing <signing-id> — safe to finalize` | the peer has moved; step 5 is safe |
+| `peer is still signing <other-id> — do NOT finalize` | the peer is still on the retired key |
+| `peer key UNKNOWN — no authenticated peer frame seen` | usually the peer is down; **not** the same as "not safe" |
+
+"Both configs say B" is a statement about two files. "The peer is currently
+SIGNING with B" is a statement about the running system, and only the second
+makes retiring the old key safe. The value tracks the **latest** verified
+frame, not a high-water mark, so a peer that rolls back to the old key makes
+finalize unsafe again rather than staying green.
+
+#### Notes
+
+- Restarting `xpfd` is still required to clear the sticky `peerAuthSeen` if you
+  are rolling *back* to an unkeyed config — see "Rolling BACK is not
+  symmetric" above. A forward rotation between two real keys needs no restart.
+- Rotation remains the **anti-replay capture-invalidation** step (below), and
+  making it rolling does not change that: after step 5 the retired key no
+  longer verifies anything.
+- **No key id goes on the wire.** #6630 asked for one so a receiver could pick
+  the key to verify against instead of trying both. Trying both is two HMACs
+  over a ~52-byte frame at 5 Hz, and a wire change on the heartbeat is a
+  mixed-version hazard on the one channel whose failure mode is dual-master.
+  The property the id was for — "can the operator tell whether the peer has
+  moved?" — is delivered by recording which accepted key last verified a peer
+  frame and rendering its id above. Same answer, no new bytes on the wire.
 
 > [!IMPORTANT]
 > **Rotate the PSK after upgrading both nodes to a #6169-capable build.** This
