@@ -295,9 +295,19 @@ each VM its own copy-on-write overlay. Put the verified image there with
 Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
 `Before=xpfd.service`):
 
-- Probes volumes labeled `xpf-config` (any filesystem) plus any ISO9660
-  medium. Mounted `ro,nosuid,nodev,noexec`; only the two fixed
-  filenames at the volume root are considered; 4 MiB size cap;
+- Probes volumes labeled `xpf-config` (any filesystem) **first**, then
+  any ISO9660 medium. That order is the contract, not an accident:
+  a labeled volume is explicit operator intent and the ISO is the
+  vSRX-parity fallback, so with two valid-but-different media attached
+  the **labeled volume's** config is the one installed and stamped.
+  The dedup deliberately preserves first-appearance order
+  (`awk 'NF && !seen[$0]++'`) rather than sorting — `| sort -u`
+  alphabetized the merged list, so an ISO at `/dev/sda` beat a labeled
+  volume at `/dev/sdb`, and any `/dev/sd*` ISO beat a virtio-blk
+  `/dev/vd*` volume (#6502). Kernel device-name order is not operator
+  intent. A medium that is both labeled and ISO9660 is probed once, in
+  its labeled position. Mounted `ro,nosuid,nodev,noexec`; only the two
+  fixed filenames at the volume root are considered; 4 MiB size cap;
   validation under timeout. Nothing on the medium is executed.
 - On PASS the config is installed as `/etc/xpf/xpf.conf` (mode 0600 —
   it may carry credential material) and xpfd's normal
