@@ -102635,3 +102635,20 @@ prose edit above them added. No diff falls in the new test body.
   root-run tooling on a box with no login model is unaffected.
 - **File(s)**: pkg/api/authz.go, pkg/api/read_authz_6660_test.go (new),
   pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
+
+## 2026-08-22 — #6666 mirror adopts the cross-node session id (DECISION)
+- **Timestamp**: 2026-08-22
+- **Action**: Decided #6666 in favour of option 2 (adopt RTFlowSessionID in the
+  BPF conntrack mirror) and implemented it. Evidence: nothing keys on the id
+  (swept every non-test reference — no map key, index, dedup or generation
+  guard); #6311's node discriminator bit makes cross-node collision structurally
+  impossible (already pinned by a test); no BPF ABI change, so the helper binary
+  does NOT move; and the change is two call sites in Go. Option 3a rejected —
+  it grows the conntrack value 144->152 and `validateUserspaceShimLivePins`
+  hard-refuses a ValueSize mismatch, i.e. session loss on upgrade. Folded in
+  option 1's deliverable: the proto comment was BACKWARDS on both halves and
+  pkg/cluster/README still described the removed `now<<16|slot`.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_convert.go,
+  pkg/daemon/mirror_session_id_adoption_6666_test.go (new),
+  pkg/daemon/userspace_sync_test.go, proto/xpf/v1/xpf.proto,
+  pkg/cluster/README.md, docs/session-sync-architecture.md, _Log.md
