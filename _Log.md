@@ -104091,3 +104091,25 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/ddns/state.go, pkg/ddns/surface_a.go, pkg/ddns/manager.go,
   pkg/ddns/cross_surface_authority_6755_test.go,
   pkg/ddns/cross_surface_clobber_5748_test.go
+
+## 2026-08-22 — #6760 + #6761 golden-image guard: two holes, one path
+- **Timestamp**: 2026-08-22
+- **Action**: Merged two A10-b4 issues into one PR after verifying a shared
+  mechanism: #6761's cited line ranges are a strict SUBSET of #6760's, and both
+  are defects in the same four functions (_qcow2_backing_file,
+  _dependent_overlays, _install_libvirt_golden, libvirt_disk).
+  #6760: the probe collapsed four outcomes into "no backing file", so an
+  unprobeable overlay was classified as not-dependent and the golden was
+  overwritten under it. Probe now raises _ProbeIndeterminate; classifier returns
+  (deps, unknown); install refuses on either, with distinct operator messages.
+  Preserved the one legitimate case (qemu-img absent entirely = determinate
+  none, the documented #5043 reasoning).
+  #6761: replacement was an unlocked check-then-in-place-copy — TOCTOU against
+  overlay creation AND a truncated golden on interruption. Now temp+os.replace
+  under an flock that libvirt_disk takes too.
+- **Also found**: /tmp/opus-review-001.md, the "fix direction" reference for all
+  six A10-b4 issues (#6758-#6763), no longer exists — the stated direction is
+  unreachable and had to be derived from the code.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_disk.py, docs/distribution.md
+

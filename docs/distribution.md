@@ -237,7 +237,38 @@ shares one golden, a single re-fetch would poison *both* nodes' disks. So
 `fetch --install-libvirt` refuses to overwrite a golden that still has
 dependent overlays (it scans `/var/lib/libvirt/images/*.qcow2` and checks each
 one's `qemu-img info` backing file). First install (no golden yet) and a
-re-fetch after the dependents are gone both proceed normally. To roll a new
+re-fetch after the dependents are gone both proceed normally.
+
+**Two holes in that guard, closed together (#6760 + #6761).** They are one code
+path — the probe, the classifier, the replacement and the overlay creator — and
+fixing either alone leaves it unsafe.
+
+*An unprobeable sibling is not evidence of safety (#6760).* The backing probe
+returned "no backing file" for four different outcomes: `qemu-img` absent,
+`qemu-img` exited non-zero, unparseable JSON, and a genuine absence. The
+classifier read that as *not a dependent overlay*, so a file the tool could not
+read was assumed safe and the golden was overwritten under it. A running
+domain's overlay is the realistic instance — `qemu-img` can fail on an image a
+live VM holds open. The probe now distinguishes **indeterminate** from
+**no-backing**, and an indeterminate sibling BLOCKS the install with its own
+message (investigate the file) separate from a known dependant (destroy the VM).
+
+The one case that legitimately means "no backing" is preserved: `qemu-img`
+missing *entirely* still classifies as determinate-none, because `qemu-img` is a
+hard dependency of the overlay-create path, so its absence means this tool never
+created an overlay on that host. That reasoning covers a missing binary only; it
+never covered a probe that ran and failed, which was the hole.
+
+*The replacement is atomic and locked (#6761).* It was an unlocked
+check-then-in-place-copy, which fails two ways. An overlay created between the
+check and the copy backs onto bytes that are about to be swapped and nothing
+looks again (TOCTOU); and an **interrupted** in-place copy leaves a truncated
+golden, corrupting every existing overlay with no concurrency involved at all.
+The new image is now written to a sibling temp file and moved into place with an
+atomic rename, so the golden is either wholly the old image or wholly the new
+one — under an exclusive `flock` on `<images-dir>/.xpf-golden.lock` that
+`libvirt_disk` takes as well. Both sides must hold the same lock: locking only
+the replacement would close nothing. To roll a new
 image onto hosts with live VMs, EITHER:
 
 - destroy the dependent VM(s) first so no overlay references the old golden —
