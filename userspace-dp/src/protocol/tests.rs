@@ -308,6 +308,38 @@ fn process_status_worker_command_queue_poison_recoveries_roundtrip() {
     assert_eq!(legacy.worker_command_queue_poison_recoveries, 0);
 }
 
+// #2402/#6641: round-trip + backward-compat pin for the shared-session
+// poison-recovery counter. The wire key feeds
+// pkg/dataplane/userspace/protocol_status.go and the Prometheus counter
+// `xpf_userspace_shared_session_poison_recoveries_total`. A key rename on
+// either side decodes silently as zero, which for THIS counter reads as
+// "no worker panic ever touched HA session state" -- the exact reassuring
+// value the defect already produced, so the tag is pinned on both sides.
+#[test]
+fn process_status_shared_session_poison_recoveries_roundtrip() {
+    let status = ProcessStatus {
+        shared_session_poison_recoveries: 7,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["shared_session_poison_recoveries"], 7);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.shared_session_poison_recoveries, 7);
+
+    // Pre-#6641 payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("shared_session_poison_recoveries")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#6641 payload decodes");
+    assert_eq!(legacy.shared_session_poison_recoveries, 0);
+}
+
 // #2315: round-trip + backward-compat pin for the GRE-decap RFC 6040
 // §4.2 illegal-combination drop counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter

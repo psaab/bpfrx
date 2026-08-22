@@ -989,6 +989,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceSharedSessionPoisonRecoveries: prometheus.NewDesc(
+			"xpf_userspace_shared_session_poison_recoveries_total",
+			"shared-session poison recoveries",
+			nil,
+			nil,
+		),
 		userspaceGreDecapEcnIllegalDrops: prometheus.NewDesc(
 			"xpf_userspace_gre_decap_ecn_illegal_drops_total",
 			"gre decap rfc6040 illegal-combo drops",
@@ -1102,6 +1108,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		NatReverseKeySharedDisplacementsTotal: 4,
 		// #1807: poison-recovery counter emitted unconditionally.
 		WorkerCommandQueuePoisonRecoveries: 2,
+		// #2402/#6641: shared-session poison-recovery counter emitted
+		// unconditionally.
+		SharedSessionPoisonRecoveries: 5,
 		// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter
 		// emitted unconditionally.
 		GreDecapEcnIllegalDropsTotal: 3,
@@ -1190,9 +1199,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// contention surface (publish call count + publish lock pair +
 	// replication upserts/enqueued/contended + replication queue depth
 	// high-water = 7, plus the depth SUM added when the lifetime max was
-	// demoted to operator context = 8) = 38.
-	if len(got) != 38 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 38 metrics, got %d", len(got))
+	// demoted to operator context = 8) = 38 + the #2402/#6641
+	// shared-session poison-recovery counter = 39.
+	if len(got) != 39 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 39 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1230,6 +1240,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeySharedDisplacements, nil, 4)
 	// #1807: poison-recovery counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceWorkerCommandQueuePoisonRecoveries, nil, 2)
+	// #2402/#6641: shared-session poison-recovery counter emitted
+	// unconditionally, so a 0 is a real "no worker panic touched HA session
+	// state" signal rather than an absent series.
+	assertCounterClose(t, got, c.userspaceSharedSessionPoisonRecoveries, nil, 5)
 	// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreDecapEcnIllegalDrops, nil, 3)

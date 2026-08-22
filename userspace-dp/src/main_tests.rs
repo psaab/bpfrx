@@ -2150,6 +2150,14 @@ fn apply_snapshot_same_plan_preserves_persistent_snat_lease_state() {
         assert_eq!(status[0].allocations_total, 1);
         assert_eq!(status[0].reuses_total, 1);
     }
+    // #6637: this test's apply reaches coordinator bringup, which spawns the
+    // `neigh-monitor` thread. There is no `impl Drop for Coordinator`, and this
+    // one lives inside a ServerState behind an Arc<Mutex<..>>, so nothing here
+    // tears it down — it was the last of the eight spawners in the suite still
+    // leaking. The thread holds a netlink socket subscribed to RTMGRP_NEIGH and
+    // parses every host neighbor event into a map nobody reads for the life of
+    // the test binary.
+    state.lock().expect("server state").afxdp.stop();
 }
 
 #[test]

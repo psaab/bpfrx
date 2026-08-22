@@ -474,6 +474,17 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "worker_command_queue_poison_recoveries", default)]
     pub worker_command_queue_poison_recoveries: u64,
+    /// #2402/#6641: total shared-session mutex poison recoveries (a
+    /// worker thread panicked while holding a shared-session or
+    /// owner-RG-index mutex; the committed map was recovered and the
+    /// poison cleared — afxdp/shared_ops.rs, mirroring the #1807
+    /// worker-queue policy). Nonzero means a worker panic happened and
+    /// the HA session state survived it instead of being silently
+    /// emptied at failover (the #2402 bug). Surfaced as the Prometheus
+    /// counter `xpf_userspace_shared_session_poison_recoveries_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "shared_session_poison_recoveries", default)]
+    pub shared_session_poison_recoveries: u64,
     /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
     /// ECN combine because the outer header carried a CE mark over an
     /// inner packet that was Not-ECT (the illegal combination — a

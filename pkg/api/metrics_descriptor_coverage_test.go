@@ -560,6 +560,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_dnat_publish_errors_total",                          // #2244 dnat_table reverse-NAT publish failures
 		"xpf_userspace_session_nat_reverse_key_shared_displacements_total", // #1760 W3' shared displacements
 		"xpf_userspace_worker_command_queue_poison_recoveries_total",       // #1807 poison recoveries
+		"xpf_userspace_shared_session_poison_recoveries_total",             // #2402/#6641 shared-session poison recoveries
 		"xpf_userspace_gre_decap_ecn_illegal_drops_total",                  // #2315 RFC 6040 4.2 decap illegal-combo drops
 		"xpf_userspace_wg_decap_ecn_illegal_drops_total",                   // #2317 WG RFC 6040 4.2 decap illegal-combo drops
 		"xpf_userspace_gre_encap_df_oversize_drops_total",                  // #2331 GRE encap DF-set oversized-outer drops
