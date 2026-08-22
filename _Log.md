@@ -1,3 +1,81 @@
+## 2026-08-22 — #6455 Finding 1: a duplicate authored inside an applied group compiled clean
+
+- **Timestamp**: 2026-08-22 (fix/6455-group-authored-dupnames)
+- **Action**: Added `validateDuplicateNamesExpandedAST`, the POST-expansion half
+  of the duplicate-name gate family: it re-runs the three pre-expansion scanners
+  on a group-expanded clone, once per cluster node, and subtracts what the
+  pre-expansion gates already reported.
+- **File(s)**: `pkg/config/dup_names_expanded_6455.go` (new),
+  `pkg/config/dup_names_expanded_6455_test.go` (new), `pkg/config/compiler.go`,
+  `pkg/config/compiler_opts.go`, `pkg/config/dup_names_6455.go`,
+  `pkg/config/dup_named_blocks.go`, `pkg/config/dup_nat_rule_names.go`,
+  `pkg/config/dup_nat_ruleset_names.go`, `docs/config-schema.md`
+
+  The three gates (#5180 named-block, #5649 NAT rule, #6454 NAT rule-set) scan
+  TOP-LEVEL stanzas only. That is correct for them — apply-groups DEEP-MERGES a
+  group-provided named block onto an inline peer, so walking group bodies
+  pre-expansion would count one merged object twice. But a duplicate authored
+  ENTIRELY inside an applied group, with no inline peer, is appended wholesale
+  by ast_groups.go and never coalesced.
+
+  Measured on `52f51200e` before the fix: the issue's repro compiled CLEAN and
+  produced rule-set "RS" holding TWO rules both named "R", while the
+  byte-identical duplicate authored inline was hard-rejected. Same config, same
+  compiled shape, opposite verdict, decided by where the operator wrote it.
+
+  PR #6491 tried a pre-expansion per-group-body scan and WITHDREW it: fragments
+  of one named object authored across repeated group roots COALESCE under
+  `mergeNodes` during ExpandGroups, and a sibling-scan cannot model that
+  same-pass coalescing, so it rejected configs that compile to one object. This
+  runs the same scanners AFTER expansion, where the coalescing has already
+  happened — a fragment pair is one node by then and reports nothing. The
+  pre-existing `TestDup6455GroupFragmentCoalescingAccepted` is the accept-side
+  control and passes unchanged; so does its C4 case, where two group-local
+  same-name rule siblings coalesce INTO an inline peer.
+
+  Reusing the scanners verbatim rather than reimplementing the name-keying is
+  deliberate: it is what stops the two views from disagreeing about what
+  "duplicate" means.
+
+  Expansion runs once per cluster node (node0 AND node1), reusing the
+  clone-and-expand shape of `collectNodeExpandedInterfaceUnitSpellings` and
+  mirroring the #5878 / #5879 / #6178 / #6662 union gates, so a `groups node1`
+  duplicate that only the PEER's `${node}` expansion selects is rejected at
+  commit instead of committing green here and merely warning on the standby.
+
+  Findings the pre-expansion gates already produced are subtracted, so an inline
+  duplicate is reported exactly ONCE on the lenient path. Dedup is by rendered
+  message because both views render through the same functions — identical
+  findings are byte-identical strings by construction, no second wording to keep
+  in sync. On the strict path the subtraction is a no-op (the pre-expansion
+  gates return their error immediately, so reaching this gate means they found
+  nothing).
+
+  `expandInterfaceRanges` is deliberately NOT applied to the clone: a range
+  expanding to two identical names is a different defect on a different axis,
+  nothing detects it today, and covering it here would be the same speculative
+  scope that produced the withdrawn false-reject.
+
+  Mutation proof — `go build ./pkg/config/` checked clean before each cell, so no
+  red is a build failure in disguise:
+  - restore the VERBATIM pre-fix `pkg/config/compiler.go`
+    (`git show origin/master:pkg/config/compiler.go`), i.e. delete the production
+    wiring rather than break the function it calls — TEST_RC=1, five tests red;
+  - `expandedDupNodeViews = []int{0}` — TEST_RC=1, and it LOCALISES: only
+    `TestDupExpanded6455PeerOnlyNodeGroupCaught` reds;
+  - drop the `alreadyReported` subtraction — TEST_RC=1, reds the new
+    report-once control AND the pre-existing
+    `TestDup6455QuotedEmptyLenientWarnsOnce`;
+  - drop each of the three scanners from `dupNameScannersExpanded` in turn —
+    TEST_RC=1 each, and each reds exactly its OWN subtest of
+    `TestDupExpanded6455EachScannerIsWired`, so a missing member cannot hide
+    behind a compound red.
+
+  Control at HEAD: `go test -count=1 ./pkg/config/` TEST_RC=0,
+  `go test -count=1 ./pkg/configstore/ ./pkg/daemon/ ./pkg/cli/` TEST_RC=0,
+  `go vet ./pkg/config/` VET_RC=0, `go build ./...` BUILD_RC=0. Go-only; no
+  dataplane binary moves, so no cluster smoke is owed.
+
 ## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
 
 - **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
