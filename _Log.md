@@ -1,3 +1,38 @@
+## 2026-08-22 — #6677: derive the pre-rename kernel name from the kernel, not from PCI arithmetic
+
+- **Timestamp**: 2026-08-22
+- **Action**: Established the reference behaviour firsthand before writing
+  anything, on a host with 38 ARI-enabled netdevs, and it INVERTED the issue.
+  `udevadm test-builtin net_id` (systemd 261) shows systemd does NOT produce
+  an ARI-combined name for any netdev here: every ARI netdev is either at slot
+  0 (`slot<<3 == 0`, ARI a no-op) or an SR-IOV VF, where net_id's VF path
+  takes precedence and names it from the PHYSICAL function's address plus the
+  VF index (`0000:b7:02.0` -> `enp183s0f0v0`, physfn `0000:b7:00.0`). So the
+  issue named the one divergence I could not observe and missed two I could —
+  VF naming and the `npN` port suffix.
+  That killed the prescribed fix (`func += slot << 3`): implementing it would
+  have addressed the unobservable third of the problem while leaving the two
+  demonstrable ones, and closed the issue. Filed the ARI case as #7415 with
+  the hardware that would discriminate it, rather than guessing.
+  Then found the real answer in the kernel: altnames already carry every
+  candidate systemd computed (`eno5v0` carries `enp183s0f0v0`;
+  `ix0` carries `eno5np0`, `enp183s0f0np0`, `enx...`), they are stable across
+  renames, and `ensureRethLinkOriginalName` has used the mechanism in
+  production all along. `deriveKernelName` now asks for altnames first in
+  systemd's NamePolicy order and keeps the PCI derivation as a documented
+  best-effort fallback. Single-sourced the duplicated altname walk out of
+  `ensureRethLinkOriginalName` — a divergence between the two would always be
+  a bug — keeping `eth` as a last resort so that path's prior behaviour is
+  preserved rather than silently altered.
+  Rejected reading `ID_NET_NAME`/`INTERFACE` from the udev database after
+  measuring it: on an xpf-managed NIC those reflect xpf's own rename, so it
+  would return the LOGICAL name — the same defect as #6678.
+  Mutation matrix M1-M4 all RED with real assertions, vet clean at each,
+  RUN=10 matching the control; M5 re-ran the FULL package under M1.
+- **File(s)**: `pkg/daemon/daemon_reth.go`,
+  `pkg/daemon/derive_kernel_name_6677_test.go` (new),
+  `docs/critical-patterns.md`
+
 ## 2026-08-22 — #7406: operator note on where a credential may live in a URL
 
 - **Timestamp**: 2026-08-22
@@ -102686,6 +102721,30 @@ prose edit above them added. No diff falls in the new test body.
     starvation — and reds on a revert to `while !stop`.
   - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
     docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6629 — config sync shipped the ACTIVE TREE unredacted, so the
+    control-link PSK crossed the fabric in cleartext on the very link it
+    authenticates, at the one moment that link is guaranteed unauthenticated
+    (session-sync auth is fixed per connection at handshake time and a key
+    commit does not restart comms, so the carrying connection is by
+    construction one handshaked while both ends were unkeyed). Sealed the
+    config payload under a per-connection ephemeral X25519 + HKDF-SHA256 +
+    AES-256-GCM key (`syncMsgConfigKeyExchange` 30 / `syncMsgConfigEncrypted`
+    31, both additive, no wire-version bump). Chose this over excluding the
+    leaf: `SyncApply` promotes the received tree wholesale under a LENIENT
+    compile, so a stripped leaf makes the standby lose its own key and revert
+    to fail-open — and a new primary would drive an old standby unkeyed on a
+    rolling upgrade, where encryption's fallback is only "no worse than today".
+    Mutation matrix 8/9 RED; C7 (the nil-key guard) GREEN BY DESIGN and
+    annotated in place — removing it is unobservable because openConfigPayload
+    fails closed on a nil key; the safety property is bound by C9.
+    Also recorded the three-way incompatibility (#6629 vs the #5078 no-restart
+    pin vs the read-only secondary) in pkg/cluster/README.md.
+  - **File(s)**: pkg/cluster/{sync_config_crypto.go,sync_config_crypto_6629_test.go,
+    sync.go,sync_conn.go,sync_conn_config.go,sync_conn_read.go,
+    sync_capabilities_6650_test.go,README.md},
+    docs/session-sync-architecture.md
 
 ## 2026-08-22 — #6566 member 2: clear policy hit-counts reaches the helper
 - **Timestamp**: 2026-08-22
