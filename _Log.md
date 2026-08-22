@@ -100154,3 +100154,33 @@ prose edit above them added. No diff falls in the new test body.
   Deleting `ss.BulkSnapshotSource = d.userspaceBulkSnapshot` left all five
   existing #6031 tests green while silently reverting the fix.
 - **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
+
+## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: `compileNAT` / `compileStaticNAT` / `compileNAT64` built
+  `SNATValue`, `SNATValueV6`, `SNATEgressValue`, `NATPoolConfig`, `DNATValue`,
+  static-NAT and `NAT64Config` records and handed them to `SetSNATRule` /
+  `SetDNATEntry` / `SetNATPoolConfig` / the stale-NAT deleters. Every one of
+  those writes landed nowhere: the only production compile path is
+  `Manager.CompileUserspaceShim`, whose `userspaceShimCompileDataplane`
+  implements each as `return nil` (loader.go); the real `(*Manager)` writers in
+  `maps_nat.go` are reachable only through `Manager.Compile`, which no
+  production caller reaches because no backend registers a non-userspace type
+  and `LegacyDataPlaneAdapter` shadows `Compile`/`ApplyConfig` with the
+  userspace ones. Deleted the construction; kept every value that escapes —
+  `result.PoolIDs` / `NextPoolID`, `result.NATCounterIDs`, the implicit
+  `_snat_match_<cidr>` entries in `result.AddrIDs`, the persistent-NAT table
+  (`GetPersistentNAT`, the file's one non-no-op dataplane call), and every
+  compile-failing rejection. `compileNPTv6` is untouched: it still writes
+  `nptv6_rules`, and retiring that plus the `maps_nat.go` writers is the
+  sibling cleanup. New `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms
+  every retired writer to FAIL and requires a clean validate on both marker
+  arms, so a reintroduced write reds by error propagation rather than by a
+  counter. 594 lines removed from compiler_nat.go (1428 -> 1066).
+- **File(s)**: pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
