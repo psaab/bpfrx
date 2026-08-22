@@ -100909,3 +100909,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_validate_warn_lag_6544_test.go (new),
   docs/feature-gaps.md, docs/phases.md, docs/vsrx-gaps.md, _Log.md
+
+## 2026-08-21 — #6547: pre-sign gate now verifies the image seal
+- **Timestamp**: 2026-08-21
+- **Action**: `scripts/image/validate.py` — the gate that runs strictly before
+  `sign_step` — asserted nothing about image sealing, so a clone-identity
+  regression (shared SSH host key / machine-id / SNMPv3 EngineID) shipped
+  SIGNED. Added `_image_seal_verdict` + `Harness.assert_image_sealed`, which
+  reads the exported qcow2 OFFLINE with libguestfs (the only place the property
+  is observable — first boot regenerates all of it) and fails closed on an
+  unobserved check or a missing tool. `bake.py` grew `SYSPREP_ENABLE_OPS` /
+  `SYSPREP_PURGE_PATHS` as the single source for the seal; a hermetic test binds
+  the gate's identity table to them, so dropping an `--enable` member reds.
+  Calibrated end-to-end on purpose-built unsealed/sealed qcow2 fixtures.
+- **File(s)**: scripts/image/validate.py, scripts/image/bake.py,
+  scripts/image/test_validate_image_seal_6547.py (new),
+  docs/image-validation.md, docs/install-images.md, _Log.md

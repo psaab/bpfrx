@@ -144,7 +144,13 @@ Pipeline (offline — the image is never booted to provision it):
    verified in-place cut-over is owned by the package itself; see
    `docs/in-place-upgrade.md` for the full state machine.
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
-   bash history, package caches, random seed; `/etc/xpf` factory-empty.
+   bash history, package caches, random seed, the SNMPv3 EngineID +
+   engineBoots (#5283); `/etc/xpf` factory-empty. The operations and the
+   purged paths come from `SYSPREP_ENABLE_OPS` / `SYSPREP_PURGE_PATHS` in
+   `bake.py` — one source, so the validation gate can bind to it. The gate
+   VERIFIES the outcome on the exported artifact before signing (#6547); it
+   previously asserted nothing about sealing, so a clone-identity regression
+   would have shipped signed.
 6. Export compressed qcow2 + incus metadata tarball + the per-version
    `xpf-<ver>.SHA256SUMS` checksum manifest. The manifest is NOT signed
    yet — signing is deferred to AFTER the validation gate (step 8, #4017).
@@ -529,8 +535,15 @@ is a clean no-op.
 - Headless/SSH access comes from the day-0 config (`system
   root-authentication`, `system login user ...`) — set credentials
   there, or use the console once and `commit` a config.
-- The image ships no ssh host keys, no machine-id, no logs; both are
-  regenerated per-instance at first boot.
+- The image ships no ssh host keys, no machine-id, no SNMPv3 EngineID and
+  no random-seed, and no logs; each is regenerated per-instance at first
+  boot, so no per-device identity is shared across clones. This is
+  ENFORCED, not merely performed: the pre-sign validation gate reads the
+  exported qcow2 offline and refuses to let an unsealed image be signed
+  (#6547). Before that it was performed and never verified, so a member
+  silently falling out of the seal would have shipped a signed image whose
+  every clone answered SSH with the same host key and accepted every other
+  clone's authenticated SNMPv3 requests.
 - Verify artifacts with their minisign-signed per-version manifest
   (#1924): `xpf-deploy.py fetch` verifies the exact bytes against
   `xpf-<ver>.SHA256SUMS` + `.minisig`, or verify manually with
