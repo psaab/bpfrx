@@ -98888,6 +98888,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/configstore/nat_match_address_no_brick_7145_test.go,
   docs/config-schema.md, docs/userspace-dnat-plan.md, _Log.md
 
+- **Timestamp**: 2026-08-21
+- **Action**: #7223 — eventengine within-clause trigger-on crossing suppressed
+  by clause ORDER. Filed as the successor to the A9 F4 row of #5250, whose
+  close rationale ("re-arms an edge trigger slightly early rather than blocking
+  a fire") is disproved by a runnable reproduction: the mid-loop `return` means
+  the loosest clause only clears the latch if the walk REACHES it, so a
+  stricter clause earlier in the list blocks the fire outright. `withinMatches`
+  split into three passes — validity, re-arm/latch over ALL trigger-on clauses,
+  trigger-until — so no verdict depends on clause order.
+  Validation: `go test -count=1 ./pkg/eventengine/` green; restoring engine.go
+  from origin/master reds the order-independence test with
+  "long-window-first fired at [2], short-window-first fired at [2 102]".
+- **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/README.md,
+  pkg/eventengine/within_clause_order_7223_test.go, _Log.md
+
 ## 2026-08-21 — #5838 userspace helper crash supervision
 
 - **Timestamp**: 2026-08-21T23:xx UTC
