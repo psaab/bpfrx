@@ -2925,6 +2925,105 @@ fn route_family_contradicts_destination_fails_closed() {
     ));
 }
 
+/// #6568 (member 1): a route whose destination parses as NEITHER family fails
+/// the snapshot CLOSED via `RouteDestinationUnparseable`.
+///
+/// This was a SILENT skip — no Err, no counter, no log — at a boundary whose
+/// whole #2409/#2410/#3771 contract is "no silent skips". The cohort filed it
+/// as a low-materiality residual with "no traffic fail-open"; measured, both
+/// halves are wrong. `ipnet`'s parsers REQUIRE a prefix length, so a bare host
+/// address is exactly the input that vanished — and for a `discard`/`reject`
+/// route the vanishing is a FAIL-OPEN: with no blackhole entry the packet
+/// longest-prefix matches a LESS-SPECIFIC route (typically the default) and is
+/// FORWARDED where the operator asked for it to be dropped.
+///
+/// fail-on-revert: restore the fall-through (delete the trailing `return
+/// Err(...)`) and the build succeeds, making these `expect_err`s red.
+#[test]
+fn route_destination_unparseable_fails_closed() {
+    // A BARE HOST ADDRESS: legal-looking operator input, no prefix length.
+    for (table, dest) in [
+        ("inet.0", "10.0.0.1"),
+        ("inet6.0", "2001:db8::1"),
+        // The Junos `default` keyword, which the Go config compiler accepts
+        // verbatim as a destination.
+        ("inet.0", "default"),
+        ("inet.0", "not-an-address"),
+    ] {
+        let snapshot = ConfigSnapshot {
+            routes: vec![crate::RouteSnapshot {
+                table: table.into(),
+                destination: dest.into(),
+                discard: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = try_build_forwarding_state_with_policy_counters(
+            &snapshot,
+            &crate::policy::PolicyCounterStore::default(),
+        )
+        .expect_err("an unparseable destination must fail the snapshot CLOSED");
+        match err {
+            crate::policy::SnapshotIntegrityError::RouteDestinationUnparseable {
+                table: got_table,
+                destination,
+            } => {
+                assert_eq!(got_table, table);
+                assert_eq!(destination, dest);
+            }
+            other => panic!("destination {dest:?}: expected RouteDestinationUnparseable, got {other:?}"),
+        }
+    }
+}
+
+/// #6568 (member 1) anti-over-reject: every destination shape the Go producer
+/// can legitimately emit still builds. Without this, a gate that rejected
+/// EVERYTHING would satisfy the fail-closed test above while breaking all
+/// forwarding.
+#[test]
+fn route_destination_valid_prefixes_still_build() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                destination: "10.9.0.0/16".into(),
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                destination: "0.0.0.0/0".into(),
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                // The /32 host prefix the Go producer now emits for a bare
+                // host address — the shape that replaces the silent drop.
+                destination: "10.0.0.1/32".into(),
+                discard: true,
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                destination: "2001:db8::/64".into(),
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                destination: "2001:db8::1/128".into(),
+                discard: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect("every valid prefix shape must still build");
+}
+
 /// #3771 (M4) anti-over-reject: a route whose `family` AGREES with its
 /// destination builds, and an EMPTY `family` (older / omitted producer) is
 /// unconstrained and also builds (parse-only, the pre-fix behaviour).
