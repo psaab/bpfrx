@@ -227,6 +227,37 @@ func TestJunosHostResidualIsUnrenderedAndWarned6612(t *testing.T) {
 			flipRules: true,
 		},
 		{
+			// #6612: destination-narrowed, source UNSCOPED — the shape that was
+			// silent on BOTH halves before the destination clause landed. Source
+			// `any` is load-bearing: with a concrete source the row would warn
+			// through junosHostPolicySourceScoped and could not tell whether the
+			// destination clause exists.
+			name:       "destination-scoped permit (a carve nft cannot express as a saddr subtraction)",
+			policyName: "dst-permit",
+			cmds:       concat(residualBase, policy("dst-permit", "any", "fw-mgmt", "any", "permit")),
+			flip:       concat(residualBase, policy("dst-permit", "any", "any", "any", "permit")),
+			flipRules:  false,
+		},
+		{
+			// The excluded form must be covered too: a fix catching the named
+			// destination and missing `destination-address-excluded` would leave a
+			// residual with the same shape as the bug, which is the hardest kind
+			// to notice later. The projection gates on both
+			// (`junosHostAddrScoped(dest) || DestinationAddressExcluded`) and so
+			// does the warning.
+			name:       "destination-EXCLUDED permit (same carve, inverted domain)",
+			policyName: "dstx-permit",
+			// `destination-address any` + excluded, NOT a named destination: that
+			// isolates the `DestinationAddressExcluded` disjunct on both the
+			// projection and the advisory. Naming an address here would satisfy
+			// `junosHostAddrScoped` too, and a mutation dropping one disjunct
+			// could not be localised — the other would keep the row green.
+			cmds: concat(residualBase, policy("dstx-permit", "any", "any", "any", "permit"),
+				[]string{"set security policies from-zone untrust to-zone junos-host policy dstx-permit match destination-address-excluded"}),
+			flip:      concat(residualBase, policy("dstx-permit", "any", "any", "any", "permit")),
+			flipRules: false,
+		},
+		{
 			name:       "source-restricted permit (its implied deny-non-permitted half is unenforced)",
 			policyName: "src-permit",
 			cmds:       concat(residualBase, policy("src-permit", "bad-host", "any", "any", "permit")),
@@ -347,52 +378,36 @@ func TestJunosHostMultiTermApplicationIsFullyExpanded6612(t *testing.T) {
 	}
 }
 
-// TestJunosHostDestinationScopedPermitDoesNotWidenALaterDeny6612 locks the half
-// of the destination-scoped-permit contract that HOLDS today, and names the half
-// that does not.
+// TestJunosHostDestinationScopedPermitDoesNotWidenALaterDeny6612 is the
+// mutation anchor for the RULES half of the destination-scoped-permit contract.
+// The table above asserts the conjunction (no rules AND a warning naming the
+// policy) for this class; this pins the half the table's fixture cannot make
+// gate-sensitive.
 //
-// A `to-zone junos-host` permit narrowed on DESTINATION (or carrying
-// `destination-address-excluded`) is un-representable: a permit is projected only
-// as a `saddr !=` SUBTRACTION of later denies, which cannot express a carve that
-// is also destination-scoped. junosHostProjectTerm marks it so, and the whole
-// zone program then emits nothing.
+// The two halves cannot be made load-bearing by ONE fixture, and the reason is
+// structural rather than a shortcut here:
 //
-// The fixture deliberately places a DENY after the permit, because that is the
-// only shape in which the gate changes a packet verdict. A lone
-// destination-scoped permit renders nothing whether or not the gate exists — the
-// projection is DROP-only — so a test built on one would assert a property that
-// holds for an unrelated reason and would stay green with the gate deleted. With
-// a following deny, dropping the gate renders `saddr != <permit source>` on that
-// deny, which stops denying the permitted source to firewall addresses the
-// permit never covered: an under-deny, and exactly the fail-open the gate exists
-// to prevent.
+//   - For the RULES half to red when the projection's destination gate is
+//     deleted, the permit needs a CONCRETE source. With `source-address any` the
+//     permit sets permitAllV4 and shadows every later deny outright, so the
+//     program renders nothing with or without the gate.
+//   - For the WARNING half to red when the advisory's destination clause is
+//     deleted, the permit must NOT be source-scoped, or it warns through
+//     junosHostPolicySourceScoped and proves nothing about the destination
+//     dimension.
 //
-// **The warning half is a KNOWN OPEN DEFECT and is deliberately NOT asserted
-// here.** Measured on this fixture, ValidateConfig emits ZERO warnings of any
-// kind for the permit: junosHostPolicyStricterThanCoarseGate
-// (pkg/config/compiler_validate_warn_host_inbound.go) admits a permit as
-// stricter-than-coarse only through junosHostPolicySourceScoped, which inspects
-// the SOURCE dimension alone, so a destination-narrowed permit never reaches the
-// test. The policy commits clean, renders nothing, and says nothing — the exact
-// silent state #4168 exists to prevent, and the reason #6612's closing claim
-// ("each affected policy emits the #4168 commit warning naming itself") is false
-// as written.
+// A concrete source and no concrete source are mutually exclusive, so the class
+// is covered by the table row (source `any` — pins the warning clause) plus this
+// test (concrete source ahead of a deny — pins the projection gate). Both
+// fixtures assert what they can; neither pretends to bind the other's gate.
 //
-// The fix is one clause, binding the warning to the SAME predicate the
-// projection already uses in junosHostProjectTerm so the two halves cannot drift:
-//
-//	if junosHostAddrScoped(m.DestinationAddresses) || m.DestinationAddressExcluded {
-//	    return true, "destination-restricted permit"
-//	}
-//
-// It lands in pkg/config, outside this lane's file surface, and is tracked on
-// #6612. When it lands, this test folds back into the table above as two rows
-// asserting both halves — they were written and measured, and they pass with
-// that clause.
+// The property this one binds: without the projection gate, the deny that
+// follows renders `saddr != <permit source>` and stops denying that source to
+// every firewall address the permit never covered — an under-deny, and the only
+// shape in which the gate changes a packet verdict.
 //
 // FAIL-ON-REVERT: delete the `p.Action != PolicyDeny && (junosHostAddrScoped(...)
-// || DestinationAddressExcluded)` gate in junosHostProjectTerm and the following
-// deny renders a widened rule — RED here.
+// || DestinationAddressExcluded)` gate in junosHostProjectTerm — RED here.
 func TestJunosHostDestinationScopedPermitDoesNotWidenALaterDeny6612(t *testing.T) {
 	followingDeny := policy("blk", "any", "any", "any", "deny")
 	for _, tc := range []struct {
