@@ -1,3 +1,28 @@
+## 2026-08-22 — #6500 signed image inventory (guest kernel + package set)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The bake now writes `/etc/xpf/image-inventory` inside the
+  image as its last virt-customize step and reads it back OFFLINE with
+  `virt-cat` (no boot), emitting `dist/xpf-<ver>.pkgs` under the signed
+  SHA256SUMS. `build_manifest_text` takes `guest_kernel` as a REQUIRED
+  keyword so a caller cannot silently omit the field the publish gate
+  needs, and `gate_provenance` gains a third fail-closed leg refusing a
+  missing guest_kernel, an absent or uncovered `.pkgs`, a hollow
+  inventory, or a kernel disagreement between the two authenticated
+  records. The record format is single-sourced in
+  `scripts/dist/image_inventory.py` — bake writes it, publish reads it,
+  and a divergence there is always a bug, so it is one definition
+  rather than two bound by a canary. Three pre-existing fixtures set
+  the OLD gate input and were carried forward rather than left to pass
+  vacuously, and the provenance negatives now assert WHICH check fired
+  instead of only that SystemExit was raised.
+- **File(s)**: scripts/image/bake.py, scripts/dist/publish.py,
+  scripts/dist/image_inventory.py, scripts/dist/selftest.sh,
+  scripts/dist/test_image_inventory_6500.py,
+  scripts/dist/test_publish_provenance.py,
+  scripts/image/test_bake_base_pin.py, docs/install-images.md,
+  docs/distribution.md
+
 ## 2026-08-22 — #6499 boot-firmware self-tests + lint-list drift guard
 
 - **Timestamp**: 2026-08-22
