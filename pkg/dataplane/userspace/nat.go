@@ -192,45 +192,94 @@ func coalescePortRanges(ports []int) []NatPortRangeWire {
 	return ranges
 }
 
-// appPortsFromSpec parses a port specification like "80", "1024-65535" into a
-// list of port numbers. Mirrors the logic in pkg/dataplane/compiler.go.
-func appPortsFromSpec(spec string) []int {
-	if spec == "" {
+// appPortRangesFromSpec returns exactly what
+// coalescePortRanges(appPortsFromSpec(spec)) returns, WITHOUT materializing the
+// intermediate per-port slice (#5250, A6-b2 F3).
+//
+// A port spec is a single value or ONE contiguous inclusive range, so its
+// coalesced form is always zero or one wire range — there is nothing for
+// coalescePortRanges to merge. The old path nonetheless appended every port
+// from lo..hi into a []int first, so `destination-port 1-65535` allocated ~65k
+// ints (512 KiB on a 64-bit build) purely to have them collapsed back into one
+// {Low:1,High:65535} entry on the very next line, once per application and
+// again for every member of an application-set — a commit-time allocation
+// spike on the same goroutine that services the control socket.
+//
+// Equivalence with the composition it replaces, arm by arm (pinned by
+// TestAppPortRangesFromSpecMatchesCoalescedSlice, which asserts the two agree
+// across a spec corpus rather than trusting this comment):
+//   - "" / parse failure / reversed range (#3726) -> both yield no range.
+//   - lo == hi -> the slice path yields []int{lo}, which coalesces to
+//     {lo,lo} when lo >= 1 and to nothing when lo == 0.
+//   - lo < hi  -> the slice path yields lo..hi, and coalescePortRanges drops
+//     only the sub-1 values, so the result is {max(lo,1), hi}. hi <= 65535 is
+//     guaranteed by the ParseUint bit width, so no high-side clamp is needed.
+func appPortRangesFromSpec(spec string) []NatPortRangeWire {
+	lo, hi, ok := appPortSpecBounds(spec)
+	if !ok {
 		return nil
+	}
+	// coalescePortRanges skips every value below 1; for a contiguous range that
+	// is exactly a low-side clamp.
+	if lo < 1 {
+		lo = 1
+	}
+	if hi < lo {
+		// Either a single port 0, or a range whose only members were sub-1.
+		return nil
+	}
+	return []NatPortRangeWire{{Low: uint16(lo), High: uint16(hi)}}
+}
+
+// appPortSpecBounds parses a port spec into its inclusive [lo,hi] bounds. ok is
+// false for an empty spec, a malformed number, or a REVERSED range (#3726 —
+// "200-100" can never match, and must not be narrowed to an exact match on the
+// low port). It is the shared parse behind appPortsFromSpec and
+// appPortRangesFromSpec so the two cannot drift.
+func appPortSpecBounds(spec string) (lo, hi uint64, ok bool) {
+	if spec == "" {
+		return 0, 0, false
 	}
 	if strings.Contains(spec, "-") {
 		parts := strings.SplitN(spec, "-", 2)
 		lo, err := strconv.ParseUint(parts[0], 10, 16)
 		if err != nil {
-			return nil
+			return 0, 0, false
 		}
 		hi, err := strconv.ParseUint(parts[1], 10, 16)
 		if err != nil {
-			return nil
-		}
-		if hi > lo {
-			var ports []int
-			for p := lo; p <= hi; p++ {
-				ports = append(ports, int(p))
-			}
-			return ports
+			return 0, 0, false
 		}
 		if hi < lo {
 			// #3726: a REVERSED range ("200-100", lo>hi) is invalid — it can
-			// never match any port. Return nil (not []int{lo}) so the caller
-			// treats it as "configured but unrepresentable" and fails CLOSED
-			// via the never-match sentinel, rather than silently narrowing the
-			// NAT rule to an exact match on the low port. Strict commit already
-			// rejects lo>hi (pkg/config range validation); this hardens the
-			// #1960 tolerant-load / peer-sync backstop. The hi==lo case below
-			// is a legitimate single exact port.
-			return nil
+			// never match any port. Report "no bounds" (not lo..lo) so the
+			// caller treats it as "configured but unrepresentable" and fails
+			// CLOSED via the never-match sentinel, rather than silently
+			// narrowing the NAT rule to an exact match on the low port. Strict
+			// commit already rejects lo>hi (pkg/config range validation); this
+			// hardens the #1960 tolerant-load / peer-sync backstop. hi==lo is a
+			// legitimate single exact port.
+			return 0, 0, false
 		}
-		return []int{int(lo)}
+		return lo, hi, true
 	}
 	p, err := strconv.ParseUint(spec, 10, 16)
 	if err != nil {
+		return 0, 0, false
+	}
+	return p, p, true
+}
+
+// appPortsFromSpec parses a port specification like "80", "1024-65535" into a
+// list of port numbers. Mirrors the logic in pkg/dataplane/compiler.go.
+func appPortsFromSpec(spec string) []int {
+	lo, hi, ok := appPortSpecBounds(spec)
+	if !ok {
 		return nil
 	}
-	return []int{int(p)}
+	ports := make([]int, 0, hi-lo+1)
+	for p := lo; p <= hi; p++ {
+		ports = append(ports, int(p))
+	}
+	return ports
 }

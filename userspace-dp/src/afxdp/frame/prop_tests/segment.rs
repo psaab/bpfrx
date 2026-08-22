@@ -24,6 +24,9 @@ use super::strategies::{
 use super::*;
 
 const TCP_PSH: u8 = 0x08;
+// #5191: the two flags software segmentation must NOT clone verbatim.
+const TCP_URG: u8 = 0x20;
+const TCP_CWR: u8 = 0x80;
 
 fn seg_fixture(mtu: usize, tx_vlan: u16) -> ForwardingState {
     let mut forwarding = ForwardingState::default();
@@ -101,6 +104,10 @@ fn check_segments(
         orig[pkt.l4() + 7],
     ]);
     let orig_flags = orig[pkt.l4() + 13];
+    // #5191: the two header fields the splitter must rebase rather than clone.
+    let orig_urg_ptr = u16::from_be_bytes([orig[pkt.l4() + 18], orig[pkt.l4() + 19]]);
+    let orig_ipv4_id = u16::from_be_bytes([orig[pkt.l3 + 4], orig[pkt.l3 + 5]]);
+    let orig_ipv4_df = pkt.addr_family == AF4 && (orig[pkt.l3 + 6] & 0x40) != 0;
     let orig_ttl = orig[pkt.l3 + if pkt.addr_family == AF4 { 8 } else { 7 }];
     let orig_payload = &orig[pkt.l4() + tcp_hdr..];
 
@@ -165,13 +172,54 @@ fn check_segments(
             orig_seq.wrapping_add(cumulative as u32),
             "sequence number"
         );
-        // PSH cleared on all but the last segment; other flags kept.
-        let want_flags = if is_last {
-            orig_flags
-        } else {
-            orig_flags & !TCP_PSH
-        };
+        // PSH cleared on all but the last segment. #5191: CWR is a one-shot
+        // (RFC 3168 §6.1.2), so it survives only on segment 0; URG survives
+        // only while the urgent point is still at or ahead of this segment's
+        // first byte. Every other flag is kept verbatim.
+        let mut want_flags = orig_flags;
+        if !is_last {
+            want_flags &= !TCP_PSH;
+        }
+        if idx > 0 {
+            want_flags &= !TCP_CWR;
+            if u32::from(orig_urg_ptr) < cumulative as u32 {
+                want_flags &= !TCP_URG;
+            }
+        }
         prop_assert_eq!(tcp[13], want_flags, "TCP flags");
+
+        // #5191: the urgent pointer is relative to the segment's OWN seq, so
+        // the ABSOLUTE urgent octet must be identical across every segment
+        // that still carries URG; a segment that dropped URG carries a zero
+        // pointer.
+        let seg_urg_ptr = u16::from_be_bytes([tcp[18], tcp[19]]);
+        if (tcp[13] & TCP_URG) != 0 {
+            prop_assert_eq!(
+                orig_seq
+                    .wrapping_add(cumulative as u32)
+                    .wrapping_add(u32::from(seg_urg_ptr)),
+                orig_seq.wrapping_add(u32::from(orig_urg_ptr)),
+                "urgent pointer rebased to the same absolute octet"
+            );
+        } else if (orig_flags & TCP_URG) != 0 {
+            prop_assert_eq!(seg_urg_ptr, 0, "cleared URG zeroes the urgent pointer");
+        }
+
+        // #5191: a NON-atomic IPv4 datagram (DF clear) needs a distinct
+        // Identification per segment (RFC 6864 §4.1); an atomic one keeps the
+        // original, the field being ignored there.
+        if pkt.addr_family == AF4 {
+            let want_id = if orig_ipv4_df {
+                orig_ipv4_id
+            } else {
+                orig_ipv4_id.wrapping_add(idx as u16)
+            };
+            prop_assert_eq!(
+                u16::from_be_bytes([packet[4], packet[5]]),
+                want_id,
+                "IPv4 Identification"
+            );
+        }
 
         // Full checksum oracle per segment (P-N2 — NOT the v4-TCP-only
         // verify_built_frame_checksums).

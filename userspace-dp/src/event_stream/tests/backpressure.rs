@@ -469,3 +469,115 @@ fn test_lossless_send_waits_for_capacity() {
     assert_eq!(shared.frames_sent.load(Ordering::Relaxed), 2);
     assert_eq!(shared.frames_dropped.load(Ordering::Relaxed), 0);
 }
+
+
+// ---------------------------------------------------------------------------
+// #5189 (A1-b10-F4) — the idle keepalive is a backlog producer and must obey
+// the same WRITE_BACKLOG_MAX_BYTES ceiling the channel drain enforces.
+// ---------------------------------------------------------------------------
+
+use super::super::connection::append_idle_keepalive_if_due;
+
+/// #5189 (A1-b10-F4) fail-on-revert guard.
+///
+/// `drain_channel_into_write_buf` halts at `WRITE_BACKLOG_MAX_BYTES` so a
+/// live-but-non-reading consumer cannot migrate unbounded bytes into the
+/// heap-backed backlog (#2381). #2883 then routed the idle keepalive through
+/// the SAME `write_buf` — but without the cap check. A consumer wedged at the
+/// cap keeps `drained_any == false` forever, which is exactly the condition
+/// that arms the idle keepalive, and the socket write returns `WouldBlock`
+/// forever, so nothing ever reclaims those bytes: the backlog grew by one
+/// frame header per keepalive interval, monotonically and without bound,
+/// falsifying the documented `cap + one max EventFrame` ceiling.
+///
+/// This drives the SAME function the connected loop calls for its keepalive
+/// (`connection.rs`'s idle branch has no other keepalive path), so the site is
+/// production-reachable rather than a test-only shim.
+///
+/// It pins the BOUNDARY, not merely "never appends": the first call sits one
+/// frame below the cap and MUST append (otherwise the suppression assertion
+/// below would be vacuous — a helper that never appends would pass it), and
+/// only the call that would cross the cap is suppressed. Dropping the
+/// `pending_len() >= WRITE_BACKLOG_MAX_BYTES` guard makes the backlog grow past
+/// the cap on the very first post-cap attempt → RED.
+#[test]
+fn idle_keepalive_stops_at_the_write_backlog_cap_5189() {
+    let mut write_buf = WriteBacklog::with_capacity(WRITE_BACKLOG_MAX_BYTES);
+    write_buf.extend_from_slice(&vec![0u8; WRITE_BACKLOG_MAX_BYTES - FRAME_HEADER_SIZE]);
+    let mut last_write = Instant::now();
+
+    // One frame of headroom left: the keepalive is due and MUST be appended.
+    assert!(
+        append_idle_keepalive_if_due(&mut write_buf, &mut last_write, Duration::ZERO),
+        "a due keepalive with headroom below the cap must still be appended — \
+         otherwise the suppression assertion below proves nothing"
+    );
+    assert_eq!(
+        write_buf.pending_len(),
+        WRITE_BACKLOG_MAX_BYTES,
+        "the appended keepalive must be exactly one frame header"
+    );
+    assert_eq!(
+        write_buf.pending()[write_buf.pending_len() - FRAME_HEADER_SIZE + 4],
+        MSG_KEEPALIVE,
+        "the appended bytes must be a keepalive frame"
+    );
+
+    // Now at the cap with a wedged consumer (no `advance`, so nothing is ever
+    // reclaimed). Every further keepalive must be suppressed.
+    for attempt in 0..64 {
+        assert!(
+            !append_idle_keepalive_if_due(&mut write_buf, &mut last_write, Duration::ZERO),
+            "keepalive attempt {attempt} appended past WRITE_BACKLOG_MAX_BYTES"
+        );
+        assert_eq!(
+            write_buf.pending_len(),
+            WRITE_BACKLOG_MAX_BYTES,
+            "the write backlog grew past the cap on keepalive attempt {attempt}: \
+             a stalled consumer must degrade telemetry, never grow helper heap \
+             without bound (#5189 A1-b10-F4)"
+        );
+    }
+}
+
+/// #5189 (A1-b10-F4): a suppressed keepalive must NOT re-arm `last_write`.
+///
+/// The keepalive stays DUE while the backlog is capped, so the first cycle
+/// after the backlog drains below the cap emits it immediately instead of
+/// waiting out another full interval — otherwise a consumer that unwedges just
+/// after a suppressed attempt goes a further `KEEPALIVE_IDLE_INTERVAL` with no
+/// liveness signal on an otherwise-idle stream. Re-arming `last_write` inside
+/// the suppression branch makes the final assertion RED.
+#[test]
+fn suppressed_idle_keepalive_does_not_rearm_the_interval_5189() {
+    let interval = Duration::from_millis(50);
+    let mut write_buf = WriteBacklog::with_capacity(WRITE_BACKLOG_MAX_BYTES);
+    write_buf.extend_from_slice(&vec![0u8; WRITE_BACKLOG_MAX_BYTES]);
+    let mut last_write = Instant::now();
+
+    // Not yet due: the interval gate, not the cap, is what declines here.
+    assert!(
+        !append_idle_keepalive_if_due(&mut write_buf, &mut last_write, interval),
+        "a keepalive that is not yet due must not be appended"
+    );
+
+    thread::sleep(interval + Duration::from_millis(10));
+    assert!(
+        !append_idle_keepalive_if_due(&mut write_buf, &mut last_write, interval),
+        "a due keepalive must be suppressed while the backlog is at the cap"
+    );
+
+    // The consumer starts reading again: one frame's worth of backlog is
+    // written out, so there is headroom below the cap.
+    write_buf.advance(FRAME_HEADER_SIZE);
+    assert!(
+        write_buf.pending_len() < WRITE_BACKLOG_MAX_BYTES,
+        "control: the advance must put the backlog below the cap"
+    );
+    assert!(
+        append_idle_keepalive_if_due(&mut write_buf, &mut last_write, interval),
+        "the keepalive was still due when the backlog drained below the cap, so \
+         it must fire immediately — the suppressed attempt must not have \
+         re-armed last_write (#5189 A1-b10-F4)"
+    );
+}

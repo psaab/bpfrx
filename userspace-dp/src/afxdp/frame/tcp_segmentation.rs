@@ -9,6 +9,106 @@
 
 use super::*;
 
+/// #5191: the per-segment header fixups every software-segmentation output
+/// gets, shared by the copy-path builder here and the prepared-TX twin in
+/// `tx/tcp_segmentation.rs`. Both builders clone the ORIGINAL IP and TCP
+/// headers verbatim into each output; everything that must NOT be cloned is
+/// repaired here, in one place, so the two twins cannot drift.
+///
+/// `packet` starts at the L3 header. `l4_offset` is the TCP offset relative to
+/// it (equal to the IP header length at both call sites — the copied header
+/// includes any IPv6 extension chain). `segment_index` is 0 for the first
+/// output, `data_offset` is this chunk's byte offset within the original TCP
+/// data, and `is_last` marks the final output.
+///
+/// Caller ordering contract: both twins call this BEFORE the IPv4 header
+/// checksum recompute and BEFORE `recompute_l4_checksum_ipv4/6`, so the fields
+/// written here are covered by the fresh checksums rather than invalidating
+/// them.
+///
+/// What is repaired, and why cloning it is wrong:
+///
+/// - **seq** — each segment starts `data_offset` bytes further into the
+///   stream. (Pre-#5191 behaviour, unchanged.)
+/// - **PSH** — only the final segment carries the original push.
+///   (Pre-#5191 behaviour, unchanged.)
+/// - **CWR** (RFC 3168 §6.1.2) — a one-shot signal that the sender has already
+///   responded to an ECN-Echo. The receiver clears its "keep echoing" state on
+///   the first CWR it sees, so a CWR replicated onto later segments retracts an
+///   ECE the receiver may have re-raised for a NEW congestion event in between,
+///   and the sender never reduces cwnd for it. Kept on segment 0 only — the
+///   same rule a TSO NIC and Linux's `tcp_gso_segment` apply.
+/// - **URG + urgent pointer** (RFC 9293 §3.1) — the pointer is relative to the
+///   segment's OWN sequence number, so cloning it moves the urgent point
+///   forward by one chunk per segment and invents urgent data that the sender
+///   never marked. A receiver with `SO_OOBINLINE` off pulls the byte at the
+///   (wrong) urgent point OUT of the data stream, which corrupts the
+///   application byte stream rather than merely mis-signalling. The ABSOLUTE
+///   urgent point `seq + urg_ptr` is preserved instead: later segments get
+///   `urg_ptr - data_offset`, and a segment that starts past the urgent point
+///   has URG cleared (its urgent data was fully delivered by an earlier
+///   segment). Preserving the absolute value keeps the RFC 793 and RFC 1122
+///   readings of the pointer equivalent — a receiver derives the same urgent
+///   sequence number under either.
+/// - **IPv4 Identification** (RFC 6864 §4.1) — a NON-atomic datagram (DF
+///   clear) must carry a unique Identification per source/destination/protocol
+///   while it could still be fragmented downstream. Cloning one ID across N
+///   segments lets a downstream fragmenting router produce fragments from
+///   DIFFERENT segments that share the reassembly key, so the receiver splices
+///   them into a corrupt datagram (caught by the TCP checksum, but only after
+///   the data is lost). Each segment gets `id + segment_index`. An ATOMIC
+///   datagram (DF set — the normal PMTUD case) keeps the original ID
+///   unchanged: RFC 6864 §4.1 says the field is ignored there, so rewriting it
+///   would be a gratuitous wire change.
+#[inline]
+pub(in crate::afxdp) fn finalize_tcp_segment_headers(
+    packet: &mut [u8],
+    addr_family: u8,
+    l4_offset: usize,
+    original_seq: u32,
+    data_offset: usize,
+    segment_index: u16,
+    is_last: bool,
+) -> Option<()> {
+    // IPv4 Identification, before the TCP borrow. Only non-atomic datagrams
+    // (DF clear) need distinct IDs; byte 6 bit 0x40 is DF.
+    if addr_family as i32 == libc::AF_INET && segment_index > 0 && (*packet.get(6)? & 0x40) == 0 {
+        let original_id = u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]);
+        let id = original_id.wrapping_add(segment_index);
+        packet.get_mut(4..6)?.copy_from_slice(&id.to_be_bytes());
+    }
+
+    let tcp = packet.get_mut(l4_offset..)?;
+    let seq = original_seq.wrapping_add(data_offset as u32);
+    tcp.get_mut(4..8)?.copy_from_slice(&seq.to_be_bytes());
+    if !is_last {
+        *tcp.get_mut(13)? &= !TCP_FLAG_PSH;
+    }
+    if segment_index == 0 {
+        // Segment 0 keeps the original CWR and the original urgent pointer:
+        // its sequence number is the original one, so both are already right.
+        return Some(());
+    }
+    *tcp.get_mut(13)? &= !TCP_FLAG_CWR;
+    if (*tcp.get(13)? & TCP_FLAG_URG) != 0 {
+        let urg_ptr = u32::from(u16::from_be_bytes([*tcp.get(18)?, *tcp.get(19)?]));
+        let consumed = data_offset as u32;
+        if urg_ptr >= consumed {
+            // Still points into (or at the start of) this segment. The
+            // subtraction cannot overflow a u16: `urg_ptr` already fits one and
+            // only shrinks.
+            let rebased = (urg_ptr - consumed) as u16;
+            tcp.get_mut(18..20)?.copy_from_slice(&rebased.to_be_bytes());
+        } else {
+            // The urgent point lies before this segment — an earlier segment
+            // already carried the signal with a correct pointer.
+            *tcp.get_mut(13)? &= !TCP_FLAG_URG;
+            tcp.get_mut(18..20)?.copy_from_slice(&[0, 0]);
+        }
+    }
+    Some(())
+}
+
 pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
     frame: &[u8],
     meta: impl Into<ForwardPacketMeta>,
@@ -199,6 +299,7 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
     };
     let mut out = Vec::with_capacity((data.len() / segment_payload_max) + 1);
     let mut data_offset = 0usize;
+    let mut segment_index = 0u16;
     while data_offset < data.len() {
         let chunk_len = (data.len() - data_offset).min(segment_payload_max);
         let is_last = data_offset + chunk_len == data.len();
@@ -221,12 +322,17 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                 .get_mut(ip_header_len + tcp_header_len..total_ip_len)?
                 .copy_from_slice(data.get(data_offset..data_offset + chunk_len)?);
 
-            let tcp = packet.get_mut(tcp_offset..)?;
-            let seq = original_seq.wrapping_add(data_offset as u32);
-            tcp.get_mut(4..8)?.copy_from_slice(&seq.to_be_bytes());
-            if !is_last {
-                tcp[13] &= !TCP_FLAG_PSH;
-            }
+            // #5191: seq / PSH / CWR / URG+urgent-pointer / IPv4 ID, shared
+            // with the prepared-TX twin.
+            finalize_tcp_segment_headers(
+                packet,
+                meta.addr_family,
+                tcp_offset,
+                original_seq,
+                data_offset,
+                segment_index,
+                is_last,
+            )?;
         }
 
         match meta.addr_family as i32 {
@@ -261,6 +367,7 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
             out.push(frame_out);
         }
         data_offset += chunk_len;
+        segment_index = segment_index.saturating_add(1);
     }
     Some(out)
 }

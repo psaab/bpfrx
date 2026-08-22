@@ -446,6 +446,28 @@ The generalisation: a sweep keyed on a NAME is a proxy for the property "every
 per-packet accounting effect is bound". It found three real gaps and then
 under-reported its own residue by four, which is what a proxy does.
 
+**#5190: the hit TALLY itself, not just the per-hit side effects.** The sweep
+above bound what a SERVED hit records. It did not ask whether the packets counted
+as hits were served. `lookup_counted` commits `hits += 1` (plus the LRU promote,
+the `last_used_epoch` stamp and the `observed_bytes` add) as soon as
+key/generation/epoch/lease pass, because it has to hand the caller a borrow of
+the entry and cannot hold a mutable borrow across the caller's own validation.
+`stage_flow_cache_hit` then re-checks two things the cache cannot see — the
+per-shard neighbor MAC epoch (#3048/#5147) and the HA/fabric decision validity —
+and on failure evicts the slot and returns `FallThrough`. That packet went to the
+slow path, and it was still published as a cache hit. The per-ENTRY state needed
+no undo (the eviction takes it), but the three tallies outlive the entry, so
+`FlowCache::reclassify_hit_as_miss` now moves a rejected candidate to the
+miss/eviction side at the reject branch — off the steady-state fast path, which
+is untouched. It matters because the inflation is correlated: it peaks during
+gateway VRRP failover, a NIC swap or an RG transition, i.e. exactly when an
+operator reads `flow_cache_hits` to explain a stall. Bound by
+`live_flow_cache_callsite_rejected_candidate_is_not_a_hit_5190` (which asserts
+`FallThrough` FIRST, so a fixture that stopped reaching the reject branch fails
+loudly instead of passing vacuously) plus the
+`..._served_hit_still_counts_as_a_hit_5190` control, which is what stops the
+correction being mis-wired onto the accept path.
+
 The generalisation worth keeping: a telemetry call reached by every test is not
 thereby covered. It binds nothing if a guard above it is false in every fixture,
 nothing if its arguments select a no-op arm, nothing if the collection it walks is
