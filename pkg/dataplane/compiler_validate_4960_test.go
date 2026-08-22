@@ -601,21 +601,32 @@ func TestEachValidationPhaseRowRunsItsOwnCompiler_4960(t *testing.T) {
 			want: "rs64-6894",
 		},
 		{
+			// #7268 rebound this row. It used to bind NAME->BODY by faulting a
+			// DATAPLANE call (failOneDP{fail: "SetNPTv6Rule"}) on an otherwise
+			// VALID rule, but compileNPTv6 no longer writes the eBPF
+			// nptv6_rules surface, so there is no dataplane call left to fault
+			// and that binding would have gone vacuous — the row would pass
+			// whether or not the `nptv6` name still ran the nptv6 body.
+			//
+			// It now binds through the row's OWN error instead: a config-shaped
+			// fault (a nptv6-prefix the helper refuses) that only compileNPTv6
+			// can produce. compileStaticNAT skips IsNPTv6 rules, so no other row
+			// can claim this config, which is what makes the attribution
+			// discriminating. Same hard-error path
+			// TestHelperRefusedNPTv6PrefixStillHardErrors_7077 exercises
+			// (#6894 r9 / #7077). Named, not numbered (#6894 r8 F5).
 			phase: "nptv6",
-			dp:    failOneDP{fail: "SetNPTv6Rule"},
+			dp:    discardingDataPlane{},
 			cfg: emptyCfgWith(func(c *config.Config) {
-				// A VALID NPTv6 rule: compileStaticNAT skips IsNPTv6 rules, so
-				// the `static nat` row passes and `nptv6` reaches its dataplane
-				// write. Named, not numbered (#6894 r8 F5).
 				c.Security.NAT.Static = []*config.StaticNATRuleSet{{
 					Name: "rs-npt",
 					Rules: []*config.StaticNATRule{{
 						Name: "npt", IsNPTv6: true,
-						Match: "2001:db8:1::/48", Then: "fd00:1::/48",
+						Match: "2001:db8:1::/48", Then: "not-a-prefix",
 					}},
 				}}
 			}),
-			want: "set nptv6 inbound",
+			want: "invalid nptv6-prefix",
 		},
 		{
 			phase: "screen profiles",
