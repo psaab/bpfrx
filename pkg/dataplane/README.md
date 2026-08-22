@@ -1116,20 +1116,37 @@ depending only on `core`, which `tests_shim_ext_parity.rs`
 resolvable chain length are compared outcomes, not source-text claims.
 
 The two layers cover different things and both are needed. The corpus
-proves the walk behaves identically **in the dimension the shim
-represents**, which is narrower than "identically":
-`walk_ipv6_ext_headers` returns `(offset, protocol)` and nothing else, so
-the compared unit is terminal offset, terminal protocol, no-next-header
-and fail-closed. Fragment state is not compared because the shim has none
-to compare against. `walk_ipv6_ext_chain` additionally records the first
-Fragment header's raw bytes and a non-first-fragment flag, and the shim's
-blindness there is a real, OPEN divergence rather than an artefact of the
-comparison: on `IPv6 || Fragment(frag_off != 0, next = TCP)` the shim
-resolves `L4(48, TCP)` and `parse_l4` reads fragment PAYLOAD as a TCP
-header, where this crate refuses those bytes. That is **#6704** —
-pre-existing, not introduced by #4555, PINNED (not fixed) by
-`shim_is_not_more_permissive`, and closable only by a shim behaviour
-change with its own verifier cost. The emitted facts, meanwhile, travel
+proves the walk behaves identically in the dimensions the shim
+represents: terminal offset, terminal protocol, no-next-header,
+fail-closed — and, since #6704, the NON-FIRST-FRAGMENT sighting.
+
+`walk_ipv6_ext_headers` returns `ExtWalk { offset, protocol,
+non_first_fragment }`. The third field is set when ANY Fragment header the
+walk stepped over carried non-zero offset bits (`& 0xFFF8`, RFC 8200
+§4.5), which is field-for-field the semantics of
+`ExtChainWalk::non_first_fragment_offset_seen` on this side — so the
+corpus compares them for EQUALITY at every L3 offset, and
+`shim_is_not_more_permissive` pins that a first and a non-first fragment
+move that field in both walkers together. Before #6704 the shim returned a
+bare `(offset, protocol)` and the fragment dimension could not be compared
+from the test side at all; an earlier attempt to compare it hand-wrote a
+second walk loop in the test and asserted `X == X`.
+
+**The divergence itself is still OPEN, and the sighting is not yet
+consumed.** `parse_ipv6` / `parse_ipv4` still pass the bytes at the
+resolved L4 offset to `parse_l4`, so on `IPv6 || Fragment(frag_off != 0,
+next = TCP)` the shim reads fragment PAYLOAD as a TCP header where this
+crate refuses those bytes. That half is **#7494**, and it is blocked on a
+MEASURED verifier wall rather than on design: at a 777,901-instruction
+baseline (22.21% headroom under the 1M cap), carrying the sighting costs
+6,274 and fits, while every shape that ACTS on it — masking the parsed L4
+values, masking just the two ports, carrying the flag as a `ParsedPacket`
+field, forking the session block with any address-keyed check in the new
+arm, or gating the single existing lookup — was rejected by the kernel
+verifier at 1,000,001 instructions. The branch is free; correlating an L4
+register with a packet-derived predicate defeats state pruning. The full
+matrix is in #7494; do not attempt the values-suppression shape without
+re-running `make generate`. The emitted facts, meanwhile, travel
 with the artifact so a consumer of a prebuilt object — the Debian
 packaging path never compiles the shim crate — can check the walk's
 constants without a Rust toolchain.

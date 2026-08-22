@@ -103348,3 +103348,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/mirror_exclusion_reason.go,
   pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
   docs/junos-cli-reference.md
+
+## 2026-08-22 — #6704 shim IPv6 non-first-fragment sighting
+- **Action**: Taught the shim's IPv6 ext-header walk to report a NON-FIRST
+  fragment sighting and made userspace-dp's executable parity corpus compare
+  it against `non_first_fragment_offset_seen`. Consumption of the sighting is
+  NOT included — measured over the 1M verifier cap in eight shapes; split to
+  #7494 with the matrix.
+- **File(s)**: `userspace-xdp/src/ipv6_ext_walk.rs`, `userspace-xdp/src/lib.rs`,
+  `userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs`,
+  `pkg/dataplane/userspace_xdp_bpfel.o`, `pkg/dataplane/userspace_xdp_manifest.json`,
+  `pkg/dataplane/README.md`
