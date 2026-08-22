@@ -98204,6 +98204,40 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
 
+## 2026-08-21 — #5250 LOW cohort: six trivially-bounded Go items
+
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed six of the ten live items on the #5250 ps-review-042 LOW
+  cohort. (1) A8-b2 F3: applied the existing `clampInt32` at the three
+  unclamped int32 protobuf hand-offs and moved the NAT session accumulators to
+  int64 so they cannot wrap while being built. (2) A3-b2 F3: narrowed the
+  host-inbound lifeline fabric fallback from `HasPrefix("fab")` to an exact
+  `fab<digits>` match, so an interface named `fab-foo` no longer gains a silent
+  host-inbound deny bypass (a configured fabric/control link still reaches the
+  set from the chassis-cluster stanza). (3) A6-b2 F1: `ForEachSnapshotNeighbor`
+  now snapshots under `m.mu` and invokes the callback with the lock released —
+  a re-entrant callback used to self-deadlock. (4) A7-b1 F1:
+  `parseEthtoolCoalesce` raises the scanner line cap to 1 MiB and reports
+  `parsed=false` on a scan error, so a long line no longer yields a silently
+  partial parse and per-commit ethtool rewrite churn. (5) A7-b2 F2:
+  `readQueueCount` returns an error distinct from a zero count; on a sysfs read
+  failure the RSS path restores the kernel-default indirection table instead of
+  silently leaving a stale concentrated one live. (6) A9 F3: the default-TTL
+  route-mask cache is now a process singleton, so per-commit exporter rebuilds
+  stop spawning fresh uncancellable background netlink lookups and stop
+  restarting from a cold cache. Each fix carries a fail-on-revert test; the
+  8-cell mutation matrix was green/red/green with zero unsound cells. Go-only
+  diff, no shim `.o` or protocol movement, so no cluster smoke is owed.
+- **File(s)**: pkg/grpcapi/server_helpers.go, pkg/grpcapi/server_nat.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_total_clamp_5250_test.go,
+  pkg/config/lifeline.go, pkg/config/lifeline_fabric_exact_5250_test.go,
+  pkg/dataplane/userspace/manager_neighbor.go,
+  pkg/dataplane/userspace/neighbor_callback_unlocked_5250_test.go,
+  pkg/daemon/coalescence.go, pkg/daemon/coalescence_scan_bound_5250_test.go,
+  pkg/daemon/rss_indirection.go, pkg/daemon/rss_indirection_test.go,
+  pkg/daemon/rss_queue_count_error_5250_test.go, pkg/flowexport/routemask.go,
+  pkg/flowexport/routemask_singleton_5250_test.go, docs/junos-cli-reference.md,
+  docs/host-inbound-service-matrix.md, docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-08-21
 - **Action**: Closed the #5698 Go-side interleaving window (bounded half; the
   full Rust pair-transaction goes to a successor). `mirrorSessionPairV4` /
@@ -98303,6 +98337,49 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/scoped_global_zoneset_failclosed_5488_test.go,
   pkg/dataplane/README.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: #5275 (transit half) — made kernel transit forwarding
+  conditional on the dataplane being ARMED. A successful compile followed by
+  an `rt.Start`/`LoadUserspaceShim` failure cleared the dataplane cell, logged
+  "config-only mode", and fell through to `applyConfig`, while
+  `enableForwarding` (bring-up) and `applyKernelTuning` (EVERY apply tail)
+  both wrote `ip_forward=1` / `ipv6.conf.all.forwarding=1` unconditionally.
+  With no shim attached and zero `hook forward` chains in the repo, the kernel
+  routed transit under no policy. New `Daemon.dataplaneArmed atomic.Bool`
+  (accessor `DataplaneArmed()`) is set true only after `rt.Start()` returns
+  nil and false on every path landing in `setDataplane(nil)` — boot arm
+  failure, bootstrap-exit arm failure, both retired-backend arms — plus
+  bootstrap / `--no-dataplane`, which never arm (suppression is not closure:
+  the sysctls outlive the process, so a restart inherited `ip_forward=1`),
+  and the first-commit-confirmed rollback, whose teardown DETACHES an armed
+  dataplane without passing through either arm writer.
+  `applyKernelTuning` now writes the armed state, so a later commit cannot
+  re-open the hole. The bootstrap-exit arm restores `1`; there is NO re-arm
+  path after a non-bootstrap boot arm failure (`rt.Start` has exactly two call
+  sites), so that node needs an xpfd restart — documented. Armed behaviour is
+  byte-identical (desired value `1`). FRR/VRRP/RG-ownership relinquishment is
+  deliberately out of scope (HA-coupled, owes `test-failover`).
+
+  Validation: `go build ./...` exit 0, `go vet ./pkg/daemon/...` exit 0,
+  `go test -count=1 ./pkg/daemon/...` exit 0, `./pkg/dataplane/...
+  ./pkg/cluster/... ./pkg/fsatomic/...` exit 0. Mutation matrix, one mutation
+  per cell, `$?` read directly: M1 boot-arm-failure close removed → exit 1
+  (`TestBootArmFailureClosesTransit5275`); M2 `applyKernelTuning` back to an
+  unconditional `1` → exit 1 (`TestApplyKernelTuningHonoursArmGate5275` +
+  `TestArmFailureSurvivesApplyTail5275`); M3 bootstrap-exit restore removed →
+  exit 1 (`TestRearmAfterArmFailureRestoresTransit5275`); M4 bootstrap-exit
+  close removed → exit 1 (`TestBootstrapExitArmFailureClosesTransit5275`); M5
+  boot-arm-success enable removed → exit 1 (`TestBootArmSuccessKeepsTransit5275`,
+  the negative control); M6 boot policy back to suppress-only → exit 1
+  (`TestBootTransitPolicyClosesWhenNeverArming5275`); M7 rollback un-arm
+  removed → exit 1 (`TestBootstrapRollbackClosesTransit5275`). Go-only diff, no shim
+  `.o` and no protocol movement, but the change alters real forwarding
+  behaviour on the box, so a cluster smoke IS owed before merge.
+- **File(s)**: pkg/daemon/daemon_transit_gate.go (new),
+  pkg/daemon/transit_forwarding_failclosed_5275_test.go (new),
+  pkg/daemon/daemon.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/daemon_run_naming.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/bootstrap.go, pkg/daemon/README.md, pkg/config/README.md,
+  pkg/fsatomic/canary_test.go, _Log.md
 - **Action**: Correct four in-tree "deferred follow-up" claims that went stale
   when the issues they pointed at were plan-killed. Claims-only round, but two
   of the sentences are OPERATOR-FACING commit warnings, so this moves `.text`
