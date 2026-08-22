@@ -355,3 +355,75 @@ fn nat_counter_clear_zeroes_when_uncontended_3830() {
     assert_eq!(after.bytes, 0, "clear zeroes bytes when uncontended");
 }
 
+
+// #6568 (member 6): `rule_counter` must SURVIVE a poisoned counter mutex, not
+// panic on it.
+//
+// The pre-fix `.expect("nat counter store poisoned")` ran on the NAT
+// translation path, so one unrelated panic — whatever poisoned the mutex —
+// became a panic on EVERY subsequent packet that consulted a rule counter.
+// That is panic amplification: a single worker fault turns into a forwarding
+// outage. A rule counter is DIAGNOSTIC state; losing an increment is a
+// reporting gap and never a forwarding decision, so the correct posture is to
+// recover the guard and carry on.
+//
+// The poisoning thread panicked, it did not corrupt the BTreeMap, so
+// `PoisonError::into_inner` yields a structurally intact map and the counters
+// keep working through the incident — which this asserts, rather than merely
+// asserting "did not panic".
+//
+// The sibling `NatCounterStore::snapshots` in the SAME struct already degrades
+// gracefully on a poisoned lock (`let Ok(counters) = ... else { return
+// Vec::new() }`), so `rule_counter` was the odd one out — and it is the one on
+// the packet path.
+//
+// FAIL-ON-REVERT: restore `.lock().expect(...)` and this test panics instead
+// of returning a counter.
+#[test]
+fn nat_rule_counter_recovers_from_a_poisoned_store_mutex() {
+    let store = NatCounterStore::default();
+
+    // Seed a counter BEFORE poisoning, so the recovery path is proven to see
+    // the pre-existing map contents rather than a fresh empty one.
+    let seeded = store.rule_counter(7).expect("counter 7");
+    for _ in 0..3 {
+        seeded.add(100);
+    }
+
+    // Poison the mutex the way the established #1790 test does: take the lock
+    // on another thread and panic while holding it.
+    let poisoner = {
+        let store_ref = &store;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let _guard = store_ref.counters.lock().unwrap();
+                    panic!("deliberate poison");
+                })
+                .join()
+        })
+    };
+    assert!(poisoner.is_err(), "the poisoning thread must have panicked");
+    assert!(
+        store.counters.lock().is_err(),
+        "premise: the mutex must actually be poisoned, else this test proves nothing"
+    );
+
+    // The whole point: this call must not panic.
+    let recovered = store.rule_counter(7).expect("counter 7 after poisoning");
+    // ...and it must be the SAME counter, carrying the pre-poison total —
+    // returning a fresh zeroed counter would silently reset the operator's
+    // numbers, which is a quieter version of the same defect.
+    let got = recovered.snapshot(7);
+    assert_eq!(got.packets, 3, "pre-poison packet count lost");
+    assert_eq!(got.bytes, 300, "pre-poison byte count lost");
+
+    // The store still works for a NEW id after the incident.
+    let fresh = store.rule_counter(9).expect("counter 9 after poisoning");
+    fresh.add(100);
+    let fresh_got = fresh.snapshot(9);
+    assert_eq!((fresh_got.packets, fresh_got.bytes), (1, 100));
+
+    // The id==0 sentinel is unaffected.
+    assert!(store.rule_counter(0).is_none());
+}

@@ -508,27 +508,69 @@ fn pick_source(rng: &mut XorShift, p: &Profile) -> u32 {
     }
 }
 
-// Build a GLOBALLY-UNIQUE flow. `src_id` (repeats, drives sticky
-// addressing + skew) sets src_ip; `owner` (thread id, or 255 for the
-// pre-population pass) is folded into the top byte of dst_ip and `n`
-// (0..ops within that owner) into the low 24 bits, so the full 5-tuple
-// never collides across threads or between prepop and churn. This
-// matters because the proposed shape skips the reuse-get (in production
-// the session table dedups a repeated 5-tuple before allocate is ever
-// called), so a duplicate key would leak a bitmap bit + a live-count
-// slot — a pure bench artifact that must not exist.
+// dst_ip is a UNIQUENESS TAG, not an address and not an accumulator. Its top
+// byte identifies who produced the flow and its low 24 bits count within that
+// producer, so the full 5-tuple never collides across threads or between the
+// prepop pass and the churn loop. That matters because the proposed shape skips
+// the reuse-get (in production the session table dedups a repeated 5-tuple
+// before allocate is ever called), so a duplicate key would leak a bitmap bit
+// plus a live-count slot — a pure bench artifact that must not exist.
+//
+// #6610: the tag used to be computed as `0xc000_0000 + ((owner as u32) << 24)`,
+// with owner 255 for the prepop pass. `0xc0` already occupies the top byte, so
+// that addition overflows u32 for any owner >= 64 and panicked on the FIRST
+// prepop flow under debug assertions — which is why `cargo test --all-targets`
+// blew up while `make test-rust` (release, `--bins --tests`) never noticed.
+//
+// The release behaviour was NOT wrong, and the fix preserves it exactly. The
+// low-24 term cannot carry (every realized `n` is < 2^24), so the wrap was a
+// pure mod-256 fold of the top byte: prepop landed on 0xbf and the worker
+// threads on 0xc0..0xc7, which are all distinct — the one invariant this
+// function has. Every published allocs/sec, percentile and fail-fraction from
+// this bench therefore stands; nothing needs re-measuring.
+//
+// Two fixes that look right and are NOT:
+//   - `saturating_add` collapses `0xc0 + 0xff` to u32::MAX for EVERY prepop
+//     `n`, destroying the low-24 discriminator and creating the exact duplicate
+//     keys the comment above warns about.
+//   - a wider accumulator changes the tag values, so the run is no longer
+//     byte-comparable with the published numbers.
+//
+// So the tag is now built the way it was always meant to be read: two DISJOINT
+// bit fields OR'd together, with the producer byte named rather than computed.
+const WORKER_TAG_BASE: u8 = 0xc0;
+const PREPOP_TAG: u8 = 0xbf;
+
+// The producer byte must stay injective over the realized domain, and that is
+// the whole correctness argument for this file. A const assert costs nothing and
+// runs on every `cargo build`/`cargo check` of the bench — unlike a #[test],
+// which the Rust gate never compiles for a bench target. This is what makes the
+// `cargo check --benches` leg of `make test-rust` able to catch a reintroduction
+// of #6610 rather than merely catching compile rot.
+const MAX_BENCH_THREADS: u8 = 8; // main()'s `threads` array tops out at 8
+const _: () = assert!(
+    WORKER_TAG_BASE.checked_add(MAX_BENCH_THREADS).is_some(),
+    "worker tag would overflow u8"
+);
+const _: () = assert!(
+    PREPOP_TAG < WORKER_TAG_BASE,
+    "prepop tag must sit below every worker tag so no thread id can collide with it"
+);
+
+// Build a GLOBALLY-UNIQUE flow. `src_id` (repeats, drives sticky addressing +
+// skew) sets src_ip; `tag` is the producer byte (PREPOP_TAG, or
+// WORKER_TAG_BASE + thread id) and `n` counts within that producer.
 #[inline]
-fn make_flow(src_id: u32, owner: u8, n: u32) -> FlowKey {
+fn make_flow(src_id: u32, tag: u8, n: u32) -> FlowKey {
     FlowKey {
         src_ip: 0x0a00_0000 + src_id, // 10.x.x.x (drives addressing)
-        dst_ip: 0xc000_0000 + ((owner as u32) << 24) + (n & 0x00ff_ffff),
+        // Disjoint fields: OR, not +, so no carry between them is even possible.
+        dst_ip: ((tag as u32) << 24) | (n & 0x00ff_ffff),
         src_port: 1024 + (n as u16 & 0x3fff),
         dst_port: 80 + ((n >> 14) as u16 & 0x1ff),
         protocol: 6,
     }
 }
-
-const PREPOP_OWNER: u8 = 255;
 
 // Percentile from a sorted latency slice (nanoseconds).
 fn pct(sorted: &[u32], q: f64) -> u32 {
@@ -560,14 +602,14 @@ fn run_config(build: &dyn Fn() -> Arc<dyn Alloc>, p: &Profile, m: usize) -> RunR
     let mut t = 0usize;
     let mut installed = 0usize;
     // Round-robin the pre-populated flows across threads' queues. Prepop
-    // flows use the reserved owner byte (PREPOP_OWNER) + a monotonic `n`
+    // flows use the reserved producer byte (PREPOP_TAG) + a monotonic `n`
     // so they never collide with any thread's churn flows.
     let mut prepop_n: u32 = 0;
     let mut attempts = 0usize;
     while installed < target && attempts < target * 4 {
         attempts += 1;
         let src = pick_source(&mut prepop_rng, p);
-        let flow = make_flow(src, PREPOP_OWNER, prepop_n);
+        let flow = make_flow(src, PREPOP_TAG, prepop_n);
         prepop_n += 1;
         if alloc.allocate(flow).is_some() {
             outstanding[t].push_back(flow);
@@ -590,15 +632,22 @@ fn run_config(build: &dyn Fn() -> Arc<dyn Alloc>, p: &Profile, m: usize) -> RunR
             let mut fails: u64 = 0;
             // Per-thread churn key space: owner byte = tid, n = op index,
             // so the 5-tuple is globally unique (see make_flow).
-            let owner = tid as u8;
+            let tag = WORKER_TAG_BASE + tid as u8;
             barrier.wait();
             let start = Instant::now();
             for n in 0..ops {
                 let src = pick_source(&mut rng, &profile);
-                let flow = make_flow(src, owner, n as u32);
+                let flow = make_flow(src, tag, n as u32);
                 let t0 = Instant::now();
                 let got = alloc.allocate(flow);
-                let dt = t0.elapsed().as_nanos() as u32;
+                // #6610: clamp rather than truncate. `as u32` on a u128
+                // wraps, so a single allocate() over 4.295s would be recorded
+                // as a near-ZERO latency and would pull the percentiles DOWN --
+                // the same silent-wrong-number class as the tag overflow above,
+                // in the one place a latency figure could go wrong. Observed
+                // worst p999 is ~186us, so this is unreachable today; it costs
+                // one min() to keep it unreachable by construction.
+                let dt = t0.elapsed().as_nanos().min(u32::MAX as u128) as u32;
                 lat.push(dt);
                 match got {
                     Some(_) => {
