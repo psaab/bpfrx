@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -73,6 +74,56 @@ type fakeDNSServer struct {
 	tsig    map[string]string
 }
 
+// listenDNSPair returns a UDP PacketConn and a TCP Listener bound to the SAME
+// 127.0.0.1 ephemeral port, which is what a real DNS server looks like and what
+// the truncation→TCP-retry path needs to reach one address for both.
+//
+// UDP and TCP are independent port namespaces, so there is no portable way to
+// reserve a port number in both at once; the only sound approach is to draw a
+// candidate, try to complete the pair, and DRAW AGAIN on conflict (#6709).
+// Every attempt uses a fresh port, so attempts are independent rather than a
+// retry against a busy port.
+func listenDNSPair() (net.PacketConn, net.Listener, error) {
+	var lastErr error
+	for i := 0; i < dnsPairAttempts; i++ {
+		pc, l, err := dnsPairAttempt()
+		if err == nil {
+			return pc, l, nil
+		}
+		lastErr = err
+	}
+	return nil, nil, fmt.Errorf("no free udp+tcp port pair after %d attempts: %w", dnsPairAttempts, lastErr)
+}
+
+// dnsPairAttempts bounds the resample. Attempts are INDEPENDENT (each draws a
+// fresh port), so the residual failure probability is the per-attempt collision
+// rate raised to this power — at a measured ~0.2% that is ~1e-22.
+const dnsPairAttempts = 8
+
+// dnsPairAttempt draws ONE candidate ephemeral port and tries to complete the
+// UDP+TCP pair on it. It is indirected through a var so the resample loop can
+// be tested against a CONFLICTING candidate deterministically. The alternative
+// — occupying a large slice of the host's real ephemeral TCP range to force a
+// collision — would manufacture, for every other test process on this box,
+// exactly the flake #6709/#7009 exist to remove.
+var dnsPairAttempt = realDNSPairAttempt
+
+func realDNSPairAttempt() (net.PacketConn, net.Listener, error) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, fmt.Errorf("udp listen: %w", err)
+	}
+	l, err := net.Listen("tcp", pc.LocalAddr().String())
+	if err != nil {
+		// That port number is taken on TCP by something else on the host.
+		// Release the UDP side so the next attempt draws a different port.
+		addr := pc.LocalAddr()
+		_ = pc.Close()
+		return nil, nil, fmt.Errorf("tcp listen on udp-assigned %s: %w", addr, err)
+	}
+	return pc, l, nil
+}
+
 func newFakeDNSServer(t *testing.T, tsig map[string]string) *fakeDNSServer {
 	t.Helper()
 	s := &fakeDNSServer{t: t, rcodeForZone: map[string]int{}, tsig: tsig}
@@ -82,18 +133,29 @@ func newFakeDNSServer(t *testing.T, tsig map[string]string) *fakeDNSServer {
 	// UPDATE opcode unless a handler is registered for the exact zone name).
 	handler := dns.HandlerFunc(s.handle)
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("udp listen: %v", err)
-	}
 	// Bind TCP on the SAME host:port the UDP socket got (UDP and TCP are
 	// independent port namespaces), so a client that retries-over-TCP against
 	// the single configured server address reaches this server's TCP listener
 	// too — mirroring a real DNS server (UDP+TCP on :53). This makes the
 	// truncation→TCP-retry path testable end to end.
-	l, err := net.Listen("tcp", pc.LocalAddr().String())
+	//
+	// #6709/#7009: because the two namespaces are independent, the kernel
+	// handing out a free UDP port says NOTHING about whether that port number
+	// is free for TCP — another process on the host (a second `go test`, of
+	// which this repo routinely runs a dozen) may hold it. Binding UDP once and
+	// then asserting the TCP bind succeeds therefore failed ~7% of full-package
+	// runs with "bind: address already in use", on a RANDOM test each time.
+	//
+	// RESAMPLE the pair rather than retrying a contended port. Each attempt
+	// draws a FRESH ephemeral port, so this is not the retry-on-EADDRINUSE loop
+	// #7009 rejects — that one re-attempts the SAME port and converts a fast
+	// deterministic failure into a slow flaky one. Redrawing makes attempts
+	// independent: at a measured ~0.2% per-attempt collision rate, 8 attempts
+	// leave a residual around 1e-22, and the loop still fails FAST and loudly
+	// if the host genuinely cannot supply a dual-stack port pair.
+	pc, l, err := listenDNSPair()
 	if err != nil {
-		t.Fatalf("tcp listen: %v", err)
+		t.Fatalf("listen udp+tcp pair: %v", err)
 	}
 	s.addrUDP = pc.LocalAddr().String()
 	s.addrTCP = l.Addr().String()
@@ -1074,6 +1136,21 @@ func TestRFC2136UnsignedUpdateWarnsOncePerProvider(t *testing.T) {
 			t.Fatalf("precondition: updater must have no TSIG key, got %q", u.tsigKeyName)
 		}
 
+		// #6709: unsignedUpdateWarned is a PROCESS-GLOBAL dedup keyed by server
+		// host:port, and ephemeral ports ARE recycled inside a single test
+		// binary (measured: ~1 reuse per 550 binds, so ~8% of full-package
+		// runs). If an earlier test warned for the port this server happens to
+		// draw, LoadOrStore reports "already warned", warnUnsignedOnce returns
+		// silently, and this assertion observes ZERO warns with an EMPTY log —
+		// the exact reported symptom, on a test that passes in isolation.
+		//
+		// SEED the poisoned state explicitly, then clear it. Seeding makes the
+		// hostile precondition deterministic instead of an ~8% lottery: without
+		// the Delete below this subtest fails EVERY run rather than rarely, so
+		// the reset is pinned by a mutation that reds reliably.
+		unsignedUpdateWarned.LoadOrStore(u.server, struct{}{})
+		unsignedUpdateWarned.Delete(u.server)
+
 		var buf bytes.Buffer
 		prev := slog.Default()
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
@@ -1113,6 +1190,13 @@ func TestRFC2136UnsignedUpdateWarnsOncePerProvider(t *testing.T) {
 		if u.tsigKeyName == "" {
 			t.Fatal("precondition: updater must have a TSIG key")
 		}
+
+		// #6709: this is a NEGATIVE assertion, so a stale global dedup entry
+		// for this server's address would silence warnUnsignedOnce and make it
+		// pass VACUOUSLY — green even if the TSIG gate regressed and the signed
+		// path started warning. Clear the slot so the only reason no warn
+		// appears is the TSIG gate itself.
+		unsignedUpdateWarned.Delete(u.server)
 
 		var buf bytes.Buffer
 		prev := slog.Default()
