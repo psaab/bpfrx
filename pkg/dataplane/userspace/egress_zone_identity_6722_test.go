@@ -1566,9 +1566,9 @@ func TestAuthoredUnitRefIsCanonicalisedLikeTheRowNames_6722(t *testing.T) {
 			"Full map: %v", got, "lan", authored)
 	}
 	if _, raw := authored["ge-0/0/1.01"]; raw {
-		t.Errorf("authoredZoneRefs still carries the RAW key `ge-0/0/1.01`; the "+
-			"key must be canonicalised, not merely duplicated, or a second "+
-			"spelling of the same unit becomes a second authored claim and rule "+
+		t.Errorf("authoredZoneRefs still carries the RAW key `ge-0/0/1.01`; the " +
+			"key must be canonicalised, not merely duplicated, or a second " +
+			"spelling of the same unit becomes a second authored claim and rule " +
 			"2's conflict arm fires on one operator sentence")
 	}
 	if unit := snapByName6722(t, snaps, "ge-0/0/1.1"); unit.Ifindex != 26 {
@@ -1722,9 +1722,9 @@ func TestNilUnitSlotOnARethMemberIsNotAnL3Identity_6722(t *testing.T) {
 			"PRESENT slot holding nil", ok, u == nil)
 	}
 	if _, hasUnit := firstConfiguredUnit(member); hasUnit {
-		t.Fatalf("firstConfiguredUnit reports a configured unit on a member whose "+
-			"only unit slot is nil; a nil slot is an artefact of the tolerant "+
-			"load, not an operator statement, and treating it as one makes the "+
+		t.Fatalf("firstConfiguredUnit reports a configured unit on a member whose " +
+			"only unit slot is nil; a nil slot is an artefact of the tolerant " +
+			"load, not an operator statement, and treating it as one makes the " +
 			"member an L3 identity of its own")
 	}
 	assertEgressZone6722(t, buildInterfaceSnapshots(cfg), 24, "lan",
@@ -1851,12 +1851,12 @@ func TestBarePortOfADifferentRethDoesNotDeferToThisOne_6722(t *testing.T) {
 			dotted.Ifindex, rethUnit.Ifindex)
 	}
 	if got := snapByName6722(t, snaps, "reth2").Ifindex; got == 32 {
-		t.Fatalf("precondition: reth2 resolved onto ifindex 32 as well, making "+
-			"THREE identities there; this cell must exercise the two-identity "+
+		t.Fatalf("precondition: reth2 resolved onto ifindex 32 as well, making " +
+			"THREE identities there; this cell must exercise the two-identity " +
 			"deference test, not the >2 refusal")
 	}
 	if ifc := cfg.Interfaces.Interfaces["ge-0/0/1.100"]; ifc == nil || ifc.RedundantParent != "reth2" {
-		t.Fatalf("precondition: ge-0/0/1.100 redundant-parent is not `reth2`; the "+
+		t.Fatalf("precondition: ge-0/0/1.100 redundant-parent is not `reth2`; the " +
 			"whole cell is that the port names a DIFFERENT reth")
 	}
 	if egressRethMemberOf(cfg, "ge-0/0/1.100", "reth1") {

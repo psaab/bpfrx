@@ -40,6 +40,16 @@ func TestPCIAddrToEnp_Domain_6199(t *testing.T) {
 		{"domainN_65536", "10000:01:00.0", "enP65536p1s0"},
 		// Non-zero domain AND non-zero function together.
 		{"domainN_func1", "0001:03:00.1", "enP1p3s0f1"},
+		// #7426: NON-ZERO SLOT rows. Every fixture above sits at slot 0, and
+		// under ARI the slot term is `slot << 3`, which at slot 0 is
+		// identically zero — so this file was STRUCTURALLY INCAPABLE of failing
+		// on a slot-handling defect while appearing to cover the derivation.
+		// It also explains why an ARI probe on a slot-0/VF-only host comes back
+		// negative. These rows are taken from the ARI development host's real
+		// topology (bus 0xb7 == 183, slots 2 and 6 are SR-IOV VFs).
+		{"slot2", "0000:b7:02.0", "enp183s2"},
+		{"slot6_func3", "0000:b7:06.3", "enp183s6f3"},
+		{"slot31_func7", "0000:ff:1f.7", "enp255s31f7"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

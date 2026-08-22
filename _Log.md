@@ -102916,3 +102916,25 @@ prose edit above them added. No diff falls in the new test body.
     compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
     pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
     docs/config-schema.md
+
+## 2026-08-22 — #7426: single-source the predictable-name derivation
+- **Timestamp**: 2026-08-22
+- **Action**: Two live re-implementations wrong in OPPOSITE directions on the
+  same field — the daemon had NamePolicy ordering but never emitted `f0`
+  (`fn > 0`), the dataplane had #4795's multifunction fix but took the first
+  altname in kernel order. An agreement test could only pin one wrongness to the
+  other, so: new zero-import leaf `pkg/netname` (pkg/daemon imports
+  pkg/dataplane, so the resolver cannot live in pkg/daemon). Both call sites
+  rewired; the duplicated dataplane helpers deleted and #4795's test MOVED with
+  the code; `altNamePrefixOrder` aliased so the #6677 test keeps binding the
+  live order. Also found two divergences the issue did not name — no PCI domain
+  handling and a base-10 function parse in the dataplane copy — both latent on
+  this host (single domain, max function 7), verified rather than assumed.
+  Fixed the #6199 fixture vacuity: all rows were slot 0, where the ARI `slot<<3`
+  term is identically zero.
+- **File(s)**: pkg/netname/netname.go (new), pkg/netname/README.md (new),
+  pkg/netname/netname_7426_test.go (new),
+  pkg/netname/pci_function_suffix_4795_test.go (moved from pkg/dataplane),
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
+  pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md

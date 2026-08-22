@@ -1,4 +1,4 @@
-package dataplane
+package netname
 
 import "testing"
 
@@ -14,8 +14,14 @@ import "testing"
 // (ensureRethLinkOriginalName / linksetup.go match RETH members by
 // OriginalName, not MAC).
 //
-// pciFunctionSuffix is the extracted pure boundary function; this test
-// pins its logic without touching sysfs.
+// FunctionSuffix is the extracted pure boundary function; this test pins its
+// logic without touching sysfs.
+//
+// #7426 MOVED this file from pkg/dataplane to pkg/netname, following the code.
+// The daemon carried its own derivation that tested `fn > 0` and so never
+// emitted `f0` — the exact OPPOSITE error to the one #4795 fixed here. Leaving
+// this test behind in pkg/dataplane would have left it guarding a deleted copy
+// while the surviving derivation went unpinned.
 func TestPCIFunctionSuffix(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -50,8 +56,8 @@ func TestPCIFunctionSuffix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pciFunctionSuffix(tc.multifunction, tc.fn); got != tc.want {
-				t.Errorf("pciFunctionSuffix(%v, %d) = %q, want %q",
+			if got := FunctionSuffix(tc.multifunction, tc.fn); got != tc.want {
+				t.Errorf("FunctionSuffix(%v, %d) = %q, want %q",
 					tc.multifunction, tc.fn, got, tc.want)
 			}
 		})
@@ -62,8 +68,8 @@ func TestPCIFunctionSuffix(t *testing.T) {
 // conservative failure mode: a nonexistent PCI address (no sysfs config
 // file, as in any non-bare-metal test environment) reports false rather
 // than panicking or erroring, matching systemd's own fail-safe behavior.
-func TestIsPCIMultifunctionDevice_MissingSysfsReturnsFalse(t *testing.T) {
-	if got := isPCIMultifunctionDevice("0000:ff:1f.7"); got != false {
-		t.Errorf("isPCIMultifunctionDevice on a nonexistent PCI address = %v, want false", got)
+func TestMultifunction_MissingSysfsReturnsFalse(t *testing.T) {
+	if got := Multifunction("0000:ff:1f.7"); got != false {
+		t.Errorf("Multifunction on a nonexistent PCI address = %v, want false", got)
 	}
 }

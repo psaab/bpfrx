@@ -154,7 +154,7 @@ func TestClearAllSessionsFastFailsAcrossChunksOnHungHelper5380(t *testing.T) {
 				"only bypass the HELPER delete, never the mirror clear", mv4, mv6)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("ClearAllSessions did not return within 5s against a hung helper; "+
+		t.Fatalf("ClearAllSessions did not return within 5s against a hung helper; " +
 			"the per-chunk helper delete is not short-circuiting (#5380)")
 	}
 }
