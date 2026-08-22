@@ -1777,6 +1777,87 @@ single-site mutations were run, each localising to its own assertion with
 leading-dash gate (leaving the read widened) and one that swaps `api-key` to the
 empty-skipping reader.
 
+### #6696: the two dhcp-local-server list leaves, and why they take DIFFERENT readers
+
+`system services dhcp-local-server group <g> interface` and `... group <g> pool
+<p> dns-server` were read with `nodeVal`, so a bracketed list — which the lexer
+collapses onto ONE node's `Keys` — compiled its first member and dropped the
+rest. The group served only its first interface (the second segment got **no
+leases at all**, a failure that looks like a network problem rather than a config
+one) and a pool offered one resolver where two were configured, so the operator's
+redundancy was simply absent.
+
+**The failing axis is BRACKETED-vs-repeated-leaf, not strict-vs-tolerant.**
+Measured at `origin/master` before the fix:
+
+| spelling | strict | tolerant |
+|---|---|---|
+| `interface [ ge-0/0/0.0 ge-0/0/1.0 ]` | `["ge-0/0/0.0"]` | `["ge-0/0/0.0"]` |
+| two `set … interface <v>` lines | both | both |
+
+The issue that reported this named the tolerant path as the one that mattered. A
+reader who tested only that path would have found the drop there, concluded the
+strict commit path was safe, and been wrong. The strict-path result makes the HA
+argument STRONGER, not weaker: a bracket-authored group is narrowed at the
+ORIGINAL commit, so both cluster nodes agree — on the wrong value — and there is
+no divergence to notice. The tests therefore compile every case on BOTH paths and
+assert the two AGREE.
+
+**Both leaves are now modelled, and modelling is what made the fix decidable.**
+Neither leaf existed in `setSchema` at all, so the grammar said nothing about how
+many tokens they take. Both families' `group` subtrees are now ONE function,
+`dhcpLocalServerGroupSchema` — a divergence between v4 and v6 is always a bug
+(the compiler is one function with an `isV6` flag), so it is made
+unrepresentable rather than merely tested against.
+
+**They take different readers, and that is the point:**
+
+- `pool dns-server` is a plain value list (`multi: true`, `children: nil`,
+  `ValidateIPAddress`), read with `firewallMatchValues` — both sides, every key
+  of every child. Modelling it also brought it under the spelling-differential
+  gate, which immediately caught a `Keys`-only first attempt as class-C INERT in
+  spelling B (`dns-server { v1; v2; }`), a shape the old `nodeVal` fallback did
+  handle.
+- `group interface` is NOT a plain value list. It is the one leaf here carrying
+  per-interface Junos MODIFIERS (`interface ge-0/0/0.0 exclude`, `…
+  upgrade-server <addr>`), so it is `multi: true, valueList: true` with those
+  modifier keywords modelled as CHILDREN — the #3872 static-route `next-hop`
+  precedent, whose doc comment uses this exact `interface` modifier as its
+  example. `valueList` absorbs a trailing token that is neither a sibling nor a
+  known child (the bracket list) while still DESCENDING when the next token names
+  a known child (the modifier). xpf parses and ignores every one of those
+  modifiers — as it did before, where the single-value read dropped them — and
+  they are modelled so the grammar has somewhere to park them other than the
+  value list.
+
+  `dhcpGroupInterfaceValues` then reads `Keys[1:]` when the statement names an
+  interface on its own line (any child is then a modifier BODY), and every key of
+  every child only for a bare `interface { … }` value block, whose values have
+  nowhere else to live. Using `firewallMatchValues` here would PROMOTE `exclude`
+  into the interface list — the #6673 promotion class, but with an unusually
+  sharp consequence: `group.Interfaces` is handed to Kea verbatim as
+  `interfaces-config.interfaces`, and one name no device answers to takes the
+  WHOLE DHCP server down, not just that group. **The differential gate does not
+  state that direction** — it detects a DROPPED value, not a PROMOTED modifier.
+  Measured rather than assumed: swapping in `firewallMatchValues` DOES red the
+  gate, but only INDIRECTLY, at the modelled `interface <if> <modifier>` sub-leaf
+  sites — which exist only because the modifiers are modelled. Delete those
+  children and the gate goes green with the promotion still present, and only
+  `TestDHCPGroup6696PerInterfaceModifierIsNotAnInterface` reds. The property is
+  owned by that test, not by the gate.
+
+**A widened read needs a widened validator.** Before the fix only slot 0 could
+reach a consumer, so a malformed element past it was inert; now every element is
+installed. `dns-server` carries `ValidateIPAddress`; `interface` carries
+`keyValidator: ValidateInterfaceName` — keyValidator rather than validator
+because the node declares children, so its values ride the identity KEY slot and
+it is the #5726 `valueList`+`keyValidator` arm of the schema walk that checks
+EVERY packed value instead of only the first. Both run on the strict commit /
+commit-check path only (`schemaValidateExpandedTreeForNode`, `pkg/configstore`),
+so an already-persisted config still boots (#1960).
+
+Fail-on-revert covered by `pkg/config/compiler_dhcp_group_multivalue_6696_test.go`.
+
 ### A widened read must not PROMOTE a token the old reader discarded (#6673)
 
 Widening a one-sided reader has a failure mode symmetric to the one it fixes.
