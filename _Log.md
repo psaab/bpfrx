@@ -98525,3 +98525,84 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #7145 — reject a malformed literal in a NAT rule's `match
+  source-address` / `match destination-address` on the four (kind x leaf) slots
+  that had no parse gate at all.
+
+  MEASURED FIRST, at bf10c6b7c, over the issue's own base config, with BOTH
+  `999.1.1.1/24` and `zznotanaddr` (so this is not a near-miss in the CIDR
+  grammar). Four of the six (NAT kind x match leaf) slots accepted the value;
+  two rejected it — the same operator typo refused in one slot of a rule and
+  accepted in the sibling slot of the SAME rule:
+
+  | kind | match source-address | match destination-address |
+  |---|---|---|
+  | source | ACCEPTED -> reject | ACCEPTED -> reject |
+  | destination | ACCEPTED -> reject | reject (#3228) |
+  | static | ACCEPTED -> reject | reject (#3206) |
+
+  Not inert. The Go snapshot builders copy the list to the wire VERBATIM and
+  each Rust consumer drops per entry what it cannot parse — `parse_match_prefix`
+  (nat/source.rs), `DnatTable::from_snapshots` (nat/destination.rs),
+  `SourceConstraint::from_list` (nat/static_nat.rs) — while the `*_constrained`
+  flag stays set from the non-empty list. A malformed entry NARROWS the rule
+  below what was authored; an all-malformed list leaves it constrained with zero
+  prefixes, matching NOTHING, visible only as a bounded NAT parse-error counter
+  (#4718).
+
+  `validateNATMatchAddressLiteralsStrict` closes the four; the two
+  already-rejecting slots keep their own gates. Scope is the LITERAL leaves
+  only: `*-address-name` is an address-book reference whose unresolvable raw
+  token is appended to the same wire list ON PURPOSE (#2416 fail-closed
+  backstop), so a gate walking the post-resolution list would reject the
+  backstop itself.
+
+  Predicate is `net.ParseCIDR` then `net.ParseIP` (`natMatchPrefixParses`), the
+  exact Rust pair — NOT `netip`. `netip.ParsePrefix` is STRICTER than Rust on
+  the mask text: it rejects a zero-padded prefix length (`1.2.3.4/024`) that
+  Rust's `u8::from_str` reads as 24 and installs. Refusing a value the dataplane
+  installs is the one direction a widened validator must never take.
+
+  Tolerant path (flag `lenientNATMatchAddressLiterals`) warns and KEEPS the
+  value. Dropping it Go-side would empty an all-malformed list, clear
+  `*_constrained` and collapse the rule to MATCH-ANY — a fail-OPEN regression
+  strictly worse than the silent narrowing this closes.
+
+  The four sites were removed from `slotEscapeUngated` (#7143's scout registry,
+  which is where the asymmetry surfaced): their rows now carry a real verdict and
+  run the full slot-1 escape comparison instead of skipping.
+
+  Validation: `go test ./... -count=1` — only pkg/ddns
+  TestSurfaceARealBackendWithdrawOnAddressLoss failed, the known #7009 UDP/TCP
+  port-space flake; green in isolation (exit 0). `go vet` exit 0. Mutation
+  matrix, ONE mutation per cell, exit codes from `$?`, `go vet` clean on every
+  cell (no build breaks): (1) remove the strict gate call site -> exit 1, RED at
+  the "committed CLEAN" assertion on all 8 #7145 cells while both control cells
+  (#3228 / #3206) stayed GREEN; (2) drop `lenientNATMatchAddressLiterals` from
+  `lenientCompileOpts` -> exit 1 at "Store.Load REFUSED" / "SyncApply REJECTED"
+  and at the compiler-level tolerance assertion (the CommitCheck over-reach
+  guard reds at its PRECONDITION, as its own comment records); (3) swap the
+  predicate to `netip` -> exit 1 on exactly the `1.2.3.4/024` cells of the four
+  gated slots, every other value green; (4) make the tolerant path DROP instead
+  of KEEP -> exit 1 at the KEEP assertion in both store ingresses while the
+  over-reach guard stayed green. Go-only, `pkg/config` + a `pkg/configstore`
+  test; nothing reaches the Rust helper or the wire protocol, so no cluster
+  smoke is owed.
+
+  Known residuals, measured, deliberately NOT folded in (a different value class
+  from the issue's malformed CIDR, each in an OLDER gate): an out-of-range mask
+  (`10.0.0.0/33`) is still accepted on destination-NAT `match
+  destination-address`, whose #3228 gate strips the mask and parses only the
+  address part while its own builder uses `net.ParseCIDR` and skips the entry;
+  and a quoted empty value is still accepted on static-NAT `match
+  destination-address`, where an empty slot carries the deliberate #6673
+  "authored blank selection" meaning. Filed as #7215 and #7216.
+- **File(s)**: pkg/config/compiler_validate_strict_nat_match_addr.go,
+  pkg/config/compiler_nat_helpers.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_nat.go,
+  pkg/config/nat_match_address_literal_7145_test.go,
+  pkg/config/schema_slot_escape_fixtures_test.go,
+  pkg/configstore/nat_match_address_no_brick_7145_test.go,
+  docs/config-schema.md, docs/userspace-dnat-plan.md, _Log.md
