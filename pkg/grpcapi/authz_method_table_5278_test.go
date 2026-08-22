@@ -303,8 +303,15 @@ func TestPrimaryAndFabricChainsAreDistinct_5278(t *testing.T) {
 		t.Fatalf("parse server.go: %v", err)
 	}
 	want := map[string][]string{
-		"buildPrimaryServer": {"principalUnaryInterceptor", "principalStreamInterceptor", "peerAuthStatsHandler"},
-		"buildFabricServer":  {"fabricAuthUnaryInterceptor", "fabricAllowlistUnaryInterceptor"},
+		// loopbackServerInterceptors is #5883's, not #5278's, and is required
+		// here because THIS function is now its only production consumer: the
+		// #5278 chain wraps it, so #5883's own wiring test (which only calls
+		// the constructor) can no longer observe its removal from the listener.
+		"buildPrimaryServer": {
+			"principalUnaryInterceptor", "principalStreamInterceptor",
+			"peerAuthStatsHandler", "loopbackServerInterceptors",
+		},
+		"buildFabricServer": {"fabricAuthUnaryInterceptor", "fabricAllowlistUnaryInterceptor"},
 	}
 	forbid := map[string][]string{
 		"buildPrimaryServer": {"fabricAuthUnaryInterceptor", "fabricAllowlistUnaryInterceptor"},

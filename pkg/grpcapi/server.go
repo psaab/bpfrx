@@ -502,6 +502,21 @@ func (s *Server) Run(ctx context.Context) error {
 // gate would deny every console call. Neither chain is a superset of the other
 // and neither may be installed on the other listener.
 func (s *Server) buildPrimaryServer() *grpc.Server {
+	// #5883: no cluster peer ever dials this listener, so an inbound
+	// x-peer-forwarded / xpf-no-peer marker here is forged by definition. Strip
+	// both and promote NOTHING, so every handler on this listener sees the
+	// markers absent and does the peer work it is supposed to do. The chain is
+	// built by loopbackServerInterceptors so the WIRING is testable, not just
+	// the interceptor.
+	loopbackUnary, loopbackStream := loopbackServerInterceptors()
+	// ORDER: the #5278 principal gate runs FIRST, so a caller whose login class
+	// does not hold this RPC is refused before any request sanitisation runs on
+	// its behalf. It mirrors the fabric chain's convention (authenticate, THEN
+	// touch the markers) and is safe in the other direction too: the gate reads
+	// the connection's accept-time identity, the method and the decoded
+	// request — never metadata — so #5883's strip cannot change its verdict.
+	unary := append([]grpc.UnaryServerInterceptor{s.principalUnaryInterceptor}, loopbackUnary...)
+	stream := append([]grpc.StreamServerInterceptor{s.principalStreamInterceptor}, loopbackStream...)
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		// #5278: resolve the caller's identity ONCE per connection, at
@@ -509,8 +524,8 @@ func (s *Server) buildPrimaryServer() *grpc.Server {
 		// grpc-go's per-connection goroutine, not its accept loop, so the
 		// lookup is inline; see authz.go for why that differs from pkg/api.
 		grpc.StatsHandler(&peerAuthStatsHandler{s: s}),
-		grpc.ChainUnaryInterceptor(s.principalUnaryInterceptor),
-		grpc.ChainStreamInterceptor(s.principalStreamInterceptor),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 		// #5849: the config-lock lifecycle is owned by a connection-scoped
 		// stats.Handler (releases on ConnEnd), NOT a per-RPC interceptor that
 		// tore the session down on any per-RPC cancellation.
@@ -633,8 +648,13 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 func (s *Server) buildFabricServer() *grpc.Server {
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
-		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor),
-		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor),
+		// #5883: peerMarker runs LAST in the chain on purpose —
+		// ChainUnaryInterceptor invokes in order, so #4107 auth and the #4122
+		// allowlist have both already accepted the call before the hop markers
+		// are promoted to the in-process capability. An unauthenticated caller
+		// on the fabric segment is rejected before anything is trusted.
+		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor, peerMarkerUnaryInterceptor(true)),
+		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor, peerMarkerStreamInterceptor(true)),
 		// #5849: same connection-scoped config-lock release contract as the
 		// loopback server (a no-op for the fabric allowlist, which never admits
 		// the config RPCs, but keeps the lifecycle uniform across both servers).

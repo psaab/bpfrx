@@ -58,6 +58,67 @@
   `pkg/grpcapi/README.md`, `pkg/api/README.md`, `pkg/api/authz.go`,
   `pkg/authz/authz.go`, `pkg/config/login_perms.go`, `cmd/cli/main.go`,
   `docs/system-login.md`, `CLAUDE.md`
+## 2026-08-21 — #5883: peer hop markers were caller-settable headers
+
+- **Timestamp**: 2026-08-21 (fix/5883-peer-marker-capability)
+- **Action**: Replaced the raw-metadata reads of `x-peer-forwarded` /
+  `xpf-no-peer` with an in-process capability that only the fabric listener's
+  post-auth interceptor can set, and stripped both keys at every listener.
+- **File(s)**: `pkg/grpcapi/peer_marker_5883.go` (new),
+  `pkg/grpcapi/peer_marker_5883_test.go` (new), `pkg/grpcapi/server.go`,
+  `pkg/grpcapi/server_helpers.go`, `pkg/grpcapi/server_sessions.go`,
+  `pkg/grpcapi/server_show_cluster_text.go`,
+  `pkg/grpcapi/server_diag_monitor.go`, `pkg/grpcapi/README.md`, and four
+  retargeted tests.
+
+  Both markers exist to bound forwarding to one hop, and every handler that
+  reads one uses it to SUPPRESS work. Read by presence off incoming metadata,
+  they were assertions a caller could make about itself: claim to be a
+  forwarded peer request and the node skips the peer half of a cluster-wide
+  clear while still reporting success, leaving sessions alive on the peer to
+  come back on failback.
+
+  The fix is not to authenticate the header — it is to stop the header being
+  the carrier. Trust is a property of WHICH LISTENER received the call. The
+  fabric listener is the only one a peer dials; its chain is
+  `fabricAuth -> fabricAllowlist -> peerMarker(trust=true)`, in that order, so
+  the promotion happens only on a call #4107 auth already accepted. The
+  loopback listener promotes nothing. Both then strip the keys, so a handler
+  reaching for the raw header finds nothing — `server_sessions.go` was exactly
+  such a site, reading `md.Get("x-peer-forwarded")` instead of the helper.
+
+  `xpf-no-peer` was never named in #5883, which called out only
+  `x-peer-forwarded`. It is the same mechanism on the show and monitor
+  proxies, and `MonitorInterface` is a STREAMING RPC — a unary-only fix would
+  have left it forgeable, the same shape as the #3908 gap after #3082. One
+  interceptor pair covers both, and `reservedPeerMetadataKeys` is the single
+  source of truth for the strip and the promote so they cannot drift.
+
+  Absent capability defaults to false for both markers, which is the safe
+  direction: false means "do the peer work", so a stripped or forged header
+  can only cause MORE work to be attempted, never less. On an unkeyed cluster
+  fabric auth still fails open (#4107 dual-accept), so behaviour there is
+  unchanged — an attacker on that segment could already call ClearSessions
+  WITHOUT the header for a strictly more destructive cluster-wide clear.
+
+  `Test_PeerCallSkipsDialBack` RE-IMPLEMENTED the predicate inline rather than
+  calling it, so it asserted its own copy and could not have noticed the
+  forgeability. Retargeted through the production interceptor with a
+  forged-on-loopback row.
+
+  Mutation proof, four, each one line:
+  - `if trust {` -> `if true {` (restore the forgeable read) — exit=1, four
+    tests red including the retargeted `Test_PeerCallSkipsDialBack/forged_on_loopback`;
+  - drop the strip — exit=1, both reserved keys survive on both listeners;
+  - `if trust {` -> `if false {` (degenerate to always-false) — exit=1, seven
+    positive controls red, so the fix is not satisfiable by returning false;
+  - `loopbackServerInterceptors` -> `return nil, nil` — exit=1. That mutation
+    is why the seam exists: every other test drives the interceptor directly
+    and would pass on a build where the listener never installs it.
+
+  Control: `go test -count=1 ./pkg/grpcapi/ ./pkg/api/ ./pkg/cli/ ./pkg/daemon/`
+  exit=0, `go vet` clean. Go-only; no dataplane binary moves, so no cluster
+  smoke is owed.
 ## 2026-08-21 — #6218 audit cohort: 7 fixed, plus #7197 (nil-deref DoS found while fixing #6218 item 13)
 
 - **Timestamp**: 2026-08-21 (fix/6218-audit-cohort-survivors)
