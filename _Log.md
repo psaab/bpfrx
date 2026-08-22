@@ -104148,3 +104148,12 @@ prose edit above them added. No diff falls in the new test body.
   forbids. Presence now comes from the option SLOT; option 249's discarded
   parse error is logged.
 - **File(s)**: pkg/dhcp/dhcpv4.go, pkg/dhcp/classless_presence_6756_test.go
+
+## 2026-08-22 — #6764 day-0 ISO is never created world-readable
+- **Timestamp**: 2026-08-22
+- **Action**: Both ISO builders chmod 0600 only AFTER the tool writes the
+  output, so the secret-bearing ISO existed at umask-derived 0644 for the whole
+  build. Added an _owner_only_umask() guard around the tool invocation in
+  make_config_drive.py and xpf-deploy.py; kept the post-chmod as a belt.
+- **File(s)**: scripts/image/make_config_drive.py, scripts/deploy/xpf-deploy.py,
+  scripts/image/test_config_drive_creation_umask_6764.py
