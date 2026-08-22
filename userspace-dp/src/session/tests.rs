@@ -7753,3 +7753,60 @@ fn reverse_index_collision_is_not_attributed_6751() {
          distinct SERVERS as distinct internal sources",
     );
 }
+
+#[test]
+fn same_source_pat_collision_is_not_attributed_6751() {
+    // THE SECOND DISCRIMINATING HALF, and the one that binds the src_ip
+    // COMPARISON itself rather than the branch it runs in.
+    //
+    // Same internal host, two DIFFERENT forward sessions, one reverse wire
+    // key: session A is PAT'd from :5555 to :6000, session B natively uses
+    // :6000 and is translated address-only. Both collapse to
+    // (8.8.8.8:443 -> 203.0.113.9:6000). That is the same-host port-reuse
+    // population -- real, but NOT the #6751 cross-session leak, because one
+    // host cannot steal its own return traffic in a way that crosses a
+    // security boundary. It must move the aggregate and NOT the attributed
+    // counter.
+    //
+    // A previous attempt at this half used same-source/different-dst_port and
+    // its premise check caught it as VACUOUS: with one NAT decision, two
+    // sessions from one host sharing a reverse wire key must share
+    // (src_port, dst_ip, dst_port) too, so they are the same session key and
+    // the push dedups. Making the two NAT DECISIONS differ is what creates a
+    // genuine same-source collision.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let egress = Ipv4Addr::new(203, 0, 113, 9);
+
+    let mut pat = iface_snat_decision(egress);
+    pat.nat.rewrite_src_port = Some(6000);
+
+    let a = key_v4();
+    let mut b = key_v4();
+    b.src_port = 6000;
+    assert_eq!(a.src_ip, b.src_ip, "fixture: both sessions are the SAME host");
+
+    assert!(table.install_with_protocol(a, pat, metadata(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(
+        b,
+        iface_snat_decision(egress),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x10
+    ));
+
+    // THE FIXTURE MUST ACTUALLY COLLIDE, or the assertion below is vacuous.
+    assert!(
+        table.nat_reverse_key_collisions() > 0,
+        "premise: this same-source pair must produce a reverse-key collision, \
+         otherwise the distinct-source assertion below proves nothing",
+    );
+    assert_eq!(
+        table.nat_reverse_key_collisions_distinct_src(),
+        0,
+        "a collision between two sessions from the SAME internal host is \
+         port reuse, not the #6751 cross-source leak, and must not be \
+         attributed",
+    );
+}
