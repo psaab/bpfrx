@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -1320,4 +1321,139 @@ func classifyHTTPStatus(code int) error {
 	default:
 		return fmt.Errorf("ddns http: unexpected status %d", code)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Provider-CHOSEN text (#6634)
+// ---------------------------------------------------------------------------
+
+// The scrubbers above bound error VALUES that carry a request URL. This is the
+// other direction: text the PROVIDER put in its response BODY and that four
+// backends render into a returned error the daemon logs — Cloudflare's
+// Errors[].Message, Route 53's decoded Code/Message, and the unrecognized first
+// response line on dyndns2 and DuckDNS.
+//
+// THE PROVIDER IS THE UNTRUSTED PARTY HERE. No hostile transport is needed: a
+// "your request was invalid: <the request>" style API echoes our own update URL
+// back, and a DuckDNS-shaped endpoint carries its token in the QUERY, so the
+// echo is the credential. The same body is also the DoS surface — readCappedBody
+// admits httpMaxResponseBody (64 KiB), and every byte of it was reaching a
+// journal line on every reconcile tick of a persistent failure, plus the
+// provider's retained lastErr.
+//
+// WHAT THE SINKS ALREADY DO, so this does not duplicate them. Control-character
+// forgery is closed twice over and neither fix belongs here: the daemon's
+// slog.TextHandler (cmd/xpfd/main.go) strconv.Quote-s any value carrying a byte
+// outside printable ASCII, so an embedded newline cannot split a journal line;
+// and `show services ddns` renders LastError through termsafe.SanitizeForDisplay
+// on both the CLI and gRPC surfaces (#6468). What NO sink can undo is a
+// credential in the bytes, or 64 KiB of them.
+//
+// SO THIS BOUNDS TWO THINGS AND IS HONEST ABOUT THE THIRD:
+//
+//  1. LENGTH — hard cap, total. This half is a proof: nothing provider-chosen
+//     can exceed maxProviderTextBytes plus a fixed marker.
+//  2. URL AND USERINFO SHAPES — a whitespace-delimited token carrying "://", a
+//     userinfo-shaped "user:pass@host", or a percent-escape is replaced whole.
+//     This closes the ECHO threat the issue describes, where the secret arrives
+//     inside a well-formed URL.
+//  3. NOT a proof against a provider that WANTS to leak. A credential echoed as
+//     bare prose ("your token abc123 is invalid") is indistinguishable from a
+//     word, and no filter recovers it. That residual is accepted rather than
+//     papered over, because the alternative — withholding provider text
+//     wholesale, as the transport path does for its own errors — costs the
+//     operator the single most useful diagnostic they get ("token invalid",
+//     "zone not found", "rate limited") in exchange for a threat model
+//     (a provider deliberately exfiltrating a credential it was ALREADY GIVEN)
+//     that withholding does not actually close either.
+//
+// WHY NOT THE CODE-MAPPING OPTION. Mapping known provider error codes onto our
+// own constants, the transportReason discipline, would give a closed output —
+// but only for codes we already know. The unmapped case is exactly the case an
+// operator is debugging, and it would render as a constant saying nothing. Route
+// 53 also classifies delete-idempotency on the raw message text
+// (r53DeleteAlreadyGone), so the VALUE must keep flowing to the classifier
+// untouched; only the RENDER goes through here.
+//
+// FILTER FIRST, THEN BOUND. The other order splits a URL at the cap and leaves
+// its prefix — "https://user:PA" — rendered, which is a partial credential.
+
+const (
+	// maxProviderTextBytes caps any provider-chosen string rendered into an
+	// error. Generous for real provider prose (Route 53's InvalidChangeBatch
+	// "…but it was not found" sentence is under 100 bytes), three orders of
+	// magnitude under the 64 KiB body cap.
+	maxProviderTextBytes = 200
+
+	// providerTextTruncated marks a bounded render. Fixed text, so it cannot
+	// itself carry anything provider-chosen.
+	providerTextTruncated = "[truncated]"
+
+	// providerURLWithheld replaces one URL-shaped or userinfo-shaped token.
+	providerURLWithheld = "[url withheld]"
+
+	// providerTextEmpty distinguishes "the provider said nothing" from "the
+	// provider's text was withheld", which are different diagnoses.
+	providerTextEmpty = "[no text]"
+)
+
+// scrubProviderText renders a provider-supplied string under the bound above.
+// Whitespace runs collapse to a single space: it costs nothing diagnostically,
+// and it means a body that is 64 KiB of newlines cannot dominate the budget.
+func scrubProviderText(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return providerTextEmpty
+	}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if providerTokenCarriesURL(f) {
+			f = providerURLWithheld
+		}
+		out = append(out, f)
+	}
+	joined := strings.Join(out, " ")
+	if len(joined) > maxProviderTextBytes {
+		// Cut on a byte boundary that cannot split a multi-byte rune: back off
+		// to the last boundary at or before the cap. A rune split would emit a
+		// lone continuation byte, which is exactly the invalid-UTF-8 shape the
+		// display sanitizer then has to escape.
+		cut := maxProviderTextBytes
+		for cut > 0 && !utf8.RuneStart(joined[cut]) {
+			cut--
+		}
+		joined = joined[:cut] + providerTextTruncated
+	}
+	return joined
+}
+
+// providerTokenCarriesURL reports whether one whitespace-delimited token is
+// shaped like something that can carry a credential.
+//
+// Three shapes, deliberately narrow so ordinary prose survives:
+//
+//   - a scheme separator "://" — any URL, whatever the scheme;
+//   - USERINFO WITH A PASSWORD: a ':' before an '@'. A bare "user@host" is NOT
+//     withheld — there is no secret in it, and withholding it would eat
+//     "contact support@example.com" from a legitimate provider message;
+//   - a PERCENT-ESCAPE "%XX" — the encoded form of the two above, which is what
+//     a URL echoed through a provider's own escaping looks like. Two hex digits
+//     are required, so "80% of quota" survives.
+func providerTokenCarriesURL(tok string) bool {
+	if strings.Contains(tok, "://") {
+		return true
+	}
+	if at := strings.IndexByte(tok, '@'); at > 0 && strings.IndexByte(tok[:at], ':') >= 0 {
+		return true
+	}
+	for i := 0; i+2 < len(tok); i++ {
+		if tok[i] == '%' && isHexDigit(tok[i+1]) && isHexDigit(tok[i+2]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }

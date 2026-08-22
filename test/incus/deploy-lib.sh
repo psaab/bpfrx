@@ -222,6 +222,110 @@ deploy_rolling_rg_ids() {
 	awk '/^Redundancy group:[[:space:]]/ { print $3 }' | sort -n -u
 }
 
+# ── Post-deploy node0-primary reassert (#4009, fail-closed in #6591) ──
+#
+# deploy_reassert_node0_primary_ok reads `show chassis cluster status` on stdin
+# and succeeds ONLY IF at least one redundancy group is present AND node0 reads
+# exactly `primary` for EVERY one of them.
+#
+# The "at least one" clause is the #6591 fix, not a formality. The pre-fix
+# reassert treated an unreadable status as "no redundancy groups to iterate",
+# did nothing, warned, and returned SUCCESS — so a deploy that reasserted
+# NOTHING was indistinguishable from one that succeeded, and the failure
+# surfaced minutes later in an unrelated smoke target's preflight where the
+# natural first hypothesis is that the change under test broke HA. An empty or
+# unparseable status must therefore FAIL here.
+#
+# The comparison is `$3 == "primary"`, exact and scoped to the node0 row of the
+# CURRENT group — not a `grep "node0.*primary"`. A grep cannot express "every
+# RG", which is the property that matters: the reassert loops all groups, so a
+# check satisfied by any single group would pass while the others stayed
+# inverted.
+deploy_reassert_node0_primary_ok() {
+	awk '
+		/^Redundancy group:[[:space:]]/ { rg = $3; seen[rg] = 1; next }
+		/^node0[[:space:]]/ { if (rg != "" && $3 == "primary") { ok[rg] = 1 } }
+		END {
+			n = 0
+			for (g in seen) { n++; if (!(g in ok)) { exit 1 } }
+			if (n == 0) { exit 1 }
+			exit 0
+		}
+	'
+}
+
+# Bounded retries for the two reads. Overridable so the self-test does not
+# sleep. The status read needs them because the daemon is still coming up right
+# after a deploy: the measured failure was a reassert issued ~20s post-deploy
+# that did not take, while the identical command issued later did.
+DEPLOY_REASSERT_READ_TRIES="${DEPLOY_REASSERT_READ_TRIES:-30}"
+DEPLOY_REASSERT_READ_DELAY="${DEPLOY_REASSERT_READ_DELAY:-2}"
+DEPLOY_REASSERT_VERIFY_TRIES="${DEPLOY_REASSERT_VERIFY_TRIES:-15}"
+DEPLOY_REASSERT_VERIFY_DELAY="${DEPLOY_REASSERT_VERIFY_DELAY:-2}"
+
+# deploy_reassert_primary_node0 leaves node0 the primary for EVERY redundancy
+# group after a deploy, so downstream smoke (apply-cos-config, test-failover)
+# starts from the documented node0-primary steady state regardless of preempt
+# config.
+#
+# It is NO LONGER best-effort (#6591). It dies if it cannot establish that
+# state, because the alternative — the pre-fix behaviour — is a preflight that
+# fails OPEN, and a preflight that fails open is how a real HA regression gets
+# laundered as an infrastructure hiccup. The deploy returning 0 while the
+# cluster is left inverted relative to its configured priorities (node0 at
+# priority 200 sitting secondary behind node1 at 100, because preempt=no means
+# nothing corrects it) cost two misdiagnosed gate cycles.
+#
+# Sequence per RG, on node0: reset -> transfer -> reset.
+#   - the leading reset clears a stale manual-failover flag that would
+#     otherwise refuse the transfer;
+#   - the transfer is what actually MOVES ownership (`failover reset` alone
+#     never did — that was the original #6591 report);
+#   - the trailing reset clears the flag the transfer itself sets, which
+#     otherwise blocks the peer from electing during a later reboot leg.
+#
+# The trailing reset is safe to add precisely BECAUSE the verify below is
+# fail-closed: if clearing the flag ever moved ownership back, this dies loudly
+# instead of handing the next smoke an inverted cluster.
+deploy_reassert_primary_node0() {
+	local rinst="$1"
+	local status rgs rg try
+
+	status=""
+	rgs=""
+	for (( try = 0; try < DEPLOY_REASSERT_READ_TRIES; try++ )); do
+		status=$(incus exec "$rinst" -- cli -c "show chassis cluster status" 2>/dev/null || true)
+		rgs=$(printf '%s\n' "$status" | deploy_rolling_rg_ids)
+		[[ -n "$rgs" ]] && break
+		sleep "$DEPLOY_REASSERT_READ_DELAY"
+	done
+	if [[ -z "$rgs" ]]; then
+		die "post-deploy primary reassert: could not read cluster status from $rinst after ${DEPLOY_REASSERT_READ_TRIES} attempts. NOT continuing: the pre-#6591 code warned and returned success here, leaving the next HA smoke to discover an un-reasserted cluster in its own preflight."
+	fi
+
+	while read -r rg; do
+		[[ -n "$rg" ]] || continue
+		incus exec "$rinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
+		incus exec "$rinst" -- cli -c "request chassis cluster failover redundancy-group $rg node 0" >/dev/null 2>&1 || true
+		incus exec "$rinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
+	done <<<"$rgs"
+
+	# Individual requests are tolerated (|| true) because the VERDICT is the
+	# observed role, not the exit code of any one CLI call. A transfer that
+	# returns non-zero but lands is fine; one that returns zero and does not
+	# land is not — and only this read can tell them apart.
+	for (( try = 0; try < DEPLOY_REASSERT_VERIFY_TRIES; try++ )); do
+		status=$(incus exec "$rinst" -- cli -c "show chassis cluster status" 2>/dev/null || true)
+		if printf '%s\n' "$status" | deploy_reassert_node0_primary_ok; then
+			info "Re-asserted node0 primary for all redundancy groups (post-deploy, verified)."
+			return 0
+		fi
+		sleep "$DEPLOY_REASSERT_VERIFY_DELAY"
+	done
+	die "post-deploy primary reassert FAILED: node0 is not primary for every redundancy group after ${DEPLOY_REASSERT_VERIFY_TRIES} verification attempts. The cluster is left in whatever state the transfer produced; do NOT run an HA smoke against it and read the failure as an HA regression. Last status from $rinst:
+${status}"
+}
+
 # ── #1864 verify-dataplane pre-flight (#6493) ────────────────────────
 # The embedded AF_XDP shim object in a freshly built xpfd can be REJECTED by
 # the target box's BPF verifier (a drifted `make generate` toolchain, or simply

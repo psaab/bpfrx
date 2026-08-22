@@ -2124,3 +2124,515 @@ fn every_shared_session_lock_in_production_recovers_from_poison_6653() {
         offenders.join("\n  ")
     );
 }
+
+// --- #6600: reserve-before-publish -----------------------------------------
+
+/// A single-address pool source-NAT rule, so a synced translation names a real
+/// pool port that a local flow can contend for.
+fn reserve6600_forwarding() -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[crate::SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "p".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..crate::SourceNATRuleSnapshot::default()
+    }]);
+    forwarding
+}
+
+/// A peer-synced forward entry whose NAT decision names `pool_port` on the
+/// single-address pool above.
+fn reserve6600_entry(src_port: u16, pool_port: u16) -> SyncedSessionEntry {
+    SyncedSessionEntry {
+        key: SessionKey {
+            src_port,
+            ..test_key()
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+                rewrite_src_port: Some(pool_port),
+                ..NatDecision::default()
+            },
+        },
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    }
+}
+
+/// #6600 fail-on-revert gate: an import whose translated NAT port is already
+/// owned by a LOCAL flow must be REFUSED — not published, not fanned out — and
+/// counted.
+///
+/// Before this, `upsert_synced_session` published the shared entry (visible at
+/// once on `synced`, `nat` and `forward_wire`) and only THEN enqueued the worker
+/// commands. The reservation lived solely inside the worker-local upsert, and
+/// `reserve_flow` refuses to steal a port a different live allocation holds —
+/// with the refusal returned by nothing, counted by nothing and logged by
+/// nothing. A worker that sampled an empty command queue just before the push
+/// proceeds into `poll_binding` with the entry already live, and
+/// `materialize_shared_session_hit` forwards on `replica.decision.nat` without
+/// reserving anything. The session then advertised a translation this node did
+/// not own.
+///
+/// Reverting the pre-publish reservation in `upsert_synced_session` makes case
+/// (b) go red: the entry is published and fanned out with the port unreserved.
+#[test]
+fn upsert_synced_session_refuses_import_whose_nat_port_is_locally_owned_6600() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = reserve6600_forwarding();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+
+    // (a) POSITIVE CONTROL FIRST. Without it a coordinator that refused every
+    // import would satisfy (b) completely.
+    let free = reserve6600_entry(40001, 50001);
+    let free_key = free.key.clone();
+    coordinator.upsert_synced_session(free);
+    assert!(
+        synced6600_contains(&coordinator, &free_key),
+        "an import whose translated port is FREE must still be admitted"
+    );
+    assert_eq!(
+        coordinator.synced_import_reserve_refused_total(),
+        0,
+        "an admissible import must not be counted as a reservation refusal"
+    );
+
+    // A LOCAL flow now owns pool port 50000 — the port the next import names.
+    // This is the racing allocation the publish/enqueue window admits.
+    let contended: u16 = 50000;
+    let local_flow = SessionKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 200)),
+        src_port: 44444,
+        ..test_key()
+    };
+    // Occupied through the PUBLIC reservation entry point rather than the
+    // allocator's private mint, so the test drives the same code the production
+    // paths do. A different flow holding the same translated identity is
+    // exactly the "different live allocation" `reserve_flow` refuses to steal
+    // from.
+    assert!(
+        crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.source_nat_rules,
+            &local_flow,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+                rewrite_src_port: Some(contended),
+                ..NatDecision::default()
+            },
+            false,
+            None,
+            1_000,
+        ),
+        "setup: the local flow must end up holding the exact port the import names, \
+         or the case below is not exercising the collision at all"
+    );
+
+    let before = coordinator.synced_import_reserve_refused_total();
+
+    // (b) THE CASE. An import naming the locally-owned port must be refused.
+    let clashing = reserve6600_entry(40002, contended);
+    let clashing_key = clashing.key.clone();
+    coordinator.upsert_synced_session(clashing);
+
+    assert!(
+        !synced6600_contains(&coordinator, &clashing_key),
+        "an import whose translated NAT port is owned by a LOCAL flow was PUBLISHED; \
+         every packet forwarded on that shared-backed decision uses a port this node \
+         does not own"
+    );
+    {
+        let pending = commands.lock().expect("commands");
+        assert!(
+            !pending.iter().any(|cmd| matches!(
+                cmd,
+                WorkerCommand::UpsertSynced(entry) if entry.key == clashing_key
+            )),
+            "a refused import must not be fanned out to any worker command queue"
+        );
+    }
+    assert_eq!(
+        coordinator.synced_import_reserve_refused_total(),
+        before + 1,
+        "a refused import must be COUNTED — a silent drop trades one invisible \
+         failure for another"
+    );
+}
+
+/// #6600: with NO worker registered the pre-publish reservation is skipped.
+///
+/// Nothing polls, so there is no racing local allocation to guard against, and
+/// an `Untracked` reservation that no worker ever adopts has no one to release
+/// it. Making the coordinator reserve unconditionally would leak a pool port on
+/// every early-boot / teardown import.
+#[test]
+fn upsert_synced_session_skips_pre_publish_reserve_with_no_workers_6600() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = reserve6600_forwarding();
+
+    let entry = reserve6600_entry(40003, 50002);
+    let key = entry.key.clone();
+    coordinator.upsert_synced_session(entry);
+
+    assert!(
+        synced6600_contains(&coordinator, &key),
+        "with no workers registered the import must still be admitted"
+    );
+    assert_eq!(
+        coordinator.synced_import_reserve_refused_total(),
+        0,
+        "the zero-worker path must not refuse imports"
+    );
+    // And it must have taken NO reservation. A DIFFERENT flow reserving the
+    // same translated port proves the port is free: had the coordinator
+    // reserved it, the occupancy CAS would refuse this. That is the assertion
+    // that binds the guard — without it, deleting the zero-worker carve-out
+    // leaves every case green while every early-boot import leaks a pool port
+    // with holders == 0 and no worker to release it.
+    let unrelated = SessionKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 210)),
+        src_port: 44446,
+        ..test_key()
+    };
+    assert!(
+        crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.source_nat_rules,
+            &unrelated,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+                rewrite_src_port: Some(50002),
+                ..NatDecision::default()
+            },
+            false,
+            None,
+            1_000,
+        ),
+        "the zero-worker path must take NO reservation — the port it would have \
+         held has no worker to release it"
+    );
+}
+
+/// #6600: a half-taken reservation must be ROLLED BACK.
+///
+/// A NAT64 decision carries BOTH a v4 pool source (the source-NAT allocator)
+/// and a translated `(pool v4, port)` (the per-prefix allocator), so a session
+/// can be admissible to one and not the other. Without the rollback, a
+/// source-NAT reservation taken moments before a NAT64 refusal is left behind
+/// holding a pool port that NO worker will ever release — the import is not
+/// published, so there is no session to reap.
+///
+/// Deleting the `release_source_nat_allocation` call in
+/// `reserve_synced_translation` makes this go red.
+#[test]
+fn upsert_synced_session_rolls_back_source_nat_when_nat64_refuses_6600() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = reserve6600_forwarding();
+    coordinator.forwarding.nat64 = crate::nat64::Nat64State::from_snapshots(&[
+        crate::NAT64RuleSnapshot {
+            name: "nat64-wkp".to_string(),
+            prefix: "64:ff9b::/96".to_string(),
+            pool_addresses: vec!["203.0.113.1".to_string()],
+            no_v6_frag_header: false,
+            ..Default::default()
+        },
+    ]);
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+
+    // A NAT64 decision naming pool port 51000 on 203.0.113.1.
+    let nat64_port: u16 = 51000;
+    let mk = |src_port: u16| SyncedSessionEntry {
+        key: SessionKey {
+            src_port,
+            ..test_key()
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+                rewrite_src_port: Some(nat64_port),
+                nat64: true,
+                ..NatDecision::default()
+            },
+        },
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+        session_id: 0,
+    };
+
+    // Occupy the NAT64 translated identity with a DIFFERENT flow, so the
+    // import's NAT64 leg refuses while its source-NAT leg succeeds.
+    let squatter = mk(40010);
+    assert!(
+        crate::nat64::reserve_synced_nat64_allocation(
+            &coordinator.forwarding.nat64,
+            &squatter.key,
+            squatter.decision.nat,
+            false,
+            1_000,
+        ),
+        "setup: the squatter must take the NAT64 identity"
+    );
+
+    let entry = mk(40011);
+    let key = entry.key.clone();
+    let before = coordinator.synced_import_reserve_refused_total();
+    coordinator.upsert_synced_session(entry);
+
+    assert!(
+        !synced6600_contains(&coordinator, &key),
+        "setup: the import must be refused, or the rollback is not exercised"
+    );
+    assert_eq!(
+        coordinator.synced_import_reserve_refused_total(),
+        before + 1,
+        "setup: the refusal must be counted"
+    );
+
+    // THE ASSERTION: the source-NAT port the refused import briefly held must
+    // be free again. An unrelated flow reserving it proves the rollback ran.
+    let unrelated = SessionKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 211)),
+        src_port: 44447,
+        ..test_key()
+    };
+    assert!(
+        crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.source_nat_rules,
+            &unrelated,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+                rewrite_src_port: Some(nat64_port),
+                ..NatDecision::default()
+            },
+            false,
+            None,
+            1_000,
+        ),
+        "the source-NAT reservation taken before the NAT64 refusal was NOT rolled \
+         back — it holds a pool port no worker will ever release, because no \
+         session was published to reap"
+    );
+}
+
+/// #6600: the coordinator's `Untracked` reservation must be ABSORBED by the
+/// per-worker reservations rather than doubling them, so the last worker's
+/// release still frees the port.
+///
+/// This is the composability claim the whole design rests on: `reserve_flow`
+/// finds the identical `(flow, translated)` already live and takes its
+/// idempotent early return, OR-ing the worker's bit into a mask that started
+/// EMPTY (`NatHolder::Untracked` contributes no bit). If the coordinator's
+/// reservation instead made the worker's reserve REFUSE, no holder bit would
+/// ever be recorded and the port would leak.
+#[test]
+fn coordinator_pre_publish_reserve_is_absorbed_by_worker_reserve_6600() {
+    let forwarding = reserve6600_forwarding();
+    let entry = reserve6600_entry(40004, 50003);
+    let now_ns = 1_000;
+
+    assert!(
+        crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &forwarding.source_nat_rules,
+            &entry.key,
+            entry.decision.nat,
+            entry.metadata.is_reverse,
+            None,
+            now_ns,
+        ),
+        "the coordinator's reservation must succeed on a free port"
+    );
+    // Two workers then reserve the SAME translation, exactly as the fan-out
+    // produces. Both must SUCCEED — a refusal here is the failure mode that
+    // would leak the port.
+    for worker_id in 0..2u32 {
+        assert!(
+            crate::nat::reserve_synced_source_nat_allocation_for_worker(
+                &forwarding.source_nat_rules,
+                &entry.key,
+                entry.decision.nat,
+                entry.metadata.is_reverse,
+                None,
+                now_ns,
+                worker_id,
+            ),
+            "worker {worker_id}'s reservation must be ABSORBED by the coordinator's, \
+             not refused — a refusal records no holder bit and the port leaks"
+        );
+    }
+    // The last worker's release frees it: the port is allocatable again by an
+    // unrelated flow.
+    for worker_id in 0..2u32 {
+        crate::nat::release_source_nat_allocation_for_worker(
+            &forwarding.source_nat_rules,
+            &entry.key,
+            entry.decision.nat,
+            entry.metadata.is_reverse,
+            now_ns,
+            worker_id,
+        );
+    }
+    let other = SessionKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 201)),
+        src_port: 44445,
+        ..test_key()
+    };
+    assert!(
+        crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &forwarding.source_nat_rules,
+            &other,
+            entry.decision.nat,
+            false,
+            None,
+            now_ns,
+        ),
+        "after the LAST worker released, the port must be reservable again by an \
+         unrelated flow — an un-absorbed coordinator reservation would hold it forever"
+    );
+}
+
+/// Read through the shared synced map's lock. `sessions.synced` is an
+/// `Arc<Mutex<..>>`, so a bare `contains_key` does not compile.
+fn synced6600_contains(coordinator: &Coordinator, key: &SessionKey) -> bool {
+    coordinator
+        .sessions
+        .synced
+        .lock()
+        .expect("synced map")
+        .contains_key(key)
+}
+
+/// #6600: the coordinator's pre-publish reservation must resolve the synced
+/// zone pair through the SAME helper the worker-side upsert uses.
+///
+/// This matters only when two source-NAT rules share a pool address — the #6211
+/// case. The zone pair narrows PASS 1 to the rule the ACTIVE node actually
+/// matched; without it the reservation falls through to PASS 2, "the first rule
+/// whose pool contains the address", which can be a DIFFERENT allocator. The
+/// coordinator would then reserve a port in one allocator while the workers
+/// reserve in another: the coordinator's check passes, the port the session
+/// actually names stays unreserved, and the defect is back wearing a new shape
+/// — plus a leaked port in the allocator nobody will reap from.
+///
+/// Replacing the shared call with a bare `None` makes this go red.
+#[test]
+fn coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600() {
+    let mut coordinator = Coordinator::new();
+    // TWO rules over the SAME pool address. Rule 0 is a decoy in a different
+    // zone pair and is what PASS 2 would pick; rule 1 is the one the entry's
+    // metadata names, and is what PASS 1 picks when zones resolve.
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+        crate::SourceNATRuleSnapshot {
+            name: "decoy".to_string(),
+            from_zone: "dmz".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "p-decoy".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+        crate::SourceNATRuleSnapshot {
+            name: "real".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "p-real".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+    ]);
+    forwarding
+        .zone_id_to_name
+        .insert(TEST_LAN_ZONE_ID, "lan".to_string());
+    forwarding
+        .zone_id_to_name
+        .insert(TEST_WAN_ZONE_ID, "wan".to_string());
+    coordinator.forwarding = forwarding;
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+
+    // Non-vacuity: the zone pair must actually RESOLVE, or both the fix and the
+    // mutation see `None` and this test proves nothing.
+    let meta = test_metadata();
+    assert!(
+        crate::afxdp::session_glue::synced_source_nat_zone_pair(&coordinator.forwarding, &meta)
+            .is_some(),
+        "setup: the zone pair must resolve, or the discriminator does not vary"
+    );
+
+    let port: u16 = 52000;
+    let entry = reserve6600_entry(40020, port);
+    let key = entry.key.clone();
+    coordinator.upsert_synced_session(entry);
+    assert!(
+        synced6600_contains(&coordinator, &key),
+        "setup: the import must be admitted"
+    );
+
+    let unrelated = SessionKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 220)),
+        src_port: 44448,
+        ..test_key()
+    };
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+        rewrite_src_port: Some(port),
+        ..NatDecision::default()
+    };
+    // The ZONE-MATCHED rule's allocator must hold the port.
+    assert!(
+        !crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.source_nat_rules[1..2],
+            &unrelated,
+            nat,
+            false,
+            None,
+            1_000,
+        ),
+        "the coordinator did not reserve in the ZONE-MATCHED rule's allocator — it \
+         resolved a different zone pair than the worker will, so the port the \
+         session names stays unreserved"
+    );
+    // And the decoy's must NOT — otherwise the coordinator reserved in the
+    // fall-through allocator, leaking a port nobody reaps from.
+    assert!(
+        crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.source_nat_rules[0..1],
+            &unrelated,
+            nat,
+            false,
+            None,
+            1_000,
+        ),
+        "the coordinator reserved in the DECOY rule's allocator (the PASS 2 \
+         fall-through), which no worker will ever release"
+    );
+}

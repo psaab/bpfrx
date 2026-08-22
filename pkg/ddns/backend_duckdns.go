@@ -246,6 +246,11 @@ func parseDuckDNSResponse(body, name string) error {
 		return fmt.Errorf("ddns duckdns: %s: response %q (bad token or unknown domain): %w",
 			name, keyword, errHTTPAuth)
 	default:
-		return fmt.Errorf("ddns duckdns: %s: unrecognized response %q", name, first)
+		// SECURITY (#6634): as on the dyndns2 path — `first` is up to
+		// httpMaxResponseBody (64 KiB) of provider-chosen bytes. DuckDNS carries
+		// its token in the QUERY STRING of the update URL, so an endpoint that
+		// echoes the request back echoes the token itself; %q neutralizes
+		// control characters and nothing else.
+		return fmt.Errorf("ddns duckdns: %s: unrecognized response %q", name, scrubProviderText(first))
 	}
 }
