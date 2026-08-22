@@ -56,6 +56,21 @@ type ChannelStatus struct {
 	// literal import cycle, since pkg/upgrade's tests already import
 	// pkg/cluster.
 	HoldReason string
+	// Refusal is the boot gate's durable did-not-run record (#6622), when one
+	// exists. The gate exits 0 on every path so `systemctl status` reads
+	// SUCCESS even after a refusal; this is what makes the decline visible
+	// somewhere an operator looks, and it survives journal rotation.
+	//
+	// It carries the resolution FACTS the gate decided on. It does NOT carry
+	// which candidate was armed, and that is deliberate rather than a gap: the
+	// gate is POSIX sh and the journal is JSON, so it reads that file for one
+	// bit and never for a value. The candidate is joined in here instead, from
+	// Journal.CandidateVersion, which this function has already parsed in Go —
+	// and it is still accurate, because a refusal never transitions the
+	// journal, so the record and the ARMED candidate it declined are read from
+	// one consistent state.
+	Refusal PromoteRefusal
+
 	// ReadErr records a failure to read the durable state. The status still
 	// renders — a channel whose state cannot be read is itself the finding, and
 	// refusing to print anything would leave the operator with strictly less
@@ -81,6 +96,17 @@ func ReadChannelStatus(journalPath string, sys KernelSystem) ChannelStatus {
 		st.Journal = *j
 		st.Armed = j.State.atLeast(KernelStateArmed) &&
 			j.State != KernelStatePromoted && j.State != KernelStateReverted
+	}
+	// The gate's did-not-run record (#6622). Read before the sys-backed
+	// lookups because it needs no KernelSystem: a box whose sys is nil (or
+	// whose probes fail) is exactly the box whose gate most likely declined,
+	// and the refusal is the most useful thing on the screen there.
+	if rec, rerr := ReadRefusalRecord(journalPath); rerr != nil {
+		if st.ReadErr == nil {
+			st.ReadErr = rerr
+		}
+	} else {
+		st.Refusal = rec
 	}
 	if sys == nil {
 		return st
@@ -194,6 +220,14 @@ func RenderChannelStatus(w io.Writer, st ChannelStatus) {
 	} else {
 		fmt.Fprintln(w, "  Last roll:       none recorded")
 	}
+
+	// ── boot-gate refusal (#6622) ──
+	//
+	// Rendered AFTER the armed/marker/last-roll block so the candidate it
+	// declined is already on screen above it: the record deliberately does not
+	// duplicate the candidate version, and this ordering is what joins the two
+	// for the reader.
+	renderRefusal(w, st.Refusal)
 
 	// ── cluster election hold ──
 	if st.HoldReason != "" {

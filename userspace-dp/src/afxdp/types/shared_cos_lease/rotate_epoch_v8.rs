@@ -226,7 +226,7 @@ impl SharedCoSQueueLease {
         // (the Step-0 cells measured 21-29% of the class cap evaporating
         // this way under aggressor pressure while EVERY active worker
         // cumulatively over-asked its entitlement — claim-sampling loss,
-        // docs/research/1863-realization-gap/plan.md §5). Bank the
+        // docs/pr/1863-realization-gap/plan.md §5). Bank the
         // remainder into the SAME bounded carry the lag machinery uses:
         // the next rotation's `new_cap` draws it back and the share
         // formula below re-deals it flow-proportionally, so per-worker

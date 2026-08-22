@@ -38,6 +38,151 @@
 - **File(s)**: `pkg/config/junos_host_deny.go`,
   `pkg/dataplane/userspace/junos_host_vrf_scope_6619_test.go` (new),
   `docs/host-inbound-service-matrix.md`
+## 2026-08-21 — #6635 ddns: the error-tree bound follows a caller-supplied `As`
+
+- **Timestamp**: 2026-08-21
+- **Action**: `errTreeWithinBound` ran ONCE, at the two public scrubber entry
+  points, validating the `Unwrap` tree AS PRESENTED there — which is not the
+  tree the stdlib ends up walking. `errors.As` dispatches to an `As(any) bool`
+  method the CALLER defines, and that method returns a value of the caller's
+  choosing: an error with a one-node tree (guard passes) can install a fresh
+  `*url.Error` whose `Err` self-unwraps, and the next `errors.As` spins forever.
+  REPRODUCED AT MY HEAD before fixing: the entry guard returned true and
+  `scrubURLError` did not return in 5s.
+  The guard now runs at every entry to `scrubURLErrorAt` / `scrubInnerErrorAt`,
+  which is where a caller-supplied subtree can first appear; the public wrappers
+  become thin delegates. Cost is a re-walk per level, at most maxUnwrapDepth^2
+  Unwrap calls on an error path that runs once per reconcile tick.
+  NOT CLOSED, deliberately and stated: a caller-supplied `Error()`/`Unwrap()`
+  that BLOCKS. No placement of the guard fixes that — it needs a watchdog
+  goroutine per render — and the reason to decline is not only cost: a blocking
+  `Error()` hangs ANY fmt render of that error anywhere in the daemon, so
+  bounding it inside one package's scrubber buys nothing.
+  REACHABILITY, checked rather than assumed: caller-supplied, in-process only.
+  Production builds its own client; the only caller passing one is the Surface A
+  reconcile path passing its own. A provider chooses BYTES over the wire, not a
+  Go type. Robustness, NOT a live DoS, and the PR says so.
+  MATRIX FINDING, kept rather than tuned away: narrowing the `scrubURLErrorAt`
+  guard to `depth == 0` stays GREEN, because the only depth>0 caller hands over
+  a value `errors.As` already resolved to a `*url.Error`, matched at node 0
+  without walking. That is a reachability argument about a caller, which this
+  package does not build invariants on, so the guard stays unconditional and
+  the redundancy is documented instead of removed. Removing it ENTIRELY hangs
+  the pre-existing `TestSelfUnwrappingErrorTerminates` — a red only the FULL
+  suite shows, not `-run 6635`.
+- **File(s)**: `pkg/ddns/backend_http.go`,
+  `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
+## 2026-08-22 — #6584 command-output + swanctl termsafe guards
+
+- **Timestamp**: 2026-08-22
+- **Action**: Block-sanitized `journalctl`/`tail` on BOTH renderers plus
+  `journalctl --boot` (structurally identical, not named in the issue),
+  and guarded every fork in the multi-fork gRPC functions
+  (`GetSystemInfo` ×4, `showNTP` ×4) so no guarded arm vouches for a raw
+  sibling. CORRECTED the issue's framing for site B: swanctl stdout never
+  reaches a terminal — the PARSED fields do — so it is the #6579
+  parsed-row class and is guarded once at INGEST (`sanitizeSAStatus` in
+  `GetSAStatus`) rather than at ~24 render sites across two renderers.
+  Added the mechanism the research showed was missing entirely: a
+  both-directions tripwire requiring every fork-containing function to
+  apply >= as many termsafe calls as forks, or be allowlisted with a
+  reason.
+  Mutation matrix 6/6 RED after two real fixture defects the matrix
+  itself exposed: (1) the tripwire's first version asked only whether a
+  function "references termsafe", which let one guarded arm vouch for
+  its siblings — four cells that removed a real guard stayed GREEN;
+  (2) after switching to a count, package-scope forks had an EMPTY body
+  so `0 >= 0` waved them through silently — the control run caught that.
+  Both now conservative. Successor #7389 filed for the streaming sites
+  (tcpdump renders attacker packet bytes; traceroute resolves PTR) which
+  need a line-wise writer, plus the low-taint remainder.
+- **File(s)**: pkg/cli/cli_show_system.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go,
+  pkg/ipsec/ike.go, pkg/ipsec/manager.go,
+  pkg/cli/command_output_termsafe_6584_test.go,
+  pkg/ipsec/sa_status_termsafe_6584_test.go, pkg/cli/README.md
+
+## 2026-08-22 — #6612 destination-scoped junos-host permit: the missing advisory clause
+
+- **Timestamp**: 2026-08-22
+- **Action**: Landed the one clause the #6612 audit found missing. A
+  `to-zone junos-host` permit narrowed on DESTINATION (or carrying
+  `destination-address-excluded`) rendered no kernel rule AND produced
+  ZERO warnings of any kind: `junosHostProjectTerm` already refused to
+  render it, while `junosHostPolicyStricterThanCoarseGate` admitted a
+  permit as stricter-than-coarse only through
+  `junosHostPolicySourceScoped`, which inspects the source dimension
+  alone. The advisory now keys on the SAME expression the projection
+  applies (`junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded`) rather than a second copy — a divergence
+  between "the projection refuses to render it" and "the warning says
+  so" is always a bug, which is the discriminator for single-sourcing
+  over binding two copies with an agreement test. Restored the two table
+  rows so each asserts BOTH halves in one cell. Measured, rather than
+  assumed, that a fixture cannot make both halves gate-sensitive at
+  once: the rules half needs a CONCRETE permit source (with
+  `source-address any` the permit sets permitAllV4 and shadows every
+  later deny, so nothing renders with or without the projection gate),
+  while the warning half needs NO concrete source (or it warns through
+  the source predicate and says nothing about the destination
+  dimension). The class is therefore bound by a table row plus the
+  separate widening test, and the doc records why so neither is
+  "simplified" into the other later. Re-shaped the excluded row to
+  `destination-address any` + excluded so the two disjuncts localise
+  independently. Three one-line mutations, each `go vet` clean at the
+  mutated state, each reddening exactly one row: dropping the named
+  disjunct reds only `dst-permit`, dropping the excluded disjunct reds
+  only `dstx-permit`, and dropping the projection gate reds only the
+  widening test's two subtests and none of the table rows — the split
+  the doc describes, confirmed by measurement.
+- **File(s)**: `pkg/config/compiler_validate_warn_host_inbound.go`,
+  `pkg/dataplane/userspace/junos_host_residual_6612_test.go`,
+  `docs/host-inbound-service-matrix.md`
+## 2026-08-21 — #6622 kernel promote gate: a refusal now leaves a durable record
+
+- **Timestamp**: 2026-08-21
+- **Action**: The boot gate exits 0 on every path (deliberately — a non-zero
+  exit trips the unit's `OnFailure=` and reboots the box over what may be a
+  transient packaging window) and the unit is `Type=oneshot` +
+  `RemainAfterExit=yes`, so `systemctl status xpf-kernel-promote` read SUCCESS
+  and stayed active even when the gate REFUSED and the armed candidate was
+  running unverified. The only signal was a journald line, which journal
+  rotation removes.
+
+  `refuse()` now writes `/var/lib/xpf/kernel-promote-refusal`, one `key=value`
+  per line, carrying the discovery-snapshot facts the DECISION was made on
+  (`LoadState`, `MainPID`, `ControlGroup`, raw `ExecStart`), the journal bit,
+  the cause, the branch-specific advice, a timestamp and the boot id. Read by
+  `upgrade.ReadRefusalRecord` and surfaced through `ChannelStatus` /
+  `RenderChannelStatus`, so `show system kernel-upgrade`, the console CLI, the
+  remote `cli` and the status RPC all get it without touching `pkg/cli` or
+  `pkg/grpcapi`. The unit still exits 0 and still does not trip `OnFailure=`;
+  a test asserts that rather than assuming it.
+
+  The indeterminate-journal WARNING writes one too, as
+  `disposition=indeterminate`. That is what makes the record's ABSENCE
+  meaningful: if only `refuse()` wrote one, "no record" could not distinguish
+  a clean boot from a boot the gate skipped for the other reason. The quiet
+  "nothing to promote" branch and the post-exec `rc` paths deliberately write
+  nothing — the first is the ordinary boot, the second is where the Go half
+  already owns the durable state.
+
+  The record does NOT duplicate the candidate version: the gate reads the JSON
+  journal for one bit and never for a value, so the candidate is joined in Go
+  by `ReadChannelStatus`, which is accurate because a refusal never transitions
+  the journal.
+
+  Tightened `ReadRefusalRecord` while writing its test: counting `=`-bearing
+  lines rather than RECOGNISED keys let a file whose only fields are unknown
+  parse as a refusal with every field empty, rendering a REFUSED banner made
+  entirely of dashes. The first draft of the test could not see it — its own
+  fixture text contained the literal "key=value".
+- **File(s)**: `scripts/image/xpf-kernel-promote`,
+  `scripts/image/test_kernel_promote_explicit_path.py`,
+  `pkg/upgrade/kernel_promote_refusal.go` (new),
+  `pkg/upgrade/kernel_promote_refusal_6622_test.go` (new),
+  `pkg/upgrade/kernel_status.go`, `pkg/upgrade/kernel_run.go`,
+  `pkg/upgrade/kernel_arm_record.go`, `docs/in-place-upgrade.md`, `_Log.md`
 
 ## 2026-08-21 — #6612 junos-host residual: audited the claim, found it false, locked what holds
 
@@ -102187,3 +102332,44 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6615 — repo-wide dangling doc-citation gate (pkg/docsref) with a
+    grandfathered ratchet baseline; corrected 4 provable research/->pr/ cite
+    relocations. Sweep found 53 dangling paths across live (non-archive) files.
+  - **File(s)**: pkg/docsref/{doc.go,docsref_test.go,testdata/known_dangling.txt},
+    docs/fairness-regimes.md, docs/pr/1863-realization-gap/plan.md,
+    docs/pr/1864-toolchain-pin/reviewer-ids.md,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/{epoch.rs,rotate_epoch_v8.rs}
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6625 — the #1798 control-character gate rendered a credential
+    leaf's VALUE into its error (twice: path + quoted value). Now reports the
+    byte class and offset instead, for credential leaves only. `community` is
+    path-qualified (secret under snmp, a BGP route-target name elsewhere).
+  - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
+    pkg/config/secret_in_error_6625_test.go
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6626 + #6627 — the heatmap hard gate could return "ok (cached)"
+    on a real threshold crossing (working tree is not a go test cache input);
+    make test-go now runs pkg/refactoraudit uncached, guarded by a Makefile
+    wiring test. #6627: a duplicated heatmap row is now rejected explicitly.
+  - **File(s)**: Makefile, pkg/refactoraudit/audit_canary_test.go
+
+## 2026-08-22 — #6639 cut re-stamps the kernel arm record
+- **Timestamp**: 2026-08-22
+- **Action**: An in-place binary cut repoints `current`, the sbin links and the
+  unit ExecStart but left the kernel arm record naming the OLD binary, so a
+  candidate boot refused. The refusal fires in the POSIX-sh OUTER hop (before it
+  execs anything), so the SIDECAR is what had to move — a Go-only change could
+  not fix it. Added step 6d inside `flip()` (after 6c, so a crash leaves today's
+  safe refusing state), gated on an ARMED journal, writing sidecar + journal
+  field from one value with `fsatomic.WriteFileDurable`, fail-closed. Left
+  `VerifyPromoteBinaryMatchesRecord` and the shell untouched: relaxing the
+  comparison would re-admit the stale leftover #6601 exists to eliminate.
+  Consequence was worse than filed — the journal is never cleared, so the gate
+  re-refuses every boot and an HA node holds SECONDARY indefinitely.
+- **File(s)**: pkg/upgrade/flip.go, pkg/upgrade/kernel.go,
+  pkg/upgrade/kernel_arm_restamp_6639_test.go (new), _Log.md

@@ -15,6 +15,8 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // swanctlTimeout bounds every swanctl shell-out. reload() runs on the
@@ -403,7 +405,7 @@ func (m *Manager) terminateIKE(name string) bool {
 func (m *Manager) liveConnNames() (map[string]bool, error) {
 	out, err := m.sc("--list-sas")
 	if err != nil {
-		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, string(out))
+		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, termsafe.SanitizeForDisplay(string(out)))
 	}
 	names := make(map[string]bool)
 	for _, sa := range parseSAOutput(string(out)) {

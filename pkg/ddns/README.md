@@ -405,14 +405,71 @@ Two further consequences:
   error that unwraps to itself hangs them and an `Unwrap() []error` self-cycle
   overflows the stack; `errTreeWithinBound` walks the tree under a node budget
   before the first `errors.As` and withholds when it blows.
-  **What that bounds, precisely:** the `Unwrap` tree as presented at entry. It
-  does NOT bound a caller's other methods. A custom `As` can install a fresh
-  subtree that was never prewalked, and an `Error()` that blocks or recurses
-  hangs at the first render regardless of tree shape — neither is reachable
-  without a caller-supplied hostile error, and no production caller supplies
-  one, but the bound is not total and should not be read as such. The diagnostic cost — `net/http`'s internal prose, the failing
-  address, the unknown-error type name — is accepted: an unrecognised error is
-  exactly the case where we cannot say what it contains.
+  **What that bounds, precisely (#6635).** The guard used to run ONCE, at the
+  two public entry points, validating the `Unwrap` tree *as presented there* —
+  which is not the tree the stdlib ends up walking. `errors.As` dispatches to an
+  `As(any) bool` method the CALLER defines, and that method hands back a value
+  of the caller's choosing:
+
+  ```go
+  func (e hostile) As(target any) bool {
+      *target.(**url.Error) = &url.Error{Err: selfUnwrappingError{}}
+      return true
+  }
+  ```
+
+  The tree at entry is a single node, so the guard passed; the subtree the `As`
+  installed was never walked, and `scrubURLErrorAt` descended straight into it
+  and spun forever inside the next `errors.As`. Reproduced before the fix: the
+  entry guard returned true and the scrubber did not return.
+
+  The guard now runs at **every entry to the depth-carrying functions**, which
+  is where a caller-supplied subtree can first appear, and the public wrappers
+  are thin delegates. Cost is a re-walk per level — at most
+  `maxUnwrapDepth`² `Unwrap` calls, on an error path that runs at most once per
+  reconcile tick and only for trees that are already pathological; a legitimate
+  error walks one or two levels.
+
+  The guard in `scrubURLErrorAt` is **unconditional rather than `depth == 0`**,
+  and the mutation matrix is explicit about the trade. Removing it hangs
+  `TestSelfUnwrappingErrorTerminates` — with the wrapper reduced to a delegate,
+  depth 0 IS the public entry and round 12's property lives there. Narrowing it
+  to depth 0 alone stays green, because today the only depth>0 caller is
+  `scrubInnerErrorAt` handing over a value `errors.As` already resolved to a
+  `*url.Error`, which the next `errors.As` matches at node 0 without walking
+  anything. That is a reachability argument about a caller, and this package
+  does not build invariants on those — the same stance the dyndns2 endpoint
+  scrub takes. It is kept total.
+
+  **Still NOT bounded, deliberately.** A caller-supplied `Error()` or `Unwrap()`
+  that BLOCKS hangs the first render or the guard itself, and no placement of
+  the guard fixes that — it would need a watchdog goroutine per render. The
+  reason for not doing it is not only cost: a blocking `Error()` hangs *any*
+  `fmt` render of that error anywhere in the daemon, so bounding it inside one
+  package's scrubber buys nothing while adding a goroutine to a path that must
+  stay cheap.
+
+  **Reachability, so this is not read as a live DoS.** The bypass needs a Go
+  error VALUE with hostile methods. Production builds its own client
+  (`newProviderHTTPClient` → `newHTTPClientBound`); `ensureProviderHTTPClient`
+  accepts a caller-supplied `*http.Client`, but the only production caller is
+  the Surface A reconcile path passing its own cached client, and every error on
+  these paths originates in `net/http` or the stdlib. A provider chooses BYTES,
+  not a Go type. This is robustness and model consistency, not a reachable
+  denial of service.
+
+  Gates: `errtree_bound_after_as_6635_test.go`. The failure mode is a HANG, so
+  every cell runs the scrubber on a goroutine with a deadline and the test
+  RETURNING is the signal — a direct call would wedge the package run instead of
+  failing. Each cell first asserts the presented tree PASSES `errTreeWithinBound`,
+  which is what makes it a test of the installed subtree rather than a re-test of
+  the round-11 guard; one cell enters the bypass one level down so a fix that
+  guarded only the first entry fails. `TestOrdinaryErrorsStillClassifyNormally_6635`
+  is the over-reach guard — withholding everything satisfies every hang cell and
+  destroys the classification this package exists to produce. The diagnostic
+  cost — `net/http`'s internal prose, the failing address, the unknown-error
+  type name — is accepted: an unrecognised error is exactly the case where we
+  cannot say what it contains.
 - **`guardRedirect`'s refusals name no provider-supplied host at all.** The
   grammar (`refusalHost`/`safeScheme`) bounds a host's character SET — zone ids,
   raw non-ASCII and anything that is not a plain reg-name are withheld — but it
