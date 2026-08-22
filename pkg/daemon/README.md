@@ -825,6 +825,69 @@ and `TestInvalidateAppliedRearmsAnySecondWriter` /
 `TestInvalidateAppliedKeepsStructInvariant` (the generic second-writer
 contract), all in `rg_state_fence_rearm_6530_test.go`.
 
+**Where the wiring lives (#6428).** `startClusterComms` was a 602-line
+constructor; the sub-constructions were extracted verbatim into thirteen focused
+builders in **`daemon_ha_comms_wiring.go`** (VRF-device resolution, HA watchdog
+heartbeat, sync-transport selection, session-sync transport refs, fabric gRPC
+listeners, the config / peer-lifecycle / remote-failover callback groups, the
+cluster peer-failover hooks, fence wiring, event-stream wiring, the auxiliary
+comms loops, and the fabric-forwarding loops). What stays in
+`daemon_ha_sync.go` is the control-flow spine, because **the order is the
+contract** and it is documented on `startClusterComms` itself:
+
+- `beginClusterCommsEpoch` first — every goroutine below captures its
+  sub-context and every publish presents its generation;
+- `resolveClusterVRFDevice` before the heartbeat goroutine and the constructor
+  goroutine (both take `vrfDevice` by value);
+- `syncRGStrictVIPOwnershipMode` before the heartbeat goroutine, so `rg_active`
+  already follows VIP ownership once VRRP starts driving it;
+- `clusterCommsWG.Add(1)` on the caller's stack, never inside the goroutine, so
+  `stopClusterComms` cannot `Wait()` past an unregistered constructor;
+- inside the constructor: resolve → build `ss` → `publishSessionSyncIfCurrent`
+  → **all** wiring → `ss.Start`. Every `ss.On*` callback, cluster-Manager hook
+  and `SetVRFDevice` must be installed before `Start`, which spawns the
+  accept/connect goroutines whose first connection runs the authoritative
+  cold-prime bulk;
+- `wireUserspaceEventStreamForSync` before the `ss.Start` retry loop — its
+  result selects which drain loop that loop launches;
+- fabric refresh channels published before `startFabricForwardingLoops` hands
+  each loop its own channel by value.
+
+The five blocks that carry a `return` out of the constructor goroutine (address
+resolution, fab1 resolution, `ss` construction + publish, the `ss.Start` retry
+loop, the fabric-channel publish) were deliberately NOT extracted: turning those
+escapes into sentinel returns is exactly the rewrite that can change which
+later phases still run — the `ss.Start` loop must fall through to the auxiliary
+loops when all 30 attempts fail, but must NOT when the context was cancelled.
+
+**Goroutine lifecycle: only ONE of eleven is joined.** `clusterCommsWG.Add(1)`
+appears exactly once in the tree — it tracks the session-sync constructor
+goroutine, and `stopClusterComms` joins only that one. The other ten goroutines
+this path spawns (`startHeartbeatWithRetry`, the HA watchdog ticker, the gRPC
+fabric-listener poller and its inner listener, `eventStreamFallbackLoop` /
+`runUserspaceEventStream`, `syncIPsecSAPeriodic`, `configSyncReconcileLoop`,
+`populateFabricFwd{,1}`, `monitorFabricState`) are context-cancelled only,
+never joined. That asymmetry is the structural reason **#7257** is reachable:
+`stopClusterComms` cancels the context, joins only the constructor, and then
+calls `d.cluster.StopHeartbeat()` — which nils the heartbeat handles under
+`m.mu` while an unjoined `startHeartbeatWithRetry` goroutine may still be
+inside `StartHeartbeat` dereferencing them unlocked. #6428 did not move
+`startHeartbeatWithRetry` and did not change the lifecycle; #7257 needs a
+lifecycle fix, not a code move.
+
+**The wiring was unbound when #6428 measured it.** `go tool cover -func` over
+`./pkg/daemon/` reported **0.0% statement coverage** for all ten builders that
+live inside the constructor goroutine, and nilling all 30 wiring assignments at
+once left `./pkg/daemon/` and `./pkg/cluster/` fully green. The tests that do
+call `startClusterComms` deliberately configure it to early-return before the
+goroutine. `cluster_comms_wiring_bound_6428_test.go` now binds the 17
+observable sites — the 15 `ss.*` handles plus `d.syncPeerAddr{,1}` — by calling
+each builder directly and asserting the installation, each site mutation-proven
+(unwire it, the test reds naming that field). The remaining 13 sites are the
+`d.cluster.Set*()` hooks and `ss.SetAuthProvider`/`SetSyncTransport`;
+`cluster.Manager` exposes no getter for any of them, so binding those needs an
+observation seam in `pkg/cluster`.
+
 ### Per-RG Router-Advertisement reconcile (#5861)
 
 In cluster mode RA senders run ONLY on the RG that is the current active

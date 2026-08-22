@@ -100229,6 +100229,53 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_prepass_logging_4960_test.go,
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 — `Daemon.startClusterComms` was a 602-line constructor
+  wiring the whole cluster-comms stack. Extracted thirteen sub-constructions
+  into focused builders in a new `daemon_ha_comms_wiring.go`: VRF-device
+  resolution, HA watchdog heartbeat, sync-transport selection, session-sync
+  transport refs, fabric gRPC listeners, the config / peer-lifecycle /
+  remote-failover callback groups, cluster peer-failover hooks, fence wiring,
+  event-stream wiring, the auxiliary comms loops, and the fabric-forwarding
+  loops. `startClusterComms` drops 602 -> 233 lines and keeps only the
+  control-flow spine, because in a cluster bring-up constructor the ORDER is
+  the contract. Pure code motion: all thirteen bodies verified byte-identical
+  modulo indentation by an independent extract/normalise/diff verifier (10
+  exactly identical, 3 with a pure appended `return`), and a second verifier
+  proved the only lines that left `daemon_ha_sync.go` are those thirteen blocks
+  plus two now-unused imports and an orphaned `watchClusterEvents` doc comment.
+  Every argument is passed under the identifier it binds, and each such variable
+  was shown single-assignment before its moved consumer, so by-value parameters
+  are equivalent to the original by-reference captures. The five blocks that
+  `return` out of the constructor goroutine were deliberately left inline.
+  `daemon_ha_sync.go` left the refactor-audit WATCH tier (1585 -> 1245 LOC);
+  audit regenerated. `make test-failover` and a startup validation are OWED and
+  UNRUN.
+- **File(s)**: pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_comms_wiring.go, pkg/daemon/README.md,
+  docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 follow-up in the same PR — measured whether the wiring the
+  decomposition relocates is bound by any test. It was not: `go tool cover
+  -func` over `./pkg/daemon/` reports 0.0% statement coverage for all ten
+  builders inside the sync-constructor goroutine, and nilling ALL 30 wiring
+  assignments at once left `./pkg/daemon/` and `./pkg/cluster/` green — the
+  tests that call `startClusterComms` deliberately configure it to early-return
+  before the goroutine. Added `cluster_comms_wiring_bound_6428_test.go` binding
+  the 17 observable sites (15 `ss.*` handles + `d.syncPeerAddr{,1}`) by calling
+  each builder directly and asserting the installation, not the behaviour. The
+  first draft was VACUOUS: collecting func fields into a table of `any` boxes a
+  typed nil into a non-nil interface, so 14 of 17 unwire mutations stayed green;
+  rewritten with direct `== nil` comparisons and re-proven 17/17 RED, each
+  naming the dropped field. Remaining 13 sites (the `d.cluster.Set*` hooks plus
+  `ss.SetAuthProvider`/`SetSyncTransport`) have no getter on `cluster.Manager`
+  and stay unbound — reported, not silently relocated. Also recorded the
+  goroutine-lifecycle finding: `clusterCommsWG.Add(1)` occurs exactly once, so
+  only the constructor goroutine is joined and the other ten (including
+  `startHeartbeatWithRetry`) are cancel-only — the structural reason #7257 is
+  reachable. #7257 is NOT fixed here; it needs a lifecycle change, not a move.
+- **File(s)**: pkg/daemon/cluster_comms_wiring_bound_6428_test.go (new),
+  pkg/daemon/README.md, _Log.md
 
 ## 2026-08-21 — #6311: node discriminator in the session-id namespace
 - **Timestamp**: 2026-08-21
