@@ -1278,6 +1278,45 @@ empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
 
+**Two of those leaves accept ONE value permanently, and #6674 ratified that
+rather than implementing the list.** #6673 fixed the READ half for both — every
+authored value now reaches validation and a multi-valued list is hard-REJECTED
+at commit, warned on the tolerant path — but the scalar the runtime installs is
+still a single value at three successive layers. Six source sites told the
+reader a follow-up was coming; none is. The two arms ratify for DIFFERENT
+reasons, and conflating them is how the wrong decision gets made for the pair:
+
+- `security nat static … rule … match destination-address`: **Junos takes one
+  prefix here**, so the schema's `multi: true` is an xpf over-advertisement of
+  the grammar, not a promise. A static-NAT rule is a 1:1 mapping — one `match
+  destination-address` against one `then static-nat prefix` — so N external
+  prefixes against one internal prefix names no target, and fanning the rule
+  into N rows would have to invent a pairing Junos does not define. `rule R1` /
+  `rule R2` already expresses the intent.
+- `routing-options forwarding-table export`: **Junos genuinely takes a policy
+  CHAIN**, so "the schema over-advertises" is not available here — and neither
+  is the tempting shortcut "a chain is equivalent to its first policy", which
+  was MEASURED FALSE (`pkg/frr/forwarding_export_chain_6674_test.go`: for a
+  plain first policy and a load-balancing second, the first-policy reading gives
+  `maximum-paths` 0 and the OR-composed chain gives 64). It ratifies for a
+  structural reason instead: `resolveECMP` derives exactly two booleans from the
+  ONE named policy — any term with a load-balance action sets `ecmpMaxPaths` to
+  64, any `consistent-hash` term sets `ConsistentHash` — and evaluates no `from`
+  match, term order, or terminating action. Junos evaluates an export chain PER
+  ROUTE and stops at the first terminating action, so the cheap composition
+  (OR across the chain) is not Junos, and the faithful one is not expressible at
+  all because the value being derived is FRR's GLOBAL `maximum-paths`. A chain
+  needs a per-route forwarding-policy model xpf does not have — a feature,
+  tracked as its own issue, not a defect in the multi-value read.
+
+The operator-facing half is pinned behaviourally rather than by comment:
+`TestRatifiedGatesDoNotPromiseAFollowUp_6674` compiles each config on the
+tolerant path and asserts the warning the operator READS neither promises a
+follow-up nor drops the reason, with the still-rejects/still-commits pair as its
+green control. A comment that rots is bad; a warning that promises a feature
+which is never coming is worse, because the operator acts on it — they leave the
+list in place and wait.
+
 **SIX leaf families, SEVEN read sites AT #6673 — the category table above has
 FOUR rows and is not the inventory.** (The table is appended to as later fixes
 land; row 8 is #6687's, and the counts in this sentence describe #6673 only.) The four rows classify EMPTY-VALUE semantics, and
