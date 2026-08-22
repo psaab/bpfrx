@@ -250,8 +250,18 @@ func (s *SessionSync) configItemIncarnationStale(item configApplyItem) bool {
 	}
 	current := s.PeerBootIncarnation()
 	if !current.known() {
-		// Nothing has primed with an incarnation yet; there is no namespace to
-		// be outside of.
+		// Nothing has primed with an incarnation yet, so there is no namespace
+		// to be outside of.
+		//
+		// UNREACHABLE while the two records are made together: the only writer
+		// of a connection's stamp is noteConnBootIncarnation, called from the
+		// same BulkStart arm that calls notePeerBootIncarnation, so an item
+		// cannot carry an incarnation the receiver has never seen. A mutation
+		// flipping this arm to `true` therefore changes nothing observable —
+		// it is kept as an explicit FAIL-OPEN so that if a future change ever
+		// splits the two records, the outcome is today's generation-only
+		// ordering rather than every payload being dropped against a namespace
+		// that does not exist.
 		return false
 	}
 	return !bytes.Equal(item.incarnation[:], current[:])

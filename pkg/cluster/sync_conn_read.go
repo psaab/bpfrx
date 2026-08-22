@@ -193,8 +193,15 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// ORDER MATTERS: both records land BEFORE resetRecvGen below. Reversing
 		// them opens a window in which the high-waters are already zeroed while
 		// the current incarnation is still the DEAD one, so a prior-boot payload
-		// dequeued in that window passes the fence and records its (large)
-		// generation — the exact defect this exists to close.
+		// dequeued by configApplyLoop in that window passes the fence and
+		// records its (large) generation — the exact defect this exists to
+		// close. In this order there is no such window.
+		//
+		// Not covered by a test, and deliberately called out rather than left
+		// implied: binding it would mean interleaving the apply-loop goroutine
+		// between two adjacent statements here, which no deterministic fixture
+		// in this package can do. A mutation moving both records after the
+		// reset leaves the whole suite green.
 		inc := parseBootIncarnation(payload)
 		s.noteConnBootIncarnation(conn, inc)
 		switched := s.notePeerBootIncarnation(inc)
