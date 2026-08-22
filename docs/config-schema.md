@@ -56,11 +56,34 @@ A tail that leaves the modelled grammar is returned UNEXPANDED rather than
 guessed — the helper exists to stop configuration being silently dropped, and
 inventing a shape the schema does not describe is another way of doing that.
 
-**A stanza whose leaves are not modelled in `setSchema` cannot be fixed this
-way.** `security screen ids-option <p> icmp` models only `fragment`, so the
-screen checks are absent from the schema and the packed screen body (#6683)
-cannot be expanded until they are added — which is also why those leaves get no
-`?` completion and no `SchemaValidate` typed-leaf checking.
+**A stanza whose leaves are not modelled in `setSchema` cannot be expanded**,
+because an unmodelled keyword cannot be resolved and the expander declines
+rather than guessing. That was the blocker on #6683: `security screen ids-option
+<p> icmp` modelled only `fragment`. The screen subtree is now modelled in full
+(#6683/#7460) — every check flag plus every sub-knob — which also gives those
+leaves `?` completion and `SchemaValidate` reach that they never had.
+
+Modelling a subtree is not free, and the screen case is the worked example of
+what else has to move with it:
+
+- **Sub-knob children are load-bearing, not decoration.** `flood` modelled as a
+  bare flag makes the expander stop at `[flood]` and silently DROP a trailing
+  `threshold 500` — the same silent weakening the issues are about. Model the
+  value, or do not model the parent.
+- **Modelling changes flat-set token grouping.** `ast_edit.go` keys on
+  `args`/`children`/`compoundKey`/`multi`, so a value that used to collapse onto
+  `Keys` now parks as a CHILD. Any compiler reading a fixed `Keys` index for
+  that value breaks on a path that worked. `flood` read `Keys[2]` while its
+  siblings read `Children`; single-sourcing all four onto the child shape is
+  what made the change safe (#7460).
+- **It moves trailing-garbage detection from `Keys` to `Children`.** A modelled
+  childless leaf parks flat-set trailing tokens as children, so a compiler
+  calling only `recordKeyExtras` stops seeing them and the #3332/#3318 gate goes
+  quiet. Arm `recordChildExtras` on every leaf you model.
+- **It can add entries to the #2419 spelling-differential gate.** Ten bare flags
+  legitimately name a different garbage token per spelling. Allowlisting that is
+  a CLAIM, so it is paired with a test asserting the commit decision is REJECT
+  in BOTH spellings — otherwise the allowlist would hide a fail-open.
 
 ### Where it is NOT done
 
@@ -614,6 +637,60 @@ peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/
 `test/incus/xpf-cluster-fw0.conf` each carried the cross-feature overlap (one
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.
+
+### Duplicate `system login user` name (#6992)
+
+The same `user` name authored in two `system login` blocks was WORSE than the
+last-writer-wins drop the #5180 gate covers: both blocks survived in
+`Login.Users`, and two readers picked DIFFERENT ones.
+
+| reader | picks |
+|---|---|
+| `configuredClass` (`pkg/cli/identity.go`) | the FIRST block with a non-empty class |
+| `applySystemLogin` (`pkg/daemon/daemon_system.go`) | iterates every block in order, so the account state that lands comes from the LAST |
+
+Measured on a config that committed CLEAN at strict:
+
+```
+user alice { uid 2001; class admins; authentication { ssh-rsa "K1"; } }
+user alice { uid 2002; class ops;    authentication { ssh-rsa "K2"; } }
+```
+
+`applySystemLogin` rewrites `authorized_keys` per entry with
+`WriteFileDurable`, so **K2** — the key the operator wrote under the VIEW-only
+block — is the one on disk, while `configuredClass` answered **admins**. The
+credential that authenticates and the class that authorizes it came from
+different blocks, in the permissive direction. This is the third instance of the
+class in this area: #6861 keyed an advisory on a name the runtime resolved
+differently, #6838 keyed a fold on a class name the runtime picked differently.
+
+**The fix is a fold, not a matched tie-break.** `compileSystemLogin` collapses a
+duplicated name into ONE entry with per-LEAF last-authored-wins — which is what
+the FLAT spelling already produces, because `SetPath` merges `set system login
+user alice …` written twice onto one node and replaces each leaf. That makes the
+two AST shapes agree (the #5180 dual-AST-equivalence property) rather than
+inventing a third answer, and it is stronger than teaching one reader the
+other's tie-break: after the fold there is no tie to break. #6838 records why the
+weaker form is wrong — matching a tie-break is a proxy that rots the day the
+other reader changes.
+
+Per-LEAF, not per-block: a second block authoring only a `class` must leave the
+first block's `uid` in place, because that is what the flat spelling gives.
+Folding to the last BLOCK would silently zero it.
+
+The `authentication` section is the one exception — a later block's section
+replaces the earlier block's key set wholesale rather than merging into it. That
+is chosen so the fold preserves the PROVISIONED state exactly: `authorized_keys`
+is already rewritten per entry, so the last entry's keys are already the ones on
+disk.
+
+`system login user` is also registered in the #5180 duplicate-named-block gate,
+because a fold is still a silent drop of the earlier block's uid / class / keys.
+Strict rejects; the tolerant load / peer-sync path warns and boots (#1960).
+
+Deliberately NOT applied to `system login class`: #6838 already made the class
+cohort reader-independent by folding permissions across the whole same-named
+set, and a merge here would fight that design.
 
 ### Duplicate NAT rule name (#5649, C181-M18)
 

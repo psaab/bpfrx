@@ -147,8 +147,58 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)
 				sys.Login.Classes = append(sys.Login.Classes, lc)
 			}
+			// #6992: a user NAME authored in two blocks folds into ONE entry.
+			//
+			// Without the fold both blocks survive in Login.Users and two
+			// readers pick different ones: pkg/cli configuredClass returns the
+			// FIRST block with a non-empty class, while pkg/daemon
+			// applySystemLogin iterates every block in order, so the account
+			// state that lands (password, authorized_keys) comes from the LAST.
+			// Measured on a config that commits CLEAN at strict: with
+			// `class admins` first and `class ops` second, the SSH key the
+			// operator wrote under the VIEW-only block authenticates and the
+			// CLI then grants super-user. The authorization decision and the
+			// credential that reaches it come from different blocks.
+			//
+			// The fold is per-LEAF last-authored-wins because that is what the
+			// FLAT spelling already produces — SetPath merges `set system login
+			// user alice ...` written twice onto one node, replacing each leaf —
+			// so folding makes the two AST shapes agree rather than inventing a
+			// third answer. This is the #5180 dual-AST-equivalence property, and
+			// the same reasoning as the #6838 cohort fold one stanza over: make
+			// the outcome INDEPENDENT of which reader picks, rather than
+			// teaching one reader the other's tie-break, which is a proxy that
+			// rots the day the other reader changes. Here it is stronger than a
+			// matched tie-break: after the fold there is no tie to break.
+			//
+			// Deliberately NOT applied to `class`: #6838 already made the class
+			// cohort reader-independent by folding permissions across it, and a
+			// merge here would fight that design.
+			userByName := map[string]*LoginUser{}
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
-				user := &LoginUser{Name: userInst.name}
+				user := userByName[userInst.name]
+				if user == nil {
+					user = &LoginUser{Name: userInst.name}
+					userByName[userInst.name] = user
+					sys.Login.Users = append(sys.Login.Users, user)
+				}
+				// A later block's `authentication` section replaces the earlier
+				// block's key set wholesale rather than appending to it. That is
+				// what the runtime already does — applySystemLogin rewrites
+				// authorized_keys per entry with WriteFileDurable, so the last
+				// entry's keys are the ones on disk — so the fold preserves the
+				// provisioned key set exactly and removes only the divergence.
+				authoredAuth := false
+				for _, prop := range userInst.node.Children {
+					if prop.Name() == "authentication" {
+						authoredAuth = true
+						break
+					}
+				}
+				if authoredAuth {
+					user.SSHKeys = nil
+					user.EncryptedPassword = ""
+				}
 				for _, prop := range userInst.node.Children {
 					switch prop.Name() {
 					case "uid":
@@ -172,7 +222,6 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 						}
 					}
 				}
-				sys.Login.Users = append(sys.Login.Users, user)
 			}
 		case "backup-router":
 			if len(child.Keys) >= 2 {
