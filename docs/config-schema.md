@@ -6666,13 +6666,24 @@ reserved for whole-dataplane selection where a rewrite shim
   DoS, not a fail-open). The Go side now clamps once
   (`workers := maxInt(cfg.Workers, 1)`, mirroring the adjacent `QueueCount`
   / disabled-ctrl coercions) for the `userspace_ctrl` fields, and the
-  heartbeat zero-init loop bound is computed by
-  `heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())`
-  (`pkg/dataplane/userspace/maps_sync.go`): it clamps the worker count into
-  `[1, mapCap/heartbeatSlotsPerWorker]` so neither a negative nor an absurd
-  positive worker count can make the loop wrap `uint32` or index past the
-  fixed-size Array. This is the "lenient WARN-not-hang" contract applied at
-  the runtime consumer.
+  heartbeat zero-init loop bound is `heartbeatZeroSlotBound(
+  heartbeatMap.MaxEntries())` (`pkg/dataplane/userspace/maps_sync.go`) — the
+  Array's own capacity, which does not read `cfg.Workers` at all, so no value
+  of it can make the loop wrap `uint32` or index past the fixed-size Array.
+  This is the "lenient WARN-not-hang" contract applied at the runtime
+  consumer, now closed by construction rather than by a clamp.
+
+  **#6702 changed that bound, and the reason is worth stating** because the
+  pre-#6702 shape (`heartbeatZeroSlots(cfg.Workers, mapCap)`, clamped into
+  `[1, mapCap/heartbeatSlotsPerWorker]`) was measuring the wrong quantity. A
+  heartbeat slot is indexed by the **binding slot** — the shim reads
+  `USERSPACE_HEARTBEAT.get(binding.slot)` — and the binding count
+  (`min(rx_queues) * interfaces`) has never been a function of the worker
+  count. With the default `Workers: 1` the loop zeroed 32 slots, so a box with
+  three interfaces at 16 queues, or six at 6, left its tail slots holding the
+  PREVIOUS load's timestamps. A zeroed slot reads as stale and the shim
+  correctly refuses to redirect; a slot still holding a timestamp from inside
+  the heartbeat timeout reads as FRESH and masks a helper that has STOPPED.
 - **#5011 (time-zone path-traversal reject):** `system time-zone` was an
   untyped string leaf rendered directly into the `/etc/localtime` symlink
   target (`/usr/share/zoneinfo/<value>`, `applyTimezone` in
