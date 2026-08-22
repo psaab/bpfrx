@@ -270,9 +270,14 @@ type BindingStatus struct {
 	SlowPathMissingNeighborPackets uint64 `json:"slow_path_missing_neighbor_packets,omitempty"`
 	SlowPathNoRoutePackets         uint64 `json:"slow_path_no_route_packets,omitempty"`
 	SlowPathNextTablePackets       uint64 `json:"slow_path_next_table_packets,omitempty"`
-	SlowPathForwardBuildPackets    uint64 `json:"slow_path_forward_build_packets,omitempty"`
-	SlowPathDrops                  uint64 `json:"slow_path_drops,omitempty"`
-	SlowPathRateLimited            uint64 `json:"slow_path_rate_limited,omitempty"`
+	// NextTableUnsupportedDrops counts NextTableUnsupported frames dropped
+	// fail-closed by the slow-path allow-list (#6664). Since #6664 this is
+	// where the signal lives; SlowPathNextTablePackets above stays on the wire
+	// for older readers but no longer advances.
+	NextTableUnsupportedDrops   uint64 `json:"next_table_unsupported_drops,omitempty"`
+	SlowPathForwardBuildPackets uint64 `json:"slow_path_forward_build_packets,omitempty"`
+	SlowPathDrops               uint64 `json:"slow_path_drops,omitempty"`
+	SlowPathRateLimited         uint64 `json:"slow_path_rate_limited,omitempty"`
 	// TunnelEncapUnresolvedDrops counts tunnel-marked inner packets
 	// dropped at the slow-path chokepoint / pending-neigh exclusion
 	// instead of plaintext kernel reinjection (#1873 R-C/R-E).

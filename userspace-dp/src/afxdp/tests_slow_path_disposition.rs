@@ -99,11 +99,16 @@ fn slow_path_eligibility_predicate_allow_list() {
     assert!(LocalDelivery.is_slow_path_eligible());
     assert!(NoRoute.is_slow_path_eligible());
     assert!(MissingNeighbor.is_slow_path_eligible());
-    assert!(NextTableUnsupported.is_slow_path_eligible());
     // NOT eligible: must drop, never reinject.
     assert!(!PolicyDenied.is_slow_path_eligible());
     assert!(!HAInactive.is_slow_path_eligible());
     assert!(!DiscardRoute.is_slow_path_eligible());
+    // #6664: NextTableUnsupported left the allow-list. Unlike NoRoute it is
+    // NOT transient -- no FIB refresh resolves an over-deep or cyclic
+    // next-table chain -- so reinjecting it was a STANDING zone-policy bypass
+    // for that config rather than a window, and the #7409 "do not black-hole a
+    // destination the kernel can still reach" argument does not reach it.
+    assert!(!NextTableUnsupported.is_slow_path_eligible());
     // Forward/fabric dispositions never reach the generic slow path.
     assert!(!ForwardCandidate.is_slow_path_eligible());
     assert!(!FabricRedirect.is_slow_path_eligible());
@@ -1064,3 +1069,141 @@ fn syn_cookie_counters_hot_path_accumulate_in_batch() {
 // still forwards, is NOT flow-cached, and self-heals below cap), I6
 // (refused seed is recycled, not buffered), I14 (NAT64 refusal drops).
 
+
+
+// #6664: NextTableUnsupported is DROPPED by the filtered wrapper and counted,
+// and NoRoute still DELEGATES. Both halves are asserted in one test against
+// the same harness because the failure this guards against is not "the deny
+// does not work" -- it is "the deny was applied to the wrong disposition", and
+// only the pair can see that. A change that denied both would satisfy a
+// deny-only test.
+//
+// The two dispositions produce OPPOSITE counter signatures, which is what
+// makes the assertions mutation-sensitive:
+//   - filtered at the top   -> slow_path_drops == 0, no exception,
+//                              next_table_unsupported_drops == 1
+//   - proceeds past the top -> slow_path_drops == 1, an exception recorded
+//                              (there is no reinjector in this harness),
+//                              next_table_unsupported_drops == 0
+// Restoring NextTableUnsupported to the allow-list flips it onto the second
+// signature and reds on an assertion rather than on a build error.
+#[test]
+fn next_table_unsupported_is_dropped_and_counted_no_route_still_delegates_6664() {
+    struct Case {
+        disposition: ForwardingDisposition,
+        filtered: bool,
+    }
+    for case in [
+        Case {
+            disposition: ForwardingDisposition::NextTableUnsupported,
+            filtered: true,
+        },
+        Case {
+            disposition: ForwardingDisposition::NoRoute,
+            filtered: false,
+        },
+    ] {
+        let disposition = case.disposition;
+        let frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let local_tunnel_reinjectors = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+
+        let binding = BindingIdentity {
+            slot: 3,
+            queue_id: 2,
+            worker_id: 1,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 5,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        // egress_ifindex 0 mirrors what the FIB actually builds for both of
+        // these dispositions (there is no egress interface), so the harness
+        // is not quietly kinder to them than production is.
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition,
+                local_ifindex: 0,
+                egress_ifindex: 0,
+                tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        maybe_reinject_slow_path(
+            &binding,
+            &live,
+            None,
+            &local_tunnel_reinjectors,
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            decision,
+            &recent_exceptions,
+            &ForwardingState::default(),
+        );
+
+        let drops = live.next_table_unsupported_drops.load(Ordering::Relaxed);
+        let slow_path_drops = live.slow_path_drops.load(Ordering::Relaxed);
+        let exception_seen = !recent_exceptions.lock().expect("exceptions").is_empty();
+
+        if case.filtered {
+            assert_eq!(
+                drops, 1,
+                "{disposition:?} must be counted as a fail-closed drop so the signal \
+                 moves to next_table_unsupported_drops instead of vanishing with the \
+                 accept-path counter it used to bump",
+            );
+            assert_eq!(
+                slow_path_drops, 0,
+                "{disposition:?} is filtered by the allow-list before any slow-path \
+                 drop accounting",
+            );
+            assert!(
+                !exception_seen,
+                "{disposition:?} is filtered cleanly, with no slow-path exception",
+            );
+        } else {
+            assert_eq!(
+                drops, 0,
+                "{disposition:?} must NOT be counted as a next-table drop -- the #6664 \
+                 deny is scoped to one disposition, not to the slow path generally",
+            );
+            assert_eq!(
+                slow_path_drops, 1,
+                "{disposition:?} must still DELEGATE: it proceeds past the allow-list \
+                 and is only dropped here because this harness has no reinjector. If \
+                 this is 0 the packet was filtered out, i.e. NoRoute stopped being \
+                 slow-path eligible -- the #7409 black-hole regression.",
+            );
+            assert!(
+                exception_seen,
+                "{disposition:?} proceeded into the slow-path body, which records an \
+                 exception when no reinjector is configured",
+            );
+        }
+    }
+}

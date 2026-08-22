@@ -43,6 +43,14 @@ func collectSlowPathSeries(t *testing.T, c *xpfCollector, status dpuserspace.Pro
 			"slow_path_next_table_packets_total",
 			"slow_path_local_delivery_packets_total",
 			"slow_path_missing_neighbor_packets_total",
+			// #6664. Note this one makes the quoted-fqName anchoring below
+			// load-bearing rather than merely careful: the RETIRED
+			// slow_path_next_table_packets HELP now names
+			// xpf_userspace_binding_next_table_unsupported_drops_total in
+			// prose, to point operators at its replacement. A bare
+			// strings.Contains on the metric name would match that HELP and
+			// attribute the retired series' value to this one.
+			"next_table_unsupported_drops_total",
 		} {
 			// Desc.String() embeds the HELP text as well as the fqName, and
 			// several of these help strings cross-reference the other
@@ -72,8 +80,13 @@ func TestSlowPathReinjectCountersAreEmittedEvenWhenZero(t *testing.T) {
 	}
 
 	got := collectSlowPathSeries(t, c, status)
-	if len(got) != 4 {
-		t.Fatalf("want all 4 reinject series present at zero, got %d: %v", len(got), got)
+	// #6664: five now — the four #7409 reinject series plus the next_table
+	// fail-closed drop. The zero-datapoint property matters MORE for the drop
+	// than for the reinjects: a next_table drop is an operator config defect,
+	// so its steady state is legitimately 0 and the series would otherwise
+	// never appear until the defect already existed.
+	if len(got) != 5 {
+		t.Fatalf("want all 5 slow-path allow-list series present at zero, got %d: %v", len(got), got)
 	}
 	for name, v := range got {
 		if v != 0 {
@@ -95,6 +108,7 @@ func TestSlowPathReinjectCountersMapToTheCorrectSeries(t *testing.T) {
 			SlowPathNextTablePackets:       22,
 			SlowPathLocalDeliveryPackets:   33,
 			SlowPathMissingNeighborPackets: 44,
+			NextTableUnsupportedDrops:      55,
 		}},
 	}
 
@@ -104,6 +118,10 @@ func TestSlowPathReinjectCountersMapToTheCorrectSeries(t *testing.T) {
 		"slow_path_next_table_packets_total":       22,
 		"slow_path_local_delivery_packets_total":   33,
 		"slow_path_missing_neighbor_packets_total": 44,
+		// #6664: the fail-closed drop that replaced the next_table reinject.
+		// Asserted by VALUE, not just present in the series count below, so a
+		// wiring that emitted the wrong field cannot pass.
+		"next_table_unsupported_drops_total": 55,
 	} {
 		if got[name] != want {
 			t.Errorf("%s = %v, want %v", name, got[name], want)
@@ -131,7 +149,9 @@ func TestSlowPathReinjectCountersAreEmittedPerBinding(t *testing.T) {
 	for range ch {
 		n++
 	}
-	if n != 8 {
-		t.Fatalf("want 4 series x 2 bindings = 8 metrics, got %d", n)
+	// #6664 made this five: the four #7409 reinject counters plus the
+	// next_table fail-closed drop that replaced one of them.
+	if n != 10 {
+		t.Fatalf("want 5 series x 2 bindings = 10 metrics, got %d", n)
 	}
 }

@@ -117,6 +117,13 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 /// `#[cfg(test)]` `AtomicU64` field declared ahead of `pending_tx_admitted`
 /// leaves size and align UNCHANGED (it fits in existing tail slack) and moves
 /// `pending_tx_admitted` 2152 -> 2160; declared last, after
+/// #6664 moved the two OFFSET literals here (2152 -> 2160, 2280 -> 2288) in
+/// lockstep with the `const _` asserts beside the struct, when the production
+/// field `next_table_unsupported_drops` was added to the cold-counter run.
+/// Size and align are unchanged — the 8 bytes came out of tail padding. This
+/// cell is the readable mirror, so it moves WITH those asserts or it is not a
+/// mirror; it is not independent evidence and must never be re-measured alone.
+///
 /// `delta_loss_pending`, it leaves size, align and `pending_tx_admitted`
 /// unchanged and moves `delta_loss_pending` 2280 -> 2288. A size-only guard
 /// calls both of those layout-neutral, and both would be exactly the
@@ -148,14 +155,14 @@ fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304(
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, pending_tx_admitted),
-        2152,
+        2160,
         "#6304/#6114: ...nor the OFFSET of the admission counter whose \
          cacheline this is all about. A `cfg(test)` field ahead of it moves \
          this to 2160 while leaving the size assert above satisfied"
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, delta_loss_pending),
-        2280,
+        2288,
         "#6304: ...nor the offset of the last-declared field, which is the \
          sentinel for a `cfg(test)` member appended at the END of the struct — \
          that shape moves this to 2288 and trips nothing else"
