@@ -99982,3 +99982,13 @@ prose edit above them added. No diff falls in the new test body.
   pkg/vrrp/resign_barrier_6177_test.go (new),
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 — fence-only drop scope (`BuildFenceAddrSets`): withhold
+    lifeline-shared addresses (Finding A), cover every firewall-local address
+    including on a zone-less router (Finding B); wire both fence call sites.
+  - **File(s)**: pkg/dataplane/userspace/zones_host_inbound.go,
+    pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+    pkg/daemon/host_inbound_fence_scope_6492_test.go,
+    pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+    docs/host-inbound-service-matrix.md

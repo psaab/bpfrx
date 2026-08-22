@@ -422,8 +422,10 @@ func TestColdBootFenceUnzonedDropPublishesState5759(t *testing.T) {
 			}
 			defer func() { nftInstaller = orig }()
 
-			if err := d.installHostInboundColdBootFence(tc.views, tc.unzonedV4, tc.unzonedV6, nil,
-				hostInboundDesiredDropAddrs(tc.views, tc.unzonedV4, tc.unzonedV6)); err != nil {
+			sets := dpuserspace.FenceAddrSets{
+				Views: tc.views, UnzonedV4: tc.unzonedV4, UnzonedV6: tc.unzonedV6,
+			}
+			if err := d.installHostInboundColdBootFence(sets, nil); err != nil {
 				t.Fatalf("installHostInboundColdBootFence: %v", err)
 			}
 			if calls != 1 {

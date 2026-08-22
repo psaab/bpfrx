@@ -698,14 +698,16 @@ type Daemon struct {
 	// host-inbound per-address gap fence (#5789), which lo0 does not need because the
 	// operator's hand-authored filter is not per-destination-address scoped.
 	//
-	// Residuals (pre-existing, NOT introduced or addressed here — tracked in #6492):
-	// a retained REAL lo0 filter with no catch-all term (a valid config,
-	// compiler_filter_nocatchall_3295_test) need not itself cover a new day-2 address
-	// (the lo0 filter's own coverage semantics, independent of this boot fence); and
-	// the shared BuildZoneHostInboundViews / fence body carries a management-IP-on-
-	// non-lifeline and a zone-less-router behaviour that affect the host-inbound
-	// #5644 fence identically. Production access is serialized under applySem (via
-	// applyLo0Filter); atomic.Bool matches the hostInboundEnforced type.
+	// The management-IP-on-non-lifeline lockout and the zone-less-router empty
+	// fence that #6492 filed against the SHARED fence builder are fixed:
+	// dpuserspace.BuildFenceAddrSets now derives a fence-only drop scope (shared
+	// addresses withheld, every firewall-local address covered). One residual is
+	// still open and is NOT addressed here: a retained REAL lo0 filter with no
+	// catch-all term (a valid config, compiler_filter_nocatchall_3295_test) need
+	// not itself cover a new day-2 address — the lo0 filter's own coverage
+	// semantics, independent of this boot fence. Production access is serialized
+	// under applySem (via applyLo0Filter); atomic.Bool matches the
+	// hostInboundEnforced type.
 	lo0Enforced atomic.Bool
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
