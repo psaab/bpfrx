@@ -103861,3 +103861,13 @@ prose edit above them added. No diff falls in the new test body.
   `config.IsSecureTunnelIfName`.
 - **File(s)**: `pkg/dataplane/compiler_iface.go`,
   `pkg/dataplane/compiler_iface_st_prefix_6729_6730_test.go` (new)
+
+## 2026-08-22 — #6742 bootstrap rollback relinquishes cluster mastership
+- **Timestamp**: 2026-08-22
+- **Action**: enterBootstrapMode tore down networkd/FRR/dataplane but never
+  stopped cluster comms, so a node rolled back into bootstrap kept advertising
+  VRRP, could hold RG mastership, and answered for the RETH VIPs with a
+  detached dataplane. Added relinquishClusterForBootstrap (ResignRG per live
+  RG + barrier wait, then stopClusterComms) ahead of the teardown.
+- **File(s)**: pkg/daemon/bootstrap.go,
+  pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
