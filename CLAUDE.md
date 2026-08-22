@@ -92,6 +92,12 @@ make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:
 make test-cluster-env-lib # Self-test the cluster-env resolver (#5024): $FW0/
                      #   $FW1/$CLUSTER_LAN_HOST derive from each env's VM0/VM1/
                      #   LAN_HOST and get INCUS_REMOTE-qualified (no cluster)
+make test-iperf-throughput-lib # Self-test the #6897 iperf3 throughput parse +
+                     #   verdict used by test-failover.sh. The defect it guards
+                     #   is a MISSING CELL, not a wrong number: the old parse
+                     #   matched only "Gbits", so a sub-Gbit run matched neither
+                     #   the pass nor the fail branch and the gate emitted
+                     #   NOTHING while still summarising "0 failed". Hermetic.
 make test-newflow-ceiling-lib # Self-test the #4800 connection-rate analysis
                      #   layer (synthetic snapshot pairs -> new-flows/sec +
                      #   which contention site saturated) and the newflow-gen

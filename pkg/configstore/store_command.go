@@ -487,21 +487,31 @@ func hasFlatVerb(line string) bool {
 }
 
 func applyEditLine(tree *config.ConfigTree, line string) error {
-	verb, path, quoted, err := config.ParseSetVerbQuoted(line)
+	verb, path, quoted, grouped, err := config.ParseSetVerbGrouped(line)
 	if err != nil {
 		return err
 	}
 	switch verb {
 	case "delete":
-		return tree.DeletePath(path)
+		return tree.DeletePathGrouped(path, grouped)
 	case "deactivate":
-		return tree.DeactivatePath(path)
+		return tree.DeactivatePathGrouped(path, grouped)
 	case "activate":
-		return tree.ActivatePath(path)
+		return tree.ActivatePathGrouped(path, grouped)
 	default: // "set" (or a bare, unprefixed path)
 		// Quote provenance rides along so a `show | display set` dump replays
-		// into the same tree it was rendered from (#6673).
-		return tree.SetPathQuoted(path, quoted)
+		// into the same tree it was rendered from (#6673), and the bracket
+		// grouping rides along so a CONTAINER node's key list survives the
+		// round trip instead of being re-split at the schema's arity (#6668).
+		//
+		// The second one is not only an operator-facing display concern: the
+		// hierarchical branch of LoadMergeAs above renders the parsed file with
+		// FormatSet and replays it through THIS function, so before #6668 a
+		// `load merge <hierarchical-file>` rewrote the operator's config inside
+		// the daemon — a member demoted to a leaf keyword and its body
+		// re-parented under it — with every token still present and the merge
+		// reported as successful.
+		return tree.SetPathQuotedGrouped(path, quoted, grouped)
 	}
 }
 

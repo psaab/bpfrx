@@ -40,7 +40,7 @@ import (
 //
 // Rationale (#1521 / Codex r1 HIGH-2 / AGY r1):
 //   - Uses go/ast so it inspects actual call expressions, not text.
-//   - strconv.Unquote handles both `"userspace_x"` and `\`userspace_x\``.
+//   - strconv.Unquote handles both `"userspace_x"` and `\`userspace_x\“.
 //   - Skips _test.go files (cap test asserts the literal value of the
 //     pinned compatibility name; that's a legitimate test-only use).
 //   - Hard-fails on any parse or read error rather than silently
@@ -566,7 +566,6 @@ func walkWithScope(node ast.Node, initialScope map[string]string, f func(ast.Nod
 	ast.Walk(walker, node)
 }
 
-
 func findForbiddenMapNameAliases(src string) ([]string, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
@@ -978,7 +977,7 @@ func S() string { return "userspace_compat" }
 		},
 		{
 			name: "raw_string_literal_caught",
-			src: "package x\nfunc F(m M) { _ = m.Map(`userspace_raw_alias`) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
+			src:  "package x\nfunc F(m M) { _ = m.Map(`userspace_raw_alias`) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
 			want: []string{"userspace_raw_alias"},
 		},
 		{
@@ -1013,7 +1012,7 @@ func (M) Map(string) any { return nil }
 		},
 		{
 			name: "agy_r3_iii_newline_padding",
-			src: "package x\nconst bypass = \"userspace_ctrl\\n\\t\"\nfunc F(m M) { _ = m.Map(bypass) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
+			src:  "package x\nconst bypass = \"userspace_ctrl\\n\\t\"\nfunc F(m M) { _ = m.Map(bypass) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
 			// AGY r3 §iii: padding with non-space whitespace.
 			// AGY r5 §I.d.2: trim-first isMapNameSuspect reports
 			// the padded literal as the violating value (more
@@ -1022,7 +1021,7 @@ func (M) Map(string) any { return nil }
 		},
 		{
 			name: "agy_r3_iii_nbsp_padding",
-			src: "package x\nconst bypass = \"userspace_ctrl\\u00A0\"\nfunc F(m M) { _ = m.Map(bypass) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
+			src:  "package x\nconst bypass = \"userspace_ctrl\\u00A0\"\nfunc F(m M) { _ = m.Map(bypass) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
 			// AGY r3 §iii: NBSP (U+00A0) is whitespace by Unicode.
 			// trimPaddingForBypass uses unicode.IsSpace so NBSP is
 			// stripped; trimmed value equals "userspace_ctrl".

@@ -56,6 +56,46 @@
   which is what shows the fixture change is what closed them.
 - **File(s)**: `pkg/networkd/activation_tail_5718_test.go`,
   `pkg/networkd/README.md`
+## 2026-08-22 — #6897: the failover gate could emit no throughput cell, and had
+
+- **Timestamp**: 2026-08-22
+- **Action**: Answered the "has it already bitten us" question with data
+  instead of leaving it open. Swept every local failover log: 71 runs at
+  `14 passed, 0 failed`, one at `12 passed, 2 failed` (12+2 = 14, all cells
+  emitted), and ONE at `13 passed, 0 failed`. That odd run
+  (`jobs/22249260/tmp/failover.log`) emits 13 cells and `grep -c "iperf3
+  throughput"` returns 0 — the cell is ABSENT, not failed, and
+  `PASS iperf3 completed successfully` fired just before it, so the run looked
+  healthy to the summary. 13 assertions plus one silent absence, reported as a
+  clean green.
+  Root cause: the parse matched only `Gbits`, so a sub-Gbit `[SUM]` line set
+  the throughput to the literal `"0"` and then matched neither the pass branch
+  nor the fail branch — there was no else. Sub-Gbit is exactly what a
+  throughput regression or a CoS-shaped class looks like, so the gate went
+  silent in the case it exists to catch.
+  Fixed by extracting the parse and the verdict into
+  `test/incus/iperf-throughput-lib.sh`: the unit is normalised (K/M/G), and
+  the verdict is TOTAL — absent, unparseable, too-low and healthy each yield
+  exactly one cell. The caller maps the verdict with a catch-all default so an
+  unknown status still emits one. Demonstrated old-vs-new on the exact
+  incident input: OLD emits 0 cells, NEW emits 1 carrying the real 0.0860 Gbps.
+  Extraction was the point, not tidiness: it makes the GATE'S OWN fix testable
+  without a cluster, which is what lets this change be reviewed on its own
+  terms. New hermetic `make test-iperf-throughput-lib` (18 cells).
+  The self-test also binds the WIRING, not just the lib — deleting the call
+  from `test-failover.sh` would otherwise leave it green, which is the shape
+  that has produced repeated false confidence. Mutation M1 is exactly that
+  deletion and it reds.
+  Defect 2 of the issue (the established-session floor) is OBSOLETE: #4052
+  already added the 20 x 0.5s poll the issue asks for, and #7368 already added
+  the fw0/fw1 cross-reference that names an ownership/forwarding divergence
+  instead of blaming establishment — which is precisely the inconsistency the
+  issue observed.
+  Mutation matrix M1-M5 all RED, `bash -n` clean at every mutated state, PASS
+  cell counts compared against the control (18) rather than merely non-zero.
+- **File(s)**: `test/incus/iperf-throughput-lib.sh` (new),
+  `test/incus/iperf-throughput-selftest.sh` (new),
+  `test/incus/test-failover.sh`, `Makefile`, `CLAUDE.md`
 
 ## 2026-08-22 — #6678: device-map OriginalName= no longer falls back to the logical name
 
@@ -102908,3 +102948,40 @@ prose edit above them added. No diff falls in the new test body.
     compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
     pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
     docs/config-schema.md
+
+## 2026-08-22 — #7426: single-source the predictable-name derivation
+- **Timestamp**: 2026-08-22
+- **Action**: Two live re-implementations wrong in OPPOSITE directions on the
+  same field — the daemon had NamePolicy ordering but never emitted `f0`
+  (`fn > 0`), the dataplane had #4795's multifunction fix but took the first
+  altname in kernel order. An agreement test could only pin one wrongness to the
+  other, so: new zero-import leaf `pkg/netname` (pkg/daemon imports
+  pkg/dataplane, so the resolver cannot live in pkg/daemon). Both call sites
+  rewired; the duplicated dataplane helpers deleted and #4795's test MOVED with
+  the code; `altNamePrefixOrder` aliased so the #6677 test keeps binding the
+  live order. Also found two divergences the issue did not name — no PCI domain
+  handling and a base-10 function parse in the dataplane copy — both latent on
+  this host (single domain, max function 7), verified rather than assumed.
+  Fixed the #6199 fixture vacuity: all rows were slot 0, where the ARI `slot<<3`
+  term is identically zero.
+- **File(s)**: pkg/netname/netname.go (new), pkg/netname/README.md (new),
+  pkg/netname/netname_7426_test.go (new),
+  pkg/netname/pci_function_suffix_4795_test.go (moved from pkg/dataplane),
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
+  pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md
+
+## 2026-08-22 — #6668 display-set container bracket round-trip
+- **Timestamp**: 2026-08-22
+- **Action**: Carry authored `[ ... ]` bracket grouping through `display set`
+  render and flat replay so a bracket authored at a CONTAINER position survives
+  the round trip; fixes the `load merge <hierarchical-file>` ingest corruption
+  and the two Reject→Accept commit-gate laundering cases.
+- **File(s)**: pkg/config/lexer.go, pkg/config/parser.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/ast_format.go, pkg/config/inactive.go,
+  pkg/configstore/store_command.go,
+  pkg/config/formatset_container_bracket_6668_test.go,
+  pkg/configstore/loadmerge_bracket_container_6668_test.go,
+  pkg/config/dual_ast_differential_test.go,
+  pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+  docs/config-schema.md, docs/host-inbound-service-matrix.md

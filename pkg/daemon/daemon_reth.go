@@ -14,6 +14,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"github.com/psaab/xpf/pkg/netname"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -92,7 +93,11 @@ var altNameCandidatesFn = func(ifName string) []string {
 // A MAC-based name (enx…) is deliberately NOT accepted: it is last in the
 // default policy and is not a name udev assigns unless the others are
 // unavailable.
-var altNamePrefixOrder = []string{"eno", "ens", "enp", "eth"}
+// #7426: an ALIAS of the shared order, not a second copy. Keeping a
+// separate literal here would leave derive_kernel_name_6677_test.go
+// pinning a variable production no longer reads — a test that still
+// passes while guarding nothing.
+var altNamePrefixOrder = netname.NamePolicyPrefixOrder
 
 // kernelNameFromAltNames returns the predictable name udev would assign, taken
 // from the interface's kernel alternative names (#6677).
@@ -118,15 +123,10 @@ var altNamePrefixOrder = []string{"eno", "ens", "enp", "eth"}
 // recovered. ensureRethLinkOriginalName has used the same mechanism in
 // production since before this change.
 func kernelNameFromAltNames(ifName string) string {
-	alts := altNameCandidatesFn(ifName)
-	for _, want := range altNamePrefixOrder {
-		for _, alt := range alts {
-			if strings.HasPrefix(alt, want) {
-				return alt
-			}
-		}
-	}
-	return ""
+	// #7426: the NamePolicy ordering lives in pkg/netname, shared with the
+	// dataplane compile path, which previously took whichever altname the
+	// kernel listed first.
+	return netname.FromAltNames(altNameCandidatesFn(ifName))
 }
 
 // deriveKernelName returns the predictable kernel name (e.g. enp8s0) for an
@@ -192,39 +192,19 @@ func pciAddrFromPath(path string) string {
 // sysfs address fields as hex and prints them decimal, so parse hex / render
 // decimal for every component (domain, bus, slot, func) to match.
 func pciAddrToEnp(pciAddr string) string {
-	parts := strings.SplitN(pciAddr, ":", 3)
-	if len(parts) != 3 {
-		return ""
-	}
-	domain, err := strconv.ParseUint(parts[0], 16, 32)
-	if err != nil {
-		return ""
-	}
-	bus, err := strconv.ParseUint(parts[1], 16, 16)
-	if err != nil {
-		return ""
-	}
-	sf := strings.SplitN(parts[2], ".", 2)
-	if len(sf) != 2 {
-		return ""
-	}
-	slot, err := strconv.ParseUint(sf[0], 16, 16)
-	if err != nil {
-		return ""
-	}
-	fn, err := strconv.ParseUint(sf[1], 16, 8)
-	if err != nil {
-		return ""
-	}
-	name := "en"
-	if domain > 0 {
-		name += fmt.Sprintf("P%d", domain)
-	}
-	name += fmt.Sprintf("p%ds%d", bus, slot)
-	if fn > 0 {
-		name += fmt.Sprintf("f%d", fn)
-	}
-	return name
+	// #7426: single-sourced onto pkg/netname, shared with the dataplane
+	// compile path. This copy had the domain segment and the hex function
+	// parse but tested `fn > 0`, so it NEVER emitted the `f0` suffix — an
+	// UNDER-emission bug, the mirror image of the OVER-emission #4795 fixed in
+	// the dataplane copy. Measured on the ARI development host: 0000:b7:00.0
+	// is multifunction (PCI_HEADER_TYPE 0x80) and its real ID_NET_NAME_PATH is
+	// enp183s0f0np0, while this derivation produced enp183s0.
+	//
+	// `OriginalName=` is the only stable match for a RETH member — its MAC
+	// alternates between physical at boot and virtual once the daemon programs
+	// the RETH virtual MAC — so a wrong name here is not self-correcting at the
+	// next boot.
+	return netname.FromPCIAddr(pciAddr, netname.Multifunction(pciAddr))
 }
 
 // rethLinkOps groups the netlink primitives that renameRethMember and

@@ -172,8 +172,34 @@ func (t *ConfigTree) FormatPath(path []string) string {
 // FormatSet renders the tree as flat "set" commands.
 func (t *ConfigTree) FormatSet() string {
 	var b strings.Builder
-	formatSetNodes(&b, t.Children, nil, nil)
+	formatSetNodes(&b, t.Children, nil, nil, nil)
 	return b.String()
+}
+
+// nodeKeyBracketMask returns the per-key BRACKET mask for one node's
+// contribution to a flat `set` line (#6668): key i is emitted inside
+// `[ ... ]` when the operator AUTHORED it inside a bracket list and the node
+// is a CONTAINER.
+//
+// Provenance, not inference. The alternative — bracketing whenever a node
+// carries more keys than its schema arity — also catches the PACKED-statement
+// family (`scheduler-maps edge-map forwarding-class best-effort { ... }`,
+// `unit 0 shaping-rate 10g { ... }`), which is a different defect class
+// (#6588/#6665/#6672) whose flat replay already reconstructs an equivalent
+// config. Bracketing those would churn `show | display set` for every deployed
+// CoS config to say something the replay did not need to be told. Measured:
+// that rule moved 4 lines of the class-of-service dual-AST fixture and 0 lines
+// of the case this exists to fix.
+//
+// A LEAF is never bracketed: SetPath's trailing-value absorber already
+// collapses a leaf's whole tail onto one node (the #2419 contract), so every
+// bracketed VALUE list round-trips clean without a delimiter — and emitting one
+// would rewrite every `source-address [ a b c ]` line in the tree.
+func nodeKeyBracketMask(n *Node) []bool {
+	if n == nil || n.IsLeaf || len(n.KeysBracketed) != len(n.Keys) {
+		return nil
+	}
+	return n.KeysBracketed
 }
 
 // FormatPathSet renders a subtree as flat "set" commands.
@@ -203,14 +229,14 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 		// The ancestor prefix is reconstructed from the REQUESTED path, not
 		// walked, so no node is available to source its quote provenance from;
 		// only the matched node's own keys carry a mask (#6673).
-		prefix, prefixQuote := appendNodeKeys(parentPrefix, nil, n)
+		prefix, prefixQuote, prefixGroup := appendNodeKeysGrouped(parentPrefix, nil, nil, n)
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "set %s\n", joinQuotedKeysProv(prefix, prefixQuote))
+			fmt.Fprintf(&b, "set %s\n", joinKeysProvGrouped(prefix, prefixQuote, prefixGroup))
 		} else {
-			formatSetNodes(&b, n.Children, prefix, prefixQuote)
+			formatSetNodes(&b, n.Children, prefix, prefixQuote, prefixGroup)
 		}
 		if n.Inactive {
-			fmt.Fprintf(&b, "deactivate %s\n", joinQuotedKeysProv(prefix, prefixQuote))
+			fmt.Fprintf(&b, "deactivate %s\n", joinKeysProvGrouped(prefix, prefixQuote, prefixGroup))
 		}
 	}
 	return b.String()
@@ -222,16 +248,16 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 // models deactivation as the separate `deactivate` verb rather than an
 // inline token. Loading such output replays the `set` then the
 // `deactivate`, restoring the Inactive flag.
-func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string, prefixQuote []bool) {
+func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string, prefixQuote, prefixGroup []bool) {
 	for _, n := range canonicalOrder(nodes) {
-		path, pathQuote := appendNodeKeys(prefix, prefixQuote, n)
+		path, pathQuote, pathGroup := appendNodeKeysGrouped(prefix, prefixQuote, prefixGroup, n)
 		if n.IsLeaf {
-			fmt.Fprintf(b, "set %s\n", joinQuotedKeysProv(path, pathQuote))
+			fmt.Fprintf(b, "set %s\n", joinKeysProvGrouped(path, pathQuote, pathGroup))
 		} else {
-			formatSetNodes(b, n.Children, path, pathQuote)
+			formatSetNodes(b, n.Children, path, pathQuote, pathGroup)
 		}
 		if n.Inactive {
-			fmt.Fprintf(b, "deactivate %s\n", joinQuotedKeysProv(path, pathQuote))
+			fmt.Fprintf(b, "deactivate %s\n", joinKeysProvGrouped(path, pathQuote, pathGroup))
 		}
 	}
 }
@@ -295,13 +321,70 @@ func joinQuotedKeysProv(keys []string, forceQuote []bool) string {
 // forceQuote is normalized to len(path) first so a caller may pass nil (or a
 // stale short mask) without silently shifting every subsequent key's flag.
 func appendNodeKeys(path []string, forceQuote []bool, n *Node) ([]string, []bool) {
+	p, q, _ := appendNodeKeysGrouped(path, forceQuote, nil, n)
+	return p, q
+}
+
+// appendNodeKeysGrouped is appendNodeKeys plus the parallel BRACKET-GROUP mask
+// (#6668), taken from the node's authored bracket provenance.
+func appendNodeKeysGrouped(path []string, forceQuote, group []bool, n *Node) ([]string, []bool, []bool) {
 	outPath := append(append([]string(nil), path...), n.Keys...)
 	outQuote := make([]bool, len(path), len(outPath))
 	copy(outQuote, forceQuote)
+	outGroup := make([]bool, len(path), len(outPath))
+	copy(outGroup, group)
+	bracket := nodeKeyBracketMask(n)
 	for i := range n.Keys {
 		outQuote = append(outQuote, n.KeyQuoted(i))
+		outGroup = append(outGroup, i < len(bracket) && bracket[i])
 	}
-	return outPath, outQuote
+	return outPath, outQuote, outGroup
+}
+
+// joinKeysProvGrouped is joinQuotedKeysProv plus BRACKET GROUPS (#6668): a
+// maximal run of group[i] spanning more than one key is wrapped in `[ ... ]`,
+// which is the only way the flat-set language can say where a CONTAINER node's
+// key list ends. A one-key run is emitted bare — a single token needs no
+// delimiter and bracketing it would churn output for no information.
+func joinKeysProvGrouped(keys []string, forceQuote, group []bool) string {
+	if len(group) != len(keys) {
+		return joinQuotedKeysProv(keys, forceQuote)
+	}
+	parts := make([]string, 0, len(keys)+4)
+	for i := 0; i < len(keys); {
+		if !group[i] {
+			parts = append(parts, quoteKeyProv(keys, forceQuote, i))
+			i++
+			continue
+		}
+		run := 0
+		for i+run < len(keys) && group[i+run] {
+			run++
+		}
+		if run < 2 {
+			parts = append(parts, quoteKeyProv(keys, forceQuote, i))
+			i++
+			continue
+		}
+		parts = append(parts, "[")
+		for j := i; j < i+run; j++ {
+			parts = append(parts, quoteKeyProv(keys, forceQuote, j))
+		}
+		parts = append(parts, "]")
+		i += run
+	}
+	return strings.Join(parts, " ")
+}
+
+// quoteKeyProv renders keys[i] with the same authored-quote rule
+// joinQuotedKeysProv applies, including its terminal-key suppression (#6673
+// r11 B1): the LAST token of a line decides no grouping, so its authored quote
+// is dropped, while every earlier token keeps the bit the next parse needs.
+func quoteKeyProv(keys []string, forceQuote []bool, i int) string {
+	if i < len(keys)-1 && i < len(forceQuote) && forceQuote[i] {
+		return `"` + keyEscaper.Replace(keys[i]) + `"`
+	}
+	return quoteKey(keys[i])
 }
 
 // FormatCompare produces a Junos-style hierarchical diff between two trees.

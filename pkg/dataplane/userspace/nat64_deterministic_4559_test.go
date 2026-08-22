@@ -95,7 +95,7 @@ func TestNAT64SnapshotDeterministicV6Slash32_4559(t *testing.T) {
 func TestDeterministicNAT64V6FieldsGuards(t *testing.T) {
 	mk := func(host string, block int) *config.NATPool {
 		return &config.NATPool{
-			Name:        "p64",
+			Name:          "p64",
 			Deterministic: &config.DeterministicNATConfig{BlockSize: block, HostAddress: host},
 		}
 	}

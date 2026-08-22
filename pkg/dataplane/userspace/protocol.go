@@ -102,7 +102,7 @@ const (
 	// from ensureRequiredSnapshotProtocolLocked. The per-branch prose above
 	// still says "4 -> 5" and "moved to 6"; those describe each branch's own
 	// history, not this constant's current value.
-	ProtocolVersion                  = 8
+	ProtocolVersion = 8
 
 	// MinProtocolMultiZoneScopedPolicy is the FIRST snapshot protocol version
 	// that can represent a multi-zone scoped global policy — the plural
