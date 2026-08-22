@@ -21,6 +21,24 @@ locating any symbol below is now a matter of opening the named file.
   `buildHeartbeat`, `handlePeerHeartbeat`, `handlePeerTimeout`,
   `handlePeerNeverSeen`, `HeartbeatStats`,
   `vrfListenConfig` — `heartbeat_manager.go`.
+
+  **Start/stop lifecycle tenure (#7257).** `StartHeartbeat` publishes
+  `hbSender`/`hbReceiver` and *starts* them in ONE critical section, and refuses
+  to publish at all if a `StopHeartbeat` overtook it while its sockets were
+  being created. `Manager.hbEpoch` is the tenure counter: `StopHeartbeat` bumps
+  it under `mu`; `StartHeartbeat` captures it **after** its own #4033 idempotent
+  teardown (capturing at entry would compare against a value the call had itself
+  invalidated) and re-checks it under the publish lock, returning
+  `ErrHeartbeatStartSuperseded` if it moved. Callers must treat that sentinel as
+  terminal, not as a bind failure — retrying would resurrect a heartbeat the
+  teardown exists to remove; `startHeartbeatWithRetry` does.
+
+  This is the same shape `publishSessionSyncIfCurrent` uses for the session-sync
+  constructor, and for the same reason: the daemon's cluster-comms teardown
+  cancels a context and joins exactly one goroutine (`clusterCommsWG`), so every
+  OTHER comms-scoped goroutine that publishes shared state needs a generation
+  gate of its own. The heartbeat retry loop runs on a bare `go` and is not in
+  that WaitGroup.
 - `HeartbeatPacket`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, the #4107 control-channel auth
   (`MarshalHeartbeatAuth`, `marshalHeartbeatAuthEpoch`,

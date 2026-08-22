@@ -1086,6 +1086,17 @@ func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peer
 			continue
 		}
 		if err := d.cluster.StartHeartbeat(localIP, peerAddr, vrfDevice); err != nil {
+			// #7257: a start the teardown superseded is terminal, not a bind
+			// failure. Retrying would race the same teardown again and, on
+			// success, resurrect the heartbeat stopClusterComms exists to
+			// remove. The ctx.Err() check at the top of the next iteration
+			// would catch it too — stopClusterComms cancels before it calls
+			// StopHeartbeat — but returning on the verdict we were actually
+			// given beats relying on a second signal to arrive in time.
+			if errors.Is(err, cluster.ErrHeartbeatStartSuperseded) {
+				slog.Info("cluster: heartbeat start superseded by comms teardown, not retrying")
+				return
+			}
 			if i < 5 {
 				slog.Info("cluster: heartbeat bind not ready, retrying",
 					"err", err, "attempt", i+1)
