@@ -1875,6 +1875,12 @@ func ValidateConfig(cfg *Config) []string {
 	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
 	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
 
+	// #6544: 802.3ad link aggregation is schema-advertised and commits
+	// clean while being entirely inert. Accepted-only advisory so the
+	// operator is not told the aggregate exists by three layers at once
+	// and handed nothing.
+	warnings = append(warnings, validateLinkAggregationWarnings(cfg)...)
+
 	// #4788 + #4785 half 1: `tunnel mode ipip` is now HARD-REJECTED at commit
 	// (validateIpipTunnelUnimplementedStrict, compiler_tailgates.go), but the
 	// advisory MUST stay registered here. The alarm surfaces — `show system

@@ -100875,3 +100875,18 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_chassis_rg_id_canonical_6543_test.go (new),
   pkg/cluster/rg_id_canonical_6543_test.go (new), docs/config-schema.md,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-21 — #6544: LAG (ae/802.3ad) accepted-only advisory + doc correction
+- **Timestamp**: 2026-08-21
+- **Action**: `ae` / `802.3ad` is schema-advertised, commits with ZERO warnings,
+  and is inert — `AggregatedEtherOpts` / `LAGParent` compile and nothing reads
+  them; measured `buildFabricBondModels` produces ZERO models for a full LAG
+  config, so no `.netdev`, no `Bond=` member, no bond device, no LACP,
+  `minimum-links` unhonoured. Added `validateLinkAggregationWarnings` (the
+  #2078/#4231/#5804 accepted-only doctrine) and corrected the two docs that
+  claimed LAG was Done (`docs/feature-gaps.md` x2, `docs/phases.md`), pointing
+  the remaining feature work at the `docs/vsrx-gaps.md` parity row.
+- **File(s)**: pkg/config/compiler_validate_warn_routing.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_warn_lag_6544_test.go (new),
+  docs/feature-gaps.md, docs/phases.md, docs/vsrx-gaps.md, _Log.md
