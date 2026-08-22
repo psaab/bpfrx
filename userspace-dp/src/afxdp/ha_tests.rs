@@ -950,9 +950,9 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
     // all fan-out).
     {
         let pending = commands.lock().expect("commands");
-        let rejected_enqueued = pending.iter().any(|cmd| {
-            matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == rejected_key)
-        });
+        let rejected_enqueued = pending.iter().any(
+            |cmd| matches!(cmd, WorkerCommand::UpsertSynced(entry) if entry.key == rejected_key),
+        );
         assert!(
             !rejected_enqueued,
             "a rejected over-ceiling synced import must not be fanned out to \
@@ -1174,10 +1174,7 @@ fn delete_synced_session_gen_refuses_stale_generation() {
         synced_generation(&coordinator, &key).is_some(),
         "stale-generation delete wrongly removed the live entry"
     );
-    assert_eq!(
-        coordinator.session_delete_stale_ignored_total(),
-        before + 1
-    );
+    assert_eq!(coordinator.session_delete_stale_ignored_total(), before + 1);
 
     // Equal-generation delete (gen=2) — applies. This is the positive control:
     // without it the test accepts a guard that refuses EVERY generation-aware
@@ -1606,7 +1603,10 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
         let pending = commands.lock().expect("commands");
         assert_eq!(pending.len(), 1, "exactly one export command enqueued");
         match pending.front().expect("front") {
-            WorkerCommand::ExportOwnerRGSessions { sequence, owner_rgs } => {
+            WorkerCommand::ExportOwnerRGSessions {
+                sequence,
+                owner_rgs,
+            } => {
                 assert_eq!(*sequence, 1, "first export bumps the sequence to 1");
                 assert_eq!(owner_rgs, &vec![1, 2], "owner-RG set propagated verbatim");
             }
@@ -1617,7 +1617,9 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
     // No real bindings, so the drain yields an empty set once the worker acks.
     ack.store(1, Ordering::Release);
     assert!(
-        wait.wait_and_collect().expect("export after ack").is_empty(),
+        wait.wait_and_collect()
+            .expect("export after ack")
+            .is_empty(),
         "no bindings means no deltas to drain"
     );
 }
@@ -1718,7 +1720,10 @@ fn purge_remapped_tunnel_sessions_no_drop_on_lossless_success() {
 
     let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
 
-    assert_eq!(purged, 1, "the local session is purged and the count is correct");
+    assert_eq!(
+        purged, 1,
+        "the local session is purged and the count is correct"
+    );
     assert!(
         coordinator
             .sessions
@@ -1764,7 +1769,11 @@ fn drain_session_deltas_from_live_is_fair_across_bindings() {
         .collect();
 
     let (drained, cursor) = drain_session_deltas_from_live(&live, 30, 0); // quantum 10
-    assert_eq!(drained.len(), 30, "capped export returns exactly the budget");
+    assert_eq!(
+        drained.len(),
+        30,
+        "capped export returns exactly the budget"
+    );
     // Cursor wrapped back to 0 after serving all three (10 each).
     assert_eq!(cursor % 3, 0, "cursor rotated through every binding");
 
@@ -1776,4 +1785,342 @@ fn drain_session_deltas_from_live_is_fair_across_bindings() {
              leaving 30 — a whole-budget-first export would not"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #6652 / #6653 / #6654 — non-recovering locks on the shared-session surfaces.
+//
+// The module policy is to RECOVER from poison: `lock_shared_recover` keeps the
+// committed map, clears the poison, counts and logs. Publish, lookup, remove
+// and prewarm all follow it. Six production sites did not, and each applied
+// the opposite policy in its own way:
+//
+//   coordinator/mod.rs  snapshot_shared_session_entries  -> empty vec  (#6652)
+//   coordinator/mod.rs  teardown clears x3               -> skip       (#6653)
+//   types/mod.rs        owner-RG index clears x4         -> skip       (#6653)
+//   ha/export.rs        bulk export                      -> refuse     (#6654)
+//   ha/tunnel_purge.rs  #1873 R-D remap purge            -> return 0   (sweep)
+//   ha/state.rs         RG-activation log line           -> report 0   (sweep)
+//
+// The last two are NOT named by any of the three issues. They were found by
+// sweeping the PREDICATE ("every production access to a shared-session surface
+// recovers") rather than the three cited call sites, and the tunnel-purge one
+// is arguably the most severe of the six: on poison the #1873 R-D purge
+// silently does nothing, leaving a live session to re-resolve a remapped
+// tunnel_endpoint_id into the WRONG tunnel.
+//
+// What makes these bugs rather than style is the NONDETERMINISM. Every
+// recovering path CLEARS the poison, so the poisoned window closes the instant
+// any of them runs. Whether a reconcile preserved state, a teardown left a
+// surface populated, or an export was refused therefore depended on which
+// thread happened to lock first.
+
+// poison_mutex poisons any shared mutex the same way poison_shared_synced does
+// — a scoped thread panics while holding it, and join() contains the panic —
+// so the teardown probe can poison the sibling maps and the owner-RG indexes,
+// not just `synced`.
+fn poison_mutex<T: Send + 'static>(m: &Arc<Mutex<T>>) {
+    let to_poison = m.clone();
+    let poisoner = std::thread::spawn(move || {
+        let _guard = to_poison.lock().expect("lock before poisoning");
+        panic!("poison shared mutex");
+    })
+    .join();
+    assert!(poisoner.is_err(), "poisoning thread must panic");
+    assert!(m.lock().is_err(), "mutex must be poisoned");
+}
+
+// #6652: the reconcile snapshot read `.lock().map(..).unwrap_or_default()`, so
+// a poisoned mutex yielded an EMPTY vector that the reconcile path then
+// preserved as "the sessions to bring back". stop_inner(false) replaced the
+// workers and bring-up replayed nothing, while the shared map still held them.
+//
+// RED-on-revert: restore
+//   self.sessions.synced.lock().map(|s| s.values().cloned().collect()).unwrap_or_default()
+// in snapshot_shared_session_entries and this reads 0 entries.
+#[test]
+fn reconcile_snapshot_replays_sessions_on_poisoned_shared_mutex_6652() {
+    let coordinator = Coordinator::new();
+    coordinator.upsert_synced_session(synced_entry_with_generation(1));
+
+    let committed = coordinator.snapshot_shared_session_entries().len();
+    assert!(
+        committed > 0,
+        "fixture broken: nothing committed to the shared map, so a poisoned \
+         read returning 0 would be indistinguishable from a correct one"
+    );
+
+    poison_shared_synced(&coordinator);
+
+    let snapshot = coordinator.snapshot_shared_session_entries();
+    assert_eq!(
+        snapshot.len(),
+        committed,
+        "a poisoned shared mutex made the reconcile snapshot yield ZERO sessions \
+         to replay. The map still holds them, so bring-up would rebuild the worker \
+         tables empty and silently lose every synced session across a reconcile \
+         that crossed a contained worker panic (#6652)"
+    );
+}
+
+// #6653: teardown skipped a poisoned surface, so it left some maps/indexes
+// full and others empty. The asymmetry is what makes it worse than a leak:
+// teardown is supposed to leave EVERY surface empty, and poison made it leave
+// them inconsistently empty — a state no later code is written to expect. On
+// the next start lookups resolve stale sessions, and the survivors still count
+// toward the #5674 aggregate admission ceiling, refusing legitimate imports.
+//
+// Every surface is poisoned, so the probe cannot pass by having recovered only
+// the one the fixture happened to touch first.
+//
+// RED-on-revert: restore any `if let Ok(mut x) = <surface>.lock() { x.clear() }`
+// in stop_inner or SharedSessionOwnerRgIndexes::clear and that surface is named.
+#[test]
+fn full_teardown_clears_every_shared_surface_on_poisoned_mutexes_6653() {
+    let mut coordinator = Coordinator::new();
+    let key = test_key();
+    let entry = synced_entry_with_generation(1);
+
+    // Seed all three maps and all four indexes DIRECTLY rather than through an
+    // install API: the property under test is teardown's, and routing through
+    // whichever API happens to populate which surface would make the coverage
+    // depend on that API rather than on teardown.
+    for map in [
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+    ] {
+        map.lock()
+            .expect("seed map")
+            .insert(key.clone(), entry.clone());
+    }
+    let indexes = &coordinator.sessions.owner_rg_indexes;
+    for index in [
+        &indexes.sessions,
+        &indexes.nat_sessions,
+        &indexes.forward_wire_sessions,
+        &indexes.reverse_prewarm_sessions,
+    ] {
+        index
+            .lock()
+            .expect("seed index")
+            .entry(1)
+            .or_default()
+            .insert(key.clone());
+    }
+
+    poison_mutex(&coordinator.sessions.synced);
+    poison_mutex(&coordinator.sessions.nat);
+    poison_mutex(&coordinator.sessions.forward_wire);
+    poison_mutex(&indexes.sessions);
+    poison_mutex(&indexes.nat_sessions);
+    poison_mutex(&indexes.forward_wire_sessions);
+    poison_mutex(&indexes.reverse_prewarm_sessions);
+
+    coordinator.stop_inner(true);
+
+    let indexes = &coordinator.sessions.owner_rg_indexes;
+    for (name, len) in [
+        (
+            "sessions.synced",
+            recovered_len(&coordinator.sessions.synced),
+        ),
+        ("sessions.nat", recovered_len(&coordinator.sessions.nat)),
+        (
+            "sessions.forward_wire",
+            recovered_len(&coordinator.sessions.forward_wire),
+        ),
+        (
+            "owner_rg_indexes.sessions",
+            recovered_len(&indexes.sessions),
+        ),
+        (
+            "owner_rg_indexes.nat_sessions",
+            recovered_len(&indexes.nat_sessions),
+        ),
+        (
+            "owner_rg_indexes.forward_wire_sessions",
+            recovered_len(&indexes.forward_wire_sessions),
+        ),
+        (
+            "owner_rg_indexes.reverse_prewarm_sessions",
+            recovered_len(&indexes.reverse_prewarm_sessions),
+        ),
+    ] {
+        assert_eq!(
+            len, 0,
+            "full teardown left {name} populated because its mutex was poisoned. \
+             Teardown must empty EVERY shared surface — a poisoned one that \
+             survives leaves the maps and the indexes that mirror them torn \
+             apart, so the next start resolves stale sessions and they consume \
+             the #5674 admission ceiling (#6653)"
+        );
+    }
+}
+
+// recovered_len reads a length WITHOUT expect() so a still-poisoned mutex
+// yields a clean assertion failure rather than panicking inside the reader.
+fn recovered_len<K, V>(m: &Arc<Mutex<FastMap<K, V>>>) -> usize {
+    m.lock().unwrap_or_else(|p| p.into_inner()).len()
+}
+
+// #6654: bulk export returned Err("shared sessions lock poisoned") instead of
+// recovering, so the refusal fired purely on interleaving. End-to-end loss was
+// bounded (pkg/daemon/daemon_ha_sync.go falls back to the authoritative
+// BulkSync), which is why it is the nondeterministic refusal itself that is
+// the defect, not a loss of sync.
+//
+// RED-on-revert: restore `.lock().map_err(|_| "shared sessions lock poisoned")`
+// in snapshot_all_sessions_export and this gets that Err back.
+#[test]
+fn bulk_export_succeeds_on_poisoned_shared_mutex_6654() {
+    let mut coordinator = Coordinator::new();
+    coordinator.upsert_synced_session(synced_entry_with_generation(1));
+
+    // An event stream must exist or the export short-circuits on "event stream
+    // not started" BEFORE reaching the lock — the fixture would then pass
+    // against the unfixed code for the wrong reason.
+    let (sender, _rx) = crate::event_stream::EventStreamSender::test_sender(false, 16);
+    coordinator.event_stream = Some(sender);
+    assert!(
+        coordinator.snapshot_all_sessions_export().is_ok(),
+        "fixture broken: the export already fails before the poisoned lock is reached"
+    );
+
+    poison_shared_synced(&coordinator);
+
+    match coordinator.snapshot_all_sessions_export() {
+        Ok(_) => {}
+        Err(e) => panic!(
+            "bulk session export REFUSED on a poisoned shared mutex: {e}. Every \
+             other shared-session path clears the poison, so this refusal fires \
+             or does not fire purely on which thread locked first — a guard whose \
+             firing depends on scheduling is not a guard (#6654)"
+        ),
+    }
+}
+
+// Sweep extra, not named by #6652/#6653/#6654: the #1873 R-D remap purge bailed
+// with `return 0` on a poisoned mutex. That purge is what stops a live session
+// re-resolving a remapped tunnel_endpoint_id into the WRONG tunnel
+// (cross-tunnel encap) or dead-ending on the R-C gate, so silently doing
+// nothing is the most consequential of the six sites.
+//
+// RED-on-revert: restore `let Ok(sessions) = self.sessions.synced.lock() else
+// { return 0; };` in purge_remapped_tunnel_sessions and this purges 0.
+#[test]
+fn tunnel_remap_purge_still_purges_on_poisoned_shared_mutex_6653_sweep() {
+    let (mut coordinator, key) = coordinator_with_tunnel_session(7);
+    let (sender, _rx) = crate::event_stream::EventStreamSender::test_sender(false, 16);
+    coordinator.event_stream = Some(sender);
+
+    poison_shared_synced(&coordinator);
+
+    let purged = coordinator.purge_remapped_tunnel_sessions(&[7]);
+    assert_eq!(
+        purged, 1,
+        "the #1873 R-D remapped-tunnel purge silently did NOTHING on a poisoned \
+         shared mutex, leaving the session to re-resolve its stale \
+         tunnel_endpoint_id into the wrong tunnel"
+    );
+    assert!(
+        coordinator
+            .sessions
+            .synced
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .is_none(),
+        "the purged session is still in the shared map"
+    );
+}
+
+// The armed tripwire, and the part of this change that survives it.
+//
+// Six sites drifted from the module's poison policy across five separate
+// issues (#2402, #1807, #6643, and the three fixed here), which says the
+// policy was carried by convention and convention lost. This asserts the
+// PREDICATE directly: no production file under src/afxdp/ may take a
+// shared-session surface with a bare `.lock()`.
+//
+// It is deliberately narrow. The needles are the exact field paths of the
+// three maps and the four owner-RG indexes, so it cannot red on unrelated
+// mutexes — the failure mode that got an AST-shaped guard rejected in #7294.
+// It is also WRAP-INSENSITIVE: whitespace is collapsed before searching,
+// because the #6652 site was spelled across four lines
+// (`self\n.sessions\n.synced\n.lock()`) and a line-oriented grep would have
+// walked straight past the very bug this file exists for.
+#[test]
+fn every_shared_session_lock_in_production_recovers_from_poison_6653() {
+    use std::path::Path;
+
+    // Exact spellings of a bare lock on a shared-session surface.
+    const NEEDLES: &[&str] = &[
+        "sessions.synced.lock()",
+        "sessions.nat.lock()",
+        "sessions.forward_wire.lock()",
+        ".nat_sessions.lock()",
+        ".forward_wire_sessions.lock()",
+        ".reverse_prewarm_sessions.lock()",
+    ];
+
+    fn is_test_file(name: &str) -> bool {
+        name.contains("test")
+    }
+
+    fn walk(dir: &Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name != "tests" {
+                    walk(&path, out);
+                }
+                continue;
+            }
+            if !name.ends_with(".rs") || is_test_file(&name) {
+                continue;
+            }
+            // shared_ops.rs OWNS the policy: lock_shared_recover and
+            // lock_shared_publish are where a raw lock is the implementation.
+            if name == "shared_ops.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read file");
+            out.push((path.display().to_string(), src));
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/afxdp");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(
+        files.len() > 20,
+        "scanned only {} production files under src/afxdp — the walk is \
+         vacuous, so a green here proves nothing",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    for (path, src) in &files {
+        // Collapse ALL whitespace so a call broken across lines by rustfmt is
+        // still one contiguous string.
+        let flat: String = src.split_whitespace().collect::<Vec<_>>().join("");
+        for needle in NEEDLES {
+            let flat_needle: String = needle.split_whitespace().collect::<Vec<_>>().join("");
+            if flat.contains(&flat_needle) {
+                offenders.push(format!("{path}: {needle}"));
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "non-recovering lock on a shared-session surface in production code:\n  {}\n\
+         Use lock_shared_recover: every other shared-session path CLEARS the \
+         poison, so a bare lock here fires or does not fire purely on which \
+         thread locked first (#6652/#6653/#6654).",
+        offenders.join("\n  ")
+    );
 }

@@ -22,9 +22,14 @@ impl crate::afxdp::Coordinator {
         let mut keys = Vec::new();
         let mut deltas = Vec::new();
         {
-            let Ok(sessions) = self.sessions.synced.lock() else {
-                return 0;
-            };
+            // #6653 sweep: RECOVERING lock. `let Ok(..) else { return 0 }`
+            // made the #1873 R-D purge SILENTLY DO NOTHING on a poisoned
+            // mutex -- and this purge is what stops a live session
+            // re-resolving a remapped tunnel_endpoint_id into the WRONG
+            // tunnel (cross-tunnel encap) or dead-ending on the R-C gate.
+            // Not named by #6652/#6653/#6654; found by sweeping the predicate
+            // rather than the three cited sites.
+            let sessions = crate::afxdp::shared_ops::lock_shared_recover(&self.sessions.synced);
             for entry in sessions.values() {
                 let id = entry.decision.resolution.tunnel_endpoint_id;
                 if id == 0 || !purge_ids.contains(&id) {

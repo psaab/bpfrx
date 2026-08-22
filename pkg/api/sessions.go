@@ -471,7 +471,9 @@ func (s *Server) writeSessionList(w http.ResponseWriter, r *http.Request, resp S
 	resp.NodeID = s.nodeID()
 	if includePeer, _ := sessionIncludePeer(r); includePeer && sessionFirstPage(r) {
 		if svc := s.clusterSession(); svc != nil {
-			if pr, err := svc.GetSessions(r.Context(), peerSessionsRequest(r)); err == nil {
+			// #5968: PeerSessions, not GetSessions — the local list is already
+			// built above and the delegate's own local walk was thrown away.
+			if pr, err := svc.PeerSessions(r.Context(), peerSessionsRequest(r)); err == nil {
 				if peer := pr.GetPeer(); peer != nil {
 					resp.Peer = sessionListFromPB(peer)
 				}
@@ -745,7 +747,10 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	// standalone node rather than silently leaving Peer nil.
 	if includePeer {
 		if svc := s.clusterSession(); svc != nil {
-			pr, err := svc.GetSessionSummary(r.Context(), &pb.GetSessionSummaryRequest{IncludePeer: true})
+			// #5968: PeerSessionSummary, not GetSessionSummary — the local
+			// summary is already computed above and the delegate's own local
+			// walk was discarded.
+			pr, err := svc.PeerSessionSummary(r.Context())
 			if err != nil {
 				summary.PeerStatus = "unreachable"
 				summary.PeerError = err.Error()
@@ -987,7 +992,10 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 	// first-page gate.
 	if includePeer {
 		if svc := s.clusterSession(); svc != nil {
-			pr, err := svc.GetZonePairSummary(r.Context(), &pb.GetZonePairSummaryRequest{IncludePeer: true})
+			// #5968: PeerZonePairSummary, not GetZonePairSummary — the local
+			// breakdown is already computed above and the delegate's own local
+			// walk was discarded.
+			pr, err := svc.PeerZonePairSummary(r.Context())
 			if err != nil {
 				// #5320: a failed local RPC still leaves the breakdown
 				// incomplete — mark it unreachable rather than silently OK.

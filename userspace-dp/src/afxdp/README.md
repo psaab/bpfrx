@@ -1105,21 +1105,58 @@ by a test that poisons the mutex and asserts the guard still refuses —
 including the #5674 ceiling, which the pre-existing ceiling test could not
 cover because it runs on a healthy mutex.
 
-**Scope — this is not a module-wide guarantee.** What #5154 establishes is
-narrow: the three guard reads named above. Direct accesses to these maps
-OUTSIDE `shared_ops.rs` and `ha/session_import.rs` still swallow or refuse
-poison, so the shared-session surface as a whole does NOT yet recover
-uniformly. Known remaining sites, all pre-existing and filed separately:
+### The policy is now module-wide, and a tripwire holds it there (#6652/#6653/#6654)
+
+Until #6652/#6653/#6654 this section carried a table of "known remaining
+sites" and the caveat that the shared-session surface as a whole did NOT
+recover uniformly. That caveat is retired: every production access now goes
+through `lock_shared_recover`, and
+`every_shared_session_lock_in_production_recovers_from_poison_6653`
+(`ha_tests.rs`) asserts the predicate directly against the source tree.
+
+The six sites closed, and how each applied the OPPOSITE policy:
 
 | Site | Pattern | Consequence | Issue |
 |---|---|---|---|
 | `coordinator/mod.rs` `snapshot_shared_session_entries` | `.unwrap_or_default()` | a reconcile crossing a poisoned mutex replays ZERO sessions | #6652 |
-| `coordinator/mod.rs` teardown + `types/mod.rs` `SharedSessionOwnerRgIndexes::clear` | `if let Ok(..)` | teardown skips poisoned maps/indexes, leaving torn state that still consumes the #5674 ceiling | #6653 |
+| `coordinator/mod.rs` teardown x3 | `if let Ok(..)` — skips | poisoned maps survive teardown | #6653 |
+| `types/mod.rs` `SharedSessionOwnerRgIndexes::clear` x4 | `if let Ok(..)` — skips | poisoned indexes survive teardown, tearing them apart from the maps they mirror | #6653 |
 | `ha/export.rs` `snapshot_all_sessions_export` | `.map_err(..)` — refuses | the refusal fires by lock order, not by any property of the data | #6654 |
+| `ha/tunnel_purge.rs` `purge_remapped_tunnel_sessions` | `let Ok(..) else { return 0 }` | the #1873 R-D remap purge silently does NOTHING, so a live session re-resolves a remapped `tunnel_endpoint_id` into the WRONG tunnel | (sweep) |
+| `ha/state.rs` RG-activation log | `.map(len).unwrap_or(0)` | the activation line reports `shared_sessions=0` — the single most misleading number to get wrong in a failover post-mortem | (sweep) |
 
-Treat the section above as describing the policy `shared_ops.rs` and
-`ha/session_import.rs` implement, not a property every accessor of
-`sessions.synced` currently has.
+The last two were **not named by any of the three issues**. They were found
+by sweeping the PREDICATE rather than the cited call sites, and the
+tunnel-purge one is arguably the most consequential of the six.
+
+Two structural points worth keeping:
+
+- **The nondeterminism is the defect, not the swallowed value.** Every
+  recovering path CLEARS the poison, so the poisoned window closes the
+  instant any of publish / lookup / remove / prewarm runs. Whether a
+  reconcile preserved state, a teardown left a surface populated, or an
+  export was refused therefore depended on which thread happened to lock
+  first. A guard whose firing depends on scheduling is not a guard.
+- **Teardown's asymmetry was worse than a leak.** Teardown is supposed to
+  leave every surface empty; poison made it leave them INCONSISTENTLY
+  empty — entries present in one map, absent from its siblings and from
+  the indexes meant to mirror it. No later code is written to expect that,
+  so the next start resolves stale sessions AND the survivors still consume
+  the #5674 aggregate admission ceiling, refusing legitimate imports.
+
+Six sites drifted from this policy across five separate issues (#2402,
+#1807/#5154, and the three above), which is what says the policy was
+carried by convention and convention lost. The tripwire is deliberately
+narrow — it searches the exact field paths of the three maps and four
+indexes, so it cannot red on unrelated mutexes — and it is
+WRAP-INSENSITIVE, collapsing whitespace before matching, because the #6652
+site was spelled across four lines and a line-oriented grep would have
+walked straight past the very bug it exists for.
+
+The `state_writer.rs` / `slowpath.rs` `mode`-mutex status reads keep
+`.lock().map(..).unwrap_or_default()` deliberately, as before: they are not
+shared-session surfaces and a momentary default-mode status read is
+harmless.
 
 **Direction of the fix — recover the read, do not refuse the write.**
 Refusing to mutate on poison is not a coherent alternative here:

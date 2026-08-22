@@ -755,15 +755,16 @@ impl Coordinator {
             .warned_disconnect
             .store(false, Ordering::Relaxed);
         if clear_synced_state {
-            if let Ok(mut sessions) = self.sessions.synced.lock() {
-                sessions.clear();
-            }
-            if let Ok(mut nat_sessions) = self.sessions.nat.lock() {
-                nat_sessions.clear();
-            }
-            if let Ok(mut forward_wire_sessions) = self.sessions.forward_wire.lock() {
-                forward_wire_sessions.clear();
-            }
+            // #6653: RECOVERING locks. `if let Ok(..)` SKIPS a poisoned map,
+            // so a teardown crossing a contained worker panic left some
+            // surfaces full and others empty — a torn state no later code is
+            // written to expect. On the next start, lookups resolve stale
+            // sessions and the survivors still count toward the #5674
+            // aggregate admission ceiling, refusing legitimate imports. A
+            // teardown must leave every surface empty, poisoned or not.
+            lock_shared_recover(&self.sessions.synced).clear();
+            lock_shared_recover(&self.sessions.nat).clear();
+            lock_shared_recover(&self.sessions.forward_wire).clear();
             self.sessions.owner_rg_indexes.clear();
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
@@ -800,12 +801,21 @@ impl Coordinator {
         // teardown that is part of the same reconcile attempt.
     }
 
+    /// Snapshot the committed shared sessions so a reconcile can replay them
+    /// after the workers are replaced.
+    ///
+    /// #6652: RECOVERING lock. This was `.lock().map(..).unwrap_or_default()`,
+    /// so a poisoned mutex yielded an EMPTY vector — which the reconcile path
+    /// then preserved as "the sessions to bring back", replaying nothing while
+    /// the shared map still held them. Whether a reconcile preserved state
+    /// depended on which thread happened to lock first, because every other
+    /// shared-session path CLEARS the poison; that nondeterminism is the
+    /// defect, not merely the empty result.
     pub(crate) fn snapshot_shared_session_entries(&self) -> Vec<SyncedSessionEntry> {
-        self.sessions
-            .synced
-            .lock()
-            .map(|sessions| sessions.values().cloned().collect())
-            .unwrap_or_default()
+        lock_shared_recover(&self.sessions.synced)
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn replay_synced_sessions(
