@@ -20,13 +20,23 @@ package config
 // surface — the one place in this audit where the "give the renderer applied
 // state" instinct has real force, rather than the predicate being enough.
 //
-// Callers: buildMirrorSnapshots (pkg/dataplane/userspace/mirrors.go), and BOTH
-// duplicated show surfaces — cli.showPortMirroring and
-// Server.showForwardingOptionsPortMirroring. Those two are byte-identical
-// copies with no shared formatter; until they are single-sourced the way
-// pkg/natshow and pkg/dataplane/userspace/format already are, the agreement
-// test must assert BOTH of them, because fixing one copy leaves the other
-// lying.
+// Callers: buildMirrorSnapshots (pkg/dataplane/userspace/mirrors.go), and all
+// THREE show surfaces — cli.showPortMirroring,
+// Server.showForwardingOptionsPortMirroring, and cli.showForwardingOptions.
+//
+// This comment said TWO until #6534's closure, and the miscount was the bug:
+// the first two are byte-identical copies of each other and were annotated
+// together, while `show forwarding-options` in cli_show_routing.go — a third
+// copy with its own layout, printing MORE per-instance detail than the gRPC
+// command of the same name — was not, and kept rendering a dropped instance as
+// armed with the suite green. An enumeration in a comment is a claim about a
+// population nobody measured; pkg/showaudit measures it now
+// (TestSurfaceAnnotationCensusIsExact6534), so a fourth renderer cannot appear
+// unannotated and cannot make this sentence wrong again without a red test.
+//
+// Until these copies are single-sourced the way pkg/natshow and
+// pkg/dataplane/userspace/format already are, every one of them must consult
+// this predicate: annotating some leaves the rest lying.
 func PortMirroringInstanceExcludedReason(inst *PortMirrorInstance) string {
 	if inst == nil {
 		return ""
