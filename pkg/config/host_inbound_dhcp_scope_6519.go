@@ -41,10 +41,11 @@ var hostInboundDHCPExceptionServices = []string{"dhcp", "bootp"}
 // ref's own unit-level override (#3720, both are interface-level statements) —
 // and whether ref declares any interface-level stanza at all.
 //
-// It is the interface-level half of what InterfaceHostInboundEffective resolves,
-// exposed on its own because a caller sometimes needs to know what the INTERFACE
-// authorized as distinct from what the interface ends up admitting. #6519 is
-// that caller: "the zone-level token is what authorizes DHCP here" is precisely
+// It is the interface-level half of what InterfaceHostInboundEffective resolves
+// — that resolver CALLS this, so the #3720 physical∪unit walk exists once and not
+// twice: a divergence between them would always be a bug. It is exposed on its
+// own because a caller sometimes needs to know what the INTERFACE authorized as
+// distinct from what the interface ends up admitting. #6519 is that caller: "the zone-level token is what authorizes DHCP here" is precisely
 // "the effective set admits it and the interface's own stanza does not", and
 // that predicate is correct whether the two levels union or the interface level
 // replaces the zone level.

@@ -125,15 +125,28 @@ type natSessionCounts struct {
 	ruleSetSessions map[natRuleSetKey]int64
 }
 
-func (s *Server) countSNATSessions(zoneByID map[uint16]string) natSessionCounts {
-	return s.countNATSessions(dataplane.SessFlagSNAT, zoneByID)
+func (s *Server) countSNATSessions(ctx context.Context, zoneByID map[uint16]string) natSessionCounts {
+	return s.countNATSessions(ctx, dataplane.SessFlagSNAT, zoneByID)
 }
 
-func (s *Server) countDNATSessions(zoneByID map[uint16]string) natSessionCounts {
-	return s.countNATSessions(dataplane.SessFlagDNAT, zoneByID)
+func (s *Server) countDNATSessions(ctx context.Context, zoneByID map[uint16]string) natSessionCounts {
+	return s.countNATSessions(ctx, dataplane.SessFlagDNAT, zoneByID)
 }
 
-func (s *Server) countNATSessions(flag uint16, zoneByID map[uint16]string) natSessionCounts {
+// countNATSessions walks the FULL v4+v6 conntrack table. Callers must have
+// taken a sessionWalkLimiter slot first — the walk holds per-bucket BPF-map
+// locks against the live session-sync path, so an unadmitted one starves
+// session installs on the shared control socket.
+//
+// ctx is the admission LEASE context from AcquireCtx, not merely the request
+// context, and it is sampled inside both callbacks (#6553). Without it the
+// walk ran to completion after the client was gone, holding a slot the
+// hardened surfaces were queueing for: because REST and gRPC share ONE 4-slot
+// diagcmd.SessionWalkLimiter, an un-cancellable gRPC walk degrades the REST
+// twin that does honour cancellation. A cancelled walk returns the partial
+// tally rather than an error — the caller renders a count, and a truncated
+// count for a client that has already disconnected is not worth an error path.
+func (s *Server) countNATSessions(ctx context.Context, flag uint16, zoneByID map[uint16]string) natSessionCounts {
 	counts := natSessionCounts{
 		ruleSetSessions: make(map[natRuleSetKey]int64),
 	}
@@ -153,10 +166,16 @@ func (s *Server) countNATSessions(flag uint16, zoneByID map[uint16]string) natSe
 
 	sessions := s.sessionStore()
 	_ = sessions.ForEachV4(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if ctx != nil && ctx.Err() != nil {
+			return false // client gone / lease cancelled — stop the walk
+		}
 		add(val.IsReverse, val.Flags, val.IngressZone, val.EgressZone)
 		return true
 	})
 	_ = sessions.ForEachV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if ctx != nil && ctx.Err() != nil {
+			return false
+		}
 		add(val.IsReverse, val.Flags, val.IngressZone, val.EgressZone)
 		return true
 	})
