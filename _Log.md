@@ -54,6 +54,70 @@
   peer,tai64n,timers}.rs, userspace-dp/src/afxdp/wg/poison_tests.rs (new),
   userspace-dp/src/afxdp/wg/{mod,tests,cookie_tests,tai64n_tests}.rs,
   docs/engineering-style.md, _Log.md
+## 2026-08-21 — #6429: applyHelperStatusLocked split into per-domain apply steps
+
+- **Timestamp**: 2026-08-21 (refactor/6429-apply-helper-status)
+- **Action**: Split the 481-line `applyHelperStatusLocked` god-function into 12
+  per-domain steps in a new `helper_status_apply.go`, leaving an 84-line driver
+  in `maps_sync.go`. PURE CODE MOTION: 21 of 24 moved blocks are byte-identical
+  modulo leading tabs, verified mechanically by searching the produced files for
+  the left-stripped original ranges (`check.py`), not by eye. The only 8
+  differing lines are the two mechanical adaptations a function boundary forces:
+  the two `goto ctrlReady` jumps became `return` (the label sat immediately
+  after the block they escaped and that block was the last statement in the
+  chain, so the jump and the return land on the same statement — the label is
+  now dead and removed), and the six `return m.failClosedUserspaceCtrlLocked(…)`
+  in the two binding-row loops gained the `newBindingIndices` accumulator as a
+  first result.
+
+  Steps extracted: `helperCtrlFlagsLocked`, `resolveCtrlEnableLocked`,
+  `ensureCtrlEnablePrewarmLocked`, `bindingReadinessLocked`,
+  `observeXSKReceiveLivenessLocked`, `applyXSKLivenessGateLocked`,
+  `advanceXSKLivenessLocked`, `resolveXSKLivenessProbeTimeoutLocked`,
+  `flushStaleBPFStateOnCtrlEnableLocked`, `applyRuntimeModeLocked`,
+  `applyPrimaryBindingRowsLocked`, `applyAliasBindingRowsLocked`.
+
+  The path runs under `m.mu` at ~1/s per helper, so the two rules that govern it
+  were checked rather than asserted. Allocation: `go build -gcflags=-m` over the
+  before/after regions gives an IDENTICAL heap-fact set — 50 distinct, 109 total
+  — with zero facts present after that were absent before. Every new message is
+  a `does not escape` annotation for a newly-introduced parameter; notably
+  `ctrl` is taken by pointer in five places and escape analysis still reports
+  `ctrl does not escape` for all five, and `newBindingIndexSet` keeps its
+  pre-existing `make(map[uint32]struct {}) does not escape`. Logging: all 15
+  `slog` sites diff clean on level AND message text; nothing was promoted from
+  Debug.
+
+  Early-return map (unchanged by the split): R1/R2 (`ctrlMap`/`bindingsMap` nil)
+  skip everything; R3 (ctrl-disable write fails) returns BEFORE
+  `m.ctrlWasEnabled = false` / `m.ctrlDisabledAt` are updated and skips both
+  binding loops, `clearStaleBindingRowsLocked`, the three map syncs,
+  `syncBPFCountersLocked`, the ctrl-enable write and `recordHelperStatusLocked`;
+  R4-R6 (primary loop) and R7-R9 (alias loop) fail ctrl closed and skip
+  everything from `clearStaleBindingRowsLocked` onward, leaving
+  `m.lastBindingIndices` untouched; R10-R12 (the three syncs) skip the syncs
+  below them plus counters/enable/record; R13 (ctrl-enable write) skips only
+  `recordHelperStatusLocked`. The two former `goto`s are not returns — they skip
+  only the liveness-failure tail and leave `ctrl.Enabled = 1` standing.
+
+  `pkg/dataplane/userspace/maps_sync.go` moves 2046 [REFACTOR] -> 1655 [WATCH]
+  in the modularity heatmap; the new file is 567 lines, below the audit floor.
+  Doc pointers into the moved code updated in `docs/reth-mac.md` (the ctrl-write
+  gate is now consulted in `resolveCtrlEnableLocked`; the predicate
+  `ctrlMustStayDisabledLocked` stays in `maps_sync.go`) and
+  `docs/afxdp-packet-processing.md` (the #4894/#814 write-side dimension guards
+  moved with the apply path; the watchdog copies stayed).
+
+  A cluster smoke is OWED and was NOT run — this is the helper status-apply
+  path. Deliberately out of scope: the five repeated
+  `UsingUserspaceXDPShimEntryProgram`/`SwapTo…` blocks were NOT deduplicated,
+  because that is a rewrite, not code motion.
+
+- **File(s)**: `pkg/dataplane/userspace/helper_status_apply.go` (new),
+  `pkg/dataplane/userspace/maps_sync.go`, `docs/reth-mac.md`,
+  `docs/afxdp-packet-processing.md`, `docs/refactoring-audit-current.txt`,
+  `_Log.md`
+
 ## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
 
 - **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
