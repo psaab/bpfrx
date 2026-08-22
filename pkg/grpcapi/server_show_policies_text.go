@@ -13,7 +13,9 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -137,6 +139,12 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	// #3408: surface a per-policy counter read failure as a warning AFTER all
 	// reads rather than printing clean-zero hit counts.
 	var readErr error
+	// #7016: an UNPUBLISHED per-rule counter is not a read failure -- the
+	// helper has published nothing for that rule id yet (warm-up before the
+	// first status poll, or config skew after a non-abort-class apply failure).
+	// Render it "n/a" with a trailing note rather than an authoritative 0 under
+	// a warning naming a fault that does not exist.
+	var unpublished int
 	// #4344: read the whole policy set from ONE snapshot (O(P+C), one brief
 	// dataplane lock) via the #3965 bulk reader instead of a per-policy
 	// ReadPolicyCounters loop. Built only when the dataplane is loaded; falls
@@ -178,18 +186,27 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
+			published := true
 			if (statsEnabled || pol.Count) && readPolicy != nil {
-				if counters, err := readPolicy(ruleID); err == nil {
+				counters, err := readPolicy(ruleID)
+				switch {
+				case err == nil:
 					pkts = counters.Packets
 					bytes = counters.Bytes
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					published = false // #7016
+					unpublished++
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			}
 			totalPkts += pkts
 			totalBytes += bytes
-			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
-				zpp.FromZone, zpp.ToZone, pol.Name, action, pkts, bytes)
+			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
+				zpp.FromZone, zpp.ToZone, pol.Name, action,
+				policyCounterCell(pkts, published), policyCounterCell(bytes, published))
 		}
 		policySetID++
 	}
@@ -227,12 +244,20 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
+			published := true
 			if (statsEnabled || pol.Count) && readPolicy != nil {
-				if counters, err := readPolicy(ruleID); err == nil {
+				counters, err := readPolicy(ruleID)
+				switch {
+				case err == nil:
 					pkts = counters.Packets
 					bytes = counters.Bytes
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					published = false // #7016
+					unpublished++
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			}
 			totalPkts += pkts
@@ -242,8 +267,9 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			// unscoped global keeps "*"/"*".
 			hcFrom := config.ScopeLabelOr(pol.Match.FromZones, "*")
 			hcTo := config.ScopeLabelOr(pol.Match.ToZones, "*")
-			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
-				hcFrom, hcTo, pol.Name, action, pkts, bytes)
+			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
+				hcFrom, hcTo, pol.Name, action,
+				policyCounterCell(pkts, published), policyCounterCell(bytes, published))
 		}
 	}
 	// #3363: the IMPLICIT default-policy catch-all has a reserved hit counter
@@ -260,23 +286,36 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			defAction = "reject"
 		}
 		var pkts, bytes uint64
+		published := true
 		if statsEnabled && readPolicy != nil {
-			if counters, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
+			counters, err := readPolicy(dataplane.DefaultPolicySentinelID)
+			switch {
+			case err == nil:
 				pkts = counters.Packets
 				bytes = counters.Bytes
-			} else if readErr == nil {
-				readErr = err
+			case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+				published = false // #7016
+				unpublished++
+			default:
+				if readErr == nil {
+					readErr = err
+				}
 			}
 		}
 		totalPkts += pkts
 		totalBytes += bytes
-		fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
-			"-", "-", dataplane.DefaultPolicyName, defAction, pkts, bytes)
+		fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
+			"-", "-", dataplane.DefaultPolicyName, defAction,
+			policyCounterCell(pkts, published), policyCounterCell(bytes, published))
 	}
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
 	fmt.Fprintf(buf, "%-48s %8s %12d %16d\n", "Total", "", totalPkts, totalBytes)
 	if readErr != nil {
 		fmt.Fprintf(buf, "warning: policy counter read failed (hit counts may be incomplete): %v\n", readErr)
+	}
+	if unpublished > 0 {
+		fmt.Fprintf(buf, "note: %d policy counter(s) not yet published by the dataplane "+
+			"(shown as n/a; the helper has not reported these rules yet)\n", unpublished)
 	}
 }
 
@@ -399,11 +438,20 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				fmt.Fprintf(buf, "      count\n")
 			}
 			if (statsEnabled || pol.Count) && readPolicy != nil {
-				if counters, err := readPolicy(ruleID); err == nil {
+				counters, err := readPolicy(ruleID)
+				switch {
+				case err == nil:
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					// #7016: say so explicitly. Omitting the block silently is
+					// indistinguishable from `policy-stats` being off.
+					fmt.Fprintf(buf, "    Session statistics: not available "+
+						"(not yet published by the dataplane)\n")
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			}
 		}
@@ -475,11 +523,20 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				fmt.Fprintf(buf, "      count\n")
 			}
 			if (statsEnabled || pol.Count) && readPolicy != nil {
-				if counters, err := readPolicy(ruleID); err == nil {
+				counters, err := readPolicy(ruleID)
+				switch {
+				case err == nil:
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					// #7016: say so explicitly. Omitting the block silently is
+					// indistinguishable from `policy-stats` being off.
+					fmt.Fprintf(buf, "    Session statistics: not available "+
+						"(not yet published by the dataplane)\n")
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			}
 		}
@@ -556,4 +613,15 @@ func (s *Server) showPolicyOptions(cfg *config.Config, buf *strings.Builder) {
 	if len(po.PrefixLists) == 0 && len(po.PolicyStatements) == 0 {
 		buf.WriteString("No policy-options configured\n")
 	}
+}
+
+// policyCounterCell renders one packets/bytes cell of the hit-count text
+// table. A published counter renders as its decimal value, byte-identical to
+// the previous %d formatting; an UNPUBLISHED counter (#7016) renders "n/a"
+// rather than a 0 an operator would read as "this rule matched no traffic".
+func policyCounterCell(v uint64, published bool) string {
+	if !published {
+		return "n/a"
+	}
+	return strconv.FormatUint(v, 10)
 }

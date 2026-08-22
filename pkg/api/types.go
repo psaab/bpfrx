@@ -213,10 +213,20 @@ type PolicyRule struct {
 	HitBytes     uint64   `json:"hit_bytes"`
 	// HitCountersUnavailable marks HitPackets/HitBytes as NOT authoritative
 	// because the rule is counter-ELIGIBLE (system-wide `policy-stats` on, or
-	// this rule carries `then count`) but there is no runtime counter source:
-	// the userspace dataplane is UNLOADED (config-only / degraded boot), so the
-	// handler never built its per-policy counter reader and the fields stay 0
-	// without reflecting real traffic (#5580). Mirrors the
+	// this rule carries `then count`) but there is no runtime counter source.
+	// Two causes, both meaning "the 0/0 below reflects no traffic measurement":
+	//
+	//   - the userspace dataplane is UNLOADED (config-only / degraded boot), so
+	//     the handler never built its per-policy counter reader and the fields
+	//     stay 0 without reflecting real traffic (#5580); or
+	//   - the dataplane IS loaded but the helper has published no counter for
+	//     THIS rule's stable rule id — the pre-first-status-poll warm-up window,
+	//     or config skew after a non-abort-class apply failure (#5679) where the
+	//     control plane has promoted a config the helper is not yet enforcing
+	//     (#7016). This is a PER-RULE condition, so it flags only the affected
+	//     rules and the rest of the inventory serializes normally.
+	//
+	// Mirrors the
 	// InterfaceStats.Unavailable (#3464) /
 	// GlobalStats.HostInboundKernelDeniesUnavailable (#3681) idiom and the
 	// #3345 "counter-unavailable != zero" contract: a monitoring consumer must
@@ -224,9 +234,12 @@ type PolicyRule struct {
 	// source absent". Omitted (false) when the counters read successfully AND
 	// when the rule is NOT counter-enabled (no `then count` with policy-stats
 	// off) — that rule is legitimately no-counter, signalled by Count=false,
-	// which is DISTINCT from counter-enabled-but-source-unavailable. A loaded
-	// read FAILURE is still surfaced fail-loud as HTTP 500 (#3408), never as
-	// this in-body flag. Old consumers keep reading the numeric fields
+	// which is DISTINCT from counter-enabled-but-source-unavailable. A genuine
+	// read FAILURE — the dataplane snapshot itself errored — is still surfaced
+	// fail-loud as HTTP 500 (#3408), never as this in-body flag; only the
+	// no-data dispositions above set it, the same split the zone handler makes
+	// between dataplane.ErrCounterNotPopulated (flag) and a real read error
+	// (500) (#6843). Old consumers keep reading the numeric fields
 	// unchanged; new consumers check this flag before trusting a 0.
 	HitCountersUnavailable bool `json:"hit_counters_unavailable,omitempty"`
 	// MatchFromZone / MatchToZone carry the optional from-zone/to-zone
