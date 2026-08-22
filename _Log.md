@@ -102995,3 +102995,13 @@ prose edit above them added. No diff falls in the new test body.
     pkg/dataplane/userspace/fabric_peer_mac_6598_test.go,
     pkg/daemon/fabric_neigh_single_source_6598_test.go,
     docs/fabric-cross-chassis-fwd.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6599 — fenced the session-sync delta filter's fabric-redirect
+    carve-out on INGRESS-side RG ownership. It admitted every fabric-redirect
+    delta unconditionally, which is the emission channel the transient-purge
+    re-entry class rides: a node that owns neither side of a flow could push an
+    identity-less Open (plus its forward-wire alias) that overwrote the RG
+    owner's authoritative session family under latest-generation-wins.
+  - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+    pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
