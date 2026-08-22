@@ -103360,3 +103360,12 @@ prose edit above them added. No diff falls in the new test body.
   rendered.
 - **File(s)**: pkg/config/junos_host_deny.go,
   pkg/config/junos_host_deny_unenforced_6705_test.go
+
+## 2026-08-22 — #6696 dhcp-local-server group interface / pool dns-server
+- **Action**: Both arms now read every element of a bracketed list; modelled
+  the two leaves (and both families' shared `group` subtree) in `setSchema`
+  with per-element validators; `interface` keeps its per-interface modifiers
+  out of the value list via `valueList` + modelled modifier children.
+- **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
+  `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
+  `docs/config-schema.md`
