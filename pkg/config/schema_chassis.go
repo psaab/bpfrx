@@ -222,6 +222,15 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 				children:      nil,
 			},
 			"preempt": {desc: "Allow a higher-priority node to preempt the primary role", children: nil},
+			// #6663: declared here because compileChassis has always
+			// compiled it (redundancyGroupStatements -> compileRGStrictVIPOwnership).
+			// The gap was NOT a commit rejection — the redundancy-group subtree
+			// is open-world, so the statement committed and took effect — it was
+			// a COMPLETION gap: `set chassis cluster redundancy-group 1 ?` never
+			// offered it, so an operator could not discover from the CLI a knob
+			// the compiler implements. Valueless flag, same shape as `preempt`
+			// above, which it sits beside in the dispatch table.
+			"strict-vip-ownership": {desc: "Only the VRRP master may hold the redundancy group's VIPs", children: nil},
 			// interface-monitor weight is NOT typed here: the
 			// `<ifname> weight <n>` tokens pack inline into one leaf
 			// (children==nil here); typing the weight would require a
