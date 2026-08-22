@@ -245,6 +245,16 @@ inlining. Treat the trend as a defect, not a style preference.
   to the relevant tracking issue (or asking the author to open
   one). Don't let "but the surrounding code is already like that"
   land.
+- **The gate reds the author of the growth, not the next merger**
+  (#7253). `pkg/refactoraudit`'s
+  `TestTouchedFileCrossedModularityThreshold` fails when a file **your
+  branch touches** crosses 1500 or 2000 LOC, measured from your own diff
+  against the merge base — so an unrelated file growing elsewhere can
+  never red you, and regenerating `docs/refactoring-audit-current.txt`
+  can never silence you. Split the file, or record the decision and its
+  reason in `docs/refactoring-audit-accepted.txt`. Keeping the global
+  heatmap current is `make audit-refresh`'s job; its lag fails nothing.
+  See `docs/refactoring-audit.md` "The two gates".
 
 ## Overflow / failure policy
 

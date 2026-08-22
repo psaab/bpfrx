@@ -21,13 +21,18 @@
 # simpler than a brittle stripper.
 #
 #
-# Output is committed to docs/refactoring-audit-current.txt. The gate on
-# that artifact (TestHeatmapNotStale in pkg/refactoraudit) compares the
-# audited file set and each file's tier, NOT the exact bytes — the LOC
-# column is an advisory snapshot the tree is expected to outrun between
-# regenerations (#6617; see docs/refactoring-audit.md "Drift guard").
+# Output is committed to docs/refactoring-audit-current.txt by the refresh
+# job (scripts/refactoring-audit-refresh.sh / `make audit-refresh`), not
+# by PR authors. NOTHING fails a build when that artifact lags the tree:
+# it is a repo-GLOBAL snapshot, so any file crossing a threshold anywhere
+# invalidated it for everyone, and #7235/#7252/#7254 each regenerated it
+# inside one hour (#7252 was already stale when it merged). The gate that
+# does fail is pkg/refactoraudit's touched-file gate, which measures a
+# branch's own diff — see docs/refactoring-audit.md "The two gates".
+#
 # Output must still be byte-reproducible run to run, which
-# TestGeneratorDeterministic pins.
+# TestGeneratorDeterministic pins, and internally coherent, which
+# TestHeatmapArtifactWellFormed pins.
 #
 # Run from repo root or anywhere — uses `git rev-parse` to anchor.
 set -euo pipefail
@@ -37,8 +42,10 @@ cd "$ROOT"
 # Classifier (exclusion regex) and LOC measurement live in the shared
 # library so the generator, the `make audit-check` diff, and the
 # enforcement fixtures (pkg/refactoraudit) classify every path the same
-# way. Sourcing defines $AUDIT_SKIP_RE + audit_loc() with no side
-# effects. See scripts/refactoring-audit-lib.sh for the full skip list
+# way. Sourcing defines $AUDIT_SKIP_RE, the $AUDIT_ROOTS_* root lists,
+# the $AUDIT_FLOOR / $AUDIT_REFACTOR_FLOOR thresholds, audit_loc() and
+# audit_is_audited_path() with no side effects. See
+# scripts/refactoring-audit-lib.sh for the full skip list
 # (target/vendor, generated code, Go/Rust test filename shapes — #6232
 # added the tests_*.rs / test_*.rs sibling-test-module shapes — retired
 # plan retrospectives, findings docs, lockfiles).
@@ -48,7 +55,7 @@ SKIP_RE="$AUDIT_SKIP_RE"
 
 categorize() {
     local loc=$1
-    if [ "$loc" -ge 2000 ]; then echo "[REFACTOR]"; else echo "[WATCH]   "; fi
+    if [ "$loc" -ge "$AUDIT_REFACTOR_FLOOR" ]; then echo "[REFACTOR]"; else echo "[WATCH]   "; fi
 }
 
 # Echo the subset of the given paths that are existing directories, one
@@ -83,7 +90,9 @@ audit_rust() {
     # root would make `find` exit non-zero and abort the whole script under
     # `set -e`, which is exactly the drift bug #1661 item 8 fixed.
     local dirs
-    dirs=$(audit_existing_dirs userspace-dp/src userspace-xdp/src)
+    # shellcheck disable=SC2086 # word-split intentional: AUDIT_ROOTS_RS
+    # is a space-separated list of whitespace-free root names.
+    dirs=$(audit_existing_dirs $AUDIT_ROOTS_RS)
     [ -z "$dirs" ] && return 0
     # shellcheck disable=SC2086 # word-split intentional: $dirs is a
     # newline/space-separated list of validated directory paths.
@@ -91,7 +100,7 @@ audit_rust() {
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(audit_loc "$f")
-            if [ "$loc" -ge 1500 ]; then
+            if [ "$loc" -ge "$AUDIT_FLOOR" ]; then
                 printf "%s  %5d  %s\n" "$(categorize "$loc")" "$loc" "$f"
             fi
         done
@@ -99,14 +108,15 @@ audit_rust() {
 
 audit_go() {
     local dirs
-    dirs=$(audit_existing_dirs pkg cmd)
+    # shellcheck disable=SC2086 # see audit_rust.
+    dirs=$(audit_existing_dirs $AUDIT_ROOTS_GO)
     [ -z "$dirs" ] && return 0
     # shellcheck disable=SC2086 # see audit_rust.
     find $dirs -name '*.go' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(audit_loc "$f")
-            if [ "$loc" -ge 1500 ]; then
+            if [ "$loc" -ge "$AUDIT_FLOOR" ]; then
                 printf "%s  %5d  %s\n" "$(categorize "$loc")" "$loc" "$f"
             fi
         done
@@ -126,13 +136,15 @@ audit_go() {
 # heatmap drifted).
 audit_bpf() {
     local dirs
-    dirs=$(audit_existing_dirs bpf/xdp bpf/tc)
+    # shellcheck disable=SC2086 # see audit_rust.
+    dirs=$(audit_existing_dirs $AUDIT_ROOTS_C)
     [ -z "$dirs" ] && return 0
     # shellcheck disable=SC2086 # see audit_rust.
     find $dirs -name '*.c' 2>/dev/null \
+        | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(audit_loc "$f")
-            if [ "$loc" -ge 1500 ]; then
+            if [ "$loc" -ge "$AUDIT_FLOOR" ]; then
                 printf "%s  %5d  %s\n" "$(categorize "$loc")" "$loc" "$f"
             fi
         done
