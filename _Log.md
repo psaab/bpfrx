@@ -102588,3 +102588,18 @@ prose edit above them added. No diff falls in the new test body.
     controlLinkAuthKey now REDs). Residual closed: readLoop's CALL to admitFrame
     was still unbound — severing it left every 5086 test green.
   - **File(s)**: pkg/cluster/heartbeat_replay_restart_5086_test.go
+
+## 2026-08-22 — #6663 redundancy-group schema/compiler SSOT agreement
+- **Timestamp**: 2026-08-22
+- **Action**: `compileChassis` compiles `strict-vip-ownership` (via the
+  `redundancyGroupStatements` dispatch table) but `setSchema` did not declare
+  it. Not a commit rejection — the RG subtree is open-world, so it committed
+  and took effect — a COMPLETION gap: `redundancy-group 1 ?` never offered it.
+  Declared the leaf, and bound the two SSOTs with an agreement test in ONE
+  direction (compiler ⇒ schema always a bug; schema ⇒ compiler is the
+  documented accepted-only posture). The sweep was provable rather than
+  eyeballed because both sides are enumerable: dispatch-table keys vs schema
+  children, exactly one missing.
+- **File(s)**: pkg/config/schema_chassis.go,
+  pkg/config/rg_schema_compiler_agreement_6663_test.go (new),
+  docs/config-schema.md, _Log.md
