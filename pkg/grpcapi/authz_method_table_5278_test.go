@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -651,6 +652,86 @@ func TestShowTextPrefixRulesAreUnambiguous_5278(t *testing.T) {
 				t.Errorf("prefix rule %q is shadowed by %q; a topic matching both "+
 					"would be priced by table ordering", a.prefix, b.prefix)
 			}
+		}
+	}
+}
+
+// TestShowTextDispatchLivesInOneFile_5278 guards the guard.
+//
+// TestEveryShowTextTopicHasAPermission_5278 parses ONE file. That is only a
+// coverage claim if that file is where every topic decision is made — a topic
+// dispatched from any other file would be invisible to it, and the guard would
+// go on passing while a whole family of topics was unpriced. That is the same
+// wrong-property failure the topic guard exists to correct, one level up.
+//
+// The dispatch SSOT is server_show.go. server_show_interfaces_text.go is the
+// one allowed exception: it re-tests an already-dispatched `class-of-service:`
+// topic to pick a rendering, not to decide which topic is served.
+//
+// RED on revert: dispatch a new topic (`req.Topic == "x"`,
+// `strings.HasPrefix(req.Topic, ...)` or `switch req.Topic`) from any other
+// production file in this package.
+func TestShowTextDispatchLivesInOneFile_5278(t *testing.T) {
+	allowed := map[string]bool{
+		"server_show.go":                 true,
+		"server_show_interfaces_text.go": true,
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	checked := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		checked++
+		if allowed[name] {
+			continue
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Errorf("parse %s: %v", name, perr)
+			continue
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.BinaryExpr:
+				if v.Op == token.EQL && (isReqTopicSelector(v.X) || isReqTopicSelector(v.Y)) {
+					t.Errorf("%s dispatches on req.Topic; ShowText topic coverage is "+
+						"proven by parsing server_show.go alone, so a topic decided "+
+						"here is invisible to TestEveryShowTextTopicHasAPermission_5278 "+
+						"(#5278)", name)
+				}
+			case *ast.SwitchStmt:
+				if isReqTopicSelector(v.Tag) {
+					t.Errorf("%s contains `switch req.Topic`; see above (#5278)", name)
+				}
+			case *ast.CallExpr:
+				sel, ok := v.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "HasPrefix" || len(v.Args) != 2 {
+					return true
+				}
+				if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "strings" {
+					return true
+				}
+				if isReqTopicSelector(v.Args[0]) {
+					t.Errorf("%s prefix-dispatches on req.Topic; see above (#5278)", name)
+				}
+			}
+			return true
+		})
+	}
+	if checked < 20 {
+		t.Fatalf("only %d production files scanned; the walk is broken and a pass "+
+			"would certify nothing", checked)
+	}
+	for name := range allowed {
+		if _, err := os.Stat(name); err != nil {
+			t.Errorf("allowlisted dispatcher %s no longer exists; the topic guard's "+
+				"enumeration source has moved (#5278)", name)
 		}
 	}
 }
