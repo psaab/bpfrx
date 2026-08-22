@@ -154,24 +154,35 @@ type SessionValue struct {
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
 	//
-	// Only pkg/cli — the IN-DAEMON console CLI — consumes this today. The gRPC
-	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
-	// AND clear) and the REST query in pkg/api still resolve an interface
-	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
-	// Porting them is tracked in #6975.
+	// All THREE session surfaces consume it (#6960): pkg/cli (the in-daemon
+	// console), pkg/grpcapi (what the REMOTE cli binary uses for show AND
+	// clear, and what a console clear propagates to the HA peer over) and
+	// pkg/api (REST). Each resolves the ingress interface from this identity
+	// and falls back to the zone only where it is absent. Before #6960 the two
+	// remote surfaces answered from the ingress ZONE in the pre-#4792
+	// first-interface-only form, so an interface-scoped clear through gRPC
+	// deleted every session of that zone (#6975).
 	//
-	// Until that lands, an interface-filtered SHOW is exact for rows this node
-	// owns ONLY when the row's {ifindex, vlan} names a currently-configured
-	// unit; it is approximate for peer rows and for three local shapes besides
-	// (#6928 derivation). `sessionFilter.resolveIngressIfaces` returns a single
-	// name only on a hit in `ifaceNamesByKey`, and that map is rebuilt per
-	// query from the CURRENT config and the CURRENT kernel ifindex:
+	// An interface-filtered SHOW is exact for rows this node owns ONLY when the
+	// row's {ifindex, vlan} names a currently-configured unit; it is
+	// approximate for peer rows and for three local shapes besides (#6928
+	// derivation). The resolvers return a single name only on a hit in the
+	// {ifindex, vlan} name map, and that map is rebuilt per query from the
+	// CURRENT config and the CURRENT kernel ifindex:
 	//   - a non-zero ifindex the config cannot name (unit deleted since
 	//     install, tunnel/fabric ingress with no config unit) MISSES and falls
 	//     back to the zone — the resolver's own doc says so;
 	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
 	//     different interface, which is worse than approximate: it renders one
-	//     confident WRONG name rather than a zone list;
+	//     confident WRONG name rather than a zone list. All three surfaces
+	//     CORROBORATE a hit against the row's own recorded ingress zone and,
+	//     when the two disagree, treat it as a MISS and answer from the zone
+	//     — the filter feeds `clear`, so an untrustworthy name must not select
+	//     anything (#6960/#6987). The reported column declines to name an
+	//     interface at all on such a disagreement, and names a zone's
+	//     interface only where the zone binds exactly ONE. Corroboration
+	//     cannot separate a recycle WITHIN one zone from the truth, on any
+	//     surface;
 	//   - the map keys a unit under `vlan-id`, else `unit number`
 	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
 	//     THE WIRE. Those agree when the unit number equals the vlan id, or
@@ -187,29 +198,28 @@ type SessionValue struct {
 	//     ifindex in the row — it is not there (#6928 review).
 	// (Note the collision the map DOES avoid: units do not collapse onto
 	// {ifindex, 0}, because that same number-fallback separates them; a
-	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
-	// exact even when typed on the console: `clearFilteredSessions`
-	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
-	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
-	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
-	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
-	// DELETES peer flows actually received on `reth0.80`.
+	// first-writer-wins insert still decides any genuine key collision.)
+	//
+	// An interface-filtered CLEAR propagates to the peer unconditionally
+	// (`clearFilteredSessions`, `pkg/cli/cli_clear.go`). The peer honours the
+	// filter through this same identity since #6960, so on zone
+	// `[reth0.50, reth0.80]` clearing `reth0.50` no longer deletes peer flows
+	// received on `reth0.80` — but only for peer rows that CARRY an identity,
+	// and a peer-synced row does not: the ifindex is node-local and is
+	// deliberately imported as 0 (#7095). Those rows still fall back to the
+	// zone on the peer, so a cross-node interface-scoped clear remains
+	// zone-wide in practice until #7095 lands.
 	//
 	// Do not read the local exactness this field buys as an end-to-end
 	// guarantee. It is bounded on BOTH sides, and the local bound is the one
 	// easy to lose: "this node is the authority" does NOT upgrade to "exact"
 	// — the three shapes enumerated above are all rows this node owns
-	// outright, and the recycled-ifindex one is not even a miss. An interface
-	// removed and its kernel index reused by a configured sibling makes the
-	// filter AND the `If:` column report that SIBLING, confidently, for a
-	// locally-owned row. Local authority buys exactness only for the nameable
-	// subset. On the other side the clear path leaves this node entirely.
-	// #6975 carries the trace and the fix shape.
+	// outright, and the recycled-ifindex one is not even a miss.
 	//
-	// REST is a separate case and is NOT merely approximate: pkg/api
-	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
-	// degrading it to a clear-all, so there is no approximate REST clear to
-	// be wrong about (#6928 review).
+	// REST has no clear to be wrong about at all: pkg/api sessions.go REJECTS
+	// any filtered clear with HTTP 400 rather than degrading it to a clear-all
+	// (#6928 review). Its interface filter still reads this identity, because
+	// the REST session QUERY reports the same rows (#6960).
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
@@ -450,24 +460,35 @@ type SessionValueV6 struct {
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
 	//
-	// Only pkg/cli — the IN-DAEMON console CLI — consumes this today. The gRPC
-	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
-	// AND clear) and the REST query in pkg/api still resolve an interface
-	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
-	// Porting them is tracked in #6975.
+	// All THREE session surfaces consume it (#6960): pkg/cli (the in-daemon
+	// console), pkg/grpcapi (what the REMOTE cli binary uses for show AND
+	// clear, and what a console clear propagates to the HA peer over) and
+	// pkg/api (REST). Each resolves the ingress interface from this identity
+	// and falls back to the zone only where it is absent. Before #6960 the two
+	// remote surfaces answered from the ingress ZONE in the pre-#4792
+	// first-interface-only form, so an interface-scoped clear through gRPC
+	// deleted every session of that zone (#6975).
 	//
-	// Until that lands, an interface-filtered SHOW is exact for rows this node
-	// owns ONLY when the row's {ifindex, vlan} names a currently-configured
-	// unit; it is approximate for peer rows and for three local shapes besides
-	// (#6928 derivation). `sessionFilter.resolveIngressIfaces` returns a single
-	// name only on a hit in `ifaceNamesByKey`, and that map is rebuilt per
-	// query from the CURRENT config and the CURRENT kernel ifindex:
+	// An interface-filtered SHOW is exact for rows this node owns ONLY when the
+	// row's {ifindex, vlan} names a currently-configured unit; it is
+	// approximate for peer rows and for three local shapes besides (#6928
+	// derivation). The resolvers return a single name only on a hit in the
+	// {ifindex, vlan} name map, and that map is rebuilt per query from the
+	// CURRENT config and the CURRENT kernel ifindex:
 	//   - a non-zero ifindex the config cannot name (unit deleted since
 	//     install, tunnel/fabric ingress with no config unit) MISSES and falls
 	//     back to the zone — the resolver's own doc says so;
 	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
 	//     different interface, which is worse than approximate: it renders one
-	//     confident WRONG name rather than a zone list;
+	//     confident WRONG name rather than a zone list. All three surfaces
+	//     CORROBORATE a hit against the row's own recorded ingress zone and,
+	//     when the two disagree, treat it as a MISS and answer from the zone
+	//     — the filter feeds `clear`, so an untrustworthy name must not select
+	//     anything (#6960/#6987). The reported column declines to name an
+	//     interface at all on such a disagreement, and names a zone's
+	//     interface only where the zone binds exactly ONE. Corroboration
+	//     cannot separate a recycle WITHIN one zone from the truth, on any
+	//     surface;
 	//   - the map keys a unit under `vlan-id`, else `unit number`
 	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
 	//     THE WIRE. Those agree when the unit number equals the vlan id, or
@@ -483,29 +504,28 @@ type SessionValueV6 struct {
 	//     ifindex in the row — it is not there (#6928 review).
 	// (Note the collision the map DOES avoid: units do not collapse onto
 	// {ifindex, 0}, because that same number-fallback separates them; a
-	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
-	// exact even when typed on the console: `clearFilteredSessions`
-	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
-	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
-	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
-	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
-	// DELETES peer flows actually received on `reth0.80`.
+	// first-writer-wins insert still decides any genuine key collision.)
+	//
+	// An interface-filtered CLEAR propagates to the peer unconditionally
+	// (`clearFilteredSessions`, `pkg/cli/cli_clear.go`). The peer honours the
+	// filter through this same identity since #6960, so on zone
+	// `[reth0.50, reth0.80]` clearing `reth0.50` no longer deletes peer flows
+	// received on `reth0.80` — but only for peer rows that CARRY an identity,
+	// and a peer-synced row does not: the ifindex is node-local and is
+	// deliberately imported as 0 (#7095). Those rows still fall back to the
+	// zone on the peer, so a cross-node interface-scoped clear remains
+	// zone-wide in practice until #7095 lands.
 	//
 	// Do not read the local exactness this field buys as an end-to-end
 	// guarantee. It is bounded on BOTH sides, and the local bound is the one
 	// easy to lose: "this node is the authority" does NOT upgrade to "exact"
 	// — the three shapes enumerated above are all rows this node owns
-	// outright, and the recycled-ifindex one is not even a miss. An interface
-	// removed and its kernel index reused by a configured sibling makes the
-	// filter AND the `If:` column report that SIBLING, confidently, for a
-	// locally-owned row. Local authority buys exactness only for the nameable
-	// subset. On the other side the clear path leaves this node entirely.
-	// #6975 carries the trace and the fix shape.
+	// outright, and the recycled-ifindex one is not even a miss.
 	//
-	// REST is a separate case and is NOT merely approximate: pkg/api
-	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
-	// degrading it to a clear-all, so there is no approximate REST clear to
-	// be wrong about (#6928 review).
+	// REST has no clear to be wrong about at all: pkg/api sessions.go REJECTS
+	// any filtered clear with HTTP 400 rather than degrading it to a clear-all
+	// (#6928 review). Its interface filter still reads this identity, because
+	// the REST session QUERY reports the same rows (#6960).
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first

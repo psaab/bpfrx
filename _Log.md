@@ -99503,6 +99503,7 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/README.md, _Log.md
 - **Action**: #7216 — reject a static-NAT rule whose selected `match
   destination-address` is empty.
+## 2026-08-21 — userspace-dp LOW cohorts (#5191/#5193): three bounded residuals
 
   Reproduced firsthand at `7230dcdcd` over the #7145 base config. Of the six
   (NAT kind x match leaf) slots, static-NAT `match destination-address` was the
@@ -99645,10 +99646,164 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/helper_restart_after_stop_5838_test.go, _Log.md
 
 - **Timestamp**: 2026-08-21
-  - **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
-    return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
-    (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
-    degraded arm; document the idle regulation in the worker README.
-  - **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
-    `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
-    `userspace-dp/src/afxdp/worker/README.md`
+- **Action**: Fixed three bounded items across two userspace-dp LOW cohorts.
+  #5191 A1-b9-F5: the transport-data and CookieReply parsers now compare the
+  full little-endian 32-bit type word via the handshake parser's
+  `is_canonical_type`, closing a parser differential against kernel WG /
+  wireguard-go (both previously accepted nonzero RESERVED bytes that every
+  other implementation drops). #5193 A1-b7-F1: `populate_tunnel_endpoints`
+  preflights endpoint-id uniqueness BEFORE mutating state (typed
+  `TunnelEndpointDuplicateId`), so a duplicate id can no longer install the
+  last row under that id while both interfaces' ifindexes alias it; a
+  duplicate ifindex keeps the first row and logs instead of silently
+  overwriting. #5193 A1-b7-F7: the CoS DSCP rewrite-rule ingest bounds every
+  code-point to 0..=63 (`CosDscpRewriteCodePointOutOfRange`), so a value the
+  TX path would mask into a different PHB fails the snapshot closed like the
+  classifier builders have since #2447.
+  THREE items this work originally carried were DROPPED before merge because
+  other lanes landed the same fixes first, and taking a second implementation
+  of a landed fix is how a guard gets silently lost: #5189 A1-b10-F4 (keepalive
+  vs `WRITE_BACKLOG_MAX_BYTES`) went to PR #7199, whose version also declines
+  to re-arm `last_write` on suppression; #5190 A1-b1-F7 (`rx_over_1514`
+  rename), A1-b12-F3 (bench merge-gate claims) and A1-b8-F6
+  (`zero_unbound_slot` completeness) all went to PR #7226, whose census test
+  drives the real `refresh_bindings` unbound branch rather than calling
+  `zero_unbound_slot` directly. Each was reverted here in full — production,
+  test and doc — rather than hand-merged, and #7199's non-re-arm guard was
+  mutation-verified to still bite in a scratch tree holding both branches.
+  4-cell mutation matrix green/red/green, zero unsound cells; `cargo check
+  --tests` clean first; full `cargo test --release --bins --tests --
+  --test-threads=1` green. Rust diff moves the helper binary, so a cluster
+  smoke is OWED (not run here).
+- **File(s)**: userspace-dp/src/afxdp/wg/{framing,cookie,handshake,cookie_tests}.rs,
+  userspace-dp/src/afxdp/forwarding_build/{cos,tunnels,tests}.rs,
+  userspace-dp/src/policy_snapshot_error.rs, docs/config-schema.md,
+  docs/wireguard-interop.md, docs/userspace-dataplane-architecture.md, _Log.md
+- **Action**: #6960/#6975 — the gRPC and REST session-interface filters resolved
+  a session's INGRESS interface as `zone.Interfaces[0]`, a value that does not
+  depend on the session at all. The remote `cli` routes both `show` and `clear`
+  through the gRPC filter, and a console clear propagates the operator's filter
+  to the HA peer over the same RPC, so
+  `clear security flow session interface <the zone's first interface>` DELETED
+  every session in that zone, including flows received on a sibling interface.
+
+  REPRODUCED FIRST at 849576b94, driving the real RPC: a trust zone bound to
+  `[ge-0/0/0.0, ge-0/0/3.50, ge-0/0/3.80]` collapsed to
+  `zoneIfaces = {trust: "ge-0/0/0.0"}`, `matchV4` returned true for a session
+  whose recorded ingress binding was `ge-0/0/3.80`, and
+  `ClearSessions{Interface: "ge-0/0/0"}` returned `ipv4_cleared=1` after
+  deleting it.
+
+  Both surfaces now widen `zoneIfaces` to `map[uint16][]string` (the #4792 form
+  pkg/cli has carried since #4983) and resolve the ingress arm through
+  `resolveSessionIngressIfaces`: the single interface the recorded
+  `{IngressIfindex, IngressVlanID}` identity names, else EVERY interface bound
+  to the ingress zone. The zone fallback deliberately WIDENS — a filter that
+  drops a candidate hides a live session from `show` and leaves it behind on
+  `clear` — so peer-synced rows, reverse companions and the host-outbound GRE
+  path stay reachable.
+
+  An identity hit is CORROBORATED against the row's own recorded ingress zone
+  before it is reported as fact: the name map is rebuilt per query from the
+  current config and current kernel ifindexes while the row's ifindex was
+  recorded at install, so a RECYCLED ifindex can hit and name an interface the
+  session never arrived on (#6987, the same mechanism in pkg/cli). On a
+  disagreement is treated as a MISS and the zone answers instead — the same
+  answer these surfaces gave before they read the identity at all. A rezoned
+  interface produces the identical disagreement and the row cannot tell the two
+  apart, so the tie breaks toward not ACTING on the name: this filter feeds
+  `clear`, and selecting on an untrustworthy name would delete sessions that
+  never touched the named interface. The row stays reachable through its
+  recorded ingress zone and its egress arm.
+
+  SCOPE: what the reported column may CLAIM when no identity is available is
+  deliberately UNCHANGED here — it is still the ingress zone's first bound
+  interface. Narrowing that is operator-visible and has to land on all three
+  session surfaces at once, or the console and the remote `cli` disagree; it is
+  #6987.
+
+  VALIDATION: 6 mutations, each one line on a clean tree, all RED with
+  `go vet` clean (assertion reds, not build breaks) — zone collapse restored
+  (gRPC + REST), ingress arm restored to the zone (gRPC + REST), and
+  corroboration forced true (gRPC + REST).
+  `go test -count=1 ./pkg/grpcapi/ ./pkg/api/ ./pkg/cli/ ./pkg/daemon/` green;
+  `go build ./...` and `go vet ./...` clean. The Rust diff is doc comments
+  only (`session/entry.rs`, `session/README.md` claims that named these two
+  surfaces as retaining the zone form); no executable Rust code changed, so no
+  cluster smoke is owed.
+- **File(s)**: pkg/grpcapi/server_sessions.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/session_iface_identity_6960_test.go,
+  pkg/grpcapi/session_egress_drift_4650_test.go,
+  pkg/grpcapi/pagination_test.go, pkg/grpcapi/server_sessions_test.go,
+  pkg/grpcapi/server_sessions_policy_id_zero_4626_test.go,
+  pkg/api/sessions.go, pkg/api/server.go,
+  pkg/api/session_iface_identity_6960_test.go,
+  pkg/api/sessions_policy_id_zero_4626_test.go, pkg/dataplane/types.go,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6987 — a session's recorded ingress `{ifindex, VLAN}` is stamped
+  at INSTALL, while the `{ifindex, VLAN} -> interface name` table is rebuilt
+  from the CURRENT config and the CURRENT kernel ifindexes on EVERY query. A
+  kernel ifindex is RECYCLED — a tunnel, VLAN unit or XFRM interface is
+  destroyed and its number handed to a different interface later — so a stale
+  ifindex does not merely MISS the rebuilt table: it HITS it and names an
+  interface the session never arrived on. Nothing in the output distinguished
+  that from a correct answer.
+
+  REPRODUCED FIRST on top of the #6960 branch: `gr-0/0/0` (zone vpn) held
+  ifindex 42 when the session installed; the tunnel was torn down and `ge-0/0/2`
+  (zone trust) took 42. `resolveIngressIfaces(42, 0, vpn)` returned
+  `[ge-0/0/2]` — one confident name in the WRONG zone — and
+  `show security flow session interface ge-0/0/2` selected the row.
+
+  The row carries one other identity recorded at the same instant: its ingress
+  ZONE, whose id is name-derived and STABLE across commits (`assignZoneIDs`).
+  An identity hit is now corroborated against it. A disagreement is a MISS on
+  the FILTER (`clear security flow session interface <name>` runs through the
+  same predicate, so selecting on an untrustworthy name would DELETE sessions
+  that never touched the named interface; the row stays reachable through its
+  recorded zone and its egress arm), and prints NOTHING on the reported column
+  — even where the zone binds exactly one interface, because the row carries
+  positive evidence of inconsistency rather than mere absence.
+
+  The reported column also stops naming one member of a MULTI-interface zone on
+  behalf of its siblings. `pkg/cli` built a second, display-only
+  `map[uint16]string` of each zone's first interface, deliberately separate
+  from the filter's widened map; that map is deleted and both columns now read
+  the one map `populateIfaceMaps` builds. The same rule lands on `pkg/grpcapi`
+  and `pkg/api` in the same change, or the console and the remote `cli` would
+  report different interfaces for one session. Where a zone binds exactly ONE
+  interface the approximation has exactly one answer and is still printed, so
+  the #4983 never-blank property holds: peer-synced and reverse-direction rows
+  keep an ingress column (the zone name where the zone cannot narrow).
+
+  Residual, measured and deliberately NOT closed: a recycle WITHIN one zone
+  corroborates and still names the wrong sibling. Separating it needs an
+  install-time generation carried on the session row, which is a dataplane wire
+  change. Filed as #7239, with the uncorroborated EGRESS side as #7240.
+
+  VALIDATION: 6 mutations, each one line on a clean tree, all RED with `go vet`
+  clean (assertion reds, not build breaks) — corroboration forced true (cli),
+  the disputed-display arm removed (cli + gRPC), and the sole-member display
+  rule widened to "first of any" (cli + gRPC + REST). `go test -count=1` green
+  for pkg/cli, pkg/grpcapi, pkg/api, pkg/dataplane; `go build ./...` and
+  `go vet ./...` clean. Rust diff is doc comments only; nothing reaches the
+  helper binary, so no cluster smoke is owed.
+- **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/session_ingress_identity_stale_6987_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/session_iface_identity_6960_test.go, pkg/api/sessions.go,
+  pkg/api/session_iface_identity_6960_test.go, pkg/dataplane/types.go,
+  userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
+  return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
+  (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
+  degraded arm; document the idle regulation in the worker README.
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`
