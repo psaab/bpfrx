@@ -39,7 +39,7 @@ func TestBindingForwardingLiveRequiresReady(t *testing.T) {
 			want:    false,
 		},
 		{
-			name: "ready but unregistered is withheld",
+			name:    "ready but unregistered is withheld",
 			binding: BindingStatus{WorkerID: 2, Registered: false, Armed: true, Bound: true, XSKRegistered: true, Ready: true},
 			want:    false,
 		},

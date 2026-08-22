@@ -1,3 +1,29 @@
+## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
+
+- **Timestamp**: 2026-08-22
+- **Action**: The tail's `networkctl reconfigure` argv was asserted in full,
+  but `activationTailIfaces()` had exactly one ELIGIBLE interface, so
+  `[reconfigure trust0]` was also the output of a hardcoded literal, a deleted
+  `Unmanaged` predicate, a deleted `Disable` predicate and a reversed
+  accumulation. Confirmed rather than assumed: all four were run against the
+  BASE fixture and all four exited 0.
+  Extended the fixture to five interfaces covering every arm — two included
+  (`trust0`, `dmz0`) sitting on either side of three excluded (bond member,
+  unmanaged, disabled) — so accumulation and ORDER are both observable, which
+  one eligible interface can never make so.
+  Spelled the expectation out as `wantActivationTailArgv` rather than deriving
+  it by filtering the fixture with the production predicate: deriving it would
+  make the assertion true by construction, since the same predicate would
+  decide both the behaviour and the expectation and deleting an arm would move
+  them together.
+  Left `debtTestIfaces()` untouched — it is deliberately minimal for the
+  reload-debt tests that share it, and the richer fixture is local to the
+  activation-tail file.
+  Mutation matrix M1-M5 all RED at RUN=48 matching the control, vet clean at
+  each; and the same four mutations verified GREEN against the base fixture,
+  which is what shows the fixture change is what closed them.
+- **File(s)**: `pkg/networkd/activation_tail_5718_test.go`,
+  `pkg/networkd/README.md`
 ## 2026-08-22 — #6897: the failover gate could emit no throughput cell, and had
 
 - **Timestamp**: 2026-08-22
@@ -102890,6 +102916,43 @@ prose edit above them added. No diff falls in the new test body.
     compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
     pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
     docs/config-schema.md
+
+## 2026-08-22 — #7426: single-source the predictable-name derivation
+- **Timestamp**: 2026-08-22
+- **Action**: Two live re-implementations wrong in OPPOSITE directions on the
+  same field — the daemon had NamePolicy ordering but never emitted `f0`
+  (`fn > 0`), the dataplane had #4795's multifunction fix but took the first
+  altname in kernel order. An agreement test could only pin one wrongness to the
+  other, so: new zero-import leaf `pkg/netname` (pkg/daemon imports
+  pkg/dataplane, so the resolver cannot live in pkg/daemon). Both call sites
+  rewired; the duplicated dataplane helpers deleted and #4795's test MOVED with
+  the code; `altNamePrefixOrder` aliased so the #6677 test keeps binding the
+  live order. Also found two divergences the issue did not name — no PCI domain
+  handling and a base-10 function parse in the dataplane copy — both latent on
+  this host (single domain, max function 7), verified rather than assumed.
+  Fixed the #6199 fixture vacuity: all rows were slot 0, where the ARI `slot<<3`
+  term is identically zero.
+- **File(s)**: pkg/netname/netname.go (new), pkg/netname/README.md (new),
+  pkg/netname/netname_7426_test.go (new),
+  pkg/netname/pci_function_suffix_4795_test.go (moved from pkg/dataplane),
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
+  pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md
+
+## 2026-08-22 — #6668 display-set container bracket round-trip
+- **Timestamp**: 2026-08-22
+- **Action**: Carry authored `[ ... ]` bracket grouping through `display set`
+  render and flat replay so a bracket authored at a CONTAINER position survives
+  the round trip; fixes the `load merge <hierarchical-file>` ingest corruption
+  and the two Reject→Accept commit-gate laundering cases.
+- **File(s)**: pkg/config/lexer.go, pkg/config/parser.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/ast_format.go, pkg/config/inactive.go,
+  pkg/configstore/store_command.go,
+  pkg/config/formatset_container_bracket_6668_test.go,
+  pkg/configstore/loadmerge_bracket_container_6668_test.go,
+  pkg/config/dual_ast_differential_test.go,
+  pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+  docs/config-schema.md, docs/host-inbound-service-matrix.md
 
 - **Timestamp**: 2026-08-22
   - **Action**: #6598 — brought the LIVE fabric peer-MAC resolver up to the

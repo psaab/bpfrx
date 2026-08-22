@@ -1383,12 +1383,14 @@ which is what makes applying the body to every member safe here. Full mechanism:
 `docs/config-schema.md`, "A per-interface `host-inbound-traffic` override is
 scoped by the KEYS of the node it is authored on".
 
-**Known limitation (#6668).** The multi-member shape survives config persistence
-and HA config sync, but NOT a `show | display set` round-trip — `display set`
-flattens it into a form that fails to compile on reload (it fails closed, with a
-`references interface "host-inbound-traffic"` error, rather than silently
-dropping admission). Author multi-member bodies in hierarchical form, or use
-per-interface statements, if you round-trip configs through `display set`.
+**Round-trip (#6668, fixed).** The multi-member shape survives config
+persistence, HA config sync, `show | display set` → `load set`, and `load merge`
+of a hierarchical file. Before #6668 the display-set form flattened into a
+container keyed on the first member with the second demoted to a leaf keyword,
+which failed to compile on reload; the same replay ran inside the daemon on the
+`load merge` path, so a merge could rewrite the candidate. `display set` now
+re-emits the authored `[ ... ]` group and the replay reconstructs it. See
+`docs/config-schema.md`, "Round-trip: fixed in #6668".
 
 **Revoking a grant made this way needs care.** A bracket-body grant has no
 targeted `delete`: because the admission was authored on the multi-member node
