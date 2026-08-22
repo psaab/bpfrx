@@ -554,10 +554,19 @@ message EventEntry {
   // did not carry the field (e.g. a non-close event, or no NAT applied).
   string nat_src_addr = 21;     // post-NAT source "ip:port" ("" = no NAT)
   string nat_dst_addr = 22;     // post-NAT destination "ip:port"
-  // Node-local dataplane session id (the #4915 [152:160] ringbuf slot): unique
-  // within this node, but NOT the same on both cluster nodes (#6198). Use it to
-  // correlate this event with `show security flow session` on THIS node; it is
-  // not a cross-node key.
+  // Dataplane session id (the #4915 [152:160] ringbuf slot).
+  //
+  // CROSS-NODE STABLE (#5212): a peer-synced session ADOPTS the originating
+  // node's id, so this node's SESSION_CLOSE carries the same id as the
+  // originating node's SESSION_CREATE. That is the whole point of #5212 and it
+  // is what a SIEM correlates on across a failover.
+  //
+  // #6666 corrected this comment, which was backwards on BOTH halves: it said
+  // the id was node-local and NOT the same on both nodes (it is the same, since
+  // #5212), and it pointed at `show security flow session` on THIS node as the
+  // correlation target (which rendered a DIFFERENT, control-plane-minted id for
+  // a peer-synced session until #6666 made the mirror adopt this one). Both
+  // surfaces now render this id, so either correlation works.
   uint64 session_id = 23;
   uint32 elapsed_time = 24;     // seconds since session creation (CLOSE)
   uint32 created = 25;          // absolute session-creation Unix seconds (CLOSE)
