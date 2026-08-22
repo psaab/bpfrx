@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
@@ -93,11 +94,17 @@ type CLI struct {
 	// / unit test): showSystemServices falls back to the documented loopback
 	// defaults.
 	listenersFn func() sysservices.Listeners
-	hostname    string
-	username    string
-	userClass   string
-	version     string
-	startTime   time.Time
+	// bootstrapImportFn returns the recorded day-0 / bootstrap config-import
+	// outcome for `show system bootstrap-import` (#6496). The daemon wires it
+	// to Daemon.BootstrapImportSnapshot — the SAME snapshot /health and the
+	// gRPC ShowText path read. Nil in a `cli` spawned outside the daemon,
+	// where the command reports that no outcome has been recorded.
+	bootstrapImportFn func() bootstrapshow.Snapshot
+	hostname          string
+	username          string
+	userClass         string
+	version           string
+	startTime         time.Time
 
 	vrrpMgr *vrrp.Manager
 
@@ -283,6 +290,16 @@ func (c *CLI) SetFlowCollectorHealthFn(fn func() []flowexport.ExporterCollectorH
 // showSystemServices on the documented loopback defaults (offline / unit test).
 func (c *CLI) SetListenersFn(fn func() sysservices.Listeners) {
 	c.listenersFn = fn
+}
+
+// SetBootstrapImportFn wires the recorded day-0 / bootstrap config-import
+// outcome for `show system bootstrap-import` (#6496). The daemon passes
+// Daemon.BootstrapImportSnapshot — the SAME snapshot /health and the gRPC
+// ShowText renderer read — so the console, the remote `cli`, and the health
+// probe cannot disagree about whether the day-0 configuration applied. Nil
+// leaves the command reporting an unrecorded outcome (offline / unit test).
+func (c *CLI) SetBootstrapImportFn(fn func() bootstrapshow.Snapshot) {
+	c.bootstrapImportFn = fn
 }
 
 // SetDDNSOwnedRecordsFn sets a callback for retrieving the DHCP

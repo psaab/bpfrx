@@ -207,7 +207,7 @@ The YAML + `xpf.conf` are the deployable artifacts — treat them as code:
 
 | Symptom | Look at |
 |---|---|
-| day-0 config not applied | `journalctl -u xpf-day0-config` — verbatim commit-check rejection; box stays factory-default, fix + reboot |
+| day-0 config not applied | `show system bootstrap-import` from the CLI — the recorded verdict AND the reason (#6496); then `journalctl -u xpf-day0-config` for the verbatim commit-check rejection. Box stays factory-default: fix + reboot. See docs/install-images.md "My day-0 config did not apply" |
 | NIC roles shifted | `cli -c "show interfaces terse"` vs your YAML; an interface added between deploys changes order |
 | VF dataplane dead after host reboot | unpinned VF MAC rotated — set `mac:` on the interface |
 | no mgmt after commit | hypervisor console → `cli` → `rollback 1`, `commit` |

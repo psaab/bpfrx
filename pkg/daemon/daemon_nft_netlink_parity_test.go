@@ -118,7 +118,7 @@ func runNftNetlinkParityInner(t *testing.T) {
 		cfg := parityLo0Config()
 		oracle := buildLo0FilterPayload(cfg, "lo0f", "lo0f6")
 		spec := toNftLo0Spec(cfg, "lo0f", "lo0f6")
-		parityCheck(t, xnft.Lo0TableName, oracle, func() error { return inst.InstallLo0(spec) })
+		parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
 	})
 
 	t.Run("lo0_unrepresentable_port_fails_closed", func(t *testing.T) {
@@ -148,7 +148,7 @@ func runNftNetlinkParityInner(t *testing.T) {
 
 		// Netlink side: InstallLo0 must ERROR and install nothing.
 		spec := toNftLo0Spec(badCfg, "badf", "")
-		if err := inst.InstallLo0(spec); err == nil {
+		if _, err := inst.InstallLo0(spec); err == nil {
 			nftDeleteTableBestEffort(xnft.Lo0TableName)
 			t.Fatal("netlink FAIL-CLOSED expected: InstallLo0 returned nil on an unresolvable port token (fail-open: the accept widened to match-all)")
 		}

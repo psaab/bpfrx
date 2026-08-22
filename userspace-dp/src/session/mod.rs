@@ -510,14 +510,28 @@ struct SessionRecord {
     entry: SessionEntry,
 }
 
-/// The `session_id` high-16 (worker) value RESERVED for the Go control plane
+/// The `session_id` high-16 NAMESPACE value RESERVED for the Go control plane
 /// (#6198). `nextUserspaceSyncedSessionID`
 /// (`pkg/daemon/daemon_ha_userspace_convert.go`) mints
 /// `0xFFFF << 48 | counter48` for the peer-synced sessions the daemon installs,
 /// and those land in the SAME BPF conntrack mirror field this table stamps. A
-/// `SessionTable` must never take this as its worker id — see `set_worker_id`,
-/// which enforces it.
+/// `SessionTable` must never take this as its namespace — see
+/// `set_session_id_namespace`, which enforces it.
 pub(crate) const CONTROL_PLANE_SESSION_ID_WORKER_HI: u64 = 0xFFFF;
+
+/// #6311: bit position, WITHIN the 16-bit session-id namespace field, of the
+/// NODE discriminator. The namespace is `node_bit << 15 | worker_id`, so the
+/// worker half narrows from 16 bits to 15 — still ~256x the hard cap on worker
+/// ids (`MAX_NAT_HOLDER_WORKERS` = 128, enforced where `binding.worker_id` is
+/// minted in `server/helpers/planning.rs`), so nothing real loses room.
+pub(crate) const SESSION_ID_NODE_BIT_SHIFT: u32 = 15;
+
+/// #6311: the largest worker id representable in the narrowed worker half. A
+/// worker id above this would carry into the node bit and mint ids in the PEER's
+/// namespace — a silent cross-node collision, strictly worse than the aliasing
+/// the pre-#6311 mask produced, so `set_session_id_namespace` refuses it rather
+/// than masking it away.
+pub(crate) const SESSION_ID_MAX_WORKER: u64 = (1u64 << SESSION_ID_NODE_BIT_SHIFT) - 1;
 
 pub(crate) struct SessionTable {
     /// #964 Step 1: slab-allocated session storage. Indexed by u32
@@ -694,11 +708,14 @@ pub(crate) struct SessionTable {
     /// counter here, so a plain `u64` (no atomic). Combined with
     /// `session_id_worker_hi` to form the STABLE `SessionEntry.session_id`.
     next_session_id: u64,
-    /// #4915: this worker's id shifted into the high 16 bits, so a session id is
-    /// unique across the node's shared-nothing per-worker `SessionTable`s
-    /// (`(worker_id as u64) << 48`). 0 for a table with no worker id set (the
-    /// test default and any single-table context) — harmless there because a
-    /// lone table's monotonic counter is already unique.
+    /// #4915 + #6311: this table's session-id NAMESPACE, shifted into the high
+    /// 16 bits — `(node_bit << 15 | worker_id) << 48`. The worker half makes a
+    /// session id unique across the node's shared-nothing per-worker
+    /// `SessionTable`s; the node half makes it unique across the CLUSTER, so a
+    /// peer id adopted verbatim on import (#5212) can never collide with an id
+    /// this node mints. 0 for a table whose namespace was never set (the test
+    /// default and any single-table context) — harmless there because a lone
+    /// table's monotonic counter is already unique.
     session_id_worker_hi: u64,
 }
 
@@ -760,8 +777,8 @@ impl SessionTable {
             session_limit_src_counts: HashMap::with_hasher(state.clone()),
             session_limit_dst_counts: HashMap::with_hasher(state),
             // #4915: monotonic session-id counter starts at 1 (0 = "unknown"
-            // sentinel on the wire); worker namespace defaults to 0 until
-            // `set_worker_id` is called at worker setup.
+            // sentinel on the wire); the node/worker namespace defaults to 0
+            // until `set_session_id_namespace` is called at worker setup.
             next_session_id: 1,
             session_id_worker_hi: 0,
         }
@@ -772,47 +789,75 @@ impl SessionTable {
         self.epoch_counter
     }
 
-    /// #4915: namespace this table's session ids by worker so the STABLE session
-    /// id (`SessionEntry.session_id`) is unique across the node's shared-nothing
-    /// per-worker `SessionTable`s. Called once at worker setup with the worker's
-    /// id; the id occupies the high 16 bits, leaving the low 48 for the
-    /// per-worker monotonic counter. A worker id >= 2^16 is clamped into range
-    /// (never happens — a queue index is tiny) so the shift cannot alias the
-    /// counter bits.
+    /// #4915 + #6311: namespace this table's session ids so the STABLE session
+    /// id (`SessionEntry.session_id`) is unique across the CLUSTER. Called once
+    /// at worker setup. The high 16 bits carry `node_bit << 15 | worker_id`,
+    /// leaving the low 48 for the per-worker monotonic counter.
     ///
-    /// **RESERVED: worker id `0xFFFF` belongs to the Go control plane (#6198).**
+    /// **Why the node half exists (#6311).** Before it, the namespace was the
+    /// worker id alone — and both HA nodes run the SAME worker set (queue
+    /// indices 0..N) with per-worker counters that both start at 1. Under #5212
+    /// a standby ADOPTS the primary's id verbatim on import, so an adopted
+    /// `(w << 48) | c` collided with the importing node's OWN worker-`w` id
+    /// `(w << 48) | c`. In active/active — a supported, tested mode
+    /// (`test-active-active`) — low-counter collisions early after boot were
+    /// essentially guaranteed. That also REGRESSED pre-#5212 same-node
+    /// uniqueness: before adoption, every import got a fresh local id, so a
+    /// node's own RT_FLOW stream was internally unique.
+    ///
+    /// The node bit fixes it structurally rather than by bookkeeping: an adopted
+    /// id carries the ORIGINATING node's bit, which by construction differs from
+    /// every id this node mints. That is also why `upsert_synced_with_origin`
+    /// deliberately does NOT reconcile `next_session_id` against an adopted id —
+    /// the two live in disjoint namespaces, so a later local alloc cannot
+    /// re-hand-out an adopted id.
+    ///
+    /// `node_id` is the chassis-cluster node id (0 or 1 — `parseNodeIDFileContent`
+    /// and the config compiler both bound it, and `IsSupportedClusterNodeID`
+    /// pins the 2-node topology). It is narrowed with `& 1` rather than
+    /// asserted: it arrives on the wire from the daemon, and a helper that
+    /// aborts on a wire value is a worse failure than one that folds an
+    /// impossible third node onto node 0. A standalone (non-cluster) node passes
+    /// 0 and gets exactly the pre-#6311 layout.
+    ///
+    /// **RESERVED: namespace `0xFFFF` belongs to the Go control plane (#6198).**
     /// Both allocators write into the SAME BPF conntrack mirror field: this table
     /// stamps `session_id` for sessions the helper owns, and
     /// `nextUserspaceSyncedSessionID` (pkg/daemon/daemon_ha_userspace_convert.go)
     /// mints `0xFFFF << 48 | counter48` for a peer-synced session the daemon
-    /// installs. Keeping `0xFFFF` out of this half is what makes the two id
-    /// spaces disjoint. It is unreachable today — `binding.worker_id` is bounded
-    /// by the worker count (`replan_bindings_from_candidates`) — but anything
-    /// that re-partitions these high bits (e.g. #6311's proposal to steal a bit
-    /// from the worker field) must preserve the reservation.
+    /// installs. `0xFFFF` is node-bit-1 plus worker `0x7FFF`, so the reservation
+    /// survives the re-partition unchanged — and the assert now guards the
+    /// COMBINED namespace, not just the worker half, which is what keeps it
+    /// meaningful after the split.
     ///
-    /// The reservation is ENFORCED, not merely documented: a worker id landing on
-    /// it aborts at worker setup. This is a config-time invariant (called once per
-    /// worker, with a queue index), so per `docs/engineering-style.md` a hard
-    /// failure beats running with ids that silently alias the control plane's. A
-    /// plain `assert!` rather than `debug_assert!` because `make test-rust` and
-    /// the shipped helper both build `--release`, where a debug assertion is
-    /// stripped and would guard nothing.
-    pub fn set_worker_id(&mut self, worker_id: u32) {
-        let worker_hi = (worker_id as u64) & 0xFFFF;
-        assert_ne!(
-            worker_hi, CONTROL_PLANE_SESSION_ID_WORKER_HI,
-            "worker id {worker_id} maps onto the session-id namespace reserved \
-             for the Go control plane (#6198): nextUserspaceSyncedSessionID mints \
-             {CONTROL_PLANE_SESSION_ID_WORKER_HI:#x} << 48 | counter into the same \
-             BPF conntrack mirror field"
+    /// Both assertions are hard `assert!`s rather than `debug_assert!`s because
+    /// `make test-rust` and the shipped helper both build `--release`, where a
+    /// debug assertion is stripped and would guard nothing. This is a config-time
+    /// invariant (called once per worker, with a queue index), so per
+    /// `docs/engineering-style.md` a hard failure beats running with ids that
+    /// silently alias the control plane's or the peer node's.
+    pub fn set_session_id_namespace(&mut self, node_id: u8, worker_id: u32) {
+        assert!(
+            (worker_id as u64) <= SESSION_ID_MAX_WORKER,
+            "worker id {worker_id} does not fit the {SESSION_ID_NODE_BIT_SHIFT}-bit \
+             session-id worker field (#6311): it would carry into the node \
+             discriminator and mint ids inside the PEER node's namespace"
         );
-        self.session_id_worker_hi = worker_hi << 48;
+        let node_bit = ((node_id as u64) & 1) << SESSION_ID_NODE_BIT_SHIFT;
+        let namespace = node_bit | (worker_id as u64 & SESSION_ID_MAX_WORKER);
+        assert_ne!(
+            namespace, CONTROL_PLANE_SESSION_ID_WORKER_HI,
+            "node {node_id} worker {worker_id} maps onto the session-id namespace \
+             reserved for the Go control plane (#6198): nextUserspaceSyncedSessionID \
+             mints {CONTROL_PLANE_SESSION_ID_WORKER_HI:#x} << 48 | counter into the \
+             same BPF conntrack mirror field"
+        );
+        self.session_id_worker_hi = namespace << 48;
     }
 
-    /// #4915: allocate the next STABLE session id for a freshly-installed entry.
-    /// Worker id in the high 16 bits, per-worker monotonic counter (masked to 48
-    /// bits) in the low bits; the counter starts at 1 so the returned id is never
+    /// #4915 + #6311: allocate the next STABLE session id for a freshly-installed
+    /// entry. Node bit + worker id in the high 16 bits, per-worker monotonic
+    /// counter (masked to 48 bits) in the low bits; the counter starts at 1 so the returned id is never
     /// 0 (0 is the "unknown/legacy" wire sentinel). The 48-bit counter space is
     /// ~281 trillion ids per worker — unreachable in a process lifetime — but the
     /// mask + the `== 0` guard keep the id well-formed even in the impossible

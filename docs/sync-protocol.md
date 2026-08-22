@@ -392,12 +392,28 @@ the same logical session carries the SAME id on both nodes — that cross-node
 correlation is the entire point. It is a **metadata-only** stamp (RT_FLOW
 correlation and the `show security flow session` mirror id), NEVER a lookup key
 or slab handle, so adoption cannot affect forwarding, security, or memory
-safety. It is **not globally unique**: the `worker_id<<48 | counter` namespace
-carries no node discriminator and both nodes run the same worker set, so in an
-active/active cluster an adopted id can collide with a local same-worker id (a
-duplicate correlation stamp — observability-only, bounded). A node-discriminator
-bit that makes adoption globally collision-free is tracked as a follow-up
-(#6311).
+safety. Since #6311 it is also globally **collision-free**: the high-16
+namespace is `node_bit << 15 | worker_id`, fed from `ConfigSnapshot.node_id`, so
+an adopted id carries the ORIGINATING node's bit and can never equal an id the
+importing node mints. Before that bit, both nodes ran the same worker set with
+counters that both start at 1, so in an active/active cluster an adopted id
+collided with a local same-worker id — and that also regressed pre-#5212
+same-node uniqueness, where every import got a fresh local id. The node bit is
+also why `upsert_synced_with_origin` does not reconcile `next_session_id`
+against an adopted id: the two namespaces are disjoint, so a later local alloc
+cannot re-hand-out an adopted value.
+
+`node_id` rides `apply_snapshot` as an additive `omitempty` /
+`#[serde(default)]` field with **no** `CONFIG_SNAPSHOT_PROTOCOL_VERSION` bump.
+The snapshot handler gates on EXACT version equality, so a bump would make a
+mixed-base pair refuse to apply a snapshot at all; an older helper that ignores
+the field simply keeps the pre-#6311 layout. The pairing is monotone in both
+directions — new-daemon/old-helper is today's behaviour, and
+old-daemon/new-helper leaves node 1 in the un-bitted low half, also today's
+behaviour — so neither direction introduces a NEW collision. It is consumed only
+at worker SPAWN, so a node id that changes at runtime takes effect on the next
+plan change or restart; `/etc/xpf/node-id` is read once at daemon start, so that
+is already a reboot-level operation.
 
 **Additive, not a guard.** Unlike #5274's `ConfigEpoch`, this field is pure
 identity carriage — no receiver rejects on it. `RTFlowSessionID == 0` (legacy
