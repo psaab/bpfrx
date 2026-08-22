@@ -64,6 +64,28 @@ pub(in crate::afxdp) struct SessionManager {
     /// peer's full logical set (N logical → 2N entries) EXACTLY fits the 2N cap
     /// — never trips it, at any peer load.
     pub(in crate::afxdp) import_cap_drops: AtomicU64,
+    /// #6600: peer-synced imports REFUSED because this node could not reserve
+    /// the translated NAT port the session names.
+    ///
+    /// The import path published the shared session entry BEFORE any worker
+    /// reserved that port, and the reservation — which happens only inside the
+    /// worker-local upsert — REFUSES to steal a port a different live
+    /// allocation already holds. The refusal was returned by nothing, counted
+    /// by nothing and logged by nothing, so in the window between publish and
+    /// worker-apply a local flow could claim the port and the imported session
+    /// went on advertising a translation this node did not own. Any packet
+    /// forwarded on that shared-backed decision used it.
+    ///
+    /// The reservation now happens at the coordinator BEFORE the publish, and a
+    /// refusal drops the import instead. That is the safe direction — no
+    /// session beats a session naming someone else's port, and the peer re-syncs
+    /// — but it is still a DROPPED failover session, so it must be visible: a
+    /// silent drop would trade one invisible failure for another. A nonzero
+    /// value means a local flow held the translated port at import time, which
+    /// on a healthy standby (owning RG passive) should not happen and points at
+    /// overlapping pools, an active-active RG pair sharing one SNAT pool, or
+    /// genuine NAT config drift between the nodes.
+    pub(in crate::afxdp) import_reserve_refused: AtomicU64,
 }
 
 impl SessionManager {
@@ -77,6 +99,7 @@ impl SessionManager {
             install_stale_ignored: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),
+            import_reserve_refused: AtomicU64::new(0),
         }
     }
 }

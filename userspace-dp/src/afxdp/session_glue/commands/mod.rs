@@ -13,7 +13,7 @@ mod delete_synced;
 mod demote_owner_rgs;
 mod export_owner_rg_sessions;
 mod refresh_owner_rgs;
-mod upsert_synced;
+pub(in crate::afxdp) mod upsert_synced;
 
 pub(in crate::afxdp::session_glue) use delete_synced::handle_delete_synced;
 pub(in crate::afxdp::session_glue) use demote_owner_rgs::handle_demote_owner_rgs;

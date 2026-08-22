@@ -18,7 +18,12 @@ use super::super::*;
 /// too rather than assumed: an empty `from_zone` would silently EXCLUDE every
 /// zone-scoped rule instead of leaving the axis unconstrained, which is the one
 /// way this narrowing could pick a worse rule than the pre-#6211 fallback.
-fn synced_source_nat_zone_pair<'a>(
+/// #6600: `pub(in crate::afxdp)` so the COORDINATOR's pre-publish reservation
+/// resolves the zone pair through the SAME function the worker does. If the two
+/// ever disagreed, the coordinator would reserve on one allocator and the worker
+/// on another — the coordinator's check would pass while the port the session
+/// actually names stayed unreserved, which is the defect wearing a new shape.
+pub(in crate::afxdp) fn synced_source_nat_zone_pair<'a>(
     forwarding: &'a ForwardingState,
     metadata: &crate::session::SessionMetadata,
 ) -> crate::nat::SyncedNatZones<'a> {
