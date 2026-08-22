@@ -1,3 +1,37 @@
+## 2026-08-21 — #6620 inner promote hop: delete the filesystem-inference fallbacks
+
+- **Timestamp**: 2026-08-21
+- **Action**: `resolveVerifyGateBin` (the INNER hop of the #1930 A/B kernel
+  promote gate) fell back to `<SbinDir>/xpfd` and then
+  `<VersionsDir>/current/xpfd` when `os.Executable()` failed or its path no
+  longer resolved. That is the defect class #6601 r5 removed from the OUTER
+  shell hop: selecting a binary by inference from filesystem evidence, where a
+  leftover from a relocated runtime is indistinguishable from a healthy layout.
+  Deleted both candidates and the `gateSbinDir`/`gateVersionsDir` package vars
+  that made them reachable; `os.Executable()` is now the sole authority and an
+  unresolvable answer REFUSES. A Gate-3 error routes to `revert()` (restore the
+  known-good `BootOrder`, reboot known-good), so refusing is a correct terminal
+  outcome and strictly better than verifying the candidate kernel against a
+  stale dataplane.
+
+  Swept every fixture that set the deleted seams rather than leaving a vacuous
+  survivor: the four `FallsBack`/`PrefersSbin`/`SkipsDangling` tests are
+  inverted into refusals, the rival-binary plant in the priority test is
+  removed (the resolver can no longer see such a file, so it asserted nothing),
+  and `TestGateResolutionDefaultsToProductionVersionsDir` — which pinned the
+  now-deleted vars — is replaced by an anti-over-reach test for the over-reach
+  that IS now possible: refusing a healthy box.
+
+  Added a source-level guard because deleting the fallbacks also deleted the
+  seams a behavioural test needed: with no seam, a reverted resolver reaches for
+  the real `/usr/local/sbin/xpfd`, so whether a refusal test reds becomes a
+  property of the test HOST. `TestResolveVerifyGateBinHasNoFilesystemInference_6620`
+  walks the AST and is host-independent.
+- **File(s)**: `pkg/upgrade/kernel_linux.go`,
+  `pkg/upgrade/kernel_verify_explicit_path_6541_test.go`,
+  `pkg/upgrade/kernel_verify_no_inference_6620_test.go` (new),
+  `docs/in-place-upgrade.md`, `_Log.md`
+
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
