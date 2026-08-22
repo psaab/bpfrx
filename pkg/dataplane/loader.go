@@ -247,10 +247,28 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	// no-ops, so CompileConfig writes no ifindex-keyed map before this runs;
 	// the userspace_bindings ARRAY cap in maps_sync.go stays the real
 	// fail-closed guardrail.
-	if err := m.preflightCheckIfindexCaps(ifindexSet(result.pendingXDP)); err != nil {
-		return nil, err
-	}
-	if err := m.attachUserspaceShimXDP(result); err != nil {
+	//
+	// #4960: both of the steps below land AFTER CompileConfig's Phase 2 has
+	// already mutated the host, and there is no undo. Neither can be hoisted
+	// above it — preflightCheckIfindexCaps consumes result.pendingXDP, which
+	// only compileZones populates, and the attach is the actuation itself. They
+	// are therefore grouped into runPostMutationSteps, which names that region
+	// and annotates any failure with what already moved.
+	// Both steps are written as CALLS inside closures rather than as method
+	// values (`m.attachUserspaceShimXDP`). The #5275 arm-proof canary
+	// (TestArmProofIsInvokedFromCompileUserspaceShim) locates the attach by
+	// walking this function for a CallExpr and asserts the proof runs after it;
+	// a method value is a SelectorExpr and would silently give that canary
+	// nothing to anchor to. Keeping the call shape keeps the existing guard
+	// intact instead of loosening it to fit this refactor.
+	if err := runPostMutationSteps(result,
+		func(r *CompileResult) error {
+			return m.preflightCheckIfindexCaps(ifindexSet(r.pendingXDP))
+		},
+		func(r *CompileResult) error {
+			return m.attachUserspaceShimXDP(r)
+		},
+	); err != nil {
 		return nil, err
 	}
 	// #5275 PR1: OBSERVE-ONLY arm-coverage proof. Runs after the attach so it

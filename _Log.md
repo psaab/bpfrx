@@ -499,6 +499,81 @@
   Touches no cluster/session-sync/failover code — the peer fan-out here is the
   read-only diagnostic path, not the sync path.
 
+## 2026-08-22 — #4960: an apply that aborted after mutating the host said nothing about it
+
+- **Timestamp**: 2026-08-22 (fix/4960-host-mutation-report)
+- **Action**: An abort in the post-mutation window now reports which classes of
+  live host state this apply already changed, and the address-reconcile
+  decision was split out as a pure function so that flag actually varies.
+- **File(s)**: `pkg/dataplane/compiler_hostmutation_4960.go` (new),
+  `pkg/dataplane/compiler_hostmutation_4960_test.go` (new),
+  `pkg/dataplane/compiler_iface.go`, `pkg/dataplane/compiler.go`,
+  `pkg/dataplane/loader.go`, `pkg/dataplane/README.md`
+
+  `pkg/dataplane.CompileConfig` mutates the host in Phase 2 (VLAN sub-interface
+  create, interface address reconcile) with no undo log. PR #6894 added a
+  pre-pass that catches the config-shape classes BEFORE that point, but three
+  fallible steps still run after it: CompileConfig's own later phases,
+  `preflightCheckIfindexCaps`, and `attachUserspaceShimXDP`. The last is the
+  reachable one — an ordinary XDP attach failure on a driver that refuses a
+  generic attach. When any of them fails, `CompileUserspaceShim` returns before
+  publishing, so the Rust dataplane keeps its PREVIOUS snapshot while the host
+  has already moved.
+
+  The operator saw `apply failed: attach userspace shim XDP: ...` and had every
+  reason to read it as "the apply did nothing" — then retry or roll back on a
+  box whose VLANs and addresses had already been changed by the failed attempt.
+
+  This does not undo the mutation. An apply transaction with a real undo path is
+  #4960's own "split pure planning from actuation" / "restore the prior host
+  plan" redesign, it has a stranded plan branch with two PLAN-NEEDS-MAJOR review
+  rounds, and none of it is reachable without first deciding what an abort does
+  to an already-mutated host. What this fixes is that the split state was
+  INVISIBLE.
+
+  The flag has to VARY or it says nothing: recorded unconditionally it would be
+  true on every apply of an addressed interface and the annotation would fire on
+  every failure. So `ensureVLANSubInterface` reports whether it actually added a
+  link (an existing link brought up is not a creation; every return after a
+  successful LinkAdd reports true, including the failure paths, because the link
+  exists either way), and `reconcileInterfaceAddresses` reports whether a delete
+  or add actually landed (an "exists" error is not a change).
+
+  `planAddressReconcile` splits the delete/add DECISION out as a pure function of
+  (existing, desired) — #4960's planning/actuation clause at this one site — which
+  is what makes the converged case provable without root.
+
+  The two loader steps are grouped into `runPostMutationSteps`, the only place
+  the post-mutation abort contract is expressed, so a step added to that window
+  inherits it. Both are written as CALLS inside closures rather than method
+  values: the #5275 arm-proof canary locates the attach by walking for a
+  CallExpr, and a method value would have silently left it with nothing to
+  anchor to. Keeping the call shape keeps that guard intact instead of loosening
+  it to fit this refactor — it caught the refactor on the first full run.
+
+  Mutation proof — `go build ./pkg/dataplane/` checked clean before every cell:
+  - delete the annotation from `runPostMutationSteps` (the production wiring) —
+    TEST_RC=1, BOTH abort paths red;
+  - drop the `!result.HostMutated()` guard — TEST_RC=1, the not-annotated
+    control reds;
+  - drop the summary sort — TEST_RC=1, the order-stability test reds;
+  - mark unconditionally at the reconcile CALL SITE — TEST_RC=1 on
+    `TestCompileZonesRecordsNoMutationWhenConverged`. That test exists because
+    the first version of this mutation stayed GREEN: every other test drives
+    `CompileResult` or the plan directly and none of them reaches
+    `mapZoneInterface`. It now drives the real `compileZones` over `lo`, passing
+    as desired exactly the addresses `lo` already has (read from the kernel
+    first, with the empty plan asserted as a premise), so it reaches the call
+    site and cannot modify the host it runs on;
+  - plan every desired address regardless of what exists — TEST_RC=1;
+  - stop skipping link-local in the delete set — TEST_RC=1;
+  - replay adds from the map instead of authored order — TEST_RC=1.
+
+  Control: `go test -count=1 ./pkg/dataplane/...` TEST_RC=0,
+  `go test -count=1 ./pkg/daemon/ ./pkg/config/` TEST_RC=0,
+  `go vet ./pkg/dataplane/...` VET_RC=0, `go build ./...` BUILD_RC=0. Go-only;
+  no dataplane binary moves, so no cluster smoke is owed.
+
 ## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
 
 - **Timestamp**: 2026-08-22
