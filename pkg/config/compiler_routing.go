@@ -82,13 +82,48 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 		}
 	}
 
-	// Parse rib inet6.0 { static { route ... } }
-	// In routing-instances, the rib name is "<instance>.inet6.0" (e.g., "ATT.inet6.0").
+	// Parse rib <name> { static { route ... } }.
+	// In routing-instances the rib name is "<instance>.inet6.0" / "<instance>.inet.0"
+	// (e.g. "ATT.inet6.0"); at the top level it is the bare table name.
+	//
+	// #7512: this loop used to match ONLY the inet6 tables, and every other name
+	// fell through with no branch and no else. `rib inet.0 { static { route
+	// 0.0.0.0/0 { next-hop ...; } } }` — the ordinary Junos way to scope IPv4
+	// statics, and the natural thing to write beside a `rib inet6.0` block —
+	// therefore compiled to NOTHING, committed clean, and emitted no warning.
+	// An operator authoring the symmetric pair got their IPv6 default route and
+	// silently lost their IPv4 one, with `show configuration` rendering the
+	// stanza back verbatim so the config looked correct.
+	//
+	// The missing `else` is the real defect and is the durable half of the fix:
+	// adding an `inet.0` branch alone would leave `inet.2`, `inet.3`, a typo'd
+	// `ient.0` and every future table name silently eating routes exactly as
+	// before. An unimplemented rib is now RECORDED so the commit path can say
+	// so — see validateUnhandledRibWarnings.
 	for _, ribNode := range node.FindChildren("rib") {
 		ribName := nodeVal(ribNode)
-		if ribName == "inet6.0" || strings.HasSuffix(ribName, ".inet6.0") {
-			if ribStatic := ribNode.FindChild("static"); ribStatic != nil {
+		ribStatic := ribNode.FindChild("static")
+		switch {
+		case ribName == "inet6.0" || strings.HasSuffix(ribName, ".inet6.0"):
+			if ribStatic != nil {
 				ro.Inet6StaticRoutes = compileStaticRoutes(ribStatic, ro.Inet6StaticRoutes)
+			}
+		case ribName == "inet.0" || strings.HasSuffix(ribName, ".inet.0"):
+			// The IPv4 unicast table is the SAME destination as a bare
+			// `routing-options static` block, so routes reached either way land
+			// in one list and append rather than replace.
+			if ribStatic != nil {
+				ro.StaticRoutes = compileStaticRoutes(ribStatic, ro.StaticRoutes)
+			}
+		default:
+			// Not implemented. Record it ONLY when routes were actually lost —
+			// an empty `rib foo { }` discards nothing, and warning there would
+			// be noise that teaches operators to scroll past the real case.
+			if ribStatic == nil {
+				continue
+			}
+			if n := len(compileStaticRoutes(ribStatic, nil)); n > 0 {
+				ro.UnhandledRibs = append(ro.UnhandledRibs, UnhandledRib{Name: ribName, Routes: n})
 			}
 		}
 	}
@@ -490,6 +525,9 @@ func compileRoutingInstances(node *Node, cfg *Config) error {
 				}
 				ri.StaticRoutes = ro.StaticRoutes
 				ri.Inet6StaticRoutes = ro.Inet6StaticRoutes
+				// #7512: carried explicitly — this copy is field-by-field, so a
+				// VRF's dropped ribs are unreported unless named here.
+				ri.UnhandledRibs = ro.UnhandledRibs
 				// #3870: capture the instance-level autonomous-system so a
 				// per-instance BGP that omits local-as can inherit it (falling
 				// back to the global routing-options AS in resolveBGPAutonomousSystem).

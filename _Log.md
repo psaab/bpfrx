@@ -103815,3 +103815,25 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/api/server.go, pkg/api/listener.go,
   pkg/api/leg_slot_identity_6734_test.go (new),
   pkg/api/listener_retiredauth_5561_test.go, pkg/api/README.md
+
+## 2026-08-22 — #7512 rib inet.0 static routes silently discarded
+- **Timestamp**: 2026-08-22
+- **Action**: compiler_routing.go matched only `inet6.0`/`*.inet6.0` in the rib
+  loop, with no branch and NO ELSE, so `routing-options rib inet.0 { static {
+  ... } }` compiled to nothing, committed clean and warned nothing — the
+  symmetric v4+v6 pair installed the IPv6 default route and silently blackholed
+  IPv4. Added the `inet.0` / `<vrf>.inet.0` branch AND the missing else: an
+  unimplemented rib is recorded (only when it actually carried routes) and
+  reported by validateUnhandledRibWarnings. WARN not reject — `rib inet.2` is
+  valid Junos a box may already have committed, so rejecting would brick the
+  tolerant load (#1960); a warning reaches both paths so no lenient* opt is
+  needed. Carried UnhandledRibs across the field-by-field VRF copy explicitly.
+- **Golden**: golden_4406.json regenerated after CLASSIFYING the diff — 24 keys
+  added, all `UnhandledRibs`, all null; 0 removed, 0 values changed, so no
+  fixture behaviour moved.
+- **File(s)**: pkg/config/compiler_routing.go, pkg/config/types_routing.go,
+  pkg/config/compiler_validate_warn_routing.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/rib_static_routes_7512_test.go (new),
+  pkg/config/testdata/golden_4406.json, docs/feature-gaps.md
+
