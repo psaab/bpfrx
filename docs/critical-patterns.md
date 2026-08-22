@@ -71,6 +71,26 @@ non-trivial code. This page is the quick-reference gotcha list.
     MAC alternates between physical (boot) and virtual (daemon), so
     `MACAddress=` is unreliable. `ensureRethLinkOriginalName()`
     auto-fixes stale files.
+  - **The pre-rename name comes from the KERNEL, not from arithmetic
+    (#6677).** `deriveKernelName()` asks for the interface's kernel
+    ALTERNATIVE names first and only falls back to deriving one from the
+    sysfs PCI address. Altnames are the candidate set udev itself computed
+    and are stable across renames, so they stay correct after xpf has
+    renamed the interface — which is exactly when the pre-rename name has
+    to be recovered.
+    Re-deriving from the address cannot match systemd, which has at least
+    three inputs the address string does not carry (all measured on real
+    hardware, systemd 261): **ARI** folds slot and function into one 8-bit
+    function number; an **SR-IOV VF** is named from its *physical*
+    function's address plus the VF index (`0000:b7:02.0`, physfn
+    `0000:b7:00.0`, is `enp183s0f0v0` — the address-only derivation says
+    `enp183s2f0`); and a multi-port NIC carries an **`npN` port suffix**
+    (`enp183s0f0np0`). Altname selection follows systemd's default
+    `NamePolicy` order — onboard (`eno`), slot (`ens`), path (`enp`) —
+    because a device commonly carries several at once and the first the
+    policy resolves is the one udev assigns. `eth` is accepted last only,
+    and a MAC-based `enx` name never. #7415 tracks the one divergence that
+    could not be reproduced on available hardware.
   - **Collision-safe positional rename (#4178).** The positional loop
     (`renamePositional`) is two-pass, like device-map mode: it captures
     every NIC's `OriginalName=` from the existing `.link` set BEFORE
