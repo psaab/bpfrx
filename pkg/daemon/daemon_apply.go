@@ -49,6 +49,83 @@ func setVLANSubAddrGenMode(iface string) {
 func (d *Daemon) applyConfig(cfg *config.Config) {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
+	d.applyConfigUnderSem(cfg)
+}
+
+// applyActiveConfig applies whatever config is ACTIVE at the moment the apply
+// semaphore is acquired, rather than one the caller captured before waiting for
+// it (#6716).
+//
+// The background callbacks — a DHCP lease change, a dynamic-feed update, the
+// boot-time apply — all want "reconcile against the current config", not
+// "reconcile against the config that was current when I woke up". They used to
+// read store.ActiveConfig() and only THEN block on applySem, so a commit that
+// landed while they waited was silently reverted by the older snapshot: every
+// subsystem applyConfigLocked reconciles was driven from config A after the
+// operator had committed config B, with no error anywhere.
+//
+// The sharpest instance is a REVOKED api-auth credential being republished by a
+// DHCP callback that happened to be waiting, but the inversion re-applies any
+// A-vs-B difference — bind address, TLS, and everything else the apply pipeline
+// touches. It also made the applied-stamp lie: applyConfig marks the ACTIVE
+// config applied afterwards, so on the inverted path it stamped B applied while
+// A was what ran, and handleConfigSync's #4957 converged shortcut then skipped
+// re-applying B on a peer sync, letting the divergence survive a reconnect.
+//
+// Re-reading under the semaphore closes both halves at once and makes the stamp
+// honest by construction: a commit cannot land between the read and the apply,
+// because a commit needs this same semaphore.
+//
+// A nil active config means there is nothing to reconcile (the pre-boot window)
+// and is a no-op, matching the guard every caller previously wrote inline.
+// applyConfig(cfg) is retained for callers that genuinely mean "apply THIS
+// config" — the commit paths use applyConfigLocked directly, and tests drive a
+// synthetic config through it.
+func (d *Daemon) applyActiveConfig() {
+	_ = d.applySem.Acquire(context.Background(), 1)
+	defer d.applySem.Release(1)
+	if d.store == nil {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	d.applyConfigUnderSem(cfg)
+}
+
+// applyActiveConfigResult is applyActiveConfig that RETURNS the apply error
+// instead of only logging it.
+//
+// The feed onUpdate publication path (#5646) uses the returned result to decide
+// whether the feed content was ACCEPTED: the feed manager advances its per-feed
+// published-hash only on a nil return, so a rejected apply leaves publication
+// debt that the next identical refetch retries, rather than committing the
+// content hash and suppressing retry forever. The returned error is still
+// logged — by feeds.installSnapshot's reject branch, not here.
+//
+// A nil active config returns nil: the pre-boot vacuous success the feed
+// manager relies on to record content as published rather than spinning.
+//
+// This replaces applyConfigResult(cfg), which is deliberately gone rather than
+// left unused. It was the natural-looking entry point for exactly the callers
+// that must not pre-capture a config, so keeping a dead copy would invite the
+// #6716 inversion straight back in.
+func (d *Daemon) applyActiveConfigResult() error {
+	_ = d.applySem.Acquire(context.Background(), 1)
+	defer d.applySem.Release(1)
+	if d.store == nil {
+		return nil
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return nil
+	}
+	return d.applyConfigLocked(context.Background(), cfg)
+}
+
+// applyConfigUnderSem is applyConfig's body. The caller MUST hold d.applySem.
+func (d *Daemon) applyConfigUnderSem(cfg *config.Config) {
 	// Boot / DHCP-callback / feed / config-poll applies must always run to
 	// completion (they are not request-bound and there is no operator waiting
 	// to cancel them), so the heavy pipeline is driven with a non-cancellable
@@ -69,21 +146,6 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.store != nil {
 		d.store.MarkActiveApplied()
 	}
-}
-
-// applyConfigResult applies cfg exactly like applyConfig — under the apply
-// semaphore with a non-cancellable context — but RETURNS the apply error
-// instead of only logging it. The feed onUpdate publication path (#5646) uses
-// the returned result to decide whether the feed content was ACCEPTED: the feed
-// manager advances its per-feed published-hash only on a nil return, so a
-// rejected apply leaves publication debt that the next identical refetch
-// retries (rather than committing the content hash and suppressing retry
-// forever, the pre-#5646 bug). The returned error is still logged — by
-// feeds.installSnapshot's reject branch (feeds side), not by this function.
-func (d *Daemon) applyConfigResult(cfg *config.Config) error {
-	_ = d.applySem.Acquire(context.Background(), 1)
-	defer d.applySem.Release(1)
-	return d.applyConfigLocked(context.Background(), cfg)
 }
 
 // applyCancelCtx returns the context whose cancellation aborts the heavy apply

@@ -12,7 +12,8 @@
 //                        resolve_tx_binding_ifindex,
 //                        and the slot-resolution helpers).
 // - `slow_path`       — handle_forward_build_failure,
-//                       maybe_reinject_slow_path*,
+//                       maybe_reinject_slow_path*, slow_path_admit
+//                       (the single admit/refuse decision, #6664),
 //                       extract_l3_packet* family. All marked
 //                       #[cold] #[inline(never)] per AGY round-2
 //                       finding D.
@@ -53,7 +54,7 @@ use shared_recycle::{
 };
 pub(in crate::afxdp) use slow_path::{
     extract_l3_packet_with_nat, handle_forward_build_failure, maybe_reinject_slow_path,
-    maybe_reinject_slow_path_from_frame,
+    maybe_reinject_slow_path_from_frame, slow_path_admit,
 };
 // pub(in crate::afxdp::tx) was previously pub(super) on the
 // extract_l3_packet[_from_frame] family; the re-export keeps the

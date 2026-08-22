@@ -197,6 +197,18 @@ type authConn struct {
 	readKey  []byte
 	writeKey []byte
 
+	// bootIncarnation is the peer boot id the BulkStart on THIS connection
+	// primed under (#5084). Zero until an incarnated prime arrives, and zero
+	// forever against a peer that predates the field. Per connection rather
+	// than per slot because a config payload must be stamped with the
+	// incarnation of the stream that carried it, not with whatever the other
+	// fabric last saw.
+	//
+	// unincarnatedWarned makes the fail-open notice ONE line per connection
+	// instead of one per prime.
+	bootIncarnation    bootIncarnation
+	unincarnatedWarned bool
+
 	// authPSK is the control-link PSK this connection's authentication was
 	// established under — the staleness test the #6628 reconciler uses. Nil on
 	// an unauthenticated connection. It is what lets ReconcileConnectionAuth

@@ -164,10 +164,40 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 		if resp.Error == "" {
 			resp.Error = "unknown helper error"
 		}
-		return ControlResponse{}, errors.New(resp.Error)
+		return ControlResponse{}, newHelperRejection(resp.Error)
 	}
 	return resp, nil
 }
+
+// errHelperRejected marks an IN-BAND refusal: the helper decoded the request,
+// ran its handler (for apply_snapshot, the non-mutating integrity preflight)
+// and answered `{"ok":false}`. It is the ONLY error class from which "the
+// helper still holds the state it held before this request" follows.
+//
+// Every other failure of a control round trip — dial, write, response-decode,
+// EOF, deadline — leaves the helper's state UNKNOWN, and not merely in
+// principle: controlRoundtripDeadline exists because a fixed 3s deadline
+// "reported the apply FAILED while the dataplane had applied it live"
+// (requestDetailedLocked above). Treating that as "the helper kept the old
+// snapshot" is precisely the inversion that turns a fail-closed compensation
+// into a fail-open one, which is why #7468's atomic retain is gated on this
+// sentinel and not on `err != nil`.
+var errHelperRejected = errors.New("userspace helper rejected the request")
+
+// helperRejectedError carries the helper's own message VERBATIM while matching
+// errHelperRejected under errors.Is.
+//
+// A wrapping fmt.Errorf("%w: %s", ...) would prepend a prefix to every in-band
+// refusal the helper can produce, changing operator-facing text on paths that
+// have nothing to do with #7468. The classification is new information about an
+// existing error, so it is added beside the message rather than in front of it.
+type helperRejectedError struct{ msg string }
+
+func newHelperRejection(msg string) error { return &helperRejectedError{msg: msg} }
+
+func (e *helperRejectedError) Error() string { return e.msg }
+
+func (e *helperRejectedError) Is(target error) bool { return target == errHelperRejected }
 
 // sessionSocketPath returns the path to the dedicated session sync socket.
 func (m *Manager) sessionSocketPath() string {

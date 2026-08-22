@@ -1186,9 +1186,8 @@ impl ForwardingDisposition {
     ///     try, rate-limited.
     ///   - `MissingNeighbor`: route exists, ARP/NDP unresolved; the kernel
     ///     can resolve and forward (the userspace prober runs in parallel).
-    ///   - `NextTableUnsupported`: inter-VRF next-table the helper does not
-    ///     implement; defer to the kernel FIB.
     ///
+
     /// NOT eligible (drop — do NOT reinject):
     ///   - `PolicyDenied`: a zone-policy DENY. Reinjecting would silently
     ///     bypass the firewall by forwarding the packet via the kernel FIB
@@ -1198,6 +1197,33 @@ impl ForwardingDisposition {
     ///     (duplicate/asymmetric forwarding, wrong-node plaintext send).
     ///   - `DiscardRoute`: matched a discard/reject route whose entire
     ///     purpose is to drop the traffic.
+    ///   - `NextTableUnsupported`: an inter-VRF next-table chain the helper
+    ///     cannot resolve — deeper than `MAX_NEXT_TABLE_DEPTH`, or a cycle
+    ///     (`fib.rs`). Reinjecting handed it to the kernel FIB, which forwards
+    ///     with no zone policy, session, NAT or screen (#6664).
+    ///
+    ///     Unlike `NoRoute` this is NOT transient, so the #7409 "do not
+    ///     black-hole a destination the kernel can still reach" argument does
+    ///     not apply: no FIB refresh resolves an over-deep or cyclic chain, so
+    ///     delegating it was a STANDING policy bypass for that config rather
+    ///     than a window. Failing closed matches the posture this codebase
+    ///     already takes when the dataplane cannot represent a config.
+    ///
+    ///     This is defense-in-depth, not a live exposure fix, and the
+    ///     distinction is worth stating honestly: no config that reaches the
+    ///     dataplane can currently produce this disposition. Every
+    ///     `next_table`-bearing route in the FIB lives in the GLOBAL table --
+    ///     the only two producers are the global static-route pass and the
+    ///     synthetic ip-rule leak pass, and a next-table authored UNDER a
+    ///     routing-instance is hard-rejected at commit (#5830) and dropped
+    ///     from the snapshot even on the tolerant load / peer-sync path
+    ///     (`pkg/dataplane/userspace/routes.go`). So the recursion is at most
+    ///     one hop, global -> instance, and it terminates there: neither the
+    ///     depth cap nor a cycle is reachable. That safety is an EMERGENT
+    ///     property of two guards in a different language and package, not an
+    ///     invariant this predicate enforces -- a third `next_table` producer,
+    ///     or one relaxed guard, would silently reopen the bypass. Fail closed
+    ///     here so the dataplane's own posture is correct on its own terms.
     ///   - `ForwardCandidate` / `FabricRedirect`: handled by the forward /
     ///     fabric path, never the generic slow path. The ONE intentional
     ///     unfiltered `_from_frame` caller — the ForwardCandidate
@@ -1213,7 +1239,6 @@ impl ForwardingDisposition {
             ForwardingDisposition::LocalDelivery
                 | ForwardingDisposition::NoRoute
                 | ForwardingDisposition::MissingNeighbor
-                | ForwardingDisposition::NextTableUnsupported
         )
     }
 }

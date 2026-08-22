@@ -185,6 +185,26 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if len(payload) >= 8 {
 			epoch = binary.LittleEndian.Uint64(payload[:8])
 		}
+		// #5084: the peer's boot incarnation, when it sent one. Recorded on the
+		// CONNECTION so every config payload arriving on it is stamped with the
+		// incarnation that primed it, and compared against the receiver-wide
+		// current incarnation to decide a namespace switch.
+		//
+		// ORDER MATTERS: both records land BEFORE resetRecvGen below. Reversing
+		// them opens a window in which the high-waters are already zeroed while
+		// the current incarnation is still the DEAD one, so a prior-boot payload
+		// dequeued by configApplyLoop in that window passes the fence and
+		// records its (large) generation — the exact defect this exists to
+		// close. In this order there is no such window.
+		//
+		// Not covered by a test, and deliberately called out rather than left
+		// implied: binding it would mean interleaving the apply-loop goroutine
+		// between two adjacent statements here, which no deterministic fixture
+		// in this package can do. A mutation moving both records after the
+		// reset leaves the whole suite green.
+		inc := parseBootIncarnation(payload)
+		s.noteConnBootIncarnation(conn, inc)
+		switched := s.notePeerBootIncarnation(inc)
 		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
 		s.stats.BulkSyncEndTime.Store(0)
 		s.stats.BulkSyncSessions.Store(0)
@@ -201,7 +221,16 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
 		s.bulkZoneSnapshot = zoneSnap
 		s.bulkMu.Unlock()
-		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch, "local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn))
+		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch,
+			"peer_boot_incarnation", inc.String(), "incarnation_switched", switched,
+			"local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn))
+		// #5084: a peer that primes without an incarnation gets today's
+		// generation-only ordering (fail open). Warn ONCE per connection, not
+		// per frame — a silent fallback is how a half-upgraded cluster hides,
+		// and the CLAUDE.md logging rule forbids the per-frame version.
+		if !inc.known() {
+			s.warnUnincarnatedPrimeOnce(conn)
+		}
 	case syncMsgBulkEnd:
 		var epoch uint64
 		if len(payload) >= 8 {
@@ -323,7 +352,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// speak for the current one. See noteHeartbeatAck (sync_conn.go).
 		s.noteHeartbeatAck(conn)
 	case syncMsgConfig:
-		s.handleConfigPayload(payload)
+		s.handleConfigPayload(conn, payload)
 	case syncMsgConfigEncrypted:
 		// #6629: same payload, sealed under this connection's ephemeral key.
 		// Decrypt, then hand the plaintext to the SAME handler — the two arms
@@ -360,7 +389,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				"err", err, "remote", connRemoteAddrString(conn))
 			return
 		}
-		s.handleConfigPayload(plaintext)
+		s.handleConfigPayload(conn, plaintext)
 	case syncMsgConfigKeyExchange:
 		s.handleConfigKeyExchange(conn, payload)
 	case syncMsgAuthUpgradeHello:
@@ -586,7 +615,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 // generation high-water accounting and the apply-queue admission must be
 // identical for the two — a divergence between them is always a bug, so the
 // behaviour is single-sourced rather than duplicated and kept in agreement.
-func (s *SessionSync) handleConfigPayload(payload []byte) {
+// The conn parameter is #5084: the payload is stamped with the boot incarnation
+// the CONNECTION primed under, so a payload queued from a peer's prior boot can
+// be dropped at apply time rather than applying across a reset and stranding
+// the high-water.
+func (s *SessionSync) handleConfigPayload(conn net.Conn, payload []byte) {
 	s.stats.ConfigsReceived.Add(1)
 	s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())
 	configText, gen := decodeConfigPayload(payload)
@@ -604,6 +637,33 @@ func (s *SessionSync) handleConfigPayload(payload []byte) {
 	// needs no CAS") holds per connection but there are TWO receive loops,
 	// so a raise driven by one fabric raced resetRecvGen's clear driven by
 	// the other and could re-raise the mark that clear had just zeroed.
+	// #5084: a payload arriving under a peer boot incarnation that a re-prime
+	// has ALREADY replaced is dead, and has to be refused here as well as at
+	// apply. recordRecvConfigGen below is a monotone max that gates
+	// manual-failover readiness (#5563 refuses promotion while PeerConfigGen >
+	// AppliedConfigGen), and a dead incarnation's generation is drawn from the
+	// peer's PRE-reboot counter, so it is far higher than anything the live
+	// incarnation can produce. Raising the received mark for a payload the
+	// apply loop is then going to drop would strand the standby reading
+	// config-stale, with nothing able to close the gap short of another
+	// re-prime — trading the #5084 divergence for a different silent wedge.
+	//
+	// The apply-time check is NOT made redundant by this one. This site sees
+	// only payloads that ARRIVE after the switch; the apply-time site catches a
+	// payload that was already QUEUED when the re-prime landed, which is the
+	// reported defect ("resetRecvGen does not drain items already queued from
+	// the prior boot"). Neither site subsumes the other.
+	item := configApplyItem{gen: gen, text: configText, incarnation: s.connBootIncarnation(conn)}
+	if s.configItemIncarnationStale(item) {
+		s.stats.ConfigsDeadIncarnationDropped.Add(1)
+		slog.Warn("cluster sync: dropping config received under a replaced peer boot "+
+			"incarnation — the peer rebooted and re-primed, so this payload's generation "+
+			"is incomparable with the current one (#5084)",
+			"item_incarnation", item.incarnation.String(),
+			"current_incarnation", s.PeerBootIncarnation().String(),
+			"gen", gen, "size", len(configText), "remote", connRemoteAddrString(conn))
+		return
+	}
 	s.recordRecvConfigGen(gen)
 	// #3931: enqueue onto the single-consumer ordered apply queue instead
 	// of spawning a racing `go OnConfigReceived`. The receiveLoop is
@@ -613,7 +673,7 @@ func (s *SessionSync) handleConfigPayload(payload []byte) {
 	// heartbeats on this connection.
 	if s.configApplyCh != nil {
 		select {
-		case s.configApplyCh <- configApplyItem{gen: gen, text: configText}:
+		case s.configApplyCh <- item:
 		default:
 			// Ordered apply queue full — practically impossible (commits
 			// are seconds apart, apply is sub-second). Drop with an alarm;

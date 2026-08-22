@@ -750,7 +750,10 @@ control plane still reported the old one. That divergence is a policy
 BYPASS, not merely an outage. Both pre-publish failure modes drive the
 shim to `ctrl.Enabled=0` — `programBootstrapMapsLocked` programs it
 disabled, and `publishSnapshotFailClosedLocked` disables it on the
-same-plan path (#4959) — and a disabled ctrl DROPS transit on every
+same-plan path (#4959), EXCEPT where #7468's atomic retain applies (an
+in-band helper refusal with a retained snapshot: the classifier maps are
+rolled back to it and ctrl stays enabled, because the maps then match
+what the helper is enforcing) — and a disabled ctrl DROPS transit on every
 interface that still carries the shim, because
 `degraded_ctrl_disabled_action` runs before the ingress-map test in
 `userspace-xdp/src/lib.rs`. An interface that has already been detached

@@ -64,6 +64,7 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.slow_path_missing_neighbor_packets = 0;
         binding.slow_path_no_route_packets = 0;
         binding.slow_path_next_table_packets = 0;
+        binding.next_table_unsupported_drops = 0;
         binding.slow_path_forward_build_packets = 0;
         binding.slow_path_drops = 0;
         binding.slow_path_rate_limited = 0;
