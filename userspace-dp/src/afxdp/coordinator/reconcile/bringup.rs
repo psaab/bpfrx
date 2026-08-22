@@ -169,7 +169,18 @@ pub(super) fn bring_up_workers(
     // `await_readiness` relies on (the barrier never sees `Disconnected` while
     // this sender lives).
     let (startup_report_tx, startup_report_rx) = mpsc::channel::<WorkerStartupReport>();
-    match spawn_workers(coord, workers, worker_command_queues, dnat_fds, &startup_report_tx) {
+    match spawn_workers(
+        coord,
+        workers,
+        // #6311: the node discriminator for every spawned worker's session-id
+        // namespace. Read from the SNAPSHOT being brought up, so a node id that
+        // changed since the last reconcile takes effect with the plan that
+        // carried it.
+        snapshot.node_id,
+        worker_command_queues,
+        dnat_fds,
+        &startup_report_tx,
+    ) {
         // #4952 differential ARM 1 (stays in the shell): a spawn failed on the
         // post-teardown path. Return WITHOUT `stop_inner` — the already-launched
         // workers KEEP their records (reclaimed by the next reconcile's
@@ -540,6 +551,7 @@ pub(in crate::afxdp) fn ensure_resolver(coord: &mut Coordinator) -> Option<Arc<N
 fn spawn_workers(
     coord: &mut Coordinator,
     workers: BTreeMap<u32, Vec<BindingPlan>>,
+    node_id: u8,
     worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>>,
     dnat_fds: DnatTableFds,
     startup_report_tx: &mpsc::Sender<WorkerStartupReport>,
@@ -640,7 +652,7 @@ fn spawn_workers(
         // `coord` HERE and are then MOVED into the worker body, which
         // never touches `coord` (it must be 'static for the spawn).
         let launch_plan =
-            WorkerLaunchPlan::new(worker_id, binding_plans, worker_poll_mode, dnat_fds);
+            WorkerLaunchPlan::new(worker_id, node_id, binding_plans, worker_poll_mode, dnat_fds);
         let shared_dataplane = WorkerSharedDataplane::from_coord(coord);
         let control_channels = WorkerControlChannels::new(
             commands_clone,

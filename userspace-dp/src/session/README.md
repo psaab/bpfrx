@@ -1438,21 +1438,47 @@ to put on the wire.
 - **Generation** — `SessionTable::alloc_session_id` (called once per fresh
   install in `install_with_protocol_with_origin`, and once per peer-synced
   import in `upsert_synced_with_origin` **only when no wire id was carried** —
-  see #5212 below) returns `(worker_id << 48) | counter`, the per-worker counter
-  starting at 1. The worker id (set at worker setup via `set_worker_id`)
-  namespaces the id so it is unique across the node's shared-nothing per-worker
-  `SessionTable`s; the counter is monotonic, so a reused 5-tuple (same worker)
-  gets a DISTINCT id. `0` is reserved as the wire "unknown" sentinel — a real id
-  is never 0. **Worker id `0xFFFF` is reserved for the Go control plane (#6198)**:
-  `nextUserspaceSyncedSessionID` (`pkg/daemon/daemon_ha_userspace_convert.go`)
-  mints `0xFFFF << 48 | counter48` for the peer-synced sessions the daemon writes
-  into the SAME BPF conntrack mirror field, so the two id spaces stay disjoint.
-  Unreachable today (`binding.worker_id` is bounded by the worker count), but any
-  re-partition of these high bits must preserve it — `set_worker_id` ENFORCES the
-  reservation with a hard `assert!` (not `debug_assert!`: the helper and
-  `make test-rust` both build `--release`, where a debug assertion is stripped).
-  Pinned by `session::tests::set_worker_id_rejects_the_control_plane_namespace_6198`
-  and its negative control.
+  see #5212 below) returns `(namespace << 48) | counter`, the per-worker counter
+  starting at 1. The **namespace** is `node_bit << 15 | worker_id` (#6311), set
+  at worker setup via `set_session_id_namespace(node_id, worker_id)`:
+
+  - the **worker half** (15 bits) makes the id unique across the node's
+    shared-nothing per-worker `SessionTable`s;
+  - the **node half** (1 bit, from `ConfigSnapshot.node_id`) makes it unique
+    across the CLUSTER, so a peer id ADOPTED verbatim on import (#5212) can
+    never collide with an id this node mints. Both nodes otherwise run the same
+    worker set (queue indices 0..N) with counters that both start at 1, so in
+    active/active low-counter collisions were essentially guaranteed — and that
+    also regressed pre-#5212 same-node uniqueness, where every import got a
+    fresh local id. Node 0's layout is bit-for-bit the pre-#6311 one.
+
+  The counter is monotonic, so a reused 5-tuple (same worker) gets a DISTINCT
+  id. `0` is reserved as the wire "unknown" sentinel — a real id is never 0.
+
+  Two invariants are ENFORCED with hard `assert!`s (not `debug_assert!`: the
+  helper and `make test-rust` both build `--release`, where a debug assertion is
+  stripped), at worker setup, where `docs/engineering-style.md` prefers
+  crash-start over running with a wrong invariant:
+
+  - **Namespace `0xFFFF` is reserved for the Go control plane (#6198)**:
+    `nextUserspaceSyncedSessionID` (`pkg/daemon/daemon_ha_userspace_convert.go`)
+    mints `0xFFFF << 48 | counter48` for the peer-synced sessions the daemon
+    writes into the SAME BPF conntrack mirror field, so the two id spaces stay
+    disjoint. Post-#6311 that value is node-bit-1 plus worker `0x7FFF`, so the
+    assert guards the COMBINED namespace rather than the worker half alone.
+  - **A worker id above `0x7FFF` is REFUSED, not masked** (#6311): masking would
+    carry into the node bit and mint ids inside the PEER node's namespace — a
+    silent cross-node collision, strictly worse than the counter aliasing the old
+    16-bit mask prevented.
+
+  Both unreachable today (`binding.worker_id` is bounded by
+  `MAX_NAT_HOLDER_WORKERS` = 128 where it is minted), which is why they are
+  pinned rather than merely documented:
+  `session::tests::set_worker_id_rejects_the_control_plane_namespace_6198` and its
+  negative control,
+  `set_session_id_namespace_refuses_a_worker_id_that_would_reach_the_node_bit_6311`,
+  `session_id_carries_the_node_discriminator_6311`, and
+  `adopted_peer_id_cannot_collide_with_a_local_id_6311`.
 - **Storage** — write-once on `SessionEntry.session_id`, never re-stamped, so a
   session's create and close read the same value.
 - **Wire** — harvested onto the Open/Close `SessionDelta.session_id` and encoded
