@@ -100182,6 +100182,14 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha_sync.go`,
   `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_state_fence_rearm_6530_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6527 single-RG transfer-commit rollback
+- **Timestamp**: 2026-08-21
+- **Action**: Roll back `peerTransferOutOverride` when
+  `commitRequestedPeerFailover` loses the election, mirroring the batch path;
+  agreement-binding regression test across both request paths.
+- **File(s)**: `pkg/cluster/failover.go`,
+  `pkg/cluster/failover_commit_rollback_6527_test.go`,
+  `pkg/cluster/README.md`
 ## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
 
 - **Timestamp**: 2026-08-21
