@@ -104026,3 +104026,27 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: userspace-dp/src/server/helpers/planning.rs,
   userspace-dp/src/server/handlers/snapshot.rs,
   userspace-dp/src/main_tests.rs
+
+## 2026-08-22 — #6750 failed reconcile no longer retains the requested state
+- **Action**: Re-derived the rotted cites by SYMBOL at `ac4f5dce1`. All three
+  control handlers (`set_forwarding_state`, `set_binding_state`,
+  `set_queue_state`) commit the REQUESTED arm/registration bits into
+  `guard.status` and only then call `reconcile_status_bindings`. #5621/#6135 made
+  the failure honest to the CALLER (ok=false + error, no persist) but left the
+  committed state committed, so the helper reported a posture its AF_XDP sockets
+  had never been reconciled to. The suppression half is on the Go side:
+  `syncDesiredForwardingStateLocked` short-circuits on
+  `m.lastStatus.ForwardingArmed == desired`, and the 1 Hz poll feeds
+  `m.lastStatus` straight from the helper (`applyHelperStatusLocked` ->
+  `recordHelperStatusLocked`, maps_sync.go:503) — so the poll ADOPTS the retained
+  value, the equality holds, and the retry is never sent. Fix: one shared
+  `BindingArmSnapshot` capture/restore in `helpers/status.rs`, used by all three
+  handlers, restoring the global flag and the per-slot registered/armed/
+  last_change on the reconcile-failure path only. Restoring makes the helper
+  truthful, which is all automatic recovery needs — no new retry machinery and
+  no persisted debt, so the issue's larger desired/applied split is not required.
+- **File(s)**: userspace-dp/src/server/helpers/status.rs,
+  userspace-dp/src/server/handlers/forwarding.rs,
+  userspace-dp/src/server/handlers/binding.rs,
+  userspace-dp/src/server/handlers/queue.rs,
+  userspace-dp/src/server/tests.rs

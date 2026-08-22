@@ -2,8 +2,8 @@
 // to handlers.rs lines 132-155.
 
 use super::super::helpers::{
-    forwarding_unsupported_error, reconcile_status_bindings, refresh_status,
-    set_bindings_forwarding_armed,
+    capture_binding_arm_state, forwarding_unsupported_error, reconcile_status_bindings,
+    refresh_status, restore_binding_arm_state, set_bindings_forwarding_armed,
 };
 use super::super::ServerState;
 use crate::{ControlResponse, ForwardingControlRequest};
@@ -35,6 +35,9 @@ pub(super) fn set(
         response.error = forwarding_unsupported_error(&guard.status.capabilities);
         return;
     }
+    // #6750: capture BEFORE the commit so a failed reconcile can put the
+    // helper's report back to the truth. See BindingArmSnapshot.
+    let prior = capture_binding_arm_state(&guard.status);
     guard.status.forwarding_armed = forwarding_req.armed;
     set_bindings_forwarding_armed(&mut guard.status, forwarding_req.armed);
     // #3789: arming/disarming reconciles the ALREADY-ACCEPTED stored
@@ -53,6 +56,12 @@ pub(super) fn set(
     if let Err(err) = reconcile_status_bindings(guard) {
         response.ok = false;
         response.error = format!("forwarding reconcile failed: {err}");
+        // #6750: roll the requested state back BEFORE refreshing, so the
+        // refreshed status describes what the sockets are actually doing. Go's
+        // 1 Hz poll then sees the real state, its
+        // `lastStatus.ForwardingArmed == desired` short-circuit fails, and the
+        // next tick retries by itself.
+        restore_binding_arm_state(&mut guard.status, prior);
         refresh_status(guard);
         return;
     }
