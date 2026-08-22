@@ -18,7 +18,7 @@ import (
 // HTTP servers. The DHCP one is live before the write:
 //
 //	daemon_run_bringup.go  dhcp.New(..., d.onDHCPAddressChange, ...)  callback wired
-//	daemon_run_bringup.go  boot d.applyConfig(cfg)
+//	daemon_run_bringup.go  boot d.applyActiveConfig()
 //	 -> daemon_apply_routing.go  reconcileDHCPClients(cfg)            client goroutines START
 //	daemon_run.go          d.startClusterComms(ctx)                   the WRITE happens here
 //

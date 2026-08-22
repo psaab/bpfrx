@@ -103522,3 +103522,56 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_spelling_gate_coverage_7484_test.go (new),
   pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
 
+## 2026-08-22 — #6716 background applies re-read the active config
+- **Timestamp**: 2026-08-22
+- **Action**: Background apply callbacks (DHCP lease change, dynamic feed,
+  boot-time apply) captured store.ActiveConfig() BEFORE waiting on applySem and
+  then applied that snapshot, silently reverting a commit that landed during the
+  wait. Added applyActiveConfig / applyActiveConfigResult, which re-read under
+  the semaphore; removed the now-dead applyConfigResult so the pre-capturing
+  entry point cannot be reached again.
+- **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_dhcp.go,
+  pkg/daemon/daemon_feeds.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/apply_active_reread_6716_test.go,
+  pkg/daemon/cluster_transport_race_6290_test.go
+
+## 2026-08-22 — #6707 consequence 1 / #7468 atomic retain on a rejected publish
+- **Action**: A rejected `apply_snapshot` on the samePlanRefresh path disabled
+  `userspace_ctrl`, dropping ALL transit for up to a second on every rejected
+  policy update, and on a FIRST apply returned before `ensureStatusLoopLocked()`
+  so the manager was left inert with transit dropped indefinitely. #6707's own
+  fix direction ("do not disable ctrl when the helper retained a usable
+  snapshot") is unsafe as written — it leaves the new-plan maps in place, the
+  #4959 fail-open. Implemented the safe form: roll the classifier maps BACK to
+  `m.lastSnapshot` so they match what the helper is enforcing, and only for an
+  IN-BAND helper refusal (`errHelperRejected`, a decoded `{"ok":false}`), which
+  is the only class proving the helper retained its snapshot. A transport error
+  keeps the ctrl-disable — `controlRoundtripDeadline` exists because a deadline
+  once reported an apply failed while the dataplane had applied it live, so
+  rolling back there would leave the maps a generation BEHIND. Also start the
+  reconcile worker on any rejected publish; proved safe because a helper holding
+  no snapshot reports no bindings and `status.enabled` requires
+  `!bindings.is_empty()`. Corrected the "or any transport error … keeps
+  enforcing the previous-good snapshot" claim in both the code comment and the
+  architecture doc.
+- **File(s)**: pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/publish_reject_retain_7468_test.go (new),
+  docs/userspace-dataplane-architecture.md, pkg/dataplane/README.md
+
+## 2026-08-22 — #6519 stage 1.5: the DHCP host-inbound advisory names the ROLE
+- **Action**: The #6519 advisory now annotates each reported interface with WHY
+  the zone-level `dhcp`/`bootp` token is load-bearing there — `DHCP server`
+  (dhcp-local-server / dhcpv6-local-server / dhcp-relay member: the case the
+  vendor sentence covers), `DHCP client` (`family inet { dhcp; }`: the case it
+  does NOT reach, where the token holds up the interface's ADDRESS), or
+  `no DHCP configured` (pure over-admission, safe to remove today). That role is
+  the exact discriminator the deferred stage-2 enforcement flip turns on. Also
+  fixed the remedy to warn that a per-interface stanza REPLACES the zone stanza
+  (#6515), which following stage 1's wording verbatim would silently rely on.
+  Enforcement unchanged; WARN-only.
+- **File(s)**: `pkg/config/host_inbound_dhcp_scope_6519.go`,
+  `pkg/config/host_inbound_dhcp_role_6519_test.go` (new),
+  `pkg/config/testdata/golden_4406.json`,
+  `docs/host-inbound-service-matrix.md`

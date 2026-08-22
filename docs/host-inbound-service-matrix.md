@@ -1358,6 +1358,40 @@ Three details that matter:
   and after #6515 makes the interface level replace the zone level, without
   asserting which rule is in force.
 
+### The advisory names the DHCP ROLE on each interface (stage 1.5)
+
+The advisory annotates every interface it reports with WHY the zone-level token
+is load-bearing there, because that role is exactly the discriminator the
+deferred enforcement flip turns on:
+
+| label | source | what a flip would mean there |
+|---|---|---|
+| `DHCP server` | a `dhcp-local-server` / `dhcpv6-local-server` group member, or a `dhcp-relay` group member | The case the vendor sentence covers — the server must know the incoming interface. Migrating to the interface stanza **matches Junos**. |
+| `DHCP client` | the unit runs `family inet { dhcp; }` | The case the vendor sentence does **not** reach. The token is holding up the interface's **address**, not merely a service: a flip that dropped it would cost that interface its lease renewals. Move the token; do not drop it. |
+| `no DHCP configured` | neither of the above | Pure over-admission — the token opens udp/67-68 for nothing. **Removing it narrows nothing in use, today, at no risk.** |
+
+A relay counts as the server role because it too receives client DISCOVER on
+udp/67 and must know the incoming interface to send the reply back.
+
+Role matching treats a bare physical ref and a unit under it as the same
+interface (the #3720 physical/unit relationship, `reth1` ↔ `reth1.0`) but keeps
+two DIFFERENT units distinct (`reth1.0` vs `reth1.50`) — basing both sides on the
+physical would leak a sibling unit's DHCP role onto an interface that has none,
+and label an idle interface as vendor-backed for migration when it is not.
+
+Only the v4 client is consulted: the tokens this advisory covers open udp/67-68,
+and `dhcpv6` is deliberately outside the vendor sentence (above).
+
+### The remedy accounts for #6515 replace semantics
+
+Stage 1's remedy said "move the token to `interfaces <if> host-inbound-traffic
+system-services ...`". Under #6515, a per-interface stanza **REPLACES** the zone
+stanza on that interface, so following that verbatim drops every OTHER service
+the zone admitted there — a zone admitting `ping ssh dhcp` narrows to `dhcp`
+alone on the migrated interface. The sibling #6515 advisory does catch it and
+names the lost tokens, but only on a LATER commit, after the narrowing has
+already been authored. The message now carries the caveat up front.
+
 ### Why the enforcement flip is staged separately
 
 Withdrawing the zone-level authorization is a NARROWING with a real population,
