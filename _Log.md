@@ -1,3 +1,64 @@
+## 2026-08-21 — #5858: tightening an interface input filter reported clean while established sessions kept forwarding
+
+- **Timestamp**: 2026-08-21 (fix/5858-filter-change-advisory)
+- **Action**: Added a commit-time advisory when a commit attaches or tightens an
+  interface INPUT filter that can deny, and bound it to the existing policy
+  invalidation through one entry point so a commit path cannot wire one without
+  the other.
+- **File(s)**: `pkg/daemon/daemon_filter_invalidate_5858.go` (new),
+  `pkg/daemon/daemon_filter_invalidate_5858_test.go` (new),
+  `pkg/daemon/daemon_apply_commit.go`, `docs/sync-protocol.md`,
+  `docs/feature-gaps.md`
+
+  The session-hit fast path re-evaluates an input filter only when its match
+  semantics genuinely vary per packet (DSCP / per-packet L4). A purely static
+  address/protocol/port `then discard` added after a session exists is never
+  rechecked, so that flow forwards until it idles out.
+
+  The asymmetry is what makes it a defect rather than a known limitation:
+  tightening a POLICY revokes established sessions at commit
+  (clearSessionsForPolicyChanges — the #4234 deletion clear, the modified-policy
+  re-eval, the #4342 default-policy clear), and tightening an interface FILTER
+  does not, though the exposure is the same class. An operator who has watched a
+  policy tightening take effect immediately has every reason to expect the same.
+
+  NOT the policy-style clear, deliberately. Two rounds of hostile plan review on
+  #5858 killed it and both reasons re-verify: the policy clear drops sessions
+  ATTRIBUTED to the changed policy, while an interface clear would drop every
+  session INGRESSING that interface — on a WAN, all transit traffic, for a filter
+  change that may deny none of it; and dropping permitted flows is not free,
+  because the non-persistent PAT allocator hands out a fresh monotonic-cursor
+  port before draining the recycle FIFO, so a purged-then-recreated permitted
+  SNAT flow reinstalls on a DIFFERENT translated port and breaks. Revoking
+  authorization the operator removed is correct; breaking flows they did not
+  touch is not. The correct fix is per-tuple revalidation in the Rust dataplane
+  and is tracked separately.
+
+  The advisory rides `newCfg.Warnings`, which CommitResponse,
+  CommitConfirmedResponse and the REST commit response all carry — so it lands
+  on the operator's terminal at commit, not only in the journal. It appends
+  AFTER applyConfigLocked has logged cfg.Warnings, so there is no double log.
+
+  Noise discipline is load-bearing: a filter with no discard/reject term cannot
+  revoke anything, a detach is strictly loosening, and an unchanged filter was
+  already in force — all three stay silent, because a commit warning an operator
+  cannot act on is one they learn to ignore. filterCanDeny reads BOTH `Action`
+  and `TerminalActions`: Action is last-write-wins, so a term with
+  `then discard` followed by `then accept` would otherwise be misread as
+  harmless.
+
+  Mutation proof, four:
+  - name-only comparison (drop the DeepEqual on the definition) — exit=1,
+    editing an already-attached filter goes unreported, which is the common case;
+  - read `Action` only — exit=1, the mixed-terminal-actions term is misclassified;
+  - drop the can-deny gate — exit=1, the accept-only control fires a false alarm;
+  - drop the call from reportSessionAuthorizationChanges — exit=1 on the WIRING
+    test alone, while every direct-call test still passes. That mutation is why
+    the entry point exists.
+
+  Control: `go test -count=1 ./pkg/daemon/` exit=0, `go vet` clean. Go-only; no
+  dataplane binary moves, so no cluster smoke is owed.
+
 ## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
 
 - **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
