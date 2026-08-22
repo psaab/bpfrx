@@ -103449,3 +103449,19 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/cluster/sync.go`, `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_bulk.go`,
   `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
   `pkg/cluster/status.go`, `docs/sync-protocol.md`
+
+## 2026-08-22 — #6519 stage 1.5: the DHCP host-inbound advisory names the ROLE
+- **Action**: The #6519 advisory now annotates each reported interface with WHY
+  the zone-level `dhcp`/`bootp` token is load-bearing there — `DHCP server`
+  (dhcp-local-server / dhcpv6-local-server / dhcp-relay member: the case the
+  vendor sentence covers), `DHCP client` (`family inet { dhcp; }`: the case it
+  does NOT reach, where the token holds up the interface's ADDRESS), or
+  `no DHCP configured` (pure over-admission, safe to remove today). That role is
+  the exact discriminator the deferred stage-2 enforcement flip turns on. Also
+  fixed the remedy to warn that a per-interface stanza REPLACES the zone stanza
+  (#6515), which following stage 1's wording verbatim would silently rely on.
+  Enforcement unchanged; WARN-only.
+- **File(s)**: `pkg/config/host_inbound_dhcp_scope_6519.go`,
+  `pkg/config/host_inbound_dhcp_role_6519_test.go` (new),
+  `pkg/config/testdata/golden_4406.json`,
+  `docs/host-inbound-service-matrix.md`
