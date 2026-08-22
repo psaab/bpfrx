@@ -101275,3 +101275,18 @@ prose edit above them added. No diff falls in the new test body.
   TOUCHES VRRP — owes `make test-failover`.
 - **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
   pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
+
+## 2026-08-21 — #6563: inject-packet emit-on-wire validates the source
+- **Timestamp**: 2026-08-21
+- **Action**: `request inject-packet --emit-on-wire` ran FIB/HA/CoS then enqueued
+  TX with an operator-arbitrary `source_ip` — `inject.rs` had ZERO references to
+  policy or screen, so a local principal could emit spoofed-source ICMP/ICMPv6
+  bypassing the zone policy and screen that govern transit. Added
+  `is_firewall_local_address` (global `local_v4`/`local_v6` membership:
+  interface host addresses + static-NAT/DNAT externals) and gated
+  `validate_injected_packet_tuple` on it. The gate is LAST (structural faults
+  keep message precedence) and applies to the EMIT path only, so non-emit
+  classification keeps its full diagnostic range.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/inject.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md, _Log.md
