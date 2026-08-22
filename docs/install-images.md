@@ -1,10 +1,11 @@
 # xpf appliance images (#1879 Path C)
 
 vSRX-style prebuilt-image distribution: one bootable root disk, built
-offline, carrying everything xpf needs — the LATEST Ubuntu release
-(operator policy: always the newest — 26.04 today, discovered at bake
-time), a >= 6.18 kernel (the AF_XDP shim's verifier floor; 26.04 ships
-7.0), FRR, strongSwan, Kea, chrony, systemd-networkd, and the xpf
+offline, carrying everything xpf needs — a REVIEWED-PIN Ubuntu base
+(`PINNED_BASE_RELEASE` in `bake.py`, 26.04 LTS today; bumping it is a
+deliberate, reviewed commit, **not** auto-latest — #1943), a >= 6.18
+kernel (the AF_XDP shim's verifier floor; 26.04 ships 7.0), FRR,
+strongSwan, Kea, chrony, systemd-networkd, and the xpf
 binaries (`xpfd`, `cli`, `xpf-userspace-dp`) with their systemd units.
 There is no dependency matrix to install and no kernel hunt: the image
 IS the dependency closure.
@@ -67,10 +68,12 @@ Pipeline (offline — the image is never booted to provision it):
    binaries into the `xpf` Debian package (binary set staged under
    `/usr/local/share/xpf/staged`). The bake installs that `.deb` instead
    of copying raw binaries.
-2. Discover the LATEST Ubuntu release from the upstream listing
-   (`XPF_BASE_RELEASE` pins one), then fetch + SHA256-verify the
-   official Ubuntu *server cloudimg*. Upstream owns partitioning and
-   the UEFI/BIOS bootloader.
+2. Resolve the base release from the **reviewed pin**
+   (`PINNED_BASE_RELEASE = "26.04"`, `bake.py`), then fetch the official
+   Ubuntu *server cloudimg* and authenticate it against
+   `PINNED_BASE_SHA256` — a trust anchor the mirror does not control.
+   An unpinned base is **refused**; see "Base-image pin policy" below.
+   Upstream owns partitioning and the UEFI/BIOS bootloader.
 3. `virt-resize` the root partition into an 8 GiB work disk
    (`XPF_IMAGE_DISK_SIZE` overrides). This is the *floor* size: an
    operator who provisions a larger root disk gets the extra space
@@ -166,9 +169,9 @@ Pipeline (offline — the image is never booted to provision it):
 
 Each bake also writes `dist/xpf-<ver>.manifest` recording the exact
 inputs (base image URL + release + verified SHA256, git commit, bake
-date/host kernel). Bakes are not bit-reproducible (the base tracks
-the newest upstream release unless `XPF_BASE_RELEASE` pins one); the
-manifest is the traceability record. The manifest ALSO records the
+date/host kernel). Bakes are not bit-reproducible even at a fixed
+base release — the mirror's package versions move between bakes — so
+the manifest is the traceability record. The manifest ALSO records the
 staged binary's compile-time protocol versions (`ha_protocol_version`,
 `ha_protocol_min_compat`, `session_sync_protocol_version`,
 `configdb_*_version`, from `xpfd protocol-versions`); the #1930 LANE-2
@@ -177,6 +180,81 @@ without booting the image — whether a rolling image-replace can preserve
 sessions across the mixed-base window or must replace both nodes at once.
 See `docs/in-place-upgrade.md` (Kernel / OS upgrade lanes) for the full
 LANE-1/2/3 decision rule and the state-carry contract.
+
+### Base-image pin policy (#1943 / #4904-B)
+
+The base is a **reviewed pin**, not mirror-latest. Two constants in
+`scripts/image/bake.py` are the contract:
+
+| Constant | What it pins | How it moves |
+|---|---|---|
+| `PINNED_BASE_RELEASE` | the Ubuntu release (`"26.04"`) | a reviewed commit (a PR), never automatically |
+| `PINNED_BASE_SHA256` | that release's base-image digest | a reviewed commit, after re-verifying Canonical's GPG-signed `SHA256SUMS` against the UEC signing key `D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81` |
+
+The old default scraped `cloud-images.ubuntu.com` and took the
+highest-numbered listing, which silently selects whatever the mirror
+calls newest — a non-LTS (26.10), or the *previous* release (25.10) when
+an LTS image lags publication. That drift is what the pin forbids.
+
+The digest pin is a supply-chain **trust anchor**, not a convenience: the
+image and its `SHA256SUMS` come from the same configurable mirror
+endpoint, so a same-endpoint checksum authenticates nothing against a
+compromised mirror or a TLS/DNS/CA compromise — the mirror can serve
+matching malicious bytes *and* hash, and xpf would then sign the result
+with its RELEASE key.
+
+**Refusals you can expect** (all `die()`, non-zero exit):
+
+- the downloaded base digest does not match `PINNED_BASE_SHA256` — a
+  wrong/compromised mirror, or a stale pin after a Canonical respin
+  (re-verify the GPG-signed `SHA256SUMS`, then bump the pin in a
+  reviewed commit);
+- the resolved release has **no** pin entry and no `XPF_BASE_SHA256` —
+  the bake refuses rather than trusting a same-endpoint checksum.
+
+**Opt-in overrides** (all one-off, none of them the default):
+
+| Env var | Effect |
+|---|---|
+| `XPF_BASE_RELEASE=<rel>` | use `<rel>` instead of `PINNED_BASE_RELEASE` for this run |
+| `XPF_BASE_SHA256=<digest>` | supply the trust anchor for this run (e.g. a point respin between reviewed bumps); wins over the repo constant |
+| `XPF_UBUNTU_AUTODISCOVER=1` | opt back into mirror-latest discovery — off by default |
+| `XPF_ALLOW_UNPINNED_BASE=1` | proceed with an unauthenticated base. The bake warns loudly and the manifest records `base_image_pinned: false` |
+
+An `XPF_ALLOW_UNPINNED_BASE=1` bake is **not publishable**:
+`publish.py`'s `gate_provenance` refuses `base_image_pinned != true`
+fail-closed (#5815), with no override — a signed unpinned image is not
+releasable. The test VM follows the same policy: `test/incus/setup.sh`
+tracks whatever release production was last baked at, deliberately,
+rather than the newest Ubuntu on the day you run `make test-vm`.
+**What the image SHIPS (#6500).** `bake_host_kernel` above is the BUILD
+HOST's kernel (`os.uname().release`) and answers a different question
+from "what does this image carry". Two additional records close that:
+
+- `guest_kernel:` in the `.manifest` — the kernel the IMAGE runs, i.e.
+  the exact artifact the #1930 LANE-1 channel promotes.
+- `dist/xpf-<ver>.pkgs` — the full installed package inventory
+  (`name=version`, one per line, plus the guest kernel), **covered by the
+  signed `xpf-<ver>.SHA256SUMS`** exactly like the `.manifest` sidecar
+  (#5042), so it is authenticated the moment the manifest signature
+  verifies.
+
+The bake writes the same record INSIDE the image at
+`/etc/xpf/image-inventory` and reads it back out **offline with
+`virt-cat`** — no boot — so "does release X ship openssl 3.x.y
+(CVE-YYYY)?" and "which kernel does image X carry, so I can plan a
+LANE-1 arm?" are answered from the dist tree, and the copy that stays in
+the image answers them on the box too.
+
+Both are **fail-closed at publish**: `publish.py gate_provenance` refuses
+a release whose manifest has no `guest_kernel`, whose `.pkgs` sidecar is
+missing or not covered by the signed manifest, whose inventory is HOLLOW
+(a present-but-empty record satisfies a presence check and answers
+nothing), or whose two authenticated records disagree about the kernel —
+alongside the existing `validated` / `base_image_pinned` refusals. The
+format lives in `scripts/dist/image_inventory.py`, single-sourced because
+bake.py writes it and publish.py reads it and a divergence between those
+is always a bug.
 
 Full first-boot matrix (run after a bake, or standalone):
 
