@@ -103876,6 +103876,12 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/daemon/bootstrap.go,
   pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
 
+## 2026-08-22 — #6745 shared reverse-NAT steering row holders
+- **Action**: Added a process-global holder set for `dnat_table` steering rows;
+  `publish_dnat_table_entry` records a hold and `delete_dnat_table_entry`
+  deletes only when the closing session was the last holder.
+- **File(s)**: `userspace-dp/src/afxdp/checksum.rs`,
+  `userspace-dp/src/afxdp/tests_decap_dnat_table.rs`
 ## 2026-08-22 — #6740 guard the 1 Hz status-path link-map reads
 - **Timestamp**: 2026-08-22
 - **Action**: The 1 Hz userspace status path ranged the root Manager's LIVE
