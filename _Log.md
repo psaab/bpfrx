@@ -102938,3 +102938,18 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/original_kernel_name_callsite_7426_test.go (new),
   pkg/daemon/daemon_reth.go, pkg/daemon/daemon_reth_pciaddr_6199_test.go, _Log.md
+
+## 2026-08-22 — #6668 display-set container bracket round-trip
+- **Timestamp**: 2026-08-22
+- **Action**: Carry authored `[ ... ]` bracket grouping through `display set`
+  render and flat replay so a bracket authored at a CONTAINER position survives
+  the round trip; fixes the `load merge <hierarchical-file>` ingest corruption
+  and the two Reject→Accept commit-gate laundering cases.
+- **File(s)**: pkg/config/lexer.go, pkg/config/parser.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/ast_format.go, pkg/config/inactive.go,
+  pkg/configstore/store_command.go,
+  pkg/config/formatset_container_bracket_6668_test.go,
+  pkg/configstore/loadmerge_bracket_container_6668_test.go,
+  pkg/config/dual_ast_differential_test.go,
+  pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go,
+  docs/config-schema.md, docs/host-inbound-service-matrix.md

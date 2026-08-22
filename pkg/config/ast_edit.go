@@ -271,6 +271,67 @@ func refreshDupKeysQuoted(n *Node, quoted []bool) {
 	n.setKeysQuoted(quoted)
 }
 
+// widenKeyCountToGroupEnd extends a node's key slice path[from:end) so that no
+// authored bracket group is CUT IN HALF by it, and returns the new end (#6668).
+//
+// The flat-set walks split a path into nodes by consuming `1 + schema.args`
+// tokens per level. That rule cannot express a container carrying more keys
+// than its arity, which is exactly what a bracket list authored at a container
+// position is — `interfaces [ ge-0/0/0 ge-0/0/1 ] { ... }` is ONE node with two
+// keys. Replaying its flattened token run made the first token the container
+// and demoted the rest to a LEAF, re-parenting the body under it; every token
+// survived, so nothing downstream could notice.
+//
+// Overlap is the test, not "the group starts at from". A group need not begin
+// where the node does: `security-zone [ trust dmz ]` puts the bracket on the
+// node's SECOND and THIRD keys, and the arity rule would take
+// ["security-zone","trust"] and leave `dmz` to open a node of its own, splitting
+// one container into two.
+//
+// It only ever GROWS the slice, and THIS function is where that is decided —
+// the call sites assign its result unconditionally rather than re-testing it,
+// so the property has one owner and a change here is not silently masked by a
+// second guard. A group shorter than the arity leaves the node exactly as the
+// arity rule built it, so a malformed `[ x ]` at a two-token position cannot
+// truncate a keyed container's identity and split one node into two. grouped
+// may be nil, which is the pre-#6668 behaviour: nothing is widened.
+func widenKeyCountToGroupEnd(grouped []bool, from, end int) int {
+	if grouped == nil {
+		return end
+	}
+	for k := from; k < end && k < len(grouped); k++ {
+		if !grouped[k] {
+			continue
+		}
+		j := k
+		for j < len(grouped) && grouped[j] {
+			j++
+		}
+		if j > end {
+			end = j
+		}
+	}
+	return end
+}
+
+// bracketGroupStartLen reports the length of an authored bracket group that
+// begins exactly at from, or 0 when from is not a group's first token (#6668).
+// Used only where no schema level is available to supply a starting arity, so
+// the group itself has to say where the node's keys end.
+func bracketGroupStartLen(grouped []bool, from int) int {
+	if grouped == nil || from < 0 || from >= len(grouped) || !grouped[from] {
+		return 0
+	}
+	if from > 0 && grouped[from-1] {
+		return 0 // continuation of an earlier group, not its start
+	}
+	n := 0
+	for from+n < len(grouped) && grouped[from+n] {
+		n++
+	}
+	return n
+}
+
 // SetPath inserts a leaf node at the given path in the tree.
 // Intermediate block nodes are created as needed. The schema determines
 // which keywords are containers (and how many extra args they consume)
@@ -292,11 +353,44 @@ func (t *ConfigTree) SetPath(path []string) error {
 // treated as nil rather than silently misattributing quotes to the wrong
 // tokens.
 func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
+	return t.SetPathQuotedGrouped(path, quoted, nil)
+}
+
+// SetPathQuotedGrouped is SetPathQuoted carrying per-token BRACKET GROUPING
+// (#6668): grouped[i] reports whether path[i] was authored inside a
+// `[ ... ]` list.
+//
+// WHAT THE GROUPING DECIDES, and why arity cannot decide it. This walk splits a
+// flat path into nodes by consuming `1 + schema.args` tokens per level. That
+// rule can express a container whose key count IS its arity and nothing wider,
+// so a container node carrying a bracket list —
+//
+//	interfaces { [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } } }
+//	  -> ONE node, Keys=["ge-0/0/0","ge-0/0/1"], with the body as its children
+//
+// — had no flat spelling at all. Replaying its flattened token run made
+// `ge-0/0/0` the container and demoted `ge-0/0/1` to the FIRST KEY OF A LEAF,
+// with the whole body re-parented under it. Every token survived, so the
+// corruption is invisible to a token-count or an idempotency check: re-running
+// FormatSet over the damaged tree reproduces the SAME line, a fixed point.
+//
+// A bracket only ever WIDENS a key group — `nodeKeyCount` is raised to the run
+// length, never lowered below `1 + args`. A short group at a wide position
+// (`[ x ]` where the schema takes two tokens) therefore behaves exactly as the
+// bare tokens would, rather than truncating the node's identity.
+//
+// grouped may be nil (or a length that disagrees with path), which is the
+// pre-#6668 behaviour: every group is one node's arity and nothing is widened.
+// It is never a false "this was bare" claim — a nil mask asserts nothing.
+func (t *ConfigTree) SetPathQuotedGrouped(path []string, quoted, grouped []bool) error {
 	if len(path) == 0 {
 		return fmt.Errorf("empty path")
 	}
 	if len(quoted) != len(path) {
 		quoted = nil
+	}
+	if len(grouped) != len(path) {
+		grouped = nil
 	}
 	// quotedRange returns the provenance for path[from:to] — every node built
 	// below takes its keys from exactly one CONTIGUOUS range of path (the
@@ -308,7 +402,15 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 		}
 		return quoted[from:to]
 	}
-
+	// groupedRange returns the bracket provenance for path[from:to], matching
+	// quotedRange, so a node rebuilt from a flat line re-renders with the same
+	// bracket the operator authored (#6668).
+	groupedRange := func(from, to int) []bool {
+		if grouped == nil || from < 0 || to > len(grouped) || from > to {
+			return nil
+		}
+		return grouped[from:to]
+	}
 	current := &t.Children
 	schema := setSchema
 	i := 0
@@ -328,6 +430,32 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 		}
 
 		if childSchema == nil {
+			// #6668: an unmodeled position still honours an authored bracket
+			// group that does not reach the end of the path — those tokens are
+			// ONE node's keys and what follows is its body, so the node must be
+			// a CONTAINER. Without this the whole tail collapses into a single
+			// leaf and the body is fused onto the group's keys.
+			if run := bracketGroupStartLen(grouped, i); run > 0 && i+run < len(path) {
+				nodeKeys := path[i : i+run]
+				i += run
+				found := false
+				for _, n := range *current {
+					if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+						current = &n.Children
+						found = true
+						break
+					}
+				}
+				if !found {
+					newNode := &Node{Keys: append([]string(nil), nodeKeys...)}
+					newNode.setKeysQuoted(quotedRange(keyStart, i))
+					newNode.setKeysBracketed(groupedRange(keyStart, i))
+					*current = append(*current, newNode)
+					current = &newNode.Children
+				}
+				schema = nil
+				continue
+			}
 			// No schema match: all remaining tokens form a leaf node.
 			// Skip if exact duplicate already exists.
 			remaining := path[i:]
@@ -342,12 +470,17 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 				IsLeaf: true,
 			}
 			leaf.setKeysQuoted(quotedRange(i, len(path)))
+			leaf.setKeysBracketed(groupedRange(i, len(path)))
 			*current = append(*current, leaf)
 			return nil
 		}
 
 		// Consume keyword + extra args as this node's keys.
 		nodeKeyCount := 1 + childSchema.args
+		// #6668: an authored bracket group carries the node's full key list,
+		// which the arity rule cannot infer. widenKeyCountToGroupEnd owns the
+		// widen-only rule; assign its result rather than re-testing it here.
+		nodeKeyCount = widenKeyCountToGroupEnd(grouped, i, i+nodeKeyCount) - i
 		if i+nodeKeyCount > len(path) {
 			// Not enough tokens; treat remainder as leaf.
 			leaf := &Node{
@@ -355,6 +488,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 				IsLeaf: true,
 			}
 			leaf.setKeysQuoted(quotedRange(i, len(path)))
+			leaf.setKeysBracketed(groupedRange(i, len(path)))
 			*current = append(*current, leaf)
 			return nil
 		}
@@ -390,6 +524,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 								IsLeaf: true,
 							}
 							repl.setKeysQuoted(quotedRange(keyStart, i))
+							repl.setKeysBracketed(groupedRange(keyStart, i))
 							filtered = append(filtered, repl)
 							replaced = true
 						}
@@ -416,6 +551,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 				IsLeaf: true,
 			}
 			leaf.setKeysQuoted(quotedRange(keyStart, i))
+			leaf.setKeysBracketed(groupedRange(keyStart, i))
 			*current = append(*current, leaf)
 			return nil
 		}
@@ -497,6 +633,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 						IsLeaf: true,
 					}
 					listLeaf.setKeysQuoted(quotedRange(keyStart, i))
+					listLeaf.setKeysBracketed(groupedRange(keyStart, i))
 					*current = append(*current, listLeaf)
 				}
 				if i >= len(path) {
@@ -524,6 +661,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 				Keys: append([]string(nil), nodeKeys...),
 			}
 			newNode.setKeysQuoted(quotedRange(keyStart, i))
+			newNode.setKeysBracketed(groupedRange(keyStart, i))
 			*current = append(*current, newNode)
 			current = &newNode.Children
 		}
@@ -537,14 +675,25 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 // Uses the same schema-driven traversal as SetPath to navigate the tree,
 // then removes the target node from its parent's Children slice.
 func (t *ConfigTree) DeletePath(path []string) error {
+	return t.DeletePathGrouped(path, nil)
+}
+
+// DeletePathGrouped is DeletePath carrying per-token BRACKET GROUPING (#6668),
+// so a `delete` line replayed from `show | display set` navigates to the same
+// node the matching `set` line built. Without it the walk re-splits a bracketed
+// CONTAINER key group at the schema arity and reports the node missing.
+func (t *ConfigTree) DeletePathGrouped(path []string, grouped []bool) error {
 	if len(path) == 0 {
 		return fmt.Errorf("empty path")
 	}
+	if len(grouped) != len(path) {
+		grouped = nil
+	}
 
-	return deletePath(&t.Children, path, setSchema, 0)
+	return deletePath(&t.Children, path, grouped, setSchema, 0)
 }
 
-func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) error {
+func deletePath(current *[]*Node, path []string, grouped []bool, schema *schemaNode, i int) error {
 	if i >= len(path) {
 		return ErrPathNotFound
 	}
@@ -562,6 +711,19 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 	}
 
 	if childSchema == nil {
+		// #6668: an unmodeled position still honours an authored bracket group
+		// that does not reach the end of the path — those tokens are ONE node's
+		// keys and what follows is its body, so descend rather than treating
+		// the whole tail as leaf keys.
+		if run := bracketGroupStartLen(grouped, i); run > 0 && i+run < len(path) {
+			nodeKeys := path[i : i+run]
+			for _, n := range *current {
+				if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+					return deletePath(&n.Children, path, grouped, nil, i+run)
+				}
+			}
+			return fmt.Errorf("%w: container %q does not exist", ErrPathNotFound, strings.Join(nodeKeys, " "))
+		}
 		// No schema match: remaining tokens form leaf keys, remove matching node.
 		leafKeys := path[i:]
 		return removeMatchingNode(current, leafKeys)
@@ -596,6 +758,9 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 
 	// Consume keyword + extra args as this node's keys.
 	nodeKeyCount := 1 + childSchema.args
+	// #6668: widen to an authored bracket group's end, never narrower —
+	// widenKeyCountToGroupEnd owns that rule.
+	nodeKeyCount = widenKeyCountToGroupEnd(grouped, i, i+nodeKeyCount) - i
 	if i+nodeKeyCount > len(path) {
 		// Not enough tokens; treat remainder as leaf keys.
 		leafKeys := path[i:]
@@ -622,7 +787,7 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 	// More tokens remain: find matching container and descend.
 	for _, n := range *current {
 		if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
-			return deletePath(&n.Children, path, childSchema, i)
+			return deletePath(&n.Children, path, grouped, childSchema, i)
 		}
 	}
 
@@ -649,27 +814,49 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 // always emits the node's `set` line(s) before its `deactivate` line, so on
 // reload the node is present by the time this runs.
 func (t *ConfigTree) DeactivatePath(path []string) error {
+	return t.DeactivatePathGrouped(path, nil)
+}
+
+// DeactivatePathGrouped is DeactivatePath carrying per-token BRACKET GROUPING
+// (#6668). `show | display set` emits a node's `set` line(s) and then its
+// `deactivate` line over the SAME tokens, so the two must tokenize into the
+// same nodes; without the grouping the deactivate line re-split a bracketed
+// container key group at the schema arity and reported the node missing, which
+// on the load paths aborts the whole replay.
+func (t *ConfigTree) DeactivatePathGrouped(path []string, grouped []bool) error {
 	if len(path) == 0 {
 		return fmt.Errorf("empty path")
 	}
-	return setInactiveAtPath(&t.Children, path, setSchema, 0, true)
+	if len(grouped) != len(path) {
+		grouped = nil
+	}
+	return setInactiveAtPath(&t.Children, path, grouped, setSchema, 0, true)
 }
 
 // ActivatePath clears the inactive marker on the node at the given path
 // (#2008 H1), implementing the Junos `activate <path>` verb. The target
 // node must already exist.
 func (t *ConfigTree) ActivatePath(path []string) error {
+	return t.ActivatePathGrouped(path, nil)
+}
+
+// ActivatePathGrouped is ActivatePath carrying per-token BRACKET GROUPING
+// (#6668). See DeactivatePathGrouped.
+func (t *ConfigTree) ActivatePathGrouped(path []string, grouped []bool) error {
 	if len(path) == 0 {
 		return fmt.Errorf("empty path")
 	}
-	return setInactiveAtPath(&t.Children, path, setSchema, 0, false)
+	if len(grouped) != len(path) {
+		grouped = nil
+	}
+	return setInactiveAtPath(&t.Children, path, grouped, setSchema, 0, false)
 }
 
 // setInactiveAtPath navigates to the node identified by path (using the
 // same schema-driven traversal as deletePath) and sets its Inactive flag to
 // the requested value. It does NOT create missing nodes — deactivate /
 // activate toggle an existing statement.
-func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i int, inactive bool) error {
+func setInactiveAtPath(current *[]*Node, path []string, grouped []bool, schema *schemaNode, i int, inactive bool) error {
 	if i >= len(path) {
 		return fmt.Errorf("path not found")
 	}
@@ -686,6 +873,17 @@ func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i in
 	}
 
 	if childSchema == nil {
+		// #6668: honour an authored bracket group at an unmodeled position —
+		// see the matching branch in deletePath.
+		if run := bracketGroupStartLen(grouped, i); run > 0 && i+run < len(path) {
+			nodeKeys := path[i : i+run]
+			for _, n := range *current {
+				if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+					return setInactiveAtPath(&n.Children, path, grouped, nil, i+run, inactive)
+				}
+			}
+			return fmt.Errorf("path not found: container %q does not exist", strings.Join(nodeKeys, " "))
+		}
 		// No schema match: remaining tokens form leaf keys.
 		return markMatchingNodeInactive(current, path[i:], inactive)
 	}
@@ -711,6 +909,9 @@ func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i in
 	}
 
 	nodeKeyCount := 1 + childSchema.args
+	// #6668: widen to an authored bracket group's end, never narrower —
+	// widenKeyCountToGroupEnd owns that rule.
+	nodeKeyCount = widenKeyCountToGroupEnd(grouped, i, i+nodeKeyCount) - i
 	if i+nodeKeyCount > len(path) {
 		return markMatchingNodeInactive(current, path[i:], inactive)
 	}
@@ -735,7 +936,7 @@ func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i in
 	// More tokens remain: find matching container and descend.
 	for _, n := range *current {
 		if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
-			return setInactiveAtPath(&n.Children, path, childSchema, i, inactive)
+			return setInactiveAtPath(&n.Children, path, grouped, childSchema, i, inactive)
 		}
 	}
 

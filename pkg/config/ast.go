@@ -70,6 +70,38 @@ type Node struct {
 	// group the pre-provenance text rule already joined.
 	KeysQuoted []bool `json:",omitempty"`
 
+	// KeysBracketed records, per key, whether the operator AUTHORED that key
+	// inside a `[ ... ]` list (#6668). Like KeysQuoted it carries the one bit
+	// about a key that its TEXT cannot: where the operator said this node's
+	// key group ENDS.
+	//
+	// It matters only for a CONTAINER. The flat-set language re-splits a `set`
+	// line into nodes at each keyword's schema arity, so a container carrying
+	// more keys than its arity has no flat spelling — `interfaces
+	// [ ge-0/0/0 ge-0/0/1 ] { host-inbound-traffic { ... } }` flattened to a
+	// bare token run, and replaying that run demoted `ge-0/0/1` from a zone
+	// MEMBER to the first key of a LEAF with the whole body re-parented under
+	// it. Every token survived the trip, so nothing downstream could notice,
+	// and re-rendering the damaged tree reproduced the same line — a fixed
+	// point no idempotency check can see. FormatSet re-emits the bracket for
+	// exactly the groups that carried one.
+	//
+	// A LEAF never needs it: SetPath's trailing-value absorber already
+	// collapses a leaf's whole tail onto one node (the #2419 contract), which
+	// is why every bracketed VALUE list round-trips clean without this and why
+	// none of them changes rendering.
+	//
+	// INVARIANT: nil, or len(KeysBracketed) == len(Keys). Use
+	// Node.KeyBracketed(i), never index it directly — a Node built by hand
+	// (compiler synthesis, a config DB written before #6668) legitimately
+	// carries no provenance at all, and a nil slice asserts nothing rather
+	// than claiming every key was bare.
+	//
+	// nil whenever NO key is bracketed, which is nearly every node: JSON-tagged
+	// omitempty so those configs stay byte-identical on disk, exactly as for
+	// KeysQuoted above.
+	KeysBracketed []bool `json:",omitempty"`
+
 	// Line/Column where this node starts (for error reporting).
 	Line   int
 	Column int
@@ -95,6 +127,37 @@ func (n *Node) KeyQuoted(i int) bool {
 // — not that every key was bare.
 func (n *Node) KeysHaveQuoteProvenance() bool {
 	return n != nil && len(n.KeysQuoted) == len(n.Keys) && len(n.Keys) > 0
+}
+
+// KeyBracketed reports whether key i was AUTHORED inside a `[ ... ]` list
+// (#6668). It answers false for every index when the node carries no
+// provenance, and for an out-of-range index, so a caller never has to
+// length-check. A false means "not known to be bracketed", not "known to be
+// bare".
+func (n *Node) KeyBracketed(i int) bool {
+	if n == nil || i < 0 || i >= len(n.KeysBracketed) {
+		return false
+	}
+	return n.KeysBracketed[i]
+}
+
+// setKeysBracketed stores bracket provenance alongside keys, normalizing to
+// the same invariant setKeysQuoted uses: nil unless the lengths agree AND at
+// least one key is bracketed. Every Node construction path that has the
+// provenance available funnels through here so the "nil means all-false or
+// unknown" collapse is made in exactly one place.
+func (n *Node) setKeysBracketed(bracketed []bool) {
+	if len(bracketed) != len(n.Keys) {
+		n.KeysBracketed = nil
+		return
+	}
+	for _, b := range bracketed {
+		if b {
+			n.KeysBracketed = append([]bool(nil), bracketed...)
+			return
+		}
+	}
+	n.KeysBracketed = nil
 }
 
 // setKeysQuoted stores quote provenance alongside keys, normalizing to the
@@ -543,6 +606,7 @@ func cloneNodes(nodes []*Node) []*Node {
 		result[i] = &Node{
 			Keys:          append([]string(nil), n.Keys...),
 			KeysQuoted:    append([]bool(nil), n.KeysQuoted...),
+			KeysBracketed: append([]bool(nil), n.KeysBracketed...),
 			Children:      cloneNodes(n.Children),
 			IsLeaf:        n.IsLeaf,
 			Annotation:    n.Annotation,
