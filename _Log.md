@@ -1,3 +1,37 @@
+## 2026-08-21 — #6635 ddns: the error-tree bound follows a caller-supplied `As`
+
+- **Timestamp**: 2026-08-21
+- **Action**: `errTreeWithinBound` ran ONCE, at the two public scrubber entry
+  points, validating the `Unwrap` tree AS PRESENTED there — which is not the
+  tree the stdlib ends up walking. `errors.As` dispatches to an `As(any) bool`
+  method the CALLER defines, and that method returns a value of the caller's
+  choosing: an error with a one-node tree (guard passes) can install a fresh
+  `*url.Error` whose `Err` self-unwraps, and the next `errors.As` spins forever.
+  REPRODUCED AT MY HEAD before fixing: the entry guard returned true and
+  `scrubURLError` did not return in 5s.
+  The guard now runs at every entry to `scrubURLErrorAt` / `scrubInnerErrorAt`,
+  which is where a caller-supplied subtree can first appear; the public wrappers
+  become thin delegates. Cost is a re-walk per level, at most maxUnwrapDepth^2
+  Unwrap calls on an error path that runs once per reconcile tick.
+  NOT CLOSED, deliberately and stated: a caller-supplied `Error()`/`Unwrap()`
+  that BLOCKS. No placement of the guard fixes that — it needs a watchdog
+  goroutine per render — and the reason to decline is not only cost: a blocking
+  `Error()` hangs ANY fmt render of that error anywhere in the daemon, so
+  bounding it inside one package's scrubber buys nothing.
+  REACHABILITY, checked rather than assumed: caller-supplied, in-process only.
+  Production builds its own client; the only caller passing one is the Surface A
+  reconcile path passing its own. A provider chooses BYTES over the wire, not a
+  Go type. Robustness, NOT a live DoS, and the PR says so.
+  MATRIX FINDING, kept rather than tuned away: narrowing the `scrubURLErrorAt`
+  guard to `depth == 0` stays GREEN, because the only depth>0 caller hands over
+  a value `errors.As` already resolved to a `*url.Error`, matched at node 0
+  without walking. That is a reachability argument about a caller, which this
+  package does not build invariants on, so the guard stays unconditional and
+  the redundancy is documented instead of removed. Removing it ENTIRELY hangs
+  the pre-existing `TestSelfUnwrappingErrorTerminates` — a red only the FULL
+  suite shows, not `-run 6635`.
+- **File(s)**: `pkg/ddns/backend_http.go`,
+  `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
 ## 2026-08-22 — #6584 command-output + swanctl termsafe guards
 
 - **Timestamp**: 2026-08-22
@@ -102276,3 +102310,26 @@ prose edit above them added. No diff falls in the new test body.
     path-qualified (secret under snmp, a BGP route-target name elsewhere).
   - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
     pkg/config/secret_in_error_6625_test.go
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6626 + #6627 — the heatmap hard gate could return "ok (cached)"
+    on a real threshold crossing (working tree is not a go test cache input);
+    make test-go now runs pkg/refactoraudit uncached, guarded by a Makefile
+    wiring test. #6627: a duplicated heatmap row is now rejected explicitly.
+  - **File(s)**: Makefile, pkg/refactoraudit/audit_canary_test.go
+
+## 2026-08-22 — #6639 cut re-stamps the kernel arm record
+- **Timestamp**: 2026-08-22
+- **Action**: An in-place binary cut repoints `current`, the sbin links and the
+  unit ExecStart but left the kernel arm record naming the OLD binary, so a
+  candidate boot refused. The refusal fires in the POSIX-sh OUTER hop (before it
+  execs anything), so the SIDECAR is what had to move — a Go-only change could
+  not fix it. Added step 6d inside `flip()` (after 6c, so a crash leaves today's
+  safe refusing state), gated on an ARMED journal, writing sidecar + journal
+  field from one value with `fsatomic.WriteFileDurable`, fail-closed. Left
+  `VerifyPromoteBinaryMatchesRecord` and the shell untouched: relaxing the
+  comparison would re-admit the stale leftover #6601 exists to eliminate.
+  Consequence was worse than filed — the journal is never cleared, so the gate
+  re-refuses every boot and an HA node holds SECONDARY indefinitely.
+- **File(s)**: pkg/upgrade/flip.go, pkg/upgrade/kernel.go,
+  pkg/upgrade/kernel_arm_restamp_6639_test.go (new), _Log.md
