@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -668,7 +670,44 @@ func (a *Agent) getIfData() []IfData {
 	if a.ifDataFn == nil {
 		return nil
 	}
-	return a.ifDataFn()
+	data := a.ifDataFn()
+	// This function has always DOCUMENTED that it returns sorted interface
+	// data, but nothing ever sorted: buildSNMPIfData hands back links in raw
+	// netlink.LinkList (RTM_GETLINK dump) order, which the kernel does not
+	// promise is ifIndex-ordered. Ascending IfIndex is load-bearing for the
+	// GETNEXT/GETBULK walk -- the successor search enumerates
+	// <prefix>.<col>.<ifIndex> column-major and takes the first entry greater
+	// than the requested OID, which is the lexicographic successor only if
+	// ifIndex ascends. Out of order, the walk emits varbinds that go backwards,
+	// and RFC 3416 managers respond to that by looping or stopping early.
+	//
+	// #6597 makes the contract real rather than assumed, because the successor
+	// search is now a binary search (nextTableOID) and a binary search over an
+	// unsorted array does not merely emit a mis-ordered answer, it emits an
+	// arbitrary one.
+	//
+	// The already-sorted case is the norm and costs one scan and no allocation;
+	// only genuinely out-of-order data is copied, so the callback's slice is
+	// never mutated underneath it.
+	if slices.IsSortedFunc(data, compareIfIndex) {
+		return data
+	}
+	sorted := slices.Clone(data)
+	slices.SortStableFunc(sorted, compareIfIndex)
+	return sorted
+}
+
+// compareIfIndex orders interface rows by ascending IfIndex, the order the
+// ifTable/ifXTable OID space is enumerated in.
+func compareIfIndex(x, y IfData) int {
+	switch {
+	case x.IfIndex < y.IfIndex:
+		return -1
+	case x.IfIndex > y.IfIndex:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // ifSnapshot memoizes a single interface-table read for the lifetime of ONE
@@ -1669,32 +1708,51 @@ func (a *Agent) findNextOIDSnap(oid []int, snap *ifSnapshot) []int {
 		return nil
 	}
 
-	// Build sorted list of all ifTable OIDs.
-	for _, col := range ifTableColumns {
-		for _, iface := range ifaces {
-			candidate := make([]int, len(oidIfTablePrefix)+2)
-			copy(candidate, oidIfTablePrefix)
-			candidate[len(oidIfTablePrefix)] = col
-			candidate[len(oidIfTablePrefix)+1] = iface.IfIndex
-			if oidCompare(candidate, oid) > 0 {
-				return candidate
-			}
-		}
+	// ifTable OIDs: 1.3.6.1.2.1.2.2.1.<col>.<ifIndex>, then ifXTable OIDs:
+	// 1.3.6.1.2.1.31.1.1.1.<col>.<ifIndex>. Every ifTable OID sorts below every
+	// ifXTable OID (2 < 31 at the differing arc), so the first region to yield a
+	// successor holds the answer.
+	if next := nextTableOID(oidIfTablePrefix, ifTableColumns, ifaces, oid); next != nil {
+		return next
 	}
+	return nextTableOID(oidIfXTablePrefix, ifXTableColumns, ifaces, oid)
+}
 
-	// Walk ifXTable OIDs: 1.3.6.1.2.1.31.1.1.1.<col>.<ifIndex>
-	for _, col := range ifXTableColumns {
-		for _, iface := range ifaces {
-			candidate := make([]int, len(oidIfXTablePrefix)+2)
-			copy(candidate, oidIfXTablePrefix)
-			candidate[len(oidIfXTablePrefix)] = col
-			candidate[len(oidIfXTablePrefix)+1] = iface.IfIndex
-			if oidCompare(candidate, oid) > 0 {
-				return candidate
-			}
-		}
+// nextTableOID returns the smallest OID in a <prefix>.<col>.<ifIndex> table
+// region that is strictly greater than oid, or nil if the region holds none.
+//
+// The region is a VIRTUAL sorted array rather than a materialised one: entry p
+// denotes cols[p/len(ifaces)] and ifaces[p%len(ifaces)].IfIndex, which
+// enumerates the region column-major -- exactly the lexicographic order of the
+// OIDs it denotes, given that cols ascends (both column lists are declared
+// sorted) and IfIndex ascends (getIfData now guarantees it).
+//
+// Because that order is ascending, "entry p is greater than oid" is monotone in
+// p: false over a prefix of the region and true over the rest. So the first p
+// satisfying it -- precisely the entry the pre-#6597 linear scan returned -- is
+// a binary search, and only O(log n) candidates are built instead of O(n).
+//
+// The virtual array matters as much as the search. Materialising the region
+// would move the cost rather than remove it: a one-varbind GETNEXT near the top
+// of the tree pays O(1) today, and building 20*len(ifaces) OIDs to answer it
+// would be a regression for the most common poll shape there is.
+func nextTableOID(prefix, cols []int, ifaces []IfData, oid []int) []int {
+	n := len(cols) * len(ifaces)
+	if n == 0 {
+		return nil
 	}
-	return nil
+	at := func(p int) []int {
+		candidate := make([]int, len(prefix)+2)
+		copy(candidate, prefix)
+		candidate[len(prefix)] = cols[p/len(ifaces)]
+		candidate[len(prefix)+1] = ifaces[p%len(ifaces)].IfIndex
+		return candidate
+	}
+	p := sort.Search(n, func(p int) bool { return oidCompare(at(p), oid) > 0 })
+	if p == n {
+		return nil
+	}
+	return at(p)
 }
 
 // varbind holds a single OID-value binding.

@@ -563,9 +563,45 @@ packet handlers, and MIB view that call into them.
   yields at least two components, so a varbind built from a wire OID re-encodes
   to at least seven bytes and the six-byte `minVarbindEncodedBytes` floor used
   for the structural cap is conservative rather than reachable. A max-size
-  GETNEXT (239 deep ifXTable OIDs) costs ~33 ms and returns all 239 varbinds in
-  a full 4095-byte response; that cost is `findNextOIDSnap` being a linear MIB
-  scan, not unbounded expansion, and is not addressed here.
+  GETNEXT (239 deep ifXTable OIDs) cost ~33 ms and returned all 239 varbinds in
+  a full 4095-byte response; that cost was `findNextOIDSnap` being a linear MIB
+  scan, not unbounded expansion. It was scoped out of #6551 and fixed
+  separately in #6597 (next bullet).
+- **The successor lookup is a binary search over a virtual sorted array
+  (#6597).** `findNextOIDSnap` used to resolve each lexicographic successor by
+  scanning the MIB from the top, so a lookup cost O(static + 20*interfaces) and
+  a full walk was QUADRATIC in the number of served OIDs. Because
+  `buildSNMPIfData` enumerates every kernel link except `lo`, the interface
+  count is driven by configuration — VLAN subinterfaces, GRE tunnels, and one
+  XFRM interface per IPsec tunnel — so it is not small on a real firewall, and
+  the agent runs on a single serial goroutine that every other operation shares.
+  Measured full walk, before -> after: 64 interfaces 145 ms -> 2.3 ms,
+  256 interfaces 1.54 s -> 9.4 ms, 512 interfaces 6.32 s -> 21.7 ms.
+  `nextTableOID` treats each `<prefix>.<col>.<ifIndex>` region as a VIRTUAL
+  sorted array — entry `p` is `cols[p/len(ifaces)]` and
+  `ifaces[p%len(ifaces)].IfIndex`, which enumerates it column-major, exactly
+  lexicographic order — and binary-searches it, building only the O(log n)
+  candidates it probes. It is deliberately not materialised: a one-varbind
+  GETNEXT near the top of the tree costs O(1), and building `20*interfaces`
+  OIDs to answer it would move the cost rather than remove it. The answers are
+  unchanged, pinned by `TestFindNextOIDSnapMatchesLinearScan_6597` and
+  `TestWalkSequenceUnchanged_6597`, which keep the pre-#6597 linear scan
+  verbatim as an equivalence oracle. The regression guard,
+  `TestSuccessorLookupIsNotLinear_6597`, counts allocations rather than elapsed
+  time — every candidate examined is one allocation, so the count IS the number
+  of MIB entries visited (24 versus ~5,632 linear at 512 interfaces), which is
+  deterministic where a timing assertion would be flaky.
+- **`getIfData` sorts by ifIndex, and that is load-bearing (#6597).** It had
+  always DOCUMENTED that it returns sorted data while nothing sorted:
+  `buildSNMPIfData` returns links in raw `netlink.LinkList` (RTM_GETLINK dump)
+  order, which the kernel does not promise is ifIndex-ordered. Ascending
+  ifIndex is what makes the column-major enumeration lexicographic; unsorted,
+  the walk emits varbinds that go backwards and an RFC 3416 manager loops or
+  stops early. The binary search raises the stakes — over an unsorted array it
+  returns an arbitrary entry, not merely a mis-ordered one — so the contract is
+  now enforced instead of assumed. Already-sorted input, the normal case, costs
+  one scan and no allocation; only out-of-order data is cloned, so the
+  callback's slice is never reordered underneath it.
 - **GETBULK varbind order is repetition-major (RFC 3416 §4.2.3, #5065).** For
   `R` repeater columns and `M` repetitions the response interleaves by
   repetition — `rep0-col0, rep0-col1, …, rep1-col0, …` (varbind index

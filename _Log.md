@@ -102792,3 +102792,11 @@ prose edit above them added. No diff falls in the new test body.
   the CLEAR half was live.
 - **File(s)**: pkg/dataplane/userspace/legacy_dataplane.go,
   pkg/dataplane/userspace/clear_policy_counters_6566_test.go (new), _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6597 — replaced the linear MIB successor scan with a binary
+    search over a virtual sorted array, and made getIfData's long-documented
+    but never-enforced ifIndex sort real (the binary search depends on it).
+    Full walk at 512 interfaces: 6.32s -> 21.7ms.
+  - **File(s)**: pkg/snmp/agent.go, pkg/snmp/successor_lookup_6597_test.go,
+    pkg/snmp/README.md
