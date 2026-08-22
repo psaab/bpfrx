@@ -262,13 +262,16 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			representable = false
 		}
 		var prog JunosHostDenyProgram
+		// emitted is the subset of this zone's term keys that actually produced
+		// >=1 rule; nil whenever no program was projected at all (#6705).
+		var emitted map[string]bool
 		if emitsRules && representable {
 			// A cross-dimension permit/deny overlap (a narrow-application or
 			// source-excluded permit ahead of a deny) cannot be cleanly rendered
 			// as a `saddr !=` subtraction — the whole program is un-representable
 			// (§5.1). junosHostProjectProgram reports this via ok=false.
 			var ok bool
-			prog, ok = junosHostProjectProgram(zoneName, ifaceRefs, terms)
+			prog, emitted, ok = junosHostProjectProgram(zoneName, ifaceRefs, terms)
 			if !ok {
 				representable = false
 			}
@@ -300,6 +303,26 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			}
 			appliesEnforceable[t.key]++
 			if !representable {
+				blockedByUnrep[t.key] = true
+				continue
+			}
+			// #6705: representable is not enforced. A deny term can survive every
+			// representability check and still project NO rule — an earlier
+			// application-any permit for every source shadows it, its application
+			// resolves entirely to the other family, or its address match is the
+			// #5828 degenerate empty set. Suppressing the #4168 warning on that
+			// key told the operator the deny was enforced by the kernel gate when
+			// the kernel gate had been handed nothing to enforce, so a config that
+			// commits cleanly with ZERO warnings produced an empty DROP program.
+			// Emission is the property the suppression actually claims, so gate on
+			// it directly rather than on the representability that implied it.
+			// No action guard here on purpose: the suppression loop below already
+			// restricts RenderedPolicyKeys to PolicyDeny, so blocking a permit's
+			// key is unobservable. A `t.action == PolicyDeny` condition here read
+			// as load-bearing while no test could distinguish it either way —
+			// mutating it away changed nothing — so it is stated once, where it
+			// is actually enforced, instead of twice.
+			if !emitted[t.key] {
 				blockedByUnrep[t.key] = true
 			}
 		}
@@ -447,12 +470,22 @@ func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[stri
 // cross-dimension permit/deny subtraction that cannot be cleanly rendered (a
 // narrow-application or source-excluded permit ahead of a deny) — the whole
 // program is then un-representable and the caller warns (§5.1).
-func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostTerm) (JunosHostDenyProgram, bool) {
+func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostTerm) (JunosHostDenyProgram, map[string]bool, bool) {
 	prog := JunosHostDenyProgram{
 		Zone:          zone,
 		InterfaceRefs: ifaceRefs,
 		Representable: true,
 	}
+	// emitted records the term keys that contributed AT LEAST ONE rule to this
+	// program. A deny term can be fully representable and still project nothing
+	// — an earlier application-any permit for every source shadows it
+	// (junosHostBuildRule's permitAll arm), its application resolves entirely to
+	// the other family, or its address match is the #5828 degenerate empty set.
+	// The caller needs that distinction because "representable" and "enforced"
+	// are different properties: without it a deny that emitted zero rules still
+	// counted as rendered and had its #4168 warning suppressed, so the operator
+	// got neither the enforcement nor the diagnostic (#6705).
+	emitted := map[string]bool{}
 	// Accumulated earlier-permit source sets (per family) that carve later
 	// denies via `saddr !=`. A permit that permits ALL sources shadows every
 	// later deny.
@@ -472,7 +505,7 @@ func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostT
 			// because it is a PERMIT, never suppressed).
 			if !t.appAny || t.srcExcluded {
 				if sawDeny {
-					return JunosHostDenyProgram{}, false
+					return JunosHostDenyProgram{}, nil, false
 				}
 				// No deny yet: a later deny would make this un-representable.
 				// Record a poison flag by shadowing nothing but forcing the check
@@ -496,22 +529,24 @@ func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostT
 		// action deny.
 		sawDeny = true
 		if junosHostHasPoison(permitV4) || junosHostHasPoison(permitV6) {
-			return JunosHostDenyProgram{}, false
+			return JunosHostDenyProgram{}, nil, false
 		}
 		if r, ok := junosHostBuildRule("ip", t, permitV4, permitAllV4); ok {
 			prog.RulesV4 = append(prog.RulesV4, r)
+			emitted[t.key] = true
 			if t.appAny {
 				prog.HasApplicationAnyDeny = true
 			}
 		}
 		if r, ok := junosHostBuildRule("ip6", t, permitV6, permitAllV6); ok {
 			prog.RulesV6 = append(prog.RulesV6, r)
+			emitted[t.key] = true
 			if t.appAny {
 				prog.HasApplicationAnyDeny = true
 			}
 		}
 	}
-	return prog, true
+	return prog, emitted, true
 }
 
 // junosHostPoison is a sentinel accumulated for a cross-dimension permit so a
