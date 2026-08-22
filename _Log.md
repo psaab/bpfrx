@@ -99982,3 +99982,11 @@ prose edit above them added. No diff falls in the new test body.
   pkg/vrrp/resign_barrier_6177_test.go (new),
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
+
+## 2026-08-21 — #7259: bind the BulkSnapshotSource production wiring
+- **Timestamp**: 2026-08-21
+- **Action**: Add a test that drives the real `startClusterComms` and INVOKES the
+  `BulkSnapshotSource` it published, asserting the exported session round-trips.
+  Deleting `ss.BulkSnapshotSource = d.userspaceBulkSnapshot` left all five
+  existing #6031 tests green while silently reverting the fix.
+- **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
