@@ -127,6 +127,8 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // panic poisoned a command queue and it was recovered.
     state.status.worker_command_queue_poison_recoveries =
         state.afxdp.worker_command_queue_poison_recoveries_total();
+    state.status.shared_session_poison_recoveries =
+        state.afxdp.shared_session_poison_recoveries_total();
     // #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
     // over a Not-ECT inner). Nonzero = a misbehaving tunnel ingress
     // ECT-marked the outer for un-ECN inner traffic on a congested path.
@@ -455,5 +457,123 @@ pub(crate) fn set_bindings_forwarding_armed(status: &mut ProcessStatus, armed: b
     for binding in &mut status.bindings {
         binding.armed = armed && binding.registered;
         binding.last_change = Some(Utc::now());
+    }
+}
+
+#[cfg(test)]
+mod status_wiring_tests {
+    /// #6641: every Coordinator `*_total()` counter accessor must actually be
+    /// ASSIGNED into `ProcessStatus` by the status refresh above.
+    ///
+    /// This exists because the populate line is the wiring, and nothing bound
+    /// it. Deleting
+    ///
+    ///     state.status.shared_session_poison_recoveries =
+    ///         state.afxdp.shared_session_poison_recoveries_total();
+    ///
+    /// left the ENTIRE suite green: the serde round-trip tests build a
+    /// `ProcessStatus` literal, the Go decode tests parse a literal, and the
+    /// Prometheus test feeds a literal — none of them observes whether the
+    /// helper ever copies the live counter into the status it sends. Verified
+    /// against the #1807 twin as well: deleting ITS populate line was also
+    /// silent, so this was a gap in the pattern, not in one instance of it.
+    ///
+    /// The check is textual because it is a wiring property, not a value
+    /// property: there is no cheap way to stand up a full coordinator here,
+    /// and a behavioural test that did would still only cover the one counter
+    /// it exercised.
+    ///
+    /// ALLOWLIST: counters that deliberately have no status field yet. Each is
+    /// read only by tests today — the same state the #6641 counter was in
+    /// before it was surfaced — so the list is a visible queue rather than a
+    /// permission slip. Adding a counter here means deciding NOT to show it to
+    /// an operator; prefer wiring it.
+    const UNSURFACED: &[&str] = &[
+        "session_delete_stale_ignored_total",
+        "session_install_stale_ignored_total",
+        "synced_import_reserve_refused_total",
+    ];
+
+    fn read(rel: &str) -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e))
+    }
+
+    /// Strip comment lines before scanning.
+    ///
+    /// Load-bearing, and found the hard way: the doc comment on THIS test
+    /// quotes the very assignment the scan looks for, so with comments
+    /// included the gate stayed green after the real
+    /// `state.status.shared_session_poison_recoveries = ...` line was deleted
+    /// — the documentation satisfied the check on the code's behalf. Any
+    /// source-scanning gate that can be quoted in prose has this failure mode.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Accessor names declared as `pub fn <name>_total(&self) -> u64`.
+    fn accessors(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("pub fn ") else {
+                continue;
+            };
+            let Some(name) = rest.split('(').next() else {
+                continue;
+            };
+            if name.ends_with("_total") && rest.contains("(&self) -> u64") {
+                out.push(name.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn every_counter_accessor_is_wired_into_process_status() {
+        let coord = code_only(&read("src/afxdp/coordinator/status.rs"));
+        let refresh = code_only(&read("src/server/helpers/status.rs"));
+
+        let accs = accessors(&coord);
+        assert!(
+            accs.len() >= 20,
+            "found only {} `*_total(&self) -> u64` accessors in coordinator/status.rs — the \
+             scan pattern has rotted and this gate would pass vacuously",
+            accs.len()
+        );
+
+        let mut missing = Vec::new();
+        for a in &accs {
+            if UNSURFACED.contains(&a.as_str()) {
+                continue;
+            }
+            if !refresh.contains(&format!("state.afxdp.{}()", a)) {
+                missing.push(a.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "#6641: {} Coordinator counter(s) are never assigned into ProcessStatus by the \
+             status refresh, so the helper computes them and an operator never sees them:\n  {}\n\
+             Wire each as `state.status.<field> = state.afxdp.<name>();`, or — only if it is \
+             deliberately not surfaced — add it to UNSURFACED with a reason.",
+            missing.len(),
+            missing.join("\n  ")
+        );
+
+        // The allowlist must not accumulate dead entries.
+        for u in UNSURFACED {
+            assert!(
+                accs.iter().any(|a| a == u),
+                "#6641: UNSURFACED lists {:?}, which is not a Coordinator `*_total()` accessor \
+                 any more — a dead entry hides how many counters are really unsurfaced",
+                u
+            );
+        }
     }
 }

@@ -325,6 +325,26 @@ impl super::Coordinator {
         crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_POISON_RECOVERIES.load(Ordering::Relaxed)
     }
 
+    /// #2402/#6641: total shared-session mutex poison recoveries across
+    /// every shared-session and owner-RG-index site (publish, remove,
+    /// lookups, index maintenance, and the #5154 HA import
+    /// generation-guard reads). Each recovery means a worker thread
+    /// panicked while holding one of those mutexes and the committed map
+    /// was recovered rather than lost — the #2402 policy, which exists
+    /// because substituting an empty table silently dropped every active
+    /// synced session at the moment of failover.
+    ///
+    /// Surfaced as
+    /// `xpf_userspace_shared_session_poison_recoveries_total`. Nonzero
+    /// means a worker panic happened (see #925 supervisor) and HA state
+    /// survived it. The recovery is deliberately self-healing
+    /// (`clear_poison` restores the fast path), so without this counter
+    /// the only record was a sparse journald line — the twin of the
+    /// #1807 counter directly above, which was already surfaced.
+    pub fn shared_session_poison_recoveries_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_POISON_RECOVERIES.load(Ordering::Relaxed)
+    }
+
     /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
     /// ECN combine because the outer header carried a CE mark over an
     /// inner packet that was Not-ECT (the illegal combination — a
