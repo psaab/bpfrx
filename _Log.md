@@ -102192,3 +102192,13 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6615 — repo-wide dangling doc-citation gate (pkg/docsref) with a
+    grandfathered ratchet baseline; corrected 4 provable research/->pr/ cite
+    relocations. Sweep found 53 dangling paths across live (non-archive) files.
+  - **File(s)**: pkg/docsref/{doc.go,docsref_test.go,testdata/known_dangling.txt},
+    docs/fairness-regimes.md, docs/pr/1863-realization-gap/plan.md,
+    docs/pr/1864-toolchain-pin/reviewer-ids.md,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/{epoch.rs,rotate_epoch_v8.rs}

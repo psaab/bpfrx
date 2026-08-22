@@ -1,0 +1,127 @@
+# #6615 — grandfathered dangling documentation citations.
+#
+# Each path below is cited from a tracked file but does NOT exist on master:
+# the plan lives only on an unmerged research branch, or was never merged.
+# They are recorded rather than repaired because there is no correct path to
+# substitute and no honest way to reconstruct the content in bulk.
+#
+# This file is a RATCHET, not a permission slip. pkg/docsref enforces:
+#   - a dangling citation NOT listed here fails (no new rot);
+#   - a listed path that now RESOLVES fails (remove it);
+#   - a listed path nothing cites any more fails (dead grandfathering).
+#
+# So the list can only shrink. Removing an entry means either the plan was
+# merged or the citation was corrected — both are progress.
+#
+# Generated-history files (docs/issues/*-history.md) and _Log.md are excluded
+# from the sweep: they quote what a PR body or log entry once said, and are
+# regenerated wholesale, so a repair there would be reverted.
+#
+# Format: one path per line. Comments start with #.
+
+# cited by: docs/fairness-regimes.md
+docs/pr/1215-per5tuple-fairness/plan.md
+# cited by: docs/pr/1516-grpcapi-migration/plan.md, docs/pr/1517-cli-migration/plan.md, docs/pr/1518-cluster-session-sync-migration/plan.md, docs/pr/1521-maps-sync-decouple/plan.md
+docs/pr/1451-migration-scope/scope.md
+# cited by: docs/pr/1615-flooder-multithread-virtio/plan.md
+docs/pr/1611-flooder-runner-body/plan-v4.md
+# cited by: pkg/nftables/netlink_build.go
+docs/pr/6387-hostinbound-netlink/plan.md
+# cited by: docs/pr/827-p3-captures/plan.md
+docs/pr/827-p3-captures/pyshell-code-review.md
+# cited by: docs/pr/900-100e100m-harness/findings.md
+docs/pr/840-slice-d-v2/findings.md
+# cited by: docs/pr/905-mouse-latency/plan.md, docs/pr/913-mqfq-vtime/plan.md, docs/pr/929-same-class-harness/plan.md
+docs/pr/905-mouse-latency/findings.md
+# cited by: docs/pr/909-meta-prefetch/plan.md
+docs/pr/909-meta-prefetch/findings.md
+# cited by: docs/fairness-regimes.md
+docs/pr/937-ingress-xdp-redirect/feasibility.md
+# cited by: docs/pr/941-vacate-hard-cap/plan.md
+docs/pr/940-942-vmin-correctness/942-investigation.md
+# cited by: docs/pr/917-vmin-trio-closeout/plan.md
+docs/pr/940-942-vmin-correctness/smoke.md
+# cited by: pkg/config/types_system.go, pkg/ddns/manager.go, pkg/dhcpserver/README.md
+docs/research/1387-dhcp-ddns/plan.md
+# cited by: pkg/daemon/daemon_ddns.go, pkg/ddns/backend_rfc2136.go, pkg/dhcpserver/README.md
+docs/research/1387-inc2-ddns-backend/plan.md
+# cited by: docs/wireguard-interop.md
+docs/research/1434-multi-tunnel-wireguard/plan.md
+# cited by: pkg/config/compiler_validate_wireguard.go, pkg/config/types_routing.go
+docs/research/1434-multitunnel-wg/plan.md
+# cited by: docs/pr/1614-multi-rss-cos/plan.md, docs/pr/1691-cos-push-ceiling-gate-rescope/plan.md
+docs/research/1614-simul-load-diagnosis/plan.md
+# cited by: docs/pr/1630-cause1-credit-carry/plan.md
+docs/research/1630-cos-equalize-rootcause/plan.md
+# cited by: docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md
+docs/research/1649-initial-placement/plan.md
+# cited by: docs/pr/1651-b3-negcache/plan.md
+docs/research/1651-cold-resolve-latency/plan.md
+# cited by: docs/pr/1709-wireguard-s1-wire-protocol-compliance/plan.md
+docs/research/1703-wireguard-ubiquiti-interop/plan.md
+# cited by: docs/pr/1713-resolved-dns-renderer/plan.md
+docs/research/1715-dns-resolv-ownership/plan.md
+# cited by: docs/pr/1733-equal-flow-worker-cap-reject/plan.md, docs/pr/1735-mqfq-generalize-shaped/plan.md
+docs/research/1731-cos-mqfq-generalize/plan.md
+# cited by: docs/pr/1746-equal-flow-target-policy/f1-measurement.md
+docs/research/1746-equal-flow-target-policy/plan.md
+# cited by: docs/pr/1752-session-inplace-refresh/plan.md
+docs/research/1752-cpu-headroom/plan.md
+# cited by: test/incus/reverse-key-collision-probe.sh, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/worker/loop_body/mod.rs
+docs/research/1760-reverse-key-v2/plan.md
+# cited by: test/incus/capture-cold-stall.sh
+docs/research/1782-cold-start-stall-residual/plan.md
+# cited by: docs/pr/1824-proptest-harness/validation.md, userspace-dp/src/afxdp/frame/README.md, userspace-dp/src/afxdp/frame/prop_tests/mod.rs
+docs/research/1824-fuzz-harness/plan.md
+# cited by: docs/multi-wan.md, docs/pr/1827-pr3-nat/plan.md
+docs/research/1827-multiwan/plan.md
+# cited by: docs/multi-wan.md
+docs/research/1827-pr4-loadshare/plan.md
+# cited by: docs/cos-wan-sqm.md
+docs/research/1828-wan-sq/plan.md
+# cited by: docs/pr/1844-dhcp-nexthop/reviewer-ids.md
+docs/research/1844-dhcp-nexthop/plan.md
+# cited by: docs/pr/1861-install-txn/claude-smr-code-r1.md, userspace-dp/src/afxdp/tests_slow_path_disposition.rs, userspace-dp/src/session/README.md
+docs/research/1861-install-txn/plan.md
+# cited by: docs/pr/1866-wg-teardown/reviewer-ids.md
+docs/research/1866-wg-teardown/claude-smr-plan-r1.md
+# cited by: docs/pr/1866-wg-teardown/reviewer-ids.md
+docs/research/1866-wg-teardown/claude-smr-plan-r2.md
+# cited by: docs/pr/1866-wg-teardown/reviewer-ids.md
+docs/research/1866-wg-teardown/claude-smr-plan-r3.md
+# cited by: docs/pr/1866-wg-teardown/reviewer-ids.md
+docs/research/1866-wg-teardown/claude-smr-plan-r4.md
+# cited by: docs/pr/1866-wg-teardown/reviewer-ids.md
+docs/research/1866-wg-teardown/claude-smr-plan-r5.md
+# cited by: userspace-dp/src/session/README.md
+docs/research/1870-local-tunnel-pair/plan.md
+# cited by: docs/pr/1870-local-tunnel/reviewer-ids.md
+docs/research/1870-local-tunnel-pair/reviewer-ids.md
+# cited by: docs/pr/1912-cold-encap/reviewer-ids.md
+docs/research/1912-cold-encap/plan.md
+# cited by: docs/reviews/archive/ps-review-036-cohort12-14.md, pkg/dhcprelay/relay.go
+docs/research/1915-relay-socket-lifecycle/plan.md
+# cited by: docs/pr/1922-pr2-bootstrap/reviewer-ids.md, pkg/config/types_system.go
+docs/research/1922-safe-bootstrap-daemon/plan.md
+# cited by: docs/distribution.md, scripts/dist/README.md, scripts/dist/sign.py
+docs/research/1924-signed-hosted-dist/plan.md
+# cited by: docs/research/1961-wire-type-dscp/plan.md
+docs/research/1961-virtio-xsk-delivery/plan.md
+# cited by: docs/feature-gaps.md
+docs/research/2008-tier2/plan.md
+# cited by: docs/pr/2008-h7-log-default-profile/plan.md
+docs/research/2008-tier3/plan.md
+# cited by: pkg/natpoolalarm/natpoolalarm.go
+docs/research/2079-nat-pool-util-alarm/plan.md
+# cited by: pkg/dataplane/armed_gate_matrix_test.go
+docs/research/2114-nat-pool-alarm-dp-race/plan.md
+# cited by: docs/pr/2134-screen-session-limit-enforce/self-review.md, userspace-dp/src/session/README.md
+docs/research/2128-2134-screen-session-limit/plan.md
+# cited by: docs/reviews/archive/ps-review-043.md
+docs/research/2852-portalloc/results.md
+# cited by: docs/feature-coverage.md, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_firewall.go, userspace-dp/src/filter/README.md
+docs/research/3295-filter-failopen/plan.md
+# cited by: pkg/config/junos_host_deny.go
+docs/research/4146-junos-host-direct-deny/plan.md
+# cited by: docs/userspace-dnat-plan.md, pkg/config/compiler_interface_addr_nat_warning_5837_test.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_nat_iface_addr.go
+docs/research/5837-xdp-dnat-before-local/plan.md
