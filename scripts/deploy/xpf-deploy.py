@@ -53,6 +53,7 @@ Examples:
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -748,48 +749,81 @@ def libvirt_overlay_path(name):
     return contained_join(LIBVIRT_IMAGES, f"{name}.qcow2", "per-VM overlay")
 
 
-def _qcow2_backing_file(path):
-    """Absolute (realpath) backing-file of a qcow2 image, or None.
+class _ProbeIndeterminate(Exception):
+    """A qcow2 backing-file probe could not determine the answer (#6760).
 
-    Parses `qemu-img info --output=json` and returns the resolved
-    `full-backing-filename` (falling back to `backing-filename`), or None when
-    the image has no backing file, is unreadable, or qemu-img is absent.
-    qemu-img is a hard dependency of the libvirt overlay-create path
-    (`libvirt_disk` -> `qemu-img create`), so its absence means this tool
-    never created an overlay here — treating "unknown" as "no backing" is
-    therefore safe for the overwrite guard below (#5043)."""
+    Distinct from "this image has no backing file". The overwrite guard below
+    treats the two OPPOSITELY: no-backing means the file is not a dependent
+    overlay, while indeterminate means it MIGHT be and must not be assumed
+    away."""
+
+
+def _qcow2_backing_file(path):
+    """Absolute (realpath) backing-file of a qcow2 image, or None when the
+    image demonstrably has no backing file.
+
+    Raises _ProbeIndeterminate when the answer could not be determined —
+    qemu-img exited non-zero (unreadable, locked by a running domain,
+    permission denied, corrupt header) or its JSON did not parse.
+
+    #6760: this used to return None for FOUR different outcomes — qemu-img
+    absent, qemu-img failed, unparseable JSON, and genuinely no backing file —
+    and `_dependent_overlays` read None as "does not back onto the golden". So
+    an overlay this tool could not probe was silently classified as NOT
+    dependent, and `_install_libvirt_golden` then overwrote the golden and
+    corrupted exactly the overlay it had failed to read. A running VM's overlay
+    is a realistic instance: qemu-img can fail on an image held by a live
+    domain.
+
+    The ONE case that legitimately means "no backing" is qemu-img being absent
+    ENTIRELY, and the original reasoning for it still holds and is preserved
+    below: qemu-img is a hard dependency of the overlay-CREATE path
+    (`libvirt_disk` -> `qemu-img create`), so if it is missing from this host
+    then this tool never created an overlay here (#5043). That argument covers
+    a missing binary only; it never covered a probe that ran and failed, which
+    is the hole."""
     try:
         r = subprocess.run(["qemu-img", "info", "--output=json", path],
                            capture_output=True, text=True)
     except FileNotFoundError:
+        # qemu-img absent: no overlay can have been created here. Determinate.
         return None
     if r.returncode != 0:
-        return None
+        raise _ProbeIndeterminate(
+            f"qemu-img info failed for {path}: rc={r.returncode} "
+            f"{(r.stderr or '').strip()}")
     try:
         info = json.loads(r.stdout)
-    except (ValueError, TypeError):
-        return None
+    except (ValueError, TypeError) as exc:
+        raise _ProbeIndeterminate(f"qemu-img info for {path} did not parse: {exc}")
     bf = info.get("full-backing-filename") or info.get("backing-filename")
     return os.path.realpath(bf) if bf else None
 
 
 def _dependent_overlays(golden):
-    """Per-VM overlay qcow2 files in the golden's directory that back onto it.
+    """Classify sibling `*.qcow2` files by whether they back onto `golden`.
+
+    Returns `(deps, unknown)` — sorted absolute paths that PROVABLY back onto
+    the golden, and those whose backing could not be determined (#6760).
 
     `libvirt_disk` creates each VM's overlay as `qemu-img create -b <golden>`,
     so the overlay depends on the golden's bytes being IMMUTABLE. Overwriting
     the golden in place shifts the backing bytes under every one of these
     overlays and corrupts them (#5043) — commonly BOTH HA nodes at once, since
-    a cluster pair shares one golden. Scans sibling `*.qcow2` files and returns
-    the sorted absolute paths whose backing file resolves to `golden` (empty
-    when none, or when the images dir is missing/unreadable)."""
+    a cluster pair shares one golden.
+
+    `unknown` exists because an unprobeable file is not evidence of safety. It
+    is returned separately rather than folded into `deps` so the caller can say
+    something true and actionable about each: a known dependant names the VM to
+    destroy, an unknown one names a file to investigate."""
     golden_real = os.path.realpath(golden)
     imgdir = os.path.dirname(golden_real)
     deps = []
+    unknown = []
     try:
         entries = sorted(os.listdir(imgdir))
     except OSError:
-        return deps
+        return deps, unknown
     for entry in entries:
         if not entry.endswith(".qcow2"):
             continue
@@ -798,49 +832,144 @@ def _dependent_overlays(golden):
             continue  # the golden is not its own overlay
         if not os.path.isfile(cand):
             continue
-        if _qcow2_backing_file(cand) == golden_real:
+        try:
+            backing = _qcow2_backing_file(cand)
+        except _ProbeIndeterminate as exc:
+            unknown.append((os.path.abspath(cand), str(exc)))
+            continue
+        if backing == golden_real:
             deps.append(os.path.abspath(cand))
-    return deps
+    return deps, unknown
+
+
+@contextlib.contextmanager
+def _golden_lock(golden):
+    """Serialize golden replacement against overlay creation (#6761).
+
+    An exclusive flock on `<images-dir>/.xpf-golden.lock`, held across the
+    whole check-then-replace in `_install_libvirt_golden` and across the
+    `qemu-img create -b <golden>` in `libvirt_disk`. Without it the dependency
+    check and the copy are a plain TOCTOU: an overlay created between them
+    backs onto a golden that is about to be replaced, and nothing ever looks
+    again.
+
+    The lock file lives beside the golden so both operations on the same host
+    agree on it. If the directory is not writable by this user the lock cannot
+    be taken; that is not a reason to proceed unserialized, but it is also not
+    a reason to fail a first install on a root-owned images dir, so the lock is
+    best-effort and its absence is reported rather than silently ignored."""
+    lockpath = os.path.join(os.path.dirname(os.path.realpath(golden)),
+                            ".xpf-golden.lock")
+    fd = None
+    try:
+        try:
+            os.makedirs(os.path.dirname(lockpath), exist_ok=True)
+            fd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError as exc:
+            print(f"==> note: golden lock {lockpath} unavailable ({exc}); "
+                  f"proceeding WITHOUT serialization against overlay creation "
+                  f"(#6761)")
+            yield False
+            return
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield True
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def _install_libvirt_golden(srcq, image):
     """Install a verified qcow2 to the libvirt golden path deploy reads
-    (fable-165 H-30). Falls back to `sudo install` when the images dir is
-    root-owned (the common case). Returns the destination path.
+    (fable-165 H-30). Returns the destination path.
 
     Golden-immutability contract (#5043): the golden is a SHARED read-only
     backing store — every per-VM overlay is `qemu-img create -b <golden>` and
     depends on its bytes NEVER changing. Overwriting it in place while overlays
     back onto it shifts the backing bytes under live/created overlays and
     corrupts EVERY one (both HA nodes commonly share one golden — a single
-    re-fetch would poison both disks). First install (no golden yet) and a
-    legitimate re-fetch with no dependent overlays are safe; the dangerous
-    in-place overwrite of an in-use golden fails closed with a clear operator
-    message."""
+    re-fetch would poison both disks).
+
+    Two holes in that guard are closed here, and they are one path:
+
+    #6760 — an overlay whose backing could not be PROBED was classified as not
+    dependent, so the guard passed and the golden was overwritten under exactly
+    the file the tool had failed to read. Indeterminate now blocks, separately
+    worded from a known dependant.
+
+    #6761 — the check and the copy were an unlocked check-then-act on a live
+    file. Two failures, not one: an overlay created between the check and the
+    copy is corrupted (TOCTOU), and an INTERRUPTED in-place `copyfile` leaves a
+    truncated golden that corrupts every existing overlay even when the check
+    was correct. The replacement is now written to a temp file in the same
+    directory and moved into place with an atomic rename, under the same lock
+    `libvirt_disk` takes to create an overlay."""
     golden = libvirt_golden_path(image)
-    if os.path.isfile(golden):
-        deps = _dependent_overlays(golden)
-        if deps:
-            listing = "\n    - ".join(deps)
-            die(f"refusing to overwrite golden {golden} in place: "
-                f"{len(deps)} per-VM overlay(s) back onto it and would be "
-                f"corrupted (the qcow2 backing bytes would shift under a live "
-                f"disk — HA-pair disk corruption, #5043):\n    - {listing}\n"
-                f"  Fix by EITHER destroying the dependent VM(s) first "
-                f"(xpf-deploy.py --hypervisor libvirt destroy <appliance.yaml> "
-                f"for each), OR installing the new image under a fresh tag so "
-                f"existing overlays keep their immutable backing "
-                f"(fetch --install-libvirt --alias <new-name>, then reference "
-                f"image: <new-name> in the deploy YAML).")
-    print(f"==> installing verified qcow2 -> {golden} (libvirt golden)")
+    with _golden_lock(golden):
+        if os.path.isfile(golden):
+            deps, unknown = _dependent_overlays(golden)
+            if deps:
+                listing = "\n    - ".join(deps)
+                die(f"refusing to overwrite golden {golden} in place: "
+                    f"{len(deps)} per-VM overlay(s) back onto it and would be "
+                    f"corrupted (the qcow2 backing bytes would shift under a live "
+                    f"disk — HA-pair disk corruption, #5043):\n    - {listing}\n"
+                    f"  Fix by EITHER destroying the dependent VM(s) first "
+                    f"(xpf-deploy.py --hypervisor libvirt destroy <appliance.yaml> "
+                    f"for each), OR installing the new image under a fresh tag so "
+                    f"existing overlays keep their immutable backing "
+                    f"(fetch --install-libvirt --alias <new-name>, then reference "
+                    f"image: <new-name> in the deploy YAML).")
+            if unknown:
+                listing = "\n    - ".join(f"{p}: {why}" for p, why in unknown)
+                die(f"refusing to overwrite golden {golden} in place: "
+                    f"{len(unknown)} sibling qcow2 file(s) could not be probed, so "
+                    f"whether they back onto this golden is UNKNOWN — and an "
+                    f"unprobeable overlay is not evidence of safety (#6760). A "
+                    f"running domain's overlay is a common cause: qemu-img can "
+                    f"fail on an image a live VM holds open.\n    - {listing}\n"
+                    f"  Fix by EITHER making each file probeable (stop the domain "
+                    f"holding it, or correct its permissions) and re-running, OR "
+                    f"installing under a fresh tag so existing overlays keep their "
+                    f"immutable backing (fetch --install-libvirt --alias <new-name>).")
+        print(f"==> installing verified qcow2 -> {golden} (libvirt golden)")
+        _atomic_install_golden(srcq, golden)
+    return golden
+
+
+def _atomic_install_golden(srcq, golden):
+    """Place `srcq` at `golden` by an ATOMIC RENAME, never an in-place copy
+    (#6761).
+
+    An interrupted `shutil.copyfile` onto the live golden leaves it TRUNCATED,
+    which shifts the backing bytes under every existing overlay — the same
+    corruption the dependency guard exists to prevent, reached without any
+    concurrency at all. Writing a sibling temp file and renaming means the
+    golden is either wholly the old image or wholly the new one.
+
+    The temp file is created in the golden's own directory so the rename is
+    within one filesystem (os.replace across filesystems is not atomic and
+    raises). The sudo fallback mirrors the same shape for the root-owned
+    /var/lib/libvirt/images case."""
+    tmp = f"{golden}.xpf-tmp.{os.getpid()}"
     try:
         os.makedirs(os.path.dirname(golden), exist_ok=True)
-        shutil.copyfile(srcq, golden)
+        shutil.copyfile(srcq, tmp)
+        os.replace(tmp, golden)
+        return
     except OSError:
-        # /var/lib/libvirt/images is normally root-owned; -D creates the dir.
-        # run_capture so a failing install reports its stderr, not a traceback.
-        run_capture(["sudo", "install", "-m", "0644", "-D", srcq, golden])
-    return golden
+        # Clean up our partial temp before falling back, so a failed attempt
+        # never leaves a stray sibling *.qcow2-adjacent file behind.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    # /var/lib/libvirt/images is normally root-owned; -D creates the dir.
+    # install writes the temp, mv -f renames it into place atomically.
+    run_capture(["sudo", "install", "-m", "0644", "-D", srcq, tmp])
+    run_capture(["sudo", "mv", "-f", tmp, golden])
 
 
 def libvirt_disk(ap, runner):
@@ -873,8 +1002,22 @@ def libvirt_disk(ap, runner):
             f"(see `xpf-deploy.py fetch`) or set image: in the YAML.")
     # Fresh overlay per deploy so the VM boots clean from golden; the
     # golden is the read-only -b backing store and is never written.
-    runner.run(["qemu-img", "create", "-f", "qcow2",
-                "-b", golden, "-F", "qcow2", overlay])
+    #
+    # #6761: taken under the SAME lock `_install_libvirt_golden` holds across
+    # its check-then-replace. Without it the two race: a golden replacement
+    # can check for dependent overlays, find none, and then be overtaken by
+    # this create — leaving a brand-new overlay backing onto bytes that are
+    # about to be swapped, which nothing looks at again. Locking only the
+    # replacement side would close nothing; both sides must agree on the lock.
+    #
+    # A dry run performs no filesystem work, so it takes no lock.
+    if runner.dry:
+        runner.run(["qemu-img", "create", "-f", "qcow2",
+                    "-b", golden, "-F", "qcow2", overlay])
+        return overlay
+    with _golden_lock(golden):
+        runner.run(["qemu-img", "create", "-f", "qcow2",
+                    "-b", golden, "-F", "qcow2", overlay])
     return overlay
 
 

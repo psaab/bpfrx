@@ -26,6 +26,8 @@ path and it IS the golden.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import importlib.util
 import os
 import shutil
@@ -39,6 +41,10 @@ _SPEC = importlib.util.spec_from_file_location(
 xpf_deploy = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(xpf_deploy)
+
+
+# Sentinel for "the probe ran and could not determine the answer" (#6760).
+_INDETERMINATE = object()
 
 
 class RecordingRunner:
@@ -193,8 +199,15 @@ class LibvirtGoldenOverwriteGuardTests(unittest.TestCase):
         # required): a {realpath: backing-or-None} map drives the classifier.
         self._backing = {}
 
+        # #6760: the map value may be the sentinel _INDETERMINATE, so a test can
+        # express "the probe RAN and failed" — distinct from "no backing file".
+        # Before #6760 the production probe collapsed both to None and the guard
+        # read that as "not a dependent overlay".
         def fake_backing(path):
-            return self._backing.get(os.path.realpath(path))
+            v = self._backing.get(os.path.realpath(path))
+            if v is _INDETERMINATE:
+                raise xpf_deploy._ProbeIndeterminate(f"fake probe failed for {path}")
+            return v
 
         xpf_deploy._qcow2_backing_file = fake_backing
 
@@ -259,17 +272,253 @@ class LibvirtGoldenOverwriteGuardTests(unittest.TestCase):
         self._backing[os.path.realpath(dep1)] = os.path.realpath(golden)
         # Backs onto a DIFFERENT golden -> not a dependent of this one.
         self._backing[os.path.realpath(indep)] = "/var/lib/libvirt/images/other.qcow2"
-        deps = {os.path.realpath(d)
-                for d in xpf_deploy._dependent_overlays(golden)}
+        found, unknown = xpf_deploy._dependent_overlays(golden)
+        deps = {os.path.realpath(d) for d in found}
         self.assertEqual(deps,
                          {os.path.realpath(dep0), os.path.realpath(dep1)})
+        self.assertEqual(unknown, [], "every fixture probes cleanly here, so "
+                                      "nothing may land in the unknown bucket")
 
     def test_golden_is_not_its_own_overlay(self):
         # A golden whose own backing (spuriously) resolves to itself must never
         # be reported as a dependent overlay of itself.
         golden = self._write(self._golden_path(), b"G")
         self._backing[os.path.realpath(golden)] = os.path.realpath(golden)
-        self.assertEqual(xpf_deploy._dependent_overlays(golden), [])
+        self.assertEqual(xpf_deploy._dependent_overlays(golden), ([], []))
+
+
+class GoldenProbeIndeterminateTests(unittest.TestCase):
+    """#6760: an overlay whose backing could not be PROBED must not be
+    classified as "does not back onto the golden".
+
+    The old probe returned None for four different outcomes — qemu-img absent,
+    qemu-img failed, unparseable JSON, and genuinely no backing file — and the
+    guard read None as "not a dependent overlay". So an unprobeable overlay was
+    assumed safe and the golden was overwritten under exactly the file the tool
+    had failed to read. A running domain's overlay is the realistic instance:
+    qemu-img can fail on an image a live VM holds open.
+    """
+
+    def setUp(self):
+        self._imgdir = tempfile.mkdtemp(prefix="xpf-golden-images-")
+        self._srcdir = tempfile.mkdtemp(prefix="xpf-golden-src-")
+        self._orig_images = xpf_deploy.LIBVIRT_IMAGES
+        self._orig_backing = xpf_deploy._qcow2_backing_file
+        xpf_deploy.LIBVIRT_IMAGES = self._imgdir
+        self._backing = {}
+
+        def fake_backing(path):
+            v = self._backing.get(os.path.realpath(path))
+            if v is _INDETERMINATE:
+                raise xpf_deploy._ProbeIndeterminate(f"fake probe failed for {path}")
+            return v
+
+        xpf_deploy._qcow2_backing_file = fake_backing
+
+    def tearDown(self):
+        xpf_deploy.LIBVIRT_IMAGES = self._orig_images
+        xpf_deploy._qcow2_backing_file = self._orig_backing
+        shutil.rmtree(self._imgdir, ignore_errors=True)
+        shutil.rmtree(self._srcdir, ignore_errors=True)
+
+    def _write(self, path, content=b"x"):
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    def _golden(self):
+        return self._write(os.path.join(self._imgdir, "appliance.qcow2"), b"GOLDEN")
+
+    def _src(self):
+        return self._write(os.path.join(self._srcdir, "verified.qcow2"), b"NEW")
+
+    def test_unprobeable_sibling_is_reported_unknown_not_independent(self):
+        golden = self._golden()
+        opaque = self._write(os.path.join(self._imgdir, "running-vm.qcow2"))
+        self._backing[os.path.realpath(opaque)] = _INDETERMINATE
+
+        deps, unknown = xpf_deploy._dependent_overlays(golden)
+        self.assertEqual(deps, [], "an unprobeable file is not PROVABLY a dependant")
+        self.assertEqual([p for p, _ in unknown], [os.path.abspath(opaque)],
+                         "...but it must be reported as unknown, not dropped: "
+                         "before #6760 it vanished and the golden was overwritten "
+                         "under it")
+
+    def test_overwrite_refused_when_a_sibling_is_unprobeable(self):
+        golden = self._golden()
+        before = open(golden, "rb").read()
+        opaque = self._write(os.path.join(self._imgdir, "running-vm.qcow2"))
+        self._backing[os.path.realpath(opaque)] = _INDETERMINATE
+
+        with self.assertRaises(SystemExit):
+            xpf_deploy._install_libvirt_golden(self._src(), "appliance")
+        self.assertEqual(open(golden, "rb").read(), before,
+                         "the golden was overwritten despite an unprobeable sibling "
+                         "— this is the #6760 corruption path")
+
+    def test_qemu_img_absent_still_means_no_backing(self):
+        # The ONE case the original reasoning covered and which must NOT start
+        # blocking: qemu-img missing entirely means this tool never created an
+        # overlay here (#5043). Restoring the real probe with no qemu-img on
+        # PATH must yield a determinate None, not an indeterminate.
+        xpf_deploy._qcow2_backing_file = self._orig_backing
+        orig_run = xpf_deploy.subprocess.run
+
+        def no_qemu_img(argv, *a, **kw):
+            if argv and argv[0] == "qemu-img":
+                raise FileNotFoundError("qemu-img")
+            return orig_run(argv, *a, **kw)
+
+        xpf_deploy.subprocess.run = no_qemu_img
+        try:
+            self.assertIsNone(xpf_deploy._qcow2_backing_file("/nonexistent.qcow2"),
+                              "a missing qemu-img must stay DETERMINATE-none; "
+                              "making it indeterminate would block every install "
+                              "on a host without qemu-img, which the #5043 "
+                              "reasoning explicitly covers")
+        finally:
+            xpf_deploy.subprocess.run = orig_run
+
+    def test_clean_probe_still_permits_install(self):
+        # The over-blocking control: with every sibling probing cleanly and none
+        # backing onto the golden, the install must still proceed. An
+        # implementation that treated any probe as suspicious would pass every
+        # test above and break ordinary re-fetches.
+        golden = self._golden()
+        indep = self._write(os.path.join(self._imgdir, "other-vm.qcow2"))
+        self._backing[os.path.realpath(indep)] = "/var/lib/libvirt/images/other.qcow2"
+        self._backing[os.path.realpath(golden)] = None
+
+        out = xpf_deploy._install_libvirt_golden(self._src(), "appliance")
+        self.assertEqual(open(out, "rb").read(), b"NEW",
+                         "a clean re-fetch with no dependants must still install")
+
+
+class GoldenAtomicReplaceTests(unittest.TestCase):
+    """#6761: golden replacement was an unlocked check-then-in-place-copy.
+
+    Two distinct failures, and the second needs no concurrency at all: an
+    INTERRUPTED `shutil.copyfile` onto the live golden leaves it TRUNCATED, and
+    a truncated golden shifts the backing bytes under every existing overlay —
+    the exact corruption the dependency guard exists to prevent.
+    """
+
+    def setUp(self):
+        self._imgdir = tempfile.mkdtemp(prefix="xpf-golden-images-")
+        self._srcdir = tempfile.mkdtemp(prefix="xpf-golden-src-")
+        self._orig_images = xpf_deploy.LIBVIRT_IMAGES
+        xpf_deploy.LIBVIRT_IMAGES = self._imgdir
+
+    def tearDown(self):
+        xpf_deploy.LIBVIRT_IMAGES = self._orig_images
+        shutil.rmtree(self._imgdir, ignore_errors=True)
+        shutil.rmtree(self._srcdir, ignore_errors=True)
+
+    def _paths(self):
+        golden = os.path.join(self._imgdir, "appliance.qcow2")
+        with open(golden, "wb") as f:
+            f.write(b"OLD-GOLDEN-CONTENT")
+        src = os.path.join(self._srcdir, "verified.qcow2")
+        with open(src, "wb") as f:
+            f.write(b"NEW")
+        return src, golden
+
+    def test_interrupted_replace_leaves_the_old_golden_intact(self):
+        src, golden = self._paths()
+        before = open(golden, "rb").read()
+
+        real_copy = xpf_deploy.shutil.copyfile
+
+        def boom(a, b, *args, **kw):
+            real_copy(a, b, *args, **kw)   # write the temp fully...
+            raise KeyboardInterrupt("interrupted after the temp write")
+
+        xpf_deploy.shutil.copyfile = boom
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                xpf_deploy._atomic_install_golden(src, golden)
+        finally:
+            xpf_deploy.shutil.copyfile = real_copy
+
+        self.assertEqual(open(golden, "rb").read(), before,
+                         "an interruption before the rename must leave the golden "
+                         "WHOLLY the old image — an in-place copy would have left "
+                         "it truncated and corrupted every overlay backing onto it")
+
+    def test_successful_replace_is_whole(self):
+        src, golden = self._paths()
+        xpf_deploy._atomic_install_golden(src, golden)
+        self.assertEqual(open(golden, "rb").read(), b"NEW")
+
+    def test_no_temp_file_is_left_behind(self):
+        # A stray sibling temp would itself be scanned by the dependency guard
+        # on the next run, so cleanup is part of the contract rather than tidiness.
+        src, golden = self._paths()
+        xpf_deploy._atomic_install_golden(src, golden)
+        strays = [n for n in os.listdir(self._imgdir) if "xpf-tmp" in n]
+        self.assertEqual(strays, [], f"temp file(s) left behind: {strays}")
+
+    def test_overlay_create_actually_takes_the_lock(self):
+        # BIND THE WIRING, not the callee. The exclusivity test below proves the
+        # lock works when held; it does NOT prove libvirt_disk takes it, and a
+        # mutation that removed the lock from the overlay-create side passed
+        # every other test in this file. Without both sides on the same lock the
+        # TOCTOU is only half-closed, which is indistinguishable from closed.
+        _, golden = self._paths()
+        overlay_dir = tempfile.mkdtemp(prefix="xpf-overlay-")
+        self.addCleanup(shutil.rmtree, overlay_dir, ignore_errors=True)
+
+        taken = []
+        real_lock = xpf_deploy._golden_lock
+
+        @contextlib.contextmanager
+        def recording_lock(path):
+            taken.append(path)
+            with real_lock(path) as held:
+                yield held
+
+        class LiveRunner:
+            dry = False
+
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv):
+                self.calls.append(list(argv))
+                return ""
+
+        orig_overlay = xpf_deploy.libvirt_overlay_path
+        xpf_deploy._golden_lock = recording_lock
+        xpf_deploy.libvirt_overlay_path = lambda name: os.path.join(overlay_dir, f"{name}.qcow2")
+        try:
+            runner = LiveRunner()
+            xpf_deploy.libvirt_disk({"name": "vm0", "image": "appliance"}, runner)
+        finally:
+            xpf_deploy._golden_lock = real_lock
+            xpf_deploy.libvirt_overlay_path = orig_overlay
+
+        self.assertEqual(len(taken), 1,
+                         "libvirt_disk did not take the golden lock; the overlay "
+                         "create races golden replacement (#6761)")
+        self.assertEqual(os.path.realpath(taken[0]), os.path.realpath(golden),
+                         "the overlay create must lock on the SAME golden the "
+                         "replacement locks on, or the two never contend")
+
+    def test_lock_is_exclusive_between_replace_and_overlay_create(self):
+        # #6761 TOCTOU: the replacement and the overlay create must contend on
+        # the SAME lock. Holding it in this process must block a second
+        # acquisition, which is what serializes the two paths.
+        _, golden = self._paths()
+        with xpf_deploy._golden_lock(golden) as held:
+            self.assertTrue(held, "the temp images dir is writable, so the lock "
+                                  "must actually be taken here")
+            lockpath = os.path.join(self._imgdir, ".xpf-golden.lock")
+            fd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
 
 
 if __name__ == "__main__":
