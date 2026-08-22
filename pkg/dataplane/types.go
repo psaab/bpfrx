@@ -174,13 +174,15 @@ type SessionValue struct {
 	//     back to the zone — the resolver's own doc says so;
 	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
 	//     different interface, which is worse than approximate: it renders one
-	//     confident WRONG name rather than a zone list. pkg/grpcapi and pkg/api
+	//     confident WRONG name rather than a zone list. All three surfaces
 	//     CORROBORATE a hit against the row's own recorded ingress zone and,
 	//     when the two disagree, treat it as a MISS and answer from the zone
 	//     — the filter feeds `clear`, so an untrustworthy name must not select
-	//     anything (#6960). pkg/cli's resolver does not corroborate at all,
-	//     which is #6987. Corroboration cannot separate a recycle WITHIN one
-	//     zone from the truth, on any surface;
+	//     anything (#6960/#6987). The reported column declines to name an
+	//     interface at all on such a disagreement, and names a zone's
+	//     interface only where the zone binds exactly ONE. Corroboration
+	//     cannot separate a recycle WITHIN one zone from the truth, on any
+	//     surface;
 	//   - the map keys a unit under `vlan-id`, else `unit number`
 	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
 	//     THE WIRE. Those agree when the unit number equals the vlan id, or
@@ -478,13 +480,15 @@ type SessionValueV6 struct {
 	//     back to the zone — the resolver's own doc says so;
 	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
 	//     different interface, which is worse than approximate: it renders one
-	//     confident WRONG name rather than a zone list. pkg/grpcapi and pkg/api
+	//     confident WRONG name rather than a zone list. All three surfaces
 	//     CORROBORATE a hit against the row's own recorded ingress zone and,
 	//     when the two disagree, treat it as a MISS and answer from the zone
 	//     — the filter feeds `clear`, so an untrustworthy name must not select
-	//     anything (#6960). pkg/cli's resolver does not corroborate at all,
-	//     which is #6987. Corroboration cannot separate a recycle WITHIN one
-	//     zone from the truth, on any surface;
+	//     anything (#6960/#6987). The reported column declines to name an
+	//     interface at all on such a disagreement, and names a zone's
+	//     interface only where the zone binds exactly ONE. Corroboration
+	//     cannot separate a recycle WITHIN one zone from the truth, on any
+	//     surface;
 	//   - the map keys a unit under `vlan-id`, else `unit number`
 	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
 	//     THE WIRE. Those agree when the unit number equals the vlan id, or

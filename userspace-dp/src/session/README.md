@@ -1040,40 +1040,36 @@ through the SAME `{ifindex, VLAN}` map. Both halves are pinned by
 the egress-arm disagreement and the ingress-arm agreement against the real
 `showFlowSession`.
 
-For a ZERO or unresolvable identity the ingress arm and the column degrade
-differently as well: the FILTER falls back to every interface bound to the zone
-(`resolveIngressIfaces`), the DISPLAY to the zone's first/representative
-interface (`sessionIngressIf`). So a zero-identity row in zone `[A, B]` is
-selected by `interface B` yet prints `If: A`. That is a second, independent way
-the two can name different interfaces — a fallback artefact, not a filtering
-error.
+For a ZERO or unresolvable identity the ingress arm and the column still degrade
+differently, but no longer in a way that lets the column NAME an interface the
+filter would not select. The FILTER falls back to every interface bound to the
+zone (`resolveIngressIfaces`); the COLUMN falls back to that zone's interface
+only when the zone binds exactly ONE, and otherwise prints the zone NAME
+(`ingressIfaceDisplay`). So a zero-identity row in zone `[A, B]` is selected by
+`interface A` and by `interface B`, and prints `If: <zone>` — not `If: A`.
 
-The DISPLAY side's own fallback chain, for completeness: an absent or an
-unnameable identity falls back to the ingress zone's FIRST interface, and a
-zone that binds none falls back to the zone NAME. Never to a blank column, and
-that part matters — WHERE THE INGRESS ZONE BINDS AT LEAST ONE INTERFACE, those
-populations (§ "`0` means no ingress identity carried" below) are still
-selectable by an interface filter through the zone approximation, so a blank
-would hide a row the filter can still reach. Where the zone binds NONE, that
-particular route in is gone — but the row is NOT thereby unreachable, because
-the filter still has its egress arm; see the consequence spelled out below. The
-never-blank rule is still right there — the column prints the zone name — but
-its justification is the bound-interface case, not every case.
+**#6987 changed this.** Until then DISPLAY built its own
+`map[uint16]string` holding each zone's FIRST interface, kept deliberately
+separate from the filter's widened `map[uint16][]string`:
 
-**Verified at this head, because the paragraph that used to stand here said the
-two fallbacks were "the same degradation" and they are not.** They are
-different TYPES, built from the same config in different shapes:
-
-| side | map | built from | fallback yields |
+| side | map | built from | fallback yielded |
 |---|---|---|---|
 | FILTER (`session_filter.go`, `populateIfaceMaps`) | `map[uint16][]string` | `append(zoneIfaces[zid], zone.Interfaces...)` | EVERY bound interface |
-| DISPLAY (`cli_show_flow.go`) | `map[uint16]string` | `zone.Interfaces[0]` | the FIRST one, else the zone name |
+| DISPLAY (`cli_show_flow.go`, retired) | `map[uint16]string` | `zone.Interfaces[0]` | the FIRST one, else the zone name |
 
-`cli_show_flow.go` states the split itself where it builds them: use
-`populateIfaceMaps` "rather than the single-first-interface `zoneIfaces` built
-above for display", which "stay display-only". So the divergence is deliberate
-on the filter's side — an interface-filtered `show` must see every interface of
-a zone (#4792) — and simply not mirrored into the one-name column.
+A zero-identity row in zone `[A, B]` therefore printed `If: A` as though A were
+the session's own interface. There is now ONE map (`populateIfaceMaps`) and one
+rule; the column declines to pick a member where the row cannot support the
+choice. The never-blank property is preserved — the column prints the zone name
+instead — which is what keeps the peer-synced and reverse-direction populations
+(§ "`0` means no ingress identity carried" below) visible in the output while
+they remain selectable through the zone.
+
+The column also declines when the identity RESOLVES but the row's own recorded
+ingress zone does not bind the resulting interface. That is what a recycled
+kernel ifindex looks like from the query side, and it is the one case where a
+confident name is likeliest to be the wrong one — so it prints the zone even
+where the zone binds exactly one interface.
 
 Two consequences beyond the `[A, B]` example above. A zone binding NO interface
 gives the filter an empty slice, so `ifaceMatchesAny` is false on the INGRESS
@@ -1123,9 +1119,13 @@ disagreement is a MISS: the filter feeds `clear`, and selecting on an
 untrustworthy name would delete sessions that never touched the named
 interface. The row stays reachable through its zone and its egress arm.
 
-`pkg/cli` does not corroborate yet, and the zone approximation itself still
-names one interface for all of its siblings in the reported column on every
-surface; both are #6987.
+`pkg/cli` corroborates the same way since #6987, and the reported column on all
+three surfaces now names the zone rather than one member standing in for its
+siblings. What remains open on every surface is a recycle WITHIN one zone: the
+recorded zone corroborates the new owner, so the name still passes. Separating
+that from the truth needs an install-time generation carried on the session row
+itself, which is a dataplane wire change (#7239). The EGRESS side is not
+corroborated at all and carries the same recycle hazard (#7240).
 
 The identity is stamped ONCE and never re-derived from the zone; re-deriving
 is the approximation it exists to remove.
