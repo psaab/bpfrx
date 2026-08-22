@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/natshow"
 )
 
 // sortedKeys returns the keys of a string-keyed map in ascending order. The
@@ -285,10 +286,19 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			flow := cfg.Security.Flow
 			buf.WriteString("Flow session timeouts:\n")
 			if flow.TCPSession != nil {
-				fmt.Fprintf(&buf, "  TCP established:      %ds\n", flow.TCPSession.EstablishedTimeout)
-				fmt.Fprintf(&buf, "  TCP initial:          %ds\n", flow.TCPSession.InitialTimeout)
-				fmt.Fprintf(&buf, "  TCP closing:          %ds\n", flow.TCPSession.ClosingTimeout)
-				fmt.Fprintf(&buf, "  TCP time-wait:        %ds\n", flow.TCPSession.TimeWaitTimeout)
+				// #6539: only established-timeout has a dataplane wire
+				// carrier; the other three never leave the control plane and
+				// must not be printed in the same shape as the enforced one.
+				// The annotation comes from config.AnnotateTCPSessionTimeout,
+				// shared with the CLI/gRPC surfaces and the commit advisory.
+				tcpRow := func(label, leaf string, secs int) {
+					fmt.Fprintf(&buf, "  %-21s %s\n", label+":",
+						config.AnnotateTCPSessionTimeout(leaf, fmt.Sprintf("%ds", secs)))
+				}
+				tcpRow("TCP established", config.TCPSessionEstablishedTimeoutLeaf, flow.TCPSession.EstablishedTimeout)
+				tcpRow("TCP initial", config.TCPSessionInitialTimeoutLeaf, flow.TCPSession.InitialTimeout)
+				tcpRow("TCP closing", config.TCPSessionClosingTimeoutLeaf, flow.TCPSession.ClosingTimeout)
+				tcpRow("TCP time-wait", config.TCPSessionTimeWaitTimeoutLeaf, flow.TCPSession.TimeWaitTimeout)
 			}
 			fmt.Fprintf(&buf, "  UDP session:          %ds\n", flow.UDPSessionTimeout)
 			fmt.Fprintf(&buf, "  ICMP session:         %ds\n", flow.ICMPSessionTimeout)
@@ -313,49 +323,26 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+	// #6565: BOTH NAT views delegate to the SHARED pkg/natshow renderers, the
+	// same ones the CLI (cli_show_nat.go) and gRPC (server_show_nat.go) call.
+	//
+	// REST used to reimplement them, printing every rule straight from config.
+	// That third copy is what made the fail-closed annotations a per-surface
+	// lottery: #5323 taught two surfaces to say NOT INSTALLED for a rule the
+	// userspace snapshot builder drops, and #6534 taught two surfaces a further
+	// set of exclusion reasons — each time leaving REST rendering the dropped
+	// rule as though it were live. An operator (or an automation) reading the
+	// REST surface saw a configured NPTv6 prefix rewrite or static-NAT rule
+	// reported as installed when nothing was programmed.
+	//
+	// The CLI and gRPC surfaces had a byte-equality test against the shared
+	// renderer (#1687) and REST did not, which is exactly why REST is the copy
+	// that drifted. show_nat_shared_test.go now closes that gap.
 	case "nat-static":
-		if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
-			buf.WriteString("No static NAT rules configured.\n")
-		} else {
-			for _, rs := range cfg.Security.NAT.Static {
-				fmt.Fprintf(&buf, "Static NAT rule-set: %s\n", rs.Name)
-				fmt.Fprintf(&buf, "  From zone: %s\n", rs.FromZone)
-				for _, rule := range rs.Rules {
-					fmt.Fprintf(&buf, "  Rule: %s\n", rule.Name)
-					fmt.Fprintf(&buf, "    Match destination-address: %s\n", rule.Match)
-					if rule.IsNPTv6 {
-						fmt.Fprintf(&buf, "    Then nptv6-prefix:         %s\n", rule.Then)
-					} else {
-						fmt.Fprintf(&buf, "    Then static-nat prefix:    %s\n", rule.Then)
-					}
-				}
-				buf.WriteString("\n")
-			}
-		}
+		natshow.RenderStatic(&buf, cfg)
 
 	case "nat-nptv6":
-		if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
-			buf.WriteString("No NPTv6 rules configured.\n")
-		} else {
-			found := false
-			for _, rs := range cfg.Security.NAT.Static {
-				for _, rule := range rs.Rules {
-					if !rule.IsNPTv6 {
-						continue
-					}
-					if !found {
-						fmt.Fprintf(&buf, "%-20s %-20s %-50s %-50s\n",
-							"Rule-set", "Rule", "External prefix", "Internal prefix")
-						found = true
-					}
-					fmt.Fprintf(&buf, "%-20s %-20s %-50s %-50s\n",
-						rs.Name, rule.Name, rule.Match, rule.Then)
-				}
-			}
-			if !found {
-				buf.WriteString("No NPTv6 rules configured.\n")
-			}
-		}
+		natshow.RenderNPTv6(&buf, cfg)
 
 	default:
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown topic: %s", topic))
