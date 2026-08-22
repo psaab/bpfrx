@@ -1,3 +1,31 @@
+## 2026-08-21 — #6656 transfer-out override cleared on peer loss
+
+- **Timestamp**: 2026-08-21
+- **Action**: `handlePeerTimeout` cleared `ManualFailover`, `peerGroups`,
+  `peerMonitors` and both peer version fields but left
+  `peerTransferOutOverride` armed. That override has NO expiry and is
+  re-applied to the rebuilt peer-group map on every heartbeat, and it
+  feeds BOTH the election AND the operator-facing status render
+  (`FormatStatus` prints the post-override `m.peerGroups`) — so an
+  override outliving its peer incarnation makes this node force a
+  reconnecting peer to secondary-hold forever and self-elect primary,
+  which is the reported signature (node0 primary for all RGs, node1
+  carrying the traffic). Cleared beside the existing ManualFailover
+  clear, using the same argument that comment already makes.
+  RECORD CORRECTION: the issue's VRRP virtual-MAC/VIP hypothesis is
+  INAPPLICABLE — `private-rg-election` is the compiler default
+  (`compiler_system.go`), so `CollectRethInstances` returns nil and the
+  cluster has no RETH VRRP instances at all.
+  Mutation matrix: V1 (no clear — the shipped state) and V2 (clear only
+  the first RG) RED; V3 (drop only the map entry, keep the Previous
+  snapshot) GREEN and disclosed — with the override gone the snapshot is
+  unreachable, so it is a bounded leak, not a correctness gap.
+  NOT REPRODUCED on hardware: the loss cluster is shared and serialized
+  by the lead. Successors filed for the two cluster-dependent gaps.
+- **File(s)**: pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/transfer_override_peer_loss_6656_test.go,
+  pkg/cluster/README.md
+
 ## 2026-08-21 — #6534 port-mirroring: dropped instances stop rendering as armed
 
 - **Timestamp**: 2026-08-21
