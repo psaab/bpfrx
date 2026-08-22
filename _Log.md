@@ -71,6 +71,40 @@
   pkg/dataplane/userspace/zones_host_inbound.go, cmd/cli, plus the
   eight fixtures that encoded the union semantics
 
+## 2026-08-21 — #6552 diagnostic-fork concurrency bound on ShowText/GetSystemInfo
+
+- **Timestamp**: 2026-08-21
+- **Action**: Made `outputTimeout`/`combinedOutputTimeout` acquire the
+  shared `diagcmd.DefaultLimiter` slot before forking, so the ten
+  read-only diagnostic fork sites in `ShowText` (journalctl, tail,
+  chronyc ×2, ntpq, timedatectl) and `GetSystemInfo` (ps, df,
+  journalctl, ss) draw from the same `MaxConcurrentDiagnostics=4` budget
+  ping/traceroute already use on both surfaces. Unbounded forms renamed
+  `*Unlimited`; three uses stay unbounded by design (power actions,
+  zeroize teardown, ip neigh flush) and are named in an allowlist a
+  source tripwire checks in BOTH directions. Errors map through
+  `diagExecError` so a refused admission is `ResourceExhausted`, not
+  `Internal`. Both `grpc.NewServer` builders now set
+  `MaxConcurrentStreams(256)` — grpc-go's server default is unlimited.
+  SECURITY DETERMINATION: no injection vector. Nine sites pass only
+  compile-time literals to `exec.CommandContext` (no shell); the tenth
+  (`tail -n N <logPath>`) is request-derived on both args and
+  constrained on both (clampTailLines [1,10000] re-emitted via Itoa;
+  SyslogLogFilePath enforces `filepath.Base` + the configured
+  `system syslog file` allowlist → `/var/log/<allowlisted-base>`).
+  Mutation matrix: N1/N2 (restore each helper's pre-fix unbounded body)
+  → the matching bound test + tripwire red; N3 (anchor site points at
+  the Unlimited helper) → tripwire names it; N4 (delete a
+  `MaxConcurrentStreams` line) → server test red; N5 (acquire at the
+  handler top instead of the fork) → the non-forking `users` negative
+  control reds; N6 (bogus exemption) → tripwire reds on the stale side.
+  Issue said six fork sites; there are ten, and the chronyc/ntpq chain
+  is in `ShowText{ntp}`, not `GetSystemInfo`.
+- **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show.go, pkg/grpcapi/server_show_status.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/diag_fork_limiter_6552_test.go, pkg/grpcapi/README.md
 ## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
 
 - **Timestamp**: 2026-08-22
@@ -100890,6 +100924,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
 
+## 2026-08-21 — #6519: zone-level DHCP/BOOTP host-inbound parity advisory
+- **Timestamp**: 2026-08-21
+- **Action**: Junos accepts `dhcp`/`bootp` host-inbound only per INTERFACE ("All
+  services (except DHCP and BOOTP) can be configured either per zone or per
+  interface"). xpf accepts them at the zone level, where they authorize every
+  member interface. Added `validateHostInboundZoneLevelDHCPWarnings`, a
+  commit-time WARN naming the token (including the `all` case, since `all`
+  expands to a union containing dhcp/bootp) and the member interfaces the
+  zone-level authorization reaches, skipping lifelines and any interface that
+  authorized the service through its own stanza. Added
+  `ZoneConfig.InterfaceHostInboundOverride` as the interface-level half of the
+  effective-set resolution, bound to `InterfaceHostInboundEffective` by test.
+  Enforcement is NOT changed: the flip has a real population (the shipped
+  cluster configs) and would cost a zoned DHCP-client interface its address.
+- **File(s)**: pkg/config/host_inbound_dhcp_scope_6519.go (new),
+  pkg/config/host_inbound_dhcp_scope_6519_test.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/testdata/golden_4406.json (regenerated — 12 added warning lines,
+  one per case cell, no config-shape change),
+  docs/host-inbound-service-matrix.md
 ## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
 - **Timestamp**: 2026-08-21
 - **Action**: `terminateRemovedConns` was fire-and-forget while
@@ -100957,3 +101011,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_device_map_dup_name_6546_test.go (new),
   pkg/daemon/device_map_dup_name_6546_test.go (new),
   docs/bare-metal-device-map.md, _Log.md
+
+## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
+- **Timestamp**: 2026-08-21
+- **Action**: #6515 and #6519 landed independently, each carrying its own copy of
+  the #3720 physical∪unit interface-level override walk —
+  `InterfaceHostInboundEffective` inline, and `InterfaceHostInboundOverride` in
+  the #6519 advisory. `InterfaceHostInboundEffective` now CALLS
+  `InterfaceHostInboundOverride`. Single-sourced rather than bound with an
+  agreement test because a divergence would ALWAYS be a bug: the #6519 advisory
+  asks "does the interface's own stanza authorize this?" to decide what the
+  zone-level stanza is answerable for, and must be asking about the set the
+  resolver admits. Behaviour-preserving; no advisory or enforcement change.
+- **File(s)**: pkg/config/host_inbound_view.go,
+  pkg/config/host_inbound_dhcp_scope_6519.go
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #7304 follow-up — folded a post-merge hostile Codex review: closed
+    two vacuous-green holes in the #6419 assertions (errors.Is(nil,nil) sentinel
+    mutation; the production OnConfigReceived wiring was never bound), corrected
+    the backwards R1 comment, and recorded the tagged-epoch variant that refutes
+    the categorical #6419 close.
+  - **File(s)**: pkg/daemon/config_sync_test.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/sync_conn_gen.go, docs/session-sync-architecture.md
