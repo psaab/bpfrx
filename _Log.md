@@ -102686,3 +102686,30 @@ prose edit above them added. No diff falls in the new test body.
     starvation — and reds on a revert to `while !stop`.
   - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
     docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6630 — PSK rotation was a planned outage: with one key, the
+    moment one node commits the new one each end receives a
+    present-but-invalid HMAC, `admitFrame` rejects without refreshing
+    `lastSeen`, and after ~1s BOTH nodes declare the peer dead and BOTH take
+    over their RGs. The documented workaround (clear both keys first) is
+    refused by #6611's validator. Added `additional-authentication-key`: a
+    second key a node ACCEPTS and never SIGNS with, so the two commits can be
+    separated in time. Heartbeat AND fabric gRPC widen together; session sync
+    does not (connection-scoped, #6628's territory). Finalize is an operator
+    commit (delete the leaf), never a timer. Declined the wire key-id #6630
+    prescribed — the PROPERTY it was for is "can the operator tell whether the
+    peer moved", answered by recording which accepted key last verified a peer
+    frame and rendering its derived id in `show chassis cluster statistics`,
+    with no new bytes on the heartbeat. Mutation matrix 8/8 RED. R4 (epoch read
+    must use the VERIFYING key) was GREEN until the rotation fixture was made
+    epoch-bearing — `samplePkt()` carries no epoch, so `heartbeatFrameEpoch`
+    returned hasEpoch=false whatever key it was handed and the cell measured
+    nothing.
+  - **File(s)**: pkg/cluster/{control_key_rotation.go,
+    control_key_rotation_6630_test.go,heartbeat.go,manager.go,group_state.go,
+    status.go,README.md}, pkg/config/{types_chassis.go,compiler_system.go,
+    schema_chassis.go,ast_redact.go,compiler_validate_strict_cluster_auth.go,
+    compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
+    pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
+    docs/config-schema.md

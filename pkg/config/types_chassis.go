@@ -120,7 +120,27 @@ type ClusterConfig struct {
 	// agnostic: the SAME key on both nodes, synced by config-sync. Secret-
 	// typed so it is redacted on every show/log/JSON/YAML path and never
 	// echoed into an error string.
-	ControlLinkAuthKey    Secret
+	ControlLinkAuthKey Secret
+	// ControlLinkAuthKeyAlt is a SECOND key this node ACCEPTS on the control
+	// channel but never SIGNS with (#6630). It exists so a PSK rotation is a
+	// rolling operation instead of a planned outage.
+	//
+	// Without it, rotating one node to a new key makes each end receive a
+	// present-but-invalid HMAC from the other. Those frames are rejected
+	// without refreshing lastSeen, so after heartbeat-interval x threshold
+	// (~1s at shipped settings) BOTH nodes declare the peer dead and BOTH take
+	// over their redundancy groups — dual-master with duplicate VIPs for the
+	// whole window between the two commits.
+	//
+	// "Additional accepted", not "previous", because it holds the NEW key in
+	// the first half of a rotation and the OLD key in the second. The
+	// procedure in pkg/cluster/README.md walks both halves.
+	//
+	// Secret-typed and redacted exactly like ControlLinkAuthKey. It does NOT
+	// satisfy the #6611 keyed-cluster requirement on its own: a cluster whose
+	// only key is this one signs with nothing, so validateClusterAuthKeyStrict
+	// still demands ControlLinkAuthKey.
+	ControlLinkAuthKeyAlt Secret
 	NATStateSync          bool   // enable NAT state synchronization (session sync with NAT fields)
 	IPsecSASync           bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
 	DHCPLeaseSync         bool   // enable DHCP-server lease synchronization (#2239 PATH C: lease state held on standby, seeded into Kea on takeover)
