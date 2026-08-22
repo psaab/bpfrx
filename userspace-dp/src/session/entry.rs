@@ -37,8 +37,10 @@ pub(crate) struct SessionMetadata {
     /// zone (#4792 widened that CLI to consider every interface bound to the
     /// zone, which is as good as the approximation gets without this datum).
     /// The gRPC surface the REMOTE `cli` binary uses (`pkg/grpcapi`) and the
-    /// REST surface (`pkg/api`) still answer an interface filter from the zone
-    /// — see `session/README.md` "Which surfaces this applies to".
+    /// REST surface (`pkg/api`) read the same identity since #6960; before
+    /// that they answered an interface filter from the zone, so a remote
+    /// `clear ... interface <name>` tore down sibling-interface sessions —
+    /// see `session/README.md` "Which surfaces this applies to".
     ///
     /// SCOPE (#6965): "for the sessions that are mirrored" is load-bearing.
     /// `publish_bpf_conntrack_entry` is called from only three sites in

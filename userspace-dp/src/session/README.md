@@ -1099,19 +1099,33 @@ three arms; there is no corresponding test asserting the two sides agree,
 because they do not.
 
 **Which surfaces this applies to.** The consumer side landed in the IN-DAEMON
-CLI only (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
-the same session table and still answer an `interface` filter from the ingress
-ZONE, in the pre-#4792 FIRST-interface-only form:
+CLI first (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
+the same session table and answered an `interface` filter from the ingress
+ZONE, in the pre-#4792 FIRST-interface-only form, until #6960 ported the
+identity to both:
 
-- `pkg/grpcapi/server_sessions.go` (`f.zoneIfaces[zid] = zone.Interfaces[0]`),
-  which is what the REMOTE `cli` binary uses for both `show security flow
-  session interface <name>` and the matching `clear`;
+- `pkg/grpcapi/server_sessions.go`, which is what the REMOTE `cli` binary uses
+  for both `show security flow session interface <name>` and the matching
+  `clear`, and what a console clear propagates to the HA peer over (#6975);
 - `pkg/api/sessions.go`, the HTTP/REST session query.
 
-Neither is changed here (this PR's diff against `pkg/grpcapi` and `pkg/api` is
-empty), so on those surfaces an interface filter still selects every session of
-the named interface's zone whose zone happens to resolve to that first
-interface. Porting `resolveIngressIfaces` to them is tracked separately.
+Both now resolve the ingress interface through `resolveSessionIngressIfaces` —
+the interface a CORROBORATED identity names, else EVERY interface bound to the
+ingress zone. The zone reduction they used before (`zone.Interfaces[0]`) made
+the ingress arm independent of the session, so `clear security flow session
+interface <the zone's first interface>` DELETED every session in that zone.
+
+"Corroborated" means the row's own recorded ingress ZONE binds the interface
+the `{ifindex, VLAN}` table names. It has to be checked because that table is
+rebuilt per query while the ifindex was recorded at install, so a RECYCLED
+kernel ifindex can HIT and name an interface the session never arrived on. A
+disagreement is a MISS: the filter feeds `clear`, and selecting on an
+untrustworthy name would delete sessions that never touched the named
+interface. The row stays reachable through its zone and its egress arm.
+
+`pkg/cli` does not corroborate yet, and the zone approximation itself still
+names one interface for all of its siblings in the reported column on every
+surface; both are #6987.
 
 The identity is stamped ONCE and never re-derived from the zone; re-deriving
 is the approximation it exists to remove.

@@ -173,6 +173,11 @@ type Server struct {
 	// (--grpc-addr). Immutable, so it is read without effMu; it is the fallback
 	// address reported while pre-bind and on a bind failure (#6385/#6401).
 	requestedAddr string
+	// ifindexByName resolves a netdev name to its kernel ifindex when
+	// building the session {ifindex, VLAN} -> interface-name table. nil
+	// means the real kernel lookup; tests inject a fixed table so the
+	// session-identity paths are exercisable without real netdevs.
+	ifindexByName func(string) (int, error)
 	// effMu guards the primary gRPC listener state Run records for the
 	// `show system services` effective-listener snapshot (#6385/#6401): effAddr
 	// is the actual bound address (post-#5035 clamp, post-net.Listen), effState
