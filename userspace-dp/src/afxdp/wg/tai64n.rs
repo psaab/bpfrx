@@ -171,7 +171,7 @@ impl Tai64nClock {
     /// `last`.
     pub(crate) fn now(&self) -> [u8; TAI64N_LEN] {
         let candidate = Self::wall_clock_now();
-        let mut guard = self.last.lock().unwrap();
+        let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let next = match *guard {
             // Strictly greater (big-endian byte compare == numeric): take
             // the fresh wall-clock value.
@@ -196,7 +196,7 @@ impl Tai64nClock {
     /// control plane (#1703 S6) can prevent cross-restart regression. The
     /// next `now()` will return strictly greater than `hw`. Slow path only.
     pub(crate) fn seed_high_water(&self, hw: [u8; TAI64N_LEN]) {
-        let mut guard = self.last.lock().unwrap();
+        let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
         // Only move the high-water mark forward; never let a stale seed
         // pull it backwards.
         match *guard {
@@ -208,7 +208,7 @@ impl Tai64nClock {
     /// Snapshot the current high-water mark for persistence (#1703 S6).
     /// Returns `None` if `now()` has never been called and no seed applied.
     pub(crate) fn high_water(&self) -> Option<[u8; TAI64N_LEN]> {
-        *self.last.lock().unwrap()
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

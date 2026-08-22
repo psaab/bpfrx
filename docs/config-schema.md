@@ -8478,7 +8478,7 @@ scope committed against a pre-`4` helper disarms it and aborts the commit
 The rest of the config still loads (#1960 no-brick).
 The id→name reverse maps resolve a colliding id to the survivor deterministically
 (`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,
-`pkg/dataplane/userspace/manager_ha.go:zoneNameByID`) rather than to whichever
+`pkg/dataplane/userspace/manager_sessionsync_request.go:zoneNameByID`) rather than to whichever
 name won a map-iteration race. The quarantine is surfaced to the operator as a
 loud one-shot `slog.Error` naming both zones, on `ProcessStatus.ZoneIDCollisions`
 (`show`), and as the `xpf_userspace_zone_id_collision` 0/1 gauge, so an operator
