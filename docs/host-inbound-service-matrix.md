@@ -1112,6 +1112,63 @@ an interface's admission routes through the former — the kernel nft view build
 (`ClassifyHostInboundForInterface`), the commit-time advisories, the
 duplicate-host-address gate, and all six display surfaces.
 
+### The advisory consumes the enforcer's view, it does not model it (#6640)
+
+`config.EffectiveHostInboundTokens` settles the zone-vs-interface choice, but it
+takes an interface's override as an ARGUMENT — it does not resolve one. The
+resolution (the #3720 physical→unit merge, the #3720 M01 / #5489 cross-zone
+quarantines, the #5878 canonicalisation) lives in
+`config.ResolveInterfaceHostInbound`, and the enforcement builders in
+`pkg/dataplane/userspace` (`buildInterfaceHostInboundMap`,
+`buildInterfaceZoneMap`, `mergeHostInboundTraffic`) are one-line delegations to
+it.
+
+That move is #6640, and the reason is that the commit-time advisory could not
+reach the old location — `pkg/dataplane/userspace` imports `pkg/config`, not the
+other way round — so it re-derived an approximation instead: a union of the zone
+stanza with each **raw** interface stanza, modelling no physical→unit layer at
+all. The advisory and the enforcer were therefore describing different objects,
+and the advisory emitted FALSE denial warnings on configurations that
+full-admit:
+
+| authored | effective (enforced) | old advisory |
+|---|---|---|
+| physical `any-service` + unit `rpm` | `{any-service, rpm}` — full admit | "rpm is DENIED; add `any-service`" |
+| physical `rpm` + unit `any-service` | `{rpm, any-service}` — full admit | same, at the physical stanza |
+| lifeline-only zone (`fxp0.0`) | not enforced at all (#3277) | same, at the zone |
+| `fxp0.0` interface override | not enforced at all (#3277) | same, at the interface |
+
+Three separate rounds (#3226, #6616, #6640) each fixed one more advisory case by
+copying one more enforcement rule into the advisory. The general shape, stated
+once: **the advisory must not maintain its own model of enforcement semantics.**
+Every divergence found so far has been a place where enforcement grew a rule the
+advisory did not copy, so the advisory now calls the same function instead.
+
+Two rules follow from that, and they are separate:
+
+- **Observability comes from the EFFECTIVE view.** An advisory fires only where
+  the dataplane acts: for an interface stanza, on the enforcement KEYS that ref
+  governs (a physical interface with units is never itself a key — its units
+  are), skipping lifeline keys, and only when at least one such key does not
+  full-admit once resolved. For the zone stanza, only when at least one
+  non-lifeline key in the zone still resolves to NO interface override, so the
+  zone-level tokens actually reach something. A zone with no interfaces yet keeps
+  warning: the stanza governs nothing, but the advisory is about what the
+  operator authored.
+- **The named TOKENS come from the AUTHORED stanza.** The resolved set on a unit
+  also carries tokens inherited from its physical parent, and naming those at the
+  unit's own stanza would report a service that stanza never accepted — the same
+  cry-wolf failure in a new place, with one denial drawing two advisories.
+
+The lifeline exemption (#3277) now covers the unported-service advisory as well
+as the scoping one; before #6640 it was applied to the latter only.
+
+Gate: `pkg/config/host_inbound_advisory_effective_view_6640_test.go` (four false
+shapes silent, three real denials still warning) plus
+`pkg/dataplane/userspace/host_inbound_shared_view_6640_test.go` (the same fixture
+observed through the classifier). Breaking `ResolveInterfaceHostInbound` must red
+BOTH files; if only the advisory reds, they are not sharing it.
+
 ### Replace, not union (#6515) — UPGRADE NOTE
 
 > **This is an admission NARROWING. Read it before upgrading if any of your

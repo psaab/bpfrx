@@ -103324,3 +103324,23 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/frr/policy_render.go`,
   `pkg/config/compiler_as_path_multitoken_6686_test.go` (new),
   `pkg/frr/policy_aspath_regex_6686_test.go` (new), `docs/config-schema.md`
+
+## 2026-08-22 — #6640 host-inbound advisory consumes the enforcer's view
+- **Timestamp**: 2026-08-22
+- **Action**: Moved the per-interface host-inbound override RESOLUTION (#3720
+  physical->unit merge, #3720 M01 / #5489 cross-zone quarantines, #5878
+  canonicalisation) out of pkg/dataplane/userspace into pkg/config as
+  InterfaceZoneMap / MergeHostInboundTraffic / ResolveInterfaceHostInbound, with
+  the userspace helpers delegating, so the commit-time advisory calls the same
+  function the dataplane enforces on instead of re-deriving a raw-stanza union.
+  Re-gated the advisory on the effective view + the #3277 lifeline exemption
+  (which had never been ported to the unported-service advisory), keeping the
+  named tokens on the AUTHORED stanza so an inherited physical token is not
+  reported at a unit stanza that never named it. Four reproduced false warnings
+  now silent, three real denials still warn.
+- **File(s)**: pkg/config/host_inbound_effective_view.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/host_inbound_advisory_effective_view_6640_test.go (new),
+  pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/zones_override.go,
+  pkg/dataplane/userspace/host_inbound_shared_view_6640_test.go (new),
+  docs/host-inbound-service-matrix.md

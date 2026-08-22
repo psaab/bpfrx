@@ -544,27 +544,89 @@ func ValidateConfig(cfg *Config) []string {
 			}
 			return false
 		}
-		// The zone-level stanza governs every interface that does NOT declare its
-		// own host-inbound-traffic stanza. #6515: an interface that declares one
-		// REPLACES the zone set, so if EVERY interface in the zone declares one,
-		// the zone-level tokens reach nothing and their advisories are moot.
-		// (Before #6515 the levels unioned, so only a full-admit override could
-		// make the zone-level narrowing unobservable — a strictly narrower
-		// condition.) The lookup is the exact ref, so a unit that merely INHERITS
-		// a physical-parent override is not counted here and the advisory is still
-		// emitted: erring toward showing an advisory, never toward hiding one.
+		// #6640: the advisories below reason about the SAME EFFECTIVE VIEW the
+		// dataplane enforces, resolved by config.ResolveInterfaceHostInbound —
+		// which the enforcement builders in pkg/dataplane/userspace now call
+		// too. Before this they unioned the zone with each RAW interface stanza
+		// and modelled no physical->unit layer at all, so the two reasoned about
+		// different objects and the advisory contradicted enforcement on any
+		// config that used both levels.
+		//
+		// The resolved map is keyed by the enforcement key — a canonical logical
+		// unit, or a bare physical for a unit-less interface — and its value is
+		// the physical-inherited override UNIONED with the unit-level one
+		// (#3720), cross-zone quarantined (#3720 M01 / #5489).
+		resolvedHI := ResolveInterfaceHostInbound(cfg)
+		// hiKeysFor returns the enforcement keys a raw zone-interface REF
+		// governs. It is deliberately not "the ref itself": a physical ref with
+		// units never reaches the dataplane as a key — the per-unit snapshot
+		// consumer looks up "<phy>.<unit>" — so an advisory keyed on the bare
+		// physical would describe an object nothing enforces. A unit-less
+		// physical IS its own key (see ResolveHostInboundIngressInterface).
+		hiKeysFor := func(ref string) []string {
+			canon := CanonicalInterfaceUnitRef(ref)
+			if strings.Contains(canon, ".") {
+				return []string{canon}
+			}
+			if ifCfg := cfg.Interfaces.Interfaces[canon]; ifCfg != nil && len(ifCfg.Units) > 0 {
+				units := make([]string, 0, len(ifCfg.Units))
+				for unitNum := range ifCfg.Units {
+					units = append(units, fmt.Sprintf("%s.%d", canon, unitNum))
+				}
+				sort.Strings(units)
+				return units
+			}
+			return []string{canon}
+		}
+		// hiEffectiveAt returns the effective system-service set the dataplane
+		// admits on ONE enforcement key: the resolved override when one applies
+		// (it REPLACES the zone level, #6515), else the zone-level set.
+		hiEffectiveAt := func(key string) []string {
+			ovr := resolvedHI[key]
+			var is []string
+			if ovr != nil {
+				is = ovr.SystemServices
+			}
+			return EffectiveHostInboundTokens(zoneSvcs, is, ovr != nil)
+		}
+		// The zone-level stanza governs every enforcement key that does NOT
+		// resolve to an interface-level override. #6515: an interface that
+		// declares one REPLACES the zone set, so if EVERY key in the zone
+		// resolves to an override, the zone-level tokens reach nothing and their
+		// advisories are moot. A LIFELINE key is excluded as well: its host
+		// traffic is served unconditionally (#3277), so the zone-level narrowing
+		// is not observable there either — which is the false warning #6640
+		// reproduced for a lifeline-only zone.
+		//
+		// The lookup is the RESOLVED map, not the raw stanza list, so a unit that
+		// merely INHERITS a physical-parent override counts as covered. It is
+		// covered: the dataplane enforces the inherited override on that unit and
+		// never the zone set.
+		//
+		// A zone with NO interfaces keeps warning, exactly as before: the stanza
+		// governs nothing yet, but the advisory is about what the operator
+		// AUTHORED, and suppressing it would silence the #3226 advisory on the
+		// commonest way to write one (a zone stanza authored before its
+		// interfaces). Only a zone that HAS interfaces, none of which the
+		// zone-level set can reach, is silenced.
 		zoneObservable := !effectiveFullAdmits(zoneSvcs)
 		if zoneObservable && len(zone.Interfaces) > 0 {
-			allCovered := true
+			reached := false
 			for _, ifRef := range zone.Interfaces {
-				if zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)] == nil {
-					allCovered = false
+				if HostInboundLifelineInterface(ifRef, lifelines) {
+					continue
+				}
+				for _, key := range hiKeysFor(ifRef) {
+					if resolvedHI[key] == nil {
+						reached = true
+						break
+					}
+				}
+				if reached {
 					break
 				}
 			}
-			if allCovered {
-				zoneObservable = false
-			}
+			zoneObservable = reached
 		}
 		if zone.HostInboundTraffic != nil {
 			where := fmt.Sprintf("zone %q host-inbound-traffic", name)
@@ -583,21 +645,45 @@ func ValidateConfig(cfg *Config) []string {
 				continue
 			}
 			where := fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef)
-			// The EFFECTIVE set for this interface, exactly as the dataplane
-			// enforcement view builder computes it — post-#6515 the override
-			// REPLACES the zone-level set rather than adding to it.
-			effective := EffectiveHostInboundTokens(zoneSvcs, hi.SystemServices, true)
 			// The full-admit notice stays keyed on the OVERRIDE's own tokens: it
 			// reports what this stanza declares, and a zone-level `any-service`
 			// already drew its own notice at the zone level.
 			fullAdmitAdvice(where, hi.SystemServices)
-			observable := !effectiveFullAdmits(effective)
-			// An override is scoped to ONE interface, so gate it on that
-			// interface's own lifeline status rather than the zone's.
-			allScopingAdvice(where, effective,
-				!HostInboundLifelineInterface(ifRef, lifelines) && observable)
+			// #6640: the stanza's narrowing is OBSERVABLE only where the
+			// dataplane acts on it, so walk the enforcement keys this ref
+			// governs and ask whether ANY of them (a) is not a lifeline and
+			// (b) does not full-admit once resolved. A physical stanza whose
+			// unit unions an `any-service`, or a unit stanza sitting under a
+			// physical `any-service`, resolves to a full admit and denies
+			// nothing — the two false cases #6640 reproduced.
+			//
+			// The TOKEN LIST stays the stanza's OWN authored set, not the
+			// resolved one. Under #6515 an interface override REPLACES the zone
+			// level, so `EffectiveHostInboundTokens(zoneSvcs, hi.SystemServices,
+			// true)` was already exactly hi.SystemServices here and this changes
+			// no wording — but the resolved set also carries the tokens INHERITED
+			// from a physical-level stanza, and naming those at the unit stanza
+			// would report a service the unit stanza never accepted. That is the
+			// same cry-wolf failure in a new place: one denial would draw two
+			// advisories, one of them at a stanza that did not mention the
+			// service.
+			observable := false
+			for _, key := range hiKeysFor(ifRef) {
+				if HostInboundLifelineInterface(key, lifelines) {
+					continue
+				}
+				if !effectiveFullAdmits(hiEffectiveAt(key)) {
+					observable = true
+					break
+				}
+			}
+			// An override is scoped to the interface it names, so it is gated on
+			// THAT interface's own lifeline status rather than the zone's — which
+			// `observable` already carries, since every lifeline key is skipped
+			// above.
+			allScopingAdvice(where, hi.SystemServices, observable)
 			if observable {
-				unportedAdvice(where, effective)
+				unportedAdvice(where, hi.SystemServices)
 			}
 		}
 	}
