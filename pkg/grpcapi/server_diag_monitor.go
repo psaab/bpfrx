@@ -339,11 +339,13 @@ const monitorNoPeerMarker = "xpf-no-peer"
 // spoof it to reach data it could not otherwise reach — the worst it can do is
 // force a would-be proxy to serve locally / report not-found.
 func monitorRequestForwardedFromPeer(ctx context.Context) bool {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return false
-	}
-	return len(md.Get(monitorNoPeerMarker)) > 0
+	// #5883: read the unforgeable in-process capability, not the raw header.
+	// The comment above is right that spoofing this marker reaches no data the
+	// caller could not otherwise reach — but "the worst it can do is force a
+	// would-be proxy to serve locally" is still a caller deciding a hop bound
+	// the operator did not, and it is the same key the session-clear path
+	// trusts. One mechanism for both, so neither can drift.
+	return peerMarkersFromContext(ctx).noPeer
 }
 
 // monitorClusterState is the slice of the cluster manager the MonitorInterface
