@@ -57,6 +57,13 @@ type CompileResult struct {
 	Lo0FilterV4 uint32 // lo0 inet filter ID (0=none), set by compileFirewallFilters
 	Lo0FilterV6 uint32 // lo0 inet6 filter ID (0=none), set by compileFirewallFilters
 
+	// hostMutations records the CLASSES of live host state this compile
+	// actually changed (#4960), so an abort after the Phase-2 mutation point can
+	// tell the operator the host has moved. Keyed by action rather than counted,
+	// so N reconciled interfaces produce one entry. Set only on a real change —
+	// a converged re-apply records nothing. See compiler_hostmutation_4960.go.
+	hostMutations map[string]bool
+
 	nextAddrID   uint32            // next available address ID (after address book)
 	implicitSets map[string]uint32 // cache of implicit set key -> set ID
 	// NATCounterIDs maps a type-namespaced NAT rule key (NATCounterKey →
