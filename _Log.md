@@ -101237,6 +101237,20 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
+## 2026-08-21 — #6561 ip-monitoring probe-state wipe on an unrelated commit
+- **Timestamp**: 2026-08-21
+- **Action**: `rpm.Manager.Apply` rebuilt the whole results table from config,
+  seeding every key `LastStatus: "unknown"`, which ipmon reads as PASS — so at
+  the default hold-down of 0 an ACTIVE failover route was withdrawn. The
+  trigger is not an RPM edit: `reconcileRPM`'s hash covers
+  `cfg.RethToPhysical()`, so any RETH-member change reopens the gate. Preserved
+  the runtime half rather than skipping the reconcile: `Apply` snapshots the
+  prior results before `StopAll` and carries a verdict forward when the
+  RESOLVED measurement identity is unchanged. Corrected mid-implementation from
+  an fwmark-based discriminator (the mark is a positional index, not a path
+  identity — it does not move on a RETH remap).
+- **File(s)**: pkg/rpm/rpm.go, pkg/rpm/probe_verdict_carry_6561_test.go (new),
+  pkg/ipmon/README.md, pkg/rpm/README.md, _Log.md
 ## 2026-08-21 — #6548: console `load ... terminal` aborts on Ctrl-C
 - **Timestamp**: 2026-08-21
 - **Action**: `pkg/cli` handleLoad's terminal read loop took the same `break`
@@ -101272,3 +101286,34 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   docs/feature-gaps.md, docs/phases.md, _Log.md
+
+## 2026-08-21 — #6560 VRRP self-frame filter
+- **Timestamp**: 2026-08-21
+- **Action**: VRRP had no PACKET_OUTGOING / multicast-loop self-frame filter;
+  self-filtering rested solely on the deliberately-nilable getLocalIP()
+  snapshot, which is nil for 30ms-1s during the #2528 RETH-MAC flush window,
+  so a MASTER could process its own advert and self-demote via
+  resolveEqualPriorityMaster's nil-localCmp step-down. Confirmed the frame IS
+  delivered by two mechanisms (AF_PACKET ETH_P_ALL TX tap; IP multicast
+  loopback on the fallback raw sockets) — the socket did NOT already filter.
+  Added PACKET_IGNORE_OUTGOING (set before bind, best-effort), an sll_pkttype
+  drop in receiverAfPacket (Recvfrom's sockaddr was being discarded), and
+  IP_MULTICAST_LOOP/IPV6_MULTICAST_LOOP disable on both fallback sockets.
+  TOUCHES VRRP — owes `make test-failover`.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
+  pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
+
+## 2026-08-21 — #6563: inject-packet emit-on-wire validates the source
+- **Timestamp**: 2026-08-21
+- **Action**: `request inject-packet --emit-on-wire` ran FIB/HA/CoS then enqueued
+  TX with an operator-arbitrary `source_ip` — `inject.rs` had ZERO references to
+  policy or screen, so a local principal could emit spoofed-source ICMP/ICMPv6
+  bypassing the zone policy and screen that govern transit. Added
+  `is_firewall_local_address` (global `local_v4`/`local_v6` membership:
+  interface host addresses + static-NAT/DNAT externals) and gated
+  `validate_injected_packet_tuple` on it. The gate is LAST (structural faults
+  keep message precedence) and applies to the EMIT path only, so non-emit
+  classification keeps its full diagnostic range.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/inject.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md, _Log.md

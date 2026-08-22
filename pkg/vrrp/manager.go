@@ -1130,6 +1130,16 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*
 		return nil, nil, fmt.Errorf("raw conn: %w", err)
 	}
 
+	// Do not loop our own adverts back to local sockets (#6560). This socket
+	// both sends and receives, and it joins 224.0.0.18 below, so with the
+	// default IP_MULTICAST_LOOP=1 the kernel clones every advert we transmit
+	// back up the local receive path and into this very socket. The option is
+	// per-SENDING-socket, so it suppresses only the loopback of our own
+	// transmissions; a peer's advert arriving from the wire is unaffected.
+	if err := rawConn.SetMulticastLoopback(false); err != nil {
+		slog.Debug("vrrp: disable ipv4 multicast loopback failed", "interface", ifName, "err", err)
+	}
+
 	// Join VRRP multicast group on this interface.
 	group := net.IPv4(224, 0, 0, 18)
 	if err := rawConn.JoinGroup(iface, &net.IPAddr{IP: group}); err != nil {
@@ -1143,6 +1153,12 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*
 // It is a package var so tests can intercept the call and assert the type
 // flags (notably SOCK_CLOEXEC) without needing CAP_NET_RAW.
 var afPacketSocket = unix.Socket
+
+// afPacketSetsockoptInt is the setsockopt(2) entry point used by
+// openAfPacketReceiver for PACKET_IGNORE_OUTGOING. Package var for the same
+// reason as afPacketSocket: it lets a test assert the EXACT (level, option,
+// value) the call site uses, deterministically and without CAP_NET_RAW.
+var afPacketSetsockoptInt = unix.SetsockoptInt
 
 // VRRP advertisement multicast destination MACs. IPv4 VRRP adverts go to
 // 224.0.0.18 which maps to the Ethernet multicast MAC 01:00:5e:00:00:12; IPv6
@@ -1268,6 +1284,31 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 	fd, err := afPacketSocket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, int(proto))
 	if err != nil {
 		return -1, fmt.Errorf("af_packet socket: %w", err)
+	}
+
+	// Ask the kernel not to deliver our OWN transmissions to this capture
+	// socket (#6560).
+	//
+	// This socket is an ETH_P_ALL tap, which is what tcpdump uses and why it
+	// shows egress traffic: dev_queue_xmit_nit clones every outbound frame to
+	// each ptype_all tap with skb->pkt_type = PACKET_OUTGOING, and packet_rcv
+	// drops only PACKET_LOOPBACK. Adverts leave on the raw AF_INET/AF_INET6
+	// sockets, but they egress the very netdev this socket is bound to, so a
+	// MASTER's own advertisement lands in its own receive queue -- passing the
+	// cBPF filter, which matches ethertype and IP protocol only and has no
+	// pkttype ancillary load.
+	//
+	// Set BEFORE bind, deliberately. socket(AF_PACKET, SOCK_RAW,
+	// htons(ETH_P_ALL)) with a non-zero protocol is already capturing on every
+	// interface at creation, so setting this after bind would leave a window in
+	// which our own frames could already be queued.
+	//
+	// Best-effort: PACKET_IGNORE_OUTGOING is Linux >= 4.20. An older kernel
+	// returns ENOPROTOOPT and keeps working, because the receive loop's
+	// sll_pkttype check (receiverAfPacket) is the belt this is the braces for.
+	if err := afPacketSetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_IGNORE_OUTGOING, 1); err != nil {
+		slog.Debug("vrrp: PACKET_IGNORE_OUTGOING unavailable; relying on the sll_pkttype check",
+			"ifindex", ifIndex, "err", err)
 	}
 
 	// Bind to specific interface.
@@ -1396,6 +1437,13 @@ func openIPv6Socket(ifName string, iface *net.Interface, isVLAN bool) (net.Packe
 	if err := sc.Control(func(rawfd uintptr) {
 		// Ignore error — may fail if group already joined.
 		_ = unix.SetsockoptIPv6Mreq(int(rawfd), unix.IPPROTO_IPV6, unix.IPV6_JOIN_GROUP, mreq)
+		// Do not loop our own adverts back to local sockets (#6560) — the v6
+		// twin of the IP_MULTICAST_LOOP disable on the IPv4 raw conn. Same
+		// reasoning: this socket sends AND joins ff02::12, so the default
+		// loopback delivers our own adverts straight back into it.
+		if err := unix.SetsockoptInt(int(rawfd), unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_LOOP, 0); err != nil {
+			slog.Debug("vrrp: disable ipv6 multicast loopback failed", "interface", ifName, "err", err)
+		}
 	}); err != nil {
 		slog.Debug("vrrp: ipv6 join multicast failed", "interface", ifName, "err", err)
 	}
