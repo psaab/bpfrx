@@ -280,6 +280,107 @@ func fabricParentUp(linuxName string) bool {
 	}
 }
 
+// fabricNeighListFn is the netlink neighbour enumerator used by the fabric
+// peer-MAC resolver, indirected so a test can drive buildFabricPeerMAC itself
+// against a synthetic neighbour table (#7443).
+//
+// #6598 hardened the selection but bound only the extracted helper
+// (selectFabricPeerMAC) and pkg/daemon's call sites. buildFabricPeerMAC -- the
+// LIVE resolver, whose result becomes FabricSnapshot.PeerMAC and reaches the
+// dataplane as the cross-chassis redirect destination -- called netlink
+// directly, so no test could execute it and reverting its body to the
+// pre-#6598 inline loop left the whole suite green. The seam is what makes the
+// fail-on-revert assertion reach the function the issue names.
+//
+// Same shape as ruleListFn (routes.go) and as the d.linkByNameFn/d.neighListFn
+// seams pkg/daemon added for exactly this purpose in #6554.
+var fabricNeighListFn = netlink.NeighList
+
+// FabricNeighValidStates is the NUD mask of neighbour states whose hardware
+// address is usable for forwarding. INCOMPLETE/FAILED/NONE carry no address, or
+// retain a stale one, and are excluded. NUD_NOARP is excluded too -- an earlier
+// revision of this comment enumerated only the first three, which read as though
+// NOARP were accepted (#7443).
+//
+// This is deliberately NOT the same mask as usableNUD
+// (pkg/daemon/daemon_neighbor_listener.go), which does accept NUD_NOARP. The
+// two answer different questions and a difference between them is therefore
+// permissible, unlike the pkg/daemon duplication #6598 removed:
+//
+//   - usableNUD governs the GENERAL host-neighbour snapshot and is
+//     contractually pinned to the Rust dataplane's accept rules
+//     (userspace-dp/src/server/handlers.rs, .../afxdp/forwarding/mod.rs).
+//   - this mask governs which single entry may be adopted as the fabric PEER'S
+//     forwarding identity, and answers it more strictly.
+//
+// Do not unify them in a future single-sourcing pass. Widening this one would
+// let a NOARP entry stand in for the peer; narrowing usableNUD would change
+// which neighbours the listener publishes and break its stated mirror of the
+// Rust rules. docs/fabric-cross-chassis-fwd.md records keeping the two apart as
+// deliberate; what it does not record is a rationale for excluding NOARP from
+// THIS mask specifically, so treat that exclusion as the mask's behaviour
+// rather than as a decision this comment can justify for you.
+//
+// It lives here, in the package that owns the LIVE fabric peer-MAC resolver,
+// and pkg/daemon consumes it. Both packages resolve the same thing -- which MAC
+// currently answers for the fabric peer -- so any disagreement between them is
+// a defect by construction, never a legitimate difference of policy. That is
+// the case for one definition rather than two agreeing ones (#6598).
+const FabricNeighValidStates = netlink.NUD_REACHABLE | netlink.NUD_STALE |
+	netlink.NUD_PERMANENT | netlink.NUD_DELAY | netlink.NUD_PROBE
+
+// FabricNeighUsable reports whether a neighbour entry's link-layer address may
+// be used as a fabric forwarding destination: a 6-byte Ethernet address in a
+// NUD state that means the kernel believes it.
+//
+// The length check is not redundant with the state check. A NUD_STALE entry is
+// a perfectly valid state whose HardwareAddr can still be a non-Ethernet or
+// truncated address on a non-Ethernet link, and the dataplane copies exactly
+// six bytes into the redirect header.
+func FabricNeighUsable(n netlink.Neigh) bool {
+	return len(n.HardwareAddr) == 6 && n.State&FabricNeighValidStates != 0
+}
+
+// selectFabricPeerMAC returns the link-layer address of the first entry in
+// neighs that both answers for ip and is usable for forwarding, or nil.
+//
+// Split out from buildFabricPeerMAC so the selection can be tested without a
+// netlink socket or root: the defect this guards is entirely in which entries
+// are ACCEPTED, and that decision should not require the kernel to reproduce.
+func selectFabricPeerMAC(neighs []netlink.Neigh, ip net.IP) net.HardwareAddr {
+	for _, neigh := range neighs {
+		if neigh.IP == nil || !neigh.IP.Equal(ip) {
+			continue
+		}
+		if !FabricNeighUsable(neigh) {
+			continue
+		}
+		return neigh.HardwareAddr
+	}
+	return nil
+}
+
+// buildFabricPeerMAC resolves the MAC that currently answers for the fabric
+// peer address, or "" if none does.
+//
+// This is the LIVE resolver: its result becomes FabricSnapshot.PeerMAC and
+// reaches the dataplane as the cross-chassis redirect destination.
+//
+// It used to accept the first address-matched entry with any non-nil
+// HardwareAddr, checking neither the NUD state nor the address length, which
+// made it laxer than refreshFabricFwd -- the path whose result is NOT consulted
+// (#6598). An entry that has gone NUD_FAILED while retaining the peer's old
+// lladdr is exactly what the RETH virtual-MAC reprogramming sequence produces
+// (programRethMAC does link DOWN -> set MAC -> link UP), so the stale entry it
+// would accept is the realistic case, not the exotic one.
+//
+// Returning "" is a deliberate degrade, not a gap. The dataplane treats an
+// empty peer_mac as UNRESOLVED and falls back to its own neighbour table, which
+// is NUD-allowlisted at insert (#3771 M12) -- so the fallback is STRICTER than
+// the stale entry removed here, not laxer. If that table cannot answer either,
+// the link is skipped as FabricSkipReason::UnresolvedPeerMac, which is counted
+// and recorded by name. Both outcomes beat forwarding to a MAC the peer no
+// longer owns, which is silent and looks like a working fabric.
 func buildFabricPeerMAC(overlayIfindex, parentIfindex int, peer string) string {
 	ip := net.ParseIP(peer)
 	if ip == nil {
@@ -293,15 +394,12 @@ func buildFabricPeerMAC(overlayIfindex, parentIfindex int, peer string) string {
 		if ifindex <= 0 {
 			continue
 		}
-		neighs, err := netlink.NeighList(ifindex, family)
+		neighs, err := fabricNeighListFn(ifindex, family)
 		if err != nil {
 			continue
 		}
-		for _, neigh := range neighs {
-			if neigh.IP == nil || !neigh.IP.Equal(ip) || neigh.HardwareAddr == nil {
-				continue
-			}
-			return neigh.HardwareAddr.String()
+		if mac := selectFabricPeerMAC(neighs, ip); mac != nil {
+			return mac.String()
 		}
 	}
 	return ""

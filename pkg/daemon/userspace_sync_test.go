@@ -769,12 +769,24 @@ func TestShouldSyncUserspaceDeltaSkipsMissingNeighborSeed(t *testing.T) {
 	}
 }
 
+// The property this pins is that the OWNER-RG gate must not block a
+// fabric-redirect handoff: a fabric redirect exists precisely because the peer
+// owns the flow's egress RG, so delta.OwnerRGID always names an RG this node is
+// not primary for.
+//
+// #6599 retargeted the fixture. It used to make the node primary for NOTHING —
+// which also made it not primary for the RG owning the flow's INGRESS zone, so
+// the test asserted that a node owning neither side of the flow may still push
+// an Open to the peer. That is the identity-less-Open emission channel, not the
+// handoff property. The node is now primary for RG 2 and the flow ingresses on
+// a zone that lives on RG 2, so it legitimately owns the traffic it hands off
+// while its owner RG (1) is still the peer's.
 func TestShouldSyncUserspaceDeltaAllowsStaleOwnerFabricRedirect(t *testing.T) {
 	ss := &cluster.SessionSync{
 		IsPrimaryFn:      func() bool { return false },
-		IsPrimaryForRGFn: func(rgID int) bool { return false },
+		IsPrimaryForRGFn: func(rgID int) bool { return rgID == 2 },
 	}
-	ss.SetZoneRGMap(map[uint16]int{1: 1})
+	ss.SetZoneRGMap(map[uint16]int{1: 2})
 	d := &Daemon{sessionSync: ss}
 	delta := dpuserspace.SessionDeltaInfo{
 		OwnerRGID:      1,
@@ -1137,5 +1149,121 @@ func TestBulkSyncFallbackWhenDPIsNil(t *testing.T) {
 	err := d.bulkSyncViaEventStreamOrFallback(nil)
 	if err == nil {
 		t.Fatal("expected error from nil session sync fallback")
+	}
+}
+
+// captureDeltaSink records every session the delta walk admits, so a test can
+// assert on BOTH the canonical open and the forward-wire alias the
+// fabric-redirect branch emits alongside it.
+type captureDeltaSink struct {
+	opensV4   []dataplane.SessionKey
+	opensV6   []dataplane.SessionKeyV6
+	deletesV4 []dataplane.SessionKey
+	deletesV6 []dataplane.SessionKeyV6
+}
+
+func (c *captureDeltaSink) openV4(key dataplane.SessionKey, _ dataplane.SessionValue) {
+	c.opensV4 = append(c.opensV4, key)
+}
+
+func (c *captureDeltaSink) openV6(key dataplane.SessionKeyV6, _ dataplane.SessionValueV6) {
+	c.opensV6 = append(c.opensV6, key)
+}
+
+func (c *captureDeltaSink) deleteV4(key dataplane.SessionKey) {
+	c.deletesV4 = append(c.deletesV4, key)
+}
+
+func (c *captureDeltaSink) deleteV6(key dataplane.SessionKeyV6) {
+	c.deletesV6 = append(c.deletesV6, key)
+}
+
+// #6599: the fabric-redirect carve-out must still require that THIS node owns
+// the RG the flow's INGRESS zone belongs to.
+//
+// A fabric redirect means "the peer owns the EGRESS side", so judging the delta
+// by delta.OwnerRGID would refuse every legitimate split-RG handoff — that is
+// what the carve-out exists for. But bypassing ownership ENTIRELY lets a node
+// that owns neither side emit an Open for a session it fabricated on a
+// peer-owned tuple: the transient-purge re-entry class. The ingress-zone RG is
+// the predicate that keeps the handoff and drops the fabrication.
+func TestShouldSyncUserspaceDeltaFabricRedirectRequiresIngressOwnership6599(t *testing.T) {
+	ss := &cluster.SessionSync{
+		IsPrimaryFn: func() bool { return false },
+		// Split-RG: this node is primary for RG 2 only. RG 1 is the peer's.
+		IsPrimaryForRGFn: func(rgID int) bool { return rgID == 2 },
+	}
+	// Zone 1 lives on RG 1 (peer-owned); zone 5 lives on RG 2 (locally owned).
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 5: 2})
+	d := &Daemon{sessionSync: ss}
+
+	peerIngress := dpuserspace.SessionDeltaInfo{
+		OwnerRGID:      1,
+		FabricRedirect: true,
+		FabricIngress:  false,
+		IngressZone:    "wan",
+		EgressZone:     "lan",
+	}
+	if d.shouldSyncUserspaceDelta(d.sessionSync, peerIngress, 1) {
+		t.Fatal("expected a fabric-redirect delta whose INGRESS RG is peer-owned to be refused (#6599)")
+	}
+
+	// Positive control: the legitimate split-RG handoff. The session's owner RG
+	// is the peer's (that is why it is a fabric redirect at all), but the flow
+	// ingressed on an RG this node owns, so the handoff must still sync.
+	localIngress := peerIngress
+	if !d.shouldSyncUserspaceDelta(d.sessionSync, localIngress, 5) {
+		t.Fatal("expected a fabric-redirect handoff from a locally-owned ingress RG to sync")
+	}
+}
+
+// #6599: the gate is what the WALK consults, and the fabric-redirect branch
+// emits TWO sessions per admitted delta (the canonical key and the forward-wire
+// alias). Bind the walk, not just the predicate: an unowned-ingress delta must
+// contribute ZERO sessions, alias included.
+func TestWalkUserspaceSessionDeltasDropsUnownedFabricRedirect6599(t *testing.T) {
+	zoneIDs := map[string]uint16{"wan": 1, "lan": 5}
+	ss := &cluster.SessionSync{
+		IsPrimaryFn:      func() bool { return false },
+		IsPrimaryForRGFn: func(rgID int) bool { return rgID == 2 },
+	}
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 5: 2})
+	d := &Daemon{sessionSync: ss}
+
+	// The spoofed re-entry: a session the standby fabricated on the peer-owned
+	// flow's translated tuple. It ingressed on the WAN zone, whose RG the peer
+	// owns, and its resolution is a fabric redirect because this node is not
+	// the RG owner — exactly the condition that fired the transient purge.
+	spoofed := dpuserspace.SessionDeltaInfo{
+		Event:          "open",
+		AddrFamily:     dataplane.AFInet,
+		Protocol:       6,
+		SrcIP:          "172.16.80.8",
+		DstIP:          "172.16.80.200",
+		SrcPort:        39906,
+		DstPort:        5201,
+		IngressZone:    "wan",
+		EgressZone:     "lan",
+		OwnerRGID:      1,
+		NATSrcIP:       "172.16.80.9",
+		NATSrcPort:     39906,
+		FabricRedirect: true,
+		FabricIngress:  false,
+	}
+	var sink captureDeltaSink
+	n := d.walkUserspaceSessionDeltas(ss, zoneIDs, []dpuserspace.SessionDeltaInfo{spoofed}, &sink)
+	if n != 0 || len(sink.opensV4) != 0 {
+		t.Fatalf("expected the unowned-ingress fabric-redirect open AND its forward-wire alias to be dropped (#6599); got n=%d opens=%v", n, sink.opensV4)
+	}
+
+	// Positive control: the same delta ingressing on a locally-owned RG still
+	// emits BOTH the canonical session and its forward-wire alias.
+	handoff := spoofed
+	handoff.IngressZone = "lan"
+	handoff.EgressZone = "wan"
+	var okSink captureDeltaSink
+	n = d.walkUserspaceSessionDeltas(ss, zoneIDs, []dpuserspace.SessionDeltaInfo{handoff}, &okSink)
+	if n != 2 || len(okSink.opensV4) != 2 {
+		t.Fatalf("expected the owned-ingress handoff to emit the session and its alias; got n=%d opens=%v", n, okSink.opensV4)
 	}
 }

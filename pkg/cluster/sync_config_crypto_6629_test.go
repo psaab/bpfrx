@@ -412,7 +412,7 @@ func TestConfigCryptoMessageTypesAreUnique6629(t *testing.T) {
 		{syncMsgConfigEncrypted, "syncMsgConfigEncrypted"},
 	} {
 		live := liveSyncMessageTypesExcept(under.v)
-		if len(live) < 31 {
+		if len(live) < 34 {
 			t.Fatalf("the live-type census holds only %d entries — it has fallen behind "+
 				"sync.go and can no longer certify uniqueness", len(live))
 		}

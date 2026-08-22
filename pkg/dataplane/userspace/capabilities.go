@@ -110,6 +110,35 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	// sampling, full-L2 clone delivery, lossy pressure handling, and status
 	// counters are all owned by userspace-dp.
 	// Flow export (NetFlow v9) is now supported in the userspace dataplane.
+	//
+	// #7409 — DELIBERATELY NOT A REASON: "a dynamic routing protocol is
+	// configured". #7409's acceptance criterion offered a choice between
+	// importing kernel-learned routes into the helper FIB and refusing to arm
+	// when a routing protocol is configured. The import shipped; the arm-gate
+	// was rejected, and the reasoning is recorded here because the gate reads
+	// like the conservative option and will otherwise be re-proposed.
+	//
+	//  1. Keyed on protocols it closes NOTHING. The exposure is a learned
+	//     route in a reinject-reachable kernel table, and a DHCP lease on a
+	//     non-management interface produces exactly that with no protocol
+	//     stanza at all (pkg/frr renders the AD-200 default and its RFC 3442
+	//     classless routes through staticd). Measured across every config
+	//     checked into this repo: ZERO configure BGP/OSPF/IS-IS/RIP, while
+	//     examples/deploy/standalone.conf and test/incus/xpf-internet-test.conf
+	//     hit the DHCP vector today.
+	//  2. Extended to DHCP to make it sound, it BRICKS the fleet. 20 of 23
+	//     shipped configs carry `family inet { dhcp; }`, including all three
+	//     docs/ha-cluster*.conf — the smoke and failover substrate — plus both
+	//     customer examples and the day-0 image fixture. And a refused arm is
+	//     not graceful degradation to kernel forwarding: the #5275 transit gate
+	//     drives ip_forward to 0 on every path landing in setDataplane(nil), so
+	//     such a box forwards NOTHING. That trades a policy bypass for a
+	//     guaranteed total outage.
+	//  3. It is unsound in PRINCIPLE. pkg/frr writeManagedSection preserves
+	//     operator content outside the managed markers verbatim, and nothing in
+	//     this repo controls /etc/frr/daemons, so a hand-written `router bgp`
+	//     installs main-table routes that cfg.Protocols cannot see. A
+	//     config-keyed gate can never be sound about what FRR actually runs.
 	return caps
 }
 

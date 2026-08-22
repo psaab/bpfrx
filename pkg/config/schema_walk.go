@@ -81,6 +81,19 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	// no-op (no clone) when nothing is deactivated.
 	tree = tree.WithoutInactive()
 	defsSource = defsSource.WithoutInactive()
+	// #6672: expand a PACKED `chassis cluster` body into children before the
+	// walk. The walker descends `.Children`, so a statement packed onto the
+	// cluster (or chassis) line sits below every modeled depth and no typed-leaf
+	// validator fires on it. That was harmless while the packed spelling also
+	// compiled to nothing; now that it compiles, the same normalization must
+	// happen HERE or the packed spelling would reach the runtime with an ungated
+	// `cluster-id` (one byte of the RETH virtual MAC) and an ungated
+	// `reth-advertise-interval` (a 12-bit VRRP wire field) while the container
+	// spelling stays gated. One splitter, both consumers — the alternative is a
+	// second hand-written bounds table that drifts from the schema.
+	//
+	// No-op (no clone) when nothing is packed, like WithoutInactive above.
+	tree = normalizePackedChassisCluster(tree)
 	// #4060: reject the raw-AST redaction placeholder ("##SECRET-DATA##") on
 	// commit-ingest. This is the symmetric guard for the #4051 display
 	// redaction — re-applying a secret-redacted REST export must not silently

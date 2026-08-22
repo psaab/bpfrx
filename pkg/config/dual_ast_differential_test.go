@@ -896,6 +896,57 @@ services {
 	},
 }
 
+// #6668 fixture class: a bracket list authored at a CONTAINER position — the
+// one shape the FormatSet-text sanity gate in step 4 cannot see, because
+// re-rendering the damaged tree reproduces the SAME line (a fixed point). All
+// 29 pre-existing bracket fixtures in this file are value LEAVES, which
+// round-trip clean by construction; none of them exercises this.
+var dualASTBracketedContainerCases = []dualASTCase{
+	{
+		name: "bracketed-container-zone-interfaces",
+		hier: `interfaces {
+    ge-0/0/0 { unit 0 { family inet { address 10.0.1.1/24; } } }
+    ge-0/0/1 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces {
+                [ ge-0/0/0 ge-0/0/1 ] {
+                    host-inbound-traffic {
+                        system-services ssh;
+                    }
+                }
+            }
+        }
+    }
+}`,
+	},
+	{
+		name: "bracketed-container-security-zone-list",
+		hier: `security {
+    zones {
+        security-zone [ trust dmz ] {
+            host-inbound-traffic {
+                system-services ssh;
+            }
+        }
+    }
+}`,
+	},
+	{
+		name: "bracketed-container-applications",
+		hier: `applications {
+    application [ a1 a2 ] {
+        protocol tcp;
+        destination-port 443;
+    }
+}`,
+	},
+}
+
+func init() { dualASTCases = append(dualASTCases, dualASTBracketedContainerCases...) }
+
 // TestDualASTDifferential is the harness entry point. See the file
 // header comment for the mechanism.
 func TestDualASTDifferential(t *testing.T) {
@@ -961,11 +1012,17 @@ func runDualASTCase(t *testing.T, tc dualASTCase) string {
 		if line == "" {
 			continue
 		}
-		path, err := ParseSetCommand(line)
+		// #6668: replay through the GROUPED entry, which is what the service
+		// load paths use (configstore applyEditLine). The ungrouped one
+		// discards the authored bracket, so a fixture carrying a bracketed
+		// CONTAINER key group would be measured against a replay no production
+		// path performs — the harness would report a defect the daemon does not
+		// have, or miss one it does.
+		path, quoted, grouped, err := ParseSetCommandGrouped(line)
 		if err != nil {
 			return fmt.Sprintf("set-replay failure class: ParseSetCommand(%q): %v", line, err)
 		}
-		if err := flatTree.SetPath(path); err != nil {
+		if err := flatTree.SetPathQuotedGrouped(path, quoted, grouped); err != nil {
 			return fmt.Sprintf("set-replay failure class: SetPath(%q): %v", line, err)
 		}
 	}
@@ -990,6 +1047,26 @@ func runDualASTCase(t *testing.T, tc dualASTCase) string {
 				"--- hierarchical FormatSet ---\n%s"+
 				"--- flat-replay FormatSet ---\n%s", hierSet, flatSet)
 		}
+	}
+
+	// Step 4b: STRUCTURAL gate for authored bracket groups (#6668).
+	//
+	// Step 4 compares FormatSet TEXT, and that comparison is blind to the one
+	// corruption class this file was least equipped to see: re-rendering a tree
+	// whose container key group was re-split produces the SAME flat line, so
+	// the damage is a FIXED POINT of FormatSet. Both sides render identically
+	// while denoting different configs. Compare the node STRUCTURE for the
+	// groups the operator actually bracketed instead — that is decidable, and
+	// it is exactly where the text oracle cannot help.
+	//
+	// Scoped to bracketed containers on purpose. A blanket structural equality
+	// would also fail the PACKED-statement family (`unit 0 shaping-rate 10g {
+	// ... }`), whose flat replay legitimately re-nests into a different but
+	// equivalent shape — a different defect class (#6588/#6665/#6672) that this
+	// gate must not silently absorb.
+	if diff := bracketedContainerStructureDiff(hierTree.Children, flatTree.Children, nil); diff != "" {
+		return fmt.Sprintf("bracketed-container structure failure class: "+
+			"a bracketed CONTAINER key group did not survive the flat round trip\n%s", diff)
 	}
 
 	// Step 5: compile both shapes with the same entry the existing

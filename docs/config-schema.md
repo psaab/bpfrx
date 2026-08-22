@@ -2428,16 +2428,48 @@ Scope rules that follow:
   Without that, a later single-scoped override merged into one member would
   mutate the value its bracket siblings point at.
 
-**Round-trip limitation (#6668, pre-existing, NOT introduced by #6391).** The
-multi-key shape survives `Format()` → `NewParser` (local persistence) and HA
-config sync byte-for-byte, but it does NOT survive `show | display set`:
-`FormatSet()` emits
+**Round-trip: fixed in #6668.** The multi-key shape survives `Format()` →
+`NewParser` (local persistence) and HA config sync byte-for-byte, and it now
+survives `show | display set` as well.
+
+It did not before. `FormatSet()` emitted
 `set ... interfaces ge-0/0/0 ge-0/0/1 host-inbound-traffic system-services ssh`,
-which replays into a single garbage leaf
-`Keys=["ge-0/0/1","host-inbound-traffic","system-services","ssh"]` and then fails
-to compile (`zone "trust" references interface "host-inbound-traffic"`). It fails
-CLOSED, but it means the multi-member fan is not durable through a display-set
-round-trip. Tracked separately as #6668.
+and the flat replay re-split that run at the schema arity — `nodeKeyCount =
+1 + args` is 1 at the zone-`interfaces` wildcard — so `ge-0/0/0` became the
+container and `ge-0/0/1` was demoted to the first key of a LEAF
+(`Keys=["ge-0/0/1","host-inbound-traffic","system-services","ssh"]`) with the
+whole body re-parented under it.
+
+Three things about that are worth keeping, because they generalize to any
+bracket authored at a CONTAINER position — the trigger is a non-leaf node with
+`len(Keys) > 1 + schema.args`, not `multi: true` (every bracketed VALUE leaf
+round-tripped clean all along, because SetPath's trailing-value absorber
+re-collapses a leaf's tail — the #2419 contract):
+
+- It was **not display-only.** `Store.LoadMergeAs`'s hierarchical branch renders
+  the parsed file with `FormatSet` and replays it through `applyEditLine`, so
+  `load merge <file>` rewrote the operator's config inside the daemon and
+  reported success. `load override` was unaffected (it installs the parse tree
+  directly) and so was HA config sync (it ships `Format()`, whose `{` terminates
+  the key list).
+- It was **not uniformly fail-closed.** The zone-`interfaces` case was rejected
+  on reload, but `system login user [ alice bob ] { class super-user; }` and
+  `class-of-service scheduler-maps [ m1 m2 ] { ... }` were REJECTED as authored
+  and COMMITTED CLEAN after the round trip, with the second member's body gone —
+  a round trip that launders a config past a commit gate.
+- It was **invisible to an idempotency check.** Re-rendering the damaged tree
+  produced the same flat line: the corruption is a fixed point of `FormatSet`.
+
+The fix records, per key, whether the operator authored it inside `[ ... ]`
+(`Node.KeysBracketed`, the bracket sibling of the #6673 `KeysQuoted`
+provenance), re-emits the delimiter for a bracketed CONTAINER group, and honours
+it on replay (`ParseSetVerbGrouped` → `SetPathQuotedGrouped` /
+`DeletePathGrouped` / `DeactivatePathGrouped`). A group only ever WIDENS a node's
+key slice, never narrows it. Rendering keys off the authored provenance rather
+than off "wider than the arity" deliberately: the arity rule would also bracket
+the PACKED-statement family (`unit 0 shaping-rate 10g { ... }`), whose flat
+replay already reconstructs an equivalent config and which is tracked separately
+(#6588 / #6665 / #6672).
 
 All of the above is pinned by
 `pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go`, which asserts
@@ -2621,12 +2653,26 @@ is what Junos renders (one statement per line).
 
 Consequences worth knowing when adding a reader:
 
-- **The schema walker does not see this shape at all.** `SchemaValidate` walks
-  the AST from `setSchema`, and a packed tail sits below the depth it reaches,
-  so a typed leaf's `validator` never fires on it. A range/arity gate that must
-  cover the packed spelling has to run on the COMPILED struct
-  (`validateChassisClusterStrict`), not on the schema — which is only true once
-  the packed shape actually compiles.
+- **The schema walker does not see this shape** — unless the subtree is
+  NORMALIZED before the walk. `SchemaValidate` walks the AST from `setSchema`,
+  and a packed tail sits below the depth it reaches, so a typed leaf's
+  `validator` never fires on it. Two answers exist, and which one is available
+  depends on whether the packed body can be split back into statements:
+  - Where it can, split it **before both consumers**. `chassis cluster`
+    (#6672, below) expands its packed body into children at the top of
+    `SchemaValidateWithDefinitions` and inside `compileChassis`, so the
+    EXISTING typed-leaf validators fire on the packed spelling unchanged. That
+    is strictly better than a parallel gate: there is one bounds table, and it
+    is the one the container spelling already uses.
+  - Where it cannot, the gate has to run on the COMPILED struct
+    (`validateChassisClusterStrict`), not on the schema — which is only true
+    once the packed shape actually compiles.
+
+  Either way, **making a packed spelling compile without also making it
+  validate opens a range-gate escape that did not exist before**: while the
+  packed form compiled to nothing, the missing walker coverage was inert. This
+  is not hypothetical — `cluster-id` is one byte of the RETH virtual MAC and
+  `reth-advertise-interval` is a 12-bit VRRP wire field.
 - **Silently compiling to nothing is the worst of the three options.** A
   statement whose packed spelling is genuinely unsupported must be REJECTED at
   commit with an actionable error. `services ip-monitoring` (a different
@@ -2635,6 +2681,55 @@ Consequences worth knowing when adding a reader:
   compiled routes is a hard commit error ("at least one then preferred-route
   route is required"), so the operator is told rather than left with a silent
   no-op.
+- **`chassis cluster` is the whole-stanza case (#6672).** The same shape one
+  level ABOVE the redundancy group dropped the ENTIRE cluster configuration.
+  Four spellings exist and three were silently empty:
+
+  ```
+  chassis { cluster { cluster-id 1; node 0; } }   # container  -> compiles
+  chassis { cluster cluster-id 1 node 0; }        # packed body -> ClusterConfig, every field zero
+  chassis cluster { cluster-id 1; node 0; }       # keyword packed onto the chassis line -> Cluster == nil
+  chassis cluster cluster-id 1 node 0;            # fully packed -> Cluster == nil
+  ```
+
+  A fifth arrives from the child side — `cluster { node 1 reth-count 2; }`, one
+  child carrying two statements — and is split the same way. `compileChassis`
+  reads the body with `FindChild`, i.e. off `.Children`, so a packed body was an
+  empty stanza: no cluster-id, no node identity, no control PSK, no fabric
+  addresses, no redundancy groups, and a clean `commit` with
+  `show configuration` echoing what the operator wrote.
+
+  `clusterStatements` (`compiler_chassis_cluster_packed.go`) is the SSOT for the
+  statement set and each statement's value arity, and `clusterBodyStatements` is
+  the splitter. Two properties are specific to this level and worth carrying:
+
+  - **It nests, so `packedStatementPropsArity` (#6665) is not enough.** That
+    helper is flat: any registered keyword re-arms it. The cluster and
+    redundancy-group tables OVERLAP on exactly one token, `node` — the cluster's
+    own identity and a group's per-node priority — so under the flat rule
+    `redundancy-group 1 node 0 priority 200` re-arms at `node`, setting the
+    CLUSTER's node identity and dropping the group's election priority. That is
+    the #6588 failure reintroduced one level up. The rule is: once
+    `redundancy-group` opens, a token re-arms only if it is `redundancy-group`
+    itself or a cluster statement that is NOT also a redundancy-group statement.
+    Overlap resolves to the INNER scope; cluster-only statements written after a
+    packed group (`... redundancy-group 1 preempt reth-count 2`) still compile.
+  - **The #6665 value-slot reservation crosses the boundary.** While a
+    redundancy-group tail is open the splitter honours
+    `redundancyGroupStatementArity`, so `interface-monitor reth-count weight 255`
+    keeps a monitored interface literally named after a CLUSTER keyword instead
+    of re-arming the outer splitter. `ValidateDeviceMapLogicalName` admits
+    keyword-shaped names, so that is a name an operator can configure.
+
+  Two divergences the work surfaced, both tracked separately rather than folded
+  in: `fabric1-interface` and `fabric1-peer-address` are compiled by
+  `compileChassis` but absent from `schemaChassis` (no completion, no
+  validator), and `additional-authentication-key` / `control-ports` /
+  `private-rg-election` sit on the other side of that line for stated reasons.
+  `TestClusterSplitterAndSchemaAgree_6672` binds the set in both directions with
+  the exception list as an EQUALITY, so the exception cannot outlive the
+  divergence it documents.
+
 - **`system login` is the fail-closed example with a dedicated gate (#6662).**
   Where `ip-monitoring` gets its rejection for free (an empty policy is
   independently invalid), an empty login class is *structurally* fine, so the

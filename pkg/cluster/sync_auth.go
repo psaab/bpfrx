@@ -76,7 +76,13 @@ const (
 const (
 	syncAuthVersion   = 1
 	syncAuthNonceSize = 32
-	syncAuthMACSize   = sha256.Size // 32
+
+	// syncAuthProofLen is the challenge-response proof length (HMAC-SHA256).
+	// Named for the #6628 in-place upgrade, whose payload is length-gated on
+	// it; the connect-time handshake compares with hmac.Equal and never needed
+	// the constant.
+	syncAuthProofLen = 32
+	syncAuthMACSize  = sha256.Size // 32
 	// syncAuthFrameTrailerSize is appended to each frame on an authenticated
 	// connection: seq(8) + HMAC-SHA256(32).
 	syncAuthFrameTrailerSize = 8 + syncAuthMACSize
@@ -169,7 +175,54 @@ func (s *SessionSync) authKey() []byte {
 // path — so the same wrapper type covers both negotiated postures.
 type authConn struct {
 	net.Conn
-	key     []byte        // per-connection frame-MAC key (nil ⇒ pass-through)
+	// readKey and writeKey are the per-connection frame-MAC key, held
+	// SEPARATELY per direction (#6628). Nil ⇒ pass-through in that direction.
+	//
+	// One field for both directions was correct while authentication could
+	// only be decided at connection setup: the handshake set it before any
+	// frame flowed, so read and write were always in the same state. The
+	// in-place upgrade switches a LIVE stream, and a single field flips both
+	// directions at the same instant on ONE end — the moment X starts
+	// requiring a trailer, Y is still sending unsealed frames, so X consumes
+	// syncAuthFrameTrailerSize bytes of the NEXT frame as a "trailer", fails
+	// the MAC, and drops the connection. Splitting them lets each direction
+	// switch at the frame boundary the peer actually switched at, which TCP's
+	// per-direction ordering makes unambiguous. See upgradeAuthInPlace.
+	//
+	// writeKey is published under SessionSync.writeMu — already the invariant
+	// that serialises every write to a connection — so the receive-loop
+	// goroutine that installs it cannot race a concurrent seal. readKey is
+	// touched only by the single receiveLoop goroutine that owns this
+	// connection, like recvSeq/recvSeen below.
+	readKey  []byte
+	writeKey []byte
+
+	// authPSK is the control-link PSK this connection's authentication was
+	// established under — the staleness test the #6628 reconciler uses. Nil on
+	// an unauthenticated connection. It is what lets ReconcileConnectionAuth
+	// be called on EVERY commit and cost nothing: an unrelated config change
+	// finds authPSK equal to the live key and does nothing.
+	authPSK []byte
+
+	// The #6628 in-place upgrade exchange state. All of it is read and written
+	// under SessionSync.writeMu, which the exchange already holds to keep each
+	// key install inside the same critical section as the frame that is the
+	// peer's read boundary.
+	upgradeNonce        []byte // our challenge, once we have emitted a Hello or Proof
+	upgradePeerNonce    []byte // the peer's challenge
+	upgradeProofSent    bool
+	upgradePeerVerified bool // the peer proved key equality over OUR nonce
+	upgradeWriteDone    bool // this exchange installed writeKey
+	upgradeReadDone     bool // this exchange installed readKey
+	// upgradeForPSK is the key the IN-FLIGHT exchange belongs to. A rotation
+	// over an already-authenticated connection must be able to start a fresh
+	// exchange, and the in-flight state of the PREVIOUS one would otherwise
+	// refuse it forever (its nonce is set, its proof is sent). Comparing this
+	// to the live key is what distinguishes "an exchange is already running
+	// for this key" from "the state belongs to a key we have since rotated
+	// away from".
+	upgradeForPSK []byte
+
 	sendSeq atomic.Uint64 // monotonic per-connection send counter
 	// recvSeq/recvSeen are the replay watermark, touched only by the single
 	// receiveLoop goroutine that owns this connection — no lock needed.
@@ -177,8 +230,39 @@ type authConn struct {
 	recvSeen bool
 }
 
-// authed reports whether this connection seals/verifies frames.
-func (a *authConn) authed() bool { return a != nil && len(a.key) > 0 }
+// beginUpgradeExchangeLocked prepares this connection for an upgrade exchange
+// under key, clearing any state left by an exchange for a DIFFERENT key.
+// Returns false when an exchange for this same key is already in flight, which
+// is what makes the level-triggered reconciler idempotent.
+//
+// Caller holds SessionSync.writeMu.
+func (a *authConn) beginUpgradeExchangeLocked(key []byte) bool {
+	if bytes.Equal(a.upgradeForPSK, key) {
+		return a.upgradeNonce == nil
+	}
+	a.upgradeNonce = nil
+	a.upgradePeerNonce = nil
+	a.upgradeProofSent = false
+	a.upgradePeerVerified = false
+	a.upgradeWriteDone = false
+	a.upgradeReadDone = false
+	a.upgradeForPSK = append([]byte(nil), key...)
+	return true
+}
+
+// readAuthed reports whether inbound frames on this connection carry a trailer
+// that must be verified.
+func (a *authConn) readAuthed() bool { return a != nil && len(a.readKey) > 0 }
+
+// writeAuthed reports whether outbound frames on this connection must be
+// sealed.
+func (a *authConn) writeAuthed() bool { return a != nil && len(a.writeKey) > 0 }
+
+// authed reports whether this connection is authenticated in BOTH directions.
+// It is the operator-facing / status sense of the word; the two directional
+// predicates above are what the frame paths gate on, because during an
+// in-place upgrade (#6628) the two are briefly, legitimately, different.
+func (a *authConn) authed() bool { return a.readAuthed() && a.writeAuthed() }
 
 // sealFrame appends the per-connection auth trailer to a fully-encoded frame
 // (header||payload). Callers hold s.writeMu — the invariant that serializes
@@ -189,7 +273,7 @@ func (a *authConn) sealFrame(frame []byte) []byte {
 	out := make([]byte, len(frame)+syncAuthFrameTrailerSize)
 	n := copy(out, frame)
 	binary.LittleEndian.PutUint64(out[n:n+8], seq)
-	mac := hmac.New(sha256.New, a.key)
+	mac := hmac.New(sha256.New, a.writeKey)
 	mac.Write(syncAuthFrameMACTag)
 	mac.Write(out[:n+8]) // frame || seq
 	copy(out[n+8:], mac.Sum(nil))
@@ -207,7 +291,7 @@ func (a *authConn) verifyFrame(header, payload, trailer []byte) error {
 		return errSyncFrameAuth
 	}
 	seq := binary.LittleEndian.Uint64(trailer[:8])
-	mac := hmac.New(sha256.New, a.key)
+	mac := hmac.New(sha256.New, a.readKey)
 	mac.Write(syncAuthFrameMACTag)
 	mac.Write(header)
 	mac.Write(payload)
@@ -349,17 +433,26 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // bootstrap that gives it its node-id.
 //
 // That qualifier is load-bearing, and it is exactly what makes the live-keying
-// procedure above work. Verification is gated PER CONNECTION on ac.authed(),
-// which is fixed at handshake time, so a connection established BEFORE the key
-// was committed stays unauthenticated for its whole lifetime and keeps having
-// its frames accepted with no HMAC — the key never applies retroactively to an
-// established stream. That residual is PRE-EXISTING (master behaves
-// identically) and is tracked by #6628 — the broader "never re-handshakes on
-// an auth-key CHANGE", which also covers a key ROTATION and subsumes the
-// narrower unkeyed→keyed case. It is OPEN. Do not read the sentence above as
-// claiming it is closed. pkg/cluster/README.md, "Rolling it onto
-// a live unkeyed cluster", spells out the operator consequence: the restart in
-// step 3 is not optional.
+// procedure above work. Verification is gated PER CONNECTION and was fixed at
+// handshake time, so a connection established BEFORE the key was committed
+// used to stay unauthenticated for its whole lifetime and keep having its
+// frames accepted with no HMAC.
+//
+// #6628 closed the part of that about the LEGITIMATE peer: a commit now
+// triggers an IN-PLACE upgrade over the established connection
+// (sync_auth_upgrade.go), which promotes it to authenticated — and re-derives
+// its frame key on a rotation — without a reconnect and without ever dropping
+// it. So "the key never applies retroactively to an established stream" is no
+// longer true for a peer that answers.
+//
+// It is still true for a peer that does NOT answer, and that residual is
+// OPEN. A hostile stream admitted before the commit declines the upgrade by
+// staying silent, and a decliner is indistinguishable from a legitimate peer
+// that is not keyed yet — which is the rolling-upgrade case none of this may
+// break. Closing it needs a bounded window after which an un-upgraded
+// connection is dropped, i.e. the mechanism this file records as shipped and
+// then REMOVED, with the three constraints any replacement must answer. Do not
+// read the upgrade as closing it.
 func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK bool) (mode syncAuthMode, accept bool, reason string) {
 	if !keyConfigured {
 		return syncAuthUnauthenticated, true, ""
@@ -531,7 +624,18 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 func (s *SessionSync) wrapSyncConn(fabricIdx int, conn net.Conn, mode syncAuthMode, frameKey []byte) *authConn {
 	ac := &authConn{Conn: conn}
 	if mode == syncAuthAuthenticated {
-		ac.key = frameKey
+		// Both directions at once: the handshake completed before any frame
+		// flowed, so there is no live stream to switch and no ordering to
+		// respect. Only the #6628 in-place upgrade sets them separately.
+		ac.readKey = frameKey
+		ac.writeKey = frameKey
+		// #6628: record the PSK this connection authenticated under, so the
+		// in-place-upgrade reconciler leaves it alone. Without this a
+		// connect-authenticated connection looks stale to the reconciler
+		// (authPSK nil) and every commit starts a pointless upgrade exchange
+		// on a perfectly healthy stream — needless traffic, and a mid-stream
+		// key switch exercised for no reason.
+		ac.authPSK = append([]byte(nil), s.authKey()...)
 		slog.Info("cluster sync: connection authenticated with control-link PSK",
 			"fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 	}
