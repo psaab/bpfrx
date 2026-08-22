@@ -207,6 +207,44 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
       and the same `Unavailable` idiom as per-interface counters (#3464). An
       absent chain (no host-inbound stanza enforced) reads as a clean 0 with
       no marker.
+    - **#5719 (the counter-LESS table is unavailable too):** the same marker
+      now covers a third kernel state the read previously could not see. The
+      #5644 M37 cold-boot fail-closed FENCE installs `inet xpf_hostinbound`
+      with catch-all DROPs and, by design
+      (`buildHostInboundFencePayload`/`buildHostInboundFenceNetlink`: "NO
+      per-service accepts, NO named counters"), NO counter objects — so the
+      object walk returned an empty set from a table that is ACTIVELY
+      DROPPING host-bound traffic, indistinguishable from a torn-down table.
+      REST published `host_inbound_kernel_denies: 0` with the marker absent,
+      certifying "no denies" during exactly the degraded window that most
+      needs the signal. `pkg/nftables.ReadHostInboundDenyCounters` now
+      returns a `HostInboundTableState` alongside the rows, and a
+      `HostInboundTableCounterless` read sets
+      `host_inbound_kernel_denies_unavailable: true`. Three states, three
+      answers:
+      | kernel state | `xpf_hostinbound` | named counters | REST |
+      |---|---|---|---|
+      | real policy loaded | present | >=1 | authoritative counts |
+      | cold-boot fence (#5644 M37) | present, DROPping | none | `unavailable: true` |
+      | table absent | absent | — | authoritative `0` |
+      Two things this deliberately does NOT do. It does not make every zero
+      unavailable: a table whose real deny counters merely READ zero still
+      HAS those counter objects, so the read is `Counted` and its `0` stays
+      authoritative (pinned by the `real counters reading zero stay
+      AUTHORITATIVE` case in `stats_global_host_inbound_fence_5719_test.go`).
+      And it does not false-alarm on a legitimate generation with no
+      per-zone catch-all DROP (a junos-host program-only ruleset): a real
+      table always declares the three #4759 ICMP/ND ACCEPT counters, so the
+      discriminator is "the table carries NO named counter OBJECT", not "no
+      DENY counters". The Prometheus analogue bumps
+      `xpf_counter_read_errors_total` for the counterless state (there is no
+      series to omit — there are no counter objects to label), keeping the
+      two surfaces in agreement. **Not in scope, tracked separately:** this
+      is a kernel-observable proxy, NOT the daemon's applied-state latch
+      (`pkg/daemon` `hostInboundEnforced`, still unexported) and NOT a
+      dedicated `host_inbound_enforcement_degraded` discriminator across
+      REST/gRPC/CLI — no new REST field, Prometheus series, or gRPC field
+      was added here.
     - **L03 (zone/family split):** `host_inbound_kernel_deny_detail` carries
       the per-`{zone, family}` breakdown the aggregate scalar collapses,
       matching the `xpf_host_inbound_kernel_denies_total` labels.
@@ -1629,14 +1667,22 @@ under the daemon's errgroup. Nothing else imports this package.
     load gate (#3681), a read failure there does NOT 500 the whole response
     (which would hide the good userspace counters) — it sets the
     `host_inbound_kernel_denies_unavailable` marker, the same non-authoritative
-    idiom as per-interface `unavailable` (#3464).
+    idiom as per-interface `unavailable` (#3464). That marker also covers the
+    #5719 counter-LESS table (the #5644 cold-boot fence enforces with no named
+    counters, so its empty read is NOT a certified zero); an ABSENT table, and
+    real deny counters that merely read zero, both stay authoritative.
   - **Prometheus** (`metrics_counters.go`) OMITS the affected sample
     (rather than emitting a misleading `0`) for global, per-zone,
     per-policy, and per-filter reads, and bumps the monotonic
     `xpf_counter_read_errors_total` scrape-error counter, always emitted
     (0 when healthy) for alerting. The same counter is ALSO bumped by the
     pre-gate kernel-nftables host-inbound collector (`#3361`) when its
-    netlink read fails, so the descriptor Help text names every read surface
+    netlink read fails — and (#5719) when that read finds the host-inbound
+    table PRESENT but carrying no named counter objects, the cold-boot-fence
+    state whose empty result cannot be certified as zero; the bump is the
+    Prometheus analogue of the REST `unavailable` marker, since there is no
+    series to omit when no counter object exists to label. The descriptor Help
+    text names every read surface
     that increments it — global, zone, policy, and filter dataplane reads
     PLUS the kernel-nftables host-inbound read (#3463), not global-only, so
     it matches this contract. The error-counter SAMPLE is emitted via a

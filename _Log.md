@@ -98961,6 +98961,35 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md,
   _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #5962 and the bounded half of #5862.
+  #5962: `commitAndApplyOperator` resolved `rg0ConfigSyncAuthority(d.cluster)`
+  into a bool BEFORE `store.Commit`, and carried that frozen answer to the push
+  site. A bool cannot distinguish "this commit must never reach the peer" (the
+  event-options engine's POLICY, true whatever this node owns) from "this node
+  is not the RG0 authority right now" (a FACT with a lifetime), so RG0
+  ownership moving in between produced a successful commit with the push
+  silently skipped. Replaced the bool with `peerSyncPolicy`
+  (`peerSyncNever` / `peerSyncAlways` / `peerSyncIfRG0Authority`) resolved once,
+  in `applyAndSyncCommitted`, at the point the push is made — after the commit
+  and after `ensureWritableLocked`, which is itself tied to RG0 ownership. Both
+  directions are now pinned: promotion in the window MUST push, demotion in the
+  window MUST NOT (the pre-#5962 code got the second wrong in the other
+  direction whenever the attempt-time answer was true). The type is the fix, not
+  just the moved call: re-evaluating authority for every caller would have
+  started replicating event-engine remediations to the peer.
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed the last live #5719 cohort item (applied-nft truth
+  projection). `ReadHostInboundDenyCounters` answered `(nil, nil)` for BOTH
+  "no `inet xpf_hostinbound` table" and "table PRESENT but carrying no named
+  counter objects", so the #5644 M37 cold-boot fail-closed FENCE — which
+  renders catch-all DROPs with deliberately NO counters — was
+  indistinguishable from no enforcement at all. While a fence enforced, REST
+  `/statistics/global` published `host_inbound_kernel_denies: 0` with
+  `host_inbound_kernel_denies_unavailable` absent, i.e. certified "no denies"
+  during the degraded window in which the appliance is actively dropping
+  host-bound traffic — contradicting the #3345 / #3681-H05 contract the same
+  function cites for the netlink-failure case.
 
 - **Timestamp**: 2026-08-21
 - **Action**: #7145 — reject a malformed literal in a NAT rule's `match
@@ -99360,3 +99389,115 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/icmp_embed/nat_match_v6.rs,
   userspace-dp/src/afxdp/tests_icmp_reject_reversal.rs,
   docs/deterministic-nat-cgnat.md, userspace-dp/src/afxdp/README.md, _Log.md
+
+  #5862: measured the current lock picture rather than trusting the issue text.
+  Three of its claims are STALE — the owner-RG export ack-wait (#2962), the bulk
+  export push (#4054) and the state-file serialize+fsync (#5469) already run
+  with the lock released. The core claim is LIVE: the "dedicated" session socket
+  is a separate socket on a separate thread but its one verb (`sync_session`)
+  dispatches through the same `Arc<Mutex<ServerState>>`. Landed the bounded
+  piece: `wait_for_binding_settle` (2 s at 50 ms, reached by
+  `set_forwarding_state` / `set_queue_state` / `set_binding_state`) now releases
+  the lock across each sleep, and the three handlers RECORD the owed settle so
+  `handle_request` runs it after the guard drops — the same locked-kick /
+  unlocked-wait split #2962 and #4054 use. The consequence this closes is not a
+  latency tail: the Go session round-trip budget is 3 s
+  (`sessionSyncRoundtripDeadline`) and #5380 aborts the rest of a bulk batch on
+  the first transport failure, so a settle overlapping a mirror burst could drop
+  the remainder of up to 255 session mirrors at failover. NOT closed, and split
+  out: `apply_snapshot` can still hold the lock across a 10 s worker-readiness
+  barrier, a 500 ms mlx5 quiesce, an unbounded worker `join()`, and BPF pin-open
+  syscalls; `ServerState` is still one mutex over four fields.
+
+  Validation: `go test -count=1 ./...` exit 0, `go vet ./...` exit 0.
+  #5962 mutation matrix, one mutation per cell, exit codes from `$?`: resolve
+  the authority at attempt time (pre-#5962 shape) → exit 1 on BOTH the
+  promotion and the demotion cell; collapse `peerSyncNever` into the authority
+  answer → exit 1 at the policy table AND at the existing #5054 event-engine
+  test. #5862 mutation matrix (`cargo test -- --test-threads=1`, never
+  parallel): helper holds one guard across the loop → exit 101 on both cells,
+  measured 818 ms lock acquisition and a 1.87 s `sync_session` wait; handler
+  waits inline under the lock with the helper unchanged → exit 101 on the
+  wiring cell ONLY, helper cell green — the two tests localise to different
+  halves. Rust helper changed (`userspace-dp`), and the change is on the HA
+  session-sync contention path, so `make test-failover` on the loss userspace
+  cluster is OWED and was NOT run by this lane.
+- **File(s)**: pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_apply_commit.go,
+  pkg/daemon/daemon_apply_tail.go, pkg/daemon/daemon_run_servers.go,
+  pkg/daemon/configsync_toctou_5962_test.go, pkg/daemon/*_test.go (mechanical
+  peerSyncPolicy migration), userspace-dp/src/server/helpers/planning.rs,
+  userspace-dp/src/server/handlers/{mod,forwarding,queue,binding}.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/server/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21 (revised)
+- **Action**: #7207 — the two control-plane residuals split out of #5250 by
+  PR #7195. A concurrent lane fixed six of the ten #5250 rows and closed the
+  cohort while this lane was mid-flight; this branch was rebuilt on the new
+  master to carry ONLY the two rows #7207 tracks. A6-b2 F3: emit NAT app port
+  ranges directly instead of materializing up to ~65k ints per application.
+  A7-b1 F4: make waitLocalFailoverCommitReady abortable on daemon stop and
+  capture the VRRP debounce closure's manager references.
+  Validation: `go build ./...` exit 0; `go test -count=1` green on
+  pkg/daemon, pkg/dataplane/userspace, pkg/refactoraudit; per-row revert
+  mutations red. `pkg/daemon/daemon_ha.go` is HA/failover code — `make
+  test-failover` is OWED and was not run by this lane.
+- **File(s)**: pkg/dataplane/userspace/nat.go, nat_source.go,
+  nat_destination.go, pkg/daemon/daemon_ha.go, docs/userspace-dnat-plan.md,
+  docs/refactoring-audit-current.txt, plus two new `*_5250_test.go` files.
+
+## 2026-08-21 — #5838 userspace helper crash supervision
+
+- **Timestamp**: 2026-08-21T23:xx UTC
+- **Action**: Add a generation-fenced supervisor that owns `cmd.Wait()` for each
+  spawned `xpf-userspace-dp` generation, fails the node closed on an unexpected
+  exit (disarm shim, drop `m.proc`, clear helper-derived status so
+  `TakeoverReady()` goes false), and schedules a bounded-backoff restart through
+  the ordinary bring-up path. Removed the second `cmd.Wait()` in `stopLocked`.
+  Documented that the post-crash forwarding posture was ALREADY fail-closed via
+  the shim's three degraded-path gates — the defect was the manager advertising
+  a dead helper as a valid HA takeover target.
+- **File(s)**: `pkg/dataplane/userspace/process_supervisor.go` (new),
+  `pkg/dataplane/userspace/process.go`, `pkg/dataplane/userspace/manager.go`,
+  `pkg/dataplane/userspace/helper_crash_supervisor_5838_test.go` (new),
+  `pkg/dataplane/README.md`
+
+  The read now returns a `HostInboundTableState`
+  (Absent / Counterless / Counted) alongside the rows; `pkg/api/stats.go`
+  routes Counterless onto the EXISTING `HostInboundKernelDeniesUnavailable`
+  channel and `collectHostInboundKernelDenies` bumps
+  `xpf_counter_read_errors_total` (no series exists to omit — there are no
+  counter objects to label), keeping the two surfaces in agreement. The
+  discriminator is "the table carries no named counter OBJECT", not "no DENY
+  counter": a real generation always declares the three #4759 ICMP/ND accept
+  counters, so a junos-host program-only ruleset (no per-zone catch-all DROP,
+  hence no deny counter) still reads Counted and is not false-alarmed. An
+  ABSENT table, and real deny counters that merely READ zero, both stay
+  AUTHORITATIVE. No new REST field, Prometheus series, or gRPC field: the
+  daemon's `hostInboundEnforced` applied-state latch and a dedicated
+  `host_inbound_enforcement_degraded` discriminator are a successor issue.
+
+  Validation: `go build ./...` exit 0; `go vet ./pkg/api/... ./pkg/nftables/...
+  ./pkg/daemon/...` exit 0; `go test -count=1` on the same three packages exit
+  0 (api 42.3s, nftables, daemon 36.6s). `TestFenceTableReadsCounterless` run
+  for real under `unshare -rn` (it SKIPs unprivileged) — absent -> fence ->
+  absent all three states observed against the kernel. Mutation matrix, one
+  mutation per cell, exit codes read from `$?`: revert the REST case -> exit 1,
+  only the counterless row; swap the state constant to Absent -> exit 1, the
+  fence row AND the absent negative control (so the control is not vacuous);
+  revert the Prometheus branch -> exit 1, the counterReadErrors assertion;
+  `namedCounters == 0` -> always-Counted -> exit 1, both counterless rows;
+  wrong discriminator `len(out) == 0` -> exit 1, the accept-counters-only row;
+  rival value-keyed fix (`aggregate == 0 -> unavailable`) -> exit 1, the absent
+  AND real-counters-reading-zero rows. Post-restore control green. Go-only
+  diff, no shim `.o` or protocol movement, so no cluster smoke is owed.
+- **File(s)**: pkg/nftables/host_inbound_counters.go,
+  pkg/nftables/host_inbound_counters_state_5719_test.go,
+  pkg/nftables/netlink_fence.go, pkg/nftables/netlink_kernel_test.go,
+  pkg/nftables/README.md, pkg/api/stats.go, pkg/api/metrics_counters.go,
+  pkg/api/stats_global_host_inbound_fence_5719_test.go,
+  pkg/api/stats_global_host_inbound_3681_test.go,
+  pkg/api/metrics_host_inbound_kernel_test.go,
+  pkg/api/metrics_counter_read_errors_every_path_5045_test.go,
+  pkg/api/filter_counters_metrics_test.go,
+  pkg/api/zone_counters_metrics_test.go, pkg/api/README.md,
+  pkg/daemon/README.md, _Log.md

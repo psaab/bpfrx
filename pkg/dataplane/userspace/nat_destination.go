@@ -234,11 +234,22 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			//     constraint, carried verbatim (already valid u8s). nil = no ICMP
 			//     type/code constraint (match every type/code of the protocol).
 			type appTerm struct {
-				proto    string
-				ports    []int
-				srcPorts []NatPortRangeWire
-				icmpType *uint8
-				icmpCode *uint8
+				proto string
+				// #5250 (A6-b2 F3): the destination-port axis is carried
+				// ALREADY COALESCED. It used to be a []int of every individual
+				// port, so an application with `destination-port 1-65535`
+				// materialized ~65k ints per term (and again per application-set
+				// member) only for the loop below to collapse them back into one
+				// range. dstPortsPresent preserves the one thing the slice was
+				// also read for: whether the source list was non-empty BEFORE
+				// coalescing, which the #3726/#3857 fail-closed test needs and a
+				// coalesced list cannot recover (a spec of "0" is present but
+				// coalesces away).
+				dstRanges       []NatPortRangeWire
+				dstPortsPresent bool
+				srcPorts        []NatPortRangeWire
+				icmpType        *uint8
+				icmpCode        *uint8
 				// dstPortConfigured records that the application specified a
 				// non-empty destination-port spec, even if it coalesced to no
 				// representable port (all out of 1..65535, or a reversed
@@ -252,7 +263,7 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			var appTerms []appTerm
 
 			appTermFor := func(a *config.Application) appTerm {
-				srcPorts := coalescePortRanges(appPortsFromSpec(a.SourcePort))
+				srcPorts := appPortRangesFromSpec(a.SourcePort)
 				if a.SourcePort != "" && len(srcPorts) == 0 {
 					// #3437: a configured source-port that coalesces to nothing
 					// (every value out of 1..65535) fails CLOSED — match no source
@@ -261,7 +272,8 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				}
 				return appTerm{
 					proto:             a.Protocol,
-					ports:             appPortsFromSpec(a.DestinationPort),
+					dstRanges:         appPortRangesFromSpec(a.DestinationPort),
+					dstPortsPresent:   a.DestinationPort != "",
 					srcPorts:          srcPorts,
 					icmpType:          a.ICMPType,
 					icmpCode:          a.ICMPCode,
@@ -374,7 +386,11 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 						protos = []string{""}
 					}
 					for _, proto := range protos {
-						appTerms = append(appTerms, appTerm{proto: proto, ports: rule.Match.DestinationPorts})
+						appTerms = append(appTerms, appTerm{
+							proto:           proto,
+							dstRanges:       coalescePortRanges(rule.Match.DestinationPorts),
+							dstPortsPresent: len(rule.Match.DestinationPorts) > 0,
+						})
 					}
 				}
 			}
@@ -432,13 +448,15 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				// when the rule did NOT configure `match destination-port`. On
 				// the no-application explicit-match path term.ports already IS
 				// rule.Match.DestinationPorts, so the override is a no-op there.
-				termPorts := term.ports
+				termRanges := term.dstRanges
+				termPortsPresent := term.dstPortsPresent
 				termDstPortConfigured := term.dstPortConfigured
 				if ruleDstPortConfigured {
-					termPorts = ruleDstPorts
+					termRanges = coalescePortRanges(ruleDstPorts)
+					termPortsPresent = len(ruleDstPorts) > 0
 					termDstPortConfigured = true
 				}
-				portRanges := coalescePortRanges(termPorts)
+				portRanges := termRanges
 				// Did this term CONFIGURE a destination-port at all? A configured
 				// port that survived to no valid value must not become wildcard.
 				// #3726: term.dstPortConfigured is true when the application named
@@ -450,7 +468,7 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 				// InvalidDestinationPorts). Without this the empty ports slip
 				// through to the wildcard match-any-port default — a fail-open
 				// that widens the DNAT rule to every port.
-				portConfigured := len(termPorts) > 0 || termDstPortConfigured
+				portConfigured := termPortsPresent || termDstPortConfigured
 				if len(portRanges) == 0 {
 					switch {
 					case portConfigured:
