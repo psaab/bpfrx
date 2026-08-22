@@ -536,6 +536,35 @@ The logic lives in `deploy-lib.sh` (`deploy_reassert_primary_node0`,
 `deploy_reassert_node0_primary_ok`) so `make test-deploy-lib` covers it against
 a mocked incus — no cluster required.
 
+**The failover smoke names WHICH failure it hit (#7368).**
+`test-failover.sh` used one exit code (2) for three different outcomes, so
+`FO_RC=2` was read as "failover broke" when it meant "the cluster was never in
+a testable state". The three are now distinct:
+
+| outcome | signal |
+|---|---|
+| precondition not met | `FATAL[PRECONDITION]`, exit 2 |
+| ownership and forwarding disagree | `FATAL[DIVERGENCE]`, exit 3 |
+| a real assertion failed | the usual `FAIL` tally, exit 1 |
+
+Two changes make that possible. The preflight primacy check now uses
+`deploy_reassert_node0_primary_ok` — the same per-RG predicate the deploy
+reassert uses — instead of `grep -q "node0.*primary"` over the whole status
+output. Measured: `secondary` contains no `primary` substring, so that grep
+was not wrong in the way it looks; it was **unscoped**, so a cluster with
+node0 SECONDARY for RG0 and primary for RG1 satisfied it.
+
+And the session assertion now cross-references the two independent checks the
+script already performed. Primacy is read from a field the node reports about
+ITSELF; the session count is a real measurement; they were never compared. In
+#6656 that meant a genuine ownership divergence (node0 primary with 1 session,
+node1 carrying 33) surfaced as a session-count shortfall and was attributed to
+the change under test. The peer count is read on the shortfall path only, and
+`failover_ownership_verdict` (pure, in `deploy-lib.sh`, selftested) decides
+between `diverged` and `nostream`. "The peer has sessions" is deliberately NOT
+the discriminator — session sync means the peer legitimately holds some, so the
+peer must be above `MIN_SESSIONS` while the reported primary is below it.
+
 ### VRRP State Verification
 ```bash
 # Both nodes should agree: fw0=MASTER, fw1=BACKUP for all groups
