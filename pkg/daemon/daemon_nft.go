@@ -214,11 +214,17 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 // (xpf_lo0 at lo0FilterPriority). It is attempted whenever a real lo0 install
 // failed and no real filter is currently loaded (lo0Enforced false).
 //
-// Safety: the fence drops only to the SAME lifeline-excluded address sets the
-// host-inbound fence uses (fxp0/em0/fab* and their addresses are subtracted by
-// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so it can never
-// strand management or break HA. It carries no named counters (a fence is
-// transient).
+// Scope: the fence drops to the SAME address sets the host-inbound fence uses.
+// Those builders exclude lifeline INTERFACES (fxp0/em0/fab*), NOT lifeline
+// address VALUES. A management address that is also configured on a non-lifeline
+// interface IS in the drop set, and the drop carries no iifname, so this fence
+// drops NEW management connections to that address for the whole fence window
+// (#6492 Finding A; the real table's per-service accept, which this fence strips,
+// is what normally admits them). Already-established sessions survive via the
+// mandatory ct established,related admit. A lifeline address not shared onto any
+// non-lifeline interface is never in the set. See docs/host-inbound-service-
+// matrix.md, "Lifeline exclusion is by INTERFACE, not by address value". It
+// carries no named counters (a fence is transient).
 //
 // A fence deliberately does NOT set lo0Enforced — that flag is set true ONLY by a
 // successful real InstallLo0, so it means exactly "a real operator lo0 filter is
@@ -378,9 +384,13 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// only, so host-bound traffic to an addressed-but-unzoned interface would
 	// fall through the chain's `policy accept` and reach the host stack with no
 	// host-inbound admission (fail-open; Junos passes no traffic on an unzoned
-	// interface). These get their own catch-all DROP below. Lifelines are
-	// excluded and zoned addresses are subtracted by the builder, so this can
-	// never strand management or conflict with a zone rule.
+	// interface). These get their own catch-all DROP below. The builder excludes
+	// lifeline INTERFACES and subtracts zoned addresses, so this never conflicts with
+	// a zone rule — but it does NOT subtract lifeline address VALUES: a management
+	// address also configured on an UNZONED interface lands here with an EMPTY admit
+	// set, so the real table drops new management connections to it and the #5566
+	// reconcile flushes the established ones. See docs/host-inbound-service-matrix.md,
+	// "Lifeline exclusion is by INTERFACE, not by address value".
 	unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
 	// #3698: surface the transient fail-open admit window. A configured
 	// host-inbound-enforcing zone whose non-lifeline interfaces have no
@@ -603,12 +613,17 @@ func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, w
 // with a successfully loaded zero-drop table shell; it does not prove table
 // absence.
 //
-// Safety: the fence drops only to the SAME address sets the real ruleset would
-// scope (views + the addressed-but-unzoned set), which are already
-// lifeline-excluded (fxp0/em0/fab* and their addresses are subtracted by
-// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so the fence can
-// never strand management or break HA — it is strictly the real table with every
-// service ACCEPT removed. It carries no named counters (a fence is transient) so
+// Scope: the fence drops to the SAME address sets the real ruleset would scope
+// (views + the addressed-but-unzoned set) — it is strictly the real table with
+// every service ACCEPT removed. Those builders exclude lifeline INTERFACES
+// (fxp0/em0/fab*), NOT lifeline address VALUES, so a management address also
+// configured on a non-lifeline interface IS dropped here, with no iifname to
+// distinguish the ingress path: new management connections to it die for the fence
+// window (#6492 Finding A). Removing the service ACCEPTs is exactly what takes
+// away the admission the real table gave it. Already-established sessions survive
+// via the mandatory ct established,related admit. See docs/host-inbound-service-
+// matrix.md, "Lifeline exclusion is by INTERFACE, not by address value". It
+// carries no named counters (a fence is transient) so
 // it has fewer moving parts than the real payload and is more likely to load when
 // the real one hit a payload-specific nft error. After successful nft completion,
 // hostInboundEnforced is set true only when this exact payload contains an
@@ -685,9 +700,11 @@ func buildLo0FencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, un
 // (hostInboundFenceMandatoryAdmits) then a catch-all DROP for every firewall-local
 // address the real ruleset would scope — per host-inbound-configured zone
 // (default-deny parity, #3405) and the addressed-but-unzoned set (#4420 HI-2).
-// These sets are already lifeline-excluded, so the fence never denies management /
-// cluster-control traffic. During the fence window even a `system-services all`
-// zone is denied (maximally fail-closed); the next clean commit restores the real
+// These sets exclude lifeline INTERFACES, not lifeline address VALUES: a
+// management address shared onto a non-lifeline interface is denied here like any
+// other, and the drop carries no iifname (#6492 Finding A). During the fence
+// window even a `system-services all` zone is denied (maximally fail-closed); the
+// next clean commit restores the real
 // accepts. It is the single body shared by the host-inbound fence
 // (xpf_hostinbound, priority 10, #5644) and the lo0 fence (xpf_lo0, priority 0,
 // #6476) so their admit/deny posture can never diverge. Empty address inputs
@@ -819,9 +836,11 @@ func hostInboundUncoveredDropAddrs(views []dpuserspace.ZoneHostInboundView, unzo
 // valid rules"): a covered address is service-accepted or catch-all-dropped by
 // the main table (prio 10) and either way its verdict is unchanged, while a
 // newly-appeared uncovered address falls through the main chain's policy-accept
-// and is dropped here. The uncovered lists are already lifeline-excluded (they
-// derive from the same builder-subtracted views/unzoned sets), so the gap can
-// never fence management / cluster-control traffic. Callers must only invoke this
+// and is dropped here. The uncovered lists inherit the same lifeline treatment as
+// the views/unzoned sets they derive from — lifeline INTERFACES excluded, lifeline
+// address VALUES not — so a management address shared onto a non-lifeline
+// interface can be fenced here too, with no iifname to distinguish the ingress
+// path (#6492 Finding A applies to this fence as well). Callers must only invoke this
 // with a non-empty uncovered set (an all-empty payload would be a pointless
 // zero-drop shell); an empty set instead deletes the table.
 func buildHostInboundGapFencePayload(uncoveredV4, uncoveredV6 []string, wgListenPorts []uint16) string {
@@ -1208,7 +1227,9 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 	// traffic on an unzoned interface (a decrypted host-terminated tunnel, ND,
 	// PMTUD) while every other host-bound service/protocol is denied — the Junos
 	// fail-closed posture for an interface with no zone. The address set is
-	// already lifeline-excluded and zone-subtracted by BuildUnzonedHostInboundAddrs.
+	// already zone-subtracted by BuildUnzonedHostInboundAddrs and excludes lifeline
+	// INTERFACES — but not lifeline address VALUES, so a management address on an
+	// unzoned interface is denied here with no service accept in front of it.
 	emitUnzonedHostInboundDeny(&rules, "ip", unzonedV4)
 	emitUnzonedHostInboundDeny(&rules, "ip6", unzonedV6)
 	rules = append(rules, "  }")

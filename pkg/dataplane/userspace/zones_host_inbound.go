@@ -162,8 +162,14 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	// management-plane exposure on any zone the operator never locked down. The
 	// management / cluster-control lifeline interfaces (fxp0/em0/fab*) are
 	// excluded from the address sets below, and the established / ESP-AH / ND /
-	// PMTUD accepts precede every drop, so the default-deny can never strand
-	// management or break HA. A zone-level stanza or any per-interface override
+	// PMTUD accepts precede every drop, so an ESTABLISHED management session and HA
+	// control traffic survive. A NEW management connection is not covered by that
+	// argument: a management address shared onto a non-lifeline interface is in that
+	// zone's drop set, and only a zone that ADMITS the service puts an accept in
+	// front of it — a zone with no host-inbound-traffic stanza drops it. The
+	// exclusion above is by INTERFACE, not by address value; see
+	// docs/host-inbound-service-matrix.md, "Lifeline exclusion is by INTERFACE, not
+	// by address value". A zone-level stanza or any per-interface override
 	// (#3362) still further scopes what the zone admits.
 	configured := func(zone *config.ZoneConfig) bool {
 		return zone != nil
@@ -376,9 +382,18 @@ const UnzonedHostInboundZoneLabel = "junos-host"
 //   - Only meaningful when the operator uses the zone model at all (>= 1 zone):
 //     a zone-less bootstrap / degenerate config is left untouched (nil), so this
 //     never turns a no-zones box into deny-all host-inbound.
-//   - Management / cluster-control LIFELINE interfaces (fxp0 / em0 / fab*, plus
+//   - Management / cluster-control LIFELINE INTERFACES (fxp0 / em0 / fab*, plus
 //     the configured control / fabric links) are excluded exactly as the zone
-//     path excludes them, so the deny can never strand management or break HA.
+//     path excludes them. That is an INTERFACE exclusion, not an address-VALUE
+//     one: a management address ALSO configured on an unzoned interface is
+//     contributed by that interface's snapshot and lands in this set with an
+//     EMPTY admit set, so the real table drops NEW management connections to it
+//     (no service accept precedes an unzoned drop) and the #5566 reconcile
+//     flushes its ESTABLISHED entries. The drop is destination-address-only with
+//     no iifname (#3718), so arriving on the lifeline does not exempt it. A
+//     lifeline address not shared onto a non-lifeline interface is never in this
+//     set. See docs/host-inbound-service-matrix.md, "Lifeline exclusion is by
+//     INTERFACE, not by address value".
 //   - Addresses already scoped by a zone view are subtracted, so a (mis)config
 //     placing one firewall-local address on both a zoned and an unzoned
 //     interface never yields a duplicate / conflicting rule for the same daddr.

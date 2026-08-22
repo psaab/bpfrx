@@ -1759,12 +1759,22 @@ never lock an operator out of a remote box it manages.
   branch; a zoned NON-lifeline DHCP interface (e.g. a standalone `fxp1`) now forces
   the full recompile that builds its address-scoped host-inbound fence, closing the
   addressless→addressed gap where the broad class exempted it from that reapply.
-  **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  **Lifeline exclusion — by INTERFACE, not by address value:**
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
-  the address sets so a host-inbound deny can never strand management or break
-  HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages
-  are accepted before any deny; a configured zone that resolves to zero
-  recognized matches fails OPEN (no deny) rather than locking the zone out.
+  the address sets, so an address reachable ONLY through a lifeline is never
+  denied. A management address ALSO configured on a non-lifeline interface is NOT
+  subtracted: it is in that interface's drop set, and every host-inbound drop is
+  destination-address-only with no `iifname` (#3718), so arriving on the lifeline
+  does not exempt it. Only a zone that ADMITS the service puts an accept in front
+  of the drop — a zone with no stanza (#3405) or an unzoned interface (#4420)
+  drops NEW management connections to that address, and the #5566 conntrack
+  reconcile flushes its ESTABLISHED ones. `ct state established,related` and IPv6
+  ND + v4/v6 PMTUD control messages are accepted before any deny, which is what
+  preserves HA control traffic and an established session where the reconcile
+  does not flush it. See `docs/host-inbound-service-matrix.md`, "Lifeline
+  exclusion is by INTERFACE, not by address value". A configured zone that
+  resolves to zero recognized matches fails OPEN (no deny) rather than locking
+  the zone out.
   **Unzoned interfaces (#4420 HI-2):** an interface that carries an address but
   is assigned to NO security zone is not covered by any per-zone view above, so
   before #4420 its firewall-local addresses fell through the chain's
@@ -1773,9 +1783,11 @@ never lock an operator out of a remote box it manages.
   host-inbound traffic at all). `applyHostInboundFilter` now also scopes a
   catch-all DROP to those addresses (`userspace.BuildUnzonedHostInboundAddrs`,
   counted under the reserved `junos-host` sentinel label so the #3361 scraper
-  reports them as `zone="junos-host"`). Lifelines are excluded and zoned
-  addresses subtracted, so it can never strand management or conflict with a zone
-  rule; it is emitted only when the zone model is in use (>= 1 zone), so a
+  reports them as `zone="junos-host"`). Lifeline INTERFACES are excluded and
+  zoned addresses subtracted, so it never conflicts with a zone rule — but an
+  unzoned drop carries NO service accept, so a management address shared onto an
+  unzoned interface is denied outright here (see the lifeline note above); it is
+  emitted only when the zone model is in use (>= 1 zone), so a
   bootstrap / zoneless box is left untouched. Unzoned interfaces are not
   AF_XDP-bound, so the kernel nft deny is the sole and sufficient enforcement
   point (no userspace-dp change). **Known limitation (#4420 HI-1):** the chain
