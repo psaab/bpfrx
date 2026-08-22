@@ -102668,3 +102668,11 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/mirror_session_id_adoption_6666_test.go (new),
   pkg/daemon/userspace_sync_test.go, proto/xpf/v1/xpf.proto,
   pkg/cluster/README.md, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6590 — `show isis neighbor` was parsed left-to-right, so a
+    peer-advertised hostname containing spaces shifted every later column and let
+    the neighbour forge its own State/Level/Interface/HoldTime. Now right-anchored
+    against a header-derived trailing width; short/headerless rows dropped.
+  - **File(s)**: pkg/frr/status_parse.go,
+    pkg/frr/isis_positional_forgery_6590_test.go
