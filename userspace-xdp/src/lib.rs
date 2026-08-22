@@ -1304,8 +1304,20 @@ fn parse_ipv6(
     // attribute — described, not spelled; see that file's module comment for
     // why — and driven on real buffers), so its advance arithmetic and bounds
     // revalidation are observed rather than asserted about the source text.
-    let (offset, protocol) =
-        ipv6_ext_walk::walk_ipv6_ext_headers(data, data_end, l3_offset, protocol, offset)?;
+    let walk = ipv6_ext_walk::walk_ipv6_ext_headers(data, data_end, l3_offset, protocol, offset)?;
+    // #6704: `walk.non_first_fragment` is NOT consumed here yet, and that is a
+    // measured decision rather than an oversight. Every shape that acts on it
+    // — masking the parsed L4 values, forking the session block, gating the
+    // ICMP-type steering, even a lone extra `is_local_destination` on the
+    // fragment path — was REJECTED by the kernel verifier at 1,000,001
+    // processed instructions against the 1,000,000 cap, from this object's
+    // 777,901 baseline. Carrying the sighting costs 6,274 and fits; consuming
+    // it does not fit until the shim buys headroom. The full matrix is in the
+    // successor issue. What the sighting buys today is that the fragment
+    // dimension is finally COMPARABLE: userspace-dp's executable parity corpus
+    // reads this field against its own `non_first_fragment_offset_seen`, which
+    // was impossible while the walk returned a bare `(offset, protocol)`.
+    let (offset, protocol) = (walk.offset, walk.protocol);
 
     let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
