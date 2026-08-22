@@ -227,6 +227,34 @@ fail-closed (#5815), with no override — a signed unpinned image is not
 releasable. The test VM follows the same policy: `test/incus/setup.sh`
 tracks whatever release production was last baked at, deliberately,
 rather than the newest Ubuntu on the day you run `make test-vm`.
+**What the image SHIPS (#6500).** `bake_host_kernel` above is the BUILD
+HOST's kernel (`os.uname().release`) and answers a different question
+from "what does this image carry". Two additional records close that:
+
+- `guest_kernel:` in the `.manifest` — the kernel the IMAGE runs, i.e.
+  the exact artifact the #1930 LANE-1 channel promotes.
+- `dist/xpf-<ver>.pkgs` — the full installed package inventory
+  (`name=version`, one per line, plus the guest kernel), **covered by the
+  signed `xpf-<ver>.SHA256SUMS`** exactly like the `.manifest` sidecar
+  (#5042), so it is authenticated the moment the manifest signature
+  verifies.
+
+The bake writes the same record INSIDE the image at
+`/etc/xpf/image-inventory` and reads it back out **offline with
+`virt-cat`** — no boot — so "does release X ship openssl 3.x.y
+(CVE-YYYY)?" and "which kernel does image X carry, so I can plan a
+LANE-1 arm?" are answered from the dist tree, and the copy that stays in
+the image answers them on the box too.
+
+Both are **fail-closed at publish**: `publish.py gate_provenance` refuses
+a release whose manifest has no `guest_kernel`, whose `.pkgs` sidecar is
+missing or not covered by the signed manifest, whose inventory is HOLLOW
+(a present-but-empty record satisfies a presence check and answers
+nothing), or whose two authenticated records disagree about the kernel —
+alongside the existing `validated` / `base_image_pinned` refusals. The
+format lives in `scripts/dist/image_inventory.py`, single-sourced because
+bake.py writes it and publish.py reads it and a divergence between those
+is always a bug.
 
 Full first-boot matrix (run after a bake, or standalone):
 

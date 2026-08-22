@@ -1,3 +1,48 @@
+## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
+
+- **Timestamp**: 2026-08-22
+- **Action**: Corrected every remaining claim that the bake discovers the
+  LATEST Ubuntu base, which contradicts the #1943/#4904 reviewed-pin
+  policy. The issue named three sites in install-images.md; a
+  wrap-insensitive, extension-agnostic sweep found a FOURTH at
+  Makefile:287-288, hidden because the claim wrapped across two comment
+  lines AND the file has no extension. Added a guard that bans the
+  complete ASSERTING clauses rather than keywords — a keyword ban would
+  red on the four correct "not auto-latest" negations while the real
+  false claim walked past — plus two matcher self-tests asserting that
+  the normalizer sees a wrapped claim and that a line-oriented search
+  misses the same claim, so the reason the guard normalizes is bound
+  rather than assumed. The TRUE half binds the doc to bake.py's actual
+  PINNED_BASE_RELEASE value, its constants and GPG fingerprint, and
+  refuses an override bake.py never reads.
+- **File(s)**: docs/install-images.md, Makefile,
+  scripts/test_base_pin_docs_6501.py
+
+## 2026-08-22 — #6500 signed image inventory (guest kernel + package set)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The bake now writes `/etc/xpf/image-inventory` inside the
+  image as its last virt-customize step and reads it back OFFLINE with
+  `virt-cat` (no boot), emitting `dist/xpf-<ver>.pkgs` under the signed
+  SHA256SUMS. `build_manifest_text` takes `guest_kernel` as a REQUIRED
+  keyword so a caller cannot silently omit the field the publish gate
+  needs, and `gate_provenance` gains a third fail-closed leg refusing a
+  missing guest_kernel, an absent or uncovered `.pkgs`, a hollow
+  inventory, or a kernel disagreement between the two authenticated
+  records. The record format is single-sourced in
+  `scripts/dist/image_inventory.py` — bake writes it, publish reads it,
+  and a divergence there is always a bug, so it is one definition
+  rather than two bound by a canary. Three pre-existing fixtures set
+  the OLD gate input and were carried forward rather than left to pass
+  vacuously, and the provenance negatives now assert WHICH check fired
+  instead of only that SystemExit was raised.
+- **File(s)**: scripts/image/bake.py, scripts/dist/publish.py,
+  scripts/dist/image_inventory.py, scripts/dist/selftest.sh,
+  scripts/dist/test_image_inventory_6500.py,
+  scripts/dist/test_publish_provenance.py,
+  scripts/image/test_bake_base_pin.py, docs/install-images.md,
+  docs/distribution.md
+
 ## 2026-08-22 — #6499 boot-firmware self-tests + lint-list drift guard
 
 - **Timestamp**: 2026-08-22
