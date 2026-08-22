@@ -103662,3 +103662,17 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
+
+## 2026-08-22 — #6719 management reconciler startup race + unguarded publish
+- **Action**: `d.mgmt` became an `atomic.Pointer[managementReconciler]` (was a
+  plain field written in startHTTPServer and read unguarded by
+  reconcileWebManagement, with cluster comms — and therefore peer sync — live
+  ~190 lines earlier in Run). `managementReconciler.start` now derives its
+  desired state from `store.ActiveConfig()` UNDER `m.mu` via a new `startLocked`
+  shared body, so a promotion racing startup is no longer dropped by a reconcile
+  that no-ops on `m.srv == nil` and then overwritten by the stale snapshot.
+- **File(s)**: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/management.go`,
+  `pkg/daemon/management_start_race_6719_test.go` (new),
+  `pkg/daemon/daemon_dp_escape_rest_test.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `pkg/daemon/README.md`

@@ -200,7 +200,31 @@ func (m *managementReconciler) desired(cfg *config.Config) api.Config {
 // start builds and starts the initial listener from the active config. A bind
 // failure is returned (the caller logs it non-fatally); the next commit retries.
 func (m *managementReconciler) start(ctx context.Context) error {
-	return m.startTo(ctx, m.desired(m.d.store.ActiveConfig()))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// #6719: derive the desired state from the store UNDER m.mu, not before
+	// taking it. The pre-#6719 shape read ActiveConfig() first and only then
+	// contended for the lock, which lost a promotion outright:
+	//
+	//  1. start reads active config A (credential A);
+	//  2. a peer sync promotes B, revoking A, and calls reconcile;
+	//  3. that reconcile wins the lock, finds m.srv == nil, and no-ops;
+	//  4. start finally takes the lock and installs the server built from A.
+	//
+	// Credential A then stayed accepted until some later reconcile or a restart
+	// — and the same window applied to the bind address and TLS.
+	//
+	// Reading under the lock removes the case entirely, because the two orders
+	// are now both correct rather than one being lossy. If the promotion landed
+	// BEFORE this line, ActiveConfig() returns B and we install B. If it lands
+	// while we hold the lock, its reconcile blocks here and runs afterwards
+	// against a server that now exists, so it converges to B itself. There is no
+	// interleaving left in which the newer snapshot is dropped.
+	//
+	// committedDesired (the reconcile path) reads the same store.ActiveConfig(),
+	// so the two derivations agree on their authority by construction rather
+	// than by convention.
+	return m.startLocked(ctx, m.desired(m.d.store.ActiveConfig()))
 }
 
 // startTo starts the initial listener for an explicit desired config. Split from
@@ -210,6 +234,14 @@ func (m *managementReconciler) start(ctx context.Context) error {
 func (m *managementReconciler) startTo(ctx context.Context, next api.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.startLocked(ctx, next)
+}
+
+// startLocked is the body of start/startTo. The caller MUST hold m.mu — that is
+// the whole point of the split (#6719): start derives its snapshot from the
+// store under the same lock the reconcile path contends for, so a promotion
+// racing startup is never dropped.
+func (m *managementReconciler) startLocked(ctx context.Context, next api.Config) error {
 	// Record the attempted HTTP bind BEFORE Start so a bind failure (curSet stays
 	// false) can report it as `(bind failed)` in `show system services` (#6401).
 	m.lastHTTPAttempt = next.Addr
@@ -669,8 +701,9 @@ func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 		return
 	}
 	d.staleCertMu.Lock()
-	pending, gen, mgmt := d.staleCertPending, d.staleCertGen, d.mgmt
+	pending, gen := d.staleCertPending, d.staleCertGen
 	d.staleCertMu.Unlock()
+	mgmt := d.mgmt.Load()
 	if !pending || mgmt == nil {
 		return
 	}
@@ -810,10 +843,11 @@ func (m *managementReconciler) wait() {
 // logged (retry debt), mirroring reconcileSNMP's warn-and-retry posture rather
 // than bricking an otherwise-successful commit.
 func (d *Daemon) reconcileWebManagement(cfg *config.Config) error {
-	if d.mgmt == nil {
+	mgmt := d.mgmt.Load()
+	if mgmt == nil {
 		return nil
 	}
-	err := d.mgmt.reconcile(cfg)
+	err := mgmt.reconcile(cfg)
 	// #6827: a reconcile may have just brought HTTPS up (enable, or a retried
 	// bind). If a host-name staleness diagnosis is still owed from a window
 	// when nothing was serving, settle it now rather than losing it.
