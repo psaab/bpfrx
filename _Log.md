@@ -101050,3 +101050,24 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: scripts/image/validate.py, scripts/image/bake.py,
   scripts/image/test_validate_image_seal_6547.py (new),
   docs/image-validation.md, docs/install-images.md, _Log.md
+
+## 2026-08-21 — #6460 DHCP-server host-inbound bypass advisory
+- **Timestamp**: 2026-08-21
+- **Action**: Split #6460. Its multicast/broadcast leg is the same defect as
+  #4455 (HI-1), already terminal there — Component B (the observability
+  advisory) shipped in PR #4786, Component A (the per-zone `iifname` DROP
+  gate) PLAN-KILLed — and #6460's own 65-round research arc re-derived that
+  same kill. The one leg #4455 never covered is the DHCP server: both #4455
+  arms cross-check ROUTING protocols against FRR, so a `dhcp-local-server`
+  group bound to an interface whose zone omits `dhcp`/`dhcpv6` produced ZERO
+  advisory. Added `validateDHCPServerHostInboundBypassWarnings`: WARN-only,
+  zero dataplane surface, per-family mechanism text (v4 = Kea's default `raw`
+  AF_PACKET socket taps ahead of netfilter; v6 = ff02::1:2 matches no per-zone
+  unicast `daddr` and falls through `policy accept`). Reuses the
+  `zoneIfaceLogicalKeys` + `InterfaceHostInboundEffective` SSOTs so the three
+  advisories cannot drift. Remedy leads with removing the interface from the
+  group, not with adding the token — the token cannot enforce anything on v4.
+- **File(s)**: pkg/config/compiler_validate_warn_dhcp_hostinbound.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/dhcp_host_inbound_bypass_6460_test.go (new),
+  docs/host-inbound-multicast.md, pkg/dhcpserver/README.md, _Log.md

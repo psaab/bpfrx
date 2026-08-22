@@ -853,6 +853,21 @@ adds `github.com/miekg/dns` (DNS UPDATE construction + TSIG signing).
 
 - Config is regenerated fully on every `Apply()` (no diff). The Kea config
   schema is JSON-based, so this is cheap.
+- **`dhcp-socket-type` is never emitted, so Dhcp4 runs Kea's default
+  `raw` (#6460).** `interfaces-config` carries only the `interfaces`
+  list. AF_PACKET delivery happens BEFORE the netfilter input hook, so
+  the `xpf_hostinbound` chain cannot gate DHCPv4 at all — a zone whose
+  `host-inbound-traffic system-services` omits `dhcp` does **not** stop
+  this server answering on an interface its group binds. Dhcp6 has no
+  raw mode but is addressed at the `ff02::1:2` multicast group, which
+  matches no per-zone unicast `daddr` rule and falls through the input
+  chain's accept policy — same outcome, different mechanism. A
+  commit-time advisory names the mismatch
+  (`validateDHCPServerHostInboundBypassWarnings`); see
+  `docs/host-inbound-multicast.md` "The DHCP-server sibling (#6460)".
+  Do not switch Dhcp4 to `udp` to "fix" this: UDP sockets cannot serve
+  clients that have no address yet, so it is a behaviour change with its
+  own migration, not a bug fix.
 - If the typed config drops the DHCP server entirely, `Apply()` stops the
   service and removes the config file. Running Kea processes are not
   killed via SIGKILL — systemd manages the lifecycle.
