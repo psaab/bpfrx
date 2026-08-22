@@ -4,6 +4,94 @@ xpf has **two** command-tree sources of truth. Knowing which one to edit
 is the single most common mistake when adding CLI completion or config
 validation.
 
+
+## Compact (packed) stanza bodies
+
+A stanza body can be written NESTED or PACKED onto one line, and the two are the
+same configuration:
+
+```
+security { screen { ids-option s1 { icmp { ping-death; } } } }   nested
+security { screen { ids-option s1 icmp ping-death; } }           packed
+```
+
+The parser does not normalise them. A packed body arrives as extra tokens on the
+node's OWN `Keys`, with no `Children` at all:
+
+```
+nested   [ids-option s1] -> [icmp] -> [ping-death]
+packed   [ids-option s1 icmp ping-death]
+```
+
+A compiler that descends only `node.Children` therefore sees an EMPTY body. The
+instance NAME survives, which is what makes this class hard to notice: the
+profile/host/term exists, `show configuration` displays what the operator wrote,
+it binds to a zone or an interface normally — and it enforces nothing. Known
+instances all failed in the security-relevant direction: a syslog host with zero
+facilities ships nothing (#6684), a filter term with an empty action does not
+discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
+(#7457).
+
+**Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
+`node.Children` directly** when compiling a stanza that accepts a packed body.
+
+### Why it is schema-driven
+
+The packed tail does NOT expand uniformly, which is why a split on whitespace is
+wrong and why fixing one site by hand does not generalise:
+
+| packed | expands to | shape |
+|---|---|---|
+| `ids-option s1 icmp ping-death` | `[icmp]` -> `[ping-death]` | a chain |
+| `host 10.0.0.1 any any` | `[any any]` | ONE two-key leaf |
+| `term t1 then discard` | `[then]` -> `[discard]` | a chain |
+
+How many tokens each level swallows is a property of the grammar, and the
+grammar already has a single source of truth: `setSchema`, whose
+`schemaNode.args` is "extra tokens consumed as part of this node's key".
+The expander uses `consumeNodeKeys`, the same primitive `SchemaValidate` uses,
+so expansion cannot drift from validation.
+
+A tail that leaves the modelled grammar is returned UNEXPANDED rather than
+guessed — the helper exists to stop configuration being silently dropped, and
+inventing a shape the schema does not describe is another way of doing that.
+
+**A stanza whose leaves are not modelled in `setSchema` cannot be expanded**,
+because an unmodelled keyword cannot be resolved and the expander declines
+rather than guessing. That was the blocker on #6683: `security screen ids-option
+<p> icmp` modelled only `fragment`. The screen subtree is now modelled in full
+(#6683/#7460) — every check flag plus every sub-knob — which also gives those
+leaves `?` completion and `SchemaValidate` reach that they never had.
+
+Modelling a subtree is not free, and the screen case is the worked example of
+what else has to move with it:
+
+- **Sub-knob children are load-bearing, not decoration.** `flood` modelled as a
+  bare flag makes the expander stop at `[flood]` and silently DROP a trailing
+  `threshold 500` — the same silent weakening the issues are about. Model the
+  value, or do not model the parent.
+- **Modelling changes flat-set token grouping.** `ast_edit.go` keys on
+  `args`/`children`/`compoundKey`/`multi`, so a value that used to collapse onto
+  `Keys` now parks as a CHILD. Any compiler reading a fixed `Keys` index for
+  that value breaks on a path that worked. `flood` read `Keys[2]` while its
+  siblings read `Children`; single-sourcing all four onto the child shape is
+  what made the change safe (#7460).
+- **It moves trailing-garbage detection from `Keys` to `Children`.** A modelled
+  childless leaf parks flat-set trailing tokens as children, so a compiler
+  calling only `recordKeyExtras` stops seeing them and the #3332/#3318 gate goes
+  quiet. Arm `recordChildExtras` on every leaf you model.
+- **It can add entries to the #2419 spelling-differential gate.** Ten bare flags
+  legitimately name a different garbage token per spelling. Allowlisting that is
+  a CLAIM, so it is paired with a test asserting the commit decision is REJECT
+  in BOTH spellings — otherwise the allowlist would hide a fail-open.
+
+### Where it is NOT done
+
+Expansion is deliberately not done in the parser. `show configuration` renders
+from the AST, so normalising at parse time would rewrite the operator's packed
+one-liner into nested form on display — a round-trip fidelity change well beyond
+fixing the compile-time drops.
+
 ## Operational tree → `pkg/cmdtree`
 
 `run` / `show` / `clear` / `request` / `monitor` / `ping` / `traceroute`
@@ -46,6 +134,57 @@ sibling aspect files in the same package (`schema_security.go`,
 Because completion (3) and validation (4) read the SAME node, they cannot
 drift — typing a leaf fixes both `set ... ?` help and `commit check`
 rejection together.
+
+## Typed WILDCARD identity slots (`keyValidator` on a wildcard, #6834)
+
+A `keyValidator` on a **named-keyword** node validates the arg token(s) that
+follow the keyword — `unit <n>`, `address <cidr>`. The walker implements that as
+`node.Keys[1:1+args]`.
+
+A **wildcard** node is different: its identity IS the keyword, at `Keys[0]`, and
+it declares no args. So the arg span is `Keys[1:1]` — empty — and before #6834 a
+`keyValidator` on a wildcard validated **nothing at all** and returned nil. Every
+one of the schema's existing `keyValidator`s sat on a `<keyword> <arg>` slot, so
+the gap had no instance and no symptom until an interface name needed gating.
+
+`walkSchemaNode` now validates a wildcard's own keyword as identity slot 0.
+Which of the two cases applies is decided by a single hoisted `exactMatch`
+local, read by both the scalar-value-leaf rule and this one — two copies of
+"was this an exact match?" could only ever disagree by mistake.
+
+**Precondition, verified rather than assumed.** `exactMatch` is
+`parent.children[keyword] == childSchema`, a POINTER comparison. If any parent
+registered the same `*schemaNode` as both a named child and as its wildcard, the
+predicate would report EXACT for a wildcard match and this gate would silently
+stop running — no failure, just unvalidated config again.
+`TestNoSchemaNodeIsBothChildAndWildcard_6834` walks the whole schema (1464 nodes,
+0 aliases at the time of writing) to keep that true, and
+`TestAliasDetectorFindsARealAlias_6834` plants an alias so the detector itself
+cannot rot into a tripwire that never fires.
+
+### `interfaces <name>` is the first typed wildcard identity
+
+The interface name is interpolated into four sites in the generated systemd
+units, and one of them — `[Match] Name=` in the `.network` file — systemd reads
+as a **whitespace-separated list of shell-style globs, matching the device name
+or its alternative names**. An unvalidated name does not corrupt the unit file;
+it makes one `.network` claim SEVERAL interfaces.
+
+`ValidateInterfaceName` is an **allowlist**: letters, digits, `-`, `.`, `_`, `/`.
+The slash is included because the Junos spelling `ge-0/0/0` is the documented
+form and is canonicalised to `ge-0-0-0` downstream.
+
+**Do not "simplify" it into a call to `sanitizeUnitValue`.** That helper maps
+control bytes to a SPACE, which for a whitespace-separated list is the
+SEPARATOR — it would turn one pattern into two, each claiming devices. Applying
+the safe-looking neighbouring helper to this sink is strictly worse than
+rendering the field raw.
+
+**No length bound**, deliberately: `IFNAMSIZ` applies to the DERIVED kernel name
+(slashes folded, `.<unit>` appended), so a bound here would have to model that
+derivation, and a validator wrong in the *rejecting* direction turns a working
+config into a failed commit with no operator workaround (the #6564
+`ValidateOSPFArea` lesson, where a `>= 1` floor would have refused OSPF area 0).
 
 ## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
 
@@ -498,6 +637,60 @@ peer-view wiring (node0 accepts the peer-only overlap). The shipped `test/incus/
 `test/incus/xpf-cluster-fw0.conf` each carried the cross-feature overlap (one
 pool drawn by both NAT64 and a source-NAT rule) and were separated into distinct
 pools + proxy-ARP as part of this change.
+
+### Duplicate `system login user` name (#6992)
+
+The same `user` name authored in two `system login` blocks was WORSE than the
+last-writer-wins drop the #5180 gate covers: both blocks survived in
+`Login.Users`, and two readers picked DIFFERENT ones.
+
+| reader | picks |
+|---|---|
+| `configuredClass` (`pkg/cli/identity.go`) | the FIRST block with a non-empty class |
+| `applySystemLogin` (`pkg/daemon/daemon_system.go`) | iterates every block in order, so the account state that lands comes from the LAST |
+
+Measured on a config that committed CLEAN at strict:
+
+```
+user alice { uid 2001; class admins; authentication { ssh-rsa "K1"; } }
+user alice { uid 2002; class ops;    authentication { ssh-rsa "K2"; } }
+```
+
+`applySystemLogin` rewrites `authorized_keys` per entry with
+`WriteFileDurable`, so **K2** — the key the operator wrote under the VIEW-only
+block — is the one on disk, while `configuredClass` answered **admins**. The
+credential that authenticates and the class that authorizes it came from
+different blocks, in the permissive direction. This is the third instance of the
+class in this area: #6861 keyed an advisory on a name the runtime resolved
+differently, #6838 keyed a fold on a class name the runtime picked differently.
+
+**The fix is a fold, not a matched tie-break.** `compileSystemLogin` collapses a
+duplicated name into ONE entry with per-LEAF last-authored-wins — which is what
+the FLAT spelling already produces, because `SetPath` merges `set system login
+user alice …` written twice onto one node and replaces each leaf. That makes the
+two AST shapes agree (the #5180 dual-AST-equivalence property) rather than
+inventing a third answer, and it is stronger than teaching one reader the
+other's tie-break: after the fold there is no tie to break. #6838 records why the
+weaker form is wrong — matching a tie-break is a proxy that rots the day the
+other reader changes.
+
+Per-LEAF, not per-block: a second block authoring only a `class` must leave the
+first block's `uid` in place, because that is what the flat spelling gives.
+Folding to the last BLOCK would silently zero it.
+
+The `authentication` section is the one exception — a later block's section
+replaces the earlier block's key set wholesale rather than merging into it. That
+is chosen so the fold preserves the PROVISIONED state exactly: `authorized_keys`
+is already rewritten per entry, so the last entry's keys are already the ones on
+disk.
+
+`system login user` is also registered in the #5180 duplicate-named-block gate,
+because a fold is still a silent drop of the earlier block's uid / class / keys.
+Strict rejects; the tolerant load / peer-sync path warns and boots (#1960).
+
+Deliberately NOT applied to `system login class`: #6838 already made the class
+cohort reader-independent by folding permissions across the whole same-named
+set, and a merge here would fight that design.
 
 ### Duplicate NAT rule name (#5649, C181-M18)
 
@@ -1278,6 +1471,45 @@ empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
 
+**Two of those leaves accept ONE value permanently, and #6674 ratified that
+rather than implementing the list.** #6673 fixed the READ half for both — every
+authored value now reaches validation and a multi-valued list is hard-REJECTED
+at commit, warned on the tolerant path — but the scalar the runtime installs is
+still a single value at three successive layers. Six source sites told the
+reader a follow-up was coming; none is. The two arms ratify for DIFFERENT
+reasons, and conflating them is how the wrong decision gets made for the pair:
+
+- `security nat static … rule … match destination-address`: **Junos takes one
+  prefix here**, so the schema's `multi: true` is an xpf over-advertisement of
+  the grammar, not a promise. A static-NAT rule is a 1:1 mapping — one `match
+  destination-address` against one `then static-nat prefix` — so N external
+  prefixes against one internal prefix names no target, and fanning the rule
+  into N rows would have to invent a pairing Junos does not define. `rule R1` /
+  `rule R2` already expresses the intent.
+- `routing-options forwarding-table export`: **Junos genuinely takes a policy
+  CHAIN**, so "the schema over-advertises" is not available here — and neither
+  is the tempting shortcut "a chain is equivalent to its first policy", which
+  was MEASURED FALSE (`pkg/frr/forwarding_export_chain_6674_test.go`: for a
+  plain first policy and a load-balancing second, the first-policy reading gives
+  `maximum-paths` 0 and the OR-composed chain gives 64). It ratifies for a
+  structural reason instead: `resolveECMP` derives exactly two booleans from the
+  ONE named policy — any term with a load-balance action sets `ecmpMaxPaths` to
+  64, any `consistent-hash` term sets `ConsistentHash` — and evaluates no `from`
+  match, term order, or terminating action. Junos evaluates an export chain PER
+  ROUTE and stops at the first terminating action, so the cheap composition
+  (OR across the chain) is not Junos, and the faithful one is not expressible at
+  all because the value being derived is FRR's GLOBAL `maximum-paths`. A chain
+  needs a per-route forwarding-policy model xpf does not have — a feature,
+  tracked as its own issue, not a defect in the multi-value read.
+
+The operator-facing half is pinned behaviourally rather than by comment:
+`TestRatifiedGatesDoNotPromiseAFollowUp_6674` compiles each config on the
+tolerant path and asserts the warning the operator READS neither promises a
+follow-up nor drops the reason, with the still-rejects/still-commits pair as its
+green control. A comment that rots is bad; a warning that promises a feature
+which is never coming is worse, because the operator acts on it — they leave the
+list in place and wait.
+
 **SIX leaf families, SEVEN read sites AT #6673 — the category table above has
 FOUR rows and is not the inventory.** (The table is appended to as later fixes
 land; row 8 is #6687's, and the counts in this sentence describe #6673 only.) The four rows classify EMPTY-VALUE semantics, and
@@ -1544,6 +1776,87 @@ single-site mutations were run, each localising to its own assertion with
 `go build` and `go vet` at exit 0 — including one that narrows ONLY the
 leading-dash gate (leaving the read widened) and one that swaps `api-key` to the
 empty-skipping reader.
+
+### #6696: the two dhcp-local-server list leaves, and why they take DIFFERENT readers
+
+`system services dhcp-local-server group <g> interface` and `... group <g> pool
+<p> dns-server` were read with `nodeVal`, so a bracketed list — which the lexer
+collapses onto ONE node's `Keys` — compiled its first member and dropped the
+rest. The group served only its first interface (the second segment got **no
+leases at all**, a failure that looks like a network problem rather than a config
+one) and a pool offered one resolver where two were configured, so the operator's
+redundancy was simply absent.
+
+**The failing axis is BRACKETED-vs-repeated-leaf, not strict-vs-tolerant.**
+Measured at `origin/master` before the fix:
+
+| spelling | strict | tolerant |
+|---|---|---|
+| `interface [ ge-0/0/0.0 ge-0/0/1.0 ]` | `["ge-0/0/0.0"]` | `["ge-0/0/0.0"]` |
+| two `set … interface <v>` lines | both | both |
+
+The issue that reported this named the tolerant path as the one that mattered. A
+reader who tested only that path would have found the drop there, concluded the
+strict commit path was safe, and been wrong. The strict-path result makes the HA
+argument STRONGER, not weaker: a bracket-authored group is narrowed at the
+ORIGINAL commit, so both cluster nodes agree — on the wrong value — and there is
+no divergence to notice. The tests therefore compile every case on BOTH paths and
+assert the two AGREE.
+
+**Both leaves are now modelled, and modelling is what made the fix decidable.**
+Neither leaf existed in `setSchema` at all, so the grammar said nothing about how
+many tokens they take. Both families' `group` subtrees are now ONE function,
+`dhcpLocalServerGroupSchema` — a divergence between v4 and v6 is always a bug
+(the compiler is one function with an `isV6` flag), so it is made
+unrepresentable rather than merely tested against.
+
+**They take different readers, and that is the point:**
+
+- `pool dns-server` is a plain value list (`multi: true`, `children: nil`,
+  `ValidateIPAddress`), read with `firewallMatchValues` — both sides, every key
+  of every child. Modelling it also brought it under the spelling-differential
+  gate, which immediately caught a `Keys`-only first attempt as class-C INERT in
+  spelling B (`dns-server { v1; v2; }`), a shape the old `nodeVal` fallback did
+  handle.
+- `group interface` is NOT a plain value list. It is the one leaf here carrying
+  per-interface Junos MODIFIERS (`interface ge-0/0/0.0 exclude`, `…
+  upgrade-server <addr>`), so it is `multi: true, valueList: true` with those
+  modifier keywords modelled as CHILDREN — the #3872 static-route `next-hop`
+  precedent, whose doc comment uses this exact `interface` modifier as its
+  example. `valueList` absorbs a trailing token that is neither a sibling nor a
+  known child (the bracket list) while still DESCENDING when the next token names
+  a known child (the modifier). xpf parses and ignores every one of those
+  modifiers — as it did before, where the single-value read dropped them — and
+  they are modelled so the grammar has somewhere to park them other than the
+  value list.
+
+  `dhcpGroupInterfaceValues` then reads `Keys[1:]` when the statement names an
+  interface on its own line (any child is then a modifier BODY), and every key of
+  every child only for a bare `interface { … }` value block, whose values have
+  nowhere else to live. Using `firewallMatchValues` here would PROMOTE `exclude`
+  into the interface list — the #6673 promotion class, but with an unusually
+  sharp consequence: `group.Interfaces` is handed to Kea verbatim as
+  `interfaces-config.interfaces`, and one name no device answers to takes the
+  WHOLE DHCP server down, not just that group. **The differential gate does not
+  state that direction** — it detects a DROPPED value, not a PROMOTED modifier.
+  Measured rather than assumed: swapping in `firewallMatchValues` DOES red the
+  gate, but only INDIRECTLY, at the modelled `interface <if> <modifier>` sub-leaf
+  sites — which exist only because the modifiers are modelled. Delete those
+  children and the gate goes green with the promotion still present, and only
+  `TestDHCPGroup6696PerInterfaceModifierIsNotAnInterface` reds. The property is
+  owned by that test, not by the gate.
+
+**A widened read needs a widened validator.** Before the fix only slot 0 could
+reach a consumer, so a malformed element past it was inert; now every element is
+installed. `dns-server` carries `ValidateIPAddress`; `interface` carries
+`keyValidator: ValidateInterfaceName` — keyValidator rather than validator
+because the node declares children, so its values ride the identity KEY slot and
+it is the #5726 `valueList`+`keyValidator` arm of the schema walk that checks
+EVERY packed value instead of only the first. Both run on the strict commit /
+commit-check path only (`schemaValidateExpandedTreeForNode`, `pkg/configstore`),
+so an already-persisted config still boots (#1960).
+
+Fail-on-revert covered by `pkg/config/compiler_dhcp_group_multivalue_6696_test.go`.
 
 ### A widened read must not PROMOTE a token the old reader discarded (#6673)
 
@@ -2602,12 +2915,26 @@ is what Junos renders (one statement per line).
 
 Consequences worth knowing when adding a reader:
 
-- **The schema walker does not see this shape at all.** `SchemaValidate` walks
-  the AST from `setSchema`, and a packed tail sits below the depth it reaches,
-  so a typed leaf's `validator` never fires on it. A range/arity gate that must
-  cover the packed spelling has to run on the COMPILED struct
-  (`validateChassisClusterStrict`), not on the schema — which is only true once
-  the packed shape actually compiles.
+- **The schema walker does not see this shape** — unless the subtree is
+  NORMALIZED before the walk. `SchemaValidate` walks the AST from `setSchema`,
+  and a packed tail sits below the depth it reaches, so a typed leaf's
+  `validator` never fires on it. Two answers exist, and which one is available
+  depends on whether the packed body can be split back into statements:
+  - Where it can, split it **before both consumers**. `chassis cluster`
+    (#6672, below) expands its packed body into children at the top of
+    `SchemaValidateWithDefinitions` and inside `compileChassis`, so the
+    EXISTING typed-leaf validators fire on the packed spelling unchanged. That
+    is strictly better than a parallel gate: there is one bounds table, and it
+    is the one the container spelling already uses.
+  - Where it cannot, the gate has to run on the COMPILED struct
+    (`validateChassisClusterStrict`), not on the schema — which is only true
+    once the packed shape actually compiles.
+
+  Either way, **making a packed spelling compile without also making it
+  validate opens a range-gate escape that did not exist before**: while the
+  packed form compiled to nothing, the missing walker coverage was inert. This
+  is not hypothetical — `cluster-id` is one byte of the RETH virtual MAC and
+  `reth-advertise-interval` is a 12-bit VRRP wire field.
 - **Silently compiling to nothing is the worst of the three options.** A
   statement whose packed spelling is genuinely unsupported must be REJECTED at
   commit with an actionable error. `services ip-monitoring` (a different
@@ -2616,6 +2943,55 @@ Consequences worth knowing when adding a reader:
   compiled routes is a hard commit error ("at least one then preferred-route
   route is required"), so the operator is told rather than left with a silent
   no-op.
+- **`chassis cluster` is the whole-stanza case (#6672).** The same shape one
+  level ABOVE the redundancy group dropped the ENTIRE cluster configuration.
+  Four spellings exist and three were silently empty:
+
+  ```
+  chassis { cluster { cluster-id 1; node 0; } }   # container  -> compiles
+  chassis { cluster cluster-id 1 node 0; }        # packed body -> ClusterConfig, every field zero
+  chassis cluster { cluster-id 1; node 0; }       # keyword packed onto the chassis line -> Cluster == nil
+  chassis cluster cluster-id 1 node 0;            # fully packed -> Cluster == nil
+  ```
+
+  A fifth arrives from the child side — `cluster { node 1 reth-count 2; }`, one
+  child carrying two statements — and is split the same way. `compileChassis`
+  reads the body with `FindChild`, i.e. off `.Children`, so a packed body was an
+  empty stanza: no cluster-id, no node identity, no control PSK, no fabric
+  addresses, no redundancy groups, and a clean `commit` with
+  `show configuration` echoing what the operator wrote.
+
+  `clusterStatements` (`compiler_chassis_cluster_packed.go`) is the SSOT for the
+  statement set and each statement's value arity, and `clusterBodyStatements` is
+  the splitter. Two properties are specific to this level and worth carrying:
+
+  - **It nests, so `packedStatementPropsArity` (#6665) is not enough.** That
+    helper is flat: any registered keyword re-arms it. The cluster and
+    redundancy-group tables OVERLAP on exactly one token, `node` — the cluster's
+    own identity and a group's per-node priority — so under the flat rule
+    `redundancy-group 1 node 0 priority 200` re-arms at `node`, setting the
+    CLUSTER's node identity and dropping the group's election priority. That is
+    the #6588 failure reintroduced one level up. The rule is: once
+    `redundancy-group` opens, a token re-arms only if it is `redundancy-group`
+    itself or a cluster statement that is NOT also a redundancy-group statement.
+    Overlap resolves to the INNER scope; cluster-only statements written after a
+    packed group (`... redundancy-group 1 preempt reth-count 2`) still compile.
+  - **The #6665 value-slot reservation crosses the boundary.** While a
+    redundancy-group tail is open the splitter honours
+    `redundancyGroupStatementArity`, so `interface-monitor reth-count weight 255`
+    keeps a monitored interface literally named after a CLUSTER keyword instead
+    of re-arming the outer splitter. `ValidateDeviceMapLogicalName` admits
+    keyword-shaped names, so that is a name an operator can configure.
+
+  Two divergences the work surfaced, both tracked separately rather than folded
+  in: `fabric1-interface` and `fabric1-peer-address` are compiled by
+  `compileChassis` but absent from `schemaChassis` (no completion, no
+  validator), and `additional-authentication-key` / `control-ports` /
+  `private-rg-election` sit on the other side of that line for stated reasons.
+  `TestClusterSplitterAndSchemaAgree_6672` binds the set in both directions with
+  the exception list as an EQUALITY, so the exception cannot outlive the
+  divergence it documents.
+
 - **`system login` is the fail-closed example with a dedicated gate (#6662).**
   Where `ip-monitoring` gets its rejection for free (an empty policy is
   independently invalid), an empty login class is *structurally* fine, so the
@@ -3497,6 +3873,91 @@ both AST shapes):
   the first port to the VRF and the rest stayed in the DEFAULT table — a VRF
   isolation break. Coverage: `compiler_routing_instance_interface_3904_test.go`
   (both AST shapes + single-value back-compat).
+
+**NAT match address arms read both slots (#6693) — the #4121 defect at five
+sites that were not swept.** Source-NAT `match source-address` /
+`match destination-address`, destination-NAT `match destination-address` /
+`match source-address`, and static-NAT `match source-address` all carried the
+same per-arm either/or (`if len(m.Keys) >= 2 { Keys[1:] } else { Children }`),
+while the four SIBLING arms in the same switch — `source-address-name`,
+`destination-address-name`, `protocol`, `application` — already read both slots.
+
+The reachable input is `match { source-address 10.0.0.0/8 { 192.0.2.0/24; } }`:
+`parseStatement`'s `case TokenLBrace` keeps every key token AND the block, so
+`Keys=["source-address","10.0.0.0/8"]` with `Children=[["192.0.2.0/24"]]`, the
+first branch fires, and the `else if` is structurally unreachable. It commits
+CLEAN — these leaves are untyped (`args: 1, multi: true, children: nil`, no
+validator) in an open-world subtree — and the second prefix never reaches the
+dataplane. Two consequences, and they are independent: the rule silently matches
+LESS traffic than authored (for source NAT that means untranslated egress, i.e.
+an internal source address on the wire), and the dropped value ESCAPES
+`validateNATMatchAddressLiteralsStrict` (#7145), which reasons from the compiled
+list — so a malformed prefix in the child slot committed clean.
+
+It is NOT reachable from flat-set: for a `multi` leaf with no children `SetPath`
+always emits a leaf at the same level and never descends, so a flat replay
+produces packed Keys or sibling leaves and never both slots. That is worth
+recording, because a prior investigation enumerated the flat and one-slot
+hierarchical spellings, found perfect agreement, and concluded the shape was
+unreachable and a fix would be unfalsifiable. The enumeration was sound; it was
+not exhaustive.
+
+The five arms now use `natMatchAddressValues`
+(`compiler_nat_match_values.go`), which accumulates both slots. It is
+deliberately NEITHER of the two existing readers, and both alternatives were
+measured rather than reasoned about:
+
+- **not `firewallMatchValues`** (what the siblings use): it DROPS empty tokens,
+  and here an authored empty is not absence. Switching these arms to it turned
+  five #7216 subtests from reject to commit-clean, because `match
+  source-address ""` no longer reached the compiled list that
+  `validateStaticNATSelectedMatchAddressStrict` reasons from. Fixing a
+  fail-closed drop by opening a fail-open hole is worse than the drop.
+- **not `multiLeafAuthoredValues`** (#6673, which does keep empties): it
+  synthesizes ONE empty value for a node with no value slot at all, to keep
+  `values[0] == nodeVal(n)` total for a SELECTION leaf. These arms have no such
+  scalar invariant, and a bare `source-address;` compiling to `[""]` would make
+  the Rust `source_constrained` flag true over a prefix that parses as nothing —
+  the rule then matches NOTHING instead of leaving the criterion absent.
+
+So: accumulate both slots, keep empties, synthesize nothing. It reads every KEY
+of each child rather than `child.Name()`, per #6714.
+
+**The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
+SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
+puts values in both AST slots of one node, which is exactly what an either/or
+reader cannot see. Across the whole schema it moved ONE site beyond the five it
+was added for, and that site is not a defect: `system archival configuration
+archive-sites` puts a per-site MODIFIER block under an authored value
+(`archive-sites a { password S; }`), so its child is not a member and dropping it
+is correct. That is recorded in a third category,
+`mixedChildIsAModifierBlock` — separate from `notAValueList` (the leaf is not a
+list in ANY spelling) and from `knownSpellingInconsistencies` (a tracked
+DEFECT), because neither of those is true here and using either would state
+something false.
+
+**The sharpest statement of the defect is a PERSISTENCE divergence.** The mixed
+shape round-trips two different ways and they used to disagree with each other.
+`ConfigTree.Format()` re-renders it verbatim (value in the identifier slot, tail
+in the block), while `FormatSet()` — the spelling the configstore persists and
+the CLI replays — renders it PACKED (`set … match source-address 10.0.0.0/8
+192.0.2.0/24`). Both re-parse to a ONE-SLOT shape the either/or reader handled
+correctly, so one config text had two meanings: as authored it matched only the
+first prefix, and after any save/load cycle through the set spelling it matched
+both. A rule silently WIDENS on the next reboot while `show | compare` reports no
+change. `TestMixedShapeAgreesWithItsOwnPersistedRendering_6693` asserts the three
+readings AGREE rather than pinning any one of them to a hand-written expectation.
+
+Coverage is per-arm on both compile paths. The five arms are each asserted under
+STRICT `CompileConfig` and tolerant `CompileConfigLenient`, agreeing with each
+other before either is compared to the authored pair, and each is separately
+shown to carry a malformed tail INTO its strict gate (three different gates cover
+the five arms) while the tolerant path still ACCEPTS it — the #1960 no-brick
+half, since a box can already hold a config whose tail never reached a gate. The
+static-NAT fixture carries a valid `match destination-address` sibling for the
+same reason the issue names: without it the #7216 "selected external prefix is
+MISSING" gate fires first and its rejection is indistinguishable from the gate
+under test firing on the tail.
 
 **Policy match source-/destination-address/application share the reader
 (#4121, divergence-elimination, NOT a fail-open).** `compilePolicy`
@@ -4814,6 +5275,57 @@ is exactly the repetition). The ordered list lands in `PolicyTerm.ASPathPrepend
 `pkg/config/compiler_as_path_prepend_2892_test.go` (parse) and
 `TestGeneratePolicyOptions_ASPathPrepend` in
 `pkg/frr/policy_as_path_prepend_2892_test.go` (render).
+
+### The as-path REGEX is the whole token tail, and it is validated (#6686)
+
+`policy-options as-path <name> <regex>` is a `args: 2, multi: true` schema node
+(`schema_routing.go`), so the definition's regular expression is the node's
+whole trailing token run — not one key. The two spellings of one value land
+differently:
+
+| authored | Keys |
+|---|---|
+| `as-path AP1 ".* 65000 .*"` | `["as-path" "AP1" ".* 65000 .*"]` (one lexer string token) |
+| `as-path AP1 .* 65000 .*` | `["as-path" "AP1" ".*" "65000" ".*"]` |
+
+Reading `Keys[2]` alone kept the FIRST token of the unquoted spelling, compiling
+`.* 65000 .*` down to `.*` — the whole-path wildcard. A `from as-path AP1; then
+accept` term built on that definition accepts **every** BGP path instead of only
+those transiting AS 65000: a route-leak / hijack-acceptance exposure that
+committed clean with zero warnings, in BOTH the flat-`set` and hierarchical
+spellings, while `show configuration` displayed the authored regex back
+verbatim. The same widening applied one level down, to a hierarchical brace body
+(`as-path AP1 { .* 65000 .*; }`), whose regex tokens land on a CHILD leaf's
+`Keys` and were read as `entry.Keys[0]`.
+
+`ASPathRegexFromTokens` (`aspath_regex.go`) rejoins the tail with single spaces
+at both sites. That is reconstruction, not a guess: every regex metacharacter
+that is also lexer syntax (`^`, `{`, `}`, `|`, `[`, `]`, `;`, `"`) either fails
+to lex unquoted or is stripped, so an unquoted regex reaching the compiler is a
+whitespace-separated run of identifier tokens. FRR's `bgp as-path access-list`
+DEFUN ends in a variadic `LINE...` that `argv_concat` rejoins with single
+spaces, which is what makes a multi-AS pattern expressible at all — so the join
+matches what FRR itself does with the rendered line.
+
+**The regex is validated, at three layers with one predicate.** `ValidASPathRegex`
+(`aspath_regex.go`) rejects an EMPTY regex — reachable with no diagnostic at all
+via `set policy-options as-path AP1` with no value — and one that is not a valid
+POSIX ERE. Either renders a line frr-reload rejects (an incomplete command, or a
+regcomp failure), and a single `CMD_WARNING_CONFIG_FAILED` exits the whole vtysh
+add-batch non-zero, failing the ENTIRE reload and leaving every dynamic routing
+change stale. `validatePolicyASPathRegexStrict` hard-rejects on commit /
+commit-check; the tolerant load / peer-sync paths downgrade to a warning
+(`lenientPolicyASPathRegex`, the #1960 no-brick class); and `generatePolicyOptions`
+(`pkg/frr/policy_render.go`) OMITS an unrenderable definition so the leniently
+loaded config cannot poison the reload — FRR resolves a `match as-path <name>`
+with no such list to NO MATCH, confining the damage to the referencing terms.
+The three layers share `ValidASPathRegex` so they cannot drift.
+
+Fail-on-revert covered by `pkg/config/compiler_as_path_multitoken_6686_test.go`
+(five spellings asserted to AGREE and to equal the authored regex, the empty and
+malformed strict/lenient legs, and a tightening control that commits nine real
+AS-path regexes clean) and `pkg/frr/policy_aspath_regex_6686_test.go` (the
+multi-token regex renders whole; the unrenderable ones are omitted).
 
 ### Repeated policy-statement blocks MERGE, not last-win (#5824)
 

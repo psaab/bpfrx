@@ -32,7 +32,7 @@ func TestBuildSnapshotIncludesThreeColorPolicerSchema(t *testing.T) {
 		},
 	}
 
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if !snap.Capabilities.ForwardingSupported {
 		t.Fatalf("ForwardingSupported = false, want three-color policers admitted. Reasons: %+v", snap.Capabilities.UnsupportedReasons)
 	}

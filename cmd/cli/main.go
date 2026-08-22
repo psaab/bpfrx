@@ -572,7 +572,8 @@ func (c *ctl) handleLoad(args []string) error {
 			return err
 		}
 	} else {
-		data, err := os.ReadFile(source)
+		// #6753: bound the READ, not just the post-read length.
+		data, err := configstore.ReadBoundedConfigFile(source)
 		if err != nil {
 			return fmt.Errorf("load: %v", err)
 		}

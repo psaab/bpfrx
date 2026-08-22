@@ -161,8 +161,10 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 					"the ECMP render honours AT MOST ONE policy (the one the wrapped "+
 					"error names — none at all when the selected value is empty) and "+
 					"the rest have no "+
-					"effect on load-balancing; configure one export policy (support for the Junos "+
-					"export policy CHAIN is tracked in #6674). Downgraded to a warning on the "+
+					"effect on load-balancing; configure one export policy. xpf models "+
+					"forwarding-table export as a GLOBAL ECMP toggle derived from one "+
+					"policy, not as a per-route Junos policy chain, so a chain has no "+
+					"representable meaning here (#6674). Downgraded to a warning on the "+
 					"tolerant load / peer-sync path so an already-persisted config still boots: %v", err))
 		} else {
 			return err
@@ -187,6 +189,29 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 		if opts.lenientPolicyCommunityRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy community reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
+	// #6686: as-path regex gate. `policy-options as-path <name> <regex>`
+	// renders one `bgp as-path access-list <name> permit <regex>` line. An
+	// EMPTY regex (reachable with no diagnostic: `set policy-options as-path
+	// AP1` alone) is an incomplete FRR command, and a malformed one fails
+	// FRR's regcomp — either is a CMD_WARNING_CONFIG_FAILED, and a single
+	// vtysh -f add-batch exits non-zero on any of those, failing the WHOLE
+	// reload and leaving dynamic routing stale. Strict on commit /
+	// commit-check (hard reject naming the as-path and the line that would be
+	// rendered); lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960; the render path carries the
+	// ValidASPathRegex belt that keeps the unrenderable definition out of
+	// frr.conf on that path). Runs on the fully-compiled *Config so the
+	// as-path map is populated regardless of authoring order. Mirrors
+	// validatePolicyCommunityReferencesStrict.
+	if err := validatePolicyASPathRegexStrict(cfg); err != nil {
+		if opts.lenientPolicyASPathRegex {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy as-path regex (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return err
 		}

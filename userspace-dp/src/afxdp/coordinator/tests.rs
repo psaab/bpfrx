@@ -2340,6 +2340,10 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
 /// and this assertion fails.
 #[test]
 fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut coordinator = StoppedCoordinator::wrap(gre1881_coordinator_with_worker()); // #6637
     assert!(
         !coordinator.workers.records.is_empty(),
@@ -4067,6 +4071,10 @@ fn reconcile_missing_session_pin_keeps_prior_generation_published() {
 /// fixtures; here we only assert the publish happened.
 #[test]
 fn reconcile_all_mandatory_maps_open_advances_published_generation() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut coordinator = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
@@ -5026,6 +5034,10 @@ fn rejected_apply_does_not_prune_live_zone_counters_6832() {
 
 #[test]
 fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     // POSITIVE direction, reconcile call site. Anti-over-fix: deferring the
     // prune must not DELETE it. Same zone move, but the workers come up, so the
     // apply commits and zone 200 is dropped.
@@ -5328,6 +5340,10 @@ fn zone_flood_counters_drops_a_zone_that_lost_its_slot_3651() {
 /// preflight-zone-source fix prevents.
 #[test]
 fn reconcile_fresh_boot_concrete_zone_policy_passes_preflight_3402() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut coordinator = StoppedCoordinator::new(); // #6637
     // Fresh coordinator: the live forwarding zone table is EMPTY (the bug
     // condition — the snapshot carries the zones, the live table does not yet).
@@ -5741,6 +5757,10 @@ fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
 /// failure).
 #[test]
 fn reconcile_empty_optional_pins_advance_published_generation() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut coordinator = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
@@ -5776,6 +5796,10 @@ fn reconcile_empty_optional_pins_advance_published_generation() {
 /// healthy configured map).
 #[test]
 fn reconcile_present_optional_pins_open_ok_advance_generation() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut coordinator = StoppedCoordinator::new(); // #6637
     let prior = ValidationState {
         snapshot_installed: true,
@@ -6163,6 +6187,10 @@ fn multi_fault_map_pins_use_two_pass_precedence_from_both_paths_6243() {
 /// — proving each walks and opens the FULL bundle before returning Ok.
 #[test]
 fn both_paths_open_full_seven_pin_bundle_before_ok_6243() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut pins = all_map_pins_ok_6243();
     pins.conntrack_v4 = format!("{TEST_MAP_PIN_OK}conntrack_v4");
     pins.conntrack_v6 = format!("{TEST_MAP_PIN_OK}conntrack_v6");
@@ -6630,7 +6658,22 @@ fn await_neigh_monitor_count(want: usize) -> usize {
 /// Preventing the spawn reds the first.
 #[test]
 fn coordinator_bringup_does_not_leak_a_neigh_monitor_thread_6637() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let before = neigh_monitor_thread_count();
+    // #7413 anti-rot precondition. The guard above makes this hold; an
+    // ELEVENTH spawner added without taking it breaks it, and this fails
+    // naming the missing lock instead of failing later as an off-by-one delta
+    // that reads like a real monitor leak.
+    assert_eq!(
+        before, 0,
+        "a neigh-monitor thread is already running when this gate started \
+         (before={before}). Either a sibling test spawned one without taking \
+         neigh_monitor_test_serial(), or a previous test leaked one; both make \
+         the deltas below measure the wrong thing (#7413)"
+    );
 
     let mut coordinator = Coordinator::new();
     zone_counter_live_coordinator(&mut coordinator);
@@ -6671,7 +6714,22 @@ fn coordinator_bringup_does_not_leak_a_neigh_monitor_thread_6637() {
 /// Deleting the `Drop` impl reds this.
 #[test]
 fn stopped_coordinator_guard_joins_the_neigh_monitor_on_drop_6637() {
+    // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak
+    // gates read the PROCESS-WIDE count of those. Held for the whole body so a
+    // parallel sibling cannot move that count inside their window.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let before = neigh_monitor_thread_count();
+    // #7413 anti-rot precondition. The guard above makes this hold; an
+    // ELEVENTH spawner added without taking it breaks it, and this fails
+    // naming the missing lock instead of failing later as an off-by-one delta
+    // that reads like a real monitor leak.
+    assert_eq!(
+        before, 0,
+        "a neigh-monitor thread is already running when this gate started \
+         (before={before}). Either a sibling test spawned one without taking \
+         neigh_monitor_test_serial(), or a previous test leaked one; both make \
+         the deltas below measure the wrong thing (#7413)"
+    );
     {
         let mut coordinator = StoppedCoordinator::new();
         zone_counter_live_coordinator(&mut coordinator);

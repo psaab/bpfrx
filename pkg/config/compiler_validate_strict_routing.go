@@ -286,10 +286,25 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 // multi-policy chain silently collapsed to the first — the operator's remaining
 // policies had no effect on load-balancing and nothing said so.
 //
-// Rejecting makes that collapse loud and fails CLOSED. It is deliberately NOT a
-// renderer change: implementing a real policy chain means deciding how several
-// policies compose into one ecmpMaxPaths, which is a routing-semantics design
-// question rather than a multi-value-read fix. Tracked as #6674.
+// Rejecting makes that collapse loud and fails CLOSED, and #6674 RATIFIED it as
+// the permanent contract rather than a pending renderer change.
+//
+// The reason, stated because "Junos takes a chain here" is true and still does
+// not make a chain implementable: resolveECMP (pkg/frr/config_render.go) derives
+// exactly TWO booleans from the ONE named policy — any term with a load-balance
+// action sets ecmpMaxPaths to 64, any term with `consistent-hash` sets
+// fc.ConsistentHash — and evaluates no `from` match, no term order, and no
+// terminating action. Junos evaluates an export chain PER ROUTE and stops at the
+// first terminating action, so the only cheap composition (OR the flags across
+// the chain) is NOT Junos: a route accepted by the first policy never reaches
+// the second, yet the OR would apply the second's load-balance to it. Measured,
+// not assumed — the two readings differ whenever the first policy carries no
+// load-balance term and a later one does, which is pinned by
+// TestForwardingTableExportIsAGlobalToggleNotAChain_6674. The faithful reading
+// cannot be expressed at all: the value being derived is FRR's GLOBAL
+// `maximum-paths`, which has no per-route form. A chain therefore needs a
+// per-route forwarding-policy model xpf does not have — a feature, tracked
+// separately, not a defect in this gate.
 //
 // Strict on commit / commit-check (hard reject); the call site downgrades to a
 // warning on the tolerant load / peer-sync path (#1960 no-brick), where
@@ -1305,6 +1320,63 @@ func validatePolicyReservedChainNameStrict(cfg *Config) error {
 					"silently altering BGP route filtering — rename the "+
 					"policy-statement off the reserved suffix",
 				name, ReservedChainSuffix)
+		}
+	}
+	return nil
+}
+
+// validatePolicyASPathRegexStrict hard-rejects a `policy-options as-path
+// <name>` whose regular expression cannot be rendered into frr.conf at
+// all — an EMPTY regex, or one that is not a valid POSIX extended regular
+// expression (#6686).
+//
+// xpf renders one `bgp as-path access-list <name> permit <regex>` line per
+// definition (pkg/frr/policy_render.go). FRR's DEFUN for that command ends
+// in a variadic `LINE...` parameter which argv_concat joins back with
+// single spaces, which is what makes a multi-AS regex like `.* 65000 .*`
+// expressible at all — but it also means an ABSENT regex is an incomplete
+// command, and a malformed one fails FRR's regcomp. Either is a
+// CMD_WARNING_CONFIG_FAILED, and a single such failure exits the whole
+// vtysh add-batch non-zero: it does not merely drop this one access-list,
+// it fails the ENTIRE frr-reload and leaves every dynamic routing change
+// stale.
+//
+// An empty regex was reachable with no diagnostic at all: `set
+// policy-options as-path AP1` with no value compiled to an ASPathDef with
+// Regex "" and committed clean.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to
+// a warning (opts.lenientPolicyASPathRegex) so an already-persisted or
+// peer-synced config still boots (#1960 fail-closed-on-load class);
+// pkg/frr's ValidASPathRegex belt then keeps the unrenderable definition
+// out of frr.conf on that path, so the reload survives. Commit /
+// commit-check stay strict. Runs on the fully-compiled *Config so the
+// as-path map is populated regardless of authoring order. Mirrors
+// validatePolicyCommunityReferencesStrict.
+func validatePolicyASPathRegexStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// Sort for a deterministic first-error message (the typed-config map
+	// iteration order is otherwise random).
+	names := make([]string, 0, len(cfg.PolicyOptions.ASPaths))
+	for name := range cfg.PolicyOptions.ASPaths {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		ap := cfg.PolicyOptions.ASPaths[name]
+		if ap == nil {
+			continue
+		}
+		if err := ValidASPathRegex(ap.Regex); err != nil {
+			return fmt.Errorf("policy-options as-path %s: %v — xpf renders "+
+				"`bgp as-path access-list %s permit %s`, which frr-reload "+
+				"rejects (failing the entire FRR config load); write the "+
+				"regular expression as a QUOTED value, e.g. "+
+				"`set policy-options as-path %s \".* 65000 .*\"`",
+				name, err, name, ap.Regex, name)
 		}
 	}
 	return nil

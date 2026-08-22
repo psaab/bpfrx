@@ -33,7 +33,7 @@ func TestUserspaceSupportsSimpleZonePolicies(t *testing.T) {
 			Action: config.PolicyPermit,
 		}},
 	}}
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if snap.DefaultPolicy != "deny" || len(snap.Policies) != 1 || snap.Policies[0].Action != "permit" {
 		t.Fatalf("unexpected policy snapshot: %+v", snap.Policies)
 	}
@@ -71,7 +71,7 @@ func TestUserspaceSupportsAddressBookPolicyMatches(t *testing.T) {
 			Action: config.PolicyPermit,
 		}},
 	}}
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
 	}
@@ -109,7 +109,7 @@ func TestUserspaceSupportsNamedApplicationPolicyMatches(t *testing.T) {
 			Action: config.PolicyPermit,
 		}},
 	}}
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 {
 		t.Fatalf("len(Policies) = %d, want 1", len(snap.Policies))
 	}
@@ -138,7 +138,7 @@ func TestUserspaceSupportsGlobalPolicies(t *testing.T) {
 		},
 		Action: config.PolicyPermit,
 	}}
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if len(snap.Policies) != 1 || snap.Policies[0].Action != "permit" {
 		t.Fatalf("unexpected global-policy snapshot: %+v", snap.Policies)
 	}
@@ -324,7 +324,7 @@ func TestUpdatePolicyScheduleStatePublishesUserspaceSnapshot(t *testing.T) {
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 	m.cfg.ControlSocket = controlSock
 	m.generation = 7
-	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
 	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
 
 	m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})
@@ -422,7 +422,7 @@ func TestUpdatePolicyScheduleStateRefusesOldHelperForScheduledPolicies(t *testin
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
 	m.cfg.ControlSocket = controlSock
 	m.generation = 7
-	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, cfg, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
 	m.lastSnapshot.Policies[0].Inactive = false
 
 	m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})
@@ -475,7 +475,7 @@ func TestUpdatePolicyScheduleStateWithoutHelperDoesNotMutateSnapshot(t *testing.
 
 	m := New()
 	m.generation = 7
-	m.lastSnapshot, _ = buildSnapshot(cfg, config.UserspaceConfig{}, 7, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 7, 0)
 	m.lastSnapshot.Policies[0].Inactive = false
 
 	m.UpdatePolicyScheduleState(cfg, map[string]bool{"workhours": false})

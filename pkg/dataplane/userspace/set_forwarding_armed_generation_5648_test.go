@@ -62,9 +62,18 @@ func TestSetForwardingArmedRefusesStaleProtocolMismatch(t *testing.T) {
 	// config snapshot protocol version is STALE (below the required version).
 	m.lastStatus.Capabilities.ForwardingSupported = true
 	m.lastStatus.ForwardingArmed = false
-	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion - 1
-	// Last-applied config REQUIRES ProtocolVersion (scheduler-driven policy).
-	m.lastSnapshot, _ = buildSnapshot(scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
+	// #6648: BELOW THE FEATURE'S FLOOR. This used to say `ProtocolVersion - 1`,
+	// which only produced ErrPolicySchedulerProtocolIncompatible because every
+	// gate compared against the shared constant. Policy-scheduler state has
+	// been representable since v2 (MinProtocolPolicyScheduler), so a helper one
+	// version behind the constant CAN carry this snapshot's scheduler content
+	// and the scheduler gate is the wrong thing to name for it. Retargeted, not
+	// relaxed: the assertion below is unchanged and now runs against a helper
+	// that genuinely cannot represent the feature it names.
+	m.lastStatus.ConfigSnapshotProtocolVersion = MinProtocolPolicyScheduler - 1
+	// Last-applied config carries scheduler-driven policy, so it REQUIRES at
+	// least MinProtocolPolicyScheduler.
+	m.lastSnapshot = mustBuildSnapshot(t, scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
 
 	_, err := m.SetForwardingArmed(true)
 	if !errors.Is(err, ErrPolicySchedulerProtocolIncompatible) {
@@ -102,7 +111,7 @@ func TestSetForwardingArmedArmsWhenProtocolMatches(t *testing.T) {
 	// Helper's accepted image is CURRENT — satisfies the required protocol.
 	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
 	// Same protocol-requiring config as the mismatch test.
-	m.lastSnapshot, _ = buildSnapshot(scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
+	m.lastSnapshot = mustBuildSnapshot(t, scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
 
 	// applyHelperStatusLocked touches a BPF map absent in a unit test, so the
 	// call may return that local-bookkeeping error AFTER the wire arm request

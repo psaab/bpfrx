@@ -244,10 +244,37 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
+		// #6683: `ids-option s1 icmp ping-death;` packs the WHOLE body onto
+		// the ids-option node's Keys, leaving Children empty — every check in
+		// the profile compiled DISABLED while the profile itself survived and
+		// bound to a zone normally, so the operator got no protection from a
+		// check they configured and nothing said so.
+		idsSchema := schemaForPath("security", "screen", "ids-option")
+		body := packedBody(inst.node, idsSchema)
+
+		// screenOpt normalises ONE family-option node so a sub-knob written
+		// packed (`flood threshold 500;`) is read from the same CHILD shape as
+		// the block spelling (`flood { threshold 500; }`). #7460: the two
+		// spellings were read by two different readers — ip-sweep/port-scan/
+		// syn-flood iterated Children and never saw the packed form, so the
+		// configured threshold was silently replaced by the default.
+		screenOpt := func(famSchema *schemaNode, n *Node) *Node {
+			if famSchema == nil || n == nil || len(n.Keys) == 0 {
+				return n
+			}
+			return packedBody(n, resolveSchemaChild(famSchema, n.Keys[0]))
+		}
+		famSchema := func(fam string) *schemaNode {
+			if idsSchema == nil {
+				return nil
+			}
+			return resolveSchemaChild(idsSchema, fam)
+		}
+
 		// #3318: the screen schema subtrees are open. Record any unknown/
 		// unsupported top-level screen family so validateScreenUnknownStrict can
 		// reject the commit fail-closed instead of silently dropping it.
-		for _, fam := range inst.node.Children {
+		for _, fam := range body.Children {
 			switch fam.Name() {
 			case "icmp", "ip", "tcp", "udp", "limit-session":
 				// handled below
@@ -270,19 +297,45 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		icmpNode := inst.node.FindChild("icmp")
+		icmpNode := body.FindChild("icmp")
 		if icmpNode != nil {
-			for _, opt := range icmpNode.Children {
+			icmpSchema := famSchema("icmp")
+			for _, rawOpt := range icmpNode.Children {
+				opt := screenOpt(icmpSchema, rawOpt)
 				switch opt.Name() {
 				case "ping-death":
 					profile.ICMP.PingDeath = true
 					recordKeyExtras("icmp ping-death", opt, 1)
+					recordChildExtras("icmp ping-death", opt)
 				case "fragment":
 					profile.ICMP.Fragment = true
 					recordKeyExtras("icmp fragment", opt, 1)
+					recordChildExtras("icmp fragment", opt)
 				case "flood":
 					recordKeyExtras("icmp flood", opt, 3)
-					if n, ok := parseThresh("icmp flood", numVal(opt, 2)); ok {
+					// #7460: read the threshold from the CHILD shape too, which
+					// is what the expander normalises the packed spelling into
+					// and what ip-sweep / port-scan / syn-flood already read.
+					// Before this, `flood` was the ONLY sub-knob reading Keys,
+					// so it accepted the spelling its siblings rejected and
+					// rejected the one they accepted.
+					floodVal := ""
+					if len(opt.Keys) > 2 {
+						floodVal = opt.Keys[2]
+					}
+					for _, fOpt := range opt.Children {
+						if fOpt.Name() != "threshold" {
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "icmp flood "+fOpt.Name())
+							continue
+						}
+						recordKeyExtras("icmp flood threshold", fOpt, 2)
+						// Prefix is the FLOOD path, not the threshold path: a
+						// trailing token after the value is garbage on `icmp flood`,
+						// and that is the leaf name the #3332 gate reports.
+						recordChildExtras("icmp flood", fOpt)
+						floodVal = numVal(fOpt, 1)
+					}
+					if n, ok := parseThresh("icmp flood", floodVal); ok {
 						profile.ICMP.FloodThreshold = n
 					}
 					// icmp flood enabled without an explicit threshold: arm at
@@ -297,21 +350,26 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		ipNode := inst.node.FindChild("ip")
+		ipNode := body.FindChild("ip")
 		if ipNode != nil {
-			for _, opt := range ipNode.Children {
+			ipSchema := famSchema("ip")
+			for _, rawOpt := range ipNode.Children {
+				opt := screenOpt(ipSchema, rawOpt)
 				switch opt.Name() {
 				case "source-route-option":
 					profile.IP.SourceRouteOption = true
 					recordKeyExtras("ip source-route-option", opt, 1)
+					recordChildExtras("ip source-route-option", opt)
 				case "tear-drop":
 					profile.IP.TearDrop = true
 					recordKeyExtras("ip tear-drop", opt, 1)
+					recordChildExtras("ip tear-drop", opt)
 				case "ip-sweep":
 					for _, swOpt := range opt.Children {
 						switch swOpt.Name() {
 						case "threshold":
 							recordKeyExtras("ip ip-sweep threshold", swOpt, 2)
+							recordChildExtras("ip ip-sweep threshold", swOpt)
 							if n, ok := parseThresh("ip ip-sweep threshold", numVal(swOpt, 1)); ok {
 								profile.IP.IPSweepThreshold = n
 							}
@@ -332,28 +390,36 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		tcpNode := inst.node.FindChild("tcp")
+		tcpNode := body.FindChild("tcp")
 		if tcpNode != nil {
-			for _, opt := range tcpNode.Children {
+			tcpSchema := famSchema("tcp")
+			for _, rawOpt := range tcpNode.Children {
+				opt := screenOpt(tcpSchema, rawOpt)
 				switch opt.Name() {
 				case "land":
 					profile.TCP.Land = true
 					recordKeyExtras("tcp land", opt, 1)
+					recordChildExtras("tcp land", opt)
 				case "winnuke":
 					profile.TCP.WinNuke = true
 					recordKeyExtras("tcp winnuke", opt, 1)
+					recordChildExtras("tcp winnuke", opt)
 				case "syn-frag":
 					profile.TCP.SynFrag = true
 					recordKeyExtras("tcp syn-frag", opt, 1)
+					recordChildExtras("tcp syn-frag", opt)
 				case "syn-fin":
 					profile.TCP.SynFin = true
 					recordKeyExtras("tcp syn-fin", opt, 1)
+					recordChildExtras("tcp syn-fin", opt)
 				case "no-flag":
 					profile.TCP.NoFlag = true
 					recordKeyExtras("tcp no-flag", opt, 1)
+					recordChildExtras("tcp no-flag", opt)
 				case "fin-no-ack":
 					profile.TCP.FinNoAck = true
 					recordKeyExtras("tcp fin-no-ack", opt, 1)
+					recordChildExtras("tcp fin-no-ack", opt)
 				case "syn-flood":
 					sf := &SynFloodConfig{}
 					for _, sfOpt := range opt.Children {
@@ -361,26 +427,31 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 						switch sfOpt.Name() {
 						case "alarm-threshold":
 							recordKeyExtras("tcp syn-flood alarm-threshold", sfOpt, 2)
+							recordChildExtras("tcp syn-flood alarm-threshold", sfOpt)
 							if n, ok := parseThresh("tcp syn-flood alarm-threshold", val); ok {
 								sf.AlarmThreshold = n
 							}
 						case "attack-threshold":
 							recordKeyExtras("tcp syn-flood attack-threshold", sfOpt, 2)
+							recordChildExtras("tcp syn-flood attack-threshold", sfOpt)
 							if n, ok := parseThresh("tcp syn-flood attack-threshold", val); ok {
 								sf.AttackThreshold = n
 							}
 						case "source-threshold":
 							recordKeyExtras("tcp syn-flood source-threshold", sfOpt, 2)
+							recordChildExtras("tcp syn-flood source-threshold", sfOpt)
 							if n, ok := parseThresh("tcp syn-flood source-threshold", val); ok {
 								sf.SourceThreshold = n
 							}
 						case "destination-threshold":
 							recordKeyExtras("tcp syn-flood destination-threshold", sfOpt, 2)
+							recordChildExtras("tcp syn-flood destination-threshold", sfOpt)
 							if n, ok := parseThresh("tcp syn-flood destination-threshold", val); ok {
 								sf.DestinationThreshold = n
 							}
 						case "timeout":
 							recordKeyExtras("tcp syn-flood timeout", sfOpt, 2)
+							recordChildExtras("tcp syn-flood timeout", sfOpt)
 							if n, ok := parseThresh("tcp syn-flood timeout", val); ok {
 								sf.Timeout = n
 							}
@@ -404,6 +475,7 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 						switch psOpt.Name() {
 						case "threshold":
 							recordKeyExtras("tcp port-scan threshold", psOpt, 2)
+							recordChildExtras("tcp port-scan threshold", psOpt)
 							if n, ok := parseThresh("tcp port-scan threshold", numVal(psOpt, 1)); ok {
 								profile.TCP.PortScanThreshold = n
 							}
@@ -424,13 +496,37 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		udpNode := inst.node.FindChild("udp")
+		udpNode := body.FindChild("udp")
 		if udpNode != nil {
-			for _, opt := range udpNode.Children {
+			udpSchema := famSchema("udp")
+			for _, rawOpt := range udpNode.Children {
+				opt := screenOpt(udpSchema, rawOpt)
 				switch opt.Name() {
 				case "flood":
 					recordKeyExtras("udp flood", opt, 3)
-					if n, ok := parseThresh("udp flood", numVal(opt, 2)); ok {
+					// #7460: read the threshold from the CHILD shape too, which
+					// is what the expander normalises the packed spelling into
+					// and what ip-sweep / port-scan / syn-flood already read.
+					// Before this, `flood` was the ONLY sub-knob reading Keys,
+					// so it accepted the spelling its siblings rejected and
+					// rejected the one they accepted.
+					floodVal := ""
+					if len(opt.Keys) > 2 {
+						floodVal = opt.Keys[2]
+					}
+					for _, fOpt := range opt.Children {
+						if fOpt.Name() != "threshold" {
+							profile.UnknownLeaves = append(profile.UnknownLeaves, "udp flood "+fOpt.Name())
+							continue
+						}
+						recordKeyExtras("udp flood threshold", fOpt, 2)
+						// Prefix is the FLOOD path, not the threshold path: a
+						// trailing token after the value is garbage on `udp flood`,
+						// and that is the leaf name the #3332 gate reports.
+						recordChildExtras("udp flood", fOpt)
+						floodVal = numVal(fOpt, 1)
+					}
+					if n, ok := parseThresh("udp flood", floodVal); ok {
 						profile.UDP.FloodThreshold = n
 					}
 					// udp flood enabled without an explicit threshold: arm at
@@ -445,19 +541,23 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 			}
 		}
 
-		limitNode := inst.node.FindChild("limit-session")
+		limitNode := body.FindChild("limit-session")
 		if limitNode != nil {
-			for _, opt := range limitNode.Children {
+			limitsessionSchema := famSchema("limit-session")
+			for _, rawOpt := range limitNode.Children {
+				opt := screenOpt(limitsessionSchema, rawOpt)
 				val := numVal(opt, 1)
 				switch opt.Name() {
 				case "source-ip-based":
 					recordKeyExtras("limit-session source-ip-based", opt, 2)
+					recordChildExtras("limit-session source-ip-based", opt)
 					recordChildExtras("limit-session source-ip-based", opt)
 					if n, ok := parseThresh("limit-session source-ip-based", val); ok {
 						profile.LimitSession.SourceIPBased = n
 					}
 				case "destination-ip-based":
 					recordKeyExtras("limit-session destination-ip-based", opt, 2)
+					recordChildExtras("limit-session destination-ip-based", opt)
 					recordChildExtras("limit-session destination-ip-based", opt)
 					if n, ok := parseThresh("limit-session destination-ip-based", val); ok {
 						profile.LimitSession.DestinationIPBased = n

@@ -1,0 +1,81 @@
+package configstore
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"syscall"
+)
+
+// ReadBounded reads at most max+1 bytes from r and rejects a source that
+// exceeds max, allocating no more than max+1 bytes REGARDLESS of how much data
+// r would supply. This is the load-bearing half of the #4909 fix: a plain
+// io.ReadAll materializes the WHOLE source before any cap, so a FUSE/racing
+// file that under-reported its Stat size could still stream an unbounded body
+// and balloon memory. io.LimitReader(max+1) caps the read; reaching the
+// (max+1)-th byte proves the source is over-cap.
+func ReadBounded(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("exceeds %d byte limit", max)
+	}
+	return data, nil
+}
+
+// ReadBoundedFile reads path, refusing anything larger than max bytes while
+// allocating at most max+1 bytes REGARDLESS of the file's reported size.
+//
+// The pre-#4909 pattern was os.Stat (size gate) then os.ReadFile (whole-file
+// alloc) then a post-read len(data) cap — a TOCTOU: an adversarial or
+// FUSE-backed file can under-report its size to Stat and then stream an
+// unbounded body to ReadFile, ballooning memory before the post-read cap
+// fires. Reading through an io.LimitReader(max+1) on a single opened
+// descriptor closes the window: the allocation is bounded by the limit, not by
+// what Stat claimed, and reaching the (max+1)-th byte proves the file is
+// over-cap. A non-regular file (dir/device/FIFO) is refused up front.
+//
+// #6753: the open uses O_NONBLOCK. Opening a FIFO for reading BLOCKS until a
+// writer appears, so a plain os.Open hangs before Stat can classify the path
+// and reject it — the "or blocks" half of the defect, which a size cap alone
+// does not address. O_NONBLOCK is a no-op for regular files, so the fast path
+// is unchanged; it only ensures a non-regular path can be reached, classified
+// and refused instead of hanging the process.
+func ReadBoundedFile(path string, max int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	data, err := ReadBounded(f, max)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return data, nil
+}
+
+// ReadBoundedConfigFile reads a configuration file under the same MaxConfigSize
+// ceiling the store enforces on any payload it accepts.
+//
+// It exists because that ceiling was previously enforced only AFTER the whole
+// file was resident: checkConfigSize takes an already-materialised string, so
+// it bounds what the store will ACCEPT, never what a caller will ALLOCATE. The
+// CLI load paths read with os.ReadFile and then handed the result over, so a
+// multi-gigabyte file was fully read and only then rejected (#6753).
+//
+// Both CLI surfaces call this rather than each bounding its own read: #4883-D
+// fixed a directly analogous divergence between the local and remote CLI by
+// moving the shared logic to one place, and the comment at that site records
+// that the divergence itself is what produced the bug.
+func ReadBoundedConfigFile(path string) ([]byte, error) {
+	return ReadBoundedFile(path, MaxConfigSize)
+}

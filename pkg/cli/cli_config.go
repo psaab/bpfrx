@@ -166,7 +166,10 @@ func (c *CLI) handleLoad(args []string) error {
 		}
 	} else {
 		// Read from file
-		data, err := os.ReadFile(source)
+		// #6753: bound the READ, not just the post-read length. checkConfigSize
+		// takes an already-materialised string, so it bounds what the store
+		// ACCEPTS, never what this path ALLOCATES.
+		data, err := configstore.ReadBoundedConfigFile(source)
 		if err != nil {
 			return fmt.Errorf("load: %w", err)
 		}

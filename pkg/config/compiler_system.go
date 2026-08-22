@@ -147,8 +147,58 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)
 				sys.Login.Classes = append(sys.Login.Classes, lc)
 			}
+			// #6992: a user NAME authored in two blocks folds into ONE entry.
+			//
+			// Without the fold both blocks survive in Login.Users and two
+			// readers pick different ones: pkg/cli configuredClass returns the
+			// FIRST block with a non-empty class, while pkg/daemon
+			// applySystemLogin iterates every block in order, so the account
+			// state that lands (password, authorized_keys) comes from the LAST.
+			// Measured on a config that commits CLEAN at strict: with
+			// `class admins` first and `class ops` second, the SSH key the
+			// operator wrote under the VIEW-only block authenticates and the
+			// CLI then grants super-user. The authorization decision and the
+			// credential that reaches it come from different blocks.
+			//
+			// The fold is per-LEAF last-authored-wins because that is what the
+			// FLAT spelling already produces — SetPath merges `set system login
+			// user alice ...` written twice onto one node, replacing each leaf —
+			// so folding makes the two AST shapes agree rather than inventing a
+			// third answer. This is the #5180 dual-AST-equivalence property, and
+			// the same reasoning as the #6838 cohort fold one stanza over: make
+			// the outcome INDEPENDENT of which reader picks, rather than
+			// teaching one reader the other's tie-break, which is a proxy that
+			// rots the day the other reader changes. Here it is stronger than a
+			// matched tie-break: after the fold there is no tie to break.
+			//
+			// Deliberately NOT applied to `class`: #6838 already made the class
+			// cohort reader-independent by folding permissions across it, and a
+			// merge here would fight that design.
+			userByName := map[string]*LoginUser{}
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
-				user := &LoginUser{Name: userInst.name}
+				user := userByName[userInst.name]
+				if user == nil {
+					user = &LoginUser{Name: userInst.name}
+					userByName[userInst.name] = user
+					sys.Login.Users = append(sys.Login.Users, user)
+				}
+				// A later block's `authentication` section replaces the earlier
+				// block's key set wholesale rather than appending to it. That is
+				// what the runtime already does — applySystemLogin rewrites
+				// authorized_keys per entry with WriteFileDurable, so the last
+				// entry's keys are the ones on disk — so the fold preserves the
+				// provisioned key set exactly and removes only the divergence.
+				authoredAuth := false
+				for _, prop := range userInst.node.Children {
+					if prop.Name() == "authentication" {
+						authoredAuth = true
+						break
+					}
+				}
+				if authoredAuth {
+					user.SSHKeys = nil
+					user.EncryptedPassword = ""
+				}
 				for _, prop := range userInst.node.Children {
 					switch prop.Name() {
 					case "uid":
@@ -172,7 +222,6 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 						}
 					}
 				}
-				sys.Login.Users = append(sys.Login.Users, user)
 			}
 		case "backup-router":
 			if len(child.Keys) >= 2 {
@@ -304,7 +353,11 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			sys.Syslog = &SystemSyslogConfig{}
 			for _, slInst := range namedInstances(child.FindChildren("host")) {
 				host := &SyslogHostConfig{Address: slInst.name}
-				for _, prop := range slInst.node.Children {
+				// #6684: `host 10.0.0.1 any any;` packs the whole body onto the
+				// host node's Keys, leaving Children empty — the host compiled
+				// with ZERO facilities and shipped nothing, silently.
+				for _, prop := range packedBodyChildren(slInst.node,
+					schemaForPath("system", "syslog", "host")) {
 					// #4303 S-1: switch on the KNOWN host sub-statements
 					// before the facility/severity fallback. Without this
 					// every non-`allow-duplicates` child (source-address,
@@ -1932,7 +1985,12 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 		}
 	}
 
-	clusterNode := node.FindChild("cluster")
+	// #6672: resolve the cluster body across all four spellings. A body packed
+	// onto the `cluster` line — or onto the `chassis` line above it — carries
+	// its statements on Keys with NO children, so the FindChild reads below saw
+	// an empty stanza and compiled nothing while the commit succeeded. The
+	// container spelling returns the same node, untouched.
+	clusterNode := normalizedClusterNode(node)
 	if clusterNode == nil {
 		return nil
 	}
@@ -2383,7 +2441,13 @@ func redundancyGroupStatementArity(tok string) int {
 
 // redundancyGroupBody returns the body statements of one `redundancy-group`
 // instance across both spellings (#6588). It is the ONE-LEVEL-UP twin of the
-// packing this file already undoes inside the body:
+// packing this file already undoes inside the body — and is itself one level
+// BELOW the `chassis cluster` body, where the same shape dropped the entire
+// cluster stanza (#6672, compiler_chassis_cluster_packed.go). The two splitters
+// interact on exactly one token: `node` is both a cluster statement and a
+// redundancy-group statement, so the cluster splitter must NOT re-arm on it
+// inside a group's tail or this function never sees the priority it exists to
+// preserve:
 //
 //	redundancy-group 1 { interface-monitor ge-0/0/0 weight 255; }
 //	  -> Keys=["redundancy-group","1"], one child per statement

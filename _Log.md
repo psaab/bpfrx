@@ -1,3 +1,35 @@
+## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
+
+- **Timestamp**: 2026-08-22
+- **Action**: Wrote the validator and wired `keyValidator` onto the interfaces
+  wildcard — and the WIRING TEST FAILED, which is why it existed. `keyValidator`
+  never reached a wildcard identity slot at all: `walkSchemaNode` validates
+  `Keys[1:1+args]`, and a wildcard's identity is `Keys[0]` with args 0, so the
+  span was empty. No wildcard in the schema carried a keyValidator, so the gap
+  had no instance. Corrected my own earlier triage claim that "the mechanism
+  already exists" — true for `<keyword> <arg>` slots, false for wildcards.
+  Hoisted the exactness predicate that was open-coded for the scalar-value-leaf
+  rule into one `exactMatch` local read by both sites, rather than adding a
+  second copy that could drift.
+  Verified the pointer-equality precondition instead of assuming it: 0 schema
+  nodes register a child that IS their wildcard, across 1464 nodes. Kept as a
+  permanent tripwire — and then gave the tripwire a POSITIVE CONTROL after a
+  mutation showed it could not red (there is nothing to detect today, so
+  breaking its comparison changed nothing). The detector is now bound by a
+  planted alias.
+  Two harness lessons paid for in this issue. A mutation that reddened via
+  `declared and not used` with vet rc 1 was DISCARDED and re-run with the
+  variable kept live. And an uncommitted edit was EATEN by the harness's
+  `git checkout -- pkg/` restore; re-applied and committed before mutating,
+  which is the rule I already knew and did not follow.
+  Character class only, no length bound — the repo carries a 17-char fixture
+  and IFNAMSIZ applies to the DERIVED name.
+  M1-M5 + M7 RED with vet 0 at every mutated state; M1 deletes the CALL from
+  the production path and M5 is the reject-everything control.
+- **File(s)**: `pkg/config/schema_walk.go`, `pkg/config/schema_interfaces.go`,
+  `pkg/config/validate_interface_name.go` (new),
+  `pkg/config/validate_interface_name_6834_test.go` (new),
+  `docs/config-schema.md`
 ## 2026-08-22 — #6912: an external reload discharged a postcondition it cannot perform
 
 - **Timestamp**: 2026-08-22
@@ -103131,6 +103163,19 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
     pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
 
+## 2026-08-22 — #6674 ratify both multi-value arms
+- **Timestamp**: 2026-08-22
+- **Action**: Ratify `forwarding-table export` and static-NAT
+  `match destination-address` as one-value leaves; measure and record that a
+  policy chain is NOT equivalent to its first member; clear six source sites
+  that promised a follow-up.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/types_security.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/multivalue_ratified_contract_6674_test.go,
+  pkg/frr/forwarding_export_chain_6674_test.go, docs/config-schema.md
 - **Timestamp**: 2026-08-22
   - **Action**: #6675 — made pkg/dataplane/userspace hermetic w.r.t. the kernel
     ip-rule table via TestMain, so an EPERM dump can no longer nil-deref a
@@ -103158,6 +103203,193 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_ipsec_plaintext_warn.go,
     pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
     docs/userspace-dataplane-gaps.md
+
+## 2026-08-22 — #6672 packed chassis cluster body
+- **Timestamp**: 2026-08-22
+- **Action**: Split a packed `chassis cluster` body into statements before BOTH
+  the compiler and the schema walker, so all five spellings compile identically
+  and the packed spelling cannot escape the typed-leaf range gates.
+- **File(s)**: pkg/config/compiler_chassis_cluster_packed.go (new),
+  pkg/config/compiler_system.go, pkg/config/schema_walk.go,
+  pkg/config/packed_chassis_cluster_6672_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6648 — gave each per-feature required-protocol gate an
+    immutable floor (the version its wire representation landed at) instead of
+    the shared ProtocolVersion, so an unrelated wire bump no longer retroactively
+    re-arms every gate and reports a false reason. #6649 and #6647 were measured
+    already-closed at master (by #6722's unconditional equality gate, and by
+    #5485 + #5488 F7 respectively) and are pinned rather than re-fixed: added the
+    composition cell for #6649, and hardened goFunctionSource to return CODE so
+    the #6647 compensator's source-scanning guard can no longer be satisfied by a
+    comment quoting the call it demands.
+  - **File(s)**: pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/manager_compile.go,
+    pkg/dataplane/userspace/protocol_feature_floors_6648_test.go (new),
+    pkg/dataplane/userspace/shim_loader_boundary_test.go,
+    pkg/dataplane/userspace/manager_capabilities_test.go,
+    pkg/dataplane/userspace/set_forwarding_armed_generation_5648_test.go,
+    pkg/dataplane/userspace/sync_desired_forwarding_generation_6165_test.go,
+    docs/userspace-dataplane-architecture.md
+  - **Action**: #6684/#6685/#7457 — added a schema-driven expander for packed
+    stanza bodies (compact_tail.go) and wired it into the syslog host, firewall
+    filter term, and filter `from` compile sites. #6683 (screens) is blocked on
+    the screen check leaves being absent from setSchema.
+  - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
+    pkg/config/compiler_firewall.go,
+    pkg/config/compact_tail_6684_6685_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #7413 — three tests read process-global state and failed under a
+    parallel `cargo test`. Two independent resources, each with a single
+    mechanism, measured rather than inferred: `DETERMINISTIC_V6_DOWNGRADE_COUNT`
+    (2 asserters, 6/6 fail at --test-threads=2, `left: 2 right: 1`) and the
+    process-wide `neigh-monitor` thread count (10 spawners across 2 modules,
+    4/8 fail running ONLY the two asserters, `before=0 during=2`). Both take a
+    poison-tolerant serial guard. Corrected my own issue text: the nat64
+    counter is PRODUCTION state, so the `thread_local!` pattern does not apply
+    — it would break the product. Population enumerated by running all 4549
+    tests alone and watching each observable's own log line, which also proved
+    no spawner leaks. Guard on the two asserters is BOUND (5/8 red); the guard
+    on the other eight is precautionary and reported as such — it does not red
+    even paired one-to-one, and the `before == 0` precondition is the anti-rot
+    diagnostic that makes a future collision name the missing lock.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/{neighbor_manager.rs,mod.rs,
+    tests.rs}, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/main_tests.rs,
+    userspace-dp/src/nat64_tests.rs, docs/engineering-style.md
+
+## 2026-08-22 — #6992 duplicate system login user blocks
+- **Timestamp**: 2026-08-22
+- **Action**: Fold a duplicated `system login user` name into ONE compiled entry
+  (per-leaf last-authored-wins, matching the flat spelling) so no reader can
+  pick a different block, and register the container in the #5180 duplicate
+  gate so the silent drop is rejected at commit.
+- **File(s)**: pkg/config/compiler_system.go, pkg/config/dup_named_blocks.go,
+  pkg/config/duplicate_login_user_6992_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22 11:15 UTC
+  - **Action**: #6753 — bound the CLI config-file read instead of checking size
+    after materialising it. Moved the #4909 bounded reader into pkg/configstore
+    (which owns MaxConfigSize) as ReadBounded/ReadBoundedFile/
+    ReadBoundedConfigFile; cmd/xpfd now delegates to it so the logic is
+    single-sourced rather than copied; both CLI load paths call it. Added
+    O_NONBLOCK to the open so a writerless FIFO is classified and refused
+    instead of hanging the process — the "or blocks" half of the issue, which
+    the size cap alone does not address.
+  - **File(s)**: pkg/configstore/bounded_read.go (new),
+    pkg/configstore/bounded_read_6753_test.go (new),
+    pkg/cli/load_bounded_read_6753_test.go (new), pkg/cli/cli_config.go,
+    cmd/cli/main.go, cmd/xpfd/main.go, pkg/configstore/README.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6683/#7460 — modelled the whole screen subtree in setSchema and
+    routed the screen compiler through the packed-body expander at both the
+    ids-option and family-option levels. Single-sourced the four sub-knob
+    readers onto the child shape (flood was the odd one out) and armed
+    recordChildExtras on every modelled leaf.
+  - **File(s)**: pkg/config/schema_security.go,
+    pkg/config/compiler_security_screen.go,
+    pkg/config/screen_packed_body_6683_test.go,
+    pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #7446 — converted the 44 pointer-returning buildSnapshot discard
+    sites (16 files) to must-helpers, added an AST guard against
+    re-introduction, and folded in the contributed #3772 propagation-link test.
+  - **File(s)**: pkg/dataplane/userspace/buildsnapshot_must_7446_test.go,
+    pkg/dataplane/userspace/buildsnapshot_discard_guard_7446_test.go,
+    16 converted *_test.go files, docs/engineering-style.md
+
+  - **Action**: #6707 — added a `commit confirmed` rollback-target APPLIABILITY
+    pre-flight so the confirmed-commit safety net cannot arm against a target
+    the dataplane is guaranteed to refuse (#5575 lenient-content poison). The
+    timeout path applies its target unconditionally by design, so the decision
+    has to be made at arm time. Measured the issue's other two consequences at
+    master: the peer-sync divergence is CLOSED by #7328's config-apply NACK, and
+    the ctrl-disable outage is real but its stated fix direction is unsafe —
+    both reported rather than changed.
+  - **File(s)**: pkg/config/compiler_security_policy.go,
+    pkg/config/lenient_dropped_locator_6707_test.go (new),
+    pkg/daemon/rollback_target_appliable_6707.go (new),
+    pkg/daemon/rollback_target_appliable_6707_test.go (new),
+    pkg/daemon/daemon_apply_commit.go, pkg/daemon/README.md,
+    docs/bare-metal-device-map.md
+
+## 2026-08-22 — #6686 as-path multi-token regex
+- **Action**: Fixed `policy-options as-path` reading only the first tail token
+  (unquoted `.* 65000 .*` compiled to `.*`), added the shared
+  `ValidASPathRegex` predicate + strict commit gate + FRR render belt.
+- **File(s)**: `pkg/config/aspath_regex.go` (new),
+  `pkg/config/compiler_routing.go`, `pkg/config/compiler_validate_strict_routing.go`,
+  `pkg/config/compiler_opts.go`, `pkg/config/compiler_uniformgates_log_feed_routing.go`,
+  `pkg/frr/policy_render.go`,
+  `pkg/config/compiler_as_path_multitoken_6686_test.go` (new),
+  `pkg/frr/policy_aspath_regex_6686_test.go` (new), `docs/config-schema.md`
+## 2026-08-22 — #6693 NAT match arms read both AST slots
+- **Timestamp**: 2026-08-22
+- **Action**: Replace the either/or reader at five NAT match-address arms with
+  an accumulate-both reader that preserves authored empties and synthesizes
+  nothing; add the mixed spelling to the schema spelling differential gate.
+- **File(s)**: pkg/config/compiler_nat_match_values.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/nat_match_mixed_shape_6693_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6693 follow-up on the rescued commit — widened the coverage to
+    all five arms on BOTH compile paths (strict + tolerant, asserted to agree),
+    per-arm malformed-tail gate reachability with a tolerant-accept no-brick leg,
+    the spelling-equivalence test extended from one arm to five, and a new
+    persistence round-trip test (Format / FormatSet re-readings must agree with
+    the authored tree). Completed the static-NAT fixture with a valid `match
+    destination-address` so the #7216 gate cannot fire first and mask the gate
+    under test.
+  - **File(s)**: pkg/config/nat_match_mixed_shape_6693_test.go,
+    docs/config-schema.md
+
+## 2026-08-22 — #6534 closure: third port-mirroring renderer + cross-surface gate
+- **Action**: Closed #6534 by fixing the one live instance the three landed
+  family PRs missed and adding the mechanism that makes the class mechanically
+  enumerable. `cli.showForwardingOptions` is a THIRD port-mirroring renderer —
+  the only one printing full per-instance detail under `show
+  forwarding-options`, since the gRPC twin emits only a pointer line — and it
+  rendered an instance the snapshot builder DROPS as armed. New `pkg/showaudit`
+  registers the six builder-side `pkg/config` drop predicates across five
+  families and asserts (a) exact equality between the predicates the builder
+  calls and the registry, so a NEW fail-closed exclusion cannot land without
+  declaring its surfaces; (b) existence closure — some surface consults each
+  verdict; (c) guardedness closure — the census of render functions that do NOT
+  consult it, asserted EXACTLY in both directions so a deferral cannot decay
+  into an allowlist. Measured population: 6 predicates, 32 render functions
+  across 5 surface packages, 20 still unannotated (filed as #7473). Corrected
+  two stale enumeration claims that said "BOTH" of two port-mirroring surfaces.
+- **File(s)**: pkg/showaudit/doc.go (new),
+  pkg/showaudit/surface_gate_6534_test.go (new),
+  pkg/cli/cli_show_routing.go,
+  pkg/cli/mirror_exclusion_surfaces_6534_test.go (new),
+  pkg/config/mirror_exclusion_reason.go,
+  pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
+  docs/junos-cli-reference.md
+
+## 2026-08-22 — #6705 junos-host unenforced-deny advisory suppression
+- **Timestamp**: 2026-08-22
+- **Action**: Gate the #4168 advisory suppression on ACTUAL rule emission, not
+  on representability. Reproduced the issue's five spellings first: the omitted
+  and valueless forms are already rejected at strict commit (#3044 / #6526), so
+  the issue's stated vector is closed; the reachable vector is an
+  application-any permit for every source, which commits cleanly with zero
+  warnings and leaves the DROP program empty while the deny still counts as
+  rendered.
+- **File(s)**: pkg/config/junos_host_deny.go,
+  pkg/config/junos_host_deny_unenforced_6705_test.go
+
+## 2026-08-22 — #6696 dhcp-local-server group interface / pool dns-server
+- **Action**: Both arms now read every element of a bracketed list; modelled
+  the two leaves (and both families' shared `group` subtree) in `setSchema`
+  with per-element validators; `interface` keeps its per-interface modifiers
+  out of the value list via `valueList` + modelled modifier children.
+- **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
+  `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
+  `docs/config-schema.md`
 
 ## 2026-08-22 — #6664 NextTableUnsupported fails closed + single-door admit
 - **Action**: Removed `NextTableUnsupported` from `is_slow_path_eligible`, so an

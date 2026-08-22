@@ -151,7 +151,7 @@ func TestFullSnapshotMarshalsInRange_1977(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.TCPMSSGreIn = 70000
 	cfg.Security.Flow.TCPSession = &config.TCPSessionConfig{EstablishedTimeout: math.MaxInt64}
-	snap, _ := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
 	if _, err := json.Marshal(&ControlRequest{Type: "apply_snapshot", Snapshot: snap}); err != nil {
 		t.Fatalf("marshal: %v", err)
 	}

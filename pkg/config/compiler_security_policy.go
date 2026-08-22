@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 func compilePolicies(node *Node, sec *SecurityConfig) error {
 	for _, child := range node.Children {
 		if child.Name() == "default-policy" {
@@ -490,4 +492,46 @@ func applyCollapsedDenyModifiers(pol *Policy, denyNode *Node) {
 	for _, c := range denyNode.Children {
 		walk(c)
 	}
+}
+
+// LenientDroppedPolicyLocator names the first policy in cfg whose compile
+// SILENTLY DROPPED a match / then-permit constraint on the tolerant path
+// (#5575 LenientContentDropped), or "" when none did.
+//
+// The flag is the compiler's fail-closed poison: policies_lower.go stamps such
+// a rule with the __unsupported__ application sentinel so the Rust integrity
+// preflight REJECTS THE WHOLE SNAPSHOT rather than arming a permit broader than
+// the operator configured. So a config carrying this flag is one the dataplane
+// is GUARANTEED to refuse — which makes it a usable local predicate for "this
+// config cannot become the running snapshot" without a round trip to the
+// helper.
+//
+// It walks BOTH policy shapes. A zone-pair rule and a global rule reach the
+// poison through the same compilePolicy path, so a walker that checked only
+// `Security.Policies` would report a clean config for a poisoned global policy
+// — the exact miss that would let an unappliable rollback target through the
+// #6707 gate. Returning the locator rather than a bare bool lets the caller
+// name the offending rule to the operator; a rule with no zone context is a
+// global policy and is labelled as such.
+func LenientDroppedPolicyLocator(cfg *Config) string {
+	if cfg == nil {
+		return ""
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && pol.LenientContentDropped {
+				return fmt.Sprintf("from-zone %s to-zone %s policy %q",
+					zpp.FromZone, zpp.ToZone, pol.Name)
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol != nil && pol.LenientContentDropped {
+			return fmt.Sprintf("global policy %q", pol.Name)
+		}
+	}
+	return ""
 }
