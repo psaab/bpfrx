@@ -587,6 +587,25 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 }
 
 func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
+	// #7016: emitted on EVERY path through this function (0 when there is
+	// nothing to report), so `> 0` is alertable and its absence means the
+	// collector did not run. It mirrors the per-zone
+	// xpf_zone_counters_unpopulated_zones disposition: an unpublished per-rule
+	// counter OMITS the sample and counts here, and does NOT bump
+	// counterReadErrors.
+	//
+	// Scope note: unlike the zone gauge (#6843 R1), this one is NOT hoisted
+	// above the dataplane-loaded gate -- Collect calls collectPolicyCounters
+	// only on the loaded path, so a degraded / config-only boot emits no policy
+	// counter family at all. That is pre-existing and deliberately unchanged
+	// here; the REST inventory's hit_counters_unavailable (#5580) is the signal
+	// for the unloaded state.
+	unpublished := 0
+	defer func() {
+		ch <- prometheus.MustNewConstMetric(c.policyCountersUnpublishedRules,
+			prometheus.GaugeValue, float64(unpublished))
+	}()
+
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -612,8 +631,12 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 	// the mutex held the entire time — starving commit/apply. NewPolicyCounter
 	// Reader builds the index once (O(P+C), one brief lock) when the dataplane
 	// provides the bulk snapshot, and falls back to the per-policy read
-	// otherwise. A policy the helper has not published yields an error, so the
-	// skip-and-bump contract (#3345/#3408) below is unchanged.
+	// otherwise. A policy the helper has not published yields
+	// ErrPolicyCounterUnpublished; the sample is skipped for it exactly as for a
+	// failed read (#3345: never a 0 standing in for an unknown), but it counts
+	// into xpf_policy_counters_unpublished_rules instead of bumping
+	// counterReadErrors -- unpublished is a no-data window, not a failure
+	// (#7016). A genuine read failure keeps the #3345/#3408 skip-and-bump.
 	readPolicy := dpuserspace.NewPolicyCounterReader(dp, cfg, dp.ReadPolicyCounters)
 
 	var policySetID uint32
@@ -638,7 +661,16 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 			policyID := policyCounterID(policySetID, i)
 			ctrs, err := readPolicy(policyID)
 			if err != nil {
-				c.counterReadErrors.Add(1)
+				// #7016: unpublished is a no-data window, not a degraded read.
+				// Skip the sample either way (#3345: never a 0 standing in for
+				// an unknown), but bump the ERROR counter only for a genuine
+				// failure -- routing the warm-up window there is exactly the
+				// #3643 false alert.
+				if errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished) {
+					unpublished++
+				} else {
+					c.counterReadErrors.Add(1)
+				}
 				continue
 			}
 			ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
@@ -657,7 +689,12 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		policyID := policyCounterID(policySetID, i)
 		ctrs, err := readPolicy(policyID)
 		if err != nil {
-			c.counterReadErrors.Add(1)
+			// #7016: see the zone-pair loop above.
+			if errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished) {
+				unpublished++
+			} else {
+				c.counterReadErrors.Add(1)
+			}
 			continue
 		}
 		// #3286: a scoped global policy (#3148 `match from-zone`/`to-zone`)
@@ -683,11 +720,16 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 	// that was previously uncounted. Gated on policy-stats like the per-rule
 	// metrics above so all surfaces agree.
 	if statsEnabled {
-		if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err != nil {
-			c.counterReadErrors.Add(1)
-		} else {
+		ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID)
+		switch {
+		case err == nil:
 			ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
 				float64(ctrs.Packets), "-", "-", dataplane.DefaultPolicyName)
+		case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+			// #7016: see the zone-pair loop above.
+			unpublished++
+		default:
+			c.counterReadErrors.Add(1)
 		}
 	}
 }
