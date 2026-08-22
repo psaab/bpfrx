@@ -304,6 +304,13 @@ var showTextElevatedTopics = map[string]config.LoginClassPermission{
 // (TestEveryShowTextTopicHasAPermission_5278 parses server_show.go), which is
 // what makes it a coverage claim rather than an assertion of good intent. Keys
 // ending in ':' are prefix rules, exactly as above.
+//
+// #6496: "bootstrap-import" sits here at PermView, matching the coarse model
+// the rest of `show` uses (PermView gates every show command) and matching
+// "login" below, which renders login configuration at the same level. Its
+// error detail is withheld from /health because that endpoint is
+// UNAUTHENTICATED (#5031) — a different distinction from privilege level;
+// every caller reaching here has authenticated.
 var showTextViewTopics = map[string]bool{
 	"address-book":                      true,
 	"alarms":                            true,
@@ -312,6 +319,7 @@ var showTextViewTopics = map[string]bool{
 	"applications":                      true,
 	"backup-router":                     true,
 	"bfd-peers":                         true,
+	"bootstrap-import":                  true,
 	"buffers":                           true,
 	"buffers-detail":                    true,
 	"chassis":                           true,
@@ -371,6 +379,7 @@ var showTextViewTopics = map[string]bool{
 	"internet-options":                         true,
 	"ipsec-statistics":                         true,
 	"ipv6-router-advertisement":                true,
+	"kernel-upgrade":                           true,
 	"lldp":                                     true,
 	"lldp-neighbors":                           true,
 	"log":                                      true,

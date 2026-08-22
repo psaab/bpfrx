@@ -19,6 +19,16 @@ import (
 )
 
 const pendingCallbackFramesLimit = 4096
+
+// pendingDroppedMarkerType is the frame-type byte stamped on a #6558 dropped
+// marker. Markers are dispatched by their `dropped` flag, never by type, so
+// this only has to be a value that is NOT a live protocol frame type — a
+// marker stamped with the refused frame's own type would look dispatchable in
+// a log or a debugger. Zero is outside the allocated range (protocol_events.go
+// starts at 1) and TestDroppedMarkerTypeIsNotALiveFrameType6558 keeps it that
+// way: if 0 were ever allocated, a marker reaching the flush's type switch
+// would be dispatched as real traffic.
+const pendingDroppedMarkerType uint8 = 0
 const callbackNotReadyBackoff = 100 * time.Millisecond
 
 type pendingCallbackFrame struct {
@@ -27,6 +37,13 @@ type pendingCallbackFrame struct {
 	sessionDelta     SessionDeltaInfo
 	dataplanePayload []byte
 	dataplaneRecord  logging.EventRecord
+
+	// dropped marks a frame that will never be applied — an undecodable,
+	// oversized or unknown-type frame the reader refused (#6130/#6132/#6160).
+	// It carries no callback; the flush simply advances the watermark past it
+	// IN ORDER (#6558). See markDroppedFrameApplied for why a refused frame
+	// has to enter the queue at all.
+	dropped bool
 }
 
 // EventStream manages the daemon-side event socket for receiving session events
@@ -530,7 +547,10 @@ func (es *EventStream) readLoop(ctx context.Context) {
 				// is PRESENT on the wire, so the watermark is advanced past it
 				// (loop-break) and the connection kept alive. See
 				// handleSessionDecodeFailure.
-				es.handleSessionDecodeFailure(seq, &prevSeq)
+				if !es.handleSessionDecodeFailure(seq, &prevSeq) {
+					es.backoffCallbackNotReady(ctx)
+					return
+				}
 				continue
 			}
 			if typ == EventTypeSessionOpen {
@@ -561,7 +581,10 @@ func (es *EventStream) readLoop(ctx context.Context) {
 				// #5483/#6130: see the SessionOpen/Update case — an undecodable
 				// session CLOSE frame forces a resync and advances the watermark
 				// past the present-but-undecodable frame (loop-break).
-				es.handleSessionDecodeFailure(seq, &prevSeq)
+				if !es.handleSessionDecodeFailure(seq, &prevSeq) {
+					es.backoffCallbackNotReady(ctx)
+					return
+				}
 				continue
 			}
 			delta.Event = "close"
@@ -613,14 +636,20 @@ func (es *EventStream) readLoop(ctx context.Context) {
 			if !dataplaneEventPayloadMatchesFrame(typ, payload) {
 				es.DecodeErrors.Add(1)
 				es.recordDataplaneEventDrop(typ)
-				es.markDroppedFrameApplied(seq, &prevSeq)
+				if !es.markDroppedFrameApplied(seq, &prevSeq) {
+					es.backoffCallbackNotReady(ctx)
+					return
+				}
 				continue
 			}
 			rec, ok := decodeDataplaneEventPayload(payload)
 			if !ok {
 				es.DecodeErrors.Add(1)
 				es.recordDataplaneEventDrop(typ)
-				es.markDroppedFrameApplied(seq, &prevSeq)
+				if !es.markDroppedFrameApplied(seq, &prevSeq) {
+					es.backoffCallbackNotReady(ctx)
+					return
+				}
 				continue
 			}
 			onRawDataplaneEvent, onDataplaneEvent := es.dataplaneCallbacks()
@@ -637,24 +666,100 @@ func (es *EventStream) readLoop(ctx context.Context) {
 
 		default:
 			es.UnknownFrameDrops.Add(1)
-			es.markDroppedFrameApplied(seq, &prevSeq)
+			if !es.markDroppedFrameApplied(seq, &prevSeq) {
+				es.backoffCallbackNotReady(ctx)
+				return
+			}
 			slog.Debug("event stream: dropped unknown frame type", "type", typ, "seq", seq)
 		}
 	}
 }
 
-func (es *EventStream) markDroppedFrameApplied(seq uint64, prevSeq *uint64) {
+// markDroppedFrameApplied performs the LOOP-BREAK for a frame the reader
+// refused: it advances the receive watermark past the frame so the gap detector
+// does not re-fire on it and the helper is not asked to replay something that
+// would only be refused again (#6130/#6132/#6160).
+//
+// #6558: the ACK watermark is a DURABILITY claim, and it must not overtake the
+// pending-apply queue. `dispatchOrQueue*` returns true after a successful
+// ENQUEUE, so the reader keeps reading with frames still queued unapplied. A
+// refused frame arriving behind them used to call markFrameApplied directly,
+// which advanced lastAppliedSeq — and therefore the cumulative ACK — PAST
+// deltas that had not been applied. The helper trims its replay buffer on
+// `front.seq <= acked` and the daemon discards its pending queue on the next
+// accept, so those deltas were unrecoverable. The three prior refusal fixes each
+// reasoned about the refused frame ITSELF and were correct for it; none of them
+// reasoned about frames still queued BEHIND it, because the queue did not exist
+// yet when the first was written.
+//
+// So a refusal that lands while the queue is non-empty ENTERS the queue as a
+// dropped marker and its watermark advance happens in FIFO order, exactly like
+// an applied frame. The loop-break is unaffected — prevSeq and lastRecvSeq still
+// move immediately, so nothing re-fires the gap detector and nothing is
+// re-requested.
+//
+// Returns false only when the queue is full, matching the dispatchOrQueue*
+// contract: the caller closes the stream so the helper replays from a watermark
+// that is still honest.
+func (es *EventStream) markDroppedFrameApplied(seq uint64, prevSeq *uint64) bool {
 	if seq > *prevSeq+1 && *prevSeq > 0 {
 		es.SeqGaps.Add(1)
 	}
 	*prevSeq = seq
 	es.lastRecvSeq.Store(seq)
-	es.markFrameApplied(seq)
+
+	return es.applyRefusedFrameInOrder(seq)
 }
 
+// applyRefusedFrameInOrder advances the ACK watermark past a frame the reader
+// refused, BEHIND anything still queued unapplied (#6558).
+//
+// It is deliberately separate from the loop-break bookkeeping each caller does
+// (prevSeq / lastRecvSeq / SeqGaps): those differ per refusal site — the
+// session-decode path does not count a gap where the telemetry path does — and
+// folding them together here would silently change the gap accounting on two of
+// the three sites. This helper owns exactly one property: the ACK watermark
+// moves in FIFO order.
+//
+// Returns false only when the pending queue is full, matching the
+// dispatchOrQueue* contract: the caller closes the stream so the helper replays
+// from a watermark that is still honest.
+func (es *EventStream) applyRefusedFrameInOrder(seq uint64) bool {
+	if es.hasPendingCallbackFrames() {
+		if !es.enqueuePendingCallbackFrame(pendingCallbackFrame{
+			typ:     pendingDroppedMarkerType,
+			seq:     seq,
+			dropped: true,
+		}) {
+			return false
+		}
+		es.flushPendingCallbackFrames()
+		return true
+	}
+	es.markFrameApplied(seq)
+	return true
+}
+
+// markFrameApplied advances the cumulative applied watermark.
+//
+// #6558: the advance is MONOTONIC. It was a bare Store, which let a later
+// in-order flush REWIND the watermark below a value a drop path had already
+// jumped it to — and a rewound lastAppliedSeq is silently swallowed by
+// sendAckIfNeeded's `applied <= acked` guard and can regress
+// SendDrainRequest's fence. Frames are applied in order on one goroutine, so
+// the CAS is uncontended in practice; it is here so no future caller can
+// reintroduce a rewind.
 func (es *EventStream) markFrameApplied(seq uint64) {
 	es.ackBatch.Add(1)
-	es.lastAppliedSeq.Store(seq)
+	for {
+		cur := es.lastAppliedSeq.Load()
+		if seq <= cur {
+			return
+		}
+		if es.lastAppliedSeq.CompareAndSwap(cur, seq) {
+			return
+		}
+	}
 }
 
 // handleSessionSyncGap responds to a detected sequence gap on a
@@ -767,7 +872,7 @@ const decodeFailureResyncInterval = 2 * time.Second
 // Scope: SESSION frames ONLY. A decode failure on a lossy TELEMETRY/stats frame
 // stays tolerable to skip (DecodeErrors + drop-counter + markDroppedFrameApplied)
 // — telemetry carries no HA session state.
-func (es *EventStream) handleSessionDecodeFailure(seq uint64, prevSeq *uint64) {
+func (es *EventStream) handleSessionDecodeFailure(seq uint64, prevSeq *uint64) bool {
 	es.DecodeErrors.Add(1)
 
 	// Rate-limited resync trigger + WARN. Fire BEFORE advancing the watermark so
@@ -777,10 +882,16 @@ func (es *EventStream) handleSessionDecodeFailure(seq uint64, prevSeq *uint64) {
 
 	// Loop-break (#6130): advance PAST the present-but-undecodable frame
 	// unconditionally so the cumulative ACK trims it from the helper's replay
-	// buffer and it is never re-sent.
+	// buffer and it is never re-sent. Byte-identical to the pre-#6558 lines —
+	// this path deliberately does NOT count a SeqGap, and routing it through
+	// markDroppedFrameApplied (which does) would have changed that.
 	*prevSeq = seq
 	es.lastRecvSeq.Store(seq)
-	es.markFrameApplied(seq)
+
+	// #6558: the watermark advance goes behind anything still queued unapplied.
+	// Returns false only on a full queue, which the caller turns into a stream
+	// close so the helper replays from an honest watermark.
+	return es.applyRefusedFrameInOrder(seq)
 }
 
 // triggerRateLimitedResync fires a full resync (onFullResync) plus a WARN for a
@@ -870,7 +981,15 @@ func (es *EventStream) handleOversizedFrame(conn net.Conn, length uint32, typ ui
 	// trustworthy) so the helper trims it and never re-sends it verbatim.
 	*prevSeq = seq
 	es.lastRecvSeq.Store(seq)
-	es.markFrameApplied(seq)
+	// #6558: the advance goes behind anything still queued unapplied, so the
+	// ACK this function flushes on its drop path (below) cannot trim the
+	// helper's replay buffer over a delta the daemon has not applied. A full
+	// queue means the drop cannot be recorded in order at all, so drop the
+	// connection WITHOUT flushing an ACK — the helper then replays from a
+	// watermark that is still honest, which is the whole point.
+	if !es.applyRefusedFrameInOrder(seq) {
+		return false
+	}
 
 	// Oversized-but-well-framed: the declared length is a trusted frame boundary
 	// (within the discard ceiling). Drain exactly that many bytes to re-align on
@@ -1017,6 +1136,21 @@ func (es *EventStream) flushPendingCallbackFrames() {
 		}
 		frame := es.pendingCallbackFrames[0]
 		es.pendingMu.Unlock()
+
+		// #6558: a dropped marker has no callback. It exists only to hold the
+		// ACK watermark's place in FIFO order, so it "applies" unconditionally
+		// — including when no callback is wired, which is exactly the state
+		// that queued the frames ahead of it.
+		if frame.dropped {
+			es.markFrameApplied(frame.seq)
+			es.pendingMu.Lock()
+			if len(es.pendingCallbackFrames) > 0 && es.pendingCallbackFrames[0].seq == frame.seq {
+				copy(es.pendingCallbackFrames, es.pendingCallbackFrames[1:])
+				es.pendingCallbackFrames = es.pendingCallbackFrames[:len(es.pendingCallbackFrames)-1]
+			}
+			es.pendingMu.Unlock()
+			continue
+		}
 
 		switch frame.typ {
 		case EventTypeSessionOpen, EventTypeSessionUpdate, EventTypeSessionClose:

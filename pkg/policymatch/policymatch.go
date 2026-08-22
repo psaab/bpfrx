@@ -252,7 +252,8 @@ type Query struct {
 	// A zone can carry multiple per-interface host-inbound effective views
 	// (#3362); without this selector the classifier reports HostInboundAmbiguous
 	// when they disagree. With it, the classifier evaluates ONLY this interface's
-	// effective view (zone-level ∪ per-interface override), so an operator can
+	// effective view (its per-interface override where declared, which REPLACES
+	// the zone-level set — #6515 — else the zone-level set), so an operator can
 	// certify one interface's TRUE host-inbound posture (admit vs deny) instead of
 	// a zone-wide fold. The ref must name an interface assigned to FromZone; a
 	// caller validates it via dataplane/userspace.ResolveHostInboundIngressInterface

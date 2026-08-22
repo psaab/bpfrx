@@ -41,6 +41,7 @@ fn allocate(alloc: &PortAllocator, addrs: &[Ipv4Addr], src_port: u16, now_ns: u6
             PersistentNatPermit::TargetHostPort,
             0,
             now_ns,
+            crate::nat::NatHolder::Untracked,
         )
         .expect("free range must allocate");
 }
@@ -209,6 +210,7 @@ fn live_lock_counting_does_not_disturb_allocation_results() {
             PersistentNatPermit::TargetHostPort,
             0,
             1_000,
+            crate::nat::NatHolder::Untracked,
         )
         .expect("free range must allocate");
     assert_eq!(translated.ip, IpAddr::V4(pool_ip));

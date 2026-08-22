@@ -2776,6 +2776,49 @@ which key the sample is filed under. The test now requires each sample to begin
 with its own statement keyword AND instruments the dispatch table so a case that
 never reaches the handler it is filed under fails.
 
+**A redundancy-group is folded by CANONICAL ID, not by the spelling
+(#6543).** `namedInstances` yields one entry per AST node and
+`compileChassis` parses the instance name with `strconv.Atoi`, which maps `1`,
+`01`, `001` and `+1` to the SAME int. Appending one `*RedundancyGroup` per
+instance therefore committed **two** records sharing `ID=1`:
+
+```
+set chassis cluster redundancy-group 1 node 0 priority 200   # record A: NodePriorities{0:200}
+set chassis cluster redundancy-group 01 preempt              # record B: NodePriorities{} Preempt
+```
+
+The repeated hierarchical block hits the same split for a different reason —
+`SetPath` merges same-name flat-set children, but the hierarchical parser
+leaves `redundancy-group 1 { ... } redundancy-group 1 { ... }` as two nodes.
+
+Everything downstream keys redundancy groups by the **int** id.
+`cluster.Manager.UpdateConfig` (`pkg/cluster/group_state.go`) walks the slice
+into an id-keyed map and does `existing.LocalPriority = rg.NodePriorities[m.nodeID]`,
+so whichever record it visited last won: the empty-map record overwrote the
+configured 200 with the **map-miss zero** and node 0 ran RG 1 at priority 0 —
+it loses an election it was configured to win. The #4880 node-priority range
+gate could not catch it either; it iterated the empty-map record and passed
+**vacuously**, having nothing to range-check. Two silent-failure shapes
+intersecting: an overloaded zero (map-miss `0` indistinguishable from a
+configured `0`) behind a vacuous gate.
+
+`compileChassis` now folds instances into one record per canonical id and
+replays each instance's body into it through the same `redundancyGroupStatements`
+dispatch table, so the merge is **leaf-level last-wins** — ordinary Junos `set`
+semantics — rather than one whole record silently displacing another.
+First-appearance order of the ids is preserved so the compiled slice, and every
+first-error message derived from it, stays deterministic. Merging rather than
+rejecting is deliberate: the repeated-hierarchical-block spelling is legal
+Junos that merges, so a hard reject would newly refuse a config an operator can
+legitimately write.
+
+Covered by `pkg/config/compiler_chassis_rg_id_canonical_6543_test.go` (the
+compile half, including a distinct-ids negative control and the #4880 gate now
+seeing the merged record) and `pkg/cluster/rg_id_canonical_6543_test.go` (the
+runtime half — real set lines through the real compiler into the real
+`Manager`, asserting `LocalPriority` is the configured 200 and is insensitive
+to which spelling came first).
+
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
 bracket list. The SAME `multi: true` marker fixes a second, distinct shape:
@@ -7194,9 +7237,10 @@ reserved for whole-dataplane selection where a rewrite shim
   the pre-#4544 read). Flat-set `SetPath` and `load merge` (FormatSet round-trip)
   both merge two same-key lines onto ONE node, so — like every entry in this
   cluster — the fail-open was reachable ONLY via the hierarchical `NewParser` /
-  `LoadOverride` shape. Distinct from the #3362/#3720 union, which merges
-  host-inbound authored at DIFFERENT granularities (zone ∪ physical ∪ unit);
-  #4544 merges repeated blocks at the SAME granularity. Regression coverage:
+  `LoadOverride` shape. Distinct from the #3362/#3720/#6515 resolution, which
+  combines host-inbound authored at DIFFERENT granularities (`physical ∪ unit`,
+  then REPLACING the zone level); #4544 merges repeated blocks at the SAME
+  granularity. Regression coverage:
   `pkg/config/host_inbound_dup_block_4544_test.go` (zone + interface two-block
   merge, cross-block dedup, single-block byte-identical guard — built with
   `NewParser` for the `LoadOverride` shape); operator doc:
@@ -7605,6 +7649,16 @@ reserved for whole-dataplane selection where a rewrite shim
     validating so they stay byte-for-byte in lockstep (a leading-whitespace
     template must not warn while the runtime trims+accepts it). The malformed
     template is `RedactURL`'d in the warning message (it may carry a credential).
+    `RedactURL` itself was only sound for a WELL-FORMED URL until #6609: it
+    located userinfo by finding `@` inside the authority, so the commonest
+    credentialed typo — omitting the `@`, as in
+    `http://user:s3cr3t.example/` — matched nothing and was returned in full,
+    on the very branch that exists to report a malformed template. It now also
+    redacts the whole authority when the host part carries a colon whose suffix
+    is not a port (a bracketed IPv6 literal is recognised, so a well-formed
+    `[2001:db8::1]:8443` is still printed), starts the authority correctly for
+    a scheme-relative `//user:pass@host/`, and drops the fragment — which a
+    query already dropped as a side effect, so only the no-query case leaked.
     Without the commit-time check the typo committed silently and the runtime
     fetch then masqueraded forever as a transient observation failure,
     suppressing publishing indefinitely. The runtime `ddns.CheckIP` gate
@@ -9061,8 +9115,8 @@ the value sits in a single typed slot:
     (`buildFlowExportSnapshot` reads `fm.Version9` only).
   - `security flow tcp-session` expanded to a container: `established-timeout`
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
-    `time-wait-timeout` (config-only, not wire-reaching) all
-    `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
+    `time-wait-timeout` (config-only, not wire-reaching — see **#6539** below)
+    all `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
     NOT u64-max. This is the operator-facing reject; it stays in lockstep with
     the runtime saturation backstop `SessionTimeouts::from_seconds` (#2441),
     which converts `secs → ns` with `checked_mul` and saturates at
@@ -9075,12 +9129,40 @@ the value sits in a single typed slot:
     presence-only for completion parity. The presence flags compile into
     `TCPSessionConfig` (NoSynCheck / NoSynCheckInTunnel / RstInvalidateSession
     / NoSequenceCheck) but are typed-config only — the userspace dataplane does
-    not read them. The session table is a pure 5-tuple flow entry with no TCP
-    state machine and no sequence/window tracking, so there is nothing for any
-    of these knobs to enforce or skip. **#2078:** setting any of them emits a
+    not read them. The session table is a 5-tuple flow entry with no
+    sequence/window tracking, so there is nothing for any of these knobs to
+    enforce or skip. **#2078:** setting any of them emits a
     single accepted-only commit advisory (`pkg/config/compiler.go`,
     `security flow tcp-session ... accepted-only`) so an operator is not
     silently misled; research #2078 converged PLAN-KILL on enforcement.
+    (**#6539** narrowed that sentence: it used to say the dataplane has no TCP
+    state machine, which #3152 — OPENING vs established — and #3046 — RST vs
+    FIN close — have since made false. Those states are precisely why the
+    TIMEOUT leaves need a differently-worded advisory.)
+
+    **#6539 — the three unenforced timeout leaves.** `initial-timeout`,
+    `closing-timeout` and `time-wait-timeout` are committable but have no wire
+    carrier and no consumer, while REST, CLI and gRPC all printed them in the
+    same shape as `established-timeout`, which IS carried. That is worse than a
+    plainly unimplemented feature: the surface an operator checks after
+    committing confirmed the false belief, and `initial-timeout` is the
+    half-open / SYN-flood bounding control. `pkg/config/flow_tcp_timeouts_6539.go`
+    is now the single authority for the enforced/unenforced split — the commit
+    advisory and all three render surfaces read it, so they cannot disagree, and
+    a leaf that later gains a carrier loses its annotation everywhere at once.
+    The fixed windows the dataplane applies instead (20s half-open, 30s FIN
+    close, 2s RST abort, 300s established fallback) are quoted in operator-facing
+    text, so a test re-reads them from `userspace-dp/src/session/mod.rs` and
+    fails on drift; another in `pkg/dataplane/userspace` fails if any of the
+    three starts reaching the wire snapshot without the table being updated. A
+    fourth guard walks `setSchema` and fails if a new `*-timeout` leaf is
+    declared under `tcp-session` without an entry in the table — otherwise the
+    new leaf would render unannotated and reproduce #6539 for itself.
+    Enforcing the three is a separate, larger job: `initial-timeout` maps 1:1
+    onto `SessionTimeouts.tcp_opening_ns` and could be carried additively, but
+    `time-wait-timeout` has no state to attach to (`session_timeout_ns` splits a
+    close only into RST vs FIN), so it needs a close-state split in the Rust
+    session machine — and a wire bump owes a cluster smoke.
     The RST design rationale (suppress RST→CLOSED for ESTABLISHED, keep
     `rst-invalidate-session` as the opt-in override) is in
     `docs/active-active-new-connections.md`. The dead legacy `flow_config_map`

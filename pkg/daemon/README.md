@@ -773,6 +773,68 @@ reconcile passes: an edge pass whose apply fails, a no-transition pass that
 must re-drive it, and a third that must NOT) and
 `TestClaimApplyRetryOnlyAfterAFailedApply`, in
 `dhcp_apply_converger_6535_test.go`.
+
+### Cluster DHCP member scoping: node-local vs RG-scoped (#6520)
+
+`filterDHCPConfigForMasterRGs` decides which members of each
+`dhcp-local-server` / `dhcpv6-local-server` group this node serves. Two
+properties, both wrong before #6520.
+
+**Mastership scopes only RG-scoped members.** The keep-set used to be built
+exclusively from `rethInterfacesForRG` over the currently-MASTER RGs, and that
+function only ever yields members of `reth*` interfaces. Every interface that
+is *not* part of a redundancy group — the `fxp0` management lifeline, and any
+plain node-local data interface — was therefore removed from every group on
+BOTH nodes, and a group made only of such members vanished entirely. Clustering
+a box silently killed the DHCP service its operator had configured on a
+node-local segment. Redundancy-group mastership answers "which node answers for
+this REDUNDANT interface"; it says nothing about an interface with no redundant
+peer, and Junos clusters likewise run `fxp0` services per node. So:
+
+- a member that belongs to NO redundancy group is **node-local** and is kept
+  unconditionally, on both nodes;
+- a member that IS redundancy-group-scoped is kept only while this node masters
+  that RG (unchanged).
+
+Both sets come from ONE walker, `rethInterfacesMatchingRG`, of which
+`rethInterfacesForRG` is now a predicate wrapper. That is deliberate rather than
+stylistic: a divergence between "RG-scoped" and "mastered" is always a bug,
+because the keep rule is exactly *RG-scoped implies mastered*. If one set
+resolved a RETH member to a different name than the other, a node-local
+interface would read as an unmastered RG member (service dropped) or an RG
+member as node-local (both nodes serving DHCP on one redundant segment).
+
+**A narrowed group must not keep Kea's per-subnet interface selector.**
+`config.DHCPServerGroup` carries independent `Interfaces` and `Pools` arrays
+with no semantic edge — nothing records which pool belongs to which member. So
+once this filter removes a member, "the group has exactly one interface" no
+longer implies "every pool in the group is served on that interface", which is
+the inference `dhcpserver.subnetInterface` makes when it emits Kea's per-subnet
+`interface` selector (#1778). A mixed `[fxp0.0, reth0.80]` group narrowed to the
+surviving RETH member would bind the fxp0 pool's subnet to the RETH member.
+
+The filter therefore sets `DHCPServerGroup.MembersFiltered` whenever it actually
+shrinks a group, and `subnetInterface` omits the selector for such a group —
+falling back to Kea address-based subnet selection, the same mechanism every
+multi-interface group already uses. This never changes WHICH subnets are served,
+only how Kea selects among them. `MembersFiltered` is a runtime marker, excluded
+from every marshal (`json:"-"`, `yaml:"-"`) so it cannot reach the
+compiled-config dump, the golden compile baseline, or the peer over cluster
+config-sync.
+
+Dropping the whole group instead was considered and rejected: for a mixed-RG
+group in active/active (say `reth0.80` in RG1 and `reth1.0` in RG2) BOTH nodes
+would drop it and DHCP would stop everywhere.
+
+Guards: `pkg/daemon/dhcp_rg_filter_6520_test.go` (node-local member kept beside
+a mastered RETH member; node-local-only group survives on a node mastering
+nothing; an RG-scoped member of a BACKUP RG is still removed; the flag is set
+exactly when the group shrank) and
+`pkg/dhcpserver/kea_filtered_group_selector_6520_test.go` (the renderer emits no
+per-subnet selector for a narrowed group, and still emits one for an authored
+singleton). The two files name their own side of the agreement so a failure says
+which half broke.
+
 ### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
 
 `rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an
@@ -1022,6 +1084,21 @@ never lock an operator out of a remote box it manages.
   in-band. A daemon hard-exit is deliberately NOT used (it would also strand
   mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1, which IS a fatal exit
   because the bytes themselves cannot be read).
+  - **The boot commit-confirmed recovery reaches the same guard (#6538).** A
+    `commit confirmed` window that expired while the daemon was down is
+    resolved inside `Store.Load` by `recoverPendingConfirmLocked`, which
+    reverts to the record's `PrevTree`. That tree is a previously-committed
+    config, but `Load`'s tree repairs (`rewriteRetiredDataplaneType`,
+    `SanitizeTreeControlChars`) run only on `active.json`, never on the
+    `PrevTree` inside `confirm.json` — so a target committed on an older build
+    (`system dataplane-type ebpf` is the concrete case) can fail even the
+    lenient compile. That branch used to warn, assign the nil into
+    `s.compiled`, set `everCommitted = true`, and let `Load` return SUCCESS —
+    reconstructing the exact dangerous tuple above and bypassing this guard.
+    It now returns an `ErrConfigCompile`-tagged error, so the recovery lands in
+    `loadCompileFailed` like any other uncompilable committed config. The
+    rollback itself still completes first: the unconfirmed config must not
+    stand, and the reverted tree has to stay reachable for in-band recovery.
   - **Why mgmt stays reachable — freeze in last-known-good, not a wipe.** This
     path does NOT run the `enterBootstrapMode()` teardown (which removes the
     `10-xpf-*` `.network`/`.link` files, clears the FRR managed section, and
@@ -1806,6 +1883,44 @@ never lock an operator out of a remote box it manages.
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
   `firewall_address_literal_3433_test.go`.
 
+  **A MALFORMED address token fails the install CLOSED (#6512).** #3433 dropped
+  a malformed token silently, so an ALL-malformed positive list reached
+  "constrained + empty -> match nothing". That resolution is wrong for the two
+  shapes #6512 filed. A PARTIALLY malformed positive list installed a NARROWED
+  rule — a `discard`/`reject` term enforcing a smaller address set than the
+  operator wrote, with the dropped range falling through to the implicit accept
+  (fail-OPEN). And an EXCEPT list narrowed to empty takes the "empty except ->
+  match ALL" arm above, so the direction becomes UNCONSTRAINED (fail-OPEN in the
+  other direction) — which is why "skip the bad entry" can never be the fix
+  here. Both builders now refuse: `nftFamilyAddrs` (oracle) keeps the token
+  VERBATIM so `nft -f -` rejects the whole ruleset, and `filterFamilyAddrs`
+  (`pkg/nftables/netlink_lo0.go`, the production builder) returns an error that
+  fails the plan and aborts the install — the same posture both already had for
+  an unrepresentable port / DSCP token (#6405). Wrong-family and `any`/empty
+  tokens are unaffected: those are legitimate drops that match the userspace
+  matcher.
+
+  Fail-closed here does not mean fail-to-boot (#1960): the install error makes
+  `applyLo0Filter` install the #6476 cold-boot fail-closed fence (lifelines
+  exempt, mandatory L3 / return traffic admitted) and the boot apply logs and
+  discards the error, so an already-persisted config still loads — it just does
+  not get a kernel filter that differs from what the operator wrote. On the
+  strict COMMIT path the commit now fails with the malformed token named,
+  instead of silently installing the narrowed filter.
+
+  Detection is on the TOKEN, not on the #6463 `AddressUnrepresentable` marker,
+  because that marker is derived from `term.UnknownAddresses` — malformed
+  LITERAL `from source-address` / `destination-address` tokens only. A malformed
+  entry inside a referenced `policy-options prefix-list` reaches this lowering
+  through `ResolveFilterPrefixListAddrs` with the marker unset, and is not
+  rejected at strict commit either (`validateFirewallPrefixListReferencesStrict`
+  validates that the REFERENCE resolves, not that its entries parse). Pinned by
+  `pkg/nftables/netlink_lo0_addrs_6512_test.go` (builder fails closed; wrong-family
+  and placeholder tokens still lower) and
+  `pkg/daemon/lo0_addr_failclosed_6512_test.go` (the token reaches the builder
+  from a prefix-list on the ordinary commit path; a failed build fences and
+  surfaces the error).
+
   **ICMP type/code lowering mirrors userspace (#3483):** `nftRulesFromTerm`
   renders `icmp-type` and `icmp-code` as INDEPENDENT predicates, each gated
   only on its own value list — `icmp[v6] type <set>` when `len(ICMPTypes) > 0`
@@ -1910,12 +2025,22 @@ never lock an operator out of a remote box it manages.
   branch; a zoned NON-lifeline DHCP interface (e.g. a standalone `fxp1`) now forces
   the full recompile that builds its address-scoped host-inbound fence, closing the
   addressless→addressed gap where the broad class exempted it from that reapply.
-  **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  **Lifeline exclusion — by INTERFACE, not by address value:**
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
-  the address sets so a host-inbound deny can never strand management or break
-  HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages
-  are accepted before any deny; a configured zone that resolves to zero
-  recognized matches fails OPEN (no deny) rather than locking the zone out.
+  the address sets, so an address reachable ONLY through a lifeline is never
+  denied. A management address ALSO configured on a non-lifeline interface is NOT
+  subtracted: it is in that interface's drop set, and every host-inbound drop is
+  destination-address-only with no `iifname` (#3718), so arriving on the lifeline
+  does not exempt it. Only a zone that ADMITS the service puts an accept in front
+  of the drop — a zone with no stanza (#3405) or an unzoned interface (#4420)
+  drops NEW management connections to that address, and the #5566 conntrack
+  reconcile flushes its ESTABLISHED ones. `ct state established,related` and IPv6
+  ND + v4/v6 PMTUD control messages are accepted before any deny, which is what
+  preserves HA control traffic and an established session where the reconcile
+  does not flush it. See `docs/host-inbound-service-matrix.md`, "Lifeline
+  exclusion is by INTERFACE, not by address value". A configured zone that
+  resolves to zero recognized matches fails OPEN (no deny) rather than locking
+  the zone out.
   **Unzoned interfaces (#4420 HI-2):** an interface that carries an address but
   is assigned to NO security zone is not covered by any per-zone view above, so
   before #4420 its firewall-local addresses fell through the chain's
@@ -1924,9 +2049,11 @@ never lock an operator out of a remote box it manages.
   host-inbound traffic at all). `applyHostInboundFilter` now also scopes a
   catch-all DROP to those addresses (`userspace.BuildUnzonedHostInboundAddrs`,
   counted under the reserved `junos-host` sentinel label so the #3361 scraper
-  reports them as `zone="junos-host"`). Lifelines are excluded and zoned
-  addresses subtracted, so it can never strand management or conflict with a zone
-  rule; it is emitted only when the zone model is in use (>= 1 zone), so a
+  reports them as `zone="junos-host"`). Lifeline INTERFACES are excluded and
+  zoned addresses subtracted, so it never conflicts with a zone rule — but an
+  unzoned drop carries NO service accept, so a management address shared onto an
+  unzoned interface is denied outright here (see the lifeline note above); it is
+  emitted only when the zone model is in use (>= 1 zone), so a
   bootstrap / zoneless box is left untouched. Unzoned interfaces are not
   AF_XDP-bound, so the kernel nft deny is the sole and sufficient enforcement
   point (no userspace-dp change). **Known limitation (#4420 HI-1):** the chain

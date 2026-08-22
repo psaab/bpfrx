@@ -513,9 +513,10 @@ type InterfaceSnapshot struct {
 	CoSPriorityLowMinShareBytes uint64 `json:"cos_priority_low_min_share_bytes,omitempty"`
 	// HostInbound* carry the per-interface host-inbound-traffic OVERRIDE
 	// (#3362). Junos models host-inbound at both the zone level (ZoneSnapshot
-	// above) and the interface level; the EFFECTIVE admission set for an
-	// interface is the UNION of the zone-level set and any interface-level
-	// override. These fields carry that already-unioned effective set and are
+	// above) and the interface level; an interface that declares an
+	// interface-level stanza is described ENTIRELY by it — the zone-level set is
+	// REPLACED, not unioned (#6515). These fields carry that already-resolved
+	// effective set and are
 	// populated ONLY for an interface that declared an interface-level stanza
 	// (and is not a management/cluster-control lifeline). When present the Rust
 	// dataplane keys the host-inbound admission check by ingress interface

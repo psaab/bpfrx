@@ -11,9 +11,26 @@ pub(super) struct InjectedPacketTuple {
     pub protocol: u8,
 }
 
+/// #6563: is `ip` an address THIS FIREWALL answers for?
+///
+/// `local_v4`/`local_v6` are the GLOBAL local-address membership sets — every
+/// interface host address plus every static-NAT/DNAT external IP, table
+/// agnostic. Global membership is the right question for SOURCE validation
+/// ("is this address ours at all?"), which is deliberately weaker than the
+/// table-scoped test `lookup_forwarding_resolution` uses to DECIDE local
+/// delivery: an address owned only in another VRF is still ours, and emitting
+/// from it is not third-party spoofing.
+pub(super) fn is_firewall_local_address(state: &ForwardingState, ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => state.local_v4.contains(&v4),
+        IpAddr::V6(v6) => state.local_v6.contains(&v6),
+    }
+}
+
 pub(super) fn validate_injected_packet_tuple(
     req: &InjectPacketRequest,
     dst: IpAddr,
+    forwarding: &ForwardingState,
 ) -> Result<InjectedPacketTuple, String> {
     if req.tuple_metadata_version != INJECT_PACKET_TUPLE_PROTOCOL_VERSION {
         return Err(format!(
@@ -51,6 +68,27 @@ pub(super) fn validate_injected_packet_tuple(
         return Err(format!(
             "emit-on-wire supports only protocol {} for this address family (got {})",
             protocol, req.protocol
+        ));
+    }
+
+    // #6563: `--emit-on-wire` puts a real frame on a real egress interface, and
+    // the emit path runs FIB, HA and CoS/output-filter processing but NEVER
+    // security policy, screen, or any source check — so before this an
+    // operator-arbitrary `source_ip` was emitted verbatim. That is a spoofing
+    // primitive, not a diagnostic: the usual "loopback gRPC, therefore
+    // administrator-only" bound does not hold here, because #5278 establishes
+    // that any provisioned login-class shell user reaches this plane.
+    //
+    // The source must therefore be an address the firewall itself owns. This
+    // gate is on the EMIT path only — `inject-packet` WITHOUT `--emit-on-wire`
+    // classifies a synthetic packet and puts nothing on the wire, so it keeps
+    // its full diagnostic range including foreign sources.
+    if !is_firewall_local_address(forwarding, source_ip) {
+        return Err(format!(
+            "emit-on-wire source_ip {source_ip} is not an address this firewall \
+             owns — emitting it would put a spoofed source on the wire, \
+             bypassing the security policy and screen that govern transit \
+             traffic; use a local interface or static-NAT address"
         ));
     }
 
@@ -214,7 +252,8 @@ impl super::Coordinator {
                         let target_live = self.workers.live.get(&target_slot).ok_or_else(|| {
                             format!("binding slot {} has no live state", target_slot)
                         })?;
-                        let tuple = validate_injected_packet_tuple(&req, dst)?;
+                        let tuple =
+                            validate_injected_packet_tuple(&req, dst, &self.forwarding)?;
                         let frame = build_injected_packet(
                             &req,
                             tuple.source_ip,

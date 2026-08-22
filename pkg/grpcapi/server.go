@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/authz"
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/clusterfailover"
 	"github.com/psaab/xpf/pkg/config"
@@ -42,6 +43,7 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -52,6 +54,23 @@ import (
 // is rejected at the transport with ResourceExhausted rather than buffered and
 // fed to the parser.
 const maxRecvMsgSize = 16 << 20 // 16 MiB
+
+// maxConcurrentStreams caps how many RPCs one HTTP/2 connection may have in
+// flight (#6552). grpc-go's SERVER default is unlimited, so before this a
+// single connection could open an unbounded number of concurrent streams —
+// which is the multiplier that turns a per-request cost into an amplification.
+// It is the transport-level companion to the diagnostic semaphore in
+// exec_timeout.go: the semaphore bounds how many forks run at once, this
+// bounds how many requests can be queued behind it holding handler goroutines
+// and stream state.
+//
+// 256 is far above any real operator load — the local CLI, the remote CLI, the
+// Prometheus scrape and the peer's fabric calls together sit in the low tens,
+// and long-lived streams (MonitorInterface) are single-digit — so it is a
+// runaway ceiling, not a throttle. Applied to BOTH servers: the loopback one
+// is not administrator-only (per open #5278), and
+// the fabric one is reachable by anything on the fabric segment.
+const maxConcurrentStreams = 256
 
 // Config configures the gRPC server.
 type Config struct {
@@ -130,6 +149,19 @@ type Config struct {
 	// unit-test / no-daemon build, where showSystemServices falls back to the
 	// documented loopback defaults.
 	ListenersFn func() sysservices.Listeners
+	// KernelUpgradeStatusFn returns the #1930 kernel-channel state for
+	// `show system kernel-upgrade` (#6495). Wired by the daemon, which reads
+	// the durable journal + promotion marker + last-roll record and supplies
+	// the cluster hold reason it alone knows. nil in a unit-test / no-daemon
+	// build, where the topic reports an idle channel.
+	KernelUpgradeStatusFn func() upgrade.ChannelStatus
+	// BootstrapImportFn returns the recorded day-0 / bootstrap config-import
+	// outcome for `show system bootstrap-import` (#6496). Wired by the daemon
+	// to Daemon.BootstrapImportSnapshot — the SAME recorded snapshot /health
+	// reports, so the two surfaces cannot disagree about whether a day-0
+	// config applied. nil in a unit-test / no-daemon build, where the topic
+	// reports that the daemon has not recorded an outcome.
+	BootstrapImportFn func() bootstrapshow.Snapshot
 	// PeerLookupFn overrides how the primary listener's #5278 authorization
 	// gate learns which local account owns a connection. Production leaves it
 	// nil and the gate calls authz.LookupPeer, which reads the kernel's socket
@@ -179,6 +211,13 @@ type Server struct {
 	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
 	// no-daemon unit-test build.
 	listenersFn func() sysservices.Listeners
+	// kernelUpgradeStatusFn backs the `kernel-upgrade` ShowText topic (#6495).
+	// Wired from Config.KernelUpgradeStatusFn; nil in a no-daemon unit build.
+	kernelUpgradeStatusFn func() upgrade.ChannelStatus
+	// bootstrapImportFn returns the recorded day-0 import outcome for the
+	// `bootstrap-import` ShowText topic (#6496). Wired from
+	// Config.BootstrapImportFn; nil in a no-daemon unit-test build.
+	bootstrapImportFn func() bootstrapshow.Snapshot
 	// requestedAddr is the primary gRPC bind requested at construction
 	// (--grpc-addr). Immutable, so it is read without effMu; it is the fallback
 	// address reported while pre-bind and on a bind failure (#6385/#6401).
@@ -315,6 +354,8 @@ func NewServer(addr string, cfg Config) *Server {
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
 		listenersFn:           cfg.ListenersFn,
+		kernelUpgradeStatusFn: cfg.KernelUpgradeStatusFn,
+		bootstrapImportFn:     cfg.BootstrapImportFn,
 		peerLookupFn:          cfg.PeerLookupFn,
 	}
 }
@@ -524,6 +565,7 @@ func (s *Server) buildPrimaryServer() *grpc.Server {
 	stream := append([]grpc.StreamServerInterceptor{s.principalStreamInterceptor}, loopbackStream...)
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.MaxConcurrentStreams(maxConcurrentStreams), // #6552
 		// #5278: resolve the caller's identity ONCE per connection, at
 		// connection setup, and authorize every RPC against it. TagConn runs on
 		// grpc-go's per-connection goroutine, not its accept loop, so the
@@ -653,6 +695,7 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 func (s *Server) buildFabricServer() *grpc.Server {
 	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.MaxConcurrentStreams(maxConcurrentStreams), // #6552
 		// #5883: peerMarker runs LAST in the chain on purpose —
 		// ChainUnaryInterceptor invokes in order, so #4107 auth and the #4122
 		// allowlist have both already accepted the call before the hop markers

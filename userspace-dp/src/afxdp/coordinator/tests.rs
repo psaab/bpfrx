@@ -11,6 +11,24 @@ use crate::{
     CoSSchedulerMapSnapshot,
 };
 
+/// #6563: a `ForwardingState` that OWNS the given addresses, i.e. they are in
+/// the global local-address membership sets `local_v4`/`local_v6`. The
+/// emit-on-wire source gate admits exactly these.
+fn forwarding_owning(addrs: &[IpAddr]) -> ForwardingState {
+    let mut state = ForwardingState::default();
+    for addr in addrs {
+        match addr {
+            IpAddr::V4(v4) => {
+                state.local_v4.insert(*v4);
+            }
+            IpAddr::V6(v6) => {
+                state.local_v6.insert(*v6);
+            }
+        }
+    }
+    state
+}
+
 #[test]
 fn stamp_injected_packet_tuple_builds_ipv4_icmp_flow_key() {
     let mut meta = UserspaceDpMeta {
@@ -29,7 +47,9 @@ fn stamp_injected_packet_tuple_builds_ipv4_icmp_flow_key() {
         destination_port: Some(0),
         ..Default::default()
     };
-    let tuple = inject::validate_injected_packet_tuple(&req, dst).expect("validate tuple");
+    let owned = forwarding_owning(&[IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))]);
+    let tuple =
+        inject::validate_injected_packet_tuple(&req, dst, &owned).expect("validate tuple");
     let egress = EgressInterface {
         bind_ifindex: 12,
         vlan_id: 0,
@@ -79,8 +99,9 @@ fn stamp_injected_packet_tuple_builds_ipv6_icmp_flow_key() {
         destination_port: Some(0),
         ..Default::default()
     };
-    let tuple =
-        inject::validate_injected_packet_tuple(&req, IpAddr::V6(dst)).expect("validate tuple");
+    let owned = forwarding_owning(&[IpAddr::V6(src)]);
+    let tuple = inject::validate_injected_packet_tuple(&req, IpAddr::V6(dst), &owned)
+        .expect("validate tuple");
     let egress = EgressInterface {
         bind_ifindex: 12,
         vlan_id: 80,
@@ -105,6 +126,186 @@ fn stamp_injected_packet_tuple_builds_ipv6_icmp_flow_key() {
     assert_eq!(flow.forward_key.dst_port, 0);
 }
 
+// ── #6563: emit-on-wire source validation ───────────────────────────
+//
+// `--emit-on-wire` puts a real frame on a real egress interface. The emit path
+// runs FIB, HA and CoS/output-filter processing but NEVER security policy,
+// screen, or any source check — `inject.rs` contained zero references to
+// policy or screen — so `source_ip` was operator-arbitrary and emitted
+// verbatim. That is a spoofing primitive: a local principal could put spoofed
+// ICMP/ICMPv6 on the wire, bypassing the zone policy and screen that govern
+// transit traffic. The usual "loopback gRPC, therefore administrator-only"
+// bound does not hold here — #5278 establishes that any provisioned
+// login-class shell user reaches this plane.
+//
+// The source must now be an address the firewall itself owns (the global
+// `local_v4`/`local_v6` membership sets: interface host addresses plus
+// static-NAT/DNAT externals).
+//
+// FAIL-ON-REVERT: delete the `is_firewall_local_address` gate from
+// `validate_injected_packet_tuple` and the foreign-source cases below are
+// accepted again.
+
+#[test]
+fn emit_on_wire_refuses_a_foreign_source_ip() {
+    let req = InjectPacketRequest {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        destination_ip: "172.16.80.200".into(),
+        tuple_metadata_version: INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+        // Not an address this firewall owns — a third party's.
+        source_ip: "203.0.113.7".into(),
+        source_port: Some(0x1234),
+        destination_port: Some(0),
+        ..Default::default()
+    };
+    let owned = forwarding_owning(&[IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))]);
+
+    let err = inject::validate_injected_packet_tuple(
+        &req,
+        IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        &owned,
+    )
+    .expect_err("a foreign source_ip must not be emitted on the wire");
+    assert!(err.contains("203.0.113.7"), "{err}");
+    assert!(err.contains("not an address this firewall"), "{err}");
+}
+
+#[test]
+fn emit_on_wire_refuses_a_foreign_source_ipv6() {
+    let src = "2001:db8:dead::1".parse::<Ipv6Addr>().unwrap();
+    let dst = "2001:db8:80::200".parse::<Ipv6Addr>().unwrap();
+    let req = InjectPacketRequest {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        destination_ip: "2001:db8:80::200".into(),
+        tuple_metadata_version: INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+        source_ip: "2001:db8:dead::1".into(),
+        source_port: Some(0x4321),
+        destination_port: Some(0),
+        ..Default::default()
+    };
+    // The firewall owns a DIFFERENT v6 address, so the refusal is about this
+    // source and not about an empty state.
+    let owned = forwarding_owning(&[IpAddr::V6("2001:db8:80::8".parse().unwrap())]);
+
+    let err = inject::validate_injected_packet_tuple(&req, IpAddr::V6(dst), &owned)
+        .expect_err("a foreign IPv6 source must not be emitted on the wire");
+    assert!(err.contains("2001:db8:dead::1"), "{err}");
+    let _ = src;
+}
+
+#[test]
+fn emit_on_wire_accepts_a_local_interface_source() {
+    // The positive control. Without it the gate could refuse everything and
+    // both refusal tests would still pass.
+    let req = InjectPacketRequest {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        destination_ip: "172.16.80.200".into(),
+        tuple_metadata_version: INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+        source_ip: "172.16.80.8".into(),
+        source_port: Some(0x1234),
+        destination_port: Some(0),
+        ..Default::default()
+    };
+    let owned = forwarding_owning(&[IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))]);
+
+    let tuple = inject::validate_injected_packet_tuple(
+        &req,
+        IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        &owned,
+    )
+    .expect("a firewall-owned source must be accepted");
+    assert_eq!(tuple.source_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+}
+
+#[test]
+fn emit_on_wire_accepts_a_static_nat_external_source() {
+    // `local_v4` carries static-NAT/DNAT externals as well as interface host
+    // addresses. Those are addresses the firewall answers for, so emitting
+    // from one is not third-party spoofing and must not be refused.
+    let nat_external = Ipv4Addr::new(198, 51, 100, 20);
+    let req = InjectPacketRequest {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        destination_ip: "172.16.80.200".into(),
+        tuple_metadata_version: INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+        source_ip: "198.51.100.20".into(),
+        source_port: Some(0x1234),
+        destination_port: Some(0),
+        ..Default::default()
+    };
+    let owned = forwarding_owning(&[IpAddr::V4(nat_external)]);
+
+    inject::validate_injected_packet_tuple(
+        &req,
+        IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        &owned,
+    )
+    .expect("a firewall-owned NAT external source must be accepted");
+}
+
+#[test]
+fn emit_on_wire_source_gate_is_the_last_check() {
+    // Ordering matters for the operator-facing message: a request that is BOTH
+    // malformed AND foreign-sourced must report the STRUCTURAL fault, so the
+    // structural tests above cannot pass for the source gate's reason and vice
+    // versa. Parse -> validate shape -> authorize.
+    let req = InjectPacketRequest {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP, // structural fault: not ICMP for v4
+        destination_ip: "172.16.80.200".into(),
+        tuple_metadata_version: INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+        source_ip: "203.0.113.7".into(), // also foreign
+        source_port: Some(0x1234),
+        destination_port: Some(0),
+        ..Default::default()
+    };
+    let err = inject::validate_injected_packet_tuple(
+        &req,
+        IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        &forwarding_owning(&[]),
+    )
+    .expect_err("must fail");
+    assert!(
+        err.contains("supports only protocol"),
+        "structural fault must be reported before the source gate: {err}"
+    );
+}
+
+#[test]
+fn is_firewall_local_address_is_family_exact() {
+    // A v4 address must not be admitted by a v6 membership entry or vice
+    // versa — the sets are separate and the match arms must not be crossed.
+    let state = forwarding_owning(&[
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+    ]);
+    assert!(inject::is_firewall_local_address(
+        &state,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+    ));
+    assert!(inject::is_firewall_local_address(
+        &state,
+        IpAddr::V6("2001:db8::1".parse().unwrap())
+    ));
+    assert!(!inject::is_firewall_local_address(
+        &state,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+    ));
+    assert!(!inject::is_firewall_local_address(
+        &state,
+        IpAddr::V6("2001:db8::2".parse().unwrap())
+    ));
+    // An empty state owns nothing.
+    let empty = forwarding_owning(&[]);
+    assert!(!inject::is_firewall_local_address(
+        &empty,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+    ));
+}
+
 #[test]
 fn validate_injected_packet_tuple_rejects_legacy_wire_request() {
     let req = InjectPacketRequest {
@@ -118,7 +319,11 @@ fn validate_injected_packet_tuple_rejects_legacy_wire_request() {
     };
 
     let err =
-        inject::validate_injected_packet_tuple(&req, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)))
+        inject::validate_injected_packet_tuple(
+            &req,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            &forwarding_owning(&[IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))]),
+        )
             .expect_err("legacy request must fail closed");
     assert!(err.contains("tuple metadata version"), "{err}");
 }
@@ -137,7 +342,11 @@ fn validate_injected_packet_tuple_rejects_protocol_mismatch() {
     };
 
     let err =
-        inject::validate_injected_packet_tuple(&req, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)))
+        inject::validate_injected_packet_tuple(
+            &req,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            &forwarding_owning(&[IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))]),
+        )
             .expect_err("non-ICMP tuple must fail closed");
     assert!(err.contains("supports only protocol"), "{err}");
 }

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -35,13 +36,89 @@ func newClusterManager(primary bool) *cluster.Manager {
 
 // TestHandleConfigSync_RejectsWhenPrimary verifies that the RG0 primary
 // rejects incoming config sync (prevents secondary from overwriting).
+//
+// The returned ERROR is load-bearing, not incidental. `configApplyLoop`
+// advances the config high-water (`recordAppliedConfigGen`) ONLY on a nil
+// `OnConfigReceived` return (M-2/#4151), so a short-circuit that returned nil
+// here would advance `lastAppliedConfigGen` past a config this node never
+// applied — the primary's re-push of that same generation would then be
+// dropped by `shouldApplyConfigGen` as stale and the node would sit silently
+// diverged. Asserting only "it did not panic on the nil store" cannot see that:
+// verified by mutation at `daemon_ha_sync.go`'s rejection arm — replacing
+// `return errConfigSyncRejectedPrimary` with `return nil` left the pre-#6419
+// form of this test GREEN.
+//
+// The `err == nil` check below is NOT redundant with the `errors.Is`. Go
+// defines `errors.Is(nil, nil)` as true (`errors/wrap.go`: `if err == nil ||
+// target == nil { return err == target }`), so mutating the production sentinel
+// itself to a nil `error` makes the handler return nil AND satisfies
+// `errors.Is` — the #6419 form of this test was still vacuous against that
+// mutation. Checking non-nil first closes it.
+//
+// #6419: this rejection is also half of the reason the "reuse the authority's
+// own config-generation namespace" shortcut cannot close the active/active
+// reverse direction — see the `stampInstallGenV4` comment and
+// docs/session-sync-architecture.md. Each counter is live in exactly one role
+// (`configGenCounter` on the authority, `lastAppliedConfigGen` off it), which
+// is why the shortcut cannot be written role-free.
 func TestHandleConfigSync_RejectsWhenPrimary(t *testing.T) {
 	d := &Daemon{
 		cluster: newClusterManager(true),
 	}
-	// If the guard doesn't work, handleConfigSync would panic accessing
-	// d.store (nil). A successful return means the guard rejected the config.
-	d.handleConfigSync("set system host-name bad-config")
+	// Reaching the assertion at all proves the short-circuit fired: without the
+	// guard, the call falls through and panics on this Daemon's nil dependencies
+	// (`applySem` is dereferenced before the nil store is ever reached). The
+	// assertions then prove it short-circuited as a REJECTION, not a silent
+	// success.
+	err := d.handleConfigSync("set system host-name bad-config")
+	if err == nil {
+		t.Fatal("RG0 primary must REJECT a peer config push with a NON-NIL error " +
+			"so configApplyLoop leaves the config high-water pinned (M-2/#4151); got nil")
+	}
+	if !errors.Is(err, errConfigSyncRejectedPrimary) {
+		t.Fatalf("RG0 primary rejection must be errConfigSyncRejectedPrimary; got err = %v", err)
+	}
+}
+
+// TestConfigReceivedWiringPropagatesRejection binds the production WIRING, not
+// the handler it calls.
+//
+// TestHandleConfigSync_RejectsWhenPrimary invokes `d.handleConfigSync` directly,
+// but nothing in production does. `configApplyLoop` calls
+// `SessionSync.OnConfigReceived`, and the only thing that ever populates that
+// field is the assignment in `wireSessionSyncConfigCallbacks`. A closure that
+// called the handler and then returned nil regardless would keep every direct
+// handler test green while `configApplyLoop` recorded the config as APPLIED —
+// exactly the silent-divergence outcome those tests exist to prevent.
+//
+// Verified: rewriting that closure's tail to `_ = d.handleConfigSync(configText);
+// return nil` left the ENTIRE pkg/daemon suite green before this test existed.
+// This test reds on that mutation and on deletion of the assignment itself.
+func TestConfigReceivedWiringPropagatesRejection(t *testing.T) {
+	d := &Daemon{
+		cluster: newClusterManager(true),
+	}
+	ss := cluster.NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	d.wireSessionSyncConfigCallbacks(ss)
+
+	if ss.OnConfigReceived == nil {
+		t.Fatal("wireSessionSyncConfigCallbacks must install OnConfigReceived — " +
+			"configApplyLoop has no other source for it")
+	}
+
+	// Drive the callback the way configApplyLoop does. This node is RG0 primary,
+	// so the handler rejects; the wiring must hand that rejection back unchanged,
+	// because configApplyLoop advances lastAppliedConfigGen on a nil return.
+	err := ss.OnConfigReceived("set system host-name bad-config")
+	if err == nil {
+		t.Fatal("OnConfigReceived must PROPAGATE the RG0-primary rejection; it returned nil, " +
+			"so configApplyLoop would record an un-applied config as applied and the peer's " +
+			"re-push of that generation would then be dropped as stale (M-2/#4151)")
+	}
+	if !errors.Is(err, errConfigSyncRejectedPrimary) {
+		t.Fatalf("OnConfigReceived must propagate errConfigSyncRejectedPrimary unchanged; got err = %v", err)
+	}
 }
 
 // TestHandleConfigSync_AcceptsWhenSecondary verifies that a secondary node

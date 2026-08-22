@@ -2127,7 +2127,7 @@ type ZoneInfo struct {
 	// interface_host_inbound (#3328, #3362) carries per-interface host-inbound
 	// overrides. An entry exists only for an interface that declares its own
 	// `host-inbound-traffic` stanza; the effective admission set for that
-	// interface is the UNION of the zone-level set above and its override.
+	// interface IS the override — it REPLACES the zone-level set above (#6515).
 	InterfaceHostInbound []*InterfaceHostInbound `protobuf:"bytes,15,rep,name=interface_host_inbound,json=interfaceHostInbound,proto3" json:"interface_host_inbound,omitempty"`
 	// lifeline_interfaces (#3682) lists the zone's interfaces that are
 	// management / cluster-control LIFELINES (fxp0 / em0 / fab* / configured
@@ -6674,7 +6674,8 @@ type MatchPoliciesRequest struct {
 	// ingress interface's effective host-inbound view (#5579). A zone can carry
 	// multiple per-interface host-inbound views (#3362); without this selector the
 	// classifier reports "ambiguous" when they disagree. With it, only this
-	// interface's effective view (zone-level ∪ per-interface override) is
+	// interface's effective view (its per-interface override where declared,
+	// which REPLACES the zone-level set — #6515 — else the zone-level set) is
 	// classified, so an operator can certify one interface's TRUE host-inbound
 	// posture (admit vs deny) instead of a zone-wide first-admit fold. The ref must
 	// name an interface assigned to from_zone; an unknown / zone-mismatched /

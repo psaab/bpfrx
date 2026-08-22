@@ -178,7 +178,7 @@ fn per_interface_override_keys_by_ifindex() {
 
     // Uplink (override present): admits ssh, denies https, and does NOT
     // inherit the zone's ping (the override REPLACES the zone set on this
-    // interface — its set is the Go-side effective union).
+    // interface — #6515 — and the carried set is already resolved in Go).
     assert!(
         host_inbound_admits_iface(&state, IFINDEX_UPLINK, ZONE, TCP, 22, false, 0),
         "uplink override must admit ssh (tcp/22)",

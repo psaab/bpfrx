@@ -577,15 +577,30 @@ func TestNftRuleFromTermAddressSemantics3433(t *testing.T) {
 			want: "ip saddr 172.16.0.0/24 drop",
 		},
 		{
-			// H09: an all-malformed positive literal set is constrained + empty
-			// (parse drops the bad token) -> match NOTHING (skip). The pre-fix
-			// code emitted `ip saddr 10.0.0.0/99 ...` -> atomic load failure.
-			name: "malformed positive literal -> match nothing (skip)",
+			// H09, REVISED by #6512: a malformed literal is emitted VERBATIM so
+			// `nft -f -` REJECTS the whole ruleset and the prior generation is
+			// retained — the same fail-closed posture this oracle already has for
+			// an unresolvable port / DSCP token (#6405), and the behavior the
+			// production netlink builder now has (filterFamilyAddrs errors).
+			//
+			// #3433 originally dropped the token silently to reach "match
+			// NOTHING (skip)", for two reasons that later work retired. (1) "it
+			// breaks a legitimate commit": a malformed LITERAL can no longer be
+			// committed at all — validateFilterAddressLiteralsStrict hard-rejects
+			// it. (2) "it leaves the kernel mirror ABSENT while userspace stays
+			// armed": on the lenient path a failed install now installs the #6476
+			// cold-boot fail-closed FENCE, so the kernel side is more restrictive
+			// than the filter, not absent. Meanwhile the silent drop was itself a
+			// fail-open on the shapes #6512 filed: a PARTIALLY malformed positive
+			// list installed a narrowed discard, and an all-malformed EXCEPT list
+			// emptied and dropped the predicate entirely, leaving the direction
+			// unconstrained (match ALL).
+			name: "malformed positive literal -> emitted verbatim (nft rejects, fail closed)",
 			term: &config.FirewallFilterTerm{
 				Name: "bad", SourceAddresses: []string{"10.0.0.0/99"}, Action: "accept",
 			},
 			fam:  "ip",
-			want: "",
+			want: "ip saddr 10.0.0.0/99 accept",
 		},
 		{
 			// Non-empty except is representable in nft as a negated set.

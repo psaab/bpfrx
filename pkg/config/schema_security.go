@@ -173,9 +173,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// / protocols as untyped containers — tokens validated by
 			// validateHostInboundTokensStrict, not the schema). A bare
 			// `interfaces <if>` (no body) stays valid (zone membership only). The
-			// effective admission set for an interface is the UNION of the
-			// zone-level set and this interface-level set (Junos additive
-			// semantics).
+			// effective admission set for an interface is THIS interface-level
+			// set when the stanza is present — it REPLACES the zone-level stanza
+			// below rather than adding to it (#6515; Junos: "Interface
+			// configuration overrides that of the zone"). A present-but-EMPTY
+			// body is a deny-all override, not a fallback to the zone set.
 			"interfaces": {desc: "Interfaces in this zone", wildcard: &schemaNode{
 				desc: "Interface name", valueHint: ValueHintInterfaceName, placeholder: "<interface-name>",
 				children: map[string]*schemaNode{
@@ -630,7 +632,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"proxy-arp": {desc: "Proxy ARP for NAT pool addresses", children: map[string]*schemaNode{
 			"interface": {desc: "Interface to answer proxy ARP on", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-				"address": {desc: "Address or range to answer ARP for", args: 1, multi: true, placeholder: "<address>", children: nil},
+				"address": {desc: "Address, prefix or range to answer ARP for", args: 1, multi: true, placeholder: "<address>", children: nil},
 			}},
 		}},
 	}},

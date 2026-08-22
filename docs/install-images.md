@@ -1,10 +1,11 @@
 # xpf appliance images (#1879 Path C)
 
 vSRX-style prebuilt-image distribution: one bootable root disk, built
-offline, carrying everything xpf needs — the LATEST Ubuntu release
-(operator policy: always the newest — 26.04 today, discovered at bake
-time), a >= 6.18 kernel (the AF_XDP shim's verifier floor; 26.04 ships
-7.0), FRR, strongSwan, Kea, chrony, systemd-networkd, and the xpf
+offline, carrying everything xpf needs — a REVIEWED-PIN Ubuntu base
+(`PINNED_BASE_RELEASE` in `bake.py`, 26.04 LTS today; bumping it is a
+deliberate, reviewed commit, **not** auto-latest — #1943), a >= 6.18
+kernel (the AF_XDP shim's verifier floor; 26.04 ships 7.0), FRR,
+strongSwan, Kea, chrony, systemd-networkd, and the xpf
 binaries (`xpfd`, `cli`, `xpf-userspace-dp`) with their systemd units.
 There is no dependency matrix to install and no kernel hunt: the image
 IS the dependency closure.
@@ -67,10 +68,12 @@ Pipeline (offline — the image is never booted to provision it):
    binaries into the `xpf` Debian package (binary set staged under
    `/usr/local/share/xpf/staged`). The bake installs that `.deb` instead
    of copying raw binaries.
-2. Discover the LATEST Ubuntu release from the upstream listing
-   (`XPF_BASE_RELEASE` pins one), then fetch + SHA256-verify the
-   official Ubuntu *server cloudimg*. Upstream owns partitioning and
-   the UEFI/BIOS bootloader.
+2. Resolve the base release from the **reviewed pin**
+   (`PINNED_BASE_RELEASE = "26.04"`, `bake.py`), then fetch the official
+   Ubuntu *server cloudimg* and authenticate it against
+   `PINNED_BASE_SHA256` — a trust anchor the mirror does not control.
+   An unpinned base is **refused**; see "Base-image pin policy" below.
+   Upstream owns partitioning and the UEFI/BIOS bootloader.
 3. `virt-resize` the root partition into an 8 GiB work disk
    (`XPF_IMAGE_DISK_SIZE` overrides). This is the *floor* size: an
    operator who provisions a larger root disk gets the extra space
@@ -141,7 +144,13 @@ Pipeline (offline — the image is never booted to provision it):
    verified in-place cut-over is owned by the package itself; see
    `docs/in-place-upgrade.md` for the full state machine.
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
-   bash history, package caches, random seed; `/etc/xpf` factory-empty.
+   bash history, package caches, random seed, the SNMPv3 EngineID +
+   engineBoots (#5283); `/etc/xpf` factory-empty. The operations and the
+   purged paths come from `SYSPREP_ENABLE_OPS` / `SYSPREP_PURGE_PATHS` in
+   `bake.py` — one source, so the validation gate can bind to it. The gate
+   VERIFIES the outcome on the exported artifact before signing (#6547); it
+   previously asserted nothing about sealing, so a clone-identity regression
+   would have shipped signed.
 6. Export compressed qcow2 + incus metadata tarball + the per-version
    `xpf-<ver>.SHA256SUMS` checksum manifest. The manifest is NOT signed
    yet — signing is deferred to AFTER the validation gate (step 8, #4017).
@@ -166,9 +175,9 @@ Pipeline (offline — the image is never booted to provision it):
 
 Each bake also writes `dist/xpf-<ver>.manifest` recording the exact
 inputs (base image URL + release + verified SHA256, git commit, bake
-date/host kernel). Bakes are not bit-reproducible (the base tracks
-the newest upstream release unless `XPF_BASE_RELEASE` pins one); the
-manifest is the traceability record. The manifest ALSO records the
+date/host kernel). Bakes are not bit-reproducible even at a fixed
+base release — the mirror's package versions move between bakes — so
+the manifest is the traceability record. The manifest ALSO records the
 staged binary's compile-time protocol versions (`ha_protocol_version`,
 `ha_protocol_min_compat`, `session_sync_protocol_version`,
 `configdb_*_version`, from `xpfd protocol-versions`); the #1930 LANE-2
@@ -177,6 +186,81 @@ without booting the image — whether a rolling image-replace can preserve
 sessions across the mixed-base window or must replace both nodes at once.
 See `docs/in-place-upgrade.md` (Kernel / OS upgrade lanes) for the full
 LANE-1/2/3 decision rule and the state-carry contract.
+
+### Base-image pin policy (#1943 / #4904-B)
+
+The base is a **reviewed pin**, not mirror-latest. Two constants in
+`scripts/image/bake.py` are the contract:
+
+| Constant | What it pins | How it moves |
+|---|---|---|
+| `PINNED_BASE_RELEASE` | the Ubuntu release (`"26.04"`) | a reviewed commit (a PR), never automatically |
+| `PINNED_BASE_SHA256` | that release's base-image digest | a reviewed commit, after re-verifying Canonical's GPG-signed `SHA256SUMS` against the UEC signing key `D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81` |
+
+The old default scraped `cloud-images.ubuntu.com` and took the
+highest-numbered listing, which silently selects whatever the mirror
+calls newest — a non-LTS (26.10), or the *previous* release (25.10) when
+an LTS image lags publication. That drift is what the pin forbids.
+
+The digest pin is a supply-chain **trust anchor**, not a convenience: the
+image and its `SHA256SUMS` come from the same configurable mirror
+endpoint, so a same-endpoint checksum authenticates nothing against a
+compromised mirror or a TLS/DNS/CA compromise — the mirror can serve
+matching malicious bytes *and* hash, and xpf would then sign the result
+with its RELEASE key.
+
+**Refusals you can expect** (all `die()`, non-zero exit):
+
+- the downloaded base digest does not match `PINNED_BASE_SHA256` — a
+  wrong/compromised mirror, or a stale pin after a Canonical respin
+  (re-verify the GPG-signed `SHA256SUMS`, then bump the pin in a
+  reviewed commit);
+- the resolved release has **no** pin entry and no `XPF_BASE_SHA256` —
+  the bake refuses rather than trusting a same-endpoint checksum.
+
+**Opt-in overrides** (all one-off, none of them the default):
+
+| Env var | Effect |
+|---|---|
+| `XPF_BASE_RELEASE=<rel>` | use `<rel>` instead of `PINNED_BASE_RELEASE` for this run |
+| `XPF_BASE_SHA256=<digest>` | supply the trust anchor for this run (e.g. a point respin between reviewed bumps); wins over the repo constant |
+| `XPF_UBUNTU_AUTODISCOVER=1` | opt back into mirror-latest discovery — off by default |
+| `XPF_ALLOW_UNPINNED_BASE=1` | proceed with an unauthenticated base. The bake warns loudly and the manifest records `base_image_pinned: false` |
+
+An `XPF_ALLOW_UNPINNED_BASE=1` bake is **not publishable**:
+`publish.py`'s `gate_provenance` refuses `base_image_pinned != true`
+fail-closed (#5815), with no override — a signed unpinned image is not
+releasable. The test VM follows the same policy: `test/incus/setup.sh`
+tracks whatever release production was last baked at, deliberately,
+rather than the newest Ubuntu on the day you run `make test-vm`.
+**What the image SHIPS (#6500).** `bake_host_kernel` above is the BUILD
+HOST's kernel (`os.uname().release`) and answers a different question
+from "what does this image carry". Two additional records close that:
+
+- `guest_kernel:` in the `.manifest` — the kernel the IMAGE runs, i.e.
+  the exact artifact the #1930 LANE-1 channel promotes.
+- `dist/xpf-<ver>.pkgs` — the full installed package inventory
+  (`name=version`, one per line, plus the guest kernel), **covered by the
+  signed `xpf-<ver>.SHA256SUMS`** exactly like the `.manifest` sidecar
+  (#5042), so it is authenticated the moment the manifest signature
+  verifies.
+
+The bake writes the same record INSIDE the image at
+`/etc/xpf/image-inventory` and reads it back out **offline with
+`virt-cat`** — no boot — so "does release X ship openssl 3.x.y
+(CVE-YYYY)?" and "which kernel does image X carry, so I can plan a
+LANE-1 arm?" are answered from the dist tree, and the copy that stays in
+the image answers them on the box too.
+
+Both are **fail-closed at publish**: `publish.py gate_provenance` refuses
+a release whose manifest has no `guest_kernel`, whose `.pkgs` sidecar is
+missing or not covered by the signed manifest, whose inventory is HOLLOW
+(a present-but-empty record satisfies a presence check and answers
+nothing), or whose two authenticated records disagree about the kernel —
+alongside the existing `validated` / `base_image_pinned` refusals. The
+format lives in `scripts/dist/image_inventory.py`, single-sourced because
+bake.py writes it and publish.py reads it and a divergence between those
+is always a bug.
 
 Full first-boot matrix (run after a bake, or standalone):
 
@@ -266,9 +350,19 @@ each VM its own copy-on-write overlay. Put the verified image there with
 Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
 `Before=xpfd.service`):
 
-- Probes volumes labeled `xpf-config` (any filesystem) plus any ISO9660
-  medium. Mounted `ro,nosuid,nodev,noexec`; only the two fixed
-  filenames at the volume root are considered; 4 MiB size cap;
+- Probes volumes labeled `xpf-config` (any filesystem) **first**, then
+  any ISO9660 medium. That order is the contract, not an accident:
+  a labeled volume is explicit operator intent and the ISO is the
+  vSRX-parity fallback, so with two valid-but-different media attached
+  the **labeled volume's** config is the one installed and stamped.
+  The dedup deliberately preserves first-appearance order
+  (`awk 'NF && !seen[$0]++'`) rather than sorting — `| sort -u`
+  alphabetized the merged list, so an ISO at `/dev/sda` beat a labeled
+  volume at `/dev/sdb`, and any `/dev/sd*` ISO beat a virtio-blk
+  `/dev/vd*` volume (#6502). Kernel device-name order is not operator
+  intent. A medium that is both labeled and ISO9660 is probed once, in
+  its labeled position. Mounted `ro,nosuid,nodev,noexec`; only the two
+  fixed filenames at the volume root are considered; 4 MiB size cap;
   validation under timeout. Nothing on the medium is executed.
 - On PASS the config is installed as `/etc/xpf/xpf.conf` (mode 0600 —
   it may carry credential material) and xpfd's normal
@@ -285,6 +379,46 @@ Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
   make a box that booted once (empty `.configdb` present) permanently
   skip the probe, killing the fix-and-reboot retry above. A box in
   factory bootstrap has no `active.json`, so the loader re-probes.
+
+### "My day-0 config did not apply" — where to look (#4184 / #6496)
+
+The boot-time config-import decision is RECORDED, so this is a question with an
+in-band answer rather than a journald hunt. From the CLI on the box (console or
+ssh, local `cli` or remote):
+
+```
+> show system bootstrap-import
+Bootstrap configuration import:
+  Status:   import-failed
+  Meaning:  a configuration file was present but could NOT be applied — see Error below
+  Recorded: 2026-08-21 14:02:11 UTC
+  Error:    day-0 config REJECTED by commit-check: ...
+
+  The box is in the lifeline-safe bootstrap state; ...
+```
+
+The four statuses are `ok` (imported + committed), `loaded-from-db` (an active
+config was already present, so no file import was attempted — the normal
+steady-state boot), `no-config` (nothing to import: the expected factory boot),
+and `import-failed` (a file was present but could not be read, parsed,
+committed, or survived the device-map strand preflight).
+
+`import-failed` is INFORMATIONAL, not a fault state: the box is in the
+lifeline-safe bootstrap state and still reachable, so neither this command nor
+`/health` treats it as a reason to pull the box. It also emits a
+`BOOTSTRAP_IMPORT_FAILED` event.
+
+The same status is on the loopback REST probe for scripted checks:
+
+```
+curl -s http://127.0.0.1:8080/health | jq '.data | {bootstrap_import_status, bootstrap_import_failed, bootstrap_import_unix}'
+```
+
+Use the CLI when you need the **reason**. `/health` deliberately reports the
+status enum, the failed flag and the timestamp but NOT the error text: that
+endpoint is unauthenticated, and an import error quotes the offending
+configuration, which can echo a submitted secret (#5031). The CLI and gRPC
+paths are authenticated, so they are the only surfaces that can tell you why.
 
 ### The `/etc/xpf/appliance` marker (#7114)
 
@@ -401,8 +535,15 @@ is a clean no-op.
 - Headless/SSH access comes from the day-0 config (`system
   root-authentication`, `system login user ...`) — set credentials
   there, or use the console once and `commit` a config.
-- The image ships no ssh host keys, no machine-id, no logs; both are
-  regenerated per-instance at first boot.
+- The image ships no ssh host keys, no machine-id, no SNMPv3 EngineID and
+  no random-seed, and no logs; each is regenerated per-instance at first
+  boot, so no per-device identity is shared across clones. This is
+  ENFORCED, not merely performed: the pre-sign validation gate reads the
+  exported qcow2 offline and refuses to let an unsealed image be signed
+  (#6547). Before that it was performed and never verified, so a member
+  silently falling out of the seal would have shipped a signed image whose
+  every clone answered SSH with the same host key and accepted every other
+  clone's authenticated SNMPv3 requests.
 - Verify artifacts with their minisign-signed per-version manifest
   (#1924): `xpf-deploy.py fetch` verifies the exact bytes against
   `xpf-<ver>.SHA256SUMS` + `.minisig`, or verify manually with
@@ -466,9 +607,36 @@ external tool is missing SKIPs rather than fails, so the runner is green
 on a minimal host and only goes RED on a genuine regression. It covers:
 
 - shell parse-check (`sh`/`bash -n`) + `shellcheck` over the image/dist
-  shell scripts (`xpf-day0-config`, `xpf-grow-root`, `selftest.sh`, …);
+  shell scripts (`xpf-day0-config`, `xpf-grow-root`, `xpf-uefi-slots`,
+  `xpf-kernel-promote`, `selftest.sh`, …). That list is a HAND enumeration,
+  so `scripts/test_selftest_lint_coverage_6499.py` guards it both ways:
+  every shipped `scripts/image/xpf-*` shell script must be listed (a
+  shipped production script with no parse check at all — #6499), and
+  every listed path must still exist (`run-selftests.sh:103` skips a
+  missing path silently, so a rename deletes a lint leg without a word
+  in the output);
 - `scripts/image/test-grow-root.sh` — grow-root device resolution + stamp
   discipline (#1925);
+- `scripts/image/test_uefi_slots_6499.py` — the **boot-firmware**
+  registrar's destructive paths (#6499). `xpf-uefi-slots` mutates firmware
+  NVRAM on every boot of every shipped appliance — it deletes boot
+  entries, dedups them, and rewrites BootOrder — and `sh -n` +
+  `shellcheck` cannot see that a logic change wipes a customer box's
+  PXE/recovery entries or undoes a promoted kernel slot. The real script
+  runs under a real `/bin/sh` with a mock `efibootmgr` modelling NVRAM as
+  state files, so the four classes a reviewer caught during #1930 are
+  regression fixtures: wrong-loader-path deletion, duplicate dedup,
+  promoted-slot BootOrder preservation, and the empty-BootOrder no-write
+  guard (a reseed built from an unreadable BootOrder would emit
+  `--bootorder <A>,<B>` and wipe everything else). `[ -b "$ESP_DISK" ]` is
+  not relaxed by a test hook — the mock names a partition of a real host
+  block device — and only two path roots are overridable
+  (`XPF_UEFI_SLOTS_EFIVARS`, `XPF_UEFI_SLOTS_ESP`), the same pattern
+  `xpf-grow-root` uses;
+- `scripts/image/test_kernel_promote_explicit_path.py` — the promotion
+  gate's authority model AND its rc contract (`0` → continue, `3` →
+  reboot to known-good and still exit 0, `1`/other → infra error, do NOT
+  reboot into a bounce loop);
 - `scripts/image/test_bake_sign_ordering.py` — VALIDATE-before-SIGN
   ordering (#4017) + frr-pythontools presence;
 - `scripts/image/test_validate_scenarios.py` — the `validate.py` scenario

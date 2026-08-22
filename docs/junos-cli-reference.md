@@ -716,8 +716,11 @@ From zone: guest, To zone: lan
     the zone) AND the interface level (`set security zones security-zone <z>
     interfaces <if> host-inbound-traffic ...`, applies only to that interface).
     xpf now supports the interface-level stanza; the EFFECTIVE admission set for
-    an interface is the UNION of the zone-level set and its interface-level
-    override (Junos additive semantics). A zone is host-inbound-ENFORCING when it
+    an interface is its interface-level stanza when it declares one, otherwise
+    the zone-level set — the interface stanza REPLACES the zone stanza (#6515;
+    Junos: "Interface configuration overrides that of the zone"), and an
+    explicitly EMPTY interface stanza is a deny-all override, not a fallback.
+    A zone is host-inbound-ENFORCING when it
     declares a zone-level stanza OR any interface-level override — so an operator
     can expose a service (e.g. `ssh`) on one interface of a zone while denying it
     on the others by setting the override only on the exposed interface and
@@ -1059,7 +1062,8 @@ and report on the FIRST admitting view, so it certified a zone-wide
 DENIES — a false-admission diagnosis. Two changes remove it:
 
 - `ingress-interface <if>` scopes the host-inbound classification to ONE
-  interface's EFFECTIVE view (zone-level ∪ that interface's override), so the
+  interface's EFFECTIVE view (that interface's override where declared, which
+  REPLACES the zone-level set — #6515 — else the zone-level set), so the
   reported admission is that interface's TRUE posture (admit vs deny), not a
   zone-wide fold. The ref must name an interface assigned to `from-zone`; an
   unknown, zone-mismatched, or management/cluster lifeline (fxp0/em0/fab*) ref is
@@ -1378,6 +1382,38 @@ its logging/inversion intent (#3684):
   rows (`pkg/api/security.go`) and structured `GetPolicies` (#3363/#3624).
 
 ---
+
+## Security: NAT rules the dataplane does not install (#6534)
+
+Every `show security nat ...` topic renders rules from the committed
+configuration. A rule the userspace snapshot builder DROPS or DISARMS —
+because it is not representable and must fail closed — would otherwise
+render identically to an enforced one, so those rules carry an extra
+line:
+
+```
+source NAT rule: r1
+  Rule-set: rs1                        ID: 1
+    From zone: trust    To zone: untrust
+    Match:
+      Source addresses:      10.0.0.0/24
+      Destination addresses: 0.0.0.0/0
+    Action:                  pool nope
+    Status:                  NOT INSTALLED — references an undefined pool
+    Number of sessions:      0
+```
+
+The annotation appears on `show security nat source rule detail`,
+`destination rule detail`, `static [rule [detail]]`, and `nptv6`. It is
+emitted ONLY for a rule the dataplane is not enforcing, so output for a
+healthy configuration is unchanged.
+
+Reachability: the strict commit gates reject these configurations, so a
+rule cannot reach this state through `commit`. It reaches it through the
+lenient boot / HA peer-sync load path (#1960 no-brick) — a configuration
+persisted by an older binary, or synced from a peer. Seeing this line
+means the box is forwarding that traffic untranslated right now; the
+reason text names which condition fired.
 
 ## Security: NAT Source Rule All
 

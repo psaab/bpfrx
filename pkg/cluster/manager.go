@@ -158,6 +158,11 @@ type Manager struct {
 	// primary until the promotion gate verifies the dataplane. Set BEFORE
 	// Start() on a candidate boot; cleared by promote/rejoin/revert.
 	kernelUpgradeHold bool
+	// kernelUpgradeHoldReason is WHY the hold is set — one of the
+	// KernelUpgradeHold* constants (#6495). The flag alone cannot tell an
+	// operator whether they are waiting on a promotion gate or looking at an
+	// unreadable journal, and those have different remedies.
+	kernelUpgradeHoldReason string
 
 	// Peer state tracking (heartbeat).
 	peerAlive    bool
@@ -215,6 +220,21 @@ type Manager struct {
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
 	hbReceiver *heartbeatReceiver
+	// hbStartInWindowHook, when non-nil, is invoked by StartHeartbeat INSIDE the
+	// window the #7257 epoch guard covers — after the tenure is captured, before
+	// the sockets are created. Production leaves it nil; a test sets it to land a
+	// StopHeartbeat exactly there, which is the only way to drive the
+	// start-after-stop ordering deterministically. Without it the ordering can
+	// only be approached with a sleep, and a sleep samples whichever side wins
+	// on the day: the first version of that test passed against a build with the
+	// guard removed. Set once before StartHeartbeat; read on that path only.
+	hbStartInWindowHook func()
+	// hbEpoch identifies the current heartbeat lifecycle tenure (#7257).
+	// StopHeartbeat bumps it under mu; StartHeartbeat captures it on entry and
+	// refuses to publish if it moved while the sockets were being created. That
+	// is what makes a start that a teardown already superseded fail instead of
+	// installing a sender/receiver pair nothing holds a handle to. Guarded by mu.
+	hbEpoch uint64
 
 	// hbAuth is the #4107 control-channel authentication state for the peer:
 	// the anti-replay watermarks plus the sticky peer-authenticated flag. It

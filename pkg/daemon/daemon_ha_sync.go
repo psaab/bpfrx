@@ -395,10 +395,22 @@ func (d *Daemon) syncConfigToPeer() {
 	d.pushConfigToPeer()
 }
 
-// pushConfigToPeer sends the active config to the cluster peer unconditionally
-// (does not check primary/secondary status). Used both by normal commit sync
-// and by the peer-reconnect path where the stable node pushes its config
-// regardless of whether it was preempted.
+// pushConfigToPeer sends the active config to the cluster peer. The FUNCTION
+// itself does not check primary/secondary status — the gate lives at the call
+// site.
+//
+// Its only production caller is syncConfigToPeer, which gates on
+// rg0ConfigSyncAuthority. The peer-reconnect path no longer arrives here: since
+// #5863 it runs through reconcileConfigSyncToPeer, which is RG0-primary-gated
+// too (so a reconnecting SECONDARY never overwrites the authoritative primary's
+// config — #2239/#4385) and calls QueueConfig directly. Those two are the ONLY
+// production QueueConfig sites, which is why configGenCounter advances only on
+// the RG0 config-sync authority — the property the #5274 config-epoch guard and
+// the #6419 disposition both rest on. (Only, not atomically: both sites sample
+// authority and then queue several statements later, so a demotion landing in
+// that gap can still let one already-authorized increment through. It is a
+// steady-state property, not a mutual-exclusion guarantee.) Adding an ungated
+// push here would break it outright.
 func (d *Daemon) pushConfigToPeer() {
 	ss := d.getSessionSync()
 	if ss == nil {
@@ -1086,6 +1098,17 @@ func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peer
 			continue
 		}
 		if err := d.cluster.StartHeartbeat(localIP, peerAddr, vrfDevice); err != nil {
+			// #7257: a start the teardown superseded is terminal, not a bind
+			// failure. Retrying would race the same teardown again and, on
+			// success, resurrect the heartbeat stopClusterComms exists to
+			// remove. The ctx.Err() check at the top of the next iteration
+			// would catch it too — stopClusterComms cancels before it calls
+			// StopHeartbeat — but returning on the verdict we were actually
+			// given beats relying on a second signal to arrive in time.
+			if errors.Is(err, cluster.ErrHeartbeatStartSuperseded) {
+				slog.Info("cluster: heartbeat start superseded by comms teardown, not retrying")
+				return
+			}
 			if i < 5 {
 				slog.Info("cluster: heartbeat bind not ready, retrying",
 					"err", err, "attempt", i+1)

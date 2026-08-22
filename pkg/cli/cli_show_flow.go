@@ -903,26 +903,43 @@ func (c *CLI) showFlowTimeouts() error {
 
 	fmt.Println("Flow session timeouts:")
 
-	// TCP
-	if flow.TCPSession != nil {
-		tcp := flow.TCPSession
-		printTimeout := func(name string, val, def int) {
-			if val > 0 {
-				fmt.Printf("  %-30s %ds\n", name+":", val)
-			} else {
-				fmt.Printf("  %-30s %ds (default)\n", name+":", def)
-			}
+	// TCP (#6539). Two claims on each of these rows are enforcement claims and
+	// both used to be wrong:
+	//
+	//  1. Only established-timeout has a dataplane wire carrier. The other
+	//     three are committed and stored but never leave the control plane, so
+	//     they carry config.AnnotateTCPSessionTimeout's annotation — the same
+	//     string the REST and gRPC surfaces and the commit advisory use.
+	//  2. The "(default)" values were the Junos defaults (1800/30/30/120), not
+	//     the windows this dataplane applies. Nothing in the Go path fills a
+	//     default in, so an unset leaf reaches the helper as 0 and it falls
+	//     back to its own constant. config.TCPSessionTimeoutDataplaneDefault is
+	//     the authority for what those constants are; time-wait reports none,
+	//     because the dataplane has no TIME_WAIT state to give a window to.
+	printTimeout := func(name, leaf string, val int) {
+		var cell string
+		switch def, ok := config.TCPSessionTimeoutDataplaneDefault(leaf); {
+		case val > 0:
+			cell = fmt.Sprintf("%ds", val)
+		case ok:
+			cell = fmt.Sprintf("%ds (default)", def)
+		default:
+			cell = "not set"
 		}
-		printTimeout("TCP established timeout", tcp.EstablishedTimeout, 1800)
-		printTimeout("TCP initial timeout", tcp.InitialTimeout, 30)
-		printTimeout("TCP closing timeout", tcp.ClosingTimeout, 30)
-		printTimeout("TCP time-wait timeout", tcp.TimeWaitTimeout, 120)
-	} else {
-		fmt.Println("  TCP established timeout:       1800s (default)")
-		fmt.Println("  TCP initial timeout:           30s (default)")
-		fmt.Println("  TCP closing timeout:           30s (default)")
-		fmt.Println("  TCP time-wait timeout:         120s (default)")
+		fmt.Printf("  %-30s %s\n", name+":", config.AnnotateTCPSessionTimeout(leaf, cell))
 	}
+	tcp := flow.TCPSession
+	if tcp == nil {
+		// No tcp-session stanza: every leaf is unset, which is exactly the
+		// val<=0 case above. Render through the same helper rather than
+		// duplicating four literal lines that can drift out of agreement with
+		// it (they had).
+		tcp = &config.TCPSessionConfig{}
+	}
+	printTimeout("TCP established timeout", config.TCPSessionEstablishedTimeoutLeaf, tcp.EstablishedTimeout)
+	printTimeout("TCP initial timeout", config.TCPSessionInitialTimeoutLeaf, tcp.InitialTimeout)
+	printTimeout("TCP closing timeout", config.TCPSessionClosingTimeoutLeaf, tcp.ClosingTimeout)
+	printTimeout("TCP time-wait timeout", config.TCPSessionTimeWaitTimeoutLeaf, tcp.TimeWaitTimeout)
 
 	// UDP
 	if flow.UDPSessionTimeout > 0 {

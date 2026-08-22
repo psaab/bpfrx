@@ -350,10 +350,11 @@ func (c *CLI) showInterfaces(args []string) error {
 			fmt.Printf("    Security: Zone: %s\n", li.zoneName)
 
 			// Host-inbound traffic services (#3654 H05/M03): show the EFFECTIVE
-			// admitted set for THIS logical interface — the UNION of the zone
-			// set and any per-interface override — flag an interface-local
-			// override, and print an explicit default-deny posture line so a
-			// blank section is never misread as "not enforced".
+			// admitted set for THIS logical interface — its per-interface
+			// override where one is declared (which REPLACES the zone set,
+			// #6515), else the zone set — flag an interface-local override, and
+			// print an explicit default-deny posture line so a blank section is
+			// never misread as "not enforced".
 			if li.zone != nil {
 				svc, proto, overridden := li.zone.InterfaceHostInboundEffective(li.ifaceRef)
 				// #3682: a management / cluster-control lifeline interface is

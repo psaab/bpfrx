@@ -99,7 +99,7 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `https` / `webapi-ssl` | tcp 443 | tcp 443 | dual | Web-management HTTPS. Admit port = `webmgmt.HTTPSPort` = 443 = the listener bind (#5715, was 8443). Same contract as `http` above. |
 | `ping` | icmp/icmpv6 echo-request | ICMP type 8 (v4) / 128 (v6) | dual | Echo-request only; ICMP errors are global-accepted (see below). |
 | `dns` | udp 53, tcp 53 | udp 53, tcp 53 | dual | |
-| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). |
+| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). **Junos accepts these two per INTERFACE only** — see [DHCP and BOOTP are per-interface only in Junos (#6519)](#dhcp-and-bootp-are-per-interface-only-in-junos-6519). |
 | `dhcpv6` | udp {546, 547} | udp 546, 547 | **ip6** | DHCPv6; v6-only (#3225). |
 | `ntp` | udp 123 | udp 123 | dual | |
 | `snmp` | udp 161 | udp 161 | dual | |
@@ -634,6 +634,60 @@ Two observability surfaces consume it:
   visible in a config-only / degraded boot). Alert with e.g.
   `max_over_time(xpf_host_inbound_addressless_zones[1h]) > 0`.
 
+## Lifeline exclusion is by INTERFACE, not by address value
+
+**What the builders actually subtract.** `BuildZoneHostInboundViews` and
+`BuildUnzonedHostInboundAddrs` skip a snapshot whose *interface* is a lifeline
+(`hostInboundLifelineInterface` — fxp0 / em0 / fab<N> plus the configured
+chassis-cluster control and fabric links, #3277). They do **not** subtract the
+lifeline's address *values*. If the same firewall-local address is ALSO
+configured on a non-lifeline interface, that interface's snapshot contributes it
+and the address is in the drop set.
+
+**Why that reaches management.** Every host-inbound drop is
+destination-address-only, with no `iifname` qualifier (#3718). So a drop scoped
+to a shared management address applies to traffic arriving on the lifeline too —
+the rule cannot tell the two ingress paths apart.
+
+**The topology is one the commit gate accepts.**
+`validateDuplicateHostLocalAddressStrict` permits a management address shared
+onto a non-lifeline interface (`pkg/config/dup_host_local_address_3718_test.go`,
+`TestDupHostLocalLifelineExcluded`), and its rationale — that a lifeline address
+"is never host-inbound-denied" — is the premise corrected here. Three variants
+behave differently, all verified by driving the real builders:
+
+| Shared onto | Real table for the shared address | New mgmt connection | Established mgmt session |
+|---|---|---|---|
+| a zone that **admits** the service | `daddr <ip> tcp dport 22 accept` then `daddr <ip> … drop` | survives (accept precedes) | survives (#5566 admits tcp/22) |
+| a zone with **no `host-inbound-traffic` stanza** (#3405) | `daddr <ip> … drop` only, **no accept** | **dropped** | **flushed** by the #5566 reconcile (empty admit set) |
+| an **unzoned** interface (#4420 HI-2) | `daddr <ip> … drop` only, **no accept** | **dropped** | **flushed** by the #5566 reconcile (empty admit set) |
+
+Only the first row is protected, and only because that zone happens to admit the
+service. The other two strand management through the **real** table, on an
+ordinary healthy commit — no failed install and no fence involved.
+
+**What the FENCE does about it.** A fence is the real table with every
+per-service ACCEPT removed, so it would collapse row 1 into rows 2-3 for the
+fence window — that was #6492 Finding A. #6492 fixes it by giving the fence its
+own drop scope, which WITHHOLDS any address shared with a lifeline interface, so
+a fence never drops a shared management address on any render (see "Fence drop
+scope is not the real ruleset's scope"). The guarantee is narrower than
+"management is safe": an address the operator manages the box on that is NOT
+shared with a lifeline is fenced like any other for the fence window. The global
+mandatory admits (`ct established,related`, raw ESP/AH, IPv6 ND, v4/v6 PMTUD)
+precede every drop, so an already-established session survives the chain — but
+see the flush column above for whether it survives the reconcile, which the fence
+does not change.
+
+**What is still true.** A lifeline address that is NOT shared onto any
+non-lifeline interface never enters a view or the unzoned set, and is never
+dropped or flushed. That is the case the exclusion was written for, and it is the
+overwhelmingly common one. The correction is that "lifeline interface excluded"
+was being read as "management address protected", and those are different claims.
+
+#6492 fixes the fence half (the withholding above). The real-table rows 2-3 are
+tracked separately and are NOT fixed — they need no failed install and no fence.
+
 ## Cold-boot fail-closed install fence (#5644, M37)
 
 `applyHostInboundFilter` loads the chain with `nft -f -`, which is **atomic**:
@@ -714,9 +768,12 @@ snapshot produces a zero-drop table shell:
   It carries **no per-service accept and no named counters** — it is strictly the
   real table with every service ACCEPT removed, so during the fence window even a
   `system-services all` zone is denied (maximally fail-closed). The address sets
-  are already lifeline-excluded (fxp0 / em0 / fab<N> and their addresses are
-  subtracted by `BuildZoneHostInboundViews` / `BuildUnzonedHostInboundAddrs`), so
-  the fence can **never** strand management or break HA.
+  exclude lifeline INTERFACES (fxp0 / em0 / fab<N>) via
+  `BuildZoneHostInboundViews` / `BuildUnzonedHostInboundAddrs` — but **not**
+  lifeline address VALUES. A management address also configured on a non-lifeline
+  interface IS in the fence's drop set, and the drop carries no `iifname`, so the
+  fence drops new management connections to it for the whole fence window (#6492
+  Finding A). See "Lifeline exclusion is by INTERFACE, not by address value".
 - The requested apply still **fails** (`applyHostInboundFilter` returns the
   wrapped real nft error, joined with a fallback error when fallback also fails).
   A later full apply seeing an address gets another fallback opportunity only if
@@ -774,8 +831,11 @@ filter is unenforced.
 The fix mirrors the host-inbound cold-boot fence for the lo0 table:
 
 - `installLo0ColdBootFence` / `buildLo0FencePayload` (`daemon_nft.go`) build the
-  fence from the SAME lifeline-excluded firewall-local address sets
-  (`BuildZoneHostInboundViews` + `BuildUnzonedHostInboundAddrs`) and the SAME
+  fence from the SAME fence-only address scope as the host-inbound cold-boot
+  fence (`dpuserspace.BuildFenceAddrSets`, #6492 — lifeline INTERFACES excluded
+  and lifeline-shared address VALUES withheld; see "Fence drop scope is not the
+  real ruleset's scope" and "Lifeline exclusion is by INTERFACE, not by address
+  value") and the SAME
   `buildFenceTablePayload` body as the host-inbound cold-boot fence — mandatory L3
   / return admits (`ct established,related`, raw ESP/AH, IPv6 ND, v4/v6
   PMTUD+error, the configured WireGuard listen port) then a catch-all
@@ -849,13 +909,66 @@ separately):**
   new day-2 address. That is the lo0 filter's own coverage semantics, independent
   of this boot fence — the fence only guarantees the RE path is not left fully
   open when NO real filter is loaded.
-- The shared fence body / `BuildZoneHostInboundViews` / `BuildUnzonedHostInbound
-  Addrs` that this fence reuses carry two known behaviours that affect the
-  **host-inbound #5644 fence identically** (a shared-mechanism concern, not
-  lo0-specific — tracked in **#6492**): a management IP shared onto a non-lifeline
-  interface can pick up a global `daddr` drop, and a zone-less router yields empty
-  address sets → an accept-all fence shell. Both live in the shared mechanism and
-  pre-date #6476.
+- The two shared-mechanism behaviours #6492 filed against this fence body — a
+  management IP shared onto a non-lifeline interface picking up a global `daddr`
+  drop, and a zone-less router yielding empty address sets → an accept-all fence
+  shell — are **fixed**; see "Fence drop scope is not the real ruleset's scope"
+  below.
+
+### Fence drop scope is not the real ruleset's scope (#6492)
+
+A fence is the real table with **every per-service ACCEPT removed**, so it cannot
+reuse the real ruleset's address scope unchanged. `dpuserspace.BuildFenceAddrSets`
+(`pkg/dataplane/userspace/zones_host_inbound.go`) derives the fence-only scope and
+is called by BOTH fence sites (`installHostInboundColdBootFence`,
+`installLo0ColdBootFence`). It differs from `BuildZoneHostInboundViews` +
+`BuildUnzonedHostInboundAddrs` in two directions:
+
+- **Narrower — lifeline-shared addresses are WITHHELD (Finding A).** The view
+  builders exclude lifeline INTERFACES (fxp0 / em0 / fab* / the configured
+  control+fabric links), not lifeline address VALUES. If the SAME IP is also
+  configured on a non-lifeline interface — a topology xpf explicitly accepts,
+  `pkg/config/dup_host_local_address_3718_test.go` — that snapshot re-adds it, and
+  the fence's drop rule carries **no `iifname` qualifier**, so it renders as a bare
+  `ip daddr <mgmt-ip> drop` that kills every NEW management connection to it for
+  the whole fence window. Such addresses are removed from the fence's drop set and
+  reported at WARN (`logFenceWithheld`: `withheld_v4` / `withheld_v6`). This is
+  fence-only: the REAL table keeps denying them, because its per-service accepts
+  (the mgmt zone's `system-services ssh`) precede its catch-all DROP and still
+  admit the session. Withholding them in the view builder instead would relax the
+  real table's default-deny — a fail-open.
+- **Wider — every firewall-local address is covered, zones or not (Finding B).**
+  Both view builders return nothing when the config declares no security zone,
+  because the real host-inbound default-deny is a zone-model construct. But
+  host-inbound / lo0 filters are independently valid without zones
+  (`pkg/config/compiler_filter_ref_3296_test.go`), so on a zone-less-but-addressed
+  router a failed cold-boot lo0 install produced an accept-policy fence shell with
+  **ZERO drops** — fail-OPEN, defeating the fence's whole purpose. The fence's drop
+  set is therefore derived from the firewall-local ADDRESSES (every non-lifeline
+  interface address from the canonical snapshot builder, plus every configured VRRP
+  virtual address — a VIP is live only on the RG master, so the backup node's
+  snapshot misses it, #3172), not from zone membership. There is no
+  "are there zones?" branch: the address walk is identical either way and simply
+  yields more than the zone views do when zones are absent or incomplete. It also
+  closes the smaller same-shape hole in a ZONED config — a VRRP VIP on an unzoned
+  interface, which neither view builder collected.
+
+  This reaches production through `applyLo0Filter` only: `applyHostInboundFilter`
+  returns on its teardown branch before the install when nothing is enforceable, so
+  a zone-less router never reaches the host-inbound fence.
+
+Because the fence's coverage now differs from the real ruleset's desired-drop set
+in both directions, `installHostInboundColdBootFence` records
+`hostInboundCoveredAddrs` from the **fence's own** sets, not from the real
+ruleset's `desiredDrop` — the #5789 day-2 gap check must describe what the
+retained enforcement actually drops.
+
+Fail-on-revert proof: `pkg/daemon/host_inbound_fence_scope_6492_test.go` —
+`TestFenceWithholdsLifelineSharedAddress6492` (which also asserts the REAL views
+still carry the shared address, so an over-fix in the view builder goes RED) and
+`TestFenceCoversZonelessRouter6492`, both driven through the production
+`applyLo0Filter` → `installLo0ColdBootFence` path with an injected install
+failure.
 
 Fail-on-revert proof: `pkg/daemon/lo0_coldboot_fence_6476_test.go` —
 `TestColdBootLo0FenceThenNewAddressReFences` pins the #6489 fence→fail→re-fence
@@ -911,23 +1024,105 @@ Two observability surfaces consume it (mirroring #3698):
   aggregate — this per-interface series is strictly more sensitive and is exported
   alongside it, not in place of it.
 
-## Per-interface override precedence (#3362, #3720)
+## Per-interface override precedence (#3362, #3720, #6515)
 
-Host-inbound-traffic can be authored at three granularities, and the EFFECTIVE
-admission set for a logical unit is the **UNION** of all three (Junos
-host-inbound is additive — an interface admits a service listed at ANY level):
+Host-inbound-traffic can be authored at three granularities:
 
 1. **zone-level** — `security zones <z> host-inbound-traffic { ... }`, applies to
-   every interface in the zone;
+   every interface in the zone **that does not declare its own stanza**;
 2. **physical-interface-level** — `security zones <z> interfaces <ifN>
    host-inbound-traffic { ... }` (a bare interface ref), applies to every
    configured unit of that physical interface;
 3. **unit-level** — `security zones <z> interfaces <ifN.M>
    host-inbound-traffic { ... }`, applies only to that logical unit.
 
-So for unit `ifN.M`: `effective = zone ∪ physical(ifN) ∪ unit(ifN.M)`. A
-more-specific unit override never *replaces* a physical override — they are
-merged. Before #3720 the resolver
+Levels 2 and 3 are both the **interface level** and they UNION with each other.
+The interface level as a whole **REPLACES** the zone level:
+
+```
+effective(ifN.M) = physical(ifN) ∪ unit(ifN.M)     if either is declared
+                 = zone                             otherwise
+```
+
+`config.EffectiveHostInboundTokens` is the SSOT for that outer choice and
+`config.UnionHostInboundTokens` for the inner merge; every surface that resolves
+an interface's admission routes through the former — the kernel nft view builder
+(`BuildZoneHostInboundViews`), the per-interface classifier
+(`ClassifyHostInboundForInterface`), the commit-time advisories, the
+duplicate-host-address gate, and all six display surfaces.
+
+### Replace, not union (#6515) — UPGRADE NOTE
+
+> **This is an admission NARROWING. Read it before upgrading if any of your
+> configs author a per-interface `host-inbound-traffic` stanza.**
+
+Junos, [Security Zones](https://www.juniper.net/documentation/us/en/software/junos/security-policies/topics/topic-map/security-zone-configuration.html):
+"You can configure these parameters at the zone level, in which case they affect
+all interfaces of the zone, or at the interface level. **(Interface configuration
+overrides that of the zone.)**"
+
+Before #6515 xpf UNIONed the two levels and asserted "Junos additive semantics"
+in-tree, so an interface stanza could only ever WIDEN admission and never narrow
+it: a zone admitting `protocols ospf` with an interface stanza admitting only
+`ping` still admitted OSPF on that interface, where Junos denies it. #6515 makes
+the interface stanza replace the zone stanza on the interfaces that declare one.
+
+**Presence, not emptiness.** An explicit `host-inbound-traffic { }` on an
+interface is a **deny-all** override, not a fallback to the zone set.
+`parseHostInboundNode` compiles a present-but-empty stanza to a non-nil empty
+struct precisely so the two are distinguishable.
+
+**The WHOLE stanza replaces, not each leaf.** An interface stanza that declares
+only `protocols` also drops the zone's `system-services`. That is the literal
+reading of the sentence above, and the community consensus states it the same way
+("if you configure anything under specific interface level, then zone-specific
+configuration doesn't apply to this interface anymore"). No vendor text was found
+describing a per-leaf inheritance, so none is implemented — a per-leaf rule would
+be a guess, and a guess that silently widens admission.
+
+**Junos's own narrowing idiom is `except`, which xpf does not implement.** The
+worked example in the Juniper topic narrows a second interface with
+`system-services all` plus `ftp except` / `http except`. xpf's schema has no
+`except` keyword, so the only way to narrow an interface here is to author the
+narrower token list directly. That is a separate parity gap, not a consequence of
+this change.
+
+**What upgrading takes away.** For every interface that declares a stanza, the
+lost set is the zone-level tokens the interface stanza does not repeat (after
+`all`-expansion). The services most likely to disappear are exactly the ones that
+hurt: `ssh`, `https`/webmgmt, `ike` (ESP/AH keep their global accept, but IKE
+udp/500,4500 is token-gated, so tunnels stop rekeying), and unicast `bgp`/`ospf`
+to the interface address.
+
+**It is not only new connections.** The #5566 conntrack reconcile
+(`buildHostInboundConntrackFlushFilter`) rebuilds its admit set from these same
+views and DELETES established kernel conntrack entries to a covered
+firewall-local address that the new set no longer admits. A narrowing commit
+therefore drops LIVE sessions to a removed service, not merely refuses new ones.
+
+**What is structurally out of scope.** Lifeline interfaces (`fxp0` / `em0` /
+`fab*` and the configured control + fabric links) are excluded from host-inbound
+deny scoping by INTERFACE, so management over `fxp0` and the HA control plane are
+unaffected by this flip. That exclusion is by interface, not by address value —
+a management address also configured on a zoned interface is NOT exempt (see
+"Lifeline exclusion is by INTERFACE, not by address value"). VRRP advertisements
+are unaffected because the views scope drops to unicast interface addresses plus
+VRRP VIPs only, and 224.0.0.18 is never in that scope.
+
+**Migration.** `validateHostInboundOverrideReplaceWarnings`
+(`pkg/config/compiler_validate_warn_host_inbound.go`) emits a commit-time
+advisory naming every `(zone, interface, lost tokens)` triple, so `commit check`
+shows the loss BEFORE the commit that would cause it. The remedy is mechanical:
+repeat the zone-level tokens in the interface stanza. It is WARN-only — the new
+behaviour is the Junos behaviour, and rejecting the config would refuse something
+Junos accepts. Lifeline interfaces and effective sets that full-admit
+(`any-service`) are skipped: nothing is lost there, and an advisory that fires on
+configs losing nothing is one operators learn to ignore.
+
+### Physical∪unit merge (#3720)
+
+A more-specific unit override never *replaces* a physical override — they are
+merged, because both are interface-level statements. Before #3720 the resolver
 (`buildInterfaceHostInboundMap`, `pkg/dataplane/userspace/zones.go`) walked refs
 in sorted order and wrote each key first-writer-wins; a bare physical ref sorts
 before (is a prefix of) its units, so it filled `out["ifN.M"]` first and the
@@ -960,8 +1155,9 @@ enforce the owner predicate `zoneByIface[ref] == zn`:
 **Presentation parity (#3720 H05).** `ZoneConfig.InterfaceHostInboundEffective`
 (`pkg/config/host_inbound_view.go`) — used by `show interfaces <unit>`, `show
 security zones`, and the gRPC interface diagnostic — folds the physical-parent
-override into a unit ref's effective set with the same additive rule, so the
-operator diagnostic agrees with what the dataplane admits. Before #3720 it read
+override into a unit ref's effective set with the same within-level union rule
+(and then replaces the zone level with it, #6515), so the operator diagnostic
+agrees with what the dataplane admits. Before #3720 it read
 only the exact ref and reported "no override / default-deny" for a unit that in
 fact inherited a physical override.
 
@@ -981,8 +1177,9 @@ false-deny (the base view's narrower set drops a service the unit-0 override
 opened). The fix skips the base (physical) snapshot's host-inbound address
 contribution when unit 0 is configured: unit 0's snapshot is the authoritative
 carrier (its merged override matches enforcement and `InterfaceHostInboundEffective`),
-so the address resolves to ONE view carrying the additive `zone ∪ physical ∪
-unit-0` admit set. The skip is gated on the ACTUAL same-netdev collapse
+so the address resolves to ONE view carrying the `physical ∪ unit-0` admit set
+(which post-#6515 replaces the zone level; before #6515 it was `zone ∪ physical ∪
+unit-0`). The skip is gated on the ACTUAL same-netdev collapse
 (`snapshotLinuxName(base, unit0) == snapshotLinuxName(base, nil)`), NOT merely
 "unit 0 exists": a VLAN unit 0 (`VlanID > 0` → Linux `<base>.<vlan>`) or a
 tunnel-mapped unit 0 resolves to a DISTINCT netdev, so the base and unit-0
@@ -996,8 +1193,71 @@ address is never dropped from the deny scope.
 **Gate alignment.** The commit-time duplicate-address gate
 (`buildHostInboundOverrideMapLocal` +
 `validateDuplicateHostLocalAddressStrict`, `pkg/config/dup_host_local_address.go`)
-mirrors the same additive resolution and quarantine, so the
+mirrors the same resolution and quarantine — `effectiveHostInboundSigLocal`
+delegates to `EffectiveHostInboundTokens` — so the
 `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
+That matters here specifically: the gate rejects two zones claiming one
+firewall-local address with DIFFERING admission, so a signature built from a
+different combination rule than enforcement uses would compare the wrong sets.
+
+## DHCP and BOOTP are per-interface only in Junos (#6519)
+
+Juniper, [Security Zones](https://www.juniper.net/documentation/us/en/software/junos/security-policies/topics/topic-map/security-zone-configuration.html):
+
+> "All services (except DHCP and BOOTP) can be configured either per zone or per
+> interface. A DHCP server is configured only per interface because the incoming
+> interface must be known by the server to be able to send out DHCP replies."
+
+`dhcp` and `bootp` are therefore the two `system-services` tokens Junos does NOT
+accept at the zone level. xpf accepts them there, and a zone-level token
+authorizes udp/67-68 on the firewall-local addresses of every member interface —
+an over-authorization relative to Junos, which would make the operator admit the
+service interface by interface.
+
+**Status: WARN-only parity deviation. Enforcement is unchanged.**
+`validateHostInboundZoneLevelDHCPWarnings`
+(`pkg/config/host_inbound_dhcp_scope_6519.go`) emits one commit-time advisory per
+zone, naming the token and the member interfaces the zone-level authorization
+actually reaches, with the remedy: move it to
+`interfaces <if> host-inbound-traffic system-services dhcp`.
+
+Three details that matter:
+
+- **A zone-level `all` counts.** `all` expands to the named-service union, which
+  contains `dhcp` and `bootp` (`HostInboundAllExpansionServices`), so a zone-level
+  `all` authorizes them on every member exactly as a named token would. The
+  advisory reports that case explicitly, marked "via `all`", because the edit that
+  fixes it is a different edit. An advisory that reported only the named token
+  would have left the `all` case as a silent deviation.
+- **`dhcpv6` is deliberately NOT covered.** The vendor sentence names DHCP and
+  BOOTP. Extending it to the v6 token would be an inference, not a citation.
+- **An interface that authorized the service ITSELF is not named.** The advisory
+  fires for an interface whose EFFECTIVE set admits the token while its OWN
+  interface-level stanza does not — i.e. the zone-level token is the authorizer.
+  Stating the predicate that way keeps it correct both while the two levels union
+  and after #6515 makes the interface level replace the zone level, without
+  asserting which rule is in force.
+
+### Why the enforcement flip is staged separately
+
+Withdrawing the zone-level authorization is a NARROWING with a real population,
+unlike #6515:
+
+- Configs **in this repo** author zone-level `dhcp` today —
+  `test/incus/xpf-cluster-fw{0,1}.conf`, `docs/ha-cluster.conf`,
+  `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`. The
+  `ha-cluster-userspace` `lan` zone even carries a comment explaining that it
+  MUST admit dhcp or client DISCOVER to the firewall is denied. The advisory
+  fires on exactly that zone (`reth1`) and on nothing else in those files — the
+  `mgmt` and `control` zones' members are lifelines, which are excluded from
+  host-inbound deny scoping and so are skipped.
+- The traffic it would stop is not only a DHCP *server*'s. The firewall's own
+  DHCP **client** on a zoned, non-lifeline interface needs udp/68 admitted for
+  its unicast renewals, so a flip costs that interface its ADDRESS rather than
+  merely refusing a service — and the vendor rationale quoted above ("the server
+  must know the incoming interface") does not speak to the client case at all.
+- #6519 is filed as an enhancement and asks for the staged treatment: advisory,
+  then an all-planes flip in its own release with the shipped configs migrated.
 
 ## Multi-member bracket body applies to every member (#6391) — UPGRADE NOTE
 
@@ -1123,9 +1383,10 @@ unchanged, with no dedup, so a single block keeps its exact token multiset;
 dedup applies only when a second block is actually merged. RED-on-revert guards:
 `pkg/config/host_inbound_dup_block_4544_test.go`.
 
-This is orthogonal to the "Per-interface override precedence (#3362, #3720)"
-union above, which merges host-inbound authored at DIFFERENT granularities
-(zone ∪ physical ∪ unit). #4544 merges repeated blocks at the SAME granularity.
+This is orthogonal to the "Per-interface override precedence (#3362, #3720,
+#6515)" section above, which resolves host-inbound authored at DIFFERENT
+granularities (`physical ∪ unit`, then REPLACING the zone level). #4544 merges
+repeated blocks at the SAME granularity.
 
 **#4818 extends this merge one level UP.** #4544 merges repeated
 `host-inbound-traffic {}` blocks *within one* `security-zone <name> {}`
@@ -1294,7 +1555,8 @@ helper never sees it, so a helper crash cannot lock management out).
   shield must carve TCP/113 out (`HostInboundServiceTokenExpansion`).
   - **Per-interface scope of the IKE / ident shield (#5565).** The shield is
     scoped to the SPECIFIC netdevs whose EFFECTIVE per-interface host-inbound set
-    (`InterfaceHostInboundEffective`, zone-level ∪ interface override) admits the
+    (`InterfaceHostInboundEffective`: the interface override where declared,
+    else the zone-level set — #6515) admits the
     exemption — `JunosHostDenyProgram.IKEExemptNetdevs` / `IdentResetNetdevs`,
     each a subset of the program's `IngressNetdevs`. A per-INTERFACE `ike` /
     `ident-reset` override therefore shields only the interface(s) that configured

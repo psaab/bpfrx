@@ -482,15 +482,121 @@ it refuses on epoch alone — and deliberately does NOT record the per-key
 generation, so the peer's next re-sync of that key is admitted rather than
 refused as stale.
 
-**Item 1 (deferred, documented residual).** The guard still covers only the
+**Item 1 (accepted residual — #6419 closed).** The guard covers only the
 config-authority → peer direction (the primary that admits the session is also
 the RG0 config-sync authority). A non-authority's sessions carry the
 authority-independent seed epoch, so the guard is inert for the reverse
-direction in an active/active deployment (fail-OPEN). Closing it requires a
-bidirectional config-generation namespace that #5274 deliberately scoped out (a
-design-heavy change, not part of #6284 item 2). #6284's residual-COVERAGE gap
-is closed (item 2 by #6366, item 1 by #6418); the substantive hardening of this
-inert direction is tracked separately as a future enhancement on #6419.
+direction in an active/active deployment (fail-OPEN). #6284's residual-COVERAGE
+gap is closed (item 2 by #6366, item 1 by #6418).
+
+Closing the reverse direction itself requires a bidirectional
+config-generation namespace that #5274 deliberately scoped out. #6419 evaluated
+the one shortcut that appeared to avoid building a second namespace — "the
+authority A's generations are already a name both nodes can say, so let the
+non-authority B stamp `B.lastAppliedConfigGen` (the A-generation B is running)
+and let A threshold on its own `configGenCounter`" — and closed it as
+unworkable. Recorded here because it has been re-derived more than once; the
+three reasons are structural, not implementation detail:
+
+- **The two counters are never simultaneously live on one node, so the shortcut
+  cannot be expressed role-free.** `configGenCounter` advances only through
+  `nextConfigGen` ← `QueueConfig`, whose only production callers
+  (`syncConfigToPeer`, `reconcileConfigSyncToPeer`) are gated on
+  `rg0ConfigSyncAuthority` = `IsLocalPrimary(0)`. `lastAppliedConfigGen`
+  advances only through `recordAppliedConfigGen` on a nil `OnConfigReceived`,
+  and `handleConfigSync` returns `errConfigSyncRejectedPrimary` whenever
+  `IsLocalPrimary(0)`. So a node's send counter is frozen for its whole
+  non-authority tenure and its applied mark for its whole authority tenure, and
+  the shortcut must therefore branch on `IsLocalPrimary(0)` at BOTH the stamp
+  site and the threshold site. A role-FREE formulation is not available as a way
+  out: coalescing with `max(configGenCounter, lastAppliedConfigGen)` chooses
+  between two independent `MonotonicNanos()` boot seeds (`initGenState`), so
+  which side wins is a function of relative node uptime rather than of config
+  order.
+
+  To be precise about what this does *not* claim: the role-branched mismatch
+  that follows an RG0 handover is **not permanent by construction**.
+  `reconcileConfigSyncToPeer` runs on the `"rg0-promotion"` trigger, so once the
+  new authority has pushed and the new non-authority has applied, both counters
+  are back in one namespace. Nor, however, is it bounded by the handover itself:
+  the promotion reconciler claims its `(epoch × generation)` dedupe marker
+  **before** sending, so if the demoted node still believed it was primary when
+  the push landed it returns `errConfigSyncRejectedPrimary`, `configApplyLoop`
+  drops that attempt without advancing the applied mark, and every later
+  reconcile tick is deduped by the marker it already claimed. Convergence then
+  waits for a new commit (new generation) or a reconnect (new epoch). So the
+  window is *not* self-limiting to the transition — which makes the next point,
+  not this one, the load-bearing objection.
+- **The handover window needs the wire field the shortcut avoids.** RG0 role is
+  not learned atomically by both nodes: each side updates on its own
+  heartbeat/VRRP timing, so there is necessarily a skew window in which the old
+  authority still believes it is the authority while the new one already does.
+  Dual-active is not theoretical either — the election code has an explicit
+  DUAL-ACTIVE branch (`pkg/cluster/election.go`) that detects both nodes primary
+  for one RG and resolves it by effective priority then node ID, which takes a
+  heartbeat round to converge. Throughout that window BOTH nodes stamp and
+  threshold on `configGenCounter`, i.e. on two independent `MonotonicNanos()`
+  boot seeds compared directly, so whether the guard is inert or refuses *every*
+  inbound synced session is decided by relative uptime. The issue's own proposed
+  remedy — treat the epoch as 0 (the documented disable value) for a session
+  stamped under a different authority incarnation than the receiver's current
+  one — is what would close this, and it requires the receiver to know a stamp's
+  authority incarnation. `SessionValue.ConfigEpoch` is a bare `uint64`
+  (`pkg/dataplane/types.go`) written as eight raw LE bytes with no companion tag
+  (`encodeSessionV4Payload` / `encodeSessionV6Payload`), and nothing else on the
+  session wire identifies the minting authority — so the remedy is exactly the
+  wire field the shortcut set out to avoid.
+- **It converts a self-healing failure into total reverse-direction loss.** A
+  config apply that does not take effect on the non-authority (compile/promote
+  failure, or the RG0-primary rejection above — counted by
+  `ConfigsApplyFailed`) deliberately leaves `lastAppliedConfigGen` pinned so the
+  authority's re-push re-converges (M-2/#4151). With the applied mark as the
+  stamp source, that same condition pins the non-authority's stamp while the
+  authority's threshold keeps climbing on every push, so the authority refuses
+  EVERY reverse-direction session for as long as the apply keeps failing.
+  `resetRecvGen` compounds it: it stores `lastAppliedConfigGen = 0` on each peer
+  bulk re-prime, so the stamp would be 0 — the disable value — through cold
+  prime, which is exactly when bulk sessions flow.
+
+**What remains open: the tagged-epoch variant.** The three reasons above kill
+the *untagged* shortcut, but they do not establish that a new wire field or a
+`ProtocolVersion` bump is structurally required, and an earlier revision of this
+section wrongly said they did. A hostile review of #6419 constructed a variant
+that answers all three without either, and it is recorded here as the concrete
+starting point rather than left to be re-derived:
+
+Reserve the top bit of `ConfigEpoch` as a **stamp-source tag**. The authority
+sends its raw `configGenCounter` (tag clear); a *converged* non-authority sends
+`tag | lastAppliedConfigGen`; anything not converged sends 0. A receiver then
+accepts only the encoding its own role expects — a non-authority expects an
+untagged authority generation and compares it against `lastAppliedConfigGen`
+(exactly today's behaviour), an authority expects a tagged reverse generation,
+strips the tag and compares against `configGenCounter`. Any mismatch between the
+tag and the receiver's role means the sender's role assumption disagrees with
+the receiver's, so the epoch is treated as 0 and the guard disables.
+
+That disagreement case is what dissolves reason 2: during a dual-primary window
+both nodes send untagged and both expect tagged, so both disable rather than
+compare two unrelated boot seeds; during a both-secondary window the symmetric
+thing happens; and a message delayed across a role change fails open on the same
+rule. Reason 3 is answered by the convergence precondition — stamp the tagged
+form only when the received and applied marks agree and are nonzero, so a pinned
+or reset applied mark stamps 0 (today's fail-OPEN) instead of a stale value that
+would refuse everything.
+
+The bit is available in practice: generations derive from `MonotonicNanos()`, so
+the top bit is unused for centuries, and reserving it explicitly is a
+compile-time invariant rather than a wire-layout change. Nor does a semantic tag
+inside an existing field need a `ProtocolVersion` bump — the project bumps for
+incompatible layout changes, session trailers are length-gated, and the
+config-generation trailer itself deliberately avoided a bump. A legacy receiver
+reads a tagged value as a very large generation, which its unsigned `epoch <
+barrier` comparison admits — fail-OPEN, i.e. exactly today's behaviour.
+
+This is a design sketch, not code, and it has not itself been hostile-reviewed
+end to end; the RG0-role plumbing it needs at the stamp and threshold sites does
+already exist. Anyone picking it up owes the usual HA gate — it is session-sync
+coupled and owes a `test-failover` smoke.
 
 Both halves of this directional correctness are regression-pinned by
 `sync_config_epoch_active_active_6284_test.go`: the SAME frozen non-authority
@@ -1018,6 +1124,41 @@ source tuple (reply mis-delivery / a session-hijack surface).
   is cleared from `address_only_owners` by the same `release_flow`). A reverse
   synced entry, or a session with no source NAT at all (`rewrite_src` unset),
   reserves nothing.
+- **Stale-tuple eviction is a FOURTH teardown, and it must be mode-correct
+  (#6528):** when a synced upsert re-decides a live flow onto a DIFFERENT
+  translated tuple, `reserve_flow` evicts the incumbent `live_by_flow` record.
+  That eviction used to be an unconditional
+  `free_translated_port(existing.addr_index, existing.translated.port,
+  !existing.deterministic)` — the PAT-shaped teardown — which is correct for
+  exactly ONE of the three allocation modes. For the other two it mutated state
+  belonging to an UNRELATED flow:
+
+  - an ADDRESS-ONLY record (#5269/#6041) owns NO occupancy bit. Its `addr_index`
+    is a hardcoded 0 and its `translated.port` is the PRESERVED internal source
+    port, so the call cleared whatever bit pool address 0 held at that offset —
+    and a `port no-translation` rule SHARES an allocator with a PAT rule whenever
+    their pool name, addresses and port range agree, because `allocator_key()`
+    does not include `no_translation`. So the bit belonged to a live PAT flow,
+    and `free_recycle` queued the port for reuse: two flows on one translated
+    tuple. Its actual property, the `address_only_owners` reverse-identity token,
+    was never cleared, denying that public identity for the life of the
+    allocator.
+  - a PERSISTENT record's port belongs to the LEASE, not the flow (`release_flow`
+    deliberately does not free it). The call freed a port the lease still
+    claimed, and never dropped the lease's `active_flows` refcount. A leaked
+    refcount is never idle, so the lease never enters `lease_expirations` and NO
+    GC path reclaims it.
+
+  All three retiring paths — `release_flow`, `rollback_flow` and this eviction —
+  now share `unlink_live_allocation_locked` (remove the record, clear an
+  address-only token, free a port only when the record actually owns one), so a
+  fifth cannot diverge. `release_flow` and the eviction additionally share
+  `complete_persistent_lease_locked`; `rollback_flow` keeps its own lease arm
+  because it undoes an activation rather than completing a flow. The eviction
+  takes RELEASE semantics because the incumbent tuple WAS in service — it is a
+  re-decision of a live flow, not the withdrawal of an allocation that never
+  shipped — and that is why `reserve_flow` (and the synced-reserve chain above
+  it) now carries `now_ns`: re-arming a lease's idle expiry needs a real clock.
 - **Per-worker holder set (#6211 F2):** a synced entry is pushed to EVERY
   worker's session table (`afxdp/ha/session_import.rs` fans `UpsertSynced` out to
   each worker's command queue) while the source-NAT / NAT64 allocator is ONE
@@ -1028,9 +1169,9 @@ source tuple (reply mis-delivery / a session-hijack surface).
   `reserve_address_only`'s) idempotent early return — which is BOTH where workers
   2..N land AND the path an already-holding worker takes on every refresh, so OR
   is required where an increment would inflate without bound. The port is freed
-  only when the LAST holder's bit clears. `holders == 0` marks an untracked LOCAL
-  allocation (RSS steers a 5-tuple to one worker, so it has a single holder by
-  construction) and keeps the first-release-frees contract unchanged.
+  only when the LAST holder's bit clears. `holders == 0` marks an UNTRACKED
+  allocation and keeps the first-release-frees contract unchanged; #6522 narrowed
+  which callers that is (see below).
 
   Without the holder set the N reserves collapsed into one record and the FIRST
   worker to let go freed a port the other N-1 were still forwarding through. That
@@ -1047,6 +1188,43 @@ source tuple (reply mis-delivery / a session-hijack surface).
   their NAT64/rollback twins) are `#[cfg(test)]`, so a production path that
   forgot to thread its worker id is a BUILD failure rather than a silent
   single-holder release.
+- **The ALLOCATING worker is a holder too (#6522):** #6211 F2 left the LOCAL
+  allocation path untracked on the ground that "RSS steers a 5-tuple to exactly
+  one worker, so a local allocation has a single holder by construction". That
+  ground does not hold, because a locally-born session is REPLICATED across
+  workers exactly like a peer-synced one. `poll_descriptor` calls
+  `replicate_session_upsert`, which fans a `WorkerLocalImport`-origin
+  `UpsertSynced` to `peer_worker_commands` — the queue list
+  `coordinator/reconcile/bringup.rs` builds with
+  `.filter(|(id, _)| **id != worker_id)`, i.e. every worker EXCEPT the allocating
+  one — and `SessionOrigin::is_peer_synced()` is TRUE for `WorkerLocalImport`, so
+  every sibling's `handle_upsert_synced` reserves and takes a bit on the record
+  the owner created. With the owner untracked the mask therefore named every
+  worker EXCEPT the one forwarding: the sibling replicas see no traffic
+  (flow-hash steering pins the flow to one worker), are never refreshed, all age
+  out, and the LAST one to reap emptied the mask and freed a `(pool_addr, port)`
+  the owner was still using — mid-flow pool-port reuse. A second path needs no
+  reserve at all: `session_glue::materialize_shared_session_hit` installs a
+  `WorkerLocalImport` replica off the shared map WITHOUT reserving, and
+  `reap_expired_sessions` releases for every expired entry with no origin or
+  holder filter.
+
+  The local allocation now records `NatHolder::Worker(worker_id)` at every
+  `LiveAllocation` mint (`allocate_translation` and its locked/lease twins, the
+  deterministic v4/v6 claims, and both address-only reservations), so the mask is
+  complete and the port survives until the OWNER releases. The packet-path
+  funnels take a `u32`, not a `NatHolder` — `source_nat_decision_for_flow` and
+  `Nat64State::allocate_source_for_worker` build the holder internally — so a
+  packet-path call site cannot express "untracked"; the untracked twins
+  (`Nat64State::allocate_source`) are `#[cfg(test)]`. The one production
+  untracked caller is `source_nat_would_translate_fragment`, the read-only
+  non-first-fragment probe, which mints nothing by contract.
+
+  Direction of the residual: a holder bit is cleared only by that worker's own
+  release, so a worker that dies with an allocation outstanding strands it
+  (#7092). #6522 widens that from synced reservations to local ones. It fails
+  closed — a leaked pool port, not a live flow's tuple handed to a new flow —
+  and is second-order to an already-fatal event.
 - **Worker-id bound (#6211 F2):** the mask tracks
   `nat::MAX_NAT_HOLDER_WORKERS` (128) workers, tied to the `u128` width by a
   `const` assertion so the two cannot drift. The bound is enforced where ids are
@@ -1360,6 +1538,40 @@ advance the cumulative ACK past the unapplied session seq, the helper's replay
 buffer would trim over it, and no subsequent gap would fire — so the standby
 diverged with no recovery. `handleSessionDecodeFailure` forces a full resync
 from table truth.
+
+**#6558 — the same pathology, reached through the PENDING-APPLY QUEUE.** The
+paragraph above is the sibling case, and it stayed live in a second form until
+#6558. The normal path is strictly receive → apply → ACK (`markFrameApplied`
+runs only after `onEvent` returns true), and a callback returning false enqueues
+the frame WITHOUT marking it — the withhold-ACK contract, pinned by
+`TestEventStreamSessionCallbackFalseWithholdsAck` and its FullResync/dataplane
+twins. But `dispatchOrQueue*` returns TRUE after a successful enqueue, so the
+reader keeps reading with frames still queued unapplied, and every REFUSAL path
+advanced `lastAppliedSeq` with no pending-queue check:
+`markDroppedFrameApplied` (telemetry type/payload mismatch, decode failure,
+unknown frame type — #1394), `handleSessionDecodeFailure` (#5483/#6130) and
+`handleOversizedFrame` (#6132/#6160, which additionally FLUSHES the ACK
+immediately). Enqueue delta N unapplied, receive refused frame N+1, and the
+cumulative ACK names N+1: the helper trims on `front.seq <= acked`
+(`event_stream/control.rs`) and the daemon calls `clearPendingCallbackFrames`
+on the next accept, so delta N is gone from both sides. The oversized path did
+both in one shot.
+
+Each of the three refusal fixes reasoned correctly about the REFUSED FRAME
+ITSELF; none reasoned about frames still queued BEHIND it, because the pending
+queue did not exist when the first was written.
+
+The repair keeps every loop-break intact — `prevSeq` and `lastRecvSeq` still
+advance immediately, so nothing re-fires the gap detector and the helper is
+never asked to replay a frame that would only be refused again (the #6130
+wedge). Only the ACK watermark is held back: `applyRefusedFrameInOrder`
+enqueues a **dropped marker** when the pending queue is non-empty, and the
+flush releases it in FIFO order like any applied frame. With an EMPTY queue the
+advance is immediate, exactly as before. `markFrameApplied` is also monotonic
+now: it was a bare `Store`, so a later in-order flush could REWIND the watermark
+below a value a drop path had jumped it to — and a rewound `lastAppliedSeq` is
+silently swallowed by `sendAckIfNeeded`'s `applied <= acked` guard and can
+regress `SendDrainRequest`'s fence.
 
 **#6130 — how a decode failure terminates (it does NOT mirror the #2874 gap
 self-heal).** The first #5483 fix reused the gap mechanics verbatim: force the

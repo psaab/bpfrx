@@ -521,13 +521,13 @@ func ValidateConfig(cfg *Config) []string {
 			}
 		}
 		// #3226 fold: every advisory below reasons about the EFFECTIVE token
-		// set — the zone-level list UNION the per-interface override, via the
-		// shared UnionHostInboundTokens — because that is what enforcement acts
-		// on (Junos host-inbound is additive across the two levels). Reasoning
-		// per RAW STANZA made the advisories contradict enforcement AND each
-		// other: a zone `any-service` with a per-interface `rpm` warned that rpm
-		// was DENIED when the union full-admits it. Sharing the union removes
-		// the whole class rather than special-casing each pair.
+		// set — via the shared EffectiveHostInboundTokens — because that is what
+		// enforcement acts on. Reasoning per RAW STANZA made the advisories
+		// contradict enforcement AND each other: a zone `any-service` with a
+		// per-interface `rpm` warned that rpm was DENIED when the effective set
+		// admits everything. Sharing the resolver removes the whole class rather
+		// than special-casing each pair. Post-#6515 that resolver REPLACES the
+		// zone level with a declared interface stanza rather than unioning them.
 		var zoneSvcs []string
 		if zone.HostInboundTraffic != nil {
 			zoneSvcs = zone.HostInboundTraffic.SystemServices
@@ -544,15 +544,20 @@ func ValidateConfig(cfg *Config) []string {
 			}
 			return false
 		}
-		// The zone-level stanza governs every interface that does NOT override.
-		// If EVERY interface in the zone overrides with a full-admit, the
-		// zone-level narrowing is unobservable and its advisories are moot too.
+		// The zone-level stanza governs every interface that does NOT declare its
+		// own host-inbound-traffic stanza. #6515: an interface that declares one
+		// REPLACES the zone set, so if EVERY interface in the zone declares one,
+		// the zone-level tokens reach nothing and their advisories are moot.
+		// (Before #6515 the levels unioned, so only a full-admit override could
+		// make the zone-level narrowing unobservable — a strictly narrower
+		// condition.) The lookup is the exact ref, so a unit that merely INHERITS
+		// a physical-parent override is not counted here and the advisory is still
+		// emitted: erring toward showing an advisory, never toward hiding one.
 		zoneObservable := !effectiveFullAdmits(zoneSvcs)
 		if zoneObservable && len(zone.Interfaces) > 0 {
 			allCovered := true
 			for _, ifRef := range zone.Interfaces {
-				hi := zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)]
-				if hi == nil || !effectiveFullAdmits(hi.SystemServices) {
+				if zone.InterfaceHostInbound[CanonicalInterfaceUnitRef(ifRef)] == nil {
 					allCovered = false
 					break
 				}
@@ -579,8 +584,9 @@ func ValidateConfig(cfg *Config) []string {
 			}
 			where := fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef)
 			// The EFFECTIVE set for this interface, exactly as the dataplane
-			// enforcement view builder computes it.
-			effective := UnionHostInboundTokens(zoneSvcs, hi.SystemServices)
+			// enforcement view builder computes it — post-#6515 the override
+			// REPLACES the zone-level set rather than adding to it.
+			effective := EffectiveHostInboundTokens(zoneSvcs, hi.SystemServices, true)
 			// The full-admit notice stays keyed on the OVERRIDE's own tokens: it
 			// reports what this stanza declares, and a zone-level `any-service`
 			// already drew its own notice at the zone level.
@@ -850,13 +856,21 @@ func ValidateConfig(cfg *Config) []string {
 	// today. no-syn-check / no-syn-check-in-tunnel would gate the
 	// session-create SYN check; rst-invalidate-session would tear a session
 	// down on RST; no-sequence-check (#2008 M9) would skip sequence-window
-	// validation. The dataplane session table is a pure 5-tuple flow entry
-	// with no TCP state machine and no sequence/window tracking, so there is
-	// nothing for any of these knobs to enforce or skip. This is an
-	// intentional, reviewed parity gap (see #2008 M9 and the RST design
-	// rationale in docs/active-active-new-connections.md); research #2078
-	// converged PLAN-KILL on enforcement. Warn so an operator who sets one
-	// of these is not silently misled into believing it has runtime effect.
+	// validation. The dataplane session table is a 5-tuple flow entry with no
+	// sequence/window tracking, so there is nothing for any of these knobs to
+	// enforce or skip. This is an intentional, reviewed parity gap (see #2008
+	// M9 and the RST design rationale in docs/active-active-new-connections.md);
+	// research #2078 converged PLAN-KILL on enforcement. Warn so an operator
+	// who sets one of these is not silently misled into believing it has
+	// runtime effect.
+	//
+	// #6539: the message used to say the dataplane "has no TCP state machine",
+	// which stopped being true — #3152 added the OPENING-vs-established
+	// distinction and #3046 the RST-vs-FIN close split, and those very states
+	// are why the tcp-session TIMEOUT leaves need their own, differently-worded
+	// advisory below. What remains true for these four PRESENCE flags is the
+	// absence of sequence/window tracking, so the sentence now claims only
+	// that.
 	if ts := cfg.Security.Flow.TCPSession; ts != nil {
 		var unenforced []string
 		if ts.NoSynCheck {
@@ -873,8 +887,18 @@ func ValidateConfig(cfg *Config) []string {
 		}
 		if len(unenforced) > 0 {
 			warnings = append(warnings, fmt.Sprintf(
-				"security flow tcp-session %s configured but accepted-only — the userspace dataplane has no TCP state machine and does not enforce these knobs (config-only parity, #2078)",
+				"security flow tcp-session %s configured but accepted-only — the userspace dataplane does not track TCP sequence/window state and does not enforce these knobs (config-only parity, #2078)",
 				strings.Join(unenforced, ", ")))
+		}
+		// #6539: the three tcp-session TIMEOUT leaves (initial / closing /
+		// time-wait) get their own line because their consequence is SPECIFIC
+		// rather than "no effect" (the #5804 rule): the dataplane DOES bound
+		// each of those session states, just on a fixed window the operator
+		// cannot move. Text and enforced/unenforced split both come from
+		// flow_tcp_timeouts_6539.go, the same authority the three `show`
+		// surfaces read.
+		if adv := tcpSessionTimeoutAdvisory(ts); adv != "" {
+			warnings = append(warnings, adv)
 		}
 	}
 
@@ -1869,6 +1893,12 @@ func ValidateConfig(cfg *Config) []string {
 	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
 	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
 
+	// #6544: 802.3ad link aggregation is schema-advertised and commits
+	// clean while being entirely inert. Accepted-only advisory so the
+	// operator is not told the aggregate exists by three layers at once
+	// and handed nothing.
+	warnings = append(warnings, validateLinkAggregationWarnings(cfg)...)
+
 	// #4788 + #4785 half 1: `tunnel mode ipip` is now HARD-REJECTED at commit
 	// (validateIpipTunnelUnimplementedStrict, compiler_tailgates.go), but the
 	// advisory MUST stay registered here. The alarm surfaces — `show system
@@ -1888,8 +1918,21 @@ func ValidateConfig(cfg *Config) []string {
 	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress
 	// interface). Surface that Junos-parity/hardening gap at commit; the per-zone
 	// iifname enforcement remains deferred.
+	warnings = append(warnings, validateHostInboundZoneLevelDHCPWarnings(cfg)...)
+	warnings = append(warnings, validateHostInboundOverrideReplaceWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundMulticastWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundManagedRoutingMismatch(cfg)...)
+
+	// #6460: a configured DHCP server answers on every interface its
+	// `dhcp-local-server` / `dhcpv6-local-server` group binds, REGARDLESS of the
+	// zone's `host-inbound-traffic system-services` set — DHCPv4 because Kea
+	// receives on an AF_PACKET raw socket that is delivered before the netfilter
+	// input hook, DHCPv6 because the ff02::1:2 request matches no per-zone
+	// unicast `daddr` rule and falls through the input chain's accept policy.
+	// Neither #4455 arm can see this (they cross-check routing protocols against
+	// FRR), so this shape produced no advisory at all before #6460. WARN-only;
+	// the per-zone enforcement is PLAN-KILLed with #4455 Component A.
+	warnings = append(warnings, validateDHCPServerHostInboundBypassWarnings(cfg)...)
 
 	// #5837 (Track-1 mitigation): a destination-NAT / static-NAT rule whose
 	// public (matched / external) destination address equals a configured
