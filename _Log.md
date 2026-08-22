@@ -1,3 +1,142 @@
+## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
+
+- **Timestamp**: 2026-08-22
+- **Action**: Repo-wide sweep correcting the RFC 6052 section cited for the
+  NAT64 non-global embedded-IPv4 rule. 17 occurrences across 11 files said
+  §2.2; §2.2 is the IPv4-Embedded IPv6 Address *Format* section and states no
+  such rule. The normative "MUST NOT translate / MUST drop" language is §3.1
+  (Restrictions on the use of the Well-Known Prefix).
+- **File(s)**: docs/feature-coverage.md, pkg/dataplane/userspace/format/
+  status_test.go, pkg/dataplane/userspace/protocol_binding.go,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/protocol/binding.rs
+- **Note**: the 2026-07-24 #6475 heading above carries the original mis-citation
+  and is deliberately left as written. This log is append-only and records what
+  was believed at the time; rewriting a past entry would falsify the record.
+  This entry is the correction.
+
+## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
+
+- **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
+- **Action**: Converted every production lock acquisition under
+  `userspace-dp/src/afxdp/wg/` from `.unwrap()` to the tree-wide
+  poison-tolerant idiom `unwrap_or_else(|e| e.into_inner())`.
+
+  Measured at `5e0aa38aa`: **68 lock-guard `.unwrap()` sites** in the six
+  production files (cookie.rs 7, engine.rs 21, handshake_session.rs 19,
+  peer.rs 10, tai64n.rs 3, timers.rs 8) — 29 `Mutex::lock()` plus 39
+  `RwLock::read()/write()`. A single-line grep reports 64; four sites wrap
+  `.lock()`/`.read()` and `.unwrap()` across source lines and need a
+  newline-tolerant match. **60 were converted; 8 `#[cfg(test)]` accessors
+  were left panicking on purpose** — they are compiled out of the shipped
+  helper so they cannot cause the production failure, and in a test build
+  a poisoned lock is evidence of a panic the test should surface.
+
+  Adoption of the existing remedy in `wg/` was ZERO before this: the only
+  `into_inner` under `wg/` was `engine_tests.rs`'s own #6157 harness lock.
+  `worker_queue::lock_recover` (#1807) and `shared_ops::lock_shared_recover`
+  (#2402) were deliberately NOT reused — each stamps a subsystem-specific
+  journald line and bumps a subsystem-specific recovery counter that a WG
+  cookie or replay-window recovery would falsify, and neither takes an
+  `RwLock`, which is 39 of the 68 sites.
+
+  Why recovery is correct at each site, not merely convenient: the guarded
+  state is either a map holding the committed prefix of every completed
+  insert (`pending`, `pending_by_peer`, `sessions_by_local_index`, the
+  per-peer keypair slots — discarding it is the #2402 defect), or a value
+  mutated only by infallible integer/array arithmetic with no panic site in
+  the critical section (`ReplayState::check_and_update`, the two TAI64N
+  high-water marks, the cookie load/budget windows), so `into_inner()`
+  always yields a well-formed committed value. For the anti-replay marks
+  recovery is strictly SAFER than panicking: a supervisor restart loop
+  risks the mark coming back reset, which accepts the replays it exists to
+  reject. `reconcile_lock` is the one lock that guards a cross-map
+  invariant rather than data of its own — recovering does not repair a
+  half-done reconcile, but neither does panicking, and panicking also
+  guarantees the idempotent `reconcile_peers` pass that COULD repair it
+  never runs again.
+
+  **Validation**: 10 new poison regressions (7 in a new
+  `wg/poison_tests.rs`, 2 in cookie_tests.rs, 1 in tai64n_tests.rs) poison
+  a real engine lock and assert the production entry point still
+  completes. Full Rust suite green under `--test-threads=1`.
+  Mutation-proved: reverting a single converted site to `.unwrap()` reds
+  its pinning test while `cargo check --all-targets` stays clean (an
+  assertion/panic red, not a build break) — matrix in the PR body.
+
+  **Smoke is OWED**: this changes the `xpf-userspace-dp` helper binary, so
+  a loss-userspace cluster smoke is required before merge. Not run here —
+  the cluster is shared and lock-protected.
+- **File(s)**: userspace-dp/src/afxdp/wg/{cookie,engine,handshake_session,
+  peer,tai64n,timers}.rs, userspace-dp/src/afxdp/wg/poison_tests.rs (new),
+  userspace-dp/src/afxdp/wg/{mod,tests,cookie_tests,tai64n_tests}.rs,
+  docs/engineering-style.md, _Log.md
+## 2026-08-21 — #6429: applyHelperStatusLocked split into per-domain apply steps
+
+- **Timestamp**: 2026-08-21 (refactor/6429-apply-helper-status)
+- **Action**: Split the 481-line `applyHelperStatusLocked` god-function into 12
+  per-domain steps in a new `helper_status_apply.go`, leaving an 84-line driver
+  in `maps_sync.go`. PURE CODE MOTION: 21 of 24 moved blocks are byte-identical
+  modulo leading tabs, verified mechanically by searching the produced files for
+  the left-stripped original ranges (`check.py`), not by eye. The only 8
+  differing lines are the two mechanical adaptations a function boundary forces:
+  the two `goto ctrlReady` jumps became `return` (the label sat immediately
+  after the block they escaped and that block was the last statement in the
+  chain, so the jump and the return land on the same statement — the label is
+  now dead and removed), and the six `return m.failClosedUserspaceCtrlLocked(…)`
+  in the two binding-row loops gained the `newBindingIndices` accumulator as a
+  first result.
+
+  Steps extracted: `helperCtrlFlagsLocked`, `resolveCtrlEnableLocked`,
+  `ensureCtrlEnablePrewarmLocked`, `bindingReadinessLocked`,
+  `observeXSKReceiveLivenessLocked`, `applyXSKLivenessGateLocked`,
+  `advanceXSKLivenessLocked`, `resolveXSKLivenessProbeTimeoutLocked`,
+  `flushStaleBPFStateOnCtrlEnableLocked`, `applyRuntimeModeLocked`,
+  `applyPrimaryBindingRowsLocked`, `applyAliasBindingRowsLocked`.
+
+  The path runs under `m.mu` at ~1/s per helper, so the two rules that govern it
+  were checked rather than asserted. Allocation: `go build -gcflags=-m` over the
+  before/after regions gives an IDENTICAL heap-fact set — 50 distinct, 109 total
+  — with zero facts present after that were absent before. Every new message is
+  a `does not escape` annotation for a newly-introduced parameter; notably
+  `ctrl` is taken by pointer in five places and escape analysis still reports
+  `ctrl does not escape` for all five, and `newBindingIndexSet` keeps its
+  pre-existing `make(map[uint32]struct {}) does not escape`. Logging: all 15
+  `slog` sites diff clean on level AND message text; nothing was promoted from
+  Debug.
+
+  Early-return map (unchanged by the split): R1/R2 (`ctrlMap`/`bindingsMap` nil)
+  skip everything; R3 (ctrl-disable write fails) returns BEFORE
+  `m.ctrlWasEnabled = false` / `m.ctrlDisabledAt` are updated and skips both
+  binding loops, `clearStaleBindingRowsLocked`, the three map syncs,
+  `syncBPFCountersLocked`, the ctrl-enable write and `recordHelperStatusLocked`;
+  R4-R6 (primary loop) and R7-R9 (alias loop) fail ctrl closed and skip
+  everything from `clearStaleBindingRowsLocked` onward, leaving
+  `m.lastBindingIndices` untouched; R10-R12 (the three syncs) skip the syncs
+  below them plus counters/enable/record; R13 (ctrl-enable write) skips only
+  `recordHelperStatusLocked`. The two former `goto`s are not returns — they skip
+  only the liveness-failure tail and leave `ctrl.Enabled = 1` standing.
+
+  `pkg/dataplane/userspace/maps_sync.go` moves 2046 [REFACTOR] -> 1655 [WATCH]
+  in the modularity heatmap; the new file is 567 lines, below the audit floor.
+  Doc pointers into the moved code updated in `docs/reth-mac.md` (the ctrl-write
+  gate is now consulted in `resolveCtrlEnableLocked`; the predicate
+  `ctrlMustStayDisabledLocked` stays in `maps_sync.go`) and
+  `docs/afxdp-packet-processing.md` (the #4894/#814 write-side dimension guards
+  moved with the apply path; the watchdog copies stayed).
+
+  A cluster smoke is OWED and was NOT run — this is the helper status-apply
+  path. Deliberately out of scope: the five repeated
+  `UsingUserspaceXDPShimEntryProgram`/`SwapTo…` blocks were NOT deduplicated,
+  because that is a rewrite, not code motion.
+
+- **File(s)**: `pkg/dataplane/userspace/helper_status_apply.go` (new),
+  `pkg/dataplane/userspace/maps_sync.go`, `docs/reth-mac.md`,
+  `docs/afxdp-packet-processing.md`, `docs/refactoring-audit-current.txt`,
+  `_Log.md`
+
 ## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
 
 - **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
@@ -99940,6 +100079,191 @@ prose edit above them added. No diff falls in the new test body.
   cluster smoke is OWED.
 - **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
   userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
+
+## 2026-08-21 — #6440 CoS-apply CLI-transcript gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Diagnosed #6440 (`apply-cos-config.sh` exits 6). Root cause: the
+  piped-stdin CLI is a REPL that prints `error: ...` for a failed command,
+  continues, and exits 0 — so the phase-1/phase-2 exit-status gates could
+  never fire, and a silently-failed `load merge` committed a deletes-only
+  candidate (a CoS wipe) that surfaced only as the phase-3 "no shaper
+  binding" grep. Replaced the exit-status gates with CLI success-marker
+  verification, made every rollback verified, and added a daemon-readiness
+  wait.
+- **File(s)**: `test/incus/cos-apply-lib.sh` (new),
+  `test/incus/cos-apply-lib-selftest.sh` (new),
+  `cmd/cli/cos_apply_markers_6440_test.go` (new),
+  `test/incus/apply-cos-config.sh`, `Makefile`, `CLAUDE.md`,
+  `docs/cos-validation-notes.md`
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
+  return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
+  (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
+  degraded arm; document the idle regulation in the worker README.
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
+  `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`
+
+## 2026-08-21 — #6177 item 1: fence the remote-failover ack on RETH VIP release
+- **Timestamp**: 2026-08-21
+- **Action**: Close the RETH VIP-removal sub-ms two-owner residual. `vrrp.ResignRG`
+  now returns a `*ResignBarrier` armed on every targeted instance before
+  `triggerResign`; instances report to it from the sites that actually complete a
+  VIP release (`becomeBackup` with the `removeVIPs` verdict, the MASTER-arm
+  shutdown removal, a new BACKUP-arm `resignCh` consumer, and `stop()`).
+  `handleClusterEvent` defers the demotion fence verdict to
+  `awaitRethVIPRelease`, which resolves `signalFailoverActuated` /
+  `signalFailoverActuationFailed` from the release itself, on its own goroutine.
+- **File(s)**: pkg/vrrp/resign_barrier.go (new), pkg/vrrp/instance.go,
+  pkg/vrrp/manager.go, pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go,
+  pkg/vrrp/resign_barrier_6177_test.go (new),
+  pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
+  docs/session-sync-architecture.md
+
+## 2026-08-21 — #6427: split manager_ha.go into seven responsibility-scoped files
+
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/dataplane/userspace/manager_ha.go` (2,299 LOC, the `[REFACTOR]`
+  tier of the modularity audit) fused seven unrelated responsibilities behind
+  one HA-shaped filename: the HA state machine, fabric-state publish, helper
+  counter bridging, session-table mutation verbs, session-sync request
+  construction, session-sync transmit/lock discipline, and the NAPI bootstrap
+  probe interface list. Split by responsibility into `manager_ha.go` (873),
+  `manager_sessions.go` (569), `manager_sessionsync_request.go` (327),
+  `manager_counters.go` (267), `manager_sessionsync_transmit.go` (187),
+  `manager_fabric_sync.go` (102) and `napi_probe_interfaces.go` (57). PURE CODE
+  MOTION: every declaration was copied by exact source line range, so no body,
+  signature, receiver, visibility, lock scope or defer ordering changed and no
+  new exported surface was created (everything stays in package `userspace`).
+  Two INDEPENDENT mechanical proofs, not eyeballing: (1) a regex block parser
+  compared all 80 top-level declarations before/after and found 80 byte-identical
+  including indentation, 0 dropped, 0 added, with each declaration's leading
+  comment run compared separately so a doc comment landing on the wrong
+  neighbour would fail; (2) a `go/parser` + `go/printer` dump keyed by
+  declaration name, emitting each decl's `ast.Doc` text and printed source,
+  diffed to zero across the seven post-split files. Also refreshed the six
+  now-stale `manager_ha.go` path pointers in docs/Rust comments that name a
+  moved symbol, and regenerated the refactor audit — manager_ha.go leaves the
+  `[REFACTOR]` tier and no new file enters the >=1500 LOC audit at all.
+  `go build ./...`, `go vet ./pkg/dataplane/...`, `go test -count=1
+  ./pkg/dataplane/...`, `go test -count=1 -race -run 'Session|HA'
+  ./pkg/dataplane/userspace/...`, `go test -count=1 ./pkg/refactoraudit/...` and
+  `go test -count=1 ./...` all rc=0, with the `_5007` / `_5698` / `_5305` /
+  `_5380` / `_5881` cells unchanged. **HA/session-sync code: `make test-failover`
+  is OWED and was NOT run (shared loss cluster not touched).**
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/manager_sessionsync_request.go,
+  pkg/dataplane/userspace/manager_sessionsync_transmit.go,
+  pkg/dataplane/userspace/manager_counters.go,
+  pkg/dataplane/userspace/manager_fabric_sync.go,
+  pkg/dataplane/userspace/napi_probe_interfaces.go,
+  docs/refactoring-audit-current.txt, docs/config-schema.md,
+  docs/fabric-cross-chassis-fwd.md, docs/snapshot-publish-redesign.md,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/ha/session_import.rs, userspace-dp/src/main_tests.rs,
+  _Log.md
+
+## 2026-08-21 — #7259: bind the BulkSnapshotSource production wiring
+- **Timestamp**: 2026-08-21
+- **Action**: Add a test that drives the real `startClusterComms` and INVOKES the
+  `BulkSnapshotSource` it published, asserting the exported session round-trips.
+  Deleting `ss.BulkSnapshotSource = d.userspaceBulkSnapshot` left all five
+  existing #6031 tests green while silently reverting the fix.
+- **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
+
+## 2026-08-21 — #6535 periodic converger for the Kea applier
+- **Timestamp**: 2026-08-21
+- **Action**: Track whether a Kea apply converged (`applyFailed` +
+  `ClaimApplyRetry`, on their own mutex); add `reconcileClusterDHCPServices`
+  to `reconcileRGState`; single-source the desired state as
+  `desiredClusterDHCPConfig`.
+- **File(s)**: `pkg/dhcpserver/dhcpserver.go`, `pkg/dhcpserver/test_seams.go`,
+  `pkg/dhcpserver/README.md`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/daemon_apply_routing.go`,
+  `pkg/daemon/dhcp_apply_converger_6535_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6530 fence re-arms the rg_active reconcile retry
+- **Timestamp**: 2026-08-21
+- **Action**: Add `rgStateMachine.InvalidateApplied()` so an out-of-band
+  `rg_active` write re-arms `reconcileRGState`'s desired-vs-applied retry;
+  route the received-peer-fence path through it; lazily allocate `d.rgStates`.
+- **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha_sync.go`,
+  `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/rg_state_fence_rearm_6530_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6527 single-RG transfer-commit rollback
+- **Timestamp**: 2026-08-21
+- **Action**: Roll back `peerTransferOutOverride` when
+  `commitRequestedPeerFailover` loses the election, mirroring the batch path;
+  agreement-binding regression test across both request paths.
+- **File(s)**: `pkg/cluster/failover.go`,
+  `pkg/cluster/failover_commit_rollback_6527_test.go`,
+  `pkg/cluster/README.md`
+## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: `compileNAT` / `compileStaticNAT` / `compileNAT64` built
+  `SNATValue`, `SNATValueV6`, `SNATEgressValue`, `NATPoolConfig`, `DNATValue`,
+  static-NAT and `NAT64Config` records and handed them to `SetSNATRule` /
+  `SetDNATEntry` / `SetNATPoolConfig` / the stale-NAT deleters. Every one of
+  those writes landed nowhere: the only production compile path is
+  `Manager.CompileUserspaceShim`, whose `userspaceShimCompileDataplane`
+  implements each as `return nil` (loader.go); the real `(*Manager)` writers in
+  `maps_nat.go` are reachable only through `Manager.Compile`, which no
+  production caller reaches because no backend registers a non-userspace type
+  and `LegacyDataPlaneAdapter` shadows `Compile`/`ApplyConfig` with the
+  userspace ones. Deleted the construction; kept every value that escapes —
+  `result.PoolIDs` / `NextPoolID`, `result.NATCounterIDs`, the implicit
+  `_snat_match_<cidr>` entries in `result.AddrIDs`, the persistent-NAT table
+  (`GetPersistentNAT`, the file's one non-no-op dataplane call), and every
+  compile-failing rejection. `compileNPTv6` is untouched: it still writes
+  `nptv6_rules`, and retiring that plus the `maps_nat.go` writers is the
+  sibling cleanup. New `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms
+  every retired writer to FAIL and requires a clean validate on both marker
+  arms, so a reintroduced write reds by error propagation rather than by a
+  counter. 594 lines removed from compiler_nat.go (1428 -> 1066).
+- **File(s)**: pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+
+## 2026-08-21 — #6311: node discriminator in the session-id namespace
+- **Timestamp**: 2026-08-21
+- **Action**: Fold a chassis-cluster node bit into the userspace session-id
+  namespace so an id adopted verbatim from the peer (#5212) can never collide
+  with a locally-minted one. `SessionTable::set_worker_id` becomes
+  `set_session_id_namespace(node_id, worker_id)` — namespace is
+  `node_bit << 15 | worker_id` in the high 16 bits — with the #6198 control-plane
+  reservation now guarding the COMBINED namespace and a new assert refusing a
+  worker id that would carry into the node bit. `node_id` is plumbed
+  Go config -> `ConfigSnapshot.node_id` -> `bring_up_workers` -> `spawn_workers`
+  -> `WorkerLaunchPlan` -> `worker_loop_setup`. Additive wire field, no protocol
+  version bump.
+- **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/worker/launch.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/setup.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/snapshot_node_id_6311_test.go,
+  pkg/daemon/daemon_ha_userspace_convert.go, docs/sync-protocol.md
+
+## 2026-08-21 — #6311: de-vacuum the adoption-collision test
+- **Timestamp**: 2026-08-21
+- **Action**: The mutation matrix showed
+  `adopted_peer_id_cannot_collide_with_a_local_id_6311` passing under the
+  node-bit-removal cell. It built the peer id as a hardcoded literal, so it
+  named a value the un-bitted allocator never produces — a probe keyed to the
+  fix, not to the property. Rewrote it to MINT the peer id from a real node-1
+  `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
+  It now reds under that cell (4 failures, was 3).
+- **File(s)**: userspace-dp/src/session/tests.rs
 
 ## 2026-08-21 — #7253: split the modularity gate from the heatmap freshness gate
 

@@ -221,3 +221,109 @@ deploy_rolling_secondary_node() {
 deploy_rolling_rg_ids() {
 	awk '/^Redundancy group:[[:space:]]/ { print $3 }' | sort -n -u
 }
+
+# ── #1864 verify-dataplane pre-flight (#6493) ────────────────────────
+# The embedded AF_XDP shim object in a freshly built xpfd can be REJECTED by
+# the target box's BPF verifier (a drifted `make generate` toolchain, or simply
+# an older kernel on the VM than on the build host). Nothing else in a deploy
+# notices: `incus file push` succeeds, deploy_verify_pushed_sha compares BYTES,
+# and deploy_verify_running_xpfd only proves systemd launched the pushed image.
+# All three pass while the node comes up in config-only mode with NO dataplane,
+# and the failure surfaces later as a forwarding mystery. That is the
+# 2026-06-10 #1864 incident mode exactly.
+#
+# So every path that swaps xpfd on a live box proves the new binary's shim
+# LOADS on THAT box's kernel first. The cluster deploy has done this since
+# #1869; the standalone test/incus deploy did not, which is the venue where
+# shim iteration actually happens (#6493). This is the shared implementation
+# both callers now use.
+
+# Where the candidate binary is staged on the target for the probe. Deliberately
+# NOT /usr/local/sbin/xpfd: the whole point is to decide BEFORE replacing
+# anything the running daemon depends on.
+DEPLOY_PREFLIGHT_PATH="/tmp/xpfd.preflight"
+
+# deploy_verify_dataplane_preflight <rinst> <local_xpfd>
+#
+# ORDERING INVARIANT — the reason this function exists and the thing to protect
+# in review: NO dataplane stop, `xpfd cleanup`, pkill, binary replacement, or
+# legacy-name (bpfrxd) migration may run before this returns. On REJECT it
+# die()s, so the caller aborts with the OLD daemon still running and forwarding.
+# A preflight placed after `systemctl stop xpfd` proves the same fact but has
+# already taken the box down to learn it, which is the bug.
+#
+# The probe loads anonymous maps only — no pins, no attach — so the live
+# dataplane is untouched by a PASS.
+#
+# CPU contract: the verifier walk costs ~17s of one core on a REJECT. Running
+# that on an AF_XDP worker core would stall forwarding on a box that is still
+# in service, so it runs on the COMPLEMENT of the worker cores, derived from the
+# live xpf-userspace-dp tasks' Cpus_allowed_list, at nice -19. If the complement
+# is empty or cannot be derived (no helper running — the standalone case on a
+# box whose daemon is down), it falls back to nice -19 across all CPUs.
+deploy_verify_dataplane_preflight() {
+	local rinst="$1" local_xpfd="$2"
+
+	[[ -f "$local_xpfd" ]] \
+		|| die "verify-dataplane pre-flight: local xpfd not found at $local_xpfd — nothing to verify (build first)"
+
+	info "Pre-flight: verifying new xpfd dataplane object on $rinst..."
+	incus file push "$local_xpfd" "${rinst}${DEPLOY_PREFLIGHT_PATH}" --mode 0755 \
+		|| die "verify-dataplane pre-flight: failed to stage $local_xpfd at ${DEPLOY_PREFLIGHT_PATH} on $rinst — deploy aborted, old daemon untouched"
+
+	if ! incus exec "$rinst" -- bash -c '
+		set -u
+		free_cpus() {
+			# Worker threads pin themselves to exactly one CPU each
+			# (userspace-dp pin_current_thread); collect the
+			# single-CPU Cpus_allowed_list values (unpinned control
+			# threads report full ranges and are not workers) and
+			# return the complement vs online CPUs.
+			# pidof, not pgrep -x: the process name is 16 chars,
+			# past the 15-char comm truncation pgrep -x matches on.
+			local pid used t v
+			pid=$(pidof -s xpf-userspace-dp 2>/dev/null)
+			[ -n "$pid" ] || return 1
+			used=""
+			for t in /proc/"$pid"/task/*/status; do
+				[ -r "$t" ] || continue
+				v=$(awk -F"\t" "/^Cpus_allowed_list/ {print \$2}" "$t")
+				[[ "$v" =~ ^[0-9]+$ ]] && used="$used $v"
+			done
+			[ -n "${used// /}" ] || return 1
+			seq 0 $(( $(nproc --all) - 1 )) | \
+				awk -v used="$used" "BEGIN{n=split(used,a,\" \"); for(i=1;i<=n;i++) u[a[i]]=1} !(\$0 in u)" | \
+				paste -sd, -
+		}
+		MASK=$(free_cpus 2>/dev/null || true)
+		# Probe the mask before trusting it: the complement is taken
+		# against `nproc --all` (configured CPUs), which can include
+		# offline CPUs — taskset then EINVALs and, because this exec
+		# chain treats any non-zero exit as a verifier REJECT, a bad
+		# mask would false-reject a good binary (observed live on
+		# fw1 during the #1864 deploy smoke). An unusable mask falls
+		# back to the un-pinned nice-only run.
+		if [ -n "$MASK" ] && taskset -c "$MASK" true 2>/dev/null; then
+			exec nice -n 19 taskset -c "$MASK" '"$DEPLOY_PREFLIGHT_PATH"' verify-dataplane
+		fi
+		exec nice -n 19 '"$DEPLOY_PREFLIGHT_PATH"' verify-dataplane
+	'; then
+		deploy_preflight_cleanup "$rinst"
+		die "verify-dataplane REJECTED the new binary's embedded shim on $rinst — deploy aborted, old daemon untouched.
+  This is the #1864 failure mode. Rebuild with the pinned toolchain (make generate) or restore the tracked object:
+    git checkout -- pkg/dataplane/userspace_xdp_bpfel.o && make build"
+	fi
+	deploy_preflight_cleanup "$rinst"
+	info "Pre-flight PASS: the new xpfd's embedded shim loads on $rinst's kernel."
+}
+
+# deploy_preflight_cleanup <rinst>
+#
+# Remove the staged candidate. Runs on BOTH the PASS and the REJECT path — a
+# REJECT that leaves a stale /tmp/xpfd.preflight behind seeds the next probe's
+# diagnosis with a binary nobody asked about. Best-effort by design: a failure
+# to unlink must not turn a passing pre-flight into a failed deploy.
+deploy_preflight_cleanup() {
+	local rinst="$1"
+	incus exec "$rinst" -- rm -f "$DEPLOY_PREFLIGHT_PATH" 2>/dev/null || true
+}

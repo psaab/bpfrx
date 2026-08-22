@@ -392,12 +392,28 @@ the same logical session carries the SAME id on both nodes — that cross-node
 correlation is the entire point. It is a **metadata-only** stamp (RT_FLOW
 correlation and the `show security flow session` mirror id), NEVER a lookup key
 or slab handle, so adoption cannot affect forwarding, security, or memory
-safety. It is **not globally unique**: the `worker_id<<48 | counter` namespace
-carries no node discriminator and both nodes run the same worker set, so in an
-active/active cluster an adopted id can collide with a local same-worker id (a
-duplicate correlation stamp — observability-only, bounded). A node-discriminator
-bit that makes adoption globally collision-free is tracked as a follow-up
-(#6311).
+safety. Since #6311 it is also globally **collision-free**: the high-16
+namespace is `node_bit << 15 | worker_id`, fed from `ConfigSnapshot.node_id`, so
+an adopted id carries the ORIGINATING node's bit and can never equal an id the
+importing node mints. Before that bit, both nodes ran the same worker set with
+counters that both start at 1, so in an active/active cluster an adopted id
+collided with a local same-worker id — and that also regressed pre-#5212
+same-node uniqueness, where every import got a fresh local id. The node bit is
+also why `upsert_synced_with_origin` does not reconcile `next_session_id`
+against an adopted id: the two namespaces are disjoint, so a later local alloc
+cannot re-hand-out an adopted value.
+
+`node_id` rides `apply_snapshot` as an additive `omitempty` /
+`#[serde(default)]` field with **no** `CONFIG_SNAPSHOT_PROTOCOL_VERSION` bump.
+The snapshot handler gates on EXACT version equality, so a bump would make a
+mixed-base pair refuse to apply a snapshot at all; an older helper that ignores
+the field simply keeps the pre-#6311 layout. The pairing is monotone in both
+directions — new-daemon/old-helper is today's behaviour, and
+old-daemon/new-helper leaves node 1 in the un-bitted low half, also today's
+behaviour — so neither direction introduces a NEW collision. It is consumed only
+at worker SPAWN, so a node id that changes at runtime takes effect on the next
+plan change or restart; `/etc/xpf/node-id` is read once at daemon start, so that
+is already a reboot-level operation.
 
 **Additive, not a guard.** Unlike #5274's `ConfigEpoch`, this field is pure
 identity carriage — no receiver rejects on it. `RTFlowSessionID == 0` (legacy
@@ -822,13 +838,33 @@ the event-stream stream can drop frames under load, it can never delimit an
 authoritative snapshot: reconciling against an incomplete set would DELETE live
 peer-owned sessions merely dropped in transit. The override is therefore no
 longer wired in production (`startClusterComms`); `doBulkSync` always ends with
-`BulkSync()`, whose direct writes under `writeMu` are lossless and complete.
-`BulkSync` sources sessions from the shim `sessions`/`sessions_v6` BPF mirror
-maps (owner-RG-filtered by `ShouldSyncZone`); a table-truth source
-(`ExportOwnerRGSessions`) that removes the mirror-drift residual is tracked as a
-follow-up. `BulkSyncOverride` is retained only as a test/extension seam and is
-regression-proof: the trailing `BulkSync()` runs unconditionally, so an override
-can never re-send empty markers.
+a lossless direct-write window under `writeMu`. `BulkSyncOverride` is retained
+only as a test/extension seam and is regression-proof: the trailing window is
+framed unconditionally, so an override can never re-send empty markers.
+
+#### Table-truth window source (#6031)
+
+The window's session SOURCE is no longer the shim `sessions`/`sessions_v6` BPF
+maps. Under the userspace dataplane those are a best-effort **display mirror**:
+the helper publishes a conntrack row only on the host-inbound install, the
+missing-neighbor seed, and the reverse-companion repair, so a **transit** session
+— which is what an HA firewall is actually protecting — has no row there at all.
+Combined with the authoritative reconcile above (absent from the window ⇒
+DELETED), framing the window from that mirror deleted the standby's live
+peer-owned transit sessions on every cold prime, survivor re-drive, and forced
+resync.
+
+`doBulkSync` now prefers `SessionSync.BulkSnapshotSource`, wired by the daemon to
+`ExportOwnerRGSessions(rgIDs, 0)` — the helper's in-process `SessionTable`,
+owner-RG-filtered, synchronous, and UNBOUNDED (a cap would truncate the window
+and the peer would delete the remainder). The snapshot is converted by the SAME
+walk and filter the incremental delta stream uses, so both admit one set, and it
+is framed verbatim (no second `ShouldSyncZone` pass — that could drop an entry
+the incremental path admits, which the receiver would then delete). If the source
+errors, `doBulkSync` fails CLOSED and frames NO window rather than falling back
+to the mirror: an incomplete authoritative window destroys live sessions, while
+framing none only defers the reconcile to the next armed retry. `BulkSync()`'s
+store walk remains for callers with no snapshot source wired.
 
 #### Survivor-fabric cold-start bulk re-drive (#4090)
 

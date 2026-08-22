@@ -989,6 +989,75 @@ than re-running. The accompanying fixture at
 `test/incus/cos-iperf-config.set` covers both `family inet` and
 `family inet6` classifier state.
 
+### How the loader detects a failed apply (#6440)
+
+That strictness could not actually work before #6440, and it is worth
+understanding why, because the same trap catches any script driving this
+CLI.
+
+The loader runs the CLI by piping a heredoc into it:
+
+```bash
+incus exec "$TARGET" -- /usr/local/sbin/cli <<EOF
+configure
+delete class-of-service
+load merge /tmp/cos-iperf-sets.set
+commit check
+...
+```
+
+**That form is a REPL, not a batch runner.** `cmd/cli`'s read loop prints
+`error: <msg>` for a failed command, continues to the NEXT line, and the
+process still exits 0. So gating a phase on the session's exit status
+detects nothing. (`cli -c "<one command>"` is the opposite — it
+`os.Exit(1)`s on a dispatch error. Only the piped-stdin form swallows.)
+
+The failure #6440 recorded: `load merge` failed, leaving a candidate that
+held only the loader's `delete class-of-service ...` lines. Deleting is
+valid, so `commit check` passed and `commit` committed the deletes —
+**wiping CoS instead of applying it**. The first check that noticed
+anything was the post-commit `show class-of-service interface` grep, which
+reported the misleading "no shaper/scheduler binding" and exited 6. Every
+CoS measurement taken after such a run was silently taken against
+un-applied config.
+
+The loader now verifies the CLI's own **success markers** in each captured
+transcript (`test/incus/cos-apply-lib.sh`):
+
+| verb | marker printed only on success |
+|---|---|
+| `load merge` | `load merge complete` |
+| `commit check` | `configuration check succeeds` |
+| `commit` | `commit complete` (or `commit complete: <summary>`) |
+| `rollback N` | `configuration rolled back` |
+
+Positive markers are checked rather than scanning for `error:` lines
+because the loader's delete list is idempotent by design: its `delete`
+lines legitimately error with a path-not-found on a fresh post-deploy box
+where CoS was already wiped. Those benign errors must not fail the apply,
+and they do not disturb the markers.
+
+Two consequences worth knowing:
+
+- **`rollback` is verified too.** Every rollback site previously announced
+  "live state reverted" from the `then` branch of an `if` on the session's
+  exit status — i.e. unconditionally. The loader could report a clean
+  revert over a rollback that never happened. It now says
+  `live state reverted (verified)` only when both markers appear, and
+  escalates to `MANUAL INTERVENTION REQUIRED` otherwise.
+- **Exit 6 now means what it says.** A CLI/daemon reachability failure
+  during the readback exits 6 with an explicit "this is a CLI/daemon
+  reachability failure, NOT a CoS binding failure" line, and a new exit 3
+  covers "xpfd never became reachable" (the loader waits for the gRPC
+  listener before the first commit — a deploy restarts xpfd, and #6440 also
+  recorded a commit-check dying on connection-refused).
+
+`make test-cos-apply-lib` self-tests all of this hermetically (mocked
+incus, canned transcripts — no cluster). The marker strings are a
+cross-language contract; `cmd/cli/cos_apply_markers_6440_test.go` pins
+both halves (printed on success, withheld on failure) and fails if the
+shell library and the CLI ever disagree.
+
 Opt-in injectors layered onto the selected fixture: the
 `--surplus-sharing` flag (#915) and `COS_EQUAL_FLOW=1` (#1831,
 follow-up to #1766/#1745) each append one presence-only scheduler

@@ -5304,7 +5304,7 @@ fn nat64_5623_eligible_source_non_nat64_dest_still_routes() {
 }
 
 // ===========================================================================
-// #6475: NAT64 DESTINATION-eligibility rejection (RFC 6052 §2.2).
+// #6475: NAT64 DESTINATION-eligibility rejection (RFC 6052 §3.1).
 //
 // A NAT64 prefix MUST NOT translate an embedded IPv4 destination that is not
 // globally routable. Pre-gate, `match_ipv6_dest` extracted the low 32 bits
@@ -5422,7 +5422,7 @@ fn nat64_6475_dst_reserved_and_limited_broadcast_rejected() {
 #[test]
 fn nat64_6475_global_dst_still_translates() {
     // Over-reject guard: a legitimate embedded IPv4 destination must still
-    // translate exactly as before. 198.51.100.50 is TEST-NET-2 — RFC 6052 §2.2
+    // translate exactly as before. 198.51.100.50 is TEST-NET-2 — RFC 6052 §3.1
     // also names RFC 1918 / RFC 5735 special-use space, but the issue scopes
     // that screening to OPTIONAL (an NSP deployment may legitimately translate
     // to internal v4), so only the listed classes are rejected and TEST-NET /

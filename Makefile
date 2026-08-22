@@ -345,7 +345,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-cos-apply-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -374,6 +374,17 @@ test-deploy-lib:
 test-cluster-lock-lib:
 	bash ./test/incus/with-cluster-selftest.sh
 	bash ./test/incus/cluster-cell-selftest.sh
+
+# Self-test the #6440 CoS-apply CLI-transcript gate. `apply-cos-config.sh`
+# drives the Junos CLI by piping a heredoc into it; that form is a REPL that
+# prints "error: ..." for a failed command, continues, and still exits 0 — so
+# the phase gates verify the CLI's own success markers instead of the session
+# exit status. Hermetic: mocked incus, canned transcripts; no cluster, no VM.
+# Run this after touching apply-cos-config.sh or cos-apply-lib.sh. The Go half
+# of the marker contract lives in cmd/cli/cos_apply_markers_6440_test.go.
+test-cos-apply-lib:
+	bash ./test/incus/cos-apply-lib-selftest.sh
+	go test -count=1 -run 6440 ./cmd/cli/
 
 # Self-test the shared cluster-env resolver (#5024): the HA/failover
 # smoke scripts read $FW0/$FW1/$CLUSTER_LAN_HOST, which cluster-env.sh

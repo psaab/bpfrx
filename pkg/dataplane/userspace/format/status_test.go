@@ -273,7 +273,7 @@ func TestFormatStatusSummaryShowsNAT64ExthdrIneligible(t *testing.T) {
 
 // #6475: the status summary surfaces the fail-closed NAT64 destination
 // ineligibility counter — a NAT64-prefix-matched destination whose embedded
-// IPv4 is non-global per RFC 6052 §2.2 (0.0.0.0/8, 127.0.0.0/8,
+// IPv4 is non-global per RFC 6052 §3.1 (0.0.0.0/8, 127.0.0.0/8,
 // 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 — e.g. 64:ff9b::127.0.0.1, which
 // would otherwise LocalDeliver to the localhost-only control plane) — as its
 // own row, summed across bindings, distinct from the source/pool/fragment
