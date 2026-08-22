@@ -98855,6 +98855,9 @@ prose edit above them added. No diff falls in the new test body.
   only the rule NAME (#4316, accepted-but-inert) and `system syslog file <f>
   archive` is a recognized-but-uncompiled modifier (#4303 S-1), so their
   `code-points` / `archive-sites` leaves are unread in EVERY spelling.
+- **Timestamp**: 2026-08-21
+- **Action**: Verified all 8 items of audit cohort #6227 (claude-spark-review-002)
+  against current master and fixed the three confirmed LIVE + TRIVIAL survivors.
 
   #6714's three arms were all live at HEAD and are fixed here, plus the fourth
   site compiler_routing.go carried as a named #6714 blind spot.
@@ -99190,3 +99193,110 @@ prose edit above them added. No diff falls in the new test body.
     userspace-dp/src/afxdp/frame/prop_tests/segment.rs,
     userspace-dp/src/afxdp/frame/prop_tests/strategies.rs,
     userspace-dp/src/afxdp/frame/README.md
+
+  1. Deterministic-CGNAT silent downgrade (`nat64.rs`): `build_deterministic_v6`
+     falling back to round-robin on ANY build failure (including a `host_count`
+     `u32` overflow) for a rule that DID request deterministic mapping was
+     unobservable. Added `DETERMINISTIC_V6_DOWNGRADE_COUNT` + a paired
+     `eprintln!`, both gated on `!snap.deterministic_host_base_v6.is_empty()`
+     so the ordinary non-deterministic case stays silent. New test
+     `napt64_deterministic_v6_host_count_overflow_warns_operator` (70,000-entry
+     pool forces the u32 overflow); extended the existing
+     `napt64_deterministic_v6_unsupported_prefix_len_falls_back` with the same
+     assertion.
+  5. WireGuard handshake-session `lock().unwrap()` (`afxdp/wg/
+     handshake_session.rs`): 7 sites across `reconcile_lock`/`cookie_gen`
+     panicked the control thread on an unrelated prior panic's poison instead
+     of recovering per the established #1790/#1807/#2402 crate policy. Added
+     a generic `lock_recover<T>` + `WG_HANDSHAKE_LOCK_POISON_RECOVERIES` and
+     converted all 7 sites. New test
+     `reserve_pending_recovers_from_a_poisoned_reconcile_lock` poisons the real
+     lock from a spawned thread and asserts recovery.
+  6. NPTv6 embedded-ICMP reverse lookup (`icmp_embed/nat_match_v6.rs`): keyed
+     `ifindex_to_zone_id` on the raw physical `meta.ingress_ifindex` instead of
+     resolving the logical VLAN unit first — the 4th instance of the
+     #3021/#3022/#3026 class (filed as #7198, since the symptom — PMTUD
+     black-holing on VLAN-trunked NPTv6 flows — is independently rediscoverable
+     and deserves to outlive the cohort). Fixed via
+     `resolve_ingress_logical_ifindex`, matching the 9 already-correct sibling
+     sites. New test
+     `icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_physical_parent`
+     builds a two-zone VLAN-trunk fixture with `NatDecision::default()`
+     (no recorded rewrite) specifically to avoid the masking discovered in the
+     pre-existing sibling test `icmpv6_te_nptv6_reverse_lookup_restores_
+     internal_client`, which — confirmed firsthand via instrumented tracing —
+     resolves via `lookup_forward_nat_across_scopes`'s `reverse_translated_index`
+     alias and passes regardless of whether the zone lookup is correct, so it
+     exercised none of this bug. The new fixture's `external_client` is derived
+     from `internal_client` via a live `translate_outbound` call (not
+     hand-picked) so the RFC 6296 checksum-neutral word adjustment round-trips
+     correctly regardless of the specific prefix pair chosen.
+
+  Items verified and left unchanged: #2 (NPTv6 zone-only scoping) confirmed
+  DISPOSITIONED — terminal fail-closed reject, PR #7192/#6043 plan-kill; #3
+  (static-NAT block `external_ips()` base-only) confirmed LIVE but sized
+  BOUNDED/LARGE (a real port of `destination.rs`'s bounded host-expansion +
+  exempt-host shadowing machinery), filed as a successor issue rather than
+  fixed inline; #4 (NAT64 pool CIDR ergonomics) confirmed WONTFIX-by-design
+  per the existing issue-thread ruling; #7 (event-stream budget double-
+  release) traced every acquire/release call site and found the accounting
+  provably balanced (one `try_acquire`, two disjoint release paths), backed
+  by an existing production underflow tripwire
+  (`DATAPLANE_EVENT_BUDGET_UNDERFLOWS`) and PR #4608's independent prior
+  investigation of the same defect class — not live, no change; #8
+  (host-inbound cold-boot zone-0 admit) confirmed REFUTED — `classify_metadata`
+  (`forwarding/fib.rs`) dispositions every packet `NoSnapshot` while
+  `!validation.snapshot_installed`, and the host-inbound admit path is
+  reachable only from inside the `PacketDisposition::Valid` branch, so the
+  early-boot window the issue worried about is unreachable; tracked
+  independently as #6873 (deliberately outside this cohort).
+
+  Docs updated per the module-documentation convention: `docs/deterministic-
+  nat-cgnat.md` (names the new counter/eprintln for item 1's downgrade path),
+  `userspace-dp/src/afxdp/README.md` (a new "WireGuard handshake-session
+  poison policy (#6227 item 5)" section mirroring the existing worker-queue /
+  shared-session poison-policy sections, and a new 10th enumerated site under
+  the existing "Same SSOT for zone / screen / generated-ICMP keying" list for
+  item 6).
+
+  Validation: `cargo check` and `cargo check --tests` clean (exit 0).
+  `cargo test -- --test-threads=1` full-crate run (parallel deadlocks this
+  crate). Mutation-proved each of the three fixes on a confirmed-COMPILING
+  tree (an earlier round's item-6 mutation attempt was invalidated by a test-
+  fixture bug of my own making — a hand-picked external/internal address pair
+  that did not actually round-trip through NPTv6's checksum-neutral
+  adjustment — caught and fixed by deriving the external address from
+  `translate_outbound` instead of hand-picking both values; all three mutation
+  reds below were re-captured afterward against a clean `cargo check --tests`
+  exit-0 tree):
+    - Item 1: `if false && deterministic_v6.is_none() && ...` (one line) ->
+      both `napt64_deterministic_v6_host_count_overflow_warns_operator` and
+      `napt64_deterministic_v6_unsupported_prefix_len_falls_back` FAILED
+      (assert_eq panics at nat64_tests.rs:241 and :201); 1 unrelated test in
+      the same filter still passed. Restored -> exit 0.
+    - Item 5: reverted exactly ONE of the seven `lock_recover` call sites
+      (`try_reserve_pending_for_test`, handshake_session.rs:266) back to
+      `.lock().unwrap()` -> `reserve_pending_recovers_from_a_poisoned_
+      reconcile_lock` FAILED (panicked at handshake_session.rs:266:49); the
+      other 193 `afxdp::wg::` tests (exercising the other six sites) stayed
+      GREEN, localizing the mutation to the one reverted call site. Restored
+      -> exit 0.
+    - Item 6: reverted the `.get(&logical_ingress_ifindex)` line back to
+      `.get(&(meta.ingress_ifindex as i32))` -> the new
+      `icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_
+      physical_parent` FAILED (`.expect(...)` panic at
+      tests_icmp_reject_reversal.rs:1540), while the pre-existing sibling
+      `icmpv6_te_nptv6_reverse_lookup_restores_internal_client` stayed GREEN —
+      the vacuous-coverage proof: the sibling cannot see this class of bug.
+      Restored -> exit 0.
+
+  Rust dataplane change: moves the userspace-dp helper binary and OWES a
+  cluster smoke test on the shared loss userspace cluster. NOT run here — the
+  cluster is lock-held by a concurrent batch smoke gate; this PR states the
+  obligation and stops.
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/wg/handshake_session.rs,
+  userspace-dp/src/afxdp/wg/tests.rs,
+  userspace-dp/src/afxdp/icmp_embed/nat_match_v6.rs,
+  userspace-dp/src/afxdp/tests_icmp_reject_reversal.rs,
+  docs/deterministic-nat-cgnat.md, userspace-dp/src/afxdp/README.md, _Log.md
