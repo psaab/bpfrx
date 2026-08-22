@@ -232,3 +232,44 @@ off with core count). Deferred until the loss-cluster new-flow-ceiling
 measurement shows the residual map mutex is the next bottleneck. Design
 (two-tier shard keys, F5 lock-ordering resolution) is in the converged v3
 plan on the `research/2852-portalloc` branch.
+
+## #6610 — the bench's flow-key overflow, and why these numbers stand
+
+`benches/snat_allocator.rs` computed its synthetic `dst_ip` uniqueness tag as
+`0xc000_0000 + ((owner as u32) << 24) + (n & 0x00ff_ffff)`, with `owner = 255`
+for the pre-population pass. `0xc0` already occupies the top byte, so that
+addition overflows `u32` for any owner >= 64 and **panicked on the very first
+prepop flow** under debug assertions — which is why `cargo test --all-targets`
+blew up while `make test-rust` (release, `--bins --tests`) never noticed.
+
+**The published numbers above are NOT affected, and nothing needs
+re-measuring.** The failure mode had to be established rather than assumed,
+because a silent release wrap producing a wrong accumulator would have
+invalidated every figure here. It does not:
+
+- `dst_ip` is a uniqueness tag consumed only by the `FxHashMap<FlowKey, _>`
+  hash. Address selection uses `src_ip`. No throughput, percentile or
+  fail-fraction figure reads its numeric value.
+- Every realized `n` is `< 2^24`, so the low-24 term can never carry into the
+  top byte. The wrap was therefore a pure mod-256 fold of that byte: prepop
+  landed on `0xbf`, worker threads on `0xc0..0xc7`. All nine realized tags stay
+  **distinct**, so the globally-unique-5-tuple invariant — the only thing this
+  arithmetic has to guarantee — survived intact.
+- Confirmed empirically: a post-fix release run reproduces this document's
+  fail-fraction fingerprint exactly (0.0/0.0 on uniform-low, skew-80-20 and
+  narrow-64port; 0.2/0.2 on high-occ, identical CUR/NEW). Had the wrap aliased
+  prepop flows onto churn flows, the duplicate keys would have leaked bitmap
+  bits and live-count slots and the fail fractions would have diverged.
+
+Two fixes that look right and are **not**, recorded so they are not tried
+again: `saturating_add` collapses `0xc0 + 0xff` to `u32::MAX` for *every*
+prepop `n`, destroying the low-24 discriminator and manufacturing the exact
+duplicate keys the invariant forbids; and a wider accumulator changes the tag
+values, so a run is no longer byte-comparable with the numbers above.
+
+The tag is now built as two disjoint bit fields OR'd together, with the
+producer byte named (`WORKER_TAG_BASE`, `PREPOP_TAG`) rather than computed, and
+the injectivity invariant expressed as `const _: () = assert!(...)` so it is
+checked at compile time. `make test-rust` gained a `cargo check --benches` leg:
+benches are still never *run* there, but compiling them is what evaluates those
+const asserts, so a reintroduction of this class now fails the gate.

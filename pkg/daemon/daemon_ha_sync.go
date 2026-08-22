@@ -12,6 +12,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 func (d *Daemon) stopSyncReadyTimer() {
@@ -747,6 +748,13 @@ func (d *Daemon) publishSessionSyncIfCurrent(gen uint64, ss *cluster.SessionSync
 			"publish_gen", gen, "current_gen", d.clusterCommsGen)
 		return false
 	}
+	// #6650: stamp this node's config-snapshot protocol version onto every
+	// session-sync instance as it is published, so the peer's commit path can
+	// refuse to push a config this node cannot represent. Done HERE rather than
+	// at the construction site because publishSessionSyncIfCurrent is the one
+	// generation-gated point every live instance passes through -- a stamp at
+	// construction would also stamp instances a superseded epoch drops.
+	ss.SetLocalSnapshotProtocolVersion(userspace.ProtocolVersion)
 	d.sessionSync = ss
 	return true
 }

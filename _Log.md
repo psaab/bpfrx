@@ -64,6 +64,42 @@
   pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
   docs/junos-cli-reference.md, _Log.md
 
+## 2026-08-21 — #6650 cross-chassis snapshot-protocol gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added a peer capability exchange + a COMMIT preflight so a
+  current primary refuses to push a multi-zone scoped policy to a peer
+  that would narrow it. `syncMsgPeerCapabilities` (additive, no version
+  bump — the #2239 DHCP-lease precedent; the receive switch has no
+  default arm) advertises the sender's config-snapshot protocol version
+  once per installed session-sync connection, beside the clock sync.
+  Chose the sync channel over the heartbeat: same connection as the
+  config push (one lifecycle), and the heartbeat's optional sections are
+  back-indexed from a fixed-size auth trailer (#6169 epoch at len-68)
+  AND require a PSK. Gate refuses in the commit PREFLIGHT, not at push:
+  skipping the push would trade a narrowing for a config divergence.
+  Floor is a new per-feature immutable `MinProtocolMultiZoneScopedPolicy
+  = 4`, deliberately NOT `ProtocolVersion` — keying on the shared
+  constant imports open #6648's defect into new code. Arming predicate is
+  an exported WRAPPER of the local gate's, not a copy.
+  Corrected a FALSE CLAIM in docs/userspace-dataplane-architecture.md
+  ("a multi-zone scope can never reach a reader that would narrow it") —
+  true only for the local skew.
+  Mutation matrix 8/8 RED: U1 unadvertised-reads-capable, U2 wiring
+  deleted from the preflight, U3 key on the shared version, U4
+  capability survives disconnect, U5 never advertise, U6 refuse when the
+  peer is down, U7 floor renumbered, U8 drop the receive store.
+  Issue citations were stale: the gate is at
+  `pkg/dataplane/userspace/manager_compile.go:857` (not
+  `pkg/daemon/manager_compile.go:750`), and `ProtocolVersion` is 8, not 4.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_capabilities_6650.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync_conn_read.go, pkg/cluster/sync_conn_write.go,
+  pkg/daemon/peer_snapshot_protocol_gate_6650.go,
+  pkg/daemon/daemon_apply_commit.go, pkg/daemon/daemon_ha_sync.go,
+  docs/userspace-dataplane-architecture.md
+
 ## 2026-08-21 — #6533 applied/published/converged marker rule: audited, PLAN-KILLED
 
 - **Timestamp**: 2026-08-21
@@ -101742,6 +101778,20 @@ prose edit above them added. No diff falls in the new test body.
     pkg/cluster/sync_config_apply_nack_7328_test.go,
     pkg/daemon/configsync_rearm_7328_test.go
 
+## 2026-08-22 — #6606 dyndns2 raw server render
+- **Timestamp**: 2026-08-22
+- **Action**: `resolveDyndns2Endpoint` interpolated the raw `server` at FOUR
+  sites (the issue named two; its review comment warned that fixing only the
+  cited ones leaves the other half open). Applied the #6594 parse-first split:
+  on a parse failure render NO part of the input plus `urlParseCause`; on the
+  branches where the URL parsed, `config.RedactURL` is provably sound. Verified
+  empirically that dropping only the `%w` still leaks — `invalid port %q after
+  host` and `invalid host: ParseAddr(...)` are unbounded inner causes — so the
+  mutation that keeps a redacted render on the parse branch reds. Removed the
+  self-expiring `issue6606Exemption` from the source gate, which fired on cue.
+- **File(s)**: pkg/ddns/backend_dyndns2.go,
+  pkg/ddns/dyndns2_server_leak_6606_test.go (new),
+  pkg/ddns/url_render_class_6545_test.go, pkg/ddns/README.md, _Log.md
 ## 2026-08-21 — #6568: Rust-dataplane cohort, provable subset
 - **Timestamp**: 2026-08-21
 - **Action**: Swept all 8 rows individually. Member 1 was filed as a
@@ -101773,3 +101823,18 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/compiler_security_alg.go, pkg/config/compiler_routing.go,
     pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
     docs/config-schema.md
+
+## 2026-08-22 — #6610 snat_allocator bench flow-key overflow
+- **Timestamp**: 2026-08-22
+- **Action**: Determined READING 1 (benign) with evidence, not assumption: the
+  overflowing add is in the bench's synthetic dst_ip uniqueness TAG, not an
+  accumulator and not port accounting; the release wrap was a pure mod-256 fold
+  of the top byte leaving all nine producer tags distinct, and a post-fix
+  release run reproduces the published fail-fraction fingerprint exactly. Fixed
+  by building the tag as two disjoint bit fields OR'd together with named
+  producer bytes; `saturating_add` would have been WRONG (collapses the low-24
+  discriminator). Added const-assert invariants and a `cargo check --benches`
+  leg to `make test-rust` — compiling a bench is what evaluates its const
+  asserts, so the compile-only gate is meaningful for this class.
+- **File(s)**: userspace-dp/benches/snat_allocator.rs, Makefile,
+  docs/research/2852-portalloc/microbench-results.md, _Log.md
