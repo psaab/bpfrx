@@ -272,6 +272,13 @@ type KernelSystem interface {
 	// before recording the verified ARMED journal — a firmware that silently
 	// dropped or partial-wrote the variable must not yield a false-ARMED journal.
 	GetBootNext() (string, error)
+	// ClearBootNext removes the one-shot BootNext variable (#6758). The
+	// two-phase arm calls it on EVERY failure that happens after SetBootNext
+	// has already succeeded, so NVRAM never stays armed while the durable
+	// journal records ARMING — a state the journal explicitly defines as "the
+	// firmware still boots the known-good default (no confirmed one-shot)".
+	// Clearing an already-absent BootNext is not an error.
+	ClearBootNext() error
 	// ArmWatchdog arms the persistent watchdog before the reboot (best
 	// effort; the firmware BootNext clear is the loop-safety, the watchdog
 	// only converts a hang into the reset that triggers the fallback).

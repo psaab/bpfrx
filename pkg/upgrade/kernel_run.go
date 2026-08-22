@@ -391,12 +391,14 @@ func (r *KernelRunner) armCandidate(j *KernelJournal) error {
 	// ARMING and surface the error so no false-ARMED journal is persisted.
 	got, err = sys.GetBootNext()
 	if err != nil {
-		return fmt.Errorf("kernel-upgrade arm: read back BootNext (staying ARMING): %w", err)
+		return disarmAfterArmFailure(sys, fmt.Errorf(
+			"kernel-upgrade arm: read back BootNext (staying ARMING): %w", err))
 	}
 	if got != inactiveID {
-		return fmt.Errorf("kernel-upgrade arm: BootNext readback = %q, expected inactive slot %s "+
-			"(%s); firmware did not accept the one-shot — refusing to record ARMED (staying ARMING)",
-			got, j.InactiveSlot, inactiveID)
+		return disarmAfterArmFailure(sys, fmt.Errorf(
+			"kernel-upgrade arm: BootNext readback = %q, expected inactive slot %s "+
+				"(%s); firmware did not accept the one-shot — refusing to record ARMED (staying ARMING)",
+			got, j.InactiveSlot, inactiveID))
 	}
 
 	// Verified: the firmware WILL boot the candidate next. Record the confirmed
@@ -407,13 +409,56 @@ func (r *KernelRunner) armCandidate(j *KernelJournal) error {
 	// state; failing here refuses the arm rather than producing an armed
 	// candidate nothing is designated to verify (#6601 r6).
 	if err := r.recordPromoteBinary(j); err != nil {
-		return fmt.Errorf("kernel-upgrade arm: %w", err)
+		return disarmAfterArmFailure(sys, fmt.Errorf("kernel-upgrade arm: %w", err))
 	}
 	if err := r.ktransition(j, KernelStateArmed); err != nil {
-		return err
+		return disarmAfterArmFailure(sys, err)
 	}
 
 	return nil
+}
+
+// disarmAfterArmFailure clears the one-shot BootNext for a failure that happens
+// AFTER SetBootNext has already succeeded, and returns the original cause
+// (#6758).
+//
+// THE DIVERGENCE IT CLOSES. The two-phase arm records ARMING before touching
+// NVRAM and only advances to ARMED after a positive BootNext readback. Every
+// failure between those two points returned an error and left the journal at
+// ARMING — but SetBootNext had ALREADY SUCCEEDED, so the firmware would still
+// one-shot the candidate on the next reboot. ARMING is documented as exactly
+// the opposite: "the firmware still boots the known-good default (no confirmed
+// one-shot)", which is what lets `Arm` re-arm from ARMING and what stops
+// self-recovery suppressing expired-lease failback. So BootNext stayed armed
+// while every durable software gate classified the node as unarmed, and a
+// drained node could rejoin with an untested candidate kernel queued for its
+// next boot.
+//
+// The `recordPromoteBinary` path is the sharpest: the readback had already
+// CONFIRMED the one-shot, so the candidate was genuinely queued while no xpfd
+// was designated to verify it — an armed candidate with nothing to run the
+// promotion gate, which #6601 added that record specifically to prevent.
+//
+// SINGLE-SOURCED on purpose: four failure paths need the identical undo, and
+// four copies of it is how one gets missed. Clearing an absent BootNext is not
+// an error, so this is safe on the readback-mismatch path where the firmware
+// may have dropped the variable already.
+//
+// If the clear itself FAILS the divergence is real and cannot be undone here,
+// so the error says so explicitly and names the operator command. It is
+// deliberately not escalated to a journal state: ARMED asserts a verified
+// one-shot WITH a recorded promote binary, which is precisely what may be
+// missing on the recordPromoteBinary path, so claiming it would substitute a
+// different false record for this one.
+func disarmAfterArmFailure(sys KernelSystem, cause error) error {
+	if cerr := sys.ClearBootNext(); cerr != nil {
+		return fmt.Errorf("%w; AND the one-shot BootNext could not be cleared (%v) — "+
+			"the firmware may still boot the candidate on the next reboot while the "+
+			"journal records ARMING (no trial), so self-recovery will not treat this "+
+			"node as being in a trial. Clear it manually before rebooting: "+
+			"efibootmgr --delete-bootnext", cause, cerr)
+	}
+	return cause
 }
 
 // newArmNonce builds a per-attempt arm token (#5847). It combines the system

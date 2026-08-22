@@ -104157,3 +104157,25 @@ prose edit above them added. No diff falls in the new test body.
   make_config_drive.py and xpf-deploy.py; kept the post-chmod as a belt.
 - **File(s)**: scripts/image/make_config_drive.py, scripts/deploy/xpf-deploy.py,
   scripts/image/test_config_drive_creation_umask_6764.py
+
+## 2026-08-22 — #6758 clear BootNext when the two-phase arm fails after SetBootNext
+- **Timestamp**: 2026-08-22
+- **Action**: The arm records ARMING, sets BootNext, reads it back, then advances
+  to ARMED. Every failure after SetBootNext SUCCEEDED returned an error and left
+  the journal at ARMING — while the firmware would still one-shot the candidate.
+  ARMING documents the opposite ("the firmware still boots the known-good
+  default"), which is what lets Arm re-arm and what stops self-recovery
+  suppressing failback, so a drained node could rejoin with an untested kernel
+  queued. Added KernelSystem.ClearBootNext (efibootmgr --delete-bootnext) and a
+  single-sourced disarmAfterArmFailure on all four post-SetBootNext failure
+  paths. A failed clear is reported loudly with the operator command rather than
+  escalated to a journal state (ARMED would assert a recorded promote binary
+  that may be exactly what is missing).
+- **Sharpest path**: recordPromoteBinary failing AFTER a confirmed readback left
+  a genuinely queued candidate with no xpfd designated to verify it — the thing
+  #6601 added that record to prevent.
+- **File(s)**: pkg/upgrade/kernel.go, pkg/upgrade/kernel_linux.go,
+  pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_test.go,
+  pkg/upgrade/kernel_bootnext_disarm_6758_test.go (new),
+  docs/in-place-upgrade.md
+
