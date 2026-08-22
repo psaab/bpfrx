@@ -34,6 +34,11 @@ type fakeCluster struct {
 	// persistent enumeration/transport failure surfaced at the deadline.
 	rejoinIncomplete bool
 	rejoinErr        error
+	// #6557: how many times LocalRejoinComplete was consulted. TestRolling_
+	// HappyPath asserted only that ResetFailover was CALLED, which a step 7
+	// that never confirms satisfies just as well; this counter is what
+	// distinguishes "requested the rejoin" from "confirmed it".
+	rejoinChecks int
 	// #4717 test seams: when set, the predicate returns this error on EVERY
 	// poll (persistent transport failure), so a deadline miss must surface it.
 	peerAliveErr error
@@ -65,6 +70,7 @@ func (f *fakeCluster) DrainComplete() (bool, error) {
 func (f *fakeCluster) ResetFailover() error        { f.resetCalled = true; return f.resetErr }
 func (f *fakeCluster) LocalPrimary() (bool, error) { return f.localPri, nil }
 func (f *fakeCluster) LocalRejoinComplete() (bool, error) {
+	f.rejoinChecks++
 	if f.rejoinErr != nil {
 		return false, f.rejoinErr
 	}

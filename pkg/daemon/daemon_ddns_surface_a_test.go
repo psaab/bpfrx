@@ -952,3 +952,85 @@ func TestBuildSurfaceAScopesDeterministicOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestObserveInterfaceAddrDHCPRestartTransient_6555 is the #6555 fail-on-revert
+// gate: the DEFAULT Surface A address source (`interface`) must not report a
+// DHCP client-restart address-gone window as a DEFINITIVE loss, because the
+// engine answers a definitive loss with a wire withdraw of the public A/AAAA
+// record (surface_a.go: !obs.Addr.IsValid() -> withdrawScopeLocked ->
+// backend.DeleteLease). A routine DHCP option change restarts the client, whose
+// finishClient removes the leased address, and the removal itself nudges a
+// Surface A pass ~2s later — squarely inside the DORA re-acquire window.
+//
+// The `dhcp` source already carried this guard (#4423 M10); the default one did
+// not. Both now read the same committed-config predicate
+// (unitRunsDHCPForFamily), so they cannot drift.
+//
+// Deleting the `len(addrs) == 0 && unitRunsDHCPForFamily(...)` guard from
+// observeInterfaceAddr makes cases (a) and (c) go red.
+func TestObserveInterfaceAddrDHCPRestartTransient_6555(t *testing.T) {
+	origLink := netlinkLinkByName
+	origAddr := netlinkAddrList
+	t.Cleanup(func() {
+		netlinkLinkByName = origLink
+		netlinkAddrList = origAddr
+	})
+	fakeLink := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "ge-0-0-2"}}
+	netlinkLinkByName = func(string) (netlink.Link, error) { return fakeLink, nil }
+	d := &Daemon{}
+
+	noAddrs := func(netlink.Link, int) ([]netlink.Addr, error) { return nil, nil }
+
+	// (a) v4: unit still `family inet dhcp`, kernel reports no IPv4 at all —
+	// the client-restart flush window. TRANSIENT: retain, never withdraw.
+	netlinkAddrList = noAddrs
+	if got, ok := d.observeInterfaceAddr("ge-0-0-2", true, &config.InterfaceUnit{DHCP: true}); ok || got.IsValid() {
+		t.Fatalf("(a) DHCPv4 unit with no address: got (%v, %v); want (zero, false) transient — a definitive verdict here withdraws the public A record on every DHCP option change", got, ok)
+	}
+
+	// (b) v4: the unit was reconfigured AWAY from DHCP, so the absence is real.
+	// This must stay DEFINITIVE — the guard must not swallow a genuine loss.
+	netlinkAddrList = noAddrs
+	if got, ok := d.observeInterfaceAddr("ge-0-0-2", true, &config.InterfaceUnit{}); !ok || got.IsValid() {
+		t.Fatalf("(b) non-DHCP unit with no address: got (%v, %v); want (zero, true) definitively-none", got, ok)
+	}
+
+	// (c) v6 uses the DHCPv6 flag, not the v4 one. A guard keyed on the wrong
+	// field would pass (a) and (b) and still leave the v6 default source
+	// withdrawing AAAA on every DHCPv6 restart.
+	netlinkAddrList = noAddrs
+	if got, ok := d.observeInterfaceAddr("ge-0-0-2", false, &config.InterfaceUnit{DHCPv6: true}); ok || got.IsValid() {
+		t.Fatalf("(c) DHCPv6 unit with no v6 address: got (%v, %v); want (zero, false) transient", got, ok)
+	}
+
+	// (d) CROSS-FAMILY: a v4-only DHCP unit asked about v6 must stay definitive.
+	// A guard that ignored the family argument would wrongly go transient here
+	// and never withdraw a stale AAAA.
+	netlinkAddrList = noAddrs
+	if got, ok := d.observeInterfaceAddr("ge-0-0-2", false, &config.InterfaceUnit{DHCP: true}); !ok || got.IsValid() {
+		t.Fatalf("(d) v4-DHCP unit asked about v6: got (%v, %v); want (zero, true) definitively-none", got, ok)
+	}
+
+	// (e) A configured static still WINS over the transient guard: it is a real
+	// address, and the pre-existing present-but-addressless static fallback must
+	// not be shadowed by the new branch (guard placement — it sits AFTER
+	// staticUnitAddr).
+	netlinkAddrList = noAddrs
+	unit := &config.InterfaceUnit{DHCP: true, Addresses: []string{"198.51.99.7/24"}}
+	want := netip.MustParseAddr("198.51.99.7")
+	if got, ok := d.observeInterfaceAddr("ge-0-0-2", true, unit); !ok || got != want {
+		t.Fatalf("(e) DHCP unit with a configured static: got (%v, %v); want (%v, true) static fallback", got, ok, want)
+	}
+
+	// (f) SCOPE BOUNDARY: the family HAS an address, it was merely rejected by
+	// selectInterfaceAddr (here IFA_F_TENTATIVE). That is NOT the restart window
+	// and stays DEFINITIVE — the same posture the `dhcp` source takes for a
+	// non-public lease. Widening the guard to "selectInterfaceAddr found nothing"
+	// would flip this and is a separate behaviour choice.
+	netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+		return []netlink.Addr{mkAddr("2001:db8::1/64", unix.IFA_F_TENTATIVE)}, nil
+	}
+	if got, ok := d.observeInterfaceAddr("ge-0-0-2", false, &config.InterfaceUnit{DHCPv6: true}); !ok || got.IsValid() {
+		t.Fatalf("(f) tentative-only v6 on a DHCPv6 unit: got (%v, %v); want (zero, true) definitive — the guard must key on an EMPTY family list, not on selection failure", got, ok)
+	}
+}

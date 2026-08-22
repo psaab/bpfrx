@@ -203,7 +203,7 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))) // #6553
 		addr := strings.Join(pool.Addresses, ",")
 		pools = append(pools, poolInfo{name: name, address: addr, total: totalPorts})
 	}
@@ -346,7 +346,7 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))) // #6553
 
 		fmt.Printf("Pool name: %s\n", name)
 		for _, addr := range pool.Addresses {

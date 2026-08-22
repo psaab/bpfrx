@@ -225,13 +225,37 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 	}
 	logf("rolling: upgraded node re-synced")
 
-	// 7. Rejoin election (failback). The forward-verify is the natural
-	//    post-promotion check the external driver runs (controlled
-	//    promotion, never while passive).
-	if err := cl.ResetFailover(); err != nil {
-		return fmt.Errorf("rolling: reset failover (rejoin election): %w", err)
+	// 7. Rejoin election (failback) and CONFIRM it before reporting the cut
+	//    complete (#6557). ResetFailover only REQUESTS the reset, per RG; a
+	//    call that returned nil is not proof any RG left the ForceSecondary
+	//    drain, and a client that could not enumerate an RG never issued its
+	//    reset at all. Step 6's SyncEstablished does not close that gap:
+	//    PeerAlive and SyncEstablished are GLOBAL predicates that hold while
+	//    an individual RG is still held at weight 0.
+	//
+	//    Left unconfirmed, a reset that is ACKed but not effected (e.g. a
+	//    post-upgrade interface monitor pinning an RG at weight 0) leaves this
+	//    node silently ineligible; the external driver advances to the peer,
+	//    whose ForceSecondary then leaves that RG with NO PRIMARY ON EITHER
+	//    NODE until the peer's DrainDeadline expires.
+	//
+	//    RejoinAndConfirm is the #5138 readback, and it was already declared on
+	//    the RollingCluster interface right here in this file — it was simply
+	//    never wired into this, its other caller. Reusing it (rather than
+	//    open-coding a poll) also keeps the binary rolling cut and the LANE-1
+	//    kernel roll on ONE definition of "rejoined", which is the property the
+	//    external driver's never-both-down gate depends on.
+	//
+	//    The forward-verify is the natural post-promotion check the external
+	//    driver runs (controlled promotion, never while passive).
+	if err := RejoinAndConfirm(cl, rc.RejoinDeadline); err != nil {
+		return fmt.Errorf("rolling: local node did not rejoin election after the cut "+
+			"within %s — leaving it secondary; the driver MUST NOT advance to the peer "+
+			"(draining it would leave a redundancy group with no primary on either "+
+			"node): %w", rc.RejoinDeadline, err)
 	}
-	logf("rolling: local node rejoined election; cut complete for this node")
+	logf("rolling: local node rejoined election, confirmed for every configured RG; " +
+		"cut complete for this node")
 	return nil
 }
 
