@@ -4,6 +4,71 @@ xpf has **two** command-tree sources of truth. Knowing which one to edit
 is the single most common mistake when adding CLI completion or config
 validation.
 
+
+## Compact (packed) stanza bodies
+
+A stanza body can be written NESTED or PACKED onto one line, and the two are the
+same configuration:
+
+```
+security { screen { ids-option s1 { icmp { ping-death; } } } }   nested
+security { screen { ids-option s1 icmp ping-death; } }           packed
+```
+
+The parser does not normalise them. A packed body arrives as extra tokens on the
+node's OWN `Keys`, with no `Children` at all:
+
+```
+nested   [ids-option s1] -> [icmp] -> [ping-death]
+packed   [ids-option s1 icmp ping-death]
+```
+
+A compiler that descends only `node.Children` therefore sees an EMPTY body. The
+instance NAME survives, which is what makes this class hard to notice: the
+profile/host/term exists, `show configuration` displays what the operator wrote,
+it binds to a zone or an interface normally — and it enforces nothing. Known
+instances all failed in the security-relevant direction: a syslog host with zero
+facilities ships nothing (#6684), a filter term with an empty action does not
+discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
+(#7457).
+
+**Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
+`node.Children` directly** when compiling a stanza that accepts a packed body.
+
+### Why it is schema-driven
+
+The packed tail does NOT expand uniformly, which is why a split on whitespace is
+wrong and why fixing one site by hand does not generalise:
+
+| packed | expands to | shape |
+|---|---|---|
+| `ids-option s1 icmp ping-death` | `[icmp]` -> `[ping-death]` | a chain |
+| `host 10.0.0.1 any any` | `[any any]` | ONE two-key leaf |
+| `term t1 then discard` | `[then]` -> `[discard]` | a chain |
+
+How many tokens each level swallows is a property of the grammar, and the
+grammar already has a single source of truth: `setSchema`, whose
+`schemaNode.args` is "extra tokens consumed as part of this node's key".
+The expander uses `consumeNodeKeys`, the same primitive `SchemaValidate` uses,
+so expansion cannot drift from validation.
+
+A tail that leaves the modelled grammar is returned UNEXPANDED rather than
+guessed — the helper exists to stop configuration being silently dropped, and
+inventing a shape the schema does not describe is another way of doing that.
+
+**A stanza whose leaves are not modelled in `setSchema` cannot be fixed this
+way.** `security screen ids-option <p> icmp` models only `fragment`, so the
+screen checks are absent from the schema and the packed screen body (#6683)
+cannot be expanded until they are added — which is also why those leaves get no
+`?` completion and no `SchemaValidate` typed-leaf checking.
+
+### Where it is NOT done
+
+Expansion is deliberately not done in the parser. `show configuration` renders
+from the AST, so normalising at parse time would rewrite the operator's packed
+one-liner into nested form on display — a round-trip fidelity change well beyond
+fixing the compile-time drops.
+
 ## Operational tree → `pkg/cmdtree`
 
 `run` / `show` / `clear` / `request` / `monitor` / `ping` / `traceroute`
@@ -46,6 +111,57 @@ sibling aspect files in the same package (`schema_security.go`,
 Because completion (3) and validation (4) read the SAME node, they cannot
 drift — typing a leaf fixes both `set ... ?` help and `commit check`
 rejection together.
+
+## Typed WILDCARD identity slots (`keyValidator` on a wildcard, #6834)
+
+A `keyValidator` on a **named-keyword** node validates the arg token(s) that
+follow the keyword — `unit <n>`, `address <cidr>`. The walker implements that as
+`node.Keys[1:1+args]`.
+
+A **wildcard** node is different: its identity IS the keyword, at `Keys[0]`, and
+it declares no args. So the arg span is `Keys[1:1]` — empty — and before #6834 a
+`keyValidator` on a wildcard validated **nothing at all** and returned nil. Every
+one of the schema's existing `keyValidator`s sat on a `<keyword> <arg>` slot, so
+the gap had no instance and no symptom until an interface name needed gating.
+
+`walkSchemaNode` now validates a wildcard's own keyword as identity slot 0.
+Which of the two cases applies is decided by a single hoisted `exactMatch`
+local, read by both the scalar-value-leaf rule and this one — two copies of
+"was this an exact match?" could only ever disagree by mistake.
+
+**Precondition, verified rather than assumed.** `exactMatch` is
+`parent.children[keyword] == childSchema`, a POINTER comparison. If any parent
+registered the same `*schemaNode` as both a named child and as its wildcard, the
+predicate would report EXACT for a wildcard match and this gate would silently
+stop running — no failure, just unvalidated config again.
+`TestNoSchemaNodeIsBothChildAndWildcard_6834` walks the whole schema (1464 nodes,
+0 aliases at the time of writing) to keep that true, and
+`TestAliasDetectorFindsARealAlias_6834` plants an alias so the detector itself
+cannot rot into a tripwire that never fires.
+
+### `interfaces <name>` is the first typed wildcard identity
+
+The interface name is interpolated into four sites in the generated systemd
+units, and one of them — `[Match] Name=` in the `.network` file — systemd reads
+as a **whitespace-separated list of shell-style globs, matching the device name
+or its alternative names**. An unvalidated name does not corrupt the unit file;
+it makes one `.network` claim SEVERAL interfaces.
+
+`ValidateInterfaceName` is an **allowlist**: letters, digits, `-`, `.`, `_`, `/`.
+The slash is included because the Junos spelling `ge-0/0/0` is the documented
+form and is canonicalised to `ge-0-0-0` downstream.
+
+**Do not "simplify" it into a call to `sanitizeUnitValue`.** That helper maps
+control bytes to a SPACE, which for a whitespace-separated list is the
+SEPARATOR — it would turn one pattern into two, each claiming devices. Applying
+the safe-looking neighbouring helper to this sink is strictly worse than
+rendering the field raw.
+
+**No length bound**, deliberately: `IFNAMSIZ` applies to the DERIVED kernel name
+(slashes folded, `.<unit>` appended), so a bound here would have to model that
+derivation, and a validator wrong in the *rejecting* direction turns a working
+config into a failed commit with no operator workaround (the #6564
+`ValidateOSPFArea` lesson, where a `>= 1` floor would have refused OSPF area 0).
 
 ## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
 
