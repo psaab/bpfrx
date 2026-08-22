@@ -319,6 +319,58 @@
   pkg/cli/show_services_ddns.go, pkg/cli/cli_residual_escape_6468_test.go,
   _Log.md
 
+## 2026-08-21 — #5189 A1-b8-F5 + A1-b10-F4: two ungated warmed-path costs
+
+- **Timestamp**: 2026-08-21 (fix/5189-cohort)
+- **Action**: Gated the worker report tick's diagnostics build behind
+  `debug-log`, and made the event-stream idle keepalive obey
+  `WRITE_BACKLOG_MAX_BYTES`. Swept all six items of the #5189 cohort
+  firsthand first; all six are LIVE, four are deferred to a successor
+  issue because they need design decisions.
+
+  **A1-b8-F5.** #1776 moved the ~1 s report tick's `eprintln!` into the
+  `#[cfg(feature = "debug-log")]` module `debug_report` but deliberately
+  left the `binding_summary` BUILD inline and ungated — its own module
+  header documented that partition. So a release build paid, per worker
+  per second: a heap `String` plus every `write!` that grows it, one
+  `statistics_v2()` (`XDP_STATISTICS` `getsockopt`) per binding, and one
+  `getsockopt(SO_ERROR)` per binding, for a value whose only consumer was
+  compiled out. The build is now `debug_report::build_binding_summary`,
+  called from a `#[cfg(feature = "debug-log")]` binding — so the module
+  gate makes it a COMPILE-TIME guarantee, not a runtime branch. The
+  report tick's always-on half is untouched: the `BindingLiveState`
+  publish loop still stores the ring-pressure counters, its own
+  `rx_fill_ring_empty_descs` sample, `outstanding_tx` and
+  `umem_inflight_frames` as fixed scalar atomics (#802/#878) — those are
+  what operators actually read.
+
+  **A1-b10-F4.** #2883 routed the idle keepalive through `write_buf` so a
+  `WouldBlock` is backpressure rather than a fatal reconnect. That made
+  the keepalive a PRODUCER into the backlog, and it was the only producer
+  that did not check `WRITE_BACKLOG_MAX_BYTES` — the cap lived solely in
+  `drain_channel_into_write_buf`. The two conditions compose: a
+  live-but-non-reading consumer stalls the drain AT the cap, which keeps
+  `drained_any == false` forever, which is exactly what arms the idle
+  keepalive; and the socket write returns `WouldBlock` forever, so
+  `advance` never reclaims. The backlog grew by one frame header per
+  keepalive interval, monotonically and without bound. The RATE is slow
+  (8 B / 10 s), so this was never a near-term OOM — but it is unbounded,
+  and it falsified the README's stated `cap + one max EventFrame` ceiling
+  and its bolded "a stuck consumer degrades telemetry, nothing else"
+  invariant. `append_idle_keepalive_if_due` now declines while
+  `pending_len() >= WRITE_BACKLOG_MAX_BYTES`, and deliberately does NOT
+  re-arm `last_write` when it declines, so the keepalive fires on the
+  first cycle after the backlog drains rather than waiting out another
+  interval.
+
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/debug_report.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`,
+  `userspace-dp/src/event_stream/connection.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `userspace-dp/src/event_stream/tests/backpressure.rs`,
+  `userspace-dp/src/server/tests.rs`
+
 ## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
 
 - **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
