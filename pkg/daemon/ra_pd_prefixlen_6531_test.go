@@ -12,7 +12,9 @@ package daemon
 // Both are documentation of the consumer seam and the blast radius, NOT
 // RED-on-revert guards: they are GREEN before and after the pkg/dhcp fix (the
 // first is an over-reach guard; the second pins current unguarded behavior,
-// exactly like pkg/ra's TestBuildRA_6531_ZeroPrefixWouldBeAdvertised). The
+// exactly like pkg/ra's TestBuildRA_6587_ConfiguredZeroPrefixStillAdvertised,
+// renamed from TestBuildRA_6531_ZeroPrefixWouldBeAdvertised when #6587 gave
+// pkg/ra a provenance-scoped floor). The
 // RED-on-revert coverage for the guard itself lives in
 // pkg/dhcp/dhcpv6_iapd_prefixlen_6531_test.go.
 
@@ -102,5 +104,68 @@ func TestBuildRAConfigs_6531_ZeroPrefixSurvivesTheIsValidGuard(t *testing.T) {
 	if !got.OnLink || !got.Autonomous {
 		t.Errorf("OnLink = %v, Autonomous = %v, want both true "+
 			"(this is what makes a /0 a LAN-wide hijack)", got.OnLink, got.Autonomous)
+	}
+}
+
+// TestBuildRAConfigs_6587_StampsDelegatedProvenance binds the WIRING for the
+// #6587 floor.
+//
+// pkg/ra's tests construct config.RAPrefix values directly, so they prove the
+// floor WORKS and say nothing about whether anything sets the flag it keys on.
+// Deleting `Delegated: true` from buildRAConfigs leaves every one of them green
+// while the floor silently stops firing — a delegated /0 reaches the LAN again
+// and the only thing that changed is one struct field nobody asserts.
+//
+// It also asserts the operator-authored side stays FALSE from the same run, so
+// the flag cannot be satisfied by stamping every prefix true.
+func TestBuildRAConfigs_6587_StampsDelegatedProvenance(t *testing.T) {
+	mgr := dhcp.NewManagerForTesting(nil)
+	mgr.SeedDelegatedPrefixesForRATesting("ge-0/0/3", "trust0", []dhcp.DelegatedPrefix{{
+		Interface:         "ge-0/0/3",
+		Prefix:            netip.MustParsePrefix("2001:db8:900d::/64"),
+		PreferredLifetime: 3600 * time.Second,
+		ValidLifetime:     7200 * time.Second,
+	}})
+
+	// An operator-authored prefix on a DIFFERENT interface, present in the
+	// same buildRAConfigs run.
+	cfg := &config.Config{}
+	cfg.Protocols.RouterAdvertisement = []*config.RAInterfaceConfig{{
+		Interface: "dmz0",
+		Prefixes:  []*config.RAPrefix{{Prefix: "2001:db8:dmz::/64", OnLink: true, Autonomous: true}},
+	}}
+
+	d := &Daemon{dhcp: mgr}
+	ras := d.buildRAConfigs(cfg)
+
+	var sawPD, sawConfigured bool
+	for _, ra := range ras {
+		for _, p := range ra.Prefixes {
+			switch ra.Interface {
+			case "trust0":
+				sawPD = true
+				if !p.Delegated {
+					t.Errorf("PD-derived prefix %s on %s has Delegated=false. The #6587 "+
+						"floor keys on this flag, so it never fires and a delegated /0 "+
+						"reaches the LAN — while every pkg/ra test stays green, because "+
+						"they set the flag themselves", p.Prefix, ra.Interface)
+				}
+			case "dmz0":
+				sawConfigured = true
+				if p.Delegated {
+					t.Errorf("operator-authored prefix %s on %s has Delegated=true. The "+
+						"floor would then refuse a legitimate `::/0` — the exact "+
+						"over-reach the provenance exists to prevent", p.Prefix, ra.Interface)
+				}
+			}
+		}
+	}
+	if !sawPD {
+		t.Fatal("no PD-derived prefix in the output — the fixture does not exercise the " +
+			"stamping path, so this test proves nothing")
+	}
+	if !sawConfigured {
+		t.Fatal("no operator-authored prefix in the output — the false-side control is " +
+			"vacuous")
 	}
 }

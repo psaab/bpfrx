@@ -1078,7 +1078,13 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 			a.Prefixes[i].OnLink != b.Prefixes[i].OnLink ||
 			a.Prefixes[i].Autonomous != b.Prefixes[i].Autonomous ||
 			a.Prefixes[i].ValidLifetime != b.Prefixes[i].ValidLifetime ||
-			a.Prefixes[i].PreferredLife != b.Prefixes[i].PreferredLife {
+			a.Prefixes[i].PreferredLife != b.Prefixes[i].PreferredLife ||
+			// #6587: Delegated gates whether the PIO is emitted at all
+			// (buildRA drops a delegated /0), so it is WIRE-AFFECTING and
+			// belongs in this change detector. The #4307 comment above
+			// records what omitting a wire-affecting field from this list
+			// cost last time: a stale advertisement.
+			a.Prefixes[i].Delegated != b.Prefixes[i].Delegated {
 			return false
 		}
 	}

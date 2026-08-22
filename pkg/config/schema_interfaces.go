@@ -246,8 +246,43 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 					"client-type":    {desc: "Client type", args: 1, placeholder: "<type>", children: nil},
 					"client-ia-type": {desc: "Client IA type", args: 1, placeholder: "<type>", children: nil},
 					"prefix-delegating": {desc: "Prefix delegation", children: map[string]*schemaNode{
-						"preferred-prefix-length": {desc: "Preferred prefix length", args: 1, placeholder: "<length>", children: nil},
-						"sub-prefix-length":       {desc: "Sub-prefix length", args: 1, placeholder: "<length>", children: nil},
+						// #6587: both leaves were untyped `<length>` placeholders
+						// parsed with an unbounded strconv.Atoi whose error is
+						// DISCARDED, so `abc` and `999` both silently became a
+						// value the operator never typed.
+						//
+						// sub-prefix-length was incidentally fail-closed —
+						// netip.PrefixFrom(addr, >128) yields an invalid Prefix
+						// that daemon_ra.go's IsValid() check rejects — but the
+						// operator got no commit error, just a silently absent
+						// delegation. preferred-prefix-length is NOT even that:
+						// net.CIDRMask(999, 128) returns nil, and the IA_PD hint
+						// then EGRESSES to the upstream server with wire
+						// prefix-length 0.
+						//
+						// 0..128 is the IPv6 prefix-length domain; 0 is retained
+						// as the documented "not set" sentinel both fields
+						// already use.
+						"preferred-prefix-length": {
+							desc:          "Preferred prefix length",
+							args:          1,
+							placeholder:   "<0..128>",
+							valueType:     ValueInteger,
+							valueDesc:     "Requested IA_PD prefix length (0..128; 0 = not set, send no length hint)",
+							valueExamples: []string{"48", "56", "60"},
+							validator:     ValidateInteger(0, 128),
+							children:      nil,
+						},
+						"sub-prefix-length": {
+							desc:          "Sub-prefix length",
+							args:          1,
+							placeholder:   "<0..128>",
+							valueType:     ValueInteger,
+							valueDesc:     "Length of the sub-prefix derived from the delegation for RA (0..128; 0 = advertise the delegated prefix as-is)",
+							valueExamples: []string{"64"},
+							validator:     ValidateInteger(0, 128),
+							children:      nil,
+						},
 					}},
 					"client-identifier": {desc: "Client identifier", children: map[string]*schemaNode{
 						"duid-type": {desc: "DUID type", args: 1, placeholder: "<type>", children: nil},
