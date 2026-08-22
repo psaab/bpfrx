@@ -99614,3 +99614,45 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
   `userspace-dp/src/server/helpers/status.rs`,
   `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
+
+- **Timestamp**: 2026-08-21 18:52 PDT
+- **Action**: #7017 — standalone daemon re-installs event-stream callbacks on
+  a replaced stream
+
+  On a STANDALONE (no-cluster) daemon the userspace event-stream callbacks were
+  installed once and never re-installed when the helper's `EventStream`
+  instance was REPLACED. The clustered path got the `es != wired` re-install in
+  #6743 r6-F4; `runUserspaceEventStream`'s standalone arm called
+  `wireUserspaceEventStreamCallbacks` — which RETURNS as soon as it installs —
+  and returned with it, never running `eventStreamFallbackLoop`. Stated in-tree
+  as a KNOWN GAP (#6743 r2-N5) and reproduces identically on origin/master, so
+  pre-existing rather than introduced.
+
+  Symptom: a commit-confirmed rollback tears the armed backend's stream down
+  while KEEPING the backend object, and the corrected re-arm constructs a new
+  one; that instance has no `SetOnEvent`/`SetOnFullResync`/dataplane-event
+  callback, so every helper event lands in the callback-not-ready queue and
+  RT_FLOW session records stop reaching `show log`, syslog and the flow
+  exporter for the rest of the process lifetime. Only a restart recovers.
+
+  Fix: `watchUserspaceEventStreamCallbacks` — same 500 ms cadence and
+  first-wire behaviour, but it never returns and applies the fallback loop's
+  instance-IDENTITY re-install every tick. The arm now blocks for the life of
+  ctx where it used to return, and its goroutine is on the run WaitGroup;
+  `runShutdownSequence` calls `stop()` before `wg.Wait()`, so it joins within
+  one tick — that ordering is load-bearing and has its own binder.
+  `wireUserspaceEventStreamCallbacks` is unchanged and still used by
+  `daemon_ha_sync.go`.
+
+  Validation: reproduced firsthand at origin/master `aa3780666` — with
+  callbacks on stream A and the backend then publishing stream B, no ACK ever
+  came back on B (FAIL at the wiring deadline, 85.20s); with the loop the ACK
+  lands on the next tick, 0.50s PASS. Mutation 3/3 RED (revert the arm to
+  wire-once; weaken `es != wired` to `wired == nil`; drop the `ctx.Done()`
+  select arm), `go vet` clean at each with a non-zero exit captured.
+  `go test -count=1 ./pkg/daemon/` exit 0; the two new tests exit 0 under
+  `-race`. Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no
+  cluster smoke is owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_standalone_stream_rewire_7017_test.go,
+  pkg/daemon/README.md, _Log.md
