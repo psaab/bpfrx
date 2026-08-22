@@ -113,8 +113,13 @@ type xpfCollector struct {
 	zoneBytesTotal               *prometheus.Desc
 	zoneCountersUnpopulatedZones *prometheus.Desc
 
-	// Policy counters
-	policyHitsTotal *prometheus.Desc
+	// Policy counters. policyCountersUnpublishedRules is the policy analogue of
+	// zoneCountersUnpopulatedZones: the explicit "no counter published for this
+	// rule" signal that lets the per-rule sample be OMITTED rather than
+	// published as an authoritative 0 -- and, critically, WITHOUT bumping
+	// counterReadErrors, because unpublished is not a failure (#7016).
+	policyHitsTotal                *prometheus.Desc
+	policyCountersUnpublishedRules *prometheus.Desc
 
 	// Filter counters
 	filterHitsTotal *prometheus.Desc
@@ -679,6 +684,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.zoneBytesTotal
 	ch <- c.zoneCountersUnpopulatedZones
 	ch <- c.policyHitsTotal
+	ch <- c.policyCountersUnpublishedRules
 	ch <- c.filterHitsTotal
 	ch <- c.threeColorPolicerPacketsTotal
 	ch <- c.threeColorPolicerBytesTotal

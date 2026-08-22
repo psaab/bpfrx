@@ -1314,6 +1314,23 @@ list still collapses to `MatchAny` via `from_prefixes`, but a mixed
 hand-built / mixed-version-decode legacy path; a normal Go v3 snapshot never
 uses the legacy field.
 
+**Duplicate tunnel-endpoint-id fail-closed (#5193).** `populate_tunnel_endpoints`
+preflights endpoint-id uniqueness across the whole snapshot BEFORE it inserts
+anything, and returns `SnapshotIntegrityError::TunnelEndpointDuplicateId` on a
+repeat of a nonzero id. The function maintains two independent indexes —
+`tunnel_endpoints` keyed by id and `tunnel_endpoint_by_ifindex` keyed by ifindex
+— so a duplicate id used to keep only the LAST row under that id while BOTH
+interfaces' ifindexes resolved to it: traffic on the losing interface
+encapsulated with the winner's outer source/destination/key. Running the check
+as a preflight (rather than mid-loop) is what keeps a rejected snapshot from
+leaving a half-populated forwarding state behind, matching the #3713 pattern
+below. The Go producer drops an id collision at build time (`usedIDs`, #1873),
+so a clean commit never trips this; it is the helper-boundary backstop for a
+corrupt / mixed-version peer-sync snapshot, alongside the #2410 TTL bound in the
+same function. Two rows naming ONE ifindex (distinct ids) is not an integrity
+failure — the first row keeps the ifindex index and the collision is logged,
+rather than the later row silently overwriting it.
+
 **Duplicate rule-identity fail-closed (#3713).** `parse_policy_state_with_counters`
 preflights rule-identity uniqueness BEFORE it allocates any per-rule hit counter
 or builds a `PolicyRule` entry — the FIRST validation in the function, so no

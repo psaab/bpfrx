@@ -246,8 +246,16 @@ pub(crate) fn parse_initiation<'a>(
 /// `expected_type` — i.e. the type byte matches AND the three reserved bytes
 /// are zero. WG transmits `message_type` as a u32; a compliant peer's
 /// initiation/response always has zero reserved bytes.
+///
+/// `pub(super)` since #5191 (A1-b9-F5): this is the SSOT for the WG type-word
+/// check across the whole `wg` module. The transport-data parser
+/// (`framing::parse_data_header`) and the CookieReply decrypt
+/// (`cookie::decrypt_cookie_reply`) previously compared only the low byte,
+/// which made xpf accept datagrams kernel WG / wireguard-go reject — a parser
+/// differential, and the kind of ambiguity an evasion probe looks for. Callers
+/// must length-check before calling: this indexes `msg[0..4]`.
 #[inline]
-fn is_canonical_type(msg: &[u8], expected_type: u8) -> bool {
+pub(super) fn is_canonical_type(msg: &[u8], expected_type: u8) -> bool {
     let word = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
     word == expected_type as u32
 }

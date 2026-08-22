@@ -254,11 +254,22 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 					// production config path today; this is defensive
 					// SSOT-alignment, like #3476/#3494.)
 					policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-					if ctrs, err := readPolicy(policyID); err == nil {
+					ctrs, err := readPolicy(policyID)
+					switch {
+					case err == nil:
 						pr.HitPackets = ctrs.Packets
 						pr.HitBytes = ctrs.Bytes
-					} else if readErr == nil {
-						readErr = err
+					case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+						// #7016: the helper has published no counter for THIS
+						// rule id yet. Per-rule "no counter source", NOT a read
+						// failure — flag it like the unloaded case below rather
+						// than 500'ing the whole inventory, exactly as the zone
+						// handler above treats ErrCounterNotPopulated (#6843).
+						pr.HitCountersUnavailable = true
+					default:
+						if readErr == nil {
+							readErr = err
+						}
 					}
 				} else {
 					// #5580: the rule is counter-eligible but no runtime counter
@@ -342,11 +353,19 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			if statsEnabled || rule.Count {
 				if readPolicy != nil {
 					policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-					if ctrs, err := readPolicy(policyID); err == nil {
+					ctrs, err := readPolicy(policyID)
+					switch {
+					case err == nil:
 						pr.HitPackets = ctrs.Packets
 						pr.HitBytes = ctrs.Bytes
-					} else if readErr == nil {
-						readErr = err
+					case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+						// #7016: unpublished global-rule counter — flag, do not
+						// fail the inventory (see the zone-pair loop).
+						pr.HitCountersUnavailable = true
+					default:
+						if readErr == nil {
+							readErr = err
+						}
 					}
 				} else {
 					// #5580: counter-eligible global rule, dataplane unloaded —
@@ -397,11 +416,21 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		// (ReadAllPolicyCounters puts it), so the value is identical.
 		if statsEnabled {
 			if readPolicy != nil {
-				if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
+				ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID)
+				switch {
+				case err == nil:
 					defRule.HitPackets = ctrs.Packets
 					defRule.HitBytes = ctrs.Bytes
-				} else if readErr == nil {
-					readErr = err
+				case errors.Is(err, dpuserspace.ErrPolicyCounterUnpublished):
+					// #7016: the implicit default-policy sentinel is published
+					// unconditionally by an applied helper, so this is the
+					// warm-up / config-skew window — flag it rather than
+					// discarding the whole inventory.
+					defRule.HitCountersUnavailable = true
+				default:
+					if readErr == nil {
+						readErr = err
+					}
 				}
 			} else {
 				// #5580: the implicit default-policy row is counter-eligible

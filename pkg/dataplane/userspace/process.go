@@ -302,6 +302,31 @@ func findBinary(explicit string) (string, error) {
 }
 
 func (m *Manager) stopLocked() {
+	// #5838 follow-up: retire this process generation FIRST — before the
+	// `m.proc == nil` early return below, which is exactly the branch an
+	// intentional stop takes when the helper has already crashed (the crash
+	// path nils `m.proc` itself, so a stop after a crash reached NONE of the
+	// teardown under that return).
+	//
+	// `restartHelperAfterCrash` fences its attempt on `m.procGen != gen`, and
+	// before this bump a stop satisfied none of its three fences: it cleared
+	// `m.proc` and `m.procSup` but left `m.procGen` and `m.helperCrash`
+	// untouched. A crash whose backoff was still pending when the daemon shut
+	// down therefore spawned a helper for a Manager that had been torn down —
+	// after `Close()` that child outlives xpfd holding the NIC queues, the
+	// EBUSY-on-zero-copy-queues collision the next start then hits — and the
+	// restart chain kept re-arming afterwards.
+	//
+	// Only the GENERATION is retired here. `m.helperCrash` is deliberately NOT
+	// cleared: `ensureProcessLocked` calls this same function when a spawn
+	// fails its readiness wait, and the crash record is the retry debt that
+	// path depends on (attempt count and backoff). Clearing it here would make
+	// a failed restart forget it was retrying — see
+	// TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838, which pins that
+	// debt. The bump is compatible with that path by construction: it already
+	// re-fences its next attempt on whatever `m.procGen` reads after the failed
+	// spawn.
+	m.procGen++
 	if m.eventStreamCancel != nil {
 		m.eventStreamCancel()
 		m.eventStreamCancel = nil
