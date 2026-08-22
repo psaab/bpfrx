@@ -98203,6 +98203,105 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_fibgen.go,
   pkg/dataplane/compiler_fibgen_7149_test.go, pkg/dataplane/dataplane.go,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Closed the #5698 Go-side interleaving window (bounded half; the
+  full Rust pair-transaction goes to a successor). `mirrorSessionPairV4` /
+  `mirrorSessionPairV6` built the forward+reverse pair under ONE `m.mu` hold
+  (#5007) and then transmitted through `syncSessionRequestsLocked`, which drops
+  `m.mu` once but LOOPS calling `requestSessionSync` — and that took and
+  released `m.sessionMu` per request. So `m.sessionMu` was free between the
+  forward's reply and the reverse's dial: a concurrent operator clear / policy
+  invalidation / GC delete / stale-session reconcile could land INSIDE the pair,
+  and a generation-0 forward delete there removes both halves in the helper,
+  after which the pair's already-built explicit reverse re-creates a standalone
+  reverse-only permit. `syncSessionRequestsLocked`'s doc asserted the opposite
+  ("Sending both requests under a single unlock also keeps the pair's transmit
+  contiguous") — a single `m.mu` unlock says nothing about `m.sessionMu`
+  ordering; that sentence is deleted and replaced with what the unlock actually
+  buys.
+
+  Implementation: `requestSessionSync` splits into the per-request locking
+  wrapper plus `requestSessionSyncLocked` (unlocked inner, caller holds
+  `sessionMu`) with dial timeout, round-trip deadline and
+  `errSessionHelperUnreachable` wrapping unchanged. New `syncSessionPairLocked`
+  drops `m.mu` as before, takes `m.sessionMu` ONCE, drives the group through the
+  inner, releases, reacquires `m.mu`. The #5380 transport fast-fail is preserved
+  by factoring the loop into one shared `sendSessionSyncBatch` used by both
+  transmit paths. Only the two pair mirrors are repointed: the bulk delete
+  chunks (up to `sessionHelperDeleteChunk` = 256) and the authoritative
+  clear-all keep per-request locking, and a `sessionPairMaxRequests` = 2 cap
+  makes that structural — an over-cap group logs and falls back rather than
+  holding `sessionMu` across a chunk large enough to starve live installs.
+
+  Validation: `go build ./...` exit 0, `go vet ./pkg/dataplane/...` exit 0,
+  `go test -count=1 ./pkg/dataplane/userspace/...` exit 0,
+  `go test -count=1 -race -run Session ./pkg/dataplane/userspace/...` exit 0.
+  New test drives the real mirrors against a fake session socket with three
+  competing `requestSessionSync` goroutines and a 2ms per-reply hold; the hold
+  and the >1 competitor count are load-bearing (Go's mutex clears its starving
+  bit on a hand-off to the LAST waiter, so a single competitor lets the unfixed
+  loop barge and the test false-greens — the first draft did exactly that).
+  Mutation matrix, one mutation per cell, exit code read from `$?`: repoint
+  `mirrorSessionPairV4` back to `syncSessionRequestsLocked` → exit 1, V4 cell
+  only; same for `mirrorSessionPairV6` → exit 1, V6 cell only; make the over-cap
+  branch return an error instead of falling back → exit 1 on the received count.
+  Base RED reproduced 5/5, fixed GREEN 5/5. Go-only diff, no shim `.o` and no
+  protocol movement, so no cluster smoke is owed on artifact grounds; an HA
+  session-sync smoke is still the prudent lane since the changed code is on the
+  local session install path.
+- **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/session_pair_transmit_5698_test.go,
+  docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-21 16:30 UTC
+- **Action**: #5485 — stop detaching XDP/TC before the snapshot is accepted.
+  `userspace.Manager.Compile` ran `syncInterfaceAttachments` (which detaches
+  XDP and TC from every ifindex the NEW snapshot no longer adjudicates) BEFORE
+  `apply_snapshot`, while `m.lastSnapshot` — the authority every fail-closed
+  path calls "retained" — advances only on a successful publish. Any failure in
+  between left the kernel on the new interface set and the control plane on the
+  old one. That is a policy BYPASS: both pre-publish failure modes drive the
+  shim to `ctrl.Enabled=0`, which DROPS transit on every still-attached
+  interface (`degraded_ctrl_disabled_action` runs before the ingress-map test
+  in `userspace-xdp/src/lib.rs`), so a DETACHED interface leaves that
+  fail-closed surface entirely and forwards through the Linux stack with
+  `ip_forward=1`, unadjudicated.
+
+  Mechanism (a), re-sequence, chosen over (b) record-and-rollback. The
+  post-publish transient is strictly safe: an ifindex absent from
+  `userspace_ingress_ifaces` takes `cpumap_or_pass` (the same kernel path a
+  detached interface takes) and a still-disabled ctrl drops its transit, so the
+  new window can only be as permissive as the detach it replaces. Nothing
+  between the old detach site and the publish reads the attachment set —
+  `entryProgramsLocked` is the only other `XDPLinks()` reader and it is status
+  reporting. The ATTACH half stays before the publish: the helper cannot bind
+  AF_XDP to an interface with no shim, and its failure mode is an extra
+  fail-closed drop, not a bypass. Compile is split at the `m.mu` boundary into
+  `Compile` + `applyCompiledSnapshot` (also the test seam, and it takes a
+  230-line function down); `syncInterfaceAttachments` now runs at BOTH
+  acceptance points — after the published `m.lastSnapshot = snap` and after the
+  deferred-publish branch's, which also advances the authority and returns nil.
+  The #4959 and #5488 source guards were retargeted from `Compile` to
+  `applyCompiledSnapshot`, asserted substrings unchanged, and re-verified as
+  still binding.
+
+  Validation: `go build ./...` exit 0, `go vet ./pkg/dataplane/...` exit 0,
+  `go test -count=1 ./pkg/dataplane/...` exit 0. Mutation, one line: re-insert
+  `m.syncInterfaceAttachments(result, snap)` after `defer m.mu.Unlock()` in
+  `applyCompiledSnapshot` (the pre-fix ordering) → exit 1, RED on
+  "XDP link for ifindex 4242 was detached by a FAILED apply" plus the TC and
+  handle-close legs, and RED on the structural guard (3 calls, 2 dominated).
+  Restored → exit 0. Go-only diff, no shim `.o` and no protocol movement, but
+  the change alters live XDP/TC attachment ordering on a real apply, so a
+  cluster smoke on the loss userspace cluster is owed before merge (deploy +
+  commit an interface REMOVAL and confirm the removed NIC keeps its shim across
+  a failed apply and loses it on a good one).
+- **File(s)**: pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/attach_before_publish_5485_test.go,
+  pkg/dataplane/userspace/addr_only_commit_failclosed_4959_test.go,
+  pkg/dataplane/userspace/scoped_global_zoneset_failclosed_5488_test.go,
+  pkg/dataplane/README.md, _Log.md
 - **Timestamp**: 2026-08-21
 - **Action**: Correct four in-tree "deferred follow-up" claims that went stale
   when the issues they pointed at were plan-killed. Claims-only round, but two
