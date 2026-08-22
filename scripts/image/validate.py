@@ -4,12 +4,13 @@
 Boots the baked artifacts under LOCAL incus (instances xpf-image-* —
 never the shared loss cluster) and proves the first-boot contract:
 
-  a  no config drive  -> factory bootstrap: boots, xpfd active, fxp0 DHCP,
-     sshd listening, in-guest `xpfd verify-dataplane` PASSES against the
-     image's own kernel (the bake gate), AND the #1930 LANE-1 A/B kernel
-     channel actually came up in the guest (#6494): both slots registered
-     with their own signed shim and reachable in BootOrder, and both
-     first-boot oneshots ran clean.
+  a  no config drive  -> factory bootstrap: boots UNDER SECURE BOOT (the
+     production posture, asserted not inherited — #6497), xpfd active,
+     fxp0 DHCP, sshd listening, in-guest `xpfd verify-dataplane` PASSES
+     against the image's own kernel (the bake gate), AND the #1930 LANE-1
+     A/B kernel channel actually came up in the guest (#6494): both slots
+     registered with their own signed shim and reachable in BootOrder, and
+     both first-boot oneshots ran clean.
   b  valid day-0 drive -> config validated + installed + committed at first
      boot (hostname applied); a reboot does NOT re-apply (stamp).
   c  invalid day-0 drive -> commit-check REJECT logged, nothing installed,
@@ -27,7 +28,9 @@ never the shared loss cluster) and proves the first-boot contract:
      sell for "libvirt/KVM, plain QEMU" is a valid, non-corrupt qcow2 of at
      least the bake floor (always), and — gated on qemu-system-x86_64 +
      /dev/kvm + OVMF — actually boots under direct QEMU with the day-0 config
-     on a cdrom (the cdrom day-0 attach path incus never exercises).
+     on a cdrom (the cdrom day-0 attach path incus never exercises). Prefers
+     an SB-ENFORCING firmware pair; an SB-off fallback is reported AS one
+     rather than presented as Secure Boot proof (#6497).
 
 Usage:
   validate.py --qcow2 <img> --metadata <tar.gz> [a|b|c|d|e|q|all]
@@ -69,16 +72,55 @@ SCENARIO_METHODS = {
 }
 SCENARIO_ORDER = ["a", "b", "c", "d", "e", "q"]
 
-# Preference order: a NON-secboot OVMF_CODE first so shim->grub->kernel boots
-# without needing MOK enrollment in the firmware var store (the shipped image
-# is Secure-Boot-signed, but plain-QEMU bootability is proven fine with SB off).
+# ── Secure Boot posture (#6497) ──────────────────────────────────────
+# The production appliance posture is UEFI Secure Boot ON — test/incus/setup.sh
+# sets security.secureboot: "true" "to match the production posture (#1943)".
+# The Tier-1 gate is the only thing between a bake and a release signature, and
+# it used to prove nothing about SB at all: the incus scenarios INHERITED it
+# from the incus default rather than setting it, and the plain-QEMU leg
+# deliberately preferred a NON-secboot OVMF and had no SB-on variant. A default
+# flip, a profile override, or a hypervisor without the MS db silently degraded
+# the whole gate to SB-off — and still passed.
+#
+# That matters more than "the image is signed": the #1930 A/B substrate makes
+# Secure-Boot-LOCKDOWN-sensitive design choices that nothing automated
+# exercised. scripts/image/grub.d/09_xpf documents that `regexp` may be
+# unavailable under lockdown and that the slot selector must be a GRUB *script*
+# so GRUB can parse it there. The only SB-on validation of that chain was a
+# one-time manual probe on a hand-staged stock VM, not the baked artifact.
+#
+# So: the incus scenarios now set security.secureboot EXPLICITLY and assert the
+# guest reports SB enabled, and the QEMU leg prefers an SB-ENFORCING firmware
+# pair and says loudly when it has fallen back to SB-off.
+
+# SB-ENFORCING pair, preferred. The CODE build must be the secboot one (a
+# non-secboot build ignores SB even with MS keys present) and the VARS must
+# carry the Microsoft KEK/db, so the Canonical-signed shim the image ships
+# verifies with NO MOK enrollment. Debian/Ubuntu ship these as *.ms.fd;
+# Fedora as *.secboot.fd.
+_OVMF_SECBOOT_CODE_CANDIDATES = (
+    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.ms.fd",
+    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
+    "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+    "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
+)
+_OVMF_MS_VARS_CANDIDATES = (
+    "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+    "/usr/share/OVMF/OVMF_VARS.ms.fd",
+    "/usr/share/OVMF/OVMF_VARS_4M.secboot.fd",
+    "/usr/share/edk2/x64/OVMF_VARS.secboot.4m.fd",
+    "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
+)
+# SB-OFF fallback, used only when no enforcing pair exists on the host. Kept so
+# a minimal host still gets plain-QEMU bootability coverage — but the caller
+# must LOG that this leg is not Secure-Boot proof (that silent conflation is
+# the #6497 defect).
 _OVMF_CODE_CANDIDATES = (
     "/usr/share/OVMF/OVMF_CODE_4M.fd",
     "/usr/share/OVMF/OVMF_CODE.fd",
     "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
     "/usr/share/qemu/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
-    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
 )
 _OVMF_VARS_CANDIDATES = (
     "/usr/share/OVMF/OVMF_VARS_4M.fd",
@@ -86,6 +128,97 @@ _OVMF_VARS_CANDIDATES = (
     "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
     "/usr/share/qemu/OVMF_VARS.fd",
 )
+
+# EFI global variable holding the firmware's Secure Boot state. The efivarfs
+# file is 4 attribute bytes followed by the value, so byte 4 is the flag.
+# Reading it needs no package: mokutil is NOT in bake.py's RUNTIME_PACKAGES,
+# so an assertion that required mokutil would fail on package drift rather than
+# on a real SB regression.
+_SECUREBOOT_EFIVAR = ("/sys/firmware/efi/efivars/"
+                      "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c")
+
+
+def _qemu_firmware_choice(find=None):
+    """Pick the OVMF pair for the plain-QEMU leg. Returns
+    (code, vars, secure_boot, reason).
+
+    Prefers an SB-ENFORCING pair (secboot CODE + MS-keyed VARS) so the leg
+    actually exercises the shim->grub->kernel chain the appliance ships under
+    lockdown. Falls back to the SB-off pair only when no enforcing pair exists,
+    and reports secure_boot=False so the caller can say so out loud instead of
+    presenting an SB-off boot as bootability proof (#6497).
+
+    `find` is injected so the preference order is unit-testable without
+    depending on which OVMF packages the test host happens to have. It
+    defaults to _find_first, resolved at CALL time rather than as a default
+    argument value: _find_first is defined further down this file, and binding
+    it in the signature raised NameError at import. py_compile does not catch
+    that (it checks syntax, not import), so the unit tests — which import the
+    module — are the green that matters for this file.
+    """
+    if find is None:
+        find = _find_first
+    code = find(_OVMF_SECBOOT_CODE_CANDIDATES)
+    varsf = find(_OVMF_MS_VARS_CANDIDATES)
+    if code and varsf:
+        return code, varsf, True, f"Secure Boot ENFORCING ({code} + {varsf})"
+    code = find(_OVMF_CODE_CANDIDATES)
+    varsf = find(_OVMF_VARS_CANDIDATES)
+    if code and varsf:
+        return code, varsf, False, (
+            "no SB-enforcing OVMF pair on this host (need a secboot CODE build "
+            "AND MS-keyed VARS) — falling back to SB-OFF firmware; this leg "
+            "proves plain-QEMU bootability only, NOT the Secure Boot chain")
+    return None, None, False, (
+        "no usable OVMF firmware pair found (neither SB-enforcing nor SB-off)")
+
+
+def _secureboot_verdict(efivar_byte, mokutil_out, lockdown_out):
+    """Pure verdict over the guest's Secure Boot readings: is SB actually ON?
+    Returns (ok, reason).
+
+    Three independent readings, because each can be unavailable for a reason
+    that is not "SB is off":
+      - efivar_byte: byte 4 of the SecureBoot EFI variable, as a string, or ""
+        if unreadable. AUTHORITATIVE — it is the firmware's own answer and needs
+        no package. "1" = enabled, "0" = disabled.
+      - mokutil_out: `mokutil --sb-state` output, or "" if mokutil is absent.
+        mokutil is NOT in the image's package set, so its absence must not be
+        read as SB being off.
+      - lockdown_out: /sys/kernel/security/lockdown, or "" if securityfs is not
+        mounted / the LSM is absent. CORROBORATING only: an active lockdown
+        policy is strong evidence the kernel booted SB-enabled, but lockdown can
+        also be forced on the cmdline, so it never OVERRIDES a definite "off".
+
+    A definite "off" from any authoritative source loses. Absence of every
+    reading is a FAIL, not a pass: a gate that cannot observe the property it
+    exists to assert has not asserted it (#6497 is exactly the failure of
+    treating an unobserved posture as a satisfied one).
+    """
+    efivar_byte = (efivar_byte or "").strip()
+    mok = (mokutil_out or "").strip().lower()
+    lock = (lockdown_out or "").strip().lower()
+
+    if efivar_byte == "0":
+        return False, ("firmware reports Secure Boot DISABLED (SecureBoot "
+                       "efivar = 0) — the guest did not boot under Secure Boot")
+    if "secureboot disabled" in mok:
+        return False, "mokutil reports SecureBoot disabled"
+
+    if efivar_byte == "1":
+        extra = f"; lockdown={lock}" if lock else ""
+        return True, f"firmware reports Secure Boot ENABLED (SecureBoot efivar = 1){extra}"
+    if "secureboot enabled" in mok:
+        return True, "mokutil reports SecureBoot enabled"
+    if "[integrity]" in lock or "[confidentiality]" in lock:
+        return True, (f"kernel lockdown is active ({lock}) — SB-enabled boot "
+                      "(the SecureBoot efivar was unreadable)")
+
+    return False, (
+        "could not observe Secure Boot state at all "
+        f"(efivar={efivar_byte!r}, mokutil={mok!r}, lockdown={lock!r}). The "
+        "production posture is SB ON; a gate that cannot see the property is "
+        "not asserting it, so this FAILS rather than passing silently.")
 
 
 def _qemu_img_verdict(imginfo, min_bytes):
@@ -390,8 +523,15 @@ class Harness:
         self._owned_delete(name)
         # Tag the instance with this run's ownership token so drop()/cleanup()
         # can prove it is ours before force-deleting (#4905-D).
+        # security.secureboot EXPLICITLY (#6497). incus defaults it to true
+        # today, but the gate must not INHERIT the posture it exists to prove:
+        # a default flip, a profile override, or a host image without the MS db
+        # would silently degrade every scenario to SB-off and still pass. The
+        # production posture is SB ON (test/incus/setup.sh:265-273, #1943), so
+        # the gate states it.
         incus("init", self.alias, name, "--vm", "--network", self.net,
               "-c", "limits.cpu=2", "-c", "limits.memory=2GiB",
+              "-c", "security.secureboot=true",
               "-c", f"user.xpf-owner={self.run_id}", capture=True)
         # Register for teardown IMMEDIATELY after init, not after the device
         # adds below. The instance exists and carries this run's ownership tag
@@ -491,6 +631,7 @@ class Harness:
             fail("more than one kernel in /lib/modules — stale cloudimg kernel not purged")
         if not guest_sh(a, 'grep -qw init_on_alloc=0 /proc/cmdline'):
             fail("init_on_alloc=0 missing from the booted kernel cmdline")
+        self.assert_secure_boot(a)
         info("in-guest verify-dataplane (the bake gate, image kernel)...")
         if guest(a, "nice", "-n", "19", "/usr/local/sbin/xpfd", "verify-dataplane",
                  check=False).returncode != 0:
@@ -535,6 +676,42 @@ class Harness:
         info("Scenario A PASS")
         self.drop(a)
 
+    def assert_secure_boot(self, inst):
+        """Assert the guest actually booted under UEFI Secure Boot (#6497).
+
+        Reads three independent sources and lets _secureboot_verdict decide, so
+        the reason a reading is missing is distinguished from the property being
+        false:
+
+          - byte 4 of the SecureBoot EFI variable. AUTHORITATIVE and
+            package-free — the first 4 bytes of an efivarfs file are the
+            variable's attributes, so the flag is at offset 4.
+          - `mokutil --sb-state`, when present. mokutil is NOT in bake.py's
+            RUNTIME_PACKAGES, so this is a bonus reading, never a requirement:
+            asserting through mokutil alone would turn a package-set change
+            into a Secure Boot "regression".
+          - /sys/kernel/security/lockdown, corroborating only (lockdown can also
+            be forced from the cmdline, so it never overrides a definite off).
+        """
+        efivar = guest(inst, "sh", "-c",
+                       f"od -An -t u1 -j 4 -N 1 {_SECUREBOOT_EFIVAR} 2>/dev/null",
+                       check=False, capture=True).stdout.strip()
+        mok = guest(inst, "sh", "-c",
+                    "command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null",
+                    check=False, capture=True).stdout.strip()
+        lock = guest(inst, "sh", "-c",
+                     "cat /sys/kernel/security/lockdown 2>/dev/null",
+                     check=False, capture=True).stdout.strip()
+        ok, reason = _secureboot_verdict(efivar, mok, lock)
+        if not ok:
+            fail("Secure Boot assertion FAILED: " + reason +
+                 "\n  The appliance's production posture is Secure Boot ON "
+                 "(#1943). The #1930 A/B slot selector (scripts/image/grub.d/"
+                 "09_xpf) is written as a GRUB script specifically because "
+                 "`regexp` may be unavailable under Secure-Boot lockdown, so an "
+                 "SB-off validation run does not exercise the chain this image "
+                 "ships.")
+        info(f"Secure Boot: {reason}")
     def _show_unit(self, inst, unit, prop):
         """One `systemctl show -p <prop> --value <unit>` field from the guest."""
         return guest(inst, "systemctl", "show", "-p", prop, "--value", unit,
@@ -903,14 +1080,29 @@ class Harness:
         # incus never exercises. Needs qemu-system + KVM + OVMF; SKIP (probe
         # stands) when any is absent, mirroring the root-required skips. ──
         qsys = shutil.which("qemu-system-x86_64")
-        ovmf = _find_first(_OVMF_CODE_CANDIDATES)
-        ovmf_vars = _find_first(_OVMF_VARS_CANDIDATES)
+        # #6497: prefer an SB-ENFORCING firmware pair. The appliance ships a
+        # Secure-Boot-signed chain and the #1930 slot selector is written for
+        # lockdown, so an SB-off boot is not proof of the chain this image
+        # actually ships. When no enforcing pair exists on the host we still run
+        # the SB-off leg for plain-QEMU bootability coverage — but we SAY so,
+        # loudly and in the log, instead of presenting it as Secure Boot proof.
+        # That silent conflation is the defect: the old comment here read
+        # "plain-QEMU bootability is proven fine with SB off", which is true and
+        # was being counted as something it is not.
+        ovmf, ovmf_vars, sb_on, fw_reason = _qemu_firmware_choice()
         if not qsys or not os.path.exists("/dev/kvm") or not ovmf or not ovmf_vars:
             info("SKIP boot leg: need qemu-system-x86_64 + /dev/kvm + OVMF "
                  f"(qemu={bool(qsys)} kvm={os.path.exists('/dev/kvm')} "
-                 f"ovmf_code={bool(ovmf)} ovmf_vars={bool(ovmf_vars)}) — "
-                 "the structural probe above stands")
+                 f"firmware: {fw_reason}) — the structural probe above stands")
             return
+        if sb_on:
+            info(f"QEMU firmware: {fw_reason}")
+        else:
+            info(f"NOTE: {fw_reason}")
+            info("      Install an OVMF secboot build + MS-keyed VARS "
+                 "(ovmf on Debian/Ubuntu: OVMF_CODE_4M.secboot.fd + "
+                 "OVMF_VARS_4M.ms.fd) to make this leg cover the Secure Boot "
+                 "chain. Scenario A still asserts SB in-guest under incus.")
         conf = os.path.join(self.work, "day0-qemu.conf")
         with open(conf, "w") as f:
             f.write("system {\n    host-name xpf-qemu;\n}\n")
@@ -927,7 +1119,8 @@ class Harness:
                 "-drive", f"file={self.qcow2},if=virtio,format=qcow2,snapshot=on",
                 "-drive", f"file={os.path.realpath(iso)},media=cdrom",
                 "-serial", f"file:{serial}", "-nic", "none"]
-        info("booting the qcow2 under direct QEMU (serial-captured, snapshot)...")
+        info("booting the qcow2 under direct QEMU (serial-captured, snapshot, "
+             f"secure-boot={'on' if sb_on else 'OFF'})...")
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
@@ -955,7 +1148,14 @@ class Harness:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with cdrom day-0)")
+        if sb_on:
+            info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with "
+                 "cdrom day-0, SECURE BOOT ENFORCING — shim->grub->kernel "
+                 "verified by the firmware)")
+        else:
+            info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with "
+                 "cdrom day-0) — SECURE BOOT OFF on this leg; it is NOT "
+                 "Secure Boot proof (see the firmware note above)")
 
 
 def _kver_ge(ver, floor):

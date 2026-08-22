@@ -76,15 +76,27 @@ class QemuImgVerdictTests(unittest.TestCase):
             {"format": "qcow2", "virtual-size": "8G"}, self.FLOOR)[0])
 
 
-# ── OVMF discovery: non-secboot preferred, first-existing wins ────────────
+# ── OVMF discovery: first-existing wins ───────────────────────────────────
 class OvmfDiscoveryTests(unittest.TestCase):
-    def test_non_secboot_code_preferred_over_secboot(self):
-        cands = validate._OVMF_CODE_CANDIDATES
-        first_plain = next(i for i, p in enumerate(cands) if "secboot" not in p)
-        first_sb = next((i for i, p in enumerate(cands) if "secboot" in p),
-                        len(cands))
-        self.assertLess(first_plain, first_sb,
-                        "a non-secboot OVMF_CODE must be tried before any secboot one")
+    def test_sb_off_fallback_list_contains_no_secboot_builds(self):
+        """#6497 inverted the preference: an SB-ENFORCING pair is now tried
+        first (_OVMF_SECBOOT_CODE_CANDIDATES + _OVMF_MS_VARS_CANDIDATES) and
+        _OVMF_CODE_CANDIDATES is the SB-OFF fallback only.
+
+        This case replaced `test_non_secboot_code_preferred_over_secboot`,
+        which asserted the retired preference. Left in place it would have gone
+        VACUOUS rather than red — the old list no longer holds a secboot entry
+        at all, so its `first_plain < first_sb` comparison passes while testing
+        nothing. The property that survives is what this list is FOR: a secboot
+        build leaking into the fallback would make the "SB-off" leg silently
+        SB-something, defeating the honest reporting #6497 added. The real
+        preference order is asserted in test_validate_secureboot_6497.py.
+        """
+        for p in validate._OVMF_CODE_CANDIDATES:
+            self.assertNotIn("secboot", p,
+                             f"{p} is a secboot build in the SB-OFF fallback list")
+            self.assertNotIn(".ms.", p,
+                             f"{p} is an MS-keyed build in the SB-OFF fallback list")
 
     def test_find_first_returns_first_existing(self):
         orig = os.path.isfile
