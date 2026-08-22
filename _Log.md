@@ -34,6 +34,30 @@
   fifth verbatim row nobody had listed.
 - **File(s)**: `pkg/ddns/backend_rfc2136_test.go`,
   `pkg/ddns/fake_dns_portpair_6709_test.go` (new), `pkg/ddns/README.md`
+## 2026-08-22 — #7368 failover smoke names which failure it hit
+
+- **Timestamp**: 2026-08-22
+- **Action**: Cross-referenced the two independent checks
+  `test-failover.sh` already performed. Primacy is read from a
+  self-reported field; the session count is a real measurement; they
+  were never compared, so #6656's ownership divergence surfaced as a
+  session-count shortfall blamed on the change under test. Added the
+  pure, selftested `failover_ownership_verdict` (ok / diverged /
+  nostream) and split the exit codes: `FATAL[PRECONDITION]` 2,
+  `FATAL[DIVERGENCE]` 3. Replaced the preflight's unscoped
+  `grep -q "node0.*primary"` with the per-RG
+  `deploy_reassert_node0_primary_ok` from #6591 — measured: `secondary`
+  does NOT contain `primary`, so the grep was not loose in the way it
+  looks; it was UNSCOPED, and accepted node0 secondary for RG0 while
+  primary for RG1.
+  Mutation matrix 6/6 RED after fixing the wiring cells: V4 and V6 were
+  GREEN because my wiring greps matched the COMMENTS that mention the
+  function names — the guard was reading its own documentation. Now
+  strips whole-line comments first.
+  NOT run on the cluster (shared; lead serializes).
+- **File(s)**: test/incus/test-failover.sh, test/incus/deploy-lib.sh,
+  test/incus/deploy-lib-selftest.sh, docs/testing.md
+
 ## 2026-08-22 — #6587 prefix-length validators + provenance-aware RA floor
 
 - **Timestamp**: 2026-08-22
