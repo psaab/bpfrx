@@ -369,7 +369,7 @@ var (
 	// ABORT the whole reset — root is revoked in place instead (#5520,
 	// zeroizeRootLoginAccount).
 	zeroizeUserdel = func(name string) ([]byte, error) {
-		return combinedOutputTimeout(context.Background(), "userdel", "-r", name)
+		return combinedOutputTimeoutUnlimited(context.Background(), "userdel", "-r", name)
 	}
 	// zeroizeRootSSHDir is the root account's .ssh directory. Root's home is
 	// /root, NOT /home/root, so its authorized_keys lives at
@@ -388,7 +388,7 @@ var (
 	// real root credential. context.Background(): a client disconnect must not
 	// abort a confirmed factory reset (mirrors zeroizeUserdel).
 	zeroizeLockRootPassword = func() ([]byte, error) {
-		return combinedOutputTimeout(context.Background(), "passwd", "-l", "root")
+		return combinedOutputTimeoutUnlimited(context.Background(), "passwd", "-l", "root")
 	}
 )
 

@@ -556,7 +556,8 @@ contract.
   ntpq, timedatectl, tail, ip neigh flush, systemctl power actions)
   must go through the bounded helpers in `exec_timeout.go` (#1805):
   `outputTimeout` / `combinedOutputTimeout` / `runTimeout` (15s timeout
-  + 5s WaitDelay, mirroring the apply-path contract in
+  + 5s WaitDelay, and — for the first two as of #6552 — a slot from the
+  shared diagnostic semaphore; mirroring the apply-path contract in
   `pkg/daemon/exec_timeout.go`, #1794 — not importable here because
   pkg/daemon imports this package). Do not add raw `exec.Command` calls
   in handlers: a wedged binary pins the handler goroutine and its gRPC
@@ -599,6 +600,57 @@ contract.
   timeout/cancel). `streamDiagCmd` is called through the `streamDiag`
   package-var seam so a test can inject a fake slow diagnostic and assert
   the cap without real subprocesses.
+
+  **That aggregate cap now covers the READ-ONLY diagnostic forks too
+  (#6552), and the default is bounded.** Ping/Traceroute were the only
+  sites acquiring it; `ShowText{log}` forked `journalctl` on nothing but
+  a decodable request, `ShowText{log:<name>}` forked `tail`,
+  `ShowText{ntp}` forked up to three of chronyc/ntpq/timedatectl, and
+  `GetSystemInfo` forked ps/df/journalctl/ss — ten sites, no admission
+  gate. A per-exec TIMEOUT bounds how long ONE fork lives; it does not
+  bound how many run at once. `ShowText` is on
+  `fabricAllowedUnaryMethods`, so it is not loopback-bounded either.
+
+  The bound is placed so a future caller gets it by default:
+  `outputTimeout` and `combinedOutputTimeout` — the plainly-named
+  helpers — now `acquireDiagSlot()` before forking, and the unbounded
+  forms carry `Unlimited` in the name. Errors go through
+  `diagExecError`, which answers `ResourceExhausted` for a refused
+  admission and `Internal` for anything the child actually did, so load
+  shedding is never reported as a server fault. Acquire at the FORK, not
+  at the handler: `GetSystemInfo{users}` forks nothing and must not be
+  throttled by the diagnostic budget (a negative-control test pins that).
+
+  Three uses stay UNBOUNDED, each named in
+  `declaredUnboundedForks`: `runTimeout`'s deferred `systemctl`
+  reboot/halt/poweroff and zeroize daemon-stop (a CONFIRMED power action
+  must not be refused because the diagnostic budget is busy), the
+  zeroize account teardown (`userdel` / `passwd -l root` — a
+  half-zeroized box that left root unlocked is worse than a slow one),
+  and the `ip -4/-6 neigh flush` pair (state-changing operator actions
+  behind `PermControl`, not diagnostics).
+  `TestNoUnboundedForkOutsideTheDeclaredExemptions6552` walks every
+  non-test file in the package and fails BOTH on an undeclared
+  unbounded fork and on a declared exemption whose site no longer
+  exists, so the allowlist cannot rot into a record of things that used
+  to be true.
+
+  Both `grpc.NewServer` builders also set
+  `grpc.MaxConcurrentStreams(maxConcurrentStreams)` = 256 (#6552).
+  grpc-go's server default is UNLIMITED streams per connection, which is
+  the multiplier that turns a per-request cost into an amplification;
+  256 is far above real operator load (low tens, single-digit long-lived
+  streams), so it is a runaway ceiling rather than a throttle.
+
+  Not an injection surface, stated because it reads like one: nine of
+  the ten sites pass only compile-time string literals to
+  `exec.CommandContext` (no shell). The tenth, `tail -n N <logPath>`, is
+  request-derived on both arguments and constrained on both — `N` via
+  `clampTailLines` to [1,10000] re-emitted with `strconv.Itoa` (so it
+  can never become an option), and `logPath` via
+  `config.SyslogLogFilePath`, which refuses any name that is not
+  `filepath.Base(name)` and then requires it in the configured
+  `system syslog file` allowlist.
 - Policy text views (`server_show_policies_text.go`) must render BOTH
   zone-pair AND global policies (#3059). `showPoliciesHitCount` and
   `showPoliciesDetail` loop `cfg.Security.Policies` and then append a

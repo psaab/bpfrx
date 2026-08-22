@@ -457,7 +457,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	case "log":
 		out, err := combinedOutputTimeout(ctx, "journalctl", "-u", "xpfd", "-n", "50", "--no-pager")
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "journalctl: %v", err)
+			return nil, diagExecError("journalctl", err)
 		}
 		buf.Write(out)
 
@@ -558,7 +558,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 			}
 			out, err := combinedOutputTimeout(ctx, "tail", "-n", strconv.Itoa(n), logPath)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "read %s: %v", logPath, err)
+				return nil, diagExecError("read "+logPath, err)
 			}
 			buf.Write(out)
 		} else {
