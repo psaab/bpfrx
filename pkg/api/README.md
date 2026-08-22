@@ -333,10 +333,10 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
   fidelity for cross-system correlation; the CLI keeps human-friendly
   whole-second output.
 
-## Server-side authorization (#5561)
+## Server-side authorization (#5561, reads #6660)
 
-Every state-changing route is gated on a **server-derived principal** before it
-reaches its handler. `authz.go` owns the route table and the middleware; the
+Every route under `/api/v1` — state-changing **and** read — is gated on a
+**server-derived principal** before it reaches its handler. `authz.go` owns the route table and the middleware; the
 decision itself lives in `pkg/authz` so the gRPC surface reaches the same
 verdict. That gRPC leg has since landed (#5278) — see
 [`pkg/grpcapi/README.md`](../grpcapi/README.md) "Server-side authorization",
@@ -346,6 +346,53 @@ inline (grpc-go calls its accept hook off the accept loop, `http.Server` does
 not), and prices the multiplexed `SystemAction` verb-by-verb because a unary
 interceptor is handed the decoded request that this middleware deliberately
 never reads.
+
+### The read surface (#6660)
+
+#5561 gated the 19 mutating routes and deliberately scoped reads out. That left
+every read route open: any local process could `GET /api/v1/config` without
+being identified, and no login-class permission was consulted. #6660 closes it —
+`restReadPermissions` + `readAuthz`, reusing #5561's identification machinery
+unchanged.
+
+**What was actually disclosed, measured rather than assumed.** `GET
+/api/v1/config` json-encodes the COMPILED `*config.Config`, so #2053's
+`config.Secret` marshaller applies and **no operator secret is rendered in
+cleartext** — verified by marshalling a populated `ControlLinkAuthKey` and
+checking the output. So this was **not** credential disclosure. What it was is
+full CONFIGURATION disclosure: zones, policies, NAT rules, interface addressing,
+routing neighbours — a complete map of the firewall, to any local uid, including
+one with no `system login user` entry at all. On a firewall that is
+reconnaissance.
+
+**Every route is `PermView`**, not a per-route tier. These are all `show`
+verbs, and Junos gates `show` on `view`; inventing finer tiers here would be a
+policy the CLI's own table does not have, and the two would drift. The finer
+question — whether a read should be REDACTED by class rather than denied — is a
+different contract and is left open.
+
+**Why this is not a no-brick problem.** `PrincipalForUID` returns a **superuser**
+principal for uid 0 unconditionally, with no login model required, so root-run
+monitoring and support tooling on a box that never adopted RBAC keeps working
+byte-for-byte. What changes is a NON-root local uid outside the login model —
+exactly the population the issue exists to stop.
+
+**`/health` and `/metrics` stay open** and are not in the table. They carry no
+configuration, `authCheck` already exempts them, and the in-tree incus harnesses
+read `/metrics`. A sweep of every in-tree consumer found those two and nothing
+else touching REST at all, so gating `/api/v1` breaks no shipped tooling.
+
+`readAuthz` serves an UNGUARDED safe route rather than refusing it — the
+opposite of the mutation gate's fail-closed default — precisely so those two
+keep working. The cost is that a NEW read route added without a table entry
+would serve unauthenticated, so `TestEveryReadRouteHasAPermission_6660`
+enumerates the routes `server.go` actually registers and fails on any `/api/v1`
+GET the table does not cover, moving that risk from runtime to the suite.
+
+It adjudicates ONCE, where the mutation gate adjudicates twice. That is a
+difference rather than an omission: the mutation gate drains the body between
+its two passes because a caller owns its body and can hold an authorization open
+for the whole read timeout. A GET has no body to withhold.
 
 **Why the loopback bind was not enough.** The daemon provisions every `system
 login user` a real shell account (`useradd -m -s /bin/bash`), and the CLI's RBAC
