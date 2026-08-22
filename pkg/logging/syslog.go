@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // Resilience defaults for the stream (TCP/TLS) transports. These bound the
@@ -543,6 +545,36 @@ func (s *SyslogClient) DroppedCooldown() uint64 { return s.droppedCooldown.Load(
 // For TCP/TLS, uses RFC 6587 octet-counting framing.
 // On write failure for TCP/TLS, attempts one reconnect.
 func (s *SyslogClient) Send(severity int, msg string) error {
+	// #6585: neutralize control bytes before the message becomes a syslog
+	// frame. This is the LAST boundary before the wire and every caller passes
+	// through it, so a producer cannot be added that bypasses it — which is the
+	// point: the producers are open-ended (any slog attribute anywhere in the
+	// daemon) and a per-producer fix rots on the next one.
+	//
+	// Go's own slog text handler quotes non-printing attribute values
+	// (log/slog/text_handler.go), which is why the local stderr/journald copy
+	// was never exposed. SyslogSlogHandler deliberately bypasses that path to
+	// build the syslog framing itself, and reintroduced the raw value.
+	//
+	// Two distinct consequences, both worse here than on a terminal because
+	// syslog is aggregated and long-retained:
+	//
+	//  1. LOG INJECTION. A bare LF is a record delimiter in RFC 3164, so an
+	//     embedded newline forges a frame boundary and lets the payload
+	//     synthesize an entire additional syslog line — arbitrary
+	//     facility/severity/timestamp/host as far as the collector is
+	//     concerned.
+	//  2. DEFERRED TERMINAL INJECTION. ESC/CSI stored verbatim in the
+	//     collector fires whenever an operator later cats or tails the
+	//     archive.
+	//
+	// SanitizeForDisplay (single-line) rather than SanitizeBlockForDisplay:
+	// the block variant deliberately PRESERVES LF, which is right for a
+	// multi-line table and exactly wrong for a single syslog frame. It has an
+	// allocation-free fast path for the already-clean case, which is every
+	// ordinary record.
+	msg = termsafe.SanitizeForDisplay(msg)
+
 	priority := s.Facility*8 + severity
 	var line string
 	if s.Format == "sd-syslog" {
