@@ -194,7 +194,8 @@ func mergeHostInboundOverrideLocal(a, b *HostInboundTraffic) *HostInboundTraffic
 // override is expanded onto each of its configured units (skipping a unit owned
 // by a DIFFERENT zone — #3720 M01) and MERGED (unioned) with any unit-level
 // override rather than the sorted-first physical ref shadowing the unit (the
-// #3720 first-writer-wins bug). Rebuilt locally because pkg/config cannot import
+// #3720 first-writer-wins bug) — both are interface-level statements, so they
+// union with each other even though the result REPLACES the zone level (#6515). Rebuilt locally because pkg/config cannot import
 // pkg/dataplane; the effective set it produces per unit therefore matches the
 // runtime builder exactly, so the commit gate and the runtime reporter classify
 // the same unit identically.
@@ -226,7 +227,8 @@ func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffi
 			}
 			if strings.Contains(ref, ".") {
 				// Logical unit ref: most specific — merge onto any physical-
-				// inherited set (Junos additive), exact match only.
+				// inherited set (both are INTERFACE-level statements and union
+				// with each other, #3720), exact match only.
 				out[ref] = mergeHostInboundOverrideLocal(out[ref], hib)
 				continue
 			}
@@ -248,22 +250,29 @@ func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffi
 }
 
 // effectiveHostInboundSigLocal returns the canonical signature of the EFFECTIVE
-// host-inbound admission set for one interface unit: the zone-level set UNION
-// the per-interface override (#3362, Junos additive), canonicalized. It mirrors
-// pkg/dataplane/userspace.unionHostInboundTokens feeding
-// CanonicalHostInboundTokenSig, so the commit gate and the runtime reporter
-// classify the same unit identically.
+// host-inbound admission set for one interface unit: the per-interface override
+// when the unit declares one, else the zone-level set (#3362; #6515 replace
+// semantics). It mirrors pkg/dataplane/userspace.effectiveHostInboundTokens
+// feeding CanonicalHostInboundTokenSig, so the commit gate and the runtime
+// reporter classify the same unit identically — the whole point of this gate is
+// that two zones claiming one firewall-local address with DIFFERING admission is
+// rejected, and a signature computed from a different combination rule than
+// enforcement uses would compare the wrong sets.
 func effectiveHostInboundSigLocal(zone *ZoneConfig, override *HostInboundTraffic) string {
-	var svc, proto []string
+	var zoneSvc, zoneProto []string
 	if zone != nil && zone.HostInboundTraffic != nil {
-		svc = append(svc, zone.HostInboundTraffic.SystemServices...)
-		proto = append(proto, zone.HostInboundTraffic.Protocols...)
+		zoneSvc = zone.HostInboundTraffic.SystemServices
+		zoneProto = zone.HostInboundTraffic.Protocols
 	}
+	var ovSvc, ovProto []string
 	if override != nil {
-		svc = append(svc, override.SystemServices...)
-		proto = append(proto, override.Protocols...)
+		ovSvc = override.SystemServices
+		ovProto = override.Protocols
 	}
-	return CanonicalHostInboundTokenSig(svc, proto)
+	overridden := override != nil
+	return CanonicalHostInboundTokenSig(
+		EffectiveHostInboundTokens(zoneSvc, ovSvc, overridden),
+		EffectiveHostInboundTokens(zoneProto, ovProto, overridden))
 }
 
 // validateDuplicateHostLocalAddressStrict implements the #3718 Option B

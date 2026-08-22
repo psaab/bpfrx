@@ -111,9 +111,14 @@ func Test_3721_DistinctSetsStaySeparate(t *testing.T) {
 // Test_3721_EnforcementPreserved is the behavior-preserving assertion: for every
 // firewall-local address, the CANONICAL effective admitted set produced by
 // BuildZoneHostInboundViews equals the set computed independently per interface
-// (unionHostInboundTokens), regardless of how the grouping collapses. The
+// (effectiveHostInboundTokens), regardless of how the grouping collapses. The
 // grouping is an optimization over WHICH view carries an address, never over
 // what that address admits.
+//
+// #6515 changed the per-interface effective set from zone ∪ override to the
+// override alone; the grouping property under test is unchanged, and the fixture
+// still exercises it — two interfaces with the SAME effective set collapse into
+// one view, a third with a different set stays separate.
 func Test_3721_EnforcementPreserved(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
@@ -133,17 +138,19 @@ func Test_3721_EnforcementPreserved(t *testing.T) {
 			Interfaces:         []string{"ge-0/0/0.0", "ge-0/0/1.0", "ge-0/0/2.0"},
 			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ping"}},
 			InterfaceHostInbound: map[string]*config.HostInboundTraffic{
-				"ge-0/0/0.0": {SystemServices: []string{"ssh"}},          // eff {ping, ssh}
-				"ge-0/0/1.0": {SystemServices: []string{"ssh"}},          // eff {ping, ssh} (merges with ge-0/0/0.0)
-				"ge-0/0/2.0": {SystemServices: []string{"https", "ssh"}}, // eff {ping, https, ssh}
+				"ge-0/0/0.0": {SystemServices: []string{"ssh"}},          // eff {ssh}
+				"ge-0/0/1.0": {SystemServices: []string{"ssh"}},          // eff {ssh} (merges with ge-0/0/0.0)
+				"ge-0/0/2.0": {SystemServices: []string{"https", "ssh"}}, // eff {https, ssh}
 			},
 		},
 	}
 
+	// #6515: each interface declares its own stanza, so the zone-level `ping`
+	// reaches none of them.
 	want := map[string]string{
-		"10.0.0.1": canonSet([]string{"ping", "ssh"}),
-		"10.0.1.1": canonSet([]string{"ping", "ssh"}),
-		"10.0.2.1": canonSet([]string{"ping", "https", "ssh"}),
+		"10.0.0.1": canonSet([]string{"ssh"}),
+		"10.0.1.1": canonSet([]string{"ssh"}),
+		"10.0.2.1": canonSet([]string{"https", "ssh"}),
 	}
 	got := map[string]string{}
 	for _, v := range BuildZoneHostInboundViews(cfg) {
@@ -156,8 +163,8 @@ func Test_3721_EnforcementPreserved(t *testing.T) {
 			t.Errorf("addr %s effective set = %s, want %s", addr, got[addr], wantSet)
 		}
 	}
-	// The two {ping, ssh} interfaces collapse to one view; {ping, https, ssh}
-	// stays separate — two address-bearing views for the zone.
+	// The two {ssh} interfaces collapse to one view; {https, ssh} stays
+	// separate — two address-bearing views for the zone.
 	if n := len(countAddrViews(BuildZoneHostInboundViews(cfg), "trunk")); n != 2 {
 		t.Errorf("address-bearing views = %d, want 2 (the two identical sets merged)", n)
 	}

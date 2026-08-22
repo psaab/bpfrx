@@ -231,7 +231,8 @@ pub(super) fn populate_interfaces(
         }
         // #3362: per-interface host-inbound OVERRIDE. When the control plane
         // marked this interface host-inbound-configured, classify its EFFECTIVE
-        // (zone ∪ interface) token set and key it by ifindex so the
+        // token set — resolved in Go, where the interface stanza REPLACES the
+        // zone one (#6515) — and key it by ifindex so the
         // local-delivery admit path prefers it over the from-zone's set. A
         // present-but-empty override classifies to an empty ZoneHostInbound =
         // fail-closed deny-all (matching the zone-level semantics and the nft

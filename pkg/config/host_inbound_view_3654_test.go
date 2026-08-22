@@ -47,16 +47,23 @@ func TestInterfaceHostInboundEffective3654(t *testing.T) {
 			"ge-0/0/9.0": {SystemServices: []string{"https", "ssh"}},
 		},
 	}
-	// Overridden interface: effective = zone UNION override.
+	// Overridden interface: effective = the OVERRIDE, which REPLACES the
+	// zone-level stanza (#6515). The fixture is deliberately asymmetric — the
+	// override declares only system-services — so it also pins the granularity:
+	// the whole zone stanza is replaced, so the zone's `protocols ospf` does NOT
+	// survive on this interface either. A per-leaf inheritance rule would leave
+	// ospf here, and no vendor text describes one.
 	svc, proto, overridden := z.InterfaceHostInboundEffective("ge-0/0/9.0")
 	if !overridden {
 		t.Fatal("expected overridden=true for ge-0/0/9.0")
 	}
-	if strings.Join(svc, ",") != "ssh,https" {
-		t.Fatalf("effective svc = %v, want [ssh https]", svc)
+	if strings.Join(svc, ",") != "https,ssh" {
+		t.Fatalf("effective svc = %v, want [https ssh] (the override REPLACES the zone stanza, #6515)", svc)
 	}
-	if strings.Join(proto, ",") != "ospf" {
-		t.Fatalf("effective proto = %v, want [ospf]", proto)
+	if len(proto) != 0 {
+		t.Fatalf("effective proto = %v, want none: the whole zone stanza is replaced, so the "+
+			"zone's `protocols ospf` does not reach an interface that declares its own "+
+			"host-inbound-traffic (#6515 granularity)", proto)
 	}
 	// Non-overridden interface: effective = zone-level only, overridden=false.
 	svc, _, overridden = z.InterfaceHostInboundEffective("ge-0/0/0.0")
@@ -84,11 +91,20 @@ func TestHostInboundViewRender3654(t *testing.T) {
 		"Host-inbound interface overrides:",
 		"ge-0/0/9.0:",
 		"override system-services: https",
-		"effective system-services: ssh, https",
+		// #6515: the override REPLACES the zone stanza on this interface, so
+		// the effective line is the override alone. The zone-level line above
+		// still reads `ssh` — it governs every interface that does NOT declare
+		// a stanza, which is exactly why both lines are asserted here: an
+		// operator reading only one of them would misjudge the posture.
+		"effective system-services: https",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("populated+override render missing %q\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "effective system-services: ssh") {
+		t.Errorf("the effective line must NOT carry the zone's `ssh` on an overridden "+
+			"interface — the interface stanza replaces it (#6515)\n%s", out)
 	}
 
 	// No-stanza zone: explicit default-deny posture line.
@@ -186,7 +202,8 @@ func TestRenderInterfaceHostInbound3654(t *testing.T) {
 	for _, want := range []string{
 		"Host-inbound services: ssh",
 		"Host-inbound interface override on ge-0/0/9.0:",
-		"effective host-inbound services: ssh, https",
+		// #6515: effective = the override, the zone's ssh having been replaced.
+		"effective host-inbound services: https",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("override diagnostic missing %q\n%s", want, out)

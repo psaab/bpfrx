@@ -101,7 +101,8 @@ func hostInboundAdmitsRoutingProtocol(protocols []string, token string) bool {
 // commit-time WARN advisory: a managed FRR routing protocol — OSPFv2, OSPFv3, or
 // RIP, which xpf renders into FRR (pkg/frr/policy_render.go) — is enabled on an
 // interface whose security zone's EFFECTIVE `host-inbound-traffic protocols` set
-// (zone-level ∪ per-interface override, #3362 additive; `all`-expanded) OMITS
+// (the per-interface override where declared, which REPLACES the zone-level set
+// — #6515, #3362; `all`-expanded) OMITS
 // the matching token (ospf/ospf3/rip).
 //
 // This surfaces the ACTUAL silent multicast fail-open that the shipped
@@ -221,9 +222,10 @@ func validateHostInboundManagedRoutingMismatch(cfg *Config) []string {
 			if z == nil {
 				continue
 			}
-			// EFFECTIVE host-inbound protocols for this interface: zone-level ∪ the
-			// per-interface override WITH #3720 physical-parent inheritance for a
-			// logical unit — reuse the InterfaceHostInboundEffective SSOT so the
+			// EFFECTIVE host-inbound protocols for this interface: the
+			// per-interface override where declared (it REPLACES the zone-level
+			// set, #6515) WITH #3720 physical-parent inheritance for a logical
+			// unit — reuse the InterfaceHostInboundEffective SSOT so the
 			// advisory matches the dataplane's admission resolution exactly (a
 			// parent `reth0` override admitting ospf must cover unit `reth0.10`,
 			// else this warns falsely).
@@ -536,4 +538,181 @@ func validatePreIDDefaultPolicyLogWarnings(cfg *Config) []string {
 			"pre-identification session-admit path exists to emit the "+
 			"RT_FLOW session log)",
 		strings.Join(modes, "/"))}
+}
+
+// hostInboundTokenExpansion expands one host-inbound token to the set of NAMED
+// tokens it stands for, so a coverage comparison is made on what is actually
+// admitted rather than on the spelling. `all` is the only expanding token, and
+// it expands differently per kind (HostInboundAllExpansionServices vs
+// HostInboundAllExpansionProtocols), which is why the kind is a parameter rather
+// than the caller picking a helper. Returned tokens are lower-cased, matching
+// how the dataplane keys them.
+func hostInboundTokenExpansion(token string, protocols bool) []string {
+	t := strings.ToLower(strings.TrimSpace(token))
+	if t == "" {
+		return nil
+	}
+	if protocols {
+		if t == "all" {
+			out := make([]string, 0, len(HostInboundAllExpansionProtocols()))
+			for _, p := range HostInboundAllExpansionProtocols() {
+				out = append(out, strings.ToLower(p))
+			}
+			return out
+		}
+		return []string{t}
+	}
+	exp := HostInboundServiceTokenExpansion(t)
+	out := make([]string, 0, len(exp))
+	for _, e := range exp {
+		out = append(out, strings.ToLower(strings.TrimSpace(e)))
+	}
+	return out
+}
+
+// hostInboundLostTokens returns the tokens from zoneToks that the interface's
+// EFFECTIVE set no longer admits, in their authored order. A zone token is
+// "kept" only when EVERY token it expands to is admitted by the effective set,
+// so `all` at the zone level with a narrow interface stanza is reported (it is
+// genuinely narrowed) while `ssh` at the zone level with `all` on the interface
+// is not (the expansion covers it).
+func hostInboundLostTokens(zoneToks, effToks []string, protocols bool) []string {
+	if len(zoneToks) == 0 {
+		return nil
+	}
+	admitted := make(map[string]bool, len(effToks)*2)
+	for _, t := range effToks {
+		for _, e := range hostInboundTokenExpansion(t, protocols) {
+			admitted[e] = true
+		}
+	}
+	var lost []string
+	for _, zt := range zoneToks {
+		exp := hostInboundTokenExpansion(zt, protocols)
+		if len(exp) == 0 {
+			continue
+		}
+		covered := true
+		for _, e := range exp {
+			if !admitted[e] {
+				covered = false
+				break
+			}
+		}
+		if !covered {
+			lost = append(lost, zt)
+		}
+	}
+	return lost
+}
+
+// validateHostInboundOverrideReplaceWarnings emits the #6515 MIGRATION advisory:
+// one warning per zone interface whose per-interface `host-inbound-traffic`
+// stanza REPLACES a zone-level stanza that admitted more than it does.
+//
+// #6515 changed the zone↔interface combination from a union to a replace, to
+// match Junos ("You can configure these parameters at the zone level, in which
+// case they affect all interfaces of the zone, or at the interface level.
+// (Interface configuration overrides that of the zone.)"). That is a NARROWING
+// for any config authored against the previous additive behaviour: an interface
+// stanza that was written to ADD `protocols ospf` to a zone admitting `ssh` now
+// admits ospf and NOTHING ELSE on that interface. The services most likely to
+// disappear are exactly the ones an operator cannot afford to lose silently —
+// ssh, https/webmgmt, ike (ESP/AH are globally accepted but IKE udp/500,4500 is
+// token-gated, so tunnels stop rekeying), and unicast bgp/ospf to the interface
+// address.
+//
+// It is worse than "new connections are refused": the #5566 reconcile rebuilds
+// its admit set from the same views and DELETES established kernel conntrack
+// entries to a covered firewall-local address the new set no longer admits, so a
+// narrowing commit drops the operator's LIVE session to a removed service. This
+// advisory therefore names every lost token at `commit check`, BEFORE the commit
+// that would remove it, and tells the operator the mechanical remedy: repeat the
+// zone tokens in the interface stanza.
+//
+// WARN-only, never a reject: the config is valid Junos and the new behaviour IS
+// the Junos behaviour. Rejecting it would refuse a config Junos accepts.
+//
+// Scope. Emitted per ZONE INTERFACE rather than per authored stanza, because a
+// unit that merely INHERITS a physical-parent override (#3720) also loses the
+// zone tokens and the operator needs to see the interface whose admission
+// actually changed. Lifeline interfaces (fxp0 / em0 / fab* / the configured
+// control + fabric links) are skipped: they are excluded from host-inbound deny
+// scoping entirely, so nothing is lost on them and an advisory would be a false
+// alarm. An effective set that full-admits (`any-service`) loses nothing and is
+// skipped for the same reason.
+func validateHostInboundOverrideReplaceWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.Security.Zones == nil {
+		return nil
+	}
+	lifelines := HostInboundLifelineSet(cfg)
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var warnings []string
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		if zone == nil || zone.HostInboundTraffic == nil {
+			continue // no zone-level stanza => nothing an override can replace
+		}
+		zoneSvc := zone.HostInboundTraffic.SystemServices
+		zoneProto := zone.HostInboundTraffic.Protocols
+		if len(zoneSvc) == 0 && len(zoneProto) == 0 {
+			continue
+		}
+		refs := make([]string, 0, len(zone.Interfaces))
+		seen := make(map[string]bool, len(zone.Interfaces))
+		for _, ref := range zone.Interfaces {
+			if ref == "" || seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			refs = append(refs, ref)
+		}
+		sort.Strings(refs)
+		for _, ref := range refs {
+			if HostInboundLifelineInterface(ref, lifelines) {
+				continue
+			}
+			effSvc, effProto, overridden := zone.InterfaceHostInboundEffective(ref)
+			if !overridden {
+				continue
+			}
+			fullAdmit := false
+			for _, s := range effSvc {
+				if HostInboundFullAdmitService(s) {
+					fullAdmit = true
+					break
+				}
+			}
+			if fullAdmit {
+				continue
+			}
+			lostSvc := hostInboundLostTokens(zoneSvc, effSvc, false)
+			lostProto := hostInboundLostTokens(zoneProto, effProto, true)
+			if len(lostSvc) == 0 && len(lostProto) == 0 {
+				continue
+			}
+			var lost []string
+			if len(lostSvc) > 0 {
+				lost = append(lost, "system-services ["+strings.Join(lostSvc, " ")+"]")
+			}
+			if len(lostProto) > 0 {
+				lost = append(lost, "protocols ["+strings.Join(lostProto, " ")+"]")
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"zone %q interface %q: the per-interface host-inbound-traffic "+
+					"stanza REPLACES the zone-level stanza on this interface "+
+					"(Junos: \"Interface configuration overrides that of the "+
+					"zone\"), so host-bound %s admitted by zone %q is DENIED "+
+					"here. Repeat those tokens in the interface stanza to keep "+
+					"admitting them. Established sessions to a removed service "+
+					"are flushed at commit, not merely refused for new "+
+					"connections (#6515, #5566).",
+				name, ref, strings.Join(lost, " and "), name))
+		}
+	}
+	return warnings
 }
