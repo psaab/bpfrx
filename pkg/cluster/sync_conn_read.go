@@ -323,42 +323,46 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// speak for the current one. See noteHeartbeatAck (sync_conn.go).
 		s.noteHeartbeatAck(conn)
 	case syncMsgConfig:
-		s.stats.ConfigsReceived.Add(1)
-		s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())
-		configText, gen := decodeConfigPayload(payload)
-		s.stats.LastConfigSyncSize.Store(uint64(len(configText)))
-		slog.Info("cluster sync: config received from peer", "size", len(configText), "gen", gen)
-		// #5563: advance the received-config high-water BEFORE enqueue. This is
-		// the receiver's view of the peer's current committed generation and
-		// gates manual-failover readiness against lastAppliedConfigGen. Record it
-		// even if the enqueue below drops the payload (queue full) so the standby
-		// stays flagged config-stale until the apply actually lands on a re-push.
-		// It stays a monotonic max so a reordered older frame cannot pull it
-		// down. #5084: the load/compare/store moved into recordRecvConfigGen and
-		// is taken under configGenMu — the prior justification here ("the
-		// receiveLoop is single-threaded per connection, so the load/store pair
-		// needs no CAS") holds per connection but there are TWO receive loops,
-		// so a raise driven by one fabric raced resetRecvGen's clear driven by
-		// the other and could re-raise the mark that clear had just zeroed.
-		s.recordRecvConfigGen(gen)
-		// #3931: enqueue onto the single-consumer ordered apply queue instead
-		// of spawning a racing `go OnConfigReceived`. The receiveLoop is
-		// single-threaded per connection, so this preserves receive order;
-		// configApplyLoop then applies only strictly-newer generations. The
-		// enqueue is non-blocking so a slow apply never stalls session sync /
-		// heartbeats on this connection.
-		if s.configApplyCh != nil {
-			select {
-			case s.configApplyCh <- configApplyItem{gen: gen, text: configText}:
-			default:
-				// Ordered apply queue full — practically impossible (commits
-				// are seconds apart, apply is sub-second). Drop with an alarm;
-				// the next commit / reconnect re-push (fresh higher gen)
-				// re-converges the standby.
-				s.stats.Errors.Add(1)
-				slog.Error("cluster sync: config apply queue full, dropping config (will re-converge on next push)", "gen", gen, "size", len(configText))
-			}
+		s.handleConfigPayload(payload)
+	case syncMsgConfigEncrypted:
+		// #6629: same payload, sealed under this connection's ephemeral key.
+		// Decrypt, then hand the plaintext to the SAME handler — the two arms
+		// must never diverge in ordering, generation accounting or apply
+		// admission, and a divergence there would always be a bug, so there is
+		// one implementation rather than two kept in agreement.
+		key := s.configKeyForConn(conn)
+		if key == nil {
+			// A sealed payload arrived on a connection with no derived key:
+			// either the exchange never completed or this is a stale
+			// connection the slots no longer reference. Either way it cannot
+			// be opened, and it must NOT be opened with another connection's
+			// key. Drop it; the sender re-pushes on the next reconcile tick.
+			//
+			// NOT BOUND BY A TEST, and deliberately recorded as such: removing
+			// this branch changes nothing observable, because
+			// openConfigPayload fails closed on a nil key (aes.NewCipher(nil)
+			// errors) and the decrypt-failure branch below drops the payload
+			// anyway. It is kept for the DIAGNOSTIC — "we never negotiated"
+			// and "it did not decrypt" send an operator to entirely different
+			// places — and as defence in depth if openConfigPayload ever grows
+			// a path that tolerates a short key. The safety property (an
+			// unopenable payload never reaches the apply path) is bound by
+			// TestConfigCryptoDropsUndecryptablePayload6629.
+			s.stats.Errors.Add(1)
+			slog.Error("cluster sync: encrypted config received but no key was negotiated on "+
+				"this connection — dropping (#6629)", "remote", connRemoteAddrString(conn))
+			return
 		}
+		plaintext, err := openConfigPayload(key, payload)
+		if err != nil {
+			s.stats.Errors.Add(1)
+			slog.Error("cluster sync: could not decrypt config payload — dropping (#6629)",
+				"err", err, "remote", connRemoteAddrString(conn))
+			return
+		}
+		s.handleConfigPayload(plaintext)
+	case syncMsgConfigKeyExchange:
+		s.handleConfigKeyExchange(conn, payload)
 	case syncMsgIPsecSA:
 		s.stats.IPsecSAReceived.Add(1)
 		// #5706: split off the (incarnation, seq) ordering trailer and admit
@@ -565,5 +569,50 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 		s.stats.LastFenceAckAt.Store(time.Now().UnixNano())
 		s.completeBarrierWait(seq)
+	}
+}
+
+// handleConfigPayload processes a decoded config-sync payload, whether it
+// arrived in the clear (syncMsgConfig) or sealed (syncMsgConfigEncrypted,
+// #6629). Both arms funnel here because the receiver-side ordering, the
+// generation high-water accounting and the apply-queue admission must be
+// identical for the two — a divergence between them is always a bug, so the
+// behaviour is single-sourced rather than duplicated and kept in agreement.
+func (s *SessionSync) handleConfigPayload(payload []byte) {
+	s.stats.ConfigsReceived.Add(1)
+	s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())
+	configText, gen := decodeConfigPayload(payload)
+	s.stats.LastConfigSyncSize.Store(uint64(len(configText)))
+	slog.Info("cluster sync: config received from peer", "size", len(configText), "gen", gen)
+	// #5563: advance the received-config high-water BEFORE enqueue. This is
+	// the receiver's view of the peer's current committed generation and
+	// gates manual-failover readiness against lastAppliedConfigGen. Record it
+	// even if the enqueue below drops the payload (queue full) so the standby
+	// stays flagged config-stale until the apply actually lands on a re-push.
+	// It stays a monotonic max so a reordered older frame cannot pull it
+	// down. #5084: the load/compare/store moved into recordRecvConfigGen and
+	// is taken under configGenMu — the prior justification here ("the
+	// receiveLoop is single-threaded per connection, so the load/store pair
+	// needs no CAS") holds per connection but there are TWO receive loops,
+	// so a raise driven by one fabric raced resetRecvGen's clear driven by
+	// the other and could re-raise the mark that clear had just zeroed.
+	s.recordRecvConfigGen(gen)
+	// #3931: enqueue onto the single-consumer ordered apply queue instead
+	// of spawning a racing `go OnConfigReceived`. The receiveLoop is
+	// single-threaded per connection, so this preserves receive order;
+	// configApplyLoop then applies only strictly-newer generations. The
+	// enqueue is non-blocking so a slow apply never stalls session sync /
+	// heartbeats on this connection.
+	if s.configApplyCh != nil {
+		select {
+		case s.configApplyCh <- configApplyItem{gen: gen, text: configText}:
+		default:
+			// Ordered apply queue full — practically impossible (commits
+			// are seconds apart, apply is sub-second). Drop with an alarm;
+			// the next commit / reconnect re-push (fresh higher gen)
+			// re-converges the standby.
+			s.stats.Errors.Add(1)
+			slog.Error("cluster sync: config apply queue full, dropping config (will re-converge on next push)", "gen", gen, "size", len(configText))
+		}
 	}
 }

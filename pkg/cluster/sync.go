@@ -126,6 +126,31 @@ const (
 	// Payload: {config_snapshot_protocol_version: u16 LE}, with the #2170
 	// trailing-field discipline so the record can grow.
 	syncMsgPeerCapabilities = 29
+
+	// syncMsgConfigKeyExchange carries the SENDER's ephemeral X25519 public
+	// key for config-payload encryption (#6629). Sent once per installed
+	// connection, right beside the capabilities advertisement.
+	//
+	// Payload: {version: u8, x25519_public_key: [32]byte}, with the #2170
+	// trailing-field discipline so the record can grow.
+	syncMsgConfigKeyExchange = 30
+
+	// syncMsgConfigEncrypted is a syncMsgConfig payload sealed under the key
+	// derived from that exchange (#6629). Its plaintext is byte-identical to
+	// the syncMsgConfig payload — the same encodeConfigPayload framing,
+	// generation trailer included — so the receive path is shared and cannot
+	// drift between the two.
+	//
+	// Payload: {version: u8, nonce: [12]byte, AES-256-GCM(ciphertext||tag)}.
+	//
+	// BOTH are ADDITIVE and version-bump-free on the #2239/#6650 precedent
+	// above: the receive switch has no default arm, so a peer that predates
+	// them ignores the exchange, never derives a key, and is sent cleartext
+	// syncMsgConfig exactly as today — with a loud warning naming the
+	// exposure. Bumping CurrentHAProtocolVersion / SessionSyncWireVersion
+	// would make the #1930 INC-3 mixed-base gate falsely refuse SESSION sync
+	// across the very rolling upgrade this must survive.
+	syncMsgConfigEncrypted = 31
 )
 
 // syncHeader is the wire header for each sync message.
@@ -360,6 +385,14 @@ type SessionSync struct {
 	mu        sync.Mutex
 	conn0     net.Conn
 	conn1     net.Conn
+	// configCrypto0/configCrypto1 hold the per-connection ephemeral X25519
+	// state that encrypts the config-sync payload (#6629). They sit here,
+	// beside the conn they belong to and under the same mu, because their
+	// lifetime is exactly a connection's: installConn replaces the slot's
+	// state with a freshly generated keypair and handleDisconnect clears it,
+	// which is what makes a reconnect derive a different key.
+	configCrypto0 *configCryptoState
+	configCrypto1 *configCryptoState
 	// peerIncarnation identifies which run of the peer process the currently
 	// installed connections belong to, and conn0Gen/conn1Gen record the
 	// incarnation each slot's connection was installed under. All three are

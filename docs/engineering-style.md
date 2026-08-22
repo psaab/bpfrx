@@ -542,6 +542,24 @@ they repeatedly bite:
     PARKS on the mutex (futex wait) instead of compounding scheduler
     oversubscription. Every test sharing a given global must take the
     SAME lock.
+  - **A worker thread whose progress the test ASSERTS must reach its
+    first cycle by CONSTRUCTION, not by scheduling — write the loop as
+    a do-while.** A `while !stop { work }` unbounded worker racing a
+    BOUNDED one can be scheduled for the first time only after the
+    bounded side finished and the main thread stored `stop`: zero
+    cycles, and a `cycles >= 1` "we made progress on both sides"
+    precondition trips as a scheduler artifact rather than a
+    regression. `loop { work; if stop { break } }` costs one extra
+    cycle and makes the precondition unfalsifiable by the scheduler
+    (`#3457` in the WG snapshot-atomicity reader; `#6633`
+    `reconcile_churn_until`). Prefer it to a RENDEZVOUS (the bounded
+    thread blocking until the unbounded one publishes a cycle): a
+    rendezvous adds a blocking edge between two test threads, which is
+    how a false red becomes a hang. It also has the better gate — the
+    do-while's contract is deterministic, so calling the helper with
+    `stop` ALREADY set is an exact fail-on-revert
+    (`reconcile_churn_completes_a_cycle_even_when_already_stopped_6633`),
+    which the scheduling assertion it replaces could never be.
   - Prove the ISOLATION variant with a **deterministic fail-on-revert**
     (two barrier-synced threads whose per-thread counter assertion is
     mathematically impossible under a shared global). The mutex GUARD

@@ -239,8 +239,47 @@ func (s *SessionSync) QueueConfig(configText string) {
 	}
 	gen := s.nextConfigGen()
 	payload := encodeConfigPayload(configText, gen)
+	// #6629: the config text is the ACTIVE TREE, rendered unredacted — it
+	// carries every Secret leaf, including `chassis cluster
+	// authentication-key`, the PSK this very link authenticates with. Seal it
+	// under the connection's ephemeral key so a passive observer on the
+	// control segment cannot read it. The plaintext is the payload built
+	// above, byte for byte, so the receiver's decode path is identical.
+	msgType := uint8(syncMsgConfig)
+	encrypted := false
+	if key := s.awaitConfigKey(conn); key != nil {
+		sealed, serr := sealConfigPayload(key, payload)
+		if serr != nil {
+			// Never fail the push on a seal error: config sync is how the
+			// standby converges, and an unconverged standby is a worse
+			// outcome than a readable payload. Fall through to cleartext with
+			// the same warning the mixed-version path emits.
+			slog.Error("cluster sync: could not encrypt config payload; sending CLEARTEXT (#6629)",
+				"err", serr)
+		} else {
+			payload, msgType, encrypted = sealed, uint8(syncMsgConfigEncrypted), true
+		}
+	}
+	if !encrypted {
+		// The mixed-version case, and the one moment the operator can act on
+		// this: a peer that predates #6629 never sends a key exchange, so the
+		// config crosses in the clear exactly as it does today. That is the
+		// correct fallback — refusing would break the rolling upgrade — but it
+		// must not be silent, because an operator running a mixed-version pair
+		// WHILE FIRST KEYING THE CLUSTER is standing in the exposed window.
+		// The key's presence is reported, never the key (config.Secret exists
+		// so it never reaches a log).
+		slog.Warn("cluster sync: sending the config to the peer IN CLEARTEXT — the peer did "+
+			"not negotiate config-payload encryption (older build). Every secret in the "+
+			"active configuration, including the control-link PSK when one is set, is "+
+			"readable by anything that can observe the control segment; upgrade the peer, "+
+			"and rotate the PSK afterwards because any capture taken now still verifies "+
+			"(#6629)",
+			"control_link_key_configured", len(s.authKey()) > 0,
+			"remote", connRemoteAddrString(conn), "gen", gen, "size", len(configText))
+	}
 	s.writeMu.Lock()
-	err := writeMsg(conn, syncMsgConfig, payload)
+	err := writeMsg(conn, msgType, payload)
 	s.writeMu.Unlock()
 	if err != nil {
 		slog.Warn("cluster sync: config send error", "err", err)
@@ -254,7 +293,8 @@ func (s *SessionSync) QueueConfig(configText string) {
 	// reconnect bumps the connection epoch and re-pushes on its own.
 	s.lastSentConfigGen.Store(gen)
 	s.stats.ConfigsSent.Add(1)
-	slog.Info("cluster sync: config sent to peer", "size", len(configText), "gen", gen)
+	slog.Info("cluster sync: config sent to peer", "size", len(configText), "gen", gen,
+		"encrypted", encrypted)
 }
 
 // sendConfigApplyNack tells the SENDER that this node did not apply the config
