@@ -100351,3 +100351,14 @@ prose edit above them added. No diff falls in the new test body.
   scripts/refactoring-audit-classify.sh,
   docs/refactoring-audit-accepted.txt (new), docs/refactoring-audit.md,
   docs/engineering-style.md, Makefile, _Log.md
+
+## 2026-08-21 — #6031 coverage salvage from the closed duplicate #7255
+- **Timestamp**: 2026-08-21
+- **Action**: Carried the 2 genuinely-uncovered contract cases from the closed
+  duplicate onto merged master, reframed for the merged API: an EMPTY
+  table-truth snapshot must still frame a real authoritative window (the #5085
+  empty-bulk skip, one layer down), and an empty owned-RG set is a determinate
+  answer rather than a precondition failure. Dropped 11 as duplicates or as
+  encoding the duplicate's own (in one case destructive) contract.
+- **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
+  pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)
