@@ -1383,6 +1383,37 @@ its logging/inversion intent (#3684):
 
 ---
 
+## Class-of-service entries the dataplane does not install (#6534)
+
+A classifier, rewrite-rule or scheduler-map entry naming a
+forwarding-class that `class-of-service forwarding-classes` does not
+define is SKIPPED by the snapshot builder. The object still installs,
+but PARTIALLY: those code points do not classify, and shaping for that
+class degrades to best-effort. `show class-of-service classifiers`,
+`... rewrite-rules` and `... scheduler-map` annotate the loss:
+
+```
+Classifier: cls, Code point type: dscp
+  Code point  Forwarding class  Loss priority
+  001010      real              low
+  010100      ghost             low
+  NOT INSTALLED: entries for forwarding-class ghost are skipped (no such class under `class-of-service forwarding-classes`)
+```
+
+Unlike the NAT exclusions below, this one is reachable through an
+ordinary `commit`: an undefined forwarding-class reference is only a
+commit-time WARNING, never a strict rejection, so it is a supported
+config shape rather than a lenient-path-only artifact.
+
+Two deliberate non-annotations:
+
+- A scheduler-map entry naming an undefined SCHEDULER is a different
+  edge with the opposite disposition — the entry is KEPT on the wire so
+  the class's queue still materializes — so it is not annotated.
+- `ieee-802.1` rewrite-rules are not published to the dataplane at all,
+  which is a wholesale gap rather than a per-entry skip, so their
+  entries are not annotated as skipped either.
+
 ## Security: NAT rules the dataplane does not install (#6534)
 
 Every `show security nat ...` topic renders rules from the committed
