@@ -1845,8 +1845,10 @@ func ValidateConfig(cfg *Config) []string {
 	// pre_routing_dnat). Today that bypass is SILENT; this advisory makes it LOUD,
 	// naming the rule + the colliding interface address. WARN-only on both compile
 	// paths (valid Junos; works for reply/established traffic; the full dataplane
-	// fix is deferred to Track-2). See docs/nat-destination.md and the converged
-	// plan docs/research/5837-xdp-dnat-before-local/plan.md §0a.
+	// fix is NOT planned — Track-2 was #6051, plan-killed). See
+	// docs/nat-destination.md and the preserved plan
+	// docs/research/5837-xdp-dnat-before-local/plan.md §0a on branch
+	// research/5837-xdp-dnat-before-local.
 	warnings = append(warnings, validateNATInterfaceAddressCollisionWarnings(cfg)...)
 
 	return warnings
