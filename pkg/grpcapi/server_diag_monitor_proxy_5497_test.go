@@ -108,15 +108,24 @@ func TestMonitorRequestForwardedFromPeer(t *testing.T) {
 	if monitorRequestForwardedFromPeer(context.Background()) {
 		t.Error("bare context must not be treated as forwarded-from-peer")
 	}
-	ctx := metadata.NewIncomingContext(context.Background(),
-		metadata.MD{monitorNoPeerMarker: []string{"1"}})
+	// #5883: the marker is honored only when the FABRIC listener's interceptor
+	// promotes it, so build the context through that interceptor rather than
+	// stuffing raw incoming metadata — which a client could do too, and which
+	// is the forgeability #5883 reported.
+	ctx := fabricMarkerCtx(t, metadata.MD{monitorNoPeerMarker: []string{"1"}})
 	if !monitorRequestForwardedFromPeer(ctx) {
-		t.Errorf("incoming metadata carrying %q must be detected as forwarded-from-peer", monitorNoPeerMarker)
+		t.Errorf("a peer-forwarded request carrying %q must be detected as forwarded-from-peer", monitorNoPeerMarker)
 	}
 	// A request WITHOUT the marker (original client call) must proxy normally.
-	ctxNoMarker := metadata.NewIncomingContext(context.Background(), metadata.MD{"other": []string{"x"}})
+	ctxNoMarker := fabricMarkerCtx(t, metadata.MD{"other": []string{"x"}})
 	if monitorRequestForwardedFromPeer(ctxNoMarker) {
 		t.Error("unrelated metadata must not be treated as forwarded-from-peer")
+	}
+	// #5883: the same header on the LOOPBACK listener, which no peer dials,
+	// must NOT be honored. Without this the test passes on a build that trusts
+	// any caller's header.
+	if monitorRequestForwardedFromPeer(fabricMarkerCtxUntrusted(t, metadata.MD{monitorNoPeerMarker: []string{"1"}})) {
+		t.Errorf("a client-supplied %q on the loopback listener was honored", monitorNoPeerMarker)
 	}
 }
 

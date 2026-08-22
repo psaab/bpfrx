@@ -1,3 +1,217 @@
+## 2026-08-21 — #5804: gre-performance-acceleration was reported as enabled while doing nothing
+
+- **Timestamp**: 2026-08-21 (fix/5804-gre-acceleration-advisory)
+- **Action**: Added the #2078/#4231 accepted-only commit advisory for
+  `security flow gre-performance-acceleration` and qualified both `show
+  security flow` surfaces, so the knob stops reading as a feature in force.
+- **File(s)**: `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/gre_acceleration_advisory_5804_test.go` (new),
+  `pkg/cli/cli_show_flow.go`, `pkg/grpcapi/server_show_flow.go`,
+  `pkg/grpcapi/show_flow_gre_5804_test.go` (new), `docs/feature-gaps.md`
+
+  The flag reaches `ForwardingState.gre_acceleration` and stops; no packet path
+  reads it. GRE is protocol 47 with no L4 ports, the shim stamps
+  `flow_src_port = flow_dst_port = 0`, and `SessionKey` has no tunnel
+  discriminator — so two GRE/PPTP tunnels between the same outer endpoints
+  share one session and its policy decision, NAT state, counters and timeout.
+  An operator enabling the knob is asking for exactly the opposite.
+
+  Every other accepted-only knob in the tree already warns (#2078 tcp-session,
+  #4231 flow knobs, #4299 vpn-monitor). This one did not, and the two `show`
+  surfaces printed an unqualified `enabled`, which is the stronger claim of the
+  two: commit output scrolls past, `show` is what an operator reads on a box
+  someone else configured. The advisory names the consequence rather than
+  saying "no effect" — a test asserts the wording contains both `5-tuple` and
+  `one session`, so a future edit cannot quietly reduce it to a generic
+  not-enforced line.
+
+  Mutation proof, each one line, each at a production-reachable site:
+  - `if flow.GREPerformanceAcceleration {` -> `if false && ...` in
+    validateSecurityFlowAcceptedOnly — exit=1, "no advisory names the knob";
+  - collapse the advisory text to a generic "does not enforce it" — exit=1,
+    both wording assertions red, quoting the weakened string.
+  Negative control in the same file: a config that does not set the knob must
+  not be warned about it, and the `show` test asserts no line is rendered when
+  it is unset, so neither fix is satisfiable by emitting unconditionally.
+
+  Control: `go test -count=1 ./pkg/config/ ./pkg/cli/ ./pkg/grpcapi/` exit=0,
+  `go vet` clean, `go build ./...` clean. Go-only; no dataplane binary moves,
+  so no cluster smoke is owed. The dataplane feature is #7188 and retires both
+  the advisory and the `show` qualifier.
+## 2026-08-21 — #5858: tightening an interface input filter reported clean while established sessions kept forwarding
+
+- **Timestamp**: 2026-08-21 (fix/5858-filter-change-advisory)
+- **Action**: Added a commit-time advisory when a commit attaches or tightens an
+  interface INPUT filter that can deny, and bound it to the existing policy
+  invalidation through one entry point so a commit path cannot wire one without
+  the other.
+- **File(s)**: `pkg/daemon/daemon_filter_invalidate_5858.go` (new),
+  `pkg/daemon/daemon_filter_invalidate_5858_test.go` (new),
+  `pkg/daemon/daemon_apply_commit.go`, `docs/sync-protocol.md`,
+  `docs/feature-gaps.md`
+
+  The session-hit fast path re-evaluates an input filter only when its match
+  semantics genuinely vary per packet (DSCP / per-packet L4). A purely static
+  address/protocol/port `then discard` added after a session exists is never
+  rechecked, so that flow forwards until it idles out.
+
+  The asymmetry is what makes it a defect rather than a known limitation:
+  tightening a POLICY revokes established sessions at commit
+  (clearSessionsForPolicyChanges — the #4234 deletion clear, the modified-policy
+  re-eval, the #4342 default-policy clear), and tightening an interface FILTER
+  does not, though the exposure is the same class. An operator who has watched a
+  policy tightening take effect immediately has every reason to expect the same.
+
+  NOT the policy-style clear, deliberately. Two rounds of hostile plan review on
+  #5858 killed it and both reasons re-verify: the policy clear drops sessions
+  ATTRIBUTED to the changed policy, while an interface clear would drop every
+  session INGRESSING that interface — on a WAN, all transit traffic, for a filter
+  change that may deny none of it; and dropping permitted flows is not free,
+  because the non-persistent PAT allocator hands out a fresh monotonic-cursor
+  port before draining the recycle FIFO, so a purged-then-recreated permitted
+  SNAT flow reinstalls on a DIFFERENT translated port and breaks. Revoking
+  authorization the operator removed is correct; breaking flows they did not
+  touch is not. The correct fix is per-tuple revalidation in the Rust dataplane
+  and is tracked separately.
+
+  The advisory rides `newCfg.Warnings`, which CommitResponse,
+  CommitConfirmedResponse and the REST commit response all carry — so it lands
+  on the operator's terminal at commit, not only in the journal. It appends
+  AFTER applyConfigLocked has logged cfg.Warnings, so there is no double log.
+
+  Noise discipline is load-bearing: a filter with no discard/reject term cannot
+  revoke anything, a detach is strictly loosening, and an unchanged filter was
+  already in force — all three stay silent, because a commit warning an operator
+  cannot act on is one they learn to ignore. filterCanDeny reads BOTH `Action`
+  and `TerminalActions`: Action is last-write-wins, so a term with
+  `then discard` followed by `then accept` would otherwise be misread as
+  harmless.
+
+  Mutation proof, four:
+  - name-only comparison (drop the DeepEqual on the definition) — exit=1,
+    editing an already-attached filter goes unreported, which is the common case;
+  - read `Action` only — exit=1, the mixed-terminal-actions term is misclassified;
+  - drop the can-deny gate — exit=1, the accept-only control fires a false alarm;
+  - drop the call from reportSessionAuthorizationChanges — exit=1 on the WIRING
+    test alone, while every direct-call test still passes. That mutation is why
+    the entry point exists.
+
+  Control: `go test -count=1 ./pkg/daemon/` exit=0, `go vet` clean. Go-only; no
+  dataplane binary moves, so no cluster smoke is owed.
+## 2026-08-21 — #5842: positional interface naming reported success on a boot that renamed nothing
+
+- **Timestamp**: 2026-08-21 (fix/5842-positional-rename-errors)
+- **Action**: Gave the positional naming path an error channel — `.link` write,
+  rename, and `networkctl reload` failures now aggregate and propagate out of
+  `enumerateAndRenameInterfaces`, mirroring the device-map path's #4956
+  `renameErrs`.
+- **File(s)**: `pkg/daemon/linksetup.go`, `pkg/daemon/device_map.go`,
+  `pkg/daemon/bootstrap.go`,
+  `pkg/daemon/linksetup_rename_err_5842_test.go` (new),
+  `pkg/daemon/README.md`, plus mechanical signature updates in three test files.
+
+  `enumerateAndRenameInterfaces` returned nil unconditionally. Three sites
+  laundered: `renamePositional` returned only a `changed bool` and swallowed
+  every rename error into a WARN; `writeLinkFile` / `writeBootstrapFxp0Network`
+  returned `false` for BOTH "unchanged" and "write failed" — opposite facts
+  under one value, so no caller could have reported the second even if it
+  wanted to; and the `networkctl reload` error was logged and dropped.
+
+  The consequence is not a logging nit. `maybeReapplyConfigArrivalNaming`
+  consumes the one-shot `emptyHANamingPending` marker only when
+  `applyStartupNamingForConfig` returns nil, and positional mode always
+  returned nil — so a #4179 config-less HA node whose renames all failed burned
+  its single retry and stayed on standalone names until a restart. That is
+  precisely the failure #4956 fixed for the MAPPED path, left open on the
+  DEFAULT one.
+
+  The pass still completes on a failure rather than abandoning midway: a
+  half-renamed NIC set is worse than a finished-and-reported one. RSS
+  indirection still runs unconditionally — it is best-effort tuning, and
+  skipping it on a naming error would turn a naming fault into a throughput
+  fault.
+
+  `enumerateAndRenameInterfaces` now reaches its NIC inventory, rename, and
+  reload through the existing injectable seams (`enumeratePCINICsFn`,
+  `renameInterfaceFn`, `networkctlReloadFn`) that the device-map path already
+  used, so the error channel is testable end to end rather than per-helper.
+
+  Mutation proof, three, each one line:
+  - launder the aggregate back to `return nil` — exit=1, three tests red
+    including "the one-shot retry marker was consumed even though naming did
+    not converge";
+  - drop only the rename error inside `renamePositional` — exit=1, so the
+    aggregate is not satisfied by the reload error alone;
+  - make a failed `writeLinkFile` return a nil error — exit=1, "indistinguishable
+    from 'unchanged'".
+  Controls in the same file: a clean pass must return nil, and the marker MUST
+  be consumed on success, so the fix is not satisfiable by always erroring or
+  by never consuming.
+
+  Control: `go test -count=1 ./pkg/daemon/` exit=0, `go vet ./pkg/daemon/`
+  clean, `go build ./...` clean. Go-only; no dataplane binary moves, so no
+  cluster smoke is owed.
+## 2026-08-21 — #5883: peer hop markers were caller-settable headers
+
+- **Timestamp**: 2026-08-21 (fix/5883-peer-marker-capability)
+- **Action**: Replaced the raw-metadata reads of `x-peer-forwarded` /
+  `xpf-no-peer` with an in-process capability that only the fabric listener's
+  post-auth interceptor can set, and stripped both keys at every listener.
+- **File(s)**: `pkg/grpcapi/peer_marker_5883.go` (new),
+  `pkg/grpcapi/peer_marker_5883_test.go` (new), `pkg/grpcapi/server.go`,
+  `pkg/grpcapi/server_helpers.go`, `pkg/grpcapi/server_sessions.go`,
+  `pkg/grpcapi/server_show_cluster_text.go`,
+  `pkg/grpcapi/server_diag_monitor.go`, `pkg/grpcapi/README.md`, and four
+  retargeted tests.
+
+  Both markers exist to bound forwarding to one hop, and every handler that
+  reads one uses it to SUPPRESS work. Read by presence off incoming metadata,
+  they were assertions a caller could make about itself: claim to be a
+  forwarded peer request and the node skips the peer half of a cluster-wide
+  clear while still reporting success, leaving sessions alive on the peer to
+  come back on failback.
+
+  The fix is not to authenticate the header — it is to stop the header being
+  the carrier. Trust is a property of WHICH LISTENER received the call. The
+  fabric listener is the only one a peer dials; its chain is
+  `fabricAuth -> fabricAllowlist -> peerMarker(trust=true)`, in that order, so
+  the promotion happens only on a call #4107 auth already accepted. The
+  loopback listener promotes nothing. Both then strip the keys, so a handler
+  reaching for the raw header finds nothing — `server_sessions.go` was exactly
+  such a site, reading `md.Get("x-peer-forwarded")` instead of the helper.
+
+  `xpf-no-peer` was never named in #5883, which called out only
+  `x-peer-forwarded`. It is the same mechanism on the show and monitor
+  proxies, and `MonitorInterface` is a STREAMING RPC — a unary-only fix would
+  have left it forgeable, the same shape as the #3908 gap after #3082. One
+  interceptor pair covers both, and `reservedPeerMetadataKeys` is the single
+  source of truth for the strip and the promote so they cannot drift.
+
+  Absent capability defaults to false for both markers, which is the safe
+  direction: false means "do the peer work", so a stripped or forged header
+  can only cause MORE work to be attempted, never less. On an unkeyed cluster
+  fabric auth still fails open (#4107 dual-accept), so behaviour there is
+  unchanged — an attacker on that segment could already call ClearSessions
+  WITHOUT the header for a strictly more destructive cluster-wide clear.
+
+  `Test_PeerCallSkipsDialBack` RE-IMPLEMENTED the predicate inline rather than
+  calling it, so it asserted its own copy and could not have noticed the
+  forgeability. Retargeted through the production interceptor with a
+  forged-on-loopback row.
+
+  Mutation proof, four, each one line:
+  - `if trust {` -> `if true {` (restore the forgeable read) — exit=1, four
+    tests red including the retargeted `Test_PeerCallSkipsDialBack/forged_on_loopback`;
+  - drop the strip — exit=1, both reserved keys survive on both listeners;
+  - `if trust {` -> `if false {` (degenerate to always-false) — exit=1, seven
+    positive controls red, so the fix is not satisfiable by returning false;
+  - `loopbackServerInterceptors` -> `return nil, nil` — exit=1. That mutation
+    is why the seam exists: every other test drives the interceptor directly
+    and would pass on a build where the listener never installs it.
+
+  Control: `go test -count=1 ./pkg/grpcapi/ ./pkg/api/ ./pkg/cli/ ./pkg/daemon/`
+  exit=0, `go vet` clean. Go-only; no dataplane binary moves, so no cluster
+  smoke is owed.
 ## 2026-08-21 — #6218 audit cohort: 7 fixed, plus #7197 (nil-deref DoS found while fixing #6218 item 13)
 
 - **Timestamp**: 2026-08-21 (fix/6218-audit-cohort-survivors)
@@ -98713,6 +98927,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/schema_slot_escape_fixtures_test.go,
   pkg/configstore/nat_match_address_no_brick_7145_test.go,
   docs/config-schema.md, docs/userspace-dnat-plan.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #7223 — eventengine within-clause trigger-on crossing suppressed
+  by clause ORDER. Filed as the successor to the A9 F4 row of #5250, whose
+  close rationale ("re-arms an edge trigger slightly early rather than blocking
+  a fire") is disproved by a runnable reproduction: the mid-loop `return` means
+  the loosest clause only clears the latch if the walk REACHES it, so a
+  stricter clause earlier in the list blocks the fire outright. `withinMatches`
+  split into three passes — validity, re-arm/latch over ALL trigger-on clauses,
+  trigger-until — so no verdict depends on clause order.
+  Validation: `go test -count=1 ./pkg/eventengine/` green; restoring engine.go
+  from origin/master reds the order-independence test with
+  "long-window-first fired at [2], short-window-first fired at [2 102]".
+- **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/README.md,
+  pkg/eventengine/within_clause_order_7223_test.go, _Log.md
 
 ## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
 
