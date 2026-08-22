@@ -26,9 +26,35 @@ func RenderStatic(w io.Writer, cfg *config.Config) {
 			} else {
 				fmt.Fprintf(w, "    Then static-nat prefix:    %s\n", rule.Then)
 			}
+			noteNotInstalledStatic(w, staticRuleNotInstalledReason(rs, rule))
 		}
 		io.WriteString(w, "\n")
 	}
+}
+
+// staticRuleNotInstalledReason reports why the userspace snapshot builder does
+// not install a rule from a static NAT rule-set, or "" when it does.
+//
+// Static rule-sets carry BOTH plain static-NAT rules and NPTv6 rules, and the
+// builder splits them into two collections with two DIFFERENT exclusion
+// predicates: buildStaticNATSnapshots skips every IsNPTv6 rule and applies
+// config.StaticNATRuleExcludedReason to the rest, while buildNPTv6Snapshots
+// takes only the IsNPTv6 rules and drops those config.NPTv6ScopeUnsupported
+// rejects (#5818). Asking one predicate about both kinds would annotate the
+// wrong half.
+func staticRuleNotInstalledReason(rs *config.StaticNATRuleSet, rule *config.StaticNATRule) string {
+	if rule == nil {
+		return ""
+	}
+	if rule.IsNPTv6 {
+		if config.NPTv6ScopeUnsupported(rs, rule) {
+			return "NPTv6 rule carries a match scope the dataplane cannot honor " +
+				"(from-interface / from-routing-instance / source-address / destination-port); " +
+				"installing it would widen the rewrite"
+		}
+		return ""
+	}
+	return config.StaticNATRuleExcludedReason(rule)
 }
 
 // RenderStaticRule renders `show security nat static rule [detail]` — the
@@ -62,6 +88,7 @@ func RenderStaticRule(w io.Writer, cfg *config.Config, detail bool) {
 			} else {
 				fmt.Fprintf(w, "    Then static-nat prefix:    %s\n", rule.Then)
 			}
+			noteNotInstalledStatic(w, staticRuleNotInstalledReason(rs, rule))
 			if !detail {
 				continue
 			}
@@ -105,6 +132,12 @@ func RenderNPTv6(w io.Writer, cfg *config.Config) {
 			}
 			fmt.Fprintf(w, "%-20s %-20s %-50s %-50s\n",
 				rs.Name, rule.Name, rule.Match, rule.Then)
+			// #6534: #5818 DROPS a scope-carrying NPTv6 rule from the
+			// snapshot. Hung under the row rather than added as a fifth
+			// column so an all-healthy table stays byte-identical.
+			if reason := staticRuleNotInstalledReason(rs, rule); reason != "" {
+				fmt.Fprintf(w, "%-20s %-20s NOT INSTALLED — %s\n", "", "", reason)
+			}
 		}
 	}
 	if !found {

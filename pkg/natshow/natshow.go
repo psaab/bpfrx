@@ -51,6 +51,38 @@ func noteSessionScanError(w io.Writer, err error) {
 	}
 }
 
+// noteNotInstalled emits the #6534 exclusion annotation for a NAT object the
+// userspace snapshot builder drops or disarms. reason is the operator-facing
+// text from the shared pkg/config predicate that the BUILDER also consults, so
+// the annotation cannot claim something the dataplane disagrees with.
+//
+// Nothing is printed when reason is empty, so an installed rule's output is
+// byte-identical to the pre-#6534 form — the golden tests on both consumers
+// keep asserting the same bytes for every healthy config, and only a rule the
+// dataplane is genuinely not enforcing gains a line.
+//
+// The wording leads with NOT INSTALLED rather than appending a parenthetical to
+// the Action line: an operator scanning a long rule list is looking down the
+// left margin, and a rule that is silently unenforced is exactly the thing that
+// must not read as a footnote.
+func noteNotInstalled(w io.Writer, reason string) {
+	if reason == "" {
+		return
+	}
+	fmt.Fprintf(w, "    Status:                  NOT INSTALLED — %s\n", reason)
+}
+
+// noteNotInstalledStatic is noteNotInstalled at the static-NAT renderers' wider
+// label column ("Match destination-address:" / "Then static-nat prefix:"), so
+// the annotation lines up with the fields it is qualifying instead of hanging
+// four columns short of them.
+func noteNotInstalledStatic(w io.Writer, reason string) {
+	if reason == "" {
+		return
+	}
+	fmt.Fprintf(w, "    Status:                    NOT INSTALLED — %s\n", reason)
+}
+
 // Reader is the narrow dataplane surface the NAT renderers need. Both
 // the gRPC grpcRuntime (pkg/grpcapi/runtime.go) and the CLI cliRuntime
 // (pkg/cli/runtime.go) already satisfy it structurally. A nil Reader is

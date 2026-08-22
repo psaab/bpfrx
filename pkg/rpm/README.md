@@ -64,6 +64,27 @@ out-of-range value to a warning.
 
 ## Gotchas
 
+- **`Apply` restarts every probe, but no longer wipes every verdict
+  (#6561).** It reallocates the results table (`StopAll`) and reseeds
+  each key `LastStatus: "unknown"`. ip-monitoring reads `"unknown"` as
+  PASS (`seedResultsLocked` buckets it with pass), so at the default
+  `hold-down` of 0 that used to withdraw an ACTIVE failover route on the
+  spot — and the trigger was not an RPM edit: `reconcileRPM`'s hash
+  covers `cfg.RethToPhysical()`, so any RETH-member change reopened the
+  gate. `Apply` now snapshots the prior results first and carries a
+  test's runtime state forward when `probeMeasurementIdentity` — probe
+  type, target, source, routing-instance, next-hop, and the destination
+  interface AFTER RETH translation — is unchanged. A new test, a
+  retargeted one, or one whose path moved correctly keeps `"unknown"`;
+  a key the config dropped stays ABSENT, which ip-monitoring needs to
+  keep distinct so it can clear a stale FAIL (#4423 M8).
+- The identity is a resolved PATH, deliberately not the fwmark:
+  `routing.BuildProbePins` assigns `ProbeFwmarkBase + idx` over sorted
+  probe/test names, so the mark is a POSITION in the pin band — it does
+  not move on a RETH remap and does move when an unrelated test sorts
+  earlier.
+
+
 - **The first probe cycle runs immediately** (`runProbeLoop` before the ticker
   loop), so a `ping_probe_failed` / `ping_test_failed` / `ping_test_completed`
   can be emitted the instant `Apply` starts a probe. The daemon wires the
