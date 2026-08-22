@@ -103777,3 +103777,14 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
   `pkg/cluster/manager.go`,
   `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)
+
+## 2026-08-22 — #6731 ip-monitoring next-hop interface-class test
+- **Action**: Replaced the raw prefix tests in
+  `resolveIPMonitoringInterfaceNextHop` with `IsTunnelOrLoopbackIfName`, a
+  canonical name-class predicate. `HasPrefix(name,"lo")` also matched `login0`,
+  `"st"` matched `start0`, `"fti"` matched `ftime0` and `"gr-"` matched
+  `gr-eenwich` — ordinary data interfaces refused as tunnels. Each namespace now
+  uses the rule the tree already uses to resolve a device in it.
+- **File(s)**: `pkg/config/ifname_class_6731.go` (new),
+  `pkg/config/compiler_services.go`,
+  `pkg/config/ipmon_nexthop_ifclass_6731_test.go` (new), `docs/multi-wan.md`
