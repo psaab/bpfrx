@@ -118,18 +118,45 @@ func applyStartupNamingPolicy(cfg *config.Config, nodeID int, clusterMode bool,
 //     pre-rename kernel name (e.g. ens3 on a fresh first map). Keep it; do NOT
 //     synthesize an enpXsY name, which would not match udev on next boot
 //     (AGY r3 MAJOR).
-func deviceMapOriginalNameFor(currentNIC, logical string) string {
+//
+// The bool reports whether a udev-matchable name was found. It is FALSE only
+// in the recovery branch when the derivation comes back empty (#6678): there
+// the NIC already wears its logical name, and the logical name is precisely
+// what udev will never present. Returning it — as this did — writes a .link
+// whose OriginalName= cannot match, so boot-time persistence fails SILENTLY:
+// the file exists, the name looks plausible, and nothing matches. Every other
+// consumer of an empty derivation treats it as a clean skip
+// (ensureRethLinkOriginalName returns without rewriting), and this was the one
+// place that converted "I could not derive a name" into "here is a name".
+//
+// The caller must not write a .link for a NIC this reports false for. Leaving
+// the NIC under its kernel name is a state the rest of the daemon understands;
+// a .link that silently never matches is not.
+func deviceMapOriginalNameFor(currentNIC, logical string) (string, bool) {
 	orig := recoverOriginalName(currentNIC)
 	if orig != currentNIC {
-		return orig // an existing .link chain recorded the true original
+		return orig, true // an existing .link chain recorded the true original
 	}
 	if currentNIC == logical {
-		if dk := deriveKernelNameFn(currentNIC); dk != "" {
-			return dk
+		dk := deriveKernelNameFn(currentNIC)
+		if dk == "" {
+			return "", false
 		}
+		return dk, true
 	}
-	return currentNIC
+	return currentNIC, true
 }
+
+// deviceMapOriginalUnknown marks, inside originalByCurrent, a bound NIC whose
+// true pre-rename kernel name could not be derived (#6678).
+//
+// It is carried as a VALUE rather than in a separate set because
+// breakNameCollisions re-keys originalByCurrent across the temp rename and
+// only rewrites KEYS — a sentinel value survives that untouched, so this needs
+// no signature change to a helper the positional rename path shares. The NUL
+// prefix makes it unrepresentable as an interface name, so it can never be
+// confused with one or silently written into a .link.
+const deviceMapOriginalUnknown = "\x00xpf-original-unknown"
 
 // enumerateAndRenameMapped is the device-map-mode replacement for
 // enumerateAndRenameInterfaces. It renames ONLY mapped NICs to their bound
@@ -210,7 +237,11 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		switch {
 		case b.Status.Bound():
 			desiredByCurrent[b.CurrentNIC] = b.Logical
-			originalByCurrent[b.CurrentNIC] = deviceMapOriginalNameFor(b.CurrentNIC, b.Logical)
+			if orig, ok := deviceMapOriginalNameFor(b.CurrentNIC, b.Logical); ok {
+				originalByCurrent[b.CurrentNIC] = orig
+			} else {
+				originalByCurrent[b.CurrentNIC] = deviceMapOriginalUnknown
+			}
 			desiredNames[b.Logical] = true
 			slog.Info("device-map: resolved binding",
 				"logical", b.Entry.LogicalName, "current", b.CurrentNIC, "status", b.Status.String())
@@ -266,6 +297,36 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		original := originalByCurrent[current]
 		if original == "" {
 			original = recoverOriginalName(current)
+		}
+		if original == deviceMapOriginalUnknown {
+			// #6678: no udev-matchable pre-rename name exists for this NIC.
+			// Writing a .link anyway would record an OriginalName= udev never
+			// presents, so the file would silently never match and this NIC
+			// would come up unnamed on the next boot with nothing to point at.
+			// Decline to write it and report on the SAME channel as a .link
+			// that failed to land (#5842) — the next-boot consequence is
+			// identical, and it must be loud now rather than discovered on a
+			// machine nobody is watching.
+			slog.Error("device-map: cannot determine the pre-rename kernel name for a "+
+				"bound NIC; refusing to write a .link whose OriginalName= could never "+
+				"match. This NIC will come up under its kernel name on the next boot.",
+				"current", current, "logical", final)
+			renameErrs = append(renameErrs,
+				fmt.Errorf("device-map: no udev-matchable OriginalName for %s (logical %s); "+
+					"boot-time persistence not established", current, final))
+			if current == final {
+				continue
+			}
+			if err := renameInterfaceFn(current, final); err != nil {
+				slog.Warn("device-map: rename failed", "from", current, "to", final, "err", err)
+				renameErrs = append(renameErrs,
+					fmt.Errorf("rename %s -> %s: %w", current, final, err))
+			} else {
+				slog.Info("device-map: renamed interface (no .link written)",
+					"from", current, "to", final)
+				changed = true
+			}
+			continue
 		}
 		if current == final {
 			// Ensure a .link exists for boot persistence even when the name
