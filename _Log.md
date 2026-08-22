@@ -104091,3 +104091,30 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/ddns/state.go, pkg/ddns/surface_a.go, pkg/ddns/manager.go,
   pkg/ddns/cross_surface_authority_6755_test.go,
   pkg/ddns/cross_surface_clobber_5748_test.go
+
+## 2026-08-22 — #6752 half-open flow no longer holds the established window
+- **Action**: Promotion is on the reverse SYN-ACK, not the final ACK, so the
+  reverse half jumped to the 300s class immediately; #4109 deliberately did not
+  extend the forward half and said so, and #4380's handshake-agnostic companion
+  probe (three days later) falsified that by re-stamping the forward half off
+  the reverse half's fresh 300s window. Both halves of a never-completed
+  handshake persisted ~300s. Added node-local `SessionEntry.handshake_pending`
+  (set on both halves by the SYN-ACK, cleared by the handshake-completing
+  forward segment); the idle-window selection now uses
+  `established && !handshake_pending`, and `companion_keeps_alive` refuses to
+  extend a half whose companion is still pending. The two close
+  DIFFERENT-SIZED leaks and an early draft overstated this: a mutation showed
+  the class change alone already reaps both halves at ~20s, so the probe refusal
+  closes the smaller retransmission-driven leak (a server retransmitting its
+  SYN-ACK slides the reverse half's window forward and the handshake-agnostic
+  probe re-stamps the forward half off it). A third test cell was added to
+  exercise it, since the first two could not. Verified the completing segment is
+  guaranteed to reach the slow path: `packet_eligible`/`should_cache` admit TCP
+  to the flow cache only when `is_ack_only`, so neither the SYN nor the SYN-ACK
+  seeds an entry and the final ACK is a cache miss. Rewrote #4109's now-false
+  comment and the README claim rather than leaving them asserting a guarantee
+  the code did not provide.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/expire.rs, userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md

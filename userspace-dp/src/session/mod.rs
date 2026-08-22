@@ -385,6 +385,41 @@ struct SessionEntry {
     /// Close-delta propagation, not its own OPENING window. No wire-format
     /// change.
     established: bool,
+    /// #6752: `established` was set by the reverse SYN-ACK, so it does NOT mean
+    /// the three-way handshake COMPLETED. This bit is the gap: true from the
+    /// moment the SYN-ACK promotes the flow until the handshake-completing
+    /// forward segment arrives.
+    ///
+    /// It exists because two correct changes combined into an incorrect
+    /// outcome. #4109 (2026-07-04) promoted on the SYN-ACK and deliberately did
+    /// NOT extend the forward half's expiry, "so a handshake the client never
+    /// completes still reaps on the short opening window". #4380 (2026-07-07)
+    /// then added the companion probe, which is protocol- and
+    /// handshake-agnostic: at the forward half's 20s deadline it saw the
+    /// reverse half alive on its brand-new 300s window, kept the forward half
+    /// and re-stamped it. Neither change was wrong; together they held BOTH
+    /// halves of a never-completed handshake for ~300s, and #4109's comment
+    /// went on asserting the conservative behaviour, which is why nobody
+    /// re-checked it.
+    ///
+    /// Two things consult it, and they close DIFFERENT-SIZED leaks — stated
+    /// separately because an earlier revision of this comment claimed both were
+    /// needed for the 300s case, and a mutation showed that was false:
+    ///   * the idle-window selection treats `established && !handshake_pending`
+    ///     as the established class, so the SYN-ACK stamps the OPENING window
+    ///     rather than 300s. THIS is what closes the ~300s hold; with it in
+    ///     place and no further traffic, both halves reap at ~20s on their own.
+    ///   * `companion_keeps_alive` refuses to extend a half whose companion is
+    ///     still pending. This closes a SMALLER, retransmission-driven leak: a
+    ///     server retransmitting its SYN-ACK slides the reverse half's window
+    ///     forward, and a handshake-agnostic probe would re-stamp the forward
+    ///     half off it for as long as the retransmissions continue
+    ///     (`retransmitted_synack_does_not_resurrect_the_forward_half_6752`).
+    ///
+    /// Node-local derived state, like `established`: `SessionEntry` is not
+    /// serialized, so this is not on any wire and an HA peer re-derives it from
+    /// the segments it sees.
+    handshake_pending: bool,
     /// #965: absolute wheel tick at which this session is scheduled to
     /// be checked for expiration. Updated on every push to the wheel.
     /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
@@ -1318,6 +1353,7 @@ impl SessionTable {
         close: bool,
         reset: bool,
         established: bool,
+        handshake_completed: bool,
     ) {
         let companion_key = reverse_session_key(matched_key, matched_nat);
         let mut shortened = false;
@@ -1327,10 +1363,28 @@ impl SessionTable {
                 // half — promote the forward companion too. Sticky and flag-only:
                 // the companion's own next segment (the handshake-completing
                 // forward ACK) re-stamps the established idle window via
-                // `session_timeout_ns(established=true)`. We deliberately do NOT
-                // extend its expiry here so a handshake the client never
-                // completes still reaps on the short opening window.
+                // `session_timeout_ns(established=true)`.
+                //
+                // #6752: the expiry is still not extended here, and #4109's
+                // comment used to justify that with "so a handshake the client
+                // never completes still reaps on the short opening window".
+                // THAT STOPPED BEING TRUE three days after it was written.
+                // #4380's companion probe is handshake-agnostic: it saw the
+                // reverse half alive on the 300s window the SYN-ACK had just
+                // stamped, kept this half, and re-stamped it — so both halves
+                // held for ~300s. Not extending here was never sufficient on its
+                // own; `handshake_pending` is what makes the claim true again,
+                // by keeping BOTH halves in the opening class and by stopping
+                // the probe from extending either.
                 entry.established = true;
+                entry.handshake_pending = true;
+            }
+            if handshake_completed {
+                // #6752: the matched (forward) half saw the completing segment;
+                // clear the companion's gap too, so the probe may extend this
+                // flow again and the reverse half's next segment stamps the
+                // established window.
+                entry.handshake_pending = false;
             }
             if close {
                 // F17: a FIN/RST on one half kills the whole flow. Stamp the

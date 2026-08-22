@@ -161,6 +161,8 @@ impl SessionTable {
                 // pre-#3152 full-established-timeout behaviour. Computed once
                 // here and reused for the initial timeout selection.
                 established: !(matches!(protocol, PROTO_TCP) && is_initial_syn(tcp_flags)),
+                // #6752: a fresh install has seen no SYN-ACK, so nothing is pending.
+                handshake_pending: false,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
@@ -389,6 +391,10 @@ impl SessionTable {
                 // `established` field is node-local and never crosses the HA
                 // wire, so this is a pure import-side decision (no wire change).
                 established: true,
+                // #6752: a mid-stream pickup is seeded ESTABLISHED with no handshake
+                // to wait for — pending must stay false or it would be held on the
+                // opening window forever.
+                handshake_pending: false,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
