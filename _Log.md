@@ -100362,3 +100362,15 @@ prose edit above them added. No diff falls in the new test body.
   encoding the duplicate's own (in one case destructive) contract.
 - **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
   pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)
+
+## 2026-08-21 — #7257: heartbeat start/stop lifecycle tenure
+- **Timestamp**: 2026-08-21
+- **Action**: `StartHeartbeat` published the sender/receiver under `m.mu`, released
+  the lock, then dereferenced the fields it had just written while `StopHeartbeat`
+  nilled them under the lock. Publish + start now happen in one critical section
+  against locals, and a new `hbEpoch` tenure counter makes a start that a teardown
+  overtook return `ErrHeartbeatStartSuperseded` instead of installing a pair
+  nothing can stop. `startHeartbeatWithRetry` treats the sentinel as terminal.
+- **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/daemon/daemon_ha_sync.go,
+  pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md
