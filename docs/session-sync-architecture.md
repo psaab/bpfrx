@@ -237,16 +237,86 @@ the new bulk is sent.
 
 ### Send Side
 
-`BulkSync()`:
+`doBulkSync()` frames one authoritative window. The window's SESSION SOURCE is
+chosen once, up front:
+
+- **table truth (production, #6031)** — when `SessionSync.BulkSnapshotSource` is
+  wired, `BulkSyncSnapshot()` frames the caller-supplied snapshot;
+- **the backend session store** — otherwise, `BulkSync()` walks
+  `sessions` / `sessions_v6`.
+
+Both then run the SAME lossless send core (`bulkSyncWindow`):
 
 1. allocates a new monotonically increasing epoch
 2. sends `BulkStart(epoch)`
-3. iterates `sessions_v4` / `sessions_v6`
-4. skips reverse entries
-5. skips sessions not owned by this node for the ingress zone
-6. sends forward entries only
-7. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
-8. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
+3. walks the chosen source
+4. stamps the install generation + config epoch on each entry
+5. sends forward entries only
+6. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
+7. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
+
+The store walk (and only the store walk) additionally skips reverse entries and
+sessions whose ingress zone this node does not own. A caller-supplied snapshot is
+framed VERBATIM — see "Why the window is not framed from the BPF mirror" below.
+
+#### Why the window is not framed from the BPF mirror (#6031)
+
+`BulkSync()`'s `ForEachV4/V6` walk reads the pinned `sessions` / `sessions_v6`
+BPF **conntrack** maps. Under the userspace dataplane those maps are a
+best-effort **display mirror**, not the authoritative session set. The Rust
+helper publishes a conntrack row (`publish_bpf_conntrack_entry`) from only three
+sites in `afxdp/poll_descriptor`: the host-inbound (LocalMiss) install, the
+missing-neighbor seed, and the reverse-companion repair. The ordinary **transit**
+forward install — the site labelled "#4800: the single place a locally learned
+transit forward flow is installed" — writes only the shim steering map
+(`publish_live_session_entry`) and the shared session tables. **A transit session
+therefore has no conntrack row at all**, and the store walk cannot see it.
+
+The standby's copy of that same session IS in its mirror, because the Go receive
+path writes it (`userspace.Manager.SetClusterSyncedSessionV4` →
+`bpfShim.SetSessionV4`), and `reconcileStaleSessions` scans exactly that map.
+Since #5085 removed the empty-bulk skip, an eligible session absent from the
+window is DELETED. Framing cold prime from the mirror therefore deleted the
+standby's live peer-owned **transit** sessions — the ones failover depends on —
+on every cold prime, survivor-fabric re-drive, and forced resync. Measured with
+the `pumpBulk` harness at base: the window carried only the host-inbound row and
+the receiver logged `reconcile stale sessions applied stale_v4=1 deleted_v4=1`.
+
+`BulkSnapshotSource` is wired in `startClusterComms` to
+`Daemon.userspaceBulkSnapshot`, which gathers the owner-RG-filtered live set from
+the helper's in-process `SessionTable` via `ExportOwnerRGSessions(rgIDs, 0)`.
+That control request is synchronous — the helper enqueues the export to every
+worker, waits for their acks, and returns the drained delta set in the response
+(`afxdp/ha/export.rs`, `OwnerRgExportWait::wait_and_collect`). `max = 0` requests
+the UNBOUNDED set: a capped export would truncate the window and the peer would
+delete the remainder.
+
+Two invariants hold this together:
+
+- **One admission filter.** The snapshot is built by `walkUserspaceSessionDeltas`
+  — the SAME walk and the SAME `shouldSyncUserspaceDelta` filter the incremental
+  delta stream uses, with a different sink. The standby must end up holding the
+  same set whichever path delivered it, and the window DELETES whatever it omits,
+  so a divergence between the two filters is always a bug. Single-sourcing the
+  walk makes that divergence unrepresentable. This is also why the snapshot is
+  framed verbatim: re-applying the coarser `ShouldSyncZone` filter on top of the
+  owner-RG one could drop an entry the incremental path admits (a fabric-redirect
+  wire alias, or a session whose owner RG this node holds but whose ingress zone
+  maps elsewhere), and that entry would then be deleted on the receiver.
+- **Fail CLOSED.** If the snapshot source errors, `doBulkSync` returns the error
+  and frames **no window at all** rather than falling back to the mirror walk. An
+  incomplete authoritative window destroys live sessions; framing none merely
+  defers the reconcile, and every `doBulkSync` caller leaves its cold-prime /
+  resync obligation armed for the next attempt. For the same reason a failed
+  export is never degraded into an EMPTY snapshot — an empty window is an
+  assertion that this node owns nothing, which the peer acts on by deleting every
+  session it holds for our RGs.
+
+A close delta drained alongside the export retracts its key from the snapshot
+(`snapshotDeltaSink.deleteV4/V6`): the export drains the same per-binding delta
+buffers the incremental path reads, so an open and a later close for one key can
+arrive in a single batch, and framing the already-closed session would resurrect
+it on the peer.
 
 The sender now treats outbound bulk acknowledgement as first-class state. A
 bulk transfer is not considered fully primed until the peer returns `BulkAck`
@@ -745,9 +815,13 @@ self-heals via `forceResync` / the #4090 survivor re-drive / the next reconnect.
 disconnect-edge triggered — `installConn` on a reconnect, `handleDisconnect` on
 a survivor fabric. A cold-prime bulk that fails WITHOUT dropping the connection
 therefore left the obligation armed with no consumer for the life of that
-connection. `BulkSync`'s own preconditions produce exactly that shape: it
-returns `session store not ready` (nil `s.sessions`) or `no peer connection`
-before it writes a byte, so no `handleDisconnect` follows. The startup window is
+connection. `doBulkSync`'s own preconditions produce exactly that shape: it
+returns `session store not ready` (nil `s.sessions`), `no peer connection`, or
+(#6031) a `bulk sync table-truth snapshot` error before it writes a byte, so no
+`handleDisconnect` follows. The #6031 fail-closed path deliberately joins this
+set: a snapshot source that cannot reach the helper leaves the obligation armed
+for the connected sweep to re-drive, rather than shipping a mirror-sourced
+window that would delete live sessions. The startup window is
 the real trigger — `startClusterComms` used to call `ss.Start()` (which spawns
 the accept/dial goroutines) and only then `ss.SetRuntime(rt)`, so a peer that
 connected in between drove the cold prime against a nil session store.
@@ -1566,15 +1640,22 @@ a surviving stale entry harmless:
   when it applies the same config snapshot, and idle GC reaps the entry on its
   inactivity timeout regardless.
 
-A full owner-RG re-export would **not** recover an undelivered close anyway. The
-userspace cold-sync delivers sessions as **incremental `Open`s** through the
-event stream and then sends **empty** `BulkStart`/`BulkEnd` markers
-(`pkg/cluster/sync_bulk.go` `doBulkSync` → `BulkSyncOverride`); the peer's
-`reconcileStaleSessions` (`pkg/cluster/sync.go`) short-circuits on an empty bulk
-("skipped (empty bulk)"). Re-emitting `Open`s therefore cannot convey a delete —
-only a non-empty **bracketed** bulk drives the stale-session prune, which the
-event-stream path never produces. A disconnected stream also triggers a fresh
-resync on reconnect (#2874) independently.
+**Historical premise, corrected (#5085, #6031).** This section originally argued
+that a full owner-RG re-export could **not** recover an undelivered close: the
+userspace cold-sync delivered sessions as incremental `Open`s through the event
+stream and then sent **empty** `BulkStart`/`BulkEnd` markers (`doBulkSync` →
+`BulkSyncOverride`), and `reconcileStaleSessions` short-circuited on an empty
+bulk ("skipped (empty bulk)"), so re-emitting `Open`s conveyed no delete.
+
+That premise no longer holds at HEAD. #5085 removed both the empty-marker path
+and the empty-bulk skip — `doBulkSync` always frames a real bracketed window —
+and #6031 sources that window from table truth, so a bulk re-drive DOES now
+prune a session the primary has closed. The conclusion below is unchanged, but it
+rests on a different reason: a bulk re-drive is a much later convergence point
+(the next cold prime, survivor re-drive, or forced resync), so an undelivered
+close must still be surfaced rather than swallowed on the assumption that some
+future bulk will mop it up. A disconnected stream also triggers a fresh resync on
+reconnect (#2874) independently.
 
 So the fix is the minimal honest change: stop silently swallowing the
 `push_delta_lossless` error. `push_purge_close_deltas` records each undelivered

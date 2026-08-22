@@ -19,9 +19,9 @@ import (
 // BulkStart -> SessionV4/V6... -> BulkEnd window (bulkRecvV4/bulkRecvV6). It is
 // therefore only correct when that window carries a COMPLETE, authoritative
 // snapshot: a session merely absent from the window is treated as stale and
-// DELETED. BulkSync() builds exactly that snapshot with LOSSLESS direct writes
-// under writeMu (no lossy sendCh drops) and filters by owned zone, so doBulkSync
-// ALWAYS ends with BulkSync().
+// DELETED. The window is built with LOSSLESS direct writes under writeMu (no
+// lossy sendCh drops), so doBulkSync ALWAYS ends with one — BulkSyncSnapshot
+// when a table-truth source is wired (#6031), BulkSync's store walk otherwise.
 //
 // BulkSyncOverride, if set, is a best-effort fast-population pre-step (the #418
 // event-stream export). It is NO LONGER wired in production (see
@@ -37,6 +37,19 @@ import (
 // #5272 is preserved: BulkSync sends a real BulkStart (sets the receiver's
 // bulkInProgress), so only a genuine transfer — never a spurious no-transfer
 // BulkEnd — reconciles.
+//
+// #6031: when BulkSnapshotSource is wired, the authoritative window is framed
+// from the caller-supplied TABLE-TRUTH snapshot instead of BulkSync's walk of
+// the `sessions`/`sessions_v6` BPF conntrack maps. Those maps are a best-effort
+// DISPLAY mirror under the userspace dataplane — the Rust helper's transit
+// forward install never publishes there — so the walk cannot see the transit
+// sessions that dominate a forwarding node, and since #5085 the receiver
+// DELETES every eligible session the window omits. Framing cold prime from the
+// mirror therefore wipes the standby's live peer-owned transit sessions.
+//
+// The source failing is NOT a reason to fall back to the mirror: an incomplete
+// authoritative window is destructive, whereas skipping this bulk only defers
+// the reconcile and every caller re-arms its cold-prime / resync obligation.
 func (s *SessionSync) doBulkSync() error {
 	if s.BulkSyncOverride != nil {
 		slog.Info("cluster sync: running bulk sync override (fast-population pre-step)")
@@ -44,19 +57,120 @@ func (s *SessionSync) doBulkSync() error {
 			slog.Warn("cluster sync: bulk sync override failed; authoritative BulkSync still runs", "err", err)
 		}
 	}
+	if src := s.BulkSnapshotSource; src != nil {
+		snap, err := src()
+		if err != nil {
+			// Fail closed — see the doc comment above.
+			return fmt.Errorf("bulk sync table-truth snapshot: %w", err)
+		}
+		return s.BulkSyncSnapshot(snap)
+	}
 	return s.BulkSync()
+}
+
+// BulkSnapshot is a caller-supplied, already-filtered set of locally-owned
+// forward sessions for one authoritative bulk window (#6031). Its entries are
+// framed verbatim — see SessionSync.BulkSnapshotSource for why the zone filter
+// is deliberately NOT re-applied on top of the caller's owner-RG filter.
+type BulkSnapshot struct {
+	V4 []dataplane.SessionEntryV4
+	V6 []dataplane.SessionEntryV6
 }
 
 // BulkSync sends all locally-owned forward sessions to the peer inside a
 // BulkStart -> sessions -> BulkEnd window, using lossless direct writes so the
 // receiver reconciles stale peer-owned sessions against the true snapshot.
+//
+// The session set comes from the backend session store, filtered by
+// ShouldSyncZone. Under the userspace dataplane that store is the BPF conntrack
+// DISPLAY mirror and is NOT table truth (#6031) — prefer BulkSyncSnapshot,
+// which doBulkSync selects automatically whenever BulkSnapshotSource is wired.
 func (s *SessionSync) BulkSync() error {
-	s.bulkSendMu.Lock()
-	defer s.bulkSendMu.Unlock()
-
 	if s.sessions == nil {
 		return fmt.Errorf("session store not ready")
 	}
+	return s.bulkSyncWindow(s.storeBulkWalk())
+}
+
+// BulkSyncSnapshot frames the caller-supplied table-truth snapshot inside the
+// same lossless BulkStart -> sessions -> BulkEnd direct-write window BulkSync
+// uses (#6031). It needs no backend session store: the snapshot IS the source.
+func (s *SessionSync) BulkSyncSnapshot(snap BulkSnapshot) error {
+	return s.bulkSyncWindow(snapshotBulkWalk(snap))
+}
+
+// bulkWalk supplies the forward sessions one authoritative window frames. Each
+// walk applies its own eligibility filter before yielding: the store walk drops
+// reverse entries and zones this node does not own, while a caller-supplied
+// snapshot is already filtered and is yielded verbatim.
+type bulkWalk struct {
+	forEachV4 func(func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	forEachV6 func(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+	// source names the walk in the bulk-sync logs so an operator can tell a
+	// table-truth window from a mirror-sourced one at a glance.
+	source string
+	// skipped counts entries the walk's own filter dropped, for the same logs.
+	skipped int
+}
+
+func (s *SessionSync) storeBulkWalk() *bulkWalk {
+	w := &bulkWalk{source: "store-mirror"}
+	w.forEachV4 = func(yield func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+		return s.sessions.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if !s.ShouldSyncZone(val.IngressZone) {
+				w.skipped++
+				return true
+			}
+			return yield(key, val)
+		})
+	}
+	w.forEachV6 = func(yield func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+		return s.sessions.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if !s.ShouldSyncZone(val.IngressZone) {
+				w.skipped++
+				return true
+			}
+			return yield(key, val)
+		})
+	}
+	return w
+}
+
+func snapshotBulkWalk(snap BulkSnapshot) *bulkWalk {
+	w := &bulkWalk{source: "table-truth"}
+	w.forEachV4 = func(yield func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+		for _, e := range snap.V4 {
+			if !yield(e.Key, e.Value) {
+				return nil
+			}
+		}
+		return nil
+	}
+	w.forEachV6 = func(yield func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+		for _, e := range snap.V6 {
+			if !yield(e.Key, e.Value) {
+				return nil
+			}
+		}
+		return nil
+	}
+	return w
+}
+
+// bulkSyncWindow is the single lossless send core behind BulkSync and
+// BulkSyncSnapshot: it owns the epoch, the BulkStart/BulkEnd markers, the
+// install-generation stamping, the record-then-send bulk-ack discipline
+// (#3912), and the writeMu direct writes. Only the session SOURCE differs.
+func (s *SessionSync) bulkSyncWindow(walk *bulkWalk) error {
+	s.bulkSendMu.Lock()
+	defer s.bulkSendMu.Unlock()
+
 	conn := s.getActiveConn()
 	if conn == nil {
 		return fmt.Errorf("no peer connection")
@@ -70,6 +184,7 @@ func (s *SessionSync) BulkSync() error {
 	stats := s.Stats()
 	slog.Info("cluster sync: bulk sync starting",
 		"epoch", epoch,
+		"source", walk.source,
 		"local", connLocalAddrString(conn),
 		"remote", connRemoteAddrString(conn),
 		"sessions_sent", stats.SessionsSent,
@@ -89,17 +204,10 @@ func (s *SessionSync) BulkSync() error {
 		return err
 	}
 
-	var count, skipped int
-	slog.Info("cluster sync: bulk sync iterating v4", "epoch", epoch)
+	var count int
+	slog.Info("cluster sync: bulk sync iterating v4", "epoch", epoch, "source", walk.source)
 	// Send owned v4 forward sessions.
-	err = s.sessions.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-		if val.IsReverse != 0 {
-			return true
-		}
-		if !s.ShouldSyncZone(val.IngressZone) {
-			skipped++
-			return true
-		}
+	err = walk.forEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		s.stampInstallGenV4(key, &val)
 		msg := encodeSessionV4Payload(key, val)
 		s.writeMu.Lock()
@@ -127,19 +235,13 @@ func (s *SessionSync) BulkSync() error {
 	}
 	slog.Info("cluster sync: bulk sync iterated v4",
 		"epoch", epoch,
+		"source", walk.source,
 		"sessions", count,
-		"skipped", skipped)
+		"skipped", walk.skipped)
 
 	// Send owned v6 forward sessions.
-	slog.Info("cluster sync: bulk sync iterating v6", "epoch", epoch, "sessions", count, "skipped", skipped)
-	err = s.sessions.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if val.IsReverse != 0 {
-			return true
-		}
-		if !s.ShouldSyncZone(val.IngressZone) {
-			skipped++
-			return true
-		}
+	slog.Info("cluster sync: bulk sync iterating v6", "epoch", epoch, "source", walk.source, "sessions", count, "skipped", walk.skipped)
+	err = walk.forEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		s.stampInstallGenV6(key, &val)
 		msg := encodeSessionV6Payload(key, val)
 		s.writeMu.Lock()
@@ -163,8 +265,9 @@ func (s *SessionSync) BulkSync() error {
 	}
 	slog.Info("cluster sync: bulk sync iterated v6",
 		"epoch", epoch,
+		"source", walk.source,
 		"sessions", count,
-		"skipped", skipped)
+		"skipped", walk.skipped)
 
 	// Record the pending bulk-ack epoch BEFORE writing the BulkEnd marker
 	// to the wire (record-then-send, mirroring the #2170/#2198 gen-guard
@@ -181,7 +284,7 @@ func (s *SessionSync) BulkSync() error {
 	s.pendingBulkAckSince.Store(time.Now().UnixNano())
 
 	// Send bulk end marker with matching epoch.
-	slog.Info("cluster sync: bulk sync writing end marker", "epoch", epoch, "sessions", count, "skipped", skipped)
+	slog.Info("cluster sync: bulk sync writing end marker", "epoch", epoch, "source", walk.source, "sessions", count, "skipped", walk.skipped)
 	s.writeMu.Lock()
 	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
 	s.writeMu.Unlock()
@@ -193,7 +296,7 @@ func (s *SessionSync) BulkSync() error {
 	}
 
 	s.stats.BulkSyncs.Add(1)
-	slog.Info("cluster sync: bulk sync complete", "sessions", count, "skipped", skipped, "epoch", epoch)
+	slog.Info("cluster sync: bulk sync complete", "source", walk.source, "sessions", count, "skipped", walk.skipped, "epoch", epoch)
 	return nil
 }
 
