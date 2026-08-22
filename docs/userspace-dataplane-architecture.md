@@ -695,6 +695,42 @@ three indexes; because one non-bijective flow-pair collides on several indexes
 at once, it can bump more than once per pair — reinforcing its documented
 upper-bound, not-a-pair-census character.
 
+**The collision counter is attributed by source identity (#6751).** The
+aggregate above is non-zero on a running cluster, but it cannot decide
+anything on its own: it is a superset of at least three populations with three
+different remedies. Two INTERNAL HOSTS racing for one source port under
+interface-mode SNAT is the cross-session leak — one host's reply can reach the
+other, crossing a security boundary. ONE host reusing a port across sessions
+whose NAT decisions differ collides identically but cannot leak across a
+boundary. The `port no-translation` / non-bijective static pairs the allocator
+admits DELIBERATELY collide by construction (#6745 governs their steering row).
+`nat_reverse_key_collisions_distinct_src` counts the first population only: on a
+bucket that grows, it bumps when any handle already in the bucket resolves to a
+session with a DIFFERENT `src_ip`. It is published per worker, aggregated into
+`ProcessStatus`, and exported as
+`xpf_userspace_worker_session_nat_reverse_key_collisions_distinct_src_total` and
+`xpf_userspace_session_nat_reverse_key_collisions_distinct_src_total`. A
+non-zero reading is the operational signal that the leak shape is actually
+occurring; aggregate-non-zero with distinct-source ZERO means the collisions are
+port reuse or deliberate pairs, and no remedy is owed.
+
+Attribution runs on the FORWARD branch of `index_forward_nat_key_parts` only.
+On the reverse/alias index (`reverse_translated_index`) the indexed key's
+`src_ip` is the EXTERNAL SERVER, not an internal source, so counting it would
+report distinct servers as distinct internal sources. Those collisions still
+reach the aggregate. Cost is on the collision path only — an empty bucket
+short-circuits before any comparison, so the no-collision install is unchanged.
+
+The counter is NOT a source-NAT MODE discriminator, and that is a measured
+limit rather than a preference: `NatDecision` is wire-serialized over the HA
+fabric with its field shape and derive set preserved bit-for-bit, and its
+equality drives both the reindex decision and whether NAT applies to a packet
+at all, so a mode bit cannot be added there; threading one through
+`install_with_protocol` instead reaches 120 call sites. Interface-mode and
+address-only pool mode therefore remain indistinguishable in this telemetry.
+Distinct-source is the axis that is both free and decisive, because the leak
+shape requires two sources whatever the mode produced the shared key.
+
 **Protocol timeouts:**
 | Protocol | Active | Closing (FIN/RST) |
 |----------|--------|-------------------|
