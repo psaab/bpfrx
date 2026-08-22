@@ -102545,3 +102545,21 @@ prose edit above them added. No diff falls in the new test body.
     controlLinkAuthKey now REDs). Residual closed: readLoop's CALL to admitFrame
     was still unbound — severing it left every 5086 test green.
   - **File(s)**: pkg/cluster/heartbeat_replay_restart_5086_test.go
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6633 defect 1 — `install_session_serializes_with_reconcile_removal`
+    asserted `reconcile_iters >= 1`, a scheduling outcome its harness never
+    arranged: under CPU oversubscription the bounded installer can finish and
+    the main thread store `stop` before the unbounded `while !stop` reconciler
+    is scheduled even once. Extracted the reconciler body into
+    `reconcile_churn_until` with a do-while shape (the #3457 pattern the
+    sibling snapshot-atomicity reader already uses one function above), so the
+    precondition holds by CONSTRUCTION. Chose the loop shape over the
+    rendezvous #6633 proposed: a rendezvous makes the bounded thread block on
+    the unbounded one, which in a module whose other open defect is a futex
+    wedge trades a false red for a possible hang. Gate:
+    `reconcile_churn_completes_a_cycle_even_when_already_stopped_6633` calls
+    the helper with `stop` already set — the deterministic model of the
+    starvation — and reds on a revert to `while !stop`.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
+    docs/engineering-style.md
