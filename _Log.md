@@ -100203,3 +100203,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_prepass_logging_4960_test.go,
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
+    lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
+    so the #6476 cold-boot fence is no longer suppressed.
+  - **File(s)**: pkg/nftables/netlink_installer.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/daemon.go, pkg/daemon/lo0_vacated_enforced_6529_test.go,
+    pkg/nftables/netlink_lo0_zero_render_6529_test.go,
+    pkg/daemon/daemon_nft_netlink_testhelper_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go,
+    pkg/nftables/netlink_kernel_test.go, docs/host-inbound-service-matrix.md

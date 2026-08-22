@@ -35,7 +35,7 @@ func (noopNftInstaller) InstallHostInbound(xnft.HostInboundSpec) error { return 
 func (noopNftInstaller) InstallColdBootFence(xnft.FenceSpec) error     { return nil }
 func (noopNftInstaller) InstallLo0ColdBootFence(xnft.FenceSpec) error  { return nil }
 func (noopNftInstaller) InstallGapFence(xnft.GapFenceSpec) error       { return nil }
-func (noopNftInstaller) InstallLo0(xnft.Lo0FilterSpec) error           { return nil }
+func (noopNftInstaller) InstallLo0(s xnft.Lo0FilterSpec) (int, error)  { return fakeLo0Rules(s), nil }
 func (noopNftInstaller) DeleteTable(string) error                      { return nil }
 
 // fakeNftInstaller is the per-test failure-injection seam. A nil hook succeeds
@@ -48,7 +48,10 @@ type fakeNftInstaller struct {
 	lo0ColdBootFence func(xnft.FenceSpec) error
 	gapFence         func(xnft.GapFenceSpec) error
 	lo0              func(xnft.Lo0FilterSpec) error
-	del              func(string) error
+	// lo0Rules overrides the rendered rule count InstallLo0 reports (#6529).
+	// nil means "derive it from the spec" (fakeLo0Rules).
+	lo0Rules *int
+	del      func(string) error
 }
 
 func (f *fakeNftInstaller) InstallHostInbound(s xnft.HostInboundSpec) error {
@@ -79,11 +82,30 @@ func (f *fakeNftInstaller) InstallGapFence(s xnft.GapFenceSpec) error {
 	return nil
 }
 
-func (f *fakeNftInstaller) InstallLo0(s xnft.Lo0FilterSpec) error {
+func (f *fakeNftInstaller) InstallLo0(s xnft.Lo0FilterSpec) (int, error) {
+	var err error
 	if f.lo0 != nil {
-		return f.lo0(s)
+		err = f.lo0(s)
 	}
-	return nil
+	if err != nil {
+		return 0, err
+	}
+	if f.lo0Rules != nil {
+		return *f.lo0Rules, nil
+	}
+	return fakeLo0Rules(s), nil
+}
+
+// fakeLo0Rules is the fakes' stand-in for the #6529 RENDERED rule count that
+// netlinkInstaller.InstallLo0 returns from nlPlan.rules. It counts TERMS, which
+// agrees with the real render for every fixture in this package (each term
+// lowers to exactly one rule) and, crucially, agrees on the value that matters:
+// a spec with no terms — a dangling filter name, or a filter with no terms —
+// renders ZERO rules. A test that needs the third door (terms present, every one
+// lowering to zero rules) sets fakeNftInstaller.lo0Rules explicitly rather than
+// relying on this approximation.
+func fakeLo0Rules(s xnft.Lo0FilterSpec) int {
+	return len(s.V4Terms) + len(s.V6Terms)
 }
 
 func (f *fakeNftInstaller) DeleteTable(name string) error {
@@ -103,8 +125,11 @@ func (c countingNftInstaller) InstallHostInbound(xnft.HostInboundSpec) error { *
 func (c countingNftInstaller) InstallColdBootFence(xnft.FenceSpec) error     { *c.calls++; return nil }
 func (c countingNftInstaller) InstallLo0ColdBootFence(xnft.FenceSpec) error  { *c.calls++; return nil }
 func (c countingNftInstaller) InstallGapFence(xnft.GapFenceSpec) error       { *c.calls++; return nil }
-func (c countingNftInstaller) InstallLo0(xnft.Lo0FilterSpec) error           { *c.calls++; return nil }
-func (c countingNftInstaller) DeleteTable(string) error                      { *c.calls++; return nil }
+func (c countingNftInstaller) InstallLo0(s xnft.Lo0FilterSpec) (int, error) {
+	*c.calls++
+	return fakeLo0Rules(s), nil
+}
+func (c countingNftInstaller) DeleteTable(string) error { *c.calls++; return nil }
 
 // hostInboundViewAddrs reports whether a HostInboundSpec view/unzoned set scopes
 // the given bare address in the requested family. Used by fence/real spec
