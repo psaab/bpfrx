@@ -391,11 +391,29 @@ Junos reading in `withinMatches` (`engine.go`):
   `until 1` made the first event `count == 1 >= 1` and NEVER fired, and
   `until N` fired only on events 1..N-1. Regression-locked by
   `TestInclusiveUntil_*_3756`.
-- **Multiple `within` clauses are combined with AND (#4423 M3).**
-  `withinMatches` returns false the moment ANY clause is unsatisfied, so a
-  policy with two `within` clauses fires only when EVERY clause passes for the
-  current event. There is no OR; express an OR-of-conditions as separate
-  policies. Regression-locked by `TestWithinMultipleClausesAreANDed`.
+- **Multiple `within` clauses are combined with AND (#4423 M3).** A policy with
+  two `within` clauses fires only when EVERY clause passes for the current
+  event. There is no OR; express an OR-of-conditions as separate policies.
+  Regression-locked by `TestWithinMultipleClausesAreANDed`.
+- **The verdict does not depend on clause ORDER (#5250, A9 F4).**
+  `withinMatches` is three passes over the clause list — structural validity,
+  then the `trigger on` re-arm/latch, then `trigger until` — rather than one
+  fused loop that returned from the middle of the walk. With the fused loop and
+  two `trigger on` clauses, whichever clause was reached first decided whether
+  the latch was checked or re-armed and the other was never evaluated: a
+  latched policy whose LONG window was still above threshold returned at that
+  clause, so the SHORT clause that had decayed below its own threshold never
+  re-armed the latch. The ANDed condition went false and true again — a real
+  crossing — and the policy stayed silent until the long window decayed. The
+  latch now clears exactly when the ANDed condition is false, i.e. when ANY
+  `trigger on` clause is below its threshold, decided across all of them first.
+  Regression-locked by `TestWithinTriggerOnRearmIsIndependentOfClauseOrder`,
+  which runs the same timeline against both clause orderings and requires them
+  to agree. One deliberate delta: a policy carrying BOTH a structurally invalid
+  clause and a below-threshold `trigger on` clause no longer clears the latch
+  (pass 1 fails closed first). Such a policy fires on no event at all while the
+  invalid clause exists, so the latch value is unobservable until the config is
+  corrected.
 
 ## Audit hardening (#4423)
 
