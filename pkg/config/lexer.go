@@ -70,7 +70,30 @@ type Lexer struct {
 	// next call to Next. skipWhitespaceAndComments cannot return a token, so
 	// the error is stashed here and drained at the top of Next.
 	pending *Token
+	// bracketDepth counts the '[' the skip loop has consumed and not yet
+	// balanced with a ']'. The lexer still STRIPS the delimiters (#2419) —
+	// this only records, for the token about to be returned, whether it was
+	// authored INSIDE a bracket list.
+	//
+	// #6668: the flat-set language has no other way to say where one node's
+	// key group ends. `set <parent> a b c` is re-split by SetPath at the
+	// schema's arity, so a CONTAINER node carrying more keys than its arity
+	// (`interfaces [ ge-0/0/0 ge-0/0/1 ] { ... }`) cannot be written down at
+	// all: the surplus members are demoted to a leaf keyword and the body is
+	// re-parented under them. Preserving the bracket lets the replay put the
+	// boundary back exactly where it was authored.
+	bracketDepth int
+	// tokInBracket is bracketDepth > 0 as of the token most recently returned
+	// by Next. It is sampled after the skip loop, so it describes THAT token
+	// and not the lexer's current position.
+	tokInBracket bool
 }
+
+// InBracket reports whether the token most recently returned by Next was
+// authored inside a `[ ... ]` list. It is only meaningful immediately after a
+// Next that returned an identifier or string; callers that do not need the
+// grouping ignore it, which is every caller predating #6668.
+func (l *Lexer) InBracket() bool { return l.tokInBracket }
 
 // NewLexer creates a new Lexer for the given input string.
 func NewLexer(input string) *Lexer {
@@ -119,14 +142,23 @@ func (l *Lexer) Next() Token {
 			// open such a literal.
 			if c == '[' {
 				if tok, ok := l.tryBracketedEndpointLiteral(); ok {
+					l.tokInBracket = l.bracketDepth > 0
 					return tok
 				}
+				l.bracketDepth++
+			} else if l.bracketDepth > 0 {
+				// Floor at zero: a stray ']' with no opener must not make the
+				// depth negative and mark every LATER token as un-bracketed by
+				// underflow. The parser reports the malformed input; the
+				// grouping record simply stays off.
+				l.bracketDepth--
 			}
 			l.advance()
 			continue
 		}
 		break
 	}
+	l.tokInBracket = l.bracketDepth > 0
 
 	ch := l.input[l.pos]
 	line, col := l.line, l.column
@@ -210,11 +242,20 @@ func (l *Lexer) Peek() Token {
 	savedLine := l.line
 	savedCol := l.column
 	savedPending := l.pending
+	// #6668: Next consumes (and counts) any bracket delimiters it skips, so
+	// the bracket state is part of the position Peek must restore. Without
+	// this a Peek that stepped over a '[' left the depth incremented, and
+	// every token after it — including tokens outside the list — reported as
+	// bracketed.
+	savedDepth := l.bracketDepth
+	savedInBracket := l.tokInBracket
 	tok := l.Next()
 	l.pos = savedPos
 	l.line = savedLine
 	l.column = savedCol
 	l.pending = savedPending
+	l.bracketDepth = savedDepth
+	l.tokInBracket = savedInBracket
 	return tok
 }
 
