@@ -103662,3 +103662,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
+
+## 2026-08-22 — #7492 typed path identifiers recover 72 more leaves
+- **Timestamp**: 2026-08-22
+- **Action**: Found the dominant cause of the `unreachable` bucket: the harness
+  names every `args` path slot with a synthetic WORD, but `interfaces <if> unit
+  <n>` needs a NUMBER, so the whole unit subtree was discarded. gateEffectivePath
+  now falls back to a numeric-arg path when (and only when) the word path leaves
+  the leaf inert. Coverage 629 -> 687; unreachable 215 -> 143 (72 moved: 58
+  compared, 14 revealed as flags, so the flag ceiling rises 161 -> 175 again).
+  Substitution is compile-time only, so siteKey/parentKey normalisation and every
+  allowlist/prereq row are untouched.
+- **Refuted first, both measured**: (a) the #6696 "schema advertises knobs nothing
+  implements" hypothesis — only 22 leaves have a name absent from compiler
+  source, and 21 are self-documented as deliberately unimplemented; (b) the
+  dangling-reference hypothesis — scheduler-map/classifier values land whether or
+  not the referent exists. Over-application was measured too: numeric-by-default
+  scores 635 (worse than 687) AND manufactures false findings at loss-priority.
+- **One real finding surfaced**: `security log profile <*> category session
+  field-extra-name` commits clean and never reaches the compiled config, with no
+  "not implemented" note in its description. Filed separately.
+- **File(s)**: pkg/config/schema_spelling_differential_gate_test.go,
+  pkg/config/schema_spelling_gate_coverage_7484_test.go, docs/config-schema.md
+

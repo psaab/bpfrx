@@ -354,6 +354,9 @@ type gateLeaf struct {
 	path  []string
 	leaf  string
 	multi bool
+	// desc is the schema's operator-facing description, read by #7492 to tell a
+	// leaf the project has DECLARED unimplemented from one that is silently so.
+	desc string
 	// args is the schema's declared value arity. #7484 reads it to prove that
 	// `args == 0` does NOT imply value-less, so nobody "optimises" the coverage
 	// classifier into excluding those leaves.
@@ -435,7 +438,7 @@ func enumerateGateLeaves() []gateLeaf {
 				if ch.midKeyword != "" || ch.args > 1 {
 					continue
 				}
-				g := gateLeaf{path: append([]string{}, path...), leaf: key, multi: ch.multi, args: ch.args}
+				g := gateLeaf{path: append([]string{}, path...), leaf: key, multi: ch.multi, args: ch.args, desc: ch.desc}
 				if _, skip := notAValueList[g.siteKey()]; skip {
 					continue
 				}
@@ -567,6 +570,92 @@ var gateSpellingsScalar = []string{"A-hier-bracket", "B-hier-block", "D-set-brac
 //	"err"      a spelling failed to parse or compile
 //
 // ---------------------------------------------------------------------------
+// TYPED PATH IDENTIFIERS (#7492).
+//
+// The harness names every `args` slot in a parent path with a synthetic WORD
+// (`xa20`). Many slots are not word-typed: `interfaces <if> unit <n>` needs a
+// NUMBER, and `unit xa20` does not parse as a unit, so the compiler discards the
+// whole unit subtree and every leaf beneath it looks inert. Measured: retrying
+// the unreachable leaves with a numeric arg token recovers 72 of 215, all under
+// `interfaces <*>` — one general cause, not 46 per-parent ones.
+//
+// The numeric form is a FALLBACK, never the default. A leaf is compiled with the
+// word path first; the numeric path is used only when the word path leaves the
+// FIRST value inert and the numeric path does not. So this can only ever turn
+// an uncomparable leaf into a comparable one — it cannot change an existing
+// verdict, and a slot that genuinely needs a word is unaffected.
+//
+// The substitution happens at COMPILE time only. gateLeaf.path keeps its word
+// tokens, so siteKey()/parentKey() normalisation, the allowlist rows and the
+// prerequisite rows are all untouched by which form a leaf ends up using.
+// ---------------------------------------------------------------------------
+
+// gateNumericArgs returns a copy of path with every synthetic ARG token replaced
+// by a number. Wildcard tokens are left alone: they name a container instance,
+// not a typed value, and a numeric name is no more valid there than a word.
+func gateNumericArgs(path []string) []string {
+	out := make([]string, len(path))
+	for i, tok := range path {
+		if strings.HasPrefix(tok, gateArgPrefix) {
+			out[i] = "7"
+			continue
+		}
+		out[i] = tok
+	}
+	return out
+}
+
+var gateEffectivePathCache = map[string][]string{}
+
+// gateEffectivePath picks the path this leaf is compiled with: the authored word
+// form, or the numeric-arg form when the word form makes the leaf unreadable.
+func gateEffectivePath(g gateLeaf) []string {
+	key := g.siteKey()
+	if p, ok := gateEffectivePathCache[key]; ok {
+		return p
+	}
+	chosen := g.path
+	numeric := gateNumericArgs(g.path)
+	if !equalPaths(numeric, g.path) {
+		if wordInert(g, g.path) && !wordInert(g, numeric) {
+			chosen = numeric
+		}
+	}
+	gateEffectivePathCache[key] = chosen
+	return chosen
+}
+
+func equalPaths(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// wordInert reports whether the leaf's FIRST value fails to move the compiled
+// output under this path — the same "inert" condition the differential uses,
+// tried across every value pair so a type mismatch on one pair is not mistaken
+// for the leaf being unreadable.
+func wordInert(g gateLeaf, path []string) bool {
+	base, err := gateCompileBrace(gateBraceConfig(path, ""))
+	if err != nil {
+		return true
+	}
+	for _, vp := range gateValuePairs {
+		one, err := gateCompileBrace(gateBraceConfig(path, g.leaf+" "+vp.v1+";"))
+		if err == nil && one != base {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
 // PARENT PREREQUISITES (#7492).
 //
 // The harness authors a leaf ALONE inside its synthetic parent path. Some
@@ -624,13 +713,14 @@ func gateLeafPrereq(g gateLeaf) (string, []string) {
 			// experiment from the one the row was verified for.
 			return "", nil
 		}
-		sets = append(sets, "set "+strings.Join(g.path, " ")+" "+stmt)
+		sets = append(sets, "set "+strings.Join(gateEffectivePath(g), " ")+" "+stmt)
 	}
 	return body, sets
 }
 
 func spellingVerdicts(g gateLeaf, v1, v2 string) map[string]string {
-	flat := "set " + strings.Join(append(append([]string{}, g.path...), g.leaf), " ")
+	epath := gateEffectivePath(g)
+	flat := "set " + strings.Join(append(append([]string{}, epath...), g.leaf), " ")
 	// #7492: prepend the parent prerequisite, identically in every form, so it
 	// cancels out of the comparison and only decides whether a comparison exists.
 	preBody, preSets := gateLeafPrereq(g)
@@ -638,7 +728,7 @@ func spellingVerdicts(g gateLeaf, v1, v2 string) map[string]string {
 		if preBody != "" {
 			stmt = preBody + " " + stmt
 		}
-		return gateCompileBrace(gateBraceConfig(g.path, stmt))
+		return gateCompileBrace(gateBraceConfig(epath, stmt))
 	}
 	sets := func(cmds ...string) (string, error) {
 		return gateCompileSet(append(append([]string{}, preSets...), cmds...))
