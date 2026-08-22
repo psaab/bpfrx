@@ -100267,6 +100267,14 @@ prose edit above them added. No diff falls in the new test body.
   existing #6031 tests green while silently reverting the fix.
 - **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
 
+- **Timestamp**: 2026-08-21
+  - **Action**: #6512 — lo0 kernel mirror fails CLOSED on a malformed address
+    token instead of installing a narrowed/widened rule; oracle keeps the token
+    verbatim so `nft -f -` rejects; #3433 H09 sub-case re-pinned.
+  - **File(s)**: pkg/nftables/netlink_lo0.go, pkg/daemon/daemon_nft.go,
+    pkg/nftables/netlink_lo0_addrs_6512_test.go,
+    pkg/daemon/lo0_addr_failclosed_6512_test.go, pkg/daemon/lo0_filter_test.go,
+    pkg/daemon/README.md, pkg/nftables/README.md
 ## 2026-08-21 — #6535 periodic converger for the Kea applier
 - **Timestamp**: 2026-08-21
 - **Action**: Track whether a Kea apply converged (`applyFailed` +

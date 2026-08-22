@@ -1909,15 +1909,26 @@ func nftAddrSet(addrs []string) string {
 }
 
 // nftFamilyAddrs keeps only the addresses belonging to the chain's family
-// ("ip" -> IPv4, "ip6" -> IPv6), dropping the empty / "any" placeholders, the
-// malformed tokens, and the wrong-family literals. This mirrors the userspace
+// ("ip" -> IPv4, "ip6" -> IPv6), dropping the empty / "any" placeholders and the
+// wrong-family literals. Dropping a WRONG-FAMILY literal mirrors the userspace
 // matcher's per-family vectors (parse_address classifies each entry into
-// source_v4 / source_v6, drops "any"/empty/malformed, and the inet / inet6 chain
-// only ever consults the matching family): a v4 CIDR carried in an inet6 filter
-// (#3433 H02) and an all-malformed list (#3433 H09) both leave THIS family's
-// vector empty, which the matcher treats as the empty positive/except set. Each
-// kept entry is re-rendered in its canonical form so a bare host IP and a CIDR
-// are both valid nft right-hand sides.
+// source_v4 / source_v6, and the inet / inet6 chain only ever consults the
+// matching family), so a v4 CIDR carried in an inet6 filter (#3433 H02) leaves
+// THIS family's vector empty, which the matcher treats as the empty
+// positive/except set. Each kept entry is re-rendered in its canonical form so a
+// bare host IP and a CIDR are both valid nft right-hand sides.
+//
+// #6512: a MALFORMED token is kept VERBATIM instead of being silently dropped.
+// The dropped-token behavior installed a NARROWED rule from a partially-
+// malformed positive list (a discard/reject term then enforced a smaller address
+// set than the operator wrote) and a WIDENED one from an except list — an
+// all-malformed except list emptied and nftAddrPredicate's empty-except arm
+// dropped the predicate entirely, leaving the direction unconstrained. Emitting
+// the raw token makes `nft -f -` REJECT the whole ruleset and retain the prior
+// generation, which is exactly the fail-closed posture this oracle already has
+// for an unresolvable port / DSCP token (#6405) — and it keeps this oracle in
+// agreement with filterFamilyAddrs in pkg/nftables/netlink_lo0.go, the
+// production builder, which errors on the same token.
 func nftFamilyAddrs(family string, addrs []string) []string {
 	wantV6 := family == "ip6"
 	out := make([]string, 0, len(addrs))
@@ -1937,9 +1948,7 @@ func nftFamilyAddrs(family string, addrs []string) []string {
 			}
 			continue
 		}
-		// Malformed token: contributes nothing (mirrors parse_address's silent
-		// drop). It still made the direction `constrained` upstream, so an
-		// all-malformed positive set fails closed below (match NOTHING).
+		out = append(out, a)
 	}
 	return out
 }
