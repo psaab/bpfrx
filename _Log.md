@@ -99038,3 +99038,49 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_ipsec_plaintext_warn.go,
   pkg/config/compiler_prewalk.go, docs/userspace-dataplane-gaps.md,
   _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6031 — frame the HA cold-prime bulk window from table truth
+  instead of the BPF conntrack display mirror.
+
+  Measured first, at origin/master e46761105, with the existing `pumpBulk`
+  harness in pkg/cluster: a primary whose conntrack mirror holds only a
+  host-inbound row frames a window carrying 1 session, and the standby logs
+  `reconcile stale sessions applied stale_v4=1 deleted_v4=1` — it DELETES the
+  live peer-owned transit session it received over the incremental delta
+  stream. The issue framed this as a narrow drift residual; it is not. The
+  helper's transit forward install (`#4800: the single place a locally learned
+  transit forward flow is installed`, afxdp/poll_descriptor) never calls
+  `publish_bpf_conntrack_entry`, so a transit session is STRUCTURALLY absent
+  from `sessions`/`sessions_v6` — while the standby's copy IS there, written by
+  `SetClusterSyncedSessionV4`. Since #5085 made the receiver reconcile
+  authoritatively, every cold prime / survivor re-drive / forced resync wiped
+  the standby's transit sessions.
+
+  Fix: `SessionSync.BulkSnapshotSource` + `BulkSyncSnapshot`; `BulkSync` and
+  the snapshot path now share one lossless send core (`bulkSyncWindow`) so the
+  epoch, markers, gen stamping and #3912 record-then-send discipline have a
+  single implementation. The daemon wires it to `ExportOwnerRGSessions(rgIDs,
+  0)` (synchronous, unbounded), converted through the SAME
+  `walkUserspaceSessionDeltas` + `shouldSyncUserspaceDelta` the incremental
+  path uses — refactored to a sink so the two cannot diverge. A snapshot-source
+  error FAILS CLOSED (no window at all) rather than falling back to the
+  destructive mirror walk.
+
+  Validation: 4 new pkg/cluster tests + 5 new pkg/daemon tests; full
+  pkg/cluster and pkg/daemon suites green with `-count=1`; `go vet` clean.
+  8 single-line mutations each produced an ASSERTION red (rc=1, exactly one
+  test run, `go vet` rc=0): ignore the snapshot source, fall back on error,
+  re-filter the snapshot by zone, drop the store walk's zone filter, cap the
+  export, no-op the close retraction, swallow the export error, bypass the
+  eligibility filter. Full `go test ./... -count=1`: only pkg/ddns failed,
+  the known #7009 bind flake (green in isolation).
+
+  Go-only diff: touches no `.rs` file and no compiled artifact, so no cluster
+  smoke is owed.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go,
+  pkg/cluster/sync_bulk_snapshot_6031_test.go,
+  pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_userspace_export.go,
+  pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/bulk_snapshot_6031_test.go,
+  docs/session-sync-architecture.md, docs/sync-protocol.md, _Log.md

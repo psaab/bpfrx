@@ -402,19 +402,93 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, wired *dpuserspace
 	}
 }
 
-func (d *Daemon) queueUserspaceSessionDeltas(
+// userspaceDeltaSink receives the sessions one helper delta batch resolves to,
+// after conversion and the sync-eligibility filter have both run.
+//
+// #6031: the incremental queue path and the cold-prime table-truth snapshot
+// collector are two SINKS over ONE walk, deliberately. The standby must end up
+// holding the same session set whichever path delivered it, and the bulk window
+// DELETES every eligible session it omits — so a divergence between the two
+// filters is always a bug, never a legitimate difference. Single-sourcing the
+// walk makes that divergence unrepresentable instead of merely tested.
+type userspaceDeltaSink interface {
+	openV4(key dataplane.SessionKey, val dataplane.SessionValue)
+	openV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6)
+	deleteV4(key dataplane.SessionKey)
+	deleteV6(key dataplane.SessionKeyV6)
+}
+
+// queueDeltaSink forwards each resolved session onto the incremental
+// session-sync send queue — the historical behavior of
+// queueUserspaceSessionDeltas.
+type queueDeltaSink struct{ ss *cluster.SessionSync }
+
+func (q queueDeltaSink) openV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+	q.ss.QueueSessionV4(key, val)
+}
+
+func (q queueDeltaSink) openV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+	q.ss.QueueSessionV6(key, val)
+}
+
+func (q queueDeltaSink) deleteV4(key dataplane.SessionKey) { q.ss.QueueDeleteV4(key) }
+
+func (q queueDeltaSink) deleteV6(key dataplane.SessionKeyV6) { q.ss.QueueDeleteV6(key) }
+
+// snapshotDeltaSink accumulates a point-in-time set of LIVE sessions for one
+// authoritative bulk window (#6031). A close delta drained alongside the export
+// retracts its key: the exported open and the close can both appear in one
+// batch, and framing an already-closed session would resurrect it on the peer.
+// Keys are accumulated in maps, so a repeated open is idempotent and window
+// order is irrelevant (the receiver keys the window by session key).
+type snapshotDeltaSink struct {
+	v4 map[dataplane.SessionKey]dataplane.SessionValue
+	v6 map[dataplane.SessionKeyV6]dataplane.SessionValueV6
+}
+
+func newSnapshotDeltaSink() *snapshotDeltaSink {
+	return &snapshotDeltaSink{
+		v4: make(map[dataplane.SessionKey]dataplane.SessionValue),
+		v6: make(map[dataplane.SessionKeyV6]dataplane.SessionValueV6),
+	}
+}
+
+func (c *snapshotDeltaSink) openV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+	c.v4[key] = val
+}
+
+func (c *snapshotDeltaSink) openV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+	c.v6[key] = val
+}
+
+func (c *snapshotDeltaSink) deleteV4(key dataplane.SessionKey) { delete(c.v4, key) }
+
+func (c *snapshotDeltaSink) deleteV6(key dataplane.SessionKeyV6) { delete(c.v6, key) }
+
+func (c *snapshotDeltaSink) snapshot() cluster.BulkSnapshot {
+	snap := cluster.BulkSnapshot{
+		V4: make([]dataplane.SessionEntryV4, 0, len(c.v4)),
+		V6: make([]dataplane.SessionEntryV6, 0, len(c.v6)),
+	}
+	for key, val := range c.v4 {
+		snap.V4 = append(snap.V4, dataplane.SessionEntryV4{Key: key, Value: val})
+	}
+	for key, val := range c.v6 {
+		snap.V6 = append(snap.V6, dataplane.SessionEntryV6{Key: key, Value: val})
+	}
+	return snap
+}
+
+// walkUserspaceSessionDeltas converts each helper delta, applies the
+// sync-eligibility filter, and hands every admitted session to sink. It returns
+// the number of sink calls made.
+func (d *Daemon) walkUserspaceSessionDeltas(
+	ss *cluster.SessionSync,
 	zoneIDs map[string]uint16,
 	deltas []dpuserspace.SessionDeltaInfo,
+	sink userspaceDeltaSink,
 ) int {
-	// Snapshot the live session-sync object once for the whole batch (#4958):
-	// the per-delta filter and queue calls all operate on this pointer instead
-	// of re-reading the shared field, so the hot path never locks per delta and
-	// a concurrent stopClusterComms cannot nil the field mid-batch.
-	ss := d.getSessionSync()
-	if ss == nil {
-		return 0
-	}
-	queued := 0
+	n := 0
 	for _, delta := range deltas {
 		switch strings.ToLower(delta.Event) {
 		case "open":
@@ -428,13 +502,13 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 				if !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
 					continue
 				}
-				ss.QueueSessionV4(key, val)
-				slog.Debug("userspace delta: queued V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
-				queued++
+				sink.openV4(key, val)
+				slog.Debug("userspace delta: admitted V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
+				n++
 				if delta.FabricRedirect && !delta.FabricIngress {
 					if wireKey, wireVal, ok := userspaceForwardWireAliasV4(key, val, delta); ok {
-						ss.QueueSessionV4(wireKey, wireVal)
-						queued++
+						sink.openV4(wireKey, wireVal)
+						n++
 					}
 				}
 			case dataplane.AFInet6:
@@ -442,12 +516,12 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 				if !ok || !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
 					continue
 				}
-				ss.QueueSessionV6(key, val)
-				queued++
+				sink.openV6(key, val)
+				n++
 				if delta.FabricRedirect && !delta.FabricIngress {
 					if wireKey, wireVal, ok := userspaceForwardWireAliasV6(key, val, delta); ok {
-						ss.QueueSessionV6(wireKey, wireVal)
-						queued++
+						sink.openV6(wireKey, wireVal)
+						n++
 					}
 				}
 			}
@@ -456,33 +530,48 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 			case dataplane.AFInet:
 				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
 				if ok && d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
-					ss.QueueDeleteV4(key)
-					queued++
+					sink.deleteV4(key)
+					n++
 					if delta.FabricRedirect && !delta.FabricIngress {
 						wireKey := userspaceForwardWireKeyV4(key, delta)
 						if wireKey != key {
-							ss.QueueDeleteV4(wireKey)
-							queued++
+							sink.deleteV4(wireKey)
+							n++
 						}
 					}
 				}
 			case dataplane.AFInet6:
 				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
 				if ok && d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
-					ss.QueueDeleteV6(key)
-					queued++
+					sink.deleteV6(key)
+					n++
 					if delta.FabricRedirect && !delta.FabricIngress {
 						wireKey := userspaceForwardWireKeyV6(key, delta)
 						if wireKey != key {
-							ss.QueueDeleteV6(wireKey)
-							queued++
+							sink.deleteV6(wireKey)
+							n++
 						}
 					}
 				}
 			}
 		}
 	}
-	return queued
+	return n
+}
+
+func (d *Daemon) queueUserspaceSessionDeltas(
+	zoneIDs map[string]uint16,
+	deltas []dpuserspace.SessionDeltaInfo,
+) int {
+	// Snapshot the live session-sync object once for the whole batch (#4958):
+	// the per-delta filter and queue calls all operate on this pointer instead
+	// of re-reading the shared field, so the hot path never locks per delta and
+	// a concurrent stopClusterComms cannot nil the field mid-batch.
+	ss := d.getSessionSync()
+	if ss == nil {
+		return 0
+	}
+	return d.walkUserspaceSessionDeltas(ss, zoneIDs, deltas, queueDeltaSink{ss: ss})
 }
 
 func (d *Daemon) drainUserspaceSessionDeltasWithConfig(

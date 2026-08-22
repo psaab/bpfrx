@@ -991,10 +991,21 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// reconciliation — a stale peer-owned session the standby held
 			// survived cold-prime. Cold-prime now uses the lossless BulkSync
 			// direct-write window (doBulkSync), which delimits a COMPLETE
-			// authoritative snapshot the receiver reconciles against. A
-			// table-truth, owner-RG-filtered snapshot via ExportOwnerRGSessions
-			// (eliminating the BulkSync mirror-map drift residual) is tracked as
-			// a follow-up.
+			// authoritative snapshot the receiver reconciles against.
+			//
+			// #6031: that window is now framed from TABLE TRUTH, not from the
+			// BPF `sessions`/`sessions_v6` conntrack maps BulkSync walks. Under
+			// the userspace dataplane those maps are a best-effort DISPLAY
+			// mirror — the helper's transit forward install never publishes a
+			// conntrack row — so the walk cannot see the transit sessions that
+			// dominate a forwarding node. Combined with #5085's authoritative
+			// reconcile (absent from the window => DELETED), framing cold prime
+			// from the mirror DELETED the standby's live peer-owned transit
+			// sessions. BulkSnapshotSource supplies the owner-RG-filtered live
+			// set from the helper's SessionTable via ExportOwnerRGSessions
+			// instead, and doBulkSync fails CLOSED if it errors rather than
+			// falling back to the destructive mirror walk.
+			ss.BulkSnapshotSource = d.userspaceBulkSnapshot
 
 			ss.OnPeerDisconnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
