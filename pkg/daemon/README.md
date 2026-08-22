@@ -399,6 +399,33 @@ mirrors `reconcileSNMP`: `reconcileWebManagement` runs EARLY in
 credential revocation is enforced even on an apply that returns early
 (`store.Commit` has already promoted the config). Reconcile discipline:
 
+**Startup ordering and publication (#6719).** `d.mgmt` is an
+`atomic.Pointer[managementReconciler]`, not a plain field, and the type is doing
+real work rather than being defensive. `startClusterComms` runs at
+`daemon_run.go` ~:405 and `startHTTPServer` at ~:596, so for roughly 190 lines of
+`Run` the peer-sync apply path is live while the reconciler does not exist yet —
+`reconcileWebManagement` reads the pointer on exactly that path. A plain field
+write racing those reads is a data race on the pointer that gates the management
+auth reconcile; the atomic gives the happens-before edge and makes the plain read
+impossible to reintroduce. (#6827 round 5 had narrowed this to the stale-cert
+path under `staleCertMu` and said so explicitly — "Do not read this as `mgmt is
+guarded`; it is not". It is now.)
+
+`start` also derives its snapshot from `store.ActiveConfig()` **under `m.mu`**,
+not before taking it. The pre-#6719 shape read the active config first and only
+then contended for the lock, which lost a promotion outright: startup read config
+A, a peer sync promoted B (revoking A's credential) and called `reconcile`, that
+reconcile won the lock, found `m.srv == nil` and no-opped, and `start` then
+installed the server built from the stale A. The credential stayed accepted until
+some later reconcile or a restart, and the same window applied to the bind
+address and TLS. Reading under the lock makes both interleavings correct rather
+than one lossy: a promotion that lands before the read is simply seen, and one
+that lands while the lock is held blocks and then converges against a server that
+now exists. `committedDesired` (the reconcile path) reads the same
+`store.ActiveConfig()`, so the two derivations agree on their authority by
+construction. `startLocked` is the shared body; `startTo` remains the
+explicit-config test seam.
+
 - **Auth change on an unchanged endpoint** → live `api.Server.ReplaceAuth`
   (atomic snapshot swap, effective next request, no rebind, no window).
 - **Endpoint change** → reconcile ONLY the listener leg that changed, PER LEG:

@@ -86,7 +86,7 @@ func TestWarnStaleMgmtCertForHostNameWithoutServer_6827(t *testing.T) {
 
 	reg := newFakeReg()
 	d := &Daemon{}
-	d.mgmt = newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
+	d.mgmt.Store(newManagementReconciler(d, api.Config{ListenFunc: reg.listen}))
 	noteRename(t, d, "new-fw-6827")
 	d.deliverStaleMgmtCertDiagnosis()
 }
@@ -262,7 +262,7 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 		reg := newFakeReg()
 		d := &Daemon{}
 		m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
-		d.mgmt = m
+		d.mgmt.Store(m)
 		stubHostname(t, "new-fw-6827")
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
@@ -371,7 +371,7 @@ func serveStaleCert(t *testing.T, d *Daemon, certName string) *managementReconci
 	t.Helper()
 	reg := newFakeReg()
 	m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
-	d.mgmt = m
+	d.mgmt.Store(m)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
@@ -650,10 +650,10 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 			// hoisted above mgmt.start would still read the name (d.mgmt is
 			// published first) but could never reach a certificate, because no
 			// server exists yet.
-			if d.mgmt != nil {
-				d.mgmt.mu.Lock()
-				srvUpAtRead = d.mgmt.srv != nil
-				d.mgmt.mu.Unlock()
+			if m := d.mgmt.Load(); m != nil {
+				m.mu.Lock()
+				srvUpAtRead = m.srv != nil
+				m.mu.Unlock()
 			}
 			return "new-fw-6827", nil
 		}
@@ -700,7 +700,7 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 		)
 		reg := newFakeReg()
 		m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
-		d.mgmt = m
+		d.mgmt.Store(m)
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 
@@ -795,7 +795,7 @@ func TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827(t *testing.T) {
 	)
 	reg := newFakeReg()
 	m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
-	d.mgmt = m
+	d.mgmt.Store(m)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -979,7 +979,7 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 		)
 		reg := newFakeReg()
 		m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
-		d.mgmt = m
+		d.mgmt.Store(m)
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 

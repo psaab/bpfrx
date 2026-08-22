@@ -103663,6 +103663,56 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
 
+## 2026-08-22 — #6719 management reconciler startup race + unguarded publish
+- **Action**: `d.mgmt` became an `atomic.Pointer[managementReconciler]` (was a
+  plain field written in startHTTPServer and read unguarded by
+  reconcileWebManagement, with cluster comms — and therefore peer sync — live
+  ~190 lines earlier in Run). `managementReconciler.start` now derives its
+  desired state from `store.ActiveConfig()` UNDER `m.mu` via a new `startLocked`
+  shared body, so a promotion racing startup is no longer dropped by a reconcile
+  that no-ops on `m.srv == nil` and then overwritten by the stale snapshot.
+- **File(s)**: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/management.go`,
+  `pkg/daemon/management_start_race_6719_test.go` (new),
+  `pkg/daemon/daemon_dp_escape_rest_test.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `pkg/daemon/README.md`
+
+## 2026-08-22 — #6733 redact credential-bearing URL fields on marshal
+- **Timestamp**: 2026-08-22
+- **Action**: The config redaction pass is name-keyed; several fields are
+  sensitive by CONTENT (URLs/endpoints named for what they are). Added
+  RedactURL coverage to SystemConfig.LicenseAutoUpdate, ArchivalConfig
+  archive-site lists, FeedServer.Hostname, FeedEntry.Path, RPMTest.Target and
+  WgPeerConfig.Endpoint, plus a reflective census gate that fails when a new
+  URL-shaped field renders a planted credential verbatim.
+- **File(s)**: pkg/config/types_system.go, pkg/config/types_security.go,
+  pkg/config/types_routing.go,
+  pkg/config/url_field_redaction_census_6733_test.go
+
+## 2026-08-22 — #6725 closed-world doc claim
+- **Action**: Corrected the one residual false claim in the open-world branch
+  ("the default for every production subtree"; unscoped "byte-identical").
+  Two of the issue's three claims were already fixed by f37fdf19b (2026-08-05),
+  four days after the issue was filed.
+- **File(s)**: `pkg/config/schema_walk.go`
+
+## 2026-08-22 — #6723 the policy-rematch half is not deferred; correct the claim
+- **Action**: `deletedPolicyRuntimeIDs`' header — the FIRST comment a reader hits
+  when tracing commit-time session invalidation — called the modified-policy
+  (policy-rematch) half "the deferred #4234 ... half, intentionally out of
+  scope". It is not deferred: `changedPolicyRuntimeIDs` /
+  `clearSessionsForModifiedPolicies` ship in the same file and
+  `clearSessionsForPolicyChanges` runs both on every commit. Following the stale
+  pointer to a now-closed issue leads a reader to conclude a shipped,
+  security-relevant behaviour is missing. Corrected both sites (the second was
+  the same phrasing in `clearSessionsForDeletedPolicies`), keeping the
+  stable-key rationale for why THIS function does not report changed policies.
+  Guarded by a WIRING bind rather than a phrase sweep: a phrase sweep is
+  defeated by paraphrase and would red on the corrections themselves, which
+  quote the old wording so the change is visible.
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/policy_rematch_shipped_6723_test.go (new)
+
 ## 2026-08-22 — #6710 measured: the dead-host cache drops permitted LAN->tunnel traffic
 - **Action**: #6710 was filed as an OPEN QUESTION, read from source with the
   worker loop never executed. MEASURED it: a LAN->xfrmi egress resolves
