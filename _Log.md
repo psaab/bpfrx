@@ -102996,6 +102996,76 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/fabric_neigh_single_source_6598_test.go,
     docs/fabric-cross-chassis-fwd.md
 
+## 2026-08-22
+
+- **Timestamp**: 2026-08-22
+- **Action**: #7409 — kernel-learned routes now reach the userspace dataplane
+  FIB. The helper FIB was built from config-derived sources only (config
+  statics, connected prefixes, the ip-rule leak mirror, the ip-monitoring
+  overlay), so FRR-installed BGP/OSPF/IS-IS/RIP routes and non-management
+  DHCP-learned routes (AD-200 default + RFC 3442 classless) were invisible to
+  it while the kernel routed them. A transit packet toward such a destination
+  either resolved `NoRoute` — slow-path eligible, so REINJECTED and forwarded
+  by the kernel with no zone policy, session, NAT or screen, and no nftables
+  `hook forward` chain behind it — or matched a less-specific config default
+  and went to the WRONG next-hop. Added `pkg/routing/fibimport.go`
+  (`ImportLearnedRoutes`) reusing the existing `rtProtoName` RTPROT mapping as
+  the route-source signal, wired into `buildRouteSnapshots` as a fifth source
+  under a GAP-FILL rule (an imported route is dropped whenever the
+  config-derived set already covers the same canonical
+  `(table, family, prefix)`), so no existing precedence contract changes.
+  Import is unicast-only + gateway-bearing + whole-ECMP-or-nothing, table set
+  bounded to main plus configured instances, mgmt VRF 999 hard-excluded, and
+  fails closed on netlink error.
+  REJECTED the alternative acceptance branch (refuse to arm when a dynamic
+  routing protocol is configured) and recorded why in `capabilities.go`: zero
+  of 23 shipped configs configure a dynamic protocol so it closes nothing,
+  extending it to DHCP would disarm 20 of 23 including the whole HA/smoke
+  substrate (and #5275 drives `ip_forward` to 0 on disarm, so such a box
+  forwards nothing), and it is unsound in principle because FRR runs operator
+  content outside the managed markers that `cfg.Protocols` cannot see.
+  Corrected the FALSE `"NoRoute drops anyway"` comment in
+  `poll_descriptor/mod.rs` — it does not drop, it is reinjected; being false
+  in the SAFE direction is why the gap went unexamined. Strengthened
+  `tests_fragment.rs` to assert the packet DOES reach the slow path
+  (`slow_path_drops == 1`) rather than the drop its comment imagined;
+  asserting the reverse would be false today and after this fix, since the
+  fixture builds an empty `scrub` table by construction. Exported the four
+  `slow_path_{no_route,next_table,local_delivery,missing_neighbor}_packets`
+  counters to Prometheus — already on the wire and delta-tracked in
+  `pkg/monitoriface`, but unexported, which is what made a rising reinject
+  rate unalertable and the bypass unobservable in production.
+  KNOWN LIMITATION, stated in code and docs: this NARROWS the window, it does
+  not close it. There is no `RouteSubscribe` in this repo, so the FIB
+  refreshes only on commit and ip-monitoring actuation and a route learned
+  between pushes still takes the reinject. `NoRoute` must therefore STAY
+  slow-path eligible; dropping it would black-hole every learned destination
+  for the width of that window. Follow-up filed for the route-event listener.
+  Validation: 11 new importer tests, 9 snapshot-wiring tests (incl. the
+  gap-fill, per-table middle state, fail-closed and determinism cases), 3
+  metric tests, `pkg/api`/`pkg/routing`/`pkg/dataplane/userspace` suites green,
+  Rust fragment test green. 8-cell mutation matrix run with an
+  apply-verifying harness: 7 RED, 1 correctly GREEN (import-vs-overlay
+  ordering is genuinely order-independent — the comment claiming otherwise was
+  corrected rather than the test strengthened). The mutation work also found a
+  real defect: the gap-fill key was not canonicalising the prefix, so a config
+  static written `10.20.30.1/24` would not have matched an imported
+  `10.20.30.0/24` and would have emitted a duplicate.
+- **File(s)**: pkg/routing/fibimport.go (new),
+  pkg/routing/fibimport_7409_test.go (new), pkg/routing/README.md,
+  pkg/dataplane/userspace/routes.go,
+  pkg/dataplane/userspace/routes_learned_7409_test.go (new),
+  pkg/dataplane/userspace/capabilities.go, pkg/dataplane/userspace/manager.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors_binding.go,
+  pkg/api/metrics_userspace.go,
+  pkg/api/metrics_userspace_slowpath.go (new — the emitter is in its own file
+  because appending it to metrics_userspace.go crossed the 2000-LOC
+  modularity floor; split rather than excepted),
+  pkg/api/metrics_slowpath_reinject_7409_test.go (new),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
+  docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
 - **Timestamp**: 2026-08-22
   - **Action**: #6599 — fenced the session-sync delta filter's fabric-redirect
     carve-out on INGRESS-side RG ownership. It admitted every fabric-redirect
