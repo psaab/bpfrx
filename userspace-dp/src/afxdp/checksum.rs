@@ -232,6 +232,135 @@ pub(super) fn dnat_v6_key_bytes(
     Some(dk)
 }
 
+/// #6745: the sessions currently relying on each reverse-NAT steering row.
+///
+/// THE ROW IS SHARED AND THE CLOSE WAS NOT. `dnat_v4_key_bytes` /
+/// `dnat_v6_key_bytes` build the key from `(protocol, SNAT source address,
+/// SNAT source port)` and NOTHING ELSE — the remote endpoint is absent. Under
+/// address-only SNAT (`port no-translation`) and plain static SNAT, two flows
+/// from one internal source to DIFFERENT remotes therefore land on ONE row,
+/// and the allocator admits both on purpose: `AddressOnlyReverseKey`
+/// (`nat/allocator.rs`) enforces uniqueness on a key that DOES include
+/// `dst_ip`/`dst_port`. A per-session close then deleted that row
+/// unconditionally, so closing either flow removed the steering the other one
+/// still needed.
+///
+/// WHY A READ-BEFORE-DELETE VALUE COMPARISON IS NOT THE FIX, since it is the
+/// first thing anyone reaches for and it is a strict improvement for a
+/// different case. The VALUE encodes the reverse-NAT target — the ORIGINAL
+/// source ip/port. The two colliding flows above share one internal source, so
+/// both publish an IDENTICAL value: a comparison cannot separate them, and the
+/// closing session still deletes the row the survivor needs. It fixes only the
+/// DISPLACED case (one session's publish overwrote another's differing value).
+/// Holders are what the shared case needs.
+///
+/// WHY A PROCESS GLOBAL, and not a field threaded through the callers. The
+/// `dnat_table` map is itself a single process-global object — `ha`'s import
+/// path says so where it publishes ("The process-global `dnat_table` map is a
+/// single shared object, so this once-per-synced-session publish (not per
+/// worker) mirrors the primary"). Holder accounting has exactly that resource's
+/// scope. Putting it in `DnatTableFds` would strip that struct's `Copy` and
+/// churn every call site; keeping it here means the ONLY two functions that
+/// touch a row are also the only two that account for it, so the accounting
+/// cannot drift from the map — there is nowhere else to put it.
+///
+/// COST. One uncontended mutex acquisition on a path that already performs a
+/// `bpf_map_update_elem` / `bpf_map_delete_elem` SYSCALL for the same row, and
+/// only for sessions that carry a source rewrite. It is not on the per-packet
+/// path; it is per NAT'd session install and close.
+static DNAT_STEERING_HOLDERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<DnatSteeringKey, Vec<crate::session::SessionKey>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The identity of one reverse-NAT steering row, per family.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum DnatSteeringKey {
+    V4([u8; 12]),
+    V6([u8; 24]),
+}
+
+/// The steering row `key`+`nat` would publish, or `None` when the flow has no
+/// SNAT source rewrite and therefore publishes no row.
+pub(super) fn dnat_steering_key(
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+) -> Option<DnatSteeringKey> {
+    match key.addr_family as i32 {
+        libc::AF_INET => dnat_v4_key_bytes(key, nat).map(DnatSteeringKey::V4),
+        libc::AF_INET6 => dnat_v6_key_bytes(key, nat).map(DnatSteeringKey::V6),
+        _ => None,
+    }
+}
+
+/// Record that `key` relies on its steering row. Idempotent: a re-publish of
+/// the same session (re-sync, reconcile replay, a second worker seeing the
+/// same flow) must not add a second holder, or the row would outlive its last
+/// real user.
+pub(super) fn add_dnat_steering_holder(key: &crate::session::SessionKey, nat: NatDecision) {
+    let Some(sk) = dnat_steering_key(key, nat) else {
+        return;
+    };
+    let mut holders = DNAT_STEERING_HOLDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = holders.entry(sk).or_default();
+    if !entry.iter().any(|held| held == key) {
+        entry.push(key.clone());
+    }
+}
+
+/// Drop `key`'s reliance on its steering row and report whether the ROW may now
+/// be deleted.
+///
+/// Returns `true` when no other session holds it — including when nothing was
+/// ever recorded, which is deliberately the PRE-#6745 answer: a row published
+/// by a path that does not account (or by an older build across a restart) is
+/// deleted exactly as before rather than leaked forever. The failure direction
+/// of an accounting gap is therefore "unchanged", never "the map fills up".
+pub(super) fn release_dnat_steering_holder(
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+) -> bool {
+    let Some(sk) = dnat_steering_key(key, nat) else {
+        return true;
+    };
+    let mut holders = DNAT_STEERING_HOLDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = holders.get_mut(&sk) else {
+        return true;
+    };
+    entry.retain(|held| held != key);
+    if entry.is_empty() {
+        holders.remove(&sk);
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+pub(super) fn dnat_steering_holder_count(
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+) -> usize {
+    let Some(sk) = dnat_steering_key(key, nat) else {
+        return 0;
+    };
+    DNAT_STEERING_HOLDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&sk)
+        .map_or(0, |v| v.len())
+}
+
+#[cfg(test)]
+pub(super) fn reset_dnat_steering_holders() {
+    DNAT_STEERING_HOLDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 /// #2979: delete the dynamic reverse-NAT `dnat_table` / `dnat_table_v6` entry
 /// published by `publish_dnat_table_entry` when the SNAT'd session closes or
 /// expires. The maps are `BPF_MAP_TYPE_HASH` (not LRU) with
@@ -249,6 +378,16 @@ pub(super) fn delete_dnat_table_entry(
     nat: NatDecision,
 ) {
     if nat.rewrite_src.is_none() {
+        return;
+    }
+    // #6745: the steering row is SHARED — its key carries no remote endpoint,
+    // so two sessions from one internal source to different remotes land on
+    // one row and the allocator admits both deliberately. Release this
+    // session's hold first and delete only when it was the last. A `false`
+    // here means another live session still steers through this row; deleting
+    // it would blackhole that session's return traffic until it re-published.
+    // See DNAT_STEERING_HOLDERS for why a value comparison does not do this.
+    if !release_dnat_steering_holder(key, nat) {
         return;
     }
     match key.addr_family as i32 {
@@ -309,6 +448,13 @@ pub(super) fn publish_dnat_table_entry(
     let Some(snat_ip) = nat.rewrite_src else {
         return true;
     };
+    // #6745: record the hold BEFORE the map write, and unconditionally — not
+    // only on the success path. A publish that fails still leaves this session
+    // steering through that row conceptually, and more importantly the FAILURE
+    // path must not make a concurrent sibling's close look like the last one.
+    // Recording here also means every publisher accounts, including the HA
+    // import path, which reaches this function and nothing else.
+    add_dnat_steering_holder(key, nat);
     match (key.addr_family as i32, snat_ip) {
         (libc::AF_INET, IpAddr::V4(_snat_v4)) => {
             let Some(fd) = fds.v4 else { return true };

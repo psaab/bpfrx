@@ -646,6 +646,7 @@ pub(crate) fn replan_queues(
     snapshot: Option<&ConfigSnapshot>,
     workers: usize,
     existing: &[BindingStatus],
+    forwarding_armed: bool,
 ) -> Vec<BindingStatus> {
     let mut candidates: Vec<(String, usize)> = Vec::new();
     let mut ifindex_by_name: BTreeMap<String, i32> = BTreeMap::new();
@@ -771,7 +772,7 @@ pub(crate) fn replan_queues(
             candidates.push((fabric.parent_linux_name.clone(), rx_queues));
         }
     }
-    replan_bindings_from_candidates(workers, existing, candidates, ifindex_by_name)
+    replan_bindings_from_candidates(workers, existing, candidates, ifindex_by_name, forwarding_armed)
 }
 
 pub(crate) fn replan_bindings_from_candidates(
@@ -779,6 +780,7 @@ pub(crate) fn replan_bindings_from_candidates(
     existing: &[BindingStatus],
     candidates: Vec<(String, usize)>,
     ifindex_by_name: BTreeMap<String, i32>,
+    forwarding_armed: bool,
 ) -> Vec<BindingStatus> {
     let mut existing_by_slot = BTreeMap::new();
     for binding in existing {
@@ -842,6 +844,36 @@ pub(crate) fn replan_bindings_from_candidates(
                 binding.ready = false;
             } else if !had_existing {
                 binding.registered = true;
+                // #6749: a NEWLY registered slot inherits the GLOBAL arm state
+                // instead of `BindingStatus::default()`'s `armed = false`.
+                //
+                // Without this, ANY binding-plan expansion — a zone gaining an
+                // interface, a fabric parent appearing, a queue-count change
+                // that widens the slot range — silently disables the WHOLE
+                // dataplane. `refresh_status` computes
+                // `status.enabled = forwarding_armed && ... &&
+                // bindings.iter().all(|b| b.registered && b.armed)`
+                // (helpers/status.rs), so one unarmed slot makes `enabled`
+                // false for every binding on the box, and Go's
+                // `resolveCtrlEnableLocked` keys ctrl-enable on that flag —
+                // ctrl goes to 0 and ALL transit drops.
+                //
+                // And it does not self-heal, which is what makes it
+                // indefinite rather than a one-tick blip. The only writer of
+                // per-binding `armed` outside this function is
+                // `set_bindings_forwarding_armed`, reached only from the
+                // `set_forwarding_state` handler — and Go suppresses that RPC
+                // as a no-op whenever the arm state has not CHANGED
+                // (`syncDesiredForwardingStateLocked`:
+                // `if m.lastStatus.ForwardingArmed == desired { return nil }`).
+                // The helper's GLOBAL `forwarding_armed` is still true across
+                // an expansion, so nothing ever re-arms the new slot.
+                //
+                // Inheriting rather than hardcoding `true` is the point: on a
+                // disarmed box (HA secondary, shutdown, a disarm from the
+                // protocol gate) a new slot must come up disarmed, exactly as
+                // `set_bindings_forwarding_armed` would have set it.
+                binding.armed = forwarding_armed;
             }
             if binding.last_change.is_none() {
                 binding.last_change = Some(Utc::now());
