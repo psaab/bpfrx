@@ -102686,3 +102686,10 @@ prose edit above them added. No diff falls in the new test body.
     starvation — and reds on a revert to `while !stop`.
   - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
     docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6593 — six of seven pre-publish siblings had no ordering guard and
+    the seventh had a hoist bypass. Added one PrePublishSiblings capture at the
+    store_runtime_view choke point covering all seven, with #6592-style
+    previous-view retention for hoist resistance. cfg(test) only.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/{cos_state.rs,mod.rs,tests.rs}

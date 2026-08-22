@@ -42,6 +42,8 @@ use cos_leases::{
     unique_interface_owner_worker_id,
 };
 pub(crate) use cos_state::SharedCoSState;
+#[cfg(test)]
+pub(crate) use cos_state::PrePublishSiblings;
 pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
 pub(crate) use neighbor_manager::WarmItem;
@@ -376,6 +378,13 @@ pub struct Coordinator {
     /// Absent from release builds; per-instance so parallel tests never race.
     #[cfg(test)]
     pub(crate) runtime_view_at_publish: Option<(Arc<RuntimeView>, Arc<RuntimeView>)>,
+    /// #6593: every worker-visible sibling structure that MUST be published
+    /// before the runtime view, captured at the instant just before the view
+    /// store. See `PrePublishSiblings` for the invariant and why it retains
+    /// `Arc`s. Absent from release builds; per-instance so parallel tests
+    /// never race.
+    #[cfg(test)]
+    pub(crate) prepublish_siblings: Option<PrePublishSiblings>,
     /// #6244: typed reconcile progress + failure identity. Replaces the
     /// former free-form `String` side-channel; the legacy operator string is
     /// rendered only at the `reconcile_debug` / `debug_reconcile_stage` wire
@@ -445,6 +454,8 @@ impl Coordinator {
             cos_owner_at_forwarding_publish: None,
             #[cfg(test)]
             runtime_view_at_publish: None,
+            #[cfg(test)]
+            prepublish_siblings: None,
             last_reconcile_stage: ReconcileStage::Idle,
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
@@ -1243,6 +1254,19 @@ impl Coordinator {
         #[cfg(test)]
         {
             self.runtime_view_at_publish = Some((view.clone(), self.ha.runtime.load_full()));
+            // #6593: capture EVERY sibling that must already be worker-visible
+            // here, not just the CoS owner map. Taken at the same instant and
+            // from the same choke point, so no publish path can bypass it.
+            self.prepublish_siblings = Some(PrePublishSiblings {
+                cos_owner_worker_by_queue: self.cos.owner_worker_by_queue.load_full(),
+                cos_owner_live_by_queue: self.cos.owner_live_by_queue.load_full(),
+                cos_root_leases: self.cos.root_leases.load_full(),
+                cos_exact_backlogs: self.cos.exact_backlogs.load_full(),
+                cos_queue_leases: self.cos.queue_leases.load_full(),
+                cos_queue_vtime_floors: self.cos.queue_vtime_floors.load_full(),
+                ha_fabrics: self.ha.fabrics.load_full(),
+                previous_view: self.ha.runtime.load_full(),
+            });
         }
         self.ha.runtime.publish(view);
     }
