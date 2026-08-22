@@ -39,6 +39,9 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 				Prefix:     subPrefix.String(),
 				OnLink:     true,
 				Autonomous: true,
+				// #6587: mark the provenance so pkg/ra can apply a floor to a
+				// DELEGATED prefix without breaking an operator-authored ::/0.
+				Delegated: true,
 			}
 			if mapping.ValidLifetime > 0 {
 				pfx.ValidLifetime = int(mapping.ValidLifetime.Seconds())

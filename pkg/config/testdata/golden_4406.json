@@ -910,7 +910,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -2171,7 +2172,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -3431,7 +3433,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -4691,7 +4694,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -5952,7 +5956,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -7212,7 +7217,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -8289,7 +8295,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -9261,7 +9268,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -10232,7 +10240,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -11203,7 +11212,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -12175,7 +12185,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [
@@ -13146,7 +13157,8 @@
                 "OnLink": true,
                 "Autonomous": true,
                 "ValidLifetime": 0,
-                "PreferredLife": 0
+                "PreferredLife": 0,
+                "Delegated": false
               }
             ],
             "DNSServers": [

@@ -1,3 +1,37 @@
+## 2026-08-22 — #6587 prefix-length validators + provenance-aware RA floor
+
+- **Timestamp**: 2026-08-22
+- **Action**: Part A: typed `ValidateInteger(0, 128)` on
+  `preferred-prefix-length` and `sub-prefix-length` (both were untyped
+  placeholders behind an Atoi whose error is discarded). CORRECTION to
+  the issue: the impact is NOT symmetric — `sub-prefix-length` is
+  incidentally fail-closed, but `preferred-prefix-length > 128` makes
+  `net.CIDRMask` return nil and the IA_PD hint EGRESSES with wire
+  prefix-length 0.
+  Part B: added `config.RAPrefix.Delegated`, set only by
+  `buildRAConfigs` on the PD path, and a `buildRA` floor refusing
+  `Delegated && Bits()==0`. That supplies the PROVENANCE #6531 said was
+  missing, so an operator-authored `::/0` is untouched. Also added the
+  field to `pkg/ra`'s `configEqual` — it gates whether the PIO is emitted
+  at all, so it is wire-affecting (#4307's lesson).
+  Regenerated `golden_4406.json`: the diff is exclusively
+  `"Delegated": false` additions, verified before regenerating.
+  Repurposed `TestBuildRA_6531_ZeroPrefixWouldBeAdvertised` — its stated
+  premise ("indistinguishable from operator-authored") is no longer true,
+  so it is renamed to `TestBuildRA_6587_ConfiguredZeroPrefixStillAdvertised`
+  and now serves as the over-reach guard.
+  Mutation matrix 8/8 RED after fixing two cells: B4 (daemon stops
+  stamping) was GREEN — the WIRING was unbound, since every pkg/ra test
+  sets the flag itself; B5 was a BAD CELL that neutered PreferredLife
+  instead of Delegated.
+- **File(s)**: pkg/config/schema_interfaces.go, pkg/config/types_routing.go,
+  pkg/config/testdata/golden_4406.json, pkg/daemon/daemon_ra.go,
+  pkg/ra/sender.go, pkg/ra/ra.go,
+  pkg/config/dhcpv6_prefixlen_schema_6587_test.go,
+  pkg/ra/sender_delegated_prefixlen_6587_test.go,
+  pkg/ra/sender_prefixlen_6531_test.go,
+  pkg/daemon/ra_pd_prefixlen_6531_test.go, pkg/dhcp/README.md
+
 ## 2026-08-22 — #6589 clamped monitor weights visible to the operator
 
 - **Timestamp**: 2026-08-22
