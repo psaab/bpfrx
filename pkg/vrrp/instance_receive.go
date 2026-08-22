@@ -258,7 +258,7 @@ func (vi *vrrpInstance) receiverAfPacket() {
 		default:
 		}
 
-		n, _, err := unix.Recvfrom(vi.afPacketFD, buf, 0)
+		n, from, err := afPacketRecvfrom(vi.afPacketFD, buf, 0)
 		if err != nil {
 			select {
 			case <-vi.stopCh:
@@ -270,6 +270,13 @@ func (vi *vrrpInstance) receiverAfPacket() {
 				}
 				continue
 			}
+		}
+
+		// Drop our OWN transmissions (#6560). See afPacketFrameIsOutgoing for
+		// why this is not redundant with PACKET_IGNORE_OUTGOING, and why the
+		// address-snapshot comparison further down cannot cover it.
+		if afPacketFrameIsOutgoing(from) {
+			continue
 		}
 
 		// Need at least 14 bytes to read the ethertype.
@@ -521,4 +528,54 @@ func (vi *vrrpInstance) warnRXDrop() {
 	}
 	slog.Warn("vrrp: rx channel full, dropping advertisements",
 		"key", vi.key(), "total_drops", drops)
+}
+
+// afPacketRecvfrom is the recvfrom(2) entry point used by receiverAfPacket.
+// Package var for the same reason as afPacketSocket in manager.go: it lets a
+// test drive the receive LOOP — including the #6560 self-frame drop, which lives
+// in the loop and not in the parsers — deterministically and without CAP_NET_RAW.
+var afPacketRecvfrom = unix.Recvfrom
+
+// afPacketFrameIsOutgoing reports whether a frame the AF_PACKET capture socket
+// delivered is one this host TRANSMITTED, using the sll_pkttype the kernel
+// reports in the frame's sockaddr_ll (#6560).
+//
+// WHY THIS EXISTS AT ALL. The capture socket is an ETH_P_ALL tap — that is what
+// tcpdump uses and why tcpdump shows egress traffic. dev_queue_xmit_nit clones
+// every outbound frame to each ptype_all tap with skb->pkt_type =
+// PACKET_OUTGOING, and packet_rcv drops only PACKET_LOOPBACK. Adverts leave on
+// the raw AF_INET/AF_INET6 sockets, but they egress the very netdev this socket
+// is bound to, so a MASTER's own advertisement arrives in its own receive queue.
+// The cBPF filter cannot stop it: every instruction matches ethertype or IP
+// protocol, there is no SKF_AD_PKTTYPE ancillary load, and a self-advert
+// satisfies the filter exactly.
+//
+// WHY THE EXISTING SELF-CHECK IS NOT ENOUGH. Self-filtering rested solely on
+// comparing the frame's source against getLocalIP()/getLocalIPv6(), and those
+// are DELIBERATELY nilable: reresolveLocalAddrs stores nil when the interface
+// has no non-VIP address of the family. Every one of those four comparisons is
+// written `lip != nil && src.Equal(lip)`, so a nil snapshot means ACCEPT. During
+// the #2528 RETH-MAC flush window — programRethMAC does link DOWN, set MAC, link
+// UP, and DOWN flushes every kernel address — the snapshot is nil for 30ms-1s.
+// A self-advert already committed to the tap then reaches handleMasterRx, where
+// it necessarily carries our own priority, so resolveEqualPriorityMaster runs;
+// that function re-reads the same nilable snapshot and, on nil, logs "local
+// source unresolved — stepping down" and calls becomeBackup. The comment there
+// justifies the step-down by assuming the advert came from a PEER. In this case
+// the "actively advertising equal-priority peer" is this node itself.
+//
+// WHY IT IS NOT REDUNDANT WITH PACKET_IGNORE_OUTGOING. That socket option is
+// Linux >= 4.20; on an older kernel openAfPacketReceiver logs and continues, and
+// this check is what still holds. Keeping both is the belt-and-braces pair: the
+// option avoids the copy, this avoids acting on it.
+//
+// A sockaddr that is missing or not a link-layer one is treated as NOT outgoing.
+// Failing open here is correct: a frame we cannot classify must still be able to
+// be a peer's advert, and dropping it would be a self-inflicted master-down.
+func afPacketFrameIsOutgoing(from unix.Sockaddr) bool {
+	sll, ok := from.(*unix.SockaddrLinklayer)
+	if !ok || sll == nil {
+		return false
+	}
+	return sll.Pkttype == unix.PACKET_OUTGOING
 }

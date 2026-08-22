@@ -2857,6 +2857,14 @@ func validateProxyARPAddressesStrict(cfg *Config) error {
 						"traffic to it would never be drawn to this firewall (#6659)",
 					entry.Interface, addr)
 			}
+			// #6559: a value that is STILL a multi-host prefix here is one the
+			// compiler's expansion declined as over-cap — every in-cap block
+			// has already become single-host entries. It installs one kernel
+			// proxy-neighbour for the address as authored (the NETWORK address
+			// for a canonical prefix), so the block answers nothing.
+			if err := proxyARPNonHostPrefixError(entry.Interface, addr); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -37,6 +37,66 @@
   `pkg/dataplane/userspace/flow_tcp_timeout_carrier_6539_test.go` (new),
   `docs/feature-gaps.md`, `docs/config-schema.md`
 
+## 2026-08-21 — #6534 NAT fail-closed exclusions stop rendering as enforced
+
+- **Timestamp**: 2026-08-21
+- **Action**: Closed the NAT family of #6534, where a rule the userspace
+  snapshot builder drops or disarms still rendered on every `show
+  security nat` surface exactly like an enforced one. Extracted the four
+  drop predicates into `pkg/config` as shared exported functions and made
+  BOTH the snapshot builder and the `pkg/natshow` renderers read them, so
+  the two cannot disagree about which rules are armed; excluded rules now
+  carry a `Status: NOT INSTALLED — <reason>` line naming the condition
+  that fired.
+  Deliberately NOT the applied-set readback the issue prescribed: all of
+  these exclusions are decided by the Go builder at snapshot-build time
+  as a deterministic function of the committed config, so there is no
+  runtime fact to read back, and `AppliedNATView` returns the applied
+  CONFIG rather than the applied SNAPSHOT — it does not carry the drop
+  bit. The missing thing was the predicate, not a data path.
+  Output for a healthy configuration is byte-identical, so the existing
+  CLI/gRPC golden tests keep asserting the same bytes.
+  Validation: `go test -count=1` green on pkg/natshow, pkg/config,
+  pkg/dataplane/userspace, pkg/cli, pkg/grpcapi; `go vet` clean on the
+  three touched packages (0 diagnostics); 6-cell mutation matrix all red
+  with vet clean at each mutated state, control and restored both green.
+  Reverting either half of the agreement — a renderer annotation or a
+  builder guard — reds and names the site.
+- **File(s)**: pkg/config/nat_exclusion_reason.go,
+  pkg/dataplane/userspace/nat_static.go,
+  pkg/dataplane/userspace/nat_destination.go,
+  pkg/dataplane/userspace/nat_exclusion_agreement_6534_test.go,
+  pkg/natshow/natshow.go, pkg/natshow/source.go, pkg/natshow/dest.go,
+  pkg/natshow/static.go, docs/engineering-style.md,
+  docs/junos-cli-reference.md, _Log.md
+## 2026-08-21 — #6558 ACK watermark held behind the pending-apply queue
+
+- **Timestamp**: 2026-08-21
+- **Action**: The event stream ACKed past queued-but-unapplied deltas — but
+  NOT by the mechanism the issue states. The normal path is already
+  receive→apply→ACK; the real window is that `dispatchOrQueue*` returns
+  true after an ENQUEUE, so the reader keeps reading while frames sit
+  unapplied, and all five refusal paths advanced `lastAppliedSeq` with no
+  pending-queue check. Added `applyRefusedFrameInOrder`: a refusal landing
+  on a non-empty queue enters it as a dropped marker and its watermark
+  advance happens in FIFO order; on an empty queue the advance is
+  immediate as before, so #6130's loop-break is intact. Made
+  `markFrameApplied` monotonic (was a bare Store, so an in-order flush
+  could rewind the watermark below a drop-path jump — silently swallowed
+  by `sendAckIfNeeded`'s `applied <= acked` guard and able to regress
+  `SendDrainRequest`'s fence). GO-ONLY: no Rust `userspace-dp` change, no
+  `userspace-xdp` shim `.o` movement, no `make generate` — the helper side
+  is already correct and fail-closed.
+  Mutation matrix: S1 (pre-fix unconditional advance) and S2 (never
+  advance while queued) → the core probe reds; S4 (bare Store) → the
+  monotonic test reds; S6 (marker type collides with a live frame type)
+  → the collision invariant reds. S3 (always queue the marker, even when
+  empty) and S5 (flush ignores the marker, falling through to the
+  pre-existing `default:` arm) are GREEN and disclosed as extensionally
+  equivalent variants, not holes.
+- **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_ack_behind_pending_6558_test.go,
+  docs/session-sync-architecture.md
 ## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
 
 - **Timestamp**: 2026-08-21
@@ -101189,6 +101249,20 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
+## 2026-08-21 — #6561 ip-monitoring probe-state wipe on an unrelated commit
+- **Timestamp**: 2026-08-21
+- **Action**: `rpm.Manager.Apply` rebuilt the whole results table from config,
+  seeding every key `LastStatus: "unknown"`, which ipmon reads as PASS — so at
+  the default hold-down of 0 an ACTIVE failover route was withdrawn. The
+  trigger is not an RPM edit: `reconcileRPM`'s hash covers
+  `cfg.RethToPhysical()`, so any RETH-member change reopens the gate. Preserved
+  the runtime half rather than skipping the reconcile: `Apply` snapshots the
+  prior results before `StopAll` and carries a verdict forward when the
+  RESOLVED measurement identity is unchanged. Corrected mid-implementation from
+  an fwmark-based discriminator (the mark is a positional index, not a path
+  identity — it does not move on a RETH remap).
+- **File(s)**: pkg/rpm/rpm.go, pkg/rpm/probe_verdict_carry_6561_test.go (new),
+  pkg/ipmon/README.md, pkg/rpm/README.md, _Log.md
 ## 2026-08-21 — #6548: console `load ... terminal` aborts on Ctrl-C
 - **Timestamp**: 2026-08-21
 - **Action**: `pkg/cli` handleLoad's terminal read loop took the same `break`
@@ -101202,3 +101276,56 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/cliterm/terminal.go (new), pkg/cliterm/terminal_test.go
   (new), pkg/cli/cli_config.go, pkg/cli/cli.go, cmd/cli/main.go,
   pkg/cli/load_terminal_abort_6548_test.go (new), pkg/cli/README.md, _Log.md
+
+## 2026-08-21 — #6559 proxy-arp prefix expansion
+- **Timestamp**: 2026-08-21
+- **Action**: `security nat proxy-arp ... address <prefix>` dropped the prefix
+  length: the compiler stored the authored string and the installer keyed on
+  `prefix.Addr()` alone, one neighbour per statement. `netip.ParsePrefix` does
+  not mask, so a CANONICAL prefix installed the NETWORK address — zero useful
+  entries with the `proxy_arp` sysctl still on. Added `expandProxyARPPrefix`
+  in the compiler (network/broadcast excluded, RFC 3021 /31 exception,
+  `Masked()` so a non-canonical spelling expands to the same block), capped at
+  256 to match the `address <low> to <high>` sibling under the same stanza.
+  Over-cap blocks are left authored and rejected by a new
+  `validateProxyARPAddressesStrict` arm (warned on the tolerant path, #1960).
+  Prerequisite: a bare IPv6 literal now compiles to /128, not the
+  unconditional /32.
+- **File(s)**: pkg/config/compiler_nat_proxyarp_prefix.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/proxy_arp_prefix_expand_6559_test.go (new),
+  pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/feature-gaps.md, docs/phases.md, _Log.md
+
+## 2026-08-21 — #6560 VRRP self-frame filter
+- **Timestamp**: 2026-08-21
+- **Action**: VRRP had no PACKET_OUTGOING / multicast-loop self-frame filter;
+  self-filtering rested solely on the deliberately-nilable getLocalIP()
+  snapshot, which is nil for 30ms-1s during the #2528 RETH-MAC flush window,
+  so a MASTER could process its own advert and self-demote via
+  resolveEqualPriorityMaster's nil-localCmp step-down. Confirmed the frame IS
+  delivered by two mechanisms (AF_PACKET ETH_P_ALL TX tap; IP multicast
+  loopback on the fallback raw sockets) — the socket did NOT already filter.
+  Added PACKET_IGNORE_OUTGOING (set before bind, best-effort), an sll_pkttype
+  drop in receiverAfPacket (Recvfrom's sockaddr was being discarded), and
+  IP_MULTICAST_LOOP/IPV6_MULTICAST_LOOP disable on both fallback sockets.
+  TOUCHES VRRP — owes `make test-failover`.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
+  pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
+
+## 2026-08-21 — #6563: inject-packet emit-on-wire validates the source
+- **Timestamp**: 2026-08-21
+- **Action**: `request inject-packet --emit-on-wire` ran FIB/HA/CoS then enqueued
+  TX with an operator-arbitrary `source_ip` — `inject.rs` had ZERO references to
+  policy or screen, so a local principal could emit spoofed-source ICMP/ICMPv6
+  bypassing the zone policy and screen that govern transit. Added
+  `is_firewall_local_address` (global `local_v4`/`local_v6` membership:
+  interface host addresses + static-NAT/DNAT externals) and gated
+  `validate_injected_packet_tuple` on it. The gate is LAST (structural faults
+  keep message precedence) and applies to the EMIT path only, so non-emit
+  classification keeps its full diagnostic range.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/inject.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md, _Log.md

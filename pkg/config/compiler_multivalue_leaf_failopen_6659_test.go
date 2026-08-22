@@ -951,13 +951,25 @@ func TestProxyARPAddresses6659MalformedRejected(t *testing.T) {
 	// netip.ParsePrefix is the installer's own call, so these are the shapes
 	// that reach it intact — a bare v4 address (compiler appends /32), an
 	// explicit CIDR block, and a v6 address.
-	for name, tree := range proxyARP6659Trees(t, "192.0.2.1", "198.51.100.0/24", "2001:db8::1/128") {
+	//
+	// #6559: the block is a /30 rather than the /24 this control used to carry,
+	// and the expectation now names its two usable hosts. Before #6559 a block
+	// passed through verbatim and installed ONE proxy neighbour for the address
+	// as authored — for a canonical prefix that is the network address, which no
+	// host ARPs for. This control therefore doubles as the positive assertion
+	// that a multi-host prefix expands, with the network and broadcast addresses
+	// excluded (198.51.100.0 and .3 are absent below by construction).
+	for name, tree := range proxyARP6659Trees(t, "192.0.2.1", "198.51.100.0/30", "2001:db8::1/128") {
 		t.Run("well-formed control/"+name, func(t *testing.T) {
 			cfg, err := CompileConfig(tree)
 			if err != nil {
 				t.Fatalf("well-formed proxy-ARP addresses rejected: %v", err)
 			}
-			want := []string{"192.0.2.1/32", "198.51.100.0/24", "2001:db8::1/128"}
+			want := []string{
+				"192.0.2.1/32",
+				"198.51.100.1/32", "198.51.100.2/32",
+				"2001:db8::1/128",
+			}
 			if got := cfg.Security.NAT.ProxyARP[0].Addresses; !reflect.DeepEqual(got, want) {
 				t.Fatalf("Addresses = %q, want %q", got, want)
 			}
