@@ -47,6 +47,11 @@ use super::*;
 /// (`coord.bpf_maps`) — the bundle carries values, never an `OwnedFd`.
 pub(crate) struct WorkerLaunchPlan {
     pub(in crate::afxdp) worker_id: u32,
+    /// #6311: the chassis-cluster node id this helper runs on (0 or 1; 0 for a
+    /// standalone node), carried on `ConfigSnapshot.node_id`. It becomes the
+    /// high bit of the worker's session-id namespace, so an id adopted verbatim
+    /// from the peer (#5212) can never collide with one this node mints.
+    pub(in crate::afxdp) node_id: u8,
     pub(in crate::afxdp) binding_plans: Vec<BindingPlan>,
     pub(in crate::afxdp) poll_mode: crate::PollMode,
     pub(in crate::afxdp) dnat_fds: DnatTableFds,
@@ -55,16 +60,19 @@ pub(crate) struct WorkerLaunchPlan {
 impl WorkerLaunchPlan {
     /// Build the per-worker launch plan from its per-worker inputs.
     /// `worker_id` + `binding_plans` come from the reconcile work list;
+    /// `node_id` comes from the applied `ConfigSnapshot` (#6311);
     /// `poll_mode` mirrors `coord.poll_mode`; `dnat_fds` is built once
     /// before the spawn loop.
     pub(in crate::afxdp) fn new(
         worker_id: u32,
+        node_id: u8,
         binding_plans: Vec<BindingPlan>,
         poll_mode: crate::PollMode,
         dnat_fds: DnatTableFds,
     ) -> Self {
         Self {
             worker_id,
+            node_id,
             binding_plans,
             poll_mode,
             dnat_fds,

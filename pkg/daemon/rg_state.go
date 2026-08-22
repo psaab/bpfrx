@@ -174,6 +174,51 @@ func (s *rgStateMachine) MarkApplied(active bool) {
 	s.lastApplyErrMsg = ""
 }
 
+// InvalidateApplied re-arms the desired-vs-applied retry after a writer OTHER
+// than the state machine's own apply path has written rg_active in the
+// dataplane.
+//
+// #6530: applied/applyPending are advanced only by MarkApplied and
+// ApplyIfCurrent, and neither has a path that SETS applyPending — both only
+// CLEAR it, when applied == active. So any second writer to rg_active leaves
+// the state machine believing it has already converged: reconcileRGState's
+// retry predicate (tr.Changed || s.NeedsApply()) sees desired == applied and
+// does nothing, and nothing else re-arms it. Forwarding then stays wherever
+// that second writer left it, permanently — a blackhole with no retry, not a
+// glitch the next tick repairs. fenceAllRedundancyGroups (daemon_ha_sync.go)
+// is the instance that motivated this entry point; it exists so a future
+// third writer is one call away from correct rather than one review away from
+// a blackhole. (daemon_run_shutdown.go's SetRGActive(false) is a third writer
+// today and deliberately does NOT call this: the daemon is exiting, there is
+// no later reconcile pass to arm.)
+//
+// It arms the retry UNCONDITIONALLY rather than recording whatever value the
+// second writer wrote. A write that returned an error may still have partially
+// landed, so the only claim the state machine can honestly make afterwards is
+// "not known to have converged"; forcing a re-drive is the fail-closed reading
+// and costs at most one idempotent re-apply on the next reconcile tick.
+// Callers must invoke it AFTER their write so the reconcile pass that observes
+// the re-armed retry runs against settled dataplane state.
+//
+// applied is set to the negation of active rather than left alone, to preserve
+// the struct invariant reconcileLocked relies on (applyPending is true exactly
+// when applied != active); a later successful MarkApplied clears both together.
+//
+// It deliberately does not bump the epoch. ApplyIfCurrent already fails
+// routinely — reconcileLocked bumps the epoch on every 2s pass — and
+// recordRGActiveAppliedIfCurrentOrStable then falls back to MarkApplied
+// whenever the desired value still matches what that caller wrote, so an epoch
+// bump would not stop a concurrent in-flight apply from stamping over this.
+// Ordering between two unsynchronised rg_active writers is not something this
+// struct can resolve; what it can guarantee is that it never silently believes
+// a convergence it did not observe.
+func (s *rgStateMachine) InvalidateApplied() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = !s.active
+	s.applyPending = true
+}
+
 // ShouldLogRetry reports whether the "reconcile: retrying rg_active apply"
 // INFO should be emitted this tick. Returns true the first time the
 // retry loop fires after a transition; subsequent ticks in the same

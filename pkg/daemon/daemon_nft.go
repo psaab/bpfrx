@@ -175,7 +175,8 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	// CI). An unrepresentable port/DSCP token fails the build CLOSED (the installer
 	// returns an error and installs nothing), mirroring the oracle's nft rejection.
 	spec := toNftLo0Spec(cfg, filterV4, filterV6)
-	if err := nftInstaller.InstallLo0(spec); err != nil {
+	rules, err := nftInstaller.InstallLo0(spec)
+	if err != nil {
 		err = tagNftInstallErr(err)
 		slog.Warn("failed to apply lo0 filter", "err", err)
 		// #6476 cold-boot fail-closed fence. Install (or re-install) a fence UNLESS a
@@ -202,10 +203,41 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 		}
 		return fmt.Errorf("apply lo0 nftables filter: %w", err)
 	}
+	if rules == 0 {
+		// #6529: the install SUCCEEDED but rendered NOTHING — the live xpf_lo0
+		// table is an empty `policy accept` shell that enforces nothing. Recording
+		// that as "a real operator filter is loaded" is what defeated the #6476
+		// fence: with the flag true every later failed install skips the fence and
+		// the host input path stays open. A vacated filter is exactly as
+		// unprotecting as no filter, so clear the gate — do NOT merely leave it
+		// alone, because a peer-sync that atomically replaces a REAL filter with a
+		// vacated one would otherwise keep the stale true.
+		//
+		// Zero rules is reachable through several doors and they are not
+		// distinguishable from a boolean: a filter NAME that resolves to no filter
+		// (toNftLo0Spec's map lookup silently yields no terms), a filter with no
+		// terms, and a filter whose every term lowers to zero rules — a Junos
+		// match-nothing scope, e.g. an unresolved `from source-prefix-list`. All
+		// three arrive here through opts.lenientFirewallRefs on Store.Load at boot
+		// or Store.SyncApply on HA peer-sync, which downgrades the dangling-
+		// firewall-ref reject to a warning.
+		//
+		// This does NOT install a fence: fencing on a SUCCESSFUL install would deny
+		// host-bound traffic on a clean commit. The gate being false is what
+		// matters — the next failed install fences from the current snapshot.
+		d.lo0Enforced.Store(false)
+		slog.Warn("lo0 input filter installed but renders NO rules; the xpf_lo0 table is an empty "+
+			"policy-accept shell that enforces nothing, so it is NOT recorded as a real filter and a "+
+			"later failed install will install the cold-boot fail-closed fence",
+			"v4", filterV4, "v6", filterV6,
+			"v4_defined", lo0FilterDefined(cfg, filterV4, false),
+			"v6_defined", lo0FilterDefined(cfg, filterV6, true))
+		return nil
+	}
 	// A real lo0 filter is now the live table. Record it so a later failed install
 	// retains this generation and skips the fence (the intended day-2 divergence).
 	d.lo0Enforced.Store(true)
-	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6, "rules", rules)
 	return nil
 }
 
@@ -228,6 +260,24 @@ func logFenceWithheld(table string, sets dpuserspace.FenceAddrSets) {
 		"the fence has no per-service accepts and its drop carries no iifname, so fencing them would drop new management connections. "+
 		"They stay unfenced until a real ruleset loads",
 		"table", table, "withheld_v4", sets.WithheldV4, "withheld_v6", sets.WithheldV6)
+}
+
+// lo0FilterDefined reports whether the named lo0 input filter exists in cfg, for
+// the #6529 vacated-install diagnostic. A configured name that resolves to no
+// filter is the headline door into the zero-rule install: toNftLo0Spec's map
+// lookup yields no terms and the resulting empty table installs cleanly. An
+// empty name is "not configured", reported as defined so it does not read as the
+// cause.
+func lo0FilterDefined(cfg *config.Config, name string, v6 bool) bool {
+	if name == "" {
+		return true
+	}
+	filters := cfg.Firewall.FiltersInet
+	if v6 {
+		filters = cfg.Firewall.FiltersInet6
+	}
+	_, ok := filters[name]
+	return ok
 }
 
 // installLo0ColdBootFence installs the #6476 lo0 cold-boot fail-closed fence: a

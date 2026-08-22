@@ -550,9 +550,11 @@ a per-rule counter claim (false for a counter-less NPTv6 rule).
 The quoted-empty rule name this gate once skipped is now rejected as an
 authoring error (#6455, see the subsection below). The other limitation it
 shares with its #5180 sibling — a duplicate authored entirely inside an applied
-group — is DEFERRED (#6455 Finding 1): a pre-expansion per-group-body scan
-false-rejects a legitimate apply-groups fragment config that coalesces
-post-expansion.
+group — is now closed by the POST-expansion gate
+`validateDuplicateNamesExpandedAST` (#6455 Finding 1), which re-runs this
+scanner on a group-expanded clone. A pre-expansion per-group-body scan would
+false-reject a legitimate apply-groups fragment config that coalesces
+post-expansion; running after expansion sees the coalesced result instead.
 
 ### Duplicate NAT rule-SET name (#6454, C181-M18 sibling)
 
@@ -692,27 +694,64 @@ byte-identical pre-#6455 diagnostics. The empty **rule-set** name is owned by th
 #6454 gate — the #5649 rule-name gate skips an empty rule-set — so the lenient
 warning fires exactly once, not double-reported.
 
-**Deferred — group-authored duplicates (#6455 Finding 1).** A duplicate authored
-entirely inside an applied group body (no inline peer) survives `ExpandGroups()`
-and reaches the compiler, but no gate catches it because the gates scan only the
-top level. The tempting fix — a pre-expansion per-group-body scan — is WRONG: it
-false-rejects a legitimate apply-groups FRAGMENT config. Fragments of one named
-object authored across repeated group roots (two `interfaces` roots each
-contributing a `ge-0/0/0` unit; a screen profile split into an ICMP fragment + a
-TCP fragment; a NAT rule split into complementary `match` / `then` fragments)
-COALESCE into a SINGLE object under `mergeNodes` during `ExpandGroups`, but a
-pre-expansion sibling-scan cannot model that same-pass coalescing and rejects a
-config that compiles to one object. The correct detection point is AFTER
-`ExpandGroups` (the coalesced tree) but before the #3096 Cartesian bracket-list
-expansion in `compileExpanded` (`compiler_nat_source.go`), AND — to stay
-HA-symmetric like the sibling tunnel / zone / unit-alias gates — it must union the
-node0 and node1 expansions rather than scan a single node's view. That is a design
-pass tracked as the group-authored half of #6455, not shipped here.
+**Group-authored duplicates (#6455 Finding 1) — CLOSED by the post-expansion
+gate.** A duplicate authored entirely inside an applied group body (no inline
+peer) survives `ExpandGroups()` and reaches the compiler with BOTH instances
+alive, while the byte-identical inline duplicate is hard-rejected — same config,
+same compiled shape, opposite verdict, decided by where the operator happened to
+write it. Measured before the fix: the issue's repro compiled clean and produced
+a rule-set holding two rules both named `R`.
+
+The tempting fix — a pre-expansion per-group-body scan — is WRONG, and was tried
+and withdrawn in PR #6491: it false-rejects a legitimate apply-groups FRAGMENT
+config. Fragments of one named object authored across repeated group roots (two
+`interfaces` roots each contributing a `ge-0/0/0` unit; a screen profile split
+into an ICMP fragment + a TCP fragment; a NAT rule split into complementary
+`match` / `then` fragments) COALESCE into a SINGLE object under `mergeNodes`
+during `ExpandGroups`, and a pre-expansion sibling-scan cannot model that
+same-pass coalescing.
+
+`validateDuplicateNamesExpandedAST` (`pkg/config/dup_names_expanded_6455.go`)
+runs the SAME three scanners on a group-EXPANDED clone, where the coalescing has
+already happened: a fragment pair is one node by then and reports nothing, while
+a genuinely duplicated pair is still two siblings and reports. Reusing the
+scanners verbatim — rather than reimplementing the name-keying — is what keeps
+the two views from disagreeing about what "duplicate" means.
+
+The clone is expanded once per cluster node (node0 AND node1), mirroring the
+#5878 / #5879 / #6178 / #6662 union gates and reusing
+`collectNodeExpandedInterfaceUnitSpellings`'s clone-and-expand shape, so a
+`groups node1` duplicate that only the PEER's `${node}` expansion selects is
+rejected at commit rather than committing green on the active node and merely
+warning on the standby. Both views are computed on both physical nodes from the
+shared candidate, so the verdict is a pure function of the candidate.
+
+Findings the three PRE-expansion gates already produced are subtracted (they are
+present in the expanded tree too), so an inline duplicate is reported exactly
+once on the lenient path. Deduplication is by rendered message because both
+views render through the same scanner functions — an identical finding produces
+a byte-identical string by construction, with no second wording to keep in sync.
+On the strict path the subtraction is a no-op: the pre-expansion gates return
+their error immediately, so reaching this gate means they found nothing.
+
+`expandInterfaceRanges` is deliberately NOT applied to the clone (the
+unit-alias helper does apply it): a range expanding to two identical interface
+names is a different defect on a different axis, nothing detects it today, and
+widening this gate to cover it would be the same speculative scope that produced
+the withdrawn false-reject.
+
+Covered by `pkg/config/dup_names_expanded_6455_test.go`: the issue's verbatim
+repro rejected, one fixture per member of `dupNameScannersExpanded` so dropping
+any single scanner reds exactly its own subtest, the peer-only `groups node1`
+union proof, the report-exactly-once dedup control, the #1960 lenient
+warns-not-bricks guard, and the inline-plus-group deep-merge ACCEPT control (the
+original reason the pre-expansion gates are top-level-only).
 
 Covered by `pkg/config/dup_names_6455_test.go`: quoted-empty reject for all five
 containers (RED on revert of the empty-name recording), a lenient warns-EXACTLY-
-once guard for the empty rule-set, and — the load-bearing regression guard for the
-deferral — `TestDup6455GroupFragmentCoalescingAccepted` locks the four fragment-
+once guard for the empty rule-set, and — the load-bearing accept-side guard, now
+for the post-expansion gate rather than for a deferral —
+`TestDup6455GroupFragmentCoalescingAccepted` locks the four fragment-
 coalescing configs (interface / screen / NAT-rule fragments, group-siblings +
 inline peer) as ACCEPT so a future group-authored detector cannot reintroduce the
 false-reject. Plus the top-level no-false-positive accepts (apply-groups
@@ -8478,7 +8517,7 @@ scope committed against a pre-`4` helper disarms it and aborts the commit
 The rest of the config still loads (#1960 no-brick).
 The id→name reverse maps resolve a colliding id to the survivor deterministically
 (`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,
-`pkg/dataplane/userspace/manager_ha.go:zoneNameByID`) rather than to whichever
+`pkg/dataplane/userspace/manager_sessionsync_request.go:zoneNameByID`) rather than to whichever
 name won a map-iteration race. The quarantine is surfaced to the operator as a
 loud one-shot `slog.Error` naming both zones, on `ProcessStatus.ZoneIDCollisions`
 (`show`), and as the `xpf_userspace_zone_id_collision` 0/1 gauge, so an operator

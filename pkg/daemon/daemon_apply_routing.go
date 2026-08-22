@@ -135,12 +135,12 @@ func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
 			}
 		} else {
-			var dhcpCfg *config.DHCPServerConfig
-			if cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil {
-				// filterDHCPConfigForMasterRGs copies the config and
-				// resolves RETH interface names internally.
-				dhcpCfg = d.filterDHCPConfigForMasterRGs(cfg)
-			}
+			// Single-sourced with the RG-transition edge and the #6535
+			// reconcile converger: all three must derive the SAME desired
+			// state from (config, current master-RG set), because a
+			// converger that disagreed with the edge would fight it every
+			// 2s tick.
+			dhcpCfg := d.desiredClusterDHCPConfig(cfg)
 			if err := d.dhcpServer.ApplyClusterCommit(dhcpCfg); err != nil {
 				slog.Warn("failed to reconcile DHCP server (cluster commit)", "err", err)
 				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)

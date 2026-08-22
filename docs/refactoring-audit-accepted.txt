@@ -1,0 +1,23 @@
+# Accepted modularity threshold crossings (#7253).
+#
+# One line per file whose author DECIDED, with a reason, to let it cross
+# 1500 or 2000 LOC rather than split it first. Format:
+#
+#   <tier> <path> <reason...>
+#
+# tier is [WATCH] (accepts crossing 1500) or [REFACTOR] (accepts crossing
+# 2000, and implies [WATCH]). The reason is required; it is the whole
+# point of the file. See "When NOT to refactor" in
+# docs/refactoring-audit.md for what a good one looks like.
+#
+# This is the ONLY escape from
+# pkg/refactoraudit.TestTouchedFileCrossedModularityThreshold, which reds
+# a PR that grows a file IT TOUCHES past a threshold. It is hand-written,
+# never generated: unlike docs/refactoring-audit-current.txt it cannot go
+# stale from an unrelated file growing elsewhere, because nothing outside
+# a deliberate human edit ever changes it.
+#
+# Nothing gates on an entry's continued presence. Once the crossing PR
+# has landed, every later branch measures the file as already over the
+# floor and no longer crosses it, so an entry may be pruned as soon as it
+# stops describing a live decision. It is a decision record, not state.

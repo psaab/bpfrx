@@ -243,7 +243,7 @@ join five different ways:
 | #5134 worker arm | `manager_worker_arm_5134.go` | republishes the snapshot with `DeferWorkers=false` — starts the workers |
 | busy-binding auto-rebind | `maps_sync.go` (`maybeAutoRebindBusyBindingsLocked`) | sends `rebind` — the exact inverse of the `stop_workers` just issued |
 | bindings watchdog | `maps_sync.go` (`verifyBindingsMapLocked`) | repopulates binding rows a fail-closed ctrl disable had just cleared |
-| ctrl gate | `maps_sync.go` (`applyHelperStatusLocked`) | re-enables `ctrl`, steering transit into XSK sockets whose queues are being destroyed |
+| ctrl gate | `helper_status_apply.go` (`resolveCtrlEnableLocked`, reached from `maps_sync.go`'s `applyHelperStatusLocked`) | re-enables `ctrl`, steering transit into XSK sockets whose queues are being destroyed |
 
 `stop_workers` preserves registered bindings and `forwarding_armed`, so the Rust
 same-plan predicate sees runnable-but-not-live bindings and reconciles by
@@ -266,8 +266,10 @@ It is consulted in exactly four places:
   `pendingWorkerArm`, `pendingHAStateClear`, `lastStatus.ForwardingArmed` vs
   desired), so the next tick after the lease ends services whatever is still
   outstanding.
-- **at the ctrl write in `applyHelperStatusLocked`**, alongside the existing
-  `rgTransitionInFlight` check. This is not redundant with the tick guard:
+- **at the ctrl write in `resolveCtrlEnableLocked`** (the step
+  `applyHelperStatusLocked` drives for the ctrl decision, split out of it in
+  #6429), alongside the existing `rgTransitionInFlight` check. This is not
+  redundant with the tick guard:
   `UpdateRGActive` also ends in `applyHelperStatusLocked`, and it runs off VRRP
   events and `reconcileRGStateLoop`'s 2s pass (`daemon_ha.go`, which also wakes
   early on dropped-event notifications) — **neither serialized on the daemon's
@@ -680,7 +682,8 @@ on that would be an over-rejection.
 | `pkg/dataplane/userspace/manager_ha.go` | the `set_forwarding_state` deferral (covers the HA watchdog heartbeat) |
 | `pkg/daemon/daemon_apply_dataplane.go` | `renewLinkCycleLease` + its three call sites — `programRethMemberMAC`, `finishRethMemberLinkTail`, `reconcileAfterRethLinkCycle` — and `abandonLinkCycleLease`, deferred over the whole of `applyDataplaneAndHACore` |
 | `pkg/dataplane/userspace/process_status.go` | the tick-wide skip |
-| `pkg/dataplane/userspace/maps_sync.go` | the ctrl-write gate (covers `UpdateRGActive`) |
+| `pkg/dataplane/userspace/maps_sync.go` | `ctrlMustStayDisabledLocked` — the ctrl-write gate predicate (covers `UpdateRGActive`) |
+| `pkg/dataplane/userspace/helper_status_apply.go` | `resolveCtrlEnableLocked` — where that predicate is consulted (#6429) |
 | `pkg/dataplane/userspace/manager_status.go` | `errLinkCycleInFlight` + the three operator-verb gates |
 | `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` + `LinkController.RenewLinkCycle()` + `LinkController.AbandonLinkCycle() bool` |
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.NotifyLinkCycle()` — the live adapter carrying the rebind error to the daemon |

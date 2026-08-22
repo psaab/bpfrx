@@ -327,16 +327,26 @@ impl SessionTable {
         // carries the SAME RT_FLOW id on both nodes (cross-node log/event
         // correlation). The id is a metadata-only stamp (RT_FLOW correlation +
         // the show-session mirror id) — NEVER a lookup key or slab handle — so
-        // adopting it verbatim cannot affect forwarding/security/memory. It is
-        // NOT globally unique: the worker_id<<48|counter namespace has no node
-        // discriminator and both nodes run the same worker set, so in
-        // active/active an adopted id can collide with a local same-worker id
-        // (observability-only; a node-discriminator bit is tracked as #6311). A zero
-        // wire id (a legacy peer that predates the field, or a locally-generated
-        // upsert such as a tunnel replica) falls back to a FRESH node-local id
-        // via `alloc_session_id()` — the pre-#5212 behavior (rolling-upgrade
-        // safe). 0 is never a real id (the allocator starts its counter at 1),
-        // so the sentinel is unambiguous.
+        // adopting it verbatim cannot affect forwarding/security/memory. Since
+        // #6311 it is also globally COLLISION-FREE: the namespace is
+        // `node_bit<<15 | worker_id` in the high 16 bits
+        // (`set_session_id_namespace`), so an adopted id carries the ORIGINATING
+        // node's bit and can never equal an id this node mints. That is exactly
+        // why `next_session_id` is deliberately NOT reconciled against an
+        // adopted id here — the two live in disjoint namespaces, so a later
+        // local alloc cannot re-hand-out an adopted value. Before the node bit,
+        // both nodes ran the same worker set with counters that both start at 1,
+        // so an adopted `(w<<48)|c` collided with the importing node's own
+        // worker-`w` id — guaranteed in active/active early after boot.
+        //
+        // A peer that predates the node bit (mixed-base) mints ids in the
+        // un-bitted low half, which is the pre-#6311 posture: no NEW collision,
+        // just the old one until both nodes are upgraded. A zero wire id (a
+        // legacy peer that predates the field, or a locally-generated upsert
+        // such as a tunnel replica) falls back to a FRESH node-local id via
+        // `alloc_session_id()` — the pre-#5212 behavior (rolling-upgrade safe).
+        // 0 is never a real id (the allocator starts its counter at 1), so the
+        // sentinel is unambiguous.
         let session_id = if wire_session_id != 0 {
             wire_session_id
         } else {

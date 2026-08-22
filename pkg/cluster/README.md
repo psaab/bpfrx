@@ -2399,6 +2399,30 @@ outside the monitor loop:
   the lease. reqID is threaded
   into `OnRemoteFailover`/`OnRemoteFailoverBatch`/`OnRemoteFailoverCommit`/
   `OnRemoteFailoverCommitBatch` (`sync.go`) to arm/clear it.
+- **Every requester-side failure after `applyPeerTransferOutOverrideLocked`
+  must roll the override back — including the commit's own election failure
+  (#6527).** `commitRequestedPeerFailover` /
+  `commitRequestedPeerFailoverBatch` arm the override BEFORE calling
+  `runElection`, then return an error if the local RG did not reach primary.
+  The batch caller already aborted on that error; the single-RG caller
+  returned it bare and leaked the override. There is no expiry for
+  `peerTransferOutOverride` — `applyTransferCommitOverridesOnPeerStateLocked`
+  re-forces the peer to `SecondaryHold` on EVERY subsequent heartbeat with no
+  time bound (unlike `peerTransferCommitGraceUntil`, which does expire) — so a
+  leaked entry makes `electRG` take its "Peer transfer out" arm forever and
+  self-promote this node as soon as whatever failed the election clears. Both
+  nodes then hold the RETH VIP and virtual MAC, persistently. The failure is
+  reachable without any fault injection: `RequestPeerFailover` releases `m.mu`
+  around the fabric round-trip, `commitRequestedPeerFailover`'s re-check is
+  `IsReadyForTakeover` (Ready/ReadySince only — it does NOT read weight), so an
+  interface-monitor debt landing in that window passes readiness and then loses
+  the election on the "Local weight 0" arm. The rollback is reqID-matched and a
+  no-op on the two error returns that precede the override, so calling it on
+  every commit error is safe. Invariant for future edits: the single-RG and
+  batch request paths must agree on rollback at every failure point;
+  `TestRequestPeerFailoverCommitFailureRollsBackOverrideOnBothPaths`
+  (`failover_commit_rollback_6527_test.go`) binds the agreement rather than
+  either copy.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).

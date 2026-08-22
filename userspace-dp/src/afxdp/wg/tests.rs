@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 /// Generate a fresh X25519 keypair using snow's resolver. Slow
 /// path — fine for tests.
-fn keypair() -> ([u8; 32], [u8; 32]) {
+pub(super) fn keypair() -> ([u8; 32], [u8; 32]) {
     let kp = Builder::new(super::WG_NOISE_PATTERN.parse().unwrap())
         .generate_keypair()
         .unwrap();
@@ -40,7 +40,7 @@ fn keypair() -> ([u8; 32], [u8; 32]) {
 /// The handshake is driven entirely on the slow path of both
 /// sides — exactly the pattern a real worker would use to install
 /// sessions for the hot path.
-fn established_pair(
+pub(super) fn established_pair(
     init_allowed_for_resp: Vec<ipnet::IpNet>,
     resp_allowed_for_init: Vec<ipnet::IpNet>,
 ) -> (WgEngine, WgEngine, [u8; 32], [u8; 32]) {

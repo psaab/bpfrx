@@ -1,0 +1,327 @@
+package userspace
+
+// Session-sync request construction for the userspace dataplane: resolves a
+// BPF session key/value into the SessionSyncRequest wire shape, including
+// egress interface / owner-RG / tunnel-endpoint resolution against
+// m.lastSnapshot, zone-name lookup, and the address/port/MAC encoders.
+// Every function here is a pure snapshot read — no control-socket I/O.
+
+import (
+	"encoding/binary"
+	"net"
+
+	"github.com/psaab/xpf/pkg/dataplane"
+)
+
+func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey, val *dataplane.SessionValue) SessionSyncRequest {
+	req := SessionSyncRequest{
+		Operation:  op,
+		AddrFamily: dataplane.AFInet,
+		Protocol:   key.Protocol,
+		SrcIP:      net.IP(key.SrcIP[:]).String(),
+		DstIP:      net.IP(key.DstIP[:]).String(),
+		SrcPort:    networkUint16ToHost(key.SrcPort),
+		DstPort:    networkUint16ToHost(key.DstPort),
+	}
+	if val != nil {
+		req.IngressZone = m.zoneNameByID(val.IngressZone)
+		req.EgressZone = m.zoneNameByID(val.EgressZone)
+		// #919/#922: forward the raw u16 IDs alongside the legacy
+		// strings; the Rust daemon prefers IDs when nonzero.
+		req.IngressZoneID = val.IngressZone
+		req.EgressZoneID = val.EgressZone
+		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
+		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
+		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
+			req.TunnelEndpointID = val.FibGen
+		}
+		if req.TunnelEndpointID != 0 {
+			if endpoint, ok := m.sessionSyncTunnelEndpointLocked(req.TunnelEndpointID); ok {
+				req.EgressIfindex = endpoint.Ifindex
+				req.OwnerRGID = endpoint.RedundancyGroup
+			} else {
+				req.EgressIfindex = 0
+				req.OwnerRGID = 0
+			}
+			req.TXIfindex = 0
+			req.TXVLANID = 0
+			req.NeighborMAC = ""
+			req.SrcMAC = ""
+		} else {
+			req.TXVLANID = val.FibVlanID
+			req.NeighborMAC = macString(val.FibDmac[:])
+			req.SrcMAC = macString(val.FibSmac[:])
+		}
+		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
+		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
+		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
+		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
+		req.FabricIngress = val.LogFlags&dataplane.LogFlagUserspaceFabricIngress != 0
+		req.IsReverse = val.IsReverse != 0
+		// #2785: carry the per-policy `then log` selection to the peer helper
+		// so the synced session logs the same RT_FLOW records after failover.
+		req.LogSessionInit = val.LogFlags&dataplane.LogFlagSessionInit != 0
+		req.LogSessionClose = val.LogFlags&dataplane.LogFlagSessionClose != 0
+		// #2170: mirror the install generation to the helper so its in-memory
+		// SyncedSessionEntry can enforce the same generation guard.
+		req.Generation = val.Generation
+		// #3301: carry the admitting policy's firewall metadata so a
+		// peer-PROMOTED session resolves the admitting policy (PolicyID),
+		// increments the correct per-rule hit counter (PolicyCounterIdx), and
+		// ages on the per-application idle timeout (AppTimeout, seconds) after
+		// failover. 0 => unattributed / no counter / global timeout, the
+		// pre-#3301 behavior an old helper still applies via serde(default).
+		req.PolicyID = val.PolicyID
+		req.PolicyCounterIdx = val.PolicyCounterIdx
+		req.InactivityTimeout = val.AppTimeout
+		// #5212: carry the originating node's stable RT_FLOW session id so the
+		// peer helper adopts it on import instead of minting a fresh local id.
+		req.RTFlowSessionID = val.RTFlowSessionID
+		if val.Flags&dataplane.SessFlagSNAT == 0 {
+			req.NATSrcIP = ""
+			req.NATSrcPort = 0
+		}
+		if val.Flags&dataplane.SessFlagDNAT == 0 {
+			req.NATDstIP = ""
+			req.NATDstPort = 0
+		}
+	}
+	return req
+}
+
+func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) SessionSyncRequest {
+	req := SessionSyncRequest{
+		Operation:  op,
+		AddrFamily: dataplane.AFInet6,
+		Protocol:   key.Protocol,
+		SrcIP:      net.IP(key.SrcIP[:]).String(),
+		DstIP:      net.IP(key.DstIP[:]).String(),
+		SrcPort:    networkUint16ToHost(key.SrcPort),
+		DstPort:    networkUint16ToHost(key.DstPort),
+	}
+	if val != nil {
+		req.IngressZone = m.zoneNameByID(val.IngressZone)
+		req.EgressZone = m.zoneNameByID(val.EgressZone)
+		// #919/#922: forward the raw u16 IDs alongside the legacy
+		// strings; the Rust daemon prefers IDs when nonzero.
+		req.IngressZoneID = val.IngressZone
+		req.EgressZoneID = val.EgressZone
+		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
+		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
+		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
+			req.TunnelEndpointID = val.FibGen
+		}
+		if req.TunnelEndpointID != 0 {
+			if endpoint, ok := m.sessionSyncTunnelEndpointLocked(req.TunnelEndpointID); ok {
+				req.EgressIfindex = endpoint.Ifindex
+				req.OwnerRGID = endpoint.RedundancyGroup
+			} else {
+				req.EgressIfindex = 0
+				req.OwnerRGID = 0
+			}
+			req.TXIfindex = 0
+			req.TXVLANID = 0
+			req.NeighborMAC = ""
+			req.SrcMAC = ""
+		} else {
+			req.TXVLANID = val.FibVlanID
+			req.NeighborMAC = macString(val.FibDmac[:])
+			req.SrcMAC = macString(val.FibSmac[:])
+		}
+		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
+		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
+		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
+		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
+		req.FabricIngress = val.LogFlags&dataplane.LogFlagUserspaceFabricIngress != 0
+		req.IsReverse = val.IsReverse != 0
+		// #2785: carry the per-policy `then log` selection to the peer helper
+		// so the synced session logs the same RT_FLOW records after failover.
+		req.LogSessionInit = val.LogFlags&dataplane.LogFlagSessionInit != 0
+		req.LogSessionClose = val.LogFlags&dataplane.LogFlagSessionClose != 0
+		// #2170: mirror the install generation to the helper.
+		req.Generation = val.Generation
+		// #3301: carry the admitting policy's firewall metadata (see V4).
+		req.PolicyID = val.PolicyID
+		req.PolicyCounterIdx = val.PolicyCounterIdx
+		req.InactivityTimeout = val.AppTimeout
+		// #4565: carry the NAT64 translated pool SOURCE (non-zero marks a NAT64
+		// cross-family session) so the peer helper rebuilds the reverse (v4->v6)
+		// BIB after promotion. The generic nat_src/nat_dst fields cannot carry a
+		// v4 pool source in a v6 session's slot unambiguously — this dedicated
+		// dotted-quad is the helper's authoritative snat_v4.
+		if val.Nat64SnatV4 != ([4]byte{}) {
+			req.Nat64SnatV4 = net.IP(val.Nat64SnatV4[:]).String()
+		}
+		// #5212: carry the originating node's stable RT_FLOW session id (see V4).
+		req.RTFlowSessionID = val.RTFlowSessionID
+		if val.Flags&dataplane.SessFlagSNAT == 0 {
+			req.NATSrcIP = ""
+			req.NATSrcPort = 0
+		}
+		if val.Flags&dataplane.SessFlagDNAT == 0 {
+			req.NATDstIP = ""
+			req.NATDstPort = 0
+		}
+	}
+	return req
+}
+
+func (m *Manager) sessionSyncTunnelEndpointIDLocked(egressIfindex int) uint16 {
+	snapshot := m.lastSnapshot
+	if snapshot == nil || egressIfindex <= 0 {
+		return 0
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.Ifindex == egressIfindex {
+			return endpoint.ID
+		}
+	}
+	return 0
+}
+
+func (m *Manager) sessionSyncTunnelEndpointLocked(id uint16) (TunnelEndpointSnapshot, bool) {
+	snapshot := m.lastSnapshot
+	if snapshot == nil || id == 0 {
+		return TunnelEndpointSnapshot{}, false
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.ID == id {
+			return endpoint, true
+		}
+	}
+	return TunnelEndpointSnapshot{}, false
+}
+
+func (m *Manager) zoneNameByID(zoneID uint16) string {
+	if zoneID == 0 {
+		return ""
+	}
+	cr := m.bpfShim.LastCompileResult()
+	if cr == nil {
+		return ""
+	}
+	// #3719: a StableZoneID collision maps two zone names to the same id in
+	// ZoneIDs. The dataplane installs only the sorted-FIRST name (the survivor
+	// config.QuarantinedZoneNames keeps), so resolve deterministically to that
+	// name instead of returning whichever name a map-iteration coin flip yields
+	// — which could name the QUARANTINED zone that forwards nothing.
+	owner := ""
+	for name, id := range cr.ZoneIDs {
+		if id != zoneID {
+			continue
+		}
+		if owner == "" || name < owner {
+			owner = name
+		}
+	}
+	return owner
+}
+
+func nativeUint32ToIP(v uint32) net.IP {
+	if v == 0 {
+		return nil
+	}
+	var raw [4]byte
+	binary.NativeEndian.PutUint32(raw[:], v)
+	return net.IPv4(raw[0], raw[1], raw[2], raw[3]).To4()
+}
+
+func networkUint16ToHost(v uint16) uint16 {
+	var raw [2]byte
+	binary.NativeEndian.PutUint16(raw[:], v)
+	return binary.BigEndian.Uint16(raw[:])
+}
+
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil && v4.Equal(net.IPv4zero) {
+		return ""
+	}
+	if v6 := ip.To16(); v6 != nil && v6.Equal(net.IPv6zero) {
+		return ""
+	}
+	return ip.String()
+}
+
+func macString(raw []byte) string {
+	if len(raw) < 6 {
+		return ""
+	}
+	allZero := true
+	for i := 0; i < 6; i++ {
+		if raw[i] != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return ""
+	}
+	return net.HardwareAddr(raw[:6]).String()
+}
+
+func (m *Manager) sessionSyncEgressLocked(fibIfindex int, fibVlanID uint16, egressZone string) (egressIfindex, txIfindex, ownerRGID int) {
+	snapshot := m.lastSnapshot
+	if snapshot == nil {
+		return fibIfindex, fibIfindex, 0
+	}
+	if fibIfindex <= 0 {
+		// FibIfindex is unresolved but we can still derive owner_rg_id
+		// from the session's egress zone so the sync peer doesn't have
+		// to fall back to the imprecise any_rg_active heuristic.
+		return fibIfindex, fibIfindex, resolveOwnerRGFromZone(snapshot, egressZone)
+	}
+	if iface, ok := findUserspaceEgressInterfaceSnapshot(snapshot, fibIfindex, fibVlanID); ok {
+		egress := iface.Ifindex
+		if egress <= 0 {
+			egress = fibIfindex
+		}
+		tx := iface.ParentIfindex
+		if tx <= 0 {
+			tx = egress
+		}
+		return egress, tx, iface.RedundancyGroup
+	}
+	return fibIfindex, fibIfindex, 0
+}
+
+// resolveOwnerRGFromZone returns the RedundancyGroup for the first interface
+// in the given egress zone. This is used as a fallback when FibIfindex is 0
+// so the sync sender can still propagate a meaningful owner_rg_id to the peer.
+func resolveOwnerRGFromZone(snapshot *ConfigSnapshot, egressZone string) int {
+	if snapshot == nil || egressZone == "" {
+		return 0
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == egressZone && iface.RedundancyGroup > 0 {
+			return iface.RedundancyGroup
+		}
+	}
+	return 0
+}
+
+func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex int, fibVlanID uint16) (InterfaceSnapshot, bool) {
+	if snapshot == nil {
+		return InterfaceSnapshot{}, false
+	}
+	if fibVlanID != 0 {
+		for _, iface := range snapshot.Interfaces {
+			if iface.ParentIfindex == fibIfindex && iface.VLANID == int(fibVlanID) {
+				return iface, true
+			}
+		}
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.Ifindex == fibIfindex {
+			return iface, true
+		}
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.ParentIfindex == fibIfindex {
+			return iface, true
+		}
+	}
+	return InterfaceSnapshot{}, false
+}

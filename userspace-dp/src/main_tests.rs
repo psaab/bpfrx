@@ -5151,7 +5151,7 @@ fn apply_snapshot_rejects_a_newer_protocol_version_too() {
 /// WHY A ROW CAN CARRY IFINDEX 0 WHILE THE FABRIC ROW CARRIES A LIVE ONE: the
 /// two are sampled at different instants. `buildInterfaceSnapshots`
 /// (interfaces.go) and `buildFabricSnapshotsFrom` (fabric.go) each take their
-/// own `buildLinkSnapshot`, and `SyncFabricState` (manager_ha.go) refreshes the
+/// own `buildLinkSnapshot`, and `SyncFabricState` (manager_fabric_sync.go) refreshes the
 /// fabric rows ALONE and persists them back into `m.lastSnapshot` beside
 /// interface rows that were never re-sampled.
 ///
