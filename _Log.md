@@ -99643,3 +99643,12 @@ prose edit above them added. No diff falls in the new test body.
   movement, so no cluster smoke is owed.
 - **File(s)**: pkg/dataplane/userspace/process.go,
   pkg/dataplane/userspace/helper_restart_after_stop_5838_test.go, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6431 — check the Interrupt-mode idle-regulation `libc::poll`
+    return in `worker_loop`; add `loop_body/idle_poll.rs` classifier
+    (Waited / Interrupted / Degraded) + a substituted 1 ms sleep on the
+    degraded arm; document the idle regulation in the worker README.
+  - **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/idle_poll.rs` (new),
+    `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+    `userspace-dp/src/afxdp/worker/README.md`
