@@ -370,6 +370,19 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// to the local kernel slow path (a wrong-path / conntrack-poison
     /// hazard; cf. the #1873 R-C `tunnel_encap_unresolved_drops` gate).
     pub(in crate::afxdp) fabric_redirect_unsendable_drops: AtomicU64,
+    /// #6664: `NextTableUnsupported` frames refused by the slow-path
+    /// allow-list and dropped fail-closed.
+    ///
+    /// This counter EXISTS BECAUSE the deny silences another one. Before
+    /// #6664 the disposition was slow-path eligible, so every such packet
+    /// bumped `slow_path_next_table_packets` on the accept path
+    /// (`record_slow_path_accept`) and that counter is exported all the way
+    /// to `xpf_userspace_binding_slow_path_next_table_packets_total`.
+    /// Refusing the reinject without adding this would have driven that
+    /// metric to a permanent zero -- indistinguishable, to an operator,
+    /// from "no such packets ever arrived". The drop is counted here
+    /// instead, so the signal moves rather than disappears.
+    pub(in crate::afxdp) next_table_unsupported_drops: AtomicU64,
     pub(super) kernel_rx_dropped: AtomicU64,
     pub(super) kernel_rx_invalid_descs: AtomicU64,
     pub(super) tx_packets: AtomicU64,
@@ -790,10 +803,21 @@ pub(in crate::afxdp) struct BindingLiveState {
 // difference between them and the runtime cell: the runtime cell can be
 // re-measured green, and these cannot. Removing them is therefore a reviewable
 // act, not cleanup.
+//
+// #6664 re-measured the two offset literals (2152 -> 2160, 2280 -> 2288) when
+// `next_table_unsupported_drops` was added to the cold-counter run above. That
+// is the legitimate case for this guard, and it is worth naming why: the hazard
+// documented above is a `#[cfg(test)]` field, for which production and test
+// builds DISAGREE and so at most one of them can be green at any one pair of
+// literals. This field is unconditional, so both configurations shift by the
+// same 8 bytes and re-measuring makes both green together -- which is the
+// guard reporting a real layout change and being answered, not defeated.
+// `size_of` is unchanged at 2304: the 8 bytes came out of existing tail
+// padding, so the next field added here will move it and should expect to.
 const _: [(); 2304] = [(); std::mem::size_of::<BindingLiveState>()];
 const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
-const _: [(); 2152] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
-const _: [(); 2280] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+const _: [(); 2160] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2288] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {
@@ -891,6 +915,7 @@ impl BindingLiveState {
             slow_path_rate_limited: AtomicU64::new(0),
             tunnel_encap_unresolved_drops: AtomicU64::new(0),
             fabric_redirect_unsendable_drops: AtomicU64::new(0),
+            next_table_unsupported_drops: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
@@ -1136,6 +1161,20 @@ impl BindingLiveState {
             }
             _ => {}
         }
+    }
+
+    /// #6664: record a `NextTableUnsupported` frame refused by the slow-path
+    /// allow-list and dropped fail-closed.
+    ///
+    /// Called from BOTH refusal sites -- the filtered wrapper
+    /// `maybe_reinject_slow_path` and the trailing chokepoint in
+    /// `poll_descriptor` -- because the two must never disagree about whether
+    /// a refusal was counted. A divergence there is always a bug, never a
+    /// policy difference, so it is one function rather than two agreeing
+    /// increments.
+    pub(in crate::afxdp) fn record_next_table_unsupported_drop(&self) {
+        self.next_table_unsupported_drops
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

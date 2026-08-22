@@ -155,6 +155,7 @@ impl BindingLiveState {
                 .load(Ordering::Relaxed),
             slow_path_no_route_packets: self.slow_path_no_route_packets.load(Ordering::Relaxed),
             slow_path_next_table_packets: self.slow_path_next_table_packets.load(Ordering::Relaxed),
+            next_table_unsupported_drops: self.next_table_unsupported_drops.load(Ordering::Relaxed),
             slow_path_forward_build_packets: self
                 .slow_path_forward_build_packets
                 .load(Ordering::Relaxed),

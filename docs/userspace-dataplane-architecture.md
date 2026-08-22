@@ -2686,18 +2686,40 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   `docs/research/3616-ipsec-host-inbound/plan.md`.
 - Packets failing forwarding resolution can enter the bounded slow path,
   but ONLY for the slow-path-eligible dispositions: `LocalDelivery`,
-  `NoRoute`, `MissingNeighbor`, and `NextTableUnsupported`
+  `NoRoute`, and `MissingNeighbor`
   (`ForwardingDisposition::is_slow_path_eligible`, the single source of
-  truth shared by the filtered `maybe_reinject_slow_path` wrapper and the
-  trailing chokepoint in `poll_binding_process_descriptor`). `PolicyDenied`,
-  `HAInactive`, and `DiscardRoute` are NOT eligible — reinjecting them
-  would hand the packet to the kernel FIB and silently bypass a zone-policy
-  DENY / HA gate / discard route (#1913). They are dropped (counted by
-  `record_forwarding_disposition`, recycled) instead. The raw
-  `maybe_reinject_slow_path_from_frame` primitive does NOT apply the
-  filter; its two intentional unfiltered callers (the FabricRedirect-Owned
-  fallback in `tx/dispatch/mod.rs` and the ForwardCandidate build-failure
-  fallback in `tx/dispatch/slow_path.rs`) own the eligibility decision.
+  truth). `PolicyDenied`, `HAInactive`, `DiscardRoute` and — since #6664 —
+  `NextTableUnsupported` are NOT eligible: reinjecting them would hand the
+  packet to the kernel FIB and silently bypass a zone-policy DENY / HA gate
+  / discard route (#1913), or forward an unresolvable inter-VRF next-table
+  chain with no zone policy, session, NAT or screen (#6664). They are
+  dropped (counted by `record_forwarding_disposition`, recycled) instead.
+  `NextTableUnsupported` additionally carries its own fail-closed drop
+  counter, `next_table_unsupported_drops` — exported as
+  `xpf_userspace_binding_next_table_unsupported_drops_total` — because the
+  deny silences the accept-path counter it used to bump
+  (`slow_path_next_table_packets`), which is still exported for existing
+  dashboards but no longer advances.
+- Both refusal points — the filtered `maybe_reinject_slow_path` wrapper and
+  the trailing chokepoint in `poll_binding_process_descriptor` — route
+  through ONE function, `slow_path_admit` (#6664), so the predicate and the
+  accounting cannot disagree about a frame. Before that the accounting was
+  duplicated per caller, and a mutation deleting the `poll_descriptor` copy
+  passed the whole suite because no test drives that function.
+- The raw `maybe_reinject_slow_path_from_frame` primitive does NOT apply the
+  filter. It has exactly TWO intentional unfiltered non-test callers, and
+  neither can carry a disposition the predicate would refuse:
+  the ForwardCandidate build-failure fallback in `tx/dispatch/slow_path.rs`
+  (reached only from the forward-frame TX dispatch, so the disposition is
+  structurally `ForwardCandidate` or `FabricRedirect`, and #1946 drops the
+  latter fail-closed before this point); and the host-terminated IPsec
+  passthrough in `poll_stages.rs`, which passes a SYNTHETIC decision whose
+  disposition is the literal `LocalDelivery`. This paragraph previously
+  named the pair as the `tx/dispatch/mod.rs` fabric fallback plus the
+  build-failure fallback — the first had already become a fail-closed drop
+  in #1946 and the IPsec passthrough was never listed. The enumeration
+  matters: it is the whole argument for why removing a disposition from
+  `is_slow_path_eligible` is enforcement rather than decoration.
   Note that `MissingNeighbor` IS slow-path-eligible, so a denied flow
   must be converted to `PolicyDenied` BEFORE it reaches the gate: the
   MissingNeighbor arm has its own policy evaluation (the main

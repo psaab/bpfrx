@@ -103390,3 +103390,41 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
   `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
   `docs/config-schema.md`
+
+## 2026-08-22 — #6664 NextTableUnsupported fails closed + single-door admit
+- **Action**: Removed `NextTableUnsupported` from `is_slow_path_eligible`, so an
+  inter-VRF next-table chain the helper cannot resolve (over-deep or cyclic) is
+  DROPPED instead of reinjected to the kernel FIB, which forwarded it with no
+  zone policy, session, NAT or screen. Collapsed the two refusal points (the
+  filtered `maybe_reinject_slow_path` wrapper and the `poll_descriptor`
+  chokepoint) into one `slow_path_admit` function so the predicate and the
+  fail-closed accounting cannot disagree, and added
+  `next_table_unsupported_drops` — exported as
+  `xpf_userspace_binding_next_table_unsupported_drops_total` — because the deny
+  freezes the accept-path counter the signal used to live on. Corrected two
+  stale enumerations of the unfiltered-reinject caller set (the code said ONE,
+  the architecture doc said TWO and named the wrong pair) and added a source
+  guard that reds if a second production caller of the predicate appears — the
+  `poll_descriptor` chokepoint is not reachable by any behavioural test in the
+  crate, which is how the pre-#6664 duplicated accounting survived a mutation.
+  NoRoute and LocalDelivery — the attacker-steerable legs — are filed as #7480.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/tx/dispatch/slow_path.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/binding_state/snapshot.rs,
+  userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/tests_slow_path_disposition.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/tests/slow_path_admit_single_site_6664.rs (new),
+  pkg/api/metrics.go, pkg/api/metrics_descriptors_binding.go,
+  pkg/api/metrics_userspace_slowpath.go,
+  pkg/api/metrics_slowpath_reinject_7409_test.go,
+  pkg/dataplane/userspace/protocol_binding.go,
+  docs/userspace-dataplane-architecture.md
