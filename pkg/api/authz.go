@@ -29,9 +29,9 @@ import (
 // CSRF defense that a non-browser client passes trivially, by design). Since
 // the daemon provisions every `system login user` a real shell account, a
 // `read-only` class holder could `curl` a commit and the CLI's client-side RBAC
-// never ran. The gRPC surface has the same hole and is tracked separately as
-// #5278; the authorization decision itself lives in pkg/authz so both surfaces
-// reach the same verdict.
+// never ran. The gRPC surface had the same hole and closed it the same way
+// (#5278, pkg/grpcapi/authz.go); the authorization decision itself lives in
+// pkg/authz so both surfaces reach the same verdict.
 //
 // # Shape of the gate
 //

@@ -1,5 +1,6 @@
 // Package authz derives and authorizes a SERVER-SIDE principal for the local
-// control-plane surfaces (#5561, and #5278 when the gRPC leg follows).
+// control-plane surfaces: the HTTP REST API (#5561, pkg/api/authz.go) and the
+// primary gRPC listener (#5278, pkg/grpcapi/authz.go).
 //
 // # Why this exists
 //
@@ -49,6 +50,14 @@
 // and day-0 tooling reads /metrics only), and root — which can write the config
 // DB directly, making a denial theater — is always authorized. See
 // pkg/api/README.md "Server-side authorization".
+//
+// The gRPC leg (#5278) inherits that cost and one more, because it gates READS
+// as well as mutations: the remote `cli` binary carried no login class at all,
+// so every one of its callers was effectively super-user, and an account
+// outside `system login user` now gets nothing rather than everything. There is
+// no api-auth analogue on that listener — a peer UID is the ONLY identity — so
+// its precedence rule is a single row. See pkg/grpcapi/README.md
+// "Server-side authorization".
 package authz
 
 import (
