@@ -2658,6 +2658,117 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateStaticNATSelectedMatchAddressStrict (#7216) hard-rejects a static-NAT
+// rule whose SELECTED `match destination-address` is EMPTY — the rule exists,
+// but it has no external prefix, so the dataplane drops the whole mapping.
+//
+// WHAT AN EMPTY VALUE MEANS HERE, established before rejecting it. #6673 gave
+// an empty slot in MatchAddresses a deliberate meaning, and this gate does not
+// touch it. That meaning is a COUNTING rule: multiLeafAuthoredValues keeps
+// empty slots so the list always contains what nodeVal selected, and the
+// cardinality gate (validateStaticNATMatchAddressesStrict) must therefore count
+// only the NON-EMPTY values — `destination-address 192.0.2.1/32` followed by
+// `destination-address [ ]` authors ONE prefix and blanks it, and counting the
+// blank as a second prefix would invent a rejection that gate was never meant
+// to make.
+//
+// That is a rule about the LIST. It says nothing about whether a blank
+// SELECTION is a shippable rule, and #6673 itself already answers that the
+// other way: its `rule.Match == ""` arm rejects the blank selection outright,
+// wording it "the selected value is EMPTY, so NONE of them takes effect and the
+// dataplane drops the rule". #6673 could only see that case when two or more
+// prefixes were also listed, because the arm sits inside `len(addrs) > 1`. This
+// gate completes it — the blank selection is rejected however it was authored,
+// while the empty-slot counting rule is left exactly as #6673 wrote it.
+//
+// WHY THE BLANK IS NOT INERT. compileNATStatic selects rule.Match from the
+// authored value, buildStaticNATSnapshots lowers it as
+// StaticNATRuleSnapshot.ExternalIP (pkg/dataplane/userspace/nat_static.go), and
+// the Rust parse_nat_prefix (userspace-dp/src/nat/static_nat.rs) returns None on
+// an empty string, so from_snapshots `continue`s and drops the ENTIRE mapping,
+// recording only a bounded NAT parse-error counter (#4718). The operator
+// authored a rule that does not exist at runtime, with no commit error and no
+// warning — the #3206 silent drop, reached through the blank rather than through
+// a typo.
+//
+// SCOPE — measured at 7230dcdcd, not assumed. Four authoring shapes reach a
+// surviving static-NAT rule with rule.Match == "", and all four committed clean
+// and were dropped identically by the dataplane:
+//
+//	match destination-address ""                       MatchAddresses = [""]
+//	match destination-address                          MatchAddresses = [""]
+//	match destination-address 192.0.2.1/32; then [ ]    MatchAddresses = ["192.0.2.1/32", ""]
+//	no `match destination-address` at all              MatchAddresses = []
+//
+// The issue (#7216) names only the first. This gate covers all four, because
+// the property that makes the rule not exist is the EMPTY SELECTION, not which
+// keystrokes produced it — a gate that refused the quoted blank and passed the
+// omitted leaf would be binding the authoring shape rather than the defect, and
+// would sit one keystroke away from being defeated. The message distinguishes
+// the two remedies (fill the blank vs add the statement) so the operator is not
+// sent looking for a line that is not there.
+//
+// EXEMPTIONS, each verified to be covered by its own gate rather than assumed:
+//
+//   - NPTv6 (`then static-nat nptv6-prefix`) — lowers through
+//     buildNptv6Snapshots, not the static_nat table, and an empty or absent
+//     match is ALREADY rejected there: "match destination-address \"\" is not
+//     a valid IPv6 prefix for nptv6-prefix translation". Exempting it leaves no
+//     hole and keeps the clearer, family-specific message.
+//   - `then static-nat inet` (the Junos NAT64 keyword) — ALREADY rejected
+//     outright by validateStaticNATInetTargetStrict (#5859) whether or not a
+//     match is present, and buildStaticNATSnapshots drops it on the tolerant
+//     path. Skipped here for the same reason validateNATHostMaskStrict skips
+//     it: its own gate gives the better diagnosis.
+//
+// Strict on commit / commit-check (hard reject naming the rule-set and rule);
+// lenient on load / peer-sync (warn — #1960 no-brick). The dataplane already
+// drops the rule there, so a leniently-loaded config is no worse off than
+// before this gate existed.
+//
+// Runs AFTER validateStaticNATMatchAddressesStrict so the two-or-more-prefix
+// shape keeps that gate's richer message (it can name the prefixes that were
+// passed over); by the time this runs, a rule with a blank selection has at
+// most one non-empty prefix beside it.
+func validateStaticNATSelectedMatchAddressStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Match != "" {
+				continue
+			}
+			if rule.IsNPTv6 || rule.Then == "inet" {
+				continue
+			}
+			// A rule with no translation target at all never materialises a
+			// mapping to complain about, and validateStaticNATThenTargetStrict
+			// owns that diagnosis.
+			if rule.Then == "" && rule.ThenPrefixName == "" {
+				continue
+			}
+			authored := "is EMPTY"
+			remedy := "give the rule the external prefix it translates"
+			if len(rule.MatchAddresses) == 0 {
+				authored = "is MISSING"
+				remedy = "add `match destination-address <prefix>` to the rule"
+			}
+			return fmt.Errorf(
+				"static NAT rule-set %q rule %q: the selected `match "+
+					"destination-address` %s; a static-NAT rule translates exactly "+
+					"ONE external prefix to the single `then static-nat prefix` "+
+					"target, so with no external prefix NOTHING takes effect and the "+
+					"dataplane drops the rule — %s (#7216)",
+				rs.Name, rule.Name, authored, remedy)
+		}
+	}
+	return nil
+}
+
 // validateProxyARPAddressesStrict (#6659 follow-up) hard-rejects a
 // `security nat proxy-arp interface <if> address <addr>` value that the
 // dataplane cannot parse.

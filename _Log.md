@@ -99501,6 +99501,58 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/filter_counters_metrics_test.go,
   pkg/api/zone_counters_metrics_test.go, pkg/api/README.md,
   pkg/daemon/README.md, _Log.md
+- **Action**: #7216 — reject a static-NAT rule whose selected `match
+  destination-address` is empty.
+
+  Reproduced firsthand at `7230dcdcd` over the #7145 base config. Of the six
+  (NAT kind x match leaf) slots, static-NAT `match destination-address` was the
+  only one that accepted a quoted `""`: it lowered `Match=""`,
+  `MatchAddresses=[""]`, which `buildStaticNATSnapshots` carries as
+  `ExternalIP=""`, on which the Rust `parse_nat_prefix` returns None and
+  `from_snapshots` drops the WHOLE mapping.
+
+  Established what the empty value means before rejecting it. #6673's
+  empty-slot meaning is a COUNTING rule — an empty slot is a SELECTION marker,
+  not a second prefix, so the cardinality gate counts only non-empty values. It
+  says nothing about whether a blank SELECTION is shippable, and #6673's own
+  `rule.Match == ""` arm already rejects the blank selection where it can see
+  it (inside `len(addrs) > 1`). The new gate reads `rule.Match`, the SELECTION,
+  never the slot count, so `[ 192.0.2.1/32 "" ]` still commits.
+
+  Scope is the SELECTION, not the keystrokes. Measured four authoring shapes
+  reaching a surviving rule with `Match == ""` — quoted `""`, the valueless
+  leaf, a prefix followed by a blank that re-selects, and no `match
+  destination-address` at all — all committing clean and all dropped
+  identically. The gate covers all four; the message distinguishes the two
+  remedies. Exempts NPTv6 and `then static-nat inet`, each MEASURED to be
+  already refused by its own gate.
+
+  Three #6673 tests changed contract, deliberately: they asserted a blanked
+  prefix COMMITS, which was the residue of the cardinality gate being the only
+  observer. Their real property is re-bound more sharply — the rejection must
+  be #7216's and must NOT be the cardinality gate's "declares N prefixes" — and
+  the drift invariant (Match always in MatchAddresses) moved to the tolerant
+  path, where every fixture still compiles. The `nat static match
+  source-address` slot-escape fixture gained a valid `match
+  destination-address` so its control commits.
+
+  Mutation-proved five ways, `go vet` clean on each: removing the gate call ->
+  exit 1 at "committed CLEAN" and at the `Store.Load` warning assertion; keying
+  on any empty SLOT instead of the selection -> exit 1 in the #6673
+  preservation cell AND in the original #6673 tests; dropping the NPTv6/inet
+  exemption -> exit 1 at the wrong-message assertion; collapsing the two
+  remedies -> exit 1 at the remedy assertion; running the gate BEFORE the
+  cardinality gate -> exit 1 at the #6659-message cell. Restored by file copy,
+  byte-identical.
+
+  Go-only, `pkg/config` plus a `pkg/configstore` test; nothing reaches the Rust
+  helper or the wire protocol, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/nat_static_blank_external_prefix_7216_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/config/schema_slot_escape_fixtures_test.go,
+  pkg/configstore/nat_static_blank_prefix_boot_7216_test.go,
 - **Action**: #7215 — make the destination-NAT `match destination-address`
   commit gate use its own builder's parse predicate.
 
