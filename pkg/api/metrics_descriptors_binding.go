@@ -55,4 +55,51 @@ func (c *xpfCollector) initBindingDescriptors() {
 			"xpf_userspace_binding_v_min_throttles_total.",
 		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
 	)
+	// #7409: per-binding slow-path reinject counters, split by disposition.
+	// The frames counted here left the userspace dataplane WITHOUT being
+	// adjudicated and were forwarded by the kernel FIB — there is no
+	// nftables `hook forward` chain behind them, so no zone policy, session,
+	// NAT or screen applied. Emitted UNCONDITIONALLY per binding so a 0 is a
+	// real "nothing was reinjected" signal rather than an absent series;
+	// alerting on the absence of a series is what let this stay invisible.
+	c.bindingSlowPathNoRoutePackets = prometheus.NewDesc(
+		"xpf_userspace_binding_slow_path_no_route_packets_total",
+		"Transit frames reinjected to the kernel because the userspace FIB "+
+			"had no route for the destination (#7409). Each one was forwarded "+
+			"by the kernel with NO zone policy, session, NAT or screen. A "+
+			"sustained non-zero rate means the helper FIB disagrees with the "+
+			"kernel FIB — the usual cause is a learned (BGP/OSPF/IS-IS/RIP or "+
+			"DHCP) route that has not yet been imported into a snapshot, since "+
+			"the FIB refreshes only on commit and ip-monitoring actuation.",
+		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+	)
+	c.bindingSlowPathNextTablePackets = prometheus.NewDesc(
+		"xpf_userspace_binding_slow_path_next_table_packets_total",
+		"Transit frames reinjected to the kernel because they hit an "+
+			"inter-VRF next-table chain the helper does not implement — "+
+			"including an acyclic chain deeper than the eight-table limit "+
+			"(#7409/#6664). Kernel-routable, policy-unevaluated. Unlike "+
+			"no_route an attacker cannot create this condition; it needs an "+
+			"operator config defect.",
+		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+	)
+	c.bindingSlowPathLocalDeliveryPackets = prometheus.NewDesc(
+		"xpf_userspace_binding_slow_path_local_delivery_packets_total",
+		"Frames delivered to the local host stack via the slow path (#7409). "+
+			"NOT a bypass: host-inbound admission is gated on all three "+
+			"delivery paths by host_inbound_gated_lo0_action plus the kernel "+
+			"nft xpf_hostinbound `hook input` chain, so transit forward policy "+
+			"is deliberately not the authority here. Exported for volume "+
+			"context alongside the other reinject reasons.",
+		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+	)
+	c.bindingSlowPathMissingNeighborPackets = prometheus.NewDesc(
+		"xpf_userspace_binding_slow_path_missing_neighbor_packets_total",
+		"Transit frames reinjected because the next-hop's ARP/NDP entry was "+
+			"unresolved while the userspace prober ran (#7409). Zone policy IS "+
+			"enforced on the flowless branch of this arm (#4024). Expect a "+
+			"transient burst on a cold neighbour table; a sustained rate means "+
+			"neighbour resolution is failing for a live next-hop.",
+		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+	)
 }
