@@ -286,6 +286,46 @@ Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
   skip the probe, killing the fix-and-reboot retry above. A box in
   factory bootstrap has no `active.json`, so the loader re-probes.
 
+### "My day-0 config did not apply" — where to look (#4184 / #6496)
+
+The boot-time config-import decision is RECORDED, so this is a question with an
+in-band answer rather than a journald hunt. From the CLI on the box (console or
+ssh, local `cli` or remote):
+
+```
+> show system bootstrap-import
+Bootstrap configuration import:
+  Status:   import-failed
+  Meaning:  a configuration file was present but could NOT be applied — see Error below
+  Recorded: 2026-08-21 14:02:11 UTC
+  Error:    day-0 config REJECTED by commit-check: ...
+
+  The box is in the lifeline-safe bootstrap state; ...
+```
+
+The four statuses are `ok` (imported + committed), `loaded-from-db` (an active
+config was already present, so no file import was attempted — the normal
+steady-state boot), `no-config` (nothing to import: the expected factory boot),
+and `import-failed` (a file was present but could not be read, parsed,
+committed, or survived the device-map strand preflight).
+
+`import-failed` is INFORMATIONAL, not a fault state: the box is in the
+lifeline-safe bootstrap state and still reachable, so neither this command nor
+`/health` treats it as a reason to pull the box. It also emits a
+`BOOTSTRAP_IMPORT_FAILED` event.
+
+The same status is on the loopback REST probe for scripted checks:
+
+```
+curl -s http://127.0.0.1:8080/health | jq '.data | {bootstrap_import_status, bootstrap_import_failed, bootstrap_import_unix}'
+```
+
+Use the CLI when you need the **reason**. `/health` deliberately reports the
+status enum, the failed flag and the timestamp but NOT the error text: that
+endpoint is unauthenticated, and an import error quotes the offending
+configuration, which can echo a submitted secret (#5031). The CLI and gRPC
+paths are authenticated, so they are the only surfaces that can tell you why.
+
 ### The `/etc/xpf/appliance` marker (#7114)
 
 The bake writes `/etc/xpf/appliance` into the image. It is what makes the

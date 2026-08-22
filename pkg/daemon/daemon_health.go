@@ -5,24 +5,33 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/logging"
 )
 
 // Bootstrap-import outcome constants (#4184). Recorded once at boot by
-// recordBootstrapImport and surfaced via /health + an event.
+// recordBootstrapImport and surfaced via /health, an event, and (#6496)
+// `show system bootstrap-import` on the CLI + gRPC paths.
+//
+// These are ALIASES of the bootstrapshow vocabulary, not independent literals.
+// The renderer maps each status to an operator-facing explanation and reports
+// anything it does not recognise as unrecognised, so a status recorded here
+// that the renderer was never taught would surface to the operator as
+// "unrecognized status". Defining them as aliases makes that unreachable: the
+// value written and the value rendered are the same constant.
 const (
 	// bootstrapImportOK: the text config file was imported and committed.
-	bootstrapImportOK = "ok"
+	bootstrapImportOK = bootstrapshow.StatusOK
 	// bootstrapImportLoadedDB: an active config was already present in the DB;
 	// no file import was attempted (normal steady-state boot).
-	bootstrapImportLoadedDB = "loaded-from-db"
+	bootstrapImportLoadedDB = bootstrapshow.StatusLoadedDB
 	// bootstrapImportNoConfig: no text config file present (factory/fresh
 	// boot). Expected — NOT a failure and NOT health-degrading.
-	bootstrapImportNoConfig = "no-config"
+	bootstrapImportNoConfig = bootstrapshow.StatusNoConfig
 	// bootstrapImportFailed: a text config file was present but could not be
 	// read/parsed/committed (or was rejected by the device-map preflight).
-	bootstrapImportFailed = "import-failed"
+	bootstrapImportFailed = bootstrapshow.StatusFailed
 )
 
 // BootstrapImport is a snapshot of the day-0 / bootstrap config-import

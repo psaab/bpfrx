@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/psaab/xpf/pkg/api"
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/eventengine"
 	"github.com/psaab/xpf/pkg/feeds"
@@ -133,6 +134,23 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		Cluster:    d.cluster,
 		DHCP:       d.dhcp,
 		DHCPServer: d.dhcpServer,
+		// #6496: the day-0 config-import verdict for `show system
+		// bootstrap-import`. Same recorded snapshot /health reports below and
+		// the in-process CLI reads (daemon_run.go SetBootstrapImportFn), so
+		// the three surfaces cannot disagree about whether a day-0 config
+		// applied. Unlike /health this path renders b.Error: it is
+		// authenticated, and the failure REASON is the entire point of the
+		// command (#5031 withholds it from /health because that endpoint is
+		// unauthenticated, which is a different question from privilege).
+		BootstrapImportFn: func() bootstrapshow.Snapshot {
+			b := d.BootstrapImportSnapshot()
+			return bootstrapshow.Snapshot{
+				Status:  b.Status,
+				Error:   b.Error,
+				UnixSec: b.UnixSec,
+				Failed:  b.Failed,
+			}
+		},
 		RPMResultsFn: func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()

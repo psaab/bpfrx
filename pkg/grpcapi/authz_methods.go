@@ -312,10 +312,17 @@ var showTextViewTopics = map[string]bool{
 	"applications":                      true,
 	"backup-router":                     true,
 	"bfd-peers":                         true,
-	"buffers":                           true,
-	"buffers-detail":                    true,
-	"chassis":                           true,
-	"chassis-cluster":                   true,
+	// #6496: the day-0 config-import verdict. PermView, matching the coarse
+	// model the rest of `show` uses (PermView gates every show command) and
+	// matching "login" above, which renders login configuration at the same
+	// level. The topic's error detail is withheld from /health because that
+	// endpoint is UNAUTHENTICATED (#5031), which is a different distinction
+	// from privilege level — every caller reaching here has authenticated.
+	"bootstrap-import": true,
+	"buffers":          true,
+	"buffers-detail":   true,
+	"chassis":          true,
+	"chassis-cluster":  true,
 	"chassis-cluster-control-plane-statistics": true,
 	"chassis-cluster-data-plane-fairness":      true,
 	"chassis-cluster-data-plane-flows":         true,
