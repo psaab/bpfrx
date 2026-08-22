@@ -219,19 +219,31 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "persistent-nat":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showPersistentNAT(&buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showPersistentNAT(&buf); err != nil {
+			return nil, err
+		}
 
 	case "nat-source-rule-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showNATSourceRuleDetail(cfg, &buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showNATSourceRuleDetail(cfg, &buf); err != nil {
+			return nil, err
+		}
 
 	case "nat-dest-rule-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showNATDestRuleDetail(cfg, &buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showNATDestRuleDetail(cfg, &buf); err != nil {
+			return nil, err
+		}
 
 	case "persistent-nat-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showPersistentNATDetail(&buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showPersistentNATDetail(&buf); err != nil {
+			return nil, err
+		}
 
 	case "tunnels":
 		// #1043 Phase 12: case body extracted to server_show_security_text.go
