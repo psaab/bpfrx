@@ -2063,15 +2063,43 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 		}
 	}
 
+	// #6543: redundancy-group instances are folded by CANONICAL id, not by
+	// the spelling the operator wrote. `strconv.Atoi` maps `1`, `01`, `001`
+	// and `+1` to the same int, and the AST keeps them as DISTINCT instances
+	// (namedInstances yields one entry per node, and a repeated hierarchical
+	// `redundancy-group 1 { ... }` block is two nodes as well). Appending one
+	// record per instance therefore committed TWO *RedundancyGroup with
+	// ID=1 — one carrying the operator's `node <n> priority <p>` map and one
+	// with an EMPTY map.
+	//
+	// Everything downstream keys redundancy groups by the int id, so the
+	// split was silently lossy: cluster.Manager.UpdateConfig's id-keyed
+	// last-wins loop overwrote LocalPriority with the map-miss zero from
+	// whichever record came second, so a node configured to win the election
+	// at priority 200 ran RG 1 at priority 0. The #4880 priority-range gate
+	// could not catch it either — it iterated the empty-map record and passed
+	// vacuously, having nothing to range-check.
+	//
+	// Folding by canonical id yields exactly one record per id and replays
+	// every instance's body into it through the same statement table, so the
+	// merge is leaf-level last-wins — Junos `set` semantics — rather than a
+	// whole record silently displacing another. First-appearance order of the
+	// ids is preserved so the compiled slice stays deterministic.
+	byID := make(map[int]*RedundancyGroup)
 	for _, rgInst := range namedInstances(clusterNode.FindChildren("redundancy-group")) {
 		rgID := 0
 		if n, err := strconv.Atoi(rgInst.name); err == nil {
 			rgID = n
 		}
 
-		rg := &RedundancyGroup{
-			ID:             rgID,
-			NodePriorities: make(map[int]int),
+		rg, ok := byID[rgID]
+		if !ok {
+			rg = &RedundancyGroup{
+				ID:             rgID,
+				NodePriorities: make(map[int]int),
+			}
+			byID[rgID] = rg
+			ch.Cluster.RedundancyGroups = append(ch.Cluster.RedundancyGroups, rg)
 		}
 
 		// #6588: redundancyGroupBody, not .Children — the whole body may be
@@ -2085,8 +2113,6 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 				compile(rg, child)
 			}
 		}
-
-		ch.Cluster.RedundancyGroups = append(ch.Cluster.RedundancyGroups, rg)
 	}
 
 	return nil

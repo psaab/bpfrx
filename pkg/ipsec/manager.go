@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +59,25 @@ type Manager struct {
 	// config's connection set yields the connections an operator DELETED, so
 	// their live SAs can be torn down (#3941). nil until the first Apply.
 	prevConnNames map[string]bool
+
+	// pendingTerminate carries the TEARDOWN DEBT of connections whose
+	// `swanctl --terminate` failed on a previous apply (#6542).
+	//
+	// prevConnNames advances to the newly-loaded set as soon as the reload
+	// succeeds, so a name that departed the loaded set is gone from it
+	// forever after that single apply. Before #6542 a failed terminate was
+	// logged and dropped on the floor: the departed connection's live child
+	// SA kept forwarding under stale selectors/credentials and no later
+	// reconcile ever retried the teardown, because the only record of what
+	// departed had already been overwritten. Carrying the failed subset here
+	// re-derives it into the NEXT apply's removed set, so the teardown is
+	// retried until it succeeds or the SA is observed gone.
+	//
+	// A debt entry is NEVER a licence to terminate a loaded connection:
+	// promoteConnNames folds the debt into `removed` only for names absent
+	// from the newly-loaded set, so an operator re-adding the VPN discharges
+	// the debt instead of tearing the restored tunnel down.
+	pendingTerminate map[string]bool
 
 	// swanctl is the exec seam for shelling out to swanctl. Nil in
 	// production and directly-constructed test Managers; sc() falls back to
@@ -148,9 +169,17 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 	// while we tear it down. Terminate is idempotent: a departed VPN with no
 	// active SA is a clean no-op (no --terminate is issued because it never
 	// shows up in --list-sas).
+	//
+	// #6542: a terminate that FAILS is not swallowed. promoteConnNames has
+	// already advanced prevConnNames past the departed names, so a dropped
+	// failure would lose the teardown debt permanently and leave the stale SA
+	// forwarding while Apply reported success. The failed subset is recorded
+	// as debt (retried on the next apply) AND surfaced as an Apply error, so
+	// the commit result shows the degraded IPsec state — the same posture
+	// #4433 established for a failed reload.
 	removed := m.promoteConnNames(loadedNames)
-	m.terminateRemovedConns(removed)
-	return nil
+	failed := m.terminateRemovedConns(removed)
+	return m.recordTerminateDebt(failed)
 }
 
 // Clear removes the xpf config and reloads strongSwan, terminating the live
@@ -163,8 +192,8 @@ func (m *Manager) Clear() error {
 		return err
 	}
 	removed := m.promoteConnNames(nil)
-	m.terminateRemovedConns(removed)
-	return nil
+	failed := m.terminateRemovedConns(removed)
+	return m.recordTerminateDebt(failed)
 }
 
 // applyConfig renders + atomically writes the swanctl snippet and reloads.
@@ -241,28 +270,77 @@ func (m *Manager) reload() error {
 // reflects the last config strongSwan actually loaded — never a config whose
 // reload failed. The name/removed diff and the prevConnNames advance stay
 // atomic under mu.
+//
+// #6542: the returned set is the union of the departed-this-apply names AND
+// any outstanding teardown debt (pendingTerminate) — connections whose
+// terminate failed on an earlier apply and whose stale SA may therefore still
+// be forwarding. Both halves are filtered by the newly-loaded set, so a name
+// that came back (operator re-added the VPN, or it became renderable again)
+// is never torn down. The debt is cleared here and re-derived from THIS
+// apply's teardown outcome by recordTerminateDebt.
 func (m *Manager) promoteConnNames(newNames map[string]bool) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var removed []string
+	seen := make(map[string]bool, len(m.prevConnNames))
 	for name := range m.prevConnNames {
 		if !newNames[name] {
+			removed = append(removed, name)
+			seen[name] = true
+		}
+	}
+	for name := range m.pendingTerminate {
+		if !newNames[name] && !seen[name] {
 			removed = append(removed, name)
 		}
 	}
 	m.prevConnNames = newNames
+	m.pendingTerminate = nil
 	return removed
 }
 
+// recordTerminateDebt records the connections whose teardown failed on this
+// apply so the next reconcile retries them, and returns the error Apply/Clear
+// reports to the caller. An empty failed set discharges cleanly (nil error).
+//
+// The debt is UNIONED into whatever pendingTerminate currently holds rather
+// than replacing it: promoteConnNames releases mu before the terminates run,
+// so a concurrent Apply (the ordered commit path and the DHCP-rebind
+// re-render both call Apply) could otherwise clobber the other's debt. A
+// stale union member is harmless — promoteConnNames filters the debt by the
+// loaded set before any terminate is issued.
+func (m *Manager) recordTerminateDebt(failed []string) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	if m.pendingTerminate == nil {
+		m.pendingTerminate = make(map[string]bool, len(failed))
+	}
+	for _, name := range failed {
+		m.pendingTerminate[name] = true
+	}
+	m.mu.Unlock()
+	sort.Strings(failed)
+	return fmt.Errorf("terminate stale IPsec SAs for removed connection(s) "+
+		"%s: teardown retried on next commit", strings.Join(failed, ", "))
+}
+
 // terminateRemovedConns tears down the live IKE/child SAs of the deleted
-// connections. It queries live SAs and only terminates a removed connection
-// that actually has an SA, so a deletion of a VPN that was never up issues no
-// swanctl call. A terminate failure is logged but never fails the apply — the
-// config reload already unloaded the connection, and the SA may simply have
-// been down already (#3941).
-func (m *Manager) terminateRemovedConns(removed []string) {
+// connections and returns the subset whose terminate FAILED. It queries live
+// SAs and only terminates a removed connection that actually has an SA, so a
+// deletion of a VPN that was never up issues no swanctl call (#3941).
+//
+// #6542: the failed subset is returned rather than only logged. A departed
+// connection that is observed LIVE and whose terminate errors is still
+// forwarding under an unloaded configuration — the exact fail-open this
+// teardown exists to close — so it becomes teardown debt the caller retries.
+// A removed connection that is NOT live is a clean no-op and owes nothing,
+// which is what lets the debt discharge once the SA is actually gone instead
+// of failing every subsequent commit forever.
+func (m *Manager) terminateRemovedConns(removed []string) []string {
 	if len(removed) == 0 {
-		return
+		return nil
 	}
 
 	removedSet := make(map[string]bool, len(removed))
@@ -270,37 +348,52 @@ func (m *Manager) terminateRemovedConns(removed []string) {
 		removedSet[name] = true
 	}
 
+	var failed []string
+
 	live, err := m.liveConnNames()
 	if err != nil {
 		// Could not enumerate live SAs (charon down / vici error). Fall back
 		// to an unconditional, idempotent terminate of each removed name so a
 		// straggler SA is not left forwarding; swanctl no-ops when nothing
 		// matches.
+		//
+		// #6542: a failure here is ambiguous — it may be a genuine teardown
+		// failure or merely "no matching SA" for a connection that was never
+		// up. It is still carried as debt: the NEXT apply enumerates live SAs
+		// and discharges the debt silently if the name is not live, so an
+		// ambiguous failure self-clears in one reconcile instead of latching.
 		slog.Warn("could not list SAs before terminating removed IPsec "+
 			"connections; terminating unconditionally", "err", err)
 		for _, name := range removed {
-			m.terminateIKE(name)
+			if !m.terminateIKE(name) {
+				failed = append(failed, name)
+			}
 		}
-		return
+		return failed
 	}
 
 	for name := range live {
-		if removedSet[name] {
-			m.terminateIKE(name)
+		if removedSet[name] && !m.terminateIKE(name) {
+			failed = append(failed, name)
 		}
 	}
+	return failed
 }
 
 // terminateIKE issues `swanctl --terminate --ike <name>` for a single
-// connection, logging (but not propagating) any error.
-func (m *Manager) terminateIKE(name string) {
+// connection and reports whether it succeeded. The error is logged here and
+// converted to a false return so the caller can carry the teardown debt
+// (#6542); it is deliberately not wrapped and propagated, because a single
+// failure must not abort the teardown of the OTHER removed connections.
+func (m *Manager) terminateIKE(name string) bool {
 	if out, err := m.sc("--terminate", "--ike", name); err != nil {
 		slog.Warn("swanctl terminate for deleted IPsec VPN failed "+
-			"(SA may already be down)", "ike", name, "err", err,
-			"output", string(out))
-		return
+			"(SA may already be down); teardown retried on next commit",
+			"ike", name, "err", err, "output", string(out))
+		return false
 	}
 	slog.Info("terminated live SAs for deleted IPsec VPN", "ike", name)
+	return true
 }
 
 // liveConnNames returns the set of connection (IKE SA) names strongSwan

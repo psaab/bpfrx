@@ -227,9 +227,10 @@ func verdictFor(v ZoneHostInboundView, a HostInboundAdmission) HostInboundViewVe
 // ClassifyHostInboundForInterface classifies the host-inbound admission for a
 // SINGLE ingress interface's EFFECTIVE host-inbound view (#5579). Unlike
 // ClassifyHostInbound — which folds every view in the zone with a first-admit OR
-// — it evaluates ONLY ifaceRef's effective token set (zone-level ∪ the
-// per-interface override, #3362, with the same physical→unit inheritance the
-// enforcement view builder uses), so a mixed zone reports the interface's TRUE
+// — it evaluates ONLY ifaceRef's effective token set (its per-interface
+// override where declared, which REPLACES the zone-level set — #6515, #3362 —
+// with the same physical→unit inheritance the enforcement view builder uses),
+// so a mixed zone reports the interface's TRUE
 // posture (admit vs deny) instead of a zone-wide first-admit fold. ifaceRef is
 // expected to be a caller-validated interface assigned to fromZone (see
 // ResolveHostInboundIngressInterface); an unresolved zone/interface yields
@@ -243,13 +244,14 @@ func ClassifyHostInboundForInterface(cfg *config.Config, fromZone, ifaceRef stri
 		return HostInboundAdmission{Status: HostInboundNotComputed}
 	}
 	// Resolve THIS interface's effective host-inbound token set with the same SSOT
-	// the enforcement view builder uses (unionHostInboundTokens over the zone-level
-	// stanza and the per-interface override, physical→unit inheritance included),
-	// then classify that single view.
+	// the enforcement view builder uses (effectiveHostInboundTokens over the
+	// zone-level stanza and the per-interface override — the override REPLACES the
+	// zone set when present, #6515 — physical→unit inheritance included), then
+	// classify that single view.
 	// #5878 phase 2: look the override up on the ref's canonical logical-unit
 	// identity so a query for ge-0/0/0.01 finds an override authored as
 	// ge-0/0/0.1 (buildInterfaceHostInboundMap now keys by the canonical unit).
-	svc, prot := unionHostInboundTokens(zone.HostInboundTraffic, buildInterfaceHostInboundMap(cfg)[config.CanonicalInterfaceUnitRef(ifaceRef)])
+	svc, prot := effectiveHostInboundTokens(zone.HostInboundTraffic, buildInterfaceHostInboundMap(cfg)[config.CanonicalInterfaceUnitRef(ifaceRef)])
 	v := ZoneHostInboundView{Zone: fromZone, Interfaces: []string{ifaceRef}, SystemServices: svc, Protocols: prot}
 	return classifyOneView(v, proto, hasProto, dstPort, icmpType, family)
 }

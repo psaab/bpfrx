@@ -12,11 +12,14 @@ Subcommands:
   launch --name … --nic …         imperative launch without a YAML file.
   inventory                       list host NICs, SR-IOV VFs, bridges → the
                                   values you drop into a definition.
-  fetch --version V [--image-url] download a signed appliance image from
-                                  XPF_IMAGE_BASE_URL, VERIFY the exact bytes
-                                  against the signed manifest (#1924), then
-                                  import it to a local incus alias. Verify
-                                  happens here, not at deploy/launch.
+  fetch [--version V] [--image-url] download a signed appliance image from
+                                  XPF_IMAGE_BASE_URL. With NO --version, the
+                                  version comes from the signed
+                                  <channel>/latest.json pointer (#6504); then
+                                  VERIFY the exact bytes against the signed
+                                  manifest (#1924) and import to a local incus
+                                  alias. Verify happens here, not at
+                                  deploy/launch.
   kernel-roll --node A --node B   LANE-1 HA kernel roll (#1930 INC-2): drive a
               --version V          verify-gated kernel bump across the HA pair
                                   ONE NODE AT A TIME (drain -> arm+reboot into
@@ -1118,6 +1121,105 @@ def _ver_key(v):
     return (rel_key, pre_rank)
 
 
+# ── #1924 signed channel pointer (#6504) ──────────────────────────────
+# publish.py produces, signs and publish-gates a per-channel latest.json
+# freshness pointer, and docs/distribution.md named "our scripts" as its
+# consumers — but no script read it: `fetch` made --version mandatory, so a
+# day-zero operator could not say "give me current stable" without already
+# knowing a version string. The signed pointer was a dead letter.
+#
+# `fetch` with no --version now resolves it from <base>/<channel>/latest.json,
+# minisign-verified against the SAME pinned image pubkey that authenticates
+# every artifact. The resolved version then flows through the EXISTING path
+# unchanged: the #5992 filename-safety validation, the anti-rollback
+# watermark, the per-file signature verification, and the import.
+#
+# A channel name is interpolated into a URL PATH, so it is validated with the
+# same fail-closed discipline as a version — `--channel ../../evil` must not
+# be able to walk the pointer fetch out of the channel namespace, and the
+# channel is also the watermark bucket key.
+_CHANNEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def validate_channel(value, field="--channel"):
+    """Reject a channel that could escape its namespace in the pointer URL or
+    poison the watermark map. Returns value on success; die()s otherwise."""
+    if not isinstance(value, str) or not value:
+        die(f"{field} is required and must be a non-empty string")
+    if not _CHANNEL_RE.match(value) or ".." in value:
+        die(f"{field} '{value}' is not a valid channel name (letters, digits, "
+            "'.', '_', '-'; must start alphanumeric and contain no '..')")
+    return value
+
+
+def _resolve_channel_version(base, channel, sign_mod, dry_run=False):
+    """Fetch + minisign-verify <base>/<channel>/latest.json and return the
+    version it names (#6504).
+
+    The pointer and its signature are downloaded into a PRIVATE 0700 temp dir,
+    never into --out: unverified bytes must not land in the operator's
+    artifact directory under a predictable name, and nothing but this function
+    ever needs them. verify_and_read re-copies and verifies again inside its
+    own private dir and returns the VERIFIED bytes, so the JSON parsed here is
+    exactly what was signed.
+
+    Fail-CLOSED at every step. A missing pointer, a missing signature, a
+    signature that does not verify against the pinned pubkey, unparseable
+    JSON, or a version that is not filename-safe all abort — an operator who
+    typed no version is trusting this pointer completely, so there is no
+    best-effort path where an unverified answer is used anyway.
+    """
+    url = f"{base}/{channel}/latest.json"
+    if dry_run:
+        print(f"  (dry-run) curl -fsSL {url} (+ .minisig) -> minisign-verify "
+              "against the pinned image pubkey -> take its `version` -> then "
+              "fetch + verify + import that version's artifacts as if it had "
+              "been passed to --version")
+        return None
+    tmp = tempfile.mkdtemp(prefix="xpf-latest-")
+    os.chmod(tmp, 0o700)
+    try:
+        latest = os.path.join(tmp, "latest.json")
+        sig = latest + ".minisig"
+        print(f"==> resolving channel '{channel}': {url}")
+        _download_to(url, latest, tmp)
+        _download_to(url + ".minisig", sig, tmp)
+        try:
+            data = sign_mod.verify_and_read(latest, sig)
+        except sign_mod.SignError as e:
+            die(f"channel pointer {channel}/latest.json FAILED signature "
+                f"verification against the pinned image pubkey: {e}. Refusing "
+                "to fetch a version named by an unauthenticated pointer.")
+        try:
+            doc = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            die(f"channel pointer {channel}/latest.json verified but is not "
+                f"valid JSON: {e}")
+        if not isinstance(doc, dict):
+            die(f"channel pointer {channel}/latest.json is not a JSON object")
+        ver = doc.get("version")
+        if not ver:
+            die(f"channel pointer {channel}/latest.json names no version "
+                f"(got {doc!r})")
+        # The pointer's own channel field must agree with the one requested:
+        # a stable pointer served at edge/ (a mis-sync, or a swapped object on
+        # the host) would otherwise silently deliver the wrong channel while
+        # verifying perfectly — both files are signed by the same key.
+        got_chan = doc.get("channel")
+        if got_chan is not None and got_chan != channel:
+            die(f"channel pointer at {channel}/latest.json says it is for "
+                f"channel {got_chan!r} — refusing (a mis-synced or swapped "
+                "pointer verifies fine; the signature says who wrote it, not "
+                "where it belongs).")
+        # #5992: this string is about to name artifact FILES. Validate BEFORE
+        # it reaches any path, exactly as an operator-supplied --version is.
+        ver = validate_version(ver, f"version from {channel}/latest.json")
+        print(f"==> channel '{channel}' -> version {ver} (signature OK)")
+        return ver
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _download_to(url, dst, workdir):
     """Download `url` to `dst` via an EXCLUSIVELY-created, unpredictable temp in
     `workdir`, then publish atomically with os.replace (#5817).
@@ -1197,6 +1299,19 @@ def cmd_fetch(args):
     if not base:
         die("fetch needs --image-url or XPF_IMAGE_BASE_URL (the image host).")
     base = base.rstrip("/")
+    # The channel is both a URL path segment (the #6504 pointer fetch) and the
+    # watermark bucket key, so validate it whether or not a version was given.
+    validate_channel(args.channel)
+    # #6504: no --version means "give me this channel's current release" —
+    # resolve it from the SIGNED latest.json publish.py already produces and
+    # gates. The resolved string then takes the identical path an operator's
+    # --version takes, validation included.
+    if args.version is None:
+        resolved = _resolve_channel_version(base, args.channel, sign,
+                                            dry_run=args.dry_run)
+        if resolved is None:      # dry-run: nothing to name yet
+            return 0
+        args.version = resolved
     # #5992: the version is interpolated into artifact WRITE paths below
     # (xpf-<ver>.qcow2 …). Reject a path-escaping / crafted version BEFORE it
     # names any file, so `--version '../../etc/x'` cannot redirect the download
@@ -2475,7 +2590,9 @@ def main():
 
     if cmd == "fetch":
         sub = argparse.ArgumentParser(prog="xpf-deploy.py fetch", add_help=False)
-        sub.add_argument("--version", required=True)
+        # #6504: OPTIONAL. Omitted means "this channel's current release",
+        # resolved from the signed <channel>/latest.json pointer.
+        sub.add_argument("--version")
         sub.add_argument("--image-url", dest="image_url")
         sub.add_argument("--out")
         sub.add_argument("--alias")

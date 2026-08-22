@@ -202,7 +202,8 @@ pub(in crate::afxdp) struct ForwardingState {
     /// #3362: per-INTERFACE host-inbound-traffic OVERRIDE admission set, keyed by
     /// ingress ifindex. Populated only for an interface that declared an
     /// interface-level `host-inbound-traffic` stanza (and is not a lifeline); the
-    /// carried set is the EFFECTIVE union (zone ∪ interface) computed in Go. When
+    /// carried set is the EFFECTIVE set computed in Go, where the interface stanza
+    /// REPLACES the zone-level one (#6515). When
     /// a packet's ingress ifindex is present here the local-delivery admit path
     /// uses THIS set instead of the from-zone's `zone_host_inbound` entry, so a
     /// service exposed on one interface of a zone is admitted there while the

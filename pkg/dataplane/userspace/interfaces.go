@@ -526,9 +526,10 @@ func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) [
 	// interface. Carried only for an interface that declared an interface-level
 	// stanza and is NOT a management/cluster-control lifeline (matching the nft
 	// primary path, which excludes lifeline addresses from host-inbound deny
-	// scoping). The carried set is the EFFECTIVE union of the zone-level set and
-	// the override, so the Rust side enforces it as-is without re-deriving the
-	// union. HostInboundConfigured marks a present override (even an empty one →
+	// scoping). The carried set is the EFFECTIVE set — the override, which
+	// REPLACES the zone-level set (#6515) — so the Rust side enforces it as-is
+	// without re-deriving it.
+	// HostInboundConfigured marks a present override (even an empty one →
 	// fail-closed) so an old Go binary that omits the field is distinguishable.
 	if overrideByIface := buildInterfaceHostInboundMap(cfg); len(overrideByIface) > 0 {
 		lifelines := hostInboundLifelineSet(cfg)
@@ -539,7 +540,7 @@ func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) [
 				hostInboundLifelineInterface(out[i].Name, lifelines) {
 				continue
 			}
-			svc, proto := unionHostInboundTokens(zone.HostInboundTraffic, ovr)
+			svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, ovr)
 			out[i].HostInboundConfigured = true
 			out[i].HostInboundSystemServices = svc
 			out[i].HostInboundProtocols = proto

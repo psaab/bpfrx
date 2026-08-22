@@ -50,9 +50,11 @@ func TestHostInboundBaseUnit0NoConflict_5699(t *testing.T) {
 			0: {Number: 0, Addresses: []string{"10.0.1.10/24"}},
 		}},
 	}
-	// Zone trust admits `ping` at the zone level; the unit-0 ref adds `ssh` via a
-	// per-interface host-inbound override — so base sig (ping) != unit-0 sig
-	// (ping+ssh).
+	// Zone trust admits `ping` at the zone level; the unit-0 ref declares a
+	// per-interface host-inbound override of `ssh`, which REPLACES the zone set
+	// on that unit (#6515) — so base sig (ping, no base-level override) !=
+	// unit-0 sig (ssh). The signatures differing is what this test needs; #6515
+	// changed WHICH sets differ, not that they do.
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust": {
 			Name:               "trust",
@@ -78,12 +80,22 @@ func TestHostInboundBaseUnit0NoConflict_5699(t *testing.T) {
 		t.Fatalf("live address 10.0.1.10 appears in %d host-inbound views, want exactly 1 "+
 			"(the #5699 base-vs-unit-0 conflict); views carrying it: %+v", len(carrying), carrying)
 	}
-	// Precedence: the single view must carry the unit-0-authoritative merged
-	// admit set (zone ping ∪ unit-0 ssh), NOT the base-only (ping) set.
+	// Precedence: the single view must carry the unit-0-authoritative admit set
+	// (the unit-0 override `ssh`, which replaces the zone-level `ping`, #6515),
+	// NOT the base ref's zone-level-only (ping) set. Asserting the ABSENCE of
+	// `ping` as well as the presence of `ssh` is what pins precedence: a view
+	// carrying both would mean the base contributed after all.
 	got := carrying[0]
-	if !containsAll(got.SystemServices, []string{"ping", "ssh"}) {
-		t.Fatalf("winning view services = %v, want the unit-0 merged set [ping ssh] "+
-			"(unit-0 override must win, not the base-only ping)", got.SystemServices)
+	if !containsAll(got.SystemServices, []string{"ssh"}) {
+		t.Fatalf("winning view services = %v, want the unit-0 override set [ssh] "+
+			"(unit-0 override must win, not the base ref's zone-level ping)", got.SystemServices)
+	}
+	for _, s := range got.SystemServices {
+		if s == "ping" {
+			t.Fatalf("winning view services = %v: the base ref's zone-level `ping` must not "+
+				"appear — the unit-0 stanza replaces the zone set (#6515) and the base's "+
+				"redundant contribution is skipped (#5699)", got.SystemServices)
+		}
 	}
 }
 

@@ -1155,14 +1155,24 @@ Closed feature gap #17 from docs/feature-gaps.md. Added policer (rate limiting),
 ## Sprint IF-1: Interface Enhancements — COMPLETE
 
 ### Overview
-Closed 6 interface feature gaps from docs/feature-gaps.md section 21. Added LAG/ae bond support, flexible VLAN tagging (QinQ), interface bandwidth for OSPF cost, point-to-point FRR wiring, primary/preferred address ordering in networkd, and interface description display. All tests pass, validated on Incus VM.
+Closed 6 interface feature gaps from docs/feature-gaps.md section 21. Added LAG/ae bond support, flexible VLAN tagging (QinQ), interface bandwidth for OSPF cost, point-to-point FRR wiring, primary/preferred address ordering in networkd, and interface description display. All tests pass, validated on Incus VM. **Two of those six were later measured to be config-only, not closed:** LAG/ae (#6544, see the corrected subsection below) and flexible VLAN tagging / QinQ (#2354/#5879, now hard-rejected at commit).
 
-### LAG / Link Aggregation (Missing → Implemented)
-- **Config types:** `AggregatedEtherOptions` struct (LACPActive/Passive, LACPPeriodic, LinkSpeed, MinimumLinks), `LAGParent` string on InterfaceConfig
-- **Compiler:** Parses `gigether-options { 802.3ad <ae-name>; }` → LAGParent, `aggregated-ether-options { lacp { active; periodic fast; } ... }` → AggregatedEtherOpts
-- **networkd:** `.netdev` bond file generation (Kind=bond, Mode=802.3ad, LACPTransmitRate, MinLinks, TransmitHashPolicy=layer3+4), `.network` member files with `Bond=<ae-name>`
-- **routing:** `ApplyBonds()` creates Linux bond via netlink, enslaves members, brings up
-- **Tests:** `TestLAGInterface`, `TestLAGInterfaceSetSyntax`, `TestGenerateNetdev_Bond`, `TestGenerateNetdev_BondDefaults`, `TestGenerateNetwork_BondMember`
+### LAG / Link Aggregation (Missing → **Config-only**, corrected #6544)
+
+> [!IMPORTANT]
+> This section originally read "Missing → Implemented". It was wrong, and
+> #6544 corrects it. `ae` / `802.3ad` is **config-only**: the parse and the
+> bond GENERATORS both exist, but nothing connects them, so configuring a LAG
+> creates no bond device, enslaves no member, runs no LACP and does not honour
+> `minimum-links`. Configuring `ae` now emits an accepted-only advisory
+> (`validateLinkAggregationWarnings`). The remaining feature work is tracked in
+> the parity matrix (`docs/vsrx-gaps.md`, "Interface Redundancy (LAG)").
+
+- **Config types:** `AggregatedEtherOptions` struct (LACPActive/Passive, LACPPeriodic, LinkSpeed, MinimumLinks), `LAGParent` string on InterfaceConfig — **compiled, and read by nothing**
+- **Compiler:** Parses `gigether-options { 802.3ad <ae-name>; }` → LAGParent, `aggregated-ether-options { lacp { active; periodic fast; } ... }` → AggregatedEtherOpts. This part is real and is what the tests below cover.
+- **networkd:** the `.netdev` bond generator (Kind=bond, Mode=802.3ad, LACPTransmitRate, MinLinks, TransmitHashPolicy=layer3+4) and the `Bond=<master>` member `.network` generator DO exist — but their only producer is `buildFabricBondModels` (`pkg/dataplane/compiler_iface.go`), which keys on `fabric-options member-interfaces` and hard-codes `active-backup`. An `ae` interface produces no model, so neither generator is ever reached for a LAG.
+- **routing:** `ApplyBonds()` likewise reconciles kernel bonds from `FabricMembers` only; `LAGParent` members are never enslaved.
+- **Tests:** `TestLAGInterface`, `TestLAGInterfaceSetSyntax` cover the PARSE; `TestGenerateNetdev_Bond`, `TestGenerateNetdev_BondDefaults`, `TestGenerateNetwork_BondMember` cover the GENERATORS in isolation. Neither end asserted that an `ae` config reaches a bond, which is how the "Implemented" claim survived. `compiler_validate_warn_lag_6544_test.go` now pins the accepted-only advisory.
 
 ### Flexible VLAN Tagging (Missing → Implemented)
 - **Config types:** `FlexibleVlanTagging bool` on InterfaceConfig, `InnerVlanID int` on InterfaceUnit

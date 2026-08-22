@@ -307,8 +307,12 @@ type ZoneConfig struct {
 	// `security zones security-zone <z> interfaces <ref>` (e.g. "ge-0/0/0.0").
 	// Junos models host-inbound-traffic at BOTH the zone level (HostInboundTraffic
 	// above, applies to every interface in the zone) and the interface level
-	// (here, applies only to that interface); the EFFECTIVE admission set for an
-	// interface is the UNION of the two (Junos additive semantics). A zone is
+	// (here, applies only to that interface). An interface that declares an
+	// interface-level stanza is described ENTIRELY by it: the stanza REPLACES the
+	// zone-level one for that interface (#6515; Junos: "Interface configuration
+	// overrides that of the zone"), and a present-but-EMPTY stanza is a deny-all
+	// override rather than a fallback to the zone set. The resolution SSOT is
+	// config.EffectiveHostInboundTokens. A zone is
 	// host-inbound-ENFORCING if it declares a zone-level stanza OR carries any
 	// interface-level override here — so an operator can expose a service
 	// (e.g. ssh) on one interface of a zone while denying it on the others by
