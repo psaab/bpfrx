@@ -1332,6 +1332,24 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   `ok=false` transient (never-blackhole). Reading the committed config flag is
   race-free, unlike probing the live client registry which has a stop→start window
   (`TestSurfaceAObserverDHCPTransientGapNoWithdraw`).
+  **The DEFAULT `interface` source carries the same guard (#6555).** The M10 guard
+  above lived only on the `dhcp` source, so the DEFAULT source — an unset
+  `address-source` resolves to `interface` — still reported the very same DHCP
+  client-restart window as DEFINITIVE and withdrew the public A/AAAA record. The
+  exposure needed no attacker: `finishClient` removes the leased address, that
+  removal fires `onDHCPAddressChange` → a Surface A nudge about 2s later, and the
+  pass lands squarely inside the DORA re-acquire window. `observeInterfaceAddr`
+  now returns the TRANSIENT `(zero, false)` when the kernel reports NO address of
+  the family AND the committed config still runs DHCP for it. Both sources read
+  one predicate, `unitRunsDHCPForFamily` — they ask the same question, so a
+  divergence would always be a bug.
+  The guard is keyed on an EMPTY family address list, deliberately NOT on
+  "`selectInterfaceAddr` found nothing usable". Those are different states and
+  only the first is the restart window: if the family HAS an address that was
+  rejected as tentative/deprecated/non-public, the observation stays DEFINITIVE,
+  matching the `dhcp` source's treatment of a non-public lease. It also sits
+  AFTER the static fallback, so a configured static still wins
+  (`TestObserveInterfaceAddrDHCPRestartTransient_6555`, cases (e) and (f)).
   **Invalid bindings stay visible (#4423 M09).** A structurally-incomplete binding
   (no hostname / no provider / undefined provider) builds no reconcile scope, but
   `buildSurfaceAScopes` returns it as a synthesized `SurfaceAStateInvalid` status
