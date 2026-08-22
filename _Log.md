@@ -102351,6 +102351,22 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
     pkg/config/secret_in_error_6625_test.go
 
+## 2026-08-22 — #6637 leaked neigh-monitor threads in tests
+- **Timestamp**: 2026-08-22
+- **Action**: Measured first-hand across the full suite: 8 `neigh-monitor`
+  threads spawned, 1 stopped, 7 leaked. Tests-only — production tears down on
+  every reconcile and on shutdown. The stop machinery
+  (`stop_and_join_monitor`) is complete and correct; tests simply never pulled
+  it, and there is no `impl Drop for Coordinator`. Only this thread leaks: its
+  two siblings exit on channel Disconnected when the coordinator drops, while
+  the monitor has only an `Arc<AtomicBool>` whose other clone it holds itself.
+  Added a `#[cfg(test)]` RAII `StoppedCoordinator` guard, converted the 6
+  coordinator-test spawners plus the one `main_tests.rs` site, and added a gate
+  that asserts BOTH directions (spawn +1, teardown back to baseline). After:
+  10 spawned / 10 stopped, zero leaks. No production change; the shipped
+  helper binary does not move.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/main_tests.rs, _Log.md
 - **Timestamp**: 2026-08-22
   - **Action**: #6626 + #6627 — the heatmap hard gate could return "ok (cached)"
     on a real threshold crossing (working tree is not a go test cache input);
