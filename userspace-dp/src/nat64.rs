@@ -1649,12 +1649,14 @@ pub(crate) fn reserve_synced_nat64_allocation(
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
+    now_ns: u64,
 ) {
     reserve_synced_nat64_allocation_with_holder(
         nat64,
         key,
         nat,
         is_reverse,
+        now_ns,
         crate::nat::NatHolder::Untracked,
     );
 }
@@ -1668,6 +1670,10 @@ pub(crate) fn reserve_synced_nat64_allocation_for_worker(
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
+    // #6528: the stale-tuple eviction inside `reserve_flow` retires the
+    // incumbent with release semantics, which re-arms a persistent lease's idle
+    // expiry off a real clock.
+    now_ns: u64,
     worker_id: u32,
 ) {
     reserve_synced_nat64_allocation_with_holder(
@@ -1675,6 +1681,7 @@ pub(crate) fn reserve_synced_nat64_allocation_for_worker(
         key,
         nat,
         is_reverse,
+        now_ns,
         crate::nat::NatHolder::Worker(worker_id),
     );
 }
@@ -1684,6 +1691,7 @@ fn reserve_synced_nat64_allocation_with_holder(
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
+    now_ns: u64,
     holder: crate::nat::NatHolder,
 ) {
     if is_reverse || !nat.nat64 {
@@ -1722,6 +1730,7 @@ fn reserve_synced_nat64_allocation_with_holder(
             port,
             addr_index,
             prefix.deterministic_v6.is_some(),
+            now_ns,
             holder,
         ) {
             break;

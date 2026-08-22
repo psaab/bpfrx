@@ -100203,3 +100203,29 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_prepass_logging_4960_test.go,
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6528 — `PortAllocator::reserve_flow`'s stale-tuple eviction
+  applied an unconditional PAT-shaped teardown
+  (`free_translated_port(addr_index, translated.port, !deterministic)`) to an
+  incumbent of ANY allocation mode. For an ADDRESS-ONLY record that cleared a
+  bit it never owned — pool address 0 at the offset of the PRESERVED internal
+  source port, which is a live PAT flow's bit whenever a `port no-translation`
+  rule shares the allocator (`allocator_key()` omits `no_translation`) — and
+  recycled it, while leaking the `address_only_owners` token. For a PERSISTENT
+  record it freed a port the LEASE still claimed and never dropped
+  `active_flows`, so the lease was never idle and no GC path could reclaim it.
+  Fix: all three retiring paths now share `unlink_live_allocation_locked`, and
+  `release_flow` + the eviction share `complete_persistent_lease_locked`;
+  `rollback_flow` keeps its own lease arm (it undoes an activation). The
+  eviction takes RELEASE semantics, which is why `reserve_flow` and the synced
+  reserve chain now carry `now_ns`. Five property cells + a fixture guard + an
+  anti-over-reach cell pinning the one mode the old code got right. Verbatim
+  pre-fix restore reds four of five; two finer single-line mutations localise
+  the lease arm and the address-only port guard to one cell each. Rust diff
+  moves the helper binary, so a cluster smoke is OWED.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
+  docs/session-sync-architecture.md, _Log.md

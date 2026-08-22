@@ -4012,7 +4012,7 @@ fn nat64_4512_synced_session_reserves_translated_port() {
     // allocation's cursor picks it first unless the reservation forces a skip.
     let key = nat64_synced_key("2001:db8::1");
     let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
-    reserve_synced_nat64_allocation(&state, &key, synced, false);
+    reserve_synced_nat64_allocation(&state, &key, synced, false, 0);
 
     // A NEW local flow (different client) allocates from the same one-address
     // pool: it MUST skip the reserved 1024 and hand out 1025. On revert (no
@@ -4038,7 +4038,7 @@ fn nat64_4512_reverse_entry_reserves_nothing() {
     let key = nat64_synced_key("2001:db8::1");
     // is_reverse = true: the reserve is a no-op.
     let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
-    reserve_synced_nat64_allocation(&state, &key, synced, true);
+    reserve_synced_nat64_allocation(&state, &key, synced, true, 0);
     let (_, port) = nat64_probe_alloc(&state);
     assert_eq!(port, 1024, "a reverse synced entry must not reserve a port");
 }
@@ -4063,7 +4063,7 @@ fn nat64_4512_non_nat64_decision_reserves_nothing() {
         nat64: false,
         nptv6: false,
     };
-    reserve_synced_nat64_allocation(&state, &key, source_nat, false);
+    reserve_synced_nat64_allocation(&state, &key, source_nat, false, 0);
     let (_, port) = nat64_probe_alloc(&state);
     assert_eq!(
         port, 1024,
@@ -4081,7 +4081,7 @@ fn nat64_4512_foreign_pool_addr_skips_reserve() {
     let key = nat64_synced_key("2001:db8::1");
     // 203.0.113.9 is NOT in the local pool [198.51.100.1] (config drift).
     let foreign = Nat64State::forward_decision(Ipv4Addr::new(203, 0, 113, 9), dst_v4, 1024);
-    reserve_synced_nat64_allocation(&state, &key, foreign, false);
+    reserve_synced_nat64_allocation(&state, &key, foreign, false, 0);
     let (snat, port) = nat64_probe_alloc(&state);
     assert_eq!(snat, Ipv4Addr::new(198, 51, 100, 1));
     assert_eq!(
@@ -4112,11 +4112,29 @@ fn nat64_4512_reserve_release_wrapper_symmetry() {
         ..flow1
     };
     assert!(
-        reserve_nat64_pool_port(alloc, flow1, snat, 1024, 0, false, crate::nat::NatHolder::Untracked),
+        reserve_nat64_pool_port(
+            alloc,
+            flow1,
+            snat,
+            1024,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked
+        ),
         "first reserve of an unowned port must take"
     );
     assert!(
-        !reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false, crate::nat::NatHolder::Untracked),
+        !reserve_nat64_pool_port(
+            alloc,
+            flow2,
+            snat,
+            1024,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked
+        ),
         "a second flow must NOT steal a port owned by a live reservation"
     );
     assert!(
@@ -4124,7 +4142,16 @@ fn nat64_4512_reserve_release_wrapper_symmetry() {
         "release must free the reservation for the owning flow"
     );
     assert!(
-        reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0, false, crate::nat::NatHolder::Untracked),
+        reserve_nat64_pool_port(
+            alloc,
+            flow2,
+            snat,
+            1024,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked
+        ),
         "after release the port is free and a later flow can re-own it"
     );
 }
@@ -5607,7 +5634,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
 
     // The synced flow arrives. A REFUSES (1024 is the squatter's), so the
     // reservation lands in B.
-    reserve_synced_nat64_allocation(&state, &synced_key, synced, false);
+    reserve_synced_nat64_allocation(&state, &synced_key, synced, false, 0);
 
     // The squatter retires, freeing 1024 in A. It is held only in A, so the
     // break under test cannot affect this release.
@@ -5621,7 +5648,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
 
     // The synced session refreshes (HA reconnect / periodic re-upsert). A now
     // accepts, so the SAME flow is held in BOTH prefixes.
-    reserve_synced_nat64_allocation(&state, &synced_key, synced, false);
+    reserve_synced_nat64_allocation(&state, &synced_key, synced, false, 0);
 
     // ONE release, exactly as the teardown path issues it.
     release_nat64_allocation(&state, &synced_key, synced, false, 3);
@@ -5644,6 +5671,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
             1024,
             0,
             false,
+            0,
             crate::nat::NatHolder::Untracked,
         ),
         "prefix A must have freed the released flow's port"
@@ -5656,6 +5684,7 @@ fn nat64_6876_release_frees_every_prefix_holding_the_flow() {
             1024,
             0,
             false,
+            0,
             crate::nat::NatHolder::Untracked,
         ),
         "prefix B still owns the released flow's port: the NAT64 release stopped \

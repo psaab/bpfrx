@@ -1018,6 +1018,41 @@ source tuple (reply mis-delivery / a session-hijack surface).
   is cleared from `address_only_owners` by the same `release_flow`). A reverse
   synced entry, or a session with no source NAT at all (`rewrite_src` unset),
   reserves nothing.
+- **Stale-tuple eviction is a FOURTH teardown, and it must be mode-correct
+  (#6528):** when a synced upsert re-decides a live flow onto a DIFFERENT
+  translated tuple, `reserve_flow` evicts the incumbent `live_by_flow` record.
+  That eviction used to be an unconditional
+  `free_translated_port(existing.addr_index, existing.translated.port,
+  !existing.deterministic)` — the PAT-shaped teardown — which is correct for
+  exactly ONE of the three allocation modes. For the other two it mutated state
+  belonging to an UNRELATED flow:
+
+  - an ADDRESS-ONLY record (#5269/#6041) owns NO occupancy bit. Its `addr_index`
+    is a hardcoded 0 and its `translated.port` is the PRESERVED internal source
+    port, so the call cleared whatever bit pool address 0 held at that offset —
+    and a `port no-translation` rule SHARES an allocator with a PAT rule whenever
+    their pool name, addresses and port range agree, because `allocator_key()`
+    does not include `no_translation`. So the bit belonged to a live PAT flow,
+    and `free_recycle` queued the port for reuse: two flows on one translated
+    tuple. Its actual property, the `address_only_owners` reverse-identity token,
+    was never cleared, denying that public identity for the life of the
+    allocator.
+  - a PERSISTENT record's port belongs to the LEASE, not the flow (`release_flow`
+    deliberately does not free it). The call freed a port the lease still
+    claimed, and never dropped the lease's `active_flows` refcount. A leaked
+    refcount is never idle, so the lease never enters `lease_expirations` and NO
+    GC path reclaims it.
+
+  All three retiring paths — `release_flow`, `rollback_flow` and this eviction —
+  now share `unlink_live_allocation_locked` (remove the record, clear an
+  address-only token, free a port only when the record actually owns one), so a
+  fifth cannot diverge. `release_flow` and the eviction additionally share
+  `complete_persistent_lease_locked`; `rollback_flow` keeps its own lease arm
+  because it undoes an activation rather than completing a flow. The eviction
+  takes RELEASE semantics because the incumbent tuple WAS in service — it is a
+  re-decision of a live flow, not the withdrawal of an allocation that never
+  shipped — and that is why `reserve_flow` (and the synced-reserve chain above
+  it) now carries `now_ns`: re-arming a lease's idle expiry needs a real clock.
 - **Per-worker holder set (#6211 F2):** a synced entry is pushed to EVERY
   worker's session table (`afxdp/ha/session_import.rs` fans `UpsertSynced` out to
   each worker's command queue) while the source-NAT / NAT64 allocator is ONE
