@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -380,3 +381,269 @@ var (
 	_ grpc.UnaryServerInterceptor  = (*Server)(nil).principalUnaryInterceptor
 	_ grpc.StreamServerInterceptor = (*Server)(nil).principalStreamInterceptor
 )
+
+// showTextTopicsFromDispatcher reads every topic literal the ShowText
+// dispatcher branches on, out of the production source.
+//
+// Three dispatch shapes carry a topic in server_show.go and all three are
+// collected: `strings.HasPrefix(req.Topic, "x")`, `req.Topic == "x"`, and the
+// case labels of `switch req.Topic`. A literal reached any other way would be
+// invisible here, so the walk is keyed on the IDENTIFIER req.Topic rather than
+// on string literals in general — a literal that is not compared against the
+// topic is not a topic.
+func showTextTopicsFromDispatcher(t *testing.T) []string {
+	t.Helper()
+	const src = "server_show.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", src, err)
+	}
+
+	seen := map[string]bool{}
+	lit := func(e ast.Expr) (string, bool) {
+		bl, ok := e.(*ast.BasicLit)
+		if !ok || bl.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(bl.Value)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	}
+
+	var sawSwitch bool
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.CallExpr:
+			// strings.HasPrefix(req.Topic, "x")
+			sel, ok := v.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "HasPrefix" || len(v.Args) != 2 {
+				return true
+			}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "strings" {
+				return true
+			}
+			if !isReqTopicSelector(v.Args[0]) {
+				return true
+			}
+			if s, ok := lit(v.Args[1]); ok {
+				seen[s] = true
+			}
+		case *ast.BinaryExpr:
+			// req.Topic == "x"
+			if v.Op != token.EQL {
+				return true
+			}
+			if isReqTopicSelector(v.X) {
+				if s, ok := lit(v.Y); ok {
+					seen[s] = true
+				}
+			}
+			if isReqTopicSelector(v.Y) {
+				if s, ok := lit(v.X); ok {
+					seen[s] = true
+				}
+			}
+		case *ast.SwitchStmt:
+			// switch req.Topic { case "a", "b": }
+			if !isReqTopicSelector(v.Tag) {
+				return true
+			}
+			sawSwitch = true
+			for _, stmt := range v.Body.List {
+				cc, ok := stmt.(*ast.CaseClause)
+				if !ok {
+					continue
+				}
+				for _, e := range cc.List {
+					s, ok := lit(e)
+					if !ok {
+						t.Errorf("%s: `switch req.Topic` has a non-literal case "+
+							"label; topic coverage can no longer be proven", src)
+						continue
+					}
+					seen[s] = true
+				}
+			}
+		}
+		return true
+	})
+	if !sawSwitch {
+		t.Fatalf("%s: no `switch req.Topic` found — the enumeration source moved, "+
+			"and a vacuous pass here would certify nothing about topic coverage", src)
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isReqTopicSelector reports whether e is the `req.Topic` expression.
+func isReqTopicSelector(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Topic" {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == "req"
+}
+
+// TestEveryShowTextTopicHasAPermission_5278 is the sibling of the method-table
+// guard, and it exists because that guard is VACUOUS for this property: it
+// enumerates the service DESCRIPTOR, so a complete method table says nothing
+// about whether ShowText's 127 topics were classified. That is precisely how
+// the `test-*` topics shipped priced at view in the first revision.
+//
+// RED on revert: drop a topic from showTextViewTopics (the "unpriced" arm), or
+// price one that the dispatcher does not serve (the "stale" arm).
+func TestEveryShowTextTopicHasAPermission_5278(t *testing.T) {
+	topics := showTextTopicsFromDispatcher(t)
+	if len(topics) < 50 {
+		t.Fatalf("only %d ShowText topics parsed out of the dispatcher; the "+
+			"extraction is broken and a pass would certify nothing", len(topics))
+	}
+
+	inDispatcher := make(map[string]bool, len(topics))
+	for _, topic := range topics {
+		inDispatcher[topic] = true
+		_, elevated := showTextElevatedTopics[topic]
+		if !elevated && !showTextViewTopics[topic] {
+			t.Errorf("ShowText topic %q is dispatched but unpriced: it would be "+
+				"charged %s (super-user only). Add it to showTextViewTopics, or "+
+				"to showTextElevatedTopics if a non-`show` command emits it (#5278)",
+				topic, permName(unmappedMethodPermission))
+		}
+		if elevated && showTextViewTopics[topic] {
+			t.Errorf("ShowText topic %q is in BOTH tables; the lookup order would "+
+				"decide its tier silently", topic)
+		}
+	}
+	for topic := range showTextViewTopics {
+		if !inDispatcher[topic] {
+			t.Errorf("showTextViewTopics prices %q, which the ShowText dispatcher "+
+				"does not serve — a stale entry hides an unpriced real topic (#5278)", topic)
+		}
+	}
+	for topic := range showTextElevatedTopics {
+		if !inDispatcher[topic] {
+			t.Errorf("showTextElevatedTopics prices %q, which the ShowText "+
+				"dispatcher does not serve (#5278)", topic)
+		}
+	}
+}
+
+// TestTestFamilyShowTextTopicsCostControl_5278 pins the specific tier confusion
+// the first revision shipped: the topics emitted by the top-level word `test`
+// must cost what pkg/cli/permissions.go charges for `test` (PermControl), not
+// what it charges for `show`.
+//
+// RED on revert: move any test-* key back to PermView.
+func TestTestFamilyShowTextTopicsCostControl_5278(t *testing.T) {
+	full := "/" + pb.BpfrxService_ServiceDesc.ServiceName + "/ShowText"
+	for _, topic := range []string{
+		"test-policy:from=trust,to=untrust,src=10.0.1.5,dst=10.0.2.5,proto=tcp,port=443",
+		"test-routing:dest=10.0.0.0/24",
+		"test-routing:dest=10.0.0.0/24,instance=dmz-vr",
+		"test-zone:interface=ge-0/0/0.0",
+	} {
+		perm, mapped := methodPermission(full, &pb.ShowTextRequest{Topic: topic})
+		if !mapped {
+			t.Errorf("ShowText topic %q is unmapped", topic)
+		}
+		if perm != config.PermControl {
+			t.Errorf("ShowText topic %q priced %s, want control — cmd/cli emits it "+
+				"from `test ...`, which pkg/cli requiredPermission charges at "+
+				"control (#5278)", topic, permName(perm))
+		}
+		if config.ClassHasPermission(nil, "read-only", perm) ||
+			config.ClassHasPermission(nil, "config-viewer", perm) {
+			t.Errorf("ShowText topic %q is reachable by a view-only class; "+
+				"`test policy` is policy reconnaissance", topic)
+		}
+	}
+}
+
+// TestShowTopicsStayAtView_5278 is the negative control for the case above: the
+// correction must not sweep the ~124 genuine `show` topics up a tier. Without
+// it, pricing EVERY topic at control would pass the test-family assertions and
+// silently take `show chassis cluster` away from read-only.
+func TestShowTopicsStayAtView_5278(t *testing.T) {
+	full := "/" + pb.BpfrxService_ServiceDesc.ServiceName + "/ShowText"
+	for _, topic := range []string{
+		"version", "chassis-cluster-information", "chassis-forwarding", "buffers",
+		"route-all", "firewall", "sessions-top:bytes", "log:messages",
+		"class-of-service", "class-of-service:ge-0/0/0", "screen-statistics:untrust",
+		"firewall-effective", "firewall-effective-filter:f1",
+	} {
+		perm, mapped := methodPermission(full, &pb.ShowTextRequest{Topic: topic})
+		if !mapped {
+			t.Errorf("ShowText topic %q is unmapped", topic)
+		}
+		if perm != config.PermView {
+			t.Errorf("ShowText topic %q priced %s, want view — it is a `show ...` "+
+				"topic and read-only must keep it (#5278)", topic, permName(perm))
+		}
+	}
+}
+
+// TestUnknownShowTextTopicIsStrict_5278 pins the fail-closed default for the
+// topic dimension, and the floor used when the topic cannot be read at all.
+func TestUnknownShowTextTopicIsStrict_5278(t *testing.T) {
+	full := "/" + pb.BpfrxService_ServiceDesc.ServiceName + "/ShowText"
+
+	for _, topic := range []string{"a-topic-nobody-serves", "", "test-", "log"} {
+		perm, mapped := methodPermission(full, &pb.ShowTextRequest{Topic: topic})
+		if topic == "log" {
+			// "log" IS a served topic; it is here as the control that proves the
+			// loop is not passing because every input is unknown.
+			if !mapped || perm != config.PermView {
+				t.Errorf("control topic %q: perm=%s mapped=%v, want view/true",
+					topic, permName(perm), mapped)
+			}
+			continue
+		}
+		if mapped {
+			t.Errorf("unknown ShowText topic %q reported MAPPED; the miss must be "+
+				"logged (#5278)", topic)
+		}
+		if perm != unmappedMethodPermission {
+			t.Errorf("unknown ShowText topic %q priced %s, want %s (fail-closed)",
+				topic, permName(perm), permName(unmappedMethodPermission))
+		}
+	}
+
+	// No request, or a request of the wrong type: the method-level FLOOR, which
+	// must be the highest tier any topic needs — never the view floor.
+	for _, req := range []any{nil, (*pb.ShowTextRequest)(nil), &pb.GetStatusRequest{}} {
+		perm, _ := methodPermission(full, req)
+		if perm != config.PermControl {
+			t.Errorf("ShowText with request %T priced %s, want control (the floor "+
+				"when the topic cannot be read) (#5278)", req, permName(perm))
+		}
+	}
+}
+
+// TestShowTextPrefixRulesAreUnambiguous_5278 asserts no prefix rule is a prefix
+// of another, so the longest-first ordering never has to arbitrate a genuine
+// overlap — if it ever did, a topic's tier would depend on table ordering
+// rather than on its classification.
+func TestShowTextPrefixRulesAreUnambiguous_5278(t *testing.T) {
+	if len(showTextPrefix) == 0 {
+		t.Fatal("no prefix rules built; init did not run or the tables are empty")
+	}
+	for i, a := range showTextPrefix {
+		for j, b := range showTextPrefix {
+			if i == j {
+				continue
+			}
+			if strings.HasPrefix(a.prefix, b.prefix) {
+				t.Errorf("prefix rule %q is shadowed by %q; a topic matching both "+
+					"would be priced by table ordering", a.prefix, b.prefix)
+			}
+		}
+	}
+}

@@ -1,3 +1,35 @@
+## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
+
+- **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
+- **Action**: Corrected the `ShowText` entry in the #5278 method table. It was
+  `PermView` with the comment "every topic is a `show ...`", which is FALSE:
+  three of its ~127 topics (`test-policy:`, `test-routing:`, `test-zone:`) are
+  emitted by the top-level word `test`, which pkg/cli charges at `PermControl`
+  — so a `read-only` class could run policy reconnaissance over gRPC. `ShowText`
+  is now priced from the decoded request's TOPIC, exactly as `SystemAction` is
+  priced from its verb, with an unknown topic costing the strictest tier and the
+  name-level entry demoted to a `PermControl` FLOOR for a request whose topic
+  cannot be read.
+
+  Nothing caught it because `TestEveryServiceMethodHasAPermission_5278`
+  enumerates the service DESCRIPTOR — i.e. methods. Topic pricing is a
+  different property, so a complete method table is a VACUOUS pass for it: a
+  guard proves the property it enumerates and nothing adjacent to it. Added the
+  sibling guard `TestEveryShowTextTopicHasAPermission_5278`, which parses every
+  literal compared against `req.Topic` in `server_show.go` (HasPrefix, `==`,
+  and `switch` case labels) and checks the tables in both directions.
+
+  Also removed the root `t.Skip` from
+  `TestProductionServerEnforcesRealPeerIdentity_5278`: it went vacuous in
+  exactly the environment CI usually runs in. Both arms now assert the kernel
+  attributed the connection, and the root arm additionally drives the
+  class-decision path, so no arm of the policy goes unasserted. Verified by
+  running the whole `5278` set under `sudo go test` (rc=0, root arm logged).
+
+- **File(s)**: `pkg/grpcapi/authz_methods.go`,
+  `pkg/grpcapi/authz_method_table_5278_test.go`,
+  `pkg/grpcapi/principal_authz_5278_test.go`, `pkg/grpcapi/README.md`
+
 ## 2026-08-21 — #5278: per-principal authorization on the primary gRPC listener
 
 - **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)

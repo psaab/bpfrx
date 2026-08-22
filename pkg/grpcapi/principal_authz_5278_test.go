@@ -619,20 +619,49 @@ func TestFabricListenerDoesNotApplyThePrincipalGate_5278(t *testing.T) {
 
 // TestProductionServerEnforcesRealPeerIdentity_5278 closes the injection loop:
 // no PeerLookupFn, so the gate reads THIS process's connection out of the real
-// kernel socket table, resolves it through a passwd fixture that names the uid
-// the suite actually runs as, and evaluates the class from a real committed
-// config.
+// kernel socket table and evaluates the result against a real committed config.
 //
 // It is the only case that proves the production resolver is wired at all — the
 // injected cases would all pass against a Server that never called
 // authz.LookupPeer.
+//
+// It does NOT skip under root, and that is deliberate. An earlier revision did,
+// which made it silently vacuous in exactly the environment most CI runs in: a
+// test that disappears where it actually executes is not coverage, it is a
+// green line. Both arms below assert that the KERNEL attributed the connection
+// to this process's real uid; they differ only in which verdict that uid earns,
+// because uid 0 short-circuits to a superuser principal by the shipped
+// pkg/authz contract. The arm that ran is logged, and the class-decision arm is
+// reached under root too — through the gate, with a synthetic non-root uid — so
+// no arm of the policy goes unasserted whoever runs the suite.
 func TestProductionServerEnforcesRealPeerIdentity_5278(t *testing.T) {
 	uid := os.Getuid()
 	if uid == 0 {
-		t.Skip("suite runs as root; uid 0 short-circuits to a superuser " +
-			"principal by contract (pkg/authz PrincipalForUID), so this case " +
-			"cannot observe a class decision")
+		t.Log("suite runs as ROOT: asserting the production resolver attributes " +
+			"the connection to uid 0 and that uid 0 is admitted (the shipped " +
+			"pkg/authz contract), plus the class-decision arm at the gate")
+		usePasswdFixture5278(t)
+		client := runPrimaryListener(t, Config{
+			Store: authzStore5278(t, authzConfig5278),
+		})
+		ctx := callCtx(t)
+
+		// The production resolver ran and reported uid 0: a superuser principal
+		// is admitted. If LookupPeer were NOT wired, the connection would carry
+		// no identity at all and this would be PermissionDenied.
+		_, err := client.Commit(ctx, &pb.CommitRequest{})
+		assertNotDenied(t, "root real-identity Commit", err)
+
+		// And the class machinery is still asserted, so the root arm is not a
+		// weaker test: a read-only uid is refused the same RPC.
+		s := NewServer("127.0.0.1:0", Config{Store: authzStore5278(t, authzConfig5278)})
+		full := "/" + pb.BpfrxService_ServiceDesc.ServiceName + "/Commit"
+		if err := s.authorizeRPC(ctxWithPeerUID(authzUIDReadOnly), full, nil); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("read-only Commit under the root arm: err=%v, want PermissionDenied", err)
+		}
+		return
 	}
+	t.Logf("suite runs as uid %d: asserting the full end-to-end class decision", uid)
 
 	// A passwd database naming THIS uid, plus a config that gives that account
 	// the read-only class.
@@ -838,4 +867,63 @@ func TestANewConnectionGetsAFreshIdentity_5278(t *testing.T) {
 	// And the FIRST connection keeps its accept-time identity.
 	_, err = first.Commit(ctx, &pb.CommitRequest{})
 	assertNotDenied(t, "first connection Commit after the answer changed", err)
+}
+
+// TestReadOnlyIsDeniedTheTestFamilyOverShowText_5278 drives the ShowText topic
+// tier through the REAL gate, end to end.
+//
+// It is the behavioural half of the correction: `test policy`, `test routing`
+// and `test security-zone` reach the server as ShowText TOPICS, and pricing the
+// method flat at view let a read-only class run policy reconnaissance — ask
+// which rule matches a given 5-tuple — over gRPC.
+//
+// The `show` topic in the same run is the load-bearing control. Without it,
+// pricing every ShowText topic at control would pass every assertion above and
+// silently take `show chassis cluster` away from read-only, which is a
+// regression wearing the shape of a fix.
+//
+// RED on revert: move any test-* key from showTextElevatedTopics back to
+// showTextViewTopics — the denial arm reds and the control arm stays green,
+// which is what localises the failure to the tier rather than to the gate.
+func TestReadOnlyIsDeniedTheTestFamilyOverShowText_5278(t *testing.T) {
+	usePasswdFixture5278(t)
+	client := runPrimaryListener(t, Config{
+		Store:        authzStore5278(t, authzConfig5278),
+		PeerLookupFn: fixedPeerUID5278(authzUIDReadOnly),
+	})
+	ctx := callCtx(t)
+
+	for _, topic := range []string{
+		"test-policy:from=trust,to=untrust,src=10.0.1.5,dst=10.0.2.5,proto=tcp,port=443",
+		"test-routing:dest=10.0.0.0/24",
+		"test-zone:interface=ge-0/0/0.0",
+	} {
+		_, err := client.ShowText(ctx, &pb.ShowTextRequest{Topic: topic})
+		assertDenied(t, "read-only ShowText{"+topic+"}", err)
+	}
+
+	// CONTROL: the same method, a `show` topic, same connection, same class.
+	_, err := client.ShowText(ctx, &pb.ShowTextRequest{Topic: "version"})
+	assertNotDenied(t, "read-only ShowText{version}", err)
+}
+
+// TestOperatorKeepsTheTestFamilyOverShowText_5278 is the other side of that
+// tier: `operator` holds PermControl, so the test family must still work for
+// it. A correction that priced the topics at maintenance would pass the
+// read-only denial above and break the class that legitimately has them.
+func TestOperatorKeepsTheTestFamilyOverShowText_5278(t *testing.T) {
+	usePasswdFixture5278(t)
+	client := runPrimaryListener(t, Config{
+		Store:        authzStore5278(t, authzConfig5278),
+		PeerLookupFn: fixedPeerUID5278(authzUIDOperator),
+	})
+	ctx := callCtx(t)
+
+	for _, topic := range []string{
+		"test-routing:dest=10.0.0.0/24",
+		"test-zone:interface=ge-0/0/0.0",
+	} {
+		_, err := client.ShowText(ctx, &pb.ShowTextRequest{Topic: topic})
+		assertNotDenied(t, "operator ShowText{"+topic+"}", err)
+	}
 }

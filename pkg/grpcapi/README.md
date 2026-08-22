@@ -109,25 +109,48 @@ and resolution at accept — are argued with their mutation proofs in
   modes are inherited. What remains bounded is bounded in `pkg/authz`: the
   socket-table read is single-flighted with a capped queue whose saturation
   answers with an error, which denies.
-- **`SystemAction` is priced per verb.** It multiplexes three permission
-  tiers (`reboot`/`zeroize` at `maintenance`, `clear-arp`/`clear system
-  config-lock` at `clear`, `request dhcp renew`/`bgp-clear` at `control`),
-  and a unary gRPC interceptor is handed the DECODED request, so the verb
-  is available without buffering anything the caller controls. Folding the
-  method up to its floor — which the REST middleware must do, because it
-  deliberately never reads a body — would have taken the `clear` family
-  away from the `operator` class that holds it today.
+- **Two methods are priced from their request, not their name.**
+  `SystemAction` multiplexes three permission tiers (`reboot`/`zeroize` at
+  `maintenance`, `clear-arp`/`clear system config-lock` at `clear`,
+  `request dhcp renew`/`bgp-clear` at `control`), and `ShowText`
+  multiplexes ~127 topics across two command families — 124 reached from
+  `show ...` at `view`, and three (`test-policy:`, `test-routing:`,
+  `test-zone:`) emitted by `test ...`, which the CLI charges at `control`.
+  A unary gRPC interceptor is handed the DECODED request, so both are
+  available without buffering anything the caller controls. Folding either
+  up to its floor — which the REST middleware must do, because it
+  deliberately never reads a body — would have taken the `clear` family and
+  every `show` topic away from the classes that hold them today. The
+  name-level entry for each IS that floor, used only when the request
+  cannot be read.
 
-**Fail closed, and how that is proven.** A method absent from the table
-costs `PermAll`, which only `super-user` holds, and the miss is logged at
-`Error`. That is the weak half. The strong half is
-`TestEveryServiceMethodHasAPermission_5278`, which enumerates the
-**generated service descriptor** and fails the build in both directions —
-an RPC with no entry, and an entry naming no RPC. Enumerating the
-descriptor rather than a list a human typed is the whole point: a guard
-that compares hand-written literals against a hand-written count cannot
-fire. `TestEverySystemActionVerbHasAPermission_5278` does the same for the
-verb table, reading the case labels out of the handler's own `switch`.
+  `ShowText` is also where the first revision of this gate was wrong: it
+  was priced flat at `view` with the comment "every topic is a `show ...`",
+  which let a `read-only` class run `test policy` — policy reconnaissance,
+  i.e. which rule matches a given 5-tuple — over gRPC. Nothing caught it
+  because the method-table guard enumerates the service DESCRIPTOR, so a
+  complete method table is a **vacuous pass** for topic pricing. A guard
+  proves the property it enumerates and nothing adjacent to it; hence the
+  sibling guard below.
+
+**Fail closed, and how that is proven.** A method absent from the table —
+or a `SystemAction` verb, or a `ShowText` topic — costs the strictest tier
+(`PermAll` for a method or topic, `PermMaint` for a verb), and the miss is
+logged at `Error`. That is the weak half. The strong half is three guards,
+one per dimension, each enumerating **generated or production source**
+rather than a list a human typed, and each failing in BOTH directions
+(something served but unpriced, something priced but not served):
+
+| Guard | Enumerates |
+|---|---|
+| `TestEveryServiceMethodHasAPermission_5278` | the generated service descriptor (48 unary + 4 streaming) |
+| `TestEverySystemActionVerbHasAPermission_5278` | the `case` labels of `switch req.Action` in `server_diag_system_action.go` |
+| `TestEveryShowTextTopicHasAPermission_5278` | every literal compared against `req.Topic` in `server_show.go` — `HasPrefix`, `==`, and `switch` case labels |
+
+Three guards because there are three dimensions, and a guard is vacuous
+for every property it does not enumerate. All three `t.Fatal` if their
+enumeration source cannot be read or has moved, so an unreadable source
+reds rather than passing empty.
 
 **Behaviour changes an operator will see.**
 
