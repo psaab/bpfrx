@@ -544,8 +544,16 @@ chains while force-enabling `ip_forward` — so tunnel-to-LAN transit is
 forwarded unfiltered. `allowed-ips` is not a substitute: it is a cryptographic
 peer/source ownership gate on the inner source address, with no destination, no
 zone-pair, no application and no direction. Leaving the tunnel out of a zone is
-not a mitigation either: an interface in no zone resolves to zone id 0 and a
-`from-zone any to-zone any permit` rule matches zone-pair (0,0) (#6682).
+not a mitigation either: the plaintext never reaches zone policy at all, so
+zoning or not zoning the interface does not change whether it is adjudicated.
+
+(This paragraph used to add that an interface in no zone resolves to zone id 0
+and "a `from-zone any to-zone any permit` rule matches zone-pair (0,0)". That
+was never true: the #3110 guard has fenced every rule tier, wildcard tiers
+included, against zone 0 since before the claim was written, and #6682 went
+further and made an unzoned INGRESS an explicit counted deny. The conclusion
+above is unchanged; only the mechanism was wrong, and the mechanism is what an
+operator would have acted on.)
 
 **Commit-time signal.** Both gaps now emit a commit-time advisory naming the
 affected tunnels and, where one is assigned, the zone that does not govern them:

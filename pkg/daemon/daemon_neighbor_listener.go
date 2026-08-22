@@ -51,6 +51,15 @@ import (
 // "none" as usable but state-0 entries have no learned MAC info,
 // so we filter them out at publish time
 // (see neighborSnapshotPublishable in pkg/dataplane/userspace).
+//
+// NUD_NOARP is accepted here and is NOT accepted by
+// FabricNeighValidStates (pkg/dataplane/userspace/fabric.go). That is the one
+// axis on which the two masks differ, and it is permissible because they answer
+// different questions: this mask decides which neighbours reach the general
+// snapshot, that one decides which single entry may be adopted as the fabric
+// peer's forwarding identity. Do not unify them -- keeping the two apart is
+// recorded as deliberate in docs/fabric-cross-chassis-fwd.md, and the note at
+// FabricNeighValidStates carries the rest (#7443).
 const usableNUD = netlink.NUD_REACHABLE | netlink.NUD_STALE |
 	netlink.NUD_DELAY | netlink.NUD_PROBE |
 	netlink.NUD_PERMANENT | netlink.NUD_NOARP

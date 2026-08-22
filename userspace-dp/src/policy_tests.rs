@@ -7519,3 +7519,169 @@ fn omitempty_zero_policy_ids_still_parse() {
         "distinct-rule_id rules never share a counter"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6682: an unzoned INGRESS must not be forwarded by the implicit default
+// policy.
+//
+// Zone id 0 is the "unknown / no zone" sentinel; StableZoneID folds every
+// CONFIGURED zone into [1, 65533], so 0 is never a real zone. The #3110 guard
+// already stops every rule tier from matching such a flow — including
+// `from-zone any to-zone any`, which is what the issue reported as the bypass
+// and which these tests confirm was ALREADY closed. What was still open is the
+// fall-through: the flow reached the implicit default, and `default-policy
+// permit-all` forwarded it, with screens already skipped.
+// ---------------------------------------------------------------------------
+
+/// A `from-zone any to-zone any permit` rule — the both-any tier.
+fn both_any_permit_snapshot_6682() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        rule_id: "both-any-permit".to_string(),
+        name: "baseline-allow".to_string(),
+        from_zone: "any".to_string(),
+        to_zone: "any".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+fn eval_6682(state: &PolicyState, from_id: u16, to_id: u16) -> PolicyEvaluationResult {
+    evaluate_policy_result_l3_aware(
+        state,
+        from_id,
+        to_id,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 5)),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+        true,
+    )
+}
+
+fn unzoned_denied_count_6682() -> u64 {
+    crate::policy::UNZONED_INGRESS_DENIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[test]
+fn unzoned_ingress_is_denied_not_defaulted_6682() {
+    // default-policy permit-all: the operator is saying what to do with traffic
+    // that matched no policy. That is not the same as saying to forward traffic
+    // that had no zone to be adjudicated in.
+    let state = parse_policy_state(
+        "permit",
+        &[both_any_permit_snapshot_6682()],
+        &test_zone_name_to_id(),
+    );
+
+    // Setup guard: the both-any permit really does permit a properly ZONED
+    // flow. Without this the deny below could pass because the rule never
+    // matches anything at all, and the test would prove nothing (the fixture,
+    // not the fix, would be doing the work).
+    assert_eq!(
+        eval_6682(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID).action,
+        PolicyAction::Permit,
+        "setup: a from-any/to-any permit must admit a zoned flow",
+    );
+
+    // The mechanism, not just the outcome. Several dispositions drop a packet;
+    // an outcome-only assertion cannot say which one fired, and a default-DENY
+    // would satisfy `action == Deny` while the bypass was still wide open.
+    let before = unzoned_denied_count_6682();
+    let result = eval_6682(&state, 0, TEST_WAN_ZONE_ID);
+    let after = unzoned_denied_count_6682();
+
+    assert_eq!(
+        result.action,
+        PolicyAction::Deny,
+        "an unzoned ingress reached the implicit default policy and \
+         default-policy permit-all forwarded it (#6682)",
+    );
+    assert_eq!(
+        after - before,
+        1,
+        "the deny must be attributed to the unzoned-ingress counter, not to \
+         default_counter: a rising default-deny means policy is working, a \
+         rising unzoned count means an interface fell out of its zone",
+    );
+    assert_eq!(
+        result.policy_counter_idx, 0,
+        "an unzoned deny installs no session and must claim no rule's hit \
+         counter (0 is the reserved no-counter handle)",
+    );
+}
+
+#[test]
+fn unzoned_ingress_denied_with_no_rules_at_all_6682() {
+    // The bypass does not need a wildcard rule — the implicit default alone is
+    // enough. This is the case the issue's evidence missed: it attributed the
+    // forward to the both-any tier, which #3110 had already fenced off.
+    let state = parse_policy_state("permit", &[], &test_zone_name_to_id());
+
+    assert_eq!(
+        eval_6682(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID).action,
+        PolicyAction::Permit,
+        "setup: default-policy permit-all must permit a zoned flow",
+    );
+
+    let before = unzoned_denied_count_6682();
+    assert_eq!(
+        eval_6682(&state, 0, TEST_WAN_ZONE_ID).action,
+        PolicyAction::Deny,
+        "default-policy permit-all must not forward an unzoned ingress (#6682)",
+    );
+    assert_eq!(unzoned_denied_count_6682() - before, 1);
+}
+
+#[test]
+fn both_any_tier_already_refused_zone_zero_before_6682() {
+    // Pins the #3110 guard itself, which is the half of the issue's report that
+    // was NOT true. With a default of DENY, an unzoned flow must be denied
+    // whether or not a both-any permit exists — i.e. the wildcard rule was
+    // never the thing forwarding it.
+    //
+    // This is deliberately a separate test from the two above: they would still
+    // pass if #3110 were deleted and the new deny alone carried the property,
+    // which would silently hand a load-bearing guard's job to a newer one.
+    let with_wildcard = parse_policy_state(
+        "deny",
+        &[both_any_permit_snapshot_6682()],
+        &test_zone_name_to_id(),
+    );
+    assert_eq!(
+        eval_6682(&with_wildcard, 0, TEST_WAN_ZONE_ID).action,
+        PolicyAction::Deny,
+        "a from-any/to-any permit must never match a zone-0 ingress (#3110)",
+    );
+}
+
+#[test]
+fn unzoned_egress_still_falls_through_to_default_6682() {
+    // Documents the deliberate scope of the #6682 deny: INGRESS only.
+    //
+    // A zero EGRESS zone has historically meant a bug elsewhere rather than
+    // genuine unzoned-ness (#6713: an xfrmi tunnel egress resolved to 0 because
+    // populate_egress needed a link-layer address a MAC-less interface has
+    // none of), so denying on it would risk black-holing a correctly configured
+    // path. If that scope is ever widened this test is the one that should be
+    // rewritten rather than deleted — its failure means the behaviour changed,
+    // which is exactly the signal wanted.
+    let state = parse_policy_state("permit", &[], &test_zone_name_to_id());
+    let before = unzoned_denied_count_6682();
+    assert_eq!(
+        eval_6682(&state, TEST_LAN_ZONE_ID, 0).action,
+        PolicyAction::Permit,
+        "the #6682 deny is scoped to the ingress zone; a zero egress zone still \
+         falls through to the default policy",
+    );
+    assert_eq!(
+        unzoned_denied_count_6682() - before,
+        0,
+        "a zero EGRESS zone must not be counted as an unzoned-ingress deny",
+    );
+}
