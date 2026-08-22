@@ -102545,3 +102545,20 @@ prose edit above them added. No diff falls in the new test body.
     controlLinkAuthKey now REDs). Residual closed: readLoop's CALL to admitFrame
     was still unbound — severing it left every 5086 test green.
   - **File(s)**: pkg/cluster/heartbeat_replay_restart_5086_test.go
+
+## 2026-08-22 — #6665 packed redundancy-group keyword theft
+- **Timestamp**: 2026-08-22
+- **Action**: `packedStatementProps` applied its keyword predicate to every token
+  in the tail with no positional state, so a registered keyword opened a
+  statement even in a VALUE slot: an interface whose name spells a keyword was
+  consumed as that statement — monitor silently dropped AND an unrelated
+  statement fabricated, so the RG accrues no link-down debt and never demotes.
+  Fixed with the value-slot reservation #6658 already established one level down
+  in `monitorEntryNodes`. Corrected two stale in-tree claims: the project DOES
+  have a canonical interface-name predicate
+  (`ValidateDeviceMapLogicalName`) and it admits all six keywords, so
+  reachability was "no operator would" not "the system prevents"; and the
+  "deliberately no test" note is superseded by a test that asserts packed ==
+  container, using the container spelling as the oracle.
+- **File(s)**: pkg/config/compiler_system.go,
+  pkg/config/packed_rg_keyword_theft_6665_test.go (new), _Log.md
