@@ -543,6 +543,16 @@ func (d *Daemon) runBootstrapTeardownSteps() []bootstrapTeardownStep {
 			steps = append(steps, bootstrapTeardownStep{name: "dataplane teardown", err: err})
 		}
 	}
+	// #5275: the detach above UN-ARMS this node — the shim is no longer
+	// attached, so nothing adjudicates transit. Close the kernel transit
+	// path to match, and drop the armed flag so the next apply tail
+	// (applyKernelTuning) does not re-open it. Unconditional: a rollback
+	// that found no published backend is equally unarmed, and the write is
+	// a no-op when the knobs are already closed. Reversed by the
+	// bootstrap-exit arm when a corrected commit re-arms the retained
+	// object.
+	d.markDataplaneNotArmed("bootstrap rollback",
+		"dataplane detached; first commit confirmed timed out")
 
 	return steps
 }
@@ -1012,7 +1022,15 @@ func (d *Daemon) setupBootstrapLifeline() {
 
 	// Rename just this one NIC to fxp0 (writes the .link + renames).
 	original := recoverOriginalName(lifeline)
-	_ = writeLinkFile(defaultMgmtInterface, original)
+	if _, err := writeLinkFile(defaultMgmtInterface, original); err != nil {
+		// #5842: the bootstrap lifeline .link is the file that keeps the
+		// management NIC named fxp0 across the next boot. Log it loudly rather
+		// than discarding — this path has no error channel to return on, so
+		// the log IS the signal, and it must not be the one it was: none.
+		slog.Error("bootstrap: failed to write the management lifeline .link; the management "+
+			"NIC may come up under its kernel name on the next boot",
+			"interface", defaultMgmtInterface, "original", original, "err", err)
+	}
 	if lifeline != defaultMgmtInterface {
 		if err := renameInterfaceFn(lifeline, defaultMgmtInterface); err != nil {
 			slog.Warn("bootstrap lifeline: rename to fxp0 failed; mgmt stays on original name",

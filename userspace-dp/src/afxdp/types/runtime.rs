@@ -497,7 +497,17 @@ pub(in crate::afxdp) struct DebugPollCounters {
     pub(in crate::afxdp) tx_tcp_rst: u64,
     pub(in crate::afxdp) rx_bytes_total: u64,
     pub(in crate::afxdp) tx_bytes_total: u64,
-    pub(in crate::afxdp) rx_oversized: u64,
+    /// #5190 (A1-b1-F7): count of RX descriptors longer than the FIXED
+    /// 1514-byte Ethernet-II + 1500-MTU frame size. Named for the constant
+    /// it actually tests, NOT `rx_oversized`: there is no per-interface MTU
+    /// or jumbo awareness here (this runs before the shim metadata is even
+    /// parsed, so the VLAN-tag presence is not yet known), so a perfectly
+    /// valid in-band 802.1Q-tagged full-MTU frame (1518 bytes) and every
+    /// jumbo frame land in this counter. Reading it as an anomaly/error
+    /// signal is wrong — on the VLAN-trunked WAN path it counts ordinary
+    /// traffic. Debug-build diagnostic only: the periodic report that prints
+    /// it is `#[cfg(feature = "debug-log")]`.
+    pub(in crate::afxdp) rx_over_1514: u64,
     pub(in crate::afxdp) rx_max_frame: u32,
     pub(in crate::afxdp) tx_max_frame: u32,
     pub(in crate::afxdp) seg_needed_but_none: u64,

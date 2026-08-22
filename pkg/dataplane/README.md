@@ -530,6 +530,86 @@ input, so a linker-pin bump moves the manifest too), so commit the
 regenerated object and manifest together — the #4977 freshness gate
 then stays green.
 
+## Helper process supervision after a post-ready exit (#5838)
+
+`pkg/dataplane/userspace` owns the `xpf-userspace-dp` child process.
+Until #5838 it owned only its BIRTH: `ensureProcessLocked` spawned it,
+waited for control-socket readiness and returned, and the only
+`cmd.Wait()` in the package was created inside `stopLocked` — i.e. only
+for an INTENTIONAL stop. A helper that died AFTER reporting ready (OOM,
+assert, SIGKILL, panic) was therefore never reaped, and because
+`cmd.ProcessState` is not populated until `Wait`, nothing could detect
+it either. `m.proc` stayed non-nil, `m.lastStatus` stayed at its
+last-good values (the 1 Hz status poll's failure branch only logged),
+and the state persisted until some unrelated compile/sync path happened
+to call `ensureProcessLocked` — which, on a stable config and a stable
+FIB, nothing does.
+
+**This was not a forwarding hole, and the distinction matters.** The XDP
+shim is attached by xpfd, not by the helper, and it survives the
+helper's death. `userspace-xdp/src/lib.rs` drops transit through THREE
+independent degraded-path gates, any one of which is sufficient:
+
+| gate | trigger after a crash |
+|---|---|
+| binding missing / not `READY` | `drop_degraded_transit` |
+| heartbeat missing or STALE | dead helper stops writing `USERSPACE_HEARTBEAT`; stale after `USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS` = 5000 |
+| XSK redirect error | the kernel drops the dead socket from `XSKMAP`, so `redirect` fails |
+
+All three `pass_local_control` for proven local/control traffic and
+`XDP_DROP` transit, so a crashed node BLACKHOLES rather than routing
+unadjudicated packets. That is the safer failure, and it is the same
+direction #7189 (#5275) establishes for the never-armed case — but by a
+DIFFERENT mechanism: #7189 gates the `ip_forward` sysctls on the arm
+state, and a post-arm crash leaves the daemon armed, so those sysctls
+stay 1 and the shim's degraded gates are what hold the line.
+
+**What was actually broken is honesty, and that is the HA-relevant
+half.** `takeoverReadyLocked` gates on `m.proc == nil` and on
+`m.lastStatus`, and after a crash BOTH were stale, so `TakeoverReady()`
+returned true — with an empty reason list — for a node whose dataplane
+was dead. A chassis-cluster peer consults exactly that before moving an
+RG, so a crashed node advertised itself as a valid failover target and
+would blackhole every flow handed to it.
+
+`process_supervisor.go` closes that:
+
+- **One waiter per generation.** `startHelperSupervisorLocked` runs at
+  the single spawn site and is the only place a waiter is created.
+  `stopLocked` now blocks on THAT waiter instead of launching a second
+  `cmd.Wait()` (two waiters race, and the loser gets `ECHILD`). The
+  waiter closes `exited` BEFORE acquiring `m.mu`, which is what lets
+  `stopLocked` wait on it while holding the lock without deadlocking.
+- **Generation fencing.** Each spawn allocates a strictly greater
+  `procGen`; the waiter and the restart timer both re-check their
+  captured generation under `m.mu` before mutating anything, so a stale
+  notification from generation N cannot clear or restart generation
+  N+1. This single fence also distinguishes an expected exit from a
+  crash: an intentional teardown clears `procSup` under `m.mu` before
+  releasing it, so a stop is already `procSup != g` by the time the
+  waiter can run.
+- **Fail closed on an unexpected exit.** Disarm the shim first
+  (`disableCtrlBeforeTeardownLocked`, the same #5486 primitive the
+  intentional teardown uses, which clears every binding row if the
+  disable cannot be verified), then drop `m.proc` and run
+  `resetAfterHelperGoneLocked` — shared with `stopLocked` precisely so
+  the crash path and the stop path cannot drift about which state a
+  departed helper invalidates. `TakeoverReady()` goes false.
+- **Bounded restart.** Exponential backoff from
+  `helperRestartBackoffBase` to `helperRestartBackoffMax`, re-armed on
+  each failure so a helper that cannot start retries forever at a fixed
+  low rate instead of fork-storming. The restart calls the ORDINARY
+  `ensureProcessLocked` against the CURRENT `m.cfg`, not the dead
+  generation's argv, so a config replacement that landed while the
+  helper was down is what starts, and the binding / XSK-liveness /
+  capability / event-stream readiness gates all still run before
+  forwarding is re-armed.
+
+Not covered here, tracked separately: the operator-facing surface for
+the crash record (exit code/signal, restart count, backoff deadline and
+crash-loop reason are recorded in `helperCrashState` but not yet
+rendered by any `show` command), and a named crash-loop state.
+
 ## Armed-state admission contract (#2114 A3)
 
 `Manager.loaded` is an `atomic.Bool` admission bit, and every
@@ -644,6 +724,70 @@ torn-down `Manager` still holds live FD-backed map objects and an
 generation therefore still reports success while the live generation
 keeps its counters. Detecting that needs a generation tag or lease on the
 handle itself — **#6741**, not this wrapper.
+
+## Apply ordering: attach → publish → detach (#5485)
+
+`userspace.Manager.Compile` mutates kernel XDP/TC attachment state twice
+per apply, and the two halves sit on opposite sides of the snapshot
+publish. The ordering is load-bearing, not incidental:
+
+1. **Attach** — `CompileUserspaceShim` installs the retained XDP shim on
+   every candidate ingress in the NEW config. This has to happen BEFORE
+   `apply_snapshot`: the helper cannot bind an AF_XDP socket to an
+   interface that carries no shim, so there is no way to stage it later.
+2. **Publish** — `applyCompiledSnapshot` programs the classifier maps and
+   sends `apply_snapshot`. `m.lastSnapshot` — the authority every
+   fail-closed path calls "the retained snapshot" — advances only on
+   success, or on the deliberate deferred-publish branch, which advances
+   it and returns nil while the status loop publishes later.
+3. **Detach** — `syncInterfaceAttachments` removes XDP and TC from every
+   ifindex the accepted snapshot no longer adjudicates. It runs at the
+   ACCEPTANCE POINTS ONLY, immediately after each `m.lastSnapshot = snap`.
+
+**Why the detach is last.** Until #5485 it ran before step 2, so any
+failure in between left the kernel on the new interface set while the
+control plane still reported the old one. That divergence is a policy
+BYPASS, not merely an outage. Both pre-publish failure modes drive the
+shim to `ctrl.Enabled=0` — `programBootstrapMapsLocked` programs it
+disabled, and `publishSnapshotFailClosedLocked` disables it on the
+same-plan path (#4959) — and a disabled ctrl DROPS transit on every
+interface that still carries the shim, because
+`degraded_ctrl_disabled_action` runs before the ingress-map test in
+`userspace-xdp/src/lib.rs`. An interface that has already been detached
+is outside that fail-closed surface entirely: with no XDP program and
+`ip_forward=1` its traffic goes straight into the Linux stack,
+unadjudicated by xpf, while the daemon reports the previous-good
+snapshot as enforced.
+
+**The transient the new ordering opens is strictly safe.** Between a
+successful publish and the detach, an interface still carries the shim
+while the applied snapshot no longer lists it. In both ctrl states that
+is at least as strict as the detached state it precedes: an ifindex
+absent from `userspace_ingress_ifaces` takes `cpumap_or_pass`, which is
+the kernel path a detached interface would have taken anyway, and a
+still-disabled ctrl drops its transit. Nothing in the window between the
+old detach site and the publish reads the attachment set —
+`entryProgramsLocked` (`maps_sync.go`) is the only other `XDPLinks()`
+reader and it is status reporting — so moving the detach costs no
+dependency.
+
+**Consequence to expect on a failing apply:** an interface the operator
+REMOVED from the config keeps its shim, and its transit stays dropped,
+until an apply succeeds. That is the intended fail-closed retention —
+the retained snapshot still lists the interface, so xpf still owns it.
+
+Record-and-rollback (capture the detached set, re-attach on error) was
+the considered alternative. It was rejected: it compensates for the
+window instead of removing it, the re-attach itself can fail with no
+second recovery, and `AttachXDP` does a fresh attach that reinitializes
+mlx5 XSK buffer pools — churning the datapath on interfaces that were
+never in question.
+
+Guarded by `TestAttachmentsNotDetachedBeforePublish_5485` (behavioral: a
+pre-publish failure retains both links) and
+`TestDetachOnlyAfterSnapshotAccepted_5485` (structural: every
+`syncInterfaceAttachments` call site is dominated by `m.lastSnapshot =
+snap`, and there are two of them — one per acceptance path).
 
 ## Entry points
 

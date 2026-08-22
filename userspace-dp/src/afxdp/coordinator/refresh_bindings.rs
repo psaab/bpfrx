@@ -276,6 +276,17 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.socket_ifindex = 0;
     binding.socket_queue_id = 0;
     binding.socket_bind_flags = 0;
+    // #5190 (A1-b8-F6): the shared-UMEM descriptors are COPIED by
+    // `copy_live_snapshot` above but were never reset here, so an
+    // unbound slot kept advertising the last worker's shared-UMEM
+    // mode/group/socket-role/disabled-reason — operator-visible state
+    // describing a socket that no longer exists. `.clear()` (not
+    // `= String::new()`) retains the allocation, matching the
+    // `xsk_bind_mode` treatment two lines up.
+    binding.shared_umem_mode.clear();
+    binding.shared_umem_group.clear();
+    binding.shared_umem_socket_role.clear();
+    binding.shared_umem_disabled_reason.clear();
     binding.rx_packets = 0;
     binding.rx_bytes = 0;
     binding.rx_batches = 0;
@@ -287,6 +298,13 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.local_delivery_packets = 0;
     binding.forward_candidate_packets = 0;
     binding.route_miss_packets = 0;
+    // #5190 (A1-b8-F6): both drop counters are copied by
+    // `copy_live_snapshot` but were missed here when they were added, so
+    // an unbound slot reported a frozen non-zero drop count alongside
+    // rx_packets == 0 — an inconsistency an operator reads as "this
+    // dead slot is still dropping traffic".
+    binding.martian_dropped = 0;
+    binding.ipv6_ext_header_dropped = 0;
     binding.neighbor_miss_packets = 0;
     binding.discard_route_packets = 0;
     binding.next_table_packets = 0;

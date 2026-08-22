@@ -940,6 +940,27 @@ func ValidateConfig(cfg *Config) []string {
 			warnings = append(warnings,
 				"security flow sync-icmp-session configured but has no effect — xpf syncs ICMP sessions to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic), so this Junos opt-in knob is a no-op: ICMP session sync is already always on and cannot be turned off (config-only parity, #4231)")
 		}
+		// #5804: gre-performance-acceleration is the same accepted-only
+		// doctrine, and it gets its own line because its consequence is
+		// SPECIFIC rather than "no effect". The flag reaches
+		// ForwardingState.gre_acceleration and stops there; no packet path
+		// reads it. GRE (protocol 47) has no L4 ports, so the shim stamps
+		// flow_src_port = flow_dst_port = 0 and SessionKey — a 5-tuple with no
+		// tunnel discriminator — is identical for every keyed tunnel sharing
+		// the outer addresses. Two GRE/PPTP tunnels between the same pair of
+		// outer endpoints therefore ALIAS one firewall session, and the second
+		// one inherits the first's policy decision, NAT state, counters and
+		// timeout. An operator enabling this knob is asking for exactly the
+		// opposite, so saying "no effect" would understate it.
+		if flow.GREPerformanceAcceleration {
+			warnings = append(warnings,
+				"security flow gre-performance-acceleration configured but accepted-only — "+
+					"the userspace dataplane keys GRE sessions on the 5-tuple with no tunnel "+
+					"discriminator, so distinct RFC 2890 keys or PPTP call IDs between the SAME "+
+					"outer endpoints still share one session and its policy/NAT/counter/timeout "+
+					"state; independent per-tunnel sessions are not provided (config-only "+
+					"parity, #5804)")
+		}
 	}
 
 	// #4299 (fable-167 V-3): `security ipsec vpn <v> vpn-monitor` is typed +
@@ -1223,6 +1244,39 @@ func ValidateConfig(cfg *Config) []string {
 		for _, url := range cfg.System.Archival.ArchiveSitesWithPassword {
 			warnings = append(warnings, fmt.Sprintf(
 				"system archival archive-sites %q: inline password is accepted but ignored — archival uses scp BatchMode and relies on SSH keys, not passwords", url))
+		}
+	}
+
+	// #7146: the `system syslog file <f> archive` block — files, size,
+	// start-time, transfer-interval, archive-sites, world/no-world-readable —
+	// is fully modeled in setSchema and implemented by NOTHING. #4303 put
+	// `archive` in compileSystem's recognized-modifier skip list, so every
+	// knob was read and discarded: the stanza committed clean, rendered back
+	// in `show configuration`, and produced no rotation, no retention, and no
+	// off-box transfer. An operator configuring log archival believed they had
+	// it. Make the acceptance LOUD instead of implementing archival (which is
+	// a feature: rotation, size accounting, a transfer schedule, and an scp
+	// path that would then need the #4589 leading-dash treatment).
+	//
+	// WARN, never reject: this stanza commits today, and a hard reject would
+	// fail the tolerant load / peer-sync path on a config an operator already
+	// has, which is the #1960 brick-on-upgrade shape.
+	//
+	// Note this is NOT the `system archival configuration` advisory above:
+	// that feature archives the CONFIG and does run. Keywords only — an
+	// archive-sites URL can embed credentials.
+	if cfg.System.Syslog != nil {
+		for _, f := range cfg.System.Syslog.Files {
+			if f == nil || !f.ArchiveConfigured {
+				continue
+			}
+			knobs := ""
+			if len(f.ArchiveKnobs) > 0 {
+				knobs = fmt.Sprintf(" [%s]", strings.Join(f.ArchiveKnobs, " "))
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"system syslog file %q archive%s: accepted for Junos compatibility but NOT implemented — xpf writes /var/log/%s through an rsyslog drop-in and applies no rotation, no size cap, no retention count, no start-time schedule, and no off-box transfer, so this log file is never rotated and its contents are NOT archived anywhere. The configuration is valid and this is expected, not a fault in it; rotate and collect /var/log/%s with the host's own log policy (#7146)",
+				f.Name, knobs, f.Name, f.Name))
 		}
 	}
 

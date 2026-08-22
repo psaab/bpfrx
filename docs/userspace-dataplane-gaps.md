@@ -5,7 +5,7 @@ AF_XDP userspace dataplane. It is not a full bug tracker and it is not a
 historical branch plan. For active debugging entry points, use
 [`userspace-debug-map.md`](userspace-debug-map.md).
 
-Last updated: 2026-05-29
+Last updated: 2026-08-21
 
 ## Deprecation Context
 
@@ -446,6 +446,28 @@ The generalisation: a sweep keyed on a NAME is a proxy for the property "every
 per-packet accounting effect is bound". It found three real gaps and then
 under-reported its own residue by four, which is what a proxy does.
 
+**#5190: the hit TALLY itself, not just the per-hit side effects.** The sweep
+above bound what a SERVED hit records. It did not ask whether the packets counted
+as hits were served. `lookup_counted` commits `hits += 1` (plus the LRU promote,
+the `last_used_epoch` stamp and the `observed_bytes` add) as soon as
+key/generation/epoch/lease pass, because it has to hand the caller a borrow of
+the entry and cannot hold a mutable borrow across the caller's own validation.
+`stage_flow_cache_hit` then re-checks two things the cache cannot see — the
+per-shard neighbor MAC epoch (#3048/#5147) and the HA/fabric decision validity —
+and on failure evicts the slot and returns `FallThrough`. That packet went to the
+slow path, and it was still published as a cache hit. The per-ENTRY state needed
+no undo (the eviction takes it), but the three tallies outlive the entry, so
+`FlowCache::reclassify_hit_as_miss` now moves a rejected candidate to the
+miss/eviction side at the reject branch — off the steady-state fast path, which
+is untouched. It matters because the inflation is correlated: it peaks during
+gateway VRRP failover, a NIC swap or an RG transition, i.e. exactly when an
+operator reads `flow_cache_hits` to explain a stall. Bound by
+`live_flow_cache_callsite_rejected_candidate_is_not_a_hit_5190` (which asserts
+`FallThrough` FIRST, so a fixture that stopped reaching the reject branch fails
+loudly instead of passing vacuously) plus the
+`..._served_hit_still_counts_as_a_hit_5190` control, which is what stops the
+correction being mis-wired onto the accept path.
+
 The generalisation worth keeping: a telemetry call reached by every test is not
 thereby covered. It binds nothing if a guard above it is false in every fixture,
 nothing if its arguments select a no-op arm, nothing if the collection it walks is
@@ -487,11 +509,66 @@ These are not "missing", but they are not pure userspace forwarding either:
 | SYN cookie flood protection | Userspace now publishes a snapshot key when cluster-synced root encrypted-password material exists, mints/validates cookies against the Unix wall-clock epoch, sends bounded SYN-ACK and validated-ACK RST replies through the AF_XDP TX path, and reports challenge/no-secret/SYN-ACK/ACK-RST/budget/valid/invalid/bypass counters. Active SYN-cookie screen profiles require that secret material at userspace capability admission; missing secret material also fails closed at runtime. #1374 is closed for the feature-gap audit; the final live HA/flood proof was delivered with the closed #1477 validation set. |
 | Kernel-owned traffic (ARP, local delivery, management, some non-IP) | cpumap or kernel pass-through from XDP |
 | GRE / ESP / explicit early filters | Live kernel-owned/tunnel-control cases use cpumap or pass-through; degraded helper/XSK states pass only proven local/control traffic and drop non-local transit |
-| IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed |
+| IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed. The DECRYPTED plaintext is not zone-adjudicated — see [Tunnel plaintext is not zone-adjudicated](#tunnel-plaintext-is-not-zone-adjudicated-5618-wireguard-5619-ipsec) (#5619). |
+| WireGuard (`interfaces <if> tunnel mode wireguard`) | The XDP shim steers inbound WireGuard transport to the kernel (#5582) and the helper's WireGuard control thread owns the UDP socket and the `wgN` TUN. The DECAPSULATED plaintext is not zone-adjudicated — see [Tunnel plaintext is not zone-adjudicated](#tunnel-plaintext-is-not-zone-adjudicated-5618-wireguard-5619-ipsec) (#5618). |
 | DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync use `SessionStore`/`Telemetry`. The manager still holds a named userspace shim manager for XDP/map bootstrap state. API/gRPC/CLI session/counter readers plus daemon control paths still name root `pkg/dataplane` session/counter types (e.g. `SessionKey`, `CounterValue`); those imports are tracked as the intentional, documented allowlist in `pkg/dataplane/retirement_boundary_canary_test.go` and move to a domain package as that type-relocation work continues. This is post-retirement interface cleanup, not a retirement blocker |
 | DPDK backend | Retired in #1525. The historical #1475 backend-local exception for its root `DataPlane` dependency applied pre-retirement; #1527 removes the registration import and #1528 deletes the package. |
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. #1379 is closed for the feature-gap audit; the final live cluster syslog proof was delivered in the closed #1477 validation set. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters in the utilization table. #5673 added a bounded aggregate cap (`MAX_DYNAMIC_NEIGHBORS`) as a pre-policy anti-DoS growth bound on the learned map, but surfacing the neighbor-cache count as a fill percentage against it is a separate `show system buffers` display change (deferred) — the cap refuses over-cap learns, it is not yet wired as a utilization denominator. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
+
+### Tunnel plaintext is not zone-adjudicated (#5618 WireGuard, #5619 IPsec)
+
+Both supported VPN modes decapsulate OUTSIDE the AF_XDP forwarding pipeline and
+hand the inner packet to the Linux kernel. The kernel then routes and forwards
+it, so **no xpf zone policy, session, NAT or screen is applied to the inner
+traffic**. This is a real authority gap, not a wording nicety: an operator can
+put the tunnel interface in a security zone, the commit is accepted, and nothing
+in the CLI or the commit output distinguishes that zone from one that is
+enforced.
+
+| Protocol | Where decapsulation happens | Why the dataplane does not see the inner packet |
+|----------|-----------------------------|--------------------------------------------------|
+| WireGuard (#5618) | `userspace-dp/src/afxdp/coordinator/wg_control/dispatch.rs` — the helper's WireGuard control thread authenticates the record, enforces the peer's `allowed-ips` against the inner SOURCE address, then calls `slowpath::write_packet_nonblocking(tun_fd, inner)`. | The XDP shim deliberately steers inbound UDP on the configured listen port to the kernel (`wg_steer_to_kernel`, #5582) so the control thread can receive the outer transport, and the plaintext is written straight to the `wgN` TUN. The in-source comment states it: "the kernel routes/firewalls it (NOT the AF_XDP policy engine)". |
+| Route-based IPsec (#5619) | The kernel XFRM stack; the plaintext is delivered on the `xfrmi` netdev. | There is no path to hand a plaintext frame back INTO an `xfrmi` for the egress direction, so the dataplane cannot own the interface end-to-end. |
+
+In both cases the interface row is excluded from the ingress-adjudication set:
+`userspaceSkipsIngressInterface` (`pkg/dataplane/userspace/ingress_exclusions.go`)
+matches WireGuard through the `Tunnel` class of `netdevExclusionClasses` and
+IPsec through the `SecureTunnel` class, so the row is left out of
+`buildUserspaceIngressIfindexes` and of the AF_XDP binding plan, and
+`syncInterfaceAttachments` detaches the shim from the netdev.
+
+**Operator-visible consequence.** Inter-zone authority for tunnel traffic is
+delegated to the kernel FIB plus nftables, and xpf installs only `hook input`
+chains while force-enabling `ip_forward` — so tunnel-to-LAN transit is
+forwarded unfiltered. `allowed-ips` is not a substitute: it is a cryptographic
+peer/source ownership gate on the inner source address, with no destination, no
+zone-pair, no application and no direction. Leaving the tunnel out of a zone is
+not a mitigation either: an interface in no zone resolves to zone id 0 and a
+`from-zone any to-zone any permit` rule matches zone-pair (0,0) (#6682).
+
+**Commit-time signal.** Both gaps now emit a commit-time advisory naming the
+affected tunnels and, where one is assigned, the zone that does not govern them:
+`warnWireGuardPlaintextUnadjudicatedAST`
+(`pkg/config/compiler_wireguard_plaintext_warn.go`, #5618) and
+`warnSecureTunnelPlaintextUnadjudicatedAST`
+(`pkg/config/compiler_ipsec_plaintext_warn.go`, #5619). They share their
+aggregation shape and zone-membership reader
+(`pkg/config/compiler_tunnel_plaintext_advisory.go`). Each emits ONE aggregated
+advisory per commit on every compile path — strict commit, lenient
+restart/peer-sync, and both HA node views — and NEITHER can reject: they have no
+error return and no `lenient` flag, so a box already running a tunnel can still
+commit an unrelated change (#1960 no-brick).
+
+The advisories make the bypass VISIBLE. They do not enforce policy on the inner
+traffic; enforcement (re-injecting the decapsulated packet into the AF_XDP
+forward/zone-policy pipeline on the tunnel's logical interface, the model native
+GRE decap already follows in `userspace-dp/src/afxdp/gre.rs`) is tracked
+separately. Native GRE is the contrast case and is NOT affected: it decaps
+inside the worker pipeline, rebinds `ingress_ifindex` to the tunnel's
+`logical_ifindex`, derives `ingress_zone` from
+`ForwardingState.ifindex_to_zone_id`, and continues through screen, session,
+route, filters and zone-pair policy.
 
 ## Observability — per-zone traffic + flood counters (both populated, #3651)
 

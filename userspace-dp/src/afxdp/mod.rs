@@ -437,8 +437,8 @@ use crate::ip_proto::{PROTO_AH, PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, 
 // visible to `super::*` consumers: event_emit, tx/tcp_segmentation,
 // frame/tcp_segmentation, frame/*) so the move is value-identical.
 use crate::tcp_flags::{
-    TCP_FIN as TCP_FLAG_FIN, TCP_PSH as TCP_FLAG_PSH, TCP_RST as TCP_FLAG_RST,
-    TCP_SYN as TCP_FLAG_SYN,
+    TCP_CWR as TCP_FLAG_CWR, TCP_FIN as TCP_FLAG_FIN, TCP_PSH as TCP_FLAG_PSH,
+    TCP_RST as TCP_FLAG_RST, TCP_SYN as TCP_FLAG_SYN, TCP_URG as TCP_FLAG_URG,
 };
 const TUNNEL_HA_STARTUP_GRACE_SECS: u64 = 10;
 const SOL_XDP: c_int = 283;
