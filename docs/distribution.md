@@ -119,6 +119,11 @@ publisher isolates suites in its own database and is unaffected. `selftest.sh`
   expire the repo between releases — keep it long for a manual cadence, or run
   an automated re-sign job.
 - Images: `latest.json` (signed) names the current version per channel.
+- Each version's signed `xpf-<ver>.SHA256SUMS` covers the qcow2, the incus
+  metadata, the `.manifest` provenance sidecar, AND the `xpf-<ver>.pkgs`
+  image inventory (guest kernel + installed package versions, #6500), so
+  the traceability record is authenticated by the same signature as the
+  bytes it describes. `publish.py` refuses a release missing any of them.
   `xpf-deploy.py fetch` records a best-effort monotonic watermark at
   `${XDG_STATE_HOME:-~/.local/state}/xpf/image-watermark.json` (per
   `--channel`, default `stable`) and REFUSES a version older than the recorded
