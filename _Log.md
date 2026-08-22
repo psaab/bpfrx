@@ -101259,3 +101259,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   docs/feature-gaps.md, docs/phases.md, _Log.md
+
+## 2026-08-21 — #6560 VRRP self-frame filter
+- **Timestamp**: 2026-08-21
+- **Action**: VRRP had no PACKET_OUTGOING / multicast-loop self-frame filter;
+  self-filtering rested solely on the deliberately-nilable getLocalIP()
+  snapshot, which is nil for 30ms-1s during the #2528 RETH-MAC flush window,
+  so a MASTER could process its own advert and self-demote via
+  resolveEqualPriorityMaster's nil-localCmp step-down. Confirmed the frame IS
+  delivered by two mechanisms (AF_PACKET ETH_P_ALL TX tap; IP multicast
+  loopback on the fallback raw sockets) — the socket did NOT already filter.
+  Added PACKET_IGNORE_OUTGOING (set before bind, best-effort), an sll_pkttype
+  drop in receiverAfPacket (Recvfrom's sockaddr was being discarded), and
+  IP_MULTICAST_LOOP/IPV6_MULTICAST_LOOP disable on both fallback sockets.
+  TOUCHES VRRP — owes `make test-failover`.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
+  pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
