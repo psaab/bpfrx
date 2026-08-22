@@ -1357,6 +1357,67 @@ impl Nat64State {
         Some(addr)
     }
 
+    /// Allocate an UNTRACKED NAT64 source translation — the pre-#6522
+    /// single-holder contract, where the first release frees the pool port.
+    ///
+    /// Compile-time completeness guard (the #6211 F2 idiom): this untracked
+    /// entry point is TEST-ONLY, so a production caller that forgot to thread
+    /// its `worker_id` is a BUILD FAILURE in the non-test profile rather than a
+    /// silent single-holder allocation that every sibling replica can free.
+    /// Production uses [`Nat64State::allocate_source_for_worker`].
+    #[cfg(test)]
+    pub(crate) fn allocate_source(
+        &self,
+        prefix_idx: usize,
+        protocol: u8,
+        src_v6: Ipv6Addr,
+        dst_v4: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        now_ns: u64,
+    ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
+        self.allocate_source_with_holder(
+            prefix_idx,
+            protocol,
+            src_v6,
+            dst_v4,
+            src_port,
+            dst_port,
+            now_ns,
+            crate::nat::NatHolder::Untracked,
+        )
+    }
+
+    /// #6522: allocate a NAT64 source translation and record `worker_id` as its
+    /// holder. The resulting session is replicated to every sibling worker,
+    /// each of which reserves against this same record, so an allocation that
+    /// does not name its own owner ends up with a holder mask covering every
+    /// worker EXCEPT the one forwarding — and the last sibling replica to
+    /// age-reap frees a live `(pool_v4, port)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_source_for_worker(
+        &self,
+        prefix_idx: usize,
+        protocol: u8,
+        src_v6: Ipv6Addr,
+        dst_v4: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        now_ns: u64,
+        worker_id: u32,
+    ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
+        self.allocate_source_with_holder(
+            prefix_idx,
+            protocol,
+            src_v6,
+            dst_v4,
+            src_port,
+            dst_port,
+            now_ns,
+            crate::nat::NatHolder::Worker(worker_id),
+        )
+    }
+
     /// #4381: allocate a UNIQUE translated `(pool v4 source, L4 port/identifier)`
     /// for a NAT64 forward flow, reusing the pool-mode SNAT `PortAllocator`
     /// (RFC 6146 BIB). Called at the Permit branch — after the flow is admitted
@@ -1369,7 +1430,11 @@ impl Nat64State {
     /// decision's `rewrite_src` / `rewrite_src_port`. The reverse (v4→v6) path
     /// maps the translated value back via `NatDecision::reverse` on the reverse
     /// session's decision.
-    pub(crate) fn allocate_source(
+    ///
+    /// #6522: `holder` is the WORKER taking the allocation — see
+    /// [`Nat64State::allocate_source_for_worker`].
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_source_with_holder(
         &self,
         prefix_idx: usize,
         protocol: u8,
@@ -1378,6 +1443,12 @@ impl Nat64State {
         src_port: u16,
         dst_port: u16,
         now_ns: u64,
+        // #6522: the allocating worker. A locally-born NAT64 session is
+        // replicated to every SIBLING worker, each of which reserves against
+        // this same allocator record; without the owner's own bit the mask
+        // holds every worker EXCEPT the one forwarding, and the last sibling
+        // replica to age-reap frees a live `(pool_v4, port)`.
+        holder: crate::nat::NatHolder,
     ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
         let prefix = self
             .prefixes
@@ -1402,9 +1473,10 @@ impl Nat64State {
                 &prefix.pool_v4,
                 det,
                 src_v6,
+                holder,
             );
         }
-        allocate_nat64_pool_port(&prefix.port_allocator, flow, &prefix.pool_v4, now_ns)
+        allocate_nat64_pool_port(&prefix.port_allocator, flow, &prefix.pool_v4, now_ns, holder)
     }
 
     /// Create a NAT64 forward decision: IPv6 packet → IPv4 translated.

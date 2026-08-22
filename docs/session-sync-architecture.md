@@ -954,9 +954,9 @@ source tuple (reply mis-delivery / a session-hijack surface).
   `reserve_address_only`'s) idempotent early return — which is BOTH where workers
   2..N land AND the path an already-holding worker takes on every refresh, so OR
   is required where an increment would inflate without bound. The port is freed
-  only when the LAST holder's bit clears. `holders == 0` marks an untracked LOCAL
-  allocation (RSS steers a 5-tuple to one worker, so it has a single holder by
-  construction) and keeps the first-release-frees contract unchanged.
+  only when the LAST holder's bit clears. `holders == 0` marks an UNTRACKED
+  allocation and keeps the first-release-frees contract unchanged; #6522 narrowed
+  which callers that is (see below).
 
   Without the holder set the N reserves collapsed into one record and the FIRST
   worker to let go freed a port the other N-1 were still forwarding through. That
@@ -973,6 +973,43 @@ source tuple (reply mis-delivery / a session-hijack surface).
   their NAT64/rollback twins) are `#[cfg(test)]`, so a production path that
   forgot to thread its worker id is a BUILD failure rather than a silent
   single-holder release.
+- **The ALLOCATING worker is a holder too (#6522):** #6211 F2 left the LOCAL
+  allocation path untracked on the ground that "RSS steers a 5-tuple to exactly
+  one worker, so a local allocation has a single holder by construction". That
+  ground does not hold, because a locally-born session is REPLICATED across
+  workers exactly like a peer-synced one. `poll_descriptor` calls
+  `replicate_session_upsert`, which fans a `WorkerLocalImport`-origin
+  `UpsertSynced` to `peer_worker_commands` — the queue list
+  `coordinator/reconcile/bringup.rs` builds with
+  `.filter(|(id, _)| **id != worker_id)`, i.e. every worker EXCEPT the allocating
+  one — and `SessionOrigin::is_peer_synced()` is TRUE for `WorkerLocalImport`, so
+  every sibling's `handle_upsert_synced` reserves and takes a bit on the record
+  the owner created. With the owner untracked the mask therefore named every
+  worker EXCEPT the one forwarding: the sibling replicas see no traffic
+  (flow-hash steering pins the flow to one worker), are never refreshed, all age
+  out, and the LAST one to reap emptied the mask and freed a `(pool_addr, port)`
+  the owner was still using — mid-flow pool-port reuse. A second path needs no
+  reserve at all: `session_glue::materialize_shared_session_hit` installs a
+  `WorkerLocalImport` replica off the shared map WITHOUT reserving, and
+  `reap_expired_sessions` releases for every expired entry with no origin or
+  holder filter.
+
+  The local allocation now records `NatHolder::Worker(worker_id)` at every
+  `LiveAllocation` mint (`allocate_translation` and its locked/lease twins, the
+  deterministic v4/v6 claims, and both address-only reservations), so the mask is
+  complete and the port survives until the OWNER releases. The packet-path
+  funnels take a `u32`, not a `NatHolder` — `source_nat_decision_for_flow` and
+  `Nat64State::allocate_source_for_worker` build the holder internally — so a
+  packet-path call site cannot express "untracked"; the untracked twins
+  (`Nat64State::allocate_source`) are `#[cfg(test)]`. The one production
+  untracked caller is `source_nat_would_translate_fragment`, the read-only
+  non-first-fragment probe, which mints nothing by contract.
+
+  Direction of the residual: a holder bit is cleared only by that worker's own
+  release, so a worker that dies with an allocation outstanding strands it
+  (#7092). #6522 widens that from synced reservations to local ones. It fails
+  closed — a leaked pool port, not a live flow's tuple handed to a new flow —
+  and is second-order to an already-fatal event.
 - **Worker-id bound (#6211 F2):** the mask tracks
   `nat::MAX_NAT_HOLDER_WORKERS` (128) workers, tied to the `u128` width by a
   `const` assertion so the two cannot drift. The bound is enforced where ids are

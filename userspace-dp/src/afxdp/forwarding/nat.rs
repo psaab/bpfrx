@@ -78,6 +78,9 @@ pub(in crate::afxdp) fn match_source_nat_for_flow_result(
         flow,
         0,
         false,
+        // #6522: no worker context in this `#[cfg_attr(not(test),
+        // allow(dead_code))]` helper — keep the untracked contract.
+        crate::nat::NatHolder::Untracked,
         &mut counter,
     )
 }
@@ -93,6 +96,11 @@ pub(in crate::afxdp) fn match_source_nat_for_flow_result_at(
     now_ns: u64,
     // #1852: gate pool-mode SNAT allocation for non-first fragments.
     non_first_fragment: bool,
+    // #6522: the worker whose packet path is allocating, recorded as the
+    // allocation's own holder so a sibling worker's replica of the resulting
+    // session cannot free a `(pool_addr, port)` this worker still forwards
+    // through. See `nat::NatHolder`.
+    holder: crate::nat::NatHolder,
     // #2218: out-param — the matched SNAT rule's per-rule hit counter.
     matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
 ) -> SourceNatLookup {
@@ -130,6 +138,7 @@ pub(in crate::afxdp) fn match_source_nat_for_flow_result_at(
             flow.forward_key.protocol,
             crate::ip_proto::PROTO_ICMP | crate::ip_proto::PROTO_ICMPV6
         ),
+        holder,
         matched_counter,
     )
 }

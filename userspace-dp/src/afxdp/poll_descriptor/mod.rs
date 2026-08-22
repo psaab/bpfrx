@@ -135,6 +135,13 @@ pub(super) fn poll_binding_process_descriptor(
     // #6211 F2: no longer inert. The packet-path rollbacks and the synced-hit
     // purge below release allocator reservations that a peer-synced session
     // holds on EVERY worker, so each must drop only THIS worker's holder bit.
+    //
+    // #6522: it is also the holder RECORDED when this worker's packet path
+    // ALLOCATES a pool source-NAT / NAT64 translation. The resulting session is
+    // replicated to every sibling worker, each of which reserves against the
+    // same allocator record, so an allocation that does not name its own owner
+    // ends up with a holder mask covering every worker EXCEPT the one
+    // forwarding.
     worker_id: u32,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
@@ -2173,7 +2180,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         IpAddr::V6(v6) => v6,
                                         _ => std::net::Ipv6Addr::UNSPECIFIED,
                                     };
-                                    match worker_ctx.forwarding.nat64.allocate_source(
+                                    match worker_ctx.forwarding.nat64.allocate_source_for_worker(
                                         prefix_idx,
                                         meta.protocol,
                                         orig_src_v6,
@@ -2181,6 +2188,14 @@ pub(super) fn poll_binding_process_descriptor(
                                         flow.forward_key.src_port,
                                         flow.forward_key.dst_port,
                                         now_ns,
+                                        // #6522: THIS worker holds the NAT64
+                                        // allocation it just made. Its
+                                        // sibling replicas each reserve the
+                                        // same record, so the owner's own bit
+                                        // is what stops the last replica's
+                                        // age-reap from freeing a live
+                                        // `(pool_v4, port)`.
+                                        worker_id,
                                     ) {
                                         Ok((snat_v4, translated_port)) => {
                                             decision.nat = Nat64State::forward_decision(
@@ -2296,6 +2311,10 @@ pub(super) fn poll_binding_process_descriptor(
                                             &nat_match_flow,
                                             now_ns,
                                             snat_non_first_fragment,
+                                            // #6522: THIS worker holds the
+                                            // pool allocation this decision
+                                            // mints — see `nat::NatHolder`.
+                                            worker_id,
                                             &mut snat_match_counter,
                                         ) {
                                             Ok(snat_decision) => {
@@ -5021,6 +5040,10 @@ pub(super) fn poll_binding_process_descriptor(
                                                 &nat_match_flow,
                                                 now_ns,
                                                 snat_non_first_fragment,
+                                                // #6522: THIS worker holds the
+                                                // pool allocation this decision
+                                                // mints — see `nat::NatHolder`.
+                                                worker_id,
                                                 &mut snat_match_counter,
                                             ) {
                                                 Ok(snat_decision) => {

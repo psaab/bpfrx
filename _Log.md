@@ -99940,3 +99940,31 @@ prose edit above them added. No diff falls in the new test body.
   cluster smoke is OWED.
 - **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
   userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6522 — a locally-born SNAT/NAT64 allocation recorded NO holder
+  bit while every SIBLING worker's replica of that session recorded one, so
+  the #6211-F2 holder mask named every worker EXCEPT the one forwarding.
+  `poll_descriptor` -> `replicate_session_upsert` fans a `WorkerLocalImport`
+  `UpsertSynced` to `peer_worker_commands` (built with
+  `.filter(|(id, _)| **id != worker_id)`), `is_peer_synced()` is TRUE for that
+  origin, so each sibling reserved and took a bit; the replicas see no traffic,
+  age out unrefreshed, and the LAST one to reap emptied the mask and freed a
+  `(pool_addr, port)` the owner was still forwarding through. A second path
+  (`materialize_shared_session_hit`) installs a replica without reserving at
+  all, and `reap_expired_sessions` releases for it unconditionally. Fix: every
+  `LiveAllocation` mint now records `NatHolder::Worker(worker_id)`, threaded
+  from `WorkerLaunchPlan::worker_id` through the packet-path funnels. Those
+  funnels take a `u32`, not a `NatHolder`, and `Nat64State::allocate_source` is
+  now `#[cfg(test)]`, so a packet-path site cannot express "untracked".
+  Four cells; two independent one-line mutations (PAT insert, address-only
+  insert) localise cleanly. Rust diff moves the helper binary, so a cluster
+  smoke is OWED.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat64.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/forwarding/nat.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat/tests_l4_match.rs,
+  userspace-dp/src/nat/tests_source.rs,
+  userspace-dp/src/nat/tests_newflow_lock.rs,
+  docs/session-sync-architecture.md, _Log.md

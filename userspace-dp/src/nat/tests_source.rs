@@ -1007,6 +1007,7 @@ fn actionless_rule_with_no_later_rule_passes_untranslated_5717() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     );
     match lookup {
