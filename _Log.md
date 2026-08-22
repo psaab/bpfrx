@@ -104157,3 +104157,22 @@ prose edit above them added. No diff falls in the new test body.
   make_config_drive.py and xpf-deploy.py; kept the post-chmod as a belt.
 - **File(s)**: scripts/image/make_config_drive.py, scripts/deploy/xpf-deploy.py,
   scripts/image/test_config_drive_creation_umask_6764.py
+
+## 2026-08-22 — #6763 staged-gen GC fails closed on an unresolvable current-gen
+- **Timestamp**: 2026-08-22
+- **Action**: GC read `if cur, rerr := c.ResolveCurrent(); rerr == nil && cur !=
+  ""` — the error was DISCARDED, so when current-gen could not be resolved the
+  live generation was never added to the protection set and the destructive loop
+  deleted it once outside the retention window. Every ResolveCurrent error path
+  means "cannot establish which generation is live", including a DANGLING
+  current-gen (corrupt layout — exactly when protection matters most). GC now
+  returns an error and deletes nothing. Absence stays benign: ResolveCurrent
+  returns ("", nil) with no link, so a never-published root still GCs.
+- **Not a new policy**: publish_generation.go already applies this rule to the
+  JOURNAL half of the protection set (#4876 — unknown protection set means skip
+  GC, "skipping is safe"). current-gen was the half that never got it. All three
+  callers treat a GC error as a warning, so the refusal cannot block a publish,
+  seed or cut.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go,
+  pkg/upgrade/stagedgen/stagedgen_test.go, docs/in-place-upgrade.md
+

@@ -3,6 +3,7 @@ package stagedgen
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -471,5 +472,130 @@ func bumpMtime(t *testing.T, path string, secs int64) {
 	mt := time.Unix(base+secs, 0)
 	if err := os.Chtimes(path, mt, mt); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// #6763 — GC discarded ResolveCurrent's error and proceeded to destructive
+// deletion with the live generation unprotected.
+//
+// The old line was `if cur, rerr := c.ResolveCurrent(); rerr == nil && cur !=
+// ""` — rerr was tested only for nil-ness and then dropped. Every one of
+// ResolveCurrent's error paths means "I cannot establish which generation is
+// live": a readlink failure, a symlink with path components that would escape
+// the staged-gen root, a target that is not a valid genid, and a DANGLING
+// current-gen whose directory is missing. In each, GC then reaped whatever fell
+// outside the retention window — including the live generation.
+//
+// The rule applied here is not new. publish-generation already refuses to run
+// GC when the OTHER half of the protection set is unknown (#4876: an unreadable
+// or malformed journal means "GC is SKIPPED rather than run with an empty
+// protection set"). current-gen was the half that never got it.
+
+// gcFixtureBeyondWindow publishes RetainGenerations+1 generations and returns
+// them oldest-first. The oldest is outside the retention window, so it is what
+// an unprotected GC deletes — which makes it the observable for these tests.
+func gcFixtureBeyondWindow(t *testing.T) (Config, []string) {
+	t.Helper()
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+	var gens []string
+	for i := 0; i < RetainGenerations+1; i++ {
+		g, err := c.Publish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		gens = append(gens, g)
+	}
+	return c, gens
+}
+
+func TestGCRefusesWhenCurrentGenIsDangling_6763(t *testing.T) {
+	c, gens := gcFixtureBeyondWindow(t)
+	oldest := gens[0]
+
+	// A DANGLING current-gen: the link names a generation whose directory is
+	// gone. ResolveCurrent calls this a corrupt layout and errors — and a
+	// corrupt layout is exactly when the live generation most needs protecting.
+	missing := "00000000000000000001-000000000000dead"
+	if err := atomicRelSymlink(filepath.Join(c.Dir, CurrentGenLink), missing); err != nil {
+		t.Fatal(err)
+	}
+
+	err := c.GC(nil)
+	if err == nil {
+		t.Fatalf("GC returned nil with an unresolvable current-gen — it proceeded to " +
+			"destructive deletion without knowing which generation is live (#6763)")
+	}
+	if !strings.Contains(err.Error(), "current") {
+		t.Errorf("the error must name the cause so an operator can act on it, got: %v", err)
+	}
+	// Nothing may have been deleted: the refusal is the whole point.
+	for _, g := range gens {
+		if _, serr := os.Stat(c.GenDir(g)); serr != nil {
+			t.Errorf("GC deleted generation %s despite refusing: %v", g, serr)
+		}
+	}
+	_ = oldest
+}
+
+func TestGCRefusesWhenCurrentGenEscapesTheRoot_6763(t *testing.T) {
+	c, gens := gcFixtureBeyondWindow(t)
+	// A hand-edited symlink with a path component. ResolveCurrent rejects it
+	// BEFORE deriving a genid precisely so it cannot escape the root; GC must
+	// treat that rejection as "unknown", not "no current generation".
+	if err := atomicRelSymlink(filepath.Join(c.Dir, CurrentGenLink), "../"+gens[len(gens)-1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.GC(nil); err == nil {
+		t.Fatalf("GC proceeded with a current-gen symlink that escapes the staged-gen root")
+	}
+	for _, g := range gens {
+		if _, serr := os.Stat(c.GenDir(g)); serr != nil {
+			t.Errorf("GC deleted generation %s despite an unresolvable current-gen: %v", g, serr)
+		}
+	}
+}
+
+// TestGCStillRunsWhenThereIsNoCurrentGen_6763 is the OVER-BLOCKING control, and
+// it is the cell that separates this fix from "abort whenever ResolveCurrent
+// returns anything unusual".
+//
+// ResolveCurrent distinguishes the benign case deliberately: NO current-gen link
+// returns ("", nil), not an error. Absence is determinate — there is nothing to
+// protect — so GC must still reap. An implementation that aborted here would
+// leave a never-published root accumulating generations forever while passing
+// both refusal tests above.
+func TestGCStillRunsWhenThereIsNoCurrentGen_6763(t *testing.T) {
+	c, gens := gcFixtureBeyondWindow(t)
+	if err := os.Remove(filepath.Join(c.Dir, CurrentGenLink)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.GC(nil); err != nil {
+		t.Fatalf("GC refused with NO current-gen link: absence is determinate and must "+
+			"not block reclamation: %v", err)
+	}
+	if _, serr := os.Stat(c.GenDir(gens[0])); !os.IsNotExist(serr) {
+		t.Errorf("the oldest generation survived a GC that should have reaped it "+
+			"(err=%v) — the retention window was not applied", serr)
+	}
+}
+
+// TestGCProtectsResolvableCurrentGen_6763 is the green control: when current-gen
+// resolves, the pre-existing protection must still hold. Without it, "refuse on
+// error" could be satisfied by an implementation that also stopped protecting
+// on success.
+func TestGCProtectsResolvableCurrentGen_6763(t *testing.T) {
+	c, gens := gcFixtureBeyondWindow(t)
+	oldest := gens[0]
+	if err := atomicRelSymlink(filepath.Join(c.Dir, CurrentGenLink), oldest); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.GC(nil); err != nil {
+		t.Fatalf("GC failed with a perfectly resolvable current-gen: %v", err)
+	}
+	if _, serr := os.Stat(c.GenDir(oldest)); serr != nil {
+		t.Errorf("GC deleted the resolvable current-gen %s: %v", oldest, serr)
 	}
 }
