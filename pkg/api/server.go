@@ -669,17 +669,16 @@ func NewServer(cfg Config) *Server {
 	s.certGen = generateSelfSignedCert
 
 	if cfg.Addr != "" {
-		s.httpSlot = s.newAuthSlot()
-		s.httpServer = s.buildHTTPServer(cfg.Addr, s.httpSlot)
+		plan := s.planHTTPLeg(cfg.Addr)
+		s.httpSlot, s.httpServer = plan.slot, plan.srv
 	}
 
 	// Set up HTTPS server with auto-generated self-signed certificate
 	if cfg.TLS && cfg.HTTPSAddr != "" {
-		s.httpsSlot = s.newAuthSlot()
-		if hs, err := s.buildHTTPSServer(cfg.HTTPSAddr, s.httpsSlot); err != nil {
+		if plan, err := s.planHTTPSLeg(cfg.HTTPSAddr); err != nil {
 			slog.Warn("failed to generate self-signed certificate", "err", err)
 		} else {
-			s.httpsServer = hs
+			s.httpsSlot, s.httpsServer = plan.slot, plan.srv
 		}
 	}
 
@@ -752,6 +751,14 @@ func (s *Server) listenerHandler(addr string, slot *authSlot) http.Handler {
 	if slot == nil {
 		// Never let a missing slot become a pass-through: substitute a FOLLOWING
 		// slot, which is what a live leg has anyway.
+		//
+		// #6734: this is now UNREACHABLE from any leg — legPlan allocates the
+		// slot and hands the same pointer to this handler and to the leg, and
+		// serveLegLocked no longer has a slot parameter to substitute for. It
+		// is kept as the single fail-closed fallback for a direct
+		// listenerHandler caller (tests build handlers this way), and it is
+		// safe to keep precisely BECAUSE it is now the only substitution in the
+		// package: one substitution cannot diverge from another.
 		slot = s.newAuthSlot()
 	}
 	return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), slot, s.sharedBase)
@@ -760,6 +767,75 @@ func (s *Server) listenerHandler(addr string, slot *authSlot) http.Handler {
 // buildHTTPServer constructs a fresh HTTP *http.Server bound-for addr with the
 // per-listener handler (#5866). Used at construction and by a per-leg HTTP
 // rebind.
+// legPlan is an http.Server together with the authSlot its handler closes
+// over (#6734). They are allocated together and travel together, so no caller
+// can hand the handler one slot and the leg a different one.
+//
+// The divergence this makes unrepresentable was latent, not live: every
+// production site threaded ONE slot through both layers. But it was reachable
+// by construction — listenerHandler substituted a fresh slot for a nil, and
+// serveLegLocked substituted again, so a future call site passing nil to both
+// would have pinned the leg to slot Y while every request on it was judged by
+// slot X. authSlot.pin / tighten would then operate on an object nothing reads
+// and a retired listener would keep following the server-wide snapshot —
+// exactly the #5561 round-14 defect the pin exists to prevent, silently.
+//
+// Pairing them is what removes the possibility. serveLegLocked no longer takes
+// a slot at all, so there is nothing left for it to substitute; the only
+// remaining allocation is the one inside these constructors.
+type legPlan struct {
+	srv  *http.Server
+	slot *authSlot
+}
+
+// planHTTPLeg builds the HTTP leg's server and the slot its handler reads.
+func (s *Server) planHTTPLeg(addr string) legPlan {
+	slot := s.newAuthSlot()
+	return legPlan{srv: s.buildHTTPServer(addr, slot), slot: slot}
+}
+
+// planHTTPSLeg is planHTTPLeg for the TLS leg; it can fail on cert generation.
+func (s *Server) planHTTPSLeg(addr string) (legPlan, error) {
+	slot := s.newAuthSlot()
+	srv, err := s.buildHTTPSServer(addr, slot)
+	if err != nil {
+		return legPlan{}, err
+	}
+	return legPlan{srv: srv, slot: slot}, nil
+}
+
+// httpLegPlan / httpsLegPlan re-pair the fields NewServer wrote from one
+// legPlan, for Start — which serves the servers built at construction rather
+// than planning fresh ones. Callers hold lifeMu.
+//
+// THEY ADOPT A MISSING SLOT RATHER THAN ASSUMING ONE, and the first draft of
+// this comment was wrong about why that is needed. It claimed each pair "has
+// exactly ONE writer: the two assignments in NewServer", so a server could
+// never exist without its slot. A caller that sets s.httpsServer DIRECTLY
+// falsifies that — TestReconcileHTTPSReplacesADeadLeg_6827's fixture does
+// exactly that and then calls Start, which produced a nil-slot leg and a nil
+// dereference the moment stopLegLocked tried to pin it.
+//
+// So the slot is allocated here if absent AND STORED BACK. Storing back is the
+// whole difference between this and the #6734 defect: the two substitutions
+// this issue is about were INDEPENDENT — each allocated a slot the other could
+// not see — whereas this one writes the very field it read, so the field, the
+// plan and the leg are the same object afterwards and a second call returns it
+// unchanged. One self-consistent adoption cannot diverge from itself.
+func (s *Server) httpLegPlan() legPlan {
+	if s.httpSlot == nil {
+		s.httpSlot = s.newAuthSlot()
+	}
+	return legPlan{srv: s.httpServer, slot: s.httpSlot}
+}
+
+func (s *Server) httpsLegPlan() legPlan {
+	if s.httpsSlot == nil {
+		s.httpsSlot = s.newAuthSlot()
+	}
+	return legPlan{srv: s.httpsServer, slot: s.httpsSlot}
+}
+
 func (s *Server) buildHTTPServer(addr string, slot *authSlot) *http.Server {
 	return &http.Server{
 		Addr:              addr,

@@ -139,7 +139,14 @@ type RouteFilter struct {
 type RoutingOptionsConfig struct {
 	StaticRoutes      []*StaticRoute
 	Inet6StaticRoutes []*StaticRoute // rib inet6.0 static routes
-	GenerateRoutes    []*GenerateRoute
+	// UnhandledRibs records every `routing-options rib <name>` whose static
+	// routes this compiler does not implement, with how many routes were lost
+	// (#7512). It exists so the drop can be REPORTED: before #7512 the rib loop
+	// matched only the inet6 tables and every other name fell through with no
+	// branch and no else, so `rib inet.0 { static { route ... } }` compiled to
+	// nothing, committed clean, and emitted no warning.
+	UnhandledRibs  []UnhandledRib
+	GenerateRoutes []*GenerateRoute
 	// ForwardingTableExport is the SELECTED `forwarding-table export` policy —
 	// the value nodeVal takes from the first `export` leaf of the first
 	// `forwarding-table` block, re-assigned per top-level `routing-options`
@@ -730,11 +737,16 @@ type RoutingInstanceConfig struct {
 	Interfaces        []string       // interfaces belonging to this instance
 	StaticRoutes      []*StaticRoute // per-instance static routes
 	Inet6StaticRoutes []*StaticRoute // per-instance rib inet6.0 static routes
-	OSPF              *OSPFConfig    // per-instance OSPF (optional)
-	OSPFv3            *OSPFv3Config  // per-instance OSPFv3 (optional)
-	BGP               *BGPConfig     // per-instance BGP (optional)
-	RIP               *RIPConfig     // per-instance RIP (optional)
-	ISIS              *ISISConfig    // per-instance IS-IS (optional)
+	// UnhandledRibs mirrors RoutingOptionsConfig.UnhandledRibs for this
+	// instance (#7512). compileRoutingInstances copies the fields it wants off
+	// the per-instance RoutingOptionsConfig one by one, so this must be carried
+	// across explicitly or a VRF's dropped ribs go unreported.
+	UnhandledRibs []UnhandledRib
+	OSPF          *OSPFConfig   // per-instance OSPF (optional)
+	OSPFv3        *OSPFv3Config // per-instance OSPFv3 (optional)
+	BGP           *BGPConfig    // per-instance BGP (optional)
+	RIP           *RIPConfig    // per-instance RIP (optional)
+	ISIS          *ISISConfig   // per-instance IS-IS (optional)
 	// AutonomousSystem is this instance's `routing-options autonomous-system`
 	// (#3870). When the instance's BGP omits `local-as`, the BGP AS is
 	// resolved from this instance-level AS if set, else the GLOBAL
@@ -743,4 +755,14 @@ type RoutingInstanceConfig struct {
 	TableID                   int    // Linux kernel routing table number (auto-assigned)
 	InterfaceRoutesRibGroup   string // interface-routes { rib-group inet <name>; }
 	InterfaceRoutesRibGroupV6 string // interface-routes { rib-group inet6 <name>; }
+}
+
+// UnhandledRib names a `routing-options rib <name>` whose static routes the
+// compiler does not implement, and how many routes were discarded with it
+// (#7512). Only ribs that actually CARRIED routes are recorded: an empty or
+// route-less `rib` stanza loses nothing, and warning about it would be noise
+// that trains operators to ignore the warning that matters.
+type UnhandledRib struct {
+	Name   string
+	Routes int
 }

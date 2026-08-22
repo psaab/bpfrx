@@ -1506,6 +1506,10 @@ func ValidateConfig(cfg *Config) []string {
 	// prefix, or a VRF→VRF import target that Phase 1 does not install) so the
 	// operator sees a fail-loud diagnostic rather than a silent no-op.
 	warnings = append(warnings, validateRibGroupLeakWarnings(cfg)...)
+	// #7512: a `routing-options rib <name>` the compiler does not implement
+	// discarded its static routes. Warn rather than reject — see
+	// validateUnhandledRibWarnings for the #1960 reasoning.
+	warnings = append(warnings, validateUnhandledRibWarnings(cfg)...)
 
 	// #1387: DHCP dynamic-DNS live-backend validation. Increment 2 wired the
 	// live RFC 2136 backend, so the increment-1 "no records are published"
