@@ -767,6 +767,9 @@ type IPFIXExporter struct {
 	// IPv6 variants IE 29/30) from the FIB. See Exporter.MaskResolver.
 	MaskResolver MaskResolver
 
+	// maskCache: see Exporter.maskCache (#5250, A9 F3).
+	maskCache *routeMaskCache
+
 	batch flowBatch
 
 	exportedFlows atomic.Uint64
@@ -792,12 +795,13 @@ func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
 	// compute the same ODID). Also the scope value of the #3748 sampler record.
 	sourceID := stableExporterID("ipfix", cfg.InstanceName, cfg.TemplateName)
 	e := &IPFIXExporter{
-		cfg:          cfg,
-		sourceID:     sourceID,
-		includeDir:   cfg.IncludeFlowDir,
-		templateSet:  encodeIPFIXTemplateSetDir(cfg.IncludeFlowDir),
-		MaskResolver: NewRouteMaskResolver(0),
+		cfg:         cfg,
+		sourceID:    sourceID,
+		includeDir:  cfg.IncludeFlowDir,
+		templateSet: encodeIPFIXTemplateSetDir(cfg.IncludeFlowDir),
 	}
+	e.maskCache = newRouteMaskCache(0)
+	e.MaskResolver = e.maskCache.resolve
 
 	// #3748: advertise the 1-in-N sampling rate via an Options Template +
 	// Options Data Record only when the group is actually sampled (rate > 1),
@@ -955,9 +959,13 @@ func (e *IPFIXExporter) CollectorHealth() []CollectorHealth {
 	return e.conns.health()
 }
 
-// Close shuts down all collector connections.
+// Close shuts down all collector connections and stops the route-mask cache's
+// background FIB lookups (#5250).
 func (e *IPFIXExporter) Close() {
 	e.conns.close()
+	if e.maskCache != nil {
+		e.maskCache.Close()
+	}
 }
 
 func (e *IPFIXExporter) sendTemplates() {

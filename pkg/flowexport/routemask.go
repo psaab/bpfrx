@@ -88,6 +88,12 @@ type routeMaskCache struct {
 	entries  map[routeMaskKey]routeMaskEntry
 	pending  map[routeMaskKey]struct{} // keys with a background lookup in flight (dedup)
 	inflight int                       // count of background lookups currently running
+	closed   bool                      // Close() called: schedule nothing further (#5250)
+
+	// wg tracks the background lookup goroutines so Close can wait for them
+	// (bounded by routeMaskCloseGrace). Add() happens under mu, next to the
+	// pending/inflight bookkeeping, so it cannot race the closed check.
+	wg sync.WaitGroup
 
 	// afterPopulate, when non-nil, is invoked after each background lookup has
 	// stored its result. Test-only seam for deterministic assertions; nil in
@@ -106,6 +112,14 @@ type routeMaskEntry struct {
 // netlink syscall rate on the hot session-close export path. ttl<=0 selects a
 // sensible default (10s).
 func NewRouteMaskResolver(ttl time.Duration) MaskResolver {
+	return newRouteMaskCache(ttl).resolve
+}
+
+// newRouteMaskCache builds the cache behind NewRouteMaskResolver and returns
+// the cache itself, so an owner (the NetFlow / IPFIX exporters) can Close it on
+// shutdown. NewRouteMaskResolver keeps the MaskResolver-only signature for
+// callers — tests — that have nothing to shut down.
+func newRouteMaskCache(ttl time.Duration) *routeMaskCache {
 	if ttl <= 0 {
 		ttl = 10 * time.Second
 	}
@@ -117,7 +131,7 @@ func NewRouteMaskResolver(ttl time.Duration) MaskResolver {
 		entries:     make(map[routeMaskKey]routeMaskEntry),
 		pending:     make(map[routeMaskKey]struct{}),
 	}
-	return c.resolve
+	return c
 }
 
 // resolve implements MaskResolver with caching. It NEVER issues the netlink
@@ -169,6 +183,14 @@ func (c *routeMaskCache) scheduleLookupLocked(key routeMaskKey, ip16 net.IP, ifi
 	if c.pending == nil {
 		c.pending = make(map[routeMaskKey]struct{})
 	}
+	if c.closed {
+		// #5250 (A9 F3): after Close, a miss resolves to the default and
+		// schedules nothing. Without this the cache had no stop signal of any
+		// kind — no ctx, no Close method — so a blocking RTM_GETROUTE could be
+		// STARTED after the exporter that owns the cache had already shut down,
+		// and each such lookup then wrote into a cache nobody would read again.
+		return
+	}
 	if _, inFlight := c.pending[key]; inFlight {
 		return
 	}
@@ -181,8 +203,48 @@ func (c *routeMaskCache) scheduleLookupLocked(key routeMaskKey, ip16 net.IP, ifi
 	}
 	c.pending[key] = struct{}{}
 	c.inflight++
+	c.wg.Add(1)
 	ipCopy := append(net.IP(nil), ip16...)
 	go c.populate(key, ipCopy, ifindex)
+}
+
+// routeMaskCloseGrace bounds how long Close waits for already-running FIB
+// lookups. A netlink round-trip is normally sub-millisecond; the grace exists
+// so a WEDGED netlink socket cannot hold daemon shutdown open indefinitely,
+// which is the failure this cache's whole background design (#3743) was built
+// to keep off the hot path in the first place.
+const routeMaskCloseGrace = 2 * time.Second
+
+// Close stops the cache. It is idempotent, and safe to call concurrently with
+// resolve.
+//
+// #5250 (A9 F3): two separate guarantees, because only the first is absolute.
+// After Close returns, NO new background lookup will ever be scheduled — that
+// one is unconditional, taken under mu, and is what stops an exporter's netlink
+// work from outliving it indefinitely. Close also WAITS for the lookups already
+// running, but only up to routeMaskCloseGrace; a lookup blocked in the kernel
+// past that is left to finish on its own. It can still write its result into
+// c.entries afterwards, which is harmless (the map outlives the cache only as
+// long as the cache does, and nothing reads it again) and is why this is a
+// bounded wait rather than a join.
+func (c *routeMaskCache) Close() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(routeMaskCloseGrace):
+	}
 }
 
 // populate runs a single background FIB lookup and stores the result so the
@@ -190,6 +252,7 @@ func (c *routeMaskCache) scheduleLookupLocked(key routeMaskKey, ip16 net.IP, ifi
 // the goroutine body scheduled by scheduleLookupLocked; the netlink round-trip
 // happens here, entirely off the EventReader callback path. #3743.
 func (c *routeMaskCache) populate(key routeMaskKey, ip net.IP, ifindex int) {
+	defer c.wg.Done()
 	mask, ok := c.lookup(ip, ifindex)
 	now := time.Now()
 	c.mu.Lock()

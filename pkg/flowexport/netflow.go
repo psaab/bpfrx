@@ -542,6 +542,12 @@ type Exporter struct {
 	// real matching-route prefix length.
 	MaskResolver MaskResolver
 
+	// maskCache is the routeMaskCache backing MaskResolver when the
+	// constructor built it, so Close can stop its background FIB lookups
+	// (#5250, A9 F3). Nil on a zero-value exporter or when a caller assigned
+	// MaskResolver directly — Close then has nothing to stop, which is correct.
+	maskCache *routeMaskCache
+
 	// Batching: accumulate records, flush periodically
 	batch flowBatch
 
@@ -583,11 +589,12 @@ func NewExporter(cfg *ExportConfig) (*Exporter, error) {
 		// #3740: stable per-group SourceID (RFC 3954 §5.1) derived from the
 		// config identity so two same-collector groups no longer collide on
 		// SourceID=1. HA-symmetric (pure function of config-synced fields).
-		sourceID:     stableExporterID("netflow9", cfg.InstanceName, cfg.TemplateName),
-		fieldsV4:     buildTemplateFieldsV4(cfg.V9TemplateOpts),
-		fieldsV6:     buildTemplateFieldsV6(cfg.V9TemplateOpts),
-		MaskResolver: NewRouteMaskResolver(0),
+		sourceID: stableExporterID("netflow9", cfg.InstanceName, cfg.TemplateName),
+		fieldsV4: buildTemplateFieldsV4(cfg.V9TemplateOpts),
+		fieldsV6: buildTemplateFieldsV6(cfg.V9TemplateOpts),
 	}
+	e.maskCache = newRouteMaskCache(0)
+	e.MaskResolver = e.maskCache.resolve
 	e.recSizeV4 = recordSize(e.fieldsV4)
 	e.recSizeV6 = recordSize(e.fieldsV6)
 	e.templateFlowSet = encodeTemplateFlowSet(cfg.V9TemplateOpts)
@@ -749,9 +756,13 @@ func (e *Exporter) CollectorHealth() []CollectorHealth {
 	return e.conns.health()
 }
 
-// Close shuts down all collector connections.
+// Close shuts down all collector connections and stops the route-mask cache's
+// background FIB lookups (#5250).
 func (e *Exporter) Close() {
 	e.conns.close()
+	if e.maskCache != nil {
+		e.maskCache.Close()
+	}
 }
 
 func (e *Exporter) sendTemplates() {

@@ -294,6 +294,26 @@ per-entry LRU bookkeeping for a syscall-amortization cache. The bound is
 pinned by `TestRouteMaskCacheBounded` (inserting >cap distinct keys keeps
 `len(entries)` <= cap; removing the bound flips it RED).
 
+**#5250 (A9 F3) — the cache is CLOSABLE.** The background scheduler had no
+stop signal of any kind: no ctx, no Close, and `NewRouteMaskResolver`
+returned only a bare `MaskResolver` closure, so the exporter that owned the
+cache could not have stopped it even if it wanted to — a blocking
+`RTM_GETROUTE` could be *started* after the exporter had been torn down.
+`newRouteMaskCache` now returns the `*routeMaskCache` itself; `NewExporter`
+/ `NewIPFIXExporter` keep it on the exporter (`maskCache`) and `Close()`
+calls `routeMaskCache.Close()`, which the daemon already invokes on every
+flow-export reconcile and at shutdown (`daemon_flowexport.go`). Two
+guarantees, and only the first is absolute: after `Close` returns **no
+further lookup is ever scheduled** (the `closed` flag is taken under `mu`
+in `scheduleLookupLocked`); `Close` also waits for the lookups already
+running, but only up to `routeMaskCloseGrace` (2s), so a netlink socket
+wedged in the kernel cannot hold daemon shutdown open — which would defeat
+the whole point of #3743. `NewRouteMaskResolver` keeps its
+`MaskResolver`-only signature for callers with nothing to shut down.
+Pinned by `TestRouteMaskCacheCloseSchedulesNoFurtherLookups`,
+`TestRouteMaskCacheCloseIsBoundedByTheGrace` and
+`TestExporterCloseStopsTheRouteMaskCache`.
+
 **#3743 — the FIB lookup runs OFF the EventReader callback.** `resolve()`
 is called from `ExportSessionClose`, which runs inside the EventReader
 session-close callback (`daemon_flowexport.go` `flowExportCallback` /
