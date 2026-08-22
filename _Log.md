@@ -102686,3 +102686,27 @@ prose edit above them added. No diff falls in the new test body.
     starvation — and reds on a revert to `while !stop`.
   - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
     docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6629 — config sync shipped the ACTIVE TREE unredacted, so the
+    control-link PSK crossed the fabric in cleartext on the very link it
+    authenticates, at the one moment that link is guaranteed unauthenticated
+    (session-sync auth is fixed per connection at handshake time and a key
+    commit does not restart comms, so the carrying connection is by
+    construction one handshaked while both ends were unkeyed). Sealed the
+    config payload under a per-connection ephemeral X25519 + HKDF-SHA256 +
+    AES-256-GCM key (`syncMsgConfigKeyExchange` 30 / `syncMsgConfigEncrypted`
+    31, both additive, no wire-version bump). Chose this over excluding the
+    leaf: `SyncApply` promotes the received tree wholesale under a LENIENT
+    compile, so a stripped leaf makes the standby lose its own key and revert
+    to fail-open — and a new primary would drive an old standby unkeyed on a
+    rolling upgrade, where encryption's fallback is only "no worse than today".
+    Mutation matrix 8/9 RED; C7 (the nil-key guard) GREEN BY DESIGN and
+    annotated in place — removing it is unobservable because openConfigPayload
+    fails closed on a nil key; the safety property is bound by C9.
+    Also recorded the three-way incompatibility (#6629 vs the #5078 no-restart
+    pin vs the read-only secondary) in pkg/cluster/README.md.
+  - **File(s)**: pkg/cluster/{sync_config_crypto.go,sync_config_crypto_6629_test.go,
+    sync.go,sync_conn.go,sync_conn_config.go,sync_conn_read.go,
+    sync_capabilities_6650_test.go,README.md},
+    docs/session-sync-architecture.md
