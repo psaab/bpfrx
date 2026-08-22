@@ -16,9 +16,9 @@ import (
 //
 // Setup:
 //   - seq 1        session delta          -> establishes prevSeq = 1 (>0, so the
-//                                             gap check is armed)
+//     gap check is armed)
 //   - FullResync(100) barrier             -> re-baselines the sequence; with the
-//                                             fix prevSeq advances to 100
+//     fix prevSeq advances to 100
 //   - seq 101      session delta (S+1)    -> must be applied contiguously
 //
 // A session-sync gap firing is observed via SessionSyncResyncs, which is

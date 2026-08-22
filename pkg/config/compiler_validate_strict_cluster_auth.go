@@ -82,6 +82,18 @@ func validateClusterAuthKeyStrict(cfg *Config) error {
 	if strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal()) != "" {
 		return nil
 	}
+	if strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKeyAlt.Reveal()) != "" {
+		// #6630: the additional key is ACCEPTED, never SIGNED with, so a
+		// cluster carrying only it signs nothing and is exactly as fail-open
+		// as an unkeyed one. Say so specifically rather than letting the
+		// generic message send an operator to re-add the leaf they already
+		// have.
+		return fmt.Errorf("chassis cluster: `additional-authentication-key` is set but " +
+			"`authentication-key` is not — the additional key is only ever VERIFIED " +
+			"against, never signed with, so this node would sign nothing and the control " +
+			"channel would fail OPEN exactly as if unkeyed; set `chassis cluster " +
+			"authentication-key <key>` to the key this node should sign with")
+	}
 	return fmt.Errorf("chassis cluster: no authentication-key configured — the " +
 		"cluster control channel (fabric gRPC, heartbeat, and session sync) " +
 		"authenticates with a shared PSK and fails OPEN when none is set, so " +
@@ -89,6 +101,43 @@ func validateClusterAuthKeyStrict(cfg *Config) error {
 		"or clear sessions, and inject sessions; set `chassis cluster " +
 		"authentication-key <key>` to the SAME value on both nodes (generate " +
 		"one with `openssl rand -base64 32`)")
+}
+
+// validateClusterAuthKeyOverlapStrict rejects a rotation overlap that is not
+// one (#6630).
+//
+// `additional-authentication-key` exists so a PSK rotation can roll node by
+// node: each node ACCEPTS both keys while the pair is mid-rotation, so neither
+// end ever receives a present-but-invalid HMAC and heartbeat liveness is never
+// lost. Setting it to the SAME value as `authentication-key` accepts exactly
+// one key — no overlap at all — while reading, in the config and in
+// `show chassis cluster statistics`, as though a rotation window were open.
+// That is worse than not setting it: the operator would proceed to the next
+// commit believing they were protected, which is precisely the dual-master
+// window the leaf exists to close.
+//
+// Whitespace-normalised on both sides for the same reason the emptiness gate
+// is: a key differing only in surrounding whitespace is the same key to
+// anything that matters, and the runtime compares raw bytes, so a
+// trim-equal pair is an overlap that isn't.
+func validateClusterAuthKeyOverlapStrict(cfg *Config) error {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	alt := strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKeyAlt.Reveal())
+	if alt == "" {
+		return nil
+	}
+	if alt != strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal()) {
+		return nil
+	}
+	// Neither key is echoed — the whole point of Secret.
+	return fmt.Errorf("chassis cluster: `additional-authentication-key` is identical to " +
+		"`authentication-key`, so this node accepts exactly ONE key and there is no " +
+		"rotation overlap; the config and `show chassis cluster statistics` would " +
+		"nonetheless read as though a rotation window were open, and proceeding to the " +
+		"next commit on that belief is the dual-master window the leaf exists to close. " +
+		"Set it to the OTHER key of the rotation, or remove it to finalize")
 }
 
 // MinAdvisedControlLinkKeyLen is the length below which
@@ -128,30 +177,58 @@ func ClusterAuthKeyStrengthWarnings(cfg *Config) []string {
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return nil
 	}
-	key := strings.TrimSpace(cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal())
+	var out []string
+	// #6630: the ADDITIONAL key is checked on the same terms. A node accepts
+	// frames signed with it, so a weak or published value there forges the
+	// control channel exactly as a weak primary does — and it is the more
+	// likely place for one, because a rotation is when an operator reaches
+	// for a throwaway. Each leaf is named in its own warning so the operator
+	// knows which to replace, which costs nothing: the NAME is not the secret.
+	out = append(out, clusterKeyStrengthWarnings(
+		"authentication-key", cfg.Chassis.Cluster.ControlLinkAuthKey.Reveal())...)
+	out = append(out, clusterKeyStrengthWarnings(
+		"additional-authentication-key", cfg.Chassis.Cluster.ControlLinkAuthKeyAlt.Reveal())...)
+	return out
+}
+
+// clusterKeyStrengthWarnings reports the length and placeholder advisories for
+// one control-link key leaf. Single-sourced across the primary and the #6630
+// additional key: a divergence between how the two are judged is always a bug,
+// since both are verified against with the same HMAC.
+func clusterKeyStrengthWarnings(leaf, raw string) []string {
+	key := strings.TrimSpace(raw)
 	if key == "" {
 		return nil // absence is validateClusterAuthKeyStrict's business
 	}
 	var out []string
 	if len(key) < MinAdvisedControlLinkKeyLen {
-		out = append(out, fmt.Sprintf("chassis cluster authentication-key is %d "+
+		out = append(out, fmt.Sprintf("chassis cluster %s is %d "+
 			"characters; %d or more is advised (the PSK backs HMAC-SHA256 on the "+
 			"heartbeat, the fabric bearer token and the session-sync frame MAC) — "+
 			"generate one with `openssl rand -base64 32`",
-			len(key), MinAdvisedControlLinkKeyLen))
+			leaf, len(key), MinAdvisedControlLinkKeyLen))
 	}
 	lower := strings.ToLower(key)
 	for _, marker := range clusterAuthKeyPlaceholderMarkers {
 		if strings.Contains(lower, marker) {
 			// Deliberately does NOT name the marker: when the key IS the
 			// marker, naming it prints the key.
-			out = append(out, "chassis cluster authentication-key matches a "+
+			out = append(out, fmt.Sprintf("chassis cluster %s matches a "+
 				"published placeholder from a reference config; those values are "+
 				"in this repository, so the control channel is forgeable by "+
 				"anyone who has read it — replace it with a key generated by "+
-				"`openssl rand -base64 32`")
+				"`openssl rand -base64 32`", leaf))
 			break
 		}
 	}
 	return out
+}
+
+// ValidateClusterAuthKeyOverlapForTest exposes validateClusterAuthKeyOverlapStrict
+// to pkg/cluster's #6630 rotation fixtures, which must assert that the
+// degenerate overlap is refused at COMMIT rather than merely being harmless at
+// runtime. Exported for the test seam only; production callers use the strict
+// gate in compiler_uniformgates_cluster_zone.go.
+func ValidateClusterAuthKeyOverlapForTest(cfg *Config) error {
+	return validateClusterAuthKeyOverlapStrict(cfg)
 }

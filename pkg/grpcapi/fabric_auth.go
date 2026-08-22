@@ -184,15 +184,45 @@ func fabricAuthDecision(keyConfigured, present, tokenOK, enforceArmed bool) (boo
 	return true, ""
 }
 
-// fabricAuthKey returns the control-link PSK for the fabric listener, or nil
-// when none is configured. fabricAuthKeyFn is a test seam; production reads the
-// live key from the cluster manager (nil when standalone).
+// fabricAuthKey returns the control-link PSK the fabric listener SIGNS with,
+// or nil when none is configured. fabricAuthKeyFn is a test seam; production
+// reads the live key from the cluster manager (nil when standalone).
+//
+// Signing only. Verification goes through fabricAcceptedKeys, which is a
+// SUPERSET during a rotation (#6630) — see there.
 func (s *Server) fabricAuthKey() []byte {
 	if s.fabricAuthKeyFn != nil {
 		return s.fabricAuthKeyFn()
 	}
 	if s.cluster != nil {
 		return s.cluster.ControlLinkAuthKey()
+	}
+	return nil
+}
+
+// fabricAcceptedKeys returns every key an inbound fabric token may be verified
+// against (#6630): the signing key, plus the additional rotation key while a
+// rotation window is open.
+//
+// The fabric listener widens with the heartbeat, not after it. Both surfaces
+// key off the SAME PSK and both are consulted during a failover, so leaving
+// one narrow would turn a rotation from "no outage" into "no outage on the
+// heartbeat, `Unauthenticated` on every peer-proxied RPC" — a partial fix that
+// looks like a whole one right up to the moment an operator needs a
+// cross-node RPC mid-rotation.
+//
+// The test seam is honoured: a test that pins fabricAuthKeyFn gets exactly
+// that one key and no widening, so the #4107 fixtures keep meaning what they
+// meant.
+func (s *Server) fabricAcceptedKeys() [][]byte {
+	if s.fabricAuthKeyFn != nil {
+		if k := s.fabricAuthKeyFn(); len(k) > 0 {
+			return [][]byte{k}
+		}
+		return nil
+	}
+	if s.cluster != nil {
+		return s.cluster.ControlLinkAcceptedKeys()
 	}
 	return nil
 }
@@ -219,9 +249,21 @@ func (s *Server) heartbeatPeerAuthSeen() bool {
 // Returns a codes.Unauthenticated status when the call is rejected; nil to
 // admit it. The key is never logged.
 func (s *Server) checkFabricAuth(ctx context.Context, method string) error {
-	key := s.fabricAuthKey()
+	// #6630: verify against every ACCEPTED key so a PSK rotation does not turn
+	// every peer-proxied RPC into codes.Unauthenticated for the window between
+	// the two nodes' commits. keyConfigured below is the accepted SET being
+	// non-empty, for the same reason.
+	keys := s.fabricAcceptedKeys()
 	token, present := fabricAuthTokenFromMetadata(ctx)
-	tokenOK := present && verifyFabricAuthToken(key, token)
+	tokenOK := false
+	if present {
+		for _, k := range keys {
+			if verifyFabricAuthToken(k, token) {
+				tokenOK = true
+				break
+			}
+		}
+	}
 	if tokenOK {
 		// Sticky: once the peer proves it holds the key on the fabric channel,
 		// a later tokenless call is a downgrade attack, not a rollout gap.
@@ -236,7 +278,7 @@ func (s *Server) checkFabricAuth(ctx context.Context, method string) error {
 	// keyed, the peer is not signing heartbeats either, so neither source arms
 	// and the dual-accept grace still holds.
 	armed := s.fabricPeerAuthSeen.Load() || s.heartbeatPeerAuthSeen()
-	accept, reason := fabricAuthDecision(len(key) > 0, present, tokenOK, armed)
+	accept, reason := fabricAuthDecision(len(keys) > 0, present, tokenOK, armed)
 	if !accept {
 		slog.Warn("fabric gRPC listener rejected call: authentication failed", "method", method, "reason", reason)
 		return status.Errorf(codes.Unauthenticated, "fabric RPC authentication failed: %s", reason)

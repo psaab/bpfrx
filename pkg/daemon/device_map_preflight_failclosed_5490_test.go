@@ -207,6 +207,21 @@ func TestEnumerateAndRenameMapped_BootRecheckAllowsSafeMap_5490(t *testing.T) {
 	networkctlReloadFn = func() error { return nil }
 	t.Cleanup(func() { networkctlReloadFn = savedReload })
 
+	// fxp0 already wears its logical name, so the OriginalName= comes from the
+	// sysfs derivation. Stub it: unstubbed, this read the REAL /sys of whatever
+	// host ran the test, found no fxp0, and returned "" — which before #6678
+	// silently fell back to the logical name and let this test pass on the
+	// defect. The property under test here is the pre-flight stranding check,
+	// not name derivation, so pin the derivation rather than inherit the host's.
+	savedDerive := deriveKernelNameFn
+	deriveKernelNameFn = func(name string) string {
+		if name == "fxp0" {
+			return "enp5s0" // matches its mapped PCI address 0000:05:00.0
+		}
+		return ""
+	}
+	t.Cleanup(func() { deriveKernelNameFn = savedDerive })
+
 	dm := &config.DeviceMapConfig{
 		Entries: []config.DeviceMapEntry{
 			{LogicalName: "fxp0", PCIAddr: "0000:05:00.0"},

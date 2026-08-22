@@ -91,6 +91,15 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	} else {
 		m.controlAuthKey = nil
 	}
+	// #6630: the additional ACCEPTED key. Clearing it is the operator's
+	// explicit FINALIZE step — the retired key stops being accepted on the
+	// next commit, so the overlap is bounded by an operator action rather
+	// than being permanent.
+	if k := cfg.ControlLinkAuthKeyAlt.Reveal(); k != "" {
+		m.controlAuthKeyAlt = []byte(k)
+	} else {
+		m.controlAuthKeyAlt = nil
+	}
 
 	// Update peer fencing config.
 	m.peerFencing = cfg.PeerFencing

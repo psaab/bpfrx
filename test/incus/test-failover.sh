@@ -37,6 +37,8 @@ source "${SCRIPT_DIR}/cluster-env.sh"
 # `make test-deploy-lib` against a mocked incus.
 # shellcheck source=test/incus/deploy-lib.sh
 source "${SCRIPT_DIR}/deploy-lib.sh"
+# shellcheck source=test/incus/iperf-throughput-lib.sh
+source "${SCRIPT_DIR}/iperf-throughput-lib.sh"
 
 IPERF_TARGET="${IPERF_TARGET:-$IPERF_TARGET4}"
 IPERF_DURATION=120      # seconds — long enough to span retries + reboot + failback
@@ -391,8 +393,16 @@ done
 # streams survived — this produces "control socket has closed unexpectedly"
 # instead of "iperf Done". Accept either outcome as long as the sender
 # [SUM] line shows adequate throughput.
-throughput=$(incus exec "$CLUSTER_LAN_HOST" -- grep '\[SUM\].*sender' /tmp/iperf3-failover.log 2>/dev/null \
-	| grep -oP '[\d.]+\s+Gbits' | grep -oP '[\d.]+' || echo "0")
+# #6897: capture the whole [SUM] sender line and let the lib parse it. The
+# previous inline parse matched only "Gbits", so a sub-Gbit run yielded the
+# literal "0" and then matched NEITHER the pass branch nor the fail branch —
+# there was no else, and the run emitted no throughput cell at all while still
+# summarising as "0 failed". Sub-Gbit is exactly what a throughput regression
+# or a CoS-shaped class looks like, so the gate went silent in the case it
+# exists to catch.
+sum_line=$(incus exec "$CLUSTER_LAN_HOST" -- grep '\[SUM\].*sender' /tmp/iperf3-failover.log 2>/dev/null \
+	| tail -1 || true)
+throughput=$(iperf_sum_rate_gbps "$sum_line")
 
 if incus exec "$CLUSTER_LAN_HOST" -- grep -q "iperf Done" /tmp/iperf3-failover.log 2>/dev/null; then
 	pass "iperf3 completed successfully"
@@ -403,11 +413,16 @@ else
 	fail "iperf3 did not complete: $iperf_log"
 fi
 
-if [[ -n "$throughput" ]] && awk "BEGIN{exit !($throughput >= $MIN_THROUGHPUT)}"; then
-	pass "iperf3 throughput: ${throughput} Gbps (>= ${MIN_THROUGHPUT} Gbps)"
-elif [[ -n "$throughput" ]] && [[ "$throughput" != "0" ]]; then
-	fail "iperf3 throughput too low: ${throughput} Gbps (expected >= ${MIN_THROUGHPUT} Gbps)"
-fi
+# The verdict is total: absent, unparseable, too-low and healthy each yield
+# exactly one cell. The catch-all default keeps that true even if the lib ever
+# grows a status this caller does not know about — a missing cell is the
+# defect, so no path may end without emitting one.
+throughput_verdict=$(iperf_throughput_verdict "$MIN_THROUGHPUT" "$sum_line")
+case "$throughput_verdict" in
+PASS\ *) pass "${throughput_verdict#PASS }" ;;
+FAIL\ *) fail "${throughput_verdict#FAIL }" ;;
+*)       fail "iperf3 throughput: unrecognised verdict from iperf_throughput_verdict: ${throughput_verdict}" ;;
+esac
 
 # ── Results ──────────────────────────────────────────────────────────
 

@@ -378,11 +378,22 @@ type Manager struct {
 	// mutated in place) under m.mu on config apply; read via
 	// controlLinkAuthKey().
 	controlAuthKey []byte
-	hbInterval     time.Duration
-	hbThreshold    int
-	hbLocalAddr    string // last StartHeartbeat localAddr (for restart)
-	hbPeerAddr     string // last StartHeartbeat peerAddr (for restart)
-	hbVRFDevice    string // last StartHeartbeat vrfDevice (for restart)
+
+	// controlAuthKeyAlt is the #6630 ADDITIONAL accepted key. Frames are
+	// verified against controlAuthKey first and this second; nothing is ever
+	// SIGNED with it. Nil when no rotation is in progress. Replaced, never
+	// mutated in place, so the RLock read stays race-free.
+	controlAuthKeyAlt []byte
+
+	// peerControlKeyID is the #6630 id of the accepted key that last verified
+	// a peer control frame — the running-system evidence that makes
+	// finalizing a rotation safe. An ID, never a key; see controlLinkKeyID.
+	peerControlKeyID string
+	hbInterval       time.Duration
+	hbThreshold      int
+	hbLocalAddr      string // last StartHeartbeat localAddr (for restart)
+	hbPeerAddr       string // last StartHeartbeat peerAddr (for restart)
+	hbVRFDevice      string // last StartHeartbeat vrfDevice (for restart)
 
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
@@ -623,6 +634,45 @@ func (m *Manager) controlLinkAuthKey() []byte {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.controlAuthKey
+}
+
+// controlLinkAcceptedKeys returns every key this node will VERIFY a control
+// frame against (#6630): the signing key first, then the additional rotation
+// key when one is configured. Empty when the cluster is unkeyed.
+//
+// Order is significant only as an optimisation — the signing key is the one
+// the peer uses outside a rotation window, so it matches first — and both are
+// tried, so a caller must not read "verified" as "verified with the signing
+// key". Callers that need to know WHICH key verified take it from the return
+// of controlLinkVerify.
+//
+// Nothing is ever SIGNED with the additional key. A rotation therefore never
+// has two signers: each node keeps signing with its own `authentication-key`
+// and merely widens what it accepts, which is what lets the two commits be
+// separated in time without either end seeing a present-but-invalid HMAC.
+func (m *Manager) controlLinkAcceptedKeys() [][]byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.controlAuthKey) == 0 && len(m.controlAuthKeyAlt) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, 2)
+	if len(m.controlAuthKey) > 0 {
+		out = append(out, m.controlAuthKey)
+	}
+	if len(m.controlAuthKeyAlt) > 0 {
+		out = append(out, m.controlAuthKeyAlt)
+	}
+	return out
+}
+
+// ControlLinkAcceptedKeys exposes controlLinkAcceptedKeys to the in-process
+// gRPC fabric listener (pkg/grpcapi), which authenticates a DIFFERENT control
+// surface with the same shared secret and must widen its acceptance during a
+// rotation for the same reason the heartbeat does. The returned slices are
+// secrets, must not be mutated, and must never be logged.
+func (m *Manager) ControlLinkAcceptedKeys() [][]byte {
+	return m.controlLinkAcceptedKeys()
 }
 
 // ControlLinkAuthKey exposes the #4107 cluster control-channel PSK to

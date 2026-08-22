@@ -58,6 +58,22 @@ Standard library only.
   classifies family by `addressIsIPv6` (colon test on the CIDR string).
 - VRF and tunnel interfaces created elsewhere are excluded from the
   unmanaged-interface scan via the `daemonOwned` map.
+- **The activation tail's `networkctl reconfigure` argv is asserted in
+  full, and the fixture must VARY every axis it claims to cover
+  (#6914).** The tail selects `!Unmanaged && !Disable && BondMaster == ""`
+  and accumulates names in slice order. An argv assertion can only catch a
+  regression along an axis the fixture varies: with a single eligible
+  interface, `[reconfigure trust0]` is also what a hardcoded literal, a
+  deleted `Unmanaged` predicate, a deleted `Disable` predicate and a
+  reversed accumulation all produce — all four were measured green against
+  the one-interface fixture. `activationTailIfaces()` therefore carries two
+  INCLUDED interfaces on either side of the three excluded ones (bond
+  member, unmanaged, disabled), so accumulation and order are both
+  observable. Its expectation (`wantActivationTailArgv`) is spelled out
+  rather than derived by filtering the fixture with the production
+  predicate — deriving it would let the same predicate decide both the
+  behaviour and the expectation, so deleting an arm would change them
+  together and the test could never red.
 - **`Apply` is fail-closed on write errors (#2987).** `writeIfChanged`
   returns `(changed, err)`; `Apply` aggregates per-file write failures
   (still attempting every generated file), reloads whatever did change,
