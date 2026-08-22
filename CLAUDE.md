@@ -84,6 +84,11 @@ make test-deploy     # Build -> push xpfd+cli+helper (each sha256-verified ==
 make test-deploy-lib # Self-test the deploy reconcile/sha-verify helpers (no VM)
 make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
                      #   lock preamble (no cluster — private lock path, mocked incus)
+make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:
+                     #   the piped-stdin CLI is a REPL that prints "error: ..."
+                     #   and still exits 0, so apply-cos-config.sh verifies the
+                     #   CLI's success markers, not the session exit status.
+                     #   Hermetic (mocked incus) + the Go marker contract.
 make test-cluster-env-lib # Self-test the cluster-env resolver (#5024): $FW0/
                      #   $FW1/$CLUSTER_LAN_HOST derive from each env's VM0/VM1/
                      #   LAN_HOST and get INCUS_REMOTE-qualified (no cluster)

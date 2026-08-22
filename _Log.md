@@ -99798,3 +99798,20 @@ prose edit above them added. No diff falls in the new test body.
   pkg/grpcapi/session_iface_identity_6960_test.go, pkg/api/sessions.go,
   pkg/api/session_iface_identity_6960_test.go, pkg/dataplane/types.go,
   userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-21 — #6440 CoS-apply CLI-transcript gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Diagnosed #6440 (`apply-cos-config.sh` exits 6). Root cause: the
+  piped-stdin CLI is a REPL that prints `error: ...` for a failed command,
+  continues, and exits 0 — so the phase-1/phase-2 exit-status gates could
+  never fire, and a silently-failed `load merge` committed a deletes-only
+  candidate (a CoS wipe) that surfaced only as the phase-3 "no shaper
+  binding" grep. Replaced the exit-status gates with CLI success-marker
+  verification, made every rollback verified, and added a daemon-readiness
+  wait.
+- **File(s)**: `test/incus/cos-apply-lib.sh` (new),
+  `test/incus/cos-apply-lib-selftest.sh` (new),
+  `cmd/cli/cos_apply_markers_6440_test.go` (new),
+  `test/incus/apply-cos-config.sh`, `Makefile`, `CLAUDE.md`,
+  `docs/cos-validation-notes.md`
