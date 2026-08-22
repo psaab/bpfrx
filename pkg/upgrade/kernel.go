@@ -285,6 +285,16 @@ type KernelSystem interface {
 	// TTL after a dead roll (r2 AGY).
 	ClearRollLease() error
 
+	// WriteLastRoll durably records the outcome of a COMPLETED roll — promoted
+	// or reverted, with the reason — so it survives the journal clear (#6495).
+	// Unlike the promotion marker this is written on BOTH outcomes and is NOT
+	// cleared at arm time: it is history, overwritten by the next roll. See
+	// kernel_lastroll.go for why the asymmetry with the marker is deliberate.
+	WriteLastRoll(rec KernelRollOutcome) error
+	// ReadLastRoll returns the last recorded roll outcome (a zero record when
+	// no roll has completed on this box).
+	ReadLastRoll() (KernelRollOutcome, error)
+
 	// ---- promotion-gate surface (runs on the candidate boot) ----
 
 	// BootCurrent returns the Boot#### id the firmware actually booted.

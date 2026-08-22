@@ -133,6 +133,10 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		Cluster:    d.cluster,
 		DHCP:       d.dhcp,
 		DHCPServer: d.dhcpServer,
+		// #6495: the #1930 kernel-channel state for `show system
+		// kernel-upgrade`. Same assembly the in-process CLI reads
+		// (daemon_run.go SetKernelUpgradeStatusFn).
+		KernelUpgradeStatusFn: d.kernelUpgradeStatus,
 		// #6496: the day-0 config-import verdict for `show system
 		// bootstrap-import`. Same recorded snapshot /health reports below and
 		// the in-process CLI reads (daemon_run.go SetBootstrapImportFn), so

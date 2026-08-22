@@ -43,6 +43,7 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
@@ -131,6 +132,12 @@ type Config struct {
 	// unit-test / no-daemon build, where showSystemServices falls back to the
 	// documented loopback defaults.
 	ListenersFn func() sysservices.Listeners
+	// KernelUpgradeStatusFn returns the #1930 kernel-channel state for
+	// `show system kernel-upgrade` (#6495). Wired by the daemon, which reads
+	// the durable journal + promotion marker + last-roll record and supplies
+	// the cluster hold reason it alone knows. nil in a unit-test / no-daemon
+	// build, where the topic reports an idle channel.
+	KernelUpgradeStatusFn func() upgrade.ChannelStatus
 	// BootstrapImportFn returns the recorded day-0 / bootstrap config-import
 	// outcome for `show system bootstrap-import` (#6496). Wired by the daemon
 	// to Daemon.BootstrapImportSnapshot — the SAME recorded snapshot /health
@@ -187,6 +194,9 @@ type Server struct {
 	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
 	// no-daemon unit-test build.
 	listenersFn func() sysservices.Listeners
+	// kernelUpgradeStatusFn backs the `kernel-upgrade` ShowText topic (#6495).
+	// Wired from Config.KernelUpgradeStatusFn; nil in a no-daemon unit build.
+	kernelUpgradeStatusFn func() upgrade.ChannelStatus
 	// bootstrapImportFn returns the recorded day-0 import outcome for the
 	// `bootstrap-import` ShowText topic (#6496). Wired from
 	// Config.BootstrapImportFn; nil in a no-daemon unit-test build.
@@ -327,6 +337,7 @@ func NewServer(addr string, cfg Config) *Server {
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
 		listenersFn:           cfg.ListenersFn,
+		kernelUpgradeStatusFn: cfg.KernelUpgradeStatusFn,
 		bootstrapImportFn:     cfg.BootstrapImportFn,
 		peerLookupFn:          cfg.PeerLookupFn,
 	}
