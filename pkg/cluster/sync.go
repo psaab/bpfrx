@@ -470,6 +470,34 @@ type SessionSync struct {
 	// always ends with the lossless BulkSync window, so an override can never
 	// reintroduce the empty-marker / skipped-reconcile regression.
 	BulkSyncOverride func() error
+	// BulkSnapshotSource, if set, supplies the authoritative cold-prime /
+	// re-drive snapshot doBulkSync frames, REPLACING the backend session-store
+	// walk BulkSync performs (#6031).
+	//
+	// BulkSync's ForEachV4/V6 walk reads the `sessions`/`sessions_v6` BPF
+	// conntrack maps, which under the userspace dataplane are a best-effort
+	// DISPLAY mirror, not the authoritative session set: the Rust helper's
+	// transit forward install publishes only the shim steering map and its
+	// shared session tables, never publish_bpf_conntrack_entry, so a TRANSIT
+	// session is structurally absent from that walk. Since #5085 made the
+	// receiver reconcile authoritatively against the delimited window, framing
+	// it from the mirror DELETES exactly the live peer-owned transit sessions
+	// the standby needs at failover. A table-truth source closes that.
+	//
+	// The supplied snapshot is framed VERBATIM: doBulkSync does NOT re-apply
+	// the ShouldSyncZone filter to it, because the caller already applies the
+	// strictly more precise owner-RG filter the incremental delta path uses
+	// (daemon shouldSyncUserspaceDelta). Re-filtering by zone could drop an
+	// entry the incremental path admits — e.g. a fabric-redirect wire alias —
+	// and every entry missing from the window is DELETED on the receiver. The
+	// two paths must admit the same set; a divergence is always a bug.
+	//
+	// A source that returns an error FAILS CLOSED: doBulkSync returns the
+	// error and frames NO window rather than falling back to the mirror walk.
+	// Sending a known-incomplete authoritative window destroys live sessions;
+	// sending none merely defers the reconcile, and every doBulkSync caller
+	// leaves its cold-prime/resync obligation armed for the next retry.
+	BulkSnapshotSource func() (BulkSnapshot, error)
 	// OnBulkSyncAckReceived fires when the peer acknowledges our outbound bulk sync.
 	OnBulkSyncAckReceived func()
 	// OnPeerConnected fires when a peer sync connection is established.
