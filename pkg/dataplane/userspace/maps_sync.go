@@ -401,6 +401,12 @@ func (m *Manager) ctrlMustStayDisabledLocked(statusEnabled bool) bool {
 	return statusEnabled && (m.rgTransitionInFlight.Load() || m.linkCycleInFlight())
 }
 
+// applyHelperStatusLocked reconciles one helper status report into the shim's
+// userspace_ctrl and userspace_bindings maps and the manager's derived state.
+// It runs under m.mu on the ~1/s status-poll path (and on the UpdateRGActive
+// path), so it must not block or allocate beyond what the steps below already
+// do. #6429 split the per-domain steps into helper_status_apply.go; the order
+// of the steps, and what each early return skips, is unchanged.
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
@@ -414,18 +420,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	var newBindingIndices []uint32
 	newBindingIndexSet := make(map[uint32]struct{})
 
-	// Preserve cpumap flag if cpumap is populated.
-	var ctrlFlags uint32
-	if cpuMap := m.bpfShim.Map(mapNameUserspaceCPUMap); cpuMap != nil {
-		ctrlFlags |= userspaceCtrlFlagCPUMap
-	}
-	if snapshotHasNativeGRE(m.lastSnapshot) {
-		ctrlFlags |= userspaceCtrlFlagNativeGRE
-	}
-	wgPort := snapshotWgListenPort(m.lastSnapshot)
-	if wgPort != 0 {
-		ctrlFlags |= userspaceCtrlFlagWgRx
-	}
+	ctrlFlags, wgPort := m.helperCtrlFlagsLocked()
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
@@ -439,308 +434,16 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if m.ctrlMustStayDisabledLocked(status.Enabled) {
-		// rgTransitionInFlight: one or more RG transitions are in progress and
-		// the helper hasn't acked the HA state update yet. Keep ctrl disabled
-		// until syncHAStateLocked succeeds to avoid re-enabling ctrl during the
-		// handoff (#279, #284).
-		//
-		// linkCycleInFlight (#6871): a RETH MAC link cycle has joined the
-		// workers and is taking the NIC down, so the XSK sockets this gate
-		// steers into are dead or about to be. The status tick is gated on the
-		// same lease and skips its whole body, but this is not only the tick's
-		// path: UpdateRGActive ends in applyHelperStatusLocked too, and it is
-		// driven by VRRP/cluster events and by reconcileRGStateLoop's 2s pass
-		// (daemon_ha.go, which also wakes early on dropped-event
-		// notifications), NEITHER of which is serialized on the daemon's
-		// applySem — so it can land in
-		// the middle of a cycle and re-enable ctrl on its own. Gating at the
-		// write is what makes the lease cover the producer rather than one
-		// caller of it. NotifyLinkCycle releases the lease at the top of its
-		// critical section, so its own post-rebind status apply is NOT gated
-		// here and a completed cycle re-enables ctrl on that call.
-		ctrl.Enabled = 0
-	} else if status.Enabled {
-		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
-		// The VRRP election + VIP add takes ~10-14s after restart.
-		// If we enable ctrl before VIPs, the XSK path gets packets but
-		// can't SNAT (no source address) -> all transit dropped. While
-		// ctrl is disabled, only proven local/control traffic reaches the
-		// kernel; transit remains fail-closed.
-		//
-		// Also delay by 3s for fill ring bootstrap: mlx5 zero-copy
-		// needs NAPI to post fill ring WQEs, and NAPI only runs on
-		// hardware RX events.  Background traffic (VRRP, ARP) during
-		// the delay generates these events.
-		if !m.neighborsPrewarmed {
-			m.neighborsPrewarmed = true
-			// Hard timeout fallback — ctrl enables after this even if
-			// readiness checks haven't passed. Prevents infinite stall
-			// if a readiness condition can never be met.
-			//
-			// Only set ctrlEnableAt on the FIRST prewarm so that
-			// subsequent rebind cycles (which reset neighborsPrewarmed)
-			// don't push the hard timeout forward indefinitely.
-			if m.ctrlEnableAt.IsZero() {
-				delay := 3 * time.Second
-				if m.clusterHA {
-					delay = 15 * time.Second
-				}
-				m.ctrlEnableAt = time.Now().Add(delay)
-				slog.Info("userspace: delaying ctrl enable for readiness",
-					"hard_timeout", delay, "cluster_ha", m.clusterHA)
-			}
-			m.bootstrapNAPIQueuesAsyncLocked("startup-prewarm")
-			m.proactiveNeighborResolveLocked()
-		}
-		// Check readiness gates BEFORE refreshing neighbors (which
-		// bumps the generation). The status reports the generation
-		// from the previous refresh cycle.
-		//
-		// The helper can only prove RX liveness after ctrl enables the
-		// shim and the userspace_bindings map exposes the binding slots.
-		// Requiring Bound here deadlocks startup: ctrl stays off, the shim
-		// keeps passing packets away from XSK, and Bound never flips true.
-		probeBindingsReady := len(status.Bindings) > 0
-		allBindingsBound := len(status.Bindings) > 0
-		for _, b := range status.Bindings {
-			if b.Ifindex <= 0 {
-				continue
-			}
-			if !b.Registered || !b.Armed {
-				probeBindingsReady = false
-			}
-			if b.Registered && !b.Bound {
-				allBindingsBound = false
-			}
-		}
-		// Fire OnXSKBound callback once when all bindings are bound.
-		// This lets the daemon create fabric IPVLAN overlays after XSK
-		// has bound in zerocopy mode on the parent interface.
-		if allBindingsBound && !m.xskBoundNotified && m.OnXSKBound != nil {
-			m.xskBoundNotified = true
-			go m.OnXSKBound()
-		}
+	m.resolveCtrlEnableLocked(status, &ctrl)
 
-		neighborSyncReady := status.NeighborGeneration > 0
-
-		// XSK receive liveness: once bindings and neighbor state are ready,
-		// arm ctrl and explicitly probe the userspace shim. A working XSK
-		// path must show RX progress while ctrl=1 and the shim is active.
-		// Otherwise keep ctrl disabled: local/control packets may still
-		// reach the kernel, but transit fails closed in both modes.
-		var currentRX uint64
-		for _, b := range status.Bindings {
-			currentRX += b.RXPackets
-		}
-		xskReceiveLive := currentRX > m.lastXSKRX
-		m.lastXSKRX = currentRX
-		slog.Debug("userspace: ctrl gate check",
-			"probeBindingsReady", probeBindingsReady,
-			"allBindingsBound", allBindingsBound,
-			"neighborSyncReady", neighborSyncReady,
-			"xskReceiveLive", xskReceiveLive,
-			"currentRX", currentRX,
-			"lastXSKRX", m.lastXSKRX,
-			"neighborsPrewarmed", m.neighborsPrewarmed,
-			"xskLivenessFailed", m.xskLivenessFailed,
-			"xdpEntryProg", m.bpfShim.XDPEntryProgram())
-		if m.xskLivenessFailed {
-			// XSK proven broken: ctrl stays disabled. The shim only passes
-			// proven local/control packets and drops transit.
-			ctrl.Enabled = 0
-		} else if probeBindingsReady && neighborSyncReady {
-			ctrl.Enabled = 1
-			if m.xskLivenessProven {
-				if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
-					if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
-						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
-					}
-				}
-			} else if xskReceiveLive {
-				m.xskLivenessProven = true
-				m.xskProbeStart = time.Time{}
-				if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
-					if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
-						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
-					}
-				}
-				slog.Info("userspace: XSK liveness proven")
-			} else {
-				if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
-					if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
-						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
-					}
-				}
-				if m.xskProbeStart.IsZero() {
-					m.xskProbeStart = time.Now()
-					slog.Info("userspace: starting XSK liveness probe")
-				} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-					if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
-						m.xskLivenessProven = true
-						m.xskProbeStart = time.Time{}
-						if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
-							if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
-								slog.Warn("userspace: failed to restore XDP shim after idle standby liveness success", "err", err)
-							}
-						}
-						slog.Info("userspace: XSK liveness proven on idle standby")
-						goto ctrlReady
-					} else if m.shouldExtendXSKLivenessIdleLocked(currentRX, allBindingsBound) {
-						m.xskProbeStart = time.Now()
-						slog.Info("userspace: extending XSK liveness probe while idle")
-						goto ctrlReady
-					}
-					m.xskLivenessFailed = true
-					m.xskProbeStart = time.Time{}
-					ctrl.Enabled = 0
-					if m.configuredMode == ModeUserspaceStrict {
-						// Strict mode: keep the shim attached with ctrl=0
-						// so packets hit the fail-closed ctrl-disabled path.
-						// Log at error level because this degraded state
-						// needs operator attention.
-						slog.Error("userspace: XSK liveness probe failed in strict mode; dataplane degraded fail-closed")
-					} else {
-						slog.Warn("userspace: XSK liveness probe failed; keeping shim disabled with transit fail-closed")
-						if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
-							if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
-								slog.Warn("userspace: failed to restore XDP shim after XSK liveness failure", "err", err)
-							}
-						}
-					}
-				}
-			}
-		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
-			// Hard timeout fallback: allow ctrl even if readiness has not been
-			// fully proven yet. The XSK liveness probe still decides whether
-			// the userspace shim starts redirecting or stays fail-closed
-			// for transit.
-			ctrl.Enabled = 1
-		} else {
-			ctrl.Enabled = 0
-		}
-	}
-ctrlReady:
-	// Flush stale BPF session entries when ctrl transitions from
-	// disabled to enabled. Older legacy-fallback windows could create
-	// PASS_TO_KERNEL entries in the userspace session map. These poison
-	// the XDP shim after ctrl enables: it sees the stale entry and
-	// bypasses XSK instead of redirecting to the userspace helper.
-	//
-	// Also flush BPF conntrack sessions left by earlier legacy-fallback
-	// windows. These sessions interfere with the userspace pipeline via
-	// TC egress: when the Rust helper sends packets via XSK TX, TC egress
-	// finds the stale BPF conntrack entries and may apply conflicting NAT
-	// or update session state incorrectly. The userspace helper's own
-	// session table (Rust SessionTable + shared_sessions) holds the
-	// authoritative synced sessions, so BPF conntrack must be empty when
-	// ctrl re-enables.
-	// Only flush stale BPF sessions on the very first ctrl enable after
-	// daemon startup. Snapshot generation is not a reliable proxy for
-	// "startup" on long-lived HA nodes because a steady appliance can stay
-	// at generation 1 indefinitely; later ctrl re-enables during RG moves
-	// would then retrigger the startup flush and destroy synced sessions.
+	// Only flush stale BPF sessions on the very first ctrl enable after daemon
+	// startup; flushStaleBPFStateOnCtrlEnableLocked documents why that gate
+	// matters and closes it by setting m.initialCtrlCleanupDone.
 	if ctrl.Enabled == 1 && !m.ctrlWasEnabled && !m.initialCtrlCleanupDone {
-		if usMap := m.bpfShim.Map(mapNameUserspaceSessions); usMap != nil {
-			var key, nextKey []byte
-			key = make([]byte, usMap.KeySize())
-			nextKey = make([]byte, usMap.KeySize())
-			deleted := 0
-			for {
-				if err := usMap.NextKey(key, nextKey); err != nil {
-					break
-				}
-				copy(key, nextKey)
-				_ = usMap.Delete(key)
-				deleted++
-			}
-			if deleted > 0 {
-				slog.Info("userspace: flushed stale BPF session entries on initial ctrl enable",
-					"deleted", deleted)
-			}
-		}
-		// Flush BPF conntrack sessions left by an earlier fallback
-		// transition window. Only delete
-		// sessions whose Created timestamp is AFTER ctrlDisabledAt —
-		// synced sessions from the cluster peer have earlier timestamps
-		// and must survive for HA failover continuity.
-		//
-		// Why this is needed (issue #334): a previous legacy fallback
-		// can leave conntrack entries in the BPF sessions map. When
-		// ctrl re-enables, TC egress finds these stale BPF entries and
-		// may apply conflicting NAT or update session state incorrectly;
-		// the userspace helper's own session table (Rust SessionTable +
-		// shared_sessions) is authoritative.
-		//
-		// session_value layout: State[1]+Flags[1]+TCPState[1]+
-		// IsReverse[1]+AppTimeout[4]+SessionID[8]+Created[8].
-		// Created is at byte offset 16. The value is seconds since
-		// boot (bpf_ktime_get_coarse_ns / 1e9). ctrlDisabledAt is
-		// nanoseconds, so convert to seconds for comparison.
-		cutoffSec := m.ctrlDisabledAt / 1_000_000_000
-		for _, mapName := range []string{"sessions", "sessions_v6"} {
-			if ctMap := m.bpfShim.Map(mapName); ctMap != nil {
-				keySize := ctMap.KeySize()
-				valSize := ctMap.ValueSize()
-				var key, nextKey []byte
-				key = make([]byte, keySize)
-				nextKey = make([]byte, keySize)
-				val := make([]byte, valSize)
-				deleted, kept := 0, 0
-				for {
-					if err := ctMap.NextKey(key, nextKey); err != nil {
-						break
-					}
-					copy(key, nextKey)
-					// Read session value to check Created timestamp.
-					// Created is at byte offset 16:
-					//   State(1) + Flags(1) + TCPState(1) + IsReverse(1)
-					//   + AppTimeout(4) + SessionID(8) = 16
-					if cutoffSec > 0 {
-						if err := ctMap.Lookup(key, val); err == nil && len(val) >= 24 {
-							created := binary.NativeEndian.Uint64(val[16:24])
-							if created > 0 && created <= cutoffSec {
-								kept++
-								continue // synced session — keep it
-							}
-						}
-					}
-					_ = ctMap.Delete(key)
-					deleted++
-				}
-				if deleted > 0 || kept > 0 {
-					slog.Info("userspace: flushed stale BPF conntrack on ctrl enable",
-						"map", mapName, "deleted", deleted, "kept_synced", kept,
-						"cutoff_sec", cutoffSec)
-				}
-			}
-		}
-		m.initialCtrlCleanupDone = true
+		m.flushStaleBPFStateOnCtrlEnableLocked()
 	}
 
-	// Compute active runtime mode from ctrl state and liveness.
-	switch {
-	case ctrl.Enabled == 0 || m.xskLivenessFailed:
-		// Degraded userspace mode keeps the shim attached. Compat still only
-		// permits local/control kernel delivery; it is not eBPF-only transit.
-		if m.configuredMode == ModeUserspaceStrict {
-			m.mode = ModeUserspaceStrict
-		} else {
-			m.mode = ModeUserspaceCompat
-		}
-	case m.xskLivenessProven && m.configuredMode == ModeUserspaceStrict:
-		m.mode = ModeUserspaceStrict
-	case m.xskLivenessProven:
-		m.mode = ModeUserspaceCompat
-	default:
-		// ctrl enabled but liveness not yet proven — still probing.
-		m.mode = ModeUserspaceCompat
-	}
-	// Set strict flag in ctrl so the XDP shim reports strict degraded drops
-	// separately while keeping transit fail-closed in both modes.
-	if m.configuredMode == ModeUserspaceStrict {
-		ctrl.Flags |= userspaceCtrlFlagStrict
-	}
+	m.applyRuntimeModeLocked(&ctrl)
 
 	if ctrl.Enabled == 0 {
 		if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
@@ -753,109 +456,15 @@ ctrlReady:
 	}
 
 	deadWorkers := deadWorkerIDSet(status.WorkerRuntime)
-	for _, binding := range status.Bindings {
-		if binding.Ifindex <= 0 {
-			continue
-		}
-		flags := uint32(0)
-		if bindingForwardingLive(binding, deadWorkers) {
-			// #1666: mark forwarding-ready only when the helper derives
-			// the binding Ready (registered && bound && xsk_registered &&
-			// heartbeat_fresh) and the worker has not panicked. The prior
-			// (Registered && Armed) predicate let the XDP shim steer
-			// transit to a slot whose worker had crashed or never finished
-			// XSK registration (crash-blind blackhole). Ready's
-			// sub-conditions are all set by worker bringup independent of
-			// RX, so this does not deadlock startup (plan §4).
-			flags = userspaceBindingReady
-		}
-		// Queue-dimension bound guard (#4894): a queue-id at or above the
-		// fixed stride makes idx = ifindex*stride + queue land on
-		// (ifindex+1)*stride + (queue-stride) — aliasing a slot that
-		// belongs to the ADJACENT ifindex. The dense-cap guard below
-		// cannot catch this (the aliased index is in range), so bound the
-		// queue dimension explicitly and fail closed rather than steer an
-		// interface's packets into another interface's XSK. Never
-		// clamp/modulo the queue-id: that would still steer to a wrong
-		// slot.
-		if binding.QueueID >= bindingQueuesPerIface {
-			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-				"update userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (ifindex=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
-				binding.QueueID, uint32(bindingQueuesPerIface), binding.Ifindex,
-			))
-		}
-		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
-		// Call-site cap guard (#814): the aya Array is sized to
-		// dataplane.BindingArrayMaxEntries = MaxInterfaces *
-		// BindingQueuesPerIface. An ifindex above MaxInterfaces would
-		// overflow the flat index; fail with a legible error instead
-		// of relying on the kernel's "argument list too long" E2BIG.
-		if idx >= dataplane.BindingArrayMaxEntries {
-			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-				"update userspace_bindings: idx=%d exceeds cap=%d (ifindex=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
-				idx, dataplane.BindingArrayMaxEntries, binding.Ifindex, binding.QueueID,
-			))
-		}
-		val := userspaceBindingValue{
-			Slot:  binding.Slot,
-			Flags: flags,
-		}
-		if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err))
-		}
-		if _, seen := newBindingIndexSet[idx]; !seen {
-			newBindingIndexSet[idx] = struct{}{}
-			newBindingIndices = append(newBindingIndices, idx)
-		}
+	newBindingIndices, err := m.applyPrimaryBindingRowsLocked(
+		status, ctrlMap, bindingsMap, ctrl, deadWorkers, newBindingIndices, newBindingIndexSet)
+	if err != nil {
+		return err
 	}
-	for childIfindex, parentIfindex := range buildUserspaceIngressBindingAliases(m.lastSnapshot) {
-		for _, binding := range status.Bindings {
-			if binding.Ifindex != int(parentIfindex) {
-				continue
-			}
-			flags := uint32(0)
-			if bindingForwardingLive(binding, deadWorkers) {
-				// #1666: unify the VLAN-alias child with the primary gate.
-				flags = userspaceBindingReady
-			}
-			// Queue-dimension bound guard (#4894): see primary apply above.
-			// The alias child uses its own ifindex, but the queue-id comes
-			// from the parent's binding, so bound it here too.
-			if binding.QueueID >= bindingQueuesPerIface {
-				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-					"update aliased userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (child=%d parent=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
-					binding.QueueID, uint32(bindingQueuesPerIface), childIfindex, parentIfindex,
-				))
-			}
-			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
-			// Call-site cap guard (#814): see primary apply above.
-			// VLAN-alias children use their own ifindex here, so the
-			// child (not the parent) is the overflow risk.
-			if idx >= dataplane.BindingArrayMaxEntries {
-				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-					"update aliased userspace_bindings: idx=%d exceeds cap=%d (child=%d parent=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
-					idx, dataplane.BindingArrayMaxEntries, childIfindex, parentIfindex, binding.QueueID,
-				))
-			}
-			val := userspaceBindingValue{
-				Slot:  binding.Slot,
-				Flags: flags,
-			}
-			if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-					"update aliased userspace_bindings idx=%d (if=%d parent=%d q=%d): %w",
-					idx,
-					childIfindex,
-					parentIfindex,
-					binding.QueueID,
-					err,
-				))
-			}
-			if _, seen := newBindingIndexSet[idx]; !seen {
-				newBindingIndexSet[idx] = struct{}{}
-				newBindingIndices = append(newBindingIndices, idx)
-			}
-		}
+	newBindingIndices, err = m.applyAliasBindingRowsLocked(
+		status, ctrlMap, bindingsMap, ctrl, deadWorkers, newBindingIndices, newBindingIndexSet)
+	if err != nil {
+		return err
 	}
 	m.lastBindingIndices = m.clearStaleBindingRowsLocked(bindingsMap, newBindingIndices, newBindingIndexSet)
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {

@@ -1,3 +1,22 @@
+## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
+
+- **Timestamp**: 2026-08-22
+- **Action**: Repo-wide sweep correcting the RFC 6052 section cited for the
+  NAT64 non-global embedded-IPv4 rule. 17 occurrences across 11 files said
+  §2.2; §2.2 is the IPv4-Embedded IPv6 Address *Format* section and states no
+  such rule. The normative "MUST NOT translate / MUST drop" language is §3.1
+  (Restrictions on the use of the Well-Known Prefix).
+- **File(s)**: docs/feature-coverage.md, pkg/dataplane/userspace/format/
+  status_test.go, pkg/dataplane/userspace/protocol_binding.go,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/protocol/binding.rs
+- **Note**: the 2026-07-24 #6475 heading above carries the original mis-citation
+  and is deliberately left as written. This log is append-only and records what
+  was believed at the time; rewriting a past entry would falsify the record.
+  This entry is the correction.
+
 ## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
 
 - **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
@@ -54,6 +73,70 @@
   peer,tai64n,timers}.rs, userspace-dp/src/afxdp/wg/poison_tests.rs (new),
   userspace-dp/src/afxdp/wg/{mod,tests,cookie_tests,tai64n_tests}.rs,
   docs/engineering-style.md, _Log.md
+## 2026-08-21 — #6429: applyHelperStatusLocked split into per-domain apply steps
+
+- **Timestamp**: 2026-08-21 (refactor/6429-apply-helper-status)
+- **Action**: Split the 481-line `applyHelperStatusLocked` god-function into 12
+  per-domain steps in a new `helper_status_apply.go`, leaving an 84-line driver
+  in `maps_sync.go`. PURE CODE MOTION: 21 of 24 moved blocks are byte-identical
+  modulo leading tabs, verified mechanically by searching the produced files for
+  the left-stripped original ranges (`check.py`), not by eye. The only 8
+  differing lines are the two mechanical adaptations a function boundary forces:
+  the two `goto ctrlReady` jumps became `return` (the label sat immediately
+  after the block they escaped and that block was the last statement in the
+  chain, so the jump and the return land on the same statement — the label is
+  now dead and removed), and the six `return m.failClosedUserspaceCtrlLocked(…)`
+  in the two binding-row loops gained the `newBindingIndices` accumulator as a
+  first result.
+
+  Steps extracted: `helperCtrlFlagsLocked`, `resolveCtrlEnableLocked`,
+  `ensureCtrlEnablePrewarmLocked`, `bindingReadinessLocked`,
+  `observeXSKReceiveLivenessLocked`, `applyXSKLivenessGateLocked`,
+  `advanceXSKLivenessLocked`, `resolveXSKLivenessProbeTimeoutLocked`,
+  `flushStaleBPFStateOnCtrlEnableLocked`, `applyRuntimeModeLocked`,
+  `applyPrimaryBindingRowsLocked`, `applyAliasBindingRowsLocked`.
+
+  The path runs under `m.mu` at ~1/s per helper, so the two rules that govern it
+  were checked rather than asserted. Allocation: `go build -gcflags=-m` over the
+  before/after regions gives an IDENTICAL heap-fact set — 50 distinct, 109 total
+  — with zero facts present after that were absent before. Every new message is
+  a `does not escape` annotation for a newly-introduced parameter; notably
+  `ctrl` is taken by pointer in five places and escape analysis still reports
+  `ctrl does not escape` for all five, and `newBindingIndexSet` keeps its
+  pre-existing `make(map[uint32]struct {}) does not escape`. Logging: all 15
+  `slog` sites diff clean on level AND message text; nothing was promoted from
+  Debug.
+
+  Early-return map (unchanged by the split): R1/R2 (`ctrlMap`/`bindingsMap` nil)
+  skip everything; R3 (ctrl-disable write fails) returns BEFORE
+  `m.ctrlWasEnabled = false` / `m.ctrlDisabledAt` are updated and skips both
+  binding loops, `clearStaleBindingRowsLocked`, the three map syncs,
+  `syncBPFCountersLocked`, the ctrl-enable write and `recordHelperStatusLocked`;
+  R4-R6 (primary loop) and R7-R9 (alias loop) fail ctrl closed and skip
+  everything from `clearStaleBindingRowsLocked` onward, leaving
+  `m.lastBindingIndices` untouched; R10-R12 (the three syncs) skip the syncs
+  below them plus counters/enable/record; R13 (ctrl-enable write) skips only
+  `recordHelperStatusLocked`. The two former `goto`s are not returns — they skip
+  only the liveness-failure tail and leave `ctrl.Enabled = 1` standing.
+
+  `pkg/dataplane/userspace/maps_sync.go` moves 2046 [REFACTOR] -> 1655 [WATCH]
+  in the modularity heatmap; the new file is 567 lines, below the audit floor.
+  Doc pointers into the moved code updated in `docs/reth-mac.md` (the ctrl-write
+  gate is now consulted in `resolveCtrlEnableLocked`; the predicate
+  `ctrlMustStayDisabledLocked` stays in `maps_sync.go`) and
+  `docs/afxdp-packet-processing.md` (the #4894/#814 write-side dimension guards
+  moved with the apply path; the watchdog copies stayed).
+
+  A cluster smoke is OWED and was NOT run — this is the helper status-apply
+  path. Deliberately out of scope: the five repeated
+  `UsingUserspaceXDPShimEntryProgram`/`SwapTo…` blocks were NOT deduplicated,
+  because that is a rewrite, not code motion.
+
+- **File(s)**: `pkg/dataplane/userspace/helper_status_apply.go` (new),
+  `pkg/dataplane/userspace/maps_sync.go`, `docs/reth-mac.md`,
+  `docs/afxdp-packet-processing.md`, `docs/refactoring-audit-current.txt`,
+  `_Log.md`
+
 ## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
 
 - **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
@@ -100099,3 +100182,202 @@ prose edit above them added. No diff falls in the new test body.
     pkg/nftables/netlink_lo0_addrs_6512_test.go,
     pkg/daemon/lo0_addr_failclosed_6512_test.go, pkg/daemon/lo0_filter_test.go,
     pkg/daemon/README.md, pkg/nftables/README.md
+## 2026-08-21 — #6535 periodic converger for the Kea applier
+- **Timestamp**: 2026-08-21
+- **Action**: Track whether a Kea apply converged (`applyFailed` +
+  `ClaimApplyRetry`, on their own mutex); add `reconcileClusterDHCPServices`
+  to `reconcileRGState`; single-source the desired state as
+  `desiredClusterDHCPConfig`.
+- **File(s)**: `pkg/dhcpserver/dhcpserver.go`, `pkg/dhcpserver/test_seams.go`,
+  `pkg/dhcpserver/README.md`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/daemon_apply_routing.go`,
+  `pkg/daemon/dhcp_apply_converger_6535_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6530 fence re-arms the rg_active reconcile retry
+- **Timestamp**: 2026-08-21
+- **Action**: Add `rgStateMachine.InvalidateApplied()` so an out-of-band
+  `rg_active` write re-arms `reconcileRGState`'s desired-vs-applied retry;
+  route the received-peer-fence path through it; lazily allocate `d.rgStates`.
+- **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha_sync.go`,
+  `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/rg_state_fence_rearm_6530_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6527 single-RG transfer-commit rollback
+- **Timestamp**: 2026-08-21
+- **Action**: Roll back `peerTransferOutOverride` when
+  `commitRequestedPeerFailover` loses the election, mirroring the batch path;
+  agreement-binding regression test across both request paths.
+- **File(s)**: `pkg/cluster/failover.go`,
+  `pkg/cluster/failover_commit_rollback_6527_test.go`,
+  `pkg/cluster/README.md`
+## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
+
+- **Timestamp**: 2026-08-21
+- **Action**: `compileNAT` / `compileStaticNAT` / `compileNAT64` built
+  `SNATValue`, `SNATValueV6`, `SNATEgressValue`, `NATPoolConfig`, `DNATValue`,
+  static-NAT and `NAT64Config` records and handed them to `SetSNATRule` /
+  `SetDNATEntry` / `SetNATPoolConfig` / the stale-NAT deleters. Every one of
+  those writes landed nowhere: the only production compile path is
+  `Manager.CompileUserspaceShim`, whose `userspaceShimCompileDataplane`
+  implements each as `return nil` (loader.go); the real `(*Manager)` writers in
+  `maps_nat.go` are reachable only through `Manager.Compile`, which no
+  production caller reaches because no backend registers a non-userspace type
+  and `LegacyDataPlaneAdapter` shadows `Compile`/`ApplyConfig` with the
+  userspace ones. Deleted the construction; kept every value that escapes —
+  `result.PoolIDs` / `NextPoolID`, `result.NATCounterIDs`, the implicit
+  `_snat_match_<cidr>` entries in `result.AddrIDs`, the persistent-NAT table
+  (`GetPersistentNAT`, the file's one non-no-op dataplane call), and every
+  compile-failing rejection. `compileNPTv6` is untouched: it still writes
+  `nptv6_rules`, and retiring that plus the `maps_nat.go` writers is the
+  sibling cleanup. New `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms
+  every retired writer to FAIL and requires a clean validate on both marker
+  arms, so a reintroduced write reds by error propagation rather than by a
+  counter. 594 lines removed from compiler_nat.go (1428 -> 1066).
+- **File(s)**: pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
+    lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
+    so the #6476 cold-boot fence is no longer suppressed.
+  - **File(s)**: pkg/nftables/netlink_installer.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/daemon.go, pkg/daemon/lo0_vacated_enforced_6529_test.go,
+    pkg/nftables/netlink_lo0_zero_render_6529_test.go,
+    pkg/daemon/daemon_nft_netlink_testhelper_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go,
+    pkg/nftables/netlink_kernel_test.go, docs/host-inbound-service-matrix.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 — `Daemon.startClusterComms` was a 602-line constructor
+  wiring the whole cluster-comms stack. Extracted thirteen sub-constructions
+  into focused builders in a new `daemon_ha_comms_wiring.go`: VRF-device
+  resolution, HA watchdog heartbeat, sync-transport selection, session-sync
+  transport refs, fabric gRPC listeners, the config / peer-lifecycle /
+  remote-failover callback groups, cluster peer-failover hooks, fence wiring,
+  event-stream wiring, the auxiliary comms loops, and the fabric-forwarding
+  loops. `startClusterComms` drops 602 -> 233 lines and keeps only the
+  control-flow spine, because in a cluster bring-up constructor the ORDER is
+  the contract. Pure code motion: all thirteen bodies verified byte-identical
+  modulo indentation by an independent extract/normalise/diff verifier (10
+  exactly identical, 3 with a pure appended `return`), and a second verifier
+  proved the only lines that left `daemon_ha_sync.go` are those thirteen blocks
+  plus two now-unused imports and an orphaned `watchClusterEvents` doc comment.
+  Every argument is passed under the identifier it binds, and each such variable
+  was shown single-assignment before its moved consumer, so by-value parameters
+  are equivalent to the original by-reference captures. The five blocks that
+  `return` out of the constructor goroutine were deliberately left inline.
+  `daemon_ha_sync.go` left the refactor-audit WATCH tier (1585 -> 1245 LOC);
+  audit regenerated. `make test-failover` and a startup validation are OWED and
+  UNRUN.
+- **File(s)**: pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_comms_wiring.go, pkg/daemon/README.md,
+  docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 follow-up in the same PR — measured whether the wiring the
+  decomposition relocates is bound by any test. It was not: `go tool cover
+  -func` over `./pkg/daemon/` reports 0.0% statement coverage for all ten
+  builders inside the sync-constructor goroutine, and nilling ALL 30 wiring
+  assignments at once left `./pkg/daemon/` and `./pkg/cluster/` green — the
+  tests that call `startClusterComms` deliberately configure it to early-return
+  before the goroutine. Added `cluster_comms_wiring_bound_6428_test.go` binding
+  the 17 observable sites (15 `ss.*` handles + `d.syncPeerAddr{,1}`) by calling
+  each builder directly and asserting the installation, not the behaviour. The
+  first draft was VACUOUS: collecting func fields into a table of `any` boxes a
+  typed nil into a non-nil interface, so 14 of 17 unwire mutations stayed green;
+  rewritten with direct `== nil` comparisons and re-proven 17/17 RED, each
+  naming the dropped field. Remaining 13 sites (the `d.cluster.Set*` hooks plus
+  `ss.SetAuthProvider`/`SetSyncTransport`) have no getter on `cluster.Manager`
+  and stay unbound — reported, not silently relocated. Also recorded the
+  goroutine-lifecycle finding: `clusterCommsWG.Add(1)` occurs exactly once, so
+  only the constructor goroutine is joined and the other ten (including
+  `startHeartbeatWithRetry`) are cancel-only — the structural reason #7257 is
+  reachable. #7257 is NOT fixed here; it needs a lifecycle change, not a move.
+- **File(s)**: pkg/daemon/cluster_comms_wiring_bound_6428_test.go (new),
+  pkg/daemon/README.md, _Log.md
+
+## 2026-08-21 — #6311: node discriminator in the session-id namespace
+- **Timestamp**: 2026-08-21
+- **Action**: Fold a chassis-cluster node bit into the userspace session-id
+  namespace so an id adopted verbatim from the peer (#5212) can never collide
+  with a locally-minted one. `SessionTable::set_worker_id` becomes
+  `set_session_id_namespace(node_id, worker_id)` — namespace is
+  `node_bit << 15 | worker_id` in the high 16 bits — with the #6198 control-plane
+  reservation now guarding the COMBINED namespace and a new assert refusing a
+  worker id that would carry into the node bit. `node_id` is plumbed
+  Go config -> `ConfigSnapshot.node_id` -> `bring_up_workers` -> `spawn_workers`
+  -> `WorkerLaunchPlan` -> `worker_loop_setup`. Additive wire field, no protocol
+  version bump.
+- **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/worker/launch.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/setup.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/snapshot_node_id_6311_test.go,
+  pkg/daemon/daemon_ha_userspace_convert.go, docs/sync-protocol.md
+
+## 2026-08-21 — #6311: de-vacuum the adoption-collision test
+- **Timestamp**: 2026-08-21
+- **Action**: The mutation matrix showed
+  `adopted_peer_id_cannot_collide_with_a_local_id_6311` passing under the
+  node-bit-removal cell. It built the peer id as a hardcoded literal, so it
+  named a value the un-bitted allocator never produces — a probe keyed to the
+  fix, not to the property. Rewrote it to MINT the peer id from a real node-1
+  `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
+  It now reds under that cell (4 failures, was 3).
+- **File(s)**: userspace-dp/src/session/tests.rs
+
+## 2026-08-21 — #7253: split the modularity gate from the heatmap freshness gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: `TestHeatmapNotStale` fused two properties into one fatal
+  assertion — modularity ("a file is growing past the point where it should be
+  split", aimed at the author of the growth) and freshness ("the committed
+  global snapshot disagrees with the tree", aimed at whoever merges next). The
+  second could not stay true: the heatmap is a repo-GLOBAL snapshot, so any
+  file crossing 1500/2000 LOC anywhere flipped it for everyone. #7235, #7252
+  and #7254 each regenerated it inside one hour and #7252 was ALREADY STALE
+  when it merged; `pkg/dataplane/types.go` crossed the floor at exactly 1501
+  lines. Split per the issue's recorded decision (option 3). HARD half: new
+  `TestTouchedFileCrossedModularityThreshold` +
+  `scripts/refactoring-audit-touched.sh` — reds only when a file the BRANCH
+  TOUCHES crossed a floor, measured base-vs-worktree over
+  `git diff <merge-base(origin/master,HEAD)>` plus untracked files; it never
+  reads the artifact, is silent on master (empty changed set), and fails loudly
+  (exit 3) when the changed set is undeterminable rather than printing an empty
+  set. Escape hatch is a reasoned entry in
+  `docs/refactoring-audit-accepted.txt`. DEMOTED half:
+  `TestGlobalHeatmapFreshnessAdvisory` reports drift and never fails;
+  `scripts/refactoring-audit-refresh.sh` (`make audit-refresh`) regenerates and
+  commits it. `make audit-check` now exits 0 on every staleness and keeps exit 1
+  for a malformed artifact, so its verdict still agrees with the suite.
+  `$AUDIT_ROOTS_*` / `$AUDIT_FLOOR` / `audit_is_audited_path` moved into the
+  shared lib so the generator and the touched probe cannot drift; generator
+  output verified byte-identical after that refactor. Fail-on-revert for each
+  half, plus `TestTouchedGateIsNotASnapshotCompare` proving the hard half
+  disagrees with a repo-global snapshot compare in BOTH directions. Test tooling
+  only — no dataplane or control-plane code, so no cluster smoke is owed.
+- **File(s)**: pkg/refactoraudit/audit_touched_test.go (new),
+  pkg/refactoraudit/audit_jobs_test.go (new),
+  pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
+  scripts/refactoring-audit-touched.sh (new),
+  scripts/refactoring-audit-refresh.sh (new),
+  scripts/refactoring-audit-lib.sh, scripts/refactoring-audit.sh,
+  scripts/refactoring-audit-classify.sh,
+  docs/refactoring-audit-accepted.txt (new), docs/refactoring-audit.md,
+  docs/engineering-style.md, Makefile, _Log.md
+
+## 2026-08-21 — #6031 coverage salvage from the closed duplicate #7255
+- **Timestamp**: 2026-08-21
+- **Action**: Carried the 2 genuinely-uncovered contract cases from the closed
+  duplicate onto merged master, reframed for the merged API: an EMPTY
+  table-truth snapshot must still frame a real authoritative window (the #5085
+  empty-bulk skip, one layer down), and an empty owned-RG set is a determinate
+  answer rather than a precondition failure. Dropped 11 as duplicates or as
+  encoding the duplicate's own (in one case destructive) contract.
+- **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
+  pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)

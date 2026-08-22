@@ -51,12 +51,16 @@ func daemonMonotonicNanos() uint64 {
 //
 // The Rust dataplane's own stable id (`SessionTable::alloc_session_id`, #4915 —
 // carried across the cluster wire as the DISTINCT RTFlowSessionID, #5212) is
-// `(worker_id & 0xFFFF) << 48 | counter48`, where `worker_id` is a worker/queue
-// index (`set_worker_id`, userspace-dp/src/session/mod.rs). Reserving 0xFFFF for
-// the Go-minted ids keeps the two id spaces disjoint inside the shared BPF
-// conntrack mirror: the helper stamps its own id for sessions it owns, the
-// control plane stamps one of these for a peer-synced session it installs, and
-// neither can ever alias the other.
+// `namespace << 48 | counter48`, where the high-16 namespace is
+// `node_bit << 15 | worker_id` since #6311 (`set_session_id_namespace`,
+// userspace-dp/src/session/mod.rs): a 15-bit worker/queue index plus a
+// chassis-cluster node discriminator. Reserving 0xFFFF for the Go-minted ids
+// keeps the two id spaces disjoint inside the shared BPF conntrack mirror: the
+// helper stamps its own id for sessions it owns, the control plane stamps one of
+// these for a peer-synced session it installs, and neither can ever alias the
+// other. The #6311 re-partition preserved the reservation — 0xFFFF is node-bit-1
+// plus worker 0x7FFF, which the helper's namespace assert refuses — so this
+// constant is unchanged.
 const userspaceSyncedSessionIDNamespace = uint64(0xFFFF) << 48
 
 // userspaceSyncedSessionIDCounterMask is the low-48-bit counter space inside

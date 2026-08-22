@@ -69,7 +69,7 @@ func TestNetlinkInstallLoadsInKernel(t *testing.T) {
 	if err := in.InstallGapFence(gapFenceScenario()); err != nil {
 		t.Fatalf("gap fence install failed: %v", err)
 	}
-	if err := in.InstallLo0(lo0Scenario()); err != nil {
+	if _, err := in.InstallLo0(lo0Scenario()); err != nil {
 		t.Fatalf("lo0 install failed: %v", err)
 	}
 
@@ -173,7 +173,7 @@ func TestCounterReadbackThroughExistingReaders(t *testing.T) {
 func TestLo0CounterReadback(t *testing.T) {
 	enterPrivateNetns(t)
 	in := NewNetlinkInstaller()
-	if err := in.InstallLo0(lo0Scenario()); err != nil {
+	if _, err := in.InstallLo0(lo0Scenario()); err != nil {
 		t.Fatalf("lo0 install failed: %v", err)
 	}
 	counts, err := ReadLo0Counters()
