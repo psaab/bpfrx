@@ -32,6 +32,11 @@ xpf_enter_destructive_cluster_cell "test-failover $*" "$0" "$@"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test/incus/cluster-env.sh
 source "${SCRIPT_DIR}/cluster-env.sh"
+# #7368: deploy_reassert_node0_primary_ok (the per-RG primacy predicate #6591
+# added) and failover_ownership_verdict, both covered by
+# `make test-deploy-lib` against a mocked incus.
+# shellcheck source=test/incus/deploy-lib.sh
+source "${SCRIPT_DIR}/deploy-lib.sh"
 
 IPERF_TARGET="${IPERF_TARGET:-$IPERF_TARGET4}"
 IPERF_DURATION=120      # seconds — long enough to span retries + reboot + failback
@@ -50,6 +55,12 @@ pass()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
 fail()  { echo "  FAIL  $*"; FAIL=$((FAIL + 1)); ERRORS+=("$*"); }
 
 die() { echo "FATAL: $*" >&2; exit 2; }
+# #7368: a PRECONDITION failure is not a failover regression, and neither is an
+# ownership/forwarding divergence. All three used to exit 2, so `FO_RC=2` was
+# read as "failover broke" when it meant "the cluster was not in a state to
+# test" — twice, on the shared gate, against changes that were not at fault.
+die_precondition() { echo "FATAL[PRECONDITION]: $*" >&2; exit 2; }
+die_divergence()   { echo "FATAL[DIVERGENCE]: $*" >&2; exit 3; }
 
 instance_running() {
 	local status
@@ -85,12 +96,22 @@ for rg in 0 1 2; do
 done
 sleep 2
 
-# Verify fw0 is primary
+# Verify fw0 is primary for EVERY redundancy group.
+#
+# #7368: this was `grep -q "node0.*primary"` over the whole status output.
+# `secondary` does not contain `primary`, so that part was sound — but the grep
+# is not scoped to a redundancy group, so a cluster with node0 SECONDARY for
+# RG0 and primary for RG1 satisfied it. The reassert makes node0 primary for
+# all RGs, and the post-failover phase below already asserts all three, so the
+# precondition should be the same shape. deploy_reassert_node0_primary_ok is
+# the predicate #6591 added and `make test-deploy-lib` covers; reusing it keeps
+# one definition of "node0 is primary" rather than a second grep that can drift.
 fw0_status=$(incus exec "$FW0" -- cli -c 'show chassis cluster status' 2>/dev/null)
-if echo "$fw0_status" | grep -q "node0.*primary"; then
-	pass "fw0 is primary"
+if printf '%s\n' "$fw0_status" | deploy_reassert_node0_primary_ok; then
+	pass "fw0 is primary for every redundancy group"
 else
-	die "fw0 is not primary — cannot run failover test"
+	die_precondition "fw0 is not primary for every redundancy group — cannot run the failover test. This is a PRECONDITION failure, NOT a failover regression: the cluster was not in a testable state before the change under test ran. Check the post-deploy reassert (#6591) and re-read the state directly:
+$fw0_status"
 fi
 
 # Verify iperf target reachable
@@ -180,10 +201,33 @@ for _ in $(seq 1 20); do
 	[[ "$fw0_sessions" -ge "$MIN_SESSIONS" ]] && break
 	sleep 0.5
 done
+# #7368: cross-reference the two independent checks this script already
+# performs before deciding WHICH failure this is.
+#
+# Primacy is read from `show chassis cluster status` — a field the node reports
+# about itself, with no oracle. The session count is a real measurement. They
+# were never compared, so #6656's divergence (node0 primary with 1 session,
+# node1 carrying 33) surfaced here as "streams did not establish" — a shortfall
+# attributed to whatever change was under test, when the actual failure was
+# that ownership and forwarding disagreed.
+#
+# The peer count is read ONLY on the shortfall path, so the healthy run pays
+# nothing. failover_ownership_verdict is pure and selftested.
 if [[ "$fw0_sessions" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw0 has $fw0_sessions established sessions"
 else
-	fail "fw0 has only $fw0_sessions established sessions (expected >= $MIN_SESSIONS)"
+	fw1_probe=$(incus exec "$FW1" -- cli -c \
+		"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
+	case "$(failover_ownership_verdict "$fw0_sessions" "$fw1_probe" "$MIN_SESSIONS")" in
+	diverged)
+		die_divergence "OWNERSHIP AND FORWARDING DISAGREE. fw0 reports PRIMARY for every redundancy group but carries only $fw0_sessions session(s), while fw1 — reported secondary — carries $fw1_probe. The cluster-state field and the traffic disagree, so neither 'failover is broken' nor 'the streams did not establish' is the right reading; see #6656. Read both nodes directly before re-running:
+  incus exec $FW0 -- cli -c 'show chassis cluster status'
+  incus exec $FW1 -- cli -c 'show chassis cluster status'"
+		;;
+	*)
+		fail "fw0 has only $fw0_sessions established sessions (expected >= $MIN_SESSIONS); fw1 carries $fw1_probe, so this is an establishment failure rather than an ownership/forwarding divergence"
+		;;
+	esac
 fi
 
 # ── Phase 2: Wait for session sync ──────────────────────────────────
