@@ -1023,6 +1023,12 @@ var urlErrorProducers = map[string]bool{
 	// chooses that string outright. It rendered with %w at
 	// backend_route53.go:203.
 	"xml.Unmarshal": true,
+	// json.Unmarshal was the gap at #6634, and it is FILE-SCOPED — see
+	// producerFileScope below. Go's JSON decoder quotes the offending input
+	// back ("json: cannot unmarshal number 9876543210… into Go struct field"),
+	// and the Cloudflare backend decodes a PROVIDER-CHOSEN response body, so
+	// that string is attacker-selected. Three sites rendered it with %w.
+	"json.Unmarshal": true,
 	// readCappedBody was the gap this list had at round 10. doRequest has TWO
 	// adjacent error returns; .Do covered the first, and the second — four
 	// lines below it — rendered readCappedBody's error with %w and no producer
@@ -1098,7 +1104,7 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 			}
 			aliases := importAliases(file)
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				for _, site := range urlErrorHandlers(n, aliases) {
+				for _, site := range urlErrorHandlers(n, name, aliases) {
 					sites++
 					bad := unscrubbedUses(fset, site.stmts, site.errVar, aliases)
 					for _, pos := range bad {
@@ -1237,13 +1243,13 @@ type handlerSite struct {
 //	if err != nil { return fmt.Errorf("...: %w", err) }
 //
 // from reading as a leak.
-func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
+func urlErrorHandlers(n ast.Node, file string, aliases map[string]string) []handlerSite {
 	switch node := n.(type) {
 	case *ast.BlockStmt:
 		// Shape 1: the assignment is a preceding statement in the same block.
 		var sites []handlerSite
 		for i := 0; i+1 < len(node.List); i++ {
-			errVar, producer := producedErrVar(node.List[i], aliases)
+			errVar, producer := producedErrVar(node.List[i], file, aliases)
 			if errVar == "" {
 				continue
 			}
@@ -1264,7 +1270,7 @@ func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
 		if node.Init == nil {
 			return nil
 		}
-		errVar, producer := producedErrVar(node.Init, aliases)
+		errVar, producer := producedErrVar(node.Init, file, aliases)
 		if errVar == "" || !testsErrVar(node.Cond, errVar) {
 			return nil
 		}
@@ -1273,9 +1279,34 @@ func urlErrorHandlers(n ast.Node, aliases map[string]string) []handlerSite {
 	return nil
 }
 
+// producerFileScope narrows a producer to the files where its error can carry
+// FOREIGN bytes. Only json.Unmarshal needs it, and the scope is a PREDICATE, not
+// a list of sites: an entry naming individual files would go stale the moment a
+// backend was added, and would fail OPEN in exactly the direction that matters.
+//
+// json.Unmarshal decodes two completely different things in this package. In a
+// `backend_*.go` file it decodes a PROVIDER RESPONSE BODY, so the decoder quotes
+// bytes an untrusted party chose. In state.go it decodes the ownership state
+// file this daemon wrote itself, at a root-owned path — an attacker who can
+// choose those bytes already has root, and the decoder's detail ("invalid
+// character '}' after object key") is the whole diagnostic an operator gets when
+// repairing a corrupt store. Scrubbing that would cost a real capability and
+// close nothing.
+//
+// This is a SCOPE, not an exemption: it says where a call can carry foreign
+// input, not that a known-unsafe site is tolerated. Any NEW backend file is
+// covered automatically, which is the direction a scope has to fail.
+// TestProviderDecodeScopeIsLoadBearing_6634 pins both halves.
+func producerFileScope(callee, file string) bool {
+	if callee == "json.Unmarshal" {
+		return strings.HasPrefix(file, "backend_")
+	}
+	return true
+}
+
 // producedErrVar returns the name of the error variable assigned from a
 // URL-bearing call, or "" if the statement is not such an assignment.
-func producedErrVar(stmt ast.Stmt, aliases map[string]string) (errVar, producer string) {
+func producedErrVar(stmt ast.Stmt, file string, aliases map[string]string) (errVar, producer string) {
 	assign, isAssign := stmt.(*ast.AssignStmt)
 	if !isAssign || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
 		return "", ""
@@ -1285,7 +1316,7 @@ func producedErrVar(stmt ast.Stmt, aliases map[string]string) (errVar, producer 
 		return "", ""
 	}
 	callee := calleeName(call.Fun, aliases)
-	if !urlErrorProducers[callee] {
+	if !urlErrorProducers[callee] || !producerFileScope(callee, file) {
 		return "", ""
 	}
 	last, isIdent := assign.Lhs[len(assign.Lhs)-1].(*ast.Ident)

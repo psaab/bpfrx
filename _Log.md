@@ -28,6 +28,154 @@
   pkg/cli/command_output_termsafe_6584_test.go,
   pkg/ipsec/sa_status_termsafe_6584_test.go, pkg/cli/README.md
 
+## 2026-08-22 — #6612 destination-scoped junos-host permit: the missing advisory clause
+
+- **Timestamp**: 2026-08-22
+- **Action**: Landed the one clause the #6612 audit found missing. A
+  `to-zone junos-host` permit narrowed on DESTINATION (or carrying
+  `destination-address-excluded`) rendered no kernel rule AND produced
+  ZERO warnings of any kind: `junosHostProjectTerm` already refused to
+  render it, while `junosHostPolicyStricterThanCoarseGate` admitted a
+  permit as stricter-than-coarse only through
+  `junosHostPolicySourceScoped`, which inspects the source dimension
+  alone. The advisory now keys on the SAME expression the projection
+  applies (`junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded`) rather than a second copy — a divergence
+  between "the projection refuses to render it" and "the warning says
+  so" is always a bug, which is the discriminator for single-sourcing
+  over binding two copies with an agreement test. Restored the two table
+  rows so each asserts BOTH halves in one cell. Measured, rather than
+  assumed, that a fixture cannot make both halves gate-sensitive at
+  once: the rules half needs a CONCRETE permit source (with
+  `source-address any` the permit sets permitAllV4 and shadows every
+  later deny, so nothing renders with or without the projection gate),
+  while the warning half needs NO concrete source (or it warns through
+  the source predicate and says nothing about the destination
+  dimension). The class is therefore bound by a table row plus the
+  separate widening test, and the doc records why so neither is
+  "simplified" into the other later. Re-shaped the excluded row to
+  `destination-address any` + excluded so the two disjuncts localise
+  independently. Three one-line mutations, each `go vet` clean at the
+  mutated state, each reddening exactly one row: dropping the named
+  disjunct reds only `dst-permit`, dropping the excluded disjunct reds
+  only `dstx-permit`, and dropping the projection gate reds only the
+  widening test's two subtests and none of the table rows — the split
+  the doc describes, confirmed by measurement.
+- **File(s)**: `pkg/config/compiler_validate_warn_host_inbound.go`,
+  `pkg/dataplane/userspace/junos_host_residual_6612_test.go`,
+  `docs/host-inbound-service-matrix.md`
+## 2026-08-21 — #6622 kernel promote gate: a refusal now leaves a durable record
+
+- **Timestamp**: 2026-08-21
+- **Action**: The boot gate exits 0 on every path (deliberately — a non-zero
+  exit trips the unit's `OnFailure=` and reboots the box over what may be a
+  transient packaging window) and the unit is `Type=oneshot` +
+  `RemainAfterExit=yes`, so `systemctl status xpf-kernel-promote` read SUCCESS
+  and stayed active even when the gate REFUSED and the armed candidate was
+  running unverified. The only signal was a journald line, which journal
+  rotation removes.
+
+  `refuse()` now writes `/var/lib/xpf/kernel-promote-refusal`, one `key=value`
+  per line, carrying the discovery-snapshot facts the DECISION was made on
+  (`LoadState`, `MainPID`, `ControlGroup`, raw `ExecStart`), the journal bit,
+  the cause, the branch-specific advice, a timestamp and the boot id. Read by
+  `upgrade.ReadRefusalRecord` and surfaced through `ChannelStatus` /
+  `RenderChannelStatus`, so `show system kernel-upgrade`, the console CLI, the
+  remote `cli` and the status RPC all get it without touching `pkg/cli` or
+  `pkg/grpcapi`. The unit still exits 0 and still does not trip `OnFailure=`;
+  a test asserts that rather than assuming it.
+
+  The indeterminate-journal WARNING writes one too, as
+  `disposition=indeterminate`. That is what makes the record's ABSENCE
+  meaningful: if only `refuse()` wrote one, "no record" could not distinguish
+  a clean boot from a boot the gate skipped for the other reason. The quiet
+  "nothing to promote" branch and the post-exec `rc` paths deliberately write
+  nothing — the first is the ordinary boot, the second is where the Go half
+  already owns the durable state.
+
+  The record does NOT duplicate the candidate version: the gate reads the JSON
+  journal for one bit and never for a value, so the candidate is joined in Go
+  by `ReadChannelStatus`, which is accurate because a refusal never transitions
+  the journal.
+
+  Tightened `ReadRefusalRecord` while writing its test: counting `=`-bearing
+  lines rather than RECOGNISED keys let a file whose only fields are unknown
+  parse as a refusal with every field empty, rendering a REFUSED banner made
+  entirely of dashes. The first draft of the test could not see it — its own
+  fixture text contained the literal "key=value".
+- **File(s)**: `scripts/image/xpf-kernel-promote`,
+  `scripts/image/test_kernel_promote_explicit_path.py`,
+  `pkg/upgrade/kernel_promote_refusal.go` (new),
+  `pkg/upgrade/kernel_promote_refusal_6622_test.go` (new),
+  `pkg/upgrade/kernel_status.go`, `pkg/upgrade/kernel_run.go`,
+  `pkg/upgrade/kernel_arm_record.go`, `docs/in-place-upgrade.md`, `_Log.md`
+
+## 2026-08-21 — #6612 junos-host residual: audited the claim, found it false, locked what holds
+
+- **Timestamp**: 2026-08-21
+- **Action**: Audited #6612's closing claim — "each affected policy
+  emits the #4168 commit warning naming itself" — against the real
+  compile+validate path rather than the prose. It is FALSE for one
+  member: a `to-zone junos-host` permit narrowed on DESTINATION (or
+  carrying `destination-address-excluded`) renders no kernel rule AND
+  emits ZERO warnings of any kind, so the commit is clean and nothing
+  enforces. The projection already marks it un-representable
+  (`junosHostProjectTerm`), but the warning's
+  `junosHostPolicyStricterThanCoarseGate` admits a permit only through
+  `junosHostPolicySourceScoped`, which inspects the SOURCE dimension
+  alone; the two halves disagree. The one-clause fix (key the warning on
+  the same `junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded` expression the projection uses) lands in
+  pkg/config, outside this lane's file surface, so it is handed over
+  rather than applied here and #6612 stays open for it. Also corrected a
+  second error shared by the issue and the module doc: a PURE multi-term
+  application is NOT un-representable — it compiles to an implicit
+  application-SET and is fully OR-expanded, so the deny IS enforced and
+  the real hazard is the inverse (a partial expansion renders a kernel
+  deny silently narrower than authored); only a MIXED direct+term
+  application is un-representable, and the strict structure gate rejects
+  that at commit. Shipped a residual coverage lock: one row per class,
+  each asserting BOTH halves and each carrying a FLIP (the same fixture
+  with the residual attribute neutralised) so no row can pass because a
+  fixture was broken some other way. Four one-line mutations against the
+  production gates, each `go vet` clean and each reddening only its own
+  row: scheduler gate, ALG gate, application-set expansion truncated to
+  its first member, and the destination-scoped-permit gate. The fourth
+  found a defect in this lane's own first draft — a lone
+  destination-scoped permit renders nothing whether or not the gate
+  exists, so the test as first written was mutation-INSENSITIVE; it was
+  rebuilt around a permit ahead of a DENY, which is the only shape in
+  which the gate changes a packet verdict, and now reds. Filed #7374 for
+  the third dimension (an APPLICATION-scoped permit, same silent shape),
+  deliberately not folded in because it needs a comparison against the
+  zone's effective admit set rather than a token test.
+- **File(s)**: `pkg/dataplane/userspace/junos_host_residual_6612_test.go`
+  (new), `docs/host-inbound-service-matrix.md`
+
+## 2026-08-21 — #6585 syslog wire sanitized at the Send boundary
+
+- **Timestamp**: 2026-08-21
+- **Action**: `SyslogClient.Send` now runs
+  `termsafe.SanitizeForDisplay` on the message before it becomes a frame
+  — the LAST boundary before the wire, so no producer can bypass it
+  (the producers are any slog attribute in the daemon). Single-line
+  variant deliberately: the block variant PRESERVES LF, which is a
+  record delimiter in RFC 3164. Placed before the format branch so both
+  RFC 3164 and RFC 5424 are covered.
+  Verified the live producer FIRSTHAND: Route 53's `e.Error.Code` /
+  `e.Error.Message` (`backend_route53.go:197`) and Cloudflare's
+  `cfErrors(env)` are decoded from the PROVIDER's response body and flow
+  into `slog.Warn(..., "err", err)` in `pkg/ddns/surface_a.go`.
+  SEVERITY: log injection + deferred terminal injection, NOT command
+  injection — no exec path is involved.
+  Mutation matrix 4/4 RED: Y1 no sanitize, Y2 block variant (LF kept),
+  Y3 only the RFC3164 branch, Y4 strip instead of escape.
+  NOTE: the first frame-count test was VACUOUS — over UDP one Send is
+  one datagram regardless, and the Y2 cell proved it by staying green.
+  Replaced with an embedded-LF assertion, which is the property that
+  actually determines collector behaviour and which Y2 reds.
+- **File(s)**: pkg/logging/syslog.go,
+  pkg/logging/syslog_attr_sanitize_6585_test.go, pkg/logging/README.md
 ## 2026-08-21 — #6631 kernel arm: refuse a journal path the boot gate cannot read
 
 - **Timestamp**: 2026-08-21
@@ -132,6 +280,41 @@
 - **File(s)**: pkg/routing/rules.go, pkg/routing/rules_6467_test.go,
   pkg/routing/README.md
 
+## 2026-08-21 — #6634 ddns: provider RESPONSE TEXT is bounded and shape-filtered
+
+- **Timestamp**: 2026-08-21
+- **Action**: Four backends rendered text from the PROVIDER'S response BODY
+  straight into a returned error the daemon logs and retains as `lastErr`:
+  Cloudflare `Errors[].Message`, Route 53 decoded `Code`/`Message`, and the
+  unrecognized first response line on dyndns2 and DuckDNS — plus three
+  Cloudflare `json.Unmarshal` sites rendering the decoder error with `%w`.
+  No hostile transport is needed, only an API that echoes the request back;
+  DuckDNS carries its token in the QUERY STRING, so the echo IS the credential.
+  MEASURED FIRST, and it changed the fix: two thirds of the issue's surface was
+  already closed elsewhere. `termsafe.SanitizeForDisplay` covers both `show
+  services ddns` surfaces (#6468) and the daemon's `slog.TextHandler`
+  `strconv.Quote`s any non-printable byte, so control-character forgery cannot
+  split a journal line. What neither closes is a CREDENTIAL in the bytes or
+  64 KiB of them. So the fix is a bound plus a URL/userinfo shape filter, NOT
+  an escape.
+  `scrubProviderText` is total on LENGTH (`maxProviderTextBytes`, plus a COUNT
+  bound on the Cloudflare envelope — a per-message cap is not a bound when the
+  provider picks the array length) and partial on SHAPE, and says so: a
+  credential echoed as bare prose is indistinguishable from a word. Filter
+  BEFORE bounding, since the other order splits a URL at the cap and leaves
+  `https://user:PA` rendered. Route 53's returned code/message are NOT scrubbed
+  — `r53DeleteAlreadyGone` classifies delete-idempotency on the raw text, so
+  scrubbing the value would change a control decision; only the render goes
+  through the scrubber.
+  The class gate gained `json.Unmarshal`, FILE-SCOPED: it decodes a provider
+  body in `backend_*.go` and this daemon's own state file in `state.go`. The
+  scope is a predicate, not a site list, so a new backend file is covered
+  automatically.
+- **File(s)**: `pkg/ddns/backend_http.go`, `pkg/ddns/backend_cloudflare.go`,
+  `pkg/ddns/backend_route53.go`, `pkg/ddns/backend_dyndns2.go`,
+  `pkg/ddns/backend_duckdns.go`,
+  `pkg/ddns/provider_response_text_6634_test.go` (new),
+  `pkg/ddns/url_render_class_6545_test.go`, `pkg/ddns/README.md`
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
@@ -102075,3 +102258,21 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6615 — repo-wide dangling doc-citation gate (pkg/docsref) with a
+    grandfathered ratchet baseline; corrected 4 provable research/->pr/ cite
+    relocations. Sweep found 53 dangling paths across live (non-archive) files.
+  - **File(s)**: pkg/docsref/{doc.go,docsref_test.go,testdata/known_dangling.txt},
+    docs/fairness-regimes.md, docs/pr/1863-realization-gap/plan.md,
+    docs/pr/1864-toolchain-pin/reviewer-ids.md,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/{epoch.rs,rotate_epoch_v8.rs}
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6625 — the #1798 control-character gate rendered a credential
+    leaf's VALUE into its error (twice: path + quoted value). Now reports the
+    byte class and offset instead, for credential leaves only. `community` is
+    path-qualified (secret under snmp, a BGP route-target name elsewhere).
+  - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
+    pkg/config/secret_in_error_6625_test.go

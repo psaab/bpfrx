@@ -1063,7 +1063,7 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   bytes each worker ASKED of (every `acquire_v8` call with
   `requested > 0`, granted or not) and was GRANTED by a CoS queue's
   shared v8 lease. The pair is the honored-realization-gap attribution
-  instrument (docs/research/1863-realization-gap/plan.md section 5): on
+  instrument (docs/pr/1863-realization-gap/plan.md section 5): on
   an undergranting class, a worker with requested >> granted was
   share-bounded while asking (share/demand mismatch), while a worker
   with near-zero requested despite class backlog never sampled its

@@ -1702,13 +1702,74 @@ emits nothing and every one of its policies keeps the warning — never a deny
 widened past the permit's destination scope.
 
 **Un-representable remainder (keeps the commit warning below):** feed-tainted
-source **or destination**, multi-term / ALG application, an application scoped
-to an IPsec/ident exempt tuple, a **destination-scoped `permit`**, a
-scheduler-gated policy, a `tcp-rst` ingress zone (silent drop would diverge from
-Junos's RST verdict class), `reject`, and the "deny non-permitted" half of a
-source-restricted `permit` (the reject and source-restricted-permit slices are
-tracked follow-ups using the identical machinery). No partial/coarsened kernel
-rule is ever emitted for the remainder.
+source **or destination**, a **MIXED direct+term** or ALG-bearing application, an
+application scoped to an IPsec/ident exempt tuple, a **destination-scoped or
+destination-excluded `permit`**, a scheduler-gated policy, a `tcp-rst` ingress
+zone (silent drop would diverge from Junos's RST verdict class), `reject`, and
+the "deny non-permitted" half of a source-restricted `permit` (the reject and
+source-restricted-permit slices are tracked follow-ups using the identical
+machinery). No partial/coarsened kernel rule is ever emitted for the remainder.
+
+A **pure multi-term** application is NOT in that remainder, contrary to earlier
+revisions of this paragraph. A `term`-bearing application with no direct match
+body compiles to an implicit application-SET — the parent struct is discarded and
+each term is stored as its own application (`compiler_applications.go`) — so
+`junosHostResolveApplications` takes the application-set branch and OR-expands
+every term into its own L4 fragment, exactly as the representable subset above
+describes for application-sets. The deny IS enforced, so the hazard on this row
+is the inverse of the one previously documented: a PARTIAL expansion would render
+a kernel deny **silently narrower** than authored. Only a MIXED direct+term
+application is un-representable (`MixedDirectTermApps`), and the strict structure
+gate hard-rejects that at commit before it can reach the projection.
+
+**Each member of this remainder owes BOTH halves.** "No kernel rule is rendered"
+AND "the #4168 warning fires naming the policy" — either alone is satisfiable by
+a bug, and a policy that renders nothing while saying nothing is the silent
+failure this projection exists to avoid.
+`pkg/dataplane/userspace/junos_host_residual_6612_test.go` asserts both halves per
+class, and gives every row a FLIP (the same fixture with the residual attribute
+neutralised) so a row cannot pass because the fixture was broken in some other
+way. Covered today: scheduler-gated deny, feed-bound source, feed-bound
+destination, `reject`, `tcp-rst` zone, ALG application, IKE-exempt-tuple
+application, source-restricted permit.
+
+A destination-scoped `permit` was silent on BOTH halves until #6612: it rendered
+nothing and produced **zero warnings of any kind**. The projection correctly
+refused to render it (`junosHostProjectTerm`: `p.Action != PolicyDeny &&
+(junosHostAddrScoped(dest) || DestinationAddressExcluded)`), but
+`junosHostPolicyStricterThanCoarseGate`
+(`pkg/config/compiler_validate_warn_host_inbound.go`) admitted a permit as
+stricter-than-coarse only through `junosHostPolicySourceScoped`, which inspects
+the SOURCE dimension alone. One system held both beliefs: the projection knew it
+could not enforce the policy, and the advisory never said so. The warning now
+keys on the SAME expression the projection applies — deliberately not a second
+copy of the condition, because a divergence between the two is always a bug.
+`destination-address-excluded` is covered as its own disjunct, so a config using
+the inverted form is not left with a residual of the bug's own shape.
+
+**Worse than silence — the shape to remember.** A destination-scoped permit
+followed by a deny emitted exactly ONE warning, and it named the **deny**. An
+operator saw output, reasonably concluded the config had been checked, and the
+policy that silently enforced nothing was not the one named. A partial signal
+that points at the wrong policy is more dangerous than no signal, which at least
+invites suspicion.
+
+**Why this class needs two fixtures.** The two halves cannot be made
+gate-sensitive by one config, and the reason is structural. For the RULES half to
+red when the projection's destination gate is removed, the permit needs a
+CONCRETE source — with `source-address any` it sets `permitAllV4` and shadows
+every later deny outright, so nothing renders either way. For the WARNING half to
+red when the advisory clause is removed, the permit must NOT be source-scoped, or
+it warns through the source predicate and proves nothing about the destination
+dimension. The two requirements are mutually exclusive, so the class is bound by a
+table row (source `any`, pinning the advisory clause) plus
+`TestJunosHostDestinationScopedPermitDoesNotWidenALaterDeny6612` (concrete source
+ahead of a deny, pinning the projection gate).
+
+The third dimension, an APPLICATION-scoped permit, has the same silent shape and
+is tracked separately in #7374: it needs a comparison against the zone's
+EFFECTIVE admit set rather than a token test, because a syntactic
+"application != any" rule would warn on configs that have no gap at all.
 
 ### Commit-time warning (direction c — shipped; now suppressed on render)
 

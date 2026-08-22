@@ -94,6 +94,51 @@ reports.
 - Never put `slog.Info` inside per-session, per-packet, or per-poll-tick
   loops.
 
+## Control bytes never reach the syslog wire (#6585)
+
+`SyslogClient.Send` runs `termsafe.SanitizeForDisplay` on the message
+before it becomes a frame. That is the LAST boundary before the wire and
+every caller passes through it, which is the point: the producers are
+open-ended — any `slog` attribute anywhere in the daemon — so a
+per-producer fix rots on the next one.
+
+**Why the local copy was already safe and this one was not.** Go's
+standard `slog` text handler quotes non-printing attribute values, so the
+stderr/journald copy is protected. `SyslogSlogHandler` deliberately
+bypasses that path to build the syslog framing itself (`formatRecord`
+rebuilds attributes with a raw `slog.Value.String()`), and reintroduced
+the raw value.
+
+**A proven live producer.** DDNS provider error text reaches
+`slog.Warn(..., "err", err)` in `pkg/ddns/surface_a.go`, and that error
+embeds the PROVIDER's decoded response body — Route 53's `e.Error.Code` /
+`e.Error.Message` and Cloudflare's `cfErrors(env)`. A hostile,
+compromised or MITM'd DDNS endpoint therefore gets its bytes onto the
+operator's remote syslog.
+
+**Two consequences, both worse than the terminal case** because syslog is
+aggregated and long-retained:
+
+1. **Log injection.** RFC 3164 has no length prefix, so a bare LF is a
+   record delimiter — a collector writing records to a file, or a relay
+   forwarding with RFC 6587 non-transparent framing, reads the payload as
+   an additional record with an arbitrary priority, timestamp and host.
+2. **Deferred terminal injection.** ESC/CSI stored verbatim in the
+   collector fires whenever an operator later `cat`s or `tail`s the
+   archive.
+
+**Variant choice matters here.** `SanitizeForDisplay` (single-line), NOT
+`SanitizeBlockForDisplay` — the block variant deliberately PRESERVES LF,
+which is correct for a multi-line table and exactly wrong for a single
+syslog frame.
+
+**Placement matters too.** The call sits before the format branch, so
+both RFC 3164 and RFC 5424 (`sd-syslog`) are covered; which format is
+live is an operator config choice, not a property of the code. The
+sanitizer's allocation-free fast path means an already-clean record — every
+ordinary one — pays a scan and no allocation, which is what keeps this
+acceptable on the shared dataplane event path described below.
+
 ## Syslog stream-transport resilience (#2283)
 
 `SyslogClient.Send` / `SendBinary` are reached on the SHARED dataplane

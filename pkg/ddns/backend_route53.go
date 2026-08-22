@@ -194,7 +194,13 @@ func (b *route53Backend) listRRSet(ctx context.Context, name, rtype string) (r53
 	if cerr := classifyHTTPStatus(code); cerr != nil {
 		var e r53ErrorXML
 		if xml.Unmarshal(raw, &e) == nil && e.Error.Code != "" {
-			return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: %s: %s: %w", b.name, e.Error.Code, e.Error.Message, cerr)
+			// SECURITY (#6634): Code and Message are decoded from a
+			// PROVIDER-CHOSEN response body and were rendered verbatim with %s
+			// into an error the daemon logs and retains as lastErr. Scrub and
+			// bound both; an API that echoes the request back would otherwise
+			// put our own credentialed update URL in the journal.
+			return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: %s: %s: %w", b.name,
+				scrubProviderText(e.Error.Code), scrubProviderText(e.Error.Message), cerr)
 		}
 		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: %w", b.name, cerr)
 	}
@@ -288,7 +294,14 @@ func (b *route53Backend) change(ctx context.Context, action, name, rtype string,
 		// Surface the Route 53 error code/message when present (never the creds).
 		var e r53ErrorXML
 		if xml.Unmarshal(raw, &e) == nil && e.Error.Code != "" {
-			return e.Error.Code, e.Error.Message, fmt.Errorf("ddns route53: %s: %s: %s: %w", b.name, e.Error.Code, e.Error.Message, cerr)
+			// SECURITY (#6634): the RENDER is scrubbed and bounded, the RETURNED
+			// values are not. r53DeleteAlreadyGone classifies delete-idempotency
+			// on the raw code/message ("but it was not found"), so scrubbing the
+			// values would change a control decision, not just a log line — a
+			// withheld token could turn an idempotent delete into a permanent
+			// retry. Only what reaches the error text goes through the scrubber.
+			return e.Error.Code, e.Error.Message, fmt.Errorf("ddns route53: %s: %s: %s: %w",
+				b.name, scrubProviderText(e.Error.Code), scrubProviderText(e.Error.Message), cerr)
 		}
 		return "", "", fmt.Errorf("ddns route53: %s: %w", b.name, cerr)
 	}
