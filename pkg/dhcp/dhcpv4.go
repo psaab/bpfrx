@@ -407,20 +407,52 @@ func leaseFromACKv4(ifaceName string, ack *dhcpv4.DHCPv4) (*Lease, error) {
 // route is installed — the server's explicit choice). A malformed entry
 // (bad mask, short buffer) is skipped rather than failing the whole lease.
 func classlessStaticRoutes(ack *dhcpv4.DHCPv4) (routes []LeaseRoute, defaultGW netip.Addr, present bool) {
+	// #6756: PRESENCE is whether the server RETURNED the option, not whether it
+	// parsed. RFC 3442 is explicit — "If the DHCP server returns both a Classless
+	// Static Routes option and a Router option, the DHCP client MUST ignore the
+	// Router option" — and it conditions that on the option being RETURNED. A
+	// zero-length or malformed option 121/249 is still returned.
+	//
+	// Deriving presence from len(parsedRoutes) != 0 collapsed three distinct
+	// cases — absent, present-but-empty, present-but-unparseable — into one
+	// false, so the caller fell through to option 3 in exactly the situations
+	// the RFC forbids it. A server that means "no default route via option 3"
+	// and emits a malformed 121 got the router honoured anyway.
+	//
+	// Read the raw option slots directly. gopacket-style accessors cannot
+	// express "present but unusable": ClasslessStaticRoute() maps any per-entry
+	// error to nil, and the option-249 branch below discards its parse error.
+	_, has121 := ack.Options[uint8(dhcpv4.OptionClasslessStaticRoute)]
+	_, has249 := ack.Options[249]
+	present = has121 || has249
+
 	libRoutes := ack.ClasslessStaticRoute() // option 121
 	if len(libRoutes) == 0 {
 		// Legacy option 249 (Microsoft), identical RFC 3442 encoding.
 		if raw := ack.Options.Get(dhcpv4.GenericOptionCode(249)); len(raw) > 0 {
 			var r dhcpv4.Routes
-			if err := r.FromBytes(raw); err == nil {
+			if err := r.FromBytes(raw); err != nil {
+				// #6756: previously discarded silently. The option is still
+				// PRESENT, so option 3 stays suppressed either way — but an
+				// operator whose default route vanished deserves to know the
+				// server sent something unparseable rather than nothing.
+				slog.Warn("dhcp: classless-static-route option 249 is malformed; ignoring its contents (option 3 stays suppressed per RFC 3442)",
+					"err", err, "len", len(raw))
+			} else {
 				libRoutes = r
 			}
 		}
 	}
-	if len(libRoutes) == 0 {
+	if !present {
 		return nil, netip.Addr{}, false
 	}
-	present = true
+	if len(libRoutes) == 0 {
+		// Present but yielding nothing usable. Return present=true so the caller
+		// does NOT fall back to option 3.
+		slog.Warn("dhcp: classless-static-route option present but yielded no usable routes; option 3 (router) is suppressed per RFC 3442",
+			"option_121", has121, "option_249", has249)
+		return nil, netip.Addr{}, true
+	}
 	for _, lr := range libRoutes {
 		if lr == nil || lr.Dest == nil {
 			continue

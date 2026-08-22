@@ -187,7 +187,11 @@ var managerMethodClasses = map[string]string{
 	"XDPEntryPrograms":   "catG",
 	"IsVLANSubInterface": "catG",
 	"SetLinkForTest":     "catG",
-	"DetachTC":           "catG", // reads only the construction link map
+	// #6741: a pure read of the observability counter under m.mu. It changes no
+	// behaviour and needs no armed state, so it classifies with the other
+	// registry-state reads.
+	"ObsoleteRegistryAccesses": "catG",
+	"DetachTC":                 "catG", // reads only the construction link map
 	// DetachXDP's single label is category G (its direct access is the
 	// construction link map) with the class-3-LIKE delegation target
 	// setXDPAttachedFlag: scoped lookups, cleanup always runs, NO gate.
@@ -243,8 +247,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 163 {
-		t.Fatalf("exported *Manager method inventory = %d, want 163 (the plan census 157 + the two #6743 r4 additions + ReplaceFloodCounterOffsets (#3651) + the three #6740 additions: XDPEntryPrograms, IsVLANSubInterface, SetLinkForTest); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 164 {
+		t.Fatalf("exported *Manager method inventory = %d, want 164 (the plan census 157 + the two #6743 r4 additions + ReplaceFloodCounterOffsets (#3651) + the three #6740 additions: XDPEntryPrograms, IsVLANSubInterface, SetLinkForTest) + the #6741 observability accessor ObsoleteRegistryAccesses); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {

@@ -7810,3 +7810,197 @@ fn same_source_pat_collision_is_not_attributed_6751() {
          attributed",
     );
 }
+
+/// #6752: SYN → SYN-ACK → **no final ACK** must reap on the OPENING window,
+/// not hold both halves for the full established timeout.
+///
+/// The gap the issue names: promotion happens on the SYN-ACK, not on the final
+/// ACK, so the reverse half jumped straight to the 300s class. #4109
+/// deliberately did NOT extend the forward half's expiry, and said so — "a
+/// handshake the client never completes still reaps on the short opening
+/// window". Three days later #4380's companion probe, which is protocol- and
+/// handshake-agnostic, made that false: at the forward half's 20s deadline it
+/// saw the reverse half alive on its brand-new 300s window and re-stamped the
+/// forward half off it. Both halves then persisted ~300s from the SYN-ACK.
+///
+/// WHY THE EXISTING COVERAGE DID NOT CATCH IT.
+/// `tcp_handshake_promotes_opening_to_established` asserts the `established`
+/// FLAG after the SYN-ACK, then sends the final ACK and only afterwards asserts
+/// `expires_after_ns`. It never asserts the reverse entry's window after the
+/// SYN-ACK, and it never runs the no-final-ACK case at all.
+/// `forward_ack_without_reverse_synack_stays_opening` covers the opposite shape
+/// (no SYN-ACK). Neither can see this.
+#[test]
+fn synack_without_final_ack_stays_on_the_opening_window_6752() {
+    let mut table = SessionTable::new();
+    let forward = key_v4();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+
+    // The server answers; the client never completes.
+    assert!(
+        table
+            .lookup(&reverse, now + 1_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+
+    let rev = table.entry_by_key(&reverse).expect("rev after synack");
+    assert!(
+        rev.established,
+        "premise: the SYN-ACK still promotes the flag — this fix does not change \
+         WHEN a flow counts as established, only which idle window it ages on",
+    );
+    assert_eq!(
+        rev.expires_after_ns,
+        table.timeouts.tcp_opening_ns,
+        "the reverse half jumped to the ESTABLISHED idle window on the SYN-ACK, \
+         so a handshake the client never completes is held for the full \
+         established timeout instead of reaping at the opening window (#6752)",
+    );
+    let fwd = table.entry_by_key(&forward).expect("fwd after synack");
+    assert_eq!(
+        fwd.expires_after_ns,
+        table.timeouts.tcp_opening_ns,
+        "the forward half must also still be on the opening window",
+    );
+
+    // The companion probe must not resurrect either half. Step past the opening
+    // window and expire: with the flow still half-open, BOTH halves must go.
+    // A few seconds past the opening window — comfortably beyond it, and still
+    // two orders of magnitude short of the 300s established window, so a reap
+    // here can only mean the opening class was applied. The margin also clears
+    // the wheel's `cursor_tick < now_tick` sweep boundary and the GC interval
+    // gate, which is test plumbing rather than part of the property.
+    let past = now + table.timeouts.tcp_opening_ns + 5_000_000_000;
+    // Drive the wheel forward the way the other expiry tests do: the sweep only
+    // examines ticks between `last_gc_ns` and `now_ns`.
+    table.last_gc_ns = past - 2_000_000_000;
+    table.expire_stale_entries(past);
+    assert!(
+        table.entry_by_key(&forward).is_none(),
+        "the forward half survived past the opening window — the #4380 companion \
+         probe extended it off the reverse half, which is exactly the resurrection \
+         #6752 is about",
+    );
+    assert!(
+        table.entry_by_key(&reverse).is_none(),
+        "the reverse half survived past the opening window",
+    );
+}
+
+/// #6752 NEGATIVE CONTROL — the completed handshake must still get its full
+/// established window, in BOTH directions.
+///
+/// Without this the fix is indistinguishable from "never promote the idle
+/// window at all", which would reap every legitimate idle TCP session at 20s.
+/// The forward half's window is asserted directly; the reverse half's is
+/// asserted through the companion probe, because a completed flow's reverse
+/// half keeps whatever window its last segment stamped and relies on #4380 to
+/// age with its sibling — so the probe must start extending again the moment
+/// the handshake completes.
+#[test]
+fn completed_handshake_still_gets_the_established_window_6752() {
+    let mut table = SessionTable::new();
+    let forward = key_v4();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+
+    assert!(
+        table
+            .lookup(&reverse, now + 1_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+    // The client completes. This segment reaches the slow path by construction:
+    // `packet_eligible` admits a TCP packet to the flow cache only when
+    // `is_ack_only`, and `should_cache` uses the same predicate, so neither the
+    // SYN nor the SYN-ACK ever seeded an entry — the final ACK is a cache MISS.
+    assert!(table.lookup(&forward, now + 2_000_000, TCP_ACK).is_some());
+
+    let fwd = table.entry_by_key(&forward).expect("fwd after final ack");
+    assert!(fwd.established);
+    assert_eq!(
+        fwd.expires_after_ns,
+        table.timeouts.tcp_established_ns,
+        "a COMPLETED handshake must get the established idle window — without \
+         this the #6752 fix would reap every legitimate idle TCP session at the \
+         20s opening window",
+    );
+
+    // Past the opening window but well inside the established one: the flow —
+    // both halves — must still be there. The reverse half survives via the
+    // companion probe, which the fix must have re-enabled on completion.
+    let past_opening = now + table.timeouts.tcp_opening_ns + 5_000_000_000;
+    table.last_gc_ns = past_opening - 2_000_000_000;
+    table.expire_stale_entries(past_opening);
+    assert!(
+        table.entry_by_key(&forward).is_some(),
+        "the completed flow's forward half was reaped at the opening window",
+    );
+    assert!(
+        table.entry_by_key(&reverse).is_some(),
+        "the completed flow's reverse half was reaped at the opening window — the \
+         companion probe must extend again once the handshake completes, or the \
+         fix trades a half-open leak for a reaped live session",
+    );
+}
+
+/// #6752, the second half of the fix: the companion probe must not resurrect a
+/// half-open flow that the SERVER keeps refreshing.
+///
+/// The effective-class change alone is not sufficient here, and the two cells
+/// above cannot show it — with both halves on the opening window and no further
+/// traffic, the probe's own idle test already fails, so it never gets the chance
+/// to extend. The gap opens when the reverse half keeps receiving packets: a
+/// server retransmitting its SYN-ACK (normally ~5 times over ~30 s) slides the
+/// reverse half's window forward, and a handshake-agnostic probe then re-stamps
+/// the forward half off it for as long as the retransmissions continue.
+///
+/// That is a smaller leak than the ~300 s the class change closes, and it is
+/// stated that way rather than as "both halves for 300 s" — but it is the reason
+/// `companion_keeps_alive` consults `handshake_pending` rather than relying on
+/// the class change to make the probe harmless.
+#[test]
+fn retransmitted_synack_does_not_resurrect_the_forward_half_6752() {
+    let mut table = SessionTable::new();
+    let forward = key_v4();
+    let now = 1_000_000_000u64;
+    let reverse = install_forward_reverse_pair(&mut table, &forward, now, TCP_SYN);
+
+    // Server answers, then retransmits 15 s later. The client never completes.
+    assert!(
+        table
+            .lookup(&reverse, now + 1_000_000, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+    let retransmit = now + 15_000_000_000;
+    assert!(
+        table
+            .lookup(&reverse, retransmit, TCP_SYN | TCP_ACK)
+            .is_some()
+    );
+
+    // Past the FORWARD half's opening window, while the reverse half is fresh
+    // (10 s idle, inside its own 20 s window) — precisely the state in which the
+    // probe would extend.
+    let past_forward = retransmit + 10_000_000_000;
+    assert!(
+        past_forward.saturating_sub(now) > table.timeouts.tcp_opening_ns,
+        "fixture: the forward half must have crossed its window",
+    );
+    assert!(
+        past_forward.saturating_sub(retransmit) < table.timeouts.tcp_opening_ns,
+        "fixture: the reverse half must still be INSIDE its window, or the probe \
+         would decline for the ordinary idle reason and this cell would prove \
+         nothing",
+    );
+    table.last_gc_ns = past_forward - 2_000_000_000;
+    table.expire_stale_entries(past_forward);
+
+    assert!(
+        table.entry_by_key(&forward).is_none(),
+        "the forward half was kept alive off a retransmitted SYN-ACK. The #4380 \
+         companion probe is handshake-agnostic, so without the handshake_pending \
+         refusal a server that keeps retransmitting holds the client-side half of \
+         a handshake that never completed (#6752)",
+    );
+}

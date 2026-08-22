@@ -104060,3 +104060,109 @@ prose edit above them added. No diff falls in the new test body.
   `afxdp/coordinator/status.rs`, `protocol/control.rs`, `protocol/binding.rs`,
   `server/lifecycle.rs`, `afxdp/worker_runtime_tests.rs`,
   `pkg/dataplane/userspace/protocol_status.go`, `pkg/api/metrics*.go`
+## 2026-08-22 — #6741 Increment 1: count obsolete registry generations
+- **Timestamp**: 2026-08-22
+- **Action**: Split #6741 and shipped the observability half only. Added
+  registryGeneration (bumped inside publishShimRegistryLocked's existing m.mu
+  hold), registryObsoleteFrom (recorded by Teardown, NOT Close — Close keeps its
+  pinned handles live for hitless restart), and a counter incremented at the two
+  lookup choke points when a lookup SERVES a handle from a superseded
+  generation, with a once-per-epoch warn naming the map. No behaviour change at
+  any of the 135 call sites.
+- **Deliberately NOT closed**: the escape window. lookupMapLocked returns the
+  handle by reference then releases m.mu, so a republish after the lookup is
+  invisible; a zero counter means "no lookup observed a superseded generation",
+  not "no obsolete mutation occurred". Said so in the source, the README and on
+  the issue — a metric implying a guard it lacks is worse than no metric.
+- **Design tension recorded on #6741**: #6740 forbids a BPF syscall under m.mu;
+  a mutation-time generation check requires exactly that (or a token threaded
+  through 135 sites). The two fixes pull in opposite directions and someone must
+  decide deliberately.
+- **Not wired to Prometheus**: the collector reaches the dataplane through the
+  narrow apiRuntimeDataPlane interface (47 references + test fakes); widening it
+  is a separable change. Counter is readable via ObsoleteRegistryAccesses().
+- **Also filed**: #7547 (AttachXDP/DetachXDP read-modify-write sequences have no
+  concurrent coverage; their atomicity rests on an untested applySem claim) —
+  kept OUT of #6741 so a concrete gap does not get buried in a design item.
+- **File(s)**: pkg/dataplane/armed_gate.go, pkg/dataplane/loader.go,
+  pkg/dataplane/registry_generation_6741_test.go (new),
+  pkg/dataplane/armed_gate_matrix_test.go, pkg/dataplane/README.md
+
+
+## 2026-08-22 — #6755 DDNS wire-RR claims carry their DNS authority
+- **Timestamp**: 2026-08-22
+- **Action**: WireRRClaim was {FQDN,type,rdata} with no authority, so two
+  surfaces publishing the same RR to DIFFERENT servers compared equal and the
+  teardown suppressed its own DELETE, leaving the record published forever.
+  Added Authority (credential-free endpoint fingerprint) + a coOwns predicate
+  treating an empty authority as UNKNOWN rather than different. Single-sourced
+  the fingerprint format so the two surfaces cannot drift.
+- **File(s)**: pkg/ddns/state.go, pkg/ddns/surface_a.go, pkg/ddns/manager.go,
+  pkg/ddns/cross_surface_authority_6755_test.go,
+  pkg/ddns/cross_surface_clobber_5748_test.go
+
+## 2026-08-22 — #6760 + #6761 golden-image guard: two holes, one path
+- **Timestamp**: 2026-08-22
+- **Action**: Merged two A10-b4 issues into one PR after verifying a shared
+  mechanism: #6761's cited line ranges are a strict SUBSET of #6760's, and both
+  are defects in the same four functions (_qcow2_backing_file,
+  _dependent_overlays, _install_libvirt_golden, libvirt_disk).
+  #6760: the probe collapsed four outcomes into "no backing file", so an
+  unprobeable overlay was classified as not-dependent and the golden was
+  overwritten under it. Probe now raises _ProbeIndeterminate; classifier returns
+  (deps, unknown); install refuses on either, with distinct operator messages.
+  Preserved the one legitimate case (qemu-img absent entirely = determinate
+  none, the documented #5043 reasoning).
+  #6761: replacement was an unlocked check-then-in-place-copy — TOCTOU against
+  overlay creation AND a truncated golden on interruption. Now temp+os.replace
+  under an flock that libvirt_disk takes too.
+- **Also found**: /tmp/opus-review-001.md, the "fix direction" reference for all
+  six A10-b4 issues (#6758-#6763), no longer exists — the stated direction is
+  unreachable and had to be derived from the code.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_disk.py, docs/distribution.md
+
+## 2026-08-22 — #6752 half-open flow no longer holds the established window
+- **Action**: Promotion is on the reverse SYN-ACK, not the final ACK, so the
+  reverse half jumped to the 300s class immediately; #4109 deliberately did not
+  extend the forward half and said so, and #4380's handshake-agnostic companion
+  probe (three days later) falsified that by re-stamping the forward half off
+  the reverse half's fresh 300s window. Both halves of a never-completed
+  handshake persisted ~300s. Added node-local `SessionEntry.handshake_pending`
+  (set on both halves by the SYN-ACK, cleared by the handshake-completing
+  forward segment); the idle-window selection now uses
+  `established && !handshake_pending`, and `companion_keeps_alive` refuses to
+  extend a half whose companion is still pending. The two close
+  DIFFERENT-SIZED leaks and an early draft overstated this: a mutation showed
+  the class change alone already reaps both halves at ~20s, so the probe refusal
+  closes the smaller retransmission-driven leak (a server retransmitting its
+  SYN-ACK slides the reverse half's window forward and the handshake-agnostic
+  probe re-stamps the forward half off it). A third test cell was added to
+  exercise it, since the first two could not. Verified the completing segment is
+  guaranteed to reach the slow path: `packet_eligible`/`should_cache` admit TCP
+  to the flow cache only when `is_ack_only`, so neither the SYN nor the SYN-ACK
+  seeds an entry and the final ACK is a cache miss. Rewrote #4109's now-false
+  comment and the README claim rather than leaving them asserting a guarantee
+  the code did not provide.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/expire.rs, userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md
+
+## 2026-08-22 — #6756 RFC 3442 option presence vs parse success
+- **Timestamp**: 2026-08-22
+- **Action**: classlessStaticRoutes derived `present` from len(parsedRoutes)!=0,
+  collapsing absent / present-but-zero-length / present-but-malformed into one
+  false, so a broken option 121/249 fell through to the option-3 Router the RFC
+  forbids. Presence now comes from the option SLOT; option 249's discarded
+  parse error is logged.
+- **File(s)**: pkg/dhcp/dhcpv4.go, pkg/dhcp/classless_presence_6756_test.go
+
+## 2026-08-22 — #6764 day-0 ISO is never created world-readable
+- **Timestamp**: 2026-08-22
+- **Action**: Both ISO builders chmod 0600 only AFTER the tool writes the
+  output, so the secret-bearing ISO existed at umask-derived 0644 for the whole
+  build. Added an _owner_only_umask() guard around the tool invocation in
+  make_config_drive.py and xpf-deploy.py; kept the post-chmod as a belt.
+- **File(s)**: scripts/image/make_config_drive.py, scripts/deploy/xpf-deploy.py,
+  scripts/image/test_config_drive_creation_umask_6764.py
