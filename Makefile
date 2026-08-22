@@ -107,9 +107,21 @@ test-go: test-race-dp
 # and fails if any test in the declared concurrency-binder files stops
 # matching. Keep the `-run '<pattern>'` single-quoted spelling — that canary
 # reads it.
+#
+# #6550: the pkg/cluster leg. Before it, NO make target ran ./pkg/cluster
+# under -race at all, so the cluster Monitor's concurrent-map fatal (poll
+# goroutine vs UpdateGroups) and the #7257 heartbeat start/stop race were
+# not races CI had failed to catch — they were races CI had no path to
+# observe. The selection is the two packages' race PROBES only (they are
+# ~2s combined at -count=2); pkg/cluster's non-race tests stay on the
+# plain `go test ./...` leg. Keep the `-run '<pattern>'` single-quoted
+# spelling here too: pkg/cluster's TestRaceGateCoversTheClusterProbes6550
+# parses this line, and pkg/daemon's canary reads the FIRST -run line in
+# this recipe, so this leg must stay BELOW the pkg/daemon one.
 test-race-dp:
 	$(GO) test -race ./pkg/daemon/ -run 'DataplaneCell|NATPoolAlarm|ForwardingStatus|BootstrapExit|RuntimeDataplaneNeverBareRootManager|EventStreamFallbackLoop|RunUserspaceEventStream|LiveDataPlane_|GRPCShowBuffers_|SystemAction_|GRPCServer_|RESTServer_|ManagementProbe|ConsoleCLIProbeWiring|FullResync|ReconcilePassUsesOneDataplaneSnapshot|ReconcileBlackholeWrappersStillReloadPerCall' -count=2
 	$(GO) test -race ./pkg/dataplane/ -run 'ArmedGate|PreArm' -count=2
+	$(GO) test -race ./pkg/cluster/ -run 'DoesNotRaceUpdateGroups6550|DoesNotHoldMuAcrossManagerCallback6550|DoesNotRaceStopHeartbeat7257|HeartbeatStartSuperseded' -count=2
 
 # Rust userspace-dp correctness suite (#4006). userspace-dp is a
 # binary-only crate (no [lib] target), so its unit tests live in the bin
@@ -147,25 +159,31 @@ test-rust:
 # docs/refactoring-audit-current.txt, printing the exact drift and the
 # one-line regenerate command.
 #
-# The AUTHORITATIVE enforcement is the pkg/refactoraudit canary
-# (TestHeatmapNotStale), which runs under `go test ./...` inside the
-# required `make test` aggregate (#6232). Before #6232 nothing in a
-# required target ran this check, so the artifact drifted to 62 rows vs
-# 16 committed on master. Run THIS target while iterating to see and fix
-# the drift before `make test` fails, then commit the regenerated
-# artifact.
+# NOTHING IN `make test` FAILS ON WHAT THIS TARGET REPORTS (#7253). Global
+# heatmap staleness stopped being a gate: it is a repo-GLOBAL property, so
+# any file crossing 1500 or 2000 LOC anywhere flipped it for every author
+# on the board, and #7235, #7252 and #7254 all regenerated it inside one
+# hour — #7252 was already stale when it merged. The gate that remains is
+# pkg/refactoraudit's TestTouchedFileCrossedModularityThreshold, which reds
+# only the author who grew a file THEY TOUCHED past a threshold and is
+# derived from that branch's own diff, so it cannot go stale. Converging
+# the global artifact is `make audit-refresh`'s job, not a PR author's.
 #
-# This target's verdict MUST agree with that canary, or the two surfaces
+# This target's verdict MUST agree with the suite, or the two surfaces
 # teach opposite lessons and both get ignored — which is how the artifact
-# came to sit stale for 21 consecutive commits (#6617). The canary gates
-# audit CONTENT (which files are audited, at which tier); the LOC column
-# is an advisory snapshot that the tree outruns constantly and that no
-# gate can keep byte-exact under parallel merges. So this target
-# classifies its own diff:
+# came to sit stale for 21 consecutive commits (#6617). So it exits 0 on
+# every kind of staleness and reserves exit 1 for a MALFORMED artifact,
+# which is a real defect the suite does still fail on:
 #
 #   no diff                       -> up to date, exit 0
-#   LOC-only (same files+tiers)   -> ADVISORY refresh, exit 0 (canary passes)
-#   a file entered/left/retiered  -> ERROR, exit 1 (canary WILL fail)
+#   LOC-only (same files+tiers)   -> ADVISORY refresh, exit 0
+#   a file entered/left/retiered  -> STALE, exit 0 (run `make audit-refresh`)
+#   malformed rows / dead generator -> ERROR, exit 1 (the suite fails too)
+#
+# For a machine-readable staleness predicate — a timer deciding whether to
+# refresh — use `bash scripts/refactoring-audit-refresh.sh --check`, which
+# exits 1 when the artifact is behind. That is a job's question, not a
+# developer's.
 #
 # The full `diff -u` is printed either way, so a refresh is still one
 # command away when you want the numbers current.
@@ -217,18 +235,36 @@ audit-check:
 		echo "audit-check: ADVISORY — same files, same tiers; only the LOC snapshot drifted."; \
 		echo "  This target compares the (tier, path) projection SORTED, so it is blind to"; \
 		echo "  LOC values and to row order BY DESIGN — that is what makes LOC advisory."; \
-		echo "  TestHeatmapNotStale passes on this. It is NOT a statement about the whole"; \
-		echo "  suite: TestHeatmapArtifactWellFormed still checks each row's LOC against its"; \
+		echo "  No test fails on this. It is NOT a statement about the whole suite:"; \
+		echo "  TestHeatmapArtifactWellFormed still checks each row's LOC against its"; \
 		echo "  tier band and checks generator sort order, and can fail while this target is"; \
 		echo "  green. Run 'go test ./pkg/refactoraudit/' for the authoritative answer."; \
 		echo "  Refresh when convenient:"; \
-		echo "    bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
+		echo "    make audit-refresh"; \
 		exit 0; \
 	fi; \
-	echo "ERROR: a file entered the audit, left it, or changed tier."; \
-	echo "  TestHeatmapNotStale WILL FAIL until the artifact is regenerated:"; \
-	echo "    bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
-	exit 1
+	echo "audit-check: STALE — a file entered the audit, left it, or changed tier."; \
+	echo "  This is NOT a failure and no test reds on it (#7253): the heatmap is a"; \
+	echo "  repo-global snapshot that any unrelated file can invalidate, so keeping it"; \
+	echo "  current is a job's work, not yours. Converge it with:"; \
+	echo "    make audit-refresh"; \
+	echo "  If one of the files above is one YOU grew past a threshold, the test that"; \
+	echo "  says so is pkg/refactoraudit.TestTouchedFileCrossedModularityThreshold,"; \
+	echo "  and regenerating this artifact will not silence it."; \
+	exit 0
+
+# Periodic heatmap refresh job (#7253). Regenerates
+# docs/refactoring-audit-current.txt and COMMITS it, so global freshness
+# converges without interrupting a PR author who did nothing wrong. Run it
+# by hand, or wire it as a timer on a master checkout; add --push there
+# (the docs-only maintenance carve-out from docs/engineering-style.md
+# first principle #6, the same one /sync-history takes). Refuses to commit
+# an empty heatmap, and commits only the artifact path even on a dirty
+# tree. Self-tested hermetically by pkg/refactoraudit's
+# TestRefreshJobConvergesTheGlobalArtifact — no repo state involved.
+.PHONY: audit-refresh
+audit-refresh:
+	bash scripts/refactoring-audit-refresh.sh
 
 # Upgrade/install docs canary (#2001). Fails if either of the two
 # misleading upgrade-install doc phrasings reappears: "symlinks into the
@@ -260,8 +296,9 @@ selftest:
 	sh scripts/run-selftests.sh
 
 # Bake the distributable appliance image (#1879 Path C): one
-# offline-built bootable root disk (LATEST Ubuntu server cloudimg base
-# discovered at bake time — XPF_BASE_RELEASE pins; linux-generic
+# offline-built bootable root disk (REVIEWED-PIN Ubuntu server cloudimg
+# base — PINNED_BASE_RELEASE + PINNED_BASE_SHA256 in bake.py, not
+# auto-latest; XPF_BASE_RELEASE overrides one run; linux-generic
 # kernel >= 6.18, xpfd + cli + xpf-userspace-dp + day-0 config-drive
 # loader), exported as a qcow2 for libvirt/KVM AND as an incus VM
 # image (metadata tarball + the same qcow2). Includes the in-guest

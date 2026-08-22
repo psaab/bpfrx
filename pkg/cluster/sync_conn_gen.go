@@ -124,9 +124,32 @@ func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane
 	// table when it is queued has survived this node's own config-apply
 	// clearSessionsForDeletedPolicies sweep, so it is admitted under the
 	// current config; the receiver refuses it only once IT applies a strictly
-	// newer config (lastAppliedConfigGen advances past this epoch). configGen
-	// and lastAppliedConfigGen are the SAME sender→receiver namespace, so the
-	// comparison is meaningful across the HA boundary.
+	// newer config (lastAppliedConfigGen advances past this epoch).
+	//
+	// The namespace claim holds in ONE direction only. configGenCounter and the
+	// receiver's lastAppliedConfigGen are the same sender→receiver namespace
+	// when the SENDER is the RG0 config-sync authority — the authority mints the
+	// generation and the peer records the one it applied. In the reverse
+	// (non-authority → authority) direction, reachable only active/active, the
+	// stamp is a value this node's configGenCounter has not advanced since it
+	// last held the authority (its construction seed if it never has), while the
+	// authority's high-water never advances at all, so the guard is inert:
+	// fail-OPEN, no false reject. That residual is deliberate (#5274 scope-out)
+	// and regression-pinned by sync_config_epoch_active_active_6284_test.go.
+	//
+	// #6419 closed the reverse direction as not-cheaply-fixable. Note what the
+	// blocker is and is NOT. Each counter IS live in the role the obvious
+	// shortcut ("non-authority stamps lastAppliedConfigGen, authority thresholds
+	// on configGenCounter") wants to read it: configGenCounter advances on the
+	// authority, lastAppliedConfigGen advances off it. What that asymmetry
+	// establishes is only that the shortcut cannot be written role-free — each
+	// counter is frozen in the OTHER role, so both the stamp site and the
+	// threshold site must branch on IsLocalPrimary(0). The actual kill is that a
+	// role-branched stamp is unreadable across an RG0 handover: role is not
+	// learned atomically by both nodes, and telling the two namespaces apart
+	// needs an authority tag that ConfigEpoch, a bare uint64 on the wire, does
+	// not carry today. See docs/session-sync-architecture.md for the full
+	// argument and for the tagged-epoch variant that remains open.
 	val.ConfigEpoch = s.configGenCounter.Load()
 	s.genSentMu.Lock()
 	if s.genSentV4 == nil {

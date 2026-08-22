@@ -114,7 +114,8 @@ var fabricSecretSentinels = []string{
 // Parameterized (prefix:) topics carry a representative argument.
 var showTextAuditTopics = []string{
 	"address-book", "alarms", "alg", "application-identification-status",
-	"applications", "backup-router", "bfd-peers", "buffers", "buffers-detail",
+	"applications", "backup-router", "bfd-peers", "bootstrap-import",
+	"buffers", "buffers-detail",
 	"chassis", "chassis-cluster", "chassis-cluster-control-plane-statistics",
 	"chassis-cluster-data-plane-fairness", "chassis-cluster-data-plane-flows",
 	"chassis-cluster-data-plane-interfaces", "chassis-cluster-data-plane-statistics",
@@ -129,7 +130,8 @@ var showTextAuditTopics = []string{
 	"flow-statistics", "flow-timeouts", "flow-traceoptions", "forwarding-options",
 	"forwarding-options-port-mirroring", "ike", "interfaces-detail",
 	"interfaces-extensive", "interfaces-statistics", "internet-options",
-	"ipsec-statistics", "ipv6-router-advertisement", "lldp", "lldp-neighbors",
+	"ipsec-statistics", "ipv6-router-advertisement", "kernel-upgrade",
+	"lldp", "lldp-neighbors",
 	"log", "login", "nat64", "nat-dest-rule-detail", "nat-nptv6",
 	"nat-source-rule-detail", "nat-static", "ntp", "persistent-nat",
 	"persistent-nat-detail", "policies-detail", "policies-hit-count",

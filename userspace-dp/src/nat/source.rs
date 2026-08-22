@@ -1544,6 +1544,7 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     is_reverse: bool,
     // #6211: see `SyncedNatZones`.
     synced_zones: SyncedNatZones<'_>,
+    now_ns: u64,
 ) {
     reserve_synced_source_nat_allocation_with_holder(
         rules,
@@ -1551,6 +1552,7 @@ pub(crate) fn reserve_synced_source_nat_allocation(
         nat,
         is_reverse,
         synced_zones,
+        now_ns,
         NatHolder::Untracked,
     );
 }
@@ -1569,6 +1571,10 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
     nat: NatDecision,
     is_reverse: bool,
     synced_zones: SyncedNatZones<'_>,
+    // #6528: the stale-tuple eviction inside `reserve_flow` retires the
+    // incumbent with release semantics, which re-arms a persistent lease's idle
+    // expiry off a real clock.
+    now_ns: u64,
     worker_id: u32,
 ) {
     reserve_synced_source_nat_allocation_with_holder(
@@ -1577,6 +1583,7 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
         nat,
         is_reverse,
         synced_zones,
+        now_ns,
         NatHolder::Worker(worker_id),
     );
 }
@@ -1588,6 +1595,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
     is_reverse: bool,
     // #6211: see `SyncedNatZones`.
     synced_zones: SyncedNatZones<'_>,
+    now_ns: u64,
     holder: NatHolder,
 ) {
     if is_reverse {
@@ -1631,6 +1639,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
             flow,
             rewrite_src,
             nat.rewrite_src_port,
+            now_ns,
             holder,
         )
     {
@@ -1653,6 +1662,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
         flow,
         rewrite_src,
         nat.rewrite_src_port,
+        now_ns,
         holder,
     );
 }
@@ -1668,6 +1678,8 @@ fn reserve_synced_on_first_pool_owner<'a>(
     flow: SourceNatFlowKey,
     rewrite_src: IpAddr,
     rewrite_src_port: Option<u16>,
+    // #6528: threaded to `reserve_flow` for its stale-tuple eviction.
+    now_ns: u64,
     // #6211 F2: the worker taking this reservation, so a fan-out to N workers
     // records N holders on ONE allocator record.
     holder: NatHolder,
@@ -1729,6 +1741,7 @@ fn reserve_synced_on_first_pool_owner<'a>(
             },
             addr_index,
             rule.deterministic_v4.is_some(),
+            now_ns,
             holder,
         ) {
             return true;
@@ -1756,6 +1769,8 @@ pub(crate) fn allocate_nat64_pool_port(
     flow: SourceNatFlowKey,
     pool_v4: &[Ipv4Addr],
     now_ns: u64,
+    // #6522: the allocating worker — see `match_source_nat_result_for_tuple`.
+    holder: NatHolder,
 ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
     let translated = allocator.allocate_translation(
         flow,
@@ -1766,6 +1781,7 @@ pub(crate) fn allocate_nat64_pool_port(
         PersistentNatPermit::default(),
         0, // persistent_nat_timeout_ns — unused when persistent_nat is false
         now_ns,
+        holder,
     )?;
     match translated.ip {
         IpAddr::V4(v4) => Ok((v4, translated.port)),
@@ -1788,8 +1804,11 @@ pub(crate) fn allocate_nat64_pool_port_deterministic_v6(
     pool_v4: &[Ipv4Addr],
     params: DeterministicV6,
     src_v6: Ipv6Addr,
+    // #6522: the allocating worker — see `match_source_nat_result_for_tuple`.
+    holder: NatHolder,
 ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
-    let translated = allocator.allocate_deterministic_v6(flow, pool_v4, params, src_v6)?;
+    let translated =
+        allocator.allocate_deterministic_v6(flow, pool_v4, params, src_v6, holder)?;
     match translated.ip {
         IpAddr::V4(v4) => Ok((v4, translated.port)),
         IpAddr::V6(_) => Err(SourceNatFailureReason::WrongAddressFamily),
@@ -1858,6 +1877,8 @@ pub(crate) fn reserve_nat64_pool_port(
     port: u16,
     addr_index: usize,
     deterministic: bool,
+    // #6528: threaded to `reserve_flow` for its stale-tuple eviction.
+    now_ns: u64,
     // #6211 F2: the worker taking this reservation. The synced NAT64 entry is
     // fanned out to every worker against ONE shared allocator, exactly like the
     // pool-mode SNAT reservation.
@@ -1867,7 +1888,7 @@ pub(crate) fn reserve_nat64_pool_port(
         ip: IpAddr::V4(snat_v4),
         port,
     };
-    allocator.reserve_flow(flow, translated, addr_index, deterministic, holder)
+    allocator.reserve_flow(flow, translated, addr_index, deterministic, now_ns, holder)
 }
 
 pub(crate) fn match_source_nat(
@@ -1919,6 +1940,10 @@ pub(crate) fn match_source_nat_result(
         // #4088: the address-only wrapper never carries an ICMP query id
         // (the tuple is unknown), so there is no identifier to preserve.
         false,
+        // #6522: this wrapper has no worker context (its only callers are the
+        // `#[cfg_attr(not(test), allow(dead_code))]` helpers in
+        // `afxdp/forwarding/nat.rs`), so it keeps the untracked contract.
+        NatHolder::Untracked,
         &mut counter,
     )
 }
@@ -1975,6 +2000,13 @@ pub(crate) fn match_source_nat_result_for_tuple(
     // address on the reverse tuple (pool_addr, 0). The synthetic /
     // address-only (`protocol == 0`) callers pass `false`.
     icmp_identifier_present: bool,
+    // #6522: the worker whose packet path is making this allocation. The record
+    // this call inserts names its own holder, so a sibling worker's replica of
+    // the resulting session cannot free a `(pool_addr, port)` this worker is
+    // still forwarding through (see `NatHolder` / `LiveAllocation::holders`).
+    // `NatHolder::Untracked` keeps the pre-#6522 single-holder contract for the
+    // test entry points and the read-only fragment probe.
+    holder: NatHolder,
     matched_counter: &mut Option<Arc<NatRuleCounter>>,
 ) -> SourceNatLookup {
     // #5687: decode the out-of-band protocol. `None` is the tuple-unknown
@@ -2227,6 +2259,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                         &rule.pool_addresses_v4,
                         det,
                         src_v4,
+                        holder,
                     ) {
                         Ok(translated) => translated,
                         Err(reason) => {
@@ -2304,6 +2337,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             rule.persistent_nat_permit,
                             rule.persistent_nat_timeout_ns,
                             now_ns,
+                            holder,
                         )
                     } else {
                         // #6226: probe the WHOLE pool from the round-robin start
@@ -2320,6 +2354,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             0,
                             addr_idx,
                             rule.address_persistent,
+                            holder,
                         )
                     };
                     match reserved {
@@ -2348,6 +2383,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     rule.persistent_nat_permit,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
+                    holder,
                 ) {
                     Ok(translated) => translated,
                     Err(reason) => {
@@ -2415,6 +2451,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             rule.persistent_nat_permit,
                             rule.persistent_nat_timeout_ns,
                             now_ns,
+                            holder,
                         )
                     } else {
                         // #6226: probe the WHOLE pool from the round-robin start
@@ -2429,6 +2466,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             v6_offset,
                             addr_idx,
                             rule.address_persistent,
+                            holder,
                         )
                     };
                     match reserved {
@@ -2457,6 +2495,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     rule.persistent_nat_permit,
                     rule.persistent_nat_timeout_ns,
                     now_ns,
+                    holder,
                 ) {
                     Ok(translated) => translated,
                     Err(reason) => {

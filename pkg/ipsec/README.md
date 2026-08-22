@@ -32,10 +32,15 @@ the apply path pays no fsync (the file is regenerated on every apply).
   reported success). Promotion of `prevConnNames` and removed-SA termination are
   gated on reload SUCCESS — a failed reload leaves the OLD config effective, so
   the applied-name set is preserved and no SA is torn down, letting the next
-  successful Apply/Clear retry the diff + teardown.
+  successful Apply/Clear retry the diff + teardown. **A FAILED terminate is
+  also load-bearing (#6542):** the failed subset becomes teardown DEBT
+  (`pendingTerminate`) that the next Apply folds back into its removed set,
+  and Apply RETURNS the failure instead of reporting success over a stale SA
+  that is still forwarding.
 - `Clear() error` — `manager.go`. Remove the xpf snippet, reload, and
   terminate every previously-applied connection's live SAs (#3941). Like Apply,
-  a reload failure is returned and skips promotion/termination (#4898).
+  a reload failure is returned and skips promotion/termination (#4898), and a
+  failed terminate is carried as debt and returned (#6542).
 - `SAStatus`, `TerminateAllSAs`, `InitiateConnection`, `GetSAStatus`,
   `ActiveConnectionNames` — `ike.go`.
 - `PrepareConfig(cfg *config.Config) *config.IPsecConfig` — `policy.go`.
@@ -102,6 +107,38 @@ all files stay in `package ipsec`, so the public API is unchanged.
   departures are torn down. All swanctl shell-outs route through the `sc`
   seam so the diff→terminate path is unit-tested against recording doubles
   (`delete_terminate_3941_test.go`, `manager_reload_ordering_4898_test.go`).
+
+- **A FAILED terminate is teardown DEBT, not a log line (#6542).**
+  `promoteConnNames` advances `prevConnNames` to the newly-loaded set the
+  moment the reload succeeds, so a departed name is gone from the only record
+  of "what was loaded" after exactly ONE apply. `terminateRemovedConns` was
+  fire-and-forget: a `swanctl --terminate` that errored was logged at WARN and
+  dropped, `Apply` still returned nil, and no later reconcile ever retried —
+  the departed VPN kept forwarding under its stale child SA until rekey /
+  lifetime expiry while the commit reported success. This is the
+  "advance-then-act, lose the debt" family: the marker advanced on a path that
+  was not verified-success.
+
+  The failed subset is now recorded in `pendingTerminate` and UNIONED into the
+  next apply's removed set by `promoteConnNames`, so the teardown is retried
+  every reconcile until it succeeds. `Apply`/`Clear` return the failure
+  (`recordTerminateDebt`), which the commit path joins into its tail result the
+  same way it joins a failed reload (#4433) — the operator sees the degraded
+  IPsec state instead of a false success.
+
+  Two properties keep the debt from latching or misfiring:
+  - It **discharges** when the departed connection is no longer live —
+    `terminateRemovedConns` only terminates (and only charges debt for) a
+    removed name that `--list-sas` actually reports, so an SA that died on its
+    own clears the debt silently rather than failing every future commit. The
+    ambiguous `--list-sas`-failed fallback (unconditional terminate, where a
+    "no matching SA" error is indistinguishable from a real failure) is
+    likewise self-clearing: the next apply enumerates and discharges.
+  - It **never terminates a LOADED connection** — both halves of the removed
+    set are filtered by the newly-loaded names, so an operator re-adding the
+    VPN discharges the debt instead of tearing the restored tunnel down.
+
+  Covered by `terminate_debt_6542_test.go`.
 
 - **The diff keys off the RENDERED set, not the raw VPN name (#5494 —
   FLIPS the prior #3941 name-keyed behavior).** `renderConfig` returns the

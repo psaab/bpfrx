@@ -4,9 +4,13 @@
 Boots the baked artifacts under LOCAL incus (instances xpf-image-* —
 never the shared loss cluster) and proves the first-boot contract:
 
-  a  no config drive  -> factory bootstrap: boots, xpfd active, fxp0 DHCP,
-     sshd listening, AND in-guest `xpfd verify-dataplane` PASSES against
-     the image's own kernel (the bake gate).
+  a  no config drive  -> factory bootstrap: boots UNDER SECURE BOOT (the
+     production posture, asserted not inherited — #6497), xpfd active,
+     fxp0 DHCP, sshd listening, in-guest `xpfd verify-dataplane` PASSES
+     against the image's own kernel (the bake gate), AND the #1930 LANE-1
+     A/B kernel channel actually came up in the guest (#6494): both slots
+     registered with their own signed shim and reachable in BootOrder, and
+     both first-boot oneshots ran clean.
   b  valid day-0 drive -> config validated + installed + committed at first
      boot (hostname applied); a reboot does NOT re-apply (stamp).
   c  invalid day-0 drive -> commit-check REJECT logged, nothing installed,
@@ -24,15 +28,19 @@ never the shared loss cluster) and proves the first-boot contract:
      sell for "libvirt/KVM, plain QEMU" is a valid, non-corrupt qcow2 of at
      least the bake floor (always), and — gated on qemu-system-x86_64 +
      /dev/kvm + OVMF — actually boots under direct QEMU with the day-0 config
-     on a cdrom (the cdrom day-0 attach path incus never exercises).
+     on a cdrom (the cdrom day-0 attach path incus never exercises). Prefers
+     an SB-ENFORCING firmware pair; an SB-off fallback is reported AS one
+     rather than presented as Secure Boot proof (#6497).
 
 Usage:
   validate.py --qcow2 <img> --metadata <tar.gz> [a|b|c|d|e|q|all]
 """
 
 import argparse
+import fnmatch
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -65,16 +73,55 @@ SCENARIO_METHODS = {
 }
 SCENARIO_ORDER = ["a", "b", "c", "d", "e", "q"]
 
-# Preference order: a NON-secboot OVMF_CODE first so shim->grub->kernel boots
-# without needing MOK enrollment in the firmware var store (the shipped image
-# is Secure-Boot-signed, but plain-QEMU bootability is proven fine with SB off).
+# ── Secure Boot posture (#6497) ──────────────────────────────────────
+# The production appliance posture is UEFI Secure Boot ON — test/incus/setup.sh
+# sets security.secureboot: "true" "to match the production posture (#1943)".
+# The Tier-1 gate is the only thing between a bake and a release signature, and
+# it used to prove nothing about SB at all: the incus scenarios INHERITED it
+# from the incus default rather than setting it, and the plain-QEMU leg
+# deliberately preferred a NON-secboot OVMF and had no SB-on variant. A default
+# flip, a profile override, or a hypervisor without the MS db silently degraded
+# the whole gate to SB-off — and still passed.
+#
+# That matters more than "the image is signed": the #1930 A/B substrate makes
+# Secure-Boot-LOCKDOWN-sensitive design choices that nothing automated
+# exercised. scripts/image/grub.d/09_xpf documents that `regexp` may be
+# unavailable under lockdown and that the slot selector must be a GRUB *script*
+# so GRUB can parse it there. The only SB-on validation of that chain was a
+# one-time manual probe on a hand-staged stock VM, not the baked artifact.
+#
+# So: the incus scenarios now set security.secureboot EXPLICITLY and assert the
+# guest reports SB enabled, and the QEMU leg prefers an SB-ENFORCING firmware
+# pair and says loudly when it has fallen back to SB-off.
+
+# SB-ENFORCING pair, preferred. The CODE build must be the secboot one (a
+# non-secboot build ignores SB even with MS keys present) and the VARS must
+# carry the Microsoft KEK/db, so the Canonical-signed shim the image ships
+# verifies with NO MOK enrollment. Debian/Ubuntu ship these as *.ms.fd;
+# Fedora as *.secboot.fd.
+_OVMF_SECBOOT_CODE_CANDIDATES = (
+    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.ms.fd",
+    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
+    "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+    "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
+)
+_OVMF_MS_VARS_CANDIDATES = (
+    "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+    "/usr/share/OVMF/OVMF_VARS.ms.fd",
+    "/usr/share/OVMF/OVMF_VARS_4M.secboot.fd",
+    "/usr/share/edk2/x64/OVMF_VARS.secboot.4m.fd",
+    "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
+)
+# SB-OFF fallback, used only when no enforcing pair exists on the host. Kept so
+# a minimal host still gets plain-QEMU bootability coverage — but the caller
+# must LOG that this leg is not Secure-Boot proof (that silent conflation is
+# the #6497 defect).
 _OVMF_CODE_CANDIDATES = (
     "/usr/share/OVMF/OVMF_CODE_4M.fd",
     "/usr/share/OVMF/OVMF_CODE.fd",
     "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
     "/usr/share/qemu/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
-    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
 )
 _OVMF_VARS_CANDIDATES = (
     "/usr/share/OVMF/OVMF_VARS_4M.fd",
@@ -82,6 +129,97 @@ _OVMF_VARS_CANDIDATES = (
     "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
     "/usr/share/qemu/OVMF_VARS.fd",
 )
+
+# EFI global variable holding the firmware's Secure Boot state. The efivarfs
+# file is 4 attribute bytes followed by the value, so byte 4 is the flag.
+# Reading it needs no package: mokutil is NOT in bake.py's RUNTIME_PACKAGES,
+# so an assertion that required mokutil would fail on package drift rather than
+# on a real SB regression.
+_SECUREBOOT_EFIVAR = ("/sys/firmware/efi/efivars/"
+                      "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c")
+
+
+def _qemu_firmware_choice(find=None):
+    """Pick the OVMF pair for the plain-QEMU leg. Returns
+    (code, vars, secure_boot, reason).
+
+    Prefers an SB-ENFORCING pair (secboot CODE + MS-keyed VARS) so the leg
+    actually exercises the shim->grub->kernel chain the appliance ships under
+    lockdown. Falls back to the SB-off pair only when no enforcing pair exists,
+    and reports secure_boot=False so the caller can say so out loud instead of
+    presenting an SB-off boot as bootability proof (#6497).
+
+    `find` is injected so the preference order is unit-testable without
+    depending on which OVMF packages the test host happens to have. It
+    defaults to _find_first, resolved at CALL time rather than as a default
+    argument value: _find_first is defined further down this file, and binding
+    it in the signature raised NameError at import. py_compile does not catch
+    that (it checks syntax, not import), so the unit tests — which import the
+    module — are the green that matters for this file.
+    """
+    if find is None:
+        find = _find_first
+    code = find(_OVMF_SECBOOT_CODE_CANDIDATES)
+    varsf = find(_OVMF_MS_VARS_CANDIDATES)
+    if code and varsf:
+        return code, varsf, True, f"Secure Boot ENFORCING ({code} + {varsf})"
+    code = find(_OVMF_CODE_CANDIDATES)
+    varsf = find(_OVMF_VARS_CANDIDATES)
+    if code and varsf:
+        return code, varsf, False, (
+            "no SB-enforcing OVMF pair on this host (need a secboot CODE build "
+            "AND MS-keyed VARS) — falling back to SB-OFF firmware; this leg "
+            "proves plain-QEMU bootability only, NOT the Secure Boot chain")
+    return None, None, False, (
+        "no usable OVMF firmware pair found (neither SB-enforcing nor SB-off)")
+
+
+def _secureboot_verdict(efivar_byte, mokutil_out, lockdown_out):
+    """Pure verdict over the guest's Secure Boot readings: is SB actually ON?
+    Returns (ok, reason).
+
+    Three independent readings, because each can be unavailable for a reason
+    that is not "SB is off":
+      - efivar_byte: byte 4 of the SecureBoot EFI variable, as a string, or ""
+        if unreadable. AUTHORITATIVE — it is the firmware's own answer and needs
+        no package. "1" = enabled, "0" = disabled.
+      - mokutil_out: `mokutil --sb-state` output, or "" if mokutil is absent.
+        mokutil is NOT in the image's package set, so its absence must not be
+        read as SB being off.
+      - lockdown_out: /sys/kernel/security/lockdown, or "" if securityfs is not
+        mounted / the LSM is absent. CORROBORATING only: an active lockdown
+        policy is strong evidence the kernel booted SB-enabled, but lockdown can
+        also be forced on the cmdline, so it never OVERRIDES a definite "off".
+
+    A definite "off" from any authoritative source loses. Absence of every
+    reading is a FAIL, not a pass: a gate that cannot observe the property it
+    exists to assert has not asserted it (#6497 is exactly the failure of
+    treating an unobserved posture as a satisfied one).
+    """
+    efivar_byte = (efivar_byte or "").strip()
+    mok = (mokutil_out or "").strip().lower()
+    lock = (lockdown_out or "").strip().lower()
+
+    if efivar_byte == "0":
+        return False, ("firmware reports Secure Boot DISABLED (SecureBoot "
+                       "efivar = 0) — the guest did not boot under Secure Boot")
+    if "secureboot disabled" in mok:
+        return False, "mokutil reports SecureBoot disabled"
+
+    if efivar_byte == "1":
+        extra = f"; lockdown={lock}" if lock else ""
+        return True, f"firmware reports Secure Boot ENABLED (SecureBoot efivar = 1){extra}"
+    if "secureboot enabled" in mok:
+        return True, "mokutil reports SecureBoot enabled"
+    if "[integrity]" in lock or "[confidentiality]" in lock:
+        return True, (f"kernel lockdown is active ({lock}) — SB-enabled boot "
+                      "(the SecureBoot efivar was unreadable)")
+
+    return False, (
+        "could not observe Secure Boot state at all "
+        f"(efivar={efivar_byte!r}, mokutil={mok!r}, lockdown={lock!r}). The "
+        "production posture is SB ON; a gate that cannot see the property is "
+        "not asserting it, so this FAILS rather than passing silently.")
 
 
 def _qemu_img_verdict(imginfo, min_bytes):
@@ -98,6 +236,508 @@ def _qemu_img_verdict(imginfo, min_bytes):
         return False, (f"virtual-size {vsize} below the {min_bytes}-byte bake floor "
                        "— truncated / incomplete image")
     return True, f"qcow2, virtual-size {vsize / (1024 ** 3):.1f}GiB"
+
+
+# ── #1930 LANE-1 A/B slot registration (#6494) ────────────────────────
+# The bake STAGES /boot/efi/EFI/{xpf-A,xpf-B} and ENABLES xpf-uefi-slots.service
+# + xpf-kernel-promote.service, and hard-asserts the signed shim is there. What
+# it cannot assert offline is the half that only happens in-guest: UEFI Boot####
+# variables live in the target's firmware NVRAM, which virt-customize cannot
+# write, so registration is a first-boot oneshot on the real machine.
+#
+# That oneshot is deliberately NON-FATAL on every failure path ("degraded, not
+# bricked" — a read-only/no-efivars platform must still boot), and nothing
+# downstream re-read its outcome. So a regression in the ESP disk/part parse,
+# the loader-path match, or the efibootmgr write shipped a fully "validated"
+# image whose verify-gated kernel channel was silently unavailable, and the
+# operator discovered it only when `xpfd upgrade kernel arm` exited 2 with "A/B
+# slots not both registered ... the first-boot registration oneshot must run
+# first" (pkg/upgrade/kernel_run.go ErrKernelChannelUnavailable).
+#
+# A gate for a production appliance image should prove the upgrade substrate it
+# ships, not only the files that substrate is made of.
+#
+# The slots the #1930 channel requires. Both must exist; the channel refuses to
+# arm unless BOTH are registered, so one is as unavailable as none.
+_AB_SLOTS = ("xpf-A", "xpf-B")
+
+# An efibootmgr entry line is "BootXXXX[*]<space>LABEL<TAB>loader-path". The
+# label is followed by a TAB and the path, NOT line-end — anchoring at $ is the
+# miss that created duplicate slots live during #1930. Mirrors the shell regex
+# in scripts/image/xpf-uefi-slots register_slot() on purpose: the gate must
+# agree with the script about what "registered" means, or it certifies a state
+# the script would not accept.
+_EFIBOOT_ENTRY_RE = re.compile(
+    r"^Boot([0-9A-Fa-f]{4})\*?[ \t]+(?P<label>\S+)[ \t]+(?P<rest>.*)$")
+_BOOTORDER_RE = re.compile(r"^BootOrder:\s*(?P<order>\S*)\s*$", re.MULTILINE)
+
+
+def _efibootmgr_slot_verdict(out, slots=_AB_SLOTS):
+    """Pure verdict over `efibootmgr` (or `efibootmgr -v`) output: are BOTH
+    #1930 A/B slots registered exactly once, each pointing at its own signed
+    shim, and both reachable in BootOrder? Returns (ok, reason).
+
+    Split out from the scenario so the acceptance criterion is unit-testable
+    without a hypervisor, in the _qemu_img_verdict idiom (#4209 H-9).
+
+    Three separate properties, reported separately, because they have three
+    different causes:
+      - exactly once  -> a duplicate means the registration guard's label match
+                         missed (the #1930 live bug); a duplicate ALSO poisons
+                         BootNext, since which Boot#### the slot means is then
+                         ambiguous.
+      - loader path   -> an entry that merely shares the LABEL but points
+                         elsewhere chainloads the wrong loader.
+      - in BootOrder  -> a slot the firmware will never reach is registered but
+                         unusable, which is not "registered" in any sense the
+                         kernel channel can act on.
+    """
+    ids = {}          # slot -> [Boot#### ids with the RIGHT loader path]
+    wrong_path = {}   # slot -> [rendered lines whose path does not match]
+    for line in out.splitlines():
+        m = _EFIBOOT_ENTRY_RE.match(line.rstrip())
+        if not m:
+            continue
+        label = m.group("label")
+        if label not in slots:
+            continue
+        # efibootmgr prints "...File(\EFI\xpf-A\shimx64.efi)" or the bare
+        # "...\EFI\xpf-A\shimx64.efi". Match the slot's shim path with any
+        # separator between the components and case-insensitively, exactly as
+        # the shell guard does (grep -qiE "EFI.${slot}.shimx64\.efi").
+        want = re.compile(r"EFI.%s.shimx64\.efi" % re.escape(label), re.IGNORECASE)
+        if want.search(m.group("rest")):
+            ids.setdefault(label, []).append(m.group(1))
+        else:
+            wrong_path.setdefault(label, []).append(line.strip())
+
+    problems = []
+    for slot in slots:
+        got = ids.get(slot, [])
+        if not got:
+            bad = wrong_path.get(slot)
+            if bad:
+                problems.append(
+                    f"{slot}: registered but the loader path is NOT "
+                    f"\\EFI\\{slot}\\shimx64.efi ({bad!r}) — it would chainload "
+                    "the wrong loader")
+            else:
+                problems.append(
+                    f"{slot}: NOT registered — the first-boot xpf-uefi-slots "
+                    "oneshot did not create it (LANE-1 kernel channel "
+                    "unavailable on this image)")
+        elif len(got) > 1:
+            problems.append(
+                f"{slot}: registered {len(got)} times ({', '.join(got)}) — a "
+                "duplicated slot makes BootNext ambiguous")
+
+    mo = _BOOTORDER_RE.search(out)
+    if mo is None:
+        problems.append("efibootmgr reported no BootOrder line — cannot prove "
+                        "either slot is reachable by the firmware")
+    else:
+        order = [x for x in mo.group("order").split(",") if x]
+        for slot in slots:
+            got = ids.get(slot, [])
+            if got and not any(i.upper() in (o.upper() for o in order) for i in got):
+                problems.append(
+                    f"{slot}: registered ({got[0]}) but absent from BootOrder "
+                    f"({mo.group('order')!r}) — the firmware would never reach it")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, ("both A/B slots registered exactly once with the right shim "
+                  "loader and present in BootOrder")
+
+
+# The three files the bake stages into EACH slot dir, and the selector's own
+# variable names. Kept in the same place as the slot list so the ESP-staging
+# assertion and the registration assertion are read together.
+#
+# Both halves matter and fail differently:
+#   - shimx64.efi/grubx64.efi ABSENT -> xpf-uefi-slots' register_slot() sees no
+#     shim, returns 1, and the slot is NEVER registered. That failure surfaces
+#     downstream as "slot not registered", so asserting the staging separately
+#     is what tells an operator whether the BAKE or the in-guest ONESHOT broke.
+#   - xpf.selector absent or naming the WRONG kernel -> the slot registers fine
+#     and boots, but GRUB's 09_xpf branch sources a selector that points at a
+#     vmlinuz/initrd pair that is not on this image, so THAT slot is a dead
+#     boot entry. Nothing else in the gate would notice: the entry exists, the
+#     oneshot exits 0, and the failure only appears when the firmware actually
+#     falls through to that slot — i.e. during a rollback, the one moment the
+#     channel exists for.
+_AB_SLOT_FILES = ("shimx64.efi", "grubx64.efi", "xpf.selector")
+_SELECTOR_VARS = {"xpf_slot_kernel": "vmlinuz-", "xpf_slot_initrd": "initrd.img-"}
+
+# `set xpf_slot_kernel="vmlinuz-7.0.0-15-generic"` — the GRUB-script form
+# bake.py seeds and scripts/image/grub.d/09_xpf sources. Quotes optional so a
+# hand-edited selector without them still parses (and is then judged on its
+# VALUE, not rejected on its punctuation).
+_SELECTOR_SET_RE = re.compile(
+    r'^\s*set\s+(?P<var>xpf_slot_\w+)\s*=\s*"?(?P<val>[^"\s]*)"?\s*$')
+
+
+# In-guest probe feeding _ab_slot_esp_verdict. Emits a flat line protocol
+# rather than raw `ls`/`cat` output so the verdict is a pure function over
+# something stable: no locale, no ls format, no ordering assumptions. Every
+# required file is reported either way (present AND MISSING lines), so a probe
+# that silently produced nothing cannot be mistaken for a clean run.
+_AB_SLOT_ESP_PROBE = (
+    "for slot in " + " ".join(_AB_SLOTS) + "; do "
+    "d=/boot/efi/EFI/$slot; "
+    "for f in " + " ".join(_AB_SLOT_FILES) + "; do "
+    'if [ -f "$d/$f" ]; then echo "FILE $slot $f present"; '
+    'else echo "FILE $slot $f MISSING"; fi; done; '
+    'if [ -f "$d/xpf.selector" ]; then '
+    'while IFS= read -r l; do echo "SEL $slot $l"; done < "$d/xpf.selector"; '
+    "fi; done"
+)
+
+
+def _ab_slot_esp_verdict(out, kver, slots=_AB_SLOTS):
+    """Pure verdict over the in-guest ESP probe: is each #1930 A/B slot dir
+    fully staged, and does each slot's selector name the RUNNING kernel?
+    Returns (ok, reason).
+
+    `out` is the probe's line protocol (see Harness._probe_ab_slot_esp):
+        FILE <slot> <name> present|MISSING
+        SEL  <slot> <verbatim selector line>
+
+    A slot whose selector file is missing is reported ONCE (as a missing file);
+    its variable values are not additionally reported, so one defect produces
+    one diagnosis rather than three.
+
+    Naming the RUNNING kernel is the right assertion on a FACTORY boot, which
+    is the only place this is called (scenario A): the bake seeds both
+    selectors at `ls /lib/modules | sort -V | tail -1` and hard-asserts exactly
+    one kernel remains, and scenario A re-asserts that count, so the running
+    kernel IS the seeded one. After a promotion the two selectors legitimately
+    differ — asserting equality there would be wrong, which is why this is a
+    scenario-A assertion and not a general one.
+    """
+    present = {}   # slot -> set(filenames found)
+    missing = {}   # slot -> [filenames reported MISSING]
+    sel = {}       # slot -> {var: value}
+    for line in (out or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 4 and parts[0] == "FILE":
+            _, slot, fname, state = parts[:4]
+            if state == "present":
+                present.setdefault(slot, set()).add(fname)
+            else:
+                missing.setdefault(slot, []).append(fname)
+        elif len(parts) >= 3 and parts[0] == "SEL":
+            m = _SELECTOR_SET_RE.match(line.split(None, 2)[2])
+            if m:
+                sel.setdefault(parts[1], {})[m.group("var")] = m.group("val")
+
+    problems = []
+    for slot in slots:
+        got = present.get(slot, set())
+        absent = [f for f in _AB_SLOT_FILES if f not in got]
+        if absent:
+            problems.append(
+                f"{slot}: /boot/efi/EFI/{slot} is missing {', '.join(absent)} "
+                "— the bake did not stage this slot, so xpf-uefi-slots can "
+                "never register it (LANE-1 unavailable on this image)")
+            continue
+        vals = sel.get(slot, {})
+        for var, prefix in sorted(_SELECTOR_VARS.items()):
+            want = prefix + kver
+            got_val = vals.get(var)
+            if got_val is None:
+                problems.append(
+                    f"{slot}: xpf.selector does not set {var} — GRUB's 09_xpf "
+                    "branch would source a selector that names no kernel")
+            elif got_val != want:
+                problems.append(
+                    f"{slot}: xpf.selector sets {var}={got_val!r}, not "
+                    f"{want!r} (the running kernel) — this slot would "
+                    "chainload a kernel this image does not ship")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, (f"both A/B slot dirs fully staged ({', '.join(_AB_SLOT_FILES)}) "
+                  f"with selectors seeded at the running kernel {kver}")
+
+
+# ── #1930 INC-0 kernel hold (#6498) ───────────────────────────────────
+# The bake HOLDS the kernel so an unattended apt run cannot move the running
+# kernel out from under the verifier-gated shim .o (#1864): a kernel the .o was
+# never verified against can REJECT it at boot, i.e. no dataplane. bake.py
+# verifies the hold at bake time; nothing re-read it on the booted image, so a
+# hold that did not survive virt-sysprep/export/first boot shipped green.
+#
+# ENUMERATION, and why it is NOT the literal `linux-*`. #6498's acceptance
+# criterion says "every installed linux-* package appears in apt-mark showhold".
+# Taken literally that assertion REDS every valid image: `linux-base` is a hard
+# dependency of linux-image-*-generic, and `linux-libc-dev` /
+# `linux-sysctl-defaults` are installed too — none are kernel packages and
+# bake.py deliberately does not hold them. The property the criterion reaches
+# for is "the kernel cannot move", so the gate enumerates exactly the set
+# bake.py holds. The globs are MIRRORED from bake.py's hold fragment on
+# purpose and a drift canary asserts the two agree
+# (test_validate_ab_substrate_6498.py): a gate that enumerated a different set
+# than the bake holds would either red on a good image or certify an
+# unprotected one.
+_KERNEL_PKG_GLOBS = ("linux-image-*", "linux-headers-*", "linux-modules-*",
+                     "linux-generic")
+
+
+# The guest-side enumeration. Mirrors bake.py's hold fragment exactly: the
+# same globs, the same ${db:Status-Status} filter (dpkg-query -W matches every
+# package dpkg KNOWS OF, including purged and never-installed names that
+# `apt-mark hold` cannot select — the #1926 abort).
+_INSTALLED_KERNEL_PKGS_PROBE = (
+    "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' "
+    + " ".join(f"'{g}'" for g in _KERNEL_PKG_GLOBS)
+    + " 2>/dev/null | awk '$1==\"installed\"{print $2}' | sort -u"
+)
+
+
+def _kernel_hold_verdict(installed, held):
+    """Pure verdict over the guest's kernel-package enumeration and
+    `apt-mark showhold`: is every installed kernel package held?
+    Returns (ok, reason).
+
+    An EMPTY enumeration is a FAIL, not a vacuous pass. That is the whole
+    failure mode this guards: bake.py's own hold fragment aborted every bake
+    twice during #1926 because the enumeration collapsed to nothing (an
+    unescaped `${Package}`, then dpkg-query returning never-installed names),
+    and an "all zero of them are held" pass here would argue against anyone
+    ever re-examining it.
+    """
+    inst = sorted({p for p in (installed or "").split() if p})
+    hold = {p for p in (held or "").split() if p}
+    if not inst:
+        return False, (
+            "could not enumerate any INSTALLED kernel package in the guest "
+            f"({', '.join(_KERNEL_PKG_GLOBS)}) — the image ships a kernel, so "
+            "an empty enumeration is a broken probe (or a broken image), not "
+            "an image with nothing to hold. Refusing to pass vacuously")
+    unheld = [p for p in inst if p not in hold]
+    if unheld:
+        return False, (
+            f"{len(unheld)} of {len(inst)} installed kernel packages are NOT "
+            f"in `apt-mark showhold`: {', '.join(unheld)} — an unattended apt "
+            "run can move the kernel out from under the verifier-gated shim "
+            ".o (#1864/#1930 INC-0), which can leave the appliance with no "
+            "dataplane after a background upgrade")
+    return True, (f"all {len(inst)} installed kernel packages held "
+                  f"({', '.join(inst)})")
+
+
+def _oneshot_clean_verdict(name, exec_main_status, active_state, result):
+    """Pure verdict over `systemctl show` fields for a first-boot oneshot:
+    did it RUN and exit 0? Returns (ok, reason).
+
+    A oneshot with RemainAfterExit=yes reports ActiveState=active after a clean
+    run. The distinction that matters is "did not run" vs "ran and failed":
+    inactive means a Condition skipped it (the unit was never enabled, or
+    ConditionPathExists=/boot/efi did not hold — an image with no ESP), which
+    is a DIFFERENT bake defect from a non-zero exit, so they are reported
+    separately rather than as one 'not clean'.
+    """
+    if active_state in ("inactive", "") and result in ("", "success"):
+        return False, (f"{name} never ran (ActiveState={active_state!r}) — the "
+                       "bake did not enable it, or its Condition did not hold "
+                       "on this image")
+    if result and result != "success":
+        return False, f"{name} failed (Result={result!r}, ExecMainStatus={exec_main_status!r})"
+    if exec_main_status not in ("0", 0):
+        return False, f"{name} exited {exec_main_status!r}, not 0"
+    return True, f"{name} ran clean (ExecMainStatus=0)"
+
+
+# ── day-0 config permissions (#6503) ──────────────────────────────────
+# The day-0 loader installs /etc/xpf/xpf.conf mode 0600 because it "may carry
+# credential material (root-authentication encrypted-password, IKE PSKs)"
+# (scripts/image/xpf-day0-config). Scenario B asserted the file EXISTS and is
+# non-empty (`test -s`) and nothing about the mode — docs/image-validation.md
+# said so in as many words — so a regression to 0644 would ship
+# world-readable IKE PSKs and password hashes in a signed image and pass the
+# Tier-1 gate.
+#
+# The probe reads three fields from ONE `stat`, because a mode check alone has
+# a hole: `stat` follows a symlink only with -L, so without it a symlinked
+# xpf.conf reports the LINK's 0777 — but a naive check that ran `stat -L`
+# would report the TARGET's mode while the file an attacker controls is the
+# link. A credential file must be a regular file, owned by root, mode exactly
+# 0600.
+_DAY0_CONF = "/etc/xpf/xpf.conf"
+_DAY0_CONF_STAT = f"stat -c '%a %U:%G %F' {_DAY0_CONF} 2>/dev/null"
+
+
+def _conf_mode_verdict(stat_out, want_mode=0o600, want_owner="root:root"):
+    """Pure verdict over `stat -c '%a %U:%G %F'` for the installed day-0
+    config: is it a root-owned regular file with exactly mode 0600?
+    Returns (ok, reason).
+
+    The mode is compared as an OCTAL VALUE, not as a string. This is
+    ROBUSTNESS, not a caught bug: GNU `stat -c %a` emits "600" unpadded, so a
+    string compare against "600" rejects "4600" (a setuid bit) just as an int
+    compare does. What the value compare buys is independence from the
+    RENDERING — a zero-padded "0600" from a non-GNU stat is the same mode and
+    must not be a false red, while every extra bit is still rejected because
+    0o4600 != 0o600. Said plainly because the reverse claim (that a string
+    compare would let 4600 through) is FALSE and was in an earlier draft of
+    this comment; the mutation matrix caught it.
+
+    Unreadable / absent output is a FAIL, not a pass. A gate that cannot
+    observe the property it exists to assert has not asserted it.
+    """
+    fields = (stat_out or "").strip().split(None, 2)
+    if len(fields) < 3:
+        return False, (
+            f"could not stat {_DAY0_CONF} in the guest (got {stat_out!r}) — "
+            "the day-0 config is missing, or the probe failed; either way the "
+            "permission is unobserved, which is not the same as satisfied")
+    mode_s, owner, ftype = fields
+    try:
+        mode = int(mode_s, 8)
+    except ValueError:
+        return False, f"{_DAY0_CONF}: unparseable mode {mode_s!r}"
+
+    problems = []
+    if ftype != "regular file":
+        problems.append(
+            f"is a {ftype!r}, not a regular file — a symlinked config puts the "
+            "bytes xpfd reads outside the mode this gate checks")
+    if mode != want_mode:
+        problems.append(
+            f"has mode {mode_s} (0o{mode:o}), not {want_mode:04o} — a day-0 "
+            "config may carry root-authentication encrypted-password and IKE "
+            "PSKs, so any extra bit makes them readable to every local user "
+            "on the appliance")
+    if owner != want_owner:
+        problems.append(f"is owned by {owner}, not {want_owner}")
+    if problems:
+        return False, f"{_DAY0_CONF} " + "; ".join(problems)
+    return True, f"{_DAY0_CONF} is a root:root regular file, mode {mode_s}"
+
+
+# ── Image seal / clone identity (#6547) ──────────────────────────────
+#
+# The bake seals the image with virt-sysprep so no PER-DEVICE IDENTITY ships
+# inside the golden artifact: every appliance must regenerate its own
+# machine-id, SSH host keys, SNMPv3 EngineID and random-seed on first boot.
+# This gate — the last thing between a bake and a release signature — asserted
+# NOTHING about that. A clone-identity regression therefore shipped SIGNED and
+# passed the publish gate.
+#
+# The acute risk was bounded (bake's `run()` is check=True, so an outright
+# virt-sysprep failure raises), but the real exposure is DRIFT: the `--enable`
+# list was a hand-maintained string literal and the identity purge is a
+# `rm -rf ... 2>/dev/null || true` whose failure is swallowed by construction.
+# Nothing would have caught a member falling out of either, or the step being
+# refactored away. The consequence is fleet-wide shared SSH host keys (every
+# appliance answers with the same host identity, so an operator's known_hosts
+# cannot distinguish one from an impostor), a shared machine-id, and a shared
+# SNMPv3 EngineID — from which every clone derives BYTE-IDENTICAL localized USM
+# keys and will accept another appliance's authenticated SNMPv3 requests.
+#
+# The assertion is made OFFLINE, against the exported qcow2, and that is not an
+# implementation convenience — it is the only place the property is observable.
+# Inside a BOOTED guest every one of these identities has already been
+# regenerated by first boot, so an in-guest probe would find a machine-id and
+# host keys present and could not tell a freshly-generated identity from a
+# baked-in one. The shipped bytes are what the operator receives, so the
+# shipped bytes are what is checked.
+#
+# Each entry names the seal step that produces its outcome. The hermetic test
+# (test_validate_image_seal_6547.py) binds those names to bake.py's
+# SYSPREP_ENABLE_OPS / SYSPREP_PURGE_PATHS, so dropping a member from the bake
+# reds — the seal and the gate that verifies it cannot drift apart silently.
+#
+# kind:
+#   "empty"  — the path may exist but MUST be empty (systemd's uninitialized
+#              machine-id is a present, zero-byte file; virt-sysprep truncates
+#              rather than deletes it, and an absent file is equally fine).
+#   "absent" — nothing may match the glob at all.
+_SEAL_IDENTITY_CHECKS = (
+    {
+        "glob": "/etc/machine-id",
+        "kind": "empty",
+        "sealed_by": "machine-id",
+        "why": "a shared machine-id gives every appliance one systemd/journal "
+               "identity and seeds derived per-host secrets identically",
+    },
+    {
+        "glob": "/etc/ssh/ssh_host_*",
+        "kind": "absent",
+        "sealed_by": "ssh-hostkeys",
+        "why": "a shared SSH host key means every appliance answers with the "
+               "same host identity, so known_hosts cannot tell one from an "
+               "impostor and a stolen key impersonates the whole fleet",
+    },
+    {
+        "glob": "/var/lib/xpf/snmp-engine-id",
+        "kind": "absent",
+        "sealed_by": "/var/lib/xpf/snmp-engine-id",
+        "why": "a shared SNMPv3 EngineID makes every clone derive "
+               "byte-identical localized USM keys, so each appliance accepts "
+               "another's authenticated SNMPv3 requests (#5283)",
+    },
+    {
+        "glob": "/var/lib/xpf/snmp-engineboots",
+        "kind": "absent",
+        "sealed_by": "/var/lib/xpf/snmp-engineboots",
+        "why": "a shipped engineBoots counter replays against the SNMPv3 "
+               "time-window check (#5283)",
+    },
+    {
+        "glob": "/var/lib/systemd/random-seed",
+        "kind": "absent",
+        "sealed_by": "/var/lib/systemd/random-seed",
+        "why": "a shared random-seed credits identical entropy into every "
+               "appliance's pool at the same point in early boot",
+    },
+)
+
+
+def _image_seal_verdict(found, checks=_SEAL_IDENTITY_CHECKS):
+    """Pure verdict over the offline image inventory: does the exported qcow2
+    carry any per-device identity? Returns (ok, reason).
+
+    `found` maps each check's glob to the list of paths present in the image
+    for it, plus — for an "empty" check — the file's byte length under the key
+    `"<glob>:size"`. A glob MISSING from `found` is a FAIL, not a pass: a gate
+    that could not observe the property it exists to assert has not asserted
+    it, and an unreadable image is exactly when a silent pass is most costly.
+
+    Every failing check is reported, not just the first. These are independent
+    identities and an operator re-baking should see all of them at once rather
+    than rediscovering them one signature attempt at a time.
+    """
+    problems = []
+    for c in checks:
+        glob = c["glob"]
+        if glob not in found:
+            problems.append(
+                f"{glob}: NOT OBSERVED — the image inventory carries no result "
+                f"for it, so the {c['sealed_by']!r} seal step is unverified "
+                "(an unobserved property is not a satisfied one)")
+            continue
+        hits = found[glob]
+        if c["kind"] == "absent":
+            if hits:
+                problems.append(
+                    f"{glob}: image ships {len(hits)} file(s) "
+                    f"({', '.join(sorted(hits)[:4])}) — the {c['sealed_by']!r} "
+                    f"seal step did not take effect; {c['why']}")
+            continue
+        # kind == "empty"
+        size = found.get(f"{glob}:size")
+        if hits and size:
+            problems.append(
+                f"{glob}: image ships {size} bytes of content — the "
+                f"{c['sealed_by']!r} seal step did not take effect; {c['why']}")
+    if problems:
+        return False, ("image is NOT sealed — a per-device identity would ship "
+                       "inside the signed artifact and be shared by every "
+                       "clone: " + "; ".join(problems))
+    return True, ("image seal verified: no machine-id, SSH host key, SNMPv3 "
+                  "EngineID/engineBoots or random-seed ships in the artifact")
 
 
 def _find_first(candidates):
@@ -235,6 +875,62 @@ class Harness:
         info(f"signature OK: {os.path.basename(self.qcow2)} + "
              f"{os.path.basename(self.metadata)} (manifest {os.path.basename(chosen)})")
 
+    def assert_image_sealed(self):
+        """Assert the exported qcow2 carries NO per-device identity (#6547).
+
+        Runs BEFORE the image is imported or booted, and reads the artifact
+        OFFLINE with libguestfs — the only place the property is observable.
+        By the time a guest is up, first boot has regenerated the machine-id,
+        the SSH host keys and the random-seed, so an in-guest probe finds them
+        present and cannot distinguish a freshly-generated identity from a
+        baked-in one.
+
+        libguestfs missing is a FAILURE, not a skip. This gate is the last step
+        before a release signature, it runs on the host that just baked the
+        image (bake.py already `require()`s virt-cat and the rest of
+        libguestfs-tools), and a security gate that skips itself when its tool
+        is absent is the vacuous-gate shape this check exists to remove.
+        """
+        info("verifying image seal (no per-device identity in the artifact)...")
+        for tool in ("virt-ls", "virt-cat"):
+            if shutil.which(tool) is None:
+                fail(f"{tool} not found — install libguestfs-tools. The image "
+                     "seal cannot be verified without reading the artifact, "
+                     "and an unverified seal must not be signed (#6547)")
+
+        found = {}
+        for c in _SEAL_IDENTITY_CHECKS:
+            glob = c["glob"]
+            directory, _, pattern = glob.rpartition("/")
+            directory = directory or "/"
+            # virt-ls a DIRECTORY (not the glob) and filter here: virt-ls does
+            # not expand shell globs, and an absent directory must read as "no
+            # matches" rather than as an unobserved check.
+            r = subprocess.run(["virt-ls", "-a", self.qcow2, directory],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                if "No such file or directory" in (r.stderr or ""):
+                    found[glob] = []
+                    continue
+                fail(f"could not read {directory} from {self.qcow2}: "
+                     f"{(r.stderr or '').strip()} (#6547 seal unverifiable)")
+            names = [n for n in (r.stdout or "").split() if n]
+            hits = [f"{directory.rstrip('/')}/{n}"
+                    for n in names if fnmatch.fnmatch(n, pattern)]
+            found[glob] = hits
+            if c["kind"] == "empty" and hits:
+                cat = subprocess.run(["virt-cat", "-a", self.qcow2, glob],
+                                     capture_output=True, text=True)
+                if cat.returncode != 0:
+                    fail(f"could not read {glob} from {self.qcow2}: "
+                         f"{(cat.stderr or '').strip()} (#6547 seal unverifiable)")
+                found[f"{glob}:size"] = len((cat.stdout or "").strip())
+
+        ok, reason = _image_seal_verdict(found)
+        if not ok:
+            fail(reason)
+        info(reason)
+
     def import_image(self):
         self.verify_signatures()
         # self.alias is run-namespaced, so a concurrent bake using the default
@@ -252,8 +948,15 @@ class Harness:
         self._owned_delete(name)
         # Tag the instance with this run's ownership token so drop()/cleanup()
         # can prove it is ours before force-deleting (#4905-D).
+        # security.secureboot EXPLICITLY (#6497). incus defaults it to true
+        # today, but the gate must not INHERIT the posture it exists to prove:
+        # a default flip, a profile override, or a host image without the MS db
+        # would silently degrade every scenario to SB-off and still pass. The
+        # production posture is SB ON (test/incus/setup.sh:265-273, #1943), so
+        # the gate states it.
         incus("init", self.alias, name, "--vm", "--network", self.net,
               "-c", "limits.cpu=2", "-c", "limits.memory=2GiB",
+              "-c", "security.secureboot=true",
               "-c", f"user.xpf-owner={self.run_id}", capture=True)
         # Register for teardown IMMEDIATELY after init, not after the device
         # adds below. The instance exists and carries this run's ownership tag
@@ -353,6 +1056,8 @@ class Harness:
             fail("more than one kernel in /lib/modules — stale cloudimg kernel not purged")
         if not guest_sh(a, 'grep -qw init_on_alloc=0 /proc/cmdline'):
             fail("init_on_alloc=0 missing from the booted kernel cmdline")
+        self.assert_kernel_hold(a)
+        self.assert_secure_boot(a)
         info("in-guest verify-dataplane (the bake gate, image kernel)...")
         if guest(a, "nice", "-n", "19", "/usr/local/sbin/xpfd", "verify-dataplane",
                  check=False).returncode != 0:
@@ -386,6 +1091,7 @@ class Harness:
             fail("sshd effective config does not refuse root password auth")
         if not guest_sh(a, '/usr/sbin/sshd -T | grep -qx "permitemptypasswords no"'):
             fail("sshd effective config does not pin PermitEmptyPasswords no")
+        self.assert_ab_kernel_channel(a)
         if guest(a, "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
             fail("unexpected /etc/xpf/xpf.conf")
         if guest(a, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
@@ -395,6 +1101,187 @@ class Harness:
             fail("day-0 loader did not log the no-medium fallback")
         info("Scenario A PASS")
         self.drop(a)
+
+    def assert_kernel_hold(self, inst):
+        """Assert the #1930 INC-0 kernel hold survived onto the BOOTED image
+        (#6498) — every installed kernel package is in `apt-mark showhold`.
+
+        bake.py verifies the hold at bake time (per-package, not a count), but
+        that check runs inside virt-customize, before virt-sysprep, the
+        sparsify/export, and the first boot. Nothing re-read it afterwards, so
+        a hold that did not survive any of those steps shipped in a signed,
+        `validated: true` image — and the consequence is not cosmetic: an
+        unattended apt run that moves the kernel can leave the appliance
+        booting a kernel the verifier-gated shim .o was never verified
+        against, i.e. with no dataplane.
+
+        The unattended-upgrades blacklist (99-xpf-kernel-hold) is the second
+        half of the same protection, but it is a `--write` of a static file
+        with no in-guest behaviour to observe short of running an actual
+        unattended-upgrade — so this asserts the half that has an observable.
+        """
+        inst_pkgs = guest(inst, "sh", "-c", _INSTALLED_KERNEL_PKGS_PROBE,
+                          check=False, capture=True).stdout
+        held = guest(inst, "sh", "-c", "apt-mark showhold 2>/dev/null",
+                     check=False, capture=True).stdout
+        ok, reason = _kernel_hold_verdict(inst_pkgs, held)
+        if not ok:
+            fail("#1930 INC-0 kernel hold assertion FAILED: " + reason)
+        info(f"kernel hold: {reason}")
+
+    def assert_day0_conf_perms(self, inst):
+        """Assert the installed day-0 config's credential posture (#6503).
+
+        Called from every scenario where the loader actually INSTALLS a config
+        — B (valid drive), C's retry leg (fix + reboot applies), and E
+        (node-id drive) — because they all reach the same `install -o root -g
+        root -m 0600` and a regression there would ship in a signed image from
+        any of them.
+
+        Deliberately NOT asserted: /etc/xpf's own directory mode. The loader
+        sets it best-effort (`chmod 0750 ... || true`) and the directory comes
+        from the .deb on a real appliance, so it is not the loader's contract
+        to pin here.
+        """
+        out = guest(inst, "sh", "-c", _DAY0_CONF_STAT,
+                    check=False, capture=True).stdout
+        ok, reason = _conf_mode_verdict(out)
+        if not ok:
+            fail("day-0 config permission assertion FAILED: " + reason +
+                 "\n  The loader installs it 0600 precisely because it may "
+                 "carry credential material (scripts/image/xpf-day0-config); "
+                 "the Tier-1 gate has to pin that, exactly as scenario A pins "
+                 "the sshd posture.")
+        info(f"day-0 config perms: {reason}")
+
+    def assert_secure_boot(self, inst):
+        """Assert the guest actually booted under UEFI Secure Boot (#6497).
+
+        Reads three independent sources and lets _secureboot_verdict decide, so
+        the reason a reading is missing is distinguished from the property being
+        false:
+
+          - byte 4 of the SecureBoot EFI variable. AUTHORITATIVE and
+            package-free — the first 4 bytes of an efivarfs file are the
+            variable's attributes, so the flag is at offset 4.
+          - `mokutil --sb-state`, when present. mokutil is NOT in bake.py's
+            RUNTIME_PACKAGES, so this is a bonus reading, never a requirement:
+            asserting through mokutil alone would turn a package-set change
+            into a Secure Boot "regression".
+          - /sys/kernel/security/lockdown, corroborating only (lockdown can also
+            be forced from the cmdline, so it never overrides a definite off).
+        """
+        efivar = guest(inst, "sh", "-c",
+                       f"od -An -t u1 -j 4 -N 1 {_SECUREBOOT_EFIVAR} 2>/dev/null",
+                       check=False, capture=True).stdout.strip()
+        mok = guest(inst, "sh", "-c",
+                    "command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null",
+                    check=False, capture=True).stdout.strip()
+        lock = guest(inst, "sh", "-c",
+                     "cat /sys/kernel/security/lockdown 2>/dev/null",
+                     check=False, capture=True).stdout.strip()
+        ok, reason = _secureboot_verdict(efivar, mok, lock)
+        if not ok:
+            fail("Secure Boot assertion FAILED: " + reason +
+                 "\n  The appliance's production posture is Secure Boot ON "
+                 "(#1943). The #1930 A/B slot selector (scripts/image/grub.d/"
+                 "09_xpf) is written as a GRUB script specifically because "
+                 "`regexp` may be unavailable under Secure-Boot lockdown, so an "
+                 "SB-off validation run does not exercise the chain this image "
+                 "ships.")
+        info(f"Secure Boot: {reason}")
+    def _show_unit(self, inst, unit, prop):
+        """One `systemctl show -p <prop> --value <unit>` field from the guest."""
+        return guest(inst, "systemctl", "show", "-p", prop, "--value", unit,
+                     check=False, capture=True).stdout.strip()
+
+    def assert_ab_kernel_channel(self, inst):
+        """Assert the #1930 LANE-1 A/B kernel-channel substrate actually came
+        up IN THE GUEST (#6494) — not merely that the bake staged its files.
+
+        Three things, in the order their failures would be diagnosed:
+          1. the registration oneshot ran clean (it is non-fatal by design, so
+             its own exit is the only place a failure is recorded at all);
+          2. both slots are registered exactly once, with the right shim loader,
+             and reachable in BootOrder — the state `xpfd upgrade kernel arm`
+             refuses to proceed without;
+          3. the promotion gate ran clean on this ordinary boot.
+
+        On (3), note what is NOT asserted: the "promotion gate: clean" line.
+        That line is only emitted once the gate has exec'd xpfd to run the
+        promote verb. On a factory boot with nothing armed the script exits 0
+        much earlier, logging "no armed kernel candidate recorded", so requiring
+        the former here would fail every good image. What IS asserted is that
+        the unit ran and exited 0, plus the ordinary-boot line, which together
+        prove the gate EXECUTED rather than being skipped by a Condition — the
+        thing an operator is relying on when they arm a candidate later.
+        """
+        info("#1930 LANE-1: A/B slot registration + promotion gate...")
+
+        # Both oneshots are WantedBy=multi-user.target and are NOT ordered
+        # Before=xpfd (deliberately — a hanging efibootmgr must never block the
+        # #1922 mgmt lifeline), so xpfd being active does not imply they have
+        # finished. Wait for each to settle rather than racing it.
+        for unit in ("xpf-uefi-slots.service", "xpf-kernel-promote.service"):
+            self._wait(inst,
+                       lambda u=unit: self._show_unit(inst, u, "ActiveState")
+                       not in ("activating", "reloading"),
+                       40, 3, f"{unit} still activating after 120s")
+
+        ok, reason = _oneshot_clean_verdict(
+            "xpf-uefi-slots.service",
+            self._show_unit(inst, "xpf-uefi-slots.service", "ExecMainStatus"),
+            self._show_unit(inst, "xpf-uefi-slots.service", "ActiveState"),
+            self._show_unit(inst, "xpf-uefi-slots.service", "Result"))
+        if not ok:
+            jrn = guest(inst, "journalctl", "-u", "xpf-uefi-slots", "-b",
+                        "--no-pager", check=False, capture=True).stdout
+            fail(f"#1930 A/B slot registration: {reason}\n{jrn[-800:]}")
+
+        # The ESP dirs are the PRECONDITION for registration: register_slot()
+        # returns 1 without ever calling efibootmgr when a slot has no shim. So
+        # assert the staging BEFORE the NVRAM state — otherwise an unstaged
+        # slot is diagnosed as "the oneshot did not register it", pointing at
+        # the wrong half of the channel.
+        kver = guest(inst, "uname", "-r", capture=True).stdout.strip()
+        esp = guest(inst, "sh", "-c", _AB_SLOT_ESP_PROBE,
+                    check=False, capture=True).stdout
+        ok, reason = _ab_slot_esp_verdict(esp, kver)
+        if not ok:
+            fail("#1930 A/B slot ESP staging FAILED in-guest: " + reason +
+                 "\n--- probe ---\n" + esp)
+        info(f"  ESP OK: {reason}")
+
+        got = guest(inst, "efibootmgr", check=False, capture=True)
+        if got.returncode != 0:
+            fail("efibootmgr failed in the guest "
+                 f"(rc={got.returncode}: {(got.stderr or '').strip()!r}) — the "
+                 "#1930 A/B kernel channel needs it to register the slots, so "
+                 "an image where it is absent or cannot read NVRAM ships with "
+                 "LANE-1 permanently unavailable")
+        ok, reason = _efibootmgr_slot_verdict(got.stdout)
+        if not ok:
+            fail("#1930 A/B slot registration FAILED in-guest: " + reason +
+                 "\n--- efibootmgr ---\n" + got.stdout)
+        info(f"  slots OK: {reason}")
+
+        ok, reason = _oneshot_clean_verdict(
+            "xpf-kernel-promote.service",
+            self._show_unit(inst, "xpf-kernel-promote.service", "ExecMainStatus"),
+            self._show_unit(inst, "xpf-kernel-promote.service", "ActiveState"),
+            self._show_unit(inst, "xpf-kernel-promote.service", "Result"))
+        if not ok:
+            jrn = guest(inst, "journalctl", "-u", "xpf-kernel-promote", "-b",
+                        "--no-pager", check=False, capture=True).stdout
+            fail(f"#1930 promotion gate: {reason}\n{jrn[-800:]}")
+        if not guest_sh(inst,
+                        'journalctl -u xpf-kernel-promote -b --no-pager '
+                        '| grep -q "no armed kernel candidate recorded"'):
+            fail("#1930 promotion gate did not log the ordinary-boot path "
+                 "(\"no armed kernel candidate recorded\") — it exited 0 without "
+                 "reaching its decision, so an armed candidate would go "
+                 "unverified on a later boot")
+        info("  promotion gate ran clean on this ordinary boot")
 
     def scenario_b(self):
         info("── Scenario B: first boot WITH valid day-0 config drive ──")
@@ -413,6 +1300,7 @@ class Harness:
             fail("day-0 stamp missing")
         if guest(b, "test", "-s", "/etc/xpf/xpf.conf", check=False).returncode != 0:
             fail("/etc/xpf/xpf.conf missing")
+        self.assert_day0_conf_perms(b)
         if not guest_sh(b,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "day-0 config installed"'):
             fail("day-0 loader did not log the install")
@@ -489,6 +1377,7 @@ class Harness:
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q '
                         '"day-0 config installed"'):
             fail("retry: day-0 loader did not install the fixed config on reboot")
+        self.assert_day0_conf_perms(c)
         self._wait(c,
                    lambda: guest_sh(c, '[ "$(hostname)" = xpf-day0-c-fixed ]'),
                    20, 3, "retry: fixed hostname xpf-day0-c-fixed not applied")
@@ -636,6 +1525,7 @@ class Harness:
         if nid != "1":
             fail(f"/etc/xpf/node-id is '{nid}', expected '1' — node-id not "
                  "persisted from the day-0 drive")
+        self.assert_day0_conf_perms(e)
         # Cluster-mode naming: node 1 uses FPC 7. em0 is assigned only in
         # cluster mode (position 2); ge-7/0/0 proves the node-1 FPC branch.
         if not guest_sh(e, 'ip link show em0 >/dev/null 2>&1'):
@@ -685,14 +1575,29 @@ class Harness:
         # incus never exercises. Needs qemu-system + KVM + OVMF; SKIP (probe
         # stands) when any is absent, mirroring the root-required skips. ──
         qsys = shutil.which("qemu-system-x86_64")
-        ovmf = _find_first(_OVMF_CODE_CANDIDATES)
-        ovmf_vars = _find_first(_OVMF_VARS_CANDIDATES)
+        # #6497: prefer an SB-ENFORCING firmware pair. The appliance ships a
+        # Secure-Boot-signed chain and the #1930 slot selector is written for
+        # lockdown, so an SB-off boot is not proof of the chain this image
+        # actually ships. When no enforcing pair exists on the host we still run
+        # the SB-off leg for plain-QEMU bootability coverage — but we SAY so,
+        # loudly and in the log, instead of presenting it as Secure Boot proof.
+        # That silent conflation is the defect: the old comment here read
+        # "plain-QEMU bootability is proven fine with SB off", which is true and
+        # was being counted as something it is not.
+        ovmf, ovmf_vars, sb_on, fw_reason = _qemu_firmware_choice()
         if not qsys or not os.path.exists("/dev/kvm") or not ovmf or not ovmf_vars:
             info("SKIP boot leg: need qemu-system-x86_64 + /dev/kvm + OVMF "
                  f"(qemu={bool(qsys)} kvm={os.path.exists('/dev/kvm')} "
-                 f"ovmf_code={bool(ovmf)} ovmf_vars={bool(ovmf_vars)}) — "
-                 "the structural probe above stands")
+                 f"firmware: {fw_reason}) — the structural probe above stands")
             return
+        if sb_on:
+            info(f"QEMU firmware: {fw_reason}")
+        else:
+            info(f"NOTE: {fw_reason}")
+            info("      Install an OVMF secboot build + MS-keyed VARS "
+                 "(ovmf on Debian/Ubuntu: OVMF_CODE_4M.secboot.fd + "
+                 "OVMF_VARS_4M.ms.fd) to make this leg cover the Secure Boot "
+                 "chain. Scenario A still asserts SB in-guest under incus.")
         conf = os.path.join(self.work, "day0-qemu.conf")
         with open(conf, "w") as f:
             f.write("system {\n    host-name xpf-qemu;\n}\n")
@@ -709,7 +1614,8 @@ class Harness:
                 "-drive", f"file={self.qcow2},if=virtio,format=qcow2,snapshot=on",
                 "-drive", f"file={os.path.realpath(iso)},media=cdrom",
                 "-serial", f"file:{serial}", "-nic", "none"]
-        info("booting the qcow2 under direct QEMU (serial-captured, snapshot)...")
+        info("booting the qcow2 under direct QEMU (serial-captured, snapshot, "
+             f"secure-boot={'on' if sb_on else 'OFF'})...")
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
@@ -737,7 +1643,14 @@ class Harness:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with cdrom day-0)")
+        if sb_on:
+            info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with "
+                 "cdrom day-0, SECURE BOOT ENFORCING — shim->grub->kernel "
+                 "verified by the firmware)")
+        else:
+            info("Scenario Q PASS (qcow2 valid + boots under plain QEMU with "
+                 "cdrom day-0) — SECURE BOOT OFF on this leg; it is NOT "
+                 "Secure Boot proof (see the firmware note above)")
 
 
 def _kver_ge(ver, floor):
@@ -787,6 +1700,12 @@ def main():
     net = os.environ.get("XPF_VALIDATE_NETWORK", "xpf-image-net")
     h = Harness(a.qcow2, a.metadata, net, a.keep, a.verify_sig)
     try:
+        # #6547: the seal is verified on the EXPORTED ARTIFACT, before the
+        # image is imported or any scenario boots. First, because it is the
+        # only point at which a per-device identity is observable; second, so a
+        # clone-identity regression fails the gate cheaply rather than after
+        # six VM boots.
+        h.assert_image_sealed()
         h.ensure_network()
         h.import_image()
         keys = SCENARIO_ORDER if a.scenario == "all" else [a.scenario]

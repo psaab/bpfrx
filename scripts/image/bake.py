@@ -52,6 +52,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 
 # Signed-distribution helpers (#1924) live under scripts/dist.
 sys.path.insert(0, os.path.join(ROOT, "scripts", "dist"))
+import image_inventory  # noqa: E402  (#6500 inventory format)
 import sign  # noqa: E402
 
 # Runtime dependency set installed explicitly into the image. This is the
@@ -166,6 +167,53 @@ def validate_version(value, field):
 def require(tool, hint):
     if not shutil.which(tool):
         die(f"{tool} not found — {hint}")
+
+
+# ── Image seal (#5283, #6547) ────────────────────────────────────────
+#
+# The seal is what stops the golden image shipping an identical PER-DEVICE
+# IDENTITY to every clone. These two tuples are the SINGLE SOURCE for it: the
+# virt-sysprep argv below is built from them, and the pre-sign validation gate
+# (scripts/image/validate.py) asserts the OUTCOME of each one on the exported
+# qcow2 before a signature is ever produced.
+#
+# #6547: before that gate existed the seal was performed but never verified.
+# The `--enable` list was a hand-maintained string literal and the purge was a
+# `rm -rf ... 2>/dev/null || true` whose failure is swallowed by construction,
+# so a member silently dropping out of either — or the step being refactored
+# away — would have shipped a SIGNED image with a fleet-wide shared SSH host
+# key, machine-id and SNMPv3 EngineID, and passed the publish gate green.
+# `scripts/image/test_validate_image_seal_6547.py` binds these tuples to the
+# gate's identity table, so dropping a member from either one reds.
+SYSPREP_ENABLE_OPS = (
+    "machine-id",
+    "ssh-hostkeys",
+    "ssh-userdir",
+    "logfiles",
+    "tmp-files",
+    "bash-history",
+    "package-manager-cache",
+    "backup-files",
+    "passwd-backups",
+    "utmp",
+)
+
+# Paths removed by the seal's --run-command. The xpf state entries make the
+# image a factory artifact (no committed config, no day-0 stamp); the SNMPv3
+# EngineID component and its engineBoots counter (#5283) and the systemd
+# random-seed are per-device identity — every clone must regenerate them on
+# first boot, or all of them derive byte-identical localized USM keys and
+# accept each other's authenticated SNMPv3 requests.
+SYSPREP_PURGE_PATHS = (
+    "/etc/xpf/.configdb",
+    "/etc/xpf/xpf.conf",
+    "/etc/xpf/.day0-config-applied",
+    "/etc/xpf/.root-grown",
+    "/var/lib/xpf/snmp-engine-id",
+    "/var/lib/xpf/snmp-engineboots",
+    "/var/lib/systemd/random-seed",
+    "/var/lib/apt/lists/*",
+)
 
 
 def run(argv, **kw):
@@ -615,6 +663,15 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
         "--run-command", "passwd -d root",
+        # #6500: record what this image actually SHIPS — the guest kernel and
+        # the full installed package set — INSIDE the image, as the last step
+        # so the enumeration is the final one (after every install, purge and
+        # autoremove above). bake.py reads it back out offline with virt-cat
+        # and emits it as the signed xpf-<ver>.pkgs sidecar; the in-image copy
+        # stays so an operator on the box can answer the same CVE-triage
+        # question without the dist tree. The fragment FAILS THE BAKE on an
+        # empty enumeration rather than shipping a hollow record.
+        "--run-command", image_inventory.WRITE_CMD,
         "--run-command", "/usr/local/sbin/xpfd version",
     ]
     run(argv)
@@ -693,7 +750,7 @@ def finalize_artifacts(*, validate_step, sign_step):
 
 def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
                         base_pinned, validated, bake_date, kernel,
-                        proto_lines=""):
+                        guest_kernel, proto_lines=""):
     """Assemble the xpf-<ver>.manifest sidecar text (key: value lines).
 
     Pure + unit-testable so the supply-chain PROVENANCE fields are asserted
@@ -705,6 +762,13 @@ def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
       - `base_image_pinned` (#4904 B): whether the Ubuntu base was authenticated
         against the repo-pinned trust-anchor digest (bound alongside the base
         digest + source URL already recorded here).
+      - `guest_kernel` (#6500): the kernel the IMAGE ships — the exact artifact
+        the #1930 LANE-1 channel promotes. `kernel` above is the BUILD HOST's
+        (`os.uname().release`, honestly named `bake_host_kernel`) and answers a
+        different question entirely. It is a REQUIRED keyword, not a defaulted
+        one, so a caller cannot silently omit the field the publish gate
+        requires. The full package inventory is too large for this sidecar and
+        rides in xpf-<ver>.pkgs, covered by the same signed SHA256SUMS.
 
     The sidecar is covered by the signed xpf-<ver>.SHA256SUMS (#5042), so these
     fields are authenticated once the manifest signature verifies.
@@ -719,6 +783,7 @@ def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
         f"validated: {'true' if validated else 'false'}\n"
         f"bake_date: {bake_date}\n"
         f"bake_host_kernel: {kernel}\n"
+        f"guest_kernel: {guest_kernel}\n"
         + proto_lines
     )
 
@@ -743,6 +808,7 @@ def main():
                     ("virt-sysprep", "apt-get install libguestfs-tools"),
                     ("virt-sparsify", "apt-get install libguestfs-tools"),
                     ("virt-filesystems", "apt-get install libguestfs-tools"),
+                    ("virt-cat", "apt-get install libguestfs-tools"),
                     ("curl", "apt-get install curl")]:
         require(t, hint)
     if not (os.access("/dev/kvm", os.R_OK) and os.access("/dev/kvm", os.W_OK)):
@@ -823,23 +889,29 @@ def main():
         info("customizing image offline (packages, kernel >= 6.18, xpf install)...")
         virt_customize(work_qcow, xpf_deb)
 
+        # 4b. read the #6500 inventory back OUT of the image, offline.
+        # virt-cat, not a boot: the whole point is that the record is
+        # extractable without running the appliance. A parse failure ABORTS the
+        # bake — an image whose traceability record is missing or hollow is not
+        # publishable anyway (publish.py's gate refuses it), so failing here
+        # gives the operator the real cause instead of a refusal three steps
+        # later against an artifact that already exists.
+        info("reading the image inventory (guest kernel + installed packages)...")
+        inventory_text = out_text(
+            ["virt-cat", "-a", work_qcow, image_inventory.INVENTORY_GUEST_PATH])
+        try:
+            guest_kernel, inventory_pkgs = image_inventory.parse(inventory_text)
+        except image_inventory.InventoryError as e:
+            die(f"the baked image carries no usable inventory at "
+                f"{image_inventory.INVENTORY_GUEST_PATH}: {e}")
+        info(f"guest kernel {guest_kernel}, {len(inventory_pkgs)} packages recorded")
+
         # 5. seal
         info("sealing image (virt-sysprep)...")
-        run(["virt-sysprep", "-a", work_qcow, "--quiet", "--enable",
-             "machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,"
-             "package-manager-cache,backup-files,passwd-backups,utmp",
-             # #5283: strip the persisted per-device SNMPv3 EngineID component
-             # (and the engineBoots counter) so the golden image never ships an
-             # identical per-device identity across clones. Like /etc/machine-id
-             # (reset by the enabled virt-sysprep machine-id op above), each
-             # appliance regenerates a fresh EngineID component on first boot;
-             # otherwise every clone would derive byte-identical localized USM
-             # keys and accept each other's authenticated SNMPv3 requests.
-             "--run-command", "rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf "
-             "/etc/xpf/.day0-config-applied /etc/xpf/.root-grown "
-             "/var/lib/xpf/snmp-engine-id /var/lib/xpf/snmp-engineboots "
-             "/var/lib/systemd/random-seed "
-             "/var/lib/apt/lists/* 2>/dev/null || true"])
+        run(["virt-sysprep", "-a", work_qcow, "--quiet",
+             "--enable", ",".join(SYSPREP_ENABLE_OPS),
+             "--run-command",
+             "rm -rf " + " ".join(SYSPREP_PURGE_PATHS) + " 2>/dev/null || true"])
 
         # 6. export
         ver = a.version
@@ -913,7 +985,8 @@ def main():
                 rel=rel, base_sha=base_sha, base_pinned=base_pinned,
                 validated=not a.skip_validate,
                 bake_date=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                kernel=os.uname().release, proto_lines=proto_lines))
+                kernel=os.uname().release, guest_kernel=guest_kernel,
+                proto_lines=proto_lines))
         info(f"manifest: {manifest}")
 
         # Per-version, version-named checksum manifest (#1924 §5.1): each bake
@@ -925,8 +998,19 @@ def main():
         # `xpf-deploy image-roll` verifies it against this SHA256SUMS before
         # parsing the ha-protocol / session-sync fields. The .minisig over this
         # manifest is produced only AFTER the validation gate (finalize_artifacts).
+        # #6500: the package inventory sidecar. Its own file rather than more
+        # manifest lines — a full dpkg list is hundreds of entries and the
+        # .manifest is parsed line-by-line by the deployer's mixed-base gate.
+        # It joins the signed SHA256SUMS below, so it is authenticated exactly
+        # like the .manifest sidecar is (#5042).
+        pkgs_out = os.path.join(a.out, image_inventory.sidecar_name(ver))
+        with open(pkgs_out, "w") as f:
+            f.write(inventory_text if inventory_text.endswith("\n")
+                    else inventory_text + "\n")
+        info(f"inventory: {pkgs_out}")
+
         sums = os.path.join(a.out, f"xpf-{ver}.SHA256SUMS")
-        sign.write_manifest(sums, [qcow_out, meta_out, manifest])
+        sign.write_manifest(sums, [qcow_out, meta_out, manifest, pkgs_out])
         info("checksums:")
         print(open(sums).read(), end="")
 

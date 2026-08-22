@@ -213,11 +213,23 @@ type ALGConfig struct {
 }
 
 // TCPSessionConfig holds TCP session timeout configuration.
+//
+// #6539: only EstablishedTimeout reaches the dataplane. The other three are
+// parsed, typed, committed and stored here and go no further — the wire struct
+// has no field for them and no consumer reads them, so they capture operator
+// intent only. flow_tcp_timeouts_6539.go is the authority for that split; the
+// commit advisory and all three `show` surfaces read it, and a test in
+// pkg/dataplane/userspace fails if a carrier appears without the table being
+// updated. The per-field "unset =>" comments below name the window the
+// DATAPLANE falls back to (userspace-dp/src/session/mod.rs), not the Junos
+// default — an unset leaf lowers as 0 and never carries the Junos value, so
+// quoting Junos here is what let three surfaces print 1800s for a session that
+// actually idles out at 300s.
 type TCPSessionConfig struct {
-	EstablishedTimeout   int  // default 1800
-	InitialTimeout       int  // default 30
-	ClosingTimeout       int  // default 30
-	TimeWaitTimeout      int  // default 120
+	EstablishedTimeout   int  // enforced; unset => 300s (DEFAULT_TCP_SESSION_TIMEOUT_NS)
+	InitialTimeout       int  // NOT enforced; half-open reaps at 20s (DEFAULT_TCP_OPENING_TIMEOUT_NS)
+	ClosingTimeout       int  // NOT enforced; FIN close reaps at 30s (TCP_CLOSING_TIMEOUT_NS)
+	TimeWaitTimeout      int  // NOT enforced; the dataplane has no TIME_WAIT state
 	NoSynCheck           bool // allow mid-stream TCP session creation
 	NoSynCheckInTunnel   bool // allow mid-stream TCP for tunnel traffic only
 	RstInvalidateSession bool // immediately expire session on RST
@@ -307,8 +319,12 @@ type ZoneConfig struct {
 	// `security zones security-zone <z> interfaces <ref>` (e.g. "ge-0/0/0.0").
 	// Junos models host-inbound-traffic at BOTH the zone level (HostInboundTraffic
 	// above, applies to every interface in the zone) and the interface level
-	// (here, applies only to that interface); the EFFECTIVE admission set for an
-	// interface is the UNION of the two (Junos additive semantics). A zone is
+	// (here, applies only to that interface). An interface that declares an
+	// interface-level stanza is described ENTIRELY by it: the stanza REPLACES the
+	// zone-level one for that interface (#6515; Junos: "Interface configuration
+	// overrides that of the zone"), and a present-but-EMPTY stanza is a deny-all
+	// override rather than a fallback to the zone set. The resolution SSOT is
+	// config.EffectiveHostInboundTokens. A zone is
 	// host-inbound-ENFORCING if it declares a zone-level stanza OR carries any
 	// interface-level override here — so an operator can expose a service
 	// (e.g. ssh) on one interface of a zone while denying it on the others by
@@ -637,7 +653,18 @@ type NATConfig struct {
 // ProxyARPEntry configures proxy ARP responses for NAT addresses.
 type ProxyARPEntry struct {
 	Interface string
-	Addresses []string // /32 CIDRs (expanded from ranges)
+	// Addresses is the fully-expanded SINGLE-HOST prefix set the installer
+	// programs: /32 for IPv4, /128 for IPv6, one kernel NTF_PROXY neighbour
+	// each. A `address <low> to <high>` range and (since #6559) a multi-host
+	// `address <prefix>` are both expanded here, in the compiler, so this field
+	// and pkg/dataplane/proxyarp.go agree on what "an address" is.
+	//
+	// One exception, deliberately: a prefix whose host count exceeds
+	// proxyARPMaxExpandedHosts is left AUTHORED so
+	// validateProxyARPAddressesStrict can reject it (strict) or warn (tolerant,
+	// #1960). On that tolerant path the installed set is byte-identical to
+	// pre-#6559 — one entry for the address as authored.
+	Addresses []string
 	// MalformedRangeSpecs records every proxy-arp `address` STATEMENT on this
 	// interface whose token stream still carried the `to` range keyword after
 	// neither well-formed range shape consumed it (#6714). Two things reach it:

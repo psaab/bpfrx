@@ -230,6 +230,22 @@ type ConfigSnapshot struct {
 	Config       *config.Config            `json:"config,omitempty"`
 	Userspace    config.UserspaceConfig    `json:"userspace"`
 	DeferWorkers bool                      `json:"defer_workers,omitempty"`
+	// NodeID is the chassis-cluster node id this daemon runs as (0 or 1; 0 when
+	// standalone). #6311: the helper folds it into the high bit of every
+	// worker's session-id namespace (SessionTable::set_session_id_namespace), so
+	// a peer session id the standby adopts verbatim on import (#5212) can never
+	// collide with an id this node mints — both nodes otherwise run the same
+	// worker set (queue indices 0..N) with counters that both start at 1.
+	//
+	// ADDITIVE with omitempty and a Rust-side #[serde(default)], deliberately
+	// WITHOUT a ProtocolVersion bump. The snapshot handler gates on EXACT
+	// version equality, so a bump would make a mixed-base pair refuse to apply a
+	// snapshot at all; whereas an older helper that ignores this field simply
+	// keeps the pre-#6311 layout, which is exactly today's behaviour. The pairing
+	// is monotone in both directions: new-daemon/old-helper is no worse than
+	// today, and old-daemon/new-helper leaves node 1 in the un-bitted low half —
+	// still today's behaviour, never a NEW collision.
+	NodeID uint8 `json:"node_id,omitempty"`
 	// #1620: cold-path latency histogram sample mask. *uint64 with
 	// omitempty so a nil pointer omits the field entirely from the
 	// wire (matching the Rust Option<u64>::None behavior). Default
@@ -497,9 +513,10 @@ type InterfaceSnapshot struct {
 	CoSPriorityLowMinShareBytes uint64 `json:"cos_priority_low_min_share_bytes,omitempty"`
 	// HostInbound* carry the per-interface host-inbound-traffic OVERRIDE
 	// (#3362). Junos models host-inbound at both the zone level (ZoneSnapshot
-	// above) and the interface level; the EFFECTIVE admission set for an
-	// interface is the UNION of the zone-level set and any interface-level
-	// override. These fields carry that already-unioned effective set and are
+	// above) and the interface level; an interface that declares an
+	// interface-level stanza is described ENTIRELY by it — the zone-level set is
+	// REPLACED, not unioned (#6515). These fields carry that already-resolved
+	// effective set and are
 	// populated ONLY for an interface that declared an interface-level stanza
 	// (and is not a management/cluster-control lifeline). When present the Rust
 	// dataplane keys the host-inbound admission check by ingress interface

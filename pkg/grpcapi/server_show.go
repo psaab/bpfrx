@@ -5,8 +5,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -217,19 +219,31 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "persistent-nat":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showPersistentNAT(&buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showPersistentNAT(&buf); err != nil {
+			return nil, err
+		}
 
 	case "nat-source-rule-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showNATSourceRuleDetail(cfg, &buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showNATSourceRuleDetail(cfg, &buf); err != nil {
+			return nil, err
+		}
 
 	case "nat-dest-rule-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showNATDestRuleDetail(cfg, &buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showNATDestRuleDetail(cfg, &buf); err != nil {
+			return nil, err
+		}
 
 	case "persistent-nat-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		s.showPersistentNATDetail(&buf)
+		// #6553: full-table conntrack walk — admission-gated, error propagated.
+		if err := s.showPersistentNATDetail(&buf); err != nil {
+			return nil, err
+		}
 
 	case "tunnels":
 		// #1043 Phase 12: case body extracted to server_show_security_text.go
@@ -455,7 +469,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	case "log":
 		out, err := combinedOutputTimeout(ctx, "journalctl", "-u", "xpfd", "-n", "50", "--no-pager")
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "journalctl: %v", err)
+			return nil, diagExecError("journalctl", err)
 		}
 		buf.Write(out)
 
@@ -499,6 +513,25 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	case "core-dumps":
 		s.showCoreDumps(cfg, &buf)
 
+	case "kernel-upgrade":
+		// #6495: the LANE-1 kernel channel, in-band. Rendered through
+		// pkg/upgrade so this and the in-process CLI cannot disagree about a
+		// node mid-roll.
+		st := upgrade.ChannelStatus{}
+		if s.kernelUpgradeStatusFn != nil {
+			st = s.kernelUpgradeStatusFn()
+		}
+		upgrade.RenderChannelStatus(&buf, st)
+	case "bootstrap-import":
+		// #6496: the day-0 config-import verdict, in-band. Renders through the
+		// shared bootstrapshow package so this and the in-process CLI cannot
+		// disagree about the same recorded fact.
+		snap := bootstrapshow.Snapshot{}
+		if s.bootstrapImportFn != nil {
+			snap = s.bootstrapImportFn()
+		}
+		bootstrapshow.Render(&buf, snap)
+
 	case "task":
 		s.showTask(cfg, &buf)
 
@@ -537,7 +570,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 			}
 			out, err := combinedOutputTimeout(ctx, "tail", "-n", strconv.Itoa(n), logPath)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "read %s: %v", logPath, err)
+				return nil, diagExecError("read "+logPath, err)
 			}
 			buf.Write(out)
 		} else {

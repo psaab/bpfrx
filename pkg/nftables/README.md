@@ -168,5 +168,17 @@ those types into the self-contained spec structs in `netlink_spec.go`.
   `nlPlan.fail` -> the install aborts, prior ruleset retained), mirroring
   the oracle whose raw token `nft -f -` rejects. NEVER drop the predicate
   and widen a port/DSCP-constrained rule to match-all (the #6405 fail-open).
+- lo0 filter ADDRESSES take the same posture (#6512): `filterFamilyAddrs`
+  returns an error on a token that is neither a valid address nor a valid
+  prefix, so the plan fails and the install aborts with the prior ruleset
+  retained. Dropping the token per-token installed a NARROWED positive list
+  (a `discard` enforcing a smaller set than authored, the rest falling
+  through to the implicit accept) or a WIDENED except list — and an except
+  list narrowed to EMPTY takes `lo0AddrScope`'s empty-except arm, which
+  drops the predicate entirely and makes the direction match every address.
+  "Empty" means "match everything" for an except set, so skipping a bad
+  entry is never the fix here. Wrong-family literals and the `any`/empty
+  placeholders are still dropped — those match the userspace matcher.
+  Pinned by `netlink_lo0_addrs_6512_test.go`.
 - Table name `xpf_dp_rst`, family `INet` (covers both IPv4 and IPv6 in
   one table — don't split it without rethinking the atomic batch).

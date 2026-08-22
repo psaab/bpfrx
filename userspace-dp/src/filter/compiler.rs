@@ -73,7 +73,20 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
         &mut used_runtime_ids,
     );
     lower_single_rate_policer_runtimes(&mut state, policers, previous, &mut used_runtime_ids);
-    parse_filter_table(&mut state, filters)?;
+    // #6540: the set of policer names this snapshot DEFINES, across both
+    // stanzas. Built from the wire slices rather than
+    // `state.three_color_policer_by_name` on purpose — the #4514 single-rate
+    // lowering above deliberately SKIPS a degenerate zero-rate meter-only
+    // policer (it has no action to enforce), so that policer is defined but
+    // absent from the runtime map. Rejecting on absence from the MAP would
+    // refuse a config that boots today; rejecting on absence from this SET is
+    // the same question the Go strict gate asks.
+    let defined_policers: rustc_hash::FxHashSet<&str> = policers
+        .iter()
+        .map(|p| p.name.as_str())
+        .chain(three_color_policers.iter().map(|p| p.name.as_str()))
+        .collect();
+    parse_filter_table(&mut state, filters, &defined_policers)?;
     assign_interface_filters(&mut state, interfaces)?;
     recompute_fast_map_aggregates(&mut state);
     state.lo0_filter_v4_fast = resolve_lo0_filter(&state.filters, "inet", lo0_filter_v4)?;
@@ -148,6 +161,7 @@ fn lower_single_rate_policer_runtimes(
 fn parse_filter_table(
     state: &mut FilterState,
     filters: &[FirewallFilterSnapshot],
+    defined_policers: &rustc_hash::FxHashSet<&str>,
 ) -> Result<(), SnapshotIntegrityError> {
     for (filter_idx, snap) in filters.iter().enumerate() {
         let key = qualify_filter_key(&snap.family, &snap.name);
@@ -162,6 +176,7 @@ fn parse_filter_table(
                     &snap.family,
                     &snap.name,
                     &state.three_color_policer_by_name,
+                    defined_policers,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -542,18 +557,42 @@ fn qualify_filter_key(family: &str, filter_name: &str) -> String {
     format!("{family}:{filter_name}")
 }
 
+/// #6540 fail-closed backstop for `then policer <name>`: reject the whole
+/// snapshot when a term references a policer the snapshot never defines, rather
+/// than resolving it to `None` and silently forwarding unpoliced. See
+/// `SnapshotIntegrityError::MissingPolicerRef` for why this asks about
+/// DEFINEDNESS and not about the compiled runtime map.
+fn preflight_term_policer_ref(
+    snap: &FirewallTermSnapshot,
+    filter_family: &str,
+    filter_name: &str,
+    defined_policers: &rustc_hash::FxHashSet<&str>,
+) -> Result<(), SnapshotIntegrityError> {
+    if snap.policer.is_empty() || defined_policers.contains(snap.policer.as_str()) {
+        return Ok(());
+    }
+    Err(SnapshotIntegrityError::MissingPolicerRef {
+        family: filter_family.to_string(),
+        filter: filter_name.to_string(),
+        term: snap.name.clone(),
+        policer: snap.policer.clone(),
+    })
+}
+
 fn parse_term(
     snap: &FirewallTermSnapshot,
     id: u32,
     filter_family: &str,
     filter_name: &str,
     three_color_policers: &rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
+    defined_policers: &rustc_hash::FxHashSet<&str>,
 ) -> Result<FilterTerm, SnapshotIntegrityError> {
     // Non-mutating preflight first: every guard rejects the WHOLE snapshot
     // (the reconcile preflight keeps the previous good filter state), so all
     // of them run before any lowering begins.
     preflight_term_markers(snap, filter_family, filter_name)?;
     preflight_term_value_ranges(snap, filter_family, filter_name)?;
+    preflight_term_policer_ref(snap, filter_family, filter_name, defined_policers)?;
     let addresses = parse_term_addresses(snap);
     let protocols = resolve_term_protocols(snap, filter_family, filter_name)?;
     check_cross_field_satisfiability(snap, &protocols, filter_family, filter_name)?;

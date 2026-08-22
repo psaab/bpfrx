@@ -35,6 +35,13 @@ func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
 	if s, ok = d.rgStates[rgID]; ok {
 		return s
 	}
+	// New() always makes this map, but the fence path (#6530) now reaches
+	// here from a Daemon that minimal constructions build as a literal, and
+	// a nil-map write panics. Lazily allocating costs nothing on the hot
+	// read path (which never gets here) and removes the footgun.
+	if d.rgStates == nil {
+		d.rgStates = make(map[int]*rgStateMachine)
+	}
 	s = newRGStateMachine()
 	d.rgStates[rgID] = s
 	return s
@@ -1258,6 +1265,10 @@ func (d *Daemon) reconcileRGState() {
 	// owners every pass — hash-gated, so it is a no-op when the effective RA
 	// set did not move, and re-applies (via ra.Apply's safe diff) when it did.
 	d.reconcileClusterRAServices("reconcile")
+	// #6535: the same dropped-work safety net for the OTHER per-RG service.
+	// Unlike RA, Kea had no converger at all — a failed apply was simply
+	// lost until the next RG transition or operator commit.
+	d.reconcileClusterDHCPServices("reconcile")
 }
 
 // startupGoodbyeNeeded reports whether the cold-boot one-shot goodbye still
@@ -1329,12 +1340,27 @@ func (d *Daemon) runStartupGoodbye(rgID int, rgRA []*config.RAInterfaceConfig) {
 // rethInterfacesForRG returns the Linux interface names of RETH interfaces
 // belonging to the given redundancy group.
 func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
+	return rethInterfacesMatchingRG(cfg, func(id int) bool { return id == rgID })
+}
+
+// rethInterfacesMatchingRG returns the Linux interface names of every RETH
+// interface whose redundancy group satisfies want.
+//
+// It is the SINGLE source for both RG-derived interface sets the cluster DHCP
+// filter needs — "which interfaces does THIS node currently master" and "which
+// interfaces are redundancy-group-scoped AT ALL" (#6520). Deriving the two from
+// one walker is not a style preference: a divergence between them is ALWAYS a
+// bug, because the filter's keep rule is exactly "RG-scoped implies mastered".
+// If one set resolved a RETH member differently from the other, a node-local
+// interface would be misread as an unmastered RG member (service dropped) or an
+// RG member as node-local (both nodes serve DHCP on one redundant segment).
+func rethInterfacesMatchingRG(cfg *config.Config, want func(rgID int) bool) []string {
 	var names []string
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
 		}
-		if ifc.RedundancyGroup == rgID && strings.HasPrefix(name, "reth") {
+		if want(ifc.RedundancyGroup) && strings.HasPrefix(name, "reth") {
 			// Resolve RETH to physical member for Linux-level operations.
 			resolved := config.LinuxIfName(cfg.ResolveReth(name))
 			for _, unit := range ifc.Units {
@@ -1504,8 +1530,11 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	// cannot race a concurrent commit/demotion; the state machine already
 	// marked rgID active before this call, so the snapshot includes it.
 	d.reconcileClusterRAServices(fmt.Sprintf("vrrp-master-rg%d", rgID))
-	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
-		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
+	if d.dhcpServer != nil {
+		// Same desired state as the commit path and the #6535 converger.
+		// The MASTER edge deliberately does NOT apply a nil desired state —
+		// clearing is the BACKUP edge's job — so the nil guard stays.
+		dhcpCfg := d.desiredClusterDHCPConfig(cfg)
 		if dhcpCfg != nil {
 			// #2239 Q3: pre-seed the held peer leases into the Kea
 			// memfile BEFORE the (re)start so Kea loads the in-use
@@ -1588,7 +1617,7 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 		if anyOtherMaster {
 			// Reapply DHCP with only the remaining master RGs'
 			// interfaces (nil when none match → clear).
-			d.dhcpServer.ApplyAsync(d.filterDHCPConfigForMasterRGs(cfg),
+			d.dhcpServer.ApplyAsync(d.desiredClusterDHCPConfig(cfg),
 				fmt.Sprintf("vrrp BACKUP rg%d (other RG still MASTER)", rgID))
 		} else {
 			d.dhcpServer.ApplyAsync(nil, fmt.Sprintf("vrrp BACKUP rg%d", rgID))
@@ -1631,9 +1660,84 @@ func stripUntaggedUnitSuffix(iface string) string {
 	return strings.TrimSuffix(iface, ".0")
 }
 
-// filterDHCPConfigForMasterRGs returns a DHCP config containing only groups
-// whose interfaces belong to RGs that are currently MASTER. Returns nil if
-// no groups match.
+// desiredClusterDHCPConfig is the single source of truth for the Kea desired
+// state in cluster mode: the master-RG-filtered DHCP config, or nil when this
+// node should serve nothing. Every driver — the commit path
+// (daemon_apply_routing.go), the RG-transition edge (applyRethServicesForRG /
+// clearRethServicesForRG), and the #6535 reconcile converger — derives its
+// desired state from here.
+//
+// It is single-sourced rather than duplicated because a divergence between the
+// converger and the edge is ALWAYS a bug: the converger runs every 2s and
+// would fight the edge forever, restarting Kea on every tick. Binding two
+// copies with a test would not be enough — there is no legitimate reason for
+// them to differ.
+func (d *Daemon) desiredClusterDHCPConfig(cfg *config.Config) *config.DHCPServerConfig {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil {
+		return nil
+	}
+	// filterDHCPConfigForMasterRGs copies the config and resolves RETH
+	// interface names internally. It returns nil when no group's interfaces
+	// belong to a currently-MASTER RG.
+	return d.filterDHCPConfigForMasterRGs(cfg)
+}
+
+// reconcileClusterDHCPServices is the periodic converger for the Kea applier
+// (#6535). Every other trigger is an EDGE: applyRethServicesForRG /
+// clearRethServicesForRG run only under `if tr.Changed`, and the commit path
+// runs only when an operator commits. So a Kea apply that FAILED had nowhere
+// to be retried from, and the failure survives: the node that should be
+// serving stays dark, or the node that should have stopped keeps serving —
+// persistent dual-DHCP (or no-DHCP) after a failover, not a transient blip.
+//
+// This mirrors reconcileClusterRAServices, the converger the RA half of the
+// same two services already has, including its central rule — the applied
+// marker advances only on a verified success, so a transient error is retried
+// on a later pass rather than latched as converged.
+//
+// It re-drives ONLY when the manager reports the last completed attempt
+// failed, and the manager spaces retries (applyRetryInterval). A converged Kea
+// costs one atomic-guarded bool read per pass.
+func (d *Daemon) reconcileClusterDHCPServices(reason string) {
+	if d.dhcpServer == nil || d.store == nil {
+		return
+	}
+	if !d.dhcpServer.ClaimApplyRetry(time.Now()) {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	desired := d.desiredClusterDHCPConfig(cfg)
+	slog.Info("reconcile: retrying failed DHCP server apply", "reason", reason)
+	d.dhcpServer.ApplyAsync(desired, "reconcile: "+reason)
+}
+
+// filterDHCPConfigForMasterRGs returns the DHCP config this node should serve
+// in cluster mode: every group member that is either NODE-LOCAL or belongs to a
+// redundancy group this node currently masters. Returns nil if nothing
+// survives.
+//
+// #6520 (a) — mastership scoping applies ONLY to RG-scoped members. Before this
+// fix the keep-set was built exclusively from `rethInterfacesForRG` over the
+// MASTER RGs, so it could only ever contain RETH members: every interface that
+// is not part of a redundancy group — the `fxp0.0` management lifeline, and any
+// plain node-local data interface — was removed from every group on BOTH nodes,
+// and a group made only of such members disappeared entirely. That silently
+// killed DHCP service the operator configured on a node-local segment the
+// moment the box was clustered. Redundancy-group mastership says which node
+// answers for a REDUNDANT interface; it says nothing about an interface that
+// has no redundant peer, and Junos clusters likewise run `fxp0` services per
+// node. So an interface that belongs to NO redundancy group is kept
+// unconditionally, and only an RG-scoped member is gated on this node holding
+// that RG.
+//
+// The two sets are derived from ONE walker (rethInterfacesMatchingRG) so
+// "RG-scoped" and "mastered" cannot resolve a RETH member differently.
 func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPServerConfig {
 	// Collect all interfaces belonging to master RGs. Normalize the untagged
 	// ".0" suffix (#4647) so the set is keyed by the bare member name that the
@@ -1646,6 +1750,13 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 		for _, n := range rethInterfacesForRG(cfg, rgID) {
 			masterIfaces[stripUntaggedUnitSuffix(n)] = true
 		}
+	}
+	// Every interface that IS redundancy-group-scoped, regardless of which node
+	// currently masters it. An interface absent from this set has no redundant
+	// peer and is therefore node-local (#6520).
+	rgScoped := make(map[string]bool)
+	for _, n := range rethInterfacesMatchingRG(cfg, func(int) bool { return true }) {
+		rgScoped[stripUntaggedUnitSuffix(n)] = true
 	}
 
 	dhcpCfg := cfg.System.DHCPServer
@@ -1666,13 +1777,23 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 				// "ge-0-0-1.0" is not a device. Tagged units keep their
 				// ".<vlan>" and match only the tagged member.
 				norm := stripUntaggedUnitSuffix(iface)
-				if masterIfaces[norm] {
+				// #6520: node-local members (no redundancy group) are not
+				// mastership-scoped and are always kept; RG-scoped members are
+				// kept only while this node masters their RG.
+				if masterIfaces[norm] || !rgScoped[norm] {
 					kept = append(kept, norm)
 				}
 			}
 			if len(kept) > 0 {
 				cp := *group
 				cp.Interfaces = kept
+				// #6520 (b): DHCPServerGroup carries independent Interfaces and
+				// Pools arrays with no semantic edge, so a group whose member
+				// list SHRANK here no longer describes which pool belongs to
+				// which member. Record that so the Kea renderer suppresses its
+				// per-subnet interface selector instead of cross-binding a
+				// removed member's pool onto a survivor (dhcpserver.subnetInterface).
+				cp.MembersFiltered = len(kept) != len(group.Interfaces)
 				result[name] = &cp
 			}
 		}

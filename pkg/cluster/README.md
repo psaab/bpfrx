@@ -21,6 +21,24 @@ locating any symbol below is now a matter of opening the named file.
   `buildHeartbeat`, `handlePeerHeartbeat`, `handlePeerTimeout`,
   `handlePeerNeverSeen`, `HeartbeatStats`,
   `vrfListenConfig` — `heartbeat_manager.go`.
+
+  **Start/stop lifecycle tenure (#7257).** `StartHeartbeat` publishes
+  `hbSender`/`hbReceiver` and *starts* them in ONE critical section, and refuses
+  to publish at all if a `StopHeartbeat` overtook it while its sockets were
+  being created. `Manager.hbEpoch` is the tenure counter: `StopHeartbeat` bumps
+  it under `mu`; `StartHeartbeat` captures it **after** its own #4033 idempotent
+  teardown (capturing at entry would compare against a value the call had itself
+  invalidated) and re-checks it under the publish lock, returning
+  `ErrHeartbeatStartSuperseded` if it moved. Callers must treat that sentinel as
+  terminal, not as a bind failure — retrying would resurrect a heartbeat the
+  teardown exists to remove; `startHeartbeatWithRetry` does.
+
+  This is the same shape `publishSessionSyncIfCurrent` uses for the session-sync
+  constructor, and for the same reason: the daemon's cluster-comms teardown
+  cancels a context and joins exactly one goroutine (`clusterCommsWG`), so every
+  OTHER comms-scoped goroutine that publishes shared state needs a generation
+  gate of its own. The heartbeat retry loop runs on a bare `go` and is not in
+  that WaitGroup.
 - `HeartbeatPacket`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, the #4107 control-channel auth
   (`MarshalHeartbeatAuth`, `marshalHeartbeatAuthEpoch`,
@@ -64,6 +82,30 @@ locating any symbol below is now a matter of opening the named file.
   file keeps the "committed-failover-suppresses-stale-heartbeat"
   invariant answerable by reading one file end-to-end.
 - Readiness gate (`SetRGReady`) — `readiness.go`.
+
+### `UpdateConfig` is id-keyed and last-wins (#6543)
+
+`UpdateConfig` walks `cfg.RedundancyGroups` — a SLICE — into `m.groups`, a
+`map[int]*RedundancyGroupState` keyed by `rg.ID`, doing
+`existing.LocalPriority = rg.NodePriorities[m.nodeID]` on every visit. Two
+compiled records sharing one id are therefore a silent overwrite by whichever
+came last, and a `NodePriorities` MAP MISS is indistinguishable from a
+configured priority of 0.
+
+That was reachable from config: `redundancy-group 1 node 0 priority 200` plus
+`redundancy-group 01 preempt` compiled to two `ID=1` records, one with an empty
+priority map, so node 0 ran RG 1 at priority **0** instead of 200 and lost an
+election it was configured to win. The fix is upstream — `compileChassis` now
+folds redundancy-group instances by CANONICAL int id, so the compiler cannot
+hand `UpdateConfig` two records for one group (see `docs/config-schema.md`,
+"A redundancy-group is folded by CANONICAL ID"). The runtime half of that
+property is pinned in `rg_id_canonical_6543_test.go`, which drives real set
+lines through the real compiler into a real `Manager`.
+
+The last-wins loop itself is unchanged and is still the contract: ONE compiled
+record per redundancy-group id. A future caller that synthesizes
+`ClusterConfig` records directly (peer sync, tests) owes that same invariant —
+`UpdateConfig` does not enforce it.
 
 ### Live vs desired heartbeat timing (#5081)
 
@@ -208,6 +250,45 @@ every election gate still declines to promote it. `FormatStatus` /
 `pkg/upgrade`'s pre-demotion precheck parses the first token after
 `Takeover ready:` and treats `no` as a blocker, which is the intended reading —
 a holding RG genuinely cannot take over yet.
+
+**The kernel-upgrade election hold is annotated too (#6495).** On a #1930
+candidate trial boot the daemon sets `kernelUpgradeHold`, which unconditionally
+holds the node SECONDARY until the promotion marker confirms the running
+kernel. Until #6495 nothing rendered it, so a node parked SECONDARY by the
+*expected gate* was indistinguishable from one demoted by a monitor failure or
+a manual failover — during exactly the maintenance window where an operator is
+deciding whether what they see is normal. `FormatStatus` and
+`FormatInformation` now emit a `Held secondary: <reason>` line rendering
+`Manager.KernelUpgradeHoldReason()`, the same value `show system
+kernel-upgrade` reads through the daemon.
+
+**Two reasons, not one.** The daemon sets this single flag for two materially
+different conditions: a genuinely ARMED candidate
+(`KernelUpgradeHoldCandidate`), and the #5682 fail-closed hold taken when
+`IsArmed` returns an **error** (`KernelUpgradeHoldUnreadableJournal`). Their
+remedies differ — wait for the promotion marker, versus repair `/var/lib/xpf` —
+so `SetKernelUpgradeHold` requires the caller to say which, and
+`KernelUpgradeHeld()` stays the yes/no predicate the *election* uses rather
+than the thing the status renders. A single string would be a false statement
+in the fail-closed case, where the daemon does not know a candidate exists and
+no marker may ever be written.
+
+Two properties of that line are load-bearing rather than cosmetic:
+
+- It is **node-scoped and rendered once**, in the node header rather than
+  inside the per-RG loop. The hold holds the whole node regardless of how many
+  redundancy groups exist, and a node with no RGs configured yet would render
+  nothing at all from inside the loop.
+- It sits **above every `Redundancy group:` header** and its first field is
+  `Held`, not a node token. `deploy_rolling_secondary_node`
+  (`test/incus/deploy-lib.sh`) picks the RG0 secondary by awk-matching
+  `$1 == "node0"` inside an RG block, and a rolling cluster deploy uses that
+  answer to decide which node to restart first — a line it misread would
+  restart the PRIMARY first and cause a spurious mid-deploy failover (#4009).
+
+The hold does **not** degrade `Local node:` health. The node is healthy; it is
+deliberately not eligible. Folding it into health would tell the operator
+something false and send them chasing a fault that does not exist.
 
 `DefaultTakeoverHoldTime` is **0**: with `set chassis cluster
 takeover-hold-time` unset the gate is readiness-only and both renders are
@@ -2257,6 +2338,41 @@ removed/changed persisted and stranded a healthy node secondary forever.
 (it runs under the manager lock already held by `UpdateConfig`); the
 manager-side clear happens directly in `reconcileMonitorDebtsLocked`.
 
+**Monitor map locking and the `m.mu -> mon.mu` order (#6550).** The poll
+goroutine and `UpdateGroups` share four maps — `ifaceState`, `ipState`,
+`ipDebts`, `ipThresholdState`. `UpdateGroups` deletes from all four under
+`mon.mu`; the poll cycle used to write all four with no lock at all, which
+is a Go RUNTIME FATAL (`concurrent map read and map write`), not a
+tolerable race, and it is reachable from an ordinary commit — with
+config-sync, on both nodes.
+
+The repair cannot be one lock around the whole apply phase. The lock order
+in this package is **`m.mu` -> `mon.mu`**: `Manager.UpdateConfig` holds
+`m.mu` across its whole body and calls `Monitor.UpdateGroups`, which takes
+`mon.mu`. The poll path calls `mgr.SetMonitorWeight` / `mgr.RecordEvent`,
+which take `m.mu`. Holding `mon.mu` across those callbacks inverts the
+order and deadlocks a commit against a poll — trading a probabilistic
+fatal for a deterministic hang.
+
+So each mutation site takes `mon.mu` for the map access and the dampening
+update it feeds, and releases it before calling the manager.
+`reconcileRGIPDebts` drives its whole bookkeeping to the new value under
+the lock, collects the resulting weight changes into a local
+`[]ipDebtAction`, drops the lock, and only then replays them (removals
+first, then installs — the pre-#6550 emission order). `desiredRGIPDebts`
+therefore requires `mon.mu` held. `Monitor.Stop` is unaffected: it drops
+`mon.mu` before `wg.Wait()`, so a poll blocked on the lock cannot wedge a
+teardown.
+
+Two probes pin this, both in `monitor_poll_update_race_6550_test.go`: a
+race probe (poll cycles bounded, `UpdateGroups` looped, ratio logged) and a
+deterministic lock-order probe that lands an `UpdateGroups` on another
+goroutine exactly at a manager callback and requires it to complete. Both
+assert only under `-race` or a deadlock, so a third test reads the
+Makefile and requires `test-race-dp` to keep its `./pkg/cluster/` leg —
+before #6550 no make target raced this package at all, so these were races
+CI had no path to rather than races CI had missed.
+
 `reconcileMonitorDebtsLocked` reconciles INTERFACE-monitor debt ONLY.
 `monitorWeights` + `MonitorFails` are a SHARED structure that also holds
 IP-MONITORING debts (installed by `SetMonitorWeight` from the ip-monitor
@@ -2399,6 +2515,30 @@ outside the monitor loop:
   the lease. reqID is threaded
   into `OnRemoteFailover`/`OnRemoteFailoverBatch`/`OnRemoteFailoverCommit`/
   `OnRemoteFailoverCommitBatch` (`sync.go`) to arm/clear it.
+- **Every requester-side failure after `applyPeerTransferOutOverrideLocked`
+  must roll the override back — including the commit's own election failure
+  (#6527).** `commitRequestedPeerFailover` /
+  `commitRequestedPeerFailoverBatch` arm the override BEFORE calling
+  `runElection`, then return an error if the local RG did not reach primary.
+  The batch caller already aborted on that error; the single-RG caller
+  returned it bare and leaked the override. There is no expiry for
+  `peerTransferOutOverride` — `applyTransferCommitOverridesOnPeerStateLocked`
+  re-forces the peer to `SecondaryHold` on EVERY subsequent heartbeat with no
+  time bound (unlike `peerTransferCommitGraceUntil`, which does expire) — so a
+  leaked entry makes `electRG` take its "Peer transfer out" arm forever and
+  self-promote this node as soon as whatever failed the election clears. Both
+  nodes then hold the RETH VIP and virtual MAC, persistently. The failure is
+  reachable without any fault injection: `RequestPeerFailover` releases `m.mu`
+  around the fabric round-trip, `commitRequestedPeerFailover`'s re-check is
+  `IsReadyForTakeover` (Ready/ReadySince only — it does NOT read weight), so an
+  interface-monitor debt landing in that window passes readiness and then loses
+  the election on the "Local weight 0" arm. The rollback is reqID-matched and a
+  no-op on the two error returns that precede the override, so calling it on
+  every commit error is safe. Invariant for future edits: the single-RG and
+  batch request paths must agree on rollback at every failure point;
+  `TestRequestPeerFailoverCommitFailureRollsBackOverrideOnBothPaths`
+  (`failover_commit_rollback_6527_test.go`) binds the agreement rather than
+  either copy.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).

@@ -133,13 +133,32 @@ class ManifestProvenanceBindingTests(_EnvGuard):
             base_url="https://mirror.invalid/rel", base_img="ubuntu.img",
             rel="26.04", base_sha=FAKE, base_pinned=base_pinned,
             validated=validated, bake_date="2026-01-01T00:00:00Z",
-            kernel="6.18.0-test")
+            kernel="6.18.0-test", guest_kernel="7.0.0-15-generic")
 
     def test_base_digest_and_pin_bound(self):
         t = self._text(base_pinned=True, validated=True)
         self.assertIn(f"base_image_sha256: {FAKE}\n", t)
         self.assertIn("base_image_pinned: true\n", t)
         self.assertIn("base_image: https://mirror.invalid/rel/ubuntu.img\n", t)
+
+    def test_guest_kernel_is_bound_and_distinct_from_the_build_host(self):
+        # #6500: `bake_host_kernel` is os.uname().release on the BUILD HOST and
+        # answers a different question from "what does this image ship". Both
+        # must be present and they must not be conflated.
+        t = self._text(base_pinned=True, validated=True)
+        self.assertIn("guest_kernel: 7.0.0-15-generic\n", t)
+        self.assertIn("bake_host_kernel: 6.18.0-test\n", t)
+
+    def test_guest_kernel_is_a_required_keyword(self):
+        # Not defaulted: a caller that forgets it must fail at the call site,
+        # not ship a manifest the publish gate then refuses three steps later.
+        with self.assertRaises(TypeError):
+            bake.build_manifest_text(
+                ver="9.9.9-test", commit="deadbeef",
+                base_url="https://mirror.invalid/rel", base_img="ubuntu.img",
+                rel="26.04", base_sha=FAKE, base_pinned=True,
+                validated=True, bake_date="2026-01-01T00:00:00Z",
+                kernel="6.18.0-test")
 
     def test_validated_true_and_false(self):
         self.assertIn("validated: true\n",
@@ -148,6 +167,39 @@ class ManifestProvenanceBindingTests(_EnvGuard):
                       self._text(base_pinned=True, validated=False))
         self.assertIn("base_image_pinned: false\n",
                       self._text(base_pinned=False, validated=True))
+
+
+class InventoryWiringTests(unittest.TestCase):
+    """#6500: the pure pieces are unit-tested, but a bake main() that never
+    CALLS them records nothing. main() itself needs libguestfs and a real base
+    image, so these pin the call sites in source — deleting one reds here
+    instead of silently shipping an image with no traceability record."""
+
+    SRC = Path(__file__).resolve().parent.joinpath("bake.py").read_text(
+        encoding="utf-8")
+
+    def test_virt_customize_runs_the_inventory_writer(self):
+        self.assertIn("image_inventory.WRITE_CMD", self.SRC)
+
+    def test_the_inventory_is_read_back_offline_with_virt_cat(self):
+        # virt-cat, not a boot: the record must be extractable without running
+        # the appliance, which is the point of recording it at all.
+        self.assertIn('"virt-cat", "-a", work_qcow', self.SRC)
+        self.assertIn('("virt-cat", "apt-get install libguestfs-tools")',
+                      self.SRC)
+
+    def test_the_pkgs_sidecar_joins_the_SIGNED_checksum_set(self):
+        # Outside the signed set it is unauthenticated metadata — exactly the
+        # gap #5042 closed for the .manifest sidecar.
+        self.assertIn(
+            "sign.write_manifest(sums, [qcow_out, meta_out, manifest, pkgs_out])",
+            self.SRC)
+
+    def test_a_bad_inventory_aborts_the_bake(self):
+        self.assertIn("image_inventory.InventoryError", self.SRC)
+
+    def test_main_passes_the_guest_kernel_into_the_manifest(self):
+        self.assertIn("guest_kernel=guest_kernel", self.SRC)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,39 @@ drain paths (#5845).
   DB, so a later rollback could not restore the config. A `dirSize`
   failure while sizing a PRESENT DB (e.g. EIO on a subfile) is likewise
   surfaced, never silently sized as 0.
+
+  **A RESUMED cut RE-TAKES this snapshot (#6556).** PREFLIGHT, COPY and
+  VERIFY are pure — the daemon stays LIVE and accepting commits across
+  all three — and the host-wide upgrade lock is NOT held across an
+  interruption, so the operator has no signal that a cut is pending. A
+  resume that reused the snapshot taken at the ORIGINAL preflight meant a
+  later auto-rollback silently reverted every commit made in the
+  interruption window. This is the same argument the VERIFY bullet below
+  already makes for its own sibling case (#1967/#1981), with a crash in
+  place of a verify failure.
+
+  The re-snapshot is FLOORED at STOPPED, and that floor is load-bearing
+  rather than cautious. From STOPPED the daemon is down, so no commit can
+  have landed and there is nothing to re-capture; and re-snapshotting at
+  FLIPPED would be actively WRONG — `versions/current` already points at
+  the new binary, which may have started and migrated the DB envelope, so
+  the "pre-upgrade" snapshot would capture POST-upgrade state and defeat
+  rollback entirely. The exposed span is exactly
+  `{PREFLIGHT, COPIED, VERIFIED}`.
+
+  The snapshot writer (`snapshotConfigDB`, extracted from `preflight` so
+  the resume path shares one implementation) also changed its ORDERING
+  for this: the replacement is made durable in `.partial` FIRST and only
+  then does the previous snapshot give way. The pre-#6556 code removed
+  the live snapshot before copying, which is harmless on a first
+  preflight (nothing to lose) and not harmless on a re-snapshot — a crash
+  mid-copy would leave the journal naming a directory that no longer
+  exists, so the rollback fails at restore time instead of falling back
+  on the older snapshot. It re-classifies the DB directory rather than
+  trusting the original preflight's verdict: a DB that is GONE by resume
+  time clears `DBSnapshotPath`/`AdvancedStateFloor` **and removes the
+  stale snapshot dir**, so a rollback cannot restore a config DB over a
+  root the operator deliberately emptied.
 - **COPY** — `staged/` → `.<ver>.partial/` + checksum + atomic rename to
   `versions/<ver>/`. A crash never leaves a half-populated version dir;
   stray `.partial` dirs are swept on re-run, and the sweep fsyncs the
@@ -573,6 +606,19 @@ state machines are untouched.
    post-promotion check (`make test-failover`) — a passive node structurally
    cannot forward, so it is never "verified while passive".
 
+   **#6557**: until that issue, this paragraph described the intent and the
+   code did not implement it. `runRollingWith` step 7 called a bare
+   `cl.ResetFailover()` and returned nil; `RejoinAndConfirm` — declared on
+   the `RollingCluster` interface in `rolling.go` itself — was wired only
+   into `kernel_drain.go`. `fakeCluster` had carried the `rejoinIncomplete`
+   / `rejoinErr` seams since #5138 and no rolling test ever set them, and
+   `TestRolling_HappyPath` asserted only that `ResetFailover` was *called*,
+   so nothing observed the difference between requesting a rejoin and
+   confirming one. Step 7 now calls `RejoinAndConfirm(cl, RejoinDeadline)`,
+   so the binary rolling cut and the LANE-1 kernel roll share ONE definition
+   of "rejoined". On failure the node is left secondary and the error tells
+   the driver explicitly not to advance to the peer.
+
 ### `--unit` and the cluster control endpoint (#1983)
 
 `--unit <name>` (default `xpfd`) selects the systemd unit the
@@ -884,6 +930,92 @@ candidate boot, `xpf-kernel-promote.service` runs the kernel-space
 `maxPromoteAttempts`, then `restoreKnownGood`). The journal at
 `/var/lib/xpf/kernel-upgrade.state` makes the trial crash-safe and
 idempotent across the reboot.
+
+### Operator visibility (#6495)
+
+During a roll the channel is legible from the CLI the operator already has,
+not only from a root shell:
+
+```
+> show system kernel-upgrade
+Kernel upgrade channel (LANE 1, A/B slots):
+  Running kernel:  6.18.4-11-generic
+  Armed:           yes — a candidate trial is IN FLIGHT
+    Candidate:     6.19.0-1-generic
+    Known-good:    6.18.4-11-generic
+    Active slot:   xpf-A
+    Candidate slot: xpf-B
+    State:         ARMED
+    BootNext:      Boot0004 (one-shot, cleared by the firmware on boot)
+  Promotion marker: none
+  Last roll:       none recorded
+
+  Cluster: this node is HELD SECONDARY — kernel-candidate promotion gate ...
+```
+
+Three things it answers that previously needed a root shell or journald:
+
+- **Is a candidate armed?** `ARMING` is reported as *not* armed and says why:
+  it is prepared intent whose firmware one-shot was never read back (#5847), so
+  the next boot is the **known-good** kernel. An operator told "armed" there
+  would expect a trial that will not happen.
+- **Is this node held secondary by the upgrade gate, and by *which* gate?**
+  `show chassis cluster status` and `show chassis cluster information` now
+  annotate the hold, so a node parked SECONDARY by the *expected gate* is no
+  longer indistinguishable from one demoted by a monitor failure or a manual
+  failover.
+
+  There are **two** hold reasons, because the daemon sets the one
+  `kernelUpgradeHold` flag for two materially different conditions whose
+  remedies differ:
+
+  | Reason | Condition | Operator action |
+  |---|---|---|
+  | `KernelUpgradeHoldCandidate` | a candidate is genuinely ARMED | wait — the durable promotion marker releases it |
+  | `KernelUpgradeHoldUnreadableJournal` | the #5682 fail-closed hold: `IsArmed` returned an **error**, so whether anything is armed is UNKNOWN | repair `/var/lib/xpf` — no marker may ever be written |
+
+  Rendering one string for both would be a **false statement** in the
+  fail-closed case: "held until the promotion marker confirms the running
+  kernel" asserts a candidate exists and that a marker will resolve it, and the
+  daemon reached that branch precisely because it could not establish either.
+  That is the same class of defect as the invisibility this section is about,
+  one layer in. `Manager.KernelUpgradeHoldReason()` returns the active reason;
+  `KernelUpgradeHeld()` remains the yes/no predicate the election uses, and is
+  deliberately **not** what the status surfaces render.
+
+  The reason also follows the **#5682 self-heal transition**: when a fail-closed
+  hold's journal becomes readable and a candidate *is* armed,
+  `reconcileKernelUpgradeHold` converts it in place to a candidate hold and
+  re-sets the reason, so the status stops telling the operator to repair a
+  filesystem that is now healthy.
+
+  The annotation is node-scoped and sits **above** every `Redundancy group:`
+  header so the rolling-deploy node parser (`deploy_rolling_secondary_node`,
+  `test/incus/deploy-lib.sh`) cannot read it as a table row.
+- **Did the last candidate promote or revert, and why?** `revert()` clears the
+  journal by design (the next boot must be a clean ordinary boot) and the
+  promotion marker is written only on PROMOTE, so a rejected candidate used to
+  leave `promoted=none` / `armed=none`: correct, and indistinguishable from a
+  box that never tried, with the reason surviving only in journald. A durable
+  last-roll record at `/var/lib/xpf/kernel-last-roll` (version, known-good,
+  outcome, reason, timestamp) now survives the clear.
+
+The last-roll record is deliberately **not** cleared at arm time, unlike the
+promotion marker. The marker is cleared on `Arm` because a stale "promoted"
+from a prior same-version roll would false-satisfy the HA orchestrator's
+post-reboot version check. This record answers no such check — it is history,
+overwritten by the next roll's outcome, and clearing it on arm would destroy
+the previous answer exactly when an operator re-arming after a failure wants
+it. Both writes are best-effort: a failed history write never changes what the
+channel does, and a revert that could not record itself is still a revert. It
+is written at the TOP of `revert()`, before that function's two early exits (a
+journal that cannot be persisted, and the attempt-cap give-up), because those
+are the states an operator most needs explained.
+
+`show system kernel-upgrade`, the console CLI, and the remote `cli` all render
+through `upgrade.RenderChannelStatus`, and the read path
+(`upgrade.ReadChannelStatus`) mutates nothing, so it is safe at operator
+polling frequency against the same durable state the promotion gate depends on.
 
 **The gate execs xpfd by EXPLICIT path, never `$PATH` (#6541).** The
 promotion gate runs as root on the candidate boot and its exit status

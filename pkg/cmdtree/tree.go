@@ -687,11 +687,13 @@ var OperationalTree = map[string]*Node{
 			"rollback": {Desc: "Show rolled back configuration", Children: map[string]*Node{
 				"compare": {Desc: "Compare rollback with active config"},
 			}},
-			"backup-router": {Desc: "Show backup router configuration"},
+			"backup-router":    {Desc: "Show backup router configuration"},
+			"bootstrap-import": {Desc: "Show the day-0 / bootstrap configuration import outcome"},
 			"buffers": {Desc: "Show buffer utilization", Children: map[string]*Node{
 				"detail": {Desc: "Show detailed per-map statistics"},
 			}},
 			"internet-options": {Desc: "Show internet options"},
+			"kernel-upgrade":   {Desc: "Show kernel-upgrade channel state (armed candidate, promotion marker, last roll)"},
 			"license":          {Desc: "Show system license"},
 			"login":            {Desc: "Show login configuration"},
 			"memory":           {Desc: "Show system memory usage"},

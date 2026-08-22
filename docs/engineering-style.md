@@ -245,6 +245,16 @@ inlining. Treat the trend as a defect, not a style preference.
   to the relevant tracking issue (or asking the author to open
   one). Don't let "but the surrounding code is already like that"
   land.
+- **The gate reds the author of the growth, not the next merger**
+  (#7253). `pkg/refactoraudit`'s
+  `TestTouchedFileCrossedModularityThreshold` fails when a file **your
+  branch touches** crosses 1500 or 2000 LOC, measured from your own diff
+  against the merge base — so an unrelated file growing elsewhere can
+  never red you, and regenerating `docs/refactoring-audit-current.txt`
+  can never silence you. Split the file, or record the decision and its
+  reason in `docs/refactoring-audit-accepted.txt`. Keeping the global
+  heatmap current is `make audit-refresh`'s job; its lag fails nothing.
+  See `docs/refactoring-audit.md` "The two gates".
 
 ## Overflow / failure policy
 
@@ -255,6 +265,48 @@ inlining. Treat the trend as a defect, not a style preference.
 | Invariant violation at config time | `panic!` with context. Not recoverable; crash-start is safer than running with a wrong invariant. |
 | Invariant violation at runtime (rare, driver bug) | Bump a dedicated counter, continue. Crashing the dataplane on a single misbehaved packet punishes every other flow. |
 | "Path not found" at config apply | Warn + continue if the path is a best-effort cleanup; fail hard if the path is load-bearing. Don't let `|| true` mask the load-bearing case. |
+
+## A fail-closed exclusion owes a show-surface annotation (#6534)
+
+When you make the snapshot builder DROP or DISARM a config object to fail
+closed, you have created a second, quieter bug: the operator's `show`
+output still renders that object from config, so the box now reports as
+enforced something it is deliberately not enforcing. #6534 found this had
+happened at ~21 sites, because each individual fail-closed fix was
+reviewed on its own and every one of them looked complete.
+
+The rule: a PR that adds an exclusion must also make the surface tell the
+truth, in the same PR. Concretely:
+
+1. Put the drop predicate in `pkg/config` as an exported
+   `...ExcludedReason(...) string` (or `...Unsupported(...) bool`), not
+   inline in the builder. `nat_exclusion_reason.go` and `nptv6_scope.go`
+   are the worked examples.
+2. Have BOTH the builder and the renderer call it. Two copies drift, and
+   they drift in two directions that fail differently: a builder that
+   drops what the renderer calls armed lies to the operator, and a
+   renderer that annotates what the builder installs cries wolf.
+3. Surface the REASON, not just the fact. "NOT INSTALLED" alone makes the
+   operator guess which of five conditions fired.
+4. Bind the two halves with an AGREEMENT test that names WHICH site
+   diverged, and pin each fixture to ground truth first so a fixture that
+   stops constructing the malformed shape fails loudly instead of passing
+   vacuously (`TestNATExclusionBuilderRendererAgree_6534`).
+
+What NOT to reach for: an applied-set readback from the helper. These
+exclusions are decided by the Go builder at snapshot-build time as a
+deterministic function of the committed config — the dataplane does not
+decide anything at runtime, it honors a verdict already reached. There is
+no runtime fact to read back, and `AppliedNATView` hands back the applied
+CONFIG, not the applied SNAPSHOT, so it does not carry the drop bit
+anyway. What the renderer is missing is the predicate, not a data path.
+
+Reachability, so severity is judged correctly: every one of these
+exclusions is a LENIENT-path backstop. The strict commit gate rejects the
+config outright, so the lying-show state is reachable only via
+`Store.Load` at boot or `Store.SyncApply` on HA peer-sync
+(`opts.lenientFirewallRefs`, #1960 no-brick) — which is exactly when an
+operator is reading `show` output to work out why traffic is not flowing.
 
 ## Persistence classes (#1894)
 

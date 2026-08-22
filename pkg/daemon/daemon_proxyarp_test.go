@@ -67,7 +67,7 @@ func TestProxyARPIfaceMap_ResolvesRethToPhysical(t *testing.T) {
 	linux := config.LinuxIfName("ge-0/0/2")
 	withFakeIfaceResolver(t, map[string]int{linux: wantIdx})
 
-	m := proxyARPIfaceMap(cfg)
+	m, _, _ := proxyARPIfaceMap(cfg)
 	got, ok := m["reth0.0"]
 	if !ok {
 		t.Fatalf("reth0.0 not resolved; map=%v (RETH→physical resolution dropped?)", m)
@@ -123,7 +123,7 @@ func TestProxyARPIfaceMap_ResolvesVLANSubinterfaceToOwnNetdev(t *testing.T) {
 		config.LinuxIfName("ge-0/0/1"): parentIdx,
 	})
 
-	m := proxyARPIfaceMap(cfg)
+	m, _, _ := proxyARPIfaceMap(cfg)
 	got, ok := m["ge-0/0/1.3"]
 	if !ok {
 		t.Fatalf("ge-0/0/1.3 not resolved; map=%v (VLAN sub-interface resolution dropped?)", m)
@@ -148,7 +148,7 @@ func TestProxyARPIfaceMap_DedupesAndSkipsUnresolvable(t *testing.T) {
 	}
 	withFakeIfaceResolver(t, map[string]int{config.LinuxIfName("ge-0/0/1"): 5})
 
-	m := proxyARPIfaceMap(cfg)
+	m, _, _ := proxyARPIfaceMap(cfg)
 	if len(m) != 1 {
 		t.Fatalf("map = %v, want exactly one resolved entry", m)
 	}

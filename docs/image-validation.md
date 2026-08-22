@@ -104,13 +104,259 @@ Scenarios:
 
 | Scenario | Proves |
 |---|---|
-| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp |
-| **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
+| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path); **both slot ESP dirs fully staged with selectors seeded at the running kernel** and **every installed kernel package still held** (#6498); **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
+| **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600` because it may carry credential material; the scenario now asserts that posture — root-owned **regular file**, mode exactly `0600` — #6503.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 | **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
 
+Before any scenario runs, the harness verifies the **image seal** on the
+exported artifact (#6547 — see below). It is a pre-scenario step, not a
+scenario, so a single-scenario run is gated by it too.
+
 **Pass:** `Validation complete.` with all selected scenarios PASS. Any
 `FAIL:` line blocks the bake.
+
+### The image seal / clone identity (#6547)
+
+The bake seals the image with `virt-sysprep` so **no per-device identity ships
+inside the golden artifact**: every appliance must regenerate its own
+machine-id, SSH host keys, SNMPv3 EngineID and random-seed on first boot. Until
+#6547 this gate — the last thing between a bake and a release signature —
+asserted **nothing** about that. `grep -ciE 'ssh_host|machine-id|engine-id|
+random-seed|sysprep'` over `validate.py` returned 0 for the identities. A
+clone-identity regression therefore shipped **signed** and passed the publish
+gate.
+
+The acute risk was bounded: bake's `run()` is `subprocess.run(argv,
+check=True)`, so an outright `virt-sysprep` failure raises. The exposure is
+**drift**. The `--enable` list was a hand-maintained string literal, and the
+identity purge is a `rm -rf … 2>/dev/null || true` whose failure is swallowed by
+construction — so a member falling out of either, or the step being refactored
+away, produced no signal anywhere. What ships then is fleet-wide shared SSH host
+keys (every appliance answers with the same host identity, so an operator's
+`known_hosts` cannot distinguish one from an impostor and a stolen key
+impersonates the fleet), a shared machine-id, and a shared SNMPv3 EngineID —
+from which every clone derives **byte-identical localized USM keys** and will
+accept another appliance's authenticated SNMPv3 requests (#5283).
+
+| Identity | Must be | Sealed by |
+|---|---|---|
+| `/etc/machine-id` | absent or **empty** | `--enable machine-id` |
+| `/etc/ssh/ssh_host_*` | absent | `--enable ssh-hostkeys` |
+| `/var/lib/xpf/snmp-engine-id` | absent | purge path (#5283) |
+| `/var/lib/xpf/snmp-engineboots` | absent | purge path (#5283) |
+| `/var/lib/systemd/random-seed` | absent | purge path |
+
+**The assertion is made OFFLINE, against the exported qcow2, and that is not an
+implementation convenience — it is the only place the property is observable.**
+Inside a booted guest every one of these identities has already been
+regenerated by first boot, so an in-guest probe finds a machine-id and host keys
+present and cannot tell a freshly-generated identity from a baked-in one. The
+shipped bytes are what the operator receives, so the shipped bytes are what is
+checked. `machine-id` is checked as *absent or empty* rather than absent because
+`virt-sysprep` truncates it rather than deleting it, and systemd's
+uninitialized state is a present zero-byte file.
+
+**libguestfs missing is a FAILURE, not a skip.** This runs on the host that just
+baked the image (`bake.py` already `require()`s `virt-cat` and the rest of
+libguestfs-tools), and a security gate that skips itself when its tool is absent
+is exactly the vacuous shape this check exists to remove. A glob the inventory
+carries no result for likewise FAILS: an unobserved property is not a satisfied
+one, and an unreadable image is when a silent pass costs the most.
+
+**The seal and the gate that verifies it cannot drift apart.** `bake.py` now
+carries `SYSPREP_ENABLE_OPS` and `SYSPREP_PURGE_PATHS` as the single source for
+the seal (the `virt-sysprep` argv is built from them), and each entry in
+`validate.py`'s `_SEAL_IDENTITY_CHECKS` names the seal step that produces its
+outcome. `scripts/image/test_validate_image_seal_6547.py` binds the two: remove
+one `--enable` member from the bake and it goes RED, with no VM and no real
+image. That file also calibrates the verdict on known-bad input for each
+identity separately, and pins the unobserved-check-fails rule.
+
+Calibrated end to end on real qcow2 artifacts before being trusted: a
+purpose-built **unsealed** image (planted machine-id, host keys, EngineID,
+engineBoots, random-seed) is REJECTED naming all five; the same image with those
+removed PASSES; an image missing the `/var/lib/xpf` directory entirely PASSES
+(no matches, not an unobserved check); and an image shipping only
+`snmp-engineboots` is REJECTED naming exactly that one.
+
+**Related — #6503.** Same root shape: a gate that asserts presence rather than
+properties. The `/etc/xpf` directory's own mode remains unasserted for the
+reason given in that section.
+
+### Secure Boot posture (#6497)
+
+The production appliance posture is UEFI Secure Boot **ON** — `test/incus/setup.sh`
+sets `security.secureboot: "true"` "to match the production posture (#1943)".
+The gate now proves it rather than inheriting it:
+
+- **incus scenarios launch with an explicit `-c security.secureboot=true`.** It
+  is the incus default today, but the gate must not inherit the property it
+  exists to assert: a default flip, a profile override, or a host without the MS
+  db would silently degrade every scenario to SB-off and still pass.
+- **Scenario A asserts the guest actually booted under SB.** Three independent
+  readings, so a *missing* reading is distinguished from the property being
+  false: byte 4 of the `SecureBoot` EFI variable (authoritative and package-free
+  — an efivarfs file is 4 attribute bytes then the value), `mokutil --sb-state`
+  when present, and `/sys/kernel/security/lockdown` as corroboration.
+  `mokutil` is **not** in `bake.py`'s `RUNTIME_PACKAGES`, so an assertion that
+  required it would turn a package-set change into a fake SB regression. An
+  active lockdown never *overrides* a definite "off" — lockdown can also be
+  forced from the cmdline. **No readable source at all is a FAIL**, not a pass:
+  a gate that cannot observe the property has not asserted it, which is exactly
+  how SB-off shipped green.
+- **The plain-QEMU leg prefers an SB-ENFORCING firmware pair** (a secboot
+  `OVMF_CODE` build *and* MS-keyed `OVMF_VARS`, so the Canonical-signed shim
+  verifies with no MOK enrollment). Both halves are required: a non-secboot CODE
+  build ignores SB even with MS keys present, and a secboot CODE build with
+  plain VARS has no db for the shim to verify against. When the host has no
+  enforcing pair the leg still runs SB-off for bootability coverage, but says so
+  in the log and in its PASS line. The old comment read "plain-QEMU bootability
+  is proven fine with SB off" — true, and being counted as something it is not.
+
+Why this is more than "the image is signed": the #1930 A/B substrate makes
+lockdown-sensitive design choices nothing automated exercised.
+`scripts/image/grub.d/09_xpf` documents that `regexp` may be unavailable under
+Secure-Boot lockdown and that the slot selector must therefore be a GRUB
+*script* so GRUB can parse it there. Before this, the only SB-on validation of
+that chain was a one-time manual probe on a hand-staged stock VM
+(`docs/pr/1930-inc1-kernel-channel/live-validation.md`), not the baked artifact.
+
+`_secureboot_verdict` and `_qemu_firmware_choice` are pure functions
+(`find` is injected into the latter so the preference order is asserted
+independently of the test host's OVMF packages), unit-tested in
+`scripts/image/test_validate_secureboot_6497.py` and run by `make selftest`.
+### Why scenario A asserts the A/B kernel channel (#6494)
+
+The bake stages `/boot/efi/EFI/{xpf-A,xpf-B}` and enables the two #1930
+oneshots, and hard-asserts the signed shim is present. What it cannot assert
+offline is the half that only happens in-guest: UEFI `Boot####` variables live
+in the target's firmware NVRAM, which `virt-customize` cannot write, so
+registration is a first-boot oneshot on the real machine.
+
+That oneshot is deliberately non-fatal on every failure path — a read-only or
+no-efivars platform must still boot ("degraded, not bricked") — and until #6494
+nothing downstream re-read its outcome. So a regression in the ESP disk/part
+parse, the loader-path match, or the `efibootmgr` write shipped a fully
+`validated: true` image whose verify-gated kernel channel was silently
+unavailable. The operator found out when `xpfd upgrade kernel arm` exited 2
+with *"A/B slots not both registered ... the first-boot registration oneshot
+must run first"*.
+
+Note what scenario A does **not** assert about the promotion gate: the
+`promotion gate: clean` journal line. That line is emitted only once the gate
+has exec'd xpfd to run the promote verb. On a factory boot with nothing armed
+the script exits 0 much earlier, logging `no armed kernel candidate recorded`,
+so requiring the former would fail every good image. The gate asserts
+`ExecMainStatus=0` plus that ordinary-boot line, which together prove the unit
+**executed** rather than being skipped by a Condition.
+
+The three slot properties are checked separately because they have three
+different causes: registered *exactly once* (a duplicate makes `BootNext`
+ambiguous — the live #1930 bug, from a label guard anchored at `$`), pointing
+at *its own* `\EFI\<slot>\shimx64.efi` (a label-only match would chainload the
+wrong loader), and present in *BootOrder* (a slot the firmware never reaches is
+not registered in any sense the channel can act on). The verdict functions
+mirror `xpf-uefi-slots`' own shell regexes on purpose: a gate that disagreed
+with the script about what "registered" means would certify a state the script
+would not accept.
+
+Both verdicts are pure functions over captured command output
+(`_efibootmgr_slot_verdict`, `_oneshot_clean_verdict`), unit-tested without a
+hypervisor in `scripts/image/test_validate_ab_slots_6494.py` (run by `make
+selftest`), in the same idiom as `_qemu_img_verdict`.
+
+### The rest of the first-boot substrate (#6498)
+
+Registration is not the whole LANE-1 contract. Two halves of it are invisible
+to the #6494 assertions, and scenario A now covers both.
+
+**The slot ESP dirs, and what each selector names.** A slot registers only if
+the bake staged its shim: `xpf-uefi-slots`' `register_slot()` returns 1 without
+ever calling `efibootmgr` when `/boot/efi/EFI/<slot>/shimx64.efi` is absent. So
+an unstaged slot LOOKS like a registration failure, pointing at the wrong half
+of the channel — which is why the ESP assertion runs BEFORE the NVRAM one and
+is diagnosed separately (a unit test pins that ordering). The selector is the
+half nothing else could see at all: a slot whose `xpf.selector` names a
+`vmlinuz`/`initrd` pair the image does not ship registers cleanly, boots
+cleanly, and exits 0 from both oneshots — and is a dead boot entry discovered
+only when the firmware actually falls through to it, i.e. during a rollback,
+the one moment the channel exists for. Scenario A asserts each selector names
+the RUNNING kernel, which is correct **because it is a factory boot**: the bake
+seeds both selectors at the single kernel it leaves in `/lib/modules` and
+scenario A re-asserts that count. After a promotion the two selectors
+legitimately differ, so this is deliberately a scenario-A assertion and not a
+general one.
+
+**The #1930 INC-0 kernel hold, on the booted image.** `bake.py` verifies the
+hold per-package — but inside `virt-customize`, before `virt-sysprep`, the
+sparsify/export, and the first boot. Nothing re-read it afterwards, so a hold
+that did not survive any of those steps shipped in a signed, `validated: true`
+image. The consequence is not cosmetic: an unattended apt run that moves the
+kernel can leave the appliance booting a kernel the verifier-gated shim `.o`
+was never verified against — no dataplane.
+
+> **The enumeration is the KERNEL package set, not the literal `linux-*`.**
+> #6498's acceptance criterion reads "every installed `linux-*` package appears
+> in `apt-mark showhold`". Asserted literally, that REDS every valid image:
+> `linux-base` is a hard dependency of `linux-image-*-generic`, and
+> `linux-libc-dev` / `linux-sysctl-defaults` / `linux-perf` are installed
+> alongside it. None are kernel packages and `bake.py` deliberately holds none
+> of them. The property the criterion reaches for is "the kernel cannot move",
+> so the gate enumerates exactly the four globs `bake.py` holds
+> (`linux-image-*`, `linux-headers-*`, `linux-modules-*`, `linux-generic`) with
+> the same `${db:Status-Status}` installed-only filter. A **drift canary** binds
+> the two enumerations: a gate asserting a different set than the bake protects
+> would either red on a good image or certify an unprotected one, so the
+> agreement itself is the property under test.
+
+An EMPTY enumeration FAILS rather than passing. "All zero of them are held" is
+the pass that would argue against anyone re-examining the property — and
+`bake.py`'s own hold fragment collapsed to an empty enumeration twice during
+#1926 (an unexpanded `${Package}`, then `dpkg-query -W` returning
+never-installed names).
+
+`_ab_slot_esp_verdict` and `_kernel_hold_verdict` are pure functions over
+captured command output, unit-tested (with the bake-agreement canaries and the
+call-site wiring assertions) in
+`scripts/image/test_validate_ab_substrate_6498.py`, run by `make selftest`.
+
+### The day-0 config's credential posture (#6503)
+
+The loader installs `/etc/xpf/xpf.conf` with `install -o root -g root -m 0600`
+because it "may carry credential material (root-authentication
+encrypted-password, IKE PSKs)". Until #6503 the gate asserted the file exists
+and is non-empty and **nothing about the mode** — this document said so in as
+many words — so a regression to `0644` would ship world-readable IKE PSKs and
+password hashes inside a *signed* image and pass Tier 1 green. It is pinned now
+for the same reason scenario A pins the sshd posture.
+
+Asserted in **every** scenario that installs a config — B (valid drive), C's
+retry leg, and E (node-id drive) — because they all reach the same `install`
+call and a regression there would ship from any of them.
+
+Two details a naive version of this check gets wrong:
+
+- **The mode is compared as an octal value, not the string `"600"`** — for
+  rendering independence, not because a string compare would let a bad mode
+  through. GNU `stat -c %a` emits `600` unpadded, so `!= "600"` rejects `4600`
+  exactly as `!= 0o600` does; what the value compare buys is that a zero-padded
+  `0600` from a non-GNU `stat` is the same mode and is not a false red.
+- **The probe does not pass `stat -L`.** For a symlink, `stat -c '%a %U:%G %F'`
+  reports the *link* (`777 … symbolic link`); `stat -L` reports the *target*
+  (`644 … regular file`). A check that followed the link would read the
+  target's mode while the file an attacker controls is the link — a `0600`
+  target behind a world-writable link would PASS on mode alone. The file type
+  is therefore part of the verdict, and `_DAY0_CONF_STAT` is asserted to carry
+  no `-L`.
+
+**Not** asserted: `/etc/xpf`'s own directory mode. The loader sets it
+best-effort (`chmod 0750 … || true`) and the directory comes from the `.deb` on
+a real appliance, so it is not the loader's contract to pin here.
+
+`_conf_mode_verdict` is a pure function over the captured `stat` output,
+unit-tested (with the call-site wiring assertions) in
+`scripts/image/test_validate_day0_perms_6503.py` and run by `make selftest`.
 
 ---
 

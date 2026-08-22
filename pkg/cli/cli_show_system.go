@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"golang.org/x/sys/unix"
 )
 
@@ -232,6 +234,41 @@ func (c *CLI) showCoreDumps() error {
 	if !found {
 		fmt.Println("No core dumps found")
 	}
+	return nil
+}
+
+// showBootstrapImport renders the day-0 / bootstrap config-import outcome
+// (#4184) recorded at boot — the answer to "why didn't my day-0 config apply?"
+// (#6496).
+//
+// Before this the outcome existed only in the loopback /health JSON, so the
+// operator standing at a fresh box in this very CLI had to know to leave it
+// and curl 127.0.0.1:8080/health. It renders through pkg/bootstrapshow, the
+// same implementation the gRPC ShowText path uses, so the console and the
+// remote `cli` cannot disagree about the same recorded fact.
+func (c *CLI) showBootstrapImport() error {
+	snap := bootstrapshow.Snapshot{}
+	if c.bootstrapImportFn != nil {
+		snap = c.bootstrapImportFn()
+	}
+	bootstrapshow.Render(os.Stdout, snap)
+	return nil
+}
+
+// showKernelUpgrade renders the #1930 LANE-1 kernel-channel state (#6495):
+// the armed candidate, the durable promotion marker, the last completed roll
+// and its reason, and whether this node is being held SECONDARY by the
+// promotion gate.
+//
+// Renders through pkg/upgrade, the same implementation the gRPC ShowText path
+// uses, so the console and the remote `cli` cannot tell an operator two
+// different things about one node mid-roll.
+func (c *CLI) showKernelUpgrade() error {
+	st := upgrade.ChannelStatus{}
+	if c.kernelUpgradeStatusFn != nil {
+		st = c.kernelUpgradeStatusFn()
+	}
+	upgrade.RenderChannelStatus(os.Stdout, st)
 	return nil
 }
 
@@ -1074,6 +1111,11 @@ func (c *CLI) handleShowSystem(args []string) error {
 
 	case "core-dumps":
 		return c.showCoreDumps()
+
+	case "kernel-upgrade":
+		return c.showKernelUpgrade()
+	case "bootstrap-import":
+		return c.showBootstrapImport()
 
 	case "license":
 		fmt.Println("License: open-source (no license required)")

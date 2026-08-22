@@ -837,8 +837,19 @@ snap`, and there are two of them — one per acceptance path).
     static-NAT rule, a non-/96 NAT64 prefix, an empty NAT64 source pool).
     `TestNATCompilerCallsNoDataplaneNATWriter_6420` arms every retired writer
     to FAIL and requires a clean validate, so a reintroduced write reds.
-    `compileNPTv6` still writes `nptv6_rules`; retiring that surface and the
-    `maps_nat.go` writers themselves is the sibling cleanup.
+    #7268 extended that deletion to `compileNPTv6`: it no longer writes
+    `nptv6_rules`, and `SetNPTv6Rule` / `DeleteStaleNPTv6` are armed in the same
+    tripwire. `compileNPTv6` is now a pure VALIDATOR — every parse and the
+    #6894 r9 / #7077 reject-vs-warn disposition stay, because they are the
+    pre-pass deciding whether an apply can succeed, not dead record-building.
+    The helper builds its own NPTv6 state from the config snapshot and computes
+    its own RFC 6296 adjustment (`userspace-dp/src/nptv6.rs`
+    `compute_adjustment`), so the Go-side `nptv6Adjustment` and its RFC 6296
+    vectors went with the write — the property is still tested where the value
+    is actually computed (`nptv6_tests.rs`: `compute_adjustment_simple`,
+    `checksum_neutrality`, `checksum_neutrality_64`). Retiring the `maps_nat.go`
+    writers and the `DataPlane` NAT interface surface themselves remains the
+    sibling cleanup (#7268 scope 2-4).
   - The pre-pass (`compiler_validate_4960.go`, #4960) re-runs the fallible
     HOST-PURE phases against a discarding dataplane BEFORE the zones phase
     performs the first destructive host netlink mutation, so a config that

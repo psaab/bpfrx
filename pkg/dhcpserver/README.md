@@ -48,6 +48,15 @@ parses a torn file, no fsync on the apply path.
   authoritative clear. Errors are logged with `reason`; the commit
   path keeps synchronous `Apply` (fail-closed; a superseded sync
   applier returns nil — being outraced is not a failure).
+- `ClaimApplyRetry(now) bool` — `dhcpserver.go`. The converger predicate
+  (#6535): true when the last COMPLETED apply attempt returned an error,
+  claiming a spaced retry window (`applyRetryInterval`, 30s) when it says
+  yes. It is the debt marker the cluster reconcile loop consumes — see
+  "Failed applies had no converger" under Gotchas. Guarded by `retryMu`,
+  deliberately NOT `mu`: `mu` is held for the whole apply body (a
+  15s-bounded systemctl shell-out) and the caller is the daemon's 2s
+  reconcile pass, which must not block behind a restart still in flight.
+  Lock order is `mu` -> `retryMu`; only the tail of `apply` takes both.
 - `ApplyClusterCommit(cfg) error` — `dhcpserver.go`. Cluster-commit
   reconcile (#1835 F3): always regenerates configs for configured
   families but restarts only units that are currently active; clears
@@ -844,6 +853,21 @@ adds `github.com/miekg/dns` (DNS UPDATE construction + TSIG signing).
 
 - Config is regenerated fully on every `Apply()` (no diff). The Kea config
   schema is JSON-based, so this is cheap.
+- **`dhcp-socket-type` is never emitted, so Dhcp4 runs Kea's default
+  `raw` (#6460).** `interfaces-config` carries only the `interfaces`
+  list. AF_PACKET delivery happens BEFORE the netfilter input hook, so
+  the `xpf_hostinbound` chain cannot gate DHCPv4 at all — a zone whose
+  `host-inbound-traffic system-services` omits `dhcp` does **not** stop
+  this server answering on an interface its group binds. Dhcp6 has no
+  raw mode but is addressed at the `ff02::1:2` multicast group, which
+  matches no per-zone unicast `daddr` rule and falls through the input
+  chain's accept policy — same outcome, different mechanism. A
+  commit-time advisory names the mismatch
+  (`validateDHCPServerHostInboundBypassWarnings`); see
+  `docs/host-inbound-multicast.md` "The DHCP-server sibling (#6460)".
+  Do not switch Dhcp4 to `udp` to "fix" this: UDP sockets cannot serve
+  clients that have no address yet, so it is a behaviour change with its
+  own migration, not a bug fix.
 - If the typed config drops the DHCP server entirely, `Apply()` stops the
   service and removes the config file. Running Kea processes are not
   killed via SIGKILL — systemd manages the lifecycle.
@@ -861,6 +885,31 @@ adds `github.com/miekg/dns` (DNS UPDATE construction + TSIG signing).
   regenerated, but units restart only if currently active (this node
   is serving) — also fail-closed. VRRP MASTER/BACKUP transitions own
   start/stop via `ApplyAsync`.
+- **Failed applies had no converger (#6535).** In cluster mode every
+  Kea driver is an EDGE: `applyRethServicesForRG` /
+  `clearRethServicesForRG` run only under `if tr.Changed`,
+  `applyDirectVIPOwnership` only on an ownership change, and
+  `ApplyClusterCommit` only when an operator commits. The async worker
+  logs an apply error and drops it — it does not retry. So a failover
+  whose Kea apply failed left the wrong node serving: persistent
+  dual-DHCP (both nodes' Kea up) or no-DHCP (neither), until the next RG
+  transition or commit. Neither happens on its own.
+  The fix pairs a success-gated debt marker here (`applyFailed`, set on
+  every completed attempt, cleared only by a success) with a periodic
+  converger in `pkg/daemon` (`reconcileClusterDHCPServices`, called from
+  `reconcileRGState` beside the RA converger it mirrors). Two rules for
+  future edits: the marker advances only on a COMPLETED attempt — a
+  superseded apply (`gen <= lastAppliedGen`) never ran and leaves it
+  alone — and the retry must stay SPACED, because re-driving a
+  permanently broken Kea on every 2s tick is a continuous systemctl
+  restart loop.
+  Note `lastAppliedGen` still advances on failure, deliberately: a retry
+  allocates a fresh generation so it is never blocked by the superseded
+  guard, and leaving that ordering invariant alone keeps the #1835
+  coalescing reasoning intact.
+  The desired state every driver applies is single-sourced in
+  `pkg/daemon` as `desiredClusterDHCPConfig` — a converger that
+  disagreed with the edge would fight it every tick.
 - Lease queries read Kea's CSV lease backends directly:
   `/var/lib/kea/kea-leases4.csv` and `kea-leases6.csv`. No control
   channel / socket call. Missing files yield an empty list, not an

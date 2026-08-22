@@ -532,23 +532,32 @@ func TestHostInboundMatrixDocDoesNotAdviseTheRefutedRemedy(t *testing.T) {
 // Test_3226_AdvisoriesReasonAboutTheEffectiveTokenSet pins the STRUCTURAL fix
 // for a family of self-contradicting advisory pairs.
 //
-// Junos host-inbound is ADDITIVE across the zone and interface levels: an
-// interface admits a service when EITHER level lists it, and the dataplane
-// enforcement view is built from that union. The commit advisories used to run
+// The commit advisories must reason about the same EFFECTIVE token set the
+// dataplane enforcement view is built from (post-#6515: the interface stanza
+// where one is declared, else the zone stanza). They used to run
 // per RAW STANZA, so they reasoned about a different object than the enforcer
 // and emitted advice that contradicted it — and contradicted each other in the
 // same commit output. Three shapes, all closed here:
 //
 //	any-service + all in ONE stanza      -> "everything is admitted" together
 //	                                        with "ports are now DENIED".
-//	zone any-service + interface rpm     -> "rpm is DENIED, add any-service"
-//	                                        when the union already full-admits.
-//	zone rpm + interface any-service     -> same, in the other direction.
+//	zone rpm + interface any-service     -> "rpm is DENIED, add any-service"
+//	                                        when the effective set already
+//	                                        full-admits.
 //
 // Fixing those case by case would have left the two views diverging, so the
-// advisories now consume config.UnionHostInboundTokens — the same union the
-// dataplane builder uses — and suppress the scoping / unported notices whenever
-// the EFFECTIVE set full-admits.
+// advisories now consume config.EffectiveHostInboundTokens — the same resolver
+// the dataplane builder uses — and suppress the scoping / unported notices
+// whenever the EFFECTIVE set full-admits.
+//
+// #6515 retired the third shape (zone any-service + interface rpm). Under the
+// old ADDITIVE combination that interface's effective set was
+// zone{any-service} ∪ iface{rpm}, a full-admit, so the "rpm is DENIED" notice
+// contradicted it. Under REPLACE the interface is described entirely by its own
+// stanza, so the effective set really is {rpm} and rpm really IS denied there —
+// the advisory is now correct and must fire. That subtest is kept and inverted
+// rather than deleted: it is the case that distinguishes the two combination
+// rules, so it is the one worth pinning.
 //
 // FAIL-ON-REVERT: drop the effectiveFullAdmits gates, or go back to passing the
 // raw per-stanza token lists, and the contradicting pair reappears.
@@ -587,10 +596,22 @@ func Test_3226_AdvisoriesReasonAboutTheEffectiveTokenSet(t *testing.T) {
 			"set security zones security-zone wan interfaces ge-0/0/0.0",
 			"set security zones security-zone wan host-inbound-traffic system-services any-service",
 			"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services rpm")
-		if got := hostInboundUnportedWarnings(cfg); len(got) != 0 {
-			t.Errorf("the interface's EFFECTIVE set is zone{any-service} + iface{rpm}, which "+
-				"full-admits — rpm traffic is NOT denied there, so the unported advisory must "+
-				"not fire, got: %v", got)
+		// #6515 INVERSION. The interface declares its own stanza, so its
+		// effective set is {rpm} — the zone's any-service is REPLACED, not
+		// added to. rpm has no platform default port, so it genuinely IS
+		// denied on this interface and the unported advisory is telling the
+		// truth. Before #6515 the effective set was the union (a full-admit)
+		// and the same advisory was a contradiction. Asserting the advisory
+		// FIRES here is what makes this subtest discriminate replace from
+		// union at all; asserting it stays silent would pass under both.
+		got := hostInboundUnportedWarnings(cfg)
+		if len(got) != 1 {
+			t.Fatalf("the interface's EFFECTIVE set is iface{rpm} (the zone's any-service is "+
+				"REPLACED, #6515), so rpm IS denied there and the unported advisory must "+
+				"fire exactly once, got %d: %v", len(got), got)
+		}
+		if !strings.Contains(got[0], "ge-0/0/0.0") {
+			t.Errorf("the unported advisory must name the interface whose stanza denies rpm, got: %v", got)
 		}
 	})
 
@@ -642,25 +663,34 @@ func Test_3226_AdvisoriesReasonAboutTheEffectiveTokenSet(t *testing.T) {
 // because the two computed it separately; a shared helper only removes the class
 // while it actually stays shared.
 //
-// config.UnionHostInboundTokens is the SSOT. The dataplane builder
-// (pkg/dataplane/userspace unionHostInboundTokens) delegates to it, differing
-// only by lower-casing for map keying — which cannot change MEMBERSHIP, because
-// every predicate the advisories apply to the union is case-insensitive.
+// The SSOT is config.EffectiveHostInboundTokens for the zone↔interface
+// combination, and config.UnionHostInboundTokens for merging tokens authored at
+// the SAME level (the #3720 physical→unit resolution, #4544 repeated blocks).
+// The dataplane builder (pkg/dataplane/userspace effectiveHostInboundTokens)
+// delegates to the former, differing only by lower-casing for map keying — which
+// cannot change MEMBERSHIP, because every predicate the advisories apply is
+// case-insensitive.
 //
-// FAIL-ON-REVERT: give either side its own union and the additive/order/dedup
-// properties asserted here stop matching.
+// The table below is the within-level UNION. #6515: it is NOT the zone↔interface
+// rule any more, so a case here named "additive across levels" would be a false
+// claim about a real behaviour — the cases are named for what they are, merges of
+// two same-level lists. The zone↔interface rule has its own table in
+// host_inbound_replace_6515_test.go.
+//
+// FAIL-ON-REVERT: give either side its own merge and the order/dedup properties
+// asserted here stop matching.
 func Test_3226_AdvisoryUnionIsTheEnforcementUnion(t *testing.T) {
 	cases := []struct {
 		name        string
 		zone, iface []string
 		want        []string
 	}{
-		{"additive across levels", []string{"ssh"}, []string{"rpm"}, []string{"ssh", "rpm"}},
-		{"zone tokens keep authored order first", []string{"ping", "ssh"}, []string{"rpm"}, []string{"ping", "ssh", "rpm"}},
+		{"both lists merge", []string{"ssh"}, []string{"rpm"}, []string{"ssh", "rpm"}},
+		{"first list keeps authored order first", []string{"ping", "ssh"}, []string{"rpm"}, []string{"ping", "ssh", "rpm"}},
 		{"exact duplicates collapse", []string{"ssh"}, []string{"ssh", "rpm"}, []string{"ssh", "rpm"}},
 		{"empties skipped", []string{"ssh", ""}, []string{" "}, []string{"ssh"}},
-		{"nil override is the zone set", []string{"ssh"}, nil, []string{"ssh"}},
-		{"nil zone is the override set", nil, []string{"rpm"}, []string{"rpm"}},
+		{"nil second list is the first", []string{"ssh"}, nil, []string{"ssh"}},
+		{"nil first list is the second", nil, []string{"rpm"}, []string{"rpm"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -676,23 +706,34 @@ func Test_3226_AdvisoryUnionIsTheEnforcementUnion(t *testing.T) {
 			}
 		})
 	}
-	// The property the advisories actually depend on: a full-admit token
-	// anywhere in EITHER level is a full-admit in the union, whatever its case.
-	for _, tc := range []struct{ zone, iface []string }{
-		{[]string{"any-service"}, []string{"rpm"}},
-		{[]string{"rpm"}, []string{"any-service"}},
-		{[]string{"rpm"}, []string{"ANY-SERVICE"}},
+	// The property the advisories actually depend on, stated against the
+	// zone↔interface resolver rather than the union: whether the EFFECTIVE set
+	// full-admits, whatever the token's case. #6515 moved two of these three
+	// cases — a full-admit at the ZONE level no longer survives an interface
+	// stanza, because that stanza replaces it.
+	for _, tc := range []struct {
+		zone, iface []string
+		overridden  bool
+		wantFull    bool
+	}{
+		{[]string{"any-service"}, nil, false, true},
+		{[]string{"rpm"}, []string{"any-service"}, true, true},
+		{[]string{"rpm"}, []string{"ANY-SERVICE"}, true, true},
+		// #6515: the zone full-admit does NOT reach an interface that declares
+		// its own stanza. This case is the one that separates replace from
+		// union, so it is asserted in both directions.
+		{[]string{"any-service"}, []string{"rpm"}, true, false},
 	} {
 		full := false
-		for _, svc := range UnionHostInboundTokens(tc.zone, tc.iface) {
+		for _, svc := range EffectiveHostInboundTokens(tc.zone, tc.iface, tc.overridden) {
 			if HostInboundFullAdmitService(svc) {
 				full = true
 			}
 		}
-		if !full {
-			t.Errorf("union of zone %v + iface %v must be recognized as full-admit — the "+
+		if full != tc.wantFull {
+			t.Errorf("effective set of zone %v + iface %v (overridden=%v) full-admit = %v, want %v — the "+
 				"advisory suppression and the dataplane short-circuit both key on this",
-				tc.zone, tc.iface)
+				tc.zone, tc.iface, tc.overridden, full, tc.wantFull)
 		}
 	}
 }

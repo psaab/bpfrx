@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
@@ -34,12 +35,19 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/sysservices"
+	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 // CLI is the interactive command-line interface.
 type CLI struct {
-	rl              *readline.Instance
+	rl *readline.Instance
+	// readLineFn overrides rl.Readline for the multi-line terminal-input
+	// paths. It is a TEST SEAM, nil in production: the `load ... terminal`
+	// read loop is a security-relevant control flow (a Ctrl-C-aborted paste
+	// must not be applied, #6548) and it was unguarded for exactly as long as
+	// it had no injectable input. See readLine below.
+	readLineFn      func() (string, error)
 	store           *configstore.Store
 	dp              cliRuntime
 	eventBuf        *logging.EventBuffer
@@ -93,11 +101,23 @@ type CLI struct {
 	// / unit test): showSystemServices falls back to the documented loopback
 	// defaults.
 	listenersFn func() sysservices.Listeners
-	hostname    string
-	username    string
-	userClass   string
-	version     string
-	startTime   time.Time
+	// bootstrapImportFn returns the recorded day-0 / bootstrap config-import
+	// outcome for `show system bootstrap-import` (#6496). The daemon wires it
+	// to Daemon.BootstrapImportSnapshot — the SAME snapshot /health and the
+	// gRPC ShowText path read. Nil in a `cli` spawned outside the daemon,
+	// where the command reports that no outcome has been recorded.
+	bootstrapImportFn func() bootstrapshow.Snapshot
+	// kernelUpgradeStatusFn returns the #1930 kernel-channel state for
+	// `show system kernel-upgrade` (#6495). The daemon wires the same reader
+	// the gRPC path uses, so the console and the remote `cli` cannot disagree
+	// about a node mid-roll. Nil outside the daemon, where the command reports
+	// an idle channel.
+	kernelUpgradeStatusFn func() upgrade.ChannelStatus
+	hostname              string
+	username              string
+	userClass             string
+	version               string
+	startTime             time.Time
 
 	vrrpMgr *vrrp.Manager
 
@@ -283,6 +303,25 @@ func (c *CLI) SetFlowCollectorHealthFn(fn func() []flowexport.ExporterCollectorH
 // showSystemServices on the documented loopback defaults (offline / unit test).
 func (c *CLI) SetListenersFn(fn func() sysservices.Listeners) {
 	c.listenersFn = fn
+}
+
+// SetBootstrapImportFn wires the recorded day-0 / bootstrap config-import
+// outcome for `show system bootstrap-import` (#6496). The daemon passes
+// Daemon.BootstrapImportSnapshot — the SAME snapshot /health and the gRPC
+// ShowText renderer read — so the console, the remote `cli`, and the health
+// probe cannot disagree about whether the day-0 configuration applied. Nil
+// leaves the command reporting an unrecorded outcome (offline / unit test).
+func (c *CLI) SetBootstrapImportFn(fn func() bootstrapshow.Snapshot) {
+	c.bootstrapImportFn = fn
+}
+
+// SetKernelUpgradeStatusFn wires the #1930 kernel-channel state for
+// `show system kernel-upgrade` (#6495). Before this, the only readout of an
+// in-flight kernel roll was a root shell running `xpfd upgrade kernel status`
+// or journald — automation had a path (the xpf-deploy orchestrator polls that
+// verb over node_exec) and the human operator did not.
+func (c *CLI) SetKernelUpgradeStatusFn(fn func() upgrade.ChannelStatus) {
+	c.kernelUpgradeStatusFn = fn
 }
 
 // SetDDNSOwnedRecordsFn sets a callback for retrieving the DHCP

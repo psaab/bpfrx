@@ -99,3 +99,13 @@ func NewDDNSManagerForTesting(
 		keaLeaseParser, updater, statePath, leasePath4, leasePath6, nodeID, now, newUpdater,
 	)
 }
+
+// ApplyFailedForTesting reports whether the most recently COMPLETED apply
+// attempt failed (#6535). Read-only: unlike ClaimApplyRetry it does not consume
+// the retry window, so a test can wait for the async worker to record a failure
+// without disarming the converger it is about to exercise.
+func (m *Manager) ApplyFailedForTesting() bool {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	return m.applyFailed
+}

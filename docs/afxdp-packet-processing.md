@@ -21,6 +21,21 @@ The shim checks several conditions before redirecting a packet to userspace:
 
 1. `userspace_ctrl` must be enabled with matching metadata version.
 2. Ingress ifindex must be in `userspace_ingress_ifaces` map.
+
+   **Delete inventory (#6537).** `syncIngressIfaceMapLocked`
+   (`pkg/dataplane/userspace/maps_sync.go`) keeps `m.lastIngressIfaces`, the
+   only record of which rows exist in this map; its reap loop rescans nothing
+   else. The inventory is therefore written on EVERY exit from the sync, not
+   only the all-succeeded one. On an early return — a failed `Update` (map
+   full / ENOMEM / EPERM) or a failed stale-row `Delete` — it becomes
+   `prior ∪ installed-this-pass`, so a row the aborted pass created is still
+   reachable later; on a clean pass it is exactly the new ingress set, because
+   every prior row outside that set was successfully deleted. Recording it only
+   on the all-succeeded path wrote the debt down exactly when there was none:
+   a row installed on a pass that failed partway became permanently
+   unreachable, and the shim kept treating a de-configured interface as ingress
+   until the daemon restarted. Same shape as the #5697 retry inventory
+   `clearStaleBindingRowsLocked` keeps for stale `userspace_bindings` rows.
 3. A binding must exist in `userspace_bindings` for (ifindex, queue_id) and be
    marked `USERSPACE_BINDING_READY`. `queue_id` is the packet's OWN RX queue,
    read once from the XDP context and never transformed on the way to the

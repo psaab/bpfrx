@@ -193,8 +193,8 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     deny-all; kept split so a system-service such as ssh/ping/dhcp is
     distinguishable from a routing protocol such as ospf/bgp), plus any
     `interface_host_inbound` per-interface override (#3362, omitted when
-    none; the effective set for an interface is the union of the zone-level
-    set and its override). The legacy flattened `host_inbound_services`
+    none; the effective set for such an interface IS the override — it REPLACES
+    the zone-level set, #6515). The legacy flattened `host_inbound_services`
     (services + protocols concatenated) is retained as a back-compat alias.
     Before #3653 the bit was re-derived from config shape and reported
     `false` for a no-stanza zone — the pre-#3405 "false = admit-all"
@@ -1016,6 +1016,41 @@ under the daemon's errgroup. Nothing else imports this package.
 
 `authz`, `config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`,
 `ipsec`, `logging`, `routing`, `vrrp`.
+
+## NAT show views delegate to `pkg/natshow` (#6565)
+
+`show-text?topic=nat-static` and `topic=nat-nptv6` call
+`natshow.RenderStatic` / `natshow.RenderNPTv6` — the SAME renderers the CLI
+(`cli_show_nat.go`) and gRPC (`server_show_nat.go`) call. They must never be
+reimplemented here.
+
+REST used to reimplement both, printing every rule straight from config. That
+third copy made the fail-closed NOT-INSTALLED annotations a per-surface
+lottery: #5323 taught two surfaces to annotate a rule the userspace snapshot
+builder drops, #6534 taught two surfaces a further set of exclusion reasons,
+and each time REST kept rendering the dropped rule as live. CLI and gRPC each
+had a byte-equality test against the shared renderer (#1687); REST did not, and
+REST is the copy that drifted.
+
+`show_nat_shared_test.go` is the third leg of that invariant. Two things about
+its fixture are load-bearing and were both learned by a mutation cell failing
+to red:
+
+- **It is staged through the TOLERANT ingress (`Store.SyncApply`), not a
+  commit.** Every exclusion `staticRuleNotInstalledReason` reports is also
+  hard-rejected by a strict commit gate (`then static-nat inet` by #5859, the
+  NPTv6 scope forms by #5818), so an excluded rule cannot reach `ActiveConfig`
+  through a commit at all. A commit-staged fixture contains no exclusion, both
+  renderers agree byte-for-byte, and the test passes on the UNFIXED code. The
+  tolerant ingress — a persisted config at boot, or an HA peer sync — is where
+  those gates downgrade to warnings (#1960) and therefore the only path on
+  which REST was lying.
+- **It carries an excluded rule in EACH view.** With only a static-NAT
+  exclusion the `nptv6` subtest compares two renderings that agree trivially
+  and passes on the unfixed code.
+
+The test guards both premises explicitly, so a fixture that stops exercising
+the drop fails loudly instead of going quietly vacuous.
 
 ## Gotchas
 
@@ -2191,6 +2226,30 @@ under the daemon's errgroup. Nothing else imports this package.
     Note: only the interface-mode session-walk arm is gated; the pool-mode rows
     read the helper's live `SourceNATPoolStatus` (no table walk) and need no
     admission slot.
+    **#6553 closes the mirror-image gap on the gRPC side** — the direction that
+    matters, because across this campaign 12 of 14 measured REST-vs-gRPC parity
+    gaps ran gRPC-UNhardened, the reverse of #6451's direction. Six gRPC NAT
+    surfaces drove full v4+v6 walks with no admission at all: `GetNATPoolStats`
+    and `GetNATDestination` (loopback; the latter has NO REST twin, since
+    `natDestHandler` does not scan), and the four `ShowText` topics
+    `persistent-nat`, `persistent-nat-detail`, `nat-source-rule-detail`,
+    `nat-dest-rule-detail`, which reach `pkg/natshow`'s walks and are
+    reachable over the FABRIC listener. The two RPCs `AcquireCtx` and sample
+    the lease inside `countNATSessions`; the four `ShowText` topics take the
+    plain `Acquire` (the existing ShowText precedent) because `pkg/natshow` is
+    shared with `pkg/cli` and takes no context — the admission half lands now,
+    the cancellation half is the stated residual. Because both surfaces alias
+    ONE `diagcmd.SessionWalkLimiter`, an un-cancellable gRPC walk was actively
+    degrading the REST twin that does honour cancellation.
+    #6553 also single-sources the NAT pool port formula
+    (`config.NATPoolTotalPorts`): `(portHigh - portLow + 1) * addrCount` had
+    been written out five times and had already diverged — only this REST
+    handler carried the `portHigh >= portLow` guard, so the gRPC handler, the
+    Prometheus NAT collector and both CLI renders would compute a NEGATIVE
+    capacity for a reversed window. (Reachability of a reversed window is not
+    claimed: #5457's `parseSourcePoolPortRange` fails closed and strict commit
+    rejects one; the tolerant load / peer-sync path is the residual. Four
+    surfaces disagreeing about one formula is the defect being fixed.)
     **#5880 makes the shared limiter request-graph-aware to fix a reentrant
     double-acquire.** A REST list/summary/zone-pair handler acquires a slot and
     then delegates IN-PROCESS to the gRPC session service for `include_peer`
@@ -2210,8 +2269,29 @@ under the daemon's errgroup. Nothing else imports this package.
     path is a no-op). Pinned by `TestAcquireCtx_5880` (mechanism),
     `TestGetSessions_InProcessLeaseReuse_5880` (gRPC reuse at cap 1), and
     `TestRESTIncludePeerReusesLease_5880` (REST include_peer succeeds at cap 1),
-    each RED on revert. The BROADER redesign #5880 also asks for — structural
-    per-surface admission via a registration/source-level test, weighted cost for
+    each RED on revert.
+    **#5968 removes the redundant local WALK on the same path.** #5880 fixed the
+    double-ACQUIRE; the delegation still walked the local table TWICE. The REST
+    handler builds its own local list/summary/breakdown and then called the
+    in-process gRPC method purely for `.Peer`, discarding that method's own local
+    result — a second full v4+v6 traversal per request, contending with the live
+    session-sync path for the same per-bucket map locks. The three handlers now
+    delegate to `PeerSessions` / `PeerSessionSummary` / `PeerZonePairSummary`,
+    in-process-only methods on `ClusterSessionService` that fetch the peer view
+    with NO local walk. They cost no protobuf or wire change (the REST bridge and
+    the gRPC server are the same process), and they acquire through the SAME
+    lease-aware `AcquireCtx` the full methods use — slot accounting is identical
+    before and after, so the #5880 lease guarantee is preserved rather than
+    quietly retired by a path that never acquires. Peer-status classification
+    (#5320 OK / UNREACHABLE / NOT_APPLICABLE) is single-sourced in
+    `attachPeerSessionSummary` / `attachPeerZonePairSummary`, shared with the
+    full paths, because a divergence there would always be a bug. Pinned by
+    `pkg/grpcapi/peer_only_5968_test.go`: a walk-counting dataplane proves ZERO
+    local traversals, with `GetSessions` on the same server as the positive
+    control so the assertion cannot be satisfied by a dataplane that never
+    iterates.
+    The rest of the redesign #5880/#5968 ask for — structural per-surface
+    admission via a registration/source-level test, weighted cost for
     local+peer/cursor/clear, and a separate remote budget — is deferred to a
     follow-up.
     **#5779 extends the SAME shared bound to the session-CLEAR (mutation)

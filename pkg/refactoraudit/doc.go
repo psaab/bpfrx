@@ -3,26 +3,61 @@
 //
 // It contains no runtime code. Its sole purpose is to give `go test
 // ./...` — the required pre-commit aggregate (`make test`) — a home for
-// the drift gate that keeps the committed heatmap honest: if a
-// production file enters the audit (crosses 1500 LOC), leaves it, or is
-// promoted/demoted across the 2000 LOC [REFACTOR] boundary without the
-// artifact being regenerated, TestHeatmapNotStale fails.
+// the modularity gate.
 //
-// The gate is on audit CONTENT — the file set and each file's tier —
-// not on the artifact's exact bytes. The LOC column is a repo-global
-// quantity that no gate can hold byte-exact under parallel merges, and
-// #6617 records what happened when one tried: master was red in 26 of
-// 40 consecutive commits, including PRs that regenerated the artifact
-// correctly and still landed stale on a file they never touched. The
-// count is reproducible by regenerating at each first-parent commit;
-// docs/refactoring-audit.md carries the method.
+// # Two properties, two surfaces (#7253)
+//
+// The gate used to be one test, TestHeatmapNotStale, and it fused two
+// different properties:
+//
+//	modularity — "this file is growing past the point where it should be
+//	split". Aimed at the author of the growth, actionable by them, worth
+//	interrupting them for.
+//
+//	freshness — "the committed global snapshot disagrees with the tree".
+//	Aimed at whoever merges next, not actionable by them, and not worth
+//	interrupting anyone for.
+//
+// Only the first is a gate, and the second could not stay true long
+// enough to be one: the heatmap is a snapshot of a repo-GLOBAL property,
+// so any file crossing 1500 or 2000 LOC anywhere in the tree flipped it
+// for every author. #7235, #7252 and #7254 each regenerated it inside one
+// hour for different files, and #7252 was ALREADY STALE when it merged.
+// #6617 had narrowed the same class once before (byte-compare ->
+// content-compare, after master measured byte-stale in 26 of 40
+// first-parent commits) without changing its shape.
+//
+// So the two properties now have two surfaces:
+//
+//   - TestTouchedFileCrossedModularityThreshold is the HARD gate. It reds
+//     when a file THE BRANCH TOUCHES crossed 1500 or 2000 LOC, measured
+//     from the branch's own diff against its merge base with
+//     origin/master (scripts/refactoring-audit-touched.sh). It never reads
+//     the committed artifact, so no unrelated file can invalidate it and
+//     regenerating the artifact cannot silence it. On master the changed
+//     set is empty and it is structurally silent. The one escape is a
+//     written acknowledgement in docs/refactoring-audit-accepted.txt.
+//
+//   - TestGlobalHeatmapFreshnessAdvisory REPORTS global drift and does
+//     not fail on it. scripts/refactoring-audit-refresh.sh (make
+//     audit-refresh) regenerates and commits the artifact, so freshness
+//     converges through a job rather than through a human.
+//
+// TestTouchedGateIsNotASnapshotCompare is the test that keeps the split
+// from decaying back into one property: it shows the two mechanisms
+// disagreeing in BOTH directions on the same input, so the hard gate
+// cannot be re-implemented as a restricted snapshot compare.
 //
 // The companion tests pin the artifact's internal coherence
 // (TestHeatmapArtifactWellFormed), generator determinism
 // (TestGeneratorDeterministic), the Rust test-only filename classifier
-// (#6232), and the raw-LOC measurement so the gate cannot silently
+// (#6232), the audited-path predicate the touched probe shares with the
+// generator, and the raw-LOC measurement so the gate cannot silently
 // start counting test warehouses as production again.
 //
-// See audit_canary_test.go, docs/refactoring-audit.md,
-// scripts/refactoring-audit.sh, and scripts/refactoring-audit-lib.sh.
+// See audit_touched_test.go, audit_jobs_test.go, audit_canary_test.go,
+// docs/refactoring-audit.md, scripts/refactoring-audit.sh,
+// scripts/refactoring-audit-touched.sh,
+// scripts/refactoring-audit-refresh.sh, and
+// scripts/refactoring-audit-lib.sh.
 package refactoraudit
