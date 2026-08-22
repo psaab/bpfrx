@@ -633,6 +633,25 @@ func (m *Manager) entryProgramsLocked() map[int]string {
 	return result
 }
 
+// syncIngressIfaceMapLocked reconciles userspace_ingress_ifaces to the ingress
+// set the snapshot adjudicates, and maintains m.lastIngressIfaces — the delete
+// inventory the reap loop below rescans.
+//
+// #6537: the inventory is recorded on EVERY exit, not only the all-succeeded
+// one. It is the sole record of which rows exist in the BPF map, and the reap
+// loop only ever revisits ifindexes named in it, so a row that is installed but
+// never recorded is permanently unreachable: when its interface later drops out
+// of the config nothing deletes it, and the XDP shim keeps redirecting that
+// interface's traffic to userspace. Recording it only when no retry is needed
+// wrote the debt down exactly when there was none — the same shape #5697 fixed
+// for the stale userspace_bindings clears (clearStaleBindingRowsLocked).
+//
+// On an early return the inventory becomes prior ∪ installed: the prior entries
+// are kept because a failed (or not-yet-attempted) delete still has to be
+// retried, and the entries installed on this pass are added because they are
+// now live rows. On a clean pass it is exactly newIngress — every prior entry
+// not in the new set was successfully deleted, so carrying it would make the
+// reap loop rescan keys that are already gone.
 func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 	ifaceMap := m.bpfShim.Map(mapNameUserspaceIngressIfaces)
 	if ifaceMap == nil {
@@ -640,28 +659,62 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 	}
 
 	newIngress := buildUserspaceIngressIfindexes(snapshot)
+	prior := m.lastIngressIfaces
+	// installed accumulates the rows THIS pass created, so an early return can
+	// hand them to the retry inventory rather than stranding them.
+	installed := make([]uint32, 0, len(newIngress))
+	retainDebt := func() {
+		m.lastIngressIfaces = mergeIngressInventory(prior, installed)
+	}
+
 	newIngressSet := make(map[uint32]struct{}, len(newIngress))
 	for _, ifindex := range newIngress {
 		newIngressSet[ifindex] = struct{}{}
 		if err := ifaceMap.Update(ifindex, uint8(1), ebpf.UpdateAny); err != nil {
+			retainDebt()
 			return fmt.Errorf("update userspace_ingress_ifaces %d: %w", ifindex, err)
 		}
+		installed = append(installed, ifindex)
 	}
 	// HashMap: Delete removes the entry. ErrKeyNotExist is expected
 	// across daemon restarts (idempotent). Any other failure must be
 	// fatal — a stale entry the dataplane still treats as ingress
 	// would silently redirect traffic for an interface removed from
 	// the config.
-	for _, k := range m.lastIngressIfaces {
+	for _, k := range prior {
 		if _, keep := newIngressSet[k]; keep {
 			continue
 		}
 		if err := ifaceMap.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			retainDebt()
 			return fmt.Errorf("delete userspace_ingress_ifaces %d: %w", k, err)
 		}
 	}
 	m.lastIngressIfaces = newIngress
 	return nil
+}
+
+// mergeIngressInventory returns the union of the prior userspace_ingress_ifaces
+// delete inventory and the rows installed on an interrupted pass, preserving
+// prior order and de-duplicating (#6537).
+//
+// It is only reached on an error path, so it allocates a fresh slice rather
+// than appending into prior: prior may alias the caller's newIngress from an
+// earlier successful sync, and growing it in place would mutate an inventory
+// another reader still holds.
+func mergeIngressInventory(prior, installed []uint32) []uint32 {
+	merged := make([]uint32, 0, len(prior)+len(installed))
+	seen := make(map[uint32]struct{}, len(prior)+len(installed))
+	for _, src := range [][]uint32{prior, installed} {
+		for _, k := range src {
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			merged = append(merged, k)
+		}
+	}
+	return merged
 }
 
 func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {

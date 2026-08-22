@@ -100264,3 +100264,15 @@ prose edit above them added. No diff falls in the new test body.
   `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
   It now reds under that cell (4 failures, was 3).
 - **File(s)**: userspace-dp/src/session/tests.rs
+
+- **Timestamp**: 2026-08-21
+- **Action**: #6537 — record the `userspace_ingress_ifaces` delete inventory on
+  EVERY exit from `syncIngressIfaceMapLocked`, not only the all-succeeded path.
+  Both early returns now retain `prior ∪ installed-this-pass` via
+  `mergeIngressInventory`, so a row installed by a pass that later failed is
+  still reachable to a subsequent reap. Fail-on-revert coverage as a table plus
+  an end-to-end reap test; the rows localise (dropping the update-path debt
+  greens the delete-path row and vice versa). BPF-map fixtures SKIP unprivileged.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_ingress_partial_6537_test.go,
+  docs/afxdp-packet-processing.md, _Log.md
