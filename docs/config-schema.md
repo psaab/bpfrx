@@ -4049,6 +4049,58 @@ could finally see them. The `flag` ceiling therefore goes UP (158 → 161) in th
 same change that improves coverage. The population changed; a pre-fix number
 carried forward as a target would have read that as a regression.
 
+### Typed path identifiers, and the real cause of the `unreachable` bucket (#7492)
+
+The harness names every `args` slot in a synthetic parent path with a
+synthetic WORD (`xa20`). Many slots are not word-typed. `interfaces <if> unit
+<n>` needs a NUMBER, and `unit xa20` does not parse as a unit — so the compiler
+discards the whole unit subtree and every leaf beneath it looks `inert`.
+
+That single cause accounted for **72 of the 215** remaining `unreachable`
+leaves, all under `interfaces <*>` — the largest parent prefix, and one general
+mechanism rather than the 46 per-parent recipes the issue predicted.
+
+`gateEffectivePath` therefore compiles a leaf with the **word path first** and
+falls back to a numeric-arg path only when the word path leaves the first value
+inert AND the numeric path does not. The substitution happens at COMPILE time
+only: `gateLeaf.path` keeps its word tokens, so `siteKey()` / `parentKey()`
+normalisation, allowlist rows and prerequisite rows are all unaffected by which
+form a leaf ends up using.
+
+**Fallback, never default — and that is not caution, it is measured.** Making
+the numeric form the default instead scores **worse in both directions**:
+coverage falls to 635 (below the 687 the fallback reaches, because ~52 slots
+genuinely need a word), *and* it manufactures FALSE #2419 findings at
+`class-of-service classifiers dscp <*> forwarding-class <*> loss-priority <*>
+code-points` with `A=inert B=inert C=inert D=keep E=keep F=inert` — `7` is not a
+valid loss-priority, so the brace forms go inert while the set forms still read
+the leaf. An always-numeric harness would have looked like a simplification and
+been strictly worse.
+
+**What the `unreachable` bucket is NOT.** Two hypotheses were measured and
+refuted before this one:
+
+- *"setSchema advertises knobs nothing implements"* (the #6696 class). Of the
+  215, only 14 distinct leaf names never appear as a quoted literal anywhere in
+  non-test, non-schema compiler source — 22 leaves — and **21 of those 22 are
+  explicitly self-documented in their own schema description**: `rx-mode` says
+  "retired, ignored", `security ipsec vpn <*> manual` says "NOT supported —
+  rejected at commit", and every `dhcp-local-server … interface <*>` modifier
+  says "(parsed, not implemented)". Deliberate, declared, and correctly inert.
+  Exactly one leaf lacks such a note — see below.
+- *"the value is a dangling reference the harness never defines"*. Refuted
+  directly: `scheduler-map SM1` and `classifiers dscp CL1` both land in the
+  compiled config whether or not the referent exists.
+
+Widening the instrument does not rescue the first hypothesis either: only 31 of
+the 215 carry a not-implemented marker in their description at all.
+
+**The one genuine finding it did surface.** `security log profile <*> category
+session field-extra-name` commits CLEAN on the strict path, its container
+materialises, and the value never reaches the compiled config — while its
+description ("Extra field to include in session records") reads like a working
+feature, unlike its 21 neighbours. Tracked separately rather than folded here.
+
 **The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
 SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
 puts values in both AST slots of one node, which is exactly what an either/or

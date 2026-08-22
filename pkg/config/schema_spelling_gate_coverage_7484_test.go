@@ -107,11 +107,12 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 	// classifier reasons about a different config than the gate it explains —
 	// a leaf the prerequisite rescued would still be reported as unreachable.
 	pre, _ := gateLeafPrereq(g)
+	epath := gateEffectivePath(g)
 	withPre := func(stmt string) (string, error) {
 		if pre != "" {
 			stmt = pre + " " + stmt
 		}
-		return gateCompileBrace(gateBraceConfig(g.path, stmt))
+		return gateCompileBrace(gateBraceConfig(epath, stmt))
 	}
 	noLeaf, errNo := withPre("")
 	bare, errBare := withPre(g.leaf + ";")
@@ -148,16 +149,18 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // Measured at 6b47801de. Raising a ceiling is a real decision: it says a leaf
 // the #2419 class can hide in was added on purpose.
 // ---------------------------------------------------------------------------
-const gateCoverageFloor = 629
+const gateCoverageFloor = 687
 
 var gateBlindCeiling = map[gateBlindClass]int{
-	// #7492 moved 13 leaves out of `unreachable`: 10 became COMPARED and 3 were
-	// revealed to be flags once the parent prerequisite let their container
-	// materialise. That is why the flag ceiling RISES here — the population
+	// #7492 moved leaves out of `unreachable` in two rounds. The parent
+	// prerequisite moved 13 (10 compared, 3 revealed as flags); the typed
+	// path-identifier fallback then moved 72 more (58 compared, 14 revealed as
+	// flags) by giving `interfaces <if> unit <n>` a NUMERIC unit instead of a
+	// synthetic word. That is why the flag ceiling RISES here — the population
 	// changed, and a blind-spot count going up after a fix is the fix working,
 	// not a regression. Never carry a pre-fix number forward as a target.
-	gateBlindUnreachable: 215,
-	gateBlindFlag:        161,
+	gateBlindUnreachable: 143,
+	gateBlindFlag:        175,
 	gateBlindErr:         43,
 	gateBlindValueMoves:  1,
 }
