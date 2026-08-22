@@ -476,6 +476,27 @@ Rules of thumb:
 These are not "style" but are worth keeping next to the rest because
 they repeatedly bite:
 
+- **A test that needs a kernel capability must STUB it, not skip on it
+  (#6675).** `pkg/dataplane/userspace` builds every snapshot through
+  `buildRouteSnapshots`, which dumps the kernel ip-rule table via
+  `ruleListFn` and — correctly, per #3772 M9 — refuses to swallow a dump
+  failure. In a sandbox without `CAP_NET_ADMIN` that returns EPERM,
+  `buildSnapshot` returns a nil `*ConfigSnapshot`, and the ~45 test call
+  sites that discard the error dereference it. A nil dereference is a
+  SIGSEGV that aborts the whole test BINARY, so the first one takes every
+  remaining test in the package with it: the review run shows a crash with
+  no diagnostic, and reviewers chase a phantom regression in whatever PR
+  happened to be under test.
+  The fix is a `TestMain` that replaces the enumerator package-wide, NOT a
+  `t.Skipf` on EPERM. Skipping trades a crash for silence and leaves the
+  package with zero coverage in exactly the reduced-capability
+  environments where reviews run; stubbing lets those tests actually run
+  there. Guard the wiring with a code-pointer comparison against the real
+  function (`TestPackageIsHermeticWrtKernelIPRules_6675`) — a behavioural
+  check passes on any machine that HAS the capability, which is every
+  laptop and most CI runners, so it would never notice the stub being
+  deleted.
+
 - **Smoke tests run ONLY on the loss userspace cluster.** The smoke
   target is `loss:xpf-userspace-fw0` / `loss:xpf-userspace-fw1`,
   driven by `INCUS_REMOTE=loss` + `test/incus/loss-userspace-cluster.env`.

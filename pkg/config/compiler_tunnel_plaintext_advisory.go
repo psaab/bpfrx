@@ -97,8 +97,16 @@ const (
 	// plaintextAdvisoryUnzonedCaveat is emitted only when at least one tunnel
 	// is unzoned. Leaving a tunnel out of a zone is NOT a mitigation, and an
 	// operator reading only the zoned paragraph could conclude that it is.
-	plaintextAdvisoryUnzonedCaveat = "An UNZONED tunnel is not safer: an interface in no zone resolves to " +
-		"zone id 0, which a `from-zone any to-zone any permit` rule matches (#6682)."
+	// #6682: this sentence used to say an unzoned interface resolves to zone id
+	// 0 "which a `from-zone any to-zone any permit` rule matches". That was
+	// never true -- the #3110 guard has fenced every rule tier, wildcard tiers
+	// included, against zone 0 since before the claim was written -- and #6682
+	// went further and made an unzoned INGRESS an explicit deny. The conclusion
+	// survives; only the mechanism was wrong, and it is the mechanism an
+	// operator would act on.
+	plaintextAdvisoryUnzonedCaveat = "An UNZONED tunnel is not safer: leaving it out of a zone does " +
+		"not bring its plaintext under policy, it only leaves it unadjudicated by a different route " +
+		"(#6682)."
 )
 
 // renderPlaintextUnadjudicatedAdvisory folds every finding into ONE advisory.

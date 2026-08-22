@@ -304,7 +304,11 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			sys.Syslog = &SystemSyslogConfig{}
 			for _, slInst := range namedInstances(child.FindChildren("host")) {
 				host := &SyslogHostConfig{Address: slInst.name}
-				for _, prop := range slInst.node.Children {
+				// #6684: `host 10.0.0.1 any any;` packs the whole body onto the
+				// host node's Keys, leaving Children empty — the host compiled
+				// with ZERO facilities and shipped nothing, silently.
+				for _, prop := range packedBodyChildren(slInst.node,
+					schemaForPath("system", "syslog", "host")) {
 					// #4303 S-1: switch on the KNOWN host sub-statements
 					// before the facility/severity fallback. Without this
 					// every non-`allow-duplicates` child (source-address,
@@ -1932,7 +1936,12 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 		}
 	}
 
-	clusterNode := node.FindChild("cluster")
+	// #6672: resolve the cluster body across all four spellings. A body packed
+	// onto the `cluster` line — or onto the `chassis` line above it — carries
+	// its statements on Keys with NO children, so the FindChild reads below saw
+	// an empty stanza and compiled nothing while the commit succeeded. The
+	// container spelling returns the same node, untouched.
+	clusterNode := normalizedClusterNode(node)
 	if clusterNode == nil {
 		return nil
 	}
@@ -2383,7 +2392,13 @@ func redundancyGroupStatementArity(tok string) int {
 
 // redundancyGroupBody returns the body statements of one `redundancy-group`
 // instance across both spellings (#6588). It is the ONE-LEVEL-UP twin of the
-// packing this file already undoes inside the body:
+// packing this file already undoes inside the body — and is itself one level
+// BELOW the `chassis cluster` body, where the same shape dropped the entire
+// cluster stanza (#6672, compiler_chassis_cluster_packed.go). The two splitters
+// interact on exactly one token: `node` is both a cluster statement and a
+// redundancy-group statement, so the cluster splitter must NOT re-arm on it
+// inside a group's tail or this function never sees the priority it exists to
+// preserve:
 //
 //	redundancy-group 1 { interface-monitor ge-0/0/0 weight 255; }
 //	  -> Keys=["redundancy-group","1"], one child per statement

@@ -1,3 +1,35 @@
+## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
+
+- **Timestamp**: 2026-08-22
+- **Action**: Wrote the validator and wired `keyValidator` onto the interfaces
+  wildcard — and the WIRING TEST FAILED, which is why it existed. `keyValidator`
+  never reached a wildcard identity slot at all: `walkSchemaNode` validates
+  `Keys[1:1+args]`, and a wildcard's identity is `Keys[0]` with args 0, so the
+  span was empty. No wildcard in the schema carried a keyValidator, so the gap
+  had no instance. Corrected my own earlier triage claim that "the mechanism
+  already exists" — true for `<keyword> <arg>` slots, false for wildcards.
+  Hoisted the exactness predicate that was open-coded for the scalar-value-leaf
+  rule into one `exactMatch` local read by both sites, rather than adding a
+  second copy that could drift.
+  Verified the pointer-equality precondition instead of assuming it: 0 schema
+  nodes register a child that IS their wildcard, across 1464 nodes. Kept as a
+  permanent tripwire — and then gave the tripwire a POSITIVE CONTROL after a
+  mutation showed it could not red (there is nothing to detect today, so
+  breaking its comparison changed nothing). The detector is now bound by a
+  planted alias.
+  Two harness lessons paid for in this issue. A mutation that reddened via
+  `declared and not used` with vet rc 1 was DISCARDED and re-run with the
+  variable kept live. And an uncommitted edit was EATEN by the harness's
+  `git checkout -- pkg/` restore; re-applied and committed before mutating,
+  which is the rule I already knew and did not follow.
+  Character class only, no length bound — the repo carries a 17-char fixture
+  and IFNAMSIZ applies to the DERIVED name.
+  M1-M5 + M7 RED with vet 0 at every mutated state; M1 deletes the CALL from
+  the production path and M5 is the reject-everything control.
+- **File(s)**: `pkg/config/schema_walk.go`, `pkg/config/schema_interfaces.go`,
+  `pkg/config/validate_interface_name.go` (new),
+  `pkg/config/validate_interface_name_6834_test.go` (new),
+  `docs/config-schema.md`
 ## 2026-08-22 — #6912: an external reload discharged a postcondition it cannot perform
 
 - **Timestamp**: 2026-08-22
@@ -103065,6 +103097,40 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/tests_fragment.rs, docs/multi-wan.md,
   docs/research/7409-learned-route-fib/plan.md (new), _Log.md
+
+## 2026-08-22 — #7443 bind the live fabric peer-MAC resolver
+
+- **Timestamp**: 2026-08-22 (fix/7443-fabric-peer-mac-binding)
+- **Action**: Bind `buildFabricPeerMAC` — the LIVE fabric peer-MAC resolver —
+  with a test that actually executes it. #6598 hardened the selection but its
+  coverage was a table over the extracted helper `selectFabricPeerMAC` plus an
+  AST scan of `pkg/daemon/daemon_ha_fabric.go`; neither ran
+  `buildFabricPeerMAC`, so restoring that function's body to the pre-#6598
+  inline loop (the exact shipped defect: any address-matched entry with a
+  non-nil `HardwareAddr`, no NUD state test, no length test) passed `go vet`
+  and both full suites. `selectFabricPeerMAC` went dead under the revert, but
+  Go does not error on an unused package-level func and this repo runs no
+  `unused`/staticcheck gate, so nothing caught it. Added the
+  `fabricNeighListFn` seam (mirroring `ruleListFn` in routes.go, which is bound
+  by 20+ existing tests, and the `d.linkByNameFn`/`d.neighListFn` seams #6554
+  added for the same purpose) and drove the real resolver against a synthetic
+  neighbour table. Secondary, at the coordinator's direction: cross-reference
+  comments at BOTH NUD masks (`FabricNeighValidStates` and
+  `usableNUD`), each naming the other and the question it answers, so a future
+  single-sourcing pass cannot mistake the divergence for drift. Also corrected
+  `FabricNeighValidStates`'s exclusion list, which named only
+  INCOMPLETE/FAILED/NONE and so read as though NUD_NOARP were accepted.
+  Mutation matrix (4 cells x with/without the new fixture, `go vet` rc=0 in
+  every cell): restoring the pre-#6598 selection reds on
+  `buildFabricPeerMAC = "02:bf:72:cc:00:01", want ""` with the fixture and goes
+  GREEN without it — the escape reproduced, then closed. Bypassing the seam
+  also reds only with the fixture. The length and state halves red in both
+  columns (#6598/#6554 already own those), reported as redundancy rather than
+  claimed as new coverage.
+- **File(s)**: pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/fabric_peer_mac_binding_7443_test.go (new),
+  pkg/daemon/daemon_neighbor_listener.go, docs/fabric-cross-chassis-fwd.md,
+  _Log.md
 - **Timestamp**: 2026-08-22
   - **Action**: #6628 — session-sync authentication was fixed per connection at
     handshake time and a key commit does not restart comms, so an established
@@ -103096,6 +103162,82 @@ prose edit above them added. No diff falls in the new test body.
     owner's authoritative session family under latest-generation-wins.
   - **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
     pkg/daemon/userspace_sync_test.go, docs/session-sync-architecture.md
+
+## 2026-08-22 — #6674 ratify both multi-value arms
+- **Timestamp**: 2026-08-22
+- **Action**: Ratify `forwarding-table export` and static-NAT
+  `match destination-address` as one-value leaves; measure and record that a
+  policy chain is NOT equivalent to its first member; clear six source sites
+  that promised a follow-up.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/types_security.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/multivalue_ratified_contract_6674_test.go,
+  pkg/frr/forwarding_export_chain_6674_test.go, docs/config-schema.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6675 — made pkg/dataplane/userspace hermetic w.r.t. the kernel
+    ip-rule table via TestMain, so an EPERM dump can no longer nil-deref a
+    snapshot and SIGSEGV the whole test binary. Chose stubbing over skipping so
+    the package keeps coverage in reduced-capability sandboxes.
+  - **File(s)**: pkg/dataplane/userspace/hermetic_iprules_6675_test.go,
+    docs/engineering-style.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6682 — an unzoned INGRESS (zone id 0) no longer falls through to
+    the implicit default policy, where `default-policy permit-all` forwarded it
+    with screens already skipped. Now an explicit deny counted on
+    UNZONED_INGRESS_DENIED. The issue's reported mechanism (a from-any/to-any
+    rule matching zone 0) was already closed by #3110 and was false when filed.
+  - **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+    docs/userspace-dataplane-architecture.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6682 follow-through — corrected the operator-facing advisory
+    caveat and its four doc/comment copies, which asserted that a wildcard rule
+    matches zone-pair (0,0). That was false when written (#3110) and doubly so
+    after the deny. Conclusion preserved, mechanism corrected.
+  - **File(s)**: pkg/config/compiler_tunnel_plaintext_advisory.go,
+    pkg/config/compiler_wireguard_plaintext_warn.go,
+    pkg/config/compiler_ipsec_plaintext_warn.go,
+    pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
+    docs/userspace-dataplane-gaps.md
+
+## 2026-08-22 — #6672 packed chassis cluster body
+- **Timestamp**: 2026-08-22
+- **Action**: Split a packed `chassis cluster` body into statements before BOTH
+  the compiler and the schema walker, so all five spellings compile identically
+  and the packed spelling cannot escape the typed-leaf range gates.
+- **File(s)**: pkg/config/compiler_chassis_cluster_packed.go (new),
+  pkg/config/compiler_system.go, pkg/config/schema_walk.go,
+  pkg/config/packed_chassis_cluster_6672_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6648 — gave each per-feature required-protocol gate an
+    immutable floor (the version its wire representation landed at) instead of
+    the shared ProtocolVersion, so an unrelated wire bump no longer retroactively
+    re-arms every gate and reports a false reason. #6649 and #6647 were measured
+    already-closed at master (by #6722's unconditional equality gate, and by
+    #5485 + #5488 F7 respectively) and are pinned rather than re-fixed: added the
+    composition cell for #6649, and hardened goFunctionSource to return CODE so
+    the #6647 compensator's source-scanning guard can no longer be satisfied by a
+    comment quoting the call it demands.
+  - **File(s)**: pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/manager_compile.go,
+    pkg/dataplane/userspace/protocol_feature_floors_6648_test.go (new),
+    pkg/dataplane/userspace/shim_loader_boundary_test.go,
+    pkg/dataplane/userspace/manager_capabilities_test.go,
+    pkg/dataplane/userspace/set_forwarding_armed_generation_5648_test.go,
+    pkg/dataplane/userspace/sync_desired_forwarding_generation_6165_test.go,
+    docs/userspace-dataplane-architecture.md
+  - **Action**: #6684/#6685/#7457 — added a schema-driven expander for packed
+    stanza bodies (compact_tail.go) and wired it into the syslog host, firewall
+    filter term, and filter `from` compile sites. #6683 (screens) is blocked on
+    the screen check leaves being absent from setSchema.
+  - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
+    pkg/config/compiler_firewall.go,
+    pkg/config/compact_tail_6684_6685_test.go, docs/config-schema.md
 
 - **Timestamp**: 2026-08-22
   - **Action**: #7413 — three tests read process-global state and failed under a

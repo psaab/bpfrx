@@ -168,9 +168,12 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 					"(the LAST authored `match destination-address` statement, or within "+
 					"a bracketed list that statement's first value; none at all when that "+
 					"value is empty) — and the rest carry no translation; "+
-					"author one rule per external prefix (support for the list form is tracked "+
-					"in #6674). Downgraded to a warning on the tolerant load / peer-sync path "+
-					"so an already-persisted config still boots: %v", err))
+					"author one rule per external prefix. A static-NAT rule is a 1:1 "+
+					"mapping — one `match destination-address` against one `then static-nat "+
+					"prefix` — so N external prefixes against one internal prefix has no "+
+					"defined target, which is why this is the permanent contract and not a "+
+					"pending feature (#6674). Downgraded to a warning on the tolerant load / "+
+					"peer-sync path so an already-persisted config still boots: %v", err))
 		} else {
 			return err
 		}

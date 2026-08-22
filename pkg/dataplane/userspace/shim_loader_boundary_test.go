@@ -1,8 +1,10 @@
 package userspace
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -102,7 +104,84 @@ func goFunctionSource(t *testing.T, path, name string) string {
 	if fn == nil {
 		t.Fatalf("function %s not found in %s", name, path)
 	}
-	start := fset.Position(fn.Pos()).Offset
-	end := fset.Position(fn.End()).Offset
-	return string(data[start:end])
+	// RETURN CODE, NOT TEXT (#6647). This used to slice the raw file bytes
+	// from fn.Pos() to fn.End(), which includes every comment INSIDE the
+	// function body — so a source-scanning guard built on it could be
+	// satisfied by a comment that merely quotes the call it demands.
+	//
+	// MEASURED on this file's own subject before the fix: deleting the real
+	// `m.disarmSnapshotProtocolFailClosedLocked(snap, err, samePlanRefresh)`
+	// from applyCompiledSnapshot, substituting the weaker plain-disarm call,
+	// and leaving the demanded string behind in a `//` comment left
+	// TestProtocolGateSitesRouteThroughFailClosedHelper5488 GREEN — and the
+	// whole pkg/dataplane/userspace suite green with it, at `go vet` rc 0. The
+	// #5488 F7 fail-closed compensation was unpinned in exactly the way the
+	// guard existed to prevent.
+	//
+	// ParseFile ran with mode 0 above, so comments were never attached to the
+	// AST; printing the node back out therefore yields the declaration's CODE
+	// with every interior comment dropped. Formatting is gofmt-normalised,
+	// which is what the tree is already in, so asserted call-expression
+	// substrings are unaffected.
+	//
+	// The direction is right for both assertion shapes every caller uses: a
+	// presence check can no longer be faked by a comment, and a banned-token
+	// check can no longer FALSE-POSITIVE on prose that names the token it
+	// forbids.
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, fn); err != nil {
+		t.Fatalf("print %s from %s: %v", name, path, err)
+	}
+	return buf.String()
+}
+
+// #6647: goFunctionSource must return CODE, not raw file text.
+//
+// Every source-scanning guard in this package is built on it, including the one
+// that pins the #5488 F7 fail-closed compensation in applyCompiledSnapshot —
+// the compensator that closes #6647's "abort strands an armed helper behind new
+// classifier state". While the helper sliced raw bytes from fn.Pos() to
+// fn.End(), interior comments came back with the code, so a guard demanding a
+// call could be satisfied by a comment that merely quotes it.
+//
+// MEASURED at origin/master before this fix, on that exact subject: deleting
+// `m.disarmSnapshotProtocolFailClosedLocked(snap, err, samePlanRefresh)` from
+// applyCompiledSnapshot, substituting the weaker plain-disarm call, and leaving
+// the demanded string behind in a `//` comment left
+// TestProtocolGateSitesRouteThroughFailClosedHelper5488 GREEN — and the whole
+// pkg/dataplane/userspace suite green with it, at `go vet` rc 0.
+//
+// This cell is the paired proof: the SAME text is present in a comment and
+// absent from the code, so a helper that leaks comments returns it and a helper
+// that returns code does not. Reverting to the byte-slice form reds it.
+func TestGoFunctionSourceReturnsCodeNotComments6647(t *testing.T) {
+	t.Parallel()
+
+	// A subject whose body carries a comment naming a call it does NOT make.
+	// commentDecoySubject6647 is defined below purely for this cell.
+	src := goFunctionSource(t, "shim_loader_boundary_test.go", "commentDecoySubject6647")
+
+	if strings.Contains(src, "decoyCallThatIsOnlyEverMentionedInAComment") {
+		t.Fatalf("goFunctionSource leaked an interior comment: the returned text "+
+			"contains a call the function never makes, so every presence guard "+
+			"built on this helper can be satisfied by a comment quoting the line "+
+			"it demands (#6647). Got:\n%s", src)
+	}
+	// Positive control: the real call in the body must still be visible, or the
+	// helper would be "safe" by returning nothing useful and every guard above
+	// would pass vacuously.
+	if !strings.Contains(src, "realCallTheSubjectActuallyMakes") {
+		t.Fatalf("goFunctionSource dropped real code; guards built on it would "+
+			"pass vacuously. Got:\n%s", src)
+	}
+}
+
+func realCallTheSubjectActuallyMakes() int { return 0 }
+
+// commentDecoySubject6647 exists only as the subject of
+// TestGoFunctionSourceReturnsCodeNotComments6647.
+func commentDecoySubject6647() int {
+	// decoyCallThatIsOnlyEverMentionedInAComment() is named here and nowhere
+	// else in this function's code. A comment-leaking reader returns it.
+	return realCallTheSubjectActuallyMakes()
 }

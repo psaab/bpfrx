@@ -252,8 +252,24 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 					// unaffected: SetPath merges duplicate containers into one
 					// node (ast_edit.go), so this only changes the hierarchical
 					// (parser / load merge) shape.
-					for _, fromNode := range termInst.node.FindChildren("from") {
-						compileFilterFrom(fromNode, term, af)
+					// #6685: `term t1 then discard;` packs the term body onto the
+					// term node's Keys, leaving Children empty — the term compiled
+					// with an EMPTY Action, so a discard did not discard while the
+					// term still existed and still matched.
+					termBody := packedBody(termInst.node,
+						schemaForPath("firewall", "family", af, "filter", "term"))
+
+					for _, fromNode := range termBody.FindChildren("from") {
+						// A `from` written as a one-line STATEMENT inside the term
+						// block — `term t1 { from protocol tcp; }` — packs the
+						// condition onto the from node's own Keys, exactly as the
+						// term-level packing does one level up. compileFilterFrom
+						// reads children, so the condition was dropped and the term
+						// matched EVERYTHING. Found by comparing the two spellings
+						// for #6685, where this is the NESTED side.
+						compileFilterFrom(packedBody(fromNode,
+							schemaForPath("firewall", "family", af, "filter", "term", "from")),
+							term, af)
 					}
 
 					// #3850: apply EVERY `then {}` block. compileFilterThen
@@ -261,7 +277,7 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 					// terminal action (accept/discard/reject) resolves last-wins
 					// across blocks (Junos merges duplicate stanzas), so the
 					// second block's action is applied, never silently dropped.
-					for _, thenNode := range termInst.node.FindChildren("then") {
+					for _, thenNode := range termBody.FindChildren("then") {
 						compileFilterThen(thenNode, term)
 					}
 

@@ -4,6 +4,71 @@ xpf has **two** command-tree sources of truth. Knowing which one to edit
 is the single most common mistake when adding CLI completion or config
 validation.
 
+
+## Compact (packed) stanza bodies
+
+A stanza body can be written NESTED or PACKED onto one line, and the two are the
+same configuration:
+
+```
+security { screen { ids-option s1 { icmp { ping-death; } } } }   nested
+security { screen { ids-option s1 icmp ping-death; } }           packed
+```
+
+The parser does not normalise them. A packed body arrives as extra tokens on the
+node's OWN `Keys`, with no `Children` at all:
+
+```
+nested   [ids-option s1] -> [icmp] -> [ping-death]
+packed   [ids-option s1 icmp ping-death]
+```
+
+A compiler that descends only `node.Children` therefore sees an EMPTY body. The
+instance NAME survives, which is what makes this class hard to notice: the
+profile/host/term exists, `show configuration` displays what the operator wrote,
+it binds to a zone or an interface normally — and it enforces nothing. Known
+instances all failed in the security-relevant direction: a syslog host with zero
+facilities ships nothing (#6684), a filter term with an empty action does not
+discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
+(#7457).
+
+**Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
+`node.Children` directly** when compiling a stanza that accepts a packed body.
+
+### Why it is schema-driven
+
+The packed tail does NOT expand uniformly, which is why a split on whitespace is
+wrong and why fixing one site by hand does not generalise:
+
+| packed | expands to | shape |
+|---|---|---|
+| `ids-option s1 icmp ping-death` | `[icmp]` -> `[ping-death]` | a chain |
+| `host 10.0.0.1 any any` | `[any any]` | ONE two-key leaf |
+| `term t1 then discard` | `[then]` -> `[discard]` | a chain |
+
+How many tokens each level swallows is a property of the grammar, and the
+grammar already has a single source of truth: `setSchema`, whose
+`schemaNode.args` is "extra tokens consumed as part of this node's key".
+The expander uses `consumeNodeKeys`, the same primitive `SchemaValidate` uses,
+so expansion cannot drift from validation.
+
+A tail that leaves the modelled grammar is returned UNEXPANDED rather than
+guessed — the helper exists to stop configuration being silently dropped, and
+inventing a shape the schema does not describe is another way of doing that.
+
+**A stanza whose leaves are not modelled in `setSchema` cannot be fixed this
+way.** `security screen ids-option <p> icmp` models only `fragment`, so the
+screen checks are absent from the schema and the packed screen body (#6683)
+cannot be expanded until they are added — which is also why those leaves get no
+`?` completion and no `SchemaValidate` typed-leaf checking.
+
+### Where it is NOT done
+
+Expansion is deliberately not done in the parser. `show configuration` renders
+from the AST, so normalising at parse time would rewrite the operator's packed
+one-liner into nested form on display — a round-trip fidelity change well beyond
+fixing the compile-time drops.
+
 ## Operational tree → `pkg/cmdtree`
 
 `run` / `show` / `clear` / `request` / `monitor` / `ping` / `traceroute`
@@ -46,6 +111,57 @@ sibling aspect files in the same package (`schema_security.go`,
 Because completion (3) and validation (4) read the SAME node, they cannot
 drift — typing a leaf fixes both `set ... ?` help and `commit check`
 rejection together.
+
+## Typed WILDCARD identity slots (`keyValidator` on a wildcard, #6834)
+
+A `keyValidator` on a **named-keyword** node validates the arg token(s) that
+follow the keyword — `unit <n>`, `address <cidr>`. The walker implements that as
+`node.Keys[1:1+args]`.
+
+A **wildcard** node is different: its identity IS the keyword, at `Keys[0]`, and
+it declares no args. So the arg span is `Keys[1:1]` — empty — and before #6834 a
+`keyValidator` on a wildcard validated **nothing at all** and returned nil. Every
+one of the schema's existing `keyValidator`s sat on a `<keyword> <arg>` slot, so
+the gap had no instance and no symptom until an interface name needed gating.
+
+`walkSchemaNode` now validates a wildcard's own keyword as identity slot 0.
+Which of the two cases applies is decided by a single hoisted `exactMatch`
+local, read by both the scalar-value-leaf rule and this one — two copies of
+"was this an exact match?" could only ever disagree by mistake.
+
+**Precondition, verified rather than assumed.** `exactMatch` is
+`parent.children[keyword] == childSchema`, a POINTER comparison. If any parent
+registered the same `*schemaNode` as both a named child and as its wildcard, the
+predicate would report EXACT for a wildcard match and this gate would silently
+stop running — no failure, just unvalidated config again.
+`TestNoSchemaNodeIsBothChildAndWildcard_6834` walks the whole schema (1464 nodes,
+0 aliases at the time of writing) to keep that true, and
+`TestAliasDetectorFindsARealAlias_6834` plants an alias so the detector itself
+cannot rot into a tripwire that never fires.
+
+### `interfaces <name>` is the first typed wildcard identity
+
+The interface name is interpolated into four sites in the generated systemd
+units, and one of them — `[Match] Name=` in the `.network` file — systemd reads
+as a **whitespace-separated list of shell-style globs, matching the device name
+or its alternative names**. An unvalidated name does not corrupt the unit file;
+it makes one `.network` claim SEVERAL interfaces.
+
+`ValidateInterfaceName` is an **allowlist**: letters, digits, `-`, `.`, `_`, `/`.
+The slash is included because the Junos spelling `ge-0/0/0` is the documented
+form and is canonicalised to `ge-0-0-0` downstream.
+
+**Do not "simplify" it into a call to `sanitizeUnitValue`.** That helper maps
+control bytes to a SPACE, which for a whitespace-separated list is the
+SEPARATOR — it would turn one pattern into two, each claiming devices. Applying
+the safe-looking neighbouring helper to this sink is strictly worse than
+rendering the field raw.
+
+**No length bound**, deliberately: `IFNAMSIZ` applies to the DERIVED kernel name
+(slashes folded, `.<unit>` appended), so a bound here would have to model that
+derivation, and a validator wrong in the *rejecting* direction turns a working
+config into a failed commit with no operator workaround (the #6564
+`ValidateOSPFArea` lesson, where a `>= 1` floor would have refused OSPF area 0).
 
 ## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
 
@@ -1277,6 +1393,45 @@ strict commit. `commands` is not: `eventengine.classifyPlan` trims and SKIPS an
 empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
+
+**Two of those leaves accept ONE value permanently, and #6674 ratified that
+rather than implementing the list.** #6673 fixed the READ half for both — every
+authored value now reaches validation and a multi-valued list is hard-REJECTED
+at commit, warned on the tolerant path — but the scalar the runtime installs is
+still a single value at three successive layers. Six source sites told the
+reader a follow-up was coming; none is. The two arms ratify for DIFFERENT
+reasons, and conflating them is how the wrong decision gets made for the pair:
+
+- `security nat static … rule … match destination-address`: **Junos takes one
+  prefix here**, so the schema's `multi: true` is an xpf over-advertisement of
+  the grammar, not a promise. A static-NAT rule is a 1:1 mapping — one `match
+  destination-address` against one `then static-nat prefix` — so N external
+  prefixes against one internal prefix names no target, and fanning the rule
+  into N rows would have to invent a pairing Junos does not define. `rule R1` /
+  `rule R2` already expresses the intent.
+- `routing-options forwarding-table export`: **Junos genuinely takes a policy
+  CHAIN**, so "the schema over-advertises" is not available here — and neither
+  is the tempting shortcut "a chain is equivalent to its first policy", which
+  was MEASURED FALSE (`pkg/frr/forwarding_export_chain_6674_test.go`: for a
+  plain first policy and a load-balancing second, the first-policy reading gives
+  `maximum-paths` 0 and the OR-composed chain gives 64). It ratifies for a
+  structural reason instead: `resolveECMP` derives exactly two booleans from the
+  ONE named policy — any term with a load-balance action sets `ecmpMaxPaths` to
+  64, any `consistent-hash` term sets `ConsistentHash` — and evaluates no `from`
+  match, term order, or terminating action. Junos evaluates an export chain PER
+  ROUTE and stops at the first terminating action, so the cheap composition
+  (OR across the chain) is not Junos, and the faithful one is not expressible at
+  all because the value being derived is FRR's GLOBAL `maximum-paths`. A chain
+  needs a per-route forwarding-policy model xpf does not have — a feature,
+  tracked as its own issue, not a defect in the multi-value read.
+
+The operator-facing half is pinned behaviourally rather than by comment:
+`TestRatifiedGatesDoNotPromiseAFollowUp_6674` compiles each config on the
+tolerant path and asserts the warning the operator READS neither promises a
+follow-up nor drops the reason, with the still-rejects/still-commits pair as its
+green control. A comment that rots is bad; a warning that promises a feature
+which is never coming is worse, because the operator acts on it — they leave the
+list in place and wait.
 
 **SIX leaf families, SEVEN read sites AT #6673 — the category table above has
 FOUR rows and is not the inventory.** (The table is appended to as later fixes
@@ -2602,12 +2757,26 @@ is what Junos renders (one statement per line).
 
 Consequences worth knowing when adding a reader:
 
-- **The schema walker does not see this shape at all.** `SchemaValidate` walks
-  the AST from `setSchema`, and a packed tail sits below the depth it reaches,
-  so a typed leaf's `validator` never fires on it. A range/arity gate that must
-  cover the packed spelling has to run on the COMPILED struct
-  (`validateChassisClusterStrict`), not on the schema — which is only true once
-  the packed shape actually compiles.
+- **The schema walker does not see this shape** — unless the subtree is
+  NORMALIZED before the walk. `SchemaValidate` walks the AST from `setSchema`,
+  and a packed tail sits below the depth it reaches, so a typed leaf's
+  `validator` never fires on it. Two answers exist, and which one is available
+  depends on whether the packed body can be split back into statements:
+  - Where it can, split it **before both consumers**. `chassis cluster`
+    (#6672, below) expands its packed body into children at the top of
+    `SchemaValidateWithDefinitions` and inside `compileChassis`, so the
+    EXISTING typed-leaf validators fire on the packed spelling unchanged. That
+    is strictly better than a parallel gate: there is one bounds table, and it
+    is the one the container spelling already uses.
+  - Where it cannot, the gate has to run on the COMPILED struct
+    (`validateChassisClusterStrict`), not on the schema — which is only true
+    once the packed shape actually compiles.
+
+  Either way, **making a packed spelling compile without also making it
+  validate opens a range-gate escape that did not exist before**: while the
+  packed form compiled to nothing, the missing walker coverage was inert. This
+  is not hypothetical — `cluster-id` is one byte of the RETH virtual MAC and
+  `reth-advertise-interval` is a 12-bit VRRP wire field.
 - **Silently compiling to nothing is the worst of the three options.** A
   statement whose packed spelling is genuinely unsupported must be REJECTED at
   commit with an actionable error. `services ip-monitoring` (a different
@@ -2616,6 +2785,55 @@ Consequences worth knowing when adding a reader:
   compiled routes is a hard commit error ("at least one then preferred-route
   route is required"), so the operator is told rather than left with a silent
   no-op.
+- **`chassis cluster` is the whole-stanza case (#6672).** The same shape one
+  level ABOVE the redundancy group dropped the ENTIRE cluster configuration.
+  Four spellings exist and three were silently empty:
+
+  ```
+  chassis { cluster { cluster-id 1; node 0; } }   # container  -> compiles
+  chassis { cluster cluster-id 1 node 0; }        # packed body -> ClusterConfig, every field zero
+  chassis cluster { cluster-id 1; node 0; }       # keyword packed onto the chassis line -> Cluster == nil
+  chassis cluster cluster-id 1 node 0;            # fully packed -> Cluster == nil
+  ```
+
+  A fifth arrives from the child side — `cluster { node 1 reth-count 2; }`, one
+  child carrying two statements — and is split the same way. `compileChassis`
+  reads the body with `FindChild`, i.e. off `.Children`, so a packed body was an
+  empty stanza: no cluster-id, no node identity, no control PSK, no fabric
+  addresses, no redundancy groups, and a clean `commit` with
+  `show configuration` echoing what the operator wrote.
+
+  `clusterStatements` (`compiler_chassis_cluster_packed.go`) is the SSOT for the
+  statement set and each statement's value arity, and `clusterBodyStatements` is
+  the splitter. Two properties are specific to this level and worth carrying:
+
+  - **It nests, so `packedStatementPropsArity` (#6665) is not enough.** That
+    helper is flat: any registered keyword re-arms it. The cluster and
+    redundancy-group tables OVERLAP on exactly one token, `node` — the cluster's
+    own identity and a group's per-node priority — so under the flat rule
+    `redundancy-group 1 node 0 priority 200` re-arms at `node`, setting the
+    CLUSTER's node identity and dropping the group's election priority. That is
+    the #6588 failure reintroduced one level up. The rule is: once
+    `redundancy-group` opens, a token re-arms only if it is `redundancy-group`
+    itself or a cluster statement that is NOT also a redundancy-group statement.
+    Overlap resolves to the INNER scope; cluster-only statements written after a
+    packed group (`... redundancy-group 1 preempt reth-count 2`) still compile.
+  - **The #6665 value-slot reservation crosses the boundary.** While a
+    redundancy-group tail is open the splitter honours
+    `redundancyGroupStatementArity`, so `interface-monitor reth-count weight 255`
+    keeps a monitored interface literally named after a CLUSTER keyword instead
+    of re-arming the outer splitter. `ValidateDeviceMapLogicalName` admits
+    keyword-shaped names, so that is a name an operator can configure.
+
+  Two divergences the work surfaced, both tracked separately rather than folded
+  in: `fabric1-interface` and `fabric1-peer-address` are compiled by
+  `compileChassis` but absent from `schemaChassis` (no completion, no
+  validator), and `additional-authentication-key` / `control-ports` /
+  `private-rg-election` sit on the other side of that line for stated reasons.
+  `TestClusterSplitterAndSchemaAgree_6672` binds the set in both directions with
+  the exception list as an EQUALITY, so the exception cannot outlive the
+  divergence it documents.
+
 - **`system login` is the fail-closed example with a dedicated gate (#6662).**
   Where `ip-monitoring` gets its rejection for free (an empty policy is
   independently invalid), an empty login class is *structurally* fine, so the
