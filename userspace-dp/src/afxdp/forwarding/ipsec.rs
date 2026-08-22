@@ -290,18 +290,171 @@ impl IkeExchangeKey {
 /// strongSwan's next outbound IKE packet (DPD / rekey / re-auth), and the
 /// ESP data plane is exempt throughout.
 pub(in crate::afxdp) struct IkeExchangeTable {
-    entries: Mutex<FastMap<IkeExchangeKey, u64>>, // key -> last-seen monotonic ns
+    inner: Mutex<IkeExchangeInner>,
+    /// #6747: count of live exchanges evicted to make room. Non-zero means the
+    /// cap is binding — either a genuinely large deployment or a forged-
+    /// initiation flood churning legitimate seeds. The condition was previously
+    /// unobservable. Relaxed: it is a diagnostic, ordered against nothing.
+    evictions: AtomicU64,
+}
+
+/// #6747: the LRU slot index sentinel. IKE_EXCHANGE_TABLE_CAP is 4096, so a
+/// u32 index is ample and the const assert below keeps that true if the cap
+/// ever moves.
+const IKE_SLOT_NIL: u32 = u32::MAX;
+const _: () = assert!(IKE_EXCHANGE_TABLE_CAP < IKE_SLOT_NIL as usize);
+
+/// One tracked exchange plus its links in the recency list.
+///
+/// The key is stored here as well as in the index because eviction starts from
+/// the list head and has to reach the index to remove it — the whole point of
+/// the structure is that it never has to search for the victim.
+struct IkeExchangeSlot {
+    key: IkeExchangeKey,
+    seen_ns: u64,
+    prev: u32,
+    next: u32,
+}
+
+/// #6747: an intrusive LRU over a slab, replacing the `min_by_key` scan.
+///
+/// The old shape was `Mutex<FastMap<Key, u64>>`, and on a full table `seed`
+/// chose its victim with `entries.iter().min_by_key(...)` — a full traversal of
+/// all 4096 entries plus the empty hashbrown slots, a key clone and a second
+/// hash lookup for the remove, all under a lock that `matches` takes on the hot
+/// admission path for every Responder-SPI IKE packet, on a table `Arc`-shared
+/// by every packet worker. One worker's scan stalled the others.
+///
+/// The scan is reachable exactly when 4096 DISTINCT live exchanges are
+/// resident, which is also precisely the state a forged-initiation flood
+/// produces — so the worst case and the attack case are the same case. An
+/// amortised "reap the idle ones first" would not have helped there: under a
+/// flood every entry is fresh.
+///
+/// SEMANTICS ARE UNCHANGED, and that is deliberate. `min_by_key(seen)` is
+/// least-recently-touched, and `matches` refreshes `seen` on every hit, so the
+/// old policy was already LRU — just computed by scanning. This keeps exact
+/// LRU and makes it O(1): `touch` unlinks and re-appends at the tail, eviction
+/// pops the head. Nothing about WHICH entry is evicted changes, so the
+/// availability reasoning in `seed`'s doc comment still holds verbatim.
+///
+/// FIFO was rejected. It is simpler (insertion-ordered queue, no touch on the
+/// read path) but it would evict a long-lived exchange that DPD refreshes every
+/// 30s in favour of a brand-new forged initiation — strictly worse under the
+/// flood this cap exists for, and a behaviour change where none is needed.
+///
+/// Allocation-free after the first fill: slots are recycled through `free`, and
+/// `slots` never shrinks. Bounded by the cap, so ~4096 * (key + u64 + 2*u32).
+struct IkeExchangeInner {
+    index: FastMap<IkeExchangeKey, u32>,
+    slots: Vec<IkeExchangeSlot>,
+    free: Vec<u32>,
+    /// Least recently touched; the eviction victim.
+    head: u32,
+    /// Most recently touched.
+    tail: u32,
+}
+
+impl IkeExchangeInner {
+    fn new() -> Self {
+        Self {
+            index: FastMap::default(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: IKE_SLOT_NIL,
+            tail: IKE_SLOT_NIL,
+        }
+    }
+
+    /// Detach `idx` from the recency list, leaving its payload intact.
+    fn unlink(&mut self, idx: u32) {
+        let (prev, next) = {
+            let s = &self.slots[idx as usize];
+            (s.prev, s.next)
+        };
+        if prev == IKE_SLOT_NIL {
+            self.head = next;
+        } else {
+            self.slots[prev as usize].next = next;
+        }
+        if next == IKE_SLOT_NIL {
+            self.tail = prev;
+        } else {
+            self.slots[next as usize].prev = prev;
+        }
+        let s = &mut self.slots[idx as usize];
+        s.prev = IKE_SLOT_NIL;
+        s.next = IKE_SLOT_NIL;
+    }
+
+    /// Append `idx` at the MRU end. The slot must already be unlinked.
+    fn push_tail(&mut self, idx: u32) {
+        let old = self.tail;
+        self.slots[idx as usize].prev = old;
+        self.slots[idx as usize].next = IKE_SLOT_NIL;
+        if old == IKE_SLOT_NIL {
+            self.head = idx;
+        } else {
+            self.slots[old as usize].next = idx;
+        }
+        self.tail = idx;
+    }
+
+    fn touch(&mut self, idx: u32, now_ns: u64) {
+        self.slots[idx as usize].seen_ns = now_ns;
+        self.unlink(idx);
+        self.push_tail(idx);
+    }
+
+    /// Remove `idx` from the list, the index and the live set, recycling it.
+    fn drop_slot(&mut self, idx: u32) {
+        self.unlink(idx);
+        let key = self.slots[idx as usize].key.clone();
+        self.index.remove(&key);
+        self.free.push(idx);
+    }
+
+    fn insert(&mut self, key: IkeExchangeKey, now_ns: u64) {
+        let idx = match self.free.pop() {
+            Some(idx) => {
+                let s = &mut self.slots[idx as usize];
+                s.key = key.clone();
+                s.seen_ns = now_ns;
+                s.prev = IKE_SLOT_NIL;
+                s.next = IKE_SLOT_NIL;
+                idx
+            }
+            None => {
+                let idx = self.slots.len() as u32;
+                self.slots.push(IkeExchangeSlot {
+                    key: key.clone(),
+                    seen_ns: now_ns,
+                    prev: IKE_SLOT_NIL,
+                    next: IKE_SLOT_NIL,
+                });
+                idx
+            }
+        };
+        self.index.insert(key, idx);
+        self.push_tail(idx);
+    }
 }
 
 impl IkeExchangeTable {
     pub(in crate::afxdp) fn new() -> Self {
         Self {
-            entries: Mutex::new(FastMap::default()),
+            inner: Mutex::new(IkeExchangeInner::new()),
+            evictions: AtomicU64::new(0),
         }
     }
 
-    fn lock_entries(&self) -> std::sync::MutexGuard<'_, FastMap<IkeExchangeKey, u64>> {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, IkeExchangeInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// #6747: live exchanges evicted because the table was at cap.
+    pub(in crate::afxdp) fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
     }
 
     /// Record (or refresh) a live exchange. On a full table the OLDEST entry
@@ -318,17 +471,18 @@ impl IkeExchangeTable {
     /// the rate limiter.
     pub(in crate::afxdp) fn seed(&self, key: IkeExchangeKey, now_ns: u64) {
         let mut entries = self.lock_entries();
-        if let Some(seen) = entries.get_mut(&key) {
-            *seen = now_ns;
+        if let Some(&idx) = entries.index.get(&key) {
+            entries.touch(idx, now_ns);
             return;
         }
-        if entries.len() >= IKE_EXCHANGE_TABLE_CAP
-            && let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, seen)| **seen)
-                .map(|(k, _)| k.clone())
-        {
-            entries.remove(&oldest);
+        // #6747: O(1). The victim is the recency list HEAD — the same entry the
+        // old `min_by_key(seen)` scan selected, reached without traversing.
+        if entries.index.len() >= IKE_EXCHANGE_TABLE_CAP {
+            let victim = entries.head;
+            if victim != IKE_SLOT_NIL {
+                entries.drop_slot(victim);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
         }
         entries.insert(key, now_ns);
     }
@@ -339,28 +493,21 @@ impl IkeExchangeTable {
     /// forged packets forever.
     pub(in crate::afxdp) fn matches(&self, key: &IkeExchangeKey, now_ns: u64) -> bool {
         let mut entries = self.lock_entries();
-        let stale = match entries.get_mut(key) {
-            Some(seen) => {
-                if now_ns.saturating_sub(*seen) > IKE_EXCHANGE_IDLE_NS {
-                    true
-                } else {
-                    *seen = now_ns;
-                    false
-                }
-            }
-            None => return false,
+        let Some(&idx) = entries.index.get(key) else {
+            return false;
         };
-        if stale {
-            entries.remove(key);
+        if now_ns.saturating_sub(entries.slots[idx as usize].seen_ns) > IKE_EXCHANGE_IDLE_NS {
+            entries.drop_slot(idx);
             return false;
         }
+        entries.touch(idx, now_ns);
         true
     }
 
     /// Test/telemetry seam: current entry count.
     #[cfg(test)]
     pub(in crate::afxdp) fn len(&self) -> usize {
-        self.lock_entries().len()
+        self.lock_entries().index.len()
     }
 }
 
@@ -584,6 +731,152 @@ mod tests {
         assert!(!table.matches(&key(0), cap + 1));
         assert!(table.matches(&key(cap), cap + 1));
         assert!(table.matches(&key(1), cap + 1));
+    }
+
+    /// #6747: the victim must stay LEAST-RECENTLY-TOUCHED, not
+    /// least-recently-INSERTED.
+    ///
+    /// This is the cell that separates the O(1) LRU from the obvious cheaper
+    /// rewrite. An insertion-ordered FIFO queue removes the scan just as well
+    /// and passes `exchange_full_evicts_oldest_not_newest` above — every entry
+    /// there is inserted once and never refreshed, so insertion order and
+    /// recency order are the same sequence. They diverge only when something
+    /// REFRESHES an old entry, which is exactly what a live SA does: DPD, rekey
+    /// and INFORMATIONAL all carry the seeded Initiator SPI and land in
+    /// `matches`.
+    ///
+    /// Under FIFO the longest-lived exchange on the box is evicted in favour of
+    /// a brand-new forged initiation — strictly worse under the flood the cap
+    /// exists for. `min_by_key(seen)` never did that, and neither must this.
+    #[test]
+    fn exchange_eviction_is_recency_not_insertion_order_6747() {
+        let table = IkeExchangeTable::new();
+        let cap = IKE_EXCHANGE_TABLE_CAP as u64;
+        for spi in 0..cap {
+            table.seed(key(spi), spi);
+        }
+        assert_eq!(table.len(), IKE_EXCHANGE_TABLE_CAP);
+
+        // The OLDEST-INSERTED entry is refreshed, as a live SA's DPD would.
+        // Its insertion rank is unchanged; its recency rank is now the newest.
+        assert!(table.matches(&key(0), cap + 1));
+
+        // One more distinct initiation forces exactly one eviction.
+        table.seed(key(cap), cap + 2);
+        assert_eq!(table.len(), IKE_EXCHANGE_TABLE_CAP);
+
+        assert!(
+            table.matches(&key(0), cap + 3),
+            "the refreshed exchange was evicted: eviction is following INSERTION \
+             order, so a live SA that DPD keeps alive loses its seed to a brand-new \
+             (possibly forged) initiation — the regression a FIFO rewrite of #6747 \
+             would introduce, and the one min_by_key(seen) never had",
+        );
+        assert!(
+            !table.matches(&key(1), cap + 3),
+            "spi 1 is now the least-recently-touched entry and must be the victim; \
+             if it survived, something other than the LRU head was evicted",
+        );
+        assert!(table.matches(&key(cap), cap + 3), "the new seed must be resident");
+        assert_eq!(table.evictions(), 1, "exactly one live exchange was evicted");
+    }
+
+    /// #6747: the eviction path must recycle slots rather than grow the slab.
+    ///
+    /// The scan is gone, but an O(1) victim is worth nothing if the structure
+    /// that provides it leaks a slot per eviction — a sustained forged-
+    /// initiation flood is unbounded in TIME, not just in distinct keys, so a
+    /// per-eviction leak is the same denial-of-service through a different
+    /// door. Churns 4x the cap through a full table and asserts the slab never
+    /// exceeds it.
+    #[test]
+    fn exchange_eviction_recycles_slots_6747() {
+        let table = IkeExchangeTable::new();
+        let cap = IKE_EXCHANGE_TABLE_CAP as u64;
+        for spi in 0..(5 * cap) {
+            table.seed(key(spi), spi);
+        }
+        assert_eq!(table.len(), IKE_EXCHANGE_TABLE_CAP);
+        assert_eq!(
+            table.evictions(),
+            4 * cap,
+            "every insert past the cap must evict exactly one entry",
+        );
+        let inner = table.lock_entries();
+        assert!(
+            inner.slots.len() <= IKE_EXCHANGE_TABLE_CAP,
+            "slab grew to {} for a table capped at {}: eviction is leaking a slot \
+             per victim, so a sustained flood exhausts memory even though the \
+             live-entry count is bounded",
+            inner.slots.len(),
+            IKE_EXCHANGE_TABLE_CAP,
+        );
+    }
+
+    /// #6747: the recency list must stay structurally consistent with the index
+    /// under a mixed workload.
+    ///
+    /// unlink/push_tail are the only places the invariant can break, and a
+    /// broken link is silent: a severed list still answers `matches` correctly
+    /// from the index, so every behavioural cell above would pass while
+    /// eviction walked a truncated list and evicted the wrong entry — or
+    /// nothing at all, quietly turning the cap off. Walk the list from head to
+    /// tail and require it to visit every indexed entry exactly once, in
+    /// non-decreasing `seen_ns` order.
+    #[test]
+    fn exchange_recency_list_matches_the_index_6747() {
+        let table = IkeExchangeTable::new();
+        let cap = IKE_EXCHANGE_TABLE_CAP as u64;
+        // Fill, refresh a scattered third, reap some, then overflow.
+        for spi in 0..cap {
+            table.seed(key(spi), spi);
+        }
+        for spi in (0..cap).step_by(3) {
+            assert!(table.matches(&key(spi), cap + spi));
+        }
+        for spi in (1..cap).step_by(7) {
+            // Past the idle window: reaped through the matches() path.
+            assert!(!table.matches(&key(spi), 3 * cap + IKE_EXCHANGE_IDLE_NS + spi));
+        }
+        for spi in cap..(cap + 128) {
+            table.seed(key(spi), 4 * cap + spi);
+        }
+
+        let inner = table.lock_entries();
+        let mut seen = 0usize;
+        let mut prev_ns = 0u64;
+        let mut idx = inner.head;
+        let mut back = IKE_SLOT_NIL;
+        while idx != IKE_SLOT_NIL {
+            let slot = &inner.slots[idx as usize];
+            assert_eq!(slot.prev, back, "prev link is not the reverse of next");
+            assert_eq!(
+                inner.index.get(&slot.key).copied(),
+                Some(idx),
+                "a slot on the recency list is not the one the index names for its key",
+            );
+            assert!(
+                slot.seen_ns >= prev_ns,
+                "recency list is out of order at slot {idx}: {} < {prev_ns} — the head \
+                 is then not the least-recently-touched entry and eviction picks the \
+                 wrong victim",
+                slot.seen_ns,
+            );
+            prev_ns = slot.seen_ns;
+            back = idx;
+            idx = slot.next;
+            seen += 1;
+            assert!(seen <= inner.slots.len(), "recency list contains a cycle");
+        }
+        assert_eq!(back, inner.tail, "tail is not the last node reached from head");
+        assert_eq!(
+            seen,
+            inner.index.len(),
+            "the recency list visits {seen} slots but the index holds {} — a severed \
+             or duplicated link makes eviction walk the wrong set while every \
+             behavioural assertion still passes",
+            inner.index.len(),
+        );
     }
 
     #[test]
