@@ -1,3 +1,202 @@
+## 2026-08-21 — #6534 CoS family: skipped classifier/scheduler entries annotated
+
+- **Timestamp**: 2026-08-21
+- **Action**: Extended the #6534 fix to the class-of-service family. All
+  five builder sites in `cos.go` skip an entry on the SAME condition — it
+  names a forwarding-class `class-of-service forwarding-classes` does not
+  define — so one shared predicate, `config.CoSForwardingClassUndefined`,
+  binds all of them, and the three renderers that display a filtered
+  collection now annotate the loss.
+  Of the five builder sites only FOUR have a lying surface: the
+  inet-precedence classifier is excluded by the builder but rendered by
+  no show surface at all, so it is not a #6534 instance. Worth recording
+  that the population of "fail-closed exclusions" and the population of
+  "exclusions with a lying renderer" are not the same set.
+  Two deliberate non-annotations, each pinned by a test: a scheduler-map
+  entry naming an undefined SCHEDULER is KEPT on the wire (different
+  edge, opposite disposition), and `ieee-802.1` rewrite-rules are never
+  published at all (a wholesale gap, not a per-entry skip — annotating
+  them would misreport a bigger gap as a smaller one).
+  The builder and renderer agreement is bound by TWO tests rather than
+  one, because `format` imports `userspace` and a single spanning test
+  would be an import cycle; they compose through the shared predicate.
+  Unlike the NAT exclusions, this one is reachable through an ordinary
+  `commit` — an undefined forwarding-class reference is only a
+  commit-time warning.
+  Validation: `go test -count=1` green on pkg/config, pkg/natshow,
+  pkg/dataplane/userspace, .../format, pkg/cli, pkg/grpcapi; `-run 6534`
+  binds 26 `=== RUN` lines; 6-cell mutation matrix all red with `go vet`
+  clean at every mutated state, control and restored green.
+- **File(s)**: pkg/config/cos_exclusion_reason.go,
+  pkg/dataplane/userspace/cos.go,
+  pkg/dataplane/userspace/cos_exclusion_6534_test.go,
+  pkg/dataplane/userspace/format/cos_show.go,
+  pkg/dataplane/userspace/format/cos_exclusion_6534_test.go,
+  docs/junos-cli-reference.md, _Log.md
+## 2026-08-21 — #6540 dangling `then policer` stops forwarding unpoliced
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added `SnapshotIntegrityError::MissingPolicerRef` and a
+  `preflight_term_policer_ref` guard in the filter compiler, so a term
+  whose `then policer <name>` resolves to nothing rejects the snapshot
+  instead of silently no-opping the meter and forwarding unpoliced.
+  Policer was the one member of the strict-commit / lenient-boot /
+  Rust-backstop family with no backstop at all.
+  DESIGN CORRECTION vs the issue as filed: the predicate is DEFINEDNESS
+  (the name appears in the `policers` or `three_color_policers` snapshot
+  collection), NOT presence in the compiled `three_color_policer_by_name`
+  map that the issue prescribes. `lower_single_rate_policer_runtimes`
+  (#4514) deliberately skips a degenerate zero-rate meter-only policer
+  because it has no action to enforce, so that policer is defined, absent
+  from the map, and boots fine today — keying the rejection on the map
+  would refuse a working config. Definedness is also the exact question
+  the Go strict gate (#2217 Finding A) asks, so the two cannot disagree.
+  DEFERRED, with reason: the issue's "second site in the same change"
+  (the four CoS interface reference fields) is NOT included. Those have
+  no Go strict gate — only warnings at compiler_validate_warn.go:1668/
+  1686/1693/1700 — so a Rust hard-reject would let commit SUCCEED and
+  then have the helper refuse the whole snapshot. That is a brick and
+  strictly worse than today's QoS degradation. Filed as #7337 with the
+  required sequencing (Go strict gate first).
+  FIXTURE REPAIR: `filter_result_modifiers_roundtrip_5444` named policer
+  `p-lo` and never defined it. It asserted the policer NAME propagates
+  into the accumulator while the rate limit it named was not enforced at
+  all — a live demonstration of this bug inside the test suite. It now
+  defines a meter-only `p-lo`, which cannot alter its assertions.
+  Validation: full `cargo test --release --bins --tests --
+  --test-threads=1` green, 4522 passed / 0 failed (4517 baseline + 5 new
+  cells); pristine baseline re-run green beforehand. 4-cell mutation
+  matrix all red, each reddening a DIFFERENT named cell, control and
+  restored green.
+- **File(s)**: userspace-dp/src/policy_snapshot_error.rs,
+  userspace-dp/src/filter/compiler.rs, userspace-dp/src/filter/tests.rs,
+  userspace-dp/src/filter/README.md, docs/feature-coverage.md, _Log.md
+## 2026-08-21 — #6539 tcp-session timeouts: stop printing uncarried values as enforced
+
+- **Timestamp**: 2026-08-21
+- **Action**: `security flow tcp-session initial/closing/time-wait-timeout`
+  are modeled, parsed and committable but have NO dataplane wire carrier
+  and no live consumer, while REST, CLI and gRPC all printed them in the
+  same shape as `established-timeout`, which IS carried. Chose the honest
+  render over enforcement: `initial-timeout` maps 1:1 onto the Rust
+  `SessionTimeouts.tcp_opening_ns`, but `time-wait-timeout` has no state
+  to attach to (`session_timeout_ns` splits a close only into RST vs FIN),
+  so an "enforce" PR is partial by construction and would owe a wire bump
+  plus a cluster smoke while still leaving the same follow-up. Added
+  `pkg/config/flow_tcp_timeouts_6539.go` as the single authority for the
+  enforced/unenforced split; the commit advisory and all three render
+  surfaces read it, so they cannot disagree and a leaf that later gains a
+  carrier loses its annotation everywhere at once. Also corrected two
+  false claims found in the same block: the CLI printed the Junos 1800s
+  default for an unset `established-timeout` when nothing in the Go path
+  fills that in (the helper idles the session out at 300s), and the #2078
+  advisory asserted the dataplane "has no TCP state machine", which #3152
+  and #3046 have since made false.
+  Mutation matrix: M1/M2/M3 (revert each surface to the unannotated
+  render) → that surface's cell reds; M4 (drop the advisory call) → the
+  four pkg/config advisory cells red; M5 (mark initial-timeout enforced
+  in the table) → the table, carrier and all three surface cells red;
+  M6 (drift the quoted half-open window) → the Rust-parity cell reds;
+  M7 (restore the Junos 1800s default) → the CLI defaults cell reds.
+- **File(s)**: `pkg/config/flow_tcp_timeouts_6539.go` (new),
+  `pkg/config/flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/types_security.go`,
+  `pkg/config/tcp_session_advisory_test.go`, `pkg/api/show_text.go`,
+  `pkg/api/show_text_tcp_timeouts_6539_test.go` (new),
+  `pkg/cli/cli_show_flow.go`,
+  `pkg/cli/cli_show_flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/grpcapi/server_show_flow.go`,
+  `pkg/grpcapi/show_flow_tcp_timeouts_6539_test.go` (new),
+  `pkg/dataplane/userspace/flow_tcp_timeout_carrier_6539_test.go` (new),
+  `docs/feature-gaps.md`, `docs/config-schema.md`
+
+## 2026-08-21 — #6652/#6653/#6654 shared-session locks recover from poison
+
+- **Timestamp**: 2026-08-21
+- **Action**: Routed every production access to a shared-session surface
+  through `lock_shared_recover`, the module's stated poison policy. The
+  three issues cite four sites; a sweep of the PREDICATE ("every
+  production access recovers") found SIX, including two the issues do
+  not name: `ha/tunnel_purge.rs` (the #1873 R-D remap purge bailed with
+  `return 0`, leaving a live session to re-resolve a remapped
+  `tunnel_endpoint_id` into the WRONG tunnel — arguably the most severe
+  of the six) and `ha/state.rs` (the RG-activation log reported
+  `shared_sessions=0`). Added an armed source tripwire that asserts the
+  predicate, keyed on the exact field paths and WRAP-INSENSITIVE
+  (whitespace collapsed) because the #6652 site was spelled across four
+  lines. Retired the README's "known remaining sites" table, which
+  listed exactly these three issues as open.
+  Mutation matrix 5/5 RED: T1-T5 each restore one site's pre-fix bytes;
+  each reds its own behavioural probe AND the tripwire.
+  DATAPLANE: this MOVES the userspace-dp binary — owes a cluster gate.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/types/mod.rs,
+  userspace-dp/src/afxdp/ha/export.rs,
+  userspace-dp/src/afxdp/ha/tunnel_purge.rs,
+  userspace-dp/src/afxdp/ha/state.rs,
+  userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/README.md
+
+## 2026-08-21 — #6534 NAT fail-closed exclusions stop rendering as enforced
+
+- **Timestamp**: 2026-08-21
+- **Action**: Closed the NAT family of #6534, where a rule the userspace
+  snapshot builder drops or disarms still rendered on every `show
+  security nat` surface exactly like an enforced one. Extracted the four
+  drop predicates into `pkg/config` as shared exported functions and made
+  BOTH the snapshot builder and the `pkg/natshow` renderers read them, so
+  the two cannot disagree about which rules are armed; excluded rules now
+  carry a `Status: NOT INSTALLED — <reason>` line naming the condition
+  that fired.
+  Deliberately NOT the applied-set readback the issue prescribed: all of
+  these exclusions are decided by the Go builder at snapshot-build time
+  as a deterministic function of the committed config, so there is no
+  runtime fact to read back, and `AppliedNATView` returns the applied
+  CONFIG rather than the applied SNAPSHOT — it does not carry the drop
+  bit. The missing thing was the predicate, not a data path.
+  Output for a healthy configuration is byte-identical, so the existing
+  CLI/gRPC golden tests keep asserting the same bytes.
+  Validation: `go test -count=1` green on pkg/natshow, pkg/config,
+  pkg/dataplane/userspace, pkg/cli, pkg/grpcapi; `go vet` clean on the
+  three touched packages (0 diagnostics); 6-cell mutation matrix all red
+  with vet clean at each mutated state, control and restored both green.
+  Reverting either half of the agreement — a renderer annotation or a
+  builder guard — reds and names the site.
+- **File(s)**: pkg/config/nat_exclusion_reason.go,
+  pkg/dataplane/userspace/nat_static.go,
+  pkg/dataplane/userspace/nat_destination.go,
+  pkg/dataplane/userspace/nat_exclusion_agreement_6534_test.go,
+  pkg/natshow/natshow.go, pkg/natshow/source.go, pkg/natshow/dest.go,
+  pkg/natshow/static.go, docs/engineering-style.md,
+  docs/junos-cli-reference.md, _Log.md
+## 2026-08-21 — #6558 ACK watermark held behind the pending-apply queue
+
+- **Timestamp**: 2026-08-21
+- **Action**: The event stream ACKed past queued-but-unapplied deltas — but
+  NOT by the mechanism the issue states. The normal path is already
+  receive→apply→ACK; the real window is that `dispatchOrQueue*` returns
+  true after an ENQUEUE, so the reader keeps reading while frames sit
+  unapplied, and all five refusal paths advanced `lastAppliedSeq` with no
+  pending-queue check. Added `applyRefusedFrameInOrder`: a refusal landing
+  on a non-empty queue enters it as a dropped marker and its watermark
+  advance happens in FIFO order; on an empty queue the advance is
+  immediate as before, so #6130's loop-break is intact. Made
+  `markFrameApplied` monotonic (was a bare Store, so an in-order flush
+  could rewind the watermark below a drop-path jump — silently swallowed
+  by `sendAckIfNeeded`'s `applied <= acked` guard and able to regress
+  `SendDrainRequest`'s fence). GO-ONLY: no Rust `userspace-dp` change, no
+  `userspace-xdp` shim `.o` movement, no `make generate` — the helper side
+  is already correct and fail-closed.
+  Mutation matrix: S1 (pre-fix unconditional advance) and S2 (never
+  advance while queued) → the core probe reds; S4 (bare Store) → the
+  monotonic test reds; S6 (marker type collides with a live frame type)
+  → the collision invariant reds. S3 (always queue the marker, even when
+  empty) and S5 (flush ignores the marker, falling through to the
+  pre-existing `default:` arm) are GREEN and disclosed as extensionally
+  equivalent variants, not holes.
+- **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_ack_behind_pending_6558_test.go,
+  docs/session-sync-architecture.md
 ## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
 
 - **Timestamp**: 2026-08-21
@@ -303,6 +502,140 @@
 - **File(s)**: scripts/image/validate.py,
   scripts/image/test_validate_ab_substrate_6498.py,
   docs/image-validation.md
+## 2026-08-22 — #5968: the REST include_peer path walked the local session table twice
+
+- **Timestamp**: 2026-08-22 (fix/5968-peer-only-delegation)
+- **Action**: Added peer-ONLY in-process entry points (`PeerSessions`,
+  `PeerSessionSummary`, `PeerZonePairSummary`) and pointed the three REST
+  include_peer handlers at them, removing a second full v4+v6 table traversal
+  per request.
+- **File(s)**: `pkg/grpcapi/peer_only_5968.go` (new),
+  `pkg/grpcapi/peer_only_5968_test.go` (new), `pkg/grpcapi/server_sessions.go`,
+  `pkg/api/server.go`, `pkg/api/sessions.go`, `pkg/api/README.md`, plus three
+  retargeted test files.
+
+  A REST list / summary / zone-pair request with `include_peer` walks the LOCAL
+  table in the REST handler, then delegated to the in-process gRPC method purely
+  to read `.Peer` — and that method walked the local table AGAIN to build a local
+  answer the caller discarded. #5880 fixed the double-ACQUIRE on this path (the
+  nested call re-acquired the shared limiter and self-rejected at capacity); the
+  redundant WALK survived it. One slot, two full traversals, each contending
+  with the live session-sync path for the same per-bucket map locks.
+
+  All THREE handlers had the identical shape, so a fix covering only the list —
+  the one the issue names — would have left two-thirds of the redundant work.
+
+  The new entry points are Go-interface methods on `ClusterSessionService`, not
+  registered gRPC methods, so this costs no protobuf or wire change and no
+  version negotiation: the REST bridge and the gRPC server are the same process
+  by construction.
+
+  ADMISSION IS DELIBERATELY UNCHANGED. Skipping the limiter was tempting — these
+  perform no local walk — but it would have silently retired the #5880
+  lease-propagation guard on exactly the delegation that guard was written for,
+  turning `TestRESTIncludePeerReusesLease_5880` vacuous without failing it. Each
+  peer-only method acquires through the same lease-aware `AcquireCtx`, so slot
+  accounting is identical before and after and the change is purely about the
+  walk.
+
+  Peer-status classification (#5320 OK / UNREACHABLE / NOT_APPLICABLE) is
+  single-sourced in `attachPeerSessionSummary` / `attachPeerZonePairSummary`,
+  shared with the full paths: a divergence between how the full method and the
+  peer-only method classify the SAME fetch would always be a bug, so it is
+  single-sourced rather than bound by a test.
+
+  Mutation proof — `go build ./...` checked clean before every cell:
+  - `PeerSessions` delegates to `GetSessions` (restores the double walk) —
+    TEST_RC=1 on the zero-walk measurement;
+  - peer-only paths skip admission — TEST_RC=1 on
+    `TestPeerOnlyStillAcquiresAdmission`;
+  - each of the three REST call sites reverted to its full-view method —
+    TEST_RC=1 each, localising to that surface's tests.
+  The zero-walk test carries `GetSessions` on the SAME server and dataplane as a
+  positive control, so it cannot be satisfied by a dataplane that never
+  iterates.
+
+  Control: `go test -count=1 ./pkg/api/ ./pkg/grpcapi/` TEST_RC=0,
+  `go test -count=1 ./pkg/daemon/` TEST_RC=0, `go vet` VET_RC=0, `go build ./...`
+  BUILD_RC=0. Go-only; no dataplane binary moves, so no cluster smoke is owed.
+  Touches no cluster/session-sync/failover code — the peer fan-out here is the
+  read-only diagnostic path, not the sync path.
+
+## 2026-08-22 — #4960: an apply that aborted after mutating the host said nothing about it
+
+- **Timestamp**: 2026-08-22 (fix/4960-host-mutation-report)
+- **Action**: An abort in the post-mutation window now reports which classes of
+  live host state this apply already changed, and the address-reconcile
+  decision was split out as a pure function so that flag actually varies.
+- **File(s)**: `pkg/dataplane/compiler_hostmutation_4960.go` (new),
+  `pkg/dataplane/compiler_hostmutation_4960_test.go` (new),
+  `pkg/dataplane/compiler_iface.go`, `pkg/dataplane/compiler.go`,
+  `pkg/dataplane/loader.go`, `pkg/dataplane/README.md`
+
+  `pkg/dataplane.CompileConfig` mutates the host in Phase 2 (VLAN sub-interface
+  create, interface address reconcile) with no undo log. PR #6894 added a
+  pre-pass that catches the config-shape classes BEFORE that point, but three
+  fallible steps still run after it: CompileConfig's own later phases,
+  `preflightCheckIfindexCaps`, and `attachUserspaceShimXDP`. The last is the
+  reachable one — an ordinary XDP attach failure on a driver that refuses a
+  generic attach. When any of them fails, `CompileUserspaceShim` returns before
+  publishing, so the Rust dataplane keeps its PREVIOUS snapshot while the host
+  has already moved.
+
+  The operator saw `apply failed: attach userspace shim XDP: ...` and had every
+  reason to read it as "the apply did nothing" — then retry or roll back on a
+  box whose VLANs and addresses had already been changed by the failed attempt.
+
+  This does not undo the mutation. An apply transaction with a real undo path is
+  #4960's own "split pure planning from actuation" / "restore the prior host
+  plan" redesign, it has a stranded plan branch with two PLAN-NEEDS-MAJOR review
+  rounds, and none of it is reachable without first deciding what an abort does
+  to an already-mutated host. What this fixes is that the split state was
+  INVISIBLE.
+
+  The flag has to VARY or it says nothing: recorded unconditionally it would be
+  true on every apply of an addressed interface and the annotation would fire on
+  every failure. So `ensureVLANSubInterface` reports whether it actually added a
+  link (an existing link brought up is not a creation; every return after a
+  successful LinkAdd reports true, including the failure paths, because the link
+  exists either way), and `reconcileInterfaceAddresses` reports whether a delete
+  or add actually landed (an "exists" error is not a change).
+
+  `planAddressReconcile` splits the delete/add DECISION out as a pure function of
+  (existing, desired) — #4960's planning/actuation clause at this one site — which
+  is what makes the converged case provable without root.
+
+  The two loader steps are grouped into `runPostMutationSteps`, the only place
+  the post-mutation abort contract is expressed, so a step added to that window
+  inherits it. Both are written as CALLS inside closures rather than method
+  values: the #5275 arm-proof canary locates the attach by walking for a
+  CallExpr, and a method value would have silently left it with nothing to
+  anchor to. Keeping the call shape keeps that guard intact instead of loosening
+  it to fit this refactor — it caught the refactor on the first full run.
+
+  Mutation proof — `go build ./pkg/dataplane/` checked clean before every cell:
+  - delete the annotation from `runPostMutationSteps` (the production wiring) —
+    TEST_RC=1, BOTH abort paths red;
+  - drop the `!result.HostMutated()` guard — TEST_RC=1, the not-annotated
+    control reds;
+  - drop the summary sort — TEST_RC=1, the order-stability test reds;
+  - mark unconditionally at the reconcile CALL SITE — TEST_RC=1 on
+    `TestCompileZonesRecordsNoMutationWhenConverged`. That test exists because
+    the first version of this mutation stayed GREEN: every other test drives
+    `CompileResult` or the plan directly and none of them reaches
+    `mapZoneInterface`. It now drives the real `compileZones` over `lo`, passing
+    as desired exactly the addresses `lo` already has (read from the kernel
+    first, with the empty plan asserted as a premise), so it reaches the call
+    site and cannot modify the host it runs on;
+  - plan every desired address regardless of what exists — TEST_RC=1;
+  - stop skipping link-local in the delete set — TEST_RC=1;
+  - replay adds from the map instead of authored order — TEST_RC=1.
+
+  Control: `go test -count=1 ./pkg/dataplane/...` TEST_RC=0,
+  `go test -count=1 ./pkg/daemon/ ./pkg/config/` TEST_RC=0,
+  `go vet ./pkg/dataplane/...` VET_RC=0, `go build ./...` BUILD_RC=0. Go-only;
+  no dataplane binary moves, so no cluster smoke is owed.
+
 ## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
 
 - **Timestamp**: 2026-08-22
@@ -101150,6 +101483,20 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
+## 2026-08-21 — #6561 ip-monitoring probe-state wipe on an unrelated commit
+- **Timestamp**: 2026-08-21
+- **Action**: `rpm.Manager.Apply` rebuilt the whole results table from config,
+  seeding every key `LastStatus: "unknown"`, which ipmon reads as PASS — so at
+  the default hold-down of 0 an ACTIVE failover route was withdrawn. The
+  trigger is not an RPM edit: `reconcileRPM`'s hash covers
+  `cfg.RethToPhysical()`, so any RETH-member change reopens the gate. Preserved
+  the runtime half rather than skipping the reconcile: `Apply` snapshots the
+  prior results before `StopAll` and carries a verdict forward when the
+  RESOLVED measurement identity is unchanged. Corrected mid-implementation from
+  an fwmark-based discriminator (the mark is a positional index, not a path
+  identity — it does not move on a RETH remap).
+- **File(s)**: pkg/rpm/rpm.go, pkg/rpm/probe_verdict_carry_6561_test.go (new),
+  pkg/ipmon/README.md, pkg/rpm/README.md, _Log.md
 ## 2026-08-21 — #6548: console `load ... terminal` aborts on Ctrl-C
 - **Timestamp**: 2026-08-21
 - **Action**: `pkg/cli` handleLoad's terminal read loop took the same `break`
@@ -101185,6 +101532,65 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   docs/feature-gaps.md, docs/phases.md, _Log.md
+
+## 2026-08-21 — #6560 VRRP self-frame filter
+- **Timestamp**: 2026-08-21
+- **Action**: VRRP had no PACKET_OUTGOING / multicast-loop self-frame filter;
+  self-filtering rested solely on the deliberately-nilable getLocalIP()
+  snapshot, which is nil for 30ms-1s during the #2528 RETH-MAC flush window,
+  so a MASTER could process its own advert and self-demote via
+  resolveEqualPriorityMaster's nil-localCmp step-down. Confirmed the frame IS
+  delivered by two mechanisms (AF_PACKET ETH_P_ALL TX tap; IP multicast
+  loopback on the fallback raw sockets) — the socket did NOT already filter.
+  Added PACKET_IGNORE_OUTGOING (set before bind, best-effort), an sll_pkttype
+  drop in receiverAfPacket (Recvfrom's sockaddr was being discarded), and
+  IP_MULTICAST_LOOP/IPV6_MULTICAST_LOOP disable on both fallback sockets.
+  TOUCHES VRRP — owes `make test-failover`.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance_receive.go,
+  pkg/vrrp/self_frame_filter_6560_test.go (new), pkg/vrrp/README.md, _Log.md
+
+## 2026-08-21 — #6563: inject-packet emit-on-wire validates the source
+- **Timestamp**: 2026-08-21
+- **Action**: `request inject-packet --emit-on-wire` ran FIB/HA/CoS then enqueued
+  TX with an operator-arbitrary `source_ip` — `inject.rs` had ZERO references to
+  policy or screen, so a local principal could emit spoofed-source ICMP/ICMPv6
+  bypassing the zone policy and screen that govern transit. Added
+  `is_firewall_local_address` (global `local_v4`/`local_v6` membership:
+  interface host addresses + static-NAT/DNAT externals) and gated
+  `validate_injected_packet_tuple` on it. The gate is LAST (structural faults
+  keep message precedence) and applies to the EMIT path only, so non-emit
+  classification keeps its full diagnostic range.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/inject.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md, _Log.md
+
+## 2026-08-21 — #6565: REST NAT show views delegate to the shared renderer
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/api/show_text.go` reimplemented `nat-static` / `nat-nptv6`,
+  printing every rule straight from config — a THIRD independently-written copy
+  alongside CLI and gRPC, which both delegate to `pkg/natshow`. #5323 and
+  #6534 each taught a strict subset of the copies to annotate a rule the
+  snapshot builder drops, leaving REST rendering it as live. Routed REST
+  through `natshow.RenderStatic`/`RenderNPTv6` and added the third leg of the
+  #1687 byte-equality invariant (`show_nat_shared_test.go`). Fixture is staged
+  via the TOLERANT ingress and carries an exclusion in EACH view — both facts
+  were forced by mutation cells that failed to red.
+- **File(s)**: pkg/api/show_text.go, pkg/api/show_nat_shared_test.go (new),
+  pkg/api/README.md, _Log.md
+
+## 2026-08-22 — #6609 RedactURL credential slots
+- **Timestamp**: 2026-08-22
+- **Action**: `config.RedactURL` leaked a credential in three slots, all three
+  reproduced first-hand before any edit: a missing `@` puts the credential in
+  the host:port slot and nothing matched; a scheme-relative `//user:pw@host/`
+  had authStart=0 so the authority scanned as EMPTY; and the fragment was never
+  redacted (only ever dropped as a side effect of the query rule truncating the
+  tail, so only the no-query case leaked). Added `urlAuthorityStart` (RFC 3986
+  scheme rule + the `//` case) and `urlHostPortPlausible` (bracketed-IPv6 aware,
+  empty port valid). A non-port colon now redacts the WHOLE authority — with a
+  malformed authority there is no way to tell host from secret.
+- **File(s)**: pkg/config/secret.go,
+  pkg/config/redact_url_slots_6609_test.go (new), docs/config-schema.md, _Log.md
 
 - **Timestamp**: 2026-08-21
   - **Action**: #7328 — make a failed config-sync apply re-pushable. Receiver

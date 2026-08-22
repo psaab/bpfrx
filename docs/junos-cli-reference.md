@@ -1383,6 +1383,69 @@ its logging/inversion intent (#3684):
 
 ---
 
+## Class-of-service entries the dataplane does not install (#6534)
+
+A classifier, rewrite-rule or scheduler-map entry naming a
+forwarding-class that `class-of-service forwarding-classes` does not
+define is SKIPPED by the snapshot builder. The object still installs,
+but PARTIALLY: those code points do not classify, and shaping for that
+class degrades to best-effort. `show class-of-service classifiers`,
+`... rewrite-rules` and `... scheduler-map` annotate the loss:
+
+```
+Classifier: cls, Code point type: dscp
+  Code point  Forwarding class  Loss priority
+  001010      real              low
+  010100      ghost             low
+  NOT INSTALLED: entries for forwarding-class ghost are skipped (no such class under `class-of-service forwarding-classes`)
+```
+
+Unlike the NAT exclusions below, this one is reachable through an
+ordinary `commit`: an undefined forwarding-class reference is only a
+commit-time WARNING, never a strict rejection, so it is a supported
+config shape rather than a lenient-path-only artifact.
+
+Two deliberate non-annotations:
+
+- A scheduler-map entry naming an undefined SCHEDULER is a different
+  edge with the opposite disposition — the entry is KEPT on the wire so
+  the class's queue still materializes — so it is not annotated.
+- `ieee-802.1` rewrite-rules are not published to the dataplane at all,
+  which is a wholesale gap rather than a per-entry skip, so their
+  entries are not annotated as skipped either.
+
+## Security: NAT rules the dataplane does not install (#6534)
+
+Every `show security nat ...` topic renders rules from the committed
+configuration. A rule the userspace snapshot builder DROPS or DISARMS —
+because it is not representable and must fail closed — would otherwise
+render identically to an enforced one, so those rules carry an extra
+line:
+
+```
+source NAT rule: r1
+  Rule-set: rs1                        ID: 1
+    From zone: trust    To zone: untrust
+    Match:
+      Source addresses:      10.0.0.0/24
+      Destination addresses: 0.0.0.0/0
+    Action:                  pool nope
+    Status:                  NOT INSTALLED — references an undefined pool
+    Number of sessions:      0
+```
+
+The annotation appears on `show security nat source rule detail`,
+`destination rule detail`, `static [rule [detail]]`, and `nptv6`. It is
+emitted ONLY for a rule the dataplane is not enforcing, so output for a
+healthy configuration is unchanged.
+
+Reachability: the strict commit gates reject these configurations, so a
+rule cannot reach this state through `commit`. It reaches it through the
+lenient boot / HA peer-sync load path (#1960 no-brick) — a configuration
+persisted by an older binary, or synced from a peer. Seeing this line
+means the box is forwarding that traffic untranslated right now; the
+reason text names which condition fired.
+
 ## Security: NAT Source Rule All
 
 **Command:** `show security nat source rule all`

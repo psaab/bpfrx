@@ -50,38 +50,6 @@ func dnatDestinationParts(raw string) (base, prefix string, ok bool) {
 	return ipNet.IP.String(), ipNet.String(), true
 }
 
-// dnatPoolHostIP validates a DNAT pool's translated address and returns the
-// bare host IP the wire carries. The Rust DnatTable parses the pool address as
-// a single host IpAddr, so the pool must resolve to exactly one host: a bare
-// IP, /32, or /128. A non-host CIDR (e.g. 10.0.0.0/24) would otherwise be
-// coerced to its network base (10.0.0.0) with no pool/range semantics (#3450
-// M05), and a non-IP token (e.g. an address-book name) would be dropped by the
-// Rust parser, leaving the VIP untranslated (#3450 M06). ok is false for both
-// so the caller fails CLOSED (skips the rule, installing no entry) rather than
-// translating to the wrong address. The commit-time gate (validateDNATPoolStrict)
-// makes the bad address operator-visible; this is the lenient / peer-sync
-// backstop.
-func dnatPoolHostIP(addr string) (string, bool) {
-	if addr == "" {
-		return "", false
-	}
-	if strings.IndexByte(addr, '/') == -1 {
-		ip := net.ParseIP(addr)
-		if ip == nil {
-			return "", false
-		}
-		return ip.String(), true
-	}
-	ip, ipNet, err := net.ParseCIDR(addr)
-	if err != nil {
-		return "", false
-	}
-	if ones, bits := ipNet.Mask.Size(); ones != bits {
-		return "", false // non-host prefix — would coerce to the network base
-	}
-	return ip.String(), true
-}
-
 // buildDestinationNATSnapshots is the static-only convenience wrapper retained
 // for callers without a dynamic-address feed overlay (tests, legacy paths). The
 // production snapshot path uses buildDestinationNATSnapshotsWithFeeds (#3303).
@@ -130,30 +98,29 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// xpfd->helper wire form — still resolves to the exemption; see
 			// dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820.
 			if !isOff {
-				var ok bool
-				pool, ok = cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
-				if !ok || pool == nil || pool.Address == "" {
+				// #3450 fail-closed (lenient / peer-sync backstop; the commit
+				// gate validateDNATPoolStrict rejects these). A missing /
+				// address-less pool, a non-host pool address, or a
+				// configured-but-invalid port must publish NO entry, so the
+				// rule matches NOTHING rather than wrapping the port on a
+				// uint16 cast, collapsing to preserve-destination-port, or
+				// coercing a non-host CIDR to its network base.
+				//
+				// #6534: the verdict comes from
+				// config.DestinationNATRuleExcludedReason so this builder and
+				// natshow.RenderDestRuleDetail cannot disagree about which
+				// rules are armed. The per-clause rationale lives with the
+				// predicate.
+				if reason := config.DestinationNATRuleExcludedReason(cfg.Security.NAT.Destination, rule); reason != "" {
+					slog.Warn("userspace snapshot: skipping DNAT rule (fail-closed, #3450)",
+						"ruleset", rs.Name, "rule", rule.Name,
+						"pool", rule.Then.PoolName, "reason", reason)
 					continue
 				}
-				// #3450 fail-closed (lenient / peer-sync backstop; the commit gate
-				// validateDNATPoolStrict rejects these). A pool with a
-				// configured-but-invalid port (0/out-of-range/non-numeric — PortRaw
-				// set but Port not in 1..65535) or a non-host pool address must
-				// publish NO entry, so the rule matches NOTHING rather than wrapping
-				// the port on a uint16 cast, collapsing to preserve-destination-port,
-				// or coercing a non-host CIDR to its network base.
-				var poolAddrOK bool
-				poolAddr, poolAddrOK = dnatPoolHostIP(pool.Address)
-				if !poolAddrOK {
-					slog.Warn("userspace snapshot: skipping DNAT rule with non-host pool address (fail-closed, #3450)",
-						"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "address", pool.Address)
-					continue
-				}
-				if pool.PortRaw != "" && (pool.Port < 1 || pool.Port > 65535) {
-					slog.Warn("userspace snapshot: skipping DNAT rule with out-of-range pool port (fail-closed, #3450)",
-						"ruleset", rs.Name, "rule", rule.Name, "pool", rule.Then.PoolName, "port_raw", pool.PortRaw, "port", pool.Port)
-					continue
-				}
+				pool = cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
+				// The predicate above already proved this resolves; the second
+				// return is the host form the wire carries.
+				poolAddr, _ = config.DNATPoolHostIP(pool.Address)
 			}
 			// #2395: a DNAT rule may publish multiple destination addresses
 			// (`match destination-address [ A B C ]`). The DNAT table is keyed

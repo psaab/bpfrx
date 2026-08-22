@@ -1017,6 +1017,41 @@ under the daemon's errgroup. Nothing else imports this package.
 `authz`, `config`, `configstore`, `conntrack`, `dataplane`, `dhcp`, `frr`,
 `ipsec`, `logging`, `routing`, `vrrp`.
 
+## NAT show views delegate to `pkg/natshow` (#6565)
+
+`show-text?topic=nat-static` and `topic=nat-nptv6` call
+`natshow.RenderStatic` / `natshow.RenderNPTv6` — the SAME renderers the CLI
+(`cli_show_nat.go`) and gRPC (`server_show_nat.go`) call. They must never be
+reimplemented here.
+
+REST used to reimplement both, printing every rule straight from config. That
+third copy made the fail-closed NOT-INSTALLED annotations a per-surface
+lottery: #5323 taught two surfaces to annotate a rule the userspace snapshot
+builder drops, #6534 taught two surfaces a further set of exclusion reasons,
+and each time REST kept rendering the dropped rule as live. CLI and gRPC each
+had a byte-equality test against the shared renderer (#1687); REST did not, and
+REST is the copy that drifted.
+
+`show_nat_shared_test.go` is the third leg of that invariant. Two things about
+its fixture are load-bearing and were both learned by a mutation cell failing
+to red:
+
+- **It is staged through the TOLERANT ingress (`Store.SyncApply`), not a
+  commit.** Every exclusion `staticRuleNotInstalledReason` reports is also
+  hard-rejected by a strict commit gate (`then static-nat inet` by #5859, the
+  NPTv6 scope forms by #5818), so an excluded rule cannot reach `ActiveConfig`
+  through a commit at all. A commit-staged fixture contains no exclusion, both
+  renderers agree byte-for-byte, and the test passes on the UNFIXED code. The
+  tolerant ingress — a persisted config at boot, or an HA peer sync — is where
+  those gates downgrade to warnings (#1960) and therefore the only path on
+  which REST was lying.
+- **It carries an excluded rule in EACH view.** With only a static-NAT
+  exclusion the `nptv6` subtest compares two renderings that agree trivially
+  and passes on the unfixed code.
+
+The test guards both premises explicitly, so a fixture that stops exercising
+the drop fails loudly instead of going quietly vacuous.
+
 ## Gotchas
 
 - **Management-plane DoS hardening (#4150).** Both `http.Server` literals in
@@ -2234,8 +2269,29 @@ under the daemon's errgroup. Nothing else imports this package.
     path is a no-op). Pinned by `TestAcquireCtx_5880` (mechanism),
     `TestGetSessions_InProcessLeaseReuse_5880` (gRPC reuse at cap 1), and
     `TestRESTIncludePeerReusesLease_5880` (REST include_peer succeeds at cap 1),
-    each RED on revert. The BROADER redesign #5880 also asks for — structural
-    per-surface admission via a registration/source-level test, weighted cost for
+    each RED on revert.
+    **#5968 removes the redundant local WALK on the same path.** #5880 fixed the
+    double-ACQUIRE; the delegation still walked the local table TWICE. The REST
+    handler builds its own local list/summary/breakdown and then called the
+    in-process gRPC method purely for `.Peer`, discarding that method's own local
+    result — a second full v4+v6 traversal per request, contending with the live
+    session-sync path for the same per-bucket map locks. The three handlers now
+    delegate to `PeerSessions` / `PeerSessionSummary` / `PeerZonePairSummary`,
+    in-process-only methods on `ClusterSessionService` that fetch the peer view
+    with NO local walk. They cost no protobuf or wire change (the REST bridge and
+    the gRPC server are the same process), and they acquire through the SAME
+    lease-aware `AcquireCtx` the full methods use — slot accounting is identical
+    before and after, so the #5880 lease guarantee is preserved rather than
+    quietly retired by a path that never acquires. Peer-status classification
+    (#5320 OK / UNREACHABLE / NOT_APPLICABLE) is single-sourced in
+    `attachPeerSessionSummary` / `attachPeerZonePairSummary`, shared with the
+    full paths, because a divergence there would always be a bug. Pinned by
+    `pkg/grpcapi/peer_only_5968_test.go`: a walk-counting dataplane proves ZERO
+    local traversals, with `GetSessions` on the same server as the positive
+    control so the assertion cannot be satisfied by a dataplane that never
+    iterates.
+    The rest of the redesign #5880/#5968 ask for — structural per-surface
+    admission via a registration/source-level test, weighted cost for
     local+peer/cursor/clear, and a separate remote budget — is deferred to a
     follow-up.
     **#5779 extends the SAME shared bound to the session-CLEAR (mutation)

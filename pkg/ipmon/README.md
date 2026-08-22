@@ -38,6 +38,48 @@ route caches). A sustained per-cycle flapper with hold-down 0
 produces at most one frr-reload + one snapshot push per throttle window
 — bounded and observable via `xpf_ipmon_policy_transitions_total`.
 
+### Probe verdicts survive a probe restart (#6561)
+
+`evaluateLocked` computes `anyFailed` from `e.failedTests`, which
+`seedResultsLocked` fills with `r.LastStatus == "fail"` — so `"unknown"`
+buckets with `"pass"`. Combined with the DEFAULT `hold-down` of 0 (Junos
+parity: withdraw immediately on recovery), a results snapshot in which
+every test reads `"unknown"` recovers the policy and withdraws an ACTIVE
+failover route **in the same call**.
+
+That used to happen on an ordinary commit. `reconcileRPM` is hash-gated,
+but the hash covers `cfg.RethToPhysical()` as well as the RPM stanza, so
+adding, removing or renaming any RETH member — an interface-stanza edit
+that never mentions `services rpm` or `services ip-monitoring` — reopened
+the gate, and `rpm.Manager.Apply` then rebuilt its whole results table
+from config with every key seeded `"unknown"`. `Apply` here goes to real
+trouble to preserve its own runtime half (`st.failed = prev.failed`), and
+the reseed immediately overwrote it from the wiped snapshot. The
+commit's own FRR render is snapshotted **before** step 17c, so the
+withdrawal never appeared in the commit output — it landed on the
+delayed actuation about a second later.
+
+The fix is in `pkg/rpm`, not here: `Manager.Apply` snapshots the prior
+results before `StopAll` reallocates the table and carries a test's
+runtime verdict forward when its RESOLVED measurement identity — probe
+type, target, source, routing-instance, next-hop, and the destination
+interface **after** RETH translation — is unchanged. The reconcile is
+not skipped; probes genuinely must restart when their marks are
+reprogrammed. What is preserved is the half the config does not carry.
+
+Two boundaries that must not drift:
+
+- **ABSENT is not UNKNOWN.** A key the config dropped stays absent, and
+  an absent key still clears a stale FAIL (#4423 M8) — no probe, no
+  protection. The carry-forward only ever fills a key present in both
+  tables.
+- **The identity is a resolved PATH, not the fwmark.** An earlier
+  revision compared marks; `BuildProbePins` assigns
+  `ProbeFwmarkBase + idx` over sorted probe/test names, so a mark is a
+  POSITION in the pin band. It does not move when a RETH remap changes
+  the resolved interface, and it does move when an unrelated test sorts
+  earlier. Both directions are wrong.
+
 The daemon actuator (`pkg/daemon/daemon_ipmon.go`) runs under the SAME
 apply semaphore as operator commits and bumps the FIB generation ONLY
 after a successful snapshot publish (ordering is load-bearing — see
