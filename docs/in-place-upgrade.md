@@ -808,7 +808,22 @@ window for ALL FOUR managed binaries:
   the pinned generation is UNKNOWN, so publish-generation SKIPS the GC
   rather than run it with an empty protection set and reap the crashed
   cut's source (which would leave the resume unrecoverable). An absent
-  journal means no crashed cut, so GC proceeds normally.
+  journal means no crashed cut, so GC proceeds normally. **The SAME rule now covers
+  the other half of the protection set (#6763):** `current-gen` is
+  resolved explicitly, and that resolution can FAIL — a readlink error, a
+  hand-edited symlink carrying path components that would escape the
+  staged-gen root, a target that is not a valid `genid`, or a DANGLING
+  `current-gen` whose directory is missing. The error used to be
+  DISCARDED, so the live generation simply went unprotected and GC reaped
+  it as soon as it fell outside the retention window — with the dangling
+  case being the sharpest, since a corrupt layout is exactly when the live
+  generation most needs protecting. GC now REFUSES and deletes nothing
+  when `current-gen` cannot be resolved. The benign case stays benign:
+  `ResolveCurrent` returns `("", nil)` when there is no `current-gen` link
+  at all, so a never-published root still GCs normally — absence is
+  determinate, failure is not. All three GC callers already treat a GC
+  error as a warning, never fatal, so the refusal degrades to "GC
+  skipped" and cannot block a publish, a seed or a cut.
 - **Same-version replacement (B-P3b OPT1).** `versions/<ver>` carries a
   `.srcgen` stamp; the copy-skip is generation-aware. A same-version
   re-stage with NEW bytes (a new generation) RE-COPIES a stale, non-live
