@@ -132,6 +132,15 @@ func (c *CLI) testPolicy(args []string) error {
 		// #3285: host-bound traffic — no transit global/default fallback.
 		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", fromZone)
 		fmt.Printf("  %s\n", policymatch.HostInboundShowLine)
+		// #5649 (C181-C20): name the admitting host-inbound-traffic token (or
+		// report deny/global-accept/indeterminate), mirroring the local `show
+		// security match-policies` renderer (#3627 B1a) — this remote/`request`
+		// path was missing it entirely.
+		if res.HostInbound != nil {
+			if line := res.HostInbound.Describe(); line != "" {
+				fmt.Printf("  host-inbound-traffic (zone %s): %s\n", fromZone, line)
+			}
+		}
 		return nil
 	}
 	// #4373 (E4/H2/H7): a multicast/broadcast/unspecified/loopback destination is
@@ -173,6 +182,16 @@ func (c *CLI) testPolicy(args []string) error {
 	fmt.Printf("  Policy:    %s\n", res.PolicyName)
 	printPolicyMatchIdentity(res)
 	fmt.Printf("  Action:    %s\n", policymatch.ActionString(res.Action))
+	// #5649 (C181-C20): a MATCHED to-zone junos-host fine policy still needs
+	// the coarse host-inbound-traffic admission gate named — LocalDelivery
+	// evaluates BOTH and the fine action alone does not govern the flow.
+	// res.HostInbound is populated only for to-zone junos-host queries
+	// (matchJunosHost), so this is a no-op for an ordinary transit match.
+	if res.HostInbound != nil {
+		if line := res.HostInbound.Describe(); line != "" {
+			fmt.Printf("  Host-inbound: %s\n", line)
+		}
+	}
 	if srcIP != "" {
 		fmt.Printf("  Source:    %s -> ", srcIP)
 	} else {
