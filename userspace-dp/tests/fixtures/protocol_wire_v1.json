@@ -930,6 +930,7 @@
     "session_replication_queue_depth_sum": 0,
     "session_replication_upserts_total": 0,
     "session_table_entries": 0,
+    "shared_session_poison_recoveries": 0,
     "shared_session_publish_lock_acquisitions_total": 0,
     "shared_session_publish_lock_contended_total": 0,
     "shared_session_publishes_total": 0,

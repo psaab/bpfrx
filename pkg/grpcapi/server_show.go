@@ -11,6 +11,8 @@ import (
 	"github.com/psaab/xpf/pkg/upgrade"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // --- Operational show RPCs ---
@@ -471,7 +473,10 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		if err != nil {
 			return nil, diagExecError("journalctl", err)
 		}
-		buf.Write(out)
+		// #6584: the remote `cli` prints resp.Output VERBATIM, so this is the
+		// same terminal reached over a different transport — and it is the
+		// more common operator posture.
+		buf.WriteString(termsafe.SanitizeBlockForDisplay(string(out)))
 
 	case "internet-options":
 		s.showInternetOptions(cfg, &buf)
@@ -572,7 +577,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 			if err != nil {
 				return nil, diagExecError("read "+logPath, err)
 			}
-			buf.Write(out)
+			buf.WriteString(termsafe.SanitizeBlockForDisplay(string(out)))
 		} else {
 			return nil, status.Errorf(codes.InvalidArgument, "unknown topic: %s", req.Topic)
 		}

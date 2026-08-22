@@ -52,8 +52,102 @@ func (r *Runner) flip(ver string) error {
 	if err := r.cfg.Sys.DaemonReload(); err != nil {
 		return fmt.Errorf("daemon-reload after unit template: %w", err)
 	}
+	// 6d (#6639): if a kernel candidate is ARMED, re-stamp the arm record at
+	// the binary this cut just made live.
+	//
+	// LAST, deliberately. The record must never name a binary the unit does not
+	// yet point at, so a crash between 6c and here leaves the OLD record — which
+	// is today's behaviour: safe, refusing, and repaired by re-running the cut.
+	if err := r.restampKernelArmRecord(ver); err != nil {
+		return fmt.Errorf("re-stamp kernel arm record: %w", err)
+	}
 	return nil
 }
+
+// restampKernelArmRecord points the kernel channel's arm record at the xpfd
+// this cut just made live (#6639).
+//
+// THE DEFECT. `xpfd upgrade kernel arm` records the arming binary's resolved
+// path — `/var/lib/xpf/versions/<A>/xpfd` — into both the journal's
+// `PromoteBinary` field and the `kernel-promote-binary` sidecar. An in-place
+// binary cut then repoints `current`, the sbin links and the unit's ExecStart at
+// version B and touches neither record. On the candidate boot the POSIX-sh outer
+// hop compares the recorded path against what the unit independently resolves,
+// finds two genuinely different files, and refuses.
+//
+// It is the SIDECAR that has to move. The refusal fires in the shell, before it
+// execs anything, so the Go-side cross-check (VerifyPromoteBinaryMatchesRecord)
+// is never reached — a Go-only change could not fix this.
+//
+// WHY RE-STAMP RATHER THAN RELAX THE COMPARISON. What #6601 built is the
+// property that the promotion gate executes the LIVE xpfd and never a stale
+// leftover, because a stale verifier's PASS permanently promotes a kernel
+// nothing actually validated. Making the comparison version-aware or
+// identity-aware would re-admit `versions/<OLD>/xpfd` — a retained, valid,
+// executable binary — which is exactly the stale leftover that design
+// eliminates. The recorded path is a PROXY for "live", established by
+// authority-of-construction at arm time; a cut has that same authority, because
+// it CREATED the new binary and repointed `current`, the sbin link and
+// ExecStart at it. "Which xpfd is live" is not inferred here — it is this
+// function's own output. So the proxy is updated by a party entitled to update
+// it, and both gates stay byte-identical.
+//
+// The consequence of leaving it is worse than a lost candidate. The shell
+// refuses BEFORE exec'ing xpfd, so Promote() never runs and the journal is never
+// cleared: the gate re-refuses on every subsequent boot from a unit that reports
+// success, and on an HA node `reconcileKernelUpgradeHold` releases the SECONDARY
+// hold only when a promotion marker names the running kernel — a marker that
+// will never be written — so the node holds SECONDARY indefinitely.
+//
+// A no-op unless a candidate is ARMED: with nothing armed there is no record to
+// re-stamp and none is created, so a cut on a box that never used the kernel
+// channel is byte-identical to before.
+//
+// FAILS CLOSED. A half-updated record naming a binary that may not exist is
+// strictly worse than an untouched one, so the sidecar and the journal field are
+// written from ONE resolved value and any failure fails the cut. Leaving the old
+// record intact degrades to exactly this issue, which is the safe fallback.
+func (r *Runner) restampKernelArmRecord(ver string) error {
+	// The struct is built directly rather than through NewKernelRunner, which
+	// requires a KernelSystem. Nothing here touches the system: this is a
+	// journal read, a path join and two durable writes. Demanding a Sys would
+	// mean the binary channel constructing UEFI/apt/systemd plumbing it never
+	// uses, purely to read a file.
+	kr := &KernelRunner{cfg: KernelConfig{JournalPath: kernelArmRestampJournalPath}}
+	j, err := kr.loadKernelJournal()
+	if err != nil {
+		// An unreadable journal is NOT "nothing armed" — it may be an armed one
+		// this cut is about to invalidate. Refuse rather than cut past it.
+		return fmt.Errorf("read kernel journal: %w", err)
+	}
+	if !j.State.atLeast(KernelStateArmed) ||
+		j.State == KernelStatePromoted || j.State == KernelStateReverted {
+		return nil // nothing armed — no record exists to re-stamp
+	}
+	bin := filepath.Join(r.cfg.VersionsDir, ver, "xpfd")
+	if err := validateGateBin(bin); err != nil {
+		return fmt.Errorf("cut target %s is not usable as the promotion gate: %w", bin, err)
+	}
+	j.PromoteBinary = bin
+	if err := kr.saveKernelJournal(j); err != nil {
+		return err
+	}
+	path := ArmRecordPath(kr.cfg.JournalPath)
+	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create arm-record dir: %w", err)
+	}
+	return fsatomic.WriteFileDurable(path, []byte(bin+"\n"), 0o644)
+}
+
+// kernelArmRestampJournalPath is the kernel journal the cut re-stamps against.
+//
+// A package var seeded from the production default, matching bootGateJournalPath
+// (kernel_arm_journal_path.go): a unit test that drives flip() over a t.TempDir()
+// layout must not write to the real /var/lib/xpf, and nothing outside this
+// package can reach it, so production is structurally incapable of pointing it
+// elsewhere. #6631 already refuses to ARM against a non-default journal, so
+// there is exactly one path this can legitimately be.
+var kernelArmRestampJournalPath = DefaultKernelJournalPath
 
 // repointSymlink atomically points linkPath at a RELATIVE target (basename
 // within the same dir, e.g. current -> <ver>). Atomic via temp+rename.
