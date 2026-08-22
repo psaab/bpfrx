@@ -57,10 +57,39 @@ MANIFEST="$OUT/xpf-$VER.SHA256SUMS"
 # baseline signed set so the positive publish cases below exercise the real
 # shape (validated:false is exercised as a negative in section 8i).
 SIDECAR="$OUT/xpf-$VER.manifest"
-printf 'version: %s\nbase_image_pinned: true\nvalidated: true\n' "$VER" > "$SIDECAR"
+# #6500: the signed record must also say what the image SHIPS — the manifest's
+# `guest_kernel` (the IMAGE's kernel, not the build host's bake_host_kernel)
+# and an xpf-<ver>.pkgs inventory sidecar covered by the same SHA256SUMS.
+# gate_provenance requires both, fail-closed, so the baseline signed set below
+# must carry them or every POSITIVE publish case would fail for the wrong
+# reason. The negatives are exercised in section 8j.
+GUEST_KERNEL="7.0.0-15-generic"
+# prov_sidecar <path> <validated> [guest_kernel; "-" omits the line]
+prov_sidecar() {
+    _gk=${3:-$GUEST_KERNEL}
+    printf 'version: %s\nbase_image_pinned: true\nvalidated: %s\n' "$VER" "$2" > "$1"
+    [ "$_gk" = "-" ] || printf 'guest_kernel: %s\n' "$_gk" >> "$1"
+}
+# make_pkgs <path> [package count] — an inventory in the real format. The
+# default count clears image_inventory.MIN_PACKAGES; a small count models the
+# HOLLOW record the gate must refuse.
+make_pkgs() {
+    _n=${2:-60}
+    {
+        echo "# xpf appliance image inventory"
+        echo "guest_kernel: ${3:-$GUEST_KERNEL}"
+        echo "packages:"
+        _i=0
+        while [ "$_i" -lt "$_n" ]; do echo "pkg$_i=1.0-$_i"; _i=$((_i + 1)); done
+    } > "$1"
+}
+PKGS="$OUT/xpf-$VER.pkgs"
+prov_sidecar "$SIDECAR" true
+make_pkgs "$PKGS"
 XPF_IMAGE_PUBKEY="$WORK/img.pub" \
   $PY "$DIST/sign.py" sign-manifest --manifest "$MANIFEST" \
-      --seckey "$WORK/img.sec" --comment "selftest" "$QCOW" "$META" "$SIDECAR" >/dev/null
+      --seckey "$WORK/img.sec" --comment "selftest" "$QCOW" "$META" "$SIDECAR" \
+      "$PKGS" >/dev/null
 [ -f "$MANIFEST.minisig" ] && ok "manifest signed" || bad "manifest not signed"
 
 verify() {  # verify <file> with pubkey; prints OK/err, returns rc
@@ -207,7 +236,7 @@ fi
 
 # Orphan image artifact NOT covered by any manifest (Codex-r2-1).
 PGO="$WORK/pgorphan"; mkdir -p "$PGO"
-cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$PGO/"
+cp "$QCOW" "$META" "$SIDECAR" "$PKGS" "$MANIFEST" "$MANIFEST.minisig" "$PGO/"
 head -c 64 /dev/urandom > "$PGO/xpf-9.9.9.qcow2"   # orphan, no manifest covers it
 if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
      --dist "$PGO" --channel stable --no-apt >/dev/null 2>&1; then
@@ -218,7 +247,7 @@ fi
 
 # Symlink under the image publish root (Codex-r4).
 PGS="$WORK/pgsym"; mkdir -p "$PGS"
-cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$PGS/"
+cp "$QCOW" "$META" "$SIDECAR" "$PKGS" "$MANIFEST" "$MANIFEST.minisig" "$PGS/"
 ln -s /etc/passwd "$PGS/sneaky.qcow2"
 if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
      --dist "$PGS" --channel stable --no-apt >/dev/null 2>&1; then
@@ -412,7 +441,7 @@ rm -f "$WORK/pwned"
 # ── 8. publish gate: install.sh mandatory + stamped + signed ────────────────
 info "8. publish gate — install.sh mandatory, stamped, signed"
 GD="$WORK/gate"; mkdir -p "$GD"
-cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$GD/"
+cp "$QCOW" "$META" "$SIDECAR" "$PKGS" "$MANIFEST" "$MANIFEST.minisig" "$GD/"
 XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
     --channel stable --version "$VER" --dist "$GD" >/dev/null 2>&1
 # 8a. install.sh MISSING -> refuse (mandatory).
@@ -473,7 +502,7 @@ fi
 # ── 8g. HB165 H-5: default-deny sweep refuses a stray non-image file ────────
 info "8g. publish default-deny sweep refuses a stray file under dist/ (HB165 H-5)"
 GOOD="$WORK/hb165"; mkdir -p "$GOOD"
-cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$GOOD/"
+cp "$QCOW" "$META" "$SIDECAR" "$PKGS" "$MANIFEST" "$MANIFEST.minisig" "$GOOD/"
 XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
     --channel stable --version "$VER" --dist "$GOOD" >/dev/null 2>&1
 $PY "$DIST/publish.py" stamp-installer --out "$GOOD/install.sh" \
@@ -530,12 +559,16 @@ PROV="$WORK/prov"; mkdir -p "$PROV"
 cp "$QCOW" "$META" "$PROV/"
 # A signed image set that is byte-shape-identical to a release but whose signed
 # provenance sidecar says validated:false (a --skip-validate bake).
-printf 'version: %s\nbase_image_pinned: true\nvalidated: false\n' "$VER" \
-    > "$PROV/xpf-$VER.manifest"
+# It carries a COMPLETE #6500 inventory on purpose: this leg must be refused
+# for validated:false, not for a missing inventory. A negative that can be
+# satisfied by the wrong cause stops testing what it names.
+prov_sidecar "$PROV/xpf-$VER.manifest" false
+make_pkgs "$PROV/xpf-$VER.pkgs"
 XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/sign.py" sign-manifest \
     --manifest "$PROV/xpf-$VER.SHA256SUMS" --seckey "$WORK/img.sec" \
     --comment "selftest-skipvalidate" "$PROV/xpf-$VER.qcow2" \
-    "$PROV/xpf-$VER.incus-metadata.tar.gz" "$PROV/xpf-$VER.manifest" >/dev/null
+    "$PROV/xpf-$VER.incus-metadata.tar.gz" "$PROV/xpf-$VER.manifest" \
+    "$PROV/xpf-$VER.pkgs" >/dev/null
 XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
     --channel stable --version "$VER" --dist "$PROV" >/dev/null 2>&1
 $PY "$DIST/publish.py" stamp-installer --out "$PROV/install.sh" \
@@ -550,17 +583,102 @@ else
     ok "publish refuses a validated:false (--skip-validate) image (#4904 A)"
 fi
 # Positive control: flip validated -> true, re-sign the same set -> PASSES.
-printf 'version: %s\nbase_image_pinned: true\nvalidated: true\n' "$VER" \
-    > "$PROV/xpf-$VER.manifest"
+prov_sidecar "$PROV/xpf-$VER.manifest" true
 XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/sign.py" sign-manifest \
     --manifest "$PROV/xpf-$VER.SHA256SUMS" --seckey "$WORK/img.sec" \
     --comment "selftest-validated" "$PROV/xpf-$VER.qcow2" \
-    "$PROV/xpf-$VER.incus-metadata.tar.gz" "$PROV/xpf-$VER.manifest" >/dev/null
+    "$PROV/xpf-$VER.incus-metadata.tar.gz" "$PROV/xpf-$VER.manifest" \
+    "$PROV/xpf-$VER.pkgs" >/dev/null
 if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
      --dist "$PROV" --channel stable --no-apt >/dev/null 2>&1; then
     ok "publish passes the same set once validated:true (#4904 A control)"
 else
     bad "publish MUST pass a validated:true image but FAILED (#4904 A control)"
+fi
+
+# ── 8j. #6500: the signed record must say what the image SHIPS ──────────────
+# Four refusals, each with the OTHER three inputs intact, so a leg cannot be
+# satisfied by the wrong cause; then one positive control proving the whole
+# set publishes once every input is right.
+info "8j. publish inventory gate — guest_kernel + xpf-<ver>.pkgs are required (#6500)"
+INV="$WORK/inv"; mkdir -p "$INV"
+# resign_inv <extra-artifacts...> — rebuild + sign INV's manifest.
+resign_inv() {
+    XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/sign.py" sign-manifest \
+        --manifest "$INV/xpf-$VER.SHA256SUMS" --seckey "$WORK/img.sec" \
+        --comment "selftest-inventory" "$INV/xpf-$VER.qcow2" \
+        "$INV/xpf-$VER.incus-metadata.tar.gz" "$INV/xpf-$VER.manifest" \
+        "$@" >/dev/null
+}
+inv_publish() {
+    XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+        --dist "$INV" --channel stable --no-apt >/dev/null 2>&1
+}
+inv_reset() {
+    rm -rf "$INV"; mkdir -p "$INV"
+    cp "$QCOW" "$META" "$INV/"
+    prov_sidecar "$INV/xpf-$VER.manifest" true
+    make_pkgs "$INV/xpf-$VER.pkgs"
+    # make-latest requires the version's SHA256SUMS to exist, so sign the
+    # complete set first; each case below re-signs after mutating one input.
+    resign_inv "$INV/xpf-$VER.pkgs"
+    XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
+        --channel stable --version "$VER" --dist "$INV" >/dev/null 2>&1
+    $PY "$DIST/publish.py" stamp-installer --out "$INV/install.sh" \
+        --archive-key "$AKEY" --apt-base-url "https://dl.selftest.invalid/apt" \
+        --channel stable >/dev/null 2>&1
+    minisign -S -W -s "$WORK/img.sec" -m "$INV/install.sh" \
+        -x "$INV/install.sh.minisig" >/dev/null 2>&1
+}
+
+# 8j-1: manifest with NO guest_kernel (an older bake) — inventory sidecar present.
+inv_reset
+prov_sidecar "$INV/xpf-$VER.manifest" true -
+resign_inv "$INV/xpf-$VER.pkgs"
+if inv_publish; then
+    bad "publish MUST refuse a manifest with no guest_kernel but PASSED (#6500)"
+else
+    ok "publish refuses a manifest with no guest_kernel (#6500)"
+fi
+
+# 8j-2: guest_kernel present, inventory sidecar ABSENT.
+inv_reset
+rm -f "$INV/xpf-$VER.pkgs"
+resign_inv
+if inv_publish; then
+    bad "publish MUST refuse a set with no xpf-<ver>.pkgs but PASSED (#6500)"
+else
+    ok "publish refuses a set with no inventory sidecar (#6500)"
+fi
+
+# 8j-3: sidecar present and signed but HOLLOW (below the package floor). A
+# present-but-empty record satisfies a presence check and answers nothing.
+inv_reset
+make_pkgs "$INV/xpf-$VER.pkgs" 3
+resign_inv "$INV/xpf-$VER.pkgs"
+if inv_publish; then
+    bad "publish MUST refuse a HOLLOW inventory but PASSED (#6500)"
+else
+    ok "publish refuses a hollow inventory (below the package floor) (#6500)"
+fi
+
+# 8j-4: the two authenticated records DISAGREE about the kernel.
+inv_reset
+make_pkgs "$INV/xpf-$VER.pkgs" 60 "9.9.9-other"
+resign_inv "$INV/xpf-$VER.pkgs"
+if inv_publish; then
+    bad "publish MUST refuse a manifest/inventory kernel mismatch but PASSED (#6500)"
+else
+    ok "publish refuses a manifest/inventory guest_kernel mismatch (#6500)"
+fi
+
+# 8j-5: positive control — every input right, the same tree publishes.
+inv_reset
+resign_inv "$INV/xpf-$VER.pkgs"
+if inv_publish; then
+    ok "publish passes a complete inventory set (#6500 control)"
+else
+    bad "publish MUST pass a complete inventory set but FAILED (#6500 control)"
 fi
 
 # ── 9. install.sh H-16: validate-before-mutate + cleanup-on-failure ─────────

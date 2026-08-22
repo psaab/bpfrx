@@ -349,6 +349,183 @@ def _efibootmgr_slot_verdict(out, slots=_AB_SLOTS):
                   "loader and present in BootOrder")
 
 
+# The three files the bake stages into EACH slot dir, and the selector's own
+# variable names. Kept in the same place as the slot list so the ESP-staging
+# assertion and the registration assertion are read together.
+#
+# Both halves matter and fail differently:
+#   - shimx64.efi/grubx64.efi ABSENT -> xpf-uefi-slots' register_slot() sees no
+#     shim, returns 1, and the slot is NEVER registered. That failure surfaces
+#     downstream as "slot not registered", so asserting the staging separately
+#     is what tells an operator whether the BAKE or the in-guest ONESHOT broke.
+#   - xpf.selector absent or naming the WRONG kernel -> the slot registers fine
+#     and boots, but GRUB's 09_xpf branch sources a selector that points at a
+#     vmlinuz/initrd pair that is not on this image, so THAT slot is a dead
+#     boot entry. Nothing else in the gate would notice: the entry exists, the
+#     oneshot exits 0, and the failure only appears when the firmware actually
+#     falls through to that slot — i.e. during a rollback, the one moment the
+#     channel exists for.
+_AB_SLOT_FILES = ("shimx64.efi", "grubx64.efi", "xpf.selector")
+_SELECTOR_VARS = {"xpf_slot_kernel": "vmlinuz-", "xpf_slot_initrd": "initrd.img-"}
+
+# `set xpf_slot_kernel="vmlinuz-7.0.0-15-generic"` — the GRUB-script form
+# bake.py seeds and scripts/image/grub.d/09_xpf sources. Quotes optional so a
+# hand-edited selector without them still parses (and is then judged on its
+# VALUE, not rejected on its punctuation).
+_SELECTOR_SET_RE = re.compile(
+    r'^\s*set\s+(?P<var>xpf_slot_\w+)\s*=\s*"?(?P<val>[^"\s]*)"?\s*$')
+
+
+# In-guest probe feeding _ab_slot_esp_verdict. Emits a flat line protocol
+# rather than raw `ls`/`cat` output so the verdict is a pure function over
+# something stable: no locale, no ls format, no ordering assumptions. Every
+# required file is reported either way (present AND MISSING lines), so a probe
+# that silently produced nothing cannot be mistaken for a clean run.
+_AB_SLOT_ESP_PROBE = (
+    "for slot in " + " ".join(_AB_SLOTS) + "; do "
+    "d=/boot/efi/EFI/$slot; "
+    "for f in " + " ".join(_AB_SLOT_FILES) + "; do "
+    'if [ -f "$d/$f" ]; then echo "FILE $slot $f present"; '
+    'else echo "FILE $slot $f MISSING"; fi; done; '
+    'if [ -f "$d/xpf.selector" ]; then '
+    'while IFS= read -r l; do echo "SEL $slot $l"; done < "$d/xpf.selector"; '
+    "fi; done"
+)
+
+
+def _ab_slot_esp_verdict(out, kver, slots=_AB_SLOTS):
+    """Pure verdict over the in-guest ESP probe: is each #1930 A/B slot dir
+    fully staged, and does each slot's selector name the RUNNING kernel?
+    Returns (ok, reason).
+
+    `out` is the probe's line protocol (see Harness._probe_ab_slot_esp):
+        FILE <slot> <name> present|MISSING
+        SEL  <slot> <verbatim selector line>
+
+    A slot whose selector file is missing is reported ONCE (as a missing file);
+    its variable values are not additionally reported, so one defect produces
+    one diagnosis rather than three.
+
+    Naming the RUNNING kernel is the right assertion on a FACTORY boot, which
+    is the only place this is called (scenario A): the bake seeds both
+    selectors at `ls /lib/modules | sort -V | tail -1` and hard-asserts exactly
+    one kernel remains, and scenario A re-asserts that count, so the running
+    kernel IS the seeded one. After a promotion the two selectors legitimately
+    differ — asserting equality there would be wrong, which is why this is a
+    scenario-A assertion and not a general one.
+    """
+    present = {}   # slot -> set(filenames found)
+    missing = {}   # slot -> [filenames reported MISSING]
+    sel = {}       # slot -> {var: value}
+    for line in (out or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 4 and parts[0] == "FILE":
+            _, slot, fname, state = parts[:4]
+            if state == "present":
+                present.setdefault(slot, set()).add(fname)
+            else:
+                missing.setdefault(slot, []).append(fname)
+        elif len(parts) >= 3 and parts[0] == "SEL":
+            m = _SELECTOR_SET_RE.match(line.split(None, 2)[2])
+            if m:
+                sel.setdefault(parts[1], {})[m.group("var")] = m.group("val")
+
+    problems = []
+    for slot in slots:
+        got = present.get(slot, set())
+        absent = [f for f in _AB_SLOT_FILES if f not in got]
+        if absent:
+            problems.append(
+                f"{slot}: /boot/efi/EFI/{slot} is missing {', '.join(absent)} "
+                "— the bake did not stage this slot, so xpf-uefi-slots can "
+                "never register it (LANE-1 unavailable on this image)")
+            continue
+        vals = sel.get(slot, {})
+        for var, prefix in sorted(_SELECTOR_VARS.items()):
+            want = prefix + kver
+            got_val = vals.get(var)
+            if got_val is None:
+                problems.append(
+                    f"{slot}: xpf.selector does not set {var} — GRUB's 09_xpf "
+                    "branch would source a selector that names no kernel")
+            elif got_val != want:
+                problems.append(
+                    f"{slot}: xpf.selector sets {var}={got_val!r}, not "
+                    f"{want!r} (the running kernel) — this slot would "
+                    "chainload a kernel this image does not ship")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, (f"both A/B slot dirs fully staged ({', '.join(_AB_SLOT_FILES)}) "
+                  f"with selectors seeded at the running kernel {kver}")
+
+
+# ── #1930 INC-0 kernel hold (#6498) ───────────────────────────────────
+# The bake HOLDS the kernel so an unattended apt run cannot move the running
+# kernel out from under the verifier-gated shim .o (#1864): a kernel the .o was
+# never verified against can REJECT it at boot, i.e. no dataplane. bake.py
+# verifies the hold at bake time; nothing re-read it on the booted image, so a
+# hold that did not survive virt-sysprep/export/first boot shipped green.
+#
+# ENUMERATION, and why it is NOT the literal `linux-*`. #6498's acceptance
+# criterion says "every installed linux-* package appears in apt-mark showhold".
+# Taken literally that assertion REDS every valid image: `linux-base` is a hard
+# dependency of linux-image-*-generic, and `linux-libc-dev` /
+# `linux-sysctl-defaults` are installed too — none are kernel packages and
+# bake.py deliberately does not hold them. The property the criterion reaches
+# for is "the kernel cannot move", so the gate enumerates exactly the set
+# bake.py holds. The globs are MIRRORED from bake.py's hold fragment on
+# purpose and a drift canary asserts the two agree
+# (test_validate_ab_substrate_6498.py): a gate that enumerated a different set
+# than the bake holds would either red on a good image or certify an
+# unprotected one.
+_KERNEL_PKG_GLOBS = ("linux-image-*", "linux-headers-*", "linux-modules-*",
+                     "linux-generic")
+
+
+# The guest-side enumeration. Mirrors bake.py's hold fragment exactly: the
+# same globs, the same ${db:Status-Status} filter (dpkg-query -W matches every
+# package dpkg KNOWS OF, including purged and never-installed names that
+# `apt-mark hold` cannot select — the #1926 abort).
+_INSTALLED_KERNEL_PKGS_PROBE = (
+    "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' "
+    + " ".join(f"'{g}'" for g in _KERNEL_PKG_GLOBS)
+    + " 2>/dev/null | awk '$1==\"installed\"{print $2}' | sort -u"
+)
+
+
+def _kernel_hold_verdict(installed, held):
+    """Pure verdict over the guest's kernel-package enumeration and
+    `apt-mark showhold`: is every installed kernel package held?
+    Returns (ok, reason).
+
+    An EMPTY enumeration is a FAIL, not a vacuous pass. That is the whole
+    failure mode this guards: bake.py's own hold fragment aborted every bake
+    twice during #1926 because the enumeration collapsed to nothing (an
+    unescaped `${Package}`, then dpkg-query returning never-installed names),
+    and an "all zero of them are held" pass here would argue against anyone
+    ever re-examining it.
+    """
+    inst = sorted({p for p in (installed or "").split() if p})
+    hold = {p for p in (held or "").split() if p}
+    if not inst:
+        return False, (
+            "could not enumerate any INSTALLED kernel package in the guest "
+            f"({', '.join(_KERNEL_PKG_GLOBS)}) — the image ships a kernel, so "
+            "an empty enumeration is a broken probe (or a broken image), not "
+            "an image with nothing to hold. Refusing to pass vacuously")
+    unheld = [p for p in inst if p not in hold]
+    if unheld:
+        return False, (
+            f"{len(unheld)} of {len(inst)} installed kernel packages are NOT "
+            f"in `apt-mark showhold`: {', '.join(unheld)} — an unattended apt "
+            "run can move the kernel out from under the verifier-gated shim "
+            ".o (#1864/#1930 INC-0), which can leave the appliance with no "
+            "dataplane after a background upgrade")
+    return True, (f"all {len(inst)} installed kernel packages held "
+                  f"({', '.join(inst)})")
+
+
 def _oneshot_clean_verdict(name, exec_main_status, active_state, result):
     """Pure verdict over `systemctl show` fields for a first-boot oneshot:
     did it RUN and exit 0? Returns (ok, reason).
@@ -369,6 +546,73 @@ def _oneshot_clean_verdict(name, exec_main_status, active_state, result):
     if exec_main_status not in ("0", 0):
         return False, f"{name} exited {exec_main_status!r}, not 0"
     return True, f"{name} ran clean (ExecMainStatus=0)"
+
+
+# ── day-0 config permissions (#6503) ──────────────────────────────────
+# The day-0 loader installs /etc/xpf/xpf.conf mode 0600 because it "may carry
+# credential material (root-authentication encrypted-password, IKE PSKs)"
+# (scripts/image/xpf-day0-config). Scenario B asserted the file EXISTS and is
+# non-empty (`test -s`) and nothing about the mode — docs/image-validation.md
+# said so in as many words — so a regression to 0644 would ship
+# world-readable IKE PSKs and password hashes in a signed image and pass the
+# Tier-1 gate.
+#
+# The probe reads three fields from ONE `stat`, because a mode check alone has
+# a hole: `stat` follows a symlink only with -L, so without it a symlinked
+# xpf.conf reports the LINK's 0777 — but a naive check that ran `stat -L`
+# would report the TARGET's mode while the file an attacker controls is the
+# link. A credential file must be a regular file, owned by root, mode exactly
+# 0600.
+_DAY0_CONF = "/etc/xpf/xpf.conf"
+_DAY0_CONF_STAT = f"stat -c '%a %U:%G %F' {_DAY0_CONF} 2>/dev/null"
+
+
+def _conf_mode_verdict(stat_out, want_mode=0o600, want_owner="root:root"):
+    """Pure verdict over `stat -c '%a %U:%G %F'` for the installed day-0
+    config: is it a root-owned regular file with exactly mode 0600?
+    Returns (ok, reason).
+
+    The mode is compared as an OCTAL VALUE, not as a string. This is
+    ROBUSTNESS, not a caught bug: GNU `stat -c %a` emits "600" unpadded, so a
+    string compare against "600" rejects "4600" (a setuid bit) just as an int
+    compare does. What the value compare buys is independence from the
+    RENDERING — a zero-padded "0600" from a non-GNU stat is the same mode and
+    must not be a false red, while every extra bit is still rejected because
+    0o4600 != 0o600. Said plainly because the reverse claim (that a string
+    compare would let 4600 through) is FALSE and was in an earlier draft of
+    this comment; the mutation matrix caught it.
+
+    Unreadable / absent output is a FAIL, not a pass. A gate that cannot
+    observe the property it exists to assert has not asserted it.
+    """
+    fields = (stat_out or "").strip().split(None, 2)
+    if len(fields) < 3:
+        return False, (
+            f"could not stat {_DAY0_CONF} in the guest (got {stat_out!r}) — "
+            "the day-0 config is missing, or the probe failed; either way the "
+            "permission is unobserved, which is not the same as satisfied")
+    mode_s, owner, ftype = fields
+    try:
+        mode = int(mode_s, 8)
+    except ValueError:
+        return False, f"{_DAY0_CONF}: unparseable mode {mode_s!r}"
+
+    problems = []
+    if ftype != "regular file":
+        problems.append(
+            f"is a {ftype!r}, not a regular file — a symlinked config puts the "
+            "bytes xpfd reads outside the mode this gate checks")
+    if mode != want_mode:
+        problems.append(
+            f"has mode {mode_s} (0o{mode:o}), not {want_mode:04o} — a day-0 "
+            "config may carry root-authentication encrypted-password and IKE "
+            "PSKs, so any extra bit makes them readable to every local user "
+            "on the appliance")
+    if owner != want_owner:
+        problems.append(f"is owned by {owner}, not {want_owner}")
+    if problems:
+        return False, f"{_DAY0_CONF} " + "; ".join(problems)
+    return True, f"{_DAY0_CONF} is a root:root regular file, mode {mode_s}"
 
 
 def _find_first(candidates):
@@ -631,6 +875,7 @@ class Harness:
             fail("more than one kernel in /lib/modules — stale cloudimg kernel not purged")
         if not guest_sh(a, 'grep -qw init_on_alloc=0 /proc/cmdline'):
             fail("init_on_alloc=0 missing from the booted kernel cmdline")
+        self.assert_kernel_hold(a)
         self.assert_secure_boot(a)
         info("in-guest verify-dataplane (the bake gate, image kernel)...")
         if guest(a, "nice", "-n", "19", "/usr/local/sbin/xpfd", "verify-dataplane",
@@ -675,6 +920,58 @@ class Harness:
             fail("day-0 loader did not log the no-medium fallback")
         info("Scenario A PASS")
         self.drop(a)
+
+    def assert_kernel_hold(self, inst):
+        """Assert the #1930 INC-0 kernel hold survived onto the BOOTED image
+        (#6498) — every installed kernel package is in `apt-mark showhold`.
+
+        bake.py verifies the hold at bake time (per-package, not a count), but
+        that check runs inside virt-customize, before virt-sysprep, the
+        sparsify/export, and the first boot. Nothing re-read it afterwards, so
+        a hold that did not survive any of those steps shipped in a signed,
+        `validated: true` image — and the consequence is not cosmetic: an
+        unattended apt run that moves the kernel can leave the appliance
+        booting a kernel the verifier-gated shim .o was never verified
+        against, i.e. with no dataplane.
+
+        The unattended-upgrades blacklist (99-xpf-kernel-hold) is the second
+        half of the same protection, but it is a `--write` of a static file
+        with no in-guest behaviour to observe short of running an actual
+        unattended-upgrade — so this asserts the half that has an observable.
+        """
+        inst_pkgs = guest(inst, "sh", "-c", _INSTALLED_KERNEL_PKGS_PROBE,
+                          check=False, capture=True).stdout
+        held = guest(inst, "sh", "-c", "apt-mark showhold 2>/dev/null",
+                     check=False, capture=True).stdout
+        ok, reason = _kernel_hold_verdict(inst_pkgs, held)
+        if not ok:
+            fail("#1930 INC-0 kernel hold assertion FAILED: " + reason)
+        info(f"kernel hold: {reason}")
+
+    def assert_day0_conf_perms(self, inst):
+        """Assert the installed day-0 config's credential posture (#6503).
+
+        Called from every scenario where the loader actually INSTALLS a config
+        — B (valid drive), C's retry leg (fix + reboot applies), and E
+        (node-id drive) — because they all reach the same `install -o root -g
+        root -m 0600` and a regression there would ship in a signed image from
+        any of them.
+
+        Deliberately NOT asserted: /etc/xpf's own directory mode. The loader
+        sets it best-effort (`chmod 0750 ... || true`) and the directory comes
+        from the .deb on a real appliance, so it is not the loader's contract
+        to pin here.
+        """
+        out = guest(inst, "sh", "-c", _DAY0_CONF_STAT,
+                    check=False, capture=True).stdout
+        ok, reason = _conf_mode_verdict(out)
+        if not ok:
+            fail("day-0 config permission assertion FAILED: " + reason +
+                 "\n  The loader installs it 0600 precisely because it may "
+                 "carry credential material (scripts/image/xpf-day0-config); "
+                 "the Tier-1 gate has to pin that, exactly as scenario A pins "
+                 "the sshd posture.")
+        info(f"day-0 config perms: {reason}")
 
     def assert_secure_boot(self, inst):
         """Assert the guest actually booted under UEFI Secure Boot (#6497).
@@ -760,6 +1057,20 @@ class Harness:
                         "--no-pager", check=False, capture=True).stdout
             fail(f"#1930 A/B slot registration: {reason}\n{jrn[-800:]}")
 
+        # The ESP dirs are the PRECONDITION for registration: register_slot()
+        # returns 1 without ever calling efibootmgr when a slot has no shim. So
+        # assert the staging BEFORE the NVRAM state — otherwise an unstaged
+        # slot is diagnosed as "the oneshot did not register it", pointing at
+        # the wrong half of the channel.
+        kver = guest(inst, "uname", "-r", capture=True).stdout.strip()
+        esp = guest(inst, "sh", "-c", _AB_SLOT_ESP_PROBE,
+                    check=False, capture=True).stdout
+        ok, reason = _ab_slot_esp_verdict(esp, kver)
+        if not ok:
+            fail("#1930 A/B slot ESP staging FAILED in-guest: " + reason +
+                 "\n--- probe ---\n" + esp)
+        info(f"  ESP OK: {reason}")
+
         got = guest(inst, "efibootmgr", check=False, capture=True)
         if got.returncode != 0:
             fail("efibootmgr failed in the guest "
@@ -808,6 +1119,7 @@ class Harness:
             fail("day-0 stamp missing")
         if guest(b, "test", "-s", "/etc/xpf/xpf.conf", check=False).returncode != 0:
             fail("/etc/xpf/xpf.conf missing")
+        self.assert_day0_conf_perms(b)
         if not guest_sh(b,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "day-0 config installed"'):
             fail("day-0 loader did not log the install")
@@ -884,6 +1196,7 @@ class Harness:
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q '
                         '"day-0 config installed"'):
             fail("retry: day-0 loader did not install the fixed config on reboot")
+        self.assert_day0_conf_perms(c)
         self._wait(c,
                    lambda: guest_sh(c, '[ "$(hostname)" = xpf-day0-c-fixed ]'),
                    20, 3, "retry: fixed hostname xpf-day0-c-fixed not applied")
@@ -1031,6 +1344,7 @@ class Harness:
         if nid != "1":
             fail(f"/etc/xpf/node-id is '{nid}', expected '1' — node-id not "
                  "persisted from the day-0 drive")
+        self.assert_day0_conf_perms(e)
         # Cluster-mode naming: node 1 uses FPC 7. em0 is assigned only in
         # cluster mode (position 2); ge-7/0/0 proves the node-1 FPC branch.
         if not guest_sh(e, 'ip link show em0 >/dev/null 2>&1'):

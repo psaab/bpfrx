@@ -1,3 +1,145 @@
+## 2026-08-22 — #6515 host-inbound per-interface override REPLACES the zone stanza
+
+- **Timestamp**: 2026-08-22
+- **Action**: Flipped the per-interface host-inbound override from UNION
+  (additive) to REPLACE, matching Junos ("Interface configuration
+  overrides that of the zone"), across all four effective-set
+  resolvers, and shipped a commit-time migration advisory in the same
+  commit. The advisory names every (zone, interface, lost-token) triple
+  and states that established sessions to a removed service are FLUSHED
+  at commit — the #5566 reconcile rebuilds its admit set from the same
+  views and deletes established conntrack entries — rather than merely
+  refused for new connections, because "I am already connected" is the
+  wrong inference here. WARN-only, never a reject: the config is valid
+  Junos and the new behaviour IS the Junos behaviour. Lifeline
+  interfaces are skipped (excluded from host-inbound scoping, so an
+  advisory there would be a false alarm). Measured in-repo blast
+  radius: zero configs author an interface-level override.
+- **File(s)**: pkg/config/compiler_validate_warn_host_inbound.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/host_inbound_view.go,
+  pkg/dataplane/userspace/zones_host_inbound.go, cmd/cli, plus the
+  eight fixtures that encoded the union semantics
+
+## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The Tier-1 gate asserted the day-0 config was installed
+  (`test -s`) but never its MODE, so a credential-permission regression
+  shipped green. Added `_conf_mode_verdict` pinning the installed file
+  as root-owned, a REGULAR FILE, mode exactly 0600, asserted from all
+  three scenarios that install a config (B, C's retry leg, E) since
+  they share one `install` call. The probe deliberately omits `stat -L`:
+  a symlink's own mode is always 0777 on Linux, so an unfollowed stat
+  reports `777 symbolic link` and fails, while following the link would
+  report the TARGET's `600 regular file` and PASS for a path an attacker
+  controls. File type is part of the verdict and a test asserts the
+  probe carries no `-L`. Also corrected image-validation.md:108, whose
+  sentence ("asserts it exists and is non-empty, not the mode") was true
+  and became false with this change.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_day0_perms_6503.py,
+  docs/image-validation.md
+
+## 2026-08-22 — #6502 day-0 loader probe order (labeled-first contract)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The day-0 config loader concatenated its labeled-volume
+  and iso9660 probe passes and piped them through `sort -u`, which
+  ALPHABETIZES — so with two valid-but-different media attached the ISO
+  on /dev/sda beat the labeled volume on /dev/sdb, the exact opposite
+  of the labeled-first contract the surrounding comment states.
+  Replaced with `awk 'NF && !seen[$0]++'` over the concatenated stream,
+  which preserves first-appearance order AND dedups ACROSS passes — a
+  medium that is both labeled and iso9660 appears once, in its LABELED
+  position. The self-correcting cases are preserved: a REJECTED labeled
+  volume and an EMPTY labeled volume both still fall through to the
+  ISO, so the fix does not become "labeled or nothing".
+- **File(s)**: scripts/image/xpf-day0-config,
+  scripts/image/test_day0_probe_order_6502.py
+
+## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
+
+- **Timestamp**: 2026-08-22
+- **Action**: Corrected every remaining claim that the bake discovers the
+  LATEST Ubuntu base, which contradicts the #1943/#4904 reviewed-pin
+  policy. The issue named three sites in install-images.md; a
+  wrap-insensitive, extension-agnostic sweep found a FOURTH at
+  Makefile:287-288, hidden because the claim wrapped across two comment
+  lines AND the file has no extension. Added a guard that bans the
+  complete ASSERTING clauses rather than keywords — a keyword ban would
+  red on the four correct "not auto-latest" negations while the real
+  false claim walked past — plus two matcher self-tests asserting that
+  the normalizer sees a wrapped claim and that a line-oriented search
+  misses the same claim, so the reason the guard normalizes is bound
+  rather than assumed. The TRUE half binds the doc to bake.py's actual
+  PINNED_BASE_RELEASE value, its constants and GPG fingerprint, and
+  refuses an override bake.py never reads.
+- **File(s)**: docs/install-images.md, Makefile,
+  scripts/test_base_pin_docs_6501.py
+
+## 2026-08-22 — #6500 signed image inventory (guest kernel + package set)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The bake now writes `/etc/xpf/image-inventory` inside the
+  image as its last virt-customize step and reads it back OFFLINE with
+  `virt-cat` (no boot), emitting `dist/xpf-<ver>.pkgs` under the signed
+  SHA256SUMS. `build_manifest_text` takes `guest_kernel` as a REQUIRED
+  keyword so a caller cannot silently omit the field the publish gate
+  needs, and `gate_provenance` gains a third fail-closed leg refusing a
+  missing guest_kernel, an absent or uncovered `.pkgs`, a hollow
+  inventory, or a kernel disagreement between the two authenticated
+  records. The record format is single-sourced in
+  `scripts/dist/image_inventory.py` — bake writes it, publish reads it,
+  and a divergence there is always a bug, so it is one definition
+  rather than two bound by a canary. Three pre-existing fixtures set
+  the OLD gate input and were carried forward rather than left to pass
+  vacuously, and the provenance negatives now assert WHICH check fired
+  instead of only that SystemExit was raised.
+- **File(s)**: scripts/image/bake.py, scripts/dist/publish.py,
+  scripts/dist/image_inventory.py, scripts/dist/selftest.sh,
+  scripts/dist/test_image_inventory_6500.py,
+  scripts/dist/test_publish_provenance.py,
+  scripts/image/test_bake_base_pin.py, docs/install-images.md,
+  docs/distribution.md
+
+## 2026-08-22 — #6499 boot-firmware self-tests + lint-list drift guard
+
+- **Timestamp**: 2026-08-22
+- **Action**: Added 17 hermetic functional tests driving the real
+  `xpf-uefi-slots` under `/bin/sh` with a mock efibootmgr that models
+  NVRAM as state files, covering the four destructive classes
+  (wrong-loader-path deletion, duplicate dedup, promoted-slot BootOrder
+  preservation, empty-BootOrder no-write). Added a coverage guard over
+  `SH_SCRIPTS` catching drift in both directions — a shipped
+  `scripts/image/xpf-*` missing from the lint list, and a listed path
+  that no longer exists (which `:103`'s `|| continue` would drop
+  silently). Two of the issue's three acceptance criteria were already
+  satisfied at master (`xpf-kernel-promote` is in SH_SCRIPTS as of
+  de74cc2db, and its rc contract is covered by
+  test_kernel_promote_explicit_path.py); confirmed rather than
+  re-implemented. Tests are Python so the `run-selftests.sh:139` glob
+  discovers them — a shell self-test would not be run (#7296).
+- **File(s)**: scripts/image/xpf-uefi-slots,
+  scripts/image/test_uefi_slots_6499.py,
+  scripts/test_selftest_lint_coverage_6499.py,
+  docs/install-images.md
+
+## 2026-08-22 — #6498 Tier-1 A/B substrate + kernel-hold assertions
+
+- **Timestamp**: 2026-08-22
+- **Action**: Added two pure verdict helpers to the Tier-1 image gate —
+  `_ab_slot_esp_verdict` (both slot ESP dirs staged; each `xpf.selector`
+  names the running kernel) and `_kernel_hold_verdict` (every kernel
+  package the bake holds appears in `apt-mark showhold`), wired into
+  scenario A with the ESP check ordered BEFORE the NVRAM check.
+  AC4 as written ("every installed `linux-*` package is held") is
+  unreachable — `linux-base` is a hard dependency of
+  `linux-image-*-generic` — so the gate asserts the bake's own kernel
+  enumeration plus a drift canary binding the two lists, and a
+  non-vacuity guard so an empty enumeration cannot pass trivially.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_ab_substrate_6498.py,
+  docs/image-validation.md
 ## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
 
 - **Timestamp**: 2026-08-22
@@ -100527,6 +100669,34 @@ prose edit above them added. No diff falls in the new test body.
   pkg/configstore/confirm_recovery_uncompilable_target_6538_test.go,
   pkg/daemon/daemon_apply_commit.go, pkg/configstore/README.md,
   pkg/daemon/README.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6522 — a locally-born SNAT/NAT64 allocation recorded NO holder
+  bit while every SIBLING worker's replica of that session recorded one, so
+  the #6211-F2 holder mask named every worker EXCEPT the one forwarding.
+  `poll_descriptor` -> `replicate_session_upsert` fans a `WorkerLocalImport`
+  `UpsertSynced` to `peer_worker_commands` (built with
+  `.filter(|(id, _)| **id != worker_id)`), `is_peer_synced()` is TRUE for that
+  origin, so each sibling reserved and took a bit; the replicas see no traffic,
+  age out unrefreshed, and the LAST one to reap emptied the mask and freed a
+  `(pool_addr, port)` the owner was still forwarding through. A second path
+  (`materialize_shared_session_hit`) installs a replica without reserving at
+  all, and `reap_expired_sessions` releases for it unconditionally. Fix: every
+  `LiveAllocation` mint now records `NatHolder::Worker(worker_id)`, threaded
+  from `WorkerLaunchPlan::worker_id` through the packet-path funnels. Those
+  funnels take a `u32`, not a `NatHolder`, and `Nat64State::allocate_source` is
+  now `#[cfg(test)]`, so a packet-path site cannot express "untracked".
+  Four cells; two independent one-line mutations (PAT insert, address-only
+  insert) localise cleanly. Rust diff moves the helper binary, so a cluster
+  smoke is OWED.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat64.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/forwarding/nat.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat/tests_l4_match.rs,
+  userspace-dp/src/nat/tests_source.rs,
+  userspace-dp/src/nat/tests_newflow_lock.rs,
+  docs/session-sync-architecture.md, _Log.md
 
 ## 2026-08-21 — #7268 scope 1: retire compileNPTv6's eBPF nptv6_rules writes
 - **Timestamp**: 2026-08-21
@@ -100542,6 +100712,31 @@ prose edit above them added. No diff falls in the new test body.
   (deleted), pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
   pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go,
   pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/README.md
+- **Action**: #6528 — `PortAllocator::reserve_flow`'s stale-tuple eviction
+  applied an unconditional PAT-shaped teardown
+  (`free_translated_port(addr_index, translated.port, !deterministic)`) to an
+  incumbent of ANY allocation mode. For an ADDRESS-ONLY record that cleared a
+  bit it never owned — pool address 0 at the offset of the PRESERVED internal
+  source port, which is a live PAT flow's bit whenever a `port no-translation`
+  rule shares the allocator (`allocator_key()` omits `no_translation`) — and
+  recycled it, while leaking the `address_only_owners` token. For a PERSISTENT
+  record it freed a port the LEASE still claimed and never dropped
+  `active_flows`, so the lease was never idle and no GC path could reclaim it.
+  Fix: all three retiring paths now share `unlink_live_allocation_locked`, and
+  `release_flow` + the eviction share `complete_persistent_lease_locked`;
+  `rollback_flow` keeps its own lease arm (it undoes an activation). The
+  eviction takes RELEASE semantics, which is why `reserve_flow` and the synced
+  reserve chain now carry `now_ns`. Five property cells + a fixture guard + an
+  anti-over-reach cell pinning the one mode the old code got right. Verbatim
+  pre-fix restore reds four of five; two finer single-line mutations localise
+  the lease arm and the address-only port guard to one cell each. Rust diff
+  moves the helper binary, so a cluster smoke is OWED.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat64_tests.rs,
+  docs/session-sync-architecture.md, _Log.md
 
 ## 2026-08-21 — #7257: heartbeat start/stop lifecycle tenure
 - **Timestamp**: 2026-08-21
@@ -100600,3 +100795,41 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/host_inbound_baseunit0_5699_test.go,
   pkg/dataplane/userspace/host_inbound_view_grouping_3721_test.go,
   pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go
+## 2026-08-21 — #6520: cluster DHCP RG filter drops node-local members
+- **Timestamp**: 2026-08-21
+- **Action**: `filterDHCPConfigForMasterRGs` built its keep-set only from RETH
+  members of MASTER RGs, so every interface with no redundancy group (the `fxp0`
+  lifeline, any node-local data interface) was removed from every
+  `dhcp-local-server` group on BOTH nodes and a node-local-only group vanished.
+  Mastership now scopes only RG-scoped members; a member in no RG is node-local
+  and always kept. Both sets come from one walker, `rethInterfacesMatchingRG`.
+  Second half: a group the filter SHRANK still carries the removed member's
+  pools, so `dhcpserver.subnetInterface` cross-bound them onto the survivor;
+  the filter now records `DHCPServerGroup.MembersFiltered` (runtime-only,
+  `json:"-"`) and the renderer omits Kea's per-subnet interface selector for
+  such a group, falling back to address-based subnet selection.
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/config/types_system.go,
+  pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
+  pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
+  pkg/daemon/README.md
+
+## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
+- **Timestamp**: 2026-08-21
+- **Action**: `terminateRemovedConns` was fire-and-forget while
+  `promoteConnNames` advanced `prevConnNames` first, so a failed
+  `swanctl --terminate` lost the teardown debt permanently and `Apply` still
+  returned nil — a deleted/unrenderable VPN kept forwarding under its stale
+  child SA. The failed subset is now carried in `pendingTerminate`, unioned
+  into the next apply's removed set (filtered by the loaded names so a
+  re-added VPN is never torn down), and returned as an `Apply`/`Clear` error.
+  Debt discharges when the SA is no longer live, so it cannot latch.
+- **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
+  pkg/ipsec/terminate_debt_6542_test.go (new), pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6419 — evaluated and closed the "reuse the authority's config-gen
+    namespace" shortcut for the active/active reverse direction; recorded the
+    structural reason in code + docs and armed the RG0-primary config-sync
+    rejection pin (previously a vacuous green).
+  - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
+    docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go

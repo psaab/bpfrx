@@ -648,6 +648,7 @@ impl super::Coordinator {
             // #4088: this helper is exercised only with TCP/UDP tuples; ICMP
             // id==0 classification is covered by the nat/ unit tests.
             false,
+            crate::nat::NatHolder::Untracked,
             &mut counter,
         )
     }
