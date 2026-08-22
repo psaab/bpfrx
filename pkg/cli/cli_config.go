@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cliterm"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 )
@@ -102,6 +103,23 @@ func (c *CLI) handleInsert(parts []string) error {
 	return c.store.Insert(elemPath, refPath, isBefore)
 }
 
+// readLine reads one line of terminal input, honouring the readLineFn test
+// seam. Production leaves readLineFn nil and reads from the readline instance,
+// so this is the same call the console always made.
+//
+// The seam exists because `load ... terminal` is a security-relevant read loop
+// with no other observable: the difference between a committed paste and an
+// ABORTED one is invisible from outside the process, and the console's copy of
+// that loop applied Ctrl-C-truncated input as complete for two years after the
+// remote CLI's copy was fixed (#6548). Nothing could red, because nothing
+// could drive it.
+func (c *CLI) readLine() (string, error) {
+	if c.readLineFn != nil {
+		return c.readLineFn()
+	}
+	return c.rl.Readline()
+}
+
 func (c *CLI) handleLoad(args []string) error {
 	if len(args) < 2 {
 		fmt.Println("load:")
@@ -125,18 +143,27 @@ func (c *CLI) handleLoad(args []string) error {
 	var content string
 
 	if source == "terminal" {
-		// Read from terminal until a line containing only a single Ctrl-D marker
+		// Read until Ctrl-D (io.EOF) COMMITS the paste. Ctrl-C — or any other
+		// read error — ABORTS it and the partial input is discarded (#6548).
+		//
+		// This loop used to take the same `break` for EOF, readline's
+		// ErrInterrupt, and every read error, then join whatever lines had
+		// been collected and apply them, printing "load <mode> complete". An
+		// operator who aborted a paste was told it had succeeded and could
+		// commit a TRUNCATED configuration — and a truncated `security
+		// policies` stanza is a WIDENED one, because the deny terms that would
+		// have followed never arrive.
+		//
+		// #4883-D fixed exactly this on the REMOTE CLI and was never applied
+		// here. The loop now lives in pkg/cliterm so there is one
+		// implementation for both surfaces rather than two copies to keep in
+		// step — the divergence is what produced this bug.
 		fmt.Println("[Type or paste configuration, then press Ctrl-D on an empty line]")
-		var lines []string
-		for {
-			line, err := c.rl.Readline()
-			if err != nil {
-				// EOF (Ctrl-D)
-				break
-			}
-			lines = append(lines, line)
+		var err error
+		content, err = cliterm.ReadConfig(c.readLine)
+		if err != nil {
+			return err
 		}
-		content = strings.Join(lines, "\n")
 	} else {
 		// Read from file
 		data, err := os.ReadFile(source)

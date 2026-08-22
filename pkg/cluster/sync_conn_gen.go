@@ -131,17 +131,25 @@ func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane
 	// when the SENDER is the RG0 config-sync authority — the authority mints the
 	// generation and the peer records the one it applied. In the reverse
 	// (non-authority → authority) direction, reachable only active/active, the
-	// stamp is the sender's frozen boot seed and the authority's high-water
-	// never advances, so the guard is inert: fail-OPEN, no false reject. That
-	// residual is deliberate (#5274 scope-out), regression-pinned by
-	// sync_config_epoch_active_active_6284_test.go, and #6419 closed it as
-	// not-cheaply-fixable — the "stamp lastAppliedConfigGen and threshold on
-	// configGenCounter" shortcut fails because each counter is FROZEN for
-	// exactly the tenure in which the shortcut needs it live (a node pushes
-	// config only while IsLocalPrimary(0), and handleConfigSync rejects every
-	// peer config while IsLocalPrimary(0)), and telling the two namespaces apart
-	// across an RG0 handover needs an authority tag that ConfigEpoch, a bare
-	// uint64 on the wire, does not carry. See docs/session-sync-architecture.md.
+	// stamp is a value this node's configGenCounter has not advanced since it
+	// last held the authority (its construction seed if it never has), while the
+	// authority's high-water never advances at all, so the guard is inert:
+	// fail-OPEN, no false reject. That residual is deliberate (#5274 scope-out)
+	// and regression-pinned by sync_config_epoch_active_active_6284_test.go.
+	//
+	// #6419 closed the reverse direction as not-cheaply-fixable. Note what the
+	// blocker is and is NOT. Each counter IS live in the role the obvious
+	// shortcut ("non-authority stamps lastAppliedConfigGen, authority thresholds
+	// on configGenCounter") wants to read it: configGenCounter advances on the
+	// authority, lastAppliedConfigGen advances off it. What that asymmetry
+	// establishes is only that the shortcut cannot be written role-free — each
+	// counter is frozen in the OTHER role, so both the stamp site and the
+	// threshold site must branch on IsLocalPrimary(0). The actual kill is that a
+	// role-branched stamp is unreadable across an RG0 handover: role is not
+	// learned atomically by both nodes, and telling the two namespaces apart
+	// needs an authority tag that ConfigEpoch, a bare uint64 on the wire, does
+	// not carry today. See docs/session-sync-architecture.md for the full
+	// argument and for the tagged-epoch variant that remains open.
 	val.ConfigEpoch = s.configGenCounter.Load()
 	s.genSentMu.Lock()
 	if s.genSentV4 == nil {

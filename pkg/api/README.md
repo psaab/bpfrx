@@ -2191,6 +2191,30 @@ under the daemon's errgroup. Nothing else imports this package.
     Note: only the interface-mode session-walk arm is gated; the pool-mode rows
     read the helper's live `SourceNATPoolStatus` (no table walk) and need no
     admission slot.
+    **#6553 closes the mirror-image gap on the gRPC side** — the direction that
+    matters, because across this campaign 12 of 14 measured REST-vs-gRPC parity
+    gaps ran gRPC-UNhardened, the reverse of #6451's direction. Six gRPC NAT
+    surfaces drove full v4+v6 walks with no admission at all: `GetNATPoolStats`
+    and `GetNATDestination` (loopback; the latter has NO REST twin, since
+    `natDestHandler` does not scan), and the four `ShowText` topics
+    `persistent-nat`, `persistent-nat-detail`, `nat-source-rule-detail`,
+    `nat-dest-rule-detail`, which reach `pkg/natshow`'s walks and are
+    reachable over the FABRIC listener. The two RPCs `AcquireCtx` and sample
+    the lease inside `countNATSessions`; the four `ShowText` topics take the
+    plain `Acquire` (the existing ShowText precedent) because `pkg/natshow` is
+    shared with `pkg/cli` and takes no context — the admission half lands now,
+    the cancellation half is the stated residual. Because both surfaces alias
+    ONE `diagcmd.SessionWalkLimiter`, an un-cancellable gRPC walk was actively
+    degrading the REST twin that does honour cancellation.
+    #6553 also single-sources the NAT pool port formula
+    (`config.NATPoolTotalPorts`): `(portHigh - portLow + 1) * addrCount` had
+    been written out five times and had already diverged — only this REST
+    handler carried the `portHigh >= portLow` guard, so the gRPC handler, the
+    Prometheus NAT collector and both CLI renders would compute a NEGATIVE
+    capacity for a reversed window. (Reachability of a reversed window is not
+    claimed: #5457's `parseSourcePoolPortRange` fails closed and strict commit
+    rejects one; the tolerant load / peer-sync path is the residual. Four
+    surfaces disagreeing about one formula is the defect being fixed.)
     **#5880 makes the shared limiter request-graph-aware to fix a reentrant
     double-acquire.** A REST list/summary/zone-pair handler acquires a slot and
     then delegates IN-PROCESS to the gRPC session service for `include_peer`
