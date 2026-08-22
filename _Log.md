@@ -1,3 +1,28 @@
+## 2026-08-21 — #6585 syslog wire sanitized at the Send boundary
+
+- **Timestamp**: 2026-08-21
+- **Action**: `SyslogClient.Send` now runs
+  `termsafe.SanitizeForDisplay` on the message before it becomes a frame
+  — the LAST boundary before the wire, so no producer can bypass it
+  (the producers are any slog attribute in the daemon). Single-line
+  variant deliberately: the block variant PRESERVES LF, which is a
+  record delimiter in RFC 3164. Placed before the format branch so both
+  RFC 3164 and RFC 5424 are covered.
+  Verified the live producer FIRSTHAND: Route 53's `e.Error.Code` /
+  `e.Error.Message` (`backend_route53.go:197`) and Cloudflare's
+  `cfErrors(env)` are decoded from the PROVIDER's response body and flow
+  into `slog.Warn(..., "err", err)` in `pkg/ddns/surface_a.go`.
+  SEVERITY: log injection + deferred terminal injection, NOT command
+  injection — no exec path is involved.
+  Mutation matrix 4/4 RED: Y1 no sanitize, Y2 block variant (LF kept),
+  Y3 only the RFC3164 branch, Y4 strip instead of escape.
+  NOTE: the first frame-count test was VACUOUS — over UDP one Send is
+  one datagram regardless, and the Y2 cell proved it by staying green.
+  Replaced with an embedded-LF assertion, which is the property that
+  actually determines collector behaviour and which Y2 reds.
+- **File(s)**: pkg/logging/syslog.go,
+  pkg/logging/syslog_attr_sanitize_6585_test.go, pkg/logging/README.md
+
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
