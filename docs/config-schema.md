@@ -2377,16 +2377,48 @@ Scope rules that follow:
   Without that, a later single-scoped override merged into one member would
   mutate the value its bracket siblings point at.
 
-**Round-trip limitation (#6668, pre-existing, NOT introduced by #6391).** The
-multi-key shape survives `Format()` → `NewParser` (local persistence) and HA
-config sync byte-for-byte, but it does NOT survive `show | display set`:
-`FormatSet()` emits
+**Round-trip: fixed in #6668.** The multi-key shape survives `Format()` →
+`NewParser` (local persistence) and HA config sync byte-for-byte, and it now
+survives `show | display set` as well.
+
+It did not before. `FormatSet()` emitted
 `set ... interfaces ge-0/0/0 ge-0/0/1 host-inbound-traffic system-services ssh`,
-which replays into a single garbage leaf
-`Keys=["ge-0/0/1","host-inbound-traffic","system-services","ssh"]` and then fails
-to compile (`zone "trust" references interface "host-inbound-traffic"`). It fails
-CLOSED, but it means the multi-member fan is not durable through a display-set
-round-trip. Tracked separately as #6668.
+and the flat replay re-split that run at the schema arity — `nodeKeyCount =
+1 + args` is 1 at the zone-`interfaces` wildcard — so `ge-0/0/0` became the
+container and `ge-0/0/1` was demoted to the first key of a LEAF
+(`Keys=["ge-0/0/1","host-inbound-traffic","system-services","ssh"]`) with the
+whole body re-parented under it.
+
+Three things about that are worth keeping, because they generalize to any
+bracket authored at a CONTAINER position — the trigger is a non-leaf node with
+`len(Keys) > 1 + schema.args`, not `multi: true` (every bracketed VALUE leaf
+round-tripped clean all along, because SetPath's trailing-value absorber
+re-collapses a leaf's tail — the #2419 contract):
+
+- It was **not display-only.** `Store.LoadMergeAs`'s hierarchical branch renders
+  the parsed file with `FormatSet` and replays it through `applyEditLine`, so
+  `load merge <file>` rewrote the operator's config inside the daemon and
+  reported success. `load override` was unaffected (it installs the parse tree
+  directly) and so was HA config sync (it ships `Format()`, whose `{` terminates
+  the key list).
+- It was **not uniformly fail-closed.** The zone-`interfaces` case was rejected
+  on reload, but `system login user [ alice bob ] { class super-user; }` and
+  `class-of-service scheduler-maps [ m1 m2 ] { ... }` were REJECTED as authored
+  and COMMITTED CLEAN after the round trip, with the second member's body gone —
+  a round trip that launders a config past a commit gate.
+- It was **invisible to an idempotency check.** Re-rendering the damaged tree
+  produced the same flat line: the corruption is a fixed point of `FormatSet`.
+
+The fix records, per key, whether the operator authored it inside `[ ... ]`
+(`Node.KeysBracketed`, the bracket sibling of the #6673 `KeysQuoted`
+provenance), re-emits the delimiter for a bracketed CONTAINER group, and honours
+it on replay (`ParseSetVerbGrouped` → `SetPathQuotedGrouped` /
+`DeletePathGrouped` / `DeactivatePathGrouped`). A group only ever WIDENS a node's
+key slice, never narrows it. Rendering keys off the authored provenance rather
+than off "wider than the arity" deliberately: the arity rule would also bracket
+the PACKED-statement family (`unit 0 shaping-rate 10g { ... }`), whose flat
+replay already reconstructs an equivalent config and which is tracked separately
+(#6588 / #6665 / #6672).
 
 All of the above is pinned by
 `pkg/config/compiler_zone_iface_hostinbound_sibling_6391_test.go`, which asserts
