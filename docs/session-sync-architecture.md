@@ -482,15 +482,80 @@ it refuses on epoch alone — and deliberately does NOT record the per-key
 generation, so the peer's next re-sync of that key is admitted rather than
 refused as stale.
 
-**Item 1 (deferred, documented residual).** The guard still covers only the
+**Item 1 (accepted residual — #6419 closed).** The guard covers only the
 config-authority → peer direction (the primary that admits the session is also
 the RG0 config-sync authority). A non-authority's sessions carry the
 authority-independent seed epoch, so the guard is inert for the reverse
-direction in an active/active deployment (fail-OPEN). Closing it requires a
-bidirectional config-generation namespace that #5274 deliberately scoped out (a
-design-heavy change, not part of #6284 item 2). #6284's residual-COVERAGE gap
-is closed (item 2 by #6366, item 1 by #6418); the substantive hardening of this
-inert direction is tracked separately as a future enhancement on #6419.
+direction in an active/active deployment (fail-OPEN). #6284's residual-COVERAGE
+gap is closed (item 2 by #6366, item 1 by #6418).
+
+Closing the reverse direction itself requires a bidirectional
+config-generation namespace that #5274 deliberately scoped out. #6419 evaluated
+the one shortcut that appeared to avoid building a second namespace — "the
+authority A's generations are already a name both nodes can say, so let the
+non-authority B stamp `B.lastAppliedConfigGen` (the A-generation B is running)
+and let A threshold on its own `configGenCounter`" — and closed it as
+unworkable. Recorded here because it has been re-derived more than once; the
+three reasons are structural, not implementation detail:
+
+- **The two counters are never simultaneously live on one node, so the shortcut
+  cannot be expressed role-free.** `configGenCounter` advances only through
+  `nextConfigGen` ← `QueueConfig`, whose only production callers
+  (`syncConfigToPeer`, `reconcileConfigSyncToPeer`) are gated on
+  `rg0ConfigSyncAuthority` = `IsLocalPrimary(0)`. `lastAppliedConfigGen`
+  advances only through `recordAppliedConfigGen` on a nil `OnConfigReceived`,
+  and `handleConfigSync` returns `errConfigSyncRejectedPrimary` whenever
+  `IsLocalPrimary(0)`. So a node's send counter is frozen for its whole
+  non-authority tenure and its applied mark for its whole authority tenure, and
+  the shortcut must therefore branch on `IsLocalPrimary(0)` at BOTH the stamp
+  site and the threshold site. A role-FREE formulation is not available as a way
+  out: coalescing with `max(configGenCounter, lastAppliedConfigGen)` chooses
+  between two independent `MonotonicNanos()` boot seeds (`initGenState`), so
+  which side wins is a function of relative node uptime rather than of config
+  order.
+
+  To be precise about what this does *not* claim: the role-branched mismatch
+  that follows an RG0 handover **self-heals**. `reconcileConfigSyncToPeer` runs
+  on the `"rg0-promotion"` trigger, so once the new authority has pushed and the
+  new non-authority has applied, both counters are back in one namespace. The
+  hazard is not the steady state after a handover — it is the window *during*
+  one, which the next point covers.
+- **The handover window needs the wire field the shortcut avoids.** RG0 role is
+  not learned atomically by both nodes: each side updates on its own
+  heartbeat/VRRP timing, so there is necessarily a skew window in which the old
+  authority still believes it is the authority while the new one already does.
+  Dual-active is not theoretical either — the election code has an explicit
+  DUAL-ACTIVE branch (`pkg/cluster/election.go`) that detects both nodes primary
+  for one RG and resolves it by effective priority then node ID, which takes a
+  heartbeat round to converge. Throughout that window BOTH nodes stamp and
+  threshold on `configGenCounter`, i.e. on two independent `MonotonicNanos()`
+  boot seeds compared directly, so whether the guard is inert or refuses *every*
+  inbound synced session is decided by relative uptime. The issue's own proposed
+  remedy — treat the epoch as 0 (the documented disable value) for a session
+  stamped under a different authority incarnation than the receiver's current
+  one — is what would close this, and it requires the receiver to know a stamp's
+  authority incarnation. `SessionValue.ConfigEpoch` is a bare `uint64`
+  (`pkg/dataplane/types.go`) written as eight raw LE bytes with no companion tag
+  (`encodeSessionV4Payload` / `encodeSessionV6Payload`), and nothing else on the
+  session wire identifies the minting authority — so the remedy is exactly the
+  wire field the shortcut set out to avoid.
+- **It converts a self-healing failure into total reverse-direction loss.** A
+  config apply that does not take effect on the non-authority (compile/promote
+  failure, or the RG0-primary rejection above — counted by
+  `ConfigsApplyFailed`) deliberately leaves `lastAppliedConfigGen` pinned so the
+  authority's re-push re-converges (M-2/#4151). With the applied mark as the
+  stamp source, that same condition pins the non-authority's stamp while the
+  authority's threshold keeps climbing on every push, so the authority refuses
+  EVERY reverse-direction session for as long as the apply keeps failing.
+  `resetRecvGen` compounds it: it stores `lastAppliedConfigGen = 0` on each peer
+  bulk re-prime, so the stamp would be 0 — the disable value — through cold
+  prime, which is exactly when bulk sessions flow.
+
+Reopening the reverse direction therefore starts from the namespace design
+(a wire field carrying each node's applied-config generation, or an authority
+tag alongside `ConfigEpoch` plus a defined ordering across an RG0 authority
+change), which is a `ProtocolVersion` bump and an explicit owner decision — not
+a bounded increment.
 
 Both halves of this directional correctness are regression-pinned by
 `sync_config_epoch_active_active_6284_test.go`: the SAME frozen non-authority

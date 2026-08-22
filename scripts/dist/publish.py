@@ -64,6 +64,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+import image_inventory  # noqa: E402  (#6500 inventory format)
 import sign  # noqa: E402
 
 
@@ -108,15 +109,18 @@ def _is_allowed_publish_file(name, at_top):
         anywhere in the tree;
       - top-level bake outputs: `install.sh` (its minisign signature is
         verified in gate_images), `xpf-image.pub` (the pinned pubkey convenience
-        copy), and `xpf-<ver>.manifest` (build metadata read by
-        `xpf-deploy image-roll`);
+        copy), `xpf-<ver>.manifest` (build metadata read by
+        `xpf-deploy image-roll`), and `xpf-<ver>.pkgs` (the #6500 image
+        inventory — guest kernel + installed package versions — covered by the
+        signed SHA256SUMS and REQUIRED by gate_provenance);
       - a per-channel `latest.json` in a channel subdir — gate_latest verifies
         its signature.
     """
     if name.endswith((".minisig", ".SHA256SUMS")):
         return True
     if at_top:
-        return name in ("install.sh", "xpf-image.pub") or name.endswith(".manifest")
+        return (name in ("install.sh", "xpf-image.pub")
+                or name.endswith((".manifest", ".pkgs")))
     return name == "latest.json"
 
 
@@ -638,6 +642,13 @@ def gate_provenance(dist, versions, pub):
     image cannot be released via the normal path. There is deliberately no
     override — a signed unpinned image is not releasable.
 
+    #6500 adds the third leg: the signed record must say what the image
+    actually SHIPS. The manifest must carry `guest_kernel` (the kernel the
+    IMAGE runs, not `bake_host_kernel`), and the version must carry an
+    `xpf-<ver>.pkgs` inventory sidecar — covered by the same signed SHA256SUMS
+    — that parses as a real inventory and agrees with the manifest about the
+    kernel. A hollow inventory is refused, not accepted as best-effort.
+
     Fail-CLOSED: every version MUST carry a provenance sidecar that is (a) listed
     in — and hash-matches — the signed manifest, (b) says validated: true, AND
     (c) says base_image_pinned: true. A missing sidecar, an unsigned/mismatched
@@ -689,7 +700,57 @@ def gate_provenance(dist, versions, pub):
                 "a release signature: a signed dev/unpinned bake is not "
                 "releasable. Re-bake against a PINNED_BASE_SHA256 base WITHOUT "
                 "XPF_ALLOW_UNPINNED_BASE.")
-        info(f"image set {ver}: provenance validated=true base_image_pinned=true")
+        # #6500: the traceability record must actually say what the image
+        # ships. `bake_host_kernel` names the BUILD HOST's kernel and answers a
+        # different question; without guest_kernel + the package inventory,
+        # "does release X ship openssl 3.x.y (CVE-YYYY)?" and "which kernel
+        # does X carry, so I can plan a LANE-1 arm?" both require booting or
+        # mounting the image. Fail-CLOSED, exactly like validated /
+        # base_image_pinned: a missing field, a missing sidecar, a sidecar not
+        # covered by the signed manifest, or a HOLLOW one all refuse.
+        #
+        # A hollow record is refused deliberately, not tolerated as
+        # best-effort: a present-but-empty inventory satisfies a presence check
+        # and answers nothing, which is strictly worse than an absent one
+        # because it argues against anyone re-examining it.
+        gkern = fields.get("guest_kernel")
+        if not gkern:
+            die(f"image set {ver} provenance records no guest_kernel — the "
+                "signed manifest cannot say which kernel the image ships (the "
+                "exact artifact the #1930 LANE-1 channel promotes; "
+                "bake_host_kernel is the BUILD HOST's and answers a different "
+                "question). Refusing to publish an image whose traceability "
+                "record cannot describe it. Re-bake (#6500).")
+        pkgs_name = image_inventory.sidecar_name(ver)
+        pkgs_path = os.path.join(dist, pkgs_name)
+        if not os.path.isfile(pkgs_path):
+            die(f"image set {ver} has no inventory sidecar {pkgs_name} in "
+                f"{dist} — the signed record cannot list the package versions "
+                "the image ships, so a CVE-triage question needs the image "
+                "booted or mounted. Refusing to publish (the sidecar is "
+                "written + signed by scripts/image/bake.py; re-bake).")
+        try:
+            pkgs_data = sign.verify_listed_artifact_bytes(pkgs_path, sums, sig, pub)
+        except sign.SignError as e:
+            die(f"inventory sidecar {pkgs_name} failed verify against the "
+                f"signed manifest {os.path.basename(sums)}: {e}")
+        try:
+            inv_kern, inv_pkgs = image_inventory.parse(
+                pkgs_data.decode("utf-8", "replace"))
+        except image_inventory.InventoryError as e:
+            die(f"inventory sidecar {pkgs_name} is not a usable inventory: {e}. "
+                "Refusing to publish.")
+        # The two authenticated records must AGREE about the kernel. They are
+        # written from the same in-guest read, so a divergence means one of
+        # them was edited after the bake — and both are inside the signature,
+        # so it means the whole signed set was re-assembled.
+        if inv_kern != gkern:
+            die(f"image set {ver}: the manifest says guest_kernel={gkern!r} but "
+                f"the inventory sidecar says {inv_kern!r}. Both are covered by "
+                "the same signature, so these cannot disagree on an untampered "
+                "bake. Refusing to publish.")
+        info(f"image set {ver}: provenance validated=true base_image_pinned=true "
+             f"guest_kernel={gkern} inventory={len(inv_pkgs)} packages")
 
 
 def _gate_one_latest(dist, channel, pub, require_present):

@@ -2338,6 +2338,41 @@ removed/changed persisted and stranded a healthy node secondary forever.
 (it runs under the manager lock already held by `UpdateConfig`); the
 manager-side clear happens directly in `reconcileMonitorDebtsLocked`.
 
+**Monitor map locking and the `m.mu -> mon.mu` order (#6550).** The poll
+goroutine and `UpdateGroups` share four maps — `ifaceState`, `ipState`,
+`ipDebts`, `ipThresholdState`. `UpdateGroups` deletes from all four under
+`mon.mu`; the poll cycle used to write all four with no lock at all, which
+is a Go RUNTIME FATAL (`concurrent map read and map write`), not a
+tolerable race, and it is reachable from an ordinary commit — with
+config-sync, on both nodes.
+
+The repair cannot be one lock around the whole apply phase. The lock order
+in this package is **`m.mu` -> `mon.mu`**: `Manager.UpdateConfig` holds
+`m.mu` across its whole body and calls `Monitor.UpdateGroups`, which takes
+`mon.mu`. The poll path calls `mgr.SetMonitorWeight` / `mgr.RecordEvent`,
+which take `m.mu`. Holding `mon.mu` across those callbacks inverts the
+order and deadlocks a commit against a poll — trading a probabilistic
+fatal for a deterministic hang.
+
+So each mutation site takes `mon.mu` for the map access and the dampening
+update it feeds, and releases it before calling the manager.
+`reconcileRGIPDebts` drives its whole bookkeeping to the new value under
+the lock, collects the resulting weight changes into a local
+`[]ipDebtAction`, drops the lock, and only then replays them (removals
+first, then installs — the pre-#6550 emission order). `desiredRGIPDebts`
+therefore requires `mon.mu` held. `Monitor.Stop` is unaffected: it drops
+`mon.mu` before `wg.Wait()`, so a poll blocked on the lock cannot wedge a
+teardown.
+
+Two probes pin this, both in `monitor_poll_update_race_6550_test.go`: a
+race probe (poll cycles bounded, `UpdateGroups` looped, ratio logged) and a
+deterministic lock-order probe that lands an `UpdateGroups` on another
+goroutine exactly at a manager callback and requires it to complete. Both
+assert only under `-race` or a deadlock, so a third test reads the
+Makefile and requires `test-race-dp` to keep its `./pkg/cluster/` leg —
+before #6550 no make target raced this package at all, so these were races
+CI had no path to rather than races CI had missed.
+
 `reconcileMonitorDebtsLocked` reconciles INTERFACE-monitor debt ONLY.
 `monitorWeights` + `MonitorFails` are a SHARED structure that also holds
 IP-MONITORING debts (installed by `SetMonitorWeight` from the ip-monitor
