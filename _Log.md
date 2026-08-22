@@ -1,3 +1,40 @@
+## 2026-08-22 — #6502 day-0 loader probe order (labeled-first contract)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The day-0 config loader concatenated its labeled-volume
+  and iso9660 probe passes and piped them through `sort -u`, which
+  ALPHABETIZES — so with two valid-but-different media attached the ISO
+  on /dev/sda beat the labeled volume on /dev/sdb, the exact opposite
+  of the labeled-first contract the surrounding comment states.
+  Replaced with `awk 'NF && !seen[$0]++'` over the concatenated stream,
+  which preserves first-appearance order AND dedups ACROSS passes — a
+  medium that is both labeled and iso9660 appears once, in its LABELED
+  position. The self-correcting cases are preserved: a REJECTED labeled
+  volume and an EMPTY labeled volume both still fall through to the
+  ISO, so the fix does not become "labeled or nothing".
+- **File(s)**: scripts/image/xpf-day0-config,
+  scripts/image/test_day0_probe_order_6502.py
+
+## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
+
+- **Timestamp**: 2026-08-22
+- **Action**: Corrected every remaining claim that the bake discovers the
+  LATEST Ubuntu base, which contradicts the #1943/#4904 reviewed-pin
+  policy. The issue named three sites in install-images.md; a
+  wrap-insensitive, extension-agnostic sweep found a FOURTH at
+  Makefile:287-288, hidden because the claim wrapped across two comment
+  lines AND the file has no extension. Added a guard that bans the
+  complete ASSERTING clauses rather than keywords — a keyword ban would
+  red on the four correct "not auto-latest" negations while the real
+  false claim walked past — plus two matcher self-tests asserting that
+  the normalizer sees a wrapped claim and that a line-oriented search
+  misses the same claim, so the reason the guard normalizes is bound
+  rather than assumed. The TRUE half binds the doc to bake.py's actual
+  PINNED_BASE_RELEASE value, its constants and GPG fingerprint, and
+  refuses an override bake.py never reads.
+- **File(s)**: docs/install-images.md, Makefile,
+  scripts/test_base_pin_docs_6501.py
+
 ## 2026-08-22 — #6500 signed image inventory (guest kernel + package set)
 
 - **Timestamp**: 2026-08-22
