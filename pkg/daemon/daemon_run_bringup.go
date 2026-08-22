@@ -519,7 +519,10 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 			// gate reads the real arm state instead of re-opening forwarding.
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				slog.Info("applying active configuration")
-				d.applyConfig(cfg)
+				// #6716: re-reads the active config under applySem rather than
+				// applying this pre-semaphore snapshot. The check above stays a
+				// cheap "is there anything to apply yet" guard.
+				d.applyActiveConfig()
 			}
 		}
 	}
