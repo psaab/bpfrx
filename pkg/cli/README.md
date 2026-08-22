@@ -151,12 +151,37 @@ presenter's rendered output is byte-identical:
 
 ## Dependencies
 
-`appid`, `cluster`, `cmdtree`, `config`, `configstore`, `dataplane`,
+`appid`, `cliterm`, `cluster`, `cmdtree`, `config`, `configstore`, `dataplane`,
 `dhcp`, `dhcprelay`, `feeds`, `frr`, `ipsec`, `lldp`, `logging`, `routing`,
 `rpm`, `vrrp`.
 
 ## Gotchas
 
+- **`load {override,merge,set} terminal` COMMITS only on Ctrl-D (#6548).**
+  Ctrl-C — and any other read error — is an ABORT: the partial input is
+  discarded and `handleLoad` returns an error, so the candidate is untouched.
+  The loop originally took the same `break` for EOF, `readline.ErrInterrupt`
+  and every read error, joined whatever lines had arrived, applied them, and
+  printed `load <mode> complete`. An operator who aborted a paste was told it
+  succeeded and could commit a TRUNCATED configuration — and a truncated
+  `security policies` stanza is a WIDENED one, because the deny terms that
+  would have followed never arrive.
+
+  This is the #4883-D bug. It was fixed on the remote CLI and never applied
+  here, so the console kept the broken loop. **The read loop therefore lives in
+  `pkg/cliterm` and both surfaces call it** — a divergence between the console
+  and the remote CLI on this is always a bug, so it is single-sourced rather
+  than duplicated and held in step by a test. `pkg/cliterm` is deliberately
+  dependency-light so `cmd/cli` can import it without pulling in the whole
+  interactive console.
+
+  `CLI.readLineFn` is a test seam (nil in production) that makes the loop
+  drivable. It exists because the loop had NO other observable — the difference
+  between a committed paste and an aborted one is invisible from outside the
+  process — and it was unguarded for exactly as long as it was undrivable.
+  Covered by `load_terminal_abort_6548_test.go`; the abort fixtures paste a
+  syntactically COMPLETE prefix on purpose, so a green cannot come from the
+  truncated input merely failing to parse.
 - TTY detection uses `unix.IoctlGetTermios(fd, TCGETS)`, **not**
   `os.ModeCharDevice` — `/dev/null` matches `ModeCharDevice` and would
   trick the latter into starting an interactive session in a systemd unit.
