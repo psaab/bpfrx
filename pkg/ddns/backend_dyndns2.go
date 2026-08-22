@@ -111,24 +111,62 @@ func resolveDyndns2Endpoint(p *config.DDNSProvider) (string, error) {
 		if strings.Contains(s, "://") {
 			u, err := url.Parse(s)
 			if err != nil {
-				return "", fmt.Errorf("ddns dyndns2: provider %q server %q is not a valid URL: %w", p.Name, s, err)
+				// PARSE-FAILURE BRANCH: render NO part of the input (#6606).
+				//
+				// This is the #6594 split, and both halves of it are load-
+				// bearing. Dropping the %w matters because (*url.Error).Error()
+				// re-embeds the whole raw URL — but dropping it alone is not
+				// enough, because several INNER net/url causes embed input too,
+				// and one is unbounded: `invalid port %q after host` quotes an
+				// arbitrary-length substring. The realistic trigger IS the
+				// credentialed case: an operator who omits the '@' in
+				// "https://user:s3cr3t@host/" leaves net/url parsing host
+				// "user" and port ":s3cr3t", so the failure mode puts the
+				// PASSWORD in the message. urlParseCause returns only closed
+				// parseReason constants, which is what makes the diagnostic
+				// safe.
+				//
+				// And not even a redacted render of the input belongs here:
+				// config.RedactURL is sound for a URL that PARSED, but this one
+				// did not, so a credential can be sitting in a slot no redactor
+				// can identify (a bad %-escape mid-path, say). The provider name
+				// plus the cause is enough to act on.
+				return "", fmt.Errorf("ddns dyndns2: provider %q server is not a valid URL: %s",
+					p.Name, urlParseCause(err))
 			}
+			// PARSED: from here config.RedactURL is provably sound — a
+			// successfully-parsed URL cannot hide a credential in the host:port
+			// slot ("http://h:abc/x" is itself a parse error) — so the value is
+			// rendered redacted, which keeps the message actionable.
 			if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
-				return "", fmt.Errorf("ddns dyndns2: provider %q server %q must be an http(s) URL", p.Name, s)
+				return "", fmt.Errorf("ddns dyndns2: provider %q server %q must be an http(s) URL",
+					p.Name, config.RedactURL(s))
 			}
 			// Hostname() (not Host) so a port-only authority ("https://:8080/…")
 			// is rejected as hostless rather than accepted with an empty host.
 			if u.Hostname() == "" {
-				return "", fmt.Errorf("ddns dyndns2: provider %q server %q has no host", p.Name, s)
+				return "", fmt.Errorf("ddns dyndns2: provider %q server %q has no host",
+					p.Name, config.RedactURL(s))
 			}
 			return s, nil
 		}
 		// Bare host → canonical dyndns2 path over HTTPS. Validate the host by
 		// parsing the composed URL so a hostless value (":8080", "/path") is
 		// rejected here instead of at the first publish.
+		//
+		// The two failure modes are SPLIT (#6606) rather than sharing one
+		// message: they had opposite safety properties behind a single `err !=
+		// nil || Hostname() == ""` condition, so one render had to be wrong for
+		// one of them.
 		full := "https://" + s + "/nic/update"
-		if u, err := url.Parse(full); err != nil || u.Hostname() == "" {
-			return "", fmt.Errorf("ddns dyndns2: provider %q server %q is not a valid host", p.Name, s)
+		u, err := url.Parse(full)
+		if err != nil {
+			return "", fmt.Errorf("ddns dyndns2: provider %q server is not a valid host: %s",
+				p.Name, urlParseCause(err))
+		}
+		if u.Hostname() == "" {
+			return "", fmt.Errorf("ddns dyndns2: provider %q server %q is not a valid host",
+				p.Name, config.RedactURL(s))
 		}
 		return full, nil
 	}

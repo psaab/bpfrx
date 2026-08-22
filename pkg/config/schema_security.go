@@ -185,7 +185,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				},
 			}},
 			"tcp-rst":              {desc: "Send TCP RST for denied traffic", children: nil},
-			"screen":               {desc: "Screen profile name", args: 1, placeholder: "<screen-name>", children: nil},
+			"screen":               {desc: "Screen profile name", args: 1, scalar: true, placeholder: "<screen-name>", children: nil},
 			"host-inbound-traffic": {desc: "Host inbound traffic", children: hostInboundSchemaChildren()},
 			// #3061: zone-local address book. Same entry grammar as the
 			// global book (security address-book global) but attached
