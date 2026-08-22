@@ -913,16 +913,38 @@ Three things it answers that previously needed a root shell or journald:
   it is prepared intent whose firmware one-shot was never read back (#5847), so
   the next boot is the **known-good** kernel. An operator told "armed" there
   would expect a trial that will not happen.
-- **Is this node held secondary by the upgrade gate?** The candidate trial boot
-  sets `kernelUpgradeHold`, which holds the node SECONDARY until the promotion
-  marker confirms the running kernel. `show chassis cluster status` and `show
-  chassis cluster information` now annotate it too, so a node parked SECONDARY
-  by the *expected gate* is no longer indistinguishable from one demoted by a
-  monitor failure or a manual failover. Both surfaces render the same
-  `cluster.KernelUpgradeHoldReason` constant — an operator comparing them
-  mid-roll should not have to decide whether two phrasings mean one hold. The
-  annotation is node-scoped and sits **above** every `Redundancy group:` header
-  so the rolling-deploy node parser (`deploy_rolling_secondary_node`,
+- **Is this node held secondary by the upgrade gate, and by *which* gate?**
+  `show chassis cluster status` and `show chassis cluster information` now
+  annotate the hold, so a node parked SECONDARY by the *expected gate* is no
+  longer indistinguishable from one demoted by a monitor failure or a manual
+  failover.
+
+  There are **two** hold reasons, because the daemon sets the one
+  `kernelUpgradeHold` flag for two materially different conditions whose
+  remedies differ:
+
+  | Reason | Condition | Operator action |
+  |---|---|---|
+  | `KernelUpgradeHoldCandidate` | a candidate is genuinely ARMED | wait — the durable promotion marker releases it |
+  | `KernelUpgradeHoldUnreadableJournal` | the #5682 fail-closed hold: `IsArmed` returned an **error**, so whether anything is armed is UNKNOWN | repair `/var/lib/xpf` — no marker may ever be written |
+
+  Rendering one string for both would be a **false statement** in the
+  fail-closed case: "held until the promotion marker confirms the running
+  kernel" asserts a candidate exists and that a marker will resolve it, and the
+  daemon reached that branch precisely because it could not establish either.
+  That is the same class of defect as the invisibility this section is about,
+  one layer in. `Manager.KernelUpgradeHoldReason()` returns the active reason;
+  `KernelUpgradeHeld()` remains the yes/no predicate the election uses, and is
+  deliberately **not** what the status surfaces render.
+
+  The reason also follows the **#5682 self-heal transition**: when a fail-closed
+  hold's journal becomes readable and a candidate *is* armed,
+  `reconcileKernelUpgradeHold` converts it in place to a candidate hold and
+  re-sets the reason, so the status stops telling the operator to repair a
+  filesystem that is now healthy.
+
+  The annotation is node-scoped and sits **above** every `Redundancy group:`
+  header so the rolling-deploy node parser (`deploy_rolling_secondary_node`,
   `test/incus/deploy-lib.sh`) cannot read it as a table row.
 - **Did the last candidate promote or revert, and why?** `revert()` clears the
   journal by design (the next boot must be a clean ordinary boot) and the

@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/upgrade"
 )
 
@@ -22,16 +21,23 @@ import (
 // election hold is cluster state, not channel state: pkg/upgrade records what
 // was armed, pkg/cluster decides what that means for eligibility, and only the
 // daemon holds both. (It is also a literal import cycle — pkg/upgrade's tests
-// already import pkg/cluster.) The reason STRING is
-// cluster.KernelUpgradeHoldReason, the same constant `show chassis cluster
-// status` renders, so the two surfaces cannot phrase one hold two ways and
-// leave an operator comparing them mid-roll to guess whether they mean the
-// same thing.
+// already import pkg/cluster.) The reason comes from
+// Manager.KernelUpgradeHoldReason(), the SAME value `show chassis cluster
+// status` renders, so the two surfaces cannot phrase one hold two ways — nor
+// name the WRONG one of the two holds — and leave an operator comparing them
+// mid-roll to guess which applies.
 func (d *Daemon) kernelUpgradeStatus() upgrade.ChannelStatus {
+	// d.newKernelSystem(), not upgrade.NewKernelSystem() directly: that is the
+	// package's injectable seam (kernelSystemFn), and bypassing it made this
+	// path untestable and inconsistent with the rest of the file.
 	st := upgrade.ReadChannelStatus(upgrade.DefaultKernelJournalPath,
-		upgrade.NewKernelSystem())
-	if d.cluster != nil && d.cluster.KernelUpgradeHeld() {
-		st.HoldReason = cluster.KernelUpgradeHoldReason
+		d.newKernelSystem())
+	// The REASON, not a literal. The manager holds for two different conditions
+	// and KernelUpgradeHeld() alone cannot tell them apart, so asking it for the
+	// reason is what keeps this surface and `show chassis cluster status`
+	// agreeing about WHICH hold is in force (#6495).
+	if d.cluster != nil {
+		st.HoldReason = d.cluster.KernelUpgradeHoldReason()
 	}
 	return st
 }

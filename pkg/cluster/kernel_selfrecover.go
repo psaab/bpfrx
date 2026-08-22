@@ -49,10 +49,14 @@ func (m *Manager) PeerHealthyPrimary() bool {
 // auto-cleared for an isolated node, so a candidate that cannot see the peer
 // still cannot blackhole traffic by claiming primary (r2 AGY Critical). Set it
 // BEFORE Start() on a candidate boot. Idempotent.
-func (m *Manager) SetKernelUpgradeHold() {
+// reason must be one of the KernelUpgradeHold* constants above; it is what the
+// status surfaces render, so a caller that cannot say WHY it is holding should
+// not be holding (#6495).
+func (m *Manager) SetKernelUpgradeHold(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.kernelUpgradeHold = true
+	m.kernelUpgradeHoldReason = reason
 	// Defense in depth: the daemon sets the hold before the first election, so
 	// normally no group is primary yet. But setting the hold only BLOCKS future
 	// promotions — it must also DEMOTE any group that is already primary, so the
@@ -66,20 +70,37 @@ func (m *Manager) SetKernelUpgradeHold() {
 	}
 }
 
-// KernelUpgradeHoldReason is the operator-facing explanation rendered wherever
-// a node is held SECONDARY by the kernel-candidate promotion gate (#6495).
+// The operator-facing explanations rendered wherever a node is held SECONDARY
+// by the kernel-upgrade gate (#6495).
 //
-// ONE string, used by `show chassis cluster status`, `show chassis cluster
-// information` and `show system kernel-upgrade`. An operator comparing those
-// during a kernel roll must not have to decide whether two phrasings mean the
-// same hold — and a node parked SECONDARY here is otherwise indistinguishable
-// from one demoted by a monitor failure or a manual failover.
+// There are TWO of them because the daemon sets this ONE flag for two
+// materially different reasons, and the operator's next action differs between
+// them. A single string would be a false statement in one of the two cases:
 //
-// It lives HERE, next to the flag it explains, rather than in pkg/upgrade:
+//   - Candidate: a candidate kernel is genuinely ARMED. The hold releases when
+//     the durable promotion marker confirms the running kernel. Nothing to do
+//     but wait for the promotion gate.
+//   - UnreadableJournal: the #5682 fail-closed hold. IsArmed returned an ERROR
+//     — the journal exists but cannot be read or parsed — so the daemon could
+//     not establish whether anything is armed and held fail-closed. There may
+//     be no candidate at all. The operator's action is to fix /var/lib/xpf, not
+//     to wait for a promotion that may never come.
+//
+// Telling an operator "held until the promotion marker confirms the running
+// kernel" on a fail-closed hold asserts a candidate exists and that a marker
+// will resolve it, both of which may be false. That is the same class of defect
+// as the invisibility this issue is about, one layer in.
+//
+// These live HERE, next to the flag they explain, rather than in pkg/upgrade:
 // pkg/cluster owns the hold (the flag, the election gate, the status
 // annotation), pkg/upgrade only records what was armed. The daemon carries the
-// string across when it assembles the kernel-upgrade status.
-const KernelUpgradeHoldReason = "kernel-candidate promotion gate (held until the promotion marker confirms the running kernel)"
+// active one across when it assembles the kernel-upgrade status, so `show
+// chassis cluster status` and `show system kernel-upgrade` render one string.
+const (
+	KernelUpgradeHoldCandidate = "kernel-candidate promotion gate (held until the promotion marker confirms the running kernel)"
+
+	KernelUpgradeHoldUnreadableJournal = "kernel-upgrade journal unreadable — held fail-closed (#5682) until the state can be re-read; whether a candidate is armed is UNKNOWN, so this hold may not clear on its own"
+)
 
 // KernelUpgradeHeld reports whether the kernel-upgrade election hold is set.
 // Used by the daemon's reconcile loop to release the hold against the durable
@@ -91,6 +112,21 @@ func (m *Manager) KernelUpgradeHeld() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.kernelUpgradeHold
+}
+
+// KernelUpgradeHoldReason returns the operator-facing explanation for the
+// current hold, or "" when no hold is set (#6495).
+//
+// KernelUpgradeHeld() alone answers only "held: yes/no", which surfaces the
+// hold without letting an operator tell WHICH hold it is — and the two have
+// different remedies. Callers rendering the hold must use this, not a literal.
+func (m *Manager) KernelUpgradeHoldReason() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.kernelUpgradeHold {
+		return ""
+	}
+	return m.kernelUpgradeHoldReason
 }
 
 // ClearKernelUpgradeHold releases the kernel-upgrade election hold and re-runs
@@ -108,6 +144,7 @@ func (m *Manager) ClearKernelUpgradeHold() {
 	defer m.mu.Unlock()
 	if m.kernelUpgradeHold {
 		m.kernelUpgradeHold = false
+		m.kernelUpgradeHoldReason = ""
 		// Re-elect with the same peer-aware dispatch the rest of the manager
 		// uses: an isolated cleared node (peerAlive=false) must go through the
 		// single-node path to claim primary; runElection alone would not promote

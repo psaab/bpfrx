@@ -158,6 +158,11 @@ type Manager struct {
 	// primary until the promotion gate verifies the dataplane. Set BEFORE
 	// Start() on a candidate boot; cleared by promote/rejoin/revert.
 	kernelUpgradeHold bool
+	// kernelUpgradeHoldReason is WHY the hold is set — one of the
+	// KernelUpgradeHold* constants (#6495). The flag alone cannot tell an
+	// operator whether they are waiting on a promotion gate or looking at an
+	// unreadable journal, and those have different remedies.
+	kernelUpgradeHoldReason string
 
 	// Peer state tracking (heartbeat).
 	peerAlive    bool

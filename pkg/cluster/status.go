@@ -19,7 +19,15 @@ func (m *Manager) FormatStatus() string {
 	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	configSyncFailing := m.configSyncFailing // #6387: node-global CF annotation
 	takeoverHold := m.takeoverHoldTime       // #103: hold is part of eligibility
-	kernelHold := m.kernelUpgradeHold        // #6495: kernel-candidate trial hold
+	// #6495: read the REASON, not just the flag. The daemon sets this one flag
+	// for two materially different conditions (an armed candidate, and the
+	// #5682 fail-closed unreadable-journal hold) whose remedies differ, so
+	// rendering "held" without saying WHICH is the same blindness one layer in.
+	// Guarded on the flag: the reason field is only meaningful while held.
+	kernelHold := ""
+	if m.kernelUpgradeHold {
+		kernelHold = m.kernelUpgradeHoldReason
+	}
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -52,8 +60,8 @@ func (m *Manager) FormatStatus() string {
 	// field is "Held", not a node token — a line that could be read as a node
 	// row would steer a rolling cluster deploy into restarting the PRIMARY
 	// first (#4009).
-	if kernelHold {
-		fmt.Fprintf(&b, "Held secondary: %s\n", KernelUpgradeHoldReason)
+	if kernelHold != "" {
+		fmt.Fprintf(&b, "Held secondary: %s\n", kernelHold)
 	}
 	fmt.Fprintln(&b)
 	if localVersion != "" {
@@ -163,7 +171,11 @@ func (m *Manager) FormatInformation() string {
 	configSyncFailing := m.configSyncFailing   // #6387
 	configSyncReason := m.configSyncFailReason // #6387
 	takeoverHold := m.takeoverHoldTime         // #103
-	kernelHold := m.kernelUpgradeHold          // #6495
+	// #6495: the hold REASON, not just the flag (see FormatStatus).
+	kernelHold := ""
+	if m.kernelUpgradeHold {
+		kernelHold = m.kernelUpgradeHoldReason
+	}
 	m.mu.RUnlock()
 
 	states := m.GroupStates()
@@ -246,8 +258,8 @@ func (m *Manager) FormatInformation() string {
 	// degrade node health — the node is fine, it is deliberately not eligible —
 	// so it is its own line rather than folded into localHealth, which would
 	// tell the operator something false about the node.
-	if kernelHold {
-		fmt.Fprintf(&b, "  Held secondary: %s\n", KernelUpgradeHoldReason)
+	if kernelHold != "" {
+		fmt.Fprintf(&b, "  Held secondary: %s\n", kernelHold)
 	}
 	fmt.Fprintln(&b)
 

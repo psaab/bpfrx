@@ -216,9 +216,20 @@ kernel. Until #6495 nothing rendered it, so a node parked SECONDARY by the
 *expected gate* was indistinguishable from one demoted by a monitor failure or
 a manual failover — during exactly the maintenance window where an operator is
 deciding whether what they see is normal. `FormatStatus` and
-`FormatInformation` now emit a `Held secondary: <reason>` line keyed on the
-flag, using the shared `KernelUpgradeHoldReason` constant (defined next to the
-flag in `kernel_selfrecover.go`) that `show system kernel-upgrade` also renders.
+`FormatInformation` now emit a `Held secondary: <reason>` line rendering
+`Manager.KernelUpgradeHoldReason()`, the same value `show system
+kernel-upgrade` reads through the daemon.
+
+**Two reasons, not one.** The daemon sets this single flag for two materially
+different conditions: a genuinely ARMED candidate
+(`KernelUpgradeHoldCandidate`), and the #5682 fail-closed hold taken when
+`IsArmed` returns an **error** (`KernelUpgradeHoldUnreadableJournal`). Their
+remedies differ — wait for the promotion marker, versus repair `/var/lib/xpf` —
+so `SetKernelUpgradeHold` requires the caller to say which, and
+`KernelUpgradeHeld()` stays the yes/no predicate the *election* uses rather
+than the thing the status renders. A single string would be a false statement
+in the fail-closed case, where the daemon does not know a candidate exists and
+no marker may ever be written.
 
 Two properties of that line are load-bearing rather than cosmetic:
 
