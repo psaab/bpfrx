@@ -129,6 +129,44 @@ func cosInterfaceMatchesSelector(name, selector string) bool {
 // render as 6-bit binary and 802.1p PCP as 3-bit binary, matching the vSRX
 // "Code point" column. A queue's loss priority defaults to "low" (the Junos
 // classifier default) when the config omits it.
+// noteUninstalledCoSEntries emits the #6534 annotation for classifier /
+// rewrite-rule / scheduler-map entries the userspace snapshot builder SKIPS
+// because they name an undefined forwarding-class. Such an object installs a
+// PARTIAL table — the listed code points do not classify, and shaping for that
+// class degrades to best-effort — while every row above rendered from config
+// exactly like an installed one.
+//
+// The verdict comes from config.CoSForwardingClassUndefined, the same
+// predicate the five builder loops in pkg/dataplane/userspace/cos.go consult,
+// so this cannot claim something the dataplane disagrees with.
+//
+// Emitted as a note under the table rather than an extra column so that an
+// all-healthy object's output stays byte-identical and the existing golden
+// tests keep asserting the same bytes. Nothing is written when every entry
+// installs.
+func noteUninstalledCoSEntries(b *strings.Builder, cos *config.ClassOfServiceConfig, fcs []string) {
+	seen := make(map[string]struct{}, len(fcs))
+	var bad []string
+	for _, fc := range fcs {
+		if !config.CoSForwardingClassUndefined(cos, fc) {
+			continue
+		}
+		if _, dup := seen[fc]; dup {
+			continue
+		}
+		seen[fc] = struct{}{}
+		bad = append(bad, fc)
+	}
+	if len(bad) == 0 {
+		return
+	}
+	sort.Strings(bad)
+	for _, fc := range bad {
+		fmt.Fprintf(b, "  NOT INSTALLED: entries for forwarding-class %s are skipped "+
+			"(no such class under `class-of-service forwarding-classes`)\n", emptyDash(fc))
+	}
+}
+
 func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) string {
 	if cfg == nil || cfg.ClassOfService == nil {
 		return "No class-of-service classifiers configured\n"
@@ -207,11 +245,16 @@ func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) str
 		sort.SliceStable(blk.rows, func(i, j int) bool { return blk.rows[i].value < blk.rows[j].value })
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "  Code point\tForwarding class\tLoss priority")
+		fcs := make([]string, 0, len(blk.rows))
 		for _, r := range blk.rows {
 			fmt.Fprintf(tw, "  %s\t%s\t%s\n",
 				codePointBinary(r.value, r.bits), emptyDash(r.fc), r.lp)
+			fcs = append(fcs, r.fc)
 		}
 		_ = tw.Flush()
+		// #6534: both classifier families have a builder skip
+		// (pkg/dataplane/userspace/cos.go, the DSCP and IEEE 802.1 loops).
+		noteUninstalledCoSEntries(&b, cos, fcs)
 	}
 	return b.String()
 }
@@ -497,11 +540,21 @@ func FormatCoSRewriteRules(cfg *config.Config, nameFilter, typeFilter string) st
 		})
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "  Forwarding class\tLoss priority\tCode point")
+		fcs := make([]string, 0, len(blk.rows))
 		for _, r := range blk.rows {
 			fmt.Fprintf(tw, "  %s\t%s\t%s\n",
 				emptyDash(r.fc), r.lp, codePointBinary(r.value, r.bits))
+			fcs = append(fcs, r.fc)
 		}
 		_ = tw.Flush()
+		// #6534: ONLY the dscp family. The builder publishes and filters
+		// DSCPRewriteRules (pkg/dataplane/userspace/cos.go); it never
+		// publishes IEEE8021RewriteRules at all, so annotating an
+		// ieee-802.1 entry here would claim a per-entry skip that does not
+		// happen — a different and larger gap, tracked separately.
+		if blk.cpType == "dscp" {
+			noteUninstalledCoSEntries(&b, cos, fcs)
+		}
 	}
 	return b.String()
 }
@@ -582,6 +635,15 @@ func FormatCoSSchedulerMaps(cfg *config.Config, nameFilter string) string {
 				emptyDash(row.fc), schedName, queue, priority, rate, buffer, exact)
 		}
 		_ = tw.Flush()
+		// #6534: a scheduler-map entry naming an undefined forwarding-class is
+		// skipped by the builder, so the class is not shaped. The Queue column
+		// already renders "-" for it, but a dash reads as "no queue
+		// configured", not "this entry is not installed" — state it.
+		fcs := make([]string, 0, len(rows))
+		for _, row := range rows {
+			fcs = append(fcs, row.fc)
+		}
+		noteUninstalledCoSEntries(&b, cos, fcs)
 	}
 	if rendered == 0 {
 		return fmt.Sprintf("No class-of-service scheduler-map matches %s\n", nameFilter)

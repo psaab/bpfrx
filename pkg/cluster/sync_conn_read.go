@@ -281,6 +281,30 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if s.OnBulkSyncAckReceived != nil {
 			go s.OnBulkSyncAckReceived()
 		}
+	case syncMsgConfigApplyNack:
+		// #7328: the peer did not apply a config generation this node pushed.
+		// Length-gated: a short/absent payload is ignored rather than treated
+		// as generation 0, which would be a valid-looking "legacy" value.
+		if len(payload) < 8 {
+			slog.Debug("cluster sync: short config-apply nack ignored", "len", len(payload))
+			return
+		}
+		nackedGen := binary.LittleEndian.Uint64(payload[:8])
+		// Only a nack for the generation this node most recently sent can
+		// re-arm the push marker. An older generation is a straggler for a
+		// push already superseded by a newer one; acting on it would re-push
+		// a config the peer may already have applied.
+		if sent := s.lastSentConfigGen.Load(); nackedGen != sent {
+			slog.Debug("cluster sync: ignoring stale config-apply nack",
+				"nacked_gen", nackedGen, "last_sent_gen", sent)
+			return
+		}
+		s.stats.ConfigApplyNacksReceived.Add(1)
+		slog.Warn("cluster sync: peer did not apply the config generation we pushed — re-arming the push marker",
+			"gen", nackedGen)
+		if s.OnPeerConfigApplyFailed != nil {
+			s.OnPeerConfigApplyFailed(nackedGen)
+		}
 	case syncMsgHeartbeat:
 		if conn == nil {
 			return

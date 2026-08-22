@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"time"
 )
@@ -247,8 +248,47 @@ func (s *SessionSync) QueueConfig(configText string) {
 		s.handleDisconnect(conn)
 		return
 	}
+	// #7328: record the generation actually put on the wire so a peer's
+	// config-apply nack can be matched to THIS push. Stored only after a
+	// successful write — a send that errored above disconnected, and the
+	// reconnect bumps the connection epoch and re-pushes on its own.
+	s.lastSentConfigGen.Store(gen)
 	s.stats.ConfigsSent.Add(1)
 	slog.Info("cluster sync: config sent to peer", "size", len(configText), "gen", gen)
+}
+
+// sendConfigApplyNack tells the SENDER that this node did not apply the config
+// generation it pushed (#7328). Called from configApplyLoop's failure branch,
+// which is the single ordered consumer, so nacks are naturally rate-bounded by
+// how often the peer pushes.
+//
+// Best-effort by construction: with no active connection there is nothing to
+// tell, and a write error disconnects, which bumps the peer's connection epoch
+// and makes its reconciler re-push anyway. The transport is TCP, so a nack that
+// is not delivered means the connection is gone — there is no silent-loss case
+// that would strand the marker.
+func (s *SessionSync) sendConfigApplyNack(gen uint64) {
+	if gen == 0 {
+		// A legacy/unknown generation never advanced a high-water and is
+		// applied unconditionally, so there is no marker to re-arm.
+		return
+	}
+	conn := s.getActiveConn()
+	if conn == nil {
+		return
+	}
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], gen)
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgConfigApplyNack, payload[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Debug("cluster sync: config-apply nack send error", "gen", gen, "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return
+	}
+	slog.Info("cluster sync: told peer its config generation did not apply here", "gen", gen)
 }
 
 // shouldApplyConfigGen is the admission half of the #3931 receiver-side config
@@ -430,6 +470,15 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				// degraded health instead of only the terse `Transfer ready: no`
 				// string.
 				s.noteConfigApplyFailure(err)
+				// #7328: tell the SENDER this generation did not take effect.
+				// #4151 leaves this node eligible for a re-push of the SAME
+				// generation, but the sender's #5863 (epoch x generation) marker
+				// was claimed BEFORE the push and nothing clears it, so no
+				// trigger on the live connection would ever push it again --
+				// the eligibility #4151 preserves is unreachable without this.
+				// The sender re-arms its marker and re-pushes on its ordinary
+				// reconcile cadence.
+				s.sendConfigApplyNack(item.gen)
 				// #6284: drop the fence — the high-water intentionally stays put
 				// (M-2/#4151), so restore the pre-apply admission posture.
 				s.endConfigApply()

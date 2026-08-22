@@ -104,10 +104,15 @@ impl crate::afxdp::Coordinator {
         // would otherwise pin coordinator state across the (blocking) push.
         let zone_name_to_id = self.forwarding.zone_name_to_id.clone();
 
-        let sessions = self
-            .sessions.synced
-            .lock()
-            .map_err(|_| "shared sessions lock poisoned".to_string())?;
+        // #6654: RECOVERING lock. This returned "shared sessions lock
+        // poisoned", so whether bulk export was REFUSED depended purely on
+        // which thread reached the mutex first: every other shared-session
+        // path (publish, lookup, remove, prewarm) CLEARS the poison, so the
+        // window closes the instant any of them runs. A guard that fires on
+        // thread interleaving is not a guard. End-to-end loss was bounded --
+        // pkg/daemon/daemon_ha_sync.go falls back to the authoritative
+        // BulkSync -- so the defect was the nondeterministic refusal itself.
+        let sessions = lock_shared_recover(&self.sessions.synced);
 
         let ha_state = self.ha.rg_runtime.load();
         let mut deltas = Vec::new();

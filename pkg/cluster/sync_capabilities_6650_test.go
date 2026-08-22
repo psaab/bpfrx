@@ -113,27 +113,41 @@ func TestCapabilityAdvertisedOnConnectionInstall6650(t *testing.T) {
 // type instead would have them MISPARSE it as real traffic.
 func TestPeerCapabilitiesMessageTypeIsUnique6650(t *testing.T) {
 	t.Parallel()
-	live := map[int]string{
-		syncMsgSessionV4: "SessionV4", syncMsgSessionV6: "SessionV6",
-		syncMsgDeleteV4: "DeleteV4", syncMsgDeleteV6: "DeleteV6",
-		syncMsgBulkStart: "BulkStart", syncMsgBulkEnd: "BulkEnd",
-		syncMsgHeartbeat: "Heartbeat", syncMsgConfig: "Config",
-		syncMsgIPsecSA: "IPsecSA", syncMsgFailover: "Failover",
-		syncMsgFence: "Fence", syncMsgClockSync: "ClockSync",
-		syncMsgBarrier: "Barrier", syncMsgBarrierAck: "BarrierAck",
-		syncMsgBulkAck: "BulkAck", syncMsgFailoverAck: "FailoverAck",
-		syncMsgFailoverCommit: "FailoverCommit", syncMsgFailoverCommitAck: "FailoverCommitAck",
-		syncMsgPrepareActivation: "PrepareActivation", syncMsgFailoverBatch: "FailoverBatch",
-		syncMsgFailoverBatchAck: "FailoverBatchAck", syncMsgFailoverBatchCommit: "FailoverBatchCommit",
-		syncMsgFailoverBatchCommitAck: "FailoverBatchCommitAck", syncMsgHeartbeatAck: "HeartbeatAck",
-		syncMsgDHCPLeaseV4: "DHCPLeaseV4", syncMsgDHCPLeaseV6: "DHCPLeaseV6",
-		syncMsgAuthHello: "AuthHello", syncMsgAuthProof: "AuthProof",
+	// A SLICE, not a map: syncMsgAuthHello and syncMsgConfigApplyNack both hold
+	// 27 (phase-separated -- pre-install handshake vs post-install), and a map
+	// literal with duplicate constant keys does not compile. Enumerating pairs
+	// keeps every live name in the guard instead of silently dropping one.
+	live := []struct {
+		v    int
+		name string
+	}{
+		{syncMsgSessionV4, "SessionV4"}, {syncMsgSessionV6, "SessionV6"},
+		{syncMsgDeleteV4, "DeleteV4"}, {syncMsgDeleteV6, "DeleteV6"},
+		{syncMsgBulkStart, "BulkStart"}, {syncMsgBulkEnd, "BulkEnd"},
+		{syncMsgHeartbeat, "Heartbeat"}, {syncMsgConfig, "Config"},
+		{syncMsgIPsecSA, "IPsecSA"}, {syncMsgFailover, "Failover"},
+		{syncMsgFence, "Fence"}, {syncMsgClockSync, "ClockSync"},
+		{syncMsgBarrier, "Barrier"}, {syncMsgBarrierAck, "BarrierAck"},
+		{syncMsgBulkAck, "BulkAck"}, {syncMsgFailoverAck, "FailoverAck"},
+		{syncMsgFailoverCommit, "FailoverCommit"}, {syncMsgFailoverCommitAck, "FailoverCommitAck"},
+		{syncMsgPrepareActivation, "PrepareActivation"}, {syncMsgFailoverBatch, "FailoverBatch"},
+		{syncMsgFailoverBatchAck, "FailoverBatchAck"}, {syncMsgFailoverBatchCommit, "FailoverBatchCommit"},
+		{syncMsgFailoverBatchCommitAck, "FailoverBatchCommitAck"}, {syncMsgHeartbeatAck, "HeartbeatAck"},
+		{syncMsgDHCPLeaseV4, "DHCPLeaseV4"}, {syncMsgDHCPLeaseV6, "DHCPLeaseV6"},
+		{syncMsgAuthHello, "AuthHello"}, {syncMsgAuthProof, "AuthProof"},
+		{syncMsgConfigApplyNack, "ConfigApplyNack"},
 	}
-	if name, ok := live[syncMsgPeerCapabilities]; ok {
-		t.Fatalf("syncMsgPeerCapabilities (%d) collides with %s. An old peer ignores an "+
-			"UNKNOWN type via the receive switch's missing default arm — that is the whole "+
-			"no-version-bump argument — but it MISPARSES a known one (#6650).",
-			syncMsgPeerCapabilities, name)
+	for _, m := range live {
+		if m.v == syncMsgPeerCapabilities {
+			t.Fatalf("syncMsgPeerCapabilities (%d) collides with %s. An old peer ignores an "+
+				"UNKNOWN type via the receive switch's missing default arm — that is the "+
+				"whole no-version-bump argument — but it MISPARSES a known one (#6650).",
+				syncMsgPeerCapabilities, m.name)
+		}
+	}
+	if len(live) < 25 {
+		t.Fatalf("the live-type list holds only %d entries — it has fallen behind "+
+			"sync.go and can no longer certify uniqueness", len(live))
 	}
 }
 

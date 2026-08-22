@@ -8,7 +8,10 @@ import (
 // #2078: the `security flow tcp-session` presence flags (no-syn-check,
 // no-syn-check-in-tunnel, rst-invalidate-session, no-sequence-check) are typed
 // and committed but the userspace AF_XDP dataplane enforces none of them (it
-// has no TCP state machine). Research #2078 converged PLAN-KILL on enforcement
+// does not track TCP sequence/window state). #6539 narrowed that clause: the
+// advisory used to say the dataplane "has no TCP state machine", which #3152
+// (OPENING vs established) and #3046 (RST vs FIN close) have since made false.
+// Research #2078 converged PLAN-KILL on enforcement
 // and recommended C2: emit a commit-time advisory so an operator who sets one
 // is not silently misled into believing it has runtime effect. These tests
 // pin that the advisory fires for each knob and folds them into one warning.
@@ -98,9 +101,13 @@ func TestTCPSessionAdvisory_FoldsAllKnobs(t *testing.T) {
 	}
 }
 
-// A tcp-session stanza with ONLY enforced/typed fields (timeouts) and none of
-// the unenforced presence flags must NOT emit the advisory — proves the warning
-// is gated on the actual knobs, not on the presence of the tcp-session node.
+// A tcp-session stanza with only established-timeout — the one leaf that IS
+// wire-carried — and none of the unenforced presence flags must NOT emit this
+// advisory: it proves the warning is gated on the actual knobs, not on the
+// presence of the tcp-session node. The OTHER three timeout leaves are not
+// enforced either and get their own advisory, keyed on #6539 rather than
+// #2078; findTCPSessionAdvisory below requires "#2078", so the two families
+// cannot satisfy each other's assertions.
 func TestTCPSessionAdvisory_TimeoutsOnlyNoWarn(t *testing.T) {
 	cfg := compileSetLines(t, []string{
 		"set security flow tcp-session established-timeout 600",
