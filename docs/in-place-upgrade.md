@@ -94,6 +94,39 @@ drain paths (#5845).
   DB, so a later rollback could not restore the config. A `dirSize`
   failure while sizing a PRESENT DB (e.g. EIO on a subfile) is likewise
   surfaced, never silently sized as 0.
+
+  **A RESUMED cut RE-TAKES this snapshot (#6556).** PREFLIGHT, COPY and
+  VERIFY are pure — the daemon stays LIVE and accepting commits across
+  all three — and the host-wide upgrade lock is NOT held across an
+  interruption, so the operator has no signal that a cut is pending. A
+  resume that reused the snapshot taken at the ORIGINAL preflight meant a
+  later auto-rollback silently reverted every commit made in the
+  interruption window. This is the same argument the VERIFY bullet below
+  already makes for its own sibling case (#1967/#1981), with a crash in
+  place of a verify failure.
+
+  The re-snapshot is FLOORED at STOPPED, and that floor is load-bearing
+  rather than cautious. From STOPPED the daemon is down, so no commit can
+  have landed and there is nothing to re-capture; and re-snapshotting at
+  FLIPPED would be actively WRONG — `versions/current` already points at
+  the new binary, which may have started and migrated the DB envelope, so
+  the "pre-upgrade" snapshot would capture POST-upgrade state and defeat
+  rollback entirely. The exposed span is exactly
+  `{PREFLIGHT, COPIED, VERIFIED}`.
+
+  The snapshot writer (`snapshotConfigDB`, extracted from `preflight` so
+  the resume path shares one implementation) also changed its ORDERING
+  for this: the replacement is made durable in `.partial` FIRST and only
+  then does the previous snapshot give way. The pre-#6556 code removed
+  the live snapshot before copying, which is harmless on a first
+  preflight (nothing to lose) and not harmless on a re-snapshot — a crash
+  mid-copy would leave the journal naming a directory that no longer
+  exists, so the rollback fails at restore time instead of falling back
+  on the older snapshot. It re-classifies the DB directory rather than
+  trusting the original preflight's verdict: a DB that is GONE by resume
+  time clears `DBSnapshotPath`/`AdvancedStateFloor` **and removes the
+  stale snapshot dir**, so a rollback cannot restore a config DB over a
+  root the operator deliberately emptied.
 - **COPY** — `staged/` → `.<ver>.partial/` + checksum + atomic rename to
   `versions/<ver>/`. A crash never leaves a half-populated version dir;
   stray `.partial` dirs are swept on re-run, and the sweep fsyncs the
@@ -572,6 +605,19 @@ state machines are untouched.
    opening a no-primary window for that group. forward-verify is the natural
    post-promotion check (`make test-failover`) — a passive node structurally
    cannot forward, so it is never "verified while passive".
+
+   **#6557**: until that issue, this paragraph described the intent and the
+   code did not implement it. `runRollingWith` step 7 called a bare
+   `cl.ResetFailover()` and returned nil; `RejoinAndConfirm` — declared on
+   the `RollingCluster` interface in `rolling.go` itself — was wired only
+   into `kernel_drain.go`. `fakeCluster` had carried the `rejoinIncomplete`
+   / `rejoinErr` seams since #5138 and no rolling test ever set them, and
+   `TestRolling_HappyPath` asserted only that `ResetFailover` was *called*,
+   so nothing observed the difference between requesting a rejoin and
+   confirming one. Step 7 now calls `RejoinAndConfirm(cl, RejoinDeadline)`,
+   so the binary rolling cut and the LANE-1 kernel roll share ONE definition
+   of "rejoined". On failure the node is left secondary and the error tells
+   the driver explicitly not to advance to the peer.
 
 ### `--unit` and the cluster control endpoint (#1983)
 

@@ -515,11 +515,18 @@ three reasons are structural, not implementation detail:
   order.
 
   To be precise about what this does *not* claim: the role-branched mismatch
-  that follows an RG0 handover **self-heals**. `reconcileConfigSyncToPeer` runs
-  on the `"rg0-promotion"` trigger, so once the new authority has pushed and the
-  new non-authority has applied, both counters are back in one namespace. The
-  hazard is not the steady state after a handover — it is the window *during*
-  one, which the next point covers.
+  that follows an RG0 handover is **not permanent by construction**.
+  `reconcileConfigSyncToPeer` runs on the `"rg0-promotion"` trigger, so once the
+  new authority has pushed and the new non-authority has applied, both counters
+  are back in one namespace. Nor, however, is it bounded by the handover itself:
+  the promotion reconciler claims its `(epoch × generation)` dedupe marker
+  **before** sending, so if the demoted node still believed it was primary when
+  the push landed it returns `errConfigSyncRejectedPrimary`, `configApplyLoop`
+  drops that attempt without advancing the applied mark, and every later
+  reconcile tick is deduped by the marker it already claimed. Convergence then
+  waits for a new commit (new generation) or a reconnect (new epoch). So the
+  window is *not* self-limiting to the transition — which makes the next point,
+  not this one, the load-bearing objection.
 - **The handover window needs the wire field the shortcut avoids.** RG0 role is
   not learned atomically by both nodes: each side updates on its own
   heartbeat/VRRP timing, so there is necessarily a skew window in which the old
@@ -551,11 +558,45 @@ three reasons are structural, not implementation detail:
   bulk re-prime, so the stamp would be 0 — the disable value — through cold
   prime, which is exactly when bulk sessions flow.
 
-Reopening the reverse direction therefore starts from the namespace design
-(a wire field carrying each node's applied-config generation, or an authority
-tag alongside `ConfigEpoch` plus a defined ordering across an RG0 authority
-change), which is a `ProtocolVersion` bump and an explicit owner decision — not
-a bounded increment.
+**What remains open: the tagged-epoch variant.** The three reasons above kill
+the *untagged* shortcut, but they do not establish that a new wire field or a
+`ProtocolVersion` bump is structurally required, and an earlier revision of this
+section wrongly said they did. A hostile review of #6419 constructed a variant
+that answers all three without either, and it is recorded here as the concrete
+starting point rather than left to be re-derived:
+
+Reserve the top bit of `ConfigEpoch` as a **stamp-source tag**. The authority
+sends its raw `configGenCounter` (tag clear); a *converged* non-authority sends
+`tag | lastAppliedConfigGen`; anything not converged sends 0. A receiver then
+accepts only the encoding its own role expects — a non-authority expects an
+untagged authority generation and compares it against `lastAppliedConfigGen`
+(exactly today's behaviour), an authority expects a tagged reverse generation,
+strips the tag and compares against `configGenCounter`. Any mismatch between the
+tag and the receiver's role means the sender's role assumption disagrees with
+the receiver's, so the epoch is treated as 0 and the guard disables.
+
+That disagreement case is what dissolves reason 2: during a dual-primary window
+both nodes send untagged and both expect tagged, so both disable rather than
+compare two unrelated boot seeds; during a both-secondary window the symmetric
+thing happens; and a message delayed across a role change fails open on the same
+rule. Reason 3 is answered by the convergence precondition — stamp the tagged
+form only when the received and applied marks agree and are nonzero, so a pinned
+or reset applied mark stamps 0 (today's fail-OPEN) instead of a stale value that
+would refuse everything.
+
+The bit is available in practice: generations derive from `MonotonicNanos()`, so
+the top bit is unused for centuries, and reserving it explicitly is a
+compile-time invariant rather than a wire-layout change. Nor does a semantic tag
+inside an existing field need a `ProtocolVersion` bump — the project bumps for
+incompatible layout changes, session trailers are length-gated, and the
+config-generation trailer itself deliberately avoided a bump. A legacy receiver
+reads a tagged value as a very large generation, which its unsigned `epoch <
+barrier` comparison admits — fail-OPEN, i.e. exactly today's behaviour.
+
+This is a design sketch, not code, and it has not itself been hostile-reviewed
+end to end; the RG0-role plumbing it needs at the stamp and threshold sites does
+already exist. Anyone picking it up owes the usual HA gate — it is session-sync
+coupled and owes a `test-failover` smoke.
 
 Both halves of this directional correctness are regression-pinned by
 `sync_config_epoch_active_active_6284_test.go`: the SAME frozen non-authority

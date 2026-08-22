@@ -26,6 +26,89 @@
 - **File(s)**: pkg/dataplane/userspace/eventstream.go,
   pkg/dataplane/userspace/eventstream_ack_behind_pending_6558_test.go,
   docs/session-sync-architecture.md
+## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
+
+- **Timestamp**: 2026-08-21
+- **Action**: Gated all six gRPC NAT full-table conntrack walks on the
+  shared `diagcmd.SessionWalkLimiter` the REST twin got in #6216:
+  `GetNATPoolStats` and `GetNATDestination` via `AcquireCtx` (with the
+  lease sampled inside `countNATSessions`' v4 and v6 callbacks), and the
+  four `ShowText` topics `persistent-nat`, `persistent-nat-detail`,
+  `nat-source-rule-detail`, `nat-dest-rule-detail` via the plain
+  `Acquire` ShowText precedent — those reach `pkg/natshow`, which is
+  shared with `pkg/cli` and takes no ctx, so the cancellation half is a
+  stated residual with a successor issue. Gate placement is inside the
+  dataplane-loaded branch, not at the handler top, so a config-only read
+  is never refused (a negative control pins that). Also centralised the
+  NAT pool port formula into `config.NATPoolTotalPorts` — five copies,
+  only REST carried the `portHigh >= portLow` guard.
+  Mutation matrix: P1/P2 (drop admission from each RPC) → that surface's
+  cell reds; P3 (ShowText gate neutered) → the four ShowText cells red;
+  P4 (drop ctx sampling) → the cancellation probe reds; P5 (hoist
+  admission to the handler top) → the no-dataplane negative control
+  reds; P6 (re-inline the port formula) → the SSOT guard reds.
+  NOTE: acceptance criterion 2 (a structural "every full-table-scan
+  surface declares an admission policy" test) is deliberately NOT
+  attempted — open #7294 owns it and records that the AST approach was
+  tried and abandoned as too brittle. #5968 is closed and its inventory
+  does not name these surfaces, so this is not a dup.
+- **File(s)**: pkg/grpcapi/server_nat.go, pkg/grpcapi/server_helpers.go,
+  pkg/grpcapi/server_show_nat.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/nat_walk_admission_6553_test.go,
+  pkg/grpcapi/nat_walk_admission_6553_helper_test.go,
+  pkg/config/nat_pool_ports.go, pkg/api/nat.go, pkg/api/metrics_nat.go,
+  pkg/cli/cli_show_nat.go, pkg/api/README.md
+## 2026-08-21 — #6556 resumed cut re-takes the config-DB snapshot
+
+- **Timestamp**: 2026-08-21
+- **Action**: A resumed upgrade cut reused the config-DB snapshot taken
+  at the ORIGINAL preflight, so a later auto-rollback silently reverted
+  every commit made in the interruption window. Extracted
+  `snapshotConfigDB` from `preflight` and called it from a new resume arm
+  on the preflight gate, FLOORED at `StateStopped`: from STOPPED the
+  daemon is down (nothing to re-capture) and at FLIPPED a re-snapshot
+  would capture POST-upgrade DB state and defeat rollback outright, so
+  the exposed span is exactly {PREFLIGHT, COPIED, VERIFIED}. The
+  extracted writer also re-classifies the DB dir (a DB deleted during the
+  window clears the fields AND removes the stale snapshot) and reorders
+  the write so the replacement is durable in `.partial` before the old
+  snapshot gives way.
+  Mutation matrix: Q1 (remove the resume arm — the pre-fix gate) → all
+  three live-state cells red; Q2 (drop the STOPPED floor) → the
+  past-STOPPED inverse test reds; Q3 (drop the stale-snapshot cleanup)
+  → the DB-removed test reds; Q4 (restore the destroy-before-copy
+  ordering) → the mid-copy-failure test reds; Q5 (drop the post-
+  re-snapshot `saveJournal`) → GREEN and disclosed: the next state
+  transition persists anyway, so binding it would need a crash seam.
+  Attribution correction: the sibling DB-snapshot clearing came from
+  #1967 (`0dc51d983`), not #1981 (`f35cc4d61`, which deepened the rewind
+  to StateInit and added the SourceGeneration clear).
+- **File(s)**: pkg/upgrade/cutover.go,
+  pkg/upgrade/resume_dbsnapshot_6556_test.go, docs/in-place-upgrade.md
+
+## 2026-08-21 — #6557 rolling step 7 confirms the rejoin per-RG
+
+- **Timestamp**: 2026-08-21
+- **Action**: `runRollingWith` step 7 called a bare `cl.ResetFailover()`
+  and reported "cut complete" without confirming it. Replaced with
+  `RejoinAndConfirm(cl, rc.RejoinDeadline)` — the #5138 per-RG readback
+  that was declared on the `RollingCluster` interface in `rolling.go`
+  itself but wired only into `kernel_drain.go`. Reusing it (rather than
+  open-coding a poll) keeps the binary rolling cut and the LANE-1 kernel
+  roll on one definition of "rejoined". The failure error now tells the
+  driver explicitly not to advance to the peer. Added a `rejoinChecks`
+  counter to `fakeCluster`: the pre-existing `TestRolling_HappyPath`
+  asserted only that `ResetFailover` was CALLED, which a step 7 that
+  never confirms satisfies just as well.
+  Mutation matrix: R1 (restore the shipped bare `ResetFailover`) → all
+  three tests red; R2 (confirm but log-and-continue) → both behavioural
+  tests red; R3 (drop the "MUST NOT advance to the peer" guidance) → the
+  incomplete-rejoin test reds.
+  NOTE: `docs/in-place-upgrade.md` already DESCRIBED this behaviour as
+  shipped — the doc was ahead of the code, and now says so.
+- **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/rolling_test.go,
+  pkg/upgrade/rolling_rejoin_confirm_6557_test.go,
+  docs/in-place-upgrade.md
 
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
@@ -68,6 +151,40 @@
   pkg/dataplane/userspace/zones_host_inbound.go, cmd/cli, plus the
   eight fixtures that encoded the union semantics
 
+## 2026-08-21 — #6552 diagnostic-fork concurrency bound on ShowText/GetSystemInfo
+
+- **Timestamp**: 2026-08-21
+- **Action**: Made `outputTimeout`/`combinedOutputTimeout` acquire the
+  shared `diagcmd.DefaultLimiter` slot before forking, so the ten
+  read-only diagnostic fork sites in `ShowText` (journalctl, tail,
+  chronyc ×2, ntpq, timedatectl) and `GetSystemInfo` (ps, df,
+  journalctl, ss) draw from the same `MaxConcurrentDiagnostics=4` budget
+  ping/traceroute already use on both surfaces. Unbounded forms renamed
+  `*Unlimited`; three uses stay unbounded by design (power actions,
+  zeroize teardown, ip neigh flush) and are named in an allowlist a
+  source tripwire checks in BOTH directions. Errors map through
+  `diagExecError` so a refused admission is `ResourceExhausted`, not
+  `Internal`. Both `grpc.NewServer` builders now set
+  `MaxConcurrentStreams(256)` — grpc-go's server default is unlimited.
+  SECURITY DETERMINATION: no injection vector. Nine sites pass only
+  compile-time literals to `exec.CommandContext` (no shell); the tenth
+  (`tail -n N <logPath>`) is request-derived on both args and
+  constrained on both (clampTailLines [1,10000] re-emitted via Itoa;
+  SyslogLogFilePath enforces `filepath.Base` + the configured
+  `system syslog file` allowlist → `/var/log/<allowlisted-base>`).
+  Mutation matrix: N1/N2 (restore each helper's pre-fix unbounded body)
+  → the matching bound test + tripwire red; N3 (anchor site points at
+  the Unlimited helper) → tripwire names it; N4 (delete a
+  `MaxConcurrentStreams` line) → server test red; N5 (acquire at the
+  handler top instead of the fork) → the non-forking `users` negative
+  control reds; N6 (bogus exemption) → tripwire reds on the stale side.
+  Issue said six fork sites; there are ten, and the chronyc/ntpq chain
+  is in `ShowText{ntp}`, not `GetSystemInfo`.
+- **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show.go, pkg/grpcapi/server_show_status.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/diag_fork_limiter_6552_test.go, pkg/grpcapi/README.md
 ## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
 
 - **Timestamp**: 2026-08-22
@@ -100975,6 +101092,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/device_map_dup_name_6546_test.go (new),
   docs/bare-metal-device-map.md, _Log.md
 
+## 2026-08-21 — #6515 (b): the narrowing advisory is guarded on the real commit paths
+- **Timestamp**: 2026-08-21
+- **Action**: The #6515 advisory warns that established sessions are FLUSHED at
+  commit (#5566), not merely that new connections are refused — but nothing
+  bound either that sentence or the claim that the advisory reaches an operator
+  who types `commit` without ever running `commit check`. MEASURED by driving
+  the real handlers rather than reading the wiring: the local CLI prints it on
+  `commit`, `commit check` and `commit confirmed`, and all three gRPC commit
+  RPCs return it in their `Warnings` field. No product change was needed; the
+  guards are new. Also renamed the new test functions to carry `_6515` — the
+  file name alone made `-run 6515` select ZERO tests and exit 0.
+- **File(s)**: pkg/cli/commit_advisory_surface_6515_test.go (new),
+  pkg/grpcapi/commit_advisory_warnings_6515_test.go (new)
 ## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
 - **Timestamp**: 2026-08-21
 - **Action**: #6515 and #6519 landed independently, each carrying its own copy of
@@ -100988,3 +101118,98 @@ prose edit above them added. No diff falls in the new test body.
   resolver admits. Behaviour-preserving; no advisory or enforcement change.
 - **File(s)**: pkg/config/host_inbound_view.go,
   pkg/config/host_inbound_dhcp_scope_6519.go
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #7304 follow-up — folded a post-merge hostile Codex review: closed
+    two vacuous-green holes in the #6419 assertions (errors.Is(nil,nil) sentinel
+    mutation; the production OnConfigReceived wiring was never bound), corrected
+    the backwards R1 comment, and recorded the tagged-epoch variant that refutes
+    the categorical #6419 close.
+  - **File(s)**: pkg/daemon/config_sync_test.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/sync_conn_gen.go, docs/session-sync-architecture.md
+
+## 2026-08-21 — #6547: pre-sign gate now verifies the image seal
+- **Timestamp**: 2026-08-21
+- **Action**: `scripts/image/validate.py` — the gate that runs strictly before
+  `sign_step` — asserted nothing about image sealing, so a clone-identity
+  regression (shared SSH host key / machine-id / SNMPv3 EngineID) shipped
+  SIGNED. Added `_image_seal_verdict` + `Harness.assert_image_sealed`, which
+  reads the exported qcow2 OFFLINE with libguestfs (the only place the property
+  is observable — first boot regenerates all of it) and fails closed on an
+  unobserved check or a missing tool. `bake.py` grew `SYSPREP_ENABLE_OPS` /
+  `SYSPREP_PURGE_PATHS` as the single source for the seal; a hermetic test binds
+  the gate's identity table to them, so dropping an `--enable` member reds.
+  Calibrated end-to-end on purpose-built unsealed/sealed qcow2 fixtures.
+- **File(s)**: scripts/image/validate.py, scripts/image/bake.py,
+  scripts/image/test_validate_image_seal_6547.py (new),
+  docs/image-validation.md, docs/install-images.md, _Log.md
+
+## 2026-08-21 — #6460 DHCP-server host-inbound bypass advisory
+- **Timestamp**: 2026-08-21
+- **Action**: Split #6460. Its multicast/broadcast leg is the same defect as
+  #4455 (HI-1), already terminal there — Component B (the observability
+  advisory) shipped in PR #4786, Component A (the per-zone `iifname` DROP
+  gate) PLAN-KILLed — and #6460's own 65-round research arc re-derived that
+  same kill. The one leg #4455 never covered is the DHCP server: both #4455
+  arms cross-check ROUTING protocols against FRR, so a `dhcp-local-server`
+  group bound to an interface whose zone omits `dhcp`/`dhcpv6` produced ZERO
+  advisory. Added `validateDHCPServerHostInboundBypassWarnings`: WARN-only,
+  zero dataplane surface, per-family mechanism text (v4 = Kea's default `raw`
+  AF_PACKET socket taps ahead of netfilter; v6 = ff02::1:2 matches no per-zone
+  unicast `daddr` and falls through `policy accept`). Reuses the
+  `zoneIfaceLogicalKeys` + `InterfaceHostInboundEffective` SSOTs so the three
+  advisories cannot drift. Remedy leads with removing the interface from the
+  group, not with adding the token — the token cannot enforce anything on v4.
+- **File(s)**: pkg/config/compiler_validate_warn_dhcp_hostinbound.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/dhcp_host_inbound_bypass_6460_test.go (new),
+  docs/host-inbound-multicast.md, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-08-21 — #6555 ddns default interface source DHCP-restart guard
+- **Timestamp**: 2026-08-21
+- **Action**: The #4423 M10 guard existed only on the `dhcp` address source. The
+  DEFAULT source (`interface`, what an unset `address-source` resolves to) still
+  read a DHCP client-restart address-gone window as a DEFINITIVE loss and
+  withdrew the public A/AAAA record. Added the symmetric guard to
+  `observeInterfaceAddr`, gated on an EMPTY family address list (the restart
+  window) rather than on selection failure (tentative/non-public stays
+  definitive, matching the dhcp source). Single-sourced both sources' predicate
+  as `unitRunsDHCPForFamily`.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
+
+## 2026-08-21 — #6548: console `load ... terminal` aborts on Ctrl-C
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/cli` handleLoad's terminal read loop took the same `break`
+  for EOF, `readline.ErrInterrupt` and every read error, then applied the
+  PARTIAL paste and printed a success message — the #4883-D bug, fixed on the
+  remote CLI and never applied to the console. The loop is now single-sourced
+  in the new `pkg/cliterm` (a divergence between the two surfaces is always a
+  bug) and both CLIs call it; only Ctrl-D commits. Added a `CLI.readLineFn`
+  test seam so the loop is drivable at all — it was unguarded for exactly as
+  long as it was undrivable.
+- **File(s)**: pkg/cliterm/terminal.go (new), pkg/cliterm/terminal_test.go
+  (new), pkg/cli/cli_config.go, pkg/cli/cli.go, cmd/cli/main.go,
+  pkg/cli/load_terminal_abort_6548_test.go (new), pkg/cli/README.md, _Log.md
+
+## 2026-08-21 — #6559 proxy-arp prefix expansion
+- **Timestamp**: 2026-08-21
+- **Action**: `security nat proxy-arp ... address <prefix>` dropped the prefix
+  length: the compiler stored the authored string and the installer keyed on
+  `prefix.Addr()` alone, one neighbour per statement. `netip.ParsePrefix` does
+  not mask, so a CANONICAL prefix installed the NETWORK address — zero useful
+  entries with the `proxy_arp` sysctl still on. Added `expandProxyARPPrefix`
+  in the compiler (network/broadcast excluded, RFC 3021 /31 exception,
+  `Masked()` so a non-canonical spelling expands to the same block), capped at
+  256 to match the `address <low> to <high>` sibling under the same stanza.
+  Over-cap blocks are left authored and rejected by a new
+  `validateProxyARPAddressesStrict` arm (warned on the tolerant path, #1960).
+  Prerequisite: a bare IPv6 literal now compiles to /128, not the
+  unconditional /32.
+- **File(s)**: pkg/config/compiler_nat_proxyarp_prefix.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/proxy_arp_prefix_expand_6559_test.go (new),
+  pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/feature-gaps.md, docs/phases.md, _Log.md

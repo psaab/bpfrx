@@ -215,7 +215,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		return &pb.SystemActionResponse{Message: fmt.Sprintf("Configuration lock cleared (was held by %s)", holder)}, nil
 
 	case "clear-arp":
-		out, err := combinedOutputTimeout(ctx, "ip", "-4", "neigh", "flush", "all")
+		out, err := combinedOutputTimeoutUnlimited(ctx, "ip", "-4", "neigh", "flush", "all")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "flush ARP: %s", strings.TrimSpace(string(out)))
 		}
@@ -227,7 +227,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		}, nil
 
 	case "clear-ipv6-neighbors":
-		out, err := combinedOutputTimeout(ctx, "ip", "-6", "neigh", "flush", "all")
+		out, err := combinedOutputTimeoutUnlimited(ctx, "ip", "-6", "neigh", "flush", "all")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "flush IPv6 neighbors: %s", strings.TrimSpace(string(out)))
 		}
