@@ -102890,3 +102890,13 @@ prose edit above them added. No diff falls in the new test body.
     compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
     pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
     docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6598 — brought the LIVE fabric peer-MAC resolver up to the
+    same bar as refreshFabricFwd (NUD state + 6-byte lladdr) and gave the
+    predicate ONE definition consumed by all five daemon sites, including an
+    inline mask expansion no search for the const name would have found.
+  - **File(s)**: pkg/dataplane/userspace/fabric.go, pkg/daemon/daemon_ha_fabric.go,
+    pkg/dataplane/userspace/fabric_peer_mac_6598_test.go,
+    pkg/daemon/fabric_neigh_single_source_6598_test.go,
+    docs/fabric-cross-chassis-fwd.md
