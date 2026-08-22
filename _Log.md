@@ -102303,3 +102303,16 @@ prose edit above them added. No diff falls in the new test body.
   re-refuses every boot and an HA node holds SECONDARY indefinitely.
 - **File(s)**: pkg/upgrade/flip.go, pkg/upgrade/kernel.go,
   pkg/upgrade/kernel_arm_restamp_6639_test.go (new), _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6641 — surfaced SHARED_SESSION_POISON_RECOVERIES (#2402) as
+    xpf_userspace_shared_session_poison_recoveries_total, mirroring #1807 end to
+    end. Added a gate binding EVERY Coordinator *_total() accessor to its
+    ProcessStatus assignment — the #1807 precedent's own populate line was
+    unbound too.
+  - **File(s)**: userspace-dp/src/{afxdp/coordinator/status.rs,protocol/control.rs,
+    protocol/tests.rs,server/helpers/status.rs,server/lifecycle.rs},
+    userspace-dp/tests/fixtures/protocol_wire_v1.json,
+    pkg/dataplane/userspace/{protocol_status.go,protocol_test.go},
+    pkg/api/{metrics.go,metrics_userspace.go,metrics_descriptors_userspace_session.go,
+    metrics_descriptor_coverage_test.go,metrics_test.go}
