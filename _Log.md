@@ -1,3 +1,44 @@
+## 2026-08-22 — #6897: the failover gate could emit no throughput cell, and had
+
+- **Timestamp**: 2026-08-22
+- **Action**: Answered the "has it already bitten us" question with data
+  instead of leaving it open. Swept every local failover log: 71 runs at
+  `14 passed, 0 failed`, one at `12 passed, 2 failed` (12+2 = 14, all cells
+  emitted), and ONE at `13 passed, 0 failed`. That odd run
+  (`jobs/22249260/tmp/failover.log`) emits 13 cells and `grep -c "iperf3
+  throughput"` returns 0 — the cell is ABSENT, not failed, and
+  `PASS iperf3 completed successfully` fired just before it, so the run looked
+  healthy to the summary. 13 assertions plus one silent absence, reported as a
+  clean green.
+  Root cause: the parse matched only `Gbits`, so a sub-Gbit `[SUM]` line set
+  the throughput to the literal `"0"` and then matched neither the pass branch
+  nor the fail branch — there was no else. Sub-Gbit is exactly what a
+  throughput regression or a CoS-shaped class looks like, so the gate went
+  silent in the case it exists to catch.
+  Fixed by extracting the parse and the verdict into
+  `test/incus/iperf-throughput-lib.sh`: the unit is normalised (K/M/G), and
+  the verdict is TOTAL — absent, unparseable, too-low and healthy each yield
+  exactly one cell. The caller maps the verdict with a catch-all default so an
+  unknown status still emits one. Demonstrated old-vs-new on the exact
+  incident input: OLD emits 0 cells, NEW emits 1 carrying the real 0.0860 Gbps.
+  Extraction was the point, not tidiness: it makes the GATE'S OWN fix testable
+  without a cluster, which is what lets this change be reviewed on its own
+  terms. New hermetic `make test-iperf-throughput-lib` (18 cells).
+  The self-test also binds the WIRING, not just the lib — deleting the call
+  from `test-failover.sh` would otherwise leave it green, which is the shape
+  that has produced repeated false confidence. Mutation M1 is exactly that
+  deletion and it reds.
+  Defect 2 of the issue (the established-session floor) is OBSOLETE: #4052
+  already added the 20 x 0.5s poll the issue asks for, and #7368 already added
+  the fw0/fw1 cross-reference that names an ownership/forwarding divergence
+  instead of blaming establishment — which is precisely the inconsistency the
+  issue observed.
+  Mutation matrix M1-M5 all RED, `bash -n` clean at every mutated state, PASS
+  cell counts compared against the control (18) rather than merely non-zero.
+- **File(s)**: `test/incus/iperf-throughput-lib.sh` (new),
+  `test/incus/iperf-throughput-selftest.sh` (new),
+  `test/incus/test-failover.sh`, `Makefile`, `CLAUDE.md`
+
 ## 2026-08-22 — #6678: device-map OriginalName= no longer falls back to the logical name
 
 - **Timestamp**: 2026-08-22
