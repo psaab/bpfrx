@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -688,6 +689,15 @@ type ifSnapshot struct {
 	a      *Agent
 	loaded bool
 	data   []IfData
+
+	// oids is the full MIB view for this PDU in lexicographic order —
+	// staticOIDs, then every ifTable cell, then every ifXTable cell — built
+	// once on first use and binary-searched by findNextOIDSnap (#6597).
+	// oidsBuilt distinguishes "not yet built" from "built and legitimately
+	// empty" (an agent with no interfaces still has staticOIDs, so empty is in
+	// practice unreachable, but the flag keeps the lazy contract honest).
+	oids      [][]int
+	oidsBuilt bool
 }
 
 // newIfSnapshot returns a fresh per-PDU interface-data snapshot bound to the
@@ -706,6 +716,65 @@ func (s *ifSnapshot) get() []IfData {
 		s.loaded = true
 	}
 	return s.data
+}
+
+// mibOIDs returns this PDU's whole MIB view in lexicographic order, built once
+// per snapshot (#6597).
+//
+// The successor lookup used to LINEAR-SCAN this view for every varbind —
+// O(static + interfaces x columns) per lookup, multiplied by every varbind an
+// operation emits. Because the agent runs on a single serial goroutine, that
+// per-lookup cost is the floor on requests/second for every operation at once,
+// and it grows with interface count: a max-size plain GETNEXT of 239 deep
+// ifXTable OIDs measured ~33 ms, i.e. ~30 req/s for that shape (#6551 fold).
+// Building the ordered view once per PDU and binary-searching it moves the walk
+// from O(varbinds x entries) to O(entries + varbinds x log entries).
+//
+// The interface list is SORTED BY IfIndex here, which the linear scan did not
+// do. Its lexicographic correctness silently depended on `ifDataFn` returning
+// IfIndex-ascending data, and nothing enforces that: the production provider
+// (`buildSNMPIfData`, pkg/daemon) appends in netlink LinkList order with no
+// sort. For the usual ascending case the emitted order is identical to the
+// linear scan's; for a provider that returns them out of order the walk is now
+// correctly lexicographic where it previously could revisit or skip OIDs, which
+// is a fix rather than a behaviour change worth preserving.
+//
+// Column-major with ascending IfIndex IS the lexicographic order of
+// `<prefix>.<col>.<ifIndex>`, so the concatenation below is sorted by
+// construction; `TestMIBOIDViewIsSorted` pins that rather than trusting it.
+func (s *ifSnapshot) mibOIDs() [][]int {
+	if s.oidsBuilt {
+		return s.oids
+	}
+	s.oidsBuilt = true
+
+	ifaces := s.get()
+	sorted := make([]IfData, len(ifaces))
+	copy(sorted, ifaces)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].IfIndex < sorted[j].IfIndex })
+
+	out := make([][]int, 0, len(staticOIDs)+
+		len(sorted)*(len(ifTableColumns)+len(ifXTableColumns)))
+	out = append(out, staticOIDs...)
+	for _, tbl := range []struct {
+		prefix []int
+		cols   []int
+	}{
+		{oidIfTablePrefix, ifTableColumns},
+		{oidIfXTablePrefix, ifXTableColumns},
+	} {
+		for _, col := range tbl.cols {
+			for _, iface := range sorted {
+				candidate := make([]int, len(tbl.prefix)+2)
+				copy(candidate, tbl.prefix)
+				candidate[len(tbl.prefix)] = col
+				candidate[len(tbl.prefix)+1] = iface.IfIndex
+				out = append(out, candidate)
+			}
+		}
+	}
+	s.oids = out
+	return s.oids
 }
 
 // Start binds the UDP/161 listener and then serves requests until the context
@@ -1656,45 +1725,17 @@ func (a *Agent) findNextOID(oid []int) []int {
 // interface snapshot, so a GETNEXT/GETBULK walk reads the interface list once
 // per PDU rather than once per next-OID lookup.
 func (a *Agent) findNextOIDSnap(oid []int, snap *ifSnapshot) []int {
-	// Check static OIDs first.
-	for _, candidate := range staticOIDs {
-		if oidCompare(candidate, oid) > 0 {
-			return candidate
-		}
-	}
-
-	// Walk ifTable OIDs: 1.3.6.1.2.1.2.2.1.<col>.<ifIndex>
-	ifaces := snap.get()
-	if len(ifaces) == 0 {
+	// #6597: binary search the per-PDU ordered MIB view instead of scanning it.
+	// sort.Search returns the first index whose OID sorts strictly after `oid`,
+	// which is exactly the GETNEXT successor.
+	view := snap.mibOIDs()
+	i := sort.Search(len(view), func(i int) bool {
+		return oidCompare(view[i], oid) > 0
+	})
+	if i == len(view) {
 		return nil
 	}
-
-	// Build sorted list of all ifTable OIDs.
-	for _, col := range ifTableColumns {
-		for _, iface := range ifaces {
-			candidate := make([]int, len(oidIfTablePrefix)+2)
-			copy(candidate, oidIfTablePrefix)
-			candidate[len(oidIfTablePrefix)] = col
-			candidate[len(oidIfTablePrefix)+1] = iface.IfIndex
-			if oidCompare(candidate, oid) > 0 {
-				return candidate
-			}
-		}
-	}
-
-	// Walk ifXTable OIDs: 1.3.6.1.2.1.31.1.1.1.<col>.<ifIndex>
-	for _, col := range ifXTableColumns {
-		for _, iface := range ifaces {
-			candidate := make([]int, len(oidIfXTablePrefix)+2)
-			copy(candidate, oidIfXTablePrefix)
-			candidate[len(oidIfXTablePrefix)] = col
-			candidate[len(oidIfXTablePrefix)+1] = iface.IfIndex
-			if oidCompare(candidate, oid) > 0 {
-				return candidate
-			}
-		}
-	}
-	return nil
+	return view[i]
 }
 
 // varbind holds a single OID-value binding.
