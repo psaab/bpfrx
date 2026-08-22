@@ -775,29 +775,52 @@ fn colliding_sessions_share_one_steering_key_6745() {
 
 #[test]
 fn a_shared_steering_row_survives_the_first_close_6745() {
+    // OBSERVED THROUGH delete_dnat_table_entry, not through the accounting
+    // helper it calls. An earlier revision asserted on
+    // release_dnat_steering_holder directly and stayed GREEN under the
+    // mutation that matters — restoring the UNCONDITIONAL delete, i.e. calling
+    // the helper and ignoring its answer. A refcount nothing consults is not a
+    // refcount, so the map delete itself is what this watches, via the
+    // test-only DNAT_DELETE_ATTEMPTS counter that the family arms bump only
+    // once the gate has let them through. The fd is -1: the syscall returns
+    // EBADF, which is benign — the contract under test is whether the keyed
+    // delete is ATTEMPTED.
+    use crate::afxdp::checksum::DNAT_DELETE_ATTEMPTS;
+    use std::sync::atomic::Ordering;
+
+    // Serialize against any other test touching the process-global counter.
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = GUARD.lock().expect("counter guard");
+
     reset_dnat_steering_holders();
     let (a, b) = colliding_pair_6745();
     let nat = dnat_snat_decision();
-    // No fds: the accounting is what is under test, and a real BPF map cannot
-    // be created under `cargo test` (unprivileged_bpf_disabled).
-    let fds = DnatTableFds::default();
+    let fds = DnatTableFds {
+        v4: Some(-1),
+        v6: None,
+    };
 
     publish_dnat_table_entry(&fds, &a, nat);
     publish_dnat_table_entry(&fds, &b, nat);
     assert_eq!(dnat_steering_holder_count(&a, nat), 2, "both sessions must hold the row");
 
-    // A closes. The row is still B's only steering path.
-    assert!(
-        !release_dnat_steering_holder(&a, nat),
-        "closing the FIRST of two sessions sharing a steering row must NOT release it -- \
-         deleting it here blackholes the survivor's return traffic (#6745)"
+    // A closes. The row is still B's only steering path, so NO map delete.
+    let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    delete_dnat_table_entry(&fds, &a, nat);
+    assert_eq!(
+        DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed),
+        before,
+        "closing the FIRST of two sessions sharing a steering row issued the map delete -- \
+         that blackholes the survivor's return traffic until it republishes (#6745)"
     );
     assert_eq!(dnat_steering_holder_count(&a, nat), 1);
 
     // B closes. Now it is nobody's, and leaving it would leak a map row.
-    assert!(
-        release_dnat_steering_holder(&b, nat),
-        "closing the LAST holder must release the row -- otherwise the fix trades a \
+    delete_dnat_table_entry(&fds, &b, nat);
+    assert_eq!(
+        DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed),
+        before + 1,
+        "closing the LAST holder must issue the map delete -- otherwise the fix trades a \
          blackhole for an unbounded map leak"
     );
     assert_eq!(dnat_steering_holder_count(&b, nat), 0);
@@ -828,11 +851,24 @@ fn an_unaccounted_row_is_still_deleted_6745() {
     // that did not account -- or by an older build across a helper restart --
     // must delete exactly as it did before #6745, never leak. "Unchanged" is
     // the right answer here; "the map fills up" is not.
+    use crate::afxdp::checksum::DNAT_DELETE_ATTEMPTS;
+    use std::sync::atomic::Ordering;
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = GUARD.lock().expect("counter guard");
+
     reset_dnat_steering_holders();
     let key = dnat_v4_key();
-    assert!(
-        release_dnat_steering_holder(&key, dnat_snat_decision()),
-        "a row with no recorded holder must still be deletable"
+    let fds = DnatTableFds {
+        v4: Some(-1),
+        v6: None,
+    };
+    let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    delete_dnat_table_entry(&fds, &key, dnat_snat_decision());
+    assert_eq!(
+        DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed),
+        before + 1,
+        "a row with no recorded holder must still be deleted -- the failure direction of an \
+         accounting gap has to be `unchanged`, never `the map fills up`"
     );
 }
 
