@@ -68,9 +68,39 @@ func (s *Server) showChassisForwarding(ctx context.Context, buf *strings.Builder
 func (s *Server) showChassisClusterStatus(buf *strings.Builder) {
 	if s.cluster != nil {
 		buf.WriteString(s.cluster.FormatStatus())
+		s.appendFabricClockSkew(buf)
 	} else {
 		fmt.Fprintln(buf, "Cluster not configured")
 	}
+}
+
+// appendFabricClockSkew surfaces the #6708 measured peer wall-clock skew.
+//
+// It is written HERE rather than inside cluster.FormatStatus because the
+// measurement belongs to the fabric gRPC listener, which lives in this package;
+// pushing it down into pkg/cluster would invert the dependency for one line of
+// output. Nothing is printed when no skew has been measured, so a healthy
+// cluster's status is byte-identical to before.
+//
+// Why it matters here specifically: a skew past the fabric auth window kills
+// every cross-node RPC while VRRP and failover keep working, so `show chassis
+// cluster status` reports a perfectly healthy cluster while every cross-node
+// query returns LOCAL-ONLY. This is the line that connects the two.
+func (s *Server) appendFabricClockSkew(buf *strings.Builder) {
+	skew, ok := s.FabricPeerClockSkew()
+	if !ok {
+		return
+	}
+	dir := "ahead of"
+	if skew < 0 {
+		dir = "behind"
+		skew = -skew
+	}
+	fmt.Fprintf(buf, "\nWarning: peer wall clock is %ds %s this node (fabric auth window %ds).\n"+
+		"  Cross-node fabric RPCs (session queries, aggregation, clear propagation,\n"+
+		"  cross-node failover) are failing authentication. Forwarding, VRRP and\n"+
+		"  failover are unaffected. Synchronise NTP on both nodes.\n",
+		skew, dir, fabricAuthWindowSeconds)
 }
 
 // showChassisClusterInterfaces renders cluster RETH interfaces.

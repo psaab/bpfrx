@@ -3923,6 +3923,132 @@ measured rather than reasoned about:
 So: accumulate both slots, keep empties, synthesize nothing. It reads every KEY
 of each child rather than `child.Name()`, per #6714.
 
+### The gate's own COVERAGE is gated too (#7484)
+
+The differential above can only fail a leaf it actually compared. It needs two
+spellings to return a usable `keep`/`drop` verdict; a leaf that does not reach
+that bar carries **no verdict at all** and cannot fail anything. At `6b47801de`
+that was **430 of 1049 enumerated leaves**, and the number lived only in a
+`t.Logf` — so 619-compared and 1049-compared both rendered as PASS.
+
+That is not hypothetical. `security log stream <*> transport protocol` and
+`… tls-profile` were among the 430, and **#6821 reports exactly that leaf as
+broken** (compact-leaf spelling drops the TLS profile, audit logs ship
+unprotected). The gate built to catch the #2419 class was reporting "no spelling
+inconsistencies" over a leaf where one was already filed.
+
+`TestSchemaSpellingGateCoverageIsGated_7484` makes coverage a **gated property**:
+
+- `gateCoverageFloor` is a FLOOR — coverage may rise freely, and a rise is a fix
+  working, never a regression. Falling below it fails the build.
+- each blind class carries a CEILING — a blind spot may shrink freely but not
+  grow, so a new schema leaf that lands COVERED costs nothing while one that
+  lands BLIND forces a deliberate decision.
+- an IMPROVEMENT also fails, with the measured numbers and an instruction to
+  tighten the constants. A ceiling nobody lowers rots into a rubber stamp.
+
+**The four blind classes are four different diagnoses**, and lumping them as
+"inert/unstable" hid that:
+
+| class | meaning | is it a gap? |
+|---|---|---|
+| `unreachable` | the leaf changed nothing at all — the synthetic parent compiled but the compiler discarded the container, so the leaf never reached it | **yes** — the real gap |
+| `flag` | the compiler READS the leaf but no value ever moves the output: a boolean | no — it has no value dimension to compare |
+| `err` | the synthetic parent/bare stanza does not compile | yes |
+| `valueMoves` | a value DOES move the output, yet fewer than two spellings produced a verdict | yes — the gate lost it some other way |
+
+**Why the classifier is behavioural and not `args == 0`.** The obvious shortcut
+is to drop leaves the schema declares value-less. It is wrong, and measurably:
+of the 232 `args == 0` leaves, **15 are compared today and are genuinely
+value-bearing lists** — `firewall … from source-prefix-list`,
+`interfaces <*> fabric-options member-interfaces`,
+`routing-options rib-groups <*> import-rib`, `event-options policy <*> events`,
+`security ike gateway <*> local-identity`. Those are **under-declared in
+setSchema**, not value-less. Excluding by `args` would have retired 15 live
+cells to make the number look better. The behavioural test cannot do that: a
+leaf that produces verdicts is already `compared` and never reaches the
+classifier.
+
+No leaf is allowlisted here. An allowlist row asserts a DEFECT exists and for
+these none has been demonstrated; #6693's `mixedChildIsAModifierBlock` is the
+precedent — where a verdict carries no information, drop the verdict rather than
+claim a defect.
+
+**A missing verdict used to read as a passing one.** `spellingVerdicts` builds
+its map by ranging `gateSpellingsMulti`, while a scalar leaf compares over
+`gateSpellingsScalar`. The two are consistent today and nothing enforced it, so
+`state[name]` for an unpopulated spelling yielded `""` — neither
+`err`/`unstable`/`inert` nor a real verdict, and it was counted as usable.
+Found by mutation: removing two entries from `gateSpellingsMulti` made coverage
+appear to RISE 619 → 1034, because every scalar leaf then scored two phantom
+verdicts. The helper now accepts only an explicit `keep`/`drop`, and
+`TestGateSpellingSetsAreConsistent_7484` pins the invariant.
+
+**The remaining gap, measured.** The 228 `unreachable` leaves spread across 46
+top-two-token parent prefixes — a long tail, not one bug. Largest:
+`interfaces <*>` (81), `system services` (28), `system syslog` (26),
+`protocols bgp` (25), `routing-instances <*>` (21), `security policies` (19).
+The cause is per-parent: the harness authors the leaf alone, and a compiler that
+requires a sibling discards the whole container. Confirmed on the #6821 leaf —
+`security { log { stream X { transport { protocol V; } } } }` is discarded,
+while adding a `host` sibling makes the value land. Recovering these means
+teaching the harness a per-parent prerequisite, which is why it is tracked
+separately rather than bundled here.
+
+**The #2419 cohort does NOT share this cause.** Measured against the eight open
+issues: only #6821 sits in the blind spot. `#6736`, `#6817`, `#6953`, `#6966`
+and `#7033` all have leaves the differential compares today, so their defects
+escaped for some other reason and closing them as one cohort would be wrong.
+
+### Parent prerequisites, and what the `unreachable` bucket actually is (#7492)
+
+The harness authors a leaf **alone** inside its synthetic parent path. Some
+compilers refuse to build the container until a required sibling is present, and
+then the leaf never reaches the compiler at all: every spelling compiles to the
+same thing, the differential calls them all `inert`, and the leaf drops out of
+coverage. `gateParentPrereq` names the statement(s) that make such a container
+materialise, injected identically into the zero-, one- and two-value configs so
+it **cancels out of every comparison** — it decides only whether there is a
+comparison to make.
+
+A row is **not** an allowlist entry: it asserts nothing about the leaf, claims no
+defect, and cannot hide one. It is refused outright if it would author the leaf
+under test, so a prerequisite can never supply the value it exists to make
+observable (`TestGateParentPrereqRefusesToAuthorTheLeafUnderTest_7492`).
+
+**#7492's own premise turned out to be mostly wrong, and that is the useful
+result.** The issue assumed the 228 `unreachable` leaves were largely a
+parent-path synthesis problem. Measured, they are not:
+
+- **A general mechanism was tried first and refuted.** Scaffolding each parent
+  with its own other childless leaves — values drawn from the gate's candidate
+  pool, keeping any that compiled — recovered **2 of 228**.
+- **Most plausible per-parent recipes do not work either.** Probed directly and
+  all still lose the value: `system syslog host <*>` with `any any`,
+  `interfaces <*> unit <*> tunnel` with `source` + `destination`,
+  `… vrrp-group <*>` with a `virtual-address`, and
+  `dhcp-local-server … interface <*>` with an `upto` sibling.
+- **One recipe works**, and it is in the table: a BGP group with no `neighbor` is
+  discarded wholesale, so every group-level leaf looked inert.
+
+So a per-parent prerequisite table is the right mechanism for a *minority* of the
+bucket. The remaining ~215 are something else: a coarse probe (does the parent
+path produce any output at all?) suggests most parents DO produce output while
+the leaf stays unreflected — but that signal is unreliable, because an OUTER
+object materialising is not the same as the innermost container materialising
+(`chassis { cluster { … } }` yields a non-nil `Chassis` with a nil `Cluster`).
+The next investigation needs a per-parent answer to two questions the current
+probes cannot separate: does the innermost container materialise, and is the leaf
+read by the compiler at that path at all. The second would be the #6696 class —
+`setSchema` advertising a knob nothing implements.
+
+**A blind-spot count that RISES after a fix can be the fix working.** Adding the
+BGP row moved 13 leaves out of `unreachable`: **10 became compared, and 3 were
+revealed to be `flag`s** once their container materialised and the classifier
+could finally see them. The `flag` ceiling therefore goes UP (158 → 161) in the
+same change that improves coverage. The population changed; a pre-fix number
+carried forward as a target would have read that as a regression.
+
 **The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
 SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
 puts values in both AST slots of one node, which is exactly what an either/or
@@ -6540,13 +6666,24 @@ reserved for whole-dataplane selection where a rewrite shim
   DoS, not a fail-open). The Go side now clamps once
   (`workers := maxInt(cfg.Workers, 1)`, mirroring the adjacent `QueueCount`
   / disabled-ctrl coercions) for the `userspace_ctrl` fields, and the
-  heartbeat zero-init loop bound is computed by
-  `heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())`
-  (`pkg/dataplane/userspace/maps_sync.go`): it clamps the worker count into
-  `[1, mapCap/heartbeatSlotsPerWorker]` so neither a negative nor an absurd
-  positive worker count can make the loop wrap `uint32` or index past the
-  fixed-size Array. This is the "lenient WARN-not-hang" contract applied at
-  the runtime consumer.
+  heartbeat zero-init loop bound is `heartbeatZeroSlotBound(
+  heartbeatMap.MaxEntries())` (`pkg/dataplane/userspace/maps_sync.go`) — the
+  Array's own capacity, which does not read `cfg.Workers` at all, so no value
+  of it can make the loop wrap `uint32` or index past the fixed-size Array.
+  This is the "lenient WARN-not-hang" contract applied at the runtime
+  consumer, now closed by construction rather than by a clamp.
+
+  **#6702 changed that bound, and the reason is worth stating** because the
+  pre-#6702 shape (`heartbeatZeroSlots(cfg.Workers, mapCap)`, clamped into
+  `[1, mapCap/heartbeatSlotsPerWorker]`) was measuring the wrong quantity. A
+  heartbeat slot is indexed by the **binding slot** — the shim reads
+  `USERSPACE_HEARTBEAT.get(binding.slot)` — and the binding count
+  (`min(rx_queues) * interfaces`) has never been a function of the worker
+  count. With the default `Workers: 1` the loop zeroed 32 slots, so a box with
+  three interfaces at 16 queues, or six at 6, left its tail slots holding the
+  PREVIOUS load's timestamps. A zeroed slot reads as stale and the shim
+  correctly refuses to redirect; a slot still holding a timestamp from inside
+  the heartbeat timeout reads as FRESH and masks a helper that has STOPPED.
 - **#5011 (time-zone path-traversal reject):** `system time-zone` was an
   untyped string leaf rendered directly into the `/etc/localtime` symlink
   target (`/usr/share/zoneinfo/<value>`, `applyTimezone` in

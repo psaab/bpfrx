@@ -71,11 +71,27 @@ import (
 // Residual 2 (clock skew): because the token is time-windowed, a wall-clock skew
 // between the two nodes larger than the tolerance (window ± 1 = ~60–90s across a
 // boundary) makes the peer's token verify against no accepted window, so
-// cross-node fabric RPCs fail Unauthenticated until the skew is corrected. A
-// >30s skew between cluster nodes is an operational fault (NTP is a cluster
-// prerequisite — the heartbeat clock-sync and session timestamp rebasing assume
-// it), so this is an accepted tradeoff rather than a bug; the ±1-window
-// tolerance already absorbs ordinary NTP jitter.
+// cross-node fabric RPCs fail Unauthenticated until the skew is corrected.
+//
+// #6708 measured this on the loss userspace cluster — 141s apart,
+// NTPSynchronized=no on both nodes, every cross-node RPC dead — so the previous
+// wording here ("an accepted tradeoff rather than a bug") was describing a
+// hypothetical. What made it expensive was not the rejection but the LABEL: it
+// reads as "invalid auth token", identical to a forged token or a PSK mismatch,
+// and the operator-visible symptom named sessions ("fw0 has only 1 established
+// sessions") while the cause was the clock.
+//
+// The accept band is still ±1 and deliberately so — it IS the replay horizon,
+// and the allowlisted RPCs include ClearSessions and cross-node failover, so
+// widening it to tolerate a drifting clock would trade a real attack bound for
+// an operational fault the operator can fix in seconds once it is named. What
+// changed in #6708 is diagnosis: fabric_auth_skew_6708.go scans a bounded band
+// around the local window on the REJECT path and, when the token verifies under
+// an accepted key at some other window, reports that offset — an AUTHENTICATED
+// measurement, since only a key holder can produce such a token. The rejection
+// then names the clock and the remedy, `show chassis cluster status` carries the
+// skew, and a forged token or a genuine key mismatch still says nothing about
+// clocks. Making fabric RPC skew-INDEPENDENT is a separate design change.
 
 const (
 	// fabricAuthMetadataKey is the gRPC metadata header carrying the hex token.
@@ -268,6 +284,9 @@ func (s *Server) checkFabricAuth(ctx context.Context, method string) error {
 		// Sticky: once the peer proves it holds the key on the fabric channel,
 		// a later tokenless call is a downgrade attack, not a rollout gap.
 		s.fabricPeerAuthSeen.Store(true)
+		// #6708: the clocks agree again — stop reporting a skew and re-arm the
+		// one-shot warning for the next episode.
+		s.noteFabricAuthOK()
 	}
 	// The downgrade-guard is armed by EITHER a prior valid fabric token OR the
 	// heartbeat having authenticated the peer. The heartbeat path is what closes
@@ -280,6 +299,16 @@ func (s *Server) checkFabricAuth(ctx context.Context, method string) error {
 	armed := s.fabricPeerAuthSeen.Load() || s.heartbeatPeerAuthSeen()
 	accept, reason := fabricAuthDecision(len(keys) > 0, present, tokenOK, armed)
 	if !accept {
+		// #6708: a present-but-invalid token may be a forgery, a wrong PSK, or
+		// a peer whose wall clock has drifted past the ±1-window accept band —
+		// and those read IDENTICALLY as "invalid auth token". The throttled
+		// scan distinguishes them: it only reports a skew when the token
+		// verifies under an accepted key at some other window, which only a key
+		// holder can produce. A forgery or a genuine key mismatch adds nothing,
+		// so a bad-PSK failure is never mislabelled as a clock problem.
+		if present && !tokenOK {
+			reason += s.noteFabricAuthSkew(keys, token, time.Now())
+		}
 		slog.Warn("fabric gRPC listener rejected call: authentication failed", "method", method, "reason", reason)
 		return status.Errorf(codes.Unauthenticated, "fabric RPC authentication failed: %s", reason)
 	}

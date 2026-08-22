@@ -1797,16 +1797,57 @@ the ingress / local-address / interface-NAT classifier BPF maps **in place**
 (`syncUserspaceClassifierMapsFailClosedLocked`) rather than re-bootstrapping the
 helper, then publishes the new `apply_snapshot`. The XDP shim reads those
 classifier maps live (kernel-pass vs XSK-redirect, local-vs-interface-NAT
-ownership) while `ctrl.Enabled == 1`. If the helper then **rejects** the
-snapshot (a helper-side validation failure, or any transport error) it keeps
-enforcing the previous-good snapshot — so the freshly-mutated maps would be a
-generation *ahead* of the applied Rust snapshot with the shim still enabled: a
-fail-**open** classifier/snapshot mismatch (wrong kernel delivery / wrong XSK
-steering). The publish therefore routes through `publishSnapshotFailClosedLocked`
-with the `samePlanRefresh` flag: on a same-plan publish error it disables
-`ctrl` (`failClosedUserspaceCtrlMapLocked` → `Enabled=0`) so transit drops to
-the kernel-only fail-closed posture until a subsequent good commit re-publishes
-and re-enables it (`applyHelperStatusLocked`). The full **bootstrap** path
+ownership) while `ctrl.Enabled == 1`. If the publish then fails, the
+freshly-mutated maps can be a generation *ahead* of the snapshot the helper is
+actually enforcing while the shim is still enabled: a fail-**open**
+classifier/snapshot mismatch (wrong kernel delivery / wrong XSK steering). The
+publish therefore routes through `publishSnapshotFailClosedLocked` with the
+`samePlanRefresh` flag.
+
+**#7468 splits that response by error class, and the reason is a claim this
+paragraph used to make.** It said the helper "keeps enforcing the previous-good
+snapshot" on "a helper-side validation failure, **or any transport error**".
+The second half is false: `controlRoundtripDeadline`
+(`process_control.go`) exists because a fixed 3s deadline once *"reported the
+apply FAILED while the dataplane had applied it live"*. On a transport failure
+the helper's state is unknown and it may be enforcing the NEW snapshot. The
+uniform ctrl-disable was correct precisely because it never depended on that
+sentence — but it also cost a full transit outage on every rejected policy
+update.
+
+- **In-band refusal** (`errHelperRejected` — the helper decoded the request, ran
+  its non-mutating integrity preflight and answered `{"ok":false}`): this is the
+  only class from which "the helper still holds `m.lastSnapshot`" follows. The
+  classifier maps are rolled **back** to `m.lastSnapshot`
+  (`retainPreviousClassifierPlanLocked`), which restores the exact plan the
+  retained snapshot expects, so `ctrl` stays enabled and there is no window in
+  which neither snapshot forwards transit. This is the atomic retain #6707
+  asked for — note that #6707's own wording, *"do not disable ctrl when the
+  helper has retained a usable previous snapshot"*, is NOT what is implemented:
+  leaving the new-plan maps in place with ctrl enabled is exactly the #4959
+  fail-open.
+- **Any other error** (dial, write, decode, EOF, deadline): helper state
+  unknown, so `ctrl` is disabled (`failClosedUserspaceCtrlMapLocked` →
+  `Enabled=0`) and transit drops to the kernel-only fail-closed posture until a
+  subsequent good commit re-publishes and re-enables it
+  (`applyHelperStatusLocked`). A rollback here would leave the maps a generation
+  *behind* an already-applied snapshot — the same fail-open with the sign
+  flipped.
+- If the **rollback itself fails**, the maps are an unknown mix of two plans,
+  which is worse than either, so the ctrl-disable is the fallback and both
+  errors are returned joined.
+
+**A rejected publish also starts the reconcile worker (#7468).** The normal
+`ensureStatusLoopLocked()` call sits further down `applyCompiledSnapshot` than
+the publish-rejection return, so a rejection on the **first** apply used to
+leave the manager inert: no status tick, no classifier re-sync, no retry-debt
+consumer, and transit dropped until the operator committed again — the same
+hazard #5873 fixed one branch away for the HA-clear debt. Starting the loop
+there cannot re-enable `ctrl` behind a rejected first snapshot: the helper holds
+no snapshot, so it reports no bindings, and
+`status.enabled = forwarding_armed && … && !bindings.is_empty() && …`
+(`userspace-dp/src/server/helpers/status.rs`) is what
+`resolveCtrlEnableLocked` requires before it will arm. The full **bootstrap** path
 (binding plan changed) already programs `ctrl.Enabled=0` in
 `programBootstrapMapsLocked` before the publish, so it is fail-closed without
 extra work — which is why the fix keeps the same-plan fast path instead of

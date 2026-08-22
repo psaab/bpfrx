@@ -143,51 +143,9 @@ func quarantinedZoneNames(cfg *config.Config) map[string]struct{} {
 }
 
 func buildInterfaceZoneMap(cfg *config.Config) map[string]string {
-	if cfg == nil || len(cfg.Security.Zones) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(cfg.Security.Zones))
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
-	sort.Strings(zoneNames)
-	for _, zoneName := range zoneNames {
-		zone := cfg.Security.Zones[zoneName]
-		if zone == nil {
-			continue
-		}
-		for _, rawIface := range zone.Interfaces {
-			if rawIface == "" {
-				continue
-			}
-			// #5878 phase 2: bind the zone reference on its CANONICAL logical-unit
-			// identity so ge-0/0/0.01 and ge-0/0/0.1 resolve to the same runtime
-			// unit as the interface's `unit 1` definition. The per-unit snapshot
-			// consumer (buildInterfaceSnapshots) keys this map by the canonical
-			// "%s.%d" unit name, so a raw ".01" key would miss and the unit would
-			// bind to NO zone. A bare ref or a malformed suffix is unchanged.
-			iface := config.CanonicalInterfaceUnitRef(rawIface)
-			if _, exists := out[iface]; !exists {
-				out[iface] = zoneName
-			}
-			if base, unit, ok := strings.Cut(iface, "."); ok && base != "" {
-				if _, exists := out[base]; !exists {
-					out[base] = zoneName
-				}
-				if unit != "" {
-					continue
-				}
-			}
-			if ifCfg := cfg.Interfaces.Interfaces[iface]; ifCfg != nil {
-				for unitNum := range ifCfg.Units {
-					unitName := fmt.Sprintf("%s.%d", iface, unitNum)
-					if _, exists := out[unitName]; !exists {
-						out[unitName] = zoneName
-					}
-				}
-			}
-		}
-	}
-	return out
+	// #6640: the resolution itself lives in pkg/config so the commit-time
+	// advisories can reason about the SAME object this builder enforces. See
+	// config.InterfaceZoneMap for the fan-up/fan-down rules and the #5878
+	// canonicalisation.
+	return config.InterfaceZoneMap(cfg)
 }
