@@ -798,6 +798,25 @@ based on PCI bus order plus the cluster node ID. RETH members match by
 between physical and virtual at boot, and `ensureRethLinkOriginalName()`
 auto-fixes stale `.link` files.
 
+It **returns an error when naming does not converge** (#5842). Every step
+that can fail — the `.link` write, the rename, and the `networkctl reload`
+— accumulates into one aggregate that `enumerateAndRenameInterfaces`
+joins and returns, mirroring the device-map path's `renameErrs` (#4956).
+The pass still COMPLETES on a failure rather than abandoning midway: a
+half-renamed NIC set is worse than a finished-and-reported one.
+
+`writeLinkFile` and `writeBootstrapFxp0Network` return `(changed, error)`
+for the same reason. A single `bool` made `false` mean BOTH "already
+correct, nothing to do" and "the write failed" — opposite facts under one
+value, so no caller could have distinguished them even if it wanted to.
+
+This matters beyond diagnostics: `maybeReapplyConfigArrivalNaming` consumes
+the one-shot `emptyHANamingPending` marker only when
+`applyStartupNamingForConfig` returns nil. Positional mode always returned
+nil, so a #4179 config-less HA node whose renames all failed burned its
+single retry and stayed on standalone names until a restart — the failure
+#4956 had already fixed for the mapped path, still open on the default one.
+
 `deriveKernelName()` synthesizes that predictable kernel name from a NIC's
 sysfs PCI address via `pciAddrToEnp()`, which mirrors systemd's
 `ID_NET_NAME_PATH` scheme (`systemd.net-naming-scheme(7)`):
