@@ -3607,6 +3607,38 @@ this repository's published `CHANGE-ME`/`EXAMPLE-ONLY` placeholders) rather
 than rejected — hard-rejecting a weak-but-real key would create a new brick
 class for an operator who already configured authentication.
 
+### The rotation overlap leaf (#6630)
+
+`chassis cluster additional-authentication-key <key>` is a SECOND key the node
+**accepts** on the control channel and never **signs** with, so a PSK rotation
+can be rolled one node at a time instead of taken as a planned outage. It
+compiles to `ClusterConfig.ControlLinkAuthKeyAlt`, is `Secret`-typed, and is in
+`ast_redact.go`'s secret keyword set in its own right (`##SECRET-DATA##` in
+raw-AST renders). `ClusterAuthKeyStrengthWarnings` judges it on the same terms
+as the primary — a weak or published value there forges the control channel
+just as effectively, and a rotation is exactly when an operator reaches for a
+throwaway.
+
+Two strict refusals attach to it, both downgraded to warnings on the tolerant
+path for the #1960 no-brick reason:
+
+- **Set without `authentication-key`.** The additional key is only ever
+  verified against, so a node holding only it signs nothing and the channel
+  fails OPEN exactly as if unkeyed. `validateClusterAuthKeyStrict` names this
+  case specifically rather than emitting the generic absence message, which
+  would send an operator to re-add a leaf they already have.
+- **Set to the SAME value as `authentication-key`
+  (`validateClusterAuthKeyOverlapStrict`).** That accepts exactly one key — no
+  overlap at all — while the config and `show chassis cluster statistics` both
+  read as though a rotation window were open. The operator proceeds to the next
+  commit believing they are protected, which is the dual-master window the leaf
+  exists to close. Compared whitespace-normalised on both sides, since the
+  runtime compares raw bytes and a trim-equal pair is an overlap that isn't.
+
+Neither refusal echoes a key. Operator procedure — including the five-step
+rolling sequence and how to tell when finalize is safe — is in
+`pkg/cluster/README.md` → "Rotation".
+
 **Strict here means every caller of `compileTreeStrict`, not just the operator
 commit.** Three paths reject an unkeyed cluster, and they differ in
 consequence:
