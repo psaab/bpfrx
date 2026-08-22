@@ -576,6 +576,18 @@ S1 makes xpf's WireGuard **handshake bytes** standards-compliant:
   `MAC2 = keyed-BLAKE2s-128(cookie, msg[0..offsetof(mac2)])`; on parse it is
   skip-verified when NOT under load (spec-correct) and validated against the
   responder cookie when under load (#4094 PR-A — see below).
+- **Canonical 32-bit type word on every parse** (#5193/#5191
+  `handshake::is_canonical_type`): WG carries `message_type` as a
+  little-endian u32, and kernel WireGuard / wireguard-go compare all four
+  bytes. Every xpf parser now does the same — the type-1/type-2 handshake
+  parsers, `framing::parse_data_header` (type 4 transport data) and
+  `CookieChecker::decrypt_cookie_reply` (type 3) all call the single
+  `is_canonical_type` helper. Before #5191 the transport-data and CookieReply
+  paths compared only the low byte and accepted nonzero RESERVED bytes, so a
+  datagram xpf would decrypt was one a kernel peer discards — a parser
+  differential, and the kind of ambiguity an evasion probe looks for. xpf's own
+  encoders have always written the reserved bytes as zero, so nothing
+  interoperable is rejected by the tightening.
 
 ## Responder cookie / MAC2 under-load DoS mitigation (#4094 PR-A)
 

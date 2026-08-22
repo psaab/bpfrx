@@ -99503,6 +99503,7 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/README.md, _Log.md
 - **Action**: #7216 — reject a static-NAT rule whose selected `match
   destination-address` is empty.
+## 2026-08-21 — userspace-dp LOW cohorts (#5191/#5193): three bounded residuals
 
   Reproduced firsthand at `7230dcdcd` over the #7145 base config. Of the six
   (NAT kind x match leaf) slots, static-NAT `match destination-address` was the
@@ -99614,6 +99615,70 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
   `userspace-dp/src/server/helpers/status.rs`,
   `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
+
+## 2026-08-21 — #5838 follow-up: a pending crash restart survived an intentional stop
+
+- **Timestamp**: 2026-08-21
+- **Action**: The #7228 helper supervisor arms a bounded-backoff restart after an
+  unexpected helper exit and fences the attempt on `(m.procGen != gen ||
+  m.proc != nil || !m.helperCrash.Crashed)`. An intentional teardown satisfied
+  none of those: `stopLocked` cleared `m.proc` and `m.procSup` but never
+  advanced `m.procGen` and never cleared `m.helperCrash`. And the stop that
+  FOLLOWS a crash takes `stopLocked`'s `m.proc == nil` early return — the crash
+  path already nil'd `m.proc` — so it reached none of the teardown below it
+  either. A crash whose backoff was still pending when the daemon shut down
+  therefore spawned a helper for a Manager that had been torn down, and the
+  restart chain kept re-arming afterwards; after `Close()` that child outlives
+  xpfd holding the NIC queues, which is the EBUSY-on-zero-copy-queues collision
+  the next start hits. Fix: retire the generation (`m.procGen++`) at the TOP of
+  `stopLocked`, above the early return. Deliberately NOT clearing
+  `m.helperCrash` there: `ensureProcessLocked` calls `stopLocked` when a spawn
+  misses its readiness wait, and the crash record is the retry debt that path
+  depends on — clearing it made a failed restart forget it was retrying and
+  turned `TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838` RED, which is
+  how the narrower fix was found. Mutation-proven: dropping the bump reds the
+  new marker assertion (a helper is spawned after the stop); anti-over-reject
+  cell asserts the ordinary crash->restart path still spawns. `go vet` clean,
+  `pkg/dataplane/userspace` and `pkg/daemon` suites green at `-count=1`, and the
+  new cells green under `-race`. Go-only diff, no shim `.o` or protocol
+  movement, so no cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/helper_restart_after_stop_5838_test.go, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Fixed three bounded items across two userspace-dp LOW cohorts.
+  #5191 A1-b9-F5: the transport-data and CookieReply parsers now compare the
+  full little-endian 32-bit type word via the handshake parser's
+  `is_canonical_type`, closing a parser differential against kernel WG /
+  wireguard-go (both previously accepted nonzero RESERVED bytes that every
+  other implementation drops). #5193 A1-b7-F1: `populate_tunnel_endpoints`
+  preflights endpoint-id uniqueness BEFORE mutating state (typed
+  `TunnelEndpointDuplicateId`), so a duplicate id can no longer install the
+  last row under that id while both interfaces' ifindexes alias it; a
+  duplicate ifindex keeps the first row and logs instead of silently
+  overwriting. #5193 A1-b7-F7: the CoS DSCP rewrite-rule ingest bounds every
+  code-point to 0..=63 (`CosDscpRewriteCodePointOutOfRange`), so a value the
+  TX path would mask into a different PHB fails the snapshot closed like the
+  classifier builders have since #2447.
+  THREE items this work originally carried were DROPPED before merge because
+  other lanes landed the same fixes first, and taking a second implementation
+  of a landed fix is how a guard gets silently lost: #5189 A1-b10-F4 (keepalive
+  vs `WRITE_BACKLOG_MAX_BYTES`) went to PR #7199, whose version also declines
+  to re-arm `last_write` on suppression; #5190 A1-b1-F7 (`rx_over_1514`
+  rename), A1-b12-F3 (bench merge-gate claims) and A1-b8-F6
+  (`zero_unbound_slot` completeness) all went to PR #7226, whose census test
+  drives the real `refresh_bindings` unbound branch rather than calling
+  `zero_unbound_slot` directly. Each was reverted here in full — production,
+  test and doc — rather than hand-merged, and #7199's non-re-arm guard was
+  mutation-verified to still bite in a scratch tree holding both branches.
+  4-cell mutation matrix green/red/green, zero unsound cells; `cargo check
+  --tests` clean first; full `cargo test --release --bins --tests --
+  --test-threads=1` green. Rust diff moves the helper binary, so a cluster
+  smoke is OWED (not run here).
+- **File(s)**: userspace-dp/src/afxdp/wg/{framing,cookie,handshake,cookie_tests}.rs,
+  userspace-dp/src/afxdp/forwarding_build/{cos,tunnels,tests}.rs,
+  userspace-dp/src/policy_snapshot_error.rs, docs/config-schema.md,
+  docs/wireguard-interop.md, docs/userspace-dataplane-architecture.md, _Log.md
 - **Action**: #6960/#6975 — the gRPC and REST session-interface filters resolved
   a session's INGRESS interface as `zone.Interfaces[0]`, a value that does not
   depend on the session at all. The remote `cli` routes both `show` and `clear`
