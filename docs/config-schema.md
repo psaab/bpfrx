@@ -9354,6 +9354,54 @@ at the REAL ingresses — `Store.Load` and `Store.SyncApply` — plus a
 `slotEscapeUngated` (`schema_slot_escape_fixtures_test.go`), so their #7143
 slot-escape rows now run the full slot-1 comparison instead of skipping.
 
+**#7215 — an out-of-range MASK on the one slot #7145 did not reach.** After
+#7145 the six (kind x leaf) slots agreed on a malformed ADDRESS. They still
+disagreed on a malformed MASK. Measured at `353f09592` over the same base
+config, `10.0.0.0/33` — and `2001:db8::/129`, `10.0.0.0/abc`, `10.0.0.0/`,
+`1.2.3.4/-1`, `10.0.0.1/255.255.255.0`, so this is not one arithmetic check
+inside Go's mask parser — was refused on five slots and ACCEPTED on
+destination-NAT `match destination-address`:
+
+| kind | `match source-address` | `match destination-address` |
+|---|---|---|
+| `security nat source` | rejected (#7145) | rejected (#7145) |
+| `security nat destination` | rejected (#7145) | accepted -> **rejected (#7215)** |
+| `security nat static` | rejected (#7145) | rejected (#3206) |
+
+#7145 did not reach it because its probe (`999.1.1.1/24`) is malformed in the
+ADDRESS half, which that slot's gate did see. `validateDestinationNAT
+AddressesStrict` (#2396(c)/#3228) split the token at the first `/`
+(`natCIDRIPPart`) and ran `net.ParseIP` on the address half ONLY, so
+`10.0.0.0/33` read as the perfectly good `10.0.0.0`. Its own consumer,
+`dnatDestinationParts` (`pkg/dataplane/userspace/nat_destination.go`), calls
+`net.ParseCIDR` on any token carrying a `/` and returns `ok == false` — the
+entry is SKIPPED and never reaches the wire. The gate's doc comment claimed the
+two matched exactly; they did not, and a comment cannot fail.
+
+The gate now calls the same `natMatchPrefixParses` the other four slots use,
+which is extensionally EQUAL to `dnatDestinationParts`'s `ok` (a maskless token
+falls through `net.ParseCIDR` to the same `net.ParseIP`; a masked token can
+never satisfy `net.ParseIP`, so it reduces to the same `net.ParseCIDR`). That
+equality is now bound by a cross-package differential,
+`pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go`, which fails
+on a disagreement in EITHER direction: `gate accepts / builder drops` is #7215,
+`gate refuses / builder installs` is the #1960 brick.
+
+The change is strictly a NARROWING, and every value it newly refuses is one the
+builder already discarded. It refuses nothing the dataplane installs —
+`0.0.0.0/0`, `::/0`, a bare host, a host-bits CIDR and `1.2.3.4/024` all still
+commit, which is why the mirror stays `net.ParseCIDR` and not
+`netip.ParsePrefix`. Lenient (`Store.Load` / peer-sync) needed no new plumbing:
+the slot's existing `lenientDestNATAddresses` flag downgrades it to a warning
+and KEEPS the value.
+
+Regression coverage: `pkg/config/nat_dnat_match_destination_mask_7215_test.go`
+(the full 3x2 census at strict with the five unchanged slots as controls;
+tolerant warn-and-KEEP with the malformed value authored SECOND so the gate is
+pinned to walk the whole bracket list; an over-rejection guard) and
+`pkg/configstore/nat_dnat_match_mask_boot_7215_test.go` (the no-brick property
+at `Store.Load` and `Store.SyncApply`, plus a `CommitCheck` over-reach guard).
+
 Regression coverage: `pkg/config/compiler_nat_host_mask_test.go` (bare/​/32/​/128
 accept; v4 + v6 non-host match/prefix reject with asserted message; NPTv6 and
 `inet` exemptions; NAT64 source-pool host vs non-host; strict-reject /
