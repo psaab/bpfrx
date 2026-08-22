@@ -26,6 +26,33 @@
   NOT run on the cluster (shared; lead serializes).
 - **File(s)**: test/incus/deploy-lib.sh, test/incus/cluster-setup.sh,
   test/incus/deploy-lib-selftest.sh, docs/testing.md
+## 2026-08-21 — #6656 transfer-out override cleared on peer loss
+
+- **Timestamp**: 2026-08-21
+- **Action**: `handlePeerTimeout` cleared `ManualFailover`, `peerGroups`,
+  `peerMonitors` and both peer version fields but left
+  `peerTransferOutOverride` armed. That override has NO expiry and is
+  re-applied to the rebuilt peer-group map on every heartbeat, and it
+  feeds BOTH the election AND the operator-facing status render
+  (`FormatStatus` prints the post-override `m.peerGroups`) — so an
+  override outliving its peer incarnation makes this node force a
+  reconnecting peer to secondary-hold forever and self-elect primary,
+  which is the reported signature (node0 primary for all RGs, node1
+  carrying the traffic). Cleared beside the existing ManualFailover
+  clear, using the same argument that comment already makes.
+  RECORD CORRECTION: the issue's VRRP virtual-MAC/VIP hypothesis is
+  INAPPLICABLE — `private-rg-election` is the compiler default
+  (`compiler_system.go`), so `CollectRethInstances` returns nil and the
+  cluster has no RETH VRRP instances at all.
+  Mutation matrix: V1 (no clear — the shipped state) and V2 (clear only
+  the first RG) RED; V3 (drop only the map entry, keep the Previous
+  snapshot) GREEN and disclosed — with the override gone the snapshot is
+  unreachable, so it is a bounded leak, not a correctness gap.
+  NOT REPRODUCED on hardware: the loss cluster is shared and serialized
+  by the lead. Successors filed for the two cluster-dependent gaps.
+- **File(s)**: pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/transfer_override_peer_loss_6656_test.go,
+  pkg/cluster/README.md
 
 ## 2026-08-21 — #6534 port-mirroring: dropped instances stop rendering as armed
 
@@ -101839,3 +101866,12 @@ prose edit above them added. No diff falls in the new test body.
   asserts, so the compile-only gate is meaningful for this class.
 - **File(s)**: userspace-dp/benches/snat_allocator.rs, Makefile,
   docs/research/2852-portalloc/microbench-results.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (strict-reject family, members 2/5/6) — malformed
+    autonomous-system, chained zone `screen` statement, and malformed OSPF area
+    id now REJECT at strict commit and WARN on the tolerant load/peer-sync path
+    (#1960 no-brick, via the #1319 SchemaValidate split). Added ValidateOSPFArea.
+  - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_security.go,
+    pkg/config/schema_validators_network.go,
+    pkg/config/silent_drop_strict_6564_test.go, docs/config-schema.md
