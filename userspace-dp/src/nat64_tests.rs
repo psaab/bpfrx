@@ -178,11 +178,37 @@ fn napt64_without_deterministic_stays_round_robin() {
     assert_eq!(port, 1024, "round-robin allocates from the cursor start (port_low)");
 }
 
+/// #7413: serialises the two tests that assert on `DETERMINISTIC_V6_DOWNGRADE_COUNT`.
+///
+/// That counter is PRODUCTION state (`nat64.rs`, bumped on the real
+/// downgrade path), not test-only, so the `thread_local!` pattern
+/// `docs/engineering-style.md` gives for test-only globals does NOT apply here
+/// — making it thread-local would break the product, because the increment
+/// happens on whichever thread compiles the snapshot and a status reader on
+/// another thread would see zero. The settled pattern for a genuinely shared
+/// global is this: a poison-tolerant serial guard held for the whole body by
+/// every test that touches it.
+///
+/// Both tests already read a RELATIVE delta (`before + 1`), which is correct in
+/// isolation and still wrong concurrently: each sees the other's increment and
+/// asserts `left: 2, right: 1`. Reproduced 6 of 6 runs at `--test-threads=2`.
+///
+/// EXACTLY TWO tests bump the counter, established by running all 4549 tests in
+/// the binary alone and watching for the paired operator warning rather than by
+/// reading call sites — so this guard covers the whole population, not the part
+/// that was easy to find.
+fn deterministic_v6_downgrade_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // #4559: an IPv6-host deterministic NAT64 snapshot with an UNSUPPORTED prefix
 // length (only /32 and /64 map to a 32-bit subscriber word) does NOT build a
 // deterministic prefix — it round-robins (the commit-time advisory covers it).
 #[test]
 fn napt64_deterministic_v6_unsupported_prefix_len_falls_back() {
+    let _downgrade_serial = deterministic_v6_downgrade_test_lock();
     let before = DETERMINISTIC_V6_DOWNGRADE_COUNT.load(Ordering::Relaxed);
     let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "napt64-bad-prefix".to_string(),
@@ -219,6 +245,7 @@ fn napt64_deterministic_v6_unsupported_prefix_len_falls_back() {
 // (silently), but the counter no longer moves.
 #[test]
 fn napt64_deterministic_v6_host_count_overflow_warns_operator() {
+    let _downgrade_serial = deterministic_v6_downgrade_test_lock();
     let before = DETERMINISTIC_V6_DOWNGRADE_COUNT.load(Ordering::Relaxed);
     // blocks_per_ip at its u16 max; a 70_000-entry pool makes
     // `num_pool_ips * blocks_per_ip` (70_000 * 65_535 ≈ 4.59e9) exceed

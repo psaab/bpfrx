@@ -560,6 +560,35 @@ they repeatedly bite:
     `stop` ALREADY set is an exact fail-on-revert
     (`reconcile_churn_completes_a_cycle_even_when_already_stopped_6633`),
     which the scheduling assertion it replaces could never be.
+  - **`thread_local!` is only for a TEST-ONLY global. A PRODUCTION global
+    takes the guard, whatever its shape.** `DETERMINISTIC_V6_DOWNGRADE_COUNT`
+    (`nat64.rs`) is an `AtomicU64` two tests assert deltas on, which looks like
+    the counter case above — but it is bumped on the real downgrade path and
+    read by the operator warning, so making it thread-local would break the
+    product: the increment happens on whichever thread compiles the snapshot
+    and a reader on another thread would see zero. Check where the global is
+    WRITTEN before choosing the pattern (#7413).
+  - **Enumerate the affected population by RUNNING every test alone, not by
+    reading call sites.** For #7413 the two shared observables were a
+    production counter and the process-wide count of threads named
+    `neigh-monitor`. Reading call sites suggested ~28 candidate coordinator
+    tests; running all 4549 tests individually and watching for each
+    observable's own log line found **exactly 2** counter bumpers and
+    **exactly 10** monitor spawners — and showed that every one of the ten
+    STOPS its monitor, which ruled out a leak and left concurrent overlap as
+    the only mechanism. It also found the one spawner in a different module,
+    which is what forced the guard to be `pub(crate)` rather than
+    module-scoped. A guard over the population you guessed is a guard over
+    part of it.
+  - **Be explicit about which guards are BOUND and which are precautionary.**
+    In #7413 the guard on the two asserting gates reds 5/8 when removed; the
+    guard on the other eight spawners does NOT red even when paired one-to-one
+    with an asserter at `--test-threads=2`, because their monitor windows are
+    too short to overlap the assertion window today. They are kept as defence
+    in depth over an enumerated population — not claimed as tested — and the
+    two gates carry a `before == 0` precondition so a future spawner that does
+    collide fails by NAMING the missing lock instead of as an off-by-one delta
+    that reads like a real leak.
   - Prove the ISOLATION variant with a **deterministic fail-on-revert**
     (two barrier-synced threads whose per-thread counter assertion is
     mathematically impossible under a shared global). The mutex GUARD

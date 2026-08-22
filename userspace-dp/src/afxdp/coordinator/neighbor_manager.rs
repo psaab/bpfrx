@@ -204,6 +204,41 @@ impl NeighborManager {
     }
 }
 
+/// #7413: serialises every test that spawns a `neigh-monitor` thread.
+///
+/// The observable the #6637 leak gates read is the PROCESS-WIDE count of
+/// threads named `neigh-monitor` (`/proc/self/task`), so it is shared by every
+/// test that brings a coordinator up — not only the two that assert on it.
+/// Under the parallel `cargo test` runner two spawners overlap and each sees
+/// the other's monitor: measured `before=0 during=2` against an expected
+/// `before+1`, with BOTH gates failing together in 4 of 8 runs of just those
+/// two tests at `--test-threads=2`.
+///
+/// TEN tests across TWO modules spawn one. That population was enumerated by
+/// running every test in the binary alone and watching for the monitor's own
+/// `listening` line, not by reading call sites — which is also how it was
+/// established that none of them LEAKS one (every spawner stops it), so the
+/// contamination is concurrent overlap and nothing else.
+///
+/// It lives in the production module beside the thing it guards, mirroring
+/// `icmp_ratelimit::global_bucket_test_lock`, and is `pub(crate)` rather than
+/// module-scoped because one of the ten spawners is in `main_tests.rs`.
+///
+/// Poison-tolerant (`into_inner`) so a panicking guarded test cannot deadlock
+/// the rest of the suite. Hold it for the WHOLE test body: the window that must
+/// be exclusive is spawn → assert → teardown, not the assert alone.
+///
+/// The two asserting gates ALSO check `before == 0` as a precondition, and that
+/// is the anti-rot half of this fix. An eleventh spawner added without the
+/// guard makes them fail loudly, naming the missing lock, instead of failing as
+/// an off-by-one delta that reads like a real leak.
+#[cfg(test)]
+pub(crate) fn neigh_monitor_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod monitor_join_tests_5165 {
     use super::*;
