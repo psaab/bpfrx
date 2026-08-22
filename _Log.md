@@ -98,6 +98,31 @@
   in the table) → the table, carrier and all three surface cells red;
   M6 (drift the quoted half-open window) → the Rust-parity cell reds;
   M7 (restore the Junos 1800s default) → the CLI defaults cell reds.
+  Wrap-insensitive sweep (normalise comment markers + collapse all
+  whitespace, then search) for the corrected claims found TWO survivors
+  a single-line grep had missed, both in `docs/feature-gaps.md`: the
+  Strict SYN Check row and the #2078 narrative still asserted "no TCP
+  state machine". The earlier grep was `--include=*.go`, so it never
+  looked at markdown. Both corrected, and the Strict SYN Check row was
+  additionally wrong to say the dataplane "does not enforce syn-check":
+  it applies two unconditional guards that are NOT the Junos knob —
+  transit drops a bare RST/FIN while preserving mid-stream ACK pickup
+  (`strict_syn_check_drops_new_flow`, #4400), and host-inbound seeds a
+  session only off a SYN (#4539). The same sweep then found a THIRD
+  survivor in the adjacent No-SYN-Check row — same phrase, same claim
+  family — also corrected: the knob is inert, but "so this opt-out is
+  inert" overstated it, since mid-stream pickup is already the transit
+  default and host-inbound the opt-out cannot reach the `has_syn` gate
+  at all. NOT corrected, and flagged rather than guessed: the
+  No-SYN-Check in Tunnel row claims "no tunnel-decap session-create
+  signal exists on the userspace path", which
+  `userspace-dp/src/afxdp/tunnel.rs:653` ("Locally decapsulated tunnel
+  session") makes doubtful; establishing it needs a real pass over the
+  tunnel path, so it is left standing and called out rather than
+  rewritten on a guess. Re-swept after: the only remaining
+  occurrences are in `_Log.md` and the generated
+  `docs/issues/pr-history.md`, both append-only historical records of
+  what was written at the time, not statements of current behaviour.
 - **File(s)**: `pkg/config/flow_tcp_timeouts_6539.go` (new),
   `pkg/config/flow_tcp_timeouts_6539_test.go` (new),
   `pkg/config/compiler_validate_warn.go`, `pkg/config/types_security.go`,
