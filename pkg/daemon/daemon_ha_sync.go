@@ -1044,6 +1044,15 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
 			slog.Warn("cluster: fence: failed to disable rg_active",
 				"rg", rg.ID, "err", err)
 		}
+		// #6530: this write bypasses the RG state machine's transition
+		// path, so without re-arming, reconcileRGState's desired-vs-applied
+		// retry sees desired == applied and never re-drives the apply — a
+		// fenced-then-recovered primary would stay dark forever. Re-arm
+		// AFTER the write (success or failure: a failed write may still have
+		// partially landed, so "not known to have converged" is the only
+		// honest reading) so the next reconcile pass restores forwarding
+		// once the cluster state says this node owns the RG again.
+		d.getOrCreateRGState(rg.ID).InvalidateApplied()
 	}
 }
 

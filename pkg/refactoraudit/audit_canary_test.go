@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -66,7 +67,10 @@ func parseHeatmap(t *testing.T, what, text string) []auditRow {
 
 // tierByPath projects rows onto the audit's *content*: which files are
 // audited, and at which tier. This is the merge-stable part of the
-// heatmap — see TestHeatmapNotStale.
+// heatmap — it moves only when a file really crosses 1500 or 2000 LOC —
+// but "merge-stable" is not "merge-proof", which is what #7253 measured
+// and why the compare over this projection is no longer a gate. See
+// TestGlobalHeatmapFreshnessAdvisory.
 func tierByPath(rows []auditRow) map[string]string {
 	m := make(map[string]string, len(rows))
 	for _, r := range rows {
@@ -103,66 +107,154 @@ func repoRoot(t *testing.T) string {
 // non-zero exit is a divergence, not a skip.
 func runScript(t *testing.T, root string, args ...string) string {
 	t.Helper()
+	out, stderr, err := runScriptErr(root, args...)
+	if err != nil {
+		t.Fatalf("bash %s: %v\nstderr:\n%s", strings.Join(args, " "), err, stderr)
+	}
+	return out
+}
+
+// runScriptErr is runScript without the testing.T, so a memoised caller
+// can record a failure once and report it to every test that asks.
+func runScriptErr(root string, args ...string) (string, string, error) {
 	cmd := exec.Command("bash", args...)
 	cmd.Dir = root
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("bash %s: %v\nstderr:\n%s", strings.Join(args, " "), err, stderr.String())
-	}
-	return string(out)
+	return string(out), stderr.String(), err
 }
 
-// TestHeatmapNotStale is the drift gate. It regenerates the heatmap with
-// the committed generator and asserts that the *audit content* — which
-// files are audited, and at which tier — matches the tree. A file that
-// enters the audit (crosses 1500 LOC), leaves it, or is promoted/demoted
-// across the 2000 LOC [REFACTOR] boundary without running
-// `bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt`
-// (or `make audit-check`) fails here.
+var (
+	generatedOnce   sync.Once
+	generatedText   string
+	generatedStderr string
+	generatedErr    error
+)
+
+// generatedHeatmap returns the heatmap generated from the working tree,
+// memoised for the whole package run.
 //
-// # Why this is not a byte-for-byte compare (#6617)
+// The generator spawns one `wc -l` per audited file, which makes it by
+// far the most expensive thing here, and two tests want the same answer
+// from the same unchanged tree. TestGeneratorDeterministic deliberately
+// does NOT use this — running it twice for real is its entire point.
 //
-// It used to be, and that criterion could not hold. The heatmap is a
-// repo-GLOBAL snapshot: its exact LOC column depends on every audited
-// file in the tree, not just the ones a PR touches. Under this project's
-// parallel-merge workflow a PR that regenerates the artifact correctly at
-// its own base still lands stale, because a sibling PR grew a different
-// file in between. That is not hypothetical — measured over the 40
-// first-parent commits ending at b4605ea9d, master was byte-stale in 26
-// of them, and #6602 and #6613 BOTH regenerated the artifact AT THEIR OWN
-// BASE and BOTH still landed red, each disagreeing only on
-// pkg/snmp/agent.go, a file neither PR touched. The precise sequence, since
-// "regenerated in its own merge commit" was the wrong description: #6602
-// regenerated at 1737 LOC in b5a524b2e, and its sync merge aac0d60dd then
-// incorporated #6596's 1823-line file WITHOUT refreshing the artifact.
-// A gate that reds when the author did everything right is noise, and the
-// noise is what let the artifact sit 22 rows stale for 21 consecutive
-// commits in the run before that.
+// The failure is recorded rather than fatalled inside the sync.Once, so
+// every caller reports the generator's own stderr instead of the second
+// caller seeing a mysterious empty artifact.
+func generatedHeatmap(t *testing.T) string {
+	t.Helper()
+	root := repoRoot(t)
+	generatedOnce.Do(func() {
+		generatedText, generatedStderr, generatedErr = runScriptErr(root, "scripts/refactoring-audit.sh")
+	})
+	if generatedErr != nil {
+		t.Fatalf("bash scripts/refactoring-audit.sh: %v\nstderr:\n%s", generatedErr, generatedStderr)
+	}
+	return generatedText
+}
+
+// heatmapDriftReport is the outcome of the repo-GLOBAL snapshot
+// compare: which audited files the committed artifact and a fresh
+// generation disagree about, and how.
+type heatmapDriftReport struct {
+	entered  []string // audited now, absent from the committed artifact
+	left     []string // in the committed artifact, no longer audited
+	retiered []string // audited by both, at different tiers
+}
+
+func (d heatmapDriftReport) empty() bool {
+	return len(d.entered)+len(d.left)+len(d.retiered) == 0
+}
+
+// heatmapDrift compares the committed artifact's (path -> tier)
+// projection against a fresh generation's. This is the WHOLE of what the
+// old fatal TestHeatmapNotStale asserted, kept as a function because two
+// callers need it and neither is a gate:
 //
-// Tier and membership do not have that problem: they only change when a
-// file actually crosses 1500 or 2000 LOC, which is a real, rare,
-// actionable event — and it is exactly the event the project's own rules
-// key on (docs/refactoring-audit.md "When to refactor a candidate", and
-// the "regen only if it crosses a tier boundary" instruction already used
-// in docs/pr/1706 and docs/pr/1732 plans).
+//   - TestGlobalHeatmapFreshnessAdvisory reports it and does not fail;
+//   - TestTouchedGateIsNotASnapshotCompare uses it as the rival
+//     mechanism it has to disagree with, in both directions. That proof
+//     is only worth anything if this really is the snapshot compare and
+//     not a strawman, which is why the advisory test keeps it bound to
+//     the real artifact and the real generator.
+func heatmapDrift(committed, generated map[string]string) heatmapDriftReport {
+	var d heatmapDriftReport
+	for path, tier := range generated {
+		old, ok := committed[path]
+		switch {
+		case !ok:
+			d.entered = append(d.entered, fmt.Sprintf("  %-10s %s", tier, path))
+		case old != tier:
+			d.retiered = append(d.retiered, fmt.Sprintf("  %s: %s -> %s", path, old, tier))
+		}
+	}
+	for path, tier := range committed {
+		if _, ok := generated[path]; !ok {
+			d.left = append(d.left, fmt.Sprintf("  %-10s %s", tier, path))
+		}
+	}
+	sort.Strings(d.entered)
+	sort.Strings(d.left)
+	sort.Strings(d.retiered)
+	return d
+}
+
+// TestGlobalHeatmapFreshnessAdvisory reports global snapshot drift and
+// DOES NOT FAIL ON IT. It is the demoted half of the old
+// TestHeatmapNotStale (#7253).
 //
-// The LOC column stays in the artifact for prioritisation, as an advisory
-// snapshot refreshed by `make audit-check`. TestHeatmapArtifactWellFormed
-// pins each recorded LOC to its tier band, and any band crossing reds this
-// test, which forces a regeneration that refreshes every number — but the
-// bound that gives is ASYMMETRIC. [WATCH] is 1500-1999, bounded both ways.
-// [REFACTOR] is "2000 or more", open above, so a file already past 2000 can
-// grow without limit unwatched; this artifact's own
-// userspace-dp/src/afxdp/worker/loop_body/mod.rs drifted 2119 -> 2448 with
-// no signal. That is tolerable only because the TIER is what the project's
-// rules act on and the tier does not go stale — not because the number is
-// nearly right.
+// # Why the fatal came off
 //
-// FAIL-ON-REVERT: retagging any committed row's tier, deleting a row, or
-// adding a phantom row makes this test RED.
-func TestHeatmapNotStale(t *testing.T) {
+// TestHeatmapNotStale fused two different properties into one assertion:
+//
+//	modularity — "this file is growing past the point where it should be
+//	split". Aimed at the author of the growth, actionable by them, and
+//	worth interrupting them for.
+//
+//	freshness — "the committed global snapshot disagrees with the tree".
+//	Aimed at whoever merges next, not actionable by them, and not worth
+//	interrupting anyone for.
+//
+// Only the first is a gate. The second could not even stay true between
+// authoring and merge: the artifact is a snapshot of a repo-GLOBAL
+// property, so any file crossing 1500 or 2000 LOC anywhere in the tree
+// flips it for everyone. #7235, #7252 and #7254 each regenerated it
+// inside one hour for different files, and #7252 was ALREADY STALE when
+// it merged — it was merged, master re-tested, and was still red on the
+// same two files. A PR whose entire content was "make the artifact match
+// the tree" could not survive its own review latency.
+//
+// #6617 had already narrowed this class once, byte-compare ->
+// content-compare, after measuring master byte-stale in 26 of 40
+// first-parent commits and after #6602 and #6613 both regenerated at
+// their own base and both still landed red on pkg/snmp/agent.go, a file
+// neither had touched. (Precise sequence, preserved from that comment:
+// #6602 regenerated at 1737 LOC in b5a524b2e, and its sync merge
+// aac0d60dd then incorporated #6596's 1823-line file WITHOUT refreshing
+// the artifact. The 26-of-40 count is over the first-parent commits
+// ending at b4605ea9d and is reproducible by regenerating at each one.)
+// Its own comment states the principle this test now obeys: a gate that
+// reds when the author did everything right is noise. The content compare was a real improvement but kept the shape;
+// pkg/dataplane/types.go crossing the floor at exactly 1501 lines flipped
+// the gate for every unrelated author on the board.
+//
+// The modularity signal is NOT deleted — tcp_segmentation.rs entering the
+// audit at 1582 was a correct and useful catch. It moved to
+// TestTouchedFileCrossedModularityThreshold, which derives its verdict
+// from the PR's own diff and therefore cannot be invalidated by an
+// unrelated file. Global freshness converges through
+// scripts/refactoring-audit-refresh.sh instead of through a human.
+//
+// # What still has teeth here
+//
+// Staleness does not fail. Corruption does: parseHeatmap is fail-closed,
+// so a malformed committed artifact, a malformed generation, or a
+// generator that emits nothing at all is still a hard failure on both
+// sides of this compare. The advisory part is the DIFFERENCE between two
+// well-formed inputs.
+func TestGlobalHeatmapFreshnessAdvisory(t *testing.T) {
 	root := repoRoot(t)
 	committedPath := filepath.Join(root, "docs", "refactoring-audit-current.txt")
 	b, err := os.ReadFile(committedPath)
@@ -170,60 +262,50 @@ func TestHeatmapNotStale(t *testing.T) {
 		t.Fatalf("read committed heatmap %s: %v", committedPath, err)
 	}
 	committed := tierByPath(parseHeatmap(t, "committed docs/refactoring-audit-current.txt", string(b)))
-	generated := tierByPath(parseHeatmap(t, "freshly generated heatmap", runScript(t, root, "scripts/refactoring-audit.sh")))
+	generated := tierByPath(parseHeatmap(t, "freshly generated heatmap", generatedHeatmap(t)))
 
-	var entered, left, retiered []string
-	for path, tier := range generated {
-		old, ok := committed[path]
-		switch {
-		case !ok:
-			entered = append(entered, fmt.Sprintf("  %-10s %s", tier, path))
-		case old != tier:
-			retiered = append(retiered, fmt.Sprintf("  %s: %s -> %s", path, old, tier))
-		}
-	}
-	for path, tier := range committed {
-		if _, ok := generated[path]; !ok {
-			left = append(left, fmt.Sprintf("  %-10s %s", tier, path))
-		}
-	}
-	if len(entered)+len(left)+len(retiered) == 0 {
+	d := heatmapDrift(committed, generated)
+	if d.empty() {
+		t.Log("docs/refactoring-audit-current.txt matches the tree")
 		return
 	}
-	sort.Strings(entered)
-	sort.Strings(left)
-	sort.Strings(retiered)
-
 	var msg strings.Builder
-	msg.WriteString("docs/refactoring-audit-current.txt is STALE: the audited file set / tier\n" +
-		"assignment no longer matches the tree.\n")
+	msg.WriteString("ADVISORY (not a failure): docs/refactoring-audit-current.txt is behind the tree.\n")
 	for _, section := range []struct {
 		title string
 		rows  []string
 	}{
-		{fmt.Sprintf("entered the audit (now >=%d LOC)", auditFloor), entered},
-		{fmt.Sprintf("left the audit (now <%d LOC, or renamed/deleted)", auditFloor), left},
-		{fmt.Sprintf("changed tier (crossed %d LOC)", refactorFloor), retiered},
+		{fmt.Sprintf("entered the audit (now >=%d LOC)", auditFloor), d.entered},
+		{fmt.Sprintf("left the audit (now <%d LOC, or renamed/deleted)", auditFloor), d.left},
+		{fmt.Sprintf("changed tier (crossed %d LOC)", refactorFloor), d.retiered},
 	} {
 		if len(section.rows) == 0 {
 			continue
 		}
 		fmt.Fprintf(&msg, "\n%s:\n%s\n", section.title, strings.Join(section.rows, "\n"))
 	}
-	msg.WriteString("\nRegenerate with:\n" +
-		"  bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt\n" +
-		"then commit the result. `make audit-check` shows the full diff.")
-	t.Fatal(msg.String())
+	msg.WriteString("\nThe refresh job converges this without interrupting anyone:\n" +
+		"  bash scripts/refactoring-audit-refresh.sh\n" +
+		"You are NOT expected to regenerate it in your PR. If one of the files\n" +
+		"above is one YOU grew past a threshold,\n" +
+		"TestTouchedFileCrossedModularityThreshold is the test that says so.")
+	t.Log(msg.String())
 }
 
 // TestHeatmapArtifactWellFormed pins the committed artifact's internal
-// coherence, which is what makes the advisory LOC column safe to let lag
-// (see TestHeatmapNotStale). Every row must record a LOC at or above the
-// audit floor whose value agrees with its own tier tag, and the rows must
-// still be in generator order. Together with the tier/membership gate this
-// bounds LOC staleness to within a tier band: a row can never carry a
-// number that contradicts the tier it is filed under, and a real band
-// crossing reds TestHeatmapNotStale.
+// coherence, which is what the artifact still guarantees now that its
+// freshness is advisory (#7253). Every row must record a LOC at or above
+// the audit floor whose value agrees with its own tier tag, and the rows
+// must still be in generator order. So a row can never carry a number
+// that contradicts the tier it is filed under.
+//
+// This bounds INCOHERENCE, not staleness. Before #7253 the tier gate
+// forced a regeneration on every band crossing, which refreshed every
+// number and bounded LOC lag to a tier band; nothing forces that now, so
+// a row's LOC may be arbitrarily old. It cannot be arbitrarily WRONG in
+// the one way that would mislead a reader — a [WATCH] row can never
+// record 2400 — because such a row could only come from a hand edit, and
+// that is what this test catches.
 //
 // These are hand-edit detectors, not drift detectors. The artifact is
 // only ever produced wholesale by scripts/refactoring-audit.sh, which
@@ -267,11 +349,12 @@ func TestHeatmapArtifactWellFormed(t *testing.T) {
 }
 
 // TestGeneratorDeterministic asserts two consecutive generations are
-// byte-identical (#6617 acceptance criterion). The tier/membership gate
-// is only as trustworthy as the generator underneath it: an unstable
+// byte-identical (#6617 acceptance criterion). Everything downstream is
+// only as trustworthy as the generator underneath it: an unstable
 // generator — unsorted `find` order leaking through, a timestamp, a
-// locale-dependent tie-break — would make the gate flap on an unchanged
-// tree and re-create the ignore-this-signal failure #6617 is about.
+// locale-dependent tie-break — would make the refresh job commit a new
+// artifact on every run and the advisory report cry drift on an unchanged
+// tree, re-creating the ignore-this-signal failure #6617 is about.
 func TestGeneratorDeterministic(t *testing.T) {
 	root := repoRoot(t)
 	first := runScript(t, root, "scripts/refactoring-audit.sh")

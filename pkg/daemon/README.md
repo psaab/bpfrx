@@ -737,6 +737,94 @@ by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
 `cluster_transport_race_6290_test.go` (production writer vs production reader
 under `-race`, plus a deterministic stale-epoch drop).
 
+### Periodic converger for the Kea applier (#6535)
+
+RA and Kea are the two per-RG services `applyRethServicesForRG` /
+`clearRethServicesForRG` own. RA has had a per-pass converger since #5861
+(`reconcileClusterRAServices`); Kea had none. Every Kea driver was an EDGE —
+those two functions run only under `if tr.Changed`, `applyDirectVIPOwnership`
+only on an ownership change, and the commit path only when an operator
+commits — and `dhcpserver`'s async worker logs an apply error and drops it
+rather than retrying.
+
+So a failover whose Kea apply failed left the wrong node serving: persistent
+dual-DHCP (the demoting node's stop failed, both Kea instances up) or no-DHCP
+(the promoting node's start failed, neither up), until the next RG transition
+or commit. Neither of those happens on its own.
+
+`reconcileClusterDHCPServices` is the missing converger, called from
+`reconcileRGState` beside `reconcileClusterRAServices` and following the same
+rule that section states: the applied marker advances only on a verified
+success, so a transient error is retried on a later pass rather than latched
+as converged. It re-drives ONLY when `dhcpserver.Manager.ClaimApplyRetry`
+reports the last COMPLETED attempt failed, and the manager spaces retries
+(30s) — a permanently broken Kea must not be held in a continuous
+15s-bounded systemctl restart loop by a 2s tick.
+
+**Single-sourced desired state.** `desiredClusterDHCPConfig` is the one place
+that derives the Kea desired state from (active config, current master-RG
+set); the commit path, both transition edges, and the converger all call it.
+This is single-sourced rather than bound with an agreement test because a
+divergence between the converger and an edge is ALWAYS a bug — the converger
+runs every pass and would fight the edge indefinitely.
+
+Guards: `TestFailedKeaApplyIsRetriedByReconcileConverger` (three real
+reconcile passes: an edge pass whose apply fails, a no-transition pass that
+must re-drive it, and a third that must NOT) and
+`TestClaimApplyRetryOnlyAfterAFailedApply`, in
+`dhcp_apply_converger_6535_test.go`.
+### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
+
+`rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an
+`applied` marker, and `reconcileRGState`'s retry predicate is
+`tr.Changed || s.NeedsApply()` — i.e. "the desired value moved, or the last
+apply did not converge". `applied`/`applyPending` are advanced only by
+`MarkApplied` and `ApplyIfCurrent`, and **neither has a path that SETS
+`applyPending`**: both only CLEAR it, when `applied == active`.
+
+That makes the retry structurally blind to any writer that changes `rg_active`
+in the dataplane WITHOUT going through the state machine's transition path.
+After such a write the machine still believes `desired == applied`, the
+reconcile pass does nothing, and nothing else re-arms it — so forwarding stays
+wherever the second writer left it, permanently. It is a blackhole with no
+retry, not a glitch the next 2 s tick repairs.
+
+`fenceAllRedundancyGroups` (`daemon_ha_sync.go`) is the instance that surfaced
+this. A received peer fence writes `SetRGActive(rg, false)` directly; before
+the fix a fenced primary never came back, because the reconcile pass that
+exists precisely to restore it could not see that anything had changed. (The
+fence itself is opt-in on the SENDING node — `set chassis cluster peer-fencing
+disable-rg`, `heartbeat_manager.go` — but the RECEIVING side is wired
+unconditionally, so a node with no fencing configured is still exposed to a
+peer that has it.)
+
+The fix is the class, not the call site: `rgStateMachine.InvalidateApplied()`
+re-arms the retry, and the fence calls it after each write. Rules for any
+future writer:
+
+- Call `InvalidateApplied()` **after** the write, so the reconcile pass that
+  observes the re-armed retry runs against settled dataplane state.
+- Call it on **failure as well as success**. A write that returned an error may
+  still have partially landed, so "not known to have converged" is the only
+  honest reading, and forcing a re-drive is the fail-closed one. It costs at
+  most one idempotent re-apply on the next tick.
+- `InvalidateApplied` sets `applied = !active` rather than only flipping
+  `applyPending`, preserving the invariant `reconcileLocked` relies on
+  (`applyPending` is true exactly when `applied != active`).
+- The one deliberate exception is `daemon_run_shutdown.go`'s
+  `SetRGActive(..., false)`: the daemon is exiting and there is no later
+  reconcile pass to arm.
+
+Bound honestly: ordering between two unsynchronised `rg_active` writers is not
+something the state machine can resolve — if a concurrent event-handler apply
+stamps `applied` after the fence's write, the retry is disarmed again. What
+`InvalidateApplied` guarantees is that the machine never *silently* believes a
+convergence it did not observe. Guards:
+`TestFenceRearmsReconcileRetry` (end-to-end through two real reconcile passes)
+and `TestInvalidateAppliedRearmsAnySecondWriter` /
+`TestInvalidateAppliedKeepsStructInvariant` (the generic second-writer
+contract), all in `rg_state_fence_rearm_6530_test.go`.
+
 **Where the wiring lives (#6428).** `startClusterComms` was a 602-line
 constructor; the sub-constructions were extracted verbatim into thirteen focused
 builders in **`daemon_ha_comms_wiring.go`** (VRF-device resolution, HA watchdog

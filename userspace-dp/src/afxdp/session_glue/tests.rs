@@ -4334,7 +4334,7 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
 #[test]
 fn reverse_materialized_shared_hit_adopts_replica_session_id_6313() {
     let mut sessions = SessionTable::new();
-    sessions.set_worker_id(4);
+    sessions.set_session_id_namespace(0, 4);
 
     let forward = test_key();
     // The reverse companion: server -> client, ports swapped.
