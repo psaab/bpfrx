@@ -178,9 +178,21 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 				for _, v := range proxyARPAddressValues(prop) {
 					addr := v
 					if !strings.Contains(addr, "/") {
-						addr += "/32"
+						// #6559: /128 for a bare IPv6 literal. The old
+						// unconditional "/32" compiled `2001:db8::1` to a
+						// 32-bit prefix on a 128-bit address — the install was
+						// correct by accident (Addr() recovers the full
+						// address) but the compiled form was indistinguishable
+						// from an authored /32 v6 BLOCK, which the expansion
+						// below has to tell apart.
+						addr += proxyARPHostSuffix(addr)
 					}
-					entry.Addresses = append(entry.Addresses, addr)
+					// #6559: a multi-host prefix expands to its ARP-addressable
+					// hosts here, in the compiler, because `Addresses` is the
+					// "/32 CIDRs" contract the installer and the commit gate
+					// both read. An over-cap block is returned unchanged so
+					// validateProxyARPAddressesStrict can reject it.
+					entry.Addresses = append(entry.Addresses, expandProxyARPPrefix(addr)...)
 				}
 			}
 			sec.NAT.ProxyARP = append(sec.NAT.ProxyARP, entry)
