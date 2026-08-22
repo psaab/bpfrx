@@ -415,42 +415,18 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 		return 0
 	}
 	queued := 0
+	emitV4 := func(key dataplane.SessionKey, val dataplane.SessionValue) {
+		ss.QueueSessionV4(key, val)
+		queued++
+	}
+	emitV6 := func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+		ss.QueueSessionV6(key, val)
+		queued++
+	}
 	for _, delta := range deltas {
 		switch strings.ToLower(delta.Event) {
 		case "open":
-			switch delta.AddrFamily {
-			case dataplane.AFInet:
-				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-				if !ok {
-					slog.Debug("userspace delta: V4 conversion failed", "src", delta.SrcIP, "dst", delta.DstIP, "disposition", delta.Disposition)
-					continue
-				}
-				if !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
-					continue
-				}
-				ss.QueueSessionV4(key, val)
-				slog.Debug("userspace delta: queued V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
-				queued++
-				if delta.FabricRedirect && !delta.FabricIngress {
-					if wireKey, wireVal, ok := userspaceForwardWireAliasV4(key, val, delta); ok {
-						ss.QueueSessionV4(wireKey, wireVal)
-						queued++
-					}
-				}
-			case dataplane.AFInet6:
-				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-				if !ok || !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
-					continue
-				}
-				ss.QueueSessionV6(key, val)
-				queued++
-				if delta.FabricRedirect && !delta.FabricIngress {
-					if wireKey, wireVal, ok := userspaceForwardWireAliasV6(key, val, delta); ok {
-						ss.QueueSessionV6(wireKey, wireVal)
-						queued++
-					}
-				}
-			}
+			d.forEachUserspaceOpenWireSession(ss, zoneIDs, delta, emitV4, emitV6)
 		case "close":
 			switch delta.AddrFamily {
 			case dataplane.AFInet:
@@ -509,4 +485,161 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 		}
 	}
 	return total, nil
+}
+
+// forEachUserspaceOpenWireSession expands ONE "open" session delta into the
+// (key, value) pairs that represent it on the cluster session-sync wire, after
+// applying the sync filter, and hands each to the family-appropriate callback.
+//
+// It is the SINGLE definition of "what does this delta look like on the wire" —
+// the conversion, the owner-RG/zone filter, and the #4090 fabric forward wire
+// alias. Both producers use it: the incremental event-stream path
+// (queueUserspaceSessionDeltas, which queues each pair onto sendCh) and the
+// #6031 authoritative bulk snapshot (userspaceBulkSessionSnapshot, which
+// collects them into the window). A divergence between those two is always a
+// bug — the bulk window is meant to be exactly the set the incremental stream
+// would have delivered — so they share one walk instead of two copies that can
+// drift.
+//
+// Callback-shaped rather than slice-returning so the incremental path, which
+// runs once per session event, allocates nothing per delta: each caller builds
+// its closures once per batch.
+func (d *Daemon) forEachUserspaceOpenWireSession(
+	ss *cluster.SessionSync,
+	zoneIDs map[string]uint16,
+	delta dpuserspace.SessionDeltaInfo,
+	v4 func(dataplane.SessionKey, dataplane.SessionValue),
+	v6 func(dataplane.SessionKeyV6, dataplane.SessionValueV6),
+) {
+	switch delta.AddrFamily {
+	case dataplane.AFInet:
+		key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+		if !ok {
+			slog.Debug("userspace delta: V4 conversion failed", "src", delta.SrcIP, "dst", delta.DstIP, "disposition", delta.Disposition)
+			return
+		}
+		if !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
+			return
+		}
+		v4(key, val)
+		slog.Debug("userspace delta: queued V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
+		if delta.FabricRedirect && !delta.FabricIngress {
+			if wireKey, wireVal, ok := userspaceForwardWireAliasV4(key, val, delta); ok {
+				v4(wireKey, wireVal)
+			}
+		}
+	case dataplane.AFInet6:
+		key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+		if !ok || !d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
+			return
+		}
+		v6(key, val)
+		if delta.FabricRedirect && !delta.FabricIngress {
+			if wireKey, wireVal, ok := userspaceForwardWireAliasV6(key, val, delta); ok {
+				v6(wireKey, wireVal)
+			}
+		}
+	}
+}
+
+// userspaceBulkSessionSnapshot builds the AUTHORITATIVE session set for one
+// cluster bulk window from the userspace dataplane's TABLE-TRUTH export
+// (#6031), and is installed as SessionSync.BulkSessionSource.
+//
+// Before this, BulkSync sourced the window from s.sessions.ForEachV4/V6 — which
+// on the userspace dataplane walks the BPF conntrack maps the Rust helper
+// publishes as a best-effort DISPLAY MIRROR (publish_bpf_conntrack_entry, so
+// `show security flow session` can render zone/interface info), not the helper's
+// authoritative in-process SessionTable. The mirror can drift: publication is
+// gated at table cap and on install_failed, the periodic refresh lags, and the
+// mirror carries no per-session ORIGIN, so it also echoes peer-owned imports
+// back at their owner. Since #5085 removed the empty-bulk reconcile skip, a
+// transiently under-populated mirror at cold-prime reconciles away LIVE
+// peer-owned sessions on the standby.
+//
+// ExportOwnerRGSessions is the table-truth walk (control verb
+// `export_owner_rg_sessions`), filtered to the redundancy groups this node is
+// primary for and skipping locally-demoted entries — so the window is both
+// complete and owner-RG accurate, which the zone-level ShouldSyncZone
+// approximation could not be.
+//
+// Return contract (SessionSync.BulkSessionSource):
+//
+//   - (nil, nil) when there is no authoritative source to consult — no
+//     published runtime, a runtime that is not the userspace exporter, or no
+//     committed config. BulkSync then falls back to the store walk, exactly as
+//     before, so nothing regresses where no table-truth exists.
+//   - (empty, nil) when this node is primary for NO redundancy group. That is
+//     an authoritative "I own nothing to sync", NOT an absent source: the peer
+//     must reconcile away sessions it still holds on our behalf. Returning
+//     (nil, nil) here would silently fall back to the mirror and re-push the
+//     peer's own imports back at it.
+//   - (nil, err) when the export itself failed. BulkSync ABORTS rather than
+//     falling back — see the field doc for why an incomplete window is the
+//     unrecoverable direction.
+func (d *Daemon) userspaceBulkSessionSnapshot() (*cluster.BulkSessionSnapshot, error) {
+	if d.getSessionSync() == nil {
+		return nil, nil
+	}
+	rt := d.dataplane()
+	if rt == nil {
+		return nil, nil
+	}
+	exporter, ok := rt.(userspaceSessionExporter)
+	if !ok {
+		return nil, nil
+	}
+	if d.store == nil {
+		return nil, nil
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return nil, nil
+	}
+	// Read the CURRENT active config's RG set on every call, never a startup
+	// snapshot: a day-2 commit can add a redundancy group (#3917) and its
+	// sessions must ride the very next bulk window.
+	return d.buildUserspaceBulkSnapshotWithConfig(exporter, cfg, d.primaryOwnerRGIDs(cfg))
+}
+
+// buildUserspaceBulkSnapshotWithConfig is the config-taking half of
+// userspaceBulkSessionSnapshot, split out so the export -> convert -> filter
+// pipeline is drivable in a unit test without a published runtime. It mirrors
+// exportUserspaceOwnerRGSessionsWithConfig, which does the same walk for the
+// full-resync path but QUEUES onto the lossy sendCh instead of collecting.
+//
+// An empty rgIDs set returns an EMPTY, non-nil snapshot: this node owns no
+// syncable sessions, which is an authoritative statement the peer must
+// reconcile against, not an absent source.
+func (d *Daemon) buildUserspaceBulkSnapshotWithConfig(
+	exporter userspaceSessionExporter,
+	cfg *config.Config,
+	rgIDs []int,
+) (*cluster.BulkSessionSnapshot, error) {
+	snapshot := &cluster.BulkSessionSnapshot{}
+	if exporter == nil || cfg == nil || len(rgIDs) == 0 {
+		return snapshot, nil
+	}
+	deltas, _, err := exporter.ExportOwnerRGSessions(rgIDs, 0)
+	if err != nil {
+		return nil, err
+	}
+	ss := d.getSessionSync()
+	zoneIDs := buildZoneIDs(cfg)
+	appendV4 := func(key dataplane.SessionKey, val dataplane.SessionValue) {
+		snapshot.V4 = append(snapshot.V4, dataplane.SessionEntryV4{Key: key, Value: val})
+	}
+	appendV6 := func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+		snapshot.V6 = append(snapshot.V6, dataplane.SessionEntryV6{Key: key, Value: val})
+	}
+	for _, delta := range deltas {
+		// The export yields the live table, so every record is an "open".
+		// Anything else would be a helper bug; skipping it keeps a stray
+		// close-shaped record from being framed as a live session.
+		if delta.Event != "" && !strings.EqualFold(delta.Event, "open") {
+			continue
+		}
+		d.forEachUserspaceOpenWireSession(ss, zoneIDs, delta, appendV4, appendV6)
+	}
+	return snapshot, nil
 }

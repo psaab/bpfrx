@@ -239,14 +239,23 @@ the new bulk is sent.
 
 `BulkSync()`:
 
-1. allocates a new monotonically increasing epoch
-2. sends `BulkStart(epoch)`
-3. iterates `sessions_v4` / `sessions_v6`
-4. skips reverse entries
-5. skips sessions not owned by this node for the ingress zone
-6. sends forward entries only
-7. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
-8. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
+1. resolves `BulkSessionSource` — the #6031 authoritative, owner-RG-filtered
+   TABLE-TRUTH snapshot (`export_owner_rg_sessions`). This happens BEFORE the
+   epoch is taken, so a source failure aborts without opening a window
+2. allocates a new monotonically increasing epoch
+3. sends `BulkStart(epoch)`
+4. iterates the snapshot when one was supplied, otherwise `sessions_v4` /
+   `sessions_v6` — the best-effort BPF display mirror, which is the fall-back for
+   a runtime with no table-truth export
+5. skips reverse entries
+6. skips sessions not owned by this node for the ingress zone — the store-walk
+   path only; a supplied snapshot is already owner-RG and origin filtered
+7. sends forward entries only
+8. records `pendingBulkAckEpoch` (**before** the `BulkEnd` write)
+9. sends `BulkEnd(epoch)` and then waits for peer acknowledgement
+
+See `docs/sync-protocol.md` "Table-truth bulk source (#6031)" for why the mirror
+is not authoritative and why an export failure aborts rather than falls back.
 
 The sender now treats outbound bulk acknowledgement as first-class state. A
 bulk transfer is not considered fully primed until the peer returns `BulkAck`

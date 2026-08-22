@@ -99519,3 +99519,18 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
   `userspace-dp/src/server/helpers/status.rs`,
   `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
+
+## 2026-08-21 — #6031: source the cold-prime bulk window from table-truth
+- **Timestamp**: 2026-08-21
+- **Action**: Add `SessionSync.BulkSessionSource` (three-case contract: snapshot /
+  fall-back / abort) so `BulkSync` delimits its authoritative window from the
+  Rust helper's `export_owner_rg_sessions` table-truth walk instead of the
+  best-effort BPF display mirror. Wired in `startClusterComms` to the daemon's
+  `userspaceBulkSessionSnapshot`. The delta -> wire expansion is now a single
+  shared walk (`forEachUserspaceOpenWireSession`) used by both the incremental
+  stream and the bulk snapshot.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go,
+  pkg/daemon/daemon_ha_userspace_stream.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/cluster/sync_bulk_source_6031_test.go (new),
+  pkg/daemon/userspace_bulk_snapshot_6031_test.go (new),
+  docs/sync-protocol.md, docs/session-sync-architecture.md

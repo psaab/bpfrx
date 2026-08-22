@@ -470,6 +470,39 @@ type SessionSync struct {
 	// always ends with the lossless BulkSync window, so an override can never
 	// reintroduce the empty-marker / skipped-reconcile regression.
 	BulkSyncOverride func() error
+	// BulkSessionSource, when set, supplies the AUTHORITATIVE session set that
+	// BulkSync delimits, replacing the walk of the local session store (#6031).
+	//
+	// The store BulkSync otherwise walks is, on the userspace dataplane, the
+	// best-effort BPF conntrack MIRROR the Rust helper publishes for display
+	// (`publish_bpf_conntrack_entry`) — not the helper's authoritative in-process
+	// SessionTable. The mirror can drift from table-truth (publish gating at
+	// table cap / on install_failed, periodic-refresh lag) and carries no
+	// per-session origin, so it can echo peer-owned imports back at their owner.
+	// Since #5085 removed the empty-bulk reconcile skip, reconciling the peer
+	// against an under-populated mirror DELETES live peer-owned sessions.
+	//
+	// Contract, in three cases — the middle one is the reason this is not just
+	// `func() []Session`:
+	//
+	//   (snapshot, nil) → this set IS the window. Sent losslessly under writeMu
+	//                     exactly as the store walk would be.
+	//   (nil, nil)      → no authoritative source is available right now (no
+	//                     userspace runtime, no committed config). Fall back to
+	//                     the store walk — today's posture, unchanged.
+	//   (nil, err)      → the authoritative source FAILED. The bulk is ABORTED.
+	//                     Falling back here would reconcile the peer against
+	//                     exactly the mirror we just decided is not
+	//                     authoritative, which is the unrecoverable direction:
+	//                     an under-populated window deletes live sessions,
+	//                     whereas a skipped bulk is re-armed and retried by
+	//                     every caller (handleNewConnection, the survivor
+	//                     re-drive, and the #82 sweep re-drive).
+	//
+	// An EMPTY non-nil snapshot is authoritative and means exactly that: this
+	// node owns no syncable sessions, so the peer must reconcile away what it
+	// still holds for us.
+	BulkSessionSource func() (*BulkSessionSnapshot, error)
 	// OnBulkSyncAckReceived fires when the peer acknowledges our outbound bulk sync.
 	OnBulkSyncAckReceived func()
 	// OnPeerConnected fires when a peer sync connection is established.

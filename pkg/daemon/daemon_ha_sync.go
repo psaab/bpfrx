@@ -1035,12 +1035,24 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// sendCh) and then sent an EMPTY BulkStart/BulkEnd, so the receiver
 			// recorded zero session keys and skipped authoritative stale
 			// reconciliation — a stale peer-owned session the standby held
-			// survived cold-prime. Cold-prime now uses the lossless BulkSync
+			// survived cold-prime. Cold-prime uses the lossless BulkSync
 			// direct-write window (doBulkSync), which delimits a COMPLETE
-			// authoritative snapshot the receiver reconciles against. A
-			// table-truth, owner-RG-filtered snapshot via ExportOwnerRGSessions
-			// (eliminating the BulkSync mirror-map drift residual) is tracked as
-			// a follow-up.
+			// authoritative snapshot the receiver reconciles against.
+			//
+			// #6031: and that window is now SOURCED from table-truth. BulkSync
+			// otherwise walks the local session store, which on the userspace
+			// dataplane is the helper's best-effort BPF display MIRROR — it can
+			// drift from the authoritative SessionTable and carries no
+			// per-session origin. Installing the source makes the window come
+			// from ExportOwnerRGSessions (owner-RG filtered, demoted entries
+			// skipped) instead, with a documented fall-back-to-store /
+			// abort-on-error contract. This is a SOURCE, not an override: the
+			// single BulkStart -> sessions -> BulkEnd window, its epoch, the
+			// #3912 record-then-send discipline and the #5272 bulk-completion
+			// gate are all unchanged, which is why it is not wired through
+			// BulkSyncOverride (that runs BEFORE BulkSync, so the mirror-sourced
+			// window would still be the one the receiver reconciled against).
+			ss.BulkSessionSource = d.userspaceBulkSessionSnapshot
 
 			ss.OnPeerDisconnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")

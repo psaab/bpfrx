@@ -823,12 +823,52 @@ authoritative snapshot: reconciling against an incomplete set would DELETE live
 peer-owned sessions merely dropped in transit. The override is therefore no
 longer wired in production (`startClusterComms`); `doBulkSync` always ends with
 `BulkSync()`, whose direct writes under `writeMu` are lossless and complete.
-`BulkSync` sources sessions from the shim `sessions`/`sessions_v6` BPF mirror
-maps (owner-RG-filtered by `ShouldSyncZone`); a table-truth source
-(`ExportOwnerRGSessions`) that removes the mirror-drift residual is tracked as a
-follow-up. `BulkSyncOverride` is retained only as a test/extension seam and is
+`BulkSyncOverride` is retained only as a test/extension seam and is
 regression-proof: the trailing `BulkSync()` runs unconditionally, so an override
 can never re-send empty markers.
+
+#### Table-truth bulk source (#6031)
+
+`BulkSync` used to source the window from the local session store, which on the
+userspace dataplane walks the shim `sessions`/`sessions_v6` BPF maps. Those are
+a best-effort DISPLAY MIRROR the Rust helper publishes
+(`publish_bpf_conntrack_entry`) so `show security flow session` can render
+zone/interface information — **not** the helper's authoritative in-process
+`SessionTable`. The mirror can drift from table-truth (publication is gated at
+table cap and on `install_failed`, the periodic refresh lags) and carries no
+per-session ORIGIN, so it also echoes peer-owned imports back at their owner.
+Since #5085 removed the empty-bulk reconcile skip, an under-populated mirror at
+cold-prime is not a missed optimization — the receiver treats every absent key as
+stale and DELETES it.
+
+`SessionSync.BulkSessionSource` (wired in `startClusterComms` to the daemon's
+`userspaceBulkSessionSnapshot`) now supplies the window from the table-truth
+control verb `export_owner_rg_sessions`, filtered to the redundancy groups this
+node is primary for and skipping locally-demoted entries. It is a SOURCE, not an
+override: exactly one `BulkStart → sessions → BulkEnd` window is written, under
+the same epoch, with the same #3912 record-then-send discipline and the same
+#5272 bulk-completion gate. No wire change.
+
+The three-case contract is what makes it safe:
+
+| source returns | BulkSync does |
+|---|---|
+| a snapshot (possibly EMPTY) | frames exactly that set — an empty snapshot is an authoritative "I own nothing", which the peer must reconcile against |
+| `(nil, nil)` | falls back to the session-store walk — no authoritative source exists (no userspace runtime, no committed config), so nothing regresses |
+| `(nil, err)` | ABORTS before writing `BulkStart` |
+
+The abort matters: falling back on an export failure would reconcile the peer
+against exactly the mirror the change decided is not authoritative, and an
+under-populated window deletes live sessions. A skipped bulk is recoverable —
+every `doBulkSync` caller re-arms and retries (`handleNewConnection`'s
+`needColdPrime` latch, the #4090 survivor re-drive, the #82 sweep re-drive).
+
+A supplied snapshot is NOT re-filtered by `ShouldSyncZone`: the source has
+already applied the per-session owner-RG and origin filter, and re-applying the
+zone-level approximation on top would drop sessions the authoritative export says
+this node owns (a zone missing from `zoneRGMap`, a fabric-redirect wire alias) —
+which the peer would then reconcile away. Reverse entries are still skipped on
+both paths.
 
 #### Survivor-fabric cold-start bulk re-drive (#4090)
 
