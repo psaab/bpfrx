@@ -90,7 +90,9 @@ func fixtureZoneIDs(t *testing.T) map[string]uint16 {
 func neutralizeKernelCounterReads(t *testing.T) {
 	t.Helper()
 	origDeny := readHostInboundDenyCounters
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) { return nil, nil }
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
+		return nil, xnft.HostInboundTableAbsent, nil
+	}
 	t.Cleanup(func() { readHostInboundDenyCounters = origDeny })
 
 	origLo0 := readLo0Counters

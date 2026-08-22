@@ -1875,7 +1875,12 @@ never lock an operator out of a remote box it manages.
   path and is DISTINCT from the userspace-dp `xpf_host_inbound_denies_total`
   (`GlobalCtrHostInboundDeny`, #3326) — they are not double counts. Before #3361
   these kernel drops were uncounted and `host_inbound_denies` stayed 0 even while
-  the firewall was actively denying control-plane traffic.
+  the firewall was actively denying control-plane traffic. The #5644 cold-boot
+  fail-closed FENCE re-creates that blind spot on purpose (it renders catch-all
+  DROPs with NO named counters), so `ReadHostInboundDenyCounters` reports the
+  present-but-counterless table as `HostInboundTableCounterless` and the API
+  marks that zero non-authoritative rather than publishing it (#5719). Adding a
+  named counter to the fence would silently re-certify the zero.
 
 ## RPM + ip-monitoring wiring (#1827)
 
