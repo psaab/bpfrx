@@ -737,6 +737,58 @@ by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +
 `cluster_transport_race_6290_test.go` (production writer vs production reader
 under `-race`, plus a deterministic stale-epoch drop).
 
+### Out-of-band `rg_active` writers must re-arm the reconcile retry (#6530)
+
+`rgStateMachine` (`rg_state.go`) tracks a desired `active` value and an
+`applied` marker, and `reconcileRGState`'s retry predicate is
+`tr.Changed || s.NeedsApply()` — i.e. "the desired value moved, or the last
+apply did not converge". `applied`/`applyPending` are advanced only by
+`MarkApplied` and `ApplyIfCurrent`, and **neither has a path that SETS
+`applyPending`**: both only CLEAR it, when `applied == active`.
+
+That makes the retry structurally blind to any writer that changes `rg_active`
+in the dataplane WITHOUT going through the state machine's transition path.
+After such a write the machine still believes `desired == applied`, the
+reconcile pass does nothing, and nothing else re-arms it — so forwarding stays
+wherever the second writer left it, permanently. It is a blackhole with no
+retry, not a glitch the next 2 s tick repairs.
+
+`fenceAllRedundancyGroups` (`daemon_ha_sync.go`) is the instance that surfaced
+this. A received peer fence writes `SetRGActive(rg, false)` directly; before
+the fix a fenced primary never came back, because the reconcile pass that
+exists precisely to restore it could not see that anything had changed. (The
+fence itself is opt-in on the SENDING node — `set chassis cluster peer-fencing
+disable-rg`, `heartbeat_manager.go` — but the RECEIVING side is wired
+unconditionally, so a node with no fencing configured is still exposed to a
+peer that has it.)
+
+The fix is the class, not the call site: `rgStateMachine.InvalidateApplied()`
+re-arms the retry, and the fence calls it after each write. Rules for any
+future writer:
+
+- Call `InvalidateApplied()` **after** the write, so the reconcile pass that
+  observes the re-armed retry runs against settled dataplane state.
+- Call it on **failure as well as success**. A write that returned an error may
+  still have partially landed, so "not known to have converged" is the only
+  honest reading, and forcing a re-drive is the fail-closed one. It costs at
+  most one idempotent re-apply on the next tick.
+- `InvalidateApplied` sets `applied = !active` rather than only flipping
+  `applyPending`, preserving the invariant `reconcileLocked` relies on
+  (`applyPending` is true exactly when `applied != active`).
+- The one deliberate exception is `daemon_run_shutdown.go`'s
+  `SetRGActive(..., false)`: the daemon is exiting and there is no later
+  reconcile pass to arm.
+
+Bound honestly: ordering between two unsynchronised `rg_active` writers is not
+something the state machine can resolve — if a concurrent event-handler apply
+stamps `applied` after the fence's write, the retry is disarmed again. What
+`InvalidateApplied` guarantees is that the machine never *silently* believes a
+convergence it did not observe. Guards:
+`TestFenceRearmsReconcileRetry` (end-to-end through two real reconcile passes)
+and `TestInvalidateAppliedRearmsAnySecondWriter` /
+`TestInvalidateAppliedKeepsStructInvariant` (the generic second-writer
+contract), all in `rg_state_fence_rearm_6530_test.go`.
+
 ### Per-RG Router-Advertisement reconcile (#5861)
 
 In cluster mode RA senders run ONLY on the RG that is the current active
