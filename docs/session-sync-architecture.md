@@ -498,31 +498,47 @@ and let A threshold on its own `configGenCounter`" — and closed it as
 unworkable. Recorded here because it has been re-derived more than once; the
 three reasons are structural, not implementation detail:
 
-- **The two counters are frozen on opposite sides of one predicate.**
-  `configGenCounter` advances only through `nextConfigGen` ← `QueueConfig`,
-  whose only callers (`syncConfigToPeer`, `reconcileConfigSyncToPeer`) are gated
-  on `rg0ConfigSyncAuthority` = `IsLocalPrimary(0)`. `lastAppliedConfigGen`
+- **The two counters are never simultaneously live on one node, so the shortcut
+  cannot be expressed role-free.** `configGenCounter` advances only through
+  `nextConfigGen` ← `QueueConfig`, whose only production callers
+  (`syncConfigToPeer`, `reconcileConfigSyncToPeer`) are gated on
+  `rg0ConfigSyncAuthority` = `IsLocalPrimary(0)`. `lastAppliedConfigGen`
   advances only through `recordAppliedConfigGen` on a nil `OnConfigReceived`,
   and `handleConfigSync` returns `errConfigSyncRejectedPrimary` whenever
   `IsLocalPrimary(0)`. So a node's send counter is frozen for its whole
-  non-authority tenure and its applied mark is frozen for its whole authority
-  tenure. After the first RG0 transition the new authority thresholds on a value
-  frozen since its last tenure while the new non-authority stamps one frozen
-  since its last tenure — a permanent mismatch, not a transient one, because
-  nothing advances either counter back into agreement.
-- **The handover disambiguation needs the wire field the shortcut avoids.** The
-  proposed remedy — treat the epoch as 0 (the documented disable value) for a
-  session stamped under a different authority incarnation than the receiver's
-  current one — requires the receiver to know a stamp's authority incarnation.
-  `SessionValue.ConfigEpoch` is a bare `uint64` (`pkg/dataplane/types.go`)
-  written as eight raw LE bytes with no companion tag
+  non-authority tenure and its applied mark for its whole authority tenure, and
+  the shortcut must therefore branch on `IsLocalPrimary(0)` at BOTH the stamp
+  site and the threshold site. A role-FREE formulation is not available as a way
+  out: coalescing with `max(configGenCounter, lastAppliedConfigGen)` chooses
+  between two independent `MonotonicNanos()` boot seeds (`initGenState`), so
+  which side wins is a function of relative node uptime rather than of config
+  order.
+
+  To be precise about what this does *not* claim: the role-branched mismatch
+  that follows an RG0 handover **self-heals**. `reconcileConfigSyncToPeer` runs
+  on the `"rg0-promotion"` trigger, so once the new authority has pushed and the
+  new non-authority has applied, both counters are back in one namespace. The
+  hazard is not the steady state after a handover — it is the window *during*
+  one, which the next point covers.
+- **The handover window needs the wire field the shortcut avoids.** RG0 role is
+  not learned atomically by both nodes: each side updates on its own
+  heartbeat/VRRP timing, so there is necessarily a skew window in which the old
+  authority still believes it is the authority while the new one already does.
+  Dual-active is not theoretical either — the election code has an explicit
+  DUAL-ACTIVE branch (`pkg/cluster/election.go`) that detects both nodes primary
+  for one RG and resolves it by effective priority then node ID, which takes a
+  heartbeat round to converge. Throughout that window BOTH nodes stamp and
+  threshold on `configGenCounter`, i.e. on two independent `MonotonicNanos()`
+  boot seeds compared directly, so whether the guard is inert or refuses *every*
+  inbound synced session is decided by relative uptime. The issue's own proposed
+  remedy — treat the epoch as 0 (the documented disable value) for a session
+  stamped under a different authority incarnation than the receiver's current
+  one — is what would close this, and it requires the receiver to know a stamp's
+  authority incarnation. `SessionValue.ConfigEpoch` is a bare `uint64`
+  (`pkg/dataplane/types.go`) written as eight raw LE bytes with no companion tag
   (`encodeSessionV4Payload` / `encodeSessionV6Payload`), and nothing else on the
-  session wire identifies the minting authority. It cannot be derived locally
-  either: RG0 role propagates per node on its own timing and the cluster has a
-  documented transient dual-primary window, in which BOTH nodes stamp and
-  threshold on `configGenCounter` — two independent `MonotonicNanos()` boot
-  seeds compared directly, so which one is larger is a function of relative
-  uptime alone.
+  session wire identifies the minting authority — so the remedy is exactly the
+  wire field the shortcut set out to avoid.
 - **It converts a self-healing failure into total reverse-direction loss.** A
   config apply that does not take effect on the non-authority (compile/promote
   failure, or the RG0-primary rejection above — counted by
