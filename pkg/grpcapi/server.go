@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/authz"
+	"github.com/psaab/xpf/pkg/bootstrapshow"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/clusterfailover"
 	"github.com/psaab/xpf/pkg/config"
@@ -130,6 +131,13 @@ type Config struct {
 	// unit-test / no-daemon build, where showSystemServices falls back to the
 	// documented loopback defaults.
 	ListenersFn func() sysservices.Listeners
+	// BootstrapImportFn returns the recorded day-0 / bootstrap config-import
+	// outcome for `show system bootstrap-import` (#6496). Wired by the daemon
+	// to Daemon.BootstrapImportSnapshot — the SAME recorded snapshot /health
+	// reports, so the two surfaces cannot disagree about whether a day-0
+	// config applied. nil in a unit-test / no-daemon build, where the topic
+	// reports that the daemon has not recorded an outcome.
+	BootstrapImportFn func() bootstrapshow.Snapshot
 	// PeerLookupFn overrides how the primary listener's #5278 authorization
 	// gate learns which local account owns a connection. Production leaves it
 	// nil and the gate calls authz.LookupPeer, which reads the kernel's socket
@@ -179,6 +187,10 @@ type Server struct {
 	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
 	// no-daemon unit-test build.
 	listenersFn func() sysservices.Listeners
+	// bootstrapImportFn returns the recorded day-0 import outcome for the
+	// `bootstrap-import` ShowText topic (#6496). Wired from
+	// Config.BootstrapImportFn; nil in a no-daemon unit-test build.
+	bootstrapImportFn func() bootstrapshow.Snapshot
 	// requestedAddr is the primary gRPC bind requested at construction
 	// (--grpc-addr). Immutable, so it is read without effMu; it is the fallback
 	// address reported while pre-bind and on a bind failure (#6385/#6401).
@@ -315,6 +327,7 @@ func NewServer(addr string, cfg Config) *Server {
 		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
 		fabricVRFDevice:       cfg.FabricVRFDevice,
 		listenersFn:           cfg.ListenersFn,
+		bootstrapImportFn:     cfg.BootstrapImportFn,
 		peerLookupFn:          cfg.PeerLookupFn,
 	}
 }

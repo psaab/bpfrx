@@ -17,6 +17,84 @@
   was believed at the time; rewriting a past entry would falsify the record.
   This entry is the correction.
 
+## 2026-08-22 — #6455 Finding 1: a duplicate authored inside an applied group compiled clean
+
+- **Timestamp**: 2026-08-22 (fix/6455-group-authored-dupnames)
+- **Action**: Added `validateDuplicateNamesExpandedAST`, the POST-expansion half
+  of the duplicate-name gate family: it re-runs the three pre-expansion scanners
+  on a group-expanded clone, once per cluster node, and subtracts what the
+  pre-expansion gates already reported.
+- **File(s)**: `pkg/config/dup_names_expanded_6455.go` (new),
+  `pkg/config/dup_names_expanded_6455_test.go` (new), `pkg/config/compiler.go`,
+  `pkg/config/compiler_opts.go`, `pkg/config/dup_names_6455.go`,
+  `pkg/config/dup_named_blocks.go`, `pkg/config/dup_nat_rule_names.go`,
+  `pkg/config/dup_nat_ruleset_names.go`, `docs/config-schema.md`
+
+  The three gates (#5180 named-block, #5649 NAT rule, #6454 NAT rule-set) scan
+  TOP-LEVEL stanzas only. That is correct for them — apply-groups DEEP-MERGES a
+  group-provided named block onto an inline peer, so walking group bodies
+  pre-expansion would count one merged object twice. But a duplicate authored
+  ENTIRELY inside an applied group, with no inline peer, is appended wholesale
+  by ast_groups.go and never coalesced.
+
+  Measured on `52f51200e` before the fix: the issue's repro compiled CLEAN and
+  produced rule-set "RS" holding TWO rules both named "R", while the
+  byte-identical duplicate authored inline was hard-rejected. Same config, same
+  compiled shape, opposite verdict, decided by where the operator wrote it.
+
+  PR #6491 tried a pre-expansion per-group-body scan and WITHDREW it: fragments
+  of one named object authored across repeated group roots COALESCE under
+  `mergeNodes` during ExpandGroups, and a sibling-scan cannot model that
+  same-pass coalescing, so it rejected configs that compile to one object. This
+  runs the same scanners AFTER expansion, where the coalescing has already
+  happened — a fragment pair is one node by then and reports nothing. The
+  pre-existing `TestDup6455GroupFragmentCoalescingAccepted` is the accept-side
+  control and passes unchanged; so does its C4 case, where two group-local
+  same-name rule siblings coalesce INTO an inline peer.
+
+  Reusing the scanners verbatim rather than reimplementing the name-keying is
+  deliberate: it is what stops the two views from disagreeing about what
+  "duplicate" means.
+
+  Expansion runs once per cluster node (node0 AND node1), reusing the
+  clone-and-expand shape of `collectNodeExpandedInterfaceUnitSpellings` and
+  mirroring the #5878 / #5879 / #6178 / #6662 union gates, so a `groups node1`
+  duplicate that only the PEER's `${node}` expansion selects is rejected at
+  commit instead of committing green here and merely warning on the standby.
+
+  Findings the pre-expansion gates already produced are subtracted, so an inline
+  duplicate is reported exactly ONCE on the lenient path. Dedup is by rendered
+  message because both views render through the same functions — identical
+  findings are byte-identical strings by construction, no second wording to keep
+  in sync. On the strict path the subtraction is a no-op (the pre-expansion
+  gates return their error immediately, so reaching this gate means they found
+  nothing).
+
+  `expandInterfaceRanges` is deliberately NOT applied to the clone: a range
+  expanding to two identical names is a different defect on a different axis,
+  nothing detects it today, and covering it here would be the same speculative
+  scope that produced the withdrawn false-reject.
+
+  Mutation proof — `go build ./pkg/config/` checked clean before each cell, so no
+  red is a build failure in disguise:
+  - restore the VERBATIM pre-fix `pkg/config/compiler.go`
+    (`git show origin/master:pkg/config/compiler.go`), i.e. delete the production
+    wiring rather than break the function it calls — TEST_RC=1, five tests red;
+  - `expandedDupNodeViews = []int{0}` — TEST_RC=1, and it LOCALISES: only
+    `TestDupExpanded6455PeerOnlyNodeGroupCaught` reds;
+  - drop the `alreadyReported` subtraction — TEST_RC=1, reds the new
+    report-once control AND the pre-existing
+    `TestDup6455QuotedEmptyLenientWarnsOnce`;
+  - drop each of the three scanners from `dupNameScannersExpanded` in turn —
+    TEST_RC=1 each, and each reds exactly its OWN subtest of
+    `TestDupExpanded6455EachScannerIsWired`, so a missing member cannot hide
+    behind a compound red.
+
+  Control at HEAD: `go test -count=1 ./pkg/config/` TEST_RC=0,
+  `go test -count=1 ./pkg/configstore/ ./pkg/daemon/ ./pkg/cli/` TEST_RC=0,
+  `go vet ./pkg/config/` VET_RC=0, `go build ./...` BUILD_RC=0. Go-only; no
+  dataplane binary moves, so no cluster smoke is owed.
+
 ## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
 
 - **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
@@ -100229,6 +100307,17 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_prepass_logging_4960_test.go,
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
+    lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
+    so the #6476 cold-boot fence is no longer suppressed.
+  - **File(s)**: pkg/nftables/netlink_installer.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/daemon.go, pkg/daemon/lo0_vacated_enforced_6529_test.go,
+    pkg/nftables/netlink_lo0_zero_render_6529_test.go,
+    pkg/daemon/daemon_nft_netlink_testhelper_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go,
+    pkg/nftables/netlink_kernel_test.go, docs/host-inbound-service-matrix.md
 - **Timestamp**: 2026-08-21
 - **Action**: #6428 — `Daemon.startClusterComms` was a 602-line constructor
   wiring the whole cluster-comms stack. Extracted thirteen sub-constructions
@@ -100351,6 +100440,17 @@ prose edit above them added. No diff falls in the new test body.
   scripts/refactoring-audit-classify.sh,
   docs/refactoring-audit-accepted.txt (new), docs/refactoring-audit.md,
   docs/engineering-style.md, Makefile, _Log.md
+
+## 2026-08-21 — #6031 coverage salvage from the closed duplicate #7255
+- **Timestamp**: 2026-08-21
+- **Action**: Carried the 2 genuinely-uncovered contract cases from the closed
+  duplicate onto merged master, reframed for the merged API: an EMPTY
+  table-truth snapshot must still frame a real authoritative window (the #5085
+  empty-bulk skip, one layer down), and an empty owned-RG set is a determinate
+  answer rather than a precondition failure. Dropped 11 as duplicates or as
+  encoding the duplicate's own (in one case destructive) contract.
+- **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
+  pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)
 
 - **Timestamp**: 2026-08-21
 - **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
