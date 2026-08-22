@@ -23,12 +23,22 @@ type swanctlRecorder struct {
 	calls   [][]string
 	listSAs string // body returned for `swanctl --list-sas`
 	listErr error  // error returned for `swanctl --list-sas` (nil = ok)
+	// terminateErr programs a per-connection failure for
+	// `swanctl --terminate --ike <name>`; a name absent from the map (the
+	// zero value, nil map) terminates successfully. Used by the #6542
+	// teardown-debt tests.
+	terminateErr map[string]error
 }
 
 func (r *swanctlRecorder) run(args ...string) ([]byte, error) {
 	r.calls = append(r.calls, args)
 	if len(args) > 0 && args[0] == "--list-sas" {
 		return []byte(r.listSAs), r.listErr
+	}
+	if len(args) == 3 && args[0] == "--terminate" && args[1] == "--ike" {
+		if err := r.terminateErr[args[2]]; err != nil {
+			return []byte("terminate failed"), err
+		}
 	}
 	return nil, nil
 }
