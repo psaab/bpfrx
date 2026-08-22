@@ -1821,6 +1821,44 @@ never lock an operator out of a remote box it manages.
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)
   `firewall_address_literal_3433_test.go`.
 
+  **A MALFORMED address token fails the install CLOSED (#6512).** #3433 dropped
+  a malformed token silently, so an ALL-malformed positive list reached
+  "constrained + empty -> match nothing". That resolution is wrong for the two
+  shapes #6512 filed. A PARTIALLY malformed positive list installed a NARROWED
+  rule — a `discard`/`reject` term enforcing a smaller address set than the
+  operator wrote, with the dropped range falling through to the implicit accept
+  (fail-OPEN). And an EXCEPT list narrowed to empty takes the "empty except ->
+  match ALL" arm above, so the direction becomes UNCONSTRAINED (fail-OPEN in the
+  other direction) — which is why "skip the bad entry" can never be the fix
+  here. Both builders now refuse: `nftFamilyAddrs` (oracle) keeps the token
+  VERBATIM so `nft -f -` rejects the whole ruleset, and `filterFamilyAddrs`
+  (`pkg/nftables/netlink_lo0.go`, the production builder) returns an error that
+  fails the plan and aborts the install — the same posture both already had for
+  an unrepresentable port / DSCP token (#6405). Wrong-family and `any`/empty
+  tokens are unaffected: those are legitimate drops that match the userspace
+  matcher.
+
+  Fail-closed here does not mean fail-to-boot (#1960): the install error makes
+  `applyLo0Filter` install the #6476 cold-boot fail-closed fence (lifelines
+  exempt, mandatory L3 / return traffic admitted) and the boot apply logs and
+  discards the error, so an already-persisted config still loads — it just does
+  not get a kernel filter that differs from what the operator wrote. On the
+  strict COMMIT path the commit now fails with the malformed token named,
+  instead of silently installing the narrowed filter.
+
+  Detection is on the TOKEN, not on the #6463 `AddressUnrepresentable` marker,
+  because that marker is derived from `term.UnknownAddresses` — malformed
+  LITERAL `from source-address` / `destination-address` tokens only. A malformed
+  entry inside a referenced `policy-options prefix-list` reaches this lowering
+  through `ResolveFilterPrefixListAddrs` with the marker unset, and is not
+  rejected at strict commit either (`validateFirewallPrefixListReferencesStrict`
+  validates that the REFERENCE resolves, not that its entries parse). Pinned by
+  `pkg/nftables/netlink_lo0_addrs_6512_test.go` (builder fails closed; wrong-family
+  and placeholder tokens still lower) and
+  `pkg/daemon/lo0_addr_failclosed_6512_test.go` (the token reaches the builder
+  from a prefix-list on the ordinary commit path; a failed build fences and
+  surfaces the error).
+
   **ICMP type/code lowering mirrors userspace (#3483):** `nftRulesFromTerm`
   renders `icmp-type` and `icmp-code` as INDEPENDENT predicates, each gated
   only on its own value list — `icmp[v6] type <set>` when `len(ICMPTypes) > 0`
@@ -1925,12 +1963,22 @@ never lock an operator out of a remote box it manages.
   branch; a zoned NON-lifeline DHCP interface (e.g. a standalone `fxp1`) now forces
   the full recompile that builds its address-scoped host-inbound fence, closing the
   addressless→addressed gap where the broad class exempted it from that reapply.
-  **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  **Lifeline exclusion — by INTERFACE, not by address value:**
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
-  the address sets so a host-inbound deny can never strand management or break
-  HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages
-  are accepted before any deny; a configured zone that resolves to zero
-  recognized matches fails OPEN (no deny) rather than locking the zone out.
+  the address sets, so an address reachable ONLY through a lifeline is never
+  denied. A management address ALSO configured on a non-lifeline interface is NOT
+  subtracted: it is in that interface's drop set, and every host-inbound drop is
+  destination-address-only with no `iifname` (#3718), so arriving on the lifeline
+  does not exempt it. Only a zone that ADMITS the service puts an accept in front
+  of the drop — a zone with no stanza (#3405) or an unzoned interface (#4420)
+  drops NEW management connections to that address, and the #5566 conntrack
+  reconcile flushes its ESTABLISHED ones. `ct state established,related` and IPv6
+  ND + v4/v6 PMTUD control messages are accepted before any deny, which is what
+  preserves HA control traffic and an established session where the reconcile
+  does not flush it. See `docs/host-inbound-service-matrix.md`, "Lifeline
+  exclusion is by INTERFACE, not by address value". A configured zone that
+  resolves to zero recognized matches fails OPEN (no deny) rather than locking
+  the zone out.
   **Unzoned interfaces (#4420 HI-2):** an interface that carries an address but
   is assigned to NO security zone is not covered by any per-zone view above, so
   before #4420 its firewall-local addresses fell through the chain's
@@ -1939,9 +1987,11 @@ never lock an operator out of a remote box it manages.
   host-inbound traffic at all). `applyHostInboundFilter` now also scopes a
   catch-all DROP to those addresses (`userspace.BuildUnzonedHostInboundAddrs`,
   counted under the reserved `junos-host` sentinel label so the #3361 scraper
-  reports them as `zone="junos-host"`). Lifelines are excluded and zoned
-  addresses subtracted, so it can never strand management or conflict with a zone
-  rule; it is emitted only when the zone model is in use (>= 1 zone), so a
+  reports them as `zone="junos-host"`). Lifeline INTERFACES are excluded and
+  zoned addresses subtracted, so it never conflicts with a zone rule — but an
+  unzoned drop carries NO service accept, so a management address shared onto an
+  unzoned interface is denied outright here (see the lifeline note above); it is
+  emitted only when the zone model is in use (>= 1 zone), so a
   bootstrap / zoneless box is left untouched. Unzoned interfaces are not
   AF_XDP-bound, so the kernel nft deny is the sole and sufficient enforcement
   point (no userspace-dp change). **Known limitation (#4420 HI-1):** the chain

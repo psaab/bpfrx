@@ -39,10 +39,20 @@ import (
 // loosening and no-op commits and needs no persisted prior-config snapshot.
 //
 // Only firewall-local addresses that carry a catch-all DROP are eligible (the
-// covered set). Management / cluster-control lifeline addresses (fxp0 / em0 /
+// covered set). Management / cluster-control lifeline INTERFACES (fxp0 / em0 /
 // fab*) are excluded from the host-inbound views by BuildZoneHostInboundViews, so
-// they are never in the covered set and their conntrack is never flushed — the
-// flush can never strand management or break HA. Kernel netfilter conntrack on
+// an address reachable ONLY through a lifeline is never in the covered set and its
+// conntrack is never flushed. That exclusion is by INTERFACE, not by address
+// VALUE. A management address ALSO configured on a non-lifeline interface IS in
+// the covered set: shared onto a zone that ADMITS the service it keeps that
+// service's admit tuple and its established sessions are preserved, but shared
+// onto an UNZONED interface (#4420) or a zone with NO host-inbound-traffic stanza
+// (#3405) it is recorded with an EMPTY admit set and every established entry to it
+// — including a live operator SSH session — is flushed. So this reconcile CAN tear
+// down management on those topologies, and the "already-established sessions
+// survive" mitigation for the #6492 fence window does not hold there. See
+// docs/host-inbound-service-matrix.md, "Lifeline exclusion is by INTERFACE, not by
+// address value". Kernel netfilter conntrack on
 // this appliance tracks only host-terminated / kernel-forwarded flows (transit
 // forwarding runs through userspace-dp's own session table, not netfilter
 // conntrack), so the table swept here is small.

@@ -100200,6 +100200,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
 
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 — fence-only drop scope (`BuildFenceAddrSets`): withhold
+    lifeline-shared addresses (Finding A), cover every firewall-local address
+    including on a zone-less router (Finding B); wire both fence call sites.
+  - **File(s)**: pkg/dataplane/userspace/zones_host_inbound.go,
+    pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+    pkg/daemon/host_inbound_fence_scope_6492_test.go,
+    pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+    docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 Finding C — add the sticky-re-render subsumption proof
+    (the #6489 whole-table re-render never fences a lifeline-shared address on
+    ANY render, and still picks up an address that appears mid-degradation).
+  - **File(s)**: pkg/daemon/host_inbound_fence_scope_6492_test.go
 ## 2026-08-21 — #6427: split manager_ha.go into seven responsibility-scoped files
 
 - **Timestamp**: 2026-08-21
@@ -100252,6 +100267,14 @@ prose edit above them added. No diff falls in the new test body.
   existing #6031 tests green while silently reverting the fix.
 - **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
 
+- **Timestamp**: 2026-08-21
+  - **Action**: #6512 — lo0 kernel mirror fails CLOSED on a malformed address
+    token instead of installing a narrowed/widened rule; oracle keeps the token
+    verbatim so `nft -f -` rejects; #3433 H09 sub-case re-pinned.
+  - **File(s)**: pkg/nftables/netlink_lo0.go, pkg/daemon/daemon_nft.go,
+    pkg/nftables/netlink_lo0_addrs_6512_test.go,
+    pkg/daemon/lo0_addr_failclosed_6512_test.go, pkg/daemon/lo0_filter_test.go,
+    pkg/daemon/README.md, pkg/nftables/README.md
 ## 2026-08-21 — #6535 periodic converger for the Kea applier
 - **Timestamp**: 2026-08-21
 - **Action**: Track whether a Kea apply converged (`applyFailed` +
@@ -100309,6 +100332,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/README.md, docs/userspace-icmp-te-debugging.md, _Log.md
 
 - **Timestamp**: 2026-08-21
+  - **Action**: #6492 claim fix — correct the false "lifeline-excluded ⇒ can
+    never strand management" safety claims at 9 sites (6 Go comments, 2 docs,
+    1 README section). Lifeline exclusion is by INTERFACE, not by address value.
+    Comment/doc only; raw .text byte-identical.
+  - **File(s)**: pkg/daemon/daemon_nft.go,
+    pkg/daemon/host_inbound_conntrack_flush.go, pkg/daemon/README.md,
+    pkg/dataplane/userspace/zones_host_inbound.go,
+    docs/host-inbound-service-matrix.md
   - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
     lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
     so the #6476 cold-boot fence is no longer suppressed.
@@ -100469,6 +100500,16 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_proxyarp_test.go,
   pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md, _Log.md
 - **Timestamp**: 2026-08-21
+- **Action**: #6537 — record the `userspace_ingress_ifaces` delete inventory on
+  EVERY exit from `syncIngressIfaceMapLocked`, not only the all-succeeded path.
+  Both early returns now retain `prior ∪ installed-this-pass` via
+  `mergeIngressInventory`, so a row installed by a pass that later failed is
+  still reachable to a subsequent reap. Fail-on-revert coverage as a table plus
+  an end-to-end reap test; the rows localise (dropping the update-path debt
+  greens the delete-path row and vice versa). BPF-map fixtures SKIP unprivileged.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_ingress_partial_6537_test.go,
+  docs/afxdp-packet-processing.md, _Log.md
 - **Action**: #6538 — stop overloading `confirmPrevCfg == nil`. New
   `Store.confirmPrevFirst` records first-commit-ness where it is known (arm
   site: pre-promotion `s.compiled`; recovery site: the persisted
@@ -100514,3 +100555,30 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/nat/tests_source.rs,
   userspace-dp/src/nat/tests_newflow_lock.rs,
   docs/session-sync-architecture.md, _Log.md
+
+## 2026-08-21 — #7268 scope 1: retire compileNPTv6's eBPF nptv6_rules writes
+- **Timestamp**: 2026-08-21
+- **Action**: Deleted the `SetNPTv6Rule` / `DeleteStaleNPTv6` calls and the
+  now-callerless `nptv6Adjustment` (+ its RFC 6296 vector tests). `compileNPTv6`
+  is now a pure validator; every parse and the #6894 r9 / #7077 reject-vs-warn
+  disposition is unchanged. Rebound the two guards that observed the write: the
+  #4960 `nptv6` row now binds NAME->BODY through a config-shaped hard error, and
+  the #7077 write-count assertions are replaced by the #6420 tripwire with
+  NPTv6 armed. Scopes 2-4 (the `DataPlane` NAT interface surface, `maps_nat.go`
+  writers, shim overrides, orphaned map helpers) deliberately held out.
+- **File(s)**: pkg/dataplane/compiler_nat.go, pkg/dataplane/nptv6_test.go
+  (deleted), pkg/dataplane/compiler_nat_dead_writes_6420_test.go,
+  pkg/dataplane/compiler_nptv6_helper_grammar_7077_test.go,
+  pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/README.md
+
+## 2026-08-21 — #7257: heartbeat start/stop lifecycle tenure
+- **Timestamp**: 2026-08-21
+- **Action**: `StartHeartbeat` published the sender/receiver under `m.mu`, released
+  the lock, then dereferenced the fields it had just written while `StopHeartbeat`
+  nilled them under the lock. Publish + start now happen in one critical section
+  against locals, and a new `hbEpoch` tenure counter makes a start that a teardown
+  overtook return `ErrHeartbeatStartSuperseded` instead of installing a pair
+  nothing can stop. `startHeartbeatWithRetry` treats the sentinel as terminal.
+- **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/daemon/daemon_ha_sync.go,
+  pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md

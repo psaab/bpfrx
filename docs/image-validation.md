@@ -104,7 +104,7 @@ Scenarios:
 
 | Scenario | Proves |
 |---|---|
-| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path) |
+| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path); **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
 | **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 | **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
@@ -112,6 +112,48 @@ Scenarios:
 **Pass:** `Validation complete.` with all selected scenarios PASS. Any
 `FAIL:` line blocks the bake.
 
+### Secure Boot posture (#6497)
+
+The production appliance posture is UEFI Secure Boot **ON** — `test/incus/setup.sh`
+sets `security.secureboot: "true"` "to match the production posture (#1943)".
+The gate now proves it rather than inheriting it:
+
+- **incus scenarios launch with an explicit `-c security.secureboot=true`.** It
+  is the incus default today, but the gate must not inherit the property it
+  exists to assert: a default flip, a profile override, or a host without the MS
+  db would silently degrade every scenario to SB-off and still pass.
+- **Scenario A asserts the guest actually booted under SB.** Three independent
+  readings, so a *missing* reading is distinguished from the property being
+  false: byte 4 of the `SecureBoot` EFI variable (authoritative and package-free
+  — an efivarfs file is 4 attribute bytes then the value), `mokutil --sb-state`
+  when present, and `/sys/kernel/security/lockdown` as corroboration.
+  `mokutil` is **not** in `bake.py`'s `RUNTIME_PACKAGES`, so an assertion that
+  required it would turn a package-set change into a fake SB regression. An
+  active lockdown never *overrides* a definite "off" — lockdown can also be
+  forced from the cmdline. **No readable source at all is a FAIL**, not a pass:
+  a gate that cannot observe the property has not asserted it, which is exactly
+  how SB-off shipped green.
+- **The plain-QEMU leg prefers an SB-ENFORCING firmware pair** (a secboot
+  `OVMF_CODE` build *and* MS-keyed `OVMF_VARS`, so the Canonical-signed shim
+  verifies with no MOK enrollment). Both halves are required: a non-secboot CODE
+  build ignores SB even with MS keys present, and a secboot CODE build with
+  plain VARS has no db for the shim to verify against. When the host has no
+  enforcing pair the leg still runs SB-off for bootability coverage, but says so
+  in the log and in its PASS line. The old comment read "plain-QEMU bootability
+  is proven fine with SB off" — true, and being counted as something it is not.
+
+Why this is more than "the image is signed": the #1930 A/B substrate makes
+lockdown-sensitive design choices nothing automated exercised.
+`scripts/image/grub.d/09_xpf` documents that `regexp` may be unavailable under
+Secure-Boot lockdown and that the slot selector must therefore be a GRUB
+*script* so GRUB can parse it there. Before this, the only SB-on validation of
+that chain was a one-time manual probe on a hand-staged stock VM
+(`docs/pr/1930-inc1-kernel-channel/live-validation.md`), not the baked artifact.
+
+`_secureboot_verdict` and `_qemu_firmware_choice` are pure functions
+(`find` is injected into the latter so the preference order is asserted
+independently of the test host's OVMF packages), unit-tested in
+`scripts/image/test_validate_secureboot_6497.py` and run by `make selftest`.
 ### Why scenario A asserts the A/B kernel channel (#6494)
 
 The bake stages `/boot/efi/EFI/{xpf-A,xpf-B}` and enables the two #1930

@@ -647,6 +647,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// state out-of-band while a concurrent commit / HA-sync / reconcile
 		// re-creates the just-erased .configdb SSOT or re-renders the wiped secrets.
 		shell.SetFactoryResetFn(d.factoryReset)
+		// #6495: the #1930 kernel-channel state on the console. Before this,
+		// an operator mid-roll had to leave the CLI for a root shell running
+		// `xpfd upgrade kernel status`, or read journald — while the
+		// xpf-deploy roll orchestrator polled that same verb over node_exec.
+		// Automation had a path; the human did not.
+		shell.SetKernelUpgradeStatusFn(d.kernelUpgradeStatus)
 		// #6496: the day-0 config-import verdict for `show system
 		// bootstrap-import` on the console. Same recorded snapshot /health and
 		// the gRPC ShowText renderer read, so an operator standing at a fresh

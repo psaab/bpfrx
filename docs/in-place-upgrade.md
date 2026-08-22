@@ -885,6 +885,92 @@ candidate boot, `xpf-kernel-promote.service` runs the kernel-space
 `/var/lib/xpf/kernel-upgrade.state` makes the trial crash-safe and
 idempotent across the reboot.
 
+### Operator visibility (#6495)
+
+During a roll the channel is legible from the CLI the operator already has,
+not only from a root shell:
+
+```
+> show system kernel-upgrade
+Kernel upgrade channel (LANE 1, A/B slots):
+  Running kernel:  6.18.4-11-generic
+  Armed:           yes — a candidate trial is IN FLIGHT
+    Candidate:     6.19.0-1-generic
+    Known-good:    6.18.4-11-generic
+    Active slot:   xpf-A
+    Candidate slot: xpf-B
+    State:         ARMED
+    BootNext:      Boot0004 (one-shot, cleared by the firmware on boot)
+  Promotion marker: none
+  Last roll:       none recorded
+
+  Cluster: this node is HELD SECONDARY — kernel-candidate promotion gate ...
+```
+
+Three things it answers that previously needed a root shell or journald:
+
+- **Is a candidate armed?** `ARMING` is reported as *not* armed and says why:
+  it is prepared intent whose firmware one-shot was never read back (#5847), so
+  the next boot is the **known-good** kernel. An operator told "armed" there
+  would expect a trial that will not happen.
+- **Is this node held secondary by the upgrade gate, and by *which* gate?**
+  `show chassis cluster status` and `show chassis cluster information` now
+  annotate the hold, so a node parked SECONDARY by the *expected gate* is no
+  longer indistinguishable from one demoted by a monitor failure or a manual
+  failover.
+
+  There are **two** hold reasons, because the daemon sets the one
+  `kernelUpgradeHold` flag for two materially different conditions whose
+  remedies differ:
+
+  | Reason | Condition | Operator action |
+  |---|---|---|
+  | `KernelUpgradeHoldCandidate` | a candidate is genuinely ARMED | wait — the durable promotion marker releases it |
+  | `KernelUpgradeHoldUnreadableJournal` | the #5682 fail-closed hold: `IsArmed` returned an **error**, so whether anything is armed is UNKNOWN | repair `/var/lib/xpf` — no marker may ever be written |
+
+  Rendering one string for both would be a **false statement** in the
+  fail-closed case: "held until the promotion marker confirms the running
+  kernel" asserts a candidate exists and that a marker will resolve it, and the
+  daemon reached that branch precisely because it could not establish either.
+  That is the same class of defect as the invisibility this section is about,
+  one layer in. `Manager.KernelUpgradeHoldReason()` returns the active reason;
+  `KernelUpgradeHeld()` remains the yes/no predicate the election uses, and is
+  deliberately **not** what the status surfaces render.
+
+  The reason also follows the **#5682 self-heal transition**: when a fail-closed
+  hold's journal becomes readable and a candidate *is* armed,
+  `reconcileKernelUpgradeHold` converts it in place to a candidate hold and
+  re-sets the reason, so the status stops telling the operator to repair a
+  filesystem that is now healthy.
+
+  The annotation is node-scoped and sits **above** every `Redundancy group:`
+  header so the rolling-deploy node parser (`deploy_rolling_secondary_node`,
+  `test/incus/deploy-lib.sh`) cannot read it as a table row.
+- **Did the last candidate promote or revert, and why?** `revert()` clears the
+  journal by design (the next boot must be a clean ordinary boot) and the
+  promotion marker is written only on PROMOTE, so a rejected candidate used to
+  leave `promoted=none` / `armed=none`: correct, and indistinguishable from a
+  box that never tried, with the reason surviving only in journald. A durable
+  last-roll record at `/var/lib/xpf/kernel-last-roll` (version, known-good,
+  outcome, reason, timestamp) now survives the clear.
+
+The last-roll record is deliberately **not** cleared at arm time, unlike the
+promotion marker. The marker is cleared on `Arm` because a stale "promoted"
+from a prior same-version roll would false-satisfy the HA orchestrator's
+post-reboot version check. This record answers no such check — it is history,
+overwritten by the next roll's outcome, and clearing it on arm would destroy
+the previous answer exactly when an operator re-arming after a failure wants
+it. Both writes are best-effort: a failed history write never changes what the
+channel does, and a revert that could not record itself is still a revert. It
+is written at the TOP of `revert()`, before that function's two early exits (a
+journal that cannot be persisted, and the attempt-cap give-up), because those
+are the states an operator most needs explained.
+
+`show system kernel-upgrade`, the console CLI, and the remote `cli` all render
+through `upgrade.RenderChannelStatus`, and the read path
+(`upgrade.ReadChannelStatus`) mutates nothing, so it is safe at operator
+polling frequency against the same durable state the promotion gate depends on.
+
 **The gate execs xpfd by EXPLICIT path, never `$PATH` (#6541).** The
 promotion gate runs as root on the candidate boot and its exit status
 decides promote-vs-rollback, so a `$PATH` entry ordered ahead of the real
