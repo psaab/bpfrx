@@ -99477,3 +99477,26 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/afxdp/forwarding_build/{cos,tunnels,tests}.rs,
   userspace-dp/src/policy_snapshot_error.rs, docs/config-schema.md,
   docs/wireguard-interop.md, docs/userspace-dataplane-architecture.md, _Log.md
+
+## 2026-08-21 — #6345: WG transit-egress dispatch follows the selected peer on both branches
+
+- **Timestamp**: 2026-08-21
+- **Action**: `resolve_forward_target_ifindex` early-returned
+  `decision.resolution.tx_ifindex` whenever it was > 0, so #6308's peer-route
+  SSOT applied only to the `tx_ifindex == 0` branch. For a WG transit-egress
+  flow whose transport table carries a DEFAULT route, tx_ifindex is the
+  default-route parent while `wg_encap_frame` builds the outer L2/VLAN/src
+  against the SELECTED PEER's more-specific route (#6306) — identical with one
+  underlay, divergent with several, where the frame left one NIC carrying
+  another segment's source MAC and VLAN. Fix: consult
+  `wg_transit_egress_physical_egress_ifindex` FIRST on both branches and fall
+  back to tx_ifindex only when it does not resolve, so dispatch and bytes agree
+  by construction; a peer NIC with no XSK binding now drops rather than emitting
+  a mismatched frame on the wrong underlay. The non-tunnel fast path is still
+  one integer compare (`tunnel_endpoint_id == 0` -> None). Two cells: a
+  multi-underlay flow must dispatch to the peer's parent and not to tx_ifindex,
+  plus an anti-over-reject cell pinning the non-tunnel fast path. Mutation-proven
+  against the verbatim pre-fix ordering. Rust diff moves the helper binary, so a
+  cluster smoke is OWED.
+- **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
