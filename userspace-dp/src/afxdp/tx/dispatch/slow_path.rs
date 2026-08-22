@@ -67,9 +67,13 @@ pub(in crate::afxdp) fn handle_forward_build_failure(
     // SHARED `fabric_redirect_unsendable_drops` counter (distinct
     // exception reason for path observability). This also keeps the
     // documented invariant true: after #1946 the only intentional
-    // unfiltered caller of the raw primitive is the ForwardCandidate
-    // build-failure reinject below (ForwardCandidate IS a route the
-    // kernel may legitimately serve).
+    // unfiltered caller of the raw primitive ON A RESOLVED DISPOSITION is
+    // the ForwardCandidate build-failure reinject below (ForwardCandidate
+    // IS a route the kernel may legitimately serve). #6664 corrects the
+    // scope of that sentence: `poll_stages.rs` also calls the raw
+    // primitive unfiltered, but with a SYNTHETIC `LocalDelivery` decision
+    // for host-terminated IPsec passthrough, so it never carries a
+    // resolved disposition past the predicate.
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
         live.fabric_redirect_unsendable_drops
             .fetch_add(1, Ordering::Relaxed);
@@ -100,6 +104,39 @@ pub(in crate::afxdp) fn handle_forward_build_failure(
     }
 }
 
+/// #1913/#6664: the ONE place that asks whether a disposition may be handed to
+/// the kernel slow path, and the one place a refusal is accounted.
+///
+/// Returns true to admit. On a refusal it records the per-disposition
+/// fail-closed drop, which is why this is a function rather than two calls to
+/// `is_slow_path_eligible`: the predicate and the accounting must never
+/// disagree about a frame. Both refusal points -- this module's filtered
+/// wrapper and the trailing chokepoint in `poll_descriptor` -- route through
+/// here, so there is a single site to bind and a single site to get wrong.
+///
+/// Before #6664 the accounting lived at each caller. That is a divergence that
+/// could only ever be a bug, never a policy difference, and it showed up as one
+/// immediately: a mutation deleting the `poll_descriptor` copy passed the whole
+/// suite, because no test drives that function. Collapsing the two sites into
+/// one is what makes the behaviour testable at all.
+pub(in crate::afxdp) fn slow_path_admit(
+    live: &BindingLiveState,
+    disposition: ForwardingDisposition,
+) -> bool {
+    if disposition.is_slow_path_eligible() {
+        return true;
+    }
+    // #6664: NextTableUnsupported left the allow-list, so its refusal is
+    // counted here. Without this the signal would vanish with the accept-path
+    // counter it used to bump (`slow_path_next_table_packets`), which is
+    // exported to Prometheus and would have frozen at zero -- to an operator,
+    // indistinguishable from "no such packets ever arrived".
+    if disposition == ForwardingDisposition::NextTableUnsupported {
+        live.record_next_table_unsupported_drop();
+    }
+    false
+}
+
 #[cold]
 #[inline(never)]
 pub(in crate::afxdp) fn maybe_reinject_slow_path(
@@ -119,7 +156,7 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
     // disposition the predicate rejects (PolicyDenied / HAInactive /
     // DiscardRoute / ForwardCandidate / FabricRedirect) must be dropped,
     // never reinjected to the kernel FIB.
-    if !decision.resolution.disposition.is_slow_path_eligible() {
+    if !slow_path_admit(live, decision.resolution.disposition) {
         return;
     }
     let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {

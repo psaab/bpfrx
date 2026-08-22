@@ -148,6 +148,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.slow_path_missing_neighbor_packets = snap.slow_path_missing_neighbor_packets;
     binding.slow_path_no_route_packets = snap.slow_path_no_route_packets;
     binding.slow_path_next_table_packets = snap.slow_path_next_table_packets;
+    binding.next_table_unsupported_drops = snap.next_table_unsupported_drops;
     binding.slow_path_forward_build_packets = snap.slow_path_forward_build_packets;
     binding.slow_path_drops = snap.slow_path_drops;
     binding.slow_path_rate_limited = snap.slow_path_rate_limited;
@@ -370,6 +371,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.slow_path_missing_neighbor_packets = 0;
     binding.slow_path_no_route_packets = 0;
     binding.slow_path_next_table_packets = 0;
+    binding.next_table_unsupported_drops = 0;
     binding.slow_path_forward_build_packets = 0;
     binding.slow_path_drops = 0;
     binding.slow_path_rate_limited = 0;

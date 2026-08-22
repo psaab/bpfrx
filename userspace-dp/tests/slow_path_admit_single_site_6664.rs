@@ -1,0 +1,183 @@
+//! #6664: `is_slow_path_eligible` must be reachable from production code
+//! through exactly ONE door — `slow_path_admit` — and both kernel-reinject
+//! refusal points must walk through it.
+//!
+//! WHY A SOURCE GUARD RATHER THAN A BEHAVIOURAL TEST. The second refusal point
+//! is the trailing chokepoint in `poll_binding_process_descriptor`, and no test
+//! in this crate drives that function. That is not an oversight this issue
+//! could fix: it takes a live binding, a UMEM, a descriptor ring and a worker
+//! context. So the accounting there is unobservable to the suite, and before
+//! #6664 that was demonstrated rather than assumed — a mutation deleting the
+//! `poll_descriptor` copy of the fail-closed accounting passed the entire
+//! cargo suite.
+//!
+//! #6664's answer was to collapse the predicate and the accounting into one
+//! function so there is a single site to get wrong. This test is what makes
+//! that answer load-bearing instead of a convention: reverting either refusal
+//! point to a bare `is_slow_path_eligible()` call reds here, at the wiring,
+//! which is the property a behavioural test cannot reach.
+//!
+//! FAIL-ON-REVERT, in both directions:
+//!   * a second production call to `is_slow_path_eligible` (e.g. restoring the
+//!     `poll_descriptor` chokepoint to call the predicate directly, which
+//!     would refuse the frame but never count the drop) -> RED;
+//!   * a refusal point that stops calling `slow_path_admit` -> RED;
+//!   * the one permitted call moving out of `slow_path_admit`'s body -> RED.
+//!
+//! SCOPE, stated so a reader does not over-read it. Comment lines are stripped
+//! before matching, so no prose here or anywhere else can satisfy this test.
+//! Whole files whose NAME contains "test" are excluded; a `#[cfg(test)]` module
+//! inlined into a production-named file is NOT excluded and would trip the
+//! guard. That is over-strict in the safe direction — it can only deny a new
+//! call site, never admit one — and no such module exists today.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn repo_src() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// True for a file that holds tests rather than production code.
+fn is_test_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("test"))
+}
+
+/// The file's lines with comment-only lines blanked, so a match can never come
+/// from prose. Trailing `// ...` on a code line is left alone: a call written
+/// there is still a call.
+fn code_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("//") { String::new() } else { l.to_string() }
+        })
+        .collect()
+}
+
+struct Site {
+    file: PathBuf,
+    line: usize,
+}
+
+fn production_call_sites(needle: &str) -> Vec<Site> {
+    let mut files = Vec::new();
+    rust_sources(&repo_src(), &mut files);
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "scanned only {} Rust sources under {}; this guard is not reading the \
+         crate it claims to audit",
+        files.len(),
+        repo_src().display()
+    );
+    let mut sites = Vec::new();
+    for path in files {
+        if is_test_file(&path) {
+            continue;
+        }
+        for (i, line) in code_lines(&path).iter().enumerate() {
+            // `fn <needle>(` is the definition, not a call.
+            if line.contains(needle) && !line.contains(&format!("fn {}", needle.trim_end_matches('('))) {
+                sites.push(Site { file: path.clone(), line: i + 1 });
+            }
+        }
+    }
+    sites
+}
+
+fn rel(p: &Path) -> String {
+    p.strip_prefix(repo_src())
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+#[test]
+fn is_slow_path_eligible_has_exactly_one_production_caller_6664() {
+    let sites = production_call_sites("is_slow_path_eligible(");
+    let listed: Vec<String> = sites.iter().map(|s| format!("{}:{}", rel(&s.file), s.line)).collect();
+
+    assert_eq!(
+        sites.len(),
+        1,
+        "`is_slow_path_eligible` must be consulted from exactly ONE production \
+         site — inside `slow_path_admit`, which also records the fail-closed \
+         drop. Found {}: {:?}.\n\
+         A second caller is how the predicate and the accounting come apart: \
+         the frame is still refused, so no forwarding test changes, but the \
+         refusal is never counted and the operator sees a metric frozen at zero \
+         — indistinguishable from \"no such packets ever arrived\".",
+        sites.len(),
+        listed
+    );
+
+    let site = &sites[0];
+    assert_eq!(
+        rel(&site.file),
+        "afxdp/tx/dispatch/slow_path.rs",
+        "the single caller moved to {}; #6664's invariant is that it lives in \
+         `slow_path_admit`",
+        rel(&site.file)
+    );
+
+    // ...and inside slow_path_admit's body, not merely in the same file.
+    let lines = code_lines(&site.file);
+    let start = lines
+        .iter()
+        .position(|l| l.contains("fn slow_path_admit("))
+        .expect("slow_path_admit is gone from slow_path.rs");
+    let end = lines[start..]
+        .iter()
+        .position(|l| l == "}")
+        .map(|off| start + off)
+        .expect("slow_path_admit has no closing brace at column 0");
+    assert!(
+        site.line > start && site.line <= end + 1,
+        "the only `is_slow_path_eligible` call is at line {} but \
+         `slow_path_admit`'s body spans {}..={}; the predicate is being \
+         consulted outside the one function that also accounts for a refusal",
+        site.line,
+        start + 1,
+        end + 1
+    );
+}
+
+#[test]
+fn both_reinject_refusal_points_call_slow_path_admit_6664() {
+    let sites = production_call_sites("slow_path_admit(");
+    let mut files: Vec<String> = sites.iter().map(|s| rel(&s.file)).collect();
+    files.sort();
+    files.dedup();
+
+    assert_eq!(
+        files,
+        vec![
+            "afxdp/poll_descriptor/mod.rs".to_string(),
+            "afxdp/tx/dispatch/slow_path.rs".to_string(),
+        ],
+        "both kernel-reinject refusal points must route through \
+         `slow_path_admit`: the filtered `maybe_reinject_slow_path` wrapper in \
+         tx/dispatch/slow_path.rs and the trailing chokepoint in \
+         poll_binding_process_descriptor. Found {files:?}.\n\
+         The chokepoint is not covered by any behavioural test in this crate \
+         (it needs a live binding, UMEM and descriptor ring), so this is the \
+         only place a regression there is visible."
+    );
+}

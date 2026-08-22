@@ -75,12 +75,25 @@ func (c *xpfCollector) initBindingDescriptors() {
 	)
 	c.bindingSlowPathNextTablePackets = prometheus.NewDesc(
 		"xpf_userspace_binding_slow_path_next_table_packets_total",
-		"Transit frames reinjected to the kernel because they hit an "+
-			"inter-VRF next-table chain the helper does not implement — "+
-			"including an acyclic chain deeper than the eight-table limit "+
-			"(#7409/#6664). Kernel-routable, policy-unevaluated. Unlike "+
-			"no_route an attacker cannot create this condition; it needs an "+
-			"operator config defect.",
+		"RETIRED by #6664 and frozen at its last value: NextTableUnsupported "+
+			"is no longer reinjected to the kernel, so this counter no longer "+
+			"advances. It is still exported so an existing dashboard or alert "+
+			"does not break on a missing series. Use "+
+			"xpf_userspace_binding_next_table_unsupported_drops_total instead — "+
+			"the same packets, now counted where they are dropped.",
+		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+	)
+	c.bindingNextTableUnsupportedDrops = prometheus.NewDesc(
+		"xpf_userspace_binding_next_table_unsupported_drops_total",
+		"Transit frames DROPPED fail-closed because they hit an inter-VRF "+
+			"next-table chain the helper cannot resolve — deeper than the "+
+			"eight-table limit, or a cycle (#6664). Before #6664 these were "+
+			"reinjected to the kernel, which forwarded them with no zone "+
+			"policy, session, NAT or screen. Unlike no_route the condition is "+
+			"not transient — no FIB refresh resolves it — so delegating was a "+
+			"standing policy bypass rather than a window. A non-zero value "+
+			"means an operator config defect: an over-deep or cyclic "+
+			"next-table chain. An attacker cannot create this condition.",
 		[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
 	)
 	c.bindingSlowPathLocalDeliveryPackets = prometheus.NewDesc(

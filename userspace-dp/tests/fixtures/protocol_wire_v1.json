@@ -126,6 +126,7 @@
     "nat_frag_untranslated_dropped": 0,
     "neighbor_miss_packets": 0,
     "next_table_packets": 0,
+    "next_table_unsupported_drops": 0,
     "outstanding_tx": 0,
     "pending_tx_local_overflow_drops": 0,
     "policy_denied_packets": 0,

@@ -1555,6 +1555,8 @@ pub(crate) struct BindingLiveSnapshot {
     /// #1946 FabricRedirect-unsendable fail-closed drop counter (see
     /// umem/mod.rs).
     pub(crate) fabric_redirect_unsendable_drops: u64,
+    /// #6664 NextTableUnsupported fail-closed drop counter.
+    pub(crate) next_table_unsupported_drops: u64,
     pub(crate) kernel_rx_dropped: u64,
     pub(crate) kernel_rx_invalid_descs: u64,
     pub(crate) tx_packets: u64,
