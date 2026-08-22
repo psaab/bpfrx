@@ -197,20 +197,6 @@ const (
 	// rather than preserved forever.
 	bootEpochPreserveMaxSkew uint64 = 30 * 24 * 60 * 60 * 1_000_000_000
 
-	// bootEpochPersistRetryInterval is how often the #6724 trigger re-attempts
-	// a persist that a previous refine pass could not complete.
-	//
-	// 30s is chosen against what the retry is racing, not against the fault:
-	// a peer that latched a raise this node emitted but could not persist
-	// refuses a concurrent incarnation until the value reaches the file. The
-	// pre-#6724 bound on that was "until the next heartbeat (re)start", which
-	// is event-driven and unbounded — a daemon can run for days without one.
-	// Anything in the tens of seconds converts an unbounded wait into a bounded
-	// one; shorter buys nothing, because the faults that make a persist fail
-	// (a full or read-only filesystem, a wedged store) do not clear in
-	// milliseconds, and each attempt takes the epoch file lock.
-	bootEpochPersistRetryInterval = 30 * time.Second
-
 	// epochClockSaneFloor is 2020-01-01T00:00:00Z in nanoseconds: the point
 	// below which the LOCAL clock is obviously unset rather than merely wrong.
 	//
@@ -242,6 +228,26 @@ var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
 // Stop runs immediately after VRRP priority-0 and before the session-sync stop
 // (its own 5s), inside the unit's TimeoutStopSec=20.
 const bootEpochStopJoinBudget = 2 * time.Second
+
+// bootEpochPersistRetryInterval is how often the #6724 trigger re-attempts a
+// persist that a previous refine pass could not complete.
+//
+// 30s is chosen against what the retry is racing, not against the fault: a peer
+// that latched a raise this node emitted but could not persist refuses a
+// concurrent incarnation until the value reaches the file. The pre-#6724 bound
+// on that was "until the next heartbeat (re)start", which is event-driven and
+// unbounded — a daemon can run for days without one. Anything in the tens of
+// seconds converts an unbounded wait into a bounded one; shorter buys nothing,
+// because the faults that make a persist fail (a full or read-only filesystem,
+// a wedged store) do not clear in milliseconds, and each attempt takes the
+// epoch file lock.
+//
+// A var, not a const, for the same reason bootEpochPath and epochFlock are:
+// the WIRING test drives a real heartbeatSender loop, and at the production
+// interval the retry cadence is 150 ticks — thirty seconds of wall clock the
+// test would have to spend to observe one retry. Never reassigned in
+// production.
+var bootEpochPersistRetryInterval = 30 * time.Second
 
 // epochFlock is the lock withEpochFileLock takes. A var for the same reason
 // epochNowNanos is one: the SECOND of its two failure branches is otherwise

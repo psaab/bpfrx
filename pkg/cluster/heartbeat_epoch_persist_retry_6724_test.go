@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -148,19 +149,24 @@ func TestPersistOwedIsSetOnlyByFAULTS_6724(t *testing.T) {
 	}
 }
 
-// TestRetryIsANoOpWhenNothingIsOwed_6724 binds the GATE, which is the part that
-// keeps this trigger from making the two-incarnation case worse.
+// TestRetryIsANoOpWhenNothingIsOwed_6724 binds the GATE, which is the part
+// that keeps this trigger from making the two-incarnation case worse.
 //
-// An unconditional periodic refine would make the leapfrog described in
-// withEpochFileLock continuous: while two incarnations overlap, each pass
-// raises above the other and rewrites the file, so both nodes would be refused
-// by the peer for part of every period instead of one being refused until its
-// next heartbeat restart. Alternating refusal is worse for HA than a stable
-// one. The gate makes the trigger a no-op for two healthy incarnations, because
-// neither ever owes a persist.
+// THE FIXTURE NEEDS A SECOND WRITER, and an earlier revision of this test did
+// not have one. With a lone manager, refinement is IDEMPOTENT — the
+// `prev == lastWrote` shortcut returns without writing — so deleting the gate
+// changed nothing observable and the test passed against the mutation it was
+// written for. Measured: mutation cell X1 (drop the
+// `if !m.bootEpochPersistOwed.Load() { return }` guard) was GREEN.
 //
-// FAIL-ON-REVERT: delete the `if !m.bootEpochPersistOwed.Load() { return }`
-// guard and the file moves under a manager that owes nothing.
+// The gate only earns its keep when the file has MOVED under us, which is what
+// a concurrent incarnation does. That is the smallest shape in which removing
+// the guard changes an outcome: an ungated retry reads the higher value, raises
+// ITSELF above it and rewrites the file — the leapfrog withEpochFileLock
+// describes, which on a timer would run every period and leave both nodes
+// refused by the peer for part of each one.
+//
+// FAIL-ON-REVERT: delete the guard and both assertions below move.
 func TestRetryIsANoOpWhenNothingIsOwed_6724(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 	m := keyedEpochManager(t, path)
@@ -169,27 +175,111 @@ func TestRetryIsANoOpWhenNothingIsOwed_6724(t *testing.T) {
 	awaitFirstRefine(t, m, "first refine")
 	waitBootEpochIdle(t, m)
 
-	settled := readPersistedEpoch(t, path)
+	settled := m.bootEpoch.Load()
 	if settled == 0 {
-		t.Fatal("nothing persisted after the first refine")
+		t.Fatal("nothing published after the first refine")
 	}
 	if m.bootEpochPersistOwed.Load() {
 		t.Fatal("a clean first refine reported an owed persist")
 	}
 
-	// Every retry the sender loop would make in a minute of ticks.
+	// A CONCURRENT INCARNATION raises the file above us — the exact input the
+	// gate exists to make us ignore. Kept inside bootEpochMaxSkew so the value
+	// is chainable: if it were out of range the refine would decline for a
+	// different reason and the mutation would be invisible again.
+	sibling := settled + 1000
+	if err := os.WriteFile(path, []byte(strconv.FormatUint(sibling, 10)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every retry the sender loop would make over many periods.
 	for i := 0; i < 8; i++ {
 		m.retryOwedBootEpochPersist()
 	}
 	waitBootEpochIdle(t, m)
 
-	if got := readPersistedEpoch(t, path); got != settled {
-		t.Fatalf("the epoch file moved from %d to %d while nothing was owed — the "+
-			"retry gate is not holding, so two overlapping incarnations would "+
-			"leapfrog on every period (#6724)", settled, got)
+	if got := readPersistedEpoch(t, path); got != sibling {
+		t.Fatalf("the epoch file moved from %d to %d while nothing was owed — an ungated "+
+			"retry chased a concurrent incarnation's value, which is the leapfrog "+
+			"the gate exists to prevent (#6724)", sibling, got)
 	}
 	if got := m.bootEpoch.Load(); got != settled {
-		t.Fatalf("the published epoch moved from %d to %d while nothing was owed", settled, got)
+		t.Fatalf("the published epoch rose from %d to %d while nothing was owed — this "+
+			"node raised itself above a live sibling on a timer", settled, got)
+	}
+}
+
+// TestSenderLoopDrivesTheRetry_6724 binds the WIRING: the trigger is only
+// reached because heartbeatSender.run calls it.
+//
+// An earlier revision of this file tested retryOwedBootEpochPersist directly
+// and nothing else, so deleting the call from the send loop left every test
+// green — measured as mutation cell X2. A retry nothing invokes is not a retry.
+// This drives the REAL loop (`sender.start()` spawns the production `run()`)
+// against a real socket, with the retry interval shortened so one tick is one
+// retry.
+//
+// FAIL-ON-REVERT: remove `s.mgr.retryOwedBootEpochPersist()` from
+// heartbeatSender.run and the persist never lands.
+func TestSenderLoopDrivesTheRetry_6724(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "state")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sub, "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+
+	// One tick, one retry — otherwise the production cadence is 150 ticks and
+	// this test would have to spend 30s of wall clock to see one.
+	origInterval := bootEpochPersistRetryInterval
+	bootEpochPersistRetryInterval = time.Nanosecond
+	t.Cleanup(func() { bootEpochPersistRetryInterval = origInterval })
+
+	// Fail the first persist.
+	if err := os.Chmod(sub, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	m.initHeartbeatEpochState()
+	awaitFirstRefine(t, m, "the failing refine")
+	waitBootEpochIdle(t, m)
+	if !m.bootEpochPersistOwed.Load() {
+		t.Fatal("the failing persist did not arm the trigger; this test would pass vacuously")
+	}
+	published := m.bootEpoch.Load()
+
+	// The fault clears, and from here ONLY the send loop can drive the retry.
+	if err := os.Chmod(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("sender socket: %v", err)
+	}
+	defer conn.Close()
+	peer := conn.LocalAddr().(*net.UDPAddr)
+
+	sender := newHeartbeatSender(m, conn, peer, time.Millisecond)
+	sender.start()
+	t.Cleanup(sender.stop)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !m.bootEpochPersistOwed.Load() {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	waitBootEpochIdle(t, m)
+
+	if m.bootEpochPersistOwed.Load() {
+		t.Fatal("the send loop never drove a retry: the trigger is still armed after 5s of " +
+			"ticks, so nothing in production reaches retryOwedBootEpochPersist (#6724)")
+	}
+	got := readPersistedEpoch(t, path)
+	if got != published {
+		t.Fatalf("the send-loop retry persisted %d, want the already-emitted %d", got, published)
 	}
 }
 
