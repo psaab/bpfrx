@@ -139,6 +139,12 @@ type ddnsPolicy struct {
 	hostnameSource string
 	conflictPolicy string
 	backend        string
+	// authority is the credential-free fingerprint of this policy's DNS
+	// endpoint (#6755), comparable with a Surface A record's stored
+	// BackendFingerprint. Computed once here because ddnsPolicy is the resolved
+	// runtime shape the reconciler carries; the raw config is not available at
+	// claim-rebuild time.
+	authority string
 }
 
 // ScopeGate decides whether THIS node may publish records for a given scope
@@ -200,6 +206,7 @@ func policyFromConfig(c *config.DHCPDynamicDNSConfig) ddnsPolicy {
 		hostnameSource: c.HostnameSource,
 		conflictPolicy: c.ConflictPolicy,
 		backend:        c.Backend,
+		authority:      leaseAuthorityFingerprint(c),
 	}
 	if p.ttl <= 0 {
 		p.ttl = defaultDDNSTTL
@@ -1098,9 +1105,9 @@ func (m *Manager) wireRRSharedWithOther(owned ownedRecord) bool {
 	// AddrText, already normalized into the Rdata field of each WireRRClaim; build
 	// the same canonical claim for this lease record and compare by value.
 	if m.surfaceACoowners != nil {
-		ownedClaim := wireRRClaim(owned.FQDN, owned.ForwardType, owned.Address)
+		ownedClaim := wireRRClaim(owned.FQDN, owned.ForwardType, owned.Address, m.currentAuthorityLocked())
 		for _, c := range m.surfaceACoowners() {
-			if c == ownedClaim {
+			if c.coOwns(ownedClaim) {
 				return true
 			}
 		}
@@ -1136,13 +1143,31 @@ func (m *Manager) WireRRClaims() []WireRRClaim {
 // lock-free read (#5748). Caller holds m.mu. A lease record's rdata IS its
 // Address; rdata-less rows are skipped (they can never co-own a wire RR). The
 // snapshot is an immutable slice — replaced wholesale, never mutated in place.
+// currentAuthorityLocked is this surface's DNS authority fingerprint (#6755),
+// taken from the last resolved policy. Empty when no policy has resolved yet,
+// which coOwns treats as unknown rather than as a different authority.
+//
+// The lease surface stamps its CURRENT authority rather than a per-record
+// publish-time one, because ownedRecord carries no fingerprint field and adding
+// one would be a durable-store change this fix does not otherwise need. The
+// asymmetry with Surface A (which does store publish-time) is bounded: a policy
+// whose endpoint changes republishes its records through the new endpoint, and
+// until it does, an authority mismatch only ever makes coOwns MORE conservative
+// about suppressing a delete on the Surface A side.
+func (m *Manager) currentAuthorityLocked() string {
+	if p := m.lastPolicy.Load(); p != nil {
+		return p.authority
+	}
+	return ""
+}
+
 func (m *Manager) rebuildWireRRClaimsLocked() {
 	claims := make([]WireRRClaim, 0, len(m.state.records))
 	for _, r := range m.state.records {
 		if r.Address == "" {
 			continue
 		}
-		claims = append(claims, wireRRClaim(r.FQDN, r.ForwardType, r.Address))
+		claims = append(claims, wireRRClaim(r.FQDN, r.ForwardType, r.Address, m.currentAuthorityLocked()))
 	}
 	m.wireRRClaims.Store(&claims)
 }
