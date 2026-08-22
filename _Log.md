@@ -104091,3 +104091,12 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/ddns/state.go, pkg/ddns/surface_a.go, pkg/ddns/manager.go,
   pkg/ddns/cross_surface_authority_6755_test.go,
   pkg/ddns/cross_surface_clobber_5748_test.go
+
+## 2026-08-22 — #6756 RFC 3442 option presence vs parse success
+- **Timestamp**: 2026-08-22
+- **Action**: classlessStaticRoutes derived `present` from len(parsedRoutes)!=0,
+  collapsing absent / present-but-zero-length / present-but-malformed into one
+  false, so a broken option 121/249 fell through to the option-3 Router the RFC
+  forbids. Presence now comes from the option SLOT; option 249's discarded
+  parse error is logged.
+- **File(s)**: pkg/dhcp/dhcpv4.go, pkg/dhcp/classless_presence_6756_test.go
