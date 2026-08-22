@@ -295,6 +295,7 @@
     "mirror_configs": [],
     "nat64_rules": [],
     "neighbors": [],
+    "node_id": 0,
     "nptv6_rules": [],
     "policers": [],
     "policies": [],

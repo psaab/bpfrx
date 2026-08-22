@@ -173,6 +173,7 @@ pub(crate) fn worker_loop(
     // bundle fields in worker/launch.rs.
     let WorkerLaunchPlan {
         worker_id,
+        node_id,
         binding_plans,
         poll_mode,
         dnat_fds,
@@ -252,6 +253,7 @@ pub(crate) fn worker_loop(
         recovered_fallbacks,
     } = setup::worker_loop_setup(
         worker_id,
+        node_id,
         binding_plans,
         &shared_runtime,
         &shared_cos_owner_worker_by_queue,

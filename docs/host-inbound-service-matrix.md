@@ -842,7 +842,8 @@ The fix mirrors the host-inbound cold-boot fence for the lo0 table:
 - **The gate keys on `d.lo0Enforced` — "is the live `xpf_lo0` table a REAL
   operator filter" — NOT "does any protecting table exist" (#6489).** A failed
   `InstallLo0` installs (or re-installs) a fence UNLESS a real filter is currently
-  loaded. It is true ONLY after a successful real `InstallLo0`; a FENCE deliberately
+  loaded. It is true ONLY after a successful real `InstallLo0` **that rendered at
+  least one kernel rule** (#6529, below); a FENCE deliberately
   does **not** set it (a fence is not a real filter — its chain is `policy accept`
   and drops only the addresses in the snapshot it was rendered from — so it stays
   false across a fence). A successful no-filter TEARDOWN stores false (the table is
@@ -865,6 +866,30 @@ The fix mirrors the host-inbound cold-boot fence for the lo0 table:
   one that appears later). So lo0 needs neither a per-address coverage set nor an
   additive gap table; the whole-table re-render (fence path) and retain-the-real-
   filter (real-filter path) together close the gap.
+- **A VACATED filter does not claim enforcement (#6529).** `Installer.InstallLo0`
+  reports the RENDERED rule count (from `nlPlan.rules`, the actual build) alongside
+  its error, and a successful install that rendered **zero** rules Stores
+  `lo0Enforced` **false**. Such an install leaves an empty `policy accept` shell
+  that enforces nothing, and one boolean cannot tell "a real filter governing every
+  local address" from "a real filter that compiled to nothing" — so the pre-#6529
+  unconditional `Store(true)` on any successful install permanently suppressed this
+  fence and left the host input path open. Zero rules is reachable through three
+  doors, none of them distinguishable by counting TERMS: a filter NAME that resolves
+  to no filter (`toNftLo0Spec`'s map lookup silently yields no terms), a filter with
+  no terms, and a filter whose every term lowers to zero rules (a Junos
+  match-nothing scope, e.g. an unresolved `from source-prefix-list`). All three
+  arrive through `opts.lenientFirewallRefs` on `Store.Load` at boot or
+  `Store.SyncApply` on HA peer-sync, which downgrades the dangling-firewall-ref
+  reject to a warning. It Stores **false** rather than merely skipping the Store,
+  because a peer-synced vacated generation atomically REPLACES a live real filter
+  (#5790 teardown parity). It does NOT install a fence: fencing on a SUCCESSFUL
+  install would deny host-bound traffic on a clean commit; the gate being false is
+  what matters, and the next failed install fences from the current snapshot.
+  Fail-on-revert: `pkg/daemon/lo0_vacated_enforced_6529_test.go` (four cases plus
+  the anti-over-fix `TestRealLo0FilterStillEnforces6529`, which pins that a real
+  filter still skips the day-2 fence) and
+  `pkg/nftables/netlink_lo0_zero_render_6529_test.go` (a spec WITH terms really can
+  render zero rules — the case a term-count gate misses).
 - A zero-drop fence (an addressless boot snapshot) is likewise not a real filter,
   so it leaves `lo0Enforced` false and a later failed real invocation
   re-fences from a possibly-now-addressed snapshot; a catastrophic double-failure

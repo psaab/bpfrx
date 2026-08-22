@@ -675,14 +675,30 @@ type Daemon struct {
 	hostInboundCoveredAddrs map[string]struct{}
 
 	// lo0Enforced records whether the currently-loaded xpf_lo0 table is a REAL
-	// operator filter (the #6476 lo0 cold-boot fence gate). It means EXACTLY that:
-	// it is set true ONLY by a successful real InstallLo0. A cold-boot FENCE
-	// deliberately does NOT set it — a fence is NOT a real filter (its chain is
+	// operator filter (the #6476 lo0 cold-boot fence gate). It is set true ONLY by
+	// a successful real InstallLo0 that RENDERED AT LEAST ONE KERNEL RULE. A cold-boot
+	// FENCE deliberately does NOT set it — a fence is NOT a real filter (its chain is
 	// `policy accept` and drops only the firewall-local addresses present in the
 	// snapshot it was rendered from, so a later-appearing address is not covered), so
 	// lo0Enforced stays false across a fence. A successful no-filter TEARDOWN Stores
 	// false (the table is deleted); a teardown FAILURE (a table may still be
 	// installed) does NOT clear it.
+	//
+	// #6529: a successful install that rendered ZERO rules Stores FALSE. Such an
+	// install leaves an empty `policy accept` shell that enforces nothing, and one
+	// boolean cannot tell "a real filter governing every local address" from "a real
+	// filter that compiled to nothing" — so the pre-#6529 unconditional Store(true)
+	// on any successful install permanently suppressed the fence and left the host
+	// input path open. Zero rules is reachable through three doors, none of them
+	// distinguishable from a term count: a filter NAME that resolves to no filter
+	// (toNftLo0Spec's map lookup silently yields no terms), a filter with no terms,
+	// and a filter whose every term lowers to zero rules (a Junos match-nothing
+	// scope, e.g. an unresolved `from source-prefix-list`). All three arrive through
+	// opts.lenientFirewallRefs on Store.Load at boot or Store.SyncApply on HA
+	// peer-sync. The count is the RENDERED one, reported by Installer.InstallLo0
+	// from nlPlan.rules, so it can never drift from the lowering. It Stores false
+	// rather than merely skipping the Store, because a peer-synced vacated
+	// generation atomically REPLACES a live real filter (#5790 teardown parity).
 	//
 	// It gates the day-2 fence-skip in applyLo0Filter: a failed InstallLo0 installs
 	// a fence UNLESS a real filter is currently loaded. This must key on real-filter-

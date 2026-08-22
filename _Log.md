@@ -17,6 +17,84 @@
   was believed at the time; rewriting a past entry would falsify the record.
   This entry is the correction.
 
+## 2026-08-22 — #6455 Finding 1: a duplicate authored inside an applied group compiled clean
+
+- **Timestamp**: 2026-08-22 (fix/6455-group-authored-dupnames)
+- **Action**: Added `validateDuplicateNamesExpandedAST`, the POST-expansion half
+  of the duplicate-name gate family: it re-runs the three pre-expansion scanners
+  on a group-expanded clone, once per cluster node, and subtracts what the
+  pre-expansion gates already reported.
+- **File(s)**: `pkg/config/dup_names_expanded_6455.go` (new),
+  `pkg/config/dup_names_expanded_6455_test.go` (new), `pkg/config/compiler.go`,
+  `pkg/config/compiler_opts.go`, `pkg/config/dup_names_6455.go`,
+  `pkg/config/dup_named_blocks.go`, `pkg/config/dup_nat_rule_names.go`,
+  `pkg/config/dup_nat_ruleset_names.go`, `docs/config-schema.md`
+
+  The three gates (#5180 named-block, #5649 NAT rule, #6454 NAT rule-set) scan
+  TOP-LEVEL stanzas only. That is correct for them — apply-groups DEEP-MERGES a
+  group-provided named block onto an inline peer, so walking group bodies
+  pre-expansion would count one merged object twice. But a duplicate authored
+  ENTIRELY inside an applied group, with no inline peer, is appended wholesale
+  by ast_groups.go and never coalesced.
+
+  Measured on `52f51200e` before the fix: the issue's repro compiled CLEAN and
+  produced rule-set "RS" holding TWO rules both named "R", while the
+  byte-identical duplicate authored inline was hard-rejected. Same config, same
+  compiled shape, opposite verdict, decided by where the operator wrote it.
+
+  PR #6491 tried a pre-expansion per-group-body scan and WITHDREW it: fragments
+  of one named object authored across repeated group roots COALESCE under
+  `mergeNodes` during ExpandGroups, and a sibling-scan cannot model that
+  same-pass coalescing, so it rejected configs that compile to one object. This
+  runs the same scanners AFTER expansion, where the coalescing has already
+  happened — a fragment pair is one node by then and reports nothing. The
+  pre-existing `TestDup6455GroupFragmentCoalescingAccepted` is the accept-side
+  control and passes unchanged; so does its C4 case, where two group-local
+  same-name rule siblings coalesce INTO an inline peer.
+
+  Reusing the scanners verbatim rather than reimplementing the name-keying is
+  deliberate: it is what stops the two views from disagreeing about what
+  "duplicate" means.
+
+  Expansion runs once per cluster node (node0 AND node1), reusing the
+  clone-and-expand shape of `collectNodeExpandedInterfaceUnitSpellings` and
+  mirroring the #5878 / #5879 / #6178 / #6662 union gates, so a `groups node1`
+  duplicate that only the PEER's `${node}` expansion selects is rejected at
+  commit instead of committing green here and merely warning on the standby.
+
+  Findings the pre-expansion gates already produced are subtracted, so an inline
+  duplicate is reported exactly ONCE on the lenient path. Dedup is by rendered
+  message because both views render through the same functions — identical
+  findings are byte-identical strings by construction, no second wording to keep
+  in sync. On the strict path the subtraction is a no-op (the pre-expansion
+  gates return their error immediately, so reaching this gate means they found
+  nothing).
+
+  `expandInterfaceRanges` is deliberately NOT applied to the clone: a range
+  expanding to two identical names is a different defect on a different axis,
+  nothing detects it today, and covering it here would be the same speculative
+  scope that produced the withdrawn false-reject.
+
+  Mutation proof — `go build ./pkg/config/` checked clean before each cell, so no
+  red is a build failure in disguise:
+  - restore the VERBATIM pre-fix `pkg/config/compiler.go`
+    (`git show origin/master:pkg/config/compiler.go`), i.e. delete the production
+    wiring rather than break the function it calls — TEST_RC=1, five tests red;
+  - `expandedDupNodeViews = []int{0}` — TEST_RC=1, and it LOCALISES: only
+    `TestDupExpanded6455PeerOnlyNodeGroupCaught` reds;
+  - drop the `alreadyReported` subtraction — TEST_RC=1, reds the new
+    report-once control AND the pre-existing
+    `TestDup6455QuotedEmptyLenientWarnsOnce`;
+  - drop each of the three scanners from `dupNameScannersExpanded` in turn —
+    TEST_RC=1 each, and each reds exactly its OWN subtest of
+    `TestDupExpanded6455EachScannerIsWired`, so a missing member cannot hide
+    behind a compound red.
+
+  Control at HEAD: `go test -count=1 ./pkg/config/` TEST_RC=0,
+  `go test -count=1 ./pkg/configstore/ ./pkg/daemon/ ./pkg/cli/` TEST_RC=0,
+  `go vet ./pkg/config/` VET_RC=0, `go build ./...` BUILD_RC=0. Go-only; no
+  dataplane binary moves, so no cluster smoke is owed.
+
 ## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
 
 - **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
@@ -100174,6 +100252,32 @@ prose edit above them added. No diff falls in the new test body.
   existing #6031 tests green while silently reverting the fix.
 - **File(s)**: pkg/daemon/bulk_snapshot_wiring_7259_test.go
 
+## 2026-08-21 — #6535 periodic converger for the Kea applier
+- **Timestamp**: 2026-08-21
+- **Action**: Track whether a Kea apply converged (`applyFailed` +
+  `ClaimApplyRetry`, on their own mutex); add `reconcileClusterDHCPServices`
+  to `reconcileRGState`; single-source the desired state as
+  `desiredClusterDHCPConfig`.
+- **File(s)**: `pkg/dhcpserver/dhcpserver.go`, `pkg/dhcpserver/test_seams.go`,
+  `pkg/dhcpserver/README.md`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/daemon_apply_routing.go`,
+  `pkg/daemon/dhcp_apply_converger_6535_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6530 fence re-arms the rg_active reconcile retry
+- **Timestamp**: 2026-08-21
+- **Action**: Add `rgStateMachine.InvalidateApplied()` so an out-of-band
+  `rg_active` write re-arms `reconcileRGState`'s desired-vs-applied retry;
+  route the received-peer-fence path through it; lazily allocate `d.rgStates`.
+- **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha_sync.go`,
+  `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/rg_state_fence_rearm_6530_test.go`, `pkg/daemon/README.md`
+## 2026-08-21 — #6527 single-RG transfer-commit rollback
+- **Timestamp**: 2026-08-21
+- **Action**: Roll back `peerTransferOutOverride` when
+  `commitRequestedPeerFailover` loses the election, mirroring the batch path;
+  agreement-binding regression test across both request paths.
+- **File(s)**: `pkg/cluster/failover.go`,
+  `pkg/cluster/failover_commit_rollback_6527_test.go`,
+  `pkg/cluster/README.md`
 ## 2026-08-21 — #6420: strip the dead eBPF NAT record construction from compiler_nat.go
 
 - **Timestamp**: 2026-08-21
@@ -100213,3 +100317,145 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/host_inbound_conntrack_flush.go, pkg/daemon/README.md,
     pkg/dataplane/userspace/zones_host_inbound.go,
     docs/host-inbound-service-matrix.md
+  - **Action**: #6529 — InstallLo0 reports the rendered rule count; a vacated
+    lo0 filter (zero rules) clears lo0Enforced instead of claiming enforcement,
+    so the #6476 cold-boot fence is no longer suppressed.
+  - **File(s)**: pkg/nftables/netlink_installer.go, pkg/daemon/daemon_nft.go,
+    pkg/daemon/daemon.go, pkg/daemon/lo0_vacated_enforced_6529_test.go,
+    pkg/nftables/netlink_lo0_zero_render_6529_test.go,
+    pkg/daemon/daemon_nft_netlink_testhelper_test.go,
+    pkg/daemon/daemon_nft_netlink_parity_test.go,
+    pkg/nftables/netlink_kernel_test.go, docs/host-inbound-service-matrix.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 — `Daemon.startClusterComms` was a 602-line constructor
+  wiring the whole cluster-comms stack. Extracted thirteen sub-constructions
+  into focused builders in a new `daemon_ha_comms_wiring.go`: VRF-device
+  resolution, HA watchdog heartbeat, sync-transport selection, session-sync
+  transport refs, fabric gRPC listeners, the config / peer-lifecycle /
+  remote-failover callback groups, cluster peer-failover hooks, fence wiring,
+  event-stream wiring, the auxiliary comms loops, and the fabric-forwarding
+  loops. `startClusterComms` drops 602 -> 233 lines and keeps only the
+  control-flow spine, because in a cluster bring-up constructor the ORDER is
+  the contract. Pure code motion: all thirteen bodies verified byte-identical
+  modulo indentation by an independent extract/normalise/diff verifier (10
+  exactly identical, 3 with a pure appended `return`), and a second verifier
+  proved the only lines that left `daemon_ha_sync.go` are those thirteen blocks
+  plus two now-unused imports and an orphaned `watchClusterEvents` doc comment.
+  Every argument is passed under the identifier it binds, and each such variable
+  was shown single-assignment before its moved consumer, so by-value parameters
+  are equivalent to the original by-reference captures. The five blocks that
+  `return` out of the constructor goroutine were deliberately left inline.
+  `daemon_ha_sync.go` left the refactor-audit WATCH tier (1585 -> 1245 LOC);
+  audit regenerated. `make test-failover` and a startup validation are OWED and
+  UNRUN.
+- **File(s)**: pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_comms_wiring.go, pkg/daemon/README.md,
+  docs/refactoring-audit-current.txt, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 follow-up in the same PR — measured whether the wiring the
+  decomposition relocates is bound by any test. It was not: `go tool cover
+  -func` over `./pkg/daemon/` reports 0.0% statement coverage for all ten
+  builders inside the sync-constructor goroutine, and nilling ALL 30 wiring
+  assignments at once left `./pkg/daemon/` and `./pkg/cluster/` green — the
+  tests that call `startClusterComms` deliberately configure it to early-return
+  before the goroutine. Added `cluster_comms_wiring_bound_6428_test.go` binding
+  the 17 observable sites (15 `ss.*` handles + `d.syncPeerAddr{,1}`) by calling
+  each builder directly and asserting the installation, not the behaviour. The
+  first draft was VACUOUS: collecting func fields into a table of `any` boxes a
+  typed nil into a non-nil interface, so 14 of 17 unwire mutations stayed green;
+  rewritten with direct `== nil` comparisons and re-proven 17/17 RED, each
+  naming the dropped field. Remaining 13 sites (the `d.cluster.Set*` hooks plus
+  `ss.SetAuthProvider`/`SetSyncTransport`) have no getter on `cluster.Manager`
+  and stay unbound — reported, not silently relocated. Also recorded the
+  goroutine-lifecycle finding: `clusterCommsWG.Add(1)` occurs exactly once, so
+  only the constructor goroutine is joined and the other ten (including
+  `startHeartbeatWithRetry`) are cancel-only — the structural reason #7257 is
+  reachable. #7257 is NOT fixed here; it needs a lifecycle change, not a move.
+- **File(s)**: pkg/daemon/cluster_comms_wiring_bound_6428_test.go (new),
+  pkg/daemon/README.md, _Log.md
+
+## 2026-08-21 — #6311: node discriminator in the session-id namespace
+- **Timestamp**: 2026-08-21
+- **Action**: Fold a chassis-cluster node bit into the userspace session-id
+  namespace so an id adopted verbatim from the peer (#5212) can never collide
+  with a locally-minted one. `SessionTable::set_worker_id` becomes
+  `set_session_id_namespace(node_id, worker_id)` — namespace is
+  `node_bit << 15 | worker_id` in the high 16 bits — with the #6198 control-plane
+  reservation now guarding the COMBINED namespace and a new assert refusing a
+  worker id that would carry into the node bit. `node_id` is plumbed
+  Go config -> `ConfigSnapshot.node_id` -> `bring_up_workers` -> `spawn_workers`
+  -> `WorkerLaunchPlan` -> `worker_loop_setup`. Additive wire field, no protocol
+  version bump.
+- **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/install.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/worker/launch.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/setup.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/snapshot_node_id_6311_test.go,
+  pkg/daemon/daemon_ha_userspace_convert.go, docs/sync-protocol.md
+
+## 2026-08-21 — #6311: de-vacuum the adoption-collision test
+- **Timestamp**: 2026-08-21
+- **Action**: The mutation matrix showed
+  `adopted_peer_id_cannot_collide_with_a_local_id_6311` passing under the
+  node-bit-removal cell. It built the peer id as a hardcoded literal, so it
+  named a value the un-bitted allocator never produces — a probe keyed to the
+  fix, not to the property. Rewrote it to MINT the peer id from a real node-1
+  `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
+  It now reds under that cell (4 failures, was 3).
+- **File(s)**: userspace-dp/src/session/tests.rs
+
+## 2026-08-21 — #7253: split the modularity gate from the heatmap freshness gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: `TestHeatmapNotStale` fused two properties into one fatal
+  assertion — modularity ("a file is growing past the point where it should be
+  split", aimed at the author of the growth) and freshness ("the committed
+  global snapshot disagrees with the tree", aimed at whoever merges next). The
+  second could not stay true: the heatmap is a repo-GLOBAL snapshot, so any
+  file crossing 1500/2000 LOC anywhere flipped it for everyone. #7235, #7252
+  and #7254 each regenerated it inside one hour and #7252 was ALREADY STALE
+  when it merged; `pkg/dataplane/types.go` crossed the floor at exactly 1501
+  lines. Split per the issue's recorded decision (option 3). HARD half: new
+  `TestTouchedFileCrossedModularityThreshold` +
+  `scripts/refactoring-audit-touched.sh` — reds only when a file the BRANCH
+  TOUCHES crossed a floor, measured base-vs-worktree over
+  `git diff <merge-base(origin/master,HEAD)>` plus untracked files; it never
+  reads the artifact, is silent on master (empty changed set), and fails loudly
+  (exit 3) when the changed set is undeterminable rather than printing an empty
+  set. Escape hatch is a reasoned entry in
+  `docs/refactoring-audit-accepted.txt`. DEMOTED half:
+  `TestGlobalHeatmapFreshnessAdvisory` reports drift and never fails;
+  `scripts/refactoring-audit-refresh.sh` (`make audit-refresh`) regenerates and
+  commits it. `make audit-check` now exits 0 on every staleness and keeps exit 1
+  for a malformed artifact, so its verdict still agrees with the suite.
+  `$AUDIT_ROOTS_*` / `$AUDIT_FLOOR` / `audit_is_audited_path` moved into the
+  shared lib so the generator and the touched probe cannot drift; generator
+  output verified byte-identical after that refactor. Fail-on-revert for each
+  half, plus `TestTouchedGateIsNotASnapshotCompare` proving the hard half
+  disagrees with a repo-global snapshot compare in BOTH directions. Test tooling
+  only — no dataplane or control-plane code, so no cluster smoke is owed.
+- **File(s)**: pkg/refactoraudit/audit_touched_test.go (new),
+  pkg/refactoraudit/audit_jobs_test.go (new),
+  pkg/refactoraudit/audit_canary_test.go, pkg/refactoraudit/doc.go,
+  scripts/refactoring-audit-touched.sh (new),
+  scripts/refactoring-audit-refresh.sh (new),
+  scripts/refactoring-audit-lib.sh, scripts/refactoring-audit.sh,
+  scripts/refactoring-audit-classify.sh,
+  docs/refactoring-audit-accepted.txt (new), docs/refactoring-audit.md,
+  docs/engineering-style.md, Makefile, _Log.md
+
+## 2026-08-21 — #6031 coverage salvage from the closed duplicate #7255
+- **Timestamp**: 2026-08-21
+- **Action**: Carried the 2 genuinely-uncovered contract cases from the closed
+  duplicate onto merged master, reframed for the merged API: an EMPTY
+  table-truth snapshot must still frame a real authoritative window (the #5085
+  empty-bulk skip, one layer down), and an empty owned-RG set is a determinate
+  answer rather than a precondition failure. Dropped 11 as duplicates or as
+  encoding the duplicate's own (in one case destructive) contract.
+- **File(s)**: pkg/cluster/sync_bulk_snapshot_empty_6031_test.go (new),
+  pkg/daemon/bulk_snapshot_empty_rgs_6031_test.go (new)
