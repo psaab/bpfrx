@@ -387,6 +387,13 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// node cannot represent. Beside the clock sync because it has the same
 	// lifetime: per-incarnation, cleared on full disconnect.
 	s.sendCapabilities(conn)
+	// #6629: advertise this connection's ephemeral public key so the peer can
+	// encrypt the config payload to us. Beside sendCapabilities because it has
+	// the same lifetime (per installed connection) and the same failure
+	// posture: advisory, never escalated to a disconnect. Sent BEFORE the
+	// OnPeerConnected dispatch below, which is what drives the first config
+	// push, so the common case never reaches awaitConfigKey's timeout.
+	s.sendConfigKeyExchange(conn)
 	coldStart := !s.bulkEverCompleted.Load()
 	if d.shouldColdPrime {
 		slog.Info("cluster sync: driving authoritative cold-prime bulk on active connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "cold_start", coldStart, "was_disconnected", d.wasDisconnected)
@@ -532,12 +539,18 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 			s.conn0.Close()
 		}
 		s.conn0 = conn
+		// #6629: a FRESH ephemeral keypair per install. Replacing (never
+		// reusing) the slot's state is what gives the config payload forward
+		// secrecy across reconnects — the superseded connection's key is
+		// dropped here with its connection.
+		s.configCrypto0 = newConfigCryptoState()
 	case 1:
 		if s.conn1 != nil {
 			supersededCurrent = s.conn1Gen == s.peerIncarnation
 			s.conn1.Close()
 		}
 		s.conn1 = conn
+		s.configCrypto1 = newConfigCryptoState()
 	}
 	s.stats.Connected.Store(true)
 	s.lastPeerRxMono.Store(MonotonicNanos())
@@ -830,6 +843,10 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	case s.conn0 != nil && s.conn0 == conn:
 		s.conn0.Close()
 		s.conn0 = nil
+		// #6629: drop the connection's ephemeral config key with the
+		// connection. Nothing may seal or open a payload with a key that
+		// outlived the exchange that produced it.
+		s.configCrypto0 = nil
 		// #5718 fold F1b: retire the slot's incarnation stamp with the
 		// connection it described. The nil slot already makes
 		// connIsCurrentIncarnationLocked reject, so this is hygiene — it keeps
@@ -840,6 +857,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	case s.conn1 != nil && s.conn1 == conn:
 		s.conn1.Close()
 		s.conn1 = nil
+		s.configCrypto1 = nil
 		s.conn1Gen = 0
 		slog.Info("cluster sync: fabric 1 disconnected")
 	default:

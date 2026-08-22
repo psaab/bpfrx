@@ -46,22 +46,13 @@ func ensureRethLinkOriginalName(ifName string) {
 	if !strings.Contains(content, "MACAddress=") {
 		return // already uses OriginalName= or other match
 	}
-	// Derive kernel name from altnames or sysfs
-	link, err := netlink.LinkByName(ifName)
-	if err != nil {
-		return
-	}
-	var kernelName string
-	for _, alt := range link.Attrs().AltNames {
-		if strings.HasPrefix(alt, "enp") || strings.HasPrefix(alt, "eno") ||
-			strings.HasPrefix(alt, "ens") || strings.HasPrefix(alt, "eth") {
-			kernelName = alt
-			break
-		}
-	}
-	if kernelName == "" {
-		kernelName = deriveKernelName(ifName)
-	}
+	// Derive the kernel name. deriveKernelName consults the SAME altnames this
+	// used to walk inline, in systemd's NamePolicy order, and falls back to the
+	// sysfs PCI derivation — so the two paths cannot disagree about what a
+	// NIC's pre-rename name is. A divergence between them would always be a
+	// bug, which is why this is one implementation rather than two kept in
+	// agreement.
+	kernelName := deriveKernelName(ifName)
 	if kernelName == "" {
 		return
 	}
@@ -70,11 +61,89 @@ func ensureRethLinkOriginalName(ifName string) {
 	fixRethLinkFile(ifName, kernelName)
 }
 
+// altNameCandidatesFn returns an interface's kernel ALTERNATIVE names. It is a
+// seam so tests can supply a device's real altname set without netlink.
+var altNameCandidatesFn = func(ifName string) []string {
+	link, err := netlink.LinkByName(ifName)
+	if err != nil {
+		return nil
+	}
+	return link.Attrs().AltNames
+}
+
+// altNamePrefixOrder is systemd's default NamePolicy order, restricted to the
+// prefixes a predictable name can carry: onboard (eno), hotplug slot (ens),
+// then PCI path (enp). See 99-default.link's
+// "NamePolicy=keep kernel database onboard slot path".
+//
+// The order matters: a device commonly carries SEVERAL candidate altnames
+// (measured on a real host, ix0 carries eno5np0, enp183s0f0np0 and
+// enx3cecef6aa8bc at once), and the one udev actually assigns is the first
+// its policy resolves — onboard before path. Picking the first altname the
+// kernel happens to list would be a coin flip between them.
+//
+// "eth" is kept as a LAST resort only. It is the pre-predictable-naming kernel
+// default rather than a policy output, so it must never outrank a real
+// predictable name — but ensureRethLinkOriginalName accepted it before this
+// change, and dropping it would silently alter which name a RETH member
+// records. Ordering it last preserves that behaviour without letting it win
+// over eno/ens/enp.
+//
+// A MAC-based name (enx…) is deliberately NOT accepted: it is last in the
+// default policy and is not a name udev assigns unless the others are
+// unavailable.
+var altNamePrefixOrder = []string{"eno", "ens", "enp", "eth"}
+
+// kernelNameFromAltNames returns the predictable name udev would assign, taken
+// from the interface's kernel alternative names (#6677).
+//
+// This is the AUTHORITATIVE source and is preferred over re-deriving a name
+// from the PCI address, because the kernel and udev have already computed
+// every candidate and kept them as altnames. Re-deriving cannot match it:
+// systemd's naming has at least three inputs a PCI address string does not
+// carry, all of them measured on real hardware —
+//
+//   - ARI: with ari_enabled the slot and function fields are ONE 8-bit
+//     function number (net_id does "func += slot * 8"), which a helper reading
+//     the address alone cannot know;
+//   - SR-IOV: a virtual function is named from its PHYSICAL function's address
+//     plus the VF index, so the VF's own slot/function never appears — a VF at
+//     0000:b7:02.0 is named enp183s0f0v0, from its physfn at 0000:b7:00.0;
+//   - the port suffix: a multi-port NIC carries npN (enp183s0f0np0), which
+//     comes from device properties the address does not contain.
+//
+// Altnames are stable across renames — they are the candidate set, not the
+// current name — so this stays correct after xpf has renamed the interface to
+// its logical name, which is exactly when the pre-rename name must be
+// recovered. ensureRethLinkOriginalName has used the same mechanism in
+// production since before this change.
+func kernelNameFromAltNames(ifName string) string {
+	alts := altNameCandidatesFn(ifName)
+	for _, want := range altNamePrefixOrder {
+		for _, alt := range alts {
+			if strings.HasPrefix(alt, want) {
+				return alt
+			}
+		}
+	}
+	return ""
+}
+
 // deriveKernelName returns the predictable kernel name (e.g. enp8s0) for an
-// interface by examining its sysfs device path. Handles both PCI-direct
-// devices (device → 0000:09:00.0) and virtio-over-PCI (device → virtioN,
-// parent → 0000:08:00.0).
+// interface.
+//
+// It asks the kernel first (kernelNameFromAltNames) and only falls back to
+// deriving a name from the sysfs PCI address when no altname is available —
+// early boot before udev has settled, or a container. The fallback is
+// best-effort by construction: it reproduces the plain domain/bus/slot/function
+// spelling and is blind to ARI, SR-IOV VF parentage and the port suffix (see
+// kernelNameFromAltNames). #7415 records the one of those three that could not
+// be reproduced on available hardware and names the device that would settle
+// it; the other two are what motivated preferring the kernel's answer.
 func deriveKernelName(ifName string) string {
+	if name := kernelNameFromAltNames(ifName); name != "" {
+		return name
+	}
 	devPath, err := filepath.EvalSymlinks(fmt.Sprintf("/sys/class/net/%s/device", ifName))
 	if err != nil {
 		return ""
