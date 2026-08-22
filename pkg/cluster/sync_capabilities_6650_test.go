@@ -122,7 +122,7 @@ func TestPeerCapabilitiesMessageTypeIsUnique6650(t *testing.T) {
 				syncMsgPeerCapabilities, m.name)
 		}
 	}
-	if len(live) < 31 {
+	if len(live) < 34 {
 		t.Fatalf("the live-type list holds only %d entries — it has fallen behind "+
 			"sync.go and can no longer certify uniqueness", len(live))
 	}
@@ -219,6 +219,9 @@ func liveSyncMessageTypesExcept(under int) []syncMessageType {
 		{syncMsgPeerCapabilities, "PeerCapabilities"},
 		{syncMsgConfigKeyExchange, "ConfigKeyExchange"},
 		{syncMsgConfigEncrypted, "ConfigEncrypted"},
+		{syncMsgAuthUpgradeHello, "AuthUpgradeHello"},
+		{syncMsgAuthUpgradeProof, "AuthUpgradeProof"},
+		{syncMsgAuthUpgradeAck, "AuthUpgradeAck"},
 	}
 	out := make([]syncMessageType, 0, len(all))
 	for _, m := range all {
