@@ -511,6 +511,42 @@ func (m *Manager) handlePeerTimeout() {
 		}
 	}
 
+	// #6656: drop the peer-transfer-out override too. It is the OTHER half of
+	// "a previous manual transfer-out" the loop above clears — that half parks
+	// the LOCAL node, this half forces our view of the PEER to secondary-hold —
+	// and it was the only half that survived peer loss.
+	//
+	// Why that matters more than a stale field. Unlike ManualFailover and the
+	// commit grace window, this override has NO expiry: it is re-applied to
+	// every rebuilt peer-group map on EVERY heartbeat
+	// (applyTransferCommitOverridesOnPeerStateLocked), and it feeds BOTH the
+	// election AND the operator-facing status render, because FormatStatus
+	// prints the post-override m.peerGroups. So an override that outlives the
+	// peer incarnation it was granted against means: the peer reconnects — a
+	// reboot, a rolling deploy, or simply a new process — and from the first
+	// heartbeat onward this node forces it to secondary-hold, electRG takes its
+	// "Peer transfer out" arm, and this node self-elects primary for that RG
+	// regardless of what the peer actually reports. Two nodes then believe they
+	// are primary, and the one that is NOT forwarding shows a healthy primary
+	// row with an empty session table.
+	//
+	// The authority the override carries is scoped to the peer that
+	// acknowledged the transfer. Peer loss ends that peer's incarnation, so the
+	// authority ends with it — the same argument the ManualFailover clear above
+	// already makes, and the same incarnation-scoping the sync layer applies to
+	// clockSynced and peerHeartbeatAckEver.
+	//
+	// Ordering: this runs AFTER suppressPeerTimeoutForTransferCommitLocked has
+	// been consulted (twice) and declined, so an in-flight commit still gets
+	// its suppression window. The time-bounded maps
+	// (peerTransferCommitGraceUntil / localTransferOutHoldUntil) are left alone
+	// deliberately — they expire on their own, and clearing them here would
+	// shorten a window a live transfer may still be inside.
+	for rgID := range m.peerTransferOutOverride {
+		slog.Info("cluster: clearing peer transfer-out override (peer lost)", "rg", rgID)
+		m.clearPeerTransferOutOverrideLocked(rgID)
+	}
+
 	// Peer lost: re-run single-node election.
 	m.electSingleNode()
 
