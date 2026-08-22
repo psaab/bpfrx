@@ -1,3 +1,110 @@
+## 2026-08-21 — #6218 audit cohort: 7 fixed, plus #7197 (nil-deref DoS found while fixing #6218 item 13)
+
+- **Timestamp**: 2026-08-21 (fix/6218-audit-cohort-survivors)
+- **Action**: Re-verified all 17 items in the #6218 low-materiality audit
+  cohort against current origin/master and fixed every one classified
+  LIVE + TRIVIAL, Go-only (no Rust, no shim `.o`, no protocol movement — no
+  cluster smoke owed):
+  - **Item 5** (`pkg/ddns/backend_cloudflare.go`): `listRecords` returned
+    `all, nil` after `slog.Warn`ing on hitting the 1000-page runaway cap,
+    silently truncating the result set. Both `UpsertLease`/`DeleteLease`
+    trust listRecords for ownership-scoped writes (#4909), so a truncated set
+    could hide the row xpf owns. Now returns a non-nil error; both callers
+    already propagate it and skip the write.
+  - **Item 6** (`pkg/ddns/state.go`): `quarantineBadState`'s stamp is
+    second-resolution; a bare `os.Rename` let a second quarantine event in
+    the same wall-clock second silently overwrite an earlier quarantine
+    file, destroying the only forensic copy. Now probes for a same-stamp
+    collision and appends a numeric suffix.
+  - **Item 7** (`pkg/config/schema_validators_logging.go`):
+    `ValidateSyslogSourceInterface` rejected a non-numeric `.<unit>` (#3349)
+    but never bounded it against `MaxLogicalUnit` (16385), so
+    `ge-0-0-0.50000` committed even though no real interface unit can exceed
+    that ceiling — the reference could never resolve, and
+    `ResolveSyslogSourceAddr` silently returned "" (the same audit-source-IP
+    loss #3349 closed, reached via an out-of-range unit).
+  - **Item 11** (`pkg/dhcpserver/lease_sync.go`): the memfile-fallback
+    `subnet_id` parse used a bare `strconv.Atoi` (platform-int width).
+    Cohort framed this as merely non-portable (amd64-inert); it is not — a
+    bare `Atoi` on THIS platform silently ACCEPTS a subnet_id above
+    `math.MaxUint32` as garbage, which Kea's real uint32 subnet-id space can
+    never produce. Switched to `strconv.ParseUint(s, 10, 32)`, which is both
+    portable and correctly bounds-checked.
+  - **Item 12** (`pkg/cli/cli_show_interfaces.go`): a malformed `.<unit>`
+    zone-interface reference (reachable only via the tolerant/peer-sync load
+    path since `validateInterfaceUnitReferencesStrict`, #5829/#5933, now
+    hard-rejects it at strict commit) silently defaulted to unit 0 —
+    misleading AND capable of borrowing the real unit 0's VLAN/address.
+    `unitNum` is now `-1` on parse failure (can never collide with a real
+    unit).
+  - **Item 13** (`pkg/cli/cli_show_security_objects.go`): the address-set
+    member-detail block resolved each member with a nested
+    `for a := range as.Addresses { for addr := range ab.Addresses {...} }`
+    scan (O(n*m), no early exit). Replaced with a direct
+    `ab.Addresses[a]` lookup (`ab.Addresses` is keyed by name).
+  - **Item 16** (`pkg/cli/show_services_ddns.go`): `showServicesDynamicDNS`'s
+    summary "Counters:" block omitted the Surface A orphan count entirely —
+    visible only as per-row `detail`-mode state, unlike the DHCP-DDNS
+    sibling surface, which has always alarmed on its own orphan-shaped
+    counter unconditionally in the summary. Added the same alarm + an
+    "Orphaned records:" counter line.
+  - **#7197** (new issue, found while writing item 13's test, filed and
+    fixed in this same PR per triage): `showAddressBook` (same file as item
+    13) dereferenced a present-but-nil `*Address`/`*AddressSet` map value
+    with NO guard — `ab.Addresses`/`ab.AddressSets` admit exactly that on
+    the tolerant/HA-sync load path (#3494 codifies this: its fixture
+    literally injects `"zz-nil-addr": nil` / `"zz-nil-set": nil`), and
+    CLI.Run has no panic recovery, so this crashes the in-process daemon.
+    Added two guards (Addresses loop head, AddressSets loop head) matching
+    the existing `#5221` application-set guard's shape; together they close
+    all four affected dereference sites (the top-level Addresses print, the
+    AddressSets body's own Name/Addresses/AddressSets reads, and the
+    member-detail loop) since each guard's `continue` skips its whole loop
+    body.
+  - **Dropped, not fixed** (per triage): item 1 (CLI pipe OOM — real, but a
+    60-90 line streaming-filter port into `cmd/cli`, not cohort-sized; filed
+    as a successor issue instead), item 9 (Rust NAT64 u16 total-length
+    truncation — real on paper, unreachable at real Ethernet MTUs, would owe
+    a cluster smoke this PR does not otherwise need), item 10 (SNMP
+    `lastPacket` — real gap but `Serve()` is a strictly serial read loop
+    today, so a mutex fix has no honest mutation-red without a contrived
+    race), item 17 (`test/incus/step2-sched-switch-reduce.py` off-CPU
+    under-report — real, but perf-profiling tooling, not the production
+    runtime).
+  - **Refuted / already-fixed** (verified, no action): items 2, 3, 4, 8, 14,
+    15 — see the PR body for the full 17-row disposition table with
+    file:line evidence.
+
+  Every fix is mutation-proven: the production line/hunk was reverted,
+  the new assertion went RED (exit 1, captured from `$?` directly, never
+  through a pipe), then restored to GREEN. Where two guards protect
+  adjacent-but-independent hazards (#7197's two nil guards), each was
+  reverted INDIVIDUALLY and the sibling test confirmed to stay GREEN, so
+  the red localizes to the guard removed rather than masking which one is
+  bound.
+
+  Docs updated for the two items whose fix changes a stated contract:
+  `pkg/ddns/README.md` (item 5's error-vs-warn behavior on the listRecords
+  page cap; item 6's collision-safe quarantine stamp) and
+  `docs/config-schema.md` (item 7's MaxLogicalUnit upper bound). The
+  remaining fixes are internal parsing/display hardening with no existing
+  documented contract to correct.
+
+  Validation: `go vet ./...` exit 0; `go test -count=1` per touched package
+  — `./pkg/ddns/...`, `./pkg/config/...`, `./pkg/dhcpserver/...`,
+  `./pkg/cli/...` — each exit 0; `go build ./...` exit 0. No Rust files
+  touched (item 9 dropped) — no cargo run owed, no cluster smoke owed.
+- **File(s)**: pkg/ddns/backend_cloudflare.go,
+  pkg/ddns/backend_cloudflare_pagination_4909_test.go, pkg/ddns/state.go,
+  pkg/ddns/corrupt_state_durable_4873_test.go, pkg/ddns/README.md,
+  pkg/config/schema_validators_logging.go,
+  pkg/config/log_stream_config_3349_test.go, docs/config-schema.md,
+  pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  pkg/cli/cli_show_interfaces.go, pkg/cli/cli_show_interfaces_nil_5068_test.go,
+  pkg/cli/cli_show_security_objects.go, pkg/cli/cli_show_security_test.go,
+  pkg/cli/show_services_ddns.go, pkg/cli/cli_residual_escape_6468_test.go,
+  _Log.md
+
 ## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
 
 - **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
