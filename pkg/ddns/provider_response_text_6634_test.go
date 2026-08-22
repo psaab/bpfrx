@@ -63,10 +63,21 @@ func hostileBody(shape string) string {
 }
 
 // decodeSentinel is the leak vector for the DECODE sites, which is a different
-// shape from the render sites. Go's JSON decoder does not quote a mismatched
-// STRING back — it names the type — but it does quote a mismatched NUMBER in
-// full, and the number is provider-chosen and arbitrarily long. So the decode
-// cells plant a long digit run and assert none of it survives.
+// shape from the render sites and NARROWER than the issue implies. Measured
+// against Go's decoder rather than assumed:
+//
+//	number into a slice   -> "cannot unmarshal number into Go value of type []ddns.cfZone"
+//	number into a string  -> "cannot unmarshal number into Go struct field cfZone.id of type string"
+//	number OVERFLOWING an int field
+//	                      -> "cannot unmarshal number 98765…7890 into Go struct field cfRecord.ttl of type int"
+//	syntax error          -> "invalid character '9' looking for beginning of object key string"
+//
+// So the literal is quoted in exactly ONE case: a numeric overflow into an int
+// field. A syntax error quotes a single character. That matters for what each
+// cell below can honestly assert, and it is why two of them assert the render
+// SHAPE rather than sentinel absence — a cell whose payload cannot produce a
+// literal would pass whether or not the site was scrubbed at all, which is how
+// the first version of this test let two mutations through.
 const decodeSentinel = "9876543210123456789012345678901234567890"
 
 // serveOnce answers every request with the given status + body and records that
@@ -520,8 +531,14 @@ func TestProviderResponseTextSecondSurfaces_6634(t *testing.T) {
 		run    func(t *testing.T, u string) error
 		// wantServed is how many round trips reaching the site requires.
 		wantServed int
-		// sentinel is what must not survive.
+		// sentinel is what must not survive. Empty when the payload cannot
+		// produce a provider-chosen literal at all (see decodeSentinel) — those
+		// cells rely on wantMarker instead.
 		sentinel string
+		// wantMarker is a fixed string the scrubbed render must CONTAIN. It is
+		// what makes a cell an assertion about the render rather than about the
+		// payload: a decode site rendered raw does not produce it.
+		wantMarker string
 	}{
 		{
 			// Route 53 change(): the GET rrset list must SUCCEED so UpsertLease
@@ -537,40 +554,59 @@ func TestProviderResponseTextSecondSurfaces_6634(t *testing.T) {
 			run:        runRoute53,
 			wantServed: 2,
 			sentinel:   providerEchoSecret,
+			wantMarker: providerURLWithheld,
 		},
 		{
 			// Cloudflare resolveZoneID(): the envelope must decode so the flow
 			// reaches the SECOND json.Unmarshal, over env.Result.
+			//
+			// NO SENTINEL IS POSSIBLE HERE, and saying so is the point. cfZone
+			// has only string fields, so no provider-chosen literal can reach
+			// this decoder's error — a number yields "cannot unmarshal number
+			// into Go value of type []ddns.cfZone" with no value in it. The scrub
+			// at this site is UNIFORMITY, not a closed leak, so the cell asserts
+			// the render SHAPE. Asserting sentinel-absence here would pass
+			// whether or not the site was scrubbed, which is a green that
+			// measures nothing.
 			name: "cloudflare_decode_zones",
 			stages: []stagedResponse{
 				{http.StatusOK, `{"success":true,"errors":[],"result":` + decodeSentinel + `}`},
 			},
 			run:        runCloudflare,
 			wantServed: 1,
-			sentinel:   decodeSentinel,
+			wantMarker: string(transportWithheld),
 		},
 		{
 			// Cloudflare listRecords(): zones must resolve first, so this needs
 			// two round trips to reach the THIRD json.Unmarshal.
+			// cfRecord DOES carry an int field (ttl), so an overflowing ttl is a
+			// real literal-bearing payload here — the one decode shape that
+			// quotes provider-chosen bytes back in full.
 			name: "cloudflare_decode_records",
 			stages: []stagedResponse{
 				{http.StatusOK, `{"success":true,"errors":[],` +
 					`"result":[{"id":"ZONEID1","name":"example.net"}]}`},
-				{http.StatusOK, `{"success":true,"errors":[],"result":` + decodeSentinel + `}`},
+				{http.StatusOK, `{"success":true,"errors":[],"result":` +
+					`[{"id":"a","type":"A","name":"n","content":"c","ttl":` + decodeSentinel + `}]}`},
 			},
 			run:        runCloudflare,
 			wantServed: 2,
 			sentinel:   decodeSentinel,
+			wantMarker: string(transportWithheld),
 		},
 		{
-			// Cloudflare do(): the envelope itself does not decode.
+			// Cloudflare do(): the ENVELOPE decode. result_info.page is an int, so
+			// an overflowing page is a literal-bearing payload — this is the
+			// issue's own reproduction, reproduced rather than taken on trust.
 			name: "cloudflare_decode_response",
 			stages: []stagedResponse{
-				{http.StatusOK, `{"success":true,"errors":[],"result":` + decodeSentinel},
+				{http.StatusOK, `{"success":true,"errors":[],"result":[],` +
+					`"result_info":{"page":` + decodeSentinel + `}}`},
 			},
 			run:        runCloudflare,
 			wantServed: 1,
 			sentinel:   decodeSentinel,
+			wantMarker: string(transportWithheld),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -587,10 +623,17 @@ func TestProviderResponseTextSecondSurfaces_6634(t *testing.T) {
 					"assertion below would be vacuous")
 			}
 			msg := err.Error()
-			if strings.Contains(msg, tc.sentinel) {
+			if tc.sentinel != "" && strings.Contains(msg, tc.sentinel) {
 				t.Errorf("provider-chosen bytes reached the returned error:\n  error = %s\n"+
 					"Render provider text through scrubProviderText, and a decoder's own error "+
 					"through scrubInnerError.", msg)
+			}
+			// WHAT IT BECAME. This is the assertion that binds the RENDER rather
+			// than the payload, and it is what catches a site restored to a raw
+			// render whose particular error text happens to carry no literal.
+			if !strings.Contains(msg, tc.wantMarker) {
+				t.Errorf("the render must go through the scrubber, observable as %q in the "+
+					"message; got:\n  %s", tc.wantMarker, msg)
 			}
 			if len(msg) > maxProviderTextBytes+256 {
 				t.Errorf("the error is %d bytes; a provider-chosen render must stay O(%d), "+
