@@ -700,7 +700,6 @@ func (m *Manager) FormatIPMonitoringStatus() string {
 			}
 		}
 		// Show IP monitor section regardless (config-driven).
-		_ = mon // monitor has the config but we show from state
 		if len(ipFails) > 0 || true {
 			// We always show the section for each RG if any monitors are configured.
 			fmt.Fprintf(&b, "Redundancy group %d:\n", rg.GroupID)
@@ -719,6 +718,27 @@ func (m *Manager) FormatIPMonitoringStatus() string {
 
 	if !hasIP {
 		fmt.Fprintln(&b, "No IP monitoring configured")
+	}
+
+	// #6589: clamped ip-monitoring weights. Unlike the interface-monitor
+	// class, this one reached no surface at all — not even journald — so a
+	// weight the runtime silently bounded to 0 owed no election debt and the
+	// RG never demoted on probe failure.
+	if mon != nil {
+		if clamped := mon.ClampedIPMonitorWeights(); len(clamped) > 0 {
+			fmt.Fprintln(&b)
+			fmt.Fprintln(&b, "Clamped IP monitoring weights:")
+			for _, c := range clamped {
+				what := "global-weight"
+				if c.Target != "" {
+					what = c.Target
+				}
+				fmt.Fprintf(&b, "  Redundancy group %d: %-20s configured %d, effective %d (CLAMPED)\n",
+					c.RGID, what, c.Configured, c.Effective)
+			}
+			fmt.Fprintln(&b, "  A weight clamped to 0 adds no election debt, so the group will")
+			fmt.Fprintln(&b, "  NOT demote when that target fails. Re-commit the weight to fix it.")
+		}
 	}
 
 	// Events.
@@ -745,6 +765,24 @@ type InterfaceMonitorInfo struct {
 	Weight          int
 	Up              bool // physical link state
 	RedundancyGroup int
+	// ConfiguredWeight is the weight as WRITTEN in the config, before
+	// ClampInterfaceMonitorWeight bounded it, and Clamped says whether that
+	// bounding actually happened (#6589).
+	//
+	// Every renderer already called the clamp and threw the signal away
+	// (`w, _ := ...`), so it printed a plausible 0 or 255 that is
+	// indistinguishable from an operator-authored one. A monitor clamped to 0
+	// contributes NO election debt: the RG never demotes when that link fails,
+	// and the operator discovers it during a failover that does not happen.
+	// The clamp itself is reachable only from a persisted config or a peer
+	// push (the strict commit gate rejects an out-of-range weight outright),
+	// which is exactly the population an operator cannot see by re-reading
+	// what they typed.
+	//
+	// Zero values mean "not clamped", so a producer that does not set them
+	// renders exactly as before.
+	ConfiguredWeight int
+	Clamped          bool
 }
 
 // RethInfo holds RETH interface status for display.
@@ -871,6 +909,7 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 		fmt.Fprintln(&b, "Interface Monitoring:")
 		fmt.Fprintf(&b, "    %-18s%-10s%-26s%s\n", "Interface", "Weight", "Status", "Redundancy-group")
 		fmt.Fprintf(&b, "    %-18s%-10s%s\n", "", "", "(Physical/Monitored)")
+		clampedAny := false
 		for _, mon := range allMonitors {
 			physStatus := "Up"
 			if !mon.Up {
@@ -878,8 +917,23 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 			}
 			// Physical and monitored status are the same (link-state based).
 			statusStr := fmt.Sprintf("%s  /  %s", physStatus, physStatus)
-			fmt.Fprintf(&b, "    %-18s%-10d%-26s%d\n",
-				mon.Interface, mon.Weight, statusStr, mon.RedundancyGroup)
+			// #6589: a clamped weight renders as "<effective> (cfg <written>)"
+			// so the operator can see the two differ. Printing the effective
+			// weight alone — which is what every renderer did — is correct but
+			// silently indistinguishable from a monitor configured that way.
+			weightCol := fmt.Sprintf("%d", mon.Weight)
+			if mon.Clamped {
+				weightCol = fmt.Sprintf("%d (cfg %d)", mon.Weight, mon.ConfiguredWeight)
+				clampedAny = true
+			}
+			fmt.Fprintf(&b, "    %-18s%-10s%-26s%d\n",
+				mon.Interface, weightCol, statusStr, mon.RedundancyGroup)
+		}
+		if clampedAny {
+			fmt.Fprintln(&b, "    NOTE: a weight shown as \"N (cfg M)\" was CLAMPED to the")
+			fmt.Fprintln(&b, "          [0,255] election domain. A monitor clamped to 0 adds no")
+			fmt.Fprintln(&b, "          election debt, so its redundancy group will NOT demote")
+			fmt.Fprintln(&b, "          when that link fails. Re-commit the weight to fix it.")
 		}
 	}
 

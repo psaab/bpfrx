@@ -56,6 +56,34 @@
   pkg/ra/sender_prefixlen_6531_test.go,
   pkg/daemon/ra_pd_prefixlen_6531_test.go, pkg/dhcp/README.md
 
+## 2026-08-22 — #6589 clamped monitor weights visible to the operator
+
+- **Timestamp**: 2026-08-22
+- **Action**: Carried the clamp signal (`ConfiguredWeight` + `Clamped`)
+  through `InterfaceMonitorInfo` AND `routing.InterfaceMonitorStatus` —
+  the latter is the LIVE path both renderers take, so annotating only
+  the config-only fallback would have left the common case silent — and
+  rendered `N (cfg M)` plus a consequence note in
+  `show chassis cluster interfaces`. Added
+  `Monitor.ClampedIPMonitorWeights` + a render in
+  `FormatIPMonitoringStatus`.
+  CONFIRMED the lead's clamp-precedes-the-gate hypothesis in a sharper
+  form: the clamp happens AT THE RENDER SITE and its boolean is
+  discarded (`w, _ :=`), so the surface prints a plausible 0/255. Also
+  found the ip-monitoring half is WORSE than filed — it reached no
+  surface at all, not even journald.
+  Mutation matrix 7/7 RED after closing three green cells: C4 (the IP
+  RENDER was unbound — the tests called the reporter directly), C5
+  (needed an in-range control), C7 (the first tripwire keyed on the
+  `w, _ :=` SPELLING, but a producer can capture the boolean and still
+  omit it from the struct — re-cut to count `Clamped:` against
+  `InterfaceMonitorInfo{` literals).
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/monitor.go,
+  pkg/routing/monitor.go, pkg/cli/cli_helpers.go,
+  pkg/grpcapi/server_cluster.go,
+  pkg/cluster/clamped_weight_visibility_6589_test.go,
+  pkg/cluster/README.md
+
 ## 2026-08-22 — #6619 + #6564 member 8: VRF-enslaved iifname scope, and coverage vs existence
 
 - **Timestamp**: 2026-08-22

@@ -14,6 +14,12 @@ type InterfaceMonitorStatus struct {
 	Interface string
 	Weight    int
 	Up        bool // true if link is operationally up
+	// ConfiguredWeight / Clamped carry the #6589 clamp signal to the display.
+	// Weight is what the election APPLIES; these say whether that differs from
+	// what the operator wrote. Zero values mean "not clamped", so a producer
+	// that does not set them renders exactly as before.
+	ConfiguredWeight int
+	Clamped          bool
 }
 
 // monitorManager owns interface-monitor link-state tracking for
@@ -53,7 +59,7 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 			// it. (Because this clamp runs first, the SetMonitorWeight
 			// chokepoint sees an already-bounded value and stays silent — its
 			// warning fires only for a producer that skipped its own clamp.)
-			weight, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
+			weight, weightClamped := config.ClampInterfaceMonitorWeight(mon.Weight)
 
 			// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
 			linuxName := config.LinuxIfName(mon.Interface)
@@ -67,6 +73,12 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 				Interface: mon.Interface,
 				Weight:    weight,
 				Up:        up,
+				// #6589: carry the clamp signal to the display. This is the
+				// LIVE path both `show chassis cluster interfaces` renderers
+				// take; annotating only the config-only fallback would leave
+				// the common case silent.
+				ConfiguredWeight: mon.Weight,
+				Clamped:          weightClamped,
 			})
 			if !up {
 				slog.Warn("interface monitor: link down",
