@@ -115,7 +115,7 @@ func TestPageTokenInvalid(t *testing.T) {
 func TestSessionFilterMatchV4(t *testing.T) {
 	f := &sessionFilter{
 		zoneNames:    make(map[uint16]string),
-		zoneIfaces:   make(map[uint16]string),
+		zoneIfaces:   make(map[uint16][]string),
 		egressIfaces: make(map[sessionEgressKey]string),
 	}
 
@@ -147,7 +147,7 @@ func TestSessionFilterMatchV4(t *testing.T) {
 	fZone := &sessionFilter{
 		zoneFilter:   99,
 		zoneNames:    make(map[uint16]string),
-		zoneIfaces:   make(map[uint16]string),
+		zoneIfaces:   make(map[uint16][]string),
 		egressIfaces: make(map[sessionEgressKey]string),
 	}
 	if fZone.matchV4(key, val) {
@@ -158,7 +158,7 @@ func TestSessionFilterMatchV4(t *testing.T) {
 	fProto := &sessionFilter{
 		protoFilter:  "tcp",
 		zoneNames:    make(map[uint16]string),
-		zoneIfaces:   make(map[uint16]string),
+		zoneIfaces:   make(map[uint16][]string),
 		egressIfaces: make(map[sessionEgressKey]string),
 	}
 	if !fProto.matchV4(key, val) {
@@ -167,7 +167,7 @@ func TestSessionFilterMatchV4(t *testing.T) {
 	fProtoUDP := &sessionFilter{
 		protoFilter:  "udp",
 		zoneNames:    make(map[uint16]string),
-		zoneIfaces:   make(map[uint16]string),
+		zoneIfaces:   make(map[uint16][]string),
 		egressIfaces: make(map[sessionEgressKey]string),
 	}
 	if fProtoUDP.matchV4(key, val) {

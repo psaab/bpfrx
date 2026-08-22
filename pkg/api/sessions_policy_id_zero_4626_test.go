@@ -34,7 +34,7 @@ func testSessionView() sessionView {
 		zoneNames:    map[uint16]string{1: "trust", 2: "untrust"},
 		policyNames:  policyNamesWithFirstPolicy(),
 		appNames:     map[uint16]string{},
-		zoneIfaces:   map[uint16]string{},
+		zoneIfaces:   map[uint16][]string{},
 		egressIfaces: map[sessionEgressKey]string{},
 	}
 }
