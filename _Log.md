@@ -103662,3 +103662,20 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
+
+## 2026-08-22 — #6723 the policy-rematch half is not deferred; correct the claim
+- **Action**: `deletedPolicyRuntimeIDs`' header — the FIRST comment a reader hits
+  when tracing commit-time session invalidation — called the modified-policy
+  (policy-rematch) half "the deferred #4234 ... half, intentionally out of
+  scope". It is not deferred: `changedPolicyRuntimeIDs` /
+  `clearSessionsForModifiedPolicies` ship in the same file and
+  `clearSessionsForPolicyChanges` runs both on every commit. Following the stale
+  pointer to a now-closed issue leads a reader to conclude a shipped,
+  security-relevant behaviour is missing. Corrected both sites (the second was
+  the same phrasing in `clearSessionsForDeletedPolicies`), keeping the
+  stable-key rationale for why THIS function does not report changed policies.
+  Guarded by a WIRING bind rather than a phrase sweep: a phrase sweep is
+  defeated by paraphrase and would red on the corrections themselves, which
+  quote the old wording so the change is visible.
+- **File(s)**: pkg/daemon/daemon_policy_invalidate.go,
+  pkg/daemon/policy_rematch_shipped_6723_test.go (new)
