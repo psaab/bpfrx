@@ -68,6 +68,24 @@ type ClusterSessionService interface {
 	// IncludePeer set it stamps the peer node's breakdown onto the response's
 	// Peer field (#3592).
 	GetZonePairSummary(context.Context, *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error)
+
+	// PeerSessions / PeerSessionSummary / PeerZonePairSummary return ONLY the
+	// cluster peer's view, with NO local table walk (#5968).
+	//
+	// The three handlers above already walked the local table themselves before
+	// delegating for include_peer, and then discarded the delegate's local
+	// result — keeping only its Peer field. That was a second full-table
+	// traversal per request, contending with the live session-sync path for the
+	// same per-bucket map locks. #5880 fixed the double-ACQUIRE on this path;
+	// this is the double-WALK, which survived it.
+	//
+	// These are in-process only, so they cost no protobuf or wire change, and
+	// they acquire through the SAME lease-aware limiter the full methods use —
+	// slot accounting is identical before and after, so the #5880 lease
+	// guarantee is preserved rather than quietly retired.
+	PeerSessions(context.Context, *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error)
+	PeerSessionSummary(context.Context) (*pb.GetSessionSummaryResponse, error)
+	PeerZonePairSummary(context.Context) (*pb.GetZonePairSummaryResponse, error)
 }
 
 // CompileHealthSnapshot mirrors daemon.CompileHealth without the import.
