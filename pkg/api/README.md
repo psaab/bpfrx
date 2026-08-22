@@ -76,7 +76,9 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     userspace `Manager.ReadAllPolicyCounters`), then resolves outside the
     lock; a dataplane without the bulk snapshot (test fakes / retired eBPF)
     transparently falls back to the per-policy read, and the skip-and-bump
-    (#3345/#3408) / HTTP-500 degraded-read contracts are unchanged.
+    (#3345/#3408) / HTTP-500 degraded-read contracts are unchanged for a
+    GENUINE read failure. #7016 split the UNPUBLISHED case out of that
+    contract — see the bullet below.
     #4344: the migration is now complete across EVERY policy-counter display
     surface — this endpoint's default-policy row (which had bypassed the
     reader with a standalone sentinel read, M02), the CLI `show security
@@ -88,6 +90,54 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     change — pinned by `TestReadAllPolicyCountersMatchesPerPolicy`); a
     per-surface static canary forbids a new show surface from regressing to
     a direct per-rule `ReadPolicyCounters` call.
+    #7016: an UNPUBLISHED per-rule counter is NOT a read failure. #6743
+    activated the bulk path on all seven observability call sites for the
+    first time, and the bulk reader signals a rule the helper has not
+    published with `dpuserspace.ErrPolicyCounterUnpublished`. Every surface
+    folded that into its degraded-read channel, so a single unpublished rule
+    discarded the WHOLE response: this endpoint returned **HTTP 500**, gRPC
+    `GetPolicies` returned **codes.Internal**, the CLI/gRPC text tables
+    printed `warning: policy counter read failed` naming a fault that does
+    not exist, and the Prometheus collector bumped
+    `xpf_counter_read_errors_total` — a permanent FALSE #3345 alert of the
+    same class #3643 removed the per-zone family to stop. The condition is
+    reachable whenever a counter-eligible rule (`then count`, or system-wide
+    `policy-stats`) exists and the helper has not published its stable rule
+    id: the window before the first 1 Hz status poll lands — `IsLoaded()` is
+    already true because the shim is loaded — or config skew after a
+    non-abort-class apply failure (#5679), where the store has promoted a
+    config the helper is not yet enforcing.
+
+    The disposition is now the one the ZONE half of this handler already
+    used for `dataplane.ErrCounterNotPopulated` (#6843): flag the affected
+    ITEM, serve the response.
+    - REST: 200 with `hit_counters_unavailable:true` on the affected rules
+      (the #5580 field, whose contract now covers loaded-but-unpublished as
+      well as dataplane-unloaded); the rest of the inventory serializes
+      normally.
+    - gRPC `GetPolicies`: the additive `PolicyRule.hit_counters_unavailable`
+      (field 23) carries the same flag; the RPC succeeds. The remote CLI
+      renders `Hit count: not available` / an `n/a` Hits cell.
+    - CLI `show security policies hit-count` / `brief` and the gRPC text
+      hit-count / detail renderers: the count cell reads `n/a` with a
+      trailing `note: N policy counter(s) not yet published by the
+      dataplane`, distinct from the retained `warning: policy counter read
+      failed`.
+    - Prometheus: the sample is still OMITTED (never a `0` standing in for
+      an unknown), but the rule counts into the new
+      `xpf_policy_counters_unpublished_rules` gauge instead of bumping
+      `xpf_counter_read_errors_total`. The gauge is the policy sibling of
+      `xpf_zone_counters_unpopulated_zones` and counts exactly the rules
+      this endpoint reports `hit_counters_unavailable:true` for while the
+      dataplane is loaded. Unlike the zone gauge it is NOT emitted above the
+      dataplane-loaded gate: `Collect` reaches `collectPolicyCounters` only
+      on the loaded path, so an unloaded boot emits no policy family at all
+      (pre-existing) and REST's flag is the signal for that state.
+
+    A GENUINE read failure — the bulk snapshot itself erroring — keeps every
+    pre-#7016 behaviour: HTTP 500, `codes.Internal`, the text warning, and
+    the `xpf_counter_read_errors_total` bump.
+
     The first rule of the first zone-pair set legitimately has runtime id
     0 (`policySetID*MaxRulesPerPolicy + ruleIndex = 0`), and since #3057
     the implicit default policy uses a distinct sentinel (`0xFFFFFFFF`),
@@ -287,8 +337,15 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
 
 Every state-changing route is gated on a **server-derived principal** before it
 reaches its handler. `authz.go` owns the route table and the middleware; the
-decision itself lives in `pkg/authz` so the gRPC surface can reach the same
-verdict when #5278 lands.
+decision itself lives in `pkg/authz` so the gRPC surface reaches the same
+verdict. That gRPC leg has since landed (#5278) — see
+[`pkg/grpcapi/README.md`](../grpcapi/README.md) "Server-side authorization",
+which documents where the two legs deliberately differ: gRPC gates READS too,
+has no `api-auth` credential and therefore no precedence rule, resolves the peer
+inline (grpc-go calls its accept hook off the accept loop, `http.Server` does
+not), and prices the multiplexed `SystemAction` verb-by-verb because a unary
+interceptor is handed the decoded request that this middleware deliberately
+never reads.
 
 **Why the loopback bind was not enough.** The daemon provisions every `system
 login user` a real shell account (`useradd -m -s /bin/bash`), and the CLI's RBAC
@@ -943,7 +1000,12 @@ count, and the outcome is fail-closed.
 — is unchanged and remains reachable by any local process on a loopback bind.
 #5561 is scoped to the mutation surface; a read-side principal check is a
 separate question with a different blast radius (`/metrics` scrapers, health
-probes).
+probes). The gRPC leg (#5278) made the opposite call on ITS surface and gates
+reads as well, because its read surface has no scraper population: nothing polls
+`GetSessions` on a timer, and `show configuration` there is exactly the render a
+`config-viewer` class exists to scope. The two legs therefore disagree about
+read gating BY DESIGN, and this is the sentence that says so rather than leaving
+a reader to infer a bug.
 
 ## Callers
 

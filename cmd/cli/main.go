@@ -53,15 +53,16 @@ func dialOpts(extra ...grpc.DialOption) []grpc.DialOption {
 // resolveUsername returns the identity the remote CLI displays in its prompt.
 //
 // #6701: it is derived from the KERNEL (real uid -> passwd, pkg/osident), never
-// from `$USER`. `cli` is an unprivileged client — the RBAC boundary it should
-// be behind lives on the gRPC listener and does not exist yet (#5278) — so this
-// is not itself an authorization decision today. It is still fixed here for two
-// reasons: a prompt sourced from a caller-controlled environment variable
-// renders whatever the caller typed (`USER=root cli` prints a root prompt to a
-// read-only operator), and when #5278 wires per-principal auth onto the socket
-// it must find the identity already coming from the credential rather than the
-// environment. An unresolvable identity renders as `uid-<n>` rather than the
-// old fabricated "remote" placeholder, which read like a real account.
+// from `$USER`. `cli` is an unprivileged client and this is NOT an
+// authorization decision — the RBAC boundary lives on the gRPC listener, which
+// since #5278 derives the caller's identity server-side from the kernel's
+// socket table and enforces the login class there. What is rendered here is the
+// prompt, and it is derived the same way so the two agree: a prompt sourced
+// from a caller-controlled environment variable renders whatever the caller
+// typed (`USER=root cli` printed a root prompt to a read-only operator whose
+// RPCs the server would refuse), which is a misleading UI rather than a bypass.
+// An unresolvable identity renders as `uid-<n>` rather than the old fabricated
+// "remote" placeholder, which read like a real account.
 func resolveUsername() string {
 	return osident.Current().String()
 }

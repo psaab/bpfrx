@@ -86,6 +86,23 @@ var slotEscNatStatic = append(append([]string{}, slotEscZones...),
 	"set security nat static rule-set RT rule R1 then static-nat prefix 10.0.9.5/32",
 )
 
+// slotEscNatStaticSrc is slotEscNatStatic plus a valid `match
+// destination-address`, for the rows whose leaf under test is NOT that one.
+//
+// #7216: a static-NAT rule with no `match destination-address` selects an EMPTY
+// external prefix, lowers ExternalIP as "" and is dropped whole by the
+// dataplane, so it is refused at strict commit. The slot-escape harness needs
+// its CONTROL (scaffold + the leaf's GOOD value) to commit clean or the row
+// cannot distinguish a slot-1 escape from a broken fixture — and it says so
+// with "fixture broken", which is how this was caught.
+//
+// The `nat static match destination-address` row must NOT use this: that row
+// supplies the destination value itself, and a second distinct prefix beside it
+// would trip the #6659 cardinality gate instead.
+var slotEscNatStaticSrc = append(append([]string{}, slotEscNatStatic...),
+	"set security nat static rule-set RT rule R1 match destination-address 10.6.0.1/32",
+)
+
 var slotEscPolicyOptions = []string{
 	"set policy-options policy-statement PS term t1 then accept",
 	"set policy-options community C1 members 65000:1",
@@ -304,7 +321,7 @@ func slotEscapeRows() []slotEscapeRow {
 			slotEscNatStatic,
 			"set security nat static rule-set RT rule R1 match destination-address", "10.6.0.1/32", "999.1.1.1/24"},
 		{"nat static match source-address", "security nat static rule-set <*> rule <*> match source-address",
-			slotEscNatStatic,
+			slotEscNatStaticSrc,
 			"set security nat static rule-set RT rule R1 match source-address", "10.5.0.0/24", "999.1.1.1/24"},
 
 		// -- routing policy -------------------------------------------------------
