@@ -6956,7 +6956,7 @@ fn local_allocation_survives_sibling_replica_reaps_6522() {
     // SIBLING worker (never worker 0 — `peer_worker_commands` excludes self).
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, sibling,
+            &rules, &key, decision, false, None, 1_000, sibling,
         );
     }
 
@@ -6988,7 +6988,7 @@ fn local_allocation_frees_when_the_owning_worker_reaps_6522() {
 
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, sibling,
+            &rules, &key, decision, false, None, 1_000, sibling,
         );
         release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
     }
@@ -7064,7 +7064,7 @@ fn local_address_only_token_survives_sibling_replica_reaps_6522() {
     let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, sibling,
+            &rules, &key, decision, false, None, 1_000, sibling,
         );
     }
     for sibling in 1..6u32 {
@@ -7168,6 +7168,7 @@ fn snat_lookup_6528(
         NS_PER_SEC,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     )
 }
