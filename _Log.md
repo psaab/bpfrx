@@ -1,3 +1,36 @@
+## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
+
+- **Timestamp**: 2026-08-21
+- **Action**: Gated all six gRPC NAT full-table conntrack walks on the
+  shared `diagcmd.SessionWalkLimiter` the REST twin got in #6216:
+  `GetNATPoolStats` and `GetNATDestination` via `AcquireCtx` (with the
+  lease sampled inside `countNATSessions`' v4 and v6 callbacks), and the
+  four `ShowText` topics `persistent-nat`, `persistent-nat-detail`,
+  `nat-source-rule-detail`, `nat-dest-rule-detail` via the plain
+  `Acquire` ShowText precedent — those reach `pkg/natshow`, which is
+  shared with `pkg/cli` and takes no ctx, so the cancellation half is a
+  stated residual with a successor issue. Gate placement is inside the
+  dataplane-loaded branch, not at the handler top, so a config-only read
+  is never refused (a negative control pins that). Also centralised the
+  NAT pool port formula into `config.NATPoolTotalPorts` — five copies,
+  only REST carried the `portHigh >= portLow` guard.
+  Mutation matrix: P1/P2 (drop admission from each RPC) → that surface's
+  cell reds; P3 (ShowText gate neutered) → the four ShowText cells red;
+  P4 (drop ctx sampling) → the cancellation probe reds; P5 (hoist
+  admission to the handler top) → the no-dataplane negative control
+  reds; P6 (re-inline the port formula) → the SSOT guard reds.
+  NOTE: acceptance criterion 2 (a structural "every full-table-scan
+  surface declares an admission policy" test) is deliberately NOT
+  attempted — open #7294 owns it and records that the AST approach was
+  tried and abandoned as too brittle. #5968 is closed and its inventory
+  does not name these surfaces, so this is not a dup.
+- **File(s)**: pkg/grpcapi/server_nat.go, pkg/grpcapi/server_helpers.go,
+  pkg/grpcapi/server_show_nat.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/nat_walk_admission_6553_test.go,
+  pkg/grpcapi/nat_walk_admission_6553_helper_test.go,
+  pkg/config/nat_pool_ports.go, pkg/api/nat.go, pkg/api/metrics_nat.go,
+  pkg/cli/cli_show_nat.go, pkg/api/README.md
+
 ## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
 
 - **Timestamp**: 2026-08-22

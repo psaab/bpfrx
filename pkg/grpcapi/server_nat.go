@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -52,7 +53,7 @@ func (s *Server) GetNATSource(_ context.Context, _ *pb.GetNATSourceRequest) (*pb
 	return resp, nil
 }
 
-func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationRequest) (*pb.GetNATDestinationResponse, error) {
+func (s *Server) GetNATDestination(ctx context.Context, _ *pb.GetNATDestinationRequest) (*pb.GetNATDestinationResponse, error) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil || cfg.Security.NAT.Destination == nil {
 		return &pb.GetNATDestinationResponse{}, nil
@@ -80,6 +81,17 @@ func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationReq
 
 	// Count active DNAT sessions and per-rule-set breakdown
 	if s.dataplaneLoaded() {
+		// #6553: same admission contract as GetNATPoolStats above. This walk
+		// has no REST counterpart at all (natDestHandler does not scan), so it
+		// was the only NAT surface on any transport driving an ungated
+		// full-table walk.
+		release, walkCtx, err := sessionWalkLimiter.AcquireCtx(ctx)
+		if err != nil {
+			return nil, status.Error(codes.ResourceExhausted,
+				"nat destination stats concurrency limit reached; retry shortly")
+		}
+		defer release()
+
 		var zoneByID map[uint16]string
 		if cr := s.applyResult(); cr != nil {
 			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
@@ -87,7 +99,7 @@ func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationReq
 				zoneByID[id] = name
 			}
 		}
-		counts := s.countDNATSessions(zoneByID)
+		counts := s.countDNATSessions(walkCtx, zoneByID)
 		resp.TotalActiveTranslations = clampInt32(counts.total)
 		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
 			key := natRuleSetKey{rs.FromZone, rs.ToZone}
@@ -104,7 +116,7 @@ func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationReq
 	return resp, nil
 }
 
-func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest) (*pb.GetNATPoolStatsResponse, error) {
+func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsRequest) (*pb.GetNATPoolStatsResponse, error) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
 		return &pb.GetNATPoolStatsResponse{}, nil
@@ -123,13 +135,14 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		// Compute the port-pool size in int64: (portHigh-portLow+1) *
-		// len(Addresses) can exceed int32 for a large pool (e.g. a /16
-		// address range over the default 64512-port window is ~4.2e9),
-		// and a bare int32() cast would wrap negative and corrupt the
-		// avail=total-used display. Saturate to int32 max when assigning
-		// the int32 proto fields (#2282).
-		totalPorts64 := int64(portHigh-portLow+1) * int64(len(pool.Addresses))
+		// Port-pool size, in int64 and via the single shared formula: it can
+		// exceed int32 for a large pool (a /16 over the default 64512-port
+		// window is ~4.2e9) and a bare int32() cast would wrap negative and
+		// corrupt the avail=total-used display, so proto assignment saturates
+		// through clampInt32 (#2282). config.NATPoolTotalPorts also carries
+		// the portHigh >= portLow guard REST had and the other three surfaces
+		// did not (#6553).
+		totalPorts64 := config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))
 		var used64 int64
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {
@@ -167,6 +180,21 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 	// Count active SNAT sessions and per-rule-set breakdown
 	var counts natSessionCounts
 	if s.dataplaneLoaded() {
+		// #6553: this is a full v4+v6 conntrack walk and it had NO admission
+		// gate — the REST twin acquired one in #6216. Take the slot at this
+		// external trust boundary, inside the dataplane-loaded branch so a
+		// config-only response is never refused, and honour the returned lease
+		// context so a disconnected client's walk stops instead of holding a
+		// slot the (hardened) REST surface is queueing for. The two surfaces
+		// share ONE 4-slot diagcmd.SessionWalkLimiter, so the un-hardened one
+		// starves the hardened one.
+		release, walkCtx, err := sessionWalkLimiter.AcquireCtx(ctx)
+		if err != nil {
+			return nil, status.Error(codes.ResourceExhausted,
+				"nat pool stats concurrency limit reached; retry shortly")
+		}
+		defer release()
+
 		var zoneByID map[uint16]string
 		if cr != nil {
 			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
@@ -174,7 +202,7 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 				zoneByID[id] = name
 			}
 		}
-		counts = s.countSNATSessions(zoneByID)
+		counts = s.countSNATSessions(walkCtx, zoneByID)
 	}
 	resp.TotalActiveTranslations = clampInt32(counts.total)
 
