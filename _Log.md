@@ -103777,3 +103777,18 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
   `pkg/cluster/manager.go`,
   `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)
+
+## 2026-08-22 — #7489 the #6460 bypass argument covered only one plane
+- **Action**: The #6460 DHCP host-inbound advisory told the operator the token
+  gates nothing on v4 because "the AF_PACKET tap is upstream of netfilter" — an
+  argument about ONE of two enforcement planes. The AF_XDP userspace dataplane
+  enforces host-inbound fail-closed on local delivery, and a packet dropped there
+  never reaches the kernel, so AF_PACKET cannot see it (MEASURED on the loss
+  userspace cluster: +22 denies, 0 packets on `tcpdump -ni any`). The advisory's
+  CONCLUSION survives — a DHCPv4 request is a 255.255.255.255 broadcast, which
+  the shim hands to the kernel before userspace — but the reasoning was too
+  broad. Message and header now name the destination and both planes; the doc
+  records the measurement and the interface-mode-SNAT exception.
+- **File(s)**: `pkg/config/compiler_validate_warn_dhcp_hostinbound.go`,
+  `pkg/config/dhcp_hostinbound_plane_scope_7489_test.go` (new),
+  `docs/host-inbound-multicast.md`
