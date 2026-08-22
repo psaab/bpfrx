@@ -157,8 +157,23 @@ type RoutingOptionsConfig struct {
 	// ForwardingTableExport remains what the FRR renderer consumes (resolveECMP
 	// derives ecmpMaxPaths from exactly one policy-statement).
 	// validateForwardingTableExportSingleStrict rejects a multi-valued list
-	// rather than letting it silently collapse. Honouring a full Junos export
-	// policy CHAIN is a separate renderer change, not this fix (#6674).
+	// rather than letting it silently collapse.
+	//
+	// #6674 RATIFIED that rejection as the permanent contract rather than a
+	// pending feature, and the reason is worth stating because "Junos takes a
+	// chain here" is true and still does not make a chain implementable.
+	// resolveECMP derives exactly TWO booleans from the ONE named policy: any
+	// term with a load-balance action sets ecmpMaxPaths to 64, and any term
+	// with `consistent-hash` sets fc.ConsistentHash. It evaluates no `from`
+	// match, no term order, and no terminating action. Junos evaluates an
+	// export chain PER ROUTE and stops at the first terminating action, so the
+	// only cheap composition — OR the flags across the chain — is NOT Junos: a
+	// route accepted by the first policy never reaches the second, yet the OR
+	// would apply the second's load-balance to it. And the faithful reading
+	// cannot be expressed at all, because the value being derived is FRR's
+	// global `maximum-paths`, which has no per-route form. Supporting a chain
+	// therefore needs a per-route forwarding-policy model xpf does not have —
+	// a feature, tracked separately, not a bug in this read.
 	//
 	// #6673: the scalar is NOT element [0] of this list, and the list is read
 	// with multiLeafAuthoredValues so empty values are KEPT. Two shapes make

@@ -155,6 +155,38 @@ impl Default for PolicyAction {
 /// by a cross-language contract test in pkg/dataplane/userspace).
 pub(crate) const DEFAULT_POLICY_SENTINEL_ID: u32 = u32::MAX;
 
+/// #6682: transit flows refused because their INGRESS interface is in no
+/// security zone.
+///
+/// Zone id 0 is the "unknown / no zone" sentinel — `StableZoneID` folds every
+/// CONFIGURED zone into [1, 65533], so 0 is never a real zone. The #3110 guard
+/// below already refuses to match ANY rule tier for such a flow, including
+/// `from-zone any to-zone any` and `junos-global`. What it did not do was stop
+/// the flow from falling through to the IMPLICIT DEFAULT policy, and with
+/// `set security policies default-policy permit-all` that default is a PERMIT —
+/// so transit on an interface the operator never put in a zone was forwarded,
+/// with screen/IDS checks already skipped (an unresolvable ingress zone returns
+/// `ScreenCheckOutcome::Pass`, there being no per-zone screen profile to apply).
+///
+/// Junos does not forward transit on an unzoned interface at all, so the
+/// disposition is a deny rather than a default.
+///
+/// It is counted HERE rather than on `default_counter` so the two causes stay
+/// distinguishable: a rising default-deny count means policy is working as
+/// configured, whereas a rising count here means an interface fell out of its
+/// zone, which is a configuration fault the operator wants to see.
+///
+/// The RT_FLOW `policy_id` still carries `DEFAULT_POLICY_SENTINEL_ID`, so the
+/// deny LOGS as `default-policy`. That is deliberate scope, not an oversight: a
+/// dedicated sentinel is a wire-visible value mirrored across ~10 Go call sites
+/// (display maps, counter readers, the #4342 invalidation sweep, gRPC/CLI/API)
+/// and interacts with the #4626 policy-id-0 handling, which is far more surface
+/// than this fix needs. `default-policy` is honest — no rule matched — just
+/// less specific than this counter. A distinct log reason is worth doing on its
+/// own, not folded in here.
+pub(crate) static UNZONED_INGRESS_DENIED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// #3363: stable rule identity under which the IMPLICIT default-policy hit
 /// counter is reported in [`PolicyState::counter_snapshots`] (and persisted in
 /// the [`PolicyCounterStore`] across snapshot rebuilds). The real per-rule
@@ -2891,6 +2923,39 @@ pub(crate) fn evaluate_policy_result_l3_aware(
                 ),
             }
         }
+    }
+    // #6682: an unzoned INGRESS must not reach the implicit default policy.
+    //
+    // The #3110 block above is skipped entirely when either zone id is 0, which
+    // correctly stops every rule tier — zone-pair, from-any, to-any, both-any
+    // and junos-global — from matching. The flow then landed on the implicit
+    // default, and `default-policy permit-all` made that a PERMIT: transit
+    // forwarded on an interface in no zone, with screens already skipped. An
+    // operator asking for permit-all is asking what to do with traffic that
+    // matched no policy, not asking to forward traffic that had no zone to be
+    // adjudicated in.
+    //
+    // Scoped to the INGRESS side deliberately. An unzoned ingress is
+    // unambiguous — Junos does not pass transit on an interface that is in no
+    // zone. A zero EGRESS zone has historically had causes that were bugs
+    // elsewhere rather than genuine unzoned-ness (#6713: an xfrmi tunnel egress
+    // resolved to 0 because `populate_egress` needed a link-layer address a
+    // MAC-less interface does not have), so denying on `to_id` would risk
+    // black-holing a correctly-configured path to fix a case that has not been
+    // shown to occur. It still falls through to the default below.
+    //
+    // Host-inbound is NOT affected: the LocalDelivery arm adjudicates through
+    // `evaluate_junos_host_policy_l3_aware`, which already declines `from_id ==
+    // 0` on its own, and both production callers of this function are transit
+    // (`ForwardCandidate` and the flowless MissingNeighbor arm). Management on
+    // an unzoned fxp0 cannot be locked out by this.
+    if from_id == 0 {
+        UNZONED_INGRESS_DENIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return PolicyEvaluationResult {
+            action: PolicyAction::Deny,
+            policy_id: DEFAULT_POLICY_SENTINEL_ID,
+            ..PolicyEvaluationResult::default()
+        };
     }
     // #4569: a flowless fragment that reaches the implicit default policy still
     // fails closed against a port-bearing DENY it skipped. If the default is

@@ -87,12 +87,18 @@ import (
 // renderPlaintextUnadjudicatedAdvisory.
 //
 // It fires whenever a WireGuard tunnel is configured, NOT only when one carries
-// a zone. Leaving the tunnel out of a zone is not a mitigation: an interface in
-// no zone resolves to zone id 0, and a `from-zone any to-zone any permit` rule
-// matches zone-pair (0,0) with no zone guard (#6682). So an unzoned tunnel's
-// plaintext is not merely unpoliced — it can be affirmatively PERMITTED by a
-// wildcard rule. Gating this advisory on zoning would tell that operator
+// a zone. Leaving the tunnel out of a zone is not a mitigation: the decrypted
+// inner packet is written straight to the wgN TUN and routed by the kernel, so
+// it never reaches zone policy at all — zoning or not zoning the interface does
+// not change that. Gating this advisory on zoning would tell that operator
 // nothing at all.
+//
+// #6682: this comment used to add that an unzoned interface resolves to zone id
+// 0 and could be "affirmatively PERMITTED by a wildcard rule". That was never
+// true — #3110 has fenced every rule tier, wildcard tiers included, against
+// zone 0 since before the claim was written — and #6682 made an unzoned INGRESS
+// an explicit deny on top of that. The advisory still fires for the reason
+// above.
 //
 // The two groups are worded differently on purpose. A ZONED tunnel is the acute
 // case and reads as an escalation, because `set security zones security-zone

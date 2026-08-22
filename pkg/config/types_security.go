@@ -1007,8 +1007,14 @@ type StaticNATRule struct {
 	// so a rule with more than one prefix has no representable meaning today.
 	// validateStaticNATMatchAddressesStrict therefore REJECTS a multi-valued
 	// list at commit rather than letting it silently collapse to the first.
-	// Widening static NAT to fan one rule into N external prefixes is a
-	// separate semantic change (see #6674), not this fix.
+	//
+	// #6674 RATIFIED that rejection as the permanent contract. A static-NAT
+	// rule is a 1:1 mapping: ONE `match destination-address` against ONE
+	// `then static-nat prefix` (Then, below). N external prefixes against one
+	// internal prefix names no target, so fanning the rule into N rows would
+	// have to invent a pairing rule Junos does not define — and `rule R1` /
+	// `rule R2` already expresses the intent exactly. The `multi: true` on the
+	// schema leaf is an xpf over-advertisement of the grammar, not a promise.
 	//
 	// #6673: read with multiLeafAuthoredValues, which KEEPS empty values, so this
 	// list always contains what Match selected; an empty entry is a selection, not

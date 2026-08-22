@@ -370,7 +370,33 @@ Every peer-MAC resolution that reaches the dataplane is keyed on the
   so re-duplicating the mask AND deleting a check outright are both
   caught. Note that `usableNUD` in `daemon_neighbor_listener.go` is a
   DIFFERENT set (it admits `NUD_NOARP` and is a publish-time filter for
-  the neighbour snapshot) and is deliberately not folded in.
+  the neighbour snapshot) and is deliberately not folded in. #7443 wrote
+  that separation into a comment at BOTH masks, each naming the other and
+  the question it answers, so a future single-sourcing pass cannot read
+  the divergence as drift and "fix" it. What is recorded is that keeping
+  them apart is deliberate; what is NOT recorded anywhere is a rationale
+  for excluding `NUD_NOARP` from `FabricNeighValidStates` specifically,
+  and the comment says so rather than inventing one.
+
+  **The live resolver is bound by a test, not just the helper it calls
+  (#7443).** #6598's coverage was a table over `selectFabricPeerMAC` plus
+  the AST scan above. Neither executed `buildFabricPeerMAC`, so restoring
+  that function's body to the pre-#6598 inline loop — the exact shipped
+  defect — passed `go vet` and both full suites; `selectFabricPeerMAC`
+  went dead under the revert, but Go does not error on an unused
+  package-level function and this repo runs no `unused`/staticcheck gate,
+  so nothing complained. The netlink read now goes through the
+  `fabricNeighListFn` seam (same shape as `ruleListFn` in `routes.go`, and
+  as the `d.linkByNameFn`/`d.neighListFn` seams #6554 added for this
+  purpose), and `fabric_peer_mac_binding_7443_test.go` drives the real
+  resolver against a synthetic neighbour table: a `NUD_FAILED` entry
+  holding the peer's old lladdr must not become the redirect MAC, the
+  overlay→parent fallback must survive rejecting the overlay entry, a
+  usable overlay entry must stop the search, and a v6 peer must be looked
+  up on `FAMILY_V6`. Restoring the pre-#6598 body now fails on an
+  assertion — `buildFabricPeerMAC = "02:bf:72:cc:00:01", want ""` — with
+  `go vet` still clean; with the new fixture removed the same revert goes
+  green again, which is what makes it a closure rather than a claim.
 - The Rust redirect's own late resolution
   (`resolve_fabric_links_from_snapshots`) looks the peer up in
   `dynamic_neighbors` keyed on `(ifindex, peer_addr)`.
