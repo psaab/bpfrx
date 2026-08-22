@@ -1,3 +1,20 @@
+## 2026-08-22 — #6502 day-0 loader probe order (labeled-first contract)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The day-0 config loader concatenated its labeled-volume
+  and iso9660 probe passes and piped them through `sort -u`, which
+  ALPHABETIZES — so with two valid-but-different media attached the ISO
+  on /dev/sda beat the labeled volume on /dev/sdb, the exact opposite
+  of the labeled-first contract the surrounding comment states.
+  Replaced with `awk 'NF && !seen[$0]++'` over the concatenated stream,
+  which preserves first-appearance order AND dedups ACROSS passes — a
+  medium that is both labeled and iso9660 appears once, in its LABELED
+  position. The self-correcting cases are preserved: a REJECTED labeled
+  volume and an EMPTY labeled volume both still fall through to the
+  ISO, so the fix does not become "labeled or nothing".
+- **File(s)**: scripts/image/xpf-day0-config,
+  scripts/image/test_day0_probe_order_6502.py
+
 ## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
 
 - **Timestamp**: 2026-08-22
