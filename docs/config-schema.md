@@ -4000,6 +4000,55 @@ issues: only #6821 sits in the blind spot. `#6736`, `#6817`, `#6953`, `#6966`
 and `#7033` all have leaves the differential compares today, so their defects
 escaped for some other reason and closing them as one cohort would be wrong.
 
+### Parent prerequisites, and what the `unreachable` bucket actually is (#7492)
+
+The harness authors a leaf **alone** inside its synthetic parent path. Some
+compilers refuse to build the container until a required sibling is present, and
+then the leaf never reaches the compiler at all: every spelling compiles to the
+same thing, the differential calls them all `inert`, and the leaf drops out of
+coverage. `gateParentPrereq` names the statement(s) that make such a container
+materialise, injected identically into the zero-, one- and two-value configs so
+it **cancels out of every comparison** — it decides only whether there is a
+comparison to make.
+
+A row is **not** an allowlist entry: it asserts nothing about the leaf, claims no
+defect, and cannot hide one. It is refused outright if it would author the leaf
+under test, so a prerequisite can never supply the value it exists to make
+observable (`TestGateParentPrereqRefusesToAuthorTheLeafUnderTest_7492`).
+
+**#7492's own premise turned out to be mostly wrong, and that is the useful
+result.** The issue assumed the 228 `unreachable` leaves were largely a
+parent-path synthesis problem. Measured, they are not:
+
+- **A general mechanism was tried first and refuted.** Scaffolding each parent
+  with its own other childless leaves — values drawn from the gate's candidate
+  pool, keeping any that compiled — recovered **2 of 228**.
+- **Most plausible per-parent recipes do not work either.** Probed directly and
+  all still lose the value: `system syslog host <*>` with `any any`,
+  `interfaces <*> unit <*> tunnel` with `source` + `destination`,
+  `… vrrp-group <*>` with a `virtual-address`, and
+  `dhcp-local-server … interface <*>` with an `upto` sibling.
+- **One recipe works**, and it is in the table: a BGP group with no `neighbor` is
+  discarded wholesale, so every group-level leaf looked inert.
+
+So a per-parent prerequisite table is the right mechanism for a *minority* of the
+bucket. The remaining ~215 are something else: a coarse probe (does the parent
+path produce any output at all?) suggests most parents DO produce output while
+the leaf stays unreflected — but that signal is unreliable, because an OUTER
+object materialising is not the same as the innermost container materialising
+(`chassis { cluster { … } }` yields a non-nil `Chassis` with a nil `Cluster`).
+The next investigation needs a per-parent answer to two questions the current
+probes cannot separate: does the innermost container materialise, and is the leaf
+read by the compiler at that path at all. The second would be the #6696 class —
+`setSchema` advertising a knob nothing implements.
+
+**A blind-spot count that RISES after a fix can be the fix working.** Adding the
+BGP row moved 13 leaves out of `unreachable`: **10 became compared, and 3 were
+revealed to be `flag`s** once their container materialised and the classifier
+could finally see them. The `flag` ceiling therefore goes UP (158 → 161) in the
+same change that improves coverage. The population changed; a pre-fix number
+carried forward as a target would have read that as a regression.
+
 **The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
 SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
 puts values in both AST slots of one node, which is exactly what an either/or

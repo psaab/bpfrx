@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -102,13 +103,23 @@ func gateLeafCompared(g gateLeaf) bool {
 // valueMoves (a value demonstrably reaching the compiler outranks any
 // explanation that says it did not), then the flag/unreachable split.
 func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
-	noLeaf, errNo := gateCompileBrace(gateBraceConfig(g.path, ""))
-	bare, errBare := gateCompileBrace(gateBraceConfig(g.path, g.leaf+";"))
+	// #7492: apply the same parent prerequisite the differential uses, or the
+	// classifier reasons about a different config than the gate it explains —
+	// a leaf the prerequisite rescued would still be reported as unreachable.
+	pre, _ := gateLeafPrereq(g)
+	withPre := func(stmt string) (string, error) {
+		if pre != "" {
+			stmt = pre + " " + stmt
+		}
+		return gateCompileBrace(gateBraceConfig(g.path, stmt))
+	}
+	noLeaf, errNo := withPre("")
+	bare, errBare := withPre(g.leaf + ";")
 	if errNo != nil || errBare != nil {
 		return gateBlindErr
 	}
 	for _, vp := range gateValuePairs {
-		withVal, err := gateCompileBrace(gateBraceConfig(g.path, g.leaf+" "+vp.v1+";"))
+		withVal, err := withPre(g.leaf + " " + vp.v1 + ";")
 		if err != nil {
 			continue
 		}
@@ -137,11 +148,16 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // Measured at 6b47801de. Raising a ceiling is a real decision: it says a leaf
 // the #2419 class can hide in was added on purpose.
 // ---------------------------------------------------------------------------
-const gateCoverageFloor = 619
+const gateCoverageFloor = 629
 
 var gateBlindCeiling = map[gateBlindClass]int{
-	gateBlindUnreachable: 228,
-	gateBlindFlag:        158,
+	// #7492 moved 13 leaves out of `unreachable`: 10 became COMPARED and 3 were
+	// revealed to be flags once the parent prerequisite let their container
+	// materialise. That is why the flag ceiling RISES here — the population
+	// changed, and a blind-spot count going up after a fix is the fix working,
+	// not a regression. Never carry a pre-fix number forward as a target.
+	gateBlindUnreachable: 215,
+	gateBlindFlag:        161,
 	gateBlindErr:         43,
 	gateBlindValueMoves:  1,
 }
@@ -277,5 +293,38 @@ func TestZeroArgLeavesCanStillBeValueBearing_7484(t *testing.T) {
 			"  reaching them. Do NOT respond by excluding args==0 leaves from coverage:\n"+
 			"  that is what this test exists to prevent (%d such leaves are enumerated).",
 			zeroArgs)
+	}
+}
+
+// TestGateParentPrereqRefusesToAuthorTheLeafUnderTest_7492 binds the guard in
+// gateLeafPrereq, which no table row currently exercises — the one shipped row
+// names `neighbor`, a container, and containers are never enumerated as leaves.
+// An unexercised guard is a claim, and a claim owes a test: without this, the
+// refusal could be deleted and nothing would notice until a future row happened
+// to collide, at which point the prerequisite would author the very value it
+// exists to make observable and the leaf would compare against itself.
+func TestGateParentPrereqRefusesToAuthorTheLeafUnderTest_7492(t *testing.T) {
+	const key = "zzq-7492-synthetic-parent"
+	gateParentPrereq[key] = "collide 10.211.199.1; other 7;"
+	defer delete(gateParentPrereq, key)
+
+	// A leaf whose name collides with the prerequisite's first statement.
+	collide := gateLeaf{path: []string{key}, leaf: "collide"}
+	if body, sets := gateLeafPrereq(collide); body != "" || sets != nil {
+		t.Errorf("prerequisite was applied to the leaf it names: body=%q sets=%v.\n"+
+			"  The row would author `collide`, so the zero/one/two configs would all\n"+
+			"  already contain a value for the leaf under test and the differential\n"+
+			"  would be comparing the leaf against itself.", body, sets)
+	}
+	// A non-colliding leaf under the same parent still gets it.
+	fine := gateLeaf{path: []string{key}, leaf: "somethingelse"}
+	body, sets := gateLeafPrereq(fine)
+	if body == "" || len(sets) != 2 {
+		t.Errorf("a non-colliding leaf must still receive the prerequisite; got body=%q sets=%v", body, sets)
+	}
+	for _, cmd := range sets {
+		if !strings.HasPrefix(cmd, "set "+key+" ") {
+			t.Errorf("set-spelling prerequisite must be rooted at the PARENT path, got %q", cmd)
+		}
 	}
 }
