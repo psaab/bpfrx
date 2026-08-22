@@ -2210,8 +2210,29 @@ under the daemon's errgroup. Nothing else imports this package.
     path is a no-op). Pinned by `TestAcquireCtx_5880` (mechanism),
     `TestGetSessions_InProcessLeaseReuse_5880` (gRPC reuse at cap 1), and
     `TestRESTIncludePeerReusesLease_5880` (REST include_peer succeeds at cap 1),
-    each RED on revert. The BROADER redesign #5880 also asks for — structural
-    per-surface admission via a registration/source-level test, weighted cost for
+    each RED on revert.
+    **#5968 removes the redundant local WALK on the same path.** #5880 fixed the
+    double-ACQUIRE; the delegation still walked the local table TWICE. The REST
+    handler builds its own local list/summary/breakdown and then called the
+    in-process gRPC method purely for `.Peer`, discarding that method's own local
+    result — a second full v4+v6 traversal per request, contending with the live
+    session-sync path for the same per-bucket map locks. The three handlers now
+    delegate to `PeerSessions` / `PeerSessionSummary` / `PeerZonePairSummary`,
+    in-process-only methods on `ClusterSessionService` that fetch the peer view
+    with NO local walk. They cost no protobuf or wire change (the REST bridge and
+    the gRPC server are the same process), and they acquire through the SAME
+    lease-aware `AcquireCtx` the full methods use — slot accounting is identical
+    before and after, so the #5880 lease guarantee is preserved rather than
+    quietly retired by a path that never acquires. Peer-status classification
+    (#5320 OK / UNREACHABLE / NOT_APPLICABLE) is single-sourced in
+    `attachPeerSessionSummary` / `attachPeerZonePairSummary`, shared with the
+    full paths, because a divergence there would always be a bug. Pinned by
+    `pkg/grpcapi/peer_only_5968_test.go`: a walk-counting dataplane proves ZERO
+    local traversals, with `GetSessions` on the same server as the positive
+    control so the assertion cannot be satisfied by a dataplane that never
+    iterates.
+    The rest of the redesign #5880/#5968 ask for — structural per-surface
+    admission via a registration/source-level test, weighted cost for
     local+peer/cursor/clear, and a separate remote budget — is deferred to a
     follow-up.
     **#5779 extends the SAME shared bound to the session-CLEAR (mutation)

@@ -72,7 +72,7 @@ func TestRESTZonePairsIncludePeer(t *testing.T) {
 	if resp.Peer != nil {
 		t.Fatal("zone-pairs peer set without include_peer")
 	}
-	if fake.zpCalled {
+	if fake.peerZPCalled || fake.zpCalled {
 		t.Fatal("peer zone-pair summary fetched without include_peer")
 	}
 	// The local breakdown from oneSessionDP is a single zone-2 -> zone-3 TCP row.
@@ -89,7 +89,8 @@ func TestRESTZonePairsIncludePeer(t *testing.T) {
 		t.Fatalf("include_peer status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
 	resp = decodeZonePairs(t, rr.Body.Bytes())
-	if !fake.zpCalled || fake.zpReq == nil || !fake.zpReq.GetIncludePeer() {
+	// #5968: delegated to PeerZonePairSummary, which takes no request.
+	if !fake.peerZPCalled {
 		t.Fatal("include_peer=true did not fetch the peer zone-pair summary via the HA-aware service")
 	}
 	if resp.NodeID != 7 {
