@@ -101149,3 +101149,17 @@ prose edit above them added. No diff falls in the new test body.
   as `unitRunsDHCPForFamily`.
 - **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
   pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
+
+## 2026-08-21 — #6548: console `load ... terminal` aborts on Ctrl-C
+- **Timestamp**: 2026-08-21
+- **Action**: `pkg/cli` handleLoad's terminal read loop took the same `break`
+  for EOF, `readline.ErrInterrupt` and every read error, then applied the
+  PARTIAL paste and printed a success message — the #4883-D bug, fixed on the
+  remote CLI and never applied to the console. The loop is now single-sourced
+  in the new `pkg/cliterm` (a divergence between the two surfaces is always a
+  bug) and both CLIs call it; only Ctrl-D commits. Added a `CLI.readLineFn`
+  test seam so the loop is drivable at all — it was unguarded for exactly as
+  long as it was undrivable.
+- **File(s)**: pkg/cliterm/terminal.go (new), pkg/cliterm/terminal_test.go
+  (new), pkg/cli/cli_config.go, pkg/cli/cli.go, cmd/cli/main.go,
+  pkg/cli/load_terminal_abort_6548_test.go (new), pkg/cli/README.md, _Log.md

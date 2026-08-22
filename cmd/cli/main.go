@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/psaab/xpf/pkg/cliterm"
 	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -537,28 +538,16 @@ func (c *ctl) handleTraceroute(args []string) error {
 // input is COMMITTED by Ctrl-D (io.EOF). A readline.ErrInterrupt (Ctrl-C) or
 // any other read error is an ABORT: the partial input is discarded and a
 // non-nil error is returned so handleLoad does NOT apply a truncated subset of
-// the config as if it were complete.
+// the config as if it were complete (#4883-D).
 //
-// Before this the read loop took the same `break` for EOF, ErrInterrupt, and
-// every read error, then joined whatever lines had been collected and Loaded
-// them — printing "load ... complete". Aborting a paste with Ctrl-C could
-// therefore silently apply a valid prefix while omitting later
-// policies/services/interfaces (#4883-D). Only EOF commits.
+// The implementation moved to pkg/cliterm in #6548. It was duplicated in the
+// local console CLI (pkg/cli handleLoad), the copies DIVERGED — #4883-D was
+// applied here and never there, so the console kept silently applying
+// Ctrl-C-truncated configurations — and a divergence between the two surfaces
+// is always a bug. One implementation now serves both; this wrapper keeps the
+// call site and the #4883-D regression tests pointed at it.
 func readTerminalConfig(readLine func() (string, error)) (string, error) {
-	var lines []string
-	for {
-		line, err := readLine()
-		if err != nil {
-			if err == io.EOF {
-				return strings.Join(lines, "\n"), nil
-			}
-			if err == readline.ErrInterrupt {
-				return "", fmt.Errorf("load terminal: aborted (partial input discarded)")
-			}
-			return "", fmt.Errorf("load terminal: read error: %v", err)
-		}
-		lines = append(lines, line)
-	}
+	return cliterm.ReadConfig(readLine)
 }
 
 func (c *ctl) handleLoad(args []string) error {
