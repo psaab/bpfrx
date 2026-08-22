@@ -103298,3 +103298,18 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/dataplane/userspace/buildsnapshot_must_7446_test.go,
     pkg/dataplane/userspace/buildsnapshot_discard_guard_7446_test.go,
     16 converted *_test.go files, docs/engineering-style.md
+
+  - **Action**: #6707 — added a `commit confirmed` rollback-target APPLIABILITY
+    pre-flight so the confirmed-commit safety net cannot arm against a target
+    the dataplane is guaranteed to refuse (#5575 lenient-content poison). The
+    timeout path applies its target unconditionally by design, so the decision
+    has to be made at arm time. Measured the issue's other two consequences at
+    master: the peer-sync divergence is CLOSED by #7328's config-apply NACK, and
+    the ctrl-disable outage is real but its stated fix direction is unsafe —
+    both reported rather than changed.
+  - **File(s)**: pkg/config/compiler_security_policy.go,
+    pkg/config/lenient_dropped_locator_6707_test.go (new),
+    pkg/daemon/rollback_target_appliable_6707.go (new),
+    pkg/daemon/rollback_target_appliable_6707_test.go (new),
+    pkg/daemon/daemon_apply_commit.go, pkg/daemon/README.md,
+    docs/bare-metal-device-map.md
