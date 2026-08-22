@@ -503,6 +503,8 @@ pub(crate) fn worker_loop(
                 wr_counters.session_table_entries = sessions.len() as u64;
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
                 wr_counters.nat_reverse_key_collisions = sessions.nat_reverse_key_collisions();
+                wr_counters.nat_reverse_key_collisions_distinct_src =
+                    sessions.nat_reverse_key_collisions_distinct_src();
                 // #1861: install-refusal trio from the worker's
                 // SessionTable (create_drops was write-only before).
                 wr_counters.session_create_drops = sessions.create_drops();

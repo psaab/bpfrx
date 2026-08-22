@@ -90,6 +90,10 @@ pub struct WorkerRuntimeStatus {
     /// `default` so an older daemon that predates this counter emits 0.
     #[serde(rename = "nat_reverse_key_collisions", default)]
     pub nat_reverse_key_collisions: u64,
+    /// #6751: the DIFFERENT-SOURCE subset. Additive and `default`ed so an
+    /// older helper deserializes to 0 instead of failing the status parse.
+    #[serde(rename = "nat_reverse_key_collisions_distinct_src", default)]
+    pub nat_reverse_key_collisions_distinct_src: u64,
     /// #1861: cumulative at-cap install refusals from this worker's
     /// SessionTable (`create_drops` — previously write-only). `default`
     /// for wire-additive compatibility with older daemons.

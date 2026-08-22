@@ -125,6 +125,11 @@ pub(crate) struct WorkerRuntimeCounters {
     /// #1760: cumulative NAT reverse-key displacement events from this
     /// worker's SessionTable (`SessionTable::nat_reverse_key_collisions`).
     pub nat_reverse_key_collisions: u64,
+    /// #6751: the DIFFERENT-SOURCE subset of the counter above
+    /// (`SessionTable::nat_reverse_key_collisions_distinct_src`). The
+    /// aggregate cannot separate the cross-session leak this issue is about
+    /// from one host reusing an ephemeral port; this one can.
+    pub nat_reverse_key_collisions_distinct_src: u64,
     /// #1861: cumulative at-cap install refusals from this worker's
     /// SessionTable (`SessionTable::create_drops` — previously
     /// write-only/invisible).
@@ -212,6 +217,7 @@ pub(crate) struct WorkerRuntimeAtomics {
     /// Relaxed cumulative counter (like `session_table_entries`), NOT part
     /// of the seqlock-published rolling-window tuple below.
     pub nat_reverse_key_collisions: AtomicU64,
+    pub nat_reverse_key_collisions_distinct_src: AtomicU64,
     /// #1861: install-refusal trio (same Relaxed cumulative pattern).
     pub session_create_drops: AtomicU64,
     pub session_install_admission_refused: AtomicU64,
@@ -284,6 +290,7 @@ impl WorkerRuntimeAtomics {
             session_table_entries: AtomicU64::new(0),
             max_sessions: AtomicU64::new(0),
             nat_reverse_key_collisions: AtomicU64::new(0),
+            nat_reverse_key_collisions_distinct_src: AtomicU64::new(0),
             session_create_drops: AtomicU64::new(0),
             session_install_admission_refused: AtomicU64::new(0),
             session_install_partial: AtomicU64::new(0),
@@ -347,6 +354,8 @@ impl WorkerRuntimeAtomics {
             .store(c.session_table_entries, Ordering::Relaxed);
         self.nat_reverse_key_collisions
             .store(c.nat_reverse_key_collisions, Ordering::Relaxed);
+        self.nat_reverse_key_collisions_distinct_src
+            .store(c.nat_reverse_key_collisions_distinct_src, Ordering::Relaxed);
         // #1861: install-refusal trio, same Relaxed cumulative cadence.
         self.session_create_drops
             .store(c.session_create_drops, Ordering::Relaxed);
@@ -453,6 +462,9 @@ impl WorkerRuntimeAtomics {
             max_sessions: self.max_sessions.load(Ordering::Relaxed),
             nat_reverse_key_collisions: self
                 .nat_reverse_key_collisions
+                .load(Ordering::Relaxed),
+            nat_reverse_key_collisions_distinct_src: self
+                .nat_reverse_key_collisions_distinct_src
                 .load(Ordering::Relaxed),
             session_create_drops: self.session_create_drops.load(Ordering::Relaxed),
             session_install_admission_refused: self

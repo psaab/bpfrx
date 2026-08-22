@@ -207,6 +207,7 @@ pub(crate) fn run() -> Result<(), String> {
             session_table_entries: 0,
             max_sessions: 0,
             nat_reverse_key_collisions: 0,
+            nat_reverse_key_collisions_distinct_src: 0,
             session_create_drops: 0,
             session_install_admission_refused: 0,
             session_install_partial: 0,
