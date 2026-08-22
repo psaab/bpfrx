@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -402,6 +403,26 @@ func (d *Daemon) enterBootstrapMode() error {
 	// no-op when no monitor is running). Runs under the caller's d.applySem.
 	d.stopAndDiscardNATPoolAlarm()
 
+	// #6742: relinquish cluster mastership and stop cluster comms BEFORE the
+	// teardown below detaches the dataplane, and the order is the whole point.
+	//
+	// A node that rolls back into bootstrap is logically unconfigured — but
+	// nothing here stopped VRRP, the heartbeat or session sync, so it kept
+	// advertising, could hold or win RG mastership, and answered for the RETH
+	// VIPs with a dataplane the teardown then detached. The peer saw a healthy
+	// node throughout. That is the bootstrap-with-live-cluster hybrid.
+	//
+	// Resigning while this node can STILL forward makes the handover a planned
+	// failover (priority-0 burst, peer takes over in ~1ms) instead of a
+	// blackhole the peer discovers a heartbeat interval later. Doing it after
+	// the dataplane detach would invert that.
+	//
+	// Placed BEFORE the seam branch below for the same reason
+	// stopAndDiscardNATPoolAlarm is: the lifecycle then runs on every path,
+	// including the rollback unit tests that stub the apply body. It is a no-op
+	// on a standalone node.
+	clusterSteps := d.relinquishClusterForBootstrap()
+
 	var steps []bootstrapTeardownStep
 	switch {
 	case d.bootstrapTeardownForTest != nil:
@@ -419,6 +440,11 @@ func (d *Daemon) enterBootstrapMode() error {
 	default:
 		steps = d.runBootstrapTeardownSteps()
 	}
+
+	// The cluster relinquish ran before the seam, so its outcomes are folded in
+	// FIRST — a failed resign is part of the same honest report, not a separate
+	// channel that a stubbed teardown could hide.
+	steps = append(clusterSteps, steps...)
 
 	// #5868: aggregate the per-step outcomes and report HONESTLY. A partial
 	// teardown must never be logged/returned as a clean rollback.
@@ -479,6 +505,84 @@ func summarizeBootstrapTeardown(steps []bootstrapTeardownStep) (err error, degra
 // earlier failures — a bootstrap rollback tears down as much as it can — but
 // failures are captured (not discarded) so the caller can report DEGRADED.
 // Runs under the caller's d.applySem.
+// relinquishClusterForBootstrap resigns every redundancy group this node holds
+// and stops cluster comms, so a node that has rolled back into bootstrap mode
+// cannot keep acting clustered while logically unconfigured (#6742).
+//
+// It is a no-op on a standalone node (no cluster manager, or no VRRP manager).
+//
+// It deliberately does NOT call vrrp.Manager.Stop(). That method is
+// single-shot: its own contract says the daemon does "Start-once at init and
+// Stop-once at shutdown, never concurrently" (#2625), and it closes the event
+// channel and cancels the manager context. Bootstrap rollback is RECOVERABLE —
+// the next compilable `commit confirmed` (or a cluster SyncApply) re-arms the
+// node — so tearing the manager down permanently would trade a hybrid state for
+// a node that can never run VRRP again until xpfd restarts. ResignRG is the
+// restartable path, the same one manual failover and a weight drop use.
+//
+// Each resign is awaited on its barrier so the virtual addresses are physically
+// off the interface before the caller detaches the dataplane; a barrier that
+// does not complete is reported as a failed step rather than waited on forever,
+// because a wedged VRRP instance must not block the rollback that is trying to
+// make this node safe.
+//
+// Runs under the caller's d.applySem. stopClusterComms takes clusterCommsMu,
+// which is the same order the apply tail already uses when a transport change
+// restarts comms (daemon_apply_tail.go), so there is no new lock edge.
+func (d *Daemon) relinquishClusterForBootstrap() []bootstrapTeardownStep {
+	if d.cluster == nil {
+		return nil
+	}
+	var steps []bootstrapTeardownStep
+
+	// Enumerate the RGs from the LIVE state machines, not from the config: the
+	// config that defined them is exactly what this rollback is discarding.
+	d.rgStatesMu.RLock()
+	rgIDs := make([]int, 0, len(d.rgStates))
+	for id := range d.rgStates {
+		rgIDs = append(rgIDs, id)
+	}
+	d.rgStatesMu.RUnlock()
+	sort.Ints(rgIDs)
+
+	for _, rgID := range rgIDs {
+		barrier := d.resignRethRG(rgID)
+		if barrier == nil {
+			// Nothing to release for this RG — no RETH tenure to hand over.
+			continue
+		}
+		timeout := d.rethVIPReleaseTimeout
+		if timeout <= 0 {
+			timeout = rethVIPReleaseTimeout
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case <-barrier.Done():
+			if err := barrier.Err(); err != nil {
+				steps = append(steps, bootstrapTeardownStep{
+					name: fmt.Sprintf("resign redundancy group %d", rgID),
+					err:  err,
+				})
+			}
+		case <-timer.C:
+			steps = append(steps, bootstrapTeardownStep{
+				name: fmt.Sprintf("resign redundancy group %d", rgID),
+				err: fmt.Errorf("timed out after %s waiting for virtual addresses to be released",
+					timeout),
+			})
+		}
+		timer.Stop()
+	}
+
+	// Stop heartbeats, session sync and the fabric refresh loops. Until this
+	// runs the peer keeps seeing a healthy node and keeps syncing sessions to
+	// one whose dataplane is about to be detached.
+	d.stopClusterComms()
+	slog.Info("bootstrap rollback: cluster comms stopped and redundancy groups resigned",
+		"redundancy_groups", len(rgIDs))
+	return steps
+}
+
 func (d *Daemon) runBootstrapTeardownSteps() []bootstrapTeardownStep {
 	steps := make([]bootstrapTeardownStep, 0, 3)
 
