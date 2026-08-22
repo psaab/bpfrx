@@ -95,6 +95,12 @@ ARM_RECORD = "/var/lib/xpf/kernel-promote-binary"
 # The kernel-channel journal. The gate reads ONE BIT out of it (is a candidate
 # ARMED) and never a path. Pinned against Go by TestPromoteScriptJournalMatchesGo.
 KERNEL_JOURNAL = "/var/lib/xpf/kernel-upgrade.state"
+# The durable did-not-run record (#6622). The gate exits 0 on every path and the
+# unit is Type=oneshot + RemainAfterExit=yes, so `systemctl status` reads SUCCESS
+# even after a refusal; this file is what makes the decline outlive journal
+# rotation. Its path is pinned against Go by
+# TestPromoteScriptRefusalRecordPathMatchesGo_6622 (pkg/upgrade).
+REFUSAL_RECORD = "/var/lib/xpf/kernel-promote-refusal"
 VERSIONED = "/var/lib/xpf/versions/current/xpfd"
 
 
@@ -484,6 +490,7 @@ class _GateBase(unittest.TestCase):
         text = text.replace(SBIN, str(self.fake_root) + SBIN)
         text = text.replace(ARM_RECORD, str(self.fake_root) + ARM_RECORD)
         text = text.replace(KERNEL_JOURNAL, str(self.fake_root) + KERNEL_JOURNAL)
+        text = text.replace(REFUSAL_RECORD, str(self.fake_root) + REFUSAL_RECORD)
         self.script_copy.write_text(text)
         self.script_copy.chmod(0o755)
 
@@ -714,6 +721,64 @@ class _GateBase(unittest.TestCase):
             f"the gate did not run the recorded xpfd ({why}): {res.stderr}",
         )
         self._assert_no_path_fallback(res, why)
+
+    def _refusal_path(self) -> Path:
+        return Path(str(self.fake_root) + REFUSAL_RECORD)
+
+    def _read_refusal(self) -> dict:
+        """Parse the durable did-not-run record the way Go does (#6622).
+
+        Splits on the FIRST '=' only: a systemd ExecStart rendering contains
+        several, and a parser that split on every one would mangle the field an
+        operator most needs. Returns {} when no record exists.
+        """
+        p = self._refusal_path()
+        if not p.is_file():
+            return {}
+        out = {}
+        for line in p.read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                out[k] = v
+        return out
+
+    def _assert_recorded(self, disposition: str, why: str) -> dict:
+        """The did-not-run outcome left a durable, parseable record."""
+        rec = self._read_refusal()
+        self.assertTrue(
+            rec,
+            f"no durable record at {self._refusal_path()} ({why}). The gate "
+            f"exits 0 and the unit is RemainAfterExit=yes, so `systemctl "
+            f"status` reads SUCCESS — without this file the operator has only "
+            f"a journald line, which journal rotation takes away (#6622)",
+        )
+        self.assertEqual(
+            rec.get("disposition"),
+            disposition,
+            f"disposition={rec.get('disposition')!r}, want {disposition!r} "
+            f"({why}). A refusal names a condition the operator can fix; an "
+            f"indeterminate says the gate could not even tell — folding them "
+            f"sends the operator to the wrong subsystem",
+        )
+        # ONE LINE PER FIELD is the format contract: the shell writes it and Go
+        # reads it, so a value carrying a newline would forge extra records.
+        raw = self._refusal_path().read_text()
+        self.assertEqual(
+            len(raw.splitlines()),
+            len([k for k in rec]),
+            f"the record has lines that are not key=value fields ({why}):\n{raw}",
+        )
+        return rec
+
+    def _assert_no_record(self, why: str):
+        self.assertEqual(
+            self._read_refusal(),
+            {},
+            f"a durable did-not-run record was written ({why}). It is written "
+            f"only where the gate never ran xpfd at all; writing it on an "
+            f"ordinary boot would rewrite the file every boot and bury the "
+            f"signal it exists to carry (#6622)",
+        )
 
     def _spawn_fake_daemon(self, subdir: str, basename: str = "xpfd", unlink: bool = False):
         """Run a real process from a real file; return (proc, path, cgroup)."""
@@ -1811,6 +1876,194 @@ class TestRefusalCarriesFacts(_GateBase):
         self.assertNotIn("Fix xpfd.service so its ExecStart", res.stderr)
 
 
+class TestRefusalLeavesADurableRecord(_GateBase):
+    """#6622 — a did-not-run outcome must survive the boot and journal rotation.
+
+    The gate exits 0 on EVERY path, deliberately: a non-zero exit trips the
+    unit's OnFailure= and reboots the box over what may be a transient
+    packaging window, and the firmware already cleared BootNext so the next
+    plain reboot falls back to known-good on its own. The unit is Type=oneshot
+    with RemainAfterExit=yes, so the cost of that correct decision is that
+    `systemctl status xpf-kernel-promote` reads SUCCESS and stays active even
+    when the gate REFUSED and the armed candidate is running unverified.
+
+    Before this the only signal was a journald line. An operator who armed a
+    candidate, rebooted, and came back later saw a box on the old kernel and a
+    promote unit reporting success, with nothing saying the gate declined or
+    why.
+
+    #6601 is what made it worth closing rather than theoretical: it converted
+    "maybe run a stale binary" into "refuse", which is the right trade, but it
+    made refusal a REACHABLE outcome. A state that is now reachable needs to be
+    observable.
+
+    The record does NOT make the unit fail, and one test below asserts that
+    explicitly — the exit-0 contract is load-bearing and this must not erode it.
+    """
+
+    def test_a_refusal_leaves_a_durable_record_with_the_facts(self):
+        # The strongest refusal: a candidate IS armed and the gate cannot run.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        self.stub_loadstate = "loaded"
+        self.stub_mainpid = "0"
+        self.stub_execstart = "{ path=/usr/local/sbin/xpfd ; argv[]=/usr/local/sbin/xpfd ; ignore_errors=no }"
+
+        res = self._run()
+        self._assert_refused(res, "journal ARMED, record absent")
+        rec = self._assert_recorded("refused", "journal ARMED, record absent")
+
+        # The RESOLUTION FACTS, not just "refused" — the issue's central
+        # criterion. These are the snapshot values the DECISION was made on, so
+        # an operator reading them days later is not looking at a re-query of a
+        # system that has since changed.
+        self.assertEqual(rec.get("load_state"), "loaded")
+        self.assertEqual(rec.get("main_pid"), "0")
+        self.assertEqual(rec.get("exec_start"), self.stub_execstart)
+        self.assertEqual(rec.get("unit"), "xpfd.service")
+        # The journal bit that made this a refusal rather than a quiet skip.
+        self.assertEqual(rec.get("journal_state"), "armed")
+        # Enough to say WHAT happened and WHAT to do about it.
+        self.assertIn("ARMED", rec.get("reason", ""))
+        self.assertTrue(rec.get("cause"), f"no cause recorded: {rec}")
+        self.assertTrue(rec.get("advice"), f"no advice recorded: {rec}")
+        # A wrong early-boot clock must not leave the event unattributable.
+        self.assertTrue(rec.get("boot_id"), f"no boot id recorded: {rec}")
+
+    def test_the_record_does_not_make_the_unit_fail(self):
+        # The exit-0 contract is why this issue exists at all, and closing the
+        # observability gap must not close it by breaking that. Asserted as its
+        # own test rather than only inside _assert_refused, because this is the
+        # constraint the fix was most likely to violate.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        res = self._run()
+        self.assertEqual(
+            res.returncode,
+            0,
+            "the gate exited non-zero after writing the record; that trips the "
+            "unit's OnFailure= and reboots the box on the boot path (#6622 "
+            "explicitly rules this out as the fix)",
+        )
+        self.assertTrue(self._read_refusal(), "no record was written")
+        self.assertFalse(
+            self.systemctl_ran.exists(),
+            "the gate rebooted after recording a refusal",
+        )
+
+    def test_advice_branch_is_recorded_not_just_logged(self):
+        # set_cause_advice BRANCHES: telling an operator to fix an ExecStart
+        # when systemctl could not be consulted at all points at the wrong
+        # system. The record must preserve WHICH branch was taken, or it
+        # reproduces that mistake one rotation later.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        self.stub_show_fail = "1"
+
+        res = self._run()
+        self._assert_refused(res, "systemctl unreachable")
+        rec = self._assert_recorded("refused", "systemctl unreachable")
+        self.assertIn("systemd-availability", rec.get("advice", ""))
+        self.assertIn("systemctl could not be consulted", rec.get("cause", ""))
+        # And the facts must say the query failed rather than reporting an
+        # empty value that reads like "systemd answered, with nothing".
+        self.assertEqual(rec.get("load_state"), "<systemctl failed>")
+
+    def test_a_multiline_execstart_cannot_forge_extra_fields(self):
+        # systemd renders multiple ExecStart entries one per LINE. The record is
+        # one line per field, so an unflattened value would turn a single field
+        # into several bogus records -- the same "a value may legally contain
+        # the delimiter" class as the ExecStart parse itself, in reverse.
+        self.armed = str(self.tmp / "nope" / "xpfd")  # unusable -> refusal
+        self.stub_loadstate = "loaded"
+        self.stub_execstart = (
+            "{ path=/a/xpfd ; argv[]=/a/xpfd ; ignore_errors=no }\n"
+            "reason=FORGED\n"
+            "{ path=/b/xpfd ; argv[]=/b/xpfd ; ignore_errors=no }"
+        )
+
+        res = self._run()
+        self._assert_refused(res, "recorded binary missing")
+        rec = self._assert_recorded("refused", "recorded binary missing")
+        # Assert on the RAW file, not on the parsed dict. The forged line lands
+        # BEFORE the real `reason=`, so a last-key-wins parse (which is what
+        # both this helper and Go's reader do) silently discards it and a
+        # dict-based assertion here could never fire -- it would read as the
+        # load-bearing check while being dead. The raw text is where the
+        # forgery is visible.
+        raw = self._refusal_path().read_text()
+        self.assertNotIn(
+            "\nreason=FORGED",
+            raw,
+            "a newline inside ExecStart forged a `reason` field; the value was "
+            f"not flattened (#6622):\n{raw}",
+        )
+        self.assertNotIn(
+            "\n",
+            rec.get("exec_start", ""),
+            "the ExecStart value kept a newline",
+        )
+        # And the real reason survived intact.
+        self.assertIn("not an executable regular file", rec.get("reason", ""))
+
+    def test_an_indeterminate_journal_is_recorded_as_such(self):
+        # Not a refusal, but the same operator problem: a candidate may be
+        # armed, the gate did not run, and nothing durable said so. Recording
+        # it is what makes the record's ABSENCE meaningful -- if only refuse()
+        # wrote one, "no record" could not distinguish a clean boot from a boot
+        # the gate skipped for this reason.
+        self.arm_explicitly_absent = True
+        journal = self._journal_path()
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.mkdir()  # a DIRECTORY: present, unreadable as a journal
+
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("cannot establish whether", res.stderr)
+        rec = self._assert_recorded("indeterminate", "journal is a directory")
+        self.assertEqual(rec.get("journal_state"), "indeterminate")
+        self.assertNotIn("REFUSING", res.stderr)
+
+    def test_an_ordinary_boot_leaves_no_record(self):
+        # The ANTI-NOISE control. A file rewritten on every boot is not a
+        # signal; and a stale record from a prior candidate would be read as a
+        # verdict on the current one.
+        self.arm_explicitly_absent = True  # nothing armed, no journal
+        res = self._run()
+        self._assert_nothing_armed(res, "nothing armed")
+        self._assert_no_record("ordinary boot, nothing armed")
+
+    def test_a_successful_promotion_leaves_no_record(self):
+        # The gate RAN. From here the Go half owns the durable state (journal,
+        # promotion marker, last-roll), so a second writer here would be a
+        # second source for the same question.
+        self._seed_runtime_layout()
+        _live, ran = self._arm_a_live_binary()
+        res = self._run()
+        self._assert_ran(res, ran, "healthy armed box")
+        self._assert_no_record("the gate ran the recorded binary")
+
+    def test_an_unwritable_state_dir_does_not_change_the_exit_path(self):
+        # This runs on a candidate boot whose whole problem may be that the
+        # filesystem is not what the gate expected. A gate that changed its
+        # exit path because it could not write a DIAGNOSTIC would convert an
+        # observability gap into an availability one -- it would reboot the box.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        res_dir = Path(str(self.fake_root) + REFUSAL_RECORD).parent
+        res_dir.mkdir(parents=True, exist_ok=True)
+        # Plant a DIRECTORY where the record goes: mkdir -p succeeds, the
+        # rename cannot.
+        self._refusal_path().mkdir(parents=True, exist_ok=True)
+
+        res = self._run()
+        self._assert_refused(res, "record unwritable")
+        self.assertFalse(
+            self.systemctl_ran.exists(),
+            "an unwritable record rebooted the box",
+        )
+
+
 class TestBusyboxParity(_GateBase):
     """NIT-1 (#6601 r5) — the portability claim was asserted but never bound.
 
@@ -1904,6 +2157,26 @@ class TestBusyboxParity(_GateBase):
         res = self._run()
         self._assert_refused(res, "busybox sh, journal ARMED, record absent")
         self.assertIn("UNVERIFIED", res.stderr)
+
+    def test_refusal_record_is_written_under_busybox(self):
+        # The record writer uses `tr`, `date`, `mv` and a redirection into a
+        # command group. The busybox leg swaps the SHELL, not the utilities, so
+        # what this binds is the SHELL's handling of the group redirect and the
+        # command substitutions inside it -- the parts a non-dash sh could
+        # differ on. Without it the whole #6622 mechanism is asserted only
+        # under /bin/sh, on a script whose entire portability claim is that it
+        # runs under both.
+        self.arm_explicitly_absent = True
+        self.journal = self.journal_body("ARMED")
+        self.stub_loadstate = "loaded"
+        self.stub_execstart = "{ path=/a/xpfd ; argv[]=/a/xpfd ; ignore_errors=no }"
+
+        res = self._run()
+        self._assert_refused(res, "busybox, journal ARMED, record absent")
+        rec = self._assert_recorded("refused", "busybox")
+        self.assertEqual(rec.get("exec_start"), self.stub_execstart)
+        self.assertEqual(rec.get("journal_state"), "armed")
+        self.assertTrue(rec.get("reason"), f"no reason recorded under busybox: {rec}")
 
     def test_arming_state_is_not_a_trial_under_busybox(self):
         # The other side of the same glob: ARMING must NOT match, or busybox

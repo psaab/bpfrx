@@ -117,15 +117,39 @@ type cfRecord struct {
 	TTL     int    `json:"ttl"`
 }
 
-// cfErrors formats the envelope errors WITHOUT leaking the token (which is only
-// ever in the request header, never echoed by Cloudflare).
+// maxCFErrors bounds how many envelope errors are rendered. The array length is
+// PROVIDER-CHOSEN, so without this the per-message cap is defeated by repetition
+// (#6634): a body carrying ten thousand short errors is still an unbounded log
+// line. Four is more than any real Cloudflare failure returns.
+const maxCFErrors = 4
+
+// cfErrors formats the envelope errors.
+//
+// The Cloudflare API token is only ever in the request header and is never
+// echoed by Cloudflare, so it is not the exposure here. The MESSAGE is: it is
+// chosen by the provider, and it was rendered verbatim with %s into an error the
+// daemon logs and retains as the provider's lastErr. An API that answers "your
+// request was invalid: <the request>" echoes our own update URL back, so the
+// text is scrubbed and bounded on the way out (#6634), and the COUNT is bounded
+// too — a per-item cap is not a bound when the provider picks the item count.
+//
+// The numeric Code is rendered as-is: an int cannot carry text.
 func cfErrors(env cfEnvelope) string {
 	if len(env.Errors) == 0 {
 		return "unknown error"
 	}
-	parts := make([]string, 0, len(env.Errors))
-	for _, e := range env.Errors {
-		parts = append(parts, fmt.Sprintf("%d:%s", e.Code, e.Message))
+	shown := env.Errors
+	extra := 0
+	if len(shown) > maxCFErrors {
+		extra = len(shown) - maxCFErrors
+		shown = shown[:maxCFErrors]
+	}
+	parts := make([]string, 0, len(shown)+1)
+	for _, e := range shown {
+		parts = append(parts, fmt.Sprintf("%d:%s", e.Code, scrubProviderText(e.Message)))
+	}
+	if extra > 0 {
+		parts = append(parts, fmt.Sprintf("[+%d more]", extra))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -161,7 +185,14 @@ func (b *cloudflareBackend) do(ctx context.Context, method, path string, body an
 	}
 	var env cfEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return cfEnvelope{}, fmt.Errorf("ddns cloudflare: %s: decode response: %w", b.name, err)
+		// SECURITY (#6634): `raw` is a provider-chosen response body, and Go's
+		// JSON decoder QUOTES the offending input back — an overflowing numeric
+		// field yields "json: cannot unmarshal number 9876543210…" with the
+		// complete provider-selected token in it. Withhold the decoder's text
+		// the same way the Route 53 XML decode does; the prefix already says
+		// which call failed.
+		return cfEnvelope{}, fmt.Errorf("ddns cloudflare: %s: decode response: %s",
+			b.name, scrubInnerError(err))
 	}
 	if !env.Success {
 		return env, fmt.Errorf("ddns cloudflare: %s: API error: %s", b.name, cfErrors(env))
@@ -179,7 +210,10 @@ func (b *cloudflareBackend) resolveZoneID(ctx context.Context) (string, error) {
 	}
 	var zones []cfZone
 	if err := json.Unmarshal(env.Result, &zones); err != nil {
-		return "", fmt.Errorf("ddns cloudflare: %s: decode zones: %w", b.name, err)
+		// SECURITY (#6634): as in do() — the decoder quotes provider-chosen
+		// input back, and env.Result came off the wire.
+		return "", fmt.Errorf("ddns cloudflare: %s: decode zones: %s",
+			b.name, scrubInnerError(err))
 	}
 	for _, z := range zones {
 		if strings.EqualFold(z.Name, b.zone) {
@@ -219,7 +253,10 @@ func (b *cloudflareBackend) listRecords(ctx context.Context, zoneID, rtype, fqdn
 		}
 		var recs []cfRecord
 		if err := json.Unmarshal(env.Result, &recs); err != nil {
-			return nil, fmt.Errorf("ddns cloudflare: %s: decode records: %w", b.name, err)
+			// SECURITY (#6634): as in do() — the decoder quotes provider-chosen
+			// input back, and env.Result came off the wire.
+			return nil, fmt.Errorf("ddns cloudflare: %s: decode records: %s",
+				b.name, scrubInnerError(err))
 		}
 		all = append(all, recs...)
 		// Stop when the API reports the last page. Fall back to a short-page

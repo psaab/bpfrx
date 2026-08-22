@@ -1206,7 +1206,7 @@ fn overlay_shared_cos_queue_lease_statuses(
             // #1863 Step-0: per-worker claim-flow counters for every v8
             // lease — BEFORE the equal-flow gate below (these are not
             // equal-flow state; they attribute the honored-realization
-            // gap per docs/research/1863-realization-gap/plan.md §5).
+            // gap per docs/pr/1863-realization-gap/plan.md §5).
             if let Some((requested, granted)) = lease.v8_worker_claim_flow() {
                 queue.lease_v8_worker_requested_bytes = requested;
                 queue.lease_v8_worker_granted_bytes = granted;
