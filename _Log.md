@@ -101745,3 +101745,18 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/compiler_security_alg.go, pkg/config/compiler_routing.go,
     pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
     docs/config-schema.md
+
+## 2026-08-22 — #6610 snat_allocator bench flow-key overflow
+- **Timestamp**: 2026-08-22
+- **Action**: Determined READING 1 (benign) with evidence, not assumption: the
+  overflowing add is in the bench's synthetic dst_ip uniqueness TAG, not an
+  accumulator and not port accounting; the release wrap was a pure mod-256 fold
+  of the top byte leaving all nine producer tags distinct, and a post-fix
+  release run reproduces the published fail-fraction fingerprint exactly. Fixed
+  by building the tag as two disjoint bit fields OR'd together with named
+  producer bytes; `saturating_add` would have been WRONG (collapses the low-24
+  discriminator). Added const-assert invariants and a `cargo check --benches`
+  leg to `make test-rust` — compiling a bench is what evaluates its const
+  asserts, so the compile-only gate is meaningful for this class.
+- **File(s)**: userspace-dp/benches/snat_allocator.rs, Makefile,
+  docs/research/2852-portalloc/microbench-results.md, _Log.md
