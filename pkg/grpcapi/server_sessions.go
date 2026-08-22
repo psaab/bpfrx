@@ -970,22 +970,13 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 	// logged and swallowed with peer=nil, which was indistinguishable from a
 	// healthy standalone node. The local totals are still returned — the local
 	// view is useful — but the response says whether it is complete.
+	// #5968: the classification is factored into attachPeerSessionSummary so the
+	// full path and the peer-ONLY path (PeerSessionSummary) cannot disagree
+	// about it. A divergence there would always be a bug — the same peer fetch
+	// must classify the same way whichever surface asked.
 	if req.GetIncludePeer() {
 		peerResp, perr := s.proxyPeerSessionSummary(ctx)
-		switch {
-		case perr != nil:
-			slog.Warn("failed to fetch peer session summary", "err", perr)
-			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
-			resp.PeerError = perr.Error()
-		case peerResp != nil:
-			resp.Peer = peerResp
-			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_OK
-		default:
-			// (nil, nil): standalone node (NOT_APPLICABLE) or a clustered node
-			// whose peer heartbeat is currently lost (UNREACHABLE — a partition,
-			// not standalone).
-			resp.PeerStatus = s.peerAbsentStatus()
-		}
+		s.attachPeerSessionSummary(resp, peerResp, perr)
 	} else {
 		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
 	}
@@ -1080,21 +1071,11 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 	// forwarded peer request (recursion guard). proxyPeerZonePairSummary stamps
 	// x-peer-forwarded on the outgoing context and, in production, dials the
 	// peer only when one is alive; a unit test wires peerZonePairSummaryFn.
+	// #5968: classification factored into attachPeerZonePairSummary, shared with
+	// the peer-ONLY path (PeerZonePairSummary) — see attachPeerSessionSummary.
 	if req.GetIncludePeer() && !peerForwardedFromContext(ctx) {
 		peerResp, perr := s.proxyPeerZonePairSummary(ctx, &pb.GetZonePairSummaryRequest{})
-		switch {
-		case perr != nil:
-			// #5320: surface the failure (UNREACHABLE) instead of swallowing it
-			// with peer=nil, which looked like a healthy standalone breakdown.
-			slog.Warn("failed to fetch peer zone-pair summary", "err", perr)
-			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
-			resp.PeerError = perr.Error()
-		case peerResp != nil:
-			resp.Peer = peerResp
-			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_OK
-		default:
-			resp.PeerStatus = s.peerAbsentStatus()
-		}
+		s.attachPeerZonePairSummary(resp, peerResp, perr)
 	} else {
 		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
 	}

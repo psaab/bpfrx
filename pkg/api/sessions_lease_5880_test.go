@@ -45,6 +45,31 @@ func (c *leaseProbeCluster) GetZonePairSummary(context.Context, *pb.GetZonePairS
 	return &pb.GetZonePairSummaryResponse{}, nil
 }
 
+// #5968: the REST include_peer list now delegates to PeerSessions (peer view
+// only, no redundant local walk). It re-enters the SAME limiter via AcquireCtx
+// exactly as GetSessions did, so this probe keeps modelling the #5880
+// double-acquire faithfully — the delegation target changed, the admission
+// contract under test did not. Had the peer-only path skipped admission, this
+// guard would have gone vacuous without failing.
+func (c *leaseProbeCluster) PeerSessions(ctx context.Context, _ *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
+	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
+	if err != nil {
+		c.selfReject = true
+		return nil, err
+	}
+	defer release()
+	c.admitted = true
+	return &pb.GetSessionsResponse{Peer: &pb.GetSessionsResponse{NodeId: 1}}, nil
+}
+
+func (c *leaseProbeCluster) PeerSessionSummary(context.Context) (*pb.GetSessionSummaryResponse, error) {
+	return &pb.GetSessionSummaryResponse{}, nil
+}
+
+func (c *leaseProbeCluster) PeerZonePairSummary(context.Context) (*pb.GetZonePairSummaryResponse, error) {
+	return &pb.GetZonePairSummaryResponse{}, nil
+}
+
 // TestRESTIncludePeerReusesLease_5880 proves a REST include_peer list at
 // capacity 1 SUCCEEDS: the REST handler acquires the one slot, stamps the
 // in-process admission lease on the request context, and the include_peer

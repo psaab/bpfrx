@@ -60,7 +60,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				// (the Rust side already drops unresolvable classifier
 				// entries; filtering here keeps the drop visible and the
 				// helper drift-backstop a true never-fires guard).
-				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+				if config.CoSForwardingClassUndefined(cos, entry.ForwardingClass) {
 					slog.Warn("cos dscp-classifier references undefined forwarding-class; skipping entry (classifier partially absent)",
 						"classifier", classifier.Name,
 						"forwarding_class", entry.ForwardingClass,
@@ -95,7 +95,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 					continue
 				}
 				// #2704: same skip+warn for 802.1p classifier entries.
-				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+				if config.CoSForwardingClassUndefined(cos, entry.ForwardingClass) {
 					slog.Warn("cos ieee-802.1 classifier references undefined forwarding-class; skipping entry (classifier partially absent)",
 						"classifier", classifier.Name,
 						"forwarding_class", entry.ForwardingClass,
@@ -136,7 +136,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				// an undefined forwarding-class ref is a commit-time warning,
 				// and the Rust builder drops the entry silently, so log it here
 				// to keep the loss visible.
-				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+				if config.CoSForwardingClassUndefined(cos, entry.ForwardingClass) {
 					slog.Warn("cos inet-precedence classifier references undefined forwarding-class; skipping entry (classifier partially absent)",
 						"classifier", classifier.Name,
 						"forwarding_class", entry.ForwardingClass,
@@ -175,7 +175,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				// Rust side only materialized rewrite for classes the
 				// interface actually carries, so the rewrite was silently
 				// no-op for the undefined class.
-				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+				if config.CoSForwardingClassUndefined(cos, entry.ForwardingClass) {
 					slog.Warn("cos dscp rewrite-rule references undefined forwarding-class; skipping entry (rewrite absent for class)",
 						"rewrite_rule", rewriteRule.Name,
 						"forwarding_class", entry.ForwardingClass,
@@ -265,7 +265,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				// drifted helper that receives an entry this emitter would have
 				// filtered, consistent with the VLAN/TTL/queue/address sites
 				// (corruption a valid config never produces).
-				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+				if config.CoSForwardingClassUndefined(cos, entry.ForwardingClass) {
 					slog.Warn("cos scheduler-map references undefined forwarding-class; skipping entry (degraded shaping)",
 						"scheduler_map", schedMap.Name,
 						"forwarding_class", entry.ForwardingClass,

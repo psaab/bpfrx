@@ -473,6 +473,31 @@ func (d *Daemon) markConfigSyncPushed(configText string) {
 	d.configSyncMu.Unlock()
 }
 
+// invalidateConfigSyncPushed clears the #5863 (epoch x generation) push marker
+// so the next reconcile trigger re-pushes the active config to the peer
+// (#7328).
+//
+// The marker is claimed BEFORE the push and nothing else ever clears it, so a
+// generation the peer refused or failed to apply is otherwise never sent again
+// on the live connection — convergence would wait for a new commit (new
+// generation) or a reconnect (new epoch). That silently defeats the M-2/#4151
+// contract, which pins the peer's high-water on a failed apply SPECIFICALLY to
+// keep it eligible for a re-push of the same generation.
+//
+// It deliberately does NOT push inline. Clearing the marker and letting the
+// ordinary reconcile tick do the work bounds the retry to the reconciler's
+// cadence, so a failure that recurs immediately cannot become a
+// push/fail/nack tight loop on the shared control path. The peer's next nack
+// re-arms it again, so a persistent failure retries at that cadence
+// indefinitely rather than converging silently or storming.
+func (d *Daemon) invalidateConfigSyncPushed() {
+	d.configSyncMu.Lock()
+	d.configSyncHasPushed = false
+	d.configSyncPushedEpoch = 0
+	d.configSyncPushedGen = 0
+	d.configSyncMu.Unlock()
+}
+
 // reconcileConfigSyncToPeer is the level-triggered config-sync reconciler
 // (#5863). It re-evaluates the desired invariant — "if I am the RG0 config
 // authority AND stable (uptime ≥ stability threshold) AND a peer is connected
