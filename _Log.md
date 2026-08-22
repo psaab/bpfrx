@@ -1,3 +1,38 @@
+## 2026-08-21 — #6552 diagnostic-fork concurrency bound on ShowText/GetSystemInfo
+
+- **Timestamp**: 2026-08-21
+- **Action**: Made `outputTimeout`/`combinedOutputTimeout` acquire the
+  shared `diagcmd.DefaultLimiter` slot before forking, so the ten
+  read-only diagnostic fork sites in `ShowText` (journalctl, tail,
+  chronyc ×2, ntpq, timedatectl) and `GetSystemInfo` (ps, df,
+  journalctl, ss) draw from the same `MaxConcurrentDiagnostics=4` budget
+  ping/traceroute already use on both surfaces. Unbounded forms renamed
+  `*Unlimited`; three uses stay unbounded by design (power actions,
+  zeroize teardown, ip neigh flush) and are named in an allowlist a
+  source tripwire checks in BOTH directions. Errors map through
+  `diagExecError` so a refused admission is `ResourceExhausted`, not
+  `Internal`. Both `grpc.NewServer` builders now set
+  `MaxConcurrentStreams(256)` — grpc-go's server default is unlimited.
+  SECURITY DETERMINATION: no injection vector. Nine sites pass only
+  compile-time literals to `exec.CommandContext` (no shell); the tenth
+  (`tail -n N <logPath>`) is request-derived on both args and
+  constrained on both (clampTailLines [1,10000] re-emitted via Itoa;
+  SyslogLogFilePath enforces `filepath.Base` + the configured
+  `system syslog file` allowlist → `/var/log/<allowlisted-base>`).
+  Mutation matrix: N1/N2 (restore each helper's pre-fix unbounded body)
+  → the matching bound test + tripwire red; N3 (anchor site points at
+  the Unlimited helper) → tripwire names it; N4 (delete a
+  `MaxConcurrentStreams` line) → server test red; N5 (acquire at the
+  handler top instead of the fork) → the non-forking `users` negative
+  control reds; N6 (bogus exemption) → tripwire reds on the stale side.
+  Issue said six fork sites; there are ten, and the chronyc/ntpq chain
+  is in `ShowText{ntp}`, not `GetSystemInfo`.
+- **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show.go, pkg/grpcapi/server_show_status.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/diag_fork_limiter_6552_test.go, pkg/grpcapi/README.md
+
 ## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
 
 - **Timestamp**: 2026-08-22
